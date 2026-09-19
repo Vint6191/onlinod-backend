@@ -7,6 +7,7 @@ const { reschedulePlannedJob } = require("./job-planning-repository");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { capabilityFreshnessWindow } = require("./capability-freshness-authority-service");
 const { readCampaignsWithRevenue } = require("./creator-analytics-ledger-service");
+const { campaignDirectoryDiscoveryCapacityState } = require("./provider-capacity-sla-service");
 const {
   buildCollectionCommand, buildCollectionPlanningDedupeParams, withCollectorStateLock, COLLECTOR_TYPES,
 } = require("./analytics-collector-control-service");
@@ -91,6 +92,29 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: creator.id, work: async (tx) => {
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow: now });
     const active = await activeCollectorJob(tx, creator.id);
+    const activeParams = object(active?.params);
+    const activeUsesDirectoryReuse = Number(activeParams.campaignDirectoryReuseVersion || 0) >= 1
+      && Boolean(clean(activeParams.campaignDirectoryReuseGeneration, 120));
+    // An explicit manual FULL is a directory-discovery demand. If provider-free
+    // reuse is already queued/running/paused, invalidate that reuse authority
+    // immediately before returning it. Its next progress preflight will fail
+    // closed against the raised discovery revision, and recurring planning can
+    // then schedule the required source-exhaustive discovery.
+    if (activeUsesDirectoryReuse && typeof tx.creatorCampaignCollectionState?.findUnique === "function"
+      && typeof tx.creatorCampaignCollectionState?.update === "function") {
+      const activeState = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: creator.id } });
+      if (activeState) {
+        const requestedRevision = Math.max(0, Number(activeState.campaignDirectoryDiscoveryRequestedRevision || 0)) + 1;
+        await tx.creatorCampaignCollectionState.update({
+          where: { creatorId: creator.id },
+          data: {
+            campaignDirectoryDiscoveryRequestedRevision: requestedRevision,
+            campaignDirectoryDiscoveryRequestedAt: authorityNow,
+            campaignDirectoryDiscoveryDueAt: authorityNow,
+          },
+        });
+      }
+    }
     if (active?.status === "PAUSED") {
       const planned = await reschedulePlannedJob({
         db: tx, job: active, params: active.params || {}, priority: active.priority || 0,
@@ -102,9 +126,20 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
     }
     if (active) return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
 
-    const state = typeof tx.creatorCampaignCollectionState?.findUnique === "function"
+    let state = typeof tx.creatorCampaignCollectionState?.findUnique === "function"
       ? await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: creator.id } })
       : null;
+    if (state && typeof tx.creatorCampaignCollectionState?.update === "function") {
+      const requestedRevision = Math.max(0, Number(state.campaignDirectoryDiscoveryRequestedRevision || 0)) + 1;
+      state = await tx.creatorCampaignCollectionState.update({
+        where: { creatorId: creator.id },
+        data: {
+          campaignDirectoryDiscoveryRequestedRevision: requestedRevision,
+          campaignDirectoryDiscoveryRequestedAt: authorityNow,
+          campaignDirectoryDiscoveryDueAt: authorityNow,
+        },
+      });
+    }
     const params = {
       manualCampaignScan: true,
       manualCampaignScanVersion: MANUAL_VERSION,
@@ -119,6 +154,8 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
       observationTokenVersion: 1,
       observationReadLeaseVersion: 1,
       campaignResumablePaginationVersion: 1,
+      campaignFreshnessCoverageVersion: 1,
+      campaignDirectoryDiscoveryVersion: 1,
     };
     const scheduled = await scheduleJobNow({
       db: tx, jobKey: JOB_KEY, creatorId: creator.id, agencyId: creator.agencyId, params, priority: 100, now: authorityNow, bucketMs: 1,
@@ -224,7 +261,26 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
   const campaignRows = page.campaigns.map(campaignForClient);
   const totals = page.summary || { campaigns: campaignRows.length, fans: 0, payingFans: 0, settledNetCents: 0, pendingNetCents: 0, transactionsCount: 0, ofValueKnownFans: 0, ofValuePayingFans: 0, platformReportedFanSpendCents: 0, ofValueFetchedAt: null };
   const onlineWorkers = await countOnlineBindings(db, creator);
+  const collectionState = await db.creatorCampaignCollectionState?.findUnique?.({ where: { creatorId: creator.id } }) || null;
+  const capacityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
+  const directoryDiscovery = campaignDirectoryDiscoveryCapacityState(collectionState, capacityNow);
   const campaignRefs = Array.isArray(continuation.campaigns) ? continuation.campaigns : [];
+  const resultScanRunId = clean(result.scanRunId ?? continuation.scanRunId, 120);
+  const coverageMatches = Boolean(resultScanRunId && collectionState?.fanValueCoverageScanRunId === resultScanRunId);
+  const fanValuesExpected = coverageMatches ? integer(collectionState.fanValueExpected, 0, 100_000_000) : integer(result.fanValuesTotal ?? continuation.fanValuesDiscovered, 0, 100_000_000);
+  const fanValuesAlreadyFresh = coverageMatches ? integer(collectionState.fanValueAlreadyFresh, 0, 100_000_000) : 0;
+  const fanValuesQueued = coverageMatches ? integer(collectionState.fanValueQueued, 0, 100_000_000) : integer(result.fanValuesRequested ?? continuation.fanValuesRequested, 0, 100_000_000);
+  const fanValuesSucceeded = coverageMatches ? integer(collectionState.fanValueSucceeded, 0, 100_000_000) : integer(result.fanValuesFetched ?? continuation.fanValuesFetched, 0, 100_000_000);
+  const fanValuesUnavailable = coverageMatches ? integer(collectionState.fanValueUnavailable, 0, 100_000_000) : integer(result.fanValuesUnavailable ?? continuation.fanValuesUnavailable, 0, 100_000_000);
+  const fanValuesFailed = coverageMatches ? integer(collectionState.fanValueFailed, 0, 100_000_000) : 0;
+  const fanValuesOutstanding = coverageMatches ? integer(collectionState.fanValueOutstanding, 0, 100_000_000) : Math.max(0, fanValuesQueued - fanValuesSucceeded - fanValuesUnavailable);
+  const fanValueFreshnessStatus = coverageMatches ? clean(collectionState.fanValueFreshnessStatus, 40) || "MISSING" : "MISSING";
+  const campaignFrontierFreshnessStatus = clean(collectionState?.campaignFrontierFreshnessStatus, 40) || "MISSING";
+  const campaignFrontierDue = integer(collectionState?.campaignFrontierDueCount, 0, 100_000_000);
+  const campaignFrontierTarget = integer(collectionState?.campaignFrontierTargetCount, 0, 100_000_000);
+  const campaignFrontierCompleted = integer(collectionState?.campaignFrontierCompletedCount, 0, 100_000_000);
+  const campaignFrontierDeferred = integer(collectionState?.campaignFrontierDeferredCount, 0, 100_000_000);
+  const fanRefreshDelegated = result.fanRefreshDelegated === true || ["campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", "campaigns-v13"].includes(continuation.collectorVersion);
   return {
     ok: true,
     creatorId: creator.id,
@@ -240,12 +296,34 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
     truncated: result.truncated === true || continuation.truncated === true,
     campaignScannerRejected: integer(result.campaignScannerRejected ?? continuation.campaignScannerRejected, 0, 100_000_000),
     claimerScannerRejected: integer(result.claimerScannerRejected ?? continuation.claimerScannerRejected, 0, 100_000_000),
-    fanValuesTotal: integer(result.fanValuesTotal ?? continuation.fanValuesDiscovered ?? (Array.isArray(continuation.fanValueQueue) ? continuation.fanValueQueue.length : 0), 0, 100_000_000),
-    fanValuesRequested: integer(result.fanValuesRequested ?? continuation.fanValuesRequested, 0, 100_000_000),
-    fanValuesFetched: integer(result.fanValuesFetched ?? continuation.fanValuesFetched, 0, 100_000_000),
-    fanValuesUnavailable: integer(result.fanValuesUnavailable ?? continuation.fanValuesUnavailable, 0, 100_000_000),
-    fanValuesComplete: result.fanValuesComplete === true,
-    fanRefreshDelegated: result.fanRefreshDelegated === true || ["campaigns-v9", "campaigns-v10"].includes(continuation.collectorVersion),
+    fanValuesTotal: fanValuesExpected,
+    fanValuesRequested: fanValuesQueued,
+    fanValuesFetched: fanValuesSucceeded,
+    fanValuesUnavailable,
+    fanValuesAlreadyFresh,
+    fanValuesFailed,
+    fanValuesOutstanding,
+    fanValueFreshnessStatus,
+    fanValueFreshnessCutoffAt: coverageMatches ? iso(collectionState.fanValueFreshnessCutoffAt) : null,
+    campaignFrontierFreshnessStatus,
+    campaignFrontierDue,
+    campaignFrontierTarget,
+    campaignFrontierCompleted,
+    campaignFrontierDeferred,
+    campaignFrontierOldestDueAt: iso(collectionState?.campaignFrontierOldestDueAt),
+    campaignFrontierNextDueAt: iso(collectionState?.campaignFrontierNextDueAt),
+    campaignMembershipCoverageStatus: clean(collectionState?.membershipCoverageStatus, 40) || "MISSING",
+    campaignDirectoryDiscoveryStatus: directoryDiscovery.status,
+    campaignDirectoryDiscoveryDueAt: iso(directoryDiscovery.dueAt),
+    campaignDirectoryVerifiedAt: iso(directoryDiscovery.verifiedAt),
+    campaignDirectoryDiscoveryOverdueByMs: directoryDiscovery.overdueByMs,
+    campaignDirectoryDiscoveryPending: directoryDiscovery.pendingDemand,
+    campaignDirectoryDiscoveryEstimatedProviderCalls: directoryDiscovery.estimatedProviderCalls,
+    campaignDirectoryDiscoveryTargetMs: directoryDiscovery.targetMs,
+    fanValuesComplete: coverageMatches
+      ? fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"
+      : fanRefreshDelegated ? false : result.fanValuesComplete === true,
+    fanRefreshDelegated,
     startedAt: iso(job?.startedAt || job?.scheduledAt),
     completedAt: iso(job?.completedAt),
     lastProgressAt: iso(job?.lastProgressAt),
@@ -264,6 +342,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
       ofValuePayingFans: integer(totals.ofValuePayingFans, 0, 100_000_000),
       platformReportedFanSpendCents: Number(totals.platformReportedFanSpendCents || 0),
       ofValueFetchedAt: iso(totals.ofValueFetchedAt),
+      ofValueFreshnessCutoffAt: iso(totals.ofValueFreshnessCutoffAt),
     },
     campaigns: campaignRows,
     pagination: page.pagination,

@@ -20,6 +20,15 @@ const NOTIFICATION_COLLECTION_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANAL
 const FINANCIAL_COLLECTION_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANALYTICS_FINANCIAL_CATCHUP_MS, 24 * 60 * 60 * 1000);
 const CAMPAIGN_COLLECTION_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANALYTICS_CAMPAIGN_CATCHUP_MS, 60 * 60 * 1000);
 const CAMPAIGN_FAN_VALUE_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANALYTICS_CAMPAIGN_FAN_VALUE_FRESHNESS_MS, 6 * 60 * 60 * 1000);
+const CAMPAIGN_ACTIVE_FRONTIER_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANALYTICS_CAMPAIGN_ACTIVE_FRONTIER_FRESHNESS_MS, 6 * 60 * 60 * 1000);
+const CAMPAIGN_INACTIVE_FRONTIER_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANALYTICS_CAMPAIGN_INACTIVE_FRONTIER_FRESHNESS_MS, 72 * 60 * 60 * 1000);
+// A14: this is an operational discovery target/deadline, not a throughput
+// guarantee. The physical provider gate may make the target infeasible under
+// fleet-wide saturation; read models expose DUE/OVERDUE honestly in that case.
+const CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS = positiveMs(process.env.CREATOR_ANALYTICS_CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS, 72 * 60 * 60 * 1000);
+// Compatibility alias for existing scheduling/ledger call sites. Do not infer
+// a guaranteed SLA from this legacy constant name.
+const CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS = CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS;
 
 function trustedCollectionTimestamp(value, now = new Date()) {
   if (!value) return null;
@@ -48,6 +57,10 @@ module.exports = {
   FINANCIAL_COLLECTION_FRESHNESS_MS,
   CAMPAIGN_COLLECTION_FRESHNESS_MS,
   CAMPAIGN_FAN_VALUE_FRESHNESS_MS,
+  CAMPAIGN_ACTIVE_FRONTIER_FRESHNESS_MS,
+  CAMPAIGN_INACTIVE_FRONTIER_FRESHNESS_MS,
+  CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS,
+  CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS,
   trustedCollectionTimestamp,
   earningsFreshnessLimitMs,
 };

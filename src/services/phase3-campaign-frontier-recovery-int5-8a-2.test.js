@@ -30,7 +30,7 @@ test("INT5.8A-2 schema and migration add generation-bound staged Campaign fronti
 test("INT5.8A-2 page-1 hash is staged and canonical frontier publishes only after a proven Campaign boundary", () => {
   const ledger = read("src/services/creator-analytics-ledger-service.js");
   const claimerTail = sliceBetween(ledger, "const claimerPageNumber = integer(payload.pageNumber", "// Campaign attribution is historical");
-  assert.match(claimerTail, /campaignComplete = \(payload\.campaignComplete === true \|\| serverDeepBoundaryReached\) && rejected === 0/);
+  assert.match(claimerTail, /campaignComplete = orderIndependentTraversal[\s\S]*payload\.sourceHasMore !== true && payload\.campaignComplete === true && rejected === 0/);
   assert.match(claimerTail, /firstPageFrontierFanIds = claimerPageNumber === 1 && rejected === 0/);
   assert.match(claimerTail, /firstPageFrontierHash = firstPageFrontierFanIds/);
   assert.match(claimerTail, /stagedCatchupFrontierRunId === scanRunId/);
@@ -43,22 +43,19 @@ test("INT5.8A-2 page-1 hash is staged and canonical frontier publishes only afte
   assert.doesNotMatch(stageBranch, /catchupFrontierHash:/, "an incomplete page-1 observation must never publish the canonical frontier");
 });
 
-test("INT5.8A-2 planner only consumes the published canonical frontier, never an unfinished staged frontier", () => {
+test("INT5.8A-2 current planner no longer consumes canonical frontier as ordering-dependent skip authority", () => {
   const orchestrator = read("src/services/creator-analytics-sync-orchestrator.js");
-  const start = orchestrator.indexOf("async function campaignCatchupState");
-  const end = orchestrator.indexOf("\nfunction retryDisposition", start);
-  assert.ok(start >= 0 && end > start);
-  const planner = orchestrator.slice(start, end);
-  assert.match(planner, /select: \{ externalCampaignId: true, catchupFrontierHash: true \}/);
-  assert.doesNotMatch(planner, /stagedCatchupFrontier/);
+  assert.doesNotMatch(orchestrator, /async function campaignCatchupState/);
+  const schedulingStart = orchestrator.indexOf('if (campaignDelegatedRefreshPending(campaignState))');
+  const schedulingEnd = orchestrator.indexOf('return { ready: true, initial, created, skipped };', schedulingStart);
+  const scheduling = orchestrator.slice(schedulingStart, schedulingEnd);
+  assert.doesNotMatch(scheduling, /knownClaimerFrontierHashes|stagedCatchupFrontier/);
+  assert.match(scheduling, /campaignOrderIndependentTraversalVersion: 1/);
 });
 
-test("INT5.8A-2 manual Campaign reader converges on v8 fanValuesDiscovered with explicit v7 queue fallback", () => {
+test("INT5.8A-2 manual Campaign reader converges on server-owned freshness coverage with legacy result/continuation fallback", () => {
   const control = read("src/services/campaign-scan-control-service.js");
-  const line = control.split("\n").find((value) => value.includes("fanValuesTotal:"));
-  assert.ok(line);
-  const resultAt = line.indexOf("result.fanValuesTotal");
-  const v8At = line.indexOf("continuation.fanValuesDiscovered");
-  const v7At = line.indexOf("continuation.fanValueQueue");
-  assert.ok(resultAt >= 0 && v8At > resultAt && v7At > v8At, `unexpected reader precedence: ${line}`);
+  assert.match(control, /const coverageMatches = Boolean\(resultScanRunId && collectionState\?\.fanValueCoverageScanRunId === resultScanRunId\)/);
+  assert.match(control, /const fanValuesExpected = coverageMatches \? integer\(collectionState\.fanValueExpected[\s\S]*?: integer\(result\.fanValuesTotal \?\? continuation\.fanValuesDiscovered/);
+  assert.match(control, /fanValuesComplete: coverageMatches[\s\S]*fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"[\s\S]*: fanRefreshDelegated \? false : result\.fanValuesComplete === true/);
 });

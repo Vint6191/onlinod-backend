@@ -50,13 +50,13 @@ delete require.cache[orchestratorPath];
 const {
   ensureInitialCreatorAnalyticsSync,
   ensureRecurringCreatorAnalyticsCatchups,
-  campaignCatchupState,
   advanceCreatorAnalyticsInitialSyncAfterCompletion,
 } = require("./creator-analytics-sync-orchestrator");
 
 function dbFixture({
   financialReady = false, campaignReady = false, active = [], financialCatchupAt = null, campaignCatchupAt = null,
   financialStatus = "COMPLETE", campaignStatus = "COMPLETE", financialRetryAfterAt = null, campaignRetryAfterAt = null,
+  campaignMembershipStatus = "COMPLETE", campaignFanFreshnessStatus = "COMPLETE", campaignFanOutstanding = 0, campaignSourceJobId = null,
 } = {}) {
   return {
     jobInstance: {
@@ -93,6 +93,10 @@ function dbFixture({
           baselineGeneration: "campaign-baseline-generation",
           lastCatchupCompletedAt: campaignCatchupAt,
           retryAfterAt: campaignRetryAfterAt,
+          membershipCoverageStatus: campaignMembershipStatus,
+          fanValueFreshnessStatus: campaignFanFreshnessStatus,
+          fanValueOutstanding: campaignFanOutstanding,
+          sourceJobId: campaignSourceJobId,
         } : null;
       },
     },
@@ -247,30 +251,11 @@ test("completed history preserves only an explicitly forced FULL rebuild", async
   assert.equal(active[0].status, "CLAIMED");
 });
 
-test("campaign catch-up reads only bounded compact campaign frontier hashes", async () => {
-  let query = null;
-  const hashA = "a".repeat(64);
-  const hashB = "b".repeat(64);
-  const db = {
-    creatorCampaign: {
-      async findMany(args) {
-        query = args;
-        return [
-          { externalCampaignId: "campaign-a", catchupFrontierHash: hashA },
-          { externalCampaignId: "campaign-b", catchupFrontierHash: hashB },
-          { externalCampaignId: "campaign-c", catchupFrontierHash: null },
-        ];
-      },
-    },
-  };
-  const state = await campaignCatchupState(db, "creator-1");
-  assert.deepEqual(query, {
-    where: { creatorId: "creator-1" },
-    orderBy: [{ collectedAt: "desc" }],
-    take: 2_000,
-    select: { externalCampaignId: true, catchupFrontierHash: true },
-  });
-  assert.deepEqual(state.knownClaimerFrontierHashes, { "campaign-a": hashA, "campaign-b": hashB });
+test("current Campaign catch-up scheduler publishes no provider-order frontier hints", async () => {
+  const source = require("node:fs").readFileSync(require.resolve("./creator-analytics-sync-orchestrator"), "utf8");
+  assert.doesNotMatch(source, /function campaignCatchupState/);
+  assert.doesNotMatch(source, /knownClaimerFrontierHashes/);
+  assert.doesNotMatch(source, /catchupFrontierHash/);
 });
 
 test("recurring analytics uses fixed head catch-ups only after initial history is ready", async () => {
@@ -314,7 +299,8 @@ test("recurring analytics uses fixed head catch-ups only after initial history i
   assert.ok(campaigns.collectionGeneration);
   assert.equal(Object.prototype.hasOwnProperty.call(campaigns, "knownCampaignFanCounts"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(campaigns, "knownClaimersByCampaign"), false);
-  assert.deepEqual(campaigns.knownClaimerFrontierHashes, { "campaign-a": "a".repeat(64) });
+  assert.equal(Object.prototype.hasOwnProperty.call(campaigns, "knownClaimerFrontierHashes"), false);
+  assert.equal(campaigns.campaignOrderIndependentTraversalVersion, 1);
   assert.equal(JSON.stringify(campaigns).includes("HOT"), false);
   assert.equal(JSON.stringify(campaigns).includes("WARM"), false);
   assert.equal(JSON.stringify(campaigns).includes("COLD"), false);
@@ -600,4 +586,86 @@ test("collector planning reloads durable state under the collector lock before d
     collectionType: "FINANCIAL",
     collectionMode: "full",
   });
+});
+
+
+test("pending delegated Campaign FanData refresh never schedules a second provider traversal", async () => {
+  const now = new Date("2026-08-09T12:00:00.000Z");
+  notificationState = { fullBackfillVerifiedAt: new Date("2026-08-09T10:00:00.000Z"), lastCatchupVerifiedAt: now };
+  const db = dbFixture({ financialReady: true, campaignReady: false, financialCatchupAt: now });
+  db.creatorCampaignCollectionState.findUnique = async () => ({
+    status: "PARTIAL",
+    baselineVerifiedAt: null,
+    baselineGeneration: null,
+    lastCatchupCompletedAt: null,
+    activeGeneration: "campaign-membership-generation",
+    membershipCoverageStatus: "PARTIAL",
+    fanValueCoverageScanRunId: "campaign-membership-generation",
+    fanValueFreshnessStatus: "QUEUED",
+    fanValueExpected: 17,
+    fanValueOutstanding: 17,
+    sourceJobId: "campaign-membership-job",
+  });
+
+  let result = await ensureInitialCreatorAnalyticsSync({ db, creatorId: "creator-1", agencyId: "agency-1", now });
+  assert.equal(result.ready, false);
+  assert.equal(result.stage, "campaigns");
+  assert.equal(result.reason, "fan_refresh_pending");
+  assert.equal(result.jobId, "campaign-membership-job");
+  assert.equal(scheduled.filter((row) => row.jobKey === "fetch_campaigns").length, 0);
+
+  // Pretend the baseline proof exists but the latest catch-up FanData queue is
+  // still draining. Recurring planning must also wait rather than re-read OF.
+  db.creatorCampaignCollectionState.findUnique = async () => ({
+    status: "PARTIAL",
+    baselineVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
+    baselineGeneration: "campaign-baseline-generation",
+    lastCatchupCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
+    activeGeneration: "campaign-catchup-generation",
+    membershipCoverageStatus: "PARTIAL",
+    fanValueCoverageScanRunId: "campaign-catchup-generation",
+    fanValueFreshnessStatus: "QUEUED",
+    fanValueExpected: 17,
+    fanValueOutstanding: 17,
+    sourceJobId: "campaign-catchup-job",
+  });
+  scheduled = [];
+  result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
+  assert.ok(result.skipped.includes("campaigns_catchup:fan_refresh_pending"));
+  assert.equal(scheduled.filter((row) => row.jobKey === "fetch_campaigns").length, 0);
+
+  // A terminal refresh failure is still unsettled freshness. Never hide it by
+  // starting a new Campaign generation and resetting run-level coverage.
+  db.creatorCampaignCollectionState.findUnique = async () => ({
+    status: "PARTIAL", baselineVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
+    baselineGeneration: "campaign-baseline-generation", lastCatchupCompletedAt: null,
+    activeGeneration: "campaign-failed-generation", membershipCoverageStatus: "PARTIAL",
+    fanValueCoverageScanRunId: "campaign-failed-generation", fanValueFreshnessStatus: "PARTIAL",
+    fanValueExpected: 3, fanValueFailed: 3, fanValueOutstanding: 0, sourceJobId: "campaign-failed-job",
+  });
+  scheduled = [];
+  result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
+  assert.ok(result.skipped.includes("campaigns_catchup:fan_refresh_pending"));
+  assert.equal(scheduled.filter((row) => row.jobKey === "fetch_campaigns").length, 0);
+});
+
+test("initial pipeline does not immediately reschedule Campaign provider reads after membership succeeds but FanData is pending", async () => {
+  const db = dbFixture({ financialReady: true, campaignReady: false });
+  const job = {
+    id: "campaign-initial",
+    jobKey: "fetch_campaigns",
+    creatorId: "creator-1",
+    agencyId: "agency-1",
+    params: { analyticsSyncKind: "initial", analyticsSyncVersion: 1, analyticsSyncStage: "campaigns" },
+  };
+  scheduled = [];
+  const result = await advanceCreatorAnalyticsInitialSyncAfterCompletion({
+    db,
+    job,
+    sideEffect: { ok: true, completion: { providerTraversalComplete: true, complete: false } },
+    now: new Date("2026-08-09T12:00:00.000Z"),
+  });
+  assert.equal(result.advanced, false);
+  assert.equal(result.reason, "campaign_fan_refresh_pending");
+  assert.equal(scheduled.filter((row) => row.jobKey === "fetch_campaigns").length, 0);
 });

@@ -5,6 +5,20 @@ const prisma = require("../prisma");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { capabilityFreshnessWindow } = require("./capability-freshness-authority-service");
+const {
+  PROVIDER_GATE_PERMIT_TTL_MS,
+  PROVIDER_GATE_WAITER_LEASE_MS,
+  PROVIDER_GATE_WAITER_HEARTBEAT_MS,
+  PROVIDER_GATE_FAIRNESS_GENERATION,
+  readProviderGateFairnessAuthority,
+  tryAcquireLegacyCompatibleProviderPermit,
+  registerDurableProviderWaiter,
+  heartbeatDurableProviderWaiters,
+  cancelDurableProviderWaiter,
+  tryAcquireDurableProviderPermit,
+  acknowledgeDurableProviderStarted,
+  cancelDurableProviderPermit,
+} = require("./provider-request-credit-authority-service");
 
 // GLOBAL CREATOR REQUEST GATE
 // ---------------------------
@@ -15,19 +29,23 @@ const { capabilityFreshnessWindow } = require("./capability-freshness-authority-
 // one). The next permit is therefore blocked until the previous Desktop says
 // that transport was actually started, and then for another 700ms.
 //
-// CURRENT LOW-COST DEPLOYMENT:
-// Render runs one backend process, so queue state lives in memory and creates no
-// per-request PostgreSQL writes. This avoids recreating the Neon resource issue.
+// CURRENT DISTRIBUTED AUTHORITY:
+// PostgreSQL always owns the physical two-phase singleton permit. A14 rolls the
+// cross-replica waiter ordering in explicitly: DRAINING is legacy-compatible so
+// an A12 binary can finish a mixed deployment without transient acquire errors;
+// QUIESCING stops new A14 starts while legacy traffic drains; ACTIVE enables the
+// starvation-resistant PostgreSQL waiter/ticket authority. Local memory is only
+// a wake/poll optimization and never owns the physical 700ms chronology.
+// Non-sticky /started or /cancel requests remain safe in every rollout state.
 //
-// FUTURE SERVER/DISTRIBUTED MIGRATION FOUNDATION:
-// Keep this API boundary. If ONLINOD later runs several backend instances or
-// server-side OF workers, replace only the state adapter with Redis/a dedicated
-// coordinator. Never add an independent per-device limiter.
+// A future Redis/dedicated coordinator may replace the durable state adapter,
+// but it must preserve the same single permit authority and fail-safe unknown-
+// outcome expiry semantics. Never add an independent per-device limiter.
 const DEFAULT_INTERVAL_MS = 700;
 const MAX_WAIT_MS = 60_000;
-const PERMIT_TTL_MS = 15_000;
+const PERMIT_TTL_MS = PROVIDER_GATE_PERMIT_TTL_MS;
+const BACKEND_INSTANCE_ID = cleanInstanceId(process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME) || `backend-${crypto.randomUUID()}`;
 const ACCESS_CACHE_TTL_MS = 60_000;
-const LANE_IDLE_TTL_MS = 5 * 60_000;
 const PRIORITIES = ["critical_write", "interactive", "realtime", "normal", "background"];
 const PRIORITY_CYCLE = [
   "critical_write", "critical_write", "critical_write",
@@ -37,9 +55,37 @@ const PRIORITY_CYCLE = [
   "background",
 ];
 
-const lanes = new Map();
 const accessCache = new Map();
 
+// One local coordinator only wakes local HTTP waiters; PostgreSQL owns global waiter order and every physical permit in production.
+// The previous implementation had one 700ms clock per creator, which allowed
+// many creators to start provider requests simultaneously. That made the
+// advertised "global" gate and all fleet-capacity math false. Keep creator
+// identity only as a fairness dimension inside each priority bucket; never as
+// an independent physical clock.
+const coordinator = {
+  buckets: new Map(PRIORITIES.map((priority) => [priority, { byCreator: new Map(), order: [], cursor: 0, lastServedKey: null }])),
+  priorityCursor: 0,
+  running: false,
+  activePermit: null,
+  nextAllowedAt: 0,
+  revision: 0,
+  lastGrantedAt: 0,
+  lastStartedAt: 0,
+  lastDeviceId: null,
+  lastCreatorId: null,
+  durableSelectedWaiterId: null,
+  waiterHeartbeatTimer: null,
+  runningEntryId: null,
+  runningWaiterRegistered: false,
+  fairnessActivationState: "DRAINING",
+  fairnessGeneration: PROVIDER_GATE_FAIRNESS_GENERATION,
+};
+
+function cleanInstanceId(value) {
+  const text = String(value ?? "").trim();
+  return text ? text.slice(0, 180) : null;
+}
 function clean(value, max = 240) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : "";
@@ -48,51 +94,96 @@ function clampInt(value, fallback, min, max) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.max(min, Math.min(max, Math.floor(parsed))) : fallback;
 }
-function laneKey(agencyId, creatorId) { return `${agencyId}:${creatorId}`; }
-function getLane(agencyId, creatorId) {
-  const key = laneKey(agencyId, creatorId);
-  let lane = lanes.get(key);
-  if (lane) {
-    if (lane.cleanupTimer) {
-      clearTimeout(lane.cleanupTimer);
-      lane.cleanupTimer = null;
-    }
-    return lane;
-  }
-  lane = {
-    key,
-    agencyId,
-    creatorId,
-    queues: new Map(PRIORITIES.map((priority) => [priority, []])),
-    cursor: 0,
-    running: false,
-    activePermit: null,
-    nextAllowedAt: 0,
-    revision: 0,
-    lastGrantedAt: 0,
-    lastStartedAt: 0,
-    lastDeviceId: null,
-    cleanupTimer: null,
-  };
-  lanes.set(key, lane);
-  return lane;
+function providerWaiterCategory({ priority, operation, source }) {
+  if (priority !== "background") return "default";
+  const op = clean(operation, 160);
+  const src = clean(source, 240);
+  if (op === "campaigns.list") return "campaign_directory";
+  if (op === "campaigns.claimers") return "campaign_frontier";
+  if (op === "users.profile" && src.startsWith("backend.readonly.fan_data_point_refresh")) return "fan_data";
+  return "background_other";
 }
-function queueLength(lane) {
+function creatorQueueKey(agencyId, creatorId) { return `${agencyId}:${creatorId}`; }
+function bucketFor(priority) { return coordinator.buckets.get(priority); }
+function enqueue(entry) {
+  const bucket = bucketFor(entry.priority);
+  const key = creatorQueueKey(entry.agencyId, entry.creatorId);
+  let queue = bucket.byCreator.get(key);
+  if (!queue) {
+    queue = [];
+    bucket.byCreator.set(key, queue);
+    bucket.order.push(key);
+  }
+  queue.push(entry);
+}
+function dropEmptyCreator(bucket, index, key) {
+  bucket.byCreator.delete(key);
+  bucket.order.splice(index, 1);
+  bucket.cursor = bucket.order.length ? index % bucket.order.length : 0;
+}
+function takeFromPriority(priority) {
+  const bucket = bucketFor(priority);
+  let remaining = bucket.order.length;
+  if (bucket.lastServedKey && bucket.order.length > 1) {
+    const lastIndex = bucket.order.indexOf(bucket.lastServedKey);
+    if (lastIndex >= 0) bucket.cursor = (lastIndex + 1) % bucket.order.length;
+  }
+  while (remaining > 0 && bucket.order.length) {
+    remaining -= 1;
+    const index = bucket.cursor % bucket.order.length;
+    const key = bucket.order[index];
+    const queue = bucket.byCreator.get(key) || [];
+    while (queue.length && queue[0].cancelled) queue.shift();
+    if (!queue.length) {
+      dropEmptyCreator(bucket, index, key);
+      continue;
+    }
+    const entry = queue.shift();
+    bucket.lastServedKey = key;
+    if (!queue.length) dropEmptyCreator(bucket, index, key);
+    else bucket.cursor = (index + 1) % bucket.order.length;
+    return entry;
+  }
+  return null;
+}
+function queueLength() {
   let total = 0;
-  for (const queue of lane.queues.values()) total += queue.length;
+  for (const bucket of coordinator.buckets.values()) {
+    for (const queue of bucket.byCreator.values()) total += queue.filter((entry) => !entry.cancelled).length;
+  }
   return total;
 }
-function takeNext(lane) {
+function takeSpecific(waiterId) {
+  const target = clean(waiterId, 200);
+  if (!target) return null;
+  for (const bucket of coordinator.buckets.values()) {
+    for (let orderIndex = 0; orderIndex < bucket.order.length; orderIndex += 1) {
+      const key = bucket.order[orderIndex];
+      const queue = bucket.byCreator.get(key) || [];
+      const index = queue.findIndex((entry) => !entry.cancelled && entry.id === target);
+      if (index < 0) continue;
+      const [entry] = queue.splice(index, 1);
+      if (!queue.length) dropEmptyCreator(bucket, orderIndex, key);
+      return entry || null;
+    }
+  }
+  return null;
+}
+function takeNext() {
+  if (coordinator.durableSelectedWaiterId) {
+    const selected = takeSpecific(coordinator.durableSelectedWaiterId);
+    if (selected) {
+      coordinator.durableSelectedWaiterId = null;
+      return selected;
+    }
+  }
   for (let step = 0; step < PRIORITY_CYCLE.length; step += 1) {
-    const index = (lane.cursor + step) % PRIORITY_CYCLE.length;
+    const index = (coordinator.priorityCursor + step) % PRIORITY_CYCLE.length;
     const priority = PRIORITY_CYCLE[index];
-    const queue = lane.queues.get(priority);
-    while (queue?.length) {
-      const entry = queue.shift();
-      if (!entry.cancelled) {
-        lane.cursor = (index + 1) % PRIORITY_CYCLE.length;
-        return entry;
-      }
+    const entry = takeFromPriority(priority);
+    if (entry) {
+      coordinator.priorityCursor = (index + 1) % PRIORITY_CYCLE.length;
+      return entry;
     }
   }
   return null;
@@ -103,6 +194,44 @@ function pruneAccessCache(now = Date.now()) {
   for (const [key, value] of accessCache) if (value.expiresAt <= now) accessCache.delete(key);
   while (accessCache.size > 2_000) accessCache.delete(accessCache.keys().next().value);
 }
+
+function durableGateAvailable() {
+  return typeof prisma?.$transaction === "function" && typeof prisma?.$queryRawUnsafe === "function";
+}
+function liveLocalWaiterIds() {
+  const ids = new Set();
+  if (coordinator.runningEntryId && coordinator.runningWaiterRegistered) ids.add(coordinator.runningEntryId);
+  for (const bucket of coordinator.buckets.values()) {
+    for (const queue of bucket.byCreator.values()) {
+      for (const entry of queue) if (entry.waiterRegistered === true && !entry.cancelled && !entry.settled) ids.add(entry.id);
+    }
+  }
+  return [...ids];
+}
+function stopWaiterHeartbeatIfIdle() {
+  if (!coordinator.waiterHeartbeatTimer) return;
+  if (queueLength() > 0 || coordinator.running) return;
+  clearInterval(coordinator.waiterHeartbeatTimer);
+  coordinator.waiterHeartbeatTimer = null;
+}
+function ensureWaiterHeartbeat() {
+  if (!durableGateAvailable() || coordinator.waiterHeartbeatTimer) return;
+  coordinator.waiterHeartbeatTimer = setInterval(() => {
+    const waiterIds = liveLocalWaiterIds();
+    if (!waiterIds.length) {
+      stopWaiterHeartbeatIfIdle();
+      return;
+    }
+    void heartbeatDurableProviderWaiters({
+      db: prisma,
+      ownerInstanceId: BACKEND_INSTANCE_ID,
+      waiterIds,
+      waiterTtlMs: PROVIDER_GATE_WAITER_LEASE_MS,
+    }).catch(() => null);
+  }, PROVIDER_GATE_WAITER_HEARTBEAT_MS);
+  coordinator.waiterHeartbeatTimer.unref?.();
+}
+
 
 async function requireGateAccess({ userId, agencyId, member, deviceId, creatorId, capability = "read" }) {
   // Access is server-authoritative and intentionally checked on every request.
@@ -188,81 +317,165 @@ function waitUntil(targetMs, signal) {
   });
 }
 
-function scheduleLaneCleanup(lane) {
-  if (lane.cleanupTimer || lane.running || lane.activePermit || queueLength(lane) > 0) return;
-  const delay = Math.max(
-    DEFAULT_INTERVAL_MS,
-    Math.min(LANE_IDLE_TTL_MS, Math.max(0, lane.nextAllowedAt - Date.now()) + DEFAULT_INTERVAL_MS),
-  );
-  lane.cleanupTimer = setTimeout(() => {
-    lane.cleanupTimer = null;
-    if (!lane.running && !lane.activePermit && queueLength(lane) === 0 && Date.now() >= lane.nextAllowedAt) {
-      lanes.delete(lane.key);
-    } else {
-      scheduleLaneCleanup(lane);
-    }
-  }, delay);
-  lane.cleanupTimer.unref?.();
-}
-
-function clearActivePermit(lane, permit) {
+function clearActivePermit(permit) {
   if (permit?.expiryTimer) clearTimeout(permit.expiryTimer);
-  if (lane.activePermit?.id === permit?.id) lane.activePermit = null;
+  if (coordinator.activePermit?.id === permit?.id) coordinator.activePermit = null;
 }
 
-function expirePermit(lane, permit) {
-  if (lane.activePermit?.id !== permit.id) return;
-  clearActivePermit(lane, permit);
+function expirePermit(permit) {
+  if (coordinator.activePermit?.id !== permit.id) return;
+  clearActivePermit(permit);
   // The client may have started transport but lost the acknowledgement. Wait an
-  // extra interval before granting another permit; this fails safe, not fast.
-  lane.nextAllowedAt = Math.max(lane.nextAllowedAt, Date.now() + permit.intervalMs);
-  lane.revision += 1;
-  setImmediate(() => pump(lane));
+  // extra global interval before granting another permit; this fails safe.
+  coordinator.nextAllowedAt = Math.max(coordinator.nextAllowedAt, Date.now() + permit.intervalMs);
+  coordinator.revision += 1;
+  setImmediate(pump);
 }
 
-function pump(lane) {
-  if (lane.running || lane.activePermit) return;
-  const entry = takeNext(lane);
-  if (!entry) {
-    scheduleLaneCleanup(lane);
-    return;
-  }
-  lane.running = true;
+function pump() {
+  const durable = durableGateAvailable();
+  if (coordinator.running || (!durable && coordinator.activePermit)) return;
+  const entry = takeNext();
+  if (!entry) return;
+  coordinator.running = true;
+  coordinator.runningEntryId = entry.id;
+  let durableRetryAtMs = 0;
   void (async () => {
     try {
-      await waitUntil(Math.max(Date.now(), lane.nextAllowedAt || 0), entry.signal);
-      if (entry.cancelled) return;
-      const permit = {
-        id: crypto.randomUUID(),
-        deviceId: entry.deviceId,
-        priority: entry.priority,
-        operation: entry.operation,
-        source: entry.source,
-        capability: entry.capability,
-        intervalMs: entry.intervalMs,
-        grantedAt: Date.now(),
-        expiryTimer: null,
-      };
-      permit.expiryTimer = setTimeout(() => expirePermit(lane, permit), PERMIT_TTL_MS);
-      permit.expiryTimer.unref?.();
-      lane.activePermit = permit;
-      lane.lastGrantedAt = permit.grantedAt;
-      lane.lastDeviceId = entry.deviceId;
-      lane.revision += 1;
+      let permit;
+      if (durable) {
+        coordinator.durableSelectedWaiterId = null;
+        if (entry.cancelled || entry.signal?.aborted) {
+          const error = new Error("Global OF gate request was cancelled");
+          error.code = "OF_GATE_CANCELLED";
+          throw error;
+        }
+        const fairness = await readProviderGateFairnessAuthority({ db: prisma });
+        coordinator.fairnessActivationState = fairness.activationState;
+        coordinator.fairnessGeneration = fairness.generation || PROVIDER_GATE_FAIRNESS_GENERATION;
+        let admission;
+        const permitId = entry.id;
+        if (fairness.activationState === "ACTIVE") {
+          if (entry.waiterRegistered !== true) {
+            await registerDurableProviderWaiter({
+              db: prisma, waiterId: entry.id, ownerInstanceId: BACKEND_INSTANCE_ID,
+              agencyId: entry.agencyId, creatorId: entry.creatorId, deviceId: entry.deviceId,
+              capability: entry.capability, priority: entry.priority,
+              category: providerWaiterCategory({ priority: entry.priority, operation: entry.operation, source: entry.source }),
+              operation: entry.operation, source: entry.source, waiterTtlMs: PROVIDER_GATE_WAITER_LEASE_MS,
+            });
+            entry.waiterRegistered = true;
+            coordinator.runningWaiterRegistered = true;
+            ensureWaiterHeartbeat();
+          }
+          admission = await tryAcquireDurableProviderPermit({
+            db: prisma, waiterId: entry.id, permitId, ownerInstanceId: BACKEND_INSTANCE_ID,
+            agencyId: entry.agencyId, creatorId: entry.creatorId, deviceId: entry.deviceId,
+            capability: entry.capability, intervalMs: entry.intervalMs, permitTtlMs: PERMIT_TTL_MS,
+          });
+        } else if (fairness.activationState === "QUIESCING") {
+          admission = { granted: false, reason: "fairness_quiescing", retryAt: new Date(Date.now() + 250) };
+        } else {
+          admission = await tryAcquireLegacyCompatibleProviderPermit({
+            db: prisma, permitId, ownerInstanceId: BACKEND_INSTANCE_ID, agencyId: entry.agencyId,
+            creatorId: entry.creatorId, deviceId: entry.deviceId, capability: entry.capability,
+            intervalMs: entry.intervalMs, permitTtlMs: PERMIT_TTL_MS,
+          });
+        }
+        if (!admission.granted) {
+          if (admission.reason === "waiter_missing") {
+            entry.waiterRegistered = false;
+            coordinator.runningWaiterRegistered = false;
+            const error = new Error("Durable OF provider waiter expired or was removed before grant");
+            error.code = "OF_GATE_WAITER_EXPIRED";
+            error.status = 503;
+            throw error;
+          }
+          if (admission.selectedWaiterId) coordinator.durableSelectedWaiterId = admission.selectedWaiterId;
+          if (!entry.cancelled) enqueue(entry);
+          durableRetryAtMs = admission.retryAt instanceof Date ? admission.retryAt.getTime() : Date.now() + 250;
+          return;
+        }
+        entry.waiterRegistered = false;
+        coordinator.runningWaiterRegistered = false;
+        if (entry.cancelled || entry.signal?.aborted) {
+          await cancelDurableProviderPermit({
+            db: prisma, permitId, agencyId: entry.agencyId, creatorId: entry.creatorId,
+            deviceId: entry.deviceId, capability: entry.capability,
+          }).catch(() => null);
+          const error = new Error("Global OF gate request was cancelled after durable grant");
+          error.code = "OF_GATE_CANCELLED";
+          throw error;
+        }
+        permit = {
+          id: permitId,
+          agencyId: entry.agencyId,
+          creatorId: entry.creatorId,
+          deviceId: entry.deviceId,
+          priority: entry.priority,
+          operation: entry.operation,
+          source: entry.source,
+          capability: entry.capability,
+          intervalMs: admission.intervalMs,
+          grantedAt: admission.grantedAt.getTime(),
+          expiresAt: admission.expiresAt.getTime(),
+          expiryTimer: null,
+          durable: true,
+        };
+        // Informational local cleanup only. PostgreSQL remains the permit owner;
+        // this timer never advances spacing or grants work.
+        permit.expiryTimer = setTimeout(() => {
+          if (coordinator.activePermit?.id === permit.id) clearActivePermit(permit);
+        }, Math.max(0, permit.expiresAt - Date.now()) + 50);
+        permit.expiryTimer.unref?.();
+      } else {
+        await waitUntil(Math.max(Date.now(), coordinator.nextAllowedAt || 0), entry.signal);
+        if (entry.cancelled) return;
+        permit = {
+          id: crypto.randomUUID(),
+          agencyId: entry.agencyId,
+          creatorId: entry.creatorId,
+          deviceId: entry.deviceId,
+          priority: entry.priority,
+          operation: entry.operation,
+          source: entry.source,
+          capability: entry.capability,
+          intervalMs: entry.intervalMs,
+          grantedAt: Date.now(),
+          expiresAt: Date.now() + PERMIT_TTL_MS,
+          expiryTimer: null,
+          durable: false,
+        };
+        permit.expiryTimer = setTimeout(() => expirePermit(permit), PERMIT_TTL_MS);
+        permit.expiryTimer.unref?.();
+      }
+      coordinator.activePermit = permit;
+      coordinator.lastGrantedAt = permit.grantedAt;
+      coordinator.lastDeviceId = entry.deviceId;
+      coordinator.lastCreatorId = entry.creatorId;
+      coordinator.revision += 1;
       entry.resolve({
         permitId: permit.id,
         grantedAt: new Date(permit.grantedAt).toISOString(),
-        expiresAt: new Date(permit.grantedAt + PERMIT_TTL_MS).toISOString(),
-        revision: lane.revision,
-        intervalMs: entry.intervalMs,
+        expiresAt: new Date(permit.expiresAt).toISOString(),
+        revision: coordinator.revision,
+        intervalMs: permit.intervalMs,
         capability: entry.capability,
         queueWaitMs: Math.max(0, Date.now() - entry.enqueuedAt),
       });
     } catch (error) {
       entry.reject(error);
     } finally {
-      lane.running = false;
-      if (!lane.activePermit) setImmediate(() => pump(lane));
+      coordinator.running = false;
+      coordinator.runningEntryId = null;
+      coordinator.runningWaiterRegistered = false;
+      stopWaiterHeartbeatIfIdle();
+      if (durableRetryAtMs > 0) {
+        const delay = Math.max(0, durableRetryAtMs - Date.now());
+        setTimeout(pump, delay);
+      } else if (durable || !coordinator.activePermit) {
+        setImmediate(pump);
+      }
     }
   })();
 }
@@ -288,17 +501,22 @@ async function acquireOfRequestSlot(input) {
     creatorId,
     capability: input.capability,
   });
-  const lane = getLane(access.agencyId, creatorId);
-
+  const entryId = crypto.randomUUID();
+  const capability = ["security_probe", "read", "write"].includes(input.capability) ? input.capability : "read";
+  const operation = clean(input.operation, 160) || "unknown";
+  const source = clean(input.source, 240) || null;
   return new Promise((resolve, reject) => {
     const entry = {
-      id: crypto.randomUUID(),
+      id: entryId,
+      agencyId: access.agencyId,
+      creatorId,
       deviceId: access.deviceId,
       priority,
-      operation: clean(input.operation, 160) || "unknown",
-      source: clean(input.source, 240) || null,
-      capability: ["security_probe", "read", "write"].includes(input.capability) ? input.capability : "read",
+      operation,
+      source,
+      capability,
       intervalMs,
+      waiterRegistered: false,
       enqueuedAt: Date.now(),
       signal: input.signal || null,
       cancelled: false,
@@ -313,6 +531,10 @@ async function acquireOfRequestSlot(input) {
       entry.cancelled = true;
       clearTimeout(timer);
       entry.signal?.removeEventListener("abort", onAbort);
+      if (durableGateAvailable() && entry.waiterRegistered === true) {
+        void cancelDurableProviderWaiter({ db: prisma, waiterId: entry.id, ownerInstanceId: BACKEND_INSTANCE_ID }).catch(() => null);
+        entry.waiterRegistered = false;
+      }
       reject(error);
     };
     const onAbort = () => {
@@ -336,8 +558,8 @@ async function acquireOfRequestSlot(input) {
       resolve(value);
     };
     entry.reject = settleReject;
-    lane.queues.get(priority).push(entry);
-    setImmediate(() => pump(lane));
+    enqueue(entry);
+    setImmediate(pump);
   });
 }
 
@@ -360,25 +582,49 @@ async function acknowledgeOfRequestStarted(input) {
     creatorId,
     capability: input.capability,
   });
-  const lane = getLane(access.agencyId, creatorId);
-  const permit = lane.activePermit;
-  if (!permit || permit.id !== permitId || permit.deviceId !== access.deviceId || permit.capability !== input.capability) {
+  if (durableGateAvailable()) {
+    const started = await acknowledgeDurableProviderStarted({
+      db: prisma,
+      permitId,
+      agencyId: access.agencyId,
+      creatorId,
+      deviceId: access.deviceId,
+      capability: input.capability,
+    });
+    const permit = coordinator.activePermit;
+    if (permit?.id === permitId) clearActivePermit(permit);
+    coordinator.lastStartedAt = started.startedAt.getTime();
+    coordinator.nextAllowedAt = started.nextAllowedAt.getTime();
+    coordinator.lastDeviceId = access.deviceId;
+    coordinator.lastCreatorId = creatorId;
+    coordinator.revision = Math.max(coordinator.revision + 1, Number(started.revision || 0));
+    setImmediate(pump);
+    return {
+      startedAt: started.startedAt.toISOString(),
+      nextAllowedAt: started.nextAllowedAt.toISOString(),
+      revision: started.revision,
+      intervalMs: started.intervalMs,
+    };
+  }
+  const permit = coordinator.activePermit;
+  if (!permit || permit.id !== permitId || permit.agencyId !== access.agencyId || permit.creatorId !== creatorId || permit.deviceId !== access.deviceId || permit.capability !== input.capability) {
     const error = new Error("Global OF request permit is missing, expired or belongs to another device/capability");
     error.code = "OF_GATE_PERMIT_INVALID";
     error.status = 409;
     throw error;
   }
   const startedAtMs = Date.now();
-  clearActivePermit(lane, permit);
-  lane.lastStartedAt = startedAtMs;
-  lane.nextAllowedAt = startedAtMs + permit.intervalMs;
-  lane.lastDeviceId = access.deviceId;
-  lane.revision += 1;
-  setImmediate(() => pump(lane));
+  clearActivePermit(permit);
+  coordinator.lastStartedAt = startedAtMs;
+  coordinator.nextAllowedAt = startedAtMs + permit.intervalMs;
+  coordinator.lastDeviceId = access.deviceId;
+  coordinator.lastCreatorId = creatorId;
+  coordinator.revision += 1;
+  setImmediate(pump);
   return {
     startedAt: new Date(startedAtMs).toISOString(),
-    nextAllowedAt: new Date(lane.nextAllowedAt).toISOString(),
-    revision: lane.revision,
+    nextAllowedAt: new Date(coordinator.nextAllowedAt).toISOString(),
+    revision: coordinator.revision,
     intervalMs: permit.intervalMs,
   };
 }
@@ -397,43 +643,91 @@ async function cancelOfRequestPermit(input) {
     creatorId,
     capability: input.capability,
   });
-  const lane = getLane(access.agencyId, creatorId);
-  const permit = lane.activePermit;
-  if (!permit || permit.id !== permitId || permit.deviceId !== access.deviceId || permit.capability !== input.capability) return { cancelled: false };
-  clearActivePermit(lane, permit);
-  lane.revision += 1;
-  setImmediate(() => pump(lane));
-  return { cancelled: true, revision: lane.revision };
+  if (durableGateAvailable()) {
+    const result = await cancelDurableProviderPermit({
+      db: prisma,
+      permitId,
+      agencyId: access.agencyId,
+      creatorId,
+      deviceId: access.deviceId,
+      capability: input.capability,
+    });
+    const permit = coordinator.activePermit;
+    if (result.cancelled && permit?.id === permitId) clearActivePermit(permit);
+    coordinator.revision = Math.max(coordinator.revision + (result.cancelled ? 1 : 0), Number(result.revision || 0));
+    setImmediate(pump);
+    return result;
+  }
+  const permit = coordinator.activePermit;
+  if (!permit || permit.id !== permitId || permit.agencyId !== access.agencyId || permit.creatorId !== creatorId || permit.deviceId !== access.deviceId || permit.capability !== input.capability) return { cancelled: false };
+  clearActivePermit(permit);
+  coordinator.revision += 1;
+  setImmediate(pump);
+  return { cancelled: true, revision: coordinator.revision };
 }
 
 function getOfRequestGateSnapshot() {
   const byCreator = {};
-  for (const lane of lanes.values()) {
-    byCreator[lane.creatorId] = {
-      queued: queueLength(lane),
-      running: lane.running,
-      activePermit: lane.activePermit ? {
-        permitId: lane.activePermit.id,
-        deviceId: lane.activePermit.deviceId,
-        priority: lane.activePermit.priority,
-        operation: lane.activePermit.operation,
-        capability: lane.activePermit.capability,
-        grantedAt: new Date(lane.activePermit.grantedAt).toISOString(),
-      } : null,
-      nextAllowedAt: lane.nextAllowedAt ? new Date(lane.nextAllowedAt).toISOString() : null,
-      lastGrantedAt: lane.lastGrantedAt ? new Date(lane.lastGrantedAt).toISOString() : null,
-      lastStartedAt: lane.lastStartedAt ? new Date(lane.lastStartedAt).toISOString() : null,
-      lastDeviceId: lane.lastDeviceId,
-      revision: lane.revision,
-      byPriority: Object.fromEntries(PRIORITIES.map((priority) => [priority, lane.queues.get(priority).length])),
+  const ensureCreator = (creatorId) => {
+    if (!byCreator[creatorId]) {
+      byCreator[creatorId] = {
+        queued: 0,
+        activePermit: null,
+        byPriority: Object.fromEntries(PRIORITIES.map((priority) => [priority, 0])),
+      };
+    }
+    return byCreator[creatorId];
+  };
+  for (const priority of PRIORITIES) {
+    const bucket = bucketFor(priority);
+    for (const queue of bucket.byCreator.values()) {
+      for (const entry of queue) {
+        if (entry.cancelled) continue;
+        const row = ensureCreator(entry.creatorId);
+        row.queued += 1;
+        row.byPriority[priority] += 1;
+      }
+    }
+  }
+  if (coordinator.activePermit) {
+    const row = ensureCreator(coordinator.activePermit.creatorId);
+    row.activePermit = {
+      permitId: coordinator.activePermit.id,
+      deviceId: coordinator.activePermit.deviceId,
+      priority: coordinator.activePermit.priority,
+      operation: coordinator.activePermit.operation,
+      capability: coordinator.activePermit.capability,
+      grantedAt: new Date(coordinator.activePermit.grantedAt).toISOString(),
     };
   }
   return {
     intervalMs: DEFAULT_INTERVAL_MS,
     permitTtlMs: PERMIT_TTL_MS,
-    coordinator: "single_backend_process_memory_two_phase",
-    distributedAdapterRequiredForMultipleBackendInstances: true,
-    activeCreators: lanes.size,
+    coordinator: durableGateAvailable()
+      ? (coordinator.fairnessActivationState === "ACTIVE" ? "postgres_durable_waiter_weighted_fair_global_two_phase" : "postgres_rolling_legacy_compatible_global_two_phase")
+      : "single_backend_process_global_two_phase_creator_round_robin",
+    fairnessGeneration: coordinator.fairnessGeneration,
+    fairnessActivationState: coordinator.fairnessActivationState,
+    distributedAdapterRequiredForMultipleBackendInstances: !durableGateAvailable(),
+    backendInstanceId: BACKEND_INSTANCE_ID,
+    queued: queueLength(),
+    running: coordinator.running,
+    activePermit: coordinator.activePermit ? {
+      permitId: coordinator.activePermit.id,
+      creatorId: coordinator.activePermit.creatorId,
+      deviceId: coordinator.activePermit.deviceId,
+      priority: coordinator.activePermit.priority,
+      operation: coordinator.activePermit.operation,
+      capability: coordinator.activePermit.capability,
+      grantedAt: new Date(coordinator.activePermit.grantedAt).toISOString(),
+    } : null,
+    nextAllowedAt: coordinator.nextAllowedAt ? new Date(coordinator.nextAllowedAt).toISOString() : null,
+    lastGrantedAt: coordinator.lastGrantedAt ? new Date(coordinator.lastGrantedAt).toISOString() : null,
+    lastStartedAt: coordinator.lastStartedAt ? new Date(coordinator.lastStartedAt).toISOString() : null,
+    lastDeviceId: coordinator.lastDeviceId,
+    lastCreatorId: coordinator.lastCreatorId,
+    revision: coordinator.revision,
+    activeCreators: Object.keys(byCreator).length,
     accessCacheEntries: accessCache.size,
     byCreator,
   };
@@ -447,12 +741,26 @@ module.exports = {
   cancelOfRequestPermit,
   getOfRequestGateSnapshot,
   _test: {
+    providerWaiterCategory,
     reset() {
-      for (const lane of lanes.values()) {
-        if (lane.cleanupTimer) clearTimeout(lane.cleanupTimer);
-        if (lane.activePermit?.expiryTimer) clearTimeout(lane.activePermit.expiryTimer);
-      }
-      lanes.clear();
+      if (coordinator.activePermit?.expiryTimer) clearTimeout(coordinator.activePermit.expiryTimer);
+      if (coordinator.waiterHeartbeatTimer) clearInterval(coordinator.waiterHeartbeatTimer);
+      coordinator.buckets = new Map(PRIORITIES.map((priority) => [priority, { byCreator: new Map(), order: [], cursor: 0, lastServedKey: null }]));
+      coordinator.priorityCursor = 0;
+      coordinator.running = false;
+      coordinator.activePermit = null;
+      coordinator.nextAllowedAt = 0;
+      coordinator.revision = 0;
+      coordinator.lastGrantedAt = 0;
+      coordinator.lastStartedAt = 0;
+      coordinator.lastDeviceId = null;
+      coordinator.lastCreatorId = null;
+      coordinator.durableSelectedWaiterId = null;
+      coordinator.waiterHeartbeatTimer = null;
+      coordinator.runningEntryId = null;
+      coordinator.runningWaiterRegistered = false;
+      coordinator.fairnessActivationState = "DRAINING";
+      coordinator.fairnessGeneration = PROVIDER_GATE_FAIRNESS_GENERATION;
       accessCache.clear();
     },
   },

@@ -59,6 +59,7 @@ function campaignJob(scanRunId, requestedAt = "2026-08-06T11:00:00.000Z", collec
 }
 
 function batchHarness(options = {}) {
+  const frontierRows = Array.isArray(options.frontierRows) ? options.frontierRows : [];
   if (!options.campaignState && Array.isArray(options.pageBatches)) {
     const campaignRows = options.pageBatches.filter((row) => String(row.idempotencyKey || '').includes(':campaigns:'));
     const claimerRows = options.pageBatches.filter((row) => String(row.idempotencyKey || '').includes(':claimers:'));
@@ -79,6 +80,15 @@ function batchHarness(options = {}) {
       campaignProofClaimerBatches: claimerRows.length,
       campaignProofRejectedBatches: rejectedBatches,
       campaignProofRejectedRows: rejectedRows,
+      fanValueCoverageScanRunId: runMatch?.[1] || null,
+      fanValueFreshnessStatus: "COMPLETE",
+      fanValueExpected: 0,
+      fanValueAlreadyFresh: 0,
+      fanValueQueued: 0,
+      fanValueSucceeded: 0,
+      fanValueUnavailable: 0,
+      fanValueFailed: 0,
+      fanValueOutstanding: 0,
     };
   }
   const created = [];
@@ -137,6 +147,32 @@ function batchHarness(options = {}) {
         return options.campaignState;
       },
     },
+    creatorCampaignFrontierFan: {
+      findMany: async ({ where = {} } = {}) => frontierRows
+        .filter((row) => (!where.campaignId || row.campaignId === where.campaignId) && (!where.frontierKind || row.frontierKind === where.frontierKind))
+        .map((row) => ({ ...row })),
+      deleteMany: async ({ where = {} } = {}) => {
+        let removed = 0;
+        for (let i = frontierRows.length - 1; i >= 0; i -= 1) {
+          const row = frontierRows[i];
+          if ((!where.campaignId || row.campaignId === where.campaignId) && (!where.frontierKind || row.frontierKind === where.frontierKind)) {
+            frontierRows.splice(i, 1);
+            removed += 1;
+          }
+        }
+        return { count: removed };
+      },
+      createMany: async ({ data = [], skipDuplicates = false } = {}) => {
+        let count = 0;
+        for (const item of data) {
+          const exists = frontierRows.some((row) => row.campaignId === item.campaignId && row.frontierKind === item.frontierKind && row.onlyFansUserId === item.onlyFansUserId);
+          if (exists && skipDuplicates) continue;
+          frontierRows.push({ id: `frontier-${frontierRows.length + 1}`, ...item });
+          count += 1;
+        }
+        return { count };
+      },
+    },
     analyticsCoverage: {
       findFirst: async () => options.latestCoverage || null,
       findUnique: async () => options.existingCoverage || null,
@@ -149,9 +185,40 @@ function batchHarness(options = {}) {
   };
   return {
     tx, db: transactional(tx), created, updated, coverage, coverageUpdates, scanProofs, scanProofUpdates,
-    campaignState: () => options.campaignState || null,
+    campaignState: () => options.campaignState || null, frontierRows,
   };
 }
+
+function installCampaignMembershipBulkQuery(harness, { resolve = null, queries = null } = {}) {
+  const previous = harness.tx.$queryRawUnsafe;
+  harness.tx.$queryRawUnsafe = async (sql, ...args) => {
+    const textSql = String(sql);
+    if (/INSERT INTO "CreatorCampaignFan"/.test(textSql)) {
+      if (Array.isArray(queries)) queries.push({ sql: textSql, args });
+      const incoming = JSON.parse(args[0]);
+      return incoming.map((row, index) => ({
+        fanRecordId: row.fanRecordId,
+        existed: false,
+        newerGeneration: false,
+        alreadyObservedInCurrentRun: false,
+        historicalBoundary: false,
+        wrote: true,
+        ...(typeof resolve === 'function' ? (resolve(row, index, args) || {}) : {}),
+      }));
+    }
+    if (typeof previous === 'function') return previous(sql, ...args);
+    if (/clock_timestamp\(\)/.test(textSql)) return [{ authorityNow: new Date('2026-09-18T00:00:00.000Z') }];
+    return [];
+  };
+}
+
+function frontierFanIds(harness, campaignId, frontierKind) {
+  return harness.frontierRows
+    .filter((row) => row.campaignId === campaignId && row.frontierKind === frontierKind)
+    .map((row) => row.onlyFansUserId)
+    .sort();
+}
+
 
 test("rangeBounds uses inclusive calendar-day windows", () => {
   const now = new Date("2026-08-06T12:34:56.000Z");
@@ -404,6 +471,7 @@ test("campaign page receipt uses PostgreSQL time for collectedAt and ingest audi
 
 test("campaign completion proves every page batch before closing coverage", async () => {
   const completeHarness = batchHarness({
+    campaignCollectorVersion: "campaigns-v13",
     pageBatches: [
       { idempotencyKey: "campaigns:job-1:run:scan-1:campaigns:a", status: "COMMITTED", rejectedRows: 0 },
       { idempotencyKey: "campaigns:job-1:run:scan-1:claimers:b", status: "COMMITTED", rejectedRows: 0 },
@@ -416,7 +484,7 @@ test("campaign completion proves every page batch before closing coverage", asyn
   };
   const payload = {
     schemaVersion: 4,
-    collectorVersion: "campaigns-v6",
+    collectorVersion: "campaigns-v13",
     scanRunId: "scan-1",
     scanStartedAt: "2026-08-06T11:00:00.000Z",
     observedAt: "2026-08-06T12:00:00.000Z",
@@ -438,7 +506,7 @@ test("campaign completion proves every page batch before closing coverage", asyn
   assert.equal(completeHarness.coverage.length, 0);
   assert.equal(completeHarness.tx.creatorCampaignCollectionState ? completeHarness.tx && true : false, true);
 
-  const partialHarness = batchHarness({ pageBatches: completeHarness.tx.analyticsIngestBatch.findMany ? [
+  const partialHarness = batchHarness({ campaignCollectorVersion: "campaigns-v13", pageBatches: completeHarness.tx.analyticsIngestBatch.findMany ? [
     { idempotencyKey: "campaigns:job-1:run:scan-1:campaigns:a", status: "COMMITTED", rejectedRows: 0 },
   ] : [] });
   let deactivated = false;
@@ -465,14 +533,14 @@ test("campaign completion proof is incremented transactionally and completes wit
     job: proofJob,
     deviceId: "device-1",
     chunk: {
-      kind: "campaigns_page", schemaVersion: 4, collectorVersion: "campaigns-v8",
-      scanRunId: "scan-proof-incremental", batchKey: "run:scan-proof-incremental:campaigns-v8:campaigns:a", scannerRejected: 0,
+      kind: "campaigns_page", schemaVersion: 4, collectorVersion: "campaigns-v13",
+      scanRunId: "scan-proof-incremental", batchKey: "run:scan-proof-incremental:campaigns-v13:campaigns:a", scannerRejected: 0,
       campaigns: [{ id: "campaign-proof", name: "Proof", isActive: true }],
     },
   });
   assert.equal(page.rejected, 0);
   assert.equal(harness.campaignState().campaignProofScanRunId, "scan-proof-incremental");
-  assert.equal(harness.campaignState().campaignProofCollectorVersion, "campaigns-v8");
+  assert.equal(harness.campaignState().campaignProofCollectorVersion, "campaigns-v13");
   assert.equal(harness.campaignState().campaignProofCampaignBatches, 1);
   assert.equal(harness.campaignState().campaignProofClaimerBatches, 0);
   assert.equal(harness.campaignState().campaignProofRejectedBatches, 0);
@@ -482,7 +550,7 @@ test("campaign completion proof is incremented transactionally and completes wit
     job: proofJob,
     deviceId: "device-1",
     result: {
-      schemaVersion: 4, collectorVersion: "campaigns-v8", scanRunId: "scan-proof-incremental",
+      schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: "scan-proof-incremental",
       campaignPagesComplete: true, claimersComplete: true, fanValuesComplete: true, truncated: false,
       campaignCount: 1, campaignBatchCount: 1, claimerBatchCount: 0,
       fanValuesRequested: 0, fanValuesFetched: 0, fanValuesUnavailable: 0,
@@ -502,7 +570,7 @@ test("campaign completion replay can promote a formerly partial audit batch", as
   };
   const payload = {
     schemaVersion: 4,
-    collectorVersion: "campaigns-v6",
+    collectorVersion: "campaigns-v13",
     scanRunId: "scan-2",
     scanStartedAt: "2026-08-06T11:00:00.000Z",
     observedAt: "2026-08-06T12:00:00.000Z",
@@ -521,6 +589,7 @@ test("campaign completion replay can promote a formerly partial audit batch", as
   existingBatch.payloadChecksum = crypto.createHash("sha256").update(JSON.stringify(payload)).digest("hex");
   const harness = batchHarness({
     existingBatch,
+    campaignCollectorVersion: "campaigns-v13",
     pageBatches: [{ idempotencyKey: "campaigns:job-1:run:scan-2:campaigns:a", status: "COMMITTED", rejectedRows: 0 }],
   });
   harness.tx.creatorCampaign = { count: async () => 1, updateMany: async () => ({ count: 0 }) };
@@ -541,6 +610,7 @@ test("campaign claimer identity freshness uses PostgreSQL receipt time, not hist
     throw new Error(`Unexpected raw query: ${String(sql)}`);
   };
   harness.tx.$executeRawUnsafe = async (sql, ...args) => { rawSql.push({ sql: String(sql), args }); return 1; };
+  installCampaignMembershipBulkQuery(harness);
   harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
   harness.tx.creatorCampaignFan = {
     findUnique: async () => null,
@@ -608,6 +678,7 @@ test("campaign claimer causal job consumes exact token and projects token chrono
     throw new Error(`Unexpected raw query: ${String(sql)}`);
   };
   harness.tx.$executeRawUnsafe = async (sql, ...args) => { rawSql.push({ sql: String(sql), args }); return 1; };
+  installCampaignMembershipBulkQuery(harness);
   let frontierWrite = null;
   harness.tx.creatorCampaign = {
     findUnique: async () => ({ id: "campaign-db-1" }),
@@ -676,9 +747,7 @@ test("campaign catch-up frontier stays staged after page 1 and publishes only at
   const campaignState = {
     id: "campaign-db-1",
     catchupFrontierHash: "f".repeat(64),
-    catchupFrontierFanIds: null,
     stagedCatchupFrontierHash: null,
-    stagedCatchupFrontierFanIds: null,
     stagedCatchupFrontierRunId: null,
     stagedCatchupFrontierStartedAt: null,
   };
@@ -717,7 +786,7 @@ test("campaign catch-up frontier stays staged after page 1 and publishes only at
   assert.equal(page1.campaignComplete, false);
   assert.equal(campaignState.catchupFrontierHash, "f".repeat(64), "page 1 must not publish canonical recovery frontier");
   assert.equal(campaignState.stagedCatchupFrontierHash, emptyHeadHash);
-  assert.deepEqual(campaignState.stagedCatchupFrontierFanIds, []);
+  assert.deepEqual(frontierFanIds(harness, "campaign-db-1", "STAGED"), []);
   assert.equal(campaignState.stagedCatchupFrontierRunId, scanRunId);
   assert.equal(new Date(campaignState.stagedCatchupFrontierStartedAt).toISOString(), scanStartedAt);
 
@@ -741,9 +810,9 @@ test("campaign catch-up frontier stays staged after page 1 and publishes only at
 
   assert.equal(page2.campaignComplete, true);
   assert.equal(campaignState.catchupFrontierHash, emptyHeadHash, "only a proven Campaign boundary may publish the staged frontier");
-  assert.deepEqual(campaignState.catchupFrontierFanIds, []);
+  assert.deepEqual(frontierFanIds(harness, "campaign-db-1", "CANONICAL"), []);
   assert.equal(campaignState.stagedCatchupFrontierHash, null);
-  assert.equal(campaignState.stagedCatchupFrontierFanIds, null);
+  assert.deepEqual(frontierFanIds(harness, "campaign-db-1", "STAGED"), []);
   assert.equal(campaignState.stagedCatchupFrontierRunId, null);
   assert.equal(campaignState.stagedCatchupFrontierStartedAt, null);
   assert.equal(writes.length, 2);
@@ -755,9 +824,7 @@ test("campaign staged frontier from an older generation cannot be published by a
   const campaignState = {
     id: "campaign-db-1",
     catchupFrontierHash: "c".repeat(64),
-    catchupFrontierFanIds: ["fan-old"],
     stagedCatchupFrontierHash: "d".repeat(64),
-    stagedCatchupFrontierFanIds: ["fan-staged"],
     stagedCatchupFrontierRunId: "old-run",
     stagedCatchupFrontierStartedAt: new Date("2026-08-10T09:00:00.000Z"),
   };
@@ -803,9 +870,9 @@ test("campaign deep frontier finds a shifted prior head identity below page 1 an
   const campaignState = {
     id: "campaign-db-1",
     catchupFrontierHash: "a".repeat(64),
-    catchupFrontierFanIds: ["fan-old-anchor", "fan-old-2"],
+    catchupFrontierRunId: "scan-prior-complete",
+    catchupFrontierStartedAt: new Date("2026-08-01T12:00:00.000Z"),
     stagedCatchupFrontierHash: stagedHeadHash,
-    stagedCatchupFrontierFanIds: stagedHeadIds,
     stagedCatchupFrontierRunId: scanRunId,
     stagedCatchupFrontierStartedAt: new Date(scanStartedAt),
   };
@@ -813,7 +880,13 @@ test("campaign deep frontier finds a shifted prior head identity below page 1 an
     findUnique: async () => ({ ...campaignState }),
     update: async ({ data }) => { Object.assign(campaignState, data); return { ...campaignState }; },
   };
+  harness.frontierRows.push(
+    { campaignId: "campaign-db-1", frontierKind: "CANONICAL", onlyFansUserId: "fan-old-anchor", sourceScanRunId: "scan-prior-complete", sourceScanStartedAt: new Date("2026-08-01T12:00:00.000Z") },
+    { campaignId: "campaign-db-1", frontierKind: "CANONICAL", onlyFansUserId: "fan-old-2", sourceScanRunId: "scan-prior-complete", sourceScanStartedAt: new Date("2026-08-01T12:00:00.000Z") },
+    ...stagedHeadIds.map((onlyFansUserId) => ({ campaignId: "campaign-db-1", frontierKind: "STAGED", onlyFansUserId, sourceScanRunId: scanRunId, sourceScanStartedAt: new Date(scanStartedAt) })),
+  );
   harness.tx.$executeRawUnsafe = async () => 1;
+  installCampaignMembershipBulkQuery(harness);
   harness.tx.creatorFan = {
     findMany: async () => [{ id: "fan-db-anchor", onlyFansUserId: "fan-old-anchor", valueCurrent: { valueObservedAt: new Date("2026-08-11T09:30:00.000Z") } }],
   };
@@ -869,9 +942,9 @@ test("campaign deep frontier finds a shifted prior head identity below page 1 an
   assert.equal(result.knownBoundaryReached, true);
   assert.equal(result.campaignComplete, true);
   assert.equal(campaignState.catchupFrontierHash, stagedHeadHash);
-  assert.deepEqual(campaignState.catchupFrontierFanIds, stagedHeadIds);
+  assert.deepEqual(frontierFanIds(harness, "campaign-db-1", "CANONICAL"), stagedHeadIds);
   assert.equal(campaignState.stagedCatchupFrontierHash, null);
-  assert.equal(campaignState.stagedCatchupFrontierFanIds, null);
+  assert.deepEqual(frontierFanIds(harness, "campaign-db-1", "STAGED"), []);
 });
 
 test("campaign deep frontier uses exact prior membership when head anchors and claimedAt are unavailable", async () => {
@@ -883,11 +956,9 @@ test("campaign deep frontier uses exact prior membership when head anchors and c
   const campaignState = {
     id: "campaign-db-history",
     catchupFrontierHash: "a".repeat(64),
-    catchupFrontierFanIds: [],
     catchupFrontierRunId: "scan-prior-complete",
     catchupFrontierStartedAt: new Date("2026-08-01T12:00:00.000Z"),
     stagedCatchupFrontierHash: stagedHeadHash,
-    stagedCatchupFrontierFanIds: stagedHeadIds,
     stagedCatchupFrontierRunId: scanRunId,
     stagedCatchupFrontierStartedAt: new Date(scanStartedAt),
   };
@@ -895,7 +966,9 @@ test("campaign deep frontier uses exact prior membership when head anchors and c
     findUnique: async () => ({ ...campaignState }),
     update: async ({ data }) => { Object.assign(campaignState, data); return { ...campaignState }; },
   };
+  harness.frontierRows.push(...stagedHeadIds.map((onlyFansUserId) => ({ campaignId: "campaign-db-history", frontierKind: "STAGED", onlyFansUserId, sourceScanRunId: scanRunId, sourceScanStartedAt: new Date(scanStartedAt) })));
   harness.tx.$executeRawUnsafe = async () => 1;
+  installCampaignMembershipBulkQuery(harness, { resolve: () => ({ existed: true, historicalBoundary: true }) });
   harness.tx.creatorFan = {
     findMany: async () => [{ id: "fan-db-known", onlyFansUserId: "fan-known", valueCurrent: { valueObservedAt: new Date("2026-08-14T09:00:00.000Z") } }],
   };
@@ -931,7 +1004,7 @@ test("campaign deep frontier uses exact prior membership when head anchors and c
   assert.equal(result.knownBoundaryReached, true);
   assert.equal(result.campaignComplete, true);
   assert.equal(campaignState.catchupFrontierHash, stagedHeadHash);
-  assert.deepEqual(campaignState.catchupFrontierFanIds, stagedHeadIds);
+  assert.deepEqual(frontierFanIds(harness, "campaign-db-history", "CANONICAL"), stagedHeadIds);
 });
 
 test("campaign deep frontier refuses membership proof from a partial generation newer than the canonical frontier", async () => {
@@ -941,11 +1014,9 @@ test("campaign deep frontier refuses membership proof from a partial generation 
   const campaignState = {
     id: "campaign-db-partial-membership",
     catchupFrontierHash: "a".repeat(64),
-    catchupFrontierFanIds: [],
     catchupFrontierRunId: "scan-canonical-complete",
     catchupFrontierStartedAt: new Date("2026-08-01T12:00:00.000Z"),
     stagedCatchupFrontierHash: "b".repeat(64),
-    stagedCatchupFrontierFanIds: ["fan-new-head"],
     stagedCatchupFrontierRunId: scanRunId,
     stagedCatchupFrontierStartedAt: new Date(scanStartedAt),
   };
@@ -954,6 +1025,7 @@ test("campaign deep frontier refuses membership proof from a partial generation 
     update: async ({ data }) => { Object.assign(campaignState, data); return { ...campaignState }; },
   };
   harness.tx.$executeRawUnsafe = async () => 1;
+  installCampaignMembershipBulkQuery(harness, { resolve: () => ({ existed: true, historicalBoundary: false }) });
   harness.tx.creatorFan = {
     findMany: async () => [{ id: "fan-db-partial", onlyFansUserId: "fan-partial", valueCurrent: { valueObservedAt: new Date("2026-08-15T09:00:00.000Z") } }],
   };
@@ -988,6 +1060,77 @@ test("campaign deep frontier refuses membership proof from a partial generation 
   assert.equal(campaignState.catchupFrontierHash, "a".repeat(64));
 });
 
+
+test("campaigns-v12 ignores historical membership/client boundary hints until provider source exhaustion", async () => {
+  const harness = batchHarness();
+  const scanRunId = "scan-order-independent-v12";
+  const scanStartedAt = "2026-08-16T10:00:00.000Z";
+  const stagedHeadIds = ["fan-new-head-v12"];
+  const stagedHeadHash = require("node:crypto").createHash("sha256").update(JSON.stringify(stagedHeadIds)).digest("hex");
+  const campaignState = {
+    id: "campaign-db-order-independent",
+    catchupFrontierHash: "a".repeat(64),
+    catchupFrontierRunId: "scan-prior-complete",
+    catchupFrontierStartedAt: new Date("2026-08-01T12:00:00.000Z"),
+    stagedCatchupFrontierHash: stagedHeadHash,
+    stagedCatchupFrontierRunId: scanRunId,
+    stagedCatchupFrontierStartedAt: new Date(scanStartedAt),
+  };
+  harness.tx.creatorCampaign = {
+    findUnique: async () => ({ ...campaignState }),
+    update: async ({ data }) => { Object.assign(campaignState, data); return { ...campaignState }; },
+  };
+  harness.frontierRows.push(
+    { campaignId: campaignState.id, frontierKind: "CANONICAL", onlyFansUserId: "fan-known-v12", sourceScanRunId: "scan-prior-complete", sourceScanStartedAt: new Date("2026-08-01T12:00:00.000Z") },
+    ...stagedHeadIds.map((onlyFansUserId) => ({ campaignId: campaignState.id, frontierKind: "STAGED", onlyFansUserId, sourceScanRunId: scanRunId, sourceScanStartedAt: new Date(scanStartedAt) })),
+  );
+  harness.tx.$executeRawUnsafe = async () => 1;
+  installCampaignMembershipBulkQuery(harness, { resolve: () => ({ existed: true, historicalBoundary: true }) });
+  harness.tx.creatorFan = {
+    findMany: async () => [{ id: "fan-db-v12", onlyFansUserId: "fan-known-v12", valueCurrent: { valueObservedAt: new Date("2026-08-16T09:30:00.000Z") } }],
+  };
+  harness.tx.creatorCampaignFanRefreshWork = { findMany: async () => [], createMany: async () => ({ count: 0 }) };
+  harness.tx.jobInstance = { createMany: async () => ({ count: 0 }), findUnique: async () => null };
+
+  const page = await ingestCampaignChunk({
+    db: harness.db,
+    job: campaignJob(scanRunId, scanStartedAt, "catchup"),
+    deviceId: "device-1",
+    chunk: {
+      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v12",
+      scanRunId, batchKey: `run:${scanRunId}:campaigns-v12:claimers:page-2`, externalCampaignId: "campaign-1",
+      pageNumber: 2, sourceHasMore: true, campaignComplete: true, knownBoundaryReached: true,
+      campaignMode: "catchup", scannerRejected: 0,
+      claimers: [{ id: "claim-known-v12", userId: "fan-known-v12", username: "known-v12", embeddedValue: { observedAt: "2026-08-16T09:59:00.000Z", totalSpentCents: 1 } }],
+    },
+  });
+
+  assert.equal(page.serverDeepBoundaryReached, false, "current collector must not use historical membership as completion authority");
+  assert.equal(page.knownBoundaryReached, false, "client boundary hints are non-authoritative in v12");
+  assert.equal(page.campaignComplete, false, "sourceHasMore=true must keep current Campaign incomplete");
+  assert.equal(campaignState.catchupFrontierHash, "a".repeat(64));
+  assert.equal(campaignState.stagedCatchupFrontierHash, stagedHeadHash);
+
+  const terminal = await ingestCampaignChunk({
+    db: harness.db,
+    job: campaignJob(scanRunId, scanStartedAt, "catchup"),
+    deviceId: "device-1",
+    chunk: {
+      kind: "campaign_claimers_page", schemaVersion: 4, collectorVersion: "campaigns-v12",
+      scanRunId, batchKey: `run:${scanRunId}:campaigns-v12:claimers:page-3`, externalCampaignId: "campaign-1",
+      pageNumber: 3, sourceHasMore: false, campaignComplete: true, knownBoundaryReached: false,
+      campaignMode: "catchup", scannerRejected: 0, claimers: [],
+    },
+  });
+
+  assert.equal(terminal.campaignComplete, true);
+  assert.equal(terminal.knownBoundaryReached, false);
+  assert.equal(campaignState.catchupFrontierHash, stagedHeadHash, "staged frontier may publish only after source exhaustion in v12");
+  assert.equal(campaignState.stagedCatchupFrontierHash, null);
+  assert.deepEqual(frontierFanIds(harness, campaignState.id, "CANONICAL"), stagedHeadIds);
+  assert.deepEqual(frontierFanIds(harness, campaignState.id, "STAGED"), []);
+});
+
 test("campaign claimer causal job fails closed when exact token is missing", async () => {
   const harness = batchHarness();
   harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
@@ -1008,12 +1151,9 @@ test("campaign claimer causal job fails closed when exact token is missing", asy
 
 test("campaign fan attribution keeps the earliest confirmed attribution date", async () => {
   const harness = batchHarness();
-  let updateData = null;
+  const membershipQueries = [];
+  installCampaignMembershipBulkQuery(harness, { queries: membershipQueries, resolve: () => ({ existed: true }) });
   harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
-  harness.tx.creatorCampaignFan = {
-    findUnique: async () => ({ id: "membership-1", sourceScanStartedAt: new Date("2026-08-05T00:00:00.000Z"), externalClaimerId: "claim-old", attributedAt: new Date("2026-07-01T00:00:00.000Z") }),
-    upsert: async ({ update }) => { updateData = update; return {}; },
-  };
   harness.tx.creatorFan = {
     findUnique: async () => ({ id: "fan-db-1", lastSeenAt: new Date("2026-07-01T00:00:00.000Z") }),
     updateMany: async () => ({ count: 1 }),
@@ -1027,7 +1167,9 @@ test("campaign fan attribution keeps the earliest confirmed attribution date", a
       claimers: [{ user: { id: "fan-1" }, id: "claim-new", attributedAt: "2026-08-01T00:00:00.000Z" }],
     },
   });
-  assert.equal(updateData.attributedAt.toISOString(), "2026-07-01T00:00:00.000Z");
+  assert.equal(membershipQueries.length, 1);
+  assert.equal(JSON.parse(membershipQueries[0].args[0])[0].attributedAt, "2026-08-01T00:00:00.000Z");
+  assert.match(membershipQueries[0].sql, /LEAST\("CreatorCampaignFan"\."attributedAt", EXCLUDED\."attributedAt"\)/);
 });
 
 test("campaign fan attribution is historical and is never pruned by a later empty page", async () => {
@@ -2022,6 +2164,7 @@ test("INT5.6A-4 embedded claimer value reuses claimer-page causal chronology wit
   const harness = batchHarness({ authorityNow });
   const rawSql = [];
   harness.tx.$executeRawUnsafe = async (sql, ...args) => { rawSql.push({ sql: String(sql), args }); return 1; };
+  installCampaignMembershipBulkQuery(harness);
   harness.tx.creatorCampaign = { findUnique: async () => ({ id: "campaign-db-1" }) };
   harness.tx.creatorCampaignFan = { findUnique: async () => null, upsert: async ({ create }) => create };
   const fanRow = {
@@ -2077,11 +2220,9 @@ test("campaigns-v10 accepts claimer pages beyond 10k and detects exact current-r
   const campaignState = {
     id: "campaign-db-resumable",
     catchupFrontierHash: null,
-    catchupFrontierFanIds: [],
     catchupFrontierRunId: null,
     catchupFrontierStartedAt: null,
     stagedCatchupFrontierHash: null,
-    stagedCatchupFrontierFanIds: null,
     stagedCatchupFrontierRunId: null,
     stagedCatchupFrontierStartedAt: null,
   };
@@ -2090,6 +2231,7 @@ test("campaigns-v10 accepts claimer pages beyond 10k and detects exact current-r
     update: async ({ data }) => { Object.assign(campaignState, data); return { ...campaignState }; },
   };
   harness.tx.$executeRawUnsafe = async () => 1;
+  installCampaignMembershipBulkQuery(harness, { resolve: () => ({ existed: true, alreadyObservedInCurrentRun: true }) });
   harness.tx.creatorFan = {
     findMany: async () => [{ id: "fan-db-repeat", onlyFansUserId: "fan-repeat", valueCurrent: { valueObservedAt: new Date(scanStartedAt) } }],
   };

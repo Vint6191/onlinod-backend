@@ -78,6 +78,8 @@ const {
   renewAnalyticsSweepLease,
   completeAnalyticsSweepCycle,
 } = require("./analytics-collection-planner");
+const { refreshProviderCapacityDebtSnapshot, readProviderCapacityDebtSnapshot } = require("./provider-capacity-debt-authority-service");
+const { deriveProviderOverloadControl } = require("./provider-capacity-topology-control-service");
 
 // Recurring sweeper interval. Owner asked for 1 hour.
 const RECURRING_INTERVAL_MS = 60 * 60 * 1000;
@@ -111,6 +113,9 @@ const CREATOR_ANALYTICS_SWEEP_LEASE_KEY = "creator_analytics_recurring_v1";
 const CREATOR_ANALYTICS_SWEEP_COORDINATION_LOCK_KEY = "creator-analytics-recurring-sweep-coordinator";
 const CREATOR_ANALYTICS_SWEEP_LEASE_MS = 15 * 60 * 1000;
 const CREATOR_ANALYTICS_SWEEP_HEARTBEAT_EVERY = 25;
+const CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP = Math.max(1, Math.min(20_000, Number.parseInt(process.env.CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP || "2400", 10) || 2400));
+const CAMPAIGN_DIRECTORY_DISCOVERY_MAX_JOBS_PER_SWEEP = Math.max(1, Math.min(1000, Number.parseInt(process.env.CAMPAIGN_DIRECTORY_DISCOVERY_MAX_JOBS_PER_SWEEP || "100", 10) || 100));
+const CAMPAIGN_DIRECTORY_PAGE_SIZE = 50;
 let recurringSweepPromise = null;
 let creatorAnalyticsSweepPromise = null;
 let phase2MaintenancePromise = null;
@@ -1645,6 +1650,136 @@ async function maybeRepairLegacyTeamPendingBootstrap({ db = prisma, now = new Da
   }
 }
 
+
+function estimatedCampaignDirectoryPages(state) {
+  const count = Math.max(0, Number(state?.campaignDirectoryCampaignCount || 0));
+  // Source-exhaustive traversal needs the terminal page as well. Existing exact
+  // count is the best server-owned cost estimate; a creator with no prior
+  // directory still reserves one page and claim-time concurrency is the second
+  // backpressure layer if reality is larger.
+  return Math.max(1, Math.ceil(count / CAMPAIGN_DIRECTORY_PAGE_SIZE) + 1);
+}
+
+async function selectCampaignDirectoryDiscoveryAdmissions({
+  db = prisma, now = new Date(),
+  pageBudget = CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP,
+  maxJobs = CAMPAIGN_DIRECTORY_DISCOVERY_MAX_JOBS_PER_SWEEP,
+} = {}) {
+  if (typeof db?.creatorCampaignCollectionState?.findMany !== "function") {
+    return { admittedCreatorIds: null, estimatedProviderPages: 0, considered: 0, reason: "adapter_without_campaign_state_scan" };
+  }
+  const safePageBudget = Math.max(1, Math.floor(Number(pageBudget) || CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP));
+  const safeMaxJobs = Math.max(1, Math.floor(Number(maxJobs) || CAMPAIGN_DIRECTORY_DISCOVERY_MAX_JOBS_PER_SWEEP));
+  // A fixed "oldest N" window can itself become a starvation source: if the
+  // head is dominated by creators whose Campaign job is already active, later
+  // overdue creators are never even considered. Page the whole due set until
+  // capacity is filled or the source is exhausted. The provider-page budget
+  // and maxJobs still bound actual admissions; this scan is DB-only.
+  const scanPageSize = Math.min(1000, Math.max(250, safeMaxJobs * 5));
+  const admitted = new Set();
+  let estimatedProviderPages = 0;
+  let considered = 0;
+  let pageCursor = null;
+  let stopForBudget = false;
+
+  while (admitted.size < safeMaxJobs && !stopForBudget) {
+    const pagination = pageCursor
+      ? (pageCursor.dueAt === null
+        ? {
+          OR: [
+            { campaignDirectoryDiscoveryDueAt: null, creatorId: { gt: pageCursor.creatorId } },
+            { campaignDirectoryDiscoveryDueAt: { not: null, lte: now } },
+          ],
+        }
+        : {
+          OR: [
+            { campaignDirectoryDiscoveryDueAt: { gt: pageCursor.dueAt, lte: now } },
+            { campaignDirectoryDiscoveryDueAt: pageCursor.dueAt, creatorId: { gt: pageCursor.creatorId } },
+          ],
+        })
+      : null;
+    const candidates = await db.creatorCampaignCollectionState.findMany({
+      where: {
+        baselineVerifiedAt: { not: null },
+        AND: [
+          {
+            OR: [
+              { campaignDirectoryDiscoveryDueAt: null },
+              { campaignDirectoryDiscoveryDueAt: { lte: now } },
+            ],
+          },
+          {
+            OR: [
+              { retryAfterAt: null },
+              { retryAfterAt: { lte: now } },
+            ],
+          },
+          {
+            OR: [
+              { status: { not: "FAILED" } },
+              { retryAfterAt: { not: null } },
+            ],
+          },
+          ...(pagination ? [pagination] : []),
+        ],
+      },
+      orderBy: [
+        { campaignDirectoryDiscoveryDueAt: { sort: "asc", nulls: "first" } },
+        { creatorId: "asc" },
+      ],
+      take: scanPageSize,
+      select: { creatorId: true, campaignDirectoryCampaignCount: true, campaignDirectoryDiscoveryDueAt: true, status: true, retryAfterAt: true },
+    });
+    if (!candidates.length) break;
+    considered += candidates.length;
+
+    const active = typeof db?.jobInstance?.findMany === "function"
+      ? await db.jobInstance.findMany({
+        where: { creatorId: { in: candidates.map((row) => row.creatorId) }, jobKey: "fetch_campaigns", status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+        select: { creatorId: true },
+        distinct: ["creatorId"],
+        take: Math.min(10_000, candidates.length),
+      })
+      : [];
+    const activeIds = new Set((active || []).map((row) => String(row.creatorId || "")).filter(Boolean));
+
+    for (const row of candidates) {
+      if (admitted.size >= safeMaxJobs) break;
+      if (activeIds.has(row.creatorId)) continue;
+      // Retry/terminal eligibility is pushed into the DB where-clause, but
+      // retain the source-side guard for compatibility with in-memory adapters
+      // that ignore query predicates.
+      const retryAt = row?.retryAfterAt ? new Date(row.retryAfterAt) : null;
+      if (retryAt && Number.isFinite(retryAt.getTime()) && retryAt.getTime() > now.getTime()) continue;
+      if (String(row?.status || "").toUpperCase() === "FAILED" && !retryAt) continue;
+      const cost = estimatedCampaignDirectoryPages(row);
+      // Strict oldest-due fairness: once an eligible older creator would exceed
+      // the remaining budget, do not let cheaper newer creators jump ahead.
+      // The first eligible creator is always admitted so an oversized oldest
+      // creator can make progress instead of becoming permanently impossible.
+      if (admitted.size > 0 && estimatedProviderPages + cost > safePageBudget) {
+        stopForBudget = true;
+        break;
+      }
+      admitted.add(row.creatorId);
+      estimatedProviderPages += cost;
+      if (estimatedProviderPages >= safePageBudget) {
+        stopForBudget = true;
+        break;
+      }
+    }
+
+    if (stopForBudget || admitted.size >= safeMaxJobs || candidates.length < scanPageSize) break;
+    const last = candidates[candidates.length - 1];
+    pageCursor = {
+      dueAt: last?.campaignDirectoryDiscoveryDueAt ? new Date(last.campaignDirectoryDiscoveryDueAt) : null,
+      creatorId: String(last?.creatorId || ""),
+    };
+    if (!pageCursor.creatorId) break;
+  }
+  return { admittedCreatorIds: admitted, estimatedProviderPages, considered, reason: "oldest_due_keyset_budget" };
+}
+
 async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), pageSize = RECURRING_READY_PAGE_SIZE } = {}) {
   if (creatorAnalyticsSweepPromise) {
     return { ok: true, skipped: true, reason: "local_overlap" };
@@ -1664,6 +1799,31 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
     }
 
     const cycleNow = claim.cycleNow;
+    let providerCapacityControl = null;
+    try {
+      const durableCapacitySnapshot = await readProviderCapacityDebtSnapshot({ db });
+      providerCapacityControl = deriveProviderOverloadControl({
+        snapshot: durableCapacitySnapshot,
+        now: cycleNow,
+        normalDirectoryAdmissionCalls: CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP,
+      });
+    } catch (error) {
+      // Admission must fail conservative when the durable capacity projection
+      // cannot be read. Canonical debt remains untouched; we only limit NEW
+      // periodic directory work to the guaranteed weighted share.
+      providerCapacityControl = deriveProviderOverloadControl({
+        snapshot: null,
+        now: cycleNow,
+        normalDirectoryAdmissionCalls: CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP,
+      });
+      providerCapacityControl.readError = error?.message || String(error);
+    }
+    const directoryAdmission = await selectCampaignDirectoryDiscoveryAdmissions({
+      db,
+      now: cycleNow,
+      pageBudget: providerCapacityControl.campaignDirectoryAdmissionBudgetCalls,
+    });
+    const directoryAdmittedIds = directoryAdmission.admittedCreatorIds;
     let cursor = claim.cursorCreatorId || null;
     let creators = 0;
     let pages = 0;
@@ -1708,6 +1868,7 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
             agencyId: creator.agencyId,
             now: cycleNow,
             priority: 20,
+            campaignDirectoryDiscoveryAdmitted: directoryAdmittedIds === null || directoryAdmittedIds.has(creator.id),
           });
           jobsCreated += Number(result?.created?.length || 0) + (result?.initial?.created ? 1 : 0);
           jobsSkipped += Number(result?.skipped?.length || 0) + (result?.initial && !result.initial.created ? 1 : 0);
@@ -1747,6 +1908,17 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
       if (rows.length < size) break;
     }
 
+    let providerCapacityDebt = null;
+    try {
+      providerCapacityDebt = await refreshProviderCapacityDebtSnapshot({ db, now: cycleNow });
+    } catch (error) {
+      // Capacity debt is a derived projection. A transient projection failure
+      // must not replay already-scheduled provider work; sampledAt/revision make
+      // staleness explicit to readers and the next sweep repairs it.
+      providerCapacityDebt = { ok: false, persisted: false, reason: "capacity_projection_failed", error: error?.message || String(error) };
+      console.warn("[scheduler] provider capacity debt projection failed:", error?.message || error);
+    }
+
     const completed = await completeAnalyticsSweepCycle({
       db,
       ownerToken: claim.ownerToken,
@@ -1755,9 +1927,21 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
       leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
     });
     if (!completed) {
-      return { ok: false, skipped: true, reason: "cycle_completion_lost", cycleKey: claim.cycleKey, creators, pages, jobsCreated, jobsSkipped, failures };
+      return { ok: false, skipped: true, reason: "cycle_completion_lost", cycleKey: claim.cycleKey, creators, pages, jobsCreated, jobsSkipped, failures, providerCapacityDebt };
     }
-    return { ok: true, skipped: false, cycleKey: claim.cycleKey, creators, pages, jobsCreated, jobsSkipped, failures, pageSize: size };
+    return {
+      ok: true, skipped: false, cycleKey: claim.cycleKey, creators, pages, jobsCreated, jobsSkipped, failures, pageSize: size, providerCapacityDebt,
+      campaignDirectoryAdmission: {
+        admitted: directoryAdmittedIds === null ? null : directoryAdmittedIds.size,
+        estimatedProviderPages: Number(directoryAdmission.estimatedProviderPages || 0),
+        considered: Number(directoryAdmission.considered || 0),
+        controlMode: providerCapacityControl?.controlMode || "CONSERVATIVE",
+        controlReason: providerCapacityControl?.controlReason || null,
+        pageBudget: Number(providerCapacityControl?.campaignDirectoryAdmissionBudgetCalls || 0),
+        topologyId: providerCapacityControl?.topology?.topologyId || "of-global",
+        topologyShardCount: Number(providerCapacityControl?.topology?.shardCount || 1),
+      },
+    };
   })();
 
   try {
@@ -2052,12 +2236,16 @@ module.exports = {
   scheduleJobNow,
   runRecurringSweep,
   runCreatorAnalyticsCatchupSweep,
+  selectCampaignDirectoryDiscoveryAdmissions,
+  estimatedCampaignDirectoryPages,
   runRecurringCreatorWork,
   startRecurringScheduler,
   stopRecurringScheduler,
   RECURRING_INTERVAL_MS,
   FRESHNESS_WINDOW_MS,
   TRAFFIC_REFRESH_WINDOW_MS,
+  CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP,
+  CAMPAIGN_DIRECTORY_DISCOVERY_MAX_JOBS_PER_SWEEP,
   RETENTION_SWEEP_WINDOW_MS,
   TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS,
   TELEGRAM_INBOUND_PROJECTION_BATCH_SIZE,

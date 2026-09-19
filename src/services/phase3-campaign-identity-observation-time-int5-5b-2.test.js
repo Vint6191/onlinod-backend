@@ -17,9 +17,9 @@ test("INT5.5B-2/A3 campaign claimer identity never uses attribution event time a
 });
 
 test("INT5.5B-2 keeps attributedAt as historical campaign membership provenance", () => {
-  assert.match(source, /attributedAt: claimer\.attributedAt,/);
-  assert.match(source, /const attributedAt = existingAttributedAt && claimer\.attributedAt/);
-  assert.match(source, /attributedAt,\n\s+sourceScanRunId:/);
+  assert.match(source, /attributedAt: claimer\.attributedAt \? claimer\.attributedAt\.toISOString\(\) : null/);
+  assert.match(source, /ELSE LEAST\("CreatorCampaignFan"\."attributedAt", EXCLUDED\."attributedAt"\)/);
+  assert.match(source, /NULLIF\(a\."attributedAt", ''\)::timestamptz/);
 });
 
 test("INT5.5B-2/A4 campaign value identity uses server-owned authority time and causal jobs consume post-read token chronology", () => {

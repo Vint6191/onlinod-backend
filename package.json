@@ -29,7 +29,13 @@
     "audit:auth-runtime-verify": "node scripts/audit/actual60-runtime-evidence-verify.js",
     "maintenance:auth-history-purge": "node scripts/maintenance/actual60-auth-history-purge-activation.js",
     "phase3:activate-campaign-causal-v1": "node scripts/phase3-activate-campaign-causal-v1.js",
-    "phase3:activate-observation-creator-clock-v1": "node scripts/phase3-activate-observation-creator-clock-v1.js"
+    "phase3:activate-observation-creator-clock-v1": "node scripts/phase3-activate-observation-creator-clock-v1.js",
+    "phase3:provider-gate-fairness": "node scripts/phase3-provider-gate-fairness-activation.js",
+    "audit:phase3-a15-postgres": "node scripts/audit/phase3-a15-postgres-proof.js",
+    "phase3:provider-capacity": "node scripts/phase3-provider-capacity-debt.js",
+    "audit:phase3-a16-postgres": "node scripts/audit/phase3-a16-postgres-proof.js",
+    "audit:phase3-a17-postgres": "node scripts/audit/phase3-a17-postgres-proof.js",
+    "audit:phase3-a18-postgres": "node scripts/audit/phase3-a18-postgres-proof.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

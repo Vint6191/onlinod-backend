@@ -254,7 +254,7 @@ async function acceptCampaignGeneration({ db = prisma, job, deviceId = null } = 
     const existing = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
     const authority = commandAuthority(existing, command);
     if (authority === "STALE") return { accepted: false, stale: true, command, state: existing };
-    if (authority === "CURRENT" && ["COMPLETE", "PARTIAL"].includes(String(existing?.status || "").toUpperCase())) {
+    if (authority === "CURRENT" && ["SCANNING", "COMPLETE", "PARTIAL"].includes(String(existing?.status || "").toUpperCase())) {
       return { accepted: true, stale: false, replay: true, command, state: existing };
     }
     if (authority === "CURRENT" && String(existing?.status || "").toUpperCase() === "FAILED" && !existing?.retryAfterAt) {
@@ -262,6 +262,13 @@ async function acceptCampaignGeneration({ db = prisma, job, deviceId = null } = 
     }
     const data = {
       status: "SCANNING", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: null,
+      membershipCoverageStatus: "SCANNING", membershipCoverageCompletedAt: null,
+      fanValueCoverageScanRunId: command.generation, fanValueFreshnessCutoffAt: null, fanValueFreshnessStatus: "MISSING",
+      fanValueExpected: 0, fanValueAlreadyFresh: 0, fanValueQueued: 0, fanValueSucceeded: 0,
+      fanValueUnavailable: 0, fanValueFailed: 0, fanValueOutstanding: 0, fanValueCoverageUpdatedAt: null,
+      campaignFrontierPlanRunId: null, campaignFrontierFreshnessStatus: "MISSING",
+      campaignFrontierDueCount: 0, campaignFrontierTargetCount: 0, campaignFrontierCompletedCount: 0, campaignFrontierDeferredCount: 0,
+      campaignFrontierOldestDueAt: null, campaignFrontierNextDueAt: null, campaignFrontierUpdatedAt: null,
       lastErrorCode: null, lastErrorMessage: null, sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220),
     };
     const state = await tx.creatorCampaignCollectionState.upsert({
@@ -271,7 +278,7 @@ async function acceptCampaignGeneration({ db = prisma, job, deviceId = null } = 
   }});
 }
 
-async function completeCampaignCollection({ db = prisma, job, deviceId = null, complete, scanRunId } = {}) {
+async function completeCampaignCollection({ db = prisma, job, deviceId = null, complete, membershipComplete = false, scanRunId } = {}) {
   const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: job.creatorId, work: async (tx) => {
     const current = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
@@ -283,8 +290,13 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
     const success = complete === true;
     const common = {
       status: success ? "COMPLETE" : "PARTIAL", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt,
-      retryAfterAt: null, lastErrorCode: success ? null : "CAMPAIGN_COLLECTION_PARTIAL",
-      lastErrorMessage: success ? null : "Campaign collection did not prove all requested campaign/claimer/value frontiers",
+      membershipCoverageStatus: membershipComplete ? "COMPLETE" : "PARTIAL",
+      membershipCoverageCompletedAt: membershipComplete ? now : null,
+      retryAfterAt: null,
+      lastErrorCode: success ? null : (membershipComplete ? "CAMPAIGN_FAN_VALUE_REFRESH_PENDING" : "CAMPAIGN_COLLECTION_PARTIAL"),
+      lastErrorMessage: success ? null : (membershipComplete
+        ? "Campaign membership coverage is complete; FanData freshness coverage is not complete yet"
+        : "Campaign collection did not prove all requested campaign/claimer frontiers"),
       sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220), ...(success ? { lastCompleteScanRunId: clean(scanRunId, 120) } : {}),
     };
     const successData = success && command.mode === "full" ? { baselineVerifiedAt: now, baselineGeneration: command.generation }

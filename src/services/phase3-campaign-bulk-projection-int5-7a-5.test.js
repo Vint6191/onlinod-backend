@@ -136,6 +136,17 @@ test("INT5.7A-5 a full 50-claimer page uses one canonical FanData lock for ident
   const fanIds = Array.from({ length: 50 }, (_, index) => `fan-${index + 1}`);
   const tx = {
     $executeRawUnsafe: async (sql, ...args) => { rawSql.push({ sql: String(sql), args }); return 1; },
+    $queryRawUnsafe: async (sql, ...args) => {
+      rawSql.push({ sql: String(sql), args });
+      if (/clock_timestamp\(\)/.test(String(sql))) return [{ authorityNow: new Date("2026-09-17T18:00:02.000Z") }];
+      if (/INSERT INTO "CreatorCampaignFan"/.test(String(sql))) {
+        return JSON.parse(args[0]).map((row) => ({
+          fanRecordId: row.fanRecordId, existed: false, newerGeneration: false,
+          alreadyObservedInCurrentRun: false, historicalBoundary: false, wrote: true,
+        }));
+      }
+      return [];
+    },
     analyticsIngestBatch: {
       findUnique: async () => null,
       create: async ({ data }) => ({ id: "batch-1", status: "RECEIVED", ...data }),
@@ -148,6 +159,11 @@ test("INT5.7A-5 a full 50-claimer page uses one canonical FanData lock for ident
     },
     creatorCampaign: {
       findUnique: async () => ({ id: "campaign-db-1" }),
+    },
+    creatorCampaignFrontierFan: {
+      findMany: async () => [],
+      deleteMany: async () => ({ count: 0 }),
+      createMany: async () => ({ count: 0 }),
     },
     creatorCampaignFan: {
       findUnique: async () => null,
@@ -222,8 +238,11 @@ test("INT5.7A-5 a full 50-claimer page uses one canonical FanData lock for ident
   assert.equal(locks.length, 3, "two fixed Campaign/collector locks + one FanData authority lock");
   const fanUpserts = rawSql.filter((entry) => /INSERT INTO "CreatorFan"/.test(entry.sql));
   const valueUpserts = rawSql.filter((entry) => /INSERT INTO "CreatorFanValueCurrent"/.test(entry.sql));
+  const membershipUpserts = rawSql.filter((entry) => /INSERT INTO "CreatorCampaignFan"/.test(entry.sql));
   assert.equal(fanUpserts.length, 1);
   assert.equal(valueUpserts.length, 1);
+  assert.equal(membershipUpserts.length, 1, "the entire claimer page must use one set-based membership statement");
+  assert.equal(JSON.parse(membershipUpserts[0].args[0]).length, 50);
   assert.equal(JSON.parse(fanUpserts[0].args[0]).length, 50);
   assert.equal(JSON.parse(valueUpserts[0].args[0]).length, 50);
 });

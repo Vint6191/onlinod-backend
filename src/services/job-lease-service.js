@@ -5,11 +5,19 @@ const prisma = require("../prisma");
 const { isOwner, normalizeAssignedCreators } = require("./team-access-control");
 const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./execution-access-fence-service");
 const { applyJobChunk, applyJobResult, recordJobFailure } = require("./job-result-service");
+const { promoteQueuedCampaignFanRefreshDemands } = require("./campaign-fan-refresh-queue-service");
 const { filterClaimableDesktopJobKeys } = require("./job-catalog");
 const { completeDialogJobFenced } = require("./dialog-job-completion-fence");
 const { completeNotificationSync } = require("./notification-sync-state-service");
 const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { lockDbAdvisoryXact } = require("./db-transaction-service");
+const {
+  FAN_DATA_REFRESH_MAX_ACTIVE_CLAIMS,
+  FAN_DATA_REFRESH_MAX_ACTIVE_CLAIMS_PER_CREATOR,
+  fanDataRefreshClaimAvailable,
+} = require("./provider-capacity-authority-service");
+const { enterCampaignClaimGeneration } = require("./campaign-causal-activation-service");
 const { capabilityFreshnessWindow, isCapabilityTimestampFresh } = require("./capability-freshness-authority-service");
 const { createFanObservationToken } = require("./fan-observation-token-service");
 const {
@@ -27,6 +35,9 @@ const RETRY_BACKOFF_MS = 60 * 1000;
 const MAX_ATTEMPTS = 5;
 const JOB_CHUNK_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 30_000 });
 const JOB_COMPLETION_TRANSACTION_OPTIONS = Object.freeze({ maxWait: 10_000, timeout: 60_000 });
+const CAMPAIGN_DIRECTORY_DISCOVERY_MAX_ACTIVE_CLAIMS = Math.max(1, Math.min(100, Number.parseInt(process.env.CAMPAIGN_DIRECTORY_DISCOVERY_MAX_ACTIVE_CLAIMS || "8", 10) || 8));
+const CAMPAIGN_DIRECTORY_DISCOVERY_CLAIM_LOCK_KEY = "campaign-directory-discovery-claim-admission-v1";
+const CAMPAIGN_DIRECTORY_DISCOVERY_MAX_NON_RECURRING_ACTIVE_CLAIMS = Math.max(1, Math.min(CAMPAIGN_DIRECTORY_DISCOVERY_MAX_ACTIVE_CLAIMS, Number.parseInt(process.env.CAMPAIGN_DIRECTORY_DISCOVERY_MAX_NON_RECURRING_ACTIVE_CLAIMS || "4", 10) || 4));
 const DIALOG_INTELLIGENCE_JOB_KEY = "dialog_intelligence_scan";
 const DIALOG_DISCOVERY_DIALOG_ID = "__dialog_discovery__";
 const FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY = Object.freeze({
@@ -52,19 +63,64 @@ function clean(value, max = 500) {
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
-function boundedCampaignFrontierHashes(value) {
-  const out = {};
-  let count = 0;
-  for (const [rawKey, rawHash] of Object.entries(object(value))) {
-    if (count >= 2_000) break;
-    const campaignId = clean(rawKey, 220);
-    const hash = String(rawHash || "").trim().toLowerCase();
-    if (!campaignId || !/^[0-9a-f]{64}$/.test(hash)) continue;
-    out[campaignId] = hash;
-    count += 1;
-  }
-  return out;
+function campaignDirectoryDiscoveryJob(params) {
+  const value = object(params);
+  // Every fetch_campaigns job without an exact directory-reuse binding can
+  // issue provider /campaigns reads. Classify old pre-A10 queued jobs as
+  // discovery too, so rolling deployment cannot bypass the new active cap.
+  return !(Number(value.campaignDirectoryReuseVersion || 0) >= 1
+    && clean(value.campaignDirectoryReuseGeneration, 120));
 }
+function campaignDirectoryRecurringDiscoveryJob(params) {
+  const value = object(params);
+  return String(value.analyticsSyncKind || "") === "catchup"
+    && String(value.reason || "") === "creator_analytics_catchup"
+    && campaignDirectoryDiscoveryJob(value);
+}
+async function campaignDirectoryDiscoveryClaimAvailable(db, candidateParams = null) {
+  if (typeof db?.$queryRawUnsafe !== "function" || typeof db?.$executeRawUnsafe !== "function") return true;
+  await lockDbAdvisoryXact({ db, key: CAMPAIGN_DIRECTORY_DISCOVERY_CLAIM_LOCK_KEY });
+  // Count the entire CLAIMED set under one transaction-scoped advisory lock.
+  // A bounded JS sample is not sufficient: provider-free reuse rows could sort
+  // ahead of discovery rows and make a saturated fleet look under capacity.
+  // Legacy pre-A10 jobs are discovery unless they carry the exact A9 reuse
+  // binding, so rolling deployment cannot escape the cap.
+  const rows = await db.$queryRawUnsafe(`
+    WITH claimed AS (
+      SELECT "params",
+        NOT (
+          CASE
+            WHEN COALESCE("params"->>'campaignDirectoryReuseVersion', '') ~ '^[0-9]+$'
+              THEN ("params"->>'campaignDirectoryReuseVersion')::integer
+            ELSE 0
+          END >= 1
+          AND NULLIF(BTRIM(COALESCE("params"->>'campaignDirectoryReuseGeneration', '')), '') IS NOT NULL
+        ) AS discovery
+      FROM "JobInstance"
+      WHERE "jobKey" = 'fetch_campaigns'
+        AND "status" = 'CLAIMED'
+    )
+    SELECT
+      COUNT(*) FILTER (WHERE discovery)::bigint AS "activeDiscovery",
+      COUNT(*) FILTER (
+        WHERE discovery
+          AND NOT (
+            COALESCE("params"->>'analyticsSyncKind', '') = 'catchup'
+            AND COALESCE("params"->>'reason', '') = 'creator_analytics_catchup'
+          )
+      )::bigint AS "activeNonRecurringDiscovery"
+    FROM claimed
+  `);
+  const row = Array.isArray(rows) ? rows[0] : rows;
+  const activeDiscovery = Number(row?.activeDiscovery ?? row?.activediscovery ?? 0);
+  const activeNonRecurring = Number(row?.activeNonRecurringDiscovery ?? row?.activenonrecurringdiscovery ?? 0);
+  if (!Number.isFinite(activeDiscovery) || activeDiscovery >= CAMPAIGN_DIRECTORY_DISCOVERY_MAX_ACTIVE_CLAIMS) return false;
+  if (!campaignDirectoryRecurringDiscoveryJob(candidateParams)) {
+    return Number.isFinite(activeNonRecurring) && activeNonRecurring < CAMPAIGN_DIRECTORY_DISCOVERY_MAX_NON_RECURRING_ACTIVE_CLAIMS;
+  }
+  return true;
+}
+
 function campaignClaimParams(value) {
   const params = { ...object(value) };
   // Retire the old O(campaign fan history) catch-up hints at the claim fence so
@@ -73,24 +129,50 @@ function campaignClaimParams(value) {
   delete params.knownCampaignFanCounts;
   delete params.knownClaimersByCampaign;
   // Retire the old terminal 10k claimer-page cap from already-queued jobs.
-  // campaigns-v10 keeps page/offset in O(1) durable continuation and relies on
+  // campaigns-v10+ keep page/offset in O(1) durable continuation and rely on
   // exact server-side no-progress detection instead of a completeness cap.
   delete params.maxClaimerPages;
-  const hashes = boundedCampaignFrontierHashes(params.knownClaimerFrontierHashes);
-  if (Object.keys(hashes).length) params.knownClaimerFrontierHashes = hashes;
-  else delete params.knownClaimerFrontierHashes;
+  // Current Campaign traversal is order-independent. Historical head hashes
+  // remain server-side diagnostics only; never lease them as skip authority.
+  delete params.knownClaimerFrontierHashes;
   return params;
+}
+function campaignDirectoryReuseInitialContinuation(value) {
+  const params = object(value);
+  if (Number(params.campaignDirectoryReuseVersion || 0) < 1) return null;
+  const directoryGeneration = clean(params.campaignDirectoryReuseGeneration, 120);
+  if (!directoryGeneration) return null;
+  const generation = clean(params.collectionGeneration, 120);
+  const requestedAt = clean(params.collectionRequestedAt, 100);
+  const mode = String(params.collectionMode || params.campaignMode || "").toLowerCase();
+  const revision = Number(params.campaignDirectoryReuseRevision);
+  const campaignCount = Number(params.campaignDirectoryReuseCampaignCount);
+  const directoryRequestedAt = clean(params.campaignDirectoryReuseRequestedAt, 100);
+  if (!generation || !requestedAt || mode !== "catchup" || !directoryRequestedAt) return null;
+  if (!Number.isInteger(revision) || revision < 1 || !Number.isInteger(campaignCount) || campaignCount < 0) return null;
+  if (!Number.isFinite(Date.parse(requestedAt)) || !Number.isFinite(Date.parse(directoryRequestedAt))) return null;
+  return {
+    driverPhase: "execute",
+    jobContinuation: {
+      collectorVersion: "campaigns-v13", scanRunId: generation, scanStartedAt: new Date(requestedAt).toISOString(),
+      phase: "segment", campaignMode: "catchup", offset: 0, page: 0, campaigns: [],
+      segmentCursor: null, segmentRequestCursor: null, segmentHasMore: false, campaignIndex: 0,
+      claimerOffset: 0, claimerPage: 0, directorySourceExhausted: true, campaignPagesComplete: true, truncated: false,
+      totalCampaignCount: campaignCount, campaignBatchCount: 0, claimerBatchCount: 0, campaignScannerRejected: 0, claimerScannerRejected: 0,
+      fanValuesDiscovered: 0, quantumLeaseRevision: 0, quantumStartedAt: new Date(requestedAt).toISOString(), quantumRequests: 0,
+    },
+  };
 }
 function campaignServerBoundaryContinuation(value, externalCampaignId, previousValue = null, { forceTruncated = false } = {}) {
   const driver = object(value);
   if (driver.driverPhase !== "execute") return null;
   const current = object(driver.jobContinuation);
-  if (!["campaigns-v9", "campaigns-v10"].includes(String(current.collectorVersion || ""))) return null;
+  if (!["campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", "campaigns-v13"].includes(String(current.collectorVersion || ""))) return null;
   const campaignId = clean(externalCampaignId, 220);
   if (!campaignId || !Array.isArray(current.campaigns)) return null;
   const currentIndex = Math.max(0, Math.floor(Number(current.campaignIndex) || 0));
   let matchedIndex = -1;
-  for (let index = currentIndex; index < current.campaigns.length && index < 2_000; index += 1) {
+  for (let index = currentIndex; index < current.campaigns.length; index += 1) {
     const row = object(current.campaigns[index]);
     if (clean(row.id, 220) === campaignId) {
       matchedIndex = index;
@@ -112,6 +194,47 @@ function campaignServerBoundaryContinuation(value, externalCampaignId, previousV
     truncated: forceTruncated === true || previous.truncated === true,
   };
 }
+
+function campaignDirectorySegmentContinuation(value, segmentValue) {
+  const driver = object(value);
+  if (driver.driverPhase !== "execute") return null;
+  const current = object(driver.jobContinuation);
+  if (
+    current.collectorVersion !== "campaigns-v13" ||
+    current.phase !== "segment" ||
+    current.directorySourceExhausted !== true ||
+    current.campaignPagesComplete !== true ||
+    current.truncated === true
+  ) return null;
+  const segment = object(segmentValue);
+  const requestCursor = clean(segment.requestCursor, 220) || null;
+  const currentCursor = clean(current.segmentCursor, 220) || null;
+  if (requestCursor !== currentCursor) return null;
+  const campaigns = Array.isArray(segment.campaigns)
+    ? segment.campaigns.slice(0, 50).map((item) => {
+      const row = object(item);
+      const id = clean(row.id, 220);
+      return id && typeof row.scanClaimers === "boolean" ? { id, scanClaimers: row.scanClaimers } : null;
+    }).filter(Boolean)
+    : [];
+  const cursor = clean(segment.cursor, 220) || requestCursor;
+  const totalCampaignCount = Number.isInteger(Number(segment.totalCampaignCount)) && Number(segment.totalCampaignCount) >= 0
+    ? Number(segment.totalCampaignCount)
+    : Number(current.totalCampaignCount || 0);
+  return {
+    ...current,
+    phase: "claimers",
+    campaigns,
+    campaignIndex: 0,
+    claimerOffset: 0,
+    claimerPage: 0,
+    segmentRequestCursor: requestCursor,
+    segmentCursor: cursor,
+    segmentHasMore: segment.hasMore === true,
+    totalCampaignCount,
+  };
+}
+
 function waitKind(reason) {
   const text = String(reason || "").toLowerCase();
   if (text.includes("creator execution context unavailable")) return "creator_context";
@@ -167,15 +290,22 @@ function dialogDiscoveryClaimConstraint(enabled) {
   };
 }
 
-function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly }) {
+function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly, excludedJobIds = [], fanRefreshBlockedCreatorIds = [], fanRefreshGlobalBlocked = false }) {
+  const constraints = [];
   const discoveryConstraint = dialogDiscoveryClaimConstraint(dialogDiscoveryOnly);
+  if (discoveryConstraint) constraints.push(discoveryConstraint);
+  if (fanRefreshGlobalBlocked) constraints.push({ jobKey: { not: "fan_data_point_refresh" } });
+  if (fanRefreshBlockedCreatorIds.length) {
+    constraints.push({ NOT: { jobKey: "fan_data_point_refresh", creatorId: { in: fanRefreshBlockedCreatorIds } } });
+  }
   return {
     status: "SCHEDULED",
     nextRunAt: { lte: now },
     attempts: { lt: MAX_ATTEMPTS },
     jobKey: { in: allowedJobKeys },
     creatorId: { in: eligibleCreatorIds },
-    ...(discoveryConstraint ? { AND: [discoveryConstraint] } : {}),
+    ...(excludedJobIds.length ? { id: { notIn: excludedJobIds } } : {}),
+    ...(constraints.length ? { AND: constraints } : {}),
   };
 }
 function safeProgress(value) {
@@ -426,11 +556,26 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   if (
     capabilities?.campaignCausalObservationV1 !== true ||
     capabilities?.campaignServerFanRefreshV1 !== true ||
-    capabilities?.campaignResumablePaginationV1 !== true
+    capabilities?.campaignResumablePaginationV1 !== true ||
+    capabilities?.campaignFreshnessCoverageV1 !== true ||
+    capabilities?.campaignOrderIndependentTraversalV1 !== true ||
+    capabilities?.campaignSegmentedFairTraversalV1 !== true ||
+    capabilities?.campaignFrontierSchedulingV1 !== true ||
+    capabilities?.campaignDirectoryReuseV1 !== true
   ) {
     allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
   }
   if (!allowedJobKeys.length) return { job: null, reason: "no-capabilities" };
+  if (allowedJobKeys.includes("fan_data_point_refresh")) {
+    try {
+      await promoteQueuedCampaignFanRefreshDemands({ db: prisma, now, maxJobs: 4 });
+    } catch (error) {
+      // Promotion is an availability optimization over already-durable demand.
+      // Never make unrelated claim classes unavailable because a backlog sweep
+      // encountered a transient DB error. The queued demand remains recoverable.
+      console.warn("[job-lease/fan-refresh-backlog-promotion] failed:", error?.message || error);
+    }
+  }
   const explicitlyExcluded = new Set(
     (Array.isArray(excludedCreatorIds) ? excludedCreatorIds : [])
       .map((value) => String(value || "").trim())
@@ -444,12 +589,18 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   // preventing parked leases without blocking useful work on another device.
   const eligibleCreatorIds = creatorIds.filter((creatorId) => !explicitlyExcluded.has(creatorId));
   if (!eligibleCreatorIds.length) return { job: null, reason: "creators-busy" };
-  for (let race = 0; race < 5; race += 1) {
+  const capacityBlockedIds = [];
+  const fanRefreshBlockedCreatorIds = [];
+  let fanRefreshGlobalBlocked = false;
+  for (let race = 0; race < 20; race += 1) {
     const candidateWhere = claimCandidateWhere({
       allowedJobKeys,
       eligibleCreatorIds,
       now,
       dialogDiscoveryOnly,
+      excludedJobIds: capacityBlockedIds,
+      fanRefreshBlockedCreatorIds,
+      fanRefreshGlobalBlocked,
     });
     const candidate = await prisma.jobInstance.findFirst({
       where: candidateWhere,
@@ -462,35 +613,76 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     if (await cancelRedundantNotificationFull(candidate, now)) continue;
     const leaseToken = crypto.randomBytes(32).toString("base64url");
     const until = new Date(now.getTime() + leaseDuration(leaseMs));
-    const updated = await prisma.jobInstance.updateMany({
-      where: {
-        id: candidate.id,
-        ...claimCandidateWhere({
-          allowedJobKeys,
-          eligibleCreatorIds,
-          now,
-          dialogDiscoveryOnly,
-        }),
-      },
-      data: {
-        status: "CLAIMED", claimedAt: now, claimedByDeviceId: device.id, leaseUntil: until,
-        leaseTokenHash: hashToken(leaseToken), leaseRevision: { increment: 1 }, leaseMemberId: member.id, leaseAccessEpoch: Number(member.accessEpoch || 1), startedAt: candidate.startedAt || now, lastError: null,
-        progress: clearWaitProgress(candidate.progress),
-        ...(FAN_OBSERVATION_READ_LEASE_JOB_KEYS.has(String(candidate.jobKey || "")) ? {
-          params: {
-            ...(String(candidate.jobKey || "") === "fetch_campaigns" ? campaignClaimParams(candidate.params) : object(candidate.params)),
-            observationTokenVersion: 1,
-            observationReadLeaseVersion: 1,
-            ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignResumablePaginationVersion: 1 } : {}),
-          },
-        } : {}),
-      },
-    });
-    if (!updated.count) continue;
-    const claimed = await prisma.jobInstance.findUnique({
-      where: { id: candidate.id },
-      include: { creator: { select: { id: true, remoteId: true, username: true, displayName: true } } },
-    });
+    const reuseContinuation = String(candidate.jobKey || "") === "fetch_campaigns" && candidate.continuation == null
+      ? campaignDirectoryReuseInitialContinuation(candidate.params)
+      : null;
+    const claimData = {
+      status: "CLAIMED", claimedAt: now, claimedByDeviceId: device.id, leaseUntil: until,
+      leaseTokenHash: hashToken(leaseToken), leaseRevision: { increment: 1 }, leaseMemberId: member.id, leaseAccessEpoch: Number(member.accessEpoch || 1), startedAt: candidate.startedAt || now, lastError: null,
+      progress: clearWaitProgress(candidate.progress),
+      ...(FAN_OBSERVATION_READ_LEASE_JOB_KEYS.has(String(candidate.jobKey || "")) ? {
+        params: {
+          ...(String(candidate.jobKey || "") === "fetch_campaigns" ? campaignClaimParams(candidate.params) : object(candidate.params)),
+          observationTokenVersion: 1,
+          observationReadLeaseVersion: 1,
+          ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignResumablePaginationVersion: 1, campaignFreshnessCoverageVersion: 1, campaignOrderIndependentTraversalVersion: 1, campaignSegmentedFairTraversalVersion: 1, campaignFrontierSchedulingVersion: 1, campaignDirectoryReuseVersion: 1 } : {}),
+        },
+      } : {}),
+      ...(reuseContinuation ? { continuation: reuseContinuation } : {}),
+    };
+    const claimWork = async (db) => {
+      if (String(candidate.jobKey || "") === "fetch_campaigns") {
+        await enterCampaignClaimGeneration({ db });
+        if (campaignDirectoryDiscoveryJob(candidate.params) && !(await campaignDirectoryDiscoveryClaimAvailable(db, candidate.params))) {
+          return { __campaignDirectoryCapacityBlocked: true };
+        }
+      }
+      if (String(candidate.jobKey || "") === "fan_data_point_refresh") {
+        const admission = await fanDataRefreshClaimAvailable(db, candidate.creatorId);
+        if (!admission.available) return { __fanDataRefreshCapacityBlocked: true, ...admission };
+      }
+      const updated = await db.jobInstance.updateMany({
+        where: {
+          id: candidate.id,
+          ...claimCandidateWhere({
+            allowedJobKeys,
+            eligibleCreatorIds,
+            now,
+            dialogDiscoveryOnly,
+            excludedJobIds: capacityBlockedIds,
+            fanRefreshBlockedCreatorIds,
+            fanRefreshGlobalBlocked,
+          }),
+        },
+        data: claimData,
+      });
+      if (!updated.count) return null;
+      return db.jobInstance.findUnique({
+        where: { id: candidate.id },
+        include: { creator: { select: { id: true, remoteId: true, username: true, displayName: true } } },
+      });
+    };
+    let claimed = null;
+    try {
+      claimed = ["fetch_campaigns", "fan_data_point_refresh"].includes(String(candidate.jobKey || ""))
+        ? await prisma.$transaction(claimWork, JOB_CHUNK_TRANSACTION_OPTIONS)
+        : await claimWork(prisma);
+    } catch (error) {
+      if (String(candidate.jobKey || "") === "fetch_campaigns"
+          && /CAMPAIGN_CLAIM_GENERATION_RETIRED/.test(String(error?.message || ""))) {
+        continue;
+      }
+      throw error;
+    }
+    if (claimed?.__campaignDirectoryCapacityBlocked === true) {
+      capacityBlockedIds.push(candidate.id);
+      continue;
+    }
+    if (claimed?.__fanDataRefreshCapacityBlocked === true) {
+      if (claimed.globalFull) fanRefreshGlobalBlocked = true;
+      else if (!fanRefreshBlockedCreatorIds.includes(String(candidate.creatorId))) fanRefreshBlockedCreatorIds.push(String(candidate.creatorId));
+      continue;
+    }
     if (!claimed) continue;
     return {
       job: {
@@ -503,7 +695,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       reason: "claimed",
     };
   }
-  return { job: null, reason: "race-lost" };
+  return { job: null, reason: capacityBlockedIds.length ? "campaign-directory-capacity" : (fanRefreshGlobalBlocked || fanRefreshBlockedCreatorIds.length ? "fan-data-refresh-capacity" : "race-lost") };
 }
 async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired = false, now = null }) {
   const { device, member } = await requireOwnedDevice({ userId, deviceId });
@@ -738,6 +930,12 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       : sideEffect?.serverNoProgressDetected === true
         ? campaignServerBoundaryContinuation(requestedContinuation, sideEffect.externalCampaignId, job.continuation, { forceTruncated: true })
         : null;
+    const campaignSegmentOverride = sideEffect?.campaignDirectorySegment
+      ? campaignDirectorySegmentContinuation(requestedContinuation, sideEffect.campaignDirectorySegment)
+      : null;
+    if (sideEffect?.campaignDirectorySegment && !campaignSegmentOverride) {
+      throw new JobLeaseError("CAMPAIGN_SEGMENT_CONTINUATION_INVALID", "Campaign directory segment could not be bound to requested continuation", 409);
+    }
     let updated = null;
     if (sideEffect?.completeAfterCommit === true) {
       updated = await tx.jobInstance.update({
@@ -750,13 +948,13 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
           },
         },
       });
-    } else if (campaignBoundaryOverride || sideEffect?.jobContinuationOverride) {
+    } else if (campaignBoundaryOverride || campaignSegmentOverride || sideEffect?.jobContinuationOverride) {
       updated = await tx.jobInstance.update({
         where: { id: job.id },
         data: {
           continuation: {
             driverPhase: "execute",
-            jobContinuation: campaignBoundaryOverride || sideEffect.jobContinuationOverride,
+            jobContinuation: campaignBoundaryOverride || campaignSegmentOverride || sideEffect.jobContinuationOverride,
           },
         },
       });
@@ -851,6 +1049,32 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       leaseRevision: completionLeaseRevision,
     };
     if (sideEffect?.ok !== true) {
+      const campaignProtocolSuperseded =
+        job.jobKey === "fetch_campaigns" &&
+        sideEffect?.type === "campaigns" &&
+        sideEffect?.completion?.protocolCurrent === false;
+      if (campaignProtocolSuperseded) {
+        const retryAt = new Date(now.getTime() + 1_000);
+        const superseded = await prisma.jobInstance.updateMany({
+          where: completionFence,
+          data: {
+            status: "SCHEDULED",
+            nextRunAt: retryAt,
+            completedAt: null,
+            claimedAt: null,
+            claimedByDeviceId: null,
+            leaseUntil: null,
+            leaseTokenHash: null,
+            continuation: null,
+            workId: null,
+            result: { ...(result || {}), completionSideEffect: sideEffect || null },
+            lastError: "fetch_campaigns_protocol_superseded",
+            progress: { percent: 0, message: "fetch_campaigns protocol upgraded; scheduled for current collector" },
+          },
+        });
+        if (!superseded.count) throw new JobLeaseError("JOB_LEASE_STALE", "Campaign protocol supersession fence was lost");
+        return { job: { id: job.id, status: "SCHEDULED", retryAt }, sideEffect, protocolSuperseded: true };
+      }
       const attempts = Number(job.attempts || 0) + 1;
       const terminal = attempts >= MAX_ATTEMPTS;
       const retryAt = terminal ? null : new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
@@ -1240,6 +1464,12 @@ module.exports = {
   completeJob,
   failJob,
   releaseJob,
+  campaignDirectoryDiscoveryJob,
+  CAMPAIGN_DIRECTORY_DISCOVERY_MAX_ACTIVE_CLAIMS,
+  CAMPAIGN_DIRECTORY_DISCOVERY_MAX_NON_RECURRING_ACTIVE_CLAIMS,
+  FAN_DATA_REFRESH_MAX_ACTIVE_CLAIMS,
+  FAN_DATA_REFRESH_MAX_ACTIVE_CLAIMS_PER_CREATOR,
+  fanDataRefreshClaimAvailable,
   sweepExpiredLeases,
   normalizeLeaseContinuation,
   dialogDiscoveryClaimConstraint,

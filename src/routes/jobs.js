@@ -23,6 +23,11 @@ const JOB_SERVER_CAPABILITIES = Object.freeze({
   campaignCausalObservationV1: true,
   campaignServerFanRefreshV1: true,
   campaignResumablePaginationV1: true,
+  campaignFreshnessCoverageV1: true,
+  campaignOrderIndependentTraversalV1: true,
+  campaignSegmentedFairTraversalV1: true,
+  campaignFrontierSchedulingV1: true,
+  campaignDirectoryReuseV1: true,
 });
 
 router.use((req, res, next) => {
@@ -91,6 +96,11 @@ const claimSchema = z.object({
     campaignCausalObservationV1: z.boolean().optional().default(false),
     campaignServerFanRefreshV1: z.boolean().optional().default(false),
     campaignResumablePaginationV1: z.boolean().optional().default(false),
+    campaignFreshnessCoverageV1: z.boolean().optional().default(false),
+    campaignOrderIndependentTraversalV1: z.boolean().optional().default(false),
+    campaignSegmentedFairTraversalV1: z.boolean().optional().default(false),
+    campaignFrontierSchedulingV1: z.boolean().optional().default(false),
+    campaignDirectoryReuseV1: z.boolean().optional().default(false),
   }).passthrough().optional().default({}),
 });
 

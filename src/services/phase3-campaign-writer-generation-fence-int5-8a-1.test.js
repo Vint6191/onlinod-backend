@@ -77,12 +77,23 @@ test("INT5.8A-1 activation uses JobInstance -> barrier lock order and bounded re
   const raw = [];
   const tx = {
     async $queryRawUnsafe(sql) {
-      raw.push(String(sql));
-      if (/FROM "JobInstance"/.test(sql) && /FOR UPDATE/.test(sql) && !/WITH claimed/.test(sql)) return [];
-      if (/FROM "SystemSetting"/.test(sql) && /FOR UPDATE/.test(sql)) {
-        return [{ value: { active: true, epoch: 5, writerGenerationActive: false, writerGeneration: 3 } }];
+      const text = String(sql);
+      raw.push(text);
+      if (/FROM "JobInstance"/.test(text) && /FOR UPDATE/.test(text) && !/WITH claimed/.test(text)) return [];
+      if (/FROM "SystemSetting"/.test(text) && /FOR UPDATE/.test(text)) {
+        return [{ value: { active: true, epoch: 5, writerGenerationActive: false, claimGenerationActive: false, writerGeneration: 3 } }];
       }
-      if (/WITH claimed/.test(sql)) return [{ revoked: 2, stamped: 4 }];
+      if (/FROM pg_trigger/.test(text)) return [
+        { triggerName: "phase3_campaign_writer_generation_ingest_guard_trg", tableName: "AnalyticsIngestBatch", enabled: "O", functionName: "phase3_campaign_writer_generation_guard", functionDefinition: "current_setting(onlinod.campaign_writer_generation) CAMPAIGN_WRITER_GENERATION_RETIRED" },
+        { triggerName: "phase3_campaign_writer_generation_identity_guard_trg", tableName: "CreatorFan", enabled: "O", functionName: "phase3_campaign_writer_generation_guard", functionDefinition: "current_setting(onlinod.campaign_writer_generation) CAMPAIGN_WRITER_GENERATION_RETIRED" },
+        { triggerName: "phase3_campaign_writer_generation_value_guard_trg", tableName: "CreatorFanValueCurrent", enabled: "O", functionName: "phase3_campaign_writer_generation_guard", functionDefinition: "current_setting(onlinod.campaign_writer_generation) CAMPAIGN_WRITER_GENERATION_RETIRED" },
+        { triggerName: "phase3_campaign_claim_generation_guard_trg", tableName: "JobInstance", enabled: "O", functionName: "phase3_campaign_claim_generation_guard", functionDefinition: "current_setting(onlinod.campaign_claim_generation) CAMPAIGN_CLAIM_GENERATION_RETIRED" },
+      ];
+      if (/FROM "_prisma_migrations"/.test(text)) return [
+        { migrationName: "20260918003000_phase3_campaign_writer_generation_fence", finishedAt: new Date(), rolledBackAt: null },
+        { migrationName: "20260918150000_phase3_campaign_claim_generation_fence", finishedAt: new Date(), rolledBackAt: null },
+      ];
+      if (/WITH claimed/.test(text)) return [{ revoked: 2, stamped: 4 }];
       throw new Error(`unexpected SQL: ${sql}`);
     },
     systemSetting: {
@@ -105,12 +116,15 @@ test("INT5.8A-1 activation uses JobInstance -> barrier lock order and bounded re
   assert.equal(transactionAttempts, 2);
   assert.equal(result.active, true);
   assert.equal(result.writerGenerationActive, true);
+  assert.equal(result.claimGenerationActive, true);
   assert.equal(result.writerGeneration, 4);
   assert.equal(result.epoch, 5, "re-activating an already-causal barrier must not invent a new causal epoch");
   assert.equal(result.revoked, 2);
-  assert.equal(raw.length, 3);
+  assert.equal(raw.length, 5);
   assert.match(raw[0], /JobInstance[\s\S]*FOR UPDATE/);
   assert.match(raw[1], /SystemSetting[\s\S]*FOR UPDATE/);
+  assert.match(raw[2], /FROM pg_trigger/);
+  assert.match(raw[3], /FROM "_prisma_migrations"/);
 });
 
 test("INT5.8A-1 all Campaign ingest/completion transactions enter the writer generation before batch work", () => {

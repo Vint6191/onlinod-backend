@@ -9,7 +9,8 @@ const { JOB_KEY: FINANCIAL_TRANSACTIONS_JOB_KEY, ingestFinancialTransactionsChun
 const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { FAN_DATA_POINT_REFRESH_JOB_KEY, applyFanDataPointRefreshChunk } = require("./fan-data-authority-service");
-const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, ingestCampaignFanValueChunk, ingestCampaignFanValuesBatchChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
+const { recordCampaignFanRefreshChunk, finalizeCampaignFanRefreshJob, recordCampaignFanRefreshJobFailure } = require("./campaign-fan-refresh-queue-service");
+const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, loadCampaignDirectorySegment, ingestCampaignFanValueChunk, ingestCampaignFanValuesBatchChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
 const { recordCampaignCollectionFailure } = require("./analytics-collector-control-service");
 const {
   LIKES_DISCOVERY_JOB_KEY,
@@ -84,7 +85,11 @@ async function applyCampaignsResult({ db = prisma, job, deviceId, userId, result
   const payload = asObject(result);
   const completion = await completeCampaignScan({ db, job, deviceId, result: payload });
   const rangeKey = String(payload.rangeKey || job.params?.rangeKey || "7d").trim() || "7d";
-  if (completion.complete !== true) {
+  // FanData refresh is delegated to a separate durable queue. Once provider
+  // membership traversal is proven, finish this OF-reading job even if that
+  // asynchronous queue is still outstanding; otherwise every refresh backlog
+  // turns into a second full Campaign provider traversal.
+  if (completion.providerTraversalComplete !== true) {
     return { ok: false, type: "campaigns", rangeKey, completion };
   }
 
@@ -109,6 +114,7 @@ async function applyCampaignsResult({ db = prisma, job, deviceId, userId, result
     campaignCount,
     totalActive,
     totalClaimers,
+    refreshPending: completion.complete !== true,
     completion,
   };
 }
@@ -191,6 +197,9 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   }
   if (job.jobKey === CAMPAIGNS_JOB_KEY && ["campaigns_page", "campaign_claimers_page"].includes(chunkResult?.kind)) {
     return ingestCampaignChunk({ db, job, deviceId, chunk: chunkResult });
+  }
+  if (job.jobKey === CAMPAIGNS_JOB_KEY && chunkResult?.kind === "campaign_directory_segment") {
+    return loadCampaignDirectorySegment({ db, job, chunk: chunkResult });
   }
   if (job.jobKey === CAMPAIGNS_JOB_KEY && chunkResult?.kind === "campaign_fan_value") {
     return ingestCampaignFanValueChunk({ db, job, deviceId, chunk: chunkResult });
@@ -284,7 +293,16 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
     return applySubscriberScanChunk({ db, job, deviceId, userId, chunkResult });
   }
   if (job.jobKey === FAN_DATA_POINT_REFRESH_JOB_KEY) {
-    return applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult });
+    const applyPointRefresh = async (tx) => {
+      const applied = await applyFanDataPointRefreshChunk({ db: tx, job, deviceId, chunkResult });
+      await recordCampaignFanRefreshChunk({ db: tx, job, chunkResult, applied });
+      return applied;
+    };
+    // Campaign freshness demand/result projection must commit atomically with
+    // canonical FanData. A process crash may not leave fresh data committed
+    // while the waiting Campaign runs remain permanently OUTSTANDING.
+    if (typeof db?.$transaction === "function") return db.$transaction((tx) => applyPointRefresh(tx));
+    return applyPointRefresh(db);
   }
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) {
     return applyLikesDiscoveryChunk({ db, job, deviceId, userId, chunkResult });
@@ -311,7 +329,10 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return applyLikesDiscoveryCompletion({ db, job, deviceId, userId, result: result || {} });
   if (job.jobKey === SFS_DISCOVERY_JOB_KEY) return applySfsDiscoveryCompletion({ db, job, deviceId, userId, result: result || {} });
   if (job.jobKey === SFS_TARGET_SCAN_JOB_KEY) return applySfsTargetScanCompletion({ db, job, deviceId, userId, result: result || {} });
-  if (job.jobKey === FAN_DATA_POINT_REFRESH_JOB_KEY) return { ok: true, type: "fan_data_point_refresh", ...(asObject(result)) };
+  if (job.jobKey === FAN_DATA_POINT_REFRESH_JOB_KEY) {
+    const demandCoverage = await finalizeCampaignFanRefreshJob({ db, job, result: result || {} });
+    return { ok: true, type: "fan_data_point_refresh", ...(asObject(result)), demandCoverage };
+  }
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) {
     const applied = await applySubscriberScanCompletion({ db, job, deviceId, userId, result: result || {} });
     cleanupSubscriberScanHistory({ creatorId: job.creatorId }).catch(() => null);
@@ -331,6 +352,7 @@ async function recordJobFailure({ db = prisma, job, error, terminal = true, retr
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) return recordSubscriberScanFailure({ db, job, error, terminal });
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return recordLikesDiscoveryFailure({ db, job, error, terminal });
   if ([SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY].includes(job.jobKey)) return recordSfsJobFailure({ db, job, error, terminal });
+  if (job.jobKey === FAN_DATA_POINT_REFRESH_JOB_KEY) return recordCampaignFanRefreshJobFailure({ db, job, error, terminal });
   return null;
 }
 

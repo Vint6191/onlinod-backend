@@ -13,6 +13,7 @@ const {
   NOTIFICATION_COLLECTION_FRESHNESS_MS,
   FINANCIAL_COLLECTION_FRESHNESS_MS,
   CAMPAIGN_COLLECTION_FRESHNESS_MS,
+  CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS,
   trustedCollectionTimestamp,
 } = require("./analytics-freshness-policy");
 const {
@@ -26,8 +27,6 @@ const CAMPAIGN_JOB_KEY = "fetch_campaigns";
 const ANALYTICS_SYNC_VERSION = 1;
 const NOTIFICATION_KNOWN_ID_LIMIT = 300;
 const FINANCIAL_KNOWN_ID_LIMIT = 300;
-const CAMPAIGN_CATCHUP_HINT_CAMPAIGN_LIMIT = 2_000;
-const CAMPAIGN_FRONTIER_HASH_RE = /^[0-9a-f]{64}$/;
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -168,6 +167,58 @@ async function campaignInitialCoverageReady(db, creatorId, now = new Date()) {
   return Boolean(state?.baselineGeneration && verifiedProofTimestampReady(state?.baselineVerifiedAt, now));
 }
 
+function campaignDelegatedRefreshPending(state) {
+  const activeGeneration = String(state?.activeGeneration || "").trim();
+  const coverageRunId = String(state?.fanValueCoverageScanRunId || "").trim();
+  const expected = Math.max(0, Number(state?.fanValueExpected || 0));
+  const freshness = String(state?.fanValueFreshnessStatus || "MISSING").toUpperCase();
+  // FanData coverage is a generation-bound post-traversal authority. Do not
+  // launch another Campaign provider generation while the current generation's
+  // delegated refresh is QUEUED/PARTIAL, even when frontier budgeting leaves
+  // membershipCoverageStatus PARTIAL. Otherwise a later frontier tranche can
+  // reset the run ledger and hide older outstanding/failed freshness work.
+  return Boolean(activeGeneration && coverageRunId === activeGeneration && expected > 0 && freshness !== "COMPLETE");
+}
+
+function campaignDirectoryDiscoveryPending(state) {
+  const requested = Math.max(0, Number(state?.campaignDirectoryDiscoveryRequestedRevision || 0));
+  const completed = Math.max(0, Number(state?.campaignDirectoryDiscoveryCompletedRevision || 0));
+  return requested > completed;
+}
+
+function campaignDirectoryDiscoveryDue(state, now = new Date()) {
+  if (!state) return true;
+  if (campaignDirectoryDiscoveryPending(state)) return true;
+  const explicitDueAt = state?.campaignDirectoryDiscoveryDueAt ? new Date(state.campaignDirectoryDiscoveryDueAt) : null;
+  if (explicitDueAt && Number.isFinite(explicitDueAt.getTime())) return explicitDueAt.getTime() <= now.getTime();
+  const verifiedAt = trustedCollectionTimestamp(state?.campaignDirectoryVerifiedAt, now);
+  if (!verifiedAt) return true;
+  return verifiedAt.getTime() <= now.getTime() - CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS;
+}
+
+function campaignFrontierWorkDue(state, now = new Date()) {
+  if (String(state?.campaignFrontierFreshnessStatus || "MISSING").toUpperCase() !== "COMPLETE") return true;
+  const nextDueAt = state?.campaignFrontierNextDueAt ? new Date(state.campaignFrontierNextDueAt) : null;
+  return Boolean(nextDueAt && Number.isFinite(nextDueAt.getTime()) && nextDueAt.getTime() <= now.getTime());
+}
+
+function campaignDirectoryReuseBinding(state, now = new Date()) {
+  if (campaignDirectoryDiscoveryDue(state, now)) return null;
+  const generation = clean(state?.campaignDirectoryGeneration, 120);
+  const requestedAt = state?.campaignDirectoryRequestedAt ? new Date(state.campaignDirectoryRequestedAt) : null;
+  const verifiedAt = state?.campaignDirectoryVerifiedAt ? new Date(state.campaignDirectoryVerifiedAt) : null;
+  const revision = Number(state?.campaignDirectoryRevision || 0);
+  const campaignCount = Number(state?.campaignDirectoryCampaignCount || 0);
+  if (!generation || !requestedAt || !Number.isFinite(requestedAt.getTime()) || !verifiedProofTimestampReady(verifiedAt, now)) return null;
+  if (!Number.isInteger(revision) || revision < 1 || !Number.isInteger(campaignCount) || campaignCount < 0) return null;
+  return {
+    campaignDirectoryReuseGeneration: generation,
+    campaignDirectoryReuseRequestedAt: requestedAt.toISOString(),
+    campaignDirectoryReuseRevision: revision,
+    campaignDirectoryReuseCampaignCount: campaignCount,
+  };
+}
+
 async function creatorAnalyticsInitialSyncReady({ db = prisma, creatorId, now = new Date() } = {}) {
   now = await dbAuthorityNow({ db, fallbackNow: now });
   if (!creatorId) return false;
@@ -234,6 +285,9 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
 
   if (!(await campaignInitialCoverageReady(db, creatorId, now))) {
     const campaignState = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId } });
+    if (campaignDelegatedRefreshPending(campaignState)) {
+      return { ready: false, stage: "campaigns", created: false, reason: "fan_refresh_pending", retryAfterAt: null, jobId: campaignState?.sourceJobId || null };
+    }
     const retry = retryDisposition(campaignState, now);
     if (retry.deferred) return { ready: false, stage: "campaigns", created: false, reason: "deferred", retryAfterAt: retry.retryAfterAt, jobId: null };
     if (retry.terminal) return { ready: false, stage: "campaigns", created: false, reason: "failed_terminal", retryAfterAt: null, jobId: null };
@@ -251,6 +305,13 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
       observationTokenVersion: 1,
       observationReadLeaseVersion: 1,
       campaignResumablePaginationVersion: 1,
+      campaignFreshnessCoverageVersion: 1,
+      campaignOrderIndependentTraversalVersion: 1,
+      campaignSegmentedFairTraversalVersion: 1,
+      campaignFrontierSchedulingVersion: 1,
+      campaignDirectoryReuseVersion: 1,
+      campaignDirectoryDiscoveryVersion: 1,
+      campaignFrontierBudget: 50,
     };
     const scheduled = await scheduleIfIdle({
       db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: 60_000,
@@ -287,29 +348,6 @@ async function recentKnownTransactionIds(db, creatorId) {
   return rows.map((row) => clean(row.externalTransactionId, 220)).filter(Boolean);
 }
 
-async function campaignCatchupState(db, creatorId) {
-  if (!db?.creatorCampaign?.findMany) return { knownClaimerFrontierHashes: {} };
-  // Catch-up planning must never walk CreatorCampaignFan history. The Desktop
-  // physically caps one collection at 2,000 Campaigns, so the planner reads at
-  // most that many compact CreatorCampaign rows using the existing
-  // (creatorId, collectedAt) index. A missing/invalid fingerprint is not a
-  // negative fact: the Desktop simply scans that Campaign.
-  const campaigns = await db.creatorCampaign.findMany({
-    where: { creatorId },
-    orderBy: [{ collectedAt: "desc" }],
-    take: CAMPAIGN_CATCHUP_HINT_CAMPAIGN_LIMIT,
-    select: { externalCampaignId: true, catchupFrontierHash: true },
-  });
-  const knownClaimerFrontierHashes = {};
-  for (const row of campaigns) {
-    const externalId = clean(row?.externalCampaignId, 220);
-    const hash = String(row?.catchupFrontierHash || "").trim().toLowerCase();
-    if (!externalId || !CAMPAIGN_FRONTIER_HASH_RE.test(hash)) continue;
-    knownClaimerFrontierHashes[externalId] = hash;
-  }
-  return { knownClaimerFrontierHashes };
-}
-
 function retryDisposition(state, now = new Date()) {
   const retryAt = state?.retryAfterAt ? new Date(state.retryAfterAt) : null;
   if (retryAt && Number.isFinite(retryAt.getTime()) && retryAt > now) {
@@ -332,7 +370,7 @@ function due(lastVerifiedAt, intervalMs, now) {
   return verifiedAt.getTime() <= now.getTime() - intervalMs;
 }
 
-async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20 } = {}) {
+async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20, campaignDirectoryDiscoveryAdmitted = true } = {}) {
   now = await dbAuthorityNow({ db, fallbackNow: now });
   const initial = await ensureInitialCreatorAnalyticsSync({ db, creatorId, agencyId, now, priority: Math.max(priority, 80) });
   if (!initial.ready) return { ready: false, initial, created: [], skipped: [] };
@@ -397,35 +435,54 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     }
   } else skipped.push("financial_catchup:fresh");
 
-  if (due(campaignState?.lastCatchupCompletedAt, CAMPAIGN_COLLECTION_FRESHNESS_MS, now)) {
-    const retry = retryDisposition(campaignState, now);
-    if (retry.deferred) skipped.push("campaigns_catchup:deferred");
-    else if (retry.terminal) skipped.push("campaigns_catchup:failed_terminal");
-    else {
-    const catchup = await campaignCatchupState(db, creatorId);
-    const params = {
-      analyticsSyncKind: "catchup",
-      analyticsSyncVersion: ANALYTICS_SYNC_VERSION,
-      analyticsSyncStage: "campaigns",
-      campaignMode: "catchup",
-      reason: "creator_analytics_catchup",
-      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "catchup", reason: "creator_analytics_catchup", now }),
-      pageSize: 50,
-      maxPages: 40,
-      claimerPageSize: 50,
-      fanValueBatchSize: 20,
-      observationTokenVersion: 1,
-      observationReadLeaseVersion: 1,
-      campaignResumablePaginationVersion: 1,
-      knownClaimerFrontierHashes: catchup.knownClaimerFrontierHashes,
-    };
-    const scheduled = await scheduleIfIdle({
-      db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: CAMPAIGN_COLLECTION_FRESHNESS_MS,
-      collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectorState: campaignState,
-    });
-    if (scheduled.created) created.push("campaigns_catchup"); else skipped.push(`campaigns_catchup:${scheduled.reason || "skipped"}`);
+  if (campaignDelegatedRefreshPending(campaignState)) {
+    skipped.push("campaigns_catchup:fan_refresh_pending");
+  } else {
+    const frontierDue = campaignFrontierWorkDue(campaignState, now);
+    const directoryDue = campaignDirectoryDiscoveryDue(campaignState, now);
+    const directoryReuse = (frontierDue || !directoryDue) ? campaignDirectoryReuseBinding(campaignState, now) : null;
+    const requiresDirectoryDiscovery = directoryDue || (frontierDue && !directoryReuse);
+    if (!frontierDue && !directoryDue) {
+      skipped.push("campaigns_catchup:fresh");
+    } else if (requiresDirectoryDiscovery && campaignDirectoryDiscoveryAdmitted !== true) {
+      skipped.push("campaigns_catchup:directory_capacity_deferred");
+    } else {
+      const retry = retryDisposition(campaignState, now);
+      if (retry.deferred) skipped.push("campaigns_catchup:deferred");
+      else if (retry.terminal) skipped.push("campaigns_catchup:failed_terminal");
+      else {
+        const params = {
+          analyticsSyncKind: "catchup",
+          analyticsSyncVersion: ANALYTICS_SYNC_VERSION,
+          analyticsSyncStage: "campaigns",
+          campaignMode: "catchup",
+          reason: "creator_analytics_catchup",
+          ...(directoryReuse || {}),
+          ...(!directoryReuse ? { campaignDirectoryDiscoveryVersion: 1 } : {}),
+          ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "catchup", reason: "creator_analytics_catchup", now }),
+          pageSize: 50,
+          maxPages: 40,
+          claimerPageSize: 50,
+          fanValueBatchSize: 20,
+          observationTokenVersion: 1,
+          observationReadLeaseVersion: 1,
+          campaignResumablePaginationVersion: 1,
+          campaignFreshnessCoverageVersion: 1,
+          campaignOrderIndependentTraversalVersion: 1,
+          campaignSegmentedFairTraversalVersion: 1,
+          campaignFrontierSchedulingVersion: 1,
+          campaignDirectoryReuseVersion: 1,
+          campaignFrontierBudget: 50,
+        };
+        const scheduled = await scheduleIfIdle({
+          db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: directoryReuse ? CAMPAIGN_COLLECTION_FRESHNESS_MS : CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS,
+          collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectorState: campaignState,
+        });
+        if (scheduled.created) created.push(directoryReuse ? "campaigns_frontier_reuse" : "campaigns_directory_discovery");
+        else skipped.push(`campaigns_catchup:${scheduled.reason || "skipped"}`);
+      }
     }
-  } else skipped.push("campaigns_catchup:fresh");
+  }
 
   return { ready: true, initial, created, skipped };
 }
@@ -434,7 +491,9 @@ async function advanceCreatorAnalyticsInitialSyncAfterCompletion({ db = prisma, 
   if (!job?.creatorId || !job?.agencyId || !lifecycleParams(job.params)) return { advanced: false, reason: "not_initial_analytics_job" };
   if (job.jobKey === NOTIFICATION_JOB_KEY && sideEffect?.verified !== true) return { advanced: false, reason: "notifications_not_verified" };
   if (job.jobKey === FINANCIAL_JOB_KEY && sideEffect?.complete !== true) return { advanced: false, reason: "financial_not_verified" };
-  if (job.jobKey === CAMPAIGN_JOB_KEY && sideEffect?.ok !== true) return { advanced: false, reason: "campaigns_not_verified" };
+  if (job.jobKey === CAMPAIGN_JOB_KEY && sideEffect?.completion?.complete !== true) {
+    return { advanced: false, reason: sideEffect?.ok === true ? "campaign_fan_refresh_pending" : "campaigns_not_verified" };
+  }
   const next = await ensureInitialCreatorAnalyticsSync({ db, creatorId: job.creatorId, agencyId: job.agencyId, now, priority: 95 });
   return { advanced: true, next };
 }
@@ -444,13 +503,16 @@ module.exports = {
   NOTIFICATION_CATCHUP_INTERVAL_MS: NOTIFICATION_COLLECTION_FRESHNESS_MS,
   FINANCIAL_CATCHUP_INTERVAL_MS: FINANCIAL_COLLECTION_FRESHNESS_MS,
   CAMPAIGN_CATCHUP_INTERVAL_MS: CAMPAIGN_COLLECTION_FRESHNESS_MS,
+  CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS,
   ensureInitialCreatorAnalyticsSync,
   ensureRecurringCreatorAnalyticsCatchups,
   advanceCreatorAnalyticsInitialSyncAfterCompletion,
   recentKnownNotificationIdsFromState,
   recentKnownTransactionIds,
-  campaignCatchupState,
   financialInitialCoverageReady,
   campaignInitialCoverageReady,
   creatorAnalyticsInitialSyncReady,
+  campaignDirectoryDiscoveryDue,
+  campaignDirectoryReuseBinding,
+  campaignFrontierWorkDue,
 };

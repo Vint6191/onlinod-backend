@@ -9,6 +9,7 @@ const {
   NOTIFICATION_COLLECTION_FRESHNESS_MS,
   FINANCIAL_COLLECTION_FRESHNESS_MS,
   CAMPAIGN_COLLECTION_FRESHNESS_MS,
+  CAMPAIGN_FAN_VALUE_FRESHNESS_MS,
   trustedCollectionTimestamp,
 } = require("./analytics-freshness-policy");
 
@@ -294,8 +295,10 @@ async function readCampaignPayingFanCount({ db, creatorId, start, end, fallback 
 
 async function readCampaignCurrentValues({ db, creatorId }) {
   if (typeof db?.$queryRawUnsafe !== "function") {
-    return { byCampaign: new Map(), summary: { ofValueKnownFans: 0, ofValuePayingFans: 0, platformReportedFanSpendCents: 0, ofValueFetchedAt: null } };
+    return { byCampaign: new Map(), summary: { ofValueKnownFans: 0, ofValuePayingFans: 0, platformReportedFanSpendCents: 0, ofValueFetchedAt: null, ofValueFreshnessCutoffAt: null } };
   }
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
+  const valueFreshnessCutoff = new Date(authorityNow.getTime() - CAMPAIGN_FAN_VALUE_FRESHNESS_MS);
   const [rows, summaryRows] = await Promise.all([
     db.$queryRawUnsafe(`
       SELECT
@@ -308,9 +311,10 @@ async function readCampaignCurrentValues({ db, creatorId }) {
       LEFT JOIN "CreatorFanValueCurrent" value
         ON value."creatorId" = membership."creatorId" AND value."fanId" = membership."fanId"
        AND value."availability" = 'AVAILABLE'
+       AND value."fetchedAt" >= $2::timestamptz
       WHERE membership."creatorId" = $1
       GROUP BY membership."campaignId"
-    `, creatorId),
+    `, creatorId, valueFreshnessCutoff),
     db.$queryRawUnsafe(`
       SELECT
         COUNT(value."id")::bigint AS "ofValueKnownFans",
@@ -320,11 +324,12 @@ async function readCampaignCurrentValues({ db, creatorId }) {
       FROM "CreatorFanValueCurrent" value
       WHERE value."creatorId" = $1
         AND value."availability" = 'AVAILABLE'
+        AND value."fetchedAt" >= $2::timestamptz
         AND EXISTS (
           SELECT 1 FROM "CreatorCampaignFan" membership
           WHERE membership."creatorId" = $1 AND membership."fanId" = value."fanId"
         )
-    `, creatorId),
+    `, creatorId, valueFreshnessCutoff),
   ]);
   return {
     byCampaign: new Map((rows || []).map((row) => [String(row.campaignId), {
@@ -338,6 +343,7 @@ async function readCampaignCurrentValues({ db, creatorId }) {
       ofValuePayingFans: int(summaryRows?.[0]?.ofValuePayingFans),
       platformReportedFanSpendCents: cents(summaryRows?.[0]?.platformReportedFanSpendCents),
       ofValueFetchedAt: iso(summaryRows?.[0]?.ofValueFetchedAt),
+      ofValueFreshnessCutoffAt: valueFreshnessCutoff.toISOString(),
     },
   };
 }
@@ -468,6 +474,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     ofValuePayingFans: int(campaignCurrent.summary.ofValuePayingFans),
     platformReportedFanSpendCents: cents(campaignCurrent.summary.platformReportedFanSpendCents),
     ofValueFetchedAt: iso(campaignCurrent.summary.ofValueFetchedAt),
+    ofValueFreshnessCutoffAt: iso(campaignCurrent.summary.ofValueFreshnessCutoffAt),
   };
 
   return {

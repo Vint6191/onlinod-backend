@@ -15,12 +15,12 @@ function sliceBetween(source, startNeedle, endNeedle) {
   return source.slice(start, end);
 }
 
-test("INT5.8A-6 current Campaign protocol is v10 and claim requires resumable-pagination capability", () => {
+test("INT5.8A-6 current Campaign protocol remains beyond v10 and claim requires resumable-pagination capability", () => {
   const ledger = read("src/services/creator-analytics-ledger-service.js");
   const route = read("src/routes/jobs.js");
   const lease = read("src/services/job-lease-service.js");
-  assert.match(ledger, /CAMPAIGN_COLLECTOR_VERSION = "campaigns-v10"/);
-  assert.match(ledger, /"campaigns-v9", CAMPAIGN_COLLECTOR_VERSION/);
+  assert.match(ledger, /CAMPAIGN_COLLECTOR_VERSION = "campaigns-v13"/);
+  assert.match(ledger, /"campaigns-v10", "campaigns-v11", "campaigns-v12", CAMPAIGN_COLLECTOR_VERSION/);
   assert.match(route, /campaignResumablePaginationV1: true/);
   assert.match(route, /campaignResumablePaginationV1: z\.boolean\(\)\.optional\(\)\.default\(false\)/);
   assert.match(lease, /capabilities\?\.campaignResumablePaginationV1 !== true/);
@@ -40,9 +40,9 @@ test("INT5.8A-6 backend accepts page numbers beyond 10k and uses exact current-r
   const ledger = read("src/services/creator-analytics-ledger-service.js");
   const claimer = sliceBetween(ledger, "const saved = await tx.creatorCampaign.findUnique", "function normalizeCampaignFanValueItem");
   assert.match(claimer, /const claimerPageNumber = integer\(payload\.pageNumber\);/);
-  assert.match(claimer, /sourceScanRunId: true/);
-  assert.match(claimer, /alreadyObservedInCurrentRun/);
-  assert.match(claimer, /currentRunMembershipProgress \+= 1/);
+  assert.match(ledger, /e\."sourceScanRunId" = \$4 AND e\."sourceScanStartedAt" = \$3::timestamptz/);
+  assert.match(ledger, /alreadyObservedInCurrentRun/);
+  assert.match(claimer, /membershipProjection\.currentRunMembershipProgress/);
   assert.match(claimer, /serverNoProgressDetected/);
   assert.match(claimer, /payload\.sourceHasMore === true/);
 });

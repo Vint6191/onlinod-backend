@@ -1122,6 +1122,45 @@ test("partial campaign proof is rescheduled instead of publishing DONE", async (
   assert.equal(failures[0].retryAfterAt.getTime(), result.job.retryAt.getTime());
 });
 
+test("pre-v12 Campaign completion is requeued as protocol superseded without consuming attempts", async () => {
+  const token = "campaign-protocol-superseded-token";
+  const now = new Date();
+  const job = {
+    id: "campaign-protocol-superseded-job", agencyId: "agency-1", creatorId: "creator-1", jobKey: "fetch_campaigns",
+    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 8,
+    leaseUntil: new Date(now.getTime() + 60_000), attempts: 4, params: { rangeKey: "30d" },
+    continuation: { driverPhase: "complete", jobContinuation: { collectorVersion: "campaigns-v11" } }, workId: "campaign-work",
+  };
+  const updates = [];
+  const failures = [];
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
+    jobInstance: {
+      findUnique: async () => job,
+      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
+    },
+  };
+  const { completeJob } = loadService({
+    db,
+    applyJobResult: async () => ({ ok: false, type: "campaigns", completion: { complete: false, protocolCurrent: false } }),
+    recordJobFailure: async (args) => { failures.push(args); return {}; },
+  });
+  const result = await completeJob({
+    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 8,
+    workId: job.workId, result: { collectorVersion: "campaigns-v11", scanRunId: "scan-old" }, progress: { percent: 100 },
+  });
+  assert.equal(updates.length, 2);
+  assert.equal(updates[1].where.leaseRevision, 9);
+  assert.equal(updates[1].data.status, "SCHEDULED");
+  assert.equal(Object.prototype.hasOwnProperty.call(updates[1].data, "attempts"), false, "protocol cutover must not consume an attempt");
+  assert.equal(updates[1].data.continuation, null);
+  assert.equal(updates[1].data.lastError, "fetch_campaigns_protocol_superseded");
+  assert.equal(result.job.status, "SCHEDULED");
+  assert.equal(result.protocolSuperseded, true);
+  assert.equal(failures.length, 0, "controlled protocol supersession is not a job failure");
+});
+
 test("claim fence cancels a legacy no-mode notification FULL once historical baseline is verified", async () => {
   const now = new Date();
   const candidate = {
@@ -1358,17 +1397,68 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
     },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true } });
   assert.equal(result.reason, "claimed");
   assert.equal(updateData.claimedAt.toISOString(), authorityNow.toISOString());
   assert.equal(updateData.startedAt.toISOString(), authorityNow.toISOString());
   assert.equal(updateData.leaseUntil.toISOString(), new Date(authorityNow.getTime() + 60_000).toISOString());
   assert.deepEqual(updateData.params, {
-    knownClaimerFrontierHashes: { "campaign-keep": "a".repeat(64) },
     observationTokenVersion: 1,
     observationReadLeaseVersion: 1,
     campaignResumablePaginationVersion: 1,
-  }, "legacy queued campaign jobs must drop unbounded catch-up hints/page caps and upgrade to causal/resumable protocol at claim time");
+    campaignFreshnessCoverageVersion: 1,
+    campaignOrderIndependentTraversalVersion: 1,
+    campaignSegmentedFairTraversalVersion: 1,
+    campaignFrontierSchedulingVersion: 1,
+    campaignDirectoryReuseVersion: 1,
+  }, "legacy queued campaign jobs must drop provider-order catch-up hints/page caps and upgrade to current causal/resumable/order-independent protocol at claim time");
+});
+
+
+test("Campaign claim sets active physical claim generation before SCHEDULED to CLAIMED mutation in the same transaction", async () => {
+  const authorityNow = new Date("2041-02-03T04:05:06.000Z");
+  const candidate = {
+    id: "campaign-claim-generation", jobKey: "fetch_campaigns", scope: "creator", creatorId: "creator-1", agencyId: "agency-1",
+    idempotencyKey: "campaign-claim-generation", params: {}, priority: 80, attempts: 0, leaseRevision: 2, startedAt: null, workId: null, continuation: null, progress: null,
+  };
+  const events = [];
+  let updateData = null;
+  const db = {
+    async $queryRawUnsafe(sql, ...args) {
+      const text = String(sql);
+      if (/clock_timestamp\(\)/.test(text)) return [{ authorityNow }];
+      if (/set_config/.test(text)) { events.push(["marker", ...args]); return [{ campaignClaimGeneration: "17" }]; }
+      throw new Error(`unexpected SQL: ${text}`);
+    },
+    systemSetting: {
+      findUnique: async () => ({ value: { active: true, writerGenerationActive: true, claimGenerationActive: true, writerGeneration: 17 } }),
+    },
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: authorityNow }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 1 }) },
+    creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
+    deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
+    jobInstance: {
+      findMany: async () => [],
+      findFirst: async () => candidate,
+      updateMany: async ({ data }) => { events.push(["update"]); updateData = data; return { count: 1 }; },
+      findUnique: async () => ({ ...candidate, ...updateData, status: "CLAIMED", leaseRevision: 3, creator: { id: "creator-1" } }),
+    },
+  };
+  db.$transaction = async (work, options) => {
+    events.push(["tx", options]);
+    return work(db);
+  };
+  const { claimJob } = loadService({ db });
+  const result = await claimJob({
+    userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"],
+    capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true },
+  });
+  assert.equal(result.reason, "claimed");
+  const markerAt = events.findIndex((event) => event[0] === "marker");
+  const updateAt = events.findIndex((event) => event[0] === "update");
+  assert.ok(markerAt >= 0 && updateAt > markerAt, "claim generation marker must be installed before the claim row mutation");
+  assert.equal(events[markerAt][1], "onlinod.campaign_claim_generation");
+  assert.equal(events[markerAt][2], "17");
 });
 
 test("cooperative job retry timing uses PostgreSQL authority instead of replica wall clock", async () => {
@@ -1417,7 +1507,7 @@ test("job claim creator capability freshness uses the same PostgreSQL authority 
     jobInstance: { findMany: async () => [], findFirst: async () => null },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true } });
   assert.equal(result.reason, "no-work");
   assert.equal(bindingWhere.lastSeenAt.gte.toISOString(), new Date(authorityNow.getTime() - 2 * 60_000).toISOString());
   assert.equal(bindingWhere.lastSeenAt.lte.toISOString(), new Date(authorityNow.getTime() + 5 * 60_000).toISOString());
@@ -1432,18 +1522,18 @@ test("job claim rejects future-poisoned device heartbeat before creator capabili
     jobInstance: { findMany: async () => [] },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true } });
   assert.equal(result.reason, "device-stale");
 });
 
-test("Campaign v10 server no-progress signal advances to the next Campaign and marks only this traversal truncated", async () => {
+test("Current Campaign server no-progress signal advances to the next Campaign and marks only this traversal truncated", async () => {
   const token = "lease-token";
   const now = new Date();
   const job = {
     id: "campaign-no-progress", agencyId: "agency-1", creatorId: "creator-1", jobKey: "fetch_campaigns",
     status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 11,
     leaseUntil: new Date(now.getTime() + 60_000), attempts: 0, progress: { current: 0 },
-    continuation: { driverPhase: "execute", jobContinuation: { collectorVersion: "campaigns-v10", campaignIndex: 0, truncated: false } },
+    continuation: { driverPhase: "execute", jobContinuation: { collectorVersion: "campaigns-v12", campaignIndex: 0, truncated: false } },
     workId: "campaign-work", params: {},
   };
   let updatePayload = null;
@@ -1467,7 +1557,7 @@ test("Campaign v10 server no-progress signal advances to the next Campaign and m
   const requested = {
     driverPhase: "execute",
     jobContinuation: {
-      collectorVersion: "campaigns-v10",
+      collectorVersion: "campaigns-v11",
       phase: "claimers",
       campaigns: [{ id: "campaign-a", scanClaimers: true }, { id: "campaign-b", scanClaimers: true }],
       campaignIndex: 0,

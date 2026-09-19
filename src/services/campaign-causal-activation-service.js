@@ -4,6 +4,15 @@ const prisma = require("../prisma");
 
 const CAMPAIGN_CAUSAL_V1_SETTING_KEY = "phase3.campaignCausalObservationV1";
 const CAMPAIGN_WRITER_GENERATION_GUC = "onlinod.campaign_writer_generation";
+const CAMPAIGN_CLAIM_GENERATION_GUC = "onlinod.campaign_claim_generation";
+const CAMPAIGN_WRITER_FENCE_MIGRATION = "20260918003000_phase3_campaign_writer_generation_fence";
+const CAMPAIGN_CLAIM_FENCE_MIGRATION = "20260918150000_phase3_campaign_claim_generation_fence";
+const CAMPAIGN_PHYSICAL_FENCE_TRIGGERS = Object.freeze([
+  Object.freeze({ name: "phase3_campaign_writer_generation_ingest_guard_trg", table: "AnalyticsIngestBatch", fn: "phase3_campaign_writer_generation_guard" }),
+  Object.freeze({ name: "phase3_campaign_writer_generation_identity_guard_trg", table: "CreatorFan", fn: "phase3_campaign_writer_generation_guard" }),
+  Object.freeze({ name: "phase3_campaign_writer_generation_value_guard_trg", table: "CreatorFanValueCurrent", fn: "phase3_campaign_writer_generation_guard" }),
+  Object.freeze({ name: "phase3_campaign_claim_generation_guard_trg", table: "JobInstance", fn: "phase3_campaign_claim_generation_guard" }),
+]);
 const DEFAULT_ACTIVATION_ATTEMPTS = 4;
 const DEFAULT_ACTIVATION_RETRY_BASE_MS = 50;
 
@@ -19,6 +28,10 @@ function writerGenerationActiveValue(value) {
   return object(value).writerGenerationActive === true;
 }
 
+function claimGenerationActiveValue(value) {
+  return object(value).claimGenerationActive === true;
+}
+
 function positiveInteger(value, fallback = 0) {
   const number = Number(value);
   return Number.isSafeInteger(number) && number > 0 ? number : fallback;
@@ -29,6 +42,7 @@ function activationState(value) {
   return {
     active: activeValue(normalized),
     writerGenerationActive: writerGenerationActiveValue(normalized),
+    claimGenerationActive: claimGenerationActiveValue(normalized),
     epoch: Math.max(0, Number(normalized.epoch || 0) || 0),
     writerGeneration: positiveInteger(normalized.writerGeneration, 0),
     value: normalized,
@@ -106,6 +120,96 @@ async function enterCampaignWriterGeneration({ db = prisma } = {}) {
   return state;
 }
 
+async function enterCampaignClaimGeneration({ db = prisma } = {}) {
+  const state = await campaignCausalV1State({ db, lockForCommit: false });
+  if (!state.claimGenerationActive) return state;
+  if (!state.writerGeneration) throw new Error("CAMPAIGN_CLAIM_GENERATION_INVALID");
+  if (typeof db.$queryRawUnsafe !== "function") {
+    throw new Error("CAMPAIGN_CLAIM_GENERATION_SESSION_UNAVAILABLE");
+  }
+  await db.$queryRawUnsafe(
+    "SELECT set_config($1, $2, true) AS \"campaignClaimGeneration\"",
+    CAMPAIGN_CLAIM_GENERATION_GUC,
+    String(state.writerGeneration),
+  );
+  return state;
+}
+
+function physicalFenceError(code, detail) {
+  const error = new Error(`${code}: ${detail}`);
+  error.code = code;
+  return error;
+}
+
+async function assertCampaignActivationPhysicalFences({ db }) {
+  if (typeof db?.$queryRawUnsafe !== "function") {
+    throw physicalFenceError("CAMPAIGN_ACTIVATION_PHYSICAL_PREFLIGHT_UNAVAILABLE", "PostgreSQL catalog access is required");
+  }
+  const triggerRows = await db.$queryRawUnsafe(`
+    SELECT
+      t.tgname AS "triggerName",
+      c.relname AS "tableName",
+      t.tgenabled AS "enabled",
+      p.proname AS "functionName",
+      pg_get_functiondef(p.oid) AS "functionDefinition"
+    FROM pg_trigger t
+    JOIN pg_class c ON c.oid = t.tgrelid
+    JOIN pg_proc p ON p.oid = t.tgfoid
+    WHERE NOT t.tgisinternal
+      AND t.tgname IN (
+        'phase3_campaign_writer_generation_ingest_guard_trg',
+        'phase3_campaign_writer_generation_identity_guard_trg',
+        'phase3_campaign_writer_generation_value_guard_trg',
+        'phase3_campaign_claim_generation_guard_trg'
+      )
+  `);
+  const byName = new Map((Array.isArray(triggerRows) ? triggerRows : []).map((row) => [String(row?.triggerName || ""), row]));
+  for (const expected of CAMPAIGN_PHYSICAL_FENCE_TRIGGERS) {
+    const row = byName.get(expected.name);
+    if (!row) throw physicalFenceError("CAMPAIGN_ACTIVATION_TRIGGER_PREFLIGHT_FAILED", `missing trigger ${expected.name}`);
+    if (String(row.tableName || "") !== expected.table) {
+      throw physicalFenceError("CAMPAIGN_ACTIVATION_TRIGGER_PREFLIGHT_FAILED", `${expected.name} table mismatch`);
+    }
+    if (String(row.functionName || "") !== expected.fn) {
+      throw physicalFenceError("CAMPAIGN_ACTIVATION_TRIGGER_PREFLIGHT_FAILED", `${expected.name} function mismatch`);
+    }
+    const functionDefinition = String(row.functionDefinition || "");
+    if (expected.fn === "phase3_campaign_writer_generation_guard"
+        && (!functionDefinition.includes("onlinod.campaign_writer_generation")
+          || !functionDefinition.includes("CAMPAIGN_WRITER_GENERATION_RETIRED"))) {
+      throw physicalFenceError("CAMPAIGN_ACTIVATION_TRIGGER_PREFLIGHT_FAILED", `${expected.fn} definition mismatch`);
+    }
+    if (expected.fn === "phase3_campaign_claim_generation_guard"
+        && (!functionDefinition.includes("onlinod.campaign_claim_generation")
+          || !functionDefinition.includes("CAMPAIGN_CLAIM_GENERATION_RETIRED"))) {
+      throw physicalFenceError("CAMPAIGN_ACTIVATION_TRIGGER_PREFLIGHT_FAILED", `${expected.fn} definition mismatch`);
+    }
+    if (!["O", "A"].includes(String(row.enabled || ""))) {
+      throw physicalFenceError("CAMPAIGN_ACTIVATION_TRIGGER_PREFLIGHT_FAILED", `${expected.name} disabled`);
+    }
+  }
+
+  const migrationRows = await db.$queryRawUnsafe(`
+    SELECT
+      "migration_name" AS "migrationName",
+      "finished_at" AS "finishedAt",
+      "rolled_back_at" AS "rolledBackAt"
+    FROM "_prisma_migrations"
+    WHERE "migration_name" IN (
+      '${CAMPAIGN_WRITER_FENCE_MIGRATION}',
+      '${CAMPAIGN_CLAIM_FENCE_MIGRATION}'
+    )
+  `);
+  const migrations = new Map((Array.isArray(migrationRows) ? migrationRows : []).map((row) => [String(row?.migrationName || ""), row]));
+  for (const name of [CAMPAIGN_WRITER_FENCE_MIGRATION, CAMPAIGN_CLAIM_FENCE_MIGRATION]) {
+    const row = migrations.get(name);
+    if (!row || !row.finishedAt || row.rolledBackAt) {
+      throw physicalFenceError("CAMPAIGN_ACTIVATION_MIGRATION_PREFLIGHT_FAILED", `migration ${name} is not fully applied`);
+    }
+  }
+  return { ok: true, triggerCount: CAMPAIGN_PHYSICAL_FENCE_TRIGGERS.length, migrationCount: 2 };
+}
+
 function errorCodeCandidates(error) {
   return [
     error?.code,
@@ -151,10 +255,15 @@ async function activateCampaignCausalV1Once({ db, activatedBy }) {
     if (!Array.isArray(rows) || !rows[0]) throw new Error("CAMPAIGN_CAUSAL_V1_BARRIER_MISSING");
     const previous = object(rows[0].value);
     const previousState = activationState(previous);
-    if (previousState.active && previousState.writerGenerationActive) {
+    await assertCampaignActivationPhysicalFences({ db: tx });
+    if ((previousState.writerGenerationActive || previousState.claimGenerationActive) && !previousState.writerGeneration) {
+      throw physicalFenceError("CAMPAIGN_ACTIVATION_GENERATION_STATE_INVALID", "active physical generation has no writerGeneration");
+    }
+    if (previousState.active && previousState.writerGenerationActive && previousState.claimGenerationActive) {
       return {
         active: true,
         writerGenerationActive: true,
+        claimGenerationActive: true,
         writerGeneration: previousState.writerGeneration,
         alreadyActive: true,
         revoked: 0,
@@ -226,11 +335,16 @@ async function activateCampaignCausalV1Once({ db, activatedBy }) {
     const epoch = previousState.active
       ? Math.max(1, previousState.epoch)
       : previousState.epoch + 1;
-    const writerGeneration = Math.max(0, previousState.writerGeneration) + 1;
+    const writerGeneration = previousState.writerGenerationActive && previousState.writerGeneration > 0
+      ? previousState.writerGeneration
+      : Math.max(0, previousState.writerGeneration) + 1;
     const activatedAt = previousState.active && previous.activatedAt
       ? previous.activatedAt
       : new Date().toISOString();
-    const writerGenerationActivatedAt = new Date().toISOString();
+    const writerGenerationActivatedAt = previousState.writerGenerationActive && previous.writerGenerationActivatedAt
+      ? previous.writerGenerationActivatedAt
+      : new Date().toISOString();
+    const claimGenerationActivatedAt = new Date().toISOString();
     await tx.systemSetting.update({
       where: { key: CAMPAIGN_CAUSAL_V1_SETTING_KEY },
       data: {
@@ -245,13 +359,19 @@ async function activateCampaignCausalV1Once({ db, activatedBy }) {
           writerGenerationActive: true,
           writerGeneration,
           writerGenerationActivatedAt,
-          writerGenerationActivatedBy: String(activatedBy || "operator").slice(0, 120),
+          writerGenerationActivatedBy: previousState.writerGenerationActive && previous.writerGenerationActivatedBy
+            ? previous.writerGenerationActivatedBy
+            : String(activatedBy || "operator").slice(0, 120),
+          claimGenerationActive: true,
+          claimGenerationActivatedAt,
+          claimGenerationActivatedBy: String(activatedBy || "operator").slice(0, 120),
         },
       },
     });
     return {
       active: true,
       writerGenerationActive: true,
+      claimGenerationActive: true,
       writerGeneration,
       alreadyActive: false,
       epoch,
@@ -285,8 +405,13 @@ async function activateCampaignCausalV1({
 module.exports = {
   CAMPAIGN_CAUSAL_V1_SETTING_KEY,
   CAMPAIGN_WRITER_GENERATION_GUC,
+  CAMPAIGN_CLAIM_GENERATION_GUC,
+  CAMPAIGN_WRITER_FENCE_MIGRATION,
+  CAMPAIGN_CLAIM_FENCE_MIGRATION,
   campaignCausalV1State,
   enterCampaignWriterGeneration,
+  enterCampaignClaimGeneration,
+  assertCampaignActivationPhysicalFences,
   retryableActivationError,
   activateCampaignCausalV1,
 };

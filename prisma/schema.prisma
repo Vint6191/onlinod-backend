@@ -203,6 +203,11 @@ enum CreatorCampaignAttributionConfidence {
   WEAK
 }
 
+enum CreatorCampaignFrontierKind {
+  CANONICAL
+  STAGED
+}
+
 enum CreatorLocalCoverageStatus {
   MISSING
   PARTIAL
@@ -582,6 +587,7 @@ model CreatorAccount {
   campaigns CreatorCampaign[]
   campaignMemberships CreatorCampaignFan[]
   campaignFanRefreshWork CreatorCampaignFanRefreshWork[]
+  fanRefreshDemands CreatorFanRefreshDemand[]
   messagesDaily CreatorMessagesDaily[]
   dailyMetrics CreatorDailyMetrics[]
   localMessageCoverage CreatorLocalMessageCoverage[]
@@ -2033,28 +2039,66 @@ model CreatorFinancialCollectionState {
 }
 
 
-model CreatorCampaignFanRefreshWork {
-  id               String   @id @default(cuid())
-  agencyId         String
-  creatorId        String
-  scanRunId        String   @db.VarChar(120)
-  scanStartedAt    DateTime
-  onlyFansUserId   String   @db.VarChar(180)
-  campaignJobId    String
-  refreshJobId     String?
-  freshnessCutoffAt DateTime
-  scheduledAt      DateTime @default(now())
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+model CreatorFanRefreshDemand {
+  id                        String   @id @default(cuid())
+  agencyId                  String
+  creatorId                 String
+  onlyFansUserId            String   @db.VarChar(180)
+  requestedFreshnessCutoffAt DateTime
+  requestedRevision         Int      @default(1)
+  satisfiedRevision         Int      @default(0)
+  activeRefreshJobId        String?
+  activeRefreshRevision     Int?
+  status                    String   @default("QUEUED") @db.VarChar(32)
+  lastRequestedAt           DateTime @default(now())
+  lastObservedAt            DateTime?
+  lastOutcome               String?  @db.VarChar(32)
+  lastCompletedAt           DateTime?
+  lastFailedAt              DateTime?
+  lastError                 String?  @db.VarChar(1000)
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
 
-  creator     CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  campaignJob JobInstance     @relation("CampaignFanRefreshCampaignJob", fields: [campaignJobId], references: [id], onDelete: Cascade)
-  refreshJob  JobInstance?    @relation("CampaignFanRefreshPointJob", fields: [refreshJobId], references: [id], onDelete: SetNull)
+  creator          CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  activeRefreshJob JobInstance?   @relation("FanRefreshDemandActiveJob", fields: [activeRefreshJobId], references: [id], onDelete: SetNull)
+  campaignWork     CreatorCampaignFanRefreshWork[]
+
+  @@unique([creatorId, onlyFansUserId], map: "CreatorFanRefreshDemand_creator_fan_key")
+  @@index([activeRefreshJobId], map: "CreatorFanRefreshDemand_active_job_idx")
+  @@index([creatorId, status, updatedAt], map: "CreatorFanRefreshDemand_creator_status_idx")
+}
+
+model CreatorCampaignFanRefreshWork {
+  id                String   @id @default(cuid())
+  agencyId          String
+  creatorId         String
+  scanRunId         String   @db.VarChar(120)
+  scanStartedAt     DateTime
+  onlyFansUserId    String   @db.VarChar(180)
+  campaignJobId     String
+  refreshJobId      String?
+  demandId          String?
+  requestedRevision Int      @default(1)
+  freshnessCutoffAt DateTime
+  status            String   @default("QUEUED") @db.VarChar(32)
+  outcome           String?  @db.VarChar(32)
+  observedAt        DateTime?
+  completedAt       DateTime?
+  lastError         String?  @db.VarChar(1000)
+  scheduledAt       DateTime @default(now())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  creator     CreatorAccount          @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  campaignJob JobInstance              @relation("CampaignFanRefreshCampaignJob", fields: [campaignJobId], references: [id], onDelete: Cascade)
+  refreshJob  JobInstance?             @relation("CampaignFanRefreshPointJob", fields: [refreshJobId], references: [id], onDelete: SetNull)
+  demand      CreatorFanRefreshDemand? @relation(fields: [demandId], references: [id], onDelete: SetNull)
 
   @@unique([creatorId, scanRunId, onlyFansUserId], map: "CreatorCampaignFanRefreshWork_creator_run_fan_key")
-  @@index([creatorId, scanRunId], map: "CreatorCampaignFanRefreshWork_creator_run_idx")
+  @@index([creatorId, scanRunId, status], map: "CreatorCampaignFanRefreshWork_creator_run_status_idx")
   @@index([refreshJobId], map: "CreatorCampaignFanRefreshWork_refreshJob_idx")
   @@index([campaignJobId], map: "CreatorCampaignFanRefreshWork_campaignJob_idx")
+  @@index([demandId, status], map: "CreatorCampaignFanRefreshWork_demand_status_idx")
 }
 
 model CreatorCampaignCollectionState {
@@ -2076,6 +2120,37 @@ model CreatorCampaignCollectionState {
   campaignProofClaimerBatches  Int      @default(0)
   campaignProofRejectedBatches Int      @default(0)
   campaignProofRejectedRows    Int      @default(0)
+  membershipCoverageStatus     AnalyticsCoverageStatus @default(MISSING)
+  membershipCoverageCompletedAt DateTime?
+  fanValueCoverageScanRunId    String?   @db.VarChar(120)
+  fanValueFreshnessCutoffAt    DateTime?
+  fanValueFreshnessStatus      AnalyticsCoverageStatus @default(MISSING)
+  fanValueExpected             Int       @default(0)
+  fanValueAlreadyFresh         Int       @default(0)
+  fanValueQueued               Int       @default(0)
+  fanValueSucceeded            Int       @default(0)
+  fanValueUnavailable          Int       @default(0)
+  fanValueFailed               Int       @default(0)
+  fanValueOutstanding          Int       @default(0)
+  fanValueCoverageUpdatedAt    DateTime?
+  campaignFrontierPlanRunId        String?   @db.VarChar(120)
+  campaignFrontierFreshnessStatus  AnalyticsCoverageStatus @default(MISSING)
+  campaignFrontierDueCount         Int       @default(0)
+  campaignFrontierTargetCount      Int       @default(0)
+  campaignFrontierCompletedCount   Int       @default(0)
+  campaignFrontierDeferredCount    Int       @default(0)
+  campaignFrontierOldestDueAt      DateTime?
+  campaignFrontierNextDueAt        DateTime?
+  campaignFrontierUpdatedAt        DateTime?
+  campaignDirectoryGeneration      String?   @db.VarChar(120)
+  campaignDirectoryRequestedAt     DateTime?
+  campaignDirectoryVerifiedAt      DateTime?
+  campaignDirectoryRevision        Int       @default(0)
+  campaignDirectoryCampaignCount   Int       @default(0)
+  campaignDirectoryDiscoveryDueAt  DateTime?
+  campaignDirectoryDiscoveryRequestedAt DateTime?
+  campaignDirectoryDiscoveryRequestedRevision Int @default(0)
+  campaignDirectoryDiscoveryCompletedRevision Int @default(0)
   retryAfterAt                 DateTime?
   lastErrorCode          String?
   lastErrorMessage       String?
@@ -2090,6 +2165,7 @@ model CreatorCampaignCollectionState {
   @@index([agencyId, status, updatedAt], map: "CreatorCampaignCollectionState_agency_status_idx")
   @@index([creatorId, baselineVerifiedAt], map: "CreatorCampaignCollectionState_creator_baseline_idx")
   @@index([creatorId, lastCatchupCompletedAt], map: "CreatorCampaignCollectionState_creator_catchup_idx")
+  @@index([campaignDirectoryDiscoveryDueAt, creatorId], map: "CreatorCampaignCollectionState_directory_due_idx")
 }
 
 model CreatorNotificationScanItem {
@@ -2903,13 +2979,17 @@ model CreatorCampaign {
   claimersCount      Int?
   clicksCount        Int?
   catchupFrontierHash            String?   @db.VarChar(64)
-  catchupFrontierFanIds          Json?
   catchupFrontierRunId           String?   @db.VarChar(120)
   catchupFrontierStartedAt       DateTime?
   stagedCatchupFrontierHash      String?   @db.VarChar(64)
-  stagedCatchupFrontierFanIds    Json?
   stagedCatchupFrontierRunId     String?   @db.VarChar(120)
   stagedCatchupFrontierStartedAt DateTime?
+  claimerRevision                Int      @default(1)
+  claimerVerifiedRevision        Int      @default(0)
+  claimersVerifiedAt             DateTime?
+  claimersNextDueAt              DateTime?
+  claimersTargetRunId            String?  @db.VarChar(120)
+  claimersLastVerifiedRunId      String?  @db.VarChar(120)
   sourceScanRunId                String?
   sourceScanStartedAt DateTime?
   collectedAt        DateTime @default(now())
@@ -2922,6 +3002,7 @@ model CreatorCampaign {
   sourceDevice WorkerDevice?  @relation("CreatorCampaignCollectedByDevice", fields: [sourceDeviceId], references: [id], onDelete: SetNull)
   sourceJob    JobInstance?    @relation(fields: [sourceJobId], references: [id], onDelete: SetNull)
   fans         CreatorCampaignFan[]
+  frontierFans CreatorCampaignFrontierFan[]
 
   @@unique([creatorId, externalCampaignId])
   @@unique([creatorId, id], map: "CreatorCampaign_creatorId_id_key")
@@ -2929,7 +3010,29 @@ model CreatorCampaign {
   @@index([creatorId, collectedAt])
   @@index([creatorId, sourceScanStartedAt])
   @@index([creatorId, sourceScanRunId])
+  @@index([creatorId, sourceScanRunId, externalCampaignId], map: "CreatorCampaign_run_segment_idx")
+  @@index([creatorId, claimersNextDueAt, externalCampaignId], map: "CreatorCampaign_frontier_due_idx")
+  @@index([creatorId, claimersTargetRunId, externalCampaignId], map: "CreatorCampaign_frontier_target_idx")
   @@index([sourceJobId])
+}
+
+model CreatorCampaignFrontierFan {
+  id                  String   @id @default(cuid())
+  agencyId            String
+  creatorId           String
+  campaignId          String
+  frontierKind        CreatorCampaignFrontierKind
+  onlyFansUserId      String   @db.VarChar(180)
+  sourceScanRunId     String?  @db.VarChar(120)
+  sourceScanStartedAt DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  campaign CreatorCampaign @relation(fields: [creatorId, campaignId], references: [creatorId, id], onDelete: Cascade)
+
+  @@unique([campaignId, frontierKind, onlyFansUserId])
+  @@index([creatorId, campaignId, frontierKind])
+  @@index([creatorId, onlyFansUserId])
 }
 
 model CreatorCampaignFan {
@@ -3183,6 +3286,7 @@ model JobInstance {
   creatorFanRelationships CreatorFanRelationshipCurrent[]
   campaignFanRefreshCampaignWork CreatorCampaignFanRefreshWork[] @relation("CampaignFanRefreshCampaignJob")
   campaignFanRefreshPointWork CreatorCampaignFanRefreshWork[] @relation("CampaignFanRefreshPointJob")
+  creatorFanRefreshDemands CreatorFanRefreshDemand[] @relation("FanRefreshDemandActiveJob")
   creatorEarningsTotals CreatorEarningsTotal[]
 
   @@index([status, nextRunAt])
@@ -3200,6 +3304,134 @@ model JobInstance {
 // Legacy singleton clock retained only so an old binary can finish a rolling
 // deployment after the additive creator-clock migration lands. Current code
 // never issues FanData observation time from this platform-global row.
+model OfProviderRequestGateState {
+  id                      String    @id
+  activePermitId          String?
+  activeOwnerInstanceId   String?
+  activeAgencyId          String?
+  activeCreatorId         String?
+  activeDeviceId          String?
+  activeCapability        String?
+  activePriority          String?
+  activeCategory          String?
+  activeIntervalMs        Int?
+  activeGrantedAt         DateTime?
+  activeExpiresAt         DateTime?
+  nextAllowedAt           DateTime?
+  revision                BigInt    @default(0)
+  lastStartedAt           DateTime?
+  lastStartedCreatorId    String?
+  lastStartedDeviceId     String?
+  priorityCursor          Int       @default(0)
+  backgroundCategoryCursor Int     @default(0)
+  fairnessGeneration      String    @default("phase3_provider_gate_fairness_v2_a14")
+  fairnessActivationState String    @default("DRAINING")
+  fairnessDrainStartedAt  DateTime?
+  fairnessActivatedAt     DateTime?
+  fairnessActivationConfirmedAt DateTime?
+  legacyPermitLastSeenAt  DateTime?
+  legacyPermitCount       BigInt    @default(0)
+  usageWindowStartedAt    DateTime?
+  usageTotalStarts        BigInt    @default(0)
+  usageCriticalWriteStarts BigInt   @default(0)
+  usageInteractiveStarts  BigInt    @default(0)
+  usageRealtimeStarts     BigInt    @default(0)
+  usageNormalStarts       BigInt    @default(0)
+  usageCampaignDirectoryStarts BigInt @default(0)
+  usageCampaignFrontierStarts BigInt @default(0)
+  usageFanDataStarts      BigInt    @default(0)
+  usageBackgroundOtherStarts BigInt @default(0)
+  usageUnclassifiedStarts BigInt    @default(0)
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  @@index([activeExpiresAt], map: "OfProviderRequestGateState_active_expiry_idx")
+  @@index([nextAllowedAt], map: "OfProviderRequestGateState_next_allowed_idx")
+}
+
+model OfProviderRequestGateWaiter {
+  ticket          BigInt   @id @default(autoincrement())
+  waiterId        String   @unique
+  ownerInstanceId String
+  agencyId        String
+  creatorId       String
+  deviceId        String
+  capability      String
+  priority        String
+  category        String
+  operation       String
+  source          String?
+  enqueuedAt      DateTime @default(now())
+  leaseUntil      DateTime
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([leaseUntil], map: "OfProviderRequestGateWaiter_lease_idx")
+  @@index([priority, category, ticket], map: "OfProviderRequestGateWaiter_bucket_ticket_idx")
+  @@index([ownerInstanceId, leaseUntil], map: "OfProviderRequestGateWaiter_owner_lease_idx")
+  @@index([creatorId, ticket], map: "OfProviderRequestGateWaiter_creator_ticket_idx")
+}
+
+model ProviderCapacityDebtState {
+  id                                   String   @id
+  sourceVersion                        String   @db.VarChar(120)
+  sampledAt                            DateTime
+  revision                             BigInt   @default(0)
+  status                               String   @default("UNKNOWN") @db.VarChar(32)
+  overloadReason                       String?  @db.VarChar(500)
+  physicalStartsPerHour                Float
+  backgroundGuaranteedStartsPerHour    Float
+  campaignDirectoryGuaranteedStartsPerHour Float
+  fanDataGuaranteedStartsPerHour       Float
+  campaignDirectoryDueCreators         Int      @default(0)
+  campaignDirectoryOverdueCreators     Int      @default(0)
+  campaignDirectoryRequiredCalls       BigInt   @default(0)
+  campaignDirectoryCapacityDebtCalls   BigInt   @default(0)
+  campaignDirectoryOldestDueAt         DateTime?
+  campaignDirectoryGuaranteedClearHours Float
+  campaignDirectoryTargetHours         Float
+  fanDataUnsatisfiedDemands            BigInt   @default(0)
+  fanDataPendingJobs                    Int      @default(0)
+  fanDataCapacityDebtCalls              BigInt   @default(0)
+  fanDataOldestRequestedAt              DateTime?
+  fanDataGuaranteedClearHours           Float
+  fanDataTargetHours                    Float
+  providerLowerBoundRequiredCalls       BigInt   @default(0)
+  providerExclusiveClearHours           Float
+  actualUsageWindowStartedAt             DateTime?
+  actualUsageTotalStarts                 BigInt   @default(0)
+  actualUsageCriticalWriteStarts         BigInt   @default(0)
+  actualUsageInteractiveStarts           BigInt   @default(0)
+  actualUsageRealtimeStarts              BigInt   @default(0)
+  actualUsageNormalStarts                BigInt   @default(0)
+  actualUsageCampaignDirectoryStarts     BigInt   @default(0)
+  actualUsageCampaignFrontierStarts      BigInt   @default(0)
+  actualUsageFanDataStarts               BigInt   @default(0)
+  actualUsageBackgroundOtherStarts       BigInt   @default(0)
+  actualUsageUnclassifiedStarts          BigInt   @default(0)
+  actualUsageAccountingComplete          Boolean  @default(true)
+  backgroundOtherPendingJobs              Int      @default(0)
+  backgroundOtherOldestScheduledAt         DateTime?
+  backgroundOtherPendingJobClasses         Int      @default(0)
+  backgroundOtherCallCardinalityKnown      Boolean  @default(true)
+  futureDebtCoverageStatus                 String   @default("COMPLETE_AT_SAMPLE") @db.VarChar(40)
+  futureDebtCoverageReason                 String?  @db.VarChar(500)
+  topologyVersion                       String   @default("phase3_provider_capacity_topology_v1_a16") @db.VarChar(120)
+  topologyId                            String   @default("of-global") @db.VarChar(120)
+  topologyScope                         String   @default("FLEET_GLOBAL") @db.VarChar(40)
+  topologyShardCount                    Int      @default(1)
+  topologyShardingAllowed               Boolean  @default(false)
+  controlMode                           String   @default("CONSERVATIVE") @db.VarChar(40)
+  controlReason                         String?  @db.VarChar(500)
+  operatorActionRequired                Boolean  @default(false)
+  campaignDirectoryAdmissionBudgetCalls Int      @default(1)
+  campaignDirectoryGuaranteedCallsPerSweep Int   @default(1)
+  createdAt                             DateTime @default(now())
+  updatedAt                             DateTime @updatedAt
+
+  @@index([status, sampledAt], map: "ProviderCapacityDebtState_status_sampled_idx")
+}
+
 model LegacyFanObservationClock {
   id             Int      @id
   lastObservedAt DateTime @default(now())

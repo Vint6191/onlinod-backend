@@ -56,9 +56,20 @@ test("INT5.7A-1 activation runtime set-based cutover revokes old owners and acti
   const tx = {
     $queryRawUnsafe: async (sql) => {
       rawCall += 1;
-      events.push(["sql", String(sql)]);
+      const text = String(sql);
+      events.push(["sql", text]);
       if (rawCall === 1) return []; // live Campaign JobInstance rows locked first
-      if (rawCall === 2) return [{ value: { active: false, epoch: 3, writerGenerationActive: false } }];
+      if (rawCall === 2) return [{ value: { active: false, epoch: 3, writerGenerationActive: false, claimGenerationActive: false } }];
+      if (/FROM pg_trigger/.test(text)) return [
+        { triggerName: "phase3_campaign_writer_generation_ingest_guard_trg", tableName: "AnalyticsIngestBatch", enabled: "O", functionName: "phase3_campaign_writer_generation_guard", functionDefinition: "current_setting(onlinod.campaign_writer_generation) CAMPAIGN_WRITER_GENERATION_RETIRED" },
+        { triggerName: "phase3_campaign_writer_generation_identity_guard_trg", tableName: "CreatorFan", enabled: "O", functionName: "phase3_campaign_writer_generation_guard", functionDefinition: "current_setting(onlinod.campaign_writer_generation) CAMPAIGN_WRITER_GENERATION_RETIRED" },
+        { triggerName: "phase3_campaign_writer_generation_value_guard_trg", tableName: "CreatorFanValueCurrent", enabled: "O", functionName: "phase3_campaign_writer_generation_guard", functionDefinition: "current_setting(onlinod.campaign_writer_generation) CAMPAIGN_WRITER_GENERATION_RETIRED" },
+        { triggerName: "phase3_campaign_claim_generation_guard_trg", tableName: "JobInstance", enabled: "O", functionName: "phase3_campaign_claim_generation_guard", functionDefinition: "current_setting(onlinod.campaign_claim_generation) CAMPAIGN_CLAIM_GENERATION_RETIRED" },
+      ];
+      if (/FROM "_prisma_migrations"/.test(text)) return [
+        { migrationName: "20260918003000_phase3_campaign_writer_generation_fence", finishedAt: new Date(), rolledBackAt: null },
+        { migrationName: "20260918150000_phase3_campaign_claim_generation_fence", finishedAt: new Date(), rolledBackAt: null },
+      ];
       return [{ revoked: 1, stamped: 2 }];
     },
     systemSetting: {
@@ -72,10 +83,10 @@ test("INT5.7A-1 activation runtime set-based cutover revokes old owners and acti
     },
   };
   const result = await activateCampaignCausalV1({ db, activatedBy: "test" });
-  assert.deepEqual(result, { active: true, writerGenerationActive: true, writerGeneration: 1, alreadyActive: false, epoch: 4, revoked: 1, stamped: 2 });
+  assert.deepEqual(result, { active: true, writerGenerationActive: true, claimGenerationActive: true, writerGeneration: 1, alreadyActive: false, epoch: 4, revoked: 1, stamped: 2 });
   assert.match(events[0][1], /JobInstance[\s\S]*FOR UPDATE/);
   assert.match(events[1][1], /SystemSetting[\s\S]*FOR UPDATE/);
-  const cutoverSql = events[2][1];
+  const cutoverSql = events[4][1];
   assert.match(cutoverSql, /DELETE FROM "FanObservationReadLease"[\s\S]*r\."leaseRevision" = c\."leaseRevision"/);
   assert.match(cutoverSql, /"leaseRevision" = j\."leaseRevision" \+ 1/);
   assert.match(cutoverSql, /"status" = 'SCHEDULED'/);
@@ -83,5 +94,6 @@ test("INT5.7A-1 activation runtime set-based cutover revokes old owners and acti
   assert.equal(events.at(-1)[0], "activate");
   assert.equal(events.at(-1)[1].data.value.active, true);
   assert.equal(events.at(-1)[1].data.value.writerGenerationActive, true);
+  assert.equal(events.at(-1)[1].data.value.claimGenerationActive, true);
   assert.equal(events.at(-1)[1].data.value.writerGeneration, 1);
 });
