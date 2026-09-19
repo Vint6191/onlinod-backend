@@ -1800,23 +1800,39 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
 
     const cycleNow = claim.cycleNow;
     let providerCapacityControl = null;
+    let preAdmissionCapacityDebt = null;
     try {
-      const durableCapacitySnapshot = await readProviderCapacityDebtSnapshot({ db });
+      // A19: sample canonical debt BEFORE directory admission. Reading a previously
+      // persisted two-hour-old HEALTHY snapshot first can admit a full normal
+      // directory budget even when new unknown-cardinality background work arrived
+      // since that sample. The sweep lease already serializes this control cycle,
+      // so refresh the derived projection first and derive admission from that exact
+      // sample.
+      preAdmissionCapacityDebt = await refreshProviderCapacityDebtSnapshot({ db, now: cycleNow });
+      const freshCapacitySnapshot = preAdmissionCapacityDebt?.computed
+        || await readProviderCapacityDebtSnapshot({ db });
       providerCapacityControl = deriveProviderOverloadControl({
-        snapshot: durableCapacitySnapshot,
+        snapshot: freshCapacitySnapshot,
         now: cycleNow,
         normalDirectoryAdmissionCalls: CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP,
       });
+      if (preAdmissionCapacityDebt?.ok !== true) {
+        providerCapacityControl = deriveProviderOverloadControl({
+          snapshot: null,
+          now: cycleNow,
+          normalDirectoryAdmissionCalls: CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP,
+        });
+        providerCapacityControl.sampleError = preAdmissionCapacityDebt?.reason || "capacity_projection_not_persisted";
+      }
     } catch (error) {
-      // Admission must fail conservative when the durable capacity projection
-      // cannot be read. Canonical debt remains untouched; we only limit NEW
-      // periodic directory work to the guaranteed weighted share.
+      // Sampling failure is fail-conservative. Canonical debt remains untouched;
+      // only NEW periodic directory admission is reduced to guaranteed capacity.
       providerCapacityControl = deriveProviderOverloadControl({
         snapshot: null,
         now: cycleNow,
         normalDirectoryAdmissionCalls: CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP,
       });
-      providerCapacityControl.readError = error?.message || String(error);
+      providerCapacityControl.sampleError = error?.message || String(error);
     }
     const directoryAdmission = await selectCampaignDirectoryDiscoveryAdmissions({
       db,
@@ -1940,6 +1956,8 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
         pageBudget: Number(providerCapacityControl?.campaignDirectoryAdmissionBudgetCalls || 0),
         topologyId: providerCapacityControl?.topology?.topologyId || "of-global",
         topologyShardCount: Number(providerCapacityControl?.topology?.shardCount || 1),
+        preAdmissionSampled: preAdmissionCapacityDebt?.ok === true,
+        preAdmissionSampleError: providerCapacityControl?.sampleError || null,
       },
     };
   })();

@@ -1618,6 +1618,12 @@ async function projectFanObservationBatch(db, {
         agencyId: scopedAgencyId, creatorId: scopedCreatorId,
         sourceDeviceId: envelope.sourceDeviceId, sourceJobId: envelope.sourceJobId, sourceDeliveryId: envelope.sourceDeliveryId,
       });
+      if (valueProjected > 0 && touchedFanIds.length) {
+        const { reconcileCampaignFanRefreshDemandsFromCanonicalObservations } = require("./campaign-fan-refresh-queue-service");
+        await reconcileCampaignFanRefreshDemandsFromCanonicalObservations({
+          db: tx, creatorId: scopedCreatorId, fanIds: touchedFanIds, now: envelope.receivedAt,
+        });
+      }
       return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };
     }
 
@@ -1637,6 +1643,12 @@ async function projectFanObservationBatch(db, {
       }
       if (relationship) await projectFanRelationship(tx, { ...relationship, ...common });
       if (value) await projectFanValue(tx, { ...value, ...common });
+    }
+    if (valueProjected > 0 && touchedFanIds.length && tx.creatorFanRefreshDemand?.findMany) {
+      const { reconcileCampaignFanRefreshDemandsFromCanonicalObservations } = require("./campaign-fan-refresh-queue-service");
+      await reconcileCampaignFanRefreshDemandsFromCanonicalObservations({
+        db: tx, creatorId: scopedCreatorId, fanIds: touchedFanIds, now: envelope.receivedAt,
+      });
     }
     return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };
   };

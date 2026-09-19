@@ -2055,6 +2055,10 @@ model CreatorFanRefreshDemand {
   lastOutcome               String?  @db.VarChar(32)
   lastCompletedAt           DateTime?
   lastFailedAt              DateTime?
+  retryAttempts             Int      @default(0)
+  nextRetryAt               DateTime?
+  lastRetryAt               DateTime?
+  quarantinedAt             DateTime?
   lastError                 String?  @db.VarChar(1000)
   createdAt                 DateTime @default(now())
   updatedAt                 DateTime @updatedAt
@@ -2066,6 +2070,8 @@ model CreatorFanRefreshDemand {
   @@unique([creatorId, onlyFansUserId], map: "CreatorFanRefreshDemand_creator_fan_key")
   @@index([activeRefreshJobId], map: "CreatorFanRefreshDemand_active_job_idx")
   @@index([creatorId, status, updatedAt], map: "CreatorFanRefreshDemand_creator_status_idx")
+  @@index([status, nextRetryAt, creatorId], map: "CreatorFanRefreshDemand_retry_due_idx")
+  @@index([creatorId, quarantinedAt], map: "CreatorFanRefreshDemand_quarantine_idx")
 }
 
 model CreatorCampaignFanRefreshWork {

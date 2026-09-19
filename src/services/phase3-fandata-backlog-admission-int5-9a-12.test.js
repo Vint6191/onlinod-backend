@@ -97,6 +97,7 @@ test("A12 promoter rematerializes oldest durable debt in creator-fair bounded jo
     $executeRawUnsafe: async () => 1,
     $queryRawUnsafe: async (sql) => {
       const text = String(sql);
+      if (/FROM "CreatorFanRefreshDemand"/.test(text) && /"status" = 'FAILED'/.test(text)) return [];
       if (/WITH ranked AS/.test(text)) return [
         { id: "d-a1", lastRequestedAt: new Date("2038-01-01T00:00:00.000Z") },
         { id: "d-b1", lastRequestedAt: new Date("2038-01-01T00:00:01.000Z") },
@@ -164,6 +165,7 @@ test("A12 backlog promotion window is capped per creator so one saturated deep b
     $executeRawUnsafe: async () => 1,
     $queryRawUnsafe: async (sql, ...args) => {
       const text = String(sql);
+      if (/FROM "CreatorFanRefreshDemand"/.test(text) && /"status" = 'FAILED'/.test(text)) return [];
       if (/WITH ranked AS/.test(text)) {
         assert.equal(args[0], 50);
         // Represents a production ranking over >800 creator-A debts: only one

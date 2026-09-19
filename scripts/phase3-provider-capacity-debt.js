@@ -6,6 +6,7 @@ const {
   refreshProviderCapacityDebtSnapshot,
   readProviderCapacityDebtSnapshot,
 } = require("../src/services/provider-capacity-debt-authority-service");
+const { providerScaleContract } = require("../src/services/provider-capacity-sla-service");
 
 async function main() {
   const command = String(process.argv[2] || "diagnostics").trim().toLowerCase();
@@ -14,12 +15,12 @@ async function main() {
   }
   if (command === "refresh") {
     const result = await refreshProviderCapacityDebtSnapshot({ db: prisma, now: new Date() });
-    console.log(JSON.stringify({ command, ok: result.ok === true, snapshot: result.snapshot || result.computed || null }, null, 2));
+    console.log(JSON.stringify({ command, ok: result.ok === true, snapshot: result.snapshot || result.computed || null, scaleContract: providerScaleContract() }, null, 2));
     if (!result.ok) process.exitCode = 2;
     return;
   }
   const snapshot = await readProviderCapacityDebtSnapshot({ db: prisma });
-  console.log(JSON.stringify({ command, snapshot }, null, 2));
+  console.log(JSON.stringify({ command, snapshot, scaleContract: providerScaleContract() }, null, 2));
 }
 
 main().catch((error) => {

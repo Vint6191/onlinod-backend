@@ -57,5 +57,6 @@ test("INT5.8A-2 manual Campaign reader converges on server-owned freshness cover
   const control = read("src/services/campaign-scan-control-service.js");
   assert.match(control, /const coverageMatches = Boolean\(resultScanRunId && collectionState\?\.fanValueCoverageScanRunId === resultScanRunId\)/);
   assert.match(control, /const fanValuesExpected = coverageMatches \? integer\(collectionState\.fanValueExpected[\s\S]*?: integer\(result\.fanValuesTotal \?\? continuation\.fanValuesDiscovered/);
-  assert.match(control, /fanValuesComplete: coverageMatches[\s\S]*fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"[\s\S]*: fanRefreshDelegated \? false : result\.fanValuesComplete === true/);
+  assert.match(control, /const fanValuesComplete = coverageMatches[\s\S]*fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"[\s\S]*: fanRefreshDelegated \? false : result\.fanValuesComplete === true/);
+  assert.match(control, /deriveCampaignPresentationStatus\(\{[\s\S]*collectorStatus[\s\S]*fanValuesComplete[\s\S]*\}\)/);
 });

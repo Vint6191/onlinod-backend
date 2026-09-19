@@ -35,7 +35,8 @@
     "phase3:provider-capacity": "node scripts/phase3-provider-capacity-debt.js",
     "audit:phase3-a16-postgres": "node scripts/audit/phase3-a16-postgres-proof.js",
     "audit:phase3-a17-postgres": "node scripts/audit/phase3-a17-postgres-proof.js",
-    "audit:phase3-a18-postgres": "node scripts/audit/phase3-a18-postgres-proof.js"
+    "audit:phase3-a18-postgres": "node scripts/audit/phase3-a18-postgres-proof.js",
+    "audit:phase3-a19-postgres": "node scripts/audit/phase3-a19-postgres-proof.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

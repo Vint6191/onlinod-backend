@@ -8,6 +8,8 @@ const { dbAuthorityNow } = require("./db-time-authority-service");
 const { capabilityFreshnessWindow } = require("./capability-freshness-authority-service");
 const { readCampaignsWithRevenue } = require("./creator-analytics-ledger-service");
 const { campaignDirectoryDiscoveryCapacityState } = require("./provider-capacity-sla-service");
+const { repairFailedCampaignFanRefreshDemands, CAMPAIGN_FAN_REFRESH_MAX_RETRIES } = require("./campaign-fan-refresh-queue-service");
+const { deriveCampaignPresentationStatus, deriveManualCampaignStartDebtAction } = require("./campaign-scan-status-authority");
 const {
   buildCollectionCommand, buildCollectionPlanningDedupeParams, withCollectorStateLock, COLLECTOR_TYPES,
 } = require("./analytics-collector-control-service");
@@ -46,7 +48,10 @@ function jobStatus(job) {
   if (job.status === "CANCELLED") return "CANCELLED";
   if (job.status === "DONE") {
     const result = object(job.result);
-    const complete = result.campaignPagesComplete === true && result.claimersComplete === true && result.fanValuesComplete === true && result.truncated !== true
+    // Collector status proves provider traversal only. FanData freshness is a
+    // delegated server-side coverage lifecycle and must be evaluated from the
+    // live CreatorCampaignCollectionState, not frozen job.result booleans.
+    const complete = result.campaignPagesComplete === true && result.claimersComplete === true && result.truncated !== true
       && integer(result.campaignScannerRejected, 0) === 0 && integer(result.claimerScannerRejected, 0) === 0;
     return complete ? "COMPLETE" : "PARTIAL";
   }
@@ -125,6 +130,27 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
       return { job: planned.job, action: "resumed" };
     }
     if (active) return { job: active, action: active.status === "CLAIMED" ? "already_running" : "already_queued" };
+
+    // If the provider collector already finished but delegated FanData debt is
+    // still open, START is a recovery/status action, never permission to replay
+    // the Campaign directory/claimer traversal. This is deliberately fail-closed
+    // across lost HTTP responses: once FAILED debt is requeued, a repeated START
+    // sees QUEUED debt and returns refresh_pending instead of launching a full scan.
+    if (typeof tx.creatorFanRefreshDemand?.count === "function") {
+      const [failedDebt, queuedDebtBeforeRepair] = await Promise.all([
+        tx.creatorFanRefreshDemand.count({ where: { creatorId: creator.id, status: "FAILED" } }),
+        tx.creatorFanRefreshDemand.count({ where: { creatorId: creator.id, status: "QUEUED" } }),
+      ]);
+      const debtAction = deriveManualCampaignStartDebtAction({ failedDebt, queuedDebt: queuedDebtBeforeRepair });
+      if (debtAction === "repair") {
+        const repaired = await repairFailedCampaignFanRefreshDemands({ db: tx, creatorId: creator.id, now: authorityNow, maxDemands: 500 });
+        // Even if another replica won the SKIP LOCKED race and repaired the rows
+        // first, the observed FAILED debt proves this request belongs to the
+        // delegated refresh recovery lifecycle. Never fall through to FULL scan.
+        return { job: null, action: repaired.recovered > 0 || repaired.promotedJobs > 0 ? "refresh_repair_queued" : "refresh_pending", repaired };
+      }
+      if (debtAction === "refresh_pending") return { job: null, action: "refresh_pending", repaired: null };
+    }
 
     let state = typeof tx.creatorCampaignCollectionState?.findUnique === "function"
       ? await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: creator.id } })
@@ -250,7 +276,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   const jobs = await recentJobs(db, creator.id, null, 60);
   const job = jobs[0] || null;
-  const status = jobStatus(job);
+  const collectorStatus = jobStatus(job);
   const safeLimit = Math.max(1, Math.min(200, integer(limit, 100, 200)));
   const safeOffset = Math.max(0, Math.min(1_000_000, integer(offset, 0, 1_000_000)));
   const progress = object(job?.progress);
@@ -281,13 +307,64 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
   const campaignFrontierCompleted = integer(collectionState?.campaignFrontierCompletedCount, 0, 100_000_000);
   const campaignFrontierDeferred = integer(collectionState?.campaignFrontierDeferredCount, 0, 100_000_000);
   const fanRefreshDelegated = result.fanRefreshDelegated === true || ["campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", "campaigns-v13"].includes(continuation.collectorVersion);
+  const membershipCoverageStatus = clean(collectionState?.membershipCoverageStatus, 40) || "MISSING";
+  const fanValuesComplete = coverageMatches
+    ? fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"
+    : fanRefreshDelegated ? false : result.fanValuesComplete === true;
+  let failedRefreshDemands = 0;
+  let quarantinedRefreshDemands = 0;
+  let refreshNextRetryAt = null;
+  let refreshLastFailureFanId = null;
+  let refreshLastFailureMessage = null;
+  let refreshLastFailureAt = null;
+  let refreshLastFailureAttempts = 0;
+  let refreshLastFailureQuarantined = false;
+  if (typeof db.creatorFanRefreshDemand?.count === "function") {
+    const counts = await Promise.all([
+      db.creatorFanRefreshDemand.count({ where: { creatorId: creator.id, status: "FAILED", quarantinedAt: null } }),
+      db.creatorFanRefreshDemand.count({ where: { creatorId: creator.id, status: "FAILED", quarantinedAt: { not: null } } }),
+    ]);
+    failedRefreshDemands = counts[0];
+    quarantinedRefreshDemands = counts[1];
+  }
+  if (failedRefreshDemands > 0 && typeof db.creatorFanRefreshDemand?.findFirst === "function") {
+    const retry = await db.creatorFanRefreshDemand.findFirst({
+      where: { creatorId: creator.id, status: "FAILED", quarantinedAt: null, nextRetryAt: { not: null } },
+      orderBy: [{ nextRetryAt: "asc" }, { id: "asc" }],
+      select: { nextRetryAt: true },
+    });
+    refreshNextRetryAt = iso(retry?.nextRetryAt);
+  }
+  if ((failedRefreshDemands > 0 || quarantinedRefreshDemands > 0) && typeof db.creatorFanRefreshDemand?.findFirst === "function") {
+    const latestFailure = await db.creatorFanRefreshDemand.findFirst({
+      where: { creatorId: creator.id, status: "FAILED" },
+      orderBy: [{ lastFailedAt: "desc" }, { id: "asc" }],
+      select: { onlyFansUserId: true, lastError: true, lastFailedAt: true, retryAttempts: true, quarantinedAt: true },
+    });
+    refreshLastFailureFanId = clean(latestFailure?.onlyFansUserId, 180);
+    refreshLastFailureMessage = clean(latestFailure?.lastError, 1000);
+    refreshLastFailureAt = iso(latestFailure?.lastFailedAt);
+    refreshLastFailureAttempts = integer(latestFailure?.retryAttempts, 0, CAMPAIGN_FAN_REFRESH_MAX_RETRIES);
+    refreshLastFailureQuarantined = Boolean(latestFailure?.quarantinedAt);
+  }
+  const presentation = deriveCampaignPresentationStatus({
+    collectorStatus, fanRefreshDelegated, membershipCoverageStatus, campaignFrontierFreshnessStatus,
+    fanValuesComplete, fanValuesOutstanding, fanValueFreshnessStatus, retryableFailedDemands: failedRefreshDemands,
+  });
+  const { status, coverageStatus, refreshPending } = presentation;
+  const refreshRecoveryAvailable = failedRefreshDemands > 0 || quarantinedRefreshDemands > 0;
+  const stateErrorCode = clean(collectionState?.lastErrorCode, 120);
+  const stateErrorMessage = clean(collectionState?.lastErrorMessage, 1000);
   return {
     ok: true,
     creatorId: creator.id,
     jobId: job?.id || null,
     status,
+    collectorStatus,
+    coverageStatus,
+    refreshPending,
     manual: Boolean(job),
-    phase: clean(continuation.phase, 40) || (status === "COMPLETE" || status === "PARTIAL" ? "complete" : "campaigns"),
+    phase: clean(continuation.phase, 40) || (["COMPLETE", "PARTIAL", "REFRESH_PENDING"].includes(status) ? "complete" : "campaigns"),
     campaignPagesScanned: integer(continuation.page ?? result.campaignBatchCount, 0, 10_000),
     campaignIndex: integer(continuation.campaignIndex ?? result.campaignCount, 0, 10_000),
     claimerPage: integer(continuation.claimerPage ?? result.claimerBatchCount, 0, 2_147_483_647),
@@ -312,7 +389,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
     campaignFrontierDeferred,
     campaignFrontierOldestDueAt: iso(collectionState?.campaignFrontierOldestDueAt),
     campaignFrontierNextDueAt: iso(collectionState?.campaignFrontierNextDueAt),
-    campaignMembershipCoverageStatus: clean(collectionState?.membershipCoverageStatus, 40) || "MISSING",
+    campaignMembershipCoverageStatus: membershipCoverageStatus,
     campaignDirectoryDiscoveryStatus: directoryDiscovery.status,
     campaignDirectoryDiscoveryDueAt: iso(directoryDiscovery.dueAt),
     campaignDirectoryVerifiedAt: iso(directoryDiscovery.verifiedAt),
@@ -320,15 +397,23 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
     campaignDirectoryDiscoveryPending: directoryDiscovery.pendingDemand,
     campaignDirectoryDiscoveryEstimatedProviderCalls: directoryDiscovery.estimatedProviderCalls,
     campaignDirectoryDiscoveryTargetMs: directoryDiscovery.targetMs,
-    fanValuesComplete: coverageMatches
-      ? fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"
-      : fanRefreshDelegated ? false : result.fanValuesComplete === true,
+    fanValuesComplete,
     fanRefreshDelegated,
+    failedRefreshDemands,
+    quarantinedRefreshDemands,
+    refreshNextRetryAt,
+    refreshRetryMaxAttempts: CAMPAIGN_FAN_REFRESH_MAX_RETRIES,
+    refreshRecoveryAvailable,
+    refreshLastFailureFanId,
+    refreshLastFailureMessage,
+    refreshLastFailureAt,
+    refreshLastFailureAttempts,
+    refreshLastFailureQuarantined,
     startedAt: iso(job?.startedAt || job?.scheduledAt),
     completedAt: iso(job?.completedAt),
     lastProgressAt: iso(job?.lastProgressAt),
-    lastErrorCode: status === "FAILED" ? "CAMPAIGN_SCAN_FAILED" : null,
-    lastErrorMessage: status === "FAILED" ? clean(job?.lastError, 1000) : null,
+    lastErrorCode: status === "FAILED" ? "CAMPAIGN_SCAN_FAILED" : (status === "PARTIAL" ? stateErrorCode : null),
+    lastErrorMessage: status === "FAILED" ? clean(job?.lastError, 1000) : (status === "PARTIAL" ? stateErrorMessage : null),
     currentMessage: clean(progress.message, 500),
     onlineWorkers,
     summary: {
@@ -356,4 +441,5 @@ module.exports = {
   startManualCampaignScan,
   stopManualCampaignScan,
   readManualCampaignScan,
+  _test: { jobStatus },
 };

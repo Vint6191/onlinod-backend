@@ -9,6 +9,8 @@
 const DEFAULT_PROVIDER_INTERVAL_MS = 700;
 const DEFAULT_CAMPAIGN_DIRECTORY_PAGE_SIZE = 50;
 const DEFAULT_CAMPAIGN_DIRECTORY_TARGET_MS = 72 * 60 * 60 * 1000;
+const DEFAULT_UNIVERSAL_CREATOR_TARGET = 4000;
+const PROVIDER_SCALE_CONTRACT_VERSION = "phase3_provider_scale_contract_v1_a19";
 
 // Must remain semantically aligned with provider-request-credit-authority-service.
 // Keeping the weights local makes this module pure and avoids importing the DB
@@ -96,6 +98,25 @@ function campaignDirectoryFleetFeasibility({
   };
 }
 
+function providerScaleContract({
+  creatorCount = DEFAULT_UNIVERSAL_CREATOR_TARGET,
+  minimumCampaignCount = 1,
+  targetMs = DEFAULT_CAMPAIGN_DIRECTORY_TARGET_MS,
+  intervalMs = DEFAULT_PROVIDER_INTERVAL_MS,
+} = {}) {
+  const feasibility = campaignDirectoryFleetFeasibility({
+    creatorCount, campaignCount: minimumCampaignCount, targetMs, intervalMs, mode: "full_saturation_guaranteed",
+  });
+  return {
+    version: PROVIDER_SCALE_CONTRACT_VERSION,
+    universalDirectorySlaGuaranteed: feasibility.feasibleWithinTarget,
+    policy: feasibility.feasibleWithinTarget ? "GUARANTEED_WITHIN_CURRENT_TOPOLOGY" : "BEST_EFFORT_OVERDUE_VISIBLE",
+    reason: feasibility.feasibleWithinTarget ? null : "FLEET_GLOBAL_CAPACITY_INSUFFICIENT",
+    noUnauditedSharding: true,
+    feasibility,
+  };
+}
+
 function campaignDirectoryDiscoveryCapacityState(state, now = new Date(), targetMs = DEFAULT_CAMPAIGN_DIRECTORY_TARGET_MS) {
   const authorityNow = asDate(now) || new Date();
   const requestedRevision = Math.max(0, finiteInt(state?.campaignDirectoryDiscoveryRequestedRevision, 0, 0));
@@ -131,6 +152,8 @@ module.exports = {
   DEFAULT_PROVIDER_INTERVAL_MS,
   DEFAULT_CAMPAIGN_DIRECTORY_PAGE_SIZE,
   DEFAULT_CAMPAIGN_DIRECTORY_TARGET_MS,
+  DEFAULT_UNIVERSAL_CREATOR_TARGET,
+  PROVIDER_SCALE_CONTRACT_VERSION,
   PROVIDER_PRIORITY_CYCLE,
   PROVIDER_BACKGROUND_CATEGORY_CYCLE,
   providerPhysicalStartsPerHour,
@@ -140,5 +163,6 @@ module.exports = {
   providerCategoryBackgroundOnlyStartsPerHour,
   estimatedCampaignDirectoryCalls,
   campaignDirectoryFleetFeasibility,
+  providerScaleContract,
   campaignDirectoryDiscoveryCapacityState,
 };

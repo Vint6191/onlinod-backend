@@ -7,6 +7,9 @@ const { fanDataRefreshScheduleAvailable } = require("./provider-capacity-authori
 
 const CAMPAIGN_FAN_REFRESH_QUEUE_VERSION = 2;
 const CAMPAIGN_FAN_REFRESH_JOB_MAX = 50;
+const CAMPAIGN_FAN_REFRESH_MAX_RETRIES = 5;
+const CAMPAIGN_FAN_REFRESH_RETRY_BASE_MS = 60 * 1000;
+const CAMPAIGN_FAN_REFRESH_RETRY_MAX_MS = 30 * 60 * 1000;
 const WORK_STATUS = Object.freeze({
   ALREADY_FRESH: "ALREADY_FRESH",
   QUEUED: "QUEUED",
@@ -50,6 +53,25 @@ function maxDate(left, right) {
   if (!a) return b;
   if (!b) return a;
   return a.getTime() >= b.getTime() ? a : b;
+}
+function campaignFanRefreshRetryDelayMs(attempt) {
+  const safeAttempt = Math.max(1, Math.min(CAMPAIGN_FAN_REFRESH_MAX_RETRIES, Number(attempt) || 1));
+  return Math.min(CAMPAIGN_FAN_REFRESH_RETRY_MAX_MS, CAMPAIGN_FAN_REFRESH_RETRY_BASE_MS * (2 ** (safeAttempt - 1)));
+}
+function campaignFanRefreshFailurePlan(demand, now) {
+  const failedAt = asDate(now) || new Date();
+  const retryAttempts = Math.max(0, Number(demand?.retryAttempts || 0)) + 1;
+  const quarantined = retryAttempts >= CAMPAIGN_FAN_REFRESH_MAX_RETRIES;
+  return {
+    retryAttempts,
+    quarantined,
+    nextRetryAt: quarantined ? null : new Date(failedAt.getTime() + campaignFanRefreshRetryDelayMs(retryAttempts)),
+    quarantinedAt: quarantined ? failedAt : null,
+    lastOutcome: quarantined ? "QUARANTINED" : "RETRY_BACKOFF",
+  };
+}
+function shouldResetCampaignRefreshJob(existing) {
+  return ["DONE", "FAILED", "CANCELLED"].includes(String(existing?.status || ""));
 }
 async function lockDemandRowsByFanIds(db, creatorId, fanIds) {
   const ids = [...new Set((Array.isArray(fanIds) ? fanIds : []).map((value) => clean(value, 180)).filter(Boolean))].sort();
@@ -167,6 +189,23 @@ async function reconcileCampaignFanValueCoverage({ db, creatorId, scanRunId, now
   return db.creatorCampaignCollectionState.update({ where: { creatorId }, data: update });
 }
 
+async function assertCoverageMutationNotLost(db, { creatorId, scanRunId, result, code }) {
+  const count = Math.max(0, Number(result?.count || 0));
+  if (count === 1) return true;
+  if (count > 1) throw new Error(code);
+  // There is only one current CreatorCampaignCollectionState row per creator.
+  // Historical Campaign runs may still have durable work rows but no longer own
+  // the creator's current aggregate counters; a zero update is legitimate for
+  // those rows. Zero is fail-closed only when the requested scanRun is still the
+  // current coverage generation, because then a work transition without matching
+  // aggregate counters would corrupt end-to-end coverage arithmetic.
+  if (typeof db?.creatorCampaignCollectionState?.findUnique === "function") {
+    const current = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId } });
+    if (String(current?.fanValueCoverageScanRunId || "") === String(scanRunId || "")) throw new Error(code);
+  }
+  return false;
+}
+
 async function transitionWorkForDemand(db, { demand, outcome, observedAt, error = null, now }) {
   if (!demand?.id) return [];
   const pending = await db.creatorCampaignFanRefreshWork.findMany({
@@ -200,12 +239,262 @@ async function transitionWorkForDemand(db, { demand, outcome, observedAt, error 
     if (outcome === WORK_STATUS.SUCCEEDED) data.fanValueSucceeded = { increment: count };
     else if (outcome === WORK_STATUS.UNAVAILABLE) data.fanValueUnavailable = { increment: count };
     else data.fanValueFailed = { increment: count };
-    await db.creatorCampaignCollectionState.updateMany({
+    const coverageUpdated = await db.creatorCampaignCollectionState.updateMany({
       where: { creatorId: demand.creatorId, fanValueCoverageScanRunId: runId, fanValueOutstanding: { gte: count } }, data,
+    });
+    await assertCoverageMutationNotLost(db, {
+      creatorId: demand.creatorId, scanRunId: runId, result: coverageUpdated,
+      code: "CAMPAIGN_FAN_REFRESH_COVERAGE_TRANSITION_LOST",
     });
     await reconcileCampaignFanValueCoverage({ db, creatorId: demand.creatorId, scanRunId: runId, now });
   }
   return transitioned;
+}
+
+async function transitionRecoveredWorkForDemand(db, { demand, outcome, observedAt, now }) {
+  if (!demand?.id) return { queued: 0, failed: 0, scanRunIds: [] };
+  const rows = await db.creatorCampaignFanRefreshWork.findMany({
+    where: { demandId: demand.id, status: { in: [WORK_STATUS.QUEUED, WORK_STATUS.FAILED] } },
+    select: { id: true, creatorId: true, scanRunId: true, status: true, freshnessCutoffAt: true },
+  });
+  const eligible = rows.filter((row) => campaignFanRefreshIsFresh(observedAt, row.freshnessCutoffAt));
+  if (!eligible.length) return { queued: 0, failed: 0, scanRunIds: [] };
+  const byRun = new Map();
+  for (const row of eligible) {
+    const key = String(row.scanRunId || "");
+    if (!key) continue;
+    const group = byRun.get(key) || { queuedIds: [], failedIds: [] };
+    if (row.status === WORK_STATUS.FAILED) group.failedIds.push(row.id);
+    else group.queuedIds.push(row.id);
+    byRun.set(key, group);
+  }
+  let queued = 0;
+  let failed = 0;
+  for (const [scanRunId, group] of byRun) {
+    let queuedCount = 0;
+    let failedCount = 0;
+    if (group.queuedIds.length) {
+      const updated = await db.creatorCampaignFanRefreshWork.updateMany({
+        where: { id: { in: group.queuedIds }, status: WORK_STATUS.QUEUED },
+        data: { status: outcome, outcome, observedAt, completedAt: now, lastError: null },
+      });
+      queuedCount = Math.max(0, Number(updated?.count || 0));
+    }
+    if (group.failedIds.length) {
+      const updated = await db.creatorCampaignFanRefreshWork.updateMany({
+        where: { id: { in: group.failedIds }, status: WORK_STATUS.FAILED },
+        data: { status: outcome, outcome, observedAt, completedAt: now, lastError: null },
+      });
+      failedCount = Math.max(0, Number(updated?.count || 0));
+    }
+    if (queuedCount || failedCount) {
+      const data = { fanValueCoverageUpdatedAt: now };
+      if (queuedCount) data.fanValueOutstanding = { decrement: queuedCount };
+      if (failedCount) data.fanValueFailed = { decrement: failedCount };
+      const completed = queuedCount + failedCount;
+      if (outcome === WORK_STATUS.SUCCEEDED) data.fanValueSucceeded = { increment: completed };
+      else data.fanValueUnavailable = { increment: completed };
+      const coverageUpdated = await db.creatorCampaignCollectionState.updateMany({
+        where: {
+          creatorId: demand.creatorId,
+          fanValueCoverageScanRunId: scanRunId,
+          ...(queuedCount ? { fanValueOutstanding: { gte: queuedCount } } : {}),
+          ...(failedCount ? { fanValueFailed: { gte: failedCount } } : {}),
+        },
+        data,
+      });
+      await assertCoverageMutationNotLost(db, {
+        creatorId: demand.creatorId, scanRunId, result: coverageUpdated,
+        code: "CAMPAIGN_FAN_REFRESH_RECOVERY_COVERAGE_TRANSITION_LOST",
+      });
+      await reconcileCampaignFanValueCoverage({ db, creatorId: demand.creatorId, scanRunId, now });
+    }
+    queued += queuedCount;
+    failed += failedCount;
+  }
+  return { queued, failed, scanRunIds: [...byRun.keys()] };
+}
+
+async function reconcileCampaignFanRefreshDemandsFromCanonicalObservations({ db, creatorId, fanIds = [], now = null } = {}) {
+  const scopedCreatorId = clean(creatorId, 180);
+  const ids = [...new Set((Array.isArray(fanIds) ? fanIds : []).map((value) => clean(value, 180)).filter(Boolean))].sort();
+  if (!db?.creatorFanRefreshDemand?.findMany || !db?.creatorFan?.findMany || !scopedCreatorId || !ids.length) return { healed: 0, reason: "nothing_to_reconcile" };
+  await lockDemandRowsByFanIds(db, scopedCreatorId, ids);
+  const demands = await db.creatorFanRefreshDemand.findMany({
+    where: {
+      creatorId: scopedCreatorId,
+      onlyFansUserId: { in: ids },
+      status: { in: [DEMAND_STATUS.QUEUED, DEMAND_STATUS.FAILED] },
+    },
+  });
+  if (!demands.length) return { healed: 0, reason: "no_open_demands" };
+  const fans = await db.creatorFan.findMany({
+    where: { creatorId: scopedCreatorId, onlyFansUserId: { in: demands.map((row) => row.onlyFansUserId) } },
+    include: { valueCurrent: true },
+  });
+  const currentByFan = new Map((fans || []).map((fan) => [String(fan.onlyFansUserId), fan.valueCurrent || null]));
+  const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
+  let healed = 0;
+  for (const demand of demands) {
+    const requestedRevision = Math.max(1, Number(demand.requestedRevision || 1));
+    const satisfiedRevision = Math.max(0, Number(demand.satisfiedRevision || 0));
+    if (satisfiedRevision >= requestedRevision) continue;
+    const value = currentByFan.get(String(demand.onlyFansUserId));
+    const observedAt = asDate(value?.valueObservedAt);
+    if (!observedAt || !campaignFanRefreshIsFresh(observedAt, demand.requestedFreshnessCutoffAt)) continue;
+    const outcome = String(value?.availability || "").toUpperCase() === "AVAILABLE" ? WORK_STATUS.SUCCEEDED : WORK_STATUS.UNAVAILABLE;
+    await db.creatorFanRefreshDemand.update({
+      where: { id: demand.id },
+      data: {
+        status: outcome === WORK_STATUS.SUCCEEDED ? DEMAND_STATUS.COMPLETE : DEMAND_STATUS.UNAVAILABLE,
+        satisfiedRevision: requestedRevision,
+        activeRefreshJobId: null,
+        activeRefreshRevision: null,
+        lastObservedAt: observedAt,
+        lastOutcome: outcome,
+        lastCompletedAt: effectiveNow,
+        lastFailedAt: null,
+        retryAttempts: 0,
+        nextRetryAt: null,
+        lastRetryAt: null,
+        quarantinedAt: null,
+        lastError: null,
+      },
+    });
+    await transitionRecoveredWorkForDemand(db, { demand, outcome, observedAt, now: effectiveNow });
+    healed += 1;
+  }
+  return { healed, reason: healed ? "canonical_observation_healed" : "no_fresh_observation" };
+}
+
+async function requeueFailedWorkForDemand(db, { demand, now }) {
+  const failedWork = await db.creatorCampaignFanRefreshWork.findMany({
+    where: { demandId: demand.id, status: WORK_STATUS.FAILED },
+    select: { id: true, scanRunId: true },
+  });
+  if (!failedWork.length) return { requeued: 0, scanRunIds: [] };
+  const byRun = new Map();
+  for (const row of failedWork) {
+    const runId = clean(row.scanRunId, 120);
+    if (!runId) continue;
+    const ids = byRun.get(runId) || [];
+    ids.push(row.id);
+    byRun.set(runId, ids);
+  }
+  let requeued = 0;
+  for (const [scanRunId, ids] of byRun) {
+    const updated = await db.creatorCampaignFanRefreshWork.updateMany({
+      where: { id: { in: ids }, status: WORK_STATUS.FAILED },
+      data: {
+        status: WORK_STATUS.QUEUED,
+        outcome: null,
+        observedAt: null,
+        completedAt: null,
+        refreshJobId: null,
+        lastError: null,
+        scheduledAt: now,
+      },
+    });
+    const count = Math.max(0, Number(updated?.count || 0));
+    if (!count) continue;
+    requeued += count;
+    const coverageUpdated = await db.creatorCampaignCollectionState.updateMany({
+      where: { creatorId: demand.creatorId, fanValueCoverageScanRunId: scanRunId, fanValueFailed: { gte: count } },
+      data: {
+        fanValueFailed: { decrement: count },
+        fanValueOutstanding: { increment: count },
+        fanValueFreshnessStatus: "QUEUED",
+        fanValueCoverageUpdatedAt: now,
+        status: "PARTIAL",
+        retryAfterAt: null,
+        lastErrorCode: "CAMPAIGN_FAN_VALUE_REFRESH_RETRY_QUEUED",
+        lastErrorMessage: `Campaign FanData refresh retry queued for ${count} fan${count === 1 ? "" : "s"}`,
+      },
+    });
+    await assertCoverageMutationNotLost(db, {
+      creatorId: demand.creatorId, scanRunId, result: coverageUpdated,
+      code: "CAMPAIGN_FAN_REFRESH_REQUEUE_COVERAGE_TRANSITION_LOST",
+    });
+  }
+  return { requeued, scanRunIds: [...byRun.keys()] };
+}
+
+async function recoverFailedCampaignFanRefreshDemands({ db, now = null, creatorId = null, force = false, maxDemands = 200 } = {}) {
+  if (!db?.creatorFanRefreshDemand?.findMany) return { recovered: 0, requeuedWork: 0, reason: "adapter_unsupported" };
+  const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
+  const scopedCreatorId = clean(creatorId, 180);
+  const limit = Math.max(1, Math.min(2000, Number(maxDemands) || 200));
+  let candidates = [];
+  if (typeof db.$queryRawUnsafe === "function") {
+    const where = [`"status" = 'FAILED'`, `"activeRefreshJobId" IS NULL`];
+    const args = [];
+    if (!force) {
+      args.push(effectiveNow);
+      where.push(`"quarantinedAt" IS NULL`, `"nextRetryAt" IS NOT NULL`, `"nextRetryAt" <= $${args.length}`);
+    }
+    if (scopedCreatorId) {
+      args.push(scopedCreatorId);
+      where.push(`"creatorId" = $${args.length}`);
+    }
+    const rows = await db.$queryRawUnsafe(`
+      SELECT "id"
+      FROM "CreatorFanRefreshDemand"
+      WHERE ${where.join(" AND ")}
+      ORDER BY COALESCE("nextRetryAt", "lastFailedAt", "updatedAt") ASC, "id" ASC
+      FOR UPDATE SKIP LOCKED
+      LIMIT ${limit}
+    `, ...args);
+    const ids = (Array.isArray(rows) ? rows : []).map((row) => clean(row?.id, 180)).filter(Boolean);
+    if (ids.length) candidates = await db.creatorFanRefreshDemand.findMany({ where: { id: { in: ids } } });
+  } else {
+    candidates = await db.creatorFanRefreshDemand.findMany({
+      where: {
+        status: DEMAND_STATUS.FAILED,
+        activeRefreshJobId: null,
+        ...(scopedCreatorId ? { creatorId: scopedCreatorId } : {}),
+        ...(force ? {} : { quarantinedAt: null, nextRetryAt: { lte: effectiveNow } }),
+      },
+      orderBy: [{ nextRetryAt: "asc" }, { id: "asc" }],
+      take: limit,
+    });
+  }
+  let recovered = 0;
+  let requeuedWork = 0;
+  for (const demand of candidates) {
+    const work = await requeueFailedWorkForDemand(db, { demand, now: effectiveNow });
+    if (!work.requeued) continue;
+    await db.creatorFanRefreshDemand.update({
+      where: { id: demand.id },
+      data: {
+        status: DEMAND_STATUS.QUEUED,
+        activeRefreshJobId: null,
+        activeRefreshRevision: null,
+        nextRetryAt: null,
+        lastRetryAt: effectiveNow,
+        quarantinedAt: force ? null : demand.quarantinedAt,
+        ...(force ? { retryAttempts: 0 } : {}),
+        lastOutcome: force ? "MANUAL_REPAIR_QUEUED" : "RETRY_QUEUED",
+        lastError: null,
+      },
+    });
+    recovered += 1;
+    requeuedWork += work.requeued;
+  }
+  return { recovered, requeuedWork, reason: recovered ? (force ? "manual_repair_queued" : "retry_due_queued") : "none_due" };
+}
+
+async function repairFailedCampaignFanRefreshDemands({ db, creatorId, now = null, maxDemands = 200 } = {}) {
+  if (!creatorId) return { recovered: 0, requeuedWork: 0, reason: "creator_required" };
+  if (typeof db?.$transaction === "function") {
+    return db.$transaction(async (tx) => {
+      const repaired = await recoverFailedCampaignFanRefreshDemands({ db: tx, creatorId, now, force: true, maxDemands });
+      const promoted = await promoteQueuedCampaignFanRefreshDemands({ db: tx, now, maxJobs: 4, inTransaction: true });
+      return { ...repaired, promotedJobs: promoted.promotedJobs, promotedFans: promoted.promotedFans };
+    });
+  }
+  const repaired = await recoverFailedCampaignFanRefreshDemands({ db, creatorId, now, force: true, maxDemands });
+  const promoted = await promoteQueuedCampaignFanRefreshDemands({ db, now, maxJobs: 4, inTransaction: true });
+  return { ...repaired, promotedJobs: promoted.promotedJobs, promotedFans: promoted.promotedFans };
 }
 
 async function scheduleDemandRefreshJob({ db, job, demands, scheduledAt, planner = null }) {
@@ -230,8 +519,8 @@ async function scheduleDemandRefreshJob({ db, job, demands, scheduledAt, planner
     });
     return null;
   }
-  const createPlannedJobIfAbsent = planner || require("./job-planning-repository").createPlannedJobIfAbsent;
-  const planned = await createPlannedJobIfAbsent({
+  const planRefreshJob = planner || require("./job-planning-repository").ensurePlannedJob;
+  const planned = await planRefreshJob({
     db, publish: false, jobKey: "fan_data_point_refresh", scope: "creator", creatorId, agencyId,
     idempotencyKey: `phase3:campaign-fan-demand:${creatorId}:${fanSetHash}`,
     params: {
@@ -244,6 +533,13 @@ async function scheduleDemandRefreshJob({ db, job, demands, scheduledAt, planner
       campaignRefreshDemandFanIds: rows.map((row) => row.fanId),
     },
     priority: Math.max(1, Number(job?.priority || 0), 85), scheduledAt, nextRunAt: scheduledAt,
+    // Same-revision demand retries intentionally reuse the semantic idempotency
+    // key. A prior terminal DONE/FAILED/CANCELLED JobInstance must therefore be
+    // rescheduled, not merely returned as an inert idempotency hit. Demand-level
+    // retryAttempts/quarantine remains the bounded retry authority.
+    resetExisting: planner ? false : true,
+    shouldResetExisting: planner ? undefined : shouldResetCampaignRefreshJob,
+    protectedStatuses: ["SCHEDULED", "CLAIMED"],
   });
   const refreshJobId = clean(planned?.job?.id, 180);
   if (!refreshJobId) throw new Error("CAMPAIGN_FAN_REFRESH_JOB_CREATE_FAILED");
@@ -414,6 +710,12 @@ async function promoteQueuedCampaignFanRefreshDemands({ db, now = null, maxJobs 
   if (!db?.creatorFanRefreshDemand?.findMany || !db?.jobInstance) return { promotedJobs: 0, promotedFans: 0, reason: "adapter_unsupported" };
   const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
   const limit = Math.max(1, Math.min(16, Number(maxJobs) || 4));
+  // Failed demand is durable debt, not a terminal dead-end. Requeue only due,
+  // non-quarantined rows under the same transaction/row locks used by the
+  // backlog promoter. This keeps multi-replica retry idempotent.
+  await recoverFailedCampaignFanRefreshDemands({
+    db, now: effectiveNow, force: false, maxDemands: limit * CAMPAIGN_FAN_REFRESH_JOB_MAX,
+  });
   // Pull a bounded oldest-per-creator window rather than one global oldest slice.
   // A creator with a very deep old backlog may already be at its per-creator
   // scheduled-job cap. If that creator can fill the whole candidate slice, a
@@ -559,6 +861,10 @@ async function recordCampaignFanRefreshChunk({ db, job, chunkResult } = {}) {
         lastOutcome: outcome,
         lastCompletedAt: now,
         lastFailedAt: null,
+        retryAttempts: 0,
+        nextRetryAt: null,
+        lastRetryAt: null,
+        quarantinedAt: null,
         lastError: null,
       },
     });
@@ -590,6 +896,7 @@ async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner =
     followUpJobId = await scheduleDemandRefreshJob({ db, job, demands: superseded, scheduledAt: now, planner });
   }
   for (const demand of failed) {
+    const { retryAttempts, quarantined, nextRetryAt, quarantinedAt, lastOutcome } = campaignFanRefreshFailurePlan(demand, now);
     await db.creatorFanRefreshDemand.update({
       where: { id: demand.id },
       data: {
@@ -597,6 +904,10 @@ async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner =
         activeRefreshJobId: null,
         activeRefreshRevision: null,
         lastFailedAt: now,
+        retryAttempts,
+        nextRetryAt,
+        quarantinedAt,
+        lastOutcome,
         lastError: `fan_data_point_refresh completed without satisfying requested freshness${result?.errors ? `; errors=${Number(result.errors)}` : ""}`,
       },
     });
@@ -622,9 +933,12 @@ async function recordCampaignFanRefreshJobFailure({ db, job, error, terminal = t
   let followUpJobId = null;
   if (superseded.length) followUpJobId = await scheduleDemandRefreshJob({ db, job, demands: superseded, scheduledAt: now, planner });
   for (const demand of failed) {
+    const { retryAttempts, quarantined, nextRetryAt, quarantinedAt, lastOutcome } = campaignFanRefreshFailurePlan(demand, now);
     await db.creatorFanRefreshDemand.update({ where: { id: demand.id }, data: {
       status: DEMAND_STATUS.FAILED, activeRefreshJobId: null, activeRefreshRevision: null,
-      lastFailedAt: now, lastError: clean(error?.message || error, 1000),
+      lastFailedAt: now, retryAttempts, nextRetryAt, quarantinedAt,
+      lastOutcome,
+      lastError: clean(error?.message || error, 1000),
     } });
     await transitionWorkForDemand(db, { demand, outcome: WORK_STATUS.FAILED, observedAt: null, error: error?.message || error, now });
   }
@@ -634,6 +948,7 @@ async function recordCampaignFanRefreshJobFailure({ db, job, error, terminal = t
 module.exports = {
   CAMPAIGN_FAN_REFRESH_QUEUE_VERSION,
   CAMPAIGN_FAN_REFRESH_JOB_MAX,
+  CAMPAIGN_FAN_REFRESH_MAX_RETRIES,
   CAMPAIGN_FAN_VALUE_FRESHNESS_MS,
   WORK_STATUS,
   DEMAND_STATUS,
@@ -641,9 +956,12 @@ module.exports = {
   campaignFanValueCoverageFromState: coverageFromState,
   enqueueUniqueCampaignFanRefreshes,
   promoteQueuedCampaignFanRefreshDemands,
+  recoverFailedCampaignFanRefreshDemands,
+  repairFailedCampaignFanRefreshDemands,
+  reconcileCampaignFanRefreshDemandsFromCanonicalObservations,
   recordCampaignFanRefreshChunk,
   finalizeCampaignFanRefreshJob,
   recordCampaignFanRefreshJobFailure,
   reconcileCampaignFanValueCoverage,
-  _test: { scheduleDemandRefreshJob },
+  _test: { scheduleDemandRefreshJob, campaignFanRefreshRetryDelayMs, campaignFanRefreshFailurePlan, shouldResetCampaignRefreshJob },
 };
