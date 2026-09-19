@@ -104,7 +104,7 @@ for (const fanCount of [1, 20, 50]) {
     assert.equal(result.scheduled, fanCount);
     assert.equal(calls.raw, 4, "revision/lock/capacity/bind SQL topology must be constant");
     assert.equal(calls.execute, 1, "capacity advisory lock must remain one bounded call");
-    assert.equal(calls.total, 12, "full production-shaped queue DB topology must not grow with fan count");
+    assert.equal(calls.total, 11, "A20.11 removes the pre-demand state write while keeping queue topology constant");
   });
 }
 

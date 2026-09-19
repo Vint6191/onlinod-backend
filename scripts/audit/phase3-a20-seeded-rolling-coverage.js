@@ -9,6 +9,7 @@ const { CURRENT_STATE_FALLBACK_EXPLAIN_SQL } = require("../database/phase3-campa
 const mode = String(process.argv[2] || "").trim().toLowerCase();
 const nonce = String(process.env.ONLINOD_A20_SEED_NONCE || "seeded").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || "seeded";
 const historyRows = Math.max(0, Math.min(100000, Number(process.env.ONLINOD_A20_SEED_HISTORY_ROWS || 20000) || 20000));
+const currentGenerationRows = Math.max(1, Math.min(50000, Number(process.env.ONLINOD_A20_SEED_CURRENT_ROWS || 10000) || 10000));
 const p = (name) => `a205-${nonce}-${name}`;
 const ids = {
   agency: p("agency"),
@@ -61,6 +62,30 @@ async function seed(db) {
   await insertWork({ id: p("work-old"), runId: "run-old", fanId: "fan-old", campaignJobId: ids.fallbackOldJob });
   await insertWork({ id: p("work-current"), runId: "run-current", fanId: "fan-current", campaignJobId: ids.fallbackCurrentJob });
 
+  if (currentGenerationRows > 1) {
+    const started = performance.now();
+    await db.$executeRawUnsafe(`
+      INSERT INTO "CreatorCampaignFanRefreshWork" (
+        "id","agencyId","creatorId","scanRunId","scanStartedAt","onlyFansUserId","campaignJobId",
+        "freshnessCutoffAt","status","scheduledAt","createdAt","updatedAt"
+      )
+      SELECT
+        $1 || '-current-work-' || g::text,
+        $2,
+        $3,
+        'run-current',
+        $4,
+        'current-fan-' || g::text,
+        $5,
+        $4,
+        'QUEUED',
+        $4,$4,$4
+      FROM generate_series(2, $6::int) AS g
+    `, p("bulk"), ids.agency, ids.fallbackCreator, now, ids.fallbackCurrentJob, currentGenerationRows);
+    const durationMs = Math.round((performance.now() - started) * 100) / 100;
+    console.log(`# A20_11_SEEDED_CURRENT_GENERATION ${JSON.stringify({ currentGenerationRows, insertDurationMs: durationMs })}`);
+  }
+
   if (historyRows > 0) {
     const started = performance.now();
     await db.$executeRawUnsafe(`
@@ -84,7 +109,7 @@ async function seed(db) {
     const durationMs = Math.round((performance.now() - started) * 100) / 100;
     console.log(`# A20_5_SEEDED_HISTORY ${JSON.stringify({ historyRows, insertDurationMs: durationMs })}`);
   }
-  console.log(`# A20_5_SEEDED_ROLLING_SEED ${JSON.stringify({ ok: true, nonce, historyRows })}`);
+  console.log(`# A20_5_SEEDED_ROLLING_SEED ${JSON.stringify({ ok: true, nonce, historyRows, currentGenerationRows })}`);
 }
 
 async function verify(db) {
@@ -145,9 +170,11 @@ async function verify(db) {
   let workRowsVisited = 0;
   let workPlanNodes = 0;
   let executionTimeMs = null;
+  let currentRunIndexUsed = false;
   const visit = (node) => {
     if (!node || typeof node !== "object") return;
     if (executionTimeMs === null && Number.isFinite(Number(node["Execution Time"]))) executionTimeMs = Number(node["Execution Time"]);
+    if (String(node["Index Name"] || "") === "CreatorCampaignFanRefreshWork_creator_run_id_idx") currentRunIndexUsed = true;
     if (String(node["Relation Name"] || "") === "CreatorCampaignFanRefreshWork") {
       const loops = Math.max(1, Number(node["Actual Loops"] || 1));
       const rows = Math.max(0, Number(node["Actual Rows"] || 0));
@@ -160,14 +187,15 @@ async function verify(db) {
   };
   for (const root of roots) visit(root);
   assert.ok(workPlanNodes > 0, "seeded migration proof must expose a physical CreatorCampaignFanRefreshWork plan node");
-  const visitBudget = Math.max(500, Math.ceil(historyRows * 0.10));
+  const visitBudget = Math.max(500, Math.ceil(currentGenerationRows * 0.02));
+  assert.equal(currentRunIndexUsed, true, "large current-generation proof must use CreatorCampaignFanRefreshWork_creator_run_id_idx");
   assert.ok(
     workRowsVisited <= visitBudget,
-    `current-state migration preflight visited ${workRowsVisited} work rows with ${historyRows} historical rows; budget=${visitBudget}`,
+    `current-state migration preflight visited ${workRowsVisited} work rows with currentGenerationRows=${currentGenerationRows}; budget=${visitBudget}`,
   );
-  console.log(`# A20_6_SEEDED_BACKFILL_EXPLAIN_METRICS ${JSON.stringify({ historyRows, workRowsVisited, visitBudget, workPlanNodes, executionTimeMs })}`);
+  console.log(`# A20_6_SEEDED_BACKFILL_EXPLAIN_METRICS ${JSON.stringify({ historyRows, currentGenerationRows, workRowsVisited, visitBudget, workPlanNodes, currentRunIndexUsed, executionTimeMs })}`);
   console.log(`# A20_6_SEEDED_BACKFILL_EXPLAIN ${JSON.stringify(payload)}`);
-  console.log(`# A20_5_SEEDED_ROLLING_VERIFY ${JSON.stringify({ ok: true, nonce, historyRows })}`);
+  console.log(`# A20_5_SEEDED_ROLLING_VERIFY ${JSON.stringify({ ok: true, nonce, historyRows, currentGenerationRows })}`);
 }
 
 (async () => {

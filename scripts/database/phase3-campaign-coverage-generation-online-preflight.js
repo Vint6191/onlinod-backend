@@ -4,11 +4,15 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 
 const MIGRATION = "20260919173000_phase3_campaign_coverage_generation_authority_v1";
+const CURRENT_RUN_INDEX_MIGRATION = "20260920003000_phase3_campaign_refresh_current_run_lookup_index_v1";
 const REQUIRED_TABLES = ["CreatorCampaignCollectionState", "CreatorCampaignFanRefreshWork", "JobInstance"];
 const PREFLIGHT_ADVISORY_LOCK_CLASS = 132987241;
 const PREFLIGHT_ADVISORY_LOCK_KEY = 201917300;
 const PREFLIGHT_TRANSACTION_MAX_WAIT_MS = 30_000;
 const PREFLIGHT_TRANSACTION_TIMEOUT_MS = 300_000;
+const CURRENT_RUN_INDEX_NAME = "CreatorCampaignFanRefreshWork_creator_run_id_idx";
+const CURRENT_RUN_INDEX_SQL = `CREATE INDEX CONCURRENTLY IF NOT EXISTS "${CURRENT_RUN_INDEX_NAME}"
+  ON "CreatorCampaignFanRefreshWork"("creatorId", "scanRunId", "id")`;
 const AUTHORITY_COLUMNS = [
   "fanValueCoverageDelegated",
   "fanValueCoverageOwnerKind",
@@ -68,6 +72,49 @@ async function currentAuthorityColumns(db) {
   return new Set((rows || []).map((row) => String(row.column_name)));
 }
 
+async function currentRunIndex(db) {
+  const rows = await db.$queryRawUnsafe(`
+    SELECT c.relname AS name,
+           i.indisvalid AS valid,
+           i.indisready AS ready,
+           pg_get_indexdef(i.indexrelid) AS definition
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      JOIN pg_class t ON t.oid = i.indrelid
+      JOIN pg_namespace n ON n.oid = t.relnamespace
+     WHERE n.nspname = current_schema()
+       AND t.relname = 'CreatorCampaignFanRefreshWork'
+       AND c.relname = $1
+     LIMIT 1
+  `, CURRENT_RUN_INDEX_NAME);
+  return Array.isArray(rows) ? rows[0] || null : null;
+}
+
+function assertCurrentRunIndex(row) {
+  if (!row?.valid || !row?.ready) fail(`${CURRENT_RUN_INDEX_NAME} is not valid/ready`);
+  const definition = String(row.definition || "").replace(/"/g, "");
+  if (!/\(\s*creatorId\s*,\s*scanRunId\s*,\s*id\s*\)/i.test(definition)) {
+    fail(`${CURRENT_RUN_INDEX_NAME} definition/order mismatch; got=${row.definition}`);
+  }
+}
+
+async function ensureCurrentRunLookupIndex(db) {
+  let existing = await currentRunIndex(db);
+  if (existing && (!existing.valid || !existing.ready)) {
+    console.warn(`# PHASE3_CAMPAIGN_COVERAGE_INDEX repair-invalid ${CURRENT_RUN_INDEX_NAME}`);
+    await db.$executeRawUnsafe(`DROP INDEX CONCURRENTLY IF EXISTS "${CURRENT_RUN_INDEX_NAME}"`);
+    existing = null;
+  }
+  if (!existing) {
+    console.log(`# PHASE3_CAMPAIGN_COVERAGE_INDEX create-concurrently ${CURRENT_RUN_INDEX_NAME}`);
+    await db.$executeRawUnsafe(CURRENT_RUN_INDEX_SQL);
+    existing = await currentRunIndex(db);
+  }
+  if (!existing) fail(`${CURRENT_RUN_INDEX_NAME} was not created`);
+  assertCurrentRunIndex(existing);
+  return { ensured: true, name: CURRENT_RUN_INDEX_NAME };
+}
+
 const DIRECT_SOURCE_JOB_BACKFILL_SQL = `
 UPDATE "CreatorCampaignCollectionState" s
 SET "fanValueCoverageDelegated" = CASE
@@ -91,11 +138,10 @@ WHERE s."sourceJobId" = j."id"
   AND s."fanValueCoverageScanRunId" IS NOT NULL
 `;
 
-// Migration-lineage-safe replacement for the historical migration's all-history
-// DISTINCT ON fallback. Start from the single current collection-state row per
-// creator, then probe only that exact creator+scanRun through the existing
-// (creatorId, scanRunId, ...) indexes. Historical work from superseded runs is
-// never enumerated just to discover the current generation's source job.
+// Start from current state and probe one exact current-generation work row. The
+// A20.11 online index (creatorId, scanRunId, id) makes ORDER BY id LIMIT 1
+// bounded by the generation lookup rather than sorting/scanning every fan in a
+// large current generation.
 const CURRENT_STATE_FALLBACK_BACKFILL_SQL = `
 WITH coverage_job AS (
   SELECT
@@ -158,21 +204,20 @@ WITH coverage_job AS (
 SELECT COUNT(*)::int AS "count" FROM coverage_job
 `;
 
-async function ensureColumnsAndBackfill(db) {
+async function acquirePreflightAuthority(tx) {
+  await tx.$executeRawUnsafe(
+    `SELECT pg_advisory_xact_lock($1::int, $2::int)`,
+    PREFLIGHT_ADVISORY_LOCK_CLASS,
+    PREFLIGHT_ADVISORY_LOCK_KEY,
+  );
+}
+
+async function ensureAuthorityColumns(db) {
   return db.$transaction(async (tx) => {
-    // Serialize concurrent deploy preflights before enabling the short DDL lock
-    // timeout. Without this transaction-scoped advisory lock, two deploys can
-    // both observe the migration as unapplied and the second can spend the 5s
-    // lock_timeout waiting on the first deploy's ALTER/backfill, producing a
-    // false deployment failure even though the peer is making valid progress.
-    // The advisory wait itself is intentionally outside the local lock_timeout;
-    // once ownership is acquired, the 5s timeout still protects real table-lock
-    // contention from unrelated writers.
-    await tx.$executeRawUnsafe(
-      `SELECT pg_advisory_xact_lock($1::int, $2::int)`,
-      PREFLIGHT_ADVISORY_LOCK_CLASS,
-      PREFLIGHT_ADVISORY_LOCK_KEY,
-    );
+    await acquirePreflightAuthority(tx);
+    const found = await currentAuthorityColumns(tx);
+    const missing = AUTHORITY_COLUMNS.filter((column) => !found.has(column));
+    if (!missing.length) return { altered: false, missing: [] };
     await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '5s'`);
     await tx.$executeRawUnsafe(`
       ALTER TABLE "CreatorCampaignCollectionState"
@@ -181,12 +226,22 @@ async function ensureColumnsAndBackfill(db) {
         ADD COLUMN IF NOT EXISTS "fanValueCoverageCollectorVersion" VARCHAR(80),
         ADD COLUMN IF NOT EXISTS "fanValueCoverageSourceJobId" TEXT
     `);
-    // The short lock timeout is only a DDL acquisition fence. PostgreSQL applies
-    // lock_timeout to row locks too, so leaving it enabled during backfill would
-    // turn ordinary runtime row-lock contention into a false migration failure.
-    // The explicit Prisma transaction timeout above remains the bounded liveness
-    // fence for the backfill itself.
-    await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '0'`);
+    // Commit immediately after DDL. ACCESS EXCLUSIVE must never be held across
+    // the potentially longer data backfill.
+    return { altered: true, missing };
+  }, {
+    maxWait: PREFLIGHT_TRANSACTION_MAX_WAIT_MS,
+    timeout: PREFLIGHT_TRANSACTION_TIMEOUT_MS,
+  });
+}
+
+async function backfillAuthority(db) {
+  return db.$transaction(async (tx) => {
+    // Re-acquire the same preflight authority in the data phase. Concurrent
+    // deploys can interleave between the short DDL commit and this transaction,
+    // but the idempotent backfills themselves remain serialized and no DDL lock
+    // is held while runtime readers/writers contend on state rows.
+    await acquirePreflightAuthority(tx);
     const directUpdated = await tx.$executeRawUnsafe(DIRECT_SOURCE_JOB_BACKFILL_SQL);
     const fallbackUpdated = await tx.$executeRawUnsafe(CURRENT_STATE_FALLBACK_BACKFILL_SQL);
     return {
@@ -194,16 +249,15 @@ async function ensureColumnsAndBackfill(db) {
       fallbackUpdated: Math.max(0, Number(fallbackUpdated || 0)),
     };
   }, {
-    // Prisma interactive transactions default to a 5s runtime timeout. That
-    // would re-introduce the exact overlapping-deploy false failure that the
-    // advisory lock is meant to remove whenever the peer preflight takes more
-    // than five seconds. Keep pool acquisition bounded, but allow the serialized
-    // migration/backfill transaction enough time to wait for a valid peer and
-    // finish its own bounded current-state work. PostgreSQL lock_timeout remains
-    // the authority for unrelated table-lock contention after advisory ownership.
     maxWait: PREFLIGHT_TRANSACTION_MAX_WAIT_MS,
     timeout: PREFLIGHT_TRANSACTION_TIMEOUT_MS,
   });
+}
+
+async function ensureColumnsAndBackfill(db) {
+  const ddl = await ensureAuthorityColumns(db);
+  const backfill = await backfillAuthority(db);
+  return { ...backfill, ddlAltered: ddl.altered === true };
 }
 
 async function verifyAuthorityColumns(db) {
@@ -220,12 +274,6 @@ async function resolveApplied({ db, spawn = spawnSync, prismaEntry = null, isApp
     { cwd: path.resolve(__dirname, "../.."), env: process.env, stdio: "inherit" },
   );
   if (!result?.error && result?.status === 0) return { resolved: true, concurrentPeer: false };
-
-  // Online deploys may overlap. If a peer completed the exact same preflight and
-  // marked the migration applied after our initial migrationApplied() read, Prisma
-  // returns P3008/non-zero here even though the desired durable state is already
-  // reached. Re-read migration history before failing the deployment; only accept
-  // the non-zero result when the same migration is now successfully applied.
   if (db && await isApplied(db)) {
     console.warn(`# PHASE3_CAMPAIGN_COVERAGE_PREFLIGHT resolve-race migration already applied by peer ${MIGRATION}`);
     return { resolved: false, concurrentPeer: true };
@@ -246,10 +294,15 @@ async function main() {
       return;
     }
 
+    // Existing/populated installations need the generation lookup index online,
+    // before the ordinary migration records the schema step. Fresh databases
+    // create the same index from the A20.11 migration itself.
+    await ensureCurrentRunLookupIndex(db);
+
     const applied = await migrationApplied(db);
     if (applied) {
       await verifyAuthorityColumns(db);
-      console.log(`# PHASE3_CAMPAIGN_COVERAGE_PREFLIGHT_PASS migrationApplied=true action=verify-only`);
+      console.log(`# PHASE3_CAMPAIGN_COVERAGE_PREFLIGHT_PASS migrationApplied=true action=verify-only index=${CURRENT_RUN_INDEX_NAME}`);
       return;
     }
 
@@ -262,7 +315,7 @@ async function main() {
     await verifyAuthorityColumns(db);
     console.log(`# PHASE3_CAMPAIGN_COVERAGE_PREFLIGHT resolve-applied ${MIGRATION}`);
     const resolved = await resolveApplied({ db });
-    console.log(`# PHASE3_CAMPAIGN_COVERAGE_PREFLIGHT_PASS migrationApplied=false action=bounded-current-state-backfill directUpdated=${result.directUpdated} fallbackUpdated=${result.fallbackUpdated} concurrentPeer=${resolved.concurrentPeer === true}`);
+    console.log(`# PHASE3_CAMPAIGN_COVERAGE_PREFLIGHT_PASS migrationApplied=false action=split-ddl-bounded-current-state-backfill directUpdated=${result.directUpdated} fallbackUpdated=${result.fallbackUpdated} ddlAltered=${result.ddlAltered} concurrentPeer=${resolved.concurrentPeer === true} index=${CURRENT_RUN_INDEX_NAME}`);
   } finally {
     await db.$disconnect();
   }
@@ -277,11 +330,14 @@ if (require.main === module) {
 
 module.exports = {
   MIGRATION,
+  CURRENT_RUN_INDEX_MIGRATION,
   REQUIRED_TABLES,
   PREFLIGHT_ADVISORY_LOCK_CLASS,
   PREFLIGHT_ADVISORY_LOCK_KEY,
   PREFLIGHT_TRANSACTION_MAX_WAIT_MS,
   PREFLIGHT_TRANSACTION_TIMEOUT_MS,
+  CURRENT_RUN_INDEX_NAME,
+  CURRENT_RUN_INDEX_SQL,
   AUTHORITY_COLUMNS,
   DIRECT_SOURCE_JOB_BACKFILL_SQL,
   CURRENT_STATE_FALLBACK_BACKFILL_SQL,
@@ -291,6 +347,12 @@ module.exports = {
   migrationApplied,
   prerequisiteState,
   currentAuthorityColumns,
+  currentRunIndex,
+  assertCurrentRunIndex,
+  ensureCurrentRunLookupIndex,
+  acquirePreflightAuthority,
+  ensureAuthorityColumns,
+  backfillAuthority,
   ensureColumnsAndBackfill,
   verifyAuthorityColumns,
   resolveApplied,

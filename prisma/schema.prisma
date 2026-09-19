@@ -2102,6 +2102,7 @@ model CreatorCampaignFanRefreshWork {
 
   @@unique([creatorId, scanRunId, onlyFansUserId], map: "CreatorCampaignFanRefreshWork_creator_run_fan_key")
   @@index([creatorId, scanRunId, status], map: "CreatorCampaignFanRefreshWork_creator_run_status_idx")
+  @@index([creatorId, scanRunId, id], map: "CreatorCampaignFanRefreshWork_creator_run_id_idx")
   @@index([refreshJobId], map: "CreatorCampaignFanRefreshWork_refreshJob_idx")
   @@index([campaignJobId], map: "CreatorCampaignFanRefreshWork_campaignJob_idx")
   @@index([demandId, status], map: "CreatorCampaignFanRefreshWork_demand_status_idx")

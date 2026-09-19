@@ -156,8 +156,8 @@ async function ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, covera
   return state;
 }
 
-async function incrementCoverage(db, { creatorId, scanRunId, cutoff, expected = 0, alreadyFresh = 0, queued = 0, outstanding = 0, now }) {
-  await ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now });
+async function incrementCoverage(db, { creatorId, scanRunId, cutoff, expected = 0, alreadyFresh = 0, queued = 0, outstanding = 0, now, coverageAuthority = null }) {
+  await ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, coverageAuthority });
   if (!(expected || alreadyFresh || queued || outstanding)) return;
   await db.creatorCampaignCollectionState.updateMany({
     where: { creatorId, fanValueCoverageScanRunId: scanRunId },
@@ -1021,9 +1021,20 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
     sourceJobId: campaignJobId,
   };
   const normalized = uniqueCandidates(candidates).slice(0, CAMPAIGN_FAN_REFRESH_JOB_MAX);
-  await ensureCoverageRun(db, { creatorId, scanRunId: runId, cutoff, now: scheduledAt, coverageAuthority });
-  if (!normalized.length) return { expected: 0, alreadyFresh: 0, queued: 0, scheduled: 0, coalesced: 0, fanIds: [] };
+  // A20.11 lock-order authority: any transaction that touches Campaign refresh
+  // demand/work plus the creator-wide collection state must acquire them in the
+  // same direction: demand -> work -> collection state. Earlier generations
+  // initialized CreatorCampaignCollectionState here, before demand row locks,
+  // while healing/recovery/terminal paths lock demand/work first. That reverse
+  // order can deadlock a new Campaign generation against completion of an older
+  // refresh job. State-only early-return cases are safe because they never seek
+  // demand/work after taking the state row.
+  if (!normalized.length) {
+    await ensureCoverageRun(db, { creatorId, scanRunId: runId, cutoff, now: scheduledAt, coverageAuthority });
+    return { expected: 0, alreadyFresh: 0, queued: 0, scheduled: 0, coalesced: 0, fanIds: [] };
+  }
   if (!db.creatorCampaignFanRefreshWork?.findMany || !db.creatorFanRefreshDemand?.findMany || !db.jobInstance) {
+    await ensureCoverageRun(db, { creatorId, scanRunId: runId, cutoff, now: scheduledAt, coverageAuthority });
     return { expected: 0, alreadyFresh: 0, queued: 0, scheduled: 0, adapterUnsupported: true, fanIds: [] };
   }
 
@@ -1034,7 +1045,12 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
   });
   const seenWork = new Set((existingWork || []).map((row) => clean(row?.onlyFansUserId, 180)).filter(Boolean));
   const newCandidates = normalized.filter((row) => !seenWork.has(row.onlyFansUserId));
-  if (!newCandidates.length) return { expected: 0, alreadyFresh: 0, queued: 0, scheduled: 0, deduped: normalized.length, fanIds: [] };
+  if (!newCandidates.length) {
+    // Replay-only path still refreshes durable generation authority, but it does
+    // so as a state-only terminal step and never seeks demand/work afterwards.
+    await ensureCoverageRun(db, { creatorId, scanRunId: runId, cutoff, now: scheduledAt, coverageAuthority });
+    return { expected: 0, alreadyFresh: 0, queued: 0, scheduled: 0, deduped: normalized.length, fanIds: [] };
+  }
 
   const fresh = newCandidates.filter((row) => row.embeddedValueAvailable || campaignFanRefreshIsFresh(row.valueObservedAt, cutoff));
   const stale = newCandidates.filter((row) => !fresh.includes(row));
@@ -1158,6 +1174,7 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
     queued: staleCreated,
     outstanding: staleCreated,
     now: scheduledAt,
+    coverageAuthority,
   });
   return {
     expected: freshCreated + staleCreated,

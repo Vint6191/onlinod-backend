@@ -45,36 +45,39 @@ test("A20.6 migration fallback starts from current state and LATERAL-probes only
   assert.doesNotMatch(sql, /DISTINCT ON/i, "online preflight must not enumerate all historical refresh work");
 });
 
-test("A20.6 online preflight applies columns + both backfills as one transaction before migrate resolve", async () => {
-  const calls = [];
+test("A20.6/A20.11 online preflight commits DDL before the bounded backfill transaction", async () => {
+  const transactions = [];
   const fake = {
-    $transaction: async (work) => work({
-      $queryRawUnsafe: async (sql, ...args) => {
-        const text = String(sql);
-        calls.push(text);
-        assert.match(text, /pg_advisory_xact_lock/);
-        assert.deepEqual(args, [preflight.PREFLIGHT_ADVISORY_LOCK_CLASS, preflight.PREFLIGHT_ADVISORY_LOCK_KEY]);
-        return [{ locked: null }];
-      },
-      $executeRawUnsafe: async (sql) => {
-        const text = String(sql);
-        calls.push(text);
-        if (text.includes('FROM "JobInstance" j')) return 3;
-        if (text.includes('JOIN LATERAL')) return 2;
-        return 0;
-      },
-    }),
+    $transaction: async (work) => {
+      const calls = [];
+      transactions.push(calls);
+      return work({
+        $queryRawUnsafe: async (sql) => {
+          calls.push(String(sql));
+          if (/information_schema\.columns/.test(String(sql))) return [];
+          return [];
+        },
+        $executeRawUnsafe: async (sql) => {
+          const text = String(sql);
+          calls.push(text);
+          if (text.includes('FROM "JobInstance" j')) return 3;
+          if (text.includes('JOIN LATERAL')) return 2;
+          return 0;
+        },
+      });
+    },
   };
   const result = await preflight.ensureColumnsAndBackfill(fake);
   assert.equal(result.directUpdated, 3);
   assert.equal(result.fallbackUpdated, 2);
-  assert.equal(calls.length, 6);
-  assert.match(calls[0], /pg_advisory_xact_lock/, "deployment serialization must happen before the short DDL lock timeout");
-  assert.match(calls[1], /SET LOCAL lock_timeout = '5s'/);
-  assert.match(calls[2], /ALTER TABLE "CreatorCampaignCollectionState"/);
-  assert.match(calls[3], /SET LOCAL lock_timeout = '0'/);
-  assert.match(calls[4], /FROM "JobInstance" j/);
-  assert.match(calls[5], /JOIN LATERAL/);
+  assert.equal(transactions.length, 2);
+  assert.match(transactions[0][0], /pg_advisory_xact_lock/);
+  assert.ok(transactions[0].some((text) => /ALTER TABLE "CreatorCampaignCollectionState"/.test(text)));
+  assert.equal(transactions[0].some((text) => /FROM "JobInstance" j|JOIN LATERAL/.test(text)), false);
+  assert.match(transactions[1][0], /pg_advisory_xact_lock/);
+  assert.equal(transactions[1].some((text) => /ALTER TABLE/.test(text)), false);
+  assert.ok(transactions[1].some((text) => /FROM "JobInstance" j/.test(text)));
+  assert.ok(transactions[1].some((text) => /JOIN LATERAL/.test(text)));
 });
 
 test("A20.6 PostgreSQL proof is zero-skip gated, persists real timing metrics, and exercises the online-preflight rolling path", () => {
@@ -82,7 +85,7 @@ test("A20.6 PostgreSQL proof is zero-skip gated, persists real timing metrics, a
   const seeded = source("scripts/audit/phase3-a20-seeded-rolling-coverage.js");
   const terminal = source("src/services/phase3-campaign-closure-a20-5.integration.test.js");
 
-  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 23/);
+  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 26/);
   assert.match(runner, /summary\.skipped !== 0/);
   assert.match(runner, /summary\.fail !== 0/);
   assert.match(runner, /A20_4_POSTGRES_HEALING_SCALE/);
@@ -95,6 +98,7 @@ test("A20.6 PostgreSQL proof is zero-skip gated, persists real timing metrics, a
   assert.match(terminal, /A20_5_POSTGRES_TERMINAL_SCALE_POINT/);
 
   assert.match(seeded, /workRowsVisited <= visitBudget/);
-  assert.match(seeded, /historyRows \* 0\.10/);
+  assert.match(seeded, /currentGenerationRows \* 0\.02/);
+  assert.match(seeded, /CreatorCampaignFanRefreshWork_creator_run_id_idx/);
   assert.match(seeded, /CURRENT_STATE_FALLBACK_EXPLAIN_SQL/);
 });

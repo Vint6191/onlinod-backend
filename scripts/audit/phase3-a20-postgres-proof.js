@@ -11,9 +11,10 @@ const ROOT = path.resolve(__dirname, "../..");
 const PRISMA_DIR = path.join(ROOT, "prisma");
 const A13_CUTOFF = "20260919010000_phase3_provider_gate_durable_waiter_fairness_v1";
 const PRE_A20_2_CUTOFF = "20260919113000_phase3_campaign_refresh_recovery_status_v1";
-const EXPECTED_PROOF_TEST_COUNT = 23;
+const EXPECTED_PROOF_TEST_COUNT = 26;
 const COVERAGE_PREFLIGHT = path.join(ROOT, "scripts/database/phase3-campaign-coverage-generation-online-preflight.js");
 const PREFLIGHT_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-concurrency.js");
+const PREFLIGHT_RUNTIME_AVAILABILITY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-runtime-availability.js");
 const PROOF_TESTS = [
   path.join(ROOT, "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js"),
   path.join(ROOT, "src/services/phase3-provider-topology-postgres-int5-9a-16.integration.test.js"),
@@ -23,6 +24,7 @@ const PROOF_TESTS = [
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-3.integration.test.js"),
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-4.integration.test.js"),
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-5.integration.test.js"),
+  path.join(ROOT, "src/services/phase3-campaign-closure-a20-11.integration.test.js"),
 ];
 
 function fail(message, code = 3) {
@@ -186,15 +188,24 @@ function main() {
       DATABASE_URL: seededRollingUrl,
       ONLINOD_A20_SEED_NONCE: nonce,
       ONLINOD_A20_SEED_HISTORY_ROWS: process.env.ONLINOD_A20_SEED_HISTORY_ROWS || "20000",
+      ONLINOD_A20_SEED_CURRENT_ROWS: process.env.ONLINOD_A20_SEED_CURRENT_ROWS || "10000",
     };
     run("seeded-pre-a20-2-migrate", cli, ["migrate", "deploy", "--schema", seededRollingSchemaFile], { DATABASE_URL: seededRollingUrl });
     run("seeded-pre-a20-2-data", process.execPath, ["scripts/audit/phase3-a20-seeded-rolling-coverage.js", "seed"], seedEnv);
+    const runtimeAvailability = run("seeded-a20-11-preflight-runtime-availability", process.execPath, [PREFLIGHT_RUNTIME_AVAILABILITY_PROOF], seedEnv);
+    if (!String(runtimeAvailability.stdout || "").includes("A20_11_PREFLIGHT_RUNTIME_AVAILABILITY_PASS")) {
+      fail("seeded preflight runtime-availability proof did not emit PASS marker");
+    }
     run("seeded-a20-2-online-preflight", process.execPath, [COVERAGE_PREFLIGHT], seedEnv);
     addMigrationsAfter(seededRollingPrisma, PRE_A20_2_CUTOFF);
     run("seeded-a20-2-to-current-migrate", cli, ["migrate", "deploy", "--schema", seededRollingSchemaFile], { DATABASE_URL: seededRollingUrl });
     const seededVerify = run("seeded-a20-2-backfill-verify", process.execPath, ["scripts/audit/phase3-a20-seeded-rolling-coverage.js", "verify"], seedEnv);
     const migrationMetrics = parseJsonLines(seededVerify.stdout, "A20_6_SEEDED_BACKFILL_EXPLAIN_METRICS");
     if (migrationMetrics.length !== 1) fail(`seeded migration proof missing A20.6 EXPLAIN metrics`);
+    const migrationMetric = migrationMetrics[0];
+    if (Number(migrationMetric?.currentGenerationRows) < 1000 || migrationMetric?.currentRunIndexUsed !== true) {
+      fail(`seeded migration proof did not exercise a large indexed current generation: ${JSON.stringify(migrationMetric)}`);
+    }
     const seededProof = runProofTests("seeded-a20-2-current-proof", seededRollingUrl);
 
     const proof = {
@@ -202,7 +213,8 @@ function main() {
       a13Cutoff: A13_CUTOFF, preA20_2Cutoff: PRE_A20_2_CUTOFF,
       expectedProofTests: EXPECTED_PROOF_TEST_COUNT,
       preflightConcurrency: { pass: true, durationMs: preflightConcurrency.durationMs },
-      cleanProof, rollingProof, seededProof, migrationMetrics: migrationMetrics[0],
+      preflightRuntimeAvailability: { pass: true, durationMs: runtimeAvailability.durationMs },
+      cleanProof, rollingProof, seededProof, migrationMetrics: migrationMetric,
     };
     const output = String(process.env.ONLINOD_AUDIT_PROOF_OUTPUT || "").trim();
     if (output) {

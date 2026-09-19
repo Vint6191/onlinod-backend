@@ -12,39 +12,34 @@ function source(relative) {
   return fs.readFileSync(path.join(ROOT, relative), "utf8");
 }
 
-test("A20.9 coverage preflight overrides Prisma's 5s interactive transaction default around advisory serialization", async () => {
-  let options = null;
-  const calls = [];
+test("A20.9/A20.11 coverage preflight overrides Prisma 5s default for both serialized phases", async () => {
+  const options = [];
+  const callsByTx = [];
   const fake = {
     $transaction: async (work, txOptions) => {
-      options = txOptions;
+      options.push(txOptions);
+      const calls = [];
+      callsByTx.push(calls);
       return work({
-        $queryRawUnsafe: async (sql) => {
-          calls.push(String(sql));
-          return [{ locked: null }];
-        },
-        $executeRawUnsafe: async (sql) => {
-          calls.push(String(sql));
-          return 0;
-        },
+        $queryRawUnsafe: async (sql) => { calls.push(String(sql)); return /information_schema\.columns/.test(String(sql)) ? [] : []; },
+        $executeRawUnsafe: async (sql) => { calls.push(String(sql)); return 0; },
       });
     },
   };
 
   await preflight.ensureColumnsAndBackfill(fake);
-  assert.deepEqual(options, {
+  assert.equal(options.length, 2);
+  for (const txOptions of options) assert.deepEqual(txOptions, {
     maxWait: preflight.PREFLIGHT_TRANSACTION_MAX_WAIT_MS,
     timeout: preflight.PREFLIGHT_TRANSACTION_TIMEOUT_MS,
   });
   assert.ok(preflight.PREFLIGHT_TRANSACTION_MAX_WAIT_MS >= 10_000);
-  assert.ok(preflight.PREFLIGHT_TRANSACTION_TIMEOUT_MS > 5_000);
   assert.ok(preflight.PREFLIGHT_TRANSACTION_TIMEOUT_MS >= 120_000);
-  assert.match(calls[0], /pg_advisory_xact_lock/);
-  assert.match(calls[1], /SET LOCAL lock_timeout = '5s'/);
-  const alterIndex = calls.findIndex((row) => /ALTER TABLE/.test(row));
-  const resetIndex = calls.findIndex((row) => /SET LOCAL lock_timeout = '0'/.test(row));
-  const backfillIndex = calls.findIndex((row) => /FROM "JobInstance" j/.test(row));
-  assert.ok(alterIndex >= 0 && resetIndex > alterIndex && backfillIndex > resetIndex);
+  assert.match(callsByTx[0][0], /pg_advisory_xact_lock/);
+  assert.ok(callsByTx[0].some((row) => /SET LOCAL lock_timeout = '5s'/.test(row)));
+  assert.ok(callsByTx[0].some((row) => /ALTER TABLE/.test(row)));
+  assert.match(callsByTx[1][0], /pg_advisory_xact_lock/);
+  assert.equal(callsByTx[1].some((row) => /ALTER TABLE/.test(row)), false);
 });
 
 test("A20.9 physical preflight concurrency proof must hold a contender beyond the historical 5s Prisma timeout", () => {
