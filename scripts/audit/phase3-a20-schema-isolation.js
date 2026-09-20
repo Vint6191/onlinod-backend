@@ -2,6 +2,7 @@
 "use strict";
 
 const prisma = require("../../src/prisma");
+const { FAMILY, GENERATION } = require("../../src/services/phase2-work-coverage-authority-service");
 const { withPhase3PostgresFixtureAuthority, cleanupPhase3PostgresAgencyFixture, auditSchemaFromDatabaseUrl } = require("./phase3-postgres-proof-fixture-authority");
 
 const mode = String(process.argv[2] || "structural").trim().toLowerCase();
@@ -103,11 +104,25 @@ async function runtimeFixtureLifecycle(expected) {
     const [agencyCount, creatorCount, coverageRows] = await Promise.all([
       prisma.agency.count({ where: { id: agencyId } }),
       prisma.creatorAccount.count({ where: { id: creatorId } }),
-      prisma.phase2WorkCoverage.findMany({ where: { agencyId }, select: { family: true, active: true, enumerationState: true }, orderBy: { family: "asc" } }),
+      prisma.phase2WorkCoverage.findMany({
+        where: { agencyId },
+        select: { family: true, generation: true, active: true, enumerationState: true, sourceWatermark: true },
+        orderBy: [{ family: "asc" }, { generation: "asc" }],
+      }),
     ]);
-    if (agencyCount !== 1 || creatorCount !== 1 || coverageRows.length !== 2
-        || coverageRows.some((row) => row.active !== true || String(row.enumerationState) !== "COMPLETE")) {
-      fail("Authorized audit fixture did not materialize its schema-local Phase2 coverage graph", { expected, agencyCount, creatorCount, coverageRows });
+    const expectedCoverage = Object.values(FAMILY).map((family) => ({ family, generation: GENERATION[family] }))
+      .filter((row) => row.generation)
+      .sort((a, b) => a.family.localeCompare(b.family) || a.generation.localeCompare(b.generation));
+    const actualCoverage = coverageRows.map((row) => ({ family: String(row.family), generation: String(row.generation) }))
+      .sort((a, b) => a.family.localeCompare(b.family) || a.generation.localeCompare(b.generation));
+    const identitiesMatch = JSON.stringify(actualCoverage) === JSON.stringify(expectedCoverage);
+    const stateValid = coverageRows.every((row) => row.active === true
+      && String(row.enumerationState) === "COMPLETE"
+      && String(row.sourceWatermark || "") === "NEW_AGENCY_AFTER_PHASE2_CUTOVER");
+    if (agencyCount !== 1 || creatorCount !== 1 || !identitiesMatch || !stateValid) {
+      fail("Authorized audit fixture did not materialize the canonical current Phase2 coverage graph", {
+        expected, agencyCount, creatorCount, expectedCoverage, coverageRows,
+      });
     }
     await cleanupPhase3PostgresAgencyFixture(prisma, agencyId);
     created = false;
@@ -119,7 +134,7 @@ async function runtimeFixtureLifecycle(expected) {
     if (agencyAfter !== 0 || creatorAfter !== 0 || coverageAfter !== 0) {
       fail("Canonical audit fixture cleanup left owned rows behind", { expected, agencyAfter, creatorAfter, coverageAfter });
     }
-    return { agencyId, creatorId, coverageRows: 2, cleanupVerified: true };
+    return { agencyId, creatorId, coverageRows: coverageRows.length, cleanupVerified: true };
   } finally {
     if (created) { try { await cleanupPhase3PostgresAgencyFixture(prisma, agencyId); } catch (_) {} }
   }

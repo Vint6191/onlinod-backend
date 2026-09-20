@@ -61,13 +61,26 @@ async function withPhase3PostgresFixtureAuthority(db, work, options = undefined)
 
 async function cleanupPhase3PostgresAgencyFixture(db, agencyId) {
   const id = String(agencyId || "").trim();
-  if (!id) return { count: 0 };
+  if (!id) return { agencyDeleted: 0, creatorsDeleted: 0 };
   return withPhase3PostgresFixtureAuthority(db, async (tx) => {
-    // This is the same transaction-local destructive identity used by the Phase2
-    // integration harness. It does not disable any trigger; it makes fixture
-    // teardown explicit while FK cascades remove the owned proof graph.
+    // Production Agency hard-delete never relies on Agency->Creator cascade: Creator
+    // lifecycles are completed first while the Agency parent still exists. Mirror that
+    // ordering in the physical-proof harness. Otherwise CreatorAccount AFTER DELETE
+    // legitimately bumps AgencyCreatorCatalogState while the Agency is already being
+    // cascade-deleted, which can produce a false FK failure in fixture teardown.
     await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, id);
-    return tx.agency.deleteMany({ where: { id } });
+    const creators = await tx.creatorAccount.findMany({ where: { agencyId: id }, select: { id: true }, orderBy: { id: "asc" } });
+    let creatorsDeleted = 0;
+    for (const creator of creators) {
+      const creatorId = String(creator.id || "").trim();
+      if (!creatorId) continue;
+      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_creator_id',$1,true) AS value`, creatorId);
+      const result = await tx.creatorAccount.deleteMany({ where: { id: creatorId, agencyId: id } });
+      creatorsDeleted += Number(result?.count || 0);
+    }
+    await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_creator_id','',true) AS value`);
+    const agencyResult = await tx.agency.deleteMany({ where: { id } });
+    return { agencyDeleted: Number(agencyResult?.count || 0), creatorsDeleted };
   });
 }
 
