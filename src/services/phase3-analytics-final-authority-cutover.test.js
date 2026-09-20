@@ -70,6 +70,9 @@ test("Billing and legacy Analytics have no active snapshot generation reader/wri
   const migration = source("prisma/migrations/20260920123000_phase3_analytics_final_authority_cutover_v1/migration.sql");
   const policy = source("docs/PHASE3_ANALYTICS_LEGACY_SNAPSHOT_RETIREMENT.md");
   const legacyPreflight = source("scripts/database/phase3-analytics-legacy-snapshot-online-preflight.js");
+  const legacyPostflight = source("scripts/database/phase3-analytics-legacy-snapshot-online-postflight.js");
+  const repairMigration = source("prisma/migrations/20260920191500_phase3_analytics_legacy_snapshot_phase_a_repair_v1/migration.sql");
+  const packageJson = source("package.json");
   assert.doesNotMatch(billing, /creatorEarningsSnapshot\./);
   assert.match(billing, /source:\s*"UNAVAILABLE"/);
   assert.match(settings, /readRolling30dRevenueBatch/);
@@ -80,8 +83,18 @@ test("Billing and legacy Analytics have no active snapshot generation reader/wri
   assert.doesNotMatch(migration, /DROP TABLE IF EXISTS "(?:AnalyticsSnapshot|CreatorCampaignsSnapshot|CreatorEarningsSnapshot)"/);
   assert.doesNotMatch(migration, /CREATE VIEW "(?:AnalyticsSnapshot|CreatorCampaignsSnapshot|CreatorEarningsSnapshot)"/);
   assert.match(migration, /Phase A only[\s\S]*physical legacy tables are preserved/);
-  assert.match(policy, /Phase B: destructive purge[\s\S]*previous backend revision is fully drained[\s\S]*backup/);
-  assert.match(legacyPreflight, /relkind[\s\S]*physicalTable[\s\S]*destructivePurgeAllowed:\s*false/);
+  assert.match(policy, /Production repair bridge[\s\S]*repairRequired[\s\S]*postflight[\s\S]*Phase B: destructive purge/);
+  assert.match(legacyPreflight, /known_zero_row_legacy_tombstone_view/);
+  assert.match(legacyPreflight, /legacyTombstoneView[\s\S]*repairRequired[\s\S]*phaseASafe/);
+  assert.match(legacyPreflight, /destructivePurgeAllowed:\s*false/);
+  assert.match(repairMigration, /DROP VIEW "AnalyticsSnapshot"/);
+  assert.match(repairMigration, /CREATE TABLE IF NOT EXISTS "AnalyticsSnapshot"/);
+  assert.match(repairMigration, /CREATE TABLE IF NOT EXISTS "CreatorCampaignsSnapshot"/);
+  assert.match(repairMigration, /CREATE TABLE IF NOT EXISTS "CreatorEarningsSnapshot"/);
+  assert.match(repairMigration, /Refusing to replace unexpected AnalyticsSnapshot view/);
+  assert.match(legacyPostflight, /PHASE_A_POST_MIGRATION_WRITABLE_COMPATIBILITY/);
+  assert.match(legacyPostflight, /requiredIndexesPresent/);
+  assert.match(packageJson, /phase3-analytics-legacy-snapshot-online-preflight\.js[\s\S]*prisma migrate deploy[\s\S]*phase3-analytics-legacy-snapshot-online-postflight\.js/);
 });
 
 test("Subscriber source state machine is exact-offset, payload-bound, CAS fenced and server-derived", () => {
