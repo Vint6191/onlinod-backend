@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+const { withPhase3PostgresFixtureAuthority } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 let projectSubscriberDirectoryItems;
 let applyFanDataPointRefreshChunk;
 let readFanCurrent;
@@ -35,13 +36,15 @@ async function createAgencyCreator(db, prefix, { agencyId = null } = {}) {
   const n = nonce(prefix);
   const a = agencyId || `${n}-agency`;
   const c = `${n}-creator`;
-  if (!agencyId) await db.agency.create({ data: { id: a, name: `Final cut ${a}` } });
-  await db.creatorAccount.create({ data: { id: c, agencyId: a, displayName: `Final cut ${c}` } });
+  await withPhase3PostgresFixtureAuthority(db, async (tx) => {
+    if (!agencyId) await tx.agency.create({ data: { id: a, name: `Final cut ${a}` } });
+    await tx.creatorAccount.create({ data: { id: c, agencyId: a, displayName: `Final cut ${c}` } });
+  });
   return { agencyId: a, creatorId: c };
 }
 
 async function cleanupAgency(db, agencyId) {
-  await db.agency.deleteMany({ where: { id: agencyId } });
+  await withPhase3PostgresFixtureAuthority(db, (tx) => tx.agency.deleteMany({ where: { id: agencyId } }));
 }
 
 async function databaseNow(db) {
@@ -490,11 +493,11 @@ test("FINAL PostgreSQL: 4000-row Campaign debt and signal plans use the final ho
       SELECT $1 || '-v-' || g::text, $2, $3, $1 || '-f-' || g::text, $4 + INTERVAL '1 minute', 'AVAILABLE', 'PLAN_PROOF', $4, $4
       FROM generate_series(1, 4000) AS g
     `, prefix, scope.agencyId, scope.creatorId, now);
-    await db.$executeRawUnsafe(`
+    await withPhase3PostgresFixtureAuthority(db, (tx) => tx.$executeRawUnsafe(`
       INSERT INTO "CreatorAccount" ("id","agencyId","displayName","createdAt","updatedAt")
       SELECT $1 || '-creator-' || g::text, $2, 'plan-signal-' || g::text, $3, $3
       FROM generate_series(1, 3999) AS g
-    `, prefix, scope.agencyId, now);
+    `, prefix, scope.agencyId, now));
     await db.$executeRawUnsafe(`
       INSERT INTO "CampaignFanRefreshPromotionSignal" ("id","agencyId","creatorId","dueAt","reason","createdAt","updatedAt")
       SELECT $1 || '-sig-' || g::text, $2,

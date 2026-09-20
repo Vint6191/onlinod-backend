@@ -16,6 +16,8 @@ const COVERAGE_PREFLIGHT = path.join(ROOT, "scripts/database/phase3-campaign-cov
 const PREFLIGHT_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-concurrency.js");
 const PREFLIGHT_RUNTIME_AVAILABILITY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-runtime-availability.js");
 const INDEX_LIFECYCLE_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-index-lifecycle-concurrency.js");
+const OPERATIONALIZE_RUNTIME = path.join(ROOT, "scripts/audit/phase3-a20-operationalize-runtime.js");
+const STEP_LOG_DIR = path.join(ROOT, "artifacts", "audit", "phase3-a20-steps");
 const PROOF_TESTS = [
   path.join(ROOT, "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js"),
   path.join(ROOT, "src/services/phase3-provider-topology-postgres-int5-9a-16.integration.test.js"),
@@ -28,6 +30,7 @@ const PROOF_TESTS = [
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-11.integration.test.js"),
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-12.integration.test.js"),
   path.join(ROOT, "src/services/phase3-analytics-final-authority-cutover.integration.test.js"),
+  path.join(ROOT, "src/services/phase3-a20-operational-runtime.integration.test.js"),
 ];
 
 function fail(message, code = 3) {
@@ -61,15 +64,44 @@ function withSchema(url, schema) {
   u.searchParams.set("schema", schema);
   return u.toString();
 }
+function safeStepName(label) {
+  return String(label || "step").replace(/[^a-zA-Z0-9_.-]+/g, "_").slice(0, 120);
+}
+function persistStepLog(label, stdout, stderr) {
+  fs.mkdirSync(STEP_LOG_DIR, { recursive: true });
+  const file = path.join(STEP_LOG_DIR, `${safeStepName(label)}.log`);
+  const body = `${stdout || ""}${stderr ? `\n--- STDERR ---\n${stderr}` : ""}`;
+  fs.writeFileSync(file, body, "utf8");
+  return { file, sha256: crypto.createHash("sha256").update(body).digest("hex"), bytes: Buffer.byteLength(body) };
+}
+function failureDigest(stdout, stderr, limit = 180) {
+  const lines = `${stdout || ""}\n${stderr || ""}`.split(/\r?\n/);
+  const keep = [];
+  const interesting = /(not ok|FAIL|AssertionError|ConnectorError|PrismaClient|Error:|error:|expected:|actual:|location:|PHASE[0-9A-Z_:-]+.*(?:FAIL|ERROR))/i;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!interesting.test(lines[i])) continue;
+    for (let j = Math.max(0, i - 2); j <= Math.min(lines.length - 1, i + 8); j += 1) keep.push(lines[j]);
+  }
+  const deduped = [];
+  for (const line of keep) if (!deduped.length || deduped[deduped.length - 1] !== line) deduped.push(line);
+  return deduped.slice(-limit).join("\n");
+}
 function run(label, command, args, env, input = undefined) {
   const startedAt = process.hrtime.bigint();
-  const out = spawnSync(command, args, { cwd: ROOT, env: { ...process.env, ...env }, encoding: "utf8", input, maxBuffer: 32 * 1024 * 1024 });
+  const out = spawnSync(command, args, { cwd: ROOT, env: { ...process.env, ...env }, encoding: "utf8", input, maxBuffer: 64 * 1024 * 1024 });
   const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
-  process.stdout.write(out.stdout || "");
-  process.stderr.write(out.stderr || "");
-  console.log(`# PHASE3_A20_POSTGRES_STEP ${JSON.stringify({ label, durationMs: Math.round(durationMs * 100) / 100, status: out.status })}`);
-  if (out.error || out.status !== 0) fail(`${label} failed (${out.error?.message || `exit ${out.status}`})`, out.status || 4);
-  return { durationMs, stdout: out.stdout || "", stderr: out.stderr || "" };
+  const stdout = out.stdout || "";
+  const stderr = out.stderr || "";
+  const log = persistStepLog(label, stdout, stderr);
+  const status = out.error ? null : out.status;
+  console.log(`# PHASE3_A20_POSTGRES_STEP ${JSON.stringify({ label, durationMs: Math.round(durationMs * 100) / 100, status, logSha256: log.sha256, logBytes: log.bytes })}`);
+  if (out.error || out.status !== 0) {
+    const digest = failureDigest(stdout, stderr);
+    if (digest) console.error(`# PHASE3_A20_POSTGRES_STEP_FAILURE_DIGEST ${label}\n${digest}`);
+    console.error(`# PHASE3_A20_POSTGRES_STEP_LOG ${JSON.stringify(log)}`);
+    fail(`${label} failed (${out.error?.message || `exit ${out.status}`})`, out.status || 4);
+  }
+  return { durationMs, stdout, stderr, log };
 }
 function tapCount(stdout, label) {
   const match = String(stdout || "").match(new RegExp(`^# ${label} (\\d+)$`, "m"));
@@ -155,8 +187,17 @@ function assertNodeProof(stdout, label) {
   return { ...summary, ...metrics, hotPlan, subscriberReconcilePlan, subscriberCursorPlan };
 }
 function runProofTests(label, databaseUrl) {
-  const out = run(label, process.execPath, ["--test", ...PROOF_TESTS], { DATABASE_URL: databaseUrl, ONLINOD_POSTGRES_INTEGRATION: "1" });
-  return { durationMs: out.durationMs, ...assertNodeProof(out.stdout, label) };
+  const out = run(label, process.execPath, ["--test", "--test-concurrency=1", ...PROOF_TESTS], { DATABASE_URL: databaseUrl, ONLINOD_POSTGRES_INTEGRATION: "1" });
+  const proof = { durationMs: out.durationMs, ...assertNodeProof(out.stdout, label) };
+  console.log(`# PHASE3_A20_NODE_PROOF_PASS ${JSON.stringify({ label, tests: proof.tests, pass: proof.pass, fail: proof.fail, skipped: proof.skipped, durationMs: Math.round(out.durationMs * 100) / 100 })}`);
+  return proof;
+}
+function operationalizeRuntime(label, databaseUrl) {
+  const out = run(label, process.execPath, [OPERATIONALIZE_RUNTIME], { DATABASE_URL: databaseUrl });
+  if (!String(out.stdout || "").includes("A20_RUNTIME_OPERATIONALIZATION_PASS")) {
+    fail(`${label} did not emit A20_RUNTIME_OPERATIONALIZATION_PASS`);
+  }
+  return { durationMs: out.durationMs };
 }
 
 function clonePrisma(targetRoot, cutoff = null) {
@@ -203,6 +244,7 @@ function main() {
   try {
     const cleanUrl = withSchema(audit, cleanSchema);
     run("clean-current-migrate", cli, ["migrate", "deploy", "--schema", cleanSchemaFile], { DATABASE_URL: cleanUrl });
+    const cleanOperationalization = operationalizeRuntime("clean-current-operationalize", cleanUrl);
     const indexAbsentConcurrency = run("clean-current-index-lifecycle-absent", process.execPath, [INDEX_LIFECYCLE_CONCURRENCY_PROOF, "absent"], { DATABASE_URL: cleanUrl });
     if (!String(indexAbsentConcurrency.stdout || "").includes("A20_12_INDEX_ABSENT_CONCURRENCY_PASS")) {
       fail("clean-current index lifecycle absent/concurrent proof did not emit PASS marker");
@@ -215,8 +257,10 @@ function main() {
 
     const rollingUrl = withSchema(audit, rollingSchema);
     run("rolling-a13-migrate", cli, ["migrate", "deploy", "--schema", rollingSchemaFile], { DATABASE_URL: rollingUrl });
+    const rollingOperationalization = operationalizeRuntime("rolling-a13-operationalize", rollingUrl);
     addMigrationsAfter(rollingPrisma, A13_CUTOFF);
     run("rolling-a13-to-current-migrate", cli, ["migrate", "deploy", "--schema", rollingSchemaFile], { DATABASE_URL: rollingUrl });
+    operationalizeRuntime("rolling-current-operationalize-verify", rollingUrl);
     const rollingProof = runProofTests("rolling-a13-to-current-proof", rollingUrl);
 
     const seededRollingUrl = withSchema(audit, seededRollingSchema);
@@ -227,6 +271,7 @@ function main() {
       ONLINOD_A20_SEED_CURRENT_ROWS: process.env.ONLINOD_A20_SEED_CURRENT_ROWS || "10000",
     };
     run("seeded-pre-a20-2-migrate", cli, ["migrate", "deploy", "--schema", seededRollingSchemaFile], { DATABASE_URL: seededRollingUrl });
+    const seededOperationalization = operationalizeRuntime("seeded-pre-a20-2-operationalize", seededRollingUrl);
     run("seeded-pre-a20-2-data", process.execPath, ["scripts/audit/phase3-a20-seeded-rolling-coverage.js", "seed"], seedEnv);
     const runtimeAvailability = run("seeded-a20-11-preflight-runtime-availability", process.execPath, [PREFLIGHT_RUNTIME_AVAILABILITY_PROOF], seedEnv);
     if (!String(runtimeAvailability.stdout || "").includes("A20_11_PREFLIGHT_RUNTIME_AVAILABILITY_PASS")) {
@@ -239,6 +284,7 @@ function main() {
     }
     addMigrationsAfter(seededRollingPrisma, PRE_A20_2_CUTOFF);
     run("seeded-a20-2-to-current-migrate", cli, ["migrate", "deploy", "--schema", seededRollingSchemaFile], { DATABASE_URL: seededRollingUrl });
+    operationalizeRuntime("seeded-current-operationalize-verify", seededRollingUrl);
     const seededVerify = run("seeded-a20-2-backfill-verify", process.execPath, ["scripts/audit/phase3-a20-seeded-rolling-coverage.js", "verify"], seedEnv);
     const migrationMetrics = parseJsonLines(seededVerify.stdout, "A20_6_SEEDED_BACKFILL_EXPLAIN_METRICS");
     if (migrationMetrics.length !== 1) fail(`seeded migration proof missing A20.6 EXPLAIN metrics`);
@@ -252,6 +298,7 @@ function main() {
       ok: true, cleanSchema, rollingSchema, seededRollingSchema,
       a13Cutoff: A13_CUTOFF, preA20_2Cutoff: PRE_A20_2_CUTOFF,
       expectedProofTests: EXPECTED_PROOF_TEST_COUNT,
+      operationalization: { clean: cleanOperationalization, rolling: rollingOperationalization, seeded: seededOperationalization },
       indexLifecycleAbsent: { pass: true, durationMs: indexAbsentConcurrency.durationMs },
       indexLifecycleInvalidRecovery: { pass: true, durationMs: indexInvalidRecovery.durationMs },
       preflightConcurrency: { pass: true, durationMs: preflightConcurrency.durationMs },

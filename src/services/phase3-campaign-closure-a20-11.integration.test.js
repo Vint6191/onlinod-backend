@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+const { withPhase3PostgresFixtureAuthority } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 const {
   enqueueUniqueCampaignFanRefreshes,
   finalizeCampaignFanRefreshJob,
@@ -23,8 +24,10 @@ function scope(prefix) {
 }
 
 async function createScope(db, s) {
-  await db.agency.create({ data: { id: s.agencyId, name: `A20.11 ${s.agencyId}` } });
-  await db.creatorAccount.create({ data: { id: s.creatorId, agencyId: s.agencyId, displayName: "A20.11 Creator" } });
+  await withPhase3PostgresFixtureAuthority(db, async (tx) => {
+    await tx.agency.create({ data: { id: s.agencyId, name: `A20.11 ${s.agencyId}` } });
+    await tx.creatorAccount.create({ data: { id: s.creatorId, agencyId: s.agencyId, displayName: "A20.11 Creator" } });
+  });
   await db.creatorCampaignCollectionState.create({
     data: {
       agencyId: s.agencyId,
@@ -51,7 +54,7 @@ async function createScope(db, s) {
 }
 
 async function cleanup(db, s) {
-  await db.agency.deleteMany({ where: { id: s.agencyId } });
+  await withPhase3PostgresFixtureAuthority(db, (tx) => tx.agency.deleteMany({ where: { id: s.agencyId } }));
 }
 
 async function planner(input) {

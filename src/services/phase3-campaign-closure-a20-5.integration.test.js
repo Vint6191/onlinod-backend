@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { performance } = require("node:perf_hooks");
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+const { withPhase3PostgresFixtureAuthority } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 const {
   enqueueUniqueCampaignFanRefreshes,
   finalizeCampaignFanRefreshJob,
@@ -26,8 +27,10 @@ function ids(prefix) {
 }
 
 async function createScope(db, scope, { secondCampaignJob = false } = {}) {
-  await db.agency.create({ data: { id: scope.agencyId, name: `A20.5 ${scope.agencyId}` } });
-  await db.creatorAccount.create({ data: { id: scope.creatorId, agencyId: scope.agencyId, displayName: "A20.5 Creator" } });
+  await withPhase3PostgresFixtureAuthority(db, async (tx) => {
+    await tx.agency.create({ data: { id: scope.agencyId, name: `A20.5 ${scope.agencyId}` } });
+    await tx.creatorAccount.create({ data: { id: scope.creatorId, agencyId: scope.agencyId, displayName: "A20.5 Creator" } });
+  });
   await db.creatorCampaignCollectionState.create({
     data: {
       agencyId: scope.agencyId,
@@ -54,7 +57,7 @@ async function createScope(db, scope, { secondCampaignJob = false } = {}) {
 }
 
 async function cleanupScope(db, scope) {
-  await db.agency.deleteMany({ where: { id: scope.agencyId } });
+  await withPhase3PostgresFixtureAuthority(db, (tx) => tx.agency.deleteMany({ where: { id: scope.agencyId } }));
 }
 
 async function prismaPlanner(input) {

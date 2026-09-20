@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
 const debt = require("./provider-capacity-debt-authority-service");
+const { withPhase3PostgresFixtureAuthority } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 
 test("A18 PostgreSQL: durable background job debt projects typed partial future-debt coverage", { skip: !enabled, timeout: 60_000 }, async () => {
   const { PrismaClient } = require("@prisma/client");
@@ -21,9 +22,13 @@ test("A18 PostgreSQL: durable background job debt projects typed partial future-
     `);
     assert.equal(columns.length, 6);
 
-    const creator = await db.creatorAccount.findFirst({ select: { id: true, agencyId: true } });
-    if (!creator) return;
-    const idempotencyKey = `a18-pg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const nonce = `${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}`;
+    const creator = { id: `a18-creator-${nonce}`, agencyId: `a18-agency-${nonce}` };
+    await withPhase3PostgresFixtureAuthority(db, async (tx) => {
+      await tx.agency.create({ data: { id: creator.agencyId, name: `A18 ${creator.agencyId}` } });
+      await tx.creatorAccount.create({ data: { id: creator.id, agencyId: creator.agencyId, displayName: `A18 ${creator.id}` } });
+    });
+    const idempotencyKey = `a18-pg-${nonce}`;
     const job = await db.jobInstance.create({ data: {
       jobKey: "traffic_sources_scan", scope: "creator", creatorId: creator.id, agencyId: creator.agencyId,
       idempotencyKey, status: "SCHEDULED", priority: 10, params: {},
@@ -39,6 +44,7 @@ test("A18 PostgreSQL: durable background job debt projects typed partial future-
       assert.equal(String(persisted.status), "UNKNOWN");
     } finally {
       await db.jobInstance.delete({ where: { id: job.id } }).catch(() => {});
+      await withPhase3PostgresFixtureAuthority(db, (tx) => tx.agency.deleteMany({ where: { id: creator.agencyId } })).catch(() => {});
     }
   } finally {
     await db.$disconnect();

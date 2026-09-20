@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const { performance } = require("node:perf_hooks");
 const { PrismaClient } = require("@prisma/client");
 const { CURRENT_STATE_FALLBACK_EXPLAIN_SQL } = require("../database/phase3-campaign-coverage-generation-online-preflight");
+const { withPhase3PostgresFixtureAuthority } = require("./phase3-postgres-proof-fixture-authority");
 
 const mode = String(process.argv[2] || "").trim().toLowerCase();
 const nonce = String(process.env.ONLINOD_A20_SEED_NONCE || "seeded").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || "seeded";
@@ -24,10 +25,11 @@ const ids = {
 };
 
 async function seed(db) {
+  return withPhase3PostgresFixtureAuthority(db, async (tx) => {
   const now = new Date("2040-04-01T00:00:00.000Z");
-  await db.$executeRawUnsafe(`INSERT INTO "Agency" ("id","name","createdAt","updatedAt") VALUES ($1,$2,$3,$3)`, ids.agency, `A20.5 seeded ${nonce}`, now);
+  await tx.$executeRawUnsafe(`INSERT INTO "Agency" ("id","name","createdAt","updatedAt") VALUES ($1,$2,$3,$3)`, ids.agency, `A20.5 seeded ${nonce}`, now);
   for (const creatorId of [ids.manualCreator, ids.automaticCreator, ids.fallbackCreator, ids.missingCreator]) {
-    await db.$executeRawUnsafe(`INSERT INTO "CreatorAccount" ("id","agencyId","displayName","createdAt","updatedAt") VALUES ($1,$2,$3,$4,$4)`, creatorId, ids.agency, creatorId, now);
+    await tx.$executeRawUnsafe(`INSERT INTO "CreatorAccount" ("id","agencyId","displayName","createdAt","updatedAt") VALUES ($1,$2,$3,$4,$4)`, creatorId, ids.agency, creatorId, now);
   }
   const jobs = [
     [ids.manualJob, ids.manualCreator, { campaignFreshnessCoverageVersion: 1, manualCampaignScan: true }, { driverPhase: "execute", jobContinuation: { collectorVersion: "campaigns-v13-wrapped" } }, null],
@@ -36,7 +38,7 @@ async function seed(db) {
     [ids.fallbackOldJob, ids.fallbackCreator, { manualCampaignScan: true }, null, { collectorVersion: "campaigns-v12-old" }],
   ];
   for (const [id, creatorId, params, continuation, result] of jobs) {
-    await db.$executeRawUnsafe(
+    await tx.$executeRawUnsafe(
       `INSERT INTO "JobInstance" ("id","jobKey","scope","creatorId","agencyId","params","status","continuation","result","createdAt","updatedAt") VALUES ($1,'fetch_campaigns','creator',$2,$3,$4::jsonb,'DONE',$5::jsonb,$6::jsonb,$7,$7)`,
       id, creatorId, ids.agency, JSON.stringify(params), continuation ? JSON.stringify(continuation) : null, result ? JSON.stringify(result) : null, now,
     );
@@ -48,13 +50,13 @@ async function seed(db) {
     [p("state-missing"), ids.missingCreator, "run-missing", p("deleted-job")],
   ];
   for (const [id, creatorId, runId, sourceJobId] of states) {
-    await db.$executeRawUnsafe(
+    await tx.$executeRawUnsafe(
       `INSERT INTO "CreatorCampaignCollectionState" ("id","agencyId","creatorId","status","mode","fanValueCoverageScanRunId","sourceJobId","createdAt","updatedAt") VALUES ($1,$2,$3,'PARTIAL','catchup',$4,$5,$6,$6)`,
       id, ids.agency, creatorId, runId, sourceJobId, now,
     );
   }
   const insertWork = async ({ id, runId, fanId, campaignJobId }) => {
-    await db.$executeRawUnsafe(
+    await tx.$executeRawUnsafe(
       `INSERT INTO "CreatorCampaignFanRefreshWork" ("id","agencyId","creatorId","scanRunId","scanStartedAt","onlyFansUserId","campaignJobId","freshnessCutoffAt","status","scheduledAt","createdAt","updatedAt") VALUES ($1,$2,$3,$4,$5,$6,$7,$5,'QUEUED',$5,$5,$5)`,
       id, ids.agency, ids.fallbackCreator, runId, now, fanId, campaignJobId,
     );
@@ -64,7 +66,7 @@ async function seed(db) {
 
   if (currentGenerationRows > 1) {
     const started = performance.now();
-    await db.$executeRawUnsafe(`
+    await tx.$executeRawUnsafe(`
       INSERT INTO "CreatorCampaignFanRefreshWork" (
         "id","agencyId","creatorId","scanRunId","scanStartedAt","onlyFansUserId","campaignJobId",
         "freshnessCutoffAt","status","scheduledAt","createdAt","updatedAt"
@@ -88,7 +90,7 @@ async function seed(db) {
 
   if (historyRows > 0) {
     const started = performance.now();
-    await db.$executeRawUnsafe(`
+    await tx.$executeRawUnsafe(`
       INSERT INTO "CreatorCampaignFanRefreshWork" (
         "id","agencyId","creatorId","scanRunId","scanStartedAt","onlyFansUserId","campaignJobId",
         "freshnessCutoffAt","status","scheduledAt","createdAt","updatedAt"
@@ -110,8 +112,9 @@ async function seed(db) {
     console.log(`# A20_5_SEEDED_HISTORY ${JSON.stringify({ historyRows, insertDurationMs: durationMs })}`);
   }
   console.log(`# A20_5_SEEDED_ROLLING_SEED ${JSON.stringify({ ok: true, nonce, historyRows, currentGenerationRows })}`);
-}
 
+  });
+}
 async function verify(db) {
   const rows = await db.$queryRawUnsafe(`
     SELECT "creatorId", "fanValueCoverageDelegated", "fanValueCoverageOwnerKind",
