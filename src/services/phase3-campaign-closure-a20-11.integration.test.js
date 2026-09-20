@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
-const { withPhase3PostgresFixtureAuthority } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+const { withPhase3PostgresFixtureAuthority, cleanupPhase3PostgresAgencyFixture } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 const {
   enqueueUniqueCampaignFanRefreshes,
   finalizeCampaignFanRefreshJob,
@@ -54,7 +54,7 @@ async function createScope(db, s) {
 }
 
 async function cleanup(db, s) {
-  await withPhase3PostgresFixtureAuthority(db, (tx) => tx.agency.deleteMany({ where: { id: s.agencyId } }));
+  await cleanupPhase3PostgresAgencyFixture(db, s.agencyId);
 }
 
 async function planner(input) {

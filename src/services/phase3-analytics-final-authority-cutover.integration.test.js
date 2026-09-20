@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
-const { withPhase3PostgresFixtureAuthority } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+const { withPhase3PostgresFixtureAuthority, cleanupPhase3PostgresAgencyFixture } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 let projectSubscriberDirectoryItems;
 let applyFanDataPointRefreshChunk;
 let readFanCurrent;
@@ -44,7 +44,7 @@ async function createAgencyCreator(db, prefix, { agencyId = null } = {}) {
 }
 
 async function cleanupAgency(db, agencyId) {
-  await withPhase3PostgresFixtureAuthority(db, (tx) => tx.agency.deleteMany({ where: { id: agencyId } }));
+  await cleanupPhase3PostgresAgencyFixture(db, agencyId);
 }
 
 async function databaseNow(db) {

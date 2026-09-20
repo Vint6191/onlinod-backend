@@ -8,7 +8,7 @@ const {
   TEAM_CONTROL_PLANE_GENERATION,
   teamControlPlaneActivationDiagnostics,
 } = require("./phase2-release-compatibility-authority-service");
-const { withPhase3PostgresFixtureAuthority } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+const { withPhase3PostgresFixtureAuthority, cleanupPhase3PostgresAgencyFixture } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 
 function id(prefix) {
   return `${prefix}-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}`;
@@ -37,7 +37,7 @@ test("A23 PostgreSQL: proof runtime is operationalized and generation-authorized
     assert.equal(await db.creatorAccount.count({ where: { id: creatorId } }), 1);
   } finally {
     try {
-      await withPhase3PostgresFixtureAuthority(db, (tx) => tx.agency.deleteMany({ where: { id: agencyId } }));
+      await cleanupPhase3PostgresAgencyFixture(db, agencyId);
     } catch (_) {}
     await db.$disconnect();
   }
@@ -62,7 +62,7 @@ test("A23 PostgreSQL: migrated DB still rejects retired direct Team and Creator 
     );
   } finally {
     try {
-      await withPhase3PostgresFixtureAuthority(db, (tx) => tx.agency.deleteMany({ where: { id: agencyId } }));
+      await cleanupPhase3PostgresAgencyFixture(db, agencyId);
     } catch (_) {}
     await db.$disconnect();
   }

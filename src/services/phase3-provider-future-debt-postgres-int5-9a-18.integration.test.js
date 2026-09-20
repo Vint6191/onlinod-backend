@@ -4,7 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
 const debt = require("./provider-capacity-debt-authority-service");
-const { withPhase3PostgresFixtureAuthority } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+const { withPhase3PostgresFixtureAuthority, cleanupPhase3PostgresAgencyFixture } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 
 test("A18 PostgreSQL: durable background job debt projects typed partial future-debt coverage", { skip: !enabled, timeout: 60_000 }, async () => {
   const { PrismaClient } = require("@prisma/client");
@@ -44,7 +44,7 @@ test("A18 PostgreSQL: durable background job debt projects typed partial future-
       assert.equal(String(persisted.status), "UNKNOWN");
     } finally {
       await db.jobInstance.delete({ where: { id: job.id } }).catch(() => {});
-      await withPhase3PostgresFixtureAuthority(db, (tx) => tx.agency.deleteMany({ where: { id: creator.agencyId } })).catch(() => {});
+      await cleanupPhase3PostgresAgencyFixture(db, creator.agencyId).catch(() => {});
     }
   } finally {
     await db.$disconnect();

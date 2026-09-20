@@ -66,3 +66,36 @@ test("A23 physical pack owns its fixtures and has no accidental cross-file boots
   assert.doesNotMatch(seeded, /await\s+db\.\$executeRawUnsafe\(`INSERT INTO "Agency"/);
   assert.doesNotMatch(seeded, /await\s+db\.\$executeRawUnsafe\(`INSERT INTO "CreatorAccount"/);
 });
+
+
+test("A24 physical proof pins PostgreSQL search_path and attests schema-local triggers/FKs before fixtures", () => {
+  const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
+  const isolation = source("scripts/audit/phase3-a20-schema-isolation.js");
+  const fixture = source("scripts/audit/phase3-postgres-proof-fixture-authority.js");
+
+  assert.match(runner, /search_path=\$\{safeSchema\},pg_catalog,public/);
+  assert.match(runner, /clean-current-schema-isolation/);
+  assert.match(runner, /rolling-current-schema-isolation/);
+  assert.match(runner, /seeded-current-schema-isolation/);
+  assert.match(isolation, /A20_SCHEMA_ISOLATION_PASS/);
+  assert.match(isolation, /Phase2WorkCoverage_agencyId_fkey/);
+  assert.match(isolation, /cross-schema foreign keys/);
+  assert.match(isolation, /trigger points at a function outside the audit schema/);
+  assert.match(isolation, /runtimeFixtureLifecycle/);
+  assert.match(runner, /clean-current-fixture-lifecycle/);
+  assert.match(isolation, /Agency_phase2_initial_coverage/);
+  assert.match(isolation, /current_schema\(\)/);
+  assert.match(fixture, /pinPhase3AuditSchema/);
+  assert.match(fixture, /set_config\('search_path'/);
+  assert.match(fixture, /cleanupPhase3PostgresAgencyFixture/);
+});
+
+test("A24 physical integration files use canonical Agency fixture teardown instead of ad-hoc deleteMany", () => {
+  const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
+  const proofFiles = [...runner.matchAll(/path\.join\(ROOT, "([^"]+\.integration\.test\.js)"\)/g)].map((match) => match[1]);
+  for (const file of proofFiles) {
+    const text = source(file);
+    if (!/agency(?:Id|\.create)/.test(text)) continue;
+    assert.doesNotMatch(text, /withPhase3PostgresFixtureAuthority\([^)]*=>\s*tx\.agency\.deleteMany/, `${file} has ad-hoc Agency fixture teardown`);
+  }
+});

@@ -17,6 +17,7 @@ const PREFLIGHT_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-pr
 const PREFLIGHT_RUNTIME_AVAILABILITY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-runtime-availability.js");
 const INDEX_LIFECYCLE_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-index-lifecycle-concurrency.js");
 const OPERATIONALIZE_RUNTIME = path.join(ROOT, "scripts/audit/phase3-a20-operationalize-runtime.js");
+const SCHEMA_ISOLATION_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-schema-isolation.js");
 const STEP_LOG_DIR = path.join(ROOT, "artifacts", "audit", "phase3-a20-steps");
 const PROOF_TESTS = [
   path.join(ROOT, "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js"),
@@ -61,7 +62,16 @@ function localPrismaCli() {
 }
 function withSchema(url, schema) {
   const u = new URL(url);
-  u.searchParams.set("schema", schema);
+  const safeSchema = String(schema || "").trim();
+  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(safeSchema)) fail(`invalid audit schema identifier: ${safeSchema || "<empty>"}`);
+  u.searchParams.set("schema", safeSchema);
+  // `schema=` is Prisma routing metadata. PostgreSQL trigger functions and raw SQL
+  // resolve unqualified relations through the server-side search_path, so pin it
+  // independently as well. The audit schema MUST be first to prevent public-schema
+  // bleed when the physical proof runs inside the production database.
+  const existingOptions = String(u.searchParams.get("options") || "").trim();
+  const searchPathOption = `-c search_path=${safeSchema},pg_catalog,public`;
+  u.searchParams.set("options", existingOptions ? `${existingOptions} ${searchPathOption}` : searchPathOption);
   return u.toString();
 }
 function safeStepName(label) {
@@ -192,6 +202,13 @@ function runProofTests(label, databaseUrl) {
   console.log(`# PHASE3_A20_NODE_PROOF_PASS ${JSON.stringify({ label, tests: proof.tests, pass: proof.pass, fail: proof.fail, skipped: proof.skipped, durationMs: Math.round(out.durationMs * 100) / 100 })}`);
   return proof;
 }
+function assertSchemaIsolation(label, databaseUrl, mode = "structural") {
+  const out = run(label, process.execPath, [SCHEMA_ISOLATION_PROOF, mode], { DATABASE_URL: databaseUrl });
+  if (!String(out.stdout || "").includes("A20_SCHEMA_ISOLATION_PASS")) {
+    fail(`${label} did not emit A20_SCHEMA_ISOLATION_PASS`);
+  }
+  return { durationMs: out.durationMs };
+}
 function operationalizeRuntime(label, databaseUrl) {
   const out = run(label, process.execPath, [OPERATIONALIZE_RUNTIME], { DATABASE_URL: databaseUrl });
   if (!String(out.stdout || "").includes("A20_RUNTIME_OPERATIONALIZATION_PASS")) {
@@ -244,7 +261,9 @@ function main() {
   try {
     const cleanUrl = withSchema(audit, cleanSchema);
     run("clean-current-migrate", cli, ["migrate", "deploy", "--schema", cleanSchemaFile], { DATABASE_URL: cleanUrl });
+    const cleanSchemaIsolation = assertSchemaIsolation("clean-current-schema-isolation", cleanUrl);
     const cleanOperationalization = operationalizeRuntime("clean-current-operationalize", cleanUrl);
+    assertSchemaIsolation("clean-current-fixture-lifecycle", cleanUrl, "runtime");
     const indexAbsentConcurrency = run("clean-current-index-lifecycle-absent", process.execPath, [INDEX_LIFECYCLE_CONCURRENCY_PROOF, "absent"], { DATABASE_URL: cleanUrl });
     if (!String(indexAbsentConcurrency.stdout || "").includes("A20_12_INDEX_ABSENT_CONCURRENCY_PASS")) {
       fail("clean-current index lifecycle absent/concurrent proof did not emit PASS marker");
@@ -257,10 +276,14 @@ function main() {
 
     const rollingUrl = withSchema(audit, rollingSchema);
     run("rolling-a13-migrate", cli, ["migrate", "deploy", "--schema", rollingSchemaFile], { DATABASE_URL: rollingUrl });
+    assertSchemaIsolation("rolling-a13-schema-isolation", rollingUrl);
     const rollingOperationalization = operationalizeRuntime("rolling-a13-operationalize", rollingUrl);
+    assertSchemaIsolation("rolling-a13-fixture-lifecycle", rollingUrl, "runtime");
     addMigrationsAfter(rollingPrisma, A13_CUTOFF);
     run("rolling-a13-to-current-migrate", cli, ["migrate", "deploy", "--schema", rollingSchemaFile], { DATABASE_URL: rollingUrl });
+    assertSchemaIsolation("rolling-current-schema-isolation", rollingUrl);
     operationalizeRuntime("rolling-current-operationalize-verify", rollingUrl);
+    assertSchemaIsolation("rolling-current-fixture-lifecycle", rollingUrl, "runtime");
     const rollingProof = runProofTests("rolling-a13-to-current-proof", rollingUrl);
 
     const seededRollingUrl = withSchema(audit, seededRollingSchema);
@@ -271,7 +294,9 @@ function main() {
       ONLINOD_A20_SEED_CURRENT_ROWS: process.env.ONLINOD_A20_SEED_CURRENT_ROWS || "10000",
     };
     run("seeded-pre-a20-2-migrate", cli, ["migrate", "deploy", "--schema", seededRollingSchemaFile], { DATABASE_URL: seededRollingUrl });
+    assertSchemaIsolation("seeded-pre-a20-2-schema-isolation", seededRollingUrl);
     const seededOperationalization = operationalizeRuntime("seeded-pre-a20-2-operationalize", seededRollingUrl);
+    assertSchemaIsolation("seeded-pre-a20-2-fixture-lifecycle", seededRollingUrl, "runtime");
     run("seeded-pre-a20-2-data", process.execPath, ["scripts/audit/phase3-a20-seeded-rolling-coverage.js", "seed"], seedEnv);
     const runtimeAvailability = run("seeded-a20-11-preflight-runtime-availability", process.execPath, [PREFLIGHT_RUNTIME_AVAILABILITY_PROOF], seedEnv);
     if (!String(runtimeAvailability.stdout || "").includes("A20_11_PREFLIGHT_RUNTIME_AVAILABILITY_PASS")) {
@@ -284,7 +309,9 @@ function main() {
     }
     addMigrationsAfter(seededRollingPrisma, PRE_A20_2_CUTOFF);
     run("seeded-a20-2-to-current-migrate", cli, ["migrate", "deploy", "--schema", seededRollingSchemaFile], { DATABASE_URL: seededRollingUrl });
+    assertSchemaIsolation("seeded-current-schema-isolation", seededRollingUrl);
     operationalizeRuntime("seeded-current-operationalize-verify", seededRollingUrl);
+    assertSchemaIsolation("seeded-current-fixture-lifecycle", seededRollingUrl, "runtime");
     const seededVerify = run("seeded-a20-2-backfill-verify", process.execPath, ["scripts/audit/phase3-a20-seeded-rolling-coverage.js", "verify"], seedEnv);
     const migrationMetrics = parseJsonLines(seededVerify.stdout, "A20_6_SEEDED_BACKFILL_EXPLAIN_METRICS");
     if (migrationMetrics.length !== 1) fail(`seeded migration proof missing A20.6 EXPLAIN metrics`);
@@ -298,6 +325,7 @@ function main() {
       ok: true, cleanSchema, rollingSchema, seededRollingSchema,
       a13Cutoff: A13_CUTOFF, preA20_2Cutoff: PRE_A20_2_CUTOFF,
       expectedProofTests: EXPECTED_PROOF_TEST_COUNT,
+      schemaIsolation: { clean: cleanSchemaIsolation, pass: true },
       operationalization: { clean: cleanOperationalization, rolling: rollingOperationalization, seeded: seededOperationalization },
       indexLifecycleAbsent: { pass: true, durationMs: indexAbsentConcurrency.durationMs },
       indexLifecycleInvalidRecovery: { pass: true, durationMs: indexInvalidRecovery.durationMs },
