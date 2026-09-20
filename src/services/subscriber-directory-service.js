@@ -19,6 +19,7 @@ const MAX_PAGE_LIMIT = 100;
 const MAX_PAGE_ITEMS = 100;
 const MAX_HIDDEN_LIST_LIMIT = 500;
 const PUBLICATION_BATCH_SIZE = 500;
+const SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES = Object.freeze(["PENDING", "CURRENT", "PREVIOUS", "FINALIZE"]);
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -91,6 +92,7 @@ function runSummary(run) {
     fanProjectionCompletedAt: run.fanProjectionCompletedAt || null,
     fanProjectionLastError: run.fanProjectionLastError || null,
     publicationStatus: run.publicationStatus || "PENDING",
+    publicationGeneration: Number(run.publicationGeneration || 0),
     publicationCursorId: run.publicationCursorId || null,
     publicationPreviousRunId: run.publicationPreviousRunId || null,
     publicationAddedCount: Number(run.publicationAddedCount || 0),
@@ -103,6 +105,24 @@ function runSummary(run) {
     summary: run.summary || {},
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
+  };
+}
+
+async function lockSubscriberPublicationCreator(db, agencyId, creatorId) {
+  if (!agencyId || !creatorId || typeof db?.$executeRawUnsafe !== "function") return;
+  await db.$executeRawUnsafe(
+    `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`,
+    `subscriber-publication:${agencyId}:${creatorId}`,
+  );
+}
+
+function subscriberPublicationDebtWhere({ agencyId, creatorId } = {}) {
+  return {
+    ...(agencyId ? { agencyId } : {}),
+    ...(creatorId ? { creatorId } : {}),
+    hasMore: false,
+    fanProjectionStatus: "COMPLETE",
+    publicationStatus: { in: [...SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES] },
   };
 }
 
@@ -121,27 +141,44 @@ async function scheduleSubscriberScan({
 } = {}) {
   if (!agencyId || !creatorId)
     throw Object.assign(new Error("Creator scope is required"), { code: "CREATOR_SCOPE_REQUIRED" });
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   const normalizedLimit = integer(pageLimit, DEFAULT_PAGE_LIMIT, 20, MAX_PAGE_LIMIT);
   const normalizedEveryDays = integer(scanEveryDays, DEFAULT_SCAN_EVERY_DAYS, 1, 30);
-
-  const active = await prisma.subscriberScanRun.findFirst({
-    where: { agencyId, creatorId, status: { in: ACTIVE_RUN_STATUSES } },
-    orderBy: { createdAt: "desc" },
-  });
-  if (active) {
-    const job = active.jobId ? await prisma.jobInstance.findUnique({ where: { id: active.jobId } }) : null;
-    if (job && ["SCHEDULED", "CLAIMED"].includes(job.status)) {
-      return { ok: true, created: false, reason: "already_in_flight", run: runSummary(active), job };
-    }
-  }
 
   let result;
   try {
     result = await prisma.$transaction(async (tx) => {
+      // A single creator-local lock serializes generation allocation with
+      // publication/recovery.  Job status is deliberately not the publication
+      // authority: a terminal JobInstance may still have durable publication
+      // debt that must finish before another generation can be scheduled.
+      await lockSubscriberPublicationCreator(tx, agencyId, creatorId);
+
+      const publicationDebt = await tx.subscriberScanRun.findFirst({
+        where: subscriberPublicationDebtWhere({ agencyId, creatorId }),
+        orderBy: [{ publicationGeneration: "asc" }, { updatedAt: "asc" }, { id: "asc" }],
+      });
+      if (publicationDebt) {
+        const debtJob = publicationDebt.jobId
+          ? await tx.jobInstance.findUnique({ where: { id: publicationDebt.jobId } }).catch(() => null)
+          : null;
+        return { existingPublication: publicationDebt, existingJob: debtJob };
+      }
+
+      const active = await tx.subscriberScanRun.findFirst({
+        where: { agencyId, creatorId, status: { in: ACTIVE_RUN_STATUSES } },
+        orderBy: [{ publicationGeneration: "desc" }, { createdAt: "desc" }],
+      });
       if (active) {
+        const job = active.jobId ? await tx.jobInstance.findUnique({ where: { id: active.jobId } }) : null;
+        if (job && ["SCHEDULED", "CLAIMED"].includes(job.status)) {
+          return { existingRun: active, existingJob: job };
+        }
         await tx.subscriberScanRun.updateMany({
-          where: { id: active.id, status: { in: ACTIVE_RUN_STATUSES } },
+          where: {
+            id: active.id,
+            status: { in: ACTIVE_RUN_STATUSES },
+          },
           data: {
             status: "FAILED",
             completedAt: now,
@@ -149,6 +186,21 @@ async function scheduleSubscriberScan({
           },
         });
       }
+
+      const state = await tx.subscriberDirectoryState.findUnique({
+        where: { creatorId },
+        select: { publicationGeneration: true, publishedGeneration: true },
+      }).catch(() => null);
+      const newestRun = await tx.subscriberScanRun.findFirst({
+        where: { creatorId },
+        orderBy: [{ publicationGeneration: "desc" }, { createdAt: "desc" }],
+        select: { publicationGeneration: true },
+      }).catch(() => null);
+      const generation = Math.max(
+        Number(state?.publicationGeneration || 0),
+        Number(newestRun?.publicationGeneration || 0),
+      ) + 1;
+
       const run = await tx.subscriberScanRun.create({
         data: {
           agencyId,
@@ -157,11 +209,13 @@ async function scheduleSubscriberScan({
           sourceType: clean(sourceType, 40) || "all",
           status: "QUEUED",
           pageLimit: normalizedLimit,
+          publicationGeneration: generation,
           createdByUserId: userId,
           summary: {
             manual: manual === true,
             force: force === true,
             reason: clean(reason, 160) || "subscriber_directory_refresh",
+            publicationGeneration: generation,
           },
         },
       });
@@ -180,6 +234,7 @@ async function scheduleSubscriberScan({
           pageLimit: normalizedLimit,
           scanEveryDays: normalizedEveryDays,
           reason: clean(reason, 160) || "subscriber_directory_refresh",
+          publicationGeneration: generation,
           observationTokenVersion: 1,
           observationReadLeaseVersion: 1,
         },
@@ -196,25 +251,28 @@ async function scheduleSubscriberScan({
           lastJobId: job.id,
           status: "SCANNING",
           scanEveryDays: normalizedEveryDays,
-          summary: { activeRunId: run.id, reason: clean(reason, 160) || null },
+          publicationGeneration: generation,
+          publishedGeneration: 0,
+          summary: { activeRunId: run.id, reason: clean(reason, 160) || null, publicationGeneration: generation },
         },
         update: {
           lastJobId: job.id,
           status: "SCANNING",
           scanEveryDays: normalizedEveryDays,
+          publicationGeneration: generation,
           lastError: null,
-          summary: { activeRunId: run.id, reason: clean(reason, 160) || null },
+          summary: { activeRunId: run.id, reason: clean(reason, 160) || null, publicationGeneration: generation },
         },
       });
       return { run: linkedRun, job };
-    });
+    }, { maxWait: 30_000, timeout: 30_000 });
   } catch (error) {
-    // The migration adds a partial unique index for one QUEUED/RUNNING run per
-    // creator. This closes the multi-process race between scheduler/manual scan.
+    // Retain the partial unique active-run index as a second line of defence for
+    // older callers, but the creator advisory lock is the generation authority.
     if (error?.code !== "P2002") throw error;
     const concurrentRun = await prisma.subscriberScanRun.findFirst({
       where: { agencyId, creatorId, status: { in: ACTIVE_RUN_STATUSES } },
-      orderBy: { createdAt: "desc" },
+      orderBy: [{ publicationGeneration: "desc" }, { createdAt: "desc" }],
     });
     const concurrentJob = concurrentRun?.jobId
       ? await prisma.jobInstance.findUnique({ where: { id: concurrentRun.jobId } })
@@ -229,6 +287,18 @@ async function scheduleSubscriberScan({
     };
   }
 
+  if (result.existingPublication) {
+    return {
+      ok: true,
+      created: false,
+      reason: "publication_recovery_in_progress",
+      run: runSummary(result.existingPublication),
+      job: result.existingJob || null,
+    };
+  }
+  if (result.existingRun) {
+    return { ok: true, created: false, reason: "already_in_flight", run: runSummary(result.existingRun), job: result.existingJob || null };
+  }
   publishPlannedJobAvailable(result.job);
   return { ok: true, created: true, reason: "created", run: runSummary(result.run), job: result.job };
 }
@@ -372,7 +442,7 @@ async function lockSubscriberPublicationRun(db, runId) {
   return db.subscriberScanRun.findUnique({ where: { id: runId } });
 }
 
-async function publicationTransaction(db, agencyId, work) {
+async function publicationTransaction(db, agencyId, creatorId, work) {
   if (typeof db?.$transaction === "function") {
     return db.$transaction(async (tx) => {
       // Serialize every derived-snapshot mutation with the same agency-wide
@@ -380,10 +450,14 @@ async function publicationTransaction(db, agencyId, work) {
       // issued completely before publication starts, or sees the publication
       // fence and retries; it can never validate against half-published state.
       await lockAutomationWriteCommitFence({ db: tx, agencyId });
+      await lockSubscriberPublicationCreator(tx, agencyId, creatorId);
       return work(tx);
     }, { maxWait: 30_000, timeout: 30_000 });
   }
-  if (typeof db?.$executeRawUnsafe === "function") await lockAutomationWriteCommitFence({ db, agencyId });
+  if (typeof db?.$executeRawUnsafe === "function") {
+    await lockAutomationWriteCommitFence({ db, agencyId });
+    await lockSubscriberPublicationCreator(db, agencyId, creatorId);
+  }
   return work(db);
 }
 
@@ -444,7 +518,7 @@ async function markHiddenOnlineDisappeared(db, run, fanIds, now) {
 async function advanceSubscriberPublication(db, { runId, jobId, scanEveryDays }) {
   const run = await lockSubscriberPublicationRun(db, runId);
   if (!run) throw new Error("Subscriber directory scan run is missing during publication");
-  if (run.status === "SUPERSEDED") return { complete: true, run, summary: run.summary || {} };
+  if (run.status === "SUPERSEDED" && String(run.publicationStatus || "") === "COMPLETE") return { complete: true, run, summary: run.summary || {} };
   if (run.status === "PUBLISHED" && String(run.publicationStatus || "") === "COMPLETE") {
     return { complete: true, run, summary: run.summary || {} };
   }
@@ -457,8 +531,46 @@ async function advanceSubscriberPublication(db, { runId, jobId, scanEveryDays })
     throw error;
   }
 
+  const generation = Number(run.publicationGeneration || 0);
+  if (!Number.isInteger(generation) || generation <= 0) {
+    const error = new Error("Subscriber publication generation is missing");
+    error.code = "SUBSCRIBER_PUBLICATION_GENERATION_MISSING";
+    throw error;
+  }
+  const generationState = await db.subscriberDirectoryState.findUnique({
+    where: { creatorId: run.creatorId },
+    select: { currentRunId: true, publicationGeneration: true, publishedGeneration: true },
+  }).catch(() => null);
+  const latestGeneration = Number(generationState?.publicationGeneration || 0);
+  const publishedGeneration = Number(generationState?.publishedGeneration || 0);
+
+  // If a newer generation is already published, every remaining phase of this
+  // run is obsolete.  It is safe to close it as SUPERSEDED because the newer
+  // generation has already replaced all derived state.  If a newer generation
+  // is merely allocated but not yet published, fail closed and keep the
+  // publication fence active rather than expose mixed generations.
+  if (publishedGeneration > generation) {
+    const superseded = await db.subscriberScanRun.update({
+      where: { id: run.id },
+      data: {
+        status: "SUPERSEDED",
+        publicationStatus: "COMPLETE",
+        publicationCursorId: null,
+        publicationCompletedAt: run.publicationCompletedAt || now,
+        completedAt: run.completedAt || now,
+        publicationLastError: null,
+      },
+    });
+    return { complete: true, phase: "COMPLETE", run: superseded, summary: superseded.summary || run.summary || {}, supersededByGeneration: publishedGeneration };
+  }
+  if (latestGeneration > generation && phase !== "COMPLETE") {
+    const error = new Error(`Subscriber publication generation ${generation} is stale behind allocated generation ${latestGeneration}`);
+    error.code = "SUBSCRIBER_PUBLICATION_GENERATION_STALE";
+    throw error;
+  }
+
   if (phase === "PENDING") {
-    const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId: run.creatorId } });
+    const state = generationState || await db.subscriberDirectoryState.findUnique({ where: { creatorId: run.creatorId } });
     const previousRunId = state?.currentRunId && state.currentRunId !== run.id ? state.currentRunId : null;
     const updated = await db.subscriberScanRun.update({
       where: { id: run.id },
@@ -561,32 +673,78 @@ async function advanceSubscriberPublication(db, { runId, jobId, scanEveryDays })
     const summary = {
       totalCount, hiddenCount, addedCount, changedCount, disappearedCount,
       currentRunId: run.id, previousRunId,
+      publicationGeneration: generation,
       fanProjectionStatus: String(run.fanProjectionStatus || "PENDING"),
       fanProjectionCursorOffset: Number(run.fanProjectionCursorOffset || 0),
       fanProjectionCount: Number(run.fanProjectionCount || 0),
-      publicationTopology: "durable_chunked_v1",
+      publicationTopology: "durable_chunked_generation_v2",
     };
-    await db.subscriberDirectoryState.upsert({
-      where: { creatorId: run.creatorId },
-      create: {
-        agencyId: run.agencyId, creatorId: run.creatorId, currentRunId: run.id, previousRunId,
-        lastJobId: jobId, status: "READY", scanEveryDays: integer(scanEveryDays, DEFAULT_SCAN_EVERY_DAYS, 1, 30),
-        nextScanAt, publishedAt: now, totalCount, hiddenCount, addedCount, changedCount, disappearedCount, summary,
+
+    // Monotonic generation CAS: only the latest allocated generation may move
+    // currentRunId forward, and publishedGeneration can only increase.  The
+    // creator advisory lock removes ordinary contention; the CAS is the durable
+    // source-level fence against old/new FINALIZE reordering and legacy callers.
+    const stateCas = await db.subscriberDirectoryState.updateMany({
+      where: {
+        creatorId: run.creatorId,
+        publicationGeneration: generation,
+        publishedGeneration: { lt: generation },
       },
-      update: {
-        currentRunId: run.id, previousRunId, lastJobId: jobId, status: "READY", nextScanAt, publishedAt: now,
-        totalCount, hiddenCount, addedCount, changedCount, disappearedCount, summary, lastError: null,
+      data: {
+        currentRunId: run.id, previousRunId, lastJobId: jobId, status: "READY",
+        scanEveryDays: integer(scanEveryDays, DEFAULT_SCAN_EVERY_DAYS, 1, 30),
+        nextScanAt, publishedAt: now, totalCount, hiddenCount, addedCount, changedCount, disappearedCount,
+        publishedGeneration: generation, summary, lastError: null,
       },
     });
-    const updated = await db.subscriberScanRun.update({
-      where: { id: run.id },
+
+    if (!Number(stateCas?.count || 0)) {
+      const currentState = await db.subscriberDirectoryState.findUnique({
+        where: { creatorId: run.creatorId },
+        select: { currentRunId: true, publicationGeneration: true, publishedGeneration: true },
+      });
+      const currentPublishedGeneration = Number(currentState?.publishedGeneration || 0);
+      const alreadyCommitted = currentState?.currentRunId === run.id && currentPublishedGeneration === generation;
+      if (!alreadyCommitted) {
+        if (currentPublishedGeneration > generation) {
+          const superseded = await db.subscriberScanRun.update({
+            where: { id: run.id },
+            data: {
+              status: "SUPERSEDED", publicationStatus: "COMPLETE", publicationCursorId: null,
+              publicationCompletedAt: now, completedAt: now, publicationLastError: null,
+            },
+          });
+          return { complete: true, phase: "COMPLETE", run: superseded, summary: superseded.summary || run.summary || {}, supersededByGeneration: currentPublishedGeneration };
+        }
+        const error = new Error("Subscriber publication FINALIZE lost the monotonic generation CAS");
+        error.code = "SUBSCRIBER_PUBLICATION_GENERATION_CAS_LOST";
+        throw error;
+      }
+    }
+
+    const committed = await db.subscriberScanRun.updateMany({
+      where: { id: run.id, publicationGeneration: generation, publicationStatus: "FINALIZE" },
       data: {
         status: "PUBLISHED", completedAt: now, publishedAt: now, hasMore: false, summary,
         publicationStatus: "COMPLETE", publicationCursorId: null, publicationCompletedAt: now, publicationLastError: null,
       },
     });
+    let updated = null;
+    if (Number(committed?.count || 0)) {
+      updated = await db.subscriberScanRun.findUnique({ where: { id: run.id } });
+    } else {
+      updated = await db.subscriberScanRun.findUnique({ where: { id: run.id } });
+      if (!(updated?.status === "PUBLISHED" && String(updated?.publicationStatus || "") === "COMPLETE")) {
+        const error = new Error("Subscriber publication run generation changed before FINALIZE commit");
+        error.code = "SUBSCRIBER_PUBLICATION_RUN_CAS_LOST";
+        throw error;
+      }
+    }
     if (previousRunId) {
-      await db.subscriberScanRun.updateMany({ where: { id: previousRunId, status: "PUBLISHED" }, data: { status: "SUPERSEDED" } });
+      await db.subscriberScanRun.updateMany({
+        where: { id: previousRunId, status: "PUBLISHED", publicationGeneration: { lt: generation } },
+        data: { status: "SUPERSEDED" },
+      });
     }
     return { complete: true, phase: "COMPLETE", run: updated, summary };
   }
@@ -600,7 +758,7 @@ async function publishRun(db, run, { jobId, scanEveryDays }) {
   // Each step is its own bounded transaction on a root Prisma client. Durable
   // phase/cursor/counters make crash/retry replay resume from the last commit.
   for (let step = 0; step < 100_000; step += 1) {
-    const result = await publicationTransaction(db, run.agencyId, (tx) => advanceSubscriberPublication(tx, { runId, jobId, scanEveryDays }));
+    const result = await publicationTransaction(db, run.agencyId, run.creatorId, (tx) => advanceSubscriberPublication(tx, { runId, jobId, scanEveryDays }));
     if (result?.complete) return result.summary || result.run?.summary || {};
   }
   const error = new Error("Subscriber publication exceeded the bounded durable step budget");
@@ -1037,10 +1195,9 @@ async function recoverSubscriberPublicationDebt({
     where: {
       OR: [
         {
-          status: "RUNNING",
           hasMore: false,
           fanProjectionStatus: "COMPLETE",
-          publicationStatus: { in: ["PENDING", "CURRENT", "PREVIOUS", "FINALIZE"] },
+          publicationStatus: { in: [...SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES] },
         },
         {
           status: { in: ["PUBLISHED", "SUPERSEDED"] },
@@ -1049,7 +1206,7 @@ async function recoverSubscriberPublicationDebt({
         },
       ],
     },
-    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+    orderBy: [{ publicationGeneration: "desc" }, { updatedAt: "asc" }, { id: "asc" }],
     take: runLimit,
     select: {
       id: true, agencyId: true, creatorId: true, jobId: true, status: true, publicationStatus: true,
@@ -1082,7 +1239,7 @@ async function recoverSubscriberPublicationDebt({
       } else {
         for (let step = 0; step < stepLimit; step += 1) {
           if (Date.now() - started >= runtimeBudget) { budgetExhausted = true; break; }
-          const result = await publicationTransaction(db, candidate.agencyId, (tx) => advanceSubscriberPublication(tx, {
+          const result = await publicationTransaction(db, candidate.agencyId, candidate.creatorId, (tx) => advanceSubscriberPublication(tx, {
             runId: candidate.id,
             jobId: candidate.jobId || null,
             scanEveryDays,
@@ -1098,9 +1255,10 @@ async function recoverSubscriberPublicationDebt({
       if (!completeResult?.complete) continue;
       const freshRun = completeResult.run || await db.subscriberScanRun.findUnique({ where: { id: candidate.id } }).catch(() => candidate);
       let planning = null;
-      if (subscriberRecoveryJobNeedsPlanning(job, authorityNow)) {
+      const publishedRun = freshRun || candidate;
+      if (String(publishedRun?.status || "") === "PUBLISHED" && subscriberRecoveryJobNeedsPlanning(job, authorityNow)) {
         planning = await planSubscriberDerivedAutomation({
-          run: freshRun || candidate,
+          run: publishedRun,
           userId: null,
           db,
           source: "subscriber_snapshot_recovered",
@@ -1117,7 +1275,7 @@ async function recoverSubscriberPublicationDebt({
     } catch (error) {
       errors += 1;
       await db.subscriberScanRun.updateMany({
-        where: { id: candidate.id, status: { in: ["RUNNING", "PUBLISHED", "SUPERSEDED"] } },
+        where: { id: candidate.id },
         data: { publicationLastError: clean(error?.message || error, 1000) || "subscriber_publication_recovery_failed" },
       }).catch(() => null);
     }

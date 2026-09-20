@@ -17,7 +17,7 @@ let signalCampaignFanRefreshPromotion;
 
 if (enabled) {
   ({ projectSubscriberDirectoryItems, applyFanDataPointRefreshChunk, readFanCurrent } = require("./fan-data-authority-service"));
-  ({ recordSubscriberScanFailure, applySubscriberScanChunk } = require("./subscriber-directory-service"));
+  ({ recordSubscriberScanFailure, applySubscriberScanChunk, recoverSubscriberPublicationDebt } = require("./subscriber-directory-service"));
   ({
     enqueueUniqueCampaignFanRefreshes,
     finalizeCampaignFanRefreshJob,
@@ -589,5 +589,123 @@ test("FINAL PostgreSQL: 4000-run Subscriber history uses the publication-job rec
   } finally {
     await cleanupAgency(db, scope.agencyId).catch(() => {});
     await db.$disconnect();
+  }
+});
+
+test("A21 PostgreSQL: large cross-run Subscriber history uses the exact runId+id publication cursor index for CURRENT and PREVIOUS", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db = new PrismaClient();
+  const scope = await createAgencyCreator(db, "a21-subscriber-cursor-plan");
+  const prefix = `${scope.creatorId}-cursor-plan`;
+  const runCount = 42;
+  const rowsPerRun = 1000;
+  try {
+    await db.$executeRawUnsafe(`
+      INSERT INTO "SubscriberScanRun" (
+        "id", "agencyId", "creatorId", "status", "publicationGeneration", "summary", "createdAt", "updatedAt"
+      )
+      SELECT $1 || '-run-' || LPAD(r::text, 3, '0'), $2, $3, 'FAILED', r, '{}'::jsonb,
+             clock_timestamp() - INTERVAL '2 days', clock_timestamp() - INTERVAL '1 day'
+      FROM generate_series(1, $4::integer) AS r
+    `, prefix, scope.agencyId, scope.creatorId, runCount);
+
+    await db.$executeRawUnsafe(`
+      INSERT INTO "SubscriberScanItem" (
+        "id", "runId", "agencyId", "creatorId", "fanId", "contentHash", "metadata", "observedAt"
+      )
+      SELECT
+        $1 || '-item-' || LPAD(g::text, 5, '0') || '-r-' || LPAD(r::text, 3, '0'),
+        $1 || '-run-' || LPAD(r::text, 3, '0'),
+        $2,
+        $3,
+        'fan-' || LPAD(g::text, 5, '0') || '-r-' || LPAD(r::text, 3, '0'),
+        md5(g::text || ':' || r::text),
+        '{}'::jsonb,
+        clock_timestamp()
+      FROM generate_series(1, $4::integer) AS r
+      CROSS JOIN generate_series(1, $5::integer) AS g
+    `, prefix, scope.agencyId, scope.creatorId, runCount, rowsPerRun);
+
+    await db.$executeRawUnsafe('ANALYZE "SubscriberScanItem"');
+
+    async function explain(runNumber) {
+      const runId = `${prefix}-run-${String(runNumber).padStart(3, "0")}`;
+      const cursorId = `${prefix}-item-00500-r-${String(runNumber).padStart(3, "0")}`;
+      const rows = await db.$queryRawUnsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+        SELECT i."id", i."fanId"
+        FROM "SubscriberScanItem" i
+        WHERE i."runId" = $1 AND i."id" > $2
+        ORDER BY i."id" ASC
+        LIMIT 500
+      `, runId, cursorId);
+      return JSON.stringify(rows?.[0]?.["QUERY PLAN"] || rows || []);
+    }
+
+    const currentPlan = await explain(1);
+    const previousPlan = await explain(2);
+    const indexName = "SubscriberScanItem_run_id_cursor_idx";
+    assert.ok(currentPlan.includes(indexName), `${indexName} missing from CURRENT EXPLAIN ANALYZE plan: ${currentPlan}`);
+    assert.ok(previousPlan.includes(indexName), `${indexName} missing from PREVIOUS EXPLAIN ANALYZE plan: ${previousPlan}`);
+    console.log(`FINAL_SUBSCRIBER_CURSOR_PLAN_PROOF ${JSON.stringify({ historyRuns: runCount, rowsPerRun, totalRows: runCount * rowsPerRun, index: indexName, phases: ["CURRENT", "PREVIOUS"] })}`);
+  } finally {
+    await cleanupAgency(db, scope.agencyId).catch(() => {});
+    await db.$disconnect();
+  }
+});
+
+
+test("A21 PostgreSQL: two Subscriber recovery replicas serialize one FAILED publication generation and converge monotonically", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db1 = new PrismaClient();
+  const db2 = new PrismaClient();
+  const scope = await createAgencyCreator(db1, "a21-subscriber-recovery-replicas");
+  const runId = `${scope.creatorId}-failed-publication`;
+  try {
+    await db1.subscriberDirectoryState.create({
+      data: {
+        agencyId: scope.agencyId,
+        creatorId: scope.creatorId,
+        status: "SCANNING",
+        publicationGeneration: 1,
+        publishedGeneration: 0,
+      },
+    });
+    await db1.subscriberScanRun.create({
+      data: {
+        id: runId,
+        agencyId: scope.agencyId,
+        creatorId: scope.creatorId,
+        status: "FAILED",
+        hasMore: false,
+        nextOffset: 0,
+        scannedCount: 0,
+        fanProjectionStatus: "COMPLETE",
+        fanProjectionCursorOffset: 0,
+        fanProjectionCount: 0,
+        publicationStatus: "FINALIZE",
+        publicationGeneration: 1,
+        summary: {},
+      },
+    });
+
+    const [left, right] = await Promise.all([
+      recoverSubscriberPublicationDebt({ db: db1, maxRuns: 1, maxStepsPerRun: 2, maxRuntimeMs: 30_000 }),
+      recoverSubscriberPublicationDebt({ db: db2, maxRuns: 1, maxStepsPerRun: 2, maxRuntimeMs: 30_000 }),
+    ]);
+
+    const run = await db1.subscriberScanRun.findUnique({ where: { id: runId } });
+    const state = await db1.subscriberDirectoryState.findUnique({ where: { creatorId: scope.creatorId } });
+    assert.equal(run.status, "PUBLISHED");
+    assert.equal(run.publicationStatus, "COMPLETE");
+    assert.equal(run.publicationGeneration, 1);
+    assert.equal(state.currentRunId, runId);
+    assert.equal(state.publicationGeneration, 1);
+    assert.equal(state.publishedGeneration, 1);
+    assert.ok(Number(left.advancedSteps || 0) + Number(right.advancedSteps || 0) >= 1);
+    assert.ok(Number(left.errors || 0) + Number(right.errors || 0) === 0);
+  } finally {
+    await cleanupAgency(db1, scope.agencyId).catch(() => {});
+    await db1.$disconnect();
+    await db2.$disconnect();
   }
 });

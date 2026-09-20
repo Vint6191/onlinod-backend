@@ -4959,6 +4959,7 @@ model SubscriberScanRun {
   fanProjectionCompletedAt  DateTime?
   fanProjectionLastError    String?  @db.VarChar(1000)
   publicationStatus           String   @default("PENDING") // PENDING | CURRENT | PREVIOUS | FINALIZE | COMPLETE
+  publicationGeneration       Int      @default(0)
   publicationCursorId         String?  @db.VarChar(180)
   publicationPreviousRunId    String?
   publicationAddedCount       Int      @default(0)
@@ -4982,7 +4983,9 @@ model SubscriberScanRun {
   @@index([creatorId, createdAt])
   @@index([status, updatedAt])
   @@index([status, publicationStatus, updatedAt])
+  @@index([creatorId, publicationGeneration], map: "SubscriberScanRun_creator_publication_generation_idx")
 }
+
 
 model SubscriberScanPage {
   id          String   @id @default(cuid())
@@ -5043,6 +5046,7 @@ model SubscriberScanItem {
 
   @@unique([runId, fanId])
   @@index([runId, pageOffset], map: "SubscriberScanItem_run_pageOffset_idx")
+  @@index([runId, id], map: "SubscriberScanItem_run_id_cursor_idx")
   @@index([runId, lastSeenIsNull])
   @@index([creatorId, fanId])
   @@index([agencyId, creatorId])
@@ -5064,6 +5068,8 @@ model SubscriberDirectoryState {
   addedCount      Int      @default(0)
   changedCount    Int      @default(0)
   disappearedCount Int    @default(0)
+  publicationGeneration Int @default(0)
+  publishedGeneration   Int @default(0)
   summary         Json     @default("{}")
   lastError       String?
   createdAt       DateTime @default(now())

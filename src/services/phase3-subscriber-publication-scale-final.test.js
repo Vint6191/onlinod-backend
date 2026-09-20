@@ -59,13 +59,13 @@ function buildFixture({ failTransactionAttempt = null } = {}) {
     id: "run-current", agencyId: "agency-1", creatorId: "creator-1", jobId: "job-1",
     status: "RUNNING", hasMore: false, nextOffset: 1200, scannedCount: 1200, pageCount: 12, hiddenCount: 434,
     fanProjectionStatus: "COMPLETE", fanProjectionCursorOffset: 1200, fanProjectionCount: 1200,
-    publicationStatus: "PENDING", publicationCursorId: null, publicationPreviousRunId: null,
+    publicationStatus: "PENDING", publicationGeneration: 2, publicationCursorId: null, publicationPreviousRunId: null,
     publicationAddedCount: 0, publicationChangedCount: 0, publicationDisappearedCount: 0,
     publicationStartedAt: null, publicationCompletedAt: null, publicationJobReconciledAt: null, publicationLastError: null,
     summary: null, updatedAt: new Date("2026-09-20T18:00:00.000Z"),
   };
-  const previousRun = { id: "run-prev", agencyId: "agency-1", creatorId: "creator-1", status: "PUBLISHED" };
-  const state = { creatorId: "creator-1", agencyId: "agency-1", currentRunId: "run-prev", status: "READY", scanEveryDays: 7 };
+  const previousRun = { id: "run-prev", agencyId: "agency-1", creatorId: "creator-1", status: "PUBLISHED", publicationGeneration: 1, publicationStatus: "COMPLETE" };
+  const state = { creatorId: "creator-1", agencyId: "agency-1", currentRunId: "run-prev", status: "READY", scanEveryDays: 7, publicationGeneration: 2, publishedGeneration: 1 };
   const job = { id: "job-1", status: "SCHEDULED", leaseUntil: null, leaseRevision: 0, params: { scanRunId: "run-current", scanEveryDays: 7 } };
   let txAttempts = 0;
   const projectedChunkSizes = [];
@@ -77,7 +77,7 @@ function buildFixture({ failTransactionAttempt = null } = {}) {
     subscriberScanRun: {
       findUnique: async ({ where }) => where.id === run.id ? clone(run) : (where.id === previousRun.id ? clone(previousRun) : null),
       findMany: async () => {
-        const incomplete = run.status === "RUNNING" && run.hasMore === false && run.fanProjectionStatus === "COMPLETE" && run.publicationStatus !== "COMPLETE";
+        const incomplete = run.hasMore === false && run.fanProjectionStatus === "COMPLETE" && run.publicationStatus !== "COMPLETE";
         const reconcileDebt = ["PUBLISHED", "SUPERSEDED"].includes(run.status) && run.publicationStatus === "COMPLETE" && run.publicationJobReconciledAt == null;
         return incomplete || reconcileDebt ? [clone(run)] : [];
       },
@@ -98,6 +98,13 @@ function buildFixture({ failTransactionAttempt = null } = {}) {
     },
     subscriberDirectoryState: {
       findUnique: async () => clone(state),
+      updateMany: async ({ where, data }) => {
+        if (where.creatorId && where.creatorId !== state.creatorId) return { count: 0 };
+        if (where.publicationGeneration !== undefined && Number(where.publicationGeneration) !== Number(state.publicationGeneration)) return { count: 0 };
+        if (where.publishedGeneration?.lt !== undefined && !(Number(state.publishedGeneration) < Number(where.publishedGeneration.lt))) return { count: 0 };
+        applyData(state, data);
+        return { count: 1 };
+      },
       upsert: async ({ create, update }) => {
         if (state.currentRunId) applyData(state, update);
         else applyData(state, create);
@@ -320,6 +327,183 @@ test("PUBLISHED Subscriber snapshot survives crash-before-job-DONE and recovery 
     assert.equal(followBackPlans, 1, "planning must not replay after marker commit");
     assert.equal(followAutomationPlans, 1);
     assert.equal(bumpPlans, 1);
+  } finally {
+    delete require.cache[servicePath];
+    for (const restore of restores.reverse()) restore();
+  }
+});
+
+test("A21 terminal failed Subscriber job cannot open a second generation while durable publication debt exists", async () => {
+  const restores = [];
+  const debtRun = {
+    id: "run-debt", agencyId: "agency-1", creatorId: "creator-1", jobId: "job-debt",
+    status: "FAILED", hasMore: false, fanProjectionStatus: "COMPLETE",
+    publicationStatus: "CURRENT", publicationGeneration: 7, updatedAt: new Date("2026-09-20T18:00:00.000Z"),
+  };
+  const failedJob = { id: "job-debt", status: "FAILED" };
+  let createdRuns = 0;
+  let plannedJobs = 0;
+  const tx = {
+    $executeRawUnsafe: async () => 0,
+    subscriberScanRun: {
+      findFirst: async ({ where }) => {
+        if (where?.publicationStatus?.in) return clone(debtRun);
+        return null;
+      },
+      create: async () => { createdRuns += 1; throw new Error("must not create a second generation"); },
+    },
+    subscriberDirectoryState: { findUnique: async () => ({ publicationGeneration: 7, publishedGeneration: 6 }) },
+    jobInstance: { findUnique: async () => clone(failedJob) },
+  };
+  const prismaMock = {
+    $transaction: async (work) => work(tx),
+    subscriberScanRun: { findFirst: async () => clone(debtRun) },
+    jobInstance: { findUnique: async () => clone(failedJob) },
+  };
+  restores.push(cacheModule("../prisma", prismaMock));
+  restores.push(cacheModule("./follow-back-service", {
+    projectFollowBackProjectionChunk: async () => ({}), staleFollowBackProjectionFans: async () => ({}), ensureAutomaticFollowBack: async () => ({}),
+  }));
+  restores.push(cacheModule("./follow-automation-service", {
+    projectFollowAutomationProjectionChunk: async () => ({}), staleFollowAutomationProjectionFans: async () => ({}), ensureAutomaticFollowAutomation: async () => ({}),
+  }));
+  restores.push(cacheModule("./bump-service", { ensureAutomaticBumps: async () => ({}) }));
+  restores.push(cacheModule("./fan-data-authority-service", { projectSubscriberDirectoryItems: async () => ({}), readFanCurrent: async () => null }));
+  restores.push(cacheModule("./job-planning-repository", {
+    createPlannedJob: async () => { plannedJobs += 1; throw new Error("must not plan a second generation"); },
+    publishPlannedJobAvailable: () => { throw new Error("must not publish a second generation"); },
+  }));
+  restores.push(cacheModule("./fan-observation-token-service", { consumeFanObservationToken: async () => null }));
+  restores.push(cacheModule("./db-time-authority-service", { dbAuthorityNow: async () => new Date("2026-09-20T18:00:00.000Z") }));
+  restores.push(cacheModule("./automation-write-commit-fence-service", { lockAutomationWriteCommitFence: async () => null }));
+  const servicePath = require.resolve("./subscriber-directory-service", { paths: [__dirname] });
+  delete require.cache[servicePath];
+  try {
+    const service = require(servicePath);
+    const result = await service.scheduleSubscriberScan({ agencyId: "agency-1", creatorId: "creator-1", manual: true, force: true });
+    assert.equal(result.created, false);
+    assert.equal(result.reason, "publication_recovery_in_progress");
+    assert.equal(result.run.id, "run-debt");
+    assert.equal(result.run.publicationGeneration, 7);
+    assert.equal(createdRuns, 0);
+    assert.equal(plannedJobs, 0);
+  } finally {
+    delete require.cache[servicePath];
+    for (const restore of restores.reverse()) restore();
+  }
+});
+
+test("A21 reverse FINALIZE ordering cannot let an older Subscriber generation replace a newer published generation", async () => {
+  const restores = [];
+  restores.push(cacheModule("../prisma", {}));
+  restores.push(cacheModule("./follow-back-service", {
+    projectFollowBackProjectionChunk: async () => ({}), staleFollowBackProjectionFans: async () => ({}), ensureAutomaticFollowBack: async () => ({}),
+  }));
+  restores.push(cacheModule("./follow-automation-service", {
+    projectFollowAutomationProjectionChunk: async () => ({}), staleFollowAutomationProjectionFans: async () => ({}), ensureAutomaticFollowAutomation: async () => ({}),
+  }));
+  restores.push(cacheModule("./bump-service", { ensureAutomaticBumps: async () => ({}) }));
+  restores.push(cacheModule("./fan-data-authority-service", { projectSubscriberDirectoryItems: async () => ({}), readFanCurrent: async () => null }));
+  restores.push(cacheModule("./job-planning-repository", { createPlannedJob: async () => null, publishPlannedJobAvailable: async () => null }));
+  restores.push(cacheModule("./fan-observation-token-service", { consumeFanObservationToken: async () => null }));
+  restores.push(cacheModule("./db-time-authority-service", { dbAuthorityNow: async () => new Date("2026-09-20T18:00:00.000Z") }));
+  restores.push(cacheModule("./automation-write-commit-fence-service", { lockAutomationWriteCommitFence: async () => null }));
+  const servicePath = require.resolve("./subscriber-directory-service", { paths: [__dirname] });
+  delete require.cache[servicePath];
+  try {
+    const service = require(servicePath);
+    const runs = new Map([
+      ["run-old", {
+        id: "run-old", agencyId: "agency-1", creatorId: "creator-1", status: "FAILED", hasMore: false,
+        scannedCount: 0, hiddenCount: 0, fanProjectionStatus: "COMPLETE", fanProjectionCursorOffset: 0, fanProjectionCount: 0,
+        publicationStatus: "FINALIZE", publicationGeneration: 1, publicationPreviousRunId: null,
+        publicationAddedCount: 0, publicationChangedCount: 0, publicationDisappearedCount: 0, summary: {},
+      }],
+      ["run-new", {
+        id: "run-new", agencyId: "agency-1", creatorId: "creator-1", status: "RUNNING", hasMore: false,
+        scannedCount: 0, hiddenCount: 0, fanProjectionStatus: "COMPLETE", fanProjectionCursorOffset: 0, fanProjectionCount: 0,
+        publicationStatus: "FINALIZE", publicationGeneration: 2, publicationPreviousRunId: null,
+        publicationAddedCount: 0, publicationChangedCount: 0, publicationDisappearedCount: 0, summary: {},
+      }],
+    ]);
+    const state = { creatorId: "creator-1", currentRunId: null, publicationGeneration: 2, publishedGeneration: 0 };
+    const db = {
+      subscriberScanRun: {
+        findUnique: async ({ where }) => clone(runs.get(where.id) || null),
+        update: async ({ where, data }) => { const row = runs.get(where.id); applyData(row, data); return clone(row); },
+        updateMany: async ({ where, data }) => {
+          const row = runs.get(where.id);
+          if (!row) return { count: 0 };
+          if (where.publicationGeneration !== undefined && Number(row.publicationGeneration) !== Number(where.publicationGeneration)) return { count: 0 };
+          if (where.publicationStatus && row.publicationStatus !== where.publicationStatus) return { count: 0 };
+          if (where.status && typeof where.status === "string" && row.status !== where.status) return { count: 0 };
+          if (where.publicationGeneration?.lt !== undefined && !(Number(row.publicationGeneration) < Number(where.publicationGeneration.lt))) return { count: 0 };
+          applyData(row, data); return { count: 1 };
+        },
+      },
+      subscriberDirectoryState: {
+        findUnique: async () => clone(state),
+        updateMany: async ({ where, data }) => {
+          if (Number(where.publicationGeneration) !== Number(state.publicationGeneration)) return { count: 0 };
+          if (!(Number(state.publishedGeneration) < Number(where.publishedGeneration.lt))) return { count: 0 };
+          applyData(state, data); return { count: 1 };
+        },
+      },
+    };
+    const newer = await service._test.advanceSubscriberPublication(db, { runId: "run-new", jobId: "job-new", scanEveryDays: 7 });
+    assert.equal(newer.complete, true);
+    assert.equal(state.currentRunId, "run-new");
+    assert.equal(state.publishedGeneration, 2);
+    assert.equal(runs.get("run-new").status, "PUBLISHED");
+
+    const older = await service._test.advanceSubscriberPublication(db, { runId: "run-old", jobId: "job-old", scanEveryDays: 7 });
+    assert.equal(older.complete, true);
+    assert.equal(runs.get("run-old").status, "SUPERSEDED");
+    assert.equal(runs.get("run-old").publicationStatus, "COMPLETE");
+    assert.equal(state.currentRunId, "run-new");
+    assert.equal(state.publishedGeneration, 2);
+  } finally {
+    delete require.cache[servicePath];
+    for (const restore of restores.reverse()) restore();
+  }
+});
+
+test("A21 Subscriber publication resumes cleanly after a process boundary at every durable phase transaction", async () => {
+  const restores = [];
+  restores.push(cacheModule("../prisma", {}));
+  restores.push(cacheModule("./follow-back-service", {
+    projectFollowBackProjectionChunk: async () => ({ ok: true }), staleFollowBackProjectionFans: async () => ({ ok: true }), ensureAutomaticFollowBack: async () => ({ ok: true, created: false }),
+  }));
+  restores.push(cacheModule("./follow-automation-service", {
+    projectFollowAutomationProjectionChunk: async () => ({ ok: true }), staleFollowAutomationProjectionFans: async () => ({ ok: true }), ensureAutomaticFollowAutomation: async () => ({ ok: true, created: false }),
+  }));
+  restores.push(cacheModule("./bump-service", { ensureAutomaticBumps: async () => ({ ok: true, created: false, sources: [] }) }));
+  restores.push(cacheModule("./fan-data-authority-service", { projectSubscriberDirectoryItems: async () => ({ projected: 0 }), readFanCurrent: async () => null }));
+  restores.push(cacheModule("./job-planning-repository", { createPlannedJob: async () => null, publishPlannedJobAvailable: async () => null }));
+  restores.push(cacheModule("./fan-observation-token-service", { consumeFanObservationToken: async () => null }));
+  restores.push(cacheModule("./db-time-authority-service", { dbAuthorityNow: async () => new Date("2026-09-20T18:00:00.000Z") }));
+  restores.push(cacheModule("./automation-write-commit-fence-service", { lockAutomationWriteCommitFence: async () => null }));
+  const servicePath = require.resolve("./subscriber-directory-service", { paths: [__dirname] });
+  delete require.cache[servicePath];
+  try {
+    const service = require(servicePath);
+    for (const failAt of [1, 2, 3, 4, 5, 6, 7, 8]) {
+      const fx = buildFixture({ failTransactionAttempt: failAt });
+      await assert.rejects(
+        () => service._test.publishRun(fx.db, fx.run, { jobId: "job-1", scanEveryDays: 7 }),
+        (error) => error?.code === "SIMULATED_RESTART",
+        `expected process boundary at publication transaction ${failAt}`,
+      );
+      fx.clearFailure();
+      const summary = await service._test.publishRun(fx.db, fx.run, { jobId: "job-1", scanEveryDays: 7 });
+      assert.equal(fx.run.status, "PUBLISHED", `failAt=${failAt}`);
+      assert.equal(fx.run.publicationStatus, "COMPLETE", `failAt=${failAt}`);
+      assert.equal(fx.state.currentRunId, "run-current", `failAt=${failAt}`);
+      assert.equal(fx.state.publishedGeneration, 2, `failAt=${failAt}`);
+      assert.equal(summary.addedCount, 200, `failAt=${failAt}`);
+      assert.equal(summary.changedCount, 100, `failAt=${failAt}`);
+      assert.equal(summary.disappearedCount, 100, `failAt=${failAt}`);
+    }
   } finally {
     delete require.cache[servicePath];
     for (const restore of restores.reverse()) restore();

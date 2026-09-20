@@ -11,7 +11,7 @@ const ROOT = path.resolve(__dirname, "../..");
 const PRISMA_DIR = path.join(ROOT, "prisma");
 const A13_CUTOFF = "20260919010000_phase3_provider_gate_durable_waiter_fairness_v1";
 const PRE_A20_2_CUTOFF = "20260919113000_phase3_campaign_refresh_recovery_status_v1";
-const EXPECTED_PROOF_TEST_COUNT = 38;
+const EXPECTED_PROOF_TEST_COUNT = 40;
 const COVERAGE_PREFLIGHT = path.join(ROOT, "scripts/database/phase3-campaign-coverage-generation-online-preflight.js");
 const PREFLIGHT_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-concurrency.js");
 const PREFLIGHT_RUNTIME_AVAILABILITY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-runtime-availability.js");
@@ -143,7 +143,16 @@ function assertNodeProof(stdout, label) {
       || subscriberReconcilePlan?.index !== "SubscriberScanRun_publication_job_reconcile_idx") {
     fail(`${label} invalid FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF: ${JSON.stringify(subscriberReconcilePlan)}`);
   }
-  return { ...summary, ...metrics, hotPlan, subscriberReconcilePlan };
+  const subscriberCursorPlans = parseJsonLines(stdout, "FINAL_SUBSCRIBER_CURSOR_PLAN_PROOF");
+  if (subscriberCursorPlans.length !== 1) fail(`${label} expected one FINAL_SUBSCRIBER_CURSOR_PLAN_PROOF marker, got ${subscriberCursorPlans.length}`);
+  const subscriberCursorPlan = subscriberCursorPlans[0] || null;
+  if (Number(subscriberCursorPlan?.historyRuns) !== 42 || Number(subscriberCursorPlan?.rowsPerRun) !== 1000
+      || Number(subscriberCursorPlan?.totalRows) !== 42000
+      || subscriberCursorPlan?.index !== "SubscriberScanItem_run_id_cursor_idx"
+      || !["CURRENT", "PREVIOUS"].every((phase) => Array.isArray(subscriberCursorPlan?.phases) && subscriberCursorPlan.phases.includes(phase))) {
+    fail(`${label} invalid FINAL_SUBSCRIBER_CURSOR_PLAN_PROOF: ${JSON.stringify(subscriberCursorPlan)}`);
+  }
+  return { ...summary, ...metrics, hotPlan, subscriberReconcilePlan, subscriberCursorPlan };
 }
 function runProofTests(label, databaseUrl) {
   const out = run(label, process.execPath, ["--test", ...PROOF_TESTS], { DATABASE_URL: databaseUrl, ONLINOD_POSTGRES_INTEGRATION: "1" });

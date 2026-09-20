@@ -68,6 +68,7 @@ test("Billing and legacy Analytics have no active snapshot generation reader/wri
   const analyticsService = source("src/services/analytics-snapshot-service.js");
   const schema = source("prisma/schema.prisma");
   const migration = source("prisma/migrations/20260920123000_phase3_analytics_final_authority_cutover_v1/migration.sql");
+  const a21Migration = source("prisma/migrations/20260920223000_phase3_analytics_a21_publication_generation_cursor_scale_v1/migration.sql");
   const policy = source("docs/PHASE3_ANALYTICS_LEGACY_SNAPSHOT_RETIREMENT.md");
   const legacyPreflight = source("scripts/database/phase3-analytics-legacy-snapshot-online-preflight.js");
   const legacyPostflight = source("scripts/database/phase3-analytics-legacy-snapshot-online-postflight.js");
@@ -146,7 +147,7 @@ test("Subscriber publication is restartable bounded work outside generic complet
   assert.match(subscriber, /publicationStatus[\s\S]*PENDING[\s\S]*CURRENT[\s\S]*PREVIOUS[\s\S]*FINALIZE[\s\S]*COMPLETE/);
   assert.match(subscriber, /publicationCursorId/);
   assert.match(subscriber, /publicationTransaction\(db/);
-  assert.match(subscriber, /publicationTopology:\s*"durable_chunked_v1"/);
+  assert.match(subscriber, /publicationTopology:\s*"durable_chunked_generation_v2"/);
   assert.match(schema, /publicationStatus\s+String\s+@default\("PENDING"\)/);
   assert.match(schema, /publicationCursorId\s+String\?/);
   const subscriberCompletion = leases.slice(leases.indexOf('if (job.jobKey === "subscriber_directory_scan")'), leases.indexOf('if (["fetch_earnings"'));
@@ -157,7 +158,8 @@ test("Subscriber publication is restartable bounded work outside generic complet
   const fail = leases.slice(failStart, leases.indexOf("async function releaseJob(", failStart));
   assert.match(fail, /publicationRecoveryPending/);
   assert.match(fail, /recordJobFailure\(\{ db: prisma/);
-  assert.match(subscriber, /async function recoverSubscriberPublicationDebt[\s\S]*publicationStatus:\s*\{ in:\s*\["PENDING", "CURRENT", "PREVIOUS", "FINALIZE"\]/);
+  assert.match(subscriber, /subscriberPublicationDebtWhere[\s\S]*fanProjectionStatus:\s*"COMPLETE"[\s\S]*publicationStatus:\s*\{ in:\s*\[\.\.\.SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES\]/);
+  assert.match(subscriber, /async function recoverSubscriberPublicationDebt[\s\S]*SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES/);
   assert.match(subscriber, /reconcileRecoveredSubscriberPublicationJob[\s\S]*status:\s*"DONE"/);
   assert.match(subscriber, /publicationJobReconciledAt/);
   assert.match(subscriber, /status:\s*\{ in:\s*\["PUBLISHED", "SUPERSEDED"\] \}[\s\S]*publicationStatus:\s*"COMPLETE"[\s\S]*publicationJobReconciledAt:\s*null/);
@@ -173,6 +175,26 @@ test("Campaign hot queries have predicate/order-specific indexes and claim SQL m
   assert.match(migration, /CreatorFanRefreshDemand_canonical_heal_idx[\s\S]*status" IN \('QUEUED', 'FAILED'\)/);
   assert.match(migration, /CampaignFanRefreshPromotionSignal_claim_due_idx[\s\S]*COALESCE\("claimUntil", '-infinity'::timestamp\)/);
   assert.match(queue, /COALESCE\(s\."claimUntil", '-infinity'::timestamp\) <= \$1[\s\S]*ORDER BY s\."dueAt" ASC, s\."creatorId" ASC/);
+});
+
+test("A21 clean bootstrap, generation CAS and exact Subscriber cursor scale are source-enforced", () => {
+  const prerequisite = source("prisma/migrations/20260616_aaa_bump_delivery_claim_prerequisite_v27/migration.sql");
+  const a21 = source("prisma/migrations/20260920223000_phase3_analytics_a21_publication_generation_cursor_scale_v1/migration.sql");
+  const subscriber = source("src/services/subscriber-directory-service.js");
+  const fence = source("src/services/subscriber-publication-fence-service.js");
+  const postflight = source("scripts/database/phase3-subscriber-publication-schema-online-postflight.js");
+  assert.match(prerequisite, /ADD COLUMN IF NOT EXISTS "cancelAt"[\s\S]*"claimedByDeviceId"[\s\S]*"claimedAt"[\s\S]*"claimUntil"/);
+  assert.ok("20260616_aaa_bump_delivery_claim_prerequisite_v27" < "20260616_bump_cancelat_backfill_v26");
+  assert.match(a21, /ROW_NUMBER\(\) OVER[\s\S]*PARTITION BY "creatorId"/);
+  assert.match(a21, /SubscriberScanItem_run_id_cursor_idx[\s\S]*"runId", "id"/);
+  assert.match(a21, /SubscriberScanRun_publication_debt_idx/);
+  assert.match(subscriber, /lockSubscriberPublicationCreator[\s\S]*pg_advisory_xact_lock/);
+  assert.match(subscriber, /publication_recovery_in_progress/);
+  assert.match(subscriber, /publishedGeneration:\s*\{ lt: generation \}/);
+  assert.match(subscriber, /SUBSCRIBER_PUBLICATION_GENERATION_CAS_LOST/);
+  assert.doesNotMatch(fence, /status:\s*"RUNNING"/);
+  assert.match(postflight, /SubscriberScanItem_run_id_cursor_idx/);
+  assert.match(postflight, /publicationGeneration[\s\S]*publishedGeneration/);
 });
 
 test("index lifecycle contract requires distinct sessions, explicit ReadCommitted owner and bounded worker connection", async () => {
@@ -201,6 +223,7 @@ test("index lifecycle contract requires distinct sessions, explicit ReadCommitte
 test("final migration carries bounded subscriber cursor, durable signal lease and retired legacy generations", () => {
   const schema = source("prisma/schema.prisma");
   const migration = source("prisma/migrations/20260920123000_phase3_analytics_final_authority_cutover_v1/migration.sql");
+  const a21Migration = source("prisma/migrations/20260920223000_phase3_analytics_a21_publication_generation_cursor_scale_v1/migration.sql");
   assert.match(schema, /fanProjectionCursorOffset\s+Int/);
   assert.match(schema, /publicationStatus\s+String\s+@default\("PENDING"\)/);
   assert.match(schema, /publicationCursorId\s+String\?/);
@@ -215,13 +238,17 @@ test("final migration carries bounded subscriber cursor, durable signal lease an
   assert.match(migration, /SubscriberScanRun_publication_job_reconcile_idx/);
   assert.match(migration, /publicationJobReconciledAt/);
   assert.match(migration, /CUTOVER_BACKFILL/);
+  assert.match(a21Migration, /publicationGeneration/);
+  assert.match(a21Migration, /publishedGeneration/);
+  assert.match(a21Migration, /SubscriberScanItem_run_id_cursor_idx/);
+  assert.match(a21Migration, /SubscriberScanRun_publication_debt_idx/);
 });
 
 
 test("final physical proof pack is rewritten for the final authority cut and persists proof JSON", () => {
   const proof = source("scripts/audit/phase3-a20-postgres-proof.js");
   const finalPg = source("src/services/phase3-analytics-final-authority-cutover.integration.test.js");
-  assert.match(proof, /EXPECTED_PROOF_TEST_COUNT\s*=\s*38/);
+  assert.match(proof, /EXPECTED_PROOF_TEST_COUNT\s*=\s*40/);
   assert.match(proof, /phase3-analytics-final-authority-cutover\.integration\.test\.js/);
   assert.match(proof, /artifacts[\s\S]*audit[\s\S]*phase3-a20-postgres-proof\.json/);
   assert.match(proof, /physical proof JSON was not persisted/);
@@ -231,6 +258,8 @@ test("final physical proof pack is rewritten for the final authority cut and per
   assert.match(finalPg, /FINAL_MANUAL_MAINTENANCE_OVERLAP_PASS/);
   assert.match(finalPg, /FINAL_TWO_REPLICA_PROMOTION_SIGNAL_PASS/);
   assert.match(finalPg, /FINAL_CUTOVER_CANONICAL_DEBT_HEAL_PASS/);
+  assert.match(finalPg, /FINAL_SUBSCRIBER_CURSOR_PLAN_PROOF/);
+  assert.match(finalPg, /two Subscriber recovery replicas serialize one FAILED publication generation/);
 });
 
 

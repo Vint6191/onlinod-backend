@@ -85,7 +85,7 @@ test("A20.6 PostgreSQL proof is zero-skip gated, persists real timing metrics, a
   const seeded = source("scripts/audit/phase3-a20-seeded-rolling-coverage.js");
   const terminal = source("src/services/phase3-campaign-closure-a20-5.integration.test.js");
 
-  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 38/);
+  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 40/);
   assert.match(runner, /summary\.skipped !== 0/);
   assert.match(runner, /summary\.fail !== 0/);
   assert.match(runner, /A20_4_POSTGRES_HEALING_SCALE/);

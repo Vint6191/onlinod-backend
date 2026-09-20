@@ -63,6 +63,9 @@ test("all subscriber-derived planners and pre-write validators cross the publica
   assert.match(fanCurrent, /validateFollowBackDeliveryCurrent[\s\S]*validateSubscriberPublicationIdle[\s\S]*followBackCandidate\.findFirst/);
   assert.match(bumps, /\["hidden_online", "paid_subscriber", "free_subscriber"\][\s\S]*assertSubscriberPublicationIdle/);
   assert.match(bumps, /validateBumpDelivery[\s\S]*validateSubscriberPublicationIdle[\s\S]*automationBumpFanState\.findUnique/);
-  assert.match(subscriber, /publicationTransaction[\s\S]*lockAutomationWriteCommitFence[\s\S]*advanceSubscriberPublication/);
+  assert.match(subscriber, /publicationTransaction[\s\S]*lockAutomationWriteCommitFence[\s\S]*lockSubscriberPublicationCreator[\s\S]*advanceSubscriberPublication/);
+  const fence = read("subscriber-publication-fence-service.js");
+  assert.doesNotMatch(fence, /status:\s*["']RUNNING["']/);
+  assert.match(fence, /hasMore:\s*false[\s\S]*fanProjectionStatus:\s*["']COMPLETE["'][\s\S]*publicationStatus/);
   assert.match(action, /validation\?\.terminal === false[\s\S]*error\.retryable = true[\s\S]*error\.retryAt/);
 });
