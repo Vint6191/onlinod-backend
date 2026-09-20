@@ -52,8 +52,8 @@ test("INT5.5C-2 presence ingest chunks all canonical activity observations at th
 
 test("INT5.5C-2 generic projector has an explicit max contract rather than slice-based loss", () => {
   const authority = read("services/fan-data-authority-service.js");
-  const start = authority.indexOf("async function projectFanObservationBatch");
-  const end = authority.indexOf("\nasync function applyFanDataPointRefreshChunk", start);
+  const start = authority.indexOf("async function commitFanFacts");
+  const end = authority.indexOf("\nasync function projectFanObservationBatch", start);
   const fn = authority.slice(start, end);
   assert.match(fn, /inputItems\.length > FAN_DATA_OBSERVATION_BATCH_MAX/);
   assert.match(fn, /FAN_DATA_OBSERVATION_BATCH_TOO_LARGE/);

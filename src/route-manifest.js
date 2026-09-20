@@ -44,7 +44,7 @@ const ROUTE_MANIFEST = Object.freeze([
   route("/api/jobs", ROUTE_CLASS.DEVICE, "routes/jobs.js", "authenticated device work authority"),
   route("/api/of-request-gate", ROUTE_CLASS.DEVICE, "routes/of-request-gate.js", "authenticated device request-gate authority"),
   route("/api/telemetry", ROUTE_CLASS.DEVICE, "routes/telemetry.js", "authenticated telemetry/device provenance"),
-  route("/api/analytics", ROUTE_CLASS.LEGACY_GONE, "routes/analytics.js", "410 tombstone; AnalyticsSnapshot is non-authoritative archive", { replacement: "/api/home + /api/stats" }),
+  route("/api/analytics", ROUTE_CLASS.LEGACY_GONE, "server.js:createLegacyGoneRouter", "410 tombstone; legacy analytics snapshot generations retired", { replacement: "/api/home + /api/stats" }),
   route("/api/traffic", ROUTE_CLASS.CREATOR_DEVICE, "routes/traffic.js", "creator scope + traffic.* permissions; device binding on machine ingress"),
   route("/api/subscribers", ROUTE_CLASS.CREATOR, "routes/subscribers.js", "creator scope + automation.manage for mutations"),
   route("/api/fan-data", ROUTE_CLASS.CREATOR, "routes/fan-data.js", "canonical creator scope; /observations additionally requires device-bound trusted producer ingress"),

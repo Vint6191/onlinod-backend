@@ -11,7 +11,7 @@ const ROOT = path.resolve(__dirname, "../..");
 const PRISMA_DIR = path.join(ROOT, "prisma");
 const A13_CUTOFF = "20260919010000_phase3_provider_gate_durable_waiter_fairness_v1";
 const PRE_A20_2_CUTOFF = "20260919113000_phase3_campaign_refresh_recovery_status_v1";
-const EXPECTED_PROOF_TEST_COUNT = 28;
+const EXPECTED_PROOF_TEST_COUNT = 34;
 const COVERAGE_PREFLIGHT = path.join(ROOT, "scripts/database/phase3-campaign-coverage-generation-online-preflight.js");
 const PREFLIGHT_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-concurrency.js");
 const PREFLIGHT_RUNTIME_AVAILABILITY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-runtime-availability.js");
@@ -27,6 +27,7 @@ const PROOF_TESTS = [
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-5.integration.test.js"),
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-11.integration.test.js"),
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-12.integration.test.js"),
+  path.join(ROOT, "src/services/phase3-analytics-final-authority-cutover.integration.test.js"),
 ];
 
 function fail(message, code = 3) {
@@ -228,13 +229,12 @@ function main() {
       preflightRuntimeAvailability: { pass: true, durationMs: runtimeAvailability.durationMs },
       cleanProof, rollingProof, seededProof, migrationMetrics: migrationMetric,
     };
-    const output = String(process.env.ONLINOD_AUDIT_PROOF_OUTPUT || "").trim();
-    if (output) {
-      const resolved = path.resolve(output);
-      fs.mkdirSync(path.dirname(resolved), { recursive: true });
-      fs.writeFileSync(resolved, JSON.stringify(proof, null, 2) + "\n", "utf8");
-      console.log(`# PHASE3_A20_POSTGRES_PROOF_FILE ${resolved}`);
-    }
+    const output = String(process.env.ONLINOD_AUDIT_PROOF_OUTPUT || path.join(ROOT, "artifacts", "audit", "phase3-a20-postgres-proof.json")).trim();
+    const resolved = path.resolve(output);
+    fs.mkdirSync(path.dirname(resolved), { recursive: true });
+    fs.writeFileSync(resolved, JSON.stringify(proof, null, 2) + "\n", "utf8");
+    if (!fs.existsSync(resolved) || fs.statSync(resolved).size <= 0) fail("physical proof JSON was not persisted");
+    console.log(`# PHASE3_A20_POSTGRES_PROOF_FILE ${resolved}`);
     console.log(`# PHASE3_A20_POSTGRES_PROOF_JSON ${JSON.stringify(proof)}`);
   } finally {
     dropSchema(cli, audit, cleanSchema, cleanSchemaFile);

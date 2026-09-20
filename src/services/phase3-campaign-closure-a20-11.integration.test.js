@@ -9,6 +9,7 @@ const {
   recoverFailedCampaignFanRefreshDemands,
   reconcileCampaignFanRefreshDemandsFromCanonicalObservations,
 } = require("./campaign-fan-refresh-queue-service");
+const { acquireCampaignTransactionLock } = require("./campaign-transaction-lock-service");
 
 function scope(prefix) {
   const nonce = `${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}`;
@@ -116,7 +117,7 @@ async function assertBlocked(promise, label) {
   let settled = false;
   promise.finally(() => { settled = true; }).catch(() => {});
   await new Promise((resolve) => setTimeout(resolve, 300));
-  assert.equal(settled, false, `${label} must be waiting on demand-first lock order before the owner reaches collection state`);
+  assert.equal(settled, false, `${label} must be waiting on the creator Campaign authority held before demand/work/state locks`);
 }
 
 async function startNewGeneration(db, s, suffix) {
@@ -148,6 +149,7 @@ async function seedOldGeneration(db, s) {
 async function raceAgainstNewGeneration({ owner, contender, s, ownerAction, suffix }) {
   let contenderPromise;
   await owner.$transaction(async (tx) => {
+    await acquireCampaignTransactionLock(tx, s.creatorId);
     await lockDemand(tx, s);
     contenderPromise = startNewGeneration(contender, s, suffix);
     await assertBlocked(contenderPromise, `A20.11 ${suffix} contender`);
@@ -156,7 +158,7 @@ async function raceAgainstNewGeneration({ owner, contender, s, ownerAction, suff
   return contenderPromise;
 }
 
-test("A20.11 PostgreSQL: terminal transition and new Campaign generation share demand->work->state lock order", { skip: !enabled, timeout: 120_000 }, async () => {
+test("A20.11 PostgreSQL: terminal transition and new Campaign generation share Campaign->demand->work->state lock order", { skip: !enabled, timeout: 120_000 }, async () => {
   const { PrismaClient } = require("@prisma/client");
   const owner = new PrismaClient();
   const contender = new PrismaClient();

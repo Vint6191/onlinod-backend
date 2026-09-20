@@ -21,24 +21,6 @@ async function acquireCampaignTransactionLock(db, creatorId) {
   return { key, adapterFallback: false };
 }
 
-async function acquireCampaignTransactionLocks(db, creatorIds) {
-  const keys = [...new Set((Array.isArray(creatorIds) ? creatorIds : [])
-    .map((creatorId) => campaignTransactionLockKey(creatorId)))]
-    .sort();
-  if (!keys.length) return { keys: [], adapterFallback: true };
-  if (typeof db?.$executeRawUnsafe !== "function") return { keys, adapterFallback: true };
-  await db.$executeRawUnsafe(`
-    WITH ordered_scope_keys AS MATERIALIZED (
-      SELECT scope_key
-      FROM unnest($1::text[]) AS candidate(scope_key)
-      ORDER BY scope_key ASC
-    )
-    SELECT pg_advisory_xact_lock(hashtext(scope_key))
-    FROM ordered_scope_keys
-  `, keys);
-  return { keys, adapterFallback: false };
-}
-
 async function withCampaignTransactionLock({ db, creatorId, work, options = undefined } = {}) {
   if (typeof work !== "function") throw new TypeError("Campaign transaction lock requires work callback");
   const key = campaignTransactionLockKey(creatorId);
@@ -50,6 +32,5 @@ module.exports = {
   CAMPAIGN_TRANSACTION_LOCK_NAMESPACE,
   campaignTransactionLockKey,
   acquireCampaignTransactionLock,
-  acquireCampaignTransactionLocks,
   withCampaignTransactionLock,
 };

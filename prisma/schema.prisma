@@ -289,8 +289,6 @@ model Agency {
   roleOverrides          AgencyRoleOverride[]
   subPermissionOverrides AgencySubPermissionOverride[]
   invitations            AgencyInvitation[]
-  earningsSnapshots  CreatorEarningsSnapshot[]
-  campaignsSnapshots CreatorCampaignsSnapshot[]
   jobs               JobInstance[]
   deviceCreatorBindings DeviceCreatorBinding[]
   teamActivityEvents TeamActivityEvent[]
@@ -309,7 +307,6 @@ model Agency {
   teamMoneyLifetimeRollups TeamMoneyLifetimeRollup[]
   teamMoneyRollupContributions TeamMoneyRollupContribution[]
   teamShifts TeamShift[]
-  analyticsSnapshots AnalyticsSnapshot[]
   workspaceSettings WorkspaceSetting[]
   moduleSettings ModuleSetting[]
   messageTemplateGroups MessageTemplateGroup[]
@@ -517,8 +514,6 @@ model CreatorAccount {
   cryptoDeviceKeyWraps CreatorDeviceKeyWrap[]
   networkProfile CreatorNetworkProfile?
   ownedProxyEndpoint AgencyProxyEndpoint? @relation("AgencyProxyOwnerCreator")
-  earningsSnapshots  CreatorEarningsSnapshot[]
-  campaignsSnapshot  CreatorCampaignsSnapshot?
   jobs               JobInstance[]
   deviceCreatorBindings DeviceCreatorBinding[]
   teamActivityEvents TeamActivityEvent[]
@@ -555,6 +550,7 @@ model CreatorAccount {
   hiddenOnlineUsers HiddenOnlineUser[]
   subscriberScanRuns SubscriberScanRun[]
   subscriberDirectoryStates SubscriberDirectoryState[]
+  campaignFanRefreshPromotionSignal CampaignFanRefreshPromotionSignal?
   followBackTasks FollowBackTask[]
   vaultPurchaseMessages VaultPurchaseMessage[]
   vaultMediaSales VaultMediaSale[]
@@ -2039,6 +2035,25 @@ model CreatorFinancialCollectionState {
 }
 
 
+model CampaignFanRefreshPromotionSignal {
+  id         String   @id @default(cuid())
+  agencyId   String
+  creatorId  String   @unique
+  dueAt      DateTime @default(now())
+  reason     String   @default("QUEUED_DEBT") @db.VarChar(64)
+  revision   Int      @default(1)
+  attempts   Int      @default(0)
+  claimToken String?  @db.VarChar(120)
+  claimUntil DateTime?
+  lastError  String?  @db.VarChar(1000)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+
+  @@index([dueAt, claimUntil, creatorId], map: "CampaignFanRefreshPromotionSignal_due_claim_creator_idx")
+}
+
 model CreatorFanRefreshDemand {
   id                        String   @id @default(cuid())
   agencyId                  String
@@ -3195,58 +3210,6 @@ model CreatorFanLocalCoverage {
   @@index([deviceId, lastVerifiedAt])
 }
 
-model CreatorEarningsSnapshot {
-  id                 String    @id @default(cuid())
-  creatorId          String
-  agencyId           String
-  rangeKey           String
-  rangeStartAt       DateTime?
-  rangeEndAt         DateTime?
-  totalCents         BigInt    @default(0)
-  grossCents         BigInt    @default(0)
-  deltaCents         BigInt    @default(0)
-  salesCount         Int       @default(0)
-  uniqueFans         Int       @default(0)
-  avgSaleCents       Int       @default(0)
-  fanLtvCents        Int       @default(0)
-  raw                Json?
-  capturedAt         DateTime  @default(now())
-  capturedByDeviceId String?
-  capturedByUserId   String?
-  createdAt          DateTime  @default(now())
-  updatedAt          DateTime  @updatedAt
-
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-
-  @@unique([creatorId, rangeKey])
-  @@index([agencyId])
-  @@index([capturedAt])
-}
-
-model CreatorCampaignsSnapshot {
-  id                 String   @id @default(cuid())
-  creatorId          String   @unique
-  agencyId           String
-  rangeKey           String   @default("7d")
-  campaigns          Json     @default("[]")
-  totalActive        Int      @default(0)
-  totalClaimers      Int      @default(0)
-  totalClicks        Int      @default(0)
-  capturedAt         DateTime @default(now())
-  capturedByDeviceId String?
-  capturedByUserId   String?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
-
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-
-  @@index([agencyId])
-}
-
-
-
 model JobInstance {
   id                String    @id @default(cuid())
   jobKey            String
@@ -3700,23 +3663,6 @@ model TeamShiftCreator {
   @@id([shiftId, creatorId])
   @@index([creatorId, shiftId])
   @@index([creatorRefId, shiftId])
-}
-
-model AnalyticsSnapshot {
-  id         String   @id @default(cuid())
-  agencyId   String
-  scope      String
-  rangeKey   String
-  payload    Json
-  capturedAt DateTime @default(now())
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-
-  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-
-  @@unique([agencyId, scope, rangeKey])
-  @@index([agencyId, scope])
-  @@index([capturedAt])
 }
 
 model WorkspaceSetting {
@@ -5006,6 +4952,11 @@ model SubscriberScanRun {
   completedAt     DateTime?
   publishedAt     DateTime?
   lastError       String?
+  fanProjectionStatus       String   @default("PENDING") // PENDING | PROJECTING | COMPLETE
+  fanProjectionCursorOffset Int      @default(0)
+  fanProjectionCount        Int      @default(0)
+  fanProjectionCompletedAt  DateTime?
+  fanProjectionLastError    String?  @db.VarChar(1000)
   summary         Json     @default("{}")
   createdByUserId String?
   createdAt       DateTime @default(now())
@@ -5044,6 +4995,7 @@ model SubscriberScanItem {
   agencyId              String
   creatorId             String
   fanId                 String
+  pageOffset            Int?
   dialogId              String?
   username              String?
   name                  String?
@@ -5078,6 +5030,7 @@ model SubscriberScanItem {
   run SubscriberScanRun @relation(fields: [runId], references: [id], onDelete: Cascade)
 
   @@unique([runId, fanId])
+  @@index([runId, pageOffset], map: "SubscriberScanItem_run_pageOffset_idx")
   @@index([runId, lastSeenIsNull])
   @@index([creatorId, fanId])
   @@index([agencyId, creatorId])

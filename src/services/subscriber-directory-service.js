@@ -5,7 +5,7 @@ const prisma = require("../prisma");
 const { refreshFollowBackProjection } = require("./follow-back-service");
 const { refreshFollowAutomationProjection } = require("./follow-automation-service");
 const { ensureAutomaticBumps } = require("./bump-service");
-const { projectSubscriberDirectoryRun, readFanCurrent } = require("./fan-data-authority-service");
+const { projectSubscriberDirectoryItems, readFanCurrent } = require("./fan-data-authority-service");
 const { createPlannedJob, publishPlannedJobAvailable } = require("./job-planning-repository");
 const { consumeFanObservationToken } = require("./fan-observation-token-service");
 
@@ -82,6 +82,11 @@ function runSummary(run) {
     completedAt: run.completedAt,
     publishedAt: run.publishedAt,
     lastError: run.lastError,
+    fanProjectionStatus: run.fanProjectionStatus || "PENDING",
+    fanProjectionCursorOffset: Number(run.fanProjectionCursorOffset || 0),
+    fanProjectionCount: Number(run.fanProjectionCount || 0),
+    fanProjectionCompletedAt: run.fanProjectionCompletedAt || null,
+    fanProjectionLastError: run.fanProjectionLastError || null,
     summary: run.summary || {},
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
@@ -340,6 +345,16 @@ async function scalarCount(db, sql, ...params) {
 
 async function publishRun(db, run, { jobId, scanEveryDays }) {
   const now = new Date();
+  const projectionStatus = String(run?.fanProjectionStatus || "PENDING");
+  const projectionCursorOffset = Number(run?.fanProjectionCursorOffset || 0);
+  const projectionCount = Number(run?.fanProjectionCount || 0);
+  const scannedCount = Number(run?.scannedCount || 0);
+  const expectedOffset = Number(run?.nextOffset || 0);
+  if (projectionStatus !== "COMPLETE" || projectionCursorOffset < expectedOffset || projectionCount < scannedCount) {
+    const error = new Error("Subscriber canonical FanData projection has not crossed the publish barrier");
+    error.code = "SUBSCRIBER_FAN_FACTS_PROJECTION_INCOMPLETE";
+    throw error;
+  }
   const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId: run.creatorId } });
   const previousRunId = state?.currentRunId && state.currentRunId !== run.id ? state.currentRunId : null;
   const totalCount = await db.subscriberScanItem.count({ where: { runId: run.id } });
@@ -383,6 +398,9 @@ async function publishRun(db, run, { jobId, scanEveryDays }) {
     disappearedCount,
     currentRunId: run.id,
     previousRunId,
+    fanProjectionStatus: projectionStatus,
+    fanProjectionCursorOffset: projectionCursorOffset,
+    fanProjectionCount: projectionCount,
   };
 
   await db.subscriberDirectoryState.upsert({
@@ -432,11 +450,7 @@ async function publishRun(db, run, { jobId, scanEveryDays }) {
     });
   }
 
-  // The immutable run is the bulk source observation. Publish it into the
-  // canonical fact projections before downstream operational read models.
-  const fanDataProjection = await projectSubscriberDirectoryRun(db, {
-    runId: run.id, agencyId: run.agencyId, creatorId: run.creatorId, sourceJobId: jobId,
-  });
+  const fanDataProjection = { projected: projectionCount, status: projectionStatus, topology: "page_commit_barrier" };
 
   // HiddenOnlineUser is a compact projection/override table. Existing ignored
   // and blocked choices are preserved while current candidates are refreshed.
@@ -530,6 +544,12 @@ async function applySubscriberScanChunk({
   // one-time. Detect an already committed page before attempting token consume.
   const existingPage = await db.subscriberScanPage.findUnique({ where: { runId_offset: { runId, offset } } });
   if (existingPage) {
+    const projectedThrough = Number(run.fanProjectionCursorOffset || 0);
+    if (!["PUBLISHED", "SUPERSEDED"].includes(run.status) && projectedThrough < Number(existingPage.nextOffset || 0)) {
+      const error = new Error("Subscriber page exists without a committed canonical FanData projection");
+      error.code = "SUBSCRIBER_PAGE_PROJECTION_GAP";
+      throw error;
+    }
     return {
       duplicate: true,
       published: run.status === "PUBLISHED",
@@ -580,13 +600,31 @@ async function applySubscriberScanChunk({
       producerObservedAt,
       observationTimeBasis,
     }))
-    .filter(Boolean);
+    .filter(Boolean)
+    .map((item) => ({ ...item, pageOffset: offset }));
   const contentHash = clean(chunk.contentHash, 128) || hashJson(items.map((item) => [item.fanId, item.contentHash]));
   const hiddenCount = items.filter((item) => item.lastSeenIsNull).length;
   await db.subscriberScanPage.create({
     data: { runId, offset, nextOffset, itemCount: items.length, hiddenCount, hasMore, contentHash },
   });
   if (items.length) await db.subscriberScanItem.createMany({ data: items, skipDuplicates: true });
+
+  // The page and its canonical FanData facts commit atomically under the job
+  // progress transaction. Provider pages are capped at 100 fans, so projection
+  // work is bounded; no final O(all subscribers) publish transaction exists.
+  const pageProjection = await projectSubscriberDirectoryItems(db, {
+    items,
+    agencyId: run.agencyId,
+    creatorId: run.creatorId,
+    runId,
+    sourceJobId: job.id,
+  });
+  if (Number(pageProjection?.projected || 0) !== items.length) {
+    const error = new Error("Subscriber page canonical FanData projection count mismatch");
+    error.code = "SUBSCRIBER_PAGE_PROJECTION_COUNT_MISMATCH";
+    throw error;
+  }
+
   const updatedRun = await db.subscriberScanRun.update({
     where: { id: runId },
     data: {
@@ -598,6 +636,11 @@ async function applySubscriberScanChunk({
       hiddenCount: { increment: hiddenCount },
       hasMore,
       lastError: null,
+      fanProjectionStatus: hasMore ? "PROJECTING" : "COMPLETE",
+      fanProjectionCursorOffset: nextOffset,
+      fanProjectionCount: { increment: items.length },
+      fanProjectionCompletedAt: hasMore ? null : new Date(),
+      fanProjectionLastError: null,
     },
   });
   if (hasMore)
@@ -609,15 +652,30 @@ async function applySubscriberScanChunk({
       scannedCount: updatedRun.scannedCount,
       pageCount: updatedRun.pageCount,
     };
-  const summary = await publishRun(db, updatedRun, { jobId: job.id, scanEveryDays: job.params?.scanEveryDays });
-  return { duplicate: false, published: true, nextOffset, hasMore: false, summary };
+  // Final-page canonical FanData commit must stay bounded. commitFanFacts holds a
+  // transaction-scoped Campaign/FanData authority until this progress transaction
+  // commits, so never run whole-directory publication work here. The subsequent
+  // job-completion transaction crosses the durable fanProjection barrier and
+  // publishes without holding Campaign authority across O(all subscribers) work.
+  return {
+    duplicate: false, published: false, readyToPublish: true, nextOffset, hasMore: false,
+    scannedCount: updatedRun.scannedCount, pageCount: updatedRun.pageCount,
+  };
 }
 
 async function applySubscriberScanCompletion({ job, userId = null, result, db = prisma }) {
   const runId = clean(job.params?.scanRunId, 120);
-  const run = runId ? await db.subscriberScanRun.findUnique({ where: { id: runId } }) : null;
-  if (!run || run.status !== "PUBLISHED")
-    throw new Error("Subscriber directory snapshot was not published before job completion");
+  let run = runId ? await db.subscriberScanRun.findUnique({ where: { id: runId } }) : null;
+  if (!run) throw new Error("Subscriber directory scan run is missing before job completion");
+  let publishedSummary = run.summary || {};
+  if (run.status !== "PUBLISHED") {
+    if (String(run.fanProjectionStatus || "") !== "COMPLETE" || run.hasMore === true) {
+      throw new Error("Subscriber directory canonical projection is not ready for publication");
+    }
+    publishedSummary = await publishRun(db, run, { jobId: job.id, scanEveryDays: job.params?.scanEveryDays });
+    run = await db.subscriberScanRun.findUnique({ where: { id: runId } });
+    if (!run || run.status !== "PUBLISHED") throw new Error("Subscriber directory snapshot publication did not commit");
+  }
 
   // Subscriber-driven write automation must be planned immediately after the
   // immutable snapshot is published. Previously Bumps waited for the hourly
@@ -646,7 +704,7 @@ async function applySubscriberScanCompletion({ job, userId = null, result, db = 
   return {
     type: "subscriber_directory",
     runId: run.id,
-    summary: run.summary || {},
+    summary: publishedSummary || run.summary || {},
     bumpPlanning,
     result: object(result),
   };
@@ -658,9 +716,15 @@ async function recordSubscriberScanFailure({ job, error, terminal = true, db = p
   const errorText = clean(error, 2000) || "subscriber scan failed";
   const now = new Date();
   const existing = await db.subscriberScanRun.findUnique({ where: { id: runId } }).catch(() => null);
-  // A final progress request may have committed and published before its HTTP
-  // response was lost. Never downgrade an immutable published snapshot.
+  // A final progress request may have committed its bounded canonical page and
+  // lost the response before the separate publication/completion transaction.
+  // If the durable page barrier is complete, recover by publishing idempotently
+  // rather than downgrading the finished provider read to FAILED.
   if (!existing || ["PUBLISHED", "SUPERSEDED"].includes(existing.status)) return existing;
+  if (String(existing.fanProjectionStatus || "") === "COMPLETE" && existing.hasMore === false) {
+    await publishRun(db, existing, { jobId: job.id, scanEveryDays: job.params?.scanEveryDays });
+    return db.subscriberScanRun.findUnique({ where: { id: runId } });
+  }
   const run = await db.subscriberScanRun
     .update({
       where: { id: runId },

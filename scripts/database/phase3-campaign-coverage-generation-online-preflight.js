@@ -164,21 +164,74 @@ async function waitForCurrentRunIndexPeerBuild(db, {
   return { waited: true, last: null, durationMs: Date.now() - startedAt };
 }
 
-async function withIndexLifecycleAuthority(db, work) {
+function indexLifecycleWorkerDatabaseUrl(databaseUrl) {
+  const raw = String(databaseUrl || "").trim();
+  if (!raw) return raw;
+  try {
+    const url = new URL(raw);
+    // A dedicated one-connection worker makes the deployment topology explicit:
+    // owner advisory transaction and CREATE/DROP INDEX CONCURRENTLY can never
+    // accidentally share a single pool connection. Tight connection/pool timeouts
+    // turn an undersized deployment pool/server limit into an immediate preflight
+    // failure instead of an unbounded build hang.
+    if (!url.searchParams.has("connection_limit")) url.searchParams.set("connection_limit", "1");
+    if (!url.searchParams.has("pool_timeout")) url.searchParams.set("pool_timeout", "10");
+    if (!url.searchParams.has("connect_timeout")) url.searchParams.set("connect_timeout", "10");
+    return url.toString();
+  } catch (_) {
+    return raw;
+  }
+}
+
+async function assertIndexLifecycleConnectionContract(ownerTx, workerDb) {
+  if (typeof ownerTx?.$queryRawUnsafe !== "function" || typeof workerDb?.$queryRawUnsafe !== "function") {
+    return { verified: false, adapterFallback: true };
+  }
+  const ownerRows = await ownerTx.$queryRawUnsafe(
+    `SELECT pg_backend_pid()::int AS pid, current_setting('transaction_isolation') AS isolation`
+  );
+  const workerRows = await workerDb.$queryRawUnsafe(
+    `SELECT pg_backend_pid()::int AS pid, current_setting('transaction_isolation') AS isolation`
+  );
+  const owner = ownerRows?.[0] || {};
+  const worker = workerRows?.[0] || {};
+  if (!Number.isInteger(Number(owner.pid)) || !Number.isInteger(Number(worker.pid))) {
+    fail("index lifecycle connection contract could not resolve PostgreSQL backend PIDs");
+  }
+  if (Number(owner.pid) === Number(worker.pid)) {
+    fail("index lifecycle requires two distinct PostgreSQL sessions; owner and concurrent-index worker share one backend PID");
+  }
+  if (String(owner.isolation || "").toLowerCase() !== "read committed") {
+    fail(`index lifecycle owner transaction must use Read Committed; got=${owner.isolation}`);
+  }
+  return {
+    verified: true, ownerPid: Number(owner.pid), workerPid: Number(worker.pid),
+    ownerIsolation: String(owner.isolation), workerIsolation: String(worker.isolation || ""),
+  };
+}
+
+async function withIndexLifecycleAuthority(db, work, { workerDb = null, requireDistinctConnections = false } = {}) {
   if (typeof work !== "function") throw new TypeError("Index lifecycle authority requires work callback");
-  if (typeof db?.$transaction !== "function") return work(db);
-  // CREATE/DROP INDEX CONCURRENTLY cannot execute inside a transaction. Hold a
-  // transaction-scoped advisory owner on one dedicated Prisma connection while
-  // the root client uses another connection for inspect/drop/create/verify.
-  // A peer deploy therefore cannot observe or drop our transient invalid index;
-  // if this process dies, PostgreSQL releases the owner transaction and the next
-  // deploy may safely repair the abandoned invalid index under the same authority.
+  const lifecycleDb = workerDb || db;
+  if (requireDistinctConnections && lifecycleDb === db) {
+    fail("index lifecycle production preflight requires a dedicated concurrent-index Prisma client");
+  }
+  if (typeof db?.$transaction !== "function") return work(lifecycleDb, { verified: false, adapterFallback: true });
+  // CREATE/DROP INDEX CONCURRENTLY cannot execute inside a transaction. Hold the
+  // transaction-scoped advisory owner on client A while dedicated client B owns
+  // the concurrent-index lifecycle. ReadCommitted is explicit so the owner does
+  // not pin a long snapshot while client B waits on old transactions/snapshots.
   return db.$transaction(async (ownerTx) => {
     await acquirePreflightAuthority(ownerTx);
-    return work(db);
+    const contract = await assertIndexLifecycleConnectionContract(ownerTx, lifecycleDb);
+    if (requireDistinctConnections && contract.verified !== true) {
+      fail("index lifecycle production connection contract was not physically verified");
+    }
+    return work(lifecycleDb, contract);
   }, {
     maxWait: PREFLIGHT_TRANSACTION_MAX_WAIT_MS,
     timeout: INDEX_LIFECYCLE_AUTHORITY_TIMEOUT_MS,
+    isolationLevel: "ReadCommitted",
   });
 }
 
@@ -452,6 +505,7 @@ async function main() {
   if (!databaseUrl) fail("DATABASE_URL is required");
   const { PrismaClient } = require("@prisma/client");
   const db = new PrismaClient({ datasources: { db: { url: databaseUrl } } });
+  let indexDb = null;
   try {
     const prerequisites = await prerequisiteState(db);
     if (!prerequisites.ready) {
@@ -461,8 +515,21 @@ async function main() {
 
     // Existing/populated installations need the generation lookup index online,
     // before the ordinary migration records the schema step. Fresh databases
-    // create the same index from the A20.11 migration itself.
-    await withIndexLifecycleAuthority(db, (lifecycleDb) => ensureCurrentRunLookupIndex(lifecycleDb));
+    // create the same index from the A20.11 migration itself. Use a dedicated
+    // Prisma client for CONCURRENTLY and verify distinct backend sessions while
+    // the owner transaction is alive. This is an explicit deployment contract,
+    // not an assumption about the root client's pool size.
+    indexDb = new PrismaClient({ datasources: { db: { url: indexLifecycleWorkerDatabaseUrl(databaseUrl) } } });
+    await indexDb.$connect();
+    await withIndexLifecycleAuthority(
+      db,
+      async (lifecycleDb, contract) => {
+        if (contract?.verified !== true) fail("index lifecycle connection contract was not verified before concurrent index work");
+        console.log(`# PHASE3_CAMPAIGN_COVERAGE_INDEX_CONNECTION_CONTRACT_PASS ownerPid=${contract.ownerPid} workerPid=${contract.workerPid} isolation=${JSON.stringify(contract.ownerIsolation)}`);
+        return ensureCurrentRunLookupIndex(lifecycleDb);
+      },
+      { workerDb: indexDb, requireDistinctConnections: true },
+    );
 
     const applied = await migrationApplied(db);
     if (applied) {
@@ -482,6 +549,7 @@ async function main() {
     const resolved = await resolveApplied({ db });
     console.log(`# PHASE3_CAMPAIGN_COVERAGE_PREFLIGHT_PASS migrationApplied=false action=split-ddl-bounded-current-state-backfill directUpdated=${result.directUpdated} fallbackUpdated=${result.fallbackUpdated} ddlAltered=${result.ddlAltered} concurrentPeer=${resolved.concurrentPeer === true} index=${CURRENT_RUN_INDEX_NAME}`);
   } finally {
+    if (indexDb) await indexDb.$disconnect().catch(() => {});
     await db.$disconnect();
   }
 }
@@ -519,6 +587,8 @@ module.exports = {
   assertCurrentRunIndex,
   currentRunIndexBuildProgress,
   waitForCurrentRunIndexPeerBuild,
+  indexLifecycleWorkerDatabaseUrl,
+  assertIndexLifecycleConnectionContract,
   withIndexLifecycleAuthority,
   ensureCurrentRunLookupIndex,
   acquirePreflightAuthority,

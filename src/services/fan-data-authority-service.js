@@ -597,77 +597,24 @@ async function projectFanValue(tx, observation) {
   return { record: current || existing, replay: Number(result?.count || 0) === 0 && !!existing, fanRecordId: fan.id };
 }
 
-async function projectSubscriberDirectoryRun(db, { runId, agencyId, creatorId, sourceJobId = null }) {
-  if (!text(runId, 180) || !text(agencyId, 180) || !text(creatorId, 180)) throw new Error("Invalid subscriber projection scope");
-  const items = await db.subscriberScanItem.findMany({ where: { runId } });
-  if (!items.length) return { projected: 0 };
+function subscriberDirectoryObservationFromItem(item) {
+  const metadata = item?.metadata && typeof item.metadata === "object" ? item.metadata : {};
+  const observed = metadata.fanDataObservedFields && typeof metadata.fanDataObservedFields === "object"
+    ? metadata.fanDataObservedFields
+    : {};
+  const identityFields = new Set(Array.isArray(observed.identity) ? observed.identity : []);
+  const relationshipFields = new Set(Array.isArray(observed.relationship) ? observed.relationship : []);
+  const valueFields = new Set(Array.isArray(observed.value) ? observed.value : []);
+  const observedAt = date(item?.observedAt);
+  const onlyFansUserIdValue = onlyFansUserId(item?.fanId);
+  if (!observedAt || !onlyFansUserIdValue) return null;
 
-  // Test/in-memory adapters do not expose raw SQL. They still use the exact same
-  // canonical projectors and therefore exercise semantic behavior, not a facade.
-  if (typeof db.$executeRawUnsafe !== "function") {
-    let projected = 0;
-    for (const item of items) {
-      const metadata = item.metadata && typeof item.metadata === "object" ? item.metadata : {};
-      const observed = metadata.fanDataObservedFields && typeof metadata.fanDataObservedFields === "object"
-        ? metadata.fanDataObservedFields
-        : {};
-      const identityFields = new Set(Array.isArray(observed.identity) ? observed.identity : []);
-      const relationshipFields = new Set(Array.isArray(observed.relationship) ? observed.relationship : []);
-      const valueFields = new Set(Array.isArray(observed.value) ? observed.value : []);
-      const identity = {
-        agencyId, creatorId, onlyFansUserId: item.fanId,
-        observedAt: item.observedAt, activityObservedAt: relationshipFields.has("lastSeenAt") ? item.lastSeenAt : undefined,
-        source: "SUBSCRIBER_DIRECTORY",
-      };
-      if (identityFields.has("username") || (!identityFields.size && item.username)) identity.username = item.username;
-      if (identityFields.has("platformDisplayName") || (!identityFields.size && item.name)) identity.platformDisplayName = item.name;
-      if (identityFields.has("avatarUrl") || (!identityFields.size && item.avatarUrl)) identity.avatarUrl = item.avatarUrl;
-      await projectFanIdentity(db, identity);
+  const identity = { source: "SUBSCRIBER_DIRECTORY", observedAt };
+  if (identityFields.has("username") || (!identityFields.size && item?.username)) identity.username = item.username;
+  if (identityFields.has("platformDisplayName") || (!identityFields.size && item?.name)) identity.platformDisplayName = item.name;
+  if (identityFields.has("avatarUrl") || (!identityFields.size && item?.avatarUrl)) identity.avatarUrl = item.avatarUrl;
 
-      const relationship = {
-        agencyId, creatorId, onlyFansUserId: item.fanId,
-        observedAt: item.observedAt, source: "SUBSCRIBER_DIRECTORY", sourceJobId, scanRunId: runId,
-      };
-      const relationshipMap = {
-        fanSubscribesToCreator: "fanSubscribesToCreator",
-        fanSubscriptionActive: "fanSubscriptionActive",
-        fanSubscriptionType: "subscriptionType",
-        fanSubscriptionExpiresAt: "fanSubscriptionExpiresAt",
-        creatorFollowsFan: "creatorFollowsFan",
-        creatorFollowExpiresAt: "creatorFollowExpiresAt",
-        canReceiveChatMessage: "canReceiveChatMessage",
-        blocked: "blocked", restricted: "restricted", performer: "performer",
-        lastSeenAt: "lastSeenAt", subscribePriceCents: "subscribePriceCents",
-      };
-      for (const [field, itemField] of Object.entries(relationshipMap)) {
-        if (relationshipFields.has(field) || (!relationshipFields.size && item[itemField] !== null && item[itemField] !== undefined)) {
-          relationship[field] = item[itemField];
-        }
-      }
-      await projectFanRelationship(db, relationship);
-
-      const value = {
-        agencyId, creatorId, onlyFansUserId: item.fanId,
-        availability: item.valueAvailability, observedAt: item.observedAt,
-        source: "SUBSCRIBER_DIRECTORY", sourceJobId, scanRunId: runId,
-      };
-      const valueMap = {
-        totalSpentCents: "totalSpentCents", messagesSpentCents: "messagesSpentCents",
-        subscriptionsSpentCents: "subscriptionsSpentCents", tipsSpentCents: "tipsSpentCents",
-        postsSpentCents: "postsSpentCents", streamsSpentCents: "streamsSpentCents",
-      };
-      for (const [field, itemField] of Object.entries(valueMap)) {
-        if (valueFields.has(field) || (!valueFields.size && item[itemField] !== null && item[itemField] !== undefined)) value[field] = item[itemField];
-      }
-      // AVAILABLE is impossible without a strict canonical total after ingress normalization.
-      if (value.availability === VALUE_AVAILABILITY.AVAILABLE && value.totalSpentCents == null) value.availability = VALUE_AVAILABILITY.MALFORMED;
-      await projectFanValue(db, value);
-      projected += 1;
-    }
-    return { projected };
-  }
-
-  const SOURCE = "SUBSCRIBER_DIRECTORY";
+  const relationship = { source: "SUBSCRIBER_DIRECTORY", observedAt };
   const relationshipMap = {
     fanSubscribesToCreator: "fanSubscribesToCreator",
     fanSubscriptionActive: "fanSubscriptionActive",
@@ -679,305 +626,61 @@ async function projectSubscriberDirectoryRun(db, { runId, agencyId, creatorId, s
     blocked: "blocked", restricted: "restricted", performer: "performer",
     lastSeenAt: "lastSeenAt", subscribePriceCents: "subscribePriceCents",
   };
+  for (const [field, itemField] of Object.entries(relationshipMap)) {
+    if (relationshipFields.has(field) || (!relationshipFields.size && item?.[itemField] !== null && item?.[itemField] !== undefined)) {
+      relationship[field] = item[itemField];
+    }
+  }
+
+  const value = {
+    source: "SUBSCRIBER_DIRECTORY",
+    observedAt,
+    availability: item?.valueAvailability,
+  };
   const valueMap = {
-    platformReportedTotalSpendCents: "totalSpentCents",
+    totalSpentCents: "totalSpentCents",
     messagesSpentCents: "messagesSpentCents",
     subscriptionsSpentCents: "subscriptionsSpentCents",
     tipsSpentCents: "tipsSpentCents",
     postsSpentCents: "postsSpentCents",
     streamsSpentCents: "streamsSpentCents",
   };
-  const chunks = [];
-  for (let index = 0; index < items.length; index += 500) chunks.push(items.slice(index, index + 500));
-
-  for (const chunk of chunks) {
-    const fanRows = [];
-    const relationshipRows = [];
-    const valueRows = [];
-
-    for (const item of chunk) {
-      const metadata = item.metadata && typeof item.metadata === "object" ? item.metadata : {};
-      const observed = metadata.fanDataObservedFields && typeof metadata.fanDataObservedFields === "object"
-        ? metadata.fanDataObservedFields
-        : {};
-      const identityMask = new Set(Array.isArray(observed.identity) ? observed.identity : []);
-      const relationshipMask = new Set(Array.isArray(observed.relationship) ? observed.relationship : []);
-      const valueMask = new Set(Array.isArray(observed.value) ? observed.value : []);
-      const observedAt = date(item.observedAt);
-      if (!observedAt) continue;
-
-      const identityInput = cleanIdentityFields({
-        username: identityMask.has("username") || (!identityMask.size && item.username) ? item.username : null,
-        platformDisplayName: identityMask.has("platformDisplayName") || (!identityMask.size && item.name) ? item.name : null,
-        avatarUrl: identityMask.has("avatarUrl") || (!identityMask.size && item.avatarUrl) ? item.avatarUrl : null,
-        headerUrl: null,
-      });
-      const usernameVersion = identityInput.username === null ? null : authorityVersion(observedAt, SOURCE, identityInput.username);
-      const displayNameVersion = identityInput.platformDisplayName === null ? null : authorityVersion(observedAt, SOURCE, identityInput.platformDisplayName);
-      const avatarVersion = identityInput.avatarUrl === null ? null : authorityVersion(observedAt, SOURCE, identityInput.avatarUrl);
-      const identityVersion = usernameVersion || displayNameVersion || avatarVersion
-        ? authorityVersion(observedAt, SOURCE, identityInput)
-        : null;
-      const activityAt = relationshipMask.has("lastSeenAt") && item.lastSeenAt ? date(item.lastSeenAt) : null;
-      fanRows.push({
-        id: crypto.randomUUID(), agencyId, creatorId, onlyFansUserId: String(item.fanId),
-        username: identityInput.username, displayName: identityInput.platformDisplayName, avatarUrl: identityInput.avatarUrl,
-        usernameAuthorityVersion: usernameVersion, displayNameAuthorityVersion: displayNameVersion,
-        avatarAuthorityVersion: avatarVersion, identityAuthorityVersion: identityVersion,
-        identityObservedAt: identityVersion ? observedAt.toISOString() : null,
-        identitySource: identityVersion ? SOURCE : null,
-        identityCompleteness: identityVersion ? identityCompleteness(identityInput) : null,
-        firstSeenAt: (activityAt || observedAt).toISOString(),
-        lastActivityObservedAt: activityAt?.toISOString?.() || null,
-      });
-
-      const relationshipObservation = { agencyId, creatorId, onlyFansUserId: item.fanId, observedAt, source: SOURCE };
-      for (const [field, itemField] of Object.entries(relationshipMap)) {
-        if (relationshipMask.has(field) || (!relationshipMask.size && item[itemField] !== null && item[itemField] !== undefined)) {
-          relationshipObservation[field] = item[itemField];
-        }
-      }
-      const relationshipFacts = relationshipData(relationshipObservation);
-      if (Object.keys(relationshipFacts).length) {
-        const row = {
-          id: crypto.randomUUID(), agencyId, creatorId, onlyFansUserId: String(item.fanId),
-          observedAt: observedAt.toISOString(), source: SOURCE, sourceJobId: text(sourceJobId, 180), scanRunId: runId,
-          relationshipAuthorityVersion: authorityVersion(observedAt, SOURCE, relationshipFacts),
-        };
-        for (const [field, versionField] of RELATIONSHIP_FIELDS) {
-          if (!Object.prototype.hasOwnProperty.call(relationshipFacts, field)) continue;
-          const value = relationshipFacts[field];
-          row[field] = value instanceof Date ? value.toISOString() : value;
-          row[versionField] = authorityVersion(observedAt, SOURCE, value);
-        }
-        relationshipRows.push(row);
-      }
-
-      const valueObservation = {
-        agencyId, creatorId, onlyFansUserId: item.fanId,
-        availability: item.valueAvailability, observedAt, source: SOURCE,
-      };
-      for (const [field, itemField] of Object.entries({
-        totalSpentCents: "totalSpentCents", messagesSpentCents: "messagesSpentCents",
-        subscriptionsSpentCents: "subscriptionsSpentCents", tipsSpentCents: "tipsSpentCents",
-        postsSpentCents: "postsSpentCents", streamsSpentCents: "streamsSpentCents",
-      })) {
-        if (valueMask.has(field) || (!valueMask.size && item[itemField] !== null && item[itemField] !== undefined)) valueObservation[field] = item[itemField];
-      }
-      if (valueObservation.availability === VALUE_AVAILABILITY.AVAILABLE && valueObservation.totalSpentCents == null) {
-        valueObservation.availability = VALUE_AVAILABILITY.MALFORMED;
-      }
-      const normalizedValue = normalizedFanValueFacts(valueObservation);
-      const valueVersion = authorityVersion(observedAt, SOURCE, normalizedValue.observedFields);
-      const availabilityVersion = authorityVersion(observedAt, SOURCE, normalizedValue.availability);
-      const valueRow = {
-        id: crypto.randomUUID(), agencyId, creatorId, onlyFansUserId: String(item.fanId),
-        availability: normalizedValue.availability,
-        availabilityAuthorityVersion: availabilityVersion,
-        valueObservedAt: observedAt.toISOString(), source: SOURCE, valueAuthorityVersion: valueVersion,
-        sourceJobId: text(sourceJobId, 180), scanRunId: runId,
-      };
-      if (normalizedValue.availability === VALUE_AVAILABILITY.AVAILABLE) {
-        for (const [field, versionField] of VALUE_FIELDS) {
-          const value = normalizedValue.numeric[field];
-          if (value === null) continue;
-          valueRow[field] = value.toString();
-          valueRow[versionField] = authorityVersion(observedAt, SOURCE, value);
-        }
-      }
-      valueRows.push(valueRow);
-    }
-
-    if (fanRows.length) {
-      const json = JSON.stringify(fanRows);
-      await db.$executeRawUnsafe(`
-        WITH incoming AS (
-          SELECT * FROM jsonb_to_recordset($1::jsonb) AS i(
-            "id" text, "agencyId" text, "creatorId" text, "onlyFansUserId" text,
-            "username" text, "displayName" text, "avatarUrl" text,
-            "usernameAuthorityVersion" text, "displayNameAuthorityVersion" text, "avatarAuthorityVersion" text,
-            "identityAuthorityVersion" text, "identityObservedAt" timestamptz, "identitySource" text, "identityCompleteness" text,
-            "firstSeenAt" timestamptz, "lastActivityObservedAt" timestamptz
-          )
-        )
-        INSERT INTO "CreatorFan" (
-          "id","agencyId","creatorId","onlyFansUserId","username","displayName","avatarUrl",
-          "identityObservedAt","identitySource","identityCompleteness","identityAuthorityVersion",
-          "usernameAuthorityVersion","displayNameAuthorityVersion","avatarAuthorityVersion",
-          "firstSeenAt","lastSeenAt","lastActivityObservedAt","createdAt","updatedAt"
-        )
-        SELECT
-          i."id",i."agencyId",i."creatorId",i."onlyFansUserId",i."username",i."displayName",i."avatarUrl",
-          i."identityObservedAt",i."identitySource",i."identityCompleteness",i."identityAuthorityVersion",
-          i."usernameAuthorityVersion",i."displayNameAuthorityVersion",i."avatarAuthorityVersion",
-          i."firstSeenAt",i."firstSeenAt",i."lastActivityObservedAt",NOW(),NOW()
-        FROM incoming i
-        ON CONFLICT ("creatorId","onlyFansUserId") DO UPDATE SET
-          "firstSeenAt" = LEAST("CreatorFan"."firstSeenAt", EXCLUDED."firstSeenAt"),
-          "lastSeenAt" = CASE WHEN EXCLUDED."lastActivityObservedAt" IS NOT NULL AND EXCLUDED."lastActivityObservedAt" > "CreatorFan"."lastSeenAt" THEN EXCLUDED."lastActivityObservedAt" ELSE "CreatorFan"."lastSeenAt" END,
-          "lastActivityObservedAt" = CASE WHEN EXCLUDED."lastActivityObservedAt" IS NOT NULL AND ("CreatorFan"."lastActivityObservedAt" IS NULL OR EXCLUDED."lastActivityObservedAt" > "CreatorFan"."lastActivityObservedAt") THEN EXCLUDED."lastActivityObservedAt" ELSE "CreatorFan"."lastActivityObservedAt" END,
-          "username" = CASE WHEN EXCLUDED."usernameAuthorityVersion" IS NOT NULL AND ("CreatorFan"."usernameAuthorityVersion" IS NULL OR EXCLUDED."usernameAuthorityVersion" > "CreatorFan"."usernameAuthorityVersion") THEN EXCLUDED."username" ELSE "CreatorFan"."username" END,
-          "usernameAuthorityVersion" = CASE WHEN EXCLUDED."usernameAuthorityVersion" IS NOT NULL AND ("CreatorFan"."usernameAuthorityVersion" IS NULL OR EXCLUDED."usernameAuthorityVersion" > "CreatorFan"."usernameAuthorityVersion") THEN EXCLUDED."usernameAuthorityVersion" ELSE "CreatorFan"."usernameAuthorityVersion" END,
-          "displayName" = CASE WHEN EXCLUDED."displayNameAuthorityVersion" IS NOT NULL AND ("CreatorFan"."displayNameAuthorityVersion" IS NULL OR EXCLUDED."displayNameAuthorityVersion" > "CreatorFan"."displayNameAuthorityVersion") THEN EXCLUDED."displayName" ELSE "CreatorFan"."displayName" END,
-          "displayNameAuthorityVersion" = CASE WHEN EXCLUDED."displayNameAuthorityVersion" IS NOT NULL AND ("CreatorFan"."displayNameAuthorityVersion" IS NULL OR EXCLUDED."displayNameAuthorityVersion" > "CreatorFan"."displayNameAuthorityVersion") THEN EXCLUDED."displayNameAuthorityVersion" ELSE "CreatorFan"."displayNameAuthorityVersion" END,
-          "avatarUrl" = CASE WHEN EXCLUDED."avatarAuthorityVersion" IS NOT NULL AND ("CreatorFan"."avatarAuthorityVersion" IS NULL OR EXCLUDED."avatarAuthorityVersion" > "CreatorFan"."avatarAuthorityVersion") THEN EXCLUDED."avatarUrl" ELSE "CreatorFan"."avatarUrl" END,
-          "avatarAuthorityVersion" = CASE WHEN EXCLUDED."avatarAuthorityVersion" IS NOT NULL AND ("CreatorFan"."avatarAuthorityVersion" IS NULL OR EXCLUDED."avatarAuthorityVersion" > "CreatorFan"."avatarAuthorityVersion") THEN EXCLUDED."avatarAuthorityVersion" ELSE "CreatorFan"."avatarAuthorityVersion" END,
-          "identityObservedAt" = CASE WHEN EXCLUDED."identityAuthorityVersion" IS NOT NULL AND ("CreatorFan"."identityAuthorityVersion" IS NULL OR EXCLUDED."identityAuthorityVersion" > "CreatorFan"."identityAuthorityVersion") THEN EXCLUDED."identityObservedAt" ELSE "CreatorFan"."identityObservedAt" END,
-          "identitySource" = CASE WHEN EXCLUDED."identityAuthorityVersion" IS NOT NULL AND ("CreatorFan"."identityAuthorityVersion" IS NULL OR EXCLUDED."identityAuthorityVersion" > "CreatorFan"."identityAuthorityVersion") THEN EXCLUDED."identitySource" ELSE "CreatorFan"."identitySource" END,
-          "identityAuthorityVersion" = CASE WHEN EXCLUDED."identityAuthorityVersion" IS NOT NULL AND ("CreatorFan"."identityAuthorityVersion" IS NULL OR EXCLUDED."identityAuthorityVersion" > "CreatorFan"."identityAuthorityVersion") THEN EXCLUDED."identityAuthorityVersion" ELSE "CreatorFan"."identityAuthorityVersion" END,
-          "updatedAt" = NOW()
-      `, json);
-      await db.$executeRawUnsafe(`
-        WITH incoming AS (SELECT "onlyFansUserId" FROM jsonb_to_recordset($1::jsonb) AS i("onlyFansUserId" text))
-        UPDATE "CreatorFan" f SET
-          "identityCompleteness" = CASE
-            WHEN f."username" IS NOT NULL AND f."displayName" IS NOT NULL AND f."avatarUrl" IS NOT NULL AND f."headerUrl" IS NOT NULL THEN 'FULL'
-            WHEN f."username" IS NOT NULL OR f."displayName" IS NOT NULL OR f."avatarUrl" IS NOT NULL OR f."headerUrl" IS NOT NULL THEN 'PARTIAL'
-            ELSE NULL END,
-          "updatedAt" = NOW()
-        WHERE f."creatorId" = $2 AND f."onlyFansUserId" IN (SELECT "onlyFansUserId" FROM incoming)
-      `, json, creatorId);
-    }
-
-    if (relationshipRows.length) {
-      const json = JSON.stringify(relationshipRows);
-      await db.$executeRawUnsafe(`
-        WITH incoming AS (
-          SELECT * FROM jsonb_to_recordset($1::jsonb) AS i(
-            "id" text,"agencyId" text,"creatorId" text,"onlyFansUserId" text,
-            "fanSubscribesToCreator" boolean,"fanSubscriptionActive" boolean,"fanSubscriptionType" text,"fanSubscriptionExpiresAt" timestamptz,
-            "creatorFollowsFan" boolean,"creatorFollowExpiresAt" timestamptz,"canReceiveChatMessage" boolean,"blocked" boolean,"restricted" boolean,"performer" boolean,
-            "lastSeenAt" timestamptz,"subscribePriceCents" integer,
-            "relationshipAuthorityVersion" text,"fanSubscribesToCreatorAuthorityVersion" text,"fanSubscriptionActiveAuthorityVersion" text,
-            "fanSubscriptionTypeAuthorityVersion" text,"fanSubscriptionExpiresAtAuthorityVersion" text,"creatorFollowsFanAuthorityVersion" text,
-            "creatorFollowExpiresAtAuthorityVersion" text,"canReceiveChatMessageAuthorityVersion" text,"blockedAuthorityVersion" text,
-            "restrictedAuthorityVersion" text,"performerAuthorityVersion" text,"lastSeenAtAuthorityVersion" text,"subscribePriceCentsAuthorityVersion" text,
-            "observedAt" timestamptz,"source" text,"sourceJobId" text,"scanRunId" text
-          )
-        ), joined AS (
-          SELECT i.*, f."id" AS "fanRecordId" FROM incoming i
-          JOIN "CreatorFan" f ON f."creatorId" = i."creatorId" AND f."onlyFansUserId" = i."onlyFansUserId"
-        )
-        INSERT INTO "CreatorFanRelationshipCurrent" (
-          "id","agencyId","creatorId","fanRecordId","onlyFansUserId",
-          "fanSubscribesToCreator","fanSubscriptionActive","fanSubscriptionType","fanSubscriptionExpiresAt","creatorFollowsFan","creatorFollowExpiresAt",
-          "canReceiveChatMessage","blocked","restricted","performer","lastSeenAt","subscribePriceCents",
-          "relationshipAuthorityVersion","fanSubscribesToCreatorAuthorityVersion","fanSubscriptionActiveAuthorityVersion","fanSubscriptionTypeAuthorityVersion",
-          "fanSubscriptionExpiresAtAuthorityVersion","creatorFollowsFanAuthorityVersion","creatorFollowExpiresAtAuthorityVersion","canReceiveChatMessageAuthorityVersion",
-          "blockedAuthorityVersion","restrictedAuthorityVersion","performerAuthorityVersion","lastSeenAtAuthorityVersion","subscribePriceCentsAuthorityVersion",
-          "observedAt","source","sourceJobId","scanRunId","createdAt","updatedAt"
-        )
-        SELECT
-          "id","agencyId","creatorId","fanRecordId","onlyFansUserId",
-          "fanSubscribesToCreator","fanSubscriptionActive","fanSubscriptionType","fanSubscriptionExpiresAt","creatorFollowsFan","creatorFollowExpiresAt",
-          "canReceiveChatMessage","blocked","restricted","performer","lastSeenAt","subscribePriceCents",
-          "relationshipAuthorityVersion","fanSubscribesToCreatorAuthorityVersion","fanSubscriptionActiveAuthorityVersion","fanSubscriptionTypeAuthorityVersion",
-          "fanSubscriptionExpiresAtAuthorityVersion","creatorFollowsFanAuthorityVersion","creatorFollowExpiresAtAuthorityVersion","canReceiveChatMessageAuthorityVersion",
-          "blockedAuthorityVersion","restrictedAuthorityVersion","performerAuthorityVersion","lastSeenAtAuthorityVersion","subscribePriceCentsAuthorityVersion",
-          "observedAt","source","sourceJobId","scanRunId",NOW(),NOW()
-        FROM joined
-        ON CONFLICT ("creatorId","onlyFansUserId") DO UPDATE SET
-          "fanRecordId" = EXCLUDED."fanRecordId",
-          "fanSubscribesToCreator" = CASE WHEN EXCLUDED."fanSubscribesToCreatorAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."fanSubscribesToCreatorAuthorityVersion" IS NULL OR EXCLUDED."fanSubscribesToCreatorAuthorityVersion" > "CreatorFanRelationshipCurrent"."fanSubscribesToCreatorAuthorityVersion") THEN EXCLUDED."fanSubscribesToCreator" ELSE "CreatorFanRelationshipCurrent"."fanSubscribesToCreator" END,
-          "fanSubscribesToCreatorAuthorityVersion" = CASE WHEN EXCLUDED."fanSubscribesToCreatorAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."fanSubscribesToCreatorAuthorityVersion" IS NULL OR EXCLUDED."fanSubscribesToCreatorAuthorityVersion" > "CreatorFanRelationshipCurrent"."fanSubscribesToCreatorAuthorityVersion") THEN EXCLUDED."fanSubscribesToCreatorAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."fanSubscribesToCreatorAuthorityVersion" END,
-          "fanSubscriptionActive" = CASE WHEN EXCLUDED."fanSubscriptionActiveAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."fanSubscriptionActiveAuthorityVersion" IS NULL OR EXCLUDED."fanSubscriptionActiveAuthorityVersion" > "CreatorFanRelationshipCurrent"."fanSubscriptionActiveAuthorityVersion") THEN EXCLUDED."fanSubscriptionActive" ELSE "CreatorFanRelationshipCurrent"."fanSubscriptionActive" END,
-          "fanSubscriptionActiveAuthorityVersion" = CASE WHEN EXCLUDED."fanSubscriptionActiveAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."fanSubscriptionActiveAuthorityVersion" IS NULL OR EXCLUDED."fanSubscriptionActiveAuthorityVersion" > "CreatorFanRelationshipCurrent"."fanSubscriptionActiveAuthorityVersion") THEN EXCLUDED."fanSubscriptionActiveAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."fanSubscriptionActiveAuthorityVersion" END,
-          "fanSubscriptionType" = CASE WHEN EXCLUDED."fanSubscriptionTypeAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."fanSubscriptionTypeAuthorityVersion" IS NULL OR EXCLUDED."fanSubscriptionTypeAuthorityVersion" > "CreatorFanRelationshipCurrent"."fanSubscriptionTypeAuthorityVersion") THEN EXCLUDED."fanSubscriptionType" ELSE "CreatorFanRelationshipCurrent"."fanSubscriptionType" END,
-          "fanSubscriptionTypeAuthorityVersion" = CASE WHEN EXCLUDED."fanSubscriptionTypeAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."fanSubscriptionTypeAuthorityVersion" IS NULL OR EXCLUDED."fanSubscriptionTypeAuthorityVersion" > "CreatorFanRelationshipCurrent"."fanSubscriptionTypeAuthorityVersion") THEN EXCLUDED."fanSubscriptionTypeAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."fanSubscriptionTypeAuthorityVersion" END,
-          "fanSubscriptionExpiresAt" = CASE WHEN EXCLUDED."fanSubscriptionExpiresAtAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."fanSubscriptionExpiresAtAuthorityVersion" IS NULL OR EXCLUDED."fanSubscriptionExpiresAtAuthorityVersion" > "CreatorFanRelationshipCurrent"."fanSubscriptionExpiresAtAuthorityVersion") THEN EXCLUDED."fanSubscriptionExpiresAt" ELSE "CreatorFanRelationshipCurrent"."fanSubscriptionExpiresAt" END,
-          "fanSubscriptionExpiresAtAuthorityVersion" = CASE WHEN EXCLUDED."fanSubscriptionExpiresAtAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."fanSubscriptionExpiresAtAuthorityVersion" IS NULL OR EXCLUDED."fanSubscriptionExpiresAtAuthorityVersion" > "CreatorFanRelationshipCurrent"."fanSubscriptionExpiresAtAuthorityVersion") THEN EXCLUDED."fanSubscriptionExpiresAtAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."fanSubscriptionExpiresAtAuthorityVersion" END,
-          "creatorFollowsFan" = CASE WHEN EXCLUDED."creatorFollowsFanAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."creatorFollowsFanAuthorityVersion" IS NULL OR EXCLUDED."creatorFollowsFanAuthorityVersion" > "CreatorFanRelationshipCurrent"."creatorFollowsFanAuthorityVersion") THEN EXCLUDED."creatorFollowsFan" ELSE "CreatorFanRelationshipCurrent"."creatorFollowsFan" END,
-          "creatorFollowsFanAuthorityVersion" = CASE WHEN EXCLUDED."creatorFollowsFanAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."creatorFollowsFanAuthorityVersion" IS NULL OR EXCLUDED."creatorFollowsFanAuthorityVersion" > "CreatorFanRelationshipCurrent"."creatorFollowsFanAuthorityVersion") THEN EXCLUDED."creatorFollowsFanAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."creatorFollowsFanAuthorityVersion" END,
-          "creatorFollowExpiresAt" = CASE WHEN EXCLUDED."creatorFollowExpiresAtAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."creatorFollowExpiresAtAuthorityVersion" IS NULL OR EXCLUDED."creatorFollowExpiresAtAuthorityVersion" > "CreatorFanRelationshipCurrent"."creatorFollowExpiresAtAuthorityVersion") THEN EXCLUDED."creatorFollowExpiresAt" ELSE "CreatorFanRelationshipCurrent"."creatorFollowExpiresAt" END,
-          "creatorFollowExpiresAtAuthorityVersion" = CASE WHEN EXCLUDED."creatorFollowExpiresAtAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."creatorFollowExpiresAtAuthorityVersion" IS NULL OR EXCLUDED."creatorFollowExpiresAtAuthorityVersion" > "CreatorFanRelationshipCurrent"."creatorFollowExpiresAtAuthorityVersion") THEN EXCLUDED."creatorFollowExpiresAtAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."creatorFollowExpiresAtAuthorityVersion" END,
-          "canReceiveChatMessage" = CASE WHEN EXCLUDED."canReceiveChatMessageAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."canReceiveChatMessageAuthorityVersion" IS NULL OR EXCLUDED."canReceiveChatMessageAuthorityVersion" > "CreatorFanRelationshipCurrent"."canReceiveChatMessageAuthorityVersion") THEN EXCLUDED."canReceiveChatMessage" ELSE "CreatorFanRelationshipCurrent"."canReceiveChatMessage" END,
-          "canReceiveChatMessageAuthorityVersion" = CASE WHEN EXCLUDED."canReceiveChatMessageAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."canReceiveChatMessageAuthorityVersion" IS NULL OR EXCLUDED."canReceiveChatMessageAuthorityVersion" > "CreatorFanRelationshipCurrent"."canReceiveChatMessageAuthorityVersion") THEN EXCLUDED."canReceiveChatMessageAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."canReceiveChatMessageAuthorityVersion" END,
-          "blocked" = CASE WHEN EXCLUDED."blockedAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."blockedAuthorityVersion" IS NULL OR EXCLUDED."blockedAuthorityVersion" > "CreatorFanRelationshipCurrent"."blockedAuthorityVersion") THEN EXCLUDED."blocked" ELSE "CreatorFanRelationshipCurrent"."blocked" END,
-          "blockedAuthorityVersion" = CASE WHEN EXCLUDED."blockedAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."blockedAuthorityVersion" IS NULL OR EXCLUDED."blockedAuthorityVersion" > "CreatorFanRelationshipCurrent"."blockedAuthorityVersion") THEN EXCLUDED."blockedAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."blockedAuthorityVersion" END,
-          "restricted" = CASE WHEN EXCLUDED."restrictedAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."restrictedAuthorityVersion" IS NULL OR EXCLUDED."restrictedAuthorityVersion" > "CreatorFanRelationshipCurrent"."restrictedAuthorityVersion") THEN EXCLUDED."restricted" ELSE "CreatorFanRelationshipCurrent"."restricted" END,
-          "restrictedAuthorityVersion" = CASE WHEN EXCLUDED."restrictedAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."restrictedAuthorityVersion" IS NULL OR EXCLUDED."restrictedAuthorityVersion" > "CreatorFanRelationshipCurrent"."restrictedAuthorityVersion") THEN EXCLUDED."restrictedAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."restrictedAuthorityVersion" END,
-          "performer" = CASE WHEN EXCLUDED."performerAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."performerAuthorityVersion" IS NULL OR EXCLUDED."performerAuthorityVersion" > "CreatorFanRelationshipCurrent"."performerAuthorityVersion") THEN EXCLUDED."performer" ELSE "CreatorFanRelationshipCurrent"."performer" END,
-          "performerAuthorityVersion" = CASE WHEN EXCLUDED."performerAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."performerAuthorityVersion" IS NULL OR EXCLUDED."performerAuthorityVersion" > "CreatorFanRelationshipCurrent"."performerAuthorityVersion") THEN EXCLUDED."performerAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."performerAuthorityVersion" END,
-          "lastSeenAt" = CASE WHEN EXCLUDED."lastSeenAtAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."lastSeenAtAuthorityVersion" IS NULL OR EXCLUDED."lastSeenAtAuthorityVersion" > "CreatorFanRelationshipCurrent"."lastSeenAtAuthorityVersion") THEN EXCLUDED."lastSeenAt" ELSE "CreatorFanRelationshipCurrent"."lastSeenAt" END,
-          "lastSeenAtAuthorityVersion" = CASE WHEN EXCLUDED."lastSeenAtAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."lastSeenAtAuthorityVersion" IS NULL OR EXCLUDED."lastSeenAtAuthorityVersion" > "CreatorFanRelationshipCurrent"."lastSeenAtAuthorityVersion") THEN EXCLUDED."lastSeenAtAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."lastSeenAtAuthorityVersion" END,
-          "subscribePriceCents" = CASE WHEN EXCLUDED."subscribePriceCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."subscribePriceCentsAuthorityVersion" IS NULL OR EXCLUDED."subscribePriceCentsAuthorityVersion" > "CreatorFanRelationshipCurrent"."subscribePriceCentsAuthorityVersion") THEN EXCLUDED."subscribePriceCents" ELSE "CreatorFanRelationshipCurrent"."subscribePriceCents" END,
-          "subscribePriceCentsAuthorityVersion" = CASE WHEN EXCLUDED."subscribePriceCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanRelationshipCurrent"."subscribePriceCentsAuthorityVersion" IS NULL OR EXCLUDED."subscribePriceCentsAuthorityVersion" > "CreatorFanRelationshipCurrent"."subscribePriceCentsAuthorityVersion") THEN EXCLUDED."subscribePriceCentsAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."subscribePriceCentsAuthorityVersion" END,
-          "observedAt" = CASE WHEN "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" IS NULL OR EXCLUDED."relationshipAuthorityVersion" > "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" THEN EXCLUDED."observedAt" ELSE "CreatorFanRelationshipCurrent"."observedAt" END,
-          "source" = CASE WHEN "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" IS NULL OR EXCLUDED."relationshipAuthorityVersion" > "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" THEN EXCLUDED."source" ELSE "CreatorFanRelationshipCurrent"."source" END,
-          "sourceJobId" = CASE WHEN "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" IS NULL OR EXCLUDED."relationshipAuthorityVersion" > "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" THEN EXCLUDED."sourceJobId" ELSE "CreatorFanRelationshipCurrent"."sourceJobId" END,
-          "scanRunId" = CASE WHEN "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" IS NULL OR EXCLUDED."relationshipAuthorityVersion" > "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" THEN EXCLUDED."scanRunId" ELSE "CreatorFanRelationshipCurrent"."scanRunId" END,
-          "relationshipAuthorityVersion" = CASE WHEN "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" IS NULL OR EXCLUDED."relationshipAuthorityVersion" > "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" THEN EXCLUDED."relationshipAuthorityVersion" ELSE "CreatorFanRelationshipCurrent"."relationshipAuthorityVersion" END,
-          "updatedAt" = NOW()
-      `, json);
-    }
-
-    if (valueRows.length) {
-      const json = JSON.stringify(valueRows);
-      await db.$executeRawUnsafe(`
-        WITH incoming AS (
-          SELECT * FROM jsonb_to_recordset($1::jsonb) AS i(
-            "id" text,"agencyId" text,"creatorId" text,"onlyFansUserId" text,
-            "availability" text,"availabilityAuthorityVersion" text,"valueObservedAt" timestamptz,"source" text,"valueAuthorityVersion" text,
-            "platformReportedTotalSpendCents" text,"platformReportedTotalSpendCentsAuthorityVersion" text,
-            "messagesSpentCents" text,"messagesSpentCentsAuthorityVersion" text,
-            "subscriptionsSpentCents" text,"subscriptionsSpentCentsAuthorityVersion" text,
-            "tipsSpentCents" text,"tipsSpentCentsAuthorityVersion" text,
-            "postsSpentCents" text,"postsSpentCentsAuthorityVersion" text,
-            "streamsSpentCents" text,"streamsSpentCentsAuthorityVersion" text,
-            "lastActivityAt" timestamptz,"lastActivityAtAuthorityVersion" text,"sourceJobId" text,"scanRunId" text
-          )
-        ), joined AS (
-          SELECT i.*, f."id" AS "fanRecordId" FROM incoming i
-          JOIN "CreatorFan" f ON f."creatorId" = i."creatorId" AND f."onlyFansUserId" = i."onlyFansUserId"
-        )
-        INSERT INTO "CreatorFanValueCurrent" (
-          "id","agencyId","creatorId","fanId","totalNetCents","messagesNetCents","subscriptionsNetCents","tipsNetCents","postsNetCents","streamsNetCents",
-          "lastActivityAt","fetchedAt","availability","source","valueAuthorityVersion","availabilityAuthorityVersion",
-          "platformReportedTotalSpendCentsAuthorityVersion","messagesSpentCentsAuthorityVersion","subscriptionsSpentCentsAuthorityVersion",
-          "tipsSpentCentsAuthorityVersion","postsSpentCentsAuthorityVersion","streamsSpentCentsAuthorityVersion","lastActivityAtAuthorityVersion",
-          "sourceJobId","scanRunId","createdAt","updatedAt"
-        )
-        SELECT
-          "id","agencyId","creatorId","fanRecordId",
-          CASE WHEN "platformReportedTotalSpendCents" IS NULL THEN NULL ELSE "platformReportedTotalSpendCents"::bigint END,
-          CASE WHEN "messagesSpentCents" IS NULL THEN NULL ELSE "messagesSpentCents"::bigint END,
-          CASE WHEN "subscriptionsSpentCents" IS NULL THEN NULL ELSE "subscriptionsSpentCents"::bigint END,
-          CASE WHEN "tipsSpentCents" IS NULL THEN NULL ELSE "tipsSpentCents"::bigint END,
-          CASE WHEN "postsSpentCents" IS NULL THEN NULL ELSE "postsSpentCents"::bigint END,
-          CASE WHEN "streamsSpentCents" IS NULL THEN NULL ELSE "streamsSpentCents"::bigint END,
-          "lastActivityAt","valueObservedAt","availability","source","valueAuthorityVersion","availabilityAuthorityVersion",
-          "platformReportedTotalSpendCentsAuthorityVersion","messagesSpentCentsAuthorityVersion","subscriptionsSpentCentsAuthorityVersion",
-          "tipsSpentCentsAuthorityVersion","postsSpentCentsAuthorityVersion","streamsSpentCentsAuthorityVersion","lastActivityAtAuthorityVersion",
-          "sourceJobId","scanRunId",NOW(),NOW()
-        FROM joined
-        ON CONFLICT ("creatorId","fanId") DO UPDATE SET
-          "availability" = CASE WHEN "CreatorFanValueCurrent"."availabilityAuthorityVersion" IS NULL OR EXCLUDED."availabilityAuthorityVersion" > "CreatorFanValueCurrent"."availabilityAuthorityVersion" THEN EXCLUDED."availability" ELSE "CreatorFanValueCurrent"."availability" END,
-          "availabilityAuthorityVersion" = CASE WHEN "CreatorFanValueCurrent"."availabilityAuthorityVersion" IS NULL OR EXCLUDED."availabilityAuthorityVersion" > "CreatorFanValueCurrent"."availabilityAuthorityVersion" THEN EXCLUDED."availabilityAuthorityVersion" ELSE "CreatorFanValueCurrent"."availabilityAuthorityVersion" END,
-          "totalNetCents" = CASE WHEN EXCLUDED."platformReportedTotalSpendCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."platformReportedTotalSpendCentsAuthorityVersion" IS NULL OR EXCLUDED."platformReportedTotalSpendCentsAuthorityVersion" > "CreatorFanValueCurrent"."platformReportedTotalSpendCentsAuthorityVersion") THEN EXCLUDED."totalNetCents" ELSE "CreatorFanValueCurrent"."totalNetCents" END,
-          "platformReportedTotalSpendCentsAuthorityVersion" = CASE WHEN EXCLUDED."platformReportedTotalSpendCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."platformReportedTotalSpendCentsAuthorityVersion" IS NULL OR EXCLUDED."platformReportedTotalSpendCentsAuthorityVersion" > "CreatorFanValueCurrent"."platformReportedTotalSpendCentsAuthorityVersion") THEN EXCLUDED."platformReportedTotalSpendCentsAuthorityVersion" ELSE "CreatorFanValueCurrent"."platformReportedTotalSpendCentsAuthorityVersion" END,
-          "messagesNetCents" = CASE WHEN EXCLUDED."messagesSpentCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."messagesSpentCentsAuthorityVersion" IS NULL OR EXCLUDED."messagesSpentCentsAuthorityVersion" > "CreatorFanValueCurrent"."messagesSpentCentsAuthorityVersion") THEN EXCLUDED."messagesNetCents" ELSE "CreatorFanValueCurrent"."messagesNetCents" END,
-          "messagesSpentCentsAuthorityVersion" = CASE WHEN EXCLUDED."messagesSpentCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."messagesSpentCentsAuthorityVersion" IS NULL OR EXCLUDED."messagesSpentCentsAuthorityVersion" > "CreatorFanValueCurrent"."messagesSpentCentsAuthorityVersion") THEN EXCLUDED."messagesSpentCentsAuthorityVersion" ELSE "CreatorFanValueCurrent"."messagesSpentCentsAuthorityVersion" END,
-          "subscriptionsNetCents" = CASE WHEN EXCLUDED."subscriptionsSpentCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."subscriptionsSpentCentsAuthorityVersion" IS NULL OR EXCLUDED."subscriptionsSpentCentsAuthorityVersion" > "CreatorFanValueCurrent"."subscriptionsSpentCentsAuthorityVersion") THEN EXCLUDED."subscriptionsNetCents" ELSE "CreatorFanValueCurrent"."subscriptionsNetCents" END,
-          "subscriptionsSpentCentsAuthorityVersion" = CASE WHEN EXCLUDED."subscriptionsSpentCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."subscriptionsSpentCentsAuthorityVersion" IS NULL OR EXCLUDED."subscriptionsSpentCentsAuthorityVersion" > "CreatorFanValueCurrent"."subscriptionsSpentCentsAuthorityVersion") THEN EXCLUDED."subscriptionsSpentCentsAuthorityVersion" ELSE "CreatorFanValueCurrent"."subscriptionsSpentCentsAuthorityVersion" END,
-          "tipsNetCents" = CASE WHEN EXCLUDED."tipsSpentCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."tipsSpentCentsAuthorityVersion" IS NULL OR EXCLUDED."tipsSpentCentsAuthorityVersion" > "CreatorFanValueCurrent"."tipsSpentCentsAuthorityVersion") THEN EXCLUDED."tipsNetCents" ELSE "CreatorFanValueCurrent"."tipsNetCents" END,
-          "tipsSpentCentsAuthorityVersion" = CASE WHEN EXCLUDED."tipsSpentCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."tipsSpentCentsAuthorityVersion" IS NULL OR EXCLUDED."tipsSpentCentsAuthorityVersion" > "CreatorFanValueCurrent"."tipsSpentCentsAuthorityVersion") THEN EXCLUDED."tipsSpentCentsAuthorityVersion" ELSE "CreatorFanValueCurrent"."tipsSpentCentsAuthorityVersion" END,
-          "postsNetCents" = CASE WHEN EXCLUDED."postsSpentCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."postsSpentCentsAuthorityVersion" IS NULL OR EXCLUDED."postsSpentCentsAuthorityVersion" > "CreatorFanValueCurrent"."postsSpentCentsAuthorityVersion") THEN EXCLUDED."postsNetCents" ELSE "CreatorFanValueCurrent"."postsNetCents" END,
-          "postsSpentCentsAuthorityVersion" = CASE WHEN EXCLUDED."postsSpentCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."postsSpentCentsAuthorityVersion" IS NULL OR EXCLUDED."postsSpentCentsAuthorityVersion" > "CreatorFanValueCurrent"."postsSpentCentsAuthorityVersion") THEN EXCLUDED."postsSpentCentsAuthorityVersion" ELSE "CreatorFanValueCurrent"."postsSpentCentsAuthorityVersion" END,
-          "streamsNetCents" = CASE WHEN EXCLUDED."streamsSpentCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."streamsSpentCentsAuthorityVersion" IS NULL OR EXCLUDED."streamsSpentCentsAuthorityVersion" > "CreatorFanValueCurrent"."streamsSpentCentsAuthorityVersion") THEN EXCLUDED."streamsNetCents" ELSE "CreatorFanValueCurrent"."streamsNetCents" END,
-          "streamsSpentCentsAuthorityVersion" = CASE WHEN EXCLUDED."streamsSpentCentsAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."streamsSpentCentsAuthorityVersion" IS NULL OR EXCLUDED."streamsSpentCentsAuthorityVersion" > "CreatorFanValueCurrent"."streamsSpentCentsAuthorityVersion") THEN EXCLUDED."streamsSpentCentsAuthorityVersion" ELSE "CreatorFanValueCurrent"."streamsSpentCentsAuthorityVersion" END,
-          "lastActivityAt" = CASE WHEN EXCLUDED."lastActivityAtAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."lastActivityAtAuthorityVersion" IS NULL OR EXCLUDED."lastActivityAtAuthorityVersion" > "CreatorFanValueCurrent"."lastActivityAtAuthorityVersion") THEN EXCLUDED."lastActivityAt" ELSE "CreatorFanValueCurrent"."lastActivityAt" END,
-          "lastActivityAtAuthorityVersion" = CASE WHEN EXCLUDED."lastActivityAtAuthorityVersion" IS NOT NULL AND ("CreatorFanValueCurrent"."lastActivityAtAuthorityVersion" IS NULL OR EXCLUDED."lastActivityAtAuthorityVersion" > "CreatorFanValueCurrent"."lastActivityAtAuthorityVersion") THEN EXCLUDED."lastActivityAtAuthorityVersion" ELSE "CreatorFanValueCurrent"."lastActivityAtAuthorityVersion" END,
-          "fetchedAt" = CASE WHEN "CreatorFanValueCurrent"."valueAuthorityVersion" IS NULL OR EXCLUDED."valueAuthorityVersion" > "CreatorFanValueCurrent"."valueAuthorityVersion" THEN EXCLUDED."fetchedAt" ELSE "CreatorFanValueCurrent"."fetchedAt" END,
-          "source" = CASE WHEN "CreatorFanValueCurrent"."valueAuthorityVersion" IS NULL OR EXCLUDED."valueAuthorityVersion" > "CreatorFanValueCurrent"."valueAuthorityVersion" THEN EXCLUDED."source" ELSE "CreatorFanValueCurrent"."source" END,
-          "sourceJobId" = CASE WHEN "CreatorFanValueCurrent"."valueAuthorityVersion" IS NULL OR EXCLUDED."valueAuthorityVersion" > "CreatorFanValueCurrent"."valueAuthorityVersion" THEN EXCLUDED."sourceJobId" ELSE "CreatorFanValueCurrent"."sourceJobId" END,
-          "scanRunId" = CASE WHEN "CreatorFanValueCurrent"."valueAuthorityVersion" IS NULL OR EXCLUDED."valueAuthorityVersion" > "CreatorFanValueCurrent"."valueAuthorityVersion" THEN EXCLUDED."scanRunId" ELSE "CreatorFanValueCurrent"."scanRunId" END,
-          "valueAuthorityVersion" = CASE WHEN "CreatorFanValueCurrent"."valueAuthorityVersion" IS NULL OR EXCLUDED."valueAuthorityVersion" > "CreatorFanValueCurrent"."valueAuthorityVersion" THEN EXCLUDED."valueAuthorityVersion" ELSE "CreatorFanValueCurrent"."valueAuthorityVersion" END,
-          "updatedAt" = NOW()
-      `, json);
-    }
+  for (const [field, itemField] of Object.entries(valueMap)) {
+    if (valueFields.has(field) || (!valueFields.size && item?.[itemField] !== null && item?.[itemField] !== undefined)) value[field] = item[itemField];
   }
+  if (value.availability === VALUE_AVAILABILITY.AVAILABLE && value.totalSpentCents == null) value.availability = VALUE_AVAILABILITY.MALFORMED;
 
-  return { projected: items.length };
+  return { onlyFansUserId: onlyFansUserIdValue, identity, relationship, value };
+}
+
+async function projectSubscriberDirectoryItems(db, { items = [], agencyId, creatorId, runId, sourceJobId = null, campaignLockHeld = false } = {}) {
+  const observations = (Array.isArray(items) ? items : []).map(subscriberDirectoryObservationFromItem).filter(Boolean);
+  if (!observations.length) return { ok: true, projected: 0, identityProjected: 0, relationshipProjected: 0, valueProjected: 0, touchedFanIds: [] };
+  return commitFanFacts(db, {
+    agencyId,
+    creatorId,
+    sourceJobId,
+    scanRunId: runId,
+    items: observations,
+    allowedSources: ["SUBSCRIBER_DIRECTORY"],
+    observedAtPolicy: "TRUSTED_INPUT",
+    receivedAt: new Date(),
+    campaignLockHeld,
+  });
+}
+
+async function projectSubscriberDirectoryRun(db, { runId, agencyId, creatorId, sourceJobId = null, cursorId = null, limit = 100 } = {}) {
+  if (!text(runId, 180) || !text(agencyId, 180) || !text(creatorId, 180)) throw new Error("Invalid subscriber projection scope");
+  const take = Math.max(1, Math.min(100, Number(limit) || 100));
+  const where = { runId, ...(cursorId ? { id: { gt: String(cursorId) } } : {}) };
+  const items = await db.subscriberScanItem.findMany({ where, orderBy: { id: "asc" }, take });
+  if (!items.length) return { projected: 0, nextCursorId: cursorId || null, done: true };
+  const result = await projectSubscriberDirectoryItems(db, { items, agencyId, creatorId, runId, sourceJobId });
+  return {
+    projected: result.projected,
+    nextCursorId: items[items.length - 1].id,
+    done: items.length < take,
+  };
 }
 
 const FAN_DATA_POINT_REFRESH_JOB_KEY = "fan_data_point_refresh";
@@ -1572,7 +1275,7 @@ async function applyGenericFanObservationBulkSql(tx, rows, scope) {
 }
 
 
-async function projectFanObservationBatch(db, {
+async function commitFanFacts(db, {
   agencyId, creatorId, sourceDeviceId = null, sourceJobId = null, sourceDeliveryId = null, scanRunId = null, items = [],
   allowedSources = null, observedAtPolicy = null, receivedAt = new Date(), causalObservedAt = null, campaignLockHeld = false,
 } = {}) {
@@ -1670,6 +1373,11 @@ async function projectFanObservationBatch(db, {
   if (typeof db.$transaction === "function") return db.$transaction((tx) => apply(tx));
   return apply(db);
 }
+
+async function projectFanObservationBatch(db, options = {}) {
+  return commitFanFacts(db, options);
+}
+
 
 async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult }) {
   if (!job?.creatorId || !job?.agencyId) throw new Error("fan_data_point_refresh job is missing creator scope");
@@ -1879,6 +1587,8 @@ module.exports = {
   projectFanRelationship,
   projectFanValue,
   projectSubscriberDirectoryRun,
+  projectSubscriberDirectoryItems,
+  commitFanFacts,
   projectFanObservationBatch,
   applyFanDataPointRefreshChunk,
   scheduleFanDataPointRefresh,

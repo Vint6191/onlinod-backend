@@ -6,7 +6,6 @@ const { dbAuthorityNow } = require("./db-time-authority-service");
 const { fanDataRefreshScheduleAvailable } = require("./provider-capacity-authority-service");
 const {
   acquireCampaignTransactionLock,
-  acquireCampaignTransactionLocks,
   withCampaignTransactionLock,
 } = require("./campaign-transaction-lock-service");
 
@@ -76,6 +75,78 @@ function campaignFanRefreshFailurePlan(demand, now) {
     lastOutcome: quarantined ? "QUARANTINED" : "RETRY_BACKOFF",
   };
 }
+function campaignPromotionSignalId(creatorId) {
+  return `campaign_promote_${crypto.createHash("sha256").update(String(creatorId || "")).digest("hex").slice(0, 24)}`;
+}
+
+async function signalCampaignFanRefreshPromotion({ db, agencyId, creatorId, dueAt = new Date(), reason = "QUEUED_DEBT" } = {}) {
+  const scopedCreatorId = clean(creatorId, 180);
+  const scopedAgencyId = clean(agencyId, 180);
+  const effectiveDueAt = asDate(dueAt) || new Date();
+  if (!scopedCreatorId || !scopedAgencyId) return { signaled: false, reason: "scope_required" };
+  if (db?.campaignFanRefreshPromotionSignal?.upsert) {
+    const existing = await db.campaignFanRefreshPromotionSignal.findUnique?.({ where: { creatorId: scopedCreatorId } });
+    const nextDueAt = existing?.dueAt && asDate(existing.dueAt) && asDate(existing.dueAt) < effectiveDueAt ? asDate(existing.dueAt) : effectiveDueAt;
+    await db.campaignFanRefreshPromotionSignal.upsert({
+      where: { creatorId: scopedCreatorId },
+      create: {
+        id: campaignPromotionSignalId(scopedCreatorId), agencyId: scopedAgencyId, creatorId: scopedCreatorId,
+        dueAt: effectiveDueAt, reason: clean(reason, 64) || "QUEUED_DEBT", revision: 1, attempts: 0,
+      },
+      update: {
+        agencyId: scopedAgencyId, dueAt: nextDueAt, reason: clean(reason, 64) || "QUEUED_DEBT",
+        revision: { increment: 1 }, lastError: null,
+      },
+    });
+    return { signaled: true, dueAt: nextDueAt };
+  }
+  if (typeof db?.$executeRawUnsafe === "function") {
+    await db.$executeRawUnsafe(`
+      INSERT INTO "CampaignFanRefreshPromotionSignal" (
+        "id","agencyId","creatorId","dueAt","reason","revision","attempts","createdAt","updatedAt"
+      ) VALUES ($1,$2,$3,$4,$5,1,0,NOW(),NOW())
+      ON CONFLICT ("creatorId") DO UPDATE SET
+        "agencyId" = EXCLUDED."agencyId",
+        "dueAt" = LEAST("CampaignFanRefreshPromotionSignal"."dueAt", EXCLUDED."dueAt"),
+        "reason" = EXCLUDED."reason",
+        "revision" = "CampaignFanRefreshPromotionSignal"."revision" + 1,
+        "lastError" = NULL,
+        "updatedAt" = NOW()
+    `, campaignPromotionSignalId(scopedCreatorId), scopedAgencyId, scopedCreatorId, effectiveDueAt, clean(reason, 64) || "QUEUED_DEBT");
+    return { signaled: true, dueAt: effectiveDueAt };
+  }
+  return { signaled: false, reason: "adapter_unsupported" };
+}
+
+async function healExistingCanonicalCampaignDebt({ db, creatorId, now = null, limit = 500 } = {}) {
+  const scopedCreatorId = clean(creatorId, 180);
+  if (!scopedCreatorId || typeof db?.$queryRawUnsafe !== "function") return { healedFans: 0, reason: "adapter_unsupported" };
+  const take = Math.max(1, Math.min(500, Number(limit) || 500));
+  const rows = await db.$queryRawUnsafe(`
+    SELECT d."onlyFansUserId"
+    FROM "CreatorFanRefreshDemand" d
+    JOIN "CreatorFan" f
+      ON f."creatorId" = d."creatorId"
+     AND f."onlyFansUserId" = d."onlyFansUserId"
+    JOIN "CreatorFanValueCurrent" v
+      ON v."creatorId" = f."creatorId"
+     AND v."fanId" = f."id"
+    WHERE d."creatorId" = $1
+      AND d."status" IN ('QUEUED','FAILED')
+      AND v."valueObservedAt" IS NOT NULL
+      AND v."valueObservedAt" >= d."requestedFreshnessCutoffAt"
+    ORDER BY d."updatedAt" ASC, d."id" ASC
+    FOR UPDATE OF d SKIP LOCKED
+    LIMIT $2
+  `, scopedCreatorId, take);
+  const fanIds = [...new Set((rows || []).map((row) => clean(row?.onlyFansUserId, 180)).filter(Boolean))];
+  if (!fanIds.length) return { healedFans: 0, reason: "none_due" };
+  const result = await reconcileCampaignFanRefreshDemandsFromCanonicalObservations({
+    db, creatorId: scopedCreatorId, fanIds, now: asDate(now) || new Date(), _campaignLockHeld: true,
+  });
+  return { healedFans: fanIds.length, result, reason: "canonical_backfill" };
+}
+
 function shouldResetCampaignRefreshJob(existing) {
   return ["DONE", "FAILED", "CANCELLED"].includes(String(existing?.status || ""));
 }
@@ -642,30 +713,11 @@ function supportsSetBasedCampaignFanRefreshRecovery(db) {
     && Boolean(db?.creatorFanRefreshDemand?.findMany);
 }
 
-async function discoverFailedCampaignFanRefreshCreatorIds({ db, now, force = false, maxDemands = 200 } = {}) {
-  const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
-  const limit = Math.max(1, Math.min(2000, Number(maxDemands) || 200));
-  const rows = await db.$queryRawUnsafe(`
-    SELECT DISTINCT d."creatorId"
-    FROM "CreatorFanRefreshDemand" d
-    WHERE d."status" = 'FAILED'
-      AND d."activeRefreshJobId" IS NULL
-      AND ($2::boolean = TRUE OR (
-        d."quarantinedAt" IS NULL
-        AND d."nextRetryAt" IS NOT NULL
-        AND d."nextRetryAt" <= $1
-      ))
-    ORDER BY d."creatorId" ASC
-    LIMIT $3
-  `, effectiveNow, force === true, limit);
-  return [...new Set((Array.isArray(rows) ? rows : []).map((row) => clean(row?.creatorId, 180)).filter(Boolean))].sort();
-}
 
-async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creatorId = null, lockedCreatorIds = [], force = false, maxDemands = 200 } = {}) {
+async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creatorId = null, force = false, maxDemands = 200 } = {}) {
   const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
   const scopedCreatorId = clean(creatorId, 180);
-  const creatorIds = [...new Set((Array.isArray(lockedCreatorIds) ? lockedCreatorIds : []).map((value) => clean(value, 180)).filter(Boolean))].sort();
-  if (!scopedCreatorId && !creatorIds.length) return { recovered: 0, requeuedWork: 0, coverageRunsUpdated: 0, reason: "none_due", topology: "set_based_v2" };
+  if (!scopedCreatorId) return { recovered: 0, requeuedWork: 0, coverageRunsUpdated: 0, reason: "creator_required", topology: "set_based_v3_creator_scoped" };
   const limit = Math.max(1, Math.min(2000, Number(maxDemands) || 200));
   const rows = await db.$queryRawUnsafe(`
     WITH candidate AS (
@@ -678,8 +730,7 @@ async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creator
           AND d."nextRetryAt" IS NOT NULL
           AND d."nextRetryAt" <= $1
         ))
-        AND ($3::text IS NULL OR d."creatorId" = $3)
-        AND ($3::text IS NOT NULL OR d."creatorId" = ANY($5::text[]))
+        AND d."creatorId" = $3
       ORDER BY COALESCE(d."nextRetryAt", d."lastFailedAt", d."updatedAt") ASC, d."id" ASC
       FOR UPDATE SKIP LOCKED
       LIMIT $4
@@ -762,7 +813,7 @@ async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creator
       (SELECT COUNT(*)::int FROM demand_update) AS "recovered",
       (SELECT COUNT(*)::int FROM work_update) AS "requeuedWork",
       (SELECT COUNT(*)::int FROM coverage_update) AS "coverageRunsUpdated"
-  `, effectiveNow, force === true, scopedCreatorId, limit, creatorIds);
+  `, effectiveNow, force === true, scopedCreatorId, limit);
   const result = Array.isArray(rows) && rows[0] ? rows[0] : {};
   if (Math.max(0, Number(result.coverageTransitionLost || 0)) > 0) {
     throw new Error("CAMPAIGN_FAN_REFRESH_REQUEUE_COVERAGE_TRANSITION_LOST");
@@ -773,41 +824,33 @@ async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creator
     requeuedWork: Math.max(0, Number(result.requeuedWork || 0)),
     coverageRunsUpdated: Math.max(0, Number(result.coverageRunsUpdated || 0)),
     reason: recovered ? (force ? "manual_repair_queued" : "retry_due_queued") : "none_due",
-    topology: "set_based_v2",
+    topology: "set_based_v3_creator_scoped",
   };
 }
 
-async function recoverFailedCampaignFanRefreshDemands({ db, now = null, creatorId = null, force = false, maxDemands = 200, _transactionWrapped = false } = {}) {
+async function recoverFailedCampaignFanRefreshDemands({ db, now = null, creatorId = null, force = false, maxDemands = 200, _transactionWrapped = false, _campaignLockHeld = false } = {}) {
   if (!db?.creatorFanRefreshDemand?.findMany) return { recovered: 0, requeuedWork: 0, reason: "adapter_unsupported" };
+  const scopedCreatorId = clean(creatorId, 180);
+  if (!scopedCreatorId) return { recovered: 0, requeuedWork: 0, reason: "creator_required" };
   if (supportsSetBasedCampaignFanRefreshRecovery(db)) {
     if (!_transactionWrapped && typeof db?.$transaction === "function") {
       return db.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({
-        db: tx, now, creatorId, force, maxDemands, _transactionWrapped: true,
+        db: tx, now, creatorId: scopedCreatorId, force, maxDemands, _transactionWrapped: true, _campaignLockHeld,
       }), { maxWait: 30_000, timeout: 60_000 });
     }
-    const scopedCreatorId = clean(creatorId, 180);
-    let lockedCreatorIds;
-    if (scopedCreatorId) {
-      await acquireCampaignTransactionLock(db, scopedCreatorId);
-      lockedCreatorIds = [scopedCreatorId];
-    } else {
-      lockedCreatorIds = await discoverFailedCampaignFanRefreshCreatorIds({ db, now, force, maxDemands });
-      if (!lockedCreatorIds.length) return { recovered: 0, requeuedWork: 0, coverageRunsUpdated: 0, reason: "none_due", topology: "set_based_v2" };
-      await acquireCampaignTransactionLocks(db, lockedCreatorIds);
-    }
-    return recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creatorId: scopedCreatorId, lockedCreatorIds, force, maxDemands });
+    if (!_campaignLockHeld) await acquireCampaignTransactionLock(db, scopedCreatorId);
+    return recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creatorId: scopedCreatorId, force, maxDemands });
   }
   const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
-  const scopedCreatorId = clean(creatorId, 180);
   const limit = Math.max(1, Math.min(2000, Number(maxDemands) || 200));
   const candidates = await db.creatorFanRefreshDemand.findMany({
     where: {
+      creatorId: scopedCreatorId,
       status: DEMAND_STATUS.FAILED,
       activeRefreshJobId: null,
-      ...(scopedCreatorId ? { creatorId: scopedCreatorId } : {}),
       ...(force ? {} : { quarantinedAt: null, nextRetryAt: { lte: effectiveNow } }),
     },
-    orderBy: [{ nextRetryAt: "asc" }, { id: "asc" }],
+    orderBy: [{ nextRetryAt: "asc" }, { updatedAt: "asc" }],
     take: limit,
   });
   let recovered = 0;
@@ -836,17 +879,24 @@ async function recoverFailedCampaignFanRefreshDemands({ db, now = null, creatorI
 }
 
 async function repairFailedCampaignFanRefreshDemands({ db, creatorId, now = null, maxDemands = 200 } = {}) {
-  if (!creatorId) return { recovered: 0, requeuedWork: 0, reason: "creator_required" };
-  if (typeof db?.$transaction === "function") {
-    return db.$transaction(async (tx) => {
-      const repaired = await recoverFailedCampaignFanRefreshDemands({ db: tx, creatorId, now, force: true, maxDemands });
-      const promoted = await promoteQueuedCampaignFanRefreshDemands({ db: tx, now, maxJobs: 4, inTransaction: true });
-      return { ...repaired, promotedJobs: promoted.promotedJobs, promotedFans: promoted.promotedFans };
+  const scopedCreatorId = clean(creatorId, 180);
+  if (!scopedCreatorId) return { recovered: 0, requeuedWork: 0, reason: "creator_required" };
+  const work = async (tx) => {
+    await acquireCampaignTransactionLock(tx, scopedCreatorId);
+    const repaired = await recoverFailedCampaignFanRefreshDemands({
+      db: tx, creatorId: scopedCreatorId, now, force: true, maxDemands,
+      _transactionWrapped: true, _campaignLockHeld: true,
     });
-  }
-  const repaired = await recoverFailedCampaignFanRefreshDemands({ db, creatorId, now, force: true, maxDemands });
-  const promoted = await promoteQueuedCampaignFanRefreshDemands({ db, now, maxJobs: 4, inTransaction: true });
-  return { ...repaired, promotedJobs: promoted.promotedJobs, promotedFans: promoted.promotedFans };
+    const agencyRow = await tx.creatorFanRefreshDemand.findFirst({ where: { creatorId: scopedCreatorId }, select: { agencyId: true } });
+    if (agencyRow?.agencyId) {
+      await signalCampaignFanRefreshPromotion({
+        db: tx, agencyId: agencyRow.agencyId, creatorId: scopedCreatorId, dueAt: asDate(now) || new Date(), reason: "MANUAL_REPAIR",
+      });
+    }
+    return { ...repaired, promotionSignaled: Boolean(agencyRow?.agencyId), promotedJobs: 0, promotedFans: 0 };
+  };
+  if (typeof db?.$transaction === "function") return db.$transaction(work, { maxWait: 30_000, timeout: 60_000 });
+  return work(db);
 }
 
 
@@ -999,6 +1049,7 @@ async function scheduleDemandRefreshJob({ db, job, demands, scheduledAt, planner
       where: { demandId: { in: demandIds }, status: WORK_STATUS.QUEUED },
       data: { refreshJobId: null },
     });
+    await signalCampaignFanRefreshPromotion({ db, agencyId, creatorId, dueAt: scheduledAt, reason: "CAPACITY_DEFERRED" });
     return null;
   }
   const planRefreshJob = planner || require("./job-planning-repository").ensurePlannedJob;
@@ -1240,6 +1291,9 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
     now: scheduledAt,
     coverageAuthority,
   });
+  if (needsJob.length && !scheduledJobId) {
+    await signalCampaignFanRefreshPromotion({ db, agencyId, creatorId, dueAt: scheduledAt, reason: "ENQUEUE_DEFERRED" });
+  }
   return {
     expected: freshCreated + staleCreated,
     alreadyFresh: freshCreated,
@@ -1252,130 +1306,173 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
   };
 }
 
-async function promoteQueuedCampaignFanRefreshDemands({ db, now = null, maxJobs = 4, planner = null, inTransaction = false } = {}) {
+async function promoteQueuedCampaignFanRefreshDemands({ db, creatorId, now = null, maxJobs = 4, planner = null, inTransaction = false, _campaignLockHeld = false } = {}) {
+  const scopedCreatorId = clean(creatorId, 180);
+  if (!scopedCreatorId) return { promotedJobs: 0, promotedFans: 0, reason: "creator_required" };
   if (!inTransaction && typeof db?.$transaction === "function") {
-    return db.$transaction((tx) => promoteQueuedCampaignFanRefreshDemands({ db: tx, now, maxJobs, planner, inTransaction: true }));
+    return db.$transaction((tx) => promoteQueuedCampaignFanRefreshDemands({
+      db: tx, creatorId: scopedCreatorId, now, maxJobs, planner, inTransaction: true, _campaignLockHeld,
+    }), { maxWait: 30_000, timeout: 60_000 });
   }
   if (!db?.creatorFanRefreshDemand?.findMany || !db?.jobInstance) return { promotedJobs: 0, promotedFans: 0, reason: "adapter_unsupported" };
+  if (!_campaignLockHeld) await acquireCampaignTransactionLock(db, scopedCreatorId);
   const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
   const limit = Math.max(1, Math.min(16, Number(maxJobs) || 4));
-  // Failed demand is durable debt, not a terminal dead-end. Requeue only due,
-  // non-quarantined rows under the same transaction/row locks used by the
-  // backlog promoter. This keeps multi-replica retry idempotent.
-  await recoverFailedCampaignFanRefreshDemands({
-    db, now: effectiveNow, force: false, maxDemands: limit * CAMPAIGN_FAN_REFRESH_JOB_MAX,
+  const pending = await db.creatorFanRefreshDemand.findMany({
+    where: {
+      creatorId: scopedCreatorId,
+      status: DEMAND_STATUS.QUEUED,
+      activeRefreshJobId: null,
+      campaignWork: { some: { status: WORK_STATUS.QUEUED } },
+    },
+    orderBy: [{ lastRequestedAt: "asc" }, { id: "asc" }],
+    take: limit * CAMPAIGN_FAN_REFRESH_JOB_MAX,
   });
-  // Pull a bounded oldest-per-creator window rather than one global oldest slice.
-  // A creator with a very deep old backlog may already be at its per-creator
-  // scheduled-job cap. If that creator can fill the whole candidate slice, a
-  // global `take` starves every newer creator before schedule admission even has
-  // a chance to consider them. Production PostgreSQL therefore contributes at
-  // most one job-sized batch per creator to this promotion pass. The actual job
-  // create path still re-checks global/per-creator capacity under the shared
-  // advisory xact lock, so this query is fairness discovery, not admission.
-  let pending;
-  if (typeof db?.$queryRawUnsafe === "function") {
-    const promotionWindow = Math.max(CAMPAIGN_FAN_REFRESH_JOB_MAX * 16, limit * CAMPAIGN_FAN_REFRESH_JOB_MAX * 16);
-    const ranked = await db.$queryRawUnsafe(`
-      WITH ranked AS (
-        SELECT
-          d."id",
-          d."creatorId",
-          d."lastRequestedAt",
-          ROW_NUMBER() OVER (
-            PARTITION BY d."creatorId"
-            ORDER BY d."lastRequestedAt" ASC, d."id" ASC
-          ) AS rn
-        FROM "CreatorFanRefreshDemand" d
-        WHERE d."status" = 'QUEUED'
-          AND d."activeRefreshJobId" IS NULL
-          AND EXISTS (
-            SELECT 1
-            FROM "CreatorCampaignFanRefreshWork" w
-            WHERE w."demandId" = d."id"
-              AND w."status" = 'QUEUED'
-          )
-      )
-      SELECT "id", "lastRequestedAt"
-      FROM ranked
-      WHERE rn <= $1
-      ORDER BY "lastRequestedAt" ASC, "id" ASC
-      LIMIT $2
-    `, CAMPAIGN_FAN_REFRESH_JOB_MAX, promotionWindow);
-    const rankedIds = (Array.isArray(ranked) ? ranked : []).map((row) => clean(row?.id, 180)).filter(Boolean);
-    if (rankedIds.length) {
-      pending = await db.creatorFanRefreshDemand.findMany({
-        where: {
-          id: { in: rankedIds },
-          status: DEMAND_STATUS.QUEUED,
-          activeRefreshJobId: null,
-          campaignWork: { some: { status: WORK_STATUS.QUEUED } },
-        },
-      });
-      pending.sort((a, b) => {
-        const at = (asDate(a?.lastRequestedAt) || effectiveNow).getTime();
-        const bt = (asDate(b?.lastRequestedAt) || effectiveNow).getTime();
-        return at - bt || String(a?.id || "").localeCompare(String(b?.id || ""));
-      });
-    } else {
-      pending = [];
-    }
-  } else {
-    pending = await db.creatorFanRefreshDemand.findMany({
-      where: {
-        status: DEMAND_STATUS.QUEUED,
-        activeRefreshJobId: null,
-        campaignWork: { some: { status: WORK_STATUS.QUEUED } },
-      },
-      orderBy: [{ lastRequestedAt: "asc" }, { id: "asc" }],
-      take: Math.max(CAMPAIGN_FAN_REFRESH_JOB_MAX, limit * CAMPAIGN_FAN_REFRESH_JOB_MAX * 4),
-    });
-  }
   if (!pending.length) return { promotedJobs: 0, promotedFans: 0, reason: "none_pending" };
-
-  const byCreator = new Map();
-  for (const demand of pending) {
-    const creatorId = clean(demand.creatorId, 180);
-    const agencyId = clean(demand.agencyId, 180);
-    const fanId = clean(demand.onlyFansUserId, 180);
-    if (!creatorId || !agencyId || !fanId) continue;
-    let group = byCreator.get(creatorId);
-    if (!group) {
-      group = { creatorId, agencyId, rows: [], cursor: 0, oldestAt: asDate(demand.lastRequestedAt) || effectiveNow };
-      byCreator.set(creatorId, group);
-    }
-    group.rows.push({ fanId, demand, revision: Math.max(1, Number(demand.requestedRevision || 1)) });
-  }
-  const groups = [...byCreator.values()].sort((a, b) => a.oldestAt.getTime() - b.oldestAt.getTime() || a.creatorId.localeCompare(b.creatorId));
+  const agencyId = clean(pending[0]?.agencyId, 180);
+  if (!agencyId) return { promotedJobs: 0, promotedFans: 0, reason: "scope_invalid" };
   let promotedJobs = 0;
   let promotedFans = 0;
-  while (promotedJobs < limit) {
-    let madeProgress = false;
-    for (const group of groups) {
-      if (promotedJobs >= limit) break;
-      if (group.cursor >= group.rows.length) continue;
-      const batch = group.rows.slice(group.cursor, group.cursor + CAMPAIGN_FAN_REFRESH_JOB_MAX);
-      group.cursor += batch.length;
-      const refreshJobId = await scheduleDemandRefreshJob({
-        db,
-        job: { id: "campaign-refresh-backlog-promoter", agencyId: group.agencyId, creatorId: group.creatorId, priority: 85 },
-        demands: batch,
-        scheduledAt: effectiveNow,
-        planner,
-      });
-      if (!refreshJobId) {
-        // Capacity for this creator/global pool is currently saturated. Do not
-        // skip deeper rows and manufacture younger work ahead of the oldest debt.
-        group.cursor -= batch.length;
-        continue;
-      }
-      promotedJobs += 1;
-      promotedFans += batch.length;
-      madeProgress = true;
-    }
-    if (!madeProgress) break;
+  for (let cursor = 0; cursor < pending.length && promotedJobs < limit; cursor += CAMPAIGN_FAN_REFRESH_JOB_MAX) {
+    const slice = pending.slice(cursor, cursor + CAMPAIGN_FAN_REFRESH_JOB_MAX);
+    const batch = slice.map((demand) => ({
+      fanId: clean(demand.onlyFansUserId, 180), demand, revision: Math.max(1, Number(demand.requestedRevision || 1)),
+    })).filter((row) => row.fanId);
+    if (!batch.length) continue;
+    const refreshJobId = await scheduleDemandRefreshJob({
+      db,
+      job: { id: "campaign-refresh-backlog-promoter", agencyId, creatorId: scopedCreatorId, priority: 85 },
+      demands: batch,
+      scheduledAt: effectiveNow,
+      planner,
+    });
+    if (!refreshJobId) break;
+    promotedJobs += 1;
+    promotedFans += batch.length;
   }
   return { promotedJobs, promotedFans, reason: promotedJobs ? "promoted" : "capacity_saturated" };
+}
+
+const CAMPAIGN_PROMOTION_SIGNAL_CLAIM_MS = 2 * 60 * 1000;
+
+async function claimCampaignFanRefreshPromotionSignal({ db, now = new Date() } = {}) {
+  if (typeof db?.$transaction !== "function") return null;
+  const effectiveNow = asDate(now) || new Date();
+  const claimToken = `claim_${crypto.randomUUID?.() || crypto.randomBytes(16).toString("hex")}`;
+  const claimUntil = new Date(effectiveNow.getTime() + CAMPAIGN_PROMOTION_SIGNAL_CLAIM_MS);
+  return db.$transaction(async (tx) => {
+    if (typeof tx?.$queryRawUnsafe !== "function") return null;
+    const rows = await tx.$queryRawUnsafe(`
+      WITH candidate AS (
+        SELECT s."id"
+        FROM "CampaignFanRefreshPromotionSignal" s
+        WHERE s."dueAt" <= $1
+          AND (s."claimUntil" IS NULL OR s."claimUntil" <= $1)
+        ORDER BY s."dueAt" ASC, s."creatorId" ASC
+        FOR UPDATE OF s SKIP LOCKED
+        LIMIT 1
+      )
+      UPDATE "CampaignFanRefreshPromotionSignal" s
+      SET "claimToken" = $2,
+          "claimUntil" = $3,
+          "updatedAt" = NOW()
+      FROM candidate c
+      WHERE s."id" = c."id"
+      RETURNING s."id", s."agencyId", s."creatorId", s."dueAt", s."revision", s."attempts", s."claimToken", s."claimUntil"
+    `, effectiveNow, claimToken, claimUntil);
+    return Array.isArray(rows) ? rows[0] || null : null;
+  }, { maxWait: 10_000, timeout: 10_000 });
+}
+
+async function releaseCampaignFanRefreshPromotionClaim({ db, signal, now = new Date(), error = null } = {}) {
+  if (!signal?.id || !signal?.claimToken) return false;
+  const effectiveNow = asDate(now) || new Date();
+  const dueAt = new Date(effectiveNow.getTime() + 60_000);
+  if (db?.campaignFanRefreshPromotionSignal?.updateMany) {
+    const updated = await db.campaignFanRefreshPromotionSignal.updateMany({
+      where: { id: signal.id, claimToken: signal.claimToken },
+      data: { dueAt, claimToken: null, claimUntil: null, attempts: { increment: 1 }, lastError: clean(error?.message || error, 1000) },
+    });
+    return Number(updated?.count || 0) > 0;
+  }
+  if (typeof db?.$executeRawUnsafe === "function") {
+    const count = await db.$executeRawUnsafe(`
+      UPDATE "CampaignFanRefreshPromotionSignal"
+      SET "dueAt" = $3, "claimToken" = NULL, "claimUntil" = NULL,
+          "attempts" = "attempts" + 1, "lastError" = $4, "updatedAt" = NOW()
+      WHERE "id" = $1 AND "claimToken" = $2
+    `, signal.id, signal.claimToken, dueAt, clean(error?.message || error, 1000));
+    return Number(count || 0) > 0;
+  }
+  return false;
+}
+
+async function runCampaignFanRefreshPromotionMaintenance({ db, now = new Date(), maxCreators = 20, maxJobsPerCreator = 4 } = {}) {
+  const root = db;
+  if (typeof root?.$transaction !== "function" || typeof root?.$queryRawUnsafe !== "function") return { processedCreators: 0, promotedJobs: 0, promotedFans: 0, healedFans: 0, recovered: 0, reason: "adapter_unsupported" };
+  const effectiveNow = asDate(now) || new Date();
+  const max = Math.max(1, Math.min(50, Number(maxCreators) || 20));
+  const totals = { processedCreators: 0, promotedJobs: 0, promotedFans: 0, healedFans: 0, recovered: 0, errors: 0, contended: 0 };
+  for (let index = 0; index < max; index += 1) {
+    // Claim is its own short SKIP LOCKED transaction. No signal row lock is held
+    // while waiting for the creator Campaign authority, avoiding signal->campaign
+    // versus campaign->signal inversion with enqueue/terminal writers.
+    const signal = await claimCampaignFanRefreshPromotionSignal({ db: root, now: effectiveNow });
+    if (!signal) break;
+    try {
+      const claimed = await root.$transaction(async (tx) => {
+        const creatorId = clean(signal.creatorId, 180);
+        const agencyId = clean(signal.agencyId, 180);
+        if (!creatorId || !agencyId) return { stale: true };
+        await acquireCampaignTransactionLock(tx, creatorId);
+        const current = await tx.campaignFanRefreshPromotionSignal.findFirst({
+          where: { id: signal.id, claimToken: signal.claimToken, claimUntil: { gt: effectiveNow } },
+        });
+        if (!current) return { stale: true };
+
+        const healed = await healExistingCanonicalCampaignDebt({ db: tx, creatorId, now: effectiveNow, limit: 500 });
+        const recovered = await recoverFailedCampaignFanRefreshDemands({
+          db: tx, creatorId, now: effectiveNow, force: false, maxDemands: 500,
+          _transactionWrapped: true, _campaignLockHeld: true,
+        });
+        const promoted = await promoteQueuedCampaignFanRefreshDemands({
+          db: tx, creatorId, now: effectiveNow, maxJobs: maxJobsPerCreator, inTransaction: true, _campaignLockHeld: true,
+        });
+        const [queuedCount, failedDueCount, nextFailed] = await Promise.all([
+          tx.creatorFanRefreshDemand.count({ where: { creatorId, status: DEMAND_STATUS.QUEUED, activeRefreshJobId: null } }),
+          tx.creatorFanRefreshDemand.count({ where: { creatorId, status: DEMAND_STATUS.FAILED, activeRefreshJobId: null, quarantinedAt: null, nextRetryAt: { lte: effectiveNow } } }),
+          tx.creatorFanRefreshDemand.findFirst({
+            where: { creatorId, status: DEMAND_STATUS.FAILED, activeRefreshJobId: null, quarantinedAt: null, nextRetryAt: { gt: effectiveNow } },
+            orderBy: { nextRetryAt: "asc" }, select: { nextRetryAt: true },
+          }),
+        ]);
+        if (queuedCount > 0 || failedDueCount > 0 || healed.healedFans >= 500) {
+          await tx.campaignFanRefreshPromotionSignal.update({
+            where: { id: signal.id },
+            data: { dueAt: new Date(effectiveNow.getTime() + 5_000), claimToken: null, claimUntil: null, attempts: { increment: 1 }, lastError: null },
+          });
+        } else if (nextFailed?.nextRetryAt) {
+          await tx.campaignFanRefreshPromotionSignal.update({
+            where: { id: signal.id },
+            data: { dueAt: nextFailed.nextRetryAt, claimToken: null, claimUntil: null, attempts: 0, lastError: null },
+          });
+        } else {
+          await tx.campaignFanRefreshPromotionSignal.delete({ where: { id: signal.id } });
+        }
+        return { creatorId, agencyId, healed, recovered, promoted };
+      }, { maxWait: 30_000, timeout: 60_000 });
+      if (claimed?.stale) { totals.contended += 1; continue; }
+      totals.processedCreators += 1;
+      totals.healedFans += Number(claimed.healed?.healedFans || 0);
+      totals.recovered += Number(claimed.recovered?.recovered || 0);
+      totals.promotedJobs += Number(claimed.promoted?.promotedJobs || 0);
+      totals.promotedFans += Number(claimed.promoted?.promotedFans || 0);
+    } catch (error) {
+      totals.errors += 1;
+      await releaseCampaignFanRefreshPromotionClaim({ db: root, signal, now: effectiveNow, error }).catch(() => {});
+    }
+  }
+  return { ...totals, reason: totals.processedCreators ? "processed" : (totals.contended ? "contended" : "none_due") };
 }
 
 function supportsSetBasedCampaignFanRefreshTerminal(db) {
@@ -1611,6 +1708,21 @@ async function recordCampaignFanRefreshChunk({ db, job, chunkResult, applied: pr
   return { applied };
 }
 
+async function signalCampaignDebtAfterTerminal({ db, job, creatorId, now, terminalApplied = 0, deferred = 0, reason = "TERMINAL_DEBT" } = {}) {
+  const scopedCreatorId = clean(creatorId || job?.creatorId, 180);
+  const agencyId = clean(job?.agencyId, 180);
+  if (!scopedCreatorId || !agencyId || (Number(terminalApplied || 0) <= 0 && Number(deferred || 0) <= 0)) {
+    return { signaled: false, reason: "none" };
+  }
+  // The maintenance lane computes the real earliest retry after taking the
+  // creator-scoped authority. Signalling immediately is safe and avoids a
+  // second global scan/read here; if all debt is in backoff it simply moves
+  // the signal to the earliest nextRetryAt.
+  return signalCampaignFanRefreshPromotion({
+    db, agencyId, creatorId: scopedCreatorId, dueAt: asDate(now) || new Date(), reason,
+  });
+}
+
 async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner = null, _campaignLockHeld = false } = {}) {
   if (!db?.creatorFanRefreshDemand?.findMany || String(job?.jobKey || "") !== "fan_data_point_refresh") return null;
   const creatorId = clean(job?.creatorId, 180);
@@ -1667,14 +1779,19 @@ async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner =
     }
     terminal = { applied: failed.length, topology: "adapter_fallback" };
   }
+  const deferred = followUpJobId ? 0 : superseded.length;
+  const promotionSignal = await signalCampaignDebtAfterTerminal({
+    db, job, creatorId, now, terminalApplied: terminal.applied, deferred, reason: "TERMINAL_FINALIZE_DEBT",
+  });
   return {
     applied: terminal.applied,
     rescheduled: followUpJobId ? superseded.length : 0,
-    deferred: followUpJobId ? 0 : superseded.length,
+    deferred,
     followUpJobId,
     topology: terminal.topology,
     workTransitioned: terminal.workTransitioned || 0,
     coverageRunsUpdated: terminal.coverageRunsUpdated || 0,
+    promotionSignaled: promotionSignal?.signaled === true,
   };
 }
 
@@ -1721,14 +1838,19 @@ async function recordCampaignFanRefreshJobFailure({ db, job, error, terminal = t
     }
     failedTransition = { applied: failed.length, topology: "adapter_fallback" };
   }
+  const deferred = followUpJobId ? 0 : superseded.length;
+  const promotionSignal = await signalCampaignDebtAfterTerminal({
+    db, job, creatorId, now, terminalApplied: failedTransition.applied, deferred, reason: "TERMINAL_FAILURE_DEBT",
+  });
   return {
     applied: failedTransition.applied,
     rescheduled: followUpJobId ? superseded.length : 0,
-    deferred: followUpJobId ? 0 : superseded.length,
+    deferred,
     followUpJobId,
     topology: failedTransition.topology,
     workTransitioned: failedTransition.workTransitioned || 0,
     coverageRunsUpdated: failedTransition.coverageRunsUpdated || 0,
+    promotionSignaled: promotionSignal?.signaled === true,
   };
 }
 
@@ -1743,6 +1865,11 @@ module.exports = {
   campaignFanValueCoverageFromState: coverageFromState,
   enqueueUniqueCampaignFanRefreshes,
   promoteQueuedCampaignFanRefreshDemands,
+  runCampaignFanRefreshPromotionMaintenance,
+  signalCampaignFanRefreshPromotion,
+  claimCampaignFanRefreshPromotionSignal,
+  releaseCampaignFanRefreshPromotionClaim,
+  healExistingCanonicalCampaignDebt,
   recoverFailedCampaignFanRefreshDemands,
   repairFailedCampaignFanRefreshDemands,
   reconcileCampaignFanRefreshDemandsFromCanonicalObservations,

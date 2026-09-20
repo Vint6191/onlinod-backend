@@ -159,7 +159,7 @@ function topologyRecoveryDb(rawResult, counter) {
     $executeRawUnsafe: async (sql, ...args) => {
       counter.execute = (counter.execute || 0) + 1;
       assert.match(String(sql), /pg_advisory_xact_lock/);
-      assert.deepEqual(args[0], ["analytics-collector:campaigns:c1"]);
+      assert.equal(args[0], "analytics-collector:campaigns:c1");
       return 1;
     },
     creatorFanRefreshDemand: {
@@ -172,11 +172,7 @@ function topologyRecoveryDb(rawResult, counter) {
     creatorCampaignCollectionState: {},
     async $queryRawUnsafe(sql, ...args) {
       counter.calls += 1;
-      if (/SELECT DISTINCT d\."creatorId"/.test(sql)) {
-        assert.ok(args[0] instanceof Date);
-        return [{ creatorId: "c1" }];
-      }
-      const [now, force, creatorId, limit, creatorIds] = args;
+      const [now, force, creatorId, limit] = args;
       assert.match(sql, /FOR UPDATE SKIP LOCKED/);
       assert.match(sql, /failed_work AS/);
       assert.match(sql, /work_update AS/);
@@ -185,9 +181,10 @@ function topologyRecoveryDb(rawResult, counter) {
       assert.match(sql, /coverage_update AS/);
       assert.ok(now instanceof Date);
       assert.equal(force, false);
-      assert.equal(creatorId, null);
+      assert.equal(creatorId, "c1");
       assert.ok(limit >= 1);
-      assert.deepEqual(creatorIds, ["c1"]);
+      assert.match(sql, /d\."creatorId" = \$3/);
+      assert.doesNotMatch(sql, /ANY\(\$5::text\[\]\)|SELECT DISTINCT d\."creatorId"/);
       return [rawResult];
     },
   };
@@ -203,15 +200,15 @@ for (const demandCount of [1, 20, 200]) {
       coverageRunsUpdated: 1,
     }, counter);
     const result = await recoverFailedCampaignFanRefreshDemands({
-      db,
+      db, creatorId: "c1",
       now: new Date("2040-01-02T01:00:00.000Z"),
       maxDemands: demandCount,
     });
-    assert.equal(counter.calls, 2);
+    assert.equal(counter.calls, 1);
     assert.equal(counter.execute, 1);
     assert.equal(result.recovered, demandCount);
     assert.equal(result.requeuedWork, demandCount);
-    assert.equal(result.topology, "set_based_v2");
+    assert.equal(result.topology, "set_based_v3_creator_scoped");
   });
 }
 
@@ -219,10 +216,10 @@ test("A20.3 failed-demand recovery fails closed on current coverage counter mism
   const counter = { calls: 0 };
   const db = topologyRecoveryDb({ coverageTransitionLost: 1, recovered: 0, requeuedWork: 0, coverageRunsUpdated: 0 }, counter);
   await assert.rejects(
-    () => recoverFailedCampaignFanRefreshDemands({ db, now: new Date("2040-01-02T01:00:00.000Z"), maxDemands: 20 }),
+    () => recoverFailedCampaignFanRefreshDemands({ db, creatorId: "c1", now: new Date("2040-01-02T01:00:00.000Z"), maxDemands: 20 }),
     /CAMPAIGN_FAN_REFRESH_REQUEUE_COVERAGE_TRANSITION_LOST/,
   );
-  assert.equal(counter.calls, 2);
+  assert.equal(counter.calls, 1);
   assert.equal(counter.execute, 1);
 });
 

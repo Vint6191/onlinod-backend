@@ -28,6 +28,9 @@ function runPreflight(label, databaseUrl) {
     child.on("error", reject);
     child.on("exit", (code, signal) => {
       if (code !== 0) return reject(new Error(`${label} failed code=${code} signal=${signal || "none"}\n${stderr || stdout}`));
+      if (!stdout.includes("PHASE3_CAMPAIGN_COVERAGE_INDEX_CONNECTION_CONTRACT_PASS")) {
+        return reject(new Error(`${label} did not prove distinct owner/worker PostgreSQL sessions with explicit ReadCommitted owner isolation`));
+      }
       resolve({ label, stdout, stderr });
     });
   });

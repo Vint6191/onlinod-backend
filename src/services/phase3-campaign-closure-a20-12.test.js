@@ -4,10 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const {
-  campaignTransactionLockKey,
-  acquireCampaignTransactionLocks,
-} = require("./campaign-transaction-lock-service");
+const { campaignTransactionLockKey } = require("./campaign-transaction-lock-service");
 const preflight = require("../../scripts/database/phase3-campaign-coverage-generation-online-preflight");
 
 const ROOT = path.resolve(__dirname, "../..");
@@ -42,23 +39,18 @@ test("A20.12 one creator Campaign lock authority covers ingest, FanData healing,
   assert.match(queue, /enqueueUniqueCampaignFanRefreshes[\s\S]{0,1800}acquireCampaignTransactionLock\(db, creatorId\)/);
   assert.match(queue, /finalizeCampaignFanRefreshJob[\s\S]{0,1400}acquireCampaignTransactionLock\(db, creatorId\)[\s\S]{0,1200}lockDemandRowsByRefreshJob/);
   assert.match(queue, /recordCampaignFanRefreshJobFailure[\s\S]{0,1400}acquireCampaignTransactionLock\(db, creatorId\)[\s\S]{0,1200}lockDemandRowsByRefreshJob/);
-  assert.match(queue, /discoverFailedCampaignFanRefreshCreatorIds[\s\S]*acquireCampaignTransactionLocks\(db, lockedCreatorIds\)[\s\S]*recoverFailedCampaignFanRefreshDemandsSetBased/);
+  assert.doesNotMatch(queue, /discoverFailedCampaignFanRefreshCreatorIds|acquireCampaignTransactionLocks/);
+  assert.match(queue, /claimCampaignFanRefreshPromotionSignal[\s\S]*FOR UPDATE OF s SKIP LOCKED[\s\S]*LIMIT 1/);
+  assert.match(queue, /runCampaignFanRefreshPromotionMaintenance[\s\S]*acquireCampaignTransactionLock\(tx, creatorId\)[\s\S]*recoverFailedCampaignFanRefreshDemands/);
 });
 
-test("A20.12 multi-creator authority locks creator keys in deterministic sorted order with one SQL call", async () => {
-  const calls = [];
-  const db = { $executeRawUnsafe: async (sql, keys) => { calls.push({ sql: String(sql), keys }); return 0; } };
-  const result = await acquireCampaignTransactionLocks(db, ["creator-z", "creator-a", "creator-z"]);
-  assert.deepEqual(result.keys, [
-    "analytics-collector:campaigns:creator-a",
-    "analytics-collector:campaigns:creator-z",
-  ]);
-  assert.equal(calls.length, 1);
-  assert.match(calls[0].sql, /ordered_scope_keys AS MATERIALIZED/);
-  assert.match(calls[0].sql, /unnest\(\$1::text\[\]\)/);
-  assert.match(calls[0].sql, /ORDER BY scope_key ASC/);
-  assert.match(calls[0].sql, /FROM ordered_scope_keys/);
-  assert.deepEqual(calls[0].keys, result.keys);
+test("A20 final recovery has no production multi-creator lock helper or global debt scan", () => {
+  const locks = source("src/services/campaign-transaction-lock-service.js");
+  const queue = source("src/services/campaign-fan-refresh-queue-service.js");
+  const leases = source("src/services/job-lease-service.js");
+  assert.doesNotMatch(locks, /acquireCampaignTransactionLocks/);
+  assert.doesNotMatch(queue, /DISTINCT\s+.*creatorId|ROW_NUMBER\(\)\s+OVER\s*\(\s*PARTITION BY/i);
+  assert.doesNotMatch(leases, /promoteQueuedCampaignFanRefreshDemands/);
 });
 
 test("A20.12 current-run index authority proves exact non-partial plain-column btree definition", () => {
@@ -69,38 +61,52 @@ test("A20.12 current-run index authority proves exact non-partial plain-column b
   assert.throws(() => preflight.assertCurrentRunIndex(exactIndex({ columns: ["creatorId", "id", "scanRunId"] })), /exact definition\/order mismatch/);
 });
 
-test("A20.12 deploy owner spans index inspect/drop/create/verify lifecycle outside the owner transaction", async () => {
+test("A20.12 deploy owner spans index lifecycle on a distinct ReadCommitted owner/worker connection pair", async () => {
   const events = [];
   let index = null;
-  const root = {
+  const owner = {
     $transaction: async (work, options) => {
       events.push(["owner-begin", options]);
       const ownerTx = {
         $executeRawUnsafe: async (sql) => { events.push(["owner-lock", String(sql)]); return 0; },
+        $queryRawUnsafe: async () => [{ pid: 101, isolation: "read committed" }],
       };
       const result = await work(ownerTx);
       events.push(["owner-commit"]);
       return result;
     },
+  };
+  const worker = {
     $queryRawUnsafe: async (sql) => {
-      events.push(["root-inspect", String(sql)]);
+      const text = String(sql);
+      if (/pg_backend_pid/.test(text)) return [{ pid: 202, isolation: "read committed" }];
+      if (/pg_stat_progress_create_index/.test(text)) return [];
+      events.push(["worker-inspect", text]);
       return index ? [index] : [];
     },
     $executeRawUnsafe: async (sql) => {
-      events.push(["root-execute", String(sql)]);
+      events.push(["worker-execute", String(sql)]);
       if (/CREATE INDEX CONCURRENTLY/.test(String(sql))) index = exactIndex();
       return 0;
     },
   };
-  await preflight.withIndexLifecycleAuthority(root, (db) => preflight.ensureCurrentRunLookupIndex(db));
+  await preflight.withIndexLifecycleAuthority(
+    owner,
+    (db, contract) => {
+      assert.equal(contract.verified, true);
+      assert.notEqual(contract.ownerPid, contract.workerPid);
+      return preflight.ensureCurrentRunLookupIndex(db);
+    },
+    { workerDb: worker, requireDistinctConnections: true },
+  );
   const lock = events.findIndex(([kind]) => kind === "owner-lock");
-  const inspect = events.findIndex(([kind]) => kind === "root-inspect");
-  const create = events.findIndex(([kind, sql]) => kind === "root-execute" && /CREATE INDEX CONCURRENTLY/.test(sql));
+  const inspect = events.findIndex(([kind]) => kind === "worker-inspect");
+  const create = events.findIndex(([kind, sql]) => kind === "worker-execute" && /CREATE INDEX CONCURRENTLY/.test(sql));
   const commit = events.findIndex(([kind]) => kind === "owner-commit");
   assert.ok(lock >= 0 && inspect > lock && create > inspect && commit > create, JSON.stringify(events));
   assert.equal(events[0][1].timeout, preflight.INDEX_LIFECYCLE_AUTHORITY_TIMEOUT_MS);
+  assert.equal(events[0][1].isolationLevel, "ReadCommitted");
 });
-
 
 
 test("A20.12 index repair waits for an active peer build before treating an invalid catalog row as abandoned", async () => {

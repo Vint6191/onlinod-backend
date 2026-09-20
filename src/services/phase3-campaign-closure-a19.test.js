@@ -136,7 +136,7 @@ test("A19 due failed debt requeues atomically from failed to outstanding under b
       updateMany: async ({ data }) => { coverageUpdates.push(data); return { count: 1 }; },
     },
   };
-  const result = await recoverFailedCampaignFanRefreshDemands({ db, now, maxDemands: 10 });
+  const result = await recoverFailedCampaignFanRefreshDemands({ db, creatorId: "c1", now, maxDemands: 10 });
   assert.equal(result.recovered, 1);
   assert.equal(result.requeuedWork, 1);
   assert.equal(workUpdates[0].status, "QUEUED");
@@ -168,7 +168,7 @@ test("A19 current-generation recovery fails closed if work CAS wins but aggregat
     },
   };
   await assert.rejects(
-    () => recoverFailedCampaignFanRefreshDemands({ db, now, maxDemands: 10 }),
+    () => recoverFailedCampaignFanRefreshDemands({ db, creatorId: "c1", now, maxDemands: 10 }),
     /CAMPAIGN_FAN_REFRESH_REQUEUE_COVERAGE_TRANSITION_LOST/,
   );
 });

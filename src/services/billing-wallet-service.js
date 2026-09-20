@@ -170,21 +170,12 @@ async function readRolling30dRevenue({ db, creatorId, now = new Date(), authorit
       };
     }
   }
-  // Legacy range snapshots are display-only migration evidence. They can tell an
-  // operator what the old generation last reported, but can never be COMPLETE,
-  // FRESH, or monetary authority.
-  const snapshot = db.creatorEarningsSnapshot?.findUnique
-    ? await db.creatorEarningsSnapshot.findUnique({ where: { creatorId_rangeKey: { creatorId, rangeKey: "30d" } } })
-    : null;
-  const capturedAt = asDate(snapshot?.capturedAt);
-  const snapshotRecent = !!snapshot && !!capturedAt && now.getTime() - capturedAt.getTime() <= earningsMaxAgeMs();
+  // The legacy CreatorEarningsSnapshot generation is physically retired by
+  // the Phase-3 final cutover. Missing canonical daily proof is UNAVAILABLE;
+  // no display or pricing reader may reconstruct revenue/tier from snapshots.
   return {
-    revenue30dCents: snapshot ? cents(snapshot.totalCents) : null,
-    capturedAt,
-    source: snapshot ? (snapshotRecent ? "EARNINGS_SNAPSHOT_30D_UNVERIFIED" : "EARNINGS_SNAPSHOT_30D_STALE") : "UNAVAILABLE",
-    fresh: false,
-    collectionState: "UNAVAILABLE",
-    complete: false, proven: false, stale: false, due: true, deferred: false,
+    revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false,
+    collectionState: "UNAVAILABLE", complete: false, proven: false, stale: false, due: true, deferred: false,
   };
 }
 
@@ -194,23 +185,7 @@ async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) 
   const results = new Map(ids.map((creatorId) => [creatorId, { revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false, collectionState: "UNAVAILABLE", complete: false, proven: false, stale: false, due: true, deferred: false }]));
   if (!ids.length) return results;
 
-  if (db.creatorEarningsSnapshot?.findMany) {
-    const snapshots = await db.creatorEarningsSnapshot.findMany({ where: { creatorId: { in: ids }, rangeKey: "30d" } });
-    for (const snapshot of snapshots) {
-      const creatorId = String(snapshot.creatorId);
-      if (!results.has(creatorId)) continue;
-      const capturedAt = asDate(snapshot.capturedAt);
-      const recent = !!capturedAt && now.getTime() - capturedAt.getTime() <= earningsMaxAgeMs();
-      results.set(creatorId, {
-        revenue30dCents: cents(snapshot.totalCents),
-        capturedAt,
-        source: recent ? "EARNINGS_SNAPSHOT_30D_UNVERIFIED" : "EARNINGS_SNAPSHOT_30D_STALE",
-        fresh: false, collectionState: "UNAVAILABLE", complete: false, proven: false, stale: false, due: true, deferred: false,
-      });
-    }
-  }
-
-  if (db.creatorEarningsDaily?.groupBy && db.analyticsCoverage?.groupBy) {
+if (db.creatorEarningsDaily?.groupBy && db.analyticsCoverage?.groupBy) {
     const closed = closedRevenueWindow(now);
     const freshThreshold = new Date(now.getTime() - earningsMaxAgeMs());
     const trustedClockCeiling = new Date(now.getTime() + COLLECTION_FUTURE_SKEW_TOLERANCE_MS);
@@ -359,20 +334,12 @@ function pricingPreviewFromRevenue({ profile, revenue }) {
   };
 }
 
-function pricingPreviewFromSnapshot({ profile, snapshot, now = new Date() }) {
-  const capturedAt = asDate(snapshot?.capturedAt);
-  const recent = !!snapshot && !!capturedAt && now.getTime() - capturedAt.getTime() <= earningsMaxAgeMs();
-  // A legacy summary is display-only evidence. Keep this helper fail-closed too
-  // so no future caller can accidentally turn a desktop-written snapshot into
-  // monetary authority by reusing this exported preview helper.
+function pricingPreviewFromSnapshot({ profile }) {
+  // Compatibility export only. Snapshot generations are retired and must not
+  // contribute revenue, automatic tier selection, core price, or line total.
   return pricingPreviewFromRevenue({
     profile,
-    revenue: {
-      revenue30dCents: snapshot ? cents(snapshot.totalCents) : null,
-      capturedAt,
-      source: snapshot ? (recent ? "EARNINGS_SNAPSHOT_30D_UNVERIFIED" : "EARNINGS_SNAPSHOT_30D_STALE") : "UNAVAILABLE",
-      fresh: false,
-    },
+    revenue: { revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false },
   });
 }
 

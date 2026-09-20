@@ -65,11 +65,16 @@ test("Closure4 production has zero queryRaw transaction advisory locks and one s
   assert.deepEqual(offenders, []);
   assert.deepEqual(lockSources.sort(), [
     "services/automation-write-commit-fence-service.js",
-    "services/campaign-transaction-lock-service.js",
     "services/creator-analytics-ledger-service.js",
     "services/db-transaction-service.js",
     "services/notification-facts-service.js",
   ]);
+
+
+  const campaignLock = fs.readFileSync(path.resolve(__dirname, "campaign-transaction-lock-service.js"), "utf8");
+  assert.match(campaignLock, /lockDbAdvisoryXact/);
+  assert.match(campaignLock, /withDbAdvisoryXactLock/);
+  assert.doesNotMatch(campaignLock, /pg_advisory_xact_lock/);
 
   const followBack = fs.readFileSync(path.resolve(__dirname, "follow-back-service.js"), "utf8");
   const follow = fs.readFileSync(path.resolve(__dirname, "follow-automation-service.js"), "utf8");

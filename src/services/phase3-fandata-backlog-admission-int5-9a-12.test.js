@@ -78,42 +78,41 @@ test("A12 saturated campaign refresh scheduling preserves durable demand and wor
   assert.deepEqual(workUpdates[0].data, { refreshJobId: null });
 });
 
-test("A12 job claim path promotes durable queued campaign demands before choosing fan refresh work", () => {
-  const source = fs.readFileSync(path.join(__dirname, "job-lease-service.js"), "utf8");
-  assert.match(source, /allowedJobKeys\.includes\("fan_data_point_refresh"\)[\s\S]*promoteQueuedCampaignFanRefreshDemands/);
+test("A12/final cut job claim never runs global Campaign promotion; bounded maintenance owns durable signals", () => {
+  const leaseSource = fs.readFileSync(path.join(__dirname, "job-lease-service.js"), "utf8");
+  const schedulerSource = fs.readFileSync(path.join(__dirname, "job-scheduler.js"), "utf8");
   const queue = fs.readFileSync(path.join(__dirname, "campaign-fan-refresh-queue-service.js"), "utf8");
-  assert.match(queue, /campaignWork:\s*\{\s*some:\s*\{\s*status:\s*WORK_STATUS\.QUEUED/);
-  assert.match(queue, /orderBy:\s*\[\{ lastRequestedAt: "asc" \}, \{ id: "asc" \}\]/);
-  assert.match(queue, /CAMPAIGN_FAN_REFRESH_JOB_MAX/);
+  assert.doesNotMatch(leaseSource, /promoteQueuedCampaignFanRefreshDemands|runCampaignFanRefreshPromotionMaintenance/);
+  assert.match(schedulerSource, /campaignFanRefreshPromotion[\s\S]*runCampaignFanRefreshPromotionMaintenance/);
+  assert.match(queue, /FOR UPDATE OF s SKIP LOCKED[\s\S]*LIMIT 1/);
+  assert.match(queue, /claimToken[\s\S]*claimUntil/);
 });
 
-
-test("A12 promoter rematerializes oldest durable debt in creator-fair bounded jobs once capacity returns", async () => {
+test("A12/final cut creator-scoped promoter rematerializes bounded oldest debt only for its creator", async () => {
   const planned = [];
   const demandUpdates = [];
   const workUpdates = [];
+  const rows = Array.from({ length: 60 }, (_, i) => ({
+    id: `d-${i}`, agencyId: "agency-1", creatorId: "creator-a", onlyFansUserId: `fan-${i}`,
+    requestedRevision: 1, lastRequestedAt: new Date(1_000 + i),
+  }));
   const db = {
     jobInstance: {},
     $executeRawUnsafe: async () => 1,
-    $queryRawUnsafe: async (sql) => {
-      const text = String(sql);
-      if (/FROM "CreatorFanRefreshDemand"/.test(text) && /"status" = 'FAILED'/.test(text)) return [];
-      if (/WITH ranked AS/.test(text)) return [
-        { id: "d-a1", lastRequestedAt: new Date("2038-01-01T00:00:00.000Z") },
-        { id: "d-b1", lastRequestedAt: new Date("2038-01-01T00:00:01.000Z") },
-        { id: "d-a2", lastRequestedAt: new Date("2038-01-01T00:00:02.000Z") },
-        { id: "d-b2", lastRequestedAt: new Date("2038-01-01T00:00:03.000Z") },
-      ];
-      if (/FROM "JobInstance"/.test(text)) return [{ pendingGlobal: 0n, pendingCreator: 0n }];
-      throw new Error(`unexpected SQL: ${text}`);
+    $queryRawUnsafe: async (sql, creatorId) => {
+      if (/FROM "JobInstance"/.test(String(sql))) {
+        assert.equal(creatorId, "creator-a");
+        return [{ pendingGlobal: 0n, pendingCreator: 0n }];
+      }
+      throw new Error(`unexpected SQL: ${String(sql)}`);
     },
     creatorFanRefreshDemand: {
-      findMany: async () => [
-        { id: "d-a1", agencyId: "agency-1", creatorId: "creator-a", onlyFansUserId: "fan-a1", requestedRevision: 2, lastRequestedAt: new Date("2038-01-01T00:00:00.000Z") },
-        { id: "d-b1", agencyId: "agency-1", creatorId: "creator-b", onlyFansUserId: "fan-b1", requestedRevision: 1, lastRequestedAt: new Date("2038-01-01T00:00:01.000Z") },
-        { id: "d-a2", agencyId: "agency-1", creatorId: "creator-a", onlyFansUserId: "fan-a2", requestedRevision: 1, lastRequestedAt: new Date("2038-01-01T00:00:02.000Z") },
-        { id: "d-b2", agencyId: "agency-1", creatorId: "creator-b", onlyFansUserId: "fan-b2", requestedRevision: 3, lastRequestedAt: new Date("2038-01-01T00:00:03.000Z") },
-      ],
+      findMany: async ({ where, take, orderBy }) => {
+        assert.equal(where.creatorId, "creator-a");
+        assert.equal(take, 100);
+        assert.deepEqual(orderBy, [{ lastRequestedAt: "asc" }, { id: "asc" }]);
+        return rows;
+      },
       update: async (input) => { demandUpdates.push(input); return input; },
     },
     creatorCampaignFanRefreshWork: {
@@ -122,82 +121,24 @@ test("A12 promoter rematerializes oldest durable debt in creator-fair bounded jo
   };
   let seq = 0;
   const result = await promoteQueuedCampaignFanRefreshDemands({
-    db,
-    now: new Date("2038-02-03T04:05:06.000Z"),
-    maxJobs: 2,
-    inTransaction: true,
-    planner: async (input) => {
-      planned.push(input);
-      seq += 1;
-      return { created: true, job: { id: `refresh-${seq}` } };
-    },
+    db, creatorId: "creator-a", now: new Date("2038-02-03T04:05:06.000Z"), maxJobs: 2,
+    inTransaction: true, _campaignLockHeld: true,
+    planner: async (input) => { planned.push(input); seq += 1; return { created: true, job: { id: `refresh-${seq}` } }; },
   });
-  assert.deepEqual(result, { promotedJobs: 2, promotedFans: 4, reason: "promoted" });
+  assert.deepEqual(result, { promotedJobs: 2, promotedFans: 60, reason: "promoted" });
   assert.equal(planned.length, 2);
   assert.equal(planned[0].creatorId, "creator-a");
-  assert.deepEqual(planned[0].params.fanIds, ["fan-a1", "fan-a2"]);
-  assert.equal(planned[1].creatorId, "creator-b");
-  assert.deepEqual(planned[1].params.fanIds, ["fan-b1", "fan-b2"]);
-  assert.equal(demandUpdates.length, 4);
-  assert.equal(workUpdates.length, 4);
+  assert.equal(planned[0].params.fanIds.length, 50);
+  assert.equal(planned[1].params.fanIds.length, 10);
+  assert.equal(demandUpdates.length, 60);
+  assert.equal(workUpdates.length, 60);
 });
 
-test("A12 backlog promotion window is capped per creator so one saturated deep backlog cannot hide another creator", async () => {
+test("A12/final cut removes global creator-fair debt scans in favor of one creator per durable maintenance claim", () => {
   const queueSource = fs.readFileSync(path.join(__dirname, "campaign-fan-refresh-queue-service.js"), "utf8");
-  assert.match(queueSource, /ROW_NUMBER\(\) OVER \([\s\S]*PARTITION BY d\."creatorId"[\s\S]*WHERE rn <= \$1/);
-
-  const planned = [];
-  const aRows = Array.from({ length: 50 }, (_, i) => ({
-    id: `d-a-${String(i).padStart(2, "0")}`,
-    agencyId: "agency-1",
-    creatorId: "creator-a",
-    onlyFansUserId: `fan-a-${i}`,
-    requestedRevision: 1,
-    lastRequestedAt: new Date(`2038-01-01T00:${String(Math.floor(i / 60)).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}.000Z`),
-  }));
-  const bRow = {
-    id: "d-b-00", agencyId: "agency-1", creatorId: "creator-b", onlyFansUserId: "fan-b-0",
-    requestedRevision: 1, lastRequestedAt: new Date("2038-01-02T00:00:00.000Z"),
-  };
-  const byId = new Map([...aRows, bRow].map((row) => [row.id, row]));
-  const db = {
-    jobInstance: {},
-    $executeRawUnsafe: async () => 1,
-    $queryRawUnsafe: async (sql, ...args) => {
-      const text = String(sql);
-      if (/FROM "CreatorFanRefreshDemand"/.test(text) && /"status" = 'FAILED'/.test(text)) return [];
-      if (/WITH ranked AS/.test(text)) {
-        assert.equal(args[0], 50);
-        // Represents a production ranking over >800 creator-A debts: only one
-        // job-sized A batch may enter the window, leaving B visible.
-        return [...aRows.map((row) => ({ id: row.id, lastRequestedAt: row.lastRequestedAt })), { id: bRow.id, lastRequestedAt: bRow.lastRequestedAt }];
-      }
-      if (/FROM "JobInstance"/.test(text)) {
-        const creatorId = args[0];
-        return [{ pendingGlobal: 4n, pendingCreator: creatorId === "creator-a" ? 4n : 0n }];
-      }
-      throw new Error(`unexpected SQL: ${text}`);
-    },
-    creatorFanRefreshDemand: {
-      findMany: async ({ where }) => where?.id?.in.map((id) => byId.get(id)).filter(Boolean),
-      update: async ({ where, data }) => ({ ...byId.get(where.id), ...data }),
-    },
-    creatorCampaignFanRefreshWork: { updateMany: async () => ({ count: 1 }) },
-  };
-
-  const result = await promoteQueuedCampaignFanRefreshDemands({
-    db,
-    now: new Date("2038-02-03T04:05:06.000Z"),
-    maxJobs: 1,
-    inTransaction: true,
-    planner: async (input) => {
-      planned.push(input);
-      return { created: true, job: { id: "refresh-b" } };
-    },
-  });
-  assert.equal(result.promotedJobs, 1);
-  assert.equal(result.promotedFans, 1);
-  assert.equal(planned.length, 1);
-  assert.equal(planned[0].creatorId, "creator-b");
-  assert.deepEqual(planned[0].params.fanIds, ["fan-b-0"]);
+  assert.doesNotMatch(queueSource, /ROW_NUMBER\(\) OVER \([\s\S]*PARTITION BY d\."creatorId"/);
+  assert.doesNotMatch(queueSource, /SELECT DISTINCT d\."creatorId"/);
+  assert.match(queueSource, /promoteQueuedCampaignFanRefreshDemands\(\{ db, creatorId/);
+  assert.match(queueSource, /claimCampaignFanRefreshPromotionSignal[\s\S]*FOR UPDATE OF s SKIP LOCKED[\s\S]*LIMIT 1/);
+  assert.match(queueSource, /runCampaignFanRefreshPromotionMaintenance[\s\S]*acquireCampaignTransactionLock\(tx, creatorId\)/);
 });

@@ -40,6 +40,7 @@ const { renewDueCreatorSubscriptions } = require("./billing-wallet-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { runMaintenanceLane } = require("./maintenance-work-authority");
+const { runCampaignFanRefreshPromotionMaintenance } = require("./campaign-fan-refresh-queue-service");
 const {
   WORK_CLASS: PHASE2_WORK_CLASS,
   claimDomainWorkBatch,
@@ -2052,6 +2053,7 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
       ["agencyDestructiveCleanup", () => runAgencyDestructiveCleanupSweep({ db, now })],
       ["creatorDestructiveCleanup", () => runCreatorDestructiveCleanupSweep({ db, now })],
       ["providerOperationalBackfill", () => maybeBackfillProviderOperationalDebt({ db, now })],
+      ["campaignFanRefreshPromotion", () => runCampaignFanRefreshPromotionMaintenance({ db, now, maxCreators: 20, maxJobsPerCreator: 4 })],
       ["dependencyFanout", () => maybeRunPhase2DependencyFanout({ db, now })],
       ["customReminderWork", () => maybePlanDueCustomReminderWork({ db, now })],
       ["providerOperationalDirty", () => maybeRepairProviderOperationalDirty({ db, now })],

@@ -353,7 +353,8 @@ test("event and campaign writers use canonical identity projector rather than di
 test("subscriber baseline feeds canonical projectors and generic isActive is not relationship truth", () => {
   const service = read("src/services/subscriber-directory-service.js");
   const authority = read("src/services/fan-data-authority-service.js");
-  assert.match(service, /projectSubscriberDirectoryRun/);
+  assert.match(service, /projectSubscriberDirectoryItems/);
+  assert.match(authority, /async function commitFanFacts/);
   assert.doesNotMatch(authority, /fanSubscriptionActive\s*:\s*[^\n]*isActive/);
   assert.doesNotMatch(authority, /fanSubscribesToCreator\s*:\s*[^\n]*isActive/);
 });

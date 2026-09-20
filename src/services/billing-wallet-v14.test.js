@@ -236,14 +236,15 @@ test("billing requires relational earnings proof; a fresh legacy snapshot alone 
   db.analyticsCoverage.count = async () => 0;
   const snapshotOnly = await svc.readRolling30dRevenue({ db, creatorId:"creator-1", now });
   assert.equal(snapshotOnly.fresh, false);
-  assert.equal(snapshotOnly.source, "EARNINGS_SNAPSHOT_30D_UNVERIFIED");
-  assert.equal(snapshotOnly.revenue30dCents, 120_000);
+  assert.equal(snapshotOnly.source, "UNAVAILABLE");
+  assert.equal(snapshotOnly.revenue30dCents, null);
   assert.throws(() => svc.pricingFromRevenue({ profile: db._profiles.get("creator-1"), revenue: snapshotOnly }), (e) => e.code === "BILLING_EARNINGS_30D_UNAVAILABLE");
 
   db._setSnapshot(120_000, "2026-08-10T00:00:00Z");
   const stale = await svc.readRolling30dRevenue({ db, creatorId:"creator-1", now });
   assert.equal(stale.fresh, false);
-  assert.equal(stale.source, "EARNINGS_SNAPSHOT_30D_STALE");
+  assert.equal(stale.source, "UNAVAILABLE");
+  assert.equal(stale.revenue30dCents, null);
 });
 
 test("exported snapshot preview and quote helpers stay fail-closed for monetary pricing", async () => {
@@ -254,8 +255,10 @@ test("exported snapshot preview and quote helpers stay fail-closed for monetary 
   const snapshot = await db.creatorEarningsSnapshot.findUnique();
   const snapshotPreview = svc.pricingPreviewFromSnapshot({ profile, snapshot, now });
   assert.equal(snapshotPreview.available, false);
-  assert.equal(snapshotPreview.revenueSource, "EARNINGS_SNAPSHOT_30D_UNVERIFIED");
-  assert.equal(snapshotPreview.tier, "GROWTH");
+  assert.equal(snapshotPreview.revenueSource, "UNAVAILABLE");
+  assert.equal(snapshotPreview.revenue30dCents, null);
+  assert.equal(snapshotPreview.tier, null);
+  assert.equal(snapshotPreview.totalCents, 0);
 
   db.creatorEarningsDaily.findMany = async () => [];
   db.analyticsCoverage.count = async () => 0;
@@ -265,8 +268,10 @@ test("exported snapshot preview and quote helpers stay fail-closed for monetary 
     now,
   });
   assert.equal(quoted.available, false);
-  assert.equal(quoted.revenueSource, "EARNINGS_SNAPSHOT_30D_UNVERIFIED");
-  assert.equal(quoted.tier, "GROWTH");
+  assert.equal(quoted.revenueSource, "UNAVAILABLE");
+  assert.equal(quoted.revenue30dCents, null);
+  assert.equal(quoted.tier, null);
+  assert.equal(quoted.totalCents, 0);
 });
 
 test("durable relational proof uses the last 30 fully closed UTC days and requires complete fresh coverage", async () => {
@@ -374,7 +379,8 @@ test("batched Settings evidence fails closed when even one coverage day is missi
   const svc = loadWalletService(db);
   const revenue = (await svc.readRolling30dRevenueBatch({ db, creatorIds: ["creator-1"], now })).get("creator-1");
   assert.equal(revenue.fresh, false);
-  assert.equal(revenue.source, "EARNINGS_SNAPSHOT_30D_STALE");
+  assert.equal(revenue.source, "UNAVAILABLE");
+  assert.equal(revenue.revenue30dCents, null);
   assert.equal(svc.pricingPreviewFromRevenue({ profile: db._profiles.get("creator-1"), revenue }).available, false);
 });
 

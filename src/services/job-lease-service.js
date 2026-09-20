@@ -5,7 +5,6 @@ const prisma = require("../prisma");
 const { isOwner, normalizeAssignedCreators } = require("./team-access-control");
 const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./execution-access-fence-service");
 const { applyJobChunk, applyJobResult, recordJobFailure } = require("./job-result-service");
-const { promoteQueuedCampaignFanRefreshDemands } = require("./campaign-fan-refresh-queue-service");
 const { filterClaimableDesktopJobKeys } = require("./job-catalog");
 const { completeDialogJobFenced } = require("./dialog-job-completion-fence");
 const { completeNotificationSync } = require("./notification-sync-state-service");
@@ -566,16 +565,6 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
   }
   if (!allowedJobKeys.length) return { job: null, reason: "no-capabilities" };
-  if (allowedJobKeys.includes("fan_data_point_refresh")) {
-    try {
-      await promoteQueuedCampaignFanRefreshDemands({ db: prisma, now, maxJobs: 4 });
-    } catch (error) {
-      // Promotion is an availability optimization over already-durable demand.
-      // Never make unrelated claim classes unavailable because a backlog sweep
-      // encountered a transient DB error. The queued demand remains recoverable.
-      console.warn("[job-lease/fan-refresh-backlog-promotion] failed:", error?.message || error);
-    }
-  }
   const explicitlyExcluded = new Set(
     (Array.isArray(excludedCreatorIds) ? excludedCreatorIds : [])
       .map((value) => String(value || "").trim())

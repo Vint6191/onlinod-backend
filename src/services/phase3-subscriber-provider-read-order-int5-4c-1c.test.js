@@ -20,7 +20,7 @@ function loadSubscriber() {
   ids.push(cacheModule("./follow-automation-service", { refreshFollowAutomationProjection: async () => ({}) }));
   ids.push(cacheModule("./bump-service", { ensureAutomaticBumps: async () => ({}) }));
   ids.push(cacheModule("./fan-data-authority-service", {
-    projectSubscriberDirectoryRun: async () => ({ projected: 0 }),
+    projectSubscriberDirectoryItems: async (_db, { items }) => ({ projected: Array.isArray(items) ? items.length : 0 }),
     readFanCurrent: async () => null,
   }));
   ids.push(cacheModule("./job-planning-repository", {
@@ -43,6 +43,7 @@ function memoryDb(runs) {
         if (data.scannedCount?.increment) next.scannedCount = (current.scannedCount || 0) + data.scannedCount.increment;
         if (data.pageCount?.increment) next.pageCount = (current.pageCount || 0) + data.pageCount.increment;
         if (data.hiddenCount?.increment) next.hiddenCount = (current.hiddenCount || 0) + data.hiddenCount.increment;
+        if (data.fanProjectionCount?.increment) next.fanProjectionCount = (current.fanProjectionCount || 0) + data.fanProjectionCount.increment;
         runs.set(where.id, next);
         return next;
       },
@@ -61,6 +62,7 @@ function run(id, createdAt) {
   return {
     id, agencyId: "agency-1", creatorId: "creator-1", status: "QUEUED",
     createdAt: new Date(createdAt), startedAt: null, scannedCount: 0, pageCount: 0, hiddenCount: 0,
+    fanProjectionStatus: "PENDING", fanProjectionCursorOffset: 0, fanProjectionCount: 0,
   };
 }
 function job(id, runId, createdAt, tokenVersion = 1) {
@@ -133,6 +135,9 @@ test("INT5.4C-1C current Subscriber Directory page fails closed without a token"
 test("INT5.4C-1C committed page replay returns idempotently without consuming the one-time token again", async () => {
   const runs = new Map([["run-replay", run("run-replay", "2026-09-17T00:00:00.000Z")]]);
   const db = memoryDb(runs);
+  runs.get("run-replay").fanProjectionStatus = "PROJECTING";
+  runs.get("run-replay").fanProjectionCursorOffset = 1;
+  runs.get("run-replay").fanProjectionCount = 1;
   db.pages.push({ runId: "run-replay", offset: 0, nextOffset: 1, hasMore: true });
   const loaded = loadSubscriber();
   try {
@@ -153,7 +158,7 @@ test("INT5.4C-1C subscriber scheduling opts into token chronology and publicatio
   assert.match(subscriber, /purpose:\s*"subscriber_directory_page"/);
   assert.match(subscriber, /SERVER_PROVIDER_READ_TOKEN/);
   assert.match(subscriber, /jobs created before the token cutover|created before the token cutover|before the token cutover/);
-  assert.match(authority, /observedAt:\s*item\.observedAt/);
+  assert.match(authority, /observedAt[,:]\s*item\?*\.observedAt|const observedAt = date\(item\?\.observedAt\)/);
 });
 test("INT5.4C-1C Subscriber Directory also has a physical one-active-run creator fence", () => {
   const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260714190000_subscriber_directory_hidden_online_v1", "migration.sql"), "utf8");
