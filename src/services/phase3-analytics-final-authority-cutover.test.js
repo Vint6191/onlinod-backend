@@ -113,6 +113,8 @@ test("final migration carries bounded subscriber cursor, durable signal lease an
   assert.match(schema, /fanProjectionCursorOffset\s+Int/);
   assert.match(schema, /pageOffset\s+Int\?/);
   assert.match(schema, /model CampaignFanRefreshPromotionSignal/);
+  assert.match(schema, /@@unique\(\[agencyId, creatorId\], map: "CampaignFanRefreshPromotionSignal_agency_creator_key"\)/);
+  assert.match(migration, /CONSTRAINT "CampaignFanRefreshPromotionSignal_agency_creator_key" UNIQUE \(\"agencyId\", \"creatorId\"\)/);
   assert.match(schema, /claimToken\s+String\?/);
   assert.match(schema, /claimUntil\s+DateTime\?/);
   assert.match(migration, /CampaignFanRefreshPromotionSignal_due_claim_creator_idx/);

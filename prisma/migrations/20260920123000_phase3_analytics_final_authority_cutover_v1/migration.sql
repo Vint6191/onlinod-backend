@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS "CampaignFanRefreshPromotionSignal" (
   "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT "CampaignFanRefreshPromotionSignal_pkey" PRIMARY KEY ("id"),
   CONSTRAINT "CampaignFanRefreshPromotionSignal_creatorId_key" UNIQUE ("creatorId"),
+  CONSTRAINT "CampaignFanRefreshPromotionSignal_agency_creator_key" UNIQUE ("agencyId", "creatorId"),
   CONSTRAINT "CampaignFanRefreshPromotionSignal_creator_fkey"
     FOREIGN KEY ("agencyId", "creatorId") REFERENCES "CreatorAccount"("agencyId", "id") ON DELETE CASCADE ON UPDATE CASCADE
 );

@@ -2051,6 +2051,7 @@ model CampaignFanRefreshPromotionSignal {
 
   creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
 
+  @@unique([agencyId, creatorId], map: "CampaignFanRefreshPromotionSignal_agency_creator_key")
   @@index([dueAt, claimUntil, creatorId], map: "CampaignFanRefreshPromotionSignal_due_claim_creator_idx")
 }
 
