@@ -10,7 +10,14 @@ const PREFLIGHT_ADVISORY_LOCK_CLASS = 132987241;
 const PREFLIGHT_ADVISORY_LOCK_KEY = 201917300;
 const PREFLIGHT_TRANSACTION_MAX_WAIT_MS = 30_000;
 const PREFLIGHT_TRANSACTION_TIMEOUT_MS = 300_000;
-const INDEX_LIFECYCLE_AUTHORITY_TIMEOUT_MS = 60 * 60 * 1000;
+const INDEX_LIFECYCLE_AUTHORITY_TIMEOUT_MS = 15 * 60 * 1000;
+const INDEX_LIFECYCLE_AUTHORITY_POLL_MS = 250;
+// Keep index lifecycle authority on a distinct advisory key from the ordinary
+// DDL/backfill xact lock. A blocked pg_advisory_xact_lock statement can retain
+// an old statement snapshot while CREATE INDEX CONCURRENTLY waits for old
+// snapshots, creating a liveness cycle. The lifecycle path therefore uses a
+// non-blocking session lock on its own key and short autocommit polling.
+const INDEX_LIFECYCLE_ADVISORY_LOCK_KEY = 20200921;
 const INDEX_PEER_BUILD_WAIT_TIMEOUT_MS = 15 * 60 * 1000;
 const INDEX_PEER_BUILD_POLL_MS = 250;
 const CURRENT_RUN_INDEX_NAME = "CreatorCampaignFanRefreshWork_creator_run_id_idx";
@@ -183,56 +190,140 @@ function indexLifecycleWorkerDatabaseUrl(databaseUrl) {
   }
 }
 
-async function assertIndexLifecycleConnectionContract(ownerTx, workerDb) {
-  if (typeof ownerTx?.$queryRawUnsafe !== "function" || typeof workerDb?.$queryRawUnsafe !== "function") {
-    return { verified: false, adapterFallback: true };
+async function indexLifecycleSessionState(db) {
+  if (typeof db?.$queryRawUnsafe !== "function") {
+    return { pid: null, isolation: null, adapterFallback: true };
   }
-  const ownerRows = await ownerTx.$queryRawUnsafe(
+  const rows = await db.$queryRawUnsafe(
     `SELECT pg_backend_pid()::int AS pid, current_setting('transaction_isolation') AS isolation`
   );
-  const workerRows = await workerDb.$queryRawUnsafe(
-    `SELECT pg_backend_pid()::int AS pid, current_setting('transaction_isolation') AS isolation`
-  );
-  const owner = ownerRows?.[0] || {};
-  const worker = workerRows?.[0] || {};
-  if (!Number.isInteger(Number(owner.pid)) || !Number.isInteger(Number(worker.pid))) {
-    fail("index lifecycle connection contract could not resolve PostgreSQL backend PIDs");
-  }
-  if (Number(owner.pid) === Number(worker.pid)) {
-    fail("index lifecycle requires two distinct PostgreSQL sessions; owner and concurrent-index worker share one backend PID");
-  }
-  if (String(owner.isolation || "").toLowerCase() !== "read committed") {
-    fail(`index lifecycle owner transaction must use Read Committed; got=${owner.isolation}`);
-  }
+  const row = rows?.[0] || {};
   return {
-    verified: true, ownerPid: Number(owner.pid), workerPid: Number(worker.pid),
-    ownerIsolation: String(owner.isolation), workerIsolation: String(worker.isolation || ""),
+    pid: Number.isInteger(Number(row.pid)) ? Number(row.pid) : null,
+    isolation: String(row.isolation || ""),
+    adapterFallback: false,
   };
 }
 
-async function withIndexLifecycleAuthority(db, work, { workerDb = null, requireDistinctConnections = false } = {}) {
+async function tryAcquireIndexLifecycleAuthority(db) {
+  if (typeof db?.$queryRawUnsafe !== "function") {
+    return { acquired: true, pid: null, isolation: null, adapterFallback: true };
+  }
+  const rows = await db.$queryRawUnsafe(
+    `SELECT pg_try_advisory_lock($1::int, $2::int) AS acquired,
+            pg_backend_pid()::int AS pid,
+            current_setting('transaction_isolation') AS isolation`,
+    PREFLIGHT_ADVISORY_LOCK_CLASS,
+    INDEX_LIFECYCLE_ADVISORY_LOCK_KEY,
+  );
+  const row = rows?.[0] || {};
+  return {
+    acquired: row.acquired === true,
+    pid: Number.isInteger(Number(row.pid)) ? Number(row.pid) : null,
+    isolation: String(row.isolation || ""),
+    adapterFallback: false,
+  };
+}
+
+async function releaseIndexLifecycleAuthority(db, expectedPid = null) {
+  if (typeof db?.$queryRawUnsafe !== "function") return { released: true, pid: expectedPid, adapterFallback: true };
+  const rows = await db.$queryRawUnsafe(
+    `SELECT pg_backend_pid()::int AS pid,
+            pg_advisory_unlock($1::int, $2::int) AS released`,
+    PREFLIGHT_ADVISORY_LOCK_CLASS,
+    INDEX_LIFECYCLE_ADVISORY_LOCK_KEY,
+  );
+  const row = rows?.[0] || {};
+  const pid = Number.isInteger(Number(row.pid)) ? Number(row.pid) : null;
+  if (expectedPid !== null && pid !== expectedPid) {
+    fail(`index lifecycle PostgreSQL session changed while authority was held; expectedPid=${expectedPid} actualPid=${pid}`);
+  }
+  if (row.released !== true) fail("index lifecycle session advisory authority was not held at release");
+  return { released: true, pid, adapterFallback: false };
+}
+
+async function assertIndexLifecycleConnectionContract(rootDb, lifecycleDb, expectedLifecyclePid = null) {
+  if (typeof rootDb?.$queryRawUnsafe !== "function" || typeof lifecycleDb?.$queryRawUnsafe !== "function") {
+    return { verified: false, adapterFallback: true, lifecyclePid: expectedLifecyclePid };
+  }
+  const root = await indexLifecycleSessionState(rootDb);
+  const lifecycle = await indexLifecycleSessionState(lifecycleDb);
+  if (!Number.isInteger(Number(root.pid)) || !Number.isInteger(Number(lifecycle.pid))) {
+    fail("index lifecycle connection contract could not resolve PostgreSQL backend PIDs");
+  }
+  if (Number(root.pid) === Number(lifecycle.pid)) {
+    fail("index lifecycle requires a dedicated PostgreSQL session distinct from the root preflight client");
+  }
+  if (expectedLifecyclePid !== null && Number(lifecycle.pid) !== Number(expectedLifecyclePid)) {
+    fail(`index lifecycle dedicated session changed after acquiring authority; expectedPid=${expectedLifecyclePid} actualPid=${lifecycle.pid}`);
+  }
+  if (String(lifecycle.isolation || "").toLowerCase() !== "read committed") {
+    fail(`index lifecycle dedicated session must use Read Committed; got=${lifecycle.isolation}`);
+  }
+  return {
+    verified: true,
+    rootPid: Number(root.pid),
+    lifecyclePid: Number(lifecycle.pid),
+    ownerPid: Number(lifecycle.pid),
+    workerPid: Number(lifecycle.pid),
+    ownerIsolation: String(lifecycle.isolation),
+    workerIsolation: String(lifecycle.isolation),
+  };
+}
+
+async function withIndexLifecycleAuthority(db, work, {
+  workerDb = null,
+  requireDistinctConnections = false,
+  timeoutMs = INDEX_LIFECYCLE_AUTHORITY_TIMEOUT_MS,
+  pollMs = INDEX_LIFECYCLE_AUTHORITY_POLL_MS,
+} = {}) {
   if (typeof work !== "function") throw new TypeError("Index lifecycle authority requires work callback");
   const lifecycleDb = workerDb || db;
   if (requireDistinctConnections && lifecycleDb === db) {
-    fail("index lifecycle production preflight requires a dedicated concurrent-index Prisma client");
+    fail("index lifecycle production preflight requires a dedicated one-connection Prisma client");
   }
-  if (typeof db?.$transaction !== "function") return work(lifecycleDb, { verified: false, adapterFallback: true });
-  // CREATE/DROP INDEX CONCURRENTLY cannot execute inside a transaction. Hold the
-  // transaction-scoped advisory owner on client A while dedicated client B owns
-  // the concurrent-index lifecycle. ReadCommitted is explicit so the owner does
-  // not pin a long snapshot while client B waits on old transactions/snapshots.
-  return db.$transaction(async (ownerTx) => {
-    await acquirePreflightAuthority(ownerTx);
-    const contract = await assertIndexLifecycleConnectionContract(ownerTx, lifecycleDb);
+
+  // Never block inside a transaction while a peer owns lifecycle authority.
+  // Each failed pg_try_advisory_lock call is a short autocommit statement, so a
+  // contender cannot pin an old snapshot that CREATE INDEX CONCURRENTLY needs
+  // to drain. The acquired session lock is held by the same one-connection
+  // Prisma client that performs CREATE/DROP INDEX CONCURRENTLY.
+  const startedAt = Date.now();
+  let acquired = null;
+  let attempts = 0;
+  while (!acquired?.acquired) {
+    attempts += 1;
+    acquired = await tryAcquireIndexLifecycleAuthority(lifecycleDb);
+    if (acquired.acquired) break;
+    if (Date.now() - startedAt >= timeoutMs) {
+      fail(`index lifecycle session authority did not become available within ${timeoutMs}ms`);
+    }
+    await sleep(pollMs);
+  }
+
+  let workError = null;
+  try {
+    const contract = await assertIndexLifecycleConnectionContract(db, lifecycleDb, acquired.pid);
     if (requireDistinctConnections && contract.verified !== true) {
       fail("index lifecycle production connection contract was not physically verified");
     }
-    return work(lifecycleDb, contract);
-  }, {
-    maxWait: PREFLIGHT_TRANSACTION_MAX_WAIT_MS,
-    timeout: INDEX_LIFECYCLE_AUTHORITY_TIMEOUT_MS,
-    isolationLevel: "ReadCommitted",
-  });
+    return await work(lifecycleDb, {
+      ...contract,
+      authorityMode: "session_try_lock",
+      authorityAttempts: attempts,
+      authorityWaitMs: Date.now() - startedAt,
+    });
+  } catch (error) {
+    workError = error;
+    throw error;
+  } finally {
+    try {
+      await releaseIndexLifecycleAuthority(lifecycleDb, acquired?.pid ?? null);
+    } catch (releaseError) {
+      if (!workError) throw releaseError;
+      console.error(`# PHASE3_CAMPAIGN_COVERAGE_INDEX_AUTHORITY_RELEASE_FAIL ${releaseError?.stack || releaseError}`);
+    }
+  }
 }
 
 async function ensureCurrentRunLookupIndex(db, peerWaitOptions = undefined) {
@@ -525,7 +616,7 @@ async function main() {
       db,
       async (lifecycleDb, contract) => {
         if (contract?.verified !== true) fail("index lifecycle connection contract was not verified before concurrent index work");
-        console.log(`# PHASE3_CAMPAIGN_COVERAGE_INDEX_CONNECTION_CONTRACT_PASS ownerPid=${contract.ownerPid} workerPid=${contract.workerPid} isolation=${JSON.stringify(contract.ownerIsolation)}`);
+        console.log(`# PHASE3_CAMPAIGN_COVERAGE_INDEX_CONNECTION_CONTRACT_PASS rootPid=${contract.rootPid} lifecyclePid=${contract.lifecyclePid} isolation=${JSON.stringify(contract.ownerIsolation)} authority=${contract.authorityMode} attempts=${contract.authorityAttempts}`);
         return ensureCurrentRunLookupIndex(lifecycleDb);
       },
       { workerDb: indexDb, requireDistinctConnections: true },
@@ -570,6 +661,8 @@ module.exports = {
   PREFLIGHT_TRANSACTION_MAX_WAIT_MS,
   PREFLIGHT_TRANSACTION_TIMEOUT_MS,
   INDEX_LIFECYCLE_AUTHORITY_TIMEOUT_MS,
+  INDEX_LIFECYCLE_AUTHORITY_POLL_MS,
+  INDEX_LIFECYCLE_ADVISORY_LOCK_KEY,
   INDEX_PEER_BUILD_WAIT_TIMEOUT_MS,
   INDEX_PEER_BUILD_POLL_MS,
   CURRENT_RUN_INDEX_NAME,
@@ -588,6 +681,9 @@ module.exports = {
   currentRunIndexBuildProgress,
   waitForCurrentRunIndexPeerBuild,
   indexLifecycleWorkerDatabaseUrl,
+  indexLifecycleSessionState,
+  tryAcquireIndexLifecycleAuthority,
+  releaseIndexLifecycleAuthority,
   assertIndexLifecycleConnectionContract,
   withIndexLifecycleAuthority,
   ensureCurrentRunLookupIndex,

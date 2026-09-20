@@ -197,7 +197,7 @@ test("A21 clean bootstrap, generation CAS and exact Subscriber cursor scale are 
   assert.match(postflight, /publicationGeneration[\s\S]*publishedGeneration/);
 });
 
-test("index lifecycle contract requires distinct sessions, explicit ReadCommitted owner and bounded worker connection", async () => {
+test("index lifecycle contract requires a dedicated ReadCommitted session and bounded one-connection worker", async () => {
   const url = preflight.indexLifecycleWorkerDatabaseUrl("postgresql://u:p@db.example/x?schema=public");
   const parsed = new URL(url);
   assert.equal(parsed.searchParams.get("connection_limit"), "1");
@@ -209,12 +209,12 @@ test("index lifecycle contract requires distinct sessions, explicit ReadCommitte
       { $queryRawUnsafe: async () => [{ pid: 9, isolation: "read committed" }] },
       { $queryRawUnsafe: async () => [{ pid: 9, isolation: "read committed" }] },
     ),
-    /two distinct PostgreSQL sessions/,
+    /dedicated PostgreSQL session distinct from the root preflight client/,
   );
   await assert.rejects(
     () => preflight.assertIndexLifecycleConnectionContract(
-      { $queryRawUnsafe: async () => [{ pid: 9, isolation: "repeatable read" }] },
-      { $queryRawUnsafe: async () => [{ pid: 10, isolation: "read committed" }] },
+      { $queryRawUnsafe: async () => [{ pid: 9, isolation: "read committed" }] },
+      { $queryRawUnsafe: async () => [{ pid: 10, isolation: "repeatable read" }] },
     ),
     /must use Read Committed/,
   );

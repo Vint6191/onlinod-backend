@@ -61,24 +61,31 @@ test("A20.12 current-run index authority proves exact non-partial plain-column b
   assert.throws(() => preflight.assertCurrentRunIndex(exactIndex({ columns: ["creatorId", "id", "scanRunId"] })), /exact definition\/order mismatch/);
 });
 
-test("A20.12 deploy owner spans index lifecycle on a distinct ReadCommitted owner/worker connection pair", async () => {
+test("A20.12 index lifecycle uses nonblocking session authority on the dedicated CREATE INDEX connection", async () => {
   const events = [];
   let index = null;
-  const owner = {
-    $transaction: async (work, options) => {
-      events.push(["owner-begin", options]);
-      const ownerTx = {
-        $executeRawUnsafe: async (sql) => { events.push(["owner-lock", String(sql)]); return 0; },
-        $queryRawUnsafe: async () => [{ pid: 101, isolation: "read committed" }],
-      };
-      const result = await work(ownerTx);
-      events.push(["owner-commit"]);
-      return result;
+  let sessionLockHeld = false;
+  const root = {
+    $queryRawUnsafe: async (sql) => {
+      assert.match(String(sql), /pg_backend_pid/);
+      return [{ pid: 101, isolation: "read committed" }];
     },
   };
   const worker = {
     $queryRawUnsafe: async (sql) => {
       const text = String(sql);
+      if (/pg_try_advisory_lock/.test(text)) {
+        events.push(["try-lock"]);
+        if (sessionLockHeld) return [{ acquired: false, pid: 202, isolation: "read committed" }];
+        sessionLockHeld = true;
+        return [{ acquired: true, pid: 202, isolation: "read committed" }];
+      }
+      if (/pg_advisory_unlock/.test(text)) {
+        events.push(["unlock"]);
+        const released = sessionLockHeld;
+        sessionLockHeld = false;
+        return [{ pid: 202, released }];
+      }
       if (/pg_backend_pid/.test(text)) return [{ pid: 202, isolation: "read committed" }];
       if (/pg_stat_progress_create_index/.test(text)) return [];
       events.push(["worker-inspect", text]);
@@ -91,21 +98,91 @@ test("A20.12 deploy owner spans index lifecycle on a distinct ReadCommitted owne
     },
   };
   await preflight.withIndexLifecycleAuthority(
-    owner,
+    root,
     (db, contract) => {
       assert.equal(contract.verified, true);
-      assert.notEqual(contract.ownerPid, contract.workerPid);
+      assert.equal(contract.rootPid, 101);
+      assert.equal(contract.lifecyclePid, 202);
+      assert.equal(contract.authorityMode, "session_try_lock");
       return preflight.ensureCurrentRunLookupIndex(db);
     },
-    { workerDb: worker, requireDistinctConnections: true },
+    { workerDb: worker, requireDistinctConnections: true, pollMs: 0 },
   );
-  const lock = events.findIndex(([kind]) => kind === "owner-lock");
+  const lock = events.findIndex(([kind]) => kind === "try-lock");
   const inspect = events.findIndex(([kind]) => kind === "worker-inspect");
   const create = events.findIndex(([kind, sql]) => kind === "worker-execute" && /CREATE INDEX CONCURRENTLY/.test(sql));
-  const commit = events.findIndex(([kind]) => kind === "owner-commit");
-  assert.ok(lock >= 0 && inspect > lock && create > inspect && commit > create, JSON.stringify(events));
-  assert.equal(events[0][1].timeout, preflight.INDEX_LIFECYCLE_AUTHORITY_TIMEOUT_MS);
-  assert.equal(events[0][1].isolationLevel, "ReadCommitted");
+  const unlock = events.findIndex(([kind]) => kind === "unlock");
+  assert.ok(lock >= 0 && inspect > lock && create > inspect && unlock > create, JSON.stringify(events));
+  assert.equal(sessionLockHeld, false);
+});
+
+test("A22 concurrent index lifecycle contenders poll without pinning a transaction snapshot", async () => {
+  let holder = null;
+  let firstEntered = false;
+  let secondEntered = false;
+  let releaseFirst;
+  const firstRelease = new Promise((resolve) => { releaseFirst = resolve; });
+  const tries = { 202: 0, 303: 0 };
+
+  function root(pid) {
+    return { $queryRawUnsafe: async () => [{ pid, isolation: "read committed" }] };
+  }
+  function lifecycle(pid) {
+    return {
+      $queryRawUnsafe: async (sql) => {
+        const text = String(sql);
+        if (/pg_try_advisory_lock/.test(text)) {
+          tries[pid] += 1;
+          if (holder === null) { holder = pid; return [{ acquired: true, pid, isolation: "read committed" }]; }
+          return [{ acquired: false, pid, isolation: "read committed" }];
+        }
+        if (/pg_advisory_unlock/.test(text)) {
+          const released = holder === pid;
+          if (released) holder = null;
+          return [{ pid, released }];
+        }
+        if (/pg_backend_pid/.test(text)) return [{ pid, isolation: "read committed" }];
+        return [];
+      },
+    };
+  }
+
+  const first = preflight.withIndexLifecycleAuthority(
+    root(101),
+    async (_db, contract) => {
+      firstEntered = true;
+      assert.equal(contract.lifecyclePid, 202);
+      await firstRelease;
+      return "first";
+    },
+    { workerDb: lifecycle(202), requireDistinctConnections: true, pollMs: 1, timeoutMs: 1000 },
+  );
+
+  while (!firstEntered) await new Promise((resolve) => setTimeout(resolve, 1));
+  const second = preflight.withIndexLifecycleAuthority(
+    root(102),
+    async (_db, contract) => { secondEntered = true; assert.equal(contract.lifecyclePid, 303); return "second"; },
+    { workerDb: lifecycle(303), requireDistinctConnections: true, pollMs: 1, timeoutMs: 1000 },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(secondEntered, false, "peer must poll rather than enter lifecycle work while authority is held");
+  assert.ok(tries[303] >= 1, "peer must use nonblocking try-lock polling");
+  releaseFirst();
+  assert.deepEqual(await Promise.all([first, second]), ["first", "second"]);
+  assert.equal(holder, null);
+});
+
+test("A20.12 lifecycle authority never waits inside an interactive transaction", () => {
+  const physical = source("scripts/database/phase3-campaign-coverage-generation-online-preflight.js");
+  const start = physical.indexOf("async function withIndexLifecycleAuthority");
+  const end = physical.indexOf("\nasync function ensureCurrentRunLookupIndex", start);
+  const body = physical.slice(start, end);
+  assert.match(body, /pg_try_advisory_lock/);
+  assert.match(body, /session_try_lock/);
+  assert.doesNotMatch(body, /\$transaction/);
+  assert.doesNotMatch(body, /pg_advisory_xact_lock/);
+  assert.match(physical, /INDEX_LIFECYCLE_ADVISORY_LOCK_KEY/);
+  assert.notEqual(preflight.INDEX_LIFECYCLE_ADVISORY_LOCK_KEY, preflight.PREFLIGHT_ADVISORY_LOCK_KEY);
 });
 
 

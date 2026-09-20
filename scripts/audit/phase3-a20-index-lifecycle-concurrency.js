@@ -28,8 +28,8 @@ function runPreflight(label, databaseUrl) {
     child.on("error", reject);
     child.on("exit", (code, signal) => {
       if (code !== 0) return reject(new Error(`${label} failed code=${code} signal=${signal || "none"}\n${stderr || stdout}`));
-      if (!stdout.includes("PHASE3_CAMPAIGN_COVERAGE_INDEX_CONNECTION_CONTRACT_PASS")) {
-        return reject(new Error(`${label} did not prove distinct owner/worker PostgreSQL sessions with explicit ReadCommitted owner isolation`));
+      if (!stdout.includes("PHASE3_CAMPAIGN_COVERAGE_INDEX_CONNECTION_CONTRACT_PASS") || !stdout.includes("authority=session_try_lock")) {
+        return reject(new Error(`${label} did not prove nonblocking session lifecycle authority on the dedicated PostgreSQL index connection`));
       }
       resolve({ label, stdout, stderr });
     });
