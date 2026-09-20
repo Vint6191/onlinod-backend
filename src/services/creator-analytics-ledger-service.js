@@ -4,7 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { rebuildCreatorDailyMetrics, upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
-const { projectFanIdentity, projectFanValue, projectFanObservationBatch } = require("./fan-data-authority-service");
+const { projectFanIdentity, projectFanObservationBatch } = require("./fan-data-authority-service");
 const { displayRangeBounds, scanContractFromJob } = require("./analytics-range-contract");
 const {
   collectionCommand, COLLECTOR_TYPES, acceptCampaignGeneration, completeCampaignCollection,
@@ -1461,29 +1461,6 @@ async function assertCampaignFanValueScope(tx, job, scanRunId, onlyFansUserIds) 
   }
 }
 
-async function projectCampaignFanValueCurrent({ tx, job, deviceId, scanRunId, item, observedAt }) {
-  const authorityObservedAt = strictDate(observedAt);
-  if (!authorityObservedAt) throw new Error("Campaign fan value authority time is invalid");
-  return projectFanValue(tx, {
-    agencyId: job.agencyId,
-    creatorId: job.creatorId,
-    onlyFansUserId: item.onlyFansUserId,
-    totalSpentCents: item.values.totalSpentCents,
-    messagesSpentCents: item.values.messagesSpentCents,
-    subscriptionsSpentCents: item.values.subscriptionsSpentCents,
-    tipsSpentCents: item.values.tipsSpentCents,
-    postsSpentCents: item.values.postsSpentCents,
-    streamsSpentCents: item.values.streamsSpentCents,
-    lastActivityAt: item.lastActivityAt,
-    availability: "AVAILABLE",
-    observedAt: authorityObservedAt,
-    source: "CAMPAIGN_CLAIMER",
-    sourceDeviceId: deviceId || null,
-    sourceJobId: job.id,
-    scanRunId,
-  });
-}
-
 async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, authorityObservedAt }) {
   if (item.available !== true) return { available: false, reasonCode: item.reasonCode };
   const observedAt = strictDate(authorityObservedAt);
@@ -1499,13 +1476,23 @@ async function upsertCampaignFanValueTx({ tx, job, deviceId, scanRunId, item, au
     observedAt,
     source: "CAMPAIGN_CLAIMER",
   });
-  const projected = await projectCampaignFanValueCurrent({ tx, job, deviceId, scanRunId, item, observedAt });
-  return {
-    replay: projected.replay,
-    available: true,
-    fanRecordId: fan.id,
-    fetchedAt: projected.record?.valueObservedAt || observedAt,
-  };
+  await projectFanObservationBatch(tx, {
+    agencyId: job.agencyId,
+    creatorId: job.creatorId,
+    sourceDeviceId: deviceId || null,
+    sourceJobId: job.id,
+    scanRunId,
+    items: [{
+      onlyFansUserId: item.onlyFansUserId,
+      identity: { username: item.username, platformDisplayName: item.displayName, avatarUrl: item.avatarUrl, headerUrl: item.headerUrl, observedAt, source: "CAMPAIGN_CLAIMER" },
+      value: { availability: "AVAILABLE", totalSpentCents: item.values.totalSpentCents, messagesSpentCents: item.values.messagesSpentCents, subscriptionsSpentCents: item.values.subscriptionsSpentCents, tipsSpentCents: item.values.tipsSpentCents, postsSpentCents: item.values.postsSpentCents, streamsSpentCents: item.values.streamsSpentCents, lastActivityAt: item.lastActivityAt, observedAt, source: "CAMPAIGN_CLAIMER" },
+    }],
+    allowedSources: ["CAMPAIGN_CLAIMER"],
+    observedAtPolicy: "TRUSTED_INPUT",
+    receivedAt: observedAt,
+    campaignLockHeld: true,
+  });
+  return { replay: false, available: true, fanRecordId: fan.id, fetchedAt: observedAt };
 }
 
 function campaignFanValueObservationTokenRequired(job) {

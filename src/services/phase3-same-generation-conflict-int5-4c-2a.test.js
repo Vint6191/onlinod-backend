@@ -2,12 +2,9 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const {
-  projectFanIdentity,
-  projectFanRelationship,
-  projectFanValue,
-  projectFanObservationBatch,
-} = require("./fan-data-authority-service");
+const fanDataAuthority = require("./fan-data-authority-service");
+const { projectFanIdentity, projectFanRelationship, projectFanObservationBatch } = fanDataAuthority;
+const { projectFanValue } = fanDataAuthority._test;
 
 function compareValue(actual, condition) {
   if (condition === null) return actual == null;

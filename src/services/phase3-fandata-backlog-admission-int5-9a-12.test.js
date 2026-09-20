@@ -49,8 +49,12 @@ test("A12 saturated campaign refresh scheduling preserves durable demand and wor
   let plannerCalls = 0;
   const db = {
     $executeRawUnsafe: async () => 1,
-    $queryRawUnsafe: async (sql) => {
+    $queryRawUnsafe: async (sql, ...args) => {
       if (/FROM "JobInstance"/.test(String(sql))) return [{ pendingGlobal: BigInt(FAN_DATA_REFRESH_MAX_PENDING_JOBS), pendingCreator: 0n }];
+      if (/INSERT INTO "CampaignFanRefreshPromotionSignal"/.test(String(sql))) {
+        assert.match(String(sql), /LEAST\("CampaignFanRefreshPromotionSignal"\."dueAt", EXCLUDED\."dueAt"\)/);
+        return [{ dueAt: args[3], revision: 1 }];
+      }
       throw new Error(`unexpected SQL: ${String(sql)}`);
     },
     creatorFanRefreshDemand: {

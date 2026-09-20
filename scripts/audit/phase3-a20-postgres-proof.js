@@ -11,7 +11,7 @@ const ROOT = path.resolve(__dirname, "../..");
 const PRISMA_DIR = path.join(ROOT, "prisma");
 const A13_CUTOFF = "20260919010000_phase3_provider_gate_durable_waiter_fairness_v1";
 const PRE_A20_2_CUTOFF = "20260919113000_phase3_campaign_refresh_recovery_status_v1";
-const EXPECTED_PROOF_TEST_COUNT = 34;
+const EXPECTED_PROOF_TEST_COUNT = 38;
 const COVERAGE_PREFLIGHT = path.join(ROOT, "scripts/database/phase3-campaign-coverage-generation-online-preflight.js");
 const PREFLIGHT_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-concurrency.js");
 const PREFLIGHT_RUNTIME_AVAILABILITY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-runtime-availability.js");
@@ -123,7 +123,27 @@ function assertNodeProof(stdout, label) {
     fail(`${label} is not zero-fail/zero-skip: ${JSON.stringify(summary)}`);
   }
   const metrics = assertScaleMetrics(stdout, label);
-  return { ...summary, ...metrics };
+  const hotPlans = parseJsonLines(stdout, "FINAL_HOT_QUERY_PLAN_PROOF");
+  if (hotPlans.length !== 1) fail(`${label} expected one FINAL_HOT_QUERY_PLAN_PROOF marker, got ${hotPlans.length}`);
+  const hotPlan = hotPlans[0];
+  const requiredIndexes = [
+    "CreatorFanRefreshDemand_promoter_ready_idx",
+    "CreatorFanRefreshDemand_recovery_order_idx",
+    "CreatorFanRefreshDemand_canonical_heal_idx",
+    "CampaignFanRefreshPromotionSignal_claim_due_idx",
+  ];
+  if (Number(hotPlan?.debtRows) !== 4000 || Number(hotPlan?.signalRows) !== 4000
+      || !requiredIndexes.every((name) => Array.isArray(hotPlan?.indexes) && hotPlan.indexes.includes(name))) {
+    fail(`${label} invalid FINAL_HOT_QUERY_PLAN_PROOF: ${JSON.stringify(hotPlan)}`);
+  }
+  const subscriberReconcilePlans = parseJsonLines(stdout, "FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF");
+  if (subscriberReconcilePlans.length !== 1) fail(`${label} expected one FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF marker, got ${subscriberReconcilePlans.length}`);
+  const subscriberReconcilePlan = subscriberReconcilePlans[0] || null;
+  if (Number(subscriberReconcilePlan?.historyRows) !== 4000 || Number(subscriberReconcilePlan?.debtRows) !== 200
+      || subscriberReconcilePlan?.index !== "SubscriberScanRun_publication_job_reconcile_idx") {
+    fail(`${label} invalid FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF: ${JSON.stringify(subscriberReconcilePlan)}`);
+  }
+  return { ...summary, ...metrics, hotPlan, subscriberReconcilePlan };
 }
 function runProofTests(label, databaseUrl) {
   const out = run(label, process.execPath, ["--test", ...PROOF_TESTS], { DATABASE_URL: databaseUrl, ONLINOD_POSTGRES_INTEGRATION: "1" });

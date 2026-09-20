@@ -5,7 +5,17 @@ ALTER TABLE "SubscriberScanRun"
   ADD COLUMN IF NOT EXISTS "fanProjectionCursorOffset" INTEGER NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS "fanProjectionCount" INTEGER NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS "fanProjectionCompletedAt" TIMESTAMP(3),
-  ADD COLUMN IF NOT EXISTS "fanProjectionLastError" VARCHAR(1000);
+  ADD COLUMN IF NOT EXISTS "fanProjectionLastError" VARCHAR(1000),
+  ADD COLUMN IF NOT EXISTS "publicationStatus" TEXT NOT NULL DEFAULT 'PENDING',
+  ADD COLUMN IF NOT EXISTS "publicationCursorId" VARCHAR(180),
+  ADD COLUMN IF NOT EXISTS "publicationPreviousRunId" TEXT,
+  ADD COLUMN IF NOT EXISTS "publicationAddedCount" INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS "publicationChangedCount" INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS "publicationDisappearedCount" INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS "publicationStartedAt" TIMESTAMP(3),
+  ADD COLUMN IF NOT EXISTS "publicationCompletedAt" TIMESTAMP(3),
+  ADD COLUMN IF NOT EXISTS "publicationJobReconciledAt" TIMESTAMP(3),
+  ADD COLUMN IF NOT EXISTS "publicationLastError" VARCHAR(1000);
 
 ALTER TABLE "SubscriberScanItem"
   ADD COLUMN IF NOT EXISTS "pageOffset" INTEGER;
@@ -21,6 +31,28 @@ SET "fanProjectionStatus" = 'COMPLETE',
     "fanProjectionCount" = GREATEST("fanProjectionCount", "scannedCount"),
     "fanProjectionCompletedAt" = COALESCE("fanProjectionCompletedAt", "publishedAt", "completedAt", "updatedAt")
 WHERE "status" IN ('PUBLISHED', 'SUPERSEDED');
+
+UPDATE "SubscriberScanRun"
+SET "publicationStatus" = 'COMPLETE',
+    "publicationStartedAt" = COALESCE("publicationStartedAt", "publishedAt", "completedAt", "updatedAt"),
+    "publicationCompletedAt" = COALESCE("publicationCompletedAt", "publishedAt", "completedAt", "updatedAt"),
+    "publicationAddedCount" = GREATEST("publicationAddedCount",
+      CASE WHEN COALESCE("summary"->>'addedCount', '') ~ '^[0-9]+$' THEN ("summary"->>'addedCount')::integer ELSE 0 END),
+    "publicationChangedCount" = GREATEST("publicationChangedCount",
+      CASE WHEN COALESCE("summary"->>'changedCount', '') ~ '^[0-9]+$' THEN ("summary"->>'changedCount')::integer ELSE 0 END),
+    "publicationDisappearedCount" = GREATEST("publicationDisappearedCount",
+      CASE WHEN COALESCE("summary"->>'disappearedCount', '') ~ '^[0-9]+$' THEN ("summary"->>'disappearedCount')::integer ELSE 0 END),
+    "publicationJobReconciledAt" = COALESCE("publicationJobReconciledAt", "publishedAt", "completedAt", "updatedAt")
+WHERE "status" IN ('PUBLISHED', 'SUPERSEDED');
+
+CREATE INDEX IF NOT EXISTS "SubscriberScanRun_publication_recovery_idx"
+  ON "SubscriberScanRun"("status", "publicationStatus", "updatedAt");
+
+CREATE INDEX IF NOT EXISTS "SubscriberScanRun_publication_job_reconcile_idx"
+  ON "SubscriberScanRun"("updatedAt", "id")
+  WHERE "status" IN ('PUBLISHED', 'SUPERSEDED')
+    AND "publicationStatus" = 'COMPLETE'
+    AND "publicationJobReconciledAt" IS NULL;
 
 -- 2) Durable creator-scoped promotion signal. Global recovery/promoter scans are
 -- replaced by SKIP LOCKED signal claiming, one creator transaction at a time.
@@ -70,73 +102,44 @@ ON CONFLICT ("creatorId") DO UPDATE SET
   "revision" = "CampaignFanRefreshPromotionSignal"."revision" + 1,
   "updatedAt" = CURRENT_TIMESTAMP;
 
--- 3) Retire obsolete Analytics snapshot generations. Current Home/Stats/Billing
--- read relational canonical facts; these archive tables must no longer be physical
--- runtime authority or a future accidental fallback.
+-- 3) Exact hot-path indexes for the creator-scoped Campaign debt lanes.
+-- These predicates/orderings intentionally mirror runtime queries; generic
+-- status indexes were not sufficient evidence for large-debt behavior.
+CREATE INDEX IF NOT EXISTS "CreatorFanRefreshDemand_promoter_ready_idx"
+  ON "CreatorFanRefreshDemand"("creatorId", "lastRequestedAt", "id")
+  WHERE "status" = 'QUEUED' AND "activeRefreshJobId" IS NULL;
+
+CREATE INDEX IF NOT EXISTS "CreatorFanRefreshDemand_recovery_order_idx"
+  ON "CreatorFanRefreshDemand"(
+    "creatorId",
+    (COALESCE("nextRetryAt", "lastFailedAt", "updatedAt")),
+    "id"
+  )
+  WHERE "status" = 'FAILED' AND "activeRefreshJobId" IS NULL;
+
+CREATE INDEX IF NOT EXISTS "CreatorFanRefreshDemand_canonical_heal_idx"
+  ON "CreatorFanRefreshDemand"("creatorId", "updatedAt", "id")
+  WHERE "status" IN ('QUEUED', 'FAILED');
+
+CREATE INDEX IF NOT EXISTS "CampaignFanRefreshPromotionSignal_claim_due_idx"
+  ON "CampaignFanRefreshPromotionSignal"(
+    "dueAt",
+    "creatorId",
+    (COALESCE("claimUntil", '-infinity'::timestamp))
+  );
+
+-- 4) Legacy snapshot retirement is deliberately TWO-PHASE. This migration is
+-- Phase A only. Runtime readers/writers are retired in the new revision, but the
+-- physical legacy tables are preserved unchanged through the rolling-deploy and
+-- rollback window so the previous revision's analyticsSnapshot.upsert() cannot
+-- hit a read-only view or a missing relation.
 --
--- Render runs migrations while the previous application revision can still be serving.
--- Dropping the legacy relations outright would therefore create a rolling-deploy window
--- where the old Billing binary can fail with relation-does-not-exist. Remove the physical
--- tables/data, then atomically replace their old relation names with zero-row read-only
--- compatibility views. The new revision has no Prisma models or source readers/writers for
--- these names; the views exist only so an old in-flight revision observes "no legacy data"
--- until traffic has fully cut over.
-DROP TABLE IF EXISTS "AnalyticsSnapshot" CASCADE;
-DROP TABLE IF EXISTS "CreatorCampaignsSnapshot" CASCADE;
-DROP TABLE IF EXISTS "CreatorEarningsSnapshot" CASCADE;
-
-CREATE VIEW "CreatorEarningsSnapshot" AS
-SELECT
-  NULL::text AS "id",
-  NULL::text AS "creatorId",
-  NULL::text AS "agencyId",
-  NULL::text AS "rangeKey",
-  NULL::timestamp(3) AS "rangeStartAt",
-  NULL::timestamp(3) AS "rangeEndAt",
-  NULL::bigint AS "totalCents",
-  NULL::bigint AS "grossCents",
-  NULL::bigint AS "deltaCents",
-  NULL::integer AS "salesCount",
-  NULL::integer AS "uniqueFans",
-  NULL::integer AS "avgSaleCents",
-  NULL::integer AS "fanLtvCents",
-  NULL::jsonb AS "raw",
-  NULL::timestamp(3) AS "capturedAt",
-  NULL::text AS "capturedByDeviceId",
-  NULL::text AS "capturedByUserId",
-  NULL::timestamp(3) AS "createdAt",
-  NULL::timestamp(3) AS "updatedAt"
-WHERE FALSE;
-
-CREATE VIEW "CreatorCampaignsSnapshot" AS
-SELECT
-  NULL::text AS "id",
-  NULL::text AS "creatorId",
-  NULL::text AS "agencyId",
-  NULL::text AS "rangeKey",
-  NULL::jsonb AS "campaigns",
-  NULL::integer AS "totalActive",
-  NULL::integer AS "totalClaimers",
-  NULL::integer AS "totalClicks",
-  NULL::timestamp(3) AS "capturedAt",
-  NULL::text AS "capturedByDeviceId",
-  NULL::text AS "capturedByUserId",
-  NULL::timestamp(3) AS "createdAt",
-  NULL::timestamp(3) AS "updatedAt"
-WHERE FALSE;
-
-CREATE VIEW "AnalyticsSnapshot" AS
-SELECT
-  NULL::text AS "id",
-  NULL::text AS "agencyId",
-  NULL::text AS "scope",
-  NULL::text AS "rangeKey",
-  NULL::jsonb AS "payload",
-  NULL::timestamp(3) AS "capturedAt",
-  NULL::timestamp(3) AS "createdAt",
-  NULL::timestamp(3) AS "updatedAt"
-WHERE FALSE;
-
-COMMENT ON VIEW "CreatorEarningsSnapshot" IS 'Phase-3 rolling-deploy tombstone; zero rows; remove after legacy revision drain';
-COMMENT ON VIEW "CreatorCampaignsSnapshot" IS 'Phase-3 rolling-deploy tombstone; zero rows; remove after legacy revision drain';
-COMMENT ON VIEW "AnalyticsSnapshot" IS 'Phase-3 rolling-deploy tombstone; zero rows; remove after legacy revision drain';
+-- Phase B is a separate, future destructive migration and MUST NOT be added here.
+-- Before Phase B: prove all old revisions drained, take/verify an explicit backup
+-- of all three legacy tables, record row counts/checksums, and retain a rollback
+-- artifact. See docs/PHASE3_ANALYTICS_LEGACY_SNAPSHOT_RETIREMENT.md.
+--
+-- Intentionally preserved in Phase A:
+--   "AnalyticsSnapshot"
+--   "CreatorCampaignsSnapshot"
+--   "CreatorEarningsSnapshot"

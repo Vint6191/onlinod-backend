@@ -30,6 +30,11 @@ function terminalDb(demandCount, rawResult, calls) {
       count("raw");
       if (/SELECT clock_timestamp\(\)/.test(sql)) return [{ authorityNow: new Date("2040-03-01T00:00:00.000Z") }];
       if (/FROM "CreatorFanRefreshDemand" WHERE "activeRefreshJobId"/.test(sql) && /FOR UPDATE/.test(sql)) return demands.map((row) => ({ id: row.id }));
+      if (/INSERT INTO "CampaignFanRefreshPromotionSignal"/.test(sql) && /ON CONFLICT \("creatorId"\)/.test(sql)) {
+        assert.match(sql, /LEAST\("CampaignFanRefreshPromotionSignal"\."dueAt", EXCLUDED\."dueAt"\)/);
+        assert.match(sql, /RETURNING "dueAt", "revision"/);
+        return [{ dueAt: args[3], revision: 1 }];
+      }
       if (/transitionCampaignFanRefreshTerminalSetBased/.test("transitionCampaignFanRefreshTerminalSetBased") && /planned_delta AS/.test(sql) && /coverage_update AS/.test(sql)) {
         assert.match(sql, /ORDER BY d\."id" ASC[\s\S]*FOR UPDATE OF d/);
         assert.match(sql, /ORDER BY w\."id" ASC[\s\S]*FOR UPDATE OF w/);
@@ -72,7 +77,7 @@ for (const demandCount of [1, 20, 50]) {
     assert.equal(result.applied, demandCount);
     assert.equal(result.workTransitioned, demandCount);
     assert.equal(result.topology, "set_based_v1");
-    assert.equal(calls.raw, 3, "row lock + DB clock + terminal CTE must remain constant");
+    assert.equal(calls.raw, 4, "row lock + DB clock + terminal CTE + durable signal merge must remain constant");
     assert.equal(calls["demand.findMany"], 1);
     assert.equal(calls["demand.update"] || 0, 0);
     assert.equal(calls["work.updateMany"] || 0, 0);
@@ -98,7 +103,7 @@ for (const demandCount of [1, 20, 50]) {
     assert.equal(result.applied, demandCount);
     assert.equal(result.workTransitioned, demandCount);
     assert.equal(result.topology, "set_based_v1");
-    assert.equal(calls.raw, 3);
+    assert.equal(calls.raw, 4);
     assert.equal(calls.total, 6);
   });
 }

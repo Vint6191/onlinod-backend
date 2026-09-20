@@ -1209,9 +1209,18 @@ test("campaign fan attribution is historical and is never pruned by a later empt
 
 test("campaign fan value current snapshot stores fresh OF subscriber totals and preserves cents exactly", async () => {
   let upsertData = null;
+  const rawSql = [];
   const authorityNow = new Date("2026-08-08T18:02:30.000Z");
   const db = {
-    $executeRawUnsafe: async () => 1,
+    $executeRawUnsafe: async (sql, ...args) => {
+      rawSql.push({ sql: String(sql), args });
+      if (/INSERT INTO "CreatorFanValueCurrent"/.test(String(sql))) {
+        const rows = JSON.parse(args[0]);
+        const row = rows[0];
+        upsertData = { platformReportedTotalSpendCents: BigInt(row.platformReportedTotalSpendCents), messagesSpentCents: BigInt(row.messagesSpentCents), tipsSpentCents: BigInt(row.tipsSpentCents), source: row.source, valueObservedAt: new Date(row.valueObservedAt) };
+      }
+      return 1;
+    },
     $queryRawUnsafe: async () => [{ authorityNow }],
     creatorCampaignCollectionState: {
       findUnique: async () => null,
@@ -1326,7 +1335,12 @@ test("campaign fan value source is server-assigned and fan scope is proven by cu
   const sources = [];
   const allowedFanId = "211347786";
   const db = {
-    $executeRawUnsafe: async () => 1,
+    $executeRawUnsafe: async (sql, ...args) => {
+      if (/INSERT INTO "CreatorFanValueCurrent"/.test(String(sql)) && args[0]) {
+        for (const row of JSON.parse(args[0])) sources.push(row.source);
+      }
+      return 1;
+    },
     $queryRawUnsafe: async () => [{ authorityNow }],
     creatorCampaignCollectionState: {
       findUnique: async () => null,

@@ -125,6 +125,10 @@ async function scheduleValidationFanRefresh(delivery, validation, trigger = "val
 function validationActionError(delivery, validation, fallbackCode, fallbackMessage) {
   const error = new ActionDeliveryError(validation?.code || fallbackCode, validation?.code || fallbackMessage);
   if (validation?.refreshRequired === true) error.fanRefresh = { delivery, validation };
+  if (validation?.terminal === false) {
+    error.retryable = true;
+    error.retryAt = validation?.retryAt || null;
+  }
   return error;
 }
 

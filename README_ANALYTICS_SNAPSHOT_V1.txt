@@ -1,40 +1,12 @@
-# Analytics Snapshot Reporting v1 - Backend
+# Analytics Snapshot v1 — RETIRED (Phase 3)
 
-This turns backend analytics into orchestration/storage, not heavy compute.
+This file is kept only as a historical marker. The v1 snapshot authority is no longer a runtime contract.
 
-## New primary flow
-Electron captures local team-stats events and computes compact summaries on the agency machine.
-Then it reports snapshots to backend:
+Current Phase 3 behavior:
+- `POST /api/analytics/snapshots/report` is retired; the authenticated analytics compatibility route returns `410 GONE`.
+- Home / Stats / Billing read canonical relational facts and current collection state. They do not read `AnalyticsSnapshot`, `CreatorCampaignsSnapshot`, or `CreatorEarningsSnapshot` as authority.
+- Electron remains the OnlyFans collector/executor, while Backend owns durable relational analytics state and authority rules.
+- The three legacy snapshot tables are intentionally preserved only during the Phase-A rolling-deploy / rollback window so an older backend revision can still finish an in-flight legacy write safely.
+- Destructive table removal is a separate Phase-B migration and must not occur until old revisions are drained and an explicit backup/preflight is verified.
 
-POST /api/analytics/snapshots/report
-
-Backend stores latest AnalyticsSnapshot rows and serves Home / Team Analytics from those snapshots.
-Raw telemetry ingest remains available for limited/debug use, but Home/Team do not need to scan raw events on every request.
-
-## New endpoint
-- POST /api/analytics/snapshots/report
-- GET /api/analytics/snapshots/latest?scope=home&range=24h
-
-## Snapshot scopes
-- home
-- team_overview
-- team_members
-- team_alerts
-- team_flags
-
-## Updated behavior
-- /api/home/summary reads latest home snapshot for messages/workers/health.
-- /api/team/analytics/* reads latest team snapshots.
-- Revenue still comes from CreatorEarningsSnapshot, which is already produced by Electron jobs-runner and stored on backend.
-
-## Deploy
-No new schema migration is required if Backend Core v1 is already applied, because AnalyticsSnapshot already exists.
-
-```bash
-npm install
-npx prisma validate
-npm run prisma:migrate
-git add -A
-git commit -m "Use analytics snapshots for home and team summaries"
-git push
-```
+See `docs/PHASE3_ANALYTICS_LEGACY_SNAPSHOT_RETIREMENT.md`.

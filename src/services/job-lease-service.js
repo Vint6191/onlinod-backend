@@ -1014,6 +1014,76 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     }, JOB_COMPLETION_TRANSACTION_OPTIONS);
   }
 
+  if (job.jobKey === "subscriber_directory_scan") {
+    // Subscriber publication is a durable multi-transaction state machine.
+    // Reserve completion ownership in a short fenced transaction, then run the
+    // publication on the root Prisma client so every 500-row phase commits
+    // independently. Crash/retry resumes from SubscriberScanRun publication
+    // phase+cursor instead of replaying one O(all subscribers) transaction.
+    const completionLeaseRevision = leaseRevision + 1;
+    await prisma.$transaction(async (tx) => {
+      try {
+        await assertExecutionAccessFence({
+          db: tx, userId, agencyId: job.agencyId, memberId: job.leaseMemberId,
+          accessEpoch: job.leaseAccessEpoch, creatorId: job.creatorId, lock: true,
+        });
+      } catch (error) {
+        if (error instanceof ExecutionAccessFenceError) throw new JobLeaseError(error.code, error.message, error.status);
+        throw error;
+      }
+      const reserved = await tx.jobInstance.updateMany({
+        where: fenceWhere,
+        data: { leaseRevision: { increment: 1 }, leaseUntil: new Date(now.getTime() + MAX_LEASE_MS), lastProgressAt: now },
+      });
+      if (!reserved.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before subscriber completion reservation");
+    }, JOB_CHUNK_TRANSACTION_OPTIONS);
+
+    let sideEffect;
+    try {
+      sideEffect = await applyJobResult({ db: prisma, job, deviceId, userId, result: result || {} });
+    } catch (error) {
+      // Keep the reserved job reclaimable. Publication progress itself is
+      // durable; shortening the lease avoids pinning a failed request for the
+      // full 15-minute reservation window while still fencing this attempt.
+      await prisma.jobInstance.updateMany({
+        where: {
+          id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: hashToken(leaseToken),
+          leaseRevision: completionLeaseRevision,
+        },
+        data: { leaseUntil: new Date(now.getTime() + MIN_LEASE_MS), lastError: clean(error?.message || error, 2000) || "subscriber_publication_failed" },
+      }).catch(() => null);
+      throw error;
+    }
+
+    const completionFence = {
+      id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId, leaseTokenHash: hashToken(leaseToken),
+      leaseRevision: completionLeaseRevision,
+    };
+    const completed = await prisma.$transaction(async (tx) => {
+      const updated = await tx.jobInstance.updateMany({ where: completionFence, data: completionData });
+      if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Subscriber completion reservation was lost");
+      if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+        await tx.fanObservationReadLease.deleteMany({
+          where: { jobId: job.id, deviceId, leaseRevision },
+        });
+      }
+      const scanRunId = clean(job.params?.scanRunId, 120);
+      if (!scanRunId) throw new JobLeaseError("SUBSCRIBER_SCAN_RUN_MISSING", "Subscriber completion is missing scanRunId");
+      const reconciledRun = await tx.subscriberScanRun.updateMany({
+        where: {
+          id: scanRunId,
+          publicationStatus: "COMPLETE",
+          status: { in: ["PUBLISHED", "SUPERSEDED"] },
+        },
+        data: { publicationJobReconciledAt: now, publicationLastError: null },
+      });
+      if (!reconciledRun.count) throw new JobLeaseError("SUBSCRIBER_PUBLICATION_RECONCILE_MISSING", "Published Subscriber run was not available for atomic job reconciliation");
+      return updated;
+    }, JOB_CHUNK_TRANSACTION_OPTIONS);
+    if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Subscriber completion fence was lost");
+    return { job: { id: job.id, status: "DONE" }, sideEffect };
+  }
+
   if (["fetch_earnings", "fetch_campaigns", "financial_transactions_scan"].includes(job.jobKey)) {
     // These jobs write durable relational projections. Reserve completion
     // ownership before any side effect so a reclaimed worker cannot publish a
@@ -1366,7 +1436,7 @@ async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, wor
     nextRunAt: new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1))), claimedAt: null,
     claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null,
   };
-  await prisma.$transaction(async (tx) => {
+  const failureSideEffect = await prisma.$transaction(async (tx) => {
     try {
       await assertExecutionAccessFence({
         db: tx, userId, agencyId: job.agencyId, memberId: job.leaseMemberId,
@@ -1386,8 +1456,16 @@ async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, wor
         where: { jobId: job.id, deviceId, leaseRevision },
       });
     }
-    await recordJobFailure({ db: tx, job, error: errorText, terminal, retryAfterAt: terminal ? null : data.nextRunAt });
+    return recordJobFailure({ db: tx, job, error: errorText, terminal, retryAfterAt: terminal ? null : data.nextRunAt });
   }, JOB_COMPLETION_TRANSACTION_OPTIONS);
+
+  // The bounded final subscriber page may be fully committed even when the
+  // worker reports failure (for example a lost final response). The transaction
+  // above records only a recovery marker; perform durable publication on the
+  // root client so its phases cannot collapse into the failJob transaction.
+  if (job.jobKey === "subscriber_directory_scan" && failureSideEffect?.publicationRecoveryPending === true) {
+    await recordJobFailure({ db: prisma, job, error: errorText, terminal, retryAfterAt: terminal ? null : data.nextRunAt });
+  }
   return { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", terminal, retryAt: terminal ? null : data.nextRunAt };
 }
 

@@ -632,11 +632,16 @@ function subscriberDirectoryObservationFromItem(item) {
     }
   }
 
-  const value = {
+  // Subscriber directory owns a value fact only when the provider actually
+  // returned a positive AVAILABLE total. NOT_FETCHED / UNAVAILABLE / MALFORMED
+  // mean that this producer has no canonical value observation and therefore
+  // must not overwrite availability or satisfy Campaign freshness debt.
+  const subscriberValueAvailable = item?.valueAvailability === VALUE_AVAILABILITY.AVAILABLE && item?.totalSpentCents != null;
+  const value = subscriberValueAvailable ? {
     source: "SUBSCRIBER_DIRECTORY",
     observedAt,
-    availability: item?.valueAvailability,
-  };
+    availability: VALUE_AVAILABILITY.AVAILABLE,
+  } : null;
   const valueMap = {
     totalSpentCents: "totalSpentCents",
     messagesSpentCents: "messagesSpentCents",
@@ -645,10 +650,11 @@ function subscriberDirectoryObservationFromItem(item) {
     postsSpentCents: "postsSpentCents",
     streamsSpentCents: "streamsSpentCents",
   };
-  for (const [field, itemField] of Object.entries(valueMap)) {
-    if (valueFields.has(field) || (!valueFields.size && item?.[itemField] !== null && item?.[itemField] !== undefined)) value[field] = item[itemField];
+  if (value) {
+    for (const [field, itemField] of Object.entries(valueMap)) {
+      if (valueFields.has(field) || (!valueFields.size && item?.[itemField] !== null && item?.[itemField] !== undefined)) value[field] = item[itemField];
+    }
   }
-  if (value.availability === VALUE_AVAILABILITY.AVAILABLE && value.totalSpentCents == null) value.availability = VALUE_AVAILABILITY.MALFORMED;
 
   return { onlyFansUserId: onlyFansUserIdValue, identity, relationship, value };
 }
@@ -656,6 +662,7 @@ function subscriberDirectoryObservationFromItem(item) {
 async function projectSubscriberDirectoryItems(db, { items = [], agencyId, creatorId, runId, sourceJobId = null, campaignLockHeld = false } = {}) {
   const observations = (Array.isArray(items) ? items : []).map(subscriberDirectoryObservationFromItem).filter(Boolean);
   if (!observations.length) return { ok: true, projected: 0, identityProjected: 0, relationshipProjected: 0, valueProjected: 0, touchedFanIds: [] };
+  const authorityReceivedAt = await dbAuthorityNow({ db, fallbackNow: new Date() });
   return commitFanFacts(db, {
     agencyId,
     creatorId,
@@ -664,7 +671,7 @@ async function projectSubscriberDirectoryItems(db, { items = [], agencyId, creat
     items: observations,
     allowedSources: ["SUBSCRIBER_DIRECTORY"],
     observedAtPolicy: "TRUSTED_INPUT",
-    receivedAt: new Date(),
+    receivedAt: authorityReceivedAt,
     campaignLockHeld,
   });
 }
@@ -1585,7 +1592,6 @@ module.exports = {
   projectFanIdentity,
   projectFanIdentityBatch,
   projectFanRelationship,
-  projectFanValue,
   projectSubscriberDirectoryRun,
   projectSubscriberDirectoryItems,
   commitFanFacts,
@@ -1595,4 +1601,5 @@ module.exports = {
   readFanCurrent,
   parseAuthorityVersion,
   relationshipFieldAuthority,
+  _test: Object.freeze({ projectFanValue }),
 };

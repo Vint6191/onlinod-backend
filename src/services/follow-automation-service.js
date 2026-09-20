@@ -22,6 +22,7 @@ const {
   refollowFollowKey,
 } = require("./follow-automation-rules");
 const { readFanCurrent, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { assertSubscriberPublicationIdle, validateSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
 const {
   readFanCurrentMap,
   evaluateRefollowCurrent,
@@ -48,6 +49,63 @@ async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
       device: { lastSeenAt: { gte: freshAfter } },
     },
   });
+}
+
+
+async function projectFollowAutomationProjectionChunk({ db = prisma, agencyId, creatorId, runId, itemIds = [], now = new Date() }) {
+  const ids = [...new Set((Array.isArray(itemIds) ? itemIds : []).map((value) => clean(value, 180)).filter(Boolean))].slice(0, 500);
+  if (!ids.length) return { ok: true, count: 0, runId };
+  const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
+  const settings = normalizeFollowAutomationSettings(control.modules.follow.settings);
+  await db.$executeRawUnsafe(
+    `
+    INSERT INTO "FollowAutomationCandidate" (
+      "id", "agencyId", "creatorId", "fanId", "dialogId", "username", "displayName", "avatarUrl",
+      "subscriptionType", "isActive", "subscribedByCreator", "subscribedOn", "subscribePriceCents",
+      "ofBlocked", "restricted", "performer", "discoveredAt", "lastSeenAt", "eligibilityReason",
+      "ignored", "blocked", "state", "phase", "generation", "nudgeCount", "cooldownUntil",
+      "waitReturnUntil", "snapshotRunId", "metadata", "createdAt", "updatedAt"
+    )
+    SELECT
+      'follow_auto_' || md5(i."creatorId" || ':' || i."fanId"), i."agencyId", i."creatorId", i."fanId",
+      i."dialogId", f."username", f."displayName", f."avatarUrl", r."fanSubscriptionType", r."fanSubscriptionActive", r."creatorFollowsFan", r."fanSubscribesToCreator",
+      COALESCE(r."subscribePriceCents", 0), COALESCE(r."blocked", false), COALESCE(r."restricted", false), COALESCE(r."performer", false),
+      $2, r."lastSeenAt",
+      CASE WHEN r."fanSubscriptionActive" = false AND r."creatorFollowsFan" = true THEN 'fan_expired_creator_following' WHEN r."fanSubscriptionActive" = true THEN 'fan_active' WHEN r."creatorFollowsFan" = false THEN 'creator_not_following' ELSE 'subscription_state_unknown' END,
+      false, false,
+      CASE WHEN r."fanSubscriptionActive" = false AND r."creatorFollowsFan" = true THEN 'CANDIDATE' WHEN r."fanSubscriptionActive" = true THEN 'NOT_ELIGIBLE' WHEN r."creatorFollowsFan" = false THEN 'NOT_FOLLOWING' ELSE 'NOT_ELIGIBLE' END,
+      'IDLE', 0, 0, NULL, NULL, i."runId",
+      COALESCE(i."metadata", '{}'::jsonb) || jsonb_build_object(
+        'source', 'fan_relationship_current', 'snapshotRunId', i."runId", 'fanSubscribesToCreator', r."fanSubscribesToCreator",
+        'creatorFollowsFan', r."creatorFollowsFan", 'fanSubscriptionActive', r."fanSubscriptionActive", 'relationshipObservedAt', r."observedAt"
+      ), $2, $2
+    FROM "SubscriberScanItem" i
+    JOIN "CreatorFan" f ON f."creatorId" = i."creatorId" AND f."onlyFansUserId" = i."fanId"
+    JOIN "CreatorFanRelationshipCurrent" r ON r."creatorId" = i."creatorId" AND r."onlyFansUserId" = i."fanId"
+    WHERE i."runId" = $1 AND i."id" = ANY($4::text[])
+    ON CONFLICT ("creatorId", "fanId") DO UPDATE SET
+      "dialogId" = EXCLUDED."dialogId", "username" = EXCLUDED."username", "displayName" = EXCLUDED."displayName", "avatarUrl" = EXCLUDED."avatarUrl",
+      "subscriptionType" = EXCLUDED."subscriptionType", "isActive" = EXCLUDED."isActive", "subscribedByCreator" = EXCLUDED."subscribedByCreator", "subscribedOn" = EXCLUDED."subscribedOn",
+      "subscribePriceCents" = EXCLUDED."subscribePriceCents", "ofBlocked" = EXCLUDED."ofBlocked", "restricted" = EXCLUDED."restricted", "performer" = EXCLUDED."performer", "lastSeenAt" = EXCLUDED."lastSeenAt",
+      "eligibilityReason" = CASE WHEN "FollowAutomationCandidate"."blocked" = true OR EXCLUDED."ofBlocked" = true THEN 'blocked' WHEN "FollowAutomationCandidate"."ignored" = true THEN 'ignored' WHEN "FollowAutomationCandidate"."phase" IN ('UNFOLLOW','FOLLOW','RECOVERY') THEN "FollowAutomationCandidate"."eligibilityReason" WHEN EXCLUDED."isActive" = true AND "FollowAutomationCandidate"."nudgeCount" > 0 THEN 'fan_returned' WHEN EXCLUDED."isActive" = true THEN 'fan_active' WHEN EXCLUDED."subscribedByCreator" = false THEN 'creator_not_following' WHEN "FollowAutomationCandidate"."cooldownUntil" > $2 THEN 'cooldown' WHEN "FollowAutomationCandidate"."nudgeCount" >= $3 THEN 'max_refollow_nudges_reached' WHEN EXCLUDED."isActive" = false AND EXCLUDED."subscribedByCreator" = true THEN 'fan_expired_creator_following' ELSE 'subscription_state_unknown' END,
+      "state" = CASE WHEN "FollowAutomationCandidate"."blocked" = true OR EXCLUDED."ofBlocked" = true THEN 'BLOCKED' WHEN "FollowAutomationCandidate"."ignored" = true THEN 'IGNORED' WHEN "FollowAutomationCandidate"."phase" IN ('UNFOLLOW','FOLLOW','RECOVERY') THEN "FollowAutomationCandidate"."state" WHEN EXCLUDED."isActive" = true AND "FollowAutomationCandidate"."nudgeCount" > 0 THEN 'RETURNED' WHEN EXCLUDED."isActive" = true THEN 'NOT_ELIGIBLE' WHEN EXCLUDED."subscribedByCreator" = false THEN 'NOT_FOLLOWING' WHEN "FollowAutomationCandidate"."cooldownUntil" > $2 THEN 'COOLDOWN' WHEN "FollowAutomationCandidate"."nudgeCount" >= $3 THEN 'MAXED' WHEN EXCLUDED."isActive" = false AND EXCLUDED."subscribedByCreator" = true THEN 'CANDIDATE' ELSE 'NOT_ELIGIBLE' END,
+      "phase" = CASE WHEN "FollowAutomationCandidate"."phase" IN ('UNFOLLOW','FOLLOW','RECOVERY') THEN "FollowAutomationCandidate"."phase" WHEN EXCLUDED."isActive" = true AND "FollowAutomationCandidate"."nudgeCount" > 0 THEN 'DONE' ELSE 'IDLE' END,
+      "waitReturnUntil" = CASE WHEN EXCLUDED."isActive" = true THEN NULL ELSE "FollowAutomationCandidate"."waitReturnUntil" END,
+      "snapshotRunId" = EXCLUDED."snapshotRunId", "metadata" = COALESCE("FollowAutomationCandidate"."metadata", '{}'::jsonb) || EXCLUDED."metadata", "updatedAt" = EXCLUDED."updatedAt"
+    `,
+    runId, now, settings.maxNudgesPerFan, ids,
+  );
+  return { ok: true, count: ids.length, runId };
+}
+
+async function staleFollowAutomationProjectionFans({ db = prisma, agencyId, creatorId, runId, fanIds = [], now = new Date() }) {
+  const ids = [...new Set((Array.isArray(fanIds) ? fanIds : []).map((value) => clean(value, 180)).filter(Boolean))].slice(0, 500);
+  if (!ids.length) return { ok: true, count: 0, runId };
+  const updated = await db.followAutomationCandidate.updateMany({
+    where: { agencyId, creatorId, fanId: { in: ids }, snapshotRunId: { not: runId }, phase: { notIn: ["UNFOLLOW", "FOLLOW", "RECOVERY"] } },
+    data: { state: "STALE", eligibilityReason: "stale_candidate", updatedAt: now },
+  });
+  return { ok: true, count: Number(updated?.count || 0), runId };
 }
 
 async function refreshFollowAutomationProjection({ db = prisma, agencyId, creatorId, runId }) {
@@ -166,6 +224,7 @@ async function refreshFollowAutomationProjection({ db = prisma, agencyId, creato
 
 async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fanId = null, source = "manual", priority = 65 }) {
   await requireCreator(agencyId, creatorId, db);
+  await assertSubscriberPublicationIdle({ db, agencyId, creatorId });
   const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: FOLLOW_AUTOMATION_MODULE_KEY, db });
   const settings = normalizeFollowAutomationSettings(control.modules.follow.settings);
   if (!settings.refollowEnabled) return { ok: true, creatorId, source, summary: { scanned: 0, created: 0, existing: 0, skipped: { refollow_disabled: 1 } } };
@@ -352,6 +411,8 @@ async function ensureAutomaticFollowAutomation({ agencyId, creatorId, source = "
 
 async function validateFollowAutomationDelivery({ delivery, control, now = new Date(), db = prisma }) {
   if (!delivery || delivery.moduleKey !== FOLLOW_AUTOMATION_MODULE_KEY) return { ok: true };
+  const publicationFence = await validateSubscriberPublicationIdle({ db, agencyId: delivery.agencyId, creatorId: delivery.creatorId, now });
+  if (publicationFence.ok === false) return publicationFence;
   const candidate = await db.followAutomationCandidate.findFirst({
     where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId: delivery.targetId || delivery.fanId },
   });
@@ -637,6 +698,8 @@ module.exports = {
   UNFOLLOW_FAN_ACTION_TYPE,
   FOLLOW_FAN_ACTION_TYPE,
   refreshFollowAutomationProjection,
+  projectFollowAutomationProjectionChunk,
+  staleFollowAutomationProjectionFans,
   planFollowAutomation,
   scheduleRefollowCurrentRefresh,
   ensureAutomaticFollowAutomation,

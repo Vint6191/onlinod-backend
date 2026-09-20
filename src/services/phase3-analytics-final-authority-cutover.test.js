@@ -28,7 +28,7 @@ test("final cut has one canonical CreatorFanValueCurrent SQL writer and Subscrib
 test("final cut canonical Subscriber page projection is bounded and publication is separated from the Campaign-lock transaction", () => {
   const subscriber = source("src/services/subscriber-directory-service.js");
   assert.match(subscriber, /MAX_PAGE_ITEMS\s*=\s*100/);
-  assert.match(subscriber, /itemsInput[\s\S]*slice\(0, MAX_PAGE_ITEMS\)/);
+  assert.match(subscriber, /SUBSCRIBER_SCAN_PAGE_TOO_LARGE/);
   assert.match(subscriber, /projectSubscriberDirectoryItems[\s\S]*fanProjectionCount:\s*\{ increment: items\.length \}/);
   const chunk = subscriber.slice(subscriber.indexOf("async function applySubscriberScanChunk"), subscriber.indexOf("async function applySubscriberScanCompletion"));
   assert.doesNotMatch(chunk, /publishRun\(db, updatedRun/);
@@ -61,13 +61,15 @@ test("final cut durable promotion claim never holds signal row while waiting for
   assert.match(maintenance, /root\.\$transaction[\s\S]*acquireCampaignTransactionLock\(tx, creatorId\)[\s\S]*campaignFanRefreshPromotionSignal\.findFirst/);
 });
 
-test("Billing and legacy Analytics have no active snapshot generation reader/writer", () => {
+test("Billing and legacy Analytics have no active snapshot generation reader/writer while Phase A preserves old writable tables", () => {
   const billing = source("src/services/billing-wallet-service.js");
   const settings = source("src/services/settings-service.js");
   const analyticsRoute = source("src/routes/analytics.js");
   const analyticsService = source("src/services/analytics-snapshot-service.js");
   const schema = source("prisma/schema.prisma");
   const migration = source("prisma/migrations/20260920123000_phase3_analytics_final_authority_cutover_v1/migration.sql");
+  const policy = source("docs/PHASE3_ANALYTICS_LEGACY_SNAPSHOT_RETIREMENT.md");
+  const legacyPreflight = source("scripts/database/phase3-analytics-legacy-snapshot-online-preflight.js");
   assert.doesNotMatch(billing, /creatorEarningsSnapshot\./);
   assert.match(billing, /source:\s*"UNAVAILABLE"/);
   assert.match(settings, /readRolling30dRevenueBatch/);
@@ -75,13 +77,89 @@ test("Billing and legacy Analytics have no active snapshot generation reader/wri
   assert.doesNotMatch(analyticsRoute, /analytics-snapshot-service|reportAnalyticsSnapshots|getLatestPayload/);
   assert.doesNotMatch(analyticsService, /prisma|analyticsSnapshot\./);
   assert.doesNotMatch(schema, /model\s+(?:CreatorEarningsSnapshot|CreatorCampaignsSnapshot|AnalyticsSnapshot)\b/);
-  assert.match(migration, /DROP TABLE IF EXISTS "AnalyticsSnapshot" CASCADE/);
-  assert.match(migration, /DROP TABLE IF EXISTS "CreatorCampaignsSnapshot" CASCADE/);
-  assert.match(migration, /DROP TABLE IF EXISTS "CreatorEarningsSnapshot" CASCADE/);
-  assert.match(migration, /CREATE VIEW "CreatorEarningsSnapshot" AS[\s\S]*WHERE FALSE/);
-  assert.match(migration, /CREATE VIEW "CreatorCampaignsSnapshot" AS[\s\S]*WHERE FALSE/);
-  assert.match(migration, /CREATE VIEW "AnalyticsSnapshot" AS[\s\S]*WHERE FALSE/);
-  assert.match(migration, /rolling-deploy tombstone; zero rows/);
+  assert.doesNotMatch(migration, /DROP TABLE IF EXISTS "(?:AnalyticsSnapshot|CreatorCampaignsSnapshot|CreatorEarningsSnapshot)"/);
+  assert.doesNotMatch(migration, /CREATE VIEW "(?:AnalyticsSnapshot|CreatorCampaignsSnapshot|CreatorEarningsSnapshot)"/);
+  assert.match(migration, /Phase A only[\s\S]*physical legacy tables are preserved/);
+  assert.match(policy, /Phase B: destructive purge[\s\S]*previous backend revision is fully drained[\s\S]*backup/);
+  assert.match(legacyPreflight, /relkind[\s\S]*physicalTable[\s\S]*destructivePurgeAllowed:\s*false/);
+});
+
+test("Subscriber source state machine is exact-offset, payload-bound, CAS fenced and server-derived", () => {
+  const subscriber = source("src/services/subscriber-directory-service.js");
+  const chunk = subscriber.slice(subscriber.indexOf("async function applySubscriberScanChunk"), subscriber.indexOf("async function applySubscriberScanCompletion"));
+  assert.match(chunk, /SELECT \* FROM "SubscriberScanRun" WHERE "id" = \$1 FOR UPDATE/);
+  assert.match(chunk, /SUBSCRIBER_SCAN_OFFSET_INVALID/);
+  assert.match(chunk, /offset !== expectedOffset[\s\S]*SUBSCRIBER_SCAN_REWIND[\s\S]*SUBSCRIBER_SCAN_GAP/);
+  assert.match(chunk, /serverDerivedNextOffset = offset \+ itemsInput\.length/);
+  assert.match(chunk, /SUBSCRIBER_SCAN_NEXT_OFFSET_MISMATCH/);
+  assert.match(chunk, /providerPayloadHash = hashJson\(itemsInput\)/);
+  assert.match(chunk, /SUBSCRIBER_SCAN_REPLAY_CONFLICT/);
+  assert.match(chunk, /SUBSCRIBER_SCAN_STALLED_CURSOR/);
+  assert.match(chunk, /SUBSCRIBER_SCAN_DUPLICATE_FAN_ACROSS_PAGES/);
+  assert.match(chunk, /updateMany\([\s\S]*nextOffset: offset[\s\S]*SUBSCRIBER_SCAN_CURSOR_CONFLICT/);
+  assert.doesNotMatch(chunk, /\.slice\(0,\s*100\)/);
+});
+
+test("Subscriber non-value outcomes cannot mutate canonical FanValue or satisfy Campaign demand", () => {
+  const authority = source("src/services/fan-data-authority-service.js");
+  const observer = authority.slice(authority.indexOf("function subscriberDirectoryObservationFromItem"), authority.indexOf("async function projectSubscriberDirectoryItems"));
+  const commit = authority.slice(authority.indexOf("async function commitFanFacts"), authority.indexOf("async function projectFanObservationBatch"));
+  assert.match(observer, /valueAvailability === VALUE_AVAILABILITY\.AVAILABLE && item\?\.totalSpentCents != null/);
+  assert.match(observer, /const value = subscriberValueAvailable \?[\s\S]*:\s*null/);
+  assert.match(commit, /const valueFanIds = rows\.filter\(\(row\) => row\.value\)/);
+  assert.match(authority, /projectSubscriberDirectoryItems[\s\S]*dbAuthorityNow/);
+});
+
+test("scalar Campaign compatibility contract uses the same commitFanFacts writer and no public scalar value escape remains", () => {
+  const ledger = source("src/services/creator-analytics-ledger-service.js");
+  const authority = source("src/services/fan-data-authority-service.js");
+  const scalar = ledger.slice(ledger.indexOf("async function ingestCampaignFanValueChunk"), ledger.indexOf("async function ingestCampaignFanValuesBatchChunk"));
+  assert.match(scalar, /upsertCampaignFanValueTx/);
+  assert.match(ledger, /async function upsertCampaignFanValueTx[\s\S]*projectFanObservationBatch\(tx,/);
+  assert.doesNotMatch(ledger, /projectCampaignFanValueCurrent/);
+  assert.doesNotMatch(ledger, /projectFanValue\(/);
+  assert.match(authority, /async function projectFanObservationBatch[\s\S]*return commitFanFacts\(db, options\)/);
+  const exportsBlock = authority.slice(authority.lastIndexOf("module.exports ="));
+  assert.doesNotMatch(exportsBlock, /\n\s*projectFanValue,/, "scalar value projector must not be a top-level production export");
+  assert.match(exportsBlock, /_test:\s*Object\.freeze\(\{ projectFanValue \}\)/, "legacy scalar semantics stay reachable only through explicit test hooks");
+});
+
+test("Subscriber publication is restartable bounded work outside generic completion/failure transactions", () => {
+  const subscriber = source("src/services/subscriber-directory-service.js");
+  const leases = source("src/services/job-lease-service.js");
+  const scheduler = source("src/services/job-scheduler.js");
+  const schema = source("prisma/schema.prisma");
+  assert.match(subscriber, /PUBLICATION_BATCH_SIZE\s*=\s*500/);
+  assert.match(subscriber, /publicationStatus[\s\S]*PENDING[\s\S]*CURRENT[\s\S]*PREVIOUS[\s\S]*FINALIZE[\s\S]*COMPLETE/);
+  assert.match(subscriber, /publicationCursorId/);
+  assert.match(subscriber, /publicationTransaction\(db/);
+  assert.match(subscriber, /publicationTopology:\s*"durable_chunked_v1"/);
+  assert.match(schema, /publicationStatus\s+String\s+@default\("PENDING"\)/);
+  assert.match(schema, /publicationCursorId\s+String\?/);
+  const subscriberCompletion = leases.slice(leases.indexOf('if (job.jobKey === "subscriber_directory_scan")'), leases.indexOf('if (["fetch_earnings"'));
+  assert.match(subscriberCompletion, /JOB_CHUNK_TRANSACTION_OPTIONS/);
+  assert.match(subscriberCompletion, /applyJobResult\(\{ db: prisma/);
+  assert.doesNotMatch(subscriberCompletion, /applyJobResult\(\{ db: tx/);
+  const failStart = leases.indexOf("async function failJob");
+  const fail = leases.slice(failStart, leases.indexOf("async function releaseJob(", failStart));
+  assert.match(fail, /publicationRecoveryPending/);
+  assert.match(fail, /recordJobFailure\(\{ db: prisma/);
+  assert.match(subscriber, /async function recoverSubscriberPublicationDebt[\s\S]*publicationStatus:\s*\{ in:\s*\["PENDING", "CURRENT", "PREVIOUS", "FINALIZE"\]/);
+  assert.match(subscriber, /reconcileRecoveredSubscriberPublicationJob[\s\S]*status:\s*"DONE"/);
+  assert.match(subscriber, /publicationJobReconciledAt/);
+  assert.match(subscriber, /status:\s*\{ in:\s*\["PUBLISHED", "SUPERSEDED"\] \}[\s\S]*publicationStatus:\s*"COMPLETE"[\s\S]*publicationJobReconciledAt:\s*null/);
+  assert.match(subscriber, /planSubscriberDerivedAutomation[\s\S]*subscriber_snapshot_recovered/);
+  assert.match(scheduler, /subscriberPublicationRecovery[\s\S]*recoverSubscriberPublicationDebt/);
+});
+
+test("Campaign hot queries have predicate/order-specific indexes and claim SQL matches its expression index", () => {
+  const migration = source("prisma/migrations/20260920123000_phase3_analytics_final_authority_cutover_v1/migration.sql");
+  const queue = source("src/services/campaign-fan-refresh-queue-service.js");
+  assert.match(migration, /CreatorFanRefreshDemand_promoter_ready_idx[\s\S]*status" = 'QUEUED'[\s\S]*activeRefreshJobId" IS NULL/);
+  assert.match(migration, /CreatorFanRefreshDemand_recovery_order_idx[\s\S]*COALESCE\("nextRetryAt", "lastFailedAt", "updatedAt"\)[\s\S]*status" = 'FAILED'/);
+  assert.match(migration, /CreatorFanRefreshDemand_canonical_heal_idx[\s\S]*status" IN \('QUEUED', 'FAILED'\)/);
+  assert.match(migration, /CampaignFanRefreshPromotionSignal_claim_due_idx[\s\S]*COALESCE\("claimUntil", '-infinity'::timestamp\)/);
+  assert.match(queue, /COALESCE\(s\."claimUntil", '-infinity'::timestamp\) <= \$1[\s\S]*ORDER BY s\."dueAt" ASC, s\."creatorId" ASC/);
 });
 
 test("index lifecycle contract requires distinct sessions, explicit ReadCommitted owner and bounded worker connection", async () => {
@@ -111,6 +189,8 @@ test("final migration carries bounded subscriber cursor, durable signal lease an
   const schema = source("prisma/schema.prisma");
   const migration = source("prisma/migrations/20260920123000_phase3_analytics_final_authority_cutover_v1/migration.sql");
   assert.match(schema, /fanProjectionCursorOffset\s+Int/);
+  assert.match(schema, /publicationStatus\s+String\s+@default\("PENDING"\)/);
+  assert.match(schema, /publicationCursorId\s+String\?/);
   assert.match(schema, /pageOffset\s+Int\?/);
   assert.match(schema, /model CampaignFanRefreshPromotionSignal/);
   assert.match(schema, /@@unique\(\[agencyId, creatorId\], map: "CampaignFanRefreshPromotionSignal_agency_creator_key"\)/);
@@ -118,6 +198,9 @@ test("final migration carries bounded subscriber cursor, durable signal lease an
   assert.match(schema, /claimToken\s+String\?/);
   assert.match(schema, /claimUntil\s+DateTime\?/);
   assert.match(migration, /CampaignFanRefreshPromotionSignal_due_claim_creator_idx/);
+  assert.match(schema, /publicationJobReconciledAt\s+DateTime\?/);
+  assert.match(migration, /SubscriberScanRun_publication_job_reconcile_idx/);
+  assert.match(migration, /publicationJobReconciledAt/);
   assert.match(migration, /CUTOVER_BACKFILL/);
 });
 
@@ -125,7 +208,7 @@ test("final migration carries bounded subscriber cursor, durable signal lease an
 test("final physical proof pack is rewritten for the final authority cut and persists proof JSON", () => {
   const proof = source("scripts/audit/phase3-a20-postgres-proof.js");
   const finalPg = source("src/services/phase3-analytics-final-authority-cutover.integration.test.js");
-  assert.match(proof, /EXPECTED_PROOF_TEST_COUNT\s*=\s*34/);
+  assert.match(proof, /EXPECTED_PROOF_TEST_COUNT\s*=\s*38/);
   assert.match(proof, /phase3-analytics-final-authority-cutover\.integration\.test\.js/);
   assert.match(proof, /artifacts[\s\S]*audit[\s\S]*phase3-a20-postgres-proof\.json/);
   assert.match(proof, /physical proof JSON was not persisted/);
@@ -136,3 +219,84 @@ test("final physical proof pack is rewritten for the final authority cut and per
   assert.match(finalPg, /FINAL_TWO_REPLICA_PROMOTION_SIGNAL_PASS/);
   assert.match(finalPg, /FINAL_CUTOVER_CANONICAL_DEBT_HEAL_PASS/);
 });
+
+
+test("Campaign promotion claim chronology is PostgreSQL-owned and stale claimant cannot mutate a re-claimed signal", async () => {
+  const queuePath = require.resolve("./campaign-fan-refresh-queue-service", { paths: [__dirname] });
+  const dbTimePath = require.resolve("./db-time-authority-service", { paths: [__dirname] });
+  const lockPath = require.resolve("./campaign-transaction-lock-service", { paths: [__dirname] });
+  const previousQueue = require.cache[queuePath];
+  const previousTime = require.cache[dbTimePath];
+  const previousLock = require.cache[lockPath];
+  const authorityNow = new Date("2026-09-20T18:00:00.000Z");
+  require.cache[dbTimePath] = { id: dbTimePath, filename: dbTimePath, loaded: true, exports: { dbAuthorityNow: async () => authorityNow } };
+  require.cache[lockPath] = { id: lockPath, filename: lockPath, loaded: true, exports: { acquireCampaignTransactionLock: async () => null, withCampaignTransactionLock: async ({ work, db }) => work(db) } };
+  delete require.cache[queuePath];
+  try {
+    const queueService = require(queuePath);
+    let txCall = 0;
+    let destructiveMutationCalls = 0;
+    let safeReleaseCalls = 0;
+    const signal = {
+      id: "signal-1", agencyId: "agency-1", creatorId: "creator-1", dueAt: authorityNow,
+      revision: 1, attempts: 0, claimToken: "claim-old", claimUntil: new Date(authorityNow.getTime() + 120_000),
+    };
+    const claimTx = {
+      $queryRawUnsafe: async (sql, nowArg) => {
+        assert.equal(nowArg.getTime(), authorityNow.getTime(), "claim due/lease predicate must use DB authority time");
+        return [signal];
+      },
+    };
+    const processTx = {
+      campaignFanRefreshPromotionSignal: {
+        findFirst: async ({ where }) => {
+          assert.equal(where.claimToken, "claim-old");
+          assert.deepEqual(where.claimUntil, { gt: authorityNow });
+          assert.equal(where.revision, 1);
+          return null; // a newer producer revision or re-claim invalidated this claimant
+        },
+        updateMany: async ({ where, data }) => {
+          if (data && data.claimToken === null && data.claimUntil === null && Object.keys(data).length === 2) {
+            assert.equal(where.id, "signal-1");
+            assert.equal(where.claimToken, "claim-old");
+            safeReleaseCalls += 1;
+            return { count: 1 };
+          }
+          destructiveMutationCalls += 1;
+          return { count: 1 };
+        },
+        deleteMany: async () => { destructiveMutationCalls += 1; return { count: 1 }; },
+      },
+    };
+    const root = {
+      $queryRawUnsafe: async () => [],
+      $transaction: async (work) => {
+        txCall += 1;
+        return work(txCall === 1 ? claimTx : processTx);
+      },
+    };
+    const result = await queueService.runCampaignFanRefreshPromotionMaintenance({ db: root, now: new Date("2099-01-01T00:00:00.000Z"), maxCreators: 1, concurrency: 1 });
+    assert.equal(result.processedCreators, 0);
+    assert.equal(result.contended, 1);
+    assert.equal(safeReleaseCalls, 1, "stale claimant should release only its own old token");
+    assert.equal(destructiveMutationCalls, 0, "stale claimant must not reschedule/delete the newer signal");
+  } finally {
+    delete require.cache[queuePath];
+    if (previousQueue) require.cache[queuePath] = previousQueue;
+    else delete require.cache[queuePath];
+    if (previousTime) require.cache[dbTimePath] = previousTime;
+    else delete require.cache[dbTimePath];
+    if (previousLock) require.cache[lockPath] = previousLock;
+    else delete require.cache[lockPath];
+  }
+});
+
+test("Campaign promotion signal merge is atomic LEAST and every claimant final mutation is revision fenced", async () => {
+  const queue = fs.readFileSync(path.join(__dirname, "campaign-fan-refresh-queue-service.js"), "utf8");
+  assert.match(queue, /ON CONFLICT \("creatorId"\) DO UPDATE SET[\s\S]*"dueAt" = LEAST\("CampaignFanRefreshPromotionSignal"\."dueAt", EXCLUDED\."dueAt"\)[\s\S]*"revision" = "CampaignFanRefreshPromotionSignal"\."revision" \+ 1[\s\S]*RETURNING "dueAt", "revision"/);
+  assert.match(queue, /findFirst\(\{[\s\S]*claimToken: signal\.claimToken[\s\S]*revision: Number\(signal\.revision \|\| 0\)/);
+  assert.match(queue, /updateMany\(\{[\s\S]*where: \{ id: signal\.id, claimToken: signal\.claimToken, revision: Number\(signal\.revision \|\| 0\) \}/);
+  assert.match(queue, /deleteMany\(\{[\s\S]*where: \{ id: signal\.id, claimToken: signal\.claimToken, revision: Number\(signal\.revision \|\| 0\) \}/);
+  assert.match(queue, /SET "dueAt" = LEAST\("dueAt", \$3\), "claimToken" = NULL/);
+});
+

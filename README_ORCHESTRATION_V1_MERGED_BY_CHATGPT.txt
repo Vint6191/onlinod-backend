@@ -1,33 +1,11 @@
-# Onlinod backend — Admin v2 + Team v2 + Orchestration v1 merged
+# Orchestration v1 — historical note, current Phase 3 authority
 
-This archive is based on the previously merged Admin v2 + Team v2 backend and adds Orchestration v1.
+This root note used to list `CreatorEarningsSnapshot` and `CreatorCampaignsSnapshot` as orchestration schema authorities. That statement is retired.
 
-Included:
-- `src/routes/stats.js`
-- `src/routes/jobs.js`
-- `prisma/migrations/20260504000000_orchestration_v1/migration.sql`
-- schema models:
-  - `CreatorEarningsSnapshot`
-  - `CreatorCampaignsSnapshot`
-  - `JobInstance`
-- server mounts:
-  - `/api/stats`
-  - `/api/jobs`
+Current authority:
+- `JobInstance` remains part of orchestration.
+- Earnings, Campaigns, Home and Stats are backed by canonical relational ledgers / current collection state, not snapshot tables.
+- Legacy `CreatorEarningsSnapshot`, `CreatorCampaignsSnapshot`, and `AnalyticsSnapshot` physical tables are retained only for the Phase-A rolling-deploy compatibility window and are not current runtime authority.
+- `/api/analytics/snapshots/report` is retired.
 
-Compatibility fixes:
-- Mounted stats/jobs under existing `authRequired`.
-- Patched stats/jobs route user access to support our auth shape: `req.auth.userId`.
-- Kept Admin v2, Team v2, Auth Core, Devices heartbeat, Workspace context intact.
-- Electron orchestration patch source files are included under `_electron_orchestration_v1_patches/` for reference.
-
-Deploy:
-```bash
-npm install && npm run prisma:migrate
-npm start
-```
-
-After deploy:
-- `/api/stats/creators/:creatorId/earnings?range=7d`
-- `/api/stats/creators/:creatorId/refresh`
-- `/api/jobs/claim`
-- `/api/jobs/pending`
+For legacy-table removal rules see `docs/PHASE3_ANALYTICS_LEGACY_SNAPSHOT_RETIREMENT.md`.

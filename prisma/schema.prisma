@@ -4958,6 +4958,16 @@ model SubscriberScanRun {
   fanProjectionCount        Int      @default(0)
   fanProjectionCompletedAt  DateTime?
   fanProjectionLastError    String?  @db.VarChar(1000)
+  publicationStatus           String   @default("PENDING") // PENDING | CURRENT | PREVIOUS | FINALIZE | COMPLETE
+  publicationCursorId         String?  @db.VarChar(180)
+  publicationPreviousRunId    String?
+  publicationAddedCount       Int      @default(0)
+  publicationChangedCount     Int      @default(0)
+  publicationDisappearedCount Int      @default(0)
+  publicationStartedAt        DateTime?
+  publicationCompletedAt      DateTime?
+  publicationJobReconciledAt  DateTime?
+  publicationLastError        String?  @db.VarChar(1000)
   summary         Json     @default("{}")
   createdByUserId String?
   createdAt       DateTime @default(now())
@@ -4971,6 +4981,7 @@ model SubscriberScanRun {
   @@index([agencyId, creatorId, status])
   @@index([creatorId, createdAt])
   @@index([status, updatedAt])
+  @@index([status, publicationStatus, updatedAt])
 }
 
 model SubscriberScanPage {

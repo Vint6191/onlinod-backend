@@ -4,6 +4,7 @@ const { readFanCurrent } = require("./fan-data-authority-service");
 const { evaluateCandidate, subscriptionBucket } = require("./follow-back-rules");
 const { evaluateRefollowCandidate } = require("./follow-automation-rules");
 const { targetEligibility } = require("./sfs-rules");
+const { validateSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
 
 
 const FAN_CURRENT_FRESHNESS_CLASS = Object.freeze({
@@ -568,6 +569,8 @@ function evaluateSfsFollowCurrent(candidate, current, settings = {}, now = new D
 
 async function validateFollowBackDeliveryCurrent({ db, delivery, settings, now = new Date() }) {
   if (!delivery || delivery.moduleKey !== "follow_back" || delivery.actionType !== "FOLLOW_BACK") return { ok: true };
+  const publicationFence = await validateSubscriberPublicationIdle({ db, agencyId: delivery.agencyId, creatorId: delivery.creatorId, now });
+  if (publicationFence.ok === false) return publicationFence;
   const candidate = await db.followBackCandidate.findFirst({
     where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId: delivery.targetId || delivery.fanId },
   });

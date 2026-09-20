@@ -6,6 +6,7 @@ const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { projectFanObservationBatch, scheduleFanDataPointRefresh, FAN_DATA_OBSERVATION_BATCH_MAX } = require("./fan-data-authority-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { assertSubscriberPublicationIdle, validateSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { classifyProgrammaticCustomMediaProvenance } = require("./custom-content-delivery-service");
@@ -274,6 +275,9 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
             : normalizedSource === "subscription_event" ? settings.subscriptionEventsEnabled
               : true;
     if (!sourceEnabled) return { ok: true, source: normalizedSource, planned: 0, skipped: [{ code: "source_disabled" }] };
+    if (["hidden_online", "paid_subscriber", "free_subscriber"].includes(normalizedSource)) {
+      await assertSubscriberPublicationIdle({ db: tx, agencyId, creatorId });
+    }
 
     const take = Math.min(settings.candidateBatchSize, Math.max(1, Number(limit) || settings.candidateBatchSize));
     const templateSelection = await activeTemplates({
@@ -549,8 +553,13 @@ async function bumpStat({ agencyId, creatorId, templateId = "", field, at = new 
 
 async function validateBumpDelivery({ delivery, control = null, now = new Date(), db = prisma }) {
   if (!delivery || delivery.moduleKey !== BUMPS_MODULE_KEY) return { ok: true };
-  const snapshot = control || await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: BUMPS_MODULE_KEY, db });
   const payload = object(delivery.payload);
+  const derivedSource = sourceKey(payload.source);
+  if (delivery.actionType === SEND_ACTION && ["hidden_online", "paid_subscriber", "free_subscriber"].includes(derivedSource)) {
+    const publicationFence = await validateSubscriberPublicationIdle({ db, agencyId: delivery.agencyId, creatorId: delivery.creatorId, now });
+    if (publicationFence.ok === false) return publicationFence;
+  }
+  const snapshot = control || await assertAutomationEnabled({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, moduleKey: BUMPS_MODULE_KEY, db });
   const state = await db.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId: delivery.creatorId, fanId: delivery.fanId } } });
   let fanCurrentFence = null;
   if (delivery.actionType === SEND_ACTION) {

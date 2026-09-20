@@ -25,7 +25,7 @@ Added backend routes:
 
 - `DeviceCreatorBinding`
 - `TeamActivityEvent`
-- `AnalyticsSnapshot`
+- `AnalyticsSnapshot` — historical v1 schema only; retired as Phase 3 runtime authority.
 - `WorkspaceSetting`
 - `ModuleSetting`
 - `MessageTemplateGroup`
@@ -72,6 +72,10 @@ Then:
 await window.desktopAPI.backend.request('/api/home/summary?range=24h')
 await window.desktopAPI.backend.request('/api/team/analytics/overview?range=24h')
 ```
+
+## Phase 3 analytics authority update
+
+The original Backend Core v1 snapshot authority has been superseded. Current Home / Stats / Billing read canonical relational facts and collection state; `/api/analytics/snapshots/report` is retired. Legacy snapshot tables remain physical only through the rolling-deploy / rollback window and are removed only by the separate Phase-B retirement procedure in `docs/PHASE3_ANALYTICS_LEGACY_SNAPSHOT_RETIREMENT.md`.
 
 ## Important boundaries
 

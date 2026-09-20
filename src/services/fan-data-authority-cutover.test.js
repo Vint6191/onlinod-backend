@@ -4,13 +4,9 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
-const {
-  projectFanIdentity,
-  projectFanRelationship,
-  projectFanValue,
-  projectSubscriberDirectoryRun,
-  VALUE_AVAILABILITY,
-} = require("./fan-data-authority-service");
+const fanDataAuthority = require("./fan-data-authority-service");
+const { projectFanIdentity, projectFanRelationship, projectSubscriberDirectoryRun, VALUE_AVAILABILITY } = fanDataAuthority;
+const { projectFanValue } = fanDataAuthority._test;
 
 const ROOT = path.resolve(__dirname, "../..");
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");

@@ -16,6 +16,7 @@ const {
 const { listActionDeliveries, retryActionDelivery } = require("./automation-action-delivery-service");
 const { evaluateCandidate } = require("./follow-back-rules");
 const { readFanCurrent, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { assertSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
 const {
   readFanCurrentMap,
   evaluateFollowBackCurrent,
@@ -27,6 +28,61 @@ const ACTIVE_DELIVERY_STATUSES = [...ACTIVE_WRITE_WORKFLOW_STATUSES];
 function clean(value, max = 500) { const text = String(value ?? "").trim(); return text ? text.slice(0, max) : null; }
 function dayStart(date = new Date()) { const out = new Date(date); out.setHours(0, 0, 0, 0); return out; }
 function monthStart(date = new Date()) { return new Date(date.getFullYear(), date.getMonth(), 1); }
+
+async function projectFollowBackProjectionChunk({ db = prisma, agencyId, creatorId, runId, itemIds = [], now = new Date() }) {
+  const ids = [...new Set((Array.isArray(itemIds) ? itemIds : []).map((value) => clean(value, 180)).filter(Boolean))].slice(0, 500);
+  if (!ids.length) return { ok: true, count: 0, runId };
+  const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
+  const settings = normalizeFollowBackSettings(control.modules.follow_back.settings);
+  await db.$executeRawUnsafe(
+    `
+    INSERT INTO "FollowBackCandidate" (
+      "id", "agencyId", "creatorId", "fanId", "dialogId", "username", "displayName", "avatarUrl",
+      "subscriptionType", "isActive", "canReceiveChatMessage", "subscribedByCreator", "discoveredAt",
+      "lastSeenAt", "eligibilityReason", "ignored", "blocked", "state", "generation", "cooldownUntil", "snapshotRunId",
+      "metadata", "createdAt", "updatedAt"
+    )
+    SELECT
+      'follow_' || md5(i."creatorId" || ':' || i."fanId"), i."agencyId", i."creatorId", i."fanId", i."dialogId",
+      f."username", f."displayName", f."avatarUrl", r."fanSubscriptionType", r."fanSubscriptionActive", r."canReceiveChatMessage",
+      r."creatorFollowsFan", $2, r."lastSeenAt",
+      CASE WHEN r."creatorFollowsFan" = true THEN 'already_followed' WHEN r."fanSubscriptionActive" = false THEN 'expired_subscriber' ELSE 'active_subscriber' END,
+      false, false, CASE WHEN r."creatorFollowsFan" = true THEN 'FOLLOWED' ELSE 'CANDIDATE' END,
+      1, NULL, i."runId",
+      COALESCE(i."metadata", '{}'::jsonb) || jsonb_build_object(
+        'source', 'fan_relationship_current', 'snapshotRunId', i."runId", 'fanSubscribesToCreator', r."fanSubscribesToCreator", 'relationshipObservedAt', r."observedAt"
+      ), $2, $2
+    FROM "SubscriberScanItem" i
+    JOIN "CreatorFan" f ON f."creatorId" = i."creatorId" AND f."onlyFansUserId" = i."fanId"
+    JOIN "CreatorFanRelationshipCurrent" r ON r."creatorId" = i."creatorId" AND r."onlyFansUserId" = i."fanId"
+    WHERE i."runId" = $1 AND i."id" = ANY($4::text[])
+    ON CONFLICT ("creatorId", "fanId") DO UPDATE SET
+      "dialogId" = EXCLUDED."dialogId", "username" = EXCLUDED."username", "displayName" = EXCLUDED."displayName", "avatarUrl" = EXCLUDED."avatarUrl",
+      "subscriptionType" = EXCLUDED."subscriptionType", "isActive" = EXCLUDED."isActive", "canReceiveChatMessage" = EXCLUDED."canReceiveChatMessage",
+      "subscribedByCreator" = EXCLUDED."subscribedByCreator", "lastSeenAt" = EXCLUDED."lastSeenAt",
+      "eligibilityReason" = CASE WHEN "FollowBackCandidate"."blocked" = true THEN 'blocked' WHEN "FollowBackCandidate"."ignored" = true THEN 'ignored' WHEN EXCLUDED."subscribedByCreator" = true THEN 'already_followed' WHEN EXCLUDED."isActive" = false THEN 'expired_subscriber' ELSE 'active_subscriber' END,
+      "state" = CASE WHEN "FollowBackCandidate"."blocked" = true THEN 'BLOCKED' WHEN "FollowBackCandidate"."ignored" = true THEN 'IGNORED' WHEN EXCLUDED."subscribedByCreator" = true THEN 'FOLLOWED' ELSE 'CANDIDATE' END,
+      "generation" = CASE WHEN "FollowBackCandidate"."subscribedByCreator" = true AND EXCLUDED."subscribedByCreator" = false THEN "FollowBackCandidate"."generation" + 1 ELSE "FollowBackCandidate"."generation" END,
+      "cooldownUntil" = CASE WHEN "FollowBackCandidate"."subscribedByCreator" = true AND EXCLUDED."subscribedByCreator" = false THEN $2 + ($3 * INTERVAL '1 day') ELSE "FollowBackCandidate"."cooldownUntil" END,
+      "snapshotRunId" = EXCLUDED."snapshotRunId",
+      "metadata" = COALESCE("FollowBackCandidate"."metadata", '{}'::jsonb) || EXCLUDED."metadata",
+      "updatedAt" = EXCLUDED."updatedAt"
+    `,
+    runId, now, settings.refollowCooldownDays, ids,
+  );
+  return { ok: true, count: ids.length, runId };
+}
+
+async function staleFollowBackProjectionFans({ db = prisma, agencyId, creatorId, runId, fanIds = [], now = new Date() }) {
+  const ids = [...new Set((Array.isArray(fanIds) ? fanIds : []).map((value) => clean(value, 180)).filter(Boolean))].slice(0, 500);
+  if (!ids.length) return { ok: true, count: 0, runId };
+  const updated = await db.followBackCandidate.updateMany({
+    where: { agencyId, creatorId, fanId: { in: ids }, snapshotRunId: { not: runId } },
+    data: { state: "STALE", eligibilityReason: "stale_candidate", updatedAt: now },
+  });
+  return { ok: true, count: Number(updated?.count || 0), runId };
+}
+
 async function refreshFollowBackProjection({ db = prisma, agencyId, creatorId, runId }) {
   const run = await db.subscriberScanRun.findFirst({
     where: { id: runId, agencyId, creatorId, status: "PUBLISHED" },
@@ -136,6 +192,7 @@ async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
 
 async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = null, source = "manual", priority = 60 }) {
   await requireCreator(agencyId, creatorId, db);
+  await assertSubscriberPublicationIdle({ db, agencyId, creatorId });
   const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: FOLLOW_BACK_MODULE_KEY, db });
   const settings = normalizeFollowBackSettings(control.modules.follow_back.settings);
   const state = await db.subscriberDirectoryState.findFirst({ where: { agencyId, creatorId, status: "READY" } });
@@ -658,6 +715,8 @@ module.exports = {
   FOLLOW_BACK_ACTION_TYPE,
   evaluateCandidate,
   refreshFollowBackProjection,
+  projectFollowBackProjectionChunk,
+  staleFollowBackProjectionFans,
   planFollowBack,
   scheduleFollowBackCurrentRefresh,
   ensureAutomaticFollowBack,
