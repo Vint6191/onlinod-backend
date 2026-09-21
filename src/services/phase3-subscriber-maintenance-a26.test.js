@@ -99,3 +99,25 @@ test("A26 changed-JS gate makes syntax/no-undef a release requirement for the cu
   assert.match(gate, /subscriber-directory-maintenance-service\.js/);
   assert.equal(pkg.scripts["audit:phase3-a26-changed-js"], "node scripts/audit/phase3-a26-changed-js-gate.js");
 });
+
+test("A27 Render wrapper self-provisions and destroys a disposable database for one-command free-tier proof", () => {
+  const wrapper = source("scripts/audit/phase3-a26-render-disposable.js");
+  const pkg = JSON.parse(source("package.json"));
+
+  assert.match(wrapper, /CREATE DATABASE/);
+  assert.match(wrapper, /DROP DATABASE/);
+  assert.match(wrapper, /WITH \(FORCE\)/);
+  assert.match(wrapper, /ONLINOD_AUDIT_DATABASE_URL:\s*disposableUrl/);
+  assert.match(wrapper, /DATABASE_URL:\s*primaryUrl/);
+  assert.match(wrapper, /PHASE3_A26_DISPOSABLE_DATABASE_CREATE_UNSUPPORTED/);
+  assert.match(wrapper, /PHASE3_A26_DISPOSABLE_DATABASE_CLEANUP_FAIL/);
+  assert.match(wrapper, /stale-active-skip/);
+  assert.match(wrapper, /stale-dropped/);
+  assert.match(wrapper, /FROM pg_database/);
+  assert.match(wrapper, /PHASE3_A26_RENDER_DISPOSABLE_RESULT/);
+  assert.doesNotMatch(wrapper, /ONLINOD_AUDIT_ALLOW_PRIMARY_DATABASE:\s*["']1["']/);
+  assert.match(wrapper, /-pooler/);
+  assert.match(wrapper, /u\.searchParams\.delete\("schema"\)/);
+  assert.match(wrapper, /u\.searchParams\.delete\("options"\)/);
+  assert.equal(pkg.scripts["audit:phase3-a26-render"], "node scripts/audit/phase3-a26-render-disposable.js");
+});
