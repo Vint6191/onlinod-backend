@@ -51,7 +51,7 @@
       ],
     },
     "hidden-online": {
-      label: "Hidden Online", model: "hiddenOnlineUser",
+      label: "Hidden Online — Current", model: null,
       api: (q) => A().dataHiddenOnline(q),
       cols: [
         { k: "fanId", label: "Fan" },
@@ -62,7 +62,7 @@
       ],
     },
     "follow-back": {
-      label: "Follow Back", model: "followBackTask",
+      label: "Follow Back — Current", model: null,
       api: (q) => A().dataFollowBack(q),
       cols: [
         { k: "fanId", label: "Fan" },

@@ -21,7 +21,7 @@ const {
   refollowUnfollowKey,
   refollowFollowKey,
 } = require("./follow-automation-rules");
-const { readFanCurrent, scheduleFanDataPointRefresh, fanDataPointRefreshDecisionDurable } = require("./fan-data-authority-service");
+const { readFanCurrent, scheduleFanDataPointRefresh, scheduleDurableFanDataRefreshDebt } = require("./fan-data-authority-service");
 const { assertSubscriberPublicationIdle, validateSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
 const {
   readFanCurrentMap,
@@ -351,38 +351,10 @@ async function scheduleRefollowCurrentRefresh({
   refreshFields = [],
   scheduleFanRefresh = scheduleFanDataPointRefresh,
 } = {}) {
-  const refreshFanIds = [...new Set((fanIds || []).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
-  if (!refreshFanIds.length) return { fanIds: [], requested: 0, decision: null };
-  try {
-    const decision = await scheduleFanRefresh({
-      agencyId,
-      creatorId,
-      onlyFansUserIds: refreshFanIds,
-      reason: "refollow_current_unknown",
-      priority: Math.max(85, Number(priority) || 65),
-      params: {
-        consumer: "follow_automation",
-        trigger: clean(trigger, 80) || "planning",
-        ...(refreshFields.length ? { refreshFields: [...new Set(refreshFields.map((value) => clean(value, 80)).filter(Boolean))] } : {}),
-      },
-    });
-    const durable = fanDataPointRefreshDecisionDurable(decision);
-    return {
-      fanIds: refreshFanIds,
-      requested: refreshFanIds.length,
-      decision,
-      durable,
-      ...(durable ? {} : { error: `fan_refresh_not_durable:${String(decision?.reason || "unknown")}` }),
-    };
-  } catch (error) {
-    return {
-      fanIds: refreshFanIds,
-      requested: refreshFanIds.length,
-      decision: null,
-      durable: false,
-      error: clean(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
-    };
-  }
+  return scheduleDurableFanDataRefreshDebt({
+    agencyId, creatorId, fanIds, consumer: "follow_automation", reason: "refollow_current_unknown",
+    priority: Math.max(85, Number(priority) || 60), trigger, refreshFields, scheduleFanRefresh,
+  });
 }
 
 async function planFollowAutomation(input) {

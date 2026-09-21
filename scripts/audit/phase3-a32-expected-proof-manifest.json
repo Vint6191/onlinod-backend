@@ -1,8 +1,8 @@
 {
-  "version": "A32",
+  "version": "A33",
   "algorithm": "sha256-canonical-json-files-v1",
-  "testCount": 49,
-  "manifestSha256": "a052216b0208cf931d357e49ff588840f8d29f945dc94cb403b086a5a5bda450",
+  "testCount": 51,
+  "manifestSha256": "8c3d5ffb0f2cf2805c2d5d5a53b24ef3084fe6506ec8f665b2a8c7df8e638d01",
   "files": [
     {
       "file": "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js",
@@ -103,7 +103,9 @@
         "A32 PostgreSQL: full fenced derived planning lane converges 500 refresh candidates across Follow Back, Follow Automation and Bumps",
         "A32 PostgreSQL: transient derived refresh scheduler failure preserves publication debt and retry converges without duplicate intents",
         "A21 PostgreSQL: large cross-run Subscriber history uses the exact runId+id publication cursor index for CURRENT and PREVIOUS",
-        "A21 PostgreSQL: two Subscriber recovery replicas serialize one FAILED publication generation and converge monotonically"
+        "A21 PostgreSQL: two Subscriber recovery replicas serialize one FAILED publication generation and converge monotonically",
+        "A33 PostgreSQL: 500-candidate Likes/SFS refresh debt is durable, consumer-specific, race-safe and terminal-failure visible",
+        "A33 PostgreSQL: terminal refresh debt retries after restart in the next bucket and converges without duplicates"
       ]
     },
     {

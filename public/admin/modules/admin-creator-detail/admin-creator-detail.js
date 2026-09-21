@@ -176,11 +176,11 @@
         cols: [{ k: "fanId", label: "Fan" }, { k: "status", label: "Status" }, { k: "messageId", label: "MsgId" }, { k: "priceCents", label: "Price", fmt: fmtMoney }, { k: "sentAt", label: "Sent", fmt: fmtDate }],
       };
       case "hidden": return {
-        model: "hiddenOnlineUser", api: () => A().dataHiddenOnline({ creatorId: cid, limit: 300 }),
+        model: null, api: () => A().dataHiddenOnline({ creatorId: cid, limit: 300 }),
         cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "status", label: "Status" }, { k: "totalSpentCents", label: "Spent", fmt: fmtMoney }, { k: "lastSignalAt", label: "Last signal", fmt: fmtDate }],
       };
       case "followback": return {
-        model: "followBackTask", api: () => A().dataFollowBack({ creatorId: cid, limit: 300 }),
+        model: null, api: () => A().dataFollowBack({ creatorId: cid, limit: 300 }),
         cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "action", label: "Action" }, { k: "status", label: "Status" }, { k: "updatedAt", label: "Updated", fmt: fmtDate }],
       };
       case "vault": return {

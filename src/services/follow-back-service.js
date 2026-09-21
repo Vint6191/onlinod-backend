@@ -15,7 +15,7 @@ const {
 } = require("./automation-control-service");
 const { listActionDeliveries, retryActionDelivery } = require("./automation-action-delivery-service");
 const { evaluateCandidate } = require("./follow-back-rules");
-const { readFanCurrent, scheduleFanDataPointRefresh, fanDataPointRefreshDecisionDurable } = require("./fan-data-authority-service");
+const { readFanCurrent, scheduleFanDataPointRefresh, scheduleDurableFanDataRefreshDebt } = require("./fan-data-authority-service");
 const { assertSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
 const {
   readFanCurrentMap,
@@ -375,38 +375,10 @@ async function scheduleFollowBackCurrentRefresh({
   refreshFields = [],
   scheduleFanRefresh = scheduleFanDataPointRefresh,
 } = {}) {
-  const refreshFanIds = [...new Set((fanIds || []).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
-  if (!refreshFanIds.length) return { fanIds: [], requested: 0, decision: null };
-  try {
-    const decision = await scheduleFanRefresh({
-      agencyId,
-      creatorId,
-      onlyFansUserIds: refreshFanIds,
-      reason: "follow_back_current_unknown",
-      priority: Math.max(85, Number(priority) || 60),
-      params: {
-        consumer: "follow_back",
-        trigger: clean(trigger, 80) || "planning",
-        ...(refreshFields.length ? { refreshFields: [...new Set(refreshFields.map((value) => clean(value, 80)).filter(Boolean))] } : {}),
-      },
-    });
-    const durable = fanDataPointRefreshDecisionDurable(decision);
-    return {
-      fanIds: refreshFanIds,
-      requested: refreshFanIds.length,
-      decision,
-      durable,
-      ...(durable ? {} : { error: `fan_refresh_not_durable:${String(decision?.reason || "unknown")}` }),
-    };
-  } catch (error) {
-    return {
-      fanIds: refreshFanIds,
-      requested: refreshFanIds.length,
-      decision: null,
-      durable: false,
-      error: clean(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
-    };
-  }
+  return scheduleDurableFanDataRefreshDebt({
+    agencyId, creatorId, fanIds, consumer: "follow_back", reason: "follow_back_current_unknown",
+    priority: Math.max(85, Number(priority) || 60), trigger, refreshFields, scheduleFanRefresh,
+  });
 }
 
 async function planFollowBack(input) {

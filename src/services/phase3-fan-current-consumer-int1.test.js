@@ -249,7 +249,7 @@ test("Phase3 Likes planning collects only refresh-required current failures befo
   const source = fs.readFileSync(path.join(__dirname, "likes-service.js"), "utf8");
   assert.match(source, /eligibility\.refreshRequired === true[\s\S]*refreshFanIds\.add/);
   assert.match(source, /planLikes\(input\)[\s\S]*withCreatorLock[\s\S]*scheduleLikesCurrentRefresh/);
-  assert.match(source, /scheduleLikesCurrentRefresh[\s\S]*slice\(0, 500\)[\s\S]*scheduleFanRefresh/);
+  assert.match(source, /scheduleLikesCurrentRefresh[\s\S]*scheduleDurableFanDataRefreshDebt[\s\S]*scheduleFanRefresh/);
   assert.doesNotMatch(source, /for \(const candidate of available\)[\s\S]{0,900}scheduleFanDataPointRefresh/);
 });
 
@@ -316,7 +316,7 @@ test("Phase3 commit-time refresh scheduling occurs outside prepare-write transac
 test("Phase3 Follow Back planning collects refresh-required fans and schedules one bounded batch after advisory lock", () => {
   const source = fs.readFileSync(path.join(__dirname, "follow-back-service.js"), "utf8");
   assert.match(source, /eligibility\.refreshRequired === true[\s\S]*refreshFanIds\.add/);
-  assert.match(source, /scheduleFollowBackCurrentRefresh[\s\S]*slice\(0, 500\)[\s\S]*scheduleFanRefresh/);
+  assert.match(source, /scheduleFollowBackCurrentRefresh[\s\S]*scheduleDurableFanDataRefreshDebt[\s\S]*scheduleFanRefresh/);
   assert.match(source, /planFollowBack\(input\)[\s\S]*withDbAdvisoryXactLock[\s\S]*scheduleFollowBackCurrentRefresh/);
 });
 

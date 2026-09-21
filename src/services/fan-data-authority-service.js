@@ -1501,6 +1501,54 @@ function fanDataPointRefreshDecisionDurable(decision) {
   return ["already_in_flight", "recently_done", "idempotency_race"].includes(String(reason || "")) && Boolean(durableJobId);
 }
 
+async function scheduleDurableFanDataRefreshDebt({
+  agencyId,
+  creatorId,
+  fanIds = [],
+  consumer,
+  reason = "fan_data_current_unknown",
+  priority = 95,
+  trigger = "planning",
+  refreshFields = [],
+  params = {},
+  scheduleFanRefresh = scheduleFanDataPointRefresh,
+} = {}) {
+  const ids = [...new Set((fanIds || []).map(onlyFansUserId).filter(Boolean))].sort().slice(0, FAN_DATA_POINT_REFRESH_MAX_FANS);
+  if (!ids.length) return { fanIds: [], requested: 0, durable: true, decision: null };
+  const fields = [...new Set((refreshFields || []).map((value) => text(value, 120)).filter(Boolean))].sort();
+  try {
+    const decision = await scheduleFanRefresh({
+      agencyId,
+      creatorId,
+      onlyFansUserIds: ids,
+      reason: text(reason, 120) || "fan_data_current_unknown",
+      priority: Number(priority) || 95,
+      params: {
+        ...(params && typeof params === "object" ? params : {}),
+        consumer: text(consumer, 120),
+        trigger: text(trigger, 80) || "planning",
+        ...(fields.length ? { refreshFields: fields } : {}),
+      },
+    });
+    const durable = fanDataPointRefreshDecisionDurable(decision);
+    return {
+      fanIds: ids,
+      requested: ids.length,
+      durable,
+      decision,
+      ...(durable ? {} : { error: `fan_refresh_not_durable:${String(decision?.reason || "unknown")}` }),
+    };
+  } catch (error) {
+    return {
+      fanIds: ids,
+      requested: ids.length,
+      durable: false,
+      decision: null,
+      error: text(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
+    };
+  }
+}
+
 async function scheduleFanDataPointRefresh({ db = null, agencyId, creatorId, onlyFansUserIds = [], reason = "fan_data_point_refresh", priority = 95, now = new Date(), params = {} } = {}) {
   if (!text(agencyId, 180) || !text(creatorId, 180)) return { created: false, reason: "missing_scope" };
   const ids = [...new Set((onlyFansUserIds || []).map(onlyFansUserId).filter(Boolean))].sort();
@@ -1621,6 +1669,7 @@ module.exports = {
   applyFanDataPointRefreshChunk,
   scheduleFanDataPointRefresh,
   fanDataPointRefreshDecisionDurable,
+  scheduleDurableFanDataRefreshDebt,
   readFanCurrent,
   parseAuthorityVersion,
   relationshipFieldAuthority,

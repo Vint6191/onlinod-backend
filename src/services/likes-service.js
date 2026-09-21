@@ -8,7 +8,7 @@ const { ensurePlannedJob } = require("./job-planning-repository");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { readFanCurrentMap, evaluateLikesCurrent, likesRequiredFields, buildFanCurrentFieldFence } = require("./fan-current-consumer-service");
-const { scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { scheduleFanDataPointRefresh, scheduleDurableFanDataRefreshDebt } = require("./fan-data-authority-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const {
   getAutomationControlSnapshot,
@@ -482,34 +482,10 @@ async function scheduleLikesCurrentRefresh({
   refreshFields = [],
   scheduleFanRefresh = scheduleFanDataPointRefresh,
 } = {}) {
-  const refreshFanIds = [...new Set((fanIds || []).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
-  if (!refreshFanIds.length) return { fanIds: [], requested: 0, decision: null };
-
-  // One bounded job request per planning batch. The point-refresh authority then
-  // coalesces an identical opaque fan-id set, so repeated planning never becomes
-  // a provider /users call per candidate.
-  try {
-    const decision = await scheduleFanRefresh({
-      agencyId,
-      creatorId,
-      onlyFansUserIds: refreshFanIds,
-      reason: clean(reason, 120) || "likes_current_unknown",
-      priority: Math.max(85, Number(priority) || 60),
-      params: {
-        consumer: "likes",
-        trigger: clean(trigger, 80) || "planning",
-        ...(refreshFields.length ? { refreshFields: [...new Set(refreshFields.map((value) => clean(value, 80)).filter(Boolean))] } : {}),
-      },
-    });
-    return { fanIds: refreshFanIds, requested: refreshFanIds.length, decision };
-  } catch (error) {
-    return {
-      fanIds: refreshFanIds,
-      requested: refreshFanIds.length,
-      decision: null,
-      error: clean(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
-    };
-  }
+  return scheduleDurableFanDataRefreshDebt({
+    agencyId, creatorId, fanIds, consumer: "likes", reason,
+    priority: Math.max(85, Number(priority) || 60), trigger, refreshFields, scheduleFanRefresh,
+  });
 }
 
 async function planLikes(input) {
@@ -545,6 +521,9 @@ async function ensureAutomaticLikes({ agencyId, creatorId, source = "automatic",
   if (!settings.automatic) return { ok: true, created: false, reason: "automatic_disabled" };
   const discovery = await scheduleLikesDiscovery({ agencyId, creatorId, source, force: false, maxFans: settings.discoveryBatchSize * 2, priority: 25, db });
   const planning = await planLikes({ agencyId, creatorId, source, manual: false, priority: 40, db });
+  if (planning?.fanRefresh?.requested > 0 && planning.fanRefresh.durable !== true) {
+    return { ok: false, created: discovery.created || planning.created, reason: "fan_refresh_debt_not_durable", discovery, planning };
+  }
   return { ok: true, created: discovery.created || planning.created, discovery, planning };
 }
 

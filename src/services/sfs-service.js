@@ -7,7 +7,7 @@ const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
 const { runDbTransaction, withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
-const { projectFanObservationBatch, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { projectFanObservationBatch, scheduleFanDataPointRefresh, scheduleDurableFanDataRefreshDebt } = require("./fan-data-authority-service");
 const { consumeFanObservationToken } = require("./fan-observation-token-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const {
@@ -103,18 +103,13 @@ async function withCreatorLock(db, agencyId, creatorId, fn) {
   return withDbAdvisoryXactLock({ db, key: `p14:sfs:${agencyId}:${creatorId}`, work: fn, options: { timeout: 30_000 } });
 }
 
-async function scheduleSfsCurrentRefresh({ agencyId, creatorId, fanIds = [], refreshFields = [], reason = "sfs_current_refresh_required" }) {
-  const ids = [...new Set((fanIds || []).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
-  if (!ids.length) return { requested: false, fanIds: [] };
-  try {
-    const decision = await scheduleFanDataPointRefresh({
-      agencyId, creatorId, onlyFansUserIds: ids, reason, priority: 90,
-      params: { consumer: "sfs", trigger: "planning", refreshFields: [...new Set((refreshFields || []).map((value) => clean(value, 80)).filter(Boolean))] },
-    });
-    return { requested: true, fanIds: ids, decision };
-  } catch {
-    return { requested: false, fanIds: ids };
-  }
+async function scheduleSfsCurrentRefresh({
+  agencyId, creatorId, fanIds = [], refreshFields = [], reason = "sfs_current_refresh_required",
+  priority = 90, trigger = "planning", scheduleFanRefresh = scheduleFanDataPointRefresh,
+} = {}) {
+  return scheduleDurableFanDataRefreshDebt({
+    agencyId, creatorId, fanIds, consumer: "sfs", reason, priority, trigger, refreshFields, scheduleFanRefresh,
+  });
 }
 
 async function scheduleSfsDiscovery({ agencyId, creatorId, userId = null, force = false, source = "manual", priority = 75, db = prisma }) {
@@ -332,7 +327,7 @@ function pickTemplate(templates, lastTemplateId = null) {
   return rows[rows.length - 1] || null;
 }
 
-async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId = null, source = "manual", priority = 70, limit = 20, db = prisma }) {
+async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId = null, source = "manual", priority = 70, limit = 20, db = prisma, scheduleFanRefresh = scheduleFanDataPointRefresh }) {
   await requireCreator(agencyId, creatorId, db);
   const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: SFS_MODULE_KEY, db });
   const settings = normalizeSfsSettings(control.modules.sfs.settings);
@@ -416,7 +411,7 @@ async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId 
   if (!result?.refreshFanIds?.length) return { ...result, fanRefresh: { requested: false, fanIds: [] } };
   const fanRefresh = await scheduleSfsCurrentRefresh({
     agencyId, creatorId, fanIds: result.refreshFanIds, refreshFields: result.refreshFields,
-    reason: "sfs_planning_current_refresh_required",
+    reason: "sfs_planning_current_refresh_required", priority: Math.max(90, Number(priority) || 70), scheduleFanRefresh,
   });
   return { ...result, fanRefresh };
 }
@@ -938,7 +933,10 @@ async function ensureAutomaticSfs({ agencyId, creatorId, source = "scheduler", d
   if (!control.effective.sfsEnabled || !settings.automatic) return { ok: true, created: false, reason: "automatic_disabled" };
   const discovery = await scheduleSfsDiscovery({ agencyId, creatorId, source, db }).catch((error) => ({ ok: false, reason: error?.code || error?.message }));
   const planning = await planSfsTargets({ agencyId, creatorId, source, limit: settings.dailyLimit, db }).catch((error) => ({ ok: false, reason: error?.code || error?.message }));
-  return { ok: true, discovery, planning };
+  if (planning?.fanRefresh?.requested > 0 && planning.fanRefresh.durable !== true) {
+    return { ok: false, created: Boolean(discovery?.created || planning?.created), reason: "fan_refresh_debt_not_durable", discovery, planning };
+  }
+  return { ok: true, created: Boolean(discovery?.created || planning?.created), discovery, planning };
 }
 
 module.exports = {

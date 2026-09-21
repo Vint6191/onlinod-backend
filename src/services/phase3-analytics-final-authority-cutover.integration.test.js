@@ -9,6 +9,7 @@ let projectSubscriberDirectoryItems;
 let applyFanDataPointRefreshChunk;
 let readFanCurrent;
 let scheduleFanDataPointRefresh;
+let scheduleDurableFanDataRefreshDebt;
 let recordSubscriberScanFailure;
 let applySubscriberScanChunk;
 let scheduleSubscriberScan;
@@ -34,7 +35,7 @@ let runCampaignFanRefreshPromotionMaintenance;
 let signalCampaignFanRefreshPromotion;
 
 if (enabled) {
-  ({ projectSubscriberDirectoryItems, applyFanDataPointRefreshChunk, readFanCurrent, scheduleFanDataPointRefresh } = require("./fan-data-authority-service"));
+  ({ projectSubscriberDirectoryItems, applyFanDataPointRefreshChunk, readFanCurrent, scheduleFanDataPointRefresh, scheduleDurableFanDataRefreshDebt } = require("./fan-data-authority-service"));
   ({
     recordSubscriberScanFailure,
     applySubscriberScanChunk,
@@ -1481,3 +1482,134 @@ test("A21 PostgreSQL: two Subscriber recovery replicas serialize one FAILED publ
     await db2.$disconnect();
   }
 });
+
+
+test("A33 PostgreSQL: 500-candidate Likes/SFS refresh debt is durable, consumer-specific, race-safe and terminal-failure visible", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db1 = new PrismaClient();
+  const db2 = new PrismaClient();
+  const scope = await createAgencyCreator(db1, "a33-derived-refresh");
+  const now = await databaseNow(db1);
+  const fanIds = Array.from({ length: 500 }, (_, index) => `${scope.creatorId}-a33-fan-${String(index).padStart(4, "0")}`);
+  const scheduleWith = (db) => (input) => scheduleFanDataPointRefresh({ db, ...input, now });
+  try {
+    const [left, right] = await Promise.all([
+      scheduleDurableFanDataRefreshDebt({
+        agencyId: scope.agencyId, creatorId: scope.creatorId, fanIds, consumer: "likes", reason: "likes_current_unknown",
+        refreshFields: ["fanSubscriptionActive", "fanSubscriptionType"], scheduleFanRefresh: scheduleWith(db1),
+      }),
+      scheduleDurableFanDataRefreshDebt({
+        agencyId: scope.agencyId, creatorId: scope.creatorId, fanIds, consumer: "likes", reason: "likes_current_unknown",
+        refreshFields: ["fanSubscriptionType", "fanSubscriptionActive"], scheduleFanRefresh: scheduleWith(db2),
+      }),
+    ]);
+    assert.equal(left.durable, true);
+    assert.equal(right.durable, true);
+    assert.equal(left.requested, 500);
+    assert.equal(right.requested, 500);
+
+    const likesJobs = await db1.jobInstance.findMany({
+      where: { agencyId: scope.agencyId, creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" },
+      orderBy: { createdAt: "asc" },
+    });
+    assert.equal(likesJobs.length, 1, "replicas must converge on one exact Likes refresh intent");
+    assert.equal(likesJobs[0].params?.consumer, "likes");
+    assert.deepEqual(likesJobs[0].params?.refreshFields, ["fanSubscriptionActive", "fanSubscriptionType"]);
+
+    const sfs = await scheduleDurableFanDataRefreshDebt({
+      agencyId: scope.agencyId, creatorId: scope.creatorId, fanIds, consumer: "sfs", reason: "sfs_planning_current_refresh_required",
+      refreshFields: ["fanSubscriptionActive", "fanSubscriptionType"], scheduleFanRefresh: scheduleWith(db2),
+    });
+    assert.equal(sfs.durable, true);
+    assert.equal(sfs.requested, 500);
+    const allJobs = await db1.jobInstance.findMany({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" } });
+    assert.equal(allJobs.length, 2, "Likes and SFS must own distinct durable consumer identities");
+
+    await db1.jobInstance.update({ where: { id: likesJobs[0].id }, data: { status: "FAILED", lastError: "A33 terminal same-bucket proof" } });
+    const failedReplay = await scheduleDurableFanDataRefreshDebt({
+      agencyId: scope.agencyId, creatorId: scope.creatorId, fanIds, consumer: "likes", reason: "likes_current_unknown",
+      refreshFields: ["fanSubscriptionActive", "fanSubscriptionType"], scheduleFanRefresh: scheduleWith(db2),
+    });
+    assert.equal(failedReplay.requested, 500);
+    assert.equal(failedReplay.durable, false);
+    assert.match(String(failedReplay.error || ""), /same_bucket_failed/);
+    assert.equal(await db1.jobInstance.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" } }), 2);
+  } finally {
+    await cleanupAgency(db1, scope.agencyId);
+    await db1.$disconnect();
+    await db2.$disconnect();
+  }
+});
+
+test("A33 PostgreSQL: terminal refresh debt retries after restart in the next bucket and converges without duplicates", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db1 = new PrismaClient();
+  let dbRestarted = null;
+  const scope = await createAgencyCreator(db1, "a33-derived-refresh-restart");
+  const firstNow = await databaseNow(db1);
+  const retryNow = new Date(firstNow.getTime() + (2 * 60 * 1000) + 1_000);
+  const fanIds = Array.from({ length: 500 }, (_, index) => `${scope.creatorId}-a33-retry-fan-${String(index).padStart(4, "0")}`);
+  try {
+    const first = await scheduleDurableFanDataRefreshDebt({
+      agencyId: scope.agencyId, creatorId: scope.creatorId, fanIds, consumer: "likes", reason: "likes_current_unknown",
+      refreshFields: ["fanSubscriptionActive", "fanSubscriptionType"],
+      scheduleFanRefresh: (input) => scheduleFanDataPointRefresh({ db: db1, ...input, now: firstNow }),
+    });
+    assert.equal(first.durable, true);
+    assert.equal(first.requested, 500);
+    const firstJobId = first.decision?.jobId;
+    assert.ok(firstJobId);
+
+    await db1.jobInstance.update({
+      where: { id: firstJobId },
+      data: { status: "FAILED", lastError: "A33 transient scheduler/worker failure before restart" },
+    });
+
+    const sameBucket = await scheduleDurableFanDataRefreshDebt({
+      agencyId: scope.agencyId, creatorId: scope.creatorId, fanIds, consumer: "likes", reason: "likes_current_unknown",
+      refreshFields: ["fanSubscriptionType", "fanSubscriptionActive"],
+      scheduleFanRefresh: (input) => scheduleFanDataPointRefresh({ db: db1, ...input, now: firstNow }),
+    });
+    assert.equal(sameBucket.requested, 500);
+    assert.equal(sameBucket.durable, false);
+    assert.match(String(sameBucket.error || ""), /same_bucket_failed/);
+
+    // Simulate a Backend process restart by dropping the original Prisma client
+    // and retrying from a fresh client after the scheduler's two-minute bucket.
+    await db1.$disconnect();
+    dbRestarted = new PrismaClient();
+
+    const afterRestart = await scheduleDurableFanDataRefreshDebt({
+      agencyId: scope.agencyId, creatorId: scope.creatorId, fanIds: [...fanIds].reverse(), consumer: "likes", reason: "likes_current_unknown",
+      refreshFields: ["fanSubscriptionActive", "fanSubscriptionType"],
+      scheduleFanRefresh: (input) => scheduleFanDataPointRefresh({ db: dbRestarted, ...input, now: retryNow }),
+    });
+    assert.equal(afterRestart.durable, true);
+    assert.equal(afterRestart.requested, 500);
+    assert.ok(afterRestart.decision?.jobId);
+    assert.notEqual(afterRestart.decision.jobId, firstJobId, "next bucket retry must own a new durable job after terminal failure");
+
+    const replay = await scheduleDurableFanDataRefreshDebt({
+      agencyId: scope.agencyId, creatorId: scope.creatorId, fanIds, consumer: "likes", reason: "likes_current_unknown",
+      refreshFields: ["fanSubscriptionType", "fanSubscriptionActive"],
+      scheduleFanRefresh: (input) => scheduleFanDataPointRefresh({ db: dbRestarted, ...input, now: retryNow }),
+    });
+    assert.equal(replay.durable, true);
+    assert.equal(replay.decision?.jobId, afterRestart.decision.jobId);
+    assert.equal(replay.decision?.reason, "already_in_flight");
+
+    const jobs = await dbRestarted.jobInstance.findMany({
+      where: { agencyId: scope.agencyId, creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" },
+      orderBy: { createdAt: "asc" },
+    });
+    assert.equal(jobs.length, 2, "terminal old bucket plus one retry bucket is the complete durable history");
+    assert.equal(jobs.filter((job) => ["SCHEDULED", "CLAIMED"].includes(job.status)).length, 1, "restart/replay must converge on exactly one claimable retry intent");
+    assert.equal(jobs.filter((job) => job.status === "FAILED").length, 1);
+  } finally {
+    const cleanupDb = dbRestarted || db1;
+    await cleanupAgency(cleanupDb, scope.agencyId);
+    if (dbRestarted) await dbRestarted.$disconnect();
+    else await db1.$disconnect();
+  }
+});
+

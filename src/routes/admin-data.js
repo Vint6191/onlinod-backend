@@ -36,6 +36,8 @@ const express = require("express");
 const prisma = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
 const { adminHttpAuditMiddleware } = require("../middleware/admin-audit");
+const { listHiddenOnline } = require("../services/subscriber-directory-service");
+const { listFollowBack } = require("../services/follow-back-service");
 
 const router = express.Router();
 router.use(adminRequired);
@@ -50,6 +52,20 @@ function clamp(n, lo, hi, dflt) {
 function limitOf(q) { return clamp(q.limit, 1, 500, 100); }
 function offsetOf(q) { return Math.max(0, clamp(q.offset, 0, 10_000_000, 0)); }
 function str(v) { const s = String(v ?? "").trim(); return s || null; }
+
+async function resolveCreatorScope(creatorId, agencyId = null) {
+  const id = str(creatorId);
+  if (!id) {
+    const error = new Error("creatorId is required for canonical current views");
+    error.status = 400; error.code = "CREATOR_ID_REQUIRED"; throw error;
+  }
+  const creator = await prisma.creatorAccount.findUnique({ where: { id }, select: { id: true, agencyId: true } });
+  if (!creator || (agencyId && creator.agencyId !== agencyId)) {
+    const error = new Error("Creator not found in requested scope");
+    error.status = 404; error.code = "CREATOR_NOT_FOUND"; throw error;
+  }
+  return creator;
+}
 
 async function adminLog(req, data) {
   try { await prisma.adminActionLog.create({ data: { adminUserId: req.admin.id, ...data } }); }
@@ -197,33 +213,25 @@ router.get("/bump-stats", async (req, res) => {
 
 router.get("/hidden-online", async (req, res) => {
   try {
-    const where = {};
-    if (str(req.query.creatorId)) where.creatorId = str(req.query.creatorId);
-    if (str(req.query.agencyId)) where.agencyId = str(req.query.agencyId);
-    if (str(req.query.status)) where.status = str(req.query.status);
-    const q = str(req.query.q);
-    if (q) where.OR = [{ username: { contains: q, mode: "insensitive" } }, { name: { contains: q, mode: "insensitive" } }, { fanId: { contains: q } }];
-    const [items, total] = await Promise.all([
-      prisma.hiddenOnlineUser.findMany({ where, orderBy: { updatedAt: "desc" }, take: limitOf(req.query), skip: offsetOf(req.query) }),
-      prisma.hiddenOnlineUser.count({ where }),
-    ]);
-    return res.json({ ok: true, total, items });
+    const scope = await resolveCreatorScope(req.query.creatorId, str(req.query.agencyId));
+    const result = await listHiddenOnline({
+      agencyId: scope.agencyId, creatorId: scope.id, status: str(req.query.status) || "all", search: str(req.query.q) || "",
+      limit: limitOf(req.query), offset: offsetOf(req.query), sort: str(req.query.sort) || "recent",
+    });
+    return res.json({ ok: true, authority: "canonical_current", total: result.count || 0, items: result.items || [] });
   } catch (err) { return sendErr(res, err); }
 });
 
 router.get("/follow-back", async (req, res) => {
   try {
-    const where = {};
-    if (str(req.query.creatorId)) where.creatorId = str(req.query.creatorId);
-    if (str(req.query.agencyId)) where.agencyId = str(req.query.agencyId);
-    if (str(req.query.status)) where.status = str(req.query.status);
-    const q = str(req.query.q);
-    if (q) where.OR = [{ username: { contains: q, mode: "insensitive" } }, { name: { contains: q, mode: "insensitive" } }, { fanId: { contains: q } }];
-    const [items, total] = await Promise.all([
-      prisma.followBackTask.findMany({ where, orderBy: { updatedAt: "desc" }, take: limitOf(req.query), skip: offsetOf(req.query) }),
-      prisma.followBackTask.count({ where }),
-    ]);
-    return res.json({ ok: true, total, items });
+    const scope = await resolveCreatorScope(req.query.creatorId, str(req.query.agencyId));
+    const rawStatus = str(req.query.status);
+    const state = rawStatus && rawStatus.toLowerCase() !== "all" ? rawStatus.toUpperCase() : null;
+    const result = await listFollowBack({
+      agencyId: scope.agencyId, creatorId: scope.id, state, search: str(req.query.q) || "",
+      limit: limitOf(req.query), offset: offsetOf(req.query),
+    });
+    return res.json({ ok: true, authority: "canonical_current", total: result.count || 0, items: result.items || [], metrics: result.metrics || null });
   } catch (err) { return sendErr(res, err); }
 });
 
@@ -297,7 +305,6 @@ router.get("/creator/:id/overview", async (req, res) => {
     const [
       crmProfiles, crmTags, crmNotes,
       deliveries, deliveriesByStatus,
-      hiddenOnline, followBack,
       vaultSales, vaultPurchases,
       contentCollections, bumpStatRows,
       moneySum,
@@ -307,14 +314,19 @@ router.get("/creator/:id/overview", async (req, res) => {
       prisma.crmNote.count({ where: { creatorId, deletedAt: null } }),
       prisma.automationDelivery.count({ where: { creatorId } }),
       prisma.automationDelivery.groupBy({ by: ["status"], where: { creatorId }, _count: { _all: true } }),
-      prisma.hiddenOnlineUser.count({ where: { creatorId } }),
-      prisma.followBackTask.count({ where: { creatorId } }),
       prisma.vaultMediaSale.count({ where: { creatorId } }),
       prisma.vaultPurchaseMessage.count({ where: { creatorId } }),
       prisma.contentCollection.count({ where: { creatorId, deletedAt: null } }),
       prisma.bumpDeliveryStat.findMany({ where: { creatorId } , take: 10000}),
       prisma.moneyAttribution.aggregate({ where: { creatorId }, _sum: { amountCents: true } }),
     ]);
+
+    const [hiddenCurrent, followBackCurrent] = await Promise.all([
+      listHiddenOnline({ agencyId: creator.agencyId, creatorId, status: "all", limit: 1, offset: 0 }),
+      listFollowBack({ agencyId: creator.agencyId, creatorId, limit: 1, offset: 0 }),
+    ]);
+    const hiddenOnline = Number(hiddenCurrent?.count || 0);
+    const followBack = Number(followBackCurrent?.count || 0);
 
     const dStatus = {};
     for (const r of deliveriesByStatus) dStatus[r.status] = r._count._all;
@@ -357,7 +369,7 @@ router.get("/search", async (req, res) => {
       prisma.automationDelivery.findMany({ where: { OR: [{ messageId: q }, { fanId: q }] }, take, select: { id: true, fanId: true, messageId: true, status: true, creatorId: true } }),
     ]);
 
-    return res.json({ ok: true, q, results: { agencies, creators, users, crmProfiles, hiddenOnline: hidden, deliveries: deliveriesByMsg } });
+    return res.json({ ok: true, q, results: { agencies, creators, users, crmProfiles, hiddenOnlineHistoricalCompatibility: hidden, deliveries: deliveriesByMsg } });
   } catch (err) { return sendErr(res, err); }
 });
 

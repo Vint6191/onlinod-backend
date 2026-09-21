@@ -4,7 +4,7 @@ const prisma = require("../prisma");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
-const { projectFanObservationBatch, scheduleFanDataPointRefresh, fanDataPointRefreshDecisionDurable, FAN_DATA_OBSERVATION_BATCH_MAX } = require("./fan-data-authority-service");
+const { projectFanObservationBatch, scheduleFanDataPointRefresh, scheduleDurableFanDataRefreshDebt, FAN_DATA_OBSERVATION_BATCH_MAX } = require("./fan-data-authority-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { assertSubscriberPublicationIdle, validateSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
@@ -235,40 +235,11 @@ async function scheduleBumpCurrentRefresh({
   refreshFields = [],
   scheduleFanRefresh = scheduleFanDataPointRefresh,
 } = {}) {
-  const refreshFanIds = [...new Set((fanIds || []).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
-  if (!refreshFanIds.length) return { fanIds: [], requested: 0, decision: null };
-  try {
-    const decision = await scheduleFanRefresh({
-      agencyId,
-      creatorId,
-      onlyFansUserIds: refreshFanIds,
-      reason: "bump_current_unknown",
-      priority: Math.max(85, Number(priority) || 60),
-      params: {
-        consumer: "bumps",
-        trigger: clean(trigger, 80) || "planning",
-        ...(refreshFields.length ? { refreshFields: [...new Set(refreshFields.map((value) => clean(value, 80)).filter(Boolean))] } : {}),
-      },
-    });
-    const durable = fanDataPointRefreshDecisionDurable(decision);
-    return {
-      fanIds: refreshFanIds,
-      requested: refreshFanIds.length,
-      decision,
-      durable,
-      ...(durable ? {} : { error: `fan_refresh_not_durable:${String(decision?.reason || "unknown")}` }),
-    };
-  } catch (error) {
-    return {
-      fanIds: refreshFanIds,
-      requested: refreshFanIds.length,
-      decision: null,
-      durable: false,
-      error: clean(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
-    };
-  }
+  return scheduleDurableFanDataRefreshDebt({
+    agencyId, creatorId, fanIds, consumer: "bumps", reason: "bump_current_unknown",
+    priority: Math.max(85, Number(priority) || 60), trigger, refreshFields, scheduleFanRefresh,
+  });
 }
-
 
 async function planBumps({ agencyId, creatorId, userId = null, source = "manual", fanIds = [], limit = null, manual = false, db = prisma, scheduleFanRefresh = scheduleFanDataPointRefresh }) {
   const normalizedSource = sourceKey(source);
