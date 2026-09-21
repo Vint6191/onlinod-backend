@@ -421,16 +421,16 @@ async function planFollowBack(input) {
   return { ...result, refreshFanIds: fanRefresh.fanIds, fanRefresh };
 }
 
-async function ensureAutomaticFollowBack({ agencyId, creatorId, source = "recurring_sweep" }) {
-  const control = await getAutomationControlSnapshot({ agencyId, creatorId });
+async function ensureAutomaticFollowBack({ agencyId, creatorId, source = "recurring_sweep", db = prisma, scheduleFanRefresh = scheduleFanDataPointRefresh }) {
+  const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
   if (!control.effective.followBackEnabled) return { ok: true, created: false, reason: "module_disabled" };
   if (!control.modules.follow_back.settings.automatic) return { ok: true, created: false, reason: "automatic_disabled" };
-  const directory = await prisma.subscriberDirectoryState.findFirst({
+  const directory = await db.subscriberDirectoryState.findFirst({
     where: { agencyId, creatorId, status: "READY" },
     select: { currentRunId: true },
   });
   if (!directory?.currentRunId) return { ok: true, created: false, reason: "snapshot_not_ready" };
-  const planned = await planFollowBack({ agencyId, creatorId, userId: null, source, priority: 50 });
+  const planned = await planFollowBack({ agencyId, creatorId, userId: null, source, priority: 50, db, scheduleFanRefresh });
   return { ok: true, created: planned.summary.created > 0, reason: planned.summary.created > 0 ? "planned" : "nothing_due", planned };
 }
 

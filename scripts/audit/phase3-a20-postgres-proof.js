@@ -11,13 +11,14 @@ const ROOT = path.resolve(__dirname, "../..");
 const PRISMA_DIR = path.join(ROOT, "prisma");
 const A13_CUTOFF = "20260919010000_phase3_provider_gate_durable_waiter_fairness_v1";
 const PRE_A20_2_CUTOFF = "20260919113000_phase3_campaign_refresh_recovery_status_v1";
-const EXPECTED_PROOF_TEST_COUNT = 42;
+const EXPECTED_PROOF_TEST_COUNT = 44;
 const COVERAGE_PREFLIGHT = path.join(ROOT, "scripts/database/phase3-campaign-coverage-generation-online-preflight.js");
 const PREFLIGHT_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-concurrency.js");
 const PREFLIGHT_RUNTIME_AVAILABILITY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-runtime-availability.js");
 const INDEX_LIFECYCLE_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-index-lifecycle-concurrency.js");
 const OPERATIONALIZE_RUNTIME = path.join(ROOT, "scripts/audit/phase3-a20-operationalize-runtime.js");
 const SCHEMA_ISOLATION_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-schema-isolation.js");
+const SUBSCRIBER_POSTFLIGHT = path.join(ROOT, "scripts/database/phase3-subscriber-publication-schema-online-postflight.js");
 const LEAK_SNAPSHOT = path.join(ROOT, "scripts/audit/phase3-a26-fixture-leak-snapshot.js");
 const STEP_LOG_DIR = path.join(ROOT, "artifacts", "audit", "phase3-a20-steps");
 const PROOF_TESTS = [
@@ -109,7 +110,7 @@ function run(label, command, args, env, input = undefined, { allowFailure = fals
   const log = persistStepLog(label, stdout, stderr);
   const status = out.error ? null : out.status;
   const failed = Boolean(out.error || out.status !== 0);
-  const digest = failed ? failureDigest(stdout, stderr, 500) : "";
+  const digest = failed ? failureDigest(stdout, stderr, 60) : "";
   console.log(`# PHASE3_A20_POSTGRES_STEP ${JSON.stringify({ label, durationMs: Math.round(durationMs * 100) / 100, status, logSha256: log.sha256, logBytes: log.bytes })}`);
   if (failed) {
     if (digest) console.error(`# PHASE3_A20_POSTGRES_STEP_FAILURE_DIGEST ${label}\n${digest}`);
@@ -185,16 +186,25 @@ function assertNodeProof(stdout, label, summaryOverride = null) {
     "CampaignFanRefreshPromotionSignal_claim_due_idx",
     "SubscriberDirectoryMaintenanceSignal_due_claim_idx",
   ];
-  if (Number(hotPlan?.debtRows) !== 4000 || Number(hotPlan?.signalRows) !== 4000
-      || Number(hotPlan?.subscriberMaintenanceSignalRows) !== 4000
-      || !requiredIndexes.every((name) => Array.isArray(hotPlan?.indexes) && hotPlan.indexes.includes(name))) {
+  const hotStats = hotPlan?.stats || {};
+  const boundedHotStats = ["promoter", "recovery", "heal", "campaignSignal", "subscriberSignal"].every((key) => {
+    const row = hotStats[key];
+    return Number.isFinite(Number(row?.executionMs)) && Number(row.executionMs) >= 0 && Number(row.executionMs) <= 500
+      && Number.isFinite(Number(row?.blocks)) && Number(row.blocks) >= 0 && Number(row.blocks) <= 30000;
+  });
+  if (Number(hotPlan?.targetDebtRows) !== 400
+      || Number(hotPlan?.sameAgencyNoiseCreators) !== 999
+      || Number(hotPlan?.crossAgencyNoiseCreators) !== 199
+      || hotPlan?.indexEligibility !== true || !boundedHotStats) {
     fail(`${label} invalid FINAL_HOT_QUERY_PLAN_PROOF: ${JSON.stringify(hotPlan)}`);
   }
   const subscriberReconcilePlans = parseJsonLines(stdout, "FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF");
   if (subscriberReconcilePlans.length !== 1) fail(`${label} expected one FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF marker, got ${subscriberReconcilePlans.length}`);
   const subscriberReconcilePlan = subscriberReconcilePlans[0] || null;
   if (Number(subscriberReconcilePlan?.historyRows) !== 4000 || Number(subscriberReconcilePlan?.debtRows) !== 200
-      || subscriberReconcilePlan?.index !== "SubscriberScanRun_publication_job_reconcile_idx") {
+      || !Number.isFinite(Number(subscriberReconcilePlan?.executionMs)) || Number(subscriberReconcilePlan.executionMs) > 500
+      || !Number.isFinite(Number(subscriberReconcilePlan?.blocks)) || Number(subscriberReconcilePlan.blocks) > 30000
+      || Number(subscriberReconcilePlan?.deletedRuns) <= 0 || Number(subscriberReconcilePlan.deletedRuns) > 50) {
     fail(`${label} invalid FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF: ${JSON.stringify(subscriberReconcilePlan)}`);
   }
   const subscriberCursorPlans = parseJsonLines(stdout, "FINAL_SUBSCRIBER_CURSOR_PLAN_PROOF");
@@ -255,9 +265,15 @@ function runProofTests(label, databaseUrl) {
     durationMs += out.durationMs;
     aggregate.push(out.stdout || "");
     const ok = !out.failed && leaks.length === 0 && fileSummary.fail === 0 && fileSummary.skipped === 0;
-    const result = { file: path.relative(ROOT, file), ok, status: out.status, ...fileSummary, leaks, log: out.log, digest: out.digest || null };
+    const firstError = out.digest ? out.digest.split(/\r?\n/).slice(0, 16).join("\n") : null;
+    const result = { file: path.relative(ROOT, file), ok, status: out.status, ...fileSummary, leaks, log: out.log, firstError };
     fileResults.push(result);
-    console.log(`# PHASE3_A26_PROOF_FILE ${JSON.stringify({ label, ...result, log: { file: result.log.file, sha256: result.log.sha256, bytes: result.log.bytes } })}`);
+    console.log(`# PHASE3_A26_PROOF_FILE ${JSON.stringify({
+      label, file: result.file, ok: result.ok, status: result.status,
+      tests: result.tests, pass: result.pass, fail: result.fail, skipped: result.skipped,
+      leaks: result.leaks, firstError: result.firstError,
+      log: { file: result.log.file, sha256: result.log.sha256, bytes: result.log.bytes },
+    })}`);
   }
   const stdout = aggregate.join("\n");
   let authority = null;
@@ -286,6 +302,13 @@ function operationalizeRuntime(label, databaseUrl) {
   const out = run(label, process.execPath, [OPERATIONALIZE_RUNTIME], { DATABASE_URL: databaseUrl });
   if (!String(out.stdout || "").includes("A20_RUNTIME_OPERATIONALIZATION_PASS")) {
     fail(`${label} did not emit A20_RUNTIME_OPERATIONALIZATION_PASS`);
+  }
+  return { durationMs: out.durationMs };
+}
+function assertSubscriberPostflight(label, databaseUrl) {
+  const out = run(label, process.execPath, [SUBSCRIBER_POSTFLIGHT], { DATABASE_URL: databaseUrl });
+  if (!/"ok"\s*:\s*true/.test(String(out.stdout || ""))) {
+    fail(`${label} did not emit ok=true`);
   }
   return { durationMs: out.durationMs };
 }
@@ -369,12 +392,13 @@ function main() {
       const schemaIsolation = assertSchemaIsolation("clean-current-schema-isolation", cleanUrl);
       const operationalization = operationalizeRuntime("clean-current-operationalize", cleanUrl);
       assertSchemaIsolation("clean-current-fixture-lifecycle", cleanUrl, "runtime");
+      const subscriberPostflight = assertSubscriberPostflight("clean-current-subscriber-postflight", cleanUrl);
       const indexAbsent = run("clean-current-index-lifecycle-absent", process.execPath, [INDEX_LIFECYCLE_CONCURRENCY_PROOF, "absent"], { DATABASE_URL: cleanUrl });
       if (!String(indexAbsent.stdout || "").includes("A20_12_INDEX_ABSENT_CONCURRENCY_PASS")) fail("clean-current index lifecycle absent/concurrent proof did not emit PASS marker");
       const preflight = run("clean-current-preflight-concurrency", process.execPath, [PREFLIGHT_CONCURRENCY_PROOF], { DATABASE_URL: cleanUrl });
       if (!String(preflight.stdout || "").includes("A20_9_PREFLIGHT_CONCURRENCY_PASS")) fail("clean-current preflight concurrency proof did not emit PASS marker");
       const proof = runProofTests("clean-current-proof", cleanUrl);
-      return { schemaIsolation, operationalization, indexLifecycleAbsent: { pass: true, durationMs: indexAbsent.durationMs }, preflightConcurrency: { pass: true, durationMs: preflight.durationMs }, proof };
+      return { schemaIsolation, operationalization, subscriberPostflight, indexLifecycleAbsent: { pass: true, durationMs: indexAbsent.durationMs }, preflightConcurrency: { pass: true, durationMs: preflight.durationMs }, proof };
     });
 
     scenario("rolling-a13-to-current", () => {
@@ -388,8 +412,9 @@ function main() {
       const schemaIsolation = assertSchemaIsolation("rolling-current-schema-isolation", rollingUrl);
       operationalizeRuntime("rolling-current-operationalize-verify", rollingUrl);
       assertSchemaIsolation("rolling-current-fixture-lifecycle", rollingUrl, "runtime");
+      const subscriberPostflight = assertSubscriberPostflight("rolling-current-subscriber-postflight", rollingUrl);
       const proof = runProofTests("rolling-a13-to-current-proof", rollingUrl);
-      return { schemaIsolation, operationalization, proof };
+      return { schemaIsolation, operationalization, subscriberPostflight, proof };
     });
 
     scenario("seeded-pre-a20-2-to-current", () => {
@@ -415,13 +440,14 @@ function main() {
       const schemaIsolation = assertSchemaIsolation("seeded-current-schema-isolation", seededRollingUrl);
       operationalizeRuntime("seeded-current-operationalize-verify", seededRollingUrl);
       assertSchemaIsolation("seeded-current-fixture-lifecycle", seededRollingUrl, "runtime");
+      const subscriberPostflight = assertSubscriberPostflight("seeded-current-subscriber-postflight", seededRollingUrl);
       const seededVerify = run("seeded-a20-2-backfill-verify", process.execPath, ["scripts/audit/phase3-a20-seeded-rolling-coverage.js", "verify"], seedEnv);
       const migrationMetrics = parseJsonLines(seededVerify.stdout, "A20_6_SEEDED_BACKFILL_EXPLAIN_METRICS");
       if (migrationMetrics.length !== 1) fail("seeded migration proof missing A20.6 EXPLAIN metrics");
       const migrationMetric = migrationMetrics[0];
       if (Number(migrationMetric?.currentGenerationRows) < 1000 || migrationMetric?.currentRunIndexUsed !== true) fail(`seeded migration proof did not exercise a large indexed current generation: ${JSON.stringify(migrationMetric)}`);
       const proof = runProofTests("seeded-a20-2-current-proof", seededRollingUrl);
-      return { schemaIsolation, operationalization, preflightRuntimeAvailability: { pass: true, durationMs: runtimeAvailability.durationMs }, indexLifecycleInvalidRecovery: { pass: true, durationMs: indexInvalid.durationMs }, migrationMetrics: migrationMetric, proof };
+      return { schemaIsolation, operationalization, subscriberPostflight, preflightRuntimeAvailability: { pass: true, durationMs: runtimeAvailability.durationMs }, indexLifecycleInvalidRecovery: { pass: true, durationMs: indexInvalid.durationMs }, migrationMetrics: migrationMetric, proof };
     });
   } finally {
     cleanup.push(dropSchema(cli, audit, cleanSchema, cleanSchemaFile));
@@ -454,7 +480,17 @@ function main() {
   if (!fs.existsSync(failureOutput) || fs.statSync(failureOutput).size <= 0) fail("physical proof failure manifest was not persisted");
   console.log(`# PHASE3_A26_POSTGRES_PROOF_FILE ${resolved}`);
   console.log(`# PHASE3_A26_FAILURE_MANIFEST ${failureOutput}`);
-  console.log(`# PHASE3_A26_POSTGRES_PROOF_JSON ${JSON.stringify(proof)}`);
+  const scenarioTotals = Object.fromEntries(Object.entries(scenarios).map(([name, row]) => [name, row?.ok
+    ? { ok: true, tests: row?.proof?.tests ?? null, pass: row?.proof?.pass ?? null, fail: row?.proof?.fail ?? null, skipped: row?.proof?.skipped ?? null }
+    : { ok: false, message: row?.failure?.message || null, exitCode: row?.failure?.exitCode || null }]));
+  console.log(`# PHASE3_A26_POSTGRES_PROOF_JSON ${JSON.stringify({
+    version: proof.version, ok: proof.ok,
+    expectedProofTestsPerScenario: proof.expectedProofTestsPerScenario,
+    expectedProofTestsTotal: proof.expectedProofTestsTotal,
+    scenarioTotals, failureCount: failures.length,
+    cleanupOk: proof.cleanup.every((row) => row.ok),
+    proofFile: resolved, failureManifest: failureOutput,
+  })}`);
   if (!proof.ok) fail(`A26 physical proof failed across ${failures.length} scenario/cleanup boundaries; inspect ${failureOutput}`);
 }
 

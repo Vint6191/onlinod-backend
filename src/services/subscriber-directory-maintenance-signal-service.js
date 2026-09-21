@@ -92,12 +92,72 @@ async function claimSubscriberDirectoryMaintenanceSignal({ db, now = new Date(),
 }
 
 async function subscriberMaintenanceClaimCurrent({ db, signal } = {}) {
-  if (!signal?.id || !signal?.claimToken || typeof db?.subscriberDirectoryMaintenanceSignal?.findFirst !== "function") return false;
-  const row = await db.subscriberDirectoryMaintenanceSignal.findFirst({
-    where: { id: signal.id, claimToken: signal.claimToken, revision: Number(signal.revision || 0) },
-    select: { id: true },
+  if (!signal?.id || !signal?.claimToken || typeof db?.$queryRawUnsafe !== "function") return false;
+  const rows = await db.$queryRawUnsafe(`
+    SELECT "id"
+    FROM "SubscriberDirectoryMaintenanceSignal"
+    WHERE "id"=$1
+      AND "claimToken"=$2
+      AND "revision"=$3
+      AND "claimUntil" > clock_timestamp()
+    LIMIT 1
+  `, signal.id, signal.claimToken, Number(signal.revision || 0));
+  return Array.isArray(rows) && rows.length === 1;
+}
+
+async function withSubscriberMaintenanceClaimFence({ db, signal, work, maxWaitMs = 5_000, timeoutMs = 30_000 } = {}) {
+  if (!signal?.id || !signal?.claimToken || typeof work !== "function" || typeof db?.$transaction !== "function") {
+    return { current: false, reason: "claim_fence_unavailable" };
+  }
+  return db.$transaction(async (tx) => {
+    const rows = await tx.$queryRawUnsafe(`
+      SELECT "id","agencyId","creatorId","kind","revision","claimToken","claimUntil",
+             clock_timestamp() AS "authorityNow"
+      FROM "SubscriberDirectoryMaintenanceSignal"
+      WHERE "id"=$1
+        AND "claimToken"=$2
+        AND "revision"=$3
+        AND "claimUntil" > clock_timestamp()
+      FOR UPDATE
+    `, signal.id, signal.claimToken, Number(signal.revision || 0));
+    const current = Array.isArray(rows) ? rows[0] || null : null;
+    if (!current) return { current: false, reason: "claim_stale_or_expired" };
+    const result = await work(tx, {
+      ...signal,
+      claimUntil: current.claimUntil,
+      authorityNow: current.authorityNow instanceof Date ? current.authorityNow : new Date(current.authorityNow),
+    });
+    return { current: true, result };
+  }, { maxWait: Math.max(250, Number(maxWaitMs) || 5_000), timeout: Math.max(1_000, Number(timeoutMs) || 30_000) });
+}
+
+async function listPoisonedSubscriberMaintenanceSignals({ db, limit = 100 } = {}) {
+  if (typeof db?.subscriberDirectoryMaintenanceSignal?.findMany !== "function") return [];
+  const take = Math.max(1, Math.min(500, Number(limit) || 100));
+  return db.subscriberDirectoryMaintenanceSignal.findMany({
+    where: { attempts: { gte: SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS } },
+    orderBy: [{ attempts: "desc" }, { dueAt: "asc" }, { creatorId: "asc" }],
+    take,
   });
-  return Boolean(row);
+}
+
+async function requeuePoisonedSubscriberMaintenanceSignal({ db, signalId, reason = "OPERATOR_REQUEUE" } = {}) {
+  const id = clean(signalId, 180);
+  if (!id || typeof db?.$queryRawUnsafe !== "function") return { requeued: false, reason: "signal_missing" };
+  const rows = await db.$queryRawUnsafe(`
+    UPDATE "SubscriberDirectoryMaintenanceSignal"
+    SET "attempts"=0,
+        "dueAt"=clock_timestamp(),
+        "claimToken"=NULL,
+        "claimUntil"=NULL,
+        "lastError"=NULL,
+        "reason"=$2,
+        "revision"="revision"+1,
+        "updatedAt"=clock_timestamp()
+    WHERE "id"=$1 AND "attempts" >= ${SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS}
+    RETURNING "id","agencyId","creatorId","kind","dueAt","revision"
+  `, id, clean(reason, 64) || "OPERATOR_REQUEUE");
+  return { requeued: Array.isArray(rows) && rows.length === 1, signal: rows?.[0] || null };
 }
 
 async function ackSubscriberDirectoryMaintenanceSignal({ db, signal } = {}) {
@@ -141,6 +201,9 @@ module.exports = {
   signalSubscriberDirectoryMaintenance,
   claimSubscriberDirectoryMaintenanceSignal,
   subscriberMaintenanceClaimCurrent,
+  withSubscriberMaintenanceClaimFence,
+  listPoisonedSubscriberMaintenanceSignals,
+  requeuePoisonedSubscriberMaintenanceSignal,
   ackSubscriberDirectoryMaintenanceSignal,
   releaseSubscriberDirectoryMaintenanceSignal,
 };

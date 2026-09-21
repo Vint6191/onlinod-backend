@@ -249,7 +249,7 @@ test("final migration carries bounded subscriber cursor, durable signal lease an
 test("final physical proof pack is rewritten for the final authority cut and persists proof JSON", () => {
   const proof = source("scripts/audit/phase3-a20-postgres-proof.js");
   const finalPg = source("src/services/phase3-analytics-final-authority-cutover.integration.test.js");
-  assert.match(proof, /EXPECTED_PROOF_TEST_COUNT\s*=\s*42/);
+  assert.match(proof, /EXPECTED_PROOF_TEST_COUNT\s*=\s*44/);
   assert.match(proof, /phase3-analytics-final-authority-cutover\.integration\.test\.js/);
   assert.match(proof, /artifacts[\s\S]*audit[\s\S]*phase3-a26-postgres-proof\.json/);
   assert.match(proof, /physical proof JSON was not persisted/);
@@ -334,12 +334,13 @@ test("Campaign promotion claim chronology is PostgreSQL-owned and stale claimant
   }
 });
 
-test("Campaign promotion signal merge is atomic LEAST and every claimant final mutation is revision fenced", async () => {
+test("Campaign promotion signal merge is atomic LEAST while exact-revision retry and every claimant final mutation are fenced", async () => {
   const queue = fs.readFileSync(path.join(__dirname, "campaign-fan-refresh-queue-service.js"), "utf8");
   assert.match(queue, /ON CONFLICT \("creatorId"\) DO UPDATE SET[\s\S]*"dueAt" = LEAST\("CampaignFanRefreshPromotionSignal"\."dueAt", EXCLUDED\."dueAt"\)[\s\S]*"revision" = "CampaignFanRefreshPromotionSignal"\."revision" \+ 1[\s\S]*RETURNING "dueAt", "revision"/);
   assert.match(queue, /findFirst\(\{[\s\S]*claimToken: signal\.claimToken[\s\S]*revision: Number\(signal\.revision \|\| 0\)/);
   assert.match(queue, /updateMany\(\{[\s\S]*where: \{ id: signal\.id, claimToken: signal\.claimToken, revision: Number\(signal\.revision \|\| 0\) \}/);
   assert.match(queue, /deleteMany\(\{[\s\S]*where: \{ id: signal\.id, claimToken: signal\.claimToken, revision: Number\(signal\.revision \|\| 0\) \}/);
-  assert.match(queue, /SET "dueAt" = LEAST\("dueAt", \$3\), "claimToken" = NULL/);
+  assert.match(queue, /SET "dueAt" = \$3, "claimToken" = NULL, "claimUntil" = NULL,[\s\S]*"revision" = \$5/);
+  assert.match(queue, /WHERE "id"=\$1 AND "claimToken"=\$2/);
 });
 

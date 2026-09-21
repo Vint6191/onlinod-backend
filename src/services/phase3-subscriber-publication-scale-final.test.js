@@ -81,6 +81,7 @@ function buildFixture({ failTransactionAttempt = null } = {}) {
         const reconcileDebt = ["PUBLISHED", "SUPERSEDED"].includes(run.status) && run.publicationStatus === "COMPLETE" && run.publicationJobReconciledAt == null;
         if (where?.agencyId && where.agencyId !== run.agencyId) return null;
         if (where?.creatorId && where.creatorId !== run.creatorId) return null;
+        if (Array.isArray(where?.OR)) return (incomplete || reconcileDebt) ? clone(run) : null;
         if (where?.publicationJobReconciledAt === null) return reconcileDebt ? clone(run) : null;
         return incomplete ? clone(run) : null;
       },
@@ -360,7 +361,7 @@ test("A21 terminal failed Subscriber job cannot open a second generation while d
     $executeRawUnsafe: async () => 0,
     subscriberScanRun: {
       findFirst: async ({ where }) => {
-        if (where?.publicationStatus?.in) return clone(debtRun);
+        if (Array.isArray(where?.OR) || where?.publicationStatus?.in) return clone(debtRun);
         return null;
       },
       create: async () => { createdRuns += 1; throw new Error("must not create a second generation"); },

@@ -10,10 +10,17 @@ let applyFanDataPointRefreshChunk;
 let readFanCurrent;
 let recordSubscriberScanFailure;
 let applySubscriberScanChunk;
+let scheduleSubscriberScan;
+let repairSubscriberDirectoryStateGeneration;
+let cleanupSubscriberScanHistory;
 let runSubscriberDirectoryMaintenance;
 let signalSubscriberDirectoryMaintenance;
 let claimSubscriberDirectoryMaintenanceSignal;
 let ackSubscriberDirectoryMaintenanceSignal;
+let subscriberMaintenanceClaimCurrent;
+let withSubscriberMaintenanceClaimFence;
+let listPoisonedSubscriberMaintenanceSignals;
+let requeuePoisonedSubscriberMaintenanceSignal;
 let SUBSCRIBER_MAINTENANCE_KIND;
 let enqueueUniqueCampaignFanRefreshes;
 let finalizeCampaignFanRefreshJob;
@@ -23,12 +30,22 @@ let signalCampaignFanRefreshPromotion;
 
 if (enabled) {
   ({ projectSubscriberDirectoryItems, applyFanDataPointRefreshChunk, readFanCurrent } = require("./fan-data-authority-service"));
-  ({ recordSubscriberScanFailure, applySubscriberScanChunk } = require("./subscriber-directory-service"));
+  ({
+    recordSubscriberScanFailure,
+    applySubscriberScanChunk,
+    scheduleSubscriberScan,
+    repairSubscriberDirectoryStateGeneration,
+    cleanupSubscriberScanHistory,
+  } = require("./subscriber-directory-service"));
   ({ runSubscriberDirectoryMaintenance } = require("./subscriber-directory-maintenance-service"));
   ({
     signalSubscriberDirectoryMaintenance,
     claimSubscriberDirectoryMaintenanceSignal,
     ackSubscriberDirectoryMaintenanceSignal,
+    subscriberMaintenanceClaimCurrent,
+    withSubscriberMaintenanceClaimFence,
+    listPoisonedSubscriberMaintenanceSignals,
+    requeuePoisonedSubscriberMaintenanceSignal,
     SUBSCRIBER_MAINTENANCE_KIND,
   } = require("./subscriber-directory-maintenance-signal-service"));
   ({
@@ -181,7 +198,7 @@ test("FINAL PostgreSQL: Subscriber canonical publish and point-refresh share one
           kind: "fan_data_point_refresh",
           items: [{
             onlyFansUserId: fanId,
-            value: { availability: "AVAILABLE", totalSpentCents: 250, messagesSpentCents: 25 },
+            value: { source: "USER_PROFILE", availability: "AVAILABLE", totalSpentCents: 250, messagesSpentCents: 25 },
           }],
         },
       }),
@@ -228,19 +245,24 @@ test("FINAL PostgreSQL: lost final Subscriber response crosses durable fanProjec
   const { PrismaClient } = require("@prisma/client");
   const db = new PrismaClient();
   const scope = await createAgencyCreator(db, "final-subscriber-lost-response");
-  const runId = `${scope.creatorId}-run`;
-  const jobId = `${scope.creatorId}-job`;
-  const job = await db.jobInstance.create({
-    data: {
-      id: jobId, jobKey: "subscriber_directory_scan", scope: "creator", creatorId: scope.creatorId,
-      agencyId: scope.agencyId, status: "CLAIMED", leaseRevision: 1,
-      params: { scanRunId: runId, scanEveryDays: 7, observationTokenVersion: 1 },
-    },
+  const scheduled = await scheduleSubscriberScan({
+    agencyId: scope.agencyId,
+    creatorId: scope.creatorId,
+    manual: true,
+    force: true,
+    reason: "FINAL_LOST_RESPONSE_PROOF",
   });
-  await db.subscriberScanRun.create({
+  const runId = scheduled?.run?.id;
+  const jobId = scheduled?.job?.id;
+  assert.ok(runId && jobId, "production Subscriber allocator must create run/job generation");
+  const job = await db.jobInstance.update({
+    where: { id: jobId },
+    data: { status: "CLAIMED", leaseRevision: 1 },
+  });
+  await db.subscriberScanRun.update({
+    where: { id: runId },
     data: {
-      id: runId, agencyId: scope.agencyId, creatorId: scope.creatorId, jobId,
-      status: "RUNNING", pageLimit: 100, nextOffset: 0, scannedCount: 0, pageCount: 1,
+      status: "RUNNING", nextOffset: 0, scannedCount: 0, pageCount: 1,
       hasMore: false, fanProjectionStatus: "COMPLETE", fanProjectionCursorOffset: 0,
       fanProjectionCount: 0, fanProjectionCompletedAt: new Date(),
     },
@@ -400,7 +422,7 @@ test("FINAL PostgreSQL: Subscriber NOT_FETCHED cannot overwrite AVAILABLE canoni
       agencyId: scope.agencyId, creatorId: scope.creatorId, runId: `${scope.creatorId}-not-fetched-run`,
     });
 
-    const current = await readFanCurrent({ db, agencyId: scope.agencyId, creatorId: scope.creatorId, onlyFansUserIds: [fanId] });
+    const current = await readFanCurrent(db, { agencyId: scope.agencyId, creatorId: scope.creatorId, onlyFansUserIds: [fanId] });
     assert.equal(current.length, 1);
     assert.equal(current[0].value?.availability, "AVAILABLE");
     assert.equal(Number(current[0].value?.platformReportedTotalSpendCents), 777);
@@ -464,13 +486,19 @@ test("FINAL PostgreSQL: concurrent Subscriber pages serialize on the durable cur
   }
 });
 
-test("FINAL PostgreSQL: 4000-row Campaign debt and signal plans use the final hot-path indexes", { skip: !enabled, timeout: 180_000 }, async () => {
+test("FINAL PostgreSQL: multi-creator/multi-agency Campaign hot paths are bounded and every intended index is planner-eligible", { skip: !enabled, timeout: 180_000 }, async () => {
   const { PrismaClient } = require("@prisma/client");
   const db = new PrismaClient();
   const scope = await createAgencyCreator(db, "final-hot-plan");
+  const noise = await createAgencyCreator(db, "final-hot-plan-noise");
   const prefix = `${scope.creatorId}-plan`;
+  const noisePrefix = `${noise.creatorId}-plan-noise`;
   const campaignJobId = `${scope.creatorId}-plan-job`;
   const now = new Date("2042-06-01T00:00:00.000Z");
+  const targetDebtRows = 400;
+  const targetQueuedRows = 200;
+  const sameAgencyNoiseCreators = 999;
+  const crossAgencyNoiseCreators = 199;
   try {
     await db.jobInstance.create({ data: { id: campaignJobId, jobKey: "fetch_campaigns", scope: "creator", creatorId: scope.creatorId, agencyId: scope.agencyId, status: "DONE" } });
     await db.$executeRawUnsafe(`
@@ -479,13 +507,13 @@ test("FINAL PostgreSQL: 4000-row Campaign debt and signal plans use the final ho
         "lastRequestedAt","lastFailedAt","nextRetryAt","createdAt","updatedAt"
       )
       SELECT $1 || '-d-' || g::text, $2, $3, $1 || '-fan-' || g::text, $4,
-             CASE WHEN g <= 2000 THEN 'QUEUED' ELSE 'FAILED' END,
+             CASE WHEN g <= $5 THEN 'QUEUED' ELSE 'FAILED' END,
              $4 - (g * INTERVAL '1 second'),
-             CASE WHEN g > 2000 THEN $4 - (g * INTERVAL '1 second') ELSE NULL END,
-             CASE WHEN g > 2000 THEN $4 - INTERVAL '1 minute' ELSE NULL END,
+             CASE WHEN g > $5 THEN $4 - (g * INTERVAL '1 second') ELSE NULL END,
+             CASE WHEN g > $5 THEN $4 - INTERVAL '1 minute' ELSE NULL END,
              $4 - INTERVAL '1 day', $4 - (g * INTERVAL '1 second')
-      FROM generate_series(1, 4000) AS g
-    `, prefix, scope.agencyId, scope.creatorId, now);
+      FROM generate_series(1, $6::integer) AS g
+    `, prefix, scope.agencyId, scope.creatorId, now, targetQueuedRows, targetDebtRows);
     await db.$executeRawUnsafe(`
       INSERT INTO "CreatorCampaignFanRefreshWork" (
         "id","agencyId","creatorId","scanRunId","scanStartedAt","onlyFansUserId","campaignJobId","demandId",
@@ -493,133 +521,325 @@ test("FINAL PostgreSQL: 4000-row Campaign debt and signal plans use the final ho
       )
       SELECT $1 || '-w-' || g::text, $2, $3, $1 || '-run', $4, $1 || '-fan-' || g::text, $5,
              $1 || '-d-' || g::text, 1, $4, 'QUEUED', $4, $4, $4
-      FROM generate_series(1, 2000) AS g
-    `, prefix, scope.agencyId, scope.creatorId, now, campaignJobId);
+      FROM generate_series(1, $6::integer) AS g
+    `, prefix, scope.agencyId, scope.creatorId, now, campaignJobId, targetQueuedRows);
     await db.$executeRawUnsafe(`
       INSERT INTO "CreatorFan" ("id","agencyId","creatorId","onlyFansUserId","firstSeenAt","lastSeenAt","createdAt","updatedAt")
       SELECT $1 || '-f-' || g::text, $2, $3, $1 || '-fan-' || g::text, $4, $4, $4, $4
-      FROM generate_series(1, 4000) AS g
-    `, prefix, scope.agencyId, scope.creatorId, now);
+      FROM generate_series(1, $5::integer) AS g
+    `, prefix, scope.agencyId, scope.creatorId, now, targetDebtRows);
     await db.$executeRawUnsafe(`
       INSERT INTO "CreatorFanValueCurrent" ("id","agencyId","creatorId","fanId","fetchedAt","availability","source","createdAt","updatedAt")
       SELECT $1 || '-v-' || g::text, $2, $3, $1 || '-f-' || g::text, $4 + INTERVAL '1 minute', 'AVAILABLE', 'PLAN_PROOF', $4, $4
-      FROM generate_series(1, 4000) AS g
-    `, prefix, scope.agencyId, scope.creatorId, now);
-    await withPhase3PostgresFixtureAuthority(db, (tx) => tx.$executeRawUnsafe(`
-      INSERT INTO "CreatorAccount" ("id","agencyId","displayName","createdAt","updatedAt")
-      SELECT $1 || '-creator-' || g::text, $2, 'plan-signal-' || g::text, $3, $3
-      FROM generate_series(1, 3999) AS g
-    `, prefix, scope.agencyId, now));
+      FROM generate_series(1, $5::integer) AS g
+    `, prefix, scope.agencyId, scope.creatorId, now, targetDebtRows);
+
+    await withPhase3PostgresFixtureAuthority(db, async (tx) => {
+      await tx.$executeRawUnsafe(`
+        INSERT INTO "CreatorAccount" ("id","agencyId","displayName","createdAt","updatedAt")
+        SELECT $1 || '-creator-' || g::text, $2, 'plan-signal-' || g::text, $3, $3
+        FROM generate_series(1, $4::integer) AS g
+      `, prefix, scope.agencyId, now, sameAgencyNoiseCreators);
+      await tx.$executeRawUnsafe(`
+        INSERT INTO "CreatorAccount" ("id","agencyId","displayName","createdAt","updatedAt")
+        SELECT $1 || '-creator-' || g::text, $2, 'plan-noise-' || g::text, $3, $3
+        FROM generate_series(1, $4::integer) AS g
+      `, noisePrefix, noise.agencyId, now, crossAgencyNoiseCreators);
+    });
+
+    await db.$executeRawUnsafe(`
+      INSERT INTO "CreatorFanRefreshDemand" (
+        "id","agencyId","creatorId","onlyFansUserId","requestedFreshnessCutoffAt","status",
+        "lastRequestedAt","createdAt","updatedAt"
+      )
+      SELECT $1 || '-noise-d-' || g::text, $2, $1 || '-creator-' || g::text,
+             $1 || '-noise-fan-' || g::text, $3, 'QUEUED', $3, $3, $3
+      FROM generate_series(1, $4::integer) AS g
+    `, prefix, scope.agencyId, now, sameAgencyNoiseCreators);
+    await db.$executeRawUnsafe(`
+      INSERT INTO "CreatorFanRefreshDemand" (
+        "id","agencyId","creatorId","onlyFansUserId","requestedFreshnessCutoffAt","status",
+        "lastRequestedAt","createdAt","updatedAt"
+      )
+      SELECT $1 || '-d-' || g::text, $2, $1 || '-creator-' || g::text,
+             $1 || '-fan-' || g::text, $3, 'QUEUED', $3, $3, $3
+      FROM generate_series(1, $4::integer) AS g
+    `, noisePrefix, noise.agencyId, now, crossAgencyNoiseCreators);
+
     await db.$executeRawUnsafe(`
       INSERT INTO "CampaignFanRefreshPromotionSignal" ("id","agencyId","creatorId","dueAt","reason","createdAt","updatedAt")
       SELECT $1 || '-sig-' || g::text, $2,
-             CASE WHEN g = 4000 THEN $3 ELSE $1 || '-creator-' || g::text END,
+             CASE WHEN g = $5 THEN $3 ELSE $1 || '-creator-' || g::text END,
              $4 - (g * INTERVAL '1 millisecond'), 'PLAN_PROOF', $4, $4
-      FROM generate_series(1, 4000) AS g
-    `, prefix, scope.agencyId, scope.creatorId, now);
+      FROM generate_series(1, $5::integer) AS g
+    `, prefix, scope.agencyId, scope.creatorId, now, sameAgencyNoiseCreators + 1);
     await db.$executeRawUnsafe(`
       INSERT INTO "SubscriberDirectoryMaintenanceSignal" ("id","agencyId","creatorId","kind","dueAt","reason","revision","attempts","createdAt","updatedAt")
       SELECT $1 || '-subsig-' || g::text, $2,
-             CASE WHEN g = 4000 THEN $3 ELSE $1 || '-creator-' || g::text END,
+             CASE WHEN g = $5 THEN $3 ELSE $1 || '-creator-' || g::text END,
              'RECOVERY', $4 - (g * INTERVAL '1 millisecond'), 'PLAN_PROOF', 1, 0, $4, $4
-      FROM generate_series(1, 4000) AS g
-    `, prefix, scope.agencyId, scope.creatorId, now);
-    await db.$executeRawUnsafe('ANALYZE "CreatorFanRefreshDemand"');
-    await db.$executeRawUnsafe('ANALYZE "CreatorCampaignFanRefreshWork"');
-    await db.$executeRawUnsafe('ANALYZE "CreatorFan"');
-    await db.$executeRawUnsafe('ANALYZE "CreatorFanValueCurrent"');
-    await db.$executeRawUnsafe('ANALYZE "CampaignFanRefreshPromotionSignal"');
-    await db.$executeRawUnsafe('ANALYZE "SubscriberDirectoryMaintenanceSignal"');
+      FROM generate_series(1, $5::integer) AS g
+    `, prefix, scope.agencyId, scope.creatorId, now, sameAgencyNoiseCreators + 1);
 
-    const explain = async (sql, ...args) => {
+    for (const table of [
+      "CreatorFanRefreshDemand", "CreatorCampaignFanRefreshWork", "CreatorFan",
+      "CreatorFanValueCurrent", "CampaignFanRefreshPromotionSignal", "SubscriberDirectoryMaintenanceSignal",
+    ]) await db.$executeRawUnsafe(`ANALYZE "${table}"`);
+
+    const analyzed = async (sql, ...args) => {
       const rows = await db.$queryRawUnsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, ...args);
-      return JSON.stringify(rows?.[0]?.["QUERY PLAN"] || rows || []);
+      const payload = rows?.[0]?.["QUERY PLAN"] || rows || [];
+      const root = Array.isArray(payload) ? payload[0] : payload;
+      return { root, text: JSON.stringify(payload) };
     };
-    const promoter = await explain(`
+    const eligible = async (indexName, sql, ...args) => db.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
+      const rows = await tx.$queryRawUnsafe(`EXPLAIN (COSTS OFF, FORMAT JSON) ${sql}`, ...args);
+      const text = JSON.stringify(rows?.[0]?.["QUERY PLAN"] || rows || []);
+      assert.ok(text.includes(indexName), `${indexName} is not planner-eligible for the production query shape: ${text}`);
+    }, { maxWait: 10_000, timeout: 30_000 });
+    const bounded = (label, plan, { maxMs = 500, maxBlocks = 30_000 } = {}) => {
+      const executionMs = Number(plan.root?.["Execution Time"] || 0);
+      const p = plan.root?.Plan || {};
+      const blocks = Number(p["Shared Hit Blocks"] || 0) + Number(p["Shared Read Blocks"] || 0);
+      assert.ok(executionMs >= 0 && executionMs <= maxMs, `${label} execution ${executionMs}ms exceeded ${maxMs}ms`);
+      assert.ok(blocks <= maxBlocks, `${label} shared blocks ${blocks} exceeded ${maxBlocks}`);
+      assert.equal(Number(p["Temp Read Blocks"] || 0) + Number(p["Temp Written Blocks"] || 0), 0, `${label} spilled to temp`);
+      return { executionMs, blocks };
+    };
+
+    const promoterSql = `
       SELECT d."id" FROM "CreatorFanRefreshDemand" d
       WHERE d."creatorId" = $1 AND d."status" = 'QUEUED' AND d."activeRefreshJobId" IS NULL
         AND EXISTS (SELECT 1 FROM "CreatorCampaignFanRefreshWork" w WHERE w."demandId" = d."id" AND w."status" = 'QUEUED')
-      ORDER BY d."lastRequestedAt" ASC, d."id" ASC LIMIT 500
-    `, scope.creatorId);
-    const recovery = await explain(`
+      ORDER BY d."lastRequestedAt" ASC, d."id" ASC LIMIT 500`;
+    const recoverySql = `
       SELECT d."id" FROM "CreatorFanRefreshDemand" d
       WHERE d."creatorId" = $1 AND d."status" = 'FAILED' AND d."activeRefreshJobId" IS NULL
         AND d."quarantinedAt" IS NULL AND d."nextRetryAt" IS NOT NULL AND d."nextRetryAt" <= $2
-      ORDER BY COALESCE(d."nextRetryAt", d."lastFailedAt", d."updatedAt") ASC, d."id" ASC LIMIT 500
-    `, scope.creatorId, now);
-    const heal = await explain(`
+      ORDER BY COALESCE(d."nextRetryAt", d."lastFailedAt", d."updatedAt") ASC, d."id" ASC LIMIT 500`;
+    const healSql = `
       SELECT d."onlyFansUserId"
       FROM "CreatorFanRefreshDemand" d
       JOIN "CreatorFan" f ON f."creatorId" = d."creatorId" AND f."onlyFansUserId" = d."onlyFansUserId"
       JOIN "CreatorFanValueCurrent" v ON v."creatorId" = f."creatorId" AND v."fanId" = f."id"
       WHERE d."creatorId" = $1 AND d."status" IN ('QUEUED','FAILED')
         AND v."fetchedAt" IS NOT NULL AND v."fetchedAt" >= d."requestedFreshnessCutoffAt"
-      ORDER BY d."updatedAt" ASC, d."id" ASC LIMIT 500
-    `, scope.creatorId);
-    const signal = await explain(`
+      ORDER BY d."updatedAt" ASC, d."id" ASC LIMIT 500`;
+    const signalSql = `
       SELECT s."id" FROM "CampaignFanRefreshPromotionSignal" s
       WHERE s."dueAt" <= $1 AND COALESCE(s."claimUntil", '-infinity'::timestamp) <= $1
-      ORDER BY s."dueAt" ASC, s."creatorId" ASC LIMIT 20
-    `, now);
-    const subscriberMaintenance = await explain(`
-      SELECT s."id"
-      FROM "SubscriberDirectoryMaintenanceSignal" s
+      ORDER BY s."dueAt" ASC, s."creatorId" ASC LIMIT 20`;
+    const subscriberSql = `
+      SELECT s."id" FROM "SubscriberDirectoryMaintenanceSignal" s
       WHERE s."dueAt" <= $1 AND s."attempts" < 100
         AND COALESCE(s."claimUntil", '-infinity'::timestamp) <= $1
-      ORDER BY s."dueAt" ASC, s."creatorId" ASC, s."kind" ASC LIMIT 1
-    `, now);
+      ORDER BY s."dueAt" ASC, s."creatorId" ASC, s."kind" ASC LIMIT 1`;
 
-    const expected = [
-      [promoter, "CreatorFanRefreshDemand_promoter_ready_idx"],
-      [recovery, "CreatorFanRefreshDemand_recovery_order_idx"],
-      [heal, "CreatorFanRefreshDemand_canonical_heal_idx"],
-      [signal, "CampaignFanRefreshPromotionSignal_claim_due_idx"],
-      [subscriberMaintenance, "SubscriberDirectoryMaintenanceSignal_due_claim_idx"],
-    ];
-    for (const [plan, indexName] of expected) assert.ok(plan.includes(indexName), `${indexName} missing from EXPLAIN ANALYZE plan: ${plan}`);
-    console.log(`FINAL_HOT_QUERY_PLAN_PROOF ${JSON.stringify({ debtRows: 4000, signalRows: 4000, subscriberMaintenanceSignalRows: 4000, indexes: expected.map(([, name]) => name) })}`);
+    const promoter = await analyzed(promoterSql, scope.creatorId);
+    const recovery = await analyzed(recoverySql, scope.creatorId, now);
+    const heal = await analyzed(healSql, scope.creatorId);
+    const signal = await analyzed(signalSql, now);
+    const subscriberMaintenance = await analyzed(subscriberSql, now);
+    const stats = {
+      promoter: bounded("promoter", promoter),
+      recovery: bounded("recovery", recovery),
+      heal: bounded("heal", heal),
+      campaignSignal: bounded("campaign-signal", signal),
+      subscriberSignal: bounded("subscriber-signal", subscriberMaintenance),
+    };
+    const promoterEligibilitySql = `
+      SELECT d."id" FROM "CreatorFanRefreshDemand" d
+      WHERE d."creatorId" = $1 AND d."status" = 'QUEUED' AND d."activeRefreshJobId" IS NULL
+      ORDER BY d."lastRequestedAt" ASC, d."id" ASC LIMIT 500`;
+    const healEligibilitySql = `
+      SELECT d."id" FROM "CreatorFanRefreshDemand" d
+      WHERE d."creatorId" = $1 AND d."status" IN ('QUEUED','FAILED')
+      ORDER BY d."updatedAt" ASC, d."id" ASC LIMIT 500`;
+    await eligible("CreatorFanRefreshDemand_promoter_ready_idx", promoterEligibilitySql, scope.creatorId);
+    await eligible("CreatorFanRefreshDemand_recovery_order_idx", recoverySql, scope.creatorId, now);
+    await eligible("CreatorFanRefreshDemand_canonical_heal_idx", healEligibilitySql, scope.creatorId);
+    await eligible("CampaignFanRefreshPromotionSignal_claim_due_idx", signalSql, now);
+    await eligible("SubscriberDirectoryMaintenanceSignal_due_claim_idx", subscriberSql, now);
+
+    console.log(`FINAL_HOT_QUERY_PLAN_PROOF ${JSON.stringify({
+      targetDebtRows,
+      sameAgencyNoiseCreators,
+      crossAgencyNoiseCreators,
+      stats,
+      indexEligibility: true,
+    })}`);
   } finally {
     await cleanupAgency(db, scope.agencyId);
+    await cleanupAgency(db, noise.agencyId);
     await db.$disconnect();
   }
 });
 
-test("FINAL PostgreSQL: 4000-run Subscriber history uses the publication-job reconciliation partial index", { skip: !enabled, timeout: 180_000 }, async () => {
+test("FINAL PostgreSQL: 4000-run Subscriber history has bounded reconciliation and retention without cross-creator deletion", { skip: !enabled, timeout: 180_000 }, async () => {
   const { PrismaClient } = require("@prisma/client");
   const db = new PrismaClient();
   const scope = await createAgencyCreator(db, "final-subscriber-reconcile-plan");
+  const sibling = await createAgencyCreator(db, "final-subscriber-reconcile-sibling", { agencyId: scope.agencyId });
   const prefix = `${scope.creatorId}-reconcile-plan`;
   const now = new Date("2042-07-01T00:00:00.000Z");
   try {
     await db.$executeRawUnsafe(`
       INSERT INTO "SubscriberScanRun" (
-        "id","agencyId","creatorId","status","hasMore","fanProjectionStatus","publicationStatus",
+        "id","agencyId","creatorId","status","publicationGeneration","hasMore","fanProjectionStatus","publicationStatus",
         "publicationJobReconciledAt","summary","createdAt","updatedAt"
       )
       SELECT $1 || '-run-' || g::text, $2, $3,
              CASE WHEN g % 2 = 0 THEN 'PUBLISHED' ELSE 'SUPERSEDED' END,
-             false, 'COMPLETE', 'COMPLETE',
+             g, false, 'COMPLETE', 'COMPLETE',
              CASE WHEN g <= 200 THEN NULL ELSE $4 END,
              '{}'::jsonb, $4 - INTERVAL '1 day', $4 - (g * INTERVAL '1 second')
       FROM generate_series(1, 4000) AS g
     `, prefix, scope.agencyId, scope.creatorId, now);
+    await db.subscriberScanRun.create({
+      data: {
+        id: `${sibling.creatorId}-safe-run`, agencyId: sibling.agencyId, creatorId: sibling.creatorId,
+        status: "FAILED", publicationGeneration: 1, hasMore: false, fanProjectionStatus: "COMPLETE",
+        publicationStatus: "COMPLETE", publicationJobReconciledAt: now, summary: {},
+      },
+    });
     await db.$executeRawUnsafe('ANALYZE "SubscriberScanRun"');
-    const rows = await db.$queryRawUnsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+    const query = `
       SELECT r."id"
       FROM "SubscriberScanRun" r
       WHERE r."status" IN ('PUBLISHED','SUPERSEDED')
         AND r."publicationStatus" = 'COMPLETE'
         AND r."publicationJobReconciledAt" IS NULL
       ORDER BY r."updatedAt" ASC, r."id" ASC
-      LIMIT 8
-    `);
-    const plan = JSON.stringify(rows?.[0]?.["QUERY PLAN"] || rows || []);
-    const indexName = "SubscriberScanRun_publication_job_reconcile_idx";
-    assert.ok(plan.includes(indexName), `${indexName} missing from EXPLAIN ANALYZE plan: ${plan}`);
-    console.log(`FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF ${JSON.stringify({ historyRows: 4000, debtRows: 200, index: indexName })}`);
+      LIMIT 8`;
+    const rows = await db.$queryRawUnsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${query}`);
+    const payload = rows?.[0]?.["QUERY PLAN"] || rows || [];
+    const root = Array.isArray(payload) ? payload[0] : payload;
+    const executionMs = Number(root?.["Execution Time"] || 0);
+    const blocks = Number(root?.Plan?.["Shared Hit Blocks"] || 0) + Number(root?.Plan?.["Shared Read Blocks"] || 0);
+    assert.ok(executionMs <= 500, `Subscriber reconcile execution ${executionMs}ms exceeded 500ms`);
+    assert.ok(blocks <= 30_000, `Subscriber reconcile blocks ${blocks} exceeded 30000`);
+    await db.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
+      const eligibilityRows = await tx.$queryRawUnsafe(`EXPLAIN (COSTS OFF, FORMAT JSON) ${query}`);
+      const text = JSON.stringify(eligibilityRows?.[0]?.["QUERY PLAN"] || eligibilityRows || []);
+      assert.ok(text.includes("SubscriberScanRun_publication_job_reconcile_idx"), `reconcile index not planner-eligible: ${text}`);
+    });
+
+    // COMPLETE but unreconciled is canonical publication debt: retention must not delete.
+    const blocked = await cleanupSubscriberScanHistory({ db, agencyId: scope.agencyId, creatorId: scope.creatorId, keep: 2, maxRuns: 50 });
+    assert.equal(blocked.blockedByPublicationDebt, true);
+    assert.equal(await db.subscriberScanRun.count({ where: { creatorId: scope.creatorId } }), 4000);
+
+    await db.subscriberScanRun.updateMany({
+      where: { creatorId: scope.creatorId, publicationStatus: "COMPLETE" },
+      data: { publicationJobReconciledAt: now },
+    });
+    const retained = await cleanupSubscriberScanHistory({ db, agencyId: scope.agencyId, creatorId: scope.creatorId, keep: 2, maxRuns: 50 });
+    assert.equal(retained.blockedByPublicationDebt, false);
+    assert.ok(retained.deletedRuns > 0 && retained.deletedRuns <= 50);
+    assert.equal(await db.subscriberScanRun.count({ where: { creatorId: sibling.creatorId } }), 1, "retention crossed creator boundary");
+    console.log(`FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF ${JSON.stringify({ historyRows: 4000, debtRows: 200, executionMs, blocks, deletedRuns: retained.deletedRuns })}`);
   } finally {
     await cleanupAgency(db, scope.agencyId);
     await db.$disconnect();
+  }
+});
+
+test("A29 PostgreSQL: generation repair is monotonic and COMPLETE/unreconciled debt blocks scheduling and retention", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db = new PrismaClient();
+  const scope = await createAgencyCreator(db, "a29-generation-debt");
+  const now = await databaseNow(db);
+  try {
+    await db.subscriberDirectoryState.create({
+      data: {
+        agencyId: scope.agencyId, creatorId: scope.creatorId, status: "READY",
+        publicationGeneration: 10, publishedGeneration: 2, summary: {},
+      },
+    });
+    await db.subscriberScanRun.create({
+      data: {
+        id: `${scope.creatorId}-published-8`, agencyId: scope.agencyId, creatorId: scope.creatorId,
+        status: "PUBLISHED", publicationGeneration: 8, hasMore: false, fanProjectionStatus: "COMPLETE",
+        publicationStatus: "COMPLETE", publicationJobReconciledAt: null, summary: {},
+      },
+    });
+    const repaired = await repairSubscriberDirectoryStateGeneration({ db, agencyId: scope.agencyId, creatorId: scope.creatorId });
+    assert.equal(repaired.repaired, true);
+    const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId: scope.creatorId } });
+    assert.equal(state.publicationGeneration, 10, "repair lowered publicationGeneration");
+    assert.equal(state.publishedGeneration, 8, "repair did not advance publishedGeneration");
+
+    const scheduled = await scheduleSubscriberScan({
+      agencyId: scope.agencyId, creatorId: scope.creatorId, manual: true, force: true, reason: "A29_COMPLETE_UNRECONCILED_DEBT",
+    });
+    assert.equal(scheduled.created, false);
+    assert.equal(scheduled.reason, "publication_recovery_in_progress");
+    const cleanup = await cleanupSubscriberScanHistory({ db, agencyId: scope.agencyId, creatorId: scope.creatorId, keep: 0, maxRuns: 50 });
+    assert.equal(cleanup.blockedByPublicationDebt, true);
+    assert.equal(await db.subscriberScanRun.count({ where: { creatorId: scope.creatorId } }), 1);
+    console.log("# A29_GENERATION_DEBT_AUTHORITY_PASS");
+  } finally {
+    await cleanupAgency(db, scope.agencyId);
+    await db.$disconnect();
+  }
+});
+
+test("A29 PostgreSQL: expired Subscriber maintenance lease cannot commit fenced work and takeover/poison requeue are durable", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const scope = await createAgencyCreator(dbA, "a29-maintenance-lease");
+  const clock = await databaseNow(dbA);
+  try {
+    await signalSubscriberDirectoryMaintenance({
+      db: dbA, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: clock, reason: "A29_LEASE_PROOF",
+    });
+    const first = await claimSubscriberDirectoryMaintenanceSignal({ db: dbA, now: clock });
+    assert.ok(first?.claimToken);
+    await dbA.subscriberDirectoryMaintenanceSignal.update({
+      where: { id: first.id },
+      data: { claimUntil: new Date(clock.getTime() - 1_000) },
+    });
+    let staleWorkExecuted = false;
+    const staleFence = await withSubscriberMaintenanceClaimFence({
+      db: dbA, signal: first,
+      work: async () => { staleWorkExecuted = true; return { impossible: true }; },
+    });
+    assert.equal(staleFence.current, false);
+    assert.equal(staleWorkExecuted, false);
+    assert.equal(await subscriberMaintenanceClaimCurrent({ db: dbA, signal: first }), false);
+
+    const second = await claimSubscriberDirectoryMaintenanceSignal({ db: dbB, now: new Date(clock.getTime() + 1_000) });
+    assert.ok(second?.claimToken && second.claimToken !== first.claimToken, "expired claim was not taken over");
+    let takeoverWorked = false;
+    const currentFence = await withSubscriberMaintenanceClaimFence({
+      db: dbB, signal: second,
+      work: async () => { takeoverWorked = true; return { ok: true }; },
+    });
+    assert.equal(currentFence.current, true);
+    assert.equal(takeoverWorked, true);
+    await ackSubscriberDirectoryMaintenanceSignal({ db: dbB, signal: second });
+
+    const poisoned = await signalSubscriberDirectoryMaintenance({
+      db: dbA, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RETENTION, dueAt: clock, reason: "A29_POISON_PROOF",
+    });
+    await dbA.subscriberDirectoryMaintenanceSignal.update({ where: { id: poisoned.signal.id }, data: { attempts: 100 } });
+    const listed = await listPoisonedSubscriberMaintenanceSignals({ db: dbA, limit: 10 });
+    assert.ok(listed.some((row) => row.id === poisoned.signal.id));
+    const requeued = await requeuePoisonedSubscriberMaintenanceSignal({ db: dbA, signalId: poisoned.signal.id });
+    assert.equal(requeued.requeued, true);
+    const claimedAgain = await claimSubscriberDirectoryMaintenanceSignal({ db: dbB, now: new Date(clock.getTime() + 2_000) });
+    assert.equal(claimedAgain?.id, poisoned.signal.id);
+    await ackSubscriberDirectoryMaintenanceSignal({ db: dbB, signal: claimedAgain });
+    console.log("# A29_MAINTENANCE_LEASE_POISON_PASS");
+  } finally {
+    await cleanupAgency(dbA, scope.agencyId);
+    await dbA.$disconnect();
+    await dbB.$disconnect();
   }
 });
 

@@ -47,7 +47,7 @@ test("A23 physical proof test-count contract is real, not an external-step offse
     }
   }
   const expected = Number(runner.match(/EXPECTED_PROOF_TEST_COUNT\s*=\s*(\d+)/)?.[1] || 0);
-  assert.equal(expected, 42);
+  assert.equal(expected, 44);
   assert.equal(registered, expected);
 });
 

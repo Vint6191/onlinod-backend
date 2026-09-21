@@ -398,14 +398,14 @@ async function planFollowAutomation(input) {
   return { ...result, refreshFanIds: fanRefresh.fanIds, fanRefresh };
 }
 
-async function ensureAutomaticFollowAutomation({ agencyId, creatorId, source = "recurring_sweep" }) {
-  const control = await getAutomationControlSnapshot({ agencyId, creatorId });
+async function ensureAutomaticFollowAutomation({ agencyId, creatorId, source = "recurring_sweep", db = prisma, scheduleFanRefresh = scheduleFanDataPointRefresh }) {
+  const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
   const settings = control.modules.follow.settings;
   if (!control.effective.followEnabled) return { ok: true, created: false, reason: "module_disabled" };
   if (!settings.automatic || !settings.refollowEnabled) return { ok: true, created: false, reason: "automatic_disabled" };
-  const directory = await prisma.subscriberDirectoryState.findFirst({ where: { agencyId, creatorId, status: "READY" }, select: { currentRunId: true } });
+  const directory = await db.subscriberDirectoryState.findFirst({ where: { agencyId, creatorId, status: "READY" }, select: { currentRunId: true } });
   if (!directory?.currentRunId) return { ok: true, created: false, reason: "snapshot_not_ready" };
-  const planned = await planFollowAutomation({ agencyId, creatorId, userId: null, source, priority: 55 });
+  const planned = await planFollowAutomation({ agencyId, creatorId, userId: null, source, priority: 55, db, scheduleFanRefresh });
   return { ok: true, created: planned.summary.created > 0, reason: planned.summary.created ? "planned" : "nothing_due", planned };
 }
 

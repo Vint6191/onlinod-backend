@@ -42,7 +42,9 @@
     "audit:phase3-legacy-snapshot-postflight": "node scripts/database/phase3-analytics-legacy-snapshot-online-postflight.js",
     "audit:phase3-a26-postgres": "node scripts/audit/phase3-a20-postgres-proof.js",
     "audit:phase3-a26-changed-js": "node scripts/audit/phase3-a26-changed-js-gate.js",
-    "audit:phase3-a26-render": "node scripts/audit/phase3-a26-render-disposable.js"
+    "audit:phase3-a26-render": "node scripts/audit/phase3-a26-render-disposable.js",
+    "audit:phase3-a29-render": "node scripts/audit/phase3-a29-render-gate.js",
+    "maintenance:subscriber-signals": "node scripts/maintenance/phase3-subscriber-maintenance-signals.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

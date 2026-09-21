@@ -9,7 +9,13 @@ const { Linter } = require("eslint");
 const ROOT = path.resolve(__dirname, "../..");
 const DEFAULT_FILES = Object.freeze([
   "scripts/audit/phase3-a20-postgres-proof.js",
+  "scripts/audit/phase3-a26-changed-js-gate.js",
   "scripts/audit/phase3-a26-render-disposable.js",
+  "scripts/audit/phase3-a29-render-gate.js",
+  "scripts/maintenance/phase3-subscriber-maintenance-signals.js",
+  "src/services/campaign-fan-refresh-queue-service.js",
+  "src/services/follow-back-service.js",
+  "src/services/follow-automation-service.js",
   "scripts/audit/phase3-a26-fixture-leak-snapshot.js",
   "scripts/audit/phase3-postgres-proof-fixture-authority.js",
   "scripts/database/phase3-subscriber-publication-schema-online-postflight.js",

@@ -23,12 +23,44 @@ const REQUIRED_INDEX_SPECS = Object.freeze({
   SubscriberScanItem_run_id_cursor_idx: { table: "SubscriberScanItem", keys: [["runid"], ["id"]] },
   SubscriberDirectoryMaintenanceSignal_creator_kind_key: { table: "SubscriberDirectoryMaintenanceSignal", keys: [["creatorid"], ["kind"]], unique: true },
   SubscriberDirectoryMaintenanceSignal_due_claim_idx: { table: "SubscriberDirectoryMaintenanceSignal", keys: [["dueat"], ["creatorid"], ["kind"], ["coalesce", "claimuntil", "-infinity"]], predicateTokens: ["attempts", "100"] },
+  SubscriberDirectoryMaintenanceSignal_poison_idx: { table: "SubscriberDirectoryMaintenanceSignal", keys: [["attempts"], ["dueat"], ["creatorid"], ["kind"]], orders: ["DESC", "ASC", "ASC", "ASC"], predicateTokens: ["attempts", "100"] },
   CreatorFanRefreshDemand_promoter_ready_idx: { table: "CreatorFanRefreshDemand", keys: [["creatorid"], ["lastrequestedat"], ["id"]], predicateTokens: ["status", "queued", "activerefreshjobid"] },
   CreatorFanRefreshDemand_recovery_order_idx: { table: "CreatorFanRefreshDemand", keys: [["creatorid"], ["coalesce", "nextretryat", "lastfailedat", "updatedat"], ["id"]], predicateTokens: ["status", "failed", "activerefreshjobid"] },
   CreatorFanRefreshDemand_canonical_heal_idx: { table: "CreatorFanRefreshDemand", keys: [["creatorid"], ["updatedat"], ["id"]], predicateTokens: ["status", "queued", "failed"] },
   CampaignFanRefreshPromotionSignal_claim_due_idx: { table: "CampaignFanRefreshPromotionSignal", keys: [["dueat"], ["creatorid"], ["coalesce", "claimuntil", "-infinity"]] },
 });
 const REQUIRED_INDEXES = Object.freeze(Object.keys(REQUIRED_INDEX_SPECS));
+const REQUIRED_CONSTRAINT_SPECS = Object.freeze({
+  SubscriberDirectoryMaintenanceSignal_agencyId_fkey: {
+    table: "SubscriberDirectoryMaintenanceSignal", type: "f",
+    tokens: ["foreign key (agencyid)", "references agency(id)", "on update cascade", "on delete cascade"],
+  },
+  SubscriberDirectoryMaintenanceSignal_creator_fkey: {
+    table: "SubscriberDirectoryMaintenanceSignal", type: "f",
+    tokens: ["foreign key (agencyid, creatorid)", "references creatoraccount(agencyid, id)", "on update cascade", "on delete cascade"],
+  },
+  SubscriberDirectoryMaintenanceSignal_kind_check: {
+    table: "SubscriberDirectoryMaintenanceSignal", type: "c",
+    tokens: ["check", "kind", "recovery", "retention"],
+  },
+  SubscriberDirectoryMaintenanceSignal_revision_positive: {
+    table: "SubscriberDirectoryMaintenanceSignal", type: "c",
+    tokens: ["check", "revision", "> 0"],
+  },
+  SubscriberDirectoryMaintenanceSignal_attempts_nonnegative: {
+    table: "SubscriberDirectoryMaintenanceSignal", type: "c",
+    tokens: ["check", "attempts", ">= 0"],
+  },
+  CreatorCampaignFrontierFan_creatorId_campaignId_fkey: {
+    table: "CreatorCampaignFrontierFan", type: "f",
+    tokens: ["foreign key (creatorid, campaignid)", "references creatorcampaign(creatorid, id)", "on update cascade", "on delete cascade"],
+  },
+  CreatorCampaignCollectionState_completion_proof_nonnegative_check: {
+    table: "CreatorCampaignCollectionState", type: "c",
+    tokens: ["check", "campaignproofcampaignbatches", "campaignproofclaimerbatches", "campaignproofrejectedbatches", "campaignproofrejectedrows", ">= 0"],
+  },
+});
+const REQUIRED_CONSTRAINTS = Object.freeze(Object.keys(REQUIRED_CONSTRAINT_SPECS));
 
 function missingFrom(actual, required) {
   const present = new Set((actual || []).map(String));
@@ -41,6 +73,45 @@ function canonicalIndexSql(value) {
     .replace(/\s+/g, " ")
     .trim()
     .toLowerCase();
+}
+function canonicalConstraintSql(value) {
+  return canonicalIndexSql(value)
+    .replace(/\s*,\s*/g, ", ")
+    .replace(/\(\s+/g, "(")
+    .replace(/\s+\)/g, ")");
+}
+function validateConstraintRow(name, spec, row) {
+  const definition = canonicalConstraintSql(row?.definition);
+  const problems = [];
+  if (String(row?.tableName) !== spec.table) problems.push(`table=${row?.tableName}`);
+  if (String(row?.constraintType || "") !== spec.type) problems.push(`type=${row?.constraintType}`);
+  if (row?.validated !== true) problems.push("convalidated=false");
+  for (const token of spec.tokens || []) {
+    if (!definition.includes(canonicalConstraintSql(token))) problems.push(`missing-def:${token}`);
+  }
+  return { name, problems, definition: normalized(row?.definition) };
+}
+async function inspectConstraints(db) {
+  const rows = await db.$queryRawUnsafe(`
+    SELECT c.conname AS "constraintName", t.relname AS "tableName",
+           c.contype AS "constraintType", c.convalidated AS "validated",
+           pg_get_constraintdef(c.oid, true) AS "definition"
+    FROM pg_constraint c
+    JOIN pg_class t ON t.oid=c.conrelid
+    JOIN pg_namespace n ON n.oid=t.relnamespace
+    WHERE n.nspname=current_schema()
+      AND c.conname=ANY($1::text[])
+    ORDER BY c.conname
+  `, [...REQUIRED_CONSTRAINTS]);
+  const byName = new Map(rows.map((row) => [String(row.constraintName), row]));
+  const invalidConstraints = [];
+  for (const [name, spec] of Object.entries(REQUIRED_CONSTRAINT_SPECS)) {
+    const row = byName.get(name);
+    if (!row) continue;
+    const validation = validateConstraintRow(name, spec, row);
+    if (validation.problems.length) invalidConstraints.push(validation);
+  }
+  return { rows, byName, invalidConstraints };
 }
 function expressionHasTokens(expression, tokens) {
   const canonical = canonicalIndexSql(expression);
@@ -172,6 +243,7 @@ async function inspect(db) {
   const stateColumns = await tableColumns(db, "SubscriberDirectoryState");
   const signalColumns = await tableColumns(db, "SubscriberDirectoryMaintenanceSignal");
   const indexes = await inspectIndexes(db);
+  const constraints = await inspectConstraints(db);
 
   const historyRows = await db.$queryRawUnsafe(`
     SELECT COUNT(*)::bigint AS "count" FROM "SubscriberScanRun"
@@ -213,6 +285,8 @@ async function inspect(db) {
   const missingStateColumns = missingFrom(stateColumns, REQUIRED_DIRECTORY_STATE_COLUMNS);
   const missingSignalColumns = missingFrom(signalColumns, REQUIRED_MAINTENANCE_SIGNAL_COLUMNS);
   const missingIndexes = missingFrom(indexNames, REQUIRED_INDEXES);
+  const constraintNames = constraints.rows.map((row) => row.constraintName);
+  const missingConstraints = missingFrom(constraintNames, REQUIRED_CONSTRAINTS);
   const historicalRowsNotComplete = Number(historyRows?.[0]?.count || 0);
   const invalidPublicationGenerations = Number(invalidGenerationRows?.[0]?.count || 0);
   const invalidDirectoryGenerations = Number(invalidStateRows?.[0]?.count || 0);
@@ -223,12 +297,14 @@ async function inspect(db) {
 
   const valid = missingColumns.length === 0 && missingStateColumns.length === 0 && missingSignalColumns.length === 0
     && missingIndexes.length === 0 && indexes.invalidIndexes.length === 0
+    && missingConstraints.length === 0 && constraints.invalidConstraints.length === 0
     && historicalRowsNotComplete === 0 && invalidPublicationGenerations === 0 && invalidDirectoryGenerations === 0
     && missingStateCount === 0 && stateBehindCount === 0 && missingRecoverySignalCount === 0
     && invalidMaintenanceSignals === 0 && claimPlan.indexUsed === true;
   return {
     runColumns, stateColumns, signalColumns, indexes: indexNames, indexDetails: indexes.rows,
-    invalidIndexes: indexes.invalidIndexes, missingColumns, missingStateColumns, missingSignalColumns, missingIndexes,
+    invalidIndexes: indexes.invalidIndexes, constraints: constraintNames, invalidConstraints: constraints.invalidConstraints,
+    missingColumns, missingStateColumns, missingSignalColumns, missingIndexes, missingConstraints,
     historicalRowsNotComplete, invalidPublicationGenerations, invalidDirectoryGenerations,
     missingStateCount, stateBehindCount, missingRecoverySignalCount, invalidMaintenanceSignals,
     maintenanceClaimPlan: claimPlan, valid,
@@ -245,11 +321,14 @@ async function main({ db } = {}) {
     requiredDirectoryStateColumns: REQUIRED_DIRECTORY_STATE_COLUMNS,
     requiredMaintenanceSignalColumns: REQUIRED_MAINTENANCE_SIGNAL_COLUMNS,
     requiredIndexes: REQUIRED_INDEXES,
+    requiredConstraints: REQUIRED_CONSTRAINTS,
     missingColumns: state.missingColumns,
     missingStateColumns: state.missingStateColumns,
     missingSignalColumns: state.missingSignalColumns,
     missingIndexes: state.missingIndexes,
     invalidIndexes: state.invalidIndexes,
+    missingConstraints: state.missingConstraints,
+    invalidConstraints: state.invalidConstraints,
     historicalRowsNotComplete: state.historicalRowsNotComplete,
     invalidPublicationGenerations: state.invalidPublicationGenerations,
     invalidDirectoryGenerations: state.invalidDirectoryGenerations,
@@ -263,7 +342,8 @@ async function main({ db } = {}) {
     const error = new Error(`Phase 3 Subscriber publication A26 postflight failed: ${JSON.stringify({
       missingColumns: state.missingColumns, missingStateColumns: state.missingStateColumns,
       missingSignalColumns: state.missingSignalColumns, missingIndexes: state.missingIndexes,
-      invalidIndexes: state.invalidIndexes, historicalRowsNotComplete: state.historicalRowsNotComplete,
+      invalidIndexes: state.invalidIndexes, missingConstraints: state.missingConstraints,
+      invalidConstraints: state.invalidConstraints, historicalRowsNotComplete: state.historicalRowsNotComplete,
       invalidPublicationGenerations: state.invalidPublicationGenerations, invalidDirectoryGenerations: state.invalidDirectoryGenerations,
       missingStateCount: state.missingStateCount, stateBehindCount: state.stateBehindCount,
       missingRecoverySignalCount: state.missingRecoverySignalCount, invalidMaintenanceSignals: state.invalidMaintenanceSignals,
@@ -276,7 +356,9 @@ async function main({ db } = {}) {
 
 module.exports = {
   REQUIRED_PUBLICATION_COLUMNS, REQUIRED_DIRECTORY_STATE_COLUMNS, REQUIRED_MAINTENANCE_SIGNAL_COLUMNS,
-  REQUIRED_INDEXES, REQUIRED_INDEX_SPECS, missingFrom, canonicalIndexSql, expressionHasTokens, keyExpressionMatches, validateIndexRow, inspectIndexes, explainMaintenanceClaim, inspect, main,
+  REQUIRED_INDEXES, REQUIRED_INDEX_SPECS, REQUIRED_CONSTRAINTS, REQUIRED_CONSTRAINT_SPECS,
+  missingFrom, canonicalIndexSql, canonicalConstraintSql, expressionHasTokens, keyExpressionMatches,
+  validateIndexRow, validateConstraintRow, inspectIndexes, inspectConstraints, explainMaintenanceClaim, inspect, main,
 };
 
 if (require.main === module) {

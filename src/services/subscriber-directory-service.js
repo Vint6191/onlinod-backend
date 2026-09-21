@@ -13,6 +13,7 @@ const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fe
 const {
   SUBSCRIBER_MAINTENANCE_KIND,
   signalSubscriberDirectoryMaintenance,
+  withSubscriberMaintenanceClaimFence,
 } = require("./subscriber-directory-maintenance-signal-service");
 
 const SUBSCRIBER_DIRECTORY_JOB_KEY = "subscriber_directory_scan";
@@ -124,9 +125,18 @@ function subscriberPublicationDebtWhere({ agencyId, creatorId } = {}) {
   return {
     ...(agencyId ? { agencyId } : {}),
     ...(creatorId ? { creatorId } : {}),
-    hasMore: false,
-    fanProjectionStatus: "COMPLETE",
-    publicationStatus: { in: [...SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES] },
+    OR: [
+      {
+        hasMore: false,
+        fanProjectionStatus: "COMPLETE",
+        publicationStatus: { in: [...SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES] },
+      },
+      {
+        status: { in: ["PUBLISHED", "SUPERSEDED"] },
+        publicationStatus: "COMPLETE",
+        publicationJobReconciledAt: null,
+      },
+    ],
   };
 }
 
@@ -992,25 +1002,36 @@ async function applySubscriberScanChunk({
   };
 }
 
-async function planSubscriberDerivedAutomation({ run, userId = null, db = prisma, source = "subscriber_snapshot_published" } = {}) {
+async function planSubscriberDerivedAutomation({
+  run,
+  userId = null,
+  db = prisma,
+  source = "subscriber_snapshot_published",
+  fencedMaintenance = false,
+} = {}) {
   if (!run?.agencyId || !run?.creatorId) return {
     followBackPlanning: { ok: false, created: false, reason: "subscriber_run_scope_missing" },
     followAutomationPlanning: { ok: false, created: false, reason: "subscriber_run_scope_missing" },
     bumpPlanning: { ok: false, created: false, reason: "subscriber_run_scope_missing", sources: [] },
   };
+  const fencedRefreshScheduler = fencedMaintenance
+    ? async () => ({ ok: true, created: false, reason: "subscriber_maintenance_fenced_deferred" })
+    : undefined;
   let followBackPlanning = null;
   let followAutomationPlanning = null;
   let bumpPlanning = null;
   try {
     followBackPlanning = await ensureAutomaticFollowBack({
-      agencyId: run.agencyId, creatorId: run.creatorId, source,
+      agencyId: run.agencyId, creatorId: run.creatorId, source, db,
+      ...(fencedRefreshScheduler ? { scheduleFanRefresh: fencedRefreshScheduler } : {}),
     });
   } catch (error) {
     followBackPlanning = { ok: false, created: false, reason: error?.code || "follow_back_planning_failed", error: clean(error?.message || error, 500) };
   }
   try {
     followAutomationPlanning = await ensureAutomaticFollowAutomation({
-      agencyId: run.agencyId, creatorId: run.creatorId, source,
+      agencyId: run.agencyId, creatorId: run.creatorId, source, db,
+      ...(fencedRefreshScheduler ? { scheduleFanRefresh: fencedRefreshScheduler } : {}),
     });
   } catch (error) {
     followAutomationPlanning = { ok: false, created: false, reason: error?.code || "follow_automation_planning_failed", error: clean(error?.message || error, 500) };
@@ -1231,17 +1252,39 @@ async function repairSubscriberDirectoryStateGeneration({ db = prisma, agencyId,
       if (error?.code !== "P2002") throw error;
     }
   }
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const repairedRows = await db.$queryRawUnsafe(`
+      UPDATE "SubscriberDirectoryState"
+      SET "publicationGeneration" = GREATEST("publicationGeneration", $3),
+          "publishedGeneration" = GREATEST("publishedGeneration", $4),
+          "updatedAt" = NOW()
+      WHERE "agencyId" = $1
+        AND "creatorId" = $2
+        AND ("publicationGeneration" < $3 OR "publishedGeneration" < $4)
+      RETURNING "publicationGeneration", "publishedGeneration"
+    `, agency, creator, maxGeneration, maxPublishedGeneration);
+    return {
+      repaired: Array.isArray(repairedRows) && repairedRows.length > 0,
+      created: false,
+      maxGeneration,
+      maxPublishedGeneration,
+      publicationGeneration: Number(repairedRows?.[0]?.publicationGeneration ?? existing?.publicationGeneration ?? 0),
+      publishedGeneration: Number(repairedRows?.[0]?.publishedGeneration ?? existing?.publishedGeneration ?? 0),
+    };
+  }
+  const nextPublicationGeneration = Math.max(Number(existing?.publicationGeneration || 0), maxGeneration);
+  const nextPublishedGeneration = Math.max(Number(existing?.publishedGeneration || 0), maxPublishedGeneration);
   const updated = await db.subscriberDirectoryState.updateMany({
     where: {
       creatorId: creator,
       OR: [
-        { publicationGeneration: { lt: maxGeneration } },
-        { publishedGeneration: { lt: maxPublishedGeneration } },
+        { publicationGeneration: { lt: nextPublicationGeneration } },
+        { publishedGeneration: { lt: nextPublishedGeneration } },
       ],
     },
     data: {
-      publicationGeneration: maxGeneration,
-      publishedGeneration: maxPublishedGeneration,
+      publicationGeneration: nextPublicationGeneration,
+      publishedGeneration: nextPublishedGeneration,
     },
   });
   return { repaired: Number(updated?.count || 0) > 0, created: false, maxGeneration, maxPublishedGeneration };
@@ -1250,22 +1293,8 @@ async function repairSubscriberDirectoryStateGeneration({ db = prisma, agencyId,
 async function findSubscriberPublicationDebtForCreator(db, { agencyId, creatorId } = {}) {
   const scope = { agencyId: clean(agencyId, 180), creatorId: clean(creatorId, 180) };
   if (!scope.agencyId || !scope.creatorId) return null;
-  const publication = await db.subscriberScanRun.findFirst({
-    where: subscriberPublicationDebtWhere(scope),
-    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
-    select: {
-      id: true, agencyId: true, creatorId: true, jobId: true, status: true, publicationStatus: true,
-      publicationJobReconciledAt: true, summary: true, updatedAt: true,
-    },
-  });
-  if (publication) return publication;
   return db.subscriberScanRun.findFirst({
-    where: {
-      ...scope,
-      status: { in: ["PUBLISHED", "SUPERSEDED"] },
-      publicationStatus: "COMPLETE",
-      publicationJobReconciledAt: null,
-    },
+    where: subscriberPublicationDebtWhere(scope),
     orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
     select: {
       id: true, agencyId: true, creatorId: true, jobId: true, status: true, publicationStatus: true,
@@ -1287,6 +1316,7 @@ async function recoverSubscriberPublicationDebt({
   maxStepsPerRun = 4,
   maxRuntimeMs = 5_000,
   beforePlanning = null,
+  maintenanceSignal = null,
 } = {}) {
   const agency = clean(agencyId, 180);
   const creator = clean(creatorId, 180);
@@ -1355,27 +1385,76 @@ async function recoverSubscriberPublicationDebt({
     const freshRun = completeResult.run || await db.subscriberScanRun.findUnique({ where: { id: candidate.id } }).catch(() => candidate);
     let planning = null;
     const publishedRun = freshRun || candidate;
-    if (String(publishedRun?.status || "") === "PUBLISHED" && subscriberRecoveryJobNeedsPlanning(job, authorityNow)) {
-      if (typeof beforePlanning === "function" && !(await beforePlanning({ run: publishedRun, job }))) {
+    let reconciled = null;
+
+    if (maintenanceSignal) {
+      const fenced = await withSubscriberMaintenanceClaimFence({
+        db,
+        signal: maintenanceSignal,
+        maxWaitMs: Math.min(2_000, Math.max(500, runtimeBudget - (Date.now() - started))),
+        timeoutMs: Math.min(15_000, Math.max(1_500, runtimeBudget - (Date.now() - started) + 2_000)),
+        work: async (tx, claim) => {
+          await lockSubscriberPublicationCreator(tx, agency, creator);
+          const txRun = await tx.subscriberScanRun.findUnique({ where: { id: publishedRun.id } }).catch(() => publishedRun);
+          const txJob = txRun?.jobId
+            ? await tx.jobInstance.findUnique({
+                where: { id: txRun.jobId },
+                select: { id: true, params: true, status: true, leaseUntil: true, leaseRevision: true },
+              }).catch(() => job)
+            : job;
+          let txPlanning = null;
+          let txPlanningRuns = 0;
+          if (String(txRun?.status || "") === "PUBLISHED" && subscriberRecoveryJobNeedsPlanning(txJob, claim.authorityNow)) {
+            txPlanning = await planSubscriberDerivedAutomation({
+              run: txRun,
+              userId: null,
+              db: tx,
+              source: "subscriber_snapshot_recovered",
+              fencedMaintenance: true,
+            });
+            txPlanningRuns = 1;
+          }
+          const txReconciled = await reconcileRecoveredSubscriberPublicationJob(tx, {
+            run: txRun || publishedRun,
+            summary: completeResult.summary || txRun?.summary || publishedRun.summary || {},
+            planning: txPlanning,
+            now: claim.authorityNow,
+          });
+          return { planning: txPlanning, planningRuns: txPlanningRuns, reconciled: txReconciled };
+        },
+      });
+      if (!fenced?.current) {
         return {
           ok: true, creatorId: creator, advancedSteps, recoveredRuns, reconciledJobs, planningRuns, stateRepairs,
           budgetExhausted, staleClaim: true, reason: "maintenance_claim_stale",
         };
       }
-      planning = await planSubscriberDerivedAutomation({
-        run: publishedRun,
-        userId: null,
-        db,
-        source: "subscriber_snapshot_recovered",
+      planning = fenced.result?.planning || null;
+      planningRuns += Number(fenced.result?.planningRuns || 0);
+      reconciled = fenced.result?.reconciled || { reconciled: false, reason: "claim_fenced_no_result" };
+    } else {
+      if (String(publishedRun?.status || "") === "PUBLISHED" && subscriberRecoveryJobNeedsPlanning(job, authorityNow)) {
+        if (typeof beforePlanning === "function" && !(await beforePlanning({ run: publishedRun, job }))) {
+          return {
+            ok: true, creatorId: creator, advancedSteps, recoveredRuns, reconciledJobs, planningRuns, stateRepairs,
+            budgetExhausted, staleClaim: true, reason: "maintenance_claim_stale",
+          };
+        }
+        planning = await planSubscriberDerivedAutomation({
+          run: publishedRun,
+          userId: null,
+          db,
+          source: "subscriber_snapshot_recovered",
+        });
+        planningRuns += 1;
+      }
+      reconciled = await reconcileRecoveredSubscriberPublicationJob(db, {
+        run: freshRun || candidate,
+        summary: completeResult.summary || freshRun?.summary || candidate.summary || {},
+        planning,
+        now: authorityNow,
       });
-      planningRuns += 1;
     }
-    const reconciled = await reconcileRecoveredSubscriberPublicationJob(db, {
-      run: freshRun || candidate,
-      summary: completeResult.summary || freshRun?.summary || candidate.summary || {},
-      planning,
-      now: authorityNow,
-    });
     if (reconciled.reconciled) reconciledJobs += 1;
     if (!reconciled.reconciled && reconciled.reason === "active_claim") break;
   }

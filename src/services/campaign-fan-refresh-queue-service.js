@@ -146,8 +146,8 @@ async function healExistingCanonicalCampaignDebt({ db, creatorId, now = null, li
      AND v."fanId" = f."id"
     WHERE d."creatorId" = $1
       AND d."status" IN ('QUEUED','FAILED')
-      AND v."valueObservedAt" IS NOT NULL
-      AND v."valueObservedAt" >= d."requestedFreshnessCutoffAt"
+      AND v."fetchedAt" IS NOT NULL
+      AND v."fetchedAt" >= d."requestedFreshnessCutoffAt"
     ORDER BY d."updatedAt" ASC, d."id" ASC
     FOR UPDATE OF d SKIP LOCKED
     LIMIT $2
@@ -1406,20 +1406,27 @@ async function releaseCampaignFanRefreshPromotionClaim({ db, signal, now = new D
   const effectiveNow = await dbAuthorityNow({ db, fallbackNow: asDate(now) || new Date() });
   const retryDueAt = new Date(effectiveNow.getTime() + 60_000);
   const lastError = clean(error?.message || error, 1000);
-  // A new producer may have signalled earlier debt while this claim was running.
-  // Releasing the old token must never postpone that newer/earlier signal.
+  // Exact claimed revision owns this retry schedule, so move dueAt forward.
+  // If a newer producer incremented revision, the exact update does not match;
+  // the stale claimant then releases only its old token and preserves producer dueAt.
   if (typeof db?.$executeRawUnsafe === "function") {
     const count = await db.$executeRawUnsafe(`
       UPDATE "CampaignFanRefreshPromotionSignal"
-      SET "dueAt" = LEAST("dueAt", $3), "claimToken" = NULL, "claimUntil" = NULL,
+      SET "dueAt" = $3, "claimToken" = NULL, "claimUntil" = NULL,
           "attempts" = "attempts" + 1, "lastError" = $4, "updatedAt" = NOW()
-      WHERE "id" = $1 AND "claimToken" = $2
-    `, signal.id, signal.claimToken, retryDueAt, lastError);
-    return Number(count || 0) > 0;
+      WHERE "id" = $1 AND "claimToken" = $2 AND "revision" = $5
+    `, signal.id, signal.claimToken, retryDueAt, lastError, Number(signal.revision || 0));
+    if (Number(count || 0) > 0) return true;
+    await db.$executeRawUnsafe(`
+      UPDATE "CampaignFanRefreshPromotionSignal"
+      SET "claimToken"=NULL, "claimUntil"=NULL, "updatedAt"=NOW()
+      WHERE "id"=$1 AND "claimToken"=$2
+    `, signal.id, signal.claimToken);
+    return false;
   }
   if (db?.campaignFanRefreshPromotionSignal?.updateMany) {
-    // Adapter fallback cannot express LEAST(current dueAt, retryDueAt). Fence by
-    // claimed revision so it cannot overwrite a signal produced after this claim.
+    // Adapter fallback is likewise fenced by claimed revision so it cannot
+    // overwrite a signal produced after this claim.
     const updated = await db.campaignFanRefreshPromotionSignal.updateMany({
       where: { id: signal.id, claimToken: signal.claimToken, revision: Number(signal.revision || 0) },
       data: { dueAt: retryDueAt, claimToken: null, claimUntil: null, attempts: { increment: 1 }, lastError },
@@ -1444,7 +1451,10 @@ async function runCampaignFanRefreshPromotionMaintenance({
   const workerCount = Math.max(1, Math.min(8, Number(concurrency) || 4, max));
   const runtimeBudgetMs = Math.max(1_000, Math.min(30_000, Number(maxRuntimeMs) || 8_000));
   const startedMonotonic = Date.now();
-  const totals = { processedCreators: 0, promotedJobs: 0, promotedFans: 0, healedFans: 0, recovered: 0, errors: 0, contended: 0 };
+  const totals = {
+    processedCreators: 0, promotedJobs: 0, promotedFans: 0, healedFans: 0, recovered: 0,
+    errors: 0, contended: 0, errorDetails: [],
+  };
   let reservedSlots = 0;
   let drained = false;
 
@@ -1528,23 +1538,48 @@ async function runCampaignFanRefreshPromotionMaintenance({
       totals.promotedFans += Number(claimed.promoted?.promotedFans || 0);
     } catch (error) {
       totals.errors += 1;
+      if (totals.errorDetails.length < 5) {
+        totals.errorDetails.push({
+          signalId: signal?.id || null,
+          agencyId: signal?.agencyId || null,
+          creatorId: signal?.creatorId || null,
+          code: error?.code || null,
+          message: String(error?.message || error || "campaign_promotion_maintenance_error").slice(0, 500),
+        });
+      }
       await releaseCampaignFanRefreshPromotionClaim({ db: root, signal, now: fallbackNow, error }).catch(() => {});
     }
   }
 
-  async function worker() {
+  async function worker(initialSignal = null) {
+    let nextSignal = initialSignal;
     for (;;) {
-      if (drained || reservedSlots >= max || Date.now() - startedMonotonic >= runtimeBudgetMs) return;
-      reservedSlots += 1;
-      // Claim is one short SKIP LOCKED transaction and derives lease chronology
-      // from PostgreSQL. Never preclaim a batch that can expire in a JS queue.
-      const signal = await claimCampaignFanRefreshPromotionSignal({ db: root, now: fallbackNow });
+      if (drained || Date.now() - startedMonotonic >= runtimeBudgetMs) return;
+      let signal = nextSignal;
+      nextSignal = null;
+      if (!signal && reservedSlots >= max) return;
+      if (!signal) {
+        reservedSlots += 1;
+        // Claim is one short SKIP LOCKED transaction and derives lease chronology
+        // from PostgreSQL. Never preclaim a batch that can expire in a JS queue.
+        signal = await claimCampaignFanRefreshPromotionSignal({ db: root, now: fallbackNow });
+      }
       if (!signal) { drained = true; return; }
       await processSignal(signal);
     }
   }
 
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  // Free-tier empty queue: pay for one claim first, only fan out when work exists.
+  reservedSlots += 1;
+  const firstSignal = await claimCampaignFanRefreshPromotionSignal({ db: root, now: fallbackNow });
+  if (!firstSignal) {
+    drained = true;
+  } else {
+    await Promise.all([
+      worker(firstSignal),
+      ...Array.from({ length: Math.max(0, workerCount - 1) }, () => worker()),
+    ]);
+  }
   const budgetExhausted = !drained && reservedSlots < max && Date.now() - startedMonotonic >= runtimeBudgetMs;
   return {
     ...totals,

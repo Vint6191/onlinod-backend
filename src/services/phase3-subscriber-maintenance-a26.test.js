@@ -29,7 +29,11 @@ test("A26 Subscriber maintenance uses a durable creator-scoped oldest-due SKIP L
   assert.match(subscriber, /SUBSCRIBER_RECOVERY_CREATOR_SCOPE_REQUIRED/);
   assert.match(subscriber, /findSubscriberPublicationDebtForCreator/);
   assert.match(maintenance, /claimSubscriberDirectoryMaintenanceSignal/);
-  assert.match(maintenance, /beforePlanning = \(\) => subscriberMaintenanceClaimCurrent/);
+  assert.match(maintenance, /maintenanceSignal:\s*signal/);
+  assert.match(signals, /withSubscriberMaintenanceClaimFence/);
+  assert.match(signals, /"claimUntil" > clock_timestamp\(\)/);
+  assert.match(signals, /FOR UPDATE/);
+  assert.match(maintenance, /if \(!signal && reserved >= limit\) return/);
   assert.match(scheduler, /subscriberDirectoryMaintenance[\s\S]*runSubscriberDirectoryMaintenance/);
   assert.doesNotMatch(scheduler, /subscriberPublicationRecovery[\s\S]*recoverSubscriberPublicationDebt/);
 });
@@ -72,7 +76,7 @@ test("A26 migration and postflight prove maintenance queue, state repair and rea
 test("A26 physical closure is hermetic, exhaustive and separated from production deploy", () => {
   const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
   const pkg = JSON.parse(source("package.json"));
-  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 42/);
+  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 44/);
   assert.match(runner, /requires a disposable physical PostgreSQL database and has no production opt-in bypass/);
   assert.doesNotMatch(runner, /ONLINOD_AUDIT_ALLOW_PRIMARY_DATABASE/);
   assert.match(runner, /search_path=\$\{safeSchema\},pg_catalog/);
@@ -85,6 +89,9 @@ test("A26 physical closure is hermetic, exhaustive and separated from production
   assert.match(runner, /scenario\("clean-current"/);
   assert.match(runner, /scenario\("rolling-a13-to-current"/);
   assert.match(runner, /scenario\("seeded-pre-a20-2-to-current"/);
+  assert.match(runner, /clean-current-subscriber-postflight/);
+  assert.match(runner, /rolling-current-subscriber-postflight/);
+  assert.match(runner, /seeded-current-subscriber-postflight/);
   assert.equal(pkg.scripts["audit:phase3-a26-postgres"], "node scripts/audit/phase3-a20-postgres-proof.js");
   assert.doesNotMatch(pkg.scripts["prisma:migrate"], /audit:phase3-a(?:20|26)-postgres/);
 });
@@ -235,4 +242,54 @@ test("A28 postflight validates PostgreSQL index semantics instead of pg_get_inde
     }),
   );
   assert.ok(wrongAccessMethod.problems.some((problem) => problem.includes("access-method")));
+});
+
+
+test("A29 closure repairs scoped constraints, poison recovery, canonical debt and release ordering", () => {
+  const migration = source("prisma/migrations/20260921103000_phase3_a29_subscriber_campaign_authority_closure_v1/migration.sql");
+  const postflight = source("scripts/database/phase3-subscriber-publication-schema-online-postflight.js");
+  const signals = source("src/services/subscriber-directory-maintenance-signal-service.js");
+  const maintenance = source("src/services/subscriber-directory-maintenance-service.js");
+  const subscriber = source("src/services/subscriber-directory-service.js");
+  const campaign = source("src/services/campaign-fan-refresh-queue-service.js");
+  const wrapper = source("scripts/audit/phase3-a29-render-gate.js");
+  const gate = source("scripts/audit/phase3-a26-changed-js-gate.js");
+  const pkg = JSON.parse(source("package.json"));
+
+  assert.match(migration, /ALTER TABLE "SubscriberDirectoryMaintenanceSignal"[\s\S]*SubscriberDirectoryMaintenanceSignal_creator_fkey/);
+  assert.match(migration, /VALIDATE CONSTRAINT "SubscriberDirectoryMaintenanceSignal_creator_fkey"/);
+  assert.match(migration, /CreatorCampaignFrontierFan_creatorId_campaignId_fkey/);
+  assert.match(migration, /CreatorCampaignCollectionState_completion_proof_nonnegative_check/);
+  assert.match(migration, /SubscriberDirectoryMaintenanceSignal_poison_idx/);
+  assert.match(postflight, /REQUIRED_CONSTRAINT_SPECS/);
+  assert.match(postflight, /convalidated/);
+  assert.match(postflight, /missingConstraints/);
+  assert.match(postflight, /invalidConstraints/);
+
+  assert.match(signals, /listPoisonedSubscriberMaintenanceSignals/);
+  assert.match(signals, /requeuePoisonedSubscriberMaintenanceSignal/);
+  assert.match(signals, /attempts:\s*\{ gte: SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS \}/);
+  assert.match(maintenance, /errorDetails/);
+  assert.match(campaign, /errorDetails/);
+  assert.match(campaign, /v\."fetchedAt"/);
+  assert.doesNotMatch(campaign, /v\."valueObservedAt"/);
+  assert.match(campaign, /if \(!signal && reservedSlots >= max\) return/);
+  assert.match(campaign, /SET "dueAt" = \$3, "claimToken" = NULL, "claimUntil" = NULL[\s\S]*"revision" = \$5/);
+  assert.doesNotMatch(campaign, /SET "dueAt" = LEAST\("dueAt", \$3\)[\s\S]*"revision" = \$5/);
+  assert.match(signals, /typeof db\?\.\$queryRawUnsafe !== "function"\) return \{ requeued: false, reason: "signal_missing" \}/);
+  assert.match(subscriber, /subscriberPublicationDebtWhere/);
+  assert.match(subscriber, /publicationJobReconciledAt:\s*null/);
+  assert.match(subscriber, /GREATEST\("publicationGeneration", \$3\)/);
+  assert.match(subscriber, /GREATEST\("publishedGeneration", \$4\)/);
+
+  const changedPos = wrapper.indexOf("CHANGED_GATE");
+  const proofPos = wrapper.indexOf("runProof(primaryUrl, disposableUrl)");
+  const dropPos = wrapper.indexOf("dropDisposableDatabase(admin, database)");
+  const migratePos = wrapper.indexOf('["run", "prisma:migrate"]');
+  assert.ok(changedPos >= 0 && proofPos > changedPos && dropPos > proofPos && migratePos > dropPos,
+    "A29 release gate must run static -> disposable proof -> cleanup -> primary migrate");
+  assert.equal(pkg.scripts["audit:phase3-a29-render"], "node scripts/audit/phase3-a29-render-gate.js");
+  assert.equal(pkg.scripts["maintenance:subscriber-signals"], "node scripts/maintenance/phase3-subscriber-maintenance-signals.js");
+  assert.match(gate, /phase3-a29-render-gate\.js/);
+  assert.match(gate, /campaign-fan-refresh-queue-service\.js/);
 });

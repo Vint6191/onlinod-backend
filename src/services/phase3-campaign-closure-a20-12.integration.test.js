@@ -32,6 +32,7 @@ function scope(prefix) {
     oldRun: `${prefix}-old-run-${nonce}`,
     ingestRun: `${prefix}-ingest-run-${nonce}`,
     deviceId: `${prefix}-device-${nonce}`,
+    userId: `${prefix}-user-${nonce}`,
   };
 }
 
@@ -58,6 +59,24 @@ async function createScope(db, s) {
   await withPhase3PostgresFixtureAuthority(db, async (tx) => {
     await tx.agency.create({ data: { id: s.agencyId, name: `A20.12 ${s.agencyId}` } });
     await tx.creatorAccount.create({ data: { id: s.creatorId, agencyId: s.agencyId, displayName: "A20.12 Creator" } });
+  });
+  await db.user.create({
+    data: {
+      id: s.userId,
+      email: `${s.userId}@example.test`,
+      passwordHash: "a20.12-integration",
+      emailVerifiedAt: authorityNow,
+    },
+  });
+  await db.workerDevice.create({
+    data: {
+      id: s.deviceId,
+      agencyId: s.agencyId,
+      userId: s.userId,
+      deviceName: "A20.12 physical proof",
+      platform: "integration",
+      appVersion: "phase3-a29",
+    },
   });
   await db.creatorCampaignCollectionState.create({
     data: {
@@ -111,6 +130,7 @@ async function createScope(db, s) {
 
 async function cleanup(db, s) {
   await cleanupPhase3PostgresAgencyFixture(db, s.agencyId);
+  await db.user.deleteMany({ where: { id: s.userId } });
 }
 
 async function planner(input) {
