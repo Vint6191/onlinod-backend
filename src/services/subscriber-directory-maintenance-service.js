@@ -24,6 +24,7 @@ async function runSubscriberDirectoryMaintenance({
   recoveryStepsPerRun = 4,
   retentionKeep = 2,
   retentionBatch = 50,
+  scheduleFanRefresh = null,
 } = {}) {
   if (typeof db?.$transaction !== "function" || typeof db?.$queryRawUnsafe !== "function") {
     return { ok: true, processedSignals: 0, reason: "adapter_unsupported" };
@@ -59,6 +60,7 @@ async function runSubscriberDirectoryMaintenance({
         maxStepsPerRun: recoveryStepsPerRun,
         maxRuntimeMs: Math.max(500, Math.min(remainingMs, 4_000)),
         maintenanceSignal: signal,
+        scheduleFanRefresh,
       });
     } catch (error) {
       if (error?.code === "SUBSCRIBER_MAINTENANCE_CLAIM_STALE") {

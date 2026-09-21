@@ -351,7 +351,7 @@ async function scheduleInitialJobsForCreator({
  * trying to backfill a missing range) want a stricter "fresh" definition than
  * the recurring sweeper's 1-hour window.
  */
-async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, now, freshnessWindowMs }) {
+async function ensureSingleJob({ db = prisma, jobKey, creatorId, agencyId, params, priority, now, freshnessWindowMs }) {
   const rangeKey = params?.rangeKey || null;
   const window = Number.isFinite(freshnessWindowMs) ? freshnessWindowMs : FRESHNESS_WINDOW_MS;
   const idempotencyKey = buildJobIdempotencyKey({
@@ -371,7 +371,7 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
   // when the application catches the exception. The next scheduler bucket gets
   // a different key and is the normal retry boundary. Older rows without a key
   // are still considered by the compatibility rangeKey scan below.
-  const keyed = await prisma.jobInstance.findUnique({ where: { idempotencyKey } });
+  const keyed = await db.jobInstance.findUnique({ where: { idempotencyKey } });
   if (keyed) {
     if (keyed.status === "SCHEDULED" || keyed.status === "CLAIMED") {
       return { created: false, reason: "already_in_flight", jobId: keyed.id };
@@ -387,7 +387,7 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
   }
 
   // Find any existing legacy job for this creator+jobKey+rangeKey.
-  const existing = await prisma.jobInstance.findMany({
+  const existing = await db.jobInstance.findMany({
     where: {
       jobKey,
       creatorId,
@@ -418,7 +418,7 @@ async function ensureSingleJob({ jobKey, creatorId, agencyId, params, priority, 
   }
 
   const planned = await createPlannedJobIfAbsent({
-    db: prisma,
+    db,
     jobKey,
     scope: "creator",
     creatorId,

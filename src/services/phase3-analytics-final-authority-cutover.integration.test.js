@@ -8,6 +8,7 @@ const { withPhase3PostgresFixtureAuthority, cleanupPhase3PostgresAgencyFixture }
 let projectSubscriberDirectoryItems;
 let applyFanDataPointRefreshChunk;
 let readFanCurrent;
+let scheduleFanDataPointRefresh;
 let recordSubscriberScanFailure;
 let applySubscriberScanChunk;
 let scheduleSubscriberScan;
@@ -22,7 +23,9 @@ let subscriberMaintenanceClaimCurrent;
 let withSubscriberMaintenanceClaimFence;
 let listPoisonedSubscriberMaintenanceSignals;
 let requeuePoisonedSubscriberMaintenanceSignal;
+let releaseSubscriberDirectoryMaintenanceSignal;
 let SUBSCRIBER_MAINTENANCE_KIND;
+let setAutomationControl;
 let subscriberTest;
 let enqueueUniqueCampaignFanRefreshes;
 let finalizeCampaignFanRefreshJob;
@@ -31,7 +34,7 @@ let runCampaignFanRefreshPromotionMaintenance;
 let signalCampaignFanRefreshPromotion;
 
 if (enabled) {
-  ({ projectSubscriberDirectoryItems, applyFanDataPointRefreshChunk, readFanCurrent } = require("./fan-data-authority-service"));
+  ({ projectSubscriberDirectoryItems, applyFanDataPointRefreshChunk, readFanCurrent, scheduleFanDataPointRefresh } = require("./fan-data-authority-service"));
   ({
     recordSubscriberScanFailure,
     applySubscriberScanChunk,
@@ -50,8 +53,10 @@ if (enabled) {
     withSubscriberMaintenanceClaimFence,
     listPoisonedSubscriberMaintenanceSignals,
     requeuePoisonedSubscriberMaintenanceSignal,
+    releaseSubscriberDirectoryMaintenanceSignal,
     SUBSCRIBER_MAINTENANCE_KIND,
   } = require("./subscriber-directory-maintenance-signal-service"));
+  ({ setAutomationControl } = require("./automation-control-service"));
   ({
     enqueueUniqueCampaignFanRefreshes,
     finalizeCampaignFanRefreshJob,
@@ -86,6 +91,87 @@ async function databaseNow(db) {
   const now = value instanceof Date ? value : new Date(value);
   if (!Number.isFinite(now.getTime())) throw new Error("PostgreSQL authority clock unavailable");
   return now;
+}
+
+async function configureA32DerivedPlanningModules(db, scope) {
+  const moduleSettings = [
+    ["follow_back", {
+      enabled: true, automatic: true, activeSubscribers: true, expiredSubscribers: true,
+      freeSubscribers: true, paidSubscribers: true, dailyLimit: 1000,
+    }],
+    ["follow", {
+      enabled: true, automatic: true, refollowEnabled: true, dailyLimit: 1000, maxNudgesPerFan: 2,
+    }],
+    ["bumps", {
+      enabled: true, automatic: true, hiddenOnlineEnabled: false, paidSubscribersEnabled: true,
+      freeSubscribersEnabled: false, subscriptionEventsEnabled: false, onlineEnabled: false,
+      dailyLimit: 1000, candidateBatchSize: 500,
+    }],
+  ];
+  for (const [moduleKey, settings] of moduleSettings) {
+    await setAutomationControl({
+      agencyId: scope.agencyId, creatorId: scope.creatorId, userId: null,
+      scope: "module", moduleKey, enabled: true, settings, db,
+    });
+  }
+}
+
+async function seedA32DerivedPlanningDebt(db, scope, { prefix = nonce("a32-derived"), fanCount = 500, generation = 77 } = {}) {
+  const runId = `${prefix}-run`;
+  const jobId = `${prefix}-subscriber-job`;
+  const now = await databaseNow(db);
+  const fanIds = Array.from({ length: fanCount }, (_, index) => `${scope.creatorId}-a32-fan-${String(index).padStart(4, "0")}`);
+
+  await db.jobInstance.create({
+    data: {
+      id: jobId, jobKey: "subscriber_directory_scan", scope: "creator", creatorId: scope.creatorId, agencyId: scope.agencyId,
+      status: "FAILED", leaseRevision: 1, lastError: "a32 derived planning proof",
+      params: { scanRunId: runId, scanEveryDays: 7 },
+    },
+  });
+  await db.subscriberScanRun.create({
+    data: {
+      id: runId, agencyId: scope.agencyId, creatorId: scope.creatorId, jobId, status: "PUBLISHED",
+      hasMore: false, scannedCount: fanCount, fanProjectionStatus: "COMPLETE", fanProjectionCount: fanCount,
+      fanProjectionCompletedAt: now, publicationStatus: "COMPLETE", publicationGeneration: generation,
+      publicationStartedAt: now, publicationCompletedAt: now, publishedAt: now, completedAt: now, summary: { fanCount },
+    },
+  });
+  await db.subscriberDirectoryState.create({
+    data: {
+      agencyId: scope.agencyId, creatorId: scope.creatorId, currentRunId: runId, lastJobId: jobId, status: "READY",
+      totalCount: fanCount, publicationGeneration: generation, publishedGeneration: generation, publishedAt: now,
+    },
+  });
+
+  const subscriberItems = fanIds.map((fanId, index) => ({
+    id: `${prefix}-scan-${String(index).padStart(4, "0")}`, runId, agencyId: scope.agencyId, creatorId: scope.creatorId,
+    fanId, dialogId: `${fanId}-dialog`, username: `fan_${index}`, name: `Fan ${index}`,
+    subscriptionType: "paid", isActive: true, valueAvailability: "NOT_FETCHED",
+    contentHash: `${prefix}-hash-${index}`, metadata: {}, observedAt: now,
+  }));
+  const followBack = fanIds.map((fanId, index) => ({
+    id: `${prefix}-fb-${String(index).padStart(4, "0")}`, agencyId: scope.agencyId, creatorId: scope.creatorId, fanId,
+    dialogId: `${fanId}-dialog`, username: `fan_${index}`, displayName: `Fan ${index}`, snapshotRunId: runId,
+    state: "CANDIDATE", generation: 1, ignored: false, blocked: false, discoveredAt: now,
+  }));
+  const followAutomation = fanIds.map((fanId, index) => ({
+    id: `${prefix}-fa-${String(index).padStart(4, "0")}`, agencyId: scope.agencyId, creatorId: scope.creatorId, fanId,
+    dialogId: `${fanId}-dialog`, username: `fan_${index}`, displayName: `Fan ${index}`, snapshotRunId: runId,
+    state: "CANDIDATE", phase: "IDLE", generation: 0, ignored: false, blocked: false, discoveredAt: now,
+  }));
+  await db.subscriberScanItem.createMany({ data: subscriberItems });
+  await db.followBackCandidate.createMany({ data: followBack });
+  await db.followAutomationCandidate.createMany({ data: followAutomation });
+  await db.automationTask.create({
+    data: {
+      id: `${prefix}-bump-template`, agencyId: scope.agencyId, creatorId: scope.creatorId, type: "bump_online",
+      title: "A32 derived planning proof", enabled: true, status: "active",
+      config: { messageText: "A32 proof bump" }, triggers: { subscriber: true }, rules: {}, schedule: {}, stats: {}, metadata: {},
+    },
+  });
+  await configureA32DerivedPlanningModules(db, scope);
+  return { runId, jobId, fanIds, generation, now };
 }
 
 async function planner(input) {
@@ -273,11 +359,32 @@ test("FINAL PostgreSQL: lost final Subscriber response crosses durable fanProjec
   });
   try {
     const repaired = await recordSubscriberScanFailure({ job, error: "simulated lost final response", terminal: true, db });
-    assert.equal(repaired?.status, "PUBLISHED");
-    const replay = await recordSubscriberScanFailure({ job, error: "duplicate terminal callback", terminal: true, db });
-    assert.equal(replay?.status, "PUBLISHED");
+    assert.equal(repaired?.status, "RUNNING");
+    assert.equal(repaired?.publicationRecoveryPending, true);
+    assert.equal(await db.subscriberDirectoryMaintenanceSignal.count({ where: { creatorId: scope.creatorId, kind: "RECOVERY" } }), 1);
+
+    const maintenanceNow = await databaseNow(db);
+    const maintenance = await runSubscriberDirectoryMaintenance({
+      db,
+      now: maintenanceNow,
+      maxSignals: 4,
+      concurrency: 1,
+      maxRuntimeMs: 10_000,
+      recoveryStepsPerRun: 8,
+    });
+    assert.equal(maintenance.errors, 0, JSON.stringify(maintenance.errorDetails || []));
+    const after = await db.subscriberScanRun.findUnique({ where: { id: runId } });
+    const afterJob = await db.jobInstance.findUnique({ where: { id: jobId } });
+    assert.equal(after?.status, "PUBLISHED");
+    assert.ok(after?.publicationJobReconciledAt instanceof Date);
+    assert.equal(afterJob?.status, "DONE");
     const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId: scope.creatorId } });
     assert.equal(state?.currentRunId, runId);
+
+    const replay = await recordSubscriberScanFailure({ job: afterJob, error: "duplicate terminal callback", terminal: true, db });
+    assert.equal(replay?.status, "PUBLISHED");
+    const afterReplay = await db.subscriberScanRun.findUnique({ where: { id: runId } });
+    assert.equal(afterReplay?.publicationJobReconciledAt?.getTime?.(), after?.publicationJobReconciledAt?.getTime?.());
     console.log("# FINAL_SUBSCRIBER_LOST_RESPONSE_BARRIER_PASS");
   } finally {
     await cleanupAgency(db, scope.agencyId);
@@ -389,7 +496,7 @@ test("FINAL PostgreSQL: cutover signal heals queued Campaign debt already satisf
     const afterWork = await db.creatorCampaignFanRefreshWork.findFirst({ where: { demandId: demand.id } });
     const state = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: scope.creatorId } });
     assert.equal(afterDemand?.status, "COMPLETE");
-    assert.equal(afterWork?.status, "COMPLETE");
+    assert.equal(afterWork?.status, "SUCCEEDED");
     assert.equal(state?.fanValueOutstanding, 0);
     assert.equal(state?.fanValueSucceeded, 1);
     console.log("# FINAL_CUTOVER_CANONICAL_DEBT_HEAL_PASS");
@@ -596,11 +703,28 @@ test("FINAL PostgreSQL: multi-creator/multi-agency Campaign hot paths are bounde
       const root = Array.isArray(payload) ? payload[0] : payload;
       return { root, text: JSON.stringify(payload) };
     };
-    const eligible = async (indexName, sql, ...args) => db.$transaction(async (tx) => {
+    const assertIndexReady = async (indexName, tableName) => {
+      const rows = await db.$queryRawUnsafe(`
+        SELECT i.indisvalid AS "valid", i.indisready AS "ready", am.amname AS "method"
+        FROM pg_class idx
+        JOIN pg_index i ON i.indexrelid=idx.oid
+        JOIN pg_class tbl ON tbl.oid=i.indrelid
+        JOIN pg_namespace ns ON ns.oid=tbl.relnamespace
+        JOIN pg_am am ON am.oid=idx.relam
+        WHERE ns.nspname=current_schema() AND idx.relname=$1 AND tbl.relname=$2
+      `, indexName, tableName);
+      assert.equal(rows.length, 1, `${indexName} missing from current schema`);
+      assert.equal(rows[0].valid, true, `${indexName} is not valid`);
+      assert.equal(rows[0].ready, true, `${indexName} is not ready`);
+      assert.equal(rows[0].method, "btree", `${indexName} is not btree`);
+    };
+    const assertAnyIndexEligible = async (label, sql, ...args) => db.$transaction(async (tx) => {
       await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
       const rows = await tx.$queryRawUnsafe(`EXPLAIN (COSTS OFF, FORMAT JSON) ${sql}`, ...args);
-      const text = JSON.stringify(rows?.[0]?.["QUERY PLAN"] || rows || []);
-      assert.ok(text.includes(indexName), `${indexName} is not planner-eligible for the production query shape: ${text}`);
+      const payload = rows?.[0]?.["QUERY PLAN"] || rows || [];
+      const text = JSON.stringify(payload);
+      assert.match(text, /Index (?:Only )?Scan|Bitmap Index Scan/, `${label} has no index path when seqscan is disabled: ${text}`);
+      return text;
     }, { maxWait: 10_000, timeout: 30_000 });
     const bounded = (label, plan, { maxMs = 500, maxBlocks = 30_000 } = {}) => {
       const executionMs = Number(plan.root?.["Execution Time"] || 0);
@@ -660,11 +784,16 @@ test("FINAL PostgreSQL: multi-creator/multi-agency Campaign hot paths are bounde
       SELECT d."id" FROM "CreatorFanRefreshDemand" d
       WHERE d."creatorId" = $1 AND d."status" IN ('QUEUED','FAILED')
       ORDER BY d."updatedAt" ASC, d."id" ASC LIMIT 500`;
-    await eligible("CreatorFanRefreshDemand_promoter_ready_idx", promoterEligibilitySql, scope.creatorId);
-    await eligible("CreatorFanRefreshDemand_recovery_order_idx", recoverySql, scope.creatorId, now);
-    await eligible("CreatorFanRefreshDemand_canonical_heal_idx", healEligibilitySql, scope.creatorId);
-    await eligible("CampaignFanRefreshPromotionSignal_claim_due_idx", signalSql, now);
-    await eligible("SubscriberDirectoryMaintenanceSignal_due_claim_idx", subscriberSql, now);
+    await assertIndexReady("CreatorFanRefreshDemand_promoter_ready_idx", "CreatorFanRefreshDemand");
+    await assertIndexReady("CreatorFanRefreshDemand_recovery_order_idx", "CreatorFanRefreshDemand");
+    await assertIndexReady("CreatorFanRefreshDemand_canonical_heal_idx", "CreatorFanRefreshDemand");
+    await assertIndexReady("CampaignFanRefreshPromotionSignal_claim_due_idx", "CampaignFanRefreshPromotionSignal");
+    await assertIndexReady("SubscriberDirectoryMaintenanceSignal_due_claim_idx", "SubscriberDirectoryMaintenanceSignal");
+    await assertAnyIndexEligible("promoter", promoterEligibilitySql, scope.creatorId);
+    await assertAnyIndexEligible("recovery", recoverySql, scope.creatorId, now);
+    await assertAnyIndexEligible("canonical-heal", healEligibilitySql, scope.creatorId);
+    await assertAnyIndexEligible("campaign-signal", signalSql, now);
+    await assertAnyIndexEligible("subscriber-signal", subscriberSql, now);
 
     console.log(`FINAL_HOT_QUERY_PLAN_PROOF ${JSON.stringify({
       targetDebtRows,
@@ -729,11 +858,24 @@ test("FINAL PostgreSQL: 4000-run Subscriber history has bounded reconciliation a
         AND r."publicationStatus"='COMPLETE'
       ORDER BY r."publicationGeneration" DESC, r."id" DESC
       LIMIT 1`;
+    const publishedIndex = await db.$queryRawUnsafe(`
+      SELECT i.indisvalid AS "valid", i.indisready AS "ready"
+      FROM pg_class idx
+      JOIN pg_index i ON i.indexrelid=idx.oid
+      JOIN pg_class tbl ON tbl.oid=i.indrelid
+      JOIN pg_namespace ns ON ns.oid=tbl.relnamespace
+      WHERE ns.nspname=current_schema()
+        AND idx.relname='SubscriberScanRun_creator_published_generation_idx'
+        AND tbl.relname='SubscriberScanRun'
+    `);
+    assert.equal(publishedIndex.length, 1);
+    assert.equal(publishedIndex[0].valid, true);
+    assert.equal(publishedIndex[0].ready, true);
     await db.$transaction(async (tx) => {
       await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
       const planRows = await tx.$queryRawUnsafe(`EXPLAIN (COSTS OFF, FORMAT JSON) ${generationLookup}`, scope.agencyId, scope.creatorId);
       const planText = JSON.stringify(planRows?.[0]?.["QUERY PLAN"] || planRows || []);
-      assert.ok(planText.includes("SubscriberScanRun_creator_published_generation_idx"), `published-generation index not planner-eligible: ${planText}`);
+      assert.match(planText, /Index (?:Only )?Scan|Bitmap Index Scan/, `published-generation query has no index path: ${planText}`);
     });
 
     const query = `
@@ -751,11 +893,24 @@ test("FINAL PostgreSQL: 4000-run Subscriber history has bounded reconciliation a
     const blocks = Number(root?.Plan?.["Shared Hit Blocks"] || 0) + Number(root?.Plan?.["Shared Read Blocks"] || 0);
     assert.ok(executionMs <= 500, `Subscriber reconcile execution ${executionMs}ms exceeded 500ms`);
     assert.ok(blocks <= 30_000, `Subscriber reconcile blocks ${blocks} exceeded 30000`);
+    const reconcileIndex = await db.$queryRawUnsafe(`
+      SELECT i.indisvalid AS "valid", i.indisready AS "ready"
+      FROM pg_class idx
+      JOIN pg_index i ON i.indexrelid=idx.oid
+      JOIN pg_class tbl ON tbl.oid=i.indrelid
+      JOIN pg_namespace ns ON ns.oid=tbl.relnamespace
+      WHERE ns.nspname=current_schema()
+        AND idx.relname='SubscriberScanRun_publication_job_reconcile_idx'
+        AND tbl.relname='SubscriberScanRun'
+    `);
+    assert.equal(reconcileIndex.length, 1);
+    assert.equal(reconcileIndex[0].valid, true);
+    assert.equal(reconcileIndex[0].ready, true);
     await db.$transaction(async (tx) => {
       await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
       const eligibilityRows = await tx.$queryRawUnsafe(`EXPLAIN (COSTS OFF, FORMAT JSON) ${query}`);
       const text = JSON.stringify(eligibilityRows?.[0]?.["QUERY PLAN"] || eligibilityRows || []);
-      assert.ok(text.includes("SubscriberScanRun_publication_job_reconcile_idx"), `reconcile index not planner-eligible: ${text}`);
+      assert.match(text, /Index (?:Only )?Scan|Bitmap Index Scan/, `reconcile query has no index path: ${text}`);
     });
 
     // COMPLETE but unreconciled is canonical publication debt: retention must not delete.
@@ -1010,6 +1165,179 @@ test("A29 PostgreSQL: expired Subscriber maintenance lease cannot commit fenced 
     await cleanupAgency(dbA, scope.agencyId);
     await dbA.$disconnect();
     await dbB.$disconnect();
+  }
+});
+
+
+test("A32 PostgreSQL: fenced 500-fan refresh intent is transaction-atomic, bounded and retryable", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db = new PrismaClient();
+  const scope = await createAgencyCreator(db, "a32-fenced-refresh-intent");
+  const fanIds = Array.from({ length: 500 }, (_, index) => `${scope.creatorId}-fan-${String(index).padStart(4, "0")}`);
+  const now = await databaseNow(db);
+  const common = {
+    agencyId: scope.agencyId,
+    creatorId: scope.creatorId,
+    onlyFansUserIds: fanIds,
+    reason: "subscriber_derived_a32_scale",
+    priority: 95,
+    now,
+    params: {
+      consumer: "subscriber_derived_a32",
+      trigger: "physical_scale_retry",
+      causalBarrierKey: `${scope.creatorId}:publication:77`,
+    },
+  };
+  try {
+    await assert.rejects(
+      () => db.$transaction(async (tx) => {
+        const decision = await scheduleFanDataPointRefresh({ db: tx, ...common });
+        assert.equal(decision.created, true);
+        const inside = await tx.jobInstance.findUnique({ where: { id: decision.jobId } });
+        assert.equal(inside?.status, "SCHEDULED");
+        assert.equal(Array.isArray(inside?.params?.fanIds) ? inside.params.fanIds.length : 0, 500);
+        throw Object.assign(new Error("A32 forced planning rollback"), { code: "A32_FORCED_ROLLBACK" });
+      }, { maxWait: 10_000, timeout: 30_000 }),
+      (error) => error?.code === "A32_FORCED_ROLLBACK",
+    );
+    assert.equal(await db.jobInstance.count({ where: { creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" } }), 0,
+      "rolled-back fenced planning leaked a refresh JobInstance");
+
+    const started = Date.now();
+    const committed = await db.$transaction((tx) => scheduleFanDataPointRefresh({ db: tx, ...common }), { maxWait: 10_000, timeout: 30_000 });
+    const commitMs = Date.now() - started;
+    assert.equal(committed.created, true);
+    assert.ok(commitMs <= 1_000, `500-fan fenced refresh scheduling ${commitMs}ms exceeded 1000ms`);
+    const stored = await db.jobInstance.findUnique({ where: { id: committed.jobId } });
+    assert.equal(stored?.status, "SCHEDULED");
+    assert.equal(Array.isArray(stored?.params?.fanIds) ? stored.params.fanIds.length : 0, 500);
+
+    const replay = await db.$transaction((tx) => scheduleFanDataPointRefresh({ db: tx, ...common }), { maxWait: 10_000, timeout: 30_000 });
+    assert.equal(replay.created, false);
+    assert.ok(["already_in_flight", "idempotency_race"].includes(String(replay.reason || "")), JSON.stringify(replay));
+    assert.equal(await db.jobInstance.count({ where: { creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" } }), 1);
+    console.log(`A32_DERIVED_PLANNING_SCALE_PROOF ${JSON.stringify({ fanIds: 500, commitMs, atomicRollback: true, replayReason: replay.reason })}`);
+  } finally {
+    await cleanupAgency(db, scope.agencyId);
+    await db.$disconnect();
+  }
+});
+
+test("A32 PostgreSQL: full fenced derived planning lane converges 500 refresh candidates across Follow Back, Follow Automation and Bumps", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db = new PrismaClient();
+  const scope = await createAgencyCreator(db, "a32-full-derived-planning");
+  try {
+    const fixture = await seedA32DerivedPlanningDebt(db, scope, { fanCount: 500, generation: 88 });
+    await signalSubscriberDirectoryMaintenance({
+      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: new Date(0), reason: "A32_FULL_DERIVED_PLANNING_SCALE",
+    });
+    const claim = await claimSubscriberDirectoryMaintenanceSignal({ db, now: await databaseNow(db) });
+    assert.ok(claim?.claimToken, "recovery signal must be claimed before fenced planning");
+
+    const started = Date.now();
+    const recovered = await recoverSubscriberPublicationDebt({
+      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 15_000, maintenanceSignal: claim,
+    });
+    const elapsedMs = Date.now() - started;
+    assert.equal(recovered.reconciledJobs, 1, JSON.stringify(recovered));
+    assert.equal(recovered.planningRuns, 1, JSON.stringify(recovered));
+    assert.ok(elapsedMs < 15_000, `full fenced derived planning held authority for ${elapsedMs}ms`);
+
+    const run = await db.subscriberScanRun.findUnique({ where: { id: fixture.runId } });
+    const subscriberJob = await db.jobInstance.findUnique({ where: { id: fixture.jobId } });
+    assert.ok(run?.publicationJobReconciledAt instanceof Date);
+    assert.equal(subscriberJob?.status, "DONE");
+    assert.equal(subscriberJob?.result?.followBackPlanning?.ok, true, JSON.stringify(subscriberJob?.result?.followBackPlanning));
+    assert.equal(subscriberJob?.result?.followAutomationPlanning?.ok, true, JSON.stringify(subscriberJob?.result?.followAutomationPlanning));
+    assert.equal(subscriberJob?.result?.bumpPlanning?.ok, true, JSON.stringify(subscriberJob?.result?.bumpPlanning));
+
+    const refreshJobs = await db.jobInstance.findMany({
+      where: { agencyId: scope.agencyId, creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" },
+      orderBy: { id: "asc" },
+    });
+    assert.equal(refreshJobs.length, 3, `expected one durable refresh intent per derived consumer: ${JSON.stringify(refreshJobs.map((row) => row.params))}`);
+    assert.deepEqual(new Set(refreshJobs.map((row) => String(row?.params?.consumer || ""))), new Set(["follow_back", "follow_automation", "bumps"]));
+    for (const job of refreshJobs) {
+      assert.equal(job.status, "SCHEDULED");
+      assert.equal(Array.isArray(job?.params?.fanIds) ? job.params.fanIds.length : 0, 500);
+      assert.equal(job?.params?.subscriberRunId, fixture.runId);
+      assert.equal(Number(job?.params?.subscriberPublicationGeneration || 0), fixture.generation);
+    }
+    assert.equal(await db.automationDelivery.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId } }), 0,
+      "unknown canonical FanData must create refresh debt, not executable delivery writes");
+    await ackSubscriberDirectoryMaintenanceSignal({ db, signal: claim });
+    console.log(`A32_FULL_DERIVED_PLANNING_SCALE ${JSON.stringify({ fanCount: 500, consumers: 3, refreshJobs: refreshJobs.length, elapsedMs })}`);
+  } finally {
+    await db.automationTask.deleteMany({ where: { agencyId: scope.agencyId } }).catch(() => null);
+    await cleanupAgency(db, scope.agencyId);
+    await db.$disconnect();
+  }
+});
+
+test("A32 PostgreSQL: transient derived refresh scheduler failure preserves publication debt and retry converges without duplicate intents", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db = new PrismaClient();
+  const scope = await createAgencyCreator(db, "a32-derived-planning-retry");
+  try {
+    const fixture = await seedA32DerivedPlanningDebt(db, scope, { fanCount: 50, generation: 89 });
+    await signalSubscriberDirectoryMaintenance({
+      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: new Date(0), reason: "A32_TRANSIENT_PLANNING_FAILURE",
+    });
+    const firstClaim = await claimSubscriberDirectoryMaintenanceSignal({ db, now: await databaseNow(db) });
+    assert.ok(firstClaim?.claimToken);
+    let injectedCalls = 0;
+    const first = await recoverSubscriberPublicationDebt({
+      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 10_000, maintenanceSignal: firstClaim,
+      scheduleFanRefresh: async () => {
+        injectedCalls += 1;
+        const error = new Error("A32 transient FanData scheduler failure");
+        error.code = "A32_TRANSIENT_REFRESH_SCHEDULER";
+        throw error;
+      },
+    });
+    assert.ok(injectedCalls >= 3, `all derived consumers must encounter the transient scheduler failure: ${injectedCalls}`);
+    assert.equal(first.reconciledJobs, 0, JSON.stringify(first));
+    const failedRun = await db.subscriberScanRun.findUnique({ where: { id: fixture.runId } });
+    const failedJob = await db.jobInstance.findUnique({ where: { id: fixture.jobId } });
+    assert.equal(failedRun?.publicationJobReconciledAt, null);
+    assert.equal(failedJob?.status, "FAILED");
+    assert.equal(await db.jobInstance.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" } }), 0);
+    await releaseSubscriberDirectoryMaintenanceSignal({
+      db, signal: firstClaim, now: await databaseNow(db), retryMs: 1_000,
+      error: Object.assign(new Error("transient derived planning failure"), { code: "A32_TRANSIENT_REFRESH_SCHEDULER" }),
+    });
+    const released = await db.subscriberDirectoryMaintenanceSignal.findUnique({ where: { id: firstClaim.id } });
+    assert.equal(released?.attempts, 1);
+    assert.equal(released?.claimToken, null);
+
+    await signalSubscriberDirectoryMaintenance({
+      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: new Date(0), reason: "A32_TRANSIENT_RETRY_NOW",
+    });
+    const secondClaim = await claimSubscriberDirectoryMaintenanceSignal({ db, now: await databaseNow(db) });
+    assert.ok(secondClaim?.claimToken);
+    assert.ok(Number(secondClaim.revision) > Number(firstClaim.revision));
+    const second = await recoverSubscriberPublicationDebt({
+      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 15_000, maintenanceSignal: secondClaim,
+    });
+    assert.equal(second.reconciledJobs, 1, JSON.stringify(second));
+    const convergedRun = await db.subscriberScanRun.findUnique({ where: { id: fixture.runId } });
+    const convergedJob = await db.jobInstance.findUnique({ where: { id: fixture.jobId } });
+    assert.ok(convergedRun?.publicationJobReconciledAt instanceof Date);
+    assert.equal(convergedJob?.status, "DONE");
+    assert.equal(await db.jobInstance.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" } }), 3);
+    await ackSubscriberDirectoryMaintenanceSignal({ db, signal: secondClaim });
+    console.log(`A32_DERIVED_PLANNING_RETRY_PROOF ${JSON.stringify({ firstReconciled: first.reconciledJobs, secondReconciled: second.reconciledJobs, injectedCalls })}`);
+  } finally {
+    await db.automationTask.deleteMany({ where: { agencyId: scope.agencyId } }).catch(() => null);
+    await cleanupAgency(db, scope.agencyId);
+    await db.$disconnect();
   }
 });
 

@@ -1,0 +1,117 @@
+{
+  "version": "A32",
+  "algorithm": "sha256-canonical-json-files-v1",
+  "testCount": 49,
+  "manifestSha256": "a052216b0208cf931d357e49ff588840f8d29f945dc94cb403b086a5a5bda450",
+  "files": [
+    {
+      "file": "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js",
+      "testNames": [
+        "A15 PostgreSQL: current migrations expose capacity debt table and physical A14 fairness fence",
+        "A15 PostgreSQL: ACTIVE fairness orders waiters across two independent Prisma clients"
+      ]
+    },
+    {
+      "file": "src/services/phase3-provider-topology-postgres-int5-9a-16.integration.test.js",
+      "testNames": [
+        "A16 PostgreSQL: topology/control columns and one-shard check constraint are physical"
+      ]
+    },
+    {
+      "file": "src/services/phase3-provider-actual-category-postgres-int5-9a-17.integration.test.js",
+      "testNames": [
+        "A17 PostgreSQL: physical start counters project actual provider categories without an extra usage ledger"
+      ]
+    },
+    {
+      "file": "src/services/phase3-provider-future-debt-postgres-int5-9a-18.integration.test.js",
+      "testNames": [
+        "A18 PostgreSQL: durable background job debt projects typed partial future-debt coverage"
+      ]
+    },
+    {
+      "file": "src/services/phase3-campaign-closure-a19.integration.test.js",
+      "testNames": [
+        "A19 PostgreSQL: Campaign FanData failed-demand recovery columns and indexes are physically installed"
+      ]
+    },
+    {
+      "file": "src/services/phase3-campaign-closure-a20-3.integration.test.js",
+      "testNames": [
+        "A20.3 PostgreSQL: real set-based queue and failed recovery execute with bounded semantics",
+        "A20.3 PostgreSQL: two clients coalesce overlapping queue work and recovery cannot double-transition",
+        "A20.3 PostgreSQL: canonical observation racing failed recovery converges without double decrement"
+      ]
+    },
+    {
+      "file": "src/services/phase3-campaign-closure-a20-4.integration.test.js",
+      "testNames": [
+        "A20.4 PostgreSQL: current canonical generation heals AVAILABLE/UNAVAILABLE while superseded work stays historical-only",
+        "A20.4 PostgreSQL: current-generation counter mismatch rolls back demand/work healing",
+        "A20.4 PostgreSQL: canonical healing executes one real raw SQL round trip for 1/20/500 rows and records timing"
+      ]
+    },
+    {
+      "file": "src/services/phase3-campaign-closure-a20-5.integration.test.js",
+      "testNames": [
+        "A20.5 PostgreSQL: terminal finalize is bounded and exact for 1 demands",
+        "A20.5 PostgreSQL: terminal finalize is bounded and exact for 20 demands",
+        "A20.5 PostgreSQL: terminal finalize is bounded and exact for 50 demands",
+        "A20.5 PostgreSQL: partial 25/50 canonical success plus terminal finalize converges exactly",
+        "A20.7 PostgreSQL: canonical point-refresh projection plus chunk hook is idempotent and bounded",
+        "A20.5 PostgreSQL: current and historical work fail once from one terminal demand",
+        "A20.5 PostgreSQL: retry attempt 4 -> 5 quarantines atomically",
+        "A20.5 PostgreSQL: two replicas terminalizing the same refresh job cannot double-decrement coverage",
+        "A20.5 PostgreSQL: terminal failure racing canonical healing converges to one successful terminal state",
+        "A20.5 PostgreSQL: current counter mismatch rolls back terminal demand/work mutations",
+        "A20.5 PostgreSQL: terminal failure followed by concurrent retry recovery and duplicate failure stays single-transition"
+      ]
+    },
+    {
+      "file": "src/services/phase3-campaign-closure-a20-11.integration.test.js",
+      "testNames": [
+        "A20.11 PostgreSQL: terminal transition and new Campaign generation share Campaign->demand->work->state lock order",
+        "A20.11 PostgreSQL: canonical healing and new Campaign generation cannot form state<->demand deadlock",
+        "A20.11 PostgreSQL: failed-demand recovery and new Campaign generation cannot deadlock"
+      ]
+    },
+    {
+      "file": "src/services/phase3-campaign-closure-a20-12.integration.test.js",
+      "testNames": [
+        "A20.12 PostgreSQL: real mixed ingest (embedded healing + stale enqueue) serializes with terminal refresh",
+        "A20.12 PostgreSQL: real mixed ingest serializes with failed-demand recovery under the same creator authority"
+      ]
+    },
+    {
+      "file": "src/services/phase3-analytics-final-authority-cutover.integration.test.js",
+      "testNames": [
+        "FINAL PostgreSQL: Subscriber canonical publish and point-refresh share one commitFanFacts authority and latest chronology wins",
+        "FINAL PostgreSQL: Subscriber persisted same-generation contradiction fails closed under shared canonical authority",
+        "FINAL PostgreSQL: lost final Subscriber response crosses durable fanProjection barrier and publishes idempotently on failure repair",
+        "FINAL PostgreSQL: manual repair and durable maintenance overlap without creator->global lock inversion",
+        "FINAL PostgreSQL: two maintenance replicas claim bounded creator signals without duplicate processing",
+        "FINAL PostgreSQL: cutover signal heals queued Campaign debt already satisfied by canonical FanData",
+        "FINAL PostgreSQL: Subscriber NOT_FETCHED cannot overwrite AVAILABLE canonical value or satisfy active Campaign debt",
+        "FINAL PostgreSQL: concurrent Subscriber pages serialize on the durable cursor and conflicting replay fails closed",
+        "FINAL PostgreSQL: multi-creator/multi-agency Campaign hot paths are bounded and every intended index is planner-eligible",
+        "FINAL PostgreSQL: 4000-run Subscriber history has bounded reconciliation and retention without cross-creator deletion",
+        "A29 PostgreSQL: generation repair is monotonic and COMPLETE/unreconciled debt blocks scheduling and retention",
+        "A31 PostgreSQL: maintenance lock order is deterministic and never signal-row -> creator",
+        "A31 PostgreSQL: expired real Subscriber recovery cannot mutate generation, run, projections, or jobs",
+        "A29 PostgreSQL: expired Subscriber maintenance lease cannot commit fenced work and takeover/poison requeue are durable",
+        "A32 PostgreSQL: fenced 500-fan refresh intent is transaction-atomic, bounded and retryable",
+        "A32 PostgreSQL: full fenced derived planning lane converges 500 refresh candidates across Follow Back, Follow Automation and Bumps",
+        "A32 PostgreSQL: transient derived refresh scheduler failure preserves publication debt and retry converges without duplicate intents",
+        "A21 PostgreSQL: large cross-run Subscriber history uses the exact runId+id publication cursor index for CURRENT and PREVIOUS",
+        "A21 PostgreSQL: two Subscriber recovery replicas serialize one FAILED publication generation and converge monotonically"
+      ]
+    },
+    {
+      "file": "src/services/phase3-a20-operational-runtime.integration.test.js",
+      "testNames": [
+        "A23 PostgreSQL: proof runtime is operationalized and generation-authorized fixtures cross both DB fences",
+        "A23 PostgreSQL: migrated DB still rejects retired direct Team and Creator writers"
+      ]
+    }
+  ]
+}

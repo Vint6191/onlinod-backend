@@ -1493,7 +1493,15 @@ async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult })
   return { type: "fan_data_point_refresh", ...result };
 }
 
-async function scheduleFanDataPointRefresh({ agencyId, creatorId, onlyFansUserIds = [], reason = "fan_data_point_refresh", priority = 95, now = new Date(), params = {} } = {}) {
+function fanDataPointRefreshDecisionDurable(decision) {
+  if (!decision || typeof decision !== "object") return false;
+  const durableJobId = decision.jobId || decision.job?.id || null;
+  if (decision.created === true) return Boolean(durableJobId);
+  const reason = text(decision.reason, 120);
+  return ["already_in_flight", "recently_done", "idempotency_race"].includes(String(reason || "")) && Boolean(durableJobId);
+}
+
+async function scheduleFanDataPointRefresh({ db = null, agencyId, creatorId, onlyFansUserIds = [], reason = "fan_data_point_refresh", priority = 95, now = new Date(), params = {} } = {}) {
   if (!text(agencyId, 180) || !text(creatorId, 180)) return { created: false, reason: "missing_scope" };
   const ids = [...new Set((onlyFansUserIds || []).map(onlyFansUserId).filter(Boolean))].sort();
   if (ids.length > FAN_DATA_POINT_REFRESH_MAX_FANS) {
@@ -1518,6 +1526,7 @@ async function scheduleFanDataPointRefresh({ agencyId, creatorId, onlyFansUserId
   delete stableParams.scheduledFromObservationAt;
   delete stableParams.reason;
   return ensureSingleJob({
+    ...(db ? { db } : {}),
     jobKey: FAN_DATA_POINT_REFRESH_JOB_KEY,
     creatorId,
     agencyId,
@@ -1598,6 +1607,7 @@ module.exports = {
   projectFanObservationBatch,
   applyFanDataPointRefreshChunk,
   scheduleFanDataPointRefresh,
+  fanDataPointRefreshDecisionDurable,
   readFanCurrent,
   parseAuthorityVersion,
   relationshipFieldAuthority,

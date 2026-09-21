@@ -5,7 +5,7 @@ const prisma = require("../prisma");
 const { projectFollowBackProjectionChunk, staleFollowBackProjectionFans, ensureAutomaticFollowBack } = require("./follow-back-service");
 const { projectFollowAutomationProjectionChunk, staleFollowAutomationProjectionFans, ensureAutomaticFollowAutomation } = require("./follow-automation-service");
 const { ensureAutomaticBumps } = require("./bump-service");
-const { projectSubscriberDirectoryItems, readFanCurrent } = require("./fan-data-authority-service");
+const { projectSubscriberDirectoryItems, readFanCurrent, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
 const { createPlannedJob, publishPlannedJobAvailable } = require("./job-planning-repository");
 const { consumeFanObservationToken } = require("./fan-observation-token-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
@@ -1047,14 +1047,26 @@ async function planSubscriberDerivedAutomation({
   db = prisma,
   source = "subscriber_snapshot_published",
   fencedMaintenance = false,
+  scheduleFanRefresh = null,
 } = {}) {
   if (!run?.agencyId || !run?.creatorId) return {
     followBackPlanning: { ok: false, created: false, reason: "subscriber_run_scope_missing" },
     followAutomationPlanning: { ok: false, created: false, reason: "subscriber_run_scope_missing" },
     bumpPlanning: { ok: false, created: false, reason: "subscriber_run_scope_missing", sources: [] },
   };
+  const refreshScheduler = typeof scheduleFanRefresh === "function" ? scheduleFanRefresh : scheduleFanDataPointRefresh;
   const fencedRefreshScheduler = fencedMaintenance
-    ? async () => ({ ok: true, created: false, reason: "subscriber_maintenance_fenced_deferred" })
+    ? async (input = {}) => refreshScheduler({
+        ...input,
+        db,
+        params: {
+          ...(input?.params && typeof input.params === "object" ? input.params : {}),
+          causalBarrierKey: input?.params?.causalBarrierKey
+            || `subscriber-derived:${run.id}:${Number(run.publicationGeneration || 0)}`,
+          subscriberRunId: run.id,
+          subscriberPublicationGeneration: Number(run.publicationGeneration || 0),
+        },
+      })
     : undefined;
   let followBackPlanning = null;
   let followAutomationPlanning = null;
@@ -1408,6 +1420,7 @@ async function recoverSubscriberPublicationDebt({
   maxRuntimeMs = 5_000,
   beforePlanning = null,
   maintenanceSignal = null,
+  scheduleFanRefresh = null,
 } = {}) {
   const agency = clean(agencyId, 180);
   const creator = clean(creatorId, 180);
@@ -1497,6 +1510,7 @@ async function recoverSubscriberPublicationDebt({
             db: tx,
             source: "subscriber_snapshot_recovered",
             fencedMaintenance: true,
+            scheduleFanRefresh,
           });
           txPlanningRuns = 1;
         }
@@ -1528,6 +1542,7 @@ async function recoverSubscriberPublicationDebt({
           userId: null,
           db,
           source: "subscriber_snapshot_recovered",
+          scheduleFanRefresh,
         });
         planningRuns += 1;
       }
@@ -1819,5 +1834,5 @@ module.exports = {
   getSubscriberDirectoryStatus,
   listHiddenOnline,
   setHiddenOnlineStatus,
-  _test: { publishRun, advanceSubscriberPublication, assertSubscriberPublicationBarrier, publicationTransaction },
+  _test: { publishRun, advanceSubscriberPublication, assertSubscriberPublicationBarrier, publicationTransaction, planSubscriberDerivedAutomation, subscriberDerivedPlanningConverged },
 };

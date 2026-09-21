@@ -57,7 +57,7 @@ test("A31 generation repair and completion work are bounded instead of O(all his
   assert.match(finalPg, /expired real Subscriber recovery cannot mutate generation, run, projections, or jobs/);
 });
 
-test("A31 fixture/proof authority owns full identity lifecycle and emits structured TAP failures with dynamic manifest", () => {
+test("A31/A32 fixture/proof authority owns full identity lifecycle, structured TAP failures and pinned manifest coverage", () => {
   const fixture = source("scripts/audit/phase3-postgres-proof-fixture-authority.js");
   const leak = source("scripts/audit/phase3-a26-fixture-leak-snapshot.js");
   const a2012 = source("src/services/phase3-campaign-closure-a20-12.integration.test.js");
@@ -66,12 +66,15 @@ test("A31 fixture/proof authority owns full identity lifecycle and emits structu
   assert.match(fixture, /creatorAccount\.deleteMany[\s\S]*agency\.deleteMany[\s\S]*user\.deleteMany/);
   assert.match(a2012, /cleanupPhase3PostgresFixtureGraph/);
   assert.doesNotMatch(a2012, /db\.user\.deleteMany/);
-  assert.match(leak, /"User"/);
-  assert.match(leak, /"WorkerDevice"/);
+  assert.match(leak, /tenant_roots/);
+  assert.match(leak, /c\.relname IN \('User', 'WorkerDevice', 'Agency', 'CreatorAccount'\)/);
+  assert.match(leak, /JOIN owned parent ON parent\.oid = fk\.confrelid/);
+  assert.doesNotMatch(leak, /const TABLES = Object\.freeze/);
   assert.match(runner, /parseTapFailures/);
   assert.match(runner, /PHASE3_A31_TAP_FAILURE/);
   assert.match(runner, /testNames/);
-  assert.match(runner, /physical proof TAP manifest drifted/);
+  assert.match(runner, /EXPECTED_PROOF_MANIFEST_FILE/);
+  assert.match(runner, /PHASE3_A32_PROOF_MANIFEST_MISMATCH/);
   assert.doesNotMatch(runner, /EXPECTED_PROOF_TEST_COUNT/);
 });
 

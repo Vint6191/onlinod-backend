@@ -2109,30 +2109,35 @@ router.get("/maintenance/subscriber-signals", async (req, res) => {
 router.post("/maintenance/subscriber-signals/:id/requeue", async (req, res) => {
   try {
     if (!ensureSuperAdmin(req, res)) return;
-    const result = await requeuePoisonedSubscriberMaintenanceSignal({
-      db: prisma,
-      signalId: req.params.id,
-      reason: "ADMIN_BREAK_GLASS_REQUEUE",
-    });
-    if (!result?.requeued) {
-      return res.status(409).json({
-        ok: false,
-        code: "SUBSCRIBER_MAINTENANCE_SIGNAL_NOT_POISONED",
-        error: "Signal is missing or no longer poison-eligible",
+    const result = await prisma.$transaction(async (tx) => {
+      const requeued = await requeuePoisonedSubscriberMaintenanceSignal({
+        db: tx,
+        signalId: req.params.id,
+        reason: "ADMIN_BREAK_GLASS_REQUEUE",
       });
-    }
-    await adminLog(req, {
-      agencyId: result.signal?.agencyId || null,
-      action: "admin.subscriber_maintenance_signal_requeued",
-      targetType: "subscriber_maintenance_signal",
-      targetId: result.signal?.id || req.params.id,
-      before: null,
-      after: { revision: result.signal?.revision || null, dueAt: result.signal?.dueAt || null },
-      reason: "ADMIN_BREAK_GLASS_REQUEUE",
-    });
+      if (!requeued?.requeued) {
+        const error = new Error("Signal is missing or no longer poison-eligible");
+        error.code = "SUBSCRIBER_MAINTENANCE_SIGNAL_NOT_POISONED";
+        error.status = 409;
+        throw error;
+      }
+      await tx.adminActionLog.create({
+        data: {
+          adminUserId: req.admin.id,
+          agencyId: requeued.signal?.agencyId || null,
+          action: "admin.subscriber_maintenance_signal_requeued",
+          targetType: "subscriber_maintenance_signal",
+          targetId: requeued.signal?.id || req.params.id,
+          before: null,
+          after: { revision: requeued.signal?.revision || null, dueAt: requeued.signal?.dueAt || null },
+          reason: "ADMIN_BREAK_GLASS_REQUEUE",
+        },
+      });
+      return requeued;
+    }, { maxWait: 5_000, timeout: 15_000 });
     return res.json({ ok: true, signal: result.signal });
   } catch (err) {
-    return res.status(500).json({
+    return res.status(Number(err?.status) || 500).json({
       ok: false,
       code: err?.code || "SUBSCRIBER_MAINTENANCE_REQUEUE_FAILED",
       error: String(err?.message || err || "Failed").slice(0, 1000),

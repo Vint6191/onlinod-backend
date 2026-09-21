@@ -4,7 +4,7 @@ const prisma = require("../prisma");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
-const { projectFanObservationBatch, scheduleFanDataPointRefresh, FAN_DATA_OBSERVATION_BATCH_MAX } = require("./fan-data-authority-service");
+const { projectFanObservationBatch, scheduleFanDataPointRefresh, fanDataPointRefreshDecisionDurable, FAN_DATA_OBSERVATION_BATCH_MAX } = require("./fan-data-authority-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { assertSubscriberPublicationIdle, validateSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
@@ -250,12 +250,20 @@ async function scheduleBumpCurrentRefresh({
         ...(refreshFields.length ? { refreshFields: [...new Set(refreshFields.map((value) => clean(value, 80)).filter(Boolean))] } : {}),
       },
     });
-    return { fanIds: refreshFanIds, requested: refreshFanIds.length, decision };
+    const durable = fanDataPointRefreshDecisionDurable(decision);
+    return {
+      fanIds: refreshFanIds,
+      requested: refreshFanIds.length,
+      decision,
+      durable,
+      ...(durable ? {} : { error: `fan_refresh_not_durable:${String(decision?.reason || "unknown")}` }),
+    };
   } catch (error) {
     return {
       fanIds: refreshFanIds,
       requested: refreshFanIds.length,
       decision: null,
+      durable: false,
       error: clean(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
     };
   }
@@ -1115,7 +1123,15 @@ async function planConfiguredBumpSources({
         limit: Math.min(settings.candidateBatchSize, Math.max(1, settings.dailyLimit)),
         manual, db, scheduleFanRefresh,
       });
-      sources.push({ source: candidateSource, ok: true, planned: result.planned || 0, skipped: result.skipped || [] });
+      const refreshDebt = Number(result?.fanRefresh?.requested || 0) > 0 && result?.fanRefresh?.durable !== true;
+      sources.push({
+        source: candidateSource,
+        ok: !refreshDebt,
+        planned: result.planned || 0,
+        skipped: result.skipped || [],
+        ...(result?.fanRefresh ? { fanRefresh: result.fanRefresh } : {}),
+        ...(refreshDebt ? { code: "fan_refresh_debt_not_durable", error: result?.fanRefresh?.error || "fan refresh intent was not durably scheduled" } : {}),
+      });
       planned += Number(result.planned || 0);
     } catch (error) {
       sources.push({ source: candidateSource, ok: false, code: error?.code || "planning_failed", error: String(error?.message || error).slice(0, 500), skipped: [] });

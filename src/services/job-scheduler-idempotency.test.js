@@ -236,3 +236,37 @@ test("stable collection dedupe can recover a terminal job when durable planning 
   assert.equal(recovered.job.status, "SCHEDULED");
   assert.equal(recovered.job.params.collectionGeneration, "generation-b");
 });
+
+test("A32 ensureSingleJob honors an explicit transaction-scoped db instead of escaping to global Prisma", async () => {
+  state.findUnique = async () => { throw new Error("global prisma must not be used"); };
+  state.findMany = async () => { throw new Error("global prisma must not be used"); };
+  state.createMany = async () => { throw new Error("global prisma must not be used"); };
+  let findUniqueCalls = 0;
+  const localDb = {
+    jobInstance: {
+      findUnique: async () => {
+        findUniqueCalls += 1;
+        return findUniqueCalls === 1 ? null : { id: "tx-job", status: "SCHEDULED" };
+      },
+      findMany: async () => [],
+      createMany: async ({ data, skipDuplicates }) => {
+        assert.equal(skipDuplicates, true);
+        assert.equal(data.length, 1);
+        return { count: 1 };
+      },
+      updateMany: async () => ({ count: 1 }),
+    },
+  };
+  const result = await ensureSingleJob({
+    db: localDb,
+    jobKey: "fan_data_point_refresh",
+    creatorId: "creator-a32",
+    agencyId: "agency-a32",
+    params: { rangeKey: "fan-data:a32" },
+    priority: 95,
+    now: new Date("2026-09-21T13:00:00.000Z"),
+    freshnessWindowMs: 120_000,
+  });
+  assert.equal(result.created, true);
+  assert.equal(result.jobId, "tx-job");
+});

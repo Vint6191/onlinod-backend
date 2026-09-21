@@ -35,6 +35,35 @@ const PROOF_TESTS = [
   path.join(ROOT, "src/services/phase3-a20-operational-runtime.integration.test.js"),
 ];
 
+const EXPECTED_PROOF_MANIFEST_FILE = path.join(ROOT, "scripts/audit/phase3-a32-expected-proof-manifest.json");
+
+function canonicalProofManifestJson(files) {
+  return JSON.stringify((Array.isArray(files) ? files : []).map((row) => ({
+    file: String(row?.file || ""),
+    testNames: Array.isArray(row?.testNames) ? row.testNames.map((name) => String(name)) : [],
+  })));
+}
+function loadExpectedProofManifest() {
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(EXPECTED_PROOF_MANIFEST_FILE, "utf8")); }
+  catch (error) { fail(`A32 expected physical proof manifest is unreadable: ${error.message}`); }
+  const files = Array.isArray(parsed?.files) ? parsed.files : [];
+  const expectedFiles = PROOF_TESTS.map((file) => path.relative(ROOT, file));
+  const actualFiles = files.map((row) => String(row?.file || ""));
+  if (JSON.stringify(actualFiles) !== JSON.stringify(expectedFiles)) {
+    fail(`A32 expected physical proof file manifest drifted: expected=${JSON.stringify(expectedFiles)} actual=${JSON.stringify(actualFiles)}`);
+  }
+  const testCount = files.reduce((sum, row) => sum + (Array.isArray(row?.testNames) ? row.testNames.length : 0), 0);
+  if (!Number.isInteger(testCount) || testCount <= 0 || Number(parsed?.testCount) !== testCount) {
+    fail(`A32 expected physical proof count is invalid: declared=${parsed?.testCount} derived=${testCount}`);
+  }
+  const manifestSha256 = crypto.createHash("sha256").update(canonicalProofManifestJson(files)).digest("hex");
+  if (String(parsed?.manifestSha256 || "") !== manifestSha256) {
+    fail(`A32 expected physical proof manifest hash mismatch: declared=${parsed?.manifestSha256 || "<none>"} actual=${manifestSha256}`);
+  }
+  return Object.freeze({ version: String(parsed?.version || "A32"), files, testCount, manifestSha256 });
+}
+
 function fail(message, code = 3) {
   const error = new Error(String(message));
   error.exitCode = Number.isInteger(Number(code)) ? Number(code) : 3;
@@ -134,6 +163,29 @@ function tapTestNames(stdout) {
 function parseTapFailures(stdout) {
   const lines = String(stdout || "").split(/\r?\n/);
   const failures = [];
+  const unquote = (value) => {
+    const text = String(value ?? "").trim();
+    if (text.length >= 2 && ["'", '"', "`"].includes(text[0]) && text[text.length - 1] === text[0]) return text.slice(1, -1);
+    return text;
+  };
+  const property = (block, key) => {
+    const rx = new RegExp(`^\\s+${key}:\\s*(.*)$`);
+    for (let i = 0; i < block.length; i += 1) {
+      const match = block[i].match(rx);
+      if (!match) continue;
+      const raw = String(match[1] || "").trim();
+      if (raw === "|-" || raw === ">-") {
+        const body = [];
+        for (let j = i + 1; j < block.length; j += 1) {
+          if (!/^\s{4,}/.test(block[j])) break;
+          body.push(block[j].replace(/^\s{4}/, ""));
+        }
+        return body.join("\n").trim();
+      }
+      return unquote(raw);
+    }
+    return null;
+  };
   for (let i = 0; i < lines.length; i += 1) {
     const match = lines[i].match(/^not ok\s+(\d+)\s+-\s+(.+)$/);
     if (!match) continue;
@@ -141,40 +193,24 @@ function parseTapFailures(stdout) {
     let j = i + 1;
     for (; j < lines.length; j += 1) {
       const line = lines[j];
-      if (/^(?:ok|not ok)\s+\d+\s+-\s+/.test(line) || /^# Subtest:\s+/.test(line) || /^1\.\.\d+$/.test(line)) break;
+      if (/^(?:ok|not ok)\s+\d+\s+-\s+/.test(line) || /^1\.\.\d+$/.test(line)) break;
       block.push(line);
-      if (/^\s*\.\.\.\s*$/.test(line)) { j += 1; break; }
     }
-    const text = block.join("\n");
-    const scalar = (key) => {
-      const m = text.match(new RegExp(`^\\\\s*${key}:\\\\s*['"]?([^\\\\n'"]+)['"]?\\\\s*$`, "m"));
-      return m ? m[1].trim() : null;
-    };
-    const errorBlock = text.match(/^\s*error:\s*\|-\s*\n((?:\s{4,}.+\n?)*)/m);
-    const error = errorBlock
-      ? errorBlock[1].split(/\r?\n/).map((row) => row.replace(/^\s{4}/, "")).join("\n").trim().slice(0, 2000)
-      : scalar("error");
-    const stackBlock = text.match(/^\s*stack:\s*\|-\s*\n((?:\s{4,}.+\n?)*)/m);
-    const stack = stackBlock
-      ? stackBlock[1].split(/\r?\n/).map((row) => row.replace(/^\s{4}/, "")).slice(0, 12).join("\n").trim()
-      : null;
     const row = {
       number: Number(match[1]),
       name: match[2].trim(),
-      code: scalar("code"),
-      error: error || null,
-      location: scalar("location"),
-      stack: stack || null,
+      code: property(block, "code"),
+      error: property(block, "error") || property(block, "failureType") || "TAP test failed without an error scalar",
+      location: property(block, "location"),
+      stack: property(block, "stack"),
     };
-    const duplicate = failures.some((existing) =>
-      existing.number === row.number && existing.name === row.name
-      && existing.code === row.code && existing.error === row.error
-    );
+    const duplicate = failures.some((existing) => existing.number === row.number && existing.name === row.name);
     if (!duplicate) failures.push(row);
     i = Math.max(i, j - 1);
   }
   return failures;
 }
+
 function parseJsonLines(stdout, marker) {
   const rows = [];
   for (const line of String(stdout || "").split(/\r?\n/)) {
@@ -299,6 +335,8 @@ function leakDiff(before, after) {
   }));
 }
 function runProofTests(label, databaseUrl) {
+  const expectedManifest = loadExpectedProofManifest();
+  const expectedByFile = new Map(expectedManifest.files.map((row) => [String(row.file), row]));
   const aggregate = [];
   const fileResults = [];
   let durationMs = 0;
@@ -317,13 +355,28 @@ function runProofTests(label, databaseUrl) {
     };
     const testNames = tapTestNames(out.stdout);
     const tapFailures = parseTapFailures(out.stdout);
+    const relativeFile = path.relative(ROOT, file);
+    const expectedFile = expectedByFile.get(relativeFile) || null;
+    const manifestOk = Boolean(expectedFile)
+      && Number(fileSummary.tests) === Number(expectedFile.testNames.length)
+      && JSON.stringify(testNames) === JSON.stringify(expectedFile.testNames);
+    if (!manifestOk) {
+      tapFailures.push({
+        number: 0,
+        name: "A32 pinned physical proof manifest mismatch",
+        code: "PHASE3_A32_PROOF_MANIFEST_MISMATCH",
+        error: `expected=${JSON.stringify(expectedFile?.testNames || null)} actual=${JSON.stringify(testNames)}`,
+        location: relativeFile,
+        stack: null,
+      });
+    }
     for (const key of Object.keys(summary)) summary[key] += Number(fileSummary[key] || 0);
     durationMs += out.durationMs;
     aggregate.push(out.stdout || "");
-    const ok = !out.failed && leaks.length === 0 && fileSummary.fail === 0 && fileSummary.skipped === 0;
+    const ok = !out.failed && manifestOk && leaks.length === 0 && fileSummary.fail === 0 && fileSummary.skipped === 0;
     const firstError = tapFailures[0] || (out.digest ? { error: out.digest.split(/\r?\n/).slice(0, 16).join("\n") } : null);
     const result = {
-      file: path.relative(ROOT, file), ok, status: out.status, ...fileSummary,
+      file: relativeFile, ok, status: out.status, ...fileSummary, manifestOk,
       testNames, tapFailures, leaks, log: out.log, firstError,
     };
     fileResults.push(result);
@@ -342,16 +395,32 @@ function runProofTests(label, databaseUrl) {
   const stdout = aggregate.join("\n");
   let authority = null;
   let assertionError = null;
-  try { authority = assertNodeProof(stdout, label, summary); }
-  catch (error) { assertionError = error; }
+  if (Number(summary.tests) !== Number(expectedManifest.testCount)) {
+    assertionError = new Error(`${label} registered ${summary.tests} physical tests; pinned A32 manifest requires ${expectedManifest.testCount}`);
+    assertionError.code = "PHASE3_A32_PROOF_TEST_COUNT_MISMATCH";
+  } else {
+    try { authority = assertNodeProof(stdout, label, summary); }
+    catch (error) { assertionError = error; }
+  }
   const badFiles = fileResults.filter((row) => !row.ok);
+  const partialProof = {
+    durationMs,
+    tests: summary.tests,
+    pass: summary.pass,
+    fail: summary.fail,
+    skipped: summary.skipped,
+    manifestSha256: expectedManifest.manifestSha256,
+    expectedTests: expectedManifest.testCount,
+    files: fileResults,
+  };
   if (assertionError || badFiles.length) {
     const error = assertionError || new Error(`${label} has ${badFiles.length} failing/leaking proof files`);
     error.proofFiles = fileResults;
     error.summary = summary;
+    error.proof = partialProof;
     throw error;
   }
-  const proof = { durationMs, ...authority, files: fileResults };
+  const proof = { durationMs, ...authority, manifestSha256: expectedManifest.manifestSha256, expectedTests: expectedManifest.testCount, files: fileResults };
   console.log(`# PHASE3_A20_NODE_PROOF_PASS ${JSON.stringify({ label, tests: proof.tests, pass: proof.pass, fail: proof.fail, skipped: proof.skipped, durationMs: Math.round(durationMs * 100) / 100 })}`);
   return proof;
 }
@@ -433,6 +502,7 @@ function main() {
       stack: String(error?.stack || "").split(/\r?\n/).slice(0, 80).join("\n"),
       summary: error?.summary || null,
       proofFiles: Array.isArray(error?.proofFiles) ? error.proofFiles : null,
+      proof: error?.proof || null,
     };
   }
   function scenario(name, work) {
@@ -443,7 +513,7 @@ function main() {
     } catch (error) {
       const failure = { scenario: name, ...serializeError(error) };
       failures.push(failure);
-      scenarios[name] = { ok: false, failure };
+      scenarios[name] = { ok: false, failure, proof: failure.proof || null };
       console.error(`# PHASE3_A26_SCENARIO_FAIL ${JSON.stringify({ scenario: name, message: failure.message, code: failure.code, exitCode: failure.exitCode })}`);
       return null;
     }
@@ -522,22 +592,19 @@ function main() {
 
   for (const row of cleanup) if (!row.ok) failures.push({ scenario: "cleanup", message: `schema cleanup failed for ${row.schema}`, cleanup: row });
 
-  const successfulProofs = Object.entries(scenarios)
-    .filter(([, row]) => row?.ok && row?.proof)
+  const expectedManifest = loadExpectedProofManifest();
+  const scenarioProofs = Object.entries(scenarios)
+    .filter(([, row]) => row?.proof)
     .map(([name, row]) => ({ name, proof: row.proof }));
-  if (successfulProofs.length > 1) {
-    const canonical = successfulProofs[0];
-    const canonicalManifest = canonical.proof.files.map((row) => ({ file: row.file, tests: row.tests, testNames: row.testNames }));
-    for (const candidate of successfulProofs.slice(1)) {
-      const manifest = candidate.proof.files.map((row) => ({ file: row.file, tests: row.tests, testNames: row.testNames }));
-      if (JSON.stringify(manifest) !== JSON.stringify(canonicalManifest)) {
-        failures.push({
-          scenario: candidate.name,
-          message: `physical proof TAP manifest drifted from ${canonical.name}`,
-          canonicalManifest,
-          actualManifest: manifest,
-        });
-      }
+  for (const candidate of scenarioProofs) {
+    const manifest = candidate.proof.files.map((row) => ({ file: row.file, testNames: row.testNames }));
+    if (canonicalProofManifestJson(manifest) !== canonicalProofManifestJson(expectedManifest.files)) {
+      failures.push({
+        scenario: candidate.name,
+        message: "physical proof TAP manifest drifted from pinned A32 authority",
+        expectedManifestSha256: expectedManifest.manifestSha256,
+        actualManifest: manifest,
+      });
     }
   }
 
@@ -547,7 +614,10 @@ function main() {
     cleanSchema, rollingSchema, seededRollingSchema,
     a13Cutoff: A13_CUTOFF,
     preA20_2Cutoff: PRE_A20_2_CUTOFF,
-    proofTestsPerScenario: scenarios["clean-current"]?.proof?.tests ?? null,
+    expectedProofManifestSha256: expectedManifest.manifestSha256,
+    expectedProofTestsPerScenario: expectedManifest.testCount,
+    expectedProofTestsTotal: expectedManifest.testCount * 3,
+    proofTestsPerScenario: Object.fromEntries(Object.entries(scenarios).map(([name, row]) => [name, row?.proof?.tests ?? null])),
     proofTestsTotal: Object.values(scenarios).reduce((sum, row) => sum + Number(row?.proof?.tests || 0), 0),
     scenarios,
     cleanup: cleanup.map(({ stdout, stderr, ...row }) => row),
@@ -564,11 +634,20 @@ function main() {
   if (!fs.existsSync(failureOutput) || fs.statSync(failureOutput).size <= 0) fail("physical proof failure manifest was not persisted");
   console.log(`# PHASE3_A26_POSTGRES_PROOF_FILE ${resolved}`);
   console.log(`# PHASE3_A26_FAILURE_MANIFEST ${failureOutput}`);
-  const scenarioTotals = Object.fromEntries(Object.entries(scenarios).map(([name, row]) => [name, row?.ok
-    ? { ok: true, tests: row?.proof?.tests ?? null, pass: row?.proof?.pass ?? null, fail: row?.proof?.fail ?? null, skipped: row?.proof?.skipped ?? null }
-    : { ok: false, message: row?.failure?.message || null, exitCode: row?.failure?.exitCode || null }]));
+  const scenarioTotals = Object.fromEntries(Object.entries(scenarios).map(([name, row]) => [name, {
+    ok: row?.ok === true,
+    tests: row?.proof?.tests ?? null,
+    pass: row?.proof?.pass ?? null,
+    fail: row?.proof?.fail ?? null,
+    skipped: row?.proof?.skipped ?? null,
+    message: row?.failure?.message || null,
+    exitCode: row?.failure?.exitCode || null,
+  }]));
   console.log(`# PHASE3_A26_POSTGRES_PROOF_JSON ${JSON.stringify({
     version: proof.version, ok: proof.ok,
+    expectedProofManifestSha256: proof.expectedProofManifestSha256,
+    expectedProofTestsPerScenario: proof.expectedProofTestsPerScenario,
+    expectedProofTestsTotal: proof.expectedProofTestsTotal,
     proofTestsPerScenario: proof.proofTestsPerScenario,
     proofTestsTotal: proof.proofTestsTotal,
     scenarioTotals, failureCount: failures.length,

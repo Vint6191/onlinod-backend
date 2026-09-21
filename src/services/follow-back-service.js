@@ -15,7 +15,7 @@ const {
 } = require("./automation-control-service");
 const { listActionDeliveries, retryActionDelivery } = require("./automation-action-delivery-service");
 const { evaluateCandidate } = require("./follow-back-rules");
-const { readFanCurrent, scheduleFanDataPointRefresh } = require("./fan-data-authority-service");
+const { readFanCurrent, scheduleFanDataPointRefresh, fanDataPointRefreshDecisionDurable } = require("./fan-data-authority-service");
 const { assertSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
 const {
   readFanCurrentMap,
@@ -390,12 +390,20 @@ async function scheduleFollowBackCurrentRefresh({
         ...(refreshFields.length ? { refreshFields: [...new Set(refreshFields.map((value) => clean(value, 80)).filter(Boolean))] } : {}),
       },
     });
-    return { fanIds: refreshFanIds, requested: refreshFanIds.length, decision };
+    const durable = fanDataPointRefreshDecisionDurable(decision);
+    return {
+      fanIds: refreshFanIds,
+      requested: refreshFanIds.length,
+      decision,
+      durable,
+      ...(durable ? {} : { error: `fan_refresh_not_durable:${String(decision?.reason || "unknown")}` }),
+    };
   } catch (error) {
     return {
       fanIds: refreshFanIds,
       requested: refreshFanIds.length,
       decision: null,
+      durable: false,
       error: clean(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
     };
   }
@@ -431,7 +439,13 @@ async function ensureAutomaticFollowBack({ agencyId, creatorId, source = "recurr
   });
   if (!directory?.currentRunId) return { ok: true, created: false, reason: "snapshot_not_ready" };
   const planned = await planFollowBack({ agencyId, creatorId, userId: null, source, priority: 50, db, scheduleFanRefresh });
-  return { ok: true, created: planned.summary.created > 0, reason: planned.summary.created > 0 ? "planned" : "nothing_due", planned };
+  const refreshDebt = Number(planned?.fanRefresh?.requested || 0) > 0 && planned?.fanRefresh?.durable !== true;
+  return {
+    ok: !refreshDebt,
+    created: planned.summary.created > 0,
+    reason: refreshDebt ? "fan_refresh_debt_not_durable" : (planned.summary.created > 0 ? "planned" : "nothing_due"),
+    planned,
+  };
 }
 
 async function retryCandidateDelivery({ agencyId, creatorId, fanId, actorUserId }) {
