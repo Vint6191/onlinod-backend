@@ -18,6 +18,7 @@ const { PrismaClient } = require("@prisma/client");
 
 const ROOT = path.resolve(__dirname, "../..");
 const CHANGED_GATE = path.join(ROOT, "scripts/audit/phase3-a26-changed-js-gate.js");
+const IDENTIFIER_LINT = path.join(ROOT, "scripts/audit/phase3-postgres-identifier-lint.js");
 
 function safeError(error) {
   return {
@@ -40,6 +41,10 @@ function run(command, args, env = process.env) {
 async function main() {
   const primaryUrl = String(process.env.DATABASE_URL || "").trim();
   if (!primaryUrl) throw new Error("DATABASE_URL is required");
+
+  const identifierLint = await run(process.execPath, [IDENTIFIER_LINT]);
+  if (identifierLint.code !== 0) throw Object.assign(new Error(`A31 PostgreSQL identifier lint failed with exit ${identifierLint.code}`), { exitCode: identifierLint.code });
+  console.log(`# PHASE3_A29_RENDER_GATE ${JSON.stringify({ phase: "identifier-lint-pass" })}`);
 
   const changedGate = await run(process.execPath, [CHANGED_GATE]);
   if (changedGate.code !== 0) throw Object.assign(new Error(`A29 changed-JS gate failed with exit ${changedGate.code}`), { exitCode: changedGate.code });

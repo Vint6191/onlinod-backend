@@ -1582,6 +1582,7 @@ async function runCampaignFanRefreshPromotionMaintenance({
   }
   const budgetExhausted = !drained && reservedSlots < max && Date.now() - startedMonotonic >= runtimeBudgetMs;
   return {
+    ok: totals.errors === 0,
     ...totals,
     claimedSlots: reservedSlots,
     concurrency: workerCount,

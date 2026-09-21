@@ -84,7 +84,9 @@ test("A20.11 seeded physical proof models a large current generation and gates i
   assert.match(runner, /ONLINOD_A20_SEED_CURRENT_ROWS/);
   assert.match(runner, /currentGenerationRows/);
   assert.match(runner, /currentRunIndexUsed/);
-  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 44/);
+  assert.doesNotMatch(runner, /EXPECTED_PROOF_TEST_COUNT/);
+  assert.match(runner, /tapTestNames/);
+  assert.match(runner, /physical proof TAP manifest drifted/);
   assert.match(runner, /phase3-campaign-closure-a20-11\.integration\.test\.js/);
   assert.match(runner, /A20_11_PREFLIGHT_RUNTIME_AVAILABILITY_PASS/);
   const availability = source("scripts/audit/phase3-a20-preflight-runtime-availability.js");

@@ -2223,9 +2223,26 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
   analyticsDemandTimer = setInterval(analyticsDemandTick, ANALYTICS_DEMAND_INTERVAL_MS);
 
   const phase2MaintenanceTick = () => {
-    runPhase2MaintenancePump({ db: prisma }).catch((err) => {
-      console.error("[scheduler] Phase2 maintenance pump crashed:", err);
-    });
+    runPhase2MaintenancePump({ db: prisma })
+      .then((result) => {
+        if (result?.ok !== false) return;
+        const degraded = {};
+        for (const [name, lane] of Object.entries(result || {})) {
+          if (!lane || typeof lane !== "object" || lane.ok !== false) continue;
+          degraded[name] = {
+            errors: Number(lane.errors || 0),
+            contended: Number(lane.contended || 0),
+            poisonedSignals: Number(lane.poisonedSignals || 0),
+            errorDetails: Array.isArray(lane.errorDetails) ? lane.errorDetails.slice(0, 5) : [],
+            poisonedSample: Array.isArray(lane.poisonedSample) ? lane.poisonedSample.slice(0, 5) : [],
+            error: lane.error || null,
+          };
+        }
+        console.error(`[scheduler] Phase2 maintenance degraded: ${JSON.stringify(degraded)}`);
+      })
+      .catch((err) => {
+        console.error("[scheduler] Phase2 maintenance pump crashed:", err);
+      });
   };
   if (runImmediately) setTimeout(phase2MaintenanceTick, 5 * 1000);
   phase2MaintenanceTimer = setInterval(phase2MaintenanceTick, PHASE2_MAINTENANCE_PUMP_INTERVAL_MS);

@@ -17,6 +17,7 @@ const REQUIRED_INDEX_SPECS = Object.freeze({
   SubscriberScanRun_publication_recovery_idx: { table: "SubscriberScanRun", keys: [["status"], ["publicationstatus"], ["updatedat"]] },
   SubscriberScanRun_publication_job_reconcile_idx: { table: "SubscriberScanRun", keys: [["updatedat"], ["id"]], predicateTokens: ["publicationjobreconciledat", "publicationstatus", "published", "superseded", "complete"] },
   SubscriberScanRun_creator_publication_generation_idx: { table: "SubscriberScanRun", keys: [["creatorid"], ["publicationgeneration"]] },
+  SubscriberScanRun_creator_published_generation_idx: { table: "SubscriberScanRun", keys: [["agencyid"], ["creatorid"], ["publicationgeneration"], ["id"]], orders: ["ASC", "ASC", "DESC", "DESC"], predicateTokens: ["status", "published", "superseded", "publicationstatus", "complete"] },
   SubscriberScanRun_publication_debt_idx: { table: "SubscriberScanRun", keys: [["agencyid"], ["creatorid"], ["updatedat"], ["id"]], predicateTokens: ["fanprojectionstatus", "publicationstatus", "hasmore", "complete", "pending", "current", "previous", "finalize"] },
   SubscriberScanRun_retention_eligible_idx: { table: "SubscriberScanRun", keys: [["creatorid"], ["createdat"], ["id"]], orders: ["ASC", "DESC", "ASC"], predicateTokens: ["publicationstatus", "complete", "superseded", "failed"] },
   SubscriberScanRun_creator_reconcile_idx: { table: "SubscriberScanRun", keys: [["creatorid"], ["updatedat"], ["id"]], predicateTokens: ["publicationjobreconciledat", "publicationstatus", "published", "superseded", "complete"] },

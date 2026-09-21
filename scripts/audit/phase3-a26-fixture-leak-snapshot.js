@@ -4,6 +4,10 @@
 const prisma = require("../../src/prisma");
 
 const TABLES = Object.freeze([
+  "User",
+  "WorkerDevice",
+  "AgencyMember",
+  "DeviceCreatorBinding",
   "Agency",
   "CreatorAccount",
   "JobInstance",

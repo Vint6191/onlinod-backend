@@ -228,7 +228,9 @@ test("final Subscriber publication is bounded at 500, durable across restart, an
     assert.ok(changedAfterFirstChunk >= 0);
 
     fx.clearFailure();
-    const summary = await service._test.publishRun(fx.db, fx.run, { jobId: "job-1", scanEveryDays: 7 });
+    const publication = await service._test.publishRun(fx.db, fx.run, { jobId: "job-1", scanEveryDays: 7 });
+    assert.equal(publication.complete, true);
+    const summary = publication.summary;
     assert.equal(fx.run.status, "PUBLISHED");
     assert.equal(fx.run.publicationStatus, "COMPLETE");
     assert.equal(summary.totalCount, 1200);
@@ -509,7 +511,9 @@ test("A21 Subscriber publication resumes cleanly after a process boundary at eve
         `expected process boundary at publication transaction ${failAt}`,
       );
       fx.clearFailure();
-      const summary = await service._test.publishRun(fx.db, fx.run, { jobId: "job-1", scanEveryDays: 7 });
+      const publication = await service._test.publishRun(fx.db, fx.run, { jobId: "job-1", scanEveryDays: 7 });
+      assert.equal(publication.complete, true, `failAt=${failAt}`);
+      const summary = publication.summary;
       assert.equal(fx.run.status, "PUBLISHED", `failAt=${failAt}`);
       assert.equal(fx.run.publicationStatus, "COMPLETE", `failAt=${failAt}`);
       assert.equal(fx.state.currentRunId, "run-current", `failAt=${failAt}`);

@@ -9,9 +9,10 @@ const {
   SUBSCRIBER_MAINTENANCE_KIND,
   signalSubscriberDirectoryMaintenance,
   claimSubscriberDirectoryMaintenanceSignal,
-  withSubscriberMaintenanceClaimFence,
   ackSubscriberDirectoryMaintenanceSignal,
   releaseSubscriberDirectoryMaintenanceSignal,
+  countPoisonedSubscriberMaintenanceSignals,
+  listPoisonedSubscriberMaintenanceSignals,
 } = require("./subscriber-directory-maintenance-signal-service");
 
 async function runSubscriberDirectoryMaintenance({
@@ -47,26 +48,28 @@ async function runSubscriberDirectoryMaintenance({
   let drained = false;
 
   async function processRecovery(signal, remainingMs) {
-    const result = await recoverSubscriberPublicationDebt({
-      db,
-      agencyId: signal.agencyId,
-      creatorId: signal.creatorId,
-      now,
-      maxRuns: 4,
-      maxStepsPerRun: recoveryStepsPerRun,
-      maxRuntimeMs: Math.max(500, Math.min(remainingMs, 4_000)),
-      maintenanceSignal: signal,
-    });
+    let result;
+    try {
+      result = await recoverSubscriberPublicationDebt({
+        db,
+        agencyId: signal.agencyId,
+        creatorId: signal.creatorId,
+        now,
+        maxRuns: 4,
+        maxStepsPerRun: recoveryStepsPerRun,
+        maxRuntimeMs: Math.max(500, Math.min(remainingMs, 4_000)),
+        maintenanceSignal: signal,
+      });
+    } catch (error) {
+      if (error?.code === "SUBSCRIBER_MAINTENANCE_CLAIM_STALE") {
+        totals.contended += 1;
+        return;
+      }
+      throw error;
+    }
     totals.recoveredRuns += Number(result?.recoveredRuns || 0);
     totals.reconciledJobs += Number(result?.reconciledJobs || 0);
     totals.stateRepairs += Number(result?.stateRepairs || 0);
-    if (result?.staleClaim) {
-      await releaseSubscriberDirectoryMaintenanceSignal({
-        db, signal, now, retryMs: 1_000, error: "claim_stale_or_expired",
-      });
-      totals.contended += 1;
-      return;
-    }
     const debtRemains = await hasSubscriberPublicationDebt({ db, agencyId: signal.agencyId, creatorId: signal.creatorId });
     if (debtRemains || result?.budgetExhausted) {
       await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, retryMs: 2_000, error: result?.budgetExhausted ? "subscriber_recovery_budget_exhausted" : null });
@@ -83,48 +86,40 @@ async function runSubscriberDirectoryMaintenance({
   }
 
   async function processRetention(signal) {
-    const fenced = await withSubscriberMaintenanceClaimFence({
-      db,
-      signal,
-      maxWaitMs: 5_000,
-      timeoutMs: 30_000,
-      work: async (tx) => {
-        const debtRemains = await hasSubscriberPublicationDebt({ db: tx, agencyId: signal.agencyId, creatorId: signal.creatorId });
-        if (debtRemains) {
-          await signalSubscriberDirectoryMaintenance({
-            db: tx,
-            agencyId: signal.agencyId,
-            creatorId: signal.creatorId,
-            kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY,
-            reason: "RETENTION_BLOCKED_BY_PUBLICATION_DEBT",
-          });
-          return { action: "release", retryMs: 30_000, error: "publication_debt" };
-        }
-        const result = await cleanupSubscriberScanHistory({
-          db: tx,
-          agencyId: signal.agencyId,
-          creatorId: signal.creatorId,
-          keep: retentionKeep,
-          maxRuns: retentionBatch,
-        });
-        if (result?.blockedByPublicationDebt) {
-          await signalSubscriberDirectoryMaintenance({
-            db: tx,
-            agencyId: signal.agencyId,
-            creatorId: signal.creatorId,
-            kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY,
-            reason: "RETENTION_RACE_DEBT",
-          });
-          return { action: "release", retryMs: 30_000, error: "publication_debt", result };
-        }
-        return { action: result?.hasMore ? "release" : "ack", retryMs: 1_000, result };
-      },
-    });
-    if (!fenced.current) { totals.contended += 1; return; }
-    const outcome = fenced.result || {};
-    totals.deletedRuns += Number(outcome.result?.deletedRuns || 0);
-    if (outcome.action === "release") {
-      await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, retryMs: outcome.retryMs || 1_000, error: outcome.error || null });
+    let result;
+    try {
+      result = await cleanupSubscriberScanHistory({
+        db,
+        agencyId: signal.agencyId,
+        creatorId: signal.creatorId,
+        keep: retentionKeep,
+        maxRuns: retentionBatch,
+        maintenanceSignal: signal,
+      });
+    } catch (error) {
+      if (error?.code === "SUBSCRIBER_MAINTENANCE_CLAIM_STALE") {
+        totals.contended += 1;
+        return;
+      }
+      throw error;
+    }
+
+    totals.deletedRuns += Number(result?.deletedRuns || 0);
+    if (result?.blockedByPublicationDebt) {
+      await signalSubscriberDirectoryMaintenance({
+        db,
+        agencyId: signal.agencyId,
+        creatorId: signal.creatorId,
+        kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY,
+        reason: "RETENTION_BLOCKED_BY_PUBLICATION_DEBT",
+      });
+      await releaseSubscriberDirectoryMaintenanceSignal({
+        db, signal, now, retryMs: 30_000, error: "publication_debt",
+      });
+      return;
+    }
+    if (result?.hasMore) {
+      await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, retryMs: 1_000 });
       return;
     }
     await ackSubscriberDirectoryMaintenanceSignal({ db, signal });
@@ -199,9 +194,18 @@ async function runSubscriberDirectoryMaintenance({
     ]);
   }
   const budgetExhausted = !drained && Date.now() - started >= budgetMs;
+  const poisonedSignals = await countPoisonedSubscriberMaintenanceSignals({ db });
+  const poisonedSample = poisonedSignals > 0
+    ? await listPoisonedSubscriberMaintenanceSignals({ db, limit: 5 })
+    : [];
   return {
-    ok: totals.errors === 0,
+    ok: totals.errors === 0 && poisonedSignals === 0,
     ...totals,
+    poisonedSignals,
+    poisonedSample: poisonedSample.map((row) => ({
+      id: row.id, agencyId: row.agencyId, creatorId: row.creatorId, kind: row.kind,
+      attempts: row.attempts, dueAt: row.dueAt, lastError: row.lastError,
+    })),
     claimedSlots: reserved,
     concurrency: workerCount,
     budgetExhausted,

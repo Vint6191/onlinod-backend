@@ -12,6 +12,7 @@ let recordSubscriberScanFailure;
 let applySubscriberScanChunk;
 let scheduleSubscriberScan;
 let repairSubscriberDirectoryStateGeneration;
+let recoverSubscriberPublicationDebt;
 let cleanupSubscriberScanHistory;
 let runSubscriberDirectoryMaintenance;
 let signalSubscriberDirectoryMaintenance;
@@ -22,6 +23,7 @@ let withSubscriberMaintenanceClaimFence;
 let listPoisonedSubscriberMaintenanceSignals;
 let requeuePoisonedSubscriberMaintenanceSignal;
 let SUBSCRIBER_MAINTENANCE_KIND;
+let subscriberTest;
 let enqueueUniqueCampaignFanRefreshes;
 let finalizeCampaignFanRefreshJob;
 let repairFailedCampaignFanRefreshDemands;
@@ -35,7 +37,9 @@ if (enabled) {
     applySubscriberScanChunk,
     scheduleSubscriberScan,
     repairSubscriberDirectoryStateGeneration,
+    recoverSubscriberPublicationDebt,
     cleanupSubscriberScanHistory,
+    _test: subscriberTest,
   } = require("./subscriber-directory-service"));
   ({ runSubscriberDirectoryMaintenance } = require("./subscriber-directory-maintenance-service"));
   ({
@@ -704,6 +708,34 @@ test("FINAL PostgreSQL: 4000-run Subscriber history has bounded reconciliation a
       },
     });
     await db.$executeRawUnsafe('ANALYZE "SubscriberScanRun"');
+
+    const generationRepairStarted = Date.now();
+    const generationRepair = await repairSubscriberDirectoryStateGeneration({
+      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
+    });
+    const generationRepairMs = Date.now() - generationRepairStarted;
+    assert.equal(generationRepair.maxGeneration, 4000);
+    assert.equal(generationRepair.maxPublishedGeneration, 4000);
+    assert.ok(generationRepairMs <= 1_000, `Subscriber generation repair ${generationRepairMs}ms exceeded 1000ms`);
+    const repairedState = await db.subscriberDirectoryState.findUnique({ where: { creatorId: scope.creatorId } });
+    assert.equal(repairedState.publicationGeneration, 4000);
+    assert.equal(repairedState.publishedGeneration, 4000);
+
+    const generationLookup = `
+      SELECT r."publicationGeneration"
+      FROM "SubscriberScanRun" r
+      WHERE r."agencyId"=$1 AND r."creatorId"=$2
+        AND r."status" IN ('PUBLISHED','SUPERSEDED')
+        AND r."publicationStatus"='COMPLETE'
+      ORDER BY r."publicationGeneration" DESC, r."id" DESC
+      LIMIT 1`;
+    await db.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
+      const planRows = await tx.$queryRawUnsafe(`EXPLAIN (COSTS OFF, FORMAT JSON) ${generationLookup}`, scope.agencyId, scope.creatorId);
+      const planText = JSON.stringify(planRows?.[0]?.["QUERY PLAN"] || planRows || []);
+      assert.ok(planText.includes("SubscriberScanRun_creator_published_generation_idx"), `published-generation index not planner-eligible: ${planText}`);
+    });
+
     const query = `
       SELECT r."id"
       FROM "SubscriberScanRun" r
@@ -739,7 +771,10 @@ test("FINAL PostgreSQL: 4000-run Subscriber history has bounded reconciliation a
     assert.equal(retained.blockedByPublicationDebt, false);
     assert.ok(retained.deletedRuns > 0 && retained.deletedRuns <= 50);
     assert.equal(await db.subscriberScanRun.count({ where: { creatorId: sibling.creatorId } }), 1, "retention crossed creator boundary");
-    console.log(`FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF ${JSON.stringify({ historyRows: 4000, debtRows: 200, executionMs, blocks, deletedRuns: retained.deletedRuns })}`);
+    console.log(`FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF ${JSON.stringify({
+      historyRows: 4000, debtRows: 200, executionMs, blocks, deletedRuns: retained.deletedRuns,
+      generationRepairMs, generationRepairIndex: "SubscriberScanRun_creator_published_generation_idx",
+    })}`);
   } finally {
     await cleanupAgency(db, scope.agencyId);
     await db.$disconnect();
@@ -780,6 +815,141 @@ test("A29 PostgreSQL: generation repair is monotonic and COMPLETE/unreconciled d
     assert.equal(cleanup.blockedByPublicationDebt, true);
     assert.equal(await db.subscriberScanRun.count({ where: { creatorId: scope.creatorId } }), 1);
     console.log("# A29_GENERATION_DEBT_AUTHORITY_PASS");
+  } finally {
+    await cleanupAgency(db, scope.agencyId);
+    await db.$disconnect();
+  }
+});
+
+test("A31 PostgreSQL: maintenance lock order is deterministic and never signal-row -> creator", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const dbC = new PrismaClient();
+  const scope = await createAgencyCreator(dbA, "a31-lock-order");
+  const clock = await databaseNow(dbA);
+  let releaseA;
+  const holdA = new Promise((resolve) => { releaseA = resolve; });
+  let enteredA;
+  const aEntered = new Promise((resolve) => { enteredA = resolve; });
+  let enteredB = false;
+  try {
+    const recoverySignalResult = await signalSubscriberDirectoryMaintenance({
+      db: dbA, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: clock, reason: "A31_LOCK_ORDER_RECOVERY",
+    });
+    const retentionSignalResult = await signalSubscriberDirectoryMaintenance({
+      db: dbA, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RETENTION, dueAt: clock, reason: "A31_LOCK_ORDER_RETENTION",
+    });
+    const claimUntil = new Date(clock.getTime() + 60_000);
+    const recoverySignal = await dbA.subscriberDirectoryMaintenanceSignal.update({
+      where: { id: recoverySignalResult.signal.id },
+      data: { claimToken: `a31-a-${Date.now()}`, claimUntil },
+    });
+    const retentionSignal = await dbA.subscriberDirectoryMaintenanceSignal.update({
+      where: { id: retentionSignalResult.signal.id },
+      data: { claimToken: `a31-b-${Date.now()}`, claimUntil },
+    });
+
+    const txA = subscriberTest.publicationTransaction(dbA, scope.agencyId, scope.creatorId, async () => {
+      enteredA();
+      await holdA;
+      return "a";
+    }, { maintenanceSignal: recoverySignal, maxWaitMs: 5_000, timeoutMs: 20_000 });
+    await aEntered;
+
+    const txB = subscriberTest.publicationTransaction(dbB, scope.agencyId, scope.creatorId, async () => {
+      enteredB = true;
+      return "b";
+    }, { maintenanceSignal: retentionSignal, maxWaitMs: 10_000, timeoutMs: 20_000 });
+
+    // Give B time to reach the canonical agency/creator lock wait. It must NOT
+    // own the retention signal row while blocked behind A.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(enteredB, false, "second transaction bypassed creator serialization");
+    const rowLockProbe = await dbC.$transaction(async (tx) => {
+      const rows = await tx.$queryRawUnsafe(`
+        SELECT "id" FROM "SubscriberDirectoryMaintenanceSignal"
+        WHERE "id"=$1 FOR UPDATE NOWAIT
+      `, retentionSignal.id);
+      return rows?.[0]?.id || null;
+    }, { maxWait: 2_000, timeout: 5_000 });
+    assert.equal(rowLockProbe, retentionSignal.id, "waiting maintenance transaction locked signal row before creator authority");
+
+    releaseA();
+    const [aResult, bResult] = await Promise.all([txA, txB]);
+    assert.equal(aResult, "a");
+    assert.equal(bResult, "b");
+    assert.equal(enteredB, true);
+    console.log("# A31_CANONICAL_LOCK_ORDER_PASS");
+  } finally {
+    releaseA?.();
+    await cleanupAgency(dbA, scope.agencyId);
+    await Promise.all([dbA.$disconnect(), dbB.$disconnect(), dbC.$disconnect()]);
+  }
+});
+
+test("A31 PostgreSQL: expired real Subscriber recovery cannot mutate generation, run, projections, or jobs", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db = new PrismaClient();
+  const scope = await createAgencyCreator(db, "a31-real-stale-recovery");
+  const clock = await databaseNow(db);
+  try {
+    await db.subscriberDirectoryState.create({
+      data: {
+        agencyId: scope.agencyId, creatorId: scope.creatorId, status: "READY",
+        publicationGeneration: 1, publishedGeneration: 0, summary: {},
+      },
+    });
+    const runId = `${scope.creatorId}-published-3`;
+    await db.subscriberScanRun.create({
+      data: {
+        id: runId, agencyId: scope.agencyId, creatorId: scope.creatorId,
+        status: "PUBLISHED", publicationGeneration: 3, hasMore: false, fanProjectionStatus: "COMPLETE",
+        publicationStatus: "COMPLETE", publicationJobReconciledAt: null, summary: {},
+      },
+    });
+    await signalSubscriberDirectoryMaintenance({
+      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: clock, reason: "A31_REAL_STALE_RECOVERY",
+    });
+    const claim = await claimSubscriberDirectoryMaintenanceSignal({ db, now: clock });
+    assert.ok(claim?.claimToken);
+    await db.subscriberDirectoryMaintenanceSignal.update({
+      where: { id: claim.id }, data: { claimUntil: new Date(clock.getTime() - 1_000) },
+    });
+
+    const before = {
+      state: await db.subscriberDirectoryState.findUnique({ where: { creatorId: scope.creatorId } }),
+      run: await db.subscriberScanRun.findUnique({ where: { id: runId } }),
+      jobs: await db.jobInstance.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId } }),
+      fanValues: await db.creatorFanValueCurrent.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId } }),
+      fanRelationships: await db.creatorFanRelationshipCurrent.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId } }),
+    };
+
+    await assert.rejects(
+      () => recoverSubscriberPublicationDebt({
+        db, agencyId: scope.agencyId, creatorId: scope.creatorId, maintenanceSignal: claim, maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 2_000,
+      }),
+      (error) => error?.code === "SUBSCRIBER_MAINTENANCE_CLAIM_STALE",
+    );
+
+    const after = {
+      state: await db.subscriberDirectoryState.findUnique({ where: { creatorId: scope.creatorId } }),
+      run: await db.subscriberScanRun.findUnique({ where: { id: runId } }),
+      jobs: await db.jobInstance.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId } }),
+      fanValues: await db.creatorFanValueCurrent.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId } }),
+      fanRelationships: await db.creatorFanRelationshipCurrent.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId } }),
+    };
+    assert.equal(after.state.publicationGeneration, before.state.publicationGeneration, "stale recovery repaired generation before lease fence");
+    assert.equal(after.state.publishedGeneration, before.state.publishedGeneration, "stale recovery repaired published generation before lease fence");
+    assert.equal(after.run.publicationJobReconciledAt?.getTime?.() || null, before.run.publicationJobReconciledAt?.getTime?.() || null);
+    assert.equal(after.run.status, before.run.status);
+    assert.equal(after.jobs, before.jobs, "stale recovery created a JobInstance");
+    assert.equal(after.fanValues, before.fanValues, "stale recovery changed fan values");
+    assert.equal(after.fanRelationships, before.fanRelationships, "stale recovery changed fan relationships");
+    console.log("# A31_REAL_STALE_RECOVERY_FENCE_PASS");
   } finally {
     await cleanupAgency(db, scope.agencyId);
     await db.$disconnect();

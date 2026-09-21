@@ -82,6 +82,10 @@ const { assertAgencyMassCampaignRetirable } = require("../services/mass-campaign
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 const { publishDomainWork, WORK_CLASS: PHASE2_WORK_CLASS } = require("../services/domain-work-authority-service");
 const { acquireAuthorizationUserLock } = require("../services/authorization-session-authority-service");
+const {
+  listPoisonedSubscriberMaintenanceSignals,
+  requeuePoisonedSubscriberMaintenanceSignal,
+} = require("../services/subscriber-directory-maintenance-signal-service");
 
 const router = express.Router();
 
@@ -2066,5 +2070,74 @@ router.post("/admin-users/:id/reset-password", async (req, res) => {
   }
 });
 
+
+// ════════════════════════════════════════════════════════════
+// Phase 3 Subscriber maintenance break-glass
+// ════════════════════════════════════════════════════════════
+
+router.get("/maintenance/subscriber-signals", async (req, res) => {
+  try {
+    if (!ensureSuperAdmin(req, res)) return;
+    const limit = Math.max(1, Math.min(500, Number(req.query?.limit) || 100));
+    const signals = await listPoisonedSubscriberMaintenanceSignals({ db: prisma, limit });
+    return res.json({
+      ok: true,
+      poisonThreshold: 100,
+      count: signals.length,
+      signals: signals.map((row) => ({
+        id: row.id,
+        agencyId: row.agencyId,
+        creatorId: row.creatorId,
+        kind: row.kind,
+        dueAt: row.dueAt,
+        attempts: row.attempts,
+        revision: row.revision,
+        claimUntil: row.claimUntil,
+        lastError: row.lastError,
+        updatedAt: row.updatedAt,
+      })),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      code: err?.code || "SUBSCRIBER_MAINTENANCE_LIST_FAILED",
+      error: String(err?.message || err || "Failed").slice(0, 1000),
+    });
+  }
+});
+
+router.post("/maintenance/subscriber-signals/:id/requeue", async (req, res) => {
+  try {
+    if (!ensureSuperAdmin(req, res)) return;
+    const result = await requeuePoisonedSubscriberMaintenanceSignal({
+      db: prisma,
+      signalId: req.params.id,
+      reason: "ADMIN_BREAK_GLASS_REQUEUE",
+    });
+    if (!result?.requeued) {
+      return res.status(409).json({
+        ok: false,
+        code: "SUBSCRIBER_MAINTENANCE_SIGNAL_NOT_POISONED",
+        error: "Signal is missing or no longer poison-eligible",
+      });
+    }
+    await adminLog(req, {
+      agencyId: result.signal?.agencyId || null,
+      action: "admin.subscriber_maintenance_signal_requeued",
+      targetType: "subscriber_maintenance_signal",
+      targetId: result.signal?.id || req.params.id,
+      before: null,
+      after: { revision: result.signal?.revision || null, dueAt: result.signal?.dueAt || null },
+      reason: "ADMIN_BREAK_GLASS_REQUEUE",
+    });
+    return res.json({ ok: true, signal: result.signal });
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      code: err?.code || "SUBSCRIBER_MAINTENANCE_REQUEUE_FAILED",
+      error: String(err?.message || err || "Failed").slice(0, 1000),
+    });
+  }
+});
 
 module.exports = router;

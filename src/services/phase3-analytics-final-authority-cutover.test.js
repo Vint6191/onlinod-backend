@@ -249,7 +249,9 @@ test("final migration carries bounded subscriber cursor, durable signal lease an
 test("final physical proof pack is rewritten for the final authority cut and persists proof JSON", () => {
   const proof = source("scripts/audit/phase3-a20-postgres-proof.js");
   const finalPg = source("src/services/phase3-analytics-final-authority-cutover.integration.test.js");
-  assert.match(proof, /EXPECTED_PROOF_TEST_COUNT\s*=\s*44/);
+  assert.doesNotMatch(proof, /EXPECTED_PROOF_TEST_COUNT/);
+  assert.match(proof, /tapTestNames/);
+  assert.match(proof, /PHASE3_A31_TAP_FAILURE/);
   assert.match(proof, /phase3-analytics-final-authority-cutover\.integration\.test\.js/);
   assert.match(proof, /artifacts[\s\S]*audit[\s\S]*phase3-a26-postgres-proof\.json/);
   assert.match(proof, /physical proof JSON was not persisted/);

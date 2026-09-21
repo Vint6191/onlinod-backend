@@ -51,6 +51,8 @@ async function signalSubscriberDirectoryMaintenance({
       "reason"=EXCLUDED."reason",
       "revision"="SubscriberDirectoryMaintenanceSignal"."revision"+1,
       "attempts"=0,
+      "claimToken"=NULL,
+      "claimUntil"=NULL,
       "lastError"=NULL,
       "updatedAt"=NOW()
     RETURNING "id","agencyId","creatorId","kind","dueAt","revision","claimToken","claimUntil"
@@ -91,6 +93,21 @@ async function claimSubscriberDirectoryMaintenanceSignal({ db, now = new Date(),
   }, { maxWait: timeoutMs, timeout: timeoutMs + 1_000 });
 }
 
+async function lockSubscriberMaintenanceClaimRow({ db, signal } = {}) {
+  if (!signal?.id || !signal?.claimToken || typeof db?.$queryRawUnsafe !== "function") return null;
+  const rows = await db.$queryRawUnsafe(`
+    SELECT "id","agencyId","creatorId","kind","revision","claimToken","claimUntil",
+           clock_timestamp() AS "authorityNow"
+    FROM "SubscriberDirectoryMaintenanceSignal"
+    WHERE "id"=$1
+      AND "claimToken"=$2
+      AND "revision"=$3
+      AND "claimUntil" > clock_timestamp()
+    FOR UPDATE
+  `, signal.id, signal.claimToken, Number(signal.revision || 0));
+  return Array.isArray(rows) ? rows[0] || null : null;
+}
+
 async function subscriberMaintenanceClaimCurrent({ db, signal } = {}) {
   if (!signal?.id || !signal?.claimToken || typeof db?.$queryRawUnsafe !== "function") return false;
   const rows = await db.$queryRawUnsafe(`
@@ -110,17 +127,10 @@ async function withSubscriberMaintenanceClaimFence({ db, signal, work, maxWaitMs
     return { current: false, reason: "claim_fence_unavailable" };
   }
   return db.$transaction(async (tx) => {
-    const rows = await tx.$queryRawUnsafe(`
-      SELECT "id","agencyId","creatorId","kind","revision","claimToken","claimUntil",
-             clock_timestamp() AS "authorityNow"
-      FROM "SubscriberDirectoryMaintenanceSignal"
-      WHERE "id"=$1
-        AND "claimToken"=$2
-        AND "revision"=$3
-        AND "claimUntil" > clock_timestamp()
-      FOR UPDATE
-    `, signal.id, signal.claimToken, Number(signal.revision || 0));
-    const current = Array.isArray(rows) ? rows[0] || null : null;
+    // Standalone helper retained for explicit signal-only operations/tests.
+    // Subscriber publication/recovery/retention MUST use publicationTransaction,
+    // whose canonical lock order is automation fence -> creator lock -> signal row.
+    const current = await lockSubscriberMaintenanceClaimRow({ db: tx, signal });
     if (!current) return { current: false, reason: "claim_stale_or_expired" };
     const result = await work(tx, {
       ...signal,
@@ -129,6 +139,13 @@ async function withSubscriberMaintenanceClaimFence({ db, signal, work, maxWaitMs
     });
     return { current: true, result };
   }, { maxWait: Math.max(250, Number(maxWaitMs) || 5_000), timeout: Math.max(1_000, Number(timeoutMs) || 30_000) });
+}
+
+async function countPoisonedSubscriberMaintenanceSignals({ db } = {}) {
+  if (typeof db?.subscriberDirectoryMaintenanceSignal?.count !== "function") return 0;
+  return Number(await db.subscriberDirectoryMaintenanceSignal.count({
+    where: { attempts: { gte: SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS } },
+  }) || 0);
 }
 
 async function listPoisonedSubscriberMaintenanceSignals({ db, limit = 100 } = {}) {
@@ -161,18 +178,27 @@ async function requeuePoisonedSubscriberMaintenanceSignal({ db, signalId, reason
 }
 
 async function ackSubscriberDirectoryMaintenanceSignal({ db, signal } = {}) {
-  if (!signal?.id || !signal?.claimToken || typeof db?.subscriberDirectoryMaintenanceSignal?.deleteMany !== "function") return false;
-  const deleted = await db.subscriberDirectoryMaintenanceSignal.deleteMany({
-    where: { id: signal.id, claimToken: signal.claimToken, revision: Number(signal.revision || 0) },
-  });
-  if (Number(deleted?.count || 0) > 0) return true;
-  if (typeof db?.subscriberDirectoryMaintenanceSignal?.updateMany === "function") {
-    await db.subscriberDirectoryMaintenanceSignal.updateMany({
-      where: { id: signal.id, claimToken: signal.claimToken },
-      data: { claimToken: null, claimUntil: null },
-    });
+  if (!signal?.id || !signal?.claimToken) return false;
+  if (typeof db?.$executeRawUnsafe === "function") {
+    const count = await db.$executeRawUnsafe(`
+      DELETE FROM "SubscriberDirectoryMaintenanceSignal"
+      WHERE "id"=$1
+        AND "claimToken"=$2
+        AND "revision"=$3
+        AND "claimUntil" > clock_timestamp()
+    `, signal.id, signal.claimToken, Number(signal.revision || 0));
+    return Number(count || 0) > 0;
   }
-  return false;
+  if (typeof db?.subscriberDirectoryMaintenanceSignal?.deleteMany !== "function") return false;
+  const deleted = await db.subscriberDirectoryMaintenanceSignal.deleteMany({
+    where: {
+      id: signal.id,
+      claimToken: signal.claimToken,
+      revision: Number(signal.revision || 0),
+      claimUntil: { gt: new Date() },
+    },
+  });
+  return Number(deleted?.count || 0) > 0;
 }
 
 async function releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now = new Date(), error = null, retryMs = 60_000 } = {}) {
@@ -185,13 +211,7 @@ async function releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now = n
         "attempts"="attempts"+1, "lastError"=$4, "updatedAt"=NOW()
     WHERE "id"=$1 AND "claimToken"=$2 AND "revision"=$5
   `, signal.id, signal.claimToken, retryDueAt, clean(error?.message || error, 1000), Number(signal.revision || 0));
-  if (Number(count || 0) > 0) return true;
-  await db.$executeRawUnsafe(`
-    UPDATE "SubscriberDirectoryMaintenanceSignal"
-    SET "claimToken"=NULL, "claimUntil"=NULL, "updatedAt"=NOW()
-    WHERE "id"=$1 AND "claimToken"=$2
-  `, signal.id, signal.claimToken);
-  return false;
+  return Number(count || 0) > 0;
 }
 
 module.exports = {
@@ -201,7 +221,9 @@ module.exports = {
   signalSubscriberDirectoryMaintenance,
   claimSubscriberDirectoryMaintenanceSignal,
   subscriberMaintenanceClaimCurrent,
+  lockSubscriberMaintenanceClaimRow,
   withSubscriberMaintenanceClaimFence,
+  countPoisonedSubscriberMaintenanceSignals,
   listPoisonedSubscriberMaintenanceSignals,
   requeuePoisonedSubscriberMaintenanceSignal,
   ackSubscriberDirectoryMaintenanceSignal,

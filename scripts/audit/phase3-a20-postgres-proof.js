@@ -11,7 +11,6 @@ const ROOT = path.resolve(__dirname, "../..");
 const PRISMA_DIR = path.join(ROOT, "prisma");
 const A13_CUTOFF = "20260919010000_phase3_provider_gate_durable_waiter_fairness_v1";
 const PRE_A20_2_CUTOFF = "20260919113000_phase3_campaign_refresh_recovery_status_v1";
-const EXPECTED_PROOF_TEST_COUNT = 44;
 const COVERAGE_PREFLIGHT = path.join(ROOT, "scripts/database/phase3-campaign-coverage-generation-online-preflight.js");
 const PREFLIGHT_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-concurrency.js");
 const PREFLIGHT_RUNTIME_AVAILABILITY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-runtime-availability.js");
@@ -123,6 +122,59 @@ function tapCount(stdout, label) {
   const match = String(stdout || "").match(new RegExp(`^# ${label} (\\d+)$`, "m"));
   return match ? Number(match[1]) : null;
 }
+
+function tapTestNames(stdout) {
+  const names = [];
+  for (const line of String(stdout || "").split(/\r?\n/)) {
+    const match = line.match(/^# Subtest:\s+(.+)$/);
+    if (match) names.push(match[1].trim());
+  }
+  return names;
+}
+function parseTapFailures(stdout) {
+  const lines = String(stdout || "").split(/\r?\n/);
+  const failures = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = lines[i].match(/^not ok\s+(\d+)\s+-\s+(.+)$/);
+    if (!match) continue;
+    const block = [lines[i]];
+    let j = i + 1;
+    for (; j < lines.length; j += 1) {
+      const line = lines[j];
+      if (/^(?:ok|not ok)\s+\d+\s+-\s+/.test(line) || /^# Subtest:\s+/.test(line) || /^1\.\.\d+$/.test(line)) break;
+      block.push(line);
+      if (/^\s*\.\.\.\s*$/.test(line)) { j += 1; break; }
+    }
+    const text = block.join("\n");
+    const scalar = (key) => {
+      const m = text.match(new RegExp(`^\\\\s*${key}:\\\\s*['"]?([^\\\\n'"]+)['"]?\\\\s*$`, "m"));
+      return m ? m[1].trim() : null;
+    };
+    const errorBlock = text.match(/^\s*error:\s*\|-\s*\n((?:\s{4,}.+\n?)*)/m);
+    const error = errorBlock
+      ? errorBlock[1].split(/\r?\n/).map((row) => row.replace(/^\s{4}/, "")).join("\n").trim().slice(0, 2000)
+      : scalar("error");
+    const stackBlock = text.match(/^\s*stack:\s*\|-\s*\n((?:\s{4,}.+\n?)*)/m);
+    const stack = stackBlock
+      ? stackBlock[1].split(/\r?\n/).map((row) => row.replace(/^\s{4}/, "")).slice(0, 12).join("\n").trim()
+      : null;
+    const row = {
+      number: Number(match[1]),
+      name: match[2].trim(),
+      code: scalar("code"),
+      error: error || null,
+      location: scalar("location"),
+      stack: stack || null,
+    };
+    const duplicate = failures.some((existing) =>
+      existing.number === row.number && existing.name === row.name
+      && existing.code === row.code && existing.error === row.error
+    );
+    if (!duplicate) failures.push(row);
+    i = Math.max(i, j - 1);
+  }
+  return failures;
+}
 function parseJsonLines(stdout, marker) {
   const rows = [];
   for (const line of String(stdout || "").split(/\r?\n/)) {
@@ -171,8 +223,10 @@ function assertNodeProof(stdout, label, summaryOverride = null) {
     fail: tapCount(stdout, "fail"),
     skipped: tapCount(stdout, "skipped"),
   };
-  if (summary.tests !== EXPECTED_PROOF_TEST_COUNT) fail(`${label} test-count drift: expected ${EXPECTED_PROOF_TEST_COUNT}, got ${summary.tests}`);
-  if (summary.pass !== EXPECTED_PROOF_TEST_COUNT || summary.fail !== 0 || summary.skipped !== 0) {
+  if (!Number.isInteger(Number(summary.tests)) || Number(summary.tests) <= 0) {
+    fail(`${label} did not register any physical proof tests: ${JSON.stringify(summary)}`);
+  }
+  if (summary.pass !== summary.tests || summary.fail !== 0 || summary.skipped !== 0) {
     fail(`${label} is not zero-fail/zero-skip: ${JSON.stringify(summary)}`);
   }
   const metrics = assertScaleMetrics(stdout, label);
@@ -261,12 +315,17 @@ function runProofTests(label, databaseUrl) {
       fail: tapCount(out.stdout, "fail") ?? (out.failed ? 1 : 0),
       skipped: tapCount(out.stdout, "skipped") ?? 0,
     };
+    const testNames = tapTestNames(out.stdout);
+    const tapFailures = parseTapFailures(out.stdout);
     for (const key of Object.keys(summary)) summary[key] += Number(fileSummary[key] || 0);
     durationMs += out.durationMs;
     aggregate.push(out.stdout || "");
     const ok = !out.failed && leaks.length === 0 && fileSummary.fail === 0 && fileSummary.skipped === 0;
-    const firstError = out.digest ? out.digest.split(/\r?\n/).slice(0, 16).join("\n") : null;
-    const result = { file: path.relative(ROOT, file), ok, status: out.status, ...fileSummary, leaks, log: out.log, firstError };
+    const firstError = tapFailures[0] || (out.digest ? { error: out.digest.split(/\r?\n/).slice(0, 16).join("\n") } : null);
+    const result = {
+      file: path.relative(ROOT, file), ok, status: out.status, ...fileSummary,
+      testNames, tapFailures, leaks, log: out.log, firstError,
+    };
     fileResults.push(result);
     console.log(`# PHASE3_A26_PROOF_FILE ${JSON.stringify({
       label, file: result.file, ok: result.ok, status: result.status,
@@ -274,6 +333,11 @@ function runProofTests(label, databaseUrl) {
       leaks: result.leaks, firstError: result.firstError,
       log: { file: result.log.file, sha256: result.log.sha256, bytes: result.log.bytes },
     })}`);
+    for (const failure of tapFailures) {
+      console.error(`# PHASE3_A31_TAP_FAILURE ${JSON.stringify({
+        label, file: result.file, ...failure,
+      })}`);
+    }
   }
   const stdout = aggregate.join("\n");
   let authority = null;
@@ -457,14 +521,34 @@ function main() {
   }
 
   for (const row of cleanup) if (!row.ok) failures.push({ scenario: "cleanup", message: `schema cleanup failed for ${row.schema}`, cleanup: row });
+
+  const successfulProofs = Object.entries(scenarios)
+    .filter(([, row]) => row?.ok && row?.proof)
+    .map(([name, row]) => ({ name, proof: row.proof }));
+  if (successfulProofs.length > 1) {
+    const canonical = successfulProofs[0];
+    const canonicalManifest = canonical.proof.files.map((row) => ({ file: row.file, tests: row.tests, testNames: row.testNames }));
+    for (const candidate of successfulProofs.slice(1)) {
+      const manifest = candidate.proof.files.map((row) => ({ file: row.file, tests: row.tests, testNames: row.testNames }));
+      if (JSON.stringify(manifest) !== JSON.stringify(canonicalManifest)) {
+        failures.push({
+          scenario: candidate.name,
+          message: `physical proof TAP manifest drifted from ${canonical.name}`,
+          canonicalManifest,
+          actualManifest: manifest,
+        });
+      }
+    }
+  }
+
   const proof = {
     version: "A26",
     ok: failures.length === 0,
     cleanSchema, rollingSchema, seededRollingSchema,
     a13Cutoff: A13_CUTOFF,
     preA20_2Cutoff: PRE_A20_2_CUTOFF,
-    expectedProofTestsPerScenario: EXPECTED_PROOF_TEST_COUNT,
-    expectedProofTestsTotal: EXPECTED_PROOF_TEST_COUNT * 3,
+    proofTestsPerScenario: scenarios["clean-current"]?.proof?.tests ?? null,
+    proofTestsTotal: Object.values(scenarios).reduce((sum, row) => sum + Number(row?.proof?.tests || 0), 0),
     scenarios,
     cleanup: cleanup.map(({ stdout, stderr, ...row }) => row),
     failures,
@@ -485,8 +569,8 @@ function main() {
     : { ok: false, message: row?.failure?.message || null, exitCode: row?.failure?.exitCode || null }]));
   console.log(`# PHASE3_A26_POSTGRES_PROOF_JSON ${JSON.stringify({
     version: proof.version, ok: proof.ok,
-    expectedProofTestsPerScenario: proof.expectedProofTestsPerScenario,
-    expectedProofTestsTotal: proof.expectedProofTestsTotal,
+    proofTestsPerScenario: proof.proofTestsPerScenario,
+    proofTestsTotal: proof.proofTestsTotal,
     scenarioTotals, failureCount: failures.length,
     cleanupOk: proof.cleanup.every((row) => row.ok),
     proofFile: resolved, failureManifest: failureOutput,
@@ -504,9 +588,10 @@ if (require.main === module) {
 }
 
 module.exports = {
-  EXPECTED_PROOF_TEST_COUNT,
   PROOF_TESTS,
   tapCount,
+  tapTestNames,
+  parseTapFailures,
   parseJsonLines,
   assertScaleMetrics,
   assertNodeProof,

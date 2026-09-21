@@ -74,9 +74,43 @@ async function cleanupPhase3PostgresAgencyFixture(db, agencyId) {
   }, { maxWait: 10_000, timeout: 120_000 });
 }
 
+
+
+async function cleanupPhase3PostgresFixtureGraph(db, {
+  agencyId,
+  userIds = [],
+} = {}) {
+  const id = String(agencyId || "").trim();
+  const users = [...new Set((Array.isArray(userIds) ? userIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
+  if (!id && !users.length) return { agencyDeleted: 0, creatorsDeleted: 0, usersDeleted: 0 };
+  return withPhase3PostgresFixtureAuthority(db, async (tx) => {
+    let creatorsDeleted = 0;
+    let agencyDeleted = 0;
+    if (id) {
+      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, id);
+      // Keep the Agency parent alive until Creator AFTER DELETE/catalog triggers
+      // complete, then let Agency cascades remove WorkerDevice and tenant-owned
+      // fixture rows before deleting the User identity.
+      const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
+      creatorsDeleted = Number(creatorResult?.count || 0);
+      const agencyResult = await tx.agency.deleteMany({ where: { id } });
+      agencyDeleted = Number(agencyResult?.count || 0);
+    }
+    const userResult = users.length
+      ? await tx.user.deleteMany({ where: { id: { in: users } } })
+      : { count: 0 };
+    return {
+      agencyDeleted,
+      creatorsDeleted,
+      usersDeleted: Number(userResult?.count || 0),
+    };
+  }, { maxWait: 10_000, timeout: 120_000 });
+}
+
 module.exports = {
   auditSchemaFromDatabaseUrl,
   pinPhase3AuditSchema,
   withPhase3PostgresFixtureAuthority,
   cleanupPhase3PostgresAgencyFixture,
+  cleanupPhase3PostgresFixtureGraph,
 };

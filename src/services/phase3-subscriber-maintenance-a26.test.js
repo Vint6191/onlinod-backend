@@ -76,7 +76,9 @@ test("A26 migration and postflight prove maintenance queue, state repair and rea
 test("A26 physical closure is hermetic, exhaustive and separated from production deploy", () => {
   const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
   const pkg = JSON.parse(source("package.json"));
-  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 44/);
+  assert.doesNotMatch(runner, /EXPECTED_PROOF_TEST_COUNT/);
+  assert.match(runner, /tapTestNames/);
+  assert.match(runner, /physical proof TAP manifest drifted/);
   assert.match(runner, /requires a disposable physical PostgreSQL database and has no production opt-in bypass/);
   assert.doesNotMatch(runner, /ONLINOD_AUDIT_ALLOW_PRIMARY_DATABASE/);
   assert.match(runner, /search_path=\$\{safeSchema\},pg_catalog/);

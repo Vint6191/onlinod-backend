@@ -9,6 +9,7 @@ const { PrismaClient } = require("@prisma/client");
 const ROOT = path.resolve(__dirname, "../..");
 const PROOF = path.join(ROOT, "scripts/audit/phase3-a20-postgres-proof.js");
 const DATABASE_PREFIX = "onlinod_a26_render_";
+const STALE_DISPOSABLE_MIN_AGE_MS = 6 * 60 * 60 * 1000;
 
 function fail(message, code = 3) {
   const error = new Error(String(message));
@@ -48,6 +49,19 @@ function directAdminUrl(value) {
   u.searchParams.delete("schema");
   u.searchParams.delete("options");
   return { url: u.toString(), directHostDerived: originalHost !== u.hostname, host: u.hostname, database: decodeURIComponent(u.pathname.replace(/^\//, "")) };
+}
+
+
+function disposableDatabaseCreatedAt(database) {
+  const name = String(database || "");
+  if (!name.startsWith(DATABASE_PREFIX)) return null;
+  const suffix = name.slice(DATABASE_PREFIX.length);
+  const encoded = suffix.split("_")[0];
+  if (!/^[0-9a-z]+$/i.test(encoded)) return null;
+  const millis = Number.parseInt(encoded, 36);
+  if (!Number.isFinite(millis) || millis <= 0) return null;
+  const createdAt = new Date(millis);
+  return Number.isFinite(createdAt.getTime()) ? createdAt : null;
 }
 
 function withDatabase(value, database) {
@@ -118,7 +132,9 @@ async function createDisposableDatabase(admin, database) {
   }
 }
 
-async function cleanupStaleDisposableDatabases(admin) {
+async function cleanupStaleDisposableDatabases(admin, { now = new Date(), minAgeMs = STALE_DISPOSABLE_MIN_AGE_MS } = {}) {
+  const authorityNow = now instanceof Date && Number.isFinite(now.getTime()) ? now : new Date();
+  const staleAgeMs = Math.max(60_000, Number(minAgeMs) || STALE_DISPOSABLE_MIN_AGE_MS);
   const rows = await admin.$queryRawUnsafe(
     `SELECT d.datname AS database_name,
             COUNT(a.pid)::int AS active_sessions
@@ -134,14 +150,22 @@ async function cleanupStaleDisposableDatabases(admin) {
     const database = String(row?.database_name || "");
     const activeSessions = Number(row?.active_sessions || 0);
     if (!database.startsWith(DATABASE_PREFIX)) continue;
+    const createdAt = disposableDatabaseCreatedAt(database);
+    const ageMs = createdAt ? Math.max(0, authorityNow.getTime() - createdAt.getTime()) : null;
+    if (!createdAt || ageMs < staleAgeMs) {
+      const result = { database, action: "stale-too-young-skip", activeSessions, ageMs, minAgeMs: staleAgeMs };
+      results.push(result);
+      console.log(`# PHASE3_A26_RENDER_DISPOSABLE ${JSON.stringify({ phase: "stale-too-young-skip", ...result })}`);
+      continue;
+    }
     if (activeSessions > 0) {
-      const result = { database, action: "stale-active-skip", activeSessions };
+      const result = { database, action: "stale-active-skip", activeSessions, ageMs, minAgeMs: staleAgeMs };
       results.push(result);
       console.log(`# PHASE3_A26_RENDER_DISPOSABLE ${JSON.stringify({ phase: "stale-active-skip", ...result })}`);
       continue;
     }
     const cleanup = await dropDisposableDatabase(admin, database);
-    const result = { database, action: "stale-dropped", activeSessions, mode: cleanup.mode };
+    const result = { database, action: "stale-dropped", activeSessions, ageMs, minAgeMs: staleAgeMs, mode: cleanup.mode };
     results.push(result);
     console.log(`# PHASE3_A26_RENDER_DISPOSABLE ${JSON.stringify({ phase: "stale-dropped", ...result })}`);
   }
@@ -236,6 +260,8 @@ if (require.main === module) {
 
 module.exports = {
   DATABASE_PREFIX,
+  STALE_DISPOSABLE_MIN_AGE_MS,
+  disposableDatabaseCreatedAt,
   quoteIdentifier,
   directAdminUrl,
   withDatabase,

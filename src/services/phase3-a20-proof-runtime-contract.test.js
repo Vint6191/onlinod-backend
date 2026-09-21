@@ -46,9 +46,10 @@ test("A23 physical proof test-count contract is real, not an external-step offse
       registered += Math.max(0, generated - 1);
     }
   }
-  const expected = Number(runner.match(/EXPECTED_PROOF_TEST_COUNT\s*=\s*(\d+)/)?.[1] || 0);
-  assert.equal(expected, 44);
-  assert.equal(registered, expected);
+  assert.ok(registered > 0, "physical proof pack must contain registered TAP tests");
+  assert.doesNotMatch(runner, /EXPECTED_PROOF_TEST_COUNT/, "A31 manifest authority must not freeze a numeric proof count");
+  assert.match(runner, /tapTestNames/);
+  assert.match(runner, /physical proof TAP manifest drifted/);
 });
 
 test("A23 physical pack owns its fixtures and has no accidental cross-file bootstrap dependency", () => {

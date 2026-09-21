@@ -1091,6 +1091,7 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
 
 async function planConfiguredBumpSources({
   agencyId, creatorId, userId = null, source = "manual", requireAutomatic = true, manual = false, db = prisma,
+  scheduleFanRefresh = scheduleFanDataPointRefresh,
 }) {
   const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
   if (!control.effective.bumpsEnabled) {
@@ -1112,7 +1113,7 @@ async function planConfiguredBumpSources({
       const result = await planBumps({
         agencyId, creatorId, userId, source: candidateSource,
         limit: Math.min(settings.candidateBatchSize, Math.max(1, settings.dailyLimit)),
-        manual, db,
+        manual, db, scheduleFanRefresh,
       });
       sources.push({ source: candidateSource, ok: true, planned: result.planned || 0, skipped: result.skipped || [] });
       planned += Number(result.planned || 0);
@@ -1123,15 +1124,21 @@ async function planConfiguredBumpSources({
   const skipCounts = summarizePlanningSkips(sources);
   const readyDevices = await sessionWriteWorkerCount({ agencyId, creatorId, db });
   const firstFailure = Object.keys(skipCounts)[0] || null;
+  const ok = sources.every((row) => row?.ok !== false);
   return {
-    ok: true, created: planned > 0,
-    reason: planned > 0 ? source : (firstFailure || "no_eligible_candidates"),
+    ok, created: planned > 0,
+    reason: ok ? (planned > 0 ? source : (firstFailure || "no_eligible_candidates")) : (firstFailure || "planning_failed"),
     planned, sources, requestedSources: requested, readyDevices, skipCounts,
   };
 }
 
-async function ensureAutomaticBumps({ agencyId, creatorId, userId = null, source = "recurring_scheduler", db = prisma }) {
-  return planConfiguredBumpSources({ agencyId, creatorId, userId, source, requireAutomatic: true, manual: false, db });
+async function ensureAutomaticBumps({
+  agencyId, creatorId, userId = null, source = "recurring_scheduler", db = prisma,
+  scheduleFanRefresh = scheduleFanDataPointRefresh,
+}) {
+  return planConfiguredBumpSources({
+    agencyId, creatorId, userId, source, requireAutomatic: true, manual: false, db, scheduleFanRefresh,
+  });
 }
 
 async function planConfiguredBumpsNow({ agencyId, creatorId, userId = null, source = "manual_plan_now", db = prisma }) {
