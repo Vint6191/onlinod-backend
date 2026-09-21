@@ -590,6 +590,7 @@ model CreatorAccount {
   dailyMetrics CreatorDailyMetrics[]
   localMessageCoverage CreatorLocalMessageCoverage[]
   fanLocalCoverage CreatorFanLocalCoverage[]
+  fanObservationClock FanObservationCreatorClock?
   notificationSyncState CreatorNotificationSyncState?
   financialCollectionState CreatorFinancialCollectionState?
   campaignCollectionState CreatorCampaignCollectionState?
@@ -3421,6 +3422,8 @@ model FanObservationCreatorClock {
   creatorId      String   @id
   lastObservedAt DateTime @default(now())
   updatedAt      DateTime @updatedAt
+
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 }
 
 model FanObservationToken {

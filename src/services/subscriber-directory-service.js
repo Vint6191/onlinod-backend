@@ -1238,6 +1238,23 @@ function subscriberDerivedPlanningConverged(planning) {
     .every((key) => !planning[key] || planning[key].ok !== false);
 }
 
+function subscriberPublicationJobLeaseAuthority(job, now = new Date()) {
+  const status = String(job?.status || "");
+  const leaseUntil = dateOrNull(job?.leaseUntil);
+  const active = status === "CLAIMED" && Boolean(leaseUntil && leaseUntil > now);
+  return {
+    active,
+    leaseUntil,
+    // A CLAIMED row is recoverable when the lease is either explicitly expired
+    // or absent. Keep the decision predicate and fenced CAS predicate generated
+    // from this one authority so NULL can never be classified differently by the
+    // read and commit layers again.
+    casWhere: status === "CLAIMED"
+      ? { OR: [{ leaseUntil: null }, { leaseUntil: { lte: now } }] }
+      : {},
+  };
+}
+
 async function reconcileRecoveredSubscriberPublicationJob(db, { run, summary = null, planning = null, now = new Date() } = {}) {
   const runId = clean(run?.id, 180);
   const jobId = clean(run?.jobId, 180);
@@ -1262,8 +1279,8 @@ async function reconcileRecoveredSubscriberPublicationJob(db, { run, summary = n
       await markSubscriberPublicationJobReconciled(tx, runId, now);
       return { reconciled: true, reason: "already_done" };
     }
-    const leaseUntil = dateOrNull(currentJob.leaseUntil);
-    if (currentJob.status === "CLAIMED" && leaseUntil && leaseUntil > now) {
+    const leaseAuthority = subscriberPublicationJobLeaseAuthority(currentJob, now);
+    if (leaseAuthority.active) {
       return { reconciled: false, reason: "active_claim" };
     }
     const resultPayload = {
@@ -1277,7 +1294,7 @@ async function reconcileRecoveredSubscriberPublicationJob(db, { run, summary = n
       id: jobId,
       status: currentJob.status,
       leaseRevision: Number(currentJob.leaseRevision || 0),
-      ...(currentJob.status === "CLAIMED" ? { leaseUntil: { lte: now } } : {}),
+      ...leaseAuthority.casWhere,
     };
     const updated = await tx.jobInstance.updateMany({
       where,
@@ -1304,8 +1321,7 @@ async function reconcileRecoveredSubscriberPublicationJob(db, { run, summary = n
 function subscriberRecoveryJobNeedsPlanning(job, now) {
   if (!job) return true;
   if (job.status === "DONE") return false;
-  const leaseUntil = dateOrNull(job.leaseUntil);
-  return !(job.status === "CLAIMED" && leaseUntil && leaseUntil > now);
+  return !subscriberPublicationJobLeaseAuthority(job, now).active;
 }
 
 async function repairSubscriberDirectoryStateGeneration({ db = prisma, agencyId, creatorId } = {}) {

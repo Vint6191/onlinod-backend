@@ -94,6 +94,12 @@ async function retireCreatorWithinTransaction({
   if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
     await tx.fanObservationReadLease.deleteMany({ where: { creatorId: creator } });
   }
+  // The creator-partitioned chronology is live execution authority, not durable
+  // historical attribution. Soft retirement must remove it in the same lifecycle
+  // transaction; hard deletion is additionally protected by the FK cascade.
+  if (typeof tx.fanObservationCreatorClock?.deleteMany === "function") {
+    await tx.fanObservationCreatorClock.deleteMany({ where: { creatorId: creator } });
+  }
   if (!current.deletedAt) {
     await authorizeCreatorAccountWrite(tx);
     await tx.creatorAccount.update({ where: { id: creator }, data: { status: "DISABLED", deletedAt: retiredAt } });

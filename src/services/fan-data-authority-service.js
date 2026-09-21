@@ -1521,8 +1521,21 @@ async function scheduleFanDataPointRefresh({ db = null, agencyId, creatorId, onl
   const causalBarrierHash = causalBarrierKey
     ? crypto.createHash("sha256").update(causalBarrierKey).digest("hex").slice(0, 16)
     : null;
-  const rangeKey = causalBarrierHash ? `fan-data:${fanSetHash}:${causalBarrierHash}` : `fan-data:${fanSetHash}`;
+  const consumerIdentity = text(params?.consumer, 120);
+  const consumerHash = consumerIdentity
+    ? crypto.createHash("sha256").update(consumerIdentity).digest("hex").slice(0, 12)
+    : null;
+  const refreshFieldSet = [...new Set((Array.isArray(params?.refreshFields) ? params.refreshFields : [])
+    .map((value) => text(value, 120))
+    .filter(Boolean))].sort();
+  const refreshFieldHash = refreshFieldSet.length
+    ? crypto.createHash("sha256").update(refreshFieldSet.join("\n")).digest("hex").slice(0, 12)
+    : null;
+  let rangeKey = causalBarrierHash ? `fan-data:${fanSetHash}:${causalBarrierHash}` : `fan-data:${fanSetHash}`;
+  if (consumerHash) rangeKey += `:consumer:${consumerHash}`;
+  if (refreshFieldHash) rangeKey += `:fields:${refreshFieldHash}`;
   const stableParams = { ...params };
+  if (refreshFieldSet.length) stableParams.refreshFields = refreshFieldSet;
   delete stableParams.scheduledFromObservationAt;
   delete stableParams.reason;
   return ensureSingleJob({

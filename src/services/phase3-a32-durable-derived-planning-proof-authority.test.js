@@ -113,3 +113,36 @@ test("A32 physical expectations follow canonical work status and prove index pat
   assert.match(proof, /Index \(\?:Only \)\?Scan\|Bitmap Index Scan/);
   assert.doesNotMatch(proof, /published-generation index not planner-eligible/);
 });
+
+
+test("A32 INT2 Subscriber recovery uses one NULL/expired/future lease authority for decision and fenced CAS", () => {
+  const subscriber = source("src/services/subscriber-directory-service.js");
+  assert.match(subscriber, /function subscriberPublicationJobLeaseAuthority/);
+  assert.match(subscriber, /active = status === "CLAIMED" && Boolean\(leaseUntil && leaseUntil > now\)/);
+  assert.match(subscriber, /casWhere: status === "CLAIMED"[\s\S]*leaseUntil: null[\s\S]*leaseUntil: \{ lte: now \}/);
+  assert.match(subscriber, /const leaseAuthority = subscriberPublicationJobLeaseAuthority\(currentJob, now\)/);
+  assert.match(subscriber, /\.\.\.leaseAuthority\.casWhere/);
+  assert.match(subscriber, /return !subscriberPublicationJobLeaseAuthority\(job, now\)\.active/);
+});
+
+test("A32 INT2 FanData refresh identity owns consumer and required field set instead of first-consumer-wins coalescing", () => {
+  const fanData = source("src/services/fan-data-authority-service.js");
+  assert.match(fanData, /consumerIdentity = text\(params\?\.consumer/);
+  assert.match(fanData, /refreshFieldSet = \[\.\.\.new Set/);
+  assert.match(fanData, /let rangeKey = causalBarrierHash \? `fan-data:\$\{fanSetHash\}:\$\{causalBarrierHash\}` : `fan-data:\$\{fanSetHash\}`/);
+  assert.match(fanData, /rangeKey \+= `:consumer:\$\{consumerHash\}`/);
+  assert.match(fanData, /rangeKey \+= `:fields:\$\{refreshFieldHash\}`/);
+  assert.match(fanData, /stableParams\.refreshFields = refreshFieldSet/);
+});
+
+test("A32 INT2 creator observation clock follows production retirement and physical CreatorAccount deletion", () => {
+  const schema = source("prisma/schema.prisma");
+  const migration = source("prisma/migrations/20260921150500_phase3_a32_int2_subscriber_recovery_refresh_identity_clock_lifecycle_v1/migration.sql");
+  const lifecycle = source("src/services/creator-lifecycle-authority-service.js");
+  assert.match(schema, /model FanObservationCreatorClock[\s\S]*creator CreatorAccount @relation\(fields: \[creatorId\], references: \[id\], onDelete: Cascade\)/);
+  assert.match(schema, /fanObservationClock FanObservationCreatorClock\?/);
+  assert.match(migration, /a\."deletedAt" IS NOT NULL/);
+  assert.match(migration, /WHERE NOT EXISTS[\s\S]*"CreatorAccount"/);
+  assert.match(migration, /FOREIGN KEY \("creatorId"\) REFERENCES "CreatorAccount"\("id"\)[\s\S]*ON DELETE CASCADE/);
+  assert.match(lifecycle, /fanObservationCreatorClock\?\.deleteMany[\s\S]*creatorId: creator/);
+});

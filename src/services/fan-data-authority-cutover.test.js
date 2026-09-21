@@ -458,7 +458,11 @@ test("point refresh scheduler scopes dedupe to the exact fan-id batch instead of
   assert.match(service, /const fanSetHash = crypto\.createHash/);
   assert.match(service, /ids\.join\("\\n"\)/);
   assert.match(service, /const causalBarrierKey = text\(params\?\.causalBarrierKey/);
-  assert.match(service, /const rangeKey = causalBarrierHash \? `fan-data:\$\{fanSetHash\}:\$\{causalBarrierHash\}` : `fan-data:\$\{fanSetHash\}`/);
+  assert.match(service, /consumerIdentity = text\(params\?\.consumer/);
+  assert.match(service, /refreshFieldSet = \[\.\.\.new Set/);
+  assert.match(service, /let rangeKey = causalBarrierHash \? `fan-data:\$\{fanSetHash\}:\$\{causalBarrierHash\}` : `fan-data:\$\{fanSetHash\}`/);
+  assert.match(service, /rangeKey \+= `:consumer:\$\{consumerHash\}`/);
+  assert.match(service, /rangeKey \+= `:fields:\$\{refreshFieldHash\}`/);
   assert.match(service, /params:\s*\{ \.\.\.stableParams, fanIds: ids, rangeKey/);
   assert.match(service, /delete stableParams\.scheduledFromObservationAt/);
 });
