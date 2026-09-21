@@ -121,3 +121,118 @@ test("A27 Render wrapper self-provisions and destroys a disposable database for 
   assert.match(wrapper, /u\.searchParams\.delete\("options"\)/);
   assert.equal(pkg.scripts["audit:phase3-a26-render"], "node scripts/audit/phase3-a26-render-disposable.js");
 });
+
+test("A28 postflight validates PostgreSQL index semantics instead of pg_get_indexdef quote formatting", () => {
+  const postflight = require("../../scripts/database/phase3-subscriber-publication-schema-online-postflight");
+
+  assert.equal(postflight.canonicalIndexSql('"status"'), "status");
+  assert.equal(postflight.canonicalIndexSql("status"), "status");
+  assert.equal(postflight.canonicalIndexSql('"publicationStatus"'), "publicationstatus");
+
+  const validRow = (overrides = {}) => ({
+    accessMethod: "btree",
+    isValid: true,
+    isReady: true,
+    isUnique: false,
+    indexDef: "CREATE INDEX x",
+    keyOrders: [],
+    predicate: "",
+    ...overrides,
+  });
+
+  const recovery = postflight.validateIndexRow(
+    "SubscriberScanRun_publication_recovery_idx",
+    postflight.REQUIRED_INDEX_SPECS.SubscriberScanRun_publication_recovery_idx,
+    validRow({
+      tableName: "SubscriberScanRun",
+      indexDef: 'CREATE INDEX "SubscriberScanRun_publication_recovery_idx" ON public."SubscriberScanRun" USING btree (status, "publicationStatus", "updatedAt")',
+      keyExpressions: ["status", '"publicationStatus"', '"updatedAt"'],
+      keyOrders: ["ASC", "ASC", "ASC"],
+    }),
+  );
+  assert.deepEqual(recovery.problems, []);
+
+  const reconcile = postflight.validateIndexRow(
+    "SubscriberScanRun_publication_job_reconcile_idx",
+    postflight.REQUIRED_INDEX_SPECS.SubscriberScanRun_publication_job_reconcile_idx,
+    validRow({
+      tableName: "SubscriberScanRun",
+      indexDef: 'CREATE INDEX x ON public."SubscriberScanRun" USING btree ("updatedAt", id) WHERE ((status = ANY (ARRAY[\'PUBLISHED\'::text, \'SUPERSEDED\'::text])) AND ("publicationStatus" = \'COMPLETE\'::text) AND ("publicationJobReconciledAt" IS NULL))',
+      keyExpressions: ['"updatedAt"', "id"],
+      keyOrders: ["ASC", "ASC"],
+      predicate: '((status = ANY (ARRAY[\'PUBLISHED\'::text, \'SUPERSEDED\'::text])) AND ("publicationStatus" = \'COMPLETE\'::text) AND ("publicationJobReconciledAt" IS NULL))',
+    }),
+  );
+  assert.deepEqual(reconcile.problems, []);
+
+  const retention = postflight.validateIndexRow(
+    "SubscriberScanRun_retention_eligible_idx",
+    postflight.REQUIRED_INDEX_SPECS.SubscriberScanRun_retention_eligible_idx,
+    validRow({
+      tableName: "SubscriberScanRun",
+      keyExpressions: ['"creatorId"', '"createdAt"', "id"],
+      keyOrders: ["ASC", "DESC", "ASC"],
+      predicate: '((status = ANY (ARRAY[\'SUPERSEDED\'::text, \'FAILED\'::text])) AND ("publicationStatus" = \'COMPLETE\'::text))',
+    }),
+  );
+  assert.deepEqual(retention.problems, []);
+
+  const expressionIndex = postflight.validateIndexRow(
+    "CreatorFanRefreshDemand_recovery_order_idx",
+    postflight.REQUIRED_INDEX_SPECS.CreatorFanRefreshDemand_recovery_order_idx,
+    validRow({
+      tableName: "CreatorFanRefreshDemand",
+      keyExpressions: ['"creatorId"', 'COALESCE("nextRetryAt", "lastFailedAt", "updatedAt")', "id"],
+      keyOrders: ["ASC", "ASC", "ASC"],
+      predicate: '((status = \'FAILED\'::text) AND ("activeRefreshJobId" IS NULL))',
+    }),
+  );
+  assert.deepEqual(expressionIndex.problems, []);
+
+  const wrongOrder = postflight.validateIndexRow(
+    "SubscriberScanItem_run_id_cursor_idx",
+    postflight.REQUIRED_INDEX_SPECS.SubscriberScanItem_run_id_cursor_idx,
+    validRow({
+      tableName: "SubscriberScanItem",
+      keyExpressions: ["id", '"runId"'],
+      keyOrders: ["ASC", "ASC"],
+    }),
+  );
+  assert.ok(wrongOrder.problems.length > 0, "ordered index-key mismatch must remain fail-closed");
+
+  const wrongDirection = postflight.validateIndexRow(
+    "SubscriberScanRun_retention_eligible_idx",
+    postflight.REQUIRED_INDEX_SPECS.SubscriberScanRun_retention_eligible_idx,
+    validRow({
+      tableName: "SubscriberScanRun",
+      keyExpressions: ['"creatorId"', '"createdAt"', "id"],
+      keyOrders: ["ASC", "ASC", "ASC"],
+      predicate: '((status = ANY (ARRAY[\'SUPERSEDED\'::text, \'FAILED\'::text])) AND ("publicationStatus" = \'COMPLETE\'::text))',
+    }),
+  );
+  assert.ok(wrongDirection.problems.some((problem) => problem.includes("order-2")));
+
+  const unexpectedPartial = postflight.validateIndexRow(
+    "SubscriberScanItem_run_id_cursor_idx",
+    postflight.REQUIRED_INDEX_SPECS.SubscriberScanItem_run_id_cursor_idx,
+    validRow({
+      tableName: "SubscriberScanItem",
+      keyExpressions: ['"runId"', "id"],
+      keyOrders: ["ASC", "ASC"],
+      predicate: '(id IS NOT NULL)',
+    }),
+  );
+  assert.ok(unexpectedPartial.problems.includes("unexpected-predicate"));
+
+  const wrongAccessMethod = postflight.validateIndexRow(
+    "SubscriberScanItem_run_id_cursor_idx",
+    postflight.REQUIRED_INDEX_SPECS.SubscriberScanItem_run_id_cursor_idx,
+    validRow({
+      tableName: "SubscriberScanItem",
+      accessMethod: "hash",
+      keyExpressions: ['"runId"', "id"],
+      keyOrders: ["ASC", "ASC"],
+    }),
+  );
+  assert.ok(wrongAccessMethod.problems.some((problem) => problem.includes("access-method")));
+});

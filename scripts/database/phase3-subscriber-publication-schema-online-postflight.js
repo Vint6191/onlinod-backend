@@ -1,6 +1,6 @@
 "use strict";
 
-const prisma = require("../../src/prisma");
+const getPrisma = () => require("../../src/prisma");
 
 const REQUIRED_PUBLICATION_COLUMNS = Object.freeze([
   "publicationStatus", "publicationGeneration", "publicationCursorId", "publicationPreviousRunId",
@@ -14,19 +14,19 @@ const REQUIRED_MAINTENANCE_SIGNAL_COLUMNS = Object.freeze([
 ]);
 
 const REQUIRED_INDEX_SPECS = Object.freeze({
-  SubscriberScanRun_publication_recovery_idx: { table: "SubscriberScanRun", tokens: ['"status"', '"publicationStatus"', '"updatedAt"'] },
-  SubscriberScanRun_publication_job_reconcile_idx: { table: "SubscriberScanRun", tokens: ['"updatedAt"', '"id"'], predicateTokens: ['publicationJobReconciledAt', 'publicationStatus'] },
-  SubscriberScanRun_creator_publication_generation_idx: { table: "SubscriberScanRun", tokens: ['"creatorId"', '"publicationGeneration"'] },
-  SubscriberScanRun_publication_debt_idx: { table: "SubscriberScanRun", tokens: ['"agencyId"', '"creatorId"', '"updatedAt"', '"id"'], predicateTokens: ['fanProjectionStatus', 'publicationStatus'] },
-  SubscriberScanRun_retention_eligible_idx: { table: "SubscriberScanRun", tokens: ['"creatorId"', '"createdAt"', '"id"'], predicateTokens: ['publicationStatus', 'SUPERSEDED', 'FAILED'] },
-  SubscriberScanRun_creator_reconcile_idx: { table: "SubscriberScanRun", tokens: ['"creatorId"', '"updatedAt"', '"id"'], predicateTokens: ['publicationJobReconciledAt', 'publicationStatus'] },
-  SubscriberScanItem_run_id_cursor_idx: { table: "SubscriberScanItem", tokens: ['"runId"', '"id"'] },
-  SubscriberDirectoryMaintenanceSignal_creator_kind_key: { table: "SubscriberDirectoryMaintenanceSignal", tokens: ['"creatorId"', '"kind"'], unique: true },
-  SubscriberDirectoryMaintenanceSignal_due_claim_idx: { table: "SubscriberDirectoryMaintenanceSignal", tokens: ['"dueAt"', '"creatorId"', '"kind"', 'COALESCE'], predicateTokens: ['attempts', '100'] },
-  CreatorFanRefreshDemand_promoter_ready_idx: { table: "CreatorFanRefreshDemand", tokens: ['creatorId', 'status', 'activeRefreshJobId'] },
-  CreatorFanRefreshDemand_recovery_order_idx: { table: "CreatorFanRefreshDemand", tokens: ['creatorId'] },
-  CreatorFanRefreshDemand_canonical_heal_idx: { table: "CreatorFanRefreshDemand", tokens: ['creatorId'] },
-  CampaignFanRefreshPromotionSignal_claim_due_idx: { table: "CampaignFanRefreshPromotionSignal", tokens: ['dueAt', 'claimUntil'] },
+  SubscriberScanRun_publication_recovery_idx: { table: "SubscriberScanRun", keys: [["status"], ["publicationstatus"], ["updatedat"]] },
+  SubscriberScanRun_publication_job_reconcile_idx: { table: "SubscriberScanRun", keys: [["updatedat"], ["id"]], predicateTokens: ["publicationjobreconciledat", "publicationstatus", "published", "superseded", "complete"] },
+  SubscriberScanRun_creator_publication_generation_idx: { table: "SubscriberScanRun", keys: [["creatorid"], ["publicationgeneration"]] },
+  SubscriberScanRun_publication_debt_idx: { table: "SubscriberScanRun", keys: [["agencyid"], ["creatorid"], ["updatedat"], ["id"]], predicateTokens: ["fanprojectionstatus", "publicationstatus", "hasmore", "complete", "pending", "current", "previous", "finalize"] },
+  SubscriberScanRun_retention_eligible_idx: { table: "SubscriberScanRun", keys: [["creatorid"], ["createdat"], ["id"]], orders: ["ASC", "DESC", "ASC"], predicateTokens: ["publicationstatus", "complete", "superseded", "failed"] },
+  SubscriberScanRun_creator_reconcile_idx: { table: "SubscriberScanRun", keys: [["creatorid"], ["updatedat"], ["id"]], predicateTokens: ["publicationjobreconciledat", "publicationstatus", "published", "superseded", "complete"] },
+  SubscriberScanItem_run_id_cursor_idx: { table: "SubscriberScanItem", keys: [["runid"], ["id"]] },
+  SubscriberDirectoryMaintenanceSignal_creator_kind_key: { table: "SubscriberDirectoryMaintenanceSignal", keys: [["creatorid"], ["kind"]], unique: true },
+  SubscriberDirectoryMaintenanceSignal_due_claim_idx: { table: "SubscriberDirectoryMaintenanceSignal", keys: [["dueat"], ["creatorid"], ["kind"], ["coalesce", "claimuntil", "-infinity"]], predicateTokens: ["attempts", "100"] },
+  CreatorFanRefreshDemand_promoter_ready_idx: { table: "CreatorFanRefreshDemand", keys: [["creatorid"], ["lastrequestedat"], ["id"]], predicateTokens: ["status", "queued", "activerefreshjobid"] },
+  CreatorFanRefreshDemand_recovery_order_idx: { table: "CreatorFanRefreshDemand", keys: [["creatorid"], ["coalesce", "nextretryat", "lastfailedat", "updatedat"], ["id"]], predicateTokens: ["status", "failed", "activerefreshjobid"] },
+  CreatorFanRefreshDemand_canonical_heal_idx: { table: "CreatorFanRefreshDemand", keys: [["creatorid"], ["updatedat"], ["id"]], predicateTokens: ["status", "queued", "failed"] },
+  CampaignFanRefreshPromotionSignal_claim_due_idx: { table: "CampaignFanRefreshPromotionSignal", keys: [["dueat"], ["creatorid"], ["coalesce", "claimuntil", "-infinity"]] },
 });
 const REQUIRED_INDEXES = Object.freeze(Object.keys(REQUIRED_INDEX_SPECS));
 
@@ -35,6 +35,30 @@ function missingFrom(actual, required) {
   return required.filter((value) => !present.has(value));
 }
 function normalized(value) { return String(value || "").replace(/\s+/g, " ").trim(); }
+function canonicalIndexSql(value) {
+  return normalized(value)
+    .replace(/"/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+function expressionHasTokens(expression, tokens) {
+  const canonical = canonicalIndexSql(expression);
+  let offset = 0;
+  for (const token of tokens || []) {
+    const normalizedToken = canonicalIndexSql(token);
+    const next = canonical.indexOf(normalizedToken, offset);
+    if (next < 0) return false;
+    offset = next + normalizedToken.length;
+  }
+  return true;
+}
+function keyExpressionMatches(expression, expectedTokens) {
+  const canonical = canonicalIndexSql(expression);
+  const tokens = (expectedTokens || []).map(canonicalIndexSql);
+  if (tokens.length === 1) return canonical === tokens[0];
+  return expressionHasTokens(canonical, tokens);
+}
 
 async function tableColumns(db, tableName) {
   const rows = await db.$queryRawUnsafe(`
@@ -46,14 +70,66 @@ async function tableColumns(db, tableName) {
   return rows.map((row) => row.columnName);
 }
 
+function validateIndexRow(name, spec, row) {
+  const def = normalized(row?.indexDef);
+  const predicate = normalized(row?.predicate);
+  const keyExpressions = Array.isArray(row?.keyExpressions) ? row.keyExpressions.map(normalized) : [];
+  const keyOrders = Array.isArray(row?.keyOrders) ? row.keyOrders.map((value) => String(value || "").toUpperCase()) : [];
+  const problems = [];
+  if (String(row?.tableName) !== spec.table) problems.push(`table=${row?.tableName}`);
+  if (String(row?.accessMethod || "").toLowerCase() !== "btree") problems.push(`access-method=${row?.accessMethod}`);
+  if (row?.isValid !== true) problems.push("indisvalid=false");
+  if (row?.isReady !== true) problems.push("indisready=false");
+  if (spec.unique === true && row?.isUnique !== true) problems.push("indisunique=false");
+  if (keyExpressions.length !== (spec.keys || []).length) {
+    problems.push(`key-count=${keyExpressions.length};expected=${(spec.keys || []).length}`);
+  }
+  for (let index = 0; index < (spec.keys || []).length; index += 1) {
+    const expectedTokens = spec.keys[index];
+    const expression = keyExpressions[index] || "";
+    if (!keyExpressionMatches(expression, expectedTokens)) {
+      problems.push(`key-${index + 1}=${JSON.stringify(expression)};expectedTokens=${JSON.stringify(expectedTokens)}`);
+    }
+  }
+  const expectedOrders = spec.orders || Array.from({ length: (spec.keys || []).length }, () => "ASC");
+  if (keyOrders.length !== expectedOrders.length) {
+    problems.push(`order-count=${keyOrders.length};expected=${expectedOrders.length}`);
+  } else {
+    expectedOrders.forEach((expectedOrder, index) => {
+      if (keyOrders[index] !== expectedOrder) problems.push(`order-${index + 1}=${keyOrders[index]};expected=${expectedOrder}`);
+    });
+  }
+  if ((spec.predicateTokens || []).length === 0) {
+    if (canonicalIndexSql(predicate) !== "") problems.push("unexpected-predicate");
+  } else {
+    if (canonicalIndexSql(predicate) === "") problems.push("missing-predicate");
+    for (const token of spec.predicateTokens || []) {
+      if (!expressionHasTokens(predicate, [token])) problems.push(`missing-predicate:${token}`);
+    }
+  }
+  return { name, problems, indexDef: def, keyExpressions, keyOrders, predicate };
+}
+
 async function inspectIndexes(db) {
   const rows = await db.$queryRawUnsafe(`
-    SELECT idx.relname AS "indexName", tbl.relname AS "tableName",
+    SELECT idx.relname AS "indexName", tbl.relname AS "tableName", am.amname AS "accessMethod",
            i.indisvalid AS "isValid", i.indisready AS "isReady", i.indisunique AS "isUnique",
+           i.indnkeyatts AS "keyCount",
            pg_get_indexdef(i.indexrelid) AS "indexDef",
-           COALESCE(pg_get_expr(i.indpred, i.indrelid), '') AS "predicate"
+           COALESCE(pg_get_expr(i.indpred, i.indrelid), '') AS "predicate",
+           ARRAY(
+             SELECT pg_get_indexdef(i.indexrelid, ord, true)
+             FROM generate_series(1, i.indnkeyatts) AS ord
+             ORDER BY ord
+           ) AS "keyExpressions",
+           ARRAY(
+             SELECT CASE WHEN ((i.indoption[ord - 1]::int & 1) = 1) THEN 'DESC' ELSE 'ASC' END
+             FROM generate_series(1, i.indnkeyatts) AS ord
+             ORDER BY ord
+           ) AS "keyOrders"
     FROM pg_index i
     JOIN pg_class idx ON idx.oid=i.indexrelid
+    JOIN pg_am am ON am.oid=idx.relam
     JOIN pg_class tbl ON tbl.oid=i.indrelid
     JOIN pg_namespace n ON n.oid=tbl.relnamespace
     WHERE n.nspname=current_schema() AND idx.relname=ANY($1::text[])
@@ -64,16 +140,8 @@ async function inspectIndexes(db) {
   for (const [name, spec] of Object.entries(REQUIRED_INDEX_SPECS)) {
     const row = byName.get(name);
     if (!row) continue;
-    const def = normalized(row.indexDef);
-    const predicate = normalized(row.predicate);
-    const problems = [];
-    if (String(row.tableName) !== spec.table) problems.push(`table=${row.tableName}`);
-    if (row.isValid !== true) problems.push("indisvalid=false");
-    if (row.isReady !== true) problems.push("indisready=false");
-    if (spec.unique === true && row.isUnique !== true) problems.push("indisunique=false");
-    for (const token of spec.tokens || []) if (!def.includes(token)) problems.push(`missing-def:${token}`);
-    for (const token of spec.predicateTokens || []) if (!predicate.includes(token)) problems.push(`missing-predicate:${token}`);
-    if (problems.length) invalidIndexes.push({ name, problems, indexDef: def, predicate });
+    const validation = validateIndexRow(name, spec, row);
+    if (validation.problems.length) invalidIndexes.push(validation);
   }
   return { rows, byName, invalidIndexes };
 }
@@ -98,7 +166,8 @@ async function explainMaintenanceClaim(db) {
   }, { maxWait: 5_000, timeout: 5_000 });
 }
 
-async function inspect(db = prisma) {
+async function inspect(db) {
+  if (!db) db = getPrisma();
   const runColumns = await tableColumns(db, "SubscriberScanRun");
   const stateColumns = await tableColumns(db, "SubscriberDirectoryState");
   const signalColumns = await tableColumns(db, "SubscriberDirectoryMaintenanceSignal");
@@ -166,7 +235,8 @@ async function inspect(db = prisma) {
   };
 }
 
-async function main({ db = prisma } = {}) {
+async function main({ db } = {}) {
+  if (!db) db = getPrisma();
   const state = await inspect(db);
   console.log(JSON.stringify({
     ok: state.valid,
@@ -206,10 +276,10 @@ async function main({ db = prisma } = {}) {
 
 module.exports = {
   REQUIRED_PUBLICATION_COLUMNS, REQUIRED_DIRECTORY_STATE_COLUMNS, REQUIRED_MAINTENANCE_SIGNAL_COLUMNS,
-  REQUIRED_INDEXES, REQUIRED_INDEX_SPECS, missingFrom, inspectIndexes, explainMaintenanceClaim, inspect, main,
+  REQUIRED_INDEXES, REQUIRED_INDEX_SPECS, missingFrom, canonicalIndexSql, expressionHasTokens, keyExpressionMatches, validateIndexRow, inspectIndexes, explainMaintenanceClaim, inspect, main,
 };
 
 if (require.main === module) {
   main().catch((error) => { console.error(error?.stack || error); process.exitCode = 1; })
-    .finally(async () => { await prisma.$disconnect().catch(() => null); });
+    .finally(async () => { const db = getPrisma(); await db.$disconnect().catch(() => null); });
 }
