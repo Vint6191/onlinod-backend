@@ -293,3 +293,23 @@ test("A29 closure repairs scoped constraints, poison recovery, canonical debt an
   assert.match(gate, /phase3-a29-render-gate\.js/);
   assert.match(gate, /campaign-fan-refresh-queue-service\.js/);
 });
+
+
+test("A30 closes PostgreSQL identifier truncation and Render production-install ESLint gaps", () => {
+  const migration = source("prisma/migrations/20260921111500_phase3_a30_constraint_name_render_gate_repair_v1/migration.sql");
+  const postflight = source("scripts/database/phase3-subscriber-publication-schema-online-postflight.js");
+  const pkg = JSON.parse(source("package.json"));
+  const canonical = "CreatorCampaignCollectionState_completion_nonnegative_chk";
+
+  assert.ok(Buffer.byteLength(canonical, "utf8") <= 63, "A30 canonical PostgreSQL constraint name must fit NAMEDATALEN-1");
+  assert.match(migration, /DROP CONSTRAINT IF EXISTS "CreatorCampaignCollectionState_completion_proof_nonnegative_che"/);
+  assert.match(migration, new RegExp(`ADD CONSTRAINT "${canonical}"`));
+  assert.match(migration, new RegExp(`VALIDATE CONSTRAINT "${canonical}"`));
+  assert.match(postflight, new RegExp(`${canonical}:`));
+  assert.match(postflight, /POSTGRES_IDENTIFIER_MAX_BYTES = 63/);
+  assert.match(postflight, /assertPostgresIdentifierWidths\(REQUIRED_CONSTRAINTS/);
+
+  assert.equal(pkg.dependencies?.eslint, "9.29.0", "Render production npm install must install ESLint for the changed-JS gate");
+  assert.equal(pkg.devDependencies?.eslint, undefined, "ESLint cannot remain dev-only while the production build gate requires it");
+  assert.equal(pkg.scripts["audit:phase3-a29-render"], "node scripts/audit/phase3-a29-render-gate.js");
+});

@@ -55,12 +55,24 @@ const REQUIRED_CONSTRAINT_SPECS = Object.freeze({
     table: "CreatorCampaignFrontierFan", type: "f",
     tokens: ["foreign key (creatorid, campaignid)", "references creatorcampaign(creatorid, id)", "on update cascade", "on delete cascade"],
   },
-  CreatorCampaignCollectionState_completion_proof_nonnegative_check: {
+  CreatorCampaignCollectionState_completion_nonnegative_chk: {
     table: "CreatorCampaignCollectionState", type: "c",
     tokens: ["check", "campaignproofcampaignbatches", "campaignproofclaimerbatches", "campaignproofrejectedbatches", "campaignproofrejectedrows", ">= 0"],
   },
 });
 const REQUIRED_CONSTRAINTS = Object.freeze(Object.keys(REQUIRED_CONSTRAINT_SPECS));
+const POSTGRES_IDENTIFIER_MAX_BYTES = 63;
+
+function assertPostgresIdentifierWidths(names, label) {
+  const tooWide = (names || []).filter((name) => Buffer.byteLength(String(name), "utf8") > POSTGRES_IDENTIFIER_MAX_BYTES);
+  if (!tooWide.length) return true;
+  const error = new Error(`${label || "PostgreSQL identifiers"} exceed ${POSTGRES_IDENTIFIER_MAX_BYTES} bytes: ${tooWide.join(", ")}`);
+  error.code = "PHASE3_POSTFLIGHT_IDENTIFIER_TOO_LONG";
+  throw error;
+}
+
+assertPostgresIdentifierWidths(Object.keys(REQUIRED_INDEX_SPECS), "required index names");
+assertPostgresIdentifierWidths(REQUIRED_CONSTRAINTS, "required constraint names");
 
 function missingFrom(actual, required) {
   const present = new Set((actual || []).map(String));
@@ -355,6 +367,8 @@ async function main({ db } = {}) {
 }
 
 module.exports = {
+  POSTGRES_IDENTIFIER_MAX_BYTES,
+  assertPostgresIdentifierWidths,
   REQUIRED_PUBLICATION_COLUMNS, REQUIRED_DIRECTORY_STATE_COLUMNS, REQUIRED_MAINTENANCE_SIGNAL_COLUMNS,
   REQUIRED_INDEXES, REQUIRED_INDEX_SPECS, REQUIRED_CONSTRAINTS, REQUIRED_CONSTRAINT_SPECS,
   missingFrom, canonicalIndexSql, canonicalConstraintSql, expressionHasTokens, keyExpressionMatches,
