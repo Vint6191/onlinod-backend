@@ -10,6 +10,11 @@ let applyFanDataPointRefreshChunk;
 let readFanCurrent;
 let recordSubscriberScanFailure;
 let applySubscriberScanChunk;
+let runSubscriberDirectoryMaintenance;
+let signalSubscriberDirectoryMaintenance;
+let claimSubscriberDirectoryMaintenanceSignal;
+let ackSubscriberDirectoryMaintenanceSignal;
+let SUBSCRIBER_MAINTENANCE_KIND;
 let enqueueUniqueCampaignFanRefreshes;
 let finalizeCampaignFanRefreshJob;
 let repairFailedCampaignFanRefreshDemands;
@@ -18,7 +23,14 @@ let signalCampaignFanRefreshPromotion;
 
 if (enabled) {
   ({ projectSubscriberDirectoryItems, applyFanDataPointRefreshChunk, readFanCurrent } = require("./fan-data-authority-service"));
-  ({ recordSubscriberScanFailure, applySubscriberScanChunk, recoverSubscriberPublicationDebt } = require("./subscriber-directory-service"));
+  ({ recordSubscriberScanFailure, applySubscriberScanChunk } = require("./subscriber-directory-service"));
+  ({ runSubscriberDirectoryMaintenance } = require("./subscriber-directory-maintenance-service"));
+  ({
+    signalSubscriberDirectoryMaintenance,
+    claimSubscriberDirectoryMaintenanceSignal,
+    ackSubscriberDirectoryMaintenanceSignal,
+    SUBSCRIBER_MAINTENANCE_KIND,
+  } = require("./subscriber-directory-maintenance-signal-service"));
   ({
     enqueueUniqueCampaignFanRefreshes,
     finalizeCampaignFanRefreshJob,
@@ -181,7 +193,7 @@ test("FINAL PostgreSQL: Subscriber canonical publish and point-refresh share one
     assert.equal(current[0].value?.observedAt?.toISOString(), refreshAt.toISOString());
     console.log("# FINAL_SUBSCRIBER_POINT_REFRESH_RACE_PASS");
   } finally {
-    await cleanupAgency(subscriberDb, scope.agencyId).catch(() => {});
+    await cleanupAgency(subscriberDb, scope.agencyId);
     await subscriberDb.$disconnect();
     await refreshDb.$disconnect();
   }
@@ -207,7 +219,7 @@ test("FINAL PostgreSQL: Subscriber persisted same-generation contradiction fails
     );
     console.log("# FINAL_SUBSCRIBER_PERSISTED_CONFLICT_PASS");
   } finally {
-    await cleanupAgency(db, scope.agencyId).catch(() => {});
+    await cleanupAgency(db, scope.agencyId);
     await db.$disconnect();
   }
 });
@@ -242,7 +254,7 @@ test("FINAL PostgreSQL: lost final Subscriber response crosses durable fanProjec
     assert.equal(state?.currentRunId, runId);
     console.log("# FINAL_SUBSCRIBER_LOST_RESPONSE_BARRIER_PASS");
   } finally {
-    await cleanupAgency(db, scope.agencyId).catch(() => {});
+    await cleanupAgency(db, scope.agencyId);
     await db.$disconnect();
   }
 });
@@ -274,7 +286,7 @@ test("FINAL PostgreSQL: manual repair and durable maintenance overlap without cr
     assert.ok(signalCount <= 1);
     console.log("# FINAL_MANUAL_MAINTENANCE_OVERLAP_PASS");
   } finally {
-    await cleanupAgency(manualDb, scope.agencyId).catch(() => {});
+    await cleanupAgency(manualDb, scope.agencyId);
     await manualDb.$disconnect();
     await maintenanceDb.$disconnect();
   }
@@ -298,7 +310,7 @@ test("FINAL PostgreSQL: two maintenance replicas claim bounded creator signals w
     assert.equal(await dbA.campaignFanRefreshPromotionSignal.count({ where: { creatorId: { in: [first.creatorId, second.creatorId] } } }), 0);
     console.log("# FINAL_TWO_REPLICA_PROMOTION_SIGNAL_PASS");
   } finally {
-    await cleanupAgency(dbA, first.agencyId).catch(() => {});
+    await cleanupAgency(dbA, first.agencyId);
     await dbA.$disconnect();
     await dbB.$disconnect();
   }
@@ -356,7 +368,7 @@ test("FINAL PostgreSQL: cutover signal heals queued Campaign debt already satisf
     assert.equal(state?.fanValueSucceeded, 1);
     console.log("# FINAL_CUTOVER_CANONICAL_DEBT_HEAL_PASS");
   } finally {
-    await cleanupAgency(db, scope.agencyId).catch(() => {});
+    await cleanupAgency(db, scope.agencyId);
     await db.$disconnect();
   }
 });
@@ -400,7 +412,7 @@ test("FINAL PostgreSQL: Subscriber NOT_FETCHED cannot overwrite AVAILABLE canoni
     assert.ok(Number(state?.fanValueOutstanding || 0) >= 1);
     console.log("# FINAL_SUBSCRIBER_NOT_FETCHED_CAMPAIGN_DEBT_PASS");
   } finally {
-    await cleanupAgency(db, scope.agencyId).catch(() => {});
+    await cleanupAgency(db, scope.agencyId);
     await db.$disconnect();
   }
 });
@@ -446,7 +458,7 @@ test("FINAL PostgreSQL: concurrent Subscriber pages serialize on the durable cur
     assert.equal(await dbA.subscriberScanItem.count({ where: { runId } }), 1);
     console.log("# FINAL_SUBSCRIBER_CONCURRENT_CURSOR_PASS");
   } finally {
-    await cleanupAgency(dbA, scope.agencyId).catch(() => {});
+    await cleanupAgency(dbA, scope.agencyId);
     await dbA.$disconnect();
     await dbB.$disconnect();
   }
@@ -505,11 +517,19 @@ test("FINAL PostgreSQL: 4000-row Campaign debt and signal plans use the final ho
              $4 - (g * INTERVAL '1 millisecond'), 'PLAN_PROOF', $4, $4
       FROM generate_series(1, 4000) AS g
     `, prefix, scope.agencyId, scope.creatorId, now);
+    await db.$executeRawUnsafe(`
+      INSERT INTO "SubscriberDirectoryMaintenanceSignal" ("id","agencyId","creatorId","kind","dueAt","reason","revision","attempts","createdAt","updatedAt")
+      SELECT $1 || '-subsig-' || g::text, $2,
+             CASE WHEN g = 4000 THEN $3 ELSE $1 || '-creator-' || g::text END,
+             'RECOVERY', $4 - (g * INTERVAL '1 millisecond'), 'PLAN_PROOF', 1, 0, $4, $4
+      FROM generate_series(1, 4000) AS g
+    `, prefix, scope.agencyId, scope.creatorId, now);
     await db.$executeRawUnsafe('ANALYZE "CreatorFanRefreshDemand"');
     await db.$executeRawUnsafe('ANALYZE "CreatorCampaignFanRefreshWork"');
     await db.$executeRawUnsafe('ANALYZE "CreatorFan"');
     await db.$executeRawUnsafe('ANALYZE "CreatorFanValueCurrent"');
     await db.$executeRawUnsafe('ANALYZE "CampaignFanRefreshPromotionSignal"');
+    await db.$executeRawUnsafe('ANALYZE "SubscriberDirectoryMaintenanceSignal"');
 
     const explain = async (sql, ...args) => {
       const rows = await db.$queryRawUnsafe(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, ...args);
@@ -541,17 +561,25 @@ test("FINAL PostgreSQL: 4000-row Campaign debt and signal plans use the final ho
       WHERE s."dueAt" <= $1 AND COALESCE(s."claimUntil", '-infinity'::timestamp) <= $1
       ORDER BY s."dueAt" ASC, s."creatorId" ASC LIMIT 20
     `, now);
+    const subscriberMaintenance = await explain(`
+      SELECT s."id"
+      FROM "SubscriberDirectoryMaintenanceSignal" s
+      WHERE s."dueAt" <= $1 AND s."attempts" < 100
+        AND COALESCE(s."claimUntil", '-infinity'::timestamp) <= $1
+      ORDER BY s."dueAt" ASC, s."creatorId" ASC, s."kind" ASC LIMIT 1
+    `, now);
 
     const expected = [
       [promoter, "CreatorFanRefreshDemand_promoter_ready_idx"],
       [recovery, "CreatorFanRefreshDemand_recovery_order_idx"],
       [heal, "CreatorFanRefreshDemand_canonical_heal_idx"],
       [signal, "CampaignFanRefreshPromotionSignal_claim_due_idx"],
+      [subscriberMaintenance, "SubscriberDirectoryMaintenanceSignal_due_claim_idx"],
     ];
     for (const [plan, indexName] of expected) assert.ok(plan.includes(indexName), `${indexName} missing from EXPLAIN ANALYZE plan: ${plan}`);
-    console.log(`FINAL_HOT_QUERY_PLAN_PROOF ${JSON.stringify({ debtRows: 4000, signalRows: 4000, indexes: expected.map(([, name]) => name) })}`);
+    console.log(`FINAL_HOT_QUERY_PLAN_PROOF ${JSON.stringify({ debtRows: 4000, signalRows: 4000, subscriberMaintenanceSignalRows: 4000, indexes: expected.map(([, name]) => name) })}`);
   } finally {
-    await cleanupAgency(db, scope.agencyId).catch(() => {});
+    await cleanupAgency(db, scope.agencyId);
     await db.$disconnect();
   }
 });
@@ -590,7 +618,7 @@ test("FINAL PostgreSQL: 4000-run Subscriber history uses the publication-job rec
     assert.ok(plan.includes(indexName), `${indexName} missing from EXPLAIN ANALYZE plan: ${plan}`);
     console.log(`FINAL_SUBSCRIBER_RECONCILE_PLAN_PROOF ${JSON.stringify({ historyRows: 4000, debtRows: 200, index: indexName })}`);
   } finally {
-    await cleanupAgency(db, scope.agencyId).catch(() => {});
+    await cleanupAgency(db, scope.agencyId);
     await db.$disconnect();
   }
 });
@@ -651,7 +679,7 @@ test("A21 PostgreSQL: large cross-run Subscriber history uses the exact runId+id
     assert.ok(previousPlan.includes(indexName), `${indexName} missing from PREVIOUS EXPLAIN ANALYZE plan: ${previousPlan}`);
     console.log(`FINAL_SUBSCRIBER_CURSOR_PLAN_PROOF ${JSON.stringify({ historyRuns: runCount, rowsPerRun, totalRows: runCount * rowsPerRun, index: indexName, phases: ["CURRENT", "PREVIOUS"] })}`);
   } finally {
-    await cleanupAgency(db, scope.agencyId).catch(() => {});
+    await cleanupAgency(db, scope.agencyId);
     await db.$disconnect();
   }
 });
@@ -691,9 +719,18 @@ test("A21 PostgreSQL: two Subscriber recovery replicas serialize one FAILED publ
       },
     });
 
+    await signalSubscriberDirectoryMaintenance({
+      db: db1, agencyId: scope.agencyId, creatorId: scope.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RETENTION, dueAt: new Date(0), reason: "A26_RETENTION_DEBT_PROOF",
+    });
+    const retentionFirst = await runSubscriberDirectoryMaintenance({ db: db1, maxSignals: 1, concurrency: 1, maxRuntimeMs: 4_000 });
+    assert.equal(await db1.subscriberScanRun.count({ where: { id: runId } }), 1, "retention must not delete unfinished publication debt");
+    assert.ok(retentionFirst.processedSignals >= 1);
+    assert.equal(await db1.subscriberDirectoryMaintenanceSignal.count({ where: { creatorId: scope.creatorId, kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY } }), 1);
+
     const [left, right] = await Promise.all([
-      recoverSubscriberPublicationDebt({ db: db1, maxRuns: 1, maxStepsPerRun: 2, maxRuntimeMs: 30_000 }),
-      recoverSubscriberPublicationDebt({ db: db2, maxRuns: 1, maxStepsPerRun: 2, maxRuntimeMs: 30_000 }),
+      runSubscriberDirectoryMaintenance({ db: db1, maxSignals: 2, concurrency: 1, maxRuntimeMs: 15_000 }),
+      runSubscriberDirectoryMaintenance({ db: db2, maxSignals: 2, concurrency: 1, maxRuntimeMs: 15_000 }),
     ]);
 
     const run = await db1.subscriberScanRun.findUnique({ where: { id: runId } });
@@ -704,10 +741,24 @@ test("A21 PostgreSQL: two Subscriber recovery replicas serialize one FAILED publ
     assert.equal(state.currentRunId, runId);
     assert.equal(state.publicationGeneration, 1);
     assert.equal(state.publishedGeneration, 1);
-    assert.ok(Number(left.advancedSteps || 0) + Number(right.advancedSteps || 0) >= 1);
-    assert.ok(Number(left.errors || 0) + Number(right.errors || 0) === 0);
+    assert.ok(Number(left.recoveredRuns || 0) + Number(right.recoveredRuns || 0) >= 1);
+    assert.equal(Number(left.errors || 0) + Number(right.errors || 0), 0);
+    assert.ok(Number(left.processedSignals || 0) + Number(right.processedSignals || 0) >= 1);
+
+    const extraA = await createAgencyCreator(db1, "a26-fair-a", { agencyId: scope.agencyId });
+    const extraB = await createAgencyCreator(db1, "a26-fair-b", { agencyId: scope.agencyId });
+    const clock = await databaseNow(db1);
+    await signalSubscriberDirectoryMaintenance({ db: db1, agencyId: scope.agencyId, creatorId: extraA.creatorId, kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: new Date(clock.getTime() - 20_000), reason: "A26_FAIR_OLDEST" });
+    await signalSubscriberDirectoryMaintenance({ db: db1, agencyId: scope.agencyId, creatorId: extraB.creatorId, kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: new Date(clock.getTime() - 10_000), reason: "A26_FAIR_SECOND" });
+    const firstClaim = await claimSubscriberDirectoryMaintenanceSignal({ db: db1, now: clock });
+    const secondClaim = await claimSubscriberDirectoryMaintenanceSignal({ db: db2, now: clock });
+    assert.equal(firstClaim.creatorId, extraA.creatorId, "global maintenance claim must be oldest-due first across creators");
+    assert.equal(secondClaim.creatorId, extraB.creatorId, "second replica must claim a different creator without duplicate planning");
+    assert.notEqual(firstClaim.id, secondClaim.id);
+    await ackSubscriberDirectoryMaintenanceSignal({ db: db1, signal: firstClaim });
+    await ackSubscriberDirectoryMaintenanceSignal({ db: db2, signal: secondClaim });
   } finally {
-    await cleanupAgency(db1, scope.agencyId).catch(() => {});
+    await cleanupAgency(db1, scope.agencyId);
     await db1.$disconnect();
     await db2.$disconnect();
   }

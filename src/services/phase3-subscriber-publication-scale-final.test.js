@@ -76,6 +76,14 @@ function buildFixture({ failTransactionAttempt = null } = {}) {
   const model = {
     subscriberScanRun: {
       findUnique: async ({ where }) => where.id === run.id ? clone(run) : (where.id === previousRun.id ? clone(previousRun) : null),
+      findFirst: async ({ where }) => {
+        const incomplete = run.hasMore === false && run.fanProjectionStatus === "COMPLETE" && run.publicationStatus !== "COMPLETE";
+        const reconcileDebt = ["PUBLISHED", "SUPERSEDED"].includes(run.status) && run.publicationStatus === "COMPLETE" && run.publicationJobReconciledAt == null;
+        if (where?.agencyId && where.agencyId !== run.agencyId) return null;
+        if (where?.creatorId && where.creatorId !== run.creatorId) return null;
+        if (where?.publicationJobReconciledAt === null) return reconcileDebt ? clone(run) : null;
+        return incomplete ? clone(run) : null;
+      },
       findMany: async () => {
         const incomplete = run.hasMore === false && run.fanProjectionStatus === "COMPLETE" && run.publicationStatus !== "COMPLETE";
         const reconcileDebt = ["PUBLISHED", "SUPERSEDED"].includes(run.status) && run.publicationStatus === "COMPLETE" && run.publicationJobReconciledAt == null;
@@ -149,7 +157,11 @@ function buildFixture({ failTransactionAttempt = null } = {}) {
     return {
       ...model,
       $queryRawUnsafe: async (sql, id) => {
-        if (String(sql).includes('FROM "SubscriberScanRun"')) return id === run.id ? [clone(run)] : [];
+        const text = String(sql);
+        if (text.includes('MAX(r."publicationGeneration")')) {
+          return [{ maxGeneration: run.publicationGeneration, maxPublishedGeneration: state.publishedGeneration }];
+        }
+        if (text.includes('FROM "SubscriberScanRun"')) return id === run.id ? [clone(run)] : [];
         return [];
       },
       $executeRawUnsafe: async (sql, ...args) => {
@@ -265,7 +277,7 @@ test("durable Subscriber publication recovery lane resumes a crashed run and rec
     fx.clearFailure();
     let result = null;
     for (let i = 0; i < 8 && fx.run.status !== "PUBLISHED"; i += 1) {
-      result = await service.recoverSubscriberPublicationDebt({ db: fx.db, maxRuns: 1, maxStepsPerRun: 2, maxRuntimeMs: 30_000 });
+      result = await service.recoverSubscriberPublicationDebt({ db: fx.db, agencyId: fx.run.agencyId, creatorId: fx.run.creatorId, maxRuns: 1, maxStepsPerRun: 2, maxRuntimeMs: 30_000 });
     }
     assert.equal(fx.run.status, "PUBLISHED");
     assert.equal(fx.run.publicationStatus, "COMPLETE");
@@ -312,7 +324,7 @@ test("PUBLISHED Subscriber snapshot survives crash-before-job-DONE and recovery 
     assert.equal(fx.run.publicationJobReconciledAt, null, "FINALIZE must not lie that JobInstance DONE was committed");
     assert.equal(fx.job.status, "SCHEDULED", "simulates process death after FINALIZE but before generic job completion");
 
-    const first = await service.recoverSubscriberPublicationDebt({ db: fx.db, maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 30_000 });
+    const first = await service.recoverSubscriberPublicationDebt({ db: fx.db, agencyId: fx.run.agencyId, creatorId: fx.run.creatorId, maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 30_000 });
     assert.equal(first.reconciledJobs, 1);
     assert.equal(first.planningRuns, 1);
     assert.equal(fx.job.status, "DONE");
@@ -322,8 +334,9 @@ test("PUBLISHED Subscriber snapshot survives crash-before-job-DONE and recovery 
     assert.equal(followAutomationPlans, 1);
     assert.equal(bumpPlans, 1);
 
-    const second = await service.recoverSubscriberPublicationDebt({ db: fx.db, maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 30_000 });
-    assert.equal(second.candidates, 0, "durable reconciliation marker must remove the published run from recovery debt");
+    const second = await service.recoverSubscriberPublicationDebt({ db: fx.db, agencyId: fx.run.agencyId, creatorId: fx.run.creatorId, maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 30_000 });
+    assert.equal(second.reason, "none_due", "durable reconciliation marker must remove the published run from recovery debt");
+    assert.equal(second.reconciledJobs, 0);
     assert.equal(followBackPlans, 1, "planning must not replay after marker commit");
     assert.equal(followAutomationPlans, 1);
     assert.equal(bumpPlans, 1);

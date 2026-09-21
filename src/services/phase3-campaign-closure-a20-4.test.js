@@ -15,6 +15,7 @@ test("A20.4 PostgreSQL proof covers the fresh-audit missing real-DB cases", () =
   assert.match(integration, /one real raw SQL round trip for 1\/20\/500 rows and records timing/);
   assert.match(integration, /CAMPAIGN_FAN_REFRESH_RECOVERY_COVERAGE_TRANSITION_LOST/);
   assert.match(integration, /workTransitioned, 4/);
-  assert.match(integration, /counter\.queryRaw, 1/);
+  assert.match(integration, /counter\.businessQueryRaw, 1/);
   assert.match(audit, /phase3-campaign-closure-a20-4\.integration\.test\.js/);
+  assert.match(integration, /syncExecuteRaw/);
 });

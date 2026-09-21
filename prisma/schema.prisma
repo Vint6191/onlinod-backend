@@ -346,6 +346,7 @@ model Agency {
   hiddenOnlineUsers HiddenOnlineUser[]
   subscriberScanRuns SubscriberScanRun[]
   subscriberDirectoryStates SubscriberDirectoryState[]
+  subscriberDirectoryMaintenanceSignals SubscriberDirectoryMaintenanceSignal[]
   followBackTasks FollowBackTask[]
   vaultPurchaseMessages VaultPurchaseMessage[]
   vaultMediaSales VaultMediaSale[]
@@ -550,6 +551,7 @@ model CreatorAccount {
   hiddenOnlineUsers HiddenOnlineUser[]
   subscriberScanRuns SubscriberScanRun[]
   subscriberDirectoryStates SubscriberDirectoryState[]
+  subscriberDirectoryMaintenanceSignals SubscriberDirectoryMaintenanceSignal[]
   campaignFanRefreshPromotionSignal CampaignFanRefreshPromotionSignal?
   followBackTasks FollowBackTask[]
   vaultPurchaseMessages VaultPurchaseMessage[]
@@ -5080,6 +5082,29 @@ model SubscriberDirectoryState {
 
   @@index([agencyId, status])
   @@index([nextScanAt])
+}
+
+
+
+model SubscriberDirectoryMaintenanceSignal {
+  id         String   @id @default(cuid())
+  agencyId   String
+  creatorId  String
+  kind       String   @db.VarChar(32) // RECOVERY | RETENTION
+  dueAt      DateTime @default(now())
+  reason     String   @default("PUBLICATION_DEBT") @db.VarChar(64)
+  revision   Int      @default(1)
+  attempts   Int      @default(0)
+  claimToken String?  @db.VarChar(120)
+  claimUntil DateTime?
+  lastError  String?  @db.VarChar(1000)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+
+  @@unique([creatorId, kind], map: "SubscriberDirectoryMaintenanceSignal_creator_kind_key")
 }
 
 model HiddenOnlineUser {

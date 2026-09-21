@@ -41,9 +41,13 @@ test("A23 physical proof test-count contract is real, not an external-step offse
   for (const file of proofFiles) {
     const text = source(file);
     registered += text.split(/\r?\n/).filter((line) => /^\s*test\(/.test(line)).length;
+    for (const match of text.matchAll(/for \(const [^)]+ of \[([^\]]+)\]\) \{\s*\n\s*test\(/g)) {
+      const generated = match[1].split(",").map((value) => value.trim()).filter(Boolean).length;
+      registered += Math.max(0, generated - 1);
+    }
   }
   const expected = Number(runner.match(/EXPECTED_PROOF_TEST_COUNT\s*=\s*(\d+)/)?.[1] || 0);
-  assert.equal(expected, 40);
+  assert.equal(expected, 42);
   assert.equal(registered, expected);
 });
 
@@ -73,7 +77,8 @@ test("A24 physical proof pins PostgreSQL search_path and attests schema-local tr
   const isolation = source("scripts/audit/phase3-a20-schema-isolation.js");
   const fixture = source("scripts/audit/phase3-postgres-proof-fixture-authority.js");
 
-  assert.match(runner, /search_path=\$\{safeSchema\},pg_catalog,public/);
+  assert.match(runner, /search_path=\$\{safeSchema\},pg_catalog/);
+  assert.doesNotMatch(runner, /pg_catalog,public/);
   assert.match(runner, /clean-current-schema-isolation/);
   assert.match(runner, /rolling-current-schema-isolation/);
   assert.match(runner, /seeded-current-schema-isolation/);
@@ -111,5 +116,6 @@ test("A25 fixture lifecycle derives coverage from current Phase2 authority and t
   const creatorDelete = fixture.indexOf("tx.creatorAccount.deleteMany");
   const agencyDelete = fixture.indexOf("tx.agency.deleteMany");
   assert.ok(creatorDelete >= 0 && agencyDelete > creatorDelete, "fixture teardown must delete Creators before Agency");
-  assert.match(fixture, /onlinod\.phase2_destructive_creator_id/);
+  assert.match(fixture, /onlinod\.phase2_destructive_agency_id/);
+  assert.match(fixture, /creatorAccount\.deleteMany/);
 });

@@ -126,9 +126,10 @@ test("A20.7 migration resolve tolerates only a proven concurrent peer apply", as
 test("A20.7 strict PostgreSQL proof now includes successful chunk post-projection idempotency", () => {
   const runner = fs.readFileSync(path.join(ROOT, "scripts/audit/phase3-a20-postgres-proof.js"), "utf8");
   const integration = fs.readFileSync(path.join(ROOT, "src/services/phase3-campaign-closure-a20-5.integration.test.js"), "utf8");
-  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 40/);
+  assert.match(runner, /EXPECTED_PROOF_TEST_COUNT = 42/);
   assert.match(runner, /A20_7_POSTGRES_CHUNK_POST_PROJECTION/);
-  assert.match(runner, /Number\(chunk\?\.queryRaw\) !== 0/);
+  assert.match(runner, /businessQueryRaw/);
+  assert.match(runner, /syncExecuteRaw/);
   assert.match(integration, /canonical point-refresh projection plus chunk hook is idempotent and bounded/);
   assert.match(integration, /fanValueSucceeded, 50, "chunk hook must not double-increment coverage"/);
 });

@@ -152,12 +152,13 @@ test("A20.3 PostgreSQL: real set-based queue and failed recovery execute with bo
     await markCampaignRefreshFailed(db, scope.creatorId, { now: failedAt, expectedCurrentRunFailed: 20 });
     const recovered = await db.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({
       db: tx,
+      creatorId: scope.creatorId,
       now: new Date(failedAt.getTime() + 2000),
       maxDemands: 200,
     }));
     assert.equal(recovered.recovered, 20);
     assert.equal(recovered.requeuedWork, 20);
-    assert.equal(recovered.topology, "set_based_v1");
+    assert.equal(recovered.topology, "set_based_v3_creator_scoped");
     assert.equal(await db.creatorFanRefreshDemand.count({ where: { creatorId: scope.creatorId, status: "QUEUED" } }), 20);
     assert.equal(await db.creatorCampaignFanRefreshWork.count({ where: { creatorId: scope.creatorId, status: "QUEUED" } }), 20);
     const state = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: scope.creatorId } });
@@ -192,7 +193,7 @@ test("A20.3 PostgreSQL: real set-based queue and failed recovery execute with bo
     assert.equal(repairedDemand.quarantinedAt, null);
     assert.equal(repairedDemand.lastOutcome, "MANUAL_REPAIR_QUEUED");
   } finally {
-    await cleanupScope(db, scope).catch(() => {});
+    await cleanupScope(db, scope);
     await db.$disconnect();
   }
 });
@@ -241,8 +242,8 @@ test("A20.3 PostgreSQL: two clients coalesce overlapping queue work and recovery
     await markCampaignRefreshFailed(db1, scope.creatorId, { now: failedAt, expectedCurrentRunFailed: currentRunWork });
 
     const [left, right] = await Promise.all([
-      db1.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({ db: tx, now: new Date(failedAt.getTime() + 2000), maxDemands: 20 })),
-      db2.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({ db: tx, now: new Date(failedAt.getTime() + 2000), maxDemands: 20 })),
+      db1.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({ db: tx, creatorId: scope.creatorId, now: new Date(failedAt.getTime() + 2000), maxDemands: 20 })),
+      db2.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({ db: tx, creatorId: scope.creatorId, now: new Date(failedAt.getTime() + 2000), maxDemands: 20 })),
     ]);
     assert.equal(left.recovered + right.recovered, 20);
     assert.equal(left.requeuedWork + right.requeuedWork, 40);
@@ -252,7 +253,7 @@ test("A20.3 PostgreSQL: two clients coalesce overlapping queue work and recovery
     assert.equal(state.fanValueFailed, 0);
     assert.equal(state.fanValueOutstanding, 20);
   } finally {
-    await cleanupScope(db1, scope).catch(() => {});
+    await cleanupScope(db1, scope);
     await Promise.all([db1.$disconnect(), db2.$disconnect()]);
   }
 });
@@ -298,7 +299,7 @@ test("A20.3 PostgreSQL: canonical observation racing failed recovery converges w
     });
     const fanIds = candidates.map((row) => row.onlyFansUserId);
     await Promise.all([
-      db1.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({ db: tx, now: new Date(observedAt.getTime() + 1000), maxDemands: 20 })),
+      db1.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({ db: tx, creatorId: scope.creatorId, now: new Date(observedAt.getTime() + 1000), maxDemands: 20 })),
       db2.$transaction((tx) => reconcileCampaignFanRefreshDemandsFromCanonicalObservations({ db: tx, creatorId: scope.creatorId, fanIds, now: new Date(observedAt.getTime() + 1000) })),
     ]);
 
@@ -309,7 +310,7 @@ test("A20.3 PostgreSQL: canonical observation racing failed recovery converges w
     assert.equal(state.fanValueOutstanding, 0);
     assert.equal(state.fanValueSucceeded, 20);
   } finally {
-    await cleanupScope(db1, scope).catch(() => {});
+    await cleanupScope(db1, scope);
     await Promise.all([db1.$disconnect(), db2.$disconnect()]);
   }
 });

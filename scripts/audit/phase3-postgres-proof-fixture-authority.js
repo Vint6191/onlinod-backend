@@ -24,7 +24,7 @@ function auditSchemaFromDatabaseUrl() {
 async function pinPhase3AuditSchema(tx) {
   const schema = auditSchemaFromDatabaseUrl();
   if (!schema || typeof tx?.$queryRawUnsafe !== "function") return { schema: null, pinned: false };
-  const searchPath = `"${schema}", pg_catalog, public`;
+  const searchPath = `"${schema}", pg_catalog`;
   await tx.$queryRawUnsafe(`SELECT set_config('search_path',$1,true) AS value`, searchPath);
   const rows = await tx.$queryRawUnsafe(`SELECT current_schema() AS "currentSchema", current_setting('search_path') AS "searchPath"`);
   const currentSchema = String(rows?.[0]?.currentSchema || "");
@@ -63,25 +63,15 @@ async function cleanupPhase3PostgresAgencyFixture(db, agencyId) {
   const id = String(agencyId || "").trim();
   if (!id) return { agencyDeleted: 0, creatorsDeleted: 0 };
   return withPhase3PostgresFixtureAuthority(db, async (tx) => {
-    // Production Agency hard-delete never relies on Agency->Creator cascade: Creator
-    // lifecycles are completed first while the Agency parent still exists. Mirror that
-    // ordering in the physical-proof harness. Otherwise CreatorAccount AFTER DELETE
-    // legitimately bumps AgencyCreatorCatalogState while the Agency is already being
-    // cascade-deleted, which can produce a false FK failure in fixture teardown.
+    // A26: teardown is set-based and bounded by SQL statement count. The current
+    // Creator writer generation authorizes physical fixture deletion; deleting all
+    // Creator rows first keeps AgencyCreatorCatalogState triggers schema-local and
+    // leaves the Agency parent alive until every Creator AFTER DELETE trigger commits.
     await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, id);
-    const creators = await tx.creatorAccount.findMany({ where: { agencyId: id }, select: { id: true }, orderBy: { id: "asc" } });
-    let creatorsDeleted = 0;
-    for (const creator of creators) {
-      const creatorId = String(creator.id || "").trim();
-      if (!creatorId) continue;
-      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_creator_id',$1,true) AS value`, creatorId);
-      const result = await tx.creatorAccount.deleteMany({ where: { id: creatorId, agencyId: id } });
-      creatorsDeleted += Number(result?.count || 0);
-    }
-    await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_creator_id','',true) AS value`);
+    const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
     const agencyResult = await tx.agency.deleteMany({ where: { id } });
-    return { agencyDeleted: Number(agencyResult?.count || 0), creatorsDeleted };
-  });
+    return { agencyDeleted: Number(agencyResult?.count || 0), creatorsDeleted: Number(creatorResult?.count || 0) };
+  }, { maxWait: 10_000, timeout: 120_000 });
 }
 
 module.exports = {

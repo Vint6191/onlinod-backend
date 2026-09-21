@@ -43,8 +43,8 @@ test("A18 PostgreSQL: durable background job debt projects typed partial future-
       assert.match(String(persisted.futureDebtCoverageReason || ""), /BACKGROUND_OTHER_CALL_CARDINALITY_UNKNOWN/);
       assert.equal(String(persisted.status), "UNKNOWN");
     } finally {
-      await db.jobInstance.delete({ where: { id: job.id } }).catch(() => {});
-      await cleanupPhase3PostgresAgencyFixture(db, creator.agencyId).catch(() => {});
+      await db.jobInstance.delete({ where: { id: job.id } });
+      await cleanupPhase3PostgresAgencyFixture(db, creator.agencyId);
     }
   } finally {
     await db.$disconnect();

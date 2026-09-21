@@ -82,18 +82,30 @@ async function prismaPlanner(input) {
   }
 }
 
+function rawSqlClass(sql) {
+  const text = String(sql || "").trim().toLowerCase();
+  const standaloneRowLock = text.startsWith("select") && text.includes("for update");
+  return text.includes("pg_advisory") || text.includes("clock_timestamp") || standaloneRowLock ? "sync" : "business";
+}
+
+function rawCounter() {
+  return { queryRaw: 0, executeRaw: 0, businessQueryRaw: 0, businessExecuteRaw: 0, syncQueryRaw: 0, syncExecuteRaw: 0 };
+}
+
 function instrumentRaw(db, counter) {
   return new Proxy(db, {
     get(target, prop, receiver) {
       if (prop === "$queryRawUnsafe") {
         return async (...args) => {
           counter.queryRaw += 1;
+          counter[rawSqlClass(args[0]) === "sync" ? "syncQueryRaw" : "businessQueryRaw"] += 1;
           return target.$queryRawUnsafe(...args);
         };
       }
       if (prop === "$executeRawUnsafe") {
         return async (...args) => {
           counter.executeRaw += 1;
+          counter[rawSqlClass(args[0]) === "sync" ? "syncExecuteRaw" : "businessExecuteRaw"] += 1;
           return target.$executeRawUnsafe(...args);
         };
       }
@@ -245,7 +257,7 @@ test("A20.4 PostgreSQL: current canonical generation heals AVAILABLE/UNAVAILABLE
     assert.equal(after.fanValueUnavailable, 1);
     assert.equal(after.fanValueFreshnessStatus, "COMPLETE");
   } finally {
-    await cleanupScope(db, scope).catch(() => {});
+    await cleanupScope(db, scope);
     await db.$disconnect();
   }
 });
@@ -294,7 +306,7 @@ test("A20.4 PostgreSQL: current-generation counter mismatch rolls back demand/wo
     assert.equal(state.fanValueSucceeded, 0);
     assert.equal(state.fanValueUnavailable, 0);
   } finally {
-    await cleanupScope(db, scope).catch(() => {});
+    await cleanupScope(db, scope);
     await db.$disconnect();
   }
 });
@@ -312,7 +324,7 @@ test("A20.4 PostgreSQL: canonical healing executes one real raw SQL round trip f
         const observedAt = new Date(cutoff.getTime() + 60_000);
         const runId = `run-scale-${count}`;
         const fanIds = await seedHealingRows(db, scope, count, { runId, cutoff, observedAt });
-        const counter = { queryRaw: 0, executeRaw: 0 };
+        const counter = rawCounter();
         const started = performance.now();
         const result = await db.$transaction(async (tx) => {
           const instrumented = instrumentRaw(tx, counter);
@@ -324,8 +336,9 @@ test("A20.4 PostgreSQL: canonical healing executes one real raw SQL round trip f
           });
         });
         const durationMs = Math.round((performance.now() - started) * 100) / 100;
-        assert.equal(counter.queryRaw, 1, `real healing topology must stay one raw CTE for ${count} rows`);
-        assert.equal(counter.executeRaw, 0);
+        assert.equal(counter.businessQueryRaw, 1, `real healing topology must stay one business raw CTE for ${count} rows`);
+        assert.equal(counter.businessExecuteRaw, 0);
+        assert.equal(counter.syncExecuteRaw, 1, `mandatory creator advisory lock must stay one synchronization write for ${count} rows`);
         assert.equal(result.healed, count);
         assert.equal(result.workTransitioned, count);
         assert.equal(result.coverageRunsUpdated, 1);
@@ -333,9 +346,9 @@ test("A20.4 PostgreSQL: canonical healing executes one real raw SQL round trip f
         assert.equal(state.fanValueOutstanding, 0);
         assert.equal(state.fanValueSucceeded, count);
         assert.equal(state.fanValueFailed, 0);
-        metrics.push({ count, queryRaw: counter.queryRaw, durationMs });
+        metrics.push({ count, ...counter, durationMs });
       } finally {
-        await cleanupScope(db, scope).catch(() => {});
+        await cleanupScope(db, scope);
       }
     }
     console.log(`# A20_4_POSTGRES_HEALING_SCALE ${JSON.stringify(metrics)}`);

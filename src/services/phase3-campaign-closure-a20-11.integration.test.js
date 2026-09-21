@@ -118,7 +118,7 @@ async function lockDemand(tx, s) {
 
 async function assertBlocked(promise, label) {
   let settled = false;
-  promise.finally(() => { settled = true; }).catch(() => {});
+  promise.finally(() => { settled = true; });
   await new Promise((resolve) => setTimeout(resolve, 300));
   assert.equal(settled, false, `${label} must be waiting on the creator Campaign authority held before demand/work/state locks`);
 }
@@ -180,7 +180,7 @@ test("A20.11 PostgreSQL: terminal transition and new Campaign generation share C
     assert.equal(next.queued, 1);
     console.log("# A20_11_LOCK_ORDER_TERMINAL_PASS");
   } finally {
-    await cleanup(owner, s).catch(() => {});
+    await cleanup(owner, s);
     await owner.$disconnect();
     await contender.$disconnect();
   }
@@ -210,7 +210,7 @@ test("A20.11 PostgreSQL: canonical healing and new Campaign generation cannot fo
     assert.equal(next.queued, 1);
     console.log("# A20_11_LOCK_ORDER_HEALING_PASS");
   } finally {
-    await cleanup(owner, s).catch(() => {});
+    await cleanup(owner, s);
     await owner.$disconnect();
     await contender.$disconnect();
   }
@@ -245,7 +245,7 @@ test("A20.11 PostgreSQL: failed-demand recovery and new Campaign generation cann
     assert.equal(next.queued, 1);
     console.log("# A20_11_LOCK_ORDER_RECOVERY_PASS");
   } finally {
-    await cleanup(owner, s).catch(() => {});
+    await cleanup(owner, s);
     await owner.$disconnect();
     await contender.$disconnect();
   }

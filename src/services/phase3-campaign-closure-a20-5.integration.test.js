@@ -91,18 +91,30 @@ function candidates(scope, count) {
   return Array.from({ length: count }, (_, index) => ({ onlyFansUserId: `fan-${scope.nonce}-${String(index + 1).padStart(4, "0")}` }));
 }
 
+function rawSqlClass(sql) {
+  const text = String(sql || "").trim().toLowerCase();
+  const standaloneRowLock = text.startsWith("select") && text.includes("for update");
+  return text.includes("pg_advisory") || text.includes("clock_timestamp") || standaloneRowLock ? "sync" : "business";
+}
+
+function rawCounter() {
+  return { queryRaw: 0, executeRaw: 0, businessQueryRaw: 0, businessExecuteRaw: 0, syncQueryRaw: 0, syncExecuteRaw: 0 };
+}
+
 function instrumentRaw(db, counter) {
   return new Proxy(db, {
     get(target, prop, receiver) {
       if (prop === "$queryRawUnsafe") {
         return async (...args) => {
           counter.queryRaw += 1;
+          counter[rawSqlClass(args[0]) === "sync" ? "syncQueryRaw" : "businessQueryRaw"] += 1;
           return target.$queryRawUnsafe(...args);
         };
       }
       if (prop === "$executeRawUnsafe") {
         return async (...args) => {
           counter.executeRaw += 1;
+          counter[rawSqlClass(args[0]) === "sync" ? "syncExecuteRaw" : "businessExecuteRaw"] += 1;
           return target.$executeRawUnsafe(...args);
         };
       }
@@ -166,7 +178,7 @@ for (const count of [1, 20, 50]) {
     try {
       await createScope(db, scope);
       const queued = await queue(db, scope, count);
-      const counter = { queryRaw: 0, executeRaw: 0 };
+      const counter = rawCounter();
       const started = performance.now();
       const result = await db.$transaction((tx) => finalizeCampaignFanRefreshJob({
         db: instrumentRaw(tx, counter),
@@ -174,10 +186,13 @@ for (const count of [1, 20, 50]) {
         result: {},
       }));
       const durationMs = Math.round((performance.now() - started) * 100) / 100;
-      console.log(`# A20_5_POSTGRES_TERMINAL_SCALE_POINT ${JSON.stringify({ count, queryRaw: counter.queryRaw, executeRaw: counter.executeRaw, durationMs })}`);
+      console.log(`# A20_5_POSTGRES_TERMINAL_SCALE_POINT ${JSON.stringify({ count, ...counter, durationMs })}`);
       assert.equal(result.applied, count);
       assert.equal(result.topology, "set_based_v1");
-      assert.equal(counter.queryRaw, 3, "lock + DB clock + terminal CTE must remain constant");
+      assert.equal(counter.businessQueryRaw, 2, "terminal transition + durable promotion signal must remain two bounded business SQL statements");
+      assert.equal(counter.businessExecuteRaw, 0);
+      assert.equal(counter.syncQueryRaw, 2, "DB authority clock reads remain bounded synchronization SQL");
+      assert.equal(counter.syncExecuteRaw, 1, "creator advisory authority remains one synchronization write");
       assert.equal(await db.creatorFanRefreshDemand.count({ where: { creatorId: scope.creatorId, status: "FAILED" } }), count);
       assert.equal(await db.creatorCampaignFanRefreshWork.count({ where: { creatorId: scope.creatorId, status: "FAILED" } }), count);
       const state = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: scope.creatorId } });
@@ -185,7 +200,7 @@ for (const count of [1, 20, 50]) {
       assert.equal(state.fanValueFailed, count);
       assert.equal(state.fanValueFreshnessStatus, "PARTIAL");
     } finally {
-      await cleanupScope(db, scope).catch(() => {});
+      await cleanupScope(db, scope);
       await db.$disconnect();
     }
   });
@@ -220,7 +235,7 @@ test("A20.5 PostgreSQL: partial 25/50 canonical success plus terminal finalize c
     assert.equal(state.fanValueFailed, 25);
     assert.equal(state.fanValueFreshnessStatus, "PARTIAL");
   } finally {
-    await cleanupScope(db, scope).catch(() => {});
+    await cleanupScope(db, scope);
     await db.$disconnect();
   }
 });
@@ -254,7 +269,7 @@ test("A20.7 PostgreSQL: canonical point-refresh projection plus chunk hook is id
     assert.equal(before.fanValueOutstanding, 0);
     assert.equal(before.fanValueSucceeded, 50);
 
-    const counter = { queryRaw: 0, executeRaw: 0 };
+    const counter = rawCounter();
     const started = performance.now();
     const receipt = await db.$transaction((tx) => recordCampaignFanRefreshChunk({
       db: instrumentRaw(tx, counter),
@@ -263,18 +278,20 @@ test("A20.7 PostgreSQL: canonical point-refresh projection plus chunk hook is id
       applied: { type: "fan_data_point_refresh", ...projection },
     }));
     const durationMs = Math.round((performance.now() - started) * 100) / 100;
-    console.log(`# A20_7_POSTGRES_CHUNK_POST_PROJECTION ${JSON.stringify({ count: 50, queryRaw: counter.queryRaw, executeRaw: counter.executeRaw, durationMs })}`);
+    console.log(`# A20_7_POSTGRES_CHUNK_POST_PROJECTION ${JSON.stringify({ count: 50, ...counter, durationMs })}`);
     assert.equal(receipt.topology, "canonical_projection_v1");
     assert.equal(receipt.applied, 0, "canonical projection already satisfied every demand");
-    assert.equal(counter.queryRaw, 0, "canonical projection already reconciled every value-bearing item; chunk hook must add no DB read/write");
-    assert.equal(counter.executeRaw, 0);
+    assert.equal(counter.businessQueryRaw, 0, "canonical projection already reconciled every value-bearing item; chunk hook must add no business SQL");
+    assert.equal(counter.businessExecuteRaw, 0);
+    assert.equal(counter.syncQueryRaw, 0);
+    assert.equal(counter.syncExecuteRaw, 1, "mandatory creator advisory authority is synchronization SQL, not business work");
     assert.equal(await db.creatorFanRefreshDemand.count({ where: { creatorId: scope.creatorId, status: "COMPLETE" } }), 50);
     assert.equal(await db.creatorCampaignFanRefreshWork.count({ where: { creatorId: scope.creatorId, status: "SUCCEEDED" } }), 50);
     const after = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: scope.creatorId } });
     assert.equal(after.fanValueOutstanding, 0);
     assert.equal(after.fanValueSucceeded, 50, "chunk hook must not double-increment coverage");
   } finally {
-    await cleanupScope(db, scope).catch(() => {});
+    await cleanupScope(db, scope);
     await db.$disconnect();
   }
 });
@@ -302,7 +319,7 @@ test("A20.5 PostgreSQL: current and historical work fail once from one terminal 
     assert.equal(state.fanValueOutstanding, 0);
     assert.equal(state.fanValueFailed, 1, "historical work must not double-count current generation counters");
   } finally {
-    await cleanupScope(db, scope).catch(() => {});
+    await cleanupScope(db, scope);
     await db.$disconnect();
   }
 });
@@ -327,7 +344,7 @@ test("A20.5 PostgreSQL: retry attempt 4 -> 5 quarantines atomically", { skip: !e
     assert.ok(demand.quarantinedAt instanceof Date);
     assert.equal(demand.lastOutcome, "QUARANTINED");
   } finally {
-    await cleanupScope(db, scope).catch(() => {});
+    await cleanupScope(db, scope);
     await db.$disconnect();
   }
 });
@@ -351,7 +368,7 @@ test("A20.5 PostgreSQL: two replicas terminalizing the same refresh job cannot d
     assert.equal(state.fanValueFailed, 20);
     assert.equal(await a.creatorCampaignFanRefreshWork.count({ where: { creatorId: scope.creatorId, status: "FAILED" } }), 20);
   } finally {
-    await cleanupScope(a, scope).catch(() => {});
+    await cleanupScope(a, scope);
     await Promise.all([a.$disconnect(), b.$disconnect()]);
   }
 });
@@ -381,7 +398,7 @@ test("A20.5 PostgreSQL: terminal failure racing canonical healing converges to o
     assert.equal(state.fanValueSucceeded, 1);
     assert.equal(state.fanValueFailed, 0);
   } finally {
-    await cleanupScope(a, scope).catch(() => {});
+    await cleanupScope(a, scope);
     await Promise.all([a.$disconnect(), b.$disconnect()]);
   }
 });
@@ -405,7 +422,7 @@ test("A20.5 PostgreSQL: current counter mismatch rolls back terminal demand/work
     assert.equal(work.status, "QUEUED");
     assert.equal(work.refreshJobId, queued.refreshJobId);
   } finally {
-    await cleanupScope(db, scope).catch(() => {});
+    await cleanupScope(db, scope);
     await db.$disconnect();
   }
 });
@@ -423,7 +440,7 @@ test("A20.5 PostgreSQL: terminal failure followed by concurrent retry recovery a
     const failedAt = new Date("2040-03-05T00:10:00.000Z");
     await a.creatorFanRefreshDemand.updateMany({ where: { creatorId: scope.creatorId }, data: { nextRetryAt: new Date(failedAt.getTime() - 1000) } });
     await Promise.all([
-      a.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({ db: tx, now: failedAt, maxDemands: 20 })),
+      a.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({ db: tx, creatorId: scope.creatorId, now: failedAt, maxDemands: 20 })),
       b.$transaction((tx) => recordCampaignFanRefreshJobFailure({ db: tx, job, error: "duplicate-terminal", terminal: true })),
     ]);
     const demand = await a.creatorFanRefreshDemand.findFirst({ where: { creatorId: scope.creatorId } });
@@ -434,7 +451,7 @@ test("A20.5 PostgreSQL: terminal failure followed by concurrent retry recovery a
     assert.equal(state.fanValueFailed, 0);
     assert.equal(state.fanValueOutstanding, 1);
   } finally {
-    await cleanupScope(a, scope).catch(() => {});
+    await cleanupScope(a, scope);
     await Promise.all([a.$disconnect(), b.$disconnect()]);
   }
 });

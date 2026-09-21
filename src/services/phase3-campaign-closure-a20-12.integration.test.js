@@ -50,8 +50,11 @@ function collectionParams(runId, requestedAt) {
 }
 
 async function createScope(db, s) {
-  const oldAt = new Date("2041-01-01T00:00:00.000Z");
-  const ingestAt = new Date("2041-01-02T00:00:00.000Z");
+  const clockRows = await db.$queryRawUnsafe('SELECT clock_timestamp() AS "now"');
+  const authorityNow = new Date(clockRows?.[0]?.now);
+  assert.ok(Number.isFinite(authorityNow.getTime()), "PostgreSQL authority clock must be available");
+  const oldAt = new Date(authorityNow.getTime() - 120_000);
+  const ingestAt = new Date(authorityNow.getTime() - 60_000);
   await withPhase3PostgresFixtureAuthority(db, async (tx) => {
     await tx.agency.create({ data: { id: s.agencyId, name: `A20.12 ${s.agencyId}` } });
     await tx.creatorAccount.create({ data: { id: s.creatorId, agencyId: s.agencyId, displayName: "A20.12 Creator" } });
@@ -230,7 +233,7 @@ test("A20.12 PostgreSQL: real mixed ingest (embedded healing + stale enqueue) se
     assert.ok(["QUEUED", "FAILED", "COMPLETE"].includes(demands.get(s.fanB)?.status), `unexpected stale-fan demand: ${JSON.stringify(demands.get(s.fanB))}`);
     console.log("# A20_12_MIXED_INGEST_TERMINAL_PASS");
   } finally {
-    await cleanup(ingestDb, s).catch(() => {});
+    await cleanup(ingestDb, s);
     await ingestDb.$disconnect();
     await terminalDb.$disconnect();
   }
@@ -263,7 +266,7 @@ test("A20.12 PostgreSQL: real mixed ingest serializes with failed-demand recover
     assert.ok(["QUEUED", "FAILED", "COMPLETE"].includes(demands.get(s.fanB)?.status));
     console.log("# A20_12_MIXED_INGEST_RECOVERY_PASS");
   } finally {
-    await cleanup(ingestDb, s).catch(() => {});
+    await cleanup(ingestDb, s);
     await ingestDb.$disconnect();
     await recoveryDb.$disconnect();
   }

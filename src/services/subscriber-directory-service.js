@@ -10,6 +10,10 @@ const { createPlannedJob, publishPlannedJobAvailable } = require("./job-planning
 const { consumeFanObservationToken } = require("./fan-observation-token-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const {
+  SUBSCRIBER_MAINTENANCE_KIND,
+  signalSubscriberDirectoryMaintenance,
+} = require("./subscriber-directory-maintenance-signal-service");
 
 const SUBSCRIBER_DIRECTORY_JOB_KEY = "subscriber_directory_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING"];
@@ -442,8 +446,10 @@ async function lockSubscriberPublicationRun(db, runId) {
   return db.subscriberScanRun.findUnique({ where: { id: runId } });
 }
 
-async function publicationTransaction(db, agencyId, creatorId, work) {
+async function publicationTransaction(db, agencyId, creatorId, work, { maxWaitMs = 30_000, timeoutMs = 30_000 } = {}) {
   if (typeof db?.$transaction === "function") {
+    const maxWait = Math.max(250, Math.min(30_000, Number(maxWaitMs) || 30_000));
+    const timeout = Math.max(250, Math.min(30_000, Number(timeoutMs) || 30_000));
     return db.$transaction(async (tx) => {
       // Serialize every derived-snapshot mutation with the same agency-wide
       // commit fence used by write actions. A write permit is therefore either
@@ -452,7 +458,7 @@ async function publicationTransaction(db, agencyId, creatorId, work) {
       await lockAutomationWriteCommitFence({ db: tx, agencyId });
       await lockSubscriberPublicationCreator(tx, agencyId, creatorId);
       return work(tx);
-    }, { maxWait: 30_000, timeout: 30_000 });
+    }, { maxWait, timeout });
   }
   if (typeof db?.$executeRawUnsafe === "function") {
     await lockAutomationWriteCommitFence({ db, agencyId });
@@ -968,6 +974,13 @@ async function applySubscriberScanChunk({
       scannedCount: updatedRun.scannedCount,
       pageCount: updatedRun.pageCount,
     };
+  // Final-page canonical FanData commit creates durable publication debt. Signal
+  // the creator-scoped recovery lane in the SAME transaction so a crash before
+  // Job completion cannot strand publication behind a global scan.
+  await signalSubscriberDirectoryMaintenance({
+    db, agencyId: run.agencyId, creatorId: run.creatorId,
+    kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: authorityNow, reason: "FINAL_PAGE_READY",
+  });
   // Final-page canonical FanData commit must stay bounded. commitFanFacts holds a
   // transaction-scoped Campaign/FanData authority until this progress transaction
   // commits, so never run whole-directory publication work here. The subsequent
@@ -1045,6 +1058,10 @@ async function applySubscriberScanCompletion({ job, userId = null, result, db = 
     db,
     source: "subscriber_snapshot_published",
   });
+  await signalSubscriberDirectoryMaintenance({
+    db, agencyId: run.agencyId, creatorId: run.creatorId,
+    kind: SUBSCRIBER_MAINTENANCE_KIND.RETENTION, reason: "PUBLICATION_COMPLETE",
+  });
 
   return {
     type: "subscriber_directory",
@@ -1067,6 +1084,10 @@ async function recordSubscriberScanFailure({ job, error, terminal = true, db = p
   // publication phase back into one O(all subscribers) transaction.
   if (!existing || ["PUBLISHED", "SUPERSEDED"].includes(existing.status)) return existing;
   if (String(existing.fanProjectionStatus || "") === "COMPLETE" && existing.hasMore === false) {
+    await signalSubscriberDirectoryMaintenance({
+      db, agencyId: existing.agencyId, creatorId: existing.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: now, reason: "JOB_FAILURE_AFTER_FINAL_PAGE",
+    });
     if (typeof db?.$transaction !== "function") {
       await db.subscriberScanRun.updateMany({
         where: { id: runId, status: { in: ["QUEUED", "RUNNING"] } },
@@ -1176,52 +1197,129 @@ function subscriberRecoveryJobNeedsPlanning(job, now) {
   return !(job.status === "CLAIMED" && leaseUntil && leaseUntil > now);
 }
 
-async function recoverSubscriberPublicationDebt({
-  db = prisma,
-  now = null,
-  maxRuns = 8,
-  maxStepsPerRun = 4,
-  maxRuntimeMs = 5_000,
-} = {}) {
-  if (typeof db?.$transaction !== "function" || typeof db?.subscriberScanRun?.findMany !== "function") {
-    return { ok: true, recoveredRuns: 0, advancedSteps: 0, reason: "adapter_unsupported" };
+async function repairSubscriberDirectoryStateGeneration({ db = prisma, agencyId, creatorId } = {}) {
+  const agency = clean(agencyId, 180);
+  const creator = clean(creatorId, 180);
+  if (!agency || !creator || typeof db?.$queryRawUnsafe !== "function") return { repaired: false, reason: "scope_missing" };
+  const rows = await db.$queryRawUnsafe(`
+    SELECT
+      COALESCE(MAX(r."publicationGeneration"),0)::int AS "maxGeneration",
+      COALESCE(MAX(CASE WHEN r."status" IN ('PUBLISHED','SUPERSEDED') AND r."publicationStatus"='COMPLETE'
+                        THEN r."publicationGeneration" ELSE 0 END),0)::int AS "maxPublishedGeneration"
+    FROM "SubscriberScanRun" r
+    WHERE r."agencyId"=$1 AND r."creatorId"=$2
+  `, agency, creator);
+  const maxGeneration = Number(rows?.[0]?.maxGeneration || 0);
+  const maxPublishedGeneration = Number(rows?.[0]?.maxPublishedGeneration || 0);
+  if (maxGeneration <= 0) return { repaired: false, reason: "no_runs", maxGeneration: 0, maxPublishedGeneration: 0 };
+
+  const existing = await db.subscriberDirectoryState.findUnique({ where: { creatorId: creator } }).catch(() => null);
+  if (!existing) {
+    try {
+      await db.subscriberDirectoryState.create({
+        data: {
+          agencyId: agency,
+          creatorId: creator,
+          status: maxPublishedGeneration > 0 ? "READY" : "SCANNING",
+          publicationGeneration: maxGeneration,
+          publishedGeneration: maxPublishedGeneration,
+          summary: { repairedBy: "subscriber_maintenance_a26" },
+        },
+      });
+      return { repaired: true, created: true, maxGeneration, maxPublishedGeneration };
+    } catch (error) {
+      if (error?.code !== "P2002") throw error;
+    }
   }
-  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now instanceof Date && Number.isFinite(now.getTime()) ? now : new Date() });
-  const runLimit = Math.max(1, Math.min(50, Number(maxRuns) || 8));
-  const stepLimit = Math.max(1, Math.min(20, Number(maxStepsPerRun) || 4));
-  const runtimeBudget = Math.max(500, Math.min(30_000, Number(maxRuntimeMs) || 5_000));
-  const started = Date.now();
-  const candidates = await db.subscriberScanRun.findMany({
+  const updated = await db.subscriberDirectoryState.updateMany({
     where: {
+      creatorId: creator,
       OR: [
-        {
-          hasMore: false,
-          fanProjectionStatus: "COMPLETE",
-          publicationStatus: { in: [...SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES] },
-        },
-        {
-          status: { in: ["PUBLISHED", "SUPERSEDED"] },
-          publicationStatus: "COMPLETE",
-          publicationJobReconciledAt: null,
-        },
+        { publicationGeneration: { lt: maxGeneration } },
+        { publishedGeneration: { lt: maxPublishedGeneration } },
       ],
     },
-    orderBy: [{ publicationGeneration: "desc" }, { updatedAt: "asc" }, { id: "asc" }],
-    take: runLimit,
+    data: {
+      publicationGeneration: maxGeneration,
+      publishedGeneration: maxPublishedGeneration,
+    },
+  });
+  return { repaired: Number(updated?.count || 0) > 0, created: false, maxGeneration, maxPublishedGeneration };
+}
+
+async function findSubscriberPublicationDebtForCreator(db, { agencyId, creatorId } = {}) {
+  const scope = { agencyId: clean(agencyId, 180), creatorId: clean(creatorId, 180) };
+  if (!scope.agencyId || !scope.creatorId) return null;
+  const publication = await db.subscriberScanRun.findFirst({
+    where: subscriberPublicationDebtWhere(scope),
+    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
     select: {
       id: true, agencyId: true, creatorId: true, jobId: true, status: true, publicationStatus: true,
       publicationJobReconciledAt: true, summary: true, updatedAt: true,
     },
   });
+  if (publication) return publication;
+  return db.subscriberScanRun.findFirst({
+    where: {
+      ...scope,
+      status: { in: ["PUBLISHED", "SUPERSEDED"] },
+      publicationStatus: "COMPLETE",
+      publicationJobReconciledAt: null,
+    },
+    orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
+    select: {
+      id: true, agencyId: true, creatorId: true, jobId: true, status: true, publicationStatus: true,
+      publicationJobReconciledAt: true, summary: true, updatedAt: true,
+    },
+  });
+}
+
+async function hasSubscriberPublicationDebt({ db = prisma, agencyId, creatorId } = {}) {
+  return Boolean(await findSubscriberPublicationDebtForCreator(db, { agencyId, creatorId }));
+}
+
+async function recoverSubscriberPublicationDebt({
+  db = prisma,
+  agencyId,
+  creatorId,
+  now = null,
+  maxRuns = 4,
+  maxStepsPerRun = 4,
+  maxRuntimeMs = 5_000,
+  beforePlanning = null,
+} = {}) {
+  const agency = clean(agencyId, 180);
+  const creator = clean(creatorId, 180);
+  if (!agency || !creator) {
+    const error = new Error("Subscriber publication recovery requires explicit agencyId and creatorId");
+    error.code = "SUBSCRIBER_RECOVERY_CREATOR_SCOPE_REQUIRED";
+    throw error;
+  }
+  if (typeof db?.$transaction !== "function" || typeof db?.subscriberScanRun?.findFirst !== "function") {
+    return { ok: true, recoveredRuns: 0, advancedSteps: 0, reason: "adapter_unsupported" };
+  }
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now instanceof Date && Number.isFinite(now.getTime()) ? now : new Date() });
+  const runLimit = Math.max(1, Math.min(10, Number(maxRuns) || 4));
+  const stepLimit = Math.max(1, Math.min(20, Number(maxStepsPerRun) || 4));
+  const runtimeBudget = Math.max(500, Math.min(30_000, Number(maxRuntimeMs) || 5_000));
+  const started = Date.now();
   let advancedSteps = 0;
   let recoveredRuns = 0;
   let reconciledJobs = 0;
   let planningRuns = 0;
-  let errors = 0;
+  let stateRepairs = 0;
   let budgetExhausted = false;
 
-  for (const candidate of candidates) {
-    if (Date.now() - started >= runtimeBudget) { budgetExhausted = true; break; }
+  const repair = await publicationTransaction(db, agency, creator, (tx) => repairSubscriberDirectoryStateGeneration({ db: tx, agencyId: agency, creatorId: creator }), {
+    maxWaitMs: Math.min(1_000, runtimeBudget), timeoutMs: Math.min(3_000, runtimeBudget),
+  });
+  if (repair?.repaired) stateRepairs += 1;
+
+  for (let runIndex = 0; runIndex < runLimit; runIndex += 1) {
+    const elapsed = Date.now() - started;
+    if (elapsed >= runtimeBudget) { budgetExhausted = true; break; }
+    const candidate = await findSubscriberPublicationDebtForCreator(db, { agencyId: agency, creatorId: creator });
+    if (!candidate) break;
     const job = candidate.jobId && typeof db?.jobInstance?.findUnique === "function"
       ? await db.jobInstance.findUnique({
           where: { id: candidate.jobId },
@@ -1229,87 +1327,104 @@ async function recoverSubscriberPublicationDebt({
         }).catch(() => null)
       : null;
     const state = typeof db?.subscriberDirectoryState?.findUnique === "function"
-      ? await db.subscriberDirectoryState.findUnique({ where: { creatorId: candidate.creatorId }, select: { scanEveryDays: true } }).catch(() => null)
+      ? await db.subscriberDirectoryState.findUnique({ where: { creatorId: creator }, select: { scanEveryDays: true } }).catch(() => null)
       : null;
     const scanEveryDays = integer(job?.params?.scanEveryDays ?? state?.scanEveryDays, DEFAULT_SCAN_EVERY_DAYS, 1, 30);
-    try {
-      let completeResult = null;
-      if (["PUBLISHED", "SUPERSEDED"].includes(String(candidate.status || "")) && String(candidate.publicationStatus || "") === "COMPLETE") {
-        completeResult = { complete: true, run: candidate, summary: candidate.summary || {} };
-      } else {
-        for (let step = 0; step < stepLimit; step += 1) {
-          if (Date.now() - started >= runtimeBudget) { budgetExhausted = true; break; }
-          const result = await publicationTransaction(db, candidate.agencyId, candidate.creatorId, (tx) => advanceSubscriberPublication(tx, {
-            runId: candidate.id,
-            jobId: candidate.jobId || null,
-            scanEveryDays,
-          }));
-          advancedSteps += 1;
-          if (result?.complete) {
-            recoveredRuns += 1;
-            completeResult = result;
-            break;
-          }
+    let completeResult = null;
+    if (["PUBLISHED", "SUPERSEDED"].includes(String(candidate.status || "")) && String(candidate.publicationStatus || "") === "COMPLETE") {
+      completeResult = { complete: true, run: candidate, summary: candidate.summary || {} };
+    } else {
+      for (let step = 0; step < stepLimit; step += 1) {
+        const remaining = runtimeBudget - (Date.now() - started);
+        if (remaining < 300) { budgetExhausted = true; break; }
+        const transactionBudget = Math.max(250, Math.min(5_000, remaining));
+        const result = await publicationTransaction(db, agency, creator, (tx) => advanceSubscriberPublication(tx, {
+          runId: candidate.id,
+          jobId: candidate.jobId || null,
+          scanEveryDays,
+        }), { maxWaitMs: Math.min(1_000, transactionBudget), timeoutMs: transactionBudget });
+        advancedSteps += 1;
+        if (result?.complete) {
+          recoveredRuns += 1;
+          completeResult = result;
+          break;
         }
       }
-      if (!completeResult?.complete) continue;
-      const freshRun = completeResult.run || await db.subscriberScanRun.findUnique({ where: { id: candidate.id } }).catch(() => candidate);
-      let planning = null;
-      const publishedRun = freshRun || candidate;
-      if (String(publishedRun?.status || "") === "PUBLISHED" && subscriberRecoveryJobNeedsPlanning(job, authorityNow)) {
-        planning = await planSubscriberDerivedAutomation({
-          run: publishedRun,
-          userId: null,
-          db,
-          source: "subscriber_snapshot_recovered",
-        });
-        planningRuns += 1;
-      }
-      const reconciled = await reconcileRecoveredSubscriberPublicationJob(db, {
-        run: freshRun || candidate,
-        summary: completeResult.summary || freshRun?.summary || candidate.summary || {},
-        planning,
-        now: authorityNow,
-      });
-      if (reconciled.reconciled) reconciledJobs += 1;
-    } catch (error) {
-      errors += 1;
-      await db.subscriberScanRun.updateMany({
-        where: { id: candidate.id },
-        data: { publicationLastError: clean(error?.message || error, 1000) || "subscriber_publication_recovery_failed" },
-      }).catch(() => null);
     }
+    if (!completeResult?.complete) break;
+    const freshRun = completeResult.run || await db.subscriberScanRun.findUnique({ where: { id: candidate.id } }).catch(() => candidate);
+    let planning = null;
+    const publishedRun = freshRun || candidate;
+    if (String(publishedRun?.status || "") === "PUBLISHED" && subscriberRecoveryJobNeedsPlanning(job, authorityNow)) {
+      if (typeof beforePlanning === "function" && !(await beforePlanning({ run: publishedRun, job }))) {
+        return {
+          ok: true, creatorId: creator, advancedSteps, recoveredRuns, reconciledJobs, planningRuns, stateRepairs,
+          budgetExhausted, staleClaim: true, reason: "maintenance_claim_stale",
+        };
+      }
+      planning = await planSubscriberDerivedAutomation({
+        run: publishedRun,
+        userId: null,
+        db,
+        source: "subscriber_snapshot_recovered",
+      });
+      planningRuns += 1;
+    }
+    const reconciled = await reconcileRecoveredSubscriberPublicationJob(db, {
+      run: freshRun || candidate,
+      summary: completeResult.summary || freshRun?.summary || candidate.summary || {},
+      planning,
+      now: authorityNow,
+    });
+    if (reconciled.reconciled) reconciledJobs += 1;
+    if (!reconciled.reconciled && reconciled.reason === "active_claim") break;
   }
 
   return {
-    ok: errors === 0,
-    candidates: candidates.length,
+    ok: true,
+    creatorId: creator,
     advancedSteps,
     recoveredRuns,
     reconciledJobs,
     planningRuns,
-    errors,
+    stateRepairs,
     budgetExhausted,
-    reason: reconciledJobs ? "reconciled" : (recoveredRuns ? "recovered" : (advancedSteps ? "advanced" : (candidates.length ? "deferred" : "none_due"))),
+    reason: reconciledJobs ? "reconciled" : (recoveredRuns ? "recovered" : (advancedSteps ? "advanced" : (budgetExhausted ? "budget_exhausted" : "none_due"))),
   };
 }
 
-async function cleanupSubscriberScanHistory({ creatorId, keep = 2 } = {}) {
-  const state = await prisma.subscriberDirectoryState.findUnique({ where: { creatorId } });
-  const keepIds = new Set([state?.currentRunId, state?.previousRunId].filter(Boolean));
-  const old = await prisma.subscriberScanRun.findMany({
-    where: {
-      creatorId,
-      status: { in: ["SUPERSEDED", "FAILED"] },
-      ...(keepIds.size ? { id: { notIn: [...keepIds] } } : {}),
-    },
-    orderBy: { createdAt: "desc" },
-    skip: Math.max(0, keep),
-    select: { id: true },
-    take: 50,
-  });
-  if (old.length) await prisma.subscriberScanRun.deleteMany({ where: { id: { in: old.map((item) => item.id) } } });
-  return { deletedRuns: old.length };
+async function cleanupSubscriberScanHistory({ db = prisma, agencyId = null, creatorId, keep = 2, maxRuns = 50 } = {}) {
+  const creator = clean(creatorId, 180);
+  if (!creator) return { deletedRuns: 0, reason: "creator_missing" };
+  let agency = clean(agencyId, 180);
+  if (!agency) {
+    const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId: creator }, select: { agencyId: true } }).catch(() => null);
+    agency = clean(state?.agencyId, 180);
+  }
+  const batch = Math.max(1, Math.min(200, Number(maxRuns) || 50));
+  const retain = Math.max(0, Math.min(20, Number(keep) || 2));
+  const work = async (tx) => {
+    const debt = await tx.subscriberScanRun.findFirst({ where: subscriberPublicationDebtWhere({ agencyId: agency || undefined, creatorId: creator }), select: { id: true } });
+    if (debt) return { deletedRuns: 0, blockedByPublicationDebt: true, reason: "publication_debt" };
+    const state = await tx.subscriberDirectoryState.findUnique({ where: { creatorId: creator }, select: { currentRunId: true, previousRunId: true } }).catch(() => null);
+    const keepIds = new Set([state?.currentRunId, state?.previousRunId].filter(Boolean));
+    const old = await tx.subscriberScanRun.findMany({
+      where: {
+        creatorId: creator,
+        status: { in: ["SUPERSEDED", "FAILED"] },
+        publicationStatus: "COMPLETE",
+        ...(keepIds.size ? { id: { notIn: [...keepIds] } } : {}),
+      },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+      skip: retain,
+      take: batch,
+      select: { id: true },
+    });
+    if (old.length) await tx.subscriberScanRun.deleteMany({ where: { id: { in: old.map((item) => item.id) }, publicationStatus: "COMPLETE" } });
+    return { deletedRuns: old.length, hasMore: old.length === batch, blockedByPublicationDebt: false, reason: old.length ? "deleted" : "none_due" };
+  };
+  if (agency) return publicationTransaction(db, agency, creator, work, { maxWaitMs: 2_000, timeoutMs: 5_000 });
+  return work(db);
 }
 
 async function getSubscriberDirectoryStatus({ agencyId, creatorId }) {
@@ -1535,6 +1650,8 @@ module.exports = {
   applySubscriberScanCompletion,
   recordSubscriberScanFailure,
   recoverSubscriberPublicationDebt,
+  repairSubscriberDirectoryStateGeneration,
+  hasSubscriberPublicationDebt,
   cleanupSubscriberScanHistory,
   getSubscriberDirectoryStatus,
   listHiddenOnline,

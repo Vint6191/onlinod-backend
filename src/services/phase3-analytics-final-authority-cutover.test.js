@@ -159,12 +159,13 @@ test("Subscriber publication is restartable bounded work outside generic complet
   assert.match(fail, /publicationRecoveryPending/);
   assert.match(fail, /recordJobFailure\(\{ db: prisma/);
   assert.match(subscriber, /subscriberPublicationDebtWhere[\s\S]*fanProjectionStatus:\s*"COMPLETE"[\s\S]*publicationStatus:\s*\{ in:\s*\[\.\.\.SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES\]/);
-  assert.match(subscriber, /async function recoverSubscriberPublicationDebt[\s\S]*SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES/);
+  assert.match(subscriber, /async function recoverSubscriberPublicationDebt[\s\S]*SUBSCRIBER_RECOVERY_CREATOR_SCOPE_REQUIRED[\s\S]*findSubscriberPublicationDebtForCreator/);
   assert.match(subscriber, /reconcileRecoveredSubscriberPublicationJob[\s\S]*status:\s*"DONE"/);
   assert.match(subscriber, /publicationJobReconciledAt/);
   assert.match(subscriber, /status:\s*\{ in:\s*\["PUBLISHED", "SUPERSEDED"\] \}[\s\S]*publicationStatus:\s*"COMPLETE"[\s\S]*publicationJobReconciledAt:\s*null/);
   assert.match(subscriber, /planSubscriberDerivedAutomation[\s\S]*subscriber_snapshot_recovered/);
-  assert.match(scheduler, /subscriberPublicationRecovery[\s\S]*recoverSubscriberPublicationDebt/);
+  assert.match(scheduler, /subscriberDirectoryMaintenance[\s\S]*runSubscriberDirectoryMaintenance/);
+  assert.match(subscriber, /SUBSCRIBER_RECOVERY_CREATOR_SCOPE_REQUIRED/);
 });
 
 test("Campaign hot queries have predicate/order-specific indexes and claim SQL matches its expression index", () => {
@@ -248,9 +249,9 @@ test("final migration carries bounded subscriber cursor, durable signal lease an
 test("final physical proof pack is rewritten for the final authority cut and persists proof JSON", () => {
   const proof = source("scripts/audit/phase3-a20-postgres-proof.js");
   const finalPg = source("src/services/phase3-analytics-final-authority-cutover.integration.test.js");
-  assert.match(proof, /EXPECTED_PROOF_TEST_COUNT\s*=\s*40/);
+  assert.match(proof, /EXPECTED_PROOF_TEST_COUNT\s*=\s*42/);
   assert.match(proof, /phase3-analytics-final-authority-cutover\.integration\.test\.js/);
-  assert.match(proof, /artifacts[\s\S]*audit[\s\S]*phase3-a20-postgres-proof\.json/);
+  assert.match(proof, /artifacts[\s\S]*audit[\s\S]*phase3-a26-postgres-proof\.json/);
   assert.match(proof, /physical proof JSON was not persisted/);
   assert.match(finalPg, /FINAL_SUBSCRIBER_POINT_REFRESH_RACE_PASS/);
   assert.match(finalPg, /FINAL_SUBSCRIBER_PERSISTED_CONFLICT_PASS/);

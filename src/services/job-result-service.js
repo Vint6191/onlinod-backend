@@ -27,7 +27,6 @@ const {
   applySubscriberScanChunk,
   applySubscriberScanCompletion,
   recordSubscriberScanFailure,
-  cleanupSubscriberScanHistory,
 } = require("./subscriber-directory-service");
 
 const {
@@ -334,9 +333,7 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
     return { ok: true, type: "fan_data_point_refresh", ...(asObject(result)), demandCoverage };
   }
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) {
-    const applied = await applySubscriberScanCompletion({ db, job, deviceId, userId, result: result || {} });
-    cleanupSubscriberScanHistory({ creatorId: job.creatorId }).catch(() => null);
-    return applied;
+    return applySubscriberScanCompletion({ db, job, deviceId, userId, result: result || {} });
   }
   throw new Error(`No backend result applier registered for ${job.jobKey}`);
 }
