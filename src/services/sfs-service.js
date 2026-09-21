@@ -927,16 +927,25 @@ async function adoptLegacySfsUnfollow({ agencyId, creatorId, targetUserId, targe
   });
 }
 
+function resolveAutomaticSfsResult({ discovery, planning }) {
+  const created = Boolean(discovery?.created || planning?.created);
+  if (planning?.fanRefresh?.requested > 0 && planning.fanRefresh.durable !== true) {
+    return { ok: false, created, reason: "fan_refresh_debt_not_durable", discovery, planning };
+  }
+  const failed = [discovery, planning].find((decision) => decision?.ok === false);
+  if (failed) {
+    return { ok: false, created, reason: failed.reason || "sfs_substep_failed", discovery, planning };
+  }
+  return { ok: true, created, discovery, planning };
+}
+
 async function ensureAutomaticSfs({ agencyId, creatorId, source = "scheduler", db = prisma }) {
   const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
   const settings = normalizeSfsSettings(control.modules.sfs.settings);
   if (!control.effective.sfsEnabled || !settings.automatic) return { ok: true, created: false, reason: "automatic_disabled" };
   const discovery = await scheduleSfsDiscovery({ agencyId, creatorId, source, db }).catch((error) => ({ ok: false, reason: error?.code || error?.message }));
   const planning = await planSfsTargets({ agencyId, creatorId, source, limit: settings.dailyLimit, db }).catch((error) => ({ ok: false, reason: error?.code || error?.message }));
-  if (planning?.fanRefresh?.requested > 0 && planning.fanRefresh.durable !== true) {
-    return { ok: false, created: Boolean(discovery?.created || planning?.created), reason: "fan_refresh_debt_not_durable", discovery, planning };
-  }
-  return { ok: true, created: Boolean(discovery?.created || planning?.created), discovery, planning };
+  return resolveAutomaticSfsResult({ discovery, planning });
 }
 
 module.exports = {
@@ -945,4 +954,5 @@ module.exports = {
   recordSfsJobFailure, planSfsTargets, validateSfsDelivery, finalizeSfsSuccess, finalizeSfsFailure,
   finalizeSfsTerminal, prepareSfsRetry, listSfs, setSfsCandidateState, adoptLegacySfsUnfollow, ensureAutomaticSfs,
   RETRYABLE_FAILURES,
+  _test: { resolveAutomaticSfsResult },
 };

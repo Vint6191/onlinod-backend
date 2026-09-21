@@ -15,7 +15,11 @@
   const esc = (v) => R().escapeHtml(v);
 
   function fmtDate(v) { if (!v) return "—"; const d = new Date(v); return isNaN(d) ? "—" : d.toISOString().slice(0, 16).replace("T", " "); }
-  function fmtMoney(v) { return "$" + (Number(v || 0) / 100).toFixed(2); }
+  function fmtMoney(v, row = null) {
+    if (v == null || (row?.valueAvailability && row.valueAvailability !== "AVAILABLE")) return "—";
+    const n = Number(v);
+    return Number.isFinite(n) ? "$" + (n / 100).toFixed(2) : "—";
+  }
   function trunc(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n) + "…" : s; }
 
   const local = { tab: "overview", creatorId: null, overview: null, tabData: {}, loading: false };
@@ -139,14 +143,18 @@
     cfg.api().then((r) => {
       if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">failed</div>`; return; }
       const items = r.items || [];
+      const readOnly = !cfg.model;
       const head = cfg.cols.map((c) => `<th>${esc(c.label)}</th>`).join("");
       const rows = items.map((row) => {
         const tds = cfg.cols.map((c) => `<td title="${esc(typeof row[c.k] === "object" ? JSON.stringify(row[c.k]) : row[c.k])}">${esc(trunc(c.fmt ? c.fmt(row[c.k], row) : (row[c.k] == null ? "—" : row[c.k]), 40))}</td>`).join("");
-        return `<tr>${tds}<td class="adm-row-actions"><button class="adm-link" data-inspect="${esc(row.id)}">inspect</button><button class="adm-link adm-link-danger" data-del="${esc(row.id)}">del</button></td></tr>`;
+        return readOnly
+          ? `<tr>${tds}</tr>`
+          : `<tr>${tds}<td class="adm-row-actions"><button class="adm-link" data-inspect="${esc(row.id)}">inspect</button><button class="adm-link adm-link-danger" data-del="${esc(row.id)}">del</button></td></tr>`;
       }).join("");
       body.innerHTML = `
-        <div class="adm-muted" style="margin:6px 0">${items.length} shown${r.total != null ? " of " + r.total + " total" : ""}</div>
-        <table class="adm-table"><thead><tr>${head}<th></th></tr></thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows</td></tr>`}</tbody></table>`;
+        <div class="adm-muted" style="margin:6px 0">${items.length} shown${r.total != null ? " of " + r.total + " total" : ""}${readOnly ? " · canonical current · read-only" : ""}</div>
+        <table class="adm-table"><thead><tr>${head}${readOnly ? "" : "<th></th>"}</tr></thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows</td></tr>`}</tbody></table>`;
+      if (readOnly) return;
       body.querySelectorAll("[data-inspect]").forEach((b) => b.addEventListener("click", async () => {
         const rr = await A().dataInspect(cfg.model, b.dataset.inspect);
         if (rr?.ok) showModal(`${cfg.model} · ${b.dataset.inspect}`, `<pre class="adm-json">${esc(JSON.stringify(rr.record, null, 2))}</pre>`);
@@ -177,11 +185,11 @@
       };
       case "hidden": return {
         model: null, api: () => A().dataHiddenOnline({ creatorId: cid, limit: 300 }),
-        cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "status", label: "Status" }, { k: "totalSpentCents", label: "Spent", fmt: fmtMoney }, { k: "lastSignalAt", label: "Last signal", fmt: fmtDate }],
+        cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "status", label: "Status" }, { k: "totalSpentCents", label: "Spent", fmt: fmtMoney }, { k: "observedAt", label: "Observed", fmt: fmtDate }, { k: "statusUpdatedAt", label: "Status updated", fmt: fmtDate }],
       };
       case "followback": return {
         model: null, api: () => A().dataFollowBack({ creatorId: cid, limit: 300 }),
-        cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "action", label: "Action" }, { k: "status", label: "Status" }, { k: "updatedAt", label: "Updated", fmt: fmtDate }],
+        cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "latestActionType", label: "Action" }, { k: "latestStatus", label: "Delivery status" }, { k: "state", label: "Candidate state" }, { k: "currentEligibility", label: "Eligibility" }, { k: "updatedAt", label: "Updated", fmt: fmtDate }],
       };
       case "vault": return {
         model: "vaultMediaSale", api: () => A().dataVaultSales({ creatorId: cid, limit: 300 }),

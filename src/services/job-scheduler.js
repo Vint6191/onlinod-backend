@@ -189,8 +189,21 @@ async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) 
  * @param {number} [args.priority=50]
  * @param {boolean} [args.includeAnalyticsCatchups=false]
  * @param {boolean} [args.includeCreatorAnalytics=true]
- * @returns {Promise<{ created: string[], skipped: string[] }>}
+ * @returns {Promise<{ ok: boolean, created: string[], skipped: string[], degraded: Array<{ work: string, reason: string, created: boolean }> }>}
  */
+function recordDerivedSchedulerOutcome({ created, skipped, degraded, work, decision, createdLabel = work, createdWhen = null, reason = null }) {
+  const didCreate = createdWhen == null ? Boolean(decision?.created) : Boolean(createdWhen);
+  const why = String(reason || decision?.reason || "skipped");
+  if (didCreate) created.push(createdLabel);
+  else skipped.push(`${work}:${why}`);
+  if (decision?.ok === false) degraded.push({ work, reason: why, created: didCreate });
+}
+
+function schedulerPlanningResult(created, skipped, degraded) {
+  const ok = degraded.length === 0;
+  return { ok, reason: ok ? null : degraded[0]?.reason || "derived_planning_degraded", created, skipped, degraded };
+}
+
 async function scheduleInitialJobsForCreator({
   creatorId,
   agencyId,
@@ -200,13 +213,14 @@ async function scheduleInitialJobsForCreator({
   includeEarningsFreshness = true,
   includeCreatorAnalytics = true,
 }) {
-  if (!creatorId || !agencyId) return { created: [], skipped: [] };
+  if (!creatorId || !agencyId) return { ok: true, created: [], skipped: [], degraded: [] };
   const creatorRemoteId = creator?.remoteId || creator?.userId || null;
   const creatorUsername = creator?.username || null;
   const creatorDisplayName = creator?.displayName || null;
 
   const created = [];
   const skipped = [];
+  const degraded = [];
   const now = new Date();
 
   // Creator Analytics bootstrap owns the creator background-read lane until its
@@ -227,7 +241,7 @@ async function scheduleInitialJobsForCreator({
       });
       if (initial.created) created.push(`creator_analytics_initial:${initial.stage}`);
       else skipped.push(`creator_analytics_initial:${initial.stage}:${initial.reason || "waiting"}`);
-      if (!initial.ready) return { created, skipped };
+      if (!initial.ready) return schedulerPlanningResult(created, skipped, degraded);
 
       if (includeAnalyticsCatchups) {
         const catchups = await ensureRecurringCreatorAnalyticsCatchups({
@@ -240,14 +254,14 @@ async function scheduleInitialJobsForCreator({
       const ready = await creatorAnalyticsInitialSyncReady({ creatorId });
       if (!ready) {
         skipped.push("creator_analytics_initial:waiting:distributed_sweep");
-        return { created, skipped };
+        return schedulerPlanningResult(created, skipped, degraded);
       }
     }
   } catch (err) {
     skipped.push(`creator_analytics:${err?.message || "schedule_failed"}`);
     // Fail closed for automatic read work. If bootstrap state cannot be proven,
     // do not start other creator-wide OF scans that can race its recovery.
-    return { created, skipped };
+    return schedulerPlanningResult(created, skipped, degraded);
   }
 
   // Earnings collection is no longer display-range scheduling. A single
@@ -306,38 +320,40 @@ async function scheduleInitialJobsForCreator({
     creatorId,
     source: "recurring_scheduler",
   });
-  if (followBackDecision.created) created.push("follow_back_plan");
-  else skipped.push(`follow_back_plan:${followBackDecision.reason}`);
+  recordDerivedSchedulerOutcome({ created, skipped, degraded, work: "follow_back_plan", decision: followBackDecision });
 
   const bumpDecision = await ensureAutomaticBumps({
     agencyId,
     creatorId,
     source: "recurring_scheduler",
   });
-  if (bumpDecision.created) created.push(`bumps_plan:${bumpDecision.planned}`);
-  else skipped.push(`bumps_plan:${bumpDecision.reason}`);
+  recordDerivedSchedulerOutcome({
+    created, skipped, degraded, work: "bumps_plan", decision: bumpDecision,
+    createdLabel: `bumps_plan:${Number(bumpDecision?.planned || 0)}`,
+  });
 
   const likesDecision = await ensureAutomaticLikes({
     agencyId,
     creatorId,
     source: "recurring_scheduler",
   });
-  if (likesDecision.created) created.push("likes_plan");
-  else skipped.push(`likes_plan:${likesDecision.reason}`);
+  recordDerivedSchedulerOutcome({ created, skipped, degraded, work: "likes_plan", decision: likesDecision });
 
   const followAutomationDecision = await ensureAutomaticFollowAutomation({
     agencyId,
     creatorId,
     source: "recurring_scheduler",
   });
-  if (followAutomationDecision.created) created.push("follow_automation_plan");
-  else skipped.push(`follow_automation_plan:${followAutomationDecision.reason}`);
+  recordDerivedSchedulerOutcome({ created, skipped, degraded, work: "follow_automation_plan", decision: followAutomationDecision });
 
   const sfsDecision = await ensureAutomaticSfs({ agencyId, creatorId, source: "recurring_scheduler" });
-  if (sfsDecision?.planning?.created || sfsDecision?.discovery?.created) created.push("sfs_plan");
-  else skipped.push(`sfs_plan:${sfsDecision?.planning?.reason || sfsDecision?.discovery?.reason || sfsDecision?.reason || "skipped"}`);
+  recordDerivedSchedulerOutcome({
+    created, skipped, degraded, work: "sfs_plan", decision: sfsDecision,
+    createdWhen: Boolean(sfsDecision?.created || sfsDecision?.planning?.created || sfsDecision?.discovery?.created),
+    reason: sfsDecision?.reason || sfsDecision?.planning?.reason || sfsDecision?.discovery?.reason || "skipped",
+  });
 
-  return { created, skipped };
+  return schedulerPlanningResult(created, skipped, degraded);
 }
 
 
@@ -1978,6 +1994,8 @@ async function runRecurringCreatorWork({ db = prisma, now = new Date(), pageSize
   let pages = 0;
   let totalCreated = 0;
   let totalSkipped = 0;
+  let totalDegraded = 0;
+  const degradedCreators = [];
   let dailyCyclesStarted = 0;
   let dailyCyclesSkipped = 0;
 
@@ -2009,6 +2027,8 @@ async function runRecurringCreatorWork({ db = prisma, now = new Date(), pageSize
         });
         totalCreated += result.created.length;
         totalSkipped += result.skipped.length;
+        totalDegraded += result.degraded?.length || 0;
+        if (result.ok === false) degradedCreators.push({ creatorId: creator.id, issues: result.degraded || [] });
       } catch (err) {
         console.warn("[scheduler] regular creator jobs failed:", creator.id, err?.message || err);
       }
@@ -2033,7 +2053,11 @@ async function runRecurringCreatorWork({ db = prisma, now = new Date(), pageSize
     if (creators.length < size) break;
   }
 
-  return { creatorsScanned, pages, totalCreated, totalSkipped, dailyCyclesStarted, dailyCyclesSkipped, pageSize: size };
+  return {
+    ok: totalDegraded === 0, reason: totalDegraded ? "derived_planning_degraded" : null,
+    creatorsScanned, pages, totalCreated, totalSkipped, totalDegraded, degradedCreators,
+    dailyCyclesStarted, dailyCyclesSkipped, pageSize: size,
+  };
 }
 
 /**
@@ -2123,6 +2147,8 @@ async function runRecurringSweepInternal() {
     pages: creatorPages,
     totalCreated,
     totalSkipped,
+    totalDegraded,
+    degradedCreators,
     dailyCyclesStarted,
     dailyCyclesSkipped,
   } = recurringCreatorWork;
@@ -2156,7 +2182,7 @@ async function runRecurringSweepInternal() {
 
   const elapsed = Date.now() - startedAt;
   console.log(
-    `[scheduler] sweep done in ${elapsed}ms — creators=${creatorsScanned}, pages=${creatorPages}, jobs created=${totalCreated}, skipped=${totalSkipped}, daily started=${dailyCyclesStarted}, daily skipped=${dailyCyclesSkipped}`
+    `[scheduler] sweep done in ${elapsed}ms — creators=${creatorsScanned}, pages=${creatorPages}, jobs created=${totalCreated}, skipped=${totalSkipped}, degraded=${totalDegraded}, daily started=${dailyCyclesStarted}, daily skipped=${dailyCyclesSkipped}`
   );
 
   return {
@@ -2164,6 +2190,10 @@ async function runRecurringSweepInternal() {
     creatorPages,
     jobsCreated: totalCreated,
     jobsSkipped: totalSkipped,
+    jobsDegraded: totalDegraded,
+    degradedCreators,
+    creatorWorkOk: recurringCreatorWork.ok,
+    creatorWorkReason: recurringCreatorWork.reason,
     dailyCyclesStarted,
     dailyCyclesSkipped,
     analyticsSweep,

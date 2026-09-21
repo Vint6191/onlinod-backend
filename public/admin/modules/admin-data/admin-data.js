@@ -58,7 +58,8 @@
         { k: "username", label: "Username" },
         { k: "status", label: "Status" },
         { k: "totalSpentCents", label: "Spent", fmt: fmtMoney },
-        { k: "lastSignalAt", label: "Last signal", fmt: fmtDate },
+        { k: "observedAt", label: "Observed", fmt: fmtDate },
+        { k: "statusUpdatedAt", label: "Status updated", fmt: fmtDate },
       ],
     },
     "follow-back": {
@@ -67,8 +68,10 @@
       cols: [
         { k: "fanId", label: "Fan" },
         { k: "username", label: "Username" },
-        { k: "action", label: "Action" },
-        { k: "status", label: "Status" },
+        { k: "latestActionType", label: "Action" },
+        { k: "latestStatus", label: "Delivery status" },
+        { k: "state", label: "Candidate state" },
+        { k: "currentEligibility", label: "Eligibility" },
         { k: "updatedAt", label: "Updated", fmt: fmtDate },
       ],
     },
@@ -97,7 +100,11 @@
   };
 
   function fmtDate(v) { if (!v) return "—"; const d = new Date(v); return isNaN(d) ? "—" : d.toISOString().slice(0, 16).replace("T", " "); }
-  function fmtMoney(v) { const n = Number(v || 0); return "$" + (n / 100).toFixed(2); }
+  function fmtMoney(v, row = null) {
+    if (v == null || (row?.valueAvailability && row.valueAvailability !== "AVAILABLE")) return "—";
+    const n = Number(v);
+    return Number.isFinite(n) ? "$" + (n / 100).toFixed(2) : "—";
+  }
 
   // local view state (kept on the module, simple)
   const view = { tab: "health", entity: "deliveries", filters: { agencyId: "", creatorId: "" }, rows: [], total: 0, statusCounts: null, selected: new Set(), loading: false };
@@ -161,6 +168,8 @@
   // ── BROWSE (entity tables) ──────────────────────────────────
   async function renderBrowse(body) {
     const opts = Object.entries(ENTITIES).map(([k, v]) => `<option value="${k}" ${k === view.entity ? "selected" : ""}>${esc(v.label)}</option>`).join("");
+    const currentEntity = ENTITIES[view.entity];
+    const readOnlyCurrent = !currentEntity?.model;
     body.innerHTML = `
       <div class="adm-data-controls">
         <select id="admEntity">${opts}</select>
@@ -168,11 +177,18 @@
         <input id="admFCreator" placeholder="creatorId (optional)" value="${esc(view.filters.creatorId)}" />
         <button class="adm-btn adm-btn-sm" id="admLoad">load</button>
         <span class="adm-flex-spacer"></span>
-        <button class="adm-btn adm-btn-sm adm-btn-danger" id="admBulkDel" disabled>delete selected</button>
+        <button class="adm-btn adm-btn-sm adm-btn-danger" id="admBulkDel" ${readOnlyCurrent ? "hidden" : ""} disabled>delete selected</button>
       </div>
       <div id="admDataTable"><div class="adm-muted">pick an entity and press load</div></div>`;
 
-    body.querySelector("#admEntity").addEventListener("change", (e) => { view.entity = e.target.value; view.selected.clear(); });
+    body.querySelector("#admEntity").addEventListener("change", (e) => {
+      view.entity = e.target.value;
+      view.selected.clear();
+      const bulk = body.querySelector("#admBulkDel");
+      if (bulk) { bulk.hidden = !ENTITIES[view.entity]?.model; bulk.disabled = true; bulk.textContent = "delete selected"; }
+      const table = body.querySelector("#admDataTable");
+      if (table) table.innerHTML = `<div class="adm-muted">press load to view ${esc(ENTITIES[view.entity]?.label || "entity")}</div>`;
+    });
     body.querySelector("#admLoad").addEventListener("click", () => loadEntity(body));
     body.querySelector("#admBulkDel").addEventListener("click", () => bulkDelete(body));
   }
@@ -198,13 +214,15 @@
     const statusBar = view.statusCounts
       ? `<div class="adm-status-bar">${Object.entries(view.statusCounts).map(([s, n]) => `<span>${esc(s)}: <b>${esc(n)}</b></span>`).join("")}</div>` : "";
 
-    const head = `<tr><th class="adm-col-check"><input type="checkbox" id="admChkAll"></th>${ent.cols.map((c) => `<th>${esc(c.label)}</th>`).join("")}<th></th></tr>`;
+    const readOnly = !ent.model;
+    const head = `<tr>${readOnly ? "" : '<th class="adm-col-check"><input type="checkbox" id="admChkAll"></th>'}${ent.cols.map((c) => `<th>${esc(c.label)}</th>`).join("")}${readOnly ? "" : "<th></th>"}</tr>`;
     const rows = view.rows.map((row) => {
       const cells = ent.cols.map((c) => {
         const raw = row[c.k];
-        const val = c.fmt ? c.fmt(raw) : (raw == null ? "—" : String(raw));
+        const val = c.fmt ? c.fmt(raw, row) : (raw == null ? "—" : String(raw));
         return `<td title="${esc(typeof raw === "object" ? JSON.stringify(raw) : raw)}">${esc(truncate(val, 40))}</td>`;
       }).join("");
+      if (readOnly) return `<tr>${cells}</tr>`;
       return `<tr data-id="${esc(row.id)}">
         <td class="adm-col-check"><input type="checkbox" class="admRowChk" data-id="${esc(row.id)}"></td>
         ${cells}
@@ -217,8 +235,10 @@
 
     table.innerHTML = `
       ${statusBar}
-      <div class="adm-muted" style="margin:6px 0">${view.rows.length} shown of ${view.total} total</div>
+      <div class="adm-muted" style="margin:6px 0">${view.rows.length} shown of ${view.total} total${readOnly ? " · canonical current · read-only" : ""}</div>
       <table class="adm-table"><thead>${head}</thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows</td></tr>`}</tbody></table>`;
+
+    if (readOnly) { updateBulkBtn(body); return; }
 
     // select-all
     table.querySelector("#admChkAll")?.addEventListener("change", (e) => {
@@ -231,15 +251,24 @@
   }
 
   function toggleSel(id, on) { if (on) view.selected.add(id); else view.selected.delete(id); }
-  function updateBulkBtn(body) { const b = body.querySelector("#admBulkDel"); if (b) { b.disabled = view.selected.size === 0; b.textContent = view.selected.size ? `delete selected (${view.selected.size})` : "delete selected"; } }
+  function updateBulkBtn(body) {
+    const b = body.querySelector("#admBulkDel");
+    if (!b) return;
+    const mutable = Boolean(ENTITIES[view.entity]?.model);
+    b.hidden = !mutable;
+    b.disabled = !mutable || view.selected.size === 0;
+    b.textContent = mutable && view.selected.size ? `delete selected (${view.selected.size})` : "delete selected";
+  }
 
   async function inspect(model, id) {
+    if (!model) return;
     const r = await A().dataInspect(model, id);
     if (!r || !r.ok) { R().toast("inspect failed", "error"); return; }
     showModal(`${model} · ${id}`, `<pre class="adm-json">${esc(JSON.stringify(r.record, null, 2))}</pre>`);
   }
 
   async function delOne(body, model, id) {
+    if (!model) return;
     if (!confirm(`Delete this ${model}? (soft if supported)`)) return;
     const r = await A().dataDeleteRecord(model, id);
     R().toast(r?.ok ? "deleted" : "delete failed", r?.ok ? "ok" : "error");
@@ -249,7 +278,7 @@
   async function bulkDelete(body) {
     const ent = ENTITIES[view.entity];
     const ids = Array.from(view.selected);
-    if (!ids.length) return;
+    if (!ent.model || !ids.length) return;
     if (!confirm(`Delete ${ids.length} ${ent.label} records?`)) return;
     const r = await A().dataBulkDelete({ model: ent.model, ids });
     R().toast(r?.ok ? `deleted ${r.deleted}` : "bulk delete failed", r?.ok ? "ok" : "error");
