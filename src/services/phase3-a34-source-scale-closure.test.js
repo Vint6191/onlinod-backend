@@ -88,6 +88,28 @@ test("A34 recurring creator planning is durable, bounded, fair and timer-visible
   assert.match(scheduler, /getRecurringSchedulerHealthSnapshot/);
 });
 
+test("A35 recurring work closes physical Creator deletion without an absent-identity UPDATE", () => {
+  const migration = source("prisma/migrations/20260922170000_phase3_a35_creator_recurring_delete_closure_v1/migration.sql");
+  const fixture = source("scripts/audit/phase3-postgres-proof-fixture-authority.js");
+  const deleteStart = migration.indexOf("IF TG_OP='DELETE' THEN");
+  const deleteEnd = migration.indexOf("END IF;", deleteStart);
+  const deleteBranch = migration.slice(deleteStart, deleteEnd);
+
+  assert.ok(deleteStart >= 0 && deleteEnd > deleteStart);
+  assert.match(deleteBranch, /DELETE FROM "DomainWorkItem"/);
+  assert.match(deleteBranch, /"workClass"=v_work_class/);
+  assert.match(deleteBranch, /"objectType"='CreatorAccount'/);
+  assert.match(deleteBranch, /"objectId"=OLD\."id"/);
+  assert.doesNotMatch(deleteBranch, /UPDATE "DomainWorkItem"/);
+  assert.match(migration, /IF v_old_eligible AND NOT \(v_new_eligible AND v_same_identity\)[\s\S]*UPDATE "DomainWorkItem"/);
+
+  const drainCall = fixture.indexOf("drainPhase3PostgresAgencyDomainWork(tx, id)", fixture.indexOf("async function cleanupPhase3PostgresAgencyFixture"));
+  const creatorDelete = fixture.indexOf("tx.creatorAccount.deleteMany", drainCall);
+  const agencyDelete = fixture.indexOf("tx.agency.deleteMany", creatorDelete);
+  assert.ok(drainCall >= 0 && creatorDelete > drainCall && agencyDelete > creatorDelete,
+    "fixture teardown must drain DomainWork, then Creators, then Agency");
+});
+
 test("A34 Hidden status has one canonical writer boundary and an atomic projection migration", () => {
   const subscriber = source("src/services/subscriber-directory-service.js");
   const likes = source("src/services/likes-service.js");

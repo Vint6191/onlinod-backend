@@ -243,6 +243,20 @@ test("A34 PostgreSQL: expired recurring claim is fenced, restart takes over and 
     work = await dbA.domainWorkItem.findFirst({ where: { workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING, creatorId: scope.creatorId } });
     assert.equal(work?.isOutstanding, true);
     assert.equal(work?.state, "READY");
+    await withPhase3PostgresFixtureAuthority(dbA, async (tx) => {
+      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, scope.agencyId);
+      await tx.creatorAccount.delete({ where: { id: scope.creatorId } });
+    });
+    assert.equal(await dbA.creatorAccount.count({ where: { id: scope.creatorId } }), 0);
+    assert.equal(await dbA.domainWorkItem.count({
+      where: {
+        agencyId: scope.agencyId,
+        workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING,
+        objectType: "CreatorAccount",
+        objectId: scope.creatorId,
+      },
+    }), 0);
+    console.log("# A35_CREATOR_RECURRING_PHYSICAL_DELETE_PASS");
     console.log("# A34_RECURRING_PLANNING_RESTART_LIFECYCLE_PASS");
   } finally {
     await cleanupPhase3PostgresAgencyFixture(dbA, scope.agencyId);

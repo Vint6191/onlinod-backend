@@ -59,18 +59,30 @@ async function withPhase3PostgresFixtureAuthority(db, work, options = undefined)
   }, options);
 }
 
+async function drainPhase3PostgresAgencyDomainWork(tx, agencyId) {
+  // Phase3 fixture agencies are isolated and disposable. Drain operational work
+  // before Creator identities in one set-based statement, matching production
+  // destructive ordering and avoiding one nested work DELETE per Creator trigger.
+  const result = await tx.domainWorkItem.deleteMany({ where: { agencyId } });
+  return Number(result?.count || 0);
+}
+
 async function cleanupPhase3PostgresAgencyFixture(db, agencyId) {
   const id = String(agencyId || "").trim();
-  if (!id) return { agencyDeleted: 0, creatorsDeleted: 0 };
+  if (!id) return { agencyDeleted: 0, creatorsDeleted: 0, domainWorkDeleted: 0 };
   return withPhase3PostgresFixtureAuthority(db, async (tx) => {
-    // A26: teardown is set-based and bounded by SQL statement count. The current
-    // Creator writer generation authorizes physical fixture deletion; deleting all
-    // Creator rows first keeps AgencyCreatorCatalogState triggers schema-local and
-    // leaves the Agency parent alive until every Creator AFTER DELETE trigger commits.
+    // Teardown is set-based and bounded by SQL statement count. Keep Agency alive
+    // while DomainWork/Creator AFTER DELETE projections commit, then let its cascade
+    // remove all remaining tenant-owned fixture rows.
     await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, id);
+    const domainWorkDeleted = await drainPhase3PostgresAgencyDomainWork(tx, id);
     const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
     const agencyResult = await tx.agency.deleteMany({ where: { id } });
-    return { agencyDeleted: Number(agencyResult?.count || 0), creatorsDeleted: Number(creatorResult?.count || 0) };
+    return {
+      agencyDeleted: Number(agencyResult?.count || 0),
+      creatorsDeleted: Number(creatorResult?.count || 0),
+      domainWorkDeleted,
+    };
   }, { maxWait: 10_000, timeout: 120_000 });
 }
 
@@ -82,15 +94,17 @@ async function cleanupPhase3PostgresFixtureGraph(db, {
 } = {}) {
   const id = String(agencyId || "").trim();
   const users = [...new Set((Array.isArray(userIds) ? userIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
-  if (!id && !users.length) return { agencyDeleted: 0, creatorsDeleted: 0, usersDeleted: 0 };
+  if (!id && !users.length) return { agencyDeleted: 0, creatorsDeleted: 0, domainWorkDeleted: 0, usersDeleted: 0 };
   return withPhase3PostgresFixtureAuthority(db, async (tx) => {
     let creatorsDeleted = 0;
     let agencyDeleted = 0;
+    let domainWorkDeleted = 0;
     if (id) {
       await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, id);
-      // Keep the Agency parent alive until Creator AFTER DELETE/catalog triggers
-      // complete, then let Agency cascades remove WorkerDevice and tenant-owned
-      // fixture rows before deleting the User identity.
+      // Drain non-historical operational work before Creator identities. Keep the
+      // Agency parent alive until all work/catalog delete triggers complete, then
+      // cascade tenant rows before deleting the User identity.
+      domainWorkDeleted = await drainPhase3PostgresAgencyDomainWork(tx, id);
       const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
       creatorsDeleted = Number(creatorResult?.count || 0);
       const agencyResult = await tx.agency.deleteMany({ where: { id } });
@@ -102,6 +116,7 @@ async function cleanupPhase3PostgresFixtureGraph(db, {
     return {
       agencyDeleted,
       creatorsDeleted,
+      domainWorkDeleted,
       usersDeleted: Number(userResult?.count || 0),
     };
   }, { maxWait: 10_000, timeout: 120_000 });
@@ -111,6 +126,7 @@ module.exports = {
   auditSchemaFromDatabaseUrl,
   pinPhase3AuditSchema,
   withPhase3PostgresFixtureAuthority,
+  drainPhase3PostgresAgencyDomainWork,
   cleanupPhase3PostgresAgencyFixture,
   cleanupPhase3PostgresFixtureGraph,
 };
