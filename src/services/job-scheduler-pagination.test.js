@@ -11,6 +11,7 @@ const prismaPath = require.resolve("../prisma");
 const plannerPath = require.resolve("./analytics-collection-planner");
 const orchestratorPath = require.resolve("./creator-analytics-sync-orchestrator");
 const dailyPath = require.resolve("./vault-intelligence-daily-service");
+const domainWorkPath = require.resolve("./domain-work-authority-service");
 const schedulerPath = require.resolve("./job-scheduler");
 
 const creators = Array.from({ length: 7 }, (_, index) => ({
@@ -70,29 +71,43 @@ cacheModule(dailyPath, {
     return { ok: true, created: 0 };
   },
 });
+cacheModule(domainWorkPath, {
+  WORK_CLASS: { CREATOR_RECURRING_PLANNING: "CREATOR_RECURRING_PLANNING" },
+  async claimDomainWorkBatch(input) {
+    assert.equal(input.workClass, "CREATOR_RECURRING_PLANNING");
+    return {
+      ownerToken: "planning-owner",
+      authorityNow: new Date("2026-09-08T18:05:00.000Z"),
+      items: creators.slice(0, input.limit).map((row, index) => ({ id: `work-${index}`, agencyId: row.agencyId, creatorId: row.id, objectId: row.id })),
+    };
+  },
+  async heartbeatDomainWorkClaim() { return { renewed: true, authorityNow: new Date("2026-09-08T18:05:00.000Z") }; },
+  async ackDomainWorkClaim() { return { acknowledged: true }; },
+  async failDomainWorkClaim() { return { failed: true }; },
+  async yieldDomainWorkClaim() { return { yielded: true }; },
+});
 
 delete require.cache[schedulerPath];
 const { runRecurringCreatorWork, runCreatorAnalyticsCatchupSweep } = require("./job-scheduler");
 
-test("generic recurring READY traversal cursor-pages beyond one bounded page with no 10k horizon", async () => {
+test("generic recurring planning claims one bounded durable batch without a READY catalog scan", async () => {
   genericQueries = 0;
   dailyCalls = 0;
   const db = {
     creatorAccount: {
-      async findMany(input) {
+      async findFirst(input) {
         genericQueries += 1;
-        assert.equal(input.take, 3);
-        assert.deepEqual(input.orderBy, [{ id: "asc" }]);
-        return pageRows(input);
+        return creators.find((row) => row.id === input.where.id) || null;
       },
     },
   };
 
   const result = await runRecurringCreatorWork({ db, now: new Date("2026-09-08T18:05:00.000Z"), pageSize: 3 });
-  assert.equal(result.creatorsScanned, 7);
-  assert.equal(result.pages, 3);
+  assert.equal(result.creatorsScanned, 3);
+  assert.equal(result.selected, 3);
+  assert.equal(result.pages, 1);
   assert.equal(genericQueries, 3);
-  assert.equal(dailyCalls, 7);
+  assert.equal(dailyCalls, 3);
 });
 
 test("Creator Analytics catchups have one durable paginated sweep lane separate from generic recurring work", async () => {

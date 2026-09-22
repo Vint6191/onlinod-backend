@@ -32,6 +32,7 @@ const PROOF_TESTS = [
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-11.integration.test.js"),
   path.join(ROOT, "src/services/phase3-campaign-closure-a20-12.integration.test.js"),
   path.join(ROOT, "src/services/phase3-analytics-final-authority-cutover.integration.test.js"),
+  path.join(ROOT, "src/services/phase3-a34-source-scale-closure.integration.test.js"),
   path.join(ROOT, "src/services/phase3-a20-operational-runtime.integration.test.js"),
 ];
 

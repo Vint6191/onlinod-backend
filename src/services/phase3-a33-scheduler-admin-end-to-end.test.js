@@ -23,14 +23,14 @@ function installSchedulerDecisionHarness() {
   const sfsPath = require.resolve("./sfs-service");
   const analyticsOrchestratorPath = require.resolve("./creator-analytics-sync-orchestrator");
   const dailyPath = require.resolve("./vault-intelligence-daily-service");
+  const domainWorkPath = require.resolve("./domain-work-authority-service");
   const schedulerPath = require.resolve("./job-scheduler");
 
   const degraded = (created = true) => ({ ok: false, created, reason: "fan_refresh_debt_not_durable" });
   const prisma = {
     creatorAccount: {
-      async findMany(args) {
-        if (args?.where?.id?.gt) return [];
-        return [{ id: "creator-a33", agencyId: "agency-a33", remoteId: "of-a33", username: "a33", displayName: "A33" }];
+      async findFirst() {
+        return { id: "creator-a33", agencyId: "agency-a33", remoteId: "of-a33", username: "a33", displayName: "A33" };
       },
     },
     jobInstance: {
@@ -43,7 +43,7 @@ function installSchedulerDecisionHarness() {
     async runRetentionSweep() { return { totalDeleted: 0 }; },
     async getRetentionSettings() { return { settings: { retentionSweepWindowHours: 24 } }; },
   });
-  cacheModule(subscriberPath, { async ensureSubscriberScanDue() { return { created: false, reason: "fresh" }; } });
+  cacheModule(subscriberPath, { async ensureSubscriberScanDue() { return { ok: true, created: false, reason: "fresh" }; } });
   cacheModule(followBackPath, { async ensureAutomaticFollowBack() { return degraded(true); } });
   cacheModule(bumpPath, { async ensureAutomaticBumps() { return { ...degraded(true), planned: 1 }; } });
   cacheModule(likesPath, { async ensureAutomaticLikes() { return degraded(true); } });
@@ -56,6 +56,16 @@ function installSchedulerDecisionHarness() {
   });
   cacheModule(dailyPath, {
     async ensureDailyVaultIntelligenceCycle() { return { ok: true, created: 0 }; },
+  });
+  cacheModule(domainWorkPath, {
+    WORK_CLASS: { CREATOR_RECURRING_PLANNING: "CREATOR_RECURRING_PLANNING" },
+    async claimDomainWorkBatch() {
+      return { ownerToken: "owner-a33", authorityNow: new Date(), items: [{ id: "work-a33", agencyId: "agency-a33", creatorId: "creator-a33", objectId: "creator-a33" }] };
+    },
+    async heartbeatDomainWorkClaim() { return { renewed: true, authorityNow: new Date() }; },
+    async ackDomainWorkClaim() { return { acknowledged: true }; },
+    async failDomainWorkClaim() { return { failed: true }; },
+    async yieldDomainWorkClaim() { return { yielded: true }; },
   });
 
   delete require.cache[schedulerPath];

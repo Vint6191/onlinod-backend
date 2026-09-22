@@ -52,7 +52,7 @@ const prisma = require("./prisma");
 const logger = require("./utils/logger");
 const { buildBackendHealthSnapshot } = require("./utils/health-snapshot");
 const { TEAM_CONTROL_PLANE_GENERATION, readTeamControlPlaneReleaseAuthority, readTeamControlPlaneDbFenceStatus } = require("./services/phase2-release-compatibility-authority-service");
-const { startRecurringScheduler } = require("./services/job-scheduler");
+const { startRecurringScheduler, getRecurringSchedulerHealthSnapshot } = require("./services/job-scheduler");
 
 const legacyAnalyticsRoutes = createLegacyGoneRouter("analytics_snapshots", "/api/home + /api/stats");
 const legacyCrmRoutes = createLegacyGoneRouter("server_crm", "Desktop local CRM authority");
@@ -251,11 +251,13 @@ app.get("/health/details", async (_req, res) => {
       authority: release,
       dbFence,
     };
+    snapshot.recurringScheduler = getRecurringSchedulerHealthSnapshot();
     return res.json(snapshot);
   } catch (err) {
     logger.warn("health details database/release check failed", { error: err?.message || String(err) });
     const snapshot = buildBackendHealthSnapshot({ database: "error" });
     snapshot.teamControlPlane = { ready: false, expectedGeneration: TEAM_CONTROL_PLANE_GENERATION, authority: null, dbFence: null };
+    snapshot.recurringScheduler = getRecurringSchedulerHealthSnapshot();
     return res.status(503).json(snapshot);
   }
 });

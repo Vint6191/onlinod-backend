@@ -1,8 +1,8 @@
 {
-  "version": "A33",
+  "version": "A34",
   "algorithm": "sha256-canonical-json-files-v1",
-  "testCount": 51,
-  "manifestSha256": "8c3d5ffb0f2cf2805c2d5d5a53b24ef3084fe6506ec8f665b2a8c7df8e638d01",
+  "testCount": 54,
+  "manifestSha256": "13db919fec16490da86dcb96d91ac7372c7efdedb12cb7f44d8f7c8bd7b8bf02",
   "files": [
     {
       "file": "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js",
@@ -106,6 +106,14 @@
         "A21 PostgreSQL: two Subscriber recovery replicas serialize one FAILED publication generation and converge monotonically",
         "A33 PostgreSQL: 500-candidate Likes/SFS refresh debt is durable, consumer-specific, race-safe and terminal-failure visible",
         "A33 PostgreSQL: terminal refresh debt retries after restart in the next bucket and converges without duplicates"
+      ]
+    },
+    {
+      "file": "src/services/phase3-a34-source-scale-closure.integration.test.js",
+      "testNames": [
+        "A34 PostgreSQL: Hidden status command, projection rollback and concurrent writers converge atomically",
+        "A34 PostgreSQL: 4000 creators publish bounded fair work and two replicas claim disjoint batches",
+        "A34 PostgreSQL: expired recurring claim is fenced, restart takes over and creator lifecycle revokes/reopens work"
       ]
     },
     {

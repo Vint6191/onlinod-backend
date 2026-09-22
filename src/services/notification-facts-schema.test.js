@@ -136,7 +136,7 @@ test("automatic creator scheduling delegates notification history to the strict 
   const body = scheduler.slice(start, end);
   assert.match(body, /ensureInitialCreatorAnalyticsSync/);
   assert.match(body, /ensureRecurringCreatorAnalyticsCatchups/);
-  assert.match(body, /if \(!initial\.ready\) return \{ created, skipped \}/);
+  assert.match(body, /if \(!initial\.ready\)[\s\S]*schedulerPlanningResult\(created, skipped, degraded, outcomes\)/);
   assert.ok(body.indexOf("ensureInitialCreatorAnalyticsSync") < body.indexOf("ensureOperationalAnalyticsFreshness"), "bootstrap gate must run before canonical earnings freshness planning");
   assert.match(body, /ensureOperationalAnalyticsFreshness/);
   assert.match(body, /includeEarningsFreshness/);

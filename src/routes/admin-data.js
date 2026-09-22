@@ -87,8 +87,8 @@ const MODELS = {
   crmAnalysisRun:     { d: () => prisma.crmAnalysisRun,     soft: false },
   automationDelivery: { d: () => prisma.automationDelivery, soft: false, deleteProtected: true },
   bumpDeliveryStat:   { d: () => prisma.bumpDeliveryStat,   soft: false },
-  hiddenOnlineUser:   { d: () => prisma.hiddenOnlineUser,   soft: false },
-  followBackTask:     { d: () => prisma.followBackTask,     soft: false },
+  hiddenOnlineUser:   { d: () => prisma.hiddenOnlineUser,   soft: false, deleteProtected: true },
+  followBackTask:     { d: () => prisma.followBackTask,     soft: false, deleteProtected: true },
   vaultMediaSale:     { d: () => prisma.vaultMediaSale,     soft: false },
   vaultPurchaseMessage:{d: () => prisma.vaultPurchaseMessage,soft: false },
   moneyAttribution:   { d: () => prisma.moneyAttribution,   soft: false },
@@ -365,11 +365,14 @@ router.get("/search", async (req, res) => {
       prisma.creatorAccount.findMany({ where: { OR: [{ displayName: ci }, { username: ci }, { id: q }, { remoteId: q }] }, take, select: { id: true, displayName: true, username: true, agencyId: true, status: true } }),
       prisma.user.findMany({ where: { OR: [{ email: ci }, { name: ci }, { id: q }] }, take, select: { id: true, email: true, name: true } }),
       prisma.crmProfile.findMany({ where: { OR: [{ fanId: q }, { username: ci }, { name: ci }] }, take, select: { id: true, fanId: true, username: true, name: true, creatorId: true, agencyId: true } }),
-      prisma.hiddenOnlineUser.findMany({ where: { OR: [{ fanId: q }, { username: ci }] }, take, select: { id: true, fanId: true, username: true, creatorId: true, status: true } }),
+      // Hidden status is canonical current authority, not a historical fuzzy-search
+      // table. Exact fanId lookup stays index-backed across creators; username search
+      // belongs to canonical fan identity/CRM surfaces above.
+      prisma.hiddenOnlineUser.findMany({ where: { fanId: q }, take, select: { id: true, fanId: true, username: true, creatorId: true, status: true } }),
       prisma.automationDelivery.findMany({ where: { OR: [{ messageId: q }, { fanId: q }] }, take, select: { id: true, fanId: true, messageId: true, status: true, creatorId: true } }),
     ]);
 
-    return res.json({ ok: true, q, results: { agencies, creators, users, crmProfiles, hiddenOnlineHistoricalCompatibility: hidden, deliveries: deliveriesByMsg } });
+    return res.json({ ok: true, q, results: { agencies, creators, users, crmProfiles, hiddenOnline: hidden, hiddenOnlineHistoricalCompatibility: hidden, deliveries: deliveriesByMsg } });
   } catch (err) { return sendErr(res, err); }
 });
 

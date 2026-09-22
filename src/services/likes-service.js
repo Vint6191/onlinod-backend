@@ -118,9 +118,8 @@ async function eligibleDiscoveryFans({ agencyId, creatorId, settings, snapshotRu
   if (!rows.length) return [];
   const ids = rows.map((row) => row.fanId);
   const failedRetryCutoff = new Date(now.getTime() - 15 * 60_000);
-  const [hiddenStatuses, bumpStates, recentDiscovery] = await Promise.all([
+  const [hiddenStatuses, recentDiscovery] = await Promise.all([
     db.hiddenOnlineUser.findMany({ where: { agencyId, creatorId, fanId: { in: ids }, status: { in: ["ignored", "blocked"] } }, select: { fanId: true } }),
-    db.automationBumpFanState.findMany({ where: { agencyId, creatorId, fanId: { in: ids }, OR: [{ ignored: true }, { blocked: true }] }, select: { fanId: true } }),
     force ? Promise.resolve([]) : db.automationContentDiscoveryState.findMany({
       where: {
         agencyId, creatorId, ownerFanId: { in: ids }, sourceKey: "fan_posts", snapshotRunId,
@@ -132,7 +131,7 @@ async function eligibleDiscoveryFans({ agencyId, creatorId, settings, snapshotRu
       select: { ownerFanId: true }, take: 10_000,
     }),
   ]);
-  const excluded = new Set([...hiddenStatuses, ...bumpStates].map((row) => row.fanId));
+  const excluded = new Set(hiddenStatuses.map((row) => row.fanId));
   const fresh = new Set(recentDiscovery.map((row) => row.ownerFanId));
   return rows.filter((row) => !excluded.has(row.fanId) && (force || !fresh.has(row.fanId))).slice(0, Math.max(1, Number(maxFans) || 500));
 }
@@ -329,11 +328,11 @@ async function recordLikesDiscoveryFailure({ job, error, db = prisma }) {
 
 async function currentBlockedFans({ agencyId, creatorId, fanIds, db }) {
   if (!fanIds.length) return new Set();
-  const [hidden, bump] = await Promise.all([
-    db.hiddenOnlineUser.findMany({ where: { agencyId, creatorId, fanId: { in: fanIds }, status: { in: ["ignored", "blocked"] } }, select: { fanId: true } }),
-    db.automationBumpFanState.findMany({ where: { agencyId, creatorId, fanId: { in: fanIds }, OR: [{ ignored: true }, { blocked: true }] }, select: { fanId: true } }),
-  ]);
-  return new Set([...hidden, ...bump].map((row) => row.fanId));
+  const hidden = await db.hiddenOnlineUser.findMany({
+    where: { agencyId, creatorId, fanId: { in: fanIds }, status: { in: ["ignored", "blocked"] } },
+    select: { fanId: true },
+  });
+  return new Set(hidden.map((row) => row.fanId));
 }
 
 async function planLikesLocked({ db, agencyId, creatorId, userId = null, candidateIds = [], source = "manual", manual = true, priority = 60 }) {
@@ -512,6 +511,21 @@ async function planLikes(input) {
   return { ...result, refreshFanIds: fanRefresh.fanIds, fanRefresh };
 }
 
+function resolveAutomaticLikesResult({ discovery, planning }) {
+  const created = Boolean(discovery?.created || planning?.created);
+  if (planning?.fanRefresh?.requested > 0 && planning.fanRefresh.durable !== true) {
+    return { ok: false, created, reason: "fan_refresh_debt_not_durable", discovery, planning };
+  }
+  const failed = [discovery, planning].find((decision) => decision?.ok === false);
+  if (failed) {
+    return { ok: false, created, reason: failed.reason || failed.code || "likes_substep_failed", discovery, planning };
+  }
+  if (!discovery || !planning || typeof discovery.ok !== "boolean" || typeof planning.ok !== "boolean") {
+    return { ok: false, created, reason: "likes_substep_malformed", discovery, planning };
+  }
+  return { ok: true, created, reason: created ? "planned" : "nothing_due", discovery, planning };
+}
+
 async function ensureAutomaticLikes({ agencyId, creatorId, source = "automatic", db = prisma }) {
   let control;
   try { control = await getAutomationControlSnapshot({ agencyId, creatorId, db }); }
@@ -519,12 +533,13 @@ async function ensureAutomaticLikes({ agencyId, creatorId, source = "automatic",
   if (!control.effective.likesEnabled) return { ok: true, created: false, reason: "module_disabled" };
   const settings = normalizeLikesSettings(control.modules.likes.settings);
   if (!settings.automatic) return { ok: true, created: false, reason: "automatic_disabled" };
-  const discovery = await scheduleLikesDiscovery({ agencyId, creatorId, source, force: false, maxFans: settings.discoveryBatchSize * 2, priority: 25, db });
-  const planning = await planLikes({ agencyId, creatorId, source, manual: false, priority: 40, db });
-  if (planning?.fanRefresh?.requested > 0 && planning.fanRefresh.durable !== true) {
-    return { ok: false, created: discovery.created || planning.created, reason: "fan_refresh_debt_not_durable", discovery, planning };
-  }
-  return { ok: true, created: discovery.created || planning.created, discovery, planning };
+  const discovery = await scheduleLikesDiscovery({
+    agencyId, creatorId, source, force: false, maxFans: settings.discoveryBatchSize * 2, priority: 25, db,
+  }).catch((error) => ({ ok: false, created: false, reason: error?.code || error?.message || "likes_discovery_failed" }));
+  const planning = await planLikes({
+    agencyId, creatorId, source, manual: false, priority: 40, db,
+  }).catch((error) => ({ ok: false, created: false, reason: error?.code || error?.message || "likes_planning_failed" }));
+  return resolveAutomaticLikesResult({ discovery, planning });
 }
 
 async function validateLikeDelivery({ delivery, control, now = new Date(), db = prisma }) {
@@ -756,4 +771,5 @@ module.exports = {
   prepareLikeRetry,
   listLikes,
   setLikeCandidateState,
+  _test: { resolveAutomaticLikesResult },
 };

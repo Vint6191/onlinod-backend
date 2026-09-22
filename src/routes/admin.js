@@ -86,6 +86,7 @@ const {
   listPoisonedSubscriberMaintenanceSignals,
   requeuePoisonedSubscriberMaintenanceSignal,
 } = require("../services/subscriber-directory-maintenance-signal-service");
+const { getRecurringSchedulerHealthSnapshot } = require("../services/job-scheduler");
 
 const router = express.Router();
 
@@ -405,8 +406,9 @@ router.get("/dashboard", async (_req, res) => {
 // ════════════════════════════════════════════════════════════
 
 router.get("/system/health", async (_req, res) => {
+  const recurringScheduler = getRecurringSchedulerHealthSnapshot();
   const result = {
-    ok: true,
+    ok: recurringScheduler.status !== "DEGRADED",
     server: {
       version: process.env.npm_package_version || "0.7.1",
       node: process.version,
@@ -421,6 +423,7 @@ router.get("/system/health", async (_req, res) => {
       publicBaseUrl: process.env.PUBLIC_BASE_URL || null,
       nodeEnv: process.env.NODE_ENV || "development",
     },
+    recurringScheduler,
   };
 
   try {

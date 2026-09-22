@@ -156,7 +156,10 @@ test("Closure4 real FollowBack and Follow Automation planning paths survive a qu
     }));
     restores.push(cacheModule("./automation-pacing-service", { nextAutomationWriteSlot: async () => new Date() }));
     restores.push(cacheModule("./automation-action-delivery-service", { listActionDeliveries: async () => ({ items: [] }), retryActionDelivery: async () => ({}) }));
-    restores.push(cacheModule("./fan-data-authority-service", { readFanCurrent: async () => [] }));
+    restores.push(cacheModule("./fan-data-authority-service", {
+      readFanCurrent: async () => [],
+      scheduleDurableFanDataRefreshDebt: async () => ({ requested: 0, durable: true, fanIds: [] }),
+    }));
 
     const followBackId = require.resolve("./follow-back-service");
     const followAutomationId = require.resolve("./follow-automation-service");

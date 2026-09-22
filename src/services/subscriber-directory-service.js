@@ -9,7 +9,8 @@ const { projectSubscriberDirectoryItems, readFanCurrent, scheduleFanDataPointRef
 const { createPlannedJob, publishPlannedJobAvailable } = require("./job-planning-repository");
 const { consumeFanObservationToken } = require("./fan-observation-token-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
-const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { lockDbAdvisoryXact } = require("./db-transaction-service");
+const { lockAutomationWriteCommitFence, runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const {
   SUBSCRIBER_MAINTENANCE_KIND,
   signalSubscriberDirectoryMaintenance,
@@ -114,11 +115,8 @@ function runSummary(run) {
 }
 
 async function lockSubscriberPublicationCreator(db, agencyId, creatorId) {
-  if (!agencyId || !creatorId || typeof db?.$executeRawUnsafe !== "function") return;
-  await db.$executeRawUnsafe(
-    `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))`,
-    `subscriber-publication:${agencyId}:${creatorId}`,
-  );
+  if (!agencyId || !creatorId) return;
+  await lockDbAdvisoryXact({ db, key: `subscriber-publication:${agencyId}:${creatorId}` });
 }
 
 function subscriberPublicationDebtWhere({ agencyId, creatorId } = {}) {
@@ -141,6 +139,7 @@ function subscriberPublicationDebtWhere({ agencyId, creatorId } = {}) {
 }
 
 async function scheduleSubscriberScan({
+  db = prisma,
   agencyId,
   creatorId,
   userId = null,
@@ -155,13 +154,13 @@ async function scheduleSubscriberScan({
 } = {}) {
   if (!agencyId || !creatorId)
     throw Object.assign(new Error("Creator scope is required"), { code: "CREATOR_SCOPE_REQUIRED" });
-  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+  const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
   const normalizedLimit = integer(pageLimit, DEFAULT_PAGE_LIMIT, 20, MAX_PAGE_LIMIT);
   const normalizedEveryDays = integer(scanEveryDays, DEFAULT_SCAN_EVERY_DAYS, 1, 30);
 
   let result;
   try {
-    result = await prisma.$transaction(async (tx) => {
+    result = await db.$transaction(async (tx) => {
       // A single creator-local lock serializes generation allocation with
       // publication/recovery.  Job status is deliberately not the publication
       // authority: a terminal JobInstance may still have durable publication
@@ -284,12 +283,12 @@ async function scheduleSubscriberScan({
     // Retain the partial unique active-run index as a second line of defence for
     // older callers, but the creator advisory lock is the generation authority.
     if (error?.code !== "P2002") throw error;
-    const concurrentRun = await prisma.subscriberScanRun.findFirst({
+    const concurrentRun = await db.subscriberScanRun.findFirst({
       where: { agencyId, creatorId, status: { in: ACTIVE_RUN_STATUSES } },
       orderBy: [{ publicationGeneration: "desc" }, { createdAt: "desc" }],
     });
     const concurrentJob = concurrentRun?.jobId
-      ? await prisma.jobInstance.findUnique({ where: { id: concurrentRun.jobId } })
+      ? await db.jobInstance.findUnique({ where: { id: concurrentRun.jobId } })
       : null;
     if (!concurrentRun) throw error;
     return {
@@ -317,11 +316,12 @@ async function scheduleSubscriberScan({
   return { ok: true, created: true, reason: "created", run: runSummary(result.run), job: result.job };
 }
 
-async function ensureSubscriberScanDue({ agencyId, creatorId, priority = 10, now = new Date() } = {}) {
-  const state = await prisma.subscriberDirectoryState.findUnique({ where: { creatorId } });
+async function ensureSubscriberScanDue({ db = prisma, agencyId, creatorId, priority = 10, now = new Date() } = {}) {
+  const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId } });
   if (state?.nextScanAt && state.nextScanAt > now)
     return { ok: true, created: false, reason: "not_due", nextScanAt: state.nextScanAt };
   return scheduleSubscriberScan({
+    db,
     agencyId,
     creatorId,
     priority,
@@ -1776,64 +1776,65 @@ async function listHiddenOnline({
   };
 }
 
-async function setHiddenOnlineStatus({ agencyId, creatorId, fanId, status }) {
+async function setHiddenOnlineStatus({ agencyId, creatorId, fanId, status, db = prisma }) {
   const normalizedStatus = normalizeStatus(status);
-  const state = await prisma.subscriberDirectoryState.findFirst({ where: { agencyId, creatorId } });
-  if (!state?.currentRunId)
-    throw Object.assign(new Error("Subscriber snapshot is not ready"), { code: "SUBSCRIBER_SNAPSHOT_NOT_READY" });
-  const item = await prisma.subscriberScanItem.findUnique({
-    where: { runId_fanId: { runId: state.currentRunId, fanId } },
+  return runWithAutomationWriteCommitFence({
+    db,
+    agencyId,
+    options: { maxWait: 30_000, timeout: 60_000 },
+    work: async (tx) => {
+      // Canonical lock order matches Subscriber publication:
+      // Agency automation fence -> creator publication lock -> current rows.
+      await lockSubscriberPublicationCreator(tx, agencyId, creatorId);
+      const state = await tx.subscriberDirectoryState.findFirst({ where: { agencyId, creatorId } });
+      if (!state?.currentRunId) {
+        throw Object.assign(new Error("Subscriber snapshot is not ready"), { code: "SUBSCRIBER_SNAPSHOT_NOT_READY" });
+      }
+      const item = await tx.subscriberScanItem.findUnique({
+        where: { runId_fanId: { runId: state.currentRunId, fanId } },
+      });
+      if (!item || !item.lastSeenIsNull) {
+        throw Object.assign(new Error("Hidden online candidate not found"), { code: "HIDDEN_ONLINE_NOT_FOUND" });
+      }
+      const changedAt = new Date().toISOString();
+      const row = await tx.hiddenOnlineUser.upsert({
+        where: { creatorId_fanId: { creatorId, fanId } },
+        create: {
+          agencyId,
+          creatorId,
+          fanId,
+          dialogId: item.dialogId,
+          username: item.username,
+          name: item.name,
+          totalSpentCents: item.totalSpentCents,
+          status: normalizedStatus,
+          signals: ["lastSeen:null"],
+          metadata: {
+            source: "subscriber_directory",
+            scanRunId: state.currentRunId,
+            statusChangedAt: changedAt,
+          },
+          lastSignalAt: item.observedAt,
+        },
+        update: {
+          dialogId: item.dialogId,
+          username: item.username,
+          name: item.name,
+          totalSpentCents: item.totalSpentCents,
+          status: normalizedStatus,
+          metadata: {
+            source: "subscriber_directory",
+            scanRunId: state.currentRunId,
+            statusChangedAt: changedAt,
+          },
+          lastSignalAt: item.observedAt,
+        },
+      });
+      // The database trigger projects ignored/blocked to AutomationBumpFanState
+      // in this same transaction. HiddenOnlineUser is the only status authority.
+      return { ok: true, creatorId, fanId, status: row.status, item: row };
+    },
   });
-  if (!item || !item.lastSeenIsNull)
-    throw Object.assign(new Error("Hidden online candidate not found"), { code: "HIDDEN_ONLINE_NOT_FOUND" });
-  const row = await prisma.hiddenOnlineUser.upsert({
-    where: { creatorId_fanId: { creatorId, fanId } },
-    create: {
-      agencyId,
-      creatorId,
-      fanId,
-      dialogId: item.dialogId,
-      username: item.username,
-      name: item.name,
-      totalSpentCents: item.totalSpentCents,
-      status: normalizedStatus,
-      signals: ["lastSeen:null"],
-      metadata: {
-        source: "subscriber_directory",
-        scanRunId: state.currentRunId,
-        statusChangedAt: new Date().toISOString(),
-      },
-      lastSignalAt: item.observedAt,
-    },
-    update: {
-      dialogId: item.dialogId,
-      username: item.username,
-      name: item.name,
-      totalSpentCents: item.totalSpentCents,
-      status: normalizedStatus,
-      metadata: {
-        source: "subscriber_directory",
-        scanRunId: state.currentRunId,
-        statusChangedAt: new Date().toISOString(),
-      },
-      lastSignalAt: item.observedAt,
-    },
-  });
-  await prisma.automationBumpFanState.upsert({
-    where: { creatorId_fanId: { creatorId, fanId } },
-    create: {
-      agencyId, creatorId, fanId, dialogId: item.dialogId || fanId,
-      ignored: normalizedStatus === "ignored",
-      blocked: normalizedStatus === "blocked",
-      metadata: { source: "hidden_online_status", statusChangedAt: new Date().toISOString() },
-    },
-    update: {
-      dialogId: item.dialogId || fanId,
-      ignored: normalizedStatus === "ignored",
-      blocked: normalizedStatus === "blocked",
-    },
-  });
-  return { ok: true, creatorId, fanId, status: row.status, item: row };
 }
 
 module.exports = {

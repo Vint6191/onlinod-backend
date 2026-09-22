@@ -115,12 +115,34 @@ const CREATOR_ANALYTICS_SWEEP_LEASE_KEY = "creator_analytics_recurring_v1";
 const CREATOR_ANALYTICS_SWEEP_COORDINATION_LOCK_KEY = "creator-analytics-recurring-sweep-coordinator";
 const CREATOR_ANALYTICS_SWEEP_LEASE_MS = 15 * 60 * 1000;
 const CREATOR_ANALYTICS_SWEEP_HEARTBEAT_EVERY = 25;
+const CREATOR_RECURRING_PLANNING_BATCH_SIZE = Math.max(1, Math.min(100, Number.parseInt(process.env.CREATOR_RECURRING_PLANNING_BATCH_SIZE || "25", 10) || 25));
+const CREATOR_RECURRING_PLANNING_MAX_RUNTIME_MS = Math.max(1_000, Math.min(60_000, Number.parseInt(process.env.CREATOR_RECURRING_PLANNING_MAX_RUNTIME_MS || "15000", 10) || 15_000));
+const CREATOR_RECURRING_PLANNING_LEASE_MS = Math.max(60_000, Math.min(30 * 60_000, Number.parseInt(process.env.CREATOR_RECURRING_PLANNING_LEASE_MS || "900000", 10) || 900_000));
+const CREATOR_RECURRING_PLANNING_PER_AGENCY_QUANTUM = Math.max(1, Math.min(25, Number.parseInt(process.env.CREATOR_RECURRING_PLANNING_PER_AGENCY_QUANTUM || "5", 10) || 5));
 const CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP = Math.max(1, Math.min(20_000, Number.parseInt(process.env.CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP || "2400", 10) || 2400));
 const CAMPAIGN_DIRECTORY_DISCOVERY_MAX_JOBS_PER_SWEEP = Math.max(1, Math.min(1000, Number.parseInt(process.env.CAMPAIGN_DIRECTORY_DISCOVERY_MAX_JOBS_PER_SWEEP || "100", 10) || 100));
 const CAMPAIGN_DIRECTORY_PAGE_SIZE = 50;
 let recurringSweepPromise = null;
 let creatorAnalyticsSweepPromise = null;
 let phase2MaintenancePromise = null;
+
+const SCHEDULER_OUTCOME = Object.freeze({
+  CREATED: "CREATED",
+  NOOP: "NOOP",
+  WAITING: "WAITING",
+  DEGRADED: "DEGRADED",
+});
+const WAITING_REASON_PATTERN = /(?:waiting|not_ready|pending|deferred|already_in_flight|recently_done|idempotency_race|daily_limit|cooldown|lease_contended|legacy_executor_drain)/i;
+let recurringSchedulerHealth = {
+  status: "STARTING",
+  consecutiveDegraded: 0,
+  lastStartedAt: null,
+  lastCompletedAt: null,
+  lastHealthyAt: null,
+  lastDegradedAt: null,
+  lastReason: null,
+  lastDegraded: [],
+};
 
 
 function retentionBreakdown(result, laneNames) {
@@ -191,20 +213,122 @@ async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) 
  * @param {boolean} [args.includeCreatorAnalytics=true]
  * @returns {Promise<{ ok: boolean, created: string[], skipped: string[], degraded: Array<{ work: string, reason: string, created: boolean }> }>}
  */
-function recordDerivedSchedulerOutcome({ created, skipped, degraded, work, decision, createdLabel = work, createdWhen = null, reason = null }) {
-  const didCreate = createdWhen == null ? Boolean(decision?.created) : Boolean(createdWhen);
-  const why = String(reason || decision?.reason || "skipped");
-  if (didCreate) created.push(createdLabel);
-  else skipped.push(`${work}:${why}`);
-  if (decision?.ok === false) degraded.push({ work, reason: why, created: didCreate });
+function schedulerDecisionNodes(value, path = "result", seen = new Set()) {
+  if (!value || typeof value !== "object" || value instanceof Date || seen.has(value)) return [];
+  seen.add(value);
+  const nodes = [{ value, path }];
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => nodes.push(...schedulerDecisionNodes(entry, `${path}[${index}]`, seen)));
+    return nodes;
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    if (!nested || typeof nested !== "object" || nested instanceof Date) continue;
+    nodes.push(...schedulerDecisionNodes(nested, `${path}.${key}`, seen));
+  }
+  return nodes;
 }
 
-function schedulerPlanningResult(created, skipped, degraded) {
+function schedulerCreated(value) {
+  if (value === true) return true;
+  if (typeof value === "number") return Number.isFinite(value) && value > 0;
+  return false;
+}
+
+function normalizeSchedulerDecision(decision, { requireOk = true, reason = null, createdWhen = null } = {}) {
+  if (!decision || typeof decision !== "object" || Array.isArray(decision)) {
+    return {
+      outcome: SCHEDULER_OUTCOME.DEGRADED,
+      ok: false,
+      created: Boolean(createdWhen),
+      reason: String(reason || "malformed_planner_result"),
+      failures: [{ path: "result", reason: "malformed_planner_result" }],
+    };
+  }
+  const nodes = schedulerDecisionNodes(decision);
+  const failures = nodes
+    .filter((node) => node.value?.ok === false)
+    .map((node) => ({
+      path: node.path,
+      reason: String(node.value?.reason || node.value?.code || node.value?.error || "planner_reported_failure"),
+    }));
+  if (requireOk && typeof decision.ok !== "boolean") {
+    failures.unshift({ path: "result", reason: "planner_result_missing_ok" });
+  }
+  const didCreate = createdWhen == null
+    ? nodes.some((node) => schedulerCreated(node.value?.created) || schedulerCreated(node.value?.planned))
+    : Boolean(createdWhen);
+  const why = String(reason || decision.reason || failures[0]?.reason || (didCreate ? "created" : "nothing_due"));
+  if (failures.length) {
+    return { outcome: SCHEDULER_OUTCOME.DEGRADED, ok: false, created: didCreate, reason: why, failures };
+  }
+  if (didCreate) return { outcome: SCHEDULER_OUTCOME.CREATED, ok: true, created: true, reason: why, failures: [] };
+  const waiting = WAITING_REASON_PATTERN.test(why);
+  return {
+    outcome: waiting ? SCHEDULER_OUTCOME.WAITING : SCHEDULER_OUTCOME.NOOP,
+    ok: true,
+    created: false,
+    reason: why,
+    failures: [],
+  };
+}
+
+function recordDerivedSchedulerOutcome({ created, skipped, degraded, outcomes = null, work, decision, createdLabel = work, createdWhen = null, reason = null, requireOk = true }) {
+  const normalized = normalizeSchedulerDecision(decision, { requireOk, reason, createdWhen });
+  if (normalized.created) created.push(createdLabel);
+  else skipped.push(`${work}:${normalized.reason}`);
+  if (normalized.outcome === SCHEDULER_OUTCOME.DEGRADED) {
+    degraded.push({
+      work,
+      reason: normalized.reason,
+      created: normalized.created,
+      failures: normalized.failures,
+    });
+  }
+  if (Array.isArray(outcomes)) outcomes.push({ work, ...normalized });
+  return normalized;
+}
+
+async function executeSchedulerConsumer({ work, execute, created, skipped, degraded, outcomes, createdLabel = work, createdWhen = null, reason = null, requireOk = true }) {
+  let decision;
+  try {
+    decision = await execute();
+  } catch (error) {
+    decision = {
+      ok: false,
+      created: false,
+      reason: error?.code || `${work}_exception`,
+      error: String(error?.message || error),
+    };
+  }
+  return {
+    decision,
+    normalized: recordDerivedSchedulerOutcome({
+      created, skipped, degraded, outcomes, work, decision,
+      createdLabel: typeof createdLabel === "function" ? createdLabel(decision) : createdLabel,
+      createdWhen: typeof createdWhen === "function" ? createdWhen(decision) : createdWhen,
+      reason: typeof reason === "function" ? reason(decision) : reason,
+      requireOk,
+    }),
+  };
+}
+
+function schedulerPlanningResult(created, skipped, degraded, outcomes = []) {
   const ok = degraded.length === 0;
-  return { ok, reason: ok ? null : degraded[0]?.reason || "derived_planning_degraded", created, skipped, degraded };
+  return {
+    ok,
+    outcome: ok
+      ? (created.length ? SCHEDULER_OUTCOME.CREATED : (outcomes.some((entry) => entry.outcome === SCHEDULER_OUTCOME.WAITING) ? SCHEDULER_OUTCOME.WAITING : SCHEDULER_OUTCOME.NOOP))
+      : SCHEDULER_OUTCOME.DEGRADED,
+    reason: ok ? null : degraded[0]?.reason || "derived_planning_degraded",
+    created,
+    skipped,
+    degraded,
+    outcomes,
+  };
 }
 
 async function scheduleInitialJobsForCreator({
+  db = prisma,
   creatorId,
   agencyId,
   priority = 50,
@@ -213,7 +337,9 @@ async function scheduleInitialJobsForCreator({
   includeEarningsFreshness = true,
   includeCreatorAnalytics = true,
 }) {
-  if (!creatorId || !agencyId) return { ok: true, created: [], skipped: [], degraded: [] };
+  if (!creatorId || !agencyId) {
+    return schedulerPlanningResult([], [], [{ work: "creator_scope", reason: "missing_scope", created: false, failures: [{ path: "input", reason: "missing_scope" }] }], []);
+  }
   const creatorRemoteId = creator?.remoteId || creator?.userId || null;
   const creatorUsername = creator?.username || null;
   const creatorDisplayName = creator?.displayName || null;
@@ -221,6 +347,7 @@ async function scheduleInitialJobsForCreator({
   const created = [];
   const skipped = [];
   const degraded = [];
+  const outcomes = [];
   const now = new Date();
 
   // Creator Analytics bootstrap owns the creator background-read lane until its
@@ -237,123 +364,143 @@ async function scheduleInitialJobsForCreator({
 
     if (includeCreatorAnalytics) {
       const initial = await ensureInitialCreatorAnalyticsSync({
-        creatorId, agencyId, now, priority: Math.max(80, priority),
+        db, creatorId, agencyId, now, priority: Math.max(80, priority),
       });
       if (initial.created) created.push(`creator_analytics_initial:${initial.stage}`);
       else skipped.push(`creator_analytics_initial:${initial.stage}:${initial.reason || "waiting"}`);
-      if (!initial.ready) return schedulerPlanningResult(created, skipped, degraded);
+      if (!initial.ready) {
+        const failedTerminal = ["failed_terminal", "missing_scope"].includes(String(initial.reason || ""));
+        const normalized = {
+          work: "creator_analytics_initial",
+          outcome: failedTerminal ? SCHEDULER_OUTCOME.DEGRADED : SCHEDULER_OUTCOME.WAITING,
+          ok: !failedTerminal,
+          created: Boolean(initial.created),
+          reason: String(initial.reason || "waiting"),
+          failures: failedTerminal ? [{ path: "result", reason: String(initial.reason) }] : [],
+        };
+        outcomes.push(normalized);
+        if (failedTerminal) degraded.push({ work: normalized.work, reason: normalized.reason, created: normalized.created, failures: normalized.failures });
+        return schedulerPlanningResult(created, skipped, degraded, outcomes);
+      }
+      outcomes.push({ work: "creator_analytics_initial", outcome: initial.created ? SCHEDULER_OUTCOME.CREATED : SCHEDULER_OUTCOME.NOOP, ok: true, created: Boolean(initial.created), reason: initial.reason || "initial_sync_complete", failures: [] });
 
       if (includeAnalyticsCatchups) {
         const catchups = await ensureRecurringCreatorAnalyticsCatchups({
-          creatorId, agencyId, now, priority: Math.max(15, priority - 10),
+          db, creatorId, agencyId, now, priority: Math.max(15, priority - 10),
         });
         created.push(...(catchups.created || []));
         skipped.push(...(catchups.skipped || []));
       }
     } else {
-      const ready = await creatorAnalyticsInitialSyncReady({ creatorId });
+      const ready = await creatorAnalyticsInitialSyncReady({ db, creatorId, now });
       if (!ready) {
         skipped.push("creator_analytics_initial:waiting:distributed_sweep");
-        return schedulerPlanningResult(created, skipped, degraded);
+        outcomes.push({ work: "creator_analytics_initial", outcome: SCHEDULER_OUTCOME.WAITING, ok: true, created: false, reason: "distributed_sweep", failures: [] });
+        return schedulerPlanningResult(created, skipped, degraded, outcomes);
       }
+      outcomes.push({ work: "creator_analytics_initial", outcome: SCHEDULER_OUTCOME.NOOP, ok: true, created: false, reason: "initial_sync_complete", failures: [] });
     }
   } catch (err) {
-    skipped.push(`creator_analytics:${err?.message || "schedule_failed"}`);
+    const reason = err?.code || "creator_analytics_exception";
+    skipped.push(`creator_analytics:${reason}`);
+    const failure = { work: "creator_analytics", reason, created: false, failures: [{ path: "exception", reason, error: String(err?.message || err) }] };
+    degraded.push(failure);
+    outcomes.push({ ...failure, outcome: SCHEDULER_OUTCOME.DEGRADED, ok: false });
     // Fail closed for automatic read work. If bootstrap state cannot be proven,
     // do not start other creator-wide OF scans that can race its recovery.
-    return schedulerPlanningResult(created, skipped, degraded);
+    return schedulerPlanningResult(created, skipped, degraded, outcomes);
   }
 
   // Earnings collection is no longer display-range scheduling. A single
   // coverage/freshness planner owns exact provider windows.
   if (includeEarningsFreshness) {
-    const earnings = await ensureOperationalAnalyticsFreshness({
-      creatorId,
-      agencyId,
-      reason: "INITIAL_SYNC",
-      priority,
-      now,
+    await executeSchedulerConsumer({
+      work: "earnings_freshness",
+      created,
+      skipped,
+      degraded,
+      outcomes,
+      requireOk: false,
+      createdLabel: "fetch_earnings",
+      execute: () => ensureOperationalAnalyticsFreshness({
+        db, creatorId, agencyId, reason: "INITIAL_SYNC", priority, now,
+      }),
     });
-    if (earnings.created > 0) created.push(`fetch_earnings:${earnings.created}`);
-    else skipped.push(`fetch_earnings:${earnings.reused ? "reused" : "fresh"}`);
   }
 
   // Traffic/member attribution stays independent once bootstrap no longer owns
   // the read lane.
-  const trafficDecision = await ensureSingleJob({
-    jobKey: "traffic_sources_scan",
-    creatorId,
-    agencyId,
-    params: {
-      hydrateFanValues: false,
-      hydrateLimit: 0,
-      valueTtlHours: 6,
-      creatorRemoteId,
-      remoteId: creatorRemoteId,
-      creatorUsername,
-      username: creatorUsername,
-      creatorDisplayName,
-      reason: "recurring_traffic_refresh",
-    },
-    priority: Math.max(10, priority - 20),
-    now,
-    freshnessWindowMs: TRAFFIC_REFRESH_WINDOW_MS,
+  await executeSchedulerConsumer({
+    work: "traffic_sources_scan",
+    created,
+    skipped,
+    degraded,
+    outcomes,
+    requireOk: false,
+    execute: () => ensureSingleJob({
+      db,
+      jobKey: "traffic_sources_scan",
+      creatorId,
+      agencyId,
+      params: {
+        hydrateFanValues: false,
+        hydrateLimit: 0,
+        valueTtlHours: 6,
+        creatorRemoteId,
+        remoteId: creatorRemoteId,
+        creatorUsername,
+        username: creatorUsername,
+        creatorDisplayName,
+        reason: "recurring_traffic_refresh",
+      },
+      priority: Math.max(10, priority - 20),
+      now,
+      freshnessWindowMs: TRAFFIC_REFRESH_WINDOW_MS,
+    }),
   });
-  if (trafficDecision.created) created.push("traffic_sources_scan");
-  else skipped.push("traffic_sources_scan");
 
   // Subscriber Directory — one shared weekly source for Hidden Online,
   // Follow Back candidates and future subscriber-driven modules.
-  const subscriberDecision = await ensureSubscriberScanDue({
-    agencyId,
-    creatorId,
-    priority: Math.max(5, priority - 30),
-    now,
+  await executeSchedulerConsumer({
+    work: "subscriber_directory_scan",
+    created,
+    skipped,
+    degraded,
+    outcomes,
+    execute: () => ensureSubscriberScanDue({
+      db, agencyId, creatorId, priority: Math.max(5, priority - 30), now,
+    }),
   });
-  if (subscriberDecision.created) created.push("subscriber_directory_scan");
-  else skipped.push("subscriber_directory_scan");
 
   // Follow Back candidate planning is backend orchestration over the already
   // published Subscriber Directory projection. It never starts another OF scan.
-  const followBackDecision = await ensureAutomaticFollowBack({
-    agencyId,
-    creatorId,
-    source: "recurring_scheduler",
-  });
-  recordDerivedSchedulerOutcome({ created, skipped, degraded, work: "follow_back_plan", decision: followBackDecision });
-
-  const bumpDecision = await ensureAutomaticBumps({
-    agencyId,
-    creatorId,
-    source: "recurring_scheduler",
-  });
-  recordDerivedSchedulerOutcome({
-    created, skipped, degraded, work: "bumps_plan", decision: bumpDecision,
-    createdLabel: `bumps_plan:${Number(bumpDecision?.planned || 0)}`,
+  await executeSchedulerConsumer({
+    work: "follow_back_plan", created, skipped, degraded, outcomes,
+    execute: () => ensureAutomaticFollowBack({ agencyId, creatorId, source: "recurring_scheduler", db }),
   });
 
-  const likesDecision = await ensureAutomaticLikes({
-    agencyId,
-    creatorId,
-    source: "recurring_scheduler",
-  });
-  recordDerivedSchedulerOutcome({ created, skipped, degraded, work: "likes_plan", decision: likesDecision });
-
-  const followAutomationDecision = await ensureAutomaticFollowAutomation({
-    agencyId,
-    creatorId,
-    source: "recurring_scheduler",
-  });
-  recordDerivedSchedulerOutcome({ created, skipped, degraded, work: "follow_automation_plan", decision: followAutomationDecision });
-
-  const sfsDecision = await ensureAutomaticSfs({ agencyId, creatorId, source: "recurring_scheduler" });
-  recordDerivedSchedulerOutcome({
-    created, skipped, degraded, work: "sfs_plan", decision: sfsDecision,
-    createdWhen: Boolean(sfsDecision?.created || sfsDecision?.planning?.created || sfsDecision?.discovery?.created),
-    reason: sfsDecision?.reason || sfsDecision?.planning?.reason || sfsDecision?.discovery?.reason || "skipped",
+  await executeSchedulerConsumer({
+    work: "bumps_plan", created, skipped, degraded, outcomes,
+    createdLabel: (decision) => `bumps_plan:${Number(decision?.planned || 0)}`,
+    execute: () => ensureAutomaticBumps({ agencyId, creatorId, source: "recurring_scheduler", db }),
   });
 
-  return schedulerPlanningResult(created, skipped, degraded);
+  await executeSchedulerConsumer({
+    work: "likes_plan", created, skipped, degraded, outcomes,
+    execute: () => ensureAutomaticLikes({ agencyId, creatorId, source: "recurring_scheduler", db }),
+  });
+
+  await executeSchedulerConsumer({
+    work: "follow_automation_plan", created, skipped, degraded, outcomes,
+    execute: () => ensureAutomaticFollowAutomation({ agencyId, creatorId, source: "recurring_scheduler", db }),
+  });
+
+  await executeSchedulerConsumer({
+    work: "sfs_plan", created, skipped, degraded, outcomes,
+    execute: () => ensureAutomaticSfs({ agencyId, creatorId, source: "recurring_scheduler", db }),
+  });
+
+  return schedulerPlanningResult(created, skipped, degraded, outcomes);
 }
 
 
@@ -1987,86 +2134,243 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
   }
 }
 
-async function runRecurringCreatorWork({ db = prisma, now = new Date(), pageSize = RECURRING_READY_PAGE_SIZE } = {}) {
-  const size = Math.max(1, Math.min(1000, Number(pageSize) || RECURRING_READY_PAGE_SIZE));
-  let cursor = null;
+async function runRecurringCreatorWork({
+  db = prisma,
+  now = new Date(),
+  batchSize = CREATOR_RECURRING_PLANNING_BATCH_SIZE,
+  pageSize = null,
+  maxRuntimeMs = CREATOR_RECURRING_PLANNING_MAX_RUNTIME_MS,
+  ownerToken = undefined,
+} = {}) {
+  const size = Math.max(1, Math.min(100, Number(pageSize ?? batchSize) || CREATOR_RECURRING_PLANNING_BATCH_SIZE));
+  const runtimeBudget = Math.max(1_000, Math.min(60_000, Number(maxRuntimeMs) || CREATOR_RECURRING_PLANNING_MAX_RUNTIME_MS));
+  const startedAt = Date.now();
+  let claim;
+  try {
+    claim = await claimDomainWorkBatch({
+      db,
+      workClass: PHASE2_WORK_CLASS.CREATOR_RECURRING_PLANNING,
+      ...(ownerToken ? { ownerToken } : {}),
+      limit: size,
+      perAgencyQuantum: Math.min(size, CREATOR_RECURRING_PLANNING_PER_AGENCY_QUANTUM),
+      perPartitionQuantum: 1,
+      leaseMs: CREATOR_RECURRING_PLANNING_LEASE_MS,
+      fallbackNow: now,
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      outcome: SCHEDULER_OUTCOME.DEGRADED,
+      reason: error?.code || "recurring_planning_claim_failed",
+      error: String(error?.message || error),
+      creatorsScanned: 0,
+      pages: 0,
+      totalCreated: 0,
+      totalSkipped: 0,
+      totalDegraded: 1,
+      degradedCreators: [],
+      dailyCyclesStarted: 0,
+      dailyCyclesSkipped: 0,
+      selected: 0,
+      yieldedForBudget: 0,
+      lostOwnership: 0,
+      pageSize: size,
+      durationMs: Date.now() - startedAt,
+    };
+  }
+
+  const items = Array.isArray(claim?.items) ? claim.items : [];
+  if (claim?.skipped && !["legacy_executor_drain"].includes(String(claim.reason || ""))) {
+    return {
+      ok: false,
+      outcome: SCHEDULER_OUTCOME.DEGRADED,
+      reason: claim.reason || "recurring_planning_claim_skipped",
+      creatorsScanned: 0,
+      pages: 0,
+      totalCreated: 0,
+      totalSkipped: 0,
+      totalDegraded: 1,
+      degradedCreators: [],
+      dailyCyclesStarted: 0,
+      dailyCyclesSkipped: 0,
+      selected: 0,
+      yieldedForBudget: 0,
+      lostOwnership: 0,
+      pageSize: size,
+      durationMs: Date.now() - startedAt,
+    };
+  }
+
   let creatorsScanned = 0;
-  let pages = 0;
   let totalCreated = 0;
   let totalSkipped = 0;
   let totalDegraded = 0;
   const degradedCreators = [];
+  const processedCreatorIds = [];
   let dailyCyclesStarted = 0;
   let dailyCyclesSkipped = 0;
+  let retired = 0;
+  let retried = 0;
+  let yielded = 0;
+  let yieldedForBudget = 0;
+  let lostOwnership = 0;
 
-  while (true) {
-    const creators = await db.creatorAccount.findMany({
-      where: {
-        status: "READY",
-        deletedAt: null,
-        agency: { deletedAt: null },
-        ...(cursor ? { id: { gt: cursor } } : {}),
-      },
-      select: { id: true, agencyId: true, remoteId: true, username: true, displayName: true },
-      orderBy: [{ id: "asc" }],
-      take: size,
-    });
-    if (!creators.length) break;
-    pages += 1;
-
-    for (const creator of creators) {
-      try {
-        const result = await scheduleInitialJobsForCreator({
-          creatorId: creator.id,
-          agencyId: creator.agencyId,
-          creator,
-          priority: 30,
-          includeAnalyticsCatchups: false,
-          includeEarningsFreshness: false,
-          includeCreatorAnalytics: false,
-        });
-        totalCreated += result.created.length;
-        totalSkipped += result.skipped.length;
-        totalDegraded += result.degraded?.length || 0;
-        if (result.ok === false) degradedCreators.push({ creatorId: creator.id, issues: result.degraded || [] });
-      } catch (err) {
-        console.warn("[scheduler] regular creator jobs failed:", creator.id, err?.message || err);
-      }
-
-      try {
-        const { ensureDailyVaultIntelligenceCycle } = require("./vault-intelligence-daily-service");
-        const daily = await ensureDailyVaultIntelligenceCycle({
-          agencyId: creator.agencyId,
-          creatorId: creator.id,
-          now,
-        });
-        if (Number(daily?.created || 0) > 0) dailyCyclesStarted += 1;
-        else dailyCyclesSkipped += 1;
-      } catch (err) {
-        dailyCyclesSkipped += 1;
-        console.warn("[scheduler] daily Vault Intelligence failed:", creator.id, err?.message || err);
-      }
-
-      creatorsScanned += 1;
-      cursor = creator.id;
+  for (let index = 0; index < items.length; index += 1) {
+    if (Date.now() - startedAt >= runtimeBudget) {
+      const remaining = items.slice(index);
+      const releases = await Promise.all(remaining.map((item) => yieldDomainWorkClaim({
+        db,
+        item,
+        ownerToken: claim.ownerToken,
+        availableAt: claim.authorityNow || now,
+        fallbackNow: now,
+      }).catch(() => ({ yielded: false, lost: true }))));
+      yieldedForBudget += releases.filter((entry) => entry?.yielded).length;
+      lostOwnership += releases.filter((entry) => !entry?.yielded).length;
+      break;
     }
-    if (creators.length < size) break;
+
+    const item = items[index];
+    const heartbeat = await heartbeatDomainWorkClaim({
+      db,
+      item,
+      ownerToken: claim.ownerToken,
+      leaseMs: CREATOR_RECURRING_PLANNING_LEASE_MS,
+      fallbackNow: now,
+    }).catch(() => ({ renewed: false, lost: true }));
+    if (!heartbeat?.renewed) {
+      lostOwnership += 1;
+      continue;
+    }
+
+    let creator;
+    try {
+      creator = await db.creatorAccount.findFirst({
+        where: {
+          id: String(item.creatorId || item.objectId || ""),
+          agencyId: String(item.agencyId || ""),
+          status: "READY",
+          deletedAt: null,
+          agency: { deletedAt: null },
+        },
+        select: { id: true, agencyId: true, remoteId: true, username: true, displayName: true },
+      });
+    } catch (error) {
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: now }).catch(() => ({ failed: false, lost: true }));
+      if (failed?.failed) retried += 1;
+      else lostOwnership += 1;
+      totalDegraded += 1;
+      degradedCreators.push({ creatorId: item.creatorId || item.objectId || null, issues: [{ work: "creator_lookup", reason: error?.code || "creator_lookup_failed", error: String(error?.message || error) }] });
+      continue;
+    }
+
+    if (!creator) {
+      const acknowledged = await ackDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, fallbackNow: now }).catch(() => ({ acknowledged: false, lost: true }));
+      if (acknowledged?.acknowledged) retired += 1;
+      else lostOwnership += 1;
+      continue;
+    }
+
+    const creatorIssues = [];
+    let planning;
+    try {
+      planning = await scheduleInitialJobsForCreator({
+        db,
+        creatorId: creator.id,
+        agencyId: creator.agencyId,
+        creator,
+        priority: 30,
+        includeAnalyticsCatchups: false,
+        includeEarningsFreshness: false,
+        includeCreatorAnalytics: false,
+      });
+      totalCreated += Number(planning?.created?.length || 0);
+      totalSkipped += Number(planning?.skipped?.length || 0);
+      if (!planning || planning.ok === false || !Array.isArray(planning.degraded)) {
+        creatorIssues.push(...(Array.isArray(planning?.degraded) && planning.degraded.length
+          ? planning.degraded
+          : [{ work: "creator_planning", reason: planning?.reason || "malformed_creator_planning_result" }]));
+      }
+    } catch (error) {
+      creatorIssues.push({ work: "creator_planning", reason: error?.code || "creator_planning_exception", error: String(error?.message || error) });
+    }
+
+    try {
+      const { ensureDailyVaultIntelligenceCycle } = require("./vault-intelligence-daily-service");
+      const daily = await ensureDailyVaultIntelligenceCycle({
+        db,
+        agencyId: creator.agencyId,
+        creatorId: creator.id,
+        now,
+      });
+      const dailyOutcome = normalizeSchedulerDecision(daily, { requireOk: true });
+      if (dailyOutcome.created) dailyCyclesStarted += 1;
+      else dailyCyclesSkipped += 1;
+      if (!dailyOutcome.ok) creatorIssues.push({ work: "daily_vault_intelligence", reason: dailyOutcome.reason, failures: dailyOutcome.failures });
+    } catch (error) {
+      dailyCyclesSkipped += 1;
+      creatorIssues.push({ work: "daily_vault_intelligence", reason: error?.code || "daily_vault_exception", error: String(error?.message || error) });
+    }
+
+    creatorsScanned += 1;
+    processedCreatorIds.push(creator.id);
+    if (creatorIssues.length) {
+      totalDegraded += creatorIssues.length;
+      degradedCreators.push({ creatorId: creator.id, issues: creatorIssues });
+      const error = Object.assign(new Error(creatorIssues.map((issue) => `${issue.work}:${issue.reason}`).join("; ").slice(0, 1900)), {
+        code: "CREATOR_RECURRING_PLANNING_DEGRADED",
+      });
+      const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: now }).catch(() => ({ failed: false, lost: true }));
+      if (failed?.failed || failed?.superseded) retried += 1;
+      else lostOwnership += 1;
+      continue;
+    }
+
+    const baseNow = heartbeat.authorityNow || claim.authorityNow || now;
+    const nextRunAt = new Date(new Date(baseNow).getTime() + RECURRING_INTERVAL_MS);
+    const released = await yieldDomainWorkClaim({
+      db,
+      item,
+      ownerToken: claim.ownerToken,
+      availableAt: nextRunAt,
+      progressCursor: { lastPlanningCycleAt: new Date(baseNow).toISOString(), nextPlanningCycleAt: nextRunAt.toISOString() },
+      fallbackNow: now,
+    }).catch(() => ({ yielded: false, lost: true }));
+    if (released?.yielded) yielded += 1;
+    else lostOwnership += 1;
   }
 
+  const ok = totalDegraded === 0 && lostOwnership === 0;
   return {
-    ok: totalDegraded === 0, reason: totalDegraded ? "derived_planning_degraded" : null,
-    creatorsScanned, pages, totalCreated, totalSkipped, totalDegraded, degradedCreators,
-    dailyCyclesStarted, dailyCyclesSkipped, pageSize: size,
+    ok,
+    outcome: ok ? (creatorsScanned ? SCHEDULER_OUTCOME.NOOP : SCHEDULER_OUTCOME.WAITING) : SCHEDULER_OUTCOME.DEGRADED,
+    reason: ok ? (claim?.skipped ? claim.reason : null) : (totalDegraded ? "derived_planning_degraded" : "domain_work_lease_lost"),
+    creatorsScanned,
+    pages: items.length ? 1 : 0,
+    totalCreated,
+    totalSkipped,
+    totalDegraded,
+    degradedCreators,
+    processedCreatorIds,
+    dailyCyclesStarted,
+    dailyCyclesSkipped,
+    selected: items.length,
+    retired,
+    retried,
+    yielded,
+    yieldedForBudget,
+    lostOwnership,
+    pageSize: size,
+    maxRuntimeMs: runtimeBudget,
+    durationMs: Date.now() - startedAt,
   };
 }
 
 /**
- * Recurring scheduler — finds all READY creators across all agencies
- * and ensures they have scheduled jobs. Runs once on startup, then
- * every RECURRING_INTERVAL_MS.
- *
- * Designed to be cheap: looks at recent JobInstance rows (already indexed
- * by creatorId + jobKey), so even with thousands of creators it stays fast.
+ * Recurring scheduler — claims a bounded, fair DomainWorkItem batch for READY
+ * creators. Creator lifecycle triggers publish/revoke that durable work, so no
+ * replica scans the full creator catalog. The maintenance pump drains backlog
+ * between hourly top-level sweeps; leases make restart/takeover safe.
  */
 async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) {
   if (phase2MaintenancePromise) return { ok: true, skipped: true, reason: "local_overlap" };
@@ -2079,6 +2383,7 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
       ["creatorDestructiveCleanup", () => runCreatorDestructiveCleanupSweep({ db, now })],
       ["providerOperationalBackfill", () => maybeBackfillProviderOperationalDebt({ db, now })],
       ["subscriberDirectoryMaintenance", () => runSubscriberDirectoryMaintenance({ db, now, maxSignals: 16, concurrency: 4, maxRuntimeMs: 5_000, recoveryStepsPerRun: 4, retentionBatch: 50 })],
+      ["creatorRecurringPlanning", () => runRecurringCreatorWork({ db, now })],
       ["campaignFanRefreshPromotion", () => runCampaignFanRefreshPromotionMaintenance({ db, now, maxCreators: 200, maxJobsPerCreator: 4, concurrency: 4, maxRuntimeMs: 8_000 })],
       ["dependencyFanout", () => maybeRunPhase2DependencyFanout({ db, now })],
       ["customReminderWork", () => maybePlanDueCustomReminderWork({ db, now })],
@@ -2141,7 +2446,25 @@ async function runRecurringSweepInternal() {
     creatorAnalyticsSweep = { ok: false, error: err?.message || String(err) };
   }
 
-  const recurringCreatorWork = await runRecurringCreatorWork({ db: prisma, now });
+  let recurringCreatorWork = null;
+  try {
+    recurringCreatorWork = await runRecurringCreatorWork({ db: prisma, now });
+  } catch (err) {
+    console.warn("[scheduler] recurring creator planning crashed:", err?.message || err);
+    recurringCreatorWork = {
+      ok: false,
+      reason: err?.code || "recurring_creator_planning_crashed",
+      error: err?.message || String(err),
+      creatorsScanned: 0,
+      pages: 0,
+      totalCreated: 0,
+      totalSkipped: 0,
+      totalDegraded: 1,
+      degradedCreators: [],
+      dailyCyclesStarted: 0,
+      dailyCyclesSkipped: 0,
+    };
+  }
   const {
     creatorsScanned,
     pages: creatorPages,
@@ -2185,7 +2508,26 @@ async function runRecurringSweepInternal() {
     `[scheduler] sweep done in ${elapsed}ms — creators=${creatorsScanned}, pages=${creatorPages}, jobs created=${totalCreated}, skipped=${totalSkipped}, degraded=${totalDegraded}, daily started=${dailyCyclesStarted}, daily skipped=${dailyCyclesSkipped}`
   );
 
+  const components = { analyticsSweep, creatorAnalyticsSweep, recurringCreatorWork, retention, billingRenewals, billingExpiry };
+  const degradedComponents = [];
+  for (const [component, result] of Object.entries(components)) {
+    const failures = schedulerDecisionNodes(result, component)
+      .filter((node) => node.value?.ok === false)
+      .map((node) => ({
+        component,
+        path: node.path,
+        reason: String(node.value?.reason || node.value?.code || node.value?.error || "resolved_degradation"),
+      }));
+    degradedComponents.push(...failures);
+  }
+  const ok = degradedComponents.length === 0;
+
   return {
+    ok,
+    outcome: ok ? SCHEDULER_OUTCOME.NOOP : SCHEDULER_OUTCOME.DEGRADED,
+    reason: ok ? null : degradedComponents[0]?.reason || "recurring_sweep_degraded",
+    degradedComponents,
+    durationMs: elapsed,
     creatorsScanned,
     creatorPages,
     jobsCreated: totalCreated,
@@ -2208,12 +2550,51 @@ async function runRecurringSweep() {
   if (recurringSweepPromise) {
     return { ok: true, skipped: true, reason: "local_overlap" };
   }
+  recurringSchedulerHealth = { ...recurringSchedulerHealth, lastStartedAt: new Date().toISOString() };
   recurringSweepPromise = runRecurringSweepInternal();
   try {
-    return await recurringSweepPromise;
+    const result = await recurringSweepPromise;
+    recordRecurringSchedulerHealth(result);
+    return result;
+  } catch (error) {
+    recordRecurringSchedulerHealth(null, error);
+    throw error;
   } finally {
     recurringSweepPromise = null;
   }
+}
+
+function recordRecurringSchedulerHealth(result, error = null) {
+  const completedAt = new Date().toISOString();
+  const degraded = Boolean(error || result?.ok === false);
+  recurringSchedulerHealth = {
+    ...recurringSchedulerHealth,
+    status: degraded ? "DEGRADED" : "HEALTHY",
+    consecutiveDegraded: degraded ? Number(recurringSchedulerHealth.consecutiveDegraded || 0) + 1 : 0,
+    lastCompletedAt: completedAt,
+    lastHealthyAt: degraded ? recurringSchedulerHealth.lastHealthyAt : completedAt,
+    lastDegradedAt: degraded ? completedAt : recurringSchedulerHealth.lastDegradedAt,
+    lastReason: degraded ? String(error?.code || result?.reason || error?.message || "recurring_sweep_degraded") : null,
+    lastDegraded: degraded
+      ? (Array.isArray(result?.degradedComponents) && result.degradedComponents.length
+        ? result.degradedComponents.slice(0, 25)
+        : [{ component: "recurringSweep", path: "exception", reason: String(error?.message || result?.reason || "recurring_sweep_degraded") }])
+      : [],
+  };
+  return getRecurringSchedulerHealthSnapshot();
+}
+
+function getRecurringSchedulerHealthSnapshot() {
+  return {
+    ...recurringSchedulerHealth,
+    lastDegraded: recurringSchedulerHealth.lastDegraded.map((entry) => ({ ...entry })),
+  };
+}
+
+function handleRecurringSweepTickResult(result) {
+  if (result?.ok !== false) return result;
+  console.error(`[scheduler] sweep resolved degraded: ${JSON.stringify({ reason: result.reason, degraded: result.degradedComponents || [] })}`);
+  return result;
 }
 
 let recurringTimer = null;
@@ -2231,9 +2612,11 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
   }
 
   const tick = () => {
-    runRecurringSweep().catch((err) => {
-      console.error("[scheduler] sweep crashed:", err);
-    });
+    runRecurringSweep()
+      .then(handleRecurringSweepTickResult)
+      .catch((err) => {
+        console.error("[scheduler] sweep crashed:", err);
+      });
   };
 
   if (runImmediately) {
@@ -2310,6 +2693,7 @@ module.exports = {
   runRecurringCreatorWork,
   startRecurringScheduler,
   stopRecurringScheduler,
+  getRecurringSchedulerHealthSnapshot,
   RECURRING_INTERVAL_MS,
   FRESHNESS_WINDOW_MS,
   TRAFFIC_REFRESH_WINDOW_MS,
@@ -2340,4 +2724,11 @@ module.exports = {
   maybePlanDueCustomReminderWork,
   maybeRepairProviderOperationalDirty,
   maybeRunPhase2DependencyFanout,
+  _test: {
+    SCHEDULER_OUTCOME,
+    normalizeSchedulerDecision,
+    executeSchedulerConsumer,
+    recordRecurringSchedulerHealth,
+    handleRecurringSweepTickResult,
+  },
 };

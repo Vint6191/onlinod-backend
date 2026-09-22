@@ -189,7 +189,8 @@ test("A21 clean bootstrap, generation CAS and exact Subscriber cursor scale are 
   assert.match(a21, /ROW_NUMBER\(\) OVER[\s\S]*PARTITION BY "creatorId"/);
   assert.match(a21, /SubscriberScanItem_run_id_cursor_idx[\s\S]*"runId", "id"/);
   assert.match(a21, /SubscriberScanRun_publication_debt_idx/);
-  assert.match(subscriber, /lockSubscriberPublicationCreator[\s\S]*pg_advisory_xact_lock/);
+  assert.match(subscriber, /lockSubscriberPublicationCreator[\s\S]*lockDbAdvisoryXact/);
+  assert.doesNotMatch(subscriber, /pg_advisory_xact_lock/);
   assert.match(subscriber, /publication_recovery_in_progress/);
   assert.match(subscriber, /publishedGeneration:\s*\{ lt: generation \}/);
   assert.match(subscriber, /SUBSCRIBER_PUBLICATION_GENERATION_CAS_LOST/);
@@ -345,4 +346,3 @@ test("Campaign promotion signal merge is atomic LEAST while exact-revision retry
   assert.match(queue, /SET "dueAt" = \$3, "claimToken" = NULL, "claimUntil" = NULL,[\s\S]*"revision" = \$5/);
   assert.match(queue, /WHERE "id"=\$1 AND "claimToken"=\$2/);
 });
-

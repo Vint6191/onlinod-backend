@@ -39,9 +39,9 @@ test("A32 Follow Back / Follow Automation / Bumps cannot report planning converg
 test("A32 physical proof uses a pinned file/test-name manifest and preserves actual totals on red scenarios", () => {
   const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
   const manifest = JSON.parse(source("scripts/audit/phase3-a32-expected-proof-manifest.json"));
-  assert.equal(manifest.version, "A33");
-  assert.equal(manifest.testCount, 51);
-  assert.equal(manifest.files.length, 12);
+  assert.equal(manifest.version, "A34");
+  assert.equal(manifest.testCount, 54);
+  assert.equal(manifest.files.length, 13);
   assert.match(runner, /EXPECTED_PROOF_MANIFEST_FILE/);
   assert.match(runner, /manifestSha256/);
   assert.match(runner, /PHASE3_A32_PROOF_MANIFEST_MISMATCH/);

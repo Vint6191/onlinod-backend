@@ -5130,6 +5130,7 @@ model HiddenOnlineUser {
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
   @@unique([creatorId, fanId])
+  @@index([fanId], map: "HiddenOnlineUser_fanId_idx")
   @@index([agencyId, status])
   @@index([creatorId, status])
   @@index([lastSignalAt])

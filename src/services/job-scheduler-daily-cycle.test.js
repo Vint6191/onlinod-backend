@@ -16,13 +16,14 @@ const likesPath = require.resolve("./likes-service");
 const followAutomationPath = require.resolve("./follow-automation-service");
 const sfsPath = require.resolve("./sfs-service");
 const dailyPath = require.resolve("./vault-intelligence-daily-service");
+const domainWorkPath = require.resolve("./domain-work-authority-service");
 const schedulerPath = require.resolve("./job-scheduler");
 
 let dailyCalls = 0;
 cacheModule(prismaPath, {
   creatorAccount: {
-    async findMany() {
-      return [{ id: "creator-1", agencyId: "agency-1", remoteId: "of-1", username: "creator", displayName: "Creator" }];
+    async findFirst() {
+      return { id: "creator-1", agencyId: "agency-1", remoteId: "of-1", username: "creator", displayName: "Creator" };
     },
   },
   jobInstance: {
@@ -30,6 +31,16 @@ cacheModule(prismaPath, {
       throw new Error("unrelated earnings scheduler failure");
     },
   },
+});
+cacheModule(domainWorkPath, {
+  WORK_CLASS: { CREATOR_RECURRING_PLANNING: "CREATOR_RECURRING_PLANNING" },
+  async claimDomainWorkBatch() {
+    return { ownerToken: "owner-1", authorityNow: new Date(), items: [{ id: "work-1", agencyId: "agency-1", creatorId: "creator-1", objectId: "creator-1" }] };
+  },
+  async heartbeatDomainWorkClaim() { return { renewed: true, authorityNow: new Date() }; },
+  async ackDomainWorkClaim() { return { acknowledged: true }; },
+  async failDomainWorkClaim() { return { failed: true }; },
+  async yieldDomainWorkClaim() { return { yielded: true }; },
 });
 cacheModule(retentionPath, {
   async runRetentionSweep() { return { totalDeleted: 0 }; },
