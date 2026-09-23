@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { readSubscriberConsumerPage } = require("./fan-consumer-cursor-service");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
@@ -206,22 +207,19 @@ async function loadCandidates({ agencyId, creatorId, source, fanIds = [], limit 
   }
   const state = await currentSubscriberRun({ agencyId, creatorId, db });
   if (!state?.currentRunId) return [];
-  const where = { runId: state.currentRunId, agencyId, creatorId, ...(ids.length ? { fanId: { in: ids } } : {}) };
-  if (source === "hidden_online") where.lastSeenIsNull = true;
-  if (source === "paid_subscriber") where.subscriptionType = { in: ["paid", "active_paid"] };
-  if (source === "free_subscriber") where.subscriptionType = { in: ["free", "active_free"] };
-  const rows = await db.subscriberScanItem.findMany({ where, orderBy: { observedAt: "desc" }, take });
+  const rows = await readSubscriberConsumerPage({ db, agencyId, creatorId, runId: state.currentRunId,
+    consumerKey: `bumps:${source}`, fanIds: ids, limit: take });
   return rows.map((row) => ({
     fanId: row.fanId,
     dialogId: row.dialogId || row.fanId,
-    username: row.username,
-    displayName: row.name,
-    subscriptionType: row.subscriptionType,
-    isActive: row.isActive,
-    canReceiveChatMessage: row.canReceiveChatMessage,
+    username: null,
+    displayName: null,
+    subscriptionType: null,
+    isActive: null,
+    canReceiveChatMessage: null,
     snapshotRunId: row.runId,
     observedAt: row.observedAt,
-    metadata: { totalSpentCents: row.totalSpentCents, lastSeenAt: row.lastSeenAt, lastSeenIsNull: row.lastSeenIsNull },
+    metadata: {},
   }));
 }
 
@@ -339,8 +337,8 @@ async function planBumps({ agencyId, creatorId, userId = null, source = "manual"
         fan: {
           fanId: candidate.fanId,
           dialogId: candidate.dialogId,
-          username: candidate.username || null,
-          displayName: candidate.displayName || null,
+          username: canonicalCandidate.username || null,
+          displayName: canonicalCandidate.displayName || null,
           subscriptionType: canonicalCandidate.subscriptionType || null,
         },
         template,
@@ -1164,12 +1162,21 @@ async function getBumpOverview({ agencyId, creatorId, db = prisma }) {
     },
   });
   if (snapshot?.currentRunId) {
-    const base = { agencyId, creatorId, runId: snapshot.currentRunId };
-    [candidateCounts.hidden_online, candidateCounts.paid_subscriber, candidateCounts.free_subscriber] = await Promise.all([
-      db.subscriberScanItem.count({ where: { ...base, lastSeenIsNull: true } }),
-      db.subscriberScanItem.count({ where: { ...base, subscriptionType: { in: ["paid", "active_paid"] } } }),
-      db.subscriberScanItem.count({ where: { ...base, subscriptionType: { in: ["free", "active_free"] } } }),
-    ]);
+    const [counts] = await db.$queryRawUnsafe(`
+      SELECT COUNT(*) FILTER (WHERE r."lastSeenAt" IS NULL AND r."lastSeenAtAuthorityVersion" IS NOT NULL) AS hidden,
+        COUNT(*) FILTER (WHERE r."fanSubscriptionActive"=TRUE AND r."fanSubscriptionActiveAuthorityVersion" IS NOT NULL
+          AND r."fanSubscriptionTypeAuthorityVersion" IS NOT NULL
+          AND LOWER(r."fanSubscriptionType") NOT LIKE '%expired%' AND LOWER(r."fanSubscriptionType") NOT LIKE '%free%'
+          AND (LOWER(r."fanSubscriptionType") LIKE '%paid%' OR LOWER(r."fanSubscriptionType") LIKE '%active%')) AS paid,
+        COUNT(*) FILTER (WHERE r."fanSubscriptionActive"=TRUE AND r."fanSubscriptionActiveAuthorityVersion" IS NOT NULL
+          AND r."fanSubscriptionTypeAuthorityVersion" IS NOT NULL
+          AND LOWER(r."fanSubscriptionType") NOT LIKE '%expired%' AND LOWER(r."fanSubscriptionType") LIKE '%free%') AS free
+        FROM "SubscriberScanItem" i
+        JOIN "CreatorFanRelationshipCurrent" r ON r."agencyId"=i."agencyId" AND r."creatorId"=i."creatorId" AND r."onlyFansUserId"=i."fanId"
+       WHERE i."agencyId"=$1 AND i."creatorId"=$2 AND i."runId"=$3`, agencyId, creatorId, snapshot.currentRunId);
+    candidateCounts.hidden_online = Number(counts?.hidden || 0);
+    candidateCounts.paid_subscriber = Number(counts?.paid || 0);
+    candidateCounts.free_subscriber = Number(counts?.free || 0);
   }
 
   const reasons = [];

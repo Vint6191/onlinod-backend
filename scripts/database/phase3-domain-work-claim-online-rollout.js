@@ -2,7 +2,7 @@
 "use strict";
 
 const TOPOLOGY_ID = "phase3_domain_work_claim_topology_a36_v1";
-const DOMAIN_WORK_EXECUTOR_GENERATION = "phase3_domain_executor_v5_a36_claim_topology";
+const { DOMAIN_WORK_EXECUTOR_GENERATION } = require("../../src/services/phase2-release-compatibility-authority-service");
 const REQUIRED_BASE_TABLES = Object.freeze([
   "DomainWorkItem",
   "Phase2WorkBroadClaimPartitionState",
@@ -63,6 +63,15 @@ AS $$
 $$`;
 
 const INDEX_SPECS = Object.freeze([
+  Object.freeze({
+    name: "AutomationContentCandidate_current_cursor_idx",
+    table: "AutomationContentCandidate",
+    createSql: `CREATE INDEX CONCURRENTLY IF NOT EXISTS "AutomationContentCandidate_current_cursor_idx"
+      ON "AutomationContentCandidate"("creatorId","contentType","snapshotRunId","contentId")`,
+    orderedMarkers: ["creatorid", "contenttype", "snapshotrunid", "contentid"],
+    keyMarkers: [["creatorid"], ["contenttype"], ["snapshotrunid"], ["contentid"]],
+    predicateMarkers: [],
+  }),
   Object.freeze({
     name: "DomainWorkItem_claimable_global_a36_idx",
     table: "DomainWorkItem",

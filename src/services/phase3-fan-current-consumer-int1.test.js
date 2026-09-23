@@ -577,14 +577,17 @@ test("Phase3 scale pre-closure keeps fan-current planning and refresh batches bo
   const followBack = fs.readFileSync(path.join(__dirname, "follow-back-service.js"), "utf8");
   const refollow = fs.readFileSync(path.join(__dirname, "follow-automation-service.js"), "utf8");
   const bump = fs.readFileSync(path.join(__dirname, "bump-service.js"), "utf8");
-  assert.match(likes, /take: Math\.min\(500, Math\.max\(capacity \* 4, 100\)\)/);
+  assert.match(likes, /const take = Math\.min\(500, Math\.max\(capacity \* 4, 100\)\)/);
+  assert.match(likes, /consumerKey: "likes:planning", limit: take/);
   assert.doesNotMatch(likes, /take: Math\.min\(2000/);
   assert.match(followBack, /batchSize = fanId \? 1 : 500/);
   assert.match(followBack, /refreshFanIds\.size < 500/);
-  assert.match(followBack, /refreshFanIds\.size >= 500/);
+  assert.match(followBack, /consumerKey: "follow_back:planning", limit: batchSize/);
+  assert.doesNotMatch(followBack, /while \(!exhausted/);
   assert.match(refollow, /batchSize = fanId \? 1 : 500/);
   assert.match(refollow, /refreshFanIds\.size < 500/);
-  assert.match(refollow, /refreshFanIds\.size >= 500/);
+  assert.match(refollow, /consumerKey: "follow_automation:planning", limit: batchSize/);
+  assert.doesNotMatch(refollow, /for \(;;\)/);
   assert.match(bump, /candidateBatchSize[\s\S]*Math\.max\(1, Number\(limit\)/);
 });
 

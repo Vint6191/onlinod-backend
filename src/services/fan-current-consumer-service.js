@@ -202,6 +202,7 @@ function likesRequiredFields(settings = {}, current = null) {
 function bumpRequiredFields(source) {
   const fields = ["canReceiveChatMessage"];
   if (source === "paid_subscriber" || source === "free_subscriber") fields.push("fanSubscriptionActive", "fanSubscriptionType");
+  if (source === "hidden_online") fields.push("lastSeenAt");
   return uniqueRelationshipFields(fields);
 }
 
@@ -450,15 +451,12 @@ function canonicalBumpCandidate(candidate, current) {
     subscriptionType: rel.fanSubscriptionType,
     isActive: rel.fanSubscriptionActive,
     canReceiveChatMessage: rel.canReceiveChatMessage,
+    metadata: { ...(candidate.metadata || {}), lastSeenAt: rel.lastSeenAt, lastSeenIsNull: rel.lastSeenAt === null },
   };
 }
 
 function bumpRefreshFields(source) {
-  const fields = ["canReceiveChatMessage"];
-  if (source === "paid_subscriber" || source === "free_subscriber") {
-    fields.push("fanSubscriptionActive", "fanSubscriptionType");
-  }
-  return fields;
+  return bumpRequiredFields(source);
 }
 
 function bumpRefreshRequired(code, source, fields = null, freshnessClass = FAN_CURRENT_FRESHNESS_CLASS.UNKNOWN) {
@@ -498,7 +496,7 @@ function validateBumpCurrentRelationship({ candidate, current, source, now = new
     }
     const type = String(canonical.subscriptionType || "").toLowerCase();
     if (!type) return { ...bumpRefreshRequired("fan_subscription_type_unknown", source, ["fanSubscriptionType"], freshness.freshnessClass), candidate: canonical };
-    if (!(type.includes("paid") || type.includes("active"))) return { ok: false, terminal: true, code: "fan_not_paid_current", candidate: canonical };
+    if (subscriptionBucket(type) !== "paid") return { ok: false, terminal: true, code: "fan_not_paid_current", candidate: canonical };
   }
   if (source === "free_subscriber") {
     if (canonical.isActive !== true) {
@@ -507,7 +505,10 @@ function validateBumpCurrentRelationship({ candidate, current, source, now = new
     }
     const type = String(canonical.subscriptionType || "").toLowerCase();
     if (!type) return { ...bumpRefreshRequired("fan_subscription_type_unknown", source, ["fanSubscriptionType"], freshness.freshnessClass), candidate: canonical };
-    if (!type.includes("free")) return { ok: false, terminal: true, code: "fan_not_free_current", candidate: canonical };
+    if (subscriptionBucket(type) !== "free") return { ok: false, terminal: true, code: "fan_not_free_current", candidate: canonical };
+  }
+  if (source === "hidden_online" && canonical.metadata.lastSeenIsNull !== true) {
+    return { ok: false, terminal: true, code: "fan_not_hidden_current", candidate: canonical };
   }
   return { ok: true, candidate: canonical, freshnessClass: freshness.freshnessClass };
 }

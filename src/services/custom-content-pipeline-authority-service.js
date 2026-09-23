@@ -389,6 +389,15 @@ async function ensureSubmissionExecutionProfile({ db, agencyId, submission, now 
       return { submission: base, vaultFolderId: existingFolder, relayRecipient: existingRecipient, pinnedNow: false };
     }
 
+    // Capture dependency revisions before observing the defaults. If a producer
+    // changes them before BLOCKED is committed, the shared blocker sees the newer
+    // revision and keeps work READY instead of losing the wakeup.
+    const { currentDependencyRevision } = require("./domain-work-authority-service");
+    const folderDependency = { dependencyKind: "CREATOR_BINDING", dependencyKey: String(base.creatorId) };
+    const recipientDependency = { dependencyKind: "CUSTOM_PIPELINE_CONFIG", dependencyKey: String(agencyId) };
+    for (const dependency of [folderDependency, recipientDependency]) {
+      dependency.dependencyRevision = await currentDependencyRevision({ db: lockedDb, agencyId, ...dependency });
+    }
     const defaults = await readExecutionDefaults({ db: lockedDb, agencyId, creatorId: String(base.creatorId) });
     // Rolling-cutover safety: pre-cutover CUSTOM_RELAY_SEND rows already pinned
     // their recipient in the durable write payload even though the submission had
@@ -403,8 +412,8 @@ async function ensureSubmissionExecutionProfile({ db, agencyId, submission, now 
     // and do not pin today's mutable relay default onto work that will never relay
     // another source message.
     const chosenRecipient = requireRelayRecipient ? (historicalRecipient || defaults.relayRecipient) : (existingRecipient || null);
-    if (!defaults.vaultFolderId) throw fail("CUSTOM_SUBMISSION_VAULT_RELAY_REQUIRED", "Customs Vault destination is not configured", 409);
-    if (requireRelayRecipient && !chosenRecipient) throw fail("CUSTOM_SUBMISSION_VAULT_RECIPIENT_REQUIRED", "Vault upload recipient is not configured", 409);
+    if (!defaults.vaultFolderId) throw Object.assign(fail("CUSTOM_SUBMISSION_VAULT_RELAY_REQUIRED", "Customs Vault destination is not configured", 409), { domainWorkDependency: folderDependency });
+    if (requireRelayRecipient && !chosenRecipient) throw Object.assign(fail("CUSTOM_SUBMISSION_VAULT_RECIPIENT_REQUIRED", "Vault upload recipient is not configured", 409), { domainWorkDependency: recipientDependency });
 
     const changed = await lockedDb.customContentSubmission.updateMany({
       where: {

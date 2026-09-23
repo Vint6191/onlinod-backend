@@ -131,6 +131,8 @@ test("Closure4 real FollowBack and Follow Automation planning paths survive a qu
   const db = {
     ...fx.db,
     subscriberDirectoryState: { findFirst: async () => ({ currentRunId: "snapshot-1" }) },
+    subscriberScanItem: { findMany: async () => [] },
+    fanConsumerCursor: { findUnique: async () => null, upsert: async () => ({}) },
     automationDelivery: { count: async () => 0 },
     deviceCreatorBinding: { count: async () => 0 },
     followBackCandidate: { findMany: async () => [] },
@@ -276,8 +278,10 @@ test("Closure4 prepareWriteActionDelivery reaches COMMITTING through executeRaw 
     assert.equal(delivery.status, "COMMITTING");
     assert.equal(delivery.writeCommitRevision, 1);
     assert.equal(fx.calls.query.length, 0);
-    assert.equal(fx.calls.execute.length, 1);
+    assert.equal(fx.calls.execute.length, 2);
     assert.deepEqual(fx.calls.execute[0].args, ["onlinod:automation-write-commit:v1", "agency-1"]);
+    assert.equal(fx.calls.execute[1].sql, "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)");
+    assert.deepEqual(fx.calls.execute[1].args, ["phase3_fan_consumer_v1_current_bounded"]);
   } finally {
     delete require.cache[actionId];
     for (const restore of restores.reverse()) restore();

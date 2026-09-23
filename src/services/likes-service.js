@@ -4,7 +4,8 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
-const { ensurePlannedJob } = require("./job-planning-repository");
+const { ensurePlannedJob, afterPlanningCommit } = require("./job-planning-repository");
+const { readSubscriberConsumerPage, readFanConsumerPage } = require("./fan-consumer-cursor-service");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { readFanCurrentMap, evaluateLikesCurrent, likesRequiredFields, buildFanCurrentFieldFence } = require("./fan-current-consumer-service");
@@ -104,17 +105,8 @@ async function eligibleDiscoveryFans({ agencyId, creatorId, settings, snapshotRu
   const now = new Date();
   const freshnessCutoff = new Date(now.getTime() - settings.discoveryFreshnessHours * 60 * 60_000);
   const requested = [...new Set((Array.isArray(fanIds) ? fanIds : []).map((value) => clean(value, 160)).filter(Boolean))];
-  const rows = await db.subscriberScanItem.findMany({
-    where: {
-      agencyId,
-      creatorId,
-      runId: snapshotRunId,
-      ...(requested.length ? { fanId: { in: requested } } : {}),
-    },
-    orderBy: [{ observedAt: "desc" }, { fanId: "asc" }],
-    select: { fanId: true, username: true, name: true, avatarUrl: true, subscriptionType: true, isActive: true, metadata: true },
-    take: Math.min(10_000, Math.max(1, Number(maxFans) || 500) * 3),
-  });
+  const rows = await readSubscriberConsumerPage({ db, agencyId, creatorId, runId: snapshotRunId,
+    consumerKey: "likes:discovery", fanIds: requested, limit: maxFans });
   if (!rows.length) return [];
   const ids = rows.map((row) => row.fanId);
   const failedRetryCutoff = new Date(now.getTime() - 15 * 60_000);
@@ -133,10 +125,22 @@ async function eligibleDiscoveryFans({ agencyId, creatorId, settings, snapshotRu
   ]);
   const excluded = new Set(hiddenStatuses.map((row) => row.fanId));
   const fresh = new Set(recentDiscovery.map((row) => row.ownerFanId));
-  return rows.filter((row) => !excluded.has(row.fanId) && (force || !fresh.has(row.fanId))).slice(0, Math.max(1, Number(maxFans) || 500));
+  const selected = rows.filter((row) => !excluded.has(row.fanId) && (force || !fresh.has(row.fanId)));
+  const currentByFan = await readFanCurrentMap(db, { agencyId, creatorId, fanIds: selected.map((row) => row.fanId) });
+  return selected.map((row) => {
+    const identity = currentByFan.get(row.fanId)?.platformIdentity || {};
+    return { ...row, username: identity.username || null, name: identity.platformDisplayName || null, avatarUrl: identity.avatarUrl || null };
+  });
 }
 
-async function scheduleLikesDiscovery({ agencyId, creatorId, userId = null, fanIds = [], force = false, source = "manual", maxFans = 500, priority = 80, db = prisma }) {
+async function scheduleLikesDiscovery(input) {
+  const db = input.db || prisma;
+  // A failed job insert rolls back the cursor; notification follows commit.
+  return afterPlanningCommit(() => withCreatorLock(db, input.agencyId, input.creatorId,
+    (tx) => scheduleLikesDiscoveryLocked({ ...input, db: tx })));
+}
+
+async function scheduleLikesDiscoveryLocked({ agencyId, creatorId, userId = null, fanIds = [], force = false, source = "manual", maxFans = 500, priority = 80, db = prisma }) {
   await requireCreator(agencyId, creatorId, db);
   const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: LIKES_MODULE_KEY, db });
   const settings = normalizeLikesSettings(control.modules.likes.settings);
@@ -351,29 +355,31 @@ async function planLikesLocked({ db, agencyId, creatorId, userId = null, candida
   if (!capacity) return { ok: true, created: false, reason: "daily_limit", planned: 0, skipped: { daily_limit: 1 } };
   const ids = [...new Set((Array.isArray(candidateIds) ? candidateIds : []).map((value) => clean(value, 160)).filter(Boolean))];
   const cutoff = new Date(now.getTime() - settings.contentMaxAgeDays * 24 * 60 * 60_000);
-  const candidates = await db.automationContentCandidate.findMany({
+  const take = Math.min(500, Math.max(capacity * 4, 100));
+  const findPage = ({ afterKey, take: pageSize }) => db.automationContentCandidate.findMany({
     where: {
       agencyId, creatorId, contentType: "post", snapshotRunId: snapshot.currentRunId,
       ...(ids.length ? { id: { in: ids } } : {}),
-      state: { in: ["ELIGIBLE", "DISCOVERED"] },
-      OR: [{ cooldownUntil: null }, { cooldownUntil: { lte: now } }],
-      AND: [
-        { OR: [{ canToggleFavorite: true }, { canToggleFavorite: null }] },
-        { OR: [{ canViewMedia: true }, { canViewMedia: null }] },
-        ...(settings.onlyUnliked ? [{ OR: [{ isFavorite: false }, { isFavorite: null }] }] : []),
-        { OR: [{ publishedAt: null }, { publishedAt: { gte: cutoff } }] },
-      ],
+      ...(afterKey ? { contentId: { gt: afterKey } } : {}),
     },
-    orderBy: [{ publishedAt: "desc" }, { discoveredAt: "desc" }],
-    take: Math.min(500, Math.max(capacity * 4, 100)),
+    orderBy: { contentId: "asc" }, take: pageSize,
   });
+  const page = ids.length ? await findPage({ take }) : await readFanConsumerPage({ db, agencyId, creatorId,
+    runId: snapshot.currentRunId, consumerKey: "likes:planning", limit: take, findPage, keyOf: (row) => row.contentId, stableAcrossPublications: true });
+  // Filter after bounded indexed enumeration, so an ineligible prefix cannot
+  // force an unbounded scan or hide the rest of the current publication.
+  const candidates = page.filter((row) => ["ELIGIBLE", "DISCOVERED"].includes(row.state)
+    && (!row.cooldownUntil || row.cooldownUntil <= now)
+    && row.canToggleFavorite !== false && row.canViewMedia !== false
+    && (!settings.onlyUnliked || row.isFavorite !== true)
+    && (!row.publishedAt || row.publishedAt >= cutoff));
   const blocked = await currentBlockedFans({ agencyId, creatorId, fanIds: [...new Set(candidates.map((row) => row.ownerFanId))], db });
   const skipped = {};
   const refreshFanIds = new Set();
   if (blocked.size) {
-    const blockedIds = [...blocked];
+    const blockedIds = candidates.filter((candidate) => blocked.has(candidate.ownerFanId)).map((candidate) => candidate.id);
     await db.automationContentCandidate.updateMany({
-      where: { agencyId, creatorId, contentType: "post", ownerFanId: { in: blockedIds }, state: { in: ["ELIGIBLE", "DISCOVERED"] } },
+      where: { agencyId, creatorId, contentType: "post", id: { in: blockedIds }, state: { in: ["ELIGIBLE", "DISCOVERED"] } },
       data: { state: "BLOCKED", skipReason: "blocked", eligibilityReason: "blocked", latestError: "blocked" },
     });
     skipped.blocked = candidates.filter((candidate) => blocked.has(candidate.ownerFanId)).length;

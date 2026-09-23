@@ -54,7 +54,8 @@ test("INT5.5C-1 snapshot/cohort stores are not promoted back into canonical curr
   const subscriber = read("services/subscriber-directory-service.js");
   assert.match(bumps, /Relationship-looking metadata is historical trigger evidence only/);
   assert.match(bumps, /Current relationship fields are overlaid exclusively from FanDataAuthority/);
-  assert.match(likes, /subscriberScanItem\.findMany/);
+  assert.match(likes, /readSubscriberConsumerPage/);
+  assert.match(read("services/fan-consumer-cursor-service.js"), /subscriberScanItem\.findMany/);
   assert.match(likes, /readFanCurrentMap/);
   assert.match(subscriber, /Legacy flat aliases are response-time derivations of canonical current/);
 });

@@ -332,13 +332,13 @@ test("A36 DomainWork admission is bounded on both Agency and creator axes withou
   assert.match(wakeAuthority, /batch\.remaining[\s\S]*yieldDomainWorkClaim/);
   assert.match(scheduler, /const dependencyWake = await maybeRunPhase2DependencyWake/);
 
-  assert.match(release, /DOMAIN_WORK_EXECUTOR_GENERATION = "phase3_domain_executor_v5_a36_claim_topology"/);
+  assert.match(release, /DOMAIN_WORK_EXECUTOR_GENERATION = "phase3_domain_executor_v6_failure_policy"/);
   assert.match(release, /DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION = "phase2_domain_executor_v4_actual56_postcut"/);
   assert.match(release, /authorizeDomainWorkDependencyWakeBridge[\s\S]*DomainWorkClaimTopologyState[\s\S]*FOR SHARE[\s\S]*Phase2ReleaseCompatibilityAuthority[\s\S]*FOR SHARE/);
   assert.match(release, /authorizeDomainWorkExecutor[\s\S]*DomainWorkClaimTopologyState[\s\S]*FOR SHARE[\s\S]*activationState \|\| ""\)\.toUpperCase\(\) !== "ACTIVE"/);
   assert.match(release, /releaseGeneration === DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION[\s\S]*releaseGeneration === DOMAIN_WORK_EXECUTOR_GENERATION/);
   assert.match(domain, /topology\?\.activationState === "BUILDING"[\s\S]*klass === WORK_CLASS\.DEPENDENCY_WAKE/);
-  assert.match(rollout, /DOMAIN_WORK_EXECUTOR_GENERATION = "phase3_domain_executor_v5_a36_claim_topology"/);
+  assert.match(rollout, /const \{ DOMAIN_WORK_EXECUTOR_GENERATION \} = require\("\.\.\/\.\.\/src\/services\/phase2-release-compatibility-authority-service"\)/);
   assert.match(rollout, /runBuildingDependencyWakeUnit[\s\S]*runDomainDependencyWakeSweep/);
   assert.match(rollout, /await maintainDependencyWake\(\);[\s\S]*backfillBatch[\s\S]*await maintainDependencyWake\(\);[\s\S]*backfillMemberBatch[\s\S]*await maintainDependencyWake\(\);/);
   const activationFenceStart = rollout.indexOf("async function activateTopologyExecutorFence");
@@ -350,7 +350,7 @@ test("A36 DomainWork admission is bounded on both Agency and creator axes withou
   assert.match(activationFence, /activationState"='ACTIVE'/);
   assert.match(activationFence, /db\.\$transaction/);
 
-  assert.equal((rollout.match(/CREATE INDEX CONCURRENTLY IF NOT EXISTS/g) || []).length, 7);
+  assert.equal((rollout.match(/CREATE INDEX CONCURRENTLY IF NOT EXISTS/g) || []).length, 8);
   const partitionSelectorStart = rollout.indexOf("async function selectBackfillCandidates");
   const partitionSelectorEnd = rollout.indexOf("async function lockBackfillAgencyLifecycles", partitionSelectorStart);
   const partitionSelector = rollout.slice(partitionSelectorStart, partitionSelectorEnd);

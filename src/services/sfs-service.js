@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { readFanConsumerPage } = require("./fan-consumer-cursor-service");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
@@ -339,10 +340,16 @@ async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId 
     });
     let remaining = Math.max(0, settings.dailyLimit - startedToday);
     if (!remaining) return { ok: true, created: 0, reason: "daily_limit", dailyLimit: settings.dailyLimit, refreshFanIds: [], refreshFields: [] };
-    const candidates = await tx.sfsTargetCandidate.findMany({
-      where: { agencyId, creatorId, ...(candidateId ? { id: candidateId } : {}) },
-      orderBy: [{ discoveredAt: "asc" }, { updatedAt: "asc" }], take: Math.min(500, Math.max(1, Number(limit) || 20) * 5),
-    });
+    const take = Math.min(500, Math.max(1, Number(limit) || 20) * 5);
+    const candidates = candidateId
+      ? await tx.sfsTargetCandidate.findMany({ where: { agencyId, creatorId, id: candidateId }, take: 1 })
+      : await readFanConsumerPage({ db: tx, agencyId, creatorId, runId: "sfs:current-targets:v1", consumerKey: "sfs:planning", limit: take,
+        keyOf: (row) => row.targetUserId,
+        findPage: ({ afterKey, take: pageSize }) => tx.sfsTargetCandidate.findMany({
+          where: { agencyId, creatorId, targetUserId: { not: null, ...(afterKey ? { gt: afterKey } : {}) } },
+          orderBy: { targetUserId: "asc" }, take: pageSize,
+        }),
+      });
     const currentByFan = await readFanCurrentMap(tx, {
       agencyId,
       creatorId,

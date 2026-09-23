@@ -1,6 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { readSubscriberConsumerPage } = require("./fan-consumer-cursor-service");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
@@ -238,17 +239,18 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
   const skip = (code) => { summary.skipped[code] = (summary.skipped[code] || 0) + 1; };
   const refreshFanIds = new Set();
 
-  let cursorId = null;
-  let exhausted = false;
   const batchSize = fanId ? 1 : 500;
-  while (!exhausted && (fanId || capacity > 0)) {
+  if (fanId || capacity > 0) {
+    if (!fanId) {
+      const page = await readSubscriberConsumerPage({ db, agencyId, creatorId, runId: state.currentRunId,
+        consumerKey: "follow_back:planning", limit: batchSize });
+      candidateWhere.fanId = { in: page.map((row) => row.fanId) };
+    }
     const candidates = await db.followBackCandidate.findMany({
       where: candidateWhere,
       orderBy: [{ discoveredAt: "asc" }, { id: "asc" }],
-      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
       take: batchSize,
     });
-    if (!candidates.length) break;
     summary.scanned += candidates.length;
     const currentByFan = await readFanCurrentMap(db, {
       agencyId,
@@ -360,8 +362,6 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
       }
     }
 
-    cursorId = candidates[candidates.length - 1].id;
-    exhausted = fanId || candidates.length < batchSize || refreshFanIds.size >= 500;
   }
   return { ok: true, creatorId, source, summary, refreshFanIds: [...refreshFanIds].slice(0, 500) };
 }

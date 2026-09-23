@@ -1183,6 +1183,12 @@ async function prepareWriteActionDelivery(input) {
         throw error;
       }
     }
+    // Transaction-local proof for the DB release fence. Set only after current
+    // consumer/access/field validation; old replicas cannot mint a new permit.
+    await tx.$executeRawUnsafe(
+      "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)",
+      "phase3_fan_consumer_v1_current_bounded",
+    );
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: "RUNNING", claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision, claimUntil: { gt: now } },
       data: {

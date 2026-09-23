@@ -551,6 +551,7 @@ model CreatorAccount {
   subscriberDirectoryStates             SubscriberDirectoryState[]
   subscriberDirectoryMaintenanceSignals SubscriberDirectoryMaintenanceSignal[]
   campaignFanRefreshPromotionSignal     CampaignFanRefreshPromotionSignal?
+  fanConsumerCursors             FanConsumerCursor[]
   followBackTasks                       FollowBackTask[]
   vaultPurchaseMessages                 VaultPurchaseMessage[]
   vaultMediaSales                       VaultMediaSale[]
@@ -2392,6 +2393,10 @@ model DomainWorkItem {
   dependencyKey            String?
   dependencyRevision       BigInt    @default(0)
   attempts                 Int       @default(0)
+  failureRevision          BigInt    @default(0)
+  consecutiveFailures      Int       @default(0)
+  lastFailureAt            DateTime?
+  lastRepair               Json?
   errorClass               String?
   lastError                String?
   terminalCause            String?
@@ -5004,6 +5009,7 @@ model AutomationContentCandidate {
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
   @@unique([creatorId, contentType, contentId])
+  @@index([creatorId, contentType, snapshotRunId, contentId], map: "AutomationContentCandidate_current_cursor_idx")
   @@index([agencyId, creatorId, state])
   @@index([creatorId, ownerFanId])
   @@index([creatorId, publishedAt])
@@ -5103,6 +5109,20 @@ model SubscriberScanPage {
 
   @@unique([runId, offset])
   @@index([runId, receivedAt])
+}
+
+model FanConsumerCursor {
+  agencyId    String
+  creatorId   String
+  consumerKey String
+  runId       String
+  afterKey    String?
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade, map: "FanConsumerCursor_creator_fkey")
+
+  @@id([creatorId, consumerKey])
+  @@index([agencyId, creatorId], map: "FanConsumerCursor_agency_creator_idx")
 }
 
 model SubscriberScanItem {

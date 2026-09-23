@@ -1618,6 +1618,16 @@ async function settleClaimedSourcePipelineFailure({
   db, agencyId, submissionId, item, ownerToken, code, error = null, now = new Date(), fallbackRetryAt = null,
 } = {}) {
   const normalizedCode = String(code || error?.code || "CUSTOM_SOURCE_PIPELINE_RETRY");
+  if (error?.domainWorkDependency) {
+    // No submission retry diagnostics are written: they are attempt-scoped and
+    // would add an old timer after a dependency wake. Block before any DWI lock
+    // to retain the dependency -> DWI order used by producers and wake workers.
+    const settlement = await failDomainWorkClaim({ db, item, ownerToken, error,
+      dependency: { ...error.domainWorkDependency, reason: normalizedCode }, fallbackNow: now });
+    return { lost: settlement?.lost === true, stale: false,
+      superseded: settlement?.newerRevision === true || settlement?.newerDependency === true,
+      report: { ok: true, blocked: settlement?.blocked === true, code: normalizedCode, nextAttemptAt: null }, settlement };
+  }
   return withSubmissionPipelineLock({ db, agencyId, submissionId, work: async (lockedDb) => {
     // Canonical source writers/triggers lock Submission before DomainWork. Keep the
     // same order here so an old worker cannot publish retry metadata after a newer
@@ -1713,7 +1723,9 @@ async function exactSourcePipelineWork({ agencyId, member, validAccountIds, item
   }
   if (!context.creator) {
     const error = Object.assign(new Error("Creator is retired while Custom source work remains"), { code: "CREATOR_RETIRED" });
-    await releaseSourcePipelineClaimAsRetry({ db, item, ownerToken, retryAt: new Date(now.getTime() + SOURCE_PIPELINE_UNAVAILABLE_RETRY_MS), error, now });
+    // This is an exact canonical lifecycle lookup, not a provider 404. Retired
+    // creators cannot regain upload authority through a timer or retry counter.
+    await ackDomainWorkClaim({ db, item, ownerToken, terminalCause: error.code, fallbackNow: now });
     return { item: null, blocked: { submissionId, code: error.code, message: error.message } };
   }
 

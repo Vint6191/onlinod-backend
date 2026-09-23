@@ -426,6 +426,7 @@ test("Closure2 delayed Traffic T1 cannot replace a newer T2 projection", async (
 
 function commitRaceDb({ moduleKey, targetId, actionType }) {
   const token = "race-token";
+  let currentConsumerPermit = false;
   const delivery = {
     id: `race-${moduleKey}`, agencyId: "agency-1", creatorId: "creator-1", originKind: "AUTOMATION", moduleKey, actionType, targetId, fanId: targetId,
     status: "RUNNING", notBefore: new Date(Date.now() - 1_000), priority: 50, attempts: 1, maxAttempts: 3,
@@ -434,12 +435,19 @@ function commitRaceDb({ moduleKey, targetId, actionType }) {
     createdAt: new Date(Date.now() - 10_000), generation: 1,
   };
   const db = {
+    $executeRawUnsafe: async (sql, generation) => {
+      assert.equal(sql, "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)");
+      assert.equal(generation, "phase3_fan_consumer_v1_current_bounded");
+      currentConsumerPermit = true;
+      return 1;
+    },
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: new Date() }) },
     agencyMember: { findFirst: async () => ({ id: "member-1", agencyId: "agency-1", accessEpoch: 7, role: "OWNER", assignedCreators: "all" }) },
     automationDelivery: {
       findUnique: async ({ where }) => where.id === delivery.id ? delivery : null,
       updateMany: async ({ where, data }) => {
         if (!rowMatches(delivery, where)) return { count: 0 };
+        if (data.status === "COMMITTING") assert.equal(currentConsumerPermit, true);
         applyData(delivery, data); return { count: 1 };
       },
     },

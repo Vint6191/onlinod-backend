@@ -1,6 +1,8 @@
 "use strict";
 
 const { createHash, randomUUID } = require("node:crypto");
+const { isDeepStrictEqual } = require("node:util");
+const { domainWorkFailureOutcome } = require("./domain-work-failure-policy");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const {
@@ -1298,7 +1300,7 @@ async function heartbeatDomainWorkClaim({ db = null, item, ownerToken = null, le
   });
 }
 
-async function ackDomainWorkClaim({ db = null, item, ownerToken = null, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION } = {}) {
+async function ackDomainWorkClaim({ db = null, item, ownerToken = null, terminalCause = null, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION } = {}) {
   if (!db) db = require("../prisma");
   if (!item?.id) return { acknowledged: false, lost: true };
   return runDbTransaction(db, async (tx) => {
@@ -1313,12 +1315,14 @@ async function ackDomainWorkClaim({ db = null, item, ownerToken = null, fallback
            "isOutstanding"=CASE WHEN "requestedRevision">$1 THEN TRUE ELSE FALSE END,
            "availableAt"=CASE WHEN "requestedRevision">$1 THEN $2 ELSE "availableAt" END,
            "ownerToken"=NULL,"leaseUntil"=$2,"nextAttemptAt"=NULL,"errorClass"=NULL,"lastError"=NULL,
+           "consecutiveFailures"=0,"failureRevision"=0,"lastFailureAt"=NULL,
+           "terminalCause"=CASE WHEN "requestedRevision">$1 THEN NULL ELSE $7::text END,
            "progressCursor"=CASE WHEN "requestedRevision">$1 THEN NULL ELSE "progressCursor" END,
            "updatedAt"=CURRENT_TIMESTAMP
          WHERE "id"=$3 AND "state"='CLAIMED' AND "ownerToken"=$4 AND "claimFence"=$5
            AND "claimedRevision"=$1 AND "activeGeneration"=$6 AND "leaseUntil">$2
          RETURNING "requestedRevision","completedRevision","state"`,
-        asBigInt(item.claimedRevision),authorityNow,String(item.id),String(ownerToken || item.ownerToken || ""),asBigInt(item.claimFence),String(generation),
+        asBigInt(item.claimedRevision),authorityNow,String(item.id),String(ownerToken || item.ownerToken || ""),asBigInt(item.claimFence),String(generation),clean(terminalCause, 120),
       );
       const row = rows?.[0];
       return row ? { acknowledged: true, lost: false, state: row.state, requestedRevision: row.requestedRevision, completedRevision: row.completedRevision } : { acknowledged: false, lost: true };
@@ -1330,7 +1334,7 @@ async function ackDomainWorkClaim({ db = null, item, ownerToken = null, fallback
     const hasNewer = asBigInt(current.requestedRevision) > asBigInt(item.claimedRevision);
     const changed = await tx.domainWorkItem.updateMany({
       where: claimWhere(item, ownerToken, authorityNow, generation),
-      data: { completedRevision: asBigInt(item.claimedRevision), state: hasNewer ? STATE.READY : STATE.DONE, isOutstanding: hasNewer, availableAt: hasNewer ? authorityNow : current.availableAt, ownerToken: null, leaseUntil: authorityNow, nextAttemptAt: null, errorClass: null, lastError: null, progressCursor: hasNewer ? null : current.progressCursor ?? null },
+      data: { completedRevision: asBigInt(item.claimedRevision), state: hasNewer ? STATE.READY : STATE.DONE, isOutstanding: hasNewer, availableAt: hasNewer ? authorityNow : current.availableAt, ownerToken: null, leaseUntil: authorityNow, nextAttemptAt: null, errorClass: null, lastError: null, consecutiveFailures: 0, failureRevision: 0n, lastFailureAt: null, terminalCause: hasNewer ? null : clean(terminalCause, 120), progressCursor: hasNewer ? null : current.progressCursor ?? null },
     });
     return Number(changed?.count || 0) === 1 ? { acknowledged: true, lost: false, state: hasNewer ? STATE.READY : STATE.DONE } : { acknowledged: false, lost: true };
   });
@@ -1388,25 +1392,38 @@ async function blockDomainWorkClaim({ db = null, item, ownerToken = null, depend
   });
 }
 
-async function failDomainWorkClaim({ db = null, item, ownerToken = null, error = null, retryAt = null, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION } = {}) {
+async function failDomainWorkClaim({ db = null, item, ownerToken = null, error = null, dependency = null, retryAt = null, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION } = {}) {
   if (!db) db = require("../prisma");
   if (!item?.id) return { failed: false, lost: true };
+  // Dependency identity/revision comes from the domain, never from message text.
+  // Delegate BEFORE locking DWI to preserve dependency -> work lock ordering.
+  if (dependency) return blockDomainWorkClaim({ db, item, ownerToken, ...dependency, fallbackNow, generation });
   return runDbTransaction(db, async (tx) => {
     const ownership = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow, generation });
     if (!ownership.current) return { failed: false, lost: true };
     const authorityNow = ownership.authorityNow;
-    const attempts = Math.max(1, Number(item.attempts || 1));
-    const delay = Math.min(15 * 60_000, Math.max(1_000, 2 ** Math.min(10, attempts) * 1_000));
-    const due = asDate(retryAt) || new Date(authorityNow.getTime() + delay);
+    const stored = ownership.item;
+    const consecutiveFailures = (asBigInt(stored.failureRevision) === asBigInt(item.claimedRevision)
+      ? Math.max(0, Number(stored.consecutiveFailures || 0)) : 0) + 1;
+    const outcome = domainWorkFailureOutcome({ error, consecutiveFailures });
+    // Respect a domain's later retry deadline, but never hot-loop a past one.
+    const due = outcome.state === STATE.READY
+      ? new Date(Math.max(authorityNow.getTime() + outcome.delayMs, asDate(retryAt)?.getTime() || 0)) : null;
     const baseWhere = claimWhere(item, ownerToken, authorityNow, generation);
     const failed = await tx.domainWorkItem?.updateMany?.({
       where: { ...baseWhere, requestedRevision: asBigInt(item.claimedRevision) },
       data: {
-        state: STATE.READY, isOutstanding: true, ownerToken: null, leaseUntil: authorityNow, availableAt: due, nextAttemptAt: due,
-        errorClass: clean(error?.code || "TRANSIENT", 120), lastError: clean(error?.message || error || "DOMAIN_WORK_FAILED", 2000),
+        state: outcome.state, isOutstanding: true, ownerToken: null, leaseUntil: authorityNow,
+        ...(due ? { availableAt: due } : {}), nextAttemptAt: due,
+        failureRevision: asBigInt(item.claimedRevision), consecutiveFailures, lastFailureAt: authorityNow,
+        errorClass: outcome.errorClass, terminalCause: outcome.terminalCause,
+        lastError: clean(`${outcome.code}: ${error?.message || error || "DOMAIN_WORK_FAILED"}`, 2000),
       },
     });
-    if (Number(failed?.count || 0) === 1) return { failed: true, lost: false, retryAt: due };
+    if (Number(failed?.count || 0) === 1) return {
+      failed: true, lost: false, retryAt: due, state: outcome.state,
+      reconcileRequired: outcome.state === STATE.RECONCILE_REQUIRED, consecutiveFailures,
+    };
 
     // A failure from V1 must never reintroduce V1 backoff/error state after a V2
     // canonical invalidation already reopened this identity. Preserve the new wakeup.
@@ -1414,7 +1431,8 @@ async function failDomainWorkClaim({ db = null, item, ownerToken = null, error =
       where: { ...baseWhere, requestedRevision: { gt: asBigInt(item.claimedRevision) } },
       data: {
         state: STATE.READY, ownerToken: null, leaseUntil: authorityNow, availableAt: authorityNow, nextAttemptAt: null,
-        errorClass: null, lastError: null, progressCursor: null,
+        errorClass: null, lastError: null, progressCursor: null, terminalCause: null,
+        consecutiveFailures: 0, failureRevision: 0n, lastFailureAt: null,
       },
     });
     return Number(reopened?.count || 0) === 1
@@ -1432,7 +1450,11 @@ async function saveDomainWorkProgress({ db = null, item, ownerToken = null, prog
     const authorityNow = ownership.authorityNow;
     const where = claimWhere(item, ownerToken, authorityNow, generation);
     where.requestedRevision = item.claimedRevision; // a new invalidation aborts the old enumeration cursor
-    const changed = await tx.domainWorkItem?.updateMany?.({ where, data: { progressCursor: progressCursor ?? null } });
+    const madeProgress = progressCursor != null && !isDeepStrictEqual(progressCursor, ownership.item.progressCursor);
+    const changed = await tx.domainWorkItem?.updateMany?.({ where, data: {
+      progressCursor: progressCursor ?? null,
+      ...(madeProgress ? { consecutiveFailures: 0, failureRevision: 0n, lastFailureAt: null, errorClass: null, lastError: null, terminalCause: null } : {}),
+    } });
     return Number(changed?.count || 0) === 1 ? { saved: true, lost: false } : { saved: false, lost: true };
   });
 }
@@ -1448,6 +1470,9 @@ async function yieldDomainWorkClaim({ db = null, item, ownerToken = null, progre
     const baseWhere = claimWhere(item, ownerToken, authorityNow, generation);
     const exactData = { state: STATE.READY, isOutstanding: true, ownerToken: null, leaseUntil: authorityNow, availableAt: due, nextAttemptAt: null, errorClass: null, lastError: null };
     if (progressCursor !== undefined) exactData.progressCursor = progressCursor;
+    if (progressCursor != null && !isDeepStrictEqual(progressCursor, ownership.item.progressCursor)) {
+      Object.assign(exactData, { consecutiveFailures: 0, failureRevision: 0n, lastFailureAt: null, terminalCause: null });
+    }
     const yielded = await tx.domainWorkItem?.updateMany?.({
       where: { ...baseWhere, requestedRevision: asBigInt(item.claimedRevision) },
       data: exactData,

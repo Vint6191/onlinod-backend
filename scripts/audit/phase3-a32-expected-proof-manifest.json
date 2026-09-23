@@ -1,8 +1,8 @@
 {
-  "version": "A37-R5",
+  "version": "A37-R6",
   "algorithm": "sha256-canonical-json-files-v1",
-  "testCount": 77,
-  "manifestSha256": "6e29e11e2ea13cff3ba7c94e03f2baeb081b6959190770c04dfa628444eb4dbb",
+  "testCount": 81,
+  "manifestSha256": "e73d910cc40bacc1df1b44ba6dfb3c90a6901e0f96d7480cb065ad1cee70e01e",
   "files": [
     {
       "file": "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js",
@@ -136,7 +136,11 @@
         "A34 PostgreSQL: expired recurring claim is fenced, restart takes over and creator lifecycle revokes/reopens work",
         "A37-R2 PostgreSQL: stale sorted Agency and shard candidates cannot survive a concurrent reservation",
         "A37-R2 PostgreSQL: reconciliation cannot rewind partition shard or Agency dispatch watermarks",
-        "A37-R2 PostgreSQL: all six claim settlements reject expiry after an observed work-row wait"
+        "A37-R2 PostgreSQL: all six claim settlements reject expiry after an observed work-row wait",
+        "Phase3 closure PostgreSQL: revision-local failure budget survives restart and exact repair cannot overwrite new work",
+        "Phase3 closure PostgreSQL: v5 acquisition and release downgrade are fenced while existing ownership drains",
+        "Phase3 closure PostgreSQL: cohort cursor is bounded tenant-scoped restartable and follows current hidden eligibility",
+        "Phase3 closure PostgreSQL: old fan consumer cannot mint a write permit and transaction-local proof cannot leak"
       ]
     },
     {

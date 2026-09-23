@@ -14,7 +14,9 @@ const DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION = "phase2_domain_executor_v4_actua
 // identity would let an old replica keep acquiring work forever after topology
 // activation.  The online activator publishes this generation atomically with
 // ACTIVE; pre-A36 claims retain v4 and are allowed only to drain.
-const DOMAIN_WORK_EXECUTOR_GENERATION = "phase3_domain_executor_v5_a36_claim_topology";
+// v6 adds revision-local failure accounting. Old v5 owners may settle once;
+// legacyExecutorDrainStatus fences acquisition until their live claims drain.
+const DOMAIN_WORK_EXECUTOR_GENERATION = "phase3_domain_executor_v6_failure_policy";
 const DOMAIN_WORK_CLAIM_TOPOLOGY_ID = "phase3_domain_work_claim_topology_a36_v1";
 const TEAM_CONTROL_PLANE_GENERATION = "phase2_team_control_plane_v2_durable_access";
 const TEAM_CONTROL_PLANE_SCOPE = "TEAM_CONTROL_PLANE";
@@ -134,7 +136,7 @@ async function authorizeDomainWorkExecutor(db) {
   const authority = Array.isArray(authorityRows) ? authorityRows[0] : null;
   if (authority?.requiredGeneration !== DOMAIN_WORK_EXECUTOR_GENERATION
       || String(authority.activationState || "").toUpperCase() !== "ACTIVE") {
-    throw Object.assign(new Error("DomainWork executor release authority is not ACTIVE on v5"), {
+    throw Object.assign(new Error("DomainWork executor release authority is not ACTIVE on v6"), {
       code: "DOMAIN_WORK_EXECUTOR_RELEASE_UNAVAILABLE",
       status: 503,
       retryable: true,
@@ -185,6 +187,7 @@ async function authorizeDomainWorkDependencyWakeBridge(db) {
   const authority = Array.isArray(authorityRows) ? authorityRows[0] : null;
   const releaseGeneration = String(authority?.requiredGeneration || "");
   const compatibleBuildingGeneration = releaseGeneration === DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION
+    || releaseGeneration === "phase3_domain_executor_v5_a36_claim_topology"
     || releaseGeneration === DOMAIN_WORK_EXECUTOR_GENERATION;
   const bridgeReady = topology?.generation === DOMAIN_WORK_CLAIM_TOPOLOGY_ID
     && String(topology.activationState || "").toUpperCase() === "BUILDING"

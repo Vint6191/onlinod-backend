@@ -498,3 +498,108 @@ test("F55-04: live publication while repair work is READY preserves only the pen
   await authority.publishDomainWork({ db: fx.db, ...identity, availableAt: new Date(t0.getTime() + 3000) });
   assert.equal(fx.rows.get(item.id).progressCursor, null, "non-repair cursors keep generic revision invalidation semantics");
 });
+
+test("Phase3 closure: failure budget survives fresh claim objects and quarantines poison without consuming healthy claims", async () => {
+  const fx = makeDb();
+  let at = new Date("2026-09-23T21:00:00Z");
+  const row = await authority.publishDomainWork({ db: fx.db, ...base, availableAt: at });
+  fx.rows.get(row.id).attempts = 9000; // successful historical batches, not errors
+  for (let failures = 1; failures <= 8; failures += 1) {
+    const claim = await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, ownerToken: `restart-${failures}`, fallbackNow: at });
+    assert.equal(claim.items.length, 1);
+    const result = await authority.failDomainWorkClaim({ db: fx.db, item: claim.items[0], fallbackNow: at,
+      error: Object.assign(new Error("network unavailable"), { code: "ECONNRESET" }), retryAt: new Date(0) });
+    assert.equal(result.consecutiveFailures, failures);
+    assert.equal(result.state, failures === 8 ? "RECONCILE_REQUIRED" : "READY");
+    assert.equal(fx.rows.get(row.id).isOutstanding, true);
+    if (failures < 8) {
+      assert.equal(result.retryAt.getTime() - at.getTime(), 1000 * 2 ** failures);
+      at = result.retryAt;
+    } else assert.equal(result.retryAt, null);
+  }
+  const idle = await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, fallbackNow: new Date(at.getTime() + 86400_000) });
+  assert.equal(idle.items.length, 0);
+  assert.equal(fx.rows.get(row.id).terminalCause, "RETRY_EXHAUSTED:ECONNRESET");
+});
+
+test("Phase3 closure: actual cursor progress resets failures; a heartbeat or empty yield does not", async () => {
+  const fx = makeDb();
+  const at = new Date("2026-09-23T21:00:00Z");
+  const row = await authority.publishDomainWork({ db: fx.db, ...base, availableAt: at });
+  const acquire = async () => (await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, fallbackNow: at })).items[0];
+  let item = await acquire();
+  Object.assign(fx.rows.get(row.id), { consecutiveFailures: 6, failureRevision: 1n, progressCursor: { page: 10 } });
+  await authority.heartbeatDomainWorkClaim({ db: fx.db, item, fallbackNow: at });
+  await authority.yieldDomainWorkClaim({ db: fx.db, item, progressCursor: { page: 10 }, fallbackNow: at });
+  assert.equal(fx.rows.get(row.id).consecutiveFailures, 6);
+  item = await acquire();
+  await authority.yieldDomainWorkClaim({ db: fx.db, item, fallbackNow: at });
+  assert.equal(fx.rows.get(row.id).consecutiveFailures, 6);
+  item = await acquire();
+  await authority.saveDomainWorkProgress({ db: fx.db, item, progressCursor: { page: 11 }, fallbackNow: at });
+  const result = await authority.failDomainWorkClaim({ db: fx.db, item, error: new Error("after durable page"), fallbackNow: at });
+  assert.equal(result.consecutiveFailures, 1, "use locked persisted progress, not the stale claimed copy");
+});
+
+test("Phase3 closure: contract errors require repair, while new canonical revision supersedes old poison", async () => {
+  for (const error of [new TypeError("broken projection"), Object.assign(new Error("bad FK"), { code: "P2010", meta: { code: "23503" } }),
+    Object.assign(new Error("bad work identity"), { code: "TEAM_DIALOG_WORK_IDENTITY_INVALID" })]) {
+    const fx = makeDb();
+    const at = new Date("2026-09-23T21:00:00Z");
+    await authority.publishDomainWork({ db: fx.db, ...base, availableAt: at });
+    let item = (await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, fallbackNow: at })).items[0];
+    const failed = await authority.failDomainWorkClaim({ db: fx.db, item, error, fallbackNow: at });
+    assert.equal(failed.reconcileRequired, true);
+    await authority.publishDomainWork({ db: fx.db, ...base, availableAt: at });
+    item = (await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, fallbackNow: at })).items[0];
+    assert.equal(item.claimedRevision, 2n);
+    const transient = await authority.failDomainWorkClaim({ db: fx.db, item, error: new Error("retry v2"), fallbackNow: at });
+    assert.equal(transient.consecutiveFailures, 1);
+    const next = transient.retryAt;
+    item = (await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, fallbackNow: next })).items[0];
+    await authority.publishDomainWork({ db: fx.db, ...base, availableAt: next });
+    assert.equal((await authority.failDomainWorkClaim({ db: fx.db, item, error, fallbackNow: next })).superseded, true);
+    assert.equal(fx.rows.get(item.id).consecutiveFailures, 0);
+    assert.equal(fx.rows.get(item.id).terminalCause, null);
+  }
+});
+
+test("Phase3 closure: typed dependency errors block and wake without burning the failure budget", async () => {
+  const fx = makeDb();
+  const at = new Date("2026-09-23T21:00:00Z");
+  await authority.publishDomainWork({ db: fx.db, ...base, availableAt: at });
+  const item = (await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, fallbackNow: at })).items[0];
+  const dependency = { dependencyKind: "CREATOR_BINDING", dependencyKey: base.creatorId, dependencyRevision: 0n };
+  const blocked = await authority.failDomainWorkClaim({ db: fx.db, item, dependency, fallbackNow: at });
+  assert.equal(blocked.blocked, true);
+  assert.equal(Number(fx.rows.get(item.id).consecutiveFailures || 0), 0);
+  await authority.bumpDomainDependency({ db: fx.db, agencyId: base.agencyId, ...dependency, fallbackNow: at });
+  const wake = await authority.runDomainDependencyWakeSweep({ db: fx.db, now: at });
+  assert.equal(wake.ok, true);
+  assert.equal(fx.rows.get(item.id).state, "READY");
+});
+
+test("Phase3 closure: repair requires tenant and revision, records reason, and refuses retired current work", async () => {
+  const { resumeDomainWorkAfterRepair } = require("./domain-work-repair-service");
+  const fx = makeDb();
+  let retired = false;
+  fx.db.agency = { async findFirst() { return { deletedAt: retired ? new Date() : null }; } };
+  fx.db.creatorAccount = { async findFirst() { return { deletedAt: null }; } };
+  const at = new Date("2026-09-23T21:00:00Z");
+  await authority.publishDomainWork({ db: fx.db, ...base, availableAt: at });
+  const item = (await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, fallbackNow: at })).items[0];
+  await authority.failDomainWorkClaim({ db: fx.db, item, error: new TypeError("broken"), fallbackNow: at });
+  const input = { db: fx.db, agencyId: base.agencyId, workId: item.id, expectedRevision: "1", reason: "source repaired", fallbackNow: at };
+  assert.equal((await resumeDomainWorkAfterRepair({ ...input, agencyId: "other-tenant" })).resumed, false);
+  assert.equal((await resumeDomainWorkAfterRepair({ ...input, expectedRevision: "2" })).resumed, false);
+  retired = true;
+  assert.equal((await resumeDomainWorkAfterRepair(input)).reason, "lifecycle_retired");
+  retired = false;
+  assert.equal((await resumeDomainWorkAfterRepair(input)).requestedRevision, "2");
+  assert.equal((await resumeDomainWorkAfterRepair(input)).resumed, false, "replay must not republish");
+  assert.equal(fx.rows.get(item.id).lastRepair.reason, "source repaired");
+  const current = (await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, fallbackNow: at })).items[0];
+  await authority.ackDomainWorkClaim({ db: fx.db, item: current, terminalCause: "CREATOR_RETIRED", fallbackNow: at });
+  assert.equal(fx.rows.get(item.id).state, "DONE");
+  assert.equal(fx.rows.get(item.id).terminalCause, "CREATOR_RETIRED");
+});

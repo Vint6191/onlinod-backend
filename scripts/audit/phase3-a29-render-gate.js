@@ -21,6 +21,8 @@ const CHANGED_GATE = path.join(ROOT, "scripts/audit/phase3-a26-changed-js-gate.j
 const IDENTIFIER_LINT = path.join(ROOT, "scripts/audit/phase3-postgres-identifier-lint.js");
 const CONTRACT_PROOFS = [
   "src/services/domain-work-authority-service.test.js",
+  "src/services/phase3-failure-consumer-closure.test.js",
+  "src/services/custom-content-pipeline-authority-service.test.js",
   "src/services/phase2-actual53-domain-work-scale-generation.test.js",
   "src/services/analytics-recurring-planning-service.test.js",
   "src/services/analytics-demand-planning-service.test.js",

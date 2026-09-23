@@ -1162,7 +1162,10 @@ test("A36 PostgreSQL: 1000 agencies publish 4000 creators and two replicas claim
       await tx.phase2ReleaseCompatibilityAuthority.update({
         where: { scope: "DOMAIN_WORK_EXECUTOR" },
         data: {
-          requiredGeneration: release.DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION,
+          // This rehearsal rebuilds topology after current activation. v6 is a
+          // one-way release floor; actual v4 expansion is covered by the runner's
+          // rolling schema. Rebuilding must not reopen an old writer here.
+          requiredGeneration: release.DOMAIN_WORK_EXECUTOR_GENERATION,
           activationState: "ACTIVE",
           activationConfirmedAt: new Date(),
         },
@@ -2190,5 +2193,172 @@ test("A37-R2 PostgreSQL: all six claim settlements reject expiry after an observ
   } finally {
     try { if (scope) await cleanupPhase3PostgresAgencyFixture(dbA, scope.agencyId); }
     finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect(), observer.$disconnect()]); }
+  }
+});
+
+test("Phase3 closure PostgreSQL: revision-local failure budget survives restart and exact repair cannot overwrite new work", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const work = require("./domain-work-authority-service");
+  const { resumeDomainWorkAfterRepair } = require("./domain-work-repair-service");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  let scope;
+  try {
+    scope = await createAgencyCreator(dbA, "phase3-failure-policy");
+    const identity = { ...scope, workClass: work.WORK_CLASS.RETENTION, objectType: "FailurePolicyProof", objectId: "one", partitionKey: scope.creatorId };
+    const published = await work.publishDomainWork({ db: dbA, ...identity });
+    await dbA.domainWorkItem.update({ where: { id: published.id }, data: { attempts: 9000 } });
+    for (let failure = 1; failure <= 8; failure += 1) {
+      const db = failure % 2 ? dbA : dbB;
+      const claim = await work.claimDomainWorkBatch({ db, agencyId: scope.agencyId, workClass: identity.workClass, objectIds: ["one"], limit: 1 });
+      assert.equal(claim.items.length, 1);
+      const failed = await work.failDomainWorkClaim({ db, item: claim.items[0], error: Object.assign(new Error("network unavailable"), { code: "ECONNRESET" }) });
+      assert.equal(failed.consecutiveFailures, failure);
+      assert.equal(failed.state, failure === 8 ? "RECONCILE_REQUIRED" : "READY");
+      if (failure < 8) await db.$executeRawUnsafe('UPDATE "DomainWorkItem" SET "availableAt"=clock_timestamp(),"nextAttemptAt"=NULL WHERE "id"=$1', published.id);
+    }
+    assert.equal((await work.claimDomainWorkBatch({ db: dbB, agencyId: scope.agencyId, workClass: identity.workClass, limit: 1 })).items.length, 0);
+    const row = await dbB.domainWorkItem.findUnique({ where: { id: published.id } });
+    assert.equal(row.isOutstanding, true);
+    assert.equal(row.terminalCause, "RETRY_EXHAUSTED:ECONNRESET");
+    await work.publishDomainWork({ db: dbB, ...identity, objectId: "healthy-neighbor" });
+    const neighbor = (await work.claimDomainWorkBatch({ db: dbB, agencyId: scope.agencyId, workClass: identity.workClass, limit: 1 })).items[0];
+    assert.equal(neighbor.objectId, "healthy-neighbor", "quarantined work must not obstruct a healthy identity in the same family/partition");
+    assert.equal((await work.ackDomainWorkClaim({ db: dbB, item: neighbor })).acknowledged, true);
+    const repair = { db: dbB, agencyId: scope.agencyId, workId: published.id, expectedRevision: "1", reason: "verified repair" };
+    assert.equal((await resumeDomainWorkAfterRepair({ ...repair, agencyId: "other-agency" })).resumed, false);
+    assert.equal((await resumeDomainWorkAfterRepair({ ...repair, expectedRevision: "2" })).resumed, false);
+    assert.equal((await resumeDomainWorkAfterRepair(repair)).requestedRevision, "2");
+    assert.equal((await resumeDomainWorkAfterRepair(repair)).resumed, false);
+    const current = (await work.claimDomainWorkBatch({ db: dbA, agencyId: scope.agencyId, workClass: identity.workClass, limit: 1 })).items[0];
+    assert.equal(current.consecutiveFailures, 0);
+    await work.publishDomainWork({ db: dbB, ...identity });
+    assert.equal((await work.failDomainWorkClaim({ db: dbA, item: current, error: new TypeError("old poison") })).superseded, true);
+    const after = await dbB.domainWorkItem.findUnique({ where: { id: published.id } });
+    assert.equal(after.requestedRevision, 3n);
+    assert.equal(after.state, "READY");
+    assert.equal(after.consecutiveFailures, 0);
+    assert.equal(after.lastRepair.reason, "verified repair");
+  } finally {
+    try { if (scope) await cleanupPhase3PostgresAgencyFixture(dbA, scope.agencyId); }
+    finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect()]); }
+  }
+});
+
+test("Phase3 closure PostgreSQL: v5 acquisition and release downgrade are fenced while existing ownership drains", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const work = require("./domain-work-authority-service");
+  const { DOMAIN_WORK_EXECUTOR_GENERATION } = require("./phase2-release-compatibility-authority-service");
+  const db = new PrismaClient();
+  let scope;
+  try {
+    scope = await createAgencyCreator(db, "phase3-executor-v6");
+    const row = await work.publishDomainWork({ db, ...scope, workClass: work.WORK_CLASS.RETENTION,
+      objectType: "ReleaseProof", objectId: "one", partitionKey: scope.creatorId });
+    const rejected = (error) => error?.meta?.code === "55000" || /INCOMPATIBLE_DOMAIN_EXECUTOR|DOWNGRADE_FORBIDDEN/.test(String(error?.message));
+    await assert.rejects(() => db.$transaction(async (tx) => {
+      await tx.$queryRawUnsafe("SELECT set_config('onlinod.phase2_domain_executor_generation','phase3_domain_executor_v5_a36_claim_topology',true)");
+      await tx.$executeRawUnsafe(`UPDATE "DomainWorkItem" SET "state"='CLAIMED',"ownerToken"='old-worker',"claimFence"="claimFence"+1,
+        "claimedRevision"="requestedRevision","leaseUntil"=clock_timestamp()+interval '1 minute' WHERE "id"=$1`, row.id);
+    }), rejected);
+    await assert.rejects(() => db.$executeRawUnsafe(`UPDATE "Phase2ReleaseCompatibilityAuthority"
+      SET "requiredGeneration"='phase3_domain_executor_v5_a36_claim_topology' WHERE "scope"='DOMAIN_WORK_EXECUTOR'`), rejected);
+    const claim = await work.claimDomainWorkBatch({ db, agencyId: scope.agencyId, workClass: work.WORK_CLASS.RETENTION, limit: 1 });
+    assert.equal(claim.items[0].claimExecutionGeneration, DOMAIN_WORK_EXECUTOR_GENERATION);
+    // Represent an already-held pre-cutover claim, without reopening acquisition.
+    await db.domainWorkItem.update({ where: { id: row.id }, data: { claimExecutionGeneration: "phase3_domain_executor_v5_a36_claim_topology" } });
+    assert.equal((await work.legacyExecutorDrainStatus({ db, workClass: work.WORK_CLASS.RETENTION })).ready, false);
+    // Old settlement shape remains legal. It has no right to acquire again.
+    await db.$executeRawUnsafe(`UPDATE "DomainWorkItem" SET "state"='DONE',"isOutstanding"=FALSE,"completedRevision"="claimedRevision",
+      "ownerToken"=NULL,"leaseUntil"=clock_timestamp() WHERE "id"=$1 AND "ownerToken"=$2 AND "claimFence"=$3`, row.id, claim.ownerToken, claim.items[0].claimFence);
+    assert.equal((await work.legacyExecutorDrainStatus({ db, workClass: work.WORK_CLASS.RETENTION })).ready, true);
+  } finally {
+    try { if (scope) await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId); }
+    finally { await db.$disconnect(); }
+  }
+});
+
+test("Phase3 closure PostgreSQL: cohort cursor is bounded tenant-scoped restartable and follows current hidden eligibility", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const { readSubscriberConsumerPage } = require("./fan-consumer-cursor-service");
+  const { projectFanObservationBatch } = require("./fan-data-authority-service");
+  const { readFanCurrentMap, validateBumpCurrentRelationship } = require("./fan-current-consumer-service");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  let scope;
+  let other;
+  try {
+    scope = await createAgencyCreator(dbA, "phase3-cohort-current");
+    other = await createAgencyCreator(dbA, "phase3-cohort-other");
+    await seedHiddenSnapshot(dbA, scope, ["8001", "8002", "8003"]);
+    await seedHiddenSnapshot(dbA, other, ["8001"]);
+    const runId = `${scope.creatorId}-hidden-run`;
+    const read = (db, publication = runId) => db.$transaction((tx) => readSubscriberConsumerPage({ db: tx, ...scope, runId: publication, consumerKey: "bumps:hidden_online", limit: 2 }));
+    const first = await read(dbA);
+    const cursorBefore = await dbA.fanConsumerCursor.findUnique({ where: { creatorId_consumerKey: { creatorId: scope.creatorId, consumerKey: "bumps:hidden_online" } } });
+    await assert.rejects(() => dbA.$transaction(async (tx) => {
+      await readSubscriberConsumerPage({ db: tx, ...scope, runId, consumerKey: "bumps:hidden_online", limit: 2 });
+      throw new Error("planner failed after cursor advance");
+    }), /planner failed after cursor advance/);
+    assert.deepEqual(await dbA.fanConsumerCursor.findUnique({ where: { creatorId_consumerKey: { creatorId: scope.creatorId, consumerKey: "bumps:hidden_online" } } }), cursorBefore);
+    const nextRunId = `${runId}-replacement`;
+    await dbA.subscriberScanRun.create({ data: { ...scope, id: nextRunId, status: "PUBLISHED", hasMore: false,
+      fanProjectionStatus: "COMPLETE", publicationStatus: "COMPLETE", publicationGeneration: 2,
+      publishedAt: new Date(), completedAt: new Date() } });
+    await dbA.subscriberScanItem.createMany({ data: ["8001", "8002", "8003"].map((fanId) => ({
+      ...scope, runId: nextRunId, fanId, contentHash: `${nextRunId}-${fanId}`, metadata: {},
+    })) });
+    await dbA.subscriberDirectoryState.update({ where: { creatorId: scope.creatorId }, data: {
+      currentRunId: nextRunId, previousRunId: runId, publicationGeneration: 2, publishedGeneration: 2,
+    } });
+    const second = await read(dbB, nextRunId);
+    assert.equal(first.length, 2);
+    assert.equal(second.length, 1);
+    assert.equal(new Set([...first, ...second].map((row) => row.fanId)).size, 3);
+    assert.equal(second[0].fanId, "8003", "a new publication cannot rewind a stable fan cursor");
+    const observedAt = new Date();
+    await dbA.$transaction((tx) => projectFanObservationBatch(tx, { ...scope,
+      receivedAt: observedAt, causalObservedAt: observedAt, observedAtPolicy: "SERVER_GENERATION", allowedSources: ["USER_PROFILE"],
+      items: [{ onlyFansUserId: "8001", relationship: { source: "USER_PROFILE", canReceiveChatMessage: true, lastSeenAt: observedAt.toISOString() } }],
+    }));
+    const current = (await readFanCurrentMap(dbB, { ...scope, fanIds: ["8001"] })).get("8001");
+    assert.equal(validateBumpCurrentRelationship({ candidate: { fanId: "8001", metadata: { lastSeenIsNull: true } }, current, source: "hidden_online" }).code, "fan_not_hidden_current");
+    assert.equal((await readFanCurrentMap(dbB, { ...other, fanIds: ["8001"] })).size, 0);
+    assert.equal(await dbA.fanConsumerCursor.count({ where: { agencyId: other.agencyId } }), 0);
+  } finally {
+    try {
+      if (scope) await cleanupPhase3PostgresAgencyFixture(dbA, scope.agencyId);
+      if (other) await cleanupPhase3PostgresAgencyFixture(dbA, other.agencyId);
+    } finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect()]); }
+  }
+});
+
+test("Phase3 closure PostgreSQL: old fan consumer cannot mint a write permit and transaction-local proof cannot leak", { skip: !enabled, timeout: 120_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db = new PrismaClient();
+  let scope;
+  try {
+    scope = await createAgencyCreator(db, "phase3-fan-commit-release");
+    const row = await db.automationDelivery.create({ data: {
+      ...scope, originKind: "AUTOMATION", moduleKey: "bumps", actionType: "SEND_MESSAGE", status: "RUNNING",
+    } });
+    const rejectOld = (error) => error?.meta?.code === "55000" || String(error?.message).includes("PHASE3_INCOMPATIBLE_FAN_CONSUMER_COMMIT");
+    const commit = (tx) => tx.automationDelivery.update({ where: { id: row.id }, data: { status: "COMMITTING", writeCommitRevision: { increment: 1 }, writeCommitAt: new Date() } });
+    await assert.rejects(() => commit(db), rejectOld);
+    assert.equal((await db.automationDelivery.findUnique({ where: { id: row.id } })).status, "RUNNING");
+    await db.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe("SELECT set_config('onlinod.phase3_fan_consumer_generation','phase3_fan_consumer_v1_current_bounded',true)");
+      await commit(tx);
+    });
+    // No proof in this transaction: even COMMITTING cannot remint a revision.
+    await assert.rejects(() => commit(db), rejectOld);
+    await db.automationDelivery.update({ where: { id: row.id }, data: { status: "RECONCILE_REQUIRED" } });
+    await db.automationDelivery.update({ where: { id: row.id }, data: { status: "COMPLETED", finishedAt: new Date() } });
+    assert.equal((await db.automationDelivery.findUnique({ where: { id: row.id } })).writeCommitRevision, 1);
+    const [{ setting }] = await db.$queryRawUnsafe("SELECT current_setting('onlinod.phase3_fan_consumer_generation',true) AS setting");
+    assert.notEqual(setting, "phase3_fan_consumer_v1_current_bounded");
+  } finally {
+    try { if (scope) await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId); }
+    finally { await db.$disconnect(); }
   }
 });

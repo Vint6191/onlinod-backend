@@ -231,6 +231,28 @@ test("execution profile pins Vault destination/relay recipient once and current 
   assert.equal(state.submission.executionProfileRevision, 1);
 });
 
+test("Phase3 closure: missing execution defaults carry the observed durable dependency instead of a retry timer", async () => {
+  for (const [folder, recipient, kind, key, code] of [
+    [null, "relay_a", "CREATOR_BINDING", "creator-1", "CUSTOM_SUBMISSION_VAULT_RELAY_REQUIRED"],
+    ["vault-a", null, "CUSTOM_PIPELINE_CONFIG", "agency-1", "CUSTOM_SUBMISSION_VAULT_RECIPIENT_REQUIRED"],
+  ]) {
+    const { db, state } = profileDb({ folder, recipient });
+    const order = [];
+    db.phase2DependencyState = { async findUnique({ where }) {
+      order.push(where.agencyId_dependencyKind_dependencyKey.dependencyKind);
+      return { revision: 7n };
+    } };
+    db.creatorAccount.findFirst = async () => { order.push("observe-defaults"); return { ...state.creator }; };
+    await assert.rejects(() => ensureSubmissionExecutionProfile({ db, agencyId: "agency-1", submission: state.submission }), (error) => {
+      assert.equal(error.code, code);
+      assert.deepEqual(error.domainWorkDependency, { dependencyKind: kind, dependencyKey: key, dependencyRevision: 7n });
+      return true;
+    });
+    assert.ok(order.indexOf(kind) < order.indexOf("observe-defaults"));
+    assert.equal(state.submission.executionProfileRevision, 0);
+  }
+});
+
 test("rolling cutover pins historical relay recipient instead of mutable current Workspace default", async () => {
   const { db, state } = profileDb({
     folder: "vault-current",
