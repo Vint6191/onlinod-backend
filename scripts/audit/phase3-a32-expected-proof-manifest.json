@@ -1,8 +1,8 @@
 {
-  "version": "A37-R4",
+  "version": "A37-R5",
   "algorithm": "sha256-canonical-json-files-v1",
-  "testCount": 75,
-  "manifestSha256": "b9c08b5e0b734af902859ccb7e61ab76055bfeed490ae17b8ad3ae7508be4905",
+  "testCount": 77,
+  "manifestSha256": "6e29e11e2ea13cff3ba7c94e03f2baeb081b6959190770c04dfa628444eb4dbb",
   "files": [
     {
       "file": "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js",
@@ -112,6 +112,8 @@
       "file": "src/services/phase3-a34-source-scale-closure.integration.test.js",
       "testNames": [
         "A36 PostgreSQL: Analytics expiry fences progress and settlement while restart preserves the unfinished cycle",
+        "A37-R5 PostgreSQL: member reservations reject stale shard revisions and preserve dispatch time",
+        "A37-R5 PostgreSQL: fixture teardown erases owned authorization history and preserves another Agency",
         "A36 PostgreSQL: Analytics renew and settlement reject leases that expire during an observed row-lock wait",
         "A36 PostgreSQL: scoped Home demand yields durable progress and a second client finishes without planning unrequested creators",
         "A37-R3 PostgreSQL: Home planning expiry rolls back real jobs and cursor then safely retries",

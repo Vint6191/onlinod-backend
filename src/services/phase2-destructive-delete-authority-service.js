@@ -965,6 +965,7 @@ async function processCreatorHardDeleteWorkItem({ db, item, ownerToken, batchSiz
 module.exports = {
   CREATOR_DELETE_BATCH,
   AGENCY_DELETE_BATCH,
+  AGENCY_NON_FK_TENANT_TABLES,
   collectCreatorPhase2DestructiveScope,
   purgeAgencyPhase2ProviderLedgersForHardDelete,
   purgeAgencyPhase2CurrentWorkRootsAfterCascade,

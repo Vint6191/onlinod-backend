@@ -91,6 +91,128 @@ const {
 } = require("../../scripts/database/phase3-domain-work-claim-online-rollout");
 const release = require("./phase2-release-compatibility-authority-service");
 
+test("A37-R5 PostgreSQL: member reservations reject stale shard revisions and preserve dispatch time", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const { reserveMemberScopeCreatorProbe, DOMAIN_WORK_GENERATION } = require("./domain-work-authority-service");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const observer = new PrismaClient();
+  let actor;
+  try {
+    const prefix = nonce("a37-member-reservation");
+    actor = await createPhase3PostgresActorFixture(dbA, prefix);
+    const candidates = await dbA.$queryRawUnsafe(`
+      SELECT DISTINCT ON ("phase3_domain_work_claim_shard"($1 || g::text))
+             $1 || g::text AS "creatorId", "phase3_domain_work_claim_shard"($1 || g::text) AS shard
+        FROM generate_series(1,2048) g
+       ORDER BY "phase3_domain_work_claim_shard"($1 || g::text),g LIMIT 64`, `${prefix}-creator-`);
+    assert.equal(candidates.length, 64);
+    const member = await withPhase3PostgresFixtureAuthority(dbA, async (tx) => {
+      await tx.creatorAccount.createMany({ data: candidates.map((row) => ({
+        id: row.creatorId, agencyId: actor.agencyId, displayName: row.creatorId, status: "READY",
+      })) });
+      return tx.agencyMember.update({ where: { id: actor.memberId }, data: {
+        role: "OPERATOR", roleKey: "chatter",
+        assignedCreators: { mode: "scoped", creatorIds: candidates.map((row) => row.creatorId) },
+      } });
+    }, { maxWait: 10_000, timeout: 30_000 });
+    const authority = { ...actor, accessEpoch: Number(member.accessEpoch) };
+    const shards = await dbA.domainWorkMemberScopeShardState.findMany({
+      where: { memberId: actor.memberId }, orderBy: { claimShard: "asc" },
+    });
+    assert.equal(shards.length, 64);
+    const peerShards = shards.slice(0, 32);
+    const peerCreators = new Set(candidates.filter((row) => peerShards.some((s) => s.claimShard === row.shard)).map((row) => row.creatorId));
+    const lockKey = `${prefix}-snapshot`;
+    let holderPid;
+    let waiterPid;
+    let result;
+    let intercepted = false;
+    await runPhase3InterleavedTransactions({
+      dbA, dbB,
+      firstA: async (tx) => {
+        [{ pid: holderPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid');
+        await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))', lockKey);
+      },
+      firstB: async (tx) => { [{ pid: waiterPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid'); },
+      secondA: async (tx) => {
+        await waitForPhase3PostgresBlock({ db: observer, holderPid, waiterPid });
+        await tx.$executeRawUnsafe(`UPDATE "DomainWorkMemberScopeShardState"
+          SET "revision"="revision"+1,"lastSelectedAt"=clock_timestamp()
+          WHERE "id"=ANY($1::text[])`, peerShards.map((row) => row.id));
+      },
+      secondB: async (tx) => {
+        const wrapped = new Proxy(tx, { get(target, key) {
+          if (key === "$queryRawUnsafe") return async (sql, ...params) => {
+            if (sql.includes("WITH observed_shards AS MATERIALIZED")) {
+              intercepted = true;
+              const parameter = `$${params.length + 1}`;
+              sql = sql.replace("), selected_shards AS MATERIALIZED (", `), paused AS MATERIALIZED (
+                SELECT pg_advisory_xact_lock(hashtext(${parameter}))::text AS held FROM observed_shards LIMIT 1
+              ), selected_shards AS MATERIALIZED (`).replace("FROM observed_shards o JOIN", "FROM observed_shards o CROSS JOIN paused JOIN");
+              params.push(lockKey);
+            }
+            return target.$queryRawUnsafe(sql, ...params);
+          };
+          const value = target[key];
+          return typeof value === "function" ? value.bind(target) : value;
+        } });
+        const root = new Proxy(wrapped, { get(target, key) {
+          return key === "$transaction" ? (work) => work(wrapped) : target[key];
+        } });
+        result = await reserveMemberScopeCreatorProbe({ db: root, authority,
+          workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING, generation: DOMAIN_WORK_GENERATION });
+      },
+    });
+    assert.equal(intercepted, true);
+    assert.equal(result.mode, "scoped");
+    assert.equal(result.creatorIds.length, 32, "stale tranche must be replaced from the fixed ring");
+    assert.equal(result.creatorIds.some((id) => peerCreators.has(id)), false, "peer-reserved revisions cannot keep their old sorted positions");
+    const [{ future }] = await dbA.$queryRawUnsafe("SELECT clock_timestamp() + interval '1 hour' AS future");
+    await dbA.domainWorkMemberScopeShardState.updateMany({ where: { memberId: actor.memberId }, data: { lastSelectedAt: future } });
+    await reserveMemberScopeCreatorProbe({ db: dbA, authority,
+      workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING, generation: DOMAIN_WORK_GENERATION });
+    const after = await dbA.domainWorkMemberScopeShardState.findMany({ where: { memberId: actor.memberId } });
+    assert.equal(after.every((row) => row.lastSelectedAt.getTime() >= future.getTime()), true);
+    console.log("# A37_MEMBER_RESERVATION_STALE_REVISION_AND_MONOTONIC_PASS");
+  } finally {
+    try { if (actor) await cleanupPhase3PostgresFixtureGraph(dbA, { agencyId: actor.agencyId, userIds: [actor.userId] }); }
+    finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect(), observer.$disconnect()]); }
+  }
+});
+
+test("A37-R5 PostgreSQL: fixture teardown erases owned authorization history and preserves another Agency", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db = new PrismaClient();
+  const actors = [];
+  try {
+    for (const label of ["target", "peer"]) {
+      const actor = await createPhase3PostgresActorFixture(db, nonce(`a37-history-${label}`));
+      actors.push(actor);
+      await withPhase3PostgresFixtureAuthority(db, (tx) => tx.agencyMember.update({
+        where: { id: actor.memberId }, data: { accessEpoch: { increment: 1 } },
+      }));
+      assert.equal(await db.agencyMemberAccessEpochBoundary.count({ where: { agencyId: actor.agencyId } }), 1);
+    }
+    const [target, peer] = actors;
+    const peerBefore = await db.agencyMemberAccessEpochBoundary.findMany({ where: { agencyId: peer.agencyId } });
+    await cleanupPhase3PostgresFixtureGraph(db, { agencyId: target.agencyId, userIds: [target.userId] });
+    assert.equal(await db.agencyMemberAccessEpochBoundary.count({ where: { agencyId: target.agencyId } }), 0);
+    assert.equal(await db.agency.count({ where: { id: target.agencyId } }), 0);
+    assert.equal(await db.user.count({ where: { id: target.userId } }), 0);
+    assert.deepEqual(await db.agencyMemberAccessEpochBoundary.findMany({ where: { agencyId: peer.agencyId } }), peerBefore);
+    console.log("# A37_FIXTURE_AUTHORIZATION_HISTORY_TENANT_ISOLATION_PASS");
+  } finally {
+    try {
+      for (const actor of actors) {
+        if (await db.agency.findUnique({ where: { id: actor.agencyId } })) {
+          await cleanupPhase3PostgresFixtureGraph(db, { agencyId: actor.agencyId, userIds: [actor.userId] });
+        }
+      }
+    } finally { await db.$disconnect(); }
+  }
+});
+
 let setHiddenOnlineStatus;
 let publishDomainWork;
 let claimDomainWorkBatch;
@@ -759,8 +881,9 @@ test("A36 PostgreSQL: scoped member claims 1000 of 2000 creators through fixed s
       }),
     ]);
     const claimed = [...claimA.items, ...claimB.items];
-    assert.equal(claimA.items.length, 25);
-    assert.equal(claimB.items.length, 25);
+    const claimStatus = (claim) => JSON.stringify({ count: claim.items.length, skipped: claim.skipped, reason: claim.reason, topologyState: claim.topologyState });
+    assert.equal(claimA.items.length, 25, `first scoped claim: ${claimStatus(claimA)}`);
+    assert.equal(claimB.items.length, 25, `second scoped claim: ${claimStatus(claimB)}`);
     assert.equal(new Set(claimed.map((row) => row.id)).size, 50);
     assert.equal(claimed.every((row) => allowedCreatorIds.includes(String(row.creatorId))), true);
 
@@ -1522,16 +1645,27 @@ test("A37-R4 PostgreSQL: absent child work and Agency cascade cannot recreate or
   try {
     // An empty live tenant and a physically deleted tenant are both converged.
     await reconcile();
+    const locatorCases = [
+      // Satisfy every non-FK invariant before testing missing parent identity.
+      ["phase2WorkBroadClaimPartitionState", { partitionKey: scope.creatorId, outstandingCount: 1 }],
+      ["domainWorkClaimShardState", { claimShard: 0, nextDispatchAt: new Date() }],
+      ["domainWorkClaimAgencyState", { nextDispatchAt: new Date() }],
+    ];
+    const data = { agencyId: scope.agencyId, workClass: klass, activeGeneration: generation };
+    for (const [name, fields] of locatorCases) {
+      // Positive control: identical payload must be valid while parent is live.
+      const row = await db[name].create({ data: { ...data, ...fields, id: `${klass}-${name}` } });
+      assert.equal(row.agencyId, scope.agencyId);
+      await db[name].delete({ where: { id: row.id } });
+    }
     await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId);
     assert.equal(await db.agency.count({ where: { id: scope.agencyId } }), 0);
     await reconcile();
     // A successful no-op is not permission to weaken FK enforcement.
-    const data = { agencyId: scope.agencyId, workClass: klass, activeGeneration: generation };
-    for (const [name, fields] of [
-      ["phase2WorkBroadClaimPartitionState", { partitionKey: scope.creatorId }],
-      ["domainWorkClaimShardState", { claimShard: 0, nextDispatchAt: new Date() }],
-      ["domainWorkClaimAgencyState", { nextDispatchAt: new Date() }],
-    ]) await assert.rejects(() => db[name].create({ data: { ...data, ...fields, id: `${klass}-${name}` } }), (error) => error?.code === "P2003");
+    for (const [name, fields] of locatorCases) {
+      await assert.rejects(() => db[name].create({ data: { ...data, ...fields, id: `${klass}-${name}` } }),
+        (error) => error?.code === "P2003" || error?.meta?.code === "23503");
+    }
     console.log("# A37_LOCATOR_LIFECYCLE_EMPTY_AND_DELETED_PARENT_PASS");
   } finally {
     try { if (await db.agency.findUnique({ where: { id: scope.agencyId } })) await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId); }

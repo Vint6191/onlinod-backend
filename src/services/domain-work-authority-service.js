@@ -457,16 +457,27 @@ async function reserveMemberScopeCreatorProbe({
       return { mode: "denied", authorityNow, creatorIds: [] };
     }
 
+    // A peer can commit after this statement takes its sorted snapshot but
+    // before it locks a shard. Reject that revision instead of reusing its old
+    // position/cursor. Observe the fixed 128-shard ring so a stale 32-shard
+    // tranche can be replaced without scanning the member's whole creator scope.
     const rows = await tx.$queryRawUnsafe(
-      `WITH selected_shards AS MATERIALIZED (
-         SELECT s."id",s."claimShard",s."cursorCreatorId"
+      `WITH observed_shards AS MATERIALIZED (
+         SELECT s."id",s."claimShard",s."revision",s."lastSelectedAt",
+                CASE WHEN w."nextDispatchAt" IS NOT NULL AND w."nextDispatchAt" <= $4 THEN 0 ELSE 1 END AS "dueRank"
            FROM "DomainWorkMemberScopeShardState" s
            LEFT JOIN "DomainWorkClaimShardState" w
              ON w."agencyId"=s."agencyId" AND w."workClass"=$6
             AND w."activeGeneration"=$5 AND w."claimShard"=s."claimShard"
           WHERE s."memberId"=$1 AND s."agencyId"=$2 AND s."accessEpoch"=$3
-          ORDER BY CASE WHEN w."nextDispatchAt" IS NOT NULL AND w."nextDispatchAt" <= $4 THEN 0 ELSE 1 END,
+          ORDER BY "dueRank",
                    s."lastSelectedAt" NULLS FIRST,s."revision",s."claimShard"
+          LIMIT ${DOMAIN_WORK_CLAIM_SHARD_COUNT}
+       ), selected_shards AS MATERIALIZED (
+         SELECT s."id",s."claimShard",s."cursorCreatorId",s."revision"
+           FROM observed_shards o JOIN "DomainWorkMemberScopeShardState" s
+             ON s."id"=o."id" AND s."revision"=o."revision"
+          ORDER BY o."dueRank",o."lastSelectedAt" NULLS FIRST,o."revision",o."claimShard"
           FOR UPDATE OF s SKIP LOCKED
           LIMIT $7
        ), ring AS MATERIALIZED (
@@ -507,10 +518,10 @@ async function reserveMemberScopeCreatorProbe({
        ), advanced AS (
          UPDATE "DomainWorkMemberScopeShardState" s
             SET "cursorCreatorId"=COALESCE(last_probe."creatorId",s."cursorCreatorId"),
-                "lastSelectedAt"=$4,"revision"=s."revision"+1,"updatedAt"=CURRENT_TIMESTAMP
+                "lastSelectedAt"=GREATEST($4,s."lastSelectedAt"),"revision"=s."revision"+1,"updatedAt"=CURRENT_TIMESTAMP
            FROM selected_shards selected
            LEFT JOIN last_probe ON last_probe."id"=selected."id"
-          WHERE s."id"=selected."id"
+          WHERE s."id"=selected."id" AND s."revision"=selected."revision"
          RETURNING s."id"
        )
        SELECT b."creatorId"

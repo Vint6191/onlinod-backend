@@ -210,6 +210,31 @@ async function installPhase3PostgresAgencyDestructiveFixtureAuthority(tx, agency
   `, String(agencyId), String(claim?.workId || ""), String(claim?.ownerToken || ""));
 }
 
+async function purgePhase3PostgresFixtureTenantResidue(tx, agencyId) {
+  // Reuse production ownership, including immutable authorization history.
+  // Frozen rolling schemas can predate some tables: discover installed members
+  // of that same inventory in the pinned schema, preserving production order.
+  // This is fixture-only, set-based teardown for one disposable Agency. Keep
+  // its parent and exact destructive claim alive until these deletes finish.
+  const { AGENCY_NON_FK_TENANT_TABLES } = require("../../src/services/phase2-destructive-delete-authority-service");
+  const installed = await tx.$queryRawUnsafe(`
+    SELECT t."tableName"
+      FROM unnest($1::text[]) WITH ORDINALITY AS t("tableName",position)
+      JOIN pg_class c ON c.relname=t."tableName"
+      JOIN pg_namespace n ON n.oid=c.relnamespace
+     WHERE n.nspname=current_schema() AND c.relkind IN ('r','p')
+     ORDER BY t.position
+  `, [...AGENCY_NON_FK_TENANT_TABLES]);
+  const present = new Set(installed.map((row) => row.tableName));
+  let deleted = 0;
+  for (const tableName of AGENCY_NON_FK_TENANT_TABLES) {
+    if (!present.has(tableName)) continue;
+    const table = `"${tableName.replace(/"/g, '""')}"`;
+    deleted += Number(await tx.$executeRawUnsafe(`DELETE FROM ${table} WHERE "agencyId"=$1`, String(agencyId)) || 0);
+  }
+  return deleted;
+}
+
 async function cleanupPhase3PostgresAgencyFixture(db, agencyId) {
   const id = String(agencyId || "").trim();
   if (!id) return { agencyDeleted: 0, creatorsDeleted: 0, domainWorkDeleted: 0 };
@@ -219,6 +244,7 @@ async function cleanupPhase3PostgresAgencyFixture(db, agencyId) {
       await installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority(tx, id);
       const domainWorkDeleted = await drainPhase3PostgresAgencyDomainWork(tx, id);
       const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
+      await purgePhase3PostgresFixtureTenantResidue(tx, id);
       const agencyResult = await tx.agency.deleteMany({ where: { id } });
       return {
         agencyDeleted: Number(agencyResult?.count || 0),
@@ -238,6 +264,7 @@ async function cleanupPhase3PostgresAgencyFixture(db, agencyId) {
     // deleting Agency removes that work item atomically.
     await installPhase3PostgresAgencyDestructiveFixtureAuthority(tx, id, claim);
     const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
+    await purgePhase3PostgresFixtureTenantResidue(tx, id);
     const agencyResult = await tx.agency.deleteMany({ where: { id } });
     return {
       agencyDeleted: Number(agencyResult?.count || 0),
@@ -262,6 +289,7 @@ async function cleanupPhase3PostgresFixtureGraph(db, {
       await installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority(tx, id);
       const domainWorkDeleted = await drainPhase3PostgresAgencyDomainWork(tx, id);
       const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
+      await purgePhase3PostgresFixtureTenantResidue(tx, id);
       const agencyResult = await tx.agency.deleteMany({ where: { id } });
       const userResult = users.length
         ? await tx.user.deleteMany({ where: { id: { in: users } } })
@@ -294,6 +322,7 @@ async function cleanupPhase3PostgresFixtureGraph(db, {
       // triggers complete, then cascade tenant rows before deleting User identity.
       const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
       creatorsDeleted = Number(creatorResult?.count || 0);
+      await purgePhase3PostgresFixtureTenantResidue(tx, id);
       const agencyResult = await tx.agency.deleteMany({ where: { id } });
       agencyDeleted = Number(agencyResult?.count || 0);
     }
@@ -321,6 +350,7 @@ module.exports = {
   installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority,
   claimPhase3PostgresAgencyDestructiveFixture,
   installPhase3PostgresAgencyDestructiveFixtureAuthority,
+  purgePhase3PostgresFixtureTenantResidue,
   cleanupPhase3PostgresAgencyFixture,
   cleanupPhase3PostgresFixtureGraph,
 };

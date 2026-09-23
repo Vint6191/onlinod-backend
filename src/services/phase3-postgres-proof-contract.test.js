@@ -192,7 +192,7 @@ test("Phase3 member proof tears down User through the same generation-fenced fix
   const source = fs.readFileSync(path.join(ROOT, "src/services/phase3-a34-source-scale-closure.integration.test.js"), "utf8");
   assert.match(source, /cleanupPhase3PostgresFixtureGraph\(dbA, \{ agencyId, userIds: \[userId\] \}\)/);
   assert.doesNotMatch(source, /dbA\.user\.deleteMany/);
-  assert.equal((source.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 9);
+  assert.equal((source.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 10);
   assert.doesNotMatch(source, /SELECT pg_sleep/);
 });
 
@@ -281,6 +281,47 @@ test("Phase3 lease deadline waits through executeRaw and cannot decode PostgreSQ
   await assert.rejects(waitUntilPhase3DatabaseTime(tx, new Date(NaN)), { code: "PHASE3_PROOF_LEASE_DEADLINE_INVALID" });
 });
 
+test("Phase3 fixture residue cleanup follows installed production ownership and binds the exact tenant", async () => {
+  const { purgePhase3PostgresFixtureTenantResidue } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+  const statements = [];
+  const agencyId = "fixture-agency'quoted";
+  const tx = {
+    async $queryRawUnsafe(sql, inventory) {
+      assert.ok(inventory.includes("AuthorizationSessionBoundary"));
+      assert.ok(inventory.includes("AgencyMemberAccessEpochBoundary"));
+      assert.ok(inventory.includes("DomainWorkMemberScopeShardState"));
+      assert.equal(inventory.includes("DomainWorkItem"), false);
+      return [
+        { tableName: "AgencyMemberAccessEpochBoundary" },
+        { tableName: "AuthorizationSessionBoundary" },
+        { tableName: "UnownedTable" },
+      ];
+    },
+    async $executeRawUnsafe(sql, id) {
+      assert.equal(id, agencyId);
+      assert.match(sql, /WHERE "agencyId"=\$1$/);
+      assert.equal(sql.includes(agencyId), false);
+      statements.push(sql);
+      return 2;
+    },
+  };
+  assert.equal(await purgePhase3PostgresFixtureTenantResidue(tx, agencyId), 4);
+  assert.deepEqual(statements, [
+    'DELETE FROM "AuthorizationSessionBoundary" WHERE "agencyId"=$1',
+    'DELETE FROM "AgencyMemberAccessEpochBoundary" WHERE "agencyId"=$1',
+  ]);
+});
+
+test("Phase3 fixture residue cleanup propagates a failed deletion instead of certifying cleanup", async () => {
+  const { purgePhase3PostgresFixtureTenantResidue } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+  const failure = Object.assign(new Error("history deletion failed"), { code: "PROBE_DELETE_FAILED" });
+  const tx = {
+    async $queryRawUnsafe() { return [{ tableName: "AgencyMemberAccessEpochBoundary" }]; },
+    async $executeRawUnsafe() { throw failure; },
+  };
+  await assert.rejects(() => purgePhase3PostgresFixtureTenantResidue(tx, "fixture-agency"), (error) => error === failure);
+});
+
 for (const exact of [false, true]) {
   test(`Phase3 fixture graph deletes User inside admitted transaction after Agency (${exact ? "exact claim" : "legacy marker"})`, async (t) => {
     const { cleanupPhase3PostgresFixtureGraph, auditSchemaFromDatabaseUrl } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
@@ -304,7 +345,16 @@ for (const exact of [false, true]) {
           return { count: 1 };
         };
         return work({
-          async $executeRawUnsafe(sql) { assert.match(sql, /pg_advisory_xact_lock_shared/); return 1; },
+          async $executeRawUnsafe(sql, ...args) {
+            if (sql.startsWith('DELETE FROM "AgencyMemberAccessEpochBoundary"')) {
+              assert.equal(args[0], "fixture-agency");
+              assert.equal(settings.get(release.TEAM_CONTROL_PLANE_DB_SETTING), release.TEAM_CONTROL_PLANE_GENERATION);
+              events.push("delete-non-fk-history");
+              return 1;
+            }
+            assert.match(sql, /pg_advisory_xact_lock_shared/);
+            return 1;
+          },
           async $queryRawUnsafe(sql, ...args) {
             if (sql.includes("WITH exact_function")) return [{
               topologyMigrationApplied: exact, exactMigrationApplied: exact,
@@ -318,6 +368,11 @@ for (const exact of [false, true]) {
               return [{ value: args[1] }];
             }
             if (sql.includes("set_config('search_path'")) return [{ value: args[0] }];
+            if (sql.includes('unnest($1::text[]) WITH ORDINALITY')) {
+              assert.ok(args[0].includes("AgencyMemberAccessEpochBoundary"));
+              assert.equal(args[0].includes("DomainWorkItem"), false, "exact destructive claim must survive fixture residue cleanup");
+              return [{ tableName: "AgencyMemberAccessEpochBoundary" }];
+            }
             if (sql.includes("current_schema()")) return [{ currentSchema: auditSchemaFromDatabaseUrl() }];
             if (sql.includes("set_config('onlinod.phase2_destructive_agency_id'")) {
               assert.equal(args[0], "fixture-agency");
@@ -336,7 +391,7 @@ for (const exact of [false, true]) {
     };
     const result = await cleanupPhase3PostgresFixtureGraph(db, { agencyId: "fixture-agency", userIds: ["fixture-user"] });
     assert.equal(result.usersDeleted, 1);
-    assert.deepEqual(events.filter((event) => event.startsWith("delete-")), ["delete-work", "delete-creator", "delete-agency", "delete-user"]);
+    assert.deepEqual(events.filter((event) => event.startsWith("delete-")), ["delete-work", "delete-creator", "delete-non-fk-history", "delete-agency", "delete-user"]);
     assert.equal(events.includes("publish-claim"), exact);
   });
 }
