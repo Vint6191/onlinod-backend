@@ -840,14 +840,38 @@ async function validateRolloutCatalog(db) {
     fail(`A36 bounded dependency wake index is missing/invalid: ${JSON.stringify(dependencyIndexRows)}`);
   }
   const dependencyFunctions = await db.$queryRawUnsafe(`
-    SELECT p.proname AS name,pg_get_functiondef(p.oid) AS definition
+    SELECT p.proname AS name,
+           pg_catalog.oidvectortypes(p.proargtypes) AS arguments,
+           pg_get_functiondef(p.oid) AS definition
       FROM pg_proc p
       JOIN pg_namespace n ON n.oid=p.pronamespace
      WHERE n.nspname=current_schema()
        AND p.proname=ANY($1::text[])
-     ORDER BY p.proname`, ["phase2_bump_dependency", "phase3_wake_domain_dependency_batch"]);
-  const bumpDefinition = String(dependencyFunctions.find((row) => row.name === "phase2_bump_dependency")?.definition || "");
-  const wakeDefinition = String(dependencyFunctions.find((row) => row.name === "phase3_wake_domain_dependency_batch")?.definition || "");
+     ORDER BY p.proname,pg_catalog.oidvectortypes(p.proargtypes)`, [
+    "phase2_bump_dependency",
+    "phase3_reconcile_domain_work_claim_shard",
+    "phase3_wake_domain_dependency_batch",
+  ]);
+  const functionDefinition = (name, args) => String(dependencyFunctions.find(
+    (row) => row.name === name && row.arguments === args,
+  )?.definition || "");
+  const bumpDefinition = functionDefinition("phase2_bump_dependency", "text, text, text");
+  const wakeDefinition = functionDefinition(
+    "phase3_wake_domain_dependency_batch",
+    "text, text, text, bigint, integer",
+  );
+  const wakePrismaDefinition = functionDefinition(
+    "phase3_wake_domain_dependency_batch",
+    "text, text, text, bigint, bigint",
+  );
+  const shardStorageDefinition = functionDefinition(
+    "phase3_reconcile_domain_work_claim_shard",
+    "text, text, text, integer, timestamp without time zone",
+  );
+  const shardPrismaDefinition = functionDefinition(
+    "phase3_reconcile_domain_work_claim_shard",
+    "text, text, text, bigint, timestamp with time zone",
+  );
   if (!bumpDefinition.includes("'DEPENDENCY_WAKE'") || /UPDATE\s+"DomainWorkItem"/i.test(bumpDefinition)) {
     fail("A36 dependency producer is not a revision-only durable wake publisher");
   }
@@ -855,6 +879,17 @@ async function validateRolloutCatalog(db) {
       || !/FOR UPDATE(?: OF d)? SKIP LOCKED/i.test(wakeDefinition)
       || !/v_remaining/i.test(wakeDefinition)) {
     fail("A36 bounded dependency wake function contract is incomplete");
+  }
+  if (!wakePrismaDefinition
+      || !/LEAST\s*\(\s*COALESCE\s*\(\s*p_limit\s*,\s*100::bigint\s*\)\s*,\s*500::bigint\s*\)/i.test(wakePrismaDefinition)
+      || !/\)::integer/i.test(wakePrismaDefinition)) {
+    fail("A36 Prisma int8 dependency-wake ABI is missing or does not bound before narrowing");
+  }
+  if (!shardStorageDefinition
+      || !shardPrismaDefinition
+      || !/p_shard::integer/i.test(shardPrismaDefinition)
+      || !/phase3_utc_timestamp/i.test(shardPrismaDefinition)) {
+    fail("A36 Prisma int8/timestamptz claim-shard ABI is missing or does not delegate to storage authority");
   }
   const dependencyAuthority = await db.$queryRawUnsafe(`
     SELECT "activeGeneration","projectionVersion"

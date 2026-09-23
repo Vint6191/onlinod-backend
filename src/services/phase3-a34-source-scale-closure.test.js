@@ -390,6 +390,39 @@ test("A36 PostgreSQL boundary normalizes Node time and selects destructive autho
   assert.match(postgresProof, /seeded-pre-a20-2-fixture-lifecycle[\s\S]*addMigrationsAfter\(seededRollingPrisma, PRE_A20_2_CUTOFF\)[\s\S]*seeded-current-fixture-lifecycle/);
 });
 
+test("A36 PostgreSQL application ABI owns every Prisma numeric narrowing boundary", () => {
+  const original = source("prisma/migrations/20260922183000_phase3_a36_domain_work_claim_shard_closure_v1/migration.sql");
+  const numericAbi = source("prisma/migrations/20260923060000_phase3_domain_work_prisma_numeric_abi_contract_v2/migration.sql");
+  const domain = source("src/services/domain-work-authority-service.js");
+  const rollout = source("scripts/database/phase3-domain-work-claim-online-rollout.js");
+
+  assert.match(original, /phase3_reconcile_domain_work_claim_shard[\s\S]*p_shard INTEGER[\s\S]*p_touched_at TIMESTAMP\(3\)/,
+    "DB-internal shard reconciliation must retain its int4/timestamp(3) storage contract");
+  assert.match(original, /phase3_wake_domain_dependency_batch[\s\S]*p_revision BIGINT,p_limit INTEGER DEFAULT 100/,
+    "DB-internal wake authority must retain its bounded int4 limit");
+
+  assert.match(numericAbi, /phase3_reconcile_domain_work_claim_shard[\s\S]*p_shard BIGINT[\s\S]*p_touched_at TIMESTAMPTZ/);
+  assert.match(numericAbi, /p_shard >= 0 AND p_shard < 128[\s\S]*p_shard::INTEGER[\s\S]*phase3_utc_timestamp/,
+    "the application ABI must validate the shard before narrowing and normalize time centrally");
+  assert.match(numericAbi, /phase3_wake_domain_dependency_batch[\s\S]*p_revision BIGINT[\s\S]*p_limit BIGINT/);
+  assert.match(numericAbi, /GREATEST\([\s\S]*1::BIGINT[\s\S]*LEAST\(COALESCE\(p_limit,100::BIGINT\),500::BIGINT\)[\s\S]*::INTEGER/,
+    "the application ABI must bound the wake limit before narrowing");
+
+  assert.match(domain, /phase3_reconcile_domain_work_claim_shard"\(\$1,\$2,\$3,\$4,\$5\)/);
+  assert.match(domain, /phase3_wake_domain_dependency_batch"\(\$1,\$2,\$3,\$4,\$5\)/);
+  assert.doesNotMatch(domain, /phase3_(?:reconcile_domain_work_claim_shard|wake_domain_dependency_batch)"\([^\n]*::(?:int|integer|bigint)/i,
+    "Prisma wire compatibility belongs to the PostgreSQL API, not scattered runtime casts");
+
+  assert.match(rollout, /oidvectortypes\(p\.proargtypes\) AS arguments/,
+    "overloaded routine verification must use the full PostgreSQL identity signature");
+  assert.match(rollout, /text, text, text, bigint, integer[\s\S]*text, text, text, bigint, bigint/,
+    "rollout must verify canonical and Prisma dependency-wake ABIs independently");
+  assert.match(rollout, /text, text, text, integer, timestamp without time zone[\s\S]*text, text, text, bigint, timestamp with time zone/,
+    "rollout must verify canonical and Prisma shard ABIs independently");
+  assert.match(rollout, /wakePrismaDefinition[\s\S]*bound before narrowing/);
+  assert.match(rollout, /shardStorageDefinition[\s\S]*shardPrismaDefinition[\s\S]*delegate to storage authority/);
+});
+
 test("A36 fixture generation classifier accepts only complete legacy or exact-claim generations", () => {
   const {
     PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE,
