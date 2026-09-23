@@ -77,9 +77,11 @@ function makeDb({ withRoot = true } = {}) {
     },
     agencyMember: {
       findFirst: async ({ where }) => {
-        const row = members.get(where.id) || null;
+        const row = (where.id ? members.get(where.id) : [...members.values()].find(m => m.agencyId === where.agencyId && m.userId === where.userId)) || null;
         if (!row || row.agencyId !== where.agencyId) return null;
         if (where.deletedAt === null && row.deletedAt) return null;
+        if (where.deactivatedAt === null && row.deactivatedAt) return null;
+        if (where.user?.is?.disabledAt === null && row.user?.disabledAt) return null;
         return clone(row);
       },
       findUnique: async ({ where }) => {

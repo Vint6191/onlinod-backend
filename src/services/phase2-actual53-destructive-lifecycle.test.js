@@ -19,9 +19,9 @@ function slice(source, start, end) {
 
 test("F55-07 Agency hard delete is a durable bounded DomainWork lifecycle, not one tenant-wide route transaction", () => {
   const route = slice(admin, 'router.delete("/agencies/:id"', '// POST /agencies/:id/restore');
-  const hardStart = route.indexOf("if (hard) {");
-  const softStart = route.indexOf("const deletedAt", hardStart);
-  const hard = route.slice(hardStart, softStart);
+  assert.match(route, /operationHandler\("agency.retire"/);
+  const owner = fs.readFileSync(path.join(__dirname,"admin-operational-command-service.js"),"utf8");
+  const hard = owner.slice(owner.indexOf('await assertAgencyCustomPipelineRetirable({db:tx'),owner.indexOf('return {agencyId:targetId,statusCode:pending'));
   const customFence = hard.indexOf("assertAgencyCustomPipelineRetirable");
   const massFence = hard.indexOf("assertAgencyMassCampaignRetirable");
   const barrier = hard.indexOf("tx.agency.update");

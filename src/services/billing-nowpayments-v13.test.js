@@ -1056,12 +1056,14 @@ test("V13.3.2 billing entitlement mutations serialize on the agency row before t
 test("V13.3.2 admin dated-access edits and creator deletion join the same agency billing lock", () => {
   const entitlementRoute = fs.readFileSync(path.join(__dirname, "admin-billing-access-command-service.js"), "utf8");
   assert.match(adminSource, /router\.patch\("\/creators\/:id\/entitlement", setEntitlementHandler\)/);
-  const deleteRoute = adminSource.match(/router\.delete\("\/creators\/:id"[\s\S]*?return res\.json\(\{[\s\S]*?deleted: before,[\s\S]*?historyPreserved: true[\s\S]*?\n  \}\);\n\}\);/)?.[0] || "";
+  assert.match(adminSource, /operationHandler\("creator.retire"/);
+  const operation = fs.readFileSync(path.join(__dirname,"admin-operational-command-service.js"),"utf8");
+  const deleteRoute=operation.slice(operation.indexOf('if(action==="creator.retire")'),operation.indexOf('if(action==="device.kick")'));
   assert.match(adminSource, /lockAgencyBillingMutation/);
   assert.match(entitlementRoute, /await lockLiveAgency\(tx, identity\.agencyId\)/);
   assert.match(entitlementRoute, /await lockAgencyBillingMutation\(tx, agencyId\)/);
   assert.match(entitlementRoute, /tx\.creatorAccount\.findUnique/);
-  assert.match(deleteRoute, /await lockAgencyBillingMutation\(tx, before\.agencyId\)/);
+  assert.match(deleteRoute, /await lockAgencyBillingMutation\(tx,input\.agencyId\)/);
 });
 
 test("V13.3.2 concurrent provider status update cannot regress REFUNDED back to PAID from a stale finished snapshot", async () => {
@@ -1139,11 +1141,13 @@ test("V13.3.1 expiry scheduler reconciles future ACTIVE aggregates and does not 
 
 
 test("V13.3.1 creator soft/hard delete recomputes billing aggregate in the canonical delete transaction", () => {
-  const deleteRoute = adminSource.match(/router\.delete\("\/creators\/:id"[\s\S]*?return res\.json\(\{[\s\S]*?deleted: before,[\s\S]*?historyPreserved: true[\s\S]*?\n  \}\);\n\}\);/)?.[0] || "";
+  assert.match(adminSource, /operationHandler\("creator.retire"/);
+  const operation = fs.readFileSync(path.join(__dirname,"admin-operational-command-service.js"),"utf8");
+  const deleteRoute=operation.slice(operation.indexOf('if(action==="creator.retire")'),operation.indexOf('if(action==="device.kick")'));
   const lifecycle = fs.readFileSync(path.join(__dirname, "creator-lifecycle-authority-service.js"), "utf8");
-  assert.match(deleteRoute, /prisma\.\$transaction/);
+  assert.match(operation, /executeAdminCommand\(\{/);
   assert.match(deleteRoute, /retireCreatorWithinTransaction\(\{/);
-  assert.match(deleteRoute, /syncAgencyBillingAggregate\(tx, before\.agencyId, deletedAt\)/);
+  assert.match(deleteRoute, /syncAgencyBillingAggregate\(tx,input\.agencyId,now\)/);
   assert.ok(deleteRoute.indexOf("retireCreatorWithinTransaction") < deleteRoute.indexOf("syncAgencyBillingAggregate"));
   assert.match(lifecycle, /creatorAccount\.update\(\{[\s\S]*?status: "DISABLED", deletedAt: retiredAt/);
   assert.match(lifecycle, /WORK_CLASS\.DESTRUCTIVE_CREATOR_CLEANUP/);

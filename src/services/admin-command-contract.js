@@ -65,6 +65,7 @@ const contentLifecycleSchema = z.object({
 }).strict();
 
 const ACTIONS = Object.freeze({
+  ...require("./admin-operational-command-contract").OPERATIONAL_ACTIONS,
   "data.content.lifecycle": { roles: ["SUPER_ADMIN"], schema: contentLifecycleSchema },
   "data.delivery.archive": { roles: ["SUPER_ADMIN"], schema: deliveryArchiveSchema },
   "billing.pricing.bulk.cancel": { roles: ["SUPER_ADMIN", "SUPPORT"], parentIdentity: true, schema: z.object({ targetCommandId: commandIdSchema, reason: reasonSchema }).strict() },

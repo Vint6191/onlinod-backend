@@ -35,7 +35,7 @@ test("role permission/access writes bump affected member accessEpoch inside the 
 });
 
 test("role epoch fence covers active explicit and legacy preset members", () => {
-  const body = bodyBetween("function liveRoleMemberWhere", "async function accessibleCreatorIdsForMember");
+  const body = bodyBetween("function liveRoleMemberWhere", "async function updateMemberSettings");
   assert.match(body, /key === "manager"[\s\S]*\["ADMIN", "MANAGER"\]/);
   assert.match(body, /key === "chatter"[\s\S]*\["OPERATOR"\]/);
   assert.match(body, /\{ roleKey: key \}/);
@@ -46,7 +46,7 @@ test("role epoch fence covers active explicit and legacy preset members", () => 
 });
 
 test("post-commit ACCESS_EPOCH_CHANGED targets every affected member and carries actor device context", () => {
-  const helper = bodyBetween("function publishRoleMemberAccessEpochs", "async function accessibleCreatorIdsForMember");
+  const helper = bodyBetween("function publishRoleMemberAccessEpochs", "async function updateMemberSettings");
   assert.match(helper, /publishMemberAccessEpoch\(\{ agencyId, member, sourceDeviceId \}\)/);
   for (const [start, end] of [
     ["async function setRoleAccess", "async function setRolePermission"],

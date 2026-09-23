@@ -114,7 +114,7 @@ const DELEGATED_PERMISSION_KEYS = Object.freeze(
 
 async function serializableTeamTransaction(db, fn) {
   try {
-    return await db.$transaction(async (tx) => {
+    return await require("./db-transaction-service").runDbTransaction(db, async (tx) => {
       // Rolling-release admission is wider than the steady-state topology mutex.
       // During DRAINING every Team control-plane writer must stop before its first
       // Role/Creator/User/Member lock, including invitation and role-metadata paths
@@ -846,7 +846,7 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
   return { id: target.id, status, deactivatedAt };
 }
 
-async function removeMember({ agencyId, memberId, actorMember = null, actorUserId: actorId = null, actorDeviceId = null, actorProof = null, platformAdmin = false, db = prisma }) {
+async function removeMember({ agencyId, memberId, actorMember = null, actorUserId: actorId = null, actorDeviceId = null, actorProof = null, platformAdmin = false, expectedAccessEpoch = null, publishEvents = true, db = prisma }) {
   const target = await db.agencyMember.findFirst({ where: { id: memberId, agencyId, deletedAt: null } });
   if (!target) {
     const error = new Error("Member not found");
@@ -885,6 +885,8 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
       if (liveTarget.id === liveActor.id) { const error = new Error("You cannot remove your own membership"); error.code = "CANNOT_REMOVE_SELF"; error.status = 409; throw error; }
     }
 
+    if (expectedAccessEpoch !== null && liveTarget.accessEpoch !== expectedAccessEpoch) throw Object.assign(new Error("Member access changed; reload"), {code:"MEMBER_REVISION_CONFLICT",status:409});
+
     // The Team control-plane fence now serializes every owner/member lifecycle
     // mutation, so a second owner-safety advisory root would only introduce a
     // competing lock order. Evaluate the invariant under this single topology.
@@ -898,7 +900,7 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
     return updatedMember || { ...liveTarget, deletedAt, deactivatedAt: deletedAt, accessEpoch: normalizedEpoch(liveTarget.accessEpoch) + 1 };
   });
 
-  publishMemberAccessEpoch({ agencyId, member: removalMutation || { ...target, accessEpoch: normalizedEpoch(target.accessEpoch) + 1 }, sourceDeviceId: actorDeviceId });
+  if (publishEvents) publishMemberAccessEpoch({ agencyId, member: removalMutation || { ...target, accessEpoch: normalizedEpoch(target.accessEpoch) + 1 }, sourceDeviceId: actorDeviceId });
   await audit({
     agencyId,
     actorUserId: platformAdmin ? null : actorId,
@@ -919,6 +921,8 @@ async function updateMemberAccessByPlatformAdmin({
   roleKey = undefined,
   permissions = undefined,
   actorDeviceId = null,
+  expectedAccessEpoch = null,
+  publishEvents = true,
   db = prisma,
 } = {}) {
   const mutation = await serializableTeamTransaction(db, async (tx) => {
@@ -931,6 +935,7 @@ async function updateMemberAccessByPlatformAdmin({
       error.status = 404;
       throw error;
     }
+    if (expectedAccessEpoch !== null && before.accessEpoch !== expectedAccessEpoch) throw Object.assign(new Error("Member access changed; reload"), {code:"MEMBER_REVISION_CONFLICT",status:409});
     const nextRoleKey = roleKey === undefined ? memberRoleKey(before) : String(roleKey || "").trim().toLowerCase();
     if (roleKey !== undefined) {
       // Platform-admin role writes obey the same Role -> Member suffix as normal
@@ -952,7 +957,7 @@ async function updateMemberAccessByPlatformAdmin({
     }
     return { before, updated };
   });
-  publishMemberAccessEpoch({ agencyId, member: mutation.updated, sourceDeviceId: actorDeviceId });
+  if (publishEvents) publishMemberAccessEpoch({ agencyId, member: mutation.updated, sourceDeviceId: actorDeviceId });
   return mutation;
 }
 

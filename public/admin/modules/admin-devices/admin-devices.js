@@ -234,7 +234,9 @@
         const name = btn.dataset.deviceName || "device";
         if (!confirm(`Kick "${name}"?\n\nElectron will get FORCE_LOGOUT command on next heartbeat.\nRefresh sessions for this user will be revoked immediately.`)) return;
 
-        const result = await A().kickDevice(id, { reason: "admin kick from devices page" });
+        const device = s.list.find(row => row.id === id);
+        const reason = prompt("Reason for kicking this device?")?.trim(); if (!reason || !device) return;
+        const result = await A().kickDevice(id, { reason, agencyId: device.agencyId, userId: device.userId });
         R().toast(result?.ok ? "device kicked" : (result?.error || "failed"));
         if (result?.ok) load(true);
       });

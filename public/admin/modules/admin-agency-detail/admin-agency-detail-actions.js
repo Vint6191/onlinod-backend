@@ -20,6 +20,13 @@
     return window.OnlinodAdminAgencyDetail.load(true);
   }
 
+  function shownAgency() {
+    const id = window.OnlinodAdminState.sectionParam;
+    return window.OnlinodAdminStateApi.ensureAgencyDetail(id).data?.agency;
+  }
+  function shownMember(id) { return shownAgency()?.members?.find(m => m.id === id); }
+  function reasonForAction(label) { const value = prompt(label); return value?.trim() || null; }
+
   // ─── Header actions ────────────────────────────────────────
 
   async function doImpersonate(agencyId) {
@@ -33,8 +40,8 @@
   }
 
   async function doSoftDelete(agencyId) {
-    const reason = prompt("Reason for deleting this agency? (saved to audit)") || "";
-    if (reason === null) return; // user cancelled
+    const reason = reasonForAction("Reason for deleting this agency? (required)");
+    if (!reason) return;
 
     const really = confirm(
       "Soft-delete this agency?\n\n" +
@@ -43,7 +50,7 @@
     );
     if (!really) return;
 
-    const result = await A().deleteAgency(agencyId, { reason });
+    const result = await A().deleteAgency(agencyId, { reason, expectedUpdatedAt: shownAgency()?.updatedAt, hard: false });
     if (!result?.ok) {
       R().toast(result?.error || "Delete failed");
       return;
@@ -53,8 +60,9 @@
   }
 
   async function doRestore(agencyId) {
-    if (!confirm("Restore this agency?\n\nStatus will go back to TRIAL — adjust subscription if needed.")) return;
-    const result = await A().restoreAgency(agencyId, {});
+    if (!confirm("Restore this agency?\n\nAccess will be recalculated from current billing entitlements.")) return;
+    const reason = reasonForAction("Reason for restoring this agency?"); if (!reason) return;
+    const result = await A().restoreAgency(agencyId, { reason, expectedUpdatedAt: shownAgency()?.updatedAt });
     if (!result?.ok) {
       R().toast(result?.error || "Restore failed");
       return;
@@ -79,7 +87,7 @@
       return;
     }
 
-    const result = await A().deleteAgency(agencyId, { hard: "1", reason });
+    const result = await A().deleteAgency(agencyId, { hard: true, reason, expectedUpdatedAt: shownAgency()?.updatedAt });
     if (!result?.ok) {
       R().toast(result?.error || "Hard delete failed");
       return;
@@ -91,7 +99,9 @@
   // ─── Members ───────────────────────────────────────────────
 
   async function changeMemberRole(memberId, role, onError) {
-    const result = await A().patchMemberRole(memberId, { role });
+    const reason = reasonForAction("Reason for changing member role?"); if (!reason) { onError?.(); return; }
+    const member = shownMember(memberId);
+    const result = await A().patchMemberRole(memberId, { role, reason, agencyId: shownAgency()?.id, expectedAccessEpoch: member?.accessEpoch });
     if (!result?.ok) {
       R().toast(result?.error || "Role change failed");
       onError?.();
@@ -102,7 +112,9 @@
   }
 
   async function kickMember(memberId) {
-    const result = await A().deleteMember(memberId, { reason: "admin removed from console" });
+    const reason = reasonForAction("Reason for removing this member?"); if (!reason) return;
+    const member = shownMember(memberId);
+    const result = await A().deleteMember(memberId, { reason, agencyId: shownAgency()?.id, expectedAccessEpoch: member?.accessEpoch });
     if (!result?.ok) {
       R().toast(result?.error || "Kick failed");
       return;
@@ -114,7 +126,9 @@
   // ─── Creators ──────────────────────────────────────────────
 
   async function deleteCreator(creatorId) {
-    const result = await A().deleteCreator(creatorId, { reason: "admin soft-delete from agency detail" });
+    const reason = reasonForAction("Reason for removing this creator?"); if (!reason) return;
+    const creator = shownAgency()?.creators?.find(c => c.id === creatorId);
+    const result = await A().deleteCreator(creatorId, { reason, agencyId: shownAgency()?.id, expectedUpdatedAt: creator?.updatedAt, hard: false });
     if (!result?.ok) {
       R().toast(result?.error || "Delete failed");
       return;

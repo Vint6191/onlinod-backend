@@ -27,6 +27,7 @@ async function retireCreatorWithinTransaction({
   managementActorMember = null,
   managementPermissionKey = null,
   agencyAlreadyLocked = false,
+  expectedUpdatedAt = null,
 } = {}) {
   const agency = clean(agencyId);
   const creator = clean(creatorId);
@@ -43,8 +44,12 @@ async function retireCreatorWithinTransaction({
   // barrier and before any Role/Creator/User/Member rows.
   await lockTeamControlPlaneTopology({ tx, agencyId: agency, agencyAlreadyLocked: true, allowDeleted: true });
   await lockCreatorPipelineLifecycle({ db: tx, agencyId: agency, creatorId: creator, allowDeleted: true });
-  const current = await tx.creatorAccount.findFirst({ where: { id: creator, agencyId: agency }, select: { id: true, deletedAt: true, status: true } });
+  const current = await tx.creatorAccount.findFirst({ where: { id: creator, agencyId: agency }, select: { id: true, deletedAt: true, status: true, updatedAt: true } });
   if (!current) throw Object.assign(new Error("Creator not found"), { code: "CREATOR_NOT_FOUND", status: 404 });
+
+  if (expectedUpdatedAt !== null && (!current.updatedAt || new Date(current.updatedAt).getTime() !== new Date(expectedUpdatedAt).getTime())) {
+    throw Object.assign(new Error("Creator changed; reload before removal"), {code:"ADMIN_TARGET_REVISION_CONFLICT",status:409});
+  }
 
   if (managementActorMember) {
     // Normal Agency UI retirement is a management commit, not merely a lifecycle

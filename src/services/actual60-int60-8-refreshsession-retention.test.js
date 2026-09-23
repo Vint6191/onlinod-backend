@@ -28,8 +28,11 @@ test("admin device kick revokes only the selected device's live refresh sessions
   const start = source.indexOf('router.post("/devices/:id/kick"');
   assert.ok(start >= 0);
   const block = source.slice(start, source.indexOf("// ═", start));
-  assert.match(block, /deviceId:\s*device\.id/);
-  assert.match(block, /userId:\s*device\.userId[\s\S]*agencyId:\s*device\.agencyId[\s\S]*deviceId:\s*device\.id[\s\S]*revokedAt:\s*null[\s\S]*expiresAt:\s*\{\s*gt:\s*sessionRevokedAt\s*\}/);
+  assert.match(block, /operationHandler\("device.kick"/);
+  const owner = read("src/services/admin-operational-command-service.js");
+  const operation = owner.slice(owner.indexOf('if(action==="device.kick")'), owner.indexOf('if(action==="maintenance.subscriber.requeue")'));
+  assert.match(operation, /userId:input\.userId,agencyId:input\.agencyId,deviceId:targetId,revokedAt:null,expiresAt:\{gt:now\}/);
+  assert.match(operation, /device\.agencyId!==input\.agencyId\|\|device\.userId!==input\.userId/);
 });
 
 test("refresh-session retention materializes compact lineage boundary before deleting raw rotations", async () => {

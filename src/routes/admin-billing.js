@@ -23,8 +23,9 @@ const { adminRequired } = require("../middleware/admin");
 const { adminHttpAuditMiddleware } = require("../middleware/admin-audit");
 const { publicEntitlement } = require("../services/billing-entitlement-service");
 
-const router = express.Router();
+const router = require("./admin-router").createAdminRouter();
 router.use(adminRequired);
+router.use(require("../middleware/admin-read-boundary").adminReadBoundary);
 router.use(adminHttpAuditMiddleware);
 
 // All admin pricing readers and writers use the canonical domain catalog.

@@ -136,7 +136,7 @@
     listAgencies:    (query) => request("/api/admin/agencies", { query }),
     getAgency:       (id)    => request(`/api/admin/agencies/${encodeURIComponent(id)}`),
     patchAgency:     (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}`,         { method: "PATCH",  body }),
-    deleteAgency:    (id, query) => request(`/api/admin/agencies/${encodeURIComponent(id)}`,        { method: "DELETE", query }),
+    deleteAgency:    (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}`,        { method: "DELETE", body }),
     restoreAgency:   (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/restore`, { method: "POST",   body }),
     impersonate:     (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/impersonate`, { method: "POST", body }),
     setBillingHold: (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/billing-hold`, { method: "PATCH", body }),
@@ -147,7 +147,7 @@
     listMembers:    (agencyId) => request(`/api/admin/agencies/${encodeURIComponent(agencyId)}/members`),
     patchMemberRole:(memberId, body) => request(`/api/admin/members/${encodeURIComponent(memberId)}/role`, { method: "PATCH", body }),
     patchMemberPerms:(memberId, body) => request(`/api/admin/members/${encodeURIComponent(memberId)}/permissions`, { method: "PATCH", body }),
-    deleteMember:   (memberId, query) => request(`/api/admin/members/${encodeURIComponent(memberId)}`, { method: "DELETE", query }),
+    deleteMember:   (memberId, body) => request(`/api/admin/members/${encodeURIComponent(memberId)}`, { method: "DELETE", body }),
 
     // users
     listUsers:      (query) => request("/api/admin/users", { query }),
@@ -160,7 +160,7 @@
     listCreators: (query) => request("/api/admin/creators", { query }),
     patchCreatorStatus:  (id, body) => request(`/api/admin/creators/${encodeURIComponent(id)}/status`,  { method: "PATCH",  body }),
     patchCreatorBilling: (id, body) => request(`/api/admin/creators/${encodeURIComponent(id)}/billing`, { method: "PATCH",  body }),
-    deleteCreator:       (id, query) => request(`/api/admin/creators/${encodeURIComponent(id)}`,        { method: "DELETE", query }),
+    deleteCreator:       (id, body) => request(`/api/admin/creators/${encodeURIComponent(id)}`,        { method: "DELETE", body }),
 
     // devices
     listDevices: (query) => request("/api/admin/devices", { query }),

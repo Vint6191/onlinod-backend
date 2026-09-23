@@ -52,7 +52,7 @@ test("INT60.5 RefreshSession mutation anti-map: every broad production updateMan
       }
     }
   }
-  assert.equal(count, 19, `RefreshSession updateMany touchpoint count changed; re-audit mutation classification before updating this freeze gate (count=${count})`);
+  assert.equal(count, 17, `RefreshSession updateMany touchpoint count changed; re-audit mutation classification before updating this freeze gate (count=${count})`);
   assert.deepEqual(findings, [], `broad RefreshSession mutations must exclude expired history: ${JSON.stringify(findings)}`);
 });
 

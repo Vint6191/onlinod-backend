@@ -349,36 +349,35 @@
         const userId = d.user.id;
 
         if (action === "disable") {
-          const reason = prompt("Reason for disabling? (saved to audit)") || "";
-          if (reason === null) return;
+          const reason = prompt("Reason for disabling? (required)")?.trim();
+          if (!reason) return;
           const ok = confirm(`Disable ${d.user.email}?\n\nAll their refresh sessions will be revoked.`);
           if (!ok) return;
-          const result = await A().patchUser(userId, { disabled: true, disabledReason: reason, reason });
+          const result = await A().patchUser(userId, { disabled: true, disabledReason: reason, reason, expectedUpdatedAt: d.user.updatedAt });
           R().toast(result?.ok ? "user disabled" : (result?.error || "failed"));
           if (result?.ok) openDrawer(userId);
           else load(true);
         }
         else if (action === "enable") {
-          const result = await A().patchUser(userId, { disabled: false, reason: "admin re-enable" });
+          const reason = prompt("Reason for enabling this user?")?.trim(); if (!reason) return;
+          const result = await A().patchUser(userId, { disabled: false, reason, expectedUpdatedAt: d.user.updatedAt });
           R().toast(result?.ok ? "user enabled" : (result?.error || "failed"));
           if (result?.ok) openDrawer(userId);
         }
         else if (action === "force-logout") {
           if (!confirm(`Force logout ${d.user.email}?\n\nKills all active refresh sessions.`)) return;
-          const result = await A().forceLogout(userId, { reason: "admin force-logout" });
+          const reason = prompt("Reason for force logout?")?.trim(); if (!reason) return;
+          const result = await A().forceLogout(userId, { reason });
           R().toast(result?.ok ? `${result.revokedSessions} session(s) revoked` : (result?.error || "failed"));
           if (result?.ok) openDrawer(userId);
         }
         else if (action === "reset-password") {
-          if (!confirm(`Reset password for ${d.user.email}?\n\nA temporary password will be shown — copy it and share with the user.\nAll their sessions will be revoked.`)) return;
-          const result = await A().resetUserPwd(userId, { reason: "admin reset" });
-          if (result?.ok && result.tempPassword) {
-            prompt("Temporary password (copy now — won't be shown again):", result.tempPassword);
-            R().toast("password reset — sessions revoked");
-            openDrawer(userId);
-          } else {
-            R().toast(result?.error || "failed");
-          }
+          const password = prompt("Enter the new password (8–72 UTF-8 bytes). Keep it until the command is confirmed; the server will not return it.");
+          if (!password) return;
+          const reason = prompt("Reason for password reset?")?.trim(); if (!reason) return;
+          const result = await A().resetUserPwd(userId, { password, reason, expectedUpdatedAt: d.user.updatedAt });
+          R().toast(result?.ok ? "password reset — sessions revoked" : (result?.error || "failed"));
+          if (result?.ok) openDrawer(userId);
         }
       });
     });

@@ -330,7 +330,9 @@ test("M1 Team admission precedes the C2 lock graph on every outer retirement pat
     "await lockCreatorPipelineLifecycle",
   ], "Creator retirement");
 
-  const adminDelete = admin.slice(admin.indexOf('router.delete("/creators/:id"'));
+  const operation=read("src/services/admin-operational-command-service.js");
+  assert.match(admin,/operationHandler\("creator.retire"/);
+  const adminDelete = operation.slice(operation.indexOf('if(action==="creator.retire")'));
   indexOrder(adminDelete, [
     "await assertTeamControlPlaneWriteAdmission(tx)",
     "await lockAgencyPipelineLifecycle",
@@ -350,7 +352,7 @@ test("M1 DRAINING covers every Team Administration write transaction without wid
   const teamAdmin = read("src/services/team-administration-service.js");
   const wrapper = teamAdmin.slice(teamAdmin.indexOf("async function serializableTeamTransaction"), teamAdmin.indexOf("function requireLiveTeamActor"));
   indexOrder(wrapper, [
-    "db.$transaction(async (tx)",
+    "runDbTransaction(db, async (tx)",
     "await assertTeamControlPlaneWriteAdmission(tx)",
     "return fn(tx)",
   ], "Team Administration release wrapper");
@@ -491,9 +493,9 @@ test("M1 v2 DRAINING exposes no Team mutation authority after the locked migrati
 
 test("M1 authority-changing User lifecycle, Agency restore, and new-Agency bootstrap join release admission before authority locks/writes", () => {
   const adminSource = read("src/routes/admin.js");
-  const userStart = adminSource.indexOf('router.patch("/users/:id"');
-  const userEnd = adminSource.indexOf('router.post("/users/:id/force-logout"', userStart);
-  const userPatch = adminSource.slice(userStart, userEnd);
+  assert.match(adminSource,/operationHandler\("user.update"/);
+  const operation=read("src/services/admin-operational-command-service.js");
+  const userPatch=operation.slice(operation.indexOf('if(action.startsWith("user."))'));
   indexOrder(userPatch, [
     "await assertTeamControlPlaneWriteAdmission(tx)",
     'SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE',
@@ -501,9 +503,8 @@ test("M1 authority-changing User lifecycle, Agency restore, and new-Agency boots
     "tx.user.update",
   ], "User lifecycle release admission");
 
-  const restoreStart = adminSource.indexOf('router.post("/agencies/:id/restore"');
-  const restoreEnd = adminSource.indexOf('router.post("/agencies/:id/impersonate"', restoreStart);
-  const restore = adminSource.slice(restoreStart, restoreEnd);
+  const agency=operation.slice(operation.indexOf('if(action.startsWith("agency."))'));
+  const restore=agency.slice(0,agency.indexOf('if(action==="agency.update")')) + agency.slice(agency.indexOf('else if(action==="agency.restore")'));
   indexOrder(restore, [
     "await assertTeamControlPlaneWriteAdmission(tx)",
     "lockAgencyPipelineLifecycleExclusive",

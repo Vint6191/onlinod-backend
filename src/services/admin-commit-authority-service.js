@@ -58,7 +58,7 @@ async function executeAdminCommand({ db, actor, commandId, action, targetId, pay
     await tx.adminCommandAudit.create({ data: { commandId: command.id, sequence: 1, actorId: actor.adminId, action, targetId, scopeAgencyId: outcome.agencyId || null, event: outcome.queued ? "ACCEPTED" : statusCode < 400 ? "COMMITTED" : "REJECTED", detail: audit, reason: normalized.reason } });
     await tx.adminCommand.update({ where: { id: command.id }, data: { status: outcome.queued ? "QUEUED" : statusCode < 400 ? "SUCCEEDED" : "REJECTED", httpStatus: statusCode, result: body, scopeAgencyId: outcome.agencyId || null, completedAt: outcome.queued ? null : await dbAuthorityNow({ db: tx }) } });
     return { commandId, replayed: false, statusCode, body };
-  }, { maxWait: 5000, timeout: 15000, isolationLevel: "ReadCommitted" });
+  }, { maxWait: 5000, timeout: 15000, isolationLevel: contract.isolationLevel || "ReadCommitted" });
 }
 
 async function readAdminCommand({ db, actor, commandId }) {

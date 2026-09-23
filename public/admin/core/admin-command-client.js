@@ -15,7 +15,8 @@
     try { if (value) sessionStorage.setItem(key, JSON.stringify(value)); else sessionStorage.removeItem(key); } catch (_) { /* Session-only memory fallback. */ }
   }
   function isCommand(path, method) {
-    return (method === "PATCH" && /^\/api\/admin\/(?:billing\/creator\/[^/]+|creators\/[^/]+\/(?:billing|entitlement)|agencies\/[^/]+\/(?:subscription|billing-hold)|admin-users\/[^/]+)$/.test(path)) ||
+    const operational = (method === "PATCH" && /^\/api\/admin\/(?:agencies\/[^/]+|members\/[^/]+\/(?:role|permissions)|users\/[^/]+)$/.test(path)) || (method === "DELETE" && /^\/api\/admin\/(?:agencies|members|creators)\/[^/]+$/.test(path)) || (method === "POST" && /^\/api\/admin\/(?:agencies\/[^/]+\/restore|users\/[^/]+\/(?:force-logout|reset-password)|devices\/[^/]+\/kick|maintenance\/subscriber-signals\/[^/]+\/requeue)$/.test(path));
+    return operational || (method === "PATCH" && /^\/api\/admin\/(?:billing\/creator\/[^/]+|creators\/[^/]+\/(?:billing|entitlement)|agencies\/[^/]+\/(?:subscription|billing-hold)|admin-users\/[^/]+)$/.test(path)) ||
       (method === "POST" && (/^\/api\/admin\/data\/content\/[^/]+\/lifecycle$/.test(path) || /^\/api\/admin\/data\/creators\/[^/]+\/archive-deliveries$/.test(path) || /^\/api\/admin\/admin-users(?:\/[^/]+\/reset-password)?$/.test(path) || /^\/api\/admin\/billing\/agency\/[^/]+\/apply-tier(?:\/cancel)?$/.test(path)));
   }
   async function prepare({ path, method, body, token }) {

@@ -77,9 +77,9 @@ test("C2 User disable succeeds when every owned Agency has another operational O
 
 test("C2 admin User disable checks owner safety after User FOR UPDATE and before eligibility mutation", () => {
   const admin = read("src/routes/admin.js");
-  const start = admin.indexOf('router.patch("/users/:id"');
-  const end = admin.indexOf('router.post("/users/:id/force-logout"', start);
-  const route = admin.slice(start, end);
+  assert.match(admin, /operationHandler\("user.update"/);
+  const source=read("src/services/admin-operational-command-service.js");
+  const route=source.slice(source.indexOf('if(action.startsWith("user."))'),source.indexOf('if(action==="creator.retire")'));
 
   const admission = route.indexOf("assertTeamControlPlaneWriteAdmission(tx)");
   const lock = route.indexOf('SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE');
@@ -87,7 +87,7 @@ test("C2 admin User disable checks owner safety after User FOR UPDATE and before
   const mutation = route.indexOf("tx.user.update");
   assert.ok(admission >= 0 && lock > admission && ownerSafety > lock && mutation > ownerSafety);
   assert.doesNotMatch(route, /lockTeamControlPlaneTopology/);
-  assert.match(route, /TEAM_CONTROL_PLANE_SERIALIZATION_CONFLICT/);
+  assert.match(read("src/routes/admin-command-handlers.js"), /P2034/);
 });
 
 test("C2 Serializable Team write conflicts surface as controlled 409 rather than backend 500", () => {
@@ -102,13 +102,13 @@ test("C2 Serializable Team write conflicts surface as controlled 409 rather than
 
 test("C2/M1 Agency restore and activation cannot expose a live Agency without an operational OWNER", async () => {
   const admin = read("src/routes/admin.js");
-  const restoreStart = admin.indexOf('router.post("/agencies/:id/restore"');
-  const restoreEnd = admin.indexOf('router.post("/agencies/:id/impersonate"', restoreStart);
-  const restore = admin.slice(restoreStart, restoreEnd);
+  assert.match(admin, /operationHandler\("agency.restore"/);
+  const source=read("src/services/admin-operational-command-service.js");
+  const restore=source.slice(source.indexOf('if(action.startsWith("agency."))'),source.indexOf('}else{\n   await assertAgencyCustomPipelineRetirable'));
   const admission = restore.indexOf("assertTeamControlPlaneWriteAdmission(tx)");
   const lifecycle = restore.indexOf("lockAgencyPipelineLifecycleExclusive");
   const owner = restore.indexOf("assertAgencyHasOperationalOwner");
-  const update = restore.indexOf("tx.agency.update");
+  const update = restore.indexOf("tx.agency.update", owner);
   assert.ok(admission >= 0 && lifecycle > admission && owner > lifecycle && update > owner);
 
   const release = read("src/services/phase2-release-compatibility-authority-service.js");
@@ -142,8 +142,8 @@ test("C2 anti-map keeps persistent User.disabledAt mutation behind the canonical
     }
   };
   walk(srcRoot);
-  assert.deepEqual(writers.sort(), ["src/routes/admin.js"]);
+  assert.deepEqual(writers.sort(), ["src/services/admin-operational-command-service.js"]);
 
   const admin = read("src/routes/admin.js");
-  assert.match(admin, /input\.disabled === true && !before\.disabledAt[\s\S]*assertUserDisableOwnerSafety/);
+  assert.match(read("src/services/admin-operational-command-service.js"), /input\.disabled===true&&!before\.disabledAt[\s\S]*assertUserDisableOwnerSafety/);
 });

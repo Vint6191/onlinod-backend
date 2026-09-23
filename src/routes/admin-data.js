@@ -39,8 +39,9 @@ const { listHiddenOnline } = require("../services/subscriber-directory-service")
 const { listFollowBack } = require("../services/follow-back-service");
 const { archiveDeliveriesHandler, contentLifecycleHandler } = require("./admin-command-handlers");
 
-const router = express.Router();
+const router = require("./admin-router").createAdminRouter();
 router.use(adminRequired);
+router.use(require("../middleware/admin-read-boundary").adminReadBoundary);
 router.use(adminHttpAuditMiddleware);
 
 // ── helpers ───────────────────────────────────────────────────
