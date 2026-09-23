@@ -69,6 +69,29 @@ async function withPhase3PostgresFixtureAuthority(db, work, options = undefined)
   }, options);
 }
 
+// A Prisma model without @relation can still have a migration-installed tenant
+// trigger. Actor-scoped proofs therefore own a real Agency/User/Member graph;
+// never manufacture an agencyId/memberId solely for a child fixture.
+async function createPhase3PostgresActorFixture(db, prefix) {
+  const id = String(prefix || "").trim();
+  if (!id) throw Object.assign(new Error("Phase3 actor fixture prefix is required"), { code: "PHASE3_POSTGRES_FIXTURE_PREFIX_REQUIRED" });
+  const agencyId = `${id}-agency`;
+  const userId = `${id}-user`;
+  const memberId = `${id}-member`;
+  return withPhase3PostgresFixtureAuthority(db, async (tx) => {
+    await tx.agency.create({ data: { id: agencyId, name: `Phase3 ${id}` } });
+    await tx.user.create({ data: { id: userId, email: `${userId}@example.test`, passwordHash: "integration" } });
+    const member = await tx.agencyMember.create({ data: {
+      id: memberId, agencyId, userId, role: "OWNER", roleKey: "owner",
+    } });
+    const accessEpoch = Number(member.accessEpoch);
+    if (!Number.isSafeInteger(accessEpoch) || accessEpoch < 1) {
+      throw Object.assign(new Error("Phase3 actor fixture has no persisted access epoch"), { code: "PHASE3_POSTGRES_FIXTURE_ACCESS_EPOCH_REQUIRED" });
+    }
+    return { agencyId, userId, memberId, accessEpoch };
+  });
+}
+
 async function drainPhase3PostgresAgencyDomainWork(tx, agencyId) {
   // Phase3 fixture agencies are isolated and disposable. Drain operational work
   // before Creator identities in one set-based statement, matching production
@@ -292,6 +315,7 @@ module.exports = {
   auditSchemaFromDatabaseUrl,
   pinPhase3AuditSchema,
   withPhase3PostgresFixtureAuthority,
+  createPhase3PostgresActorFixture,
   drainPhase3PostgresAgencyDomainWork,
   resolvePhase3PostgresDestructiveFixtureAuthority,
   installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority,

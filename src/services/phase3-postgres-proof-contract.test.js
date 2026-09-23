@@ -192,8 +192,93 @@ test("Phase3 member proof tears down User through the same generation-fenced fix
   const source = fs.readFileSync(path.join(ROOT, "src/services/phase3-a34-source-scale-closure.integration.test.js"), "utf8");
   assert.match(source, /cleanupPhase3PostgresFixtureGraph\(dbA, \{ agencyId, userIds: \[userId\] \}\)/);
   assert.doesNotMatch(source, /dbA\.user\.deleteMany/);
-  assert.equal((source.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 2);
+  assert.equal((source.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 3);
   assert.doesNotMatch(source, /SELECT pg_sleep/);
+});
+
+function actorFixtureAdapter({ failMember = false, accessEpoch = 7 } = {}) {
+  const committed = [];
+  let transactions = 0;
+  const db = { async $transaction(work) {
+    transactions += 1;
+    const draft = [];
+    const tx = {
+      agency: { create: async ({ data }) => { draft.push({ kind: "agency", ...data }); return data; } },
+      user: { create: async ({ data }) => { draft.push({ kind: "user", ...data }); return data; } },
+      agencyMember: { create: async ({ data }) => {
+        assert.ok(draft.some((row) => row.kind === "agency" && row.id === data.agencyId), "member needs its real parent agency");
+        assert.ok(draft.some((row) => row.kind === "user" && row.id === data.userId), "member needs its real parent user");
+        if (failMember) throw Object.assign(new Error("member creation failed"), { code: "FIXTURE_MEMBER_FAILED" });
+        const row = { kind: "member", ...data, accessEpoch };
+        draft.push(row);
+        return row;
+      } },
+    };
+    const result = await work(tx);
+    committed.push(...draft);
+    return result;
+  } };
+  return { db, committed, transactions: () => transactions };
+}
+
+test("Phase3 actor fixture commits one owned Agency/User/Member graph and uses persisted accessEpoch", async () => {
+  const { createPhase3PostgresActorFixture } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+  const state = actorFixtureAdapter();
+  const actor = await createPhase3PostgresActorFixture(state.db, "actor-fixture");
+  assert.equal(state.transactions(), 1);
+  assert.equal(state.committed.length, 3);
+  assert.deepEqual(actor, { agencyId: "actor-fixture-agency", userId: "actor-fixture-user", memberId: "actor-fixture-member", accessEpoch: 7 });
+});
+
+test("Phase3 actor fixture does not leave Agency/User roots after member setup failure", async () => {
+  const { createPhase3PostgresActorFixture } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+  const state = actorFixtureAdapter({ failMember: true });
+  await assert.rejects(createPhase3PostgresActorFixture(state.db, "broken-actor"), { code: "FIXTURE_MEMBER_FAILED" });
+  assert.deepEqual(state.committed, []);
+});
+
+test("Phase3 actor fixture rejects missing persisted authority instead of manufacturing accessEpoch", async () => {
+  const { createPhase3PostgresActorFixture } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+  const state = actorFixtureAdapter({ accessEpoch: null });
+  await assert.rejects(createPhase3PostgresActorFixture(state.db, "broken-epoch"), { code: "PHASE3_POSTGRES_FIXTURE_ACCESS_EPOCH_REQUIRED" });
+  assert.deepEqual(state.committed, []);
+  await assert.rejects(createPhase3PostgresActorFixture(state.db, ""), { code: "PHASE3_POSTGRES_FIXTURE_PREFIX_REQUIRED" });
+  assert.equal(state.transactions(), 1);
+});
+
+test("Phase3 block observer requires actual blocking PIDs rather than an elapsed sleep", async () => {
+  const { waitForPhase3PostgresBlock } = require("../../scripts/test-support/phase3-postgres-lock-wait");
+  let calls = 0;
+  const db = { async $queryRawUnsafe(sql, holder, waiter) {
+    assert.match(sql, /pg_blocking_pids/);
+    assert.deepEqual([holder, waiter], [101, 202]);
+    return [{ blocked: ++calls > 1, authorityNow: new Date() }];
+  } };
+  assert.equal((await waitForPhase3PostgresBlock({ db, holderPid: 101, waiterPid: 202 })).blocked, true);
+  assert.equal(calls, 2);
+});
+
+test("Phase3 block observer fails closed on absent overlap, invalid PIDs and query failure", async () => {
+  const { waitForPhase3PostgresBlock } = require("../../scripts/test-support/phase3-postgres-lock-wait");
+  const db = { $queryRawUnsafe: async () => [{ blocked: false }] };
+  await assert.rejects(waitForPhase3PostgresBlock({ db, holderPid: 1, waiterPid: 2, timeoutMs: 1 }), { code: "PHASE3_PROOF_LOCK_WAIT_NOT_OBSERVED" });
+  await assert.rejects(waitForPhase3PostgresBlock({ db, holderPid: 1, waiterPid: 1 }), { code: "PHASE3_PROOF_LOCK_PIDS_INVALID" });
+  await assert.rejects(waitForPhase3PostgresBlock({ db, holderPid: 1, waiterPid: 2, timeoutMs: Infinity }), { code: "PHASE3_PROOF_LOCK_TIMEOUT_INVALID" });
+  const error = new Error("observer disconnected");
+  await assert.rejects(waitForPhase3PostgresBlock({ db: { $queryRawUnsafe: async () => { throw error; } }, holderPid: 1, waiterPid: 2 }), (actual) => actual === error);
+});
+
+test("Phase3 lease deadline waits through executeRaw and cannot decode PostgreSQL void", async () => {
+  const { waitUntilPhase3DatabaseTime } = require("../../scripts/test-support/phase3-postgres-lock-wait");
+  const deadline = new Date();
+  let calls = 0;
+  const tx = {
+    $queryRawUnsafe: async () => assert.fail("pg_sleep must not use queryRaw"),
+    $executeRawUnsafe: async (sql, value) => { assert.match(sql, /pg_sleep/); assert.equal(value, deadline); calls += 1; },
+  };
+  await waitUntilPhase3DatabaseTime(tx, deadline);
+  assert.equal(calls, 1);
+  await assert.rejects(waitUntilPhase3DatabaseTime(tx, new Date(NaN)), { code: "PHASE3_PROOF_LEASE_DEADLINE_INVALID" });
 });
 
 for (const exact of [false, true]) {

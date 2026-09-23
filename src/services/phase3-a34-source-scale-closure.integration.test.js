@@ -12,7 +12,9 @@ test("A36 PostgreSQL: Analytics expiry fences progress and settlement while rest
   const dbB = new PrismaClient();
   const key = nonce("a36-analytics-lease");
   const demandKey = `${key}-demand`;
+  let actor = null;
   try {
+    actor = await createPhase3PostgresActorFixture(dbA, key);
     const [{ authorityNow }] = await dbA.$queryRawUnsafe('SELECT clock_timestamp() AS "authorityNow"');
     const past = new Date(authorityNow.getTime() - 1000);
     const originalTime = new Date(authorityNow.getTime() - 2 * 60 * 60 * 1000);
@@ -32,11 +34,19 @@ test("A36 PostgreSQL: Analytics expiry fences progress and settlement while rest
     assert.equal(await planner.completeAnalyticsSweepCycle(stale), false);
     assert.equal(await planner.completeAnalyticsSweepCycle({ db: dbB, leaseKey: key, ...recovered }), true);
 
-    const demand = await dbA.analyticsCollectionDemand.create({ data: {
-      key: demandKey, agencyId: `${key}-agency`, rangeKey: "7d", coverageFrom: originalTime, coverageTo: authorityNow,
-      reason: "INTERACTIVE_REFRESH", requestedByMemberId: `${key}-member`, requestedAccessEpoch: 1,
+    const demandData = {
+      key: demandKey, agencyId: actor.agencyId, rangeKey: "7d", coverageFrom: originalTime, coverageTo: authorityNow,
+      reason: "INTERACTIVE_REFRESH", requestedByMemberId: actor.memberId, requestedAccessEpoch: actor.accessEpoch,
       requestedAt: authorityNow, requestRevision: 1, claimedRevision: 1, claimToken: "expired-demand", claimUntil: past,
-    } });
+    };
+    // Prisma has no @relation here. Prove that the migration-owned lifecycle
+    // trigger still rejects an orphan; fixing a fixture must never disable it.
+    await assert.rejects(
+      () => dbA.analyticsCollectionDemand.create({ data: { ...demandData, key: `${demandKey}-orphan`, agencyId: `${key}-missing-agency` } }),
+      (error) => error?.code === "P2003" || error?.meta?.code === "23503",
+      "an Analytics demand must not outlive its Agency identity",
+    );
+    const demand = await dbA.analyticsCollectionDemand.create({ data: demandData });
     const before = await dbA.analyticsCollectionDemand.findUnique({ where: { key: demandKey } });
     assert.equal(await planner.renewAnalyticsDemandLease({ db: dbA, ...demand }), false);
     for (const error of [null, Object.assign(new Error("bad range"), { code: "ANALYTICS_DEMAND_RANGE_INVALID" })]) {
@@ -52,8 +62,15 @@ test("A36 PostgreSQL: Analytics expiry fences progress and settlement while rest
     console.log("# A36_ANALYTICS_COORDINATOR_EXPIRY_CONTINUITY_PASS");
   } finally {
     try {
-      await dbA.analyticsCollectionDemand.deleteMany({ where: { key: demandKey } });
-      await dbA.analyticsCollectionLease.deleteMany({ where: { key } });
+      try {
+        await dbA.analyticsCollectionDemand.deleteMany({ where: { key: { in: [demandKey, `${demandKey}-orphan`] } } });
+      } finally {
+        try {
+          await dbA.analyticsCollectionLease.deleteMany({ where: { key } });
+        } finally {
+          if (actor) await cleanupPhase3PostgresFixtureGraph(dbA, { agencyId: actor.agencyId, userIds: [actor.userId] });
+        }
+      }
     } finally {
       await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect()]);
     }
@@ -62,10 +79,12 @@ test("A36 PostgreSQL: Analytics expiry fences progress and settlement while rest
 const {
   pinPhase3AuditSchema,
   withPhase3PostgresFixtureAuthority,
+  createPhase3PostgresActorFixture,
   cleanupPhase3PostgresAgencyFixture,
   cleanupPhase3PostgresFixtureGraph,
 } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 const { runPhase3InterleavedTransactions } = require("../../scripts/test-support/phase3-interleaved-transactions");
+const { waitForPhase3PostgresBlock, waitUntilPhase3DatabaseTime } = require("../../scripts/test-support/phase3-postgres-lock-wait");
 const {
   TOPOLOGY_ID: DOMAIN_WORK_CLAIM_TOPOLOGY_ID,
   activateTopology: activateDomainWorkClaimTopology,
@@ -86,6 +105,92 @@ if (enabled) {
 function nonce(prefix) {
   return `${prefix}-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}`;
 }
+
+test("A36 PostgreSQL: Analytics renew and settlement reject leases that expire during an observed row-lock wait", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const planner = require("./analytics-collection-planner");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const observer = new PrismaClient();
+  const key = nonce("a36-analytics-lock-wait");
+  const demandKey = `${key}-demand`;
+  let actor = null;
+  try {
+    actor = await createPhase3PostgresActorFixture(dbA, key);
+    const [{ authorityNow }] = await dbA.$queryRawUnsafe('SELECT clock_timestamp() AS "authorityNow"');
+    const cycleKey = planner.sweepCycleKey(authorityNow);
+    await dbA.analyticsCollectionLease.create({ data: {
+      key, ownerToken: "waiting-owner", cycleKey, cycleNow: authorityNow, leaseUntil: authorityNow,
+    } });
+    await dbA.analyticsCollectionDemand.create({ data: {
+      key: demandKey, agencyId: actor.agencyId, rangeKey: "7d", coverageFrom: authorityNow, coverageTo: authorityNow,
+      reason: "INTERACTIVE_REFRESH", requestedByMemberId: actor.memberId, requestedAccessEpoch: actor.accessEpoch,
+      requestedAt: authorityNow, claimedRevision: 1, claimToken: "waiting-owner", claimUntil: authorityNow,
+    } });
+    for (const operation of ["sweep-renew", "sweep-complete", "demand-renew", "demand-settle"]) {
+      let holderPid;
+      let waiterPid;
+      let outcome;
+      if (operation.startsWith("sweep-")) {
+        await dbA.$executeRawUnsafe('UPDATE "AnalyticsCollectionLease" SET "leaseUntil" = clock_timestamp() + interval \'1 minute\' WHERE "key"=$1', key);
+      } else {
+        await dbA.$executeRawUnsafe('UPDATE "AnalyticsCollectionDemand" SET "claimUntil" = clock_timestamp() + interval \'1 minute\' WHERE "key"=$1', demandKey);
+      }
+      await runPhase3InterleavedTransactions({
+        dbA, dbB,
+        firstA: async (tx) => {
+          [{ pid: holderPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid');
+          if (operation.startsWith("sweep-")) {
+            await tx.$queryRawUnsafe('SELECT "key" FROM "AnalyticsCollectionLease" WHERE "key"=$1 FOR UPDATE', key);
+          } else {
+            await tx.$queryRawUnsafe('SELECT "key" FROM "AnalyticsCollectionDemand" WHERE "key"=$1 FOR UPDATE', demandKey);
+          }
+        },
+        firstB: async (tx) => { [{ pid: waiterPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid'); },
+        secondA: async (tx) => {
+          await waitForPhase3PostgresBlock({ db: observer, holderPid, waiterPid });
+          // Arm expiry only AFTER PostgreSQL proves the wait. Any clock sampled
+          // before the blocked lock is older than this deadline. This does not
+          // depend on two clients getting scheduled within an arbitrary interval.
+          const rows = operation.startsWith("sweep-")
+            ? await tx.$queryRawUnsafe('UPDATE "AnalyticsCollectionLease" SET "leaseUntil" = clock_timestamp() + interval \'100 milliseconds\' WHERE "key"=$1 RETURNING "leaseUntil" AS deadline', key)
+            : await tx.$queryRawUnsafe('UPDATE "AnalyticsCollectionDemand" SET "claimUntil" = clock_timestamp() + interval \'100 milliseconds\' WHERE "key"=$1 RETURNING "claimUntil" AS deadline', demandKey);
+          await waitUntilPhase3DatabaseTime(tx, rows[0].deadline);
+        },
+        secondB: async (tx) => {
+          const claim = { db: tx, leaseKey: key, ownerToken: "waiting-owner", cycleKey, cursorCreatorId: "must-not-commit" };
+          if (operation === "sweep-renew") outcome = await planner.renewAnalyticsSweepLease(claim);
+          if (operation === "sweep-complete") outcome = await planner.completeAnalyticsSweepCycle(claim);
+          if (operation === "demand-renew") outcome = await planner.renewAnalyticsDemandLease({ db: tx, key: demandKey, claimToken: "waiting-owner", claimedRevision: 1, cursorCreatorId: "must-not-commit" });
+          if (operation === "demand-settle") outcome = (await planner.settleAnalyticsDemand({ db: tx, demand: { key: demandKey, claimToken: "waiting-owner", claimedRevision: 1 } })).settled;
+        },
+      });
+      assert.equal(outcome, false, `${operation} must reject expiry after waiting`);
+      const lease = await dbA.analyticsCollectionLease.findUnique({ where: { key } });
+      const demand = await dbA.analyticsCollectionDemand.findUnique({ where: { key: demandKey } });
+      assert.equal(lease.completedAt, null);
+      assert.equal(lease.cursorCreatorId, null);
+      assert.equal(demand.completedAt, null);
+      assert.equal(demand.cursorCreatorId, null);
+      assert.equal(demand.claimToken, "waiting-owner");
+    }
+    console.log("# A36_ANALYTICS_OBSERVED_LOCK_WAIT_EXPIRY_PASS");
+  } finally {
+    try {
+      try {
+        await dbA.analyticsCollectionDemand.deleteMany({ where: { key: demandKey } });
+      } finally {
+        try {
+          await dbA.analyticsCollectionLease.deleteMany({ where: { key } });
+        } finally {
+          if (actor) await cleanupPhase3PostgresFixtureGraph(dbA, { agencyId: actor.agencyId, userIds: [actor.userId] });
+        }
+      }
+    } finally {
+      await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect(), observer.$disconnect()]);
+    }
+  }
+});
 
 async function withTeamGeneration(db, workFn) {
   return db.$transaction(async (tx) => {

@@ -1,81 +1,136 @@
-ONLINOD / PHASE 3 — RECOVERY CHECKPOINT, 2026-09-23
-Status: closure continues. SOURCE OPEN. SCALE OPEN.
+ONLINOD / PHASE 3 — CUMULATIVE RECOVERY CHECKPOINT, 2026-09-23
+STAGE: Analytics coordinator proof / tenant lifecycle and observed lock wait.
+SOURCE OPEN. SCALE OPEN. PHASE 3 NOT CLOSED.
 
-BASE ACTUAL
-onlinod-backend-main - 2026-09-23T155943.875.zip
-SHA256: ef61552692436a3ee989a8b387221d0ecc946d0aae07532ecbd869cb2348bb7f
-All changes in this ZIP are cumulative against that exact Backend.
-No deletions. Preserve relative paths when applying over the Backend root.
-No Desktop, dependency, schema or migration changes.
+INSTALL VERDICT
+Candidate for the existing Render deploy gate: YES.
+Accepted as a completed Phase 3 release: NO; physical reproof remains pending.
+Command: npm install && npm run audit:phase3-a29-render
+This is the deploy gate, including primary migrations after disposable proof.
+Expected next run: 87/87 offline; 62/62 clean, rolling and seeded, no skips/leaks;
+successful disposable cleanup, then primaryMigrationStatus=0 and gate ok=true.
 
-PREVIOUS PROOF ACCEPTED
-Render checkout: 2367e87b7f6bdfb35159413c6f585c5408fb2df6
-Previous source: 40/40 offline; 60/60 in each of three PostgreSQL scenarios.
-180/180 physical checks, no fixture leaks, primary migrations and live service OK.
-This is evidence for the preceding actual, not for the new change.
+AUTHORITATIVE INPUT
+Backend: onlinod-backend-main - 2026-09-23T165243.399.zip
+SHA256: 11f706640942bd522d5849983b8bcab858d22bd80a1855af91c5c103fca1f3d6
+1390 ZIP entries / 1101 files; path/symlink/CRC validation passed.
+Byte-identical to the preceding Analytics coordinator implementation.
+Log: Вставленных ​​уценки (2)(20260923-135254).md
+SHA256: 7f1770c8f1e624179f70611c1230c2a8665c2d0d3d67d2d83de1ccb1ba4cf6f7
+The supplied log does not identify the checkout hash; none is inferred.
 
-IMPLEMENTED IN THIS DELTA
-One shared coordinator protocol for Earnings, Creator Analytics and Home demand:
-* Row lock before PostgreSQL clock/state sampling for all claim/progress/settle writers.
-* Expired ownership cannot renew, commit a cursor, complete, backoff or quarantine.
-* Demand claim re-reads the selected candidate after obtaining the row lock.
-* Restart across UTC-hour boundaries retains unfinished cycle/time/cursor.
-* Home sweep reports failed processing/claim loss as degradation, not ok=true.
-* Real PostgreSQL clock remains authoritative; explicit times are adapter fallbacks.
-* Added physical expiry/takeover test; extended pre-DB contract gate and pinned manifest.
+LATEST RENDER RESULT — NOT A GREEN BUILD
+Offline 81/81 passed.
+Physical clean/rolling/seeded: each 60 pass, 1 fail, 0 skip; 180/183 total.
+All failures were the newly added Analytics expiry/takeover test.
+All previously existing 60 physical tests passed in all three scenarios.
+Fixture leak checks and disposable cleanup passed.
+The failed proof stopped the gate before primary migration/deployment.
 
-VERIFIED LOCALLY
-Node 24.19.0 / Prisma 5.22.0; Render previously used Node 22.23.2.
-Regression reproduction before implementation: 31 tests, 21 pass, 10 fail.
-Planner after implementation: 31/31 pass.
-Extended targeted set: 80/80 pass.
-Final exact A29 CONTRACT_PROOFS: 81/81 pass, no skips.
-Changed-JS syntax/no-undef: 89 files, pass.
-Prisma source contracts: 360 files, 0 violations.
-Full suite before: 3183 tests, 2971 pass, 103 fail, 109 skip.
-Full suite after: 3193 tests, 2980 pass, 103 fail, 110 skip.
-All 103 failure names match the baseline; zero new failures.
-Additional skip is the new PostgreSQL integration test with no local database.
-Full suite is NOT green. Existing unrelated failures are not treated as resolved.
+EXACT CAUSE
+The new proof created AnalyticsCollectionDemand using an invented agencyId.
+Although schema.prisma has no @relation for that model, migration-installed
+phase2_non_fk_tenant_insert_fence invokes
+phase2_fence_non_fk_tenant_insert_during_agency_delete.
+It raises SQLSTATE 23503 / PHASE2_AGENCY_IDENTITY_ABSENT for a missing Agency.
+Prisma presents this as a foreign-key violation with unavailable constraint name.
+The original migration is 20260911170000; A36 replaces the function in
+20260922183000 while retaining the AnalyticsCollectionDemand trigger.
+The invented member was also an invalid actor fixture, but the log failure is
+specifically the Agency identity guard. This was an error in the preceding proof,
+not evidence that the earlier production lease corrections failed.
+DMMF enum/void preflight cannot certify migration-installed lifecycle triggers.
 
-PHYSICAL PROOF PENDING
-Local PostgreSQL / DATABASE_URL unavailable. New physical test not executed here.
-Manifest A36-R3: 13 files, 61 tests per scenario, 183 total.
-SHA256 canonical files JSON:
-eee216ba1f281ad6d43edebe784f59ef60418e1e2451d5e353bf115bcff8ecf8
-All previous 60 physical tests remain required.
-Render command unchanged: npm install && npm run audit:phase3-a29-render
-This gate runs disposable proof before primary DB migrations; it is a deploy command.
-Expected: offline 81/81; physical clean/rolling/seeded each 61/61, no skips/leaks;
-then successful disposable cleanup and primaryMigrationStatus=0 / gate ok=true.
+IMPLEMENTED NOW
+1. Shared createPhase3PostgresActorFixture creates Agency, User and Member in one
+   generation-admitted, schema-pinned transaction and returns persisted accessEpoch.
+   Member/setup failure rolls back the entire graph.
+2. Analytics proof uses those real identities. Teardown removes owned demands and
+   leases before the exact-claim/generation-fenced Agency/User graph cleanup.
+   Nested cleanup still attempts subsequent stages and disconnects all clients.
+3. A negative physical assertion requires missing-Agency demand creation to fail.
+   No trigger, FK, lifecycle guard or production authority is disabled.
+4. New physical test proves expiry during an observed row-lock wait for sweep
+   renewal/completion and demand renewal/settlement. Two independent transactions
+   plus a third observer use pg_blocking_pids to prove the actual wait.
+   The holder arms a DB deadline only after blocking is observed, waits past that
+   deadline through executeRaw, commits, and the waiting operation must reject.
+   The waiter must not commit a cursor/completion or clear the live claim token.
+5. A bounded observer rejects absent overlap, invalid PIDs/timeouts and query errors.
+   Existing two-sided barrier waits for both transaction outcomes before cleanup.
+6. Six offline regressions cover fixture atomicity/persisted authority and the
+   observation/timing protocol. Existing A29 pre-DB contract gate runs them.
+   Source guards and pinned physical manifest were updated for the additional test.
 
-DO NOT MARK CLOSED: FRESH-SOURCE SCALE BLOCKERS
-1. runAnalyticsCollectionSweep: all READY creators under one global coordinator.
-2. runCreatorAnalyticsCatchupSweep: all READY creators; individual failures still
-   advance the cursor and can end as ok=true without separate durable retry debt.
-3. selectCampaignDirectoryDiscoveryAdmissions: can scan all due candidates while
-   skipping busy creators; no durable continuation for a scan budget.
-4. processAnalyticsDemand: one Home request can process an entire agency in one call.
-5. readCanonicalCapacityInputs: global current-state aggregates in capacity refresh.
-6. These Analytics lanes precede remaining recurring work in one sequential sweep.
+PRECEDING PRODUCTION CORRECTIONS REMAIN IN THIS ACTUAL
+All coordinator writers lock their row before sampling DB clock/current state.
+Expired ownership cannot renew, advance a cursor, complete, backoff or quarantine.
+Demand claims re-read their selected candidate after obtaining the row lock.
+UTC-hour rollover preserves unfinished cycleKey/cycleNow/cursor on takeover.
+Home sweep reports processing failure/claim loss as degradation rather than ok=true.
+These production files are unchanged by this delta; no broader runtime rewrite is
+mixed into the repair of the proof that must validate them.
 
-NEXT COHESIVE IMPLEMENTATION — SAME PHASE 3 AUDIT
-Design and cut over these connected lanes to durable per-creator/domain due work:
-bounded claims and planning chunks, ownership-fenced commits, per-agency fairness,
-durable retries/backoff/quarantine, lifecycle wake/cancel, resumable backfill,
-online generation rollout, explicit removal of old global planners, incremental
-rebuildable capacity projections and bounded repair. Validate existing DomainWorkItem
-fit and planner transaction boundaries before implementing that cutover.
-Do not cap the existing loops without durable continuation; it would starve the tail.
-Do not retain a second global scheduling authority alongside the new queue.
+VALIDATION
+Local Node 24.19.0 / Prisma 5.22.0; not a substitute for Render Node 22.
+Exact A29 CONTRACT_PROOFS: 87 tests, 87 pass, 0 fail, 0 skip.
+Syntax/no-undef gate: 90 files, pass.
+Prisma enum/void source contracts: 361 files, 0 violations.
+Full suite before: 3193 tests, 2980 pass, 103 fail, 110 skip.
+Full suite after: 3200 tests, 2986 pass, 103 fail, 111 skip.
+All 103 failure names match; no new or removed failures.
+The additional skip is the new PostgreSQL test without a local database.
+Existing full-suite failures remain OPEN; the entire suite is not green.
+Actual registered physical test names/order match the pinned manifest.
+A36-R4: 13 physical files, 62 tests/scenario, 186 total.
+Canonical manifest SHA256:
+6af388fb74c71ac383e806c5686e176c62f40b8f57f7ff96e77ad4f0dd5f1967
+All preceding 61 physical tests remain mandatory.
+Local PostgreSQL / DATABASE_URL unavailable; corrected/new physical tests were
+not executed here. Render confirmation is still required.
 
-Closure evidence still needed: PostgreSQL enqueue/claim/settle interleavings and
-expiry during row-lock wait; planner commit fencing; 100 workers/multi-replica;
-many agencies times many creators; bounded scan work and per-agency wait;
-large history, lifecycle isolation, restart and partial failure convergence.
-Previous scale fixtures cover 1000 agencies x 4 creators and separately
-4 agencies x 1000 creators; they do not establish the large product of both axes.
+RECONSTRUCTION / DELIVERY
+Archive contains only changed/new files relative to the exact 16:52 actual above.
+Apply preserving relative paths over the Backend root. No files are deleted.
+CRC and byte-for-byte overlay reconstruction are verified during packaging.
+No production runtime, schema, migration, dependency or Desktop changes in this
+delta. Prior production lease changes are already in the supplied full actual.
+This checkpoint replaces the preceding TXT checkpoint; no earlier delta is needed
+in addition to the specified base and this archive.
 
-Detailed source map and architecture boundary:
-docs/PHASE3_CLOSURE_CHECKPOINT_20260923.md
-Keep the existing master roadmap active; next domain has not been started.
+REMAINING ANALYTICS SOURCE / SCALE BLOCKERS — SAME AUDIT
+* runAnalyticsCollectionSweep: all READY creators under one global coordinator.
+* runCreatorAnalyticsCatchupSweep: global creator traversal; per-creator failures
+  advance the cursor without separate durable retry debt and can end as ok=true.
+* selectCampaignDirectoryDiscoveryAdmissions: may scan all due rows when busy
+  candidates are skipped; lacks a durable continuation for a scan budget.
+* processAnalyticsDemand: one Home request can traverse an entire agency per call.
+* readCanonicalCapacityInputs: global aggregates over current demand/job/state.
+* Sequential Analytics lanes delay the rest of the recurring scheduler.
+* Whole-suite contract drift still needs reconciliation against current authorities.
+
+NEXT COHESIVE IMPLEMENTATION
+First accept corrected physical coordinator proof. Then cut over the connected
+Analytics planners to durable per-creator/domain due work: bounded claims/chunks,
+ownership-fenced planning commits, fair agency admission, durable retry/backoff/
+quarantine, lifecycle wake/cancel, resumable existing-data backfill and generation
+rollout. Retire old global planners in the same implementation. Capacity needs
+incremental rebuildable projections and bounded repair. Validate DomainWorkItem
+fit and transaction/lock boundaries before implementation.
+Do not cap existing loops without durable continuation or leave parallel writers.
+
+SCALE CLOSURE EVIDENCE STILL NEEDED
+Thousands of agencies with thousands of creators each, mixed workloads, large
+history, 100 workers, multiple replicas; bounded scanned rows, queries and locks;
+per-agency/creator isolation and maximum wait; restart/partial failure recovery;
+planning commit fencing and concurrent enqueue/claim/settlement.
+Existing 1000 agencies x 4 creators and separately 4 agencies x 1000 creators do
+not establish the large product of both axes.
+
+MASTER ROADMAP
+Remain in Phase 3 / Analytics authority consolidation.
+Render proof fixture repair: IMPLEMENTED / PHYSICAL REPROOF PENDING.
+Coordinator ownership: IMPLEMENTED / COMPLETE PHYSICAL PROOF PENDING.
+Global planning and capacity scale: OPEN.
+No next functional domain started. Resweep after shared queue/schema/access cutover.
+Detailed current/history source map: docs/PHASE3_CLOSURE_CHECKPOINT_20260923.md

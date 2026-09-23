@@ -18,6 +18,7 @@ const DEFAULT_FILES = Object.freeze([
   "scripts/audit/phase3-postgres-identifier-lint.js",
   "scripts/audit/phase3-prisma-source-contract.js",
   "scripts/test-support/phase3-interleaved-transactions.js",
+  "scripts/test-support/phase3-postgres-lock-wait.js",
   "scripts/maintenance/phase3-subscriber-maintenance-signals.js",
   "scripts/maintenance/dedupe-deliveries.js",
   "scripts/maintenance/purge-stuck-deliveries.js",

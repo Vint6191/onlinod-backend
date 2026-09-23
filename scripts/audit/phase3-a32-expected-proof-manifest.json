@@ -1,8 +1,8 @@
 {
-  "version": "A36-R3",
+  "version": "A36-R4",
   "algorithm": "sha256-canonical-json-files-v1",
-  "testCount": 61,
-  "manifestSha256": "eee216ba1f281ad6d43edebe784f59ef60418e1e2451d5e353bf115bcff8ecf8",
+  "testCount": 62,
+  "manifestSha256": "6af388fb74c71ac383e806c5686e176c62f40b8f57f7ff96e77ad4f0dd5f1967",
   "files": [
     {
       "file": "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js",
@@ -112,6 +112,7 @@
       "file": "src/services/phase3-a34-source-scale-closure.integration.test.js",
       "testNames": [
         "A36 PostgreSQL: Analytics expiry fences progress and settlement while restart preserves the unfinished cycle",
+        "A36 PostgreSQL: Analytics renew and settlement reject leases that expire during an observed row-lock wait",
         "A34 PostgreSQL: Hidden status command, projection rollback and concurrent writers converge atomically",
         "A34 PostgreSQL: 4000 creators publish bounded fair work and two replicas claim disjoint batches",
         "A36 PostgreSQL: scoped member claims 1000 of 2000 creators through fixed shards without enumerating scope",

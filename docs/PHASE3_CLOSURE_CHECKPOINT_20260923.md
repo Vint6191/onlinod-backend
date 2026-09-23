@@ -1,4 +1,33 @@
-# Phase 3 — текущий checkpoint: Analytics coordinator, 2026-09-23
+# Phase 3 — текущий checkpoint: Analytics proof lifecycle, 2026-09-23
+
+**SOURCE OPEN / SCALE OPEN.** Статус установки: кандидат через существующий Render gate; завершённым релизом Phase 3 не является. Полный актуальный recovery checkpoint — `PHASE3_ANALYTICS_COORDINATOR_CHECKPOINT_20260923.txt` в этой папке.
+
+Текущий actual: `onlinod-backend-main - 2026-09-23T165243.399.zip`, SHA-256 `11f706640942bd522d5849983b8bcab858d22bd80a1855af91c5c103fca1f3d6`. Побайтово совпадает с предыдущим изменением Analytics coordinator. Присланный лог `Вставленных ​​уценки (2)(20260923-135254).md` (SHA-256 `7f1770c8f1e624179f70611c1230c2a8665c2d0d3d67d2d83de1ccb1ba4cf6f7`) фиксирует 81/81 offline и по 60 pass / 1 fail во всех трёх физических сценариях. Везде падает только добавленный Analytics test. Утечек fixtures нет, disposable cleanup успешен; primary deploy заблокирован gate.
+
+## Причина и граница исправления
+
+Предыдущий proof ошибочно создавал demand с несуществующей Agency. Связь не представлена Prisma `@relation`: её обеспечивает миграционный `phase2_non_fk_tenant_insert_fence`. Функция `phase2_fence_non_fk_tenant_insert_during_agency_delete` выдаёт SQLSTATE 23503 / `PHASE2_AGENCY_IDENTITY_ABSENT`, который Prisma показывает как FK error с неизвестным constraint. Это ошибка предыдущего test fixture. Проверка DMMF не заменяет полный контракт миграций и триггеров.
+
+Теперь общий fixture helper атомарно создаёт Agency → User → Member через generation admission/schema pin и возвращает сохранённый accessEpoch. Исходный test использует эти identities, cleanup проходит через действующую destructive authority после удаления demand/lease. Отдельное negative assertion сохраняет требование отклонять demand без Agency; ограничения БД не ослаблены.
+
+Добавлен физический сценарий для четырёх операций: sweep renew/complete и demand renew/settle. Первая транзакция держит строку, вторая выполняет реальный production-вызов, третий Prisma client подтверждает блокировку через `pg_blocking_pids`. Только после подтверждения первая транзакция устанавливает короткий DB deadline, ждёт его истечения и коммитит. Вторая должна вернуть отказ и оставить cursor/completion/token неизменными. Тайминг не используется вместо доказательства пересечения; обе транзакции завершаются до teardown.
+
+Production runtime, schema, migrations, dependencies и Desktop в этом delta не менялись. Предыдущая реализация row lock → DB clock → live ownership transition сохраняется и должна пройти восстановленный physical proof. Глобальные planning/scale блокеры из предыдущего checkpoint остаются открытыми.
+
+## Валидация и приёмка
+
+- A29 offline contract gate: **87/87 pass**, 0 skip. Добавлено 6 regressions для атомарного fixture и протокола наблюдаемой блокировки.
+- Syntax/no-undef: **90 файлов**, Prisma literal enum/void contract scan: **361 файл**, 0 нарушений.
+- Полный набор: **3200 tests, 2986 pass, 103 fail, 111 skip**. Все 103 имена падений совпадают с предыдущим actual; новых падений нет. Общий набор не зелёный.
+- Physical manifest: **A36-R4, 13 файлов, 62 теста на сценарий, 186 суммарно**. SHA-256 `6af388fb74c71ac383e806c5686e176c62f40b8f57f7ff96e77ad4f0dd5f1967`. Все прежние 61 проверка сохранены. Имена/порядок зарегистрированных тестов и hash проверены.
+- Реального PostgreSQL локально нет; исправленный и новый physical tests **не выполнены здесь**. Ожидание следующего Render: 62/62 во всех трёх сценариях, 0 skips/leaks, cleanup, primary migrations, gate ok=true.
+- Команда: `npm install && npm run audit:phase3-a29-render`. Изменять её или обходить gate не требуется.
+
+Master roadmap: тот же Phase 3 audit продолжается. Сначала восстановить полное физическое доказательство coordinator, затем согласованный cutover глобальных Earnings/Creator Analytics/Home/Campaign planners и capacity projection к ограниченной durable работе с fairness/retry/lifecycle. Требование масштаба — тысячи агентств с тысячами моделей у каждого, а не лишь 4000 creators на всю платформу.
+
+Ниже — история предыдущих checkpoint; их actual, числа и физические статусы относятся к тем итерациям. Текущие данные находятся выше и в TXT checkpoint.
+
+# История: Analytics coordinator implementation
 
 **SOURCE OPEN / SCALE OPEN.** Прежний Render blocker снят; обнаружены нарушения протокола владения и отдельный архитектурный блокер масштаба. Этот delta исправляет владение и восстановление. Он не объявляет Phase 3 закрытой.
 
