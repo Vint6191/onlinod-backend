@@ -1,27 +1,10 @@
-const bcrypt = require("bcryptjs");
+"use strict";
 const prisma = require("../src/prisma");
-
+const { bootstrapAdmin } = require("../src/services/admin-operator-bootstrap-service");
 async function main() {
-  const email = String(process.env.ADMIN_EMAIL || "").trim().toLowerCase();
-  const password = String(process.env.ADMIN_PASSWORD || "");
-  const name = String(process.env.ADMIN_NAME || "Onlinod Admin").trim();
-
-  if (!email || !password) {
-    console.error("Usage: ADMIN_EMAIL=you@example.com ADMIN_PASSWORD='strong-password' node scripts/create-admin-user.js");
-    process.exit(1);
-  }
-  if (password.length < 8) {
-    console.error("ADMIN_PASSWORD must be at least 8 characters");
-    process.exit(1);
-  }
-
-  const passwordHash = await bcrypt.hash(password, 12);
-  const admin = await prisma.adminUser.upsert({
-    where: { email },
-    create: { email, passwordHash, name, role: "SUPER_ADMIN", active: true },
-    update: { passwordHash, name, role: "SUPER_ADMIN", active: true },
-  });
-  console.log("Admin user ready:", { id: admin.id, email: admin.email, role: admin.role, active: admin.active });
+  // A retry must use the same ADMIN_COMMAND_ID, operator, reason and payload.
+  // Existing admin sessions are revoked atomically with credential rotation.
+  const result = await bootstrapAdmin({ db: prisma, commandId: process.env.ADMIN_COMMAND_ID, operator: process.env.ADMIN_OPERATOR, reason: process.env.ADMIN_REASON, email: process.env.ADMIN_EMAIL, password: process.env.ADMIN_PASSWORD, name: process.env.ADMIN_NAME || "Onlinod Admin" });
+  console.log("Admin user ready:", result);
 }
-
-main().catch((err) => { console.error(err); process.exit(1); }).finally(async () => prisma.$disconnect());
+main().catch(error => { console.error(error?.issues ? "Required: ADMIN_EMAIL, ADMIN_PASSWORD (8–72 UTF-8 bytes), ADMIN_OPERATOR, ADMIN_REASON, ADMIN_COMMAND_ID (stable UUID)." : (error.code || "ADMIN_BOOTSTRAP_FAILED")); process.exitCode = 1; }).finally(() => prisma.$disconnect());

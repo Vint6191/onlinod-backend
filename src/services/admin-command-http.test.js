@@ -1,0 +1,34 @@
+"use strict";
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
+const express = require("express");
+const { createMemoryDb } = require("../../scripts/test-support/admin-command-memory-db");
+const { createIdempotencyMiddleware } = require("../middleware/idempotency");
+
+test("both pricing HTTP aliases share receipts; revoked token cannot replay through process cache", async t => {
+  const m = createMemoryDb();
+  m.state.sessions[0].tokenHash = crypto.createHash("sha256").update("test-token").digest("hex");
+  const prismaPath = require.resolve("../prisma");
+  const original = require.cache[prismaPath];
+  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: m.db };
+  t.after(() => { if (original) require.cache[prismaPath] = original; else delete require.cache[prismaPath]; });
+  const { adminSessionRequired } = require("../middleware/admin-session");
+  const { setPricingHandler } = require("../routes/admin-command-handlers");
+  const app = express(); app.use(express.json()); app.use(createIdempotencyMiddleware());
+  app.patch("/api/admin/billing/creator/:id", adminSessionRequired, setPricingHandler);
+  app.patch("/api/admin/creators/:id/billing", adminSessionRequired, setPricingHandler);
+  const server = await new Promise(resolve => { const listener = app.listen(0, "127.0.0.1", () => resolve(listener)); });
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const commandId = crypto.randomUUID();
+  const send = (route, extra = {}) => fetch(origin + route, { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: "Bearer test-token", "Idempotency-Key": commandId }, body: JSON.stringify({ expectedRevision: 1, corePriceCents: 4500, reason: "HTTP correction", ...extra }) });
+  const first = await send("/api/admin/billing/creator/creator-a"); assert.equal(first.status, 200);
+  const body = await first.json();
+  const alias = await send("/api/admin/creators/creator-a/billing"); assert.equal(alias.status, 200); assert.equal(alias.headers.get("Idempotency-Replayed"), "true"); assert.deepEqual(await alias.json(), body);
+  assert.equal(m.state.audit.length, 1);
+  const invalid = await send("/api/admin/billing/creator/creator-a", { corePriceCents: "4500" }); assert.equal(invalid.status, 400);
+  await invalid.json();
+  m.state.sessions[0].revokedAt = m.clock;
+  const revoked = await send("/api/admin/billing/creator/creator-a"); assert.equal(revoked.status, 401); await revoked.json();
+});

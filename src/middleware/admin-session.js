@@ -1,5 +1,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
+const { KNOWN_ROLES } = require("../services/admin-session-authority-service");
 
 function sha256(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex");
@@ -23,11 +25,12 @@ async function adminSessionRequired(req, res, next) {
       include: { adminUser: true },
     });
 
-    if (!session || session.revokedAt || session.expiresAt < new Date()) {
+    const now = await dbAuthorityNow({ db: prisma });
+    if (!session || session.revokedAt || session.expiresAt <= now || session.issuedAccessEpoch !== session.adminUser?.accessEpoch) {
       return res.status(401).json({ ok: false, code: "ADMIN_AUTH_INVALID", error: "Invalid or expired admin session" });
     }
 
-    if (!session.adminUser?.active) {
+    if (!session.adminUser?.active || !KNOWN_ROLES.has(session.adminUser.role)) {
       return res.status(403).json({ ok: false, code: "ADMIN_DISABLED", error: "Admin user is disabled" });
     }
 

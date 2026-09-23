@@ -1,3 +1,4 @@
+const { setPricingHandler } = require("./admin-command-handlers");
 /* src/routes/admin-billing.js — Onlinod billing management
    ────────────────────────────────────────────────────────────
    Proper money view: subscription is on the AGENCY, but priced
@@ -182,6 +183,7 @@ router.get("/agency/:id", async (req, res) => {
         outreachPriceCents: Number(bp?.outreachPriceCents || ADDON_DEFAULTS.outreachPriceCents),
         billingExcluded: !!bp?.billingExcluded,
         hasProfile: !!bp,
+        pricingRevision: bp?.pricingRevision || 0,
         configuredLineCents: configuredLineCents(bp),
         activeLineCents: activePaidLineCents(c.billingEntitlement),
         entitlement: publicEntitlement(c.billingEntitlement),
@@ -205,43 +207,7 @@ router.get("/agency/:id", async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 // PATCH a single model's billing (create profile if missing)
 // ════════════════════════════════════════════════════════════════
-router.patch("/creator/:id", async (req, res) => {
-  try {
-    const creator = await prisma.creatorAccount.findUnique({ where: { id: req.params.id }, include: { billingProfile: true } });
-    if (!creator) return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND" });
-
-    const b = req.body || {};
-    const before = creator.billingProfile || null;
-
-    // If a tier is provided and price not explicitly set, take the tier's price.
-    let corePriceCents = before?.corePriceCents ?? TIERS.STARTER.priceCents;
-    if (b.tier && TIERS[b.tier] && b.corePriceCents == null && b.tier !== "CUSTOM") corePriceCents = TIERS[b.tier].priceCents;
-    if (b.corePriceCents != null) corePriceCents = Math.max(0, Math.min(1_000_000, Number(b.corePriceCents) || 0));
-
-    const data = {
-      tier: b.tier && TIERS[b.tier] ? b.tier : (before?.tier || "STARTER"),
-      tierMode: b.tierMode || before?.tierMode || "MANUAL",
-      corePriceCents,
-      aiChatterEnabled: b.aiChatterEnabled != null ? !!b.aiChatterEnabled : (before?.aiChatterEnabled ?? false),
-      aiChatterPriceCents: b.aiChatterPriceCents != null ? Math.max(0, Number(b.aiChatterPriceCents) || 0) : (before?.aiChatterPriceCents ?? ADDON_DEFAULTS.aiChatterPriceCents),
-      outreachEnabled: b.outreachEnabled != null ? !!b.outreachEnabled : (before?.outreachEnabled ?? false),
-      outreachPriceCents: b.outreachPriceCents != null ? Math.max(0, Number(b.outreachPriceCents) || 0) : (before?.outreachPriceCents ?? ADDON_DEFAULTS.outreachPriceCents),
-      billingExcluded: b.billingExcluded != null ? !!b.billingExcluded : (before?.billingExcluded ?? false),
-      notes: b.notes !== undefined ? b.notes : (before?.notes ?? null),
-    };
-
-    const billing = before
-      ? await prisma.creatorBillingProfile.update({ where: { creatorId: creator.id }, data })
-      : await prisma.creatorBillingProfile.create({ data: { agencyId: creator.agencyId, creatorId: creator.id, ...data } });
-
-    await adminLog(req, {
-      agencyId: creator.agencyId, action: "billing.creator_changed",
-      targetType: "creator", targetId: creator.id, before, after: billing, reason: b.reason || "billing update",
-    });
-
-    return res.json({ ok: true, billing, configuredLineCents: configuredLineCents(billing) });
-  } catch (err) { return sendErr(res, err); }
-});
+router.patch("/creator/:id", setPricingHandler);
 
 // ════════════════════════════════════════════════════════════════
 // BULK — apply a tier to ALL models of an agency at once

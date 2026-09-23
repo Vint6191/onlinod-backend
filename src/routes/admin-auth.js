@@ -1,61 +1,21 @@
+"use strict";
 const express = require("express");
-const crypto = require("node:crypto");
-const bcrypt = require("bcryptjs");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { adminSessionRequired } = require("../middleware/admin-session");
-
+const { loginAdmin, logoutAdmin } = require("../services/admin-session-authority-service");
+const { publicAdmin } = require("../services/admin-command-contract");
+const { sendCommandError } = require("./admin-command-handlers");
 const router = express.Router();
-const loginSchema = z.object({ email: z.string().email(), password: z.string().min(8) });
-
-function sha256(value) { return crypto.createHash("sha256").update(String(value || "")).digest("hex"); }
-function newToken() { return crypto.randomBytes(32).toString("base64url"); }
-
+// Login still accepts old long passwords; newly set credentials reject bcrypt truncation.
+const loginSchema = z.object({ email: z.string().trim().email().max(254), password: z.string().min(8).max(1024) }).strict();
 router.post("/login", async (req, res) => {
-  try {
-    const input = loginSchema.parse(req.body);
-    const email = input.email.trim().toLowerCase();
-    const admin = await prisma.adminUser.findUnique({ where: { email } });
-
-    if (!admin || !admin.active || !(await bcrypt.compare(input.password, admin.passwordHash))) {
-      return res.status(401).json({ ok: false, code: "ADMIN_AUTH_INVALID", error: "Invalid admin credentials" });
-    }
-
-    const token = newToken();
-    const expiresAt = new Date(Date.now() + Number(process.env.ADMIN_SESSION_DAYS || 7) * 86400000);
-
-    await prisma.adminSession.create({
-      data: {
-        adminUserId: admin.id,
-        tokenHash: sha256(token),
-        expiresAt,
-        ip: req.ip || null,
-        userAgent: req.headers["user-agent"] || null,
-      },
-    });
-
-    await prisma.adminUser.update({ where: { id: admin.id }, data: { lastLoginAt: new Date() } });
-
-    return res.json({
-      ok: true,
-      token,
-      expiresAt,
-      admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role },
-    });
-  } catch (err) {
-    if (err?.issues) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: err.issues[0]?.message || "Validation error" });
-    console.error("[admin-auth/login] failed:", err);
-    return res.status(500).json({ ok: false, code: "ADMIN_LOGIN_FAILED", error: "Admin login failed" });
-  }
+  try { return res.json(await loginAdmin({ db: prisma, ...loginSchema.parse(req.body), ip: req.ip || null, userAgent: String(req.headers["user-agent"] || "").slice(0, 1000) || null })); }
+  catch (error) { return sendCommandError(res, error); }
 });
-
-router.get("/me", adminSessionRequired, async (req, res) => {
-  return res.json({ ok: true, admin: { id: req.admin.id, email: req.admin.email, name: req.admin.name, role: req.admin.role } });
-});
-
+router.get("/me", adminSessionRequired, (req, res) => res.json({ ok: true, admin: publicAdmin(req.admin) }));
 router.post("/logout", adminSessionRequired, async (req, res) => {
-  await prisma.adminSession.update({ where: { id: req.adminSession.id }, data: { revokedAt: new Date() } });
-  return res.json({ ok: true });
+  try { return res.json(await logoutAdmin({ db: prisma, actor: { adminId: req.admin.id, sessionId: req.adminSession.id, accessEpoch: req.adminSession.issuedAccessEpoch } })); }
+  catch (error) { return sendCommandError(res, error); }
 });
-
 module.exports = router;

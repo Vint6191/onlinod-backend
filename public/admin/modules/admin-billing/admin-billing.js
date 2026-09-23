@@ -79,24 +79,24 @@
       `<option value="${k}" ${k === sel ? "selected" : ""}>${esc(v.label)} (${money(v.priceCents)})</option>`).join("");
 
     const rows = (r.models || []).map((m) => `
-      <tr data-creator="${esc(m.creatorId)}" class="${m.billingExcluded ? "adm-row-excluded" : ""}">
+      <tr data-creator="${esc(m.creatorId)}" data-pricing-revision="${Number(m.pricingRevision || 0)}" class="${m.billingExcluded ? "adm-row-excluded" : ""}">
         <td>
           <b>${esc(m.displayName || m.username || m.creatorId.slice(-8))}</b>
           <div class="adm-muted">@${esc(m.username || "—")} · ${esc(m.creatorStatus || "")}</div>
         </td>
         <td><select class="bl-tier">${tierOpts(m.tier || "STARTER")}</select></td>
-        <td><input class="bl-price" type="number" min="0" step="1" value="${(Number(m.corePriceCents || 0) / 100).toFixed(0)}" style="width:80px"> </td>
+        <td><input class="bl-price" type="number" min="0" step="0.01" value="${(Number(m.corePriceCents || 0) / 100).toFixed(2)}" style="width:80px"> </td>
         <td class="adm-addon-cell">
           <label><input type="checkbox" class="bl-ai" ${m.aiChatterEnabled ? "checked" : ""}> AI</label>
-          <input class="bl-ai-price" type="number" min="0" value="${(Number(m.aiChatterPriceCents || 0) / 100).toFixed(0)}" style="width:64px">
+          <input class="bl-ai-price" type="number" min="0" value="${(Number(m.aiChatterPriceCents || 0) / 100).toFixed(2)}" style="width:64px">
         </td>
         <td class="adm-addon-cell">
           <label><input type="checkbox" class="bl-or" ${m.outreachEnabled ? "checked" : ""}> OR</label>
-          <input class="bl-or-price" type="number" min="0" value="${(Number(m.outreachPriceCents || 0) / 100).toFixed(0)}" style="width:64px">
+          <input class="bl-or-price" type="number" min="0" value="${(Number(m.outreachPriceCents || 0) / 100).toFixed(2)}" style="width:64px">
         </td>
         <td><label><input type="checkbox" class="bl-excl" ${m.billingExcluded ? "checked" : ""}> excl</label></td>
-        <td class="adm-money bl-line">${money(m.lineCents)}</td>
-        <td><button class="adm-btn adm-btn-sm bl-save">save</button></td>
+        <td class="adm-money bl-line">${money(m.configuredLineCents)}</td>
+        <td><button class="adm-btn adm-btn-sm bl-save">save</button><button class="adm-btn adm-btn-sm bl-check" hidden>check result</button></td>
       </tr>`).join("");
 
     const sub = r.subscription;
@@ -114,7 +114,7 @@
         </div>
 
         <div class="adm-kpi-row">
-          <div class="adm-kpi adm-kpi-strong"><div class="adm-kpi-label">Agency monthly</div><div class="adm-kpi-val" id="blTotal">${money(r.monthlyCents)}</div></div>
+          <div class="adm-kpi adm-kpi-strong"><div class="adm-kpi-label">Configured monthly</div><div class="adm-kpi-val" id="blTotal">${money((r.models || []).reduce((sum, model) => sum + model.configuredLineCents, 0))}</div></div>
           <div class="adm-kpi"><div class="adm-kpi-label">Models</div><div class="adm-kpi-val">${(r.models || []).length}</div></div>
           <div class="adm-kpi"><div class="adm-kpi-label">Period end</div><div class="adm-kpi-val" style="font-size:14px">${r.agency.currentPeriodEnd ? esc(String(r.agency.currentPeriodEnd).slice(0, 10)) : "—"}</div></div>
         </div>
@@ -142,11 +142,18 @@
       const priceInp = tr.querySelector(".bl-price");
       tierSel.addEventListener("change", () => {
         const t = tierSel.value;
-        if (t !== "CUSTOM" && r.tiers[t]) priceInp.value = (r.tiers[t].priceCents / 100).toFixed(0);
+        if (t !== "CUSTOM" && r.tiers[t]) priceInp.value = (r.tiers[t].priceCents / 100).toFixed(2);
         recalcLine(tr); recalcTotal(main);
       });
       tr.querySelectorAll("input").forEach((inp) => inp.addEventListener("input", () => { recalcLine(tr); recalcTotal(main); }));
       tr.querySelector(".bl-save").addEventListener("click", () => saveLine(main, tr));
+      tr.querySelector(".bl-check").addEventListener("click", async () => {
+        try {
+          const result = await A().resolveCommand(`/api/admin/billing/creator/${encodeURIComponent(tr.dataset.creator)}`, "PATCH");
+          if (!result.pending) { R().toast("Result confirmed; current prices reloaded", "ok"); await renderAgency(main, agencyId); }
+          else R().toast("Result is still unknown. Retry the same change.", "error");
+        } catch (_) { R().toast("Status could not be retrieved. Retry later.", "error"); }
+      });
     });
 
     main.querySelector("#blBulkApply").addEventListener("click", async () => {
@@ -176,6 +183,8 @@
     const btn = tr.querySelector(".bl-save");
     btn.disabled = true; btn.textContent = "…";
     const body = {
+      expectedRevision: Number(tr.dataset.pricingRevision),
+      tierMode: "MANUAL",
       tier: tr.querySelector(".bl-tier").value,
       corePriceCents: Math.round(Number(tr.querySelector(".bl-price").value || 0) * 100),
       aiChatterEnabled: tr.querySelector(".bl-ai").checked,
@@ -187,13 +196,15 @@
     };
     const res = await A().billingSetCreator(tr.dataset.creator, body);
     btn.disabled = false; btn.textContent = "save";
+    tr.querySelector(".bl-check").hidden = !["NETWORK", "INVALID_JSON", "ADMIN_COMMAND_RESPONSE_UNKNOWN", "ADMIN_COMMAND_UNRESOLVED"].includes(res?.code);
     if (res?.ok) {
+      tr.dataset.pricingRevision = String(res.billing.pricingRevision);
       R().toast("saved " + money(res.lineCents), "ok");
       tr.querySelector(".bl-line").textContent = money(res.lineCents);
       tr.classList.toggle("adm-row-excluded", body.billingExcluded);
       recalcTotal(main);
     } else {
-      R().toast("save failed", "error");
+      R().toast(res?.error || "save failed", "error");
     }
   }
 

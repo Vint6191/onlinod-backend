@@ -1373,6 +1373,7 @@ enum BillingOrderStatus {
 }
 
 model AdminUser {
+  accessEpoch Int @default(1)
   id           String    @id @default(cuid())
   email        String    @unique
   passwordHash String
@@ -1390,6 +1391,7 @@ model AdminUser {
 }
 
 model AdminSession {
+  issuedAccessEpoch Int @default(1)
   id          String    @id @default(cuid())
   adminUserId String
   tokenHash   String    @unique
@@ -1433,6 +1435,7 @@ model AgencySubscription {
 }
 
 model CreatorBillingProfile {
+  pricingRevision Int @default(1)
   id        String @id @default(cuid())
   agencyId  String
   creatorId String @unique
@@ -6399,4 +6402,48 @@ model SystemSetting {
 
   @@index([key])
   @@index([updatedAt])
+}
+
+// Phase 4 durable command receipts. Identity/scope values intentionally have
+// no foreign keys to deletable domain rows: history survives domain retirement.
+model AdminCommand {
+  id               String    @id @default(cuid())
+  actorId          String
+  commandId        String
+  sessionId        String
+  actorAccessEpoch Int
+  action           String
+  targetId         String
+  payloadHash      String
+  reason           String
+  scopeAgencyId    String?
+  status           String
+  httpStatus       Int       @default(0)
+  result           Json?
+  createdAt        DateTime  @default(now())
+  completedAt      DateTime?
+  audit            AdminCommandAudit[]
+
+  @@unique([actorId, commandId])
+  @@index([actorId, createdAt, id])
+  @@index([scopeAgencyId, createdAt, id])
+}
+
+model AdminCommandAudit {
+  id            String   @id @default(cuid())
+  commandId     String
+  sequence      Int
+  actorId       String
+  action        String
+  targetId      String
+  scopeAgencyId String?
+  event         String
+  reason        String
+  detail        Json
+  createdAt     DateTime @default(now())
+  command       AdminCommand @relation(fields: [commandId], references: [id], onDelete: Restrict)
+
+  @@unique([commandId, sequence])
+  @@index([scopeAgencyId, createdAt, id])
+  @@index([actorId, createdAt, id])
 }

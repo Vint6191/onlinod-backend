@@ -158,6 +158,8 @@
     `;
   }
 
+  function epoch(id) { return state.list.find(item => item.id === id)?.accessEpoch; }
+
   function bind(main) {
     main.querySelector("#admAdminsRefresh")?.addEventListener("click", () => load(true));
     main.querySelector("#admAdminsCreate")?.addEventListener("click", () => openCreateModal());
@@ -168,7 +170,7 @@
       sel.addEventListener("change", async () => {
         const id = sel.dataset.adminRole;
         const newRole = sel.value;
-        const result = await A().patchAdminUser(id, { role: newRole, reason: "admin role change" });
+        const result = await A().patchAdminUser(id, { role: newRole, expectedEpoch: epoch(id), reason: "admin role change" });
         if (!result?.ok) {
           R().toast(result?.error || "Role change failed");
           sel.value = original;
@@ -185,7 +187,7 @@
         const id = btn.dataset.adminToggle;
         const wasActive = btn.dataset.adminActive === "1";
         if (wasActive && !confirm("Disable this admin?\n\nAll their sessions will be revoked.")) return;
-        const result = await A().patchAdminUser(id, { active: !wasActive, reason: wasActive ? "admin disable" : "admin enable" });
+        const result = await A().patchAdminUser(id, { active: !wasActive, expectedEpoch: epoch(id), reason: wasActive ? "admin disable" : "admin enable" });
         R().toast(result?.ok ? (wasActive ? "admin disabled" : "admin enabled") : (result?.error || "failed"));
         if (result?.ok) load(true);
       });
@@ -268,7 +270,7 @@
         return;
       }
 
-      const result = await A().createAdminUser({ email, name: name || undefined, password: pwd, role });
+      const result = await A().createAdminUser({ email, name: name || undefined, password: pwd, role, reason: "create admin account" });
       if (!result?.ok) {
         errBox.innerHTML = `<div class="adm-error">${R().escapeHtml(result?.error || "create failed")}</div>`;
         return;
@@ -282,6 +284,7 @@
   // ── Reset password modal ────────────────────────────────────
 
   function openPasswordResetModal(adminId, email) {
+    const expectedEpoch = epoch(adminId);
     const r = R();
     const slot = document.getElementById("admAdminsModal");
     if (!slot) return;
@@ -326,7 +329,7 @@
         return;
       }
 
-      const result = await A().resetAdminPwd(adminId, { password: pwd, reason: reason || undefined });
+      const result = await A().resetAdminPwd(adminId, { password: pwd, expectedEpoch, reason: reason || "admin password reset" });
       if (!result?.ok) {
         errBox.innerHTML = `<div class="adm-error">${R().escapeHtml(result?.error || "reset failed")}</div>`;
         return;

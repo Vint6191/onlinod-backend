@@ -38,6 +38,10 @@ function createIdempotencyMiddleware(options = {}) {
   const cache = new Map();
 
   return function idempotencyMiddleware(req, res, next) {
+    // Admin replay must authenticate current authority and use durable receipts.
+    // Never serve an old response before admin/session middleware is reached.
+    const path = String(req.originalUrl || req.url || "").split("?")[0];
+    if (/^\/api\/(?:admin(?:-auth)?|impersonate)(?:\/|$)/i.test(path)) return next();
     const method = String(req.method || "GET").toUpperCase();
     if (!["POST", "PUT", "PATCH", "DELETE"].includes(method)) return next();
 

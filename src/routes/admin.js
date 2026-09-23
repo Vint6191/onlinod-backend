@@ -1,3 +1,4 @@
+const { setPricingHandler, createAdminHandler, patchAdminHandler, resetAdminPasswordHandler } = require("./admin-command-handlers");
 /* src/routes/admin.js — Onlinod admin v2
    ────────────────────────────────────────────────────────────
    Full replacement. Backwards-compatible with v1 endpoints
@@ -186,7 +187,7 @@ function adminAuditMiddleware(req, res, next) {
 router.use(adminAuditMiddleware);
 
 function ensureSuperAdmin(req, res) {
-  if (req.admin?.role && req.admin.role !== "SUPER_ADMIN") {
+  if (req.admin?.role !== "SUPER_ADMIN") {
     res.status(403).json({
       ok: false,
       code: "ADMIN_INSUFFICIENT_ROLE",
@@ -1488,62 +1489,8 @@ router.patch("/creators/:id/status", async (req, res) => {
   });
 });
 
-// PATCH /creators/:id/billing   (v1, kept)
-const billingSchema = z.object({
-  tier: z.enum(["STARTER", "GROWTH", "PRO", "ELITE", "CUSTOM"]).optional(),
-  tierMode: z.enum(["MANUAL", "AUTO"]).optional(),
-  corePriceCents: z.number().int().min(0).max(1000000).optional(),
-  revenue30dCents: z.number().int().min(0).max(10000000000).optional(),
-  aiChatterEnabled: z.boolean().optional(),
-  aiChatterPriceCents: z.number().int().min(0).max(1000000).optional(),
-  outreachEnabled: z.boolean().optional(),
-  outreachPriceCents: z.number().int().min(0).max(1000000).optional(),
-  billingExcluded: z.boolean().optional(),
-  notes: z.string().max(3000).optional().nullable(),
-  reason: z.string().max(500).optional().nullable(),
-});
-
-router.patch("/creators/:id/billing", async (req, res) => {
-  try {
-    const input = billingSchema.parse(req.body);
-    const creator = await prisma.creatorAccount.findUnique({ where: { id: req.params.id }, include: { billingProfile: true } });
-    if (!creator) return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
-
-    const before = creator.billingProfile || null;
-    const tier = input.tier || before?.tier || "STARTER";
-    const d = defaultBilling(tier);
-    const data = {
-      agencyId: creator.agencyId,
-      tier,
-      tierMode: input.tierMode || before?.tierMode || d.tierMode,
-      corePriceCents: input.corePriceCents ?? before?.corePriceCents ?? d.corePriceCents,
-      revenue30dCents: input.revenue30dCents ?? before?.revenue30dCents ?? d.revenue30dCents,
-      aiChatterEnabled: input.aiChatterEnabled ?? before?.aiChatterEnabled ?? d.aiChatterEnabled,
-      aiChatterPriceCents: input.aiChatterPriceCents ?? before?.aiChatterPriceCents ?? d.aiChatterPriceCents,
-      outreachEnabled: input.outreachEnabled ?? before?.outreachEnabled ?? d.outreachEnabled,
-      outreachPriceCents: input.outreachPriceCents ?? before?.outreachPriceCents ?? d.outreachPriceCents,
-      billingExcluded: input.billingExcluded ?? before?.billingExcluded ?? d.billingExcluded,
-      notes: input.notes !== undefined ? input.notes : before?.notes || null,
-    };
-
-    const billing = before
-      ? await prisma.creatorBillingProfile.update({ where: { creatorId: creator.id }, data })
-      : await prisma.creatorBillingProfile.create({ data: { creatorId: creator.id, ...data } });
-
-    await adminLog(req, {
-      agencyId: creator.agencyId,
-      action: "admin.creator_billing_changed",
-      targetType: "creator",
-      targetId: creator.id,
-      before, after: billing,
-      reason: input.reason || "manual creator billing update",
-    });
-    return res.json({ ok: true, billing });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    return res.status(500).json({ ok: false, code: "ADMIN_CREATOR_BILLING_FAILED", error: err?.message || "Failed to update creator billing" });
-  }
-});
+// PATCH /creators/:id/billing — compatibility URL, same authority as admin-billing.
+router.patch("/creators/:id/billing", setPricingHandler);
 
 // PATCH /creators/:id/entitlement — explicit manual support grant/revoke.
 // This is intentionally separate from CreatorBillingProfile: the profile is pricing/default
@@ -1930,7 +1877,7 @@ router.get("/admin-users", async (_req, res) => {
     const admins = await prisma.adminUser.findMany({
       orderBy: { createdAt: "desc" },
       select: {
-        id: true, email: true, name: true, role: true, active: true,
+        id: true, email: true, name: true, role: true, active: true, accessEpoch: true,
         lastLoginAt: true, createdAt: true,
       },
       take: 10000});
@@ -1940,139 +1887,9 @@ router.get("/admin-users", async (_req, res) => {
   }
 });
 
-const adminCreateSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(8),
-  name: z.string().min(1).max(120).optional(),
-  role: z.enum(["SUPER_ADMIN", "SUPPORT"]).optional(),
-});
-
-router.post("/admin-users", async (req, res) => {
-  try {
-    if (!ensureSuperAdmin(req, res)) return;
-
-    const input = adminCreateSchema.parse(req.body);
-    const email = input.email.toLowerCase().trim();
-
-    const existing = await prisma.adminUser.findUnique({ where: { email } });
-    if (existing) return res.status(409).json({ ok: false, code: "EMAIL_TAKEN", error: "Admin with this email already exists" });
-
-    const passwordHash = await bcrypt.hash(input.password, 12);
-    const admin = await prisma.adminUser.create({
-      data: {
-        email,
-        passwordHash,
-        name: input.name || null,
-        role: input.role || "SUPER_ADMIN",
-        active: true,
-      },
-    });
-
-    await adminLog(req, {
-      agencyId: null,
-      action: "admin.admin_created",
-      targetType: "admin",
-      targetId: admin.id,
-      before: null, after: { id: admin.id, email: admin.email, role: admin.role },
-      reason: req.body?.reason || null,
-    });
-
-    return res.status(201).json({
-      ok: true,
-      admin: { id: admin.id, email: admin.email, name: admin.name, role: admin.role, active: admin.active },
-    });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    return res.status(500).json({ ok: false, code: "ADMIN_CREATE_FAILED", error: err?.message || "Failed" });
-  }
-});
-
-const adminPatchSchema = z.object({
-  name: z.string().min(1).max(120).optional(),
-  active: z.boolean().optional(),
-  role: z.enum(["SUPER_ADMIN", "SUPPORT"]).optional(),
-  reason: z.string().max(500).optional().nullable(),
-});
-
-router.patch("/admin-users/:id", async (req, res) => {
-  try {
-    if (!ensureSuperAdmin(req, res)) return;
-
-    const input = adminPatchSchema.parse(req.body);
-    const before = await prisma.adminUser.findUnique({ where: { id: req.params.id } });
-    if (!before) return res.status(404).json({ ok: false, code: "ADMIN_NOT_FOUND", error: "Admin not found" });
-
-    // Don't allow self-disable (lock yourself out).
-    if (input.active === false && before.id === req.admin.id) {
-      return res.status(409).json({ ok: false, code: "CANNOT_DISABLE_SELF", error: "Cannot disable yourself" });
-    }
-
-    const data = {};
-    if (input.name   !== undefined) data.name   = input.name;
-    if (input.active !== undefined) data.active = input.active;
-    if (input.role   !== undefined) data.role   = input.role;
-
-    const updated = await prisma.adminUser.update({ where: { id: before.id }, data });
-
-    if (input.active === false) {
-      await prisma.adminSession.updateMany({
-        where: { adminUserId: before.id, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
-    }
-
-    await adminLog(req, {
-      agencyId: null,
-      action: "admin.admin_updated",
-      targetType: "admin",
-      targetId: before.id,
-      before, after: updated, reason: input.reason || null,
-    });
-
-    return res.json({ ok: true, admin: updated });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    return res.status(500).json({ ok: false, code: "ADMIN_UPDATE_FAILED", error: err?.message || "Failed" });
-  }
-});
-
-const adminPasswordResetSchema = z.object({
-  password: z.string().min(8),
-  reason: z.string().max(500).optional().nullable(),
-});
-
-router.post("/admin-users/:id/reset-password", async (req, res) => {
-  try {
-    if (!ensureSuperAdmin(req, res)) return;
-
-    const input = adminPasswordResetSchema.parse(req.body);
-    const target = await prisma.adminUser.findUnique({ where: { id: req.params.id } });
-    if (!target) return res.status(404).json({ ok: false, code: "ADMIN_NOT_FOUND", error: "Admin not found" });
-
-    const passwordHash = await bcrypt.hash(input.password, 12);
-    await prisma.$transaction([
-      prisma.adminUser.update({ where: { id: target.id }, data: { passwordHash } }),
-      prisma.adminSession.updateMany({
-        where: { adminUserId: target.id, revokedAt: null },
-        data: { revokedAt: new Date() },
-      }),
-    ]);
-
-    await adminLog(req, {
-      agencyId: null,
-      action: "admin.admin_password_reset",
-      targetType: "admin",
-      targetId: target.id,
-      before: null, after: null, reason: input.reason || null,
-    });
-
-    return res.json({ ok: true });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    return res.status(500).json({ ok: false, code: "ADMIN_PASSWORD_RESET_FAILED", error: err?.message || "Failed" });
-  }
-});
-
+router.post("/admin-users", createAdminHandler);
+router.patch("/admin-users/:id", patchAdminHandler);
+router.post("/admin-users/:id/reset-password", resetAdminPasswordHandler);
 
 // ════════════════════════════════════════════════════════════
 // Phase 3 Subscriber maintenance break-glass

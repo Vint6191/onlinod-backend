@@ -47,6 +47,16 @@
       headers.Authorization = `Bearer ${token}`;
     }
 
+    let command;
+    try {
+      command = await window.OnlinodAdminCommands.prepare({ path, method: options.method || "GET", body: options.body, token });
+      if (command?.blocked) {
+        const resolved = await window.OnlinodAdminCommands.resolve(path, options.method || "GET", token);
+        if (!resolved.pending) return { ok: false, code: "ADMIN_PREVIOUS_COMMAND_COMPLETED", error: "Previous change completed. Reload current values before editing again.", commandId: command.commandId };
+        return command.result;
+      }
+      if (command) headers["Idempotency-Key"] = command.commandId;
+    } catch (_) { return { ok: false, code: "ADMIN_COMMAND_CLIENT_FAILED", error: "Could not prepare command; no change submitted" }; }
     let res;
     try {
       res = await fetch(url, {
@@ -55,7 +65,7 @@
         body: options.body ? JSON.stringify(options.body) : undefined,
       });
     } catch (err) {
-      const errResult = { ok: false, code: "NETWORK", error: String(err?.message || err) };
+      const errResult = { ok: false, code: "NETWORK", commandId: command?.commandId, error: command ? "Result unknown. Retry the same change or check its status." : String(err?.message || err) };
       stashDebug({ url, method: options.method || "GET", body: options.body }, errResult);
       return errResult;
     }
@@ -73,6 +83,8 @@
       data = { ok: res.ok, text };
     }
 
+    if (command && res.ok && (data?.ok !== true || data.commandId !== command.commandId)) data = { ok: false, code: "ADMIN_COMMAND_RESPONSE_UNKNOWN", commandId: command.commandId, error: "Result could not be confirmed. Retry the same change or check its status." };
+    window.OnlinodAdminCommands.settle(command, res, data);
     if (!res.ok && !data?.httpStatus) data.httpStatus = res.status;
 
     stashDebug({ url, method: options.method || "GET", body: options.body }, data);
@@ -92,7 +104,7 @@
 
   function stashDebug(req, res) {
     if (!window.OnlinodAdminState) return;
-    window.OnlinodAdminState.lastDebug = { request: req, response: res, at: new Date().toISOString() };
+    window.OnlinodAdminState.lastDebug = window.OnlinodAdminCommands.redact({ request: req, response: res, at: new Date().toISOString() });
   }
 
   // ─── Convenience wrappers around our admin endpoints ─────────
@@ -103,6 +115,8 @@
   const api = {
     TOKEN_KEY,
     getToken, setToken, request,
+    commandStatus: (id) => request(`/api/admin/commands/${encodeURIComponent(id)}`),
+    resolveCommand: (path, method) => window.OnlinodAdminCommands.resolve(path, method, getToken()),
 
     // auth
     login:  (body)   => request("/api/admin-auth/login",  { method: "POST", body, auth: false }),

@@ -1,0 +1,72 @@
+"use strict";
+
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { ACTIONS, adminError, commandIdSchema, intentHash } = require("./admin-command-contract");
+const { lockAdminActor } = require("./admin-session-authority-service");
+
+async function lockCommandIdentity(tx, actorId, commandId) {
+  await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", `admin-command:${actorId}:${commandId}`);
+}
+
+function safeJson(value) {
+  const json = JSON.stringify(value, (_key, item) => typeof item === "bigint" ? String(item) : item);
+  if (json === undefined || Buffer.byteLength(json) > 32768) throw adminError("ADMIN_COMMAND_RESULT_TOO_LARGE", "Command result exceeds its storage budget", 500);
+  return JSON.parse(json);
+}
+
+async function executeAdminCommand({ db, actor, commandId, action, targetId, payload, work }) {
+  const contract = ACTIONS[action];
+  if (!contract || typeof work !== "function") throw adminError("ADMIN_ACTION_UNKNOWN", "Unknown admin action", 400);
+  if (!actor?.adminId) throw adminError("ADMIN_AUTH_REQUIRED", "Admin context is required", 401);
+  commandIdSchema.parse(commandId);
+  const normalized = contract.schema ? contract.schema.parse(payload) : payload;
+  const hash = intentHash({ action, targetId, payload: normalized });
+  return db.$transaction(async tx => {
+    await lockCommandIdentity(tx, actor.adminId, commandId);
+    // Roster mutex is used only by identity commands, before any AdminUser row.
+    if (contract.roster) await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", "admin-roster-v1");
+    const authority = await lockAdminActor(tx, actor, { roles: contract.roles, mutateIdentity: contract.roster === true, targetAdminId: contract.roster ? targetId : null });
+    const where = { actorId_commandId: { actorId: actor.adminId, commandId } };
+    const existing = await tx.adminCommand.findUnique({ where });
+    if (existing) {
+      if (existing.payloadHash !== hash) throw adminError("ADMIN_COMMAND_PAYLOAD_CONFLICT", "Command identity was already used for another intent", 409);
+      return { commandId, replayed: true, statusCode: existing.httpStatus, body: existing.result };
+    }
+    const command = await tx.adminCommand.create({ data: {
+      commandId, actorId: actor.adminId, sessionId: actor.sessionId,
+      actorAccessEpoch: actor.accessEpoch, action, targetId, payloadHash: hash,
+      reason: normalized.reason, status: "RUNNING",
+    } });
+    // Domain errors must not retain a partial mutation. Keep the command row
+    // outside the savepoint so a terminal rejection has a stable receipt too.
+    await tx.$executeRawUnsafe("SAVEPOINT admin_domain_mutation");
+    let outcome;
+    try {
+      outcome = await work({ tx, authority, payload: normalized, command });
+      await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_domain_mutation");
+    } catch (error) {
+      if (!(Number(error.status) >= 400 && Number(error.status) < 500 && error.code)) throw error;
+      await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT admin_domain_mutation");
+      await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_domain_mutation");
+      outcome = { statusCode: error.status, body: { ok: false, code: error.code, error: error.message, ...(error.details ? { details: error.details } : {}) }, audit: { outcome: "REJECTED", code: error.code } };
+    }
+    const statusCode = outcome.statusCode || 200;
+    const body = safeJson({ ...outcome.body, commandId });
+    const audit = safeJson(outcome.audit || {});
+    await tx.adminCommandAudit.create({ data: { commandId: command.id, sequence: 1, actorId: actor.adminId, action, targetId, scopeAgencyId: outcome.agencyId || null, event: statusCode < 400 ? "COMMITTED" : "REJECTED", detail: audit, reason: normalized.reason } });
+    await tx.adminCommand.update({ where: { id: command.id }, data: { status: statusCode < 400 ? "SUCCEEDED" : "REJECTED", httpStatus: statusCode, result: body, scopeAgencyId: outcome.agencyId || null, completedAt: await dbAuthorityNow({ db: tx }) } });
+    return { commandId, replayed: false, statusCode, body };
+  }, { maxWait: 5000, timeout: 15000, isolationLevel: "ReadCommitted" });
+}
+
+async function readAdminCommand({ db, actor, commandId }) {
+  commandIdSchema.parse(commandId);
+  return db.$transaction(async tx => {
+    await lockAdminActor(tx, actor);
+    const row = await tx.adminCommand.findUnique({ where: { actorId_commandId: { actorId: actor.adminId, commandId } } });
+    if (!row) throw adminError("ADMIN_COMMAND_NOT_FOUND", "Command not found", 404);
+    return { ok: true, commandId, action: row.action, targetId: row.targetId, status: row.status, result: row.result, httpStatus: row.httpStatus, createdAt: row.createdAt, completedAt: row.completedAt };
+  });
+}
+
+module.exports = { executeAdminCommand, readAdminCommand, lockCommandIdentity, safeJson };

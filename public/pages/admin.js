@@ -325,7 +325,7 @@
           <span>excluded</span>
         </label>
 
-        <button class="on-btn primary" data-save-creator-billing="${a()(creator.id)}">Save creator billing</button>
+        <button class="on-btn primary" data-save-creator-billing="${a()(creator.id)}" data-pricing-revision="${Number(billing.pricingRevision || 0)}">Save creator billing</button>
       </div>
     `;
   }
@@ -580,6 +580,7 @@
           body: {
             tier: root.querySelector(`[data-creator-tier="${CSS.escape(id)}"]`)?.value || "STARTER",
             tierMode: "MANUAL",
+            expectedRevision: Number(el.dataset.pricingRevision),
             corePriceCents: Number(root.querySelector(`[data-creator-price="${CSS.escape(id)}"]`)?.value || 2000),
             aiChatterEnabled: root.querySelector(`[data-creator-ai="${CSS.escape(id)}"]`)?.checked === true,
             aiChatterPriceCents: Number(root.querySelector(`[data-creator-ai-price="${CSS.escape(id)}"]`)?.value || 10000),
