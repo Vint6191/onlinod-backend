@@ -1,3 +1,136 @@
+ONLINOD / PHASE 3 — CURRENT CUMULATIVE CHECKPOINT, 2026-09-23
+CURRENT STAGE: A37-R3. Analytics / Home / Stats closure continues.
+SOURCE OPEN. SCALE OPEN. PHASE 3 NOT CLOSED.
+This section supersedes all historical installation/proof statuses below.
+
+INSTALL VERDICT / EXACT BASE
+STAVIT: YES, as a candidate through the existing Render proof gate.
+STAVIT as a completed Phase 3 release: NO.
+Apply ONLY over: onlinod-backend-main - 2026-09-23T190250.967.zip.
+That supplied actual exactly matches the preceding A37-R2 delivered tree.
+The delta includes only changed/new files, this cumulative TXT and historical MD.
+Do not overlay earlier deltas again. No dependencies or Prisma models changed.
+Command: npm install && npm run audit:phase3-a29-render
+Expected gate: 140 offline + 71 x 3 = 213 physical tests; zero failures/skips/
+fixture leaks; disposable cleanup; then primary migration and final gate ok=true.
+A failed disposable gate continues to block primary migration/deployment.
+New additive migration: 20260923170000_phase3_locator_publication_convergence_v1.
+Do not modify checksums/content of already applied migrations.
+
+AUTHORITATIVE INPUT
+Backend SHA256:
+9662e494c5907db24e6c7cded62525cc2e8cc5d8fbee688c0e92221afa6b08bc
+1397 ZIP entries / 1106 files; CRC, paths and symlinks checked; no AGENTS.md.
+Render log: Вставленный текст(20260923-161016).txt
+Log SHA256: 4d1f921eb470f61c8353c186be8d6761fa3efdeeb1eba4bd27b3892702aff518
+Render checkout: 1fddfbc9d5ffa0cf5cd2b6c68a6dde9668ac7b3f
+
+WHAT THE LOG NOW CONFIRMS
+135/135 offline; physical 206/207: clean 69/69, rolling-a13-to-current 68/69,
+seeded-pre-a20-2-to-current 69/69. All A37-R2 new proofs pass in all 3 scenarios:
+stale reservation snapshot CAS, monotonic dispatch, six settlement expiry races.
+The strengthened three-wave 1000-Agency/4000-Creator fairness proof also passes
+in all 3 scenarios, including 300 distinct Agencies across the waves.
+Zero fixture leaks; disposable dropped successfully. Primary migration/deploy
+were NOT reached. Previous R2 physical work is now confirmed, not pending.
+The remaining failure is the existing exact-partition opposite-write-order test:
+"Unique constraint failed on the fields: (`id`)" at transaction COMMIT.
+Prisma's log does not name the table/index; the exact failing transaction timing
+was not reproduced locally. The source defects below directly affect that path.
+
+CAUSES AND COHESIVE LOCATOR FIX
+Each partition/shard/Agency locator has BOTH a deterministic id primary key and
+an independent natural unique key. Missing-row reconciliation used natural-key
+ON CONFLICT only, so the separate id constraint was outside that conflict arbiter.
+It also read child truth before obtaining ownership and ignored a losing insert/
+revision CAS. An earlier private publication could commit without pulling an
+already-created future locator forward. Suppressing duplicate errors alone would
+leave that scheduling defect.
+All three canonical functions now establish the exact locator row with untargeted
+ON CONFLICT DO NOTHING, then SELECT FOR UPDATE before reading child truth. A
+transaction-local placeholder is always finalized/deleted before commit. A peer
+that waits re-reads canonical children after taking the row, including its own
+previously private earlier work. Identity collisions fail explicitly; concurrent
+remove/recreate loops are capped at 8 attempts and fail with SQLSTATE 40001.
+Sorted partition -> shard -> Agency ordering and R2 generation-local monotonic
+watermarks remain. No retired per-row locator writer is restored. Existing ABI
+wrappers keep delegating to the same canonical function identities.
+The final design uses row locks, not one advisory lock per locator: a bulk
+publication must not exhaust PostgreSQL shared lock memory. No global execution
+lock, new table, schema rewrite, count/backfill or historical scan is introduced.
+Child truth is still read through existing indexed EXISTS/LIMIT 1 probes.
+Reference: https://www.postgresql.org/docs/current/sql-insert.html
+
+FURTHER WORK IMPLEMENTED IN THE SAME DOMAIN: HOME PLANNING COMMIT BOUNDARY
+New analytics-demand-planning-service owns one <=20-second root transaction per
+creator. It reuses canonical management commit authorization and lifecycle order:
+Agency shared lifecycle barrier -> Creator SHARE -> User SHARE -> Member SHARE
+-> exact demand row -> job planning -> final database-clock lease fence + cursor.
+This covers active User, current membership/epoch, refresh permission, creator
+scope and READY lifecycle. Demand token, claimed/requested revision, actor,
+requested creator scope and durable cursor must still match before planning.
+A newer request cannot be planned using an older claim. Jobs and durable cursor
+commit together. Expiry/failure rolls both back; job events are buffered until
+successful outer commit. Access revocation cancels through normal settlement;
+newer request revision still wins. Infrastructure errors are not misclassified
+as cancellation. Existing bounded slices, retry and yield behavior are retained.
+Home scope enumeration and global due-query cost remain separate OPEN items.
+
+PROOFS / VALIDATION
+Existing exact-partition opposite-order physical proof strengthened to 6 waves.
+New physical locator matrix: same partition, different partitions/same shard,
+and different shards/same Agency. One writer flushes future work; a third client
+observes the earlier writer blocked using pg_blocking_pids. Both must commit and
+all three resulting locator heads must expose the earlier work immediately.
+New Home physical proof: create a real job, expire the held demand, require full
+rollback of job AND cursor; reject stale member epoch; retry successfully and
+persist the cursor with the jobs. Existing scoped Home continuation proof now
+runs through the production transaction service as well.
+Four new behavioral offline Home tests prove atomic cursor/job publication,
+rollback with no notifications, stale member/revision rejection, root ownership.
+One new SQL protocol guard; no physical assertion removed or relaxed.
+
+Local runtime: Node 24.19 / Prisma 5.22. Render is Node 22, unchanged.
+Mandatory offline: 140 pass, 0 fail, 0 skip.
+Changed JS syntax/no-undef: 95 files, clean.
+Prisma source contracts: 363 files, no violations.
+PostgreSQL identifier lint: no new oversized identifiers/collisions.
+Full baseline: 3224 tests / 3003 pass / 103 fail / 118 skip.
+Full current: 3231 tests / 3008 pass / 103 fail / 120 skip.
+All 103 failure names exactly match baseline; NO new full-suite failures.
+The repository-wide suite remains red; these historical failures are not waived.
+Physical manifest A37-R3: 13 files, 71 tests/scenario, 213 total.
+Manifest SHA256:
+38bf9dd975016c377dbd242a337610fef76ba0567d3796e6e75d046a8cc7158a
+No local PostgreSQL or DATABASE_URL. New SQL/migration and physical proofs have
+NOT run locally. They must be confirmed by the next Render gate, including the
+existing scale/fairness/deadlock proofs. SQL bounds are not throughput evidence.
+Packaging checks ZIP CRC and exact reconstruction over the authoritative input;
+no deletions, credentials, dependencies, logs or unrelated files are included.
+
+CURRENT REMAINING PHASE 3 BOUNDARY / MASTER MAP
+A. Incremental capacity projection, bounded repair, restart/rebuild and freshness;
+   replace global readCanonicalCapacityInputs aggregation.
+B. Home relational member scope instead of enumerating all assigned IDs; indexed
+   due selection and lock cost. Commit transaction implemented this pass; new
+   physical evidence still pending. Complete revocation/lifecycle overlap proof.
+C. Rolling coexistence and retirement of already-running old binary writers.
+D. New locator convergence and Home physical confirmation; terminal/quarantine
+   policy and complete timer/admin failure visibility. R2 settlement/fairness
+   physical checks are now CONFIRMED by the supplied log.
+E. Many large Agencies simultaneously, thousands of Creators EACH, 100 workers,
+   large history and multi-replica scanned-row/lock/queue/planning measurements.
+F. Fresh Backend AND current Desktop adversarial closure: all writers/readers,
+   routes/RPCs/billing/admin/compatibility/migrations plus 103 old suite failures.
+Stay in Analytics/Home/Stats. No other domain was started. Next actual + full
+Render output determines whether R3 is confirmed; do not infer Phase 3 closure
+from one green build. After confirmation continue A/B/C/D/E/F in the same audit.
+No trustworthy overall completion percentage or one-more-pass guarantee yet.
+
+HISTORICAL CUMULATIVE CHECKPOINT — A37-R2 (SUPERSEDED STATUS)
+The text below preserves previous causal work and architecture. Its pending
+R2 tests are now confirmed as stated above; its installation base is historical.
+
 ONLINOD / PHASE 3 — CUMULATIVE RECOVERY CHECKPOINT, 2026-09-23
 CURRENT STAGE: A37-R2, recurring Analytics authority closure continues.
 SOURCE OPEN. SCALE OPEN. PHASE 3 NOT CLOSED.

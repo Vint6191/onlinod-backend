@@ -8,6 +8,20 @@ const path = require("node:path");
 const ROOT = path.resolve(__dirname, "../..");
 const source = (relative) => fs.readFileSync(path.join(ROOT, relative), "utf8");
 
+test("A37-R3 locator publication arbitrates all identities and locks before reading child truth", () => {
+  const sql = source("prisma/migrations/20260923170000_phase3_locator_publication_convergence_v1/migration.sql");
+  const functions = sql.split('CREATE OR REPLACE FUNCTION ').slice(1);
+  assert.equal(functions.length, 3);
+  for (const body of functions) {
+    assert.match(body, /FOR v_try IN 1\.\.8 LOOP/);
+    assert.match(body, /FOR UPDATE;\s+EXIT WHEN FOUND/);
+    assert.match(body, /ON CONFLICT DO NOTHING/);
+    assert.match(body, /PHASE3_CLAIM_LOCATOR_IDENTITY_CONFLICT/);
+    assert.match(body, /GREATEST\(v_due,p_touched_at,v_last_selected\)/);
+    assert.doesNotMatch(body, /ON CONFLICT \(|COUNT\(\*\)|LOCK TABLE|CREATE TRIGGER|pg_advisory/);
+  }
+});
+
 test("A37-R2 dispatch uses bounded snapshot revisions and preserves generation-local fairness watermarks", () => {
   const domain = source("src/services/domain-work-authority-service.js");
   const migration = source("prisma/migrations/20260923160000_phase3_dispatch_fairness_monotonic_v1/migration.sql");
@@ -373,7 +387,7 @@ test("A36 DomainWork admission is bounded on both Agency and creator axes withou
   assert.match(physical, /wave < 3/);
   assert.match(physical, /opposite-order multi-write transactions defer exact partition-shard-Agency reconciliation without deadlock/);
   assert.match(physical, /opposite-order transactions sharing the exact same partitions cannot retain the retired row-trigger inversion/);
-  assert.equal((physical.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 6);
+  assert.equal((physical.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 7);
   assert.match(physical, /state: "BLOCKED"[\s\S]*blockedPartitions\.every\(\(row\) => row\.nextClaimableAt == null\)/);
   assert.match(physical, /rebuiltPartition\?\.nextClaimableAt[\s\S]*rebuiltShard\?\.nextDispatchAt[\s\S]*rebuiltAgency\?\.nextDispatchAt/);
 });

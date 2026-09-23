@@ -61,6 +61,14 @@ function addDemandAuthority(db, overrides = {}) {
     permissions: {}, assignedCreators: "all", accessEpoch: 7, deletedAt: null, deactivatedAt: null,
     ...overrides,
   };
+  db.agency = { findUnique: async ({ where }) => ({ id: where.id, deletedAt: null }) };
+  db.user = { findUnique: async ({ where }) => ({ id: where.id, disabledAt: null }) };
+  if (db.creatorAccount) {
+    const findMany = db.creatorAccount.findMany;
+    db.creatorAccount.findMany = async (args) => args.where?.id?.in && !args.where?.status
+      ? args.where.id.in.map((id) => ({ id })) : findMany(args);
+    db.creatorAccount.findFirst = async ({ where }) => ({ id: where.id });
+  }
   db.agencyMember = {
     findFirst: async ({ where = {} } = {}) => {
       if (!live || live.deletedAt || live.deactivatedAt) return null;

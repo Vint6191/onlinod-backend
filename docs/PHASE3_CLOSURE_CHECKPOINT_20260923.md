@@ -1,3 +1,19 @@
+# Phase 3 — A37-R3, публикация locators и атомарный Home planner
+
+**SOURCE OPEN / SCALE OPEN.** Текущая база: `2026-09-23T190250.967.zip`, побайтово равна A37-R2. Новый Render подтвердил все R2 проверки во всех сценариях; итог **206/207**, единственный отказ — unique `id` на commit при конкурентном создании одинаковых partitions. Cleanup успешен, primary migration/deploy не достигнуты.
+
+Исправлены все три reconciliation-уровня: создание identity учитывает все unique constraints, row lock предшествует чтению child truth, ранняя публикация сохраняется после конкуренции. Порядок partition → shard → Agency и monotonic watermarks сохранены. Row locks не требуют по advisory lock на каждый locator. Новая additive migration меняет только функции.
+
+Дальнейшая работа: Home planning теперь объединяет lifecycle/access authority, точный demand claim, jobs, финальную lease-проверку и durable cursor в одну транзакцию; уведомления публикуются после commit. Добавлены rollback/retry proof и детерминированная concurrent publication matrix с реальным наблюдением блокировок.
+
+Локально **140/140 offline**, **95 JS**, **363 Prisma source contracts**, identifier lint проходят. Full suite **3231 / 3008 pass / 103 прежних fail / 120 skip**; новых падений нет. Manifest **71 × 3 = 213**. Новые PostgreSQL proof ещё требуют Render: локальной базы нет.
+
+**Ставить через gate как кандидат — ДА. Phase 3 CLOSED — НЕТ.** Команда: `npm install && npm run audit:phase3-a29-render`. Полный накопительный checkpoint, hashes и открытые границы — `PHASE3_ANALYTICS_COORDINATOR_CHECKPOINT_20260923.txt` в этом архиве.
+
+Далее исторические actual. Их pending/failed/installation статусы не заменяют текущий статус выше.
+
+---
+
 # Phase 3 — A37-R2, конкурентная выдача и settlement
 
 **SOURCE OPEN / SCALE OPEN. Analytics closure continues.** Единственная актуальная база: `2026-09-23T183031.958.zip`. Она побайтово совпадает с A37-R1. Новый Render подтверждает все три A37-R1 proof во всех трёх сценариях, но итог **197/198**: в clean-current две реплики выбрали 100 разных задач из **99 агентств**. Offline **101/101**, fixture leaks отсутствуют, cleanup успешен; primary migration/deploy заблокированы.

@@ -253,6 +253,63 @@ test("A36 PostgreSQL: scoped Home demand yields durable progress and a second cl
   }
 });
 
+test("A37-R3 PostgreSQL: Home planning expiry rolls back real jobs and cursor then safely retries", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const planner = require("./analytics-collection-planner");
+  const { planAnalyticsDemandCreator } = require("./analytics-demand-planning-service");
+  const db = new PrismaClient();
+  let actor;
+  try {
+    const prefix = nonce("a37-home-commit");
+    actor = await createPhase3PostgresActorFixture(db, prefix);
+    const creator = await withPhase3PostgresFixtureAuthority(db, (tx) => tx.creatorAccount.create({ data: {
+      id: `${prefix}-creator`, agencyId: actor.agencyId, displayName: prefix, status: "READY",
+    } }));
+    await planner.enqueueAgencyAnalyticsFreshnessDemand({ db, agencyId: actor.agencyId,
+      requestedByMemberId: actor.memberId, requestedAccessEpoch: actor.accessEpoch,
+      creatorIds: [creator.id], rangeKey: "today", includePrevious: false });
+    const demand = await planner.claimNextAnalyticsDemand({ db, ownerToken: prefix });
+    assert.equal(demand.agencyId, actor.agencyId);
+    const member = await db.agencyMember.findUnique({ where: { id: actor.memberId } });
+    const args = { demand, member, creator, startDay: demand.coverageFrom, endDay: demand.coverageTo, now: new Date(), coverageRows: [] };
+    let inserted = 0;
+    const faultDb = new Proxy(db, { get(target, key) {
+      if (key !== "$transaction") return target[key];
+      return (work, options) => target.$transaction((tx) => work(new Proxy(tx, { get(transaction, property) {
+        if (property !== "jobInstance") return transaction[property];
+        return new Proxy(transaction.jobInstance, { get(delegate, method) {
+          if (method !== "createMany") return delegate[method];
+          return async (input) => {
+            const result = await delegate.createMany(input);
+            inserted += Number(result.count);
+            // Expire our own locked claim after a real insert. The final live
+            // fence must roll this back, not merely reject at admission.
+            await transaction.$executeRawUnsafe('UPDATE "AnalyticsCollectionDemand" SET "claimUntil"=clock_timestamp()-interval \'1 second\' WHERE "key"=$1', demand.key);
+            return result;
+          };
+        } });
+      } })), options);
+    } });
+    await assert.rejects(() => planAnalyticsDemandCreator({ ...args, db: faultDb }), { code: "ANALYTICS_DEMAND_PLANNING_CLAIM_LOST" });
+    assert.ok(inserted > 0);
+    assert.equal(await db.jobInstance.count({ where: { creatorId: creator.id } }), 0);
+    assert.equal((await db.analyticsCollectionDemand.findUnique({ where: { key: demand.key } })).cursorCreatorId, null);
+    await assert.rejects(() => planAnalyticsDemandCreator({ ...args, db, member: { ...member, accessEpoch: member.accessEpoch + 1 } }), { code: "MANAGEMENT_ACCESS_STALE" });
+    const result = await planAnalyticsDemandCreator({ ...args, db });
+    assert.ok(result.created > 0);
+    assert.equal((await db.analyticsCollectionDemand.findUnique({ where: { key: demand.key } })).cursorCreatorId, creator.id);
+    assert.equal(await db.jobInstance.count({ where: { creatorId: creator.id } }), result.created);
+    console.log("# A37_HOME_ATOMIC_PLANNING_EXPIRY_ROLLBACK_PASS");
+  } finally {
+    try {
+      if (actor) {
+        await db.analyticsCollectionDemand.deleteMany({ where: { agencyId: actor.agencyId } });
+        await cleanupPhase3PostgresFixtureGraph(db, { agencyId: actor.agencyId, userIds: [actor.userId] });
+      }
+    } finally { await db.$disconnect(); }
+  }
+});
+
 test("A37 PostgreSQL: recurring Analytics planning rolls back partial jobs and rejects expired ownership", { skip: !enabled, timeout: 180_000 }, async () => {
   const { PrismaClient } = require("@prisma/client");
   const { planRecurringCreatorAnalytics } = require("./analytics-recurring-planning-service");
@@ -1327,16 +1384,18 @@ test("A36 PostgreSQL: opposite-order transactions sharing the exact same partiti
       objectId,
       partitionKey,
     });
-    await runPhase3InterleavedTransactions({
-      dbA, dbB,
-      firstA: (tx) => publish(tx, `${prefix}-a-p1`, p1),
-      secondA: (tx) => publish(tx, `${prefix}-a-p2`, p2),
-      firstB: (tx) => publish(tx, `${prefix}-b-p2`, p2),
-      secondB: (tx) => publish(tx, `${prefix}-b-p1`, p1),
-    });
+    for (let wave = 0; wave < 6; wave += 1) {
+      await runPhase3InterleavedTransactions({
+        dbA, dbB,
+        firstA: (tx) => publish(tx, `${prefix}-${wave}-a-p1`, p1),
+        secondA: (tx) => publish(tx, `${prefix}-${wave}-a-p2`, p2),
+        firstB: (tx) => publish(tx, `${prefix}-${wave}-b-p2`, p2),
+        secondB: (tx) => publish(tx, `${prefix}-${wave}-b-p1`, p1),
+      });
+    }
     assert.equal(await dbA.domainWorkItem.count({
       where: { agencyId, objectType: "A36ExactPartitionOrderProbe" },
-    }), 4);
+    }), 24);
     assert.equal(await dbA.phase2WorkBroadClaimPartitionState.count({
       where: {
         agencyId,
@@ -1360,6 +1419,68 @@ test("A36 PostgreSQL: opposite-order transactions sharing the exact same partiti
     } finally {
       await Promise.all([dbA.$disconnect(), dbB.$disconnect()]);
     }
+  }
+});
+
+test("A37-R3 PostgreSQL: concurrent locator creation preserves earlier private work at every hierarchy level", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const observer = new PrismaClient();
+  const scopes = [];
+  try {
+    const candidates = await dbA.$queryRawUnsafe(`SELECT g::text AS key,
+      "phase3_domain_work_claim_shard"(g::text) AS shard FROM generate_series(1,1024) g ORDER BY g`);
+    const first = candidates[0];
+    const sameShard = candidates.find((row) => row.key !== first.key && row.shard === first.shard);
+    const otherShard = candidates.find((row) => row.shard !== first.shard);
+    assert.ok(sameShard && otherShard);
+    for (const level of ["partition", "shard", "agency"]) {
+      const scope = await createAgencyCreator(dbA, `a37-publication-${level}`);
+      scopes.push(scope);
+      const klass = nonce("A37_PUBLICATION");
+      const second = level === "partition" ? first : level === "shard" ? sameShard : otherShard;
+      const [{ authorityNow }] = await dbA.$queryRawUnsafe('SELECT clock_timestamp() AS "authorityNow"');
+      const future = new Date(authorityNow.getTime() + 3_600_000);
+      let holderPid;
+      let waiterPid;
+      const publish = (tx, objectId, partitionKey, availableAt) => publishDomainWork({
+        db: tx, agencyId: scope.agencyId, workClass: klass,
+        objectType: "LocatorPublicationProbe", objectId, partitionKey, availableAt,
+      });
+      await runPhase3InterleavedTransactions({
+        dbA, dbB,
+        firstA: async (tx) => {
+          [{ pid: holderPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid');
+          await publish(tx, `${klass}-future`, first.key, future);
+          // Execute the real deferred writer and retain its locks until the peer
+          // has actually waited. There are no production timing hooks here.
+          await tx.$executeRawUnsafe('SET CONSTRAINTS "trg_phase3_domain_work_claim_locator_mutation_flush" IMMEDIATE');
+        },
+        firstB: async (tx) => {
+          [{ pid: waiterPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid');
+          await publish(tx, `${klass}-earlier`, second.key, authorityNow);
+        },
+        secondA: async () => { await waitForPhase3PostgresBlock({ db: observer, holderPid, waiterPid }); },
+        secondB: (tx) => tx.$executeRawUnsafe('SET CONSTRAINTS "trg_phase3_domain_work_claim_locator_mutation_flush" IMMEDIATE'),
+      });
+      const partition = await dbA.phase2WorkBroadClaimPartitionState.findFirst({ where: {
+        agencyId: scope.agencyId, workClass: klass, partitionKey: second.key,
+      } });
+      const shard = await dbA.domainWorkClaimShardState.findFirst({ where: {
+        agencyId: scope.agencyId, workClass: klass, claimShard: second.shard,
+      } });
+      const agency = await dbA.domainWorkClaimAgencyState.findFirst({ where: { agencyId: scope.agencyId, workClass: klass } });
+      const [{ checkedAt }] = await dbA.$queryRawUnsafe('SELECT clock_timestamp() AS "checkedAt"');
+      for (const at of [partition?.nextClaimableAt, shard?.nextDispatchAt, agency?.nextDispatchAt]) {
+        assert.ok(at instanceof Date && at <= checkedAt && at < future, `${level}: earlier work must remain dispatchable`);
+      }
+      assert.equal(await dbA.domainWorkItem.count({ where: { agencyId: scope.agencyId, workClass: klass } }), 2);
+    }
+    console.log("# A37_LOCATOR_CONCURRENT_PUBLICATION_EARLIER_WAKE_PASS");
+  } finally {
+    try { for (const scope of scopes) await cleanupPhase3PostgresAgencyFixture(dbA, scope.agencyId); }
+    finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect(), observer.$disconnect()]); }
   }
 });
 

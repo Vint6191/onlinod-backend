@@ -50,6 +50,8 @@ const DEFAULT_FILES = Object.freeze([
   "src/services/analytics-collection-planner.js",
   "src/services/analytics-recurring-planning-service.js",
   "src/services/analytics-recurring-planning-service.test.js",
+  "src/services/analytics-demand-planning-service.test.js",
+  "src/services/analytics-demand-planning-service.js",
   "src/services/job-planning-repository.js",
   "src/services/analytics-collection-planner.test.js",
   "src/services/job-scheduler-daily-cycle.test.js",

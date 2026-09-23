@@ -975,11 +975,22 @@ async function processAnalyticsDemand({
     if (!await analyticsDemandAccessFenceCurrent({ db, demand })) {
       return finish({ cancellationReason: "ANALYTICS_DEMAND_ACCESS_EPOCH_CHANGED" });
     }
-    const result = await ensureAnalyticsWindowFreshness({
-      db, creatorId: creator.id, agencyId: creator.agencyId, startDay: from, endDay: to,
-      displayRangeKey: demand.rangeKey, reason: demand.reason, priority: demand.priority,
-      now: processNow, coverageRows: byCreator.get(creator.id) || [],
-    });
+    const { planAnalyticsDemandCreator } = require("./analytics-demand-planning-service");
+    let result;
+    try {
+      result = await planAnalyticsDemandCreator({
+        db, demand, member: authority.member, creator, startDay: from, endDay: to,
+        now: processNow, coverageRows: byCreator.get(creator.id) || [],
+      });
+    } catch (error) {
+      if (error?.code === "ANALYTICS_DEMAND_PLANNING_CLAIM_LOST") return finish();
+      if (["MANAGEMENT_ACCESS_STALE", "MANAGEMENT_ACCESS_REVOKED", "MANAGEMENT_USER_DISABLED",
+        "MANAGEMENT_PERMISSION_REVOKED", "MANAGEMENT_CREATOR_SCOPE_REVOKED", "MANAGEMENT_CREATOR_RETIRED",
+        "MANAGEMENT_AGENCY_RETIRED", "MANAGEMENT_AGENCY_NOT_FOUND"].includes(error?.code)) {
+        return finish({ cancellationReason: error.code });
+      }
+      throw error;
+    }
     created += result.created;
     reused += result.reused;
     dueDays += result.dueDays;

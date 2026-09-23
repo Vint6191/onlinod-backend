@@ -23,6 +23,7 @@ const CONTRACT_PROOFS = [
   "src/services/domain-work-authority-service.test.js",
   "src/services/phase2-actual53-domain-work-scale-generation.test.js",
   "src/services/analytics-recurring-planning-service.test.js",
+  "src/services/analytics-demand-planning-service.test.js",
   "src/services/analytics-collection-planner.test.js",
   "src/services/phase3-a32-durable-derived-planning-proof-authority.test.js",
   "src/services/phase3-postgres-proof-contract.test.js",

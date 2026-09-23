@@ -1,8 +1,8 @@
 {
-  "version": "A37-R2",
+  "version": "A37-R3",
   "algorithm": "sha256-canonical-json-files-v1",
-  "testCount": 69,
-  "manifestSha256": "565b44c6e564c6bfaee588d500982c63414e1febac889d17347962332a2232dc",
+  "testCount": 71,
+  "manifestSha256": "38bf9dd975016c377dbd242a337610fef76ba0567d3796e6e75d046a8cc7158a",
   "files": [
     {
       "file": "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js",
@@ -114,6 +114,7 @@
         "A36 PostgreSQL: Analytics expiry fences progress and settlement while restart preserves the unfinished cycle",
         "A36 PostgreSQL: Analytics renew and settlement reject leases that expire during an observed row-lock wait",
         "A36 PostgreSQL: scoped Home demand yields durable progress and a second client finishes without planning unrequested creators",
+        "A37-R3 PostgreSQL: Home planning expiry rolls back real jobs and cursor then safely retries",
         "A37 PostgreSQL: recurring Analytics planning rolls back partial jobs and rejects expired ownership",
         "A37 PostgreSQL: two replicas share one directory budget and rollback releases the reservation",
         "A37 PostgreSQL: planning commit authority rejects expiry after an observed work-row wait",
@@ -124,6 +125,7 @@
         "A36 PostgreSQL: 1000 agencies publish 4000 creators and two replicas claim tenant-fair disjoint batches",
         "A36 PostgreSQL: opposite-order multi-write transactions defer exact partition-shard-Agency reconciliation without deadlock",
         "A36 PostgreSQL: opposite-order transactions sharing the exact same partitions cannot retain the retired row-trigger inversion",
+        "A37-R3 PostgreSQL: concurrent locator creation preserves earlier private work at every hierarchy level",
         "A36 PostgreSQL: destructive internal authority requires the exact live claim and preserves child composition",
         "A34 PostgreSQL: expired recurring claim is fenced, restart takes over and creator lifecycle revokes/reopens work",
         "A37-R2 PostgreSQL: stale sorted Agency and shard candidates cannot survive a concurrent reservation",
