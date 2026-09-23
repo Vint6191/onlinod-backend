@@ -1,6 +1,6 @@
 /* src/routes/admin-data.js — Onlinod admin "deep data" surface
    ────────────────────────────────────────────────────────────
-   Super-admin tools to inspect / search / clean every data entity
+   Admin tools to inspect / search data and issue typed archive commands
    across all agencies and creators. Mounted at /api/admin/data and
    protected by the same adminRequired guard as admin.js.
 
@@ -23,11 +23,10 @@
    Search:
      GET  /data/search                      — ?q  (global: fan, username, messageId, creator, agency)
 
-   Health / cleanup:
+   Health / typed archive:
      GET  /data/anomalies                   — duplicate deliveries, stuck bumps, orphans, etc.
-     DELETE /data/record/:model/:id         — delete one record (?hard=1 for non-soft models)
-     POST /data/bulk-delete                 — { model, ids:[] }  bulk delete
-     POST /data/purge-deliveries            — { creatorId?, statuses:[], olderThanDays? }
+     POST /data/creators/:id/archive-deliveries — explicit bounded selection
+     Legacy generic delete / bulk-delete / purge-deliveries return 410.
    ──────────────────────────────────────────────────────────── */
 
 "use strict";
@@ -38,7 +37,7 @@ const { adminRequired } = require("../middleware/admin");
 const { adminHttpAuditMiddleware } = require("../middleware/admin-audit");
 const { listHiddenOnline } = require("../services/subscriber-directory-service");
 const { listFollowBack } = require("../services/follow-back-service");
-const { partitionAutomationDeliveryHardDeleteCandidates } = require("../services/automation-delivery-hard-delete-guard");
+const { archiveDeliveriesHandler } = require("./admin-command-handlers");
 
 const router = express.Router();
 router.use(adminRequired);
@@ -68,56 +67,12 @@ async function resolveCreatorScope(creatorId, agencyId = null) {
   return creator;
 }
 
-async function adminLog(req, data) {
-  try { await prisma.adminActionLog.create({ data: { adminUserId: req.admin.id, ...data } }); }
-  catch (err) { console.warn("[adminData.log] failed:", err?.message || err); }
-}
-
 function sendErr(res, err, code = "ADMIN_DATA_FAILED") {
   const status = Number(err?.status || 500) || 500;
   return res.status(status).json({ ok: false, code: err?.code || code, error: String(err?.message || "Failed") });
 }
 
-const DELIVERY_DELETE_SELECT = {
-  id: true,
-  agencyId: true,
-  creatorId: true,
-  moduleKey: true,
-  actionType: true,
-  payload: true,
-  generation: true,
-  fanId: true,
-  targetId: true,
-};
-
-async function purgeAutomationDeliveriesBounded(where) {
-  let deleted = 0;
-  let protectedCount = 0;
-  let cursorId = null;
-  for (;;) {
-    const rows = await prisma.automationDelivery.findMany({
-      where: cursorId ? { AND: [where, { id: { gt: cursorId } }] } : where,
-      select: DELIVERY_DELETE_SELECT,
-      orderBy: { id: "asc" },
-      take: 500,
-    });
-    if (!rows.length) break;
-    cursorId = rows[rows.length - 1].id;
-    const partition = await partitionAutomationDeliveryHardDeleteCandidates({ db: prisma, rows });
-    protectedCount += partition.protected.length;
-    if (partition.deletable.length) {
-      const result = await prisma.automationDelivery.deleteMany({
-        where: { AND: [where, { id: { in: partition.deletable.map((row) => row.id) } }] },
-      });
-      deleted += result.count;
-    }
-    if (rows.length < 500) break;
-  }
-  return { deleted, protected: protectedCount };
-}
-
-// Whitelist of models the generic inspect/delete can touch, mapped to the
-// prisma delegate + whether they support soft-delete (deletedAt).
+// Whitelist for inspection only. Mutations belong to typed domain commands.
 const MODELS = {
   crmProfile:         { d: () => prisma.crmProfile,         soft: false },
   crmProfileTag:      { d: () => prisma.crmProfileTag,      soft: false },
@@ -505,130 +460,12 @@ router.get("/inspect/:model/:id", async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 // DELETE — single record (soft if supported & ?hard not set)
 // ════════════════════════════════════════════════════════════════
-router.delete("/record/:model/:id", async (req, res) => {
-  try {
-    const m = MODELS[req.params.model];
-    if (!m) return res.status(400).json({ ok: false, code: "MODEL_NOT_ALLOWED" });
-    if (m.deleteProtected) return res.status(403).json({ ok: false, code: "ADMIN_DELETE_PROTECTED", error: "This authority record cannot be deleted through generic admin data APIs" });
-    const hard = String(req.query.hard || "") === "1";
-    const id = req.params.id;
-
-    let result;
-    if (m.soft && !hard) {
-      result = await m.d().update({ where: { id }, data: { deletedAt: new Date() } });
-    } else {
-      result = await m.d().delete({ where: { id } });
-    }
-    await adminLog(req, { action: "data.delete", targetType: req.params.model, targetId: id, after: { hard } });
-    return res.json({ ok: true, deleted: true, hard: hard || !m.soft, id });
-  } catch (err) { return sendErr(res, err); }
-});
-
-// ════════════════════════════════════════════════════════════════
-// BULK DELETE — { model, ids:[], hard? }
-// ════════════════════════════════════════════════════════════════
-router.post("/bulk-delete", async (req, res) => {
-  try {
-    const m = MODELS[req.body?.model];
-    if (!m) return res.status(400).json({ ok: false, code: "MODEL_NOT_ALLOWED" });
-    if (m.deleteProtected) return res.status(403).json({ ok: false, code: "ADMIN_DELETE_PROTECTED", error: "This authority record cannot be deleted through generic admin data APIs" });
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).filter(Boolean) : [];
-    if (!ids.length) return res.status(400).json({ ok: false, code: "NO_IDS" });
-    const hard = req.body?.hard === true;
-
-    let count = 0;
-    if (m.soft && !hard) {
-      const r = await m.d().updateMany({ where: { id: { in: ids } }, data: { deletedAt: new Date() } });
-      count = r.count;
-    } else {
-      const r = await m.d().deleteMany({ where: { id: { in: ids } } });
-      count = r.count;
-    }
-    await adminLog(req, { action: "data.bulkDelete", targetType: req.body.model, after: { count, hard } });
-    return res.json({ ok: true, deleted: count });
-  } catch (err) { return sendErr(res, err); }
-});
-
-// ════════════════════════════════════════════════════════════════
-// PURGE DELIVERIES — targeted cleanup (clones + stuck + by status/age)
-// ════════════════════════════════════════════════════════════════
-router.post("/purge-deliveries", async (req, res) => {
-  try {
-    const creatorId = str(req.body?.creatorId);
-    const statuses = Array.isArray(req.body?.statuses) ? req.body.statuses.map(String) : [];
-    const olderThanDays = Number(req.body?.olderThanDays) || 0;
-    const dedupeClones = req.body?.dedupeClones === true;
-
-    let deletedClones = 0;
-    let protectedClones = 0;
-    if (dedupeClones) {
-      // Keep newest row per (creatorId, messageId), delete the rest.
-      const rows = await prisma.automationDelivery.findMany({
-        where: {
-          originKind: "AUTOMATION",
-          status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] },
-          AND: [
-            { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
-            { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
-            { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
-          ],
-          messageId: { not: null },
-          ...(creatorId ? { creatorId } : {}),
-        },
-        select: { ...DELIVERY_DELETE_SELECT, messageId: true, updatedAt: true },
-        orderBy: { updatedAt: "desc" },
-        take: 10000});
-      const seen = new Set();
-      const toDelete = [];
-      for (const r of rows) {
-        const key = `${r.creatorId}||${r.messageId}`;
-        if (seen.has(key)) toDelete.push(r); else seen.add(key);
-      }
-      const partition = await partitionAutomationDeliveryHardDeleteCandidates({ db: prisma, rows: toDelete });
-      protectedClones = partition.protected.length;
-      const deletableIds = partition.deletable.map((row) => row.id);
-      for (let i = 0; i < deletableIds.length; i += 500) {
-        const r = await prisma.automationDelivery.deleteMany({ where: {
-          id: { in: deletableIds.slice(i, i + 500) },
-          originKind: "AUTOMATION",
-          status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] },
-          AND: [
-            { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
-            { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
-            { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
-          ],
-        } });
-        deletedClones += r.count;
-      }
-    }
-
-    let deletedByFilter = 0;
-    let protectedByFilter = 0;
-    if (statuses.length || olderThanDays > 0) {
-      const terminalStatuses = new Set(["COMPLETED", "FAILED", "SKIPPED", "CANCELED"]);
-      const safeStatuses = statuses.filter((status) => terminalStatuses.has(status));
-      const where = {
-        originKind: "AUTOMATION",
-        status: { in: safeStatuses.length ? safeStatuses : [...terminalStatuses] },
-        AND: [
-          { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
-          { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
-          { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
-        ],
-      };
-      if (creatorId) where.creatorId = creatorId;
-      if (olderThanDays > 0) {
-        const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
-        where.OR = [{ sentAt: { lt: cutoff } }, { sentAt: null, createdAt: { lt: cutoff } }];
-      }
-      const purge = await purgeAutomationDeliveriesBounded(where);
-      deletedByFilter = purge.deleted;
-      protectedByFilter = purge.protected;
-    }
-
-    await adminLog(req, { action: "data.purgeDeliveries", targetType: "automationDelivery", after: { creatorId, statuses, olderThanDays, dedupeClones, deletedClones, deletedByFilter, protectedClones, protectedByFilter } });
-    return res.json({ ok: true, deletedClones, deletedByFilter, protectedClones, protectedByFilter, total: deletedClones + deletedByFilter });
-  } catch (err) { return sendErr(res, err); }
-});
+function retiredMutation(_req, res) {
+  return res.status(410).json({ ok: false, code: "ADMIN_DATA_MUTATION_RETIRED", error: "Generic deletion and purge are retired. Use the owning domain; terminal delivery archival requires an explicit creator, selection, cutoff and reason." });
+}
+router.delete("/record/:model/:id", retiredMutation);
+router.post("/bulk-delete", retiredMutation);
+router.post("/purge-deliveries", retiredMutation);
+router.post("/creators/:id/archive-deliveries", archiveDeliveriesHandler);
 
 module.exports = router;

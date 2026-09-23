@@ -53,7 +53,14 @@ const bulkPricingSchema = z.object({
 }).strict().refine(value => new Set(value.items.map(item => item.creatorId)).size === value.items.length, "Duplicate creator selection")
   .refine(value => value.tier !== "CUSTOM" || value.corePriceCents !== undefined, "CUSTOM requires an explicit core price");
 
+const deliveryArchiveSchema = z.object({
+  agencyId: z.string().trim().min(1).max(180), reason: reasonSchema,
+  olderThan: z.string().datetime(),
+  items: z.array(z.object({ id: z.string().trim().min(1).max(180), expectedUpdatedAt: z.string().datetime() }).strict()).min(1).max(100),
+}).strict().refine(value => new Set(value.items.map(item => item.id)).size === value.items.length, "Duplicate delivery selection");
+
 const ACTIONS = Object.freeze({
+  "data.delivery.archive": { roles: ["SUPER_ADMIN"], schema: deliveryArchiveSchema },
   "billing.pricing.bulk.cancel": { roles: ["SUPER_ADMIN", "SUPPORT"], parentIdentity: true, schema: z.object({ targetCommandId: commandIdSchema, reason: reasonSchema }).strict() },
   "billing.pricing.bulk": { resumeIdentity: true, roles: ["SUPER_ADMIN", "SUPPORT"], schema: bulkPricingSchema },
   "billing.policy.set": { roles: ["SUPER_ADMIN", "SUPPORT"], schema: billingPolicySchema },
@@ -96,4 +103,4 @@ function publicAdmin(row) {
   return { id: row.id, email: row.email, name: row.name, role: row.role, active: row.active, accessEpoch: row.accessEpoch, lastLoginAt: row.lastLoginAt || null, createdAt: row.createdAt };
 }
 
-module.exports = { bulkPricingSchema, billingPolicySchema, billingHoldSchema, entitlementSchema, ACTIONS, adminError, canonicalJson, commandIdSchema, revisionSchema, reasonSchema, pricingSchema, intentHash, passwordFingerprint, commandRequest, publicAdmin };
+module.exports = { deliveryArchiveSchema, bulkPricingSchema, billingPolicySchema, billingHoldSchema, entitlementSchema, ACTIONS, adminError, canonicalJson, commandIdSchema, revisionSchema, reasonSchema, pricingSchema, intentHash, passwordFingerprint, commandRequest, publicAdmin };

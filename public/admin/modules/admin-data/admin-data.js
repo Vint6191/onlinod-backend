@@ -3,8 +3,8 @@
    "Data" section — deep explorer over every data entity.
      - Health: anomaly detector (clones, stuck bumps, orphans…)
      - Browser: pick an entity, filter by agency/creator, view rows
-     - Inspect any row as raw JSON, delete single or bulk
-     - One-click cleanup actions (dedupe clones / purge stuck)
+     - Inspect rows as raw JSON; archive explicit terminal deliveries
+     - Mutations use typed commands with durable receipts
    Depends on window.OnlinodAdminApi data* methods.
    ──────────────────────────────────────────────────────────── */
 (function () {
@@ -14,7 +14,7 @@
   const R = () => window.OnlinodAdminRouter;
   const esc = (v) => R().escapeHtml(v);
 
-  // entity key → { label, api(query), columns:[{k,label,fmt?}], model (for delete) }
+  // entity key → { label, api(query), columns:[{k,label,fmt?}], model (for inspection) }
   const ENTITIES = {
     "crm-profiles": {
       label: "CRM Profiles", model: "crmProfile",
@@ -40,7 +40,7 @@
       ],
     },
     "deliveries": {
-      label: "Bump Deliveries", model: "automationDelivery",
+      label: "Automation Deliveries", model: "automationDelivery",
       api: (q) => A().dataDeliveries(q),
       cols: [
         { k: "fanId", label: "Fan" },
@@ -107,14 +107,14 @@
   }
 
   // local view state (kept on the module, simple)
-  const view = { tab: "health", entity: "deliveries", filters: { agencyId: "", creatorId: "" }, rows: [], total: 0, statusCounts: null, selected: new Set(), loading: false };
+  const view = { tab: "health", entity: "deliveries", filters: { agencyId: "", creatorId: "" }, rows: [], total: 0, statusCounts: null, selected: new Set(), loading: false, requestId: 0 };
 
   async function render(main) {
     main.innerHTML = `
       <div class="adm-page">
         <div class="adm-page-head">
           <h1>Data Explorer</h1>
-          <div class="adm-page-sub">inspect, search and clean every entity across all agencies</div>
+          <div class="adm-page-sub">inspect data; archive selected terminal deliveries with a reason</div>
         </div>
         <div class="adm-tabs">
           <button class="adm-tab ${view.tab === "health" ? "active" : ""}" data-tab="health">Health</button>
@@ -141,35 +141,19 @@
           <span class="adm-anomaly-count">${esc(a.count != null ? a.count : "")}</span>
         </div>
         <div class="adm-anomaly-detail">${esc(a.detail)}</div>
-        ${a.key === "delivery_clones" && a.count > 0 ? `<button class="adm-btn adm-btn-sm adm-btn-warn" data-fix="dedupe">dedupe clones</button>` : ""}
-        ${a.key === "stuck_bumps" && a.count > 0 ? `<button class="adm-btn adm-btn-sm adm-btn-warn" data-fix="purge-stuck">purge stuck</button>` : ""}
       </div>`).join("");
 
     body.innerHTML = `
       <div class="adm-anomaly-grid">${cards}</div>
       <div class="adm-muted" style="margin-top:12px">checked ${esc(fmtDate(r.checkedAt))}</div>`;
 
-    body.querySelector('[data-fix="dedupe"]')?.addEventListener("click", async (e) => {
-      if (!confirm("Delete all duplicate delivery clones (keep newest per messageId)?")) return;
-      e.target.disabled = true; e.target.textContent = "working…";
-      const res = await A().dataPurgeDeliveries({ dedupeClones: true });
-      R().toast(res?.ok ? `removed ${res.deletedClones} clones` : "failed", res?.ok ? "ok" : "error");
-      renderHealth(body);
-    });
-    body.querySelector('[data-fix="purge-stuck"]')?.addEventListener("click", async (e) => {
-      if (!confirm("Delete stuck bumps (pending/checking older than 3 days)?")) return;
-      e.target.disabled = true; e.target.textContent = "working…";
-      const res = await A().dataPurgeDeliveries({ statuses: ["pending_reply", "checking_reply"], olderThanDays: 3 });
-      R().toast(res?.ok ? `purged ${res.deletedByFilter}` : "failed", res?.ok ? "ok" : "error");
-      renderHealth(body);
-    });
+    body.insertAdjacentHTML("beforeend", '<p class="adm-muted">Inspect anomalies before acting. Stuck work uses its recovery flow. Terminal archival is available in Browse for one agency and creator.</p>');
   }
 
   // ── BROWSE (entity tables) ──────────────────────────────────
   async function renderBrowse(body) {
     const opts = Object.entries(ENTITIES).map(([k, v]) => `<option value="${k}" ${k === view.entity ? "selected" : ""}>${esc(v.label)}</option>`).join("");
-    const currentEntity = ENTITIES[view.entity];
-    const readOnlyCurrent = !currentEntity?.model;
+    const readOnlyCurrent = view.entity !== "deliveries";
     body.innerHTML = `
       <div class="adm-data-controls">
         <select id="admEntity">${opts}</select>
@@ -177,30 +161,35 @@
         <input id="admFCreator" placeholder="creatorId (optional)" value="${esc(view.filters.creatorId)}" />
         <button class="adm-btn adm-btn-sm" id="admLoad">load</button>
         <span class="adm-flex-spacer"></span>
-        <button class="adm-btn adm-btn-sm adm-btn-danger" id="admBulkDel" ${readOnlyCurrent ? "hidden" : ""} disabled>delete selected</button>
+        <button class="adm-btn adm-btn-sm adm-btn-danger" id="admBulkDel" ${readOnlyCurrent ? "hidden" : ""} disabled>archive selected</button>
+        <input id="admArchiveCutoff" type="datetime-local" aria-label="Archive records finished before (UTC)" />
+        <input id="admArchiveReason" placeholder="Archive reason" maxlength="500" />
+        <span class="adm-muted">Archive cutoff is UTC. Maximum 100 selected terminal records; monthly counters are preserved.</span>
       </div>
       <div id="admDataTable"><div class="adm-muted">pick an entity and press load</div></div>`;
 
     body.querySelector("#admEntity").addEventListener("change", (e) => {
       view.entity = e.target.value;
-      view.selected.clear();
+      view.selected.clear(); view.rows = []; view.requestId++;
       const bulk = body.querySelector("#admBulkDel");
-      if (bulk) { bulk.hidden = !ENTITIES[view.entity]?.model; bulk.disabled = true; bulk.textContent = "delete selected"; }
+      if (bulk) { bulk.hidden = view.entity !== "deliveries"; bulk.disabled = true; bulk.textContent = "archive selected"; }
       const table = body.querySelector("#admDataTable");
       if (table) table.innerHTML = `<div class="adm-muted">press load to view ${esc(ENTITIES[view.entity]?.label || "entity")}</div>`;
     });
     body.querySelector("#admLoad").addEventListener("click", () => loadEntity(body));
-    body.querySelector("#admBulkDel").addEventListener("click", () => bulkDelete(body));
+    body.querySelector("#admBulkDel").addEventListener("click", () => archiveSelected(body));
   }
 
   async function loadEntity(body) {
     view.filters.agencyId = body.querySelector("#admFAgency").value.trim();
     view.filters.creatorId = body.querySelector("#admFCreator").value.trim();
-    view.selected.clear();
+    view.selected.clear(); view.rows = []; updateBulkBtn(body);
+    const requestId = ++view.requestId;
     const table = body.querySelector("#admDataTable");
     table.innerHTML = `<div class="adm-loading">loading…</div>`;
     const ent = ENTITIES[view.entity];
     const r = await ent.api({ agencyId: view.filters.agencyId || undefined, creatorId: view.filters.creatorId || undefined, limit: 200 });
+    if (requestId !== view.requestId) return;
     if (!r || !r.ok) { table.innerHTML = `<div class="adm-error">load failed</div>`; return; }
     view.rows = r.items || [];
     view.total = r.total != null ? r.total : view.rows.length;
@@ -214,50 +203,52 @@
     const statusBar = view.statusCounts
       ? `<div class="adm-status-bar">${Object.entries(view.statusCounts).map(([s, n]) => `<span>${esc(s)}: <b>${esc(n)}</b></span>`).join("")}</div>` : "";
 
-    const readOnly = !ent.model;
-    const head = `<tr>${readOnly ? "" : '<th class="adm-col-check"><input type="checkbox" id="admChkAll"></th>'}${ent.cols.map((c) => `<th>${esc(c.label)}</th>`).join("")}${readOnly ? "" : "<th></th>"}</tr>`;
+    const readOnly = view.entity !== "deliveries";
+    const head = `<tr>${readOnly ? "" : '<th class="adm-col-check"><input type="checkbox" id="admChkAll"></th>'}${ent.cols.map((c) => `<th>${esc(c.label)}</th>`).join("")}${ent.model ? "<th></th>" : ""}</tr>`;
     const rows = view.rows.map((row) => {
       const cells = ent.cols.map((c) => {
         const raw = row[c.k];
         const val = c.fmt ? c.fmt(raw, row) : (raw == null ? "—" : String(raw));
         return `<td title="${esc(typeof raw === "object" ? JSON.stringify(raw) : raw)}">${esc(truncate(val, 40))}</td>`;
       }).join("");
-      if (readOnly) return `<tr>${cells}</tr>`;
+      if (!ent.model) return `<tr>${cells}</tr>`;
       return `<tr data-id="${esc(row.id)}">
-        <td class="adm-col-check"><input type="checkbox" class="admRowChk" data-id="${esc(row.id)}"></td>
+        ${readOnly ? "" : `<td class="adm-col-check"><input type="checkbox" class="admRowChk" data-id="${esc(row.id)}" ${canSelect(row) ? "" : "disabled"}></td>`}
         ${cells}
         <td class="adm-row-actions">
           <button class="adm-link" data-inspect="${esc(row.id)}">inspect</button>
-          <button class="adm-link adm-link-danger" data-del="${esc(row.id)}">del</button>
         </td>
       </tr>`;
     }).join("");
 
     table.innerHTML = `
       ${statusBar}
-      <div class="adm-muted" style="margin:6px 0">${view.rows.length} shown of ${view.total} total${readOnly ? " · canonical current · read-only" : ""}</div>
+      <div class="adm-muted" style="margin:6px 0">${view.rows.length} shown of ${view.total} total${readOnly ? " · read-only" : ""}</div>
       <table class="adm-table"><thead>${head}</thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows</td></tr>`}</tbody></table>`;
 
-    if (readOnly) { updateBulkBtn(body); return; }
+    table.querySelectorAll("[data-inspect]").forEach((b) => b.addEventListener("click", () => inspect(ent.model, b.dataset.inspect)));
+    updateBulkBtn(body);
+    if (readOnly) return;
 
     // select-all
     table.querySelector("#admChkAll")?.addEventListener("change", (e) => {
-      table.querySelectorAll(".admRowChk").forEach((c) => { c.checked = e.target.checked; toggleSel(c.dataset.id, e.target.checked); });
+      view.selected.clear();
+      table.querySelectorAll(".admRowChk").forEach((c) => { if (!c.disabled) { c.checked = e.target.checked && view.selected.size < 100; toggleSel(c.dataset.id, c.checked); } });
       updateBulkBtn(body);
     });
-    table.querySelectorAll(".admRowChk").forEach((c) => c.addEventListener("change", () => { toggleSel(c.dataset.id, c.checked); updateBulkBtn(body); }));
-    table.querySelectorAll("[data-inspect]").forEach((b) => b.addEventListener("click", () => inspect(ent.model, b.dataset.inspect)));
-    table.querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", () => delOne(body, ent.model, b.dataset.del)));
+    table.querySelectorAll(".admRowChk").forEach((c) => c.addEventListener("change", () => { toggleSel(c.dataset.id, c.checked); c.checked = view.selected.has(c.dataset.id); updateBulkBtn(body); }));
+
+
   }
 
-  function toggleSel(id, on) { if (on) view.selected.add(id); else view.selected.delete(id); }
+  function toggleSel(id, on) { if (!on) view.selected.delete(id); else if (view.selected.size < 100) view.selected.add(id); }
   function updateBulkBtn(body) {
     const b = body.querySelector("#admBulkDel");
     if (!b) return;
-    const mutable = Boolean(ENTITIES[view.entity]?.model);
+    const mutable = view.entity === "deliveries";
     b.hidden = !mutable;
-    b.disabled = !mutable || view.selected.size === 0;
-    b.textContent = mutable && view.selected.size ? `delete selected (${view.selected.size})` : "delete selected";
+    b.disabled = view.loading || !mutable || view.selected.size === 0;
+    b.textContent = mutable && view.selected.size ? `archive selected (${view.selected.size})` : "archive selected";
   }
 
   async function inspect(model, id) {
@@ -267,22 +258,25 @@
     showModal(`${model} · ${id}`, `<pre class="adm-json">${esc(JSON.stringify(r.record, null, 2))}</pre>`);
   }
 
-  async function delOne(body, model, id) {
-    if (!model) return;
-    if (!confirm(`Delete this ${model}? (soft if supported)`)) return;
-    const r = await A().dataDeleteRecord(model, id);
-    R().toast(r?.ok ? "deleted" : "delete failed", r?.ok ? "ok" : "error");
-    if (r?.ok) loadEntity(body);
+  function canSelect(row) {
+    return row.originKind === "AUTOMATION" && ["COMPLETED","FAILED","SKIPPED","CANCELED"].includes(row.status) && row.finishedAt && row.updatedAt && row.agencyId === view.filters.agencyId && row.creatorId === view.filters.creatorId;
   }
-
-  async function bulkDelete(body) {
-    const ent = ENTITIES[view.entity];
-    const ids = Array.from(view.selected);
-    if (!ent.model || !ids.length) return;
-    if (!confirm(`Delete ${ids.length} ${ent.label} records?`)) return;
-    const r = await A().dataBulkDelete({ model: ent.model, ids });
-    R().toast(r?.ok ? `deleted ${r.deleted}` : "bulk delete failed", r?.ok ? "ok" : "error");
-    if (r?.ok) loadEntity(body);
+  async function archiveSelected(body) {
+    if (view.loading || view.entity !== "deliveries" || !view.selected.size) return;
+    const reason = body.querySelector("#admArchiveReason").value.trim();
+    const cutoff = body.querySelector("#admArchiveCutoff").value;
+    const olderThan = cutoff ? new Date(cutoff + "Z") : null;
+    if (!view.filters.agencyId || !view.filters.creatorId || !reason || !olderThan || !Number.isFinite(olderThan.getTime())) { R().toast("Load one agency and creator; supply cutoff (UTC) and reason", "error"); return; }
+    const items = view.rows.filter(row => view.selected.has(row.id) && canSelect(row)).map(row => ({ id: row.id, expectedUpdatedAt: row.updatedAt })).sort((a,b) => a.id.localeCompare(b.id));
+    if (!items.length || items.length !== view.selected.size) { R().toast("Reload selection", "error"); return; }
+    if (!confirm(`Archive ${items.length} terminal records before ${olderThan.toISOString()}? Monthly counters are preserved.`)) return;
+    view.loading = true; updateBulkBtn(body);
+    try {
+      const r = await A().dataArchiveDeliveries(view.filters.creatorId, { agencyId: view.filters.agencyId, reason, olderThan: olderThan.toISOString(), items });
+      R().toast(r?.ok ? `archived ${r.archived}` : (r?.error || "Archive result unknown; retry the same selection"), r?.ok ? "ok" : "error");
+      if (r?.ok) await loadEntity(body);
+    } catch (_) { R().toast("Archive result unknown; retry the same selection", "error"); }
+    finally { view.loading = false; updateBulkBtn(body); }
   }
 
   function truncate(s, n) { s = String(s); return s.length > n ? s.slice(0, n) + "…" : s; }

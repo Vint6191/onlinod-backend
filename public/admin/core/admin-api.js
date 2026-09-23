@@ -193,9 +193,7 @@
     dataMoney:         (query)  => request("/api/admin/data/money", { query }),
     dataContent:       (query)  => request("/api/admin/data/content", { query }),
     dataInspect:       (model, id) => request(`/api/admin/data/inspect/${encodeURIComponent(model)}/${encodeURIComponent(id)}`),
-    dataDeleteRecord:  (model, id, query) => request(`/api/admin/data/record/${encodeURIComponent(model)}/${encodeURIComponent(id)}`, { method: "DELETE", query }),
-    dataBulkDelete:    (body)   => request("/api/admin/data/bulk-delete", { method: "POST", body }),
-    dataPurgeDeliveries:(body)  => request("/api/admin/data/purge-deliveries", { method: "POST", body }),
+    dataArchiveDeliveries: (id, body) => request(`/api/admin/data/creators/${encodeURIComponent(id)}/archive-deliveries`, { method: "POST", body }),
 
     // ─── billing management (admin-billing.js) ────────────────
     billingOverview:   ()       => request("/api/admin/billing/overview"),

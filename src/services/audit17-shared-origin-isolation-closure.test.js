@@ -25,13 +25,13 @@ test("Audit17 automation product control is origin-isolated while shared write l
   assert.doesNotMatch(action, /creatorId\s*\+\s*originKind/);
 });
 
-test("Audit17 admin and retention cannot destroy programmatic idempotency authority", () => {
+test("Audit17 generic admin mutations are retired and typed archive is origin-isolated", () => {
   const admin = fs.readFileSync(path.join(__dirname, "..", "routes", "admin-data.js"), "utf8");
   const history = read("automation-history-service.js");
-  assert.match(admin, /automationDelivery:\s*\{[^}]*deleteProtected:\s*true/);
-  assert.match(admin, /ADMIN_DELETE_PROTECTED/);
-  assert.match(admin, /purge-deliveries[\s\S]*originKind:\s*"AUTOMATION"[\s\S]*COMPLETED[\s\S]*FAILED[\s\S]*SKIPPED[\s\S]*CANCELED/);
-  assert.match(history, /deleteMany\(\{\s*where:\s*\{\s*id:\s*\{\s*in:\s*candidates\.map[\s\S]*originKind:\s*"AUTOMATION"/);
+  for (const route of ['/record/:model/:id','/bulk-delete','/purge-deliveries']) assert.ok(admin.includes('"' + route + '", retiredMutation'));
+  assert.match(admin, /status\(410\)/); assert.doesNotMatch(admin, /deleteMany|updateMany/);
+  assert.match(history, /DELETE FROM "AutomationDelivery"[\s\S]*originKind" = 'AUTOMATION'[\s\S]*status" IN \('COMPLETED','FAILED','SKIPPED','CANCELED'\)/);
+  assert.match(history, /RETURNING d\.\*/);
 });
 
 test("Audit17 origin isolation never splits the global creator physical-write lane", () => {
@@ -48,70 +48,24 @@ test("Audit17 programmatic semantic IDs stay typed instead of overloading Automa
 });
 
 
-test("Audit17 operational maintenance scripts cannot delete programmatic write receipts", () => {
+test("Audit17 operational purge and dedupe entrypoints fail closed without a DB connection", () => {
   const root = path.join(__dirname, "..", "..");
   for (const relative of ["scripts/maintenance/dedupe-deliveries.js", "scripts/maintenance/purge-stuck-deliveries.js", "dedupe-deliveries.js", "purge-stuck-deliveries.js"]) {
     const source = fs.readFileSync(path.join(root, relative), "utf8");
-    assert.match(source, /originKind:\s*"AUTOMATION"/);
-    const deletes = source.match(/automationDelivery\.deleteMany\([\s\S]*?\);/g) || [];
-    for (const statement of deletes) assert.match(statement, /originKind:\s*"AUTOMATION"/);
-    if (relative.includes("dedupe-deliveries")) {
-      assert.match(source, /TERMINAL_STATUSES/);
-      for (const statement of deletes) assert.match(statement, /status:\s*\{\s*in:\s*TERMINAL_STATUSES\s*\}/);
-    }
+    assert.match(source, /LEGACY_DELIVERY_CLEANUP_RETIRED/);
+    assert.match(source, /process.exitCode = 1/);
+    assert.doesNotMatch(source, /require\(|PrismaClient|deleteMany|\.delete\(/);
   }
 });
 
-
-test("Audit17 unresolved-do-not-retry automation receipts survive retention, admin purge and maintenance dedupe", () => {
+test("Phase3 lifecycle protections remain at the shared archive delete fence", () => {
   const history = read("automation-history-service.js");
-  const admin = fs.readFileSync(path.join(__dirname, "..", "routes", "admin-data.js"), "utf8");
-  const backendRoot = path.join(__dirname, "..", "..");
-  const maintenance = fs.readFileSync(path.join(backendRoot, "scripts", "maintenance", "dedupe-deliveries.js"), "utf8");
-  const rootMaintenance = fs.readFileSync(path.join(backendRoot, "dedupe-deliveries.js"), "utf8");
-  for (const source of [history, admin, maintenance, rootMaintenance]) {
-    assert.match(source, /failureCode:\s*null/);
-    assert.match(source, /failureCode:\s*\{\s*not:\s*"outcome_unresolved_do_not_retry"\s*\}/);
-  }
-  assert.match(history, /OR:\s*\[\{\s*failureCode:\s*null\s*\},\s*\{\s*failureCode:/);
-  assert.match(admin, /OR:\s*\[\{\s*failureCode:\s*null\s*\},\s*\{\s*failureCode:/);
-});
-
-test("Phase3 destructive resweep preserves unsettled provider future-effect rows in every delivery hard-delete path", () => {
-  const backendRoot = path.join(__dirname, "..", "..");
-  const sources = [
-    read("automation-history-service.js"),
-    fs.readFileSync(path.join(__dirname, "..", "routes", "admin-data.js"), "utf8"),
-    fs.readFileSync(path.join(backendRoot, "scripts", "maintenance", "dedupe-deliveries.js"), "utf8"),
-    fs.readFileSync(path.join(backendRoot, "scripts", "maintenance", "purge-stuck-deliveries.js"), "utf8"),
-    fs.readFileSync(path.join(backendRoot, "dedupe-deliveries.js"), "utf8"),
-    fs.readFileSync(path.join(backendRoot, "purge-stuck-deliveries.js"), "utf8"),
-  ];
-  for (const source of sources) {
-    const hardDeletes = source.match(/automationDelivery\.deleteMany/g) || [];
-    assert.ok(hardDeletes.length > 0);
-    assert.ok((source.match(/remoteLifecycleState/g) || []).length >= hardDeletes.length);
-    assert.match(source, /remoteLifecycleState:\s*null/);
-    assert.match(source, /remoteLifecycleState:\s*"SETTLED"/);
-    assert.match(source, /actionType:\s*\{\s*not:\s*"MASS_QUEUE_CREATE"\s*\}/);
-    assert.match(source, /intentAcknowledgedAt:\s*\{\s*not:\s*null\s*\}/);
-  }
-});
-
-test("Phase3 destructive resweep preserves active cross-generation SFS cleanup proof in every delivery hard-delete path", () => {
-  const backendRoot = path.join(__dirname, "..", "..");
-  const sources = [
-    read("automation-history-service.js"),
-    fs.readFileSync(path.join(__dirname, "..", "routes", "admin-data.js"), "utf8"),
-    fs.readFileSync(path.join(backendRoot, "scripts", "maintenance", "dedupe-deliveries.js"), "utf8"),
-    fs.readFileSync(path.join(backendRoot, "scripts", "maintenance", "purge-stuck-deliveries.js"), "utf8"),
-    fs.readFileSync(path.join(backendRoot, "dedupe-deliveries.js"), "utf8"),
-    fs.readFileSync(path.join(backendRoot, "purge-stuck-deliveries.js"), "utf8"),
-  ];
-  for (const source of sources) assert.match(source, /partitionAutomationDeliveryHardDeleteCandidates/);
-
+  assert.match(history, /failureCode" IS DISTINCT FROM 'outcome_unresolved_do_not_retry'/);
+  assert.match(history, /remoteLifecycleState" IS NULL OR d\."remoteLifecycleState" = 'SETTLED'/);
+  assert.match(history, /actionType" <> 'MASS_QUEUE_CREATE' OR d\."intentAcknowledgedAt" IS NOT NULL/);
+  assert.match(history, /partitionAutomationDeliveryHardDeleteCandidates\(\{ db: tx/);
+  assert.match(history, /knownCandidates.has\(sfsCandidateId\(row\)\)/);
   const guard = read("automation-delivery-hard-delete-guard.js");
-  assert.match(guard, /SFS_FOLLOW_TARGET/);
   assert.match(guard, /followEffectOwnership === "OWNED"/);
   assert.match(guard, /followEffectDeliveryId/);
   assert.match(guard, /metadata\.legacyMigration === true/);

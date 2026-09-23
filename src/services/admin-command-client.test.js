@@ -67,3 +67,10 @@ test("bulk acceptance survives network uncertainty and resolves independently of
   assert.equal(resolved.pending, false);
   assert.equal(resolved.status, "RUNNING");
 });
+
+test("archive command retains UUID on unknown response and blocks a changed selection", async () => {
+ const payload={...input,method:"POST",path:"/api/admin/data/creators/c/archive-deliveries",body:{agencyId:"a",reason:"archive",olderThan:"2026-01-01T00:00:00Z",items:[{id:"d",expectedUpdatedAt:"2025-01-01T00:00:00Z"}]}};
+ const b=browser();const first=await b.commands.prepare(payload);assert.ok(first.commandId);
+ b.commands.settle(first,{status:502},{ok:false});assert.equal((await browser(b.storage).commands.prepare(payload)).commandId,first.commandId);
+ assert.equal((await b.commands.prepare({...payload,body:{...payload.body,reason:"changed"}})).blocked,true);
+});

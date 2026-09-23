@@ -318,7 +318,8 @@ test("retention coordinator is durable, fail-closed and uses one DB-authority cu
   assert.match(source, /Promise\.allSettled/);
   assert.match(source, /renewRetentionSweepLease/);
   assert.match(source, /const authorityNow = lease\?\.startedAt instanceof Date \? lease\.startedAt : sweepNow\(options\)/);
-  assert.match(source, /const laneOptions = \{ \.\.\.options, authorityNow \}/);
+  assert.match(source, /const laneOptions = \{ \.\.\.options, authorityNow, retentionOwnerToken: lease\?\.acquired \? lease.ownerToken : null \}/);
+  assert.match(source, /commitGuard: options.retentionOwnerToken \? tx => lockRetentionCommit/);
   assert.doesNotMatch(source, /pg_try_advisory_lock\(/);
   assert.doesNotMatch(source, /pg_advisory_unlock\(/);
 });

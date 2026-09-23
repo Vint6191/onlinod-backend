@@ -15,6 +15,7 @@ const { gcTeamLedgers } = require("./team-ppv-ledger-service");
 const { purgeExpiredTipLedger } = require("./team-tip-ledger-service");
 const { compactAutomationDeliveries } = require("./automation-history-service");
 const { withDbAdvisoryXactLock, runDbTransaction } = require("./db-transaction-service");
+const { lockRetentionCommit } = require("./retention-commit-guard-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { authorizationHistoryPurgeActivationStatus } = require("./actual60-authorization-history-rollout-service");
 const { runMaintenanceLane } = require("./maintenance-work-authority");
@@ -998,6 +999,7 @@ async function runAutomationRetentionSweep(options = {}) {
   out.push(await compactAutomationDeliveries({
     olderThan: daysAgo(cfg.automationDeliveryDetailedDays, authorityNow),
     batchSize: cfg.batchSize,
+    commitGuard: options.retentionOwnerToken ? tx => lockRetentionCommit({ tx, ownerToken: options.retentionOwnerToken }) : null,
   }));
 
   out.push(await deleteByIdsInBatches({
@@ -1452,7 +1454,7 @@ async function runRetentionSweep(options = {}) {
   // same instant for every lane cutoff so replica wall-clock skew cannot make
   // destructive retention older/younger than policy.
   const authorityNow = lease?.startedAt instanceof Date ? lease.startedAt : sweepNow(options);
-  const laneOptions = { ...options, authorityNow };
+  const laneOptions = { ...options, authorityNow, retentionOwnerToken: lease?.acquired ? lease.ownerToken : null };
 
   let heartbeatTimer = null;
   let heartbeatInFlight = false;

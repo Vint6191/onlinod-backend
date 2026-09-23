@@ -1,6 +1,10 @@
 "use strict";
 
-const { partitionAutomationDeliveryHardDeleteCandidates } = require("./automation-delivery-hard-delete-guard");
+const { partitionAutomationDeliveryHardDeleteCandidates, isSfsFollowProof, sfsCandidateId } = require("./automation-delivery-hard-delete-guard");
+
+const { createHash } = require("node:crypto");
+const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
+const { adminError } = require("./admin-command-contract");
 
 const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"];
 
@@ -85,11 +89,69 @@ function groupDeliveriesForArchive(rows) {
   return [...groups.values()];
 }
 
-async function compactAutomationDeliveries({ olderThan, batchSize = 2000, db = null }) {
+// Caller owns the transaction. Selection is bounded, and only DELETE RETURNING
+// owns a history contribution. Absence after another process deletes is not proof.
+async function archiveAutomationDeliveryBatch({ tx, rows, olderThan, strict = false, commitGuard = null }) {
+  if (!Array.isArray(rows) || rows.length > 500 || !Number.isFinite(new Date(olderThan).getTime())) throw new TypeError("Invalid bounded archive selection");
+  if (commitGuard) await commitGuard(tx);
+  const agencies = [...new Set(rows.map(row => row.agencyId))].sort();
+  const liveAgencies = new Set();
+  for (const agencyId of agencies) {
+    const lifecycle = await lockAgencyLifecycleBarrier({ db: tx, agencyId });
+    if (lifecycle.row && !lifecycle.row.deletedAt) liveAgencies.add(agencyId);
+  }
+  const creatorIds = [...new Set(rows.filter(row => liveAgencies.has(row.agencyId)).map(row => row.creatorId))].sort();
+  const creators = creatorIds.length ? await tx.$queryRawUnsafe('SELECT "id", "agencyId", "deletedAt" FROM "CreatorAccount" WHERE "id" = ANY($1::text[]) ORDER BY "id" FOR SHARE', creatorIds) : [];
+  const liveCreators = new Map(creators.filter(row => !row.deletedAt).map(row => [row.id, row.agencyId]));
+  const eligible = rows.filter(row => liveCreators.get(row.creatorId) === row.agencyId);
+  // SFS settlement locks candidate before delivery. Preserve that order and
+  // retain missing/malformed candidate proofs conservatively.
+  const candidateIds = [...new Set(eligible.filter(isSfsFollowProof).map(sfsCandidateId).filter(Boolean))].sort();
+  const lockedCandidates = candidateIds.length ? await tx.$queryRawUnsafe('SELECT "id" FROM "SfsTargetCandidate" WHERE "id" = ANY($1::text[]) ORDER BY "id" FOR SHARE', candidateIds) : [];
+  const knownCandidates = new Set(lockedCandidates.map(row => row.id));
+  const manifest = eligible.map(row => ({ id: row.id, agencyId: row.agencyId, creatorId: row.creatorId, expectedUpdatedAt: row.updatedAt }));
+  const locked = manifest.length ? await tx.$queryRawUnsafe(`
+    SELECT d.* FROM "AutomationDelivery" d JOIN jsonb_to_recordset($1::jsonb)
+      AS m(id text, "agencyId" text, "creatorId" text, "expectedUpdatedAt" timestamp)
+      ON d."id"=m.id AND d."agencyId"=m."agencyId" AND d."creatorId"=m."creatorId" AND d."updatedAt"=m."expectedUpdatedAt"
+    ORDER BY d."id" FOR UPDATE OF d`, JSON.stringify(manifest)) : [];
+  const proofSafe = locked.filter(row => !isSfsFollowProof(row) || knownCandidates.has(sfsCandidateId(row)));
+  const partition = await partitionAutomationDeliveryHardDeleteCandidates({ db: tx, rows: proofSafe });
+  const ids = partition.deletable.map(row => row.id);
+  const deletedRows = ids.length ? await tx.$queryRawUnsafe(`
+    DELETE FROM "AutomationDelivery" d WHERE d."id" = ANY($1::text[])
+      AND d."originKind" = 'AUTOMATION' AND d."status" IN ('COMPLETED','FAILED','SKIPPED','CANCELED')
+      AND d."finishedAt" IS NOT NULL AND d."finishedAt" < $2::timestamp
+      AND d."failureCode" IS DISTINCT FROM 'outcome_unresolved_do_not_retry'
+      AND (d."remoteLifecycleState" IS NULL OR d."remoteLifecycleState" = 'SETTLED')
+      AND (d."actionType" <> 'MASS_QUEUE_CREATE' OR d."intentAcknowledgedAt" IS NOT NULL)
+    RETURNING d.*`, ids, new Date(olderThan)) : [];
+  if (strict && deletedRows.length !== rows.length) throw adminError("ADMIN_ARCHIVE_SELECTION_CHANGED", "Selection changed, is outside scope, or contains protected/live records; reload before archiving", 409);
+  const groups = groupDeliveriesForArchive(deletedRows).sort((a,b) => JSON.stringify([a.creatorId,a.moduleKey,a.actionType,a.periodStart]).localeCompare(JSON.stringify([b.creatorId,b.moduleKey,b.actionType,b.periodStart])));
+  if (groups.length) {
+    const data = groups.map(group => ({ ...group, id: "ama_" + createHash("sha256").update(JSON.stringify([group.creatorId, group.moduleKey, group.actionType, group.periodStart])).digest("hex") }));
+    const counters = Object.keys(counterShape());
+    const names = ['id','agencyId','creatorId','moduleKey','actionType','periodStart','firstAt','lastAt',...counters];
+    const quoted = names.map(name => '"' + name + '"').join(',');
+    const types = names.map(name => '"' + name + '" ' + (counters.includes(name) ? 'integer' : ['periodStart','firstAt','lastAt'].includes(name) ? 'timestamp' : 'text')).join(',');
+    const increments = counters.map(name => '"' + name + '" = a."' + name + '" + EXCLUDED."' + name + '"').join(',');
+    const written = await tx.$queryRawUnsafe(`
+      INSERT INTO "AutomationMonthlyAggregate" AS a (${quoted},"createdAt","updatedAt")
+      SELECT ${quoted}, clock_timestamp(), clock_timestamp() FROM jsonb_to_recordset($1::jsonb) AS g(${types})
+      ORDER BY "creatorId","moduleKey","actionType","periodStart"
+      ON CONFLICT ("creatorId","moduleKey","actionType","periodStart") DO UPDATE SET ${increments},
+        "firstAt"=LEAST(a."firstAt",EXCLUDED."firstAt"), "lastAt"=GREATEST(a."lastAt",EXCLUDED."lastAt"), "updatedAt"=clock_timestamp()
+      WHERE a."agencyId"=EXCLUDED."agencyId" RETURNING a."id"`, JSON.stringify(data));
+    if (written.length !== groups.length) throw adminError("AUTOMATION_ARCHIVE_SCOPE_CONFLICT", "Archive agency differs from its creator; explicit repair is required", 409);
+  }
+  return { archived: deletedRows.length, aggregateUpdates: groups.length, protected: rows.length - deletedRows.length };
+}
+
+async function compactAutomationDeliveries({ olderThan, batchSize = 500, db = null, commitGuard = null }) {
   db = db || require("../prisma");
   let archived = 0;
   let aggregateUpdates = 0;
-  const take = Math.max(100, Math.min(10000, Number(batchSize) || 2000));
+  const take = Math.max(1, Math.min(500, Math.floor(Number(batchSize) || 500)));
   let cursor = null;
   for (;;) {
     const lifecycleGuards = [
@@ -131,68 +193,7 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 2000, db = n
     });
     if (!rows.length) break;
     cursor = { finishedAt: rows[rows.length - 1].finishedAt, id: rows[rows.length - 1].id };
-    const committed = await db.$transaction(async (tx) => {
-      const partition = await partitionAutomationDeliveryHardDeleteCandidates({ db: tx, rows });
-      const candidates = partition.deletable;
-      if (!candidates.length) return { archived: 0, aggregateUpdates: 0, protected: partition.protected.length };
-      const deletion = await tx.automationDelivery.deleteMany({ where: {
-        id: { in: candidates.map((row) => row.id) },
-        originKind: "AUTOMATION",
-        AND: [
-          { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
-          { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
-          { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
-        ],
-      } });
-      let deletedRows = candidates;
-      if (Number(deletion?.count || 0) !== candidates.length) {
-        // A terminal MASS row may become PENDING again when a fresh provider
-        // snapshot observes its remote queue.  The delete predicate is the
-        // commit fence; only rows that actually disappeared may enter compact
-        // history, otherwise live metrics and the archive would double-count.
-        const survivors = await tx.automationDelivery.findMany({
-          where: { id: { in: candidates.map((row) => row.id) } },
-          select: { id: true },
-        });
-        const survivorIds = new Set((survivors || []).map((row) => row.id));
-        deletedRows = candidates.filter((row) => !survivorIds.has(row.id));
-      }
-      const groups = groupDeliveriesForArchive(deletedRows);
-      for (const group of groups) {
-        const where = {
-          creatorId_moduleKey_actionType_periodStart: {
-            creatorId: group.creatorId,
-            moduleKey: group.moduleKey,
-            actionType: group.actionType,
-            periodStart: group.periodStart,
-          },
-        };
-        const existing = await tx.automationMonthlyAggregate.findUnique({ where });
-        if (!existing) {
-          await tx.automationMonthlyAggregate.create({ data: group });
-        } else {
-          await tx.automationMonthlyAggregate.update({
-            where,
-            data: {
-              total: { increment: group.total },
-              completed: { increment: group.completed },
-              failed: { increment: group.failed },
-              skipped: { increment: group.skipped },
-              canceled: { increment: group.canceled },
-              sent: { increment: group.sent },
-              replied: { increment: group.replied },
-              followed: { increment: group.followed },
-              unfollowed: { increment: group.unfollowed },
-              liked: { increment: group.liked },
-              commented: { increment: group.commented },
-              firstAt: !existing.firstAt || new Date(group.firstAt) < existing.firstAt ? group.firstAt : existing.firstAt,
-              lastAt: !existing.lastAt || new Date(group.lastAt) > existing.lastAt ? group.lastAt : existing.lastAt,
-            },
-          });
-        }
-      }
-      return { archived: deletedRows.length, aggregateUpdates: groups.length, protected: partition.protected.length };
-    });
+    const committed = await db.$transaction(tx => archiveAutomationDeliveryBatch({ tx, rows, olderThan, commitGuard }), { maxWait: 5000, timeout: 15000, isolationLevel: "ReadCommitted" });
     archived += committed.archived;
     aggregateUpdates += committed.aggregateUpdates;
     if (rows.length < take) break;
@@ -215,12 +216,12 @@ function normalizeRange({ from = null, to = null, months = 12 } = {}) {
 async function getAutomationMetrics({ agencyId, creatorId, from = null, to = null, months = 12, db = null }) {
   db = db || require("../prisma");
   const { start, end } = normalizeRange({ from, to, months });
-  const [archived, liveRows, failures] = await Promise.all([
-    db.automationMonthlyAggregate.findMany({
+  const [archived, liveRows, failures] = await db.$transaction(tx => Promise.all([
+    tx.automationMonthlyAggregate.findMany({
       where: { agencyId, creatorId, periodStart: { gte: monthStart(start), lte: end } },
       orderBy: [{ periodStart: "asc" }, { moduleKey: "asc" }, { actionType: "asc" }],
     }),
-    db.automationDelivery.findMany({
+    tx.automationDelivery.findMany({
       where: {
         agencyId,
         creatorId,
@@ -231,12 +232,12 @@ async function getAutomationMetrics({ agencyId, creatorId, from = null, to = nul
       select: { moduleKey: true, actionType: true, status: true, result: true, finishedAt: true, updatedAt: true, createdAt: true, agencyId: true, creatorId: true },
       take: 100000,
     }),
-    db.automationDelivery.groupBy({
+    tx.automationDelivery.groupBy({
       by: ["moduleKey", "failureCode"],
       where: { agencyId, creatorId, originKind: "AUTOMATION", status: "FAILED", finishedAt: { gte: start, lte: end } },
       _count: { _all: true },
     }),
-  ]);
+  ]), { isolationLevel: "RepeatableRead", maxWait: 5000, timeout: 15000 });
 
   const summary = counterShape();
   const byModule = {};
@@ -310,6 +311,7 @@ module.exports = {
   classifyAutomationDelivery,
   addCounters,
   groupDeliveriesForArchive,
+  archiveAutomationDeliveryBatch,
   compactAutomationDeliveries,
   normalizeRange,
   getAutomationMetrics,

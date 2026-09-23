@@ -149,7 +149,7 @@
         const tds = cfg.cols.map((c) => `<td title="${esc(typeof row[c.k] === "object" ? JSON.stringify(row[c.k]) : row[c.k])}">${esc(trunc(c.fmt ? c.fmt(row[c.k], row) : (row[c.k] == null ? "—" : row[c.k]), 40))}</td>`).join("");
         return readOnly
           ? `<tr>${tds}</tr>`
-          : `<tr>${tds}<td class="adm-row-actions"><button class="adm-link" data-inspect="${esc(row.id)}">inspect</button><button class="adm-link adm-link-danger" data-del="${esc(row.id)}">del</button></td></tr>`;
+          : `<tr>${tds}<td class="adm-row-actions"><button class="adm-link" data-inspect="${esc(row.id)}">inspect</button></td></tr>`;
       }).join("");
       body.innerHTML = `
         <div class="adm-muted" style="margin:6px 0">${items.length} shown${r.total != null ? " of " + r.total + " total" : ""}${readOnly ? " · canonical current · read-only" : ""}</div>
@@ -159,12 +159,7 @@
         const rr = await A().dataInspect(cfg.model, b.dataset.inspect);
         if (rr?.ok) showModal(`${cfg.model} · ${b.dataset.inspect}`, `<pre class="adm-json">${esc(JSON.stringify(rr.record, null, 2))}</pre>`);
       }));
-      body.querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", async () => {
-        if (!confirm(`Delete this ${cfg.model}?`)) return;
-        const rr = await A().dataDeleteRecord(cfg.model, b.dataset.del);
-        R().toast(rr?.ok ? "deleted" : "failed", rr?.ok ? "ok" : "error");
-        if (rr?.ok) renderList(body, kind);
-      }));
+
     });
   }
 

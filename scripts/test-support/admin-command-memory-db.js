@@ -11,7 +11,7 @@ function createMemoryDb(options = {}) {
     subscriptions: [{ id: "sub-a", agencyId: "agency-a", createdAt: new Date("2026-01-01"), status: "ACTIVE", billingMode: "MANUAL", billingPeriod: "MONTHLY", corePricePerCreatorCents: 2000, trialEndsAt: null, currentPeriodEnd: null }],
     entitlements: [],
     profiles: [{ id: "profile-a", creatorId: "creator-a", agencyId: "agency-a", pricingRevision: 1, tier: "STARTER", tierMode: "AUTO", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 10000, outreachEnabled: false, outreachPriceCents: 2900, billingExcluded: false, notes: null, revenue30dCents: 42 }],
-    commands: [], audit: [], logs: [], workItems: [],
+    commands: [], audit: [], logs: [], workItems: [], deliveries: [], aggregates: [], candidates: [],
   };
   const clock = new Date("2026-09-23T12:00:00Z");
   const copy = value => structuredClone(value);
@@ -40,6 +40,28 @@ function createMemoryDb(options = {}) {
     return {
       async $queryRawUnsafe(sql, ...args) {
         const id = args[0];
+        if (sql.includes('FROM "SfsTargetCandidate"')) return table("candidates").filter(row => id.includes(row.id)).map(copy);
+        if (sql.includes('FROM "CreatorAccount"') && Array.isArray(id)) return table("creators").filter(row => id.includes(row.id)).map(copy);
+        if (sql.includes('SELECT d.* FROM "AutomationDelivery"')) {
+          const manifest = JSON.parse(id);
+          return table("deliveries").filter(row => manifest.some(m => m.id === row.id && m.agencyId === row.agencyId && m.creatorId === row.creatorId && new Date(m.expectedUpdatedAt).getTime() === row.updatedAt.getTime())).map(copy);
+        }
+        if (sql.includes('DELETE FROM "AutomationDelivery"')) {
+          if (options.beforeArchiveDelete) options.beforeArchiveDelete(table("deliveries"));
+          const rows = table("deliveries").filter(row => id.includes(row.id) && row.originKind === "AUTOMATION" && ["COMPLETED","FAILED","SKIPPED","CANCELED"].includes(row.status) && row.finishedAt && row.finishedAt < args[1] && row.failureCode !== "outcome_unresolved_do_not_retry" && (!row.remoteLifecycleState || row.remoteLifecycleState === "SETTLED") && (row.actionType !== "MASS_QUEUE_CREATE" || row.intentAcknowledgedAt));
+          read().deliveries = table("deliveries").filter(row => !rows.includes(row));
+          return rows.map(copy);
+        }
+        if (sql.includes('INSERT INTO "AutomationMonthlyAggregate"')) {
+          if (options.failAggregate) throw Error("archive unavailable");
+          return JSON.parse(id).map(group => {
+            let row = table("aggregates").find(row => ["creatorId","moduleKey","actionType","periodStart"].every(k => String(row[k]) === String(group[k])));
+            if (row && row.agencyId !== group.agencyId) return null;
+            if (!row) { table("aggregates").push(copy(group)); row = group; }
+            else { for (const [k,v] of Object.entries(group)) if (typeof v === "number") row[k] += v; row.firstAt = row.firstAt < group.firstAt ? row.firstAt : group.firstAt; row.lastAt = row.lastAt > group.lastAt ? row.lastAt : group.lastAt; }
+            return {id:row.id};
+          }).filter(Boolean);
+        }
         if (sql.includes('INSERT INTO "DomainWorkItem"')) {
           if (options.failPublish) throw new Error("work publish unavailable");
           const [id,agencyId,workClass,objectType,objectId,parentObjectId,partitionKey,creatorId,accountId,activeGeneration,projectionVersion] = args;
@@ -65,6 +87,11 @@ function createMemoryDb(options = {}) {
         else if (!sql.includes("pg_advisory")) throw new Error(`Unexpected SQL ${sql}`);
         return 1;
       },
+      automationDelivery: { findMany: async ({ where = {}, take = 500 }) => {
+        if (take > 500) throw Error("Unbounded archive selection");
+        return table("deliveries").filter(row => (!where.id?.in || where.id.in.includes(row.id)) && (!where.agencyId || row.agencyId === where.agencyId) && (!where.creatorId || row.creatorId === where.creatorId)).slice(0,take).map(copy);
+      } },
+      sfsTargetCandidate: { findMany: async ({where}) => table("candidates").filter(row => where.id.in.includes(row.id)).map(copy) },
       adminUser: {
         findUnique: async ({ where }) => find("admins", where),
         count: async ({ where }) => table("admins").filter(row => match(row, where)).length,
