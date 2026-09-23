@@ -7,6 +7,13 @@ const {
   authorizeCreatorAccountWrite,
 } = require("../../src/services/phase2-release-compatibility-authority-service");
 
+const PHASE3_CLAIM_TOPOLOGY_MIGRATION = "20260922183000_phase3_a36_domain_work_claim_shard_closure_v1";
+const PHASE3_EXACT_DESTRUCTIVE_CLAIM_MIGRATION = "20260922214500_phase3_a36_destructive_claim_authority_closure_v3";
+const PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE = Object.freeze({
+  LEGACY_AGENCY_MARKER: "LEGACY_AGENCY_MARKER",
+  EXACT_LIVE_CLAIM: "EXACT_LIVE_CLAIM",
+});
+
 function auditSchemaFromDatabaseUrl() {
   const raw = String(process.env.DATABASE_URL || "").trim();
   if (!raw) return null;
@@ -41,12 +48,13 @@ async function pinPhase3AuditSchema(tx) {
   return { schema, pinned: true };
 }
 
-// PostgreSQL integration proofs run against a fully migrated schema where the
-// Phase-2 DB writer fences are intentionally ACTIVE. Test fixtures must therefore
-// use the same transaction-local release generations as production writers.
-// The schema pin is equally authoritative: trigger functions contain unqualified
-// relation names and must never resolve into public while a proof targets an
-// isolated audit schema. Never disable triggers or mutate compatibility rows.
+// PostgreSQL integration proofs run both fully migrated and frozen rolling
+// schemas. Test fixtures must use the transaction-local authority implemented by
+// the schema generation they are exercising: the legacy Agency marker before
+// A36, and one exact live destructive DWI claim after A36. The schema pin is
+// equally authoritative: trigger functions contain unqualified relation names
+// and must never resolve into public while a proof targets an isolated audit
+// schema. Never disable triggers or mutate compatibility rows.
 async function withPhase3PostgresFixtureAuthority(db, work, options = undefined) {
   if (!db || typeof db.$transaction !== "function" || typeof work !== "function") {
     const error = new Error("Phase3 PostgreSQL fixture authority requires a root PrismaClient and work callback");
@@ -67,6 +75,75 @@ async function drainPhase3PostgresAgencyDomainWork(tx, agencyId) {
   // destructive ordering and avoiding one nested work DELETE per Creator trigger.
   const result = await tx.domainWorkItem.deleteMany({ where: { agencyId } });
   return Number(result?.count || 0);
+}
+
+function classifyPhase3PostgresDestructiveFixtureAuthority(row = {}) {
+  const capabilities = {
+    topologyMigrationApplied: row.topologyMigrationApplied === true,
+    exactMigrationApplied: row.exactMigrationApplied === true,
+    topologyTablePresent: row.topologyTablePresent === true,
+    exactFunctionInstalled: row.exactFunctionInstalled === true,
+  };
+  const legacy = !capabilities.topologyMigrationApplied
+    && !capabilities.exactMigrationApplied
+    && !capabilities.topologyTablePresent
+    && !capabilities.exactFunctionInstalled;
+  const exact = capabilities.topologyMigrationApplied
+    && capabilities.exactMigrationApplied
+    && capabilities.topologyTablePresent
+    && capabilities.exactFunctionInstalled;
+  if (!legacy && !exact) {
+    const error = new Error(`Phase3 PostgreSQL fixture schema generation is internally inconsistent: ${JSON.stringify(capabilities)}`);
+    error.code = "PHASE3_POSTGRES_FIXTURE_GENERATION_DRIFT";
+    error.capabilities = capabilities;
+    throw error;
+  }
+  return {
+    mode: exact
+      ? PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.EXACT_LIVE_CLAIM
+      : PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.LEGACY_AGENCY_MARKER,
+    ...capabilities,
+  };
+}
+
+async function resolvePhase3PostgresDestructiveFixtureAuthority(db) {
+  return withPhase3PostgresFixtureAuthority(db, async (tx) => {
+    const rows = await tx.$queryRawUnsafe(`
+      WITH exact_function AS (
+        SELECT pg_get_functiondef(p.oid) AS definition
+          FROM pg_proc p
+         WHERE p.oid=to_regprocedure('"phase2_internal_agency_destructive_authorized"(text)')
+      )
+      SELECT EXISTS (
+               SELECT 1
+                 FROM "_prisma_migrations"
+                WHERE migration_name=$1
+                  AND finished_at IS NOT NULL
+                  AND rolled_back_at IS NULL
+             ) AS "topologyMigrationApplied",
+             EXISTS (
+               SELECT 1
+                 FROM "_prisma_migrations"
+                WHERE migration_name=$2
+                  AND finished_at IS NOT NULL
+                  AND rolled_back_at IS NULL
+             ) AS "exactMigrationApplied",
+             to_regclass('"DomainWorkClaimTopologyState"') IS NOT NULL AS "topologyTablePresent",
+             COALESCE((
+               SELECT POSITION('onlinod.phase2_destructive_agency_work_id' IN definition)>0
+                  AND POSITION('onlinod.phase2_destructive_agency_owner_token' IN definition)>0
+                 FROM exact_function
+             ),FALSE) AS "exactFunctionInstalled"
+    `, PHASE3_CLAIM_TOPOLOGY_MIGRATION, PHASE3_EXACT_DESTRUCTIVE_CLAIM_MIGRATION);
+    return classifyPhase3PostgresDestructiveFixtureAuthority(rows?.[0] || {});
+  });
+}
+
+async function installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority(tx, agencyId) {
+  await tx.$queryRawUnsafe(
+    `SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS "agencyId"`,
+    String(agencyId),
+  );
 }
 
 async function claimPhase3PostgresAgencyDestructiveFixture(db, agencyId) {
@@ -114,6 +191,20 @@ async function installPhase3PostgresAgencyDestructiveFixtureAuthority(tx, agency
 async function cleanupPhase3PostgresAgencyFixture(db, agencyId) {
   const id = String(agencyId || "").trim();
   if (!id) return { agencyDeleted: 0, creatorsDeleted: 0, domainWorkDeleted: 0 };
+  const authority = await resolvePhase3PostgresDestructiveFixtureAuthority(db);
+  if (authority.mode === PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.LEGACY_AGENCY_MARKER) {
+    return withPhase3PostgresFixtureAuthority(db, async (tx) => {
+      await installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority(tx, id);
+      const domainWorkDeleted = await drainPhase3PostgresAgencyDomainWork(tx, id);
+      const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
+      const agencyResult = await tx.agency.deleteMany({ where: { id } });
+      return {
+        agencyDeleted: Number(agencyResult?.count || 0),
+        creatorsDeleted: Number(creatorResult?.count || 0),
+        domainWorkDeleted,
+      };
+    }, { maxWait: 10_000, timeout: 120_000 });
+  }
   const domainWorkDeleted = await withPhase3PostgresFixtureAuthority(
     db,
     (tx) => drainPhase3PostgresAgencyDomainWork(tx, id),
@@ -143,6 +234,24 @@ async function cleanupPhase3PostgresFixtureGraph(db, {
   const id = String(agencyId || "").trim();
   const users = [...new Set((Array.isArray(userIds) ? userIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
   if (!id && !users.length) return { agencyDeleted: 0, creatorsDeleted: 0, domainWorkDeleted: 0, usersDeleted: 0 };
+  const authority = id ? await resolvePhase3PostgresDestructiveFixtureAuthority(db) : null;
+  if (id && authority.mode === PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.LEGACY_AGENCY_MARKER) {
+    return withPhase3PostgresFixtureAuthority(db, async (tx) => {
+      await installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority(tx, id);
+      const domainWorkDeleted = await drainPhase3PostgresAgencyDomainWork(tx, id);
+      const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
+      const agencyResult = await tx.agency.deleteMany({ where: { id } });
+      const userResult = users.length
+        ? await tx.user.deleteMany({ where: { id: { in: users } } })
+        : { count: 0 };
+      return {
+        agencyDeleted: Number(agencyResult?.count || 0),
+        creatorsDeleted: Number(creatorResult?.count || 0),
+        domainWorkDeleted,
+        usersDeleted: Number(userResult?.count || 0),
+      };
+    }, { maxWait: 10_000, timeout: 120_000 });
+  }
   let destructiveClaim = null;
   let predrainedDomainWork = 0;
   if (id) {
@@ -179,10 +288,14 @@ async function cleanupPhase3PostgresFixtureGraph(db, {
 }
 
 module.exports = {
+  PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE,
+  classifyPhase3PostgresDestructiveFixtureAuthority,
   auditSchemaFromDatabaseUrl,
   pinPhase3AuditSchema,
   withPhase3PostgresFixtureAuthority,
   drainPhase3PostgresAgencyDomainWork,
+  resolvePhase3PostgresDestructiveFixtureAuthority,
+  installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority,
   claimPhase3PostgresAgencyDestructiveFixture,
   installPhase3PostgresAgencyDestructiveFixtureAuthority,
   cleanupPhase3PostgresAgencyFixture,

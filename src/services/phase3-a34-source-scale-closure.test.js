@@ -356,6 +356,73 @@ test("A36 DomainWork admission is bounded on both Agency and creator axes withou
   assert.match(physical, /rebuiltPartition\?\.nextClaimableAt[\s\S]*rebuiltShard\?\.nextDispatchAt[\s\S]*rebuiltAgency\?\.nextDispatchAt/);
 });
 
+test("A36 PostgreSQL boundary normalizes Node time and selects destructive authority by proven schema generation", () => {
+  const temporal = source("prisma/migrations/20260923043000_phase3_domain_work_temporal_api_contract_v1/migration.sql");
+  const original = source("prisma/migrations/20260922183000_phase3_a36_domain_work_claim_shard_closure_v1/migration.sql");
+  const fixture = source("scripts/audit/phase3-postgres-proof-fixture-authority.js");
+  const domain = source("src/services/domain-work-authority-service.js");
+  const postgresProof = source("scripts/audit/phase3-a20-postgres-proof.js");
+
+  assert.match(original, /p_touched_at TIMESTAMP\(3\)/,
+    "DB-internal reconciliation must keep the canonical timestamp(3) storage contract");
+  assert.match(temporal, /CREATE OR REPLACE FUNCTION "phase3_utc_timestamp"\(p_value TIMESTAMPTZ\)/);
+  assert.match(temporal, /AT TIME ZONE 'UTC'[\s\S]*::TIMESTAMP\(3\)/);
+  assert.equal((temporal.match(/p_touched_at TIMESTAMPTZ/g) || []).length, 3,
+    "partition, shard and Agency application boundaries must all accept Prisma timestamptz");
+  assert.equal((temporal.match(/"phase3_utc_timestamp"\(p_touched_at\)/g) || []).length, 3);
+  assert.match(temporal, /phase3_reconcile_domain_work_claim_partition[\s\S]*phase3_reconcile_domain_work_claim_shard[\s\S]*phase3_reconcile_domain_work_claim_agency/);
+  assert.doesNotMatch(domain, /phase3_reconcile_domain_work_claim_(?:partition|shard|agency)"\([^\n]*::timestamp/i,
+    "temporal compatibility belongs to the PostgreSQL API, not scattered caller casts");
+
+  assert.match(fixture, /PHASE3_CLAIM_TOPOLOGY_MIGRATION/);
+  assert.match(fixture, /PHASE3_EXACT_DESTRUCTIVE_CLAIM_MIGRATION/);
+  assert.match(fixture, /"_prisma_migrations"[\s\S]*finished_at IS NOT NULL[\s\S]*rolled_back_at IS NULL/);
+  assert.match(fixture, /to_regclass\('\"DomainWorkClaimTopologyState\"'\)/);
+  assert.match(fixture, /to_regprocedure\('\"phase2_internal_agency_destructive_authorized\"\(text\)'\)/);
+  assert.match(fixture, /phase2_destructive_agency_work_id[\s\S]*phase2_destructive_agency_owner_token/);
+  assert.match(fixture, /PHASE3_POSTGRES_FIXTURE_GENERATION_DRIFT/,
+    "partial or contradictory schema generations must fail closed");
+  assert.match(fixture, /LEGACY_AGENCY_MARKER/);
+  assert.match(fixture, /EXACT_LIVE_CLAIM/);
+  assert.match(fixture, /installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority[\s\S]*drainPhase3PostgresAgencyDomainWork[\s\S]*creatorAccount\.deleteMany[\s\S]*agency\.deleteMany/);
+  assert.match(fixture, /claimPhase3PostgresAgencyDestructiveFixture[\s\S]*installPhase3PostgresAgencyDestructiveFixtureAuthority/);
+  assert.match(postgresProof, /rolling-a13-fixture-lifecycle[\s\S]*addMigrationsAfter\(rollingPrisma, A13_CUTOFF\)[\s\S]*rolling-current-fixture-lifecycle/);
+  assert.match(postgresProof, /seeded-pre-a20-2-fixture-lifecycle[\s\S]*addMigrationsAfter\(seededRollingPrisma, PRE_A20_2_CUTOFF\)[\s\S]*seeded-current-fixture-lifecycle/);
+});
+
+test("A36 fixture generation classifier accepts only complete legacy or exact-claim generations", () => {
+  const {
+    PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE,
+    classifyPhase3PostgresDestructiveFixtureAuthority,
+  } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+
+  assert.equal(
+    classifyPhase3PostgresDestructiveFixtureAuthority({}).mode,
+    PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.LEGACY_AGENCY_MARKER,
+  );
+  assert.equal(
+    classifyPhase3PostgresDestructiveFixtureAuthority({
+      topologyMigrationApplied: true,
+      exactMigrationApplied: true,
+      topologyTablePresent: true,
+      exactFunctionInstalled: true,
+    }).mode,
+    PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.EXACT_LIVE_CLAIM,
+  );
+
+  for (const partial of [
+    { topologyMigrationApplied: true, topologyTablePresent: true },
+    { exactMigrationApplied: true, exactFunctionInstalled: true },
+    { topologyTablePresent: true },
+    { exactFunctionInstalled: true },
+  ]) {
+    assert.throws(
+      () => classifyPhase3PostgresDestructiveFixtureAuthority(partial),
+      (error) => error?.code === "PHASE3_POSTGRES_FIXTURE_GENERATION_DRIFT",
+    );
+  }
+});
+
 test("A36 R2 destructive bypass is bound to one live claimed DWI and preserves child Creator composition", () => {
   const destructive = source("src/services/phase2-destructive-delete-authority-service.js");
   const fixture = source("scripts/audit/phase3-postgres-proof-fixture-authority.js");
