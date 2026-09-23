@@ -16,6 +16,7 @@ const {
   sendError,
 } = require("../services/server-store-utils");
 
+const { upsertMessageLibraryBlocks, withMessageLibraryMutation, changeMessageLibraryLifecycle, runMessageLibraryTrashMaintenance, isTrash } = require("../services/message-library-lifecycle-service");
 const router = express.Router();
 
 function genericContentGone(req, res) {
@@ -46,15 +47,11 @@ router.post("/collections/:id/usage", genericContentGone);
 const MESSAGE_LIBRARY_KIND = "message_library_script";
 
 const MESSAGE_LIBRARY_TRASH_RETENTION_DAYS = 14;
-const MESSAGE_LIBRARY_PURGE_INTERVAL_MS = 10 * 60 * 1000;
-const messageLibraryPurgeStateByAgency = new Map();
-function addDays(date, days) {
-  return new Date(date.getTime() + Number(days || 0) * 24 * 60 * 60 * 1000);
-}
-
-function trashPurgeAfter(trashedAt = new Date()) {
-  const base = trashedAt instanceof Date ? trashedAt : new Date(trashedAt || Date.now());
-  return addDays(Number.isFinite(base.getTime()) ? base : new Date(), MESSAGE_LIBRARY_TRASH_RETENTION_DAYS);
+function trashPurgeAfter(trashedAt = new Date()) { return new Date(trashedAt.getTime() + MESSAGE_LIBRARY_TRASH_RETENTION_DAYS * 86400000); }
+function mutationContext(req, creatorId, scriptId, action, manager = true) {
+  return { db: prisma, agencyId: req.auth.agencyId, creatorId, scriptId, action, manager,
+    userId: req.auth.userId, actorMember: req.auth.membership || req.member,
+    expectedUpdatedAt: req.body?.expectedUpdatedAt || (action === "save" && req.body?.serverId ? req.body?.updatedAt : null) };
 }
 
 async function isMessageLibraryManager(req) {
@@ -81,72 +78,6 @@ async function requireMessageLibraryCreator(req) {
   }
   await requireProductCreator(req, creatorId, { db: prisma });
   return creatorId;
-}
-
-async function purgeExpiredMessageLibraryTrash(agencyId, creatorId) {
-  const now = new Date();
-
-  const expiredCollections = await prisma.contentCollection.findMany({
-    where: {
-      agencyId,
-      creatorId,
-      kind: MESSAGE_LIBRARY_KIND,
-      OR: [
-        { status: "trash", purgeAfter: { lte: now } },
-        { deletedAt: { not: null }, purgeAfter: { lte: now } },
-      ],
-    },
-    select: { id: true },
-    take: 10000});
-
-  const allCollections = await prisma.contentCollection.findMany({
-    where: { agencyId, creatorId, kind: MESSAGE_LIBRARY_KIND },
-    select: { id: true },
-    take: 10000});
-  const collectionIds = allCollections.map((item) => item.id);
-
-  const expiredBlocks = collectionIds.length
-    ? await prisma.contentBlock.deleteMany({
-        where: {
-          collectionId: { in: collectionIds },
-          OR: [
-            { status: "trash", purgeAfter: { lte: now } },
-            { deletedAt: { not: null }, purgeAfter: { lte: now } },
-          ],
-        },
-      })
-    : { count: 0 };
-
-  const collectionDelete = expiredCollections.length
-    ? await prisma.contentCollection.deleteMany({ where: { id: { in: expiredCollections.map((item) => item.id) } } })
-    : { count: 0 };
-
-  return { ok: true, scriptsDeleted: collectionDelete.count || 0, blocksDeleted: expiredBlocks.count || 0 };
-}
-
-async function maybePurgeExpiredMessageLibraryTrash(agencyId, creatorId, { force = false } = {}) {
-  const agencyKey = String(agencyId || "").trim();
-  const creatorKey = String(creatorId || "").trim();
-  const key = `${agencyKey}:${creatorKey}`;
-  if (!agencyKey || !creatorKey) return { ok: true, skipped: true, reason: "creator_scope_missing", scriptsDeleted: 0, blocksDeleted: 0 };
-
-  const now = Date.now();
-  const previous = messageLibraryPurgeStateByAgency.get(key) || null;
-  if (previous?.promise) return previous.promise;
-  if (!force && previous?.completedAt && now - previous.completedAt < MESSAGE_LIBRARY_PURGE_INTERVAL_MS) {
-    return { ok: true, skipped: true, reason: "throttled", scriptsDeleted: 0, blocksDeleted: 0 };
-  }
-
-  const promise = purgeExpiredMessageLibraryTrash(agencyKey, creatorKey);
-  messageLibraryPurgeStateByAgency.set(key, { completedAt: previous?.completedAt || 0, promise });
-  try {
-    const result = await promise;
-    messageLibraryPurgeStateByAgency.set(key, { completedAt: Date.now(), promise: null });
-    return result;
-  } catch (error) {
-    messageLibraryPurgeStateByAgency.delete(key);
-    throw error;
-  }
 }
 
 function asDateOrNull(value) {
@@ -261,6 +192,7 @@ function assertUniqueMlBlockClientIds(blocks) {
 function normalizeMlUsageMetadata(body, scriptId, messageId) {
   const metadata = jsonObject(body.metadata);
   return {
+    product: MESSAGE_LIBRARY_KIND,
     source: cleanString(body.source || metadata.source || "electron-message-library", 100) || "electron-message-library",
     scriptId: scriptId || null,
     messageId: messageId || null,
@@ -394,7 +326,9 @@ async function normalizeMlScriptPayload(req, { patch = false } = {}) {
   }
 
   const blocks = Array.isArray(body.messages) ? body.messages : Array.isArray(body.blocks) ? body.blocks : [];
+  if (blocks.length > 500) throw Object.assign(new Error("One script supports at most 500 messages"), {code:"MESSAGE_LIBRARY_SCRIPT_LIMIT",status:413});
   const normalizedBlocks = blocks.map(normalizeMlMessage);
+  if (Buffer.byteLength(JSON.stringify({data,blocks:normalizedBlocks})) > 2 * 1024 * 1024) throw Object.assign(new Error("One script supports at most 2 MiB of normalized content"), {code:"MESSAGE_LIBRARY_SCRIPT_LIMIT",status:413});
   assertUniqueMlBlockClientIds(normalizedBlocks);
   return { scriptId, data, blocks: normalizedBlocks };
 }
@@ -402,6 +336,7 @@ async function normalizeMlScriptPayload(req, { patch = false } = {}) {
 async function upsertMessageLibraryScript(req) {
   const normalized = await normalizeMlScriptPayload(req);
   const mediaIds = [...new Set(normalized.blocks.flatMap((block) => normalizeMlMedia(block.media).map((item) => String(item.id || "").trim())).filter(Boolean))];
+  if (mediaIds.length > 2000) throw Object.assign(new Error("One script supports at most 2000 distinct media references"), {code:"MESSAGE_LIBRARY_SCRIPT_LIMIT",status:413});
   if (mediaIds.length) {
     const customMediaIds = [];
     // The canonical programmatic provenance classifier intentionally bounds one
@@ -432,18 +367,17 @@ async function upsertMessageLibraryScript(req) {
       throw err;
     }
   }
-  const existing = await prisma.contentCollection.findFirst({
-    where: { agencyId: req.auth.agencyId, clientId: normalized.scriptId, kind: MESSAGE_LIBRARY_KIND },
-    include: { blocks: true },
-  });
-  if (existing && String(existing.creatorId || "") !== String(normalized.data.creatorId || "")) {
-    const err = new Error("Message Library script belongs to another creator");
-    err.status = 409;
-    err.code = "MESSAGE_LIBRARY_SCRIPT_CREATOR_MISMATCH";
-    throw err;
-  }
-
-  return prisma.$transaction(async (tx) => {
+  const context = mutationContext(req, normalized.data.creatorId, normalized.scriptId, "save");
+  if (req.body?.serverId && !context.expectedUpdatedAt) throw Object.assign(new Error("Reload the server script before saving"), {code:"MESSAGE_LIBRARY_REVISION_REQUIRED",status:428});
+  return withMessageLibraryMutation({ ...context, work: async ({ tx, existing, now }) => {
+    if (existing && isTrash(existing)) throw Object.assign(new Error("Restore the script before saving"), { code: "MESSAGE_LIBRARY_SCRIPT_TRASHED", status: 409 });
+    if (normalized.data.deletedAt) throw Object.assign(new Error("Use the trash action"), { code: "MESSAGE_LIBRARY_TYPED_TRASH_REQUIRED", status: 409 });
+    if (existing && !context.expectedUpdatedAt) throw Object.assign(new Error("Reload the server script before saving"), {code:"MESSAGE_LIBRARY_REVISION_REQUIRED",status:428});
+    if (req.body?.serverId && req.body.serverId !== existing?.id) throw Object.assign(new Error("Server script identity changed; reload before saving"), {code:"MESSAGE_LIBRARY_REVISION_CONFLICT",status:409});
+    for(let offset=0;offset<mediaIds.length;offset+=200){
+      const proof=await preflightProgrammaticCustomMedia({agencyId:req.auth.agencyId,member:req.auth.membership||req.member,creatorId:normalized.data.creatorId,mediaIds:mediaIds.slice(offset,offset+200),db:tx});
+      if(!proof?.ok || !Array.isArray(proof.customMediaIds) || proof.customMediaIds.length) throw Object.assign(new Error("Reusable media provenance changed; reload"), {code:"MESSAGE_LIBRARY_MEDIA_PROVENANCE_CHANGED",status:409});
+    }
     let collection;
     if (existing) {
       const updateData = { ...normalized.data };
@@ -458,7 +392,7 @@ async function upsertMessageLibraryScript(req) {
     }
 
     const incomingClientIds = normalized.blocks.map((block) => block.clientId).filter(Boolean);
-    const trashAt = new Date();
+    const trashAt = now;
     const purgeAfter = trashPurgeAfter(trashAt);
 
     // Missing blocks are moved to trash for 14 days instead of hard-deleted.
@@ -479,41 +413,26 @@ async function upsertMessageLibraryScript(req) {
       });
     }
 
-    for (const block of normalized.blocks) {
-      const activeBlock = {
-        ...block,
-        status: "active",
-        deletedAt: null,
-        purgeAfter: null,
-        trashedByUserId: null,
-      };
-      const prev = existing?.blocks?.find((item) => String(item.clientId || "") === String(block.clientId || ""));
-      if (prev) {
-        await tx.contentBlock.update({ where: { id: prev.id }, data: activeBlock });
-      } else {
-        await tx.contentBlock.create({ data: { collectionId: collection.id, ...activeBlock } });
-      }
-    }
+    await upsertMessageLibraryBlocks({ tx, collectionId: collection.id, blocks: normalized.blocks, now });
 
     return tx.contentCollection.findFirst({
       where: { id: collection.id, agencyId: req.auth.agencyId },
-      include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
+      include: { blocks: { where: { deletedAt: null, status: { notIn: ["trash","deleted"] } }, orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
     });
-  });
+  } });
 }
 
 router.get("/message-library/scripts", async (req, res) => {
   try {
     const creatorId = await requireMessageLibraryCreator(req);
-    // Trash retention is maintenance, not a dependency of reads. A temporary
-    // cleanup failure must never make the authoritative library unavailable.
-    await maybePurgeExpiredMessageLibraryTrash(req.auth.agencyId, creatorId).catch(() => null);
+    // Reads never perform destructive maintenance; the scheduler drains durable trash.
     const includeTrash = req.query.includeTrash === "true" || req.query.includeTrash === "1";
     const where = {
       agencyId: req.auth.agencyId,
       kind: MESSAGE_LIBRARY_KIND,
+      status: { not: "deleting" },
     };
-    if (!includeTrash) where.deletedAt = null;
+    if (!includeTrash) { where.deletedAt = null; where.status = { notIn: ["trash","deleted","deleting"] }; }
     if (creatorId) where.creatorId = creatorId;
 
     const take = parseLimit(req.query.limit, 500, 1000);
@@ -565,128 +484,28 @@ router.put("/message-library/scripts/:id", async (req, res) => {
   }
 });
 
-router.delete("/message-library/scripts/:id", async (req, res) => {
-  try {
-    await assertMessageLibraryManager(req);
-    const id = cleanString(req.params.id, 120);
-    const creatorId = await requireMessageLibraryCreator(req);
-    const existing = await prisma.contentCollection.findFirst({
-      where: { agencyId: req.auth.agencyId, clientId: id, kind: MESSAGE_LIBRARY_KIND, creatorId },
-    });
-    if (!existing) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
-
-    const trashedAt = new Date();
-    const purgeAfter = trashPurgeAfter(trashedAt);
-    const item = await prisma.contentCollection.update({
-      where: { id: existing.id },
-      data: {
-        deletedAt: trashedAt,
-        status: "trash",
-        purgeAfter,
-        trashedByUserId: req.auth.userId,
-        updatedByUserId: req.auth.userId,
-      },
-      include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
-    });
-    return res.json({ ok: true, retentionDays: MESSAGE_LIBRARY_TRASH_RETENTION_DAYS, item: scriptFromCollection(item) });
-  } catch (err) {
-    return sendError(res, err, "MESSAGE_LIBRARY_SCRIPT_DELETE_FAILED");
-  }
-});
-
-router.post("/message-library/scripts/:id/restore", async (req, res) => {
-  try {
-    await assertMessageLibraryManager(req);
-    const id = cleanString(req.params.id, 120);
-    const creatorId = await requireMessageLibraryCreator(req);
-    const existing = await prisma.contentCollection.findFirst({
-      where: { agencyId: req.auth.agencyId, clientId: id, kind: MESSAGE_LIBRARY_KIND, creatorId },
-    });
-    if (!existing) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
-    const item = await prisma.contentCollection.update({
-      where: { id: existing.id },
-      data: { deletedAt: null, status: "active", purgeAfter: null, trashedByUserId: null, updatedByUserId: req.auth.userId },
-      include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
-    });
-    return res.json({ ok: true, item: scriptFromCollection(item) });
-  } catch (err) {
-    return sendError(res, err, "MESSAGE_LIBRARY_SCRIPT_RESTORE_FAILED");
-  }
-});
-
-router.delete("/message-library/scripts/:id/permanent", async (req, res) => {
-  try {
-    await assertMessageLibraryManager(req);
-    const id = cleanString(req.params.id, 120);
-    const creatorId = await requireMessageLibraryCreator(req);
-    const existing = await prisma.contentCollection.findFirst({
-      where: { agencyId: req.auth.agencyId, clientId: id, kind: MESSAGE_LIBRARY_KIND, creatorId },
-      include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
-    });
-    if (!existing) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
-    if (!existing.deletedAt && existing.status !== "trash" && existing.status !== "deleted") {
-      return res.status(409).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_TRASHED", error: "Move the script to trash before deleting it forever" });
-    }
-    const item = scriptFromCollection(existing);
-    await prisma.contentCollection.delete({ where: { id: existing.id } });
-    return res.json({ ok: true, permanent: true, item });
-  } catch (err) {
-    return sendError(res, err, "MESSAGE_LIBRARY_SCRIPT_PERMANENT_DELETE_FAILED");
-  }
-});
-
-router.delete("/message-library/scripts/:scriptId/messages/:messageId", async (req, res) => {
-  try {
-    await assertMessageLibraryManager(req);
-    const scriptId = cleanString(req.params.scriptId, 120);
-    const messageId = cleanString(req.params.messageId, 120);
-    const creatorId = await requireMessageLibraryCreator(req);
-    const collection = await prisma.contentCollection.findFirst({
-      where: { agencyId: req.auth.agencyId, clientId: scriptId, kind: MESSAGE_LIBRARY_KIND, creatorId },
-      include: { blocks: true },
-    });
-    if (!collection) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
-    const block = collection.blocks.find((item) => String(item.clientId || item.id) === String(messageId));
-    if (!block) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_BLOCK_NOT_FOUND", error: "Message block not found" });
-    const trashedAt = new Date();
-    const updated = await prisma.contentBlock.update({
-      where: { id: block.id },
-      data: { status: "trash", deletedAt: trashedAt, purgeAfter: trashPurgeAfter(trashedAt), trashedByUserId: req.auth.userId },
-    });
-    return res.json({ ok: true, retentionDays: MESSAGE_LIBRARY_TRASH_RETENTION_DAYS, block: messageFromBlock(updated) });
-  } catch (err) {
-    return sendError(res, err, "MESSAGE_LIBRARY_BLOCK_DELETE_FAILED");
-  }
-});
-
-router.post("/message-library/scripts/:scriptId/messages/:messageId/restore", async (req, res) => {
-  try {
-    await assertMessageLibraryManager(req);
-    const scriptId = cleanString(req.params.scriptId, 120);
-    const messageId = cleanString(req.params.messageId, 120);
-    const creatorId = await requireMessageLibraryCreator(req);
-    const collection = await prisma.contentCollection.findFirst({
-      where: { agencyId: req.auth.agencyId, clientId: scriptId, kind: MESSAGE_LIBRARY_KIND, creatorId },
-      include: { blocks: true },
-    });
-    if (!collection) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
-    const block = collection.blocks.find((item) => String(item.clientId || item.id) === String(messageId));
-    if (!block) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_BLOCK_NOT_FOUND", error: "Message block not found" });
-    const updated = await prisma.contentBlock.update({
-      where: { id: block.id },
-      data: { status: "active", deletedAt: null, purgeAfter: null, trashedByUserId: null },
-    });
-    return res.json({ ok: true, block: messageFromBlock(updated) });
-  } catch (err) {
-    return sendError(res, err, "MESSAGE_LIBRARY_BLOCK_RESTORE_FAILED");
-  }
-});
+function lifecycleRoute(action, block = false) {
+  return async (req, res) => {
+    try {
+      await assertMessageLibraryManager(req);
+      const creatorId = await requireMessageLibraryCreator(req);
+      const scriptId = cleanString(block ? req.params.scriptId : req.params.id, 120);
+      const result = await withMessageLibraryMutation({ ...mutationContext(req, creatorId, scriptId, action), work: context => changeMessageLibraryLifecycle({ ...context, action, userId: req.auth.userId, messageId: block ? cleanString(req.params.messageId,120) : null }) });
+      return res.json({ ok: true, retentionDays: MESSAGE_LIBRARY_TRASH_RETENTION_DAYS, ...result, ...(result.item ? {item:scriptFromCollection(result.item)} : {}), ...(result.block ? {block:messageFromBlock(result.block)} : {}) });
+    } catch (err) { return sendError(res, err, "MESSAGE_LIBRARY_LIFECYCLE_FAILED"); }
+  };
+}
+router.delete("/message-library/scripts/:id", lifecycleRoute("trash"));
+router.post("/message-library/scripts/:id/restore", lifecycleRoute("restore"));
+router.delete("/message-library/scripts/:id/permanent", lifecycleRoute("permanent"));
+router.delete("/message-library/scripts/:scriptId/messages/:messageId", lifecycleRoute("trash", true));
+router.post("/message-library/scripts/:scriptId/messages/:messageId/restore", lifecycleRoute("restore", true));
 
 router.post("/message-library/purge-expired", async (req, res) => {
   try {
     await assertMessageLibraryManager(req);
     const creatorId = await requireMessageLibraryCreator(req);
-    const result = await maybePurgeExpiredMessageLibraryTrash(req.auth.agencyId, creatorId, { force: true });
+    const result = await runMessageLibraryTrashMaintenance({ db: prisma, agencyId: req.auth.agencyId, creatorId, actorMember: req.auth.membership || req.member, userId: req.auth.userId });
     return res.json({ ...result, creatorId });
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_PURGE_EXPIRED_FAILED");
@@ -696,19 +515,11 @@ router.post("/message-library/purge-expired", async (req, res) => {
 router.get("/message-library/usage", async (req, res) => {
   try {
     const creatorId = await requireMessageLibraryCreator(req);
-    const collections = await prisma.contentCollection.findMany({
-      where: { agencyId: req.auth.agencyId, creatorId, kind: MESSAGE_LIBRARY_KIND },
-      select: { id: true },
-      take: 10000,
-    });
-    const collectionIds = collections.map((item) => item.id);
-    if (!collectionIds.length) return res.json({ ok: true, source: "server", events: [], count: 0 });
-    const events = await prisma.contentUsageEvent.findMany({
-      where: { agencyId: req.auth.agencyId, creatorId, collectionId: { in: collectionIds } },
-      orderBy: [{ createdAt: "desc" }],
-      take: parseLimit(req.query.limit, 500, 2000),
-      skip: parseOffset(req.query.offset),
-    });
+    const events = await prisma.$queryRawUnsafe(`
+      SELECT e.* FROM "ContentUsageEvent" e LEFT JOIN "ContentCollection" c ON c."id"=e."collectionId" AND c."agencyId"=e."agencyId" AND c."creatorId"=e."creatorId"
+      WHERE e."agencyId"=$1 AND e."creatorId"=$2 AND (c."kind"=$3 OR e."metadata"->>'product'=$3)
+      ORDER BY e."createdAt" DESC,e."id" DESC LIMIT $4 OFFSET $5`,
+      req.auth.agencyId, creatorId, MESSAGE_LIBRARY_KIND, parseLimit(req.query.limit,500,2000), parseOffset(req.query.offset));
     return res.json({ ok: true, source: "server", creatorId, events, count: events.length });
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_USAGE_LIST_FAILED");
@@ -729,19 +540,18 @@ router.post("/message-library/usage", async (req, res) => {
     }
     await requireProductCreator(req, creatorId, { db: prisma });
 
-    const collection = await prisma.contentCollection.findFirst({
-      where: { agencyId: req.auth.agencyId, kind: MESSAGE_LIBRARY_KIND, clientId: scriptId, creatorId },
-      include: { blocks: true },
-    });
+    const event = await withMessageLibraryMutation({ ...mutationContext(req, creatorId, scriptId, "usage", false), work: async ({ tx, existing: collection }) => {
     if (!collection) {
       const err = new Error("Message Library script not found for this creator");
       err.status = 404;
       err.code = "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND";
       throw err;
     }
+    if (isTrash(collection)) throw Object.assign(new Error("Script is not available"), {code:"MESSAGE_LIBRARY_SCRIPT_TRASHED",status:409});
     const block = messageId
       ? collection.blocks.find((item) => String(item.clientId || item.id) === String(messageId)) || null
       : null;
+    if (block && isTrash(block)) throw Object.assign(new Error("Message is not available"), {code:"MESSAGE_LIBRARY_BLOCK_TRASHED",status:409});
     if (messageId && !block) {
       const err = new Error("Message Library block not found");
       err.status = 404;
@@ -749,7 +559,7 @@ router.post("/message-library/usage", async (req, res) => {
       throw err;
     }
 
-    const event = await prisma.contentUsageEvent.create({
+    return tx.contentUsageEvent.create({
       data: {
         agencyId: req.auth.agencyId,
         collectionId: collection.id,
@@ -762,6 +572,8 @@ router.post("/message-library/usage", async (req, res) => {
         createdByUserId: req.auth.userId,
       },
     });
+
+    } });
 
     return res.status(201).json({ ok: true, source: "server", event });
   } catch (err) {

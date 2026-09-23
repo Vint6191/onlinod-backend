@@ -32,6 +32,7 @@ const ROUTE_MANIFEST = Object.freeze([
   route("/api/system", ROUTE_CLASS.PUBLIC, "routes/system.js", "public system health/version contract"),
   route("/api/auth", ROUTE_CLASS.PUBLIC, "routes/auth.js", "authentication/enrollment boundary"),
   route("/api/admin-auth", ROUTE_CLASS.ADMIN, "routes/admin-auth.js", "admin authentication"),
+  route("/api/admin/commands", ROUTE_CLASS.ADMIN, "routes/admin-commands.js", "current admin session/epoch and command actor ownership"),
   route("/api/admin/data", ROUTE_CLASS.ADMIN, "routes/admin-data.js", "admin authorization"),
   route("/api/admin/billing", ROUTE_CLASS.ADMIN, "routes/admin-billing.js", "admin authorization"),
   route("/api/admin", ROUTE_CLASS.ADMIN, "routes/admin.js", "admin authorization"),

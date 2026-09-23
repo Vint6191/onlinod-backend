@@ -149,7 +149,7 @@ test("A33 Admin current UI maps canonical fields, preserves UNKNOWN money, and i
   }
 
   assert.match(data, /const readOnly = view\.entity !== "deliveries"/);
-  assert.match(data, /updateBulkBtn\(body\);\s*if \(readOnly\) return;/);
+  assert.match(data, /updateBulkBtn\(body\);[\s\S]*if \(readOnly\) return;/);
   assert.match(data, /if \(view.loading \|\| view.entity !== "deliveries" \|\| !view.selected.size\) return/);
   assert.doesNotMatch(data, /dataDeleteRecord|dataBulkDelete|dataPurgeDeliveries/);
   assert.match(detail, /const readOnly = !cfg\.model/);

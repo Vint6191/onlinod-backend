@@ -21,10 +21,10 @@ function mountedFamilies() {
   return out;
 }
 
-test("Audit16 route manifest exactly classifies all 48 production route families", () => {
+test("Audit16 route manifest exactly classifies all 49 production route families", () => {
   const mounted = mountedFamilies();
-  assert.equal(mounted.length, 48, `expected 48 route families, got ${mounted.length}`);
-  assert.equal(ROUTE_MANIFEST.length, 48, "manifest must classify exactly 48 route families");
+  assert.equal(mounted.length, 49, `expected 49 route families, got ${mounted.length}`);
+  assert.equal(ROUTE_MANIFEST.length, 49, "manifest must classify exactly 49 route families");
   assert.deepEqual(new Set(ROUTE_MANIFEST.map((x) => x.path)), new Set(mounted));
   const valid = new Set(Object.values(ROUTE_CLASS));
   for (const entry of ROUTE_MANIFEST) {
@@ -197,8 +197,8 @@ test("Audit16 optional PPV audit provenance uses signed device, never body spoof
 test("Audit16 Message Library retention and usage cannot widen back to agency scope", () => {
   const source = read("routes/content-store.js");
   assert.match(source, /async function requireMessageLibraryCreator\(req\)[\s\S]*CREATOR_ID_MISSING[\s\S]*requireProductCreator\(req, creatorId, \{ db: prisma \}\)/);
-  assert.match(source, /async function purgeExpiredMessageLibraryTrash\(agencyId, creatorId\)/);
-  assert.match(source, /where:\s*\{\s*agencyId,\s*creatorId,\s*kind:\s*MESSAGE_LIBRARY_KIND/);
+  assert.match(source, /runMessageLibraryTrashMaintenance\(\{ db: prisma, agencyId: req.auth.agencyId, creatorId, actorMember:/);
+  assert.match(read("services/message-library-lifecycle-service.js"), /if\(!agencyId \|\| !creatorId\)/);
   assert.match(source, /router\.get\("\/message-library\/usage"[\s\S]*const creatorId = await requireMessageLibraryCreator\(req\)/);
   assert.match(source, /router\.post\("\/message-library\/purge-expired"[\s\S]*const creatorId = await requireMessageLibraryCreator\(req\)/);
 });

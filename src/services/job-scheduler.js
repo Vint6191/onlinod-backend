@@ -2115,6 +2115,7 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
     // this rotation is only a resource/fairness budget, never business truth. A restart may
     // change which lane runs first, but no lane loses work because claims/cursors stay durable.
     const lanes = [
+      ["messageLibraryTrash", () => require("./message-library-lifecycle-service").runMessageLibraryTrashMaintenance({ db })],
       ["adminBillingPricing", () => require("./admin-bulk-pricing-command-service").runAdminBulkPricingSweep({ db })],
       ["agencyDestructiveCleanup", () => runAgencyDestructiveCleanupSweep({ db, now })],
       ["creatorDestructiveCleanup", () => runCreatorDestructiveCleanupSweep({ db, now })],

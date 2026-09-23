@@ -2,6 +2,7 @@
 
 const { setAdminBillingPolicy, setAdminBillingHold, setAdminEntitlement } = require("../services/admin-billing-access-command-service");
 const { archiveAdminDeliveries } = require("../services/admin-delivery-archive-command-service");
+const { changeAdminContentLifecycle } = require("../services/admin-content-lifecycle-command-service");
 const prisma = require("../prisma");
 const { submitAdminBulkPricing, cancelAdminBulkPricing } = require("../services/admin-bulk-pricing-command-service");
 const { commandRequest } = require("../services/admin-command-contract");
@@ -26,4 +27,4 @@ function handler(service, targetKey) {
   };
 }
 
-module.exports = { archiveDeliveriesHandler: handler(archiveAdminDeliveries, "creatorId"), cancelBulkPricingHandler: handler(cancelAdminBulkPricing, "agencyId"), bulkPricingHandler: handler(submitAdminBulkPricing, "agencyId"), setBillingPolicyHandler: handler(setAdminBillingPolicy, "agencyId"), setBillingHoldHandler: handler(setAdminBillingHold, "agencyId"), setEntitlementHandler: handler(setAdminEntitlement, "creatorId"), sendCommandError, setPricingHandler: handler(setAdminPricing, "creatorId"), createAdminHandler: handler(createAdminIdentity), patchAdminHandler: handler(patchAdminIdentity, "targetId"), resetAdminPasswordHandler: handler(resetAdminPassword, "targetId") };
+module.exports = { contentLifecycleHandler: handler(changeAdminContentLifecycle, "targetId"), archiveDeliveriesHandler: handler(archiveAdminDeliveries, "creatorId"), cancelBulkPricingHandler: handler(cancelAdminBulkPricing, "agencyId"), bulkPricingHandler: handler(submitAdminBulkPricing, "agencyId"), setBillingPolicyHandler: handler(setAdminBillingPolicy, "agencyId"), setBillingHoldHandler: handler(setAdminBillingHold, "agencyId"), setEntitlementHandler: handler(setAdminEntitlement, "creatorId"), sendCommandError, setPricingHandler: handler(setAdminPricing, "creatorId"), createAdminHandler: handler(createAdminIdentity), patchAdminHandler: handler(patchAdminIdentity, "targetId"), resetAdminPasswordHandler: handler(resetAdminPassword, "targetId") };

@@ -16,7 +16,7 @@
   }
   function isCommand(path, method) {
     return (method === "PATCH" && /^\/api\/admin\/(?:billing\/creator\/[^/]+|creators\/[^/]+\/(?:billing|entitlement)|agencies\/[^/]+\/(?:subscription|billing-hold)|admin-users\/[^/]+)$/.test(path)) ||
-      (method === "POST" && (/^\/api\/admin\/data\/creators\/[^/]+\/archive-deliveries$/.test(path) || /^\/api\/admin\/admin-users(?:\/[^/]+\/reset-password)?$/.test(path) || /^\/api\/admin\/billing\/agency\/[^/]+\/apply-tier(?:\/cancel)?$/.test(path)));
+      (method === "POST" && (/^\/api\/admin\/data\/content\/[^/]+\/lifecycle$/.test(path) || /^\/api\/admin\/data\/creators\/[^/]+\/archive-deliveries$/.test(path) || /^\/api\/admin\/admin-users(?:\/[^/]+\/reset-password)?$/.test(path) || /^\/api\/admin\/billing\/agency\/[^/]+\/apply-tier(?:\/cancel)?$/.test(path)));
   }
   async function prepare({ path, method, body, token }) {
     if (!isCommand(path, method)) return null;

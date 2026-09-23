@@ -37,7 +37,7 @@ const { adminRequired } = require("../middleware/admin");
 const { adminHttpAuditMiddleware } = require("../middleware/admin-audit");
 const { listHiddenOnline } = require("../services/subscriber-directory-service");
 const { listFollowBack } = require("../services/follow-back-service");
-const { archiveDeliveriesHandler } = require("./admin-command-handlers");
+const { archiveDeliveriesHandler, contentLifecycleHandler } = require("./admin-command-handlers");
 
 const router = express.Router();
 router.use(adminRequired);
@@ -272,7 +272,7 @@ router.get("/money", async (req, res) => {
 
 router.get("/content", async (req, res) => {
   try {
-    const where = { deletedAt: null };
+    const where = req.query.includeTrash === "true" ? {} : { deletedAt: null };
     if (str(req.query.agencyId)) where.agencyId = str(req.query.agencyId);
     if (str(req.query.creatorId)) where.creatorId = str(req.query.creatorId);
     if (str(req.query.kind)) where.kind = str(req.query.kind);
@@ -467,5 +467,7 @@ router.delete("/record/:model/:id", retiredMutation);
 router.post("/bulk-delete", retiredMutation);
 router.post("/purge-deliveries", retiredMutation);
 router.post("/creators/:id/archive-deliveries", archiveDeliveriesHandler);
+
+router.post("/content/:id/lifecycle", contentLifecycleHandler);
 
 module.exports = router;

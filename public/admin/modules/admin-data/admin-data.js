@@ -16,6 +16,7 @@
 
   // entity key → { label, api(query), columns:[{k,label,fmt?}], model (for inspection) }
   const ENTITIES = {
+    "content": { label: "Message Library", model: "contentCollection", api: q => A().dataContent({...q,kind:"message_library_script",includeTrash:"true"}), cols: [{k:"title",label:"Title"},{k:"status",label:"Status"},{k:"creatorId",label:"Creator"},{k:"updatedAt",label:"Updated",fmt:fmtDate}] },
     "crm-profiles": {
       label: "CRM Profiles", model: "crmProfile",
       api: (q) => A().crmProfiles(q),
@@ -217,6 +218,7 @@
         ${cells}
         <td class="adm-row-actions">
           <button class="adm-link" data-inspect="${esc(row.id)}">inspect</button>
+          ${view.entity === "content" && row.status !== "deleting" ? `<button class="adm-link" data-content-id="${esc(row.id)}" data-content-action="${row.deletedAt || row.status === "trash" ? "restore" : "trash"}">${row.deletedAt || row.status === "trash" ? "restore" : "trash"}</button>${row.deletedAt || row.status === "trash" ? `<button class="adm-link" data-content-id="${esc(row.id)}" data-content-action="permanent">delete forever</button>` : ""}` : ""}
         </td>
       </tr>`;
     }).join("");
@@ -228,6 +230,7 @@
 
     table.querySelectorAll("[data-inspect]").forEach((b) => b.addEventListener("click", () => inspect(ent.model, b.dataset.inspect)));
     updateBulkBtn(body);
+    table.querySelectorAll("[data-content-action]").forEach(b => b.addEventListener("click", () => changeContent(body, b.dataset.contentId, b.dataset.contentAction)));
     if (readOnly) return;
 
     // select-all
@@ -256,6 +259,18 @@
     const r = await A().dataInspect(model, id);
     if (!r || !r.ok) { R().toast("inspect failed", "error"); return; }
     showModal(`${model} · ${id}`, `<pre class="adm-json">${esc(JSON.stringify(r.record, null, 2))}</pre>`);
+  }
+
+  async function changeContent(body, id, action) {
+    if(view.loading)return;
+    const row=view.rows.find(row=>row.id===id);
+    if(!row?.creatorId || !row.agencyId || !row.updatedAt)return;
+    const reason=prompt(`Reason to ${action} this Message Library script:`);
+    if(!reason?.trim())return;
+    if(action==="permanent" && !confirm("Commit permanent deletion? The script cannot be restored; physical cleanup runs in the background."))return;
+    view.loading=true;
+    try{const r=await A().dataContentLifecycle(id,{agencyId:row.agencyId,creatorId:row.creatorId,expectedUpdatedAt:row.updatedAt,action,reason:reason.trim()});R().toast(r?.ok?(r.pendingCleanup?"Deletion committed; cleanup pending":"Updated"):(r?.error||"Result unknown; retry the same action"),r?.ok?"ok":"error");if(r?.ok)await loadEntity(body);}
+    finally{view.loading=false;}
   }
 
   function canSelect(row) {

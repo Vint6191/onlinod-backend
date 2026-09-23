@@ -59,7 +59,13 @@ const deliveryArchiveSchema = z.object({
   items: z.array(z.object({ id: z.string().trim().min(1).max(180), expectedUpdatedAt: z.string().datetime() }).strict()).min(1).max(100),
 }).strict().refine(value => new Set(value.items.map(item => item.id)).size === value.items.length, "Duplicate delivery selection");
 
+const contentLifecycleSchema = z.object({
+  agencyId: z.string().trim().min(1).max(180), creatorId: z.string().trim().min(1).max(180),
+  action: z.enum(["trash","restore","permanent"]), expectedUpdatedAt: z.string().datetime(), reason: reasonSchema,
+}).strict();
+
 const ACTIONS = Object.freeze({
+  "data.content.lifecycle": { roles: ["SUPER_ADMIN"], schema: contentLifecycleSchema },
   "data.delivery.archive": { roles: ["SUPER_ADMIN"], schema: deliveryArchiveSchema },
   "billing.pricing.bulk.cancel": { roles: ["SUPER_ADMIN", "SUPPORT"], parentIdentity: true, schema: z.object({ targetCommandId: commandIdSchema, reason: reasonSchema }).strict() },
   "billing.pricing.bulk": { resumeIdentity: true, roles: ["SUPER_ADMIN", "SUPPORT"], schema: bulkPricingSchema },
@@ -103,4 +109,4 @@ function publicAdmin(row) {
   return { id: row.id, email: row.email, name: row.name, role: row.role, active: row.active, accessEpoch: row.accessEpoch, lastLoginAt: row.lastLoginAt || null, createdAt: row.createdAt };
 }
 
-module.exports = { deliveryArchiveSchema, bulkPricingSchema, billingPolicySchema, billingHoldSchema, entitlementSchema, ACTIONS, adminError, canonicalJson, commandIdSchema, revisionSchema, reasonSchema, pricingSchema, intentHash, passwordFingerprint, commandRequest, publicAdmin };
+module.exports = { contentLifecycleSchema, deliveryArchiveSchema, bulkPricingSchema, billingPolicySchema, billingHoldSchema, entitlementSchema, ACTIONS, adminError, canonicalJson, commandIdSchema, revisionSchema, reasonSchema, pricingSchema, intentHash, passwordFingerprint, commandRequest, publicAdmin };

@@ -13,6 +13,7 @@ function createMemoryDb(options = {}) {
     profiles: [{ id: "profile-a", creatorId: "creator-a", agencyId: "agency-a", pricingRevision: 1, tier: "STARTER", tierMode: "AUTO", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 10000, outreachEnabled: false, outreachPriceCents: 2900, billingExcluded: false, notes: null, revenue30dCents: 42 }],
     commands: [], audit: [], logs: [], workItems: [], deliveries: [], aggregates: [], candidates: [],
   };
+  if(options.extendState) Object.assign(state, structuredClone(options.extendState));
   const clock = new Date("2026-09-23T12:00:00Z");
   const copy = value => structuredClone(value);
   const match = (row, where) => Object.entries(where).every(([key, value]) => row[key] === value);
@@ -37,7 +38,7 @@ function createMemoryDb(options = {}) {
       if (name === "agencies" && (row.deletedAt || row.billingSupportHold)) row.status = "LOCKED";
       return copy(row);
     }
-    return {
+    const api = {
       async $queryRawUnsafe(sql, ...args) {
         const id = args[0];
         if (sql.includes('FROM "SfsTargetCandidate"')) return table("candidates").filter(row => id.includes(row.id)).map(copy);
@@ -139,6 +140,7 @@ function createMemoryDb(options = {}) {
       adminCommandAudit: { create: async ({ data }) => { if (options.failAudit) throw new Error("audit unavailable"); return create("audit", data); } },
       adminActionLog: { create: async ({ data }) => { if (options.failLog) throw new Error("audit unavailable"); return create("logs", data); } },
     };
+    return options.extendClient ? options.extendClient(api, {read,write,clock,copy}) : api;
   }
   let serial = Promise.resolve();
   const db = client(() => state, next => { state = next; });

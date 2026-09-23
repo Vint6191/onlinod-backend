@@ -1,6 +1,6 @@
 "use strict";
 const test=require("node:test"),assert=require("node:assert/strict"),crypto=require("node:crypto"),express=require("express");
-const {createMemoryDb}=require("../../scripts/test-support/admin-command-memory-db");
+const {createContentDb:createMemoryDb}=require("../../scripts/test-support/message-library-memory-db");
 test("actual Data router retires wildcard purge and generic deletes; archive authenticates and replays",async t=>{
  const m=createMemoryDb();m.state.sessions[0].tokenHash=crypto.createHash("sha256").update("test-token").digest("hex");
  const at=new Date("2025-01-01T00:00:00Z");m.state.deliveries.push({id:"d",agencyId:"agency-a",creatorId:"creator-a",originKind:"AUTOMATION",moduleKey:"likes",actionType:"LIKE_POST",status:"COMPLETED",updatedAt:at,createdAt:at,finishedAt:at});
@@ -14,5 +14,8 @@ test("actual Data router retires wildcard purge and generic deletes; archive aut
  const missing=await send(url,payload,"POST",null);assert.equal(missing.status,428);await missing.json();
  const first=await send(url,payload);assert.equal(first.status,200);const receipt=await first.json();assert.equal(receipt.archived,1);
  const replay=await send(url,payload);assert.equal(replay.status,200);assert.deepEqual(await replay.json(),receipt);assert.equal(m.state.aggregates[0].total,1);
+ const contentId=crypto.randomUUID(),contentPayload={agencyId:"agency-a",creatorId:"creator-a",expectedUpdatedAt:m.state.collections[0].updatedAt.toISOString(),action:"trash",reason:"reviewed content"};
+ const content=await send("/content/collection-a/lifecycle",contentPayload,"POST",contentId);assert.equal(content.status,200);const contentBody=await content.json();assert.equal(contentBody.status,"trash");
+ const contentReplay=await send("/content/collection-a/lifecycle",contentPayload,"POST",contentId);assert.equal(contentReplay.status,200);assert.deepEqual(await contentReplay.json(),contentBody);
  m.state.sessions[0].revokedAt=at;const revoked=await send(url,payload);assert.equal(revoked.status,401);await revoked.json();
 });

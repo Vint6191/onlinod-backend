@@ -193,6 +193,7 @@
     dataMoney:         (query)  => request("/api/admin/data/money", { query }),
     dataContent:       (query)  => request("/api/admin/data/content", { query }),
     dataInspect:       (model, id) => request(`/api/admin/data/inspect/${encodeURIComponent(model)}/${encodeURIComponent(id)}`),
+    dataContentLifecycle: (id, body) => request(`/api/admin/data/content/${encodeURIComponent(id)}/lifecycle`, { method: "POST", body }),
     dataArchiveDeliveries: (id, body) => request(`/api/admin/data/creators/${encodeURIComponent(id)}/archive-deliveries`, { method: "POST", body }),
 
     // ─── billing management (admin-billing.js) ────────────────
