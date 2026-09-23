@@ -50,7 +50,7 @@ async function seedWorker({ db, agencyId, creatorId, ordinal }) {
     id: memberId,
     agencyId,
     userId,
-    role: "CHATTER",
+    role: "OPERATOR",
     roleKey: "chatter",
     assignedCreators: [creatorId],
   } }));

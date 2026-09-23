@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { Linter } = require("eslint");
+const { inspectRepository } = require("./phase3-prisma-source-contract");
 
 const ROOT = path.resolve(__dirname, "../..");
 const DEFAULT_FILES = Object.freeze([
@@ -15,6 +16,8 @@ const DEFAULT_FILES = Object.freeze([
   "scripts/audit/phase3-a26-render-disposable.js",
   "scripts/audit/phase3-a29-render-gate.js",
   "scripts/audit/phase3-postgres-identifier-lint.js",
+  "scripts/audit/phase3-prisma-source-contract.js",
+  "scripts/test-support/phase3-interleaved-transactions.js",
   "scripts/maintenance/phase3-subscriber-maintenance-signals.js",
   "scripts/maintenance/dedupe-deliveries.js",
   "scripts/maintenance/purge-stuck-deliveries.js",
@@ -51,6 +54,9 @@ const DEFAULT_FILES = Object.freeze([
   "src/services/notification-facts-schema.test.js",
   "src/services/fan-data-authority-service.js",
   "src/services/fan-data-authority-cutover.test.js",
+  "src/services/fan-observation-clock-activation-service.js",
+  "src/services/phase3-observation-clock-bridge-int5-7a-2.test.js",
+  "src/services/phase3-postgres-proof-contract.test.js",
   "src/services/subscriber-directory-service.js",
   "src/services/subscriber-directory-maintenance-service.js",
   "src/services/subscriber-directory-maintenance-signal-service.js",
@@ -133,7 +139,8 @@ function main() {
     if (messages.length) noUndefFailures.push({ file, messages: messages.map((row) => ({ line: row.line, column: row.column, message: row.message })) });
   }
 
-  const result = { ok: syntaxFailures.length === 0 && noUndefFailures.length === 0, files: files.length, syntaxFailures, noUndefFailures };
+  const prismaContracts = inspectRepository(ROOT);
+  const result = { ok: syntaxFailures.length === 0 && noUndefFailures.length === 0 && prismaContracts.ok, files: files.length, syntaxFailures, noUndefFailures, prismaContracts };
   console.log(`PHASE3_A26_CHANGED_JS_GATE ${JSON.stringify(result)}`);
   if (!result.ok) fail(JSON.stringify(result));
   return result;

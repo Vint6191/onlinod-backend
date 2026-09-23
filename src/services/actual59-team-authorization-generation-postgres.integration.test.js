@@ -51,7 +51,7 @@ test("Actual59 PostgreSQL: telemetry SHARE fence serializes accessEpoch bump and
     await withTeamGeneration(reader, (tx) => tx.agency.create({ data: { id: agencyId, name: agencyId } }));
     await reader.user.create({ data: { id: userId, email: `${userId}@example.test`, passwordHash: "integration" } });
     await withTeamGeneration(reader, (tx) => tx.agencyMember.create({
-      data: { id: memberId, agencyId, userId, role: "CHATTER", roleKey: "chatter", assignedCreators: [] },
+      data: { id: memberId, agencyId, userId, role: "OPERATOR", roleKey: "chatter", assignedCreators: [] },
     }));
     const initial = await reader.agencyMember.findUnique({ where: { id: memberId }, select: { accessEpoch: true } });
     const oldEpoch = Number(initial.accessEpoch);
@@ -328,7 +328,7 @@ test("Actual59 INT59.4D PostgreSQL: committed member deactivation wins before st
     await withTeamGeneration(reader, (tx) => tx.agency.create({ data: { id: agencyId, name: agencyId } }));
     await reader.user.create({ data: { id: userId, email: `${userId}@example.test`, passwordHash: "pw-old", emailVerifiedAt: new Date() } });
     await withTeamGeneration(reader, (tx) => tx.agencyMember.create({
-      data: { id: memberId, agencyId, userId, role: "CHATTER", roleKey: "chatter", assignedCreators: [] },
+      data: { id: memberId, agencyId, userId, role: "OPERATOR", roleKey: "chatter", assignedCreators: [] },
     }));
     const member = await reader.agencyMember.findUnique({ where: { id: memberId }, select: { accessEpoch: true } });
 
@@ -374,7 +374,7 @@ test("Actual59 INT59.4D PostgreSQL: committed password generation change wins be
     await withTeamGeneration(reader, (tx) => tx.agency.create({ data: { id: agencyId, name: agencyId } }));
     await reader.user.create({ data: { id: userId, email: `${userId}@example.test`, passwordHash: "pw-old", emailVerifiedAt: new Date() } });
     await withTeamGeneration(reader, (tx) => tx.agencyMember.create({
-      data: { id: memberId, agencyId, userId, role: "CHATTER", roleKey: "chatter", assignedCreators: [] },
+      data: { id: memberId, agencyId, userId, role: "OPERATOR", roleKey: "chatter", assignedCreators: [] },
     }));
     const member = await reader.agencyMember.findUnique({ where: { id: memberId }, select: { accessEpoch: true } });
 

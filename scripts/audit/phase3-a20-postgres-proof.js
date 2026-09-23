@@ -116,20 +116,39 @@ function persistStepLog(label, stdout, stderr) {
   fs.writeFileSync(file, body, "utf8");
   return { file, sha256: crypto.createHash("sha256").update(body).digest("hex"), bytes: Buffer.byteLength(body) };
 }
+function compactProofText(value, limit) {
+  if (value == null) return value;
+  const text = String(value);
+  if (text.length <= limit) return text;
+  const marker = `\n... [${text.length} chars; full text in step log/report] ...\n`;
+  const remaining = Math.max(0, limit - marker.length);
+  const head = Math.floor(remaining / 2);
+  return text.slice(0, head) + marker + text.slice(-(remaining - head));
+}
+function compactProofFailure(failure) {
+  if (!failure) return null;
+  // Preserve the actual Prisma reason at the END of a validation error, not
+  // just the huge serialized fixture at its beginning. Reports remain lossless.
+  return {
+    ...failure,
+    name: compactProofText(failure.name, 512),
+    error: compactProofText(failure.error, 2400),
+    stack: compactProofText(failure.stack, 1400),
+  };
+}
 function failureDigest(stdout, stderr, limit = 180) {
   const lines = `${stdout || ""}\n${stderr || ""}`.split(/\r?\n/);
-  const keep = [];
+  const keep = new Set();
   const interesting = /(not ok|FAIL|AssertionError|ConnectorError|PrismaClient|Error:|error:|expected:|actual:|location:|PHASE[0-9A-Z_:-]+.*(?:FAIL|ERROR))/i;
   for (let i = 0; i < lines.length; i += 1) {
     if (!interesting.test(lines[i])) continue;
-    for (let j = Math.max(0, i - 2); j <= Math.min(lines.length - 1, i + 8); j += 1) keep.push(lines[j]);
+    for (let j = Math.max(0, i - 2); j <= Math.min(lines.length - 1, i + 8); j += 1) keep.add(j);
   }
-  const deduped = [];
-  for (const line of keep) if (!deduped.length || deduped[deduped.length - 1] !== line) deduped.push(line);
-  if (deduped.length <= limit) return deduped.join("\n");
+  const deduped = [...keep].sort((a, b) => a - b).map((index) => compactProofText(lines[index], 1200));
+  if (deduped.length <= limit) return compactProofText(deduped.join("\n"), 12_000);
   const head = deduped.slice(0, Math.floor(limit / 2));
   const tail = deduped.slice(-Math.ceil(limit / 2));
-  return [...head, `... ${deduped.length - head.length - tail.length} relevant lines omitted; full step log persisted ...`, ...tail].join("\n");
+  return compactProofText([...head, `... ${deduped.length - head.length - tail.length} relevant lines omitted; full step log persisted ...`, ...tail].join("\n"), 12_000);
 }
 function run(label, command, args, env, input = undefined, { allowFailure = false } = {}) {
   const startedAt = process.hrtime.bigint();
@@ -346,7 +365,7 @@ function runProofTests(label, databaseUrl) {
   for (const file of PROOF_TESTS) {
     const short = path.basename(file, ".integration.test.js");
     const before = leakSnapshot(`${label}-${short}-leak-before`, databaseUrl);
-    const out = run(`${label}-${short}`, process.execPath, ["--test", "--test-concurrency=1", file], { DATABASE_URL: databaseUrl, ONLINOD_POSTGRES_INTEGRATION: "1" }, undefined, { allowFailure: true });
+    const out = run(`${label}-${short}`, process.execPath, ["--test", "--test-reporter=tap", "--test-concurrency=1", file], { DATABASE_URL: databaseUrl, ONLINOD_POSTGRES_INTEGRATION: "1" }, undefined, { allowFailure: true });
     const after = leakSnapshot(`${label}-${short}-leak-after`, databaseUrl);
     const leaks = leakDiff(before, after);
     const fileSummary = {
@@ -385,12 +404,12 @@ function runProofTests(label, databaseUrl) {
     console.log(`# PHASE3_A26_PROOF_FILE ${JSON.stringify({
       label, file: result.file, ok: result.ok, status: result.status,
       tests: result.tests, pass: result.pass, fail: result.fail, skipped: result.skipped,
-      leaks: result.leaks, firstError: result.firstError,
+      leaks: result.leaks, firstError: compactProofFailure(result.firstError),
       log: { file: result.log.file, sha256: result.log.sha256, bytes: result.log.bytes },
     })}`);
     for (const failure of tapFailures) {
       console.error(`# PHASE3_A31_TAP_FAILURE ${JSON.stringify({
-        label, file: result.file, ...failure,
+        label, file: result.file, ...compactProofFailure(failure),
       })}`);
     }
   }
@@ -679,6 +698,8 @@ module.exports = {
   tapCount,
   tapTestNames,
   parseTapFailures,
+  failureDigest,
+  compactProofFailure,
   parseJsonLines,
   assertScaleMetrics,
   assertNodeProof,

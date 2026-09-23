@@ -76,7 +76,11 @@ async function activateFanObservationCreatorClockV1({
       throw error;
     }
     if (futureSkewMs > 0) {
-      await tx.$queryRawUnsafe('SELECT pg_sleep($1::double precision)', (futureSkewMs + 2) / 1000);
+      if (typeof tx.$executeRawUnsafe !== "function") {
+        throw new Error("FAN_OBSERVATION_CLOCK_ACTIVATION_DB_EXECUTE_UNAVAILABLE");
+      }
+      // pg_sleep returns void, not a Prisma-decodable result column.
+      await tx.$executeRawUnsafe('SELECT pg_sleep($1::double precision)', (futureSkewMs + 2) / 1000);
       const nowRows = await tx.$queryRawUnsafe('SELECT clock_timestamp() AS "dbNow"');
       dbNow = asDate(nowRows?.[0]?.dbNow, "FAN_OBSERVATION_CLOCK_DB_TIME_INVALID");
       futureSkewMs = Math.max(0, floorObservedAt.getTime() - dbNow.getTime());
@@ -93,7 +97,7 @@ async function activateFanObservationCreatorClockV1({
           active: true,
           epoch,
           floorObservedAt: floorObservedAt.toISOString(),
-          activatedAt: new Date().toISOString(),
+          activatedAt: dbNow.toISOString(),
           activatedBy: String(activatedBy || "operator").slice(0, 120),
         },
       },

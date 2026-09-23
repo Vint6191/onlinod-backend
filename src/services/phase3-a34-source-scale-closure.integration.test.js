@@ -8,7 +8,9 @@ const {
   pinPhase3AuditSchema,
   withPhase3PostgresFixtureAuthority,
   cleanupPhase3PostgresAgencyFixture,
+  cleanupPhase3PostgresFixtureGraph,
 } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+const { runPhase3InterleavedTransactions } = require("../../scripts/test-support/phase3-interleaved-transactions");
 const {
   TOPOLOGY_ID: DOMAIN_WORK_CLAIM_TOPOLOGY_ID,
   activateTopology: activateDomainWorkClaimTopology,
@@ -262,7 +264,7 @@ test("A36 PostgreSQL: scoped member claims 1000 of 2000 creators through fixed s
     ), { maxWait: 30_000, timeout: 240_000 });
     await withTeamGeneration(dbA, (tx) => tx.agencyMember.create({
       data: {
-        id: memberId, agencyId, userId, role: "CHATTER", roleKey: "chatter",
+        id: memberId, agencyId, userId, role: "OPERATOR", roleKey: "chatter",
         assignedCreators: { mode: "scoped", creatorIds: allowedCreatorIds },
       },
     }));
@@ -349,10 +351,12 @@ test("A36 PostgreSQL: scoped member claims 1000 of 2000 creators through fixed s
     assert.equal(stale.reason, "domain_work_member_scope_stale");
     console.log("# A36_SCOPED_1000_OF_2000_FIXED_SHARD_ACCESS_PASS");
   } finally {
-    await cleanupPhase3PostgresAgencyFixture(dbA, agencyId).catch(() => null);
-    await dbA.user.deleteMany({ where: { id: userId } }).catch(() => null);
-    await dbA.$disconnect();
-    await dbB.$disconnect();
+    try {
+      // User DELETE is itself Team-generation fenced, even after Agency delete.
+      await cleanupPhase3PostgresFixtureGraph(dbA, { agencyId, userIds: [userId] });
+    } finally {
+      await Promise.all([dbA.$disconnect(), dbB.$disconnect()]);
+    }
   }
 });
 
@@ -481,8 +485,11 @@ test("A36 PostgreSQL: dependency changes publish one durable wake and drain bloc
     }), 0);
     console.log("# A36_DEPENDENCY_WAKE_BOUNDED_FANOUT_PASS");
   } finally {
-    await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId).catch(() => null);
-    await db.$disconnect();
+    try {
+      await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId);
+    } finally {
+      await db.$disconnect();
+    }
   }
 });
 
@@ -861,8 +868,6 @@ test("A36 PostgreSQL: opposite-order multi-write transactions defer exact partit
     assert.equal(shardPairs.length, 2);
     const [[shardOneId, shardOne], [shardTwoId, shardTwo]] = shardPairs;
 
-    let releaseFirstWrite;
-    const firstWriteCommittedToTransaction = new Promise((resolve) => { releaseFirstWrite = resolve; });
     const publish = (tx, objectId, partitionKey) => publishDomainWork({
       db: tx,
       agencyId,
@@ -870,27 +875,14 @@ test("A36 PostgreSQL: opposite-order multi-write transactions defer exact partit
       objectType: "A36DeferredLocatorProbe",
       objectId,
       partitionKey,
-      availableAt: new Date(),
     });
-
-    const transactionA = dbA.$transaction(async (tx) => {
-      await pinPhase3AuditSchema(tx);
-      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '10s'");
-      await publish(tx, `${prefix}-a-one`, shardOne[0]);
-      releaseFirstWrite();
-      await tx.$queryRawUnsafe("SELECT pg_sleep(0.5)");
-      await publish(tx, `${prefix}-a-two`, shardTwo[0]);
-    }, { maxWait: 10_000, timeout: 30_000 });
-
-    await firstWriteCommittedToTransaction;
-    const transactionB = dbB.$transaction(async (tx) => {
-      await pinPhase3AuditSchema(tx);
-      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '10s'");
-      await publish(tx, `${prefix}-b-two`, shardTwo[1]);
-      await publish(tx, `${prefix}-b-one`, shardOne[1]);
-    }, { maxWait: 10_000, timeout: 30_000 });
-
-    await Promise.all([transactionA, transactionB]);
+    await runPhase3InterleavedTransactions({
+      dbA, dbB,
+      firstA: (tx) => publish(tx, `${prefix}-a-one`, shardOne[0]),
+      secondA: (tx) => publish(tx, `${prefix}-a-two`, shardTwo[0]),
+      firstB: (tx) => publish(tx, `${prefix}-b-two`, shardTwo[1]),
+      secondB: (tx) => publish(tx, `${prefix}-b-one`, shardOne[1]),
+    });
     assert.equal(await dbA.domainWorkItem.count({
       where: { agencyId, objectType: "A36DeferredLocatorProbe" },
     }), 4);
@@ -959,9 +951,11 @@ test("A36 PostgreSQL: opposite-order multi-write transactions defer exact partit
     assert.ok(rebuiltAgency?.nextDispatchAt?.getTime() >= futureDue.getTime() - 1);
     console.log("# A36_DEFERRED_LOCATOR_MULTI_WRITE_DEADLOCK_CLOSURE_PASS");
   } finally {
-    await cleanupPhase3PostgresAgencyFixture(dbA, agencyId);
-    await dbA.$disconnect();
-    await dbB.$disconnect();
+    try {
+      await cleanupPhase3PostgresAgencyFixture(dbA, agencyId);
+    } finally {
+      await Promise.all([dbA.$disconnect(), dbB.$disconnect()]);
+    }
   }
 });
 
@@ -987,8 +981,6 @@ test("A36 PostgreSQL: opposite-order transactions sharing the exact same partiti
     assert.ok(first?.partitionKey && second?.partitionKey);
     const p1 = String(first.partitionKey);
     const p2 = String(second.partitionKey);
-    let releaseFirstWrite;
-    const firstWriteVisible = new Promise((resolve) => { releaseFirstWrite = resolve; });
     const publish = (tx, objectId, partitionKey) => publishDomainWork({
       db: tx,
       agencyId,
@@ -996,27 +988,14 @@ test("A36 PostgreSQL: opposite-order transactions sharing the exact same partiti
       objectType: "A36ExactPartitionOrderProbe",
       objectId,
       partitionKey,
-      availableAt: new Date(),
     });
-
-    const transactionA = dbA.$transaction(async (tx) => {
-      await pinPhase3AuditSchema(tx);
-      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '10s'");
-      await publish(tx, `${prefix}-a-p1`, p1);
-      releaseFirstWrite();
-      await tx.$queryRawUnsafe("SELECT pg_sleep(0.5)");
-      await publish(tx, `${prefix}-a-p2`, p2);
-    }, { maxWait: 10_000, timeout: 30_000 });
-
-    await firstWriteVisible;
-    const transactionB = dbB.$transaction(async (tx) => {
-      await pinPhase3AuditSchema(tx);
-      await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '10s'");
-      await publish(tx, `${prefix}-b-p2`, p2);
-      await publish(tx, `${prefix}-b-p1`, p1);
-    }, { maxWait: 10_000, timeout: 30_000 });
-
-    await Promise.all([transactionA, transactionB]);
+    await runPhase3InterleavedTransactions({
+      dbA, dbB,
+      firstA: (tx) => publish(tx, `${prefix}-a-p1`, p1),
+      secondA: (tx) => publish(tx, `${prefix}-a-p2`, p2),
+      firstB: (tx) => publish(tx, `${prefix}-b-p2`, p2),
+      secondB: (tx) => publish(tx, `${prefix}-b-p1`, p1),
+    });
     assert.equal(await dbA.domainWorkItem.count({
       where: { agencyId, objectType: "A36ExactPartitionOrderProbe" },
     }), 4);
@@ -1038,9 +1017,11 @@ test("A36 PostgreSQL: opposite-order transactions sharing the exact same partiti
     assert.equal(retired.length, 0);
     console.log("# A36_EXACT_PARTITION_OPPOSITE_ORDER_NO_ROW_TRIGGER_DEADLOCK_PASS");
   } finally {
-    await cleanupPhase3PostgresAgencyFixture(dbA, agencyId);
-    await dbA.$disconnect();
-    await dbB.$disconnect();
+    try {
+      await cleanupPhase3PostgresAgencyFixture(dbA, agencyId);
+    } finally {
+      await Promise.all([dbA.$disconnect(), dbB.$disconnect()]);
+    }
   }
 });
 
@@ -1139,7 +1120,7 @@ test("A36 PostgreSQL: destructive internal authority requires the exact live cla
                set_config('onlinod.phase2_destructive_creator_work_id',$3,true),
                set_config('onlinod.phase2_destructive_creator_owner_token',$4,true)
       `, scope.creatorId, scope.agencyId, creatorWork.id, creatorOwner);
-      await tx.$queryRawUnsafe(
+      await tx.$executeRawUnsafe(
         `SELECT "phase2_assert_creator_destructive_insert_allowed"($1,$2,'A36ExactCreatorChildProbe')`,
         scope.agencyId, scope.creatorId,
       );
@@ -1165,8 +1146,11 @@ test("A36 PostgreSQL: destructive internal authority requires the exact live cla
     assert.equal(await agencyAuthorized({ workId: agencyWork.id, ownerToken: agencyOwner }), false);
     console.log("# A36_DESTRUCTIVE_EXACT_CLAIM_AUTHORITY_PASS");
   } finally {
-    await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId).catch(() => null);
-    await db.$disconnect();
+    try {
+      await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId);
+    } finally {
+      await db.$disconnect();
+    }
   }
 });
 

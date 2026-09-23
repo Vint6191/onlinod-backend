@@ -19,6 +19,12 @@ const { PrismaClient } = require("@prisma/client");
 const ROOT = path.resolve(__dirname, "../..");
 const CHANGED_GATE = path.join(ROOT, "scripts/audit/phase3-a26-changed-js-gate.js");
 const IDENTIFIER_LINT = path.join(ROOT, "scripts/audit/phase3-postgres-identifier-lint.js");
+const CONTRACT_PROOFS = [
+  "src/services/phase3-postgres-proof-contract.test.js",
+  "src/services/phase3-observation-clock-bridge-int5-7a-2.test.js",
+  "src/services/phase3-a34-source-scale-closure.test.js",
+  "src/services/phase3-a20-proof-runtime-contract.test.js",
+].map((file) => path.join(ROOT, file));
 
 function safeError(error) {
   return {
@@ -49,6 +55,13 @@ async function main() {
   const changedGate = await run(process.execPath, [CHANGED_GATE]);
   if (changedGate.code !== 0) throw Object.assign(new Error(`A29 changed-JS gate failed with exit ${changedGate.code}`), { exitCode: changedGate.code });
   console.log(`# PHASE3_A29_RENDER_GATE ${JSON.stringify({ phase: "changed-js-pass" })}`);
+
+  // Verify the proof harness itself before allocating a database or migrating
+  // anything. Static source checks alone cannot establish barrier/cleanup/error
+  // behavior. These tests use no database and do not count toward physical proof.
+  const contracts = await run(process.execPath, ["--test", "--test-reporter=tap", "--test-concurrency=1", ...CONTRACT_PROOFS]);
+  if (contracts.code !== 0) throw Object.assign(new Error(`A29 proof-contract tests failed with exit ${contracts.code}`), { exitCode: contracts.code });
+  console.log(`# PHASE3_A29_RENDER_GATE ${JSON.stringify({ phase: "proof-contracts-pass" })}`);
 
   const primary = directAdminUrl(primaryUrl);
   const nonce = `${Date.now().toString(36)}_${crypto.randomBytes(4).toString("hex")}`.toLowerCase();
@@ -107,4 +120,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, run };
+module.exports = { main, run, CONTRACT_PROOFS };

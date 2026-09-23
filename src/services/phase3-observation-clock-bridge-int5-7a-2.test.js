@@ -163,15 +163,19 @@ test("INT5.7A-2 activation waits out small future skew while the barrier and leg
         return [{ lastObservedAt: new Date(10_100), dbNow: new Date(10_000) }];
       }
       if (/pg_sleep/.test(sql)) {
-        events.push(["sleep", arg]);
-        assert.ok(arg >= 0.1);
-        return [{ pg_sleep: null }];
+        throw new Error("PostgreSQL void cannot be decoded by Prisma queryRaw");
       }
       if (/clock_timestamp/.test(sql)) {
         events.push("recheck-time");
         return [{ dbNow: new Date(10_102) }];
       }
       throw new Error(`unexpected SQL: ${sql}`);
+    },
+    async $executeRawUnsafe(sql, arg) {
+      assert.match(sql, /SELECT pg_sleep/);
+      events.push(["sleep", arg]);
+      assert.ok(arg >= 0.1);
+      return 1;
     },
     systemSetting: {
       async update({ data }) { events.push(["activate", data.value]); return data; },
@@ -186,6 +190,7 @@ test("INT5.7A-2 activation waits out small future skew while the barrier and leg
     "setting-lock", "legacy-lock", "sleep", "recheck-time",
   ]);
   assert.equal(events.at(-1)[0], "activate");
+  assert.equal(events.at(-1)[1].activatedAt, new Date(10_102).toISOString());
 });
 
 test("INT5.7A-2 activation fails closed instead of propagating a large future-skewed legacy floor", async () => {
