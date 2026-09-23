@@ -1,3 +1,19 @@
+# Phase 3 — A37-R4, lifecycle locators и adversarial Home closure
+
+**SOURCE OPEN / SCALE OPEN.** Текущая база `2026-09-23T193754.324.zip` точно совпадает с R3. Render: **140/140 offline**, но **0 из 213** named physical proofs запущено: все current-сценарии остановились на удалении fixture Agency. Primary deployment не достигнут, disposable cleanup успешен.
+
+Это регрессия R3: безусловное создание отсутствующего locator происходило после удаления его Agency в той же транзакции. Additive migration исправляет все три уровня: отсутствующий locator создаётся только при наличии child witness; после получения row ownership child truth читается заново. Empty/deleted parent не воскрешается, конкурентная private publication сохраняется. Старые миграции, FK, triggers, ABI, monotonic watermarks и lock order сохранены.
+
+Добавлены physical proofs: пустой/удалённый tenant с сохранением FK; настоящий production hard-delete worker; удаление последнего child одновременно с publication на трёх уровнях; пять Home lifecycle/access/lease гонок с наблюдаемым PostgreSQL lock wait. Ранний lifecycle gate проверяет также отсутствие оставшихся locators/intents.
+
+Локально **141/141 offline**, **96 JS**, **363 Prisma contracts**, identifier lint проходят. Full suite **3236 / 3009 pass / 103 прежних fail / 124 skip**, новых падений нет. Manifest **75 × 3 = 225**, все прежние 71 proof сохранены. PostgreSQL локально отсутствует: R3/R4 требуют физического подтверждения Render.
+
+**Ставить как кандидат через gate — ДА. Phase 3 CLOSED — НЕТ.** Команда: `npm install && npm run audit:phase3-a29-render`. Полный накопительный recovery checkpoint, причины, инварианты, hashes и master boundary — `PHASE3_ANALYTICS_COORDINATOR_CHECKPOINT_20260923.txt` в архиве.
+
+Ниже история; старые installation/pending статусы не заменяют текущий статус выше.
+
+---
+
 # Phase 3 — A37-R3, публикация locators и атомарный Home planner
 
 **SOURCE OPEN / SCALE OPEN.** Текущая база: `2026-09-23T190250.967.zip`, побайтово равна A37-R2. Новый Render подтвердил все R2 проверки во всех сценариях; итог **206/207**, единственный отказ — unique `id` на commit при конкурентном создании одинаковых partitions. Cleanup успешен, primary migration/deploy не достигнуты.

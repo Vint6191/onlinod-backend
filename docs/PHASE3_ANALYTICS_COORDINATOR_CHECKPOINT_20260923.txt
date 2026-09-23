@@ -1,4 +1,145 @@
 ONLINOD / PHASE 3 — CURRENT CUMULATIVE CHECKPOINT, 2026-09-23
+CURRENT STAGE: A37-R4. Analytics / Home / Stats closure continues.
+SOURCE OPEN. SCALE OPEN. PHASE 3 NOT CLOSED.
+This section supersedes historical installation and proof statuses below.
+
+INSTALL VERDICT / EXACT BASE
+STAVIT: YES, as a candidate through the existing Render disposable proof gate.
+STAVIT as a completed Phase 3 release: NO.
+Apply ONLY over onlinod-backend-main - 2026-09-23T193754.324.zip.
+The supplied actual is byte-for-byte identical to the preceding R3 delivery.
+Only changed/new files are in this ZIP; this cumulative TXT replaces the prior
+checkpoint. Historical MD remains inside docs. Do not reapply previous deltas.
+Command: npm install && npm run audit:phase3-a29-render
+Expected gate: 141 offline, successful lifecycle probes, 75 x 3 = 225 physical
+proofs with zero skips/failures/leaks, disposable cleanup, primary migrations,
+then final ok=true. A red disposable gate still prevents primary deployment.
+New additive migration: 20260923180000_phase3_locator_lifecycle_convergence_v1.
+All pre-existing migration files are byte-identical to the supplied actual.
+No Prisma model, dependency, external endpoint or Desktop file changed.
+
+AUTHORITATIVE INPUT
+Backend ZIP SHA256:
+8da87e6fa45df71a640363ceb2217765ce3a5b386ae97926437e358ea7c519f0
+1401 entries / 1109 files. ZIP CRC/path/symlink validation passed; no AGENTS.md.
+Render log: Вставленный текст(20260923-163828).txt
+Log SHA256: df623e1cf671c8292edb5538a7051ec690147e94c14a467dd1c8368e09bc414e
+Render checkout: 427beae2910ff6480c0c1ca8abbd6a41facb4d18
+
+EXACT RENDER RESULT / RESPONSIBILITY
+140/140 offline checks passed. R3 migrations and topology activation succeeded
+in the disposable current schemas. All three scenarios then failed during the
+runtime fixture lifecycle, BEFORE the 213 named physical proofs were started.
+Physical executed count is ZERO, not 210/213 and not three failed named tests.
+Failure: FK Phase2WorkBroadClaimPartitionState_agencyId_fkey at transaction
+COMMIT, cleanupPhase3PostgresAgencyFixture called from runtimeFixtureLifecycle.
+Clean, rolling-current and seeded-current all report the same failure. Frozen
+pre-upgrade lifecycle probes still pass. Disposable cleanup succeeded, primary
+migration/deployment was not reached. R3 physical proofs remain UNCONFIRMED.
+This was a regression introduced by the R3 locator placeholder implementation.
+
+CAUSE AND FULL RELATED LIFECYCLE CORRECTION
+R3 correctly serialized concurrent locator creation, but it attempted to create
+an absent locator before checking whether any child work remained. Agency hard
+delete cascades DomainWorkItem and locator rows in its transaction; DWI deletion
+queues deferred intents that remain until commit. The deferred flush then tried
+to recreate a partition locator under an Agency that had already disappeared.
+The FK correctly rejected it. The same unconditional creation shape existed in
+partition, shard and Agency reconciliation, and affected real Agency deletion,
+not only test fixtures. Suppressing the FK or changing teardown would hide it.
+
+All three canonical functions now obey the same lifecycle protocol:
+1. Lock an existing exact locator row before reading/reconciling child truth.
+2. If absent, use an indexed EXISTS/LIMIT 1 child witness for that exact scope.
+   If both locator and child are absent, return converged without inserting.
+3. If a child exists, materialize through ON CONFLICT DO NOTHING covering both
+   primary id and natural unique constraints. A successful INSERT already owns
+   its row; use that ownership directly without a redundant second index lookup.
+4. If another transaction won, retry the exact row lock, at most eight times.
+5. Re-read child truth after owning the row, then finalize its head or delete it.
+   The pre-insert witness is admission only, never the final due-time authority.
+A concurrent publisher owns its private work and its own deferred flush. If the
+last prior child is deleted, that publisher waits, then creates/repairs the
+locator from fresh child truth. An absence result cannot consume its publication.
+The three sorted tiers, all-index conflict handling, revision checks, R2 monotonic
+watermarks, generation semantics, ABI wrappers and deferred batch cleanup remain.
+No trigger/FK is disabled, exception suppressed, historical count added, or
+per-locator/global advisory execution lock introduced. Missing-path probes are
+bounded exact-index lookups. Existing locators add no new admission probe.
+
+FRESH SOURCE AUDIT OF RELATED PATHS
+Reviewed the statement-level insert/update/delete intent capture, deferred tier
+flush, canonical claim repair, online activation, Agency/Creator fixture teardown
+and production processAgencyHardDeleteWorkItem. Production destruction retains
+the exact live cleanup claim, deletes Agency, then purges non-FK roots; the new
+functions naturally observe the now-absent children at commit. Its Serializable
+transaction and normal claim/authority guards remain unchanged.
+R3 concurrent creation, earlier-wake, monotonic dispatch, opposite-order and
+fairness proofs remain mandatory. No test or assertion was removed to deploy.
+
+NEW PHYSICAL PROOFS — ADDED, NOT RUN LOCALLY
+1. Reconcile empty live Agency and physically deleted Agency at all three tiers;
+   no locator may reappear. Direct orphan creates still must fail their FKs.
+2. The REAL production Agency hard-delete worker must complete identity deletion
+   with its final deferred flush and leave no work, locators or mutation intents.
+3. At partition, shard and Agency level, one transaction deletes the last child
+   while another publishes private new work. A third client observes the actual
+   lock wait using pg_blocking_pids. The survivor must be runnable after commit.
+4. Continue Home R3 closure with five observed lock-wait races: Agency retirement,
+   Creator retirement, User disable, member accessEpoch change and demand expiry.
+   Holder commits the change only after blocking is proven; waiting planning
+   must reject the new state and create neither a job nor a cursor advance.
+   The User-disable fixture keeps a second operational owner in the Agency.
+Existing early schema lifecycle probes now also check installed locator/intent
+relations after cleanup. Frozen schemas omit only relations that do not exist
+there; current schemas must leave no tenant rows. No cleanup shortcut is added.
+
+LOCAL VALIDATION / LIMITS
+Node 24.19 / Prisma 5.22 locally; Render Node 22.23.2, unchanged.
+Mandatory offline: 141 pass / 0 fail / 0 skip.
+Changed JS syntax/no-undef: 96 files, clean.
+Prisma source contracts: 363 files, clean.
+PostgreSQL identifier lint: no new oversized names or collisions.
+Full supplied-actual baseline: 3231 / 3008 pass / 103 fail / 120 skip.
+Full current: 3236 / 3009 pass / 103 fail / 124 skip.
+All 103 failure names match baseline exactly. No new full-suite failures.
+The repository-wide suite is still red; old failures are not waived.
+Source negative control: R3 lacks child-gated materialization in all 3 functions;
+R4 has it in all 3. This is a source check, not a PostgreSQL execution proof.
+All 71 preceding named physical proofs are retained; 4 added, 75 per scenario.
+Physical manifest A37-R4, 13 files, 225 total expected tests.
+Manifest SHA256:
+b9c08b5e0b734af902859ccb7e61ab76055bfeed490ae17b8ad3ae7508be4905
+No local PostgreSQL or DATABASE_URL; a local runtime was not available. The new
+migration and physical races are NOT claimed as executed. Render must confirm
+both R3 and R4 behavior, including prior scale/fairness/deadlock proofs.
+Packaging verifies ZIP CRC, changed-only inventory and exact reconstruction over
+the supplied actual. No deletions, credentials, node_modules or logs are shipped.
+
+CURRENT MASTER MAP / REMAINING BOUNDARY
+A. Incremental capacity projection, bounded repair/rebuild and explicit freshness;
+   replace global readCanonicalCapacityInputs aggregation.
+B. Home relational member scope and due-query/index/lock cost. R3 atomic planning
+   is implemented, R4 extends adversarial proof; physical confirmation is pending.
+C. Rolling coexistence and drain of already-running earlier binary writers.
+D. Confirm R3/R4 locator and Home physical proofs; terminal/quarantine policy and
+   complete timer/admin failure visibility. R2 settlement/fairness were confirmed
+   by the PREVIOUS 206/207 log, not by this lifecycle-blocked build.
+E. Many large Agencies concurrently, thousands of Creators EACH, 100 workers,
+   large history: measured scanned rows, locks, queue fairness and planner load.
+F. Fresh Backend AND Desktop closure across writers/readers/routes/RPCs/billing/
+   admin/compatibility/schema, plus reconciliation of 103 historical test failures.
+Continue the same Analytics/Home/Stats audit. No other domain was started.
+Next: apply delta and run unchanged Render gate. If red, use its exact first
+failing boundary plus full current source; never remove proofs to get a deploy.
+If green, record actual physical evidence, then continue the remaining boundary.
+There is no sound overall completion percentage or one-more-pass guarantee yet.
+
+HISTORICAL CUMULATIVE CHECKPOINT — R3 AND PREDECESSORS
+Installation bases and pending/failed results below are historical. The current
+section above is authoritative; R3 physical evidence remains pending.
+
+ONLINOD / PHASE 3 — CURRENT CUMULATIVE CHECKPOINT, 2026-09-23
 CURRENT STAGE: A37-R3. Analytics / Home / Stats closure continues.
 SOURCE OPEN. SCALE OPEN. PHASE 3 NOT CLOSED.
 This section supersedes all historical installation/proof statuses below.

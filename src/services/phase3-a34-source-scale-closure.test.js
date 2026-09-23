@@ -8,6 +8,27 @@ const path = require("node:path");
 const ROOT = path.resolve(__dirname, "../..");
 const source = (relative) => fs.readFileSync(path.join(ROOT, relative), "utf8");
 
+test("A37-R4 every missing locator requires child evidence before materialization and revalidates after locking", () => {
+  const sql = source("prisma/migrations/20260923180000_phase3_locator_lifecycle_convergence_v1/migration.sql");
+  const functions = sql.split('CREATE OR REPLACE FUNCTION ').slice(1);
+  assert.equal(functions.length, 3);
+  const children = ["DomainWorkItem", "Phase2WorkBroadClaimPartitionState", "DomainWorkClaimShardState"];
+  for (const [index, body] of functions.entries()) {
+    const locked = body.indexOf("EXIT WHEN FOUND;");
+    const insert = body.indexOf("INSERT INTO");
+    const admission = body.slice(locked, insert);
+    assert.ok(locked > body.indexOf("FOR UPDATE;") && insert > locked);
+    assert.ok(admission.includes(`FROM "${children[index]}"`));
+    assert.match(admission, /IF NOT EXISTS[\s\S]*LIMIT 1[\s\S]*THEN RETURN TRUE; END IF;/);
+    const revalidation = body.slice(body.indexOf("END LOOP;"));
+    assert.ok(revalidation.includes(`FROM "${children[index]}"`));
+    assert.match(revalidation, /DELETE FROM/);
+    assert.match(body, /ON CONFLICT DO NOTHING/);
+    assert.match(body, /FOR v_try IN 1\.\.8 LOOP/);
+    assert.doesNotMatch(body, /pg_advisory|LOCK TABLE|COUNT\(\*\)|DISABLE TRIGGER|EXCEPTION WHEN/);
+  }
+});
+
 test("A37-R3 locator publication arbitrates all identities and locks before reading child truth", () => {
   const sql = source("prisma/migrations/20260923170000_phase3_locator_publication_convergence_v1/migration.sql");
   const functions = sql.split('CREATE OR REPLACE FUNCTION ').slice(1);
@@ -387,7 +408,7 @@ test("A36 DomainWork admission is bounded on both Agency and creator axes withou
   assert.match(physical, /wave < 3/);
   assert.match(physical, /opposite-order multi-write transactions defer exact partition-shard-Agency reconciliation without deadlock/);
   assert.match(physical, /opposite-order transactions sharing the exact same partitions cannot retain the retired row-trigger inversion/);
-  assert.equal((physical.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 7);
+  assert.equal((physical.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 9);
   assert.match(physical, /state: "BLOCKED"[\s\S]*blockedPartitions\.every\(\(row\) => row\.nextClaimableAt == null\)/);
   assert.match(physical, /rebuiltPartition\?\.nextClaimableAt[\s\S]*rebuiltShard\?\.nextDispatchAt[\s\S]*rebuiltAgency\?\.nextDispatchAt/);
 });

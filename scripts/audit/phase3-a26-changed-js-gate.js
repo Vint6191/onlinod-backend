@@ -12,6 +12,7 @@ const DEFAULT_FILES = Object.freeze([
   "dedupe-deliveries.js",
   "purge-stuck-deliveries.js",
   "scripts/audit/phase3-a20-postgres-proof.js",
+  "scripts/audit/phase3-a20-schema-isolation.js",
   "scripts/audit/phase3-a26-changed-js-gate.js",
   "scripts/audit/phase3-a26-render-disposable.js",
   "scripts/audit/phase3-a29-render-gate.js",

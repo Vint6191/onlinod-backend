@@ -310,6 +310,87 @@ test("A37-R3 PostgreSQL: Home planning expiry rolls back real jobs and cursor th
   }
 });
 
+test("A37-R4 PostgreSQL: Home waits for lifecycle access and demand authority then rejects changed eligibility", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const planner = require("./analytics-collection-planner");
+  const { planAnalyticsDemandCreator } = require("./analytics-demand-planning-service");
+  const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const observer = new PrismaClient();
+  const cases = [
+    ["agency", "Agency", "MANAGEMENT_AGENCY_RETIRED"],
+    ["creator", "CreatorAccount", "MANAGEMENT_CREATOR_RETIRED"],
+    ["user", "User", "MANAGEMENT_USER_DISABLED"],
+    ["member", "AgencyMember", "MANAGEMENT_ACCESS_STALE"],
+    ["demand", "AnalyticsCollectionDemand", "ANALYTICS_DEMAND_PLANNING_CLAIM_LOST"],
+  ];
+  try {
+    for (const [kind, table, expectedCode] of cases) {
+      const prefix = nonce(`a37-home-wait-${kind}`);
+      const actor = await createPhase3PostgresActorFixture(dbA, prefix);
+      const backupUser = `${prefix}-backup-user`;
+      try {
+        const creator = await withPhase3PostgresFixtureAuthority(dbA, async (tx) => {
+          // Keep a live operational owner when the requesting user is disabled.
+          await tx.user.create({ data: { id: backupUser, email: `${backupUser}@example.test`, passwordHash: "integration" } });
+          await tx.agencyMember.create({ data: { id: `${prefix}-backup-member`, agencyId: actor.agencyId, userId: backupUser, role: "OWNER", roleKey: "owner" } });
+          return tx.creatorAccount.create({ data: { id: `${prefix}-creator`, agencyId: actor.agencyId, displayName: prefix, status: "READY" } });
+        });
+        const queued = await planner.enqueueAgencyAnalyticsFreshnessDemand({ db: dbA, agencyId: actor.agencyId,
+          requestedByMemberId: actor.memberId, requestedAccessEpoch: actor.accessEpoch,
+          creatorIds: [creator.id], rangeKey: "today", includePrevious: false });
+        const demand = await planner.claimNextAnalyticsDemand({ db: dbA, ownerToken: prefix });
+        assert.equal(demand.key, queued.key);
+        const member = await dbA.agencyMember.findUnique({ where: { id: actor.memberId } });
+        const targetId = { agency: actor.agencyId, creator: creator.id, user: actor.userId, member: actor.memberId, demand: demand.key }[kind];
+        const column = kind === "demand" ? "key" : "id";
+        let holderPid;
+        let waiterPid;
+        let outcome;
+        await runPhase3InterleavedTransactions({
+          dbA, dbB,
+          firstA: async (tx) => {
+            [{ pid: holderPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid');
+            await release.assertTeamControlPlaneWriteAdmission(tx);
+            await release.authorizeCreatorAccountWrite(tx);
+            if (kind === "agency") await lockAgencyLifecycleBarrier({ db: tx, agencyId: actor.agencyId, mode: "exclusive" });
+            else await tx.$queryRawUnsafe(`SELECT "${column}" FROM "${table}" WHERE "${column}"=$1 FOR UPDATE`, targetId);
+          },
+          firstB: async (tx) => { [{ pid: waiterPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid'); },
+          secondA: async (tx) => {
+            await waitForPhase3PostgresBlock({ db: observer, holderPid, waiterPid });
+            const mutation = kind === "member" ? '"accessEpoch"="accessEpoch"+1'
+              : kind === "demand" ? '"claimUntil"=clock_timestamp()-interval \'1 second\''
+                : kind === "user" ? '"disabledAt"=clock_timestamp()' : '"deletedAt"=clock_timestamp()';
+            await tx.$executeRawUnsafe(`UPDATE "${table}" SET ${mutation} WHERE "${column}"=$1`, targetId);
+          },
+          secondB: async (tx) => {
+            // The interleave helper owns this real PostgreSQL transaction. No
+            // jobs may be created, so no publication can escape its commit.
+            const root = new Proxy(tx, { get(target, key) {
+              if (key === "$transaction") return (work) => work(tx);
+              const value = target[key]; return typeof value === "function" ? value.bind(target) : value;
+            } });
+            try {
+              await planAnalyticsDemandCreator({ db: root, demand, member, creator,
+                startDay: demand.coverageFrom, endDay: demand.coverageTo, now: new Date(), coverageRows: [] });
+              outcome = "unexpected-success";
+            } catch (error) { outcome = error?.code; }
+          },
+        });
+        assert.equal(outcome, expectedCode, kind);
+        assert.equal(await dbA.jobInstance.count({ where: { creatorId: creator.id } }), 0, kind);
+        assert.equal((await dbA.analyticsCollectionDemand.findUnique({ where: { key: demand.key } })).cursorCreatorId, null, kind);
+      } finally {
+        try { await dbA.analyticsCollectionDemand.deleteMany({ where: { agencyId: actor.agencyId } }); }
+        finally { await cleanupPhase3PostgresFixtureGraph(dbA, { agencyId: actor.agencyId, userIds: [actor.userId, backupUser] }); }
+      }
+    }
+    console.log("# A37_HOME_OBSERVED_LIFECYCLE_ACCESS_AND_LEASE_WAITS_PASS");
+  } finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect(), observer.$disconnect()]); }
+});
+
 test("A37 PostgreSQL: recurring Analytics planning rolls back partial jobs and rejects expired ownership", { skip: !enabled, timeout: 180_000 }, async () => {
   const { PrismaClient } = require("@prisma/client");
   const { planRecurringCreatorAnalytics } = require("./analytics-recurring-planning-service");
@@ -1419,6 +1500,130 @@ test("A36 PostgreSQL: opposite-order transactions sharing the exact same partiti
     } finally {
       await Promise.all([dbA.$disconnect(), dbB.$disconnect()]);
     }
+  }
+});
+
+test("A37-R4 PostgreSQL: absent child work and Agency cascade cannot recreate orphan locators", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db = new PrismaClient();
+  const scope = await createAgencyCreator(db, "a37-locator-lifecycle");
+  const klass = nonce("A37_EMPTY_LOCATOR");
+  const generation = require("./domain-work-authority-service").DOMAIN_WORK_GENERATION;
+  const reconcile = async () => {
+    for (const [sql, args] of [
+      ['SELECT "phase3_reconcile_domain_work_claim_partition"($1,$2,$3,$4,CURRENT_TIMESTAMP) AS ok', [scope.agencyId, klass, generation, scope.creatorId]],
+      ['SELECT "phase3_reconcile_domain_work_claim_shard"($1,$2,$3,$4,CURRENT_TIMESTAMP) AS ok', [scope.agencyId, klass, generation, 0]],
+      ['SELECT "phase3_reconcile_domain_work_claim_agency"($1,$2,$3,CURRENT_TIMESTAMP) AS ok', [scope.agencyId, klass, generation]],
+    ]) assert.equal((await db.$queryRawUnsafe(sql, ...args))[0].ok, true);
+    for (const name of ["phase2WorkBroadClaimPartitionState", "domainWorkClaimShardState", "domainWorkClaimAgencyState"]) {
+      assert.equal(await db[name].count({ where: { agencyId: scope.agencyId, workClass: klass } }), 0);
+    }
+  };
+  try {
+    // An empty live tenant and a physically deleted tenant are both converged.
+    await reconcile();
+    await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId);
+    assert.equal(await db.agency.count({ where: { id: scope.agencyId } }), 0);
+    await reconcile();
+    // A successful no-op is not permission to weaken FK enforcement.
+    const data = { agencyId: scope.agencyId, workClass: klass, activeGeneration: generation };
+    for (const [name, fields] of [
+      ["phase2WorkBroadClaimPartitionState", { partitionKey: scope.creatorId }],
+      ["domainWorkClaimShardState", { claimShard: 0, nextDispatchAt: new Date() }],
+      ["domainWorkClaimAgencyState", { nextDispatchAt: new Date() }],
+    ]) await assert.rejects(() => db[name].create({ data: { ...data, ...fields, id: `${klass}-${name}` } }), (error) => error?.code === "P2003");
+    console.log("# A37_LOCATOR_LIFECYCLE_EMPTY_AND_DELETED_PARENT_PASS");
+  } finally {
+    try { if (await db.agency.findUnique({ where: { id: scope.agencyId } })) await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId); }
+    finally { await db.$disconnect(); }
+  }
+});
+
+test("A37-R4 PostgreSQL: production Agency hard-delete worker commits its final deferred locator flush", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const { claimPhase3PostgresAgencyDestructiveFixture } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
+  const { processAgencyHardDeleteWorkItem } = require("./phase2-destructive-delete-authority-service");
+  const db = new PrismaClient();
+  const agencyId = nonce("a37-production-agency-delete");
+  try {
+    await withPhase3PostgresFixtureAuthority(db, async (tx) => {
+      await tx.agency.create({ data: { id: agencyId, name: agencyId } });
+      await tx.agency.update({ where: { id: agencyId }, data: { deletedAt: new Date() } });
+    });
+    const claim = await claimPhase3PostgresAgencyDestructiveFixture(db, agencyId);
+    const item = await db.domainWorkItem.findUnique({ where: { id: claim.workId } });
+    assert.ok(item);
+    let outcome;
+    for (let step = 0; step < 20; step += 1) {
+      outcome = await processAgencyHardDeleteWorkItem({ db, item, ownerToken: claim.ownerToken, batchSize: 1000 });
+      assert.equal(outcome.ok, true, JSON.stringify(outcome));
+      if (outcome.complete) break;
+    }
+    assert.equal(outcome?.identityDeleted, true, JSON.stringify(outcome));
+    assert.equal(await db.agency.count({ where: { id: agencyId } }), 0);
+    assert.equal(await db.domainWorkItem.count({ where: { agencyId } }), 0);
+    for (const name of ["phase2WorkBroadClaimPartitionState", "domainWorkClaimShardState", "domainWorkClaimAgencyState"]) {
+      assert.equal(await db[name].count({ where: { agencyId } }), 0);
+    }
+    const intents = await db.$queryRawUnsafe('SELECT 1 FROM "DomainWorkClaimLocatorMutationIntent" WHERE "agencyId"=$1 LIMIT 1', agencyId);
+    assert.equal(intents.length, 0);
+    console.log("# A37_PRODUCTION_AGENCY_DELETE_LOCATOR_FLUSH_PASS");
+  } finally {
+    try { if (await db.agency.findUnique({ where: { id: agencyId } })) await cleanupPhase3PostgresAgencyFixture(db, agencyId); }
+    finally { await db.$disconnect(); }
+  }
+});
+
+test("A37-R4 PostgreSQL: deleting the last child concurrently with publication recreates every locator level", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const observer = new PrismaClient();
+  const scopes = [];
+  try {
+    const candidates = await dbA.$queryRawUnsafe(`SELECT g::text AS key,
+      "phase3_domain_work_claim_shard"(g::text) AS shard FROM generate_series(1,1024) g ORDER BY g`);
+    const first = candidates[0];
+    const sameShard = candidates.find((row) => row.key !== first.key && row.shard === first.shard);
+    const otherShard = candidates.find((row) => row.shard !== first.shard);
+    assert.ok(sameShard && otherShard);
+    for (const level of ["partition", "shard", "agency"]) {
+      const scope = await createAgencyCreator(dbA, `a37-recreate-${level}`);
+      scopes.push(scope);
+      const klass = nonce("A37_RECREATE");
+      const second = level === "partition" ? first : level === "shard" ? sameShard : otherShard;
+      const old = await publishDomainWork({ db: dbA, agencyId: scope.agencyId, workClass: klass,
+        objectType: "RecreateProbe", objectId: `${klass}-old`, partitionKey: first.key });
+      let holderPid;
+      let waiterPid;
+      await runPhase3InterleavedTransactions({
+        dbA, dbB,
+        firstA: async (tx) => {
+          [{ pid: holderPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid');
+          await tx.domainWorkItem.delete({ where: { id: old.id } });
+          await tx.$executeRawUnsafe('SET CONSTRAINTS "trg_phase3_domain_work_claim_locator_mutation_flush" IMMEDIATE');
+        },
+        firstB: async (tx) => {
+          [{ pid: waiterPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid');
+          await publishDomainWork({ db: tx, agencyId: scope.agencyId, workClass: klass,
+            objectType: "RecreateProbe", objectId: `${klass}-new`, partitionKey: second.key });
+        },
+        secondA: async () => { await waitForPhase3PostgresBlock({ db: observer, holderPid, waiterPid }); },
+        secondB: (tx) => tx.$executeRawUnsafe('SET CONSTRAINTS "trg_phase3_domain_work_claim_locator_mutation_flush" IMMEDIATE'),
+      });
+      assert.equal(await dbA.domainWorkItem.count({ where: { agencyId: scope.agencyId, workClass: klass } }), 1);
+      const partition = await dbA.phase2WorkBroadClaimPartitionState.findFirst({ where: { agencyId: scope.agencyId, workClass: klass, partitionKey: second.key } });
+      const shard = await dbA.domainWorkClaimShardState.findFirst({ where: { agencyId: scope.agencyId, workClass: klass, claimShard: second.shard } });
+      const agency = await dbA.domainWorkClaimAgencyState.findFirst({ where: { agencyId: scope.agencyId, workClass: klass } });
+      const [{ checkedAt }] = await dbA.$queryRawUnsafe('SELECT clock_timestamp() AS "checkedAt"');
+      for (const at of [partition?.nextClaimableAt, shard?.nextDispatchAt, agency?.nextDispatchAt]) {
+        assert.ok(at instanceof Date && at <= checkedAt, `${level}: the private survivor must be runnable after delete commits`);
+      }
+    }
+    console.log("# A37_LOCATOR_LAST_DELETE_CONCURRENT_PUBLICATION_PASS");
+  } finally {
+    try { for (const scope of scopes) await cleanupPhase3PostgresAgencyFixture(dbA, scope.agencyId); }
+    finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect(), observer.$disconnect()]); }
   }
 });
 

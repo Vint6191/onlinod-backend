@@ -134,7 +134,18 @@ async function runtimeFixtureLifecycle(expected) {
     if (agencyAfter !== 0 || creatorAfter !== 0 || coverageAfter !== 0) {
       fail("Canonical audit fixture cleanup left owned rows behind", { expected, agencyAfter, creatorAfter, coverageAfter });
     }
-    return { agencyId, creatorId, coverageRows: coverageRows.length, cleanupVerified: true };
+    // Frozen rolling schemas may not have the new locator tables. Inspect each
+    // installed relation without assuming the newest schema, then verify its
+    // tenant rows really disappeared when the deferred DELETE flush committed.
+    const locatorRows = {};
+    for (const table of ["Phase2WorkBroadClaimPartitionState", "DomainWorkClaimShardState", "DomainWorkClaimAgencyState", "DomainWorkClaimLocatorMutationIntent"]) {
+      const present = await prisma.$queryRawUnsafe('SELECT to_regclass($1) IS NOT NULL AS present', `"${expected}"."${table}"`);
+      if (!present?.[0]?.present) continue;
+      const rows = await prisma.$queryRawUnsafe(`SELECT 1 AS present FROM "${expected}"."${table}" WHERE "agencyId"=$1 LIMIT 1`, agencyId);
+      locatorRows[table] = rows.length;
+      if (rows.length) fail("Deferred cleanup left locator publication state behind", { expected, agencyId, table });
+    }
+    return { agencyId, creatorId, coverageRows: coverageRows.length, locatorRows, cleanupVerified: true };
   } finally {
     if (created) { try { await cleanupPhase3PostgresAgencyFixture(prisma, agencyId); } catch (_) {} }
   }
