@@ -573,3 +573,33 @@ test("A34 resolved degradation updates scheduler health instead of disappearing 
     console.error = original;
   }
 });
+
+test("Home demand fulfilled failure and rejection remain visible across healthy recurring ticks and skipped overlap", () => {
+  const scheduler = require("./job-scheduler");
+  const { handleAnalyticsDemandTickResult, recordRecurringSchedulerHealth } = scheduler._test;
+  const original = console.error;
+  const lines = [];
+  console.error = (...args) => lines.push(args.join(" "));
+  try {
+    const failed = { ok: false, failures: 2, reason: "analytics_demand_processing_failed", errors: [{ reason: "P1001" }] };
+    handleAnalyticsDemandTickResult(failed);
+    handleAnalyticsDemandTickResult(failed);
+    recordRecurringSchedulerHealth({ ok: true });
+    handleAnalyticsDemandTickResult({ ok: true, skipped: true });
+    let health = scheduler.getRecurringSchedulerHealthSnapshot();
+    assert.equal(health.status, "DEGRADED");
+    assert.equal(health.analyticsDemand.failures, 2);
+    assert.equal(health.analyticsDemand.consecutiveDegraded, 2);
+    assert.equal(lines.length, 1, "identical errors must not flood every timer tick");
+    handleAnalyticsDemandTickResult(null, Object.assign(new Error("connection lost"), { code: "P1001" }));
+    health = scheduler.getRecurringSchedulerHealthSnapshot();
+    assert.equal(health.lastReason, "P1001");
+    assert.equal(lines.length, 2);
+    handleAnalyticsDemandTickResult({ ok: true, skipped: false });
+    assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().status, "HEALTHY");
+    assert.match(source("src/services/job-scheduler.js"), /runAnalyticsCollectionDemandSweep\(\{ db: prisma \}\)[\s\S]*?\.then\(\(result\) => handleAnalyticsDemandTickResult\(result\)\)/);
+  } finally {
+    handleAnalyticsDemandTickResult({ ok: true });
+    console.error = original;
+  }
+});

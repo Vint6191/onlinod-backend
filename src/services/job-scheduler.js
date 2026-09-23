@@ -145,6 +145,11 @@ let recurringSchedulerHealth = {
   lastReason: null,
   lastDegraded: [],
 };
+let analyticsDemandHealth = {
+  status: "STARTING", consecutiveDegraded: 0, lastCompletedAt: null,
+  lastHealthyAt: null, lastDegradedAt: null, lastReason: null, failures: 0,
+};
+let analyticsDemandLastLogAt = 0;
 
 
 function retentionBreakdown(result, laneNames) {
@@ -2599,8 +2604,35 @@ function recordRecurringSchedulerHealth(result, error = null) {
 function getRecurringSchedulerHealthSnapshot() {
   return {
     ...recurringSchedulerHealth,
+    ...(analyticsDemandHealth.status === "DEGRADED" ? { status: "DEGRADED", lastReason: analyticsDemandHealth.lastReason } : {}),
+    analyticsDemand: { ...analyticsDemandHealth },
     lastDegraded: recurringSchedulerHealth.lastDegraded.map((entry) => ({ ...entry })),
   };
+}
+
+function handleAnalyticsDemandTickResult(result, error = null) {
+  if (!error && result?.ok === true && result.skipped) return result;
+  const degraded = Boolean(error || result?.ok !== true);
+  const reason = degraded ? String(error?.code || result?.reason || error?.message || "analytics_demand_sweep_degraded").slice(0, 240) : null;
+  const changed = analyticsDemandHealth.status !== (degraded ? "DEGRADED" : "HEALTHY") || analyticsDemandHealth.lastReason !== reason;
+  const completedAt = new Date().toISOString();
+  analyticsDemandHealth = {
+    status: degraded ? "DEGRADED" : "HEALTHY",
+    consecutiveDegraded: degraded ? analyticsDemandHealth.consecutiveDegraded + 1 : 0,
+    lastCompletedAt: completedAt,
+    lastHealthyAt: degraded ? analyticsDemandHealth.lastHealthyAt : completedAt,
+    lastDegradedAt: degraded ? completedAt : analyticsDemandHealth.lastDegradedAt,
+    lastReason: reason,
+    failures: degraded ? Math.max(1, Number(result?.failures) || 0) : 0,
+  };
+  // Keep repeated failures visible without dumping unbounded Prisma errors on
+  // every timer tick. Health is updated on every completed attempt.
+  if (degraded && (changed || Date.now() - analyticsDemandLastLogAt >= 60_000)) {
+    analyticsDemandLastLogAt = Date.now();
+    const errors = Array.isArray(result?.errors) ? result.errors.slice(0, 3).map((entry) => ({ reason: String(entry?.reason || "demand_failed").slice(0, 120) })) : [];
+    console.error(`[scheduler] analytics demand sweep degraded: ${JSON.stringify({ reason, failures: analyticsDemandHealth.failures, errors })}`);
+  }
+  return result;
 }
 
 function handleRecurringSweepTickResult(result) {
@@ -2640,9 +2672,9 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
   recurringTimer = setInterval(tick, intervalMs);
 
   const analyticsDemandTick = () => {
-    runAnalyticsCollectionDemandSweep({ db: prisma }).catch((err) => {
-      console.error("[scheduler] analytics demand sweep crashed:", err);
-    });
+    runAnalyticsCollectionDemandSweep({ db: prisma })
+      .then((result) => handleAnalyticsDemandTickResult(result))
+      .catch((err) => handleAnalyticsDemandTickResult(null, err));
   };
   if (runImmediately) setTimeout(analyticsDemandTick, 2 * 1000);
   analyticsDemandTimer = setInterval(analyticsDemandTick, ANALYTICS_DEMAND_INTERVAL_MS);
@@ -2743,6 +2775,7 @@ module.exports = {
     executeSchedulerConsumer,
     recordRecurringSchedulerHealth,
     handleRecurringSweepTickResult,
+    handleAnalyticsDemandTickResult,
     wakeDomainDependencyBatch,
   },
 };

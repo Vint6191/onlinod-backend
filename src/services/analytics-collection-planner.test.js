@@ -108,9 +108,10 @@ function addDemandStore(db) {
       const retryNow = andRows.flatMap((entry) => entry.OR || []).find((item) => item.nextAttemptAt?.lte)?.nextAttemptAt?.lte || claimNow;
       const candidates = [...rows.values()].filter((row) => row.completedAt == null
         && row.quarantinedAt == null
+        && !(where.agencyId?.notIn || []).includes(row.agencyId)
         && (row.claimUntil == null || new Date(row.claimUntil) <= claimNow)
         && (row.nextAttemptAt == null || new Date(row.nextAttemptAt) <= retryNow));
-      candidates.sort((a, b) => Number(b.priority || 0) - Number(a.priority || 0) || new Date(a.requestedAt) - new Date(b.requestedAt) || String(a.key).localeCompare(String(b.key)));
+      candidates.sort((a, b) => Number(new Date(a.nextAttemptAt || 0)) - Number(new Date(b.nextAttemptAt || 0)) || Number(b.priority || 0) - Number(a.priority || 0) || new Date(a.requestedAt) - new Date(b.requestedAt) || String(a.key).localeCompare(String(b.key)));
       return candidates.length ? { ...candidates[0] } : null;
     },
   };
@@ -153,7 +154,7 @@ test("Analytics restart across hours preserves unfinished cursor and original cy
   assert.equal(next.cursorCreatorId, null);
 });
 
-for (const operation of ["renew", "complete", "quarantine"]) {
+for (const operation of ["renew", "complete", "quarantine", "yield"]) {
   test(`Home demand ${operation} rejects expiry without changing durable state`, async () => {
     const db = {};
     const store = addDemandStore(db);
@@ -166,7 +167,7 @@ for (const operation of ["renew", "complete", "quarantine"]) {
       assert.equal(await planner.renewAnalyticsDemandLease({ db, ...demand, now: expired }), false);
     } else {
       const error = operation === "quarantine" ? Object.assign(new Error("bad range"), { code: "ANALYTICS_DEMAND_RANGE_INVALID" }) : null;
-      assert.deepEqual(await planner.settleAnalyticsDemand({ db, demand, completedAt: expired, error }), { settled: false, reason: "claim_lost" });
+      assert.deepEqual(await planner.settleAnalyticsDemand({ db, demand, completedAt: expired, error, yieldContinuation: operation === "yield" }), { settled: false, reason: "claim_lost" });
     }
     assert.deepEqual(store.get(demand.key), before);
   });
@@ -582,7 +583,7 @@ test("a refresh arriving during a claimed agency demand is not lost and schedule
   assert.equal(reclaimed.cursorCreatorId, null);
 });
 
-test("durable agency demand processing is cursor-paginated and does not create provider work for fresh coverage", async () => {
+test("Home demand yields bounded slices and resumes its durable cursor across three workers", async () => {
   const now = new Date("2026-09-08T14:00:00.000Z");
   const creators = Array.from({ length: 55 }, (_, index) => ({ id: `creator-${String(index + 1).padStart(3, "0")}`, agencyId: "agency-1" }));
   let creatorQueries = 0;
@@ -613,13 +614,22 @@ test("durable agency demand processing is cursor-paginated and does not create p
   addDemandAuthority(db);
   const store = addDemandStore(db);
   const queued = await planner.enqueueAgencyAnalyticsFreshnessDemand({ db, agencyId: "agency-1", rangeKey: "7d", includePrevious: true, ...DEMAND_ACTOR, now });
-  const result = await planner.runAnalyticsCollectionDemandSweep({ db, now: new Date("2026-09-08T14:00:01.000Z"), maxDemands: 1, pageSize: 25 });
-  assert.equal(result.demands, 1);
-  assert.equal(result.creators, 55);
-  assert.equal(result.pages, 3);
-  assert.equal(result.created, 0);
-  assert.equal(result.dueDays, 0);
-  assert.ok(creatorQueries >= 3);
+  for (const [index, count] of [25, 25, 5].entries()) {
+    // The default maxDemands=4 must not reclaim this same agency in one pulse.
+    const result = await planner.runAnalyticsCollectionDemandSweep({ db, now: new Date(now.getTime() + (index + 1) * 1000), pageSize: 25 });
+    assert.equal(result.ok, true);
+    assert.equal(result.demands, 1);
+    assert.equal(result.creators, count);
+    assert.equal(result.pages, 1);
+    assert.equal(result.created, 0);
+    assert.equal(result.dueDays, 0);
+    assert.equal(result.yielded, index < 2 ? 1 : 0);
+    const progress = store.get(queued.key);
+    assert.equal(progress.cursorCreatorId, creators[Math.min((index + 1) * 25, 55) - 1].id);
+    assert.equal(progress.claimToken, null);
+    if (index < 2) assert.equal(progress.completedAt, null);
+  }
+  assert.equal(creatorQueries, 3);
   const row = store.get(queued.key);
   assert.equal(row.completedRevision, 1);
   assert.ok(row.completedAt instanceof Date);
@@ -673,7 +683,7 @@ test("deferred Home refresh is cancelled when requester is deactivated or refres
   }
 });
 
-test("accessEpoch revocation during a large demand is fenced within the 25-creator heartbeat chunk", async () => {
+test("accessEpoch revocation during demand processing is checked before each creator", async () => {
   const now = new Date("2026-09-08T14:00:00.000Z");
   const creators = Array.from({ length: 55 }, (_, index) => ({ id: `creator-${String(index + 1).padStart(3, "0")}`, agencyId: "agency-1" }));
   let fenceReads = 0;
@@ -691,7 +701,7 @@ test("accessEpoch revocation during a large demand is fenced within the 25-creat
   const originalFind = db.agencyMember.findFirst;
   db.agencyMember.findFirst = async (args) => {
     fenceReads += 1;
-    // 1 = full authority resolve, 2 = page-start epoch fence, 3 = 25-creator fence.
+    // 1 = full authority resolve, 2 = page-start fence, 3 = first creator fence.
     if (fenceReads === 3) authority.set({ accessEpoch: 8 });
     return originalFind(args);
   };
@@ -752,7 +762,7 @@ test("a terminal failure from an old claimed revision cannot quarantine a newer 
   assert.equal(pending.requestRevision, 2);
   assert.equal(pending.completedAt, null);
   assert.equal(pending.attempts, 0);
-  assert.equal(pending.nextAttemptAt, null);
+  assert.equal(pending.nextAttemptAt.toISOString(), "2026-09-08T14:00:03.000Z");
   assert.equal(pending.quarantinedAt, null);
   assert.equal(pending.lastErrorClass, null);
   const reclaimed = await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-08T14:00:04.000Z"), ownerToken: "replica-new" });
@@ -767,6 +777,7 @@ test("transient analytics demand failures back off and are not immediately recla
   });
   const claimed = await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-08T14:00:01.000Z"), ownerToken: "replica-a" });
   const error = Object.assign(new Error("database temporarily unavailable"), { code: "P1001" });
+  claimed.cursorCreatorId = "creator-025";
   const settled = await planner.settleAnalyticsDemand({ db, demand: claimed, completedAt: new Date("2026-09-08T14:00:02.000Z"), error });
   assert.equal(settled.retry, true);
   assert.equal(settled.quarantined, false);
@@ -778,6 +789,8 @@ test("transient analytics demand failures back off and are not immediately recla
   assert.equal(await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-08T14:00:10.000Z"), ownerToken: "replica-b" }), null);
   const retry = await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-08T14:00:33.000Z"), ownerToken: "replica-b" });
   assert.equal(retry.key, claimed.key);
+  assert.equal(retry.claimedRevision, claimed.claimedRevision);
+  assert.equal(retry.cursorCreatorId, "creator-025", "retry must retain completed creator progress");
 });
 
 test("persistent analytics demand contract corruption quarantines immediately", async () => {
@@ -797,4 +810,119 @@ test("persistent analytics demand contract corruption quarantines immediately", 
   assert.ok(row.quarantinedAt instanceof Date);
   assert.equal(row.nextAttemptAt, null);
   assert.equal(await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-09T14:00:00.000Z"), ownerToken: "replica-b" }), null);
+});
+
+function boundedDemandFixture(count = 10, member = {}) {
+  const now = new Date("2026-09-08T14:00:00Z");
+  const creators = Array.from({ length: count }, (_, index) => ({ id: `creator-${String(index).padStart(3, "0")}`, agencyId: "agency-1" }));
+  const reads = [];
+  const covered = [];
+  const db = {
+    creatorAccount: { findMany: async (query) => {
+      reads.push(query);
+      const { where, take } = query;
+      return creators.filter((c) => c.agencyId === where.agencyId && (!where.id?.in || where.id.in.includes(c.id)) && (!where.id?.gt || c.id > where.id.gt)).slice(0, take);
+    } },
+    analyticsCoverage: { findMany: async ({ where }) => {
+      covered.push(...where.creatorId.in);
+      return where.creatorId.in.flatMap((creatorId) => daysInclusive(where.coverageDate.gte, where.coverageDate.lte).map((coverageDate) => ({
+        creatorId, coverageDate, status: "COMPLETE", lastVerifiedAt: now,
+        scanProofId: "committed", scanProof: { status: "COMMITTED" },
+      })));
+    } },
+  };
+  const store = addDemandStore(db);
+  addDemandAuthority(db, member);
+  return { db, store, now, creators, reads, covered };
+}
+
+test("Home demand processes only explicitly requested creators within current authority", async () => {
+  for (const scoped of [false, true]) {
+    const f = boundedDemandFixture(10, scoped ? { role: "MANAGER", roleKey: "manager", permissions: { "creator_analytics.refresh": true }, assignedCreators: ["creator-002", "creator-003"] } : {});
+    await planner.enqueueAgencyAnalyticsFreshnessDemand({ db: f.db, agencyId: "agency-1", ...DEMAND_ACTOR, now: f.now, creatorIds: ["creator-002", "creator-009", "foreign-creator"] });
+    const result = await planner.runAnalyticsCollectionDemandSweep({ db: f.db, now: f.now });
+    assert.equal(result.ok, true);
+    assert.deepEqual(f.covered, scoped ? ["creator-002"] : ["creator-002", "creator-009"]);
+    assert.equal(result.yielded, 0);
+  }
+});
+
+test("Home demand clamps large slice requests and persists the exact bounded continuation", async () => {
+  const f = boundedDemandFixture(1000);
+  const queued = await planner.enqueueAgencyAnalyticsFreshnessDemand({ db: f.db, agencyId: "agency-1", ...DEMAND_ACTOR, now: f.now });
+  const result = await planner.runAnalyticsCollectionDemandSweep({ db: f.db, now: f.now, maxCreators: 4000, pageSize: 4000 });
+  assert.equal(result.creators, 100);
+  assert.equal(result.yielded, 1);
+  assert.equal(f.reads.length, 1);
+  assert.equal(f.reads[0].take, 101);
+  assert.equal(f.covered.length, 100);
+  assert.equal(f.store.get(queued.key).cursorCreatorId, "creator-099");
+  assert.equal(f.store.get(queued.key).completedAt, null);
+});
+
+test("Home demand failure after one successful creator preserves progress and retry resumes the unfinished creator", async () => {
+  const f = boundedDemandFixture(3);
+  const freshCoverage = f.db.analyticsCoverage.findMany;
+  f.db.analyticsCoverage.findMany = async (args) => (await freshCoverage(args)).filter((row) => row.creatorId === "creator-000");
+  f.db.jobInstance = { findMany: async () => { throw Object.assign(new Error("connection reset during planning"), { code: "P1001" }); } };
+  const queued = await planner.enqueueAgencyAnalyticsFreshnessDemand({ db: f.db, agencyId: "agency-1", ...DEMAND_ACTOR, now: f.now, rangeKey: "today", includePrevious: false });
+  const result = await planner.runAnalyticsCollectionDemandSweep({ db: f.db, now: f.now });
+  assert.equal(result.ok, false);
+  const failed = f.store.get(queued.key);
+  assert.equal(failed.cursorCreatorId, "creator-000");
+  assert.equal(failed.lastErrorCode, "P1001");
+  f.db.analyticsCoverage.findMany = freshCoverage;
+  const retry = await planner.runAnalyticsCollectionDemandSweep({ db: f.db, now: new Date(f.now.getTime() + 31_000) });
+  assert.equal(retry.ok, true);
+  assert.equal(retry.creators, 2);
+  assert.equal(f.reads.at(-1).where.id.gt, "creator-000");
+  assert.ok(f.store.get(queued.key).completedAt);
+});
+
+test("Home demand time budget yields after progress without dropping the next creator", async (t) => {
+  const f = boundedDemandFixture();
+  const { performance } = require("node:perf_hooks");
+  let clock = 0;
+  t.mock.method(performance, "now", () => { clock += 100; return clock; });
+  const queued = await planner.enqueueAgencyAnalyticsFreshnessDemand({ db: f.db, agencyId: "agency-1", ...DEMAND_ACTOR, now: f.now });
+  const result = await planner.runAnalyticsCollectionDemandSweep({ db: f.db, now: f.now, budgetMs: 1 });
+  assert.equal(result.creators, 1);
+  assert.equal(result.yielded, 1);
+  const retry = await planner.claimNextAnalyticsDemand({ db: f.db, now: f.now });
+  assert.equal(retry.key, queued.key);
+  assert.equal(retry.cursorCreatorId, "creator-000");
+});
+
+test("Home demand rotates yielded work behind another due agency and newer revision resets progress", async () => {
+  const db = {};
+  addDemandStore(db);
+  const now = new Date("2026-09-08T14:00:00Z");
+  for (const agencyId of ["agency-1", "agency-2"]) await planner.enqueueAgencyAnalyticsFreshnessDemand({ db, agencyId, ...DEMAND_ACTOR, now });
+  const first = await planner.claimNextAnalyticsDemand({ db, now });
+  first.cursorCreatorId = "creator-025";
+  await planner.settleAnalyticsDemand({ db, demand: first, completedAt: new Date(now.getTime() + 1000), yieldContinuation: true });
+  const other = await planner.claimNextAnalyticsDemand({ db, now: new Date(now.getTime() + 2000) });
+  assert.notEqual(other.agencyId, first.agencyId);
+  const resumed = await planner.claimNextAnalyticsDemand({ db, now: new Date(now.getTime() + 3000) });
+  assert.equal(resumed.cursorCreatorId, "creator-025");
+  await planner.enqueueAgencyAnalyticsFreshnessDemand({ db, agencyId: first.agencyId, ...DEMAND_ACTOR, now: new Date(now.getTime() + 4000) });
+  const settlement = await planner.settleAnalyticsDemand({ db, demand: resumed, completedAt: new Date(now.getTime() + 5000), yieldContinuation: true });
+  assert.equal(settlement.reason, "newer_revision_pending");
+  const next = await planner.claimNextAnalyticsDemand({ db, now: new Date(now.getTime() + 6000) });
+  assert.equal(next.claimedRevision, 2);
+  assert.equal(next.cursorCreatorId, null);
+});
+
+test("Home demand rejects all-history admission and quarantines corrupt persisted scope or range before creator reads", async () => {
+  for (const badData of [{ coverageFrom: new Date("2016-01-01") }, { creatorIds: { all: true } }]) {
+    const f = boundedDemandFixture();
+    await assert.rejects(() => planner.enqueueAgencyAnalyticsFreshnessDemand({ db: f.db, agencyId: "agency-1", ...DEMAND_ACTOR, now: f.now, rangeKey: "all" }), { code: "HOME_RANGE_UNSUPPORTED" });
+    const queued = await planner.enqueueAgencyAnalyticsFreshnessDemand({ db: f.db, agencyId: "agency-1", ...DEMAND_ACTOR, now: f.now });
+    await f.db.analyticsCollectionDemand.update({ where: { key: queued.key }, data: badData });
+    const result = await planner.runAnalyticsCollectionDemandSweep({ db: f.db, now: f.now });
+    assert.equal(result.ok, false);
+    assert.equal(f.reads.length, 0);
+    assert.equal(f.store.get(queued.key).lastErrorClass, "CONTRACT");
+    assert.ok(f.store.get(queued.key).quarantinedAt);
+  }
 });

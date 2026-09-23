@@ -1,4 +1,16 @@
-# Phase 3 — текущий checkpoint: Analytics proof lifecycle, 2026-09-23
+# Phase 3 — Home demand continuation, 2026-09-23
+
+**SOURCE OPEN / SCALE OPEN.** Новый actual `onlinod-backend-main - 2026-09-23T172059.391.zip` принят как единственный исходник. Его Render checkout `db2196893e185814a1f9a0f7d114247687190af1` успешно прошёл **87/87 offline, 186/186 PostgreSQL**, cleanup и primary migrations; service live. Прежний coordinator proof больше не ожидает подтверждения.
+
+Этот delta исправляет связанный Home demand lifecycle: ограниченная порция с durable continuation, сохранение cursor/revision при ошибке, пересечение запрошенных creators с действующими правами, проверка epoch перед каждым creator, bounded Home range, приоритет новой revision при settlement и видимость fulfilled ошибок timer в admin health. Одна agency обслуживается один раз за pulse; continuation возвращается в due queue. Повторные одинаковые ошибки логируются не чаще раза в минуту, health обновляется каждый завершённый раз.
+
+Локально: **95/95** обязательных offline проверок; syntax/no-undef 90 файлов и Prisma contracts 361 файл проходят. Полный набор: **3209 tests / 2994 pass / 103 fail / 112 skip**, имена всех 103 прежних падений сохранены. PostgreSQL локально отсутствует; новый end-to-end сценарий двух clients включён в A36-R5: **63 на сценарий / 189 всего**. Он ещё требует Render. Установка: **кандидат через существующий gate — да; законченная Phase 3 — нет**. Команда прежняя: `npm install && npm run audit:phase3-a29-render`.
+
+Home LIMIT ограничивает размер порции, но не доказывает ограниченную стоимость SQL: глобальный claim lock, индекс/план due query и creator query, материализация scope и fencing на planning commit остаются открытыми. Глобальные Earnings/Creator Analytics/Campaign planners и capacity требуют согласованного cutover. Полные подтверждения, hash, установка, recovery и следующий шаг находятся в `PHASE3_ANALYTICS_COORDINATOR_CHECKPOINT_20260923.txt`.
+
+Далее сохранена история. Её старые pending/failed статусы и числа относятся к тем actual; текущий статус расположен выше и в TXT.
+
+# История: Analytics proof lifecycle, 2026-09-23
 
 **SOURCE OPEN / SCALE OPEN.** Статус установки: кандидат через существующий Render gate; завершённым релизом Phase 3 не является. Полный актуальный recovery checkpoint — `PHASE3_ANALYTICS_COORDINATOR_CHECKPOINT_20260923.txt` в этой папке.
 

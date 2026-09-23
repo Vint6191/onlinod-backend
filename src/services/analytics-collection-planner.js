@@ -1,6 +1,7 @@
 "use strict";
 
 const { randomUUID, createHash } = require("node:crypto");
+const { performance } = require("node:perf_hooks");
 const prisma = require("../prisma");
 const { buildJobIdempotencyKey, bucketTimestamp } = require("./job-idempotency");
 const { createPlannedJobIfAbsent, reschedulePlannedJob, updatePlannedJobDemand, publishPlannedJobAvailable } = require("./job-planning-repository");
@@ -20,6 +21,7 @@ const {
   ANALYTICS_CONTRACT_VERSION,
   ANALYTICS_SOURCE_TIMEZONE,
   displayRangeBounds,
+  normalizeHomeRangeKey,
   eachDay,
   utcDay,
   dateKey,
@@ -45,6 +47,9 @@ const SWEEP_LEASE_KEY = "earnings_recurring_v1";
 const SWEEP_COORDINATION_LOCK_KEY = "analytics-sweep-coordinator";
 const DEMAND_LEASE_MS = 5 * 60 * 1000;
 const DEMAND_PAGE_SIZE = 100;
+const DEMAND_SLICE_CREATORS = 25;
+const DEMAND_SLICE_MAX_CREATORS = 100;
+const DEMAND_SLICE_BUDGET_MS = 5000;
 const DEMAND_CLAIM_LOCK_KEY = "analytics-demand-claim";
 const DEMAND_MAX_PER_SWEEP = 4;
 const DEMAND_MAX_ATTEMPTS = 8;
@@ -617,7 +622,7 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
   if (!fallbackNow) throw new Error("ANALYTICS_PLANNER_NOW_INVALID");
   const currentNow = await dbAuthorityNow({ db, fallbackNow });
   const ids = normalizedDemandCreatorIds(creatorIds);
-  const range = displayRangeBounds(rangeKey, currentNow);
+  const range = displayRangeBounds(normalizeHomeRangeKey(rangeKey), currentNow);
   const rangeDays = Math.floor((range.endDay.getTime() - range.startDay.getTime()) / DAY_MS) + 1;
   const coverageFrom = includePrevious ? new Date(range.startDay.getTime() - rangeDays * DAY_MS) : range.startDay;
   const key = analyticsDemandKey({ agencyId, creatorIds: ids, rangeKey: range.rangeKey, includePrevious });
@@ -644,6 +649,7 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
             requestRevision: 1,
             completedRevision: 0,
             requestedAt: mutationNow,
+            nextAttemptAt: mutationNow,
             completedAt: null,
           },
         });
@@ -665,7 +671,7 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
           requestedAt: mutationNow,
           completedAt: null,
           attempts: 0,
-          nextAttemptAt: null,
+          nextAttemptAt: mutationNow,
           lastErrorCode: null,
           lastErrorClass: null,
           lastError: null,
@@ -678,7 +684,7 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
   });
 }
 
-async function claimNextAnalyticsDemand({ db = prisma, now = new Date(), ownerToken = randomUUID() } = {}) {
+async function claimNextAnalyticsDemand({ db = prisma, now = new Date(), ownerToken = randomUUID(), excludeAgencyIds = [] } = {}) {
   const fallbackNow = asDate(now);
   if (!fallbackNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
   return withDbAdvisoryXactLock({
@@ -690,12 +696,15 @@ async function claimNextAnalyticsDemand({ db = prisma, now = new Date(), ownerTo
         where: {
           completedAt: null,
           quarantinedAt: null,
+          ...(excludeAgencyIds.length ? { agencyId: { notIn: excludeAgencyIds.slice(0, 20) } } : {}),
           AND: [
             { OR: [{ claimUntil: null }, { claimUntil: { lte: currentNow } }] },
             { OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: currentNow } }] },
           ],
         },
-        orderBy: [{ priority: "desc" }, { requestedAt: "asc" }, { key: "asc" }],
+        // Ready time rotates continuations behind other due requests. Legacy
+        // NULL rows receive their first turn, then acquire a durable ready time.
+        orderBy: [{ nextAttemptAt: { sort: "asc", nulls: "first" } }, { priority: "desc" }, { requestedAt: "asc" }, { key: "asc" }],
       });
       if (!candidate) return null;
       await lockDemand(tx, candidate.key);
@@ -763,7 +772,7 @@ function demandRetryDelayMs(attempts) {
   return Math.min(DEMAND_RETRY_MAX_MS, DEMAND_RETRY_BASE_MS * (2 ** exponent));
 }
 
-async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Date(), error = null, cancellationReason = null }) {
+async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Date(), error = null, cancellationReason = null, yieldContinuation = false }) {
   const fallbackNow = asDate(completedAt);
   if (!fallbackNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
   return withDbAdvisoryXactLock({
@@ -787,7 +796,7 @@ async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Da
       if (Number(current.requestRevision) > Number(demand.claimedRevision)) {
         await tx.analyticsCollectionDemand.update({
           where: { key: demand.key },
-          data: { claimToken: null, claimUntil: null, claimedRevision: null, cursorCreatorId: null, completedAt: null, attempts: 0, nextAttemptAt: null, lastErrorCode: null, lastErrorClass: null, lastError: null, quarantinedAt: null },
+          data: { claimToken: null, claimUntil: null, claimedRevision: null, cursorCreatorId: null, completedAt: null, attempts: 0, nextAttemptAt: finishedAt, lastErrorCode: null, lastErrorClass: null, lastError: null, quarantinedAt: null },
         });
         return { settled: true, completed: false, retry: true, reason: "newer_revision_pending" };
       }
@@ -799,12 +808,23 @@ async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Da
         await tx.analyticsCollectionDemand.update({
           where: { key: demand.key },
           data: {
-            claimToken: null, claimUntil: finishedAt, claimedRevision: null,
+            claimToken: null, claimUntil: finishedAt, claimedRevision: demand.claimedRevision,
+            cursorCreatorId: demand.cursorCreatorId || current.cursorCreatorId || null,
             attempts, nextAttemptAt, lastErrorCode: failure.code, lastErrorClass: failure.errorClass, lastError: failure.message,
             quarantinedAt: quarantined ? finishedAt : null,
           },
         });
         return { settled: true, completed: false, retry: !quarantined, quarantined, attempts, nextAttemptAt, errorCode: failure.code, errorClass: failure.errorClass };
+      }
+      if (yieldContinuation && !cancellationReason) {
+        await tx.analyticsCollectionDemand.update({
+          where: { key: demand.key },
+          data: {
+            claimToken: null, claimUntil: finishedAt, nextAttemptAt: finishedAt,
+            cursorCreatorId: demand.cursorCreatorId || current.cursorCreatorId || null,
+          },
+        });
+        return { settled: true, completed: false, retry: true, yielded: true, reason: "continuation_pending" };
       }
       const cancelled = cancellationReason ? String(cancellationReason).slice(0, 1000) : null;
       await tx.analyticsCollectionDemand.update({
@@ -830,7 +850,7 @@ async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Da
 
 function creatorIdsFromDemand(value) {
   if (value == null) return null;
-  if (!Array.isArray(value)) throw new Error("ANALYTICS_DEMAND_SCOPE_CORRUPT");
+  if (!Array.isArray(value)) throw Object.assign(new Error("ANALYTICS_DEMAND_SCOPE_CORRUPT"), { code: "ANALYTICS_DEMAND_SCOPE_CORRUPT" });
   return normalizedDemandCreatorIds(value);
 }
 
@@ -878,128 +898,119 @@ async function analyticsDemandAccessFenceCurrent({ db = prisma, demand } = {}) {
   return Boolean(current);
 }
 
-async function processAnalyticsDemand({ db = prisma, demand, pageSize = DEMAND_PAGE_SIZE, now = new Date() } = {}) {
+async function processAnalyticsDemand({
+  db = prisma, demand, pageSize = DEMAND_PAGE_SIZE, maxCreators = DEMAND_SLICE_CREATORS,
+  budgetMs = DEMAND_SLICE_BUDGET_MS, now = new Date(),
+} = {}) {
   if (!demand?.key || !demand.claimToken || !Number.isInteger(Number(demand.claimedRevision))) {
     throw new Error("ANALYTICS_DEMAND_CLAIM_REQUIRED");
   }
+  const startedAt = performance.now();
   const fallbackNow = asDate(now);
   if (!fallbackNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
   const processNow = await dbAuthorityNow({ db, fallbackNow });
-  const size = Math.max(25, Math.min(500, Number(pageSize) || DEMAND_PAGE_SIZE));
-  // Parse persisted scope only as corruption evidence. Execution never trusts it:
-  // every page is fenced by the current member/accessEpoch/permission/scope.
-  creatorIdsFromDemand(demand.creatorIds);
+  const limit = Math.max(1, Math.min(DEMAND_SLICE_MAX_CREATORS, Math.floor(Number(maxCreators) || DEMAND_SLICE_CREATORS)));
+  const size = Math.min(limit, Math.max(1, Math.floor(Number(pageSize) || DEMAND_PAGE_SIZE)));
+  const timeBudget = Math.max(1, Math.min(DEMAND_SLICE_BUDGET_MS, Number(budgetMs) || DEMAND_SLICE_BUDGET_MS));
+  const from = demand.coverageFrom == null ? null : utcDay(demand.coverageFrom);
+  const to = demand.coverageTo == null ? null : utcDay(demand.coverageTo);
+  try {
+    normalizeHomeRangeKey(demand.rangeKey);
+    if (!from || !to || from > to || to > utcDay(processNow) || (to - from) / DAY_MS >= 180) throw new Error("invalid coverage");
+  } catch (cause) {
+    throw Object.assign(new Error("ANALYTICS_DEMAND_RANGE_INVALID", { cause }), { code: "ANALYTICS_DEMAND_RANGE_INVALID" });
+  }
+  const requestedIds = creatorIdsFromDemand(demand.creatorIds);
   let cursor = demand.cursorCreatorId || null;
   let creators = 0;
   let pages = 0;
   let created = 0;
   let reused = 0;
   let dueDays = 0;
+  const finish = async (options = {}) => {
+    const settled = await settleAnalyticsDemand({ db, demand, completedAt: now, ...options });
+    return { ok: settled.settled, settled, creators, pages, created, reused, dueDays, ...(options.cancellationReason ? { accessDenied: true } : {}) };
+  };
   const authority = await resolveAnalyticsDemandExecutionScope({ db, demand });
-  if (!authority.authorized) {
-    const settled = await settleAnalyticsDemand({
-      db, demand, completedAt: now, cancellationReason: authority.reason,
-    });
-    return { ok: settled.settled, settled, creators, pages, created, reused, dueDays, accessDenied: true };
+  if (!authority.authorized) return finish({ cancellationReason: authority.reason });
+  const requested = requestedIds == null ? null : new Set(requestedIds);
+  const scopedIds = authority.creatorIds == null
+    ? requestedIds
+    : authority.creatorIds.filter((id) => requested == null || requested.has(id));
+  if (!await analyticsDemandAccessFenceCurrent({ db, demand })) {
+    return finish({ cancellationReason: "ANALYTICS_DEMAND_ACCESS_EPOCH_CHANGED" });
   }
-  const scopedIds = authority.creatorIds;
-  for (;;) {
+  if (!await renewAnalyticsDemandLease({
+    db, key: demand.key, claimToken: demand.claimToken, claimedRevision: demand.claimedRevision, cursorCreatorId: cursor, now,
+  })) return { ok: false, reason: "demand_claim_lost", creators, pages, created, reused, dueDays };
+
+  // One bounded page plus one lookahead. The persisted cursor is advanced only
+  // after a creator's complete planning operation; no in-memory page is authority.
+  const candidates = await db.creatorAccount.findMany({
+    where: {
+      agencyId: demand.agencyId, status: "READY", deletedAt: null, agency: { deletedAt: null },
+      ...(scopedIds ? { id: { in: scopedIds, ...(cursor ? { gt: cursor } : {}) } } : cursor ? { id: { gt: cursor } } : {}),
+    },
+    orderBy: { id: "asc" }, take: size + 1, select: { id: true, agencyId: true },
+  });
+  const rows = candidates.slice(0, size);
+  if (!rows.length) return finish();
+  pages = 1;
+  const coverage = await db.analyticsCoverage.findMany({
+    where: {
+      creatorId: { in: rows.map((row) => row.id) }, dataType: "EARNINGS",
+      sourceTimezone: ANALYTICS_SOURCE_TIMEZONE, coverageDate: { gte: from, lte: to },
+    },
+    select: { creatorId: true, coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, scanProofId: true, scanProof: { select: { status: true } } },
+  });
+  const byCreator = new Map();
+  for (const item of coverage) {
+    const list = byCreator.get(item.creatorId) || [];
+    list.push(item);
+    byCreator.set(item.creatorId, list);
+  }
+  for (const creator of rows) {
+    // Cooperative time budget: do not start another creator after exhaustion.
+    // A single in-flight DB operation is governed by its own timeout.
+    if (creators > 0 && performance.now() - startedAt >= timeBudget) break;
     if (!await analyticsDemandAccessFenceCurrent({ db, demand })) {
-      const settled = await settleAnalyticsDemand({
-        db, demand, completedAt: now, cancellationReason: "ANALYTICS_DEMAND_ACCESS_EPOCH_CHANGED",
-      });
-      return { ok: settled.settled, settled, creators, pages, created, reused, dueDays, accessDenied: true };
+      return finish({ cancellationReason: "ANALYTICS_DEMAND_ACCESS_EPOCH_CHANGED" });
     }
-    const alive = await renewAnalyticsDemandLease({
-      db, key: demand.key, claimToken: demand.claimToken, claimedRevision: demand.claimedRevision, cursorCreatorId: cursor, now,
+    const result = await ensureAnalyticsWindowFreshness({
+      db, creatorId: creator.id, agencyId: creator.agencyId, startDay: from, endDay: to,
+      displayRangeKey: demand.rangeKey, reason: demand.reason, priority: demand.priority,
+      now: processNow, coverageRows: byCreator.get(creator.id) || [],
     });
-    if (!alive) return { ok: false, reason: "demand_claim_lost", creators, pages, created, reused, dueDays };
-    const rows = await db.creatorAccount.findMany({
-      where: {
-        agencyId: demand.agencyId,
-        status: "READY",
-        deletedAt: null,
-        agency: { deletedAt: null },
-        ...(scopedIds ? { id: { in: scopedIds, ...(cursor ? { gt: cursor } : {}) } } : cursor ? { id: { gt: cursor } } : {}),
-      },
-      orderBy: { id: "asc" },
-      take: size,
-      select: { id: true, agencyId: true },
-    });
-    if (!rows.length) break;
-    pages += 1;
-    creators += rows.length;
-    const ids = rows.map((row) => row.id);
-    const coverage = await db.analyticsCoverage.findMany({
-      where: {
-        creatorId: { in: ids },
-        dataType: "EARNINGS",
-        sourceTimezone: ANALYTICS_SOURCE_TIMEZONE,
-        coverageDate: { gte: demand.coverageFrom, lte: demand.coverageTo },
-      },
-      select: { creatorId: true, coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, scanProofId: true, scanProof: { select: { status: true } } },
-    });
-    const byCreator = new Map();
-    for (const item of coverage) {
-      const list = byCreator.get(item.creatorId) || [];
-      list.push(item);
-      byCreator.set(item.creatorId, list);
-    }
-    for (let index = 0; index < rows.length; index += 1) {
-      const creator = rows[index];
-      const result = await ensureAnalyticsWindowFreshness({
-        db,
-        creatorId: creator.id,
-        agencyId: creator.agencyId,
-        startDay: demand.coverageFrom,
-        endDay: demand.coverageTo,
-        displayRangeKey: demand.rangeKey,
-        reason: demand.reason,
-        priority: demand.priority,
-        now: processNow,
-        coverageRows: byCreator.get(creator.id) || [],
-      });
-      created += result.created;
-      reused += result.reused;
-      dueDays += result.dueDays;
-      cursor = creator.id;
-      demand.cursorCreatorId = cursor;
-      if ((index + 1) % 25 === 0 && index + 1 < rows.length) {
-        if (!await analyticsDemandAccessFenceCurrent({ db, demand })) {
-          const settled = await settleAnalyticsDemand({
-            db, demand, completedAt: now, cancellationReason: "ANALYTICS_DEMAND_ACCESS_EPOCH_CHANGED",
-          });
-          return { ok: settled.settled, settled, creators, pages, created, reused, dueDays, accessDenied: true };
-        }
-        const heartbeat = await renewAnalyticsDemandLease({
-          db, key: demand.key, claimToken: demand.claimToken, claimedRevision: demand.claimedRevision, cursorCreatorId: cursor, now,
-        });
-        if (!heartbeat) return { ok: false, reason: "demand_claim_lost", creators, pages, created, reused, dueDays };
-      }
-    }
-    if (rows.length < size) break;
+    created += result.created;
+    reused += result.reused;
+    dueDays += result.dueDays;
+    creators += 1;
+    cursor = creator.id;
+    demand.cursorCreatorId = cursor;
   }
-  const settled = await settleAnalyticsDemand({ db, demand, completedAt: now });
-  return { ok: settled.settled, settled, creators, pages, created, reused, dueDays };
+  return finish({ yieldContinuation: creators < candidates.length });
 }
 
-async function runAnalyticsCollectionDemandSweep({ db = prisma, now = new Date(), maxDemands = DEMAND_MAX_PER_SWEEP, pageSize = DEMAND_PAGE_SIZE } = {}) {
+async function runAnalyticsCollectionDemandSweep({ db = prisma, now = new Date(), maxDemands = DEMAND_MAX_PER_SWEEP, pageSize = DEMAND_PAGE_SIZE, maxCreators = DEMAND_SLICE_CREATORS, budgetMs = DEMAND_SLICE_BUDGET_MS } = {}) {
   if (demandSweepPromise) return { ok: true, skipped: true, reason: "in_process_demand_sweep_in_flight" };
   demandSweepPromise = (async () => {
     const limit = Math.max(1, Math.min(20, Number(maxDemands) || DEMAND_MAX_PER_SWEEP));
-    const totals = { demands: 0, creators: 0, pages: 0, created: 0, reused: 0, dueDays: 0, failures: 0 };
+    const totals = { demands: 0, creators: 0, pages: 0, created: 0, reused: 0, dueDays: 0, failures: 0, yielded: 0 };
     const errors = [];
+    const servedAgencies = [];
     for (let index = 0; index < limit; index += 1) {
-      const demand = await claimNextAnalyticsDemand({ db, now });
+      const demand = await claimNextAnalyticsDemand({ db, now, excludeAgencyIds: servedAgencies });
       if (!demand) break;
+      servedAgencies.push(demand.agencyId);
       totals.demands += 1;
       try {
-        const result = await processAnalyticsDemand({ db, demand, pageSize, now });
+        const result = await processAnalyticsDemand({ db, demand, pageSize, maxCreators, budgetMs, now });
         totals.creators += result.creators || 0;
         totals.pages += result.pages || 0;
         totals.created += result.created || 0;
         totals.reused += result.reused || 0;
         totals.dueDays += result.dueDays || 0;
+        totals.yielded += result.settled?.yielded ? 1 : 0;
         if (!result.ok) {
           totals.failures += 1;
           errors.push({ key: demand.key, reason: result.reason || result.settled?.reason || "demand_processing_failed" });

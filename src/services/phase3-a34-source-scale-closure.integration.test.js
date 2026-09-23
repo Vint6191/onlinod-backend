@@ -192,6 +192,67 @@ test("A36 PostgreSQL: Analytics renew and settlement reject leases that expire d
   }
 });
 
+test("A36 PostgreSQL: scoped Home demand yields durable progress and a second client finishes without planning unrequested creators", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const planner = require("./analytics-collection-planner");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const prefix = nonce("a36-home-continuation");
+  let actor = null;
+  try {
+    actor = await createPhase3PostgresActorFixture(dbA, prefix);
+    const ids = [0, 1, 2].map((index) => `${prefix}-creator-${index}`);
+    await withPhase3PostgresFixtureAuthority(dbA, async (tx) => {
+      await tx.creatorAccount.createMany({ data: ids.map((id) => ({ id, agencyId: actor.agencyId, displayName: id, status: "READY" })) });
+    });
+    const queued = await planner.enqueueAgencyAnalyticsFreshnessDemand({
+      db: dbA, agencyId: actor.agencyId, requestedByMemberId: actor.memberId, requestedAccessEpoch: actor.accessEpoch,
+      creatorIds: ids.slice(0, 2), rangeKey: "today", includePrevious: false,
+    });
+    const firstClaim = await planner.claimNextAnalyticsDemand({ db: dbA, ownerToken: `${prefix}-worker-a` });
+    assert.equal(firstClaim.key, queued.key);
+    const first = await planner.processAnalyticsDemand({ db: dbA, demand: firstClaim, maxCreators: 1 });
+    assert.equal(first.ok, true);
+    assert.equal(first.creators, 1);
+    assert.equal(first.created, 1);
+    assert.equal(first.settled.yielded, true);
+    const pending = await dbB.analyticsCollectionDemand.findUnique({ where: { key: queued.key } });
+    assert.equal(pending.completedAt, null);
+    assert.equal(pending.claimToken, null);
+    assert.equal(pending.claimedRevision, 1);
+    assert.equal(pending.cursorCreatorId, ids[0]);
+    assert.ok(pending.nextAttemptAt);
+    const secondClaim = await planner.claimNextAnalyticsDemand({ db: dbB, ownerToken: `${prefix}-worker-b` });
+    assert.equal(secondClaim.key, queued.key);
+    assert.equal(secondClaim.cursorCreatorId, ids[0]);
+    const second = await planner.processAnalyticsDemand({ db: dbB, demand: secondClaim, maxCreators: 1 });
+    assert.equal(second.ok, true);
+    assert.equal(second.creators, 1);
+    assert.equal(second.created, 1);
+    assert.equal(second.settled.completed, true);
+    const jobs = await dbA.jobInstance.findMany({ where: { agencyId: actor.agencyId, jobKey: "fetch_earnings" }, orderBy: { creatorId: "asc" }, select: { creatorId: true } });
+    assert.deepEqual(jobs.map((row) => row.creatorId), ids.slice(0, 2));
+    const done = await dbA.analyticsCollectionDemand.findUnique({ where: { key: queued.key } });
+    assert.equal(done.completedRevision, 1);
+    assert.equal(done.cursorCreatorId, ids[1]);
+    assert.ok(done.completedAt);
+    assert.equal((await planner.settleAnalyticsDemand({ db: dbA, demand: firstClaim, yieldContinuation: true })).settled, false);
+    console.log("# A36_HOME_DEMAND_DURABLE_CONTINUATION_PASS");
+  } finally {
+    try {
+      if (actor) {
+        try {
+          await dbA.analyticsCollectionDemand.deleteMany({ where: { agencyId: actor.agencyId } });
+        } finally {
+          await cleanupPhase3PostgresFixtureGraph(dbA, { agencyId: actor.agencyId, userIds: [actor.userId] });
+        }
+      }
+    } finally {
+      await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect()]);
+    }
+  }
+});
+
 async function withTeamGeneration(db, workFn) {
   return db.$transaction(async (tx) => {
     await tx.$queryRawUnsafe(
