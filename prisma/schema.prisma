@@ -6421,6 +6421,8 @@ model AdminCommand {
   action           String
   targetId         String
   payloadHash      String
+  executionPayload Json?
+  executionProgress Json?
   reason           String
   scopeAgencyId    String?
   status           String

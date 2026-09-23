@@ -564,9 +564,12 @@ test("Phase3 closure: contract errors require repair, while new canonical revisi
   }
 });
 
-test("Phase3 closure: typed dependency errors block and wake without burning the failure budget", async () => {
+test("Phase3 closure: typed dependency errors block and wake without burning the failure budget", async t => {
   const fx = makeDb();
   const at = new Date("2026-09-23T21:00:00Z");
+  // Settlement deliberately samples a fresh clock; keep this adapter test in
+  // the same time domain as its claimed lease, regardless of calendar date.
+  t.mock.timers.enable({ apis: ["Date"], now: at.getTime() });
   await authority.publishDomainWork({ db: fx.db, ...base, availableAt: at });
   const item = (await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, fallbackNow: at })).items[0];
   const dependency = { dependencyKind: "CREATOR_BINDING", dependencyKey: base.creatorId, dependencyRevision: 0n };

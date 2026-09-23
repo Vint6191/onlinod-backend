@@ -2,6 +2,7 @@
 
 const { setAdminBillingPolicy, setAdminBillingHold, setAdminEntitlement } = require("../services/admin-billing-access-command-service");
 const prisma = require("../prisma");
+const { submitAdminBulkPricing, cancelAdminBulkPricing } = require("../services/admin-bulk-pricing-command-service");
 const { commandRequest } = require("../services/admin-command-contract");
 const { setAdminPricing } = require("../services/admin-pricing-command-service");
 const { createAdminIdentity, patchAdminIdentity, resetAdminPassword } = require("../services/admin-identity-command-service");
@@ -24,4 +25,4 @@ function handler(service, targetKey) {
   };
 }
 
-module.exports = { setBillingPolicyHandler: handler(setAdminBillingPolicy, "agencyId"), setBillingHoldHandler: handler(setAdminBillingHold, "agencyId"), setEntitlementHandler: handler(setAdminEntitlement, "creatorId"), sendCommandError, setPricingHandler: handler(setAdminPricing, "creatorId"), createAdminHandler: handler(createAdminIdentity), patchAdminHandler: handler(patchAdminIdentity, "targetId"), resetAdminPasswordHandler: handler(resetAdminPassword, "targetId") };
+module.exports = { cancelBulkPricingHandler: handler(cancelAdminBulkPricing, "agencyId"), bulkPricingHandler: handler(submitAdminBulkPricing, "agencyId"), setBillingPolicyHandler: handler(setAdminBillingPolicy, "agencyId"), setBillingHoldHandler: handler(setAdminBillingHold, "agencyId"), setEntitlementHandler: handler(setAdminEntitlement, "creatorId"), sendCommandError, setPricingHandler: handler(setAdminPricing, "creatorId"), createAdminHandler: handler(createAdminIdentity), patchAdminHandler: handler(patchAdminIdentity, "targetId"), resetAdminPasswordHandler: handler(resetAdminPassword, "targetId") };

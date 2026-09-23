@@ -4,7 +4,7 @@
    per connected model. Two views:
      overview        — real MRR (status-filtered) + agency rollup
      agency detail   — every model with editable tier/price/addons,
-                       live line totals, bulk "apply tier to all"
+                       live line totals, bounded selected-model bulk commands
    Routed via section "billing" (overview) and a local detail state.
    ──────────────────────────────────────────────────────────── */
 (function () {
@@ -76,12 +76,12 @@
     local.tiers = r.tiers || {};
 
     const tierOpts = (sel) => Object.entries(r.tiers).map(([k, v]) =>
-      `<option value="${k}" ${k === sel ? "selected" : ""}>${esc(v.label)} (${money(v.priceCents)})</option>`).join("");
+      `<option value="${k}" ${k === sel ? "selected" : ""}>${esc(v.label)} (${k === "CUSTOM" ? "explicit price" : money(v.priceCents)})</option>`).join("");
 
     const rows = (r.models || []).map((m) => `
       <tr data-creator="${esc(m.creatorId)}" data-pricing-revision="${Number(m.pricingRevision || 0)}" class="${m.billingExcluded ? "adm-row-excluded" : ""}">
         <td>
-          <b>${esc(m.displayName || m.username || m.creatorId.slice(-8))}</b>
+          <label><input class="bl-select" type="checkbox" ${m.billingExcluded ? "disabled" : ""}> <b>${esc(m.displayName || m.username || m.creatorId.slice(-8))}</b></label>
           <div class="adm-muted">@${esc(m.username || "—")} · ${esc(m.creatorStatus || "")}</div>
         </td>
         <td><select class="bl-tier">${tierOpts(m.tier || "STARTER")}</select></td>
@@ -120,9 +120,16 @@
         </div>
 
         <div class="adm-bulk-bar">
-          <span>Bulk set tier for all models:</span>
-          <select id="blBulkTier">${Object.entries(r.tiers).map(([k, v]) => `<option value="${k}">${esc(v.label)} (${money(v.priceCents)})</option>`).join("")}</select>
-          <button class="adm-btn adm-btn-sm" id="blBulkApply">apply to all</button>
+          <span>Set tier for selected models (maximum 100):</span>
+          <select id="blBulkTier">${Object.entries(r.tiers).map(([k, v]) => `<option value="${k}">${esc(v.label)} (${k === "CUSTOM" ? "explicit price" : money(v.priceCents)})</option>`).join("")}</select>
+          <input id="blBulkCustomPrice" type="number" min="0" max="10000" step="0.01" placeholder="CUSTOM price $">
+          <input id="blBulkReason" maxlength="500" placeholder="Reason for change">
+          <button class="adm-btn adm-btn-sm" id="blBulkApply">queue selected</button>
+          <button class="adm-btn adm-btn-sm" id="blBulkCheck">check progress</button>
+          <button class="adm-btn adm-btn-sm" id="blBulkCancel">cancel remaining</button>
+          <button class="adm-btn adm-btn-sm" id="blBulkResume" disabled>resume remaining</button>
+          <span id="blBulkProgress" role="status"></span>
+          <details><summary>Results by model</summary><pre id="blBulkOutcomes"></pre></details>
         </div>
 
         <div class="adm-card">
@@ -156,13 +163,74 @@
       });
     });
 
+    const bulkStorageKey = `onlinod_admin_bulk:${agencyId}`;
+    let bulkCommandId = null;
+    try { bulkCommandId = sessionStorage.getItem(bulkStorageKey); } catch (_) {}
+    let submitting = false;
+    let resumePayload = null;
+    const progressEl = main.querySelector("#blBulkProgress");
+    async function checkBulk() {
+      if (!bulkCommandId) { progressEl.textContent = "No submitted command in this tab."; return; }
+      const status = await A().commandStatus(bulkCommandId);
+      if (!status?.ok) { progressEl.textContent = status?.error || "Result unknown; retry the same selection."; return; }
+      const p = status.execution?.progress;
+      resumePayload = status.execution?.resume || null;
+      main.querySelector("#blBulkResume").disabled = !resumePayload;
+      main.querySelector("#blBulkOutcomes").textContent = (p?.outcomes || []).map(item => `${item.creatorId}: ${item.status}${item.code ? " / " + item.code : ""}`).join("\n");
+      progressEl.textContent = `${status.status}${status.execution?.workState === "RECONCILE_REQUIRED" ? " / RECONCILE_REQUIRED" : ""}: ${p?.nextIndex || 0}/${p?.total || 0}, changed ${p?.succeeded || 0}, rejected ${p?.rejected || 0}, skipped ${p?.skipped || 0}. ${p?.stoppedCode || ""}`;
+    }
+    main.querySelector("#blBulkCheck").addEventListener("click", () => checkBulk().catch(() => { progressEl.textContent = "Status unavailable; check again."; }));
     main.querySelector("#blBulkApply").addEventListener("click", async () => {
+      if (submitting) return;
+      const items = Array.from(main.querySelectorAll("tr[data-creator]")).filter(tr => tr.querySelector(".bl-select").checked).map(tr => ({ creatorId: tr.dataset.creator, expectedRevision: Number(tr.dataset.pricingRevision) }));
       const tier = main.querySelector("#blBulkTier").value;
-      if (!confirm(`Set tier "${tier}" for ALL non-excluded models of this agency?`)) return;
-      const res = await A().billingApplyTier(agencyId, { tier });
-      R().toast(res?.ok ? `applied to ${res.updated} models` : "failed", res?.ok ? "ok" : "error");
-      if (res?.ok) renderAgency(main, agencyId);
+      const reason = main.querySelector("#blBulkReason").value.trim();
+      if (!items.length || items.length > 100 || !reason) { R().toast("Select 1–100 models and enter a reason.", "error"); return; }
+      const body = { items, tier, reason };
+      if (tier === "CUSTOM") {
+        const raw = main.querySelector("#blBulkCustomPrice").value;
+        if (!raw.trim() || !Number.isFinite(Number(raw)) || Number(raw) < 0 || Number(raw) > 10000) { R().toast("Enter a valid CUSTOM price.", "error"); return; }
+        body.corePriceCents = Math.round(Number(raw) * 100);
+      }
+      if (!confirm(`Queue tier "${tier}" for these ${items.length} selected models? Changed prices will be rejected individually.`)) return;
+      submitting = true;
+      const button = main.querySelector("#blBulkApply"); button.disabled = true;
+      try {
+        const res = await A().billingApplyTier(agencyId, body);
+        if (res?.commandId) { bulkCommandId = res.commandId; try { sessionStorage.setItem(bulkStorageKey, bulkCommandId); } catch (_) {} }
+        R().toast(res?.accepted ? "Selection accepted; check progress for completion." : res?.error || "Submission failed", res?.accepted ? "ok" : "error");
+        if (res?.accepted) await checkBulk();
+      } catch (_) { progressEl.textContent = "Result unknown; retry the same selection."; }
+      finally { submitting = false; button.disabled = false; }
     });
+    main.querySelector("#blBulkResume").addEventListener("click", async () => {
+      if (!resumePayload || submitting) return;
+      const reason = main.querySelector("#blBulkReason").value.trim();
+      if (!reason) { R().toast("Enter a reason for resuming.", "error"); return; }
+      if (!confirm(`Resume ${resumePayload.items.length} remaining models with the original prices and versions?`)) return;
+      submitting = true;
+      try {
+        const res = await A().billingApplyTier(agencyId, { ...resumePayload, reason });
+        if (res?.commandId) { bulkCommandId = res.commandId; try { sessionStorage.setItem(bulkStorageKey, bulkCommandId); } catch (_) {} }
+        R().toast(res?.accepted ? "Remaining selection accepted." : res?.error || "Resume failed", res?.accepted ? "ok" : "error");
+        if (res?.accepted) await checkBulk();
+      } catch (_) { progressEl.textContent = "Result unknown; check progress or retry the same resume."; }
+      finally { submitting = false; }
+    });
+    main.querySelector("#blBulkCancel").addEventListener("click", async () => {
+      if (!bulkCommandId || submitting) return;
+      const reason = main.querySelector("#blBulkReason").value.trim();
+      if (!reason) { R().toast("Enter a cancellation reason.", "error"); return; }
+      if (!confirm("Cancel remaining changes? Completed changes stay in place.")) return;
+      submitting = true;
+      try {
+        const res = await A().billingCancelTier(agencyId, { targetCommandId: bulkCommandId, reason });
+        R().toast(res?.ok ? "Cancellation confirmed." : res?.error || "Cancellation result unknown; retry.", res?.ok ? "ok" : "error");
+        await checkBulk();
+      } catch (_) { progressEl.textContent = "Cancellation result unknown; check or retry."; }
+      finally { submitting = false; }
+    });
+    if (bulkCommandId) checkBulk().catch(() => { progressEl.textContent = "Status unavailable; check again."; });
   }
 
   function lineFromRow(tr) {
@@ -202,6 +270,8 @@
       R().toast("saved " + money(res.lineCents), "ok");
       tr.querySelector(".bl-line").textContent = money(res.lineCents);
       tr.classList.toggle("adm-row-excluded", body.billingExcluded);
+      tr.querySelector(".bl-select").disabled = body.billingExcluded;
+      if (body.billingExcluded) tr.querySelector(".bl-select").checked = false;
       recalcTotal(main);
     } else {
       R().toast(res?.error || "save failed", "error");

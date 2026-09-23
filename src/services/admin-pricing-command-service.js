@@ -10,8 +10,9 @@ function lineCents(row) {
   return row.billingExcluded ? 0 : row.corePriceCents + (row.aiChatterEnabled ? row.aiChatterPriceCents : 0) + (row.outreachEnabled ? row.outreachPriceCents : 0);
 }
 
-async function setPricingWithinTransaction({ tx, creatorId, payload }) {
+async function setPricingWithinTransaction({ tx, creatorId, payload, expectedAgencyId = null }) {
   const identity = await tx.creatorAccount.findUnique({ where: { id: creatorId }, select: { id: true, agencyId: true } });
+  if (expectedAgencyId && identity?.agencyId !== expectedAgencyId) throw adminError("ADMIN_SELECTION_SCOPE_INVALID", "Creator moved outside the selected agency", 409);
   if (!identity) throw adminError("CREATOR_NOT_FOUND", "Creator not found", 404);
   const lifecycle = await lockAgencyLifecycleBarrier({ db: tx, agencyId: identity.agencyId });
   if (!lifecycle.row || lifecycle.row.deletedAt) throw adminError("AGENCY_RETIRED", "Agency is retired", 409);

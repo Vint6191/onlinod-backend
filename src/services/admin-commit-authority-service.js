@@ -22,7 +22,9 @@ async function executeAdminCommand({ db, actor, commandId, action, targetId, pay
   const normalized = contract.schema ? contract.schema.parse(payload) : payload;
   const hash = intentHash({ action, targetId, payload: normalized });
   return db.$transaction(async tx => {
-    await lockCommandIdentity(tx, actor.adminId, commandId);
+    const relatedIdentity = contract.parentIdentity ? normalized.targetCommandId : contract.resumeIdentity ? normalized.resumesCommandId : null;
+    const identities = [...new Set([commandId, relatedIdentity].filter(Boolean))].sort();
+    for (const identity of identities) await lockCommandIdentity(tx, actor.adminId, identity);
     // Roster mutex is used only by identity commands, before any AdminUser row.
     if (contract.roster) await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", "admin-roster-v1");
     const authority = await lockAdminActor(tx, actor, { roles: contract.roles, mutateIdentity: contract.roster === true, targetAdminId: contract.roster ? targetId : null });
@@ -53,8 +55,8 @@ async function executeAdminCommand({ db, actor, commandId, action, targetId, pay
     const statusCode = outcome.statusCode || 200;
     const body = safeJson({ ...outcome.body, commandId });
     const audit = safeJson(outcome.audit || {});
-    await tx.adminCommandAudit.create({ data: { commandId: command.id, sequence: 1, actorId: actor.adminId, action, targetId, scopeAgencyId: outcome.agencyId || null, event: statusCode < 400 ? "COMMITTED" : "REJECTED", detail: audit, reason: normalized.reason } });
-    await tx.adminCommand.update({ where: { id: command.id }, data: { status: statusCode < 400 ? "SUCCEEDED" : "REJECTED", httpStatus: statusCode, result: body, scopeAgencyId: outcome.agencyId || null, completedAt: await dbAuthorityNow({ db: tx }) } });
+    await tx.adminCommandAudit.create({ data: { commandId: command.id, sequence: 1, actorId: actor.adminId, action, targetId, scopeAgencyId: outcome.agencyId || null, event: outcome.queued ? "ACCEPTED" : statusCode < 400 ? "COMMITTED" : "REJECTED", detail: audit, reason: normalized.reason } });
+    await tx.adminCommand.update({ where: { id: command.id }, data: { status: outcome.queued ? "QUEUED" : statusCode < 400 ? "SUCCEEDED" : "REJECTED", httpStatus: statusCode, result: body, scopeAgencyId: outcome.agencyId || null, completedAt: outcome.queued ? null : await dbAuthorityNow({ db: tx }) } });
     return { commandId, replayed: false, statusCode, body };
   }, { maxWait: 5000, timeout: 15000, isolationLevel: "ReadCommitted" });
 }
@@ -65,7 +67,13 @@ async function readAdminCommand({ db, actor, commandId }) {
     await lockAdminActor(tx, actor);
     const row = await tx.adminCommand.findUnique({ where: { actorId_commandId: { actorId: actor.adminId, commandId } } });
     if (!row) throw adminError("ADMIN_COMMAND_NOT_FOUND", "Command not found", 404);
-    return { ok: true, commandId, action: row.action, targetId: row.targetId, status: row.status, result: row.result, httpStatus: row.httpStatus, createdAt: row.createdAt, completedAt: row.completedAt };
+    let execution = null;
+    if (row.action === "billing.pricing.bulk") {
+      const { workId } = require("./domain-work-authority-service");
+      const item = await tx.domainWorkItem.findUnique({ where: { id: workId({ agencyId: row.scopeAgencyId, workClass: "ADMIN_BILLING_PRICING", objectType: "AdminCommand", objectId: row.id }) } });
+      execution = { resume: row.status === "PAUSED_AUTH" ? { ...row.executionPayload, reason: undefined, items: row.executionPayload.items.slice(row.executionProgress.nextIndex), resumesCommandId: row.commandId } : null, progress: row.executionProgress, workState: item?.state || null, errorClass: item?.errorClass || null, terminalCause: item?.terminalCause || null, retryAt: item?.nextAttemptAt || null };
+    }
+    return { ok: true, execution, commandId, action: row.action, targetId: row.targetId, status: row.status, result: row.result, httpStatus: row.httpStatus, createdAt: row.createdAt, completedAt: row.completedAt };
   });
 }
 

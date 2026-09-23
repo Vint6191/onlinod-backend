@@ -1,0 +1,20 @@
+"use strict";
+const test=require("node:test"),assert=require("node:assert/strict"),fs=require("node:fs"),vm=require("node:vm"),path=require("node:path");
+async function ui({count=2,tier="PRO",price="",selected=[0],storedId=null,status=null}={}) {
+ const calls=[],toasts=[],storage=new Map(storedId?[["onlinod_admin_bulk:a",storedId]]:[]);
+ function element(value=""){return {value,checked:false,disabled:false,textContent:"",handlers:{},addEventListener(type,fn){this.handlers[type]=fn;}};}
+ const elements=Object.fromEntries(["blBack","blBulkTier","blBulkCustomPrice","blBulkReason","blBulkApply","blBulkCheck","blBulkProgress","blBulkResume","blBulkCancel","blBulkOutcomes"].map(k=>["#"+k,element()]));
+ elements["#blBulkTier"].value=tier;elements["#blBulkCustomPrice"].value=price;elements["#blBulkReason"].value="Agreed contract change";
+ const models=Array.from({length:count},(_,i)=>({creatorId:`c${i}`,pricingRevision:7+i,corePriceCents:2000,configuredLineCents:2000}));
+ const rows=models.map((m,i)=>{const controls={};return {dataset:{creator:m.creatorId,pricingRevision:String(m.pricingRevision)},querySelector(sel){controls[sel] ||= element();if(sel===".bl-select")controls[sel].checked=selected.includes(i);return controls[sel];},querySelectorAll(){return [];}};});
+ const main={innerHTML:"",querySelector:s=>elements[s],querySelectorAll:s=>s==="tr[data-creator]"?rows:[]};
+ const currentStatus=status || {ok:true,status:"QUEUED",execution:{progress:{total:selected.length,nextIndex:0,succeeded:0,rejected:0,skipped:0,outcomes:[]},workState:"READY"}};
+ const window={OnlinodAdminRouter:{escapeHtml:v=>String(v??""),toast:(...x)=>toasts.push(x)},OnlinodAdminApi:{billingAgency:async()=>({ok:true,agency:{id:"a",name:"A",status:"ACTIVE"},models,tiers:{PRO:{label:"Pro",priceCents:5000},CUSTOM:{label:"Custom",priceCents:null}}}),billingApplyTier:async(id,body)=>{calls.push({id,body});return {ok:true,accepted:true,commandId:"accepted-id"};},commandStatus:async()=>currentStatus}};
+ const source=fs.readFileSync(path.join(__dirname,"../../public/admin/modules/admin-billing/admin-billing.js"),"utf8").replace("window.OnlinodAdminBilling = { render };","window.OnlinodAdminBilling = { renderAgency };");
+ vm.runInNewContext(source,{window,confirm:()=>true,sessionStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)}});
+ await window.OnlinodAdminBilling.renderAgency(main,"a");
+ return {calls,toasts,elements,storage,click:id=>elements[id].handlers.click(),main};
+}
+test("actual bulk UI submits only selected IDs with displayed revisions and reason",async()=>{const view=await ui({selected:[1]});await view.click("#blBulkApply");assert.deepEqual(JSON.parse(JSON.stringify(view.calls[0].body)),{items:[{creatorId:"c1",expectedRevision:8}],tier:"PRO",reason:"Agreed contract change"});assert.match(view.elements["#blBulkProgress"].textContent,/QUEUED: 0\/1/);assert.equal(view.storage.get("onlinod_admin_bulk:a"),"accepted-id");assert.doesNotMatch(JSON.stringify(view.toasts),/applied to/);});
+test("actual bulk UI rejects an empty CUSTOM price and oversized selection before request",async()=>{for(const options of [{tier:"CUSTOM",price:""},{count:101,selected:Array.from({length:101},(_,i)=>i)}]){const view=await ui(options);await view.click("#blBulkApply");assert.equal(view.calls.length,0);}});
+test("actual bulk UI restores progress on reload and sends explicit linked remaining resume",async()=>{const resume={tier:"PRO",includeExcluded:false,items:[{creatorId:"c1",expectedRevision:8}],resumesCommandId:"previous-id"};const view=await ui({storedId:"previous-id",status:{ok:true,status:"PAUSED_AUTH",execution:{resume,workState:"DONE",progress:{total:2,nextIndex:1,succeeded:1,rejected:0,skipped:0,outcomes:[{creatorId:"c0",status:"SUCCEEDED"}],stoppedCode:"ADMIN_AUTH_INVALID"}}}});await view.click("#blBulkCheck");assert.match(view.elements["#blBulkProgress"].textContent,/PAUSED_AUTH/);assert.match(view.elements["#blBulkOutcomes"].textContent,/c0: SUCCEEDED/);await view.click("#blBulkResume");assert.deepEqual(JSON.parse(JSON.stringify(view.calls[0].body)),{...resume,reason:"Agreed contract change"});});

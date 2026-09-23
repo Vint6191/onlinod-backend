@@ -56,3 +56,14 @@ test("policy, support hold and entitlement mutations preserve UUID across browse
     assert.equal((await browser(b.storage).commands.prepare({ ...input, path })).commandId, first.commandId);
   }
 });
+
+test("bulk acceptance survives network uncertainty and resolves independently of completion", async () => {
+  const payload = { ...input, method: "POST", path: "/api/admin/billing/agency/a/apply-tier", body: { tier: "PRO", reason: "Bulk", items: [{ creatorId: "c", expectedRevision: 1 }] } };
+  const b = browser(new Map(), async url => ({ ok: true, json: async () => ({ ok: true, commandId: url.split("/").pop(), status: "RUNNING", result: { accepted: true } }) }));
+  const first = await b.commands.prepare(payload);
+  assert.ok(first.commandId);
+  assert.equal((await browser(b.storage).commands.prepare(payload)).commandId, first.commandId);
+  const resolved = await b.commands.resolve(payload.path, "POST", payload.token);
+  assert.equal(resolved.pending, false);
+  assert.equal(resolved.status, "RUNNING");
+});

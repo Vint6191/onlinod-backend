@@ -43,7 +43,19 @@ const entitlementSchema = z.object({
 }).strict().refine(value => ["coreValidUntil", "aiChatterValidUntil", "outreachValidUntil"].some(key => value[key] !== undefined), "Choose an access component to grant or revoke")
   .refine(value => value.tier === undefined || value.coreValidUntil !== undefined, "Changing access tier requires an explicit core grant/revoke");
 
+const bulkPricingSchema = z.object({
+  reason: reasonSchema,
+  tier: z.enum(["STARTER", "GROWTH", "PRO", "ELITE", "CUSTOM"]),
+  corePriceCents: centsSchema.optional(),
+  includeExcluded: z.boolean().default(false),
+  items: z.array(z.object({ creatorId: z.string().trim().min(1).max(180), expectedRevision: revisionSchema }).strict()).min(1).max(100),
+  resumesCommandId: commandIdSchema.optional(),
+}).strict().refine(value => new Set(value.items.map(item => item.creatorId)).size === value.items.length, "Duplicate creator selection")
+  .refine(value => value.tier !== "CUSTOM" || value.corePriceCents !== undefined, "CUSTOM requires an explicit core price");
+
 const ACTIONS = Object.freeze({
+  "billing.pricing.bulk.cancel": { roles: ["SUPER_ADMIN", "SUPPORT"], parentIdentity: true, schema: z.object({ targetCommandId: commandIdSchema, reason: reasonSchema }).strict() },
+  "billing.pricing.bulk": { resumeIdentity: true, roles: ["SUPER_ADMIN", "SUPPORT"], schema: bulkPricingSchema },
   "billing.policy.set": { roles: ["SUPER_ADMIN", "SUPPORT"], schema: billingPolicySchema },
   "billing.hold.set": { roles: ["SUPER_ADMIN"], schema: billingHoldSchema },
   "billing.entitlement.set": { roles: ["SUPER_ADMIN", "SUPPORT"], schema: entitlementSchema },
@@ -84,4 +96,4 @@ function publicAdmin(row) {
   return { id: row.id, email: row.email, name: row.name, role: row.role, active: row.active, accessEpoch: row.accessEpoch, lastLoginAt: row.lastLoginAt || null, createdAt: row.createdAt };
 }
 
-module.exports = { billingPolicySchema, billingHoldSchema, entitlementSchema, ACTIONS, adminError, canonicalJson, commandIdSchema, revisionSchema, reasonSchema, pricingSchema, intentHash, passwordFingerprint, commandRequest, publicAdmin };
+module.exports = { bulkPricingSchema, billingPolicySchema, billingHoldSchema, entitlementSchema, ACTIONS, adminError, canonicalJson, commandIdSchema, revisionSchema, reasonSchema, pricingSchema, intentHash, passwordFingerprint, commandRequest, publicAdmin };

@@ -202,6 +202,7 @@
     billingAgency:     (id)     => request(`/api/admin/billing/agency/${encodeURIComponent(id)}`),
     billingTiers:      ()       => request("/api/admin/billing/tiers"),
     billingSetCreator: (id, body) => request(`/api/admin/billing/creator/${encodeURIComponent(id)}`, { method: "PATCH", body }),
+    billingCancelTier: (id, body) => request(`/api/admin/billing/agency/${encodeURIComponent(id)}/apply-tier/cancel`, { method: "POST", body }),
     billingApplyTier:  (id, body) => request(`/api/admin/billing/agency/${encodeURIComponent(id)}/apply-tier`, { method: "POST", body }),
   };
 

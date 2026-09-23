@@ -16,7 +16,7 @@
   }
   function isCommand(path, method) {
     return (method === "PATCH" && /^\/api\/admin\/(?:billing\/creator\/[^/]+|creators\/[^/]+\/(?:billing|entitlement)|agencies\/[^/]+\/(?:subscription|billing-hold)|admin-users\/[^/]+)$/.test(path)) ||
-      (method === "POST" && /^\/api\/admin\/admin-users(?:\/[^/]+\/reset-password)?$/.test(path));
+      (method === "POST" && (/^\/api\/admin\/admin-users(?:\/[^/]+\/reset-password)?$/.test(path) || /^\/api\/admin\/billing\/agency\/[^/]+\/apply-tier(?:\/cancel)?$/.test(path)));
   }
   async function prepare({ path, method, body, token }) {
     if (!isCommand(path, method)) return null;
@@ -44,7 +44,7 @@
     if (!pending) return { ok: true, pending: false };
     const res = await fetch(`/api/admin/commands/${pending.commandId}`, { headers: { Authorization: `Bearer ${token}` } });
     const data = await res.json();
-    if (res.ok && data.commandId === pending.commandId && ["SUCCEEDED", "REJECTED"].includes(data.status)) { set(key, null); return { ...data, pending: false }; }
+    if (res.ok && data.commandId === pending.commandId && (["SUCCEEDED", "REJECTED"].includes(data.status) || data.result?.accepted === true)) { set(key, null); return { ...data, pending: false }; }
     return { ...data, pending: true, commandId: pending.commandId };
   }
   function redact(value, key = "") {
