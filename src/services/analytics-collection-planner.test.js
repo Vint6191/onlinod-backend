@@ -44,6 +44,7 @@ function addSweepLeaseStore(db) {
       if (where.ownerToken && lease.ownerToken !== where.ownerToken) return { count: 0 };
       if (where.cycleKey && lease.cycleKey !== where.cycleKey) return { count: 0 };
       if (where.completedAt === null && lease.completedAt != null) return { count: 0 };
+      if (where.leaseUntil?.gt && !(lease.leaseUntil > where.leaseUntil.gt)) return { count: 0 };
       lease = { ...lease, ...data, updatedAt: new Date() };
       return { count: 1 };
     },
@@ -96,6 +97,8 @@ function addDemandStore(db) {
       if (where.claimToken && current.claimToken !== where.claimToken) return { count: 0 };
       if (where.claimedRevision != null && Number(current.claimedRevision) !== Number(where.claimedRevision)) return { count: 0 };
       if (where.completedAt === null && current.completedAt != null) return { count: 0 };
+      if (where.claimUntil?.gt && !(current.claimUntil > where.claimUntil.gt)) return { count: 0 };
+      if (where.quarantinedAt === null && current.quarantinedAt != null) return { count: 0 };
       rows.set(where.key, { ...current, ...data, updatedAt: new Date() });
       return { count: 1 };
     },
@@ -116,6 +119,103 @@ function addDemandStore(db) {
     all: () => [...rows.values()].map((row) => ({ ...row })),
   };
 }
+
+for (const operation of ["renew", "complete"]) {
+  test(`Analytics ${operation} rejects an expired owner even without a replacement`, async () => {
+    const db = {};
+    const store = addSweepLeaseStore(db);
+    const now = new Date("2026-09-08T14:59:00Z");
+    const claim = await planner.claimAnalyticsSweepCycle({ db, now, leaseNow: now, ownerToken: "old", leaseMs: 1000 });
+    const before = store.get();
+    const expired = new Date(now.getTime() + 1000);
+    const args = { db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: "must-not-commit", leaseNow: expired, completedAt: expired };
+    const result = operation === "renew" ? await planner.renewAnalyticsSweepLease(args) : await planner.completeAnalyticsSweepCycle(args);
+    assert.equal(result, false);
+    assert.deepEqual(store.get(), before);
+  });
+}
+
+test("Analytics restart across hours preserves unfinished cursor and original cycle time", async () => {
+  const db = {};
+  addSweepLeaseStore(db);
+  const now = new Date("2026-09-08T14:00:00Z");
+  const first = await planner.claimAnalyticsSweepCycle({ db, now, leaseNow: now, ownerToken: "old" });
+  await planner.renewAnalyticsSweepLease({ db, ...first, leaseNow: now, cursorCreatorId: "creator-500" });
+  const restartAt = new Date("2026-09-08T16:00:00Z");
+  const recovered = await planner.claimAnalyticsSweepCycle({ db, now: restartAt, leaseNow: restartAt, ownerToken: "replacement" });
+  assert.equal(recovered.acquired, true);
+  assert.equal(recovered.cursorCreatorId, "creator-500");
+  assert.equal(recovered.cycleKey, first.cycleKey);
+  assert.deepEqual(recovered.cycleNow, first.cycleNow);
+  assert.equal(await planner.completeAnalyticsSweepCycle({ db, ...recovered, completedAt: restartAt }), true);
+  const next = await planner.claimAnalyticsSweepCycle({ db, now: restartAt, leaseNow: restartAt, ownerToken: "next" });
+  assert.equal(next.cycleKey, "2026-09-08T16:00:00.000Z");
+  assert.equal(next.cursorCreatorId, null);
+});
+
+for (const operation of ["renew", "complete", "quarantine"]) {
+  test(`Home demand ${operation} rejects expiry without changing durable state`, async () => {
+    const db = {};
+    const store = addDemandStore(db);
+    const now = new Date("2026-09-08T14:00:00Z");
+    await planner.enqueueAgencyAnalyticsFreshnessDemand({ db, agencyId: "agency-1", ...DEMAND_ACTOR, now });
+    const demand = await planner.claimNextAnalyticsDemand({ db, now, ownerToken: "old" });
+    const before = store.get(demand.key);
+    const expired = new Date(now.getTime() + planner.DEMAND_LEASE_MS);
+    if (operation === "renew") {
+      assert.equal(await planner.renewAnalyticsDemandLease({ db, ...demand, now: expired }), false);
+    } else {
+      const error = operation === "quarantine" ? Object.assign(new Error("bad range"), { code: "ANALYTICS_DEMAND_RANGE_INVALID" }) : null;
+      assert.deepEqual(await planner.settleAnalyticsDemand({ db, demand, completedAt: expired, error }), { settled: false, reason: "claim_lost" });
+    }
+    assert.deepEqual(store.get(demand.key), before);
+  });
+}
+
+test("Analytics lease checks database time after waiting for the row lock", async () => {
+  const db = {};
+  addSweepLeaseStore(db);
+  const now = new Date("2026-09-08T14:00:00Z");
+  const claim = await planner.claimAnalyticsSweepCycle({ db, now, leaseNow: now, ownerToken: "old", leaseMs: 1000 });
+  let clock = now;
+  const events = [];
+  db.$queryRawUnsafe = async (sql) => {
+    if (/FOR UPDATE/.test(sql)) { events.push("lock"); clock = new Date(now.getTime() + 1000); return [{ key: planner.SWEEP_LEASE_KEY }]; }
+    assert.match(sql, /clock_timestamp/);
+    events.push("clock");
+    return [{ authorityNow: clock }];
+  };
+  assert.equal(await planner.renewAnalyticsSweepLease({ db, ...claim, leaseNow: now }), false);
+  assert.deepEqual(events, ["lock", "clock"]);
+});
+
+test("Home claim re-reads completion after locking its selected candidate", async () => {
+  const db = {};
+  addDemandStore(db);
+  const now = new Date("2026-09-08T14:00:00Z");
+  const queued = await planner.enqueueAgencyAnalyticsFreshnessDemand({ db, agencyId: "agency-1", ...DEMAND_ACTOR, now });
+  db.$queryRawUnsafe = async (sql) => {
+    if (/FOR UPDATE/.test(sql)) {
+      await db.analyticsCollectionDemand.update({ where: { key: queued.key }, data: { completedAt: now } });
+      return [{ key: queued.key }];
+    }
+    assert.match(sql, /clock_timestamp/);
+    return [{ authorityNow: now }];
+  };
+  assert.equal(await planner.claimNextAnalyticsDemand({ db, now }), null);
+});
+
+test("Home sweep reports processing failure instead of a healthy success", async () => {
+  const db = {};
+  addDemandStore(db);
+  addDemandAuthority(db);
+  const now = new Date("2026-09-08T14:00:00Z");
+  await planner.enqueueAgencyAnalyticsFreshnessDemand({ db, agencyId: "agency-1", ...DEMAND_ACTOR, now });
+  db.creatorAccount = { findMany: async () => { throw Object.assign(new Error("database unavailable"), { code: "P1001" }); } };
+  const result = await planner.runAnalyticsCollectionDemandSweep({ db, now, maxDemands: 1 });
+  assert.equal(result.ok, false);
+  assert.equal(result.failures, 1);
+});
 
 test("operational freshness window covers today plus the previous 30 fully closed UTC days", () => {
   const window = planner.operationalFreshnessWindow(new Date("2026-09-08T14:00:00.000Z"));
@@ -422,8 +522,8 @@ test("next UTC-hour analytics cycle cannot preempt a still-live previous cycle l
     leaseNow: new Date("2026-09-08T15:16:00.000Z"),
   });
   assert.equal(afterExpiry.acquired, true);
-  assert.equal(afterExpiry.reason, "new_cycle_claimed");
-  assert.equal(afterExpiry.cycleKey, "2026-09-08T15:00:00.000Z");
+  assert.equal(afterExpiry.reason, "previous_cycle_recovered");
+  assert.equal(afterExpiry.cycleKey, first.cycleKey);
 });
 
 

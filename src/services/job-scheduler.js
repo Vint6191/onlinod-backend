@@ -1963,6 +1963,7 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
       db,
       now,
       leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
+      leaseNow: now,
       coordinationLockKey: CREATOR_ANALYTICS_SWEEP_COORDINATION_LOCK_KEY,
       leaseMs: CREATOR_ANALYTICS_SWEEP_LEASE_MS,
     });
@@ -2026,6 +2027,7 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
         cycleKey: claim.cycleKey,
         cursorCreatorId: cursor,
         leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
+        leaseNow: now,
         leaseMs: CREATOR_ANALYTICS_SWEEP_LEASE_MS,
       });
       if (!renewed) {
@@ -2074,6 +2076,7 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
             cycleKey: claim.cycleKey,
             cursorCreatorId: cursor,
             leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
+            leaseNow: now,
             leaseMs: CREATOR_ANALYTICS_SWEEP_LEASE_MS,
           });
           if (!heartbeat) {
@@ -2088,6 +2091,7 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
         cycleKey: claim.cycleKey,
         cursorCreatorId: cursor,
         leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
+        leaseNow: now,
         leaseMs: CREATOR_ANALYTICS_SWEEP_LEASE_MS,
       });
       if (!pageRenewed) {
@@ -2113,6 +2117,7 @@ async function runCreatorAnalyticsCatchupSweep({ db = prisma, now = new Date(), 
       cycleKey: claim.cycleKey,
       cursorCreatorId: cursor,
       leaseKey: CREATOR_ANALYTICS_SWEEP_LEASE_KEY,
+      completedAt: now,
     });
     if (!completed) {
       return { ok: false, skipped: true, reason: "cycle_completion_lost", cycleKey: claim.cycleKey, creators, pages, jobsCreated, jobsSkipped, failures, providerCapacityDebt };

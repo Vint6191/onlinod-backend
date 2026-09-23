@@ -4,6 +4,61 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
+
+test("A36 PostgreSQL: Analytics expiry fences progress and settlement while restart preserves the unfinished cycle", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const planner = require("./analytics-collection-planner");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const key = nonce("a36-analytics-lease");
+  const demandKey = `${key}-demand`;
+  try {
+    const [{ authorityNow }] = await dbA.$queryRawUnsafe('SELECT clock_timestamp() AS "authorityNow"');
+    const past = new Date(authorityNow.getTime() - 1000);
+    const originalTime = new Date(authorityNow.getTime() - 2 * 60 * 60 * 1000);
+    const originalCycle = planner.sweepCycleKey(originalTime);
+    await dbA.analyticsCollectionLease.create({ data: {
+      key, ownerToken: "expired-owner", cycleKey: originalCycle, cycleNow: originalTime,
+      cursorCreatorId: "completed-creator-500", leaseUntil: past,
+    } });
+    const stale = { db: dbA, leaseKey: key, ownerToken: "expired-owner", cycleKey: originalCycle, cursorCreatorId: "must-not-commit" };
+    assert.equal(await planner.renewAnalyticsSweepLease(stale), false);
+    assert.equal(await planner.completeAnalyticsSweepCycle(stale), false);
+    const recovered = await planner.claimAnalyticsSweepCycle({ db: dbB, leaseKey: key, coordinationLockKey: key, ownerToken: "replacement" });
+    assert.equal(recovered.reason, "previous_cycle_recovered");
+    assert.equal(recovered.cursorCreatorId, "completed-creator-500");
+    assert.equal(recovered.cycleKey, originalCycle);
+    assert.equal(recovered.cycleNow.getTime(), originalTime.getTime());
+    assert.equal(await planner.completeAnalyticsSweepCycle(stale), false);
+    assert.equal(await planner.completeAnalyticsSweepCycle({ db: dbB, leaseKey: key, ...recovered }), true);
+
+    const demand = await dbA.analyticsCollectionDemand.create({ data: {
+      key: demandKey, agencyId: `${key}-agency`, rangeKey: "7d", coverageFrom: originalTime, coverageTo: authorityNow,
+      reason: "INTERACTIVE_REFRESH", requestedByMemberId: `${key}-member`, requestedAccessEpoch: 1,
+      requestedAt: authorityNow, requestRevision: 1, claimedRevision: 1, claimToken: "expired-demand", claimUntil: past,
+    } });
+    const before = await dbA.analyticsCollectionDemand.findUnique({ where: { key: demandKey } });
+    assert.equal(await planner.renewAnalyticsDemandLease({ db: dbA, ...demand }), false);
+    for (const error of [null, Object.assign(new Error("bad range"), { code: "ANALYTICS_DEMAND_RANGE_INVALID" })]) {
+      assert.deepEqual(await planner.settleAnalyticsDemand({ db: dbA, demand, error }), { settled: false, reason: "claim_lost" });
+    }
+    assert.deepEqual(await dbA.analyticsCollectionDemand.findUnique({ where: { key: demandKey } }), before);
+    const [{ authorityNow: takeoverNow }] = await dbB.$queryRawUnsafe('SELECT clock_timestamp() AS "authorityNow"');
+    const replacement = await dbB.analyticsCollectionDemand.update({ where: { key: demandKey }, data: {
+      claimToken: "replacement-demand", claimUntil: new Date(takeoverNow.getTime() + planner.DEMAND_LEASE_MS),
+    } });
+    assert.equal((await planner.settleAnalyticsDemand({ db: dbA, demand })).settled, false);
+    assert.equal((await planner.settleAnalyticsDemand({ db: dbB, demand: replacement })).completed, true);
+    console.log("# A36_ANALYTICS_COORDINATOR_EXPIRY_CONTINUITY_PASS");
+  } finally {
+    try {
+      await dbA.analyticsCollectionDemand.deleteMany({ where: { key: demandKey } });
+      await dbA.analyticsCollectionLease.deleteMany({ where: { key } });
+    } finally {
+      await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect()]);
+    }
+  }
+});
 const {
   pinPhase3AuditSchema,
   withPhase3PostgresFixtureAuthority,

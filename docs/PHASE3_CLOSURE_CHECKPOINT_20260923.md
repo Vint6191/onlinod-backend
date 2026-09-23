@@ -1,4 +1,58 @@
-# Phase 3 — closure continues, 2026-09-23
+# Phase 3 — текущий checkpoint: Analytics coordinator, 2026-09-23
+
+**SOURCE OPEN / SCALE OPEN.** Прежний Render blocker снят; обнаружены нарушения протокола владения и отдельный архитектурный блокер масштаба. Этот delta исправляет владение и восстановление. Он не объявляет Phase 3 закрытой.
+
+Текущий actual: `onlinod-backend-main - 2026-09-23T155943.875.zip`, SHA-256 `ef61552692436a3ee989a8b387221d0ecc946d0aae07532ecbd869cb2348bb7f`. Он побайтово совпал с предыдущим исправленным Backend. ZIP текущей итерации содержит только изменения относительно этого actual; прежние 13 исправленных файлов повторно целиком не выдаются.
+
+Успешный Render checkout `2367e87b7f6bdfb35159413c6f585c5408fb2df6`: прежние 40 offline проверок и 180 физических проверок (60 clean / 60 rolling / 60 seeded) прошли; fixture leaks отсутствуют, primary migrations завершены, DomainWork topology ACTIVE, gate ok=true, service live. Этот результат относится к предыдущему source. Новое изменение ещё требует физического proof.
+
+## Подтверждённые причины и реализованный протокол
+
+- `analytics-collection-planner.js`: heartbeat и completion проверяли token/cycle/revision, но не истечение lease. Старый worker мог оживить истёкшую аренду, сохранить cursor, завершить demand или отправить его в quarantine до появления нового владельца.
+- Разные advisory locks у demand claim и enqueue/settlement не сериализовали один ряд. Claim мог использовать уже изменившийся revision/state. Все операции теперь берут один row lock, затем читают PostgreSQL clock и актуальный ряд; settlement/heartbeat требуют ещё живой lease. Предикаты renewal/completion также содержат expiry fence.
+- Lease, истёкший в следующем UTC-часе, сбрасывал незавершённый cursor. Теперь takeover сохраняет исходный cycleKey/cycleNow/cursor; следующий цикл начинается после завершения прежнего. Это относится и к Earnings, и к Creator Analytics.
+- Home sweep проглатывал processing failure/claim loss и возвращал ok=true. Теперь bounded результат содержит failures/errors и ok=false, чтобы scheduler health видел деградацию.
+- Все production writes этих двух Prisma моделей в `src` найдены в этом сервисе. Lock order: advisory lock при необходимости → row lock → DB clock → conditional transition. Heartbeat берёт только row lock. Локальный fallback now используется только адаптерами без raw SQL; production каждый раз читает текущий DB clock.
+
+Граница исправления: это fencing прогресса/завершения координатора. Оно не доказывает, что каждая создаваемая задача коммитится под тем же lease, и не устраняет глобальные обходы. Существующая per-creator/window idempotency остаётся отдельной защитой повторного планирования.
+
+## Проверки текущего delta
+
+- До production-изменения: новый набор воспроизвёл 10 падений (9 новых regressions и исправленное ожидание восстановления через границу часа).
+- После: Analytics planner 31/31; расширенный целевой набор 80/80.
+- Syntax/no-undef gate: 89 файлов; Prisma contract scan: 360 файлов, нарушений нет.
+- Дополнительный physical test проверяет expiry без takeover, неизменность состояния после stale completion/quarantine, сохранение cursor/cycle через смену часа, fencing старого token после takeover и completion действующим владельцем через два Prisma clients.
+- Pinned manifest A36-R3: 13 файлов, 61 тест на сценарий, 183 суммарно; SHA-256 `eee216ba1f281ad6d43edebe784f59ef60418e1e2451d5e353bf115bcff8ecf8`. Прежние 60 проверок сохранены; новый physical test не заменён mock-проверкой.
+- A29 pre-DB gate теперь включает также Analytics planner и guard версии physical manifest. Локальный PostgreSQL недоступен: новая физическая проверка здесь не выполнена.
+
+Финальные числа общего и pre-DB набора записаны в `docs/PHASE3_ANALYTICS_COORDINATOR_CHECKPOINT_20260923.txt`. Исходные 103 падения общего набора не объявлены устранёнными: часть относится к старым Team/E2E mocks, retired APIs, whitespace-sensitive schema assertions и внешним Desktop paths. Это требует отдельной привязки к актуальным контрактам, а не массовой замены expectations.
+
+## Оставшийся узел и production architecture следующего изменения
+
+| Граница | Fresh-source evidence | Условие closure |
+| --- | --- | --- |
+| Earnings recurring | `runAnalyticsCollectionSweep`: все READY creators под одним lease; страницы ограничены, весь запуск — нет | Durable per-creator due work, ограниченный batch/time budget, fair agency admission, восстановление независимо от глобального cursor |
+| Creator Analytics | `runCreatorAnalyticsCatchupSweep`: глобальный обход; ошибка creator увеличивает failures, cursor идёт дальше, цикл может завершиться с ok=true | Долг не теряется: отдельный durable retry/backoff/quarantine на creator; ошибка видна в health; bounded planning commits |
+| Campaign discovery | `selectCampaignDirectoryDiscoveryAdmissions`: перебор due rows может пройти весь набор, если кандидаты заняты | Индексируемый due admission с durable continuation/fairness; лимит просмотренных строк без starvation хвоста |
+| Home demand | `processAnalyticsDemand`: один demand может пройти всю agency за один вызов | Durable chunk/continuation, ограниченное время владения и честное yield; revision/access checks сохраняются на каждом chunk |
+| Capacity projection | `readCanonicalCapacityInputs`: глобальные агрегаты по current collection/demand/job state | Поддерживаемые инкрементально rebuildable projections; bounded dirty repair, reconciliation вне hot path |
+| Scheduler | Analytics global lanes исполняются последовательно перед остальной recurring работой | Отдельные bounded lanes; медленный creator/agency не блокирует остальные домены |
+
+Следующий implementation должен провести эти связанные planners через единый durable due-work lifecycle: один creator/domain work item → bounded claim → commit planning under live ownership → yield/retry/complete. Включить creator/agency lifecycle, backfill существующих READY creators, generation-aware rollout, удаление прежних global planners, индексы, restart/expiry/partial failure tests и per-agency fairness. Нельзя просто добавить LIMIT в старый цикл: без durable continuation это создаст starvation. Нельзя оставлять старый global writer рядом с новой очередью.
+
+До cutover необходимо проверить пригодность существующего `DomainWorkItem` для этих work classes и точные транзакционные границы planner. Эта часть — целевая архитектура, ещё не реализованный факт. Уже существующий bounded `CREATOR_RECURRING_PLANNING` lane не заменяет Earnings/Creator Analytics lanes.
+
+SCALE proof: сочетание many agencies × many creators, крупная история, 100 workers, несколько replicas; оценивать scanned rows, query count/time, locks, retry debt и максимальное ожидание agency. Прежние 1000 agencies × 4 creators и отдельно 4 agencies × 1000 creators не доказывают одновременный большой размер обеих осей. Для этой границы нужно также доказать конкурентные enqueue/claim/settlement и expiration при ожидании row lock на PostgreSQL; unit interleaving не заменяет такой proof.
+
+Master roadmap: остаёмся в Phase 3 / Analytics planning closure. Прежний Render proof blocker CLOSED; Analytics coordinator correction IMPLEMENTED / PHYSICAL PROOF PENDING; global planning и capacity scale OPEN. Новый project-wide resweep понадобится после изменения общей очереди/schema/access. Другие функциональные узлы сейчас не переписываются.
+
+## Применение
+
+Распаковать delta поверх текущего Backend с сохранением путей. Удалений, изменений Prisma schema, миграций, зависимостей и Desktop в этом delta нет. Команда остаётся `npm install && npm run audit:phase3-a29-render`. Это deploy gate: после успешного disposable proof он запускает миграции primary DB. Новый ожидаемый physical результат — 61/61 во всех трёх сценариях, ноль skips/leaks, затем успешный gate. Даже этот результат не закрывает перечисленные SCALE-блокеры.
+
+Ниже сохранён **исторический checkpoint предыдущего delta**. Его исходный actual, числа тестов и статус ожидания proof относятся только к прежней итерации; актуальный статус находится выше.
+
+# История: исправление Render proof contract
 
 Статус: исправление реализовано; локальные проверки выполнены. **SOURCE CLOSED / SCALE CLOSED не объявлены.** Исправленный физический proof на PostgreSQL ещё не выполнен.
 

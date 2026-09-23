@@ -60,6 +60,21 @@ function sweepCycleKey(now) {
   return new Date(bucketTimestamp(current, SWEEP_CYCLE_MS)).toISOString();
 }
 
+// Every writer locks the same row before observing PostgreSQL time. An
+// advisory lock alone is insufficient: claim, enqueue and heartbeat have
+// different advisory scopes, and waiting for a row can outlive a lease.
+async function lockSweepLease(tx, key) {
+  if (typeof tx?.$queryRawUnsafe === "function") {
+    await tx.$queryRawUnsafe('SELECT "key" FROM "AnalyticsCollectionLease" WHERE "key" = $1 FOR UPDATE', key);
+  }
+}
+
+async function lockDemand(tx, key) {
+  if (typeof tx?.$queryRawUnsafe === "function") {
+    await tx.$queryRawUnsafe('SELECT "key" FROM "AnalyticsCollectionDemand" WHERE "key" = $1 FOR UPDATE', key);
+  }
+}
+
 async function claimAnalyticsSweepCycle({
   db,
   now,
@@ -75,6 +90,7 @@ async function claimAnalyticsSweepCycle({
     db,
     key: coordinationLockKey,
     work: async (tx) => {
+      await lockSweepLease(tx, leaseKey);
       const hasDbClock = typeof tx?.$queryRawUnsafe === "function";
       const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
       const currentNow = authorityNow;
@@ -110,11 +126,9 @@ async function claimAnalyticsSweepCycle({
         return { acquired: true, reason: "cycle_lease_recovered", ownerToken, cycleKey, cycleNow: asDate(row.cycleNow) || currentNow, cursorCreatorId: row.cursorCreatorId || null };
       }
 
-      // A new UTC-hour cycle must never preempt a still-live previous cycle.
-      // Otherwise two replicas can overlap around the hour boundary until the
-      // old owner notices its token was replaced. Keep exactly one active
-      // analytics sweep globally; a new cycle may start only after the prior
-      // owner completed or its lease actually expired.
+      // A new UTC hour must neither preempt a live owner nor discard the
+      // unfinished cursor after expiry. Otherwise repeated restarts starve
+      // the tail of the catalog. Finish the old cycle before starting another.
       const previousLeaseUntil = asDate(existing.leaseUntil);
       if (!existing.completedAt && previousLeaseUntil && previousLeaseUntil > wallNow) {
         return {
@@ -126,6 +140,14 @@ async function claimAnalyticsSweepCycle({
           cursorCreatorId: existing.cursorCreatorId || null,
           activeCycleKey: String(existing.cycleKey),
         };
+      }
+
+      if (!existing.completedAt) {
+        const row = await tx.analyticsCollectionLease.update({
+          where: { key: leaseKey },
+          data: { ownerToken, leaseUntil },
+        });
+        return { acquired: true, reason: "previous_cycle_recovered", ownerToken, cycleKey: String(row.cycleKey), cycleNow: asDate(row.cycleNow) || currentNow, cursorCreatorId: row.cursorCreatorId || null };
       }
 
       const row = await tx.analyticsCollectionLease.update({
@@ -149,9 +171,10 @@ async function renewAnalyticsSweepLease({
   const fallbackNow = asDate(leaseNow);
   if (!fallbackNow) throw new Error("ANALYTICS_SWEEP_CLOCK_INVALID");
   return runDbTransaction(db, async (tx) => {
+    await lockSweepLease(tx, leaseKey);
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     const result = await tx.analyticsCollectionLease.updateMany({
-      where: { key: leaseKey, ownerToken, cycleKey, completedAt: null },
+      where: { key: leaseKey, ownerToken, cycleKey, completedAt: null, leaseUntil: { gt: authorityNow } },
       data: { cursorCreatorId: cursorCreatorId || null, leaseUntil: new Date(authorityNow.getTime() + leaseMs) },
     });
     return Number(result?.count || 0) === 1;
@@ -169,9 +192,10 @@ async function completeAnalyticsSweepCycle({
   const fallbackNow = asDate(completedAt);
   if (!fallbackNow) throw new Error("ANALYTICS_SWEEP_CLOCK_INVALID");
   return runDbTransaction(db, async (tx) => {
+    await lockSweepLease(tx, leaseKey);
     const finishedAt = await dbAuthorityNow({ db: tx, fallbackNow });
     const result = await tx.analyticsCollectionLease.updateMany({
-      where: { key: leaseKey, ownerToken, cycleKey, completedAt: null },
+      where: { key: leaseKey, ownerToken, cycleKey, completedAt: null, leaseUntil: { gt: finishedAt } },
       data: { cursorCreatorId: cursorCreatorId || null, leaseUntil: finishedAt, completedAt: finishedAt },
     });
     return Number(result?.count || 0) === 1;
@@ -601,6 +625,8 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
     db,
     key: demandLockKey(key),
     work: async (tx) => {
+      await lockDemand(tx, key);
+      const mutationNow = await dbAuthorityNow({ db: tx, fallbackNow });
       const existing = await tx.analyticsCollectionDemand.findUnique({ where: { key } });
       if (!existing) {
         const row = await tx.analyticsCollectionDemand.create({
@@ -617,13 +643,13 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
             requestedAccessEpoch: actorAccessEpoch,
             requestRevision: 1,
             completedRevision: 0,
-            requestedAt: currentNow,
+            requestedAt: mutationNow,
             completedAt: null,
           },
         });
         return { queued: true, coalesced: false, key, rangeKey: range.rangeKey, requestRevision: row.requestRevision };
       }
-      const claimAlive = Boolean(existing.claimToken && asDate(existing.claimUntil) && asDate(existing.claimUntil) > currentNow);
+      const claimAlive = Boolean(existing.claimToken && asDate(existing.claimUntil) && asDate(existing.claimUntil) > mutationNow);
       const row = await tx.analyticsCollectionDemand.update({
         where: { key },
         data: {
@@ -636,7 +662,7 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
           requestedByMemberId: actorMemberId,
           requestedAccessEpoch: actorAccessEpoch,
           requestRevision: Number(existing.requestRevision || 0) + 1,
-          requestedAt: currentNow,
+          requestedAt: mutationNow,
           completedAt: null,
           attempts: 0,
           nextAttemptAt: null,
@@ -660,7 +686,7 @@ async function claimNextAnalyticsDemand({ db = prisma, now = new Date(), ownerTo
     key: DEMAND_CLAIM_LOCK_KEY,
     work: async (tx) => {
       const currentNow = await dbAuthorityNow({ db: tx, fallbackNow });
-      const row = await tx.analyticsCollectionDemand.findFirst({
+      const candidate = await tx.analyticsCollectionDemand.findFirst({
         where: {
           completedAt: null,
           quarantinedAt: null,
@@ -671,13 +697,19 @@ async function claimNextAnalyticsDemand({ db = prisma, now = new Date(), ownerTo
         },
         orderBy: [{ priority: "desc" }, { requestedAt: "asc" }, { key: "asc" }],
       });
-      if (!row) return null;
+      if (!candidate) return null;
+      await lockDemand(tx, candidate.key);
+      const claimNow = await dbAuthorityNow({ db: tx, fallbackNow });
+      const row = await tx.analyticsCollectionDemand.findUnique({ where: { key: candidate.key } });
+      if (!row || row.completedAt || row.quarantinedAt
+        || (asDate(row.claimUntil) && asDate(row.claimUntil) > claimNow)
+        || (asDate(row.nextAttemptAt) && asDate(row.nextAttemptAt) > claimNow)) return null;
       const resumeSameRevision = Number(row.claimedRevision || 0) === Number(row.requestRevision || 0);
       const claimed = await tx.analyticsCollectionDemand.update({
         where: { key: row.key },
         data: {
           claimToken: ownerToken,
-          claimUntil: new Date(currentNow.getTime() + DEMAND_LEASE_MS),
+          claimUntil: new Date(claimNow.getTime() + DEMAND_LEASE_MS),
           claimedRevision: row.requestRevision,
           cursorCreatorId: resumeSameRevision ? row.cursorCreatorId : null,
         },
@@ -691,9 +723,10 @@ async function renewAnalyticsDemandLease({ db = prisma, key, claimToken, claimed
   const fallbackNow = asDate(now);
   if (!fallbackNow) throw new Error("ANALYTICS_DEMAND_CLOCK_INVALID");
   return runDbTransaction(db, async (tx) => {
+    await lockDemand(tx, key);
     const currentNow = await dbAuthorityNow({ db: tx, fallbackNow });
     const result = await tx.analyticsCollectionDemand.updateMany({
-      where: { key, claimToken, claimedRevision, completedAt: null },
+      where: { key, claimToken, claimedRevision, completedAt: null, quarantinedAt: null, claimUntil: { gt: currentNow } },
       data: { cursorCreatorId: cursorCreatorId || null, claimUntil: new Date(currentNow.getTime() + DEMAND_LEASE_MS) },
     });
     return Number(result?.count || 0) === 1;
@@ -737,9 +770,11 @@ async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Da
     db,
     key: demandLockKey(demand.key),
     work: async (tx) => {
+      await lockDemand(tx, demand.key);
       const finishedAt = await dbAuthorityNow({ db: tx, fallbackNow });
       const current = await tx.analyticsCollectionDemand.findUnique({ where: { key: demand.key } });
-      if (!current || current.claimToken !== demand.claimToken || Number(current.claimedRevision) !== Number(demand.claimedRevision)) {
+      if (!current || current.claimToken !== demand.claimToken || Number(current.claimedRevision) !== Number(demand.claimedRevision)
+        || current.completedAt || current.quarantinedAt || !(asDate(current.claimUntil) > finishedAt)) {
         return { settled: false, reason: "claim_lost" };
       }
       // Revision authority outranks the outcome of an older claimed pass. A
@@ -863,7 +898,7 @@ async function processAnalyticsDemand({ db = prisma, demand, pageSize = DEMAND_P
   const authority = await resolveAnalyticsDemandExecutionScope({ db, demand });
   if (!authority.authorized) {
     const settled = await settleAnalyticsDemand({
-      db, demand, completedAt: new Date(), cancellationReason: authority.reason,
+      db, demand, completedAt: now, cancellationReason: authority.reason,
     });
     return { ok: settled.settled, settled, creators, pages, created, reused, dueDays, accessDenied: true };
   }
@@ -871,12 +906,12 @@ async function processAnalyticsDemand({ db = prisma, demand, pageSize = DEMAND_P
   for (;;) {
     if (!await analyticsDemandAccessFenceCurrent({ db, demand })) {
       const settled = await settleAnalyticsDemand({
-        db, demand, completedAt: new Date(), cancellationReason: "ANALYTICS_DEMAND_ACCESS_EPOCH_CHANGED",
+        db, demand, completedAt: now, cancellationReason: "ANALYTICS_DEMAND_ACCESS_EPOCH_CHANGED",
       });
       return { ok: settled.settled, settled, creators, pages, created, reused, dueDays, accessDenied: true };
     }
     const alive = await renewAnalyticsDemandLease({
-      db, key: demand.key, claimToken: demand.claimToken, claimedRevision: demand.claimedRevision, cursorCreatorId: cursor,
+      db, key: demand.key, claimToken: demand.claimToken, claimedRevision: demand.claimedRevision, cursorCreatorId: cursor, now,
     });
     if (!alive) return { ok: false, reason: "demand_claim_lost", creators, pages, created, reused, dueDays };
     const rows = await db.creatorAccount.findMany({
@@ -932,19 +967,19 @@ async function processAnalyticsDemand({ db = prisma, demand, pageSize = DEMAND_P
       if ((index + 1) % 25 === 0 && index + 1 < rows.length) {
         if (!await analyticsDemandAccessFenceCurrent({ db, demand })) {
           const settled = await settleAnalyticsDemand({
-            db, demand, completedAt: new Date(), cancellationReason: "ANALYTICS_DEMAND_ACCESS_EPOCH_CHANGED",
+            db, demand, completedAt: now, cancellationReason: "ANALYTICS_DEMAND_ACCESS_EPOCH_CHANGED",
           });
           return { ok: settled.settled, settled, creators, pages, created, reused, dueDays, accessDenied: true };
         }
         const heartbeat = await renewAnalyticsDemandLease({
-          db, key: demand.key, claimToken: demand.claimToken, claimedRevision: demand.claimedRevision, cursorCreatorId: cursor,
+          db, key: demand.key, claimToken: demand.claimToken, claimedRevision: demand.claimedRevision, cursorCreatorId: cursor, now,
         });
         if (!heartbeat) return { ok: false, reason: "demand_claim_lost", creators, pages, created, reused, dueDays };
       }
     }
     if (rows.length < size) break;
   }
-  const settled = await settleAnalyticsDemand({ db, demand, completedAt: new Date() });
+  const settled = await settleAnalyticsDemand({ db, demand, completedAt: now });
   return { ok: settled.settled, settled, creators, pages, created, reused, dueDays };
 }
 
@@ -952,23 +987,30 @@ async function runAnalyticsCollectionDemandSweep({ db = prisma, now = new Date()
   if (demandSweepPromise) return { ok: true, skipped: true, reason: "in_process_demand_sweep_in_flight" };
   demandSweepPromise = (async () => {
     const limit = Math.max(1, Math.min(20, Number(maxDemands) || DEMAND_MAX_PER_SWEEP));
-    const totals = { demands: 0, creators: 0, pages: 0, created: 0, reused: 0, dueDays: 0 };
+    const totals = { demands: 0, creators: 0, pages: 0, created: 0, reused: 0, dueDays: 0, failures: 0 };
+    const errors = [];
     for (let index = 0; index < limit; index += 1) {
-      const demand = await claimNextAnalyticsDemand({ db, now: index === 0 ? now : new Date() });
+      const demand = await claimNextAnalyticsDemand({ db, now });
       if (!demand) break;
       totals.demands += 1;
       try {
-        const result = await processAnalyticsDemand({ db, demand, pageSize, now: index === 0 ? now : new Date() });
+        const result = await processAnalyticsDemand({ db, demand, pageSize, now });
         totals.creators += result.creators || 0;
         totals.pages += result.pages || 0;
         totals.created += result.created || 0;
         totals.reused += result.reused || 0;
         totals.dueDays += result.dueDays || 0;
+        if (!result.ok) {
+          totals.failures += 1;
+          errors.push({ key: demand.key, reason: result.reason || result.settled?.reason || "demand_processing_failed" });
+        }
       } catch (error) {
-        await settleAnalyticsDemand({ db, demand, completedAt: new Date(), error });
+        const settled = await settleAnalyticsDemand({ db, demand, completedAt: now, error });
+        totals.failures += 1;
+        errors.push({ key: demand.key, reason: analyticsDemandError(error).code, settled });
       }
     }
-    return { ok: true, skipped: false, ...totals };
+    return { ok: totals.failures === 0, skipped: false, ...totals, ...(totals.failures ? { reason: "analytics_demand_processing_failed", errors } : {}) };
   })();
   try {
     return await demandSweepPromise;
@@ -981,7 +1023,7 @@ async function runAnalyticsCollectionSweep({ db = prisma, now = new Date(), page
   if (sweepPromise) return { ok: true, skipped: true, reason: "in_process_sweep_in_flight" };
   sweepPromise = (async () => {
     const requestedNow = asDate(now) || new Date();
-    const claim = await claimAnalyticsSweepCycle({ db, now: requestedNow });
+    const claim = await claimAnalyticsSweepCycle({ db, now: requestedNow, leaseNow: requestedNow });
     if (!claim.acquired) {
       return { ok: true, skipped: true, reason: claim.reason, cycleKey: claim.cycleKey };
     }
@@ -997,7 +1039,7 @@ async function runAnalyticsCollectionSweep({ db = prisma, now = new Date(), page
     let dueDays = 0;
     for (;;) {
       const leaseAlive = await renewAnalyticsSweepLease({
-        db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: cursor,
+        db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: cursor, leaseNow: requestedNow,
       });
       if (!leaseAlive) {
         return { ok: false, skipped: true, reason: "cycle_lease_lost", cycleKey: claim.cycleKey, creators, pages, created, reused, dueDays, pageSize: size };
@@ -1052,7 +1094,7 @@ async function runAnalyticsCollectionSweep({ db = prisma, now = new Date(), page
         // reservation still makes that replay provider-write-free.
         if ((index + 1) % 25 === 0 && index + 1 < rows.length) {
           const heartbeat = await renewAnalyticsSweepLease({
-            db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: creator.id,
+            db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: creator.id, leaseNow: requestedNow,
           });
           if (!heartbeat) {
             return { ok: false, skipped: true, reason: "cycle_lease_lost", cycleKey: claim.cycleKey, creators, pages, created, reused, dueDays, pageSize: size };
@@ -1060,14 +1102,14 @@ async function runAnalyticsCollectionSweep({ db = prisma, now = new Date(), page
         }
       }
       const renewed = await renewAnalyticsSweepLease({
-        db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: cursor,
+        db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: cursor, leaseNow: requestedNow,
       });
       if (!renewed) {
         return { ok: false, skipped: true, reason: "cycle_lease_lost", cycleKey: claim.cycleKey, creators, pages, created, reused, dueDays, pageSize: size };
       }
       if (rows.length < size) break;
     }
-    const completed = await completeAnalyticsSweepCycle({ db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: cursor });
+    const completed = await completeAnalyticsSweepCycle({ db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: cursor, completedAt: requestedNow });
     if (!completed) {
       return { ok: false, skipped: true, reason: "cycle_completion_lost", cycleKey: claim.cycleKey, creators, pages, created, reused, dueDays, pageSize: size };
     }

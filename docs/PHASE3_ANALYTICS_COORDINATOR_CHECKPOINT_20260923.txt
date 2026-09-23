@@ -1,0 +1,81 @@
+ONLINOD / PHASE 3 — RECOVERY CHECKPOINT, 2026-09-23
+Status: closure continues. SOURCE OPEN. SCALE OPEN.
+
+BASE ACTUAL
+onlinod-backend-main - 2026-09-23T155943.875.zip
+SHA256: ef61552692436a3ee989a8b387221d0ecc946d0aae07532ecbd869cb2348bb7f
+All changes in this ZIP are cumulative against that exact Backend.
+No deletions. Preserve relative paths when applying over the Backend root.
+No Desktop, dependency, schema or migration changes.
+
+PREVIOUS PROOF ACCEPTED
+Render checkout: 2367e87b7f6bdfb35159413c6f585c5408fb2df6
+Previous source: 40/40 offline; 60/60 in each of three PostgreSQL scenarios.
+180/180 physical checks, no fixture leaks, primary migrations and live service OK.
+This is evidence for the preceding actual, not for the new change.
+
+IMPLEMENTED IN THIS DELTA
+One shared coordinator protocol for Earnings, Creator Analytics and Home demand:
+* Row lock before PostgreSQL clock/state sampling for all claim/progress/settle writers.
+* Expired ownership cannot renew, commit a cursor, complete, backoff or quarantine.
+* Demand claim re-reads the selected candidate after obtaining the row lock.
+* Restart across UTC-hour boundaries retains unfinished cycle/time/cursor.
+* Home sweep reports failed processing/claim loss as degradation, not ok=true.
+* Real PostgreSQL clock remains authoritative; explicit times are adapter fallbacks.
+* Added physical expiry/takeover test; extended pre-DB contract gate and pinned manifest.
+
+VERIFIED LOCALLY
+Node 24.19.0 / Prisma 5.22.0; Render previously used Node 22.23.2.
+Regression reproduction before implementation: 31 tests, 21 pass, 10 fail.
+Planner after implementation: 31/31 pass.
+Extended targeted set: 80/80 pass.
+Final exact A29 CONTRACT_PROOFS: 81/81 pass, no skips.
+Changed-JS syntax/no-undef: 89 files, pass.
+Prisma source contracts: 360 files, 0 violations.
+Full suite before: 3183 tests, 2971 pass, 103 fail, 109 skip.
+Full suite after: 3193 tests, 2980 pass, 103 fail, 110 skip.
+All 103 failure names match the baseline; zero new failures.
+Additional skip is the new PostgreSQL integration test with no local database.
+Full suite is NOT green. Existing unrelated failures are not treated as resolved.
+
+PHYSICAL PROOF PENDING
+Local PostgreSQL / DATABASE_URL unavailable. New physical test not executed here.
+Manifest A36-R3: 13 files, 61 tests per scenario, 183 total.
+SHA256 canonical files JSON:
+eee216ba1f281ad6d43edebe784f59ef60418e1e2451d5e353bf115bcff8ecf8
+All previous 60 physical tests remain required.
+Render command unchanged: npm install && npm run audit:phase3-a29-render
+This gate runs disposable proof before primary DB migrations; it is a deploy command.
+Expected: offline 81/81; physical clean/rolling/seeded each 61/61, no skips/leaks;
+then successful disposable cleanup and primaryMigrationStatus=0 / gate ok=true.
+
+DO NOT MARK CLOSED: FRESH-SOURCE SCALE BLOCKERS
+1. runAnalyticsCollectionSweep: all READY creators under one global coordinator.
+2. runCreatorAnalyticsCatchupSweep: all READY creators; individual failures still
+   advance the cursor and can end as ok=true without separate durable retry debt.
+3. selectCampaignDirectoryDiscoveryAdmissions: can scan all due candidates while
+   skipping busy creators; no durable continuation for a scan budget.
+4. processAnalyticsDemand: one Home request can process an entire agency in one call.
+5. readCanonicalCapacityInputs: global current-state aggregates in capacity refresh.
+6. These Analytics lanes precede remaining recurring work in one sequential sweep.
+
+NEXT COHESIVE IMPLEMENTATION — SAME PHASE 3 AUDIT
+Design and cut over these connected lanes to durable per-creator/domain due work:
+bounded claims and planning chunks, ownership-fenced commits, per-agency fairness,
+durable retries/backoff/quarantine, lifecycle wake/cancel, resumable backfill,
+online generation rollout, explicit removal of old global planners, incremental
+rebuildable capacity projections and bounded repair. Validate existing DomainWorkItem
+fit and planner transaction boundaries before implementing that cutover.
+Do not cap the existing loops without durable continuation; it would starve the tail.
+Do not retain a second global scheduling authority alongside the new queue.
+
+Closure evidence still needed: PostgreSQL enqueue/claim/settle interleavings and
+expiry during row-lock wait; planner commit fencing; 100 workers/multi-replica;
+many agencies times many creators; bounded scan work and per-agency wait;
+large history, lifecycle isolation, restart and partial failure convergence.
+Previous scale fixtures cover 1000 agencies x 4 creators and separately
+4 agencies x 1000 creators; they do not establish the large product of both axes.
+
+Detailed source map and architecture boundary:
+docs/PHASE3_CLOSURE_CHECKPOINT_20260923.md
+Keep the existing master roadmap active; next domain has not been started.
