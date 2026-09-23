@@ -174,70 +174,21 @@ async function expectProofFailure(run, ctx, expectedCode) {
   assert.equal(ctx.writes.length, 0, "failed proof must occur before any transactional side effect");
 }
 
-test("stolen OWNER bearer cannot deactivate another OWNER without AMK proof and correct proof commits member+wrap atomically", async () => {
-  for (const [proof, code] of [[null, "CRYPTO_ACTOR_PROOF_REQUIRED"], [WRONG_PROOF, "CRYPTO_ACTOR_PROOF_MISMATCH"]]) {
-    const ctx = makeDb();
-    await expectProofFailure(
-      () => setMemberStatus({ db: ctx.db, agencyId: "agency-1", memberId: "owner-b", status: "deactivated", ...actorArgs(ctx.actor, proof) }),
-      ctx,
-      code,
-    );
-  }
-
-  const ctx = makeDb();
-  const result = await setMemberStatus({
-    db: ctx.db, agencyId: "agency-1", memberId: "owner-b", status: "deactivated", ...actorArgs(ctx.actor, ACTOR_PROOF),
-  });
-  assert.equal(result.status, "deactivated");
-  const after = ctx.snapshotTarget();
-  assert.ok(after.deactivatedAt instanceof Date || after.deactivatedAt, "target must be deactivated");
-  assert.ok(after.wrapRevokedAt instanceof Date || after.wrapRevokedAt, "target AMK wrap must be revoked");
-  assert.deepEqual(ctx.writes.slice(0, 2).map((row) => row.type), ["member.update", "ownerWrap.revoke"]);
+// Multi-owner fixtures now represent invalid historical topology. Even a valid
+// AMK proof must not make ordinary role/status/remove paths an ownership repair.
+for (const [label,run] of [
+  ["deactivation", ctx=>setMemberStatus({db:ctx.db,agencyId:"agency-1",memberId:"owner-b",status:"deactivated",...actorArgs(ctx.actor,ACTOR_PROOF)})],
+  ["demotion", ctx=>updateMemberSettings({db:ctx.db,agencyId:"agency-1",memberId:"owner-b",patch:{roleKey:"chatter"},...actorArgs(ctx.actor,ACTOR_PROOF)})],
+  ["removal", ctx=>removeMember({db:ctx.db,agencyId:"agency-1",memberId:"owner-b",...actorArgs(ctx.actor,ACTOR_PROOF)})],
+]) test(`ordinary OWNER ${label} rejects ambiguous topology even with possession proof`,async()=>{
+  const ctx=makeDb(),before=ctx.snapshotTarget();
+  await assert.rejects(()=>run(ctx),e=>e.code==="OWNERSHIP_INVARIANT_CONFLICT"&&e.status===409);
+  assert.deepEqual(ctx.snapshotTarget(),before);assert.equal(ctx.writes.length,0);
 });
-
-test("OWNER demotion is AMK-possession gated before role mutation and wrap revocation", async () => {
-  const denied = makeDb();
-  await expectProofFailure(
-    () => updateMemberSettings({
-      db: denied.db, agencyId: "agency-1", memberId: "owner-b", patch: { roleKey: "chatter" }, ...actorArgs(denied.actor, WRONG_PROOF),
-    }),
-    denied,
-    "CRYPTO_ACTOR_PROOF_MISMATCH",
-  );
-
-  const ctx = makeDb();
-  const member = await updateMemberSettings({
-    db: ctx.db, agencyId: "agency-1", memberId: "owner-b", patch: { roleKey: "chatter" }, ...actorArgs(ctx.actor, ACTOR_PROOF),
-  });
-  assert.equal(member.roleKey, "chatter");
-  assert.equal(ctx.snapshotTarget().roleKey, "chatter");
-  assert.ok(ctx.snapshotTarget().wrapRevokedAt);
-});
-
-test("OWNER removal is AMK-possession gated before delete/deactivate and wrap revocation", async () => {
-  const denied = makeDb();
-  await expectProofFailure(
-    () => removeMember({ db: denied.db, agencyId: "agency-1", memberId: "owner-b", ...actorArgs(denied.actor, null) }),
-    denied,
-    "CRYPTO_ACTOR_PROOF_REQUIRED",
-  );
-
-  const ctx = makeDb();
-  const result = await removeMember({ db: ctx.db, agencyId: "agency-1", memberId: "owner-b", ...actorArgs(ctx.actor, ACTOR_PROOF) });
-  assert.equal(result.id, "owner-b");
-  const after = ctx.snapshotTarget();
-  assert.ok(after.deletedAt);
-  assert.ok(after.deactivatedAt);
-  assert.ok(after.wrapRevokedAt);
-});
-
-test("pre-E2E agencies keep legacy Team Administration behavior when no crypto root exists", async () => {
-  const ctx = makeDb({ withRoot: false });
-  const result = await setMemberStatus({
-    db: ctx.db, agencyId: "agency-1", memberId: "owner-b", status: "deactivated", ...actorArgs(ctx.actor, null),
-  });
-  assert.equal(result.status, "deactivated");
-  assert.ok(ctx.snapshotTarget().deactivatedAt);
+test("pre-E2E agencies also require explicit ownership transfer",async()=>{
+  const ctx=makeDb({withRoot:false}),before=ctx.snapshotTarget();
+  await assert.rejects(()=>setMemberStatus({db:ctx.db,agencyId:"agency-1",memberId:"owner-b",status:"deactivated",...actorArgs(ctx.actor,null)}),e=>e.code==="OWNERSHIP_INVARIANT_CONFLICT");
+  assert.deepEqual(ctx.snapshotTarget(),before);
 });
 
 test("all destructive Team compatibility paths accept actorProof and derive device only from signed auth claim", () => {

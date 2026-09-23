@@ -1816,6 +1816,7 @@ async function softRevokeDevice({ db, agencyId, userId, member, actorDeviceId, t
 }
 
 module.exports = {
+  normalizeWrapEnvelope,
   DEVICE_KEY_ALGORITHM,
   WRAP_ALGORITHM,
   RECOVERY_ALGORITHM,

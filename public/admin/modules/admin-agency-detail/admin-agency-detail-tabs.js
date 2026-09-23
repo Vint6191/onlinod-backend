@@ -62,8 +62,8 @@
                   </td>
                   <td class="adm-cell-mono">${r.escapeHtml(m.user?.name || "—")}</td>
                   <td>
-                    <select class="adm-select" data-member-role="${r.escapeAttr(m.id)}" style="width:140px;">
-                      <option value="OWNER"    ${m.role === "OWNER"    ? "selected" : ""}>OWNER</option>
+                    <select ${m.role === "OWNER" || m.roleKey === "owner" ? "disabled" : ""} class="adm-select" data-member-role="${r.escapeAttr(m.id)}" style="width:140px;">
+                      ${m.role === "OWNER" || m.roleKey === "owner" ? '<option value="OWNER" selected>OWNER · transfer in Desktop</option>' : ""}
                       <option value="ADMIN"    ${m.role === "ADMIN"    ? "selected" : ""}>ADMIN</option>
                       <option value="MANAGER"  ${m.role === "MANAGER"  ? "selected" : ""}>MANAGER</option>
                       <option value="OPERATOR" ${m.role === "OPERATOR" ? "selected" : ""}>OPERATOR</option>
@@ -71,7 +71,7 @@
                   </td>
                   <td class="adm-cell-mono">${r.escapeHtml(u.timeAgo(m.createdAt))}</td>
                   <td>
-                    <button class="adm-btn danger" data-member-kick="${r.escapeAttr(m.id)}" data-member-email="${r.escapeAttr(m.user?.email || "")}">kick</button>
+                    <button ${m.role === "OWNER" || m.roleKey === "owner" ? "disabled" : ""} class="adm-btn danger" data-member-kick="${r.escapeAttr(m.id)}" data-member-email="${r.escapeAttr(m.user?.email || "")}">kick</button>
                   </td>
                 </tr>
               `).join("")}

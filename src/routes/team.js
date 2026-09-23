@@ -105,6 +105,18 @@ function actor(req) {
   };
 }
 
+// Agency identity comes only from the authenticated token. Service admission is
+// current OWNER; the replay branch can still return a committed transfer receipt.
+router.get("/ownership/plan/:memberId", async (req, res) => {
+  try { return res.json(await require("../services/team-ownership-transfer-service").ownershipTransferPlan({db:require("../prisma"),agencyId:req.auth.agencyId,userId:req.auth.userId,memberId:req.params.memberId,actorDeviceId:actor(req).actorDeviceId,authorizationSessionId:req.auth.authorizationSessionId})); }
+  catch (error) { return serviceError(res,error,"OWNERSHIP_PLAN_FAILED"); }
+});
+router.post("/ownership/transfer", async (req, res) => {
+  try { return res.json(await require("../services/team-ownership-transfer-service").transferOwnership({db:require("../prisma"),agencyId:req.auth.agencyId,userId:req.auth.userId,actorDeviceId:actor(req).actorDeviceId,authorizationSessionId:req.auth.authorizationSessionId,
+    input:req.body})); }
+  catch (error) { return serviceError(res,error,"OWNERSHIP_TRANSFER_FAILED"); }
+});
+
 router.get("/state", teamReadRequired("workspace.view_team"), async (req, res) => {
   try {
     const state = await getTeamAdministrationState({

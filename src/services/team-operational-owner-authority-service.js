@@ -42,7 +42,7 @@ async function assertOperationalOwnerRemovalSafety({ db, agencyId, memberId } = 
     where: operationalOwnerWhere({ agencyId: agency, excludeMemberId: member }),
   });
   if (otherOwners === 0) throw lastOperationalOwnerError({ agencyId: agency, memberId: member });
-  return { operational: true, safe: true, otherOwners };
+  throw Object.assign(new Error("Resolve ambiguous ownership before changing an OWNER"), { code: "OWNERSHIP_INVARIANT_CONFLICT", status: 409 });
 }
 
 async function assertUserDisableOwnerSafety({ tx, userId } = {}) {
@@ -63,24 +63,21 @@ async function assertUserDisableOwnerSafety({ tx, userId } = {}) {
     select: { id: true, agencyId: true },
   });
 
-  for (const membership of ownerMemberships || []) {
-    const otherOwners = await tx.agencyMember.count({
-      where: operationalOwnerWhere({ agencyId: membership.agencyId, excludeMemberId: membership.id }),
-    });
-    if (otherOwners === 0) {
-      throw lastOperationalOwnerError({ agencyId: clean(membership.agencyId), memberId: clean(membership.id), userId: user });
-    }
+  if (ownerMemberships?.length) {
+    const membership = ownerMemberships[0];
+    throw lastOperationalOwnerError({ agencyId: clean(membership.agencyId), memberId: clean(membership.id), userId: user });
   }
   return { safe: true, ownerMemberships: ownerMemberships || [] };
 }
 
-async function assertAgencyHasOperationalOwner({ db, agencyId, code = "AGENCY_OPERATIONAL_OWNER_REQUIRED", message = "Agency requires at least one operational OWNER" } = {}) {
+async function assertAgencyHasOperationalOwner({ db, agencyId, code = "AGENCY_OPERATIONAL_OWNER_REQUIRED", message = "Agency requires exactly one operational OWNER" } = {}) {
   if (!db?.agencyMember?.count) {
     throw Object.assign(new Error("Operational OWNER storage is required"), { code: "OWNER_SAFETY_STORAGE_REQUIRED", status: 500 });
   }
   const agency = clean(agencyId);
   const count = await db.agencyMember.count({ where: operationalOwnerWhere({ agencyId: agency }) });
-  if (count > 0) return { safe: true, ownerCount: count };
+  const total = await db.agencyMember.count({where:{agencyId:agency,deletedAt:null,OR:[{roleKey:"owner"},{role:"OWNER"}]}});
+  if (count === 1 && total === 1) return { safe: true, ownerCount: count };
   const error = new Error(message);
   error.code = code;
   error.status = 409;
@@ -95,15 +92,11 @@ async function findLiveAgenciesWithoutOperationalOwner(db, { limit = 50 } = {}) 
       SELECT a."id"
         FROM "Agency" a
        WHERE a."deletedAt" IS NULL
-         AND NOT EXISTS (
-           SELECT 1
-             FROM "AgencyMember" m
-             JOIN "User" u ON u."id" = m."userId"
-            WHERE m."agencyId" = a."id"
-              AND m."deletedAt" IS NULL
-              AND m."deactivatedAt" IS NULL
-              AND u."disabledAt" IS NULL
-              AND (m."roleKey" = 'owner' OR m."role" = 'OWNER')
+         AND NOT (
+           SELECT count(*)=1 AND count(*) FILTER (WHERE m."deactivatedAt" IS NULL AND u."disabledAt" IS NULL)=1
+             FROM "AgencyMember" m JOIN "User" u ON u."id"=m."userId"
+            WHERE m."agencyId"=a."id" AND m."deletedAt" IS NULL
+              AND (m."roleKey"='owner' OR m."role"='OWNER')
          )
        ORDER BY a."id" ASC
        LIMIT $1
@@ -118,7 +111,8 @@ async function findLiveAgenciesWithoutOperationalOwner(db, { limit = 50 } = {}) 
   const missing = [];
   for (const agency of agencies || []) {
     const count = await db.agencyMember.count({ where: operationalOwnerWhere({ agencyId: agency.id }) });
-    if (count === 0) missing.push(clean(agency.id));
+    const total = await db.agencyMember.count({where:{agencyId:agency.id,deletedAt:null,OR:[{roleKey:"owner"},{role:"OWNER"}]}});
+    if (count !== 1 || total !== 1) missing.push(clean(agency.id));
   }
   return missing;
 }
@@ -126,7 +120,7 @@ async function findLiveAgenciesWithoutOperationalOwner(db, { limit = 50 } = {}) 
 async function assertAllLiveAgenciesHaveOperationalOwner({ db, limit = 50 } = {}) {
   const agencyIds = await findLiveAgenciesWithoutOperationalOwner(db, { limit });
   if (!agencyIds.length) return { safe: true, checked: true };
-  const error = new Error("Team control-plane activation blocked: live Agency without an operational OWNER");
+  const error = new Error("Team control-plane activation blocked: live Agency must have exactly one operational OWNER");
   error.code = "TEAM_CONTROL_PLANE_OWNER_INVARIANT_FAILED";
   error.status = 409;
   error.details = { agencyIds, truncated: agencyIds.length >= Math.max(1, Math.min(500, Number(limit) || 50)) };

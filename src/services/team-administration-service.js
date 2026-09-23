@@ -274,6 +274,7 @@ function memberToClient(member) {
     tone: member.tone || "amber",
     roleKey: memberRoleKey(member),
     legacyRole: member.role,
+    accessEpoch: normalizedEpoch(member.accessEpoch),
     functions: cleanFunctions((member.teamFunctions || []).map((row) => row.functionKey)),
     creatorAccess: isOwner(member) ? { mode: "all", creatorIds: [] } : normalizeAssignedCreators(member.assignedCreators),
     assignedCreators: member.assignedCreators ?? "all",
@@ -423,7 +424,7 @@ async function getTeamAdministrationState({ agencyId, viewerMember, includeAudit
   ]);
   const roles = rolesRaw.map((role) => ({
     ...role,
-    assignable: isOwner(viewerMember) || (role.key !== "owner" && !DELEGATED_PERMISSION_KEYS.some((permissionKey) =>
+    assignable: role.key !== "owner" && (isOwner(viewerMember) || !DELEGATED_PERMISSION_KEYS.some((permissionKey) =>
       role.permissions?.[permissionKey] === true && viewerPermissions?.[permissionKey] !== true
     )),
   }));
@@ -478,6 +479,7 @@ async function getTeamAdministrationState({ agencyId, viewerMember, includeAudit
 
 async function assertOwnerSafety({ agencyId, targetMember, nextRoleKey = null, removing = false, db = prisma }) {
   const currentlyOwner = isOwner(targetMember);
+  if (!currentlyOwner && nextRoleKey === "owner") throw Object.assign(new Error("Use ownership transfer to replace the current OWNER"), { code: "OWNERSHIP_TRANSFER_REQUIRED", status: 409 });
   const remainsOwner = !removing && (nextRoleKey === null || String(nextRoleKey).toLowerCase() === "owner");
   if (!currentlyOwner || remainsOwner) return;
   return assertOperationalOwnerRemovalSafety({ db, agencyId, memberId: targetMember.id });
@@ -948,6 +950,7 @@ async function updateMemberAccessByPlatformAdmin({
     }
     const ownerDemoted = isOwner(before) && nextRoleKey !== "owner";
     const data = { accessEpoch: { increment: 1 } };
+    if (legacyRole !== undefined && (legacyRole === "OWNER") !== (nextRoleKey === "owner")) throw Object.assign(new Error("OWNER representations must agree"), {code:"OWNERSHIP_INVARIANT_CONFLICT",status:409});
     if (legacyRole !== undefined) data.role = legacyRole;
     if (roleKey !== undefined) data.roleKey = nextRoleKey;
     if (permissions !== undefined) data.permissions = permissions;
@@ -979,6 +982,8 @@ async function materializeInvitationMemberWithinTransaction({
     error.status = 500;
     throw error;
   }
+
+  if (String(roleKey).trim().toLowerCase() === "owner") throw Object.assign(new Error("Ownership cannot be granted by invitation"), { code: "INVITE_OWNER_FORBIDDEN", status: 409 });
 
   // Caller must already hold the Team control-plane topology fence, the assigned
   // Role lifecycle lock, and every explicit Creator scope row in canonical order.
@@ -1067,7 +1072,7 @@ function invitationUrl(rawToken) {
 async function createInvitation({ agencyId, input, actorMember, actorUserId: actorId, db = prisma }) {
   const roleKey = await ensureRoleExists({ agencyId, roleKey: input.roleKey, db });
   if (roleKey === "owner") {
-    const error = new Error("Cannot invite as owner. Promote after the member joins.");
+    const error = new Error("Cannot invite as owner. Transfer ownership after the member joins.");
     error.code = "CANNOT_INVITE_OWNER";
     error.status = 409;
     throw error;

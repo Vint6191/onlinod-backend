@@ -48,7 +48,7 @@ test("C2 User disable rejects disabling the sole operational OWNER", async () =>
   );
 });
 
-test("C2 User disable succeeds when every owned Agency has another operational OWNER", async () => {
+test("R7 User disable rejects ambiguous multi-owner topology; only an ownership transfer can change OWNER", async () => {
   const seen = [];
   const tx = {
     agencyMember: {
@@ -71,8 +71,8 @@ test("C2 User disable succeeds when every owned Agency has another operational O
   };
 
   const { assertUserDisableOwnerSafety } = loadOwnerSafetyPureFunctions();
-  await assert.doesNotReject(() => assertUserDisableOwnerSafety({ tx, userId: "user-owner" }));
-  assert.deepEqual(seen, ["agency-a", "agency-b"]);
+  await assert.rejects(() => assertUserDisableOwnerSafety({ tx, userId: "user-owner" }), e=>e.code==="LAST_OWNER");
+  assert.deepEqual(seen, []);
 });
 
 test("C2 admin User disable checks owner safety after User FOR UPDATE and before eligibility mutation", () => {
