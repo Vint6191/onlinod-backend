@@ -32,7 +32,7 @@ function productionDb(now) {
         return [{ requiredGeneration: release.DOMAIN_WORK_EXECUTOR_GENERATION, activationState: "ACTIVE" }];
       }
       if (text.includes("set_config")) return [{ value: params[1] }];
-      if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
+      if (text.trim() === 'SELECT clock_timestamp() AS "authorityNow"') return [{ authorityNow: now }];
       if (text.includes('UPDATE "DomainWorkClaimAgencyState" a') && text.includes('RETURNING a."agencyId"')) {
         agencySelections += 1;
         return agencySelections === 1 ? [{ agencyId: "agency-1" }] : [];

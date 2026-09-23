@@ -100,6 +100,40 @@ function makeDb() {
 
 const base = { agencyId: "agency-a", workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION, objectType: "CustomOrder", objectId: "order-1", partitionKey: "creator-1", creatorId: "creator-1" };
 
+test("A37-R2: every claim settlement rejects ownership expiring while its row lock is pending", async () => {
+  const operations = [
+    ["heartbeatDomainWorkClaim", "renewed"], ["ackDomainWorkClaim", "acknowledged"],
+    ["blockDomainWorkClaim", "blocked"], ["failDomainWorkClaim", "failed"],
+    ["saveDomainWorkProgress", "saved"], ["yieldDomainWorkClaim", "yielded"],
+  ];
+  for (const [name, resultKey] of operations) {
+    const before = new Date("2026-09-23T00:00:00Z");
+    const after = new Date(before.getTime() + 60_000);
+    const calls = [];
+    let locked = false;
+    const item = { id: "expiring-work", agencyId: "agency-a", state: "CLAIMED", ownerToken: "owner",
+      claimFence: 1n, claimedRevision: 1n, requestedRevision: 1n,
+      activeGeneration: authority.DOMAIN_WORK_GENERATION, leaseUntil: new Date(before.getTime() + 1000) };
+    const db = {
+      async $transaction(work) { return work(db); },
+      domainWorkItem: { async updateMany() { throw new Error("Expired ownership attempted a mutation"); } },
+      async $queryRawUnsafe(sql) {
+        calls.push(sql);
+        if (sql.includes("clock_timestamp()")) return [{ authorityNow: locked ? after : before }];
+        if (sql.includes('FROM "DomainWorkItem"') && sql.includes("FOR UPDATE")) { locked = true; return [item]; }
+        if (sql.includes('"Phase2DependencyState"')) return [{ revision: 0n }];
+        throw new Error(`Unexpected SQL: ${sql}`);
+      },
+    };
+    const result = await authority[name]({ db, item, dependencyKind: "DEP", dependencyKey: "key", progressCursor: { page: 2 } });
+    assert.equal(result[resultKey], false, name);
+    assert.equal(result.lost, true, name);
+    const lockIndex = calls.findIndex((sql) => sql.includes('FROM "DomainWorkItem"'));
+    assert.ok(lockIndex >= 0 && lockIndex < calls.findIndex((sql) => sql.includes("clock_timestamp()")), name);
+    if (name === "blockDomainWorkClaim") assert.ok(calls.findIndex((sql) => sql.includes('"Phase2DependencyState"')) < lockIndex);
+  }
+});
+
 test("A36: immediate PostgreSQL publication is resolved by the database clock", async () => {
   const calls = [];
   const db = {

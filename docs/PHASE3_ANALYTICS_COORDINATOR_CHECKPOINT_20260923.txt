@@ -1,147 +1,191 @@
 ONLINOD / PHASE 3 — CUMULATIVE RECOVERY CHECKPOINT, 2026-09-23
-STAGE A37-R1: recurring Analytics planning authority cutover (large pass 1).
+CURRENT STAGE: A37-R2, recurring Analytics authority closure continues.
 SOURCE OPEN. SCALE OPEN. PHASE 3 NOT CLOSED.
 
-INSTALL VERDICT
-Candidate through the existing Render gate: YES. Completed Phase 3 release: NO.
-Apply only over Backend onlinod-backend-main - 2026-09-23T175022.545(1).zip.
-Its contents equal the previous HOME_DEMAND_CONTINUATION delivery plus its base.
-Earlier deltas must NOT be reapplied to this actual.
+INSTALL VERDICT / EXACT BASE
+STAVIT: YES as a candidate through the existing Render gate.
+STAVIT as a completed Phase 3 release: NO.
+Apply only over onlinod-backend-main - 2026-09-23T183031.958.zip.
+This actual is byte-for-byte identical to the preceding A37-R1 delivered tree.
+Do not reapply older deltas to it. The archive contains changed/new files only,
+including this cumulative TXT and the updated historical MD inside docs/.
 Command remains: npm install && npm run audit:phase3-a29-render
-Expected: 101 offline pass; 66 clean + 66 rolling + 66 seeded = 198 physical,
-zero skips/leaks; successful disposable cleanup, primary migrations, gate ok=true.
-New migration: 20260923150000_phase3_analytics_planning_admission_v1.
-Do not deploy the new code without that migration; the gate applies it in order.
+Expected current gate: 135 offline tests, then 69 + 69 + 69 = 207 physical tests,
+zero failures/skips/leaks, disposable cleanup, primary migrations, gate ok=true.
+The existing gate still blocks primary migration/deploy on any proof failure.
+New additive migration: 20260923160000_phase3_dispatch_fairness_monotonic_v1.
+It replaces three canonical reconciliation functions; no table/index rebuild,
+new table, history scan, backfill, dependency or Prisma model change.
+Existing timestamp/timestamptz/int8 compatibility overloads delegate unchanged.
 
 AUTHORITATIVE INPUT
 Backend ZIP SHA256:
-6cd4fbf294d22d87816e67c9751c712b49ffdebf6bf670be2ba5f1aa202f5c01
-1391 entries / 1102 files; CRC/path/symlink validation passed. No AGENTS.md.
-Log: Вставленный текст(20260923-145934).txt
-Log SHA256: e60ed114c6e4e9a870463033172f56dec96dc2963c3b79f5049c0ca9b8d189e5
-Render checkout: 6d4416ce15260f4239d198d8821d79f100d6f621
+124cfb0eac9ff9c20b05742fc0d0bc31334a027d1e4971f18c1c37ca7c5a3769
+1395 entries / 1105 files; CRC/path/symlink validation passed. No AGENTS.md.
+Render log: Вставленный текст(20260923-153111).txt
+Log SHA256: de6a332d0dfc0902f773d26acd1ee8bdfb3b18cc881cb9a45a72d5348341126f
+Render checkout: d7e98a307704938cf995a3b2b4c4b4f8d4a909eb
 
-CONFIRMED INPUT / PREVIOUS WORK
-95/95 offline; 189/189 PostgreSQL: 63 clean, 63 rolling, 63 seeded.
-Zero failures/skips/fixture leaks. Cleanup successful, primaryMigrationStatus=0,
-gate ok=true, service LIVE. These results confirm the preceding Home demand work.
-A36-R5 manifest hash: 55a2585594d829c6487e414c4b6e8b2b900254e99cb28b7f3c62b12da8c0b2ae
-Previously confirmed coordinator expiry/restart/observed lock-wait proofs remain valid.
-Home continuation, requested scope, retry cursor/revision, range bound and scheduler
-health corrections are now in the actual and physically confirmed where covered.
+WHAT THE NEW RENDER LOG ACTUALLY CONFIRMS
+101/101 offline checks passed. Physical total: 197 pass / 1 fail / 0 skip.
+clean-current: 65/66; rolling-a13-to-current: 66/66; seeded-pre-a20-2: 66/66.
+All three A37-R1 physical proofs passed in all three scenarios:
+1. Atomic recurring planning rollback/retry and expired ownership rejection.
+2. Shared directory admission budget across replicas, reservation rollback.
+3. Commit authority rejects expiry after an observed DomainWork row-lock wait.
+Thus these proofs are no longer pending in the actual. The new table migration
+also executed successfully in the disposable scenarios. Production migration
+was NOT reached because the aggregate physical gate was red.
+Zero fixture leaks; successful disposable cleanup; build blocked before deploy.
+Failing proof: A36 PostgreSQL: 1000 agencies publish 4000 creators and two
+replicas claim tenant-fair disjoint batches.
+Location: src/services/phase3-a34-source-scale-closure.integration.test.js,
+old source test line 825, failed assertion line 1135.
+Each replica claimed 50 distinct tasks from 50 Agencies, without shared task IDs.
+Their Agency union contained 99 rather than 100: one tenant received two turns
+while many tenants had not received any. This is a fairness failure, not npm,
+Prisma compilation, duplicate task execution, or an A37 planning rollback error.
+The log does not record the exact transaction schedule. The source mechanisms
+below are concrete defects; the original timing has NOT been replayed locally.
 
-PROBLEM / ARCHITECTURE OF THIS CUTOVER
-Earnings and Creator Analytics each had a global READY-catalog traversal and a
-separate cycle lease. Failed creators could be passed by a global cursor; directory
-admission could enumerate the entire busy due set. Those traversals also delayed
-other recurring work. Existing CREATOR_RECURRING_PLANNING already had durable
-per-creator identity, lifecycle publication/backfill, fair agency/shard claims,
-restart/retry and a bounded timer pump. Reusing it avoids a second queue generation.
+A37-R2 CAUSAL SOURCE FINDINGS
+A. Agency/shard dispatch sorted mutable locators and then locked them using
+   FOR UPDATE SKIP LOCKED, without retaining the snapshot revision. A row can
+   change between its sorted observation and lock acquisition; accepting its
+   replacement revision can service it at its obsolete position.
+B. Reservation recorded a clock sampled before authorization/query execution.
+   Delayed transactions could publish an older timestamp. Reconciliation also
+   used only due time and the supplied touch time, discarding its own newer
+   lastSelectedAt/lastClaimedAt when a stale or null touch arrived.
+C. A missed/contended locator immediately allowed physical fallback. Existing
+   busy locators and genuinely missing projection rows were conflated, allowing
+   a worker to bypass the normal fair dispatch hierarchy under contention.
+D. Six settlement operations sampled DB time before waiting for their DWI row.
+   An expired owner could heartbeat/ack/block/retry/save/yield using that stale
+   time. A37-R1 had corrected planning commit checks but not these transitions.
+PostgreSQL reference for mutable ordering and row-lock semantics:
+https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE
 
-IMPLEMENTED TOGETHER
-1. The existing bounded creator work consumer now invokes recurring Earnings and
-   Creator Analytics for its exact claimed creator. Failures join its degraded
-   result and existing durable retry/backoff; successful cycles retain durable
-   next availability. No global cursor can silently skip a failed Analytics creator.
-2. runAnalyticsCollectionSweep and runCreatorAnalyticsCatchupSweep are compatibility
-   delegates into that same lane. Their global loops are removed. The hourly
-   scheduler invokes the shared lane once, not three independent planners.
-3. Analytics planning uses one root transaction per creator, bounded to 20 seconds:
-   Agency SHARE -> Creator SHARE -> exact DomainWork claim -> collector/job planning.
-   Eligibility is protected against soft deletion/status changes until commit.
-   Exact work class, agency and creator identity must match the durable claim.
-4. Claim authority is checked before planning and again after planning. Expiry,
-   lost ownership or a superseding revision aborts the transaction. Jobs and any
-   Campaign admission reservation roll back together. The shared commit helper now
-   samples DB time AFTER taking the work-row lock, fixing stale pre-wait time.
-5. Job publication has an async-scoped afterPlanningCommit boundary: job events
-   are deduplicated and emitted after the transaction resolves; rollback discards
-   them. Existing non-transactional callers retain their prior publication behavior.
-6. Periodic Campaign directory admission uses a new fixed-size budget table. One
-   production row owns UTC-hour reserved provider pages and job count across all
-   replicas: atomic INSERT/ON CONFLICT, <=100 jobs/hour, guaranteed category credits.
-   The first oversized request may proceed so size cannot make it impossible to
-   serve. Later requests defer; canonical demand is preserved. This is admission,
-   not a second OnlyFans start limiter. Initial/manual/provider-start paths keep
-   their existing authorities. No capacity sharding or higher OF rate is invented.
-7. Reservation occurs under the existing collector lock after active-job and
-   current-state reads. Reused/busy jobs do not consume another reservation.
-   The reservation shares the outer transaction with the planned job.
-8. The former global discovery helper now requires <=100 explicit creator IDs,
-   performs one candidate query, and rejects an unbounded call before SQL.
-   It is no longer called by the recurring production path.
-9. Capacity reporting remains on a separate hourly maintenance lane. Its global
-   aggregate is explicitly NOT scale-closed yet, but it no longer precedes or
-   authorizes the per-creator planning path. Until incremental capacity is proven,
-   periodic admission uses conservative guaranteed credits even if a snapshot is
-   HEALTHY. This can reduce directory admission versus the old normal 2400-call
-   allowance. Existing canonical jobs/debt are not removed.
-10. Existing creator lifecycle trigger, queue generation, indexes, topology and
-    bootstrap remain the source of due work. This change needs no new catalog
-    backfill and introduces no parallel per-creator queue.
+COHESIVE IMPLEMENTATION
+1. Both broad Agency and shard reservations materialize at most 128 ordered
+   candidate identities and revisions using existing dispatch indexes. The
+   lock/join requires that same revision, and the final UPDATE repeats the CAS.
+   A peer's replacement revision cannot inherit the old sorted position.
+2. Reservation samples database time after obtaining the candidate lock and
+   preserves the existing selection watermark. No process clock is authority.
+3. A bounded indexed due-locator probe distinguishes contention from absence.
+   Contention retries only within the existing finite tranche budget. Missing
+   locators retain the indexed physical-DWI repair path; canonical tasks remain
+   the execution authority. No global lock or all-history scan is introduced.
+4. Partition, shard and Agency reconciliation preserve their own monotonic
+   selection watermark within a generation, including old/null touch inputs.
+   New generations reset that watermark. Revision-CAS and the established
+   DWI -> partition -> shard -> Agency ordering remain in place.
+5. heartbeatDomainWorkClaim, ackDomainWorkClaim, blockDomainWorkClaim,
+   failDomainWorkClaim, saveDomainWorkProgress and yieldDomainWorkClaim all use
+   lockDomainWorkClaimForCommit before testing time or changing work. Blocking
+   retains dependency -> DWI order so dependency publication cannot invert it.
+   Owner/fence/claimedRevision/generation/live-expiry must all still match.
+6. Test adapters now recognize the exact standalone DB clock SELECT. They must
+   not mistake a reservation SQL statement containing clock_timestamp for that
+   SELECT. No production time guard or physical assertion was relaxed.
 
-NEW PROOFS
-Offline: publication rollback/commit/deduplication; planning transaction and lock
-order; expiry at final fence; exact work-class scope; bounded SQL admission;
-compatibility delegation and explicit bounded directory selection.
-Physical tests added to the mandatory manifest:
-- Inject failure AFTER an actual job INSERT, prove rollback leaves zero jobs,
-  retry successfully, then prove expired ownership cannot change the jobs.
-- Independent clients share one admission row; an oversized first reservation
-  prevents another admission. Transaction rollback releases its reservation.
-  Both client outcomes settle before teardown.
-- A holder blocks the work row, a third client observes pg_blocking_pids, the holder
-  arms and waits past DB expiry, and the waiting commit-authority check rejects.
-All fixture setup/cleanup retain current generation/schema/destructive authority.
-No FK, trigger, lifecycle guard, or test gate is disabled.
+NEW / STRENGTHENED PROOFS
+Offline: all six settlements reject a clock that expires during lock acquisition;
+contention at either hierarchy level returns within the finite budget and never
+falls through to physical repair while due locators still exist; bounded CAS
+and monotonic generation-local reconciliation contracts.
+Negative controls: the two behavioral regressions run against the original
+actual's authority module both fail (2/2). Both pass against the implementation.
+Physical proofs added to the mandatory manifest (not executed locally):
+- A third PostgreSQL client observes blocking at a test-only advisory barrier
+  inside each real production reservation SQL query. A peer replaces the first
+  Agency/shard revision after the sorted snapshot; the waiting query must select
+  another Agency/shard. No production test hooks were added.
+- Partition/shard/Agency reconciliation preserves its watermark after older and
+  null touch inputs, through the actual timestamp/int8 application overloads.
+- All six settlements are blocked on the actual DWI row; only after the observer
+  proves overlap does the holder arm expiry and wait past it. Each operation
+  must reject ownership without changing work state, progress or completion.
+The original 1000-Agency/4000-Creator proof now runs THREE two-replica waves:
+50 tasks per replica per wave, 100 unique Agencies per wave, 300 unique Agencies
+across all waves, no duplicate work and each task attempted exactly once.
+Its exact fairness expectation and 60-second admission bound remain enforced.
+Concurrent outcomes settle before fixture cleanup, including failures.
 
-VALIDATION
-Local Node 24.19 / Prisma 5.22; Render remains Node 22.
-A29 exact contract set: 101 pass, zero fail/skip.
-Syntax/no-undef: 93 files. Prisma source contracts: 362 files, zero violations.
-Prisma schema validation passes using a dummy URL for syntax/config validation;
-no database connection or physical migration is implied by schema validation.
-Full baseline: 3209 tests / 2994 pass / 103 fail / 112 skip.
-Full final: 3218 tests / 3000 pass / 103 fail / 115 skip.
-All 103 failure names match baseline. The whole suite remains NOT green.
-Physical manifest A37-R1: 13 files, 66 tests per scenario, 198 total.
+LOCAL VALIDATION / LIMITS
+Node 24.19 / Prisma 5.22. Render uses Node 22; no version/dependency change.
+Mandatory offline contract set: 135 pass / 0 fail / 0 skip.
+Syntax/no-undef gate: 93 files, no failures.
+Prisma source contracts: 362 files, no violations.
+PostgreSQL identifier lint: no new oversized identifiers or collisions.
+Full actual baseline: 3218 tests / 3000 pass / 103 fail / 115 skip.
+Full current: 3224 tests / 3003 pass / 103 fail / 118 skip.
+All 103 failure names are identical to baseline, with no new failures. Existing
+unrelated old Team/E2E/retired-route/Desktop/source-contract failures still mean
+that the entire repository suite is NOT green; they are not silently waived.
+Physical manifest A37-R2: 13 files / 69 tests per scenario / 207 total.
 Canonical manifest SHA256:
-3fe27244d578f982f60455e024cbd93c856ba051e39afe6fdfdc45c51c7abaab
-Registered names/order and manifest hash checked offline. Existing 63 physical
-checks remain mandatory in each scenario. Local PostgreSQL/DATABASE_URL unavailable;
-new physical tests and migration NOT executed here. Next Render must confirm them.
+565b44c6e564c6bfaee588d500982c63414e1febac889d17347962332a2232dc
+No local PostgreSQL or DATABASE_URL. The new migration, controlled PostgreSQL
+races and strengthened scale proof MUST still be confirmed by the Render gate.
+Static SQL bounds do not establish real query cost or multi-replica throughput.
+Archive packaging checks CRC and exact byte reconstruction over the given base,
+with no deletions, credentials, node_modules, generated logs or unrelated files.
 
-INTEGRITY / DELIVERY
-Changed/new files only against the exact 17:50 actual above; no deletions.
-One additive table migration + matching schema; no dependency/Desktop changes.
-ZIP CRC and byte-for-byte reconstruction against the base are checked at packaging.
-This TXT fully replaces its predecessor. The detailed MD retains historical maps
-inside the source archive; no separate MD deliverable is required.
+CUMULATIVE CONFIRMED ARCHITECTURE FROM PRECEDING PASSES
+- Canonical observation/facts/coverage authorities remain the base; this patch
+  introduces no second earnings writer, campaign writer or projection source.
+- Analytics coordinator progress/settlement rejects expired leases after actual
+  row-lock waits. Restart resumes unfinished cycleNow/cursor across hour changes.
+- Home demand executes bounded creator slices with durable continuation. It
+  intersects requested creators with current access; preserves retry cursor and
+  revision; validates Home ranges; fences accessEpoch before each creator; gives
+  new revisions precedence; exposes fulfilled failures in timer/admin health.
+  Actor fixtures use real Agency/User/Member records and migration-owned guards.
+- A37-R1 removed the independent global recurring Earnings/Creator Analytics
+  loops. Old entry points delegate to CREATOR_RECURRING_PLANNING, already backed
+  by lifecycle publication, durable identity/retry, fair claims and bounded pumps.
+- Per-creator recurring Analytics planning is one <=20-second transaction:
+  Agency SHARE -> Creator SHARE -> exact DWI -> collector/job planning -> final
+  DWI fence. Partial jobs/reservations roll back together. Publications are
+  async-scoped/deduplicated and emitted only after successful commit.
+- One AnalyticsPlanningBudget row owns periodic directory hourly reservations
+  across replicas: guaranteed category credits and <=100 jobs/hour. The first
+  oversized request may proceed; later ones defer without dropping demand.
+  Physical OnlyFans start admission retains its existing authority/rate limits.
+- Old global directory discovery helper now requires <=100 explicit Creator IDs.
+  Capacity reporting is a separate hourly maintenance lane, no longer a global
+  prerequisite for recurring creator planning. Its global aggregation is open.
+- Previous A36 Home/coordinator input was fully green: 95 offline + 189 physical,
+  cleanup/migrations successful and service live. New A37-R1 proofs now confirmed
+  as above; this input's one fairness failure prevented the subsequent deploy.
 
-REMAINING BOUNDARY — LARGE PASS 2 TARGET, NOT A CLAIM OF COMPLETION
-A. Incremental capacity projections with bounded dirty repair, restart/rebuild and
-   explicit freshness/coverage; retire the remaining global capacity aggregation.
-B. Home demand SQL cost/index proof, fair indexed claim admission, scoped-member
-   materialization and access/lease checks at the planning COMMIT boundary.
-C. Prove rolling coexistence/drain against already-running previous backend
-   replicas; source delegates remove the old writer only in the new generation.
-   Existing idempotency is not by itself a full rolling-deploy authority proof.
-D. Broader claim settlement expiry/wait behavior, terminal failure/quarantine policy,
-   and timer/admin health aggregation across the fast creator maintenance lane.
-E. Real many-large-agencies workloads (thousands of agencies with thousands of
-   creators EACH), 100 workers/multiple replicas/large history: scanned rows,
-   locks, queue wait/fairness, retry and planner/capacity contention. Existing tests
-   of 1000x4 and 4x1000 are not proof of both large axes together.
-F. Final new Backend + current Desktop actual: adversarial source sweep for second
-   writers/old readers/routes/RPCs, billing/admin/migration/external compatibility,
-   plus reconcile 103 old full-suite contract failures against current authorities.
+REMAINING PHASE 3 BOUNDARY / NOT CLOSED
+A. Incremental capacity projections with bounded dirty repair, restart/rebuild,
+   explicit freshness/coverage, replacing global readCanonicalCapacityInputs.
+B. Home due-query/index/lock cost, relational member scope instead of all assigned
+   IDs, and authorization plus demand lease fencing at planning COMMIT. Checks
+   before a creator alone are not a commit proof.
+C. Full rolling coexistence/drain against already-running prior backend writers.
+   Source delegates remove writers only in the new binary. Old replicas still
+   need an explicit retirement/cutover proof; idempotency alone is insufficient.
+D. A37-R2 settlement correctness and fairness await physical confirmation. Separate
+   terminal/quarantine policy and complete fast-lane timer/admin health remain.
+E. Thousands of Agencies with thousands of Creators EACH, 100 workers, large
+   history and multiple replicas: actual scanned rows, lock wait/queue fairness,
+   retry and planner/capacity contention. 1000x4 and 4x1000 are not both large
+   axes together; the three-wave test is stronger but is not total SCALE CLOSURE.
+F. Fresh Backend AND current Desktop adversarial closure: all writers/readers,
+   Home/Analytics/billing/admin/routes/RPCs/external compatibility/schema/migration,
+   and reconciliation of the 103 historical full-suite contract failures.
 
-MASTER ROADMAP / NEXT ACTION
-Remain in Phase 3 Analytics/Home/Stats. No next domain started.
-Previous coordinator and Home proofs: CONFIRMED on supplied Render.
-Global recurring planner cutover: IMPLEMENTED / NEW PHYSICAL PROOF PENDING.
-Capacity and whole-domain SOURCE/SCALE closure: OPEN.
-Next: accept A37 Render evidence, then the connected capacity/Home/rollout/scale
-closure pass on the new full actual. Two passes is a target, not permission to
-mark unresolved findings CLOSED. New shared-infrastructure changes require a
-horizontal resweep before final domain closure.
+MASTER MAP / RECOVERY
+Stay on Analytics/Home/Stats; no next domain was started. A37-R2 is continued
+closure of the same node, not a new audit number or a Phase 3 CLOSED claim.
+Next: run the unchanged Render command. If red, keep the complete failing proof
+and current source as authority; never lower assertions or omit tests to deploy.
+If green, physically confirm A37-R2, then continue the remaining boundary above.
+The remaining list has not disappeared just because this build failure is fixed.
+No trustworthy overall percentage or one-more-pass completion guarantee follows
+from the available evidence.

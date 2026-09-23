@@ -1,3 +1,19 @@
+# Phase 3 — A37-R2, конкурентная выдача и settlement
+
+**SOURCE OPEN / SCALE OPEN. Analytics closure continues.** Единственная актуальная база: `2026-09-23T183031.958.zip`. Она побайтово совпадает с A37-R1. Новый Render подтверждает все три A37-R1 proof во всех трёх сценариях, но итог **197/198**: в clean-current две реплики выбрали 100 разных задач из **99 агентств**. Offline **101/101**, fixture leaks отсутствуют, cleanup успешен; primary migration/deploy заблокированы.
+
+A37-R2 связывает bounded snapshot/revision CAS при резервировании Agency/shard, время после блокировки, монотонные selection watermarks в трёх reconciliation-функциях и отказ от physical fallback при конкуренции за существующие locators. Все шесть settlement-операций используют общий live claim fence после row lock, с сохранением dependency → DWI порядка. Новая additive migration меняет только функции; модели и зависимости прежние.
+
+Локально: **135/135 обязательных offline**, syntax/no-undef **93**, Prisma source contracts **362**, identifier lint проходят. Две новые behavioral regression падают на старом authority module и проходят на новом. Full suite **3224 / 3003 pass / 103 прежних fail / 118 skip** — новых имён падений нет, весь набор пока не зелёный.
+
+Physical manifest **A37-R2: 69 × 3 = 207**. Добавлены принудительная гонка snapshot/revision на Agency и shard, проверка монотонности всех трёх уровней, шесть expiry-after-wait переходов. Прежний scale proof усилен до трёх волн и 300 различных агентств. Эти PostgreSQL проверки и migration ещё не запускались локально: необходим Render. Полная SOURCE/SCALE closure не объявлена.
+
+Ставить через прежний gate как кандидат — **ДА**; завершённая Phase 3 — **НЕТ**. Команда: `npm install && npm run audit:phase3-a29-render`. Полный самодостаточный checkpoint, hashes, текущие доказательства, границы и recovery: `PHASE3_ANALYTICS_COORDINATOR_CHECKPOINT_20260923.txt`.
+
+Далее сохранена история. Старые pending/failed/installation статусы относятся только к обозначенным там actual; текущий статус указан выше и в TXT.
+
+---
+
 # Phase 3 — A37-R1, recurring Analytics planning cutover
 
 **SOURCE OPEN / SCALE OPEN. Первый крупный проход.** Actual `2026-09-23T175022.545(1).zip` подтверждён Render: **95/95 offline, 189/189 PostgreSQL**, cleanup/migrations успешны, сервис live.

@@ -8,6 +8,21 @@ const path = require("node:path");
 const ROOT = path.resolve(__dirname, "../..");
 const source = (relative) => fs.readFileSync(path.join(ROOT, relative), "utf8");
 
+test("A37-R2 dispatch uses bounded snapshot revisions and preserves generation-local fairness watermarks", () => {
+  const domain = source("src/services/domain-work-authority-service.js");
+  const migration = source("prisma/migrations/20260923160000_phase3_dispatch_fairness_monotonic_v1/migration.sql");
+  assert.equal((domain.match(/WITH observed AS MATERIALIZED/g) || []).length, 2);
+  for (const alias of ["a", "s"]) {
+    assert.ok(domain.includes(`${alias}."revision"=o."revision"`));
+    assert.ok(domain.includes(`${alias}."revision"=c."revision"`));
+    assert.ok(domain.includes(`GREATEST(stamp."selectedAt",${alias}."lastSelectedAt")`));
+  }
+  assert.equal((domain.match(/if \(due\?\.length\) return .*contended: true/g) || []).length, 2);
+  assert.equal((migration.match(/GREATEST\(v_due,p_touched_at,v_last_selected\)/g) || []).length, 3);
+  assert.equal((migration.match(/THEN [aps]\."last(?:Selected|Claimed)At" ELSE NULL END/g) || []).length, 3);
+  assert.doesNotMatch(migration, /CREATE TABLE|ALTER TABLE|DROP |DISABLE TRIGGER/);
+});
+
 test("A34 scheduler outcome contract rejects malformed/nested failures without losing created work", async () => {
   const scheduler = require("./job-scheduler");
   const { SCHEDULER_OUTCOME, normalizeSchedulerDecision, executeSchedulerConsumer } = scheduler._test;
@@ -354,10 +369,11 @@ test("A36 DomainWork admission is bounded on both Agency and creator axes withou
   assert.match(physical, /A36_EXECUTOR_GENERATION_CUTOVER_PASS/);
   assert.match(physical, /A36_DEPENDENCY_WAKE_BOUNDED_FANOUT_PASS/);
   assert.match(physical, /batchSize: 37[\s\S]*live-after-cursor/);
-  assert.match(physical, /assert\.equal\(allAgencies\.size, 100\)/);
+  assert.match(physical, /assert\.equal\(servedAgencies\.size, 300\)/);
+  assert.match(physical, /wave < 3/);
   assert.match(physical, /opposite-order multi-write transactions defer exact partition-shard-Agency reconciliation without deadlock/);
   assert.match(physical, /opposite-order transactions sharing the exact same partitions cannot retain the retired row-trigger inversion/);
-  assert.equal((physical.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 4);
+  assert.equal((physical.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 6);
   assert.match(physical, /state: "BLOCKED"[\s\S]*blockedPartitions\.every\(\(row\) => row\.nextClaimableAt == null\)/);
   assert.match(physical, /rebuiltPartition\?\.nextClaimableAt[\s\S]*rebuiltShard\?\.nextDispatchAt[\s\S]*rebuiltAgency\?\.nextDispatchAt/);
 });

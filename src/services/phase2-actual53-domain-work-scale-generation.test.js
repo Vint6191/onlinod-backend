@@ -37,7 +37,7 @@ function productionClaimDb(now) {
       sql.push(text);
       const authorization = claimAuthorizationRows(text, params);
       if (authorization) return authorization;
-      if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
+      if (text.trim() === 'SELECT clock_timestamp() AS "authorityNow"') return [{ authorityNow: now }];
       if (text.includes('UPDATE "DomainWorkClaimAgencyState" a') && text.includes('RETURNING a."agencyId"')) {
         agencySelections += 1;
         return agencySelections === 1 ? [{ agencyId: "agency-1" }] : [];
@@ -99,7 +99,7 @@ test("A36 broad member scope derives the only claim tenant from the fenced membe
       sql.push(text);
       const authorization = claimAuthorizationRows(text, params);
       if (authorization) return authorization;
-      if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
+      if (text.trim() === 'SELECT clock_timestamp() AS "authorityNow"') return [{ authorityNow: now }];
       if (text.includes('FROM "AgencyMember" m') && text.includes("FOR SHARE OF m")) {
         assert.deepEqual(params.slice(0, 4), ["member-a", "user-a", "agency-member", 7]);
         return [{ id: "member-a", broad: true }];
@@ -146,7 +146,7 @@ test("A36 physical fallback claims one DWI then revision-CAS reconciles its loca
       const text = String(statement); sql.push(text);
       const authorization = claimAuthorizationRows(text, params);
       if (authorization) return authorization;
-      if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
+      if (text.trim() === 'SELECT clock_timestamp() AS "authorityNow"') return [{ authorityNow: now }];
       if (text.includes('SELECT d."agencyId"') && text.includes('FROM "DomainWorkItem" d')) return [{ agencyId: "agency-recovered" }];
       if (text.includes('AS "claimShard"') && text.includes('FROM "DomainWorkItem" d')) return [{ claimShard: 11 }];
       if (text.includes('SELECT f."partitionKey"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) return [];
@@ -171,6 +171,28 @@ test("A36 physical fallback claims one DWI then revision-CAS reconciles its loca
   assert.doesNotMatch(sql.join("\n"), /INSERT INTO "Phase2WorkFamilyState"|UPDATE "Phase2WorkFamilyState"/);
 });
 
+test("A37-R2 contended Agency and shard reservations cannot bypass fairness through physical fallback", async () => {
+  for (const level of ["Agency", "Shard"]) {
+    const fx = productionClaimDb(new Date("2026-09-23T12:00:00Z"));
+    const raw = fx.db.$queryRawUnsafe.bind(fx.db);
+    let reservations = 0;
+    let physicalReads = 0;
+    fx.db.$queryRawUnsafe = async (statement, ...params) => {
+      const sql = String(statement);
+      if (sql.includes(`UPDATE "DomainWorkClaim${level}State"`)) { reservations += 1; return []; }
+      if (sql.includes(`FROM "DomainWorkClaim${level}State"`) && sql.trim().startsWith("SELECT")) return [{ id: "contended-locator" }];
+      if (sql.includes('FROM "DomainWorkItem"')) { physicalReads += 1; return [{ agencyId: "unfair-bypass", claimShard: 0 }]; }
+      return raw(statement, ...params);
+    };
+    const result = await authority.claimDomainWorkBatch({ db: fx.db,
+      workClass: authority.WORK_CLASS.CREATOR_RECURRING_PLANNING, limit: 1,
+      ...(level === "Shard" ? { agencyId: "agency-1" } : {}) });
+    assert.deepEqual(result.items, []);
+    assert.ok(reservations > 0 && reservations <= 129, "contention must return within the fixed repair budget");
+    assert.equal(physicalReads, 0, "existing contended locators must retain dispatch authority");
+  }
+});
+
 test("A36 current partition candidate is admitted after separate Agency/shard reservations", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
   const sql = [];
@@ -184,7 +206,7 @@ test("A36 current partition candidate is admitted after separate Agency/shard re
       const text = String(statement); sql.push(text);
       const authorization = claimAuthorizationRows(text, params);
       if (authorization) return authorization;
-      if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
+      if (text.trim() === 'SELECT clock_timestamp() AS "authorityNow"') return [{ authorityNow: now }];
       if (text.includes('UPDATE "DomainWorkClaimAgencyState" a')) return [{ agencyId: "agency-current" }];
       if (text.includes('UPDATE "DomainWorkClaimShardState" s')) return [{ claimShard: 5 }];
       if (text.includes('SELECT f."partitionKey"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) return [{ partitionKey: "creator-1" }];
@@ -239,7 +261,7 @@ test("A36 catalog miss claims one physical DWI and repairs bounded locators with
       const text = String(statement); sql.push(text);
       const authorization = claimAuthorizationRows(text, params);
       if (authorization) return authorization;
-      if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
+      if (text.trim() === 'SELECT clock_timestamp() AS "authorityNow"') return [{ authorityNow: now }];
       if (text.includes('AS "claimShard"') && text.includes('FROM "DomainWorkItem" d')) {
         physicalShard += 1; return physicalShard === 1 ? [{ claimShard: 13 }] : [];
       }

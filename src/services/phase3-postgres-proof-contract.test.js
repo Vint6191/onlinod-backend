@@ -192,7 +192,7 @@ test("Phase3 member proof tears down User through the same generation-fenced fix
   const source = fs.readFileSync(path.join(ROOT, "src/services/phase3-a34-source-scale-closure.integration.test.js"), "utf8");
   assert.match(source, /cleanupPhase3PostgresFixtureGraph\(dbA, \{ agencyId, userIds: \[userId\] \}\)/);
   assert.doesNotMatch(source, /dbA\.user\.deleteMany/);
-  assert.equal((source.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 4);
+  assert.equal((source.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 6);
   assert.doesNotMatch(source, /SELECT pg_sleep/);
 });
 

@@ -1110,29 +1110,38 @@ test("A36 PostgreSQL: 1000 agencies publish 4000 creators and two replicas claim
     assert.match(planEvidence, /DomainWorkItem_claimable_global_a36_idx/);
 
     const began = Date.now();
-    const [claimA, claimB] = await Promise.all([
-      claimDomainWorkBatch({
-        db: dbA, workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING,
-        ownerToken: `${prefix}-replica-a`, limit: 50, perAgencyQuantum: 1,
-        perPartitionQuantum: 1, leaseMs: 120_000,
-      }),
-      claimDomainWorkBatch({
-        db: dbB, workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING,
-        ownerToken: `${prefix}-replica-b`, limit: 50, perAgencyQuantum: 1,
-        perPartitionQuantum: 1, leaseMs: 120_000,
-      }),
-    ]);
-    const idsA = new Set(claimA.items.map((item) => item.id));
-    const idsB = new Set(claimB.items.map((item) => item.id));
-    const agenciesA = new Set(claimA.items.map((item) => item.agencyId));
-    const agenciesB = new Set(claimB.items.map((item) => item.agencyId));
-    const allAgencies = new Set([...agenciesA, ...agenciesB]);
-    assert.equal(claimA.items.length, 50);
-    assert.equal(claimB.items.length, 50);
-    assert.equal([...idsA].filter((id) => idsB.has(id)).length, 0);
-    assert.equal(agenciesA.size, 50);
-    assert.equal(agenciesB.size, 50);
-    assert.equal(allAgencies.size, 100);
+    const servedAgencies = new Set();
+    const claimedIds = new Set();
+    for (let wave = 0; wave < 3; wave += 1) {
+      const outcomes = await Promise.allSettled([
+        claimDomainWorkBatch({
+          db: dbA, workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING,
+          ownerToken: `${prefix}-replica-a-${wave}`, limit: 50, perAgencyQuantum: 1,
+          perPartitionQuantum: 1, leaseMs: 120_000,
+        }),
+        claimDomainWorkBatch({
+          db: dbB, workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING,
+          ownerToken: `${prefix}-replica-b-${wave}`, limit: 50, perAgencyQuantum: 1,
+          perPartitionQuantum: 1, leaseMs: 120_000,
+        }),
+      ]);
+      for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+      const [claimA, claimB] = outcomes.map((outcome) => outcome.value);
+      const waveItems = [...claimA.items, ...claimB.items];
+      assert.equal(claimA.items.length, 50);
+      assert.equal(claimB.items.length, 50);
+      assert.equal(new Set(claimA.items.map((item) => item.agencyId)).size, 50);
+      assert.equal(new Set(claimB.items.map((item) => item.agencyId)).size, 50);
+      assert.equal(new Set(waveItems.map((item) => item.agencyId)).size, 100,
+        `wave ${wave}: both replicas must rotate through unserved Agencies`);
+      for (const item of waveItems) {
+        assert.equal(claimedIds.has(item.id), false, "replicas must never claim the same work");
+        assert.equal(servedAgencies.has(item.agencyId), false, "an unserved Agency must precede a repeat reservation");
+        claimedIds.add(item.id);
+        servedAgencies.add(item.agencyId);
+      }
+    }
+    assert.equal(servedAgencies.size, 300);
     assert.ok(Date.now() - began < 60_000);
 
     const attempts = await dbA.domainWorkItem.groupBy({
@@ -1144,7 +1153,7 @@ test("A36 PostgreSQL: 1000 agencies publish 4000 creators and two replicas claim
       },
       _count: { _all: true },
     });
-    assert.deepEqual(attempts.map((row) => ({ attempts: row.attempts, count: row._count._all })), [{ attempts: 1, count: 100 }]);
+    assert.deepEqual(attempts.map((row) => ({ attempts: row.attempts, count: row._count._all })), [{ attempts: 1, count: 300 }]);
     console.log("# A36_1000_AGENCY_4000_CREATOR_TWO_REPLICA_PASS");
   } finally {
     await withPhase3PostgresFixtureAuthority(dbA, async (tx) => {
@@ -1542,5 +1551,184 @@ test("A34 PostgreSQL: expired recurring claim is fenced, restart takes over and 
     await cleanupPhase3PostgresAgencyFixture(dbA, scope.agencyId);
     await dbA.$disconnect();
     await dbB.$disconnect();
+  }
+});
+
+test("A37-R2 PostgreSQL: stale sorted Agency and shard candidates cannot survive a concurrent reservation", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const observer = new PrismaClient();
+  const scopes = [];
+  try {
+    for (const level of ["agency", "shard"]) {
+      const scope = await createAgencyCreator(dbA, `a37-cas-${level}`);
+      const peer = await createAgencyCreator(dbA, `a37-cas-${level}-peer`);
+      scopes.push(scope, peer);
+      const klass = nonce("A37_FAIR_DISPATCH");
+      const partitions = await dbA.$queryRawUnsafe(
+        `SELECT DISTINCT ON ("phase3_domain_work_claim_shard"(g::text))
+                g::text AS key,"phase3_domain_work_claim_shard"(g::text) AS shard
+           FROM generate_series(1,128) g
+          ORDER BY "phase3_domain_work_claim_shard"(g::text),g LIMIT 2`);
+      assert.equal(partitions.length, 2);
+      for (const [index, row] of partitions.entries()) {
+        await publishDomainWork({ db: dbA, agencyId: scope.agencyId, workClass: klass,
+          objectType: "FairProbe", objectId: `${klass}-${index}`, partitionKey: row.key });
+      }
+      await publishDomainWork({ db: dbA, agencyId: peer.agencyId, workClass: klass,
+        objectType: "FairProbe", objectId: `${klass}-peer`, partitionKey: "peer" });
+      const table = level === "agency" ? "DomainWorkClaimAgencyState" : "DomainWorkClaimShardState";
+      const initial = level === "agency"
+        ? await dbA.domainWorkClaimAgencyState.findFirst({ where: { workClass: klass }, orderBy: [{ nextDispatchAt: "asc" }, { revision: "asc" }, { agencyId: "asc" }] })
+        : await dbA.domainWorkClaimShardState.findFirst({ where: { workClass: klass, agencyId: scope.agencyId }, orderBy: [{ nextDispatchAt: "asc" }, { revision: "asc" }, { claimShard: "asc" }] });
+      assert.ok(initial);
+      const lockKey = `${klass}-snapshot-barrier`;
+      let holderPid;
+      let waiterPid;
+      let admissionClock;
+      let result;
+      let intercepted = false;
+      await runPhase3InterleavedTransactions({
+        dbA, dbB,
+        firstA: async (tx) => {
+          [{ pid: holderPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid');
+          await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))', lockKey);
+        },
+        firstB: async (tx) => { [{ pid: waiterPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid'); },
+        secondA: async (tx) => {
+          await waitForPhase3PostgresBlock({ db: observer, holderPid, waiterPid });
+          // Reproduce a peer publishing its pre-sampled clock. The new row is
+          // still due for the waiting SELECT, but no longer owns its old place.
+          await tx.$executeRawUnsafe(`UPDATE "${table}" SET "revision"="revision"+1,
+            "nextDispatchAt"=$2,"lastSelectedAt"=$2 WHERE "id"=$1`, initial.id, admissionClock);
+        },
+        secondB: async (tx) => {
+          const wrapped = new Proxy(tx, { get(target, key) {
+            if (key === "$queryRawUnsafe") return async (sql, ...params) => {
+              if (!intercepted && sql.includes("WITH observed AS MATERIALIZED") && sql.includes(`UPDATE "${table}"`)) {
+                intercepted = true;
+                admissionClock = params[1];
+                // Test-only barrier inside the production query, after the
+                // materialized snapshot and before locking the candidate.
+                const parameter = `$${params.length + 1}`;
+                sql = sql.replace("), candidate AS MATERIALIZED (", `), paused AS MATERIALIZED (
+                  SELECT pg_advisory_xact_lock(hashtext(${parameter})) FROM observed LIMIT 1
+                ), candidate AS MATERIALIZED (`).replace("FROM observed o JOIN", "FROM observed o CROSS JOIN paused JOIN");
+                params.push(lockKey);
+              }
+              return target.$queryRawUnsafe(sql, ...params);
+            };
+            const value = target[key];
+            return typeof value === "function" ? value.bind(target) : value;
+          } });
+          // Reuse the helper's real transaction for this single-query race.
+          // No production callback/hook is introduced by the proof.
+          const root = new Proxy(wrapped, { get(target, key) {
+            return key === "$transaction" ? (work) => work(wrapped) : target[key];
+          } });
+          result = await claimDomainWorkBatch({ db: root, workClass: klass,
+            ...(level === "shard" ? { agencyId: scope.agencyId } : {}),
+            ownerToken: `${klass}-waiter`, limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1 });
+        },
+      });
+      assert.equal(intercepted, true);
+      assert.equal(result.items.length, 1);
+      if (level === "agency") assert.notEqual(result.items[0].agencyId, initial.agencyId);
+      else {
+        const [chosen] = await dbA.$queryRawUnsafe('SELECT "phase3_domain_work_claim_shard"($1) AS shard', result.items[0].partitionKey);
+        assert.notEqual(chosen.shard, initial.claimShard);
+      }
+    }
+    console.log("# A37_DISPATCH_STALE_SNAPSHOT_CAS_PASS");
+  } finally {
+    try { for (const scope of scopes) await cleanupPhase3PostgresAgencyFixture(dbA, scope.agencyId); }
+    finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect(), observer.$disconnect()]); }
+  }
+});
+
+test("A37-R2 PostgreSQL: reconciliation cannot rewind partition shard or Agency dispatch watermarks", { skip: !enabled, timeout: 60_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const db = new PrismaClient();
+  let scope;
+  try {
+    scope = await createAgencyCreator(db, "a37-watermark", { status: "READY" });
+    const klass = WORK_CLASS.CREATOR_RECURRING_PLANNING;
+    const partition = await db.phase2WorkBroadClaimPartitionState.findUnique({ where: { agencyId_workClass_partitionKey: {
+      agencyId: scope.agencyId, workClass: klass, partitionKey: scope.creatorId,
+    } } });
+    assert.ok(partition);
+    const [clock] = await db.$queryRawUnsafe('SELECT clock_timestamp() AS now');
+    const selected = new Date(clock.now.getTime() + 1000);
+    const generation = partition.activeGeneration;
+    for (const touched of [selected, clock.now, null]) {
+      await db.$queryRawUnsafe('SELECT "phase3_reconcile_domain_work_claim_partition"($1,$2,$3,$4,$5::timestamptz)', scope.agencyId, klass, generation, scope.creatorId, touched);
+      await db.$queryRawUnsafe('SELECT "phase3_reconcile_domain_work_claim_shard"($1,$2,$3,$4,$5::timestamptz)', scope.agencyId, klass, generation, partition.claimShard, touched);
+      await db.$queryRawUnsafe('SELECT "phase3_reconcile_domain_work_claim_agency"($1,$2,$3,$4::timestamptz)', scope.agencyId, klass, generation, touched);
+      const p = await db.phase2WorkBroadClaimPartitionState.findUnique({ where: { id: partition.id } });
+      const s = await db.domainWorkClaimShardState.findFirst({ where: { agencyId: scope.agencyId, workClass: klass, claimShard: partition.claimShard } });
+      const a = await db.domainWorkClaimAgencyState.findFirst({ where: { agencyId: scope.agencyId, workClass: klass } });
+      for (const [dispatch, watermark] of [[p.nextClaimableAt, p.lastClaimedAt], [s.nextDispatchAt, s.lastSelectedAt], [a.nextDispatchAt, a.lastSelectedAt]]) {
+        assert.equal(dispatch.getTime(), selected.getTime());
+        assert.equal(watermark.getTime(), selected.getTime());
+      }
+    }
+    console.log("# A37_DISPATCH_MONOTONIC_RECONCILIATION_PASS");
+  } finally {
+    try { if (scope) await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId); }
+    finally { await db.$disconnect(); }
+  }
+});
+
+test("A37-R2 PostgreSQL: all six claim settlements reject expiry after an observed work-row wait", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const authority = require("./domain-work-authority-service");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const observer = new PrismaClient();
+  let scope;
+  try {
+    scope = await createAgencyCreator(dbA, "a37-settlement-wait", { status: "READY" });
+    const claim = await claimDomainWorkBatch({ db: dbA, workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING,
+      agencyId: scope.agencyId, creatorIds: [scope.creatorId], limit: 1, leaseMs: 60_000 });
+    assert.equal(claim.items.length, 1);
+    const item = claim.items[0];
+    for (const [name, field] of [["heartbeatDomainWorkClaim", "renewed"], ["ackDomainWorkClaim", "acknowledged"],
+      ["blockDomainWorkClaim", "blocked"], ["failDomainWorkClaim", "failed"],
+      ["saveDomainWorkProgress", "saved"], ["yieldDomainWorkClaim", "yielded"]]) {
+      await dbA.$executeRawUnsafe('UPDATE "DomainWorkItem" SET "leaseUntil"=clock_timestamp() + interval \'1 minute\' WHERE "id"=$1', item.id);
+      let holderPid;
+      let waiterPid;
+      let outcome;
+      await runPhase3InterleavedTransactions({
+        dbA, dbB,
+        firstA: async (tx) => {
+          [{ pid: holderPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid');
+          await tx.$queryRawUnsafe('SELECT "id" FROM "DomainWorkItem" WHERE "id"=$1 FOR UPDATE', item.id);
+        },
+        firstB: async (tx) => { [{ pid: waiterPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid'); },
+        secondA: async (tx) => {
+          await waitForPhase3PostgresBlock({ db: observer, holderPid, waiterPid });
+          const [row] = await tx.$queryRawUnsafe('UPDATE "DomainWorkItem" SET "leaseUntil"=clock_timestamp() + interval \'100 milliseconds\' WHERE "id"=$1 RETURNING "leaseUntil" AS deadline', item.id);
+          await waitUntilPhase3DatabaseTime(tx, row.deadline);
+        },
+        secondB: async (tx) => {
+          outcome = await authority[name]({ db: tx, item, ownerToken: claim.ownerToken,
+            dependencyKind: "A37_WAIT", dependencyKey: item.id, progressCursor: { forbidden: true } });
+        },
+      });
+      assert.equal(outcome[field], false, name);
+      assert.equal(outcome.lost, true, name);
+      const current = await dbA.domainWorkItem.findUnique({ where: { id: item.id } });
+      assert.equal(current.state, "CLAIMED", name);
+      assert.equal(current.ownerToken, claim.ownerToken, name);
+      assert.equal(current.completedRevision, item.completedRevision, name);
+      assert.equal(current.progressCursor, null, name);
+      assert.equal(current.nextAttemptAt, null, name);
+    }
+    console.log("# A37_ALL_SETTLEMENTS_OBSERVED_WAIT_EXPIRY_PASS");
+  } finally {
+    try { if (scope) await cleanupPhase3PostgresAgencyFixture(dbA, scope.agencyId); }
+    finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect(), observer.$disconnect()]); }
   }
 });

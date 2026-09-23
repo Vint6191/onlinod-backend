@@ -778,29 +778,49 @@ async function claimDomainWorkBatchInternal({
             locatorFilter += ` AND a."agencyId" NOT IN (${placeholders})`;
           }
           const reservationSql =
-            `WITH candidate AS MATERIALIZED (
-               SELECT a."id"
+            `WITH observed AS MATERIALIZED (
+               SELECT a."id",a."revision",a."nextDispatchAt",a."agencyId"
                  FROM "DomainWorkClaimAgencyState" a
                 WHERE a."workClass"=$1 AND a."activeGeneration"=$3
                   AND a."nextDispatchAt" <= $2${locatorFilter}
                 ORDER BY a."nextDispatchAt",a."revision",a."agencyId"
+                LIMIT 128
+             ), candidate AS MATERIALIZED (
+               SELECT a."id",a."revision"
+                 FROM observed o JOIN "DomainWorkClaimAgencyState" a
+                   ON a."id"=o."id" AND a."revision"=o."revision"
+                ORDER BY o."nextDispatchAt",o."revision",o."agencyId"
                 FOR UPDATE OF a SKIP LOCKED
                 LIMIT 1
+             ), stamp AS MATERIALIZED (
+               SELECT (clock_timestamp() AT TIME ZONE 'UTC')::timestamp(3) AS "selectedAt"
+                 FROM candidate
              )
              UPDATE "DomainWorkClaimAgencyState" a
-                SET "nextDispatchAt"=$2,"lastSelectedAt"=$2,
+                SET "nextDispatchAt"=GREATEST(stamp."selectedAt",a."lastSelectedAt"),
+                    "lastSelectedAt"=GREATEST(stamp."selectedAt",a."lastSelectedAt"),
                     "revision"=a."revision"+1,"updatedAt"=CURRENT_TIMESTAMP
-               FROM candidate c WHERE a."id"=c."id"
+               FROM candidate c CROSS JOIN stamp
+              WHERE a."id"=c."id" AND a."revision"=c."revision"
              RETURNING a."agencyId"`;
 
           let rows = await tx.$queryRawUnsafe(reservationSql, ...params);
-          // A contended locator is an optimization miss, not permission to
-          // block while a DWI transaction is reconciling shard -> Agency. The
-          // indexed physical witness below preserves correctness and avoids a
-          // locator/DWI wait cycle across replicas.
+          // Reservations never wait behind a DWI writer reconciling shard ->
+          // Agency. Contention retries the bounded hierarchy; only actual
+          // absence of due locators permits physical-witness repair.
           let reservedAgency = clean(rows?.[0]?.agencyId, 180);
 
           if (!reservedAgency) {
+            // A snapshot can see a locator before a peer reserves it. Never
+            // accept its new revision at the old sorted position, or bypass
+            // the fair hierarchy because the bounded window was contended.
+            const due = await tx.$queryRawUnsafe(
+              `SELECT a."id" FROM "DomainWorkClaimAgencyState" a
+                WHERE a."workClass"=$1 AND a."activeGeneration"=$3
+                  AND a."nextDispatchAt" <= $2${locatorFilter}
+                ORDER BY a."nextDispatchAt",a."revision",a."agencyId" LIMIT 1`, ...params,
+            );
+            if (due?.length) return { agencyId: null, authorityNow, contended: true };
             const physicalParams = [klass, authorityNow, String(generation)];
             let physicalFilter = "";
             if (excluded.length) {
@@ -834,6 +854,7 @@ async function claimDomainWorkBatchInternal({
           bridgeTransitioned = true;
           break;
         }
+        if (agencyReservation.contended) continue;
         selectedAgency = clean(agencyReservation.agencyId, 180);
         if (!firstAuthorityNow) firstAuthorityNow = agencyReservation.authorityNow || null;
       }
@@ -856,25 +877,43 @@ async function claimDomainWorkBatchInternal({
           shardFilter += ` AND s."claimShard" NOT IN (${placeholders})`;
         }
         const reservationSql =
-          `WITH candidate AS MATERIALIZED (
-             SELECT s."id"
+          `WITH observed AS MATERIALIZED (
+             SELECT s."id",s."revision",s."nextDispatchAt",s."claimShard"
                FROM "DomainWorkClaimShardState" s
               WHERE s."agencyId"=$4 AND s."workClass"=$1 AND s."activeGeneration"=$3
                 AND s."nextDispatchAt" <= $2${shardFilter}
               ORDER BY s."nextDispatchAt",s."revision",s."claimShard"
+              LIMIT 128
+           ), candidate AS MATERIALIZED (
+             SELECT s."id",s."revision"
+               FROM observed o JOIN "DomainWorkClaimShardState" s
+                 ON s."id"=o."id" AND s."revision"=o."revision"
+              ORDER BY o."nextDispatchAt",o."revision",o."claimShard"
               FOR UPDATE OF s SKIP LOCKED
               LIMIT 1
+           ), stamp AS MATERIALIZED (
+             SELECT (clock_timestamp() AT TIME ZONE 'UTC')::timestamp(3) AS "selectedAt"
+               FROM candidate
            )
            UPDATE "DomainWorkClaimShardState" s
-              SET "nextDispatchAt"=$2,"lastSelectedAt"=$2,
+              SET "nextDispatchAt"=GREATEST(stamp."selectedAt",s."lastSelectedAt"),
+                  "lastSelectedAt"=GREATEST(stamp."selectedAt",s."lastSelectedAt"),
                   "revision"=s."revision"+1,"updatedAt"=CURRENT_TIMESTAMP
-             FROM candidate c WHERE s."id"=c."id"
+             FROM candidate c CROSS JOIN stamp
+            WHERE s."id"=c."id" AND s."revision"=c."revision"
            RETURNING s."claimShard"`;
 
         let shardRows = await tx.$queryRawUnsafe(reservationSql, ...shardParams);
         let selectedShard = Number(shardRows?.[0]?.claimShard);
 
         if (!Number.isInteger(selectedShard) || selectedShard < 0 || selectedShard >= DOMAIN_WORK_CLAIM_SHARD_COUNT) {
+          const due = await tx.$queryRawUnsafe(
+            `SELECT s."id" FROM "DomainWorkClaimShardState" s
+              WHERE s."agencyId"=$4 AND s."workClass"=$1 AND s."activeGeneration"=$3
+                AND s."nextDispatchAt" <= $2${shardFilter}
+              ORDER BY s."nextDispatchAt",s."revision",s."claimShard" LIMIT 1`, ...shardParams,
+          );
+          if (due?.length) return { claimShard: null, authorityNow, contended: true };
           // Locator loss cannot lose work. This physical probe is constrained to
           // one Agency and an indexed current-DWI expression, never DONE history.
           const physicalParams = [klass, authorityNow, String(generation), selectedAgency];
@@ -918,6 +957,7 @@ async function claimDomainWorkBatchInternal({
         bridgeTransitioned = true;
         break;
       }
+      if (shardReservation.contended) continue;
 
       const selectedShard = shardReservation.claimShard == null ? Number.NaN : Number(shardReservation.claimShard);
       if (!firstAuthorityNow) firstAuthorityNow = shardReservation.authorityNow || null;
@@ -1237,7 +1277,9 @@ async function heartbeatDomainWorkClaim({ db = null, item, ownerToken = null, le
   if (!db) db = require("../prisma");
   if (!item?.id) return { renewed: false, lost: true };
   return runDbTransaction(db, async (tx) => {
-    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const ownership = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow, generation });
+    if (!ownership.current) return { renewed: false, lost: true };
+    const authorityNow = ownership.authorityNow;
     const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
     const changed = await tx.domainWorkItem?.updateMany?.({ where: claimWhere(item, ownerToken, authorityNow, generation), data: { leaseUntil } });
     if (Number(changed?.count || 0) !== 1) return { renewed: false, lost: true, authorityNow };
@@ -1249,7 +1291,9 @@ async function ackDomainWorkClaim({ db = null, item, ownerToken = null, fallback
   if (!db) db = require("../prisma");
   if (!item?.id) return { acknowledged: false, lost: true };
   return runDbTransaction(db, async (tx) => {
-    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const ownership = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow, generation });
+    if (!ownership.current) return { acknowledged: false, lost: true };
+    const authorityNow = ownership.authorityNow;
     if (typeof tx?.$queryRawUnsafe === "function") {
       const rows = await tx.$queryRawUnsafe(
         `UPDATE "DomainWorkItem" SET
@@ -1286,9 +1330,12 @@ async function blockDomainWorkClaim({ db = null, item, ownerToken = null, depend
   const depKind = clean(dependencyKind, 120); const depKey = clean(dependencyKey, 240);
   if (!item?.id || !depKind || !depKey) throw Object.assign(new Error("Blocked domain work requires claim and dependency identity"), { code: "DOMAIN_WORK_DEPENDENCY_REQUIRED" });
   return runDbTransaction(db, async (tx) => {
-    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     const observedDependencyRevision = asBigInt(dependencyRevision);
     const currentDependency = await lockDependencyRevisionForBlock(tx, { agencyId: item.agencyId, dependencyKind: depKind, dependencyKey: depKey });
+    // Keep the dependency -> DWI order used by dependency publishers/wakeups.
+    const ownership = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow, generation });
+    if (!ownership.current) return { blocked: false, lost: true };
+    const authorityNow = ownership.authorityNow;
     const baseWhere = claimWhere(item, ownerToken, authorityNow, generation);
 
     // If the dependency already advanced, never publish BLOCKED. The dependency row is
@@ -1334,7 +1381,9 @@ async function failDomainWorkClaim({ db = null, item, ownerToken = null, error =
   if (!db) db = require("../prisma");
   if (!item?.id) return { failed: false, lost: true };
   return runDbTransaction(db, async (tx) => {
-    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const ownership = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow, generation });
+    if (!ownership.current) return { failed: false, lost: true };
+    const authorityNow = ownership.authorityNow;
     const attempts = Math.max(1, Number(item.attempts || 1));
     const delay = Math.min(15 * 60_000, Math.max(1_000, 2 ** Math.min(10, attempts) * 1_000));
     const due = asDate(retryAt) || new Date(authorityNow.getTime() + delay);
@@ -1367,7 +1416,9 @@ async function saveDomainWorkProgress({ db = null, item, ownerToken = null, prog
   if (!db) db = require("../prisma");
   if (!item?.id) return { saved: false, lost: true };
   return runDbTransaction(db, async (tx) => {
-    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const ownership = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow, generation });
+    if (!ownership.current) return { saved: false, lost: true };
+    const authorityNow = ownership.authorityNow;
     const where = claimWhere(item, ownerToken, authorityNow, generation);
     where.requestedRevision = item.claimedRevision; // a new invalidation aborts the old enumeration cursor
     const changed = await tx.domainWorkItem?.updateMany?.({ where, data: { progressCursor: progressCursor ?? null } });
@@ -1379,7 +1430,9 @@ async function yieldDomainWorkClaim({ db = null, item, ownerToken = null, progre
   if (!db) db = require("../prisma");
   if (!item?.id) return { yielded: false, lost: true };
   return runDbTransaction(db, async (tx) => {
-    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    const ownership = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow, generation });
+    if (!ownership.current) return { yielded: false, lost: true };
+    const authorityNow = ownership.authorityNow;
     const due = asDate(availableAt) || authorityNow;
     const baseWhere = claimWhere(item, ownerToken, authorityNow, generation);
     const exactData = { state: STATE.READY, isOutstanding: true, ownerToken: null, leaseUntil: authorityNow, availableAt: due, nextAttemptAt: null, errorClass: null, lastError: null };
