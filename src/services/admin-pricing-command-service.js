@@ -21,6 +21,7 @@ async function setPricingWithinTransaction({ tx, creatorId, payload }) {
   const creator = await tx.creatorAccount.findUnique({ where: { id: creatorId }, include: { billingProfile: true } });
   if (!creator || creator.deletedAt || creator.agencyId !== identity.agencyId) throw adminError("CREATOR_NOT_FOUND", "Creator is no longer active in this agency", 404);
   const before = creator.billingProfile;
+  if (before && before.agencyId !== identity.agencyId) throw adminError("BILLING_SCOPE_MISMATCH", "Stored pricing does not match the creator agency; explicit repair is required", 409);
   const revision = before?.pricingRevision || 0;
   if (revision !== payload.expectedRevision) throw adminError("ADMIN_PRICING_REVISION_CONFLICT", "Pricing changed; reload before editing", 409, { currentRevision: revision });
   const { expectedRevision: _revision, reason: _reason, ...patch } = payload;

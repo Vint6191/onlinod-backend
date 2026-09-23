@@ -25,7 +25,28 @@ const pricingSchema = z.object({
   notes: z.string().max(3000).nullable().optional(),
 }).strict().refine(value => Object.keys(value).some(key => !["expectedRevision", "reason"].includes(key)), "No pricing changes supplied");
 
+const billingPolicySchema = z.object({
+  expectedRevision: revisionSchema, reason: reasonSchema,
+  plan: z.string().trim().min(1).max(80).optional(),
+  billingMode: z.enum(["MANUAL", "STRIPE", "CRYPTO", "FREE_INTERNAL"]).optional(),
+  billingPeriod: z.enum(["MONTHLY", "THREE_MONTHS", "SIX_MONTHS"]).optional(),
+  corePricePerCreatorCents: centsSchema.optional(),
+  trialEndsAt: z.string().datetime().nullable().optional(),
+}).strict().refine(value => Object.keys(value).some(key => !["expectedRevision", "reason"].includes(key)), "No policy changes supplied");
+const billingHoldSchema = z.object({ expectedRevision: revisionSchema, reason: reasonSchema, enabled: z.boolean() }).strict();
+const entitlementSchema = z.object({
+  expectedRevision: revisionSchema, reason: reasonSchema,
+  tier: z.enum(["STARTER", "GROWTH", "PRO", "ELITE", "CUSTOM"]).optional(),
+  coreValidUntil: z.string().datetime().nullable().optional(),
+  aiChatterValidUntil: z.string().datetime().nullable().optional(),
+  outreachValidUntil: z.string().datetime().nullable().optional(),
+}).strict().refine(value => ["coreValidUntil", "aiChatterValidUntil", "outreachValidUntil"].some(key => value[key] !== undefined), "Choose an access component to grant or revoke")
+  .refine(value => value.tier === undefined || value.coreValidUntil !== undefined, "Changing access tier requires an explicit core grant/revoke");
+
 const ACTIONS = Object.freeze({
+  "billing.policy.set": { roles: ["SUPER_ADMIN", "SUPPORT"], schema: billingPolicySchema },
+  "billing.hold.set": { roles: ["SUPER_ADMIN"], schema: billingHoldSchema },
+  "billing.entitlement.set": { roles: ["SUPER_ADMIN", "SUPPORT"], schema: entitlementSchema },
   "billing.pricing.set": { roles: ["SUPER_ADMIN", "SUPPORT"], schema: pricingSchema },
   "admin.identity.create": { roles: ["SUPER_ADMIN"], roster: true },
   "admin.identity.patch": { roles: ["SUPER_ADMIN"], roster: true },
@@ -63,4 +84,4 @@ function publicAdmin(row) {
   return { id: row.id, email: row.email, name: row.name, role: row.role, active: row.active, accessEpoch: row.accessEpoch, lastLoginAt: row.lastLoginAt || null, createdAt: row.createdAt };
 }
 
-module.exports = { ACTIONS, adminError, canonicalJson, commandIdSchema, revisionSchema, reasonSchema, pricingSchema, intentHash, passwordFingerprint, commandRequest, publicAdmin };
+module.exports = { billingPolicySchema, billingHoldSchema, entitlementSchema, ACTIONS, adminError, canonicalJson, commandIdSchema, revisionSchema, reasonSchema, pricingSchema, intentHash, passwordFingerprint, commandRequest, publicAdmin };

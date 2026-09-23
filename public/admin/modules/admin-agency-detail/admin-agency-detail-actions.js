@@ -136,6 +136,7 @@
   }
 
   window.OnlinodAdminAgencyDetailActions = {
+    reloadDetail,
     doImpersonate,
     doSoftDelete,
     doRestore,

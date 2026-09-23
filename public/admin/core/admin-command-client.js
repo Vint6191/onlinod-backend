@@ -15,7 +15,7 @@
     try { if (value) sessionStorage.setItem(key, JSON.stringify(value)); else sessionStorage.removeItem(key); } catch (_) { /* Session-only memory fallback. */ }
   }
   function isCommand(path, method) {
-    return (method === "PATCH" && /^\/api\/admin\/(?:billing\/creator\/[^/]+|creators\/[^/]+\/billing|admin-users\/[^/]+)$/.test(path)) ||
+    return (method === "PATCH" && /^\/api\/admin\/(?:billing\/creator\/[^/]+|creators\/[^/]+\/(?:billing|entitlement)|agencies\/[^/]+\/(?:subscription|billing-hold)|admin-users\/[^/]+)$/.test(path)) ||
       (method === "POST" && /^\/api\/admin\/admin-users(?:\/[^/]+\/reset-password)?$/.test(path));
   }
   async function prepare({ path, method, body, token }) {

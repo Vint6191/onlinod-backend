@@ -249,6 +249,10 @@ model User {
 }
 
 model Agency {
+  billingPolicyRevision Int @default(1)
+  billingSupportHold Boolean @default(false)
+  billingSupportHoldReason String?
+  billingSupportHoldAt DateTime?
   id               String    @id @default(cuid())
   name             String
   plan             String    @default("trial")
@@ -1429,6 +1433,7 @@ model AgencySubscription {
 
   agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
 
+  @@index([agencyId, createdAt, id], map: "AgencySubscription_agency_created_id_idx")
   @@index([agencyId])
   @@index([status])
   @@index([currentPeriodEnd])
@@ -1552,6 +1557,7 @@ model BillingOrderLine {
 }
 
 model CreatorBillingEntitlement {
+  entitlementRevision Int @default(1)
   id        String @id @default(cuid())
   agencyId  String
   creatorId String @unique

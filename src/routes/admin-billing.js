@@ -78,7 +78,7 @@ router.get("/overview", async (req, res) => {
     const agencies = await prisma.agency.findMany({
       where: { deletedAt: null },
       include: {
-        subscriptions: { orderBy: { createdAt: "desc" }, take: 1 },
+        subscriptions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 },
         creators: {
           where: { deletedAt: null },
           include: { billingProfile: true, billingEntitlement: true },
@@ -158,7 +158,7 @@ router.get("/agency/:id", async (req, res) => {
     const agency = await prisma.agency.findUnique({
       where: { id: req.params.id },
       include: {
-        subscriptions: { orderBy: { createdAt: "desc" }, take: 1 },
+        subscriptions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 },
         creators: { where: { deletedAt: null }, include: { billingProfile: true, billingEntitlement: true }, orderBy: { createdAt: "asc" } },
       },
     });

@@ -1,4 +1,4 @@
-const { setPricingHandler, createAdminHandler, patchAdminHandler, resetAdminPasswordHandler } = require("./admin-command-handlers");
+const { setBillingPolicyHandler, setBillingHoldHandler, setEntitlementHandler, setPricingHandler, createAdminHandler, patchAdminHandler, resetAdminPasswordHandler } = require("./admin-command-handlers");
 /* src/routes/admin.js — Onlinod admin v2
    ────────────────────────────────────────────────────────────
    Full replacement. Backwards-compatible with v1 endpoints
@@ -330,7 +330,7 @@ router.get("/dashboard", async (_req, res) => {
         },
         select: {
           agencyId: true,
-          agency: { select: { subscriptions: { orderBy: { createdAt: "desc" }, take: 1, select: { billingMode: true } } } },
+          agency: { select: { subscriptions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1, select: { billingMode: true } } } },
           corePriceCents: true, coreValidUntil: true,
           aiChatterPriceCents: true, aiChatterValidUntil: true,
           outreachPriceCents: true, outreachValidUntil: true,
@@ -569,7 +569,7 @@ router.get("/agencies/:id", async (req, res) => {
         include: { billingProfile: true, billingEntitlement: true, sessionState: { select: { status: true, portableReady: true, revision: true, updatedAt: true } } },
         orderBy: [{ status: "asc" }, { createdAt: "desc" }],
       },
-      subscriptions:   { orderBy: { createdAt: "desc" }, take: 5 },
+      subscriptions:   { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 5 },
       adminActionLogs: { orderBy: { createdAt: "desc" }, take: 30 },
     },
   });
@@ -890,65 +890,9 @@ router.post("/agencies/:id/impersonate", async (req, res) => {
   }
 });
 
-// PATCH /agencies/:id/subscription   (v1, kept)
-const subSchema = z.object({
-  plan: z.string().max(80).optional(),
-  status: z.enum(["TRIAL", "ACTIVE", "PAST_DUE", "GRACE", "CANCELLED", "LOCKED"]).optional(),
-  corePricePerCreatorCents: z.number().int().min(0).optional(),
-  billingMode: z.enum(["MANUAL", "STRIPE", "CRYPTO", "FREE_INTERNAL"]).optional(),
-  billingPeriod: z.enum(["MONTHLY", "THREE_MONTHS", "SIX_MONTHS"]).optional(),
-  currentPeriodEnd: z.string().datetime().optional().nullable(),
-  trialEndsAt: z.string().datetime().optional().nullable(),
-  reason: z.string().max(500).optional().nullable(),
-});
-
-router.patch("/agencies/:id/subscription", async (req, res) => {
-  try {
-    const input = subSchema.parse(req.body);
-    const agency = await prisma.agency.findUnique({ where: { id: req.params.id } });
-    if (!agency) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND", error: "Agency not found" });
-
-    const beforeSub = await prisma.agencySubscription.findFirst({ where: { agencyId: agency.id }, orderBy: { createdAt: "desc" } });
-
-    const updated = await prisma.agency.update({
-      where: { id: agency.id },
-      data: {
-        plan: input.plan || agency.plan,
-        status: input.status || agency.status || "TRIAL",
-        currentPeriodEnd: input.currentPeriodEnd ? new Date(input.currentPeriodEnd) : input.currentPeriodEnd === null ? null : agency.currentPeriodEnd,
-        trialEndsAt: input.trialEndsAt ? new Date(input.trialEndsAt) : input.trialEndsAt === null ? null : agency.trialEndsAt,
-      },
-    });
-
-    const subData = {
-      status: input.status || beforeSub?.status || "TRIAL",
-      corePricePerCreatorCents: input.corePricePerCreatorCents ?? beforeSub?.corePricePerCreatorCents ?? 2000,
-      billingMode: input.billingMode || beforeSub?.billingMode || "MANUAL",
-      billingPeriod: input.billingPeriod || beforeSub?.billingPeriod || "MONTHLY",
-      currentPeriodEnd: input.currentPeriodEnd ? new Date(input.currentPeriodEnd) : beforeSub?.currentPeriodEnd || null,
-      trialEndsAt: input.trialEndsAt ? new Date(input.trialEndsAt) : beforeSub?.trialEndsAt || null,
-    };
-
-    const sub = beforeSub
-      ? await prisma.agencySubscription.update({ where: { id: beforeSub.id }, data: subData })
-      : await prisma.agencySubscription.create({ data: { agencyId: agency.id, ...subData } });
-
-    await adminLog(req, {
-      agencyId: agency.id,
-      action: "admin.subscription_changed",
-      targetType: "agency",
-      targetId: agency.id,
-      before: { agency, subscription: beforeSub },
-      after:  { agency: updated, subscription: sub },
-      reason: input.reason,
-    });
-    return res.json({ ok: true, agency: updated, subscription: sub });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    return res.status(500).json({ ok: false, code: "ADMIN_SUBSCRIPTION_FAILED", error: err?.message || "Failed" });
-  }
-});
-
+// PATCH /agencies/:id/subscription — policy only; paid dates are domain-owned.
+router.patch("/agencies/:id/subscription", setBillingPolicyHandler);
+router.patch("/agencies/:id/billing-hold", setBillingHoldHandler);
 
 // ════════════════════════════════════════════════════════════
 // MEMBERS
@@ -1492,116 +1436,8 @@ router.patch("/creators/:id/status", async (req, res) => {
 // PATCH /creators/:id/billing — compatibility URL, same authority as admin-billing.
 router.patch("/creators/:id/billing", setPricingHandler);
 
-// PATCH /creators/:id/entitlement — explicit manual support grant/revoke.
-// This is intentionally separate from CreatorBillingProfile: the profile is pricing/default
-// configuration, while this row is actual dated access provenance.
-const entitlementSchema = z.object({
-  tier: z.enum(["STARTER", "GROWTH", "PRO", "ELITE", "CUSTOM"]).optional(),
-  coreValidUntil: z.string().datetime().optional().nullable(),
-  aiChatterValidUntil: z.string().datetime().optional().nullable(),
-  outreachValidUntil: z.string().datetime().optional().nullable(),
-  reason: z.string().min(1).max(500),
-});
-
-router.patch("/creators/:id/entitlement", async (req, res) => {
-  try {
-    const input = entitlementSchema.parse(req.body);
-    const identity = await prisma.creatorAccount.findUnique({
-      where: { id: req.params.id },
-      select: { id: true, agencyId: true, deletedAt: true },
-    });
-    if (!identity || identity.deletedAt) {
-      return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
-    }
-
-    const now = new Date();
-    const result = await prisma.$transaction(async (tx) => {
-      // Serialize manual dated-access changes with payment activation/refund and
-      // aggregate reconciliation for this agency. Then re-read inside the lock
-      // so a concurrent payment cannot make the admin snapshot stale.
-      await lockAgencyBillingMutation(tx, identity.agencyId);
-      const creator = await tx.creatorAccount.findUnique({
-        where: { id: identity.id },
-        include: { billingProfile: true, billingEntitlement: true },
-      });
-      if (!creator || creator.deletedAt) return { missing: true };
-
-      const before = creator.billingEntitlement || null;
-      const profile = creator.billingProfile;
-      const tier = input.tier || before?.tier || profile?.tier || "STARTER";
-      const defaults = defaultBilling(tier);
-      const coreUntil = input.coreValidUntil === undefined ? before?.coreValidUntil ?? null : (input.coreValidUntil ? new Date(input.coreValidUntil) : null);
-      const aiUntil = input.aiChatterValidUntil === undefined ? before?.aiChatterValidUntil ?? null : (input.aiChatterValidUntil ? new Date(input.aiChatterValidUntil) : null);
-      const outreachUntil = input.outreachValidUntil === undefined ? before?.outreachValidUntil ?? null : (input.outreachValidUntil ? new Date(input.outreachValidUntil) : null);
-
-      const data = {
-        agencyId: creator.agencyId,
-        creatorId: creator.id,
-        tier,
-        corePriceCents: Number(profile?.corePriceCents ?? defaults.corePriceCents ?? 0),
-        aiChatterPriceCents: Number(profile?.aiChatterPriceCents ?? defaults.aiChatterPriceCents ?? 10000),
-        outreachPriceCents: Number(profile?.outreachPriceCents ?? defaults.outreachPriceCents ?? 2900),
-        ...(input.coreValidUntil !== undefined ? {
-          coreSource: "ADMIN",
-          coreValidFrom: coreUntil && coreUntil > now && !(before?.coreValidUntil && new Date(before.coreValidUntil) > now) ? now : (before?.coreValidFrom || null),
-          coreValidUntil: coreUntil,
-          coreLastOrderId: null,
-          subscriptionStartedAt: coreUntil && coreUntil > now ? (before?.subscriptionStartedAt || before?.coreValidFrom || now) : (before?.subscriptionStartedAt || null),
-          currentPeriodStartedAt: coreUntil && coreUntil > now
-            ? ((before?.coreValidUntil && new Date(before.coreValidUntil) > now) ? (before?.currentPeriodStartedAt || before?.coreValidFrom || now) : now)
-            : null,
-          currentPeriodEndsAt: coreUntil,
-          nextRenewalAt: null,
-          billingAnchorDay: coreUntil && coreUntil > now
-            ? ((before?.coreValidUntil && new Date(before.coreValidUntil) > now)
-              ? (Number(before?.billingAnchorDay) || new Date(before?.currentPeriodStartedAt || before?.coreValidFrom || now).getUTCDate())
-              : now.getUTCDate())
-            : (before?.billingAnchorDay || null),
-          tierAtPeriodStart: tier,
-          amountChargedForPeriodCents: 0,
-          autoRenewEnabled: false,
-          lastRenewalErrorCode: null,
-          walletTestMode: null,
-        } : {}),
-        ...(input.aiChatterValidUntil !== undefined ? {
-          aiChatterSource: "ADMIN",
-          aiChatterValidUntil: aiUntil,
-          aiLastOrderId: null,
-        } : {}),
-        ...(input.outreachValidUntil !== undefined ? {
-          outreachSource: "ADMIN",
-          outreachValidUntil: outreachUntil,
-          outreachLastOrderId: null,
-        } : {}),
-      };
-
-      const entitlement = before
-        ? await tx.creatorBillingEntitlement.update({ where: { creatorId: creator.id }, data })
-        : await tx.creatorBillingEntitlement.create({ data });
-      const aggregate = await syncAgencyBillingAggregate(tx, creator.agencyId, now);
-      return { missing: false, agencyId: creator.agencyId, creatorId: creator.id, before, entitlement, aggregate };
-    });
-
-    if (result.missing) {
-      return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
-    }
-
-    await adminLog(req, {
-      agencyId: result.agencyId,
-      action: "admin.creator_entitlement_changed",
-      targetType: "creator",
-      targetId: result.creatorId,
-      before: result.before ? publicEntitlement(result.before, now) : null,
-      after: publicEntitlement(result.entitlement, now),
-      reason: input.reason,
-    });
-
-    return res.json({ ok: true, entitlement: publicEntitlement(result.entitlement, now), aggregate: result.aggregate });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    return res.status(500).json({ ok: false, code: "ADMIN_CREATOR_ENTITLEMENT_FAILED", error: err?.message || "Failed to update creator entitlement" });
-  }
-});
+// PATCH /creators/:id/entitlement — explicit component-scoped grant/revoke.
+router.patch("/creators/:id/entitlement", setEntitlementHandler);
 
 // DELETE /creators/:id   (v1, kept; now soft-delete by default)
 router.delete("/creators/:id", async (req, res) => {

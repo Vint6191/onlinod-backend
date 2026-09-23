@@ -46,5 +46,13 @@ test("debug redaction removes nested login/reset/token secrets", () => {
   assert.doesNotMatch(JSON.stringify(safe), /private/);
 });
 test("unmigrated actions do not pretend to have durable command receipts", async () => {
-  const b = browser(); assert.equal(await b.commands.prepare({ ...input, path: "/api/admin/agencies/a/subscription" }), null);
+  const b = browser(); assert.equal(await b.commands.prepare({ ...input, path: "/api/admin/agencies/a" }), null);
+});
+
+test("policy, support hold and entitlement mutations preserve UUID across browser reload", async () => {
+  for (const path of ["/api/admin/agencies/a/subscription", "/api/admin/agencies/a/billing-hold", "/api/admin/creators/c/entitlement"]) {
+    const b = browser(); const first = await b.commands.prepare({ ...input, path });
+    assert.ok(first.commandId);
+    assert.equal((await browser(b.storage).commands.prepare({ ...input, path })).commandId, first.commandId);
+  }
 });

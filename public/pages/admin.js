@@ -209,12 +209,8 @@
           </label>
 
           <label class="on-field">
-            <span>Subscription status</span>
-            <select class="on-input" id="adminStatus">
-              ${["TRIAL", "ACTIVE", "PAST_DUE", "GRACE", "CANCELLED", "LOCKED"]
-                .map((x) => `<option value="${x}" ${String(agency.status) === x ? "selected" : ""}>${x}</option>`)
-                .join("")}
-            </select>
+            <span>Billing status (derived from access and hold)</span>
+            <input class="on-input" value="${a()(agency.status || "TRIAL")}" readonly>
           </label>
 
           <label class="on-field">
@@ -224,7 +220,7 @@
 
           <label class="on-field">
             <span>Current period end ISO</span>
-            <input class="on-input" id="adminPeriodEnd" value="${a()(agency.currentPeriodEnd || subscription.currentPeriodEnd || "")}">
+            <input class="on-input" id="adminPeriodEnd" readonly value="${a()(agency.currentPeriodEnd || subscription.currentPeriodEnd || "")}">
           </label>
         </div>
 
@@ -234,6 +230,8 @@
         </label>
 
         <button class="on-btn primary" id="adminSaveBilling">Save workspace billing</button>
+        <button class="on-btn" id="adminBillingHold">${agency.billingSupportHold ? "Release billing hold" : "Hold billing status"}</button>
+        <span>Billing hold preserves purchased access and payment history.</span>
       </section>
     `;
   }
@@ -535,14 +533,22 @@
       });
     });
 
+    root.querySelector("#adminBillingHold")?.addEventListener("click", async () => {
+      const agency = state.selectedAgency;
+      const reason = root.querySelector("#adminBillingReason").value.trim();
+      if (!reason) return window.OnlinodRouter.toast("Reason is required");
+      const result = await api().request(`/api/admin/agencies/${encodeURIComponent(agency.id)}/billing-hold`, { method: "PATCH", body: { enabled: !agency.billingSupportHold, expectedRevision: agency.billingPolicyRevision, reason } });
+      if (!result.ok) return window.OnlinodRouter.toast(result.error || "Billing hold failed");
+      await reload(root);
+    });
+
     root.querySelector("#adminSaveBilling")?.addEventListener("click", async () => {
       const result = await api().request(`/api/admin/agencies/${encodeURIComponent(state.selectedAgencyId)}/subscription`, {
         method: "PATCH",
         body: {
           plan: root.querySelector("#adminPlan").value,
-          status: root.querySelector("#adminStatus").value,
+          expectedRevision: state.selectedAgency.billingPolicyRevision,
           corePricePerCreatorCents: Number(root.querySelector("#adminCorePrice").value || 2000),
-          currentPeriodEnd: root.querySelector("#adminPeriodEnd").value || null,
           reason: root.querySelector("#adminBillingReason").value || "manual workspace billing change",
         },
       });
@@ -602,16 +608,16 @@
         const reason = root.querySelector(`[data-entitlement-reason="${CSS.escape(id)}"]`)?.value?.trim() || "";
         if (!reason) return window.OnlinodRouter.toast("Reason is required for manual access changes");
 
-        const result = await api().request(`/api/admin/creators/${encodeURIComponent(id)}/entitlement`, {
-          method: "PATCH",
-          body: {
-            tier: root.querySelector(`[data-entitlement-tier="${CSS.escape(id)}"]`)?.value || "STARTER",
-            coreValidUntil: localDateTimeToIso(root.querySelector(`[data-entitlement-core="${CSS.escape(id)}"]`)?.value),
-            aiChatterValidUntil: localDateTimeToIso(root.querySelector(`[data-entitlement-ai="${CSS.escape(id)}"]`)?.value),
-            outreachValidUntil: localDateTimeToIso(root.querySelector(`[data-entitlement-outreach="${CSS.escape(id)}"]`)?.value),
-            reason,
-          },
-        });
+        const creator = (state.selectedAgency?.creators || []).find(item => item.id === id);
+        const before = creator?.billingEntitlement || {};
+        const body = { expectedRevision: before.entitlementRevision || 0, reason };
+        for (const [field, selector] of [["coreValidUntil", "core"], ["aiChatterValidUntil", "ai"], ["outreachValidUntil", "outreach"]]) {
+          const value = root.querySelector(`[data-entitlement-${selector}="${CSS.escape(id)}"]`)?.value || "";
+          if (value !== localDateTimeValue(before[field])) body[field] = localDateTimeToIso(value);
+        }
+        const tier = root.querySelector(`[data-entitlement-tier="${CSS.escape(id)}"]`)?.value || "STARTER";
+        if (tier !== (before.tier || creator?.billingProfile?.tier || "STARTER")) { body.tier = tier; if (body.coreValidUntil === undefined) body.coreValidUntil = before.coreValidUntil || null; }
+        const result = await api().request(`/api/admin/creators/${encodeURIComponent(id)}/entitlement`, { method: "PATCH", body });
         if (!result.ok) return window.OnlinodRouter.toast(result.error || "Creator access save failed");
         await reload(root);
       });

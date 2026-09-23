@@ -1,5 +1,6 @@
 "use strict";
 
+const { setAdminBillingPolicy, setAdminBillingHold, setAdminEntitlement } = require("../services/admin-billing-access-command-service");
 const prisma = require("../prisma");
 const { commandRequest } = require("../services/admin-command-contract");
 const { setAdminPricing } = require("../services/admin-pricing-command-service");
@@ -23,4 +24,4 @@ function handler(service, targetKey) {
   };
 }
 
-module.exports = { sendCommandError, setPricingHandler: handler(setAdminPricing, "creatorId"), createAdminHandler: handler(createAdminIdentity), patchAdminHandler: handler(patchAdminIdentity, "targetId"), resetAdminPasswordHandler: handler(resetAdminPassword, "targetId") };
+module.exports = { setBillingPolicyHandler: handler(setAdminBillingPolicy, "agencyId"), setBillingHoldHandler: handler(setAdminBillingHold, "agencyId"), setEntitlementHandler: handler(setAdminEntitlement, "creatorId"), sendCommandError, setPricingHandler: handler(setAdminPricing, "creatorId"), createAdminHandler: handler(createAdminIdentity), patchAdminHandler: handler(patchAdminIdentity, "targetId"), resetAdminPasswordHandler: handler(resetAdminPassword, "targetId") };

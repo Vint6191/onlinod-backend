@@ -34,6 +34,7 @@ function isFuture(value, now = new Date()) {
 function publicEntitlement(row, now = new Date()) {
   if (!row) {
     return {
+      entitlementRevision: 0,
       tier: null,
       coreSource: null,
       corePriceCents: 0,
@@ -64,6 +65,7 @@ function publicEntitlement(row, now = new Date()) {
     };
   }
   return {
+    entitlementRevision: row.entitlementRevision,
     tier: row.tier ? String(row.tier) : null,
     coreSource: row.coreSource ? String(row.coreSource) : null,
     corePriceCents: Math.max(0, Number(row.corePriceCents || 0)),
@@ -164,7 +166,7 @@ async function activeEntitlementEnd(tx, agencyId, now = new Date()) {
       // Soft-deleted creators are not billable product access. Keep financial
       // history, but never let a hidden/deleted creator keep the workspace
       // aggregate ACTIVE.
-      creator: { deletedAt: null },
+      creator: { agencyId, deletedAt: null },
     },
     orderBy: { coreValidUntil: "desc" },
   });
@@ -350,21 +352,9 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
       });
     }
 
-    const subscription = await tx.agencySubscription.findFirst({ where: { agencyId: order.agencyId }, orderBy: { createdAt: "desc" } });
-    const maxEnd = await activeEntitlementEnd(tx, order.agencyId, now) || now;
-    const data = {
-      status: "ACTIVE",
-      billingMode: order.testMode ? String(subscription?.billingMode || "FREE_INTERNAL") : "CRYPTO",
-      billingPeriod: order.billingPeriod,
-      currentPeriodStart: subscription?.status === "ACTIVE" && subscription?.currentPeriodStart ? subscription.currentPeriodStart : now,
-      currentPeriodEnd: maxEnd,
-      graceUntil: null,
-    };
-    if (subscription) await tx.agencySubscription.update({ where: { id: subscription.id }, data });
-    else await tx.agencySubscription.create({ data: { agencyId: order.agencyId, ...data } });
-    await tx.agency.update({ where: { id: order.agencyId }, data: { status: "ACTIVE", currentPeriodEnd: maxEnd } });
+    const aggregate = await syncAgencyBillingAggregate(tx, order.agencyId, now, { payment: order });
+    return { activated: true, currentPeriodEnd: aggregate.currentPeriodEnd, grants };
 
-    return { activated: true, currentPeriodEnd: maxEnd, grants };
   });
 }
 
@@ -466,67 +456,37 @@ async function refundOrderEntitlements({ order, db = null }) {
       await tx.billingOrderLine.update({ where: { id: line.id }, data: { refundedAt: now } });
     }
 
-    const subscription = await tx.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } });
-    const maxEnd = await activeEntitlementEnd(tx, agencyId, now);
-    if (subscription) {
-      if (subscription.billingMode === "FREE_INTERNAL") {
-        await tx.agencySubscription.update({ where: { id: subscription.id }, data: { currentPeriodEnd: maxEnd || subscription.currentPeriodEnd } });
-      } else if (maxEnd) {
-        await tx.agencySubscription.update({ where: { id: subscription.id }, data: { status: "ACTIVE", currentPeriodEnd: maxEnd } });
-        await tx.agency.update({ where: { id: agencyId }, data: { status: "ACTIVE", currentPeriodEnd: maxEnd } });
-      } else {
-        await tx.agencySubscription.update({ where: { id: subscription.id }, data: { status: "PAST_DUE", currentPeriodEnd: null } });
-        await tx.agency.update({ where: { id: agencyId }, data: { status: "PAST_DUE", currentPeriodEnd: null } });
-      }
-    }
-    return { downgraded: !maxEnd && subscription?.billingMode !== "FREE_INTERNAL", changed, currentPeriodEnd: maxEnd };
+    const aggregate = await syncAgencyBillingAggregate(tx, agencyId, now);
+    return { downgraded: !aggregate.currentPeriodEnd && aggregate.billingMode !== "FREE_INTERNAL", changed, currentPeriodEnd: aggregate.currentPeriodEnd };
+
   });
 }
 
-async function syncAgencyBillingAggregate(tx, agencyId, now = new Date()) {
+async function syncAgencyBillingAggregate(tx, agencyId, now = new Date(), { payment = null } = {}) {
   await lockAgencyBillingMutation(tx, agencyId);
-  const subscription = await tx.agencySubscription.findFirst({
-    where: { agencyId },
-    orderBy: { createdAt: "desc" },
-  });
+  const agency = await tx.agency.findUnique({ where: { id: agencyId } });
+  if (!agency) throw Object.assign(new Error("Agency not found"), { code: "AGENCY_NOT_FOUND", status: 404 });
+  const subscription = await tx.agencySubscription.findFirst({ where: { agencyId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] });
   const maxEnd = await activeEntitlementEnd(tx, agencyId, now);
-
-  if (!subscription) {
-    if (!maxEnd) return { status: null, currentPeriodEnd: null, billingMode: null };
-    const created = await tx.agencySubscription.create({
-      data: {
-        agencyId,
-        status: "ACTIVE",
-        billingMode: "MANUAL",
-        billingPeriod: "MONTHLY",
-        currentPeriodStart: now,
-        currentPeriodEnd: maxEnd,
-      },
-    });
-    await tx.agency.update({ where: { id: agencyId }, data: { status: "ACTIVE", currentPeriodEnd: maxEnd } });
-    return { status: "ACTIVE", currentPeriodEnd: maxEnd, billingMode: created.billingMode };
-  }
-
-  if (subscription.billingMode === "FREE_INTERNAL") {
-    return { status: subscription.status, currentPeriodEnd: maxEnd || subscription.currentPeriodEnd || null, billingMode: subscription.billingMode };
-  }
-
-  if (maxEnd) {
-    await tx.agencySubscription.update({
-      where: { id: subscription.id },
-      data: { status: "ACTIVE", currentPeriodEnd: maxEnd, graceUntil: null },
-    });
-    await tx.agency.update({ where: { id: agencyId }, data: { status: "ACTIVE", currentPeriodEnd: maxEnd } });
-    return { status: "ACTIVE", currentPeriodEnd: maxEnd, billingMode: subscription.billingMode };
-  }
-
-  if (["ACTIVE", "GRACE", "PAST_DUE"].includes(String(subscription.status))) {
-    await tx.agencySubscription.update({ where: { id: subscription.id }, data: { status: "PAST_DUE", currentPeriodEnd: null } });
-    await tx.agency.update({ where: { id: agencyId }, data: { status: "PAST_DUE", currentPeriodEnd: null } });
-    return { status: "PAST_DUE", currentPeriodEnd: null, billingMode: subscription.billingMode };
-  }
-
-  return { status: subscription.status, currentPeriodEnd: subscription.currentPeriodEnd || null, billingMode: subscription.billingMode };
+  const billingMode = payment
+    ? (payment.testMode ? String(subscription?.billingMode || "FREE_INTERNAL") : "CRYPTO")
+    : subscription?.billingMode || "MANUAL";
+  let status;
+  if (agency.deletedAt || agency.billingSupportHold) status = "LOCKED";
+  else if (maxEnd || billingMode === "FREE_INTERNAL") status = "ACTIVE";
+  else if (isFuture(agency.trialEndsAt, now) || (!agency.trialEndsAt && agency.status === "TRIAL")) status = "TRIAL";
+  else if (subscription?.status === "CANCELLED") status = "CANCELLED";
+  else status = "PAST_DUE";
+  // Paid validity is a projection of live creator facts, even while held/free.
+  // Never retain an old currentPeriodEnd by falling back to the previous row.
+  const data = { status, currentPeriodEnd: maxEnd, graceUntil: null, trialEndsAt: agency.trialEndsAt || null };
+  if (payment) Object.assign(data, { billingMode, billingPeriod: payment.billingPeriod,
+    currentPeriodStart: subscription?.status === "ACTIVE" && subscription.currentPeriodStart ? subscription.currentPeriodStart : now });
+  let current = subscription;
+  if (subscription) current = await tx.agencySubscription.update({ where: { id: subscription.id }, data });
+  else if (maxEnd || payment || agency.billingSupportHold) current = await tx.agencySubscription.create({ data: { agencyId, billingMode, billingPeriod: "MONTHLY", ...data } });
+  await tx.agency.update({ where: { id: agencyId }, data: { status, currentPeriodEnd: maxEnd } });
+  return { status, currentPeriodEnd: maxEnd, billingMode: current?.billingMode || billingMode, supportHold: agency.billingSupportHold === true };
 }
 
 async function reconcileExpiredBillingStates({ now = new Date(), db = null } = {}) {

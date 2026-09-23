@@ -933,7 +933,7 @@ async function getBillingSettings({ agencyId, member, db = null }) {
   const providerBase = publicProviderConfig();
   const [agency, subscription, creators, orders, walletState] = await Promise.all([
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, trialEndsAt: true, currentPeriodEnd: true } }),
-    client.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }),
+    client.agencySubscription.findFirst({ where: { agencyId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }),
     client.creatorAccount.findMany({
       where: { agencyId, deletedAt: null },
       include: { billingProfile: true, billingEntitlement: true },

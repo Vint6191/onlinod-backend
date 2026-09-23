@@ -216,12 +216,8 @@
             <input class="adm-input" id="admSubPlan"   value="${r.escapeAttr(a.plan || "dev")}">
           </div>
           <div class="adm-field">
-            <label>status</label>
-            <select class="adm-select" id="admSubStatus" style="width:100%;">
-              ${["TRIAL","ACTIVE","GRACE","PAST_DUE","LOCKED","CANCELLED"].map((s) => `
-                <option value="${s}" ${(a.status || "TRIAL") === s ? "selected" : ""}>${s.toLowerCase()}</option>
-              `).join("")}
-            </select>
+            <label>billing status (derived from access and hold)</label>
+            <input class="adm-input" value="${r.escapeAttr(a.status || "TRIAL")}" readonly>
           </div>
 
           <div class="adm-field">
@@ -235,7 +231,7 @@
 
           <div class="adm-field" style="grid-column:1 / -1;">
             <label>current period end (ISO)</label>
-            <input class="adm-input mono" id="admSubPeriod" placeholder="2026-12-31T23:59:59Z" value="${r.escapeAttr(a.currentPeriodEnd ? new Date(a.currentPeriodEnd).toISOString() : "")}">
+            <input class="adm-input mono" id="admSubPeriod" readonly placeholder="2026-12-31T23:59:59Z" value="${r.escapeAttr(a.currentPeriodEnd ? new Date(a.currentPeriodEnd).toISOString() : "")}">
           </div>
 
           <div class="adm-field" style="grid-column:1 / -1;">
@@ -244,6 +240,9 @@
           </div>
         </div>
 
+        <div class="adm-field"><label>billing mode</label><select class="adm-select" id="admSubMode">${["MANUAL","STRIPE","CRYPTO","FREE_INTERNAL"].map(mode => `<option value="${mode}" ${(sub?.billingMode || "MANUAL") === mode ? "selected" : ""}>${mode}</option>`).join("")}</select></div>
+        <div class="adm-field"><label>billing period</label><select class="adm-select" id="admSubBillingPeriod">${["MONTHLY","THREE_MONTHS","SIX_MONTHS"].map(period => `<option value="${period}" ${(sub?.billingPeriod || "MONTHLY") === period ? "selected" : ""}>${period}</option>`).join("")}</select></div>
+        <div class="adm-field"><span>Billing hold preserves purchased access and payment history.</span><button class="adm-btn" id="admSubHold">${a.billingSupportHold ? "Release billing hold" : "Hold billing status"}</button></div>
         <div style="display:flex;gap:8px;margin-top:6px;">
           <button class="adm-btn primary" id="admSubSave">Save subscription</button>
           ${sub ? `<span style="font-family:var(--adm-mono);font-size:11px;color:var(--adm-muted);align-self:center;">last updated ${r.escapeHtml(u.timeAgo(sub.updatedAt))}</span>` : ""}
@@ -256,20 +255,28 @@
     const save = main.querySelector("#admSubSave");
     if (!save) return;
 
+    main.querySelector("#admSubHold")?.addEventListener("click", async () => {
+      const agency = slice.data.agency;
+      const reason = main.querySelector("#admSubReason").value.trim();
+      if (!reason) return R().toast("Reason is required");
+      const result = await window.OnlinodAdminApi.setBillingHold(agency.id, { enabled: !agency.billingSupportHold, expectedRevision: agency.billingPolicyRevision, reason });
+      R().toast(result?.ok ? "Billing hold updated — refresh current values" : result?.error || "Failed");
+      if (result?.ok) window.OnlinodAdminAgencyDetailActions.reloadDetail?.();
+    });
+
     save.addEventListener("click", async () => {
       const plan      = main.querySelector("#admSubPlan").value.trim();
-      const status    = main.querySelector("#admSubStatus").value;
       const coreRaw   = main.querySelector("#admSubCore").value.trim();
       const trialRaw  = main.querySelector("#admSubTrial").value.trim();
-      const periodRaw = main.querySelector("#admSubPeriod").value.trim();
       const reason    = main.querySelector("#admSubReason").value.trim();
 
       const body = {
         plan: plan || undefined,
-        status,
+        expectedRevision: slice.data.agency.billingPolicyRevision,
+        billingMode: main.querySelector("#admSubMode").value,
+        billingPeriod: main.querySelector("#admSubBillingPeriod").value,
         corePricePerCreatorCents: coreRaw ? Number(coreRaw) : undefined,
         trialEndsAt: trialRaw || null,
-        currentPeriodEnd: periodRaw || null,
         reason: reason || undefined,
       };
 

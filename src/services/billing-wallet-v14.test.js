@@ -598,7 +598,7 @@ test("admin helper defaults ordinary creator billing profiles to AUTO and only C
 
 test("schema has wallet ledger and explicit subscription period dates", () => {
   const schema=fs.readFileSync(schemaPath,"utf8");
-  for (const token of ["model AgencyBillingWallet", "model BillingWalletTransaction", "model CreatorBillingPeriod", "subscriptionStartedAt DateTime?", "currentPeriodStartedAt DateTime?", "currentPeriodEndsAt DateTime?", "nextRenewalAt DateTime?", "billingAnchorDay Int?", "autoRenewEnabled Boolean", "WALLET_TOP_UP"]) assert.match(schema,new RegExp(token.replace(/[?]/g,"\\?")));
+  for (const token of ["model AgencyBillingWallet", "model BillingWalletTransaction", "model CreatorBillingPeriod", "subscriptionStartedAt DateTime?", "currentPeriodStartedAt DateTime?", "currentPeriodEndsAt DateTime?", "nextRenewalAt DateTime?", "billingAnchorDay Int?", "autoRenewEnabled Boolean", "WALLET_TOP_UP"]) assert.match(schema,new RegExp(token.replace(/[?]/g,"\\?").replace(/ /g,"\\s+")));
 });
 
 test("customer direct tier/period checkout endpoints are retired", () => {
@@ -612,7 +612,7 @@ test("customer direct tier/period checkout endpoints are retired", () => {
 test("future creator profiles default to AUTO and migration preserves legacy sandbox/live wallet identity", () => {
   const schema=fs.readFileSync(schemaPath,"utf8");
   const sql=fs.readFileSync(migrationPath,"utf8");
-  assert.match(schema,/tierMode String @default\("AUTO"\)/);
+  assert.match(schema,/tierMode\s+String\s+@default\("AUTO"\)/);
   assert.match(sql,/ALTER COLUMN "tierMode" SET DEFAULT 'AUTO'/);
   assert.match(sql,/SELECT o\."testMode" FROM "BillingOrder" o WHERE o\."id" = e\."coreLastOrderId"/);
 });
@@ -720,12 +720,12 @@ test("hourly renewal sweep closes expired billing-period rows even when nothing 
 
 
 test("admin dated access keeps V14 display dates coherent instead of leaving stale wallet-period metadata", () => {
-  const admin=fs.readFileSync(adminPath,"utf8");
-  assert.match(admin,/subscriptionStartedAt: coreUntil/);
-  assert.match(admin,/currentPeriodStartedAt: coreUntil/);
-  assert.match(admin,/currentPeriodEndsAt: coreUntil/);
+  const admin=fs.readFileSync(path.join(__dirname, "admin-billing-access-command-service.js"), "utf8");
+  assert.match(admin,/subscriptionStartedAt:/);
+  assert.match(admin,/currentPeriodStartedAt: active/);
+  assert.match(admin,/currentPeriodEndsAt: until/);
   assert.match(admin,/nextRenewalAt: null/);
-  assert.match(admin,/billingAnchorDay: coreUntil/);
+  assert.match(admin,/billingAnchorDay: active/);
   assert.match(admin,/amountChargedForPeriodCents: 0/);
   assert.match(admin,/autoRenewEnabled: false/);
   assert.match(admin,/walletTestMode: null/);

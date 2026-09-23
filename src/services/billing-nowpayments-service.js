@@ -344,7 +344,7 @@ async function calculateCheckoutSnapshot({ agencyId, selection, db = null }) {
   const normalized = normalizeSelection(selection);
   const requestedIds = normalized.creators.map((row) => row.creatorId);
   const [subscription, creators, agency] = await Promise.all([
-    client.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }),
+    client.agencySubscription.findFirst({ where: { agencyId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }),
     client.creatorAccount.findMany({
       where: { agencyId, deletedAt: null, id: { in: requestedIds } },
       include: { billingProfile: true },
@@ -694,7 +694,7 @@ async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: r
 
   const [agency, subscription] = await Promise.all([
     client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true } }),
-    client.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }),
+    client.agencySubscription.findFirst({ where: { agencyId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }),
   ]);
   if (!agency) {
     const err = new Error("Agency not found");

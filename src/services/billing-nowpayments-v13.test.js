@@ -210,7 +210,7 @@ function makeProcessingDb({ failOrderUpdateOnce = false } = {}) {
       update: async ({ data }) => { subscriptionWrites += 1; lastSubscriptionWrite = { ...data }; subscription = { ...subscription, ...data }; return { ...subscription }; },
       create: async ({ data }) => { subscriptionWrites += 1; lastSubscriptionWrite = { ...data }; subscription = { id: "sub-created", ...data }; return { ...subscription }; },
     },
-    agency: { update: async ({ data }) => { agencyWrites += 1; return { id: "agency-1", ...data }; } },
+    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async ({ data }) => { agencyWrites += 1; return { id: "agency-1", ...data }; } },
     $transaction: async (fn) => fn(db),
     _events: eventsByKey,
     _getOrder: () => ({ ...order }),
@@ -811,7 +811,7 @@ test("V13.3 expiry reconciliation marks a paid workspace PAST_DUE only when no c
       update: async ({ data }) => { subscriptionStatus = data.status || subscriptionStatus; return { ...subscription, ...data }; },
     },
     creatorBillingEntitlement: { findFirst: async () => null },
-    agency: { update: async ({ data }) => { agencyStatus = data.status || agencyStatus; return { id: "agency-1", ...data }; } },
+    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async ({ data }) => { agencyStatus = data.status || agencyStatus; return { id: "agency-1", ...data }; } },
   };
   db.$transaction = async (fn) => fn(db);
   const service = loadEntitlementService(db);
@@ -829,7 +829,7 @@ test("V13.3 expiry reconciliation repairs a stale agency period from the latest 
   const db = {
     agencySubscription: { findMany: async () => [{ ...subscription }], findFirst: async () => ({ ...subscription }), update: async ({ data }) => { write = { ...data }; return { ...subscription, ...data }; } },
     creatorBillingEntitlement: { findFirst: async () => ({ creatorId: "creator-1", agencyId: "agency-1", coreValidUntil: activeUntil }) },
-    agency: { update: async () => ({ id: "agency-1" }) },
+    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async () => ({ id: "agency-1" }) },
   };
   db.$transaction = async (fn) => fn(db);
   const service = loadEntitlementService(db);
@@ -883,7 +883,7 @@ test("V13.3.1 refund never resurrects a payment predecessor that was already ref
       findFirst: async () => null,
     },
     agencySubscription: { findFirst: async () => ({ id: "sub-1", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: bUntil }), update: async ({ data }) => data },
-    agency: { update: async ({ data }) => data },
+    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async ({ data }) => data },
   };
   db.$transaction = async (fn) => fn(db);
   const service = loadEntitlementService(db);
@@ -916,7 +916,7 @@ test("V14 refund restores an ADMIN predecessor without inheriting refunded walle
       findFirst: async () => ({ ...entitlement }),
     },
     agencySubscription: { findFirst: async () => ({ id: "sub-1", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: paidUntil }), update: async ({ data }) => data },
-    agency: { update: async ({ data }) => data },
+    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async ({ data }) => data },
   };
   db.$transaction = async (fn) => fn(db);
   const service = loadEntitlementService(db);
@@ -962,7 +962,7 @@ test("V13.3.1 refund restores the latest still-paid predecessor but preserves a 
       findFirst: async ({ where }) => where.creator?.deletedAt === null && entitlement.coreValidUntil > where.coreValidUntil.gt ? ({ ...entitlement }) : null,
     },
     agencySubscription: { findFirst: async () => ({ id: "sub-1", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: bUntil }), update: async ({ data }) => data },
-    agency: { update: async ({ data }) => data },
+    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async ({ data }) => data },
   };
   db.$transaction = async (fn) => fn(db);
   const service = loadEntitlementService(db);
@@ -1003,7 +1003,7 @@ test("V14 refund never auto-renews an already-expired paid predecessor", async (
     },
     creatorBillingEntitlement: { findUnique: async () => ({ ...entitlement }), update: async ({ data }) => { entitlement = { ...entitlement, ...data }; return { ...entitlement }; }, findFirst: async () => null },
     agencySubscription: { findFirst: async () => ({ id: "sub-old", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: bUntil }), update: async ({ data }) => data },
-    agency: { update: async ({ data }) => data },
+    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async ({ data }) => data },
   };
   db.$transaction = async (fn) => fn(db);
   const service = loadEntitlementService(db);
@@ -1021,12 +1021,12 @@ test("V13.3.1 aggregate lookup excludes soft-deleted creators", async () => {
   const db = {
     agencySubscription: { findFirst: async () => ({ ...subscription }), update: async ({ data }) => ({ ...subscription, ...data }) },
     creatorBillingEntitlement: { findFirst: async ({ where }) => { entitlementWhere = where; return null; } },
-    agency: { update: async ({ data }) => ({ id: "agency-1", ...data }) },
+    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async ({ data }) => ({ id: "agency-1", ...data }) },
   };
   const service = loadEntitlementService(db);
   const result = await service.syncAgencyBillingAggregate(db, "agency-1", now);
   assert.equal(result.status, "PAST_DUE");
-  assert.deepEqual(entitlementWhere.creator, { deletedAt: null });
+  assert.deepEqual(entitlementWhere.creator, { agencyId: "agency-1", deletedAt: null });
 });
 
 test("V13.3.1 repair migration activates migrated lines and makes already-refunded legacy owners fail closed", () => {
@@ -1054,10 +1054,12 @@ test("V13.3.2 billing entitlement mutations serialize on the agency row before t
 });
 
 test("V13.3.2 admin dated-access edits and creator deletion join the same agency billing lock", () => {
-  const entitlementRoute = adminSource.match(/router\.patch\("\/creators\/:id\/entitlement"[\s\S]*?return res\.json\(\{ ok: true, entitlement:[\s\S]*?\n\}\);/)?.[0] || "";
+  const entitlementRoute = fs.readFileSync(path.join(__dirname, "admin-billing-access-command-service.js"), "utf8");
+  assert.match(adminSource, /router\.patch\("\/creators\/:id\/entitlement", setEntitlementHandler\)/);
   const deleteRoute = adminSource.match(/router\.delete\("\/creators\/:id"[\s\S]*?return res\.json\(\{[\s\S]*?deleted: before,[\s\S]*?historyPreserved: true[\s\S]*?\n  \}\);\n\}\);/)?.[0] || "";
   assert.match(adminSource, /lockAgencyBillingMutation/);
-  assert.match(entitlementRoute, /await lockAgencyBillingMutation\(tx, identity\.agencyId\)/);
+  assert.match(entitlementRoute, /await lockLiveAgency\(tx, identity\.agencyId\)/);
+  assert.match(entitlementRoute, /await lockAgencyBillingMutation\(tx, agencyId\)/);
   assert.match(entitlementRoute, /tx\.creatorAccount\.findUnique/);
   assert.match(deleteRoute, /await lockAgencyBillingMutation\(tx, before\.agencyId\)/);
 });
@@ -1125,7 +1127,7 @@ test("V13.3.1 expiry scheduler reconciles future ACTIVE aggregates and does not 
       update: async ({ data }) => { updates += 1; return { ...subscription, ...data }; },
     },
     creatorBillingEntitlement: { findFirst: async () => ({ creatorId: "creator-1", agencyId: "agency-1", coreValidUntil: activeUntil }) },
-    agency: { update: async () => ({ id: "agency-1" }) },
+    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async () => ({ id: "agency-1" }) },
   };
   db.$transaction = async (fn) => fn(db);
   const service = loadEntitlementService(db);

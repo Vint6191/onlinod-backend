@@ -375,7 +375,7 @@ async function assertWalletDebitAllowed(tx, agencyId, testMode) {
   // doubles without the model usable, but never bypass either live guard on the
   // real database path.
   if (!tx.agencySubscription?.findFirst) return;
-  const subscription = await tx.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" }, select: { billingMode: true } });
+  const subscription = await tx.agencySubscription.findFirst({ where: { agencyId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { billingMode: true } });
   if (String(subscription?.billingMode || "MANUAL") === "FREE_INTERNAL") {
     throw billingError("Live wallet billing is disabled while this workspace is FREE_INTERNAL", "BILLING_FREE_INTERNAL_LIVE_DEBIT_DISABLED", 409);
   }

@@ -139,6 +139,8 @@
     deleteAgency:    (id, query) => request(`/api/admin/agencies/${encodeURIComponent(id)}`,        { method: "DELETE", query }),
     restoreAgency:   (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/restore`, { method: "POST",   body }),
     impersonate:     (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/impersonate`, { method: "POST", body }),
+    setBillingHold: (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/billing-hold`, { method: "PATCH", body }),
+    patchCreatorEntitlement: (id, body) => request(`/api/admin/creators/${encodeURIComponent(id)}/entitlement`, { method: "PATCH", body }),
     patchSubscription: (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/subscription`, { method: "PATCH", body }),
 
     // members
