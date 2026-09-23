@@ -34,6 +34,9 @@ let analyticsCalls = 0;
 const leaseCalls = [];
 
 cacheModule(prismaPath, {});
+cacheModule(require.resolve("./analytics-recurring-planning-service"), {
+  async planRecurringCreatorAnalytics() { analyticsCalls += 1; return { created: 0, skipped: 0 }; },
+});
 cacheModule(plannerPath, {
   async ensureOperationalAnalyticsFreshness() { throw new Error("not expected"); },
   async runAnalyticsCollectionSweep() { return { ok: true, skipped: true, reason: "test" }; },
@@ -110,30 +113,17 @@ test("generic recurring planning claims one bounded durable batch without a READ
   assert.equal(dailyCalls, 3);
 });
 
-test("Creator Analytics catchups have one durable paginated sweep lane separate from generic recurring work", async () => {
+test("Creator Analytics compatibility entry uses the same bounded durable lane", async () => {
   analyticsCalls = 0;
   leaseCalls.length = 0;
-  const db = {
-    creatorAccount: {
-      async findMany(input) {
-        assert.equal(input.take, 3);
-        return pageRows(input);
-      },
-    },
-  };
-
-  const result = await runCreatorAnalyticsCatchupSweep({ db, now: new Date("2026-09-08T18:05:00.000Z"), pageSize: 3 });
+  const db = { creatorAccount: {
+    async findMany() { throw new Error("global catalog traversal retired"); },
+    async findFirst({ where }) { return creators.find((row) => row.id === where.id); },
+  } };
+  const result = await runCreatorAnalyticsCatchupSweep({ db, pageSize: 3 });
   assert.equal(result.ok, true);
-  assert.equal(result.skipped, false);
-  assert.equal(result.creators, 7);
-  assert.equal(result.pages, 3);
-  assert.equal(analyticsCalls, 7);
-  assert.deepEqual(leaseCalls[0], [
-    "claim",
-    "creator_analytics_recurring_v1",
-    "creator-analytics-recurring-sweep-coordinator",
-  ]);
-  assert.deepEqual(leaseCalls.at(-1), ["complete", "creator_analytics_recurring_v1", "creator-007"]);
-  assert.ok(leaseCalls.some((entry) => entry[0] === "renew" && entry[2] === "creator-003"));
-  assert.ok(leaseCalls.some((entry) => entry[0] === "renew" && entry[2] === "creator-006"));
+  assert.equal(result.selected, 3);
+  assert.equal(result.creatorsScanned, 3);
+  assert.equal(analyticsCalls, 3);
+  assert.deepEqual(leaseCalls, []);
 });

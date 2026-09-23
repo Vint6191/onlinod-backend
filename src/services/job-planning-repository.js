@@ -1,10 +1,20 @@
 "use strict";
 
 const prisma = require("../prisma");
+const { AsyncLocalStorage } = require("node:async_hooks");
 const { publishDesktopControlEvent } = require("./desktop-control-events");
 const { JOB_CATALOG } = require("./job-catalog");
 
 const DEFAULT_PROTECTED_STATUSES = Object.freeze(["CLAIMED"]);
+const planningPublications = new AsyncLocalStorage();
+
+async function afterPlanningCommit(work) {
+  if (planningPublications.getStore()) return work();
+  const pending = new Map();
+  const result = await planningPublications.run(pending, work);
+  for (const job of pending.values()) publishPlannedJobAvailable(job);
+  return result;
+}
 
 function asDate(value, fallback = new Date()) {
   if (value instanceof Date && Number.isFinite(value.getTime())) return value;
@@ -36,6 +46,8 @@ function assertPlannableJobKey(value) {
 
 function publishPlannedJobAvailable(job) {
   if (!job?.id || !job?.agencyId) return null;
+  const pending = planningPublications.getStore();
+  if (pending) { pending.set(job.id, job); return null; }
   try {
     return publishDesktopControlEvent({
       type: "JOB_AVAILABLE",
@@ -269,6 +281,7 @@ async function ensurePlannedJob({
 }
 
 module.exports = {
+  afterPlanningCommit,
   DEFAULT_PROTECTED_STATUSES,
   assertPlannableJobKey,
   scheduledCreateData,

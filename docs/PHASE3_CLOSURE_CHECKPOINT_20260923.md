@@ -1,3 +1,15 @@
+# Phase 3 — A37-R1, recurring Analytics planning cutover
+
+**SOURCE OPEN / SCALE OPEN. Первый крупный проход.** Actual `2026-09-23T175022.545(1).zip` подтверждён Render: **95/95 offline, 189/189 PostgreSQL**, cleanup/migrations успешны, сервис live.
+
+Глобальные Earnings/Creator Analytics обходы удалены; прежние entry points делегируют в существующий `CREATOR_RECURRING_PLANNING`. Планирование одного creator атомарно, с проверкой точного claim до/после работы, блокировками Agency → Creator → work и публикацией jobs после commit. Бюджет periodic Campaign directory един для replicas, сохраняется в БД вместе с jobs; применяется консервативная гарантированная доля provider capacity. Новый additive schema/migration — `AnalyticsPlanningBudget`. Глобальный directory selector заменён ограниченным explicit-scope helper.
+
+Локально: **101/101** contract tests, schema/syntax/source gates проходят. Full suite: **3218 / 3000 pass / 103 прежних fail / 115 skip**. Новый manifest A37-R1: **66 × 3 = 198 PostgreSQL tests**; реального PG локально нет, новый physical proof ещё ожидается. Ставить через прежний Render gate — кандидат ДА; готовая Phase 3 — НЕТ.
+
+Остаток: incremental capacity, Home SQL/access/commit boundary, rolling coexistence, более широкий settlement/health/quarantine, many-large-agencies load и окончательный fresh-source sweep. Полный накопительный recovery checkpoint, hash, границы и установка — в `PHASE3_ANALYTICS_COORDINATOR_CHECKPOINT_20260923.txt`.
+
+Ниже история предыдущих actual; старые pending и числа не являются текущим статусом.
+
 # Phase 3 — Home demand continuation, 2026-09-23
 
 **SOURCE OPEN / SCALE OPEN.** Новый actual `onlinod-backend-main - 2026-09-23T172059.391.zip` принят как единственный исходник. Его Render checkout `db2196893e185814a1f9a0f7d114247687190af1` успешно прошёл **87/87 offline, 186/186 PostgreSQL**, cleanup и primary migrations; service live. Прежний coordinator proof больше не ожидает подтверждения.

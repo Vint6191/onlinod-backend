@@ -85,13 +85,12 @@ test("A16 debt projection persists topology and overload-control facts without b
   assert.equal(snapshot.campaignDirectoryAdmissionBudgetCalls, snapshot.campaignDirectoryGuaranteedCallsPerSweep);
 });
 
-test("A16 scheduler consumes durable capacity state only to bound new periodic directory admission", () => {
-  const scheduler = read("src/services/job-scheduler.js");
-  assert.match(scheduler, /readProviderCapacityDebtSnapshot/);
-  assert.match(scheduler, /deriveProviderOverloadControl/);
-  assert.match(scheduler, /pageBudget:\s*providerCapacityControl\.campaignDirectoryAdmissionBudgetCalls/);
-  assert.match(scheduler, /canonical debt remains untouched/i);
-  assert.doesNotMatch(scheduler, /deleteMany[\s\S]{0,180}ProviderCapacityDebtState/);
+test("periodic directory admission uses one fleet budget under conservative capacity", () => {
+  const service = read("src/services/analytics-recurring-planning-service.js");
+  assert.match(service, /guaranteedDirectoryCallsPerSweep/);
+  assert.match(service, /AnalyticsPlanningBudget/);
+  assert.match(service, /ON CONFLICT/);
+  assert.doesNotMatch(service, /deleteMany|readCanonicalCapacityInputs/);
 });
 
 test("A16 schema and migration encode an additive one-shard topology/control projection", () => {

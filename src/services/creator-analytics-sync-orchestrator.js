@@ -71,7 +71,7 @@ async function loadCollectorPlanningState(db, collectorType, creatorId, fallback
   // every current collector-state model, so only tests use the supplied state.
   return fallbackState || null;
 }
-async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priority, now, bucketMs, collectorType, collectorState }) {
+async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priority, now, bucketMs, collectorType, collectorState, reserveDirectory = null }) {
   return withCollectorStateLock({ db, type: collectorType, creatorId, work: async (tx) => {
     const active = await inFlightJob(tx, creatorId, jobKey);
     if (active) return { created: false, reason: "already_in_flight", job: active };
@@ -79,6 +79,7 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     // the same collector lock used by accept/complete. A pre-lock snapshot can
     // race a completion on another replica and issue work for an obsolete epoch.
     const currentCollectorState = await loadCollectorPlanningState(tx, collectorType, creatorId, collectorState);
+    if (reserveDirectory && !await reserveDirectory(currentCollectorState)) return { created: false, reason: "directory_capacity_deferred" };
     return scheduleNow({
       db: tx,
       jobKey,
@@ -370,7 +371,7 @@ function due(lastVerifiedAt, intervalMs, now) {
   return verifiedAt.getTime() <= now.getTime() - intervalMs;
 }
 
-async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20, campaignDirectoryDiscoveryAdmitted = true } = {}) {
+async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20, campaignDirectoryDiscoveryAdmitted = true, reserveCampaignDirectory = null } = {}) {
   now = await dbAuthorityNow({ db, fallbackNow: now });
   const initial = await ensureInitialCreatorAnalyticsSync({ db, creatorId, agencyId, now, priority: Math.max(priority, 80) });
   if (!initial.ready) return { ready: false, initial, created: [], skipped: [] };
@@ -444,7 +445,7 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     const requiresDirectoryDiscovery = directoryDue || (frontierDue && !directoryReuse);
     if (!frontierDue && !directoryDue) {
       skipped.push("campaigns_catchup:fresh");
-    } else if (requiresDirectoryDiscovery && campaignDirectoryDiscoveryAdmitted !== true) {
+    } else if (requiresDirectoryDiscovery && campaignDirectoryDiscoveryAdmitted !== true && typeof reserveCampaignDirectory !== "function") {
       skipped.push("campaigns_catchup:directory_capacity_deferred");
     } else {
       const retry = retryDisposition(campaignState, now);
@@ -477,6 +478,7 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
         const scheduled = await scheduleIfIdle({
           db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: directoryReuse ? CAMPAIGN_COLLECTION_FRESHNESS_MS : CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS,
           collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectorState: campaignState,
+          reserveDirectory: requiresDirectoryDiscovery ? reserveCampaignDirectory : null,
         });
         if (scheduled.created) created.push(directoryReuse ? "campaigns_frontier_reuse" : "campaigns_directory_discovery");
         else skipped.push(`campaigns_catchup:${scheduled.reason || "skipped"}`);

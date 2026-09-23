@@ -357,7 +357,7 @@ test("A36 DomainWork admission is bounded on both Agency and creator axes withou
   assert.match(physical, /assert\.equal\(allAgencies\.size, 100\)/);
   assert.match(physical, /opposite-order multi-write transactions defer exact partition-shard-Agency reconciliation without deadlock/);
   assert.match(physical, /opposite-order transactions sharing the exact same partitions cannot retain the retired row-trigger inversion/);
-  assert.equal((physical.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 3);
+  assert.equal((physical.match(/await runPhase3InterleavedTransactions\(/g) || []).length, 4);
   assert.match(physical, /state: "BLOCKED"[\s\S]*blockedPartitions\.every\(\(row\) => row\.nextClaimableAt == null\)/);
   assert.match(physical, /rebuiltPartition\?\.nextClaimableAt[\s\S]*rebuiltShard\?\.nextDispatchAt[\s\S]*rebuiltAgency\?\.nextDispatchAt/);
 });

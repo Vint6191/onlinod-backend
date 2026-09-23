@@ -1,8 +1,8 @@
 {
-  "version": "A36-R5",
+  "version": "A37-R1",
   "algorithm": "sha256-canonical-json-files-v1",
-  "testCount": 63,
-  "manifestSha256": "55a2585594d829c6487e414c4b6e8b2b900254e99cb28b7f3c62b12da8c0b2ae",
+  "testCount": 66,
+  "manifestSha256": "3fe27244d578f982f60455e024cbd93c856ba051e39afe6fdfdc45c51c7abaab",
   "files": [
     {
       "file": "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js",
@@ -114,6 +114,9 @@
         "A36 PostgreSQL: Analytics expiry fences progress and settlement while restart preserves the unfinished cycle",
         "A36 PostgreSQL: Analytics renew and settlement reject leases that expire during an observed row-lock wait",
         "A36 PostgreSQL: scoped Home demand yields durable progress and a second client finishes without planning unrequested creators",
+        "A37 PostgreSQL: recurring Analytics planning rolls back partial jobs and rejects expired ownership",
+        "A37 PostgreSQL: two replicas share one directory budget and rollback releases the reservation",
+        "A37 PostgreSQL: planning commit authority rejects expiry after an observed work-row wait",
         "A34 PostgreSQL: Hidden status command, projection rollback and concurrent writers converge atomically",
         "A34 PostgreSQL: 4000 creators publish bounded fair work and two replicas claim disjoint batches",
         "A36 PostgreSQL: scoped member claims 1000 of 2000 creators through fixed shards without enumerating scope",

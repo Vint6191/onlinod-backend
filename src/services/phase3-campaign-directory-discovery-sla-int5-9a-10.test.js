@@ -76,7 +76,7 @@ test("INT5.9A-10 recurring discovery admission is oldest-due and bounded by esti
     creatorCampaignCollectionState: { findMany: async () => candidates },
     jobInstance: { findMany: async () => [] },
   };
-  const result = await scheduler.selectCampaignDirectoryDiscoveryAdmissions({ db, now, pageBudget: 82, maxJobs: 10 });
+  const result = await scheduler.selectCampaignDirectoryDiscoveryAdmissions({ db, now, creatorIds: candidates.map((r) => r.creatorId), pageBudget: 82, maxJobs: 10 });
   // 2,000 campaigns reserve 41 calls including the terminal page. Two oldest
   // creators consume the entire 82-call budget; later due creators cannot jump ahead.
   assert.deepEqual([...result.admittedCreatorIds], ["creator-a", "creator-b"]);
@@ -92,7 +92,7 @@ test("INT5.9A-10 active Campaign work does not waste a directory admission slot"
     ] },
     jobInstance: { findMany: async () => [{ creatorId: "creator-a" }] },
   };
-  const result = await scheduler.selectCampaignDirectoryDiscoveryAdmissions({ db, now, pageBudget: 41, maxJobs: 1 });
+  const result = await scheduler.selectCampaignDirectoryDiscoveryAdmissions({ db, now, creatorIds: ["creator-a", "creator-b"], pageBudget: 41, maxJobs: 1 });
   assert.deepEqual([...result.admittedCreatorIds], ["creator-b"]);
 });
 

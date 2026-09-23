@@ -26,6 +26,7 @@ function installSchedulerDecisionHarness() {
   const domainWorkPath = require.resolve("./domain-work-authority-service");
   const schedulerPath = require.resolve("./job-scheduler");
 
+  cacheModule(require.resolve("./analytics-recurring-planning-service"), { planRecurringCreatorAnalytics: async () => ({ created: 0, skipped: 0 }) });
   const degraded = (created = true) => ({ ok: false, created, reason: "fan_refresh_debt_not_durable" });
   const prisma = {
     creatorAccount: {

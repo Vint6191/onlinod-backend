@@ -20,6 +20,7 @@ const ROOT = path.resolve(__dirname, "../..");
 const CHANGED_GATE = path.join(ROOT, "scripts/audit/phase3-a26-changed-js-gate.js");
 const IDENTIFIER_LINT = path.join(ROOT, "scripts/audit/phase3-postgres-identifier-lint.js");
 const CONTRACT_PROOFS = [
+  "src/services/analytics-recurring-planning-service.test.js",
   "src/services/analytics-collection-planner.test.js",
   "src/services/phase3-a32-durable-derived-planning-proof-authority.test.js",
   "src/services/phase3-postgres-proof-contract.test.js",

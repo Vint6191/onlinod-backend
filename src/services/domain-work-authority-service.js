@@ -1200,7 +1200,6 @@ async function lockDomainWorkClaimForCommit({ db = null, item, ownerToken = null
   if (!db) db = require("../prisma");
   if (!item?.id) return { current: false, lost: true };
   return runDbTransaction(db, async (tx) => {
-    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     let current = null;
     if (typeof tx?.$queryRawUnsafe === "function") {
       const rows = await tx.$queryRawUnsafe(
@@ -1211,6 +1210,7 @@ async function lockDomainWorkClaimForCommit({ db = null, item, ownerToken = null
     } else {
       current = await tx.domainWorkItem?.findFirst?.({ where: { id: String(item.id) } });
     }
+    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     const expectedOwner = String(ownerToken || item.ownerToken || "");
     const valid = Boolean(
       current

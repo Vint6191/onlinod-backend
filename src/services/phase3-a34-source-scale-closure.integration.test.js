@@ -253,6 +253,114 @@ test("A36 PostgreSQL: scoped Home demand yields durable progress and a second cl
   }
 });
 
+test("A37 PostgreSQL: recurring Analytics planning rolls back partial jobs and rejects expired ownership", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const { planRecurringCreatorAnalytics } = require("./analytics-recurring-planning-service");
+  const db = new PrismaClient();
+  let scope = null;
+  try {
+    scope = await createAgencyCreator(db, "a37-planning", { status: "READY" });
+    const claim = await claimDomainWorkBatch({ db, workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING, agencyId: scope.agencyId, creatorIds: [scope.creatorId], limit: 1, leaseMs: 60_000 });
+    assert.equal(claim.items.length, 1);
+    let inserts = 0;
+    const faultDb = new Proxy(db, { get(target, key) {
+      if (key !== "$transaction") return target[key];
+      return (work, options) => target.$transaction((tx) => work(new Proxy(tx, { get(transaction, property) {
+        if (property !== "jobInstance") return transaction[property];
+        return new Proxy(transaction.jobInstance, { get(delegate, method) {
+          if (method !== "createMany") return delegate[method];
+          return async (args) => {
+            const result = await delegate.createMany(args);
+            inserts += Number(result.count);
+            throw Object.assign(new Error("injected failure after actual job insert"), { code: "A37_INJECTED" });
+          };
+        } });
+      } })), options);
+    } });
+    await assert.rejects(() => planRecurringCreatorAnalytics({ db: faultDb, item: claim.items[0], ownerToken: claim.ownerToken }), { code: "A37_INJECTED" });
+    assert.ok(inserts > 0, "the rollback must follow a real database insert");
+    assert.equal(await db.jobInstance.count({ where: { creatorId: scope.creatorId } }), 0);
+    const success = await planRecurringCreatorAnalytics({ db, item: claim.items[0], ownerToken: claim.ownerToken });
+    assert.ok(success.created > 0);
+    const before = await db.jobInstance.count({ where: { creatorId: scope.creatorId } });
+    await db.$executeRawUnsafe('UPDATE "DomainWorkItem" SET "leaseUntil"=clock_timestamp() - interval \'1 second\' WHERE "id"=$1', claim.items[0].id);
+    await assert.rejects(() => planRecurringCreatorAnalytics({ db, item: claim.items[0], ownerToken: claim.ownerToken }), { code: "ANALYTICS_PLANNING_CLAIM_LOST" });
+    assert.equal(await db.jobInstance.count({ where: { creatorId: scope.creatorId } }), before);
+    console.log("# A37_ANALYTICS_ATOMIC_PLANNING_PASS");
+  } finally {
+    try { if (scope) await cleanupPhase3PostgresAgencyFixture(db, scope.agencyId); }
+    finally { await db.$disconnect(); }
+  }
+});
+
+test("A37 PostgreSQL: two replicas share one directory budget and rollback releases the reservation", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const { reserveDirectoryAdmission } = require("./analytics-recurring-planning-service");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const budgetKey = nonce("a37-budget");
+  const state = { campaignDirectoryCampaignCount: 2_000_000 };
+  try {
+    await assert.rejects(() => dbA.$transaction(async (tx) => {
+      assert.equal(await reserveDirectoryAdmission({ db: tx, state, budgetKey }), true);
+      throw new Error("rollback reservation");
+    }), /rollback reservation/);
+    assert.equal((await dbA.$queryRawUnsafe('SELECT "id" FROM "AnalyticsPlanningBudget" WHERE "id"=$1', budgetKey)).length, 0);
+    const outcomes = await Promise.allSettled([
+      dbA.$transaction((tx) => reserveDirectoryAdmission({ db: tx, state, budgetKey })),
+      dbB.$transaction((tx) => reserveDirectoryAdmission({ db: tx, state, budgetKey })),
+    ]);
+    for (const result of outcomes) if (result.status === "rejected") throw result.reason;
+    const results = outcomes.map((result) => result.value);
+    assert.equal(results.filter(Boolean).length, 1);
+    const [row] = await dbA.$queryRawUnsafe('SELECT "reservedJobs","reservedCalls" FROM "AnalyticsPlanningBudget" WHERE "id"=$1', budgetKey);
+    assert.equal(row.reservedJobs, 1);
+    assert.equal(row.reservedCalls, 40001);
+    console.log("# A37_ANALYTICS_DISTRIBUTED_ADMISSION_PASS");
+  } finally {
+    try { await dbA.$executeRawUnsafe('DELETE FROM "AnalyticsPlanningBudget" WHERE "id"=$1', budgetKey); }
+    finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect()]); }
+  }
+});
+
+test("A37 PostgreSQL: planning commit authority rejects expiry after an observed work-row wait", { skip: !enabled, timeout: 180_000 }, async () => {
+  const { PrismaClient } = require("@prisma/client");
+  const { lockDomainWorkClaimForCommit } = require("./domain-work-authority-service");
+  const dbA = new PrismaClient();
+  const dbB = new PrismaClient();
+  const observer = new PrismaClient();
+  let scope = null;
+  try {
+    scope = await createAgencyCreator(dbA, "a37-commit-wait", { status: "READY" });
+    const claim = await claimDomainWorkBatch({ db: dbA, workClass: WORK_CLASS.CREATOR_RECURRING_PLANNING, agencyId: scope.agencyId, creatorIds: [scope.creatorId], limit: 1, leaseMs: 60_000 });
+    assert.equal(claim.items.length, 1);
+    let holderPid;
+    let waiterPid;
+    let result;
+    await runPhase3InterleavedTransactions({
+      dbA, dbB,
+      firstA: async (tx) => {
+        [{ pid: holderPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid');
+        await tx.$queryRawUnsafe('SELECT "id" FROM "DomainWorkItem" WHERE "id"=$1 FOR UPDATE', claim.items[0].id);
+      },
+      firstB: async (tx) => { [{ pid: waiterPid }] = await tx.$queryRawUnsafe('SELECT pg_backend_pid() AS pid'); },
+      secondA: async (tx) => {
+        await waitForPhase3PostgresBlock({ db: observer, holderPid, waiterPid });
+        const [row] = await tx.$queryRawUnsafe('UPDATE "DomainWorkItem" SET "leaseUntil"=clock_timestamp() + interval \'100 milliseconds\' WHERE "id"=$1 RETURNING "leaseUntil" AS deadline', claim.items[0].id);
+        await waitUntilPhase3DatabaseTime(tx, row.deadline);
+      },
+      secondB: async (tx) => { result = await lockDomainWorkClaimForCommit({ db: tx, item: claim.items[0], ownerToken: claim.ownerToken }); },
+    });
+    assert.equal(result.current, false);
+    assert.equal(result.lost, true);
+    assert.equal(await dbA.jobInstance.count({ where: { creatorId: scope.creatorId } }), 0);
+    console.log("# A37_PLANNING_OBSERVED_WAIT_EXPIRY_PASS");
+  } finally {
+    try { if (scope) await cleanupPhase3PostgresAgencyFixture(dbA, scope.agencyId); }
+    finally { await Promise.allSettled([dbA.$disconnect(), dbB.$disconnect(), observer.$disconnect()]); }
+  }
+});
+
 async function withTeamGeneration(db, workFn) {
   return db.$transaction(async (tx) => {
     await tx.$queryRawUnsafe(

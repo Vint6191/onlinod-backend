@@ -56,7 +56,6 @@ const DEMAND_MAX_ATTEMPTS = 8;
 const DEMAND_RETRY_BASE_MS = 30 * 1000;
 const DEMAND_RETRY_MAX_MS = 60 * 60 * 1000;
 
-let sweepPromise = null;
 let demandSweepPromise = null;
 
 function sweepCycleKey(now) {
@@ -1030,107 +1029,10 @@ async function runAnalyticsCollectionDemandSweep({ db = prisma, now = new Date()
   }
 }
 
-async function runAnalyticsCollectionSweep({ db = prisma, now = new Date(), pageSize = SWEEP_PAGE_SIZE } = {}) {
-  if (sweepPromise) return { ok: true, skipped: true, reason: "in_process_sweep_in_flight" };
-  sweepPromise = (async () => {
-    const requestedNow = asDate(now) || new Date();
-    const claim = await claimAnalyticsSweepCycle({ db, now: requestedNow, leaseNow: requestedNow });
-    if (!claim.acquired) {
-      return { ok: true, skipped: true, reason: claim.reason, cycleKey: claim.cycleKey };
-    }
-
-    const currentNow = claim.cycleNow;
-    const size = Math.max(25, Math.min(1000, Number(pageSize) || SWEEP_PAGE_SIZE));
-    const range = operationalFreshnessWindow(currentNow);
-    let cursor = claim.cursorCreatorId || null;
-    let creators = 0;
-    let pages = 0;
-    let created = 0;
-    let reused = 0;
-    let dueDays = 0;
-    for (;;) {
-      const leaseAlive = await renewAnalyticsSweepLease({
-        db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: cursor, leaseNow: requestedNow,
-      });
-      if (!leaseAlive) {
-        return { ok: false, skipped: true, reason: "cycle_lease_lost", cycleKey: claim.cycleKey, creators, pages, created, reused, dueDays, pageSize: size };
-      }
-      const rows = await db.creatorAccount.findMany({
-        where: {
-          status: "READY",
-          deletedAt: null,
-          agency: { deletedAt: null },
-          ...(cursor ? { id: { gt: cursor } } : {}),
-        },
-        orderBy: { id: "asc" },
-        take: size,
-        select: { id: true, agencyId: true },
-      });
-      if (!rows.length) break;
-      pages += 1;
-      creators += rows.length;
-      cursor = rows.at(-1).id;
-      const ids = rows.map((row) => row.id);
-      const coverage = await db.analyticsCoverage.findMany({
-        where: {
-          creatorId: { in: ids },
-          dataType: "EARNINGS",
-          sourceTimezone: ANALYTICS_SOURCE_TIMEZONE,
-          coverageDate: { gte: range.startDay, lte: range.endDay },
-        },
-        select: { creatorId: true, coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, scanProofId: true, scanProof: { select: { status: true } } },
-      });
-      const coverageByCreator = new Map();
-      for (const item of coverage) {
-        const list = coverageByCreator.get(item.creatorId) || [];
-        list.push(item);
-        coverageByCreator.set(item.creatorId, list);
-      }
-      for (let index = 0; index < rows.length; index += 1) {
-        const creator = rows[index];
-        const result = await ensureOperationalAnalyticsFreshness({
-          db,
-          creatorId: creator.id,
-          agencyId: creator.agencyId,
-          reason: "RECURRING",
-          priority: 30,
-          now: currentNow,
-          coverageRows: coverageByCreator.get(creator.id) || [],
-        });
-        created += result.created;
-        reused += result.reused;
-        dueDays += result.dueDays;
-        // Persist bounded forward progress inside a page too. A crashed owner may
-        // therefore replay at most this small chunk, and exact-window job
-        // reservation still makes that replay provider-write-free.
-        if ((index + 1) % 25 === 0 && index + 1 < rows.length) {
-          const heartbeat = await renewAnalyticsSweepLease({
-            db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: creator.id, leaseNow: requestedNow,
-          });
-          if (!heartbeat) {
-            return { ok: false, skipped: true, reason: "cycle_lease_lost", cycleKey: claim.cycleKey, creators, pages, created, reused, dueDays, pageSize: size };
-          }
-        }
-      }
-      const renewed = await renewAnalyticsSweepLease({
-        db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: cursor, leaseNow: requestedNow,
-      });
-      if (!renewed) {
-        return { ok: false, skipped: true, reason: "cycle_lease_lost", cycleKey: claim.cycleKey, creators, pages, created, reused, dueDays, pageSize: size };
-      }
-      if (rows.length < size) break;
-    }
-    const completed = await completeAnalyticsSweepCycle({ db, ownerToken: claim.ownerToken, cycleKey: claim.cycleKey, cursorCreatorId: cursor, completedAt: requestedNow });
-    if (!completed) {
-      return { ok: false, skipped: true, reason: "cycle_completion_lost", cycleKey: claim.cycleKey, creators, pages, created, reused, dueDays, pageSize: size };
-    }
-    return { ok: true, skipped: false, cycleKey: claim.cycleKey, creators, pages, created, reused, dueDays, pageSize: size };
-  })();
-  try {
-    return await sweepPromise;
-  } finally {
-    sweepPromise = null;
-  }
+// Compatibility callers share the canonical durable creator-work lane.
+async function runAnalyticsCollectionSweep(options = {}) {
+  const { runRecurringCreatorWork } = require("./job-scheduler");
+  return runRecurringCreatorWork(options);
 }
 
 module.exports = {

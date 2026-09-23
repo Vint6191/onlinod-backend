@@ -97,13 +97,12 @@ test("A15 schema/migration keep capacity debt relational and additive", () => {
   assert.match(migration, /HEALTHY.*PRESSURED.*OVERLOADED.*UNKNOWN/);
 });
 
-test("A15 recurring analytics sweep persists capacity projection without replaying provider work on projection failure", () => {
-  const source = fs.readFileSync(path.join(__dirname, "job-scheduler.js"), "utf8");
-  const block = source.slice(source.indexOf("async function runCreatorAnalyticsCatchupSweep"), source.indexOf("async function runRecurringCreatorWork"));
-  assert.match(block, /refreshProviderCapacityDebtSnapshot/);
-  assert.match(block, /capacity_projection_failed/);
-  assert.match(block, /providerCapacityDebt/);
-  assert.ok(block.indexOf("refreshProviderCapacityDebtSnapshot") < block.indexOf("completeAnalyticsSweepCycle"));
+test("recurring admission is bounded by durable budget without full capacity scans in the hot path", () => {
+  const source = fs.readFileSync(path.join(__dirname, "analytics-recurring-planning-service.js"), "utf8");
+  assert.match(source, /AnalyticsPlanningBudget/);
+  assert.match(source, /ON CONFLICT/);
+  assert.match(source, /guaranteedDirectoryCallsPerSweep/);
+  assert.doesNotMatch(source, /readCanonicalCapacityInputs|refreshProviderCapacityDebtSnapshot/);
 });
 
 test("A15 PostgreSQL proof harness rehearses clean-current and A13-applied upgrade without mutating primary by default", () => {

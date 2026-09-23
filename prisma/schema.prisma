@@ -2675,6 +2675,14 @@ model AnalyticsCollectionLease {
   @@index([cycleKey, completedAt], map: "AnalyticsCollectionLease_cycle_complete_idx")
 }
 
+model AnalyticsPlanningBudget {
+  id            String   @id
+  windowStart   DateTime
+  reservedCalls Int
+  reservedJobs  Int
+  updatedAt     DateTime @default(now())
+}
+
 model AnalyticsCollectionDemand {
   key                  String    @id
   agencyId             String

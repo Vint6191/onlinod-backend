@@ -450,47 +450,15 @@ test("expired analytics sweep lease is recoverable in the same cycle and resumes
   assert.equal(recovered.cycleNow.toISOString(), "2026-09-08T14:05:00.000Z", "recovery keeps the original server-pinned cycle clock");
 });
 
-test("analytics recurring sweep cursor-pages every READY creator instead of silently stopping at 10k", async () => {
-  const now = new Date("2026-09-08T14:00:00.000Z");
-  const creators = Array.from({ length: 55 }, (_, index) => ({
-    id: `creator-${String(index + 1).padStart(3, "0")}`,
-    agencyId: `agency-${index % 3}`,
-  }));
-  const window = planner.operationalFreshnessWindow(now);
-  const allDays = daysInclusive(window.startDay, window.endDay);
-  let creatorQueries = 0;
-  const db = {
-    creatorAccount: {
-      findMany: async ({ where, take }) => {
-        creatorQueries += 1;
-        const after = where.id?.gt || null;
-        const start = after ? creators.findIndex((row) => row.id === after) + 1 : 0;
-        return creators.slice(start, start + take);
-      },
-    },
-    analyticsCoverage: {
-      findMany: async ({ where }) => {
-        const ids = new Set(where.creatorId.in);
-        return creators.filter((creator) => ids.has(creator.id)).flatMap((creator) => allDays.map((coverageDate) => ({
-          creatorId: creator.id,
-          coverageDate,
-          status: coverageDate.getTime() === window.endDay.getTime() ? "PARTIAL" : "COMPLETE",
-          lastVerifiedAt: now,
-          retryAfterAt: null,
-          scanProofId: `proof-${creator.id}-${isoDay(coverageDate)}`,
-          scanProof: { status: "COMMITTED" },
-        })));
-      },
-    },
-  };
-  addSweepLeaseStore(db);
-
-  const result = await planner.runAnalyticsCollectionSweep({ db, now, pageSize: 25 });
-  assert.equal(result.creators, 55);
-  assert.equal(result.pages, 3);
-  assert.equal(result.created, 0);
-  assert.equal(result.dueDays, 0);
-  assert.ok(creatorQueries >= 3);
+test("legacy Earnings sweep entry delegates to the canonical durable creator lane without catalog enumeration", async (t) => {
+  const scheduler = require("./job-scheduler");
+  let calls = 0;
+  const db = { creatorAccount: { findMany: async () => { throw new Error("retired catalog scan"); } } };
+  t.mock.method(scheduler, "runRecurringCreatorWork", async (args) => {
+    calls += 1; assert.equal(args.db, db); return { ok: true, selected: 25 };
+  });
+  assert.deepEqual(await planner.runAnalyticsCollectionSweep({ db }), { ok: true, selected: 25 });
+  assert.equal(calls, 1);
 });
 
 test("next UTC-hour analytics cycle cannot preempt a still-live previous cycle lease", async () => {

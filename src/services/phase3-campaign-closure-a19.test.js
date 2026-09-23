@@ -252,10 +252,11 @@ test("A19 source contracts keep recovery multi-replica safe, sample capacity bef
 
   const sweepStart = scheduler.indexOf("async function runCreatorAnalyticsCatchupSweep");
   const sweep = scheduler.slice(sweepStart, scheduler.indexOf("async function runRecurringCreatorWork", sweepStart));
-  const sample = sweep.indexOf("refreshProviderCapacityDebtSnapshot");
-  const admit = sweep.indexOf("selectCampaignDirectoryDiscoveryAdmissions");
-  assert.ok(sample >= 0 && admit > sample, "capacity must be sampled before directory admission");
-  assert.match(sweep, /sampleError/);
+  assert.match(sweep, /return runRecurringCreatorWork/);
+  const admission = fs.readFileSync(path.join(root, "src/services/analytics-recurring-planning-service.js"), "utf8");
+  assert.match(admission, /guaranteedDirectoryCallsPerSweep/);
+  assert.match(admission, /AnalyticsPlanningBudget/);
+  assert.doesNotMatch(admission, /refreshProviderCapacityDebtSnapshot/);
 
   assert.match(shared, /'REFRESH_PENDING'/);
   assert.match(shared, /campaignFrontierFreshnessStatus/);
