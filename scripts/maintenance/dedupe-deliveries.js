@@ -21,6 +21,7 @@ const path = require("path");
 
 // Подхватываем тот же Prisma singleton, что и production backend.
 const prisma = require("../../src/prisma");
+const { partitionAutomationDeliveryHardDeleteCandidates } = require("../../src/services/automation-delivery-hard-delete-guard");
 
 const APPLY = process.argv.includes("--apply");
 const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "SKIPPED", "CANCELED", "sent", "failed", "skipped", "canceled", "cancelled", "replied"];
@@ -31,8 +32,15 @@ async function main() {
 
   // Берём все строки с messageId, только нужные поля (легко влезет в память даже на тысячах).
   const rows = await prisma.automationDelivery.findMany({
-    where: { originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }], messageId: { not: null } },
-    select: { id: true, creatorId: true, messageId: true, updatedAt: true },
+    where: { originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, AND: [
+      { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
+      { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
+      { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
+    ], messageId: { not: null } },
+    select: {
+      id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true,
+      payload: true, generation: true, fanId: true, targetId: true, messageId: true, updatedAt: true,
+    },
     orderBy: { updatedAt: "desc" }, // самые свежие первыми
   });
   console.log(`Строк с messageId: ${rows.length}`);
@@ -44,7 +52,7 @@ async function main() {
   for (const r of rows) {
     const key = `${r.creatorId}||${r.messageId}`;
     if (seen.has(key)) {
-      toDelete.push(r.id);
+      toDelete.push(r);
     } else {
       seen.add(key);
       groups++;
@@ -52,7 +60,11 @@ async function main() {
   }
 
   const withoutMessageId = await prisma.automationDelivery.count({
-    where: { originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }], messageId: null },
+    where: { originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, AND: [
+      { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
+      { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
+      { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
+    ], messageId: null },
   });
 
   console.log("------------------------------------------------------------");
@@ -67,6 +79,14 @@ async function main() {
     return;
   }
 
+  const partition = await partitionAutomationDeliveryHardDeleteCandidates({ db: prisma, rows: toDelete });
+  const deleteIds = partition.deletable.map((row) => row.id);
+  if (partition.protected.length) console.log(`Защищено активных SFS proof rows:          ${partition.protected.length}`);
+  if (!deleteIds.length) {
+    console.log("Все кандидаты удержаны lifecycle-защитой. Удалять нечего.");
+    return;
+  }
+
   if (!APPLY) {
     console.log("DRY-RUN: ничего не удалено. Запусти с --apply чтобы реально почистить.");
     return;
@@ -75,13 +95,17 @@ async function main() {
   // Удаляем пачками по 500, чтобы не упереться в лимиты.
   let deleted = 0;
   const CHUNK = 500;
-  for (let i = 0; i < toDelete.length; i += CHUNK) {
-    const chunk = toDelete.slice(i, i + CHUNK);
+  for (let i = 0; i < deleteIds.length; i += CHUNK) {
+    const chunk = deleteIds.slice(i, i + CHUNK);
     const res = await prisma.automationDelivery.deleteMany({
-      where: { id: { in: chunk }, originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }] },
+      where: { id: { in: chunk }, originKind: "AUTOMATION", status: { in: TERMINAL_STATUSES }, AND: [
+        { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
+        { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
+        { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
+      ] },
     });
     deleted += res.count;
-    console.log(`удалено ${deleted}/${toDelete.length}...`);
+    console.log(`удалено ${deleted}/${deleteIds.length}...`);
   }
 
   const after = await prisma.automationDelivery.count();

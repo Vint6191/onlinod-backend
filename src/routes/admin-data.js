@@ -38,6 +38,7 @@ const { adminRequired } = require("../middleware/admin");
 const { adminHttpAuditMiddleware } = require("../middleware/admin-audit");
 const { listHiddenOnline } = require("../services/subscriber-directory-service");
 const { listFollowBack } = require("../services/follow-back-service");
+const { partitionAutomationDeliveryHardDeleteCandidates } = require("../services/automation-delivery-hard-delete-guard");
 
 const router = express.Router();
 router.use(adminRequired);
@@ -75,6 +76,44 @@ async function adminLog(req, data) {
 function sendErr(res, err, code = "ADMIN_DATA_FAILED") {
   const status = Number(err?.status || 500) || 500;
   return res.status(status).json({ ok: false, code: err?.code || code, error: String(err?.message || "Failed") });
+}
+
+const DELIVERY_DELETE_SELECT = {
+  id: true,
+  agencyId: true,
+  creatorId: true,
+  moduleKey: true,
+  actionType: true,
+  payload: true,
+  generation: true,
+  fanId: true,
+  targetId: true,
+};
+
+async function purgeAutomationDeliveriesBounded(where) {
+  let deleted = 0;
+  let protectedCount = 0;
+  let cursorId = null;
+  for (;;) {
+    const rows = await prisma.automationDelivery.findMany({
+      where: cursorId ? { AND: [where, { id: { gt: cursorId } }] } : where,
+      select: DELIVERY_DELETE_SELECT,
+      orderBy: { id: "asc" },
+      take: 500,
+    });
+    if (!rows.length) break;
+    cursorId = rows[rows.length - 1].id;
+    const partition = await partitionAutomationDeliveryHardDeleteCandidates({ db: prisma, rows });
+    protectedCount += partition.protected.length;
+    if (partition.deletable.length) {
+      const result = await prisma.automationDelivery.deleteMany({
+        where: { AND: [where, { id: { in: partition.deletable.map((row) => row.id) } }] },
+      });
+      deleted += result.count;
+    }
+    if (rows.length < 500) break;
+  }
+  return { deleted, protected: protectedCount };
 }
 
 // Whitelist of models the generic inspect/delete can touch, mapped to the
@@ -521,41 +560,74 @@ router.post("/purge-deliveries", async (req, res) => {
     const dedupeClones = req.body?.dedupeClones === true;
 
     let deletedClones = 0;
+    let protectedClones = 0;
     if (dedupeClones) {
       // Keep newest row per (creatorId, messageId), delete the rest.
       const rows = await prisma.automationDelivery.findMany({
-        where: { originKind: "AUTOMATION", status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }], messageId: { not: null }, ...(creatorId ? { creatorId } : {}) },
-        select: { id: true, creatorId: true, messageId: true, updatedAt: true },
+        where: {
+          originKind: "AUTOMATION",
+          status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] },
+          AND: [
+            { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
+            { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
+            { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
+          ],
+          messageId: { not: null },
+          ...(creatorId ? { creatorId } : {}),
+        },
+        select: { ...DELIVERY_DELETE_SELECT, messageId: true, updatedAt: true },
         orderBy: { updatedAt: "desc" },
         take: 10000});
       const seen = new Set();
       const toDelete = [];
       for (const r of rows) {
         const key = `${r.creatorId}||${r.messageId}`;
-        if (seen.has(key)) toDelete.push(r.id); else seen.add(key);
+        if (seen.has(key)) toDelete.push(r); else seen.add(key);
       }
-      for (let i = 0; i < toDelete.length; i += 500) {
-        const r = await prisma.automationDelivery.deleteMany({ where: { id: { in: toDelete.slice(i, i + 500) }, originKind: "AUTOMATION", status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }] } });
+      const partition = await partitionAutomationDeliveryHardDeleteCandidates({ db: prisma, rows: toDelete });
+      protectedClones = partition.protected.length;
+      const deletableIds = partition.deletable.map((row) => row.id);
+      for (let i = 0; i < deletableIds.length; i += 500) {
+        const r = await prisma.automationDelivery.deleteMany({ where: {
+          id: { in: deletableIds.slice(i, i + 500) },
+          originKind: "AUTOMATION",
+          status: { in: ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] },
+          AND: [
+            { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
+            { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
+            { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
+          ],
+        } });
         deletedClones += r.count;
       }
     }
 
     let deletedByFilter = 0;
+    let protectedByFilter = 0;
     if (statuses.length || olderThanDays > 0) {
       const terminalStatuses = new Set(["COMPLETED", "FAILED", "SKIPPED", "CANCELED"]);
       const safeStatuses = statuses.filter((status) => terminalStatuses.has(status));
-      const where = { originKind: "AUTOMATION", status: { in: safeStatuses.length ? safeStatuses : [...terminalStatuses] }, AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }] };
+      const where = {
+        originKind: "AUTOMATION",
+        status: { in: safeStatuses.length ? safeStatuses : [...terminalStatuses] },
+        AND: [
+          { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
+          { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
+          { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
+        ],
+      };
       if (creatorId) where.creatorId = creatorId;
       if (olderThanDays > 0) {
         const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000);
         where.OR = [{ sentAt: { lt: cutoff } }, { sentAt: null, createdAt: { lt: cutoff } }];
       }
-      const r = await prisma.automationDelivery.deleteMany({ where });
-      deletedByFilter = r.count;
+      const purge = await purgeAutomationDeliveriesBounded(where);
+      deletedByFilter = purge.deleted;
+      protectedByFilter = purge.protected;
     }
 
-    await adminLog(req, { action: "data.purgeDeliveries", targetType: "automationDelivery", after: { creatorId, statuses, olderThanDays, dedupeClones, deletedClones, deletedByFilter } });
-    return res.json({ ok: true, deletedClones, deletedByFilter, total: deletedClones + deletedByFilter });
+    await adminLog(req, { action: "data.purgeDeliveries", targetType: "automationDelivery", after: { creatorId, statuses, olderThanDays, dedupeClones, deletedClones, deletedByFilter, protectedClones, protectedByFilter } });
+    return res.json({ ok: true, deletedClones, deletedByFilter, protectedClones, protectedByFilter, total: deletedClones + deletedByFilter });
   } catch (err) { return sendErr(res, err); }
 });
 

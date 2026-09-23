@@ -1,5 +1,7 @@
 "use strict";
 
+const { partitionAutomationDeliveryHardDeleteCandidates } = require("./automation-delivery-hard-delete-guard");
+
 const TERMINAL_STATUSES = ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"];
 
 function object(value) {
@@ -87,22 +89,39 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 2000, db = n
   db = db || require("../prisma");
   let archived = 0;
   let aggregateUpdates = 0;
+  const take = Math.max(100, Math.min(10000, Number(batchSize) || 2000));
+  let cursor = null;
   for (;;) {
+    const lifecycleGuards = [
+      { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
+      { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
+      { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
+    ];
+    if (cursor) lifecycleGuards.push({
+      OR: [
+        { finishedAt: { gt: cursor.finishedAt, lt: olderThan } },
+        { finishedAt: cursor.finishedAt, id: { gt: cursor.id } },
+      ],
+    });
     const rows = await db.automationDelivery.findMany({
       where: {
         originKind: "AUTOMATION",
         status: { in: TERMINAL_STATUSES },
-        AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }],
+        AND: lifecycleGuards,
         finishedAt: { not: null, lt: olderThan },
       },
       orderBy: [{ finishedAt: "asc" }, { id: "asc" }],
-      take: Math.max(100, Math.min(10000, Number(batchSize) || 2000)),
+      take,
       select: {
         id: true,
         agencyId: true,
         creatorId: true,
         moduleKey: true,
         actionType: true,
+        payload: true,
+        generation: true,
+        fanId: true,
+        targetId: true,
         status: true,
         result: true,
         createdAt: true,
@@ -111,8 +130,34 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 2000, db = n
       },
     });
     if (!rows.length) break;
-    const groups = groupDeliveriesForArchive(rows);
-    await db.$transaction(async (tx) => {
+    cursor = { finishedAt: rows[rows.length - 1].finishedAt, id: rows[rows.length - 1].id };
+    const committed = await db.$transaction(async (tx) => {
+      const partition = await partitionAutomationDeliveryHardDeleteCandidates({ db: tx, rows });
+      const candidates = partition.deletable;
+      if (!candidates.length) return { archived: 0, aggregateUpdates: 0, protected: partition.protected.length };
+      const deletion = await tx.automationDelivery.deleteMany({ where: {
+        id: { in: candidates.map((row) => row.id) },
+        originKind: "AUTOMATION",
+        AND: [
+          { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
+          { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
+          { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
+        ],
+      } });
+      let deletedRows = candidates;
+      if (Number(deletion?.count || 0) !== candidates.length) {
+        // A terminal MASS row may become PENDING again when a fresh provider
+        // snapshot observes its remote queue.  The delete predicate is the
+        // commit fence; only rows that actually disappeared may enter compact
+        // history, otherwise live metrics and the archive would double-count.
+        const survivors = await tx.automationDelivery.findMany({
+          where: { id: { in: candidates.map((row) => row.id) } },
+          select: { id: true },
+        });
+        const survivorIds = new Set((survivors || []).map((row) => row.id));
+        deletedRows = candidates.filter((row) => !survivorIds.has(row.id));
+      }
+      const groups = groupDeliveriesForArchive(deletedRows);
       for (const group of groups) {
         const where = {
           creatorId_moduleKey_actionType_periodStart: {
@@ -146,11 +191,11 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 2000, db = n
           });
         }
       }
-      await tx.automationDelivery.deleteMany({ where: { id: { in: rows.map((row) => row.id) }, originKind: "AUTOMATION", AND: [{ OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] }] } });
+      return { archived: deletedRows.length, aggregateUpdates: groups.length, protected: partition.protected.length };
     });
-    archived += rows.length;
-    aggregateUpdates += groups.length;
-    if (rows.length < batchSize) break;
+    archived += committed.archived;
+    aggregateUpdates += committed.aggregateUpdates;
+    if (rows.length < take) break;
   }
   return { label: "automationDelivery.compacted", archived, deleted: archived, aggregateUpdates };
 }

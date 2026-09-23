@@ -22,6 +22,7 @@
 
 // Подхватываем тот же Prisma singleton, что и production backend.
 const prisma = require("../../src/prisma");
+const { partitionAutomationDeliveryHardDeleteCandidates } = require("../../src/services/automation-delivery-hard-delete-guard");
 
 const APPLY = process.argv.includes("--apply");
 const ALL = process.argv.includes("--all");
@@ -41,8 +42,19 @@ async function main() {
 
   // Берём кандидатов по статусу.
   const candidates = await prisma.automationDelivery.findMany({
-    where: { originKind: "AUTOMATION", status: { in: STUCK_STATUSES } },
-    select: { id: true, fanId: true, status: true, sentAt: true, createdAt: true, messageId: true },
+    where: {
+      originKind: "AUTOMATION",
+      status: { in: STUCK_STATUSES },
+      AND: [
+        { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
+        { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
+      ],
+    },
+    select: {
+      id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true,
+      payload: true, generation: true, fanId: true, targetId: true,
+      status: true, sentAt: true, createdAt: true, messageId: true,
+    },
   });
   console.log(`Записей в целевых статусах: ${candidates.length}`);
 
@@ -78,12 +90,26 @@ async function main() {
     return;
   }
 
-  const ids = toDelete.map((r) => r.id);
+  const partition = await partitionAutomationDeliveryHardDeleteCandidates({ db: prisma, rows: toDelete });
+  const ids = partition.deletable.map((r) => r.id);
+  if (partition.protected.length) console.log(`Защищено активных SFS proof rows: ${partition.protected.length}`);
+  if (!ids.length) {
+    console.log("Все кандидаты удержаны lifecycle-защитой. Удалять нечего.");
+    return;
+  }
   let deleted = 0;
   const CHUNK = 500;
   for (let i = 0; i < ids.length; i += CHUNK) {
     const chunk = ids.slice(i, i + CHUNK);
-    const res = await prisma.automationDelivery.deleteMany({ where: { id: { in: chunk }, originKind: "AUTOMATION", status: { in: STUCK_STATUSES } } });
+    const res = await prisma.automationDelivery.deleteMany({ where: {
+      id: { in: chunk },
+      originKind: "AUTOMATION",
+      status: { in: STUCK_STATUSES },
+      AND: [
+        { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
+        { OR: [{ actionType: { not: "MASS_QUEUE_CREATE" } }, { intentAcknowledgedAt: { not: null } }] },
+      ],
+    } });
     deleted += res.count;
     console.log(`удалено ${deleted}/${ids.length}...`);
   }

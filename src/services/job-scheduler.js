@@ -53,6 +53,8 @@ const {
   publishDomainWork,
   currentDependencyRevision,
   hasOutstandingDomainWork,
+  wakeDomainDependencyBatch,
+  runDomainDependencyWakeSweep,
 } = require("./domain-work-authority-service");
 const { processTelegramAccountRetirementFanout } = require("./telegram-account-retirement-fanout-service");
 const {
@@ -1228,6 +1230,10 @@ async function maybeRepairProviderOperationalDirty({ db = prisma, now = new Date
   return report;
 }
 
+async function maybeRunPhase2DependencyWake({ db = prisma, now = new Date() } = {}) {
+  return runDomainDependencyWakeSweep({ db, now, claimLimit: 20, wakeLimit: 100 });
+}
+
 async function listDependencyFanoutOrders({ db, item, limit = 100 }) {
   const cursor = String(item?.progressCursor?.lastOrderId || "").trim() || null;
   const baseWhere = { agencyId: String(item.agencyId), status: "PENDING", type: { in: ["CONTENT", "CALL", "PHYSICAL"] }, ...(cursor ? { id: { gt: cursor } } : {}) };
@@ -1315,8 +1321,9 @@ async function processTeamMoneyEvidenceFanout({ db, item, now }) {
 }
 
 async function maybeRunPhase2DependencyFanout({ db = prisma, now = new Date() } = {}) {
+  const dependencyWake = await maybeRunPhase2DependencyWake({ db, now });
   const claim = await claimDomainWorkBatch({ db, workClass: PHASE2_WORK_CLASS.DEPENDENCY_FANOUT, limit: 20, perAgencyQuantum: 2, leaseMs: 2 * 60 * 1000, fallbackNow: now });
-  const report = { ok: true, selected: Number(claim?.items?.length || 0), published: 0, sourcePublished: 0, reminderReprojected: 0, completed: 0, yielded: 0, failed: 0, lostOwnership: 0 };
+  const report = { ok: true, dependencyWake, selected: Number(claim?.items?.length || 0), published: 0, sourcePublished: 0, reminderReprojected: 0, completed: 0, yielded: 0, failed: 0, lostOwnership: 0 };
   for (const item of claim?.items || []) {
     try {
       if (String(item.objectType) === "TelegramAccountRetirement") {
@@ -1406,7 +1413,7 @@ async function maybeRunPhase2DependencyFanout({ db = prisma, now = new Date() } 
       if (failed?.lost) report.lostOwnership += 1; else report.failed += 1;
     }
   }
-  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  report.ok = dependencyWake?.ok !== false && report.failed === 0 && report.lostOwnership === 0;
   return report;
 }
 
@@ -2723,6 +2730,7 @@ module.exports = {
   maybeRunPhase2HistoricalEnumeration,
   maybePlanDueCustomReminderWork,
   maybeRepairProviderOperationalDirty,
+  maybeRunPhase2DependencyWake,
   maybeRunPhase2DependencyFanout,
   _test: {
     SCHEDULER_OUTCOME,
@@ -2730,5 +2738,6 @@ module.exports = {
     executeSchedulerConsumer,
     recordRecurringSchedulerHealth,
     handleRecurringSweepTickResult,
+    wakeDomainDependencyBatch,
   },
 };

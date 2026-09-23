@@ -62,6 +62,110 @@ test("M1 release token is transaction-local and installed before new Creator wri
   assert.deepEqual(calls[0].args, ["onlinod.phase2_creator_writer_generation", release.CREATOR_ACCOUNT_WRITER_GENERATION]);
 });
 
+test("A36 dependency-wake bridge atomically proves BUILDING topology and the exact v4 release", async () => {
+  const calls = [];
+  const tx = {
+    async $queryRawUnsafe(sql, ...args) {
+      calls.push({ sql, args });
+      if (/DomainWorkClaimTopologyState/.test(sql)) {
+        return [{ generation: release.DOMAIN_WORK_CLAIM_TOPOLOGY_ID, activationState: "BUILDING" }];
+      }
+      if (/Phase2ReleaseCompatibilityAuthority/.test(sql)) {
+        return [{ requiredGeneration: release.DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION, activationState: "ACTIVE" }];
+      }
+      return [{ value: args[1] }];
+    },
+  };
+  const result = await release.authorizeDomainWorkDependencyWakeBridge(tx);
+  assert.equal(result.generation, release.DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION);
+  assert.equal(calls.length, 3);
+  assert.match(calls[0].sql, /DomainWorkClaimTopologyState[\s\S]*FOR SHARE/);
+  assert.match(calls[1].sql, /Phase2ReleaseCompatibilityAuthority[\s\S]*FOR SHARE/);
+  assert.deepEqual(calls[2].args, [
+    "onlinod.phase2_domain_executor_generation",
+    release.DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION,
+  ]);
+});
+
+test("A36 ACTIVE claim authorization locks topology then exact v5 release in the claim transaction", async () => {
+  const calls = [];
+  const tx = {
+    async $queryRawUnsafe(sql, ...args) {
+      calls.push({ sql, args });
+      if (/DomainWorkClaimTopologyState/.test(sql)) {
+        return [{ generation: release.DOMAIN_WORK_CLAIM_TOPOLOGY_ID, activationState: "ACTIVE" }];
+      }
+      if (/Phase2ReleaseCompatibilityAuthority/.test(sql)) {
+        return [{ requiredGeneration: release.DOMAIN_WORK_EXECUTOR_GENERATION, activationState: "ACTIVE" }];
+      }
+      return [{ value: args[1] }];
+    },
+  };
+  const result = await release.authorizeDomainWorkExecutor(tx);
+  assert.equal(result.generation, release.DOMAIN_WORK_EXECUTOR_GENERATION);
+  assert.equal(calls.length, 3);
+  assert.match(calls[0].sql, /DomainWorkClaimTopologyState[\s\S]*FOR SHARE/);
+  assert.match(calls[1].sql, /Phase2ReleaseCompatibilityAuthority[\s\S]*FOR SHARE/);
+  assert.deepEqual(calls[2].args, [
+    "onlinod.phase2_domain_executor_generation",
+    release.DOMAIN_WORK_EXECUTOR_GENERATION,
+  ]);
+});
+
+test("A36 stale ACTIVE precheck cannot authorize a claim after topology entered BUILDING", async () => {
+  let calls = 0;
+  const tx = {
+    async $queryRawUnsafe(sql) {
+      calls += 1;
+      assert.match(sql, /DomainWorkClaimTopologyState[\s\S]*FOR SHARE/);
+      return [{ generation: release.DOMAIN_WORK_CLAIM_TOPOLOGY_ID, activationState: "BUILDING" }];
+    },
+  };
+  await assert.rejects(
+    release.authorizeDomainWorkExecutor(tx),
+    (error) => error?.code === "DOMAIN_WORK_CLAIM_TOPOLOGY_NOT_ACTIVE" && error?.retryable === true,
+  );
+  assert.equal(calls, 1, "BUILDING must reject before reading or authorizing the v5 release");
+});
+
+test("A36 dependency-wake bridge remains live during a later BUILDING rebuild on v5", async () => {
+  const calls = [];
+  const tx = {
+    async $queryRawUnsafe(sql, ...args) {
+      calls.push({ sql, args });
+      if (/DomainWorkClaimTopologyState/.test(sql)) {
+        return [{ generation: release.DOMAIN_WORK_CLAIM_TOPOLOGY_ID, activationState: "BUILDING" }];
+      }
+      if (/Phase2ReleaseCompatibilityAuthority/.test(sql)) {
+        return [{ requiredGeneration: release.DOMAIN_WORK_EXECUTOR_GENERATION, activationState: "ACTIVE" }];
+      }
+      return [{ value: args[1] }];
+    },
+  };
+  const result = await release.authorizeDomainWorkDependencyWakeBridge(tx);
+  assert.equal(result.generation, release.DOMAIN_WORK_EXECUTOR_GENERATION);
+  assert.deepEqual(calls[2].args, [
+    "onlinod.phase2_domain_executor_generation",
+    release.DOMAIN_WORK_EXECUTOR_GENERATION,
+  ]);
+});
+
+test("A36 dependency-wake bridge cannot acquire v4 ownership after ACTIVE", async () => {
+  let calls = 0;
+  const tx = {
+    async $queryRawUnsafe(sql) {
+      calls += 1;
+      assert.match(sql, /DomainWorkClaimTopologyState/);
+      return [{ generation: release.DOMAIN_WORK_CLAIM_TOPOLOGY_ID, activationState: "ACTIVE" }];
+    },
+  };
+  await assert.rejects(
+    release.authorizeDomainWorkDependencyWakeBridge(tx),
+    (error) => error?.code === "DOMAIN_WORK_DEPENDENCY_WAKE_BRIDGE_TRANSITION" && error?.retryable === true,
+  );
+  assert.equal(calls, 1, "ACTIVE must reject before reading or authorizing the legacy release generation");
+});
+
 test("M1 Creator/Domain generation helpers reject root Prisma because their tokens are transaction-local", async () => {
   const rootClient = {
     async $transaction() { throw new Error("must not be reached"); },
@@ -75,6 +179,11 @@ test("M1 Creator/Domain generation helpers reject root Prisma because their toke
   );
   await assert.rejects(
     release.authorizeDomainWorkExecutor(rootClient),
+    (error) => error?.code === "PHASE2_RELEASE_TRANSACTION_REQUIRED"
+      && error?.setting === "onlinod.phase2_domain_executor_generation",
+  );
+  await assert.rejects(
+    release.authorizeDomainWorkDependencyWakeBridge(rootClient),
     (error) => error?.code === "PHASE2_RELEASE_TRANSACTION_REQUIRED"
       && error?.setting === "onlinod.phase2_domain_executor_generation",
   );
@@ -96,8 +205,23 @@ test("M1 every direct new-binary CreatorAccount mutation is release-authorized o
 
 test("M1 DomainWork release generation is installed in every production claim path", () => {
   const claims = domainWork.slice(domainWork.indexOf("async function claimDomainWorkBatch"), domainWork.indexOf("function claimWhere"));
-  const authorizationCalls = claims.match(/authorizeDomainWorkExecutor\(tx\)/g) || [];
-  assert.equal(authorizationCalls.length, 3, "creator-scoped, broad/raw and adapter claim paths must all authorize");
+  assert.match(claims, /const authorizeClaimExecutor = async \(tx\)[\s\S]*authorizeDomainWorkDependencyWakeBridge\(tx\)[\s\S]*authorizeDomainWorkExecutor\(tx\)/);
+  const section = (start, end) => {
+    const from = claims.indexOf(start);
+    const to = end ? claims.indexOf(end, from + start.length) : claims.length;
+    assert.ok(from >= 0 && to > from, `missing claim section: ${start}`);
+    return claims.slice(from, to);
+  };
+  const authorizedBoundaries = [
+    ["creator-scoped raw claim", section("if (rawCapable && normalizedCreatorIds.length)", "if (rawCapable && typeof db?.$transaction")],
+    ["broad Agency reservation", section("const agencyReservation = await runDbTransaction", "selectedAgency = clean(agencyReservation.agencyId")],
+    ["broad shard reservation", section("const shardReservation = await runDbTransaction", "const selectedShard = shardReservation.claimShard")],
+    ["broad physical claim", section("const tranche = await runDbTransaction", "if (!firstAuthorityNow) firstAuthorityNow = tranche.authorityNow")],
+    ["adapter claim", section("// Adapter/unit fallback.")],
+  ];
+  for (const [label, source] of authorizedBoundaries) {
+    assert.equal((source.match(/authorizeClaimExecutor\(tx\)/g) || []).length, 1, `${label} must authorize its own transaction`);
+  }
   assert.match(migration, /NEW\."claimExecutionGeneration" := v_required/);
 });
 

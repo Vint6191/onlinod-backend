@@ -40,6 +40,65 @@ function canAccessCreator(member, creatorId) {
 
 async function requireCreatorAccess({ agencyId, member, creatorId, db = null }) {
   const client = db || require("../prisma");
+  const memberId = String(member?.id || "").trim();
+  const userId = String(member?.userId || "").trim();
+  const accessEpoch = Number(member?.accessEpoch);
+  if (typeof client?.$queryRawUnsafe === "function"
+      && typeof client?.domainWorkClaimTopologyState?.findUnique === "function"
+      && memberId && userId && Number.isInteger(accessEpoch) && accessEpoch > 0) {
+    try {
+      const rows = await client.$queryRawUnsafe(
+        `SELECT c."id",c."agencyId",c."displayName",c."username",c."status"
+           FROM "CreatorAccount" c
+           JOIN "AgencyMember" m
+             ON m."id"=$3 AND m."userId"=$4 AND m."agencyId"=c."agencyId"
+            AND m."accessEpoch"=$5 AND m."deletedAt" IS NULL AND m."deactivatedAt" IS NULL
+          WHERE c."id"=$1 AND c."agencyId"=$2 AND c."deletedAt" IS NULL
+            AND (
+              "phase3_member_has_broad_creator_access"(
+                m."role"::text,m."roleKey",m."assignedCreators"
+              )
+              OR (
+                EXISTS (
+                  SELECT 1 FROM "DomainWorkClaimTopologyState" t
+                   WHERE t."id"='phase3_domain_work_claim_topology_a36_v1'
+                     AND t."generation"='phase3_domain_work_claim_topology_a36_v1'
+                     AND t."activationState"='ACTIVE'
+                )
+                AND EXISTS (
+                  SELECT 1 FROM "AgencyMemberCreatorAccessCurrent" x
+                   WHERE x."memberId"=m."id" AND x."agencyId"=m."agencyId"
+                     AND x."accessEpoch"=m."accessEpoch" AND x."creatorId"=c."id"
+                )
+              )
+              OR (
+                NOT EXISTS (
+                  SELECT 1 FROM "DomainWorkClaimTopologyState" t
+                   WHERE t."id"='phase3_domain_work_claim_topology_a36_v1'
+                     AND t."generation"='phase3_domain_work_claim_topology_a36_v1'
+                     AND t."activationState"='ACTIVE'
+                )
+                AND "phase2_scope_allows_creator"(m."assignedCreators",c."id")
+              )
+            )
+          FOR SHARE OF m`,
+        String(creatorId), String(agencyId), memberId, userId, accessEpoch,
+      );
+      if (rows?.[0]) return rows[0];
+      const existing = await client.creatorAccount.findFirst({
+        where: { id: creatorId, agencyId, deletedAt: null }, select: { id: true },
+      });
+      const error = new Error(existing ? "You do not have access to this creator" : "Creator not found");
+      error.code = existing ? "CREATOR_ACCESS_FORBIDDEN" : "CREATOR_NOT_FOUND";
+      error.status = existing ? 403 : 404;
+      throw error;
+    } catch (error) {
+      // Lightweight/pre-migration adapters do not expose the A36 projection.
+      // Production PostgreSQL errors must remain visible; only an actually
+      // absent rollout relation/function may use the legacy source predicate.
+      if (!["42P01", "42883"].includes(String(error?.code || ""))) throw error;
+    }
+  }
   const creator = await client.creatorAccount.findFirst({
     where: { id: creatorId, agencyId, deletedAt: null },
     select: { id: true, agencyId: true, displayName: true, username: true, status: true },

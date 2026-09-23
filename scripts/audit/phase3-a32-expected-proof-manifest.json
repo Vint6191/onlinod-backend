@@ -1,8 +1,8 @@
 {
-  "version": "A34",
+  "version": "A36-R2",
   "algorithm": "sha256-canonical-json-files-v1",
-  "testCount": 54,
-  "manifestSha256": "13db919fec16490da86dcb96d91ac7372c7efdedb12cb7f44d8f7c8bd7b8bf02",
+  "testCount": 60,
+  "manifestSha256": "e07ba94a0d839e7eb403cfc252ca15764c134d6e5df746e4006d98f5f22e479b",
   "files": [
     {
       "file": "src/services/phase3-provider-capacity-postgres-int5-9a-15.integration.test.js",
@@ -113,6 +113,12 @@
       "testNames": [
         "A34 PostgreSQL: Hidden status command, projection rollback and concurrent writers converge atomically",
         "A34 PostgreSQL: 4000 creators publish bounded fair work and two replicas claim disjoint batches",
+        "A36 PostgreSQL: scoped member claims 1000 of 2000 creators through fixed shards without enumerating scope",
+        "A36 PostgreSQL: dependency changes publish one durable wake and drain blocked work in indexed batches",
+        "A36 PostgreSQL: 1000 agencies publish 4000 creators and two replicas claim tenant-fair disjoint batches",
+        "A36 PostgreSQL: opposite-order multi-write transactions defer exact partition-shard-Agency reconciliation without deadlock",
+        "A36 PostgreSQL: opposite-order transactions sharing the exact same partitions cannot retain the retired row-trigger inversion",
+        "A36 PostgreSQL: destructive internal authority requires the exact live claim and preserves child composition",
         "A34 PostgreSQL: expired recurring claim is fenced, restart takes over and creator lifecycle revokes/reopens work"
       ]
     },

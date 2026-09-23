@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { cleanupAgencyFixture: cleanupAgencyFixtureAuthority } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
 
@@ -54,24 +55,8 @@ async function withClients(count, run) {
 }
 
 async function cleanupAgency(db, agencyId, userIds = []) {
-  const work = require("./domain-work-authority-service");
   try {
-    await work.publishDomainWork({
-      db,
-      agencyId,
-      workClass: work.WORK_CLASS.DESTRUCTIVE_AGENCY_CLEANUP,
-      objectType: "Phase2AgencyDestructiveCleanup",
-      objectId: agencyId,
-      partitionKey: agencyId,
-      availableAt: new Date(Date.now() - 1_000),
-    });
-    await db.$transaction(async (tx) => {
-      const release = require("./phase2-release-compatibility-authority-service");
-      await release.assertTeamControlPlaneWriteAdmission(tx);
-      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
-      await tx.agency.delete({ where: { id: agencyId } });
-      if (userIds.length) await tx.user.deleteMany({ where: { id: { in: userIds } } });
-    });
+    await cleanupAgencyFixtureAuthority(db, { agencyId, userIds });
   } catch (_) {
     // Disposable integration DB: cleanup must never hide the closure assertion.
   }

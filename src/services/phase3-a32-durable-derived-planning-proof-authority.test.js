@@ -39,8 +39,8 @@ test("A32 Follow Back / Follow Automation / Bumps cannot report planning converg
 test("A32 physical proof uses a pinned file/test-name manifest and preserves actual totals on red scenarios", () => {
   const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
   const manifest = JSON.parse(source("scripts/audit/phase3-a32-expected-proof-manifest.json"));
-  assert.equal(manifest.version, "A34");
-  assert.equal(manifest.testCount, 54);
+  assert.equal(manifest.version, "A36-R2");
+  assert.equal(manifest.testCount, 60);
   assert.equal(manifest.files.length, 13);
   assert.match(runner, /EXPECTED_PROOF_MANIFEST_FILE/);
   assert.match(runner, /manifestSha256/);
@@ -142,7 +142,7 @@ test("A32 INT2 creator observation clock follows production retirement and physi
   const migration = source("prisma/migrations/20260921150500_phase3_a32_int2_subscriber_recovery_refresh_identity_clock_lifecycle_v1/migration.sql");
   const lifecycle = source("src/services/creator-lifecycle-authority-service.js");
   assert.match(schema, /model FanObservationCreatorClock[\s\S]*creator CreatorAccount @relation\(fields: \[creatorId\], references: \[id\], onDelete: Cascade\)/);
-  assert.match(schema, /fanObservationClock FanObservationCreatorClock\?/);
+  assert.match(schema, /fanObservationClock\s+FanObservationCreatorClock\?/);
   assert.match(migration, /a\."deletedAt" IS NOT NULL/);
   assert.match(migration, /WHERE NOT EXISTS[\s\S]*"CreatorAccount"/);
   assert.match(migration, /FOREIGN KEY \("creatorId"\) REFERENCES "CreatorAccount"\("id"\)[\s\S]*ON DELETE CASCADE/);

@@ -168,10 +168,10 @@ async function purgeCreatorNonFkPhase2Batch({ tx, agencyId, creatorId, limit }) 
   if (typeof tx?.$queryRawUnsafe !== "function") return { deleted: 0, exhausted: false, source: "no_raw_sql" };
   let remaining = Math.max(1, Number(limit) || CREATOR_DELETE_BATCH);
   let deleted = 0;
-  const run = async (table, predicate) => {
+  const run = async (table, predicate, { agencyScoped = true } = {}) => {
     if (remaining <= 0) return;
     const count = await rawDeleteBatch(tx,
-      `DELETE FROM ${qident(table)} t WHERE t.ctid IN (SELECT x.ctid FROM ${qident(table)} x WHERE x."agencyId"=$1 AND (${predicate}) ORDER BY x.ctid LIMIT $3) RETURNING 1`,
+      `DELETE FROM ${qident(table)} t WHERE t.ctid IN (SELECT x.ctid FROM ${qident(table)} x WHERE ${agencyScoped ? 'x."agencyId"=$1 AND ' : ''}(${predicate}) ORDER BY x.ctid LIMIT $3) RETURNING 1`,
       [agencyId, creatorId], remaining);
     deleted += count; remaining -= count;
   };
@@ -193,6 +193,13 @@ async function purgeCreatorNonFkPhase2Batch({ tx, agencyId, creatorId, limit }) 
   await run("TeamPpvPurchaseLedger", `x."creatorId"=$2`);
   await run("TeamTipLedger", `x."creatorId"=$2`);
   await run("TeamPpvResolveJob", `x."creatorId"=$2`);
+  // Current access/lease/token/waiter rows are executable authority, not
+  // retained history.  Keep them inside the same bounded destructive budget so
+  // a hard-deleted Creator cannot leave a usable capability behind.
+  await run("AgencyMemberCreatorAccessCurrent", `x."creatorId"=$2`, { agencyScoped: false });
+  await run("FanObservationReadLease", `x."creatorId"=$2`, { agencyScoped: false });
+  await run("FanObservationToken", `x."creatorId"=$2`, { agencyScoped: false });
+  await run("OfProviderRequestGateWaiter", `x."creatorId"=$2`, { agencyScoped: false });
 
   return { deleted, exhausted: remaining <= 0, remaining };
 }
@@ -636,9 +643,13 @@ async function phase2CreatorResidualRowsRemain(tx, agencyId, creatorId) {
     [`"TeamPpvPurchaseLedger"`, `x."creatorId"=$2`],
     [`"TeamTipLedger"`, `x."creatorId"=$2`],
     [`"TeamPpvResolveJob"`, `x."creatorId"=$2`],
+    [`"AgencyMemberCreatorAccessCurrent"`, `x."creatorId"=$2`, false],
+    [`"FanObservationReadLease"`, `x."creatorId"=$2`, false],
+    [`"FanObservationToken"`, `x."creatorId"=$2`, false],
+    [`"OfProviderRequestGateWaiter"`, `x."creatorId"=$2`, false],
   ];
-  for (const [table, predicate] of checks) {
-    const rows = await tx.$queryRawUnsafe(`SELECT 1 AS present FROM ${table} x WHERE x."agencyId"=$1 AND (${predicate}) LIMIT 1`, agencyId, creatorId);
+  for (const [table, predicate, agencyScoped = true] of checks) {
+    const rows = await tx.$queryRawUnsafe(`SELECT 1 AS present FROM ${table} x WHERE ${agencyScoped ? 'x."agencyId"=$1 AND ' : ''}(${predicate}) LIMIT 1`, agencyId, creatorId);
     if (Array.isArray(rows) && rows.length) return true;
   }
   return false;
@@ -664,6 +675,12 @@ const AGENCY_NON_FK_TENANT_TABLES = Object.freeze([
   "TeamPpvPurchaseLedger",
   "TeamTipLedger",
   "TeamPpvResolveJob",
+  // A36 member-scope projections have no Agency FK by design.  They are
+  // rebuildable current authority and are drained in bounded tenant batches
+  // before Agency identity deletion; otherwise one AgencyMember cascade could
+  // synchronously fan out across its whole explicit creator scope.
+  "DomainWorkMemberScopeShardState",
+  "AgencyMemberCreatorAccessCurrent",
 ]);
 
 async function purgeAgencyNonFkTenantBatch({ tx, agencyId, limit }) {
@@ -813,7 +830,11 @@ async function processAgencyHardDeleteWorkItem({ db, item, ownerToken, batchSize
     // authorized Agency cleanup executor. DB fences require both this local token
     // and the durable destructive DWI, so ordinary/stale writers remain blocked.
     if (typeof tx?.$queryRawUnsafe === "function") {
-      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
+      await tx.$queryRawUnsafe(`
+        SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS "agencyId",
+               set_config('onlinod.phase2_destructive_agency_work_id',$2,true) AS "workId",
+               set_config('onlinod.phase2_destructive_agency_owner_token',$3,true) AS "ownerToken"
+      `, agencyId, String(item.id), String(ownerToken || item.ownerToken || ""));
     }
 
     // Agency destruction composes the existing Creator destructive lifecycle instead of
@@ -895,12 +916,16 @@ async function processCreatorHardDeleteWorkItem({ db, item, ownerToken, batchSiz
     const claim = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow });
     if (claim?.lost) return { ok: false, lost: true, code: claim.code || "DOMAIN_WORK_CLAIM_LOST" };
 
-    // Creator cleanup gets an explicit transaction-local authorization token.
-    // Trigger policy may suppress cleanup-generated invalidations only for this
-    // claimed destructive transaction, never merely because deletion is pending.
+    // Creator cleanup gets an exact transaction-local claim authorization.  DB
+    // policy re-proves the work id, owner token, CLAIMED state and live lease for
+    // every destructive bypass; an Agency/Creator marker alone is never enough.
     if (typeof tx?.$queryRawUnsafe === "function") {
-      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_creator_id',$1,true) AS value`, creatorId);
-      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
+      await tx.$queryRawUnsafe(`
+        SELECT set_config('onlinod.phase2_destructive_creator_id',$1,true) AS "creatorId",
+               set_config('onlinod.phase2_destructive_agency_id',$2,true) AS "agencyId",
+               set_config('onlinod.phase2_destructive_creator_work_id',$3,true) AS "workId",
+               set_config('onlinod.phase2_destructive_creator_owner_token',$4,true) AS "ownerToken"
+      `, creatorId, agencyId, String(item.id), String(ownerToken || item.ownerToken || ""));
     }
 
     let remaining = limit;

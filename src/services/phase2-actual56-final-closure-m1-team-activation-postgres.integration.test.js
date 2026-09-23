@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { cleanupAgencyFixture: cleanupAgencyFixtureAuthority } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 
 // This test mutates the global release state and therefore runs only under its
 // dedicated opt-in. Run it in isolation against a disposable migrated database.
@@ -44,15 +45,7 @@ async function withTeamGeneration(db, workFn) {
 async function cleanupAgency(db, agencyId) {
   if (!agencyId) return;
   try {
-    await db.$transaction(async (tx) => {
-      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
-      await tx.$queryRawUnsafe(
-        `SELECT set_config($1,$2,true) AS value`,
-        release.TEAM_CONTROL_PLANE_DB_SETTING,
-        release.TEAM_CONTROL_PLANE_GENERATION,
-      );
-      await tx.agency.delete({ where: { id: agencyId } });
-    });
+    await cleanupAgencyFixtureAuthority(db, { agencyId });
   } catch (_) {}
 }
 

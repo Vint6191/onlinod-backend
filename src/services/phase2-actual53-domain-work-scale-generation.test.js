@@ -7,10 +7,24 @@ const path = require("node:path");
 const prismaPath = require.resolve("../prisma");
 require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: {} };
 const authority = require("./domain-work-authority-service");
+const release = require("./phase2-release-compatibility-authority-service");
+
+function claimAuthorizationRows(statement, params = []) {
+  const text = String(statement);
+  if (text.includes('FROM "DomainWorkClaimTopologyState"') && text.includes("FOR SHARE")) {
+    return [{ generation: authority.DOMAIN_WORK_CLAIM_TOPOLOGY_ID, activationState: "ACTIVE" }];
+  }
+  if (text.includes('FROM "Phase2ReleaseCompatibilityAuthority"') && text.includes("FOR SHARE")) {
+    return [{ requiredGeneration: release.DOMAIN_WORK_EXECUTOR_GENERATION, activationState: "ACTIVE" }];
+  }
+  if (text.includes("set_config")) return [{ value: params[1] }];
+  return null;
+}
 
 function productionClaimDb(now) {
   const sql = [];
   let agencySelections = 0;
+  let shardSelections = 0;
   const db = {
     phase2WorkGenerationAuthority: {
       async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; },
@@ -18,13 +32,22 @@ function productionClaimDb(now) {
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
     async $transaction(work) { return work(db); },
-    async $queryRawUnsafe(statement) {
+    async $queryRawUnsafe(statement, ...params) {
       const text = String(statement);
       sql.push(text);
+      const authorization = claimAuthorizationRows(text, params);
+      if (authorization) return authorization;
       if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
-      if (text.includes('SELECT f."agencyId"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) {
+      if (text.includes('UPDATE "DomainWorkClaimAgencyState" a') && text.includes('RETURNING a."agencyId"')) {
         agencySelections += 1;
         return agencySelections === 1 ? [{ agencyId: "agency-1" }] : [];
+      }
+      if (text.includes('UPDATE "DomainWorkClaimShardState" s') && text.includes('RETURNING s."claimShard"')) {
+        shardSelections += 1;
+        return shardSelections === 1 ? [{ claimShard: 7 }] : [];
+      }
+      if (text.includes('SELECT f."partitionKey"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) {
+        return [{ partitionKey: "creator-1" }];
       }
       return [];
     },
@@ -32,7 +55,7 @@ function productionClaimDb(now) {
   return { db, sql };
 }
 
-test("F56 CUT A broad claim uses current partition projection without FamilyState execution authority", async () => {
+test("A36 broad claim reserves bounded Agency/shard locators without FamilyState execution authority", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
   const fx = productionClaimDb(now);
   const result = await authority.claimDomainWorkBatch({
@@ -40,38 +63,94 @@ test("F56 CUT A broad claim uses current partition projection without FamilyStat
     ownerToken: "actual56-worker", limit: 25, perAgencyQuantum: 5, perPartitionQuantum: 2, fallbackNow: now,
   });
   assert.deepEqual(result.items, []);
-  const agencyDiscovery = fx.sql.find((entry) => entry.includes('SELECT f."agencyId"') && entry.includes('FROM "Phase2WorkBroadClaimPartitionState" f'));
-  const claimSql = fx.sql.find((entry) => entry.includes('WITH selected_partitions AS MATERIALIZED'));
-  assert.ok(agencyDiscovery, "production broad claim must choose Agency from current partition projection");
+  const agencyDiscovery = fx.sql.find((entry) => entry.includes('UPDATE "DomainWorkClaimAgencyState" a'));
+  const shardDiscovery = fx.sql.find((entry) => entry.includes('UPDATE "DomainWorkClaimShardState" s'));
+  const claimSql = fx.sql.find((entry) => entry.includes('WITH selected_partitions("partitionKey") AS MATERIALIZED'));
+  assert.ok(agencyDiscovery, "production broad claim must reserve one Agency locator");
+  assert.ok(shardDiscovery, "production broad claim must reserve one fixed shard locator");
   assert.ok(claimSql, "production SQL claim path must execute");
-  assert.match(agencyDiscovery, /AND EXISTS \([\s\S]*FROM "DomainWorkItem" d/);
-  assert.match(agencyDiscovery, /ORDER BY f\."lastClaimedAt" ASC NULLS FIRST/);
-  assert.match(claimSql, /FROM "Phase2WorkBroadClaimPartitionState" f/);
-  assert.match(claimSql, /FOR UPDATE OF d SKIP LOCKED[\s\S]*LIMIT \$6/);
+  assert.match(agencyDiscovery, /ORDER BY a\."nextDispatchAt",a\."revision",a\."agencyId"/);
+  assert.match(shardDiscovery, /ORDER BY s\."nextDispatchAt",s\."revision",s\."claimShard"/);
+  assert.match(claimSql, /VALUES \(\$9\)/);
+  assert.match(claimSql, /FOR UPDATE OF d SKIP LOCKED[\s\S]*LIMIT \$5/);
+  assert.doesNotMatch(agencyDiscovery, /EXISTS \([\s\S]*DomainWorkItem/);
   assert.doesNotMatch(fx.sql.join("\n"), /FROM "Phase2WorkFamilyState" s/);
   assert.doesNotMatch(fx.sql.join("\n"), /DomainWorkReadyAgency|DomainWorkReadyPartition/);
 });
 
-test("F56 CUT A physical fallback repairs only the locked missing current partition projection", async () => {
+test("A36 broad member scope derives the only claim tenant from the fenced membership", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
   const sql = [];
-  const execute = [];
+  let claimedAgency = null;
+  const db = {
+    phase2WorkGenerationAuthority: {
+      async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; },
+    },
+    phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
+    maintenanceLaneState: { async findMany() { return []; } },
+    domainWorkClaimTopologyState: {
+      async findUnique() {
+        return { generation: authority.DOMAIN_WORK_CLAIM_TOPOLOGY_ID, activationState: "ACTIVE", revision: 1n };
+      },
+    },
+    async $transaction(work) { return work(db); },
+    async $queryRawUnsafe(statement, ...params) {
+      const text = String(statement);
+      sql.push(text);
+      const authorization = claimAuthorizationRows(text, params);
+      if (authorization) return authorization;
+      if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
+      if (text.includes('FROM "AgencyMember" m') && text.includes("FOR SHARE OF m")) {
+        assert.deepEqual(params.slice(0, 4), ["member-a", "user-a", "agency-member", 7]);
+        return [{ id: "member-a", broad: true }];
+      }
+      if (text.includes('UPDATE "DomainWorkClaimShardState" s')) return [{ claimShard: 7 }];
+      if (text.includes('SELECT f."partitionKey"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) {
+        assert.equal(params[3], "agency-member");
+        return [{ partitionKey: "creator-1" }];
+      }
+      if (text.includes('WITH selected_partitions("partitionKey") AS MATERIALIZED')) {
+        claimedAgency = params[3];
+        return [{ id: "member-work", agencyId: claimedAgency, partitionKey: "creator-1" }];
+      }
+      return [];
+    },
+  };
+
+  const result = await authority.claimDomainWorkBatch({
+    db,
+    workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
+    memberScope: { memberId: "member-a", userId: "user-a", agencyId: "agency-member", accessEpoch: 7 },
+    ownerToken: "member-worker",
+    limit: 1,
+    perAgencyQuantum: 1,
+    perPartitionQuantum: 1,
+    fallbackNow: now,
+  });
+
+  assert.equal(result.items.length, 1);
+  assert.equal(claimedAgency, "agency-member");
+  assert.equal(sql.some((entry) => entry.includes('UPDATE "DomainWorkClaimAgencyState" a')), false,
+    "member-scoped execution must never enter global Agency dispatch");
+});
+
+test("A36 physical fallback claims one DWI then revision-CAS reconciles its locator chain", async () => {
+  const now = new Date("2026-09-10T18:00:00.000Z");
+  const sql = [];
   const db = {
     phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; } },
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
     async $transaction(work) { return work(db); },
-    async $executeRawUnsafe(statement, ...params) { execute.push({ sql: String(statement), params }); return 1; },
-    async $queryRawUnsafe(statement) {
+    async $queryRawUnsafe(statement, ...params) {
       const text = String(statement); sql.push(text);
+      const authorization = claimAuthorizationRows(text, params);
+      if (authorization) return authorization;
       if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
-      if (text.includes('SELECT f."agencyId"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) return [];
       if (text.includes('SELECT d."agencyId"') && text.includes('FROM "DomainWorkItem" d')) return [{ agencyId: "agency-recovered" }];
-      if (text.includes('WITH selected_partitions AS MATERIALIZED')) return [];
-      if (text.includes('SELECT d."id",d."partitionKey"') && text.includes('FOR UPDATE OF d SKIP LOCKED')) {
-        return [{ id: "repair-work", partitionKey: "creator-recovered" }];
-      }
-      if (text.includes('WITH claimed AS (') && text.includes('partition_repair AS MATERIALIZED')) {
+      if (text.includes('AS "claimShard"') && text.includes('FROM "DomainWorkItem" d')) return [{ claimShard: 11 }];
+      if (text.includes('SELECT f."partitionKey"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) return [];
+      if (text.includes('UPDATE "DomainWorkItem" d SET') && text.includes('LIMIT 1')) {
         return [{ id: "claimed-recovery-row", agencyId: "agency-recovered", partitionKey: "creator-recovered" }];
       }
       return [];
@@ -82,19 +161,17 @@ test("F56 CUT A physical fallback repairs only the locked missing current partit
     limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, fallbackNow: now,
   });
   assert.equal(result.items.length, 1);
-  const rowLock = sql.find((entry) => entry.includes('SELECT d."id",d."partitionKey"') && entry.includes('FOR UPDATE OF d SKIP LOCKED'));
-  const fallback = sql.find((entry) => entry.includes('WITH claimed AS (') && entry.includes('partition_repair AS MATERIALIZED'));
-  assert.ok(rowLock);
+  const fallback = sql.find((entry) => entry.includes('UPDATE "DomainWorkItem" d SET') && entry.includes('LIMIT 1'));
   assert.ok(fallback);
-  assert.equal(execute.length, 1);
-  assert.match(execute[0].sql, /phase2_lock_domain_work_current_partition/);
-  assert.deepEqual(execute[0].params, ["agency-recovered", authority.WORK_CLASS.CUSTOM_COMMUNICATION, "creator-recovered"]);
-  assert.match(fallback, /COUNT\(d\."id"\)::INTEGER AS "outstandingCount"/);
-  assert.match(fallback, /WHERE c\."outstandingCount" > 0/);
+  assert.match(fallback, /FOR UPDATE OF d SKIP LOCKED[\s\S]*LIMIT 1/);
+  assert.ok(sql.some((entry) => entry.includes("phase3_reconcile_domain_work_claim_partition")));
+  assert.ok(sql.some((entry) => entry.includes("phase3_reconcile_domain_work_claim_shard")));
+  assert.ok(sql.some((entry) => entry.includes("phase3_reconcile_domain_work_claim_agency")));
+  assert.doesNotMatch(sql.join("\n"), /phase2_lock_domain_work_current_partition/);
   assert.doesNotMatch(sql.join("\n"), /INSERT INTO "Phase2WorkFamilyState"|UPDATE "Phase2WorkFamilyState"/);
 });
 
-test("F56 CUT A current partition candidate is admitted without FamilyState starvation gate", async () => {
+test("A36 current partition candidate is admitted after separate Agency/shard reservations", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
   const sql = [];
   let claimedAgency = null;
@@ -105,9 +182,13 @@ test("F56 CUT A current partition candidate is admitted without FamilyState star
     async $transaction(work) { return work(db); },
     async $queryRawUnsafe(statement, ...params) {
       const text = String(statement); sql.push(text);
+      const authorization = claimAuthorizationRows(text, params);
+      if (authorization) return authorization;
       if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
-      if (text.includes('SELECT f."agencyId"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) return [{ agencyId: "agency-current" }];
-      if (text.includes('WITH selected_partitions AS MATERIALIZED')) {
+      if (text.includes('UPDATE "DomainWorkClaimAgencyState" a')) return [{ agencyId: "agency-current" }];
+      if (text.includes('UPDATE "DomainWorkClaimShardState" s')) return [{ claimShard: 5 }];
+      if (text.includes('SELECT f."partitionKey"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) return [{ partitionKey: "creator-1" }];
+      if (text.includes('WITH selected_partitions("partitionKey") AS MATERIALIZED')) {
         claimedAgency = params[3];
         return [{ id: "work-1", agencyId: claimedAgency, partitionKey: "creator-1" }];
       }
@@ -143,28 +224,33 @@ test("INT7 Root A partition catalog is populated by a non-authoritative DWI trig
   assert.doesNotMatch(migration, /DomainWorkReadyAgency|DomainWorkReadyPartition/);
 });
 
-test("INT7 Root A catalog miss locks one physical DWI then repairs that partition under the shared fence", async () => {
+test("A36 catalog miss claims one physical DWI and repairs bounded locators with CAS", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
   const sql = [];
-  const execute = [];
   let normalCatalogClaim = 0;
   let physicalFallback = 0;
+  let physicalShard = 0;
   const db = {
     phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; } },
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
     async $transaction(work) { return work(db); },
-    async $executeRawUnsafe(statement, ...params) { execute.push({ sql: String(statement), params }); return 1; },
-    async $queryRawUnsafe(statement) {
+    async $queryRawUnsafe(statement, ...params) {
       const text = String(statement); sql.push(text);
+      const authorization = claimAuthorizationRows(text, params);
+      if (authorization) return authorization;
       if (text.includes("clock_timestamp")) return [{ authorityNow: now }];
-      if (text.includes('WITH selected_partitions AS MATERIALIZED')) { normalCatalogClaim += 1; return []; }
-      if (text.includes('SELECT d."id",d."partitionKey"') && text.includes('FOR UPDATE OF d SKIP LOCKED')) {
-        physicalFallback += 1;
-        return [{ id: "fallback-work", partitionKey: "creator-fallback" }];
+      if (text.includes('AS "claimShard"') && text.includes('FROM "DomainWorkItem" d')) {
+        physicalShard += 1; return physicalShard === 1 ? [{ claimShard: 13 }] : [];
       }
-      if (text.includes('WITH claimed AS (') && text.includes('partition_repair AS MATERIALIZED')) {
-        return [{ id: "fallback-row", agencyId: "agency-1", partitionKey: "creator-fallback" }];
+      if (text.includes('SELECT f."partitionKey"') && text.includes('FROM "Phase2WorkBroadClaimPartitionState" f')) {
+        normalCatalogClaim += 1; return [];
+      }
+      if (text.includes('UPDATE "DomainWorkItem" d SET') && text.includes('LIMIT 1')) {
+        physicalFallback += 1;
+        return physicalFallback === 1
+          ? [{ id: "fallback-row", agencyId: "agency-1", partitionKey: "creator-fallback" }]
+          : [];
       }
       return [];
     },
@@ -176,16 +262,12 @@ test("INT7 Root A catalog miss locks one physical DWI then repairs that partitio
   assert.equal(result.items.length, 1);
   assert.equal(normalCatalogClaim, 1);
   assert.equal(physicalFallback, 1);
-  assert.equal(execute.length, 1);
-  const normal = sql.find((entry) => entry.includes('WITH selected_partitions AS MATERIALIZED'));
-  const rowLock = sql.find((entry) => entry.includes('SELECT d."id",d."partitionKey"') && entry.includes('FOR UPDATE OF d SKIP LOCKED'));
-  const fallback = sql.find((entry) => entry.includes('WITH claimed AS (') && entry.includes('partition_repair AS MATERIALIZED'));
-  assert.ok(normal); assert.ok(rowLock); assert.ok(fallback);
+  const normal = sql.find((entry) => entry.includes('SELECT f."partitionKey"') && entry.includes('FROM "Phase2WorkBroadClaimPartitionState" f'));
+  const fallback = sql.find((entry) => entry.includes('UPDATE "DomainWorkItem" d SET') && entry.includes('LIMIT 1'));
+  assert.ok(normal); assert.ok(fallback);
   assert.doesNotMatch(normal, /partition_heads|DISTINCT ON \(d\."partitionKey"\)/);
-  assert.match(rowLock, /FOR UPDATE OF d SKIP LOCKED[\s\S]*LIMIT 1/);
-  assert.match(execute[0].sql, /phase2_lock_domain_work_current_partition/);
-  assert.match(fallback, /INSERT INTO "Phase2WorkBroadClaimPartitionState"/);
-  assert.match(fallback, /ON CONFLICT \("agencyId","workClass","partitionKey"\) DO UPDATE/);
+  assert.match(fallback, /FOR UPDATE OF d SKIP LOCKED[\s\S]*LIMIT 1/);
+  assert.ok(sql.some((entry) => entry.includes("phase3_reconcile_domain_work_claim_partition")));
 });
 
 test("F53-06 expired legacy owner does not block the new generation", async () => {

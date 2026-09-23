@@ -3,12 +3,21 @@
 const { createHash, randomUUID } = require("node:crypto");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
-const { DOMAIN_WORK_EXECUTOR_GENERATION, authorizeDomainWorkExecutor } = require("./phase2-release-compatibility-authority-service");
+const {
+  DOMAIN_WORK_EXECUTOR_GENERATION,
+  authorizeDomainWorkExecutor,
+  authorizeDomainWorkDependencyWakeBridge,
+} = require("./phase2-release-compatibility-authority-service");
 
 const DOMAIN_WORK_GENERATION = "phase2_domain_work_v3_actual55";
 const DOMAIN_WORK_PROJECTION_VERSION = "phase2_domain_work_v3_actual55";
 const DEFAULT_LEASE_MS = 2 * 60 * 1000;
 const MAX_BATCH = 100;
+const DOMAIN_WORK_CLAIM_SHARD_COUNT = 128;
+const DOMAIN_WORK_CLAIM_TOPOLOGY_ID = "phase3_domain_work_claim_topology_a36_v1";
+const DOMAIN_WORK_MEMBER_SCOPE_SHARD_PROBE = 32;
+const DOMAIN_WORK_MEMBER_SCOPE_CREATOR_PROBE = 16;
+const DOMAIN_DEPENDENCY_WAKE_OBJECT_TYPE = "DomainDependency";
 
 const WORK_CLASS = Object.freeze({
   CUSTOM_COMMUNICATION: "CUSTOM_COMMUNICATION",
@@ -21,6 +30,7 @@ const WORK_CLASS = Object.freeze({
   TEAM_RESPONSE_RANGE_REPAIR: "TEAM_RESPONSE_RANGE_REPAIR",
   TEAM_MONEY_RECONCILIATION: "TEAM_MONEY_RECONCILIATION",
   TEAM_READ_SUMMARY: "TEAM_READ_SUMMARY",
+  DEPENDENCY_WAKE: "DEPENDENCY_WAKE",
   DEPENDENCY_FANOUT: "DEPENDENCY_FANOUT",
   HISTORICAL_ENUMERATION: "HISTORICAL_ENUMERATION",
   RETENTION: "RETENTION",
@@ -371,8 +381,135 @@ async function legacyExecutorDrainStatus({ db, workClass, fallbackNow = new Date
   return { ready: true, lanes: [], skipped: true, reason: "legacy_executor_fence_adapter_unavailable" };
 }
 
-async function claimDomainWorkBatch({
-  db = null, workClass, agencyId = null, objectType = null, objectIds = null, creatorIds = null, ownerToken = randomUUID(), limit = 25,
+function normalizeMemberClaimScope(value, agencyId) {
+  if (!value || typeof value !== "object") return null;
+  const memberId = clean(value.memberId, 180);
+  const userId = clean(value.userId, 180);
+  const scopedAgencyId = clean(value.agencyId || agencyId, 180);
+  const accessEpoch = Number(value.accessEpoch);
+  if (!memberId || !userId || !scopedAgencyId || !Number.isInteger(accessEpoch) || accessEpoch < 1) {
+    throw Object.assign(new Error("member claim scope requires memberId, userId, agencyId and accessEpoch"), {
+      code: "DOMAIN_WORK_MEMBER_SCOPE_REQUIRED",
+    });
+  }
+  if (agencyId && String(agencyId) !== scopedAgencyId) {
+    throw Object.assign(new Error("member claim scope agency does not match claim agency"), {
+      code: "DOMAIN_WORK_MEMBER_SCOPE_AGENCY_MISMATCH",
+    });
+  }
+  return { memberId, userId, agencyId: scopedAgencyId, accessEpoch };
+}
+
+async function lockMemberClaimAuthority(tx, authority, mode) {
+  if (!authority) return { authorized: true, broad: null };
+  const rows = await tx.$queryRawUnsafe(
+    `SELECT m."id",
+            "phase3_member_has_broad_creator_access"(
+              m."role"::text,m."roleKey",m."assignedCreators"
+            ) AS broad
+       FROM "AgencyMember" m
+       JOIN "Agency" a ON a."id"=m."agencyId" AND a."deletedAt" IS NULL
+      WHERE m."id"=$1 AND m."userId"=$2 AND m."agencyId"=$3
+        AND m."accessEpoch"=$4 AND m."deletedAt" IS NULL AND m."deactivatedAt" IS NULL
+      FOR SHARE OF m`,
+    authority.memberId, authority.userId, authority.agencyId, authority.accessEpoch,
+  );
+  const row = rows?.[0] || null;
+  const broad = row?.broad === true;
+  return { authorized: Boolean(row) && (mode === "broad" ? broad : !broad), broad };
+}
+
+async function reserveMemberScopeCreatorProbe({
+  db, authority, workClass, generation, fallbackNow,
+  shardLimit = DOMAIN_WORK_MEMBER_SCOPE_SHARD_PROBE,
+  creatorsPerShard = DOMAIN_WORK_MEMBER_SCOPE_CREATOR_PROBE,
+} = {}) {
+  return runDbTransaction(db, async (tx) => {
+    const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+    if (typeof tx?.$queryRawUnsafe !== "function") {
+      return { mode: "unavailable", authorityNow, creatorIds: [] };
+    }
+    const current = await lockMemberClaimAuthority(tx, authority, "scoped");
+    if (!current.authorized) {
+      if (current.broad === true) return { mode: "broad", authorityNow, creatorIds: [] };
+      return { mode: "denied", authorityNow, creatorIds: [] };
+    }
+
+    const rows = await tx.$queryRawUnsafe(
+      `WITH selected_shards AS MATERIALIZED (
+         SELECT s."id",s."claimShard",s."cursorCreatorId"
+           FROM "DomainWorkMemberScopeShardState" s
+           LEFT JOIN "DomainWorkClaimShardState" w
+             ON w."agencyId"=s."agencyId" AND w."workClass"=$6
+            AND w."activeGeneration"=$5 AND w."claimShard"=s."claimShard"
+          WHERE s."memberId"=$1 AND s."agencyId"=$2 AND s."accessEpoch"=$3
+          ORDER BY CASE WHEN w."nextDispatchAt" IS NOT NULL AND w."nextDispatchAt" <= $4 THEN 0 ELSE 1 END,
+                   s."lastSelectedAt" NULLS FIRST,s."revision",s."claimShard"
+          FOR UPDATE OF s SKIP LOCKED
+          LIMIT $7
+       ), ring AS MATERIALIZED (
+         SELECT s."id",s."claimShard",picked."creatorId",picked.phase
+           FROM selected_shards s
+           CROSS JOIN LATERAL (
+             (SELECT x."creatorId",0::int AS phase
+                FROM "AgencyMemberCreatorAccessCurrent" x
+                JOIN "CreatorAccount" live_creator
+                  ON live_creator."id"=x."creatorId" AND live_creator."agencyId"=x."agencyId"
+                 AND live_creator."deletedAt" IS NULL
+               WHERE x."memberId"=$1 AND x."agencyId"=$2 AND x."accessEpoch"=$3
+                 AND x."claimShard"=s."claimShard"
+                 AND x."creatorId">COALESCE(s."cursorCreatorId",'')
+               ORDER BY x."creatorId"
+               LIMIT $8)
+             UNION ALL
+             (SELECT x."creatorId",1::int AS phase
+                FROM "AgencyMemberCreatorAccessCurrent" x
+                JOIN "CreatorAccount" live_creator
+                  ON live_creator."id"=x."creatorId" AND live_creator."agencyId"=x."agencyId"
+                 AND live_creator."deletedAt" IS NULL
+               WHERE x."memberId"=$1 AND x."agencyId"=$2 AND x."accessEpoch"=$3
+                 AND x."claimShard"=s."claimShard"
+                 AND x."creatorId"<=COALESCE(s."cursorCreatorId",'')
+               ORDER BY x."creatorId"
+               LIMIT $8)
+           ) picked
+       ), ranked AS MATERIALIZED (
+         SELECT r.*,row_number() OVER (PARTITION BY r."id" ORDER BY r.phase,r."creatorId") AS position
+           FROM ring r
+       ), bounded_probe AS MATERIALIZED (
+         SELECT * FROM ranked WHERE position <= $8
+       ), last_probe AS MATERIALIZED (
+         SELECT DISTINCT ON (b."id") b."id",b."creatorId"
+           FROM bounded_probe b
+          ORDER BY b."id",b.position DESC
+       ), advanced AS (
+         UPDATE "DomainWorkMemberScopeShardState" s
+            SET "cursorCreatorId"=COALESCE(last_probe."creatorId",s."cursorCreatorId"),
+                "lastSelectedAt"=$4,"revision"=s."revision"+1,"updatedAt"=CURRENT_TIMESTAMP
+           FROM selected_shards selected
+           LEFT JOIN last_probe ON last_probe."id"=selected."id"
+          WHERE s."id"=selected."id"
+         RETURNING s."id"
+       )
+       SELECT b."creatorId"
+         FROM bounded_probe b
+         JOIN advanced a ON a."id"=b."id"
+        ORDER BY b."claimShard",b.position`,
+      authority.memberId,authority.agencyId,authority.accessEpoch,authorityNow,
+      String(generation),String(workClass),
+      bounded(shardLimit, DOMAIN_WORK_MEMBER_SCOPE_SHARD_PROBE, DOMAIN_WORK_CLAIM_SHARD_COUNT),
+      bounded(creatorsPerShard, DOMAIN_WORK_MEMBER_SCOPE_CREATOR_PROBE, 64),
+    );
+    return {
+      mode: "scoped",
+      authorityNow,
+      creatorIds: Array.from(new Set((rows || []).map((row) => clean(row?.creatorId, 180)).filter(Boolean))),
+    };
+  });
+}
+
+async function claimDomainWorkBatchInternal({
+  db = null, workClass, agencyId = null, objectType = null, objectIds = null, creatorIds = null, memberScope = null, ownerToken = randomUUID(), limit = 25,
   perAgencyQuantum = 10, perPartitionQuantum = 2, leaseMs = DEFAULT_LEASE_MS, generation = DOMAIN_WORK_GENERATION, fallbackNow = new Date(),
 } = {}) {
   if (!db) db = require("../prisma");
@@ -382,8 +519,18 @@ async function claimDomainWorkBatch({
   const quantum = bounded(perAgencyQuantum, 10, take);
   const partitionQuantum = bounded(perPartitionQuantum, 2, quantum);
   const normalizedObjectIds = Array.from(new Set((Array.isArray(objectIds) ? objectIds : []).map((value) => clean(value, 240)).filter(Boolean)));
-  const normalizedCreatorIds = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map((value) => clean(value, 180)).filter(Boolean)));
-  if (Array.isArray(creatorIds) && !normalizedCreatorIds.length) {
+  let normalizedCreatorIds = Array.from(new Set((Array.isArray(creatorIds) ? creatorIds : []).map((value) => clean(value, 180)).filter(Boolean)));
+  const memberAuthority = normalizeMemberClaimScope(memberScope, agencyId);
+  // A member-scoped claim has exactly one tenant authority.  Do not keep the
+  // caller's optional outer agencyId as a second, weaker source: a broad member
+  // with no outer agencyId would otherwise fall into global Agency dispatch and
+  // could claim another tenant after only proving membership in its own Agency.
+  const effectiveAgencyId = memberAuthority?.agencyId || clean(agencyId, 180);
+  let memberAuthorityMode = null;
+  if (memberAuthority && Array.isArray(creatorIds)) {
+    throw Object.assign(new Error("memberScope and creatorIds are mutually exclusive"), { code: "DOMAIN_WORK_SCOPE_AMBIGUOUS" });
+  }
+  if (!memberAuthority && Array.isArray(creatorIds) && !normalizedCreatorIds.length) {
     return { ownerToken, authorityNow: null, leaseUntil: null, items: [] };
   }
 
@@ -398,16 +545,80 @@ async function claimDomainWorkBatch({
 
   const rawCapable = typeof db?.$queryRawUnsafe === "function";
 
+  // Both broad and member-scoped production claims depend on the same online
+  // current-only topology. During BUILDING old rolling replicas may continue,
+  // while the new binary fails closed instead of observing a partial backfill.
+  let dependencyWakeBridge = false;
+  if (rawCapable && typeof db?.domainWorkClaimTopologyState?.findUnique === "function") {
+    const topology = await db.domainWorkClaimTopologyState.findUnique({
+      where: { id: DOMAIN_WORK_CLAIM_TOPOLOGY_ID },
+      select: { generation: true, activationState: true, revision: true },
+    });
+    dependencyWakeBridge = Boolean(
+      topology?.generation === DOMAIN_WORK_CLAIM_TOPOLOGY_ID
+      && topology?.activationState === "BUILDING"
+      && klass === WORK_CLASS.DEPENDENCY_WAKE,
+    );
+    if ((!topology || topology.generation !== DOMAIN_WORK_CLAIM_TOPOLOGY_ID || topology.activationState !== "ACTIVE")
+        && !dependencyWakeBridge) {
+      return {
+        ownerToken,
+        authorityNow: null,
+        leaseUntil: null,
+        items: [],
+        skipped: true,
+        reason: "domain_work_claim_topology_building",
+        topologyState: topology?.activationState || "MISSING",
+      };
+    }
+  }
+  const authorizeClaimExecutor = async (tx) => {
+    try {
+      await (dependencyWakeBridge
+        ? authorizeDomainWorkDependencyWakeBridge(tx)
+        : authorizeDomainWorkExecutor(tx));
+      return true;
+    } catch (error) {
+      if (error?.code === "DOMAIN_WORK_DEPENDENCY_WAKE_BRIDGE_TRANSITION") return false;
+      throw error;
+    }
+  };
+
+  if (memberAuthority) {
+    if (!rawCapable) {
+      return { ownerToken, authorityNow: null, leaseUntil: null, items: [], skipped: true, reason: "domain_work_member_scope_storage_unavailable" };
+    }
+    const probe = await reserveMemberScopeCreatorProbe({
+      db, authority: memberAuthority, workClass: klass, generation: String(generation), fallbackNow,
+    });
+    if (probe.mode === "denied") {
+      return { ownerToken, authorityNow: probe.authorityNow, leaseUntil: null, items: [], skipped: true, reason: "domain_work_member_scope_stale" };
+    }
+    if (probe.mode === "broad") {
+      memberAuthorityMode = "broad";
+    } else if (probe.mode === "scoped") {
+      memberAuthorityMode = "scoped";
+      normalizedCreatorIds = probe.creatorIds;
+      if (!normalizedCreatorIds.length) {
+        return { ownerToken, authorityNow: probe.authorityNow, leaseUntil: null, items: [] };
+      }
+    } else {
+      return { ownerToken, authorityNow: probe.authorityNow, leaseUntil: null, items: [], skipped: true, reason: "domain_work_member_scope_storage_unavailable" };
+    }
+  }
+
   // Actual55 Root A: ready-head rows are no longer execution authority.  They were
   // introduced as a physical admission optimization, but making correctness depend
   // on their mutable MIN created the F55-01/F55-02/F55-05 failure cluster (Prisma
   // VOID decoding, Agency-wide serialization and row/advisory lock inversion).
-  // Production admission now starts from physically-current isOutstanding DWI rows.
-  // Creator-scoped workers seek their exact creator identities; broad workers first
-  // choose a due Agency from the small per-family convergence set, then rank only a
-  // bounded current-DWI window for partition fairness.
+  // Production admission still ends at physically-current isOutstanding DWI rows.
+  // Creator-scoped workers seek exact creator identities. Broad workers reserve a
+  // rebuildable Agency dispatch row and a fixed per-Agency shard dispatch row in
+  // separate short transactions, then claim physical DWI without holding either
+  // locator lock. This preserves global Agency fairness, parallelism inside a huge
+  // Agency and the canonical DWI -> partition -> shard -> Agency lock order.
   if (rawCapable && normalizedCreatorIds.length) {
-    const scopedAgencyId = clean(agencyId, 180);
+    const scopedAgencyId = effectiveAgencyId;
     if (!scopedAgencyId) {
       throw Object.assign(new Error("creator-scoped DomainWork claim requires agencyId"), { code: "DOMAIN_WORK_SCOPED_AGENCY_REQUIRED" });
     }
@@ -417,14 +628,45 @@ async function claimDomainWorkBatch({
       if (typeof tx?.$queryRawUnsafe !== "function") {
         return { ownerToken, authorityNow, leaseUntil, items: [], skipped: true, reason: "domain_work_raw_storage_unavailable" };
       }
-      await authorizeDomainWorkExecutor(tx);
+      if (!await authorizeClaimExecutor(tx)) {
+        return {
+          ownerToken, authorityNow, leaseUntil: null, items: [], skipped: true,
+          reason: "domain_work_dependency_wake_bridge_transition",
+        };
+      }
+      if (memberAuthority) {
+        const access = await lockMemberClaimAuthority(tx, memberAuthority, "scoped");
+        if (!access.authorized) {
+          return { ownerToken, authorityNow, leaseUntil: null, items: [], skipped: true, reason: "domain_work_member_scope_stale" };
+        }
+      }
       const params = [klass, authorityNow, String(generation), ownerToken, leaseUntil, partitionQuantum, take];
       const creatorValues = normalizedCreatorIds.map((value) => {
         params.push(value);
         return `($${params.length})`;
       }).join(",");
       params.push(scopedAgencyId);
-      let scopedWorkFilter = ` AND d."agencyId"=$${params.length}`;
+      const scopedAgencyParam = params.length;
+      let scopedWorkFilter = ` AND d."agencyId"=$${scopedAgencyParam}`;
+      let creatorAuthorityCte = "";
+      let creatorAuthorityRelation = "scoped_creators";
+      if (memberAuthorityMode === "scoped") {
+        params.push(memberAuthority.memberId);
+        const memberParam = params.length;
+        params.push(memberAuthority.accessEpoch);
+        const epochParam = params.length;
+        creatorAuthorityCte = `, authorized_creators AS MATERIALIZED (
+           SELECT c."creatorId"
+             FROM scoped_creators c
+             JOIN "AgencyMemberCreatorAccessCurrent" x
+               ON x."memberId"=$${memberParam} AND x."agencyId"=$${scopedAgencyParam}
+              AND x."accessEpoch"=$${epochParam} AND x."creatorId"=c."creatorId"
+             JOIN "CreatorAccount" live_creator
+               ON live_creator."id"=x."creatorId" AND live_creator."agencyId"=x."agencyId"
+              AND live_creator."deletedAt" IS NULL
+         )`;
+        creatorAuthorityRelation = "authorized_creators";
+      }
       if (objectType) {
         params.push(String(objectType));
         scopedWorkFilter += ` AND d."objectType"=$${params.length}`;
@@ -437,24 +679,30 @@ async function claimDomainWorkBatch({
       const rows = await tx.$queryRawUnsafe(
         `WITH scoped_creators("creatorId") AS (
            VALUES ${creatorValues}
-         ), candidates AS (
-           SELECT d."id",d."availableAt"
-             FROM scoped_creators c
+         )${creatorAuthorityCte}, candidates AS (
+           SELECT d."id",d."claimableAt"
+             FROM ${creatorAuthorityRelation} c
              CROSS JOIN LATERAL (
-               SELECT d."id",d."availableAt"
+               SELECT d."id",
+                      "phase3_domain_work_claimable_at"(
+                        d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil"
+                      ) AS "claimableAt"
                  FROM "DomainWorkItem" d
                 WHERE d."workClass"=$1
                   AND d."activeGeneration"=$3
                   AND d."creatorId"=c."creatorId"
                   AND d."isOutstanding"=TRUE
-                  AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-                  AND d."availableAt" <= $2
-                  AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${scopedWorkFilter}
-                ORDER BY d."availableAt",d."id"
+                  AND d."state" IN ('READY','CLAIMED')
+                  AND "phase3_domain_work_claimable_at"(
+                        d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil"
+                      ) <= $2${scopedWorkFilter}
+                ORDER BY "phase3_domain_work_claimable_at"(
+                           d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil"
+                         ),d."id"
                 FOR UPDATE OF d SKIP LOCKED
                 LIMIT $6
              ) d
-            ORDER BY d."availableAt",d."id"
+            ORDER BY d."claimableAt",d."id"
             LIMIT $7
          )
          UPDATE "DomainWorkItem" d SET
@@ -469,73 +717,235 @@ async function claimDomainWorkBatch({
   }
 
   if (rawCapable && typeof db?.$transaction === "function") {
+    // The shared ACTIVE gate above covers both broad hierarchy and member-scope
+    // projections before any locator can influence execution admission.
     const claimed = [];
-    const seenAgencies = [];
-    const maxAgencies = agencyId ? 1 : Math.max(1, Math.min(take, 100));
+    const claimedByAgency = new Map();
+    const suppressedAgencies = [];
+    const suppressedShards = [];
+    let bridgeTransitioned = false;
+    // Normal cost is three short bounded transactions per tranche: Agency
+    // reservation, shard reservation, and physical claim. The fixed repair
+    // margin can rotate every shard of one corrupt Agency without depending on
+    // total Agencies, creator partitions, or lifetime history.
+    const maxTranches = Math.max(1, Math.min(384, take + DOMAIN_WORK_CLAIM_SHARD_COUNT));
     let firstAuthorityNow = null;
     let lastLeaseUntil = null;
 
-    for (let attempt = 0; attempt < maxAgencies && claimed.length < take; attempt += 1) {
+    for (let attempt = 0; attempt < maxTranches && claimed.length < take; attempt += 1) {
       const remaining = take - claimed.length;
+      const exhaustedAgencies = effectiveAgencyId
+        ? (Number(claimedByAgency.get(effectiveAgencyId) || 0) >= quantum ? [effectiveAgencyId] : [])
+        : Array.from(claimedByAgency.entries()).filter(([, count]) => count >= quantum).map(([id]) => id);
+      if (effectiveAgencyId && exhaustedAgencies.length) break;
+
+      let selectedAgency = effectiveAgencyId;
+      if (!selectedAgency) {
+        const agencyReservation = await runDbTransaction(db, async (tx) => {
+          const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+          if (typeof tx?.$queryRawUnsafe !== "function") return { agencyId: null, authorityNow };
+          if (!await authorizeClaimExecutor(tx)) {
+            return { agencyId: null, authorityNow, bridgeTransitioned: true };
+          }
+
+          const excluded = Array.from(new Set([...exhaustedAgencies, ...suppressedAgencies]));
+          const params = [klass, authorityNow, String(generation)];
+          let locatorFilter = "";
+          if (excluded.length) {
+            const placeholders = excluded.map((value) => { params.push(value); return `$${params.length}`; }).join(",");
+            locatorFilter += ` AND a."agencyId" NOT IN (${placeholders})`;
+          }
+          const reservationSql = (skipLocked) =>
+            `WITH candidate AS MATERIALIZED (
+               SELECT a."id"
+                 FROM "DomainWorkClaimAgencyState" a
+                WHERE a."workClass"=$1 AND a."activeGeneration"=$3
+                  AND a."nextDispatchAt" <= $2${locatorFilter}
+                ORDER BY a."nextDispatchAt",a."revision",a."agencyId"
+                FOR UPDATE OF a${skipLocked ? " SKIP LOCKED" : ""}
+                LIMIT 1
+             )
+             UPDATE "DomainWorkClaimAgencyState" a
+                SET "nextDispatchAt"=$2,"lastSelectedAt"=$2,
+                    "revision"=a."revision"+1,"updatedAt"=CURRENT_TIMESTAMP
+               FROM candidate c WHERE a."id"=c."id"
+             RETURNING a."agencyId"`;
+
+          let rows = await tx.$queryRawUnsafe(reservationSql(true), ...params);
+          // If the only due Agency is being reserved by another replica, wait
+          // only for that tiny locator transaction; never fall through into a
+          // competing physical scan while a valid locator is merely locked.
+          if (!rows?.length) rows = await tx.$queryRawUnsafe(reservationSql(false), ...params);
+          let reservedAgency = clean(rows?.[0]?.agencyId, 180);
+
+          if (!reservedAgency) {
+            const physicalParams = [klass, authorityNow, String(generation)];
+            let physicalFilter = "";
+            if (excluded.length) {
+              const placeholders = excluded.map((value) => { physicalParams.push(value); return `$${physicalParams.length}`; }).join(",");
+              physicalFilter += ` AND d."agencyId" NOT IN (${placeholders})`;
+            }
+            if (objectType) {
+              physicalParams.push(String(objectType));
+              physicalFilter += ` AND d."objectType"=$${physicalParams.length}`;
+            }
+            if (normalizedObjectIds.length) {
+              const placeholders = normalizedObjectIds.map((value) => { physicalParams.push(value); return `$${physicalParams.length}`; }).join(",");
+              physicalFilter += ` AND d."objectId" IN (${placeholders})`;
+            }
+            rows = await tx.$queryRawUnsafe(
+              `SELECT d."agencyId"
+                 FROM "DomainWorkItem" d
+                WHERE d."workClass"=$1 AND d."activeGeneration"=$3 AND d."isOutstanding"=TRUE
+                  AND d."state" IN ('READY','CLAIMED')
+                  AND "phase3_domain_work_claimable_at"(d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil") <= $2${physicalFilter}
+                ORDER BY "phase3_domain_work_claimable_at"(d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil"),
+                         d."agencyId",d."partitionKey",d."id"
+                LIMIT 1`,
+              ...physicalParams,
+            );
+            reservedAgency = clean(rows?.[0]?.agencyId, 180);
+          }
+          return { agencyId: reservedAgency, authorityNow };
+        });
+        if (agencyReservation.bridgeTransitioned) {
+          bridgeTransitioned = true;
+          break;
+        }
+        selectedAgency = clean(agencyReservation.agencyId, 180);
+        if (!firstAuthorityNow) firstAuthorityNow = agencyReservation.authorityNow || null;
+      }
+      if (!selectedAgency) break;
+
+      const shardReservation = await runDbTransaction(db, async (tx) => {
+        const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
+        if (typeof tx?.$queryRawUnsafe !== "function") return { claimShard: null, authorityNow };
+        if (!await authorizeClaimExecutor(tx)) {
+          return { claimShard: null, authorityNow, bridgeTransitioned: true };
+        }
+
+        const shardParams = [klass, authorityNow, String(generation), selectedAgency];
+        let shardFilter = "";
+        const skippedForAgency = suppressedShards
+          .filter((entry) => entry.agencyId === selectedAgency)
+          .map((entry) => entry.claimShard);
+        if (skippedForAgency.length) {
+          const placeholders = skippedForAgency.map((value) => { shardParams.push(value); return `$${shardParams.length}`; }).join(",");
+          shardFilter += ` AND s."claimShard" NOT IN (${placeholders})`;
+        }
+        const reservationSql = (skipLocked) =>
+          `WITH candidate AS MATERIALIZED (
+             SELECT s."id"
+               FROM "DomainWorkClaimShardState" s
+              WHERE s."agencyId"=$4 AND s."workClass"=$1 AND s."activeGeneration"=$3
+                AND s."nextDispatchAt" <= $2${shardFilter}
+              ORDER BY s."nextDispatchAt",s."revision",s."claimShard"
+              FOR UPDATE OF s${skipLocked ? " SKIP LOCKED" : ""}
+              LIMIT 1
+           )
+           UPDATE "DomainWorkClaimShardState" s
+              SET "nextDispatchAt"=$2,"lastSelectedAt"=$2,
+                  "revision"=s."revision"+1,"updatedAt"=CURRENT_TIMESTAMP
+             FROM candidate c WHERE s."id"=c."id"
+           RETURNING s."claimShard"`;
+
+        let shardRows = await tx.$queryRawUnsafe(reservationSql(true), ...shardParams);
+        if (!shardRows?.length) shardRows = await tx.$queryRawUnsafe(reservationSql(false), ...shardParams);
+        let selectedShard = Number(shardRows?.[0]?.claimShard);
+
+        if (!Number.isInteger(selectedShard) || selectedShard < 0 || selectedShard >= DOMAIN_WORK_CLAIM_SHARD_COUNT) {
+          // Locator loss cannot lose work. This physical probe is constrained to
+          // one Agency and an indexed current-DWI expression, never DONE history.
+          const physicalParams = [klass, authorityNow, String(generation), selectedAgency];
+          let physicalFilter = "";
+          if (objectType) {
+            physicalParams.push(String(objectType));
+            physicalFilter += ` AND d."objectType"=$${physicalParams.length}`;
+          }
+          if (normalizedObjectIds.length) {
+            const placeholders = normalizedObjectIds.map((value) => { physicalParams.push(value); return `$${physicalParams.length}`; }).join(",");
+            physicalFilter += ` AND d."objectId" IN (${placeholders})`;
+          }
+          if (skippedForAgency.length) {
+            const placeholders = skippedForAgency.map((value) => { physicalParams.push(value); return `$${physicalParams.length}`; }).join(",");
+            physicalFilter += ` AND "phase3_domain_work_claim_shard"(d."partitionKey") NOT IN (${placeholders})`;
+          }
+          shardRows = await tx.$queryRawUnsafe(
+            `SELECT "phase3_domain_work_claim_shard"(d."partitionKey") AS "claimShard"
+               FROM "DomainWorkItem" d
+              WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3 AND d."isOutstanding"=TRUE
+                AND d."state" IN ('READY','CLAIMED')
+                AND "phase3_domain_work_claimable_at"(d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil") <= $2${physicalFilter}
+              ORDER BY "phase3_domain_work_claimable_at"(d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil"),
+                       d."partitionKey",d."id"
+              LIMIT 1`,
+            ...physicalParams,
+          );
+          selectedShard = Number(shardRows?.[0]?.claimShard);
+        }
+        if (!Number.isInteger(selectedShard) || selectedShard < 0 || selectedShard >= DOMAIN_WORK_CLAIM_SHARD_COUNT) {
+          await tx.$queryRawUnsafe(
+            `SELECT "phase3_reconcile_domain_work_claim_agency"($1,$2,$3,$4) AS "reconciled"`,
+            selectedAgency,klass,String(generation),authorityNow,
+          );
+          return { claimShard: null, authorityNow };
+        }
+        return { claimShard: selectedShard, authorityNow };
+      });
+
+      if (shardReservation.bridgeTransitioned) {
+        bridgeTransitioned = true;
+        break;
+      }
+
+      const selectedShard = shardReservation.claimShard == null ? Number.NaN : Number(shardReservation.claimShard);
+      if (!firstAuthorityNow) firstAuthorityNow = shardReservation.authorityNow || null;
+      if (!Number.isInteger(selectedShard) || selectedShard < 0 || selectedShard >= DOMAIN_WORK_CLAIM_SHARD_COUNT) {
+        if (effectiveAgencyId) break;
+        suppressedAgencies.push(selectedAgency);
+        continue;
+      }
+
       const tranche = await runDbTransaction(db, async (tx) => {
         const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
         const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
-        if (typeof tx?.$queryRawUnsafe !== "function") return { agencyId: null, authorityNow, leaseUntil, items: [] };
-        await authorizeDomainWorkExecutor(tx);
-
-        let selectedAgency = clean(agencyId, 180);
-        if (!selectedAgency) {
-          const params = [klass, authorityNow, String(generation)];
-          let excluded = "";
-          if (seenAgencies.length) {
-            const placeholders = seenAgencies.map((value) => { params.push(value); return `$${params.length}`; }).join(",");
-            excluded = ` AND f."agencyId" NOT IN (${placeholders})`;
-          }
-          const rows = await tx.$queryRawUnsafe(
-            `SELECT f."agencyId"
-               FROM "Phase2WorkBroadClaimPartitionState" f
-              WHERE f."workClass"=$1 AND f."activeGeneration"=$3${excluded}
-                AND EXISTS (
-                  SELECT 1 FROM "DomainWorkItem" d
-                   WHERE d."agencyId"=f."agencyId" AND d."workClass"=$1 AND d."activeGeneration"=$3
-                     AND d."partitionKey"=f."partitionKey" AND d."isOutstanding"=TRUE
-                     AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-                     AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)
-                   LIMIT 1
-                )
-              ORDER BY f."lastClaimedAt" ASC NULLS FIRST,f."agencyId" ASC,f."partitionKey" ASC
-              LIMIT 1`, ...params,
-          );
-          selectedAgency = clean(rows?.[0]?.agencyId, 180);
-
-          // Current partition projection is derived metadata, never work truth. If it
-          // is missing/corrupt, admit one physical due Agency and repair only the
-          // claimed partition in the same transaction.
-          if (!selectedAgency) {
-            const physicalParams = [klass, authorityNow, String(generation)];
-            let physicalExcluded = "";
-            if (seenAgencies.length) {
-              const placeholders = seenAgencies.map((value) => { physicalParams.push(value); return `$${physicalParams.length}`; }).join(",");
-              physicalExcluded = ` AND d."agencyId" NOT IN (${placeholders})`;
-            }
-            const rows = await tx.$queryRawUnsafe(
-              `SELECT d."agencyId"
-                 FROM "DomainWorkItem" d
-                WHERE d."workClass"=$1 AND d."activeGeneration"=$3 AND d."isOutstanding"=TRUE${physicalExcluded}
-                  AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-                  AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)
-                ORDER BY d."availableAt",d."agencyId",d."partitionKey",d."id"
-                LIMIT 1`, ...physicalParams,
-            );
-            selectedAgency = clean(rows?.[0]?.agencyId, 180);
+        if (typeof tx?.$queryRawUnsafe !== "function") return { agencyId: selectedAgency, claimShard: selectedShard, authorityNow, leaseUntil, items: [] };
+        if (!await authorizeClaimExecutor(tx)) {
+          return {
+            agencyId: selectedAgency, claimShard: selectedShard, authorityNow,
+            leaseUntil: null, items: [], bridgeTransitioned: true,
+          };
+        }
+        if (memberAuthorityMode === "broad") {
+          const access = await lockMemberClaimAuthority(tx, memberAuthority, "broad");
+          if (!access.authorized) {
+            return {
+              agencyId: selectedAgency, claimShard: selectedShard, authorityNow,
+              leaseUntil: null, items: [], accessDenied: true,
+            };
           }
         }
-        if (!selectedAgency) return { agencyId: null, authorityNow, leaseUntil, items: [] };
 
-        const agencyTake = Math.max(1, Math.min(remaining, quantum));
+        const alreadyClaimed = Number(claimedByAgency.get(selectedAgency) || 0);
+        const agencyTake = Math.max(1, Math.min(remaining, quantum - alreadyClaimed));
         const partitionsNeeded = Math.max(1, Math.ceil(agencyTake / partitionQuantum));
         const partitionSelectionCap = Math.min(256, Math.max(partitionsNeeded, partitionsNeeded * 2));
-        const params = [klass, authorityNow, String(generation), selectedAgency, partitionSelectionCap, partitionQuantum, agencyTake, ownerToken, leaseUntil];
+
+        const partitionRows = await tx.$queryRawUnsafe(
+          `SELECT f."partitionKey"
+             FROM "Phase2WorkBroadClaimPartitionState" f
+            WHERE f."agencyId"=$4 AND f."workClass"=$1 AND f."activeGeneration"=$3
+              AND f."claimShard"=$5 AND f."nextClaimableAt" <= $2
+            ORDER BY f."nextClaimableAt",f."revision",f."partitionKey"
+            LIMIT $6`,
+          klass,authorityNow,String(generation),selectedAgency,selectedShard,partitionSelectionCap,
+        );
+        const selectedPartitions = Array.from(new Set(
+          (partitionRows || []).map((row) => clean(row?.partitionKey, 500)).filter(Boolean),
+        )).sort();
+
+        const params = [klass,authorityNow,String(generation),selectedAgency,partitionQuantum,agencyTake,ownerToken,leaseUntil];
+        const partitionValues = selectedPartitions.map((value) => { params.push(value); return `($${params.length})`; }).join(",");
         let workFilter = "";
         if (objectType) {
           params.push(String(objectType));
@@ -546,158 +956,140 @@ async function claimDomainWorkBatch({
           workFilter += ` AND d."objectId" IN (${placeholders})`;
         }
 
-        let rows = await tx.$queryRawUnsafe(
-          `WITH selected_partitions AS MATERIALIZED (
-             SELECT f."partitionKey"
-               FROM "Phase2WorkBroadClaimPartitionState" f
-              WHERE f."agencyId"=$4 AND f."workClass"=$1 AND f."activeGeneration"=$3
-                AND EXISTS (
-                  SELECT 1 FROM "DomainWorkItem" d
-                   WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
-                     AND d."partitionKey"=f."partitionKey" AND d."isOutstanding"=TRUE
-                     AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-                     AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${workFilter}
-                   LIMIT 1
-                )
-              ORDER BY f."lastClaimedAt" ASC NULLS FIRST,f."partitionKey" ASC
-              LIMIT $5
-           ), candidates AS MATERIALIZED (
-             SELECT picked."id",picked."availableAt",p."partitionKey"
+        let rows = [];
+        if (selectedPartitions.length) {
+          rows = await tx.$queryRawUnsafe(
+            `WITH selected_partitions("partitionKey") AS MATERIALIZED (
+               VALUES ${partitionValues}
+             ), candidates AS MATERIALIZED (
+             SELECT picked."id",picked."claimableAt",p."partitionKey"
                FROM selected_partitions p
                CROSS JOIN LATERAL (
-                 SELECT d."id",d."availableAt"
+                 SELECT d."id",
+                        "phase3_domain_work_claimable_at"(d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil") AS "claimableAt"
                    FROM "DomainWorkItem" d
                   WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
                     AND d."partitionKey"=p."partitionKey" AND d."isOutstanding"=TRUE
-                    AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-                    AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${workFilter}
-                  ORDER BY d."availableAt",d."id"
+                    AND d."state" IN ('READY','CLAIMED')
+                    AND "phase3_domain_work_claimable_at"(d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil") <= $2${workFilter}
+                  ORDER BY "phase3_domain_work_claimable_at"(d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil"),d."id"
                   FOR UPDATE OF d SKIP LOCKED
-                  LIMIT $6
+                  LIMIT $5
                ) picked
-              ORDER BY picked."availableAt",picked."id"
-              LIMIT $7
+              ORDER BY picked."claimableAt",picked."id"
+              LIMIT $6
            ), claimed AS (
              UPDATE "DomainWorkItem" d SET
-               "state"='CLAIMED',"ownerToken"=$8,"claimFence"=d."claimFence"+1,
-               "claimedRevision"=d."requestedRevision","leaseUntil"=$9,"attempts"=d."attempts"+1,
+               "state"='CLAIMED',"ownerToken"=$7,"claimFence"=d."claimFence"+1,
+               "claimedRevision"=d."requestedRevision","leaseUntil"=$8,"attempts"=d."attempts"+1,
                "updatedAt"=CURRENT_TIMESTAMP
               FROM candidates c WHERE d."id"=c."id"
              RETURNING d.*
-           ), partition_touch AS (
-             UPDATE "Phase2WorkBroadClaimPartitionState" f
-                SET "lastClaimedAt"=$2,"updatedAt"=CURRENT_TIMESTAMP
-               FROM (SELECT DISTINCT "partitionKey" FROM claimed) c
-              WHERE f."agencyId"=$4 AND f."workClass"=$1 AND f."activeGeneration"=$3
-                AND f."partitionKey"=c."partitionKey"
-             RETURNING 1
            )
-           SELECT c.* FROM claimed c`, ...params,
-        );
+           SELECT c.* FROM claimed c`,
+            ...params,
+          );
+        }
 
         if (Number(rows?.length || 0) === 0) {
-          // Exceptional repair must participate in the same partition transition
-          // fence as the DWI trigger. First lock one due physical DWI row; normal
-          // DWI mutations also own their row before the AFTER trigger takes the
-          // partition advisory lock, so this preserves one DWI-row -> partition
-          // lock order and cannot invert against publish/settle.
-          const repairDiscoveryParams = [klass, authorityNow, String(generation), selectedAgency];
-          let repairDiscoveryFilter = "";
+          // Exceptional locator repair claims one physical row only.  Its DWI
+          // UPDATE atomically rebuilds the exact partition/shard wake via triggers.
+          const repairParams = [klass,authorityNow,String(generation),selectedAgency,selectedShard,ownerToken,leaseUntil];
+          let repairFilter = "";
           if (objectType) {
-            repairDiscoveryParams.push(String(objectType));
-            repairDiscoveryFilter += ` AND d."objectType"=$${repairDiscoveryParams.length}`;
+            repairParams.push(String(objectType));
+            repairFilter += ` AND d."objectType"=$${repairParams.length}`;
           }
           if (normalizedObjectIds.length) {
-            const placeholders = normalizedObjectIds.map((value) => {
-              repairDiscoveryParams.push(value);
-              return `$${repairDiscoveryParams.length}`;
-            }).join(",");
-            repairDiscoveryFilter += ` AND d."objectId" IN (${placeholders})`;
+            const placeholders = normalizedObjectIds.map((value) => { repairParams.push(value); return `$${repairParams.length}`; }).join(",");
+            repairFilter += ` AND d."objectId" IN (${placeholders})`;
           }
-
-          const repairCandidates = await tx.$queryRawUnsafe(
-            `SELECT d."id",d."partitionKey"
-               FROM "DomainWorkItem" d
-              WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
-                AND d."isOutstanding"=TRUE
-                AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-                AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)${repairDiscoveryFilter}
-              ORDER BY d."availableAt",d."partitionKey",d."id"
-              FOR UPDATE OF d SKIP LOCKED
-              LIMIT 1`,
-            ...repairDiscoveryParams,
+          rows = await tx.$queryRawUnsafe(
+            `WITH candidate AS MATERIALIZED (
+               SELECT d."id"
+                 FROM "DomainWorkItem" d
+                WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
+                  AND "phase3_domain_work_claim_shard"(d."partitionKey")=$5
+                  AND d."isOutstanding"=TRUE AND d."state" IN ('READY','CLAIMED')
+                  AND "phase3_domain_work_claimable_at"(d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil") <= $2${repairFilter}
+                ORDER BY "phase3_domain_work_claimable_at"(d."state",d."availableAt",d."nextAttemptAt",d."leaseUntil"),
+                         d."partitionKey",d."id"
+                FOR UPDATE OF d SKIP LOCKED
+                LIMIT 1
+             )
+             UPDATE "DomainWorkItem" d SET
+               "state"='CLAIMED',"ownerToken"=$6,"claimFence"=d."claimFence"+1,
+               "claimedRevision"=d."requestedRevision","leaseUntil"=$7,"attempts"=d."attempts"+1,
+               "updatedAt"=CURRENT_TIMESTAMP
+              FROM candidate c WHERE d."id"=c."id"
+             RETURNING d.*`,
+            ...repairParams,
           );
-          const repairWorkId = clean(repairCandidates?.[0]?.id, 240);
-          const repairPartitionKey = clean(repairCandidates?.[0]?.partitionKey, 1000);
-
-          if (repairWorkId && repairPartitionKey) {
-            if (typeof tx?.$executeRawUnsafe !== "function") {
-              throw Object.assign(new Error("DomainWork partition repair requires executeRaw lock support"), {
-                code: "DOMAIN_WORK_PARTITION_REPAIR_LOCK_REQUIRED",
-              });
-            }
-
-            // This MUST be a separate statement after the candidate row lock and
-            // before COUNT. If it waits for an in-flight transition, the following
-            // statement receives a fresh READ COMMITTED snapshot after that
-            // transition commits. The DB wrapper uses the exact same 64-bit key as
-            // phase2_track_domain_work_current_partition().
-            await tx.$executeRawUnsafe(
-              `SELECT "phase2_lock_domain_work_current_partition"($1,$2,$3)`,
-              selectedAgency,klass,repairPartitionKey,
-            );
-
-            const repairParams = [
-              klass,authorityNow,String(generation),selectedAgency,
-              ownerToken,leaseUntil,repairWorkId,repairPartitionKey,
-            ];
-            rows = await tx.$queryRawUnsafe(
-              `WITH claimed AS (
-                 UPDATE "DomainWorkItem" d SET
-                   "state"='CLAIMED',"ownerToken"=$5,"claimFence"=d."claimFence"+1,
-                   "claimedRevision"=d."requestedRevision","leaseUntil"=$6,"attempts"=d."attempts"+1,
-                   "updatedAt"=CURRENT_TIMESTAMP
-                  WHERE d."id"=$7 AND d."agencyId"=$4 AND d."workClass"=$1
-                    AND d."activeGeneration"=$3 AND d."partitionKey"=$8 AND d."isOutstanding"=TRUE
-                    AND (d."state"='READY' OR (d."state"='CLAIMED' AND d."leaseUntil" <= $2))
-                    AND d."availableAt" <= $2 AND (d."nextAttemptAt" IS NULL OR d."nextAttemptAt" <= $2)
-                 RETURNING d.*
-               ), partition_repair AS MATERIALIZED (
-                 SELECT $8::text AS "partitionKey",COUNT(d."id")::INTEGER AS "outstandingCount"
-                   FROM "DomainWorkItem" d
-                  WHERE d."agencyId"=$4 AND d."workClass"=$1 AND d."activeGeneration"=$3
-                    AND d."partitionKey"=$8 AND d."isOutstanding"=TRUE
-               ), partition_touch AS (
-                 INSERT INTO "Phase2WorkBroadClaimPartitionState"(
-                   "id","agencyId","workClass","partitionKey","activeGeneration","outstandingCount","lastClaimedAt","createdAt","updatedAt"
-                 )
-                 SELECT 'p2wbcps_' || md5($4 || E'\x1f' || $1 || E'\x1f' || c."partitionKey"),
-                        $4,$1,c."partitionKey",$3,c."outstandingCount",$2,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
-                   FROM partition_repair c
-                  WHERE c."outstandingCount" > 0
-                 ON CONFLICT ("agencyId","workClass","partitionKey") DO UPDATE SET
-                   "activeGeneration"=EXCLUDED."activeGeneration",
-                   "outstandingCount"=EXCLUDED."outstandingCount",
-                   "lastClaimedAt"=EXCLUDED."lastClaimedAt",
-                   "updatedAt"=CURRENT_TIMESTAMP
-                 RETURNING 1
-               )
-               SELECT c.* FROM claimed c`,
-              ...repairParams,
-            );
-          }
         }
-        return { agencyId: selectedAgency, authorityNow, leaseUntil, items: rows || [] };
+
+        const reconciledPartitions = Array.from(new Set([
+          ...selectedPartitions,
+          ...(rows || []).map((row) => clean(row?.partitionKey, 500)).filter(Boolean),
+        ])).sort();
+        if (reconciledPartitions.length) {
+          const reconcileParams = [selectedAgency,klass,String(generation),authorityNow];
+          const reconcileValues = reconciledPartitions
+            .map((value) => { reconcileParams.push(value); return `($${reconcileParams.length})`; })
+            .join(",");
+          await tx.$queryRawUnsafe(
+            `SELECT "phase3_reconcile_domain_work_claim_partition"($1,$2,$3,p."partitionKey",$4) AS "reconciled"
+               FROM (VALUES ${reconcileValues}) AS p("partitionKey")
+              ORDER BY p."partitionKey"`,
+            ...reconcileParams,
+          );
+        }
+        await tx.$queryRawUnsafe(
+          `SELECT "phase3_reconcile_domain_work_claim_shard"($1,$2,$3,$4,$5) AS "reconciled"`,
+          selectedAgency,klass,String(generation),selectedShard,authorityNow,
+        );
+        await tx.$queryRawUnsafe(
+          `SELECT "phase3_reconcile_domain_work_claim_agency"($1,$2,$3,$4) AS "reconciled"`,
+          selectedAgency,klass,String(generation),authorityNow,
+        );
+        return { agencyId: selectedAgency, claimShard: selectedShard, authorityNow, leaseUntil, items: rows || [] };
       });
 
       if (!firstAuthorityNow) firstAuthorityNow = tranche.authorityNow || null;
+      if (tranche.bridgeTransitioned) {
+        bridgeTransitioned = true;
+        break;
+      }
+      if (tranche.accessDenied) {
+        return {
+          ownerToken,
+          authorityNow: firstAuthorityNow,
+          leaseUntil: null,
+          items: [],
+          skipped: true,
+          reason: "domain_work_member_scope_stale",
+        };
+      }
       if (tranche.leaseUntil) lastLeaseUntil = tranche.leaseUntil;
       if (!tranche.agencyId) break;
-      seenAgencies.push(tranche.agencyId);
-      claimed.push(...(tranche.items || []));
-      if (agencyId) break;
+      const trancheItems = tranche.items || [];
+      claimed.push(...trancheItems);
+      if (trancheItems.length) {
+        claimedByAgency.set(tranche.agencyId, Number(claimedByAgency.get(tranche.agencyId) || 0) + trancheItems.length);
+      } else {
+        suppressedShards.push({ agencyId: tranche.agencyId, claimShard: tranche.claimShard });
+      }
     }
-    return { ownerToken, authorityNow: firstAuthorityNow, leaseUntil: lastLeaseUntil, items: claimed.slice(0, take) };
+    return {
+      ownerToken,
+      authorityNow: firstAuthorityNow,
+      leaseUntil: lastLeaseUntil,
+      items: claimed.slice(0, take),
+      ...(bridgeTransitioned ? {
+        bridgeTransitioned: true,
+        skipped: claimed.length === 0,
+        reason: "domain_work_dependency_wake_bridge_transition",
+      } : {}),
+    };
   }
 
   // Adapter/unit fallback. Production PostgreSQL uses the raw paths above; keep
@@ -705,7 +1097,12 @@ async function claimDomainWorkBatch({
   return runDbTransaction(db, async (tx) => {
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
-    await authorizeDomainWorkExecutor(tx);
+    if (!await authorizeClaimExecutor(tx)) {
+      return {
+        ownerToken, authorityNow, leaseUntil: null, items: [], skipped: true,
+        reason: "domain_work_dependency_wake_bridge_transition",
+      };
+    }
     if (!tx?.domainWorkItem?.findMany || !tx?.domainWorkItem?.updateMany) {
       return { ownerToken, authorityNow, leaseUntil, items: [], skipped: true, reason: "domain_work_storage_unavailable" };
     }
@@ -716,7 +1113,7 @@ async function claimDomainWorkBatch({
         OR: [{ state: STATE.READY }, { state: STATE.CLAIMED, leaseUntil: { lte: authorityNow } }],
         activeGeneration: generation,
         availableAt: { lte: authorityNow },
-        ...(agencyId ? { agencyId: String(agencyId) } : {}),
+        ...(effectiveAgencyId ? { agencyId: effectiveAgencyId } : {}),
         ...(objectType ? { objectType: String(objectType) } : {}),
         ...(normalizedObjectIds.length ? { objectId: { in: normalizedObjectIds } } : {}),
         ...(Array.isArray(creatorIds) ? { creatorId: { in: normalizedCreatorIds } } : {}),
@@ -746,6 +1143,28 @@ async function claimDomainWorkBatch({
     }
     return { ownerToken, authorityNow, leaseUntil, items };
   });
+}
+
+async function claimDomainWorkBatch(input = {}) {
+  const ownerToken = input.ownerToken || randomUUID();
+  try {
+    return await claimDomainWorkBatchInternal({ ...input, ownerToken });
+  } catch (error) {
+    // Activation may win the topology row between the initial BUILDING read and
+    // the first short reservation transaction. No work was acquired: retry on
+    // the next pump through the normal ACTIVE/v5 path.
+    if (error?.code === "DOMAIN_WORK_DEPENDENCY_WAKE_BRIDGE_TRANSITION") {
+      return {
+        ownerToken,
+        authorityNow: null,
+        leaseUntil: null,
+        items: [],
+        skipped: true,
+        reason: "domain_work_dependency_wake_bridge_transition",
+      };
+    }
+    throw error;
+  }
 }
 
 function claimWhere(item, ownerToken, authorityNow, generation = DOMAIN_WORK_GENERATION) {
@@ -970,6 +1389,61 @@ async function yieldDomainWorkClaim({ db = null, item, ownerToken = null, progre
   });
 }
 
+async function wakeDomainDependencyBatch({ db = null, item, limit = 100, fallbackNow = new Date() } = {}) {
+  if (!db) db = require("../prisma");
+  const agencyId = String(item?.agencyId || "").trim();
+  const dependencyKind = String(item?.dependencyKind || "").trim();
+  const dependencyKey = String(item?.dependencyKey || "").trim();
+  const dependencyRevision = asBigInt(item?.dependencyRevision, 0n);
+  const take = Math.max(1, Math.min(500, Number(limit) || 100));
+  if (!agencyId || !dependencyKind || !dependencyKey || dependencyRevision <= 0n) {
+    throw Object.assign(new Error("Dependency wake identity is incomplete"), { code: "DOMAIN_DEPENDENCY_WAKE_IDENTITY_REQUIRED" });
+  }
+
+  if (typeof db?.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(
+      `SELECT "woken","remaining"
+         FROM "phase3_wake_domain_dependency_batch"($1,$2,$3,$4,$5)`,
+      agencyId, dependencyKind, dependencyKey, dependencyRevision, take,
+    );
+    return {
+      woken: Number(rows?.[0]?.woken || 0),
+      remaining: rows?.[0]?.remaining === true,
+    };
+  }
+
+  // Test/adapter compatibility preserves the production authority boundary:
+  // callers never mutate DomainWorkItem storage themselves. PostgreSQL performs
+  // selection, SKIP LOCKED and the bounded mutation atomically in the function.
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow });
+  const where = {
+    agencyId,
+    state: STATE.BLOCKED,
+    isOutstanding: true,
+    dependencyKind,
+    dependencyKey,
+    dependencyRevision: { lt: dependencyRevision },
+  };
+  const candidates = await db?.domainWorkItem?.findMany?.({
+    where,
+    select: { id: true },
+    orderBy: [{ dependencyRevision: "asc" }, { id: "asc" }],
+    take,
+  }) || [];
+  if (candidates.length) {
+    await db.domainWorkItem.updateMany({
+      where: { id: { in: candidates.map((row) => String(row.id)) }, ...where },
+      data: {
+        state: STATE.READY, isOutstanding: true, availableAt: authorityNow,
+        nextAttemptAt: null, ownerToken: null, leaseUntil: authorityNow,
+        progressCursor: null, errorClass: null, lastError: null, terminalCause: null,
+      },
+    });
+  }
+  const remaining = await db?.domainWorkItem?.findFirst?.({ where, select: { id: true } });
+  return { woken: candidates.length, remaining: Boolean(remaining) };
+}
+
 async function bumpDomainDependency({ db = null, agencyId, dependencyKind, dependencyKey, fallbackNow = new Date() } = {}) {
   if (!db) db = require("../prisma");
   const a = clean(agencyId, 180); const kind = clean(dependencyKind, 120); const key = clean(dependencyKey, 240);
@@ -989,12 +1463,103 @@ async function bumpDomainDependency({ db = null, agencyId, dependencyKind, depen
       create: { id: dependencyId({ agencyId: a, dependencyKind: kind, dependencyKey: key }), agencyId: a, dependencyKind: kind, dependencyKey: key, revision, changedAt: authorityNow },
       update: { revision, changedAt: authorityNow },
     });
-    if (tx?.domainWorkItem?.updateMany) await tx.domainWorkItem.updateMany({
-      where: { agencyId: a, state: STATE.BLOCKED, dependencyKind: kind, dependencyKey: key, dependencyRevision: { lt: revision } },
-      data: { state: STATE.READY, isOutstanding: true, availableAt: authorityNow, nextAttemptAt: null, errorClass: null, lastError: null },
+    // Production PostgreSQL performs the same publication inside
+    // phase2_bump_dependency.  The adapter path must preserve that contract:
+    // a producer advances one revision and one coalescing durable wake identity,
+    // never synchronously enumerates all BLOCKED work for the dependency.
+    await publishDomainWork({
+      db: tx,
+      agencyId: a,
+      workClass: WORK_CLASS.DEPENDENCY_WAKE,
+      objectType: DOMAIN_DEPENDENCY_WAKE_OBJECT_TYPE,
+      objectId: dependencyId({ agencyId: a, dependencyKind: kind, dependencyKey: key }),
+      partitionKey: key,
+      dependencyKind: kind,
+      dependencyKey: key,
+      dependencyRevision: revision,
+      availableAt: authorityNow,
     });
     return revision;
   });
+}
+
+async function runDomainDependencyWakeSweep({
+  db = null,
+  now = new Date(),
+  claimLimit = 20,
+  wakeLimit = 100,
+} = {}) {
+  if (!db) db = require("../prisma");
+  const claim = await claimDomainWorkBatch({
+    db,
+    workClass: WORK_CLASS.DEPENDENCY_WAKE,
+    limit: bounded(claimLimit, 20, MAX_BATCH),
+    perAgencyQuantum: 2,
+    perPartitionQuantum: 1,
+    leaseMs: 2 * 60 * 1000,
+    fallbackNow: now,
+  });
+  const report = {
+    ok: true,
+    selected: Number(claim?.items?.length || 0),
+    woken: 0,
+    completed: 0,
+    yielded: 0,
+    failed: 0,
+    lostOwnership: 0,
+    skipped: claim?.skipped === true,
+    reason: claim?.reason || null,
+    bridgeTransitioned: claim?.bridgeTransitioned === true,
+  };
+  for (const item of claim?.items || []) {
+    try {
+      if (String(item.objectType) !== DOMAIN_DEPENDENCY_WAKE_OBJECT_TYPE) {
+        throw Object.assign(new Error(`Unsupported dependency wake object type: ${String(item.objectType || "")}`), {
+          code: "DOMAIN_DEPENDENCY_WAKE_OBJECT_UNSUPPORTED",
+        });
+      }
+      const batch = await wakeDomainDependencyBatch({
+        db,
+        item,
+        limit: Math.max(1, Math.min(500, Number(wakeLimit) || 100)),
+        fallbackNow: now,
+      });
+      report.woken += Number(batch.woken || 0);
+      if (batch.remaining) {
+        const yielded = await yieldDomainWorkClaim({
+          db,
+          item,
+          ownerToken: claim.ownerToken,
+          progressCursor: null,
+          availableAt: now,
+          fallbackNow: new Date(),
+        });
+        if (yielded?.lost) report.lostOwnership += 1;
+        else report.yielded += 1;
+      } else {
+        const ack = await ackDomainWorkClaim({
+          db,
+          item,
+          ownerToken: claim.ownerToken,
+          fallbackNow: new Date(),
+        });
+        if (ack?.lost) report.lostOwnership += 1;
+        else report.completed += 1;
+      }
+    } catch (error) {
+      const failed = await failDomainWorkClaim({
+        db,
+        item,
+        ownerToken: claim.ownerToken,
+        error,
+        fallbackNow: new Date(),
+      }).catch(() => ({ lost: true }));
+      if (failed?.lost) report.lostOwnership += 1;
+      else report.failed += 1;
+    }
+  }
+  report.ok = report.failed === 0 && report.lostOwnership === 0;
+  return report;
 }
 
 async function currentDependencyRevision({ db = null, agencyId, dependencyKind, dependencyKey } = {}) {
@@ -1004,7 +1569,11 @@ async function currentDependencyRevision({ db = null, agencyId, dependencyKind, 
 }
 
 module.exports = {
-  DOMAIN_WORK_GENERATION, DOMAIN_WORK_PROJECTION_VERSION, DEFAULT_LEASE_MS, MAX_BATCH, WORK_CLASS, STATE, LEGACY_DRAIN_WORK_CLASSES,
+  DOMAIN_WORK_GENERATION, DOMAIN_WORK_PROJECTION_VERSION, DEFAULT_LEASE_MS, MAX_BATCH, DOMAIN_WORK_CLAIM_TOPOLOGY_ID,
+  DOMAIN_WORK_MEMBER_SCOPE_SHARD_PROBE, DOMAIN_WORK_MEMBER_SCOPE_CREATOR_PROBE,
+  DOMAIN_DEPENDENCY_WAKE_OBJECT_TYPE,
+  WORK_CLASS, STATE, LEGACY_DRAIN_WORK_CLASSES,
   workId, publishDomainWork, activeDomainWorkGeneration, domainWorkFamilyState, hasOutstandingDomainWork, legacyExecutorDrainStatus, claimDomainWorkBatch, lockDomainWorkClaimForCommit, heartbeatDomainWorkClaim, ackDomainWorkClaim,
-  blockDomainWorkClaim, failDomainWorkClaim, saveDomainWorkProgress, yieldDomainWorkClaim, bumpDomainDependency, currentDependencyRevision,
+  blockDomainWorkClaim, failDomainWorkClaim, saveDomainWorkProgress, yieldDomainWorkClaim, wakeDomainDependencyBatch, bumpDomainDependency, runDomainDependencyWakeSweep, currentDependencyRevision,
+  normalizeMemberClaimScope, lockMemberClaimAuthority, reserveMemberScopeCreatorProbe,
 };

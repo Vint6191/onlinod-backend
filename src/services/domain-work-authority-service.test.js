@@ -254,6 +254,59 @@ test("A7 foundation: a dependency change observed before BLOCKED commit cannot b
   assert.equal(final.dependencyRevision, 2n);
 });
 
+test("A36 dependency bump publishes one coalescing wake identity without synchronously rewriting blocked work", async () => {
+  const fx = makeDb();
+  const t0 = new Date("2026-09-22T00:00:00.000Z");
+  await authority.publishDomainWork({ db: fx.db, ...base, availableAt: t0 });
+  const claim = await authority.claimDomainWorkBatch({
+    db: fx.db,
+    workClass: base.workClass,
+    ownerToken: "dependency-blocker",
+    fallbackNow: t0,
+    leaseMs: 60_000,
+  });
+  const item = claim.items[0];
+  const blocked = await authority.blockDomainWorkClaim({
+    db: fx.db,
+    item,
+    ownerToken: "dependency-blocker",
+    dependencyKind: "AUTO_PROVIDER",
+    dependencyKey: base.agencyId,
+    dependencyRevision: 0n,
+    reason: "A36_SCALE_PROBE",
+    fallbackNow: new Date(t0.getTime() + 1_000),
+  });
+  assert.equal(blocked.blocked, true);
+
+  const revision1 = await authority.bumpDomainDependency({
+    db: fx.db,
+    agencyId: base.agencyId,
+    dependencyKind: "AUTO_PROVIDER",
+    dependencyKey: base.agencyId,
+    fallbackNow: new Date(t0.getTime() + 2_000),
+  });
+  assert.equal(revision1, 1n);
+  assert.equal(fx.rows.get(item.id).state, authority.STATE.BLOCKED,
+    "producer transaction must leave population wakeup to bounded durable work");
+  const wakeRows = [...fx.rows.values()].filter((row) => row.workClass === authority.WORK_CLASS.DEPENDENCY_WAKE);
+  assert.equal(wakeRows.length, 1);
+  assert.equal(wakeRows[0].objectType, authority.DOMAIN_DEPENDENCY_WAKE_OBJECT_TYPE);
+  assert.equal(wakeRows[0].dependencyRevision, 1n);
+
+  const revision2 = await authority.bumpDomainDependency({
+    db: fx.db,
+    agencyId: base.agencyId,
+    dependencyKind: "AUTO_PROVIDER",
+    dependencyKey: base.agencyId,
+    fallbackNow: new Date(t0.getTime() + 3_000),
+  });
+  assert.equal(revision2, 2n);
+  const coalesced = [...fx.rows.values()].filter((row) => row.workClass === authority.WORK_CLASS.DEPENDENCY_WAKE);
+  assert.equal(coalesced.length, 1);
+  assert.equal(coalesced[0].requestedRevision, 2n);
+  assert.equal(coalesced[0].dependencyRevision, 2n);
+});
+
 test("A5/A18 foundation: partition fairness admits valid work and future due work is not claimed early", async () => {
   const fx = makeDb();
   const t0 = new Date("2026-09-10T00:00:00.000Z");

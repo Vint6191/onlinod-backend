@@ -230,6 +230,7 @@ test("F55-06 Creator non-FK anti-map classifies every non-cascade creatorId carr
   const operationalCleanup = [
     "ProviderOperationalDebt", "TelegramDeliveryIntent", "TelegramInboundEvent", "DomainWorkItem",
     "AutomationTask", "AutomationJob", "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob",
+    "AgencyMemberCreatorAccessCurrent", "FanObservationReadLease", "FanObservationToken", "OfProviderRequestGateWaiter",
   ];
   const retainedHistory = [
     "BillingOrderLine", "BillingWalletTransaction", "CreatorBillingPeriod", "AutomationEvent",
@@ -244,6 +245,9 @@ test("F55-06 Creator non-FK anti-map classifies every non-cascade creatorId carr
   assert.match(destructive, /await run\("AutomationJob"[\s\S]*await run\("AutomationTask"/);
   assert.match(destructive, /x\."accountId"=\$2/);
   assert.match(destructive, /FROM "AutomationTask" t/);
+  for (const table of ["AgencyMemberCreatorAccessCurrent", "FanObservationReadLease", "FanObservationToken", "OfProviderRequestGateWaiter"]) {
+    assert.match(destructive, new RegExp(`await run\\("${table}"`));
+  }
 });
 
 
@@ -279,14 +283,30 @@ test("F55-07 Agency non-FK anti-map classifies every non-cascade agencyId carrie
     "AuthorizationSessionBoundary", "AgencyMemberAccessEpochBoundary", "AgencyCreatorCatalogGenerationBoundary",
     "AnalyticsCollectionDemand", "DeviceCommand", "AutomationTask", "AutomationJob", "AutomationEvent",
     "ContentUsageEvent", "BumpDeliveryStat", "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob",
+    "AgencyMemberCreatorAccessCurrent", "DomainWorkMemberScopeShardState",
   ];
+  // Agency destruction first drains every Creator through the bounded Creator
+  // worker; these live capabilities therefore reach tenant proof-zero through
+  // their indexed creatorId ownership rather than an unindexed agency scan.
+  const creatorDrainedTenantRoots = ["FanObservationReadLease", "FanObservationToken", "OfProviderRequestGateWaiter"];
+  // This is transaction-private UNLOGGED staging, not durable tenant state. Its
+  // deferred flush deletes the parent batch, whose FK cascade removes intents.
+  const transactionScopedRoots = ["DomainWorkClaimLocatorMutationIntent"];
   const postCascadeCurrentRoots = ["Phase2WorkFamilyState", "DomainWorkReadyPartition", "DomainWorkReadyAgency"];
-  const classified = Array.from(new Set([...directSetNull, ...boundedTenantRoots, ...postCascadeCurrentRoots])).sort();
+  const classified = Array.from(new Set([
+    ...directSetNull, ...boundedTenantRoots, ...creatorDrainedTenantRoots,
+    ...transactionScopedRoots, ...postCascadeCurrentRoots,
+  ])).sort();
   assert.deepEqual(actual, classified);
 
   const destructive = source("phase2-destructive-delete-authority-service.js");
   for (const table of boundedTenantRoots) assert.match(destructive, new RegExp(`"${table}"`));
+  for (const table of creatorDrainedTenantRoots) assert.match(destructive, new RegExp(`"${table}"`));
   for (const table of postCascadeCurrentRoots) assert.match(destructive, new RegExp(`"${table}"`));
+  const a36 = source("../../prisma/migrations/20260922183000_phase3_a36_domain_work_claim_shard_closure_v1/migration.sql");
+  assert.match(a36, /CREATE UNLOGGED TABLE IF NOT EXISTS "DomainWorkClaimLocatorMutationIntent"/);
+  assert.match(a36, /DomainWorkClaimLocatorMutationIntent_txId_fkey[\s\S]*ON DELETE CASCADE/);
+  assert.match(a36, /DELETE FROM "DomainWorkClaimLocatorMutationBatch" b WHERE b\."txId"=v_txid/);
 });
 
 test("F55-07 Agency route establishes deletion barrier and publishes durable cleanup without tenant-wide cascade", () => {

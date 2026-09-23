@@ -12,6 +12,7 @@ const PRISMA_DIR = path.join(ROOT, "prisma");
 const A13_CUTOFF = "20260919010000_phase3_provider_gate_durable_waiter_fairness_v1";
 const PRE_A20_2_CUTOFF = "20260919113000_phase3_campaign_refresh_recovery_status_v1";
 const COVERAGE_PREFLIGHT = path.join(ROOT, "scripts/database/phase3-campaign-coverage-generation-online-preflight.js");
+const DOMAIN_WORK_CLAIM_ROLLOUT = path.join(ROOT, "scripts/database/phase3-domain-work-claim-online-rollout.js");
 const PREFLIGHT_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-concurrency.js");
 const PREFLIGHT_RUNTIME_AVAILABILITY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-preflight-runtime-availability.js");
 const INDEX_LIFECYCLE_CONCURRENCY_PROOF = path.join(ROOT, "scripts/audit/phase3-a20-index-lifecycle-concurrency.js");
@@ -523,7 +524,9 @@ function main() {
   try {
     scenario("clean-current", () => {
       const cleanUrl = withSchema(audit, cleanSchema);
+      run("clean-current-domain-work-preflight", process.execPath, [DOMAIN_WORK_CLAIM_ROLLOUT, "--preflight"], { DATABASE_URL: cleanUrl });
       run("clean-current-migrate", cli, ["migrate", "deploy", "--schema", cleanSchemaFile], { DATABASE_URL: cleanUrl });
+      run("clean-current-domain-work-activate", process.execPath, [DOMAIN_WORK_CLAIM_ROLLOUT, "--activate"], { DATABASE_URL: cleanUrl });
       const schemaIsolation = assertSchemaIsolation("clean-current-schema-isolation", cleanUrl);
       const operationalization = operationalizeRuntime("clean-current-operationalize", cleanUrl);
       assertSchemaIsolation("clean-current-fixture-lifecycle", cleanUrl, "runtime");
@@ -542,8 +545,10 @@ function main() {
       assertSchemaIsolation("rolling-a13-schema-isolation", rollingUrl);
       const operationalization = operationalizeRuntime("rolling-a13-operationalize", rollingUrl);
       assertSchemaIsolation("rolling-a13-fixture-lifecycle", rollingUrl, "runtime");
+      run("rolling-a13-domain-work-preflight", process.execPath, [DOMAIN_WORK_CLAIM_ROLLOUT, "--preflight"], { DATABASE_URL: rollingUrl });
       addMigrationsAfter(rollingPrisma, A13_CUTOFF);
       run("rolling-a13-to-current-migrate", cli, ["migrate", "deploy", "--schema", rollingSchemaFile], { DATABASE_URL: rollingUrl });
+      run("rolling-current-domain-work-activate", process.execPath, [DOMAIN_WORK_CLAIM_ROLLOUT, "--activate"], { DATABASE_URL: rollingUrl });
       const schemaIsolation = assertSchemaIsolation("rolling-current-schema-isolation", rollingUrl);
       operationalizeRuntime("rolling-current-operationalize-verify", rollingUrl);
       assertSchemaIsolation("rolling-current-fixture-lifecycle", rollingUrl, "runtime");
@@ -568,10 +573,12 @@ function main() {
       const runtimeAvailability = run("seeded-a20-11-preflight-runtime-availability", process.execPath, [PREFLIGHT_RUNTIME_AVAILABILITY_PROOF], seedEnv);
       if (!String(runtimeAvailability.stdout || "").includes("A20_11_PREFLIGHT_RUNTIME_AVAILABILITY_PASS")) fail("seeded preflight runtime-availability proof did not emit PASS marker");
       run("seeded-a20-2-online-preflight", process.execPath, [COVERAGE_PREFLIGHT], seedEnv);
+      run("seeded-domain-work-preflight", process.execPath, [DOMAIN_WORK_CLAIM_ROLLOUT, "--preflight"], seedEnv);
       const indexInvalid = run("seeded-index-lifecycle-invalid-recovery", process.execPath, [INDEX_LIFECYCLE_CONCURRENCY_PROOF, "invalid"], seedEnv);
       if (!String(indexInvalid.stdout || "").includes("A20_12_INDEX_INVALID_RECOVERY_PASS")) fail("seeded index lifecycle invalid recovery proof did not emit PASS marker");
       addMigrationsAfter(seededRollingPrisma, PRE_A20_2_CUTOFF);
       run("seeded-a20-2-to-current-migrate", cli, ["migrate", "deploy", "--schema", seededRollingSchemaFile], { DATABASE_URL: seededRollingUrl });
+      run("seeded-current-domain-work-activate", process.execPath, [DOMAIN_WORK_CLAIM_ROLLOUT, "--activate"], seedEnv);
       const schemaIsolation = assertSchemaIsolation("seeded-current-schema-isolation", seededRollingUrl);
       operationalizeRuntime("seeded-current-operationalize-verify", seededRollingUrl);
       assertSchemaIsolation("seeded-current-fixture-lifecycle", seededRollingUrl, "runtime");

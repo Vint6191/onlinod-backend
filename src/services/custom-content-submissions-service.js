@@ -1839,11 +1839,12 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
       take: ids.length,
     }));
   }
-  const scope = await allowedCreatorScope({ agencyId, member, db: client });
   const currentUserId = String(member.userId || "");
   const currentMemberId = String(member.id || "");
   const currentAccessEpoch = Number(member.accessEpoch);
-  const scopedCreatorIds = new Set(scope.creatorIds || []);
+  const relationalMemberScope = typeof client?.domainWorkClaimTopologyState?.findUnique === "function";
+  const adapterScope = relationalMemberScope ? null : await allowedCreatorScope({ agencyId, member, db: client });
+  const adapterCreatorIds = new Set(adapterScope?.creatorIds || []);
   const validAccountIds = leaseRows.filter((row) => {
     const anchorCreatorId = String(row.runtimeLeaseCreatorId || "");
     return requestedByAccount.get(String(row.id)) === String(row.runtimeClaimToken || "")
@@ -1852,7 +1853,7 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
       && Number.isInteger(currentAccessEpoch)
       && Number(row.runtimeLeaseAccessEpoch) === currentAccessEpoch
       && Boolean(anchorCreatorId)
-      && (scope.broad || scopedCreatorIds.has(anchorCreatorId));
+      && (relationalMemberScope || adapterScope?.broad || adapterCreatorIds.has(anchorCreatorId));
   }).map((row) => String(row.id));
 
   const maxClaims = Math.max(take, Math.min(36, take * SOURCE_PIPELINE_CLAIM_MULTIPLIER));
@@ -1861,7 +1862,14 @@ async function claimCustomContentSubmissionUploadWork({ agencyId, member, device
     workClass: PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
     agencyId: String(agencyId),
     objectType: "CustomContentSubmission",
-    creatorIds: scope.broad ? null : Array.from(scopedCreatorIds),
+    ...(relationalMemberScope ? {
+      memberScope: {
+        agencyId: String(agencyId),
+        memberId: currentMemberId,
+        userId: currentUserId,
+        accessEpoch: currentAccessEpoch,
+      },
+    } : { creatorIds: adapterScope?.broad ? null : Array.from(adapterCreatorIds) }),
     limit: maxClaims,
     perAgencyQuantum: maxClaims,
     perPartitionQuantum: Math.min(3, maxClaims),

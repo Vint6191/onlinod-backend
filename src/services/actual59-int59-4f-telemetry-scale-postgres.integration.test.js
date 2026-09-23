@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { cleanupAgencyFixture: cleanupAgencyFixtureAuthority } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 
 const enabled = process.env.ONLINOD_ACTUAL59_SCALE_INTEGRATION === "1";
 
@@ -29,27 +30,9 @@ async function withTeamGeneration(db, workFn) {
 }
 
 async function cleanupAgency(db, agencyId, userIds = []) {
-  const work = require("./domain-work-authority-service");
-  const release = require("./phase2-release-compatibility-authority-service");
   try {
-    await work.publishDomainWork({
-      db,
-      agencyId,
-      workClass: work.WORK_CLASS.DESTRUCTIVE_AGENCY_CLEANUP,
-      objectType: "Actual59ScaleAgencyDestructiveCleanup",
-      objectId: agencyId,
-      partitionKey: agencyId,
-      availableAt: new Date(Date.now() - 1_000),
-    });
-    await db.$transaction(async (tx) => {
-      await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS value`, agencyId);
-      await tx.$queryRawUnsafe(`SELECT set_config($1,$2,true) AS value`, release.TEAM_CONTROL_PLANE_DB_SETTING, release.TEAM_CONTROL_PLANE_GENERATION);
-      await tx.agency.delete({ where: { id: agencyId } });
-    });
+    await cleanupAgencyFixtureAuthority(db, { agencyId, userIds });
   } catch (_) {}
-  for (const userId of userIds) {
-    try { await db.user.delete({ where: { id: userId } }); } catch (_) {}
-  }
 }
 
 async function seedWorker({ db, agencyId, creatorId, ordinal }) {

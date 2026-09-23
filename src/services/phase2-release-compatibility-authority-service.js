@@ -8,7 +8,14 @@ const { assertAllLiveAgenciesHaveOperationalOwner, findLiveAgenciesWithoutOperat
 // must still perform their normal permission and object fencing. Their only job is
 // to let migrated PostgreSQL reject incompatible old-binary writer shapes.
 const CREATOR_ACCOUNT_WRITER_GENERATION = "phase2_creator_writer_v2_actual56_postcut";
-const DOMAIN_WORK_EXECUTOR_GENERATION = "phase2_domain_executor_v4_actual56_postcut";
+const DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION = "phase2_domain_executor_v4_actual56_postcut";
+// A36 changes physical claim admission from broad current-work probes to the
+// Agency -> fixed shard -> partition topology.  Reusing the Actual56 executor
+// identity would let an old replica keep acquiring work forever after topology
+// activation.  The online activator publishes this generation atomically with
+// ACTIVE; pre-A36 claims retain v4 and are allowed only to drain.
+const DOMAIN_WORK_EXECUTOR_GENERATION = "phase3_domain_executor_v5_a36_claim_topology";
+const DOMAIN_WORK_CLAIM_TOPOLOGY_ID = "phase3_domain_work_claim_topology_a36_v1";
 const TEAM_CONTROL_PLANE_GENERATION = "phase2_team_control_plane_v2_durable_access";
 const TEAM_CONTROL_PLANE_SCOPE = "TEAM_CONTROL_PLANE";
 const TEAM_CONTROL_PLANE_RELEASE_FENCE_KEY = "phase2:release-activation:TEAM_CONTROL_PLANE";
@@ -57,8 +64,7 @@ function triggerCoverageValid(triggerName, definition) {
   return false;
 }
 
-async function setLocalGeneration(db, setting, generation) {
-  if (typeof db?.$queryRawUnsafe !== "function") return { applied: false, generation };
+function assertTransactionLocalGenerationClient(db, setting) {
   // Every release generation in this module is transaction-local by design.
   // A root PrismaClient would execute set_config(..., true) in a one-statement
   // autocommit transaction, discard the token immediately, and make the helper
@@ -73,6 +79,11 @@ async function setLocalGeneration(db, setting, generation) {
     error.setting = setting;
     throw error;
   }
+}
+
+async function setLocalGeneration(db, setting, generation) {
+  if (typeof db?.$queryRawUnsafe !== "function") return { applied: false, generation };
+  assertTransactionLocalGenerationClient(db, setting);
   await db.$queryRawUnsafe(`SELECT set_config($1,$2,true) AS value`, setting, generation);
   return { applied: true, generation };
 }
@@ -82,7 +93,118 @@ async function authorizeCreatorAccountWrite(db) {
 }
 
 async function authorizeDomainWorkExecutor(db) {
+  if (typeof db?.$queryRawUnsafe !== "function") {
+    return { applied: false, generation: DOMAIN_WORK_EXECUTOR_GENERATION };
+  }
+  assertTransactionLocalGenerationClient(db, "onlinod.phase2_domain_executor_generation");
+
+  // The optimistic topology read in the scheduler is only a cheap fail-fast
+  // check.  Execution authority is proved again in the exact transaction that
+  // will reserve/claim work.  A shared topology lock serializes this proof with
+  // both initial activation and every later ACTIVE -> BUILDING generation
+  // invalidation; a stale precheck can therefore never acquire work after the
+  // topology stopped being ACTIVE.
+  const topologyRows = await db.$queryRawUnsafe(
+    `SELECT "generation","activationState"
+       FROM "DomainWorkClaimTopologyState"
+      WHERE "id"=$1
+      FOR SHARE`,
+    DOMAIN_WORK_CLAIM_TOPOLOGY_ID,
+  );
+  const topology = Array.isArray(topologyRows) ? topologyRows[0] : null;
+  if (topology?.generation !== DOMAIN_WORK_CLAIM_TOPOLOGY_ID
+      || String(topology.activationState || "").toUpperCase() !== "ACTIVE") {
+    throw Object.assign(new Error("DomainWork claim topology is not ACTIVE"), {
+      code: "DOMAIN_WORK_CLAIM_TOPOLOGY_NOT_ACTIVE",
+      status: 503,
+      retryable: true,
+      topologyState: topology?.activationState || null,
+    });
+  }
+
+  // Keep the global lock order topology -> release authority.  Holding the
+  // release row until claim commit also prevents a release cutover from
+  // invalidating the token between proof and the DB acquisition trigger.
+  const authorityRows = await db.$queryRawUnsafe(
+    `SELECT "requiredGeneration","activationState"
+       FROM "Phase2ReleaseCompatibilityAuthority"
+      WHERE "scope"='DOMAIN_WORK_EXECUTOR'
+      FOR SHARE`,
+  );
+  const authority = Array.isArray(authorityRows) ? authorityRows[0] : null;
+  if (authority?.requiredGeneration !== DOMAIN_WORK_EXECUTOR_GENERATION
+      || String(authority.activationState || "").toUpperCase() !== "ACTIVE") {
+    throw Object.assign(new Error("DomainWork executor release authority is not ACTIVE on v5"), {
+      code: "DOMAIN_WORK_EXECUTOR_RELEASE_UNAVAILABLE",
+      status: 503,
+      retryable: true,
+      requiredGeneration: authority?.requiredGeneration || null,
+      releaseState: authority?.activationState || null,
+    });
+  }
   return setLocalGeneration(db, "onlinod.phase2_domain_executor_generation", DOMAIN_WORK_EXECUTOR_GENERATION);
+}
+
+async function authorizeDomainWorkDependencyWakeBridge(db) {
+  if (typeof db?.$queryRawUnsafe !== "function") {
+    throw Object.assign(new Error("Dependency-wake rollout bridge requires PostgreSQL transaction storage"), {
+      code: "DOMAIN_WORK_DEPENDENCY_WAKE_BRIDGE_STORAGE_REQUIRED",
+      status: 503,
+      retryable: true,
+    });
+  }
+  assertTransactionLocalGenerationClient(db, "onlinod.phase2_domain_executor_generation");
+
+  // Lock in the same topology -> release-authority order as the A36 activator.
+  // Holding both shared locks until this claim transaction commits makes the
+  // BUILDING/v4 proof and the DWI ownership acquisition one atomic statement of
+  // compatibility.  The bridge can never leak a v4 acquisition past ACTIVE.
+  const topologyRows = await db.$queryRawUnsafe(
+    `SELECT "generation","activationState"
+       FROM "DomainWorkClaimTopologyState"
+      WHERE "id"=$1
+      FOR SHARE`,
+    DOMAIN_WORK_CLAIM_TOPOLOGY_ID,
+  );
+  const topology = Array.isArray(topologyRows) ? topologyRows[0] : null;
+  if (topology?.generation === DOMAIN_WORK_CLAIM_TOPOLOGY_ID
+      && String(topology.activationState || "").toUpperCase() === "ACTIVE") {
+    throw Object.assign(new Error("Dependency-wake rollout bridge ended during topology activation"), {
+      code: "DOMAIN_WORK_DEPENDENCY_WAKE_BRIDGE_TRANSITION",
+      status: 503,
+      retryable: true,
+    });
+  }
+
+  const authorityRows = await db.$queryRawUnsafe(
+    `SELECT "requiredGeneration","activationState"
+       FROM "Phase2ReleaseCompatibilityAuthority"
+      WHERE "scope"='DOMAIN_WORK_EXECUTOR'
+      FOR SHARE`,
+  );
+  const authority = Array.isArray(authorityRows) ? authorityRows[0] : null;
+  const releaseGeneration = String(authority?.requiredGeneration || "");
+  const compatibleBuildingGeneration = releaseGeneration === DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION
+    || releaseGeneration === DOMAIN_WORK_EXECUTOR_GENERATION;
+  const bridgeReady = topology?.generation === DOMAIN_WORK_CLAIM_TOPOLOGY_ID
+    && String(topology.activationState || "").toUpperCase() === "BUILDING"
+    && compatibleBuildingGeneration
+    && String(authority.activationState || "").toUpperCase() === "ACTIVE";
+  if (!bridgeReady) {
+    throw Object.assign(new Error("Dependency-wake rollout bridge authority is inconsistent"), {
+      code: "DOMAIN_WORK_DEPENDENCY_WAKE_BRIDGE_UNAVAILABLE",
+      status: 503,
+      retryable: false,
+      topologyState: topology?.activationState || null,
+      requiredGeneration: authority?.requiredGeneration || null,
+      releaseState: authority?.activationState || null,
+    });
+  }
+  return setLocalGeneration(
+    db,
+    "onlinod.phase2_domain_executor_generation",
+    releaseGeneration,
+  );
 }
 
 function teamControlPlaneUnavailable(row) {
@@ -365,7 +487,9 @@ async function runCreatorAccountWriteTransaction(db, work, options = undefined) 
 
 module.exports = {
   CREATOR_ACCOUNT_WRITER_GENERATION,
+  DOMAIN_WORK_PRE_A36_EXECUTOR_GENERATION,
   DOMAIN_WORK_EXECUTOR_GENERATION,
+  DOMAIN_WORK_CLAIM_TOPOLOGY_ID,
   TEAM_CONTROL_PLANE_GENERATION,
   TEAM_CONTROL_PLANE_SCOPE,
   TEAM_CONTROL_PLANE_RELEASE_FENCE_KEY,
@@ -374,6 +498,7 @@ module.exports = {
   TEAM_CONTROL_PLANE_DB_FENCE_TRIGGERS,
   authorizeCreatorAccountWrite,
   authorizeDomainWorkExecutor,
+  authorizeDomainWorkDependencyWakeBridge,
   readTeamControlPlaneReleaseAuthority,
   readTeamControlPlaneDbFenceStatus,
   assertTeamControlPlaneDbFenceIntegrity,
