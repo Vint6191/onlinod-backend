@@ -686,7 +686,7 @@ async function publishCoverageEnumerationWork({ db, agencyId, family, generation
   return publishDomainWork({
     db, agencyId, workClass: PHASE2_WORK_CLASS.HISTORICAL_ENUMERATION,
     objectType: "Phase2Coverage", objectId: `${family}:${generation}`,
-    parentObjectId: agencyId, partitionKey: agencyId, availableAt: now,
+    parentObjectId: agencyId, partitionKey: agencyId, fallbackNow: now,
   });
 }
 
@@ -740,7 +740,7 @@ async function runProviderCoverageEnumerationUnit({ db, item, ownerToken, now })
     await publishDomainWork({
       db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_COMMUNICATION,
       objectType: "CustomOrder", objectId: String(row.id), partitionKey: String(row.creatorId || item.agencyId),
-      creatorId: row.creatorId ? String(row.creatorId) : null, availableAt: now,
+      creatorId: row.creatorId ? String(row.creatorId) : null, fallbackNow: now,
     });
     projected += 1;
   }
@@ -794,7 +794,7 @@ async function runCustomSourcePipelineCoverageEnumerationUnit({ db, item, ownerT
     objectType: "CustomContentSubmission", objectId: String(row.id), partitionKey: String(row.creatorId || item.agencyId),
     creatorId: row.creatorId ? String(row.creatorId) : null,
     accountId: row.telegramSourceAccountId ? String(row.telegramSourceAccountId) : null,
-    availableAt: now,
+    fallbackNow: now,
   });
   const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
   if (Number(rows?.length || 0) >= 100) {
@@ -886,7 +886,7 @@ async function runTeamDialogCoverageEnumerationUnit({ db, item, ownerToken, now 
     if (!creatorId || !dialogId) continue;
     await publishDomainWork({ db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_DIALOG_PROJECTION,
       objectType: "CreatorDialog", objectId: dialogWorkObjectId(creatorId, dialogId), parentObjectId: String(row.id),
-      partitionKey: creatorId, creatorId, availableAt: now });
+      partitionKey: creatorId, creatorId, fallbackNow: now });
     published += 1;
   }
   const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
@@ -904,7 +904,7 @@ async function runTeamDialogCoverageEnumerationUnit({ db, item, ownerToken, now 
     const creatorId = String(row?.creatorId || "").trim(); const dialogId = String(row?.dialogId || row?.fanId || "").trim();
     if (!creatorId || !dialogId) continue;
     await publishDomainWork({ db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_DIALOG_PROJECTION, objectType: "CreatorDialog",
-      objectId: dialogWorkObjectId(creatorId, dialogId), parentObjectId: String(row.id), partitionKey: creatorId, creatorId, availableAt: now });
+      objectId: dialogWorkObjectId(creatorId, dialogId), parentObjectId: String(row.id), partitionKey: creatorId, creatorId, fallbackNow: now });
     unresolved += 1;
   }
   if (unresolved > 0) {
@@ -972,7 +972,7 @@ async function runTeamMoneyReconciliationCoverageEnumerationUnit({ db, item, own
     for (const row of rows || []) await publishDomainWork({
       db, agencyId, workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION,
       objectType: phase === "sales" ? "CreatorSale" : "CreatorTip", objectId: String(row.id),
-      partitionKey: String(row.creatorId || agencyId), creatorId: row.creatorId ? String(row.creatorId) : null, availableAt: now,
+      partitionKey: String(row.creatorId || agencyId), creatorId: row.creatorId ? String(row.creatorId) : null, fallbackNow: now,
     });
     const nextId = rows?.length ? String(rows[rows.length - 1].id) : cursor;
     if (Number(rows?.length || 0) >= 100) {
@@ -1009,7 +1009,7 @@ async function runTeamReadSummaryCoverageEnumerationUnit({ db, item, ownerToken,
   for (const row of rows || []) await publishDomainWork({
     db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_READ_SUMMARY,
     objectType: "TeamMoneyAttributionFact", objectId: String(row.id), partitionKey: String(row.creatorId || item.agencyId),
-    creatorId: row.creatorId ? String(row.creatorId) : null, availableAt: now,
+    creatorId: row.creatorId ? String(row.creatorId) : null, fallbackNow: now,
   });
   const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
   if (Number(rows?.length || 0) >= 100) {
@@ -1029,7 +1029,7 @@ async function runTeamReadSummaryCoverageEnumerationUnit({ db, item, ownerToken,
     });
   }
   for (const row of missing || []) await publishDomainWork({ db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_READ_SUMMARY, objectType: "TeamMoneyAttributionFact", objectId: String(row.id),
-    partitionKey: String(row.creatorId || item.agencyId), creatorId: row.creatorId ? String(row.creatorId) : null, availableAt: now });
+    partitionKey: String(row.creatorId || item.agencyId), creatorId: row.creatorId ? String(row.creatorId) : null, fallbackNow: now });
 
   // Existing contribution != converged contribution. A live fact can change after the
   // historical enumerator has passed it, leaving a newer TEAM_READ_SUMMARY revision queued.
@@ -1058,7 +1058,7 @@ async function runTelegramConfirmedCoverageEnumerationUnit({ db, item, ownerToke
   for (const row of rows || []) await publishDomainWork({
     db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TELEGRAM_CONFIRMED_PROJECTION,
     objectType: "TelegramDeliveryIntent", objectId: String(row.id), partitionKey: String(row.accountId || row.creatorId || item.agencyId),
-    creatorId: row.creatorId ? String(row.creatorId) : null, accountId: row.accountId ? String(row.accountId) : null, availableAt: now,
+    creatorId: row.creatorId ? String(row.creatorId) : null, accountId: row.accountId ? String(row.accountId) : null, fallbackNow: now,
   });
   const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
   if (Number(rows?.length || 0) >= 100) {
@@ -1088,7 +1088,7 @@ async function runTelegramInboundCoverageEnumerationUnit({ db, item, ownerToken,
   for (const row of rows || []) await publishDomainWork({
     db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TELEGRAM_INBOUND_PROJECTION,
     objectType: "TelegramInboundEvent", objectId: String(row.id), partitionKey: String(row.accountId || row.creatorId || item.agencyId),
-    creatorId: row.creatorId ? String(row.creatorId) : null, accountId: row.accountId ? String(row.accountId) : null, availableAt: now,
+    creatorId: row.creatorId ? String(row.creatorId) : null, accountId: row.accountId ? String(row.accountId) : null, fallbackNow: now,
   });
   const nextCursor = rows?.length ? String(rows[rows.length - 1].id) : cursor;
   if (Number(rows?.length || 0) >= 100) {
@@ -1299,7 +1299,7 @@ async function processTeamMoneyEvidenceFanout({ db, item, now }) {
     });
     for (const row of rows || []) {
       await publishDomainWork({ db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION,
-        objectType: "CreatorSale", objectId: String(row.id), partitionKey: creatorId, creatorId, availableAt: now });
+        objectType: "CreatorSale", objectId: String(row.id), partitionKey: creatorId, creatorId, fallbackNow: now });
       published += 1;
     }
     if (Number(rows?.length || 0) >= 100) return { complete: false, published, progressCursor: { phase: "sales", lastId: String(rows[rows.length - 1].id) } };
@@ -1313,7 +1313,7 @@ async function processTeamMoneyEvidenceFanout({ db, item, now }) {
   });
   for (const row of tips || []) {
     await publishDomainWork({ db, agencyId: String(item.agencyId), workClass: PHASE2_WORK_CLASS.TEAM_MONEY_RECONCILIATION,
-      objectType: "CreatorTip", objectId: String(row.id), partitionKey: creatorId, creatorId, availableAt: now });
+      objectType: "CreatorTip", objectId: String(row.id), partitionKey: creatorId, creatorId, fallbackNow: now });
     published += 1;
   }
   if (Number(tips?.length || 0) >= 100) return { complete: false, published, progressCursor: { phase: "tips", lastId: String(tips[tips.length - 1].id) } };
@@ -1380,7 +1380,7 @@ async function maybeRunPhase2DependencyFanout({ db = prisma, now = new Date() } 
       if (phase === "orders") {
         const rows = await listDependencyFanoutOrders({ db, item: { ...item, progressCursor: { lastOrderId: progress.lastId || progress.lastOrderId || null } }, limit: 100 });
         for (const row of rows) {
-          await publishDomainWork({ db, agencyId: String(row.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_COMMUNICATION, objectType: "CustomOrder", objectId: String(row.id), partitionKey: String(row.creatorId), creatorId: String(row.creatorId), availableAt: now });
+          await publishDomainWork({ db, agencyId: String(row.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_COMMUNICATION, objectType: "CustomOrder", objectId: String(row.id), partitionKey: String(row.creatorId), creatorId: String(row.creatorId), fallbackNow: now });
           report.published += 1;
         }
         if ((rows?.length || 0) >= 100) {
@@ -1396,7 +1396,7 @@ async function maybeRunPhase2DependencyFanout({ db = prisma, now = new Date() } 
         for (const row of rows) {
           await publishDomainWork({ db, agencyId: String(row.agencyId), workClass: PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
             objectType: "CustomContentSubmission", objectId: String(row.id), partitionKey: String(row.creatorId), creatorId: String(row.creatorId),
-            accountId: row.telegramSourceAccountId ? String(row.telegramSourceAccountId) : null, availableAt: now });
+            accountId: row.telegramSourceAccountId ? String(row.telegramSourceAccountId) : null, fallbackNow: now });
           report.sourcePublished += 1;
         }
         if ((rows?.length || 0) >= 100) {

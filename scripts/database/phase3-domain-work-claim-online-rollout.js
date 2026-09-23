@@ -615,7 +615,11 @@ async function selectBackfillCandidates(tx, state, batchSize) {
 async function lockBackfillAgencyLifecycles(tx, candidates) {
   const agencyIds = Array.from(new Set((candidates || []).map((row) => String(row.agencyId)))).sort();
   if (!agencyIds.length) return [];
-  await tx.$queryRawUnsafe(`
+  // Advisory lock functions return PostgreSQL void. $queryRawUnsafe asks
+  // Prisma to deserialize that pseudo-type and fails before a populated A*C
+  // rollout can start; executeRaw intentionally discards the result while
+  // retaining the deterministic lock order.
+  await tx.$executeRawUnsafe(`
     SELECT pg_advisory_xact_lock_shared(hashtext('agency-lifecycle:' || ordered."agencyId")) AS locked
       FROM (
         SELECT DISTINCT value AS "agencyId"

@@ -85,7 +85,7 @@ async function publishTeamProjectionWorkForEvent({ row, db = prisma, now = new D
     await publishDomainWork({
       db, agencyId, workClass: WORK_CLASS.TEAM_DIALOG_PROJECTION, objectType: "CreatorDialog",
       objectId: dialogWorkObjectId(creatorId, dialogId), parentObjectId: clean(row?.id, 220),
-      partitionKey: creatorId, creatorId, availableAt: now,
+      partitionKey: creatorId, creatorId, fallbackNow: now,
     });
     published += 1;
   }
@@ -93,7 +93,7 @@ async function publishTeamProjectionWorkForEvent({ row, db = prisma, now = new D
     await publishDomainWork({
       db, agencyId, workClass: WORK_CLASS.TEAM_RESPONSE_RANGE_REPAIR, objectType: "TeamActivityEvent",
       objectId: clean(row.id, 220), parentObjectId: clean(row?.coverageId || row?.correlationId, 220),
-      partitionKey: creatorId, creatorId, availableAt: now,
+      partitionKey: creatorId, creatorId, fallbackNow: now,
     });
     published += 1;
   }

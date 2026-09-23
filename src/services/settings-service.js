@@ -588,7 +588,7 @@ async function updateTelegramCustomReminderSettings({ agencyId, member, reminder
       db: tx, agencyId, workClass: PHASE2_WORK_CLASS.DEPENDENCY_FANOUT,
       objectType: "ReminderPolicy", objectId: String(agencyId), parentObjectId: String(agencyId),
       partitionKey: String(agencyId), dependencyKind: "REMINDER_POLICY", dependencyKey: String(agencyId),
-      dependencyRevision: policyRevision, availableAt: new Date(),
+      dependencyRevision: policyRevision, fallbackNow: new Date(),
     });
     await audit({
       agencyId,
@@ -666,7 +666,7 @@ async function scheduleTelegramAccountRetirementFanout({ tx, agencyId, accountId
     parentObjectId: String(accountId),
     partitionKey: `telegram-account:${String(accountId)}`,
     accountId: String(accountId),
-    availableAt: now,
+    fallbackNow: now,
   });
 }
 

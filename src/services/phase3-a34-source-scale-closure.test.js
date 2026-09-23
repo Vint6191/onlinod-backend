@@ -157,6 +157,10 @@ test("A36 DomainWork admission is bounded on both Agency and creator axes withou
   assert.match(broad, /Phase2WorkBroadClaimPartitionState/);
   assert.match(broad, /phase3_domain_work_claimable_at/);
   assert.match(broad, /FOR UPDATE OF d SKIP LOCKED/);
+  assert.equal((broad.match(/FOR UPDATE OF [as] SKIP LOCKED/g) || []).length, 2,
+    "Agency and shard reservations must both stay non-blocking");
+  assert.doesNotMatch(broad, /reservationSql\(false\)/,
+    "locator contention must fall through to indexed physical truth, never a blocking retry");
   assert.match(broad, /phase3_reconcile_domain_work_claim_partition[\s\S]*phase3_reconcile_domain_work_claim_shard[\s\S]*phase3_reconcile_domain_work_claim_agency/);
   assert.doesNotMatch(broad, /SELECT f\."agencyId"[\s\S]*EXISTS \([\s\S]*DomainWorkItem/);
   assert.doesNotMatch(broad, /DomainWorkReadyAgency|DomainWorkReadyPartition|Phase2WorkFamilyState/);
@@ -306,6 +310,8 @@ test("A36 DomainWork admission is bounded on both Agency and creator axes withou
   assert.doesNotMatch(rollout, /VALIDATE CONSTRAINT "Phase2WorkBroadClaimPartitionState_claimShard_check"/);
   assert.match(rollout, /jsonb_to_recordset\(\$1::jsonb\)/);
   assert.match(rollout, /pg_advisory_xact_lock_shared[\s\S]*agency-lifecycle:/);
+  assert.match(rollout, /lockBackfillAgencyLifecycles[\s\S]*\$executeRawUnsafe[\s\S]*pg_advisory_xact_lock_shared/,
+    "Prisma must execute and discard PostgreSQL void advisory-lock results");
   assert.match(rollout, /phase3_reconcile_domain_work_claim_partition[\s\S]*phase3_reconcile_domain_work_claim_shard[\s\S]*phase3_reconcile_domain_work_claim_agency/);
   assert.match(rollout, /cursorAgencyId[\s\S]*cursorWorkClass[\s\S]*cursorPartitionKey[\s\S]*cursorActiveGeneration[\s\S]*cursorWorkId/);
   assert.match(rollout, /backfilledPartitions"="backfilledPartitions"\+\$7::bigint/);
@@ -373,6 +379,16 @@ test("A36 PostgreSQL boundary normalizes Node time and selects destructive autho
   assert.match(temporal, /phase3_reconcile_domain_work_claim_partition[\s\S]*phase3_reconcile_domain_work_claim_shard[\s\S]*phase3_reconcile_domain_work_claim_agency/);
   assert.doesNotMatch(domain, /phase3_reconcile_domain_work_claim_(?:partition|shard|agency)"\([^\n]*::timestamp/i,
     "temporal compatibility belongs to the PostgreSQL API, not scattered caller casts");
+  assert.match(domain, /COALESCE\(\$12::timestamptz,clock_timestamp\(\)\)[\s\S]*AT TIME ZONE 'UTC'/,
+    "immediate publication must use the database clock and normalize explicit Node timestamps at one SQL boundary");
+  assert.match(domain, /DOMAIN_WORK_AVAILABLE_AT_INVALID/,
+    "an invalid explicit deadline must fail closed instead of silently becoming immediate work");
+  const exactFixtureClaim = fixture.slice(
+    fixture.indexOf("async function claimPhase3PostgresAgencyDestructiveFixture"),
+    fixture.indexOf("async function installPhase3PostgresAgencyDestructiveFixtureAuthority"),
+  );
+  assert.doesNotMatch(exactFixtureClaim, /availableAt:\s*new Date\(/,
+    "exact destructive fixture work must use the same DB-clock immediate publication contract as production");
 
   assert.match(fixture, /PHASE3_CLAIM_TOPOLOGY_MIGRATION/);
   assert.match(fixture, /PHASE3_EXACT_DESTRUCTIVE_CLAIM_MIGRATION/);

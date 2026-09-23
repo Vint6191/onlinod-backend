@@ -114,7 +114,7 @@ async function retireCreatorWithinTransaction({
       objectId: creator,
       partitionKey: creator,
       creatorId: null,
-      availableAt: retiredAt,
+      fallbackNow: retiredAt,
     });
   }
 

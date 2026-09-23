@@ -259,7 +259,7 @@ test("A36 PostgreSQL: scoped member claims 1000 of 2000 creators through fixed s
               'A36 member creator ' || g::text,'READY'::"CreatorStatus",CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
          FROM generate_series(0,1999) AS g`,
       prefix,agencyId,
-    ));
+    ), { maxWait: 30_000, timeout: 240_000 });
     await withTeamGeneration(dbA, (tx) => tx.agencyMember.create({
       data: {
         id: memberId, agencyId, userId, role: "CHATTER", roleKey: "chatter",

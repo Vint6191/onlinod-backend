@@ -124,6 +124,15 @@ function normalizePublish(input = {}) {
   if (!agencyId || !workClass || !objectType || !objectId) {
     const error = new Error("Domain work identity is required"); error.code = "DOMAIN_WORK_IDENTITY_REQUIRED"; throw error;
   }
+  const hasExplicitAvailableAt = input.availableAt !== undefined
+    && input.availableAt !== null
+    && input.availableAt !== "";
+  const availableAt = hasExplicitAvailableAt ? asDate(input.availableAt) : null;
+  if (hasExplicitAvailableAt && !availableAt) {
+    const error = new Error("Domain work availableAt must be a valid timestamp");
+    error.code = "DOMAIN_WORK_AVAILABLE_AT_INVALID";
+    throw error;
+  }
   return {
     id: workId({ agencyId, workClass, objectType, objectId }), agencyId, workClass, objectType, objectId,
     parentObjectId: clean(input.parentObjectId, 240),
@@ -131,13 +140,16 @@ function normalizePublish(input = {}) {
     creatorId: clean(input.creatorId, 180), accountId: clean(input.accountId, 180),
     dependencyKind: clean(input.dependencyKind, 120), dependencyKey: clean(input.dependencyKey, 240),
     dependencyRevision: asBigInt(input.dependencyRevision, 0n),
-    availableAt: asDate(input.availableAt) || new Date(),
+    // null means "immediately". PostgreSQL resolves that value from its own
+    // clock in the INSERT statement, so a Render/DB clock skew cannot publish
+    // fresh work a few milliseconds into the database's future.
+    availableAt,
     activeGeneration: clean(input.activeGeneration, 120) || DOMAIN_WORK_GENERATION,
     projectionVersion: clean(input.projectionVersion, 120) || DOMAIN_WORK_PROJECTION_VERSION,
   };
 }
 
-async function publishDomainWork({ db = null, ...input } = {}) {
+async function publishDomainWork({ db = null, fallbackNow = null, ...input } = {}) {
   if (!db) db = require("../prisma");
   const row = normalizePublish(input);
   if (typeof db?.$queryRawUnsafe === "function") {
@@ -146,7 +158,11 @@ async function publishDomainWork({ db = null, ...input } = {}) {
          "id","agencyId","workClass","objectType","objectId","parentObjectId","partitionKey","creatorId","accountId",
          "requestedRevision","completedRevision","activeGeneration","projectionVersion","state","isOutstanding","availableAt",
          "dependencyKind","dependencyKey","dependencyRevision","createdAt","updatedAt"
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1,0,$10,$11,'READY',TRUE,$12,$13,$14,$15,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+       ) VALUES (
+         $1,$2,$3,$4,$5,$6,$7,$8,$9,1,0,$10,$11,'READY',TRUE,
+         (COALESCE($12::timestamptz,clock_timestamp()) AT TIME ZONE 'UTC')::timestamp(3),
+         $13,$14,$15,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+       )
        ON CONFLICT ("agencyId","workClass","objectType","objectId") DO UPDATE SET
          "requestedRevision"="DomainWorkItem"."requestedRevision"+1,
          "parentObjectId"=COALESCE(EXCLUDED."parentObjectId","DomainWorkItem"."parentObjectId"),
@@ -176,23 +192,29 @@ async function publishDomainWork({ db = null, ...input } = {}) {
   if (!db?.domainWorkItem?.upsert) {
     const error = new Error("DomainWorkItem storage is unavailable"); error.code = "DOMAIN_WORK_STORAGE_REQUIRED"; throw error;
   }
+  // Lightweight/non-PostgreSQL adapters have no shared database clock. Their
+  // immediate fallback remains process time; production always takes the raw
+  // PostgreSQL branch above.
+  const adapterRow = row.availableAt
+    ? row
+    : { ...row, availableAt: asDate(fallbackNow) || new Date() };
   const existing = await db.domainWorkItem.findUnique?.({ where: identityWhere(row) });
   if (!existing) {
     return db.domainWorkItem.upsert({
       where: identityWhere(row),
-      create: { ...row, requestedRevision: 1n, completedRevision: 0n, state: STATE.READY, isOutstanding: true, claimedRevision: 0n, claimFence: 0n },
+      create: { ...adapterRow, requestedRevision: 1n, completedRevision: 0n, state: STATE.READY, isOutstanding: true, claimedRevision: 0n, claimFence: 0n },
       update: {},
     });
   }
   return db.domainWorkItem.update({
     where: { id: existing.id },
     data: {
-      requestedRevision: { increment: 1 }, parentObjectId: row.parentObjectId || existing.parentObjectId || null, partitionKey: row.partitionKey,
-      creatorId: row.creatorId || existing.creatorId || null, accountId: row.accountId || existing.accountId || null,
-      dependencyKind: row.dependencyKind, dependencyKey: row.dependencyKey,
-      dependencyRevision: row.dependencyRevision > asBigInt(existing.dependencyRevision) ? row.dependencyRevision : asBigInt(existing.dependencyRevision),
+      requestedRevision: { increment: 1 }, parentObjectId: adapterRow.parentObjectId || existing.parentObjectId || null, partitionKey: adapterRow.partitionKey,
+      creatorId: adapterRow.creatorId || existing.creatorId || null, accountId: adapterRow.accountId || existing.accountId || null,
+      dependencyKind: adapterRow.dependencyKind, dependencyKey: adapterRow.dependencyKey,
+      dependencyRevision: adapterRow.dependencyRevision > asBigInt(existing.dependencyRevision) ? adapterRow.dependencyRevision : asBigInt(existing.dependencyRevision),
       state: String(existing.state) === STATE.CLAIMED ? STATE.CLAIMED : STATE.READY, isOutstanding: true,
-      availableAt: asDate(existing.availableAt) && asDate(existing.availableAt) < row.availableAt ? existing.availableAt : row.availableAt,
+      availableAt: asDate(existing.availableAt) && asDate(existing.availableAt) < adapterRow.availableAt ? existing.availableAt : adapterRow.availableAt,
       nextAttemptAt: null,
       progressCursor: String(existing.state) === STATE.CLAIMED
         ? existing.progressCursor ?? null
@@ -755,14 +777,14 @@ async function claimDomainWorkBatchInternal({
             const placeholders = excluded.map((value) => { params.push(value); return `$${params.length}`; }).join(",");
             locatorFilter += ` AND a."agencyId" NOT IN (${placeholders})`;
           }
-          const reservationSql = (skipLocked) =>
+          const reservationSql =
             `WITH candidate AS MATERIALIZED (
                SELECT a."id"
                  FROM "DomainWorkClaimAgencyState" a
                 WHERE a."workClass"=$1 AND a."activeGeneration"=$3
                   AND a."nextDispatchAt" <= $2${locatorFilter}
                 ORDER BY a."nextDispatchAt",a."revision",a."agencyId"
-                FOR UPDATE OF a${skipLocked ? " SKIP LOCKED" : ""}
+                FOR UPDATE OF a SKIP LOCKED
                 LIMIT 1
              )
              UPDATE "DomainWorkClaimAgencyState" a
@@ -771,11 +793,11 @@ async function claimDomainWorkBatchInternal({
                FROM candidate c WHERE a."id"=c."id"
              RETURNING a."agencyId"`;
 
-          let rows = await tx.$queryRawUnsafe(reservationSql(true), ...params);
-          // If the only due Agency is being reserved by another replica, wait
-          // only for that tiny locator transaction; never fall through into a
-          // competing physical scan while a valid locator is merely locked.
-          if (!rows?.length) rows = await tx.$queryRawUnsafe(reservationSql(false), ...params);
+          let rows = await tx.$queryRawUnsafe(reservationSql, ...params);
+          // A contended locator is an optimization miss, not permission to
+          // block while a DWI transaction is reconciling shard -> Agency. The
+          // indexed physical witness below preserves correctness and avoids a
+          // locator/DWI wait cycle across replicas.
           let reservedAgency = clean(rows?.[0]?.agencyId, 180);
 
           if (!reservedAgency) {
@@ -833,14 +855,14 @@ async function claimDomainWorkBatchInternal({
           const placeholders = skippedForAgency.map((value) => { shardParams.push(value); return `$${shardParams.length}`; }).join(",");
           shardFilter += ` AND s."claimShard" NOT IN (${placeholders})`;
         }
-        const reservationSql = (skipLocked) =>
+        const reservationSql =
           `WITH candidate AS MATERIALIZED (
              SELECT s."id"
                FROM "DomainWorkClaimShardState" s
               WHERE s."agencyId"=$4 AND s."workClass"=$1 AND s."activeGeneration"=$3
                 AND s."nextDispatchAt" <= $2${shardFilter}
               ORDER BY s."nextDispatchAt",s."revision",s."claimShard"
-              FOR UPDATE OF s${skipLocked ? " SKIP LOCKED" : ""}
+              FOR UPDATE OF s SKIP LOCKED
               LIMIT 1
            )
            UPDATE "DomainWorkClaimShardState" s
@@ -849,8 +871,7 @@ async function claimDomainWorkBatchInternal({
              FROM candidate c WHERE s."id"=c."id"
            RETURNING s."claimShard"`;
 
-        let shardRows = await tx.$queryRawUnsafe(reservationSql(true), ...shardParams);
-        if (!shardRows?.length) shardRows = await tx.$queryRawUnsafe(reservationSql(false), ...shardParams);
+        let shardRows = await tx.$queryRawUnsafe(reservationSql, ...shardParams);
         let selectedShard = Number(shardRows?.[0]?.claimShard);
 
         if (!Number.isInteger(selectedShard) || selectedShard < 0 || selectedShard >= DOMAIN_WORK_CLAIM_SHARD_COUNT) {

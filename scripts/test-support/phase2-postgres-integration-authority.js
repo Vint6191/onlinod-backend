@@ -34,7 +34,6 @@ async function claimAgencyDestructiveFixture(db, agencyId) {
     objectId: id,
     partitionKey: id,
     creatorId: null,
-    availableAt: new Date(),
   });
   const claim = await domainWork.claimDomainWorkBatch({
     db,

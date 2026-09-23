@@ -778,7 +778,7 @@ async function reconcileMoneyForSentMessageEvidence({ db = prisma, sent }) {
     await publishDomainWork({
       db, agencyId, workClass: WORK_CLASS.DEPENDENCY_FANOUT,
       objectType: "TeamSentMessageLedger", objectId: sentLedgerId,
-      partitionKey: creatorId, creatorId, parentObjectId: messageId, availableAt: new Date(),
+      partitionKey: creatorId, creatorId, parentObjectId: messageId, fallbackNow: new Date(),
     });
     return { ok: true, publishedFanout: true, sentLedgerId };
   }
@@ -806,7 +806,7 @@ async function publishTeamMoneyReconciliationWork({ db = prisma, agencyId, creat
   const { publishDomainWork, WORK_CLASS } = require("./domain-work-authority-service");
   return publishDomainWork({ db, agencyId: agency, workClass: WORK_CLASS.TEAM_MONEY_RECONCILIATION,
     objectType: type === "PPV" ? "CreatorSale" : "CreatorTip", objectId: id,
-    partitionKey: clean(creatorId,160) || agency, creatorId: clean(creatorId,160), availableAt: now });
+    partitionKey: clean(creatorId,160) || agency, creatorId: clean(creatorId,160), fallbackNow: now });
 }
 
 async function dispatchTeamMoneyReconciliationForCanonicalFact({ db = prisma, agencyId, creatorId = null, sourceType, sourceId, now = new Date() } = {}) {

@@ -6,6 +6,10 @@ const assert = require("node:assert/strict");
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
 const credit = require("./provider-request-credit-authority-service");
 const capacityDebt = require("./provider-capacity-debt-authority-service");
+const {
+  withPhase3PostgresFixtureAuthority,
+  cleanupPhase3PostgresAgencyFixture,
+} = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 
 function token(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -65,7 +69,23 @@ test("A15 PostgreSQL: ACTIVE fairness orders waiters across two independent Pris
   const common = { agencyId: token("agency"), creatorId: token("creator"), deviceId: token("device"), capability: "api" };
   const w1 = token("waiter_p1");
   const w2 = token("waiter_p2");
+  let fixtureCreated = false;
   try {
+    // Durable waiters are executable Creator capabilities. The production DB
+    // fence correctly rejects identity-free rows, so the physical proof must
+    // build the same Agency/Creator graph as a real caller.
+    await withPhase3PostgresFixtureAuthority(db1, async (tx) => {
+      await tx.agency.create({ data: { id: common.agencyId, name: `A15 ${common.agencyId}` } });
+      await tx.creatorAccount.create({
+        data: {
+          id: common.creatorId,
+          agencyId: common.agencyId,
+          displayName: `A15 ${common.creatorId}`,
+          status: "READY",
+        },
+      });
+    });
+    fixtureCreated = true;
     await forceActivationReady(db1);
     await credit.registerDurableProviderWaiter({ db: db1, waiterId: w1, ownerInstanceId: "replica-p1", ...common, priority: "critical_write", category: "default", operation: "a15.pg.p1" });
     await credit.registerDurableProviderWaiter({ db: db2, waiterId: w2, ownerInstanceId: "replica-p2", ...common, deviceId: `${common.deviceId}-2`, priority: "critical_write", category: "default", operation: "a15.pg.p2" });
@@ -81,6 +101,7 @@ test("A15 PostgreSQL: ACTIVE fairness orders waiters across two independent Pris
     await credit.cancelDurableProviderWaiter({ db: db2, waiterId: w2, ownerInstanceId: "replica-p2" });
   } finally {
     try { await db1.$executeRawUnsafe(`DELETE FROM "OfProviderRequestGateWaiter" WHERE "waiterId" IN ($1,$2)`, w1, w2); } catch (_) {}
+    if (fixtureCreated) await cleanupPhase3PostgresAgencyFixture(db1, common.agencyId);
     await db1.$disconnect();
     await db2.$disconnect();
   }

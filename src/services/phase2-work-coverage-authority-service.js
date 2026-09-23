@@ -143,7 +143,7 @@ async function requestPhase2CoverageEnumeration({ db = null, agencyId, family, g
   const work = await publishDomainWork({
     db, agencyId: identity.agencyId, workClass: WORK_CLASS.HISTORICAL_ENUMERATION,
     objectType, objectId, parentObjectId: identity.agencyId, partitionKey: identity.agencyId,
-    availableAt: now instanceof Date ? now : new Date(now),
+    fallbackNow: now instanceof Date ? now : new Date(now),
   });
   return { ok: true, requested: true, inFlight: false, coverage, work };
 }

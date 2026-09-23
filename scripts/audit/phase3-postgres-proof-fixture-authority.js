@@ -159,7 +159,6 @@ async function claimPhase3PostgresAgencyDestructiveFixture(db, agencyId) {
     objectId: id,
     partitionKey: id,
     creatorId: null,
-    availableAt: new Date(),
   });
   const claim = await claimDomainWorkBatch({
     db,

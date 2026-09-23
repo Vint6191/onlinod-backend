@@ -100,6 +100,47 @@ function makeDb() {
 
 const base = { agencyId: "agency-a", workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION, objectType: "CustomOrder", objectId: "order-1", partitionKey: "creator-1", creatorId: "creator-1" };
 
+test("A36: immediate PostgreSQL publication is resolved by the database clock", async () => {
+  const calls = [];
+  const db = {
+    async $queryRawUnsafe(sql, ...params) {
+      calls.push({ sql, params });
+      return [{ id: "db-clock-work" }];
+    },
+  };
+  const processClock = new Date("2026-09-23T12:34:56.789Z");
+
+  const immediate = await authority.publishDomainWork({ db, ...base, fallbackNow: processClock });
+  assert.equal(immediate.id, "db-clock-work");
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].sql, /COALESCE\(\$12::timestamptz,clock_timestamp\(\)\)/);
+  assert.match(calls[0].sql, /AT TIME ZONE 'UTC'/);
+  assert.equal(calls[0].params[11], null,
+    "an immediate PostgreSQL write must not serialize the process clock as its due time");
+
+  const scheduledAt = new Date("2026-09-23T13:00:00.000Z");
+  await authority.publishDomainWork({ db, ...base, objectId: "order-scheduled", availableAt: scheduledAt });
+  assert.equal(calls[1].params[11], scheduledAt,
+    "an explicit business deadline must remain explicit at the centralized SQL boundary");
+});
+
+test("A36: invalid explicit publication deadlines fail closed", async () => {
+  let queries = 0;
+  const db = { async $queryRawUnsafe() { queries += 1; return []; } };
+  await assert.rejects(
+    authority.publishDomainWork({ db, ...base, availableAt: "not-a-timestamp" }),
+    (error) => error?.code === "DOMAIN_WORK_AVAILABLE_AT_INVALID",
+  );
+  assert.equal(queries, 0, "invalid deadlines must be rejected before storage mutation");
+});
+
+test("A36: non-PostgreSQL adapters receive the caller fallback clock", async () => {
+  const fx = makeDb();
+  const fallbackNow = new Date("2026-09-23T12:34:56.789Z");
+  const row = await authority.publishDomainWork({ db: fx.db, ...base, objectId: "adapter-immediate", fallbackNow });
+  assert.equal(new Date(row.availableAt).getTime(), fallbackNow.getTime());
+});
+
 test("A1: newer canonical wakeup survives stale revision ACK", async () => {
   const fx = makeDb();
   const t0 = new Date("2026-09-10T00:00:00.000Z");
