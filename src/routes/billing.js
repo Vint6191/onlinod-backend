@@ -131,6 +131,15 @@ router.post("/creators/:creatorId/start", async (req, res) => {
   }
 });
 
+router.post("/creators/:creatorId/refresh-earnings", async (req, res) => {
+  try {
+    const { requestBillingEarningsRefresh } = require("../services/billing-recovery-service");
+    const recovery = await requestBillingEarningsRefresh({ db: require("../prisma"), agencyId: req.auth.agencyId,
+      userId: req.auth.userId, memberId: req.auth.membership.id, creatorId: req.params.creatorId });
+    return res.json({ ok: true, recovery });
+  } catch (err) { return sendError(res, err, "BILLING_EARNINGS_REFRESH_FAILED"); }
+});
+
 router.post("/creators/:creatorId/cancel-renewal", async (req, res) => {
   try {
     const result = await cancelCreatorRenewal({ agencyId: req.auth.agencyId, creatorId: req.params.creatorId, actorUserId: req.auth.userId });

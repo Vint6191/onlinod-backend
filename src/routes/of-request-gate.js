@@ -22,6 +22,14 @@ const acquireSchema = scopeSchema.extend({
   operation: z.string().min(1).max(160),
   source: z.string().max(240).optional().nullable(),
   capability: capabilitySchema,
+  jobLease: z.object({ jobId: z.string().min(1).max(200), leaseToken: z.string().min(1).max(500), leaseRevision: z.number().int().positive() }).strict().optional().nullable(),
+  billingRecovery: z.object({
+    jobId: z.string().min(1).max(200),
+    leaseToken: z.string().min(1).max(500),
+    leaseRevision: z.number().int().positive(),
+    scanFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    scanTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  }).strict().optional().nullable(),
   timeoutMs: z.number().int().min(5_000).max(60_000).optional(),
 });
 const permitSchema = scopeSchema.extend({ permitId: z.string().min(1).max(200), capability: capabilitySchema });

@@ -1,5 +1,15 @@
 "use strict";
 
+const { assertProviderBillingAccess } = require("./billing-execution-access-service");
+
+// R13 cutover is the typed read-job lane. Interactive writes and their
+// reconciliation reads require a separate drain contract before global billing
+// enforcement can be activated. Never block their post-commit recovery here.
+function readJobBillingAdmission(entry) {
+  return entry.jobLease || entry.billingRecovery
+    ? assertProviderBillingAccess({ db: prisma, ...entry }) : Promise.resolve(null);
+}
+
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
@@ -449,6 +459,21 @@ function pump() {
         permit.expiryTimer = setTimeout(() => expirePermit(permit), PERMIT_TTL_MS);
         permit.expiryTimer.unref?.();
       }
+      // Admission can wait behind another replica or a long queue. Re-read
+      // membership and billing after the durable grant; the entry-time check
+      // and the device telemetry cache cannot authorize a later physical start.
+      try {
+        await requireGateAccess(entry);
+        const billing = await readJobBillingAdmission(entry);
+        if (billing?.validUntil) permit.expiresAt = Math.min(permit.expiresAt, billing.validUntil.getTime());
+      } catch (error) {
+        clearTimeout(permit.expiryTimer);
+        if (permit.durable) await cancelDurableProviderPermit({
+          db: prisma, permitId: permit.id, agencyId: entry.agencyId, creatorId: entry.creatorId,
+          deviceId: entry.deviceId, capability: entry.capability,
+        }).catch(() => null);
+        throw error;
+      }
       coordinator.activePermit = permit;
       coordinator.lastGrantedAt = permit.grantedAt;
       coordinator.lastDeviceId = entry.deviceId;
@@ -505,8 +530,12 @@ async function acquireOfRequestSlot(input) {
   const capability = ["security_probe", "read", "write"].includes(input.capability) ? input.capability : "read";
   const operation = clean(input.operation, 160) || "unknown";
   const source = clean(input.source, 240) || null;
+  const billingContext = { userId, member: input.member, billingRecovery: input.billingRecovery || null, jobLease: input.jobLease || null };
+  await readJobBillingAdmission({ ...billingContext, agencyId: access.agencyId, creatorId,
+    deviceId: access.deviceId, capability, operation });
   return new Promise((resolve, reject) => {
     const entry = {
+      ...billingContext,
       id: entryId,
       agencyId: access.agencyId,
       creatorId,

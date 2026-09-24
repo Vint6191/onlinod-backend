@@ -61,7 +61,7 @@ test("reuse of a revoked device-bound refresh token is contained to that device"
     refreshSession: {
       findUnique: async () => ({
         id: "s-a1", userId: "user-1", agencyId: "agency-1", deviceId: "device-a",
-        revokedAt: new Date("2026-08-24T10:00:00Z"), expiresAt: new Date("2026-09-24T10:00:00Z"),
+        revokedAt: new Date(Date.now() - 86400000), expiresAt: new Date(Date.now() + 86400000),
         user: { id: "user-1", disabledAt: null },
       }),
       updateMany: async ({ where, data }) => { updates.push({ where, data }); return { count: 1 }; },
@@ -87,7 +87,7 @@ test("legacy unbound refresh-token reuse retains account-wide fallback", async (
     refreshSession: {
       findUnique: async () => ({
         id: "legacy", userId: "user-1", agencyId: "agency-1", deviceId: null,
-        revokedAt: new Date("2026-08-24T10:00:00Z"), expiresAt: new Date("2026-09-24T10:00:00Z"),
+        revokedAt: new Date(Date.now() - 86400000), expiresAt: new Date(Date.now() + 86400000),
         user: { id: "user-1", disabledAt: null },
       }),
       updateMany: async ({ where, data }) => { updates.push({ where, data }); return { count: 3 }; },

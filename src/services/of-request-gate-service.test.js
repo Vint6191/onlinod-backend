@@ -4,6 +4,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 function loadService(fixture) {
+  require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(fixture.db);
   const prismaModule = require.resolve("../prisma");
   require.cache[prismaModule] = {
     id: prismaModule,
@@ -156,7 +157,7 @@ test("gate rechecks member creator access while caching only device capability v
     userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-1", creatorId: "creator-1", permitId: permitTwo.permitId, capability: "read",
   });
 
-  assert.deepEqual(accessCalls, { device: 1, creator: 4, binding: 1 });
+  assert.deepEqual(accessCalls, { device: 1, creator: 6, binding: 1 });
 });
 
 test("gate rejects an in-agency creator that the current member is not assigned", async () => {

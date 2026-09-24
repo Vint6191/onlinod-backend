@@ -9,6 +9,7 @@ function tokenHash(value) {
 }
 
 function loadService(fixture) {
+  require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(fixture.db);
   fixture.db.jobInstance = fixture.db.jobInstance || {};
   if (typeof fixture.db.jobInstance.findMany !== "function") fixture.db.jobInstance.findMany = async () => [];
   if (typeof fixture.db.$transaction !== "function") fixture.db.$transaction = async (work) => work(fixture.db);
@@ -516,8 +517,9 @@ test("discovery-only claim fences the shared dialog job key to the discovery sen
       },
     ],
   };
-  assert.deepEqual(selectedWhere.AND, [expectedConstraint]);
-  assert.deepEqual(fencedWhere.AND, [expectedConstraint]);
+  const billingConstraint = { OR: [{ creatorId: { in: ["creator-1"] } }] };
+  assert.deepEqual(selectedWhere.AND, [billingConstraint, expectedConstraint]);
+  assert.deepEqual(fencedWhere.AND, [billingConstraint, expectedConstraint]);
   assert.deepEqual(selectedWhere.jobKey.in, ["fetch_earnings", "dialog_intelligence_scan"]);
   assert.deepEqual(fencedWhere.jobKey.in, ["fetch_earnings", "dialog_intelligence_scan"]);
 });

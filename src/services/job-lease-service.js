@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { isOwner, normalizeAssignedCreators } = require("./team-access-control");
 const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./execution-access-fence-service");
+const { readBillingExecutionAccess, billingJobClaimWhere, assertJobBillingAccess, BillingExecutionAccessError } = require("./billing-execution-access-service");
 const { applyJobChunk, applyJobResult, recordJobFailure } = require("./job-result-service");
 const { filterClaimableDesktopJobKeys } = require("./job-catalog");
 const { completeDialogJobFenced } = require("./dialog-job-completion-fence");
@@ -289,8 +290,9 @@ function dialogDiscoveryClaimConstraint(enabled) {
   };
 }
 
-function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly, excludedJobIds = [], fanRefreshBlockedCreatorIds = [], fanRefreshGlobalBlocked = false }) {
+function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly, excludedJobIds = [], fanRefreshBlockedCreatorIds = [], fanRefreshGlobalBlocked = false, billingConstraint = null }) {
   const constraints = [];
+  if (billingConstraint) constraints.push(billingConstraint);
   const discoveryConstraint = dialogDiscoveryClaimConstraint(dialogDiscoveryOnly);
   if (discoveryConstraint) constraints.push(discoveryConstraint);
   if (fanRefreshGlobalBlocked) constraints.push({ jobKey: { not: "fan_data_point_refresh" } });
@@ -578,6 +580,10 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   // preventing parked leases without blocking useful work on another device.
   const eligibleCreatorIds = creatorIds.filter((creatorId) => !explicitlyExcluded.has(creatorId));
   if (!eligibleCreatorIds.length) return { job: null, reason: "creators-busy" };
+  const billingConstraint = billingJobClaimWhere({
+    access: await readBillingExecutionAccess({ db: prisma, agencyId: device.agencyId, creatorIds: eligibleCreatorIds }),
+    recoveryCapable: capabilities?.billingRecoveryLeaseV1 === true,
+  });
   const capacityBlockedIds = [];
   const fanRefreshBlockedCreatorIds = [];
   let fanRefreshGlobalBlocked = false;
@@ -590,6 +596,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       excludedJobIds: capacityBlockedIds,
       fanRefreshBlockedCreatorIds,
       fanRefreshGlobalBlocked,
+      billingConstraint,
     });
     const candidate = await prisma.jobInstance.findFirst({
       where: candidateWhere,
@@ -620,6 +627,11 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       ...(reuseContinuation ? { continuation: reuseContinuation } : {}),
     };
     const claimWork = async (db) => {
+      await assertExecutionAccessFence({ db, userId, agencyId: device.agencyId, memberId: member.id,
+        accessEpoch: Number(member.accessEpoch || 1), creatorId: candidate.creatorId, lock: true });
+      const billing = await assertJobBillingAccess({ db, job: candidate, recoveryCapable: capabilities?.billingRecoveryLeaseV1 === true });
+      claimData.claimedAt = billing.now;
+      claimData.leaseUntil = new Date(billing.now.getTime() + leaseDuration(leaseMs));
       if (String(candidate.jobKey || "") === "fetch_campaigns") {
         await enterCampaignClaimGeneration({ db });
         if (campaignDirectoryDiscoveryJob(candidate.params) && !(await campaignDirectoryDiscoveryClaimAvailable(db, candidate.params))) {
@@ -641,6 +653,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
             excludedJobIds: capacityBlockedIds,
             fanRefreshBlockedCreatorIds,
             fanRefreshGlobalBlocked,
+            billingConstraint,
           }),
         },
         data: claimData,
@@ -653,10 +666,13 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     };
     let claimed = null;
     try {
-      claimed = ["fetch_campaigns", "fan_data_point_refresh"].includes(String(candidate.jobKey || ""))
-        ? await prisma.$transaction(claimWork, JOB_CHUNK_TRANSACTION_OPTIONS)
-        : await claimWork(prisma);
+      claimed = await prisma.$transaction(claimWork, JOB_CHUNK_TRANSACTION_OPTIONS);
     } catch (error) {
+      if (error instanceof BillingExecutionAccessError) {
+        if (error.status >= 500) throw error;
+        capacityBlockedIds.push(candidate.id);
+        continue;
+      }
       if (String(candidate.jobKey || "") === "fetch_campaigns"
           && /CAMPAIGN_CLAIM_GENERATION_RETIRED/.test(String(error?.message || ""))) {
         continue;
