@@ -309,24 +309,13 @@ async function sweepExpiredProgrammaticWriteLeases({ db = prisma, agencyId, crea
   const creatorWhere = creatorId ? { creatorId } : (scopedCreatorIds ? { creatorId: { in: scopedCreatorIds.length ? scopedCreatorIds : ["__none__"] } } : {});
   const scopeWhere = { ...(agencyId ? { agencyId } : {}), originKind: { not: "AUTOMATION" }, ...creatorWhere };
   let changed = 0;
-  const scanAll = async ({ where, select }, visit) => {
-    let afterId = null;
-    for (;;) {
-      const page = await db.automationDelivery.findMany({
-        where: { ...where, ...(afterId ? { id: { gt: afterId } } : {}) },
-        select,
-        orderBy: { id: "asc" },
-        take: 500,
-      });
-      if (!page.length) return;
-      for (const row of page) await visit(row);
-      afterId = String(page[page.length - 1]?.id || "");
-      if (!afterId || page.length < 500) return;
-    }
+  const scanPage = async ({ where, select }, visit) => {
+    const page = await db.automationDelivery.findMany({ where, select, orderBy: [{ claimUntil: "asc" }, { id: "asc" }], take: 100 });
+    for (const row of page) await visit(row);
   };
   const closeIfBoundExpired = async (row, where) => {
     const result = object(row.result);
-    const startedAt = new Date(result.reconciliationStartedAt || row.writeCommitAt || now);
+    const startedAt = new Date(row.writeCommitAt || result.reconciliationStartedAt || row.updatedAt || now);
     if (!Number.isFinite(startedAt.getTime()) || now.getTime() - startedAt.getTime() < MAX_RECONCILIATION_WAIT_MS) return false;
     const closed = await db.automationDelivery.updateMany({
       where,
@@ -343,7 +332,7 @@ async function sweepExpiredProgrammaticWriteLeases({ db = prisma, agencyId, crea
     changed += closed.count;
     return Boolean(closed.count);
   };
-  await scanAll({
+  await scanPage({
     where: {
       ...scopeWhere,
       status: { in: ["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"] },
@@ -371,9 +360,10 @@ async function sweepExpiredProgrammaticWriteLeases({ db = prisma, agencyId, crea
   // A reconciler may disappear and leave a deliberately unleased RECONCILE_REQUIRED
   // row. It still owns the global creator write lane, so maintenance must eventually
   // close it no-retry once the original bounded verification window expires.
-  await scanAll({
-    where: { ...scopeWhere, status: "RECONCILE_REQUIRED", claimUntil: null },
-    select: { id: true, status: true, leaseRevision: true, result: true, failureCode: true, writeCommitAt: true },
+  await scanPage({
+    where: { ...scopeWhere, status: "RECONCILE_REQUIRED", claimUntil: null,
+      OR: [{ writeCommitAt: { lte: new Date(now.getTime() - MAX_RECONCILIATION_WAIT_MS) } }, { writeCommitAt: null, updatedAt: { lte: new Date(now.getTime() - MAX_RECONCILIATION_WAIT_MS) } }] },
+    select: { id: true, status: true, leaseRevision: true, result: true, failureCode: true, writeCommitAt: true, updatedAt: true },
   }, async (row) => {
     await closeIfBoundExpired(row, { id: row.id, status: "RECONCILE_REQUIRED", leaseRevision: row.leaseRevision, claimUntil: null });
   });
@@ -557,7 +547,7 @@ async function abandonMassLogicalIntentPrecommit(input) {
     const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId });
-    await lockAutomationWriteCommitFence({ db: tx, agencyId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId });
     await assertDevice({ db: tx, agencyId, userId, deviceId });
     await assertLiveActor({ db: tx, agencyId, userId, memberId, accessEpoch, creatorId, permissionKey: "chats.mass_message" });
     const delivery = await tx.automationDelivery.findFirst({ where: { agencyId, creatorId, actionType: "MASS_QUEUE_CREATE", targetId: dispatchId, intentAcknowledgedAt: null } });
@@ -858,7 +848,7 @@ async function readBoundNativeMassCommitGrant(input) {
     // commit fence. Without this serialization two simultaneous duplicate
     // preflights could both read the same result JSON and last-write-wins one
     // another's token hash, retroactively invalidating an already-issued grant.
-    await lockAutomationWriteCommitFence({ db: tx, agencyId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId });
     const delivery = expectedWriteId
       ? await tx.automationDelivery.findUnique({ where: { id: expectedWriteId } })
       : await tx.automationDelivery.findUnique({ where: { idempotencyKey } });
@@ -925,7 +915,7 @@ async function attachCustomManualSettlementCapability(input) {
     throw new ProgrammaticOfWriteAuthorityError("CUSTOM_MANUAL_SETTLEMENT_BINDING_INVALID", "Custom manual settlement binding is incomplete", 500);
   }
   return prisma.$transaction(async (tx) => {
-    await lockAutomationWriteCommitFence({ db: tx, agencyId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId });
     const delivery = writeId
       ? await tx.automationDelivery.findUnique({ where: { id: writeId } })
       : await tx.automationDelivery.findUnique({ where: { idempotencyKey } });
@@ -975,7 +965,7 @@ async function settleNativeMassWriteProvenNoEffect(input) {
   return prisma.$transaction(async (tx) => {
     const initial = await tx.automationDelivery.findUnique({ where: { id: writeId } });
     if (!initial) throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_WRITE_NOT_FOUND", "Native MASS write authority was not found", 404);
-    await lockAutomationWriteCommitFence({ db: tx, agencyId: initial.agencyId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId: initial.agencyId, creatorId: initial.creatorId });
     const delivery = await tx.automationDelivery.findUnique({ where: { id: writeId } });
     const result = object(delivery?.result);
     const hashes = (Array.isArray(result.nativeSettlementTokenHashes) ? result.nativeSettlementTokenHashes : []).map((value) => clean(value, 200)).filter(Boolean);
@@ -1074,7 +1064,7 @@ async function settleNativeMassWriteExact(input, db) {
   if (!agencyId || !userId || !creatorId || !deviceId || !writeId || !requestKey || !queueId || !Number.isInteger(revision) || revision < 1) {
     throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_SETTLEMENT_INVALID", "Exact native MASS write/queue/request proof is required", 400);
   }
-  await lockAutomationWriteCommitFence({ db, agencyId });
+  await lockAutomationWriteCommitFence({ db, agencyId, creatorId });
   const delivery = await db.automationDelivery.findUnique({ where: { id: writeId } });
   if (!delivery || delivery.agencyId !== agencyId || delivery.creatorId !== creatorId) {
     throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_WRITE_NOT_FOUND", "Native MASS write authority was not found", 404);
@@ -1468,7 +1458,7 @@ async function prepareProgrammaticWrite(input) {
   return prisma.$transaction(async (tx) => {
     await lockBillingWriteAdmission({ db: tx, agencyId: input.agencyId });
     let delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
-    await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
     delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
     if (delivery.status === "COMMITTING" && delivery.writeCommitAt) {
       let settlementToken = null;

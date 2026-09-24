@@ -38,7 +38,7 @@ function canAccessCreator(member, creatorId) {
   return assignedCreatorIds(member).includes(String(creatorId));
 }
 
-async function requireCreatorAccess({ agencyId, member, creatorId, db = null }) {
+async function requireMembershipCreatorAccess({ agencyId, member, creatorId, db = null }) {
   const client = db || require("../prisma");
   const memberId = String(member?.id || "").trim();
   const userId = String(member?.userId || "").trim();
@@ -138,7 +138,7 @@ function automationCreatorParamRequired() {
   };
 }
 
-async function allowedCreatorScope({ agencyId, member, requestedCreatorId = null, db = null }) {
+async function membershipCreatorScope({ agencyId, member, requestedCreatorId = null, db = null }) {
   if (requestedCreatorId) {
     const creator = await requireCreatorAccess({ agencyId, member, creatorId: requestedCreatorId, db });
     return { broad: false, creatorIds: [creator.id], creator };
@@ -161,6 +161,16 @@ async function allowedCreatorScope({ agencyId, member, requestedCreatorId = null
   }
   const live = new Set(rows.map((row) => String(row.id)));
   return { broad: false, creatorIds: ids.filter((id) => live.has(String(id))), creator: null };
+}
+
+async function requireCreatorAccess(input) {
+  const creator = await requireMembershipCreatorAccess(input);
+  await require("../services/product-billing-context-service").assertProductBilling({ db: input.db || require("../prisma"), agencyId: input.agencyId, creatorId: creator.id });
+  return creator;
+}
+async function allowedCreatorScope(input) {
+  const scope = await membershipCreatorScope(input);
+  return require("../services/product-billing-context-service").productBillingScope({ db: input.db || require("../prisma"), agencyId: input.agencyId, scope });
 }
 
 module.exports = {

@@ -540,7 +540,7 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
       agencyId, actorMember: member, creatorId: current.creatorId, permissionKey: null, db: tx,
     });
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: current.creatorId });
-    await lockAutomationWriteCommitFence({ db: tx, agencyId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId: current.creatorId });
     // The advisory fence linearizes business mutations with the moment a physical
     // Custom send crosses Audit17 COMMITTING. Once a permit exists the actual OF
     // POST is outside the database transaction, so cancellation/price/payment/etc.

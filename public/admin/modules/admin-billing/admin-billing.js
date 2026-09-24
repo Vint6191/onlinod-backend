@@ -15,7 +15,15 @@
   const esc = (v) => R().escapeHtml(v);
   const money = (c) => "$" + (Number(c || 0) / 100).toFixed(2);
 
-  const local = { view: "overview", agencyId: null, tiers: null };
+  const local = { view: "overview", agencyId: null, tiers: null, overviewAfter: null, modelsAfter: null };
+
+  function pageControls(page, after) {
+    return `<div class="adm-bulk-bar"><button class="adm-btn bl-page-first" ${after ? "" : "disabled"}>First page</button><button class="adm-btn bl-page-next" ${page?.nextCursor ? "" : "disabled"}>Next page</button><span>Up to 100 rows per page</span></div>`;
+  }
+  function bindPage(root, page, go) {
+    root.querySelector(".bl-page-first")?.addEventListener("click", () => go(null));
+    root.querySelector(".bl-page-next")?.addEventListener("click", () => go(page.nextCursor));
+  }
 
   async function render(main) {
     if (local.view === "agency" && local.agencyId) return renderAgency(main, local.agencyId);
@@ -28,7 +36,7 @@
     window.OnlinodAdminCommercialPolicy?.render(main.querySelector("#blCommercialPolicy"));
     const overview = main.querySelector("#blOverview");
     overview.innerHTML = `<div class="adm-page"><div class="adm-loading">loading billing…</div></div>`;
-    const r = await A().billingOverview();
+    const r = await A().billingOverview(local.overviewAfter);
     if (!r || !r.ok) { overview.innerHTML = `<div class="adm-page"><div class="adm-error">failed to load billing</div></div>`; return; }
 
     const m = r.mrr || {};
@@ -63,18 +71,20 @@
             <tbody>${rows || `<tr><td colspan="6" class="adm-muted">no agencies</td></tr>`}</tbody>
           </table>
         </div>
-        <div class="adm-muted">MRR counts only billable statuses (ACTIVE / PAST_DUE / GRACE). Trial = potential, not yet charged.</div>
+        ${pageControls(r.page, local.overviewAfter)}
+        <div class="adm-muted">MRR counts active paid entitlements. Trial potential uses current configured prices.</div>
       </div>`;
 
+    bindPage(overview, r.page, after => { local.overviewAfter = after; return renderOverview(main); });
     overview.querySelectorAll("tr[data-agency]").forEach((tr) => tr.addEventListener("click", () => {
-      local.view = "agency"; local.agencyId = tr.dataset.agency; render(main);
+      local.view = "agency"; local.agencyId = tr.dataset.agency; local.modelsAfter = null; render(main);
     }));
   }
 
   // ── AGENCY DETAIL (per-model editor) ────────────────────────
   async function renderAgency(main, agencyId) {
     main.innerHTML = `<div class="adm-page"><div class="adm-loading">loading agency billing…</div></div>`;
-    const r = await A().billingAgency(agencyId);
+    const r = await A().billingAgency(agencyId, local.modelsAfter);
     if (!r || !r.ok) { main.innerHTML = `<div class="adm-page"><div class="adm-error">failed</div></div>`; return; }
     local.tiers = r.tiers || {};
 
@@ -83,7 +93,7 @@
 
     const priceSource = (component, value) => `<select class="bl-${component}-source"><option value="CATALOG" ${value !== "OVERRIDE" ? "selected" : ""}>Global price</option><option value="OVERRIDE" ${value === "OVERRIDE" ? "selected" : ""}>Individual price</option></select>`;
     const rows = (r.models || []).map((m) => `
-      <tr data-creator="${esc(m.creatorId)}" data-pricing-revision="${Number(m.pricingRevision || 0)}" class="${m.billingExcluded ? "adm-row-excluded" : ""}">
+      <tr data-creator="${esc(m.creatorId)}" data-pricing-revision="${Number(m.pricingRevision || 0)}" data-configured-line="${Number(m.configuredLineCents || 0)}" class="${m.billingExcluded ? "adm-row-excluded" : ""}">
         <td>
           <label><input class="bl-select" type="checkbox" ${m.billingExcluded ? "disabled" : ""}> <b>${esc(m.displayName || m.username || m.creatorId.slice(-8))}</b></label>
           <div class="adm-muted">@${esc(m.username || "—")} · ${esc(m.creatorStatus || "")}</div>
@@ -118,8 +128,8 @@
         </div>
 
         <div class="adm-kpi-row">
-          <div class="adm-kpi adm-kpi-strong"><div class="adm-kpi-label">Configured monthly</div><div class="adm-kpi-val" id="blTotal">${money((r.models || []).reduce((sum, model) => sum + model.configuredLineCents, 0))}</div></div>
-          <div class="adm-kpi"><div class="adm-kpi-label">Models</div><div class="adm-kpi-val">${(r.models || []).length}</div></div>
+          <div class="adm-kpi adm-kpi-strong"><div class="adm-kpi-label">Configured monthly · all models</div><div class="adm-kpi-val" id="blTotal" data-configured-total="${Number(r.configuredMonthlyCents || 0)}">${money(r.configuredMonthlyCents)}</div></div>
+          <div class="adm-kpi"><div class="adm-kpi-label">Models</div><div class="adm-kpi-val">${r.modelsTotal}</div></div>
           <div class="adm-kpi"><div class="adm-kpi-label">Period end</div><div class="adm-kpi-val" style="font-size:14px">${r.agency.currentPeriodEnd ? esc(String(r.agency.currentPeriodEnd).slice(0, 10)) : "—"}</div></div>
         </div>
 
@@ -142,9 +152,11 @@
             <thead><tr><th>Model</th><th>Tier</th><th>Base $</th><th>AI chatter</th><th>Outreach</th><th>Excl</th><th>Line</th><th></th></tr></thead>
             <tbody>${rows || `<tr><td colspan="8" class="adm-muted">no models connected</td></tr>`}</tbody>
           </table>
+          ${pageControls(r.page, local.modelsAfter)}
         </div>
       </div>`;
 
+    bindPage(main, r.page, after => { local.modelsAfter = after; return renderAgency(main, agencyId); });
     main.querySelector("#blBack").addEventListener("click", () => { local.view = "overview"; render(main); });
 
     // tier select auto-fills price from catalog (except CUSTOM)
@@ -259,8 +271,8 @@
   function recalcLine(tr) { tr.querySelector(".bl-line").textContent = money(lineFromRow(tr)); }
   function recalcTotal(main) {
     let t = 0;
-    main.querySelectorAll("tr[data-creator]").forEach((tr) => { t += lineFromRow(tr); });
-    const el = main.querySelector("#blTotal"); if (el) el.textContent = money(t);
+    main.querySelectorAll("tr[data-creator]").forEach((tr) => { t += lineFromRow(tr) - Number(tr.dataset.configuredLine || 0); });
+    const el = main.querySelector("#blTotal"); if (el) el.textContent = money(Number(el.dataset.configuredTotal || 0) + t);
   }
 
   async function saveLine(main, tr) {

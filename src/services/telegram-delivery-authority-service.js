@@ -975,8 +975,12 @@ async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = ne
   const scope = await allowedCreatorScope({ agencyId, member, db: client });
   const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 25)));
   const staleCommitBefore = new Date(now.getTime() - CLAIM_MS);
-  await client.telegramDeliveryIntent.updateMany({
+  const staleCommits = await client.telegramDeliveryIntent.findMany({
     where: { agencyId, ...scopeWhere(scope), state: "COMMITTING", commitStartedAt: { lte: staleCommitBefore } },
+    select: { id: true }, orderBy: [{ commitStartedAt: "asc" }, { id: "asc" }], take: 100,
+  });
+  if (staleCommits.length) await client.telegramDeliveryIntent.updateMany({
+    where: { agencyId, id: { in: staleCommits.map(row => row.id) }, state: "COMMITTING", commitStartedAt: { lte: staleCommitBefore } },
     data: { state: "RECONCILE_REQUIRED", outcomeReason: "COMMIT_PROCESS_LOST" },
   });
 
@@ -1011,7 +1015,7 @@ async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = ne
     items,
     scannedRows,
     scanBudget,
-    scanComplete: Number(rows?.length || 0) < scanBudget || scannedRows < scanBudget,
+    scanComplete: Number(rows?.length || 0) === 0,
     serverNow: now.toISOString(),
   };
 }

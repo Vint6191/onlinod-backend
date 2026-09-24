@@ -52,7 +52,7 @@ async function loadAgencyMember(req, agencyIdValue) {
 }
 
 
-function analyticsCreatorScope(member) {
+function membershipanalyticsCreatorScope(member) {
   const isOwner = String(member?.role || "").toUpperCase() === "OWNER" || String(member?.roleKey || "").toLowerCase() === "owner";
   if (isOwner) return null;
   const raw = member?.assignedCreators;
@@ -84,7 +84,7 @@ async function requireTeamAnalyticsViewer(req, res) {
     return null;
   }
   const includeMoney = await canUseTeamCapability({ member, key: TEAM_CAPABILITIES.VIEW_ATTRIBUTION });
-  const allowedCreatorIds = analyticsCreatorScope(member);
+  const allowedCreatorIds = await analyticsCreatorScope(member);
   req.agencyMember = member;
   return { agencyId: id, member, includeMoney, allowedCreatorIds };
 }
@@ -118,7 +118,13 @@ async function requirePpvClaimsManager(req, res) {
   }
 
   req.agencyMember = member;
-  return { agencyId: id, member, canViewAudit, allowedCreatorIds: analyticsCreatorScope(member) };
+  return { agencyId: id, member, canViewAudit, allowedCreatorIds: await analyticsCreatorScope(member) };
+}
+
+async function analyticsCreatorScope(member) {
+  const ids = membershipanalyticsCreatorScope(member);
+  const scope = await require("../services/product-billing-context-service").productBillingScope({ db: prisma, agencyId: member.agencyId, scope: { broad: ids === null, creatorIds: ids } });
+  return scope.broad ? null : scope.creatorIds;
 }
 
 function ppvClaimForViewer(row, canViewAudit) {

@@ -28,7 +28,7 @@ const {
 
 const router = express.Router();
 
-function memberCreatorScope(member) {
+function membershipmemberCreatorScope(member) {
   const isOwner = String(member?.role || "").toUpperCase() === "OWNER" || String(member?.roleKey || "").toLowerCase() === "owner";
   if (isOwner) return null;
   const raw = member?.assignedCreators;
@@ -40,6 +40,12 @@ function memberCreatorScope(member) {
     return Array.from(new Set(ids.map(String).map((id) => id.trim()).filter(Boolean)));
   }
   return [];
+}
+
+async function memberCreatorScope(member) {
+  const ids = membershipmemberCreatorScope(member);
+  const scope = await require("../services/product-billing-context-service").productBillingScope({ db: prisma, agencyId: member.agencyId, scope: { broad: ids === null, creatorIds: ids } });
+  return scope.broad ? null : scope.creatorIds;
 }
 
 function creatorScopeWhere(allowedCreatorIds) {
@@ -144,7 +150,7 @@ async function claimsContext(req, actor) {
   const canViewClaims = viewAttribution || claimOwn || releaseOwn || resolveAttribution || viewAudit;
   if (!canViewClaims) return { forbidden: true, capabilities };
 
-  const allowedCreatorIds = memberCreatorScope(actor);
+  const allowedCreatorIds = await memberCreatorScope(actor);
   const canResolveOthers = resolveAttribution || overrideAttribution;
   const memberWhere = canResolveOthers
     ? { agencyId: req.auth.agencyId, deletedAt: null }
@@ -260,7 +266,7 @@ router.post("/override", async (req, res) => {
     // eligible tip rows. Agency-wide dispute resolution stays
     // owner/manager-only through manager_override and PPV Claims.
     const canOverrideAttribution = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.OVERRIDE_ATTRIBUTION });
-    const allowedCreatorIds = memberCreatorScope(actor);
+    const allowedCreatorIds = await memberCreatorScope(actor);
     if (input.action === "manager_override" && !canOverrideAttribution) {
       return res.status(403).json({
         ok: false,
@@ -341,7 +347,7 @@ router.get("/disputable", async (req, res) => {
       canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_AUDIT }),
       canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.OVERRIDE_ATTRIBUTION }),
     ]);
-    const allowedCreatorIds = memberCreatorScope(actor);
+    const allowedCreatorIds = await memberCreatorScope(actor);
     if (!senior && !canClaimOwn && !canReleaseOwn) {
       return res.status(403).json({ ok: false, code: "CLAIMS_VIEW_FORBIDDEN", error: "Claims permission is required" });
     }
@@ -398,7 +404,7 @@ router.get("/audit", async (req, res) => {
       return res.status(403).json({ ok: false, code: "NOT_AGENCY_MEMBER", error: "No agency membership" });
     }
     const senior = await canUseTeamCapability({ member: actor, key: TEAM_CAPABILITIES.VIEW_AUDIT });
-    const allowedCreatorIds = memberCreatorScope(actor);
+    const allowedCreatorIds = await memberCreatorScope(actor);
 
     if (eventHash) {
       const tipRow = await getTipClaimByHash({ agencyId: req.auth.agencyId, eventHash, allowedCreatorIds });

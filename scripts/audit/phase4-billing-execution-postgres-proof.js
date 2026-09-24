@@ -180,7 +180,7 @@ async function main() {
       for (const table of ["CreatorAccount", "CreatorBillingEntitlement", "AgencySubscription"]) await db.$executeRawUnsafe(`ANALYZE "${table}"`);
       await db.$executeRawUnsafe("SET enable_seqscan=off");
       const plan = await db.$queryRawUnsafe(`EXPLAIN (FORMAT JSON) ${access.ACCESS_SQL}`, "a", ["paid"]);
-      const text = JSON.stringify(plan); assert.match(text, /CreatorAccount_(pkey|agencyId_id_key)/); assert.match(text, /CreatorBillingEntitlement_creatorId_key/); assert.match(text, /AgencySubscription_agency_created_id_idx/);
+      const text = JSON.stringify(plan); assert.match(text, /CreatorAccount_(pkey|agencyId_id_key|live_catalog_idx)/); assert.match(text, /CreatorBillingEntitlement_creatorId_key/); assert.match(text, /AgencySubscription_agency_created_id_idx/);
       await db.$executeRawUnsafe("RESET enable_seqscan");
     });
     await check("billing validity uses UTC even when the database session uses another time zone", async () => {
@@ -189,6 +189,7 @@ async function main() {
       await db.$executeRawUnsafe("SET TIME ZONE 'UTC'");
     });
     await require("../test-support/billing-write-postgres-cases")({ db, check, member });
+    await require("../test-support/product-billing-postgres-cases")({ db, check, member });
     console.log(JSON.stringify({ ok: true, passed: cases.length, cases, engine: "PGlite with Prisma 5.22", nativeConcurrency: false, productionScale: false }));
   } finally { gate?._test.reset(); await db.$disconnect(); await server.stop(); await engine.close(); }
 }

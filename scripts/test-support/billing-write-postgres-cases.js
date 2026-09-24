@@ -131,7 +131,13 @@ module.exports = async function billingWriteCases({ db, check, member }) {
     assert.deepEqual(await admission.selectBillableTelegramWorkIds({ db, agencyId: "b", scope: { broad: true }, take: 25 }), []);
     await hold(true); assert.deepEqual(await list({ broad: true }), []); await hold(false);
     await db.agency.update({ where: { id: "a" }, data: { trialEndsAt: future() } });
-    assert.equal((await list({ broad: true })).length, 25);
+    const page = await list({ broad: true });
+    assert.equal(page.length, 3, "one candidate per creator avoids queue monopolization");
+    const unpaid = page.find(id => id.startsWith("tg-unpaid-"));
+    assert.ok(unpaid);
+    await db.telegramDeliveryIntent.update({ where: { id: unpaid }, data: { state: "CLAIMED", claimUntil: future() } });
+    const next = await list({ broad: true });
+    assert.equal(next.length, 3); assert.equal(next.includes(unpaid), false, "a live claim cannot hide the next queued intent");
     await db.agency.update({ where: { id: "a" }, data: { trialEndsAt: past() } });
   });
 };

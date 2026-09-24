@@ -25,6 +25,8 @@ const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { effectiveBillingState, liveEntitlementEnd, activeCore, scopedEntitlement } = require("../services/billing-state-service");
 const { publicEntitlement } = require("../services/billing-entitlement-service");
 
+const { billingPage, readAgencyBillingTotals, readGlobalBillingTotals } = require("../services/admin-billing-read-service");
+
 const router = require("./admin-router").createAdminRouter();
 router.use(adminRequired);
 router.use(require("../middleware/admin-read-boundary").adminReadBoundary);
@@ -76,50 +78,26 @@ router.get("/overview", async (req, res) => {
   try {
     const policy = await readCommercialPolicy({ db: prisma });
     const now = await dbAuthorityNow({ db: prisma });
-    // Pull every non-deleted agency with its latest subscription + creators' billing.
+    const page = billingPage(req.query);
     const agencies = await prisma.agency.findMany({
-      where: { deletedAt: null },
-      include: {
-        subscriptions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 },
-        creators: {
-          where: { deletedAt: null },
-          include: { billingProfile: true, billingEntitlement: true },
-        },
-      },
-      orderBy: { createdAt: "desc" },
+      where: { deletedAt: null, ...(page.after ? { id: { gt: page.after } } : {}) },
+      include: { subscriptions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 } },
+      orderBy: { id: "asc" }, take: page.limit + 1,
     });
+    const hasMore = agencies.length > page.limit;
+    if (hasMore) agencies.pop();
+    const totals = await readAgencyBillingTotals({ db: prisma, agencyIds: agencies.map(a => a.id), policy, now });
 
-    let mrrCents = 0;
-    let billedModels = 0;
-    let trialMrrCents = 0; // potential MRR sitting in trial (not yet billed)
     const rows = [];
 
     for (const a of agencies) {
       const sub = a.subscriptions[0] || null;
-      const activeUntil = liveEntitlementEnd(a.creators, a.id, now);
+      const total = totals.get(a.id);
+      const activeUntil = total.activeUntil;
       const { status } = effectiveBillingState({ agency: a, subscription: sub, activeUntil, now });
       const billable = BILLABLE_STATUSES.has(status) && sub?.billingMode !== "FREE_INTERNAL";
-
-      let agencyCents = 0;
-      let modelsCounted = 0;
-      const addons = { aiChatter: 0, outreach: 0 };
-
-      for (const c of a.creators) {
-        const bp = c.billingProfile;
-        const ent = scopedEntitlement(c, a.id);
-        const line = activePaidLineCents(ent, now);
-        if (line > 0) {
-          agencyCents += line;
-          modelsCounted += 1;
-          if (ent?.aiChatterValidUntil && new Date(ent.aiChatterValidUntil) > now) addons.aiChatter += Number(ent.aiChatterPriceCents || 0);
-          if (ent?.outreachValidUntil && new Date(ent.outreachValidUntil) > now) addons.outreach += Number(ent.outreachPriceCents || 0);
-        }
-      }
-
-      if (billable) { mrrCents += agencyCents; billedModels += modelsCounted; }
-      else if (status === "TRIAL") {
-        trialMrrCents += a.creators.reduce((sum, creator) => sum + configuredLineCents(creator.billingProfile, policy), 0);
-      }
+      const agencyCents = total.monthlyCents, modelsCounted = total.modelsBilled;
+      const addons = { aiChatter: total.ai, outreach: total.outreach };
 
       rows.push({
         agencyId: a.id,
@@ -127,7 +105,7 @@ router.get("/overview", async (req, res) => {
         plan: a.plan,
         status,
         billable,
-        modelsTotal: a.creators.length,
+        modelsTotal: total.modelsTotal,
         modelsBilled: modelsCounted,
         monthlyCents: agencyCents,
         addons,
@@ -136,18 +114,13 @@ router.get("/overview", async (req, res) => {
       });
     }
 
-    rows.sort((x, y) => y.monthlyCents - x.monthlyCents);
+    const mrr = await readGlobalBillingTotals({ db: prisma, policy, now });
 
     return res.json({
       ok: true,
-      mrr: {
-        billedCents: mrrCents,
-        trialPotentialCents: trialMrrCents,
-        billedModels,
-        billableAgencies: rows.filter((r) => r.billable).length,
-        totalAgencies: rows.length,
-      },
+      mrr,
       agencies: rows,
+      page: { limit: page.limit, nextCursor: hasMore ? agencies.at(-1).id : null },
     });
   } catch (err) { return sendErr(res, err); }
 });
@@ -157,23 +130,27 @@ router.get("/overview", async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 router.get("/agency/:id", async (req, res) => {
   try {
+    const page = billingPage(req.query);
     const agency = await prisma.agency.findUnique({
       where: { id: req.params.id },
       include: {
         subscriptions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 },
-        creators: { where: { deletedAt: null }, include: { billingProfile: true, billingEntitlement: true }, orderBy: { createdAt: "asc" } },
+        creators: { where: { deletedAt: null, ...(page.after ? { id: { gt: page.after } } : {}) }, include: { billingProfile: true, billingEntitlement: true }, orderBy: { id: "asc" }, take: page.limit + 1 },
       },
     });
-    if (!agency) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND" });
+    if (!agency || agency.deletedAt) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND" });
 
     const policy = await readCommercialPolicy({ db: prisma });
     const sub = agency.subscriptions[0] || null;
     const now = await dbAuthorityNow({ db: prisma });
-    const activeUntil = liveEntitlementEnd(agency.creators, agency.id, now);
+    const total = (await readAgencyBillingTotals({ db: prisma, agencyIds: [agency.id], policy, now })).get(agency.id);
+    const activeUntil = total.activeUntil;
+    const hasMore = agency.creators.length > page.limit;
+    if (hasMore) agency.creators.pop();
     const { status, billingMode } = effectiveBillingState({ agency, subscription: sub, activeUntil, now });
 
     const models = agency.creators.map((c) => {
-      const bp = c.billingProfile;
+      const bp = c.billingProfile?.agencyId === agency.id ? c.billingProfile : null;
       const ent = scopedEntitlement(c, agency.id);
       return {
         creatorId: c.id,
@@ -194,7 +171,7 @@ router.get("/agency/:id", async (req, res) => {
       };
     });
 
-    const monthlyCents = models.reduce((s, m) => s + m.activeLineCents, 0);
+    const monthlyCents = total.monthlyCents;
 
     return res.json({
       ok: true,
@@ -203,6 +180,9 @@ router.get("/agency/:id", async (req, res) => {
       billable: BILLABLE_STATUSES.has(status) && billingMode !== "FREE_INTERNAL",
       models,
       monthlyCents,
+      configuredMonthlyCents: total.configuredCents,
+      modelsTotal: total.modelsTotal,
+      page: { limit: page.limit, nextCursor: hasMore ? models.at(-1).creatorId : null },
       tiers: catalogForPolicy(policy).tiers,
       commercialPolicyRevision: policy.revision,
     });

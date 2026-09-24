@@ -202,8 +202,8 @@
     // ─── billing management (admin-billing.js) ────────────────
     commercialPolicy: () => request("/api/admin/billing/commercial-policy"),
     saveCommercialPolicy: body => request("/api/admin/billing/commercial-policy", { method: "PATCH", body }),
-    billingOverview:   ()       => request("/api/admin/billing/overview"),
-    billingAgency:     (id)     => request(`/api/admin/billing/agency/${encodeURIComponent(id)}`),
+    billingOverview:   (after = null) => request("/api/admin/billing/overview" + (after ? "?after=" + encodeURIComponent(after) : "")),
+    billingAgency:     (id, after = null) => request(`/api/admin/billing/agency/${encodeURIComponent(id)}` + (after ? "?after=" + encodeURIComponent(after) : "")),
     billingTiers:      ()       => request("/api/admin/billing/tiers"),
     billingSetCreator: (id, body) => request(`/api/admin/billing/creator/${encodeURIComponent(id)}`, { method: "PATCH", body }),
     billingCancelTier: (id, body) => request(`/api/admin/billing/agency/${encodeURIComponent(id)}/apply-tier/cancel`, { method: "POST", body }),

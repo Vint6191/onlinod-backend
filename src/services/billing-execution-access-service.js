@@ -104,8 +104,11 @@ async function assertJobBillingAccess({ db, job, recoveryCapable = true }) {
   throw denied(state);
 }
 
-async function assertProviderBillingAccess({ db, agencyId, creatorId, userId, deviceId, member, capability, operation, billingRecovery, jobLease }) {
+async function assertProviderBillingAccess({ db, agencyId, creatorId, userId, deviceId, member, capability, operation, billingRecovery, jobLease, operationReadback, physicalRequest }) {
   const state = await creatorBillingAccess({ db, agencyId, creatorId });
+  if (operationReadback) return require("./billing-operation-readback-service").assertOperationReadback({
+    db, agencyId, creatorId, userId, deviceId, member, capability, operation, operationReadback, physicalRequest,
+  });
   if (!state.recoverable) throw denied(state);
   // Session identity verification is needed to restore a disconnected collector.
   // A caller-supplied security_probe label alone must never admit arbitrary work.

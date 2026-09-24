@@ -475,7 +475,7 @@ async function setAutomationControl({ agencyId, userId, scope, creatorId = null,
       agencyId, userId, scope, creatorId, moduleKey, enabled, settings, db: tx, _commitFenceHeld: true,
     }), { timeout: 30_000 });
   }
-  await lockAutomationWriteCommitFence({ db, agencyId });
+  await lockAutomationWriteCommitFence({ db, agencyId, creatorId: scope === "workspace" ? null : creatorId });
 
   const normalizedScope = clean(scope, 40);
   if (!normalizedScope || !["workspace", "creator", "module"].includes(normalizedScope)) {

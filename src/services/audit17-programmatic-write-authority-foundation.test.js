@@ -36,10 +36,10 @@ function makeDb() {
         if (!expected.some((branch) => matches(branch, candidate))) return false;
         continue;
       }
-      if (key === "claimUntil" && expected && typeof expected === "object") {
-        if (!(candidate.claimUntil instanceof Date)) return false;
-        if (expected.gt && !(candidate.claimUntil > expected.gt)) return false;
-        if (expected.lte && !(candidate.claimUntil <= expected.lte)) return false;
+      if (["claimUntil", "writeCommitAt", "updatedAt"].includes(key) && expected && typeof expected === "object") {
+        if (!(candidate[key] instanceof Date)) return false;
+        if (expected.gt && !(candidate[key] > expected.gt)) return false;
+        if (expected.lte && !(candidate[key] <= expected.lte)) return false;
         continue;
       }
       if (expected && typeof expected === "object" && Object.hasOwn(expected, "not")) {
@@ -515,7 +515,8 @@ test("Audit17 stranded programmatic reconciliation auto-closes no-retry after th
       ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision,
       failureCode: "write_outcome_unknown", facts: {},
     });
-    getRow().result.reconciliationStartedAt = new Date(Date.now() - 31 * 60_000).toISOString();
+    getRow().writeCommitAt = new Date(Date.now() - 31 * 60_000);
+    getRow().result.reconciliationStartedAt = getRow().writeCommitAt.toISOString();
     getRow().claimUntil = null;
     getRow().leaseTokenHash = null;
     const changed = await authority.sweepExpiredProgrammaticWriteLeases({ agencyId: base.agencyId, creatorId: base.creatorId, now: new Date() });
@@ -695,7 +696,8 @@ test("Audit17 bounded WAIT closes MASS permanently unresolved and generic manual
       ...base, writeId: reserved.delivery.id, leaseToken: reserved.lease.token, leaseRevision: reserved.lease.revision,
       failureCode: "write_outcome_unknown", facts: { endpointSemantics: "NON_IDEMPOTENT_WRITE", writeReachedWire: true },
     });
-    getRow().result.reconciliationStartedAt = new Date(Date.now() - 31 * 60_000).toISOString();
+    getRow().writeCommitAt = new Date(Date.now() - 31 * 60_000);
+    getRow().result.reconciliationStartedAt = getRow().writeCommitAt.toISOString();
     const closed = await authority.reconcileProgrammaticWrite({
       ...base, writeId: reserved.delivery.id, leaseToken: failed.lease.token, leaseRevision: failed.lease.revision,
       outcome: "WAIT_FOR_READBACK", result: { successfulReadback: true, candidates: [{ queueId: "shape-only" }] },
@@ -848,7 +850,8 @@ test("Audit17 generic settlement endpoints cannot bypass CUSTOM_MANUAL_SEND prod
       outcome: "MATCHED", result: { messageId: "remote-message-1", mediaIds: ["9001"], customOrderId: "order-product-settle", submissionId: "submission-a" },
     }), (error) => error?.code === "PROGRAMMATIC_WRITE_PRODUCT_SETTLEMENT_REQUIRED");
 
-    getRow().result.reconciliationStartedAt = new Date(Date.now() - 31 * 60_000).toISOString();
+    getRow().writeCommitAt = new Date(Date.now() - 31 * 60_000);
+    getRow().result.reconciliationStartedAt = getRow().writeCommitAt.toISOString();
     const closed = await authority.reconcileProgrammaticWrite({
       ...manual, writeId: reserved.delivery.id, leaseToken: failed.lease.token, leaseRevision: failed.lease.revision,
       outcome: "WAIT_FOR_READBACK", result: { successfulReadback: false, negativeObservationIsNotProof: true },
@@ -887,16 +890,15 @@ test("native OF MASS page actions require a server-visible physical commit permi
   assert.ok(publicAt >= 0 && authAt > publicAt, "settlement-only capability must not be gated by a membership that can disappear after provider 2xx");
 });
 
-test("Audit17 programmatic maintenance scans all expired/stranded rows with keyset pagination instead of a 10k correctness horizon", () => {
+test("Audit17 programmatic maintenance drains bounded expired/stranded pages without a 10k horizon", () => {
   const service = read("services/programmatic-of-write-authority-service.js");
   const start = service.indexOf("async function sweepExpiredProgrammaticWriteLeases(");
   const end = service.indexOf("\n\nfunction massIntentTerminalOutcome", start);
   const sweep = service.slice(start, end);
-  assert.match(sweep, /const scanAll = async/);
-  assert.match(sweep, /orderBy:\s*\{ id:\s*"asc" \}/);
-  assert.match(sweep, /id:\s*\{ gt:\s*afterId \}/);
-  assert.match(sweep, /take:\s*500/);
-  assert.doesNotMatch(sweep, /take:\s*10000|take:\s*10_000/);
+  assert.match(sweep, /take: 100/);
+  assert.match(sweep, /writeCommitAt: \{ lte:/);
+  assert.match(sweep, /claimUntil: null/);
+  assert.doesNotMatch(sweep, /take:\s*10000|take:\s*10_000|for \(;;\)/);
 });
 
 test("Phase4 billing blocks new programmatic reserve without creating a row", async () => {

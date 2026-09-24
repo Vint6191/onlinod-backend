@@ -1,3 +1,4 @@
+const { productBilling } = require("./middleware/product-billing");
 require("dotenv").config();
 
 const express = require("express");
@@ -46,7 +47,6 @@ const programmaticOfWriteRoutes = require("./routes/programmatic-of-writes");
 const programmaticOfWriteSettlementRoutes = require("./routes/programmatic-of-write-settlement");
 const { createLegacyGoneRouter } = require("./routes/legacy-gone");
 const { authRequired } = require("./middleware/auth");
-const { createIdempotencyMiddleware } = require("./middleware/idempotency");
 const { createRequestObservabilityMiddleware } = require("./middleware/request-observability");
 const prisma = require("./prisma");
 const logger = require("./utils/logger");
@@ -139,7 +139,6 @@ app.use("/api/auth/login", authLimiter);
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(createRequestObservabilityMiddleware());
-app.use("/api", createIdempotencyMiddleware());
 
 app.use("/uploads", express.static(path.join(__dirname, "..", "uploads"), {
   setHeaders(res) {
@@ -283,35 +282,35 @@ app.use("/api/workspace", workspaceRoutes);
 app.use("/api/devices", devicesRoutes);
 app.use("/api/team", authRequired, teamRoutes);
 app.use("/api/invitations", invitationRoutes);
-app.use("/api/stats", authRequired, statsRoutes);
+app.use("/api/stats", authRequired, productBilling, statsRoutes);
 app.use("/api/jobs", authRequired, jobsRoutes);
 app.use("/api/of-request-gate", authRequired, ofRequestGateRoutes);
 app.use("/api/telemetry", authRequired, telemetryRoutes);
 app.use("/api/analytics", authRequired, legacyAnalyticsRoutes);
-app.use("/api/traffic", authRequired, trafficRoutes);
-app.use("/api/subscribers", authRequired, subscribersRoutes);
-app.use("/api/fan-data", authRequired, fanDataRoutes);
-app.use("/api/automation", authRequired, automationControlRoutes);
+app.use("/api/traffic", authRequired, productBilling, trafficRoutes);
+app.use("/api/subscribers", authRequired, productBilling, subscribersRoutes);
+app.use("/api/fan-data", authRequired, productBilling, fanDataRoutes);
+app.use("/api/automation", authRequired, productBilling, automationControlRoutes);
 // Narrow post-commit capability settlement must remain usable after logout or
 // member retirement; it cannot mint new external work.
 app.use("/api/programmatic-of-write-settlement", programmaticOfWriteSettlementRoutes);
 app.use("/api/programmatic-of-writes", authRequired, programmaticOfWriteRoutes);
-app.use("/api/server/content", authRequired, contentStoreRoutes);
+app.use("/api/server/content", authRequired, productBilling, contentStoreRoutes);
 app.use("/api/server/crm", authRequired, legacyCrmRoutes);
 app.use("/api/server/fan-lists", authRequired, legacyFanListsRoutes);
 app.use("/api/server/segments", authRequired, legacySegmentsRoutes);
 app.use("/api/server/campaigns", authRequired, legacyCampaignsRoutes);
-app.use("/api/server/automation", authRequired, automationStoreRoutes);
-app.use("/api/dialog-intelligence", authRequired, dialogIntelligenceRoutes);
-app.use("/api/custom-orders", authRequired, customOrdersRoutes);
+app.use("/api/server/automation", authRequired, productBilling, automationStoreRoutes);
+app.use("/api/dialog-intelligence", authRequired, productBilling, dialogIntelligenceRoutes);
+app.use("/api/custom-orders", authRequired, productBilling, customOrdersRoutes);
 app.use("/api/server/vault-sales", authRequired, legacyVaultSalesRoutes);
-app.use("/api/server/vault-directory", authRequired, vaultDirectoryRoutes);
-app.use("/api/server/media-library", authRequired, mediaLibraryRoutes);
+app.use("/api/server/vault-directory", authRequired, productBilling, vaultDirectoryRoutes);
+app.use("/api/server/media-library", authRequired, productBilling, mediaLibraryRoutes);
 app.use("/api/server/diagnostics", authRequired, legacyDiagnosticsRoutes);
-app.use("/api/home", authRequired, homeRoutes);
-app.use("/api/team/analytics", authRequired, teamAnalyticsRoutes);
-app.use("/api/team/claims", authRequired, teamClaimsRoutes);
-app.use("/api/team/schedule", authRequired, teamScheduleRoutes);
+app.use("/api/home", authRequired, productBilling, homeRoutes);
+app.use("/api/team/analytics", authRequired, productBilling, teamAnalyticsRoutes);
+app.use("/api/team/claims", authRequired, productBilling, teamClaimsRoutes);
+app.use("/api/team/schedule", authRequired, productBilling, teamScheduleRoutes);
 app.use("/api/audit", authRequired, legacyAuditRoutes);
 app.use("/api/modules", authRequired, legacyModulesRoutes);
 app.use("/api/billing", billingRoutes);

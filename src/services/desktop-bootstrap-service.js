@@ -50,12 +50,17 @@ function creatorScopeWhere({ agencyId, member }) {
 }
 
 async function listAccessibleCreatorRows({ db, agencyId, member }) {
-  return db.creatorAccount.findMany({
-    where: creatorScopeWhere({ agencyId, member }),
-    include: CREATOR_RUNTIME_INCLUDE,
-    orderBy: { createdAt: "desc" },
-    take: 10000,
-  });
+  const rows = [];
+  let afterId = null;
+  for (;;) {
+    const page = await db.creatorAccount.findMany({
+      where: { ...creatorScopeWhere({ agencyId, member }), ...(afterId ? { AND: [{ id: { gt: afterId } }] } : {}) },
+      include: CREATOR_RUNTIME_INCLUDE, orderBy: { id: "asc" }, take: 500,
+    });
+    rows.push(...page);
+    if (page.length < 500) return rows.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime() || a.id.localeCompare(b.id));
+    afterId = page[page.length - 1].id;
+  }
 }
 
 const CREATOR_CATALOG_SNAPSHOT_ATTEMPTS = 4;
@@ -130,7 +135,7 @@ async function accessibleCreatorIdSet({ db, agencyId, member, creatorIds }) {
   const rows = await db.creatorAccount.findMany({
     where: { agencyId, deletedAt: null, id: { in: visibleIds } },
     select: { id: true },
-    take: Math.min(10000, visibleIds.length),
+    take: visibleIds.length,
   });
   return new Set(rows.map((row) => String(row.id)));
 }
@@ -162,12 +167,19 @@ async function buildDesktopBootstrap({ db, agencyId, userId, member, deviceId })
   const { creators, creatorCatalogGeneration, accessEpoch, role, roleKey, effectivePermissions } = await readStableAccessibleCreatorCatalog({
     db, agencyId, userId, member,
   });
+  const billingAccess = await require("./billing-execution-access-service").readBillingExecutionAccess({ db, agencyId, creatorIds: creators.map(c => c.id) });
+  const billing = { version: 1, validForMs: 90_000, creators: creators.map(c => {
+    const state = billingAccess.get(c.id);
+    return { creatorId: c.id, allowed: state?.allowed === true, reason: state?.reason || "BILLING_CREATOR_NOT_FOUND",
+      validForMs: state?.allowed ? Math.max(0, Math.min(90_000, state.validUntil ? state.validUntil.getTime() - state.now.getTime() : 90_000)) : 0 };
+  }) };
   return {
     ok: true,
     bootstrapVersion: 1,
     accessEpoch,
     creatorCatalogGeneration,
     authorization: {
+      billing,
       accessEpoch,
       role,
       roleKey,

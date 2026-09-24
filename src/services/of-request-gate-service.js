@@ -2,12 +2,10 @@
 
 const { assertProviderBillingAccess } = require("./billing-execution-access-service");
 
-// R13 cutover is the typed read-job lane. Interactive writes and their
-// reconciliation reads require a separate drain contract before global billing
-// enforcement can be activated. Never block their post-commit recovery here.
+// All provider starts use current billing. Durable readback is a separate,
+// device/member/operation-bound read permission, never a generic unpaid lane.
 function readJobBillingAdmission(entry) {
-  return entry.jobLease || entry.billingRecovery
-    ? assertProviderBillingAccess({ db: prisma, ...entry }) : Promise.resolve(null);
+  return assertProviderBillingAccess({ db: prisma, ...entry });
 }
 
 const crypto = require("node:crypto");
@@ -530,7 +528,7 @@ async function acquireOfRequestSlot(input) {
   const capability = ["security_probe", "read", "write"].includes(input.capability) ? input.capability : "read";
   const operation = clean(input.operation, 160) || "unknown";
   const source = clean(input.source, 240) || null;
-  const billingContext = { userId, member: input.member, billingRecovery: input.billingRecovery || null, jobLease: input.jobLease || null };
+  const billingContext = { userId, member: input.member, billingRecovery: input.billingRecovery || null, jobLease: input.jobLease || null, operationReadback: input.operationReadback || null, physicalRequest: input.physicalRequest || null };
   await readJobBillingAdmission({ ...billingContext, agencyId: access.agencyId, creatorId,
     deviceId: access.deviceId, capability, operation });
   return new Promise((resolve, reject) => {

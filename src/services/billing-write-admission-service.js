@@ -37,7 +37,9 @@ function billingActionClaimWhere(access) {
 
 // TelegramDeliveryIntent intentionally has no ORM Creator relation. Apply the
 // current-fact predicate in SQL BEFORE the bounded work page, never post-filter
-// an unpaid prefix. This is discovery only; commit rechecks the shared authority.
+// an unpaid prefix. One indexed candidate per paid creator bounds discovery
+// independently of queued history and prevents one creator monopolizing a page.
+// This is discovery only; commit rechecks the shared authority.
 async function selectBillableTelegramWorkIds({ db, agencyId, scope, take }) {
   const rows = await db.$queryRawUnsafe(`WITH clock AS MATERIALIZED (
       SELECT clock_timestamp() AT TIME ZONE 'UTC' AS at
@@ -47,16 +49,23 @@ async function selectBillableTelegramWorkIds({ db, agencyId, scope, take }) {
         WHERE "agencyId"=a."id" ORDER BY "createdAt" DESC,"id" DESC LIMIT 1) s ON true
       WHERE a."id"=$1 AND a."deletedAt" IS NULL AND a."billingSupportHold"=false
     )
-    SELECT t."id" FROM "TelegramDeliveryIntent" t
-    JOIN agency a ON a."id"=t."agencyId" CROSS JOIN clock
-    JOIN "CreatorAccount" c ON c."id"=t."creatorId" AND c."agencyId"=t."agencyId" AND c."deletedAt" IS NULL
-    LEFT JOIN "CreatorBillingEntitlement" e ON e."creatorId"=c."id" AND e."agencyId"=a."id"
-    WHERE t."agencyId"=$1 AND ($2::boolean OR t."creatorId"=ANY($3::text[]))
-      AND t."state" IN ('PLANNED','CLAIMED','FAILED_PRECOMMIT')
-      AND NOT (t."state"='PLANNED' AND t."commitStartedAt" IS NULL
-        AND starts_with(COALESCE(t."outcomeReason",''),'PRECOMMIT_PROVIDER_UNAVAILABLE:'))
-      AND (a.mode='FREE_INTERNAL' OR a."trialEndsAt">clock.at
-        OR (e."coreValidUntil">clock.at AND (e."coreValidFrom" IS NULL OR e."coreValidFrom"<=clock.at)))
+    , eligible AS MATERIALIZED (
+      SELECT c."id" FROM "CreatorAccount" c JOIN agency a ON a."id"=c."agencyId" CROSS JOIN clock
+      LEFT JOIN "CreatorBillingEntitlement" e ON e."creatorId"=c."id" AND e."agencyId"=a."id"
+      WHERE c."deletedAt" IS NULL AND ($2::boolean OR c."id"=ANY($3::text[]))
+        AND (a.mode='FREE_INTERNAL' OR a."trialEndsAt">clock.at
+          OR (e."coreValidUntil">clock.at AND (e."coreValidFrom" IS NULL OR e."coreValidFrom"<=clock.at)))
+    )
+    SELECT t."id" FROM eligible c CROSS JOIN clock
+    CROSS JOIN LATERAL (
+      SELECT t."id",t."createdAt" FROM "TelegramDeliveryIntent" t
+      WHERE t."agencyId"=$1 AND t."creatorId"=c."id"
+        AND t."state" IN ('PLANNED','CLAIMED','FAILED_PRECOMMIT')
+        AND (t."state"<>'CLAIMED' OR t."claimUntil" IS NULL OR t."claimUntil"<=clock.at)
+        AND NOT (t."state"='PLANNED' AND t."commitStartedAt" IS NULL
+          AND starts_with(COALESCE(t."outcomeReason",''),'PRECOMMIT_PROVIDER_UNAVAILABLE:'))
+      ORDER BY t."createdAt",t."id" LIMIT 1
+    ) t
     ORDER BY t."createdAt",t."id" LIMIT $4`, agencyId, scope?.broad === true,
     (scope?.creatorIds || []).map(String), Math.max(1, Math.min(200, take)));
   return rows.map(row => row.id);

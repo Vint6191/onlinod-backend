@@ -22,6 +22,8 @@ const acquireSchema = scopeSchema.extend({
   operation: z.string().min(1).max(160),
   source: z.string().max(240).optional().nullable(),
   capability: capabilitySchema,
+  physicalRequest: z.object({ method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]), path: z.string().min(1).max(4000) }).strict().optional().nullable(),
+  operationReadback: z.object({ deliveryId: z.string().min(1).max(200), leaseToken: z.string().min(1).max(500), leaseRevision: z.number().int().positive(), writeCommitRevision: z.number().int().positive() }).strict().optional().nullable(),
   jobLease: z.object({ jobId: z.string().min(1).max(200), leaseToken: z.string().min(1).max(500), leaseRevision: z.number().int().positive() }).strict().optional().nullable(),
   billingRecovery: z.object({
     jobId: z.string().min(1).max(200),

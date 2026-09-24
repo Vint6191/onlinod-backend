@@ -466,7 +466,7 @@ async function setCandidateState({ agencyId, creatorId, fanId, action }) {
 
   return runWithAutomationWriteCommitFence({
     db: prisma,
-    agencyId,
+    agencyId, creatorId,
     options: { timeout: 30_000 },
     work: async (tx) => {
       const candidate = await tx.followBackCandidate.findFirst({ where: { agencyId, creatorId, fanId } });

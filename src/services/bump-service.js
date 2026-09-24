@@ -716,7 +716,7 @@ async function finalizeBumpDelete({ delivery, result, outcomeCode, db = prisma }
 async function markBumpReply({ agencyId, creatorId, fanId, messageId = null, repliedAt = new Date(), source = "ws", db = prisma }) {
   return runWithAutomationWriteCommitFence({
     db,
-    agencyId,
+    agencyId, creatorId,
     options: { timeout: 30_000 },
     work: async (tx) => {
       const state = await tx.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId, fanId } } });

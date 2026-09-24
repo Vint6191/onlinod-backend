@@ -5,6 +5,15 @@
 function installTrialBillingRows(db, { clock = null, billing = {} } = {}) {
   const query = db.$queryRawUnsafe?.bind(db);
   db.$queryRawUnsafe = async (sql, ...args) => {
+    if (sql.includes('/* phase4_action_fairness */')) {
+      const [agencyId, ids, types, now, paid] = args;
+      const rows = await db.automationDelivery.findMany({ where: { agencyId, creatorId: { in: ids }, originKind: "AUTOMATION", actionType: { in: types }, status: { in: ["QUEUED", "RETRY_SCHEDULED", "RECONCILE_REQUIRED"] }, notBefore: { lte: now } } });
+      const recovery = r => r.status === "RECONCILE_REQUIRED" || r.failureCategory === "OUTCOME_UNKNOWN_RECONCILE" || r.result?.outcomeState === "RECONCILE_REQUIRED";
+      const seen = new Set();
+      return rows.filter(r => (paid.includes(r.creatorId) && r.attempts < r.maxAttempts) || recovery(r))
+        .sort((a,b) => Number(recovery(b))-Number(recovery(a)) || b.priority-a.priority || a.notBefore-b.notBefore || a.createdAt-b.createdAt || a.id.localeCompare(b.id))
+        .filter(r => !seen.has(r.creatorId) && seen.add(r.creatorId)).slice(0,100);
+    }
     if (sql.includes('c."id" AS "creatorId"') && sql.includes('"billingSupportHold"')) {
       const time = clock ? clock() : query ? (await query('SELECT clock_timestamp() AS "authorityNow"'))?.[0]?.authorityNow : new Date();
       const now = time || new Date();

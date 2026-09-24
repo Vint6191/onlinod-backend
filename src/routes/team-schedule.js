@@ -17,7 +17,7 @@ function agencyId(req) {
   return String(req.query?.agencyId || req.body?.agencyId || req.auth?.agencyId || "").trim();
 }
 
-function creatorScope(member) {
+function membershipcreatorScope(member) {
   const owner = String(member?.role || "").toUpperCase() === "OWNER" || String(member?.roleKey || "").toLowerCase() === "owner";
   if (owner) return null;
   const raw = member?.assignedCreators;
@@ -60,7 +60,13 @@ async function viewer(req, res, { write = false } = {}) {
     res.status(403).json({ ok: false, code: "TEAM_SCHEDULE_MANAGE_REQUIRED", error: "workspace.manage_schedule permission is required" });
     return null;
   }
-  return { agencyId: id, member, allowedCreatorIds: creatorScope(member), canManageSchedule };
+  return { agencyId: id, member, allowedCreatorIds: await creatorScope(member), canManageSchedule };
+}
+
+async function creatorScope(member) {
+  const ids = membershipcreatorScope(member);
+  const scope = await require("../services/product-billing-context-service").productBillingScope({ db: prisma, agencyId: member.agencyId, scope: { broad: ids === null, creatorIds: ids } });
+  return scope.broad ? null : scope.creatorIds;
 }
 
 function sendError(res, err, fallbackCode) {

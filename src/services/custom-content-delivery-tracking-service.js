@@ -446,7 +446,7 @@ async function settleCustomManualDeliveryWithCapability(input, { db = null } = {
   const settle = async (tx) => {
     const initial = await tx.automationDelivery.findUnique({ where: { id: writeId } });
     if (!initial) throw fail("CUSTOM_DELIVERY_WRITE_NOT_FOUND", "Physical Custom delivery commit authority was not found", 404);
-    await lockAutomationWriteCommitFence({ db: tx, agencyId: initial.agencyId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId: initial.agencyId, creatorId: initial.creatorId });
     const delivery = await tx.automationDelivery.findUnique({ where: { id: writeId } });
     if (!delivery) throw fail("CUSTOM_DELIVERY_WRITE_NOT_FOUND", "Physical Custom delivery commit authority was not found", 404);
     const payload = object(delivery.payload); const result = object(delivery.result);

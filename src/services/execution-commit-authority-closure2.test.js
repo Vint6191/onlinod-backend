@@ -568,6 +568,8 @@ test("Audit17 stranded Automation reconciliation terminalizes no-retry after bou
   const service = loadActionService(db);
   const row = rows[0];
   row.status = "RECONCILE_REQUIRED";
+  row.writeCommitAt = new Date(Date.now() - 31 * 60_000);
+  row.updatedAt = row.writeCommitAt;
   row.claimUntil = null;
   row.claimedByDeviceId = null;
   row.leaseTokenHash = null;

@@ -743,7 +743,7 @@ async function setLikeCandidateState({ agencyId, creatorId, candidateId, action,
   if (!["ignore", "block"].includes(action)) throw Object.assign(new Error("Unsupported candidate action"), { code: "invalid_candidate_action", status: 400 });
   return runWithAutomationWriteCommitFence({
     db,
-    agencyId,
+    agencyId, creatorId,
     options: { timeout: 30_000 },
     work: async (tx) => {
       const candidate = await tx.automationContentCandidate.findFirst({ where: { id: candidateId, agencyId, creatorId } });

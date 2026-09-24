@@ -470,7 +470,7 @@ async function publicationTransaction(db, agencyId, creatorId, work, {
       //   2) creator-local Subscriber advisory lock
       //   3) durable maintenance signal row (when maintenance owns the work)
       // No maintenance path is allowed to invert (3)->(2).
-      await lockAutomationWriteCommitFence({ db: tx, agencyId });
+      await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId });
       await lockSubscriberPublicationCreator(tx, agencyId, creatorId);
       let claim = null;
       if (maintenanceSignal) {
@@ -490,7 +490,7 @@ async function publicationTransaction(db, agencyId, creatorId, work, {
     throw error;
   }
   if (typeof db?.$executeRawUnsafe === "function") {
-    await lockAutomationWriteCommitFence({ db, agencyId });
+    await lockAutomationWriteCommitFence({ db, agencyId, creatorId });
     await lockSubscriberPublicationCreator(db, agencyId, creatorId);
   }
   return work(db, null);
@@ -1780,7 +1780,7 @@ async function setHiddenOnlineStatus({ agencyId, creatorId, fanId, status, db = 
   const normalizedStatus = normalizeStatus(status);
   return runWithAutomationWriteCommitFence({
     db,
-    agencyId,
+    agencyId, creatorId,
     options: { maxWait: 30_000, timeout: 60_000 },
     work: async (tx) => {
       // Canonical lock order matches Subscriber publication:

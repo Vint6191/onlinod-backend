@@ -552,7 +552,7 @@ async function resolveRetiredCreatorPendingCustomOrder({ agencyId, member, custo
     // allowDeleted is intentional here: this audited compatibility workflow
     // adjudicates debt left behind by versions that retired CreatorAccount first.
     if (!creator.deletedAt) throw fail("CUSTOM_RETIRED_ORDER_CREATOR_ACTIVE", "This compatibility resolution is only valid for an already-retired creator", 409);
-    await lockAutomationWriteCommitFence({ db: tx, agencyId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId: initial.creatorId });
 
     const current = await tx.customOrder.findFirst({
       where: { id, agencyId, creatorId: initial.creatorId },

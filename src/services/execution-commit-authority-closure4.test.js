@@ -282,12 +282,14 @@ test("Closure4 prepareWriteActionDelivery reaches COMMITTING through executeRaw 
     assert.equal(delivery.status, "COMMITTING");
     assert.equal(delivery.writeCommitRevision, 1);
     assert.equal(fx.calls.query.length, 0);
-    assert.equal(fx.calls.execute.length, 3);
+    assert.equal(fx.calls.execute.length, 4);
     assert.equal(fx.calls.execute[0].sql, "SELECT pg_advisory_xact_lock_shared(hashtext($1))");
     assert.deepEqual(fx.calls.execute[0].args, ["agency-lifecycle:agency-1"]);
     assert.deepEqual(fx.calls.execute[1].args, ["onlinod:automation-write-commit:v1", "agency-1"]);
-    assert.equal(fx.calls.execute[2].sql, "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)");
-    assert.deepEqual(fx.calls.execute[2].args, ["phase3_fan_consumer_v1_current_bounded"]);
+    assert.equal(fx.calls.execute[1].sql, "SELECT pg_advisory_xact_lock_shared(hashtext($1), hashtext($2))");
+    assert.deepEqual(fx.calls.execute[2].args, ["onlinod:automation-creator-commit:v1", JSON.stringify(["agency-1", "creator-1"])]);
+    assert.equal(fx.calls.execute[3].sql, "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)");
+    assert.deepEqual(fx.calls.execute[3].args, ["phase3_fan_consumer_v1_current_bounded"]);
   } finally {
     delete require.cache[actionId];
     for (const restore of restores.reverse()) restore();

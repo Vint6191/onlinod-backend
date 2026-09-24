@@ -143,7 +143,7 @@ function deliveryRequiresReconciliation(delivery) {
 }
 function reconciliationStartedAt(delivery, now = new Date()) {
   const result = object(delivery?.result);
-  const value = result.reconciliationStartedAt || delivery?.writeCommitAt || now;
+  const value = delivery?.writeCommitAt || result.reconciliationStartedAt || delivery?.updatedAt || now;
   const parsed = value instanceof Date ? value : new Date(value);
   return Number.isFinite(parsed.getTime()) ? parsed : now;
 }
@@ -247,7 +247,6 @@ async function scopedReadyCreatorIds({ device, member }) {
       ...(!broad ? { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } } : {}),
     },
     select: { id: true },
-    take: 10000,
   });
   const ids = visible.map((item) => item.id);
   if (!ids.length) return [];
@@ -262,7 +261,6 @@ async function scopedReadyCreatorIds({ device, member }) {
       creatorId: { in: ids },
     },
     select: { creatorId: true },
-    take: 10000,
   });
   return bindings.map((item) => item.creatorId);
 }
@@ -284,7 +282,7 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
       id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true,
       payload: true, contentCollectionId: true, status: true, failureCode: true, failureCategory: true, writeCommitAt: true,
       attempts: true, maxAttempts: true, result: true, leaseRevision: true, generation: true, notBefore: true,
-    }, take: 10000,
+    }, orderBy: [{ claimUntil: "asc" }, { id: "asc" }], take: 100,
   });
   let changed = 0;
   const terminalizeUnresolved = async (row, where) => {
@@ -358,9 +356,10 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
   // Stranded reconciliation rows have no lease timestamp, so they need an
   // explicit bounded sweep or they would hold the global creator lane forever.
   const stranded = await client.automationDelivery.findMany({
-    where: { ...scopeWhere, status: "RECONCILE_REQUIRED", claimUntil: null },
-    select: { id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true, payload: true, status: true, result: true, failureCode: true, writeCommitAt: true, leaseRevision: true, attempts: true, maxAttempts: true },
-    take: 10000,
+    where: { ...scopeWhere, status: "RECONCILE_REQUIRED", claimUntil: null,
+      OR: [{ writeCommitAt: { lte: new Date(now.getTime() - MAX_RECONCILIATION_WAIT_MS) } }, { writeCommitAt: null, updatedAt: { lte: new Date(now.getTime() - MAX_RECONCILIATION_WAIT_MS) } }] },
+    select: { id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true, payload: true, status: true, result: true, failureCode: true, writeCommitAt: true, updatedAt: true, leaseRevision: true, attempts: true, maxAttempts: true },
+    orderBy: [{ writeCommitAt: "asc" }, { id: "asc" }], take: 100,
   });
   for (const row of stranded) {
     if (reconciliationWindowExpired(row, now)) await terminalizeUnresolved(row, { id: row.id, status: "RECONCILE_REQUIRED", leaseRevision: row.leaseRevision, claimUntil: null });
@@ -379,38 +378,42 @@ async function sweepExpiredActionLeases(input = new Date()) {
   return automationChanged + programmaticChanged;
 }
 
+const ACTION_FAIR_CANDIDATES_SQL = `/* phase4_action_fairness */
+    SELECT candidate.* FROM unnest($2::text[]) AS scope(id)
+    CROSS JOIN LATERAL (
+      SELECT d.* FROM "AutomationDelivery" d
+      WHERE d."agencyId"=$1 AND d."creatorId"=scope.id AND d."originKind"='AUTOMATION'
+        AND d."status" IN ('QUEUED','RETRY_SCHEDULED','RECONCILE_REQUIRED')
+        AND d."actionType"=ANY($3::text[]) AND d."notBefore"<=$4 AND d."claimUntil" IS NULL
+        AND NOT EXISTS (SELECT 1 FROM "AutomationDelivery" busy WHERE busy."agencyId"=d."agencyId" AND busy."creatorId"=d."creatorId"
+          AND busy."id"<>d."id" AND busy."status" IN ('CLAIMED','RUNNING','COMMITTING','RECONCILE_REQUIRED'))
+        AND (d."creatorId"=ANY($5::text[]) OR d."status"='RECONCILE_REQUIRED'
+          OR COALESCE(d."failureCategory",'')='OUTCOME_UNKNOWN_RECONCILE' OR d."result"->>'outcomeState'='RECONCILE_REQUIRED')
+        AND (d."attempts"<d."maxAttempts" OR d."status"='RECONCILE_REQUIRED'
+          OR COALESCE(d."failureCategory",'')='OUTCOME_UNKNOWN_RECONCILE' OR d."result"->>'outcomeState'='RECONCILE_REQUIRED'
+          OR (d."moduleKey"='follow' AND (d."actionType"='FOLLOW_FAN' AND d."payload"->>'recovery'='true'
+            OR d."actionType"='UNFOLLOW_FAN' AND (d."result" ? 'attemptStartedAt'
+              OR d."failureCode" IN ('network_error','timeout','temporary_of_error','of_temporary_error','backend_unavailable','lease_lost'))))
+          OR d."moduleKey"='sfs' AND d."actionType"='SFS_UNFOLLOW_TARGET')
+      ORDER BY (d."status"='RECONCILE_REQUIRED' OR COALESCE(d."failureCategory",'')='OUTCOME_UNKNOWN_RECONCILE' OR COALESCE(d."result"->>'outcomeState','')='RECONCILE_REQUIRED') DESC,
+        d."priority" DESC,d."notBefore",d."createdAt",d."id" LIMIT 1
+    ) candidate
+    LEFT JOIN LATERAL (SELECT d."claimedAt" FROM "AutomationDelivery" d
+      WHERE d."agencyId"=$1 AND d."creatorId"=scope.id AND d."originKind"='AUTOMATION' AND d."claimedAt" IS NOT NULL
+      ORDER BY d."claimedAt" DESC LIMIT 1) claim ON true
+    LEFT JOIN LATERAL (SELECT d."finishedAt" FROM "AutomationDelivery" d
+      WHERE d."agencyId"=$1 AND d."creatorId"=scope.id AND d."originKind"='AUTOMATION' AND d."status"='COMPLETED' AND d."finishedAt" IS NOT NULL
+      ORDER BY d."finishedAt" DESC LIMIT 1) finish ON true
+    ORDER BY (candidate."status"='RECONCILE_REQUIRED' OR COALESCE(candidate."failureCategory",'')='OUTCOME_UNKNOWN_RECONCILE' OR COALESCE(candidate."result"->>'outcomeState','')='RECONCILE_REQUIRED') DESC,
+      candidate."priority" DESC,GREATEST(claim."claimedAt",finish."finishedAt") ASC NULLS FIRST,
+      candidate."notBefore",candidate."createdAt",candidate."id" LIMIT 100`;
+
 async function fairCandidates({ agencyId, creatorIds, actionTypes, now, billingWhere }) {
-  const candidates = await prisma.automationDelivery.findMany({
-    where: {
-      agencyId,
-      originKind: "AUTOMATION",
-      creatorId: { in: creatorIds },
-      actionType: { in: actionTypes },
-      status: { in: CLAIMABLE_STATUSES },
-      notBefore: { lte: now },
-      AND: [billingWhere],
-    },
-    orderBy: [{ priority: "desc" }, { notBefore: "asc" }, { createdAt: "asc" }],
-    take: 100,
-  });
-  const withinAttempts = candidates.filter((item) => deliveryRequiresReconciliation(item) || item.attempts < item.maxAttempts || mustPreserveRefollowSaga(item) || isSfsCleanupDelivery(item));
-  if (!withinAttempts.length) return [];
-  const creatorSet = [...new Set(withinAttempts.map((item) => item.creatorId))];
-  const touches = await prisma.automationDelivery.groupBy({
-    by: ["creatorId"],
-    where: { agencyId, originKind: "AUTOMATION", creatorId: { in: creatorSet }, status: { in: [...CREATOR_WRITE_LANE_STATUSES, "COMPLETED"] } },
-    _max: { claimedAt: true, finishedAt: true },
-  });
-  const lastTouch = new Map(touches.map((row) => [row.creatorId, Math.max(
-    row._max.claimedAt?.getTime?.() || 0,
-    row._max.finishedAt?.getTime?.() || 0,
-  )]));
-  return withinAttempts.sort((a, b) =>
-    Number(deliveryRequiresReconciliation(b)) - Number(deliveryRequiresReconciliation(a))
-    || b.priority - a.priority
-    || (lastTouch.get(a.creatorId) || 0) - (lastTouch.get(b.creatorId) || 0)
-    || a.notBefore.getTime() - b.notBefore.getTime()
-    || a.createdAt.getTime() - b.createdAt.getTime());
+  const paidIds = billingWhere.OR[0].creatorId.in;
+  // One candidate per creator before the global page, so a busy/blocked
+  // creator cannot hide all other creators behind its queue prefix.
+  // Two ordered index probes replace the historical COMPLETED groupBy.
+  return prisma.$queryRawUnsafe(ACTION_FAIR_CANDIDATES_SQL, agencyId, creatorIds, actionTypes, now, paidIds);
 }
 
 async function updateCandidateProgress(delivery, status, failureCode = null, db = prisma, claimOwnership = false) {
@@ -851,7 +854,7 @@ async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRev
     throw new ActionDeliveryError("DELIVERY_WRONG_AUTHORITY", "Programmatic write deliveries must use ProgrammaticOfWriteAuthority", 403);
   }
   if (delivery.agencyId !== device.agencyId) throw new ActionDeliveryError("DELIVERY_DEVICE_AGENCY_MISMATCH", "Delivery belongs to another agency", 403);
-  if (billingAdmission && lockAccess) await lockBillingWriteAdmission({ db, agencyId: delivery.agencyId });
+  if (billingAdmission && lockAccess) await lockBillingWriteAdmission({ db, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
   const terminal = TERMINAL_STATUSES.includes(delivery.status);
   if (!(LEASED_STATUSES.includes(delivery.status) || (allowTerminal && terminal))) {
     throw new ActionDeliveryError("DELIVERY_NOT_CLAIMED", `Delivery status is ${delivery.status}`);
@@ -1142,7 +1145,7 @@ async function prepareWriteActionDelivery(input) {
   try {
     return await prisma.$transaction(async (tx) => {
     let delivery = await requireLease({ ...input, db: tx, lockAccess: true, billingAdmission: true });
-    await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
     // The control writer holds the same transaction-scoped fence. Re-read the
     // lease after acquiring it so a queued control/revoke transition cannot
     // race a stale pre-lock delivery snapshot into COMMITTING.
@@ -1736,6 +1739,7 @@ async function retrySafeFailures({ agencyId, actorUserId, creatorId = null, modu
 }
 
 module.exports = {
+  ACTION_FAIR_CANDIDATES_SQL,
   ActionDeliveryError,
   NORMAL_CLAIMABLE_STATUSES,
   CLAIMABLE_STATUSES,

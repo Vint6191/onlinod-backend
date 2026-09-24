@@ -835,7 +835,7 @@ async function setSfsCandidateState({ agencyId, creatorId, candidateId, action, 
     return { ok: true, deliveryId: delivery.id, requiresQueueRetry: true };
   }
 
-  return runWithAutomationWriteCommitFence({ db, agencyId, options: { timeout: 30_000 }, work: async (tx) => {
+  return runWithAutomationWriteCommitFence({ db, agencyId, creatorId, options: { timeout: 30_000 }, work: async (tx) => {
     const candidate = await tx.sfsTargetCandidate.findFirst({ where: { id: candidateId, agencyId, creatorId } });
     if (!candidate) throw Object.assign(new Error("SFS candidate not found"), { code: "candidate_not_found", status: 404 });
     const data = action === "ignore" ? { ignored: true, blocked: false, state: "IGNORED" }
