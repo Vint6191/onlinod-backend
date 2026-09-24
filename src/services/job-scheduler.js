@@ -2228,7 +2228,7 @@ async function runRecurringSweepInternal() {
     // the resulting live entitlements.
     billingExpiry = await reconcileExpiredBillingStates({ now });
     if (billingExpiry?.scanned) {
-      console.log(`[scheduler] billing expiry — scanned=${billingExpiry.scanned}, expired=${billingExpiry.expired}, repaired=${billingExpiry.repaired}`);
+      console.log(`[scheduler] billing expiry — scanned=${billingExpiry.scanned}, expired=${billingExpiry.expired}, repaired=${billingExpiry.repaired}, failed=${billingExpiry.failed}, cycleCompleted=${billingExpiry.cycleCompleted}, leaseLost=${billingExpiry.leaseLost}`);
     }
   } catch (err) {
     console.warn("[scheduler] billing expiry reconciliation failed:", err?.message || err);

@@ -1415,6 +1415,19 @@ model AdminSession {
   @@index([revokedAt])
 }
 
+model BillingReconciliationCursor {
+  id                 String @id
+  lastAgencyId       String?
+  ownerToken         String?
+  leaseUntil         DateTime?
+  cycle              Int @default(0)
+  lastCompletedAt    DateTime?
+  failureCount       Int @default(0)
+  lastFailedAgencyId  String?
+  lastErrorCode       String?
+  updatedAt          DateTime @default(now()) @updatedAt
+}
+
 model AgencySubscription {
   id       String @id @default(cuid())
   agencyId String

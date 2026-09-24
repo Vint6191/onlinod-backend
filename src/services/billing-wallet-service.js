@@ -758,8 +758,8 @@ async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMod
 async function startCreatorSubscription({ agencyId, creatorId, testMode = false, actorUserId = null, db = null, now = new Date() }) {
   const client = db || prisma;
   const result = await client.$transaction(async (tx) => {
-    now = await dbAuthorityNow({ db: tx, fallbackNow: now });
     await lockAgencyBillingMutation(tx, agencyId);
+    now = await dbAuthorityNow({ db: tx, fallbackNow: now });
     const creator = await tx.creatorAccount.findFirst({ where: { id: creatorId, agencyId, deletedAt: null }, include: { billingProfile: true, billingEntitlement: true } });
     if (!creator) throw billingError("Creator not found", "BILLING_CREATOR_NOT_FOUND", 404);
     if (creator.billingProfile?.billingExcluded === true) throw billingError("Creator is excluded from billing", "BILLING_CREATOR_EXCLUDED");
@@ -834,6 +834,7 @@ async function renewCreatorSubscription({ entitlement, db = null, now = new Date
   try {
     const result = await client.$transaction(async (tx) => {
       await lockAgencyBillingMutation(tx, agencyId);
+      now = await dbAuthorityNow({ db: tx, fallbackNow: now });
       const freshEntitlement = await tx.creatorBillingEntitlement.findUnique({ where: { creatorId } });
       if (!freshEntitlement?.autoRenewEnabled) return { renewed: false, reason: "AUTO_RENEW_DISABLED" };
       if (isFuture(freshEntitlement.coreValidUntil, now)) return { renewed: false, reason: "NOT_DUE" };

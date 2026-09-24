@@ -1,4 +1,5 @@
 "use strict";
+const { effectiveBillingState, liveEntitlementEnd, scopedEntitlement } = require("./billing-state-service");
 
 const bcrypt = require("bcryptjs");
 const prisma = require("../prisma");
@@ -949,7 +950,7 @@ async function getBillingSettings({ agencyId, member, db = null }) {
   const revenueByCreator = await readRolling30dRevenueBatch({ db: client, creatorIds, now });
   const rows = creators.map((creator) => {
     const pricing = pricingPreviewFromRevenue({ profile: creator.billingProfile, revenue: revenueByCreator.get(String(creator.id)) || null, policy });
-    return billingLine(creator, pricing, now, policy);
+    return billingLine({ ...creator, billingEntitlement: scopedEntitlement(creator, agencyId) }, pricing, now, policy);
   });
   const monthlyTotalCents = rows.reduce((sum, row) => sum + row.lineTotalCents, 0);
   const activeRows = rows.filter((row) => row.entitlement.coreActive);
@@ -963,32 +964,24 @@ async function getBillingSettings({ agencyId, member, db = null }) {
   });
   const estimatedNext30DaysCents = upcomingAutoRenewRows.reduce((sum, row) => sum + Number(row.estimatedNextChargeCents || 0), 0);
   const pricingDataUnavailableCreators = upcomingAutoRenewRows.filter((row) => row.estimatedNextChargeCents == null).length;
-  const maxEntitlementEnd = activeRows
-    .map((row) => row.entitlement.coreValidUntil ? new Date(row.entitlement.coreValidUntil) : null)
-    .filter((value) => value && Number.isFinite(value.getTime()))
-    .sort((a, b) => b.getTime() - a.getTime())[0] || null;
-  const billingMode = String(subscription?.billingMode || "MANUAL");
-  const rawStatus = String(subscription?.status || agency?.status || "TRIAL");
-  const effectiveStatus = agency?.deletedAt || agency?.billingSupportHold ? "LOCKED"
-    : activeRows.length > 0 || billingMode === "FREE_INTERNAL" ? "ACTIVE"
-    : agency?.trialEndsAt && new Date(agency.trialEndsAt) > now ? "TRIAL"
-    : rawStatus === "CANCELLED" ? "CANCELLED" : "PAST_DUE";
+  const maxEntitlementEnd = liveEntitlementEnd(creators, agencyId, now);
+  const { status: effectiveStatus, billingMode } = effectiveBillingState({ agency, subscription, activeUntil: maxEntitlementEnd, now });
   const liveCheckoutBlockedByInternalTestMode = billingMode === "FREE_INTERNAL" && providerBase.environment === "live";
 
   return {
     available: true,
-    agency: { ...agency, status: effectiveStatus },
+    agency: { ...agency, status: effectiveStatus, currentPeriodEnd: maxEntitlementEnd },
     subscription: subscription ? {
       id: subscription.id,
-      status: subscription.status,
+      status: effectiveStatus,
       effectiveStatus,
       billingMode,
       billingPeriod: "MONTHLY",
       corePricePerCreatorCents: policy.settings.starterPriceCents,
-      trialEndsAt: subscription.trialEndsAt,
-      graceUntil: subscription.graceUntil,
+      trialEndsAt: agency.trialEndsAt,
+      graceUntil: null,
       currentPeriodStart: subscription.currentPeriodStart,
-      currentPeriodEnd: subscription.currentPeriodEnd,
+      currentPeriodEnd: maxEntitlementEnd,
       effectiveCurrentPeriodEnd: maxEntitlementEnd ? maxEntitlementEnd.toISOString() : null,
     } : null,
     billedCreators: rows.filter((row) => !row.billingExcluded).length,

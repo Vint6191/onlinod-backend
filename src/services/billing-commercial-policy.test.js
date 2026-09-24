@@ -43,3 +43,16 @@ test("policy authority fails closed on invalid revision, missing fields and unex
  assert.equal(commercialSettingsSchema.safeParse({...policyFixture().settings,outreachPriceCents:0}).success,true);
  assert.throws(()=>configuredPrices(null,null),{code:"BILLING_COMMERCIAL_POLICY_REQUIRED"});
 });
+
+ test("Settings paid recovery, expiry and scope use the same fact boundary as the admin read",async()=>{
+ const f=fixture(),svc=settingsService();f.agency.trialEndsAt=new Date("2026-09-01");
+ f.creators[0].billingEntitlement={creatorId:"c1",agencyId:"a",coreValidFrom:new Date("2026-09-01"),coreValidUntil:new Date("2027-01-01"),corePriceCents:2000};
+ let r=await svc.getBillingSettings({agencyId:"a",member:{role:"OWNER"},db:f.db});
+ assert.equal(r.agency.status,"ACTIVE");assert.equal(r.subscription.status,"ACTIVE");assert.equal(r.activeEntitledCreators,1);
+ assert.equal(r.subscription.currentPeriodEnd.toISOString(),"2027-01-01T00:00:00.000Z");
+ f.creators[0].billingEntitlement.agencyId="other-agency";
+ r=await svc.getBillingSettings({agencyId:"a",member:{role:"OWNER"},db:f.db});
+ assert.equal(r.agency.status,"PAST_DUE");assert.equal(r.activeEntitledCreators,0);assert.equal(r.subscription.currentPeriodEnd,null);
+ f.creators[0].billingEntitlement.agencyId="a";f.creators[0].billingEntitlement.coreValidFrom=new Date("2026-10-01");
+ r=await svc.getBillingSettings({agencyId:"a",member:{role:"OWNER"},db:f.db});assert.equal(r.agency.status,"PAST_DUE");assert.equal(r.activeEntitledCreators,0);
+ });

@@ -2,6 +2,7 @@
 
 const { policyFixture, policyModelFixture } = require("../../scripts/test-support/commercial-policy-fixture");
 const test = require("node:test");
+const { attachReconciliationFixture } = require("../../scripts/test-support/billing-reconciliation-fixture");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
@@ -842,8 +843,9 @@ test("V13.3 expiry reconciliation marks a paid workspace PAST_DUE only when no c
   };
   db.$transaction = async (fn) => fn(db);
   const service = loadEntitlementService(db);
+  attachReconciliationFixture(db, now);
   const result = await service.reconcileExpiredBillingStates({ now, db });
-  assert.deepEqual(result, { scanned: 1, expired: 1, repaired: 0 });
+  assert.deepEqual([result.scanned, result.expired, result.repaired, result.failed], [1, 1, 0, 0]);
   assert.equal(subscriptionStatus, "PAST_DUE");
   assert.equal(agencyStatus, "PAST_DUE");
 });
@@ -862,8 +864,9 @@ test("V13.3 expiry reconciliation repairs a stale agency period from the latest 
   };
   db.$transaction = async (fn) => fn(db);
   const service = loadEntitlementService(db);
+  attachReconciliationFixture(db, now);
   const result = await service.reconcileExpiredBillingStates({ now, db });
-  assert.deepEqual(result, { scanned: 1, expired: 0, repaired: 1 });
+  assert.deepEqual([result.scanned, result.expired, result.repaired, result.failed], [1, 0, 1, 0]);
   assert.equal(write.status, "ACTIVE");
   assert.equal(write.currentPeriodEnd.toISOString(), activeUntil.toISOString());
 });
@@ -1172,14 +1175,17 @@ test("V13.3.1 expiry scheduler reconciles future ACTIVE aggregates and does not 
       update: async ({ data }) => { updates += 1; return { ...subscription, ...data }; },
     },
     creatorBillingEntitlement: { findFirst: async () => ({ creatorId: "creator-1", agencyId: "agency-1", coreValidUntil: activeUntil }) },
-    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async () => ({ id: "agency-1" }) },
+    agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", currentPeriodEnd: activeUntil, deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async () => ({ id: "agency-1" }) },
   };
   db.$transaction = async (fn) => fn(db);
   const service = loadEntitlementService(db);
+  attachReconciliationFixture(db, now, args => { findManyArgs = args; });
   const result = await service.reconcileExpiredBillingStates({ now, db });
-  assert.deepEqual(result, { scanned: 1, expired: 0, repaired: 0 });
+  assert.deepEqual([result.scanned, result.expired, result.repaired, result.failed], [1, 0, 0, 0]);
   assert.equal(Object.prototype.hasOwnProperty.call(findManyArgs.where, "currentPeriodEnd"), false);
-  assert.equal(updates, 1);
+  assert.equal(updates, 0);
+  assert.equal(findManyArgs.take, 100);
+  assert.deepEqual(findManyArgs.orderBy, { id: "asc" });
 });
 
 

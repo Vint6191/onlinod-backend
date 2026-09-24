@@ -2,6 +2,8 @@
 const { enableCommercialPricingWrite } = require("./billing-commercial-policy-service");
 
 const prisma = require("../prisma");
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { activeCore, effectiveBillingState, sameDate } = require("./billing-state-service");
 
 function asDate(value) {
   if (!value) return null;
@@ -78,10 +80,10 @@ function publicEntitlement(row, now = new Date()) {
     outreachSource: row.outreachSource ? String(row.outreachSource) : null,
     outreachPriceCents: Math.max(0, Number(row.outreachPriceCents || 0)),
     outreachValidUntil: row.outreachValidUntil ? asDate(row.outreachValidUntil)?.toISOString() || null : null,
-    coreActive: isFuture(row.coreValidUntil, now),
+    coreActive: activeCore(row, now),
     aiChatterActive: isFuture(row.aiChatterValidUntil, now),
     outreachActive: isFuture(row.outreachValidUntil, now),
-    expired: !isFuture(row.coreValidUntil, now),
+    expired: !activeCore(row, now),
     subscriptionStartedAt: row.subscriptionStartedAt ? asDate(row.subscriptionStartedAt)?.toISOString() || null : (row.coreValidFrom ? asDate(row.coreValidFrom)?.toISOString() || null : null),
     currentPeriodStartedAt: row.currentPeriodStartedAt ? asDate(row.currentPeriodStartedAt)?.toISOString() || null : null,
     currentPeriodEndsAt: row.currentPeriodEndsAt ? asDate(row.currentPeriodEndsAt)?.toISOString() || null : (row.coreValidUntil ? asDate(row.coreValidUntil)?.toISOString() || null : null),
@@ -164,6 +166,7 @@ async function activeEntitlementEnd(tx, agencyId, now = new Date()) {
     where: {
       agencyId,
       coreValidUntil: { gt: now },
+      OR: [{ coreValidFrom: null }, { coreValidFrom: { lte: now } }],
       // Soft-deleted creators are not billable product access. Keep financial
       // history, but never let a hidden/deleted creator keep the workspace
       // aggregate ACTIVE.
@@ -230,7 +233,7 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
     if (order.testMode && sandboxActivationEnabled !== true) return { activated: false, reason: "SANDBOX_ACTIVATION_DISABLED" };
 
     const lines = await ensureOrderLines(tx, order);
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const claim = await tx.billingOrder.updateMany({
       where: { id: orderId, status: "PAID", activatedAt: null },
       data: { activatedAt: now, paidAt: order.paidAt || now },
@@ -370,7 +373,7 @@ async function refundOrderEntitlements({ order, db = null }) {
     if (!currentOrder.activatedAt) return { downgraded: false, reason: "ORDER_NOT_ACTIVATED" };
 
     const lines = await tx.billingOrderLine.findMany({ where: { orderId }, orderBy: { createdAt: "asc" } });
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     let changed = 0;
 
     for (const line of lines) {
@@ -461,6 +464,7 @@ async function refundOrderEntitlements({ order, db = null }) {
 
 async function syncAgencyBillingAggregate(tx, agencyId, now = new Date(), { payment = null } = {}) {
   await lockAgencyBillingMutation(tx, agencyId);
+  now = await dbAuthorityNow({ db: tx, fallbackNow: now });
   const agency = await tx.agency.findUnique({ where: { id: agencyId } });
   if (!agency) throw Object.assign(new Error("Agency not found"), { code: "AGENCY_NOT_FOUND", status: 404 });
   const subscription = await tx.agencySubscription.findFirst({ where: { agencyId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] });
@@ -468,54 +472,27 @@ async function syncAgencyBillingAggregate(tx, agencyId, now = new Date(), { paym
   const billingMode = payment
     ? (payment.testMode ? String(subscription?.billingMode || "FREE_INTERNAL") : "CRYPTO")
     : subscription?.billingMode || "MANUAL";
-  let status;
-  if (agency.deletedAt || agency.billingSupportHold) status = "LOCKED";
-  else if (maxEnd || billingMode === "FREE_INTERNAL") status = "ACTIVE";
-  else if (isFuture(agency.trialEndsAt, now)) status = "TRIAL";
-  else if (subscription?.status === "CANCELLED") status = "CANCELLED";
-  else status = "PAST_DUE";
+  const { status } = effectiveBillingState({ agency, subscription, activeUntil: maxEnd, billingMode, now });
   // Paid validity is a projection of live creator facts, even while held/free.
   // Never retain an old currentPeriodEnd by falling back to the previous row.
   const data = { status, currentPeriodEnd: maxEnd, graceUntil: null, trialEndsAt: agency.trialEndsAt || null };
   if (payment) Object.assign(data, { billingMode, billingPeriod: payment.billingPeriod,
     currentPeriodStart: subscription?.status === "ACTIVE" && subscription.currentPeriodStart ? subscription.currentPeriodStart : now });
   let current = subscription;
-  if (subscription) current = await tx.agencySubscription.update({ where: { id: subscription.id }, data });
-  else if (maxEnd || payment || agency.billingSupportHold) current = await tx.agencySubscription.create({ data: { agencyId, billingMode, billingPeriod: "MONTHLY", ...data } });
-  await tx.agency.update({ where: { id: agencyId }, data: { status, currentPeriodEnd: maxEnd } });
+  const projectionChanged = subscription && (subscription.status !== status
+    || !sameDate(subscription.currentPeriodEnd, maxEnd)
+    || !sameDate(subscription.trialEndsAt, agency.trialEndsAt)
+    || subscription.graceUntil != null);
+  if (subscription && (projectionChanged || payment)) current = await tx.agencySubscription.update({ where: { id: subscription.id }, data });
+  else if (!subscription && (maxEnd || payment || agency.billingSupportHold)) current = await tx.agencySubscription.create({ data: { agencyId, billingMode, billingPeriod: "MONTHLY", ...data } });
+  if (agency.status !== status || !sameDate(agency.currentPeriodEnd, maxEnd)) {
+    await tx.agency.update({ where: { id: agencyId }, data: { status, currentPeriodEnd: maxEnd } });
+  }
   return { status, currentPeriodEnd: maxEnd, billingMode: current?.billingMode || billingMode, supportHold: agency.billingSupportHold === true };
 }
 
-async function reconcileExpiredBillingStates({ now = new Date(), db = null } = {}) {
-  const client = db || prisma;
-  // Reconcile every paid ACTIVE/GRACE aggregate, not only aggregates whose
-  // cached currentPeriodEnd is already due. A creator can be soft-deleted or
-  // a payment can be refunded before that cached date, so the aggregate must
-  // be derived from live creator entitlements rather than trusted as a timer.
-  const subscriptions = await client.agencySubscription.findMany({
-    where: {
-      status: { in: ["ACTIVE", "GRACE"] },
-      billingMode: { not: "FREE_INTERNAL" },
-    },
-    orderBy: { createdAt: "asc" },
-    take: 10000,
-  });
-  let expired = 0;
-  let repaired = 0;
-  for (const subscription of subscriptions) {
-    await client.$transaction(async (tx) => {
-      const beforeEnd = asDate(subscription.currentPeriodEnd);
-      const result = await syncAgencyBillingAggregate(tx, subscription.agencyId, now);
-      const afterEnd = asDate(result.currentPeriodEnd);
-      const changed =
-        String(result.status || "") !== String(subscription.status || "") ||
-        Number(beforeEnd?.getTime?.() || 0) !== Number(afterEnd?.getTime?.() || 0);
-      if (!changed) return;
-      if (result.status === "PAST_DUE") expired += 1;
-      else repaired += 1;
-    });
-  }
-  return { scanned: subscriptions.length, expired, repaired };
+async function reconcileExpiredBillingStates({ now = new Date(), db = null, ...options } = {}) {
+  return require("./billing-reconciliation-service").reconcileBillingStates({ db: db || prisma, now, ...options });
 }
 
 module.exports = {

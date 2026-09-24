@@ -21,6 +21,8 @@ const express = require("express");
 const prisma = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
 const { adminHttpAuditMiddleware } = require("../middleware/admin-audit");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
+const { effectiveBillingState, liveEntitlementEnd, activeCore, scopedEntitlement } = require("../services/billing-state-service");
 const { publicEntitlement } = require("../services/billing-entitlement-service");
 
 const router = require("./admin-router").createAdminRouter();
@@ -33,7 +35,7 @@ const { catalogForPolicy, configuredPrices } = require("../services/billing-cata
 const { readCommercialPolicy } = require("../services/billing-commercial-policy-service");
 
 // Agency statuses that count as paying / billable.
-const BILLABLE_STATUSES = new Set(["ACTIVE", "PAST_DUE", "GRACE"]);
+const BILLABLE_STATUSES = new Set(["ACTIVE"]);
 
 function sendErr(res, err, code = "ADMIN_BILLING_FAILED") {
   const status = Number(err?.status || 500) || 500;
@@ -53,7 +55,7 @@ function configuredLineCents(profile, policy) {
 function activePaidLineCents(entitlement, now = new Date()) {
   if (!entitlement) return 0;
   let cents = 0;
-  if (entitlement.coreValidUntil && new Date(entitlement.coreValidUntil) > now) cents += Number(entitlement.corePriceCents || 0);
+  if (activeCore(entitlement, now)) cents += Number(entitlement.corePriceCents || 0);
   if (entitlement.aiChatterValidUntil && new Date(entitlement.aiChatterValidUntil) > now) cents += Number(entitlement.aiChatterPriceCents || 0);
   if (entitlement.outreachValidUntil && new Date(entitlement.outreachValidUntil) > now) cents += Number(entitlement.outreachPriceCents || 0);
   return cents;
@@ -73,6 +75,7 @@ router.get("/tiers", async (_req, res) => {
 router.get("/overview", async (req, res) => {
   try {
     const policy = await readCommercialPolicy({ db: prisma });
+    const now = await dbAuthorityNow({ db: prisma });
     // Pull every non-deleted agency with its latest subscription + creators' billing.
     const agencies = await prisma.agency.findMany({
       where: { deletedAt: null },
@@ -93,9 +96,9 @@ router.get("/overview", async (req, res) => {
 
     for (const a of agencies) {
       const sub = a.subscriptions[0] || null;
-      const status = a.status || sub?.status || "TRIAL";
+      const activeUntil = liveEntitlementEnd(a.creators, a.id, now);
+      const { status } = effectiveBillingState({ agency: a, subscription: sub, activeUntil, now });
       const billable = BILLABLE_STATUSES.has(status) && sub?.billingMode !== "FREE_INTERNAL";
-      const now = new Date();
 
       let agencyCents = 0;
       let modelsCounted = 0;
@@ -103,7 +106,7 @@ router.get("/overview", async (req, res) => {
 
       for (const c of a.creators) {
         const bp = c.billingProfile;
-        const ent = c.billingEntitlement;
+        const ent = scopedEntitlement(c, a.id);
         const line = activePaidLineCents(ent, now);
         if (line > 0) {
           agencyCents += line;
@@ -128,8 +131,8 @@ router.get("/overview", async (req, res) => {
         modelsBilled: modelsCounted,
         monthlyCents: agencyCents,
         addons,
-        currentPeriodEnd: a.currentPeriodEnd || sub?.currentPeriodEnd || null,
-        trialEndsAt: a.trialEndsAt || sub?.trialEndsAt || null,
+        currentPeriodEnd: activeUntil,
+        trialEndsAt: a.trialEndsAt || null,
       });
     }
 
@@ -165,10 +168,13 @@ router.get("/agency/:id", async (req, res) => {
 
     const policy = await readCommercialPolicy({ db: prisma });
     const sub = agency.subscriptions[0] || null;
-    const status = agency.status || sub?.status || "TRIAL";
+    const now = await dbAuthorityNow({ db: prisma });
+    const activeUntil = liveEntitlementEnd(agency.creators, agency.id, now);
+    const { status, billingMode } = effectiveBillingState({ agency, subscription: sub, activeUntil, now });
 
     const models = agency.creators.map((c) => {
       const bp = c.billingProfile;
+      const ent = scopedEntitlement(c, agency.id);
       return {
         creatorId: c.id,
         displayName: c.displayName,
@@ -183,8 +189,8 @@ router.get("/agency/:id", async (req, res) => {
         hasProfile: !!bp,
         pricingRevision: bp?.pricingRevision || 0,
         configuredLineCents: configuredLineCents(bp, policy),
-        activeLineCents: activePaidLineCents(c.billingEntitlement),
-        entitlement: publicEntitlement(c.billingEntitlement),
+        activeLineCents: activePaidLineCents(ent, now),
+        entitlement: publicEntitlement(ent, now),
       };
     });
 
@@ -192,9 +198,9 @@ router.get("/agency/:id", async (req, res) => {
 
     return res.json({
       ok: true,
-      agency: { id: agency.id, name: agency.name, plan: agency.plan, status, currentPeriodEnd: agency.currentPeriodEnd, trialEndsAt: agency.trialEndsAt },
-      subscription: sub,
-      billable: BILLABLE_STATUSES.has(status),
+      agency: { id: agency.id, name: agency.name, plan: agency.plan, status, currentPeriodEnd: activeUntil, trialEndsAt: agency.trialEndsAt },
+      subscription: sub ? { ...sub, status, currentPeriodEnd: activeUntil, trialEndsAt: agency.trialEndsAt, graceUntil: null } : null,
+      billable: BILLABLE_STATUSES.has(status) && billingMode !== "FREE_INTERNAL",
       models,
       monthlyCents,
       tiers: catalogForPolicy(policy).tiers,

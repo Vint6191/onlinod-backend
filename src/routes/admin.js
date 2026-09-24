@@ -63,6 +63,7 @@ const { adminRequired } = require("../middleware/admin");
 const { getRetentionSettings } = require("../services/retention-service");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
+const { effectiveBillingState, liveEntitlementEnd, readBillingDashboard } = require("../services/billing-state-service");
 const { catalogForPolicy, configuredPrices } = require("../services/billing-catalog-service");
 const { readCommercialPolicy } = require("../services/billing-commercial-policy-service");
 const { retireCreatorWithinTransaction, publishCreatorRetirementControlEvents } = require("../services/creator-lifecycle-authority-service");
@@ -266,10 +267,7 @@ router.get("/dashboard", async (_req, res) => {
   try {
     // Counts. We compute multiple in parallel — Postgres handles it fine.
     const [
-      agenciesTotal,
-      agenciesActive,
-      agenciesTrial,
-      agenciesLocked,
+      billingDashboard,
       usersTotal,
       usersUnverified,
       creatorsTotal,
@@ -279,12 +277,8 @@ router.get("/dashboard", async (_req, res) => {
       activeCanonicalSessionsTotal,
       recentActions,
       recentSignups,
-      mrrAggregate,
     ] = await Promise.all([
-      prisma.agency.count({ where: { deletedAt: null } }),
-      prisma.agency.count({ where: { deletedAt: null, status: "ACTIVE" } }),
-      prisma.agency.count({ where: { deletedAt: null, status: "TRIAL" } }),
-      prisma.agency.count({ where: { deletedAt: null, status: { in: ["LOCKED", "PAST_DUE"] } } }),
+      readBillingDashboard({ db: prisma }),
       prisma.user.count({ where: { disabledAt: null } }),
       prisma.user.count({ where: { disabledAt: null, emailVerifiedAt: null } }),
       prisma.creatorAccount.count({ where: { deletedAt: null } }),
@@ -299,25 +293,6 @@ router.get("/dashboard", async (_req, res) => {
         take: 10,
         select: { id: true, email: true, name: true, createdAt: true, emailVerifiedAt: true },
       }),
-      // Exact active entitlement rows. Prices are snapshotted into the entitlement
-      // when access is granted, so later pricing-config edits do not rewrite MRR.
-      prisma.creatorBillingEntitlement.findMany({
-        where: {
-          agency: { deletedAt: null },
-          OR: [
-            { coreValidUntil: { gt: new Date() } },
-            { aiChatterValidUntil: { gt: new Date() } },
-            { outreachValidUntil: { gt: new Date() } },
-          ],
-        },
-        select: {
-          agencyId: true,
-          agency: { select: { subscriptions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1, select: { billingMode: true } } } },
-          corePriceCents: true, coreValidUntil: true,
-          aiChatterPriceCents: true, aiChatterValidUntil: true,
-          outreachPriceCents: true, outreachValidUntil: true,
-        },
-      }),
     ]);
 
     // Devices online — within last 5 min.
@@ -329,12 +304,7 @@ router.get("/dashboard", async (_req, res) => {
     return res.json({
       ok: true,
       counts: {
-        agencies: {
-          total: agenciesTotal,
-          active: agenciesActive,
-          trial: agenciesTrial,
-          locked: agenciesLocked,
-        },
+        agencies: billingDashboard.counts,
         users: {
           total: usersTotal,
           unverified: usersUnverified,
@@ -352,19 +322,7 @@ router.get("/dashboard", async (_req, res) => {
           activePortable: activeCanonicalSessionsTotal,
         },
       },
-      mrr: (() => {
-        const now = new Date();
-        let coreCents = 0;
-        let aiChatterCents = 0;
-        let outreachCents = 0;
-        for (const row of mrrAggregate) {
-          if (row.agency?.subscriptions?.[0]?.billingMode === "FREE_INTERNAL") continue;
-          if (row.coreValidUntil && new Date(row.coreValidUntil) > now) coreCents += Number(row.corePriceCents || 0);
-          if (row.aiChatterValidUntil && new Date(row.aiChatterValidUntil) > now) aiChatterCents += Number(row.aiChatterPriceCents || 0);
-          if (row.outreachValidUntil && new Date(row.outreachValidUntil) > now) outreachCents += Number(row.outreachPriceCents || 0);
-        }
-        return { coreCents, aiChatterCents, outreachCents };
-      })(),
+      mrr: billingDashboard.mrr,
       recentActions: recentActions.map((x) => ({
         id: x.id,
         action: x.action,
@@ -468,6 +426,7 @@ router.post("/system/retention/run", retentionCommand("run"));
 router.get("/agencies", async (req, res) => {
   try {
     const includeDeleted = req.query.includeDeleted === "1";
+    const now = await dbAuthorityNow({ db: prisma });
 
     const agencies = await prisma.agency.findMany({
       where: includeDeleted ? {} : { deletedAt: null },
@@ -475,19 +434,21 @@ router.get("/agencies", async (req, res) => {
       include: {
         members:        { include: { user: true }, orderBy: { createdAt: "asc" } },
         creators:       { include: { billingProfile: true, billingEntitlement: true, sessionState: { select: { status: true, portableReady: true, revision: true, updatedAt: true } } } },
-        subscriptions:  { orderBy: { createdAt: "desc" }, take: 1 },
+        subscriptions:  { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 },
       },
     });
 
     return res.json({
       ok: true,
       agencies: agencies.map((a) => {
-        const owner = a.members.find((m) => m.role === "OWNER") || a.members[0] || null;
+        const owner = a.members.find((m) => m.role === "OWNER" && !m.deletedAt && !m.deactivatedAt && !m.user?.disabledAt) || null;
+        const activeUntil = liveEntitlementEnd(a.creators, a.id, now);
+        const state = effectiveBillingState({ agency: a, subscription: a.subscriptions[0], activeUntil, now });
         return {
           id: a.id,
           name: a.name,
           plan: a.plan,
-          status: a.status || "TRIAL",
+          status: state.status,
           createdAt: a.createdAt,
           updatedAt: a.updatedAt,
           deletedAt: a.deletedAt,
@@ -498,8 +459,8 @@ router.get("/agencies", async (req, res) => {
             readyCreators: a.creators.filter((c) => c.status === "READY" && !c.deletedAt).length,
             activeCanonicalSessions: a.creators.filter((c) => !c.deletedAt && c.sessionState?.status === "ACTIVE" && c.sessionState?.portableReady === true).length,
           },
-          subscription: a.subscriptions[0] || null,
-          health: health(a),
+          subscription: a.subscriptions[0] ? { ...a.subscriptions[0], status: state.status, currentPeriodEnd: activeUntil, trialEndsAt: a.trialEndsAt, graceUntil: null } : null,
+          health: health({ ...a, status: state.status }),
         };
       }),
     });
@@ -532,6 +493,12 @@ router.get("/agencies/:id", async (req, res) => {
   // restore -> converge/resolve work -> retire again.
   const customPipelineBlockers = await agencyCustomPipelineBlockers({ db: prisma, agencyId: agency.id });
   const policy = await readCommercialPolicy({ db: prisma });
+  const now = await dbAuthorityNow({ db: prisma });
+  const activeUntil = liveEntitlementEnd(agency.creators, agency.id, now);
+  const state = effectiveBillingState({ agency, subscription: agency.subscriptions[0], activeUntil, now });
+  agency.status = state.status;
+  agency.currentPeriodEnd = activeUntil;
+  if (agency.subscriptions[0]) agency.subscriptions[0] = { ...agency.subscriptions[0], status: state.status, currentPeriodEnd: activeUntil, trialEndsAt: agency.trialEndsAt, graceUntil: null };
   for (const creator of agency.creators) creator.billingProfile = { ...creator.billingProfile, ...configuredPrices(creator.billingProfile, policy) };
   return res.json({ ok: true, agency, health: health(agency), customPipelineBlockers, creatorTiers: catalogForPolicy(policy).tiers, commercialPolicyRevision: policy.revision });
 });
