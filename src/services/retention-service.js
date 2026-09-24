@@ -1003,6 +1003,13 @@ async function runAnalyticsExecutionRetentionSweep(options = {}) {
         FROM "JobInstance" candidate
         WHERE candidate."jobKey" IN ('catchup_notifications_scan', 'financial_transactions_scan', 'fetch_campaigns')
           AND candidate."status" IN ('DONE', 'FAILED', 'CANCELLED', 'CANCELED', 'EXPIRED')
+          AND NOT EXISTS (
+            SELECT 1 FROM "DomainWorkItem" pending
+            WHERE pending."agencyId" = candidate."agencyId"
+              AND pending."workClass" = 'NOTIFICATION_CONSEQUENCES'
+              AND pending."objectType" = 'JobInstance' AND pending."objectId" = candidate."id"
+              AND pending."isOutstanding" = TRUE
+          )
           AND candidate."updatedAt" < $1
           AND NOT EXISTS (
             SELECT 1 FROM "CreatorNotificationScanItem" scan_item

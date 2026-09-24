@@ -900,14 +900,14 @@ async function upsertTrafficSourceScan({
   };
 }
 
-async function markTrafficFanValueDirty({ agencyId, creatorId, fanId, occurredAt = null, reason = null } = {}) {
+async function markTrafficFanValueDirty({ agencyId, creatorId, fanId, occurredAt = null, reason = null, db = prisma } = {}) {
   const cleanFanId = clean(fanId, 180);
   if (!agencyId || !creatorId || !cleanFanId) {
     return { ok: false, matched: 0, code: "BAD_TRAFFIC_DIRTY_INPUT" };
   }
 
   const when = asDate(occurredAt) || new Date();
-  const updated = await prisma.trafficSourceMember.updateMany({
+  const updated = await db.trafficSourceMember.updateMany({
     where: { agencyId, creatorId, fanId: cleanFanId },
     data: {
       lastRevenueAt: when,
@@ -916,6 +916,36 @@ async function markTrafficFanValueDirty({ agencyId, creatorId, fanId, occurredAt
   });
 
   return { ok: true, matched: updated.count || 0, fanId: cleanFanId, reason: clean(reason, 80) };
+}
+
+// Internal canonical-fact projection. The caller owns the transaction and has
+// loaded the fact from its agency/creator scope; no device/session is impersonated.
+async function projectCanonicalSubscriptionCompatibility({ db, job, fact }) {
+  const fanId = clean(fact.fanId, 180);
+  const amount = cents(fact.amountCents);
+  const eventType = String(fact.eventType || "").toLowerCase();
+  if (!fanId || amount <= 0 || /free|refund|chargeback|reversal/.test(eventType)) return { ignored: true };
+  const eventHash = clean(fact.eventHash, 220);
+  if (!eventHash) throw Object.assign(new Error("Canonical subscription fingerprint required"), { code: "NOTIFICATION_FACT_IDENTITY_REQUIRED" });
+  const occurredAt = asDate(fact.subscribedAt || fact.occurredAt);
+  if (!occurredAt) throw Object.assign(new Error("Canonical subscription time required"), { code: "NOTIFICATION_FACT_TIME_REQUIRED" });
+  const source = await db.trafficSourceMember.findFirst({
+    where: { agencyId: job.agencyId, creatorId: job.creatorId, fanId },
+    orderBy: [{ lastSeenAt: "desc" }, { createdAt: "desc" }], select: { sourceId: true },
+  });
+  const row = await db.creatorSubscriptionLedger.upsert({
+    where: { agencyId_eventHash: { agencyId: job.agencyId, eventHash } },
+    create: { agencyId: job.agencyId, creatorId: job.creatorId, accountId: job.params?.accountId || job.creatorId,
+      fanId, sourceId: source?.sourceId || null, eventHash, eventType: fact.eventType || "paid_subscribed",
+      amountCents: amount, currency: fact.currency || "USD", occurredAt,
+      externalEventId: clean(fact.externalEventId || fact.notificationId || eventHash, 220),
+      source: "canonical_subscription_fact" },
+    update: {},
+  });
+  if (row.creatorId !== job.creatorId) throw Object.assign(new Error("Subscription projection scope mismatch"), { code: "NOTIFICATION_FACT_SCOPE_MISMATCH" });
+  await applySubscriptionSideEffects(db, { agencyId: job.agencyId, creatorId: job.creatorId, fanId,
+    sourceId: row.sourceId, occurredAt: row.occurredAt });
+  return { ignored: false, ledgerId: row.id };
 }
 
 async function markTrafficFanValueDirtyFromDevice({
@@ -2036,6 +2066,7 @@ module.exports = {
   VALUE_SNAPSHOT_TTL_MS,
   upsertTrafficSourceScan,
   markTrafficFanValueDirty,
+  projectCanonicalSubscriptionCompatibility,
   getPendingTrafficValueFanIds,
   markTrafficFanValueDirtyFromDevice,
   ingestSubscriptionEvent,

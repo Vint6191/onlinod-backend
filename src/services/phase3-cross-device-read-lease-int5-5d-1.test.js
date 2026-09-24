@@ -18,6 +18,7 @@ function memoryDb() {
     get readLease() { return readLease; },
     observationTokens,
     async $queryRawUnsafe(sql, ...args) {
+      if (sql === 'SELECT clock_timestamp() AS "authorityNow"') return [{ authorityNow: new Date() }];
       if (/INSERT INTO "FanObservationReadLease"/.test(sql)) {
         const [creatorId, agencyId, token, requestId, jobId, deliveryId, deviceId, leaseRevision, purpose, ttlMs] = args;
         const now = new Date();
@@ -175,7 +176,7 @@ test("INT5.5D-1 source wiring makes new point-refresh jobs read-lease required a
   assert.match(jobs, /FAN_OBSERVATION_READ_LEASE_REQUIRED/);
   assert.match(jobs, /fanObservationReadLease\.updateMany\([\s\S]*expiresAt: new Date\(now\.getTime\(\) \+ FAN_OBSERVATION_READ_LEASE_TTL_MS\)/, "normal job keepalive must extend an in-flight causal read fence");
   assert.match(jobs, /sweepExpiredLeases[\s\S]*fanObservationReadLease\?\.deleteMany[\s\S]*jobId: job\.id[\s\S]*leaseRevision: job\.leaseRevision/, "expired job lease must release its creator causal fence in the same transaction");
-  assert.match(jobs, /return createFanObservationToken\(\{ db: tx, job, deviceId, leaseRevision, purpose, subjects \}\)/, "legacy jobs must retain the pre-cutover token path");
+  assert.match(jobs, /const issued = await createFanObservationToken\(\{ db: tx, job, deviceId, leaseRevision, purpose, subjects \}\)/, "legacy jobs must retain the pre-cutover token path");
   assert.match(routes, /observation-read-lease\/acquire/);
   assert.match(routes, /observation-read-lease\/release/);
   assert.match(schema, /model FanObservationReadLease[\s\S]*creatorId\s+String\s+@id/);

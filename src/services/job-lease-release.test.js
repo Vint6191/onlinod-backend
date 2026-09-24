@@ -13,6 +13,58 @@ function loadService(fixture) {
   fixture.db.jobInstance = fixture.db.jobInstance || {};
   if (typeof fixture.db.jobInstance.findMany !== "function") fixture.db.jobInstance.findMany = async () => [];
   if (typeof fixture.db.$transaction !== "function") fixture.db.$transaction = async (work) => work(fixture.db);
+  // Model a distinct TransactionClient and committed row updates. The old
+  // fixture returned the root and never advanced a reserved lease revision.
+  const rows = new Map();
+  const discovered = new Map();
+  const discover = fixture.db.jobInstance.findFirst;
+  if (discover) fixture.db.jobInstance.findFirst = async (args) => {
+    const candidate = await discover(args);
+    if (candidate?.id) discovered.set(candidate.id, candidate);
+    return candidate;
+  };
+  const read = fixture.db.jobInstance.findUnique;
+  if (read) fixture.db.jobInstance.findUnique = async (args) => {
+    const original = await read(args);
+    return original ? { ...original, ...(rows.get(args.where.id) || {}) } : original;
+  };
+  const update = fixture.db.jobInstance.updateMany;
+  if (update) fixture.db.jobInstance.updateMany = async (args) => {
+    const result = await update(args);
+    if (result.count && args.where.id) {
+      const previous = rows.get(args.where.id) || {};
+      const next = { ...previous };
+      for (const [key, value] of Object.entries(args.data)) {
+        next[key] = value && typeof value === "object" && "increment" in value
+          ? Number(previous[key] ?? args.where[key] ?? 0) + value.increment : value;
+      }
+      rows.set(args.where.id, next);
+    }
+    return result;
+  };
+  const transaction = fixture.db.$transaction;
+  fixture.db.$transaction = (callback, options) => transaction(async () => {
+    const tx = { ...fixture.db }; delete tx.$transaction;
+    if (fixture.db.$queryRawUnsafe) tx.$queryRawUnsafe = async (sql, ...args) => {
+      if (/FROM "JobInstance" WHERE "id"=\$1 FOR UPDATE/.test(sql)) {
+        const row = discovered.has(args[0])
+          ? { ...discovered.get(args[0]), ...(rows.get(args[0]) || {}) }
+          : await fixture.db.jobInstance.findUnique({ where: { id: args[0] } });
+        return row ? [row] : [];
+      }
+      return fixture.db.$queryRawUnsafe(sql, ...args);
+    };
+    if (fixture.db.$executeRawUnsafe) tx.$executeRawUnsafe = (sql, ...args) =>
+      sql.startsWith("SELECT set_config('lock_timeout'") ? Promise.resolve(1) : fixture.db.$executeRawUnsafe(sql, ...args);
+    return callback(tx);
+  }, options);
+  const consequencesModule = require.resolve("./notification-consequence-service");
+  require.cache[consequencesModule] = { exports: { publishNotificationConsequences: async ({ db, job }) => {
+    if (job.jobKey !== "catchup_notifications_scan" || job.params?.notificationMode !== "catchup") return null;
+    assert.notEqual(db, fixture.db);
+    fixture.notificationIntents = (fixture.notificationIntents || 0) + 1;
+    return { id: "durable-intent" };
+  } } };
   const prismaModule = require.resolve("../prisma");
   const resultModule = require.resolve("./job-result-service");
   const catalogModule = require.resolve("./job-catalog");
@@ -302,8 +354,10 @@ test("progress checkpoint uses bounded transaction options and reuses update res
     continuation: { driverPhase: "execute", jobContinuation: { offset: 80 } },
     chunkResult: { kind: "vault_unsorted_media_page" },
   });
-  assert.deepEqual(transactionOptions, { maxWait: 10_000, timeout: 30_000 });
-  assert.equal(findUniqueCalls, 1, "requireLease is the only job read");
+  assert.equal(transactionOptions.isolationLevel, "ReadCommitted");
+  assert.equal(transactionOptions.maxWait, 10000);
+  assert.ok(transactionOptions.timeout >= 29900 && transactionOptions.timeout <= 30000);
+  assert.equal(findUniqueCalls, 2, "authority lookup is followed by a fresh locked job read");
   assert.equal(updateCalls, 1, "the continuation update result is reused as the response row");
   assert.deepEqual(result.continuation, { driverPhase: "execute", jobContinuation: { offset: 80 } });
 });
@@ -395,7 +449,7 @@ test("vault completion keeps publication fenced with a longer bounded transactio
   const { completeJob } = loadService({
     db,
     applyJobResult: async ({ db: transactionDb }) => {
-      appliedInsideTransaction = transactionDb === db;
+      appliedInsideTransaction = transactionDb !== db && transactionDb.jobInstance === db.jobInstance;
       return { type: "vault_unsorted" };
     },
   });
@@ -409,7 +463,9 @@ test("vault completion keeps publication fenced with a longer bounded transactio
     progress: { current: 800, percent: 100 },
     result: { mode: "full", scanned: 800 },
   });
-  assert.deepEqual(transactionOptions, { maxWait: 10_000, timeout: 60_000 });
+  assert.equal(transactionOptions.isolationLevel, "ReadCommitted");
+  assert.equal(transactionOptions.maxWait, 10000);
+  assert.ok(transactionOptions.timeout >= 59900 && transactionOptions.timeout <= 60000);
   assert.equal(appliedInsideTransaction, true);
   assert.equal(result.job.status, "DONE");
 });
@@ -599,7 +655,7 @@ test("notification completion reserves a new lease revision before durable side 
   assert.equal(result.job.status, "DONE");
 });
 
-test("bounded notification catch-up marks DONE before deferred compatibility projection", async () => {
+test("bounded notification catch-up commits DONE with durable intent and no memory-only projection", async () => {
   const token = "bounded-notification-token";
   const now = new Date();
   const job = {
@@ -645,7 +701,8 @@ test("bounded notification catch-up marks DONE before deferred compatibility pro
   const { completeJob } = loadService({
     db,
     completeNotificationSync: async ({ db: suppliedDb, successful }) => {
-      assert.equal(suppliedDb, db);
+      assert.notEqual(suppliedDb, db);
+      assert.equal(suppliedDb.jobInstance, db.jobInstance);
       assert.equal(successful, true);
       order.push("sync-finalized");
       return { id: "sync-1" };
@@ -689,8 +746,8 @@ test("bounded notification catch-up marks DONE before deferred compatibility pro
   assert.equal(updates[0].data.status, "DONE");
   assert.deepEqual(order.slice(0, 2), ["done-fence", "sync-finalized"]);
   assert.equal(order.includes("compatibility"), false, "compatibility must not block completion response");
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(order.includes("compatibility"), true);
+  await new Promise((resolve) => globalThis.setImmediate(resolve));
+  assert.equal(order.includes("compatibility"), false, "maintenance consumes durable work after restart");
 });
 
 
@@ -1310,7 +1367,8 @@ test("Audit13 generic completion reservation, projector and terminal commit shar
   const { completeJob } = loadService({
     db: item.db,
     applyJobResult: async ({ db }) => {
-      assert.equal(db, item.db, "projector must use the completion transaction client");
+      assert.notEqual(db, item.db);
+      assert.equal(db.jobInstance, item.db.jobInstance, "projector must use the completion transaction client");
       order.push("projection");
       return { ok: true, type: "traffic" };
     },
@@ -1338,7 +1396,7 @@ test("Audit13 renew rechecks execution access with a transaction row lock before
   const locks = [];
   const { renewLease } = loadService({ ...item, assertExecutionAccessFence: async (input) => { locks.push(input.lock === true); return { ok: true }; } });
   await renewLease({ jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3, leaseMs: 60_000 });
-  assert.deepEqual(locks, [false, true]);
+  assert.deepEqual(locks, [true]);
 });
 
 test("Audit13 cooperative release rechecks execution access with a transaction row lock before reschedule", async () => {
@@ -1349,7 +1407,7 @@ test("Audit13 cooperative release rechecks execution access with a transaction r
   const locks = [];
   const { releaseJob } = loadService({ ...item, assertExecutionAccessFence: async (input) => { locks.push(input.lock === true); return { ok: true }; } });
   await releaseJob({ jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3, reason: "context unavailable" });
-  assert.deepEqual(locks, [false, true]);
+  assert.deepEqual(locks, [true]);
 });
 
 test("Audit13 failure report rechecks execution access with a transaction row lock before domain projection", async () => {
@@ -1360,7 +1418,7 @@ test("Audit13 failure report rechecks execution access with a transaction row lo
   const locks = [];
   const { failJob } = loadService({ ...item, assertExecutionAccessFence: async (input) => { locks.push(input.lock === true); return { ok: true }; } });
   await failJob({ jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3, error: "temporary", retryable: true });
-  assert.deepEqual(locks, [false, true]);
+  assert.deepEqual(locks, [true]);
 });
 
 test("job claim lease timestamps use PostgreSQL authority instead of replica wall clock", async () => {
@@ -1604,4 +1662,42 @@ test("Campaign claim rejects a worker missing resumable-pagination capability be
   });
   assert.equal(result.reason, "no-capabilities");
   assert.equal(candidateReads, 0, "an old v9 worker must not even enter Campaign candidate arbitration");
+});
+
+for (const command of ["renewLease", "progressJob", "completeJob", "acquireJobFanObservationReadLease", "issueFanObservationToken"]) {
+  test(`I3 ${command} rejects a lease that expires while access locks wait`, async () => {
+    const item = fixture();
+    const start = new Date("2040-01-01T00:00:00Z");
+    let clock = start;
+    item.job.leaseUntil = new Date(start.getTime() + 1000);
+    item.job.creatorId = "creator-1";
+    item.job.jobKey = "fan_data_point_refresh";
+    item.job.params = { observationReadLeaseVersion: 1 };
+    item.db.$queryRawUnsafe = async (sql) => {
+      assert.match(sql, /clock_timestamp/);
+      return [{ authorityNow: clock }];
+    };
+    item.assertExecutionAccessFence = async ({ lock }) => { if (lock) clock = new Date(start.getTime() + 5000); return { ok: true }; };
+    let applied = false;
+    item.applyJobResult = item.applyJobChunk = async () => { applied = true; return {}; };
+    const service = loadService(item);
+    await assert.rejects(() => service[command]({ jobId: item.job.id, userId: "user-1", deviceId: "device-1",
+      leaseToken: item.token, leaseRevision: 3, purpose: "fan_data_point_refresh", requestId: "req-expiry", subjects: ["fan-1"] }),
+    { code: "JOB_LEASE_EXPIRED" });
+    assert.equal(item.update(), null);
+    assert.equal(applied, false);
+  });
+}
+
+test("I3 renewal deadline is computed from time after locks, not request admission", async () => {
+  const item = fixture();
+  const start = new Date("2040-01-01T00:00:00Z");
+  let clock = start;
+  item.job.leaseUntil = new Date(start.getTime() + 120000);
+  item.db.$queryRawUnsafe = async () => [{ authorityNow: clock }];
+  item.assertExecutionAccessFence = async () => { clock = new Date(start.getTime() + 5000); return { ok: true }; };
+  const service = loadService(item);
+  const result = await service.renewLease({ jobId: item.job.id, userId: "user-1", deviceId: "device-1",
+    leaseToken: item.token, leaseRevision: 3, leaseMs: 30000 });
+  assert.equal(result.leaseUntil.toISOString(), "2040-01-01T00:00:35.000Z");
 });

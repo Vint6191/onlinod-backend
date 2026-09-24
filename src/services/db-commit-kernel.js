@@ -21,6 +21,8 @@ const COMMIT_PROFILES = Object.freeze({
   BILLING_RECOVERY: Object.freeze({ isolationLevel: "ReadCommitted", maxWait: 5000, timeout: 15000, deadlineMs: 20000, lockTimeoutMs: 5000, statementTimeoutMs: 15000 }),
   TEAM_MANAGEMENT: Object.freeze({ isolationLevel: "Serializable", maxWait: 5000, timeout: 15000, deadlineMs: 20000, lockTimeoutMs: 5000, statementTimeoutMs: 15000 }),
   ADMIN_COMMAND: Object.freeze({ isolationLevel: "ReadCommitted", maxWait: 5000, timeout: 15000, deadlineMs: 20000, lockTimeoutMs: 5000, statementTimeoutMs: 15000 }),
+  JOB_CHUNK: Object.freeze({ isolationLevel: "ReadCommitted", maxWait: 10000, timeout: 30000, deadlineMs: 40000, lockTimeoutMs: 5000, statementTimeoutMs: 25000 }),
+  JOB_COMPLETION: Object.freeze({ isolationLevel: "ReadCommitted", maxWait: 10000, timeout: 60000, deadlineMs: 70000, lockTimeoutMs: 5000, statementTimeoutMs: 55000 }),
 });
 
 function failure(code, message, cause = undefined) {

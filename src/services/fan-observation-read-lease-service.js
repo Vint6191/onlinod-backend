@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 const { createFanObservationToken, createActionFanObservationToken } = require("./fan-observation-token-service");
 
 const FAN_OBSERVATION_READ_LEASE_TTL_MS = 4 * 60_000;
@@ -67,7 +68,7 @@ async function acquireFanObservationReadLease({ db, ttlMs = FAN_OBSERVATION_READ
   const rows = await db.$queryRawUnsafe(`
     INSERT INTO "FanObservationReadLease" (
       "creatorId","agencyId","token","requestId","jobId","deliveryId","deviceId","leaseRevision","purpose","acquiredAt","expiresAt","updatedAt"
-    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP + ($10::bigint * INTERVAL '1 millisecond'),CURRENT_TIMESTAMP)
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(clock_timestamp() AT TIME ZONE 'UTC'),(clock_timestamp() AT TIME ZONE 'UTC') + ($10::bigint * INTERVAL '1 millisecond'),(clock_timestamp() AT TIME ZONE 'UTC'))
     ON CONFLICT ("creatorId") DO UPDATE SET
       "agencyId" = EXCLUDED."agencyId",
       "token" = EXCLUDED."token",
@@ -77,10 +78,10 @@ async function acquireFanObservationReadLease({ db, ttlMs = FAN_OBSERVATION_READ
       "deviceId" = EXCLUDED."deviceId",
       "leaseRevision" = EXCLUDED."leaseRevision",
       "purpose" = EXCLUDED."purpose",
-      "acquiredAt" = CURRENT_TIMESTAMP,
-      "expiresAt" = CURRENT_TIMESTAMP + ($10::bigint * INTERVAL '1 millisecond'),
-      "updatedAt" = CURRENT_TIMESTAMP
-    WHERE "FanObservationReadLease"."expiresAt" <= CURRENT_TIMESTAMP
+      "acquiredAt" = (clock_timestamp() AT TIME ZONE 'UTC'),
+      "expiresAt" = (clock_timestamp() AT TIME ZONE 'UTC') + ($10::bigint * INTERVAL '1 millisecond'),
+      "updatedAt" = (clock_timestamp() AT TIME ZONE 'UTC')
+    WHERE "FanObservationReadLease"."expiresAt" <= (clock_timestamp() AT TIME ZONE 'UTC')
     RETURNING *
   `, scope.creatorId, scope.agencyId, token, scope.requestId, scope.jobId, scope.deliveryId,
   scope.deviceId, scope.leaseRevision, scope.purpose, boundedTtlMs);
@@ -90,7 +91,7 @@ async function acquireFanObservationReadLease({ db, ttlMs = FAN_OBSERVATION_READ
     return { acquired: true, token: acquired.token, acquiredAt: acquired.acquiredAt, expiresAt: acquired.expiresAt };
   }
 
-  const current = await db.fanObservationReadLease.findUnique({ where: { creatorId: scope.creatorId } });
+  const current = await lockReadLease(db, scope.creatorId);
   if (sameAcquire(current, scope)) {
     return { acquired: true, token: current.token, acquiredAt: current.acquiredAt, expiresAt: current.expiresAt, replay: true };
   }
@@ -106,10 +107,18 @@ async function lockReadLease(db, creatorId) {
   const rows = await db.$queryRawUnsafe(`
     SELECT * FROM "FanObservationReadLease"
     WHERE "creatorId" = $1
-      AND "expiresAt" > CURRENT_TIMESTAMP
     FOR UPDATE
   `, creatorId);
-  return rows?.[0] || null;
+  const row = rows?.[0] || null;
+  const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
+  return row && new Date(row.expiresAt) > now ? row : null;
+}
+
+async function assertReadDeadline(db, row) {
+  const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
+  if (!row || new Date(row.expiresAt) <= now) {
+    throw new FanObservationReadLeaseError("FAN_OBSERVATION_READ_LEASE_INVALID", "Observation read lease expired during completion", 409);
+  }
 }
 
 function assertReadLease(row, { token, jobId = null, deliveryId = null, deviceId, leaseRevision, purpose }) {
@@ -133,6 +142,7 @@ async function completeJobFanObservationReadLease({ db, job, deviceId, leaseRevi
   const row = await lockReadLease(db, job.creatorId);
   assertReadLease(row, { token: readLeaseToken, jobId: job.id, deviceId, leaseRevision, purpose });
   const issued = await createFanObservationToken({ db, job, deviceId, leaseRevision, purpose, subjects });
+  await assertReadDeadline(db, row);
   const released = await db.fanObservationReadLease.deleteMany({
     where: { creatorId: job.creatorId, token: clean(readLeaseToken, 500), jobId: job.id, deviceId: clean(deviceId, 200), leaseRevision: Number(leaseRevision), purpose: clean(purpose, 120) },
   });
@@ -150,6 +160,7 @@ async function completeDeliveryFanObservationReadLease({ db, delivery, deviceId,
   const issued = await createActionFanObservationToken({
     db, delivery, deviceId, leaseRevision, purpose, subjects,
   });
+  await assertReadDeadline(db, row);
   const released = await db.fanObservationReadLease.deleteMany({
     where: { creatorId: delivery.creatorId, token: clean(readLeaseToken, 500), deliveryId: delivery.id, deviceId: clean(deviceId, 200), leaseRevision: Number(leaseRevision), purpose: clean(purpose, 120) },
   });

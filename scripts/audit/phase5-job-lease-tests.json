@@ -1,0 +1,27 @@
+{
+  "active": [
+    "src/services/analytics-retention-proof.test.js",
+    "src/services/bump-service.test.js",
+    "src/services/bump-template-convergence-f52.test.js",
+    "src/services/job-lease-release.test.js",
+    "src/services/notification-collection-command-authority.test.js",
+    "src/services/notification-facts-projection.test.js",
+    "src/services/notification-facts-service.test.js",
+    "src/services/notification-scan-control-service.test.js",
+    "src/services/notification-sync-state-service.test.js",
+    "src/services/phase2-maintenance-cluster-ownership.test.js",
+    "src/services/phase3-trusted-fan-observation-int4-1a.test.js",
+    "src/services/team-observation-realtime-coverage.test.js",
+    "src/services/phase3-cross-device-read-lease-int5-5d-1.test.js",
+    "src/services/phase3-cross-device-read-lease-int5-5d-2.test.js",
+    "src/services/phase3-cross-device-action-read-lease-int5-5d-3.test.js",
+    "src/services/phase3-read-lease-owner-transition-int5-5d-4.test.js",
+    "src/services/phase3-analytics-final-authority-cutover.test.js"
+  ],
+  "historicalOnly": [
+    {
+      "file": "src/services/notification-facts-schema.test.js",
+      "reason": "One source-format assertion already fails on accepted I2 baseline (relation whitespace); retained in baseline/candidate diagnostic, not counted as PASS."
+    }
+  ]
+}

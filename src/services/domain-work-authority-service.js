@@ -22,6 +22,7 @@ const DOMAIN_WORK_MEMBER_SCOPE_CREATOR_PROBE = 16;
 const DOMAIN_DEPENDENCY_WAKE_OBJECT_TYPE = "DomainDependency";
 
 const WORK_CLASS = Object.freeze({
+  NOTIFICATION_CONSEQUENCES: "NOTIFICATION_CONSEQUENCES",
   ADMIN_BILLING_PRICING: "ADMIN_BILLING_PRICING",
   CUSTOM_COMMUNICATION: "CUSTOM_COMMUNICATION",
   CUSTOM_REMINDER: "CUSTOM_REMINDER",
@@ -242,7 +243,7 @@ async function activeDomainWorkGeneration({ db, workClass, fallback = DOMAIN_WOR
         klass,
       );
       return clean(rows?.[0]?.activeGeneration, 120) || clean(fallback, 120) || DOMAIN_WORK_GENERATION;
-    } catch (_) {}
+    } catch (_) { /* Legacy adapter probing falls through to the existing fallback. */ }
   }
   return clean(fallback, 120) || DOMAIN_WORK_GENERATION;
 }
@@ -268,7 +269,7 @@ async function probeCurrentDomainWorkPresence({ db, agencyId, workClass, activeG
         a, klass, generation,
       );
       return Array.isArray(rows) ? rows.length > 0 : null;
-    } catch (_) {}
+    } catch (_) { /* Legacy adapter probing falls through to the existing fallback. */ }
   }
   return null;
 }

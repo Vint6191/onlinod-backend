@@ -1027,6 +1027,7 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
           providerOccurredAt: date(event.createdAt || event.occurredAt || event.ts)?.toISOString?.() || null,
         })).sort((a, b) => String(a.fanId).localeCompare(String(b.fanId))));
         return scheduleFanDataPointRefresh({
+          db: commitDb,
           agencyId,
           creatorId,
           onlyFansUserIds: observed.fanIds,
@@ -1042,6 +1043,9 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
         });
       });
       summary.subscriptionReconcile = { fanIds: observed.fanIds, decision: refreshDecision };
+      if (Number(refreshDecision?.requested || 0) > 0 && refreshDecision?.durable !== true) {
+        throw Object.assign(new Error("Subscription reconciliation was not durably scheduled"), { code: "FAN_REFRESH_INTENT_NOT_DURABLE" });
+      }
 
       const plannedCount = await runCommit(async (commitDb) => {
         const control = await getAutomationControlSnapshot({ agencyId, creatorId, db: commitDb });

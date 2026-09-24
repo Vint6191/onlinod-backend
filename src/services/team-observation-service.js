@@ -745,6 +745,9 @@ async function recordCatchupJobFailure({ job, error, db = prisma, terminal = tru
 }
 
 module.exports = {
+  projectSaleProjectionFact,
+  projectTipProjectionFact,
+  projectSubscriptionProjectionFact,
   CATCHUP_JOB_KEY,
   updateObservationFromHeartbeat,
   recordRealtimeObservationPing,

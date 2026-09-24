@@ -151,7 +151,7 @@ test("Subscriber publication is restartable bounded work outside generic complet
   assert.match(schema, /publicationStatus\s+String\s+@default\("PENDING"\)/);
   assert.match(schema, /publicationCursorId\s+String\?/);
   const subscriberCompletion = leases.slice(leases.indexOf('if (job.jobKey === "subscriber_directory_scan")'), leases.indexOf('if (["fetch_earnings"'));
-  assert.match(subscriberCompletion, /JOB_CHUNK_TRANSACTION_OPTIONS/);
+  assert.match(subscriberCompletion, /profile: "JOB_CHUNK"/);
   assert.match(subscriberCompletion, /applyJobResult\(\{ db: prisma/);
   assert.doesNotMatch(subscriberCompletion, /applyJobResult\(\{ db: tx/);
   const failStart = leases.indexOf("async function failJob");
@@ -201,7 +201,7 @@ test("A21 clean bootstrap, generation CAS and exact Subscriber cursor scale are 
 
 test("index lifecycle contract requires a dedicated ReadCommitted session and bounded one-connection worker", async () => {
   const url = preflight.indexLifecycleWorkerDatabaseUrl("postgresql://u:p@db.example/x?schema=public");
-  const parsed = new URL(url);
+  const parsed = new globalThis.URL(url);
   assert.equal(parsed.searchParams.get("connection_limit"), "1");
   assert.equal(parsed.searchParams.get("pool_timeout"), "10");
   assert.equal(parsed.searchParams.get("connect_timeout"), "10");
@@ -232,7 +232,7 @@ test("final migration carries bounded subscriber cursor, durable signal lease an
   assert.match(schema, /pageOffset\s+Int\?/);
   assert.match(schema, /model CampaignFanRefreshPromotionSignal/);
   assert.match(schema, /@@unique\(\[agencyId, creatorId\], map: "CampaignFanRefreshPromotionSignal_agency_creator_key"\)/);
-  assert.match(migration, /CONSTRAINT "CampaignFanRefreshPromotionSignal_agency_creator_key" UNIQUE \(\"agencyId\", \"creatorId\"\)/);
+  assert.match(migration, /CONSTRAINT "CampaignFanRefreshPromotionSignal_agency_creator_key" UNIQUE \("agencyId", "creatorId"\)/);
   assert.match(schema, /claimToken\s+String\?/);
   assert.match(schema, /claimUntil\s+DateTime\?/);
   assert.match(migration, /CampaignFanRefreshPromotionSignal_due_claim_creator_idx/);

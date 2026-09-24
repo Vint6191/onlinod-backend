@@ -49,7 +49,9 @@
     "test:phase5-commit": "node scripts/audit/phase5-commit-test-gate.js",
     "audit:phase5-commit-postgres": "node scripts/audit/phase5-commit-postgres-proof.js",
     "test:phase5-team": "node scripts/audit/phase5-commit-test-gate.js phase5-team-command-tests.json",
-    "audit:phase5-team-postgres": "node scripts/audit/phase5-team-command-postgres-proof.js"
+    "audit:phase5-team-postgres": "node scripts/audit/phase5-team-command-postgres-proof.js",
+    "test:phase5-jobs": "node scripts/audit/phase5-commit-test-gate.js phase5-job-lease-tests.json",
+    "audit:phase5-jobs-postgres": "node scripts/audit/phase5-job-lease-postgres-proof.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

@@ -16,6 +16,7 @@ function memoryDb() {
   return {
     get readLease() { return readLease; },
     async $queryRawUnsafe(sql, ...args) {
+      if (sql === 'SELECT clock_timestamp() AS "authorityNow"') return [{ authorityNow: new Date() }];
       if (/INSERT INTO "FanObservationReadLease"/.test(sql)) {
         const [creatorId, agencyId, token, requestId, jobId, deliveryId, deviceId, leaseRevision, purpose, ttlMs] = args;
         const now = new Date();

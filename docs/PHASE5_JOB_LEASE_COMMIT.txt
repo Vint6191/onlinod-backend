@@ -1,0 +1,70 @@
+PHASE 5A / I3 — JOB LEASE COMMIT AND DURABLE NOTIFICATION CONSEQUENCES
+
+Scope and authority
+Job claim, renewal, progress, failure/release, read-lease operations and short
+completion phases use db-commit-kernel roots. An attempt rechecks access and the
+locked JobInstance tuple, then reads fresh database time. Claim also rechecks
+billing/device telemetry after capacity locks; if command data changed during
+the wait it repeats candidate selection and admission. Retryable SQLSTATE errors
+retry the whole short commit, with at most three attempts and a total deadline.
+
+JOB_CHUNK: ReadCommitted, maxWait 10 s, transaction timeout 30 s, total 40 s,
+lock_timeout 5 s, statement_timeout 25 s.
+JOB_COMPLETION: ReadCommitted, maxWait 10 s, transaction timeout 60 s, total 70 s,
+lock_timeout 5 s, statement_timeout 55 s.
+The kernel may shorten these budgets to the remaining monotonic deadline.
+Analytic/subscriber/full-notification multi-phase publication remains explicit;
+it is not replayed inside one long root. Each reservation/final commit rechecks
+the live exact owner/token/revision. Cooperative expired-owner release is allowed.
+
+Notification consequences
+Catch-up progress writes canonical facts and publishes a NOTIFICATION_CONSEQUENCES
+DomainWorkItem in the same transaction. Bounded catch-up completion commits
+terminal state, page-receipt verification, notification sync and durable intent
+together. The old detached setImmediate completion projector is removed here.
+This uses the existing DomainWork schema, generation, fair claims and failure
+policy. No new migration, activation flag or Desktop protocol is introduced.
+
+The maintenance pump drains one claimed work item at a time, in pages of 50 facts.
+An active/nonterminal source job yields for 30 seconds; producer publication wakes
+work again. Worker lock order is JobInstance -> DomainWorkItem, matching producer
+order. Effects and progress cursor/ack use the same transaction; lost ownership
+or projection errors roll the page back. Retention preserves a source JobInstance
+while its consequence intent is outstanding, including reconcile-required work.
+Canonical facts are read by agency, creator and sourceJobId. Sales/tips mark
+traffic value dirty; subscriptions reuse their canonical event fingerprint for
+the compatibility ledger and call Bump planning with the same transaction client.
+Required fan-refresh publication failures cannot be silently acknowledged.
+The worker never re-ingests money or replays completeNotificationSync; delayed
+projection cannot rewind a newer collector frontier.
+
+Shared observation read leases use live PostgreSQL clock_timestamp rather than
+transaction-start CURRENT_TIMESTAMP. Completion checks expiration after row locks
+and after token creation. Job callers also recheck the parent job lease at the
+end of this short operation. Existing delivery callers retain their wire format.
+The expiry sweep handles at most 100 candidates; a claim only sweeps its agency.
+
+Verification
+  npm run test:phase5-jobs
+  npm run test:phase5-commit
+  npm run test:phase5-team
+  PHASE5_PROOF_RUNTIME=/path/to/audit-runtime npm run audit:phase5-jobs-postgres
+The separate audit runtime supplies @electric-sql/pglite and pglite-socket.
+The proof creates an isolated PostgreSQL WASM instance, applies migrations using
+Prisma TCP, and sets the already-established Team/DomainWork activation state.
+It never uses production DATABASE_URL. Controlled SQL/trigger faults verify
+rollback/retry; module reload verifies cursor resumption. They do not constitute
+native multi-client contention, an OS process kill or a platform load test.
+
+Open phase gates
+This is one Phase 5A implementation block, not SOURCE CLOSED / SCALE CLOSED.
+Pre-I3 terminal jobs without an intent need a separate bounded historical
+reconciliation decision/backfill. Other transaction families remain on the master
+roadmap. Per-job paging bounds rows returned, not every query's scanned rows;
+existing sourceJobId indexes, ordered cursor query plans, large per-day aggregates,
+many agencies/creators, 100 workers and native multi-replica behavior still require
+scale evidence. No claim of exactly-once external delivery is made.
+
+Install all changed files together on the accepted I2 actual.
+Render build remains: npm install && npm run prisma:migrate
+No changes to Desktop, runtime dependencies, schema or migration chain.
