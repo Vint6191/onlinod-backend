@@ -1,0 +1,17 @@
+{
+  "active": [
+    "src/services/db-commit-kernel.test.js",
+    "src/services/admin-commit-kernel.test.js",
+    "src/services/admin-command-foundation.test.js",
+    "src/services/admin-bulk-pricing-command.test.js",
+    "src/services/admin-retention-ui.test.js",
+    "src/services/admin-support-view.test.js",
+    "src/services/admin-operational-command.test.js",
+    "src/services/retention-bounded-work.test.js",
+    "src/services/actual60-int60-8-refreshsession-retention.test.js",
+    "src/services/analytics-retention-proof.test.js",
+    "src/services/phase2-team-projection-retention-v3.test.js",
+    "src/services/automation-history-service.test.js"
+  ],
+  "historicalOnly": []
+}

@@ -2,7 +2,7 @@
 
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { ACTIONS, adminError, commandIdSchema, intentHash } = require("./admin-command-contract");
-const { lockAdminActor } = require("./admin-session-authority-service");
+const { lockAdminActor, assertAdminSessionLifetime: assertCommandSessionLifetime } = require("./admin-session-authority-service");
 const { runRootCommit, discardCommitHints, classifyCommitConflict } = require("./db-commit-kernel");
 
 async function lockCommandIdentity(tx, actorId, commandId) {
@@ -13,14 +13,6 @@ function safeJson(value) {
   const json = JSON.stringify(value, (_key, item) => typeof item === "bigint" ? String(item) : item);
   if (json === undefined || Buffer.byteLength(json) > 32768) throw adminError("ADMIN_COMMAND_RESULT_TOO_LARGE", "Command result exceeds its storage budget", 500);
   return JSON.parse(json);
-}
-
-async function assertCommandSessionLifetime(tx, authority) {
-  // AdminUser/AdminSession rows stay locked throughout the command. Their
-  // expiration clock can still advance while domain locks/work are awaited.
-  if (new Date(authority.session.expiresAt) <= await dbAuthorityNow({ db: tx })) {
-    throw adminError("ADMIN_AUTH_INVALID", "Admin session expired while the command was in progress", 401);
-  }
 }
 
 async function executeAdminCommand({ db, actor, commandId, action, targetId, payload, work }) {

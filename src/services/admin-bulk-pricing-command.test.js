@@ -69,3 +69,53 @@ test("cancellation audit failure leaves the original job resumable without a fak
  await assert.rejects(cancelAdminBulkPricing({db:m.db,actor,commandId:randomUUID(),agencyId:"agency-a",payload:{targetCommandId:accepted.commandId,reason:"Cancel"}}));
  assert.equal(m.state.commands.length,1);assert.equal(m.state.commands[0].status,"QUEUED");
 });
+
+for (const boundary of ["creator-lock", "item-audit", "settlement"]) test(`session expiry at ${boundary} rolls back the whole target and records PAUSED_AUTH`, async () => {
+  let armed = false;
+  const m = createMemoryDb({ extendClient(api, { clock }) {
+    const expire = () => { if (armed) { armed = false; clock.setTime(clock.getTime() + 2000); } };
+    const query = api.$queryRawUnsafe;
+    api.$queryRawUnsafe = async (sql, ...args) => {
+      const result = await query(sql, ...args);
+      if ((boundary === "creator-lock" && sql.includes('FROM "CreatorBillingProfile"')) || (boundary === "settlement" && sql.includes('UPDATE "DomainWorkItem"'))) expire();
+      return result;
+    };
+    const create = api.adminCommandAudit.create;
+    api.adminCommandAudit.create = async input => {
+      const result = await create(input);
+      if (boundary === "item-audit" && input.data.event === "SUCCEEDED") expire();
+      return result;
+    };
+    return api;
+  } });
+  await submit(m); const c = claim(m);
+  m.state.sessions[0].expiresAt = new Date(m.clock.getTime() + 1000);
+  armed = true;
+  const result = await run(m, c);
+  assert.equal(armed, false); assert.equal(result.status, "PAUSED_AUTH");
+  assert.equal(m.state.profiles[0].tier, "STARTER"); assert.equal(m.state.profiles[0].pricingRevision, 1);
+  assert.equal(m.state.commands[0].executionProgress.nextIndex, 0);
+  assert.equal(m.state.commands[0].executionProgress.outcomes.length, 0);
+  assert.deepEqual(m.state.audit.map(a => a.event), ["ACCEPTED", "PAUSED_AUTH"]);
+  assert.equal(m.state.workItems[0].state, "DONE");
+});
+
+for (const code of ["40001", "40P01"]) test(`bulk ${code} retries the entire attempt with one committed price, cursor and receipt`, async () => {
+  const m = createMemoryDb(); await submit(m); const c = claim(m);
+  let attempts = 0;
+  const db = { $transaction: (work, options) => m.db.$transaction(async tx => {
+    const result = await work(tx);
+    if (++attempts === 1) throw Object.assign(Error("Controlled conflict"), { code: "P2010", meta: { code } });
+    return result;
+  }, options) };
+  const result = await processAdminBulkPricingItem({ db, ...c });
+  assert.equal(attempts, 2); assert.equal(result.status, "SUCCEEDED");
+  assert.equal(m.state.profiles[0].pricingRevision, 2);
+  assert.equal(m.state.commands[0].executionProgress.nextIndex, 1);
+  assert.equal(m.state.audit.length, 2);
+});
+
+test("SUPPORT bulk pricing retains its existing allowed role", async () => {
+  const m = createMemoryDb(); m.state.admins[0].role = "SUPPORT";
+  await submit(m); assert.equal((await run(m)).status, "SUCCEEDED");
+});

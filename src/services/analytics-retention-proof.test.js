@@ -1,4 +1,5 @@
 "use strict";
+const { withTransactionClient } = require("../../scripts/test-support/transaction-client-fixture");
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -14,6 +15,7 @@ const distributedClosureMigrationPath = path.join(__dirname, "..", "..", "prisma
 const schedulerPath = path.join(__dirname, "job-scheduler.js");
 
 function loadRetention(prismaMock) {
+  withTransactionClient(prismaMock);
   const original = Module._load;
   Module._load = function(request, parent, isMain) {
     if (request === "../prisma") return prismaMock;

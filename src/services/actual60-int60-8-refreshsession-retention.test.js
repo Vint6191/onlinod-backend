@@ -1,4 +1,5 @@
 "use strict";
+const { withTransactionClient } = require("../../scripts/test-support/transaction-client-fixture");
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -60,7 +61,7 @@ test("refresh-session retention materializes compact lineage boundary before del
   };
 
   const cutoff = new Date("2026-08-01T00:00:00.000Z");
-  const result = await purgeRefreshSessionHistoryBatch({ db, cutoff, batchSize: 2000 });
+  const result = await purgeRefreshSessionHistoryBatch({ db: withTransactionClient(db), cutoff, batchSize: 2000 });
   assert.equal(result.deleted, 2);
   assert.equal(result.materializedBoundaries, 1);
   assert.deepEqual(calls.deletedIds, ["row-lineaged", "row-legacy"]);
@@ -118,7 +119,7 @@ test("refresh-session retention fails closed when exact raw-delete cardinality c
     refreshSession: { deleteMany: async () => ({ count: 0 }) },
   };
   await assert.rejects(
-    purgeRefreshSessionHistoryBatch({ db, cutoff: new Date("2026-08-01T00:00:00.000Z"), batchSize: 10 }),
+    purgeRefreshSessionHistoryBatch({ db: withTransactionClient(db), cutoff: new Date("2026-08-01T00:00:00.000Z"), batchSize: 10 }),
     (error) => error?.code === "REFRESH_SESSION_RETENTION_DELETE_COUNT_MISMATCH",
   );
 });
@@ -170,7 +171,7 @@ test("refresh-session retention has a non-bypassable hourly drain floor and PART
   };
 
   const partialRetry = await claimRetentionSweepLease({
-    db,
+    db: withTransactionClient(db),
     ownerToken: "next-owner",
     fallbackNow: authorityNow,
     minIntervalMs: 24 * 60 * 60 * 1000,
@@ -184,7 +185,7 @@ test("refresh-session retention has a non-bypassable hourly drain floor and PART
     lastOutcome: "COMPLETE",
   };
   const completeRetry = await claimRetentionSweepLease({
-    db,
+    db: withTransactionClient(db),
     ownerToken: "blocked-owner",
     fallbackNow: authorityNow,
     minIntervalMs: 24 * 60 * 60 * 1000,

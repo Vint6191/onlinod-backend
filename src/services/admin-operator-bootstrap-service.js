@@ -1,5 +1,6 @@
 "use strict";
 const bcrypt = require("bcryptjs");
+const { runRootCommit } = require("./db-commit-kernel");
 const { z } = require("zod");
 const { createSchema } = require("./admin-identity-command-service");
 const { adminError, commandIdSchema, reasonSchema, intentHash, passwordFingerprint, publicAdmin } = require("./admin-command-contract");
@@ -15,7 +16,7 @@ async function bootstrapAdmin({ db, commandId, operator, reason, email, password
   const action = "admin.operator.bootstrap";
   const payloadHash = intentHash({ action, targetId: input.email, payload: { email: input.email, name: input.name, reason: input.reason, passwordFingerprint: passwordFingerprint(password) } });
   const passwordHash = await bcrypt.hash(password, 12);
-  return db.$transaction(async tx => {
+  return runRootCommit(db, async ({ tx }) => {
     await lockCommandIdentity(tx, actorId, commandId);
     await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", "admin-roster-v1");
     const existing = await tx.adminCommand.findUnique({ where: { actorId_commandId: { actorId, commandId } } });
@@ -33,6 +34,6 @@ async function bootstrapAdmin({ db, commandId, operator, reason, email, password
     const command = await tx.adminCommand.create({ data: { actorId, commandId, sessionId: "operator-cli", actorAccessEpoch: 0, action, targetId: input.email, payloadHash, reason: input.reason, status: "SUCCEEDED", httpStatus: 200, result, completedAt: now } });
     await tx.adminCommandAudit.create({ data: { commandId: command.id, sequence: 1, actorId, action, targetId: admin.id, event: "OPERATOR_BOOTSTRAP", reason: input.reason, detail: safeJson({ before: before ? publicAdmin(before) : null, after: publicAdmin(admin) }) } });
     return result;
-  }, { maxWait: 5000, timeout: 15000 });
+  }, { profile: "ADMIN_COMMAND", authority: { kind: "ADMIN_OPERATOR_BOOTSTRAP", adminId: actorId }, conflictCode: "ADMIN_BOOTSTRAP_CONFLICT" });
 }
 module.exports = { bootstrapAdmin };

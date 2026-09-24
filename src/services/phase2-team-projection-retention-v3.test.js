@@ -1,4 +1,5 @@
 "use strict";
+const { withTransactionClient } = require("../../scripts/test-support/transaction-client-fixture");
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -49,7 +50,7 @@ function fixture({ pageFull = false, liveRepairWork = false } = {}) {
       async update({ data }) { calls.coverageUpdate = data; return { agencyId: "agency-1", ...data }; },
     },
   };
-  return { db, calls };
+  return { db: withTransactionClient(db), calls };
 }
 
 test("A45 final bounded projection compaction advances retained watermark atomically only after short pages", async () => {

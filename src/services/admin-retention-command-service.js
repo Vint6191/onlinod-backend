@@ -2,9 +2,10 @@
 
 const { adminError } = require("./admin-command-contract");
 const { executeAdminCommand, lockCommandIdentity, safeJson } = require("./admin-commit-authority-service");
-const { lockAdminActor } = require("./admin-session-authority-service");
+const { lockAdminActor, assertAdminSessionLifetime } = require("./admin-session-authority-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { runRootCommit, discardCommitHints, classifyCommitConflict } = require("./db-commit-kernel");
 const retention = require("./retention-service");
 const ACTIVE = ["QUEUED", "RUNNING"];
 const COORDINATOR = "retention-sweep-coordinator";
@@ -70,19 +71,25 @@ async function finishRun(tx, row, status, detail, now) {
 // Uses the same cluster lease as recurring retention. No agency fan-out and no
 // separate cleanup executor. A crashed pass is reclaimable after lease expiry;
 // cleanup remains idempotent and its final receipt is atomic with lease release.
-async function claimAdminRetentionRun({ db, row }) {
-  return db.$transaction(async tx => {
-    await lockCommandIdentity(tx, row.actorId, row.commandId);
-    row = await tx.adminCommand.findUnique({ where: { id: row.id } });
+async function claimAdminRetentionRun({ db, row: identity }) {
+  return runRootCommit(db, async context => {
+    const { tx } = context;
+    await lockCommandIdentity(tx, identity.actorId, identity.commandId);
+    const row = await tx.adminCommand.findUnique({ where: { id: identity.id } });
     if (!row || !ACTIVE.includes(row.status)) return { skipped: true, reason: "command_terminal" };
-    let authorityError = null;
-    try { await lockAdminActor(tx, actorOf(row), { roles: ["SUPER_ADMIN"] }); }
+    let authorityError = null, authority;
+    try { authority = await lockAdminActor(tx, actorOf(row), { roles: ["SUPER_ADMIN"] }); }
     catch (error) { if (![401, 403].includes(error.status)) throw error; authorityError = error; }
     await lockDbAdvisoryXact({ db: tx, key: COORDINATOR });
     // A second worker must not cancel or finish a pass owned by another worker.
+    await tx.$queryRawUnsafe('SELECT "key" FROM "RetentionSweepLease" WHERE "key"=$1 FOR UPDATE', "global_retention_v1");
     const now = await dbAuthorityNow({ db: tx });
     const currentLease = await tx.retentionSweepLease.findUnique({ where: { key: "global_retention_v1" } });
     if (currentLease && !currentLease.completedAt && currentLease.leaseUntil > now) return { skipped: true, reason: "lease_held" };
+    if (!authorityError) {
+      try { await assertAdminSessionLifetime(tx, authority); }
+      catch (error) { if (error.code !== "ADMIN_AUTH_INVALID") throw error; authorityError = error; }
+    }
     if (authorityError) {
       await finishRun(tx, row, "CANCELLED", { code: authorityError.code }, now);
       return { skipped: true, reason: "admin_authority_changed" };
@@ -95,14 +102,29 @@ async function claimAdminRetentionRun({ db, row }) {
       await finishRun(tx, row, "CANCELLED", { code: error.code }, now);
       return { skipped: true, reason: "policy_changed" };
     }
-    const lease = await retention.claimRetentionSweepLease({ db: tx });
-    if (!lease.acquired) return { skipped: true, reason: lease.reason };
-    const progress = { attempts: Number(row.executionProgress?.attempts || 0) + 1, state: "RUNNING", startedAt: lease.startedAt.toISOString() };
-    await tx.adminCommandAudit.create({ data: { commandId: row.id, sequence: progress.attempts * 2 + 1,
-      actorId: row.actorId, action: row.action, targetId: row.targetId, event: "PASS_STARTED", reason: row.reason, detail: progress } });
-    row = await tx.adminCommand.update({ where: { id: row.id }, data: { status: "RUNNING", executionProgress: progress } });
-    return { row, lease, policySettings: policy.settings };
-  }, { maxWait: 5000, timeout: 15000 });
+    await tx.$executeRawUnsafe("SAVEPOINT admin_retention_claim");
+    try {
+      const lease = await retention.claimRetentionSweepLease({ db: tx, commitContext: context });
+      if (!lease.acquired) {
+        await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_retention_claim");
+        return { skipped: true, reason: lease.reason };
+      }
+      const progress = { attempts: Number(row.executionProgress?.attempts || 0) + 1, state: "RUNNING", startedAt: lease.startedAt.toISOString() };
+      await tx.adminCommandAudit.create({ data: { commandId: row.id, sequence: progress.attempts * 2 + 1,
+        actorId: row.actorId, action: row.action, targetId: row.targetId, event: "PASS_STARTED", reason: row.reason, detail: progress } });
+      const claimedRow = await tx.adminCommand.update({ where: { id: row.id }, data: { status: "RUNNING", executionProgress: progress } });
+      await assertAdminSessionLifetime(tx, authority);
+      await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_retention_claim");
+      return { row: claimedRow, lease, policySettings: policy.settings };
+    } catch (error) {
+      if (classifyCommitConflict(error) || error.code !== "ADMIN_AUTH_INVALID") throw error;
+      await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT admin_retention_claim");
+      await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_retention_claim");
+      discardCommitHints(context);
+      await finishRun(tx, row, "CANCELLED", { code: error.code }, await dbAuthorityNow({ db: tx }));
+      return { skipped: true, reason: "admin_authority_changed" };
+    }
+  }, { profile: "ADMIN_BACKGROUND", authority: { kind: "ADMIN_RETENTION_CLAIM" } });
 }
 
 async function runAdminRetentionSweep({ db = require("../prisma"), run = retention.runRetentionSweep } = {}) {

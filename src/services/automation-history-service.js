@@ -1,4 +1,5 @@
 "use strict";
+const { runRootCommit } = require("./db-commit-kernel");
 
 const { partitionAutomationDeliveryHardDeleteCandidates, isSfsFollowProof, sfsCandidateId } = require("./automation-delivery-hard-delete-guard");
 
@@ -144,6 +145,7 @@ async function archiveAutomationDeliveryBatch({ tx, rows, olderThan, strict = fa
       WHERE a."agencyId"=EXCLUDED."agencyId" RETURNING a."id"`, JSON.stringify(data));
     if (written.length !== groups.length) throw adminError("AUTOMATION_ARCHIVE_SCOPE_CONFLICT", "Archive agency differs from its creator; explicit repair is required", 409);
   }
+  if (commitGuard) await commitGuard(tx);
   return { archived: deletedRows.length, aggregateUpdates: groups.length, protected: rows.length - deletedRows.length };
 }
 
@@ -195,7 +197,7 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 500, db = nu
     });
     if (!rows.length) { hasMore = false; break; }
     cursor = { finishedAt: rows[rows.length - 1].finishedAt, id: rows[rows.length - 1].id };
-    const committed = await db.$transaction(tx => archiveAutomationDeliveryBatch({ tx, rows, olderThan, commitGuard }), { maxWait: 5000, timeout: 15000, isolationLevel: "ReadCommitted" });
+    const committed = await runRootCommit(db, ({ tx }) => archiveAutomationDeliveryBatch({ tx, rows, olderThan, commitGuard }), { profile: "RETENTION_MUTATION", authority: { kind: "RETENTION_ARCHIVE" } });
     archived += committed.archived;
     aggregateUpdates += committed.aggregateUpdates;
     hasMore = rows.length >= take;

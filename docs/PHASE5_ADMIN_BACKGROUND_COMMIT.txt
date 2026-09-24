@@ -1,0 +1,92 @@
+ONLINOD — Phase 5A I4 — Admin background/session commit contract
+
+Scope
+Admin login/logout, operator bootstrap, support reads, diagnostics pages,
+bulk-pricing item commits, retention claim/control and bounded cleanup batches.
+This extends I1/I2/I3. It does not close all Phase5 transaction families,
+historical notification recovery, Desktop LocalAI, or platform scale validation.
+
+Root ownership
+Each migrated operation opens one db-commit-kernel root. Retriable PostgreSQL
+40001/40P01/P2034 conflicts restart that entire short attempt, at most three times
+and within the profile deadline. Attempts re-read authority, command and cursor.
+Unknown outcomes, audit failures and timeouts do not trigger blind retries.
+No network, bcrypt hashing, sweep fan-out or timer registration occurs in retries.
+The CLI remains the only caller of operator bootstrap.
+
+Profiles (milliseconds; ReadCommitted)
+Name                 maxWait timeout deadline lock_timeout statement_timeout
+ADMIN_SESSION         5000   15000   20000     5000         15000
+ADMIN_BACKGROUND      5000   15000   20000     5000         15000
+ADMIN_SUPPORT_READ    5000   10000   15000     5000         10000
+ADMIN_DIAGNOSTICS     5000   15000   20000     5000          5000
+RETENTION_MUTATION    5000   30000   35000     5000         25000
+Kernel clamps each attempt to its remaining total budget.
+
+Admin sessions
+Login verifies bcrypt before starting a transaction, then locks and re-reads
+identity/hash/accessEpoch in every attempt. Session, lastLoginAt and required
+AdminActionLog commit together. Logout revocation and audit also commit together;
+cooperative logout of an expired session and already-revoked replay remain legal.
+Session identity rows remain locked, while clock_timestamp is sampled again at
+the final authorization boundary. Support checks both its scoped grant and the
+initiating session after reading its bounded creator page.
+
+Bulk pricing
+Command identity -> AdminUser/AdminSession -> agency/billing -> DomainWork claim
+-> creator/profile. The exact generation, revision and owner fence still apply.
+One target per short transaction, with at most ten target transactions per claim.
+At most four claims per pump, per-agency/per-partition quantum one; soft admission
+budget eight seconds uses monotonic time. Already-started transactions may finish
+beyond that soft budget and remain constrained by the kernel profile.
+
+The target savepoint contains pricing, required item audit, cursor and claim
+settlement. Expiry after locks or after effects rolls it all back, discards
+advisory hints and commits a PAUSED_AUTH receipt plus claim ack. Cursor and prior
+committed targets are preserved. A valid domain rejection remains an item result;
+SQL conflicts escape to the root retry. Failed required audit aborts the attempt.
+SUPPORT and SUPER_ADMIN retain existing bulk permissions. Resume is still a new
+authorized command bound to the exact remaining selection and original intent.
+
+Retention
+The Admin claim root explicitly joins the lease helper with its kernel-issued
+ADMIN_RETENTION_CLAIM context and the identical transaction client. Bare clients,
+nested roots and mismatched authority are rejected. Every retry starts from the
+immutable command identity. Coordinator lock -> lease row -> fresh database time.
+Session expiry while claiming rolls back the new lease, PASS_STARTED and progress,
+then stores CANCELLED without launching cleanup.
+
+Long-running cleanup remains outside the short claim transaction. Each destructive
+batch checks initiating Admin authority and durable lease before and after its
+work. Refresh-session boundary materialization, Team projection watermark changes,
+generic bounded deletes and automation source-delete/aggregate-write use this
+boundary. Expiry rolls back the current batch; previously committed batches stay.
+A recurring pass without an Admin actor retains its durable lease checks.
+
+Heartbeat/finalization have short independent kernel roots and exact owner/live
+lease CAS. Finalization may settle a failed pass after the initiating session is
+revoked; required final Admin receipt and lease release remain one transaction.
+Policy-read conflicts must propagate to the root, not masquerade as missing schema.
+
+Diagnostics
+Existing durable cursor and rolling-observation semantics remain. One transaction
+reads at most 500 rows; duplicate probes return at most two rows per source row.
+Cursor/counters retry together; no timer or process-local state represents commit.
+These bounds are not a native query-plan, contention or platform throughput proof.
+
+Verification
+npm run test:phase5-admin-background
+npm run test:phase5-commit
+npm run test:phase5-team
+npm run test:phase5-jobs
+PHASE5_PROOF_RUNTIME=/path/to/disposable-runtime npm run audit:phase5-admin-background-postgres
+The optional audit runtime supplies @electric-sql/pglite and
+@electric-sql/pglite-socket. The script creates an isolated database, applies the
+full migration chain and connects Prisma over TCP; it ignores production DATABASE_URL.
+Its controlled SQL errors and clock advances do not prove native multi-client
+contention, process-kill recovery, physical Desktop behavior or Render load.
+
+Deployment
+Apply the entire I4 changed-only Backend ZIP to the accepted I3 actual.
+No schema/migration/dependency/env/Desktop change. Render build command remains:
+npm install && npm run prisma:migrate

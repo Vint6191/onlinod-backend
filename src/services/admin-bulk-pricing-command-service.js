@@ -2,10 +2,12 @@
 
 const { bulkPricingSchema, adminError } = require("./admin-command-contract");
 const { executeAdminCommand, lockCommandIdentity, safeJson } = require("./admin-commit-authority-service");
-const { lockAdminActor } = require("./admin-session-authority-service");
+const { lockAdminActor, assertAdminSessionLifetime } = require("./admin-session-authority-service");
 const { lockLiveAgency } = require("./admin-billing-access-command-service");
 const { setPricingWithinTransaction } = require("./admin-pricing-command-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { runRootCommit, classifyCommitConflict, discardCommitHints } = require("./db-commit-kernel");
+const { performance } = require("node:perf_hooks");
 const work = require("./domain-work-authority-service");
 const GENERATION = "phase4_admin_pricing_v1";
 const WORK_CLASS = "ADMIN_BILLING_PRICING";
@@ -69,13 +71,14 @@ async function stopCommand(tx, row, item, ownerToken, status, code) {
 }
 
 async function processAdminBulkPricingItem({ db, item, ownerToken, keepClaim = false }) {
-  return db.$transaction(async tx => {
+  return runRootCommit(db, async context => {
+    const { tx } = context;
     const identity = await tx.adminCommand.findUnique({ where: { id: item.objectId } });
     if (!identity || item.objectType !== "AdminCommand" || identity.action !== "billing.pricing.bulk" || identity.scopeAgencyId !== item.agencyId) throw Object.assign(new Error("Admin billing work identity mismatch"), { code: "ADMIN_WORK_IDENTITY_INVALID", retryable: false });
     await lockCommandIdentity(tx, identity.actorId, identity.commandId);
     const row = await tx.adminCommand.findUnique({ where: { id: identity.id } });
-    let authorizationError;
-    try { await lockAdminActor(tx, actorOf(row)); }
+    let authorizationError, authority;
+    try { authority = await lockAdminActor(tx, actorOf(row)); }
     catch (error) { if (![401, 403].includes(error.status)) throw error; authorizationError = error; }
     let targetError;
     try { await lockLiveAgency(tx, item.agencyId); }
@@ -91,42 +94,55 @@ async function processAdminBulkPricingItem({ db, item, ownerToken, keepClaim = f
     const selected = input.items[progress.nextIndex];
     if (!selected) throw Object.assign(new Error("Invalid bulk cursor"), { code: "ADMIN_WORK_CURSOR_INVALID", retryable: false });
     await tx.$executeRawUnsafe("SAVEPOINT admin_bulk_item");
-    let outcome, audit;
     try {
-      await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 FOR SHARE', selected.creatorId);
-      await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorBillingProfile" WHERE "creatorId"=$1 FOR UPDATE', selected.creatorId);
-      const creator = await tx.creatorAccount.findUnique({ where: { id: selected.creatorId }, include: { billingProfile: true } });
-      if (!creator || creator.agencyId !== item.agencyId || creator.deletedAt) throw adminError("CREATOR_NOT_FOUND", "Creator is no longer live in this agency", 404);
-      if (creator.billingProfile && creator.billingProfile.agencyId !== item.agencyId) throw adminError("BILLING_SCOPE_MISMATCH", "Stored pricing belongs to another agency", 409);
-      if ((creator.billingProfile?.pricingRevision || 0) !== selected.expectedRevision) throw adminError("ADMIN_PRICING_REVISION_CONFLICT", "Pricing changed since selection", 409);
-      if (!input.includeExcluded && creator.billingProfile?.billingExcluded) {
-        outcome = { creatorId: selected.creatorId, status: "SKIPPED", code: "BILLING_EXCLUDED" }; audit = outcome;
-      } else {
-        const result = await setPricingWithinTransaction({ tx, creatorId: selected.creatorId, expectedAgencyId: item.agencyId, payload: { expectedRevision: selected.expectedRevision, reason: row.reason, tier: input.tier, ...(input.corePriceCents !== undefined ? { corePriceCents: input.corePriceCents } : {}) } });
-        outcome = { creatorId: selected.creatorId, status: "SUCCEEDED", pricingRevision: result.body.billing.pricingRevision }; audit = result.audit;
+      let outcome, audit;
+      try {
+        await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 FOR SHARE', selected.creatorId);
+        await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorBillingProfile" WHERE "creatorId"=$1 FOR UPDATE', selected.creatorId);
+        await assertAdminSessionLifetime(tx, authority);
+        const creator = await tx.creatorAccount.findUnique({ where: { id: selected.creatorId }, include: { billingProfile: true } });
+        if (!creator || creator.agencyId !== item.agencyId || creator.deletedAt) throw adminError("CREATOR_NOT_FOUND", "Creator is no longer live in this agency", 404);
+        if (creator.billingProfile && creator.billingProfile.agencyId !== item.agencyId) throw adminError("BILLING_SCOPE_MISMATCH", "Stored pricing belongs to another agency", 409);
+        if ((creator.billingProfile?.pricingRevision || 0) !== selected.expectedRevision) throw adminError("ADMIN_PRICING_REVISION_CONFLICT", "Pricing changed since selection", 409);
+        if (!input.includeExcluded && creator.billingProfile?.billingExcluded) {
+          outcome = { creatorId: selected.creatorId, status: "SKIPPED", code: "BILLING_EXCLUDED" }; audit = outcome;
+        } else {
+          const result = await setPricingWithinTransaction({ tx, creatorId: selected.creatorId, expectedAgencyId: item.agencyId, payload: { expectedRevision: selected.expectedRevision, reason: row.reason, tier: input.tier, ...(input.corePriceCents !== undefined ? { corePriceCents: input.corePriceCents } : {}) } });
+          outcome = { creatorId: selected.creatorId, status: "SUCCEEDED", pricingRevision: result.body.billing.pricingRevision }; audit = result.audit;
+        }
+      } catch (error) {
+        if (classifyCommitConflict(error) || error.code === "ADMIN_AUTH_INVALID") throw error;
+        if (!(error.status >= 400 && error.status < 500 && error.code)) throw error;
+        await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT admin_bulk_item");
+        discardCommitHints(context);
+        outcome = { creatorId: selected.creatorId, status: "REJECTED", code: error.code }; audit = outcome;
       }
+      progress.nextIndex++;
+      progress[outcome.status === "SUCCEEDED" ? "succeeded" : outcome.status === "SKIPPED" ? "skipped" : "rejected"]++;
+      progress.outcomes.push(outcome);
+      const done = progress.nextIndex === input.items.length;
+      const status = done ? (progress.rejected ? "COMPLETED_WITH_REJECTIONS" : "SUCCEEDED") : "RUNNING";
+      await tx.adminCommandAudit.create({ data: { commandId: row.id, sequence: progress.nextIndex + 1, actorId: row.actorId, action: row.action, targetId: selected.creatorId, scopeAgencyId: item.agencyId, event: outcome.status, reason: row.reason, detail: safeJson(audit) } });
+      await tx.adminCommand.update({ where: { id: row.id }, data: { executionProgress: safeJson(progress), status, completedAt: done ? await dbAuthorityNow({ db: tx }) : null } });
+      const settle = done ? work.ackDomainWorkClaim : keepClaim ? work.saveDomainWorkProgress : work.yieldDomainWorkClaim;
+      requireOwnership(await settle({ ...claimArgs(tx, item, ownerToken), progressCursor: { nextIndex: progress.nextIndex } }));
+      // The savepoint includes pricing, receipt, progress and claim settlement.
+      // Expiry while waiting or writing must never advance the target cursor.
+      await assertAdminSessionLifetime(tx, authority);
       await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_bulk_item");
+      return { status, outcome, nextIndex: progress.nextIndex };
     } catch (error) {
-      if (!(error.status >= 400 && error.status < 500 && error.code)) throw error;
+      if (classifyCommitConflict(error) || error.code !== "ADMIN_AUTH_INVALID") throw error;
       await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT admin_bulk_item");
       await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_bulk_item");
-      outcome = { creatorId: selected.creatorId, status: "REJECTED", code: error.code }; audit = outcome;
+      discardCommitHints(context);
+      return stopCommand(tx, row, item, ownerToken, "PAUSED_AUTH", error.code);
     }
-    progress.nextIndex++;
-    progress[outcome.status === "SUCCEEDED" ? "succeeded" : outcome.status === "SKIPPED" ? "skipped" : "rejected"]++;
-    progress.outcomes.push(outcome);
-    const done = progress.nextIndex === input.items.length;
-    const status = done ? (progress.rejected ? "COMPLETED_WITH_REJECTIONS" : "SUCCEEDED") : "RUNNING";
-    await tx.adminCommandAudit.create({ data: { commandId: row.id, sequence: progress.nextIndex + 1, actorId: row.actorId, action: row.action, targetId: selected.creatorId, scopeAgencyId: item.agencyId, event: outcome.status, reason: row.reason, detail: safeJson(audit) } });
-    await tx.adminCommand.update({ where: { id: row.id }, data: { executionProgress: safeJson(progress), status, completedAt: done ? await dbAuthorityNow({ db: tx }) : null } });
-    const settle = done ? work.ackDomainWorkClaim : keepClaim ? work.saveDomainWorkProgress : work.yieldDomainWorkClaim;
-    requireOwnership(await settle({ ...claimArgs(tx, item, ownerToken), progressCursor: { nextIndex: progress.nextIndex } }));
-    return { status, outcome, nextIndex: progress.nextIndex };
-  }, { maxWait: 5000, timeout: 15000, isolationLevel: "ReadCommitted" });
+  }, { profile: "ADMIN_BACKGROUND", authority: { kind: "ADMIN_BULK_PRICING", agencyId: item.agencyId } });
 }
 
 async function runAdminBulkPricingSweep({ db }) {
-  const started = Date.now();
+  const started = performance.now();
   const claim = await work.claimDomainWorkBatch({ db, workClass: WORK_CLASS, generation: GENERATION, limit: 4, perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
   const report = { ok: true, selected: claim.items.length, processed: 0, failed: 0, lost: 0, skipped: claim.skipped || false, reason: claim.reason || null };
   for (const item of claim.items) {
@@ -134,7 +150,7 @@ async function runAdminBulkPricingSweep({ db }) {
       // At most ten short per-target transactions per claim; each checks the
       // actor again. A local time budget is admission only, never commit truth.
       let released = false;
-      for (let step = 0; step < 10 && Date.now() - started < 8000; step++) {
+      for (let step = 0; step < 10 && performance.now() - started < 8000; step++) {
         const keepClaim = step < 9;
         const result = await processAdminBulkPricingItem({ db, item, ownerToken: claim.ownerToken, keepClaim });
         report.processed++;

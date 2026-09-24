@@ -1,4 +1,5 @@
 "use strict";
+const { runRootCommit } = require("./db-commit-kernel");
 // Rebuildable rolling observation, not a transaction-wide historical snapshot.
 // Each durable step reads <=500 rows and <=2 indexed duplicate candidates per row.
 const KEY = "admin.diagnostics.v1", BATCH = 500, STEP_MS = 5000, CYCLE_MS = 60000;
@@ -25,8 +26,7 @@ function newRun(now) {
     counts: Object.fromEntries(SPECS.map(([key]) => [key, 0])), sample: [] };
 }
 async function diagnosticsStep({ db }) {
-  return db.$transaction(async tx => {
-    await tx.$executeRawUnsafe("SET LOCAL statement_timeout='5s'");
+  return runRootCommit(db, async ({ tx }) => {
     // Skewed creator/message or profile/tag statistics can make PostgreSQL
     // choose a whole-table scan for a LIMIT 1/2 probe. These maintenance lanes
     // deliberately use their existing PK/identity indexes even under that skew.
@@ -69,7 +69,7 @@ async function diagnosticsStep({ db }) {
       ...(complete ? { completed: { ...run, completedAt:now.toISOString() } } : {}) };
     await tx.$executeRawUnsafe(`UPDATE "SystemSetting" SET "value"=$2::jsonb,"updatedAt"=clock_timestamp() WHERE "key"=$1`, KEY, JSON.stringify(next));
     return { processed:page.length, complete, lane:table };
-  }, { timeout:15000 });
+  }, { profile: "ADMIN_DIAGNOSTICS", authority: { kind: "ADMIN_DIAGNOSTICS" } });
 }
 async function readDiagnostics({ db }) {
   const rows=await db.$queryRawUnsafe(`SELECT "value",clock_timestamp() AT TIME ZONE 'UTC' AS now FROM "SystemSetting" WHERE "key"=$1`,KEY);

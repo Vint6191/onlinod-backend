@@ -9,16 +9,17 @@
 */
 "use strict";
 
-const { withRetentionWork, guardRetentionTransaction, runRetentionMutation: runRetentionMutationWithDb } = require("./retention-work-context-service");
+const { withRetentionWork, guardRetentionTransaction, runRetentionControl, runRetentionMutation: runRetentionMutationWithDb } = require("./retention-work-context-service");
 const { randomUUID } = require("node:crypto");
 const prisma = require("../prisma");
 const runRetentionMutation = (work, db = prisma) => runRetentionMutationWithDb(work, db);
 const { gcTeamLedgers } = require("./team-ppv-ledger-service");
 const { purgeExpiredTipLedger } = require("./team-tip-ledger-service");
 const { compactAutomationDeliveries } = require("./automation-history-service");
-const { withDbAdvisoryXactLock, runDbTransaction } = require("./db-transaction-service");
+const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { lockRetentionCommit } = require("./retention-commit-guard-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { classifyCommitConflict } = require("./db-commit-kernel");
 const { authorizationHistoryPurgeActivationStatus } = require("./actual60-authorization-history-rollout-service");
 const { runMaintenanceLane } = require("./maintenance-work-authority");
 const { FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION, phase2CoverageStatus } = require("./phase2-work-coverage-authority-service");
@@ -51,6 +52,7 @@ async function getRetentionSettings({ db = prisma } = {}) {
   try {
     row = await db.systemSetting.findUnique({ where: { key: RETENTION_SETTING_KEY } });
   } catch (err) {
+    if (classifyCommitConflict(err)) throw err;
     // If migrations were not deployed yet, fall back to env defaults so normal
     // app startup does not hard crash. Admin page will surface the DB error.
     if (/SystemSetting/i.test(String(err?.message || err))) {
@@ -86,16 +88,16 @@ async function claimRetentionSweepLease({
   fallbackNow = new Date(),
   leaseMs = RETENTION_LEASE_MS,
   minIntervalMs = 0,
+  commitContext = null,
 } = {}) {
-  return withDbAdvisoryXactLock({
-    db,
-    key: RETENTION_COORDINATION_LOCK_KEY,
-    work: async (tx) => {
+  return runRetentionControl(db, async tx => {
+      await lockDbAdvisoryXact({ db: tx, key: RETENTION_COORDINATION_LOCK_KEY });
       if (!tx?.retentionSweepLease?.findUnique || !tx?.retentionSweepLease?.upsert) {
         const error = new Error("RETENTION_COORDINATION_SCHEMA_UNAVAILABLE");
         error.code = "RETENTION_COORDINATION_SCHEMA_UNAVAILABLE";
         throw error;
       }
+      await tx.$queryRawUnsafe('SELECT "key" FROM "RetentionSweepLease" WHERE "key"=$1 FOR UPDATE', RETENTION_LEASE_KEY);
       const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
       const existing = await tx.retentionSweepLease.findUnique({ where: { key: RETENTION_LEASE_KEY } });
       const completedAt = existing?.completedAt instanceof Date ? existing.completedAt : existing?.completedAt ? new Date(existing.completedAt) : null;
@@ -133,13 +135,12 @@ async function claimRetentionSweepLease({
         },
       });
       return { acquired: true, reason: existing ? "lease_recovered_or_reclaimed" : "lease_created", ownerToken, leaseUntil, startedAt: row.startedAt || authorityNow };
-    },
-  });
+  }, commitContext);
 }
 
 async function renewRetentionSweepLease({ db = prisma, ownerToken, fallbackNow = new Date(), leaseMs = RETENTION_LEASE_MS } = {}) {
   if (!ownerToken) return false;
-  return runDbTransaction(db, async (tx) => {
+  return runRetentionControl(db, async (tx) => {
     await guardRetentionTransaction(tx);
     if (!tx?.retentionSweepLease?.updateMany) return false;
     // Sample the database clock AFTER waiting for batch readers to release the lease row.
@@ -161,7 +162,7 @@ async function renewRetentionSweepLease({ db = prisma, ownerToken, fallbackNow =
 
 async function finalizeRetentionSweepLease({ db = prisma, ownerToken, outcome, error = null, fallbackNow = new Date(), onFinalize = null } = {}) {
   if (!ownerToken) return false;
-  return runDbTransaction(db, async (tx) => {
+  return runRetentionControl(db, async (tx) => {
     await guardRetentionTransaction(tx);
     if (!tx?.retentionSweepLease?.updateMany) return false;
     // Sample the database clock AFTER waiting for batch readers to release the lease row.
@@ -224,8 +225,7 @@ async function purgeRefreshSessionHistoryBatch({ db = prisma, cutoff, batchSize 
     throw new Error("REFRESH_SESSION_RETENTION_CUTOFF_REQUIRED");
   }
   const limit = Math.max(1, Math.min(10_000, Math.floor(Number(batchSize) || DEFAULT_BATCH_SIZE)));
-  return runDbTransaction(db, async (tx) => {
-    await guardRetentionTransaction(tx);
+  return runRetentionMutation(async tx => {
     if (typeof tx?.$queryRawUnsafe !== "function" || typeof tx?.$executeRawUnsafe !== "function" || !tx?.refreshSession?.deleteMany) {
       throw new Error("REFRESH_SESSION_RETENTION_DB_CAPABILITY_REQUIRED");
     }
@@ -282,7 +282,7 @@ async function purgeRefreshSessionHistoryBatch({ db = prisma, cutoff, batchSize 
       throw error;
     }
     return { deleted, materializedBoundaries, candidateCount: candidates.length };
-  });
+  }, db);
 }
 
 async function runRefreshSessionRetentionSweep(options = {}) {
@@ -361,8 +361,7 @@ async function compactTeamProjectionAuthorityForAgency({ db = prisma, agencyId, 
   }
 
   const limit = Math.max(1, Math.min(10_000, Math.floor(Number(batchSize) || DEFAULT_BATCH_SIZE)));
-  return runDbTransaction(db, async (tx) => {
-    await guardRetentionTransaction(tx);
+  return runRetentionMutation(async tx => {
     // A45: only FULL compact correction roots are eligible. INCOMPLETE_HISTORY
     // remains explicit evidence and open coverage has endedAt=NULL, so neither is
     // destroyed merely because wall-clock retention elapsed.
@@ -423,7 +422,7 @@ async function compactTeamProjectionAuthorityForAgency({ db = prisma, agencyId, 
       coverageDeleted: Number(coverageDelete?.count || 0),
       retainedFrom: watermarkAdvanced ? cutoff : null,
     };
-  });
+  }, db);
 }
 
 async function runTeamProjectionRetentionCompaction({ db = prisma, authorityNow = new Date(), detailDays = 180, batchSize = DEFAULT_BATCH_SIZE, agenciesPerBatch = TEAM_PROJECTION_RETENTION_AGENCIES_PER_BATCH } = {}) {
