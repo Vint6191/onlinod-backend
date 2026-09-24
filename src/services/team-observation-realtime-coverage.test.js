@@ -9,7 +9,7 @@ const stubs = [
   ["./team-ppv-ledger-service", { upsertPurchaseFromEvent: async () => ({}) }],
   ["./team-tip-ledger-service", { ingestTipEvent: async () => ({}) }],
   ["./traffic-service", {
-    ingestSubscriptionEvent: async () => ({}),
+    projectCanonicalSubscriptionCompatibility: async () => ({}),
     markTrafficFanValueDirty: async () => ({}),
   }],
   ["./bump-service", { processRuntimeEvents: async () => ({}) }],

@@ -6242,6 +6242,7 @@ model CreatorSubscriptionLedger {
   @@index([sourceId, organicConfirmed, amountCents, occurredAt])
 }
 
+/// Retired I6 compatibility cache: no active business reader/writer. Retention only.
 model TrafficDailyAggregate {
   id        String   @id @default(cuid())
   agencyId  String

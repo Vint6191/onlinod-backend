@@ -27,7 +27,6 @@ async function projectFacts({ db, job, table, rows, historical = false, historyP
   const project = [projection.projectSaleProjectionFact, projection.projectTipProjectionFact,
     projection.projectSubscriptionProjectionFact][table];
   const subscriptions = [];
-  const deferredAggregates = new Map();
   let retentionExcluded = 0;
   for (const row of rows) {
     const fact = project(row);
@@ -37,17 +36,14 @@ async function projectFacts({ db, job, table, rows, historical = false, historyP
         reason: `canonical_${fact.kind}` });
       continue;
     }
-    const result = await traffic.projectCanonicalSubscriptionCompatibility({ db, job, fact, deferredAggregates, historyPolicy });
-    if (result.retentionExcluded || result.aggregateRetentionExcluded) retentionExcluded++;
+    const result = await traffic.projectCanonicalSubscriptionCompatibility({ db, job, fact, historyPolicy });
+    if (result.retentionExcluded) retentionExcluded++;
     const type = String(fact.eventType || "").toLowerCase();
     if (fact.fanId && /(subscribed|resubscribed|renewed)/.test(type) && !/(expired|refund|chargeback|auto.?renew)/.test(type)) {
       subscriptions.push({ type: "subscription_created", fanId: fact.fanId, dialogId: fact.fanId,
         createdAt: fact.subscribedAt || fact.occurredAt, source: "canonical_subscription_fact",
         providerEventId: fact.externalEventId || fact.notificationId || fact.eventHash });
     }
-  }
-  for (const aggregate of Array.from(deferredAggregates.values()).sort(traffic.compareTrafficAggregateTargets)) {
-    await traffic.recomputeTrafficDailyAggregate(db, aggregate);
   }
   if (subscriptions.length) {
     const result = await require("./bump-service").processRuntimeEvents({

@@ -17,7 +17,8 @@ async function main() {
   const server = new PGLiteSocketServer({ db: engine, host: "127.0.0.1", port: 0 });
   await server.start();
   const url = `postgresql://postgres:postgres@${server.getServerConn()}/postgres?connection_limit=1&sslmode=disable`;
-  const db = new PrismaClient({ datasources: { db: { url } } });
+  const db = new PrismaClient({ datasources: { db: { url } }, log: [{emit:"event",level:"query"}] });
+  const queries=[]; db.$on("query",event=>queries.push(event.query));
   const cases = [];
   const check = async (name, fn) => { await fn(); cases.push({ name, status: "PASS" }); console.log(JSON.stringify(cases.at(-1))); };
   try {
@@ -48,7 +49,7 @@ async function main() {
         await tx.agencyMember.create({ data: { agencyId: agency.id, userId: user.id, role: "OWNER", roleKey: "owner", assignedCreators: "all" } });
         const creator = await tx.creatorAccount.create({ data: { agencyId: agency.id, displayName: name, status: "READY" } });
         const job = await tx.jobInstance.create({ data: { agencyId: agency.id, creatorId: creator.id, jobKey: "catchup_notifications_scan", scope: "creator", status: "DONE", completedAt: new Date(), params: { notificationMode: "catchup" } } });
-        return { agency, creator, job };
+        return { agency, creator, job, user };
       });
     }
     const s = await seed(), other = await seed();
@@ -131,14 +132,14 @@ async function main() {
       assert.equal(await db.teamObservationState.count({ where: { creatorId: s.creator.id } }), 0);
       assert.equal(await db.automationDelivery.count({ where: { creatorId: s.creator.id } }), 0);
       assert.deepEqual((await db.trafficSourceMember.findUnique({ where: { id: member.id } })).convertedAt, convertedAt);
-      assert.equal((await db.trafficDailyAggregate.findFirst({ where: { sourceId: source.id } })).grossCents, 500);
+      assert.equal(await db.trafficDailyAggregate.count({ where: { sourceId: source.id } }), 0);
       assert.equal(await db.creatorSubscriptionLedger.count({ where: { creatorId: other.creator.id } }), 0);
     });
     await check("normal producer replay does not duplicate recovered paid ledger or aggregate", async () => {
       const rows = await db.creatorSubscriptionEvent.findMany({ where: { creatorId: s.creator.id } });
       await db.$transaction(tx => consequences.projectFacts({ db: tx, job: { agencyId: s.agency.id, creatorId: s.creator.id, params: {} }, table: 2, rows, historical: true }));
       assert.equal(await db.creatorSubscriptionLedger.count({ where: { creatorId: s.creator.id } }), 1);
-      assert.equal((await db.trafficDailyAggregate.findFirst({ where: { sourceId: source.id } })).grossCents, 500);
+      assert.equal(await db.trafficDailyAggregate.count({ where: { sourceId: source.id } }), 0);
     });
     await check("foreign creator claim is rejected without modifying its scope", async () => {
       const c = await claim(other.agency.id);
@@ -146,13 +147,13 @@ async function main() {
       await db.creatorAccount.update({ where: { id: other.creator.id }, data: { deletedAt: new Date() } });
       assert.equal((await history.processHistoryPage({ db, ...c })).retired, true);
     });
-    await check("historical retention boundaries do not recreate expired organic ledger or daily aggregate", async () => {
+    await check("historical retention boundaries preserve organic policy without rebuilding retired aggregate", async () => {
       const traffic = require("../../src/services/traffic-service");
       const fact = { fanId: "no-source", eventType: "paid_subscribed", amountCents: 500, eventHash: "retention-old", occurredAt: new Date("2020-01-01") };
       const policy = { organicCutoff: new Date("2024-01-01"), aggregateCutoff: new Date("2023-01-01") };
       await db.$transaction(async tx => {
         const a = await traffic.projectCanonicalSubscriptionCompatibility({ db: tx, job: { agencyId: s.agency.id, creatorId: s.creator.id }, fact, historyPolicy: policy }); assert.equal(a.retentionExcluded, true);
-        const b = await traffic.projectCanonicalSubscriptionCompatibility({ db: tx, job: { agencyId: s.agency.id, creatorId: s.creator.id }, fact: { ...fact, fanId: "123", eventHash: "retention-attributed" }, historyPolicy: policy }); assert.equal(b.aggregateRetentionExcluded, true);
+        const b = await traffic.projectCanonicalSubscriptionCompatibility({ db: tx, job: { agencyId: s.agency.id, creatorId: s.creator.id }, fact: { ...fact, fanId: "123", eventHash: "retention-attributed" }, historyPolicy: policy }); assert.equal(b.ignored, false);
       });
       assert.equal(await db.creatorSubscriptionLedger.count({ where: { eventHash: "retention-old" } }), 0);
       assert.equal(await db.trafficDailyAggregate.count({ where: { sourceId: source.id, day: new Date("2020-01-01") } }), 0);
@@ -211,8 +212,70 @@ async function main() {
       await db.$executeRawUnsafe(`CREATE INDEX "${name}" ON "${table}"("id")`);
       await assert.rejects(ensureNotificationIndexes(db), /INDEX_DEFINITION_MISMATCH/);
     });
-    const report = { ok: true, engine: "Prisma 5.22 / PGlite PostgreSQL WASM TCP", migrations: 260, cases: cases.length, results: cases, plans,
-      limits: ["Single physical SQL client, not native contention or multi-replica load", "60000 interleaved two-agency facts validate SELECT plans only; USER triggers disabled solely while loading this synthetic fixture, FK and CHECK constraints retained; not ingestion throughput", "Daily Traffic aggregation remains proportional to matching source/day history; not SCALE CLOSED", "Recovered retained canonical facts only; deleted facts and missing identities cannot be reconstructed"] };
+    const receipt = require("../../src/services/subscription-receipt-projection-service");
+    const jobScope = {agencyId:s.agency.id,creatorId:s.creator.id};
+    const baseFact = {fanId:"123",eventType:"paid_subscribed",amountCents:100,occurredAt:at};
+    await check("I6 standalone full-mode root and durable caller share one receipt identity",async()=>{
+      const fact={...baseFact,eventHash:"i6-shared"};
+      const a=await receipt.projectCanonicalSubscriptionReceipt({db,job:jobScope,fact});
+      const b=await db.$transaction(tx=>receipt.projectCanonicalSubscriptionReceipt({db:tx,job:jobScope,fact}));
+      assert.equal(a.duplicate,false);assert.equal(b.duplicate,true);assert.equal(a.ledgerId,b.ledgerId);
+      assert.equal(await db.creatorSubscriptionLedger.count({where:{eventHash:fact.eventHash}}),1);
+    });
+    await check("I6 required member effect failure rolls back the standalone receipt",async()=>{
+      await engine.exec(`CREATE FUNCTION i6_member_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+        IF EXISTS(SELECT 1 FROM "I5ProofFault" WHERE kind='member') THEN RAISE EXCEPTION 'I6_MEMBER_ROLLBACK'; END IF; RETURN NEW; END $$;
+        CREATE TRIGGER i6_member_fault BEFORE UPDATE ON "TrafficSourceMember" FOR EACH ROW EXECUTE FUNCTION i6_member_fault()`);
+      const before=await db.trafficSourceMember.findUnique({where:{id:member.id}});
+      await db.$executeRawUnsafe('INSERT INTO "I5ProofFault" VALUES(\'member\')');
+      try {await assert.rejects(receipt.projectCanonicalSubscriptionReceipt({db,job:jobScope,fact:{...baseFact,eventHash:"i6-rollback"}}),/I6_MEMBER_ROLLBACK/);}
+      finally {await db.$executeRawUnsafe('DELETE FROM "I5ProofFault"');}
+      assert.equal(await db.creatorSubscriptionLedger.count({where:{eventHash:"i6-rollback"}}),0);
+      assert.deepEqual(await db.trafficSourceMember.findUnique({where:{id:member.id}}),before);
+    });
+    await check("I6 duplicate fingerprint cannot cross creator or fan identity",async()=>{
+      const sibling=await db.creatorAccount.create({data:{agencyId:s.agency.id,displayName:"sibling"}});
+      for(const [job,fact] of [[{agencyId:s.agency.id,creatorId:sibling.id},{...baseFact,eventHash:"i6-shared"}],[jobScope,{...baseFact,eventHash:"i6-shared",fanId:"456"}]]) {
+        await assert.rejects(receipt.projectCanonicalSubscriptionReceipt({db,job,fact}),{code:"NOTIFICATION_FACT_SCOPE_MISMATCH"});
+      }
+      assert.equal(await db.creatorSubscriptionLedger.count({where:{eventHash:"i6-shared"}}),1);
+    });
+    await check("I6 standalone projection respects creator retirement",async()=>{
+      await assert.rejects(receipt.projectCanonicalSubscriptionReceipt({db,job:{agencyId:other.agency.id,creatorId:other.creator.id},fact:{...baseFact,eventHash:"i6-retired"}}),{code:"NOTIFICATION_PROJECTION_SCOPE_RETIRED"});
+      assert.equal(await db.creatorSubscriptionLedger.count({where:{eventHash:"i6-retired"}}),0);
+    });
+    await check("I6 raw conflict retries whole receipt root and commits money once",async()=>{
+      let attempts=0; const proxy={$transaction:(fn,options)=>db.$transaction(async tx=>{
+        const result=await fn(tx);if(++attempts===1)await tx.$executeRawUnsafe("DO $$ BEGIN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='I6_RETRY'; END $$");return result;
+      },options)};
+      await receipt.projectCanonicalSubscriptionReceipt({db:proxy,job:jobScope,fact:{...baseFact,eventHash:"i6-retry"}});
+      assert.equal(attempts,2);assert.equal(await db.creatorSubscriptionLedger.count({where:{eventHash:"i6-retry"}}),1);
+    });
+    await check("I6 actual Traffic reader and cost API ignore poisoned historical daily cache",async()=>{
+      const traffic=require("../../src/services/traffic-service");
+      const old=await db.trafficDailyAggregate.create({data:{agencyId:s.agency.id,creatorId:s.creator.id,sourceId:source.id,day:new Date("2026-01-01"),paidSubs:9999,grossCents:9999999,netCents:9999999,costCents:9999999}});
+      const before=await traffic.getTrafficOverview({userId:s.user.id,creatorId:s.creator.id});
+      assert.equal(before.totals.subscriptionRevenueCents,1200);assert.equal(before.totals.paidSubscriptions,4);
+      const updated=await traffic.updateTrafficSourceCost({userId:s.user.id,creatorId:s.creator.id,sourceId:source.id,costCents:321,currency:"USD"});
+      assert.equal(updated.source.costCents,321);assert.equal(updated.recompute.reason,"LEGACY_AGGREGATE_RETIRED");
+      const after=await traffic.getTrafficOverview({userId:s.user.id,creatorId:s.creator.id});
+      assert.equal(after.totals.subscriptionRevenueCents,1200);assert.equal(after.sources.find(x=>x.id===source.id).costCents,321);
+      assert.deepEqual(await db.trafficDailyAggregate.findUnique({where:{id:old.id}}),old);
+    });
+    const hotCounts=[];
+    await check("I6 paid receipt SQL work is unchanged after twenty-thousand same-day receipts",async()=>{
+      async function measure(eventHash) {
+        const start=queries.length;await receipt.projectCanonicalSubscriptionReceipt({db,job:jobScope,fact:{...baseFact,eventHash}});
+        const sql=queries.slice(start);assert.ok(!sql.some(q=>/TrafficDailyAggregate|SUM\(|COUNT\(/i.test(q)),sql.join("\n"));
+        hotCounts.push(sql.length);
+      }
+      await measure("i6-before-growth");
+      await db.$executeRawUnsafe(`INSERT INTO "CreatorSubscriptionLedger" ("id","agencyId","creatorId","accountId","fanId","sourceId","eventHash","eventType","amountCents","occurredAt","createdAt","updatedAt")
+        SELECT 'i6-bulk-'||g,$1,$2,$2,'123',$3,'i6-bulk-'||g,'paid_subscribed',100,$4::timestamp,clock_timestamp(),clock_timestamp() FROM generate_series(1,20000) g`,s.agency.id,s.creator.id,source.id,at);
+      await measure("i6-after-growth");assert.equal(hotCounts[0],hotCounts[1]);
+    });
+    const report = { ok: true, engine: "Prisma 5.22 / PGlite PostgreSQL WASM TCP", migrations: 260, cases: cases.length, results: cases, plans, receiptSqlStatementCounts: hotCounts,
+      limits: ["Single physical SQL client, not native contention or multi-replica load", "60000 interleaved two-agency facts validate SELECT plans only; USER triggers disabled solely while loading this synthetic fixture, FK and CHECK constraints retained; not ingestion throughput", "Unused daily aggregate writer retired; Traffic read-side grouping and attribution repair scale remain open", "Recovered retained canonical facts only; deleted facts and missing identities cannot be reconstructed"] };
     if (process.env.PHASE5_PROOF_OUTPUT) fs.writeFileSync(process.env.PHASE5_PROOF_OUTPUT, JSON.stringify(report,null,2)+'\n');
     console.log(JSON.stringify({ ok: true, cases: cases.length, plans: plans.length }));
   } finally { await db.$disconnect(); await server.stop(); await engine.close(); }

@@ -1,0 +1,70 @@
+ONLINOD / Phase 5A / I6 — canonical subscription receipts
+2026-09-24. This contract supersedes I5's active daily-aggregate assumptions.
+
+SOURCE FINDINGS AND DECISION
+TrafficDailyAggregate has no business reader in current Backend/Desktop sources.
+Traffic overview and member reports read CreatorSubscriptionLedger, while cost
+and ROI use TrafficSource.costCents. Maintaining the daily cache therefore caused
+unnecessary source/day history scans on receipt ingest and source cost updates.
+Remove the complete active producer/recompute family. Retain the old table,
+schema relations and existing bounded retention for historical/rolling-deploy
+compatibility. No destructive data migration, no new table or index.
+
+SINGLE RECEIPT PRODUCER
+subscription-receipt-projection-service owns creation of compatibility receipts.
+Full notification projection, durable notification consequences and I5 retained
+history repair all call it. traffic-service retains an import alias for internal
+call compatibility, containing no second normalization or persistence algorithm.
+Only paid_subscribed, subscription_renewed and subscription_resubscribed with
+positive amount and a known fan identity create paid receipts. A fingerprint and
+event time are required. Canonical source facts remain the upstream authority.
+INSERT ON CONFLICT DO NOTHING plus exact unique-key read preserves idempotency
+without catching P2002 in an aborted transaction. Creator and fan identity must
+match the existing receipt before any member side effects. Member lastRevenueAt
+only increases; convertedAt retains the earliest known conversion.
+Nonpayment repairs delete only the exact agency/creator/fingerprint receipt whose
+source is canonical_subscription_fact. Unrelated legacy receipts are preserved.
+Retained-history organic ledger policy stays active. No retired daily cache is
+reconstructed, irrespective of historical date or source cost changes.
+
+TRANSACTION OWNERSHIP
+Durable/history callers supply their existing transaction. The projector joins
+that transaction and never opens a nested root. Full-mode compatibility callers
+with a root DB client receive one JOB_CHUNK kernel transaction per receipt, with
+agency lifecycle and creator retirement checks. Receipt creation/deletion and
+member effects commit together. Known SQL conflicts retry the whole root.
+This does not claim closure of full-mode completion orchestration/Bump effects;
+those remaining families are tracked in the cumulative roadmap.
+
+HTTP AND DESKTOP COMPATIBILITY
+POST /api/traffic/subscriptions/ingest now returns explicit HTTP 410 with code
+TRAFFIC_SUBSCRIPTION_INGEST_RETIRED. Current Desktop77 has no caller of that
+endpoint; subscription observations use the canonical notification collector.
+An old external integration using raw money ingestion receives a visible retired
+contract response instead of silently accepted writes. No Desktop edit required.
+Cost update keeps its response shape with recompute={ok:true,skipped:true,
+reason:LEGACY_AGGREGATE_RETIRED,days:0,recomputedDays:0}. Actual source cost and
+read-side ROI update normally. Old aggregate contents cannot affect those reads.
+
+ROLLOUT AND HISTORY
+Install the whole I6 delta over the accepted I5 actual. Render command remains
+npm install && npm run prisma:migrate. No new migration, dependencies or ENV.
+I5 history generation keeps its existing cutoff/cursors/claims; I6 does not reset
+completed work or broaden that snapshot. Receipts created by an old writer after
+that cutoff may require a targeted historical tail repair; a whole-history clean
+state is not claimed. Old processes can finish against the retained schema during
+rollout, so deployment acceptance still requires fresh source and runtime evidence.
+
+VALIDATION AND LIMITS
+test:phase5-receipts exercises the shared projector and actual retired HTTP route.
+The maintained suite, I1-I4 active gates and current history regression gate remain.
+The existing history SQL proof now also checks standalone/transactional replay,
+member-effect rollback, creator/fan collision, retirement, raw 40001 retry, actual
+Traffic reader/cost behavior with a deliberately wrong old cache, and unchanged
+receipt statement count before/after 20000 same-day receipts. Production triggers
+remain enabled for the receipt fixture. The older 60000-fact SELECT-plan fixture
+retains its documented test-only USER-trigger bypass during bulk loading.
+Prisma/PGlite is one physical SQL client, not native PostgreSQL concurrency or a
+multi-replica throughput result. Traffic read-side all-range grouping and fan
+attribution repair still scan matching history. Whole Phase5A SOURCE/SCALE remain
+OPEN; Phase5B Desktop LocalAI remains AUDITED / NOT IMPLEMENTED.

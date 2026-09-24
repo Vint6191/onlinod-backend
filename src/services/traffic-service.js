@@ -1,9 +1,8 @@
 "use strict";
 
-const crypto = require("node:crypto");
 const { Prisma } = require("@prisma/client");
 const prisma = require("../prisma");
-const { lockDbAdvisoryXact } = require("./db-transaction-service");
+const { projectCanonicalSubscriptionReceipt: projectCanonicalSubscriptionCompatibility } = require("./subscription-receipt-projection-service");
 const { ensureSingleJob, TRAFFIC_REFRESH_WINDOW_MS } = require("./job-scheduler");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { createPlannedJobIfAbsent } = require("./job-planning-repository");
@@ -159,82 +158,6 @@ function normalizeValueStatsRow(row = {}) {
     valueStreamsCents: dbNumber(row.valueStreamsCents),
     lastValueFetchedAt: row.lastValueFetchedAt || null,
   };
-}
-
-function stableHash(parts) {
-  return crypto
-    .createHash("sha1")
-    .update((parts || []).map((x) => String(x ?? "")).join("|"), "utf8")
-    .digest("hex");
-}
-
-function utcDay(value) {
-  const d = asDate(value) || new Date();
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
-
-async function recomputeTrafficDailyAggregate(tx, { agencyId, creatorId, sourceId, day }) {
-  if (!sourceId || !day) return null;
-  const dayStart = utcDay(day);
-  const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
-  // Lock before reading: under ReadCommitted a waiter sees the preceding
-  // writer's committed ledger, rather than overwriting with an earlier sum.
-  await lockDbAdvisoryXact({ db: tx, key: `traffic-day:${JSON.stringify([agencyId, creatorId, sourceId, dayStart.toISOString()])}` });
-  const [subscriptionAgg, source] = await Promise.all([
-    tx.creatorSubscriptionLedger.aggregate({
-      where: {
-        agencyId,
-        creatorId,
-        sourceId,
-        amountCents: { gt: 0 },
-        occurredAt: { gte: dayStart, lt: dayEnd },
-      },
-      _count: { _all: true },
-      _sum: { amountCents: true },
-    }),
-    tx.trafficSource.findUnique({ where: { id: sourceId }, select: { costCents: true } }),
-  ]);
-
-  const paidSubs = Number(subscriptionAgg?._count?._all || 0);
-  const grossCents = Number(subscriptionAgg?._sum?.amountCents || 0);
-  const costCents = Number(source?.costCents || 0);
-
-  return tx.trafficDailyAggregate.upsert({
-    where: { sourceId_day: { sourceId, day: dayStart } },
-    create: {
-      agencyId,
-      creatorId,
-      sourceId,
-      day: dayStart,
-      paidSubs,
-      grossCents,
-      netCents: grossCents,
-      costCents,
-    },
-    update: {
-      paidSubs,
-      grossCents,
-      netCents: grossCents,
-      costCents,
-    },
-  });
-}
-
-async function applySubscriptionSideEffects(tx, { agencyId, creatorId, fanId, sourceId, occurredAt }) {
-  if (sourceId && fanId) {
-    await tx.trafficSourceMember.updateMany({
-      where: { agencyId, creatorId, sourceId, fanId },
-      data: {
-        lastRevenueAt: occurredAt,
-        convertedAt: occurredAt,
-        needsValueRefresh: true,
-      },
-    });
-  }
-
-  if (sourceId) {
-    await recomputeTrafficDailyAggregate(tx, { agencyId, creatorId, sourceId, day: occurredAt });
-  }
 }
 
 function rangeWindow(rangeKey = "all", now = new Date()) {
@@ -428,32 +351,6 @@ async function validateDeviceForCreator({ deviceId, userId, creatorId, db = pris
   return { device, creator, member, binding };
 }
 
-async function resolveTrafficIngestContext({ agencyId: agencyHint, deviceId, userId, creatorId }) {
-  const cleanAgencyId = clean(agencyHint, 180);
-  const cleanCreatorId = clean(creatorId, 180);
-
-  // Realtime Electron writes still use device-bound validation.
-  // Catch-up/import paths may be agency-scoped because the worker that scans
-  // missed notifications is not always the same local device bound to creator.
-  if (cleanAgencyId && cleanCreatorId) {
-    const creator = await prisma.creatorAccount.findUnique({ where: { id: cleanCreatorId } });
-    if (!creator || creator.deletedAt) {
-      const err = new Error("Creator not found");
-      err.code = "CREATOR_NOT_FOUND";
-      throw err;
-    }
-    if (creator.agencyId !== cleanAgencyId) {
-      const err = new Error("Creator and agency mismatch");
-      err.code = "CREATOR_AGENCY_MISMATCH";
-      throw err;
-    }
-    return { device: null, creator, agencyId: creator.agencyId, ingestMode: "agency_hint" };
-  }
-
-  const { device, creator } = await validateDeviceForCreator({ deviceId, userId, creatorId });
-  return { device, creator, agencyId: creator.agencyId, ingestMode: "device_bound" };
-}
-
 async function repairUnattributedSubscriptionAttribution({
   agencyId,
   creatorId,
@@ -474,7 +371,7 @@ async function repairUnattributedSubscriptionAttribution({
   let repaired = 0;
   let organicMisses = 0;
   let organicConfirmed = 0;
-  const recomputeTargets = new Map();
+  const affectedDays = new Set();
   const safeChunkSize = Math.max(1, Math.min(2000, Number(chunkSize || 1000)));
   const organicAttemptLimit = Math.max(1, Math.min(50, Number(organicConfirmAfterAttempts || 5)));
   const organicCutoff = new Date(Date.now() - Math.max(60_000, Number(organicConfirmMinAgeMs || 0)));
@@ -532,7 +429,7 @@ async function repairUnattributedSubscriptionAttribution({
       const count = Number(row.count || 0);
       if (!sourceId || !fanId || !day) continue;
       repaired += count;
-      recomputeTargets.set(`${sourceId}:${day.toISOString()}`, { sourceId, day });
+      affectedDays.add(`${sourceId}:${day.toISOString()}`);
       memberRepairPayload.push({
         sourceId,
         fanId,
@@ -598,24 +495,7 @@ async function repairUnattributedSubscriptionAttribution({
     }
   }
 
-  const targets = Array.from(recomputeTargets.values()).sort(compareTrafficAggregateTargets);
-  for (const chunk of chunkArray(targets, 30)) {
-    await prisma.$transaction(
-      async (tx) => {
-        for (const target of chunk) {
-          await recomputeTrafficDailyAggregate(tx, {
-            agencyId: cleanAgencyId,
-            creatorId: cleanCreatorId,
-            sourceId: target.sourceId,
-            day: target.day,
-          });
-        }
-      },
-      { timeout: 60_000, maxWait: 10_000 }
-    );
-  }
-
-  return { ok: true, repaired, affectedDays: targets.length, organicMisses, organicConfirmed };
+  return { ok: true, repaired, affectedDays: affectedDays.size, organicMisses, organicConfirmed };
 }
 
 async function selectFanIdsNeedingValueRefresh({
@@ -925,73 +805,6 @@ async function markTrafficFanValueDirty({ agencyId, creatorId, fanId, occurredAt
   return { ok: true, matched: updated.count || 0, fanId: cleanFanId, reason: clean(reason, 80) };
 }
 
-// Internal canonical-fact projection. The caller owns the transaction and has
-// loaded the fact from its agency/creator scope; no device/session is impersonated.
-function compareTrafficAggregateTargets(a, b) {
-  return a.sourceId < b.sourceId ? -1 : a.sourceId > b.sourceId ? 1 : a.day.getTime() - b.day.getTime();
-}
-
-async function queueCanonicalAggregate({ db, job, row, deferredAggregates, historyPolicy }) {
-  if (!row.sourceId) return false;
-  const aggregate = { agencyId: job.agencyId, creatorId: job.creatorId, sourceId: row.sourceId, day: utcDay(row.occurredAt) };
-  if (historyPolicy?.aggregateCutoff && aggregate.day < historyPolicy.aggregateCutoff) return true;
-  if (deferredAggregates) deferredAggregates.set(JSON.stringify([row.sourceId, aggregate.day.toISOString()]), aggregate);
-  else await recomputeTrafficDailyAggregate(db, aggregate);
-  return false;
-}
-
-async function projectCanonicalSubscriptionCompatibility({ db, job, fact, deferredAggregates = null, historyPolicy = null }) {
-  const fanId = clean(fact.fanId, 180);
-  const amount = cents(fact.amountCents);
-  const eventType = String(fact.eventType || "").toLowerCase();
-  const eventHash = clean(fact.eventHash, 220);
-  if (!["paid_subscribed", "subscription_renewed", "subscription_resubscribed"].includes(eventType)) {
-    // Earlier canonical projections accepted a display price on expiry/renewal
-    // settings as revenue. Remove only our exact scoped compatibility receipt;
-    // preserve legacy receipts and canonical source facts.
-    if (!eventHash) return { ignored: true };
-    const wrong = await db.creatorSubscriptionLedger.findFirst({ where: {
-      agencyId: job.agencyId, creatorId: job.creatorId, eventHash, source: "canonical_subscription_fact",
-    } });
-    if (!wrong) return { ignored: true };
-    const removed = await db.creatorSubscriptionLedger.deleteMany({ where: {
-      id: wrong.id, agencyId: job.agencyId, creatorId: job.creatorId, source: "canonical_subscription_fact",
-    } });
-    if (removed.count) await queueCanonicalAggregate({ db, job, row: wrong, deferredAggregates, historyPolicy });
-    return { ignored: true, invalidReceiptRemoved: removed.count };
-  }
-  if (!fanId || amount <= 0) return { ignored: true };
-  if (!eventHash) throw Object.assign(new Error("Canonical subscription fingerprint required"), { code: "NOTIFICATION_FACT_IDENTITY_REQUIRED" });
-  const occurredAt = asDate(fact.subscribedAt || fact.occurredAt);
-  if (!occurredAt) throw Object.assign(new Error("Canonical subscription time required"), { code: "NOTIFICATION_FACT_TIME_REQUIRED" });
-  const source = await db.trafficSourceMember.findFirst({
-    where: { agencyId: job.agencyId, creatorId: job.creatorId, fanId },
-    orderBy: [{ lastSeenAt: "desc" }, { createdAt: "desc" }], select: { sourceId: true },
-  });
-  if (historyPolicy && !source?.sourceId && historyPolicy.organicCutoff && occurredAt < historyPolicy.organicCutoff) return { ignored: true, retentionExcluded: true };
-  const row = await db.creatorSubscriptionLedger.upsert({
-    where: { agencyId_eventHash: { agencyId: job.agencyId, eventHash } },
-    create: { agencyId: job.agencyId, creatorId: job.creatorId, accountId: job.params?.accountId || job.creatorId,
-      fanId, sourceId: source?.sourceId || null, eventHash, eventType: fact.eventType || "paid_subscribed",
-      amountCents: amount, currency: fact.currency || "USD", occurredAt,
-      externalEventId: clean(fact.externalEventId || fact.notificationId || eventHash, 220),
-      source: "canonical_subscription_fact" },
-    update: {},
-  });
-  if (row.creatorId !== job.creatorId) throw Object.assign(new Error("Subscription projection scope mismatch"), { code: "NOTIFICATION_FACT_SCOPE_MISMATCH" });
-  // Replays and historical pages must not move current attribution clocks back.
-  if (row.sourceId) {
-    await db.trafficSourceMember.updateMany({ where: { agencyId: job.agencyId, creatorId: job.creatorId, sourceId: row.sourceId, fanId }, data: { needsValueRefresh: true } });
-    await db.trafficSourceMember.updateMany({ where: { agencyId: job.agencyId, creatorId: job.creatorId, sourceId: row.sourceId, fanId,
-      OR: [{ lastRevenueAt: null }, { lastRevenueAt: { lt: row.occurredAt } }] }, data: { lastRevenueAt: row.occurredAt } });
-    await db.trafficSourceMember.updateMany({ where: { agencyId: job.agencyId, creatorId: job.creatorId, sourceId: row.sourceId, fanId,
-      OR: [{ convertedAt: null }, { convertedAt: { gt: row.occurredAt } }] }, data: { convertedAt: row.occurredAt } });
-    const aggregateRetentionExcluded = await queueCanonicalAggregate({ db, job, row, deferredAggregates, historyPolicy });
-    if (aggregateRetentionExcluded) return { ignored: false, ledgerId: row.id, aggregateRetentionExcluded: true };
-  }
-  return { ignored: false, ledgerId: row.id };
-}
-
 async function markTrafficFanValueDirtyFromDevice({
   deviceId,
   userId,
@@ -1106,153 +919,6 @@ async function scheduleTrafficValueRefresh({
       creatorUsername: cleanCreatorRef, username: cleanCreatorRef, scheduledFromObservationAt: now.toISOString(),
     },
   });
-}
-
-async function ingestSubscriptionEvent({ agencyId: agencyHint, deviceId, userId, creatorId, accountId, event }) {
-  const { creator, agencyId, ingestMode } = await resolveTrafficIngestContext({
-    agencyId: agencyHint,
-    deviceId,
-    userId,
-    creatorId,
-  });
-  const fanId = clean(event?.fanId, 180);
-  const amountCents = cents(event?.amountCents) || moneyCents(event?.amount || event?.price);
-  const occurredAt = asDate(event?.occurredAt || event?.createdAt || event?.ts) || new Date();
-  const eventTypeRaw = String(event?.eventType || event?.type || "").toLowerCase();
-  const explicitFreeSub = event?.isFreeSubscription === true || eventTypeRaw.includes("free");
-
-  // Product decision: CreatorSubscriptionLedger stores PAID subscription facts only.
-  // Free/organic subscribe noise can be hundreds per day, so we drop it here and
-  // keep only TrafficSourceMember as the attribution map for campaign claimers.
-  if (!fanId || explicitFreeSub || amountCents <= 0) {
-    return {
-      ok: true,
-      ignored: true,
-      reason: !fanId ? "no_fan_id" : "free_subscription",
-      amountCents,
-    };
-  }
-
-  const sourceMember = await prisma.trafficSourceMember.findFirst({
-    where: { agencyId, creatorId: creator.id, fanId },
-    orderBy: [{ lastSeenAt: "desc" }, { createdAt: "desc" }],
-    select: { id: true, sourceId: true },
-  });
-
-  const eventHash =
-    clean(event?.eventHash, 220) ||
-    stableHash([
-      "subscription",
-      agencyId,
-      creator.id,
-      fanId,
-      amountCents,
-      occurredAt.toISOString(),
-      event?.externalEventId || event?.toastId || event?.notificationId || "",
-    ]);
-
-  const data = {
-    agencyId,
-    creatorId: creator.id,
-    accountId: clean(accountId || event?.accountId || creator.id, 180) || creator.id,
-    fanId,
-    sourceId: sourceMember?.sourceId || null,
-    eventType: clean(event?.eventType || "paid_subscribed", 80) || "paid_subscribed",
-    amountCents,
-    currency: clean(event?.currency, 8) || "USD",
-    occurredAt,
-    externalEventId: clean(event?.externalEventId || event?.toastId || event?.notificationId || null, 220),
-    eventHash,
-    source: clean(event?.source || "realtime_subscription", 80) || "realtime_subscription",
-    metadata: compactJson(event?.metadata || null),
-  };
-
-  try {
-    const created = await prisma.$transaction(async (tx) => {
-      const row = await tx.creatorSubscriptionLedger.create({ data });
-      await applySubscriptionSideEffects(tx, {
-        agencyId,
-        creatorId: creator.id,
-        fanId: row.fanId,
-        sourceId: row.sourceId,
-        occurredAt: row.occurredAt,
-      });
-      return row;
-    });
-
-    let attributionRepair = null;
-    if (!created.sourceId) {
-      attributionRepair = await repairUnattributedSubscriptionAttribution({
-        agencyId,
-        creatorId: creator.id,
-        fanIds: [created.fanId],
-      }).catch((err) => ({ ok: false, error: err?.message || String(err), repaired: 0 }));
-    }
-
-    let valueRefresh = null;
-    if (created.sourceId || attributionRepair?.repaired > 0) {
-      valueRefresh = await scheduleTrafficValueRefresh({
-        agencyId,
-        creatorId: creator.id,
-        accountId: data.accountId,
-        creatorRef: creator.username || creator.displayName || null,
-        reason: "realtime_subscription_dirty",
-        priority: 105,
-      }).catch((err) => ({ ok: false, error: err?.message || String(err) }));
-    }
-
-    return {
-      ok: true,
-      ledgerId: created.id,
-      sourceId: created.sourceId,
-      amountCents,
-      attributionRepair,
-      valueRefresh,
-      ingestMode,
-    };
-  } catch (err) {
-    if (err?.code !== "P2002") throw err;
-
-    const existing = await prisma.creatorSubscriptionLedger.findUnique({
-      where: { agencyId_eventHash: { agencyId, eventHash } },
-      select: { id: true, fanId: true, sourceId: true, occurredAt: true, amountCents: true },
-    });
-
-    if (existing) {
-      await prisma.$transaction(async (tx) => {
-        await applySubscriptionSideEffects(tx, {
-          agencyId,
-          creatorId: creator.id,
-          fanId: existing.fanId,
-          sourceId: existing.sourceId,
-          occurredAt: existing.occurredAt,
-        });
-      });
-    }
-
-    const attributionRepair =
-      existing && !existing.sourceId
-        ? await repairUnattributedSubscriptionAttribution({
-            agencyId,
-            creatorId: creator.id,
-            fanIds: [existing.fanId],
-          }).catch((err) => ({ ok: false, error: err?.message || String(err), repaired: 0 }))
-        : { ok: true, repaired: 0 };
-
-    let valueRefresh = null;
-    if (existing?.sourceId || attributionRepair?.repaired > 0) {
-      valueRefresh = await scheduleTrafficValueRefresh({
-        agencyId,
-        creatorId: creator.id,
-        accountId: clean(accountId || event?.accountId || creator.id, 180) || creator.id,
-        creatorRef: creator.username || creator.displayName || null,
-        reason: "duplicate_subscription_repair_dirty",
-        priority: 95,
-      }).catch((err) => ({ ok: false, error: err?.message || String(err) }));
-    }
-
-    return { ok: true, duplicate: true, repaired: !!existing, attributionRepair, eventHash, valueRefresh, ingestMode };
-  }
 }
 
 async function assertTrafficViewer({ userId, creatorId }) {
@@ -1893,43 +1559,6 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "all" }) {
   };
 }
 
-async function recomputeTrafficDailyAggregatesForSource({ agencyId, creatorId, sourceId, chunkSize = 30 } = {}) {
-  const cleanSourceId = clean(sourceId, 180);
-  if (!agencyId || !creatorId || !cleanSourceId) {
-    return { ok: false, days: 0, recomputedDays: 0, code: "BAD_RECOMPUTE_INPUT" };
-  }
-
-  const days = await prisma.trafficDailyAggregate.findMany({
-    where: { agencyId, creatorId, sourceId: cleanSourceId },
-    select: { day: true },
-    orderBy: { day: "asc" },
-    take: 10000,
-  });
-
-  let recomputedDays = 0;
-  for (const chunk of chunkArray(days, chunkSize)) {
-    await prisma.$transaction(
-      async (tx) => {
-        for (const { day } of chunk) {
-          await recomputeTrafficDailyAggregate(tx, {
-            agencyId,
-            creatorId,
-            sourceId: cleanSourceId,
-            day,
-          });
-          recomputedDays += 1;
-        }
-      },
-      {
-        maxWait: 10_000,
-        timeout: 60_000,
-      }
-    );
-  }
-
-  return { ok: true, days: days.length, recomputedDays };
-}
-
 async function updateTrafficSourceCost({ userId, creatorId, sourceId, costCents, currency }) {
   const { creator, member } = await assertTrafficViewer({ userId, creatorId });
 
@@ -1951,9 +1580,7 @@ async function updateTrafficSourceCost({ userId, creatorId, sourceId, costCents,
 
   const nextCostCents = cents(costCents);
 
-  // Keep the financial write itself short and atomic. Daily aggregates can span
-  // hundreds of days, so recomputing them inside the same transaction can hit
-  // Prisma/host transaction timeouts and roll back the actual cost update.
+  // Cost lives on TrafficSource; every current reader uses this canonical value.
   const updated = await prisma.$transaction(
     async (tx) => {
       const source = await tx.trafficSource.findFirst({
@@ -1990,30 +1617,9 @@ async function updateTrafficSourceCost({ userId, creatorId, sourceId, costCents,
     }
   );
 
-  // TrafficDailyAggregate stores a denormalized costCents copy for fast
-  // dashboard reads. Recompute from the ledger source of truth in small
-  // transactions so old long-lived campaigns do not lock one huge transaction.
-  let recompute = { ok: true, days: 0, recomputedDays: 0 };
-  try {
-    recompute = await recomputeTrafficDailyAggregatesForSource({
-      agencyId: creator.agencyId,
-      creatorId: creator.id,
-      sourceId: updated.id,
-      chunkSize: 30,
-    });
-  } catch (err) {
-    console.warn("[traffic] source cost updated but aggregate recompute failed", {
-      sourceId: updated.id,
-      error: err?.message || String(err),
-    });
-    recompute = {
-      ok: false,
-      days: 0,
-      recomputedDays: 0,
-      code: err?.code || "TRAFFIC_AGGREGATE_RECOMPUTE_FAILED",
-      message: err?.message || String(err),
-    };
-  }
+  // Current readers use TrafficSource.costCents and the receipt ledger directly.
+  // Preserve the response field while explicitly retiring the unused daily cache.
+  const recompute = { ok: true, skipped: true, reason: "LEGACY_AGGREGATE_RETIRED", days: 0, recomputedDays: 0 };
 
   return { ok: true, source: updated, recompute };
 }
@@ -2105,8 +1711,6 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
 }
 
 module.exports = {
-  recomputeTrafficDailyAggregate,
-  compareTrafficAggregateTargets,
   TRAFFIC_SOURCES_SCAN_JOB_KEY,
   TRAFFIC_VALUE_REFRESH_JOB_KEY,
   VALUE_SNAPSHOT_TTL_MS,
@@ -2115,7 +1719,6 @@ module.exports = {
   projectCanonicalSubscriptionCompatibility,
   getPendingTrafficValueFanIds,
   markTrafficFanValueDirtyFromDevice,
-  ingestSubscriptionEvent,
   getTrafficOverview,
   getTrafficSourceMembers,
   updateTrafficSourceCost,

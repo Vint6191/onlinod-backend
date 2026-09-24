@@ -55,7 +55,8 @@
     "test:phase5-admin-background": "node scripts/audit/phase5-commit-test-gate.js phase5-admin-background-tests.json",
     "audit:phase5-admin-background-postgres": "node scripts/audit/phase5-admin-background-postgres-proof.js",
     "test:phase5-history": "node scripts/audit/phase5-commit-test-gate.js phase5-notification-history-tests.json",
-    "audit:phase5-history-postgres": "node scripts/audit/phase5-notification-history-postgres-proof.js"
+    "audit:phase5-history-postgres": "node scripts/audit/phase5-notification-history-postgres-proof.js",
+    "test:phase5-receipts": "node scripts/audit/phase5-commit-test-gate.js phase5-subscription-receipt-tests.json"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

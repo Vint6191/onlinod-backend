@@ -6,7 +6,6 @@ const {
   upsertTrafficSourceScan,
   getPendingTrafficValueFanIds,
   markTrafficFanValueDirtyFromDevice,
-  ingestSubscriptionEvent,
   getTrafficOverview,
   getTrafficSourceMembers,
   updateTrafficSourceCost,
@@ -73,49 +72,12 @@ router.post("/sources/upsert", async (req, res) => {
   }
 });
 
-const subscriptionIngestSchema = z.object({
-  deviceId: z.string().min(1),
-  creatorId: z.string().min(1),
-  accountId: z.string().optional().nullable(),
-  event: z.object({
-    fanId: z.string().min(1),
-    eventType: z.string().optional().nullable(),
-    amountCents: z.number().int().nonnegative().optional(),
-    amount: z.union([z.number(), z.string()]).optional().nullable(),
-    price: z.union([z.number(), z.string()]).optional().nullable(),
-    currency: z.string().optional().nullable(),
-    occurredAt: z.union([z.string(), z.number(), z.date()]).optional().nullable(),
-    createdAt: z.union([z.string(), z.number(), z.date()]).optional().nullable(),
-    ts: z.union([z.string(), z.number()]).optional().nullable(),
-    externalEventId: z.string().optional().nullable(),
-    eventHash: z.string().optional().nullable(),
-    toastId: z.string().optional().nullable(),
-    notificationId: z.string().optional().nullable(),
-    source: z.string().optional().nullable(),
-    metadata: z.any().optional(),
-  }).passthrough(),
-});
-
-router.post("/subscriptions/ingest", async (req, res) => {
-  try {
-    const input = subscriptionIngestSchema.parse(req.body || {});
-    await requireProductCreator(req, input.creatorId);
-    requireProductDevice(req, input.deviceId);
-    const result = await ingestSubscriptionEvent({
-      deviceId: input.deviceId,
-      userId: actorUserId(req),
-      creatorId: input.creatorId,
-      accountId: input.accountId,
-      event: input.event,
-    });
-    return res.json(result);
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    console.error("[traffic/subscriptions/ingest] failed:", err);
-    return serviceError(res, err, "TRAFFIC_SUBSCRIPTION_INGEST_FAILED");
-  }
-});
-
+// Current Desktop publishes subscription observations through the canonical
+// notification collector. Raw client money ingestion is a retired contract.
+router.post("/subscriptions/ingest", (_req, res) => res.status(410).json({
+  ok: false, code: "TRAFFIC_SUBSCRIPTION_INGEST_RETIRED",
+  error: "Subscription receipts are projected from canonical notification facts",
+}));
 
 const trafficRefreshSchema = z.object({
   force: z.boolean().optional(),

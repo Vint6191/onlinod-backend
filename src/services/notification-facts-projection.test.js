@@ -31,7 +31,7 @@ function loadProjection({ sales = [], tips, subscriptions, ingestAssertion, inge
   inject("../prisma", db);
   inject("./job-idempotency", { buildJobIdempotencyKey: () => "key" });
   inject("./traffic-service", {
-    ingestSubscriptionEvent: async (args) => { calls.subscriptions.push(args); return { ok: true }; },
+    projectCanonicalSubscriptionCompatibility: async (args) => { calls.subscriptions.push(args); return { ignored: args.fact.eventType === "subscription_refunded" }; },
     markTrafficFanValueDirty: async (args) => {
       calls.trafficDirty.push(args);
       if (trafficError) throw new Error("traffic compatibility failed");
@@ -188,8 +188,9 @@ test("typed subscription projection keeps refund only in the relational ledger a
     db, job: scopedJob(), deviceId: "device-1", userId: "user-1", result: completionResult(2),
   });
   assert.equal(applied.ok, true);
-  assert.equal(calls.subscriptions.length, 1);
-  assert.deepEqual(calls.subscriptions.map((call) => call.event.eventType), ["paid_subscribed"]);
+  assert.equal(calls.subscriptions.length, 2);
+  assert.deepEqual(calls.subscriptions.map((call) => call.fact.eventType), ["paid_subscribed", "subscription_refunded"]);
+  assert.ok(calls.subscriptions.every(call => call.db === db && call.job.id === "job-1"));
   assert.equal(applied.summary.subscriptionRefundIgnored, 1);
   assert.equal(applied.summary.skipped, 1);
 });

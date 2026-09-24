@@ -2,7 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
-const { ingestSubscriptionEvent, markTrafficFanValueDirty } = require("./traffic-service");
+const { projectCanonicalSubscriptionCompatibility, markTrafficFanValueDirty } = require("./traffic-service");
 const { processRuntimeEvents: processBumpRuntimeEvents } = require("./bump-service");
 const { ingestNotificationFacts } = require("./notification-facts-service");
 const { completeNotificationSync, recordNotificationSyncFailure, assertNotificationCollectionResult } = require("./notification-sync-state-service");
@@ -577,39 +577,13 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, userId, resul
           });
           if (bumpSubscriptionEvents.length >= BUMP_COMPATIBILITY_PAGE_SIZE) await flushBumpSubscriptionEvents();
         }
-        if (/(refund|chargeback|reversal)/.test(subscriptionLifecycleType)) {
-          summary.subscriptionRefundIgnored += 1;
+        const subscriptionResult = await projectCanonicalSubscriptionCompatibility({ db, job, fact });
+        if (subscriptionResult.ignored) {
+          if (/(refund|chargeback|reversal)/.test(subscriptionLifecycleType)) summary.subscriptionRefundIgnored += 1;
+          else if (amountCents(fact.amountCents) <= 0) summary.subscriptionFreeIgnored += 1;
           summary.skipped += 1;
           continue;
         }
-        const subscriptionAmountCents = amountCents(fact.amountCents);
-        if (subscriptionAmountCents <= 0) {
-          summary.subscriptionFreeIgnored += 1;
-          summary.skipped += 1;
-          continue;
-        }
-        const subscriptionResult = await ingestSubscriptionEvent({
-          agencyId: job.agencyId,
-          deviceId,
-          userId,
-          creatorId: job.creatorId,
-          accountId: clean(params.accountId || job.creatorId || "unknown", 160) || "unknown",
-          event: {
-            fanId: subscriptionFanId,
-            eventType: clean(fact.eventType || "paid_subscribed", 80) || "paid_subscribed",
-            amountCents: subscriptionAmountCents,
-            currency: clean(fact.currency || "USD", 8) || "USD",
-            occurredAt: dateOrNull(fact.subscribedAt || fact.occurredAt) || now,
-            externalEventId: clean(fact.externalEventId || fact.notificationId || fact.eventHash, 220),
-            eventHash: clean(fact.eventHash, 220),
-            notificationId: clean(fact.notificationId, 220),
-            source: "canonical_subscription_fact",
-            metadata: {
-              fanUsername: clean(fact.fanUsername, 120),
-              fanName: clean(fact.fanName, 160),
-            },
-          },
-        });
         if (subscriptionResult?.duplicate) summary.deduped += 1;
         else if (!subscriptionResult?.ignored) summary.subscriptionCreatedOrUpdated += 1;
         continue;

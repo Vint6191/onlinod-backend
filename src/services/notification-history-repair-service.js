@@ -87,8 +87,7 @@ async function processHistoryPage({ db, item, ownerToken }) {
     const policy = await require("./retention-service").getRetentionSettings({ db: tx });
     if (!policy.ok) throw fault("NOTIFICATION_HISTORY_RETENTION_POLICY_UNAVAILABLE");
     const now = await dbAuthorityNow({ db: tx });
-    const historyPolicy = { organicCutoff: policy.settings.trafficPaidOrganicLedgerDays > 0 ? new Date(now.getTime() - policy.settings.trafficPaidOrganicLedgerDays * 86400000) : null,
-      aggregateCutoff: new Date(now.getTime() - policy.settings.trafficDailyAggregateDays * 86400000) };
+    const historyPolicy = { organicCutoff: policy.settings.trafficPaidOrganicLedgerDays > 0 ? new Date(now.getTime() - policy.settings.trafficPaidOrganicLedgerDays * 86400000) : null };
     const effects = await projectFacts({ db: tx, job: { agencyId: item.agencyId, creatorId: item.creatorId, params: {} }, table, rows, historical: true, historyPolicy });
     const more = page.length === PAGE_SIZE;
     const next = { cutoffAt: cursor.cutoffAt, table: more ? table : table + 1,

@@ -2,20 +2,25 @@
 const test = require("node:test"), assert = require("node:assert/strict");
 const { projectTipProjectionFact, projectSubscriptionProjectionFact } = require("./team-observation-service");
 const { projectCanonicalSubscriptionCompatibility } = require("./traffic-service");
-test("daily aggregate waits for its scoped transaction lock before reading ledger totals", async () => {
-  const { recomputeTrafficDailyAggregate } = require("./traffic-service"), calls = [];
-  const db = {
-    $executeRawUnsafe: async (sql,key) => { assert.match(sql,/pg_advisory_xact_lock/); assert.match(key,/a.*c.*source.*2026-09-24/); calls.push("lock"); },
-    creatorSubscriptionLedger: { aggregate: async () => { assert.equal(calls[0],"lock"); calls.push("read"); return {_count:{_all:2},_sum:{amountCents:300}}; } },
-    trafficSource: { findUnique: async () => ({costCents:10}) },
-    trafficDailyAggregate: { upsert: async value => { calls.push("write"); assert.equal(value.update.grossCents,300); return value; } },
-  };
-  await recomputeTrafficDailyAggregate(db,{agencyId:"a",creatorId:"c",sourceId:"source",day:new Date("2026-09-24T18:00:00Z")});
-  assert.deepEqual(calls,["lock","read","write"]);
+function receiptDb() {
+  const rows = new Map(), calls = [];
+  const db = { trafficSourceMember: { findFirst: async () => ({sourceId:"source"}), updateMany: async () => ({count:1}) },
+    creatorSubscriptionLedger: {
+      createMany: async ({data}) => { const row=data[0]; const duplicate=rows.has(row.eventHash); if(!duplicate) rows.set(row.eventHash,row); calls.push("insert"); return {count:duplicate?0:1}; },
+      findUnique: async ({where}) => { calls.push("identity"); return rows.get(where.agencyId_eventHash.eventHash); },
+      aggregate: async () => assert.fail("receipt must not scan daily history"),
+    }, trafficDailyAggregate: {upsert:async()=>assert.fail("retired aggregate must not be written")} };
+  return {db,rows,calls};
+}
+test("a canonical paid receipt does not query or write the retired daily aggregate", async () => {
+  const {db,rows}=receiptDb();
+  const result=await projectCanonicalSubscriptionCompatibility({db,job:{agencyId:"a",creatorId:"c"},
+    fact:{fanId:"123",eventType:"paid_subscribed",amountCents:100,eventHash:"fact",occurredAt:new Date()}});
+  assert.equal(result.ignored,false); assert.equal(rows.size,1);
 });
 test("nonpayment repair cannot delete foreign or legacy receipts", async () => {
   let selector;
-  const db = {creatorSubscriptionLedger:{findFirst:async ({where}) => {selector=where; return null;},deleteMany:async()=>assert.fail("no matching canonical receipt")}};
+  const db = {creatorSubscriptionLedger:{deleteMany:async ({where}) => {selector=where; return {count:0};}}};
   await projectCanonicalSubscriptionCompatibility({db,job:{agencyId:"a",creatorId:"c"},fact:{eventType:"subscription_expired",eventHash:"event"}});
   assert.deepEqual(selector,{agencyId:"a",creatorId:"c",eventHash:"event",source:"canonical_subscription_fact"});
 });
@@ -28,7 +33,7 @@ for (const project of [projectTipProjectionFact, projectSubscriptionProjectionFa
 }
 for (const eventType of ["subscription_expired", "auto_renew_enabled", "auto_renew_disabled", "subscription_refunded", "free_subscribed", "subscribed_unknown"]) {
   test(`${eventType} with positive display price cannot become a paid ledger fact`, async () => {
-    const result = await projectCanonicalSubscriptionCompatibility({ db: {}, job: {}, fact: { fanId: "123", eventType, amountCents: 100 } });
+    const result = await projectCanonicalSubscriptionCompatibility({ db: {}, job: {agencyId:"a",creatorId:"c"}, fact: { fanId: "123", eventType, amountCents: 100 } });
     assert.equal(result.ignored, true);
   });
 }
@@ -56,11 +61,12 @@ test("historical subscription repair schedules current reconciliation without al
   assert.equal(result.errors.length,0); assert.equal(result.planned,0);
   assert.deepEqual(requested.onlyFansUserIds,["123"]); assert.equal(requested.db,db);
 });
-test("several subscriptions for the same source/day collect one aggregate recomputation target", async () => {
-  const targets = new Map(), day = new Date("2026-09-24T10:00:00Z");
-  const db = { trafficSourceMember: { findFirst: async () => ({sourceId:"source"}), updateMany: async () => ({count:1}) },
-    creatorSubscriptionLedger: { upsert: async ({create}) => ({id:"row",...create}) } };
-  for(let n=0;n<3;n++) await projectCanonicalSubscriptionCompatibility({db,job:{agencyId:"a",creatorId:"c"},
-    fact:{fanId:"123",eventType:"paid_subscribed",amountCents:100,eventHash:"fact-"+n,occurredAt:day},deferredAggregates:targets});
-  assert.equal(targets.size,1); assert.equal([...targets.values()][0].day.toISOString(),"2026-09-24T00:00:00.000Z");
+test("paid receipt replay returns the same identity without duplicating money or scanning history", async () => {
+  const {db,rows,calls}=receiptDb(); const ids=[];
+  for(let n=0;n<3;n++) {
+    const result=await projectCanonicalSubscriptionCompatibility({db,job:{agencyId:"a",creatorId:"c"},
+      fact:{fanId:"123",eventType:"paid_subscribed",amountCents:100,eventHash:"same",occurredAt:new Date("2026-09-24")}});
+    ids.push(result.ledgerId); assert.equal(result.duplicate,n>0);
+  }
+  assert.equal(rows.size,1); assert.equal(new Set(ids).size,1); assert.deepEqual(calls,["insert","identity","insert","identity","insert","identity"]);
 });
