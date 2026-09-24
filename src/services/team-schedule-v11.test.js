@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -60,7 +62,7 @@ function dbForRead({ shiftMemberScope = "all" } = {}) {
 }
 
 test("Schedule read model combines planned shifts with actual coverage without immortal open sessions", async () => {
-  const payload = await schedule.buildTeamSchedule({ agencyId: "agency-1", rangeKey: "7d", now: new Date("2026-08-13T12:00:00Z"), db: dbForRead(), canManageSchedule: true });
+  const payload = await schedule.buildTeamSchedule({ agencyId: "agency-1", rangeKey: "7d", now: new Date("2026-08-13T12:00:00Z"), db: commitDatabaseFixture(dbForRead()), canManageSchedule: true });
   assert.equal(payload.context.workspaceTimezone, "Europe/Kyiv");
   assert.equal(payload.context.canManageSchedule, true);
   assert.equal(payload.shifts.length, 1);
@@ -90,7 +92,7 @@ test("current planned Schedule drops a historical shift when its member no longe
     agencyId: "agency-1",
     rangeKey: "7d",
     now: new Date("2026-08-13T12:00:00Z"),
-    db: dbForRead({ shiftMemberScope: [] }),
+    db: commitDatabaseFixture(dbForRead({ shiftMemberScope: [] })),
     canManageSchedule: true,
   });
   assert.equal(payload.shifts.length, 0);
@@ -104,7 +106,7 @@ test("Schedule context never leaks target member creator ids outside the acting 
     agencyId: "agency-1",
     rangeKey: "7d",
     now: new Date("2026-08-13T12:00:00Z"),
-    db: dbForRead(),
+    db: commitDatabaseFixture(dbForRead()),
     allowedCreatorIds: ["creator-1"],
     canManageSchedule: true,
   });
@@ -129,10 +131,10 @@ test("Schedule write target validation is fail-closed for actor and target-membe
     creatorAccount: { async findMany({ where }) { return (where.id.in || []).filter((id) => id === "creator-1" || id === "creator-2").map((id) => ({ id })); } },
     teamShift: { async create({ data }) { return { id: "shift-new", revision: 1, ...data, creators: data.creators.create }; } },
     auditLog: { async create() { return { id: "audit-1" }; } },
-    async $transaction(fn) { return fn(this); },
+    async $transaction(fn) { return fn({ ...(this), $transaction: undefined }); },
   };
-  await schedule.createTeamShift({ agencyId: "agency-1", actorUserId: "user-manager", actorMemberId: "manager", actorAllowedCreatorIds: ["creator-1"], input: { memberId: "member-a", creatorIds: ["creator-1"], startsAt: "2026-08-14T09:00:00Z", endsAt: "2026-08-14T17:00:00Z", timezone: "Europe/Kyiv" }, db });
-  await assert.rejects(() => schedule.createTeamShift({ agencyId: "agency-1", actorUserId: "user-manager", actorMemberId: "manager", actorAllowedCreatorIds: ["creator-1"], input: { memberId: "member-a", creatorIds: ["creator-2"], startsAt: "2026-08-14T09:00:00Z", endsAt: "2026-08-14T17:00:00Z", timezone: "Europe/Kyiv" }, db }), (err) => ["TEAM_SCHEDULE_CREATOR_FORBIDDEN", "MANAGEMENT_CREATOR_SCOPE_REVOKED"].includes(err.code));
+  await schedule.createTeamShift({ agencyId: "agency-1", actorUserId: "user-manager", actorMemberId: "manager", actorAllowedCreatorIds: ["creator-1"], input: { memberId: "member-a", creatorIds: ["creator-1"], startsAt: "2026-08-14T09:00:00Z", endsAt: "2026-08-14T17:00:00Z", timezone: "Europe/Kyiv" }, db: commitDatabaseFixture(db) });
+  await assert.rejects(() => schedule.createTeamShift({ agencyId: "agency-1", actorUserId: "user-manager", actorMemberId: "manager", actorAllowedCreatorIds: ["creator-1"], input: { memberId: "member-a", creatorIds: ["creator-2"], startsAt: "2026-08-14T09:00:00Z", endsAt: "2026-08-14T17:00:00Z", timezone: "Europe/Kyiv" }, db: commitDatabaseFixture(db) }), (err) => ["TEAM_SCHEDULE_CREATOR_FORBIDDEN", "MANAGEMENT_CREATOR_SCOPE_REVOKED"].includes(err.code));
 });
 
 test("Schedule is relational, additive and exposes an explicit granular manage permission", () => {

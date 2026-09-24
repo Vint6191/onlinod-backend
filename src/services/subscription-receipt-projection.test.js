@@ -1,7 +1,10 @@
 "use strict";
 const test = require("node:test"), assert = require("node:assert/strict");
-const { projectCanonicalSubscriptionReceipt: project } = require("./subscription-receipt-projection-service");
+const { projectCanonicalSubscriptionReceipt: projectImpl } = require("./subscription-receipt-projection-service");
 const fetch = globalThis.fetch;
+const { runDbTransaction } = require("./db-transaction-service");
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+const project = args => runDbTransaction(commitDatabaseFixture(args.db), tx => projectImpl({ ...args, db: tx }));
 const job = {agencyId:"agency",creatorId:"creator"};
 const fact = {fanId:"123",eventType:"paid_subscribed",amountCents:100,eventHash:"receipt",occurredAt:new Date("2026-09-24")};
 function fixture(existing = null) {
@@ -38,4 +41,10 @@ test("retired raw subscription HTTP ingress returns 410 for both old valid and m
       assert.equal(response.status,410);assert.equal((await response.json()).code,"TRAFFIC_SUBSCRIPTION_INGEST_RETIRED");
     }
   } finally {await new Promise(resolve=>server.close(resolve));}
+});
+
+test("receipt projection rejects an unissued transaction client", async () => {
+  const fx = fixture();
+  await assert.rejects(projectImpl({ db: fx.db, job, fact }), { code: "DB_COMMIT_CONTEXT_REQUIRED" });
+  assert.equal(fx.row(), null);
 });

@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
@@ -534,7 +536,7 @@ async function resolveRetiredCreatorPendingCustomOrder({ agencyId, member, custo
   if (!justification) throw fail("CUSTOM_RETIRED_ORDER_RESOLUTION_REASON_REQUIRED", "An explicit legacy retirement resolution reason is required", 400);
   if (typeof client?.$transaction !== "function") throw fail("CUSTOM_RETIRED_ORDER_RESOLUTION_TRANSACTION_REQUIRED", "Legacy Custom resolution requires transactional audit authority", 500);
 
-  return client.$transaction(async (tx) => {
+  return runDbTransaction(client, async (tx) => {
     // Even the historical compatibility resolver obeys the canonical prefix. Read
     // the immutable target identity first, then Agency -> Creator -> Member.
     const initial = await tx.customOrder.findFirst({
@@ -687,7 +689,7 @@ async function resolveUnassignedCustomContentSubmission({ agencyId, member, subm
   if (!justification) throw fail("CUSTOM_SUBMISSION_DISPOSITION_REASON_REQUIRED", "An explicit resolution reason is required", 400);
   if (typeof client?.$transaction !== "function") throw fail("CUSTOM_SUBMISSION_DISPOSITION_TRANSACTION_REQUIRED", "Pipeline resolution requires transactional audit authority", 500);
 
-  return client.$transaction(async (tx) => {
+  return runDbTransaction(client, async (tx) => {
     // Human terminal resolution is destructive control-plane authority: re-check the canonical
     // membership row and permission/scope in the commit transaction before mutating the pipeline.
     const currentMember = await lockCurrentAgencyMember({ agencyId, actorMember: member, db: tx });

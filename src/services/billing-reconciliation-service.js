@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { randomUUID } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
@@ -31,7 +33,7 @@ async function reconcileBillingStates({ db, now: fallbackNow = new Date(), limit
   const token = randomUUID();
   const started = performance.now();
   const result = { scanned: 0, expired: 0, repaired: 0, failed: 0, cycleCompleted: false, busy: false, leaseLost: false };
-  const page = await db.$transaction(async tx => {
+  const page = await runDbTransaction(db, async tx => {
     const { state, now } = await lockedCursor(tx, fallbackNow);
     if (state.ownerToken && state.leaseUntil > now) { result.busy = true; return []; }
     // Scan Agency, not Subscription. A new trial need not have a subscription;
@@ -61,7 +63,7 @@ async function reconcileBillingStates({ db, now: fallbackNow = new Date(), limit
       if (result.scanned && performance.now() - started >= budget) break;
       let outcome;
       try {
-        outcome = await db.$transaction(async tx => {
+        outcome = await runDbTransaction(db, async tx => {
           const { state, now } = await lockedCursor(tx, fallbackNow);
           if (!owned(state, token, now)) return { leaseLost: true };
           const before = await tx.agency.findUnique({ where: { id: row.id } });
@@ -85,7 +87,7 @@ async function reconcileBillingStates({ db, now: fallbackNow = new Date(), limit
         // A bad tenant cannot pin the prefix forever. Record the failure and
         // visit it again next cycle. If storage itself is down this transaction
         // fails too, leaving the cursor unchanged for crash-safe recovery.
-        outcome = await db.$transaction(async tx => {
+        outcome = await runDbTransaction(db, async tx => {
           const { state, now } = await lockedCursor(tx, fallbackNow);
           if (!owned(state, token, now)) return { leaseLost: true };
           const code = String(error?.code || "BILLING_RECONCILIATION_FAILED").slice(0, 120);

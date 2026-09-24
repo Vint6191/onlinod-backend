@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -67,7 +69,7 @@ test("Closure3 JobPlanningRepository is fail-closed for any producer key outside
     let touched = false;
     const db = { jobInstance: { create: async () => { touched = true; throw new Error("must not touch DB"); } } };
     await assert.rejects(
-      () => planning.createPlannedJob({ db, jobKey: "refresh_online_presence", creatorId: "c1", agencyId: "a1" }),
+      () => planning.createPlannedJob({ db: commitDatabaseFixture(db), jobKey: "refresh_online_presence", creatorId: "c1", agencyId: "a1" }),
       (error) => error?.code === "JOB_PLANNING_UNKNOWN_JOB_KEY" && error?.message === "JOB_PLANNING_UNKNOWN_JOB_KEY",
     );
     await assert.rejects(
@@ -151,9 +153,9 @@ test("Closure3 SFS discovery observation authority keeps T2 current when delayed
     const { applySfsDiscoveryChunk } = loaded.service;
     const t1 = "2026-08-31T10:00:00.000Z";
     const t2 = "2026-08-31T10:05:00.000Z";
-    const newer = await applySfsDiscoveryChunk({ db, job: { id: "job-B", agencyId: "a1", creatorId: "c1", createdAt: new Date(t2) }, chunkResult: sfsChunk("2099-01-01T00:00:00.000Z", "T2") });
+    const newer = await applySfsDiscoveryChunk({ db: commitDatabaseFixture(db), job: { id: "job-B", agencyId: "a1", creatorId: "c1", createdAt: new Date(t2) }, chunkResult: sfsChunk("2099-01-01T00:00:00.000Z", "T2") });
     assert.equal(newer.applied, 1);
-    const stale = await applySfsDiscoveryChunk({ db, job: { id: "job-A", agencyId: "a1", creatorId: "c1", createdAt: new Date(t1) }, chunkResult: sfsChunk("2100-01-01T00:00:00.000Z", "T1") });
+    const stale = await applySfsDiscoveryChunk({ db: commitDatabaseFixture(db), job: { id: "job-A", agencyId: "a1", creatorId: "c1", createdAt: new Date(t1) }, chunkResult: sfsChunk("2100-01-01T00:00:00.000Z", "T1") });
     assert.equal(stale.sideEffect, "STALE_NOOP");
     assert.equal(db.row.displayName, "Name T2");
     assert.equal(db.row.avatarUrl, "https://cdn.example/T2.jpg");
@@ -183,10 +185,10 @@ test("Closure3 forced SFS discovery may overlap a RUNNING older job without sacr
   const originalNow = Date.now;
   try {
     Date.now = () => 1_000;
-    const first = await loaded.service.scheduleSfsDiscovery({ db, agencyId: "a1", creatorId: "c1", force: true });
+    const first = await loaded.service.scheduleSfsDiscovery({ db: commitDatabaseFixture(db), agencyId: "a1", creatorId: "c1", force: true });
     first.job.status = "RUNNING";
     Date.now = () => 2_000;
-    const second = await loaded.service.scheduleSfsDiscovery({ db, agencyId: "a1", creatorId: "c1", force: true });
+    const second = await loaded.service.scheduleSfsDiscovery({ db: commitDatabaseFixture(db), agencyId: "a1", creatorId: "c1", force: true });
     assert.notEqual(first.job.id, second.job.id);
     assert.notEqual(first.job.idempotencyKey, second.job.idempotencyKey);
     assert.equal(first.job.status, "RUNNING");

@@ -1,3 +1,4 @@
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 "use strict";
 
 const test = require("node:test");
@@ -624,7 +625,7 @@ test("submission message ids are compact, positive, de-duplicated facts", () => 
 test("create stores one compact submission row and exact retries are idempotent", async () => {
   const db = withTransactionalRollback(fakeDb());
   const first = await createCustomContentSubmission({
-    agencyId: "agency-1", member, db,
+    agencyId: "agency-1", member, db: commitDatabaseFixture(db),
     input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [501, 502, 501], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", comment: "  second angle  ", manualImportReason: "operator recovery", receivedAt: "2026-08-21T11:00:00.000Z" },
   });
   assert.equal(first.deduped, false);
@@ -639,7 +640,7 @@ test("create stores one compact submission row and exact retries are idempotent"
   assert.equal(auditCountAfterFirstCreate, 2, "first human import audits both instruction adjudication and provider-source ownership");
 
   const retry = await createCustomContentSubmission({
-    agencyId: "agency-1", member, db,
+    agencyId: "agency-1", member, db: commitDatabaseFixture(db),
     input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [502, 501], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", comment: "ignored retry text", manualImportReason: "operator recovery" },
   });
   assert.equal(retry.deduped, true);
@@ -657,11 +658,11 @@ test("exact manual-import retry cannot silently change the CustomOrder assignmen
     ],
   }));
   const input = { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [551], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" };
-  const first = await createCustomContentSubmission({ agencyId: "agency-1", member, db, input });
+  const first = await createCustomContentSubmission({ agencyId: "agency-1", member, db: commitDatabaseFixture(db), input });
   assert.equal(first.submission.customOrderId, "custom-1");
 
   await assert.rejects(
-    () => createCustomContentSubmission({ agencyId: "agency-1", member, db, input: { ...input, customOrderId: "custom-alt" } }),
+    () => createCustomContentSubmission({ agencyId: "agency-1", member, db: commitDatabaseFixture(db), input: { ...input, customOrderId: "custom-alt" } }),
     (error) => error?.code === "CUSTOM_SUBMISSION_MANUAL_IMPORT_TARGET_CONFLICT" && error?.status === 409,
   );
   assert.equal(db._submissions.length, 1);
@@ -673,7 +674,7 @@ test("manual raw Telegram import is forbidden by the domain service without cont
   const db = fakeDb();
   const denied = { ...member, id: "member-denied", permissions: { "content.review_customs": false } };
   await assert.rejects(
-    () => createCustomContentSubmission({ agencyId: "agency-1", member: denied, db, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [601], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
+    () => createCustomContentSubmission({ agencyId: "agency-1", member: denied, db: commitDatabaseFixture(db), input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [601], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
     (error) => error?.code === "CUSTOM_SUBMISSION_MANUAL_IMPORT_FORBIDDEN" && error?.status === 403,
   );
   assert.equal(db._submissions.length, 0);
@@ -682,23 +683,23 @@ test("manual raw Telegram import is forbidden by the domain service without cont
 test("customs source read is pinned to exact account + provider user and only while source media is pending", async () => {
   const db = fakeDb({ submissions: [baseSubmission()] });
   const access = await assertCustomSubmissionTelegramSourceAccess({
-    agencyId: "agency-1", member, submissionId: "submission-existing", creatorId: "creator-1", accountId: "tg-1", messageIds: [101], db,
+    agencyId: "agency-1", member, submissionId: "submission-existing", creatorId: "creator-1", accountId: "tg-1", messageIds: [101], db: commitDatabaseFixture(db),
   });
   assert.equal(access.accountId, "tg-1");
   assert.equal(access.telegramSourceUserId, "987654321012345678");
   assert.deepEqual(access.telegramMessageIds, ["101"]);
   await assert.rejects(
-    () => assertCustomSubmissionTelegramSourceAccess({ agencyId: "agency-1", member, submissionId: "submission-existing", creatorId: "creator-1", accountId: "tg-1", messageIds: [999], db }),
+    () => assertCustomSubmissionTelegramSourceAccess({ agencyId: "agency-1", member, submissionId: "submission-existing", creatorId: "creator-1", accountId: "tg-1", messageIds: [999], db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_SOURCE_MESSAGE_MISMATCH" && error?.status === 403,
   );
   await assert.rejects(
-    () => assertCustomSubmissionTelegramSourceAccess({ agencyId: "agency-1", member, submissionId: "submission-existing", creatorId: "creator-1", accountId: "tg-2", messageIds: [101], db }),
+    () => assertCustomSubmissionTelegramSourceAccess({ agencyId: "agency-1", member, submissionId: "submission-existing", creatorId: "creator-1", accountId: "tg-2", messageIds: [101], db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_SOURCE_ACCOUNT_MISMATCH",
   );
 
   const completeDb = fakeDb({ submissions: [baseSubmission({ ofMediaIds: ["9001", "9002"] })] });
   await assert.rejects(
-    () => assertCustomSubmissionTelegramSourceAccess({ agencyId: "agency-1", member, submissionId: "submission-existing", creatorId: "creator-1", accountId: "tg-1", messageIds: [101], db: completeDb }),
+    () => assertCustomSubmissionTelegramSourceAccess({ agencyId: "agency-1", member, submissionId: "submission-existing", creatorId: "creator-1", accountId: "tg-1", messageIds: [101], db: commitDatabaseFixture(completeDb) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_SOURCE_READ_NOT_REQUIRED",
   );
 });
@@ -710,7 +711,7 @@ test("stale upload work cannot read new Telegram source media after Custom cance
     submissions: [baseSubmission({ id: "cancel-source", customOrderId: cancelledOrder.id, pipelineDisposition: "SALVAGE", telegramMessageIds: [111], ofMediaIds: [] })],
   });
   await assert.rejects(
-    () => assertCustomSubmissionTelegramSourceAccess({ agencyId: "agency-1", member, submissionId: "cancel-source", creatorId: "creator-1", accountId: "tg-1", messageIds: [111], db }),
+    () => assertCustomSubmissionTelegramSourceAccess({ agencyId: "agency-1", member, submissionId: "cancel-source", creatorId: "creator-1", accountId: "tg-1", messageIds: [111], db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_PIPELINE_TERMINAL" && error?.status === 409,
   );
 });
@@ -718,27 +719,27 @@ test("stale upload work cannot read new Telegram source media after Custom cance
 test("partial Telegram overlap is rejected instead of silently duplicating media", async () => {
   const db = withTransactionalRollback(fakeDb({ submissions: [baseSubmission()] }));
   await assert.rejects(
-    () => createCustomContentSubmission({ agencyId: "agency-1", member, db, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [102, 103], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
+    () => createCustomContentSubmission({ agencyId: "agency-1", member, db: commitDatabaseFixture(db), input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [102, 103], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
     (error) => error?.code === "CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_CONFLICT" && error?.status === 409,
   );
 });
 
 test("submission may stay unassigned and can later be assigned only to CONTENT of same creator", async () => {
   const db = fakeDb({ submissions: [baseSubmission({ customOrderId: null })] });
-  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: "custom-1", db });
+  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: "custom-1", db: commitDatabaseFixture(db) });
   assert.equal(assigned.unchanged, false);
   assert.equal(assigned.submission.customOrderId, "custom-1");
 
   await assert.rejects(
-    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: "call-1", db }),
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: "call-1", db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_ORDER_TYPE_INVALID" && error?.status === 409,
   );
   await assert.rejects(
-    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: "custom-2", db }),
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: "custom-2", db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_ORDER_NOT_FOUND" && error?.status === 404,
   );
 
-  const unassigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: null, db });
+  const unassigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: null, db: commitDatabaseFixture(db) });
   assert.equal(unassigned.submission.customOrderId, null);
 });
 
@@ -746,7 +747,7 @@ test("submission may stay unassigned and can later be assigned only to CONTENT o
 test("reviewed submissions cannot be reassigned after a manager decision", async () => {
   const db = fakeDb({ submissions: [baseSubmission({ reviewStatus: "APPROVED", reviewedByMemberId: "manager-1", reviewedAt: new Date("2026-08-21T12:00:00.000Z") })] });
   await assert.rejects(
-    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: null, db }),
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: null, db: commitDatabaseFixture(db) }),
     (error) => error.code === "CUSTOM_SUBMISSION_REVIEW_LOCKED",
   );
 });
@@ -757,11 +758,11 @@ test("list is creator-scoped and supports compact unassigned queue", async () =>
     baseSubmission({ id: "b", customOrderId: "custom-1", telegramMessageIds: [201], receivedAt: new Date("2026-08-21T11:00:00.000Z") }),
     baseSubmission({ id: "c", creatorId: "creator-2", customOrderId: "custom-2", telegramMessageIds: [301], receivedAt: new Date("2026-08-21T10:00:00.000Z") }),
   ] });
-  const result = await listCustomContentSubmissions({ agencyId: "agency-1", member, creatorId: "creator-1", unassigned: true, db });
+  const result = await listCustomContentSubmissions({ agencyId: "agency-1", member, creatorId: "creator-1", unassigned: true, db: commitDatabaseFixture(db) });
   assert.equal(result.count, 1);
   assert.equal(result.items[0].id, "a");
   await assert.rejects(
-    () => listCustomContentSubmissions({ agencyId: "agency-1", member, creatorId: "creator-2", db }),
+    () => listCustomContentSubmissions({ agencyId: "agency-1", member, creatorId: "creator-2", db: commitDatabaseFixture(db) }),
     /do not have access/i,
   );
 });
@@ -778,7 +779,7 @@ test("V20.3 upload work reuses the existing Telegram runtime lease and stores no
     leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
     limit: 2,
     now: new Date("2026-08-21T13:00:00.000Z"),
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].submission.id, "pending-a");
@@ -799,7 +800,7 @@ test("relay reservation fences the exact Telegram source identity from claimed u
   const db = fakeDb({ submissions: [baseSubmission({ id: "source-fence", telegramMessageIds: [721, 722], ofMediaIds: [] })], domainWorkItems: [sourceWork] });
   const claimed = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
-    now: new Date("2026-08-21T13:00:00.000Z"), db,
+    now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   const work = claimed.items[0];
   assert.equal(work.expectedIndex, 0);
@@ -813,7 +814,7 @@ test("relay reservation fences the exact Telegram source identity from claimed u
   await assert.rejects(
     () => reserveCustomContentSubmissionRelayWrite({
       agencyId: "agency-1", member, deviceId: "device-1", submissionId: "source-fence",
-      expectedIndex: work.expectedIndex, expectedTelegramMessageId: work.telegramMessageId, sourceWorkClaim: work.sourceWorkClaim, accessEpoch: 1, now: new Date("2026-08-21T13:00:30.000Z"), db,
+      expectedIndex: work.expectedIndex, expectedTelegramMessageId: work.telegramMessageId, sourceWorkClaim: work.sourceWorkClaim, accessEpoch: 1, now: new Date("2026-08-21T13:00:30.000Z"), db: commitDatabaseFixture(db),
       reserveWrite: async () => { reserveCalls += 1; return { delivery: { id: "should-not-exist" } }; },
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_UPLOAD_WORK_STALE" && error?.status === 409,
@@ -842,7 +843,7 @@ test("relay reservation binds canonical CUSTOM_RELAY_SEND payload to the full Te
   let captured = null;
   const result = await reserveCustomContentSubmissionRelayWrite({
     agencyId: "agency-1", member, deviceId: "device-1", submissionId: "source-bound",
-    expectedIndex: 0, expectedTelegramMessageId: "731", sourceWorkClaim: sourceClaim(sourceWork), accessEpoch: 1, now: new Date("2026-08-21T13:00:00.000Z"), db,
+    expectedIndex: 0, expectedTelegramMessageId: "731", sourceWorkClaim: sourceClaim(sourceWork), accessEpoch: 1, now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
     reserveWrite: async (input) => { assert.equal(locked, true, "source row must be locked before Audit17 reservation"); captured = input; return { delivery: { id: "write-731", status: "READY" }, lease: null }; },
   });
   assert.equal(captured.idempotencyKey, "custom-relay:source-bound:0");
@@ -878,7 +879,7 @@ test("rolling cutover adopts the exact pre-cutover relay fingerprint without wea
   };
   let captured = null;
   const result = await reserveCustomContentSubmissionRelayWrite({
-    agencyId: "agency-1", member, deviceId: "device-1", submissionId: "legacy-relay", expectedIndex: 0, expectedTelegramMessageId: "741", sourceWorkClaim: sourceClaim(sourceWork), accessEpoch: 1, now: new Date("2026-08-21T13:00:00.000Z"), db,
+    agencyId: "agency-1", member, deviceId: "device-1", submissionId: "legacy-relay", expectedIndex: 0, expectedTelegramMessageId: "741", sourceWorkClaim: sourceClaim(sourceWork), accessEpoch: 1, now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
     reserveWrite: async (input) => { captured = input; return { delivery: { id: "legacy-write", status: "RUNNING" }, lease: null }; },
   });
   assert.equal(captured.payloadFingerprint, legacyFingerprint, "the exact immutable v2 fingerprint is reused for the already-existing idempotency row");
@@ -901,7 +902,7 @@ test("rolling cutover rejects a pre-cutover relay row whose durable source bindi
   let reserveCalls = 0;
   await assert.rejects(
     () => reserveCustomContentSubmissionRelayWrite({
-      agencyId: "agency-1", member, deviceId: "device-1", submissionId: "legacy-conflict", expectedIndex: 0, expectedTelegramMessageId: "751", sourceWorkClaim: sourceClaim(sourceWork), accessEpoch: 1, now: new Date("2026-08-21T13:00:00.000Z"), db,
+      agencyId: "agency-1", member, deviceId: "device-1", submissionId: "legacy-conflict", expectedIndex: 0, expectedTelegramMessageId: "751", sourceWorkClaim: sourceClaim(sourceWork), accessEpoch: 1, now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
       reserveWrite: async () => { reserveCalls += 1; return { delivery: { id: "never" } }; },
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_EXECUTION_PROFILE_LEGACY_BINDING_CONFLICT" && error?.status === 409,
@@ -922,7 +923,7 @@ test("upload discovery reaches a valid historical relay recipient even after the
   });
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
-    limit: 1, now: new Date("2026-08-21T13:00:00.000Z"), db,
+    limit: 1, now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].kind, "UPLOAD_MEDIA");
@@ -945,7 +946,7 @@ test("ambiguous historical recipient does not consume executable LIMIT or hide l
   });
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
-    limit: 1, now: new Date("2026-08-21T13:00:00.000Z"), db,
+    limit: 1, now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].submission.id, "healthy-tail", "blocked migration history is diagnostic, not executable queue capacity");
@@ -960,7 +961,7 @@ test("V20.3 rejects stale runtime leases before exposing Telegram source work", 
     deviceId: "device-1",
     leases: [{ accountId: "tg-1", claimToken: "wrong-token" }],
     now: new Date("2026-08-21T13:00:00.000Z"),
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.deepEqual(result.items, []);
 });
@@ -988,7 +989,7 @@ test("upload discovery validates every runtime lease beyond the historical first
     leases: telegramAccounts.map((row) => ({ accountId: row.id, claimToken: row.runtimeClaimToken })),
     limit: 1,
     now: new Date("2026-08-21T13:00:00.000Z"),
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].submission.id, "lease-301-work");
@@ -1006,7 +1007,7 @@ test("shared Telegram account lease is account-level capability while creator sc
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member: sharedMember, deviceId: "device-1",
     leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1,
-    now: new Date("2026-08-21T13:00:00.000Z"), db,
+    now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].submission.id, "shared-account-creator-2");
@@ -1022,7 +1023,7 @@ test("shared Telegram account lease never broadens creator scope beyond the memb
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1",
     leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1,
-    now: new Date("2026-08-21T13:00:00.000Z"), db,
+    now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.deepEqual(result.items, []);
 });
@@ -1032,10 +1033,10 @@ test("two-device upload discovery exposes source relay work only to the Desktop 
   const now = new Date("2026-08-21T13:00:00.000Z");
   const [owner, other] = await Promise.all([
     claimCustomContentSubmissionUploadWork({
-      agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1, now, db,
+      agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1, now, db: commitDatabaseFixture(db),
     }),
     claimCustomContentSubmissionUploadWork({
-      agencyId: "agency-1", member, deviceId: "device-2", leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1, now, db,
+      agencyId: "agency-1", member, deviceId: "device-2", leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1, now, db: commitDatabaseFixture(db),
     }),
   ]);
   assert.equal(owner.items.length, 1);
@@ -1055,7 +1056,7 @@ test("Audit16 upload work rejects a Telegram lease from a stale access epoch bef
   });
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1", leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
-    now: new Date("2026-08-21T13:00:00.000Z"), db,
+    now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.deepEqual(result.items, []);
 });
@@ -1066,27 +1067,27 @@ test("proven CUSTOM_RELAY_SEND results project OF media ids strictly by Telegram
     { id: "write-1", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:submission-existing:1", status: "COMPLETED", payload: { submissionId: "submission-existing", expectedIndex: 1, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "802" }, result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "99002" }, messageId: null, finishedAt: new Date() },
   ];
   const db = fakeDb({ submissions: [baseSubmission({ telegramMessageIds: [801, 802], ofMediaIds: [] })], relayProofs });
-  const first = await commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, db });
+  const first = await commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, db: commitDatabaseFixture(db) });
   assert.equal(first.completed, false);
   assert.deepEqual(first.submission.ofMediaIds, ["99001"]);
   assert.equal(first.proof.writeId, "write-0");
 
-  const retry = await commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, db });
+  const retry = await commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, db: commitDatabaseFixture(db) });
   assert.equal(retry.idempotent, true);
 
   db._relayProofs[0].result.mediaId = "99999";
   await assert.rejects(
-    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, db }),
+    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_MEDIA_COMMIT_CONFLICT",
   );
   db._relayProofs[0].result.mediaId = "99001";
 
   await assert.rejects(
-    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 2, db }),
+    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 2, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_MEDIA_INDEX_INVALID" || error?.code === "CUSTOM_SUBMISSION_MEDIA_COMMIT_OUT_OF_ORDER",
   );
 
-  const second = await commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 1, db });
+  const second = await commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 1, db: commitDatabaseFixture(db) });
   assert.equal(second.completed, true);
   assert.deepEqual(second.submission.ofMediaIds, ["99001", "99002"]);
   assert.equal(db._audits.filter((row) => row.action === "custom_content_submission.of_upload_complete").length, 1);
@@ -1098,7 +1099,7 @@ test("media projection rejects a completed relay whose stored payload is bound t
     relayProofs: [{ id: "write-mismatch", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:source-mismatch:0", status: "COMPLETED", payload: { submissionId: "source-mismatch", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "812" }, result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "99111" } }],
   });
   await assert.rejects(
-    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "source-mismatch", expectedIndex: 0, db }),
+    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "source-mismatch", expectedIndex: 0, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_RELAY_PROOF_SOURCE_MISMATCH" && error?.status === 409,
   );
   assert.deepEqual(db._submissions[0].ofMediaIds, []);
@@ -1119,7 +1120,7 @@ test("media projection rejects a completed relay with the same message id but a 
       }],
     });
     await assert.rejects(
-      () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "namespace-mismatch", expectedIndex: 0, db }),
+      () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "namespace-mismatch", expectedIndex: 0, db: commitDatabaseFixture(db) }),
       (error) => error?.code === "CUSTOM_SUBMISSION_RELAY_PROOF_SOURCE_MISMATCH" && error?.status === 409,
     );
     assert.deepEqual(db._submissions[0].ofMediaIds, []);
@@ -1137,7 +1138,7 @@ test("legacy completed relay proof without account/user namespace stays fail-clo
     }],
   });
   await assert.rejects(
-    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "legacy-source-unproven", expectedIndex: 0, db }),
+    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "legacy-source-unproven", expectedIndex: 0, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_RELAY_PROOF_SOURCE_MISMATCH" && error?.status === 409,
   );
   assert.deepEqual(db._submissions[0].ofMediaIds, []);
@@ -1146,7 +1147,7 @@ test("legacy completed relay proof without account/user namespace stays fail-clo
 test("media projection fails closed when no confirmed CUSTOM_RELAY_SEND proof exists", async () => {
   const db = fakeDb({ submissions: [baseSubmission({ telegramMessageIds: [811], ofMediaIds: [] })] });
   await assert.rejects(
-    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, db }),
+    () => commitCustomContentSubmissionMedia({ agencyId: "agency-1", member, submissionId: "submission-existing", expectedIndex: 0, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_RELAY_PROOF_REQUIRED" && error?.status === 409,
   );
 });
@@ -1162,7 +1163,7 @@ test("V20.4 returns complete-but-not-finalized submissions as move-only library 
     leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
     limit: 1,
     now: new Date("2026-08-21T13:00:00.000Z"),
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].kind, "FINALIZE_LIBRARY");
@@ -1177,8 +1178,8 @@ test("two devices may both discover the same Telegram-independent FINALIZE recov
   ] });
   const now = new Date("2026-08-21T13:00:00.000Z");
   const [first, second] = await Promise.all([
-    claimCustomContentSubmissionUploadWork({ agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db }),
-    claimCustomContentSubmissionUploadWork({ agencyId: "agency-1", member, deviceId: "device-2", leases: [], limit: 1, now, db }),
+    claimCustomContentSubmissionUploadWork({ agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db: commitDatabaseFixture(db) }),
+    claimCustomContentSubmissionUploadWork({ agencyId: "agency-1", member, deviceId: "device-2", leases: [], limit: 1, now, db: commitDatabaseFixture(db) }),
   ]);
   assert.equal(first.items[0]?.kind, "FINALIZE_LIBRARY");
   assert.equal(second.items[0]?.kind, "FINALIZE_LIBRARY");
@@ -1200,7 +1201,7 @@ test("V20.4 does not requeue a submission whose typed Content Library provenance
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1",
     leases: [{ accountId: "tg-1", claimToken: "lease-1" }], limit: 1,
-    now: new Date("2026-08-21T13:00:00.000Z"), db,
+    now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.deepEqual(result.items, []);
 });
@@ -1218,7 +1219,7 @@ test("folder projection drift requeues FINALIZE_LIBRARY even while the Vault set
   });
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1,
-    now: new Date("2026-08-21T13:00:00.000Z"), db,
+    now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].kind, "FINALIZE_LIBRARY");
@@ -1243,7 +1244,7 @@ test("price-only mutation requeues Library projection without invalidating the c
   });
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1,
-    now: new Date("2026-08-21T13:00:00.000Z"), db,
+    now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].kind, "FINALIZE_LIBRARY");
@@ -1264,7 +1265,7 @@ test("legacy finalized assets without a pinned execution profile are requeued fo
   });
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1,
-    now: new Date("2026-08-21T13:00:00.000Z"), db,
+    now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].kind, "FINALIZE_LIBRARY");
@@ -1297,7 +1298,7 @@ test("retry-eligible old pipeline rows cannot cycle ahead of never-attempted tai
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1",
     leases: [{ accountId: "tg-1", claimToken: "lease-1" }],
-    limit: 1, now, db,
+    limit: 1, now, db: commitDatabaseFixture(db),
   });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].kind, "UPLOAD_MEDIA");
@@ -1327,7 +1328,7 @@ test("confirmed relay projection recovery honors execution backoff so an older p
       { id: "relay-healthy", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_RELAY_SEND", idempotencyKey: "custom-relay:projection-healthy:0", status: "COMPLETED", payload: { submissionId: "projection-healthy", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "921", recipient: "relay_model" }, result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "99221" } },
     ],
   });
-  const result = await claimCustomContentSubmissionUploadWork({ agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db });
+  const result = await claimCustomContentSubmissionUploadWork({ agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db: commitDatabaseFixture(db) });
   assert.deepEqual(db._submissions.find((row) => row.id === "projection-backed-off").ofMediaIds, [], "backed-off oldest proof is not retried before nextAttemptAt");
   assert.deepEqual(db._submissions.find((row) => row.id === "projection-healthy").ofMediaIds, ["99221"], "later healthy proof remains reachable");
   assert.equal(result.items[0]?.kind, "FINALIZE_LIBRARY");
@@ -1354,7 +1355,7 @@ test("cancel/crash after a confirmed CUSTOM_RELAY_SEND recovers the proven media
   });
   const result = await claimCustomContentSubmissionUploadWork({
     agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1,
-    now: new Date("2026-08-21T13:00:00.000Z"), db,
+    now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.deepEqual(db._submissions[0].ofMediaIds, ["99113"], "confirmed external fact is projected after crash/cancel");
   assert.equal(result.items.length, 1);
@@ -1367,20 +1368,20 @@ test("V20.9 transport-neutral intake allows a new assigned version only after ex
   const waiting = baseSubmission({ id: "v1-waiting", telegramMessageIds: [1001], customOrderId: "custom-1", reviewStatus: "WAITING_REVIEW" });
   const dbBusy = withTransactionalRollback(fakeDb({ submissions: [waiting] }));
   await assert.rejects(
-    () => createCustomContentSubmission({ agencyId: "agency-1", member, db: dbBusy, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1002], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
+    () => createCustomContentSubmission({ agencyId: "agency-1", member, db: commitDatabaseFixture(dbBusy), input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1002], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
     (error) => error?.code === "CUSTOM_SUBMISSION_ORDER_BUSY" && error?.status === 409,
   );
 
   const revision = baseSubmission({ id: "v1-revision", telegramMessageIds: [1101], customOrderId: "custom-1", reviewStatus: "REVISION_REQUESTED", reviewComment: "Redo ending", reviewedAt: new Date("2026-08-21T11:00:00.000Z") });
   const dbRevision = withTransactionalRollback(fakeDb({ submissions: [revision] }));
-  const next = await createCustomContentSubmission({ agencyId: "agency-1", member, db: dbRevision, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1102], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } });
+  const next = await createCustomContentSubmission({ agencyId: "agency-1", member, db: commitDatabaseFixture(dbRevision), input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1102], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } });
   assert.equal(next.deduped, false);
   assert.equal(next.submission.customOrderId, "custom-1");
 
   const approved = baseSubmission({ id: "v1-approved", telegramMessageIds: [1201], customOrderId: "custom-1", reviewStatus: "APPROVED", reviewedAt: new Date("2026-08-21T11:00:00.000Z") });
   const dbApproved = withTransactionalRollback(fakeDb({ submissions: [approved] }));
   await assert.rejects(
-    () => createCustomContentSubmission({ agencyId: "agency-1", member, db: dbApproved, input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1202], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
+    () => createCustomContentSubmission({ agencyId: "agency-1", member, db: commitDatabaseFixture(dbApproved), input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1202], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" } }),
     (error) => error?.code === "CUSTOM_SUBMISSION_ORDER_ALREADY_APPROVED" && error?.status === 409,
   );
 });
@@ -1403,7 +1404,7 @@ test("concurrent members of one Telegram album merge into the winning submission
       { id: "event-b", agencyId: "agency-1", accountId: "tg-1", creatorId: "creator-1", customOrderId: "custom-1", submissionId: null, senderTelegramUserId: "900001", messageId: 702, groupedId: "album-9", hasMedia: true, text: "b", sentAt: new Date(sent.getTime() + 1000) },
     ],
   });
-  const result = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-b", actorUserId: "user-1", db });
+  const result = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-b", actorUserId: "user-1", db: commitDatabaseFixture(db) });
   assert.deepEqual(result.submission.telegramMessageIds, ["701", "702"]);
   assert.deepEqual(result.submission.telegramInboundEventIds, ["event-a", "event-b"]);
   assert.equal(db._inboundEvents.find((row) => row.id === "event-b").submissionId, result.submission.id);
@@ -1437,7 +1438,7 @@ test("relay reservation racing an album merge serializes on the submission row a
     }
     return [{ id }];
   };
-  const result = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-lock-late", actorUserId: "user-1", db });
+  const result = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-lock-late", actorUserId: "user-1", db: commitDatabaseFixture(db) });
   const frozen = db._submissions.find((row) => row.id === "submission-lock-race");
   assert.deepEqual(frozen.telegramMessageIds.map(String), ["742"]);
   assert.notEqual(result.submission.id, "submission-lock-race");
@@ -1475,7 +1476,7 @@ test("late Telegram album media never reopens SALVAGE or terminal submission his
       ],
     });
 
-    const result = await createCustomContentSubmissionFromInboundEvent({ eventId: lateEventId, actorUserId: "user-1", db });
+    const result = await createCustomContentSubmissionFromInboundEvent({ eventId: lateEventId, actorUserId: "user-1", db: commitDatabaseFixture(db) });
     const original = db._submissions.find((row) => row.id === existing.id);
     assert.deepEqual(original.telegramMessageIds.map(String), ["731"], `${pipelineDisposition} history must remain immutable`);
     assert.notEqual(result.submission.id, existing.id);
@@ -1506,7 +1507,7 @@ test("Telegram source ordering freezes as soon as CUSTOM_RELAY_SEND execution id
       { id: "event-late-earlier", agencyId: "agency-1", accountId: "tg-1", creatorId: "creator-1", customOrderId: "custom-1", submissionId: null, senderTelegramUserId: "900001", messageId: 721, groupedId: "album-frozen", hasMedia: true, text: "late but earlier", sentAt: sent },
     ],
   });
-  const result = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-late-earlier", actorUserId: "user-1", db });
+  const result = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-late-earlier", actorUserId: "user-1", db: commitDatabaseFixture(db) });
   const frozen = db._submissions.find((row) => row.id === "submission-frozen");
   assert.deepEqual(frozen.telegramMessageIds.map(String), ["722"]);
   assert.notEqual(result.submission.id, "submission-frozen");
@@ -1526,8 +1527,8 @@ test("Telegram album members with contradictory proven CustomOrder provenance ne
       { id: "event-order-b", agencyId: "agency-1", accountId: "tg-1", creatorId: "creator-1", customOrderId: "custom-b", submissionId: null, senderTelegramUserId: "900001", messageId: 712, groupedId: "album-conflict", hasMedia: true, text: "b", sentAt: new Date(sent.getTime() + 1000) },
     ],
   });
-  const first = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-order-a", actorUserId: "user-1", db });
-  const second = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-order-b", actorUserId: "user-1", db });
+  const first = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-order-a", actorUserId: "user-1", db: commitDatabaseFixture(db) });
+  const second = await createCustomContentSubmissionFromInboundEvent({ eventId: "event-order-b", actorUserId: "user-1", db: commitDatabaseFixture(db) });
   assert.notEqual(second.submission.id, first.submission.id);
   assert.equal(first.submission.customOrderId, "custom-a");
   assert.equal(second.submission.customOrderId, null);
@@ -1560,7 +1561,7 @@ test("first submission bind and CONTENT type edit race on the same CustomOrder r
     return originalUpdateMany(args);
   };
   await assert.rejects(
-    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: target.id, db }),
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: target.id, db: commitDatabaseFixture(db) }),
     (error) => ["CUSTOM_SUBMISSION_ORDER_TYPE_INVALID", "CUSTOM_SUBMISSION_ORDER_BIND_CONFLICT"].includes(error?.code),
   );
   assert.equal(db._submissions[0].customOrderId, null);
@@ -1570,7 +1571,7 @@ test("first submission bind and CONTENT type edit race on the same CustomOrder r
   // Submission bind wins first: the stale type writer cannot cross the updatedAt fence.
   db = fakeDb({ submissions: [baseSubmission({ customOrderId: null, reviewStatus: "WAITING_REVIEW" })], orders: [clone(target)] });
   const staleRevision = new Date(db._orders[0].updatedAt);
-  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: target.id, db });
+  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "submission-existing", customOrderId: target.id, db: commitDatabaseFixture(db) });
   assert.equal(assigned.submission.customOrderId, target.id);
   assert.ok(db._orders[0].contentBoundAt instanceof Date);
   const staleEdit = await db.customOrder.updateMany({
@@ -1593,7 +1594,7 @@ test("manager assignment supersedes a precommit initial TASK before binding the 
     orders: [{ id: "custom-manager-task", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", fanDeliveredAt: null, scenario: "manager task race", priceCents: 6000, contentBoundAt: null, createdAt: stamp, updatedAt: stamp }],
     deliveryIntents: [task],
   }));
-  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-task", db });
+  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-task", db: commitDatabaseFixture(db) });
   assert.equal(assigned.submission.customOrderId, "custom-manager-task");
   assert.equal(db._deliveryIntents[0].state, "CANCELLED");
   assert.match(String(db._deliveryIntents[0].outcomeReason || ""), /^HUMAN_RESPONSE_SUPERSEDED:/);
@@ -1608,7 +1609,7 @@ test("manager assignment cannot outrun an initial TASK that already crossed COMM
     deliveryIntents: [{ id: "task-manager-committing", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-manager-committing", kind: "TASK", state: "COMMITTING", claimRevision: 2, commitStartedAt: new Date(stamp.getTime() + 1000), createdAt: stamp, updatedAt: stamp }],
   }));
   await assert.rejects(
-    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-committing", db }),
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-committing", db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_MODEL_INSTRUCTION_COMMITTING",
   );
   assert.equal(db._submissions[0].customOrderId, null);
@@ -1624,7 +1625,7 @@ test("manager assignment of V2 supersedes the exact precommit REVISION_REQUEST f
     orders: [{ id: "custom-manager-revision", agencyId: "agency-1", creatorId: "creator-1", type: "CONTENT", status: "PENDING", fanDeliveredAt: null, scenario: "manager revision", priceCents: 6000, contentBoundAt: new Date(stamp), createdAt: stamp, updatedAt: stamp }],
     deliveryIntents: [{ id: "revision-manager-precommit", agencyId: "agency-1", creatorId: "creator-1", customOrderId: "custom-manager-revision", customSubmissionId: "manager-v1", kind: "REVISION_REQUEST", state: "PLANNED", claimRevision: 0, commitStartedAt: null, createdAt: new Date(stamp.getTime() + 1500), updatedAt: new Date(stamp.getTime() + 1500) }],
   }));
-  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-revision", db });
+  const assigned = await assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-revision", db: commitDatabaseFixture(db) });
   assert.equal(assigned.submission.customOrderId, "custom-manager-revision");
   assert.equal(db._deliveryIntents[0].state, "CANCELLED");
   assert.match(String(db._deliveryIntents[0].outcomeReason || ""), /^HUMAN_RESPONSE_SUPERSEDED:/);
@@ -1652,7 +1653,7 @@ test("forced provider begin between manager read and supersede CAS blocks assign
     return original(args);
   };
   await assert.rejects(
-    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-begin-race", db }),
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: incoming.id, customOrderId: "custom-manager-begin-race", db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_MODEL_INSTRUCTION_COMMITTING",
   );
   assert.equal(db._submissions[0].customOrderId, null);
@@ -1671,8 +1672,8 @@ test("losing concurrent reassignment rolls back target content binding", async (
   }));
 
   const results = await Promise.allSettled([
-    assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: "custom-a", db }),
-    assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: "custom-b", db }),
+    assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: "custom-a", db: commitDatabaseFixture(db) }),
+    assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: "custom-b", db: commitDatabaseFixture(db) }),
   ]);
   assert.equal(results.filter((item) => item.status === "fulfilled").length, 1);
   assert.equal(results.filter((item) => item.status === "rejected").length, 1);
@@ -1692,8 +1693,8 @@ test("two manager reassignments from the same submission revision cannot both wi
     ],
   });
   const [a, b] = await Promise.allSettled([
-    assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: "custom-a", db }),
-    assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: "custom-b", db }),
+    assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: "custom-a", db: commitDatabaseFixture(db) }),
+    assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: base.id, customOrderId: "custom-b", db: commitDatabaseFixture(db) }),
   ]);
   const fulfilled = [a, b].filter((row) => row.status === "fulfilled");
   const rejected = [a, b].filter((row) => row.status === "rejected");
@@ -1711,7 +1712,7 @@ test("manual historical import cannot cross a current active Telegram thread tha
   db.customOrder.findMany = async ({ where }) => db._orders.filter((row) => row.agencyId === where.agencyId && where.id?.in?.includes(row.id) && String(row.status || "PENDING") === String(where.status || row.status || "PENDING")).map(clone);
   await assert.rejects(
     () => createCustomContentSubmission({
-      agencyId: "agency-1", member, db,
+      agencyId: "agency-1", member, db: commitDatabaseFixture(db),
       input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [901], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "historical recovery", receivedAt: "2026-09-05T10:00:02.000Z" },
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_MANUAL_IMPORT_THREAD_CONFLICT" && error?.status === 409,
@@ -1734,7 +1735,7 @@ test("automatic inbound exception cannot be adjudicated through the separate man
   db._inboundEvents[0].id = canonicalId;
   await assert.rejects(
     () => createCustomContentSubmission({
-      agencyId: "agency-1", member, db,
+      agencyId: "agency-1", member, db: commitDatabaseFixture(db),
       input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [909], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "try to bypass review queue" },
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_PROVIDER_EVENT_EXISTS" && error?.status === 409,
@@ -1749,9 +1750,9 @@ test("the same provider message manually claimed for creator A cannot acquire a 
   const broad = { ...member, role: "OWNER", roleKey: "owner", assignedCreators: "all" };
   const db = withTransactionalRollback(fakeDb({ currentMember: broad }));
   const source = { telegramMessageIds: [902], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery" };
-  const first = await createCustomContentSubmission({ agencyId: "agency-1", member: broad, db, input: { creatorId: "creator-1", customOrderId: "custom-1", ...source } });
+  const first = await createCustomContentSubmission({ agencyId: "agency-1", member: broad, db: commitDatabaseFixture(db), input: { creatorId: "creator-1", customOrderId: "custom-1", ...source } });
   await assert.rejects(
-    () => createCustomContentSubmission({ agencyId: "agency-1", member: broad, db, input: { creatorId: "creator-2", customOrderId: "custom-2", ...source } }),
+    () => createCustomContentSubmission({ agencyId: "agency-1", member: broad, db: commitDatabaseFixture(db), input: { creatorId: "creator-2", customOrderId: "custom-2", ...source } }),
     (error) => ["CUSTOM_SUBMISSION_MANUAL_IMPORT_TARGET_CONFLICT", "CUSTOM_SUBMISSION_PROVIDER_SOURCE_OWNED", "CUSTOM_SUBMISSION_TELEGRAM_MESSAGE_CONFLICT"].includes(error?.code) && error?.status === 409,
   );
   assert.equal(db._submissions.length, 1);
@@ -1765,7 +1766,7 @@ test("manual historical import audit failure rolls back provider ownership, orde
   db.auditLog.create = async () => { throw Object.assign(new Error("audit unavailable"), { code: "AUDIT_DOWN" }); };
   await assert.rejects(
     () => createCustomContentSubmission({
-      agencyId: "agency-1", member, db,
+      agencyId: "agency-1", member, db: commitDatabaseFixture(db),
       input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [903], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "operator recovery with mandatory audit" },
     }),
     (error) => error?.code === "AUDIT_DOWN",
@@ -1796,7 +1797,7 @@ test("concurrent automatic provider ownership beats manual recovery through the 
   };
   await assert.rejects(
     () => createCustomContentSubmission({
-      agencyId: "agency-1", member, db,
+      agencyId: "agency-1", member, db: commitDatabaseFixture(db),
       input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [904], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "manual recovery raced auto intake" },
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_PROVIDER_SOURCE_OWNED" && error?.status === 409,
@@ -1827,7 +1828,7 @@ test("multi-message manual recovery rolls back every earlier source claim when a
   };
   await assert.rejects(
     () => createCustomContentSubmission({
-      agencyId:"agency-1",member,db,
+      agencyId:"agency-1",member,db: commitDatabaseFixture(db),
       input:{creatorId:"creator-1",customOrderId:"custom-1",telegramMessageIds:[905,906],telegramAccountId:"tg-1",telegramUserId:"987654321012345678",manualImportReason:"recover two-message set"},
     }),
     (error)=>error?.code==="CUSTOM_SUBMISSION_PROVIDER_SOURCE_OWNED"&&error?.status===409,
@@ -1843,7 +1844,7 @@ test("F40 manual historical import rejects a RETIRING source account before prov
   const db = withTransactionalRollback(fakeDb({ telegramAccounts: [{ id: "tg-1", agencyId: "agency-1", lifecycleState: "RETIRING" }] }));
   await assert.rejects(
     () => createCustomContentSubmission({
-      agencyId: "agency-1", member, db,
+      agencyId: "agency-1", member, db: commitDatabaseFixture(db),
       input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1201], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "historical recovery" },
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_RETIRING" && error?.status === 409,
@@ -1857,7 +1858,7 @@ test("F40 manual historical import cannot create a dangling source after account
   const db = withTransactionalRollback(fakeDb({ telegramAccounts: [] }));
   await assert.rejects(
     () => createCustomContentSubmission({
-      agencyId: "agency-1", member, db,
+      agencyId: "agency-1", member, db: commitDatabaseFixture(db),
       input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1202], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "historical recovery" },
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_TELEGRAM_SOURCE_ACCOUNT_NOT_FOUND" && error?.status === 404,
@@ -1873,7 +1874,7 @@ test("F40 retirement winning the shared account transaction rejects a racing man
   let allowRetireResolve;
   const allowRetire = new Promise((resolve) => { allowRetireResolve = resolve; });
 
-  const retirement = db.$transaction(async (tx) => {
+  const retirement = require("./db-transaction-service").runDbTransaction(commitDatabaseFixture(db), async (tx) => {
     const changed = await tx.agencyTelegramMtprotoAccount.updateMany({
       where: { id: "tg-1", agencyId: "agency-1", lifecycleState: "ACTIVE" },
       data: { lifecycleState: "RETIRING" },
@@ -1885,7 +1886,7 @@ test("F40 retirement winning the shared account transaction rejects a racing man
   await retireLocked;
 
   const importing = createCustomContentSubmission({
-    agencyId: "agency-1", member, db,
+    agencyId: "agency-1", member, db: commitDatabaseFixture(db),
     input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1301], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "historical recovery" },
   });
   allowRetireResolve();
@@ -1914,12 +1915,12 @@ test("F40 manual import winning the shared account transaction commits source be
   };
 
   const importing = createCustomContentSubmission({
-    agencyId: "agency-1", member, db,
+    agencyId: "agency-1", member, db: commitDatabaseFixture(db),
     input: { creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [1302], telegramAccountId: "tg-1", telegramUserId: "987654321012345678", manualImportReason: "historical recovery" },
   });
   await sourceCreated;
 
-  const retirement = db.$transaction(async (tx) => {
+  const retirement = require("./db-transaction-service").runDbTransaction(commitDatabaseFixture(db), async (tx) => {
     const pendingSource = db._submissions.some((row) => row.telegramSourceAccountId === "tg-1" && (row.telegramMessageIds || []).length > (row.ofMediaIds || []).length);
     if (pendingSource) return { blocked: true };
     await tx.agencyTelegramMtprotoAccount.updateMany({ where: { id: "tg-1", agencyId: "agency-1" }, data: { lifecycleState: "RETIRING" } });
@@ -1951,7 +1952,7 @@ function modelInstructionRow({ id, kind = "TASK", state = "PLANNED", customSubmi
 test("human historical V1 supersedes a precommit initial TASK atomically before binding the response", async () => {
   const db = withTransactionalRollback(fakeDb({ deliveryIntents: [modelInstructionRow({ id: "task-precommit", state: "CLAIMED" })] }));
   const result = await createCustomContentSubmission({
-    agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:00:00.000Z"),
+    agencyId: "agency-1", member, db: commitDatabaseFixture(db), now: new Date("2026-08-21T11:00:00.000Z"),
     input: {
       creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9801], telegramAccountId: "tg-1",
       telegramUserId: "987654321012345678", manualImportReason: "manager confirms this is the model response",
@@ -1969,7 +1970,7 @@ test("human historical V1 cannot outrun an initial TASK that already crossed COM
   const db = withTransactionalRollback(fakeDb({ deliveryIntents: [modelInstructionRow({ id: "task-committing", state: "COMMITTING" })] }));
   await assert.rejects(
     () => createCustomContentSubmission({
-      agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:00:00.000Z"),
+      agencyId: "agency-1", member, db: commitDatabaseFixture(db), now: new Date("2026-08-21T11:00:00.000Z"),
       input: {
         creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9802], telegramAccountId: "tg-1",
         telegramUserId: "987654321012345678", manualImportReason: "manual response while task is committing",
@@ -1994,7 +1995,7 @@ test("human historical V2 supersedes the exact precommit REVISION_REQUEST for V1
     deliveryIntents: [modelInstructionRow({ id: "revision-precommit", kind: "REVISION_REQUEST", state: "PLANNED", customSubmissionId: "revision-v1" })],
   }));
   const result = await createCustomContentSubmission({
-    agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:00:00.000Z"),
+    agencyId: "agency-1", member, db: commitDatabaseFixture(db), now: new Date("2026-08-21T11:00:00.000Z"),
     input: {
       creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9803], telegramAccountId: "tg-1",
       telegramUserId: "987654321012345678", manualImportReason: "manager identifies corrected V2",
@@ -2018,7 +2019,7 @@ test("human historical V2 is blocked while exact REVISION_REQUEST outcome is unk
   }));
   await assert.rejects(
     () => createCustomContentSubmission({
-      agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:00:00.000Z"),
+      agencyId: "agency-1", member, db: commitDatabaseFixture(db), now: new Date("2026-08-21T11:00:00.000Z"),
       input: {
         creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9804], telegramAccountId: "tg-1",
         telegramUserId: "987654321012345678", manualImportReason: "manager identifies corrected V2",
@@ -2039,7 +2040,7 @@ test("accepted historical V1 immediately supersedes all precommit initial REFERE
   const refClaimed = { ...modelInstructionRow({ id: "ref-claimed-v1", kind: "REFERENCE", state: "CLAIMED" }), accountId: "tg-1", clientIntentId: "66666666-7777-4888-8999-000000000000", referenceOrdinal: 1 };
   const db = withTransactionalRollback(fakeDb({ deliveryIntents: [confirmedTask, refPlanned, refClaimed] }));
   const result = await createCustomContentSubmission({
-    agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:00:00.000Z"),
+    agencyId: "agency-1", member, db: commitDatabaseFixture(db), now: new Date("2026-08-21T11:00:00.000Z"),
     input: {
       creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9811], telegramAccountId: "tg-1",
       telegramUserId: "987654321012345678", manualImportReason: "manager accepts model V1 and closes initial reference lane",
@@ -2063,7 +2064,7 @@ test("accepted historical V1 does not block on an initial REFERENCE already COMM
   const committingRef = { ...modelInstructionRow({ id: "ref-committing-v1", kind: "REFERENCE", state: "COMMITTING" }), accountId: "tg-1", clientIntentId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", referenceOrdinal: 0 };
   const db = withTransactionalRollback(fakeDb({ deliveryIntents: [confirmedTask, committingRef] }));
   const result = await createCustomContentSubmission({
-    agencyId: "agency-1", member, db, now: new Date("2026-08-21T11:01:00.000Z"),
+    agencyId: "agency-1", member, db: commitDatabaseFixture(db), now: new Date("2026-08-21T11:01:00.000Z"),
     input: {
       creatorId: "creator-1", customOrderId: "custom-1", telegramMessageIds: [9812], telegramAccountId: "tg-1",
       telegramUserId: "987654321012345678", manualImportReason: "model response is valid while old reference outcome settles",
@@ -2091,7 +2092,7 @@ test("submission reassignment A→B reprojects both model obligations from canon
     workspaceSettings:{ vaultUploadRecipient:"relay_model", telegramCustomReminders:{ content:{ enabled:true, firstAfterMinutes:30, repeatEveryMinutes:60 } } },
   }));
 
-  const result = await assignCustomContentSubmission({ agencyId:"agency-1", member, submissionId:"move-response", customOrderId:"custom-B", now:new Date("2026-08-21T11:00:00.000Z"), db });
+  const result = await assignCustomContentSubmission({ agencyId:"agency-1", member, submissionId:"move-response", customOrderId:"custom-B", now:new Date("2026-08-21T11:00:00.000Z"), db: commitDatabaseFixture(db) });
   assert.equal(result.submission.customOrderId,"custom-B");
   const a=db._orders.find((row)=>row.id==="custom-A");
   const b=db._orders.find((row)=>row.id==="custom-B");
@@ -2107,7 +2108,7 @@ test("commit-time Custom assignment rejects a stale management actor after acces
     submissions: [baseSubmission({ id: "stale-assignment", customOrderId: null })],
   }));
   await assert.rejects(
-    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "stale-assignment", customOrderId: "custom-1", db }),
+    () => assignCustomContentSubmission({ agencyId: "agency-1", member, submissionId: "stale-assignment", customOrderId: "custom-1", db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
   );
   assert.equal(db._submissions[0].customOrderId, null, "stale assignment must not mutate the canonical submission");
@@ -2121,7 +2122,7 @@ test("commit-time manual historical import rejects a stale management actor befo
     () => createCustomContentSubmission({
       agencyId: "agency-1",
       member,
-      db,
+      db: commitDatabaseFixture(db),
       input: {
         creatorId: "creator-1",
         customOrderId: "custom-1",
@@ -2143,7 +2144,7 @@ test("A4/A43 source relay reserve fails closed without a DomainWork claim", asyn
   await assert.rejects(
     () => reserveCustomContentSubmissionRelayWrite({
       agencyId: "agency-1", member, deviceId: "device-1", submissionId: "source-claim-required",
-      expectedIndex: 0, expectedTelegramMessageId: "801", accessEpoch: 1, db,
+      expectedIndex: 0, expectedTelegramMessageId: "801", accessEpoch: 1, db: commitDatabaseFixture(db),
       reserveWrite: async () => { reserveCalls += 1; return { delivery: { id: "never" } }; },
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_REQUIRED" && error?.status === 409,
@@ -2159,7 +2160,7 @@ test("A4 source execution report rejects an expired claim before retry metadata 
     () => reportCustomContentSubmissionExecutionAttempt({
       agencyId: "agency-1", member, submissionId: submission.id, success: false, code: "NETWORK",
       sourceWorkClaim: sourceClaim(sourceWork), workKind: "UPLOAD_MEDIA", expectedIndex: 0, executionProfileRevision: 1,
-      now: new Date("2026-08-21T12:00:30.000Z"), db,
+      now: new Date("2026-08-21T12:00:30.000Z"), db: commitDatabaseFixture(db),
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE" && error?.status === 409,
   );
@@ -2174,7 +2175,7 @@ test("A1/A4 stale V1 source failure cannot write retry metadata over a newer V2 
   const settled = await reportCustomContentSubmissionExecutionAttempt({
     agencyId: "agency-1", member, submissionId: submission.id, success: false, code: "NETWORK",
     sourceWorkClaim: sourceClaim(sourceWork), workKind: "UPLOAD_MEDIA", expectedIndex: 0, executionProfileRevision: 1,
-    now: new Date("2026-08-21T12:00:30.000Z"), db,
+    now: new Date("2026-08-21T12:00:30.000Z"), db: commitDatabaseFixture(db),
   });
   assert.equal(settled.sourceWorkSettled, true);
   assert.equal(settled.sourceWorkSuperseded, true);
@@ -2211,7 +2212,7 @@ test("A1/A4 source discovery suppresses stale V1 diagnostic metadata when V2 arr
   };
 
   const result = await claimCustomContentSubmissionUploadWork({
-    agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db,
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db: commitDatabaseFixture(db),
   });
   assert.equal(injectedV2, true, "fixture must publish V2 after the V1 claim is held");
   assert.equal(result.items.length, 0);
@@ -2262,7 +2263,7 @@ test("A43 standalone source work is claimed from DomainWork, heartbeated, and AC
   const db = fakeDb({ submissions: [submission], domainWorkItems: [domainItem] });
 
   const claim = await claimCustomContentSubmissionUploadWork({
-    agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db,
+    agencyId: "agency-1", member, deviceId: "device-1", leases: [], limit: 1, now, db: commitDatabaseFixture(db),
   });
   assert.equal(claim.authority, "CUSTOM_SOURCE_PIPELINE_DOMAIN_WORK_V1");
   assert.equal(claim.items.length, 1);
@@ -2274,7 +2275,7 @@ test("A43 standalone source work is claimed from DomainWork, heartbeated, and AC
 
   const heartbeat = await heartbeatCustomContentSubmissionSourceWork({
     agencyId: "agency-1", member, deviceId: "device-1", submissionId: submission.id,
-    sourceWorkClaim: claim.items[0].sourceWorkClaim, now: new Date("2026-08-21T12:00:30.000Z"), db,
+    sourceWorkClaim: claim.items[0].sourceWorkClaim, now: new Date("2026-08-21T12:00:30.000Z"), db: commitDatabaseFixture(db),
   });
   assert.equal(heartbeat.ok, true);
   assert.equal(db._domainWorkItems[0].state, "CLAIMED");
@@ -2282,7 +2283,7 @@ test("A43 standalone source work is claimed from DomainWork, heartbeated, and AC
   const settled = await reportCustomContentSubmissionExecutionAttempt({
     agencyId: "agency-1", member, submissionId: submission.id, success: true,
     sourceWorkClaim: claim.items[0].sourceWorkClaim, workKind: "FINALIZE_LIBRARY",
-    executionProfileRevision: 1, now: new Date("2026-08-21T12:01:00.000Z"), db,
+    executionProfileRevision: 1, now: new Date("2026-08-21T12:01:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.equal(settled.sourceWorkSettled, true);
   assert.equal(settled.sourceWorkLost, false);

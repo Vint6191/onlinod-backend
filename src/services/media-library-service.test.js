@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -67,9 +69,9 @@ function metadataDb(seed = []) {
         return next;
       },
     },
-    async $transaction(callback) { return callback(db); },
+    async $transaction(callback) { return callback({ ...(db), $transaction: undefined }); },
   };
-  return { db, assets };
+  return { db: commitDatabaseFixture(db), assets };
 }
 
 test("legacy JSON metadata import endpoint is removed from the server runtime", () => {
@@ -99,7 +101,7 @@ test("server metadata edits preserve existing active catalog membership", async 
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
     mediaId: "active-media",
-    db,
+    db: commitDatabaseFixture(db),
     input: {
       mediaType: "photo",
       description: "manager note",
@@ -119,7 +121,7 @@ test("server metadata edits preserve existing active catalog membership", async 
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
     mediaIds: ["active-media"],
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.deepEqual(queried.items.map((item) => item.onlyfansMediaId), ["active-media"]);
 });
@@ -130,7 +132,7 @@ test("metadata editing creates only an inactive placeholder when catalog discove
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
     mediaId: "metadata-only",
-    db,
+    db: commitDatabaseFixture(db),
     input: {
       mediaType: "photo",
       description: "manager note before catalog discovery",
@@ -151,7 +153,7 @@ test("metadata editing creates only an inactive placeholder when catalog discove
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
     mediaIds: ["metadata-only"],
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(queried.items.length, 1);
   assert.equal(queried.items[0].description, "manager note before catalog discovery");
@@ -176,7 +178,7 @@ test("Media Library search is paged and keeps folder-scoped queries catalog-acti
   };
   const result = await searchMediaLibrary({
     agencyId: AGENCY_ID, creatorId: CREATOR_ID, query: "purple couch", scope: "everything",
-    folderId: "folder-2", folderMatchIds: ["folder-3"], mediaType: "video", offset: 0, limit: 40, db,
+    folderId: "folder-2", folderMatchIds: ["folder-3"], mediaType: "video", offset: 0, limit: 40, db: commitDatabaseFixture(db),
   });
   assert.equal(result.ok, true);
   assert.equal(result.count, 1);
@@ -213,7 +215,7 @@ test("Media Library text search includes metadata-only placeholders before catal
 
   const result = await searchMediaLibrary({
     agencyId: AGENCY_ID, creatorId: CREATOR_ID, query: "тест", scope: "everything",
-    mediaType: "all", offset: 0, limit: 40, db,
+    mediaType: "all", offset: 0, limit: 40, db: commitDatabaseFixture(db),
   });
   assert.equal(result.ok, true);
   assert.equal(result.items[0].mediaId, "m-meta-only");
@@ -249,7 +251,7 @@ test("metadata editing updates an inactive placeholder without reactivating cata
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
     mediaId: "inactive-media",
-    db,
+    db: commitDatabaseFixture(db),
     input: {
       mediaType: "video",
       description: "kept while inactive",
@@ -387,7 +389,7 @@ function usageDb({ rawSql = false } = {}) {
     },
     async $transaction(callback, options) {
       transactionCalls.push(options || null);
-      return callback(db);
+      return callback({ ...(db), $transaction: undefined });
     },
   };
   db.$queryRawUnsafe = async () => { throw new Error("void deserialization: advisory lock must not use queryRaw"); };
@@ -405,7 +407,7 @@ function usageDb({ rawSql = false } = {}) {
     }
     return projections.length;
   };
-  return { db, assets, contributions, transactionCalls, usageLocks, bulkUsageUpdates };
+  return { db: commitDatabaseFixture(db), assets, contributions, transactionCalls, usageLocks, bulkUsageUpdates };
 }
 
 test("usage sources replace atomically, reject stale revisions, and retain missing ids only as inactive placeholders", async () => {
@@ -413,7 +415,7 @@ test("usage sources replace atomically, reject stale revisions, and retain missi
   const first = await replaceUsageSources({
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
-    db,
+    db: commitDatabaseFixture(db),
     sources: [{
       sourceKey: "opaque-dialog",
       sourceRevision: "2026-07-19T10:00:00.000Z",
@@ -432,7 +434,7 @@ test("usage sources replace atomically, reject stale revisions, and retain missi
   const replaced = await replaceUsageSources({
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
-    db,
+    db: commitDatabaseFixture(db),
     sources: [{
       sourceKey: "opaque-dialog",
       sourceRevision: "2026-07-19T11:00:00.000Z",
@@ -448,7 +450,7 @@ test("usage sources replace atomically, reject stale revisions, and retain missi
   const stale = await replaceUsageSources({
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
-    db,
+    db: commitDatabaseFixture(db),
     sources: [{
       sourceKey: "opaque-dialog",
       sourceRevision: "2026-07-19T10:30:00.000Z",
@@ -465,7 +467,7 @@ test("usage batches commit one bounded source transaction and bulk projection at
   const result = await replaceUsageSources({
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
-    db,
+    db: commitDatabaseFixture(db),
     sources: [
       {
         sourceKey: "opaque-dialog-a",
@@ -484,7 +486,7 @@ test("usage batches commit one bounded source transaction and bulk projection at
 
   assert.equal(result.acceptedSources, 2);
   assert.equal(transactionCalls.length, 2);
-  assert.equal(transactionCalls.every((options) => options.maxWait === 10_000 && options.timeout === 30_000), true);
+  assert.equal(transactionCalls.every((options) => options.isolationLevel === "ReadCommitted" && options.maxWait <= 10_000 && options.maxWait > 0 && options.timeout <= 30_000 && options.timeout > 29_000), true);
   assert.equal(usageLocks.length, 2);
   assert.equal(usageLocks.every((call) => /pg_advisory_xact_lock/.test(call[0]) && !/::text/.test(call[0])), true);
   assert.equal(bulkUsageUpdates.length, 2);
@@ -510,12 +512,12 @@ test("folder membership mutation rejects removing live CUSTOM media from its pin
   };
 
   await assert.rejects(
-    () => mutateFolderMembership({ agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["9001"], folderId: "vault-pinned", action: "remove", db }),
+    () => mutateFolderMembership({ agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["9001"], folderId: "vault-pinned", action: "remove", db: commitDatabaseFixture(db) }),
     (error) => error?.code === "MEDIA_LIBRARY_CUSTOM_PIPELINE_FOLDER_OWNED" && error?.status === 409,
   );
   assert.deepEqual(assets[0].folderIds, ["vault-pinned", "other"]);
 
-  const result = await mutateFolderMembership({ agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["9001"], folderId: "other", action: "remove", db });
+  const result = await mutateFolderMembership({ agencyId: "agency-1", creatorId: "creator-1", mediaIds: ["9001"], folderId: "other", action: "remove", db: commitDatabaseFixture(db) });
   assert.equal(result.updated, 1);
   assert.deepEqual(assets[0].folderIds, ["vault-pinned"]);
 });
@@ -556,11 +558,11 @@ test("validated COMPLETED relay proof protects live CUSTOM media before asset/su
   };
 
   await assert.rejects(
-    () => mutateFolderMembership({ agencyId: AGENCY_ID, creatorId: CREATOR_ID, mediaIds: ["990701"], folderId: "vault-pinned", action: "remove", db }),
+    () => mutateFolderMembership({ agencyId: AGENCY_ID, creatorId: CREATOR_ID, mediaIds: ["990701"], folderId: "vault-pinned", action: "remove", db: commitDatabaseFixture(db) }),
     (error) => error?.code === "MEDIA_LIBRARY_CUSTOM_PIPELINE_FOLDER_OWNED",
   );
   await assert.rejects(
-    () => deleteMediaAssets({ agencyId: AGENCY_ID, creatorId: CREATOR_ID, mediaIds: ["990701"], db }),
+    () => deleteMediaAssets({ agencyId: AGENCY_ID, creatorId: CREATOR_ID, mediaIds: ["990701"], db: commitDatabaseFixture(db) }),
     (error) => error?.code === "MEDIA_LIBRARY_CUSTOM_PIPELINE_OWNED",
   );
   assert.equal(deleted, 0, "proof-owned live CUSTOM metadata must not be deleted before projection repair");
@@ -573,9 +575,11 @@ test("INT2.8 usage commit guard runs inside each source transaction before media
   const result = await replaceUsageSources({
     agencyId: AGENCY_ID,
     creatorId: CREATOR_ID,
-    db,
+    db: commitDatabaseFixture(db),
     commitGuard: async (tx) => {
-      assert.equal(tx, db);
+      assert.notEqual(tx, db);
+      assert.equal(tx.$transaction, undefined);
+      assert.equal(require("./db-commit-kernel").currentCommitContext().tx, tx);
       assert.equal(usageLocks.length, events.filter((event) => event === "guard").length);
       events.push("guard");
     },
@@ -609,7 +613,7 @@ test("INT2.8 authorization generation change between source commits fails closed
     () => replaceUsageSources({
       agencyId: AGENCY_ID,
       creatorId: CREATOR_ID,
-      db,
+      db: commitDatabaseFixture(db),
       commitGuard: async () => {
         guards += 1;
         if (guards === 2) {

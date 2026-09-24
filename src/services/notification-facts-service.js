@@ -1,4 +1,7 @@
 "use strict";
+const { literalPageContains } = require("./notification-page-receipt-service");
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
@@ -900,20 +903,17 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       const coverageByType = Object.fromEntries(requested.map((type) => [type, scannerCoverage[type] || "partial"]));
 
       if (finalizeCoverage) {
-        const priorBatches = typeof tx.analyticsIngestBatch.findMany === "function"
-          ? await tx.analyticsIngestBatch.findMany({
-              where: { sourceJobId: job.sourceJobId === null ? null : job.id, id: { not: initial.batch.id } },
-              select: { idempotencyKey: true, status: true, rejectedRows: true },
-            })
-          : [];
         for (const type of requested) {
-          const currentRunPageMarker = scanRunId ? `:run:${scanRunId}:page:${type}:` : `:page:${type}:`;
-          const priorTypeFailed = priorBatches.some((batch) => {
-            const key = String(batch.idempotencyKey || "");
-            return (key.endsWith(":v4") || key.endsWith(":v5") || key.endsWith(":v6"))
-              && key.includes(currentRunPageMarker)
-              && (batch.status !== "COMMITTED" || Number(batch.rejectedRows || 0) > 0);
-          });
+          const priorTypeFailed = typeof tx.analyticsIngestBatch.findFirst === "function"
+            ? Boolean(await tx.analyticsIngestBatch.findFirst({
+              where: { agencyId: job.agencyId, creatorId: job.creatorId,
+                sourceJobId: job.sourceJobId === null ? null : job.id,
+                idempotencyKey: { contains: literalPageContains(scanRunId, `${type}:`) },
+                OR: [{ status: { not: "COMMITTED" } }, { rejectedRows: { gt: 0 } }] }, select: { id: true },
+            }))
+            : (await tx.analyticsIngestBatch.findMany({ where: { sourceJobId: job.id }, take: 1000 }))
+              .some(batch => String(batch.idempotencyKey || "").includes(`:run:${scanRunId}:page:${type}:`)
+                && (batch.status !== "COMMITTED" || Number(batch.rejectedRows || 0) > 0));
           const typeRejected = (perTypeInitialRejected[type] || 0) + (perTypePersistenceRejected[type] || 0);
           coverageByType[type] = scannerCoverage[type] === "complete" && typeRejected === 0 && !priorTypeFailed
             ? "complete"
@@ -946,9 +946,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       return { replayed: false, batch, counts, complete, coverageByType };
     };
     const ownsTransactionBoundary = typeof db.$transaction === "function";
-    const applied = ownsTransactionBoundary
-      ? await db.$transaction(applyFacts, { maxWait: 10_000, timeout: 60_000 })
-      : await applyFacts(db);
+    const applied = await runDbTransaction(db, applyFacts, { maxWait: 10_000, timeout: 60_000 });
 
     if (applied.replayed) return applied.response;
     // CreatorDailyMetrics is a disposable read cache. Page chunks are already

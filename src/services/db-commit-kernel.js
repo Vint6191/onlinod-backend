@@ -7,9 +7,9 @@ const { setTimeout: delay } = require("node:timers/promises");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 
 // One owner begins, retries and commits. Domain services still own permission
-// checks and lock ordering. Only explicitly migrated command families use this
-// kernel; the legacy db-transaction adapter is not silently changed underneath
-// unconverted callers.
+// checks and lock ordering. All application interactive roots use this kernel;
+// the db-transaction adapter supplies strict join semantics and single-attempt
+// roots for families that do not explicitly opt into transaction replay.
 const scope = new AsyncLocalStorage();
 const contexts = new WeakMap();
 const transactionContexts = new WeakMap();

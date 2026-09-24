@@ -106,7 +106,7 @@ function makeDb({ balanceCents = 0n, revenue30dCents = 0, capturedAt = new Date(
   const db = {
     systemSetting: policyModelFixture(),
     $executeRawUnsafe: async () => 0,
-    $transaction: async (fn) => fn(db),
+    $transaction: async (fn) => fn({ ...(db), $transaction: undefined }),
     creatorEarningsSnapshot: {
       findUnique: async () => snapshot ? { ...snapshot } : null,
       findMany: async () => snapshot ? [{ ...snapshot }] : [],
@@ -650,7 +650,7 @@ test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines
     const db={
     systemSetting: policyModelFixture(),
     $executeRawUnsafe: async () => 0,
-      $transaction: async (fn)=>fn(db),
+      $transaction: async (fn)=>fn({ ...(db), $transaction: undefined }),
       agency:{ findUnique:async()=>({id:"agency-1",name:"Agency",plan:"PRO"}) },
       agencySubscription:{ findFirst:async()=>({billingMode:"MANUAL"}) },
       billingOrder:{

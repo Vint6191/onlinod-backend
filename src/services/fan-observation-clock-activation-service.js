@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const prisma = require("../prisma");
 
@@ -25,7 +27,7 @@ async function activateFanObservationCreatorClockV1({
   maxFutureSkewMs = FAN_OBSERVATION_CLOCK_ACTIVATION_MAX_WAIT_MS,
 } = {}) {
   const maxWaitMs = Math.max(0, Number(maxFutureSkewMs || 0));
-  return db.$transaction(async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     if (typeof tx.$queryRawUnsafe !== "function") {
       throw new Error("FAN_OBSERVATION_CLOCK_ACTIVATION_DB_LOCK_UNAVAILABLE");
     }

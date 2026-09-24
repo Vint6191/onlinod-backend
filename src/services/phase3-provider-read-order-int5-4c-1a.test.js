@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -88,7 +90,7 @@ test("INT5.4C-1A token issuer persists PostgreSQL-owned monotonic observation ti
     fanObservationToken: { create: async ({ data }) => { created.push(data); return data; } },
   };
   const result = await createFanObservationToken({
-    db,
+    db: commitDatabaseFixture(db),
     job: { id: "job-1", agencyId: "a1", creatorId: "c1" },
     deviceId: "device-1",
     leaseRevision: 7,
@@ -120,7 +122,7 @@ test("INT5.4C-1A point refresh uses post-read token chronology instead of older 
   };
   const db = projectionDb({ tokenRow });
   await applyFanDataPointRefreshChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job: {
       id: "job-old",
       agencyId: "a1",
@@ -150,7 +152,7 @@ test("INT5.4C-1A current point-refresh jobs fail closed on missing/replayed obse
     params: { fanIds: ["fan-1"], observationTokenVersion: 1 },
   };
   await assert.rejects(() => applyFanDataPointRefreshChunk({
-    db, job, deviceId: "device-1",
+    db: commitDatabaseFixture(db), job, deviceId: "device-1",
     chunkResult: { kind: "fan_data_point_refresh", items: [{ onlyFansUserId: "fan-1", relationship: { creatorFollowsFan: true, source: "USER_PROFILE" } }] },
   }), /FAN_OBSERVATION_TOKEN_REQUIRED|observation token/i);
 });

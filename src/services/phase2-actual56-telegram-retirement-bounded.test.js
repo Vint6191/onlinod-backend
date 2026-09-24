@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -65,7 +67,7 @@ const item = { agencyId: "agency-1", objectId: "tg-1", objectType: "TelegramAcco
 test("Telegram account retirement detaches creators in bounded restartable batches before final delete", async () => {
   const db = fakeDb(125);
 
-  const first = await processTelegramAccountRetirementFanout({ db, item, batchSize: 50 });
+  const first = await processTelegramAccountRetirementFanout({ db: commitDatabaseFixture(db), item, batchSize: 50 });
   assert.equal(first.complete, false);
   assert.equal(first.detached, 50);
   assert.equal(db.creators.filter((row) => row.telegramAccountId === "tg-1").length, 75);
@@ -73,25 +75,25 @@ test("Telegram account retirement detaches creators in bounded restartable batch
 
   // Simulate a crash/restart: progressCursor is intentionally not supplied back.
   // Durable CreatorAccount bindings are the progress authority.
-  const second = await processTelegramAccountRetirementFanout({ db, item, batchSize: 50 });
+  const second = await processTelegramAccountRetirementFanout({ db: commitDatabaseFixture(db), item, batchSize: 50 });
   assert.equal(second.complete, false);
   assert.equal(second.detached, 50);
   assert.equal(db.creators.filter((row) => row.telegramAccountId === "tg-1").length, 25);
   assert.equal(db.stats.accountDeletes, 0);
 
-  const third = await processTelegramAccountRetirementFanout({ db, item, batchSize: 50 });
+  const third = await processTelegramAccountRetirementFanout({ db: commitDatabaseFixture(db), item, batchSize: 50 });
   assert.equal(third.complete, false);
   assert.equal(third.detached, 25);
   assert.equal(db.creators.filter((row) => row.telegramAccountId === "tg-1").length, 0);
   assert.equal(db.stats.accountDeletes, 0);
 
-  const fourth = await processTelegramAccountRetirementFanout({ db, item, batchSize: 50 });
+  const fourth = await processTelegramAccountRetirementFanout({ db: commitDatabaseFixture(db), item, batchSize: 50 });
   assert.equal(fourth.complete, true);
   assert.equal(db.stats.accountDeletes, 1);
   assert.deepEqual(db.stats.updateBatches, [50, 50, 25]);
 
   // Retry after delete is idempotent/obsolete rather than recreating work.
-  const retry = await processTelegramAccountRetirementFanout({ db, item, batchSize: 50 });
+  const retry = await processTelegramAccountRetirementFanout({ db: commitDatabaseFixture(db), item, batchSize: 50 });
   assert.equal(retry.complete, true);
   assert.equal(retry.obsolete, true);
   assert.equal(db.stats.accountDeletes, 1);
@@ -101,7 +103,7 @@ test("Telegram account retirement refuses non-RETIRING account", async () => {
   const db = fakeDb(1);
   db.account.lifecycleState = "ACTIVE";
   await assert.rejects(
-    () => processTelegramAccountRetirementFanout({ db, item }),
+    () => processTelegramAccountRetirementFanout({ db: commitDatabaseFixture(db), item }),
     (err) => err && err.code === "TELEGRAM_ACCOUNT_RETIREMENT_STATE_INVALID",
   );
   assert.equal(db.creators[0].telegramAccountId, "tg-1");

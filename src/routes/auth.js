@@ -1,3 +1,5 @@
+
+const { runDbTransaction } = require("../services/db-transaction-service");
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const crypto = require("node:crypto");
@@ -618,7 +620,7 @@ router.post("/reset-password", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(input.password, 12);
 
-    await prisma.$transaction(async (tx) => {
+    await runDbTransaction(prisma, async (tx) => {
       await acquireAuthorizationUserLock(tx, { userId: record.userId });
       const revokedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
       await tx.authToken.update({ where: { id: record.id }, data: { usedAt: revokedAt } });

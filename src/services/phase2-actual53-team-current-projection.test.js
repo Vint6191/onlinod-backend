@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -26,7 +28,7 @@ function incrementalDb(initial) {
       async update() { return {}; },
     },
   };
-  return { db, state: () => copy(state), historyRead: () => historyRead };
+  return { db: commitDatabaseFixture(db), state: () => copy(state), historyRead: () => historyRead };
 }
 
 function baseState() {
@@ -110,7 +112,7 @@ function orderingFixture() {
       async upsert({ create, update }) { state = state ? { ...state, ...update } : { id: "pending-1", ...create }; return { ...state }; },
     },
   };
-  return { db, events, state: () => state ? { ...state } : null };
+  return { db: commitDatabaseFixture(db), events, state: () => state ? { ...state } : null };
 }
 
 test("F55-03 pending ownership is replay-deterministic when same-time seen is canonically before incoming", async () => {

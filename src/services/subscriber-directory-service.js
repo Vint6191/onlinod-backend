@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
@@ -160,7 +162,7 @@ async function scheduleSubscriberScan({
 
   let result;
   try {
-    result = await db.$transaction(async (tx) => {
+    result = await runDbTransaction(db, async (tx) => {
       // A single creator-local lock serializes generation allocation with
       // publication/recovery.  Job status is deliberately not the publication
       // authority: a terminal JobInstance may still have durable publication
@@ -461,39 +463,27 @@ async function publicationTransaction(db, agencyId, creatorId, work, {
   timeoutMs = 30_000,
   maintenanceSignal = null,
 } = {}) {
-  if (typeof db?.$transaction === "function") {
-    const maxWait = Math.max(250, Math.min(30_000, Number(maxWaitMs) || 30_000));
-    const timeout = Math.max(250, Math.min(30_000, Number(timeoutMs) || 30_000));
-    return db.$transaction(async (tx) => {
-      // Canonical Subscriber durable mutation lock order:
-      //   1) agency-wide automation write fence
-      //   2) creator-local Subscriber advisory lock
-      //   3) durable maintenance signal row (when maintenance owns the work)
-      // No maintenance path is allowed to invert (3)->(2).
-      await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId });
-      await lockSubscriberPublicationCreator(tx, agencyId, creatorId);
-      let claim = null;
-      if (maintenanceSignal) {
-        claim = await lockSubscriberMaintenanceClaimRow({ db: tx, signal: maintenanceSignal });
-        if (!claim) {
-          const error = new Error("Subscriber maintenance claim is stale or expired before durable mutation");
-          error.code = "SUBSCRIBER_MAINTENANCE_CLAIM_STALE";
-          throw error;
-        }
+  const maxWait = Math.max(250, Math.min(30_000, Number(maxWaitMs) || 30_000));
+  const timeout = Math.max(250, Math.min(30_000, Number(timeoutMs) || 30_000));
+  return runDbTransaction(db, async (tx) => {
+    // Canonical Subscriber durable mutation lock order:
+    //   1) agency-wide automation write fence
+    //   2) creator-local Subscriber advisory lock
+    //   3) durable maintenance signal row (when maintenance owns the work)
+    // No maintenance path is allowed to invert (3)->(2).
+    await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId });
+    await lockSubscriberPublicationCreator(tx, agencyId, creatorId);
+    let claim = null;
+    if (maintenanceSignal) {
+      claim = await lockSubscriberMaintenanceClaimRow({ db: tx, signal: maintenanceSignal });
+      if (!claim) {
+        const error = new Error("Subscriber maintenance claim is stale or expired before durable mutation");
+        error.code = "SUBSCRIBER_MAINTENANCE_CLAIM_STALE";
+        throw error;
       }
-      return work(tx, claim);
-    }, { maxWait, timeout });
-  }
-  if (maintenanceSignal) {
-    const error = new Error("Subscriber maintenance durable mutation requires transaction support");
-    error.code = "SUBSCRIBER_MAINTENANCE_FENCE_TRANSACTION_REQUIRED";
-    throw error;
-  }
-  if (typeof db?.$executeRawUnsafe === "function") {
-    await lockAutomationWriteCommitFence({ db, agencyId, creatorId });
-    await lockSubscriberPublicationCreator(db, agencyId, creatorId);
-  }
-  return work(db, null);
+    }
+    return work(tx, claim);
+  }, { maxWait, timeout });
 }
 
 async function projectHiddenOnlineChunk(db, run, itemIds, now) {
@@ -1312,10 +1302,7 @@ async function reconcileRecoveredSubscriberPublicationJob(db, { run, summary = n
     await markSubscriberPublicationJobReconciled(tx, runId, now);
     return { reconciled: true, reason: "done" };
   };
-  if (typeof db?.$transaction === "function") {
-    return db.$transaction(work, { maxWait: 10_000, timeout: 30_000 });
-  }
-  return work(db);
+  return runDbTransaction(db, work, { maxWait: 10_000, timeout: 30_000 });
 }
 
 function subscriberRecoveryJobNeedsPlanning(job, now) {

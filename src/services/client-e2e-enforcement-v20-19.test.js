@@ -146,7 +146,7 @@ function makeDb({ legacySessions = 0, legacyProxies = 0, legacyAccessSnapshots =
       },
     },
   };
-  db.$transaction = async (fn) => fn(db);
+  db.$transaction = async (fn) => fn({ ...(db), $transaction: undefined });
   return { root, proxies, identities, ownerWraps, accessSnapshots, db };
 }
 

@@ -100,7 +100,7 @@ function makeDb() {
         return { count: 1 };
       },
     },
-    $transaction: async (fn) => fn(db),
+    $transaction: async (fn) => fn({ ...(db), $transaction: undefined }),
     $executeRawUnsafe: async () => 1,
   };
   const billing = {};

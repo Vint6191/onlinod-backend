@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -29,7 +31,7 @@ function fakeDb(initial = null, currentMember = null) {
       },
     },
     _row: () => row,
-    async $transaction(fn) { return fn(this); },
+    async $transaction(fn) { return fn({ ...(this), $transaction: undefined }); },
   };
   return db;
 }
@@ -45,18 +47,18 @@ test("Customs Vault destination schema is one compact creator-scoped folder id",
 test("get/set stores only the folder id and supports explicit clear", async () => {
   const { getCustomVaultDestination, setCustomVaultDestination } = require("./custom-vault-destination-service");
   const db = fakeDb();
-  const empty = await getCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", db });
+  const empty = await getCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", db: commitDatabaseFixture(db) });
   assert.deepEqual(empty, { ok: true, creatorId: "creator-1", folderId: null, configured: false });
-  const saved = await setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: "987654", db });
+  const saved = await setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: "987654", db: commitDatabaseFixture(db) });
   assert.equal(saved.folderId, "987654"); assert.equal(db._row().customsVaultFolderId, "987654");
-  const cleared = await setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: null, db });
+  const cleared = await setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: null, db: commitDatabaseFixture(db) });
   assert.equal(cleared.folderId, null); assert.equal(cleared.configured, false);
 });
 
 test("system pseudo folders are never accepted as Customs destination", async () => {
   const { setCustomVaultDestination } = require("./custom-vault-destination-service");
   for (const value of ["all", "Unsorted", " ALL "]) {
-    await assert.rejects(() => setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: value, db: fakeDb() }), /custom Vault folder/i);
+    await assert.rejects(() => setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: value, db: commitDatabaseFixture(fakeDb()) }), /custom Vault folder/i);
   }
 });
 
@@ -65,7 +67,7 @@ test("commit-time Vault destination update rejects a stale management actor and 
   const staleCurrent = { ...member, accessEpoch: 2, assignedCreators: [] };
   const db = fakeDb("old-folder", staleCurrent);
   await assert.rejects(
-    () => setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: "new-folder", db }),
+    () => setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: "new-folder", db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
   );
   assert.equal(db._row().customsVaultFolderId, "old-folder");

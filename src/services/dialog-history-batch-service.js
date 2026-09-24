@@ -1,4 +1,7 @@
 "use strict";
+const { dbAuthorityNow } = require("./db-time-authority-service");
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { createHash, randomBytes } = require("node:crypto");
 const prisma = require("../prisma");
@@ -163,7 +166,7 @@ async function recoverExpiredDialogHistoryBatchesTx(db, input = {}) {
   const agencyId = clean(input.agencyId, 160);
   const creatorIds = [...new Set(list(input.creatorIds).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 1_000);
   if (!agencyId) return { recovered: 0, dialogCount: 0 };
-  const now = input.now instanceof Date ? input.now : new Date();
+  const now = await dbAuthorityNow({ db: db, fallbackNow: input.now instanceof Date ? input.now : new Date() });
   const runs = await db.dialogScanRun.findMany({
     where: {
       agencyId,
@@ -223,7 +226,7 @@ async function normalizeOrphanedDialogHistoryBatchesTx(db, input = {}) {
   const agencyId = clean(input.agencyId, 160);
   const creatorIds = [...new Set(list(input.creatorIds).map((value) => clean(value, 160)).filter(Boolean))].slice(0, 1_000);
   if (!agencyId) return { normalized: 0, dialogCount: 0 };
-  const now = input.now instanceof Date ? input.now : new Date();
+  const now = await dbAuthorityNow({ db: db, fallbackNow: input.now instanceof Date ? input.now : new Date() });
   const runs = await db.dialogScanRun.findMany({
     where: {
       agencyId,
@@ -326,13 +329,18 @@ async function reclaimOwnedDialogHistoryBatchTx(db, input = {}) {
     take: creatorIds.length,
   });
 
-  for (const run of runs) {
-    const continuation = object(run.continuation);
+  for (let run of runs) {
+    let continuation = object(run.continuation);
     if (clean(continuation.claimedByDeviceId, 200) !== deviceId) continue;
     if (!sameLeaseActor(continuation, actor)) continue;
     await assertExecutionAccessFence({ db, agencyId, creatorId: run.creatorId, ...actor, lock: true });
+    await lockBatchRow(db, agencyId, run.id);
+    run = await db.dialogScanRun.findFirst({ where: { id: run.id, agencyId, status: { in: ACTIVE_BATCH_STATUSES } } });
+    if (!run) continue;
+    continuation = object(run.continuation);
+    if (clean(continuation.claimedByDeviceId, 200) !== deviceId || !sameLeaseActor(continuation, actor)) continue;
     const leaseUntil = dateOrNull(continuation.leaseUntil);
-    if (!leaseUntil || leaseUntil.getTime() <= Date.now()) continue;
+    if (!leaseUntil || leaseUntil <= await dbAuthorityNow({ db, fallbackNow: new Date() })) continue;
 
     const ownedStates = await db.dialogScanState.findMany({
       where: { agencyId, creatorId: run.creatorId, activeRunId: run.id },
@@ -365,7 +373,9 @@ async function reclaimOwnedDialogHistoryBatchTx(db, input = {}) {
     if (!dialogs.length) continue;
 
     const token = randomBytes(32).toString("base64url");
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: db, fallbackNow: new Date() });
+    if (leaseUntil <= now) continue;
+    batchLeaseDeadlines.set(db, leaseUntil);
     const expiresAt = new Date(now.getTime() + leaseMs(input.leaseMs));
     const leaseRevision = integer(continuation.leaseRevision, 1, 1) + 1;
     const nextContinuation = {
@@ -584,7 +594,7 @@ async function claimDialogHistoryBatchTx(db, input) {
   if (!candidates.length) return { ok: true, batch: null, reason: "plan_generation_drained" };
 
   const token = randomBytes(32).toString("base64url");
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: db, fallbackNow: new Date() });
   const expiresAt = new Date(now.getTime() + leaseMs(input.leaseMs));
   const run = await db.dialogScanRun.create({
     data: {
@@ -688,7 +698,7 @@ async function claimDialogHistoryBatchTx(db, input) {
 
 async function claimDialogHistoryBatch(input) {
   try {
-    return await prisma.$transaction((tx) => claimDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
+    return await runBatchCommit((tx) => claimDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
   } catch (error) {
     // A rolling deploy can briefly overlap an older instance that does not yet
     // take the advisory lock. The partial unique index still chooses one
@@ -697,6 +707,27 @@ async function claimDialogHistoryBatch(input) {
       return { ok: true, batch: null, reason: "creator_batch_already_active" };
     }
     throw error;
+  }
+}
+
+
+const batchLeaseDeadlines = new WeakMap();
+function expiredBatchLease() {
+  return Object.assign(new Error("Dialog history batch lease expired before commit"), { code: "DIALOG_BATCH_LEASE_EXPIRED", status: 409 });
+}
+async function runBatchCommit(work, options) {
+  return runDbTransaction(prisma, async tx => {
+    try {
+      const result = await work(tx);
+      const deadline = batchLeaseDeadlines.get(tx);
+      if (deadline && await dbAuthorityNow({ db: tx, fallbackNow: new Date() }) >= deadline) throw expiredBatchLease();
+      return result;
+    } finally { batchLeaseDeadlines.delete(tx); }
+  }, options);
+}
+async function lockBatchRow(db, agencyId, id) {
+  if (typeof db.$queryRawUnsafe === "function") {
+    await db.$queryRawUnsafe('SELECT "id" FROM "DialogScanRun" WHERE "agencyId"=$1 AND "id"=$2 FOR UPDATE', agencyId, id);
   }
 }
 
@@ -711,7 +742,7 @@ async function requireBatchLeaseTx(db, input, options = {}) {
     error.status = 400;
     throw error;
   }
-  const run = await db.dialogScanRun.findFirst({
+  let run = await db.dialogScanRun.findFirst({
     where: { id: batchId, agencyId, dialogId: DIALOG_HISTORY_BATCH_DIALOG_ID },
   });
   if (!run) {
@@ -720,8 +751,13 @@ async function requireBatchLeaseTx(db, input, options = {}) {
     error.status = 404;
     throw error;
   }
-  const continuation = object(run.continuation);
   const actor = leaseActor(input);
+  await assertExecutionAccessFence({ db, agencyId, creatorId: run.creatorId, ...actor, lock: true });
+  await lockBatchRow(db, agencyId, batchId);
+  const current = await db.dialogScanRun.findFirst({ where: { id: batchId, agencyId, creatorId: run.creatorId, dialogId: DIALOG_HISTORY_BATCH_DIALOG_ID } });
+  if (!current) throw Object.assign(new Error("Dialog batch changed before lease admission"), { code: "DIALOG_BATCH_LEASE_STALE", status: 409 });
+  run = current;
+  const continuation = object(run.continuation);
   if (!actor.userId || !actor.memberId || actor.accessEpoch < 0 || !sameLeaseActor(continuation, actor)) {
     const error = new Error("Dialog history batch access actor is stale");
     error.code = "EXECUTION_ACCESS_EPOCH_STALE";
@@ -740,7 +776,6 @@ async function requireBatchLeaseTx(db, input, options = {}) {
     error.status = 409;
     throw error;
   }
-  await assertExecutionAccessFence({ db, agencyId, creatorId: run.creatorId, ...actor, lock: true });
   const status = clean(run.status, 40).toUpperCase();
   if (!ACTIVE_BATCH_STATUSES.includes(status)) {
     if (!(options.allowCompleted === true && status === "COMPLETED")) {
@@ -752,18 +787,20 @@ async function requireBatchLeaseTx(db, input, options = {}) {
     return { run, continuation };
   }
   const expiresAt = dateOrNull(continuation.leaseUntil);
-  if (!expiresAt || expiresAt.getTime() <= Date.now()) {
+  const authorityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
+  if (!expiresAt || expiresAt <= authorityNow) {
     const error = new Error("Dialog history batch lease expired");
     error.code = "DIALOG_BATCH_LEASE_EXPIRED";
     error.status = 409;
     throw error;
   }
-  return { run, continuation };
+  batchLeaseDeadlines.set(db, expiresAt);
+  return { run, continuation, authorityNow };
 }
 
 async function renewDialogHistoryBatchTx(tx, input) {
   const { run, continuation } = await requireBatchLeaseTx(tx, input);
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
   const expiresAt = new Date(now.getTime() + leaseMs(input.leaseMs));
   const next = {
     ...continuation,
@@ -778,12 +815,12 @@ async function renewDialogHistoryBatchTx(tx, input) {
 }
 
 async function renewDialogHistoryBatch(input) {
-  return prisma.$transaction((tx) => renewDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
+  return runBatchCommit((tx) => renewDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
 }
 
 async function progressDialogHistoryBatchTx(tx, input) {
   const { run, continuation } = await requireBatchLeaseTx(tx, input);
-  const now = new Date();
+  const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
   const expiresAt = new Date(now.getTime() + leaseMs(input.leaseMs));
   const nextContinuation = {
     ...continuation,
@@ -807,7 +844,7 @@ async function progressDialogHistoryBatchTx(tx, input) {
 }
 
 async function progressDialogHistoryBatch(input) {
-  return prisma.$transaction((tx) => progressDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
+  return runBatchCommit((tx) => progressDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
 }
 
 async function completeDialogHistoryBatchTx(tx, input) {
@@ -831,7 +868,7 @@ async function completeDialogHistoryBatchTx(tx, input) {
         .filter((item) => item.dialogId)
         .map((item) => [item.dialogId, item]),
     );
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     let completed = 0;
     let replanned = 0;
     let failed = 0;
@@ -988,7 +1025,7 @@ async function completeDialogHistoryBatchTx(tx, input) {
 }
 
 async function completeDialogHistoryBatch(input) {
-  return prisma.$transaction((tx) => completeDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
+  return runBatchCommit((tx) => completeDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
 }
 
 
@@ -1330,7 +1367,7 @@ async function reconcileDialogLocalCountsTx(tx, input) {
 }
 
 async function reconcileDialogLocalCounts(input) {
-  return prisma.$transaction(
+  return runBatchCommit(
     (tx) => reconcileDialogLocalCountsTx(tx, input),
     BATCH_TRANSACTION_OPTIONS,
   );
@@ -1338,7 +1375,7 @@ async function reconcileDialogLocalCounts(input) {
 
 async function releaseDialogHistoryBatchTx(tx, input) {
   const { run } = await requireBatchLeaseTx(tx, input);
-    const now = new Date();
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const reset = await tx.dialogScanState.updateMany({
       where: { agencyId: run.agencyId, creatorId: run.creatorId, activeRunId: run.id },
       data: { status: "PLANNED", activeRunId: null, activeJobId: null, lastError: null },
@@ -1363,7 +1400,7 @@ async function releaseDialogHistoryBatchTx(tx, input) {
 }
 
 async function releaseDialogHistoryBatch(input) {
-  return prisma.$transaction((tx) => releaseDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
+  return runBatchCommit((tx) => releaseDialogHistoryBatchTx(tx, input), BATCH_TRANSACTION_OPTIONS);
 }
 
 module.exports = {

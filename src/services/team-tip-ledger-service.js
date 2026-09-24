@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const prisma = require("../prisma");
 const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
@@ -476,7 +478,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = 
     ? actorMember
     : { id: byMemberId || null, userId: byUserId || null, accessEpoch: actorMember?.accessEpoch ?? null };
 
-  const outcome = await prisma.$transaction(async (tx) => {
+  const outcome = await runDbTransaction(prisma, async (tx) => {
     await lockAgencyLifecycle({ tx, agencyId });
     if (require("./product-billing-context-service").inProductBilling(agencyId)) {
       const observed = await tx.$queryRawUnsafe('SELECT "creatorId" FROM "TeamTipLedger" WHERE "agencyId"=$1 AND "eventHash"=$2 LIMIT 1', agencyId, safeHash);
@@ -1012,7 +1014,7 @@ async function migrateLegacyTipsToTipLedger({ db = prisma, agencyId = null, limi
   const cutoff = new Date(authorityNow.getTime() - safeRetentionDays * 24 * 60 * 60 * 1000);
 
   try {
-    return await db.$transaction(async (tx) => {
+    return await runDbTransaction(db, async (tx) => {
       await lockLegacyMoneyMigrationTable(tx);
       // Audit15 Closure3: the legacy row and any existing canonical TeamTip row
       // are both locked before precedence is decided. A committed legacy MANUAL
@@ -1296,7 +1298,7 @@ async function repairMigratedLegacyTipManualAuthority({ db = prisma, agencyId = 
   const cleanAgency = clean(agencyId, 160);
   const safeLimit = Math.min(5000, Math.max(1, int(limit, 1000)));
   try {
-    return await db.$transaction(async (tx) => {
+    return await runDbTransaction(db, async (tx) => {
       const rows = await selectMigratedTipRowsForManualRepair(tx, { agencyId: cleanAgency, limit: safeLimit });
       let repaired = 0;
       let alreadyManual = 0;

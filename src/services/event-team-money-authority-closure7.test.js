@@ -26,7 +26,7 @@ function memberFor(id) {
 function claimsFake(initialRow) {
   let row = structuredClone(initialRow);
   const fake = {
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     async $queryRaw() { return row ? [structuredClone(row)] : []; },
     agencyMember: {
       async findFirst({ where }) {

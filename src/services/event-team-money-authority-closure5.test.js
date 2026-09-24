@@ -1,3 +1,4 @@
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 "use strict";
 
 const test = require("node:test");
@@ -13,7 +14,7 @@ function source(rel) { return fs.readFileSync(path.join(ROOT, rel), "utf8"); }
 function loadWithPrisma(modulePath, fake) {
   delete require.cache[modulePath];
   delete require.cache[prismaPath];
-  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: fake };
+  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: commitDatabaseFixture(fake) };
   return require(modulePath);
 }
 

@@ -1,4 +1,5 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
 
 const { randomUUID } = require("node:crypto");
 const { runRootCommit } = require("./db-commit-kernel");
@@ -58,8 +59,8 @@ async function projectWithinTransaction({ db, job, fact, historyPolicy }) {
 async function projectCanonicalSubscriptionReceipt({ db, job, fact, historyPolicy = null }) {
   if (!db || !job?.agencyId || !job?.creatorId) throw fault("NOTIFICATION_FACT_SCOPE_REQUIRED");
   if (typeof db.$transaction !== "function") {
-    // Durable/history consumers already own the transaction and its authority.
-    return projectWithinTransaction({ db, job, fact, historyPolicy });
+    // Durable/history consumers join only their live kernel-issued attempt.
+    return runDbTransaction(db, tx => projectWithinTransaction({ db: tx, job, fact, historyPolicy }));
   }
   // Full-mode compatibility may run after collector commit. Its individual
   // receipt still needs an atomic root and a current tenant lifecycle fence.

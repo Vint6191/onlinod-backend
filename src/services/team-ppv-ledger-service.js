@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const prisma = require("../prisma");
 const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
@@ -617,7 +619,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
     return { resolved: 0, skipped: 1, code: "RESOLUTION_REASON_REQUIRED" };
   }
 
-  const outcome = await prisma.$transaction(async (tx) => {
+  const outcome = await runDbTransaction(prisma, async (tx) => {
     await lockAgencyLifecycle({ tx, agencyId });
     if (require("./product-billing-context-service").inProductBilling(agencyId)) {
       const observed = await tx.$queryRawUnsafe('SELECT "creatorId" FROM "TeamPpvResolveJob" WHERE "agencyId"=$1 AND "id"=$2 LIMIT 1', agencyId, safeJobId);

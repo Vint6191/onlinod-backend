@@ -73,6 +73,8 @@ function createDb() {
     _commits: commits,
     _locks: locks,
     $queryRawUnsafe: async (sql, memberId, userId, agencyId) => {
+      if (sql.includes('clock_timestamp()')) return [{ authorityNow: new Date() }];
+      if (sql.includes('FROM "DialogScanRun"')) return runs.has(userId) ? [{ id: userId }] : [];
       if (String(sql).includes('FROM "AgencyMember"')) {
         if (memberId !== CURRENT_ACTOR.memberId || userId !== CURRENT_ACTOR.userId || agencyId !== "agency-1") return [];
         return [{ ...actorMember }];

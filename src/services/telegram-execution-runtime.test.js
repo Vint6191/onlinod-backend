@@ -66,6 +66,7 @@ function makeDb({ sourceSubmissions = [], deliveryIntents = [], customOrders = [
   };
   const member = { id: "member-1", userId: "user-1", agencyId: "agency-1", role: "OPERATOR", roleKey: "chatter", assignedCreators: ["creator-1"], accessEpoch: 1, deletedAt: null, deactivatedAt: null };
   return {
+    $transaction: async function(work) { const tx = { ...this }; delete tx.$transaction; return work(tx); },
     _accounts: accounts,
     _creators: creators,
     _member: member,

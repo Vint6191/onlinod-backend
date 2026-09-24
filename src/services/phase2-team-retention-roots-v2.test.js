@@ -15,6 +15,7 @@ function loadTeamPpvServiceWithDb(db) {
     if (request === "./historical-attribution-target-authority-service") return { resolveHistoricalAttributionTarget: async () => ({}) };
     if (request === "../utils/prisma-transaction") return { serializableTxOptions: () => ({}) };
     if (request === "./team-money-reconciliation-service") return { reconcileMoneyForSentMessageEvidence: async () => ({}) };
+    if (request === "./db-transaction-service") return require(request);
     throw new Error(`unexpected require ${request}`);
   };
   vm.runInNewContext(source, { module, exports: module.exports, require: requireStub, console, Date, Set, Map, Math, Number, String, Array, Object, JSON, Promise, Buffer, Error }, { filename: "team-ppv-ledger-service.js" });

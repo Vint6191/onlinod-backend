@@ -58,7 +58,7 @@ test("final cut durable promotion claim never holds signal row while waiting for
   assert.match(claim, /FOR UPDATE OF s SKIP LOCKED/);
   assert.match(claim, /UPDATE "CampaignFanRefreshPromotionSignal"/);
   assert.match(maintenance, /claimCampaignFanRefreshPromotionSignal\(\{ db: root/);
-  assert.match(maintenance, /root\.\$transaction[\s\S]*acquireCampaignTransactionLock\(tx, creatorId\)[\s\S]*campaignFanRefreshPromotionSignal\.findFirst/);
+  assert.match(maintenance, /runDbTransaction\(root,[\s\S]*acquireCampaignTransactionLock\(tx, creatorId\)[\s\S]*campaignFanRefreshPromotionSignal\.findFirst/);
 });
 
 test("Billing and legacy Analytics have no active snapshot generation reader/writer while Phase A preserves old writable tables", () => {

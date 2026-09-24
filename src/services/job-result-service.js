@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const prisma = require("../prisma");
 const { CATCHUP_JOB_KEY, applyCatchupJobResult, recordCatchupJobFailure } = require("./team-observation-service");
@@ -300,8 +302,7 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
     // Campaign freshness demand/result projection must commit atomically with
     // canonical FanData. A process crash may not leave fresh data committed
     // while the waiting Campaign runs remain permanently OUTSTANDING.
-    if (typeof db?.$transaction === "function") return db.$transaction((tx) => applyPointRefresh(tx));
-    return applyPointRefresh(db);
+    return runDbTransaction(db, applyPointRefresh);
   }
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) {
     return applyLikesDiscoveryChunk({ db, job, deviceId, userId, chunkResult });

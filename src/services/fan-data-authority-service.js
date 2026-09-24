@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const { dbAuthorityNow } = require("./db-time-authority-service");
@@ -1377,8 +1379,7 @@ async function commitFanFacts(db, {
     }
     return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };
   };
-  if (typeof db.$transaction === "function") return db.$transaction((tx) => apply(tx));
-  return apply(db);
+  return runDbTransaction(db, apply);
 }
 
 async function projectFanObservationBatch(db, options = {}) {

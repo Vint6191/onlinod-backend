@@ -22,7 +22,7 @@ test("INT2.8 usage route carries exact current accessEpoch into a commit-time ex
 
 test("INT2.8 service invokes generation guard inside each source transaction before sourceRevision/media ordering", () => {
   const block = service.slice(service.indexOf("async function replaceUsageSources"), service.indexOf("async function mutateFolderMembership"));
-  const txAt = block.indexOf("db.$transaction");
+  const txAt = block.indexOf("runDbTransaction(db,");
   const guardAt = block.indexOf('if (typeof commitGuard === "function") await commitGuard(tx)');
   const replaceAt = block.indexOf("replaceUsageSourceTx(tx");
   assert.ok(txAt >= 0 && guardAt > txAt && replaceAt > guardAt);

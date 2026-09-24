@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const { audit } = require("./audit-service");
@@ -344,9 +346,7 @@ async function emitDeliveryAudits(client, result) {
 async function recordCustomDeliverySend(input = {}) {
   const client = input.db || require("../prisma");
   const run = (tx) => recordCustomDeliverySendInClient({ ...input, db: tx });
-  let result;
-  if (typeof client.$transaction === "function") result = await client.$transaction(run, { timeout: 30_000 });
-  else result = await run(client);
+  const result = await runDbTransaction(client, run, { timeout: 30_000 });
   if (input.suppressAudit !== true) await emitDeliveryAudits(client, result);
   return publicProjection(result);
 }
@@ -521,12 +521,12 @@ async function settleCustomManualDeliveryWithCapability(input, { db = null } = {
     return { ok: true, provenSuccess: true, writeId, messageId, projection };
   };
   if (typeof client.$transaction === "function") {
-    const result = await client.$transaction(settle, { timeout: 30_000 });
+    const result = await runDbTransaction(client, settle, { timeout: 30_000 });
     if (result?.projection) await emitDeliveryAudits(client, result.projection);
     if (result?.projection) result.projection = publicProjection(result.projection);
     return result;
   }
-  const result = await settle(client);
+  const result = await runDbTransaction(client, settle, { timeout: 30_000 });
   if (result?.projection) result.projection = publicProjection(result.projection);
   return result;
 }

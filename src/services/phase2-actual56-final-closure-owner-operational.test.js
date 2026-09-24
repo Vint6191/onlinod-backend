@@ -87,7 +87,7 @@ test("C2 admin User disable checks owner safety after User FOR UPDATE and before
   const mutation = route.indexOf("tx.user.update");
   assert.ok(admission >= 0 && lock > admission && ownerSafety > lock && mutation > ownerSafety);
   assert.doesNotMatch(route, /lockTeamControlPlaneTopology/);
-  assert.match(read("src/routes/admin-command-handlers.js"), /P2034/);
+  assert.match(read("src/routes/admin-command-handlers.js"), /classifyCommitConflict/);
 });
 
 test("C2 Serializable Team write conflicts surface as controlled 409 rather than backend 500", () => {

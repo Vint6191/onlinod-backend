@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const prisma = require("../prisma");
 const { createPlannedJob, updatePlannedJobDemand, publishPlannedJobAvailable } = require("./job-planning-repository");
@@ -776,7 +778,7 @@ async function restartCreatorDialogPlanTx(db, input) {
 
 async function restartCreatorDialogPlan(input) {
   try {
-    const result = await prisma.$transaction((tx) => restartCreatorDialogPlanTx(tx, input), DIALOG_CONTROL_TRANSACTION_OPTIONS);
+    const result = await runDbTransaction(prisma, (tx) => restartCreatorDialogPlanTx(tx, input), DIALOG_CONTROL_TRANSACTION_OPTIONS);
     if (result?.job?.status === "SCHEDULED") publishPlannedJobAvailable(result.job);
     return result;
   } catch (error) {
@@ -806,7 +808,7 @@ async function restartCreatorDialogPlan(input) {
 
 async function scheduleDialogScan(input) {
   try {
-    const result = await prisma.$transaction((tx) => scheduleDialogScanTx(tx, input));
+    const result = await runDbTransaction(prisma, (tx) => scheduleDialogScanTx(tx, input));
     if (result?.job?.status === "SCHEDULED") publishPlannedJobAvailable(result.job);
     return result;
   } catch (error) {
@@ -1009,7 +1011,7 @@ async function autoRecoverDialogDiscoveryTx(db, input) {
 }
 
 async function autoRecoverDialogDiscovery(input) {
-  return prisma.$transaction((tx) => autoRecoverDialogDiscoveryTx(tx, input));
+  return runDbTransaction(prisma, (tx) => autoRecoverDialogDiscoveryTx(tx, input));
 }
 
 function dialogHistoryControl(run) {
@@ -1190,7 +1192,7 @@ async function autoRecoverDialogHistoryTx(db, input) {
 }
 
 async function autoRecoverDialogHistory(input) {
-  return prisma.$transaction((tx) => autoRecoverDialogHistoryTx(tx, input));
+  return runDbTransaction(prisma, (tx) => autoRecoverDialogHistoryTx(tx, input));
 }
 
 // Raw messages, purchase facts and server Vault projections were retired from
@@ -2035,7 +2037,7 @@ async function recordDialogIntelligenceFailure({ job, error, terminal, db = pris
     // Failed legacy per-dialog runs are terminal audit rows only. The dialog
     // plan is reclaimed by the batch coordinator; do not spawn another job.
   };
-  if (db === prisma) await prisma.$transaction(project); else await project(db);
+  if (db === prisma) await runDbTransaction(prisma, project); else await project(db);
   return {
     runId,
     status,

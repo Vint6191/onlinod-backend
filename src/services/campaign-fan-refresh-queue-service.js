@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const { CAMPAIGN_FAN_VALUE_FRESHNESS_MS } = require("./analytics-freshness-policy");
@@ -847,7 +849,7 @@ async function recoverFailedCampaignFanRefreshDemands({ db, now = null, creatorI
   if (!scopedCreatorId) return { recovered: 0, requeuedWork: 0, reason: "creator_required" };
   if (supportsSetBasedCampaignFanRefreshRecovery(db)) {
     if (!_transactionWrapped && typeof db?.$transaction === "function") {
-      return db.$transaction((tx) => recoverFailedCampaignFanRefreshDemands({
+      return runDbTransaction(db, (tx) => recoverFailedCampaignFanRefreshDemands({
         db: tx, now, creatorId: scopedCreatorId, force, maxDemands, _transactionWrapped: true, _campaignLockHeld,
       }), { maxWait: 30_000, timeout: 60_000 });
     }
@@ -908,8 +910,7 @@ async function repairFailedCampaignFanRefreshDemands({ db, creatorId, now = null
     }
     return { ...repaired, promotionSignaled: Boolean(agencyRow?.agencyId), promotedJobs: 0, promotedFans: 0 };
   };
-  if (typeof db?.$transaction === "function") return db.$transaction(work, { maxWait: 30_000, timeout: 60_000 });
-  return work(db);
+  return runDbTransaction(db, work, { maxWait: 30_000, timeout: 60_000 });
 }
 
 
@@ -1323,7 +1324,7 @@ async function promoteQueuedCampaignFanRefreshDemands({ db, creatorId, now = nul
   const scopedCreatorId = clean(creatorId, 180);
   if (!scopedCreatorId) return { promotedJobs: 0, promotedFans: 0, reason: "creator_required" };
   if (!inTransaction && typeof db?.$transaction === "function") {
-    return db.$transaction((tx) => promoteQueuedCampaignFanRefreshDemands({
+    return runDbTransaction(db, (tx) => promoteQueuedCampaignFanRefreshDemands({
       db: tx, creatorId: scopedCreatorId, now, maxJobs, planner, inTransaction: true, _campaignLockHeld,
     }), { maxWait: 30_000, timeout: 60_000 });
   }
@@ -1372,7 +1373,7 @@ async function claimCampaignFanRefreshPromotionSignal({ db, now = new Date() } =
   if (typeof db?.$transaction !== "function") return null;
   const fallbackNow = asDate(now) || new Date();
   const claimToken = `claim_${crypto.randomUUID?.() || crypto.randomBytes(16).toString("hex")}`;
-  return db.$transaction(async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     if (typeof tx?.$queryRawUnsafe !== "function") return null;
     // PostgreSQL, not a scheduler replica wall clock, owns due/lease chronology.
     // A skewed process clock must never reclaim another replica's live signal.
@@ -1460,7 +1461,7 @@ async function runCampaignFanRefreshPromotionMaintenance({
 
   async function processSignal(signal) {
     try {
-      const claimed = await root.$transaction(async (tx) => {
+      const claimed = await runDbTransaction(root, async (tx) => {
         const creatorId = clean(signal.creatorId, 180);
         const agencyId = clean(signal.agencyId, 180);
         if (!creatorId || !agencyId) return { stale: true };

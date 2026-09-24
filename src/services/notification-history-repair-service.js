@@ -6,6 +6,8 @@ const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-servi
 const work = require("./domain-work-authority-service");
 const { projectFacts, PAGE_SIZE } = require("./notification-consequence-service");
 const KEY = "phase5_notification_history_v1";
+const RECEIPT_KEY = "phase5_notification_history_v2";
+const RECEIPT_WORK_CLASS = work.WORK_CLASS.NOTIFICATION_RECEIPT_REPAIR;
 const WORK_CLASS = work.WORK_CLASS.NOTIFICATION_HISTORY_REPAIR;
 const TABLES = ["CreatorSale", "CreatorTip", "CreatorSubscriptionEvent"];
 const MODELS = ["creatorSale", "creatorTip", "creatorSubscriptionEvent"];
@@ -23,12 +25,14 @@ function pageSql(table) {
     ORDER BY "createdAt","id" LIMIT $6`;
 }
 
-async function enumerateHistoryCreators({ db }) {
+async function enumerateHistoryCreators({ db, receiptRepair = false }) {
+  const key = receiptRepair ? RECEIPT_KEY : KEY;
+  const workClass = receiptRepair ? RECEIPT_WORK_CLASS : WORK_CLASS;
   return runRootCommit(db, async ({ tx }) => {
-    const rows = await tx.$queryRawUnsafe('SELECT * FROM "MaintenanceLaneState" WHERE "key"=$1 FOR UPDATE SKIP LOCKED', KEY);
+    const rows = await tx.$queryRawUnsafe('SELECT * FROM "MaintenanceLaneState" WHERE "key"=$1 FOR UPDATE SKIP LOCKED', key);
     const state = rows[0];
     if (!state) return { ok: true, skipped: true, reason: "migration_pending_or_busy" };
-    if (state.generation !== KEY || state.activeGeneration !== KEY) throw fault("NOTIFICATION_HISTORY_GENERATION_MISMATCH");
+    if (state.generation !== key || state.activeGeneration !== key) throw fault("NOTIFICATION_HISTORY_GENERATION_MISMATCH");
     if (state.completedAt) return { ok: true, complete: true, selected: 0 };
     const cursor = state.cursor;
     if (!cursor || typeof cursor.upperId !== "string" || !Number.isFinite(Date.parse(cursor.cutoffAt))) throw fault("NOTIFICATION_HISTORY_CATALOG_CURSOR_INVALID");
@@ -42,17 +46,19 @@ async function enumerateHistoryCreators({ db }) {
       await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 FOR SHARE', candidate.id, candidate.agencyId);
       const creator = await tx.creatorAccount.findFirst({ where: { id: candidate.id, agencyId: candidate.agencyId, deletedAt: null }, select: { id: true } });
       if (!creator) continue;
-      const identity = { agencyId: candidate.agencyId, workClass: WORK_CLASS, objectType: "CreatorAccount", objectId: candidate.id };
+      const identity = { agencyId: candidate.agencyId, workClass, objectType: "CreatorAccount", objectId: candidate.id };
       const id = work.workId(identity);
       if (await tx.domainWorkItem.findUnique({ where: { id }, select: { id: true } })) continue;
       const item = await work.publishDomainWork({ db: tx, ...identity, creatorId: candidate.id, parentObjectId: candidate.id, partitionKey: candidate.id });
       if (!item?.id) throw fault("NOTIFICATION_HISTORY_INTENT_REQUIRED");
-      await tx.domainWorkItem.update({ where: { id: item.id }, data: { progressCursor: { cutoffAt: cursor.cutoffAt, table: 0, processed: 0, identityMissing: 0 } } });
+      await tx.domainWorkItem.update({ where: { id: item.id }, data: { progressCursor: { cutoffAt: cursor.cutoffAt, generation: key,
+        tailFrom: null, afterCreatedAt: null, afterId: "",
+        table: 0, processed: 0, identityMissing: 0 } } });
       published++;
     }
     const complete = creators.length < CATALOG_PAGE || creators.at(-1)?.id === cursor.upperId;
     const now = await dbAuthorityNow({ db: tx });
-    await tx.maintenanceLaneState.update({ where: { key: KEY }, data: {
+    await tx.maintenanceLaneState.update({ where: { key }, data: {
       cursor: { ...cursor, afterId: creators.at(-1)?.id || cursor.afterId || "" },
       progress: { enumerated: Number(state.progress?.enumerated || 0) + creators.length, published: Number(state.progress?.published || 0) + published },
       completedAt: complete ? now : null, lastRunAt: now, lastOutcome: complete ? "ENUMERATION_COMPLETE" : "ENUMERATING",
@@ -62,7 +68,7 @@ async function enumerateHistoryCreators({ db }) {
 }
 
 async function processHistoryPage({ db, item, ownerToken }) {
-  if (item.workClass !== WORK_CLASS || item.objectType !== "CreatorAccount" || item.objectId !== item.creatorId) throw fault("NOTIFICATION_HISTORY_SCOPE_INVALID");
+  if (![WORK_CLASS, RECEIPT_WORK_CLASS].includes(item.workClass) || item.objectType !== "CreatorAccount" || item.objectId !== item.creatorId) throw fault("NOTIFICATION_HISTORY_SCOPE_INVALID");
   return runRootCommit(db, async ({ tx }) => {
     const lifecycle = await lockAgencyLifecycleBarrier({ db: tx, agencyId: item.agencyId });
     await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 FOR SHARE', item.creatorId, item.agencyId);
@@ -90,8 +96,8 @@ async function processHistoryPage({ db, item, ownerToken }) {
     const historyPolicy = { organicCutoff: policy.settings.trafficPaidOrganicLedgerDays > 0 ? new Date(now.getTime() - policy.settings.trafficPaidOrganicLedgerDays * 86400000) : null };
     const effects = await projectFacts({ db: tx, job: { agencyId: item.agencyId, creatorId: item.creatorId, params: {} }, table, rows, historical: true, historyPolicy });
     const more = page.length === PAGE_SIZE;
-    const next = { cutoffAt: cursor.cutoffAt, table: more ? table : table + 1,
-      afterId: more ? page.at(-1).id : null, afterCreatedAt: more ? page.at(-1).createdAt.toISOString() : null,
+    const next = { cutoffAt: cursor.cutoffAt, generation: cursor.generation || KEY, tailFrom: cursor.tailFrom || null, table: more ? table : table + 1,
+      afterId: more ? page.at(-1).id : null, afterCreatedAt: more ? page.at(-1).createdAt.toISOString() : (table === 0 ? cursor.tailFrom || null : null),
       retentionExcluded: Number(cursor.retentionExcluded || 0) + effects.retentionExcluded,
       processed: Number(cursor.processed || 0) + rows.length, identityMissing: Number(cursor.identityMissing || 0) + identityMissing };
     if (next.table < TABLES.length) {
@@ -100,7 +106,7 @@ async function processHistoryPage({ db, item, ownerToken }) {
     }
     // Retain a durable, scoped reconstruction report. This never fabricates a
     // collector frontier, a successful Job, or coverage for absent historical rows.
-    await tx.domainWorkItem.update({ where: { id: item.id }, data: { lastRepair: { generation: KEY, ...next, coverage: next.identityMissing ? "RETAINED_FACTS_WITH_IDENTITY_GAPS" : "RETAINED_FACTS_ONLY" } } });
+    await tx.domainWorkItem.update({ where: { id: item.id }, data: { lastRepair: { ...next, coverage: next.identityMissing ? "RETAINED_FACTS_WITH_IDENTITY_GAPS" : "RETAINED_FACTS_ONLY" } } });
     owned(await work.ackDomainWorkClaim({ db: tx, item, ownerToken, terminalCause: next.identityMissing ? "HISTORY_REPAIRED_WITH_IDENTITY_GAPS" : "RETAINED_HISTORY_REPAIRED" }));
     return { completed: true, processed: rows.length, identityMissing };
   }, { profile: "JOB_CHUNK", authority: { kind: "NOTIFICATION_HISTORY_REPAIR", agencyId: item.agencyId, creatorId: item.creatorId } });
@@ -109,11 +115,12 @@ async function processHistoryPage({ db, item, ownerToken }) {
 async function runNotificationHistoryRepairSweep({ db = require("../prisma"), limit = 4, maxRuntimeMs = 3000 } = {}) {
   const started = performance.now();
   const enumeration = await enumerateHistoryCreators({ db });
-  const report = { ok: true, enumeration, processed: 0, completed: 0, yielded: 0, failed: 0, identityMissing: 0 };
+  const receiptEnumeration = await enumerateHistoryCreators({ db, receiptRepair: true });
+  const report = { ok: true, enumeration, receiptEnumeration, processed: 0, completed: 0, yielded: 0, failed: 0, identityMissing: 0 };
   for (let step = 0; step < Math.max(1, Math.min(8, Number(limit) || 4)) && performance.now() - started < maxRuntimeMs; step++) {
-    const claim = await work.claimDomainWorkBatch({ db, workClass: WORK_CLASS, limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
+    const claim = await work.claimDomainWorkBatch({ db, workClass: step % 2 ? RECEIPT_WORK_CLASS : WORK_CLASS, limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
     if (claim.skipped) { report.ok = false; report.reason = claim.reason; break; }
-    const item = claim.items?.[0]; if (!item) break;
+    const item = claim.items?.[0]; if (!item) continue;
     try {
       const result = await processHistoryPage({ db, item, ownerToken: claim.ownerToken });
       report.processed += result.processed; report.identityMissing += result.identityMissing || 0;
@@ -124,4 +131,4 @@ async function runNotificationHistoryRepairSweep({ db = require("../prisma"), li
   }
   return report;
 }
-module.exports = { KEY, WORK_CLASS, TABLES, PAGE_SIZE, CATALOG_PAGE, pageSql, enumerateHistoryCreators, processHistoryPage, runNotificationHistoryRepairSweep };
+module.exports = { KEY, RECEIPT_KEY, RECEIPT_WORK_CLASS, WORK_CLASS, TABLES, PAGE_SIZE, CATALOG_PAGE, pageSql, enumerateHistoryCreators, processHistoryPage, runNotificationHistoryRepairSweep };

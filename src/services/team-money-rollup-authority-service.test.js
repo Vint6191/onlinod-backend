@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -47,7 +49,7 @@ function createFixture() {
     },
   });
   const db = {
-    $transaction: async (fn) => fn(db),
+    $transaction: async (fn) => fn({ ...(db), $transaction: undefined }),
     teamMoneyAttributionFact: { async findFirst({ where }) { return where.id===fact.id && where.agencyId===fact.agencyId ? { ...fact } : null; } },
     teamMoneyRollupContribution: {
       async findUnique({ where }) { const row=contributions.get(where.sourceFactId); return row ? { ...row } : null; },
@@ -56,7 +58,7 @@ function createFixture() {
     teamMoneyDailyRollup: rollupModel(daily,dayKey),
     teamMoneyLifetimeRollup: rollupModel(lifetime,lifeKey),
   };
-  return { db, fact, contributions, daily, lifetime, dayKey, lifeKey };
+  return { db: commitDatabaseFixture(db), fact, contributions, daily, lifetime, dayKey, lifeKey };
 }
 
 function total(map, predicate=()=>true) {
@@ -67,25 +69,25 @@ function total(map, predicate=()=>true) {
 
 test("A49 rollup replay/reassignment/currency-day correction/refund applies exact old->new delta once", async () => {
   const fx=createFixture();
-  let r=await applyTeamMoneyFactToRollups({ db:fx.db, agencyId:"agency-1", factId:"fact-1" });
+  let r=await applyTeamMoneyFactToRollups({ db:commitDatabaseFixture(fx.db), agencyId:"agency-1", factId:"fact-1" });
   assert.equal(r.changed,true);
   assert.deepEqual(total(fx.daily),{amount:1000n,count:1});
   assert.deepEqual(total(fx.lifetime),{amount:1000n,count:1});
 
-  r=await applyTeamMoneyFactToRollups({ db:fx.db, agencyId:"agency-1", factId:"fact-1" });
+  r=await applyTeamMoneyFactToRollups({ db:commitDatabaseFixture(fx.db), agencyId:"agency-1", factId:"fact-1" });
   assert.equal(r.idempotent,true,"same worker replay must not double contribution");
   assert.deepEqual(total(fx.daily),{amount:1000n,count:1});
 
   fx.fact.memberId="member-b"; fx.fact.currency="EUR"; fx.fact.amountCents=800;
   fx.fact.occurredAt=new Date("2026-09-02T01:00:00Z"); fx.fact.sourceUpdatedAt=new Date("2026-09-02T01:01:00Z");
-  await applyTeamMoneyFactToRollups({ db:fx.db, agencyId:"agency-1", factId:"fact-1" });
+  await applyTeamMoneyFactToRollups({ db:commitDatabaseFixture(fx.db), agencyId:"agency-1", factId:"fact-1" });
   assert.deepEqual(total(fx.daily,r=>r.memberId==="member-a"),{amount:0n,count:0},"old member/day/currency bucket must be reversed");
   assert.deepEqual(total(fx.daily,r=>r.memberId==="member-b" && r.currency==="EUR"),{amount:800n,count:1});
   assert.deepEqual(total(fx.lifetime,r=>r.memberId==="member-a"),{amount:0n,count:0});
   assert.deepEqual(total(fx.lifetime,r=>r.memberId==="member-b" && r.currency==="EUR"),{amount:800n,count:1});
 
   fx.fact.financialStatus="undo"; fx.fact.attributionActive=false; fx.fact.sourceUpdatedAt=new Date("2026-09-02T02:00:00Z");
-  await applyTeamMoneyFactToRollups({ db:fx.db, agencyId:"agency-1", factId:"fact-1" });
+  await applyTeamMoneyFactToRollups({ db:commitDatabaseFixture(fx.db), agencyId:"agency-1", factId:"fact-1" });
   assert.deepEqual(total(fx.daily),{amount:0n,count:0},"refund/deactivation must remove contribution exactly once");
   assert.deepEqual(total(fx.lifetime),{amount:0n,count:0});
 
@@ -107,7 +109,7 @@ test("A49/A20 opposite rollup reassignments acquire the same bucket locks in det
   assert.equal(forward.length, 4, "two distinct member buckets require daily+lifetime locks for both sides");
 
   const fx = createFixture();
-  await applyTeamMoneyFactToRollups({ db: fx.db, agencyId: "agency-1", factId: "fact-1" });
+  await applyTeamMoneyFactToRollups({ db: commitDatabaseFixture(fx.db), agencyId: "agency-1", factId: "fact-1" });
   fx.fact.memberId = "member-b";
   fx.fact.sourceUpdatedAt = new Date("2026-09-01T12:02:00Z");
 
@@ -120,7 +122,7 @@ test("A49/A20 opposite rollup reassignments acquire the same bucket locks in det
     model.upsert = async (args) => { events.push(`mutate:${name}:upsert`); return originalUpsert(args); };
   }
 
-  await applyTeamMoneyFactToRollups({ db: fx.db, agencyId: "agency-1", factId: "fact-1" });
+  await applyTeamMoneyFactToRollups({ db: commitDatabaseFixture(fx.db), agencyId: "agency-1", factId: "fact-1" });
   assert.match(events[0], /^lock:team-money-rollup:agency-1:fact-1$/, "per-fact serialization remains the first authority lock");
   const bucketLocks = events.filter((event) => event.startsWith("lock:team-money-rollup-bucket:"));
   assert.equal(bucketLocks.length, 4);

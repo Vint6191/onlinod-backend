@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const { activeLifecycleWhere } = require("./telegram-account-reference-authority-service");
@@ -322,7 +324,7 @@ async function reprojectCustomReminderSchedule({ agencyId, orderId, now = new Da
       const work = await synchronizeReminderDomainWork({ agencyId, order: nextOrder, desired, db: tx, now });
       return { ok: true, missing: false, changed: scheduleChanged, nextReminderAt: desiredAt, reminderKey: desired.key || null, work, attempts: attempt + 1 };
     };
-    const result = typeof db.$transaction === "function" ? await db.$transaction(execute) : await execute(db);
+    const result = await runDbTransaction(db, execute);
     if (result) return result;
   }
 

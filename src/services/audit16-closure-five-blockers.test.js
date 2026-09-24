@@ -142,7 +142,7 @@ function scopedProxyDb() {
       async findFirst() { return null; },
     },
   };
-  db.$transaction = async (fn) => fn(db);
+  db.$transaction = async (fn) => fn({ ...(db), $transaction: undefined });
   return db;
 }
 
@@ -191,9 +191,9 @@ test("Audit16 delivery admin routes propagate actor and service rechecks scope a
   for (const call of ["retryActionDelivery", "cancelActionDelivery", "releaseClaimByAdmin", "retrySafeFailures"]) {
     assert.match(route, new RegExp(`${call}\\([\\s\\S]{0,220}actorUserId:\\s*req\\.auth\\.userId`));
   }
-  assert.match(service, /retryActionDelivery\(\{ agencyId, actorUserId, deliveryId \}\)[\s\S]*requireLiveAutomationManagementActor\(\{ agencyId, actorUserId, creatorId: delivery\.creatorId \}\)[\s\S]*\$transaction\(async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
-  assert.match(service, /cancelActionDelivery\(\{ agencyId, actorUserId[\s\S]*\$transaction\(async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
-  assert.match(service, /releaseClaimByAdmin\(\{ agencyId, actorUserId[\s\S]*\$transaction\(async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
+  assert.match(service, /retryActionDelivery\(\{ agencyId, actorUserId, deliveryId \}\)[\s\S]*requireLiveAutomationManagementActor\(\{ agencyId, actorUserId, creatorId: delivery\.creatorId \}\)[\s\S]*runDbTransaction\(prisma, async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
+  assert.match(service, /cancelActionDelivery\(\{ agencyId, actorUserId[\s\S]*runDbTransaction\(prisma, async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
+  assert.match(service, /releaseClaimByAdmin\(\{ agencyId, actorUserId[\s\S]*runDbTransaction\(prisma, async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
   assert.match(service, /retrySafeFailures\(\{ agencyId, actorUserId[\s\S]*allowedCreatorScope\([\s\S]*creatorId:\s*\{ in: scope\.creatorIds/);
 });
 

@@ -32,7 +32,7 @@ function identityDb({ contact = "@model", updateCount = 1 } = {}) {
         return { ...creator };
       },
     },
-    async $transaction(work) { return work(db); },
+    async $transaction(work) { return work({ ...(db), $transaction: undefined }); },
     _updates: updates,
   };
   return db;

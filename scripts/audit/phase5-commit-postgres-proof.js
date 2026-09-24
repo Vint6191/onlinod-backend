@@ -162,4 +162,5 @@ async function main() {
   }
 }
 
-main().catch((error) => { console.error(error); process.exitCode = 1; });
+const watchdog = setTimeout(() => { console.error("PHASE5_COMMIT_PROOF_DEADLINE_EXCEEDED"); process.exit(1); }, 180000);
+main().then(() => clearTimeout(watchdog), error => { clearTimeout(watchdog); console.error(error); process.exitCode = 1; });

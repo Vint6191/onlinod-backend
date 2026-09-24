@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 const { randomUUID } = require("node:crypto");
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
@@ -33,7 +35,7 @@ async function contentAudit({tx,agencyId,userId,creatorId,scriptId,action,metada
 }
 async function withMessageLibraryMutation({db,agencyId,creatorId,actorMember,userId,scriptId,action,manager=true,expectedUpdatedAt=null,work}) {
   if(!actorMember || !userId) throw fail("MESSAGE_LIBRARY_ACTOR_REQUIRED","Current membership is required",401);
-  return db.$transaction(async tx=>{
+  return runDbTransaction(db, async tx=>{
     await lockContentScope({tx,agencyId,creatorId,actorMember,userId,manager});
     const existing=await lockMessageLibraryScript({tx,agencyId,creatorId,scriptId,expectedUpdatedAt,includeBlocks:action === "usage"});
     const now=await dbAuthorityNow({db:tx});
@@ -76,7 +78,7 @@ async function changeMessageLibraryLifecycle({tx,existing,now,action,userId=null
 // Durable deleting state is the cleanup intent. Every worker rechecks it under
 // the same parent lock; deleting the final parent never cascades a large history.
 async function cleanupMessageLibraryScript({db,agencyId,creatorId,scriptId,batchSize=200,actorMember=null,userId=null}) {
-  return db.$transaction(async tx=>{
+  return runDbTransaction(db, async tx=>{
     await lockContentScope({tx,agencyId,creatorId,actorMember,userId});
     let row=await lockMessageLibraryScript({tx,agencyId,creatorId,scriptId});
     if(!row) return {scriptsDeleted:0,blocksDeleted:0,hasMore:false};

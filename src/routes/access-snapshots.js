@@ -1,3 +1,5 @@
+
+const { runDbTransaction } = require("../services/db-transaction-service");
 const express = require("express");
 
 const prisma = require("../prisma");
@@ -150,7 +152,7 @@ router.post("/access-snapshots/:id/revoke", async (req, res) => {
     });
 
     const retiredAt = new Date();
-    const updated = await prisma.$transaction(async (tx) => {
+    const updated = await runDbTransaction(prisma, async (tx) => {
       await cryptoShredLegacyAccessSnapshotById({
         db: tx,
         agencyId: req.auth.agencyId,

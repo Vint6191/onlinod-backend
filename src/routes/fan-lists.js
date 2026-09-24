@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("../services/db-transaction-service");
+
 
 const express = require("express");
 const prisma = require("../prisma");
@@ -108,7 +110,7 @@ router.put("/:id/members", async (req, res) => {
         createdByUserId: req.auth.userId,
       };
     }).filter(Boolean);
-    await prisma.$transaction(async (tx) => {
+    await runDbTransaction(prisma, async (tx) => {
       await tx.fanListMember.deleteMany({ where: { listId: existing.id } });
       if (members.length) await tx.fanListMember.createMany({ data: members, skipDuplicates: true });
       await tx.fanList.update({ where: { id: existing.id }, data: { updatedAt: new Date() } });

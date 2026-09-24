@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -60,7 +62,7 @@ test("desktop bootstrap is user-scoped, batch, metadata-only and carries accessE
     id: "member-1", userId: "user-1", role: "OWNER", roleKey: "owner", assignedCreators: null, accessEpoch: 12,
   });
   const result = await buildDesktopBootstrap({
-    db: fx.db,
+    db: commitDatabaseFixture(fx.db),
     agencyId: "agency-1",
     userId: "user-1",
     deviceId: "device-a",
@@ -96,7 +98,7 @@ test("desktop bootstrap filters narrow member scope on the server, not on Deskto
     id: "member-2", userId: "user-2", role: "OPERATOR", roleKey: "chatter", assignedCreators: { creatorIds: ["b", "missing"] }, accessEpoch: 9,
   });
   const result = await buildDesktopBootstrap({
-    db: fx.db,
+    db: commitDatabaseFixture(fx.db),
     agencyId: "agency-1",
     userId: "user-2",
     deviceId: "device-b",
@@ -128,7 +130,7 @@ test("desktop bootstrap rejects stale middleware membership and returns the fres
     },
   };
   const result = await buildDesktopBootstrap({
-    db, agencyId: "agency-1", userId: "user-3", deviceId: "device-c",
+    db: commitDatabaseFixture(db), agencyId: "agency-1", userId: "user-3", deviceId: "device-c",
     member: { id: "member-3", userId: "user-3", role: "OPERATOR", roleKey: "chatter", assignedCreators: { creatorIds: ["a", "b"] }, accessEpoch: 9 },
   });
   assert.equal(result.accessEpoch, 10);
@@ -152,7 +154,7 @@ test("desktop bootstrap never publishes a new accessEpoch with permissions from 
     creatorAccount: { async findMany() { return rows; } },
   };
   const result = await buildDesktopBootstrap({
-    db, agencyId: "agency-1", userId: "user-4", deviceId: "device-d",
+    db: commitDatabaseFixture(db), agencyId: "agency-1", userId: "user-4", deviceId: "device-d",
     member: states[0],
   });
   assert.equal(result.authorization.accessEpoch, 21);
@@ -180,8 +182,8 @@ test("accessEpoch bumps atomically at member and agency scope", async () => {
       updateMany: async (input) => { calls.push(["many", input]); return { count: 3 }; },
     },
   };
-  assert.equal(await bumpMemberAccessEpoch({ db, memberId: "member-1" }), 8);
-  await bumpAgencyAccessEpoch({ db, agencyId: "agency-1" });
+  assert.equal(await bumpMemberAccessEpoch({ db: commitDatabaseFixture(db), memberId: "member-1" }), 8);
+  await bumpAgencyAccessEpoch({ db: commitDatabaseFixture(db), agencyId: "agency-1" });
   assert.deepEqual(calls[0][1].data, { accessEpoch: { increment: 1 } });
   assert.deepEqual(calls[1][1].where, { agencyId: "agency-1", deletedAt: null, deactivatedAt: null });
   assert.deepEqual(calls[1][1].data, { accessEpoch: { increment: 1 } });

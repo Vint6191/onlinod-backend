@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -33,7 +35,7 @@ test("Audit13 proven no-effect pre-wire failure may be retried", () => {
 test("Audit13 commit/control fence is transaction-scoped and agency-keyed", async () => {
   const calls = [];
   const tx = { async $queryRawUnsafe() { throw new Error("void deserialization"); }, async $executeRawUnsafe(sql, ...args) { calls.push({ sql, args }); return 1; } };
-  await lockAutomationWriteCommitFence({ db: tx, agencyId: "agency-1" });
+  await lockAutomationWriteCommitFence({ db: commitDatabaseFixture(tx), agencyId: "agency-1" });
   assert.equal(calls.length, 1);
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);
   assert.deepEqual(calls[0].args, ["onlinod:automation-write-commit:v1", "agency-1"]);
@@ -41,7 +43,10 @@ test("Audit13 commit/control fence is transaction-scoped and agency-keyed", asyn
 
 test("Audit13 nested lifecycle work reuses an existing transaction client", async () => {
   const tx = { marker: "tx" };
-  const result = await runDbTransaction(tx, async (db) => db.marker);
+  const root = commitDatabaseFixture(tx);
+  const result = await runDbTransaction(root, issued => runDbTransaction(issued, async db => {
+    assert.equal(db, issued); assert.notEqual(db, root); return db.marker;
+  }));
   assert.equal(result, "tx");
 });
 

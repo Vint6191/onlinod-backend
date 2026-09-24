@@ -150,7 +150,7 @@ test("manual AccessSnapshot revoke delegates timestamp-safe crypto retirement to
   const source = fs.readFileSync(path.join(__dirname, "../routes/access-snapshots.js"), "utf8");
   const revokeStart = source.indexOf('router.post("/access-snapshots/:id/revoke"');
   const revokeBlock = source.slice(revokeStart);
-  assert.match(revokeBlock, /prisma\.\$transaction/);
+  assert.match(revokeBlock, /runDbTransaction\(prisma,/);
   assert.match(revokeBlock, /cryptoShredLegacyAccessSnapshotById/);
   assert.doesNotMatch(revokeBlock, /snapshot\.payloadRetiredAt \|\| snapshot\.revokedAt/);
 });

@@ -1,3 +1,4 @@
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 "use strict";
 
 const test = require("node:test");
@@ -1245,7 +1246,7 @@ test("campaign fan value current snapshot stores fresh OF subscriber totals and 
     },
   };
   const result = await ingestCampaignFanValueChunk({
-    db, job: campaignJob("fan-value-run", "2026-08-08T18:00:00.000Z"), deviceId: "device-1",
+    db: commitDatabaseFixture(db), job: campaignJob("fan-value-run", "2026-08-08T18:00:00.000Z"), deviceId: "device-1",
     chunk: {
       kind: "campaign_fan_value",
       schemaVersion: 4,
@@ -1304,7 +1305,7 @@ test("campaign fan value batch applies 20 current snapshots with constant bounde
     },
   };
   const result = await ingestCampaignFanValuesBatchChunk({
-    db, job: campaignJob("batch-run", "2026-08-08T18:00:00.000Z"), deviceId: "device-1",
+    db: commitDatabaseFixture(db), job: campaignJob("batch-run", "2026-08-08T18:00:00.000Z"), deviceId: "device-1",
     chunk: {
       kind: "campaign_fan_values_batch",
       schemaVersion: 4, collectorVersion: "campaigns-v6",
@@ -1388,14 +1389,14 @@ test("campaign fan value source is server-assigned and fan scope is proven by cu
     source: "AUTOMATION_WRITE_RESULT",
   };
   const scopedJob = { ...campaignJob("scope-run", "2026-08-08T18:00:00.000Z"), id: "job-scope" };
-  const accepted = await ingestCampaignFanValueChunk({ db, job: scopedJob, deviceId: "device-1", chunk: baseChunk });
+  const accepted = await ingestCampaignFanValueChunk({ db: commitDatabaseFixture(db), job: scopedJob, deviceId: "device-1", chunk: baseChunk });
   assert.equal(accepted.available, true);
   assert.ok(sources.length >= 1);
   assert.ok(sources.every((source) => source === "CAMPAIGN_CLAIMER"), `unexpected source classes: ${sources.join(",")}`);
 
   await assert.rejects(
     ingestCampaignFanValueChunk({
-      db,
+      db: commitDatabaseFixture(db),
       job: scopedJob,
       deviceId: "device-1",
       chunk: { ...baseChunk, fanOnlyFansUserId: "999999", batchKey: "run:scope-run:fan-value:wrong" },
@@ -1524,7 +1525,7 @@ test("ledger overview preserves nullable earnings categories and counts only com
     },
     $queryRaw: async () => [{ campaignId: "campaign-1", totalRevenueCents: 1000n, salesRevenueCents: 700n, tipsRevenueCents: 300n, subscriptionRevenueCents: 0n, transactionsCount: 2n }],
   };
-  const result = await readCreatorLedgerOverview({ db, creatorId: "creator-1", rangeKey: "7d", now: new Date("2026-08-06T12:00:00.000Z") });
+  const result = await readCreatorLedgerOverview({ db: commitDatabaseFixture(db), creatorId: "creator-1", rangeKey: "7d", now: new Date("2026-08-06T12:00:00.000Z") });
   assert.equal(result.totals.totalCents, 1000);
   assert.equal(result.totals.subscriptionsCents, null);
   assert.equal(result.verification.earningsDays, 1);
@@ -1584,7 +1585,7 @@ test("current overview ledger mode does not read dormant server message authorit
     $queryRaw: async () => [],
   };
   const result = await readCreatorLedgerOverview({
-    db,
+    db: commitDatabaseFixture(db),
     creatorId: "creator-1",
     rangeKey: "7d",
     now: new Date("2026-08-06T12:00:00.000Z"),
@@ -1632,7 +1633,7 @@ test("today earnings are official only when the row and in-progress proof both e
     },
     $queryRaw: async () => [],
   };
-  const result = await readCreatorLedgerOverview({ db, creatorId: "creator-1", rangeKey: "24h", now: new Date("2026-08-06T12:00:00.000Z") });
+  const result = await readCreatorLedgerOverview({ db: commitDatabaseFixture(db), creatorId: "creator-1", rangeKey: "24h", now: new Date("2026-08-06T12:00:00.000Z") });
   assert.equal(result.verification.officialEarnings, true);
   assert.equal(result.verification.earningsDays, 1);
   assert.equal(result.totals.totalCents, 500);
@@ -1648,12 +1649,12 @@ test("campaign fan reader scopes the campaign to the creator and pages concrete 
       ],
     },
   };
-  const result = await readCampaignFans({ db, creatorId: "creator-1", campaignId: "campaign-1", limit: 1, offset: 0 });
+  const result = await readCampaignFans({ db: commitDatabaseFixture(db), creatorId: "creator-1", campaignId: "campaign-1", limit: 1, offset: 0 });
   assert.equal(result.campaign.name, "Link A");
   assert.equal(result.fans.length, 1);
   assert.equal(result.fans[0].fan.onlyFansUserId, "123");
   assert.equal(result.pagination.hasMore, true);
-  assert.equal(await readCampaignFans({ db, creatorId: "other", campaignId: "campaign-1" }), null);
+  assert.equal(await readCampaignFans({ db: commitDatabaseFixture(db), creatorId: "other", campaignId: "campaign-1" }), null);
 });
 
 test("chunk ingesters run inside the fenced Prisma transaction client without nesting transactions", async () => {
@@ -1662,8 +1663,8 @@ test("chunk ingesters run inside the fenced Prisma transaction client without ne
     findUnique: async () => null,
     upsert: async (args) => args.create,
   };
-  const earnings = await ingestEarningsChunk({
-    db: earningsHarness.tx,
+  const earnings = await require("./db-transaction-service").runDbTransaction(commitDatabaseFixture(transactional(earningsHarness.tx)), tx => ingestEarningsChunk({
+    db: tx,
     job,
     deviceId: "device-1",
     chunk: {
@@ -1676,7 +1677,7 @@ test("chunk ingesters run inside the fenced Prisma transaction client without ne
       scannerRejected: 0,
       rows: [{ date: "2026-08-05", sourceTimezone: "UTC", totalCents: 100, currency: "USD" }],
     },
-  });
+  }));
   assert.equal(earnings.inserted, 1);
 
   const campaignHarness = batchHarness();
@@ -1684,8 +1685,8 @@ test("chunk ingesters run inside the fenced Prisma transaction client without ne
     findUnique: async () => null,
     upsert: async (args) => args.create,
   };
-  const campaigns = await ingestCampaignChunk({
-    db: campaignHarness.tx,
+  const campaigns = await require("./db-transaction-service").runDbTransaction(commitDatabaseFixture(transactional(campaignHarness.tx)), tx => ingestCampaignChunk({
+    db: tx,
     job: campaignJob("run-fenced-campaigns"),
     deviceId: "device-1",
     chunk: {
@@ -1699,7 +1700,7 @@ test("chunk ingesters run inside the fenced Prisma transaction client without ne
       scannerRejected: 0,
       campaigns: [{ id: "campaign-1", name: "Campaign one", is_active: true }],
     },
-  });
+  }));
   assert.equal(campaigns.inserted, 1);
 });
 
@@ -1829,6 +1830,7 @@ test("campaign ingest takes a transaction-scoped advisory lock before reading ge
       campaigns: [],
     },
   });
+  for (let i = calls.length - 1; i >= 0; i--) if (calls[i][0].includes("set_config('lock_timeout'")) calls.splice(i, 1);
   assert.equal(calls.length, 1);
   assert.match(calls[0][0], /pg_advisory_xact_lock/);
   assert.equal(calls[0][1], "analytics-collector:campaigns:creator-1");
@@ -1860,7 +1862,7 @@ test("coverage reader pages on the server and reports the real total", async () 
       count: async () => 7,
     },
   };
-  const page = await readCreatorCoverage({ db, creatorId: "creator-1", rangeKey: "7d", limit: 1, offset: 2, now: new Date("2026-08-06T12:00:00.000Z") });
+  const page = await readCreatorCoverage({ db: commitDatabaseFixture(db), creatorId: "creator-1", rangeKey: "7d", limit: 1, offset: 2, now: new Date("2026-08-06T12:00:00.000Z") });
   assert.equal(calls[0].skip, 2);
   assert.equal(calls[0].take, 2);
   assert.equal(page.rows.length, 1);
@@ -1892,6 +1894,7 @@ test("earnings ingest serializes writers and never lets an older observation ove
       rows: [{ date: "2026-08-05", sourceTimezone: "UTC", totalCents: 100, currency: "USD" }],
     },
   });
+  for (let i = locks.length - 1; i >= 0; i--) if (locks[i].sql.includes("set_config('lock_timeout'")) locks.splice(i, 1);
   assert.equal(locks.length, 1);
   assert.match(locks[0].sql, /pg_advisory_xact_lock/);
   assert.equal(writes, 0);
@@ -1947,6 +1950,7 @@ test("an incomplete message ledger cannot downgrade a complete day from another 
     observedAt: "2026-08-06T12:00:00.000Z",
     rows: [{ date: "2026-08-05", sourceTimezone: "UTC", incomingMessages: 1, outgoingMessages: 1, totalMessages: 2, uniqueDialogs: 1, uniqueIncomingFans: 1, uniqueOutgoingFans: 1 }],
   });
+  for (let i = locks.length - 1; i >= 0; i--) if (locks[i].sql.includes("set_config('lock_timeout'")) locks.splice(i, 1);
   assert.equal(locks.length, 1);
   assert.equal(writes, 0);
   assert.equal(result.unchanged, 1);

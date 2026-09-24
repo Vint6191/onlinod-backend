@@ -94,7 +94,7 @@ function makeDb() {
       return { count };
     },
   };
-  const db = { domainWorkItem: model, phase2DependencyState: dependencyModel, async $transaction(work) { return work(db); } };
+  const db = { domainWorkItem: model, phase2DependencyState: dependencyModel, async $transaction(work) { return work({ ...(db), $transaction: undefined }); } };
   return { db, rows, dependencies, dependencyModel };
 }
 
@@ -115,7 +115,7 @@ test("A37-R2: every claim settlement rejects ownership expiring while its row lo
       claimFence: 1n, claimedRevision: 1n, requestedRevision: 1n,
       activeGeneration: authority.DOMAIN_WORK_GENERATION, leaseUntil: new Date(before.getTime() + 1000) };
     const db = {
-      async $transaction(work) { return work(db); },
+      async $transaction(work) { return work({ ...(db), $transaction: undefined }); },
       domainWorkItem: { async updateMany() { throw new Error("Expired ownership attempted a mutation"); } },
       async $queryRawUnsafe(sql) {
         calls.push(sql);

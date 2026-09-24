@@ -1,4 +1,5 @@
 "use strict";
+const { classifyCommitConflict } = require("../services/db-commit-kernel");
 
 const { setAdminBillingPolicy, setAdminBillingHold, setAdminEntitlement } = require("../services/admin-billing-access-command-service");
 const { archiveAdminDeliveries } = require("../services/admin-delivery-archive-command-service");
@@ -10,7 +11,7 @@ const { setAdminPricing } = require("../services/admin-pricing-command-service")
 const { createAdminIdentity, patchAdminIdentity, resetAdminPassword } = require("../services/admin-identity-command-service");
 
 function sendCommandError(res, error) {
-  if (error?.code === "P2034") return res.status(409).json({ ok:false, code:"TEAM_CONTROL_PLANE_SERIALIZATION_CONFLICT", error:"State changed concurrently; retry with the same command identity" });
+  if (classifyCommitConflict(error)) return res.status(409).json({ ok:false, code:"TEAM_CONTROL_PLANE_SERIALIZATION_CONFLICT", error:"State changed concurrently; retry with the same command identity" });
   if (error?.issues) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues[0]?.message || "Invalid command" });
   const status = Number(error?.status) || 500;
   if (status >= 500) console.error("[admin-command] failed:", error?.code || "INTERNAL_ERROR");

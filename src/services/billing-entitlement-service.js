@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 const { enableCommercialPricingWrite } = require("./billing-commercial-policy-service");
 
 const prisma = require("../prisma");
@@ -219,7 +221,7 @@ function fallbackComponentState({ previousSource, previousPriceCents, previousVa
 
 async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled, db = null }) {
   const client = db || prisma;
-  return client.$transaction(async (tx) => {
+  return runDbTransaction(client, async (tx) => {
     // Read only enough to choose the agency lock, then re-read authoritative
     // order state after acquiring it. Provider callbacks can move PAID ->
     // REFUNDED concurrently; never activate from a stale pre-lock snapshot.
@@ -363,7 +365,7 @@ async function refundOrderEntitlements({ order, db = null }) {
   const agencyId = String(order?.agencyId || "").trim();
   if (!orderId || !agencyId) return { downgraded: false, reason: "ORDER_NOT_FOUND" };
   const client = db || prisma;
-  return client.$transaction(async (tx) => {
+  return runDbTransaction(client, async (tx) => {
     // The order object passed by provider processing may predate a concurrent
     // activation. Serialize with activation and re-read after the lock so a
     // REFUNDED event can never miss an activation that just committed.

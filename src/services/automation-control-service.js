@@ -471,7 +471,7 @@ async function cancelAutomationJobsForControl({ agencyId, creatorId = null, modu
 
 async function setAutomationControl({ agencyId, userId, scope, creatorId = null, moduleKey = null, enabled, settings, db = prisma, _commitFenceHeld = false }) {
   if (!_commitFenceHeld && typeof db.$transaction === "function") {
-    return db.$transaction((tx) => setAutomationControl({
+    return runDbTransaction(db, (tx) => setAutomationControl({
       agencyId, userId, scope, creatorId, moduleKey, enabled, settings, db: tx, _commitFenceHeld: true,
     }), { timeout: 30_000 });
   }

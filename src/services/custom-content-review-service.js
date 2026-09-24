@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { audit } = require("./audit-service");
 const { allowedCreatorScope } = require("../middleware/automation-permissions");
@@ -609,9 +611,7 @@ async function reviewCustomContentSubmission({ agencyId, member, submissionId, e
     };
   };
 
-  const outcome = typeof client.$transaction === "function"
-    ? await client.$transaction(applyReview)
-    : await applyReview(client);
+  const outcome = await runDbTransaction(client, applyReview);
 
   if (outcome.idempotent) return { ok: true, idempotent: true, item: outcome.item };
 

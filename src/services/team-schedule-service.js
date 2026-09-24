@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient } = require("./range-service");
@@ -706,7 +708,7 @@ async function createTeamShift({ agencyId, actorUserId, actorMemberId, actorMemb
   const note = clean(input?.note, 500);
   const admittedActor = actorFence(actorMember, actorMemberId, actorUserId);
   const requestedCreatorIds = uniqueIds(input?.creatorIds, 100);
-  const row = await db.$transaction(async (tx) => {
+  const row = await runDbTransaction(db, async (tx) => {
     const commit = await assertManagementCommitAuthority({
       tx, agencyId, actorMember: admittedActor, permissionKey: "workspace.manage_schedule", creatorIds: requestedCreatorIds,
     });
@@ -735,7 +737,7 @@ async function updateTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, 
   const id = clean(shiftId, 180);
   const expected = requiredRevision(expectedRevision);
   const admittedActor = actorFence(actorMember, actorMemberId, actorUserId);
-  const mutation = await db.$transaction(async (tx) => {
+  const mutation = await runDbTransaction(db, async (tx) => {
     await lockAgencyLifecycle({ tx, agencyId });
     if (require("./product-billing-context-service").inProductBilling(agencyId)) {
       const observed = await tx.teamShift.findFirst({ where: { id, agencyId }, include: { creators: true } });
@@ -794,7 +796,7 @@ async function cancelTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, 
   const admittedActor = actorFence(actorMember, actorMemberId, actorUserId);
   const cancellationReason = clean(reason, 500);
   const now = new Date();
-  const mutation = await db.$transaction(async (tx) => {
+  const mutation = await runDbTransaction(db, async (tx) => {
     await lockAgencyLifecycle({ tx, agencyId });
     if (require("./product-billing-context-service").inProductBilling(agencyId)) {
       const observed = await tx.teamShift.findFirst({ where: { id, agencyId }, include: { creators: true } });

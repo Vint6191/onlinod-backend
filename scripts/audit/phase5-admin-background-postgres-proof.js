@@ -271,7 +271,7 @@ async function main() {
       assert.equal((await compactAutomationDeliveries({ db: proxy, olderThan, commitGuard })).archived, 1); assert.equal(attempts - before, 2);
       assert.equal((await db.automationMonthlyAggregate.findFirst({ where: { creatorId: s.creator.id } })).total, 1);
     });
-    const report = { ok: true, engine: "PGlite PostgreSQL WASM + TCP + Prisma 5.22", migrations: 259, cases: cases.length,
+    const report = { ok: true, engine: "PGlite PostgreSQL WASM + TCP + Prisma 5.22", migrations: fs.readdirSync(path.join(root, "prisma/migrations")).filter(name => fs.existsSync(path.join(root, "prisma/migrations", name, "migration.sql"))).length, cases: cases.length,
       limits: ["Single physical SQL connection; no native PostgreSQL contention or multi-replica load proof", "Clock advancement is injected at production query boundaries; not an OS clock or live wait", "No production database, Render restart, historical notification backfill or Desktop LocalAI validation"], results: cases };
     const output = process.env.PHASE5_PROOF_OUTPUT;
     if (output) fs.writeFileSync(output, JSON.stringify(report, null, 2) + "\n");

@@ -31,7 +31,7 @@ function productionClaimDb(now) {
     },
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
-    async $transaction(work) { return work(db); },
+    async $transaction(work) { return work({ ...(db), $transaction: undefined }); },
     async $queryRawUnsafe(statement, ...params) {
       const text = String(statement);
       sql.push(text);
@@ -93,7 +93,7 @@ test("A36 broad member scope derives the only claim tenant from the fenced membe
         return { generation: authority.DOMAIN_WORK_CLAIM_TOPOLOGY_ID, activationState: "ACTIVE", revision: 1n };
       },
     },
-    async $transaction(work) { return work(db); },
+    async $transaction(work) { return work({ ...(db), $transaction: undefined }); },
     async $queryRawUnsafe(statement, ...params) {
       const text = String(statement);
       sql.push(text);
@@ -141,7 +141,7 @@ test("A36 physical fallback claims one DWI then revision-CAS reconciles its loca
     phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; } },
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
-    async $transaction(work) { return work(db); },
+    async $transaction(work) { return work({ ...(db), $transaction: undefined }); },
     async $queryRawUnsafe(statement, ...params) {
       const text = String(statement); sql.push(text);
       const authorization = claimAuthorizationRows(text, params);
@@ -201,7 +201,7 @@ test("A36 current partition candidate is admitted after separate Agency/shard re
     phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; } },
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
-    async $transaction(work) { return work(db); },
+    async $transaction(work) { return work({ ...(db), $transaction: undefined }); },
     async $queryRawUnsafe(statement, ...params) {
       const text = String(statement); sql.push(text);
       const authorization = claimAuthorizationRows(text, params);
@@ -256,7 +256,7 @@ test("A36 catalog miss claims one physical DWI and repairs bounded locators with
     phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; } },
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
-    async $transaction(work) { return work(db); },
+    async $transaction(work) { return work({ ...(db), $transaction: undefined }); },
     async $queryRawUnsafe(statement, ...params) {
       const text = String(statement); sql.push(text);
       const authorization = claimAuthorizationRows(text, params);

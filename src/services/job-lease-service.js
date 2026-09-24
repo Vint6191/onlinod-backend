@@ -1,4 +1,5 @@
 "use strict";
+const { notificationCommittedPageProof } = require("./notification-page-receipt-service");
 
 const { isDeepStrictEqual } = require("node:util");
 
@@ -448,34 +449,6 @@ function notificationScannerSuccessful(job, result) {
     const row = object(coverage[type]);
     return row.status === "complete" && Number(row.rejected || 0) === 0;
   });
-}
-async function notificationCommittedPageProof(db, job, result) {
-  // The Desktop owns provider traversal/provenance, but it cannot be the proof
-  // authority for canonical acceptance. Every non-empty page is already stored
-  // as a backend AnalyticsIngestBatch by /progress. Verify those receipts before
-  // advancing lastCatchupVerifiedAt on the fast completion path.
-  if (!db?.analyticsIngestBatch?.findMany) return { verified: true, reason: "delegate_unavailable" };
-  const scanRunId = String(result?.scanRunId || "").trim();
-  const expectedRows = Number(result?.totalAcceptedEvents);
-  if (!scanRunId || !Number.isInteger(expectedRows) || expectedRows < 0) {
-    return { verified: false, reason: "completion_fact_count_missing" };
-  }
-  const rows = await db.analyticsIngestBatch.findMany({
-    where: { sourceJobId: job.id, dataType: "NOTIFICATIONS" },
-    select: { idempotencyKey: true, status: true, receivedRows: true, rejectedRows: true },
-  });
-  const marker = `:run:${scanRunId}:page:`;
-  const current = (rows || []).filter((row) => String(row?.idempotencyKey || "").includes(marker));
-  const receivedRows = current.reduce((sum, row) => sum + Math.max(0, Number(row?.receivedRows || 0)), 0);
-  const receiptsClean = current.every((row) => String(row?.status || "").toUpperCase() === "COMMITTED"
-    && Number(row?.rejectedRows || 0) === 0);
-  return {
-    verified: receiptsClean && receivedRows === expectedRows,
-    reason: !receiptsClean ? "backend_page_receipt_partial" : receivedRows !== expectedRows ? "backend_page_receipt_count_mismatch" : "verified",
-    expectedRows,
-    receivedRows,
-    batches: current.length,
-  };
 }
 async function notificationFullIsRedundant(job, db = prisma, now = new Date()) {
   if (job?.jobKey !== "catchup_notifications_scan") return false;
@@ -1275,126 +1248,43 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       return { job: { id: job.id, status: fast.status, retryAt: fast.retryAt }, sideEffect: fast.sideEffect };
     }
 
-    // Full/legacy notification completion still reserves ownership before its
-    // durable verification projection. Only the bounded v4+ catch-up path above
-    // is allowed to detach compatibility work from the lease.
-    // Reserve completion ownership before any ledger/compatibility side effect.
-    // The compatibility projection can touch legacy tip/subscription ledgers,
-    // so keep the fenced completion lease at the maximum supported duration.
-    // Incrementing leaseRevision is the fence: only one concurrent completion
-    // request can cross it. If the process dies after writing facts, the job is
-    // safely reclaimed later and the notification ingest is idempotent by jobId.
-    const completionLeaseRevision = leaseRevision + 1;
-    const reserved = await phaseCommit(async (tx) => tx.jobInstance.updateMany({
-      where: fenceWhere,
-      data: {
-        leaseRevision: { increment: 1 },
-        leaseUntil: new Date(now.getTime() + MAX_LEASE_MS),
-        lastProgressAt: now,
-      },
-    }), { reserved: false });
-    if (!reserved.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before notification completion");
-
-    const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });
-    const completionFence = {
-      id: job.id,
-      status: "CLAIMED",
-      claimedByDeviceId: deviceId,
-      leaseTokenHash: hashToken(leaseToken),
-      leaseRevision: completionLeaseRevision,
-    };
-    if (sideEffect?.ok !== true) {
-      const existingParams = object(job.params);
-      // Creator Analytics notification scans are manual during development.
-      // Reaching hasMore=false with rejected/ignored facts must stop and expose
-      // the PARTIAL result to the inspector; never silently schedule another
-      // full repair pass behind the operator's back.
-      if (existingParams.manualNotificationScan === true && sideEffect?.sourceTraversalComplete === true) {
-        const partial = await phaseCommit(async (tx) => tx.jobInstance.updateMany({
-          where: completionFence,
-          data: {
-            status: "DONE",
-            completedAt: now,
-            claimedAt: null,
-            claimedByDeviceId: null,
-            leaseUntil: null,
-            leaseTokenHash: null,
-            continuation: null,
-            workId: null,
-            result: { ...(result || {}), completionSideEffect: sideEffect || null },
-            lastError: "notification_scan_partial",
-            progress: { percent: 100, message: "notification scan completed with rejected facts" },
-          },
-        }), { reserved: true });
-        if (!partial.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification manual completion fence was lost");
-        // Manual scans intentionally stop at the inspected PARTIAL outcome.
-        // Do not rewrite the durable collector state to FAILED/quarantined: the
-        // operator asked for a one-shot inspection, not an automatic retry lane.
-        return { job: { id: job.id, status: "DONE" }, sideEffect };
-      }
-      const requestedTypes = Array.isArray(sideEffect?.summary?.requestedTypes)
-        ? sideEffect.summary.requestedTypes.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean)
-        : Array.isArray(existingParams.types) ? existingParams.types : [];
-      const persistedCoverage = object(sideEffect?.summary?.collectionCoverageByType);
-      const partialTypes = requestedTypes.filter((type) => persistedCoverage[type] !== "complete");
-      // Current notification collection restarts a failed/partial type from the
-      // durable SyncState frontier/known-ID boundary. The old resumeCursors path
-      // depended on per-day AnalyticsCoverage rows and was never consumed by the
-      // v8 Desktop collector. Keep retry semantics explicit and bounded instead.
-      const attempts = Number(job.attempts || 0) + 1;
-      const terminal = attempts >= MAX_ATTEMPTS;
-      const retryAt = terminal ? null : new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
-      const repairParams = {
-        ...existingParams,
-        ...(partialTypes.length ? { types: partialTypes } : {}),
-      };
+    // Full scans share the durable consequence lane. Final canonical proof,
+    // SyncState, retry/manual outcome and intent commit atomically; no full
+    // receipt history traversal or automation execution inside this command.
+    const completed = await phaseCommit(async (tx) => {
+      const sideEffect = await applyJobResult({ db: tx, job, deviceId, userId, result: result || {} });
+      const successful = sideEffect?.ok === true;
+      const manualPartial = !successful && job.params?.manualNotificationScan === true
+        && sideEffect?.sourceTraversalComplete === true;
+      const attempts = Number(job.attempts || 0) + (successful || manualPartial ? 0 : 1);
+      const terminal = !successful && !manualPartial && attempts >= MAX_ATTEMPTS;
+      const retryAt = successful || manualPartial || terminal ? null
+        : new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
+      const status = successful || manualPartial ? "DONE" : terminal ? "FAILED" : "SCHEDULED";
+      const repairParams = { ...object(job.params) };
+      const requestedTypes = sideEffect?.summary?.requestedTypes || repairParams.types || [];
+      const partialTypes = requestedTypes.filter(type => sideEffect?.summary?.collectionCoverageByType?.[type] !== "complete");
+      if (partialTypes.length) repairParams.types = partialTypes;
       delete repairParams.resumeCursors;
       delete repairParams.notificationRepairPass;
-      const partial = await phaseCommit(async (tx) => {
-        const updated = await tx.jobInstance.updateMany({
-          where: completionFence,
-          data: terminal ? {
-            status: "FAILED",
-            attempts,
-            completedAt: now,
-            claimedAt: null,
-            claimedByDeviceId: null,
-            leaseUntil: null,
-            leaseTokenHash: null,
-            continuation: null,
-            workId: null,
-            result: { ...(result || {}), completionSideEffect: sideEffect || null },
-            params: repairParams,
-            lastError: "notification_scan_partial",
-          } : {
-            status: "SCHEDULED",
-            attempts,
-            nextRunAt: retryAt,
-            completedAt: null,
-            claimedAt: null,
-            claimedByDeviceId: null,
-            leaseUntil: null,
-            leaseTokenHash: null,
-            continuation: null,
-            workId: null,
-            result: { ...(result || {}), completionSideEffect: sideEffect || null },
-            params: repairParams,
-            lastError: "notification_scan_partial",
-            progress: { percent: 0, message: "notification scan scheduled for repair" },
-          },
-        });
-        if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification partial-completion fence was lost");
-        await recordJobFailure({
-          db: tx, job, error: `${job.jobKey}_partial`, terminal, retryAfterAt: retryAt,
-        });
-        return updated;
-      }, { reserved: true, profile: "JOB_COMPLETION" });
-      return { job: { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", retryAt }, sideEffect };
-    }
-    const completed = await phaseCommit(async (tx) => tx.jobInstance.updateMany({ where: completionFence, data: completionData }), { reserved: true });
-    if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification completion fence was lost");
-    await maybeAdvanceCreatorAnalyticsInitialSync(job, sideEffect);
-    return { job: { id: job.id, status: "DONE" }, sideEffect };
+      const data = successful ? completionData : {
+        status, attempts, params: repairParams, completedAt: status === "SCHEDULED" ? null : now,
+        ...(retryAt ? { nextRunAt: retryAt } : {}),
+        claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null,
+        continuation: null, workId: null,
+        progress: manualPartial ? { percent: 100, message: "notification scan completed with rejected facts" }
+          : { percent: 0, message: "notification scan scheduled for repair" },
+        lastError: "notification_scan_partial",
+      };
+      data.result = { ...(result || {}), completionSideEffect: sideEffect };
+      const updated = await tx.jobInstance.updateMany({ where: fenceWhere, data });
+      if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification completion fence was lost");
+      if (!successful && !manualPartial) await recordJobFailure({ db: tx, job,
+        error: "notification_scan_partial", terminal, retryAfterAt: retryAt });
+      return { job: { id: job.id, status, retryAt }, sideEffect };
+    });
+    if (completed.sideEffect?.ok) await maybeAdvanceCreatorAnalyticsInitialSync(job, completed.sideEffect);
+    return completed;
   }
 
   if (job.jobKey === "vault_unsorted_scan") {

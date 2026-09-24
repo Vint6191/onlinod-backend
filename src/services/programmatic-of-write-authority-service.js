@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const { lockBillingWriteAdmission, assertBillingWriteAdmission } = require("./billing-write-admission-service");
@@ -398,7 +400,7 @@ async function reserveMassLogicalIntent(input) {
   const idempotencyKey = `mass:${creatorId}:${dispatchId}`;
   assertProgrammaticIdempotencyNamespace("MASS_QUEUE_CREATE", config, creatorId, idempotencyKey);
   const now = new Date();
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     await lockBillingWriteAdmission({ db: tx, agencyId });
     const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
@@ -517,7 +519,7 @@ async function acknowledgeMassLogicalIntent(input) {
   if (!agencyId || !userId || !memberId || !creatorId || !deviceId || !dispatchId || !Number.isInteger(accessEpoch) || accessEpoch < 0) {
     throw new ProgrammaticOfWriteAuthorityError("MASS_INTENT_ACK_INVALID", "MASS logical intent acknowledgement identity is required", 400);
   }
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     await assertDevice({ db: tx, agencyId, userId, deviceId });
     await assertLiveActor({ db: tx, agencyId, userId, memberId, accessEpoch, creatorId, permissionKey: "chats.mass_message" });
     const delivery = await tx.automationDelivery.findFirst({ where: { agencyId, creatorId, actionType: "MASS_QUEUE_CREATE", targetId: dispatchId } });
@@ -543,7 +545,7 @@ async function abandonMassLogicalIntentPrecommit(input) {
   if (!agencyId || !userId || !memberId || !creatorId || !deviceId || !dispatchId || !Number.isInteger(accessEpoch) || accessEpoch < 0) {
     throw new ProgrammaticOfWriteAuthorityError("MASS_INTENT_ABANDON_INVALID", "MASS logical intent abandon identity is required", 400);
   }
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId });
@@ -630,7 +632,7 @@ async function reconcileMassRemoteQueueSnapshot(input) {
   if (!Number.isInteger(snapshotItemCount) || snapshotItemCount < 0 || snapshotItemCount !== rawQueueIds.length || liveQueueIds.length !== rawQueueIds.length) {
     throw new ProgrammaticOfWriteAuthorityError("MASS_QUEUE_SNAPSHOT_IDENTITY_INCOMPLETE", "Every provider queue row must have one unique exact queue id before absence may settle lifecycle state", 409);
   }
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId });
@@ -843,7 +845,7 @@ async function readBoundNativeMassCommitGrant(input) {
   if (!agencyId || !creatorId || !deviceId || !userId || !kind || !idempotencyKey || !payloadFingerprint || !requestKey) {
     throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_SETTLEMENT_BINDING_INVALID", "Native MASS settlement binding is incomplete", 500);
   }
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     // Capability minting and exact response settlement share the same agency
     // commit fence. Without this serialization two simultaneous duplicate
     // preflights could both read the same result JSON and last-write-wins one
@@ -914,7 +916,7 @@ async function attachCustomManualSettlementCapability(input) {
   if (!agencyId || !creatorId || !deviceId || !userId || !idempotencyKey || !networkRequestId || !Number.isInteger(expectedRevision) || expectedRevision < 0) {
     throw new ProgrammaticOfWriteAuthorityError("CUSTOM_MANUAL_SETTLEMENT_BINDING_INVALID", "Custom manual settlement binding is incomplete", 500);
   }
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId });
     const delivery = writeId
       ? await tx.automationDelivery.findUnique({ where: { id: writeId } })
@@ -962,7 +964,7 @@ async function settleNativeMassWriteProvenNoEffect(input) {
   if (!isProviderStatusProvenNoEffect(providerStatus)) {
     throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_REJECTION_STATUS_AMBIGUOUS", `HTTP ${providerStatus} does not prove that no provider effect occurred`, 409);
   }
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const initial = await tx.automationDelivery.findUnique({ where: { id: writeId } });
     if (!initial) throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_WRITE_NOT_FOUND", "Native MASS write authority was not found", 404);
     await lockAutomationWriteCommitFence({ db: tx, agencyId: initial.agencyId, creatorId: initial.creatorId });
@@ -1118,14 +1120,14 @@ async function settleNativeMassWriteExact(input, db) {
 }
 
 async function completeNativeMassWrite(input) {
-  return prisma.$transaction(async (tx) => settleNativeMassWriteExact(input, tx), { timeout: 30_000 });
+  return runDbTransaction(prisma, async (tx) => settleNativeMassWriteExact(input, tx), { timeout: 30_000 });
 }
 
 async function completeNativeMassWriteWithSettlementToken(input) {
   const writeId = clean(input.writeId, 180);
   const settlementToken = clean(input.settlementToken, 500);
   if (!writeId || !settlementToken) throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_SETTLEMENT_TOKEN_REQUIRED", "Native MASS settlement capability is required", 401);
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const delivery = await tx.automationDelivery.findUnique({ where: { id: writeId } });
     if (!delivery) throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_WRITE_NOT_FOUND", "Native MASS write authority was not found", 404);
     const expectedHashes = (Array.isArray(object(delivery.result).nativeSettlementTokenHashes) ? object(delivery.result).nativeSettlementTokenHashes : [])
@@ -1181,7 +1183,7 @@ async function reserveProgrammaticWrite(input) {
   const leaseMs = leaseDuration(input.leaseMs);
   const now = new Date();
 
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     await lockBillingWriteAdmission({ db: tx, agencyId });
     // CUSTOM_MANUAL_SEND is part of the durable Custom pipeline lifecycle.
     // Serialize NEW manual-write creation against agency/creator retirement so a
@@ -1420,7 +1422,7 @@ async function requireProgrammaticLease(input, { db = prisma, allowTerminal = fa
 }
 
 async function startProgrammaticWrite(input) {
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     await lockBillingWriteAdmission({ db: tx, agencyId: input.agencyId });
     const delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
     if (delivery.status === "RECONCILE_REQUIRED") return { ok: true, reconciliationRequired: true, delivery: publicDelivery(delivery) };
@@ -1439,7 +1441,7 @@ async function startProgrammaticWrite(input) {
 
 
 async function checkpointProgrammaticWrite(input) {
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
     if (!new Set(["CLAIMED", "RUNNING", "RECONCILE_REQUIRED"]).has(delivery.status)) {
       throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_CHECKPOINT_FORBIDDEN", `Programmatic write status is ${delivery.status}`, 409);
@@ -1455,7 +1457,7 @@ async function checkpointProgrammaticWrite(input) {
 }
 
 async function prepareProgrammaticWrite(input) {
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     await lockBillingWriteAdmission({ db: tx, agencyId: input.agencyId });
     let delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
     await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
@@ -1522,7 +1524,7 @@ async function canRevealTerminalProgrammaticResult(input, delivery, db) {
 }
 
 async function completeProgrammaticWrite(input) {
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const delivery = await requireProgrammaticLease(input, { db: tx, allowTerminal: true, allowCommittedSettlement: true, lock: true });
     if (storedProgrammaticKind(delivery) === "CUSTOM_MANUAL_SEND") {
       throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_PRODUCT_SETTLEMENT_REQUIRED", "CUSTOM_MANUAL_SEND can settle only through canonical Custom delivery/Team-event authority", 409);
@@ -1582,7 +1584,7 @@ async function completeProgrammaticWrite(input) {
 }
 
 async function failProgrammaticWrite(input) {
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const delivery = await requireProgrammaticLease(input, { db: tx, allowCommittedSettlement: true, lock: true });
     const facts = object(input.facts);
     const storedKind = storedProgrammaticKind(delivery);
@@ -1652,7 +1654,7 @@ async function failProgrammaticWrite(input) {
 }
 
 async function reconcileProgrammaticWrite(input) {
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
     if (delivery.status !== "RECONCILE_REQUIRED") {
       throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_RECONCILING", `Programmatic write status is ${delivery.status}`, 409);
@@ -1756,7 +1758,7 @@ async function reconcileProgrammaticWrite(input) {
 }
 
 async function closeProgrammaticWriteUnresolved(input) {
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
     if (delivery.status !== "RECONCILE_REQUIRED") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_RECONCILING", `Programmatic write status is ${delivery.status}`, 409);
     if (input.expectedIdempotencyKey && delivery.idempotencyKey !== input.expectedIdempotencyKey) {
@@ -1792,7 +1794,7 @@ async function closeProgrammaticWriteUnresolved(input) {
 }
 
 async function resolveProgrammaticWriteUnresolvedMatched(input) {
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const writeId = clean(input.writeId, 180);
     const delivery = await tx.automationDelivery.findUnique({ where: { id: writeId || "__missing__" } });
     if (!delivery || delivery.originKind === "AUTOMATION") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_FOUND", "Programmatic write not found", 404);

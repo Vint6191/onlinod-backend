@@ -1,3 +1,5 @@
+
+const { runDbTransaction } = require("../services/db-transaction-service");
 const express = require("express");
 const multer = require("multer");
 const path = require("node:path");
@@ -410,7 +412,7 @@ router.patch("/:id", creatorManagementRequired, creatorAccessRequired, async (re
       return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND", error: "Creator not found" });
     }
 
-    const creator = await prisma.$transaction(async (tx) => {
+    const creator = await runDbTransaction(prisma, async (tx) => {
       const locked = await lockHumanCreatorMutation({
         tx,
         agencyId: req.auth.agencyId,
@@ -492,7 +494,7 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
     }
 
     const removedAt = new Date();
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await runDbTransaction(prisma, async (tx) => {
       const retirement = await retireCreatorWithinTransaction({
         tx,
         agencyId: req.auth.agencyId,
@@ -686,7 +688,7 @@ router.post("/:id/avatar", creatorManagementRequired, creatorAccessRequired, upl
     }
 
     const avatarUrl = `${publicBaseUrl(req)}/uploads/${req.file.filename}`;
-    const creator = await prisma.$transaction(async (tx) => {
+    const creator = await runDbTransaction(prisma, async (tx) => {
       await lockHumanCreatorMutation({
         tx,
         agencyId: req.auth.agencyId,

@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { audit } = require("./audit-service");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
@@ -69,9 +71,7 @@ async function setCustomVaultDestination({ agencyId, member, creatorId: rawCreat
     return { previousFolderId, creator: { id: cid, customsVaultFolderId: nextFolderId } };
   };
 
-  const outcome = typeof client.$transaction === "function"
-    ? await client.$transaction(apply, { timeout: 35_000 })
-    : await apply(client);
+  const outcome = await runDbTransaction(client, apply, { timeout: 35_000 });
   await audit({
     agencyId,
     actorUserId: member?.userId || null,

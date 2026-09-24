@@ -105,22 +105,22 @@ test("Closure2 TransactionClient without $transaction supports SFS completion an
   };
   const { likes, sfs, bumps } = loadPlanningServices({});
 
-  const sfsCompletion = await sfs.applySfsTargetScanCompletion({
+  const sfsCompletion = await withTestCommit(tx, () => sfs.applySfsTargetScanCompletion({
     db: tx,
     job: { id: "sfs-old", agencyId: "agency-1", creatorId: "creator-1", params: { candidateId: "cand-1", candidateGeneration: 1 } },
     result: { posts: [] },
-  });
+  }));
   assert.equal(sfsCompletion.sideEffect, "STALE_NOOP");
 
-  const likesPlan = await likes.planLikes({ db: tx, agencyId: "agency-1", creatorId: "creator-1" });
+  const likesPlan = await withTestCommit(tx, () => likes.planLikes({ db: tx, agencyId: "agency-1", creatorId: "creator-1" }));
   assert.equal(likesPlan.reason, "snapshot_not_ready");
 
   // The SFS daily-limit return happens inside withDbAdvisoryXactLock using this
   // TransactionClient directly; any nested db.$transaction call would throw.
-  const sfsPlan = await sfs.planSfsTargets({ db: tx, agencyId: "agency-1", creatorId: "creator-1" });
+  const sfsPlan = await withTestCommit(tx, () => sfs.planSfsTargets({ db: tx, agencyId: "agency-1", creatorId: "creator-1" }));
   assert.equal(sfsPlan.reason, "daily_limit");
 
-  const bumpsPlan = await bumps.planBumps({ db: tx, agencyId: "agency-1", creatorId: "creator-1" });
+  const bumpsPlan = await withTestCommit(tx, () => bumps.planBumps({ db: tx, agencyId: "agency-1", creatorId: "creator-1" }));
   assert.equal(bumpsPlan.skipped[0].code, "no_template");
   assert.equal(typeof tx.$transaction, "undefined");
 });
@@ -213,7 +213,7 @@ function actionFixture() {
     automationContentCandidate: { updateMany: async () => ({ count: 0 }) },
     followAutomationCandidate: { updateMany: async () => ({ count: 0 }) },
     sfsTargetCandidate: { updateMany: async () => ({ count: 0 }) },
-    $transaction: async (work) => work(db),
+    $transaction: async (work) => work({ ...(db), $transaction: undefined }),
   };
   return { rows, db };
 }
@@ -361,8 +361,8 @@ test("Closure2 Likes S1 completion/failure cannot overwrite current S2", async (
   };
   const { likes } = loadGenerationServices({});
   const job = { id: "likes-S1", agencyId: "agency-1", creatorId: "creator-1", params: { snapshotRunId: "S1", fans: [{ fanId: "fan-1" }] } };
-  const completed = await likes.applyLikesDiscoveryCompletion({ db: tx, job, result: { snapshotRunId: "S1" } });
-  const failed = await likes.recordLikesDiscoveryFailure({ db: tx, job, error: new Error("late S1") });
+  const completed = await withTestCommit(tx, () => likes.applyLikesDiscoveryCompletion({ db: tx, job, result: { snapshotRunId: "S1" } }));
+  const failed = await withTestCommit(tx, () => likes.recordLikesDiscoveryFailure({ db: tx, job, error: new Error("late S1") }));
   assert.equal(completed.sideEffect, "STALE_NOOP");
   assert.equal(failed.sideEffect, "STALE_NOOP");
   assert.equal(writes, 0);
@@ -381,8 +381,8 @@ test("Closure2 delayed SFS generation 1 scan is a no-op after candidate advances
   };
   const { sfs } = loadGenerationServices({});
   const job = { id: "scan-g1", jobKey: "sfs_target_scan", agencyId: "agency-1", creatorId: "creator-1", params: { candidateId: "cand-1", candidateGeneration: 1 } };
-  const result = await sfs.applySfsTargetScanCompletion({ db: tx, job, result: { posts: [{ id: "p1" }] } });
-  const failure = await sfs.recordSfsJobFailure({ db: tx, job, error: "late failure" });
+  const result = await withTestCommit(tx, () => sfs.applySfsTargetScanCompletion({ db: tx, job, result: { posts: [{ id: "p1" }] } }));
+  const failure = await withTestCommit(tx, () => sfs.recordSfsJobFailure({ db: tx, job, error: "late failure" }));
   assert.equal(result.sideEffect, "STALE_NOOP");
   assert.equal(failure.sideEffect, "STALE_NOOP");
   assert.equal(deliveryCreates, 0);
@@ -418,12 +418,12 @@ test("Closure2 delayed Traffic T1 cannot replace a newer T2 projection", async (
     jobInstance: { findMany: async () => [{ id: "T2", result: { scanStartedAt: "2026-08-31T10:02:00.000Z" }, createdAt: new Date("2026-08-31T10:01:00.000Z") }] },
   };
   const service = loadJobResultForTraffic({}, async () => { writes += 1; return { ok: true }; });
-  const result = await service.applyJobResult({
+  const result = await withTestCommit(tx, () => service.applyJobResult({
     db: tx,
     job: { id: "T1", jobKey: "traffic_sources_scan", agencyId: "agency-1", creatorId: "creator-1", createdAt: new Date("2026-08-31T10:00:00.000Z") },
     deviceId: "device-1", userId: "user-1",
     result: { scanStartedAt: "2026-08-31T10:00:30.000Z", sources: [] },
-  });
+  }));
   assert.equal(result.sideEffect, "STALE_NOOP");
   assert.equal(result.newerJobId, "T2");
   assert.equal(writes, 0);
@@ -442,6 +442,7 @@ function commitRaceDb({ moduleKey, targetId, actionType }) {
   const db = {
     $executeRawUnsafe: async (sql, generation) => {
       if (sql === "SELECT pg_advisory_xact_lock_shared(hashtext($1))") { assert.equal(generation, "agency-lifecycle:agency-1"); return 1; }
+      if (sql.includes("set_config('lock_timeout'")) return 1;
       assert.equal(sql, "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)");
       assert.equal(generation, "phase3_fan_consumer_v1_current_bounded");
       currentConsumerPermit = true;
@@ -461,7 +462,7 @@ function commitRaceDb({ moduleKey, targetId, actionType }) {
     automationContentCandidate: { updateMany: async () => ({ count: 0 }) },
     followAutomationCandidate: { updateMany: async () => ({ count: 0 }) },
     sfsTargetCandidate: { updateMany: async () => ({ count: 0 }) },
-    $transaction: async (work) => work(db),
+    $transaction: async (work) => work({ ...(db), $transaction: undefined }),
   };
   return { db, delivery, token };
 }
@@ -589,3 +590,7 @@ test("Audit17 stranded Automation reconciliation terminalizes no-retry after bou
   assert.equal(row.result.outcomeState, "UNRESOLVED_DO_NOT_RETRY");
   assert.equal(row.claimUntil, null);
 });
+
+function withTestCommit(tx, work) {
+  return require("./db-commit-kernel").runRootCommit({ $transaction: fn => fn(tx) }, work, { maxAttempts: 1 });
+}

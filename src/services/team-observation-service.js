@@ -2,8 +2,6 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
-const { projectCanonicalSubscriptionCompatibility, markTrafficFanValueDirty } = require("./traffic-service");
-const { processRuntimeEvents: processBumpRuntimeEvents } = require("./bump-service");
 const { ingestNotificationFacts } = require("./notification-facts-service");
 const { completeNotificationSync, recordNotificationSyncFailure, assertNotificationCollectionResult } = require("./notification-sync-state-service");
 
@@ -47,17 +45,6 @@ function realtimeFrameSampleAt(account, now = new Date()) {
   const ageMs = current.getTime() - frameAt.getTime();
   if (ageMs < -REALTIME_CLOCK_SKEW_MS || ageMs > REALTIME_FRAME_FRESH_MS) return null;
   return frameAt.getTime() > current.getTime() ? current : frameAt;
-}
-
-function amountCents(value) {
-  if (value === null || value === undefined || value === "") return 0;
-  const n = Number(
-    String(value)
-      .replace(/[^0-9.,-]/g, "")
-      .replace(",", ".")
-  );
-  if (!Number.isFinite(n)) return 0;
-  return Math.max(0, Math.round(n));
 }
 
 function amountDollarsToCents(value) {
@@ -296,8 +283,6 @@ function normalizeEvent(payload = {}) {
   return { ...payload, ...extra };
 }
 
-const NOTIFICATION_COMPATIBILITY_PAGE_SIZE = 500;
-const BUMP_COMPATIBILITY_PAGE_SIZE = 200;
 const LEGACY_SUBSCRIPTION_EVENT_TYPES = Object.freeze({
   SUBSCRIBED_FREE: "free_subscribed",
   SUBSCRIBED_PAID: "paid_subscribed",
@@ -379,76 +364,11 @@ function projectSubscriptionProjectionFact(row) {
   };
 }
 
-async function* iterateModelRows({ model, where, select }) {
-  let cursor = null;
-  while (true) {
-    const rows = await model.findMany({
-      where,
-      orderBy: { id: "asc" },
-      take: NOTIFICATION_COMPATIBILITY_PAGE_SIZE,
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
-      select: { id: true, ...select },
-    });
-    for (const row of rows) yield row;
-    if (rows.length < NOTIFICATION_COMPATIBILITY_PAGE_SIZE) break;
-    const nextCursor = rows.at(-1)?.id;
-    if (!nextCursor || nextCursor === cursor) {
-      throw Object.assign(new Error("Notification compatibility pagination cursor stalled"), {
-        code: "NOTIFICATION_COMPATIBILITY_CURSOR_STALLED",
-      });
-    }
-    cursor = nextCursor;
-  }
-}
-
-async function* iterateCanonicalProjectionFacts({ db, job }) {
-  if (db?.creatorSale?.findMany) {
-    const saleRows = iterateModelRows({
-      model: db.creatorSale,
-      where: { creatorId: job.creatorId, sourceJobId: job.id },
-      select: {
-        eventFingerprint: true, externalNotificationId: true, externalTransactionId: true,
-        messageId: true, amountCents: true, currency: true, purchasedAt: true,
-        fanOnlyFansUserIdAtEvent: true,
-        fan: { select: { onlyFansUserId: true } },
-      },
-    });
-    for await (const row of saleRows) yield projectSaleProjectionFact(row);
-  }
-
-  if (db?.creatorTip?.findMany) {
-    const tipRows = iterateModelRows({
-      model: db.creatorTip,
-      where: { creatorId: job.creatorId, sourceJobId: job.id },
-      select: {
-        eventFingerprint: true, externalNotificationId: true, externalTransactionId: true,
-        messageId: true, amountCents: true, currency: true, tippedAt: true,
-        fan: { select: { onlyFansUserId: true, username: true, displayName: true } },
-      },
-    });
-    for await (const row of tipRows) yield projectTipProjectionFact(row);
-  }
-
-  if (db?.creatorSubscriptionEvent?.findMany) {
-    const subscriptionRows = iterateModelRows({
-      model: db.creatorSubscriptionEvent,
-      where: { creatorId: job.creatorId, sourceJobId: job.id },
-      select: {
-        eventFingerprint: true, externalNotificationId: true, externalTransactionId: true,
-        eventType: true, observedPriceCents: true, currency: true, occurredAt: true,
-        fan: { select: { onlyFansUserId: true, username: true, displayName: true } },
-      },
-    });
-    for await (const row of subscriptionRows) yield projectSubscriptionProjectionFact(row);
-  }
-}
-
-async function applyCatchupJobResult({ db = prisma, job, deviceId, userId, result }) {
+async function applyCatchupJobResult({ db = prisma, job, deviceId, result }) {
   const params = job?.params && typeof job.params === "object" ? job.params : {};
   assertNotificationCollectionResult({ job, scanRunId: result?.scanRunId, notificationMode: result?.notificationMode });
   const events = eventList(result);
-  const now = new Date();
-  const bumpSubscriptionEvents = [];
+  const now = await require("./db-time-authority-service").dbAuthorityNow({ db, fallbackNow: new Date() });
   const ledger = await ingestNotificationFacts({
     job,
     deviceId,
@@ -498,128 +418,30 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, userId, resul
     bumpErrors: 0,
   };
 
-  const flushBumpSubscriptionEvents = async () => {
-    if (!bumpSubscriptionEvents.length) return;
-    const batch = bumpSubscriptionEvents.splice(0, BUMP_COMPATIBILITY_PAGE_SIZE);
-    summary.bumpSubscriptionEvents += batch.length;
-    try {
-      const bumpResult = await processBumpRuntimeEvents({
-        agencyId: job.agencyId,
-        creatorId: job.creatorId,
-        userId,
-        events: batch,
-      });
-      summary.bumpPlanned += Number(bumpResult?.planned || 0);
-      summary.bumpErrors += Array.isArray(bumpResult?.errors) ? bumpResult.errors.length : 0;
-    } catch (error) {
-      // Bump automation is a compatibility side effect, not the source of
-      // truth for the notification ledger. Record it without discarding facts.
-      summary.bumpErrors += 1;
-      if (!summary.errorSamples) summary.errorSamples = [];
-      if (summary.errorSamples.length < 5) summary.errorSamples.push(`bump:${error?.message || String(error)}`);
-    }
-  };
-
-  const markTrafficDirty = async (ev, reason) => {
-    const fanId = clean(ev.fanId || ev.dialogId, 160);
-    if (!fanId) return null;
-    const dirty = await markTrafficFanValueDirty({
-      agencyId: job.agencyId,
-      creatorId: job.creatorId,
-      fanId,
-      occurredAt: dateOrNull(ev.receivedAt || ev.purchasedAt || ev.occurredAt || ev.ts) || now,
-      reason,
-    });
-    if (dirty?.matched) summary.trafficValueDirtyMembers += Number(dirty.matched || 0);
-    return dirty;
-  };
-
-  for await (const fact of iterateCanonicalProjectionFacts({ db, job })) {
-    summary.compatibilityCandidates += 1;
-    summary.compatibilityProcessed += 1;
-    try {
-      if (fact.kind === "sale") {
-        // CreatorSale -> TeamPpvPurchaseLedger already happened inside the
-        // canonical notification transaction. Audit15 permits only typed
-        // non-money side effects here.
-        await markTrafficDirty(fact, "canonical_sale");
-        continue;
-      }
-
-      if (fact.kind === "tip") {
-        // CreatorTip -> TeamTipLedger already happened inside the canonical
-        // notification transaction. Never project money a second time.
-        await markTrafficDirty(fact, "canonical_tip");
-        continue;
-      }
-
-      if (fact.kind === "subscription") {
-        const subscriptionFanId = clean(fact.fanId, 160);
-        const subscriptionLifecycleType = String(fact.eventType || "").toLowerCase();
-        const shouldPlanBump = /(subscribed|resubscribed|renewed)/.test(subscriptionLifecycleType)
-          && !/(expired|refund|chargeback|auto.?renew)/.test(subscriptionLifecycleType);
-        if (subscriptionFanId && shouldPlanBump) {
-          bumpSubscriptionEvents.push({
-            type: "subscription_created",
-            fanId: subscriptionFanId,
-            dialogId: clean(fact.dialogId || subscriptionFanId, 160) || subscriptionFanId,
-            createdAt: dateOrNull(fact.subscribedAt || fact.occurredAt) || now,
-            source: "canonical_subscription_fact",
-            fanSnapshot: {
-              id: subscriptionFanId,
-              username: clean(fact.fanUsername, 120),
-              name: clean(fact.fanName, 160),
-              subscriptionType: subscriptionLifecycleType.includes("paid") ? "paid" : "free",
-              isActive: true,
-              canReceiveChatMessage: true,
-              dialogId: clean(fact.dialogId || subscriptionFanId, 160) || subscriptionFanId,
-            },
-          });
-          if (bumpSubscriptionEvents.length >= BUMP_COMPATIBILITY_PAGE_SIZE) await flushBumpSubscriptionEvents();
-        }
-        const subscriptionResult = await projectCanonicalSubscriptionCompatibility({ db, job, fact });
-        if (subscriptionResult.ignored) {
-          if (/(refund|chargeback|reversal)/.test(subscriptionLifecycleType)) summary.subscriptionRefundIgnored += 1;
-          else if (amountCents(fact.amountCents) <= 0) summary.subscriptionFreeIgnored += 1;
-          summary.skipped += 1;
-          continue;
-        }
-        if (subscriptionResult?.duplicate) summary.deduped += 1;
-        else if (!subscriptionResult?.ignored) summary.subscriptionCreatedOrUpdated += 1;
-        continue;
-      }
-
-      summary.skipped += 1;
-    } catch (err) {
-      summary.errors += 1;
-      if (!summary.errorSamples) summary.errorSamples = [];
-      if (summary.errorSamples.length < 5) summary.errorSamples.push(err?.message || String(err));
-    }
-  }
-
-  await flushBumpSubscriptionEvents();
-
-  // P9 wave 1 is read-only discovery. Revenue events mark existing traffic
-  // members dirty, but fan-value hydration is intentionally deferred to the
-  // later Fan Intel/Vault wave instead of spawning a hidden second scanner.
-  summary.trafficHydrateScheduled = false;
+  // Completion proves canonical collection only. Required projections have a
+  // durable intent in the same root as the terminal Job/SyncState transition.
+  await require("./notification-consequence-service").publishNotificationConsequences({ db, job });
+  summary.compatibilityDeferred = true;
 
   const scanTo = dateOrNull(params.to || result?.to) || now;
   const types = Array.isArray(params.types)
     ? [...new Set(params.types.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean))]
     : ["purchases", "tips", "subscriptions", "likes", "comments"];
+  const pageProof = await require("./notification-page-receipt-service").notificationCommittedPageProof(db, job, result);
+  summary.pageProof = pageProof;
   const coverageByType = ledger.coverageByType || {};
   const typeComplete = (type) => coverageByType[type] === "complete";
   const allRequestedComplete = types.length > 0 && types.every(typeComplete);
-  const compatibilityComplete = summary.errors === 0;
+  const compatibilityComplete = false; // Independently acknowledged by durable work.
   // Collection verification belongs only to canonical source traversal/facts.
   // Optional compatibility automation may fail and remain visible in the Team
   // activity projection, but it must never invalidate Analytics proof or cause
   // another OnlyFans traversal.
   const collectionFactsVerified = ledger.status === "COMMITTED"
     && allRequestedComplete
-    && ledger.rejected === 0;
-  const fullySuccessful = collectionFactsVerified && compatibilityComplete;
+    && ledger.rejected === 0
+    && pageProof.verified;
+  const fullySuccessful = collectionFactsVerified;
   const data = {
     currentScanStatus: fullySuccessful ? "idle" : "error",
     currentScanFrom: fullySuccessful ? null : dateOrNull(params.from),
@@ -650,10 +472,10 @@ async function applyCatchupJobResult({ db = prisma, job, deviceId, userId, resul
       coverageByType,
       fullySuccessful,
     },
-    ...(types.includes("purchases") && typeComplete("purchases") && ledger.rejected === 0
+    ...(types.includes("purchases") && typeComplete("purchases") && ledger.rejected === 0 && pageProof.verified
       ? { lastPurchaseScanTo: scanTo }
       : {}),
-    ...(types.includes("tips") && typeComplete("tips") && ledger.rejected === 0
+    ...(types.includes("tips") && typeComplete("tips") && ledger.rejected === 0 && pageProof.verified
       ? { lastTipScanTo: scanTo }
       : {}),
   };

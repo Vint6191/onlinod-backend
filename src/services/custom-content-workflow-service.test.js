@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -310,7 +312,7 @@ function fakeDb({ submissions = [], orders = [], assets = [], writes = [], teleg
       const orderSnapshots = orders.map((row) => structuredClone(row));
       const writeSnapshots = writes.map((row) => structuredClone(row));
       const telegramSnapshots = telegramIntents.map((row) => structuredClone(row));
-      try { return await fn(this); }
+      try { return await fn({ ...(this), $transaction: undefined }); }
       catch (error) {
         restoreRows(submissions, submissionSnapshots);
         restoreRows(orders, orderSnapshots);
@@ -332,7 +334,7 @@ test("unassigned queue stays compact and reports real upload/library progress", 
     vaultSettlementConfirmedAt: pinnedAt, vaultSettlementConfirmedByDeviceId: "device-1",
   });
   const db = fakeDb({ submissions: [row], assets: [{ agencyId: "agency-1", creatorId: "creator-1", mediaId: "9001", source: "CUSTOM", customOrderId: null, customSubmissionId: "sub-unassigned", customFullPriceCents: null, catalogActive: true, sortingStatus: "SORTED", folderIds: ["vault-unassigned"], mediaType: "video", thumbUrl: "https://cdn/9001.jpg", previewUrl: null, fullUrl: null }] });
-  const result = await listUnassignedCustomContentSubmissions({ agencyId: "agency-1", member: manager, db });
+  const result = await listUnassignedCustomContentSubmissions({ agencyId: "agency-1", member: manager, db: commitDatabaseFixture(db) });
   assert.equal(result.count, 1);
   assert.equal(result.canAssign, true);
   assert.equal(result.items[0].telegramMessageCount, 2);
@@ -351,7 +353,7 @@ test("unassigned progress fails closed when CUSTOM asset loses its pinned folder
     vaultSettlementConfirmedAt: pinnedAt, vaultSettlementConfirmedByDeviceId: "device-1",
   });
   const db = fakeDb({ submissions: [row], assets: [{ agencyId: "agency-1", creatorId: "creator-1", mediaId: "9001", source: "CUSTOM", customOrderId: null, customSubmissionId: "sub-unassigned", customFullPriceCents: null, catalogActive: true, sortingStatus: "UNSORTED", folderIds: [], mediaType: "video" }] });
-  const result = await listUnassignedCustomContentSubmissions({ agencyId: "agency-1", member: manager, db });
+  const result = await listUnassignedCustomContentSubmissions({ agencyId: "agency-1", member: manager, db: commitDatabaseFixture(db) });
   assert.equal(result.items[0].finalizedMediaCount, 0);
   assert.equal(result.items[0].libraryFinalized, false);
 });
@@ -368,7 +370,7 @@ test("Pipeline Resolution does not offer ARCHIVE when current-receipt CUSTOM pro
     vaultSettlementConfirmedAt: pinnedAt, vaultSettlementConfirmedByDeviceId: "device-1",
   });
   const db = fakeDb({ submissions: [row], assets: [{ agencyId: "agency-1", creatorId: "creator-1", mediaId: "9001", source: "CUSTOM", customOrderId: null, customSubmissionId: "sub-drift", customFullPriceCents: null, catalogActive: true, sortingStatus: "UNSORTED", folderIds: [] }] });
-  const result = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", db });
+  const result = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", db: commitDatabaseFixture(db) });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].finalizedMediaCount, 0);
   assert.equal(result.items[0].canArchive, false);
@@ -377,7 +379,7 @@ test("Pipeline Resolution does not offer ARCHIVE when current-receipt CUSTOM pro
 test("unassigned queue continuation does not silently rewind after the historical 1m offset horizon", async () => {
   const db = fakeDb({ submissions: [submission()] });
   const requestedOffset = 1_000_123;
-  const result = await listUnassignedCustomContentSubmissions({ agencyId: "agency-1", member: manager, offset: requestedOffset, db });
+  const result = await listUnassignedCustomContentSubmissions({ agencyId: "agency-1", member: manager, offset: requestedOffset, db: commitDatabaseFixture(db) });
   assert.equal(result.offset, requestedOffset);
   assert.equal(result.nextOffset, requestedOffset);
   assert.deepEqual(result.items, []);
@@ -386,7 +388,7 @@ test("unassigned queue continuation does not silently rewind after the historica
 test("pipeline resolution exposes PENDING CONTENT order blockers even when no submission exists", async () => {
   const pending = order("custom-blocker", { dialogId: "998877", scenario: "Pending custom blocks creator retirement" });
   const db = fakeDb({ submissions: [], orders: [pending] });
-  const result = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", db });
+  const result = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", db: commitDatabaseFixture(db) });
   assert.equal(result.focusedCreatorId, "creator-1");
   assert.equal(result.items.length, 0, "no fake submission should be invented for an order-only blocker");
   assert.equal(result.pendingCustomCount, 1);
@@ -403,7 +405,7 @@ test("pipeline resolution exposes active CUSTOM_RELAY_SEND blockers even if no c
     writeCommitAt: new Date("2026-08-22T12:00:00Z"), updatedAt: new Date("2026-08-22T12:01:00Z"),
   }];
   const db = fakeDb({ submissions: [], orders: [], writes });
-  const result = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", db });
+  const result = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", db: commitDatabaseFixture(db) });
   assert.equal(result.pendingCustomCount, 0);
   assert.equal(result.items.length, 0);
   assert.equal(result.activeWriteCount, 1);
@@ -418,7 +420,7 @@ test("Pipeline Resolution keeps terminal no-retry Custom manual outcomes visible
     writeCommitAt: new Date("2026-09-06T18:00:00Z"), updatedAt: new Date("2026-09-06T18:31:00Z"),
   }];
   const db = fakeDb({ submissions: [], orders: [], writes });
-  const result = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", db });
+  const result = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", db: commitDatabaseFixture(db) });
   assert.equal(result.activeWriteCount, 1);
   assert.equal(result.activeWrites[0].actionType, "CUSTOM_MANUAL_SEND");
   assert.equal(result.activeWrites[0].status, "FAILED");
@@ -435,7 +437,7 @@ test("pipeline resolution paginates pending Custom and active-write blocker lane
     updatedAt: new Date(1_700_100_000_000 + index * 1000),
   }));
   const db = fakeDb({ submissions: [], orders, writes });
-  const first = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", limit: 50, db });
+  const first = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", limit: 50, db: commitDatabaseFixture(db) });
   assert.equal(first.pendingCustoms.length, 50);
   assert.equal(first.pendingCustomCount, 135);
   assert.equal(first.pendingCustomNextOffset, 50);
@@ -447,7 +449,7 @@ test("pipeline resolution paginates pending Custom and active-write blocker lane
 
   const second = await listCustomPipelineResolutionQueue({
     agencyId: "agency-1", member: manager, creatorId: "creator-1", limit: 50,
-    pendingCustomOffset: first.pendingCustomNextOffset, activeWriteOffset: first.activeWriteNextOffset, db,
+    pendingCustomOffset: first.pendingCustomNextOffset, activeWriteOffset: first.activeWriteNextOffset, db: commitDatabaseFixture(db),
   });
   assert.equal(second.pendingCustoms[0].customOrderId, "custom-page-050");
   assert.equal(second.pendingCustomNextOffset, 100);
@@ -458,7 +460,7 @@ test("pipeline resolution paginates pending Custom and active-write blocker lane
 
   const third = await listCustomPipelineResolutionQueue({
     agencyId: "agency-1", member: manager, creatorId: "creator-1", limit: 50,
-    pendingCustomOffset: second.pendingCustomNextOffset, activeWriteOffset: second.activeWriteNextOffset, db,
+    pendingCustomOffset: second.pendingCustomNextOffset, activeWriteOffset: second.activeWriteNextOffset, db: commitDatabaseFixture(db),
   });
   assert.equal(third.pendingCustoms.length, 35);
   assert.equal(third.pendingCustomHasMore, false);
@@ -478,18 +480,18 @@ test("legacy retired creator with confirmed media has an explicit audited ABANDO
   let auditData = null;
   db.auditLog.create = async ({ data }) => { auditData = data; return { id: "audit-retired-abandon", ...data }; };
 
-  const queue = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", db });
+  const queue = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: "creator-1", db: commitDatabaseFixture(db) });
   assert.equal(queue.items[0].creatorRetired, true);
   assert.equal(queue.items[0].canArchive, false, "no false Vault-settlement proof may be invented");
   assert.equal(queue.items[0].canAbandon, true, "retired historical debt must have an explicit terminal resolution path");
 
   await assert.rejects(
-    () => resolveUnassignedCustomContentSubmission({ agencyId: "agency-1", member: manager, submissionId: row.id, disposition: "ABANDONED", reason: "", db }),
+    () => resolveUnassignedCustomContentSubmission({ agencyId: "agency-1", member: manager, submissionId: row.id, disposition: "ABANDONED", reason: "", db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_SUBMISSION_DISPOSITION_REASON_REQUIRED",
   );
   const resolved = await resolveUnassignedCustomContentSubmission({
     agencyId: "agency-1", member: manager, submissionId: row.id, disposition: "ABANDONED",
-    reason: "creator was retired before pipeline cutover; preserve external proof and stop convergence", db,
+    reason: "creator was retired before pipeline cutover; preserve external proof and stop convergence", db: commitDatabaseFixture(db),
   });
   assert.equal(resolved.pipelineDisposition, "ABANDONED");
   assert.deepEqual(row.ofMediaIds, ["99501"], "confirmed external media facts remain durable");
@@ -509,7 +511,7 @@ test("Pipeline Resolution exposes CALL/PHYSICAL pending Customs and audited term
   let auditData = null;
   db.auditLog.create = async ({ data }) => { auditData = data; return { id: "audit-retired-order", ...data }; };
 
-  const queue = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: retiredCreator.id, db });
+  const queue = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, creatorId: retiredCreator.id, db: commitDatabaseFixture(db) });
   assert.equal(queue.pendingCustomCount, 2);
   assert.deepEqual(queue.pendingCustoms.map((row) => row.type), ["CALL", "PHYSICAL"]);
   assert.equal(queue.pendingCustoms[0].creatorRetired, true);
@@ -517,7 +519,7 @@ test("Pipeline Resolution exposes CALL/PHYSICAL pending Customs and audited term
 
   const result = await resolveRetiredCreatorPendingCustomOrder({
     agencyId: "agency-1", member: manager, customOrderId: call.id,
-    reason: "creator retired before lifecycle authority; terminalize historical call without fabricating provider cancellation", db,
+    reason: "creator retired before lifecycle authority; terminalize historical call without fabricating provider cancellation", db: commitDatabaseFixture(db),
   });
   assert.equal(result.status, "CANCELLED");
   assert.equal(result.telegramCancellationWaived, true);
@@ -536,7 +538,7 @@ test("legacy retired-order terminalization is forbidden for an active creator an
   const activeOrder = order("active-creator-order", { type: "PHYSICAL", contentKind: null });
   const activeDb = fakeDb({ orders: [activeOrder] });
   await assert.rejects(
-    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: activeOrder.id, reason: "must not bypass normal lifecycle", db: activeDb }),
+    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: activeOrder.id, reason: "must not bypass normal lifecycle", db: commitDatabaseFixture(activeDb) }),
     (error) => error.code === "CUSTOM_RETIRED_ORDER_CREATOR_ACTIVE",
   );
   assert.equal(activeOrder.status, "PENDING");
@@ -546,7 +548,7 @@ test("legacy retired-order terminalization is forbidden for an active creator an
   const db = fakeDb({ orders: [retiredOrder], creatorRecord: retiredCreator });
   db.auditLog.create = async () => { throw new Error("required audit unavailable"); };
   await assert.rejects(
-    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: retiredOrder.id, reason: "explicit historical resolution", db }),
+    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: retiredOrder.id, reason: "explicit historical resolution", db: commitDatabaseFixture(db) }),
     /required audit unavailable/,
   );
   assert.equal(retiredOrder.status, "PENDING", "business terminalization and required audit commit atomically");
@@ -559,7 +561,7 @@ test("legacy retired-order resolution refuses to guess an unresolved Telegram TA
   const unknownTask = { id: "tg-task-unknown", agencyId: "agency-1", creatorId: retiredCreator.id, customOrderId: pending.id, accountId: "tg-account", kind: "TASK", state: "RECONCILE_REQUIRED", commitStartedAt: now, claimRevision: 3 };
   const db = fakeDb({ orders: [pending], telegramIntents: [unknownTask], creatorRecord: retiredCreator });
   await assert.rejects(
-    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: pending.id, reason: "do not guess provider outcome", db }),
+    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: pending.id, reason: "do not guess provider outcome", db: commitDatabaseFixture(db) }),
     (error) => error.code === "CUSTOM_RETIRED_ORDER_TASK_OUTCOME_UNRESOLVED",
   );
   assert.equal(pending.status, "PENDING");
@@ -576,7 +578,7 @@ test("legacy retired-order resolution refuses to guess an unresolved Telegram RE
   };
   const db = fakeDb({ orders: [pending], telegramIntents: [unknownRevision], creatorRecord: retiredCreator });
   await assert.rejects(
-    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: pending.id, reason: "do not guess revision provider outcome", db }),
+    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: pending.id, reason: "do not guess revision provider outcome", db: commitDatabaseFixture(db) }),
     (error) => error.code === "CUSTOM_RETIRED_ORDER_REVISION_OUTCOME_UNRESOLVED",
   );
   assert.equal(pending.status, "PENDING");
@@ -599,7 +601,7 @@ test("legacy retired historical Custom with confirmed revision but no TASK recor
 
   const result = await resolveRetiredCreatorPendingCustomOrder({
     agencyId: "agency-1", member: manager, customOrderId: pending.id,
-    reason: "provider capability already retired; preserve revision receipt and waive physical cancellation", db,
+    reason: "provider capability already retired; preserve revision receipt and waive physical cancellation", db: commitDatabaseFixture(db),
   });
   assert.equal(result.status, "CANCELLED");
   assert.equal(result.telegramCancellationWaived, true);
@@ -619,7 +621,7 @@ test("legacy retired-order resolution refuses to terminalize while CUSTOM_MANUAL
   };
   const db = fakeDb({ orders: [pending], writes: [write], creatorRecord: retiredCreator });
   await assert.rejects(
-    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: pending.id, reason: "do not guess physical send outcome", db }),
+    () => resolveRetiredCreatorPendingCustomOrder({ agencyId: "agency-1", member: manager, customOrderId: pending.id, reason: "do not guess physical send outcome", db: commitDatabaseFixture(db) }),
     (error) => error.code === "CUSTOM_RETIRED_ORDER_MANUAL_DELIVERY_OUTCOME_UNRESOLVED",
   );
   assert.equal(pending.status, "PENDING");
@@ -633,7 +635,7 @@ test("terminal Custom with stale operational blocker is not resurrected into Pip
     pipelineDisposition: "ACTIVE", pipelineBlockedCode: "STALE_EXECUTION_ERROR", pipelineBlockedAt: new Date("2026-08-22T11:40:00Z"),
   });
   const db = fakeDb({ submissions: [row], orders: [completed] });
-  const queue = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, db });
+  const queue = await listCustomPipelineResolutionQueue({ agencyId: "agency-1", member: manager, db: commitDatabaseFixture(db) });
   assert.equal(queue.count, 0);
   assert.deepEqual(queue.items, []);
 });
@@ -645,7 +647,7 @@ test("required disposition audit failure rolls back the human terminal mutation"
   await assert.rejects(
     () => resolveUnassignedCustomContentSubmission({
       agencyId: "agency-1", member: manager, submissionId: row.id, disposition: "ABANDONED",
-      reason: "explicit operator resolution", db,
+      reason: "explicit operator resolution", db: commitDatabaseFixture(db),
     }),
     /audit unavailable/,
   );
@@ -663,7 +665,7 @@ test("manual assignment candidates are only first submission or explicit revisio
     submission({ id: "approved-1", customOrderId: "custom-approved", telegramMessageIds: [401], reviewStatus: "APPROVED", reviewedAt: new Date("2026-08-22T11:20:00Z"), receivedAt: new Date("2026-08-22T10:30:00Z") }),
   ];
   const db = fakeDb({ submissions, orders });
-  const result = await listCustomSubmissionAssignmentCandidates({ agencyId: "agency-1", member: manager, submissionId: row.id, db });
+  const result = await listCustomSubmissionAssignmentCandidates({ agencyId: "agency-1", member: manager, submissionId: row.id, db: commitDatabaseFixture(db) });
   assert.deepEqual(result.items.map((item) => item.customOrderId), ["custom-revision", "custom-new"]);
   assert.equal(result.items[0].awaitingRevision, true);
   assert.equal(result.items[0].nextRevisionNumber, 2);
@@ -704,7 +706,7 @@ test("assignment suggestions apply LIMIT only after eligibility and complete rev
     createdAt: new Date(1_600_000_000_000 + index * 1000),
   }));
   const db = fakeDb({ submissions: [row, ...poisonedSubmissions, ...revisionHistory], orders: [...poisonedOrders, oldValid, revisionTarget] });
-  const result = await listCustomSubmissionAssignmentCandidates({ agencyId: "agency-1", member: manager, submissionId: row.id, limit: 50, db });
+  const result = await listCustomSubmissionAssignmentCandidates({ agencyId: "agency-1", member: manager, submissionId: row.id, limit: 50, db: commitDatabaseFixture(db) });
   const byId = new Map(result.items.map((item) => [item.customOrderId, item]));
   assert.equal(byId.has(oldValid.id), true, "older eligible target must survive >100 newer poisoned orders");
   assert.equal(byId.has(revisionTarget.id), true, "deep revision target must remain reachable");
@@ -717,8 +719,8 @@ test("review permission gates manual unassigned assignment and safe target is en
   const row = submission({ telegramMessageIds: [101], ofMediaIds: [] });
   const target = order("custom-new");
   const db = fakeDb({ submissions: [row], orders: [target] });
-  await assert.rejects(() => assignUnassignedCustomContentSubmission({ agencyId: "agency-1", member: viewer, submissionId: row.id, customOrderId: target.id, db }), (error) => error.code === "CUSTOM_WORKFLOW_ASSIGN_FORBIDDEN");
-  const result = await assignUnassignedCustomContentSubmission({ agencyId: "agency-1", member: manager, submissionId: row.id, customOrderId: target.id, db });
+  await assert.rejects(() => assignUnassignedCustomContentSubmission({ agencyId: "agency-1", member: viewer, submissionId: row.id, customOrderId: target.id, db: commitDatabaseFixture(db) }), (error) => error.code === "CUSTOM_WORKFLOW_ASSIGN_FORBIDDEN");
+  const result = await assignUnassignedCustomContentSubmission({ agencyId: "agency-1", member: manager, submissionId: row.id, customOrderId: target.id, db: commitDatabaseFixture(db) });
   assert.equal(result.submission.customOrderId, target.id);
 });
 
@@ -729,7 +731,7 @@ test("awaiting revision queue only keeps the latest rejected version per custom"
   const revB = submission({ id: "b-v1", customOrderId: b.id, reviewStatus: "REVISION_REQUESTED", reviewComment: "More light", reviewedAt: new Date("2026-08-22T10:30:00Z"), receivedAt: new Date("2026-08-22T09:00:00Z"), customOrder: b, reviewedByMember: { id: "manager-1", displayName: "Manager", roleKey: "manager" } });
   const newB = submission({ id: "b-v2", customOrderId: b.id, reviewStatus: "WAITING_REVIEW", receivedAt: new Date("2026-08-22T11:30:00Z"), customOrder: b });
   const db = fakeDb({ submissions: [revA, revB, newB], orders: [a, b] });
-  const result = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db });
+  const result = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db: commitDatabaseFixture(db) });
   assert.deepEqual(result.items.map((item) => item.customOrderId), ["custom-a"]);
   assert.equal(result.items[0].revisionNumber, 1);
   assert.equal(result.items[0].nextRevisionNumber, 2);
@@ -745,15 +747,15 @@ test("awaiting revision queue derives operational dispatch state from the one du
     state: "COMMITTING", remoteMessageId: null, remoteSentAt: null, createdAt: new Date("2026-08-22T11:00:01Z"),
   }];
   const db = fakeDb({ submissions: [revA], orders: [a], telegramIntents });
-  const sending = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db });
+  const sending = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db: commitDatabaseFixture(db) });
   assert.equal(sending.items[0].revisionDispatch.status, "SENDING");
   telegramIntents[0].state = "RECONCILE_REQUIRED";
-  const unknown = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db });
+  const unknown = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db: commitDatabaseFixture(db) });
   assert.equal(unknown.items[0].revisionDispatch.status, "DELIVERY_UNKNOWN");
   telegramIntents[0].state = "CONFIRMED";
   telegramIntents[0].remoteMessageId = 991;
   telegramIntents[0].remoteSentAt = new Date("2026-08-22T11:01:00Z");
-  const waiting = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db });
+  const waiting = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db: commitDatabaseFixture(db) });
   assert.equal(waiting.items[0].revisionDispatch.status, "WAITING_MODEL");
   assert.equal(waiting.items[0].revisionDispatch.providerMessageId, "991");
 });
@@ -788,13 +790,13 @@ test("awaiting revision queue exposes lossless cursor continuation beyond the fi
     }));
   }
   const db = fakeDb({ submissions, orders });
-  const first = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db, limit: 50 });
+  const first = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db: commitDatabaseFixture(db), limit: 50 });
   assert.equal(first.items.length, 50);
   assert.equal(first.hasMore, true);
-  const second = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db, limit: 50, cursor: first.nextCursor });
+  const second = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db: commitDatabaseFixture(db), limit: 50, cursor: first.nextCursor });
   assert.equal(second.items.length, 50);
   assert.equal(second.hasMore, true);
-  const third = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db, limit: 50, cursor: second.nextCursor });
+  const third = await listAwaitingCustomRevisions({ agencyId: "agency-1", member: manager, db: commitDatabaseFixture(db), limit: 50, cursor: second.nextCursor });
   assert.equal(third.items.length, 20);
   assert.equal(third.hasMore, false);
   assert.equal(third.nextCursor, null);
@@ -815,7 +817,7 @@ test("commit-time Pipeline Resolution rejects a stale management actor and prese
       submissionId: row.id,
       disposition: "ABANDONED",
       reason: "explicit operator resolution",
-      db,
+      db: commitDatabaseFixture(db),
     }),
     (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
   );

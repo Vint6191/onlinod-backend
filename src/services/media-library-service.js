@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const crypto = require("node:crypto");
@@ -634,7 +636,7 @@ async function replaceUsageSources({ agencyId, creatorId, sources, db = prisma, 
   // committed and the caller can safely retry the whole request: their durable
   // revisions make them cheap stale no-ops on the next attempt.
   for (const source of normalized) {
-    const sourceResult = await db.$transaction(
+    const sourceResult = await runDbTransaction(db, 
       async (tx) => {
         if (typeof commitGuard === "function") await commitGuard(tx);
         return replaceUsageSourceTx(tx, { agencyId, creatorId: id, source });
@@ -689,7 +691,7 @@ async function mutateFolderMembership({ agencyId, creatorId, mediaIds, folderId,
   const normalizedAction = action === "remove" ? "remove" : "add";
   if (!ids.length || !cleanFolderId) return { ok: true, creatorId: id, updated: 0 };
   let updated = 0;
-  await db.$transaction(async (tx) => {
+  await runDbTransaction(db, async (tx) => {
     const assets = await tx.creatorMediaAsset.findMany({
       where: { agencyId, creatorId: id, catalogActive: true, mediaId: { in: ids } },
       select: { id: true, mediaId: true, source: true, customSubmissionId: true, folderIds: true },
@@ -741,7 +743,7 @@ async function deleteMediaAssets({ agencyId, creatorId, mediaIds, db = prisma })
     const deleted = await tx.creatorMediaAsset.deleteMany({ where: { agencyId, creatorId: id, mediaId: { in: ids } } });
     return { ok: true, creatorId: id, deleted: deleted.count };
   };
-  return typeof db.$transaction === "function" ? db.$transaction(mutate) : mutate(db);
+  return runDbTransaction(db, mutate);
 }
 
 async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {
@@ -791,7 +793,7 @@ async function rebuildMediaUsage({ agencyId, creatorId, db = prisma }) {
     take: 100000,
   });
   const mediaIds = assets.map((asset) => String(asset.mediaId));
-  await db.$transaction(async (tx) => {
+  await runDbTransaction(db, async (tx) => {
     for (let offset = 0; offset < mediaIds.length; offset += MAX_MEDIA_IDS) {
       await recomputeUsage(tx, agencyId, id, mediaIds.slice(offset, offset + MAX_MEDIA_IDS));
     }

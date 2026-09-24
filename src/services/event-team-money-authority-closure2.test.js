@@ -80,7 +80,7 @@ test("Closure2 legacy migration reads fresh MoneyAttribution rows under FOR UPDA
     autoAttributedToMemberId: "member-A", autoAttributedToUserId: "user-A", autoReason: "old auto", createdAt: new Date(), updatedAt: new Date(),
   };
   const fake = {
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     async $queryRawUnsafe(sql) { assert.match(sql, /FOR UPDATE SKIP LOCKED/); return [{ ...fresh }]; },
     moneyAttribution: {
       async findMany() { throw new Error("migration must not pre-read unlocked rows when raw locking is available"); },
@@ -108,7 +108,7 @@ test("Closure2 auto-first then manual Tip resolution ends MANUAL", async () => {
     amountCents: 1000, currency: "USD", receivedAt: new Date(), financialStatus: "active", history: [], result: {}, candidates: [], weakCandidates: [],
   };
   const fake = {
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     async $queryRaw() { return [{ ...row }]; },
     agencyMember: {
       async findFirst({ where }) { return { id: where.id || "manager", userId: where.id === "member-B" ? "user-B" : "user-manager", displayName: "x" }; },
@@ -138,7 +138,7 @@ test("Closure2 auto-first then manual PPV resolution ends MANUAL", async () => {
     resolvedSource: "creator_sale_exact_message", amountCents: 1000, currency: "USD", purchasedAt: job.purchasedAt,
   };
   const fake = {
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     async $queryRaw(strings) {
       const sql = Array.isArray(strings) ? strings.join("?") : String(strings);
       if (sql.includes('"TeamPpvResolveJob"')) return [{ ...job }];

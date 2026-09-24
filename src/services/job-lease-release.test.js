@@ -10,6 +10,7 @@ function tokenHash(value) {
 
 function loadService(fixture) {
   require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(fixture.db);
+  fixture.db.analyticsIngestBatch ||= { findMany: async () => [] };
   fixture.db.jobInstance = fixture.db.jobInstance || {};
   if (typeof fixture.db.jobInstance.findMany !== "function") fixture.db.jobInstance.findMany = async () => [];
   if (typeof fixture.db.$transaction !== "function") fixture.db.$transaction = async (work) => work(fixture.db);
@@ -580,7 +581,7 @@ test("discovery-only claim fences the shared dialog job key to the discovery sen
   assert.deepEqual(fencedWhere.jobKey.in, ["fetch_earnings", "dialog_intelligence_scan"]);
 });
 
-test("notification completion reserves a new lease revision before durable side effects", async () => {
+test("full notification completion keeps canonical proof and terminal mutation in one commit", async () => {
   const token = "notification-lease-token";
   const now = new Date();
   const job = {
@@ -614,8 +615,7 @@ test("notification completion reserves a new lease revision before durable side 
       findUnique: async () => job,
       updateMany: async (args) => {
         updates.push(args);
-        if (updates.length === 1) order.push("reserved");
-        if (updates.length === 2) order.push("completed");
+        order.push("completed");
         return { count: 1 };
       },
     },
@@ -623,7 +623,7 @@ test("notification completion reserves a new lease revision before durable side 
   const { completeJob } = loadService({
     db,
     applyJobResult: async ({ db: suppliedDb }) => {
-      assert.equal(suppliedDb, undefined, "notification side effects intentionally run after the short reservation update");
+      assert.ok(suppliedDb?.jobInstance, "full collection proof uses the fenced transaction");
       order.push("side-effect");
       return { type: "catchup_notifications", ok: true };
     },
@@ -640,7 +640,7 @@ test("notification completion reserves a new lease revision before durable side 
     progress: { current: 3, total: 3, percent: 100 },
   });
 
-  assert.deepEqual(order, ["reserved", "side-effect", "completed"]);
+  assert.deepEqual(order, ["side-effect", "completed"]);
   assert.deepEqual(updates[0].where, {
     id: job.id,
     status: "CLAIMED",
@@ -649,9 +649,8 @@ test("notification completion reserves a new lease revision before durable side 
     leaseRevision: 7,
     leaseUntil: { gt: updates[0].where.leaseUntil.gt },
   });
-  assert.deepEqual(updates[0].data.leaseRevision, { increment: 1 });
-  assert.equal(updates[1].where.leaseRevision, 8);
-  assert.equal(updates[1].data.status, "DONE");
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].data.status, "DONE");
   assert.equal(result.job.status, "DONE");
 });
 
@@ -880,17 +879,17 @@ test("partial notification completion is rescheduled instead of being marked DON
     progress: { current: 1, total: 1, percent: 100 },
   });
 
-  assert.equal(updates.length, 2);
-  assert.equal(updates[1].where.leaseRevision, 4);
-  assert.equal(updates[1].data.status, "SCHEDULED");
-  assert.equal(updates[1].data.attempts, 1);
-  assert.equal(updates[1].data.continuation, null);
-  assert.equal(updates[1].data.claimedByDeviceId, null);
-  assert.equal(updates[1].data.lastError, "notification_scan_partial");
-  assert.deepEqual(updates[1].data.params.types, ["tips"]);
-  assert.equal("resumeCursors" in updates[1].data.params, false);
-  assert.equal("notificationRepairPass" in updates[1].data.params, false);
-  assert.ok(updates[1].data.nextRunAt instanceof Date);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].where.leaseRevision, 3);
+  assert.equal(updates[0].data.status, "SCHEDULED");
+  assert.equal(updates[0].data.attempts, 1);
+  assert.equal(updates[0].data.continuation, null);
+  assert.equal(updates[0].data.claimedByDeviceId, null);
+  assert.equal(updates[0].data.lastError, "notification_scan_partial");
+  assert.deepEqual(updates[0].data.params.types, ["tips"]);
+  assert.equal("resumeCursors" in updates[0].data.params, false);
+  assert.equal("notificationRepairPass" in updates[0].data.params, false);
+  assert.ok(updates[0].data.nextRunAt instanceof Date);
   assert.equal(result.job.status, "SCHEDULED");
 });
 
@@ -946,9 +945,9 @@ test("manual notification PARTIAL at a proven source boundary stays a visible on
   });
 
   assert.equal(result.job.status, "DONE");
-  assert.equal(updates.length, 2);
-  assert.equal(updates[1].data.status, "DONE");
-  assert.equal(updates[1].data.lastError, "notification_scan_partial");
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].data.status, "DONE");
+  assert.equal(updates[0].data.lastError, "notification_scan_partial");
   assert.equal(failures.length, 0, "manual rejected facts at the source boundary must not start hidden repair");
 });
 
@@ -1004,10 +1003,10 @@ test("manual notification completion retries when the source boundary was not re
   });
 
   assert.equal(result.job.status, "SCHEDULED");
-  assert.equal(updates.length, 2);
-  assert.equal(updates[1].data.status, "SCHEDULED");
-  assert.equal(updates[1].data.attempts, 1);
-  assert.ok(updates[1].data.nextRunAt instanceof Date);
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].data.status, "SCHEDULED");
+  assert.equal(updates[0].data.attempts, 1);
+  assert.ok(updates[0].data.nextRunAt instanceof Date);
   assert.equal(failures.length, 1);
   assert.equal(failures[0].terminal, false);
 });
@@ -1059,9 +1058,9 @@ test("fifth non-resumable partial notification attempt becomes FAILED instead of
     progress: { current: 1, total: 1, percent: 100 },
   });
 
-  assert.equal(updates[1].data.status, "FAILED");
-  assert.equal(updates[1].data.attempts, 5);
-  assert.equal(updates[1].data.nextRunAt, undefined);
+  assert.equal(updates[0].data.status, "FAILED");
+  assert.equal(updates[0].data.attempts, 5);
+  assert.equal(updates[0].data.nextRunAt, undefined);
   assert.equal(result.job.status, "FAILED");
   assert.equal(result.job.retryAt, null);
 });

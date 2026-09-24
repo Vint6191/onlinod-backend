@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -103,7 +105,7 @@ function dbFixture({ sent = null, existing = null, financialStatus = "done", mem
   };
 
   return {
-    db,
+    db: commitDatabaseFixture(db),
     getPurchase: () => purchase,
     getResolveJob: () => resolveJob,
     getPurchaseCreates: () => purchaseCreates,
@@ -138,7 +140,7 @@ test("source classification never treats automation/broadcast as human manual", 
 
 test("exact CreatorSale.messageId + confirmed manual provenance attributes PPV to active member", async () => {
   const fx = dbFixture({ sent: manualSent() });
-  const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  const result = await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
   assert.equal(result.ok, true);
   assert.equal(result.proposedStatus, "attributed");
   assert.equal(result.attributionBasis, "EXACT_MESSAGE_MANUAL");
@@ -154,8 +156,8 @@ test("exact CreatorSale.messageId + confirmed manual provenance attributes PPV t
 
 test("one canonical CreatorSale reconciled repeatedly still owns exactly one Team PPV row", async () => {
   const fx = dbFixture({ sent: manualSent() });
-  await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
-  await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
+  await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
   assert.equal(fx.getPurchaseCreates(), 1);
   assert.equal(fx.getPurchase().creatorSaleId, "sale-1");
 });
@@ -163,7 +165,7 @@ test("one canonical CreatorSale reconciled repeatedly still owns exactly one Tea
 test("exact automation provenance is creator revenue and cannot inherit logged-in member", async () => {
   const automation = { ...manualSent(), memberId: null, userId: null, source: "automation" };
   const fx = dbFixture({ sent: automation });
-  const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  const result = await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
   assert.equal(result.proposedStatus, "creator_revenue");
   const row = fx.getPurchase();
   assert.equal(row.status, "creator_revenue");
@@ -173,7 +175,7 @@ test("exact automation provenance is creator revenue and cannot inherit logged-i
 
 test("missing exact message provenance remains unresolved instead of using last-chatter timing", async () => {
   const fx = dbFixture({ sent: null });
-  const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  const result = await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
   assert.equal(result.proposedStatus, "unresolved");
   assert.equal(result.attributionBasis, "MESSAGE_PROVENANCE_MISSING");
   assert.equal(fx.getPurchase().attributedMemberId, null);
@@ -197,7 +199,7 @@ test("exact provenance disagreement becomes an explicit conflict instead of sile
     creatorSaleId: null,
   };
   const fx = dbFixture({ sent: manualSent("member-new"), existing });
-  const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  const result = await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
   assert.equal(result.proposedStatus, "conflict");
   assert.equal(fx.getPurchase().status, "conflict");
   assert.equal(fx.getPurchase().attributedMemberId, "member-old");
@@ -224,7 +226,7 @@ test("manual Claims resolution is never overwritten by later automatic reconcili
     creatorSaleId: null,
   };
   const fx = dbFixture({ sent: manualSent("different-member"), existing });
-  const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  const result = await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
   assert.equal(result.preservedManualResolution, true);
   assert.equal(fx.getPurchase().attributedMemberId, "manager-selected-member");
   assert.equal(fx.getPurchase().resolvedSource, "manual_claim_resolution");
@@ -232,7 +234,7 @@ test("manual Claims resolution is never overwritten by later automatic reconcili
 
 test("payout undo keeps attribution evidence but financially disables the purchase", async () => {
   const fx = dbFixture({ sent: manualSent(), financialStatus: "undo" });
-  const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  const result = await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
   assert.equal(result.financialRefunded, true);
   assert.equal(fx.getPurchase().financialStatus, "undo");
   assert.equal(fx.getPurchase().attributedMemberId, "member-1");
@@ -284,7 +286,7 @@ function tipDbFixture({ exactSent = null, recent = [], financialStatus = "done",
       async update({ data }) { attribution = { ...attribution, ...data }; return { ...attribution }; },
     },
   };
-  return { db, getAttribution: () => attribution, getTipCreates: () => tipCreates, setExactSent: (value) => { exactSentCurrent = value; }, setAttribution: (value) => { attribution = value ? { ...value } : null; } };
+  return { db: commitDatabaseFixture(db), getAttribution: () => attribution, getTipCreates: () => tipCreates, setExactSent: (value) => { exactSentCurrent = value; }, setAttribution: (value) => { attribution = value ? { ...value } : null; } };
 }
 
 function tipSent({ memberId = "member-1", source = "manual", minutesBefore = 2 } = {}) {
@@ -298,7 +300,7 @@ function tipSent({ memberId = "member-1", source = "manual", minutesBefore = 2 }
 
 test("tip exact message provenance auto-attributes only the proven manual sender", async () => {
   const fx = tipDbFixture({ exactSent: tipSent() });
-  const result = await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  const result = await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
   assert.equal(result.proposedStatus, "attributed");
   assert.equal(result.attributionBasis, "EXACT_MESSAGE_MANUAL");
   assert.equal(fx.getAttribution().attributedMemberId, "member-1");
@@ -307,15 +309,15 @@ test("tip exact message provenance auto-attributes only the proven manual sender
 
 test("one canonical CreatorTip reconciled repeatedly still owns exactly one Team Tip row", async () => {
   const fx = tipDbFixture({ exactSent: tipSent() });
-  await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
-  await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
+  await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
   assert.equal(fx.getTipCreates(), 1);
   assert.equal(fx.getAttribution().creatorTipId, "creator-tip-1");
 });
 
 test("tip exact automation message stays creator revenue", async () => {
   const fx = tipDbFixture({ exactSent: { ...tipSent({ source: "automation" }), memberId: null, userId: null } });
-  const result = await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  const result = await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
   assert.equal(result.proposedStatus, "creator_revenue");
   assert.equal(fx.getAttribution().attributedMemberId, null);
   assert.equal(result.attributionBasis, "EXACT_MESSAGE_NON_HUMAN");
@@ -324,7 +326,7 @@ test("tip exact automation message stays creator revenue", async () => {
 test("one recent chatter is evidence only and does not auto-own a tip", async () => {
   const recent = [{ ...tipSent({ memberId: "member-recent", minutesBefore: 5 }), messageId: "other-message" }];
   const fx = tipDbFixture({ recent });
-  const result = await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  const result = await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
   assert.equal(result.proposedStatus, "unresolved");
   assert.equal(result.attributionBasis, "SINGLE_RECENT_CANDIDATE_EVIDENCE_ONLY");
   assert.equal(fx.getAttribution().attributedMemberId, null);
@@ -337,7 +339,7 @@ test("multiple recent tip candidates create conflict but no guessed owner", asyn
     { ...tipSent({ memberId: "member-b", minutesBefore: 7 }), messageId: "b" },
   ];
   const fx = tipDbFixture({ recent });
-  const result = await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  const result = await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
   assert.equal(result.proposedStatus, "conflict");
   assert.equal(fx.getAttribution().attributedMemberId, null);
   assert.equal(fx.getAttribution().candidates.length, 2);
@@ -345,7 +347,7 @@ test("multiple recent tip candidates create conflict but no guessed owner", asyn
 
 test("tip payout undo is retained as evidence but marked financially reversed", async () => {
   const fx = tipDbFixture({ exactSent: tipSent(), financialStatus: "undo" });
-  const result = await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  const result = await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
   assert.equal(result.financialRefunded, true);
   assert.equal(fx.getAttribution().financialStatus, "undo");
   assert.equal(fx.getAttribution().attributedMemberId, "member-1");
@@ -354,11 +356,11 @@ test("tip payout undo is retained as evidence but marked financially reversed", 
 
 test("late exact sent-message evidence re-reconciles an existing unresolved PPV row in place", async () => {
   const fx = dbFixture({ sent: null });
-  await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
   assert.equal(fx.getPurchase().status, "unresolved");
   const sent = manualSent("member-late");
   fx.setSent(sent);
-  await reconcileMoneyForSentMessageEvidence({ db: fx.db, sent });
+  await reconcileMoneyForSentMessageEvidence({ db: commitDatabaseFixture(fx.db), sent });
   assert.equal(fx.getPurchaseCreates(), 1, "late evidence must update the same money row");
   assert.equal(fx.getPurchase().status, "attributed");
   assert.equal(fx.getPurchase().attributedMemberId, "member-late");
@@ -366,11 +368,11 @@ test("late exact sent-message evidence re-reconciles an existing unresolved PPV 
 
 test("late recent tip evidence re-evaluates an existing unresolved canonical tip row", async () => {
   const fx = tipDbFixture({ exactSent: null, recent: [], tipMessageId: "tip-message-1" });
-  await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
   assert.equal(fx.getAttribution().status, "unresolved");
   const sent = tipSent({ memberId: "member-late", minutesBefore: 2 });
   fx.setExactSent(sent);
-  await reconcileMoneyForSentMessageEvidence({ db: fx.db, sent });
+  await reconcileMoneyForSentMessageEvidence({ db: commitDatabaseFixture(fx.db), sent });
   assert.equal(fx.getTipCreates(), 1);
   assert.equal(fx.getAttribution().status, "attributed");
   assert.equal(fx.getAttribution().attributedMemberId, "member-late");
@@ -395,7 +397,7 @@ test("automatic PPV reconciliation re-reads a manual resolution at the row lock 
     fx.setPurchase(manual);
     return [{ ...manual }];
   };
-  const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  const result = await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
   assert.equal(result.preservedManualResolution, true);
   assert.deepEqual(lockOrder, ["job", "purchase"]);
   assert.equal(fx.getPurchase().attributedMemberId, "manager-selected-member");
@@ -416,7 +418,7 @@ test("automatic Tip reconciliation re-reads a manual resolution at the row lock 
     fx.setAttribution(manual);
     return [{ ...manual }];
   };
-  const result = await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  const result = await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
   assert.equal(result.preservedManualResolution, true);
   assert.equal(fx.getAttribution().attributedMemberId, "manager-selected-member");
   assert.equal(fx.getAttribution().resolvedSource, "manual_manager_resolution");
@@ -436,7 +438,7 @@ test("A36: durable PPV fact reconstructs the same protected root after old TTL d
       }];
     },
   };
-  const result = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  const result = await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
   assert.equal(result.preservedManualResolution, true);
   assert.equal(fx.getPurchase().id, "deleted-root-ppv");
   assert.equal(fx.getPurchase().migrationBaselineProtected, true);
@@ -458,7 +460,7 @@ test("A36: durable Tip fact reconstructs the same protected root after old TTL d
       }];
     },
   };
-  const result = await reconcileCreatorTipToTeam({ db: fx.db, tipId: "creator-tip-1" });
+  const result = await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
   assert.equal(result.preservedManualResolution, true);
   assert.equal(fx.getAttribution().id, "deleted-root-tip");
   assert.equal(fx.getAttribution().migrationBaselineProtected, true);
@@ -477,7 +479,7 @@ test("A38: multiple durable money generations fail closed instead of arbitrary m
     },
   };
   await assert.rejects(
-    () => reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" }),
+    () => reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" }),
     (err) => err?.code === "TEAM_MONEY_ROOT_MIGRATION_AMBIGUOUS",
   );
   assert.equal(fx.getPurchase(), null);

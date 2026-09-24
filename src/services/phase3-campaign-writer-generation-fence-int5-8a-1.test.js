@@ -103,7 +103,9 @@ test("INT5.8A-1 activation uses JobInstance -> barrier lock order and bounded re
   const db = {
     async $transaction(work, options) {
       transactionAttempts += 1;
-      assert.deepEqual(options, { maxWait: 10_000, timeout: 120_000 });
+      assert.equal(options.isolationLevel, "ReadCommitted");
+      assert.ok(options.maxWait > 0 && options.maxWait <= 10_000);
+      assert.ok(options.timeout > 100_000 && options.timeout <= 110_000, "admission and execution share the 120s root deadline");
       if (transactionAttempts === 1) {
         const error = new Error("deadlock detected");
         error.code = "40P01";

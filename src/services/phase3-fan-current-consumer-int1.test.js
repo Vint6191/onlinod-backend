@@ -308,7 +308,7 @@ test("Phase3 Follow Back missing/provenance-unknown canonical relationship fails
 test("Phase3 commit-time refresh scheduling occurs outside prepare-write transaction and covers Likes + Follow Back", () => {
   const source = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
   assert.match(source, /validationActionError[\s\S]*error\.fanRefresh/);
-  assert.match(source, /prepareWriteActionDelivery[\s\S]*prisma\.\$transaction[\s\S]*catch \(error\)[\s\S]*scheduleValidationFanRefresh[\s\S]*"prepare_write"/);
+  assert.match(source, /prepareWriteActionDelivery[\s\S]*runDbTransaction\(prisma,[\s\S]*catch \(error\)[\s\S]*scheduleValidationFanRefresh[\s\S]*"prepare_write"/);
   assert.match(source, /moduleKey === "follow_back"[\s\S]*validateFollowBackDeliveryCurrent[\s\S]*validationActionError/);
   assert.match(source, /moduleKey === "likes"[\s\S]*validateLikeDelivery[\s\S]*validationActionError/);
 });

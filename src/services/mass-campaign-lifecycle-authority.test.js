@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -101,10 +103,10 @@ function makeDb(seed = []) {
         return { count };
       },
     },
-    $transaction: async (fn) => fn(api),
+    $transaction: async (fn) => fn({ ...(api), $transaction: undefined }),
     $executeRawUnsafe: async () => 1,
   };
-  return { db: api, rows };
+  return { db: commitDatabaseFixture(api), rows };
 }
 
 async function withAuthority(seed, run) {
@@ -283,10 +285,10 @@ test("MASS retirement blockers release unresolved historical write only after it
     id: "unknown", agencyId: "agency-a", creatorId: "creator-a", actionType: "MASS_QUEUE_CREATE", status: "FAILED", failureCode: "outcome_unresolved_do_not_retry",
     remoteLifecycleState: "UNKNOWN", createdAt: old, updatedAt: old,
   }]);
-  let blockers = await service.creatorMassCampaignBlockers({ db: fx.db, agencyId: "agency-a", creatorId: "creator-a" });
+  let blockers = await service.creatorMassCampaignBlockers({ db: commitDatabaseFixture(fx.db), agencyId: "agency-a", creatorId: "creator-a" });
   assert.ok(blockers.total > 0);
   fx.rows[0].remoteLifecycleState = "SETTLED";
-  blockers = await service.creatorMassCampaignBlockers({ db: fx.db, agencyId: "agency-a", creatorId: "creator-a" });
+  blockers = await service.creatorMassCampaignBlockers({ db: commitDatabaseFixture(fx.db), agencyId: "agency-a", creatorId: "creator-a" });
   assert.equal(blockers.total, 0);
 });
 
@@ -322,7 +324,7 @@ test("native MASS create is COMMITTING before browser wire and exact 2xx queueId
     assert.ok(row.writeCommitAt instanceof Date);
 
     const blockersBeforeResponse = await require("./mass-campaign-authority-service").creatorMassCampaignBlockers({
-      db: makeDb(rows).db, agencyId: actor.agencyId, creatorId: actor.creatorId,
+      db: commitDatabaseFixture(makeDb(rows).db), agencyId: actor.agencyId, creatorId: actor.creatorId,
     });
     assert.ok(blockersBeforeResponse.total > 0);
 
@@ -364,7 +366,7 @@ test("native MASS exact 2xx is durably replayable from request-bound Team teleme
         requestKey: "wc:91:req:12",
         writeCommitRevision: permit.writeCommitRevision,
       } } },
-    }, { db });
+    }, { db: commitDatabaseFixture(db) });
     assert.equal(settled.delivery.status, "COMPLETED");
     assert.equal(row.remoteLifecycleState, "PENDING");
     assert.equal(row.remoteTargetId, "queue-native-durable-1");
@@ -374,7 +376,7 @@ test("native MASS exact 2xx is durably replayable from request-bound Team teleme
       agencyId: actor.agencyId, userId: actor.userId, memberId: actor.memberId, creatorId: actor.creatorId, deviceId: "device-a",
       broadcastDispatchId: "queue-native-durable-1",
       extra: { metadata: { massNative: { authorityVersion: "MASS_NATIVE_V3", kind: "MASS_NATIVE_QUEUE_CREATE", writeId: permit.writeId, requestKey: "wc:91:req:12", writeCommitRevision: permit.writeCommitRevision } } },
-    }, { db });
+    }, { db: commitDatabaseFixture(db) });
     assert.equal(duplicate.duplicate, true);
   });
 });
@@ -442,14 +444,14 @@ test("provider-observed orphan queue becomes a durable retirement blocker until 
     const observed = rows.find((row) => row.actionType === "MASS_PROVIDER_QUEUE_OBSERVED" && row.remoteTargetId === "manual-queue-1");
     assert.ok(observed);
     assert.equal(observed.remoteLifecycleState, "PENDING");
-    let blockers = await require("./mass-campaign-authority-service").creatorMassCampaignBlockers({ db, agencyId: actor.agencyId, creatorId: actor.creatorId });
+    let blockers = await require("./mass-campaign-authority-service").creatorMassCampaignBlockers({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId });
     assert.ok(blockers.total > 0);
 
     observed.remoteLifecycleObservedAt = new Date(Date.now() - 1000);
     const secondFence = await authority.beginMassRemoteQueueSnapshot({ ...actor, deviceId: "device-a" });
     await authority.reconcileMassRemoteQueueSnapshot({ ...actor, deviceId: "device-a", queueIds: [], snapshotItemCount: 0, snapshotFenceToken: secondFence.snapshotFenceToken });
     assert.equal(observed.remoteLifecycleState, "SETTLED");
-    blockers = await require("./mass-campaign-authority-service").creatorMassCampaignBlockers({ db, agencyId: actor.agencyId, creatorId: actor.creatorId });
+    blockers = await require("./mass-campaign-authority-service").creatorMassCampaignBlockers({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId });
     assert.equal(blockers.total, 0);
   });
 });
@@ -459,7 +461,7 @@ test("creator retirement is fail-closed without a fresh provider snapshot proof,
   const empty = makeDb([]);
   const massAuthority = fresh("./mass-campaign-authority-service");
   await assert.rejects(
-    () => massAuthority.assertCreatorMassCampaignRetirable({ db: empty.db, agencyId: actor.agencyId, creatorId: actor.creatorId }),
+    () => massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(empty.db), agencyId: actor.agencyId, creatorId: actor.creatorId }),
     (error) => error?.code === "CREATOR_MASS_PROVIDER_SNAPSHOT_REQUIRED",
   );
 
@@ -475,7 +477,7 @@ test("creator retirement is fail-closed without a fresh provider snapshot proof,
     assert.equal(proof.status, "COMPLETED");
     assert.equal(proof.result.outcomeState, "PROVIDER_SNAPSHOT_PROVEN");
     assert.equal(proof.result.purpose, "RETIREMENT");
-    const blockers = await massAuthority.assertCreatorMassCampaignRetirable({ db, agencyId: actor.agencyId, creatorId: actor.creatorId });
+    const blockers = await massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId });
     assert.equal(blockers.total, 0);
     assert.ok(blockers.providerSnapshotObservedAt instanceof Date);
   });
@@ -491,7 +493,7 @@ test("retirement proof is state-versioned: a later BROWSE reconciliation invalid
     const observed = rows.find((row) => row.actionType === "MASS_PROVIDER_QUEUE_OBSERVED" && row.remoteTargetId === "queue-before");
     assert.ok(observed);
     await assert.rejects(
-      () => massAuthority.assertCreatorMassCampaignRetirable({ db, agencyId: actor.agencyId, creatorId: actor.creatorId }),
+      () => massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId }),
       (error) => error?.code === "CREATOR_HAS_ACTIVE_MASS",
     );
 
@@ -502,7 +504,7 @@ test("retirement proof is state-versioned: a later BROWSE reconciliation invalid
     });
     assert.equal(observed.remoteLifecycleState, "SETTLED");
     await assert.rejects(
-      () => massAuthority.assertCreatorMassCampaignRetirable({ db, agencyId: actor.agencyId, creatorId: actor.creatorId }),
+      () => massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId }),
       (error) => error?.code === "CREATOR_MASS_PROVIDER_SNAPSHOT_REQUIRED",
       "an older RETIREMENT proof must not be reused after a newer BROWSE changes provider lifecycle state",
     );
@@ -511,8 +513,8 @@ test("retirement proof is state-versioned: a later BROWSE reconciliation invalid
     await authority.reconcileMassRemoteQueueSnapshot({
       ...actor, deviceId: "device-a", purpose: "RETIREMENT", queueIds: [], snapshotItemCount: 0, snapshotFenceToken: freshFence.snapshotFenceToken,
     });
-    assert.equal((await massAuthority.assertCreatorMassCampaignRetirable({ db, agencyId: actor.agencyId, creatorId: actor.creatorId })).total, 0);
-    assert.equal((await massAuthority.assertAgencyMassCampaignRetirable({ db, agencyId: actor.agencyId })).total, 0);
+    assert.equal((await massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId })).total, 0);
+    assert.equal((await massAuthority.assertAgencyMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId })).total, 0);
   });
 });
 
@@ -532,11 +534,11 @@ test("retirement proof is stale after a later physical MASS commit even when blo
       remoteLifecycleState: "SETTLED", remoteSettledAt: new Date(proof.remoteLifecycleObservedAt.getTime() + 10), createdAt: new Date(), updatedAt: new Date(),
     });
     await assert.rejects(
-      () => massAuthority.assertCreatorMassCampaignRetirable({ db, agencyId: actor.agencyId, creatorId: actor.creatorId }),
+      () => massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId }),
       (error) => error?.code === "CREATOR_MASS_PROVIDER_SNAPSHOT_REQUIRED",
     );
     await assert.rejects(
-      () => massAuthority.assertAgencyMassCampaignRetirable({ db, agencyId: actor.agencyId }),
+      () => massAuthority.assertAgencyMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId }),
       (error) => error?.code === "AGENCY_MASS_PROVIDER_SNAPSHOT_REQUIRED",
     );
   });
@@ -574,7 +576,7 @@ test("retirement proof invalidation is explicit and does not rely on timestamp o
     assert.equal(retirementProof.status, "CANCELED");
     assert.equal(retirementProof.failureCode, "mass_provider_snapshot_stale");
     await assert.rejects(
-      () => massAuthority.assertCreatorMassCampaignRetirable({ db, agencyId: actor.agencyId, creatorId: actor.creatorId }),
+      () => massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId }),
       (error) => error?.code === "CREATOR_MASS_PROVIDER_SNAPSHOT_REQUIRED",
     );
   });
@@ -589,7 +591,7 @@ test("new MASS external-work authority explicitly invalidates a fresh retirement
     });
     const proof = rows.find((row) => row.actionType === "MASS_PROVIDER_SNAPSHOT_PROOF" && row.result?.purpose === "RETIREMENT");
     assert.ok(proof);
-    assert.equal((await massAuthority.assertCreatorMassCampaignRetirable({ db, agencyId: actor.agencyId, creatorId: actor.creatorId })).total, 0);
+    assert.equal((await massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId })).total, 0);
 
     await authority.reserveProgrammaticWrite({
       ...actor, deviceId: "device-a", kind: "MASS_QUEUE_CANCEL",
@@ -599,7 +601,7 @@ test("new MASS external-work authority explicitly invalidates a fresh retirement
     assert.equal(proof.status, "CANCELED");
     assert.equal(proof.failureCode, "mass_provider_snapshot_stale");
     await assert.rejects(
-      () => massAuthority.assertCreatorMassCampaignRetirable({ db, agencyId: actor.agencyId, creatorId: actor.creatorId }),
+      () => massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId }),
       (error) => error?.code === "CREATOR_HAS_ACTIVE_MASS" || error?.code === "CREATOR_MASS_PROVIDER_SNAPSHOT_REQUIRED",
     );
   });
@@ -609,7 +611,7 @@ test("never-connected creator without immutable provider identity does not requi
   const fx = makeDb([]);
   fx.db.creatorAccount.findFirst = async () => ({ id: actor.creatorId, agencyId: actor.agencyId, remoteId: null, deletedAt: null });
   const massAuthority = fresh("./mass-campaign-authority-service");
-  const result = await massAuthority.assertCreatorMassCampaignRetirable({ db: fx.db, agencyId: actor.agencyId, creatorId: actor.creatorId });
+  const result = await massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(fx.db), agencyId: actor.agencyId, creatorId: actor.creatorId });
   assert.equal(result.total, 0);
   assert.equal(result.providerSnapshotObservedAt, undefined);
 });
@@ -638,11 +640,11 @@ test("fresh BROWSE snapshot proof never satisfies creator or agency retirement a
 
     const massAuthority = fresh("./mass-campaign-authority-service");
     await assert.rejects(
-      () => massAuthority.assertCreatorMassCampaignRetirable({ db, agencyId: actor.agencyId, creatorId: actor.creatorId }),
+      () => massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId }),
       (error) => error?.code === "CREATOR_MASS_PROVIDER_SNAPSHOT_REQUIRED",
     );
     await assert.rejects(
-      () => massAuthority.assertAgencyMassCampaignRetirable({ db, agencyId: actor.agencyId }),
+      () => massAuthority.assertAgencyMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId }),
       (error) => error?.code === "AGENCY_MASS_PROVIDER_SNAPSHOT_REQUIRED",
     );
 
@@ -654,8 +656,8 @@ test("fresh BROWSE snapshot proof never satisfies creator or agency retirement a
     assert.ok(retirementProof);
     assert.match(String(retirementProof.idempotencyKey || ""), /:RETIREMENT$/);
     assert.notEqual(retirementProof.id, browseProof.id);
-    assert.equal((await massAuthority.assertCreatorMassCampaignRetirable({ db, agencyId: actor.agencyId, creatorId: actor.creatorId })).total, 0);
-    assert.equal((await massAuthority.assertAgencyMassCampaignRetirable({ db, agencyId: actor.agencyId })).total, 0);
+    assert.equal((await massAuthority.assertCreatorMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId, creatorId: actor.creatorId })).total, 0);
+    assert.equal((await massAuthority.assertAgencyMassCampaignRetirable({ db: commitDatabaseFixture(db), agencyId: actor.agencyId })).total, 0);
   });
 });
 

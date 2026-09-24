@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 const { runRootCommit } = require("./db-commit-kernel");
 
 const { partitionAutomationDeliveryHardDeleteCandidates, isSfsFollowProof, sfsCandidateId } = require("./automation-delivery-hard-delete-guard");
@@ -221,7 +223,7 @@ function normalizeRange({ from = null, to = null, months = 12 } = {}) {
 async function getAutomationMetrics({ agencyId, creatorId, from = null, to = null, months = 12, db = null }) {
   db = db || require("../prisma");
   const { start, end } = normalizeRange({ from, to, months });
-  const [archived, liveRows, failures] = await db.$transaction(tx => Promise.all([
+  const [archived, liveRows, failures] = await runDbTransaction(db, tx => Promise.all([
     tx.automationMonthlyAggregate.findMany({
       where: { agencyId, creatorId, periodStart: { gte: monthStart(start), lte: end } },
       orderBy: [{ periodStart: "asc" }, { moduleKey: "asc" }, { actionType: "asc" }],

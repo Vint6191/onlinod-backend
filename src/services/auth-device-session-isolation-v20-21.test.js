@@ -37,7 +37,7 @@ function loadAuthService(prisma) {
 test("normal refresh-token logout revokes the whole logical device, not another device", async () => {
   const calls = [];
   const prisma = {
-    $transaction: async (work) => work(prisma),
+    $transaction: async (work) => work({ ...(prisma), $transaction: undefined }),
     $executeRawUnsafe: async () => 1,
     refreshSession: {
       findUnique: async () => ({ id: "s-a1", userId: "user-1", agencyId: "agency-1", deviceId: "device-a", revokedAt: null }),
@@ -56,7 +56,7 @@ test("normal refresh-token logout revokes the whole logical device, not another 
 test("reuse of a revoked device-bound refresh token is contained to that device", async () => {
   const updates = [];
   const prisma = {
-    $transaction: async (work) => work(prisma),
+    $transaction: async (work) => work({ ...(prisma), $transaction: undefined }),
     $executeRawUnsafe: async () => 1,
     refreshSession: {
       findUnique: async () => ({
@@ -82,7 +82,7 @@ test("reuse of a revoked device-bound refresh token is contained to that device"
 test("legacy unbound refresh-token reuse retains account-wide fallback", async () => {
   const updates = [];
   const prisma = {
-    $transaction: async (work) => work(prisma),
+    $transaction: async (work) => work({ ...(prisma), $transaction: undefined }),
     $executeRawUnsafe: async () => 1,
     refreshSession: {
       findUnique: async () => ({

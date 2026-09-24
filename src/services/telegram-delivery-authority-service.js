@@ -1,4 +1,5 @@
 "use strict";
+const { classifyCommitConflict } = require("./db-commit-kernel");
 
 const crypto = require("node:crypto");
 const { lockBillingWriteAdmission, assertBillingWriteAdmission, selectBillableTelegramWorkIds } = require("./billing-write-admission-service");
@@ -219,7 +220,7 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
   // update below act as a row mutex: either planning wins and retirement sees the new
   // blocker, or retirement wins and planning cannot create a new intent afterwards.
   if (!_transactional && typeof db?.$transaction === "function") {
-    return db.$transaction(
+    return runDbTransaction(db, 
       (tx) => createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId, referenceOrdinal, customSubmissionId, payload, now, db: tx, reactivateCancelledTask, actorMember, _transactional: true }),
       { isolationLevel: "Serializable" },
     );
@@ -937,9 +938,7 @@ async function ensureInitialTaskIntentForOrder({ agencyId, orderId, member = nul
       intent,
     };
   };
-  return typeof db?.$transaction === "function"
-    ? db.$transaction(run, { isolationLevel: "Serializable" })
-    : run(db);
+  return runDbTransaction(db, run, { isolationLevel: "Serializable" });
 }
 
 async function repairPrecommitProviderBlockedIntents({ agencyId, member = null, limit = 25, now = new Date(), db }) {
@@ -1021,7 +1020,10 @@ async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = ne
 }
 
 async function claimTelegramDeliveryIntent({ agencyId, member, intentId, deviceId, runtimeClaimToken, now = new Date(), db = null } = {}) {
-  const client = db || require("../prisma"); const id = clean(intentId, 180); const normalizedDeviceId = clean(deviceId, 180);
+  const client = db || require("../prisma");
+  return runDbTransaction(client, async tx => {
+  const client = tx;
+  const id = clean(intentId, 180); const normalizedDeviceId = clean(deviceId, 180);
   if (!id || !normalizedDeviceId) throw fail("TELEGRAM_DELIVERY_CLAIM_INPUT_INVALID", "intentId and deviceId are required");
   let row = await client.telegramDeliveryIntent.findFirst({ where: { id, agencyId } });
   if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
@@ -1034,7 +1036,7 @@ async function claimTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
     }
   }
   await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
-  await assertTelegramRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId: normalizedDeviceId, claimToken: runtimeClaimToken, now, db: client });
+  const runtime = await assertTelegramRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId: normalizedDeviceId, claimToken: runtimeClaimToken, now, db: client });
   const fence = actor(member);
   await assertExecutionAccessFence({ db: client, agencyId, creatorId: row.creatorId, ...fence, lock: true });
   if (row.state === "CONFIRMED" || row.state === "RECONCILE_REQUIRED" || row.state === "COMMITTING" || row.state === "CANCELLED") return { ok: true, claimed: false, intent: publicIntent(row), claimToken: null };
@@ -1051,9 +1053,11 @@ async function claimTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
     const unresolvedReminder = await findUnresolvedReminder({ agencyId, orderId: row.customOrderId, excludeIntentId: row.id, db: client });
     if (unresolvedReminder) return { ok: true, claimed: false, busy: true, blockedByIntentId: String(unresolvedReminder.id), intent: publicIntent(row), claimToken: null };
   }
+  const billing = await assertBillingWriteAdmission({ db: client, agencyId, creatorId: row.creatorId });
+  now = billing.now;
+  if (runtime?.account?.runtimeClaimUntil && new Date(runtime.account.runtimeClaimUntil) <= now) throw fail("TELEGRAM_EXECUTION_LEASE_INVALID", "Runtime expired before delivery claim", 409);
   const currentClaimAlive = row.state === "CLAIMED" && row.claimUntil && new Date(row.claimUntil).getTime() > now.getTime();
   if (currentClaimAlive && String(row.deviceId || "") !== normalizedDeviceId) return { ok: true, claimed: false, busy: true, intent: publicIntent(row), claimToken: null };
-  await assertBillingWriteAdmission({ db: client, agencyId, creatorId: row.creatorId });
   const claimToken = crypto.randomUUID(); const claimUntil = new Date(now.getTime() + CLAIM_MS); const nextRevision = Number(row.claimRevision || 0) + 1;
   const changed = await client.telegramDeliveryIntent.updateMany({
     where: { id: row.id, agencyId, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: Number(row.claimRevision || 0), ...(row.state === "CLAIMED" && row.claimUntil ? { claimUntil: row.claimUntil } : {}) },
@@ -1065,6 +1069,7 @@ async function claimTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
   }
   const fresh = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
   return { ok: true, claimed: true, intent: publicIntent(fresh), claimToken };
+  }, { timeout: 15000, authority: { kind: "PRODUCT_ACTOR", agencyId, userId: member?.userId } });
 }
 
 function verifyStoredClaim(row, { deviceId, claimToken }) {
@@ -1113,7 +1118,7 @@ async function currentBeginGuard({ row, member, agencyId, runtimeClaimToken, dev
       throw fail("TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED", "Telegram provider thread changed before commit; refresh the existing delivery intent", 409);
     }
   }
-  await assertTelegramRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId, claimToken: runtimeClaimToken, now, db });
+  const runtime = await assertTelegramRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId, claimToken: runtimeClaimToken, now, db });
   await assertExecutionAccessFence({ db, agencyId, creatorId: row.creatorId, userId: row.userId, memberId: row.memberId, accessEpoch: row.accessEpoch, lock: true });
   const kind = String(row.kind);
   if (kind === "REVISION_REQUEST") {
@@ -1158,7 +1163,7 @@ async function currentBeginGuard({ row, member, agencyId, runtimeClaimToken, dev
       throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "The manual reminder belongs to an obsolete Custom model-obligation cycle", 409);
     }
   }
-  return order;
+  return { order, runtime };
 }
 
 async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceId, runtimeClaimToken, claimToken, now = new Date(), db = null } = {}) {
@@ -1178,7 +1183,7 @@ async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
     if (["CONFIRMED", "RECONCILE_REQUIRED", "COMMITTING"].includes(String(row.state))) return { ok: true, begun: false, intent: publicIntent(row) };
     verifyStoredClaim(row, { deviceId, claimToken });
 
-    const order = await currentBeginGuard({ row, member, agencyId, runtimeClaimToken, deviceId, now, db: tx });
+    const { order, runtime } = await currentBeginGuard({ row, member, agencyId, runtimeClaimToken, deviceId, now, db: tx });
     const kind = String(row.kind);
     if (kind === "TASK" || kind === "REVISION_REQUEST" || REMINDER_KINDS.has(kind)) {
       const previousUpdatedAt = order?.updatedAt ? new Date(order.updatedAt) : null;
@@ -1204,6 +1209,7 @@ async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
     }
 
     const billing = await assertBillingWriteAdmission({ db: tx, agencyId, creatorId: row.creatorId });
+    if (runtime?.account?.runtimeClaimUntil && new Date(runtime.account.runtimeClaimUntil) <= billing.now) throw fail("TELEGRAM_EXECUTION_LEASE_INVALID", "Runtime expired before delivery commit", 409);
     if (!row.claimUntil || new Date(row.claimUntil) <= billing.now) throw fail("TELEGRAM_DELIVERY_CLAIM_STALE", "Telegram delivery claim expired before commit", 409);
     const changed = await tx.telegramDeliveryIntent.updateMany({
       where: { id: row.id, agencyId, state: "CLAIMED", claimRevision: row.claimRevision, claimTokenHash: row.claimTokenHash },
@@ -1215,7 +1221,7 @@ async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
   };
 
   try {
-    return typeof client.$transaction === "function" ? await client.$transaction(beginPermit) : await beginPermit(client);
+    return await runDbTransaction(client, beginPermit);
   } catch (error) {
     // Any transaction writes were rolled back. Restore only the still-same precommit claim; an
     // already-COMMITTING concurrent winner is intentionally untouched by this conditional write.
@@ -1259,7 +1265,7 @@ async function appendConfirmedReferenceMessageId({ agencyId, orderId, remoteMess
     });
     return { missing: false, changed: true };
   };
-  return typeof db.$transaction === "function" ? db.$transaction(append) : append(db);
+  return runDbTransaction(db, append);
 }
 
 async function markConfirmedProjectionBlocked({ row, error, now = new Date(), db }) {
@@ -1466,7 +1472,7 @@ async function confirmTelegramDeliveryIntent({ agencyId, member, intentId, devic
     if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_CONFIRM_RACE", "Telegram delivery changed before confirmation", 409);
     return tx.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
   };
-  const confirmed = typeof client.$transaction === "function" ? await client.$transaction(settle) : await settle(client);
+  const confirmed = await runDbTransaction(client, settle);
   // Provider receipt is the canonical external fact. CustomOrder/thread fields are
   // derived projections and converge only after that fact commits. If projection
   // fails, replaying the same receipt repairs state without authorizing another send.
@@ -1936,7 +1942,7 @@ async function markTelegramDeliveryUnknown({ agencyId, member, intentId, deviceI
 async function replaceTelegramReferencePrecommit({ agencyId, member, intentId, clientIntentId, reference, now = new Date(), db = null, _transactional = false } = {}) {
   const client = db || require("../prisma");
   if (!_transactional && typeof client?.$transaction === "function") {
-    return client.$transaction((tx) => replaceTelegramReferencePrecommit({
+    return runDbTransaction(client, (tx) => replaceTelegramReferencePrecommit({
       agencyId, member, intentId, clientIntentId, reference, now, db: tx, _transactional: true,
     }), { isolationLevel: "Serializable" });
   }
@@ -1976,7 +1982,7 @@ async function replaceTelegramReferencePrecommit({ agencyId, member, intentId, c
 async function cancelTelegramReferencePrecommit({ agencyId, member, intentId, reason, now = new Date(), db = null, _transactional = false } = {}) {
   const client = db || require("../prisma");
   if (!_transactional && typeof client?.$transaction === "function") {
-    return client.$transaction((tx) => cancelTelegramReferencePrecommit({
+    return runDbTransaction(client, (tx) => cancelTelegramReferencePrecommit({
       agencyId, member, intentId, reason, now, db: tx, _transactional: true,
     }), { isolationLevel: "Serializable" });
   }
@@ -2329,7 +2335,7 @@ async function reconcileTelegramDeliveryIntent({ agencyId, member, intentId, res
   const mode = clean(resolution, 40).toUpperCase();
   if (!["CONFIRMED", "PROVEN_NOT_SENT"].includes(mode)) throw fail("TELEGRAM_DELIVERY_RECONCILE_RESOLUTION_INVALID", "resolution must be CONFIRMED or PROVEN_NOT_SENT");
   try {
-    const fresh = await client.$transaction(async (tx) => {
+    const fresh = await runDbTransaction(client, async (tx) => {
       const currentMember = await lockCurrentAgencyMember({ agencyId, actorMember: member, db: tx });
       if (!await canUsePermission({ member: currentMember, key: "content.review_customs", db: tx })) {
         throw fail("TELEGRAM_DELIVERY_RECONCILE_FORBIDDEN", "content.review_customs permission is required", 403);
@@ -2398,7 +2404,7 @@ async function reconcileTelegramDeliveryIntent({ agencyId, member, intentId, res
     if (mode === "CONFIRMED") await reconcileInboundAfterConfirmedReceipt({ row: fresh, member, now, db: client });
     return { ok: true, intent: publicIntent(fresh) };
   } catch (error) {
-    if (String(error?.code || "") === "P2034") throw fail("TELEGRAM_DELIVERY_RECONCILE_RACE", "Telegram reconciliation changed concurrently; refresh and retry", 409);
+    if (classifyCommitConflict(error)) throw fail("TELEGRAM_DELIVERY_RECONCILE_RACE", "Telegram reconciliation changed concurrently; refresh and retry", 409);
     throw error;
   }
 }

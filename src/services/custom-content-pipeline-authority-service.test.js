@@ -1,3 +1,4 @@
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 "use strict";
 
 const test = require("node:test");
@@ -87,7 +88,7 @@ async function seedPipelineProviderAuthority(db, agencyId) {
         findFirst: db.customContentSubmission?.findFirst || (async ({ where = {} }) => submissions.find((row) => pipelineProviderMatches(row, where)) || null),
       },
     };
-    const rows = await providerOperationalAuthority.buildOrderDebtCandidates({ agencyId, order, intents, submissions, db: projectionDb });
+    const rows = await providerOperationalAuthority.buildOrderDebtCandidates({ agencyId, order, intents, submissions, db: commitDatabaseFixture(projectionDb) });
     debts.push(...rows);
   }
   db.providerOperationalDebt = {
@@ -167,7 +168,7 @@ function profileDb({ folder = "vault-a", recipient = "relay_a", relayRows = [] }
       findFirst: async () => ({ ...state.submission }),
     },
   };
-  return { db, state };
+  return { db: commitDatabaseFixture(db), state };
 }
 
 test("execution-default advisory fence serializes first pin/default publication for the same Agency", async () => {
@@ -197,14 +198,14 @@ test("execution-default advisory fence serializes first pin/default publication 
   const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
 
   const first = withCustomExecutionDefaultsLock({
-    db,
+    db: commitDatabaseFixture(db),
     agencyId: "agency-1",
     work: async () => { entered.push("first-start"); await firstGate; entered.push("first-end"); },
   });
   while (!entered.includes("first-start")) await new Promise((resolve) => setImmediate(resolve));
 
   const second = withCustomExecutionDefaultsLock({
-    db,
+    db: commitDatabaseFixture(db),
     agencyId: "agency-1",
     work: async () => { entered.push("second-start"); entered.push("second-end"); },
   });
@@ -217,14 +218,14 @@ test("execution-default advisory fence serializes first pin/default publication 
 
 test("execution profile pins Vault destination/relay recipient once and current defaults cannot retarget in-flight content", async () => {
   const { db, state } = profileDb({ folder: "vault-a", recipient: "relay_a" });
-  const first = await ensureSubmissionExecutionProfile({ db, agencyId: "agency-1", submission: { ...state.submission }, now: new Date("2026-09-06T00:00:00Z") });
+  const first = await ensureSubmissionExecutionProfile({ db: commitDatabaseFixture(db), agencyId: "agency-1", submission: { ...state.submission }, now: new Date("2026-09-06T00:00:00Z") });
   assert.equal(first.vaultFolderId, "vault-a");
   assert.equal(first.relayRecipient, "relay_a");
   assert.equal(first.pinnedNow, true);
 
   state.creator.customsVaultFolderId = "vault-b";
   state.recipient = "relay_b";
-  const second = await ensureSubmissionExecutionProfile({ db, agencyId: "agency-1", submission: { ...state.submission }, now: new Date("2026-09-06T00:01:00Z") });
+  const second = await ensureSubmissionExecutionProfile({ db: commitDatabaseFixture(db), agencyId: "agency-1", submission: { ...state.submission }, now: new Date("2026-09-06T00:01:00Z") });
   assert.equal(second.vaultFolderId, "vault-a");
   assert.equal(second.relayRecipient, "relay_a");
   assert.equal(second.pinnedNow, false);
@@ -243,7 +244,7 @@ test("Phase3 closure: missing execution defaults carry the observed durable depe
       return { revision: 7n };
     } };
     db.creatorAccount.findFirst = async () => { order.push("observe-defaults"); return { ...state.creator }; };
-    await assert.rejects(() => ensureSubmissionExecutionProfile({ db, agencyId: "agency-1", submission: state.submission }), (error) => {
+    await assert.rejects(() => ensureSubmissionExecutionProfile({ db: commitDatabaseFixture(db), agencyId: "agency-1", submission: state.submission }), (error) => {
       assert.equal(error.code, code);
       assert.deepEqual(error.domainWorkDependency, { dependencyKind: kind, dependencyKey: key, dependencyRevision: 7n });
       return true;
@@ -262,7 +263,7 @@ test("rolling cutover pins historical relay recipient instead of mutable current
       payload: { submissionId: "submission-1", expectedIndex: 0, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "731", recipient: "relay_old" },
     }],
   });
-  const result = await ensureSubmissionExecutionProfile({ db, agencyId: "agency-1", submission: { ...state.submission }, now: new Date("2026-09-06T00:00:00Z") });
+  const result = await ensureSubmissionExecutionProfile({ db: commitDatabaseFixture(db), agencyId: "agency-1", submission: { ...state.submission }, now: new Date("2026-09-06T00:00:00Z") });
   assert.equal(result.vaultFolderId, "vault-current", "pre-cutover folder was not historically recorded, so migration pins the current destination and reconciles proven media into it");
   assert.equal(result.relayRecipient, "relay_old", "durable historical relay recipient must outrank a later mutable Workspace default");
   assert.equal(state.submission.executionRelayRecipient, "relay_old");
@@ -278,7 +279,7 @@ test("rolling cutover fails closed when one submission historically used multipl
     ],
   });
   await assert.rejects(
-    () => ensureSubmissionExecutionProfile({ db, agencyId: "agency-1", submission: { ...state.submission }, now: new Date("2026-09-06T00:00:00Z") }),
+    () => ensureSubmissionExecutionProfile({ db: commitDatabaseFixture(db), agencyId: "agency-1", submission: { ...state.submission }, now: new Date("2026-09-06T00:00:00Z") }),
     (error) => error?.code === "CUSTOM_SUBMISSION_EXECUTION_PROFILE_LEGACY_RECIPIENT_CONFLICT" && error?.status === 409,
   );
   assert.equal(state.submission.executionPinnedAt, null, "ambiguous legacy execution history must not publish a guessed profile");
@@ -286,7 +287,7 @@ test("rolling cutover fails closed when one submission historically used multipl
 
 test("Telegram-independent finalization can pin a Vault destination with no relay recipient", async () => {
   const { db, state } = profileDb({ folder: "vault-finalize", recipient: null });
-  const result = await ensureSubmissionExecutionProfile({ db, agencyId: "agency-1", submission: { ...state.submission }, requireRelayRecipient: false, now: new Date("2026-09-06T00:00:00Z") });
+  const result = await ensureSubmissionExecutionProfile({ db: commitDatabaseFixture(db), agencyId: "agency-1", submission: { ...state.submission }, requireRelayRecipient: false, now: new Date("2026-09-06T00:00:00Z") });
   assert.equal(result.vaultFolderId, "vault-finalize");
   assert.equal(result.relayRecipient, null);
   assert.ok(result.submission.executionPinnedAt);
@@ -300,7 +301,7 @@ test("move-only finalization ignores contradictory historical relay recipients b
       { id: "legacy-write-2", idempotencyKey: "custom-relay:submission-1:1", status: "COMPLETED", payload: { submissionId: "submission-1", expectedIndex: 1, telegramSourceAccountId: "tg-1", telegramSourceUserId: "987654321012345678", telegramMessageId: "732", recipient: "relay_b" } },
     ],
   });
-  const result = await ensureSubmissionExecutionProfile({ db, agencyId: "agency-1", submission: { ...state.submission }, requireRelayRecipient: false, now: new Date("2026-09-06T00:00:00Z") });
+  const result = await ensureSubmissionExecutionProfile({ db: commitDatabaseFixture(db), agencyId: "agency-1", submission: { ...state.submission }, requireRelayRecipient: false, now: new Date("2026-09-06T00:00:00Z") });
   assert.equal(result.vaultFolderId, "vault-finalize");
   assert.equal(result.relayRecipient, null, "finalization must not acquire an unrelated current relay default");
   assert.ok(result.submission.executionPinnedAt);
@@ -364,7 +365,7 @@ test("stale executor failures cannot re-block a submission after another device 
     customOrder: { findFirst: async () => ({ ...liveOrder }) },
   };
   const stale = await reportSubmissionExecutionAttempt({
-    db, agencyId: "agency-1", submissionId: "submission-1", success: false, code: "DEVICE_A_FAILED",
+    db: commitDatabaseFixture(db), agencyId: "agency-1", submissionId: "submission-1", success: false, code: "DEVICE_A_FAILED",
     expectedWorkKind: "UPLOAD_MEDIA", expectedIndex: 0, expectedExecutionProfileRevision: 1, now: new Date("2026-09-06T15:00:00Z"),
   });
   assert.equal(stale.stale, true);
@@ -372,7 +373,7 @@ test("stale executor failures cannot re-block a submission after another device 
   assert.equal(updates, 0, "stale failure must not publish retry/backoff state over newer canonical progress");
 
   const currentFailure = await reportSubmissionExecutionAttempt({
-    db, agencyId: "agency-1", submissionId: "submission-1", success: false, code: "DEVICE_B_FAILED",
+    db: commitDatabaseFixture(db), agencyId: "agency-1", submissionId: "submission-1", success: false, code: "DEVICE_B_FAILED",
     expectedWorkKind: "UPLOAD_MEDIA", expectedIndex: 1, expectedExecutionProfileRevision: 1, now: new Date("2026-09-06T15:01:00Z"),
   });
   assert.equal(currentFailure.stale, false);
@@ -400,7 +401,7 @@ test("creator retirement blocks durable media-bearing provider events before sub
     automationDelivery: { count: async () => 0 },
     telegramInboundEvent: { count: async ({ where }) => { capturedInboundWhere = where; return 1; } },
   };
-  const result = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const result = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(result.unresolvedInboundEvents, 1);
   assert.equal(result.total, 1);
   assert.deepEqual(capturedInboundWhere, {
@@ -416,7 +417,7 @@ test("creator retirement treats CALL and PHYSICAL PENDING orders as live busines
     customContentSubmission: { count: async () => 0 },
     automationDelivery: { count: async () => 0 },
   };
-  const result = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const result = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(result.pendingOrders, 2);
   assert.equal(result.total, 2);
   assert.deepEqual(capturedOrderWhere, { agencyId: "agency-1", creatorId: "creator-1", status: "PENDING" });
@@ -430,7 +431,7 @@ test("creator retirement blocks terminal-order Telegram follow-up work until its
     automationDelivery: { count: async () => 0 },
     telegramDeliveryIntent: { count: async ({ where }) => { capturedIntentWhere = where; return 1; } },
   };
-  const result = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const result = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(result.activeTelegramDeliveries, 1);
   assert.equal(result.total, 1);
   assert.deepEqual(capturedIntentWhere, {
@@ -449,7 +450,7 @@ test("creator retirement blocks terminal no-retry external-write uncertainty unt
     customContentSubmission: { count: async () => 0 },
     automationDelivery: { count: async ({ where }) => { capturedWriteWhere = where; return 1; } },
   };
-  const result = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const result = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(result.activeWrites, 1);
   assert.equal(result.total, 1);
   assert.deepEqual(capturedWriteWhere, {
@@ -470,7 +471,7 @@ test("agency retirement aggregates every live Custom/source blocker across creat
     telegramDeliveryIntent: { count: async ({ where }) => { captured.telegramDeliveries = where; return 5; } },
     telegramInboundEvent: { count: async ({ where }) => { captured.inbound = where; return 4; } },
   };
-  const result = await agencyCustomPipelineBlockers({ db, agencyId: "agency-1" });
+  const result = await agencyCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1" });
   assert.deepEqual(result, { pendingOrders: 1, activeSubmissions: 2, activeWrites: 3, activeTelegramDeliveries: 5, unresolvedInboundEvents: 4, cancelledTelegramFollowupDebt: 0, confirmedTelegramProjectionDebt: 0, completedExternalProjectionDebt: 0, providerOperationalBackfillIncomplete: 0, customExternalProofBackfillIncomplete: 0, total: 15 });
   assert.deepEqual(captured.orders, { agencyId: "agency-1", status: "PENDING" });
   assert.equal(captured.submissions.agencyId, "agency-1");
@@ -520,13 +521,13 @@ test("creator retirement blocks legacy unmarked CONFIRMED projection debt until 
     },
   };
 
-  const blocked = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const blocked = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(blocked.confirmedTelegramProjectionDebt, 1);
   assert.equal(blocked.total, 1);
 
   order.telegramTaskMessageId = 701;
   order.deliveredAt = new Date("2026-09-06T00:00:00Z");
-  const converged = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const converged = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(converged.confirmedTelegramProjectionDebt, 0);
   assert.equal(converged.total, 0);
 });
@@ -546,7 +547,7 @@ test("creator retirement blocks confirmed TASK history whose cancelled-order fol
       findMany: async ({ where }) => intents.filter((row) => where.customOrderId?.in?.includes(row.customOrderId) && where.kind?.in?.includes(row.kind)),
     },
   };
-  const result = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const result = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(result.cancelledTelegramFollowupDebt, 1);
   assert.equal(result.confirmedTelegramProjectionDebt, 1);
   assert.equal(result.total, 2);
@@ -559,7 +560,7 @@ test("agency lifecycle fence uses shared advisory barrier for normal work and ex
     $executeRawUnsafe: async (query, key) => { execute.push({ sql: String(query), key }); return 0; },
     $queryRawUnsafe: async (query, id) => { selectSql = String(query); return [{ id, deletedAt: null, status: "ACTIVE" }]; },
   };
-  const row = await lockAgencyPipelineLifecycle({ db, agencyId: "agency-1" });
+  const row = await lockAgencyPipelineLifecycle({ db: commitDatabaseFixture(db), agencyId: "agency-1" });
   assert.equal(row.id, "agency-1");
   assert.equal(execute.length, 1);
   assert.match(execute[0].sql, /pg_advisory_xact_lock_shared/);
@@ -568,13 +569,13 @@ test("agency lifecycle fence uses shared advisory barrier for normal work and ex
   assert.doesNotMatch(selectSql, /FOR UPDATE/);
 
   execute.length = 0;
-  await lockAgencyPipelineLifecycleExclusive({ db, agencyId: "agency-1", allowDeleted: true });
+  await lockAgencyPipelineLifecycleExclusive({ db: commitDatabaseFixture(db), agencyId: "agency-1", allowDeleted: true });
   assert.equal(execute.length, 1);
   assert.match(execute[0].sql, /pg_advisory_xact_lock\(/);
   assert.doesNotMatch(execute[0].sql, /_shared/);
 
   db.$queryRawUnsafe = async (_query, id) => [{ id, deletedAt: new Date(), status: "LOCKED" }];
-  await assert.rejects(() => lockAgencyPipelineLifecycle({ db, agencyId: "agency-1" }), (error) => error?.code === "AGENCY_RETIRED" && error?.status === 409);
+  await assert.rejects(() => lockAgencyPipelineLifecycle({ db: commitDatabaseFixture(db), agencyId: "agency-1" }), (error) => error?.code === "AGENCY_RETIRED" && error?.status === 409);
 });
 
 test("creator retirement blocker query ignores terminal delivered history but includes SALVAGE, unassigned ACTIVE, and ACTIVE+PENDING CONTENT", async () => {
@@ -584,7 +585,7 @@ test("creator retirement blocker query ignores terminal delivered history but in
     customContentSubmission: { count: async ({ where }) => { capturedSubmissionWhere = where; return 0; } },
     automationDelivery: { count: async () => 0 },
   };
-  const result = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const result = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(result.total, 0);
   assert.deepEqual(capturedSubmissionWhere.OR[0], { pipelineDisposition: "SALVAGE" });
   assert.deepEqual(capturedSubmissionWhere.OR[1], { pipelineDisposition: "ACTIVE", customOrderId: null });
@@ -597,18 +598,18 @@ test("creator retirement blocker query ignores terminal delivered history but in
 test("creator lifecycle fence uses the CreatorAccount row as a serialization lock and rejects retired creators", async () => {
   let sql = "";
   const db = { $queryRawUnsafe: async (query) => { sql = String(query); return [{ id: "creator-1", agencyId: "agency-1", deletedAt: null, status: "READY" }]; } };
-  const row = await lockCreatorPipelineLifecycle({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const row = await lockCreatorPipelineLifecycle({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(row.id, "creator-1");
   assert.match(sql, /CreatorAccount[\s\S]*FOR UPDATE/);
 
   db.$queryRawUnsafe = async () => [{ id: "creator-1", agencyId: "agency-1", deletedAt: new Date(), status: "DISABLED" }];
-  await assert.rejects(() => lockCreatorPipelineLifecycle({ db, agencyId: "agency-1", creatorId: "creator-1" }), (error) => error?.code === "CREATOR_RETIRED" && error?.status === 409);
+  await assert.rejects(() => lockCreatorPipelineLifecycle({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" }), (error) => error?.code === "CREATOR_RETIRED" && error?.status === 409);
 });
 
 test("submission lifecycle fence is the shared serialization boundary for relay reserve and terminal manager resolution", async () => {
   const events = [];
   const db = {
-    $transaction: async (work) => work(db),
+    $transaction: async (work) => work({ ...(db), $transaction: undefined }),
     $queryRawUnsafe: async (query, id, agencyId) => {
       events.push("lock");
       assert.match(String(query), /CustomContentSubmission[\s\S]*FOR UPDATE/);
@@ -621,7 +622,7 @@ test("submission lifecycle fence is the shared serialization boundary for relay 
     },
   };
   const result = await withSubmissionPipelineLock({
-    db, agencyId: "agency-1", submissionId: "submission-lock",
+    db: commitDatabaseFixture(db), agencyId: "agency-1", submissionId: "submission-lock",
     work: async () => { events.push("work"); return "ok"; },
   });
   assert.equal(result, "ok");
@@ -674,11 +675,11 @@ test("SALVAGE resolution is fail-closed until confirmed media is safely projecte
     },
   };
 
-  const before = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const before = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(before.total, 1, "SALVAGE remains a retirement blocker until explicit resolution");
 
   await assert.rejects(
-    () => setUnassignedSubmissionDisposition({ db, agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ARCHIVED", reason: "resolved" }),
+    () => setUnassignedSubmissionDisposition({ db: commitDatabaseFixture(db), agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ARCHIVED", reason: "resolved" }),
     (error) => error?.code === "CUSTOM_SUBMISSION_SALVAGE_FINALIZATION_REQUIRED",
   );
 
@@ -687,11 +688,11 @@ test("SALVAGE resolution is fail-closed until confirmed media is safely projecte
     { mediaId: "9002", source: "CUSTOM", customOrderId: state.submission.customOrderId, customSubmissionId: state.submission.id, customFullPriceCents: 6000, catalogActive: true, sortingStatus: "SORTED", folderIds: ["vault-salvage"] },
   );
   await assert.rejects(
-    () => setUnassignedSubmissionDisposition({ db, agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ARCHIVED", reason: "assets alone are not settlement proof" }),
+    () => setUnassignedSubmissionDisposition({ db: commitDatabaseFixture(db), agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ARCHIVED", reason: "assets alone are not settlement proof" }),
     (error) => error?.code === "CUSTOM_SUBMISSION_SALVAGE_FINALIZATION_REQUIRED",
   );
   await assert.rejects(
-    () => setUnassignedSubmissionDisposition({ db, agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ABANDONED", reason: "discard confirmed media" }),
+    () => setUnassignedSubmissionDisposition({ db: commitDatabaseFixture(db), agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ABANDONED", reason: "discard confirmed media" }),
     (error) => error?.code === "CUSTOM_SUBMISSION_ABANDON_CONFIRMED_MEDIA_FORBIDDEN",
   );
   state.submission.executionPinnedAt = new Date("2026-09-06T00:00:00Z");
@@ -702,10 +703,10 @@ test("SALVAGE resolution is fail-closed until confirmed media is safely projecte
   state.submission.vaultSettlementMediaFingerprint = vaultSettlementFingerprint({ folderId: "vault-salvage", profileRevision: 1, mediaIds: state.submission.ofMediaIds });
   state.submission.vaultSettlementConfirmedAt = new Date("2026-09-06T00:01:00Z");
   state.submission.vaultSettlementConfirmedByDeviceId = "device-1";
-  const resolved = await setUnassignedSubmissionDisposition({ db, agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ARCHIVED", reason: "safe salvage complete" });
+  const resolved = await setUnassignedSubmissionDisposition({ db: commitDatabaseFixture(db), agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ARCHIVED", reason: "safe salvage complete" });
   assert.equal(resolved.pipelineDisposition, "ARCHIVED");
 
-  const after = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const after = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(after.total, 0, "terminal resolved content no longer blocks normal creator retirement");
 });
 
@@ -725,7 +726,7 @@ test("retired-confirmed ABANDON escape rechecks actual creator retirement and ca
   };
   await assert.rejects(
     () => setUnassignedSubmissionDisposition({
-      db, agencyId: "agency-1", submissionId: row.id, nextDisposition: "ABANDONED",
+      db: commitDatabaseFixture(db), agencyId: "agency-1", submissionId: row.id, nextDisposition: "ABANDONED",
       reason: "malicious caller attempts retired exception", allowRetiredConfirmedAbandon: true,
     }),
     (error) => error?.code === "CUSTOM_SUBMISSION_ABANDON_CONFIRMED_MEDIA_FORBIDDEN",
@@ -746,7 +747,7 @@ test("pipeline resolution cannot race past an in-flight CUSTOM_RELAY_SEND", asyn
     creatorMediaAsset: { findMany: async () => [] },
   };
   await assert.rejects(
-    () => setUnassignedSubmissionDisposition({ db, agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ABANDONED", reason: "operator discard" }),
+    () => setUnassignedSubmissionDisposition({ db: commitDatabaseFixture(db), agencyId: "agency-1", submissionId: state.submission.id, nextDisposition: "ABANDONED", reason: "operator discard" }),
     (error) => error?.code === "CUSTOM_SUBMISSION_EXTERNAL_EFFECT_NOT_CONVERGED",
   );
 });
@@ -789,7 +790,7 @@ test("Custom cancellation cancels only proven-precommit relay writes and preserv
       },
     },
   };
-  const result = await adjudicateCustomOrderCancellation({ db, agencyId: "agency-1", customOrderId: "custom-1", now: new Date("2026-09-06T01:00:00Z") });
+  const result = await adjudicateCustomOrderCancellation({ db: commitDatabaseFixture(db), agencyId: "agency-1", customOrderId: "custom-1", now: new Date("2026-09-06T01:00:00Z") });
   assert.equal(result.cancelledPrecommitWrites, 5);
   assert.deepEqual(writes.slice(0, 4).map((row) => row.status), ["CANCELED", "CANCELED", "CANCELED", "CANCELED"]);
   assert.equal(writes[4].status, "COMMITTING");
@@ -910,7 +911,7 @@ test("F45 terminal disposition rejects no-retry unknown and completed-but-unproj
       automationDelivery: { updateMany: async () => ({ count: 0 }), findMany: async () => [{ ...write }] },
     };
     await assert.rejects(
-      () => setUnassignedSubmissionDisposition({ db, agencyId: "agency-1", submissionId: submission.id, nextDisposition: "ABANDONED", reason: "resolve" }),
+      () => setUnassignedSubmissionDisposition({ db: commitDatabaseFixture(db), agencyId: "agency-1", submissionId: submission.id, nextDisposition: "ABANDONED", reason: "resolve" }),
       (error) => error?.code === "CUSTOM_SUBMISSION_EXTERNAL_EFFECT_NOT_CONVERGED",
       write.id,
     );
@@ -924,16 +925,16 @@ test("F45 ordinary ARCHIVE requires proven media and terminal cross-rewrite is f
     automationDelivery: { updateMany: async () => ({ count: 0 }), findMany: async () => [] },
   };
   await assert.rejects(
-    () => setUnassignedSubmissionDisposition({ db: dbSource, agencyId: "agency-1", submissionId: sourceOnly.id, nextDisposition: "ARCHIVED", reason: "bad archive" }),
+    () => setUnassignedSubmissionDisposition({ db: commitDatabaseFixture(dbSource), agencyId: "agency-1", submissionId: sourceOnly.id, nextDisposition: "ARCHIVED", reason: "bad archive" }),
     (error) => error?.code === "CUSTOM_SUBMISSION_ARCHIVE_MEDIA_REQUIRED",
   );
 
   const terminal = { id: "terminal-sub", agencyId: "agency-1", creatorId: "creator-1", customOrderId: null, pipelineDisposition: "ARCHIVED", ofMediaIds: ["9001"] };
   const dbTerminal = { customContentSubmission: { findFirst: async () => ({ ...terminal }) } };
-  const same = await setUnassignedSubmissionDisposition({ db: dbTerminal, agencyId: "agency-1", submissionId: terminal.id, nextDisposition: "ARCHIVED" });
+  const same = await setUnassignedSubmissionDisposition({ db: commitDatabaseFixture(dbTerminal), agencyId: "agency-1", submissionId: terminal.id, nextDisposition: "ARCHIVED" });
   assert.equal(same.unchanged, true);
   await assert.rejects(
-    () => setUnassignedSubmissionDisposition({ db: dbTerminal, agencyId: "agency-1", submissionId: terminal.id, nextDisposition: "ABANDONED", reason: "rewrite" }),
+    () => setUnassignedSubmissionDisposition({ db: commitDatabaseFixture(dbTerminal), agencyId: "agency-1", submissionId: terminal.id, nextDisposition: "ABANDONED", reason: "rewrite" }),
     (error) => error?.code === "CUSTOM_SUBMISSION_DISPOSITION_TERMINAL_REWRITE_FORBIDDEN",
   );
 });
@@ -968,15 +969,15 @@ test("creator and agency retirement block cancelled historical no-TASK revision 
     },
     telegramInboundEvent: { count: async () => 0 },
   };
-  const creatorBlockers = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const creatorBlockers = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(creatorBlockers.cancelledTelegramFollowupDebt, 1);
   assert.equal(creatorBlockers.total, 1);
-  const agencyBlockers = await agencyCustomPipelineBlockers({ db, agencyId: "agency-1" });
+  const agencyBlockers = await agencyCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1" });
   assert.equal(agencyBlockers.cancelledTelegramFollowupDebt, 1);
   assert.equal(agencyBlockers.total, 1);
 
   intents.push({ id: "cancel-revision-debt", agencyId: "agency-1", creatorId: "creator-1", customOrderId: order.id, accountId: "tg-old", kind: "CANCELLATION", state: "PLANNED" });
-  const converged = await creatorCustomPipelineBlockers({ db, agencyId: "agency-1", creatorId: "creator-1" });
+  const converged = await creatorCustomPipelineBlockers({ db: commitDatabaseFixture(db), agencyId: "agency-1", creatorId: "creator-1" });
   assert.equal(converged.cancelledTelegramFollowupDebt, 0);
   assert.equal(converged.total, 0);
 });

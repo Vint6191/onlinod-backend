@@ -119,6 +119,13 @@ function notifyAgency(agencyId) {
 }
 
 function publishDesktopControlEvent(input) {
+  const { currentCommitContext, deferCommitHint } = require("./db-commit-kernel");
+  const context = currentCommitContext();
+  if (context) {
+    const snapshot = { ...input };
+    deferCommitHint(context, `desktop-event:${randomUUID()}`, () => publishDesktopControlEvent(snapshot));
+    return null;
+  }
   const event = normalizeEvent(input);
   if (!event) throw new Error("DESKTOP_CONTROL_EVENT_INVALID");
   events.push(event);

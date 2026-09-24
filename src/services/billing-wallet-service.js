@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const prisma = require("../prisma");
 const { audit } = require("./audit-service");
@@ -496,7 +498,7 @@ async function mutateWallet(tx, { agencyId, testMode, amountCents, type, idempot
 
 async function creditPaidTopUp({ orderId, sandboxActivationEnabled, db = null }) {
   const client = db || prisma;
-  return client.$transaction(async (tx) => {
+  return runDbTransaction(client, async (tx) => {
     const identity = await tx.billingOrder.findUnique({ where: { id: orderId }, select: { id: true, agencyId: true } });
     if (!identity) return { credited: false, reason: "ORDER_NOT_FOUND" };
     await lockAgencyBillingMutation(tx, identity.agencyId);
@@ -554,7 +556,7 @@ async function refundTopUp({ order, db = null }) {
   const agencyId = String(order?.agencyId || "").trim();
   if (!orderId || !agencyId) return { reversed: false, reason: "ORDER_NOT_FOUND" };
   const client = db || prisma;
-  return client.$transaction(async (tx) => {
+  return runDbTransaction(client, async (tx) => {
     await lockAgencyBillingMutation(tx, agencyId);
     const current = await tx.billingOrder.findUnique({ where: { id: orderId } });
     if (!current || String(current.purpose || "SUBSCRIPTION") !== "WALLET_TOP_UP" || current.status !== "REFUNDED") return { reversed: false, reason: "ORDER_NOT_REFUNDED_TOP_UP" };
@@ -585,7 +587,7 @@ async function refundTopUp({ order, db = null }) {
 
 async function setCreatorBillingPreferences({ agencyId, creatorId, aiChatterEnabled, outreachEnabled, actorUserId = null, db = null }) {
   const client = db || prisma;
-  const result = await client.$transaction(async (tx) => {
+  const result = await runDbTransaction(client, async (tx) => {
     await lockAgencyBillingMutation(tx, agencyId);
     const creator = await tx.creatorAccount.findFirst({ where: { id: creatorId, agencyId, deletedAt: null }, include: { billingProfile: true } });
     if (!creator) throw billingError("Creator not found", "BILLING_CREATOR_NOT_FOUND", 404);
@@ -757,7 +759,7 @@ async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMod
 
 async function startCreatorSubscription({ agencyId, creatorId, testMode = false, actorUserId = null, db = null, now = new Date() }) {
   const client = db || prisma;
-  const result = await client.$transaction(async (tx) => {
+  const result = await runDbTransaction(client, async (tx) => {
     await lockAgencyBillingMutation(tx, agencyId);
     now = await dbAuthorityNow({ db: tx, fallbackNow: now });
     const creator = await tx.creatorAccount.findFirst({ where: { id: creatorId, agencyId, deletedAt: null }, include: { billingProfile: true, billingEntitlement: true } });
@@ -795,7 +797,7 @@ async function startCreatorSubscription({ agencyId, creatorId, testMode = false,
 
 async function cancelCreatorRenewal({ agencyId, creatorId, actorUserId = null, db = null }) {
   const client = db || prisma;
-  const result = await client.$transaction(async (tx) => {
+  const result = await runDbTransaction(client, async (tx) => {
     await lockAgencyBillingMutation(tx, agencyId);
     const creator = await tx.creatorAccount.findFirst({ where: { id: creatorId, agencyId, deletedAt: null }, include: { billingEntitlement: true } });
     if (!creator) throw billingError("Creator not found", "BILLING_CREATOR_NOT_FOUND", 404);
@@ -832,7 +834,7 @@ async function renewCreatorSubscription({ entitlement, db = null, now = new Date
   }
 
   try {
-    const result = await client.$transaction(async (tx) => {
+    const result = await runDbTransaction(client, async (tx) => {
       await lockAgencyBillingMutation(tx, agencyId);
       now = await dbAuthorityNow({ db: tx, fallbackNow: now });
       const freshEntitlement = await tx.creatorBillingEntitlement.findUnique({ where: { creatorId } });

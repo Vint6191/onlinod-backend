@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -102,14 +104,14 @@ test("INT4.3A SFS identity follows opaque targetUserId across username rename an
   const projectFanObservations = async (_tx, input) => { projections.push(input); return { ok: true, projected: 1 }; };
   try {
     const first = await loaded.service.applySfsDiscoveryChunk({
-      db,
+      db: commitDatabaseFixture(db),
       job: { id: "job-1", agencyId: "agency-1", creatorId: "creator-1", createdAt: new Date("2026-09-16T10:00:00.000Z") },
       deviceId: "device-1",
       chunkResult: chunk({ id: "123", username: "alice", price: 0, followed: false }),
       projectFanObservations,
     });
     const renamed = await loaded.service.applySfsDiscoveryChunk({
-      db,
+      db: commitDatabaseFixture(db),
       job: { id: "job-2", agencyId: "agency-1", creatorId: "creator-1", createdAt: new Date("2026-09-16T10:05:00.000Z") },
       deviceId: "device-1",
       chunkResult: chunk({ id: "123", username: "alice2", price: 0, followed: false }),
@@ -121,7 +123,7 @@ test("INT4.3A SFS identity follows opaque targetUserId across username rename an
     assert.equal(db.rows[0].username, "alice2");
 
     const recycled = await loaded.service.applySfsDiscoveryChunk({
-      db,
+      db: commitDatabaseFixture(db),
       job: { id: "job-3", agencyId: "agency-1", creatorId: "creator-1", createdAt: new Date("2026-09-16T10:10:00.000Z") },
       deviceId: "device-2",
       chunkResult: chunk({ id: "999", username: "alice2", price: 0, followed: false }),

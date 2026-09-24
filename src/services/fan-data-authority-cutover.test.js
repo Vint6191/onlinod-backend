@@ -1,3 +1,4 @@
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 "use strict";
 
 const test = require("node:test");
@@ -369,7 +370,7 @@ test("Subscriber Directory production bulk path carries the same per-field autho
     },
     $executeRawUnsafe: async (...args) => { calls.push(args); return 1; },
   };
-  const result = await projectSubscriberDirectoryRun(db, { runId: "run-1", agencyId: "a", creatorId: "c", sourceJobId: "job-1" });
+  const result = await projectSubscriberDirectoryRun(commitDatabaseFixture(db), { runId: "run-1", agencyId: "a", creatorId: "c", sourceJobId: "job-1" });
   assert.equal(result.projected, 1);
   assert.ok(calls.length >= 4);
   const sql = calls.map(([query]) => query).join("\n");

@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const crypto = require("node:crypto");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
@@ -15,6 +17,12 @@ const {
 const RUNTIME_LEASE_MS = 90 * 1000;
 const MAX_RUNTIME_CLAIMS = 100;
 const RUNTIME_ACCOUNT_STATE_BATCH = 250;
+const RUNTIME_AUTHORITY_SELECT = Object.freeze({
+  id: true, lifecycleState: true, runtimeClaimedByDeviceId: true, runtimeClaimToken: true, runtimeClaimUntil: true,
+  runtimeLeaseUserId: true, runtimeLeaseMemberId: true, runtimeLeaseAccessEpoch: true, runtimeLeaseCreatorId: true,
+  runtimeClaimGeneration: true, runtimeDrainedGeneration: true, runtimeClaimInboundEligible: true,
+});
+
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 function clean(value, max = 180) { const text = String(value == null ? "" : value).trim(); return text ? text.slice(0, max) : ""; }
@@ -253,17 +261,33 @@ async function claimTelegramExecutionRuntimes({ agencyId, member, deviceId, acco
     throw fail("TELEGRAM_EXECUTION_ACCOUNT_FORBIDDEN", "This member has no creator access through this Telegram account", 403);
   }
   const take = Math.max(1, Math.min(MAX_RUNTIME_CLAIMS, Math.floor(Number(limit) || MAX_RUNTIME_CLAIMS)));
-  const accountStateById = await fetchRuntimeAccountStateByIds({ agencyId, accountIds: candidates.map((candidate) => candidate.accountId), db });
+
+  const fallbackNow = now;
+  now = await dbAuthorityNow({ db, fallbackNow });
+  const accountStateById = await fetchRuntimeAccountStateByIds({ agencyId, accountIds: candidates.map(candidate => candidate.accountId), db });
   const leases = [];
   // Resource capacity is bounded by `take`, discovery is not. Walk every exact
   // eligible candidate until the lease budget is full. Stable early rows that
   // are owned by another Desktop must never hide a later claimable account.
   for (const candidate of candidates) {
     if (leases.length >= take) break;
-    const account = accountStateById.get(String(candidate.accountId));
-    if (!account) continue;
+    // Batched discovery is only an admission hint. Busy accounts incur no
+    // transaction; a possible winner is re-read under its row/access locks.
+    const hint = accountStateById.get(String(candidate.accountId));
+    if (!hint) continue;
+    const ownHint = hint.runtimeClaimedByDeviceId === normalizedDeviceId
+      && hint.runtimeLeaseUserId === actor.userId && hint.runtimeLeaseMemberId === actor.memberId
+      && Number(hint.runtimeLeaseAccessEpoch) === actor.accessEpoch;
+    if (!ownHint && (Number(hint.runtimeClaimGeneration || 0) > Number(hint.runtimeDrainedGeneration || 0)
+      || hint.runtimeClaimUntil && new Date(hint.runtimeClaimUntil) > now)) continue;
+    const granted = await runDbTransaction(db, async tx => {
+      await assertExecutionAccessFence({ db: tx, agencyId, creatorId: candidate.anchorCreatorId, ...actor, lock: true });
+      if (typeof tx.$queryRawUnsafe === "function") await tx.$queryRawUnsafe('SELECT "id" FROM "AgencyTelegramMtprotoAccount" WHERE "agencyId"=$1 AND "id"=$2 FOR UPDATE', agencyId, candidate.accountId);
+      const account = await tx.agencyTelegramMtprotoAccount.findFirst({ where: { agencyId, id: candidate.accountId }, select: RUNTIME_AUTHORITY_SELECT });
+      const now = await dbAuthorityNow({ db: tx, fallbackNow: fallbackNow });
+    if (!account) return null;
     const lifecycleState = telegramLifecycleState(account);
-    if (lifecycleState !== "ACTIVE" && lifecycleState !== "RETIRING") continue;
+    if (lifecycleState !== "ACTIVE" && lifecycleState !== "RETIRING") return null;
     const ownedIdentity = String(account.runtimeClaimedByDeviceId || "") === normalizedDeviceId
       && String(account.runtimeLeaseUserId || "") === actor.userId
       && String(account.runtimeLeaseMemberId || "") === actor.memberId
@@ -278,15 +302,14 @@ async function claimTelegramExecutionRuntimes({ agencyId, member, deviceId, acco
     const resumeUndrainedOwner = Boolean(ownedIdentity && priorUndrained);
     // A crashed/released runtime may own durable SQLite observations that the backend cannot see.
     // Never transfer that generation to a different Desktop merely because its TTL expired.
-    if (priorUndrained && !ownedIdentity) continue;
-    if (lifecycleState === "RETIRING" && !ownedIdentity) continue;
+    if (priorUndrained && !ownedIdentity) return null;
+    if (lifecycleState === "RETIRING" && !ownedIdentity) return null;
     const occupiedByOther = !ownedIdentity
       && account.runtimeClaimUntil
       && new Date(account.runtimeClaimUntil).getTime() > now.getTime();
-    if (occupiedByOther) continue;
-    await assertExecutionAccessFence({ db, agencyId, creatorId: candidate.anchorCreatorId, ...actor, lock: true });
+    if (occupiedByOther) return null;
     const claimToken = existingOwned || resumeUndrainedOwner || lifecycleState === "RETIRING" ? String(account.runtimeClaimToken) : crypto.randomUUID();
-    if (!claimToken) continue;
+    if (!claimToken) return null;
     const nextGeneration = existingOwned || resumeUndrainedOwner || lifecycleState === "RETIRING" ? claimGeneration : claimGeneration + 1;
     const claimUntil = new Date(now.getTime() + RUNTIME_LEASE_MS);
     const where = lifecycleState === "RETIRING"
@@ -323,7 +346,7 @@ async function claimTelegramExecutionRuntimes({ agencyId, member, deviceId, acco
               { runtimeClaimedByDeviceId: normalizedDeviceId },
             ],
           };
-    const changed = await db.agencyTelegramMtprotoAccount.updateMany({
+    const changed = await tx.agencyTelegramMtprotoAccount.updateMany({
       where,
       data: {
         runtimeClaimedByDeviceId: normalizedDeviceId,
@@ -339,8 +362,8 @@ async function claimTelegramExecutionRuntimes({ agencyId, member, deviceId, acco
           : (lifecycleState === "ACTIVE" && candidate.inboundEligible === true),
       },
     });
-    if (Number(changed?.count || 0) !== 1) continue;
-    leases.push({
+    if (Number(changed?.count || 0) !== 1) return null;
+    return {
       accountId: account.id,
       anchorCreatorId: candidate.anchorCreatorId,
       messagingEligible: lifecycleState === "ACTIVE" && candidate.messagingEligible === true,
@@ -350,7 +373,9 @@ async function claimTelegramExecutionRuntimes({ agencyId, member, deviceId, acco
       retiring: lifecycleState === "RETIRING",
       claimToken,
       claimUntil: claimUntil.toISOString(),
-    });
+    };
+    }, { timeout: 15000, authority: { kind: "PRODUCT_ACTOR", agencyId, creatorId: candidate.anchorCreatorId, userId: actor.userId } });
+    if (granted) leases.push(granted);
   }
   return { ok: true, leases, serverNow: now.toISOString(), leaseMs: RUNTIME_LEASE_MS };
 }
@@ -360,14 +385,14 @@ async function assertTelegramRuntimeLease({ agencyId, member, accountId, deviceI
   const normalizedDeviceId = clean(deviceId);
   const normalizedToken = clean(claimToken, 180);
   if (!normalizedAccountId || !normalizedDeviceId || !normalizedToken) throw fail("TELEGRAM_EXECUTION_LEASE_REQUIRED", "Telegram runtime lease is required", 409);
-  const account = await db.agencyTelegramMtprotoAccount.findFirst({
+  let account = await db.agencyTelegramMtprotoAccount.findFirst({
     where: { id: normalizedAccountId, agencyId },
     select: { id: true, lifecycleState: true, runtimeClaimedByDeviceId: true, runtimeClaimToken: true, runtimeClaimUntil: true, runtimeLeaseUserId: true, runtimeLeaseMemberId: true, runtimeLeaseAccessEpoch: true, runtimeLeaseCreatorId: true, runtimeClaimGeneration: true, runtimeDrainedGeneration: true, runtimeClaimInboundEligible: true },
   });
   if (!account) throw fail("TELEGRAM_EXECUTION_ACCOUNT_FORBIDDEN", "This Telegram account is not available", 403);
   const eligible = await eligibleTelegramExecutionAccounts({ agencyId, member, db, includeRetiring: true });
   let anchor = eligible.find((row) => row.accountId === normalizedAccountId) || null;
-  const lifecycleState = telegramLifecycleState(account);
+  let lifecycleState = telegramLifecycleState(account);
   // Retirement drain may outlive the account's mutable creator assignment. In that case the
   // signed runtime identity itself is the temporary drain anchor; it cannot grant new work and
   // is still checked against current member/creator access below.
@@ -387,6 +412,14 @@ async function assertTelegramRuntimeLease({ agencyId, member, accountId, deviceI
     };
   }
   if (!anchor) throw fail("TELEGRAM_EXECUTION_ACCOUNT_FORBIDDEN", "This member has no creator access through this Telegram account", 403);
+  await assertExecutionAccessFence({ db, agencyId, creatorId: anchor.anchorCreatorId,
+    userId: member?.userId, memberId: member?.id, accessEpoch: member?.accessEpoch, lock: true });
+  if (typeof db.$queryRawUnsafe === "function") await db.$queryRawUnsafe('SELECT "id" FROM "AgencyTelegramMtprotoAccount" WHERE "agencyId"=$1 AND "id"=$2 FOR SHARE', agencyId, normalizedAccountId);
+  account = await db.agencyTelegramMtprotoAccount.findFirst({ where: { agencyId, id: normalizedAccountId }, select: RUNTIME_AUTHORITY_SELECT });
+  if (!account) throw fail("TELEGRAM_EXECUTION_LEASE_INVALID", "Telegram runtime disappeared before admission", 409);
+  lifecycleState = telegramLifecycleState(account);
+  if (!["ACTIVE", "RETIRING"].includes(lifecycleState)) throw fail("TELEGRAM_EXECUTION_LEASE_INVALID", "Runtime account retired before admission", 409);
+  now = await dbAuthorityNow({ db, fallbackNow: now });
   const valid = String(account.runtimeClaimedByDeviceId || "") === normalizedDeviceId
     && String(account.runtimeClaimToken || "") === normalizedToken
     && String(account.runtimeLeaseUserId || "") === String(member?.userId || "")
@@ -396,15 +429,6 @@ async function assertTelegramRuntimeLease({ agencyId, member, accountId, deviceI
     && account.runtimeClaimUntil
     && new Date(account.runtimeClaimUntil).getTime() > now.getTime();
   if (!valid) throw fail("TELEGRAM_EXECUTION_LEASE_INVALID", "Telegram runtime lease is no longer valid", 409);
-  await assertExecutionAccessFence({
-    db,
-    agencyId,
-    creatorId: anchor.anchorCreatorId,
-    userId: member?.userId,
-    memberId: member?.id,
-    accessEpoch: member?.accessEpoch,
-    lock: true,
-  });
   return {
     account,
     anchorCreatorId: anchor.anchorCreatorId,

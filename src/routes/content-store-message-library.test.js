@@ -20,7 +20,7 @@ function loadRoute(db) {
   const priorFind = db.contentCollection.findFirst;
   db.contentCollection.findFirst = async args => { const row = await priorFind(args); return row && {agencyId:"agency-1",kind:"message_library_script",status:"active",updatedAt:new Date("2026-01-01"),...row}; };
   const priorTx = db.$transaction;
-  db.$transaction = fn => priorTx(tx => fn({...db,...tx,contentCollection:{...db.contentCollection,...tx.contentCollection}}));
+  db.$transaction = fn => priorTx(tx => fn({...db,...tx,$transaction:undefined,contentCollection:{...db.contentCollection,...tx.contentCollection}}));
 
   const router = createRouter();
   const originalLoad = Module._load;
@@ -82,7 +82,7 @@ function baseDb() {
       deleteMany: async () => ({ count: 0 }),
       delete: async () => ({}),
     },
-    $transaction: async (fn) => fn({}),
+    $transaction: async (fn) => fn({ ...({}), $transaction: undefined }),
   };
 }
 
@@ -121,7 +121,7 @@ test("script update preserves original author and exact message whitespace", asy
   db.contentCollection.findFirst = async () => existing;
   let collectionUpdate = null;
   let blockCreate = null;
-  db.$transaction = async (fn) => fn({
+  db.$transaction = async (fn) => fn({ ...({
     $executeRawUnsafe: async (sql, payload) => { if(sql.includes('INSERT INTO "ContentBlock"')) blockCreate=JSON.parse(payload)[0]; return 1; },
     contentCollection: {
       update: async ({ data }) => { collectionUpdate = data; return { ...existing, ...data }; },
@@ -136,7 +136,7 @@ test("script update preserves original author and exact message whitespace", asy
       update: async () => ({}),
       create: async ({ data }) => { blockCreate = data; return data; },
     },
-  });
+  }), $transaction: undefined });
   const api = loadRoute(db);
   const res = response();
   await api.route("PUT", "/message-library/scripts/:id")({
@@ -263,7 +263,7 @@ test("script id collisions cannot move a script to another creator", async () =>
     id: "server-script-1", clientId: "script-1", creatorId: "creator-a", blocks: [],
   });
   let transactionCalled = false;
-  db.$transaction = async fn => { transactionCalled = true; return fn({}); };
+  db.$transaction = async fn => { transactionCalled = true; return fn({ ...({}), $transaction: undefined }); };
   const api = loadRoute(db);
   const res = response();
   await api.route("PUT", "/message-library/scripts/:id")({

@@ -152,13 +152,13 @@ test("automatic creator scheduling delegates notification history to the strict 
   assert.match(scanControl, /status:\s*"PAUSED"/);
 });
 
-test("completion preserves run identity, streams compatibility facts and treats proven source traversal as technically done", () => {
+test("completion preserves run identity, publishes durable consequences and proves exact run page receipts", () => {
   const ledgerAt = observation.indexOf("await ingestNotificationFacts");
-  const compatibilityAt = observation.indexOf("for await (const fact of iterateCanonicalProjectionFacts");
+  const compatibilityAt = observation.indexOf("publishNotificationConsequences({ db, job })");
   assert.ok(ledgerAt >= 0 && compatibilityAt > ledgerAt);
   assert.match(observation, /batchKey: result\?\.batchKey/);
-  assert.match(observation, /sourceJobId: job\.id/);
-  assert.match(observation, /NOTIFICATION_COMPATIBILITY_PAGE_SIZE = 500/);
+  assert.match(observation, /notificationCommittedPageProof\(db, job, result\)/);
+  assert.doesNotMatch(observation, /iterateCanonicalProjectionFacts|for await \(const fact/);
   assert.doesNotMatch(observation, /NOTIFICATION_COMPATIBILITY_LIMIT/);
   assert.match(observation, /collectionCoverageByType/);
   assert.match(observation, /subscriptionRefundIgnored/);
@@ -166,7 +166,7 @@ test("completion preserves run identity, streams compatibility facts and treats 
   assert.match(observation, /sourceTraversalComplete/);
   assert.match(observation, /result\?\.sourceExhausted === true/);
   assert.match(leaseService, /job\.jobKey === "catchup_notifications_scan"/);
-  assert.match(leaseService, /existingParams\.manualNotificationScan === true/);
+  assert.match(leaseService, /job\.params\?\.manualNotificationScan === true/);
   assert.match(leaseService, /notification scan completed with rejected facts/);
   assert.match(leaseService, /leaseRevision: \{ increment: 1 \}/);
   assert.match(leaseService, /notification scan scheduled for repair/);

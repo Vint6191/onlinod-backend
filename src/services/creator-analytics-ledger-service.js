@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
@@ -375,10 +377,7 @@ function proofMessage(proof) {
 }
 
 async function inTransaction(db, callback) {
-  if (typeof db?.$transaction === "function") {
-    return db.$transaction(callback, { maxWait: 10_000, timeout: 60_000 });
-  }
-  return callback(db);
+  return runDbTransaction(db, callback, { maxWait: 10_000, timeout: 60_000 });
 }
 
 async function beginBatch(tx, { job, agencyId, creatorId, deviceId, idempotencyKey, dataType, rangeFrom, rangeTo, sourceTimezone = "UTC", collectorVersion, schemaVersion, payload }) {

@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -36,7 +38,7 @@ function migrationFake(legacy) {
   let canonical = null;
   let legacyPresent = true;
   const fake = {
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     async $executeRawUnsafe() { return 0; },
     async $queryRawUnsafe(sql) {
       const text = String(sql);
@@ -172,7 +174,7 @@ test("Closure6 senior manager can resolve historical quarantine beyond 48h with 
       },
       async findMany() { return [{ id: "member-B", userId: "user-B", user: { name: "B" } }]; },
     },
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     creatorTip: {
       async findUnique() {
         return {
@@ -215,7 +217,7 @@ test("Closure6 senior manager can resolve historical quarantine beyond 48h with 
   assert.ok(row.history.some((item) => item.action === "audit15_closure7_finalize_migration_review" && item.requiresManualReview === false));
 
   const reconciliation = require("./team-money-reconciliation-service");
-  const auto = await reconciliation.reconcileCreatorTipToTeam({ db: fake, tipId: "creator-tip-1" });
+  const auto = await reconciliation.reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fake), tipId: "creator-tip-1" });
   assert.equal(auto.ok, true);
   assert.equal(auto.preservedManualResolution, true, "future automatic projection must preserve senior migration review");
   assert.equal(row.status, "resolved");
@@ -240,7 +242,7 @@ test("Closure6 ordinary 48h lock remains for non-senior or non-review manager_ov
   };
   const fake = {
     agencyMember: { async findFirst({ where }) { return { id: where.id || "manager-1", userId: "user-manager", role: "manager", roleKey: "manager" }; } },
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     teamTipLedger: { async findFirst() { return structuredClone(old); } },
   };
   const tips = loadWithPrisma(fake);

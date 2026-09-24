@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -210,7 +212,7 @@ function createDb() {
         return { count: 1 };
       },
     },
-    $transaction: async (fn) => fn(api),
+    $transaction: async (fn) => fn({ ...(api), $transaction: undefined }),
   };
   return api;
 }
@@ -274,7 +276,7 @@ test("discovery pages build only a PLANNED list and never schedule history early
   resetDb();
   const { job } = seedDiscovery();
   const page = await applyDialogIntelligenceChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job,
     deviceId: "device-1",
     chunkResult: {
@@ -305,7 +307,7 @@ test("an asynchronous 100-dialog discovery batch advances durable page counters 
   resetDb();
   const { job } = seedDiscovery();
   const result = await applyDialogIntelligenceChunk({
-    db, job, deviceId: "device-1",
+    db: commitDatabaseFixture(db), job, deviceId: "device-1",
     chunkResult: {
       kind: "dialog_discovery_page", runId: "discovery-run", chunkKey: "batch-0",
       page: 0, pageStart: 0, pageEnd: 10, pagesInBatch: 10, childMode: "initial", hasMore: true,
@@ -341,7 +343,7 @@ test("hasMore=false freezes the full list for batch CRM claims without creating 
   }
 
   const completion = await completeDialogIntelligenceJob({
-    db,
+    db: commitDatabaseFixture(db),
     job,
     deviceId: "device-1",
     result: { pages: 4, dialogsFound: 3, hasMore: false },
@@ -419,7 +421,7 @@ test("explicit full discovery replans completed dialogs and resets current-plan 
   });
 
   await applyDialogIntelligenceChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job,
     deviceId: "device-1",
     chunkResult: {
@@ -518,7 +520,7 @@ test("a committed hasMore=false discovery boundary finalizes a stranded schedule
   run.status = "QUEUED";
 
   await applyDialogIntelligenceChunk({
-    db, job, deviceId: "device-1",
+    db: commitDatabaseFixture(db), job, deviceId: "device-1",
     chunkResult: {
       kind: "dialog_discovery_page", runId: run.id, chunkKey: "terminal-daily",
       page: 0, pageStart: 0, pageEnd: 1, pagesInBatch: 1, childMode: "incremental", hasMore: false,
@@ -570,7 +572,7 @@ test("terminal discovery recovery never steals a live claimed lease", async () =
   job.status = "CLAIMED";
   job.leaseUntil = new Date("2026-07-22T02:00:00.000Z");
   await applyDialogIntelligenceChunk({
-    db, job, deviceId: "device-1",
+    db: commitDatabaseFixture(db), job, deviceId: "device-1",
     chunkResult: {
       kind: "dialog_discovery_page", runId: run.id, chunkKey: "terminal-live",
       page: 0, pageStart: 0, pageEnd: 1, pagesInBatch: 1, childMode: "incremental", hasMore: false,
@@ -634,7 +636,7 @@ test("daily discovery keeps an unchanged completed dialog READY without resettin
   });
 
   const result = await applyDialogIntelligenceChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job,
     deviceId: "device-1",
     chunkResult: {
@@ -690,7 +692,7 @@ test("unchanged list heads clear stale planned/failed/idle states without messag
     });
 
     const result = await applyDialogIntelligenceChunk({
-      db,
+      db: commitDatabaseFixture(db),
       job,
       deviceId: "device-1",
       chunkResult: {
@@ -743,7 +745,7 @@ test("daily discovery plans only a changed completed dialog for incremental hist
   });
 
   const result = await applyDialogIntelligenceChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job,
     deviceId: "device-1",
     chunkResult: {
@@ -786,7 +788,7 @@ test("legacy completed dialogs bootstrap from their full-scan timestamp instead 
     createdAt: new Date(0), updatedAt: new Date(0),
   });
   const result = await applyDialogIntelligenceChunk({
-    db, job, deviceId: "device-1",
+    db: commitDatabaseFixture(db), job, deviceId: "device-1",
     chunkResult: {
       kind: "dialog_discovery_page", runId: "discovery-run", chunkKey: "legacy-watermark-old",
       page: 0, childMode: "incremental", hasMore: false,
@@ -810,7 +812,7 @@ test("legacy completed dialogs with a marker newer than their last scan are plan
     createdAt: new Date(0), updatedAt: new Date(0),
   });
   const result = await applyDialogIntelligenceChunk({
-    db, job, deviceId: "device-1",
+    db: commitDatabaseFixture(db), job, deviceId: "device-1",
     chunkResult: {
       kind: "dialog_discovery_page", runId: "discovery-run", chunkKey: "legacy-watermark-new",
       page: 0, childMode: "incremental", hasMore: false,
@@ -826,7 +828,7 @@ test("a new dialog found by a daily list rebuild is planned as an initial scan",
   resetDb();
   const { job } = seedDiscovery(122, "incremental");
   const result = await applyDialogIntelligenceChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job,
     deviceId: "device-1",
     chunkResult: {
@@ -874,7 +876,7 @@ test("an unchanged unavailable dialog stays terminal during daily maintenance", 
     updatedAt: new Date(0),
   });
   const result = await applyDialogIntelligenceChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job,
     deviceId: "device-1",
     chunkResult: {

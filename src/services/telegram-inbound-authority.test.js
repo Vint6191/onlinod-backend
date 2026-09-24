@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
@@ -128,17 +130,17 @@ function fixture({ projectedIdentity = false }={}) {
     auditLog:{async create({data}){const row={id:`audit-${audits.length+1}`,...clone(data)};audits.push(row);return clone(row);}},
     async $transaction(fn){
       const snapshots={orders:clone(orders),intents:clone(intents),events:clone(events),submissions:clone(submissions),audits:clone(audits)};
-      try{return await fn(this);}catch(error){
+      try{return await fn({ ...(this), $transaction: undefined });}catch(error){
         orders.splice(0,orders.length,...snapshots.orders); intents.splice(0,intents.length,...snapshots.intents);
         events.splice(0,events.length,...snapshots.events); submissions.splice(0,submissions.length,...snapshots.submissions); audits.splice(0,audits.length,...snapshots.audits);
         throw error;
       }
     },
   };
-  return {db,member,now,agency,creator,orders,intents,events,submissions,audits};
+  return {db: commitDatabaseFixture(db),member,now,agency,creator,orders,intents,events,submissions,audits};
 }
 
-function ingestRaw(fx, extra={}) { return ingestTelegramInboundEvent({ agencyId:"agency-1",member:fx.member,accountId:"tg-1",deviceId:"device-1",claimToken:"runtime-1",senderTelegramUserId:"900001",messageId:801,replyToMessageId:700,hasMedia:false,sentAt:fx.now.toISOString(),now:fx.now,db:fx.db,...extra }); }
+function ingestRaw(fx, extra={}) { return ingestTelegramInboundEvent({ agencyId:"agency-1",member:fx.member,accountId:"tg-1",deviceId:"device-1",claimToken:"runtime-1",senderTelegramUserId:"900001",messageId:801,replyToMessageId:700,hasMedia:false,sentAt:fx.now.toISOString(),now:fx.now,db:commitDatabaseFixture(fx.db),...extra }); }
 async function ingest(fx, extra={}) { const result=await ingestRaw(fx,extra); await new Promise((resolve)=>setImmediate(resolve)); return result; }
 
 test("confirmed provider recipient identity correlates inbound even when best-effort Creator.telegramUserId projection is missing",async()=>{
@@ -202,7 +204,7 @@ test("late confirmed recipient receipt promotes a durable unresolved inbound eve
   const first=await ingest(fx,{messageId:906,replyToMessageId:null,hasMedia:true});
   assert.equal(first.event.creatorId,null);
   fx.intents.push({id:"intent-task-late",agencyId:"agency-1",creatorId:"creator-1",customOrderId:"order-1",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:700,remoteRecipientTelegramUserId:"900001",remoteSentAt:new Date(fx.now.getTime()-5000),confirmedAt:new Date(fx.now.getTime()+1000)});
-  const repaired=await reconcilePendingInboundForConfirmedDelivery({agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",now:new Date(fx.now.getTime()+2000),db:fx.db});
+  const repaired=await reconcilePendingInboundForConfirmedDelivery({agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",now:new Date(fx.now.getTime()+2000),db:commitDatabaseFixture(fx.db)});
   assert.equal(repaired.reconciled,1);
   assert.equal(fx.events[0].creatorId,"creator-1");
   assert.equal(fx.events[0].customOrderId,"order-1");
@@ -222,7 +224,7 @@ test("confirmed receipt reconciliation is a bounded resumable keyset page instea
   }
   const first=await reconcilePendingInboundForConfirmedDelivery({
     agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",
-    now:new Date(fx.now.getTime()+1000),limit:100,db:fx.db,
+    now:new Date(fx.now.getTime()+1000),limit:100,db:commitDatabaseFixture(fx.db),
   });
   assert.equal(first.scanned,100);
   assert.equal(first.hasMore,true);
@@ -232,7 +234,7 @@ test("confirmed receipt reconciliation is a bounded resumable keyset page instea
 
   const second=await reconcilePendingInboundForConfirmedDelivery({
     agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",
-    now:new Date(fx.now.getTime()+2000),limit:100,cursor:first.nextCursor,db:fx.db,
+    now:new Date(fx.now.getTime()+2000),limit:100,cursor:first.nextCursor,db:commitDatabaseFixture(fx.db),
   });
   assert.equal(second.scanned,100);
   assert.equal(second.hasMore,true);
@@ -240,7 +242,7 @@ test("confirmed receipt reconciliation is a bounded resumable keyset page instea
 
   const third=await reconcilePendingInboundForConfirmedDelivery({
     agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",
-    now:new Date(fx.now.getTime()+3000),limit:100,cursor:second.nextCursor,db:fx.db,
+    now:new Date(fx.now.getTime()+3000),limit:100,cursor:second.nextCursor,db:commitDatabaseFixture(fx.db),
   });
   assert.equal(third.scanned,5);
   assert.equal(third.hasMore,false);
@@ -255,7 +257,7 @@ test("late manual confirmation without recipient identity still repairs an unres
   const first=await ingest(fx,{messageId:907,replyToMessageId:777,hasMedia:true});
   assert.equal(first.event.creatorId,null);
   fx.intents.push({id:"intent-manual-late",agencyId:"agency-1",creatorId:"creator-1",customOrderId:"order-1",accountId:"tg-1",kind:"MANUAL_REMINDER",state:"CONFIRMED",remoteMessageId:777,remoteRecipientTelegramUserId:null,confirmedAt:new Date(fx.now.getTime()+1000)});
-  const repaired=await reconcilePendingInboundForConfirmedDelivery({agencyId:"agency-1",accountId:"tg-1",replyToMessageId:777,actorUserId:"user-1",now:new Date(fx.now.getTime()+2000),db:fx.db});
+  const repaired=await reconcilePendingInboundForConfirmedDelivery({agencyId:"agency-1",accountId:"tg-1",replyToMessageId:777,actorUserId:"user-1",now:new Date(fx.now.getTime()+2000),db:commitDatabaseFixture(fx.db)});
   assert.equal(repaired.reconciled,1);
   assert.equal(fx.events[0].creatorId,"creator-1");
   assert.equal(fx.events[0].customOrderId,"order-1");
@@ -315,9 +317,9 @@ test("concurrent inbound projectors cannot downgrade a terminal projection with 
     return originalFind(args);
   };
 
-  const stale=projectTelegramInboundEvent({eventId:fx.events[0].id,actorUserId:"user-1",now:new Date(fx.now.getTime()+1000),db:fx.db});
+  const stale=projectTelegramInboundEvent({eventId:fx.events[0].id,actorUserId:"user-1",now:new Date(fx.now.getTime()+1000),db:commitDatabaseFixture(fx.db)});
   await new Promise((resolve)=>setImmediate(resolve));
-  const winner=await projectTelegramInboundEvent({eventId:fx.events[0].id,actorUserId:"user-1",now:new Date(fx.now.getTime()+1001),db:fx.db});
+  const winner=await projectTelegramInboundEvent({eventId:fx.events[0].id,actorUserId:"user-1",now:new Date(fx.now.getTime()+1001),db:commitDatabaseFixture(fx.db)});
   assert.equal(winner.state,"SKIPPED");
   assert.equal(fx.events[0].projectionState,"SKIPPED");
   assert.equal(fx.events[0].projectionReason,"NO_MEDIA");
@@ -346,7 +348,7 @@ test("server retry sweep can drain crash-window inbound globally without hot-loo
     createdAt:new Date(fx.now),updatedAt:new Date(fx.now),
   });
 
-  const result=await retryPendingInboundProjections({now:new Date(fx.now.getTime()+1000),limit:50,db:fx.db});
+  const result=await retryPendingInboundProjections({now:new Date(fx.now.getTime()+1000),limit:50,db:commitDatabaseFixture(fx.db)});
   assert.equal(result.scanned,1,"global server sweep should select the crash-window row without requiring an agency/Desktop caller");
   assert.equal(fx.events[0].projectionState,"SKIPPED");
   assert.equal(fx.events[0].projectionReason,"NO_MEDIA");
@@ -373,13 +375,13 @@ test("retry sweep rotates persistently failing rows so later durable inbound wor
     return originalFindMany(args);
   };
 
-  const first=await retryPendingInboundProjections({agencyId:"agency-1",now:new Date(fx.now.getTime()+1000),limit:2,db:fx.db});
+  const first=await retryPendingInboundProjections({agencyId:"agency-1",now:new Date(fx.now.getTime()+1000),limit:2,db:commitDatabaseFixture(fx.db)});
   assert.equal(first.scanned,2);
   assert.equal(fx.events[0].projectionState,"FAILED_RETRYABLE");
   assert.equal(fx.events[1].projectionState,"FAILED_RETRYABLE");
   assert.equal(fx.events[3].projectionState,"FAILED_RETRYABLE","later work is untouched in the first bounded pass");
 
-  const second=await retryPendingInboundProjections({agencyId:"agency-1",now:new Date(fx.now.getTime()+2000),limit:2,db:fx.db});
+  const second=await retryPendingInboundProjections({agencyId:"agency-1",now:new Date(fx.now.getTime()+2000),limit:2,db:commitDatabaseFixture(fx.db)});
   assert.equal(second.scanned,2);
   assert.equal(fx.events[3].projectionState,"SKIPPED","a later executable observation must become reachable instead of starving behind the same poisoned head rows");
   assert.equal(fx.events[3].projectionReason,"NO_MEDIA");
@@ -400,7 +402,7 @@ function seedReview(fx, overrides={}) {
 
 test("REVIEW_REQUIRED inbound events are visible in a management queue with explicit resolve capability",async()=>{
   const fx=fixture(); seedReview(fx);
-  const queue=await listTelegramInboundReviewQueue({agencyId:"agency-1",member:fx.member,limit:25,now:fx.now,db:fx.db});
+  const queue=await listTelegramInboundReviewQueue({agencyId:"agency-1",member:fx.member,limit:25,now:fx.now,db:commitDatabaseFixture(fx.db)});
   assert.equal(queue.ok,true); assert.equal(queue.count,1); assert.equal(queue.items.length,1); assert.equal(queue.canResolve,true);
   assert.equal(queue.items[0].eventId,fx.events[0].id); assert.equal(queue.items[0].projectionReason,"PROVENANCE_CONFLICT");
   assert.equal(queue.items[0].creatorId,"creator-1"); assert.equal(queue.items[0].customOrderId,"order-1");
@@ -416,7 +418,7 @@ test("ambiguous active threads expose candidates from each current thread withou
   const creator2={id:"creator-2",agencyId:"agency-1",status:"READY",deletedAt:null,displayName:"Creator Two",username:"creator2",avatarUrl:null};
   fx.db.creatorAccount.findMany=async({where})=>[fx.creator,creator2].filter((row)=>matches(row,where)).map(clone);
   seedReview(fx,{id:"review-ambiguous",creatorId:null,customOrderId:null,replyToMessageId:null,messageId:992,projectionReason:"ACTIVE_THREAD_AMBIGUOUS"});
-  const queue=await listTelegramInboundReviewQueue({agencyId:"agency-1",member:fx.member,limit:25,now:fx.now,db:fx.db});
+  const queue=await listTelegramInboundReviewQueue({agencyId:"agency-1",member:fx.member,limit:25,now:fx.now,db:commitDatabaseFixture(fx.db)});
   const item=queue.items.find((row)=>row.eventId==="review-ambiguous");
   assert.ok(item); assert.equal(item.threadContext.type,"AMBIGUOUS_ACTIVE_THREADS");
   assert.equal(item.candidateOrders.some((candidate)=>candidate.customOrderId==="order-1"),true);
@@ -447,7 +449,7 @@ test("REVIEW_REQUIRED candidate search can recover an older valid target beyond 
     }
     return original(args);
   };
-  const result=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-search",query:"#older-exact-target",limit:30,db:fx.db});
+  const result=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-search",query:"#older-exact-target",limit:30,db:commitDatabaseFixture(fx.db)});
   assert.equal(result.proofState,"NO_ACTIVE_THREAD");
   assert.deepEqual(result.items.map((row)=>row.customOrderId),["older-exact-target"]);
 });
@@ -459,7 +461,7 @@ test("candidate search applies proven thread eligibility before LIMIT so an olde
   for(let i=0;i<40;i+=1){
     fx.orders.unshift({...clone(fx.orders[0]),id:`newer-nonthread-${i}`,scenario:`newer nonthread ${i}`,telegramTaskMessageId:null,createdAt:new Date(fx.now.getTime()+i+1),updatedAt:new Date(fx.now)});
   }
-  const result=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-thread-window",query:"",limit:30,db:fx.db});
+  const result=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-thread-window",query:"",limit:30,db:commitDatabaseFixture(fx.db)});
   assert.equal(result.proofState,"UNIQUE_ACTIVE_THREAD");
   assert.deepEqual(result.items.map((row)=>row.customOrderId),["order-1"],"presentation LIMIT must run after exact thread eligibility");
 });
@@ -467,7 +469,7 @@ test("candidate search applies proven thread eligibility before LIMIT so an olde
 test("DIRECT_REPLY_UNRESOLVED broad-manager override has a searchable candidate surface",async()=>{
   const fx=fixture();
   seedReview(fx,{id:"review-direct-unresolved",creatorId:null,customOrderId:null,replyToMessageId:999999,messageId:974,projectionReason:"DIRECT_REPLY_UNRESOLVED"});
-  const result=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-direct-unresolved",query:"order-1",limit:30,db:fx.db});
+  const result=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-direct-unresolved",query:"order-1",limit:30,db:commitDatabaseFixture(fx.db)});
   assert.equal(result.proofState,"DIRECT_REPLY_UNRESOLVED");
   assert.equal(result.items.some((row)=>row.customOrderId==="order-1"),true,"the same explicit broad override accepted by mutation authority must be reachable from search");
 });
@@ -480,7 +482,7 @@ test("stale candidate search result cannot bypass a provider-proof change before
     sentAt:new Date(fx.now),observedAt:new Date(fx.now),projectionState:"REVIEW_REQUIRED",projectionReason:"CUSTOM_SUBMISSION_ORDER_NOT_FOUND",projectionAttempts:1,projectedAt:new Date(fx.now),
     createdAt:new Date(fx.now),updatedAt:new Date(fx.now),
   });
-  const searched=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-search-stale-proof",query:"order-1",db:fx.db});
+  const searched=await searchTelegramInboundReviewCandidates({agencyId:"agency-1",member:fx.member,eventId:"review-search-stale-proof",query:"order-1",db:commitDatabaseFixture(fx.db)});
   assert.equal(searched.proofState,"UNIQUE_ACTIVE_THREAD");
   assert.equal(searched.items[0]?.customOrderId,"order-1");
 
@@ -490,7 +492,7 @@ test("stale candidate search result cannot bypass a provider-proof change before
   fx.orders.push({...clone(fx.orders[0]),id:"order-other",creatorId:"creator-2",status:"PENDING",telegramTaskMessageId:799,contentBoundAt:null,updatedAt:new Date(fx.now)});
   fx.intents.push({id:"intent-current-other",agencyId:"agency-1",creatorId:"creator-2",customOrderId:"order-other",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:799,remoteRecipientTelegramUserId:"900001",confirmedAt:new Date(fx.now)});
   await assert.rejects(
-    ()=>resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:"review-search-stale-proof",resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"candidate looked valid before thread changed",customOrderId:"order-1",now:fx.now,db:fx.db}),
+    ()=>resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:"review-search-stale-proof",resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"candidate looked valid before thread changed",customOrderId:"order-1",now:fx.now,db:commitDatabaseFixture(fx.db)}),
     (error)=>["TELEGRAM_INBOUND_REVIEW_THREAD_CONFLICT","TELEGRAM_INBOUND_REVIEW_ORDER_INVALID","CUSTOM_SUBMISSION_ORDER_CLOSED"].includes(error?.code) && error?.status===409,
   );
   assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED");
@@ -500,10 +502,10 @@ test("stale candidate search result cannot bypass a provider-proof change before
 test("member may view REVIEW_REQUIRED queue but cannot resolve without content.review_customs",async()=>{
   const fx=fixture(); seedReview(fx);
   const viewer={...fx.member,role:"SUPERVISOR",roleKey:"supervisor",permissions:{"team.analytics.view":true,"content.review_customs":false}};
-  const queue=await listTelegramInboundReviewQueue({agencyId:"agency-1",member:viewer,db:fx.db});
+  const queue=await listTelegramInboundReviewQueue({agencyId:"agency-1",member:viewer,db:commitDatabaseFixture(fx.db)});
   assert.equal(queue.items.length,1); assert.equal(queue.canResolve,false);
   await assert.rejects(
-    resolveTelegramInboundReview({agencyId:"agency-1",member:viewer,eventId:fx.events[0].id,resolution:"SKIP",reason:"manager decision",now:fx.now,db:fx.db}),
+    resolveTelegramInboundReview({agencyId:"agency-1",member:viewer,eventId:fx.events[0].id,resolution:"SKIP",reason:"manager decision",now:fx.now,db:commitDatabaseFixture(fx.db)}),
     (error)=>error?.code==="TELEGRAM_INBOUND_REVIEW_FORBIDDEN" && error?.status===403,
   );
   assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED");
@@ -511,17 +513,17 @@ test("member may view REVIEW_REQUIRED queue but cannot resolve without content.r
 
 test("explicit REVIEW_REQUIRED skip is audited and stale automatic projection cannot downgrade it",async()=>{
   const fx=fixture(); seedReview(fx);
-  const resolved=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"SKIP",reason:"confirmed unrelated media",now:fx.now,db:fx.db});
+  const resolved=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"SKIP",reason:"confirmed unrelated media",now:fx.now,db:commitDatabaseFixture(fx.db)});
   assert.equal(resolved.state,"SKIPPED"); assert.match(fx.events[0].projectionReason,/^MANUAL_SKIP:/);
   assert.equal(fx.audits.some((row)=>row.action==="custom_order.telegram_inbound_review_skip"),true);
   assert.equal(fx.audits.at(-1).metadata.previousReason,"PROVENANCE_CONFLICT");
-  const stale=await projectTelegramInboundEvent({eventId:fx.events[0].id,actorUserId:"stale-worker",now:new Date(fx.now.getTime()+1000),db:fx.db});
+  const stale=await projectTelegramInboundEvent({eventId:fx.events[0].id,actorUserId:"stale-worker",now:new Date(fx.now.getTime()+1000),db:commitDatabaseFixture(fx.db)});
   assert.equal(stale.state,"SKIPPED"); assert.match(stale.reason,/^MANUAL_SKIP:/); assert.equal(fx.events[0].projectionState,"SKIPPED");
 });
 
 test("explicit REVIEW_REQUIRED retry is audited and deterministically re-enters automatic projection",async()=>{
   const fx=fixture(); seedReview(fx,{projectionReason:"CUSTOM_SUBMISSION_ORDER_NOT_FOUND",hasMedia:false});
-  const resolved=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"RETRY_AFTER_REPAIR",reason:"order repaired",now:new Date(fx.now.getTime()+1000),db:fx.db});
+  const resolved=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"RETRY_AFTER_REPAIR",reason:"order repaired",now:new Date(fx.now.getTime()+1000),db:commitDatabaseFixture(fx.db)});
   assert.equal(resolved.state,"SKIPPED"); assert.equal(resolved.projectionReason,"NO_MEDIA");
   assert.equal(fx.events[0].projectionState,"SKIPPED"); assert.equal(fx.events[0].projectionReason,"NO_MEDIA");
   const audit=fx.audits.find((row)=>row.action==="custom_order.telegram_inbound_review_retry");
@@ -533,7 +535,7 @@ test("human SKIP/RETRY state transition and mandatory reason audit commit atomic
     const fx=fixture(); seedReview(fx,{projectionReason:"PROVENANCE_CONFLICT"});
     fx.db.auditLog.create=async()=>{throw Object.assign(new Error("audit storage unavailable"),{code:"AUDIT_DOWN"});};
     await assert.rejects(
-      resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution,reason:"manager decision",now:new Date(fx.now.getTime()+1000),db:fx.db}),
+      resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution,reason:"manager decision",now:new Date(fx.now.getTime()+1000),db:commitDatabaseFixture(fx.db)}),
       (error)=>error?.code==="AUDIT_DOWN",
     );
     assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED","failed audit must roll back the human state decision");
@@ -544,14 +546,14 @@ test("human SKIP/RETRY state transition and mandatory reason audit commit atomic
 
 test("backend retry sweep converges linked stale REVIEW_REQUIRED rows to APPLIED without UI",async()=>{
   const fx=fixture(); seedReview(fx,{submissionId:"submission-scheduler"});
-  const result=await retryPendingInboundProjections({agencyId:"agency-1",now:new Date(fx.now.getTime()+1000),limit:50,db:fx.db});
+  const result=await retryPendingInboundProjections({agencyId:"agency-1",now:new Date(fx.now.getTime()+1000),limit:50,db:commitDatabaseFixture(fx.db)});
   assert.equal(result.convergedLinked,1); assert.equal(result.applied,1);
   assert.equal(fx.events[0].projectionState,"APPLIED"); assert.equal(fx.events[0].projectionReason,"SUBMISSION_ALREADY_LINKED");
 });
 
 test("submissionId is a stronger durable fact and REVIEW_REQUIRED converges to APPLIED",async()=>{
   const fx=fixture(); seedReview(fx,{submissionId:"submission-1"});
-  const projected=await projectTelegramInboundEvent({eventId:fx.events[0].id,actorUserId:"user-1",now:fx.now,db:fx.db});
+  const projected=await projectTelegramInboundEvent({eventId:fx.events[0].id,actorUserId:"user-1",now:fx.now,db:commitDatabaseFixture(fx.db)});
   assert.equal(projected.state,"APPLIED"); assert.equal(projected.submission.id,"submission-1");
   assert.equal(fx.events[0].projectionState,"APPLIED"); assert.equal(fx.events[0].projectionReason,"SUBMISSION_ALREADY_LINKED");
 });
@@ -569,7 +571,7 @@ test("Serializable REVIEW_REQUIRED transaction conflict becomes deterministic re
   const fx=fixture(); seedReview(fx);
   fx.db.$transaction=async()=>{throw Object.assign(new Error("serialization failure"),{code:"P2034"});};
   await assert.rejects(
-    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"SKIP",reason:"manager decision",now:fx.now,db:fx.db}),
+    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"SKIP",reason:"manager decision",now:fx.now,db:commitDatabaseFixture(fx.db)}),
     (error)=>error?.code==="TELEGRAM_INBOUND_REVIEW_RACE" && error?.status===409,
   );
   assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED");
@@ -578,7 +580,7 @@ test("Serializable REVIEW_REQUIRED transaction conflict becomes deterministic re
 test("explicit review resolution requires a human reason",async()=>{
   const fx=fixture(); seedReview(fx);
   await assert.rejects(
-    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"SKIP",reason:" ",now:fx.now,db:fx.db}),
+    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"SKIP",reason:" ",now:fx.now,db:commitDatabaseFixture(fx.db)}),
     (error)=>error?.code==="TELEGRAM_INBOUND_REVIEW_REASON_REQUIRED",
   );
   assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED");
@@ -589,7 +591,7 @@ test("explicit REVIEW_REQUIRED assignment materializes the provider event and as
   const fx=fixture();
   seedReview(fx,{customOrderId:null,hasMedia:true,text:"provider media for repaired custom"});
   const resolved=await resolveTelegramInboundReview({
-    agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"provider identity repaired and target verified",customOrderId:"order-1",now:new Date(fx.now.getTime()+1000),db:fx.db,
+    agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"provider identity repaired and target verified",customOrderId:"order-1",now:new Date(fx.now.getTime()+1000),db:commitDatabaseFixture(fx.db),
   });
   assert.equal(resolved.state,"APPLIED"); assert.ok(resolved.submissionId);
   assert.equal(fx.events[0].projectionState,"APPLIED"); assert.equal(fx.events[0].customOrderId,"order-1"); assert.equal(fx.events[0].submissionId,resolved.submissionId);
@@ -606,7 +608,7 @@ test("REVIEW_REQUIRED assignment supersedes a precommit initial TASK before the 
   seedReview(fx,{customOrderId:null,hasMedia:true,text:"historical response while task is still precommit"});
   const resolved=await resolveTelegramInboundReview({
     agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",
-    reason:"explicit human recovery supersedes unsent instruction",customOrderId:"order-1",now:new Date(fx.now.getTime()+1000),db:fx.db,
+    reason:"explicit human recovery supersedes unsent instruction",customOrderId:"order-1",now:new Date(fx.now.getTime()+1000),db:commitDatabaseFixture(fx.db),
   });
   assert.equal(resolved.state,"APPLIED");
   assert.equal(fx.events[0].projectionState,"APPLIED");
@@ -621,7 +623,7 @@ test("REVIEW_REQUIRED assignment cannot outrun a TASK already in COMMITTING and 
   Object.assign(fx.intents[0],{state:"COMMITTING",claimRevision:2,commitStartedAt:new Date(fx.now.getTime()-100),remoteMessageId:null,remoteRecipientTelegramUserId:null,confirmedAt:null});
   seedReview(fx,{customOrderId:null,hasMedia:true,text:"response racing provider begin"});
   await assert.rejects(
-    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"try to bind racing response",customOrderId:"order-1",now:new Date(fx.now.getTime()+1000),db:fx.db}),
+    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"try to bind racing response",customOrderId:"order-1",now:new Date(fx.now.getTime()+1000),db:commitDatabaseFixture(fx.db)}),
     (error)=>error?.code==="CUSTOM_MODEL_INSTRUCTION_COMMITTING",
   );
   assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED");
@@ -635,7 +637,7 @@ test("ASSIGN resolution rolls back materialization/binding when mandatory audit 
   const fx=fixture(); seedReview(fx,{customOrderId:null,hasMedia:true,text:"provider media"});
   fx.db.auditLog.create=async()=>{throw Object.assign(new Error("audit storage unavailable"),{code:"AUDIT_DOWN"});};
   await assert.rejects(
-    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"verified target",customOrderId:"order-1",now:new Date(fx.now.getTime()+1000),db:fx.db}),
+    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"verified target",customOrderId:"order-1",now:new Date(fx.now.getTime()+1000),db:commitDatabaseFixture(fx.db)}),
     (error)=>error?.code==="AUDIT_DOWN",
   );
   assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED"); assert.equal(fx.events[0].submissionId,null);
@@ -654,7 +656,7 @@ test("explicit REVIEW_REQUIRED assignment refuses a target whose creator is not 
   };
   seedReview(fx,{customOrderId:null,hasMedia:true});
   await assert.rejects(
-    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"try wrong creator",customOrderId:"order-2",now:fx.now,db:fx.db}),
+    resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:fx.events[0].id,resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"try wrong creator",customOrderId:"order-2",now:fx.now,db:commitDatabaseFixture(fx.db)}),
     (error)=>error?.code==="TELEGRAM_INBOUND_REVIEW_THREAD_CONFLICT",
   );
   assert.equal(fx.events[0].projectionState,"REVIEW_REQUIRED"); assert.equal(fx.submissions.length,0); assert.equal(fx.orders[1].contentBoundAt,null);
@@ -675,7 +677,7 @@ test("concurrent submission materialization wins over human SKIP/RETRY and conve
       }
       return original({where,data});
     };
-    const result=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:seeded.id,resolution,reason:"manager stale action",now:new Date(fx.now.getTime()+7000),db:fx.db});
+    const result=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:seeded.id,resolution,reason:"manager stale action",now:new Date(fx.now.getTime()+7000),db:commitDatabaseFixture(fx.db)});
     assert.equal(result.state,"APPLIED");
     assert.equal(result.idempotent,true);
     assert.equal(fx.events[0].projectionState,"APPLIED");
@@ -695,7 +697,7 @@ test("legitimate multi-creator active-thread ambiguity can be resolved by an aud
   fx.db.creatorAccount.findMany=async({where})=>[fx.creator,creator2].filter((row)=>matches(row,where)).map(clone);
   seedReview(fx,{id:"review-legit-ambiguous",creatorId:null,customOrderId:null,replyToMessageId:null,messageId:993,hasMedia:true,projectionReason:"ACTIVE_THREAD_AMBIGUOUS",threadResolutionType:"AMBIGUOUS_ACTIVE_THREADS"});
 
-  const result=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:"review-legit-ambiguous",resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"manager selected the matching active Custom thread",customOrderId:"order-2",now:new Date(fx.now.getTime()+1000),db:fx.db});
+  const result=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:"review-legit-ambiguous",resolution:"ASSIGN_TO_CONTENT_ORDER",reason:"manager selected the matching active Custom thread",customOrderId:"order-2",now:new Date(fx.now.getTime()+1000),db:commitDatabaseFixture(fx.db)});
   assert.equal(result.state,"APPLIED");
   const submission=fx.submissions.find((row)=>String(row.id)===String(result.submissionId));
   assert.ok(submission);
@@ -711,7 +713,7 @@ test("deleted historical creator projection cannot make a REVIEW_REQUIRED row im
   const fx=fixture();
   fx.intents.length=0; // no current active thread remains
   const row=seedReview(fx,{id:"review-deleted-history",creatorId:"creator-deleted",customOrderId:null,replyToMessageId:null,messageId:994,projectionReason:"HISTORICAL_CREATOR_DELETED"});
-  const result=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:row.id,resolution:"SKIP",reason:"historical creator was retired; archive unrelated observation",now:new Date(fx.now.getTime()+1000),db:fx.db});
+  const result=await resolveTelegramInboundReview({agencyId:"agency-1",member:fx.member,eventId:row.id,resolution:"SKIP",reason:"historical creator was retired; archive unrelated observation",now:new Date(fx.now.getTime()+1000),db:commitDatabaseFixture(fx.db)});
   assert.equal(result.state,"SKIPPED");
   assert.equal(fx.events.find((event)=>event.id===row.id).projectionState,"SKIPPED");
   assert.equal(fx.audits.some((audit)=>audit.action==="custom_order.telegram_inbound_review_skip"),true);
@@ -739,7 +741,7 @@ test("late provider proof ignores more than 200 terminal rows and reaches the la
     if(args?.where?.projectionState?.in) selectedStates.push([...args.where.projectionState.in]);
     return originalFindMany(args);
   };
-  const result=await reconcilePendingInboundForConfirmedDelivery({agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",now:new Date(fx.now.getTime()+1000),limit:200,db:fx.db});
+  const result=await reconcilePendingInboundForConfirmedDelivery({agencyId:"agency-1",accountId:"tg-1",senderTelegramUserId:"900001",actorUserId:"user-1",now:new Date(fx.now.getTime()+1000),limit:200,db:commitDatabaseFixture(fx.db)});
   assert.equal(result.scanned,1,"terminal history must not consume the late-proof batch");
   assert.equal(selectedStates.every((states)=>states.length===2&&states.includes("PENDING")&&states.includes("FAILED_RETRYABLE")),true);
   assert.equal(fx.events.find((row)=>row.id==="zz-repairable").projectionState,"SKIPPED","the newly proven no-media observation should be reconciled instead of starved");
@@ -943,14 +945,14 @@ test("closure 08: scoped manager cannot SKIP using stale creator projection afte
   const originalFindMany=fx.db.creatorAccount.findMany.bind(fx.db.creatorAccount);
   fx.db.creatorAccount.findMany=async({where})=>[fx.creator,creator2].filter((row)=>matches(row,where)).map(clone);
   seedReview(fx,{id:"review-scope-move",creatorId:"creator-1",customOrderId:"order-1",replyToMessageId:null,messageId:11008,projectionReason:"PROVENANCE_CONFLICT"});
-  const before=await listTelegramInboundReviewQueue({agencyId:"agency-1",member:scoped,db:fx.db});
+  const before=await listTelegramInboundReviewQueue({agencyId:"agency-1",member:scoped,db:commitDatabaseFixture(fx.db)});
   assert.equal(before.items.some((item)=>item.eventId==="review-scope-move"),true);
 
   fx.orders[0].status="COMPLETED";
   fx.orders.push({...clone(fx.orders[0]),id:"order-b-current",creatorId:"creator-2",status:"PENDING",telegramTaskMessageId:705,contentBoundAt:null,updatedAt:new Date(fx.now)});
   fx.intents.push({id:"task-b-current",agencyId:"agency-1",creatorId:"creator-2",customOrderId:"order-b-current",accountId:"tg-1",kind:"TASK",state:"CONFIRMED",remoteMessageId:705,remoteRecipientTelegramUserId:"900001",confirmationAuthority:"PROVIDER_RECEIPT",confirmedAt:new Date(fx.now)});
   await assert.rejects(
-    ()=>resolveTelegramInboundReview({agencyId:"agency-1",member:scoped,eventId:"review-scope-move",resolution:"SKIP",reason:"stale queue action",now:fx.now,db:fx.db}),
+    ()=>resolveTelegramInboundReview({agencyId:"agency-1",member:scoped,eventId:"review-scope-move",resolution:"SKIP",reason:"stale queue action",now:fx.now,db:commitDatabaseFixture(fx.db)}),
     (error)=>error?.code==="TELEGRAM_INBOUND_REVIEW_SCOPE_UNRESOLVED"&&error?.status===403,
   );
   assert.equal(fx.events.find((row)=>row.id==="review-scope-move").projectionState,"REVIEW_REQUIRED");
@@ -997,12 +999,12 @@ test("REVIEW_REQUIRED management queue has lossless cursor continuation beyond t
       projectedAt: new Date(fx.now.getTime() + i),
     });
   }
-  const first = await listTelegramInboundReviewQueue({ agencyId: "agency-1", member: fx.member, limit: 100, now: fx.now, db: fx.db });
+  const first = await listTelegramInboundReviewQueue({ agencyId: "agency-1", member: fx.member, limit: 100, now: fx.now, db: commitDatabaseFixture(fx.db) });
   assert.equal(first.items.length, 100);
   assert.equal(first.hasMore, true);
   assert.equal(first.nextCursor, "review-page-100");
 
-  const second = await listTelegramInboundReviewQueue({ agencyId: "agency-1", member: fx.member, limit: 100, cursor: first.nextCursor, now: fx.now, db: fx.db });
+  const second = await listTelegramInboundReviewQueue({ agencyId: "agency-1", member: fx.member, limit: 100, cursor: first.nextCursor, now: fx.now, db: commitDatabaseFixture(fx.db) });
   assert.equal(second.items.length, 25);
   assert.equal(second.hasMore, false);
   assert.equal(second.nextCursor, null);
@@ -1022,7 +1024,7 @@ test("historical inbound with deleted business context becomes REVIEW_REQUIRED i
     intakeAuthority:"PROVIDER_OBSERVATION",threadResolutionType:"DIRECT_REPLY",threadAnchorIntentId:"intent-task",resolutionAuthority:"PROVIDER_DIRECT_REPLY",
     createdAt:new Date(fx.now.getTime()-4000),updatedAt:new Date(fx.now.getTime()-3000),
   });
-  const result=await projectTelegramInboundEvent({eventId:"orphan-inbound-1",now:fx.now,db:fx.db});
+  const result=await projectTelegramInboundEvent({eventId:"orphan-inbound-1",now:fx.now,db:commitDatabaseFixture(fx.db)});
   assert.equal(result.state,"REVIEW_REQUIRED");
   assert.equal(result.reason,"LEGACY_ORPHAN_BUSINESS_CONTEXT");
   assert.equal(fx.events[0].creatorId,"deleted-creator","historical provider pointer must be preserved for review");
@@ -1037,7 +1039,7 @@ test("commit-time Telegram inbound human resolution rejects a stale management a
   fx.member.accessEpoch+=1;
   fx.member.assignedCreators=[];
   await assert.rejects(
-    ()=>resolveTelegramInboundReview({agencyId:"agency-1",member:actorSnapshot,eventId:"review-stale-access",resolution:"SKIP",reason:"stale queue action",now:fx.now,db:fx.db}),
+    ()=>resolveTelegramInboundReview({agencyId:"agency-1",member:actorSnapshot,eventId:"review-stale-access",resolution:"SKIP",reason:"stale queue action",now:fx.now,db:commitDatabaseFixture(fx.db)}),
     (error)=>error?.code==="CUSTOM_MANAGEMENT_ACCESS_STALE"&&error?.status===409,
   );
   assert.equal(fx.events.find((row)=>row.id==="review-stale-access").projectionState,"REVIEW_REQUIRED");
@@ -1057,7 +1059,7 @@ test("R9 inbound review queue has a hard scan budget and honest continuation thr
     });
   }
   const scoped = { ...fx.member, role: "CHATTER", roleKey: "chatter", assignedCreators: ["creator-1"], permissions: { ...(fx.member.permissions || {}), "team.analytics.view": true, "content.review_customs": true } };
-  const result = await listTelegramInboundReviewQueue({ agencyId: "agency-1", member: scoped, limit: 50, now: fx.now, db: fx.db });
+  const result = await listTelegramInboundReviewQueue({ agencyId: "agency-1", member: scoped, limit: 50, now: fx.now, db: commitDatabaseFixture(fx.db) });
   assert.equal(result.items.length, 0);
   assert.equal(result.scannedRows, 500);
   assert.equal(result.scanBudget, 500);

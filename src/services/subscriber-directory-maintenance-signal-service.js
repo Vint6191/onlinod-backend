@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const { dbAuthorityNow } = require("./db-time-authority-service");
@@ -66,7 +68,7 @@ async function claimSubscriberDirectoryMaintenanceSignal({ db, now = new Date(),
   const fallbackNow = asDate(now);
   const claimToken = `subclaim_${crypto.randomUUID?.() || crypto.randomBytes(16).toString("hex")}`;
   const timeoutMs = Math.max(250, Math.min(5_000, Number(statementTimeoutMs) || 2_000));
-  return db.$transaction(async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     if (typeof tx?.$queryRawUnsafe !== "function") return null;
     await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${Math.floor(timeoutMs)}ms'`);
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
@@ -126,7 +128,7 @@ async function withSubscriberMaintenanceClaimFence({ db, signal, work, maxWaitMs
   if (!signal?.id || !signal?.claimToken || typeof work !== "function" || typeof db?.$transaction !== "function") {
     return { current: false, reason: "claim_fence_unavailable" };
   }
-  return db.$transaction(async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     // Standalone helper retained for explicit signal-only operations/tests.
     // Subscriber publication/recovery/retention MUST use publicationTransaction,
     // whose canonical lock order is automation fence -> creator lock -> signal row.

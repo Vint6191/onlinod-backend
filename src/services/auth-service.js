@@ -1,3 +1,5 @@
+
+const { runDbTransaction } = require("./db-transaction-service");
 const jwt = require("jsonwebtoken");
 const prisma = require("../prisma");
 const { randomToken, randomCode, sha256, addMinutes, addDays } = require("../utils/crypto");
@@ -200,7 +202,7 @@ async function issueLoginTokens({
   // its local incarnation. Never invent a hidden random lineage for legacy login.
   const requestedAuthorizationSessionId = String(authorizationScopeIncarnation || "").trim().slice(0, 220) || null;
   const authorizationSessionId = requestedAuthorizationSessionId;
-  const committed = await prisma.$transaction(async (tx) => {
+  const committed = await runDbTransaction(prisma, async (tx) => {
     await authorizeAuthorizationHistoryPublisher(tx);
     // Canonical lock order for authentication publication:
     // user -> device -> current User/Member/Agency rows.  The user lock is
@@ -305,7 +307,7 @@ async function verifyEmailByToken(token) {
     return { ok: false, code: "TOKEN_EXPIRED", error: "Verification token expired" };
   }
 
-  const user = await prisma.$transaction(async (tx) => {
+  const user = await runDbTransaction(prisma, async (tx) => {
     await tx.authToken.update({
       where: { id: record.id },
       data: { usedAt: new Date() },
@@ -349,7 +351,7 @@ async function verifyEmailByCode({ email, code }) {
     return { ok: false, code: "CODE_INVALID", error: "Verification code is invalid or expired" };
   }
 
-  const updated = await prisma.$transaction(async (tx) => {
+  const updated = await runDbTransaction(prisma, async (tx) => {
     await tx.authToken.update({
       where: { id: record.id },
       data: { usedAt: new Date() },
@@ -439,7 +441,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
   let nextRefreshExpiresAt = null;
 
   try {
-    const rotated = await prisma.$transaction(async (tx) => {
+    const rotated = await runDbTransaction(prisma, async (tx) => {
       await authorizeAuthorizationHistoryPublisher(tx);
       await acquireAuthorizationUserLock(tx, { userId: session.userId });
       await acquireAuthorizationDeviceLock(tx, {

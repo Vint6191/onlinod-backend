@@ -244,5 +244,8 @@ async function main() {
     await db.$disconnect(); await server.stop(); await engine.close();
   }
 }
-if (require.main === module) main().catch(error => { console.error(error); process.exitCode = 1; });
+if (require.main === module) {
+  const watchdog = setTimeout(() => { console.error("PHASE5_TEAM_PROOF_DEADLINE_EXCEEDED"); process.exit(1); }, 180000);
+  main().then(() => clearTimeout(watchdog), error => { clearTimeout(watchdog); console.error(error); process.exitCode = 1; });
+}
 module.exports = { main };

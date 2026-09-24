@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -67,7 +69,7 @@ function makeDb() {
 test("INT4.1A canonical batch owns tenant creator fan and provenance envelope", async () => {
   const db = makeDb();
   const receipt = new Date("2026-09-16T15:30:00.000Z");
-  const result = await projectFanObservationBatch(db, {
+  const result = await projectFanObservationBatch(commitDatabaseFixture(db), {
     agencyId: "agency-a",
     creatorId: "creator-a",
     sourceDeviceId: "device-a",
@@ -117,7 +119,7 @@ test("INT4.1A canonical batch owns tenant creator fan and provenance envelope", 
 test("INT4.1A producer cannot self-assign AUTOMATION_WRITE_RESULT priority", async () => {
   const db = makeDb();
   await assert.rejects(
-    () => projectFanObservationBatch(db, {
+    () => projectFanObservationBatch(commitDatabaseFixture(db), {
       agencyId: "agency-a", creatorId: "creator-a",
       allowedSources: ["USER_PROFILE"], observedAtPolicy: "SERVER_RECEIPT",
       receivedAt: new Date("2026-09-16T15:30:00.000Z"),
@@ -131,7 +133,7 @@ test("INT4.1A producer cannot self-assign AUTOMATION_WRITE_RESULT priority", asy
 test("INT4.1A source/time producer policy is mandatory for generic canonical batch", async () => {
   const db = makeDb();
   await assert.rejects(
-    () => projectFanObservationBatch(db, {
+    () => projectFanObservationBatch(commitDatabaseFixture(db), {
       agencyId: "agency-a", creatorId: "creator-a",
       items: [{ onlyFansUserId: "fan-a", relationship: { creatorFollowsFan: true, source: "USER_PROFILE", observedAt: new Date() } }],
     }),
@@ -145,7 +147,7 @@ test("INT4.1A direct observation ingress is device-bound and access-fenced at DB
   const actions = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");
   const manifest = fs.readFileSync(path.join(__dirname, "../route-manifest.js"), "utf8");
   assert.match(route, /requireProductDevice\(req, req\.auth\?\.deviceId/);
-  assert.match(route, /prisma\.\$transaction\(async \(tx\)/);
+  assert.match(route, /runDbTransaction\(prisma, async \(tx\)/);
   assert.match(route, /authorizeActionProfileObservation\(\{/);
   assert.match(route, /deliveryId/);
   assert.match(route, /leaseToken/);
@@ -188,7 +190,7 @@ test("INT4.4A point refresh chunk cannot escape the server-requested fan set", a
   };
   await assert.rejects(
     () => applyFanDataPointRefreshChunk({
-      db,
+      db: commitDatabaseFixture(db),
       job,
       deviceId: "device-a",
       chunkResult: {
@@ -208,7 +210,7 @@ test("INT4.4A point refresh requires a server-requested fan scope", async () => 
   const db = makeDb();
   await assert.rejects(
     () => applyFanDataPointRefreshChunk({
-      db,
+      db: commitDatabaseFixture(db),
       job: { id: "refresh-job-legacy", agencyId: "agency-a", creatorId: "creator-a", createdAt: new Date("2026-09-16T15:00:00.000Z"), params: {} },
       deviceId: "device-a",
       chunkResult: { kind: "fan_data_point_refresh", items: [] },
@@ -227,7 +229,7 @@ test("INT4.4A point refresh value bookkeeping uses PostgreSQL receipt time, not 
     updateMany: async (input) => { trafficUpdate = input; return { count: 1 }; },
   };
   await applyFanDataPointRefreshChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job: { id: "refresh-job-value", agencyId: "agency-a", creatorId: "creator-a", createdAt: new Date("2026-09-16T15:00:00.000Z"), params: { fanIds: ["fan-a"] } },
     deviceId: "device-a",
     chunkResult: {
@@ -251,7 +253,7 @@ test("INT5.1A point refresh canonical time is server job generation, not delayed
   const delayedStartAt = new Date("2026-09-16T18:05:00.000Z");
   db.$queryRawUnsafe = async () => [{ authorityNow: new Date("2026-09-16T18:10:00.000Z") }];
   await applyFanDataPointRefreshChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job: { id: "refresh-causal", agencyId: "agency-a", creatorId: "creator-a", createdAt: generationAt, claimedAt: delayedClaimAt, startedAt: delayedStartAt, params: { fanIds: ["fan-a"] } },
     deviceId: "device-a",
     chunkResult: {

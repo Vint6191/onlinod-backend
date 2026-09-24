@@ -500,7 +500,7 @@ async function deferOrSkipFollowBackClaim(delivery, control, now) {
   else if (candidate.subscribedByCreator === true) code = "already_followed";
 
   if (code) {
-    return prisma.$transaction(async (tx) => {
+    return runDbTransaction(prisma, async (tx) => {
       const updated = await tx.automationDelivery.updateMany({
         where: { id: delivery.id, status: { in: NORMAL_CLAIMABLE_STATUSES } },
         data: {
@@ -532,7 +532,7 @@ async function deferOrSkipFollowBackClaim(delivery, control, now) {
     },
   });
   if (completedToday >= dailyLimit) {
-    return prisma.$transaction(async (tx) => {
+    return runDbTransaction(prisma, async (tx) => {
       const updated = await tx.automationDelivery.updateMany({
         where: { id: delivery.id, status: { in: NORMAL_CLAIMABLE_STATUSES } },
         data: {
@@ -555,7 +555,7 @@ async function applyBumpValidationTransition(delivery, validation, now = new Dat
   if (!delivery || delivery.moduleKey !== "bumps" || validation?.ok !== false) return false;
   const terminal = validation.terminal === true;
   const status = terminal ? (validation.status || "SKIPPED") : "RETRY_SCHEDULED";
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: {
@@ -595,7 +595,7 @@ async function applyLikeValidationTransition(delivery, validation, now = new Dat
   if (!delivery || delivery.moduleKey !== "likes" || validation?.ok !== false) return false;
   const terminal = validation.terminal === true;
   const status = terminal ? (validation.status || "SKIPPED") : "RETRY_SCHEDULED";
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: PRECOMMIT_EXECUTABLE_STATUSES }, leaseRevision: delivery.leaseRevision },
@@ -629,7 +629,7 @@ async function applyFollowAutomationValidationTransition(delivery, validation, n
   if (!delivery || delivery.moduleKey !== FOLLOW_AUTOMATION_MODULE_KEY || validation?.ok !== false) return false;
   const terminal = validation.terminal === true;
   const status = terminal ? (validation.status || "SKIPPED") : "RETRY_SCHEDULED";
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: PRECOMMIT_EXECUTABLE_STATUSES }, leaseRevision: delivery.leaseRevision },
@@ -670,7 +670,7 @@ async function applyFollowAutomationValidationTransition(delivery, validation, n
 async function applySfsValidationTransition(delivery, validation, now = new Date(), executionAccess = null) {
   const status = validation.terminal === true ? (validation.code === "already_unfollowed" ? "COMPLETED" : "SKIPPED") : "RETRY_SCHEDULED";
   const retryAt = validation.retryAt || new Date(now.getTime() + 30_000);
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: PRECOMMIT_EXECUTABLE_STATUSES }, leaseRevision: delivery.leaseRevision },
@@ -785,7 +785,7 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
     const leaseToken = crypto.randomBytes(32).toString("base64url");
     const claimUntil = new Date(now.getTime() + leaseDuration(leaseMs));
     try {
-      const claimed = await prisma.$transaction(async (tx) => {
+      const claimed = await runDbTransaction(prisma, async (tx) => {
         await lockBillingWriteAdmission({ db: tx, agencyId: candidate.agencyId });
         await assertExecutionAccessFence({ db: tx, userId, agencyId: candidate.agencyId, memberId: member.id, accessEpoch: Number(member.accessEpoch || 1), creatorId: candidate.creatorId, lock: true });
         if (!reconciliationClaim) await assertBillingWriteAdmission({ db: tx, agencyId: candidate.agencyId, creatorId: candidate.creatorId });
@@ -921,7 +921,7 @@ async function lockCurrentActionProfileLease({ db, delivery, deviceId, leaseToke
 
 async function acquireActionProfileObservationReadLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, db = prisma }) {
   const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
-  return db.$transaction(async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     const delivery = await requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, db: tx, lockAccess: true });
     if (delivery.status !== "RUNNING") throw new ActionDeliveryError("FAN_DATA_OBSERVATION_DELIVERY_NOT_RUNNING", "Profile observation read lease requires a RUNNING delivery", 409);
     if (!PROFILE_OBSERVATION_ACTION_TYPES.has(String(delivery.actionType || ""))) {
@@ -1002,7 +1002,7 @@ async function issueActionProfileObservationToken({
   db = prisma,
 }) {
   const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
-  return db.$transaction(async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     const delivery = await requireLease({
       deliveryId, userId, deviceId, leaseToken, leaseRevision, lockAccess: true, db: tx,
     });
@@ -1038,7 +1038,7 @@ async function issueActionProfileObservationToken({
 }
 
 async function renewActionLease(input) {
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const delivery = await requireLease({ ...input, db: tx, lockAccess: true });
     if (delivery.status !== "COMMITTING" && !deliveryRequiresReconciliation(delivery)) await assertDeliveryControl(delivery, { allowRunningUnfollow: true, db: tx });
     const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
@@ -1066,7 +1066,7 @@ async function renewActionLease(input) {
 }
 
 async function startActionDelivery(input) {
-  const running = await prisma.$transaction(async (tx) => {
+  const running = await runDbTransaction(prisma, async (tx) => {
     // attemptStartedAt remains rollout compatibility only for deliveries that
     // were already RUNNING before this server cutover. For every newly-started
     // profile-reading action the Backend itself marks post-provider-read tokens
@@ -1143,7 +1143,7 @@ async function validateActionDelivery(input) {
 
 async function prepareWriteActionDelivery(input) {
   try {
-    return await prisma.$transaction(async (tx) => {
+    return await runDbTransaction(prisma, async (tx) => {
     let delivery = await requireLease({ ...input, db: tx, lockAccess: true, billingAdmission: true });
     await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
     // The control writer holds the same transaction-scoped fence. Re-read the
@@ -1306,7 +1306,7 @@ async function completeActionDelivery(input) {
   if (delivery.moduleKey === SFS_MODULE_KEY && delivery.actionType === "SFS_FOLLOW_TARGET" && String(outcomeCode || "").trim().toLowerCase() !== "followed") {
     terminalStatus = "SKIPPED";
   }
-  const finalDelivery = await prisma.$transaction(async (tx) => {
+  const finalDelivery = await runDbTransaction(prisma, async (tx) => {
     await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: {
@@ -1406,7 +1406,7 @@ async function failActionDelivery(input) {
     ...(reconcile ? { reconciliationStartedAt: object(delivery.result).reconciliationStartedAt || delivery.writeCommitAt?.toISOString?.() || now.toISOString() } : {}),
     failedAt: now.toISOString(), retryable,
   };
-  const updated = await prisma.$transaction(async (tx) => {
+  const updated = await runDbTransaction(prisma, async (tx) => {
     await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: LEASED_STATUSES }, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision },
@@ -1449,7 +1449,7 @@ async function releaseActionDelivery(input) {
   const now = new Date();
   const runAfterMs = Math.max(0, Math.min(24 * 60 * 60_000, Number(input.runAfterMs) || 0));
   const nextStatus = reconciliationLease ? "RECONCILE_REQUIRED" : "QUEUED";
-  const updated = await prisma.$transaction(async (tx) => {
+  const updated = await runDbTransaction(prisma, async (tx) => {
     await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: ["CLAIMED", "RUNNING"] }, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision },
@@ -1534,7 +1534,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
     }
     if (validation.ok === false && validation.code === "already_liked") {
       const now = new Date();
-      const latest = await prisma.$transaction(async (tx) => {
+      const latest = await runDbTransaction(prisma, async (tx) => {
         await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
         const changed = await tx.automationDelivery.updateMany({
           where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1576,7 +1576,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
     }
     if (validation.ok === false && validation.code === "already_followed") {
       const now = new Date();
-      const latest = await prisma.$transaction(async (tx) => {
+      const latest = await runDbTransaction(prisma, async (tx) => {
         await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
         const changed = await tx.automationDelivery.updateMany({
           where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1595,7 +1595,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
     }
     if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
   }
-  const updated = await prisma.$transaction(async (tx) => {
+  const updated = await runDbTransaction(prisma, async (tx) => {
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1647,7 +1647,7 @@ async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason 
     throw new ActionDeliveryError("UNSAFE_REFOLLOW_CANCEL", "A started refollow cycle cannot be canceled before recovery");
   }
   const finishedAt = new Date();
-  const updated = await prisma.$transaction(async (tx) => {
+  const updated = await runDbTransaction(prisma, async (tx) => {
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1694,7 +1694,7 @@ async function releaseClaimByAdmin({ agencyId, actorUserId, deliveryId }) {
   await requireLiveAutomationManagementActor({ agencyId, actorUserId, creatorId: delivery.creatorId });
   if (["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status)) throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before administrative release");
   if (!["CLAIMED", "RUNNING"].includes(delivery.status)) return { ok: true, duplicate: true, delivery };
-  const updated = await prisma.$transaction(async (tx) => {
+  const updated = await runDbTransaction(prisma, async (tx) => {
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, originKind: "AUTOMATION", status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },

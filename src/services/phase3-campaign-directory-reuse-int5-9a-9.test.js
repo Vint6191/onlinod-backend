@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -48,6 +50,7 @@ function reuseDb() {
   let segmentReads = 0;
   let upserts = 0;
   const db = {
+    async $executeRawUnsafe(sql) { assert.match(sql, /pg_advisory_xact_lock/); return 1; },
     creatorCampaignCollectionState: {
       findUnique: async () => ({ ...state }),
       upsert: async ({ update }) => { upserts += 1; Object.assign(state, update); return { ...state }; },
@@ -76,7 +79,7 @@ function reuseDb() {
       findFirst: async () => ({ claimersNextDueAt: new Date("2026-09-18T17:00:00.000Z") }),
     },
   };
-  return { db, state, selected, exactGenerations, get segmentReads() { return segmentReads; }, get upserts() { return upserts; } };
+  return { db: commitDatabaseFixture(db), state, selected, exactGenerations, get segmentReads() { return segmentReads; }, get upserts() { return upserts; } };
 }
 
 test("INT5.9A-9 schema/migration persists exact reusable Campaign directory authority", () => {
@@ -109,7 +112,8 @@ test("INT5.9A-9 same SCANNING Campaign generation is replay, not destructive rei
     status: "SCANNING", activeGeneration: "run-same", activeRequestedAt: new Date("2026-09-18T20:00:00.000Z"),
     fanValueExpected: 77, campaignFrontierTargetCount: 50,
   };
-  const db = { creatorCampaignCollectionState: {
+  const db = {
+    async $executeRawUnsafe(sql) { assert.match(sql, /pg_advisory_xact_lock/); return 1; }, creatorCampaignCollectionState: {
     findUnique: async () => ({ ...existing }),
     upsert: async () => { upserts += 1; throw new Error("must not reinitialize current SCANNING generation"); },
   } };
@@ -117,7 +121,7 @@ test("INT5.9A-9 same SCANNING Campaign generation is replay, not destructive rei
     collectionContractVersion: 1, collectionType: "CAMPAIGNS", collectionGeneration: "run-same",
     collectionRequestedAt: "2026-09-18T20:00:00.000Z", collectionMode: "catchup",
   } };
-  const result = await acceptCampaignGeneration({ db, job });
+  const result = await acceptCampaignGeneration({ db: commitDatabaseFixture(db), job });
   assert.equal(result.accepted, true);
   assert.equal(result.replay, true);
   assert.equal(result.state.fanValueExpected, 77);
@@ -127,7 +131,7 @@ test("INT5.9A-9 same SCANNING Campaign generation is replay, not destructive rei
 test("INT5.9A-9 drains next frontier tranche from exact prior directory generation without OF directory re-read", async () => {
   const harness = reuseDb();
   const job = campaignJob();
-  const result = await loadCampaignDirectorySegment({ db: harness.db, job, chunk: {
+  const result = await loadCampaignDirectorySegment({ db: commitDatabaseFixture(harness.db), job, chunk: {
     kind: "campaign_directory_segment", schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: "run-a9", cursor: null,
   } });
   assert.equal(result.campaignDirectorySegment.totalCampaignCount, 2_500);
@@ -148,7 +152,7 @@ test("INT5.9A-9 drains next frontier tranche from exact prior directory generati
 test("INT5.9A-9 stale directory revision fails before activating/resetting a new tranche generation", async () => {
   const harness = reuseDb();
   const job = campaignJob({ revision: 6 });
-  await assert.rejects(() => loadCampaignDirectorySegment({ db: harness.db, job, chunk: {
+  await assert.rejects(() => loadCampaignDirectorySegment({ db: commitDatabaseFixture(harness.db), job, chunk: {
     kind: "campaign_directory_segment", schemaVersion: 4, collectorVersion: "campaigns-v13", scanRunId: "run-a9", cursor: null,
   } }), (error) => error?.code === "CAMPAIGN_DIRECTORY_REUSE_STALE");
   assert.equal(harness.state.activeGeneration, "prior-tranche");
@@ -179,6 +183,7 @@ test("INT5.9A-9 stale reuse claimer write fails before collection generation acc
     activeRequestedAt: new Date("2026-09-18T19:00:00.000Z"),
   };
   const db = {
+    async $executeRawUnsafe(sql) { assert.match(sql, /pg_advisory_xact_lock/); return 1; },
     creatorCampaignCollectionState: {
       findUnique: async () => ({ ...state }),
       upsert: async () => { stateUpserts += 1; throw new Error("stale reuse must fail before generation acceptance"); },
@@ -188,7 +193,7 @@ test("INT5.9A-9 stale reuse claimer write fails before collection generation acc
     },
   };
   const job = campaignJob({ revision: 6 });
-  await assert.rejects(() => ingestCampaignChunk({ db, job, deviceId: "device-1", chunk: {
+  await assert.rejects(() => ingestCampaignChunk({ db: commitDatabaseFixture(db), job, deviceId: "device-1", chunk: {
     kind: "campaign_claimers_page", batchKey: "run:run-a9:claimers:campaign-1:0",
     scanRunId: "run-a9", schemaVersion: 4, collectorVersion: "campaigns-v13",
     externalCampaignId: "campaign-1", scannerRejected: 0, claimers: [],
@@ -210,6 +215,7 @@ test("INT5.9A-9 non-target claimer write fails before collection generation acce
     activeRequestedAt: new Date("2026-09-18T19:00:00.000Z"),
   };
   const db = {
+    async $executeRawUnsafe(sql) { assert.match(sql, /pg_advisory_xact_lock/); return 1; },
     creatorCampaignCollectionState: {
       findUnique: async () => ({ ...state }),
       upsert: async () => { stateUpserts += 1; throw new Error("non-target write must fail before generation acceptance"); },
@@ -219,7 +225,7 @@ test("INT5.9A-9 non-target claimer write fails before collection generation acce
     },
   };
   const job = campaignJob();
-  await assert.rejects(() => ingestCampaignChunk({ db, job, deviceId: "device-1", chunk: {
+  await assert.rejects(() => ingestCampaignChunk({ db: commitDatabaseFixture(db), job, deviceId: "device-1", chunk: {
     kind: "campaign_claimers_page", batchKey: "run:run-a9:claimers:campaign-1:0",
     scanRunId: "run-a9", schemaVersion: 4, collectorVersion: "campaigns-v13",
     externalCampaignId: "campaign-1", scannerRejected: 0, claimers: [],

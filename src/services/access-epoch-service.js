@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
 
@@ -9,17 +11,10 @@ function normalizedAccessEpoch(value) {
 
 async function withTeamControlPlaneWrite(db, work) {
   if (!db || typeof work !== "function") throw new Error("Team access-epoch write context is required");
-  if (typeof db.$transaction === "function") {
-    return db.$transaction(async (tx) => {
-      await assertTeamControlPlaneWriteAdmission(tx);
-      return work(tx);
-    });
-  }
-  // Transaction adapters reach this branch. Callers that compose this helper
-  // inside a larger transaction must invoke it before taking Team business locks
-  // so the global M1 release fence remains the first lock in the graph.
-  await assertTeamControlPlaneWriteAdmission(db);
-  return work(db);
+  return runDbTransaction(db, async (tx) => {
+    await assertTeamControlPlaneWriteAdmission(tx);
+    return work(tx);
+  });
 }
 
 async function bumpMemberAccessEpoch({ db, memberId }) {

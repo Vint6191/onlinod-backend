@@ -78,7 +78,9 @@ test("INT5.7A-1 activation runtime set-based cutover revokes old owners and acti
   };
   const db = {
     $transaction: async (work, options) => {
-      assert.deepEqual(options, { maxWait: 10_000, timeout: 120_000 });
+      assert.equal(options.isolationLevel, "ReadCommitted");
+      assert.ok(options.maxWait > 0 && options.maxWait <= 10_000);
+      assert.ok(options.timeout > 100_000 && options.timeout <= 110_000, "admission and execution share the 120s root deadline");
       return work(tx);
     },
   };

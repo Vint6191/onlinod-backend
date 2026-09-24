@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -22,7 +24,7 @@ function productionDb(now) {
     phase2WorkGenerationAuthority: { async findUnique() { return { activeGeneration: authority.DOMAIN_WORK_GENERATION }; } },
     phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy" }]; } },
     maintenanceLaneState: { async findMany() { return []; } },
-    async $transaction(work) { return work(db); },
+    async $transaction(work) { return work({ ...(db), $transaction: undefined }); },
     async $queryRawUnsafe(statement, ...params) {
       const text = String(statement); sql.push(text);
       if (text.includes('FROM "DomainWorkClaimTopologyState"') && text.includes("FOR SHARE")) {
@@ -47,14 +49,14 @@ function productionDb(now) {
       return [];
     },
   };
-  return { db, sql };
+  return { db: commitDatabaseFixture(db), sql };
 }
 
 test("F54-01/F55-01 creator-scoped claim is direct DWI admission with no ready-head/advisory dependency", async () => {
   const now = new Date("2026-09-11T00:00:00.000Z");
   const fx = productionDb(now);
   await authority.claimDomainWorkBatch({
-    db: fx.db, workClass: authority.WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
+    db: commitDatabaseFixture(fx.db), workClass: authority.WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
     agencyId: "agency-1", creatorIds: ["creator-91", "creator-92"],
     objectType: "CustomContentSubmission", ownerToken: "scoped-worker",
     limit: 10, perPartitionQuantum: 2, fallbackNow: now,
@@ -72,7 +74,7 @@ test("A36 broad claim rotates bounded Agency and shard locators without a hot-pr
   const now = new Date("2026-09-11T00:00:00.000Z");
   const fx = productionDb(now);
   await authority.claimDomainWorkBatch({
-    db: fx.db, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
+    db: commitDatabaseFixture(fx.db), workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION,
     ownerToken: "broad-worker", limit: 25, perAgencyQuantum: 5, perPartitionQuantum: 2, fallbackNow: now,
   });
   const agencyDispatch = fx.sql.find((entry) => entry.includes('UPDATE "DomainWorkClaimAgencyState" a'));
@@ -174,7 +176,7 @@ test("Root A historical enumeration exception path uses the actual DomainWork ow
 test("F54-01 creator-scoped raw claim is fail-closed without tenant agency scope", async () => {
   const now = new Date("2026-09-11T00:00:00.000Z");
   const fx = productionDb(now);
-  await assert.rejects(authority.claimDomainWorkBatch({ db: fx.db, workClass: authority.WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
+  await assert.rejects(authority.claimDomainWorkBatch({ db: commitDatabaseFixture(fx.db), workClass: authority.WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
     creatorIds: ["creator-1"], ownerToken: "scoped-no-agency", fallbackNow: now }),
   (error) => error?.code === "DOMAIN_WORK_SCOPED_AGENCY_REQUIRED");
 });

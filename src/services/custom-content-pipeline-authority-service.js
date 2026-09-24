@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const { DEBT, providerOperationalBackfillReady, customExternalProofBackfillReady, countProviderOperationalDebt } = require("./provider-operational-debt-authority-service");
@@ -232,7 +234,7 @@ async function withSubmissionPipelineLock({ db, agencyId, submissionId, work }) 
     }
     return work(tx);
   };
-  return typeof db.$transaction === "function" ? db.$transaction(run, { timeout: 35_000 }) : run(db);
+  return runDbTransaction(db, run, { timeout: 35_000 });
 }
 
 
@@ -255,9 +257,7 @@ async function withCustomExecutionDefaultsLock({ db, agencyId, work }) {
     await lockCustomExecutionDefaults({ db: tx, agencyId });
     return work(tx);
   };
-  return typeof db.$transaction === "function"
-    ? db.$transaction(run, { timeout: 35_000 })
-    : run(db);
+  return runDbTransaction(db, run, { timeout: 35_000 });
 }
 
 async function readExecutionDefaults({ db, agencyId, creatorId }) {

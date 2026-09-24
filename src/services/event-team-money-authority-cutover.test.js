@@ -1,3 +1,4 @@
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 "use strict";
 
 const test = require("node:test");
@@ -67,7 +68,7 @@ function emptyCorePrisma({ activity = [], coverageFrom = new Date("2026-08-01T00
 function loadAnalytics(prisma) {
   delete require.cache[analyticsPath];
   delete require.cache[prismaPath];
-  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: phase2AnalyticsFixture(prisma) };
+  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: commitDatabaseFixture(phase2AnalyticsFixture(prisma)) };
   return require(analyticsPath);
 }
 
@@ -118,7 +119,7 @@ function moneyPrisma({ canonicalUndo = false } = {}) {
 function loadTipLedger(prisma) {
   delete require.cache[tipLedgerPath];
   delete require.cache[prismaPath];
-  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: phase2AnalyticsFixture(prisma) };
+  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: commitDatabaseFixture(phase2AnalyticsFixture(prisma)) };
   return require(tipLedgerPath);
 }
 

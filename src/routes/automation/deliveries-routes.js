@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("../../services/db-transaction-service");
+
 
 function registerDeliveryRoutes(router, deps) {
   const {
@@ -300,7 +302,7 @@ router.get("/deliveries/fan-state", async (req, res) => {
       const batchId = cleanString(req.body?.batchId, 120) || eventQueueBatchId(triggerKey);
       const now = new Date();
   
-      const result = await prisma.$transaction(async (tx) => {
+      const result = await runDbTransaction(prisma, async (tx) => {
         const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now, scope: "live" });
         const activeRows = await tx.automationDelivery.findMany({
           where: { agencyId: req.auth.agencyId, creatorId, fanId: { in: fanIds }, status: { in: ONLINE_SEND_ACTIVE_STATUSES } },

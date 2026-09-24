@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("../services/db-transaction-service");
+
 
 const express = require("express");
 const { z } = require("zod");
@@ -118,7 +120,7 @@ const creatorScanSchema = z.object({
 
 async function pauseCreatorRuns({ agencyId, creatorId, reason }) {
   const now = new Date();
-  return prisma.$transaction(async (tx) => {
+  return runDbTransaction(prisma, async (tx) => {
     const discovery = await setHistoryPlanControlTx(tx, {
       agencyId,
       creatorId,
@@ -181,7 +183,7 @@ async function pauseCreatorRuns({ agencyId, creatorId, reason }) {
 
 async function resumeCreatorRuns({ agencyId, creatorId }) {
   let plannedJob = null;
-  const result = await prisma.$transaction(async (tx) => {
+  const result = await runDbTransaction(prisma, async (tx) => {
     const pausedRuns = await tx.dialogScanRun.findMany({
       where: { agencyId, creatorId, status: "PAUSED" },
       orderBy: [{ generation: "desc" }, { updatedAt: "asc" }],
@@ -525,7 +527,7 @@ router.post("/creators/:creatorId/ingest/purchase-signals", async (req, res) => 
   try {
     requireProductDevice(req, req.auth?.deviceId);
     const input = purchaseSignalsSchema.parse(req.body || {});
-    const result = await prisma.$transaction((tx) => applyPurchaseSignalsChunk({
+    const result = await runDbTransaction(prisma, (tx) => applyPurchaseSignalsChunk({
       db: tx,
       job: { agencyId: req.auth.agencyId, creatorId: req.params.creatorId, params: {} },
       userId: req.auth.userId,
@@ -782,7 +784,7 @@ router.post("/creators/:creatorId/cancel", vaultManagementRequired, async (req, 
   try {
     const reason = clean(req.body?.reason, 500) || "creator scan canceled by user";
     const now = new Date();
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await runDbTransaction(prisma, async (tx) => {
       const discovery = await setHistoryPlanControlTx(tx, {
         agencyId: req.auth.agencyId,
         creatorId: req.params.creatorId,
@@ -856,7 +858,7 @@ router.post("/creators/:creatorId/dialogs/:dialogId/cancel", vaultManagementRequ
       orderBy: { createdAt: "desc" },
     });
     if (!active) return res.json({ ok: true, canceled: false, reason: "no_active_run" });
-    await prisma.$transaction(async (tx) => {
+    await runDbTransaction(prisma, async (tx) => {
       if (active.jobId) {
         await tx.jobInstance.updateMany({
           where: { id: active.jobId, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
@@ -892,7 +894,7 @@ router.patch("/control", workspaceSettingsRequired, async (req, res) => {
   try {
     const input = controlSchema.parse(req.body || {});
     const before = await moduleControl(prisma, req.auth.agencyId);
-    const transition = await prisma.$transaction(async (tx) => {
+    const transition = await runDbTransaction(prisma, async (tx) => {
       const setting = await tx.moduleSetting.upsert({
         where: { agencyId_moduleKey: { agencyId: req.auth.agencyId, moduleKey: "dialog_intelligence" } },
         create: { agencyId: req.auth.agencyId, moduleKey: "dialog_intelligence", enabled: input.enabled, status: input.enabled ? "active" : "disabled", config: input.settings || {} },

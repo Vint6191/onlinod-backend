@@ -103,7 +103,7 @@ test("creator retirement blocks every PENDING CustomOrder, not CONTENT only", ()
 test("PENDING CustomOrder mutation takes Agency and Creator lifecycle locks before its CAS", () => {
   const orders = source("services/custom-orders-service.js");
   const start = orders.indexOf("const applyPendingUpdate = async (tx) =>");
-  const end = orders.indexOf("const row = typeof client.$transaction", start);
+  const end = orders.indexOf("const row = await runDbTransaction(client", start);
   assert.ok(start >= 0 && end > start);
   const body = orders.slice(start, end);
   assert.ok(body.indexOf("lockAgencyPipelineLifecycle") < body.indexOf("lockCreatorPipelineLifecycle"));
@@ -144,7 +144,7 @@ test("first execution-profile pin and both mutable defaults share one commit-ord
   assert.ok(vaultSetter.indexOf("creatorAccount.updateMany") >= 0);
   assert.ok(vaultSetter.indexOf("creatorAccount.updateMany") < vaultSetter.indexOf("lockCustomExecutionDefaults"),
     "Vault setter must take Creator row before advisory fence; advisory -> Creator would deadlock with cancellation Creator -> Submission while pinning holds Submission -> advisory");
-  assert.match(vaultSetter, /\$transaction\(apply,\s*\{\s*timeout:\s*35_000\s*\}\)/);
+  assert.match(vaultSetter, /runDbTransaction\(client, apply,\s*\{\s*timeout:\s*35_000\s*\}\)/);
 
   const settingsStart = settings.indexOf("async function updateWorkspaceSettings");
   const settingsEnd = settings.indexOf("function billingLine", settingsStart);

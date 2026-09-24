@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const { audit } = require("./audit-service");
@@ -327,7 +329,7 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
     await planTaskIntentForCommittedOrder({ agencyId, member: access.member, order: row, now, db: tx });
     return { row, idempotent: false };
   };
-  const outcome = typeof client.$transaction === "function" ? await client.$transaction(execute) : await execute(client);
+  const outcome = await runDbTransaction(client, execute);
   const row = outcome.row;
   if (!outcome.idempotent) {
     const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
@@ -519,7 +521,7 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
       if (!row) throw fail("CUSTOM_ORDER_NOT_FOUND", "Custom order not found after payment update", 404);
       return row;
     };
-    const row = typeof client.$transaction === "function" ? await client.$transaction(applyTerminalPayment) : await applyTerminalPayment(client);
+    const row = await runDbTransaction(client, applyTerminalPayment);
     const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
     await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.payment_update", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, status: row.status, priceCents: row.priceCents, previousPaidAmountCents: Math.max(0, Number(current.paidAmountCents || 0)), paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus }, db: client });
     return { ok: true, order: serializeOrder(row, now) };
@@ -584,7 +586,7 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
     }
     return row;
   };
-  const row = typeof client.$transaction === "function" ? await client.$transaction(applyPendingUpdate) : await applyPendingUpdate(client);
+  const row = await runDbTransaction(client, applyPendingUpdate);
   const payment = paymentSnapshot(row.priceCents, row.paidAmountCents);
   await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.update", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, type: row.type, previousStatus: current.status, status: row.status, dueAt: row.dueAt, scheduledAt: row.scheduledAt, physicalStatus: row.physicalStatus, priceCents: row.priceCents, previousPaidAmountCents: Math.max(0, Number(current.paidAmountCents || 0)), paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus }, db: client });
   return { ok: true, order: serializeOrder(row, now) };

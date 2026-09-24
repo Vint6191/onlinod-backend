@@ -4,7 +4,8 @@ const { performance } = require("node:perf_hooks");
 const work = require("./domain-work-authority-service");
 const { runRootCommit } = require("./db-commit-kernel");
 const { dbAuthorityNow } = require("./db-time-authority-service");
-const WORK_CLASS = work.WORK_CLASS.NOTIFICATION_CONSEQUENCES;
+const LEGACY_WORK_CLASS = work.WORK_CLASS.NOTIFICATION_CONSEQUENCES;
+const WORK_CLASS = work.WORK_CLASS.NOTIFICATION_CONSEQUENCES_V2;
 const PAGE_SIZE = 50;
 const TABLES = ["creatorSale", "creatorTip", "creatorSubscriptionEvent"];
 const TERMINAL = new Set(["DONE", "FAILED", "CANCELLED", "CANCELED", "EXPIRED"]);
@@ -12,7 +13,7 @@ function error(code) { return Object.assign(new Error(code), { code }); }
 function owned(result) { if (!result || result.lost) throw error("NOTIFICATION_CONSEQUENCE_CLAIM_LOST"); return result; }
 
 async function publishNotificationConsequences({ db, job }) {
-  if (job?.jobKey !== "catchup_notifications_scan" || job?.params?.notificationMode !== "catchup") return null;
+  if (job?.jobKey !== "catchup_notifications_scan") return null;
   const published = await work.publishDomainWork({ db, agencyId: job.agencyId, creatorId: job.creatorId,
     workClass: WORK_CLASS, objectType: "JobInstance", objectId: job.id,
     parentObjectId: job.creatorId, partitionKey: job.creatorId });
@@ -55,7 +56,7 @@ async function projectFacts({ db, job, table, rows, historical = false, historyP
 }
 
 async function processNotificationConsequencePage({ db, item, ownerToken }) {
-  if (item.workClass !== WORK_CLASS || item.objectType !== "JobInstance" || !item.creatorId) {
+  if (![WORK_CLASS, LEGACY_WORK_CLASS].includes(item.workClass) || item.objectType !== "JobInstance" || !item.creatorId) {
     throw error("NOTIFICATION_CONSEQUENCE_SCOPE_INVALID");
   }
   return runRootCommit(db, async ({ tx }) => {
@@ -85,7 +86,7 @@ async function processNotificationConsequencePage({ db, item, ownerToken }) {
       orderBy: { id: "asc" }, take: PAGE_SIZE,
       include: { fan: { select: { onlyFansUserId: true, username: true, displayName: true } } },
     });
-    await projectFacts({ db: tx, job, table, rows });
+    await projectFacts({ db: tx, job, table, rows, historical: job.params?.notificationMode !== "catchup" });
     const processed = Math.max(0, Number(cursor.processed || 0)) + rows.length;
     const next = rows.length === PAGE_SIZE
       ? { table, afterId: rows.at(-1).id, processed }
@@ -108,7 +109,7 @@ async function processNotificationConsequencePage({ db, item, ownerToken }) {
           { OR: [{ lockedUntil: null }, { lockedUntil: { lte: now } }] }] },
       data: { lastScanSummary: { jobId: job.id, compatibilityProcessed: processed, compatibilityComplete: true,
         projection: "durable_notification_consequences_v1" },
-        ...(job.status === "DONE" ? { lastSuccessfulScanAt: completedAt, currentScanStatus: "idle", lastErrorCode: null, lastErrorAt: null } : {}) },
+        ...(job.status === "DONE" && !job.lastError ? { lastSuccessfulScanAt: completedAt, currentScanStatus: "idle", lastErrorCode: null, lastErrorAt: null } : {}) },
     });
     owned(await work.ackDomainWorkClaim({ db: tx, item, ownerToken }));
     return { completed: true, processed: rows.length };
@@ -121,9 +122,10 @@ async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntim
   const report = { ok: true, selected: 0, processed: 0, completed: 0, yielded: 0, waiting: 0, failed: 0, lostOwnership: 0 };
   // Claim one quantum at a time: do not hold a large batch's leases while the
   // first item waits. Shared DomainWork claim indexes provide agency fairness.
+  let emptyLanes = 0;
   for (let index = 0; index < Math.max(1, Math.min(16, Number(limit) || 8)); index += 1) {
     if (performance.now() - started >= maxRuntimeMs) break;
-    const claim = await work.claimDomainWorkBatch({ db, workClass: WORK_CLASS, limit: 1,
+    const claim = await work.claimDomainWorkBatch({ db, workClass: index % 2 ? LEGACY_WORK_CLASS : WORK_CLASS, limit: 1,
       perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
     if (claim?.skipped) {
       report.skipped = true;
@@ -131,7 +133,8 @@ async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntim
       report.ok = claim.reason === "domain_work_dependency_wake_bridge_transition";
     }
     const item = claim?.items?.[0];
-    if (!item) break;
+    if (!item) { if (++emptyLanes >= 2) break; continue; }
+    emptyLanes = 0;
     report.selected += 1;
     try {
       const result = await processNotificationConsequencePage({ db, item, ownerToken: claim.ownerToken });
@@ -146,4 +149,4 @@ async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntim
   return report;
 }
 
-module.exports = { projectFacts, WORK_CLASS, PAGE_SIZE, publishNotificationConsequences, processNotificationConsequencePage, runNotificationConsequenceSweep };
+module.exports = { projectFacts, WORK_CLASS, LEGACY_WORK_CLASS, PAGE_SIZE, publishNotificationConsequences, processNotificationConsequencePage, runNotificationConsequenceSweep };

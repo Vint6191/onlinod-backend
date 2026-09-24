@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -127,7 +129,7 @@ function makeDb({ events = [], ledgers = [] } = {}) {
       },
     },
   };
-  return { db, activity, states, ledgers };
+  return { db: commitDatabaseFixture(db), activity, states, ledgers };
 }
 
 function incoming(id, at, messageId = id) {
@@ -253,7 +255,7 @@ test("F54-03 pending reply boundary uses cross-family telemetry id at equal time
   const after = incoming("event-z", at, "m-after");
   const ledger = { id: "ledger-r", agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", memberId: "member-a", messageId: "reply", source: "manual", sentAt: d(at), telemetryEventId: "event-b" };
   const fx = makeDb({ events: [after, before], ledgers: [ledger] });
-  const result = await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: fx.db });
+  const result = await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: commitDatabaseFixture(fx.db) });
   assert.equal(result.status, "PENDING");
   assert.equal(result.row.incomingCount, 1);
   assert.equal(result.row.firstIncomingMessageId, "m-after");
@@ -264,7 +266,7 @@ test("F54-03 pending historical equal-time boundary without telemetry id is expl
   const event = incoming("event-a", at, "m-ambiguous");
   const ledger = { id: "legacy-r", agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", memberId: "member-a", messageId: "reply", source: "manual", sentAt: d(at), telemetryEventId: null };
   const fx = makeDb({ events: [event], ledgers: [ledger] });
-  const result = await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: fx.db });
+  const result = await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: commitDatabaseFixture(fx.db) });
   assert.equal(result.incompleteHistory, true);
   assert.equal(result.row.projectionState, "INCOMPLETE_HISTORY");
 });
@@ -276,7 +278,7 @@ test("historical backfill groups raw events by dialog and marks durable progress
     seen("seen-1", "2026-08-12T09:01:00.000Z", "member-a"),
   ];
   const fx = makeDb({ events: rows });
-  const result = await service.backfillTeamPendingProjectionBatch({ db: fx.db, limit: 100 });
+  const result = await service.backfillTeamPendingProjectionBatch({ db: commitDatabaseFixture(fx.db), limit: 100 });
   assert.equal(result.selected, 3);
   assert.equal(result.dialogs, 1);
   assert.equal(result.projected, 3);
@@ -285,7 +287,7 @@ test("historical backfill groups raw events by dialog and marks durable progress
   assert.equal(fx.states[0].ownerMemberId, "member-a");
   assert.ok(fx.activity.every((row) => row.pendingProjectionVersion === "team_pending_v2"));
 
-  const second = await service.backfillTeamPendingProjectionBatch({ db: fx.db, limit: 100 });
+  const second = await service.backfillTeamPendingProjectionBatch({ db: commitDatabaseFixture(fx.db), limit: 100 });
   assert.equal(second.selected, 0, "projection cursor is stored on raw facts; no endless rescan");
 });
 
@@ -319,7 +321,7 @@ test("open pending survives raw-detail retention instead of becoming a false CLE
 
   // Detail TTL removes the raw incoming while the compact current episode survives.
   fx.activity.splice(0, fx.activity.length);
-  const result = await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: fx.db });
+  const result = await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: commitDatabaseFixture(fx.db) });
   assert.equal(result.status, "PENDING");
   assert.equal(result.incompleteHistory, true);
   assert.equal(fx.states[0].projectionState, "INCOMPLETE_HISTORY");
@@ -335,7 +337,7 @@ test("pending reconciliation takes the dialog fence before reading projection in
   fx.db.$executeRawUnsafe = async () => { calls.push("lock"); return 1; };
   fx.db.$transaction = async (work) => work(fx.db);
 
-  await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: fx.db });
+  await service.reconcilePendingDialog({ agencyId: "agency-1", creatorId: "creator-1", dialogId: "fan-1", db: commitDatabaseFixture(fx.db) });
   assert.equal(calls[0], "lock");
   assert.ok(calls.includes("read"));
 });

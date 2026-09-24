@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -50,7 +52,7 @@ test("Closure3 existing AUTO + later legacy MANUAL migrates MANUAL before legacy
   let canonical = autoTipRow();
   let deleted = [];
   const fake = {
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     async $queryRawUnsafe(sql) {
       assert.match(String(sql), /MoneyAttribution[\s\S]*FOR UPDATE SKIP LOCKED/);
       return [{ ...legacy }];
@@ -85,7 +87,7 @@ test("Closure3 newer canonical MANUAL beats older legacy MANUAL while legacy his
   };
   let deleted = [];
   const fake = {
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     async $queryRawUnsafe() { return [{ ...legacy }]; },
     moneyAttribution: { async deleteMany({ where }) { deleted = where.id.in.slice(); return { count: deleted.length }; } },
     teamTipLedger: {
@@ -107,7 +109,7 @@ test("Closure3 latest legacy manual history owns migration even if stale legacy 
   const legacy = { ...legacyManualRow(), state: "auto", attributedToMemberId: "member-A", attributedToUserId: "user-A" };
   let canonical = autoTipRow();
   const fake = {
-    async $transaction(work) { return work(fake); }, async $queryRawUnsafe() { return [{ ...legacy }]; },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); }, async $queryRawUnsafe() { return [{ ...legacy }]; },
     moneyAttribution: { async deleteMany() { return { count: 1 }; } },
     teamTipLedger: {
       async createMany() { return { count: 0 }; }, async findFirst() { return { ...canonical }; },
@@ -141,7 +143,7 @@ test("Closure3 migrated MANUAL Tip remains MANUAL after later automatic reconcil
     },
   };
   const money = loadWithPrisma(moneyPath, {});
-  const result = await money.reconcileCreatorTipToTeam({ db, tipId: tip.id });
+  const result = await money.reconcileCreatorTipToTeam({ db: commitDatabaseFixture(db), tipId: tip.id });
   assert.equal(result.preservedManualResolution, true);
   assert.equal(row.attributedMemberId, "member-B");
   assert.match(row.resolvedSource, /^manual_/);
@@ -158,7 +160,7 @@ test("Closure3 PPV manual reassignment replaces the full owner tuple", async () 
   let purchase = state.purchase;
   const lockOrder = [];
   const fake = {
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     async $queryRaw(strings) {
       const sql = Array.isArray(strings) ? strings.join("?") : String(strings);
       if (sql.includes('"TeamPpvResolveJob"')) { lockOrder.push("job"); return [{ ...state.job }]; }
@@ -247,7 +249,7 @@ test("Closure3 true AUTO/MANUAL PPV overlap converges without deadlock and final
   const fx = createSharedPpvConcurrencyDb();
   const money = loadWithPrisma(moneyPath, {});
   const ppv = loadWithPrisma(ppvPath, fx.root);
-  const auto = money.reconcileCreatorSaleToTeam({ db: fx.root, saleId: "sale-1" });
+  const auto = money.reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.root), saleId: "sale-1" });
   const manual = ppv.resolvePpvConflict({ agencyId: "agency-1", jobId: "job-1", memberId: "member-B", actorMemberId: "manager", actorMember: phase2ManagerActor({ id: "manager", userId: "user-manager", creatorIds: ["creator-1"] }), action: "assign", deviceId: "device-1", reason: "manual wins overlap", allowedCreatorIds: ["creator-1"] });
   await Promise.race([
     Promise.all([auto, manual]),

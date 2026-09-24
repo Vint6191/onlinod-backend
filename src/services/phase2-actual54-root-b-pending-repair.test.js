@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -43,7 +45,7 @@ function makeProductionLikeDb() {
       async upsert({ create, update }) { Object.assign(state, Object.keys(state).length ? update : create); return state; },
     },
   };
-  return { db, state, get rawPage() { return rawPage; }, get projected() { return projected; } };
+  return { db: commitDatabaseFixture(db), state, get rawPage() { return rawPage; }, get projected() { return projected; } };
 }
 
 const late = {
@@ -135,13 +137,13 @@ test("F55-04 reply-boundary change explicitly rebases a preserved repair cursor"
     },
   };
 
-  const first = await applyTeamPendingProjection(late, db, { executeRepair: true, repairLimit: 2 });
+  const first = await applyTeamPendingProjection(late, commitDatabaseFixture(db), { executeRepair: true, repairLimit: 2 });
   assert.equal(first.complete, false);
   assert.equal(first.progress.replyEventId, "reply-event-a");
   assert.equal(first.progress.cursorId, "event-1-b");
 
   currentReply = { id: "ledger-r2", sentAt: d("2026-09-10T09:59:00Z"), telemetryEventId: "reply-event-z", source: "manual" };
-  const second = await applyTeamPendingProjection(late, db, { executeRepair: true, repairLimit: 2, repairProgress: first.progress });
+  const second = await applyTeamPendingProjection(late, commitDatabaseFixture(db), { executeRepair: true, repairLimit: 2, repairProgress: first.progress });
   assert.equal(second.complete, false);
   assert.equal(second.progress.replyEventId, "reply-event-z");
   assert.equal(second.progress.incomingCount, 2, "boundary change must restart/rebase rather than append old prefix");

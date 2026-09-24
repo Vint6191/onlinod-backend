@@ -1,7 +1,10 @@
 "use strict";
 const test = require("node:test"), assert = require("node:assert/strict");
 const { projectTipProjectionFact, projectSubscriptionProjectionFact } = require("./team-observation-service");
-const { projectCanonicalSubscriptionCompatibility } = require("./traffic-service");
+const { projectCanonicalSubscriptionCompatibility: projectImpl } = require("./traffic-service");
+const { runDbTransaction } = require("./db-transaction-service");
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+const projectCanonicalSubscriptionCompatibility = args => runDbTransaction(commitDatabaseFixture(args.db), tx => projectImpl({ ...args, db: tx }));
 function receiptDb() {
   const rows = new Map(), calls = [];
   const db = { trafficSourceMember: { findFirst: async () => ({sourceId:"source"}), updateMany: async () => ({count:1}) },

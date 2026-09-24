@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
@@ -337,7 +339,7 @@ function assertCheckoutRequestBinding(order, requestHash) {
 }
 
 async function runTransaction(client, fn) {
-  return typeof client?.$transaction === "function" ? client.$transaction(fn) : fn(client);
+  return runDbTransaction(client, fn);
 }
 
 async function calculateCheckoutSnapshot({ agencyId, selection, db = null }) {

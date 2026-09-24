@@ -1,4 +1,7 @@
 "use strict";
+const { classifyCommitConflict } = require("./db-commit-kernel");
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { audit } = require("./audit-service");
 const { assertTelegramInboundRuntimeLease } = require("./telegram-execution-runtime");
@@ -109,9 +112,9 @@ async function runInboundReviewTransaction(client, operation) {
     throw fail("TELEGRAM_INBOUND_REVIEW_TRANSACTION_REQUIRED", "Telegram inbound review resolution requires transactional storage", 500);
   }
   try {
-    return await client.$transaction(operation, { isolationLevel: "Serializable" });
+    return await runDbTransaction(client, operation, { isolationLevel: "Serializable" });
   } catch (error) {
-    if (String(error?.code || "") === "P2034") {
+    if (classifyCommitConflict(error)) {
       throw fail("TELEGRAM_INBOUND_REVIEW_RACE", "Telegram inbound review changed concurrently; refresh the queue", 409);
     }
     throw error;
@@ -762,8 +765,8 @@ async function ingestTelegramInboundEvent({ agencyId, member, accountId, deviceI
         return tx.telegramInboundEvent.findFirst({ where: { id } });
       }
     };
-    row = hasMedia === true && typeof client.$transaction === "function"
-      ? await client.$transaction(persistObservation)
+    row = hasMedia === true
+      ? await runDbTransaction(client, persistObservation)
       : await persistObservation(client);
   }
   if (!row) throw fail("TELEGRAM_INBOUND_PERSIST_FAILED", "Telegram inbound event could not be persisted", 500);

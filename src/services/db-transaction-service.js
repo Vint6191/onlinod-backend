@@ -1,12 +1,30 @@
 "use strict";
 
 function rootPrisma() { return require("../prisma"); }
+const { runRootCommit, joinCommit, currentCommitContext } = require("./db-commit-kernel");
 
 async function runDbTransaction(db, work, options = undefined) {
   const client = db || rootPrisma();
   if (typeof work !== "function") throw new TypeError("runDbTransaction requires a work callback");
-  if (typeof client.$transaction !== "function") return work(client);
-  return options === undefined ? client.$transaction(work) : client.$transaction(work, options);
+  const context = currentCommitContext();
+  const requirements = options || {};
+  if (context && context.tx === client) {
+    return joinCommit(context, requirements, ({ tx }) => work(tx));
+  }
+  // No duck-typed join and no unrelated root while another commit is active.
+  // A transaction client is valid only within its kernel-issued attempt.
+  if (context || typeof client.$transaction !== "function") {
+    throw Object.assign(new Error("Use the current kernel transaction for composition"), { code: "DB_COMMIT_CONTEXT_REQUIRED" });
+  }
+  const timeout = requirements.timeout ?? 5000;
+  const maxWait = requirements.maxWait ?? 5000;
+  return runRootCommit(client, ({ tx }) => work(tx), {
+    timeout, maxWait, deadlineMs: Math.min(120000, timeout + maxWait),
+    lockTimeoutMs: Math.min(timeout, 5000), statementTimeoutMs: timeout,
+    // Existing domain callbacks are not implicitly made replayable. Reviewed
+    // command families opt into retry at their root, never in a joined helper.
+    maxAttempts: 1, ...requirements,
+  });
 }
 
 async function lockDbAdvisoryXact({ db, key, mode = "exclusive" }) {

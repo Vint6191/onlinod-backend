@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -156,7 +158,7 @@ function makeTransactionalRaceDb() {
   };
 
   return {
-    db, ledgers, responseCases, acquiredKeys, firstCoverageReached,
+    db: commitDatabaseFixture(db), ledgers, responseCases, acquiredKeys, firstCoverageReached,
     releaseFirstCoverage: () => releaseFirstCoverageResolve(),
   };
 }
@@ -215,7 +217,7 @@ test("stale historical NEEDS_REPAIR page cannot downgrade a response case that i
     },
   };
 
-  const result = await service.repairHistoricalResponseCase({ row: stalePageRow, agencyId: "agency-1", db });
+  const result = await service.repairHistoricalResponseCase({ row: stalePageRow, agencyId: "agency-1", db: commitDatabaseFixture(db) });
   assert.equal(result.skippedCurrent, true);
   assert.equal(result.projectionState, "FULL");
   assert.equal(updates, 0);
@@ -270,7 +272,7 @@ function makeCoverageRaceDb() {
     },
   };
   return {
-    db, row, acquiredKeys, getReads: () => reads, firstUpdateReached,
+    db: commitDatabaseFixture(db), row, acquiredKeys, getReads: () => reads, firstUpdateReached,
     releaseFirstUpdate: () => releaseFirstUpdateResolve(),
   };
 }

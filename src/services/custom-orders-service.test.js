@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -260,7 +262,7 @@ function fakeDb(seed = {}) {
     },
     auditLog: { async create({ data }) { return { id: `audit-${seq}`, ...clone(data) }; } },
     async $executeRawUnsafe() { return 1; },
-    async $transaction(fn) { return fn(this); },
+    async $transaction(fn) { return fn({ ...(this), $transaction: undefined }); },
   };
 }
 
@@ -280,7 +282,7 @@ test("custom order create is creator-scoped and starts pending", async () => {
     agencyId: "agency-1",
     member,
     input: withCreateIntent({ creatorId: "creator-1", dialogId: "422411209", scenario: "5 minute custom", dueAt: "2026-08-18T20:00:00Z", price: 150 }),
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(result.ok, true);
   assert.equal(result.order.status, "PENDING");
@@ -290,7 +292,7 @@ test("custom order create is creator-scoped and starts pending", async () => {
   assert.equal("agencyId" in result.order, false);
   assert.equal("creatorId" in result.order, false);
   assert.equal("createdByMemberId" in result.order, false);
-  await assert.rejects(() => createCustomOrder({ agencyId: "agency-1", member, input: withCreateIntent({ creatorId: "creator-2", dialogId: "1", scenario: "x" }), db }), /do not have access/i);
+  await assert.rejects(() => createCustomOrder({ agencyId: "agency-1", member, input: withCreateIntent({ creatorId: "creator-2", dialogId: "1", scenario: "x" }), db: commitDatabaseFixture(db) }), /do not have access/i);
 });
 
 
@@ -303,7 +305,7 @@ test("custom payment amounts use integer cents and derive status/remaining inste
   const result = await createCustomOrder({
     agencyId: "agency-1", member,
     input: withCreateIntent({ creatorId: "creator-1", dialogId: "422411209", scenario: "paid in parts", price: 60, paidAmount: 40 }),
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(result.order.priceCents, 6000);
   assert.equal(result.order.paidAmountCents, 4000);
@@ -323,12 +325,12 @@ test("editing total or paid amount deterministically recomputes payment state an
     telegramTaskMessageId: null, telegramReferenceMessageIds: [], reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
     createdAt: new Date("2026-08-21T10:00:00.000Z"), updatedAt: new Date("2026-08-21T10:00:00.000Z"),
   }] });
-  const raised = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-pay", input: { price: 100 }, db });
+  const raised = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-pay", input: { price: 100 }, db: commitDatabaseFixture(db) });
   assert.equal(raised.order.paidAmount, 40);
   assert.equal(raised.order.remainingAmount, 60);
   assert.equal(raised.order.paymentStatus, "PARTIALLY_PAID");
 
-  const overpaid = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-pay", input: { paidAmount: 120 }, db });
+  const overpaid = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-pay", input: { paidAmount: 120 }, db: commitDatabaseFixture(db) });
   assert.equal(overpaid.order.paidAmount, 120);
   assert.equal(overpaid.order.remainingAmount, 0);
   assert.equal(overpaid.order.paymentStatus, "PAID_IN_FULL");
@@ -342,12 +344,12 @@ test("paid amount can be corrected after finalization without reopening immutabl
     telegramTaskMessageId: null, telegramReferenceMessageIds: [], reminderConfig: null, nextReminderAt: null, lastReminderAt: null, lastReminderKey: null, reminderClaimToken: null, reminderClaimUntil: null,
     createdAt: new Date("2026-08-21T10:00:00.000Z"), updatedAt: new Date("2026-08-21T10:30:00.000Z"),
   }] });
-  const corrected = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-final-pay", input: { paidAmount: 60 }, db });
+  const corrected = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-final-pay", input: { paidAmount: 60 }, db: commitDatabaseFixture(db) });
   assert.equal(corrected.order.status, "COMPLETED");
   assert.equal(corrected.order.paymentStatus, "PAID_IN_FULL");
   assert.equal(corrected.order.remainingAmount, 0);
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-final-pay", input: { price: 80 } , db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-final-pay", input: { price: 80 } , db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_ORDER_ALREADY_FINALIZED" && error?.status === 409,
   );
 });
@@ -402,7 +404,7 @@ test("PENDING Custom mutations are fenced after CUSTOM_MANUAL_SEND crosses the p
       createdAt: updatedAt, updatedAt,
     }] });
     await assert.rejects(
-      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-manual-inflight", input: { price: 70 }, db }),
+      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-manual-inflight", input: { price: 70 }, db: commitDatabaseFixture(db) }),
       (error) => error?.code === "CUSTOM_DELIVERY_COMMIT_IN_FLIGHT" && error?.status === 409,
       `${state.status} must block business mutation until the remote outcome is settled`,
     );
@@ -424,7 +426,7 @@ test("precommit CUSTOM_MANUAL_SEND does not freeze a PENDING Custom; commit-time
     id: "manual-running", agencyId: "agency-1", creatorId: "creator-1", actionType: "CUSTOM_MANUAL_SEND",
     targetId: "order-manual-precommit", status: "RUNNING", failureCode: null, createdAt: updatedAt, updatedAt,
   }] });
-  const result = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-manual-precommit", input: { price: 70 }, db });
+  const result = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-manual-precommit", input: { price: 70 }, db: commitDatabaseFixture(db) });
   assert.equal(result.order.priceCents, 7000);
 });
 
@@ -454,7 +456,7 @@ test("CONTENT cancellation atomically terminalizes only proven-precommit relay w
   const result = await updateCustomOrder({
     agencyId: "agency-1", member, orderId: "order-cancel-content",
     input: { status: "CANCELLED", cancelReason: "fan changed mind" },
-    now: new Date("2026-08-21T10:01:00.000Z"), db,
+    now: new Date("2026-08-21T10:01:00.000Z"), db: commitDatabaseFixture(db),
   });
 
   assert.equal(result.order.status, "CANCELLED");
@@ -472,7 +474,7 @@ test("list applies member creator scope and reports pending/overdue counters", a
     { id: "a", agencyId: "agency-1", creatorId: "creator-1", dialogId: "1", createdByMemberId: "member-1", scenario: "A", internalNote: null, status: "PENDING", dueAt: new Date("2026-08-17T19:00:00Z"), acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 1000, createdAt: new Date("2026-08-17T18:00:00Z"), updatedAt: new Date("2026-08-17T18:00:00Z") },
     { id: "b", agencyId: "agency-1", creatorId: "creator-2", dialogId: "2", createdByMemberId: "member-1", scenario: "B", internalNote: null, status: "PENDING", dueAt: new Date("2026-08-18T19:00:00Z"), acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 2000, createdAt: new Date("2026-08-17T18:00:00Z"), updatedAt: new Date("2026-08-17T18:00:00Z") },
   ] });
-  const result = await listCustomOrders({ agencyId: "agency-1", member, pendingOnly: true, now: new Date("2026-08-17T20:00:00Z"), db });
+  const result = await listCustomOrders({ agencyId: "agency-1", member, pendingOnly: true, now: new Date("2026-08-17T20:00:00Z"), db: commitDatabaseFixture(db) });
   assert.equal(result.items.length, 1);
   assert.equal(result.items[0].creator.name, "Model A");
   assert.deepEqual(result.counts, { pending: 1, completed: 0, missed: 0, cancelled: 0, overdue: 1, dueSoon: 0 });
@@ -482,7 +484,7 @@ test("CALL manual completion preserves the journal row while CONTENT uses the de
   const db = fakeDb({ orders: [
     { id: "order-x", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1", scenario: "old", internalNote: null, type: "CALL", contentKind: null, status: "PENDING", dueAt: null, scheduledAt: new Date("2026-08-17T21:00:00Z"), durationMinutes: 30, acceptedAt: null, completedAt: null, deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 0, telegramTaskMessageId: null, createdAt: new Date("2026-08-17T18:00:00Z"), updatedAt: new Date("2026-08-17T18:00:00Z") },
   ] });
-  const result = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-x", input: { status: "COMPLETED", scenario: "done" }, now: new Date("2026-08-17T22:00:00Z"), db });
+  const result = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-x", input: { status: "COMPLETED", scenario: "done" }, now: new Date("2026-08-17T22:00:00Z"), db: commitDatabaseFixture(db) });
   assert.equal(result.order.status, "COMPLETED");
   assert.equal(result.order.scenario, "done");
   assert.deepEqual(result.order.mediaIds, []);
@@ -495,14 +497,14 @@ test("terminal custom orders are immutable and duplicate finalization is idempot
   const db = fakeDb({ orders: [
     { id: "order-done", agencyId: "agency-1", creatorId: "creator-1", dialogId: "422", createdByMemberId: "member-1", scenario: "done", internalNote: null, type: "CALL", contentKind: null, status: "COMPLETED", dueAt: null, scheduledAt: new Date("2026-08-17T20:00:00Z"), durationMinutes: 30, acceptedAt: null, completedAt: new Date("2026-08-17T21:00:00Z"), deliveredAt: null, cancelledAt: null, cancelReason: null, mediaIds: "", priceCents: 1000, createdAt: new Date("2026-08-17T18:00:00Z"), updatedAt: new Date("2026-08-17T21:00:00Z") },
   ] });
-  const retry = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-done", input: { creatorId: "creator-1", status: "COMPLETED" }, db });
+  const retry = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-done", input: { creatorId: "creator-1", status: "COMPLETED" }, db: commitDatabaseFixture(db) });
   assert.equal(retry.order.status, "COMPLETED");
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-done", input: { creatorId: "creator-1", status: "CANCELLED", cancelReason: "late" }, db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-done", input: { creatorId: "creator-1", status: "CANCELLED", cancelReason: "late" }, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_ORDER_ALREADY_FINALIZED" && error?.status === 409,
   );
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-done", input: { creatorId: "creator-1", scenario: "rewrite history" }, db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-done", input: { creatorId: "creator-1", scenario: "rewrite history" }, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_ORDER_ALREADY_FINALIZED",
   );
 });
@@ -543,7 +545,7 @@ test("V2 types keep one CustomOrder row and do not arm reminders before canonica
       reminderConfig: { enabled: true, offsetsMinutes: [135, 47, 5] },
       price: 200,
     }),
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(call.order.type, "CALL");
   assert.equal(call.order.contentKind, null);
@@ -555,7 +557,7 @@ test("V2 types keep one CustomOrder row and do not arm reminders before canonica
     member,
     now: new Date("2026-08-19T12:00:00.000Z"),
     input: withCreateIntent({ creatorId: "creator-1", dialogId: "422411209", scenario: "Panties sale", type: "PHYSICAL", price: 80 }),
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(physical.order.type, "PHYSICAL");
   assert.equal(physical.order.physicalStatus, "WAITING");
@@ -578,17 +580,17 @@ test("ordinary edits preserve the current reminder while policy edits reproject 
     kind: "TASK", state: "CONFIRMED", accountId: "tg-1", remoteMessageId: 501, remoteRecipientTelegramUserId: "1001",
     remoteSentAt: new Date("2026-08-19T12:05:00.000Z"), confirmedAt: new Date("2026-08-19T12:05:01.000Z"), createdAt: new Date("2026-08-19T12:05:00.000Z"),
   });
-  const edited = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-timer", input: { internalNote: "internal only" }, now: new Date("2026-08-19T12:20:00.000Z"), db });
+  const edited = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-timer", input: { internalNote: "internal only" }, now: new Date("2026-08-19T12:20:00.000Z"), db: commitDatabaseFixture(db) });
   assert.equal(edited.order.nextReminderAt, nextAt.toISOString(), "internal edit must not move the reminder clock");
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-timer", input: { scenario: "after" }, now: new Date("2026-08-19T12:21:00.000Z"), db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-timer", input: { scenario: "after" }, now: new Date("2026-08-19T12:21:00.000Z"), db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_FIELDS_IMMUTABLE",
   );
 
   const policyEdited = await updateCustomOrder({
     agencyId: "agency-1", member, orderId: "order-timer",
     input: { reminderConfig: { enabled: true, firstAfterMinutes: 90, repeatEveryMinutes: 120 } },
-    now: new Date("2026-08-19T12:30:00.000Z"), db,
+    now: new Date("2026-08-19T12:30:00.000Z"), db: commitDatabaseFixture(db),
   });
   assert.equal(policyEdited.order.nextReminderAt, "2026-08-19T13:35:00.000Z", "policy changes recompute timing from the canonical TASK provider receipt instead of inventing a new instruction clock");
 });
@@ -610,12 +612,12 @@ test("confirmed Telegram TASK freezes every model-visible task field but keeps i
   ]) {
     const db = fakeDb({ orders: [clone(base)] });
     await assert.rejects(
-      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-frozen", input, db }),
+      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-frozen", input, db: commitDatabaseFixture(db) }),
       (error) => ["CUSTOM_ORDER_TELEGRAM_TASK_FIELDS_IMMUTABLE", "CUSTOM_ORDER_TELEGRAM_TASK_TYPE_IMMUTABLE"].includes(error?.code),
     );
   }
   const db = fakeDb({ orders: [clone(base)] });
-  const allowed = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-frozen", input: { internalNote: "manager note", paidAmount: 100 }, db });
+  const allowed = await updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-frozen", input: { internalNote: "manager note", paidAmount: 100 }, db: commitDatabaseFixture(db) });
   assert.equal(allowed.order.internalNote, "manager note");
   assert.equal(allowed.order.paymentStatus, "PAID_IN_FULL");
 });
@@ -634,10 +636,10 @@ test("TASK COMMITTING/RECONCILE_REQUIRED fences model-visible edits before provi
       commitStartedAt: new Date("2026-08-21T10:05:00.000Z"), createdAt: new Date("2026-08-21T10:00:00.000Z"),
     });
     await assert.rejects(
-      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: `order-${state}`, input: { scenario: "silently diverged task" }, db }),
+      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: `order-${state}`, input: { scenario: "silently diverged task" }, db: commitDatabaseFixture(db) }),
       (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_FIELDS_IMMUTABLE" && error?.status === 409,
     );
-    const internal = await updateCustomOrder({ agencyId: "agency-1", member, orderId: `order-${state}`, input: { internalNote: "manager-only note" }, db });
+    const internal = await updateCustomOrder({ agencyId: "agency-1", member, orderId: `order-${state}`, input: { internalNote: "manager-only note" }, db: commitDatabaseFixture(db) });
     assert.equal(internal.order.internalNote, "manager-only note");
   }
 });
@@ -652,12 +654,12 @@ test("CONTENT generic update cannot forge completion or OF media provenance", as
   };
   let db = fakeDb({ orders: [clone(row)] });
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { status: "COMPLETED" }, db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { status: "COMPLETED" }, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_ORDER_CONTENT_COMPLETION_AUTHORITY" && error?.status === 409,
   );
   db = fakeDb({ orders: [clone(row)] });
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { mediaIds: ["999"] }, db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { mediaIds: ["999"] }, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_ORDER_CONTENT_MEDIA_IDS_RETIRED" && error?.status === 409,
   );
 });
@@ -672,14 +674,14 @@ test("CONTENT type becomes immutable after submission binding, including legacy 
   };
   let db = fakeDb({ orders: [clone(base)] });
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: base.id, input: { type: "CALL", scheduledAt: "2026-08-20T18:00:00Z", durationMinutes: 30 }, db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: base.id, input: { type: "CALL", scheduledAt: "2026-08-20T18:00:00Z", durationMinutes: 30 }, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_ORDER_CONTENT_TYPE_BOUND" && error?.status === 409,
   );
 
   const legacy = { ...clone(base), id: "order-content-legacy-bound", contentBoundAt: null };
   db = fakeDb({ orders: [legacy], submissions: [{ id: "submission-legacy", agencyId: "agency-1", creatorId: "creator-1", customOrderId: legacy.id }] });
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: legacy.id, input: { type: "PHYSICAL", physicalStatus: "WAITING" }, db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: legacy.id, input: { type: "PHYSICAL", physicalStatus: "WAITING" }, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_ORDER_CONTENT_TYPE_BOUND" && error?.status === 409,
   );
 
@@ -687,7 +689,7 @@ test("CONTENT type becomes immutable after submission binding, including legacy 
   db = fakeDb({ orders: [pristine] });
   const changed = await updateCustomOrder({
     agencyId: "agency-1", member, orderId: pristine.id,
-    input: { type: "CALL", scheduledAt: "2026-08-20T18:00:00Z", durationMinutes: 30 }, db,
+    input: { type: "CALL", scheduledAt: "2026-08-20T18:00:00Z", durationMinutes: 30 }, db: commitDatabaseFixture(db),
   });
   assert.equal(changed.order.type, "CALL", "an unused CONTENT draft may still change type before any submission lifecycle binds it");
 });
@@ -713,12 +715,12 @@ test("content binding migration is additive and backfills durable submission his
 test("CustomOrder create retries with the same stable clientMutationId return the same order and conflicting payload is rejected", async () => {
   const db = fakeDb();
   const input = withCreateIntent({ creatorId: "creator-1", dialogId: "422", scenario: "stable create" });
-  const first = await createCustomOrder({ agencyId: "agency-1", member, input, db });
-  const replay = await createCustomOrder({ agencyId: "agency-1", member, input: { ...input }, db });
+  const first = await createCustomOrder({ agencyId: "agency-1", member, input, db: commitDatabaseFixture(db) });
+  const replay = await createCustomOrder({ agencyId: "agency-1", member, input: { ...input }, db: commitDatabaseFixture(db) });
   assert.equal(replay.idempotent, true);
   assert.equal(replay.order.id, first.order.id);
   await assert.rejects(
-    () => createCustomOrder({ agencyId: "agency-1", member, input: { ...input, scenario: "different intent" }, db }),
+    () => createCustomOrder({ agencyId: "agency-1", member, input: { ...input, scenario: "different intent" }, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT" && error?.status === 409,
   );
 });
@@ -737,12 +739,12 @@ test("cross-type generic PATCH cannot turn CALL/PHYSICAL into forged completed C
     };
     let db = fakeDb({ orders: [clone(row)] });
     await assert.rejects(
-      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { type: "CONTENT", contentKind: "VIDEO", status: "COMPLETED" }, db }),
+      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { type: "CONTENT", contentKind: "VIDEO", status: "COMPLETED" }, db: commitDatabaseFixture(db) }),
       (error) => error?.code === "CUSTOM_ORDER_CONTENT_COMPLETION_AUTHORITY" && error?.status === 409,
     );
     db = fakeDb({ orders: [clone(row)] });
     await assert.rejects(
-      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { type: "CONTENT", contentKind: "VIDEO", mediaIds: ["999"] }, db }),
+      () => updateCustomOrder({ agencyId: "agency-1", member, orderId: row.id, input: { type: "CONTENT", contentKind: "VIDEO", mediaIds: ["999"] }, db: commitDatabaseFixture(db) }),
       (error) => error?.code === "CUSTOM_ORDER_CONTENT_MEDIA_IDS_RETIRED" && error?.status === 409,
     );
   }
@@ -763,7 +765,7 @@ test("historical no-TASK committed REVISION_REQUEST freezes model-visible Custom
     confirmedAt: new Date("2026-09-07T18:05:00Z"), createdAt: new Date("2026-09-07T18:04:00Z"),
   });
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-revision-frozen", input: { scenario: "silently rewritten while model works" }, db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: "order-revision-frozen", input: { scenario: "silently rewritten while model works" }, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_ORDER_TELEGRAM_TASK_FIELDS_IMMUTABLE" && error?.status === 409,
   );
   assert.equal(db._rows[0].scenario, "original historical custom");
@@ -776,7 +778,7 @@ test("commit-time CustomOrder create rejects a stale creator-scope snapshot and 
       agencyId: "agency-1",
       member,
       input: withCreateIntent({ creatorId: "creator-1", dialogId: "scope-race", scenario: "must not commit after revoke" }),
-      db,
+      db: commitDatabaseFixture(db),
     }),
     (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
   );
@@ -797,7 +799,7 @@ test("commit-time pending CustomOrder update rejects stale management access bef
   };
   const db = fakeDb({ orders: [original], currentMember: { ...member, accessEpoch: 2, assignedCreators: [] } });
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: original.id, input: { internalNote: "stale write" }, db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: original.id, input: { internalNote: "stale write" }, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
   );
   assert.equal(db._rows[0].internalNote, null);
@@ -817,7 +819,7 @@ test("commit-time terminal payment correction also rejects stale management acce
   };
   const db = fakeDb({ orders: [original], currentMember: { ...member, accessEpoch: 2, assignedCreators: [] } });
   await assert.rejects(
-    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: original.id, input: { paidAmount: 60 }, db }),
+    () => updateCustomOrder({ agencyId: "agency-1", member, orderId: original.id, input: { paidAmount: 60 }, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
   );
   assert.equal(db._rows[0].paidAmountCents, 2000);

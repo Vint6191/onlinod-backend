@@ -113,7 +113,7 @@ function fakeDb({ lifecycleState = "ACTIVE", accountExists = true } = {}) {
       const agencySnapshot = clone(agency);
       const creatorSnapshot = clone(creator);
       const auditLength = audits.length;
-      try { return await work(db); }
+      try { return await work({ ...(db), $transaction: undefined }); }
       catch (error) {
         account = clone(accountSnapshot);
         Object.assign(agency, clone(agencySnapshot));

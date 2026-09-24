@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
@@ -433,7 +435,7 @@ async function pauseVaultUnsortedScan({ agencyId, creatorId, userId }) {
   const job = await loadActiveJob(prisma, creatorId);
   if (!job) return { ok: false, code: "VAULT_UNSORTED_JOB_NOT_ACTIVE", error: "Unsorted scan is not active" };
   const now = new Date();
-  await prisma.$transaction(async (tx) => {
+  await runDbTransaction(prisma, async (tx) => {
     await tx.jobInstance.updateMany({
       where: { id: job.id, status: { in: ACTIVE_JOB_STATUSES } },
       data: {
@@ -465,7 +467,7 @@ async function resumeVaultUnsortedScan({ agencyId, creatorId, userId }) {
   });
   if (!paused) return { ok: false, code: "VAULT_UNSORTED_PAUSED_JOB_NOT_FOUND", error: "Paused Unsorted scan was not found" };
   const now = new Date();
-  const result = await prisma.$transaction(async (tx) => {
+  const result = await runDbTransaction(prisma, async (tx) => {
     const job = await createPlannedJob({
       db: tx,
       publish: false,

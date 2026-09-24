@@ -100,7 +100,10 @@ test("INT5.4C-2A identical replay is idempotent while a different source may sti
 
 test("INT5.4C-2A bulk batch rejects contradictory duplicate facts before any SQL mutation", async () => {
   const writes = [];
-  const tx = { async $executeRawUnsafe(sql, ...args) { writes.push({ sql, args }); return 1; } };
+  const tx = { async $executeRawUnsafe(sql, ...args) {
+      // Transaction-local budget setup is not a domain mutation/lock.
+      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)") return 1;
+ writes.push({ sql, args }); return 1; } };
   const db = { async $transaction(work) { return work(tx); } };
   await expectConflict(projectFanObservationBatch(db, {
     agencyId: "agency-1", creatorId: "creator-1",
@@ -125,6 +128,9 @@ test("INT5.4C-2A production bulk fence rejects contradiction against persisted c
   const tx = {
     async $queryRawUnsafe() { return []; },
     async $executeRawUnsafe(sql, ...args) {
+      // Transaction-local budget setup is not a domain mutation/lock.
+      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)") return 1;
+
       const statement = String(sql);
       if (/pg_advisory_xact_lock/.test(statement)) locks.push({ sql: statement, args });
       else writes.push({ sql: statement, args });

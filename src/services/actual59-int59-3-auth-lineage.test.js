@@ -79,7 +79,7 @@ function prismaFor(session, { collision = null, authorityRow = undefined, locked
     refreshSession,
     user,
     agencyMember: { findFirst: async () => ({ id: "member-1", accessEpoch: 1, role: "CHATTER", agency: { id: "agency-1" } }) },
-    $transaction: async (fn) => fn({ refreshSession, user, $queryRawUnsafe: raw, $executeRawUnsafe: exec }),
+    $transaction: async (fn) => fn({ ...({ refreshSession, user, $queryRawUnsafe: raw, $executeRawUnsafe: exec }), $transaction: undefined }),
   };
   return { prisma, calls };
 }
@@ -274,7 +274,7 @@ test("legacy adoption serializes both the device replacement and the globally un
     authorizationScopeIncarnation: "desktop-scope-A", req: { headers: {}, ip: "127.0.0.1" },
   });
   assert.equal(result.ok, true);
-  const locks = calls.filter(([kind]) => kind === "exec").map(([, args]) => args.params[0]);
+  const locks = calls.filter(([kind, args]) => kind === "exec" && /pg_advisory_xact_lock/.test(args.sql)).map(([, args]) => args.params[0]);
   assert.deepEqual(locks.slice(0, 4), [
     "actual60:release-activation:AUTHORIZATION_HISTORY_PURGE",
     "authorization-user:user-1",

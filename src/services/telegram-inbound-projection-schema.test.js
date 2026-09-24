@@ -89,7 +89,7 @@ test("confirmed provider receipt commits before derived projection and REFERENCE
   const confirmBlock = deliveryAuthority.slice(confirmStart, repairStart);
 
   const settleStart = confirmBlock.indexOf("const settle = async (tx) =>");
-  const transactionCall = confirmBlock.indexOf("await client.$transaction(settle)", settleStart);
+  const transactionCall = confirmBlock.indexOf("await runDbTransaction(client, settle)", settleStart);
   const projectionCall = confirmBlock.indexOf("await projectConfirmedIntentObserved({ row: confirmed", transactionCall);
   assert.notEqual(settleStart, -1);
   assert.notEqual(transactionCall, -1);

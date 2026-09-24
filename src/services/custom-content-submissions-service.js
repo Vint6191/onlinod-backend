@@ -1,4 +1,7 @@
 "use strict";
+const { classifyCommitConflict } = require("./db-commit-kernel");
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const { audit } = require("./audit-service");
@@ -252,7 +255,7 @@ async function bindContentOrderForSubmission({ agencyId, creatorId, customOrderI
 }
 
 async function runSubmissionTransaction(client, work) {
-  return typeof client?.$transaction === "function" ? client.$transaction(work) : work(client);
+  return runDbTransaction(client, work);
 }
 
 async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOrderId, excludeSubmissionId = null, revisionSourceIntentId = null, revisionSentAt = null, humanOverridePrecheck = false, db }) {
@@ -317,7 +320,7 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
   }
 
   try {
-    const result = await client.$transaction(async (tx) => {
+    const result = await runDbTransaction(client, async (tx) => {
       // NEW provider-backed work is fenced by the parent Agency lifecycle first.
       // Global provider-reference lock order is Agency -> CreatorAccount -> TelegramAccount.
       await lockAgencyPipelineLifecycle({ db: tx, agencyId });
@@ -468,7 +471,7 @@ async function createCustomContentSubmission({ agencyId, member, input = {}, now
     await reprojectModelObligationScheduleIfAvailable({ agencyId, orderId: result.row?.customOrderId, now, db: client });
     return { ok: true, deduped: result.deduped === true, submission: serializeSubmission(result.row) };
   } catch (error) {
-    if (String(error?.code || "") === "P2034") throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_RACE", "Telegram provider source changed concurrently; retry from fresh state", 409);
+    if (classifyCommitConflict(error)) throw fail("CUSTOM_SUBMISSION_MANUAL_IMPORT_RACE", "Telegram provider source changed concurrently; retry from fresh state", 409);
     throw error;
   }
 }

@@ -1,3 +1,4 @@
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 "use strict";
 
 const test = require("node:test");
@@ -58,7 +59,7 @@ function loadService({ targetState = "deactivated" } = {}) {
   const prisma = { async $transaction(fn) { return fn(tx); }, agencyMember: tx.agencyMember };
   delete require.cache[servicePath];
   delete require.cache[prismaPath];
-  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: prisma };
+  require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: commitDatabaseFixture(prisma) };
   return { service: require(servicePath), getRow: () => ({ ...row }) };
 }
 

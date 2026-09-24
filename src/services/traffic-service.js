@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { Prisma } = require("@prisma/client");
 const prisma = require("../prisma");
@@ -1581,7 +1583,7 @@ async function updateTrafficSourceCost({ userId, creatorId, sourceId, costCents,
   const nextCostCents = cents(costCents);
 
   // Cost lives on TrafficSource; every current reader uses this canonical value.
-  const updated = await prisma.$transaction(
+  const updated = await runDbTransaction(prisma, 
     async (tx) => {
       const source = await tx.trafficSource.findFirst({
         where: {

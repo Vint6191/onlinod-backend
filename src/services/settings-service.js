@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 const { effectiveBillingState, liveEntitlementEnd, scopedEntitlement } = require("./billing-state-service");
 
 const bcrypt = require("bcryptjs");
@@ -220,7 +222,7 @@ async function changeAccountPassword({ agencyId, userId, currentPassword, newPas
   }
   const passwordHash = await bcrypt.hash(next, 12);
   const deviceId = clean(currentDeviceId, 160);
-  await client.$transaction(async (tx) => {
+  await runDbTransaction(client, async (tx) => {
     await acquireAuthorizationUserLock(tx, { userId });
     const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     await tx.user.update({ where: { id: userId }, data: { passwordHash } });
@@ -451,8 +453,7 @@ async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, d
       });
     }
   };
-  if (typeof client.$transaction === "function") await client.$transaction((tx) => persist(tx));
-  else await persist(client);
+  await runDbTransaction(client, persist);
 
   const after = await getWorkspaceSettings({ agencyId, member, db: client });
   await audit({
@@ -604,7 +605,7 @@ async function updateTelegramCustomReminderSettings({ agencyId, member, reminder
     });
     return normalized;
   };
-  return typeof client.$transaction === "function" ? client.$transaction(apply) : apply(client);
+  return runDbTransaction(client, apply);
 }
 
 function telegramInputError(message, code) {
@@ -653,9 +654,7 @@ async function addTelegramMtprotoAccount({ agencyId, member, apiId, apiHash, ses
       select: { id: true, apiId: true },
     });
   };
-  const account = typeof client.$transaction === "function"
-    ? await client.$transaction(createAccount, { isolationLevel: "Serializable" })
-    : await createAccount(client);
+  const account = await runDbTransaction(client, createAccount, { isolationLevel: "Serializable" });
   return { available: true, account: publicTelegramAccount({ ...account, lifecycleState: "ACTIVE", retirementRequestedAt: null, retirementDrainCompletedAt: null }, Boolean(cleanSession)) };
 }
 
@@ -730,7 +729,7 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
       if (Number(changed?.count || 0) !== 1) throw Object.assign(new Error("Telegram connection retirement changed concurrently; retry"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_RACE", status: 409 });
       return { alreadyRetiring: false };
     };
-    await client.$transaction((tx) => beginRetirement(tx), { isolationLevel: "Serializable" });
+    await runDbTransaction(client, (tx) => beginRetirement(tx), { isolationLevel: "Serializable" });
   }
 
   const retire = async (tx) => {
@@ -765,7 +764,7 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
       retirementRequestedAt: current.retirementRequestedAt ? new Date(current.retirementRequestedAt).toISOString() : null,
     };
   };
-  return client.$transaction((tx) => retire(tx), { isolationLevel: "Serializable" });
+  return runDbTransaction(client, (tx) => retire(tx), { isolationLevel: "Serializable" });
 }
 
 async function forceRetireLostTelegramMtprotoAccount({ agencyId, member, accountId, reason, acknowledgeLostObservations = false, db = null, now = new Date() }) {
@@ -777,7 +776,7 @@ async function forceRetireLostTelegramMtprotoAccount({ agencyId, member, account
   if (!why) throw Object.assign(new Error("A reason is required to force-retire a lost Telegram runtime"), { code: "SETTINGS_TELEGRAM_FORCE_RETIRE_REASON_REQUIRED", status: 400 });
   const client = db || prisma;
   if (typeof client?.$transaction !== "function") throw Object.assign(new Error("Force retirement requires transactional storage"), { code: "SETTINGS_TELEGRAM_FORCE_RETIRE_TRANSACTION_REQUIRED", status: 503 });
-  return client.$transaction(async (tx) => {
+  return runDbTransaction(client, async (tx) => {
     // Force retirement participates in the exact same Agency -> TelegramAccount ->
     // CustomOrder serialization order as normal retirement.
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
@@ -913,7 +912,7 @@ async function storeTelegramMtprotoSession({ agencyId, member, accountId, sessio
   if (!cleanSession || cleanSession.length > 262144) throw telegramInputError("MTProto session must be non-empty and smaller than 256 KB", "SETTINGS_TELEGRAM_SESSION_INVALID");
   const client = db || prisma;
   if (typeof client?.$transaction !== "function") throw Object.assign(new Error("Telegram session handoff requires transactional storage"), { code: "SETTINGS_TELEGRAM_SESSION_TRANSACTION_REQUIRED", status: 503 });
-  return client.$transaction(async (tx) => {
+  return runDbTransaction(client, async (tx) => {
     await assertManagementCommitAuthority({ tx, agencyId, actorMember: member, ownerOrAdmin: true });
     const secret = await readTelegramMtprotoAccountSecret({ agencyId, accountId, db: tx, requireActive: true });
     let encrypted;

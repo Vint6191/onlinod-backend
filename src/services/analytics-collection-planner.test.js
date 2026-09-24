@@ -25,7 +25,7 @@ function daysInclusive(start, end) {
 
 function addSweepLeaseStore(db) {
   let lease = null;
-  db.$transaction = async (work) => work(db);
+  db.$transaction = async (work) => work({ ...(db), $transaction: undefined });
   db.$executeRawUnsafe = async () => 1;
   db.analyticsCollectionLease = {
     findUnique: async () => lease ? { ...lease } : null,
@@ -83,7 +83,7 @@ function addDemandAuthority(db, overrides = {}) {
 
 function addDemandStore(db) {
   const rows = new Map();
-  db.$transaction = db.$transaction || (async (work) => work(db));
+  db.$transaction = db.$transaction || (async (work) => work({ ...db, $transaction: undefined }));
   db.$executeRawUnsafe = db.$executeRawUnsafe || (async () => 1);
   db.analyticsCollectionDemand = {
     findUnique: async ({ where }) => rows.has(where.key) ? { ...rows.get(where.key) } : null,
@@ -315,7 +315,7 @@ test("planner merges an exact claimed scan across generation buckets under a cre
     leaseRevision: 4,
   };
   const db = {
-    $transaction: async (work) => work(db),
+    $transaction: async (work) => work({ ...(db), $transaction: undefined }),
     $executeRawUnsafe: async (sql, key) => { lockCalls.push([sql, key]); return 1; },
     jobInstance: {
       findMany: async () => [{ ...current }],
@@ -345,6 +345,7 @@ test("planner merges an exact claimed scan across generation buckets under a cre
   assert.equal(result.job.id, "job-existing");
   assert.equal(result.job.priority, 100);
   assert.equal(createCalls, 0);
+  for (let i = lockCalls.length - 1; i >= 0; i--) if (lockCalls[i][0].includes("set_config('lock_timeout'")) lockCalls.splice(i, 1);
   assert.equal(lockCalls.length, 1);
   assert.match(lockCalls[0][0], /pg_advisory_xact_lock/);
   assert.equal(lockCalls[0][1], "analytics-plan:creator-1");
@@ -366,7 +367,7 @@ test("still-due exact window reschedules a terminal attempt inside the same idem
     completedAt: new Date("2026-09-08T14:01:00.000Z"),
   };
   const db = {
-    $transaction: async (work) => work(db),
+    $transaction: async (work) => work({ ...(db), $transaction: undefined }),
     $executeRawUnsafe: async () => { lockTaken = true; return 1; },
     jobInstance: {
       findMany: async () => [],

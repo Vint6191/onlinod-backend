@@ -1,4 +1,7 @@
 "use strict";
+const { classifyCommitConflict } = require("./db-commit-kernel");
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const prisma = require("../prisma");
 
@@ -210,28 +213,12 @@ async function assertCampaignActivationPhysicalFences({ db }) {
   return { ok: true, triggerCount: CAMPAIGN_PHYSICAL_FENCE_TRIGGERS.length, migrationCount: 2 };
 }
 
-function errorCodeCandidates(error) {
-  return [
-    error?.code,
-    error?.meta?.code,
-    error?.cause?.code,
-    error?.cause?.meta?.code,
-  ].filter(Boolean).map((value) => String(value));
-}
-
 function retryableActivationError(error) {
-  const codes = new Set(errorCodeCandidates(error));
-  if (codes.has("40P01") || codes.has("40001") || codes.has("P2034")) return true;
-  return /deadlock detected|serialization failure|write conflict|transaction conflict/i.test(String(error?.message || ""));
+  return Boolean(classifyCommitConflict(error));
 }
 
-function sleep(ms) {
-  if (!(ms > 0)) return Promise.resolve();
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function activateCampaignCausalV1Once({ db, activatedBy }) {
-  return db.$transaction(async (tx) => {
+async function activateCampaignCausalV1Once({ db, activatedBy, maxAttempts, retryBaseMs }) {
+  return runDbTransaction(db, async (tx) => {
     if (typeof tx.$queryRawUnsafe !== "function") throw new Error("CAMPAIGN_CAUSAL_V1_DB_LOCK_UNAVAILABLE");
 
     // Lock order is intentionally JobInstance -> activation barrier, matching
@@ -378,7 +365,8 @@ async function activateCampaignCausalV1Once({ db, activatedBy }) {
       revoked,
       stamped,
     };
-  }, { maxWait: 10_000, timeout: 120_000 });
+  }, { maxWait: 10_000, timeout: 120_000, deadlineMs: 120_000, maxAttempts, retryBaseMs,
+    authority: { kind: "CONTROL", operation: "CAMPAIGN_GENERATION_ACTIVATION" } });
 }
 
 async function activateCampaignCausalV1({
@@ -387,19 +375,10 @@ async function activateCampaignCausalV1({
   maxAttempts = DEFAULT_ACTIVATION_ATTEMPTS,
   retryBaseMs = DEFAULT_ACTIVATION_RETRY_BASE_MS,
 } = {}) {
-  const attempts = Math.max(1, Math.min(8, Number(maxAttempts) || DEFAULT_ACTIVATION_ATTEMPTS));
-  let lastError = null;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    try {
-      return await activateCampaignCausalV1Once({ db, activatedBy });
-    } catch (error) {
-      lastError = error;
-      if (attempt >= attempts || !retryableActivationError(error)) throw error;
-      const delayMs = Math.min(2_000, Math.max(0, Number(retryBaseMs) || 0) * (2 ** (attempt - 1)));
-      await sleep(delayMs);
-    }
-  }
-  throw lastError || new Error("CAMPAIGN_CAUSAL_V1_ACTIVATION_FAILED");
+  return activateCampaignCausalV1Once({ db, activatedBy,
+    maxAttempts: Math.max(1, Math.min(5, Number(maxAttempts) || DEFAULT_ACTIVATION_ATTEMPTS)),
+    retryBaseMs: Math.max(1, Math.min(1000, Number(retryBaseMs) || 1)),
+  });
 }
 
 module.exports = {

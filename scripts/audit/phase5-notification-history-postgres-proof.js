@@ -1,4 +1,5 @@
 "use strict";
+const { runDbTransaction } = require("../../src/services/db-transaction-service");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -53,12 +54,14 @@ async function main() {
       });
     }
     const s = await seed(), other = await seed();
+    console.log("[I7 proof] tenant seeds committed");
     const at = new Date(Date.now() - 86400000), cutoff = new Date();
     const source = await db.trafficSource.create({ data: { agencyId: s.agency.id, creatorId: s.creator.id, accountId: s.creator.id, sourceType: "CAMPAIGN", externalId: "i5-source", name: "proof" } });
     const lastRevenueAt = new Date(Date.now() - 1000), convertedAt = new Date(at.getTime() - 86400000);
     const member = await db.trafficSourceMember.create({ data: { agencyId: s.agency.id, creatorId: s.creator.id, sourceId: source.id, fanId: "123", lastRevenueAt, convertedAt, needsValueRefresh: false } });
     await db.creatorSale.createMany({ data: Array.from({ length: 51 }, (_, i) => ({ id: `i5-sale-${String(i).padStart(4,"0")}`, agencyId: s.agency.id, creatorId: s.creator.id,
       fanOnlyFansUserIdAtEvent: "123", eventFingerprint: crypto.createHash("sha256").update(`i5-sale-${i}`).digest("hex"), amountCents: 100, messageId: "proof", purchasedAt: at, createdAt: at, sourceJobId: s.job.id })) });
+    console.log("[I7 proof] sale fixtures committed");
     await db.creatorTip.createMany({ data: [
       { id: "i5-tip-a", agencyId: s.agency.id, creatorId: s.creator.id, fanOnlyFansUserIdAtEvent: "123", eventFingerprint: crypto.createHash("sha256").update("tip-orphan").digest("hex"), amountCents: 100, tippedAt: at, createdAt: at },
       { id: "i5-tip-b", agencyId: s.agency.id, creatorId: s.creator.id, eventFingerprint: crypto.createHash("sha256").update("tip-no-identity").digest("hex"), amountCents: 100, tippedAt: at, createdAt: at },
@@ -137,7 +140,7 @@ async function main() {
     });
     await check("normal producer replay does not duplicate recovered paid ledger or aggregate", async () => {
       const rows = await db.creatorSubscriptionEvent.findMany({ where: { creatorId: s.creator.id } });
-      await db.$transaction(tx => consequences.projectFacts({ db: tx, job: { agencyId: s.agency.id, creatorId: s.creator.id, params: {} }, table: 2, rows, historical: true }));
+      await runDbTransaction(db, tx => consequences.projectFacts({ db: tx, job: { agencyId: s.agency.id, creatorId: s.creator.id, params: {} }, table: 2, rows, historical: true }));
       assert.equal(await db.creatorSubscriptionLedger.count({ where: { creatorId: s.creator.id } }), 1);
       assert.equal(await db.trafficDailyAggregate.count({ where: { sourceId: source.id } }), 0);
     });
@@ -151,7 +154,7 @@ async function main() {
       const traffic = require("../../src/services/traffic-service");
       const fact = { fanId: "no-source", eventType: "paid_subscribed", amountCents: 500, eventHash: "retention-old", occurredAt: new Date("2020-01-01") };
       const policy = { organicCutoff: new Date("2024-01-01"), aggregateCutoff: new Date("2023-01-01") };
-      await db.$transaction(async tx => {
+      await runDbTransaction(db, async tx => {
         const a = await traffic.projectCanonicalSubscriptionCompatibility({ db: tx, job: { agencyId: s.agency.id, creatorId: s.creator.id }, fact, historyPolicy: policy }); assert.equal(a.retentionExcluded, true);
         const b = await traffic.projectCanonicalSubscriptionCompatibility({ db: tx, job: { agencyId: s.agency.id, creatorId: s.creator.id }, fact: { ...fact, fanId: "123", eventHash: "retention-attributed" }, historyPolicy: policy }); assert.equal(b.ignored, false);
       });
@@ -218,7 +221,7 @@ async function main() {
     await check("I6 standalone full-mode root and durable caller share one receipt identity",async()=>{
       const fact={...baseFact,eventHash:"i6-shared"};
       const a=await receipt.projectCanonicalSubscriptionReceipt({db,job:jobScope,fact});
-      const b=await db.$transaction(tx=>receipt.projectCanonicalSubscriptionReceipt({db:tx,job:jobScope,fact}));
+      const b=await runDbTransaction(db, tx=>receipt.projectCanonicalSubscriptionReceipt({db:tx,job:jobScope,fact}));
       assert.equal(a.duplicate,false);assert.equal(b.duplicate,true);assert.equal(a.ledgerId,b.ledgerId);
       assert.equal(await db.creatorSubscriptionLedger.count({where:{eventHash:fact.eventHash}}),1);
     });
@@ -262,19 +265,50 @@ async function main() {
       assert.equal(after.totals.subscriptionRevenueCents,1200);assert.equal(after.sources.find(x=>x.id===source.id).costCents,321);
       assert.deepEqual(await db.trafficDailyAggregate.findUnique({where:{id:old.id}}),old);
     });
-    const hotCounts=[];
+    const hotCounts=[], hotSql=[];
     await check("I6 paid receipt SQL work is unchanged after twenty-thousand same-day receipts",async()=>{
       async function measure(eventHash) {
+        await new Promise(resolve => setImmediate(resolve));
         const start=queries.length;await receipt.projectCanonicalSubscriptionReceipt({db,job:jobScope,fact:{...baseFact,eventHash}});
-        const sql=queries.slice(start);assert.ok(!sql.some(q=>/TrafficDailyAggregate|SUM\(|COUNT\(/i.test(q)),sql.join("\n"));
+        await new Promise(resolve => setImmediate(resolve));
+        const sql=queries.slice(start);hotSql.push(sql);assert.ok(!sql.some(q=>/TrafficDailyAggregate|SUM\(|COUNT\(/i.test(q)),sql.join("\n"));
         hotCounts.push(sql.length);
       }
       await measure("i6-before-growth");
       await db.$executeRawUnsafe(`INSERT INTO "CreatorSubscriptionLedger" ("id","agencyId","creatorId","accountId","fanId","sourceId","eventHash","eventType","amountCents","occurredAt","createdAt","updatedAt")
         SELECT 'i6-bulk-'||g,$1,$2,$2,'123',$3,'i6-bulk-'||g,'paid_subscribed',100,$4::timestamp,clock_timestamp(),clock_timestamp() FROM generate_series(1,20000) g`,s.agency.id,s.creator.id,source.id,at);
-      await measure("i6-after-growth");assert.equal(hotCounts[0],hotCounts[1]);
+      await measure("i6-after-growth");
+      if (process.env.PHASE5_PROOF_OUTPUT) fs.writeFileSync(process.env.PHASE5_PROOF_OUTPUT+".statements.json",JSON.stringify(hotSql,null,2));
+      assert.equal(hotCounts[0],hotCounts[1]);
     });
-    const report = { ok: true, engine: "Prisma 5.22 / PGlite PostgreSQL WASM TCP", migrations: 260, cases: cases.length, results: cases, plans, receiptSqlStatementCounts: hotCounts,
+
+    await check("I7 independent repair generation rechecks old subscriptions and reconstructs the post-V1 tail", async () => {
+      const scope = await seed(); const before = new Date(Date.now()-86400000), after = new Date();
+      const fp = crypto.createHash("sha256").update("i7-old-invalid-refund").digest("hex");
+      await db.creatorSubscriptionEvent.create({ data: { agencyId: scope.agency.id, creatorId: scope.creator.id,
+        fanOnlyFansUserIdAtEvent: "123", eventFingerprint: fp, eventType: "REFUNDED", observedPriceCents: 500, occurredAt: before, createdAt: before } });
+      await db.creatorSubscriptionLedger.create({ data: { agencyId: scope.agency.id, creatorId: scope.creator.id,
+        accountId: scope.creator.id, fanId: "123", eventHash: fp, eventType: "subscription_refunded", source: "canonical_subscription_fact", amountCents: 500, occurredAt: before } });
+      await db.creatorSubscriptionEvent.create({ data: { agencyId: scope.agency.id, creatorId: scope.creator.id,
+        fanOnlyFansUserIdAtEvent: "123", eventFingerprint: crypto.createHash("sha256").update("i7-new-paid").digest("hex"),
+        eventType: "SUBSCRIBED_PAID", observedPriceCents: 700, occurredAt: after, createdAt: after } });
+      await db.maintenanceLaneState.update({ where: { key: history.RECEIPT_KEY }, data: { completedAt: null,
+        cursor: { afterId: "", upperId: scope.creator.id, cutoffAt: new Date(Date.now()+1000).toISOString(), tailFrom: new Date(before.getTime()+1000).toISOString() } } });
+      // V1 completion survives intact: no revision/cursor reset of old work.
+      const old = await db.domainWorkItem.findMany({ where: { workClass: history.WORK_CLASS } });
+      for (let i=0;i<10;i++) if ((await history.enumerateHistoryCreators({ db, receiptRepair: true })).complete) break;
+      assert.deepEqual(await db.domainWorkItem.findMany({ where: { workClass: history.WORK_CLASS } }), old);
+      for (let i=0;i<3;i++) {
+        const c = await work.claimDomainWorkBatch({ db, workClass: history.RECEIPT_WORK_CLASS, agencyId: scope.agency.id, limit: 1 });
+        assert.equal(c.items.length, 1); await history.processHistoryPage({ db, item: c.items[0], ownerToken: c.ownerToken });
+      }
+      const ledger = await db.creatorSubscriptionLedger.findMany({ where: { creatorId: scope.creator.id } });
+      assert.equal(ledger.length, 1); assert.equal(ledger[0].amountCents, 700);
+      const done = await db.domainWorkItem.findFirst({ where: { creatorId: scope.creator.id, workClass: history.RECEIPT_WORK_CLASS } });
+      assert.equal(done.state, "DONE"); assert.equal(done.lastRepair.generation, history.RECEIPT_KEY);
+      assert.equal(await db.creatorNotificationSyncState.count({ where: { creatorId: scope.creator.id } }), 0);
+    });
+    const report = { ok: true, engine: "Prisma 5.22 / PGlite PostgreSQL WASM TCP", migrations: fs.readdirSync(path.join(root,"prisma/migrations")).filter(n=>fs.existsSync(path.join(root,"prisma/migrations",n,"migration.sql"))).length, cases: cases.length, results: cases, plans, receiptSqlStatementCounts: hotCounts, receiptSqlStatements: hotSql,
       limits: ["Single physical SQL client, not native contention or multi-replica load", "60000 interleaved two-agency facts validate SELECT plans only; USER triggers disabled solely while loading this synthetic fixture, FK and CHECK constraints retained; not ingestion throughput", "Unused daily aggregate writer retired; Traffic read-side grouping and attribution repair scale remain open", "Recovered retained canonical facts only; deleted facts and missing identities cannot be reconstructed"] };
     if (process.env.PHASE5_PROOF_OUTPUT) fs.writeFileSync(process.env.PHASE5_PROOF_OUTPUT, JSON.stringify(report,null,2)+'\n');
     console.log(JSON.stringify({ ok: true, cases: cases.length, plans: plans.length }));

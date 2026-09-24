@@ -37,7 +37,7 @@ function makeDb() {
   const walletKey = (a,mode)=>`${a}|${mode===true}`;
   function copy(x){return x?{...x}:x;}
   const db = {
-    $transaction: async fn => fn(db),
+    $transaction: async fn => fn({ ...(db), $transaction: undefined }),
     $queryRawUnsafe: async ()=>[],
     agency: { findUnique: async ({where})=>copy(agencies.get(where.id)||null) },
     agencySubscription: { findFirst: async ({where})=>copy(subs.get(where.agencyId)||null) },

@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("../../services/db-transaction-service");
+
 
 const { scheduleSubscriberScan, getSubscriberDirectoryStatus } = require("../../services/subscriber-directory-service");
 const { readFanCurrent } = require("../../services/fan-data-authority-service");
@@ -131,7 +133,7 @@ function registerHiddenOnlineRoutes(router, deps) {
       const username = optionalString(req.body?.username || req.body?.fanUsername, 120);
       const name = optionalString(req.body?.name || req.body?.fanName || req.body?.displayName, 180);
   
-      const result = await prisma.$transaction(async (tx) => {
+      const result = await runDbTransaction(prisma, async (tx) => {
         const cancelable = await tx.automationDelivery.findMany({
           where: {
             agencyId: req.auth.agencyId,
@@ -340,7 +342,7 @@ function registerHiddenOnlineRoutes(router, deps) {
   
       if (!picked.length) return res.json({ ok: true, creatorId, count: 0, items: [], skipped, skippedCount: skipped.length, skippedCounts, candidateWindow: candidates.length, activeChecked: activeRows.length, code: "NO_ELIGIBLE_HIDDEN_ONLINE" });
   
-      const result = await prisma.$transaction(async (tx) => {
+      const result = await runDbTransaction(prisma, async (tx) => {
         const gate = await acquireOnlineGate(tx, { agencyId: req.auth.agencyId, creatorId, now, scope: "hidden" });
         let cursor = onlineGateNextAllowed(gate, now);
         const items = [];

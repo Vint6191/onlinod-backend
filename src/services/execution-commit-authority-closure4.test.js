@@ -133,6 +133,7 @@ test("Closure4 real FollowBack and Follow Automation planning paths survive a qu
   const fx = driverContractFake();
   const db = {
     ...fx.db,
+    $transaction: fn => fn({ ...db, $transaction: undefined }),
     subscriberDirectoryState: { findFirst: async () => ({ currentRunId: "snapshot-1" }) },
     subscriberScanItem: { findMany: async () => [] },
     fanConsumerCursor: { findUnique: async () => null, upsert: async () => ({}) },
@@ -176,8 +177,8 @@ test("Closure4 real FollowBack and Follow Automation planning paths survive a qu
     assert.equal(back.summary.created, 0);
     assert.equal(auto.summary.created, 0);
     assert.equal(fx.calls.query.length, 0);
-    assert.equal(fx.calls.execute.length, 2);
-    assert.deepEqual(fx.calls.execute.map((call) => call.args[0]), [
+    assert.equal(fx.calls.execute.filter(call => /pg_advisory_xact_lock/.test(call.sql)).length, 2);
+    assert.deepEqual(fx.calls.execute.filter(call => /pg_advisory_xact_lock/.test(call.sql)).map((call) => call.args[0]), [
       "follow_back_plan:agency-1:creator-1",
       "follow_automation_plan:agency-1:creator-1",
     ]);
@@ -228,7 +229,7 @@ test("Closure4 prepareWriteActionDelivery reaches COMMITTING through executeRaw 
         return { count: 1 };
       },
     },
-    async $transaction(work) { return work(db); },
+    async $transaction(work) { return work({ ...(db), $transaction: undefined }); },
   };
 
   const restores = [];
@@ -282,6 +283,7 @@ test("Closure4 prepareWriteActionDelivery reaches COMMITTING through executeRaw 
     assert.equal(delivery.status, "COMMITTING");
     assert.equal(delivery.writeCommitRevision, 1);
     assert.equal(fx.calls.query.length, 0);
+    fx.calls.execute = fx.calls.execute.filter(call => !call.sql.includes("set_config('lock_timeout'"));
     assert.equal(fx.calls.execute.length, 4);
     assert.equal(fx.calls.execute[0].sql, "SELECT pg_advisory_xact_lock_shared(hashtext($1))");
     assert.deepEqual(fx.calls.execute[0].args, ["agency-lifecycle:agency-1"]);

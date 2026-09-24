@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
 const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
@@ -46,7 +48,7 @@ async function setCreatorTelegramUserId({ agencyId, actorMember, creatorId, tele
     throw err;
   }
 
-  return client.$transaction(async (tx) => {
+  return runDbTransaction(client, async (tx) => {
     await lockAgencyPipelineLifecycle({ db: tx, agencyId: agency });
     await lockCreatorPipelineLifecycle({ db: tx, agencyId: agency, creatorId: id });
     await assertManagementCommitAuthority({

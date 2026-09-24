@@ -31,7 +31,7 @@ function loadService({ failSideEffects = 0, failSideEffectAt = null, failCreator
     async $transaction(work) {
       const snapshot = rows.map((row) => ({ ...row }));
       try {
-        const result = await work(prisma);
+        const result = await work({ ...(prisma), $transaction: undefined });
         authority.transactions += 1;
         if (typeof authority.afterCommit === "function") authority.afterCommit(authority.transactions);
         return result;

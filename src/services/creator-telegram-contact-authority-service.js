@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { audit } = require("./audit-service");
 const { lockActiveTelegramAccountReference } = require("./telegram-account-reference-authority-service");
@@ -10,7 +12,7 @@ function fail(code, message, status = 400) { return Object.assign(new Error(mess
 
 async function updateCreatorTelegramContact({ agencyId, actorMember, actorUserId = null, creatorId, telegramContact, telegramAccountId, db }) {
   if (typeof db?.$transaction !== "function") throw fail("CREATOR_TELEGRAM_ACCOUNT_TRANSACTION_REQUIRED", "Telegram account assignment requires transactional storage", 503);
-  return db.$transaction(async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     // Current Telegram planning identity is a durable provider reference. Its publication must
     // serialize with both parent/creator retirement and Telegram-account retirement. Keep one
     // global order for every path that needs all three rows: Agency -> Creator -> TelegramAccount.

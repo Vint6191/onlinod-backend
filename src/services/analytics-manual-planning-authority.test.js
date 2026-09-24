@@ -97,7 +97,10 @@ test("manual Financial planning is serialized by the collector advisory transact
     activeRequestedAt: new Date("2026-09-08T20:59:59.500Z"),
   };
   const tx = {
-    async $executeRawUnsafe(sql, key) { locks.push([sql, key]); return 1; },
+    async $executeRawUnsafe(sql, key) {
+      // Transaction-local budget setup is not a domain mutation/lock.
+      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)") return 1;
+ locks.push([sql, key]); return 1; },
     jobInstance: { async findMany() { return []; } },
     creatorFinancialCollectionState: { async findUnique() { return state; } },
   };

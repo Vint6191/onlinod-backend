@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -52,7 +54,7 @@ function closure2MigratedManualRow({ overwritten = false } = {}) {
 function repairFake(initialRow) {
   let row = { ...initialRow };
   const fake = {
-    async $transaction(work) { return work(fake); },
+    async $transaction(work) { return work({ ...(fake), $transaction: undefined }); },
     async $queryRawUnsafe(sql) {
       assert.match(String(sql), /FROM "TeamTipLedger"[\s\S]*FOR UPDATE SKIP LOCKED/);
       assert.doesNotMatch(String(sql), /FROM "MoneyAttribution"/);
@@ -111,7 +113,7 @@ test("Closure4 repaired MANUAL survives future automatic CreatorTip reconciliati
     },
   };
   const money = loadWithPrisma(moneyPath, {});
-  const result = await money.reconcileCreatorTipToTeam({ db, tipId: tip.id });
+  const result = await money.reconcileCreatorTipToTeam({ db: commitDatabaseFixture(db), tipId: tip.id });
   assert.equal(result.preservedManualResolution, true);
   assert.equal(row.attributedMemberId, "member-B");
   assert.match(row.resolvedSource, /^manual_/);

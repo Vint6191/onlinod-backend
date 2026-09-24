@@ -80,7 +80,7 @@ function mutableDb(rows, workerDevices = []) {
     _cryptoWrites: cryptoWrites,
     _userWrites: userWrites,
   };
-  db.$transaction = async (fn) => fn(db);
+  db.$transaction = async (fn) => fn({ ...(db), $transaction: undefined });
   return db;
 }
 

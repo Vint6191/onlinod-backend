@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { assertAllLiveAgenciesHaveOperationalOwner, findLiveAgenciesWithoutOperationalOwner } = require("./team-operational-owner-authority-service");
@@ -432,7 +434,7 @@ async function activateTeamControlPlaneAfterDrain(db) {
     throw Object.assign(new Error("Prisma transaction support is required for Team control-plane activation"), { code: "TEAM_CONTROL_PLANE_ACTIVATION_DB_REQUIRED" });
   }
 
-  return db.$transaction(async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     await lockDbAdvisoryXact({ db: tx, key: TEAM_CONTROL_PLANE_RELEASE_FENCE_KEY, mode: "exclusive" });
     const row = await readTeamControlPlaneReleaseAuthority(tx, { forUpdate: true });
     if (!row) throw teamControlPlaneUnavailable(null);
@@ -478,14 +480,10 @@ async function activateTeamControlPlaneAfterDrain(db) {
 
 async function runCreatorAccountWriteTransaction(db, work, options = undefined) {
   if (!db || typeof work !== "function") throw new Error("Creator release write transaction context is required");
-  if (typeof db.$transaction === "function") {
-    return db.$transaction(async (tx) => {
-      await authorizeCreatorAccountWrite(tx);
-      return work(tx);
-    }, options);
-  }
-  await authorizeCreatorAccountWrite(db);
-  return work(db);
+  return runDbTransaction(db, async (tx) => {
+    await authorizeCreatorAccountWrite(tx);
+    return work(tx);
+  }, options);
 }
 
 module.exports = {

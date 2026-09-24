@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -32,7 +34,7 @@ function fakeDurableDb(start = new Date("2038-02-03T04:05:06.000Z")) {
       legacyPermitLastSeenAt: null,
       legacyPermitCount: 0n,
     },
-    $transaction: async (work) => work(db),
+    $transaction: async (work) => work({ ...(db), $transaction: undefined }),
     $queryRawUnsafe: async (sql, ...args) => {
       const text = String(sql);
       if (/INSERT INTO "OfProviderRequestGateState"/.test(text)) return [];
@@ -110,7 +112,7 @@ function fakeDurableDb(start = new Date("2038-02-03T04:05:06.000Z")) {
 }
 
 async function queueWaiter(db, { waiterId, ownerInstanceId, agencyId, creatorId, deviceId, capability = "read", priority = "normal", category = "default", operation = "test", source = null }) {
-  await registerDurableProviderWaiter({ db, waiterId, ownerInstanceId, agencyId, creatorId, deviceId, capability, priority, category, operation, source, waiterTtlMs: 60_000 });
+  await registerDurableProviderWaiter({ db: commitDatabaseFixture(db), waiterId, ownerInstanceId, agencyId, creatorId, deviceId, capability, priority, category, operation, source, waiterTtlMs: 60_000 });
 }
 
 const scopeA = { agencyId: "agency-1", creatorId: "creator-a", deviceId: "device-a", capability: "read", intervalMs: 700 };
@@ -118,28 +120,28 @@ const scopeA = { agencyId: "agency-1", creatorId: "creator-a", deviceId: "device
 test("A12 durable singleton serializes permits across backend instances and accepts /started on another replica", async () => {
   const db = fakeDurableDb();
   await queueWaiter(db, { waiterId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
-  const first = await tryAcquireDurableProviderPermit({ db, waiterId: "permit-a", permitId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
+  const first = await tryAcquireDurableProviderPermit({ db: commitDatabaseFixture(db), waiterId: "permit-a", permitId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
   assert.equal(first.granted, true);
   await queueWaiter(db, { waiterId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b" });
   const blocked = await tryAcquireDurableProviderPermit({
-    db, waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
+    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
   });
   assert.equal(blocked.granted, false);
   assert.equal(blocked.reason, "active_permit");
 
-  const started = await acknowledgeDurableProviderStarted({ db, permitId: "permit-a", ...scopeA });
+  const started = await acknowledgeDurableProviderStarted({ db: commitDatabaseFixture(db), permitId: "permit-a", ...scopeA });
   assert.equal(started.startedAt.toISOString(), db.now.toISOString());
   assert.equal(db.state.activePermitId, null);
   assert.equal(db.state.nextAllowedAt.toISOString(), new Date(db.now.getTime() + 700).toISOString());
 
   const spacing = await tryAcquireDurableProviderPermit({
-    db, waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
+    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
   });
   assert.equal(spacing.granted, false);
   assert.equal(spacing.reason, "spacing");
   db.now = new Date(started.nextAllowedAt);
   const second = await tryAcquireDurableProviderPermit({
-    db, waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
+    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
   });
   assert.equal(second.granted, true);
   assert.equal(db.state.activeOwnerInstanceId, "backend-b");
@@ -148,12 +150,12 @@ test("A12 durable singleton serializes permits across backend instances and acce
 test("A12 expired unacknowledged permit is unknown outcome and burns another full 700ms before reuse", async () => {
   const db = fakeDurableDb();
   await queueWaiter(db, { waiterId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
-  const first = await tryAcquireDurableProviderPermit({ db, waiterId: "permit-a", permitId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
+  const first = await tryAcquireDurableProviderPermit({ db: commitDatabaseFixture(db), waiterId: "permit-a", permitId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
   assert.equal(first.granted, true);
   db.now = new Date(first.expiresAt.getTime() + 1);
   await queueWaiter(db, { waiterId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b" });
   const expired = await tryAcquireDurableProviderPermit({
-    db, waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
+    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
   });
   assert.equal(expired.granted, false);
   assert.equal(expired.reason, "expired_unknown_outcome");
@@ -164,15 +166,15 @@ test("A12 expired unacknowledged permit is unknown outcome and burns another ful
 test("A12 durable started/cancel are exact-scope CAS and cannot settle another device permit", async () => {
   const db = fakeDurableDb();
   await queueWaiter(db, { waiterId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
-  await tryAcquireDurableProviderPermit({ db, waiterId: "permit-a", permitId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
+  await tryAcquireDurableProviderPermit({ db: commitDatabaseFixture(db), waiterId: "permit-a", permitId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
   await assert.rejects(
-    () => acknowledgeDurableProviderStarted({ db, permitId: "permit-a", ...scopeA, deviceId: "device-other" }),
+    () => acknowledgeDurableProviderStarted({ db: commitDatabaseFixture(db), permitId: "permit-a", ...scopeA, deviceId: "device-other" }),
     (error) => error?.code === "OF_GATE_PERMIT_INVALID",
   );
-  const wrongCancel = await cancelDurableProviderPermit({ db, permitId: "permit-a", ...scopeA, creatorId: "creator-other" });
+  const wrongCancel = await cancelDurableProviderPermit({ db: commitDatabaseFixture(db), permitId: "permit-a", ...scopeA, creatorId: "creator-other" });
   assert.equal(wrongCancel.cancelled, false);
   assert.equal(db.state.activePermitId, "permit-a");
-  const cancelled = await cancelDurableProviderPermit({ db, permitId: "permit-a", ...scopeA });
+  const cancelled = await cancelDurableProviderPermit({ db: commitDatabaseFixture(db), permitId: "permit-a", ...scopeA });
   assert.equal(cancelled.cancelled, true);
   assert.equal(db.state.activePermitId, null);
 });

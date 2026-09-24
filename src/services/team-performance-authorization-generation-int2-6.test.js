@@ -46,7 +46,7 @@ function loadIngest({ startGeneration = GENERATION, assignedCreators = [] } = {}
       if (/clock_timestamp/i.test(text)) return [{ authorityNow: new Date("2026-09-15T02:30:00.000Z") }];
       return [];
     },
-    async $transaction(work) { return work(prisma); },
+    async $transaction(work) { return work({ ...(prisma), $transaction: undefined }); },
     creatorAccount: {
       async findFirst({ where }) {
         return where.agencyId === "agency-1" && where.id === "creator-1"
@@ -253,7 +253,7 @@ test("INT2.6 delayed terminal coverage END is truncate-only and cannot stretch t
     startReason: "dialog_activity", endReason: null,
   };
   const db = {
-    async $transaction(work) { return work(db); },
+    async $transaction(work) { return work({ ...(db), $transaction: undefined }); },
     async $executeRawUnsafe() { return 1; },
     teamCoverageSession: {
       async findUnique() { return { ...existing }; },
@@ -283,7 +283,7 @@ test("INT2.6 terminal coverage replay can only shorten an already earlier durabl
     endedAt: new Date("2026-09-15T03:03:00.000Z"), durationSeconds: 180,
   };
   const db = {
-    async $transaction(work) { return work(db); }, async $executeRawUnsafe() { return 1; },
+    async $transaction(work) { return work({ ...(db), $transaction: undefined }); }, async $executeRawUnsafe() { return 1; },
     teamCoverageSession: {
       async findUnique() { return { ...existing }; }, async create({ data }) { Object.assign(existing, data); return { ...existing }; },
       async update({ data }) { Object.assign(existing, data); return { ...existing }; },

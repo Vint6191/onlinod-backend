@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -25,7 +27,7 @@ function activationDb(start = new Date("2038-02-03T04:05:06.000Z")) {
       legacyPermitLastSeenAt: null, legacyPermitCount: 0n,
     },
     waiters: [],
-    $transaction: async (work) => work(db),
+    $transaction: async (work) => work({ ...(db), $transaction: undefined }),
     $queryRawUnsafe: async (sql, ...args) => {
       const text = String(sql);
       if (/INSERT INTO "OfProviderRequestGateState"/.test(text)) return [];
@@ -94,15 +96,15 @@ const legacyScope = {
 
 test("A14 rolling activation stays legacy-compatible in DRAINING, blocks A14 starts in QUIESCING, then enforces ACTIVE", async () => {
   const db = activationDb();
-  const draining = await credit.tryAcquireLegacyCompatibleProviderPermit({ db, ...legacyScope });
+  const draining = await credit.tryAcquireLegacyCompatibleProviderPermit({ db: commitDatabaseFixture(db), ...legacyScope });
   assert.equal(draining.granted, true);
   assert.equal(db.state.legacyPermitCount, 1n);
-  await credit.cancelDurableProviderPermit({ db, ...legacyScope });
+  await credit.cancelDurableProviderPermit({ db: commitDatabaseFixture(db), ...legacyScope });
 
   const drain = await credit.beginProviderGateFairnessDrain(db);
   assert.equal(drain.changed, true);
   assert.equal(db.state.fairnessActivationState, "QUIESCING");
-  const quiescing = await credit.tryAcquireLegacyCompatibleProviderPermit({ db, ...legacyScope, permitId: "legacy-permit-2" });
+  const quiescing = await credit.tryAcquireLegacyCompatibleProviderPermit({ db: commitDatabaseFixture(db), ...legacyScope, permitId: "legacy-permit-2" });
   assert.equal(quiescing.granted, false);
   assert.equal(quiescing.reason, "fairness_quiescing");
 
@@ -114,7 +116,7 @@ test("A14 rolling activation stays legacy-compatible in DRAINING, blocks A14 sta
   const activated = await credit.activateProviderGateFairnessAfterDrain(db);
   assert.equal(activated.activated, true);
   assert.equal(db.state.fairnessActivationState, "ACTIVE");
-  const active = await credit.tryAcquireLegacyCompatibleProviderPermit({ db, ...legacyScope, permitId: "legacy-permit-3" });
+  const active = await credit.tryAcquireLegacyCompatibleProviderPermit({ db: commitDatabaseFixture(db), ...legacyScope, permitId: "legacy-permit-3" });
   assert.equal(active.granted, false);
   assert.equal(active.reason, "fairness_active");
 });

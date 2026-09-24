@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
@@ -231,9 +233,7 @@ async function stopManualCampaignScan({ db = prisma, creatorId, now = new Date()
     }
     return { changed: true };
   };
-  const outcome = typeof db.$transaction === "function"
-    ? await db.$transaction(pause)
-    : await pause(db);
+  const outcome = await runDbTransaction(db, pause);
   if (!outcome.changed) {
     const current = await db.jobInstance.findUnique({ where: { id: active.id } });
     return { job: current, action: current?.status === "PAUSED" ? "already_paused" : "changed" };

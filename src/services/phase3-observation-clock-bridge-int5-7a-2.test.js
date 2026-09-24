@@ -172,6 +172,9 @@ test("INT5.7A-2 activation waits out small future skew while the barrier and leg
       throw new Error(`unexpected SQL: ${sql}`);
     },
     async $executeRawUnsafe(sql, arg) {
+      // Transaction-local budget setup is not a domain mutation/lock.
+      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)") return 1;
+
       assert.match(sql, /SELECT pg_sleep/);
       events.push(["sleep", arg]);
       assert.ok(arg >= 0.1);

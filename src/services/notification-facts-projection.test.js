@@ -1,71 +1,48 @@
 "use strict";
-
 const test = require("node:test");
 const assert = require("node:assert/strict");
-
 function inject(id, exports) {
   const resolved = require.resolve(id);
   require.cache[resolved] = { id: resolved, filename: resolved, loaded: true, exports };
 }
-
-function pagedModel(rows, calls) {
-  return {
-    async findMany(args) {
-      calls.push(args);
-      assert.deepEqual(args.where, { creatorId: "creator-1", sourceJobId: "job-1" });
-      let start = 0;
-      if (args.cursor?.id) start = rows.findIndex((row) => row.id === args.cursor.id) + Number(args.skip || 0);
-      return rows.slice(start, start + args.take);
-    },
-  };
-}
-
-function loadProjection({ sales = [], tips, subscriptions, ingestAssertion, ingestResult = {}, trafficError = false }) {
-  const calls = { subscriptions: [], saleQueries: [], tipQueries: [], subscriptionQueries: [], state: null, bump: [], trafficDirty: [], sync: [] };
+function loadProjection({ receivedRows = 0, badReceipt = false, intentError = false, ingestResult = {}, ingestAssertion } = {}) {
+  const calls = { facts: 0, receipts: [], intents: [], sync: [], state: null };
+  const noInlineHistory = { async findMany() { calls.facts++; throw new Error("completion must not iterate canonical history"); } };
   const db = {
-    creatorSale: pagedModel(sales, calls.saleQueries),
-    creatorTip: pagedModel(tips, calls.tipQueries),
-    creatorSubscriptionEvent: pagedModel(subscriptions, calls.subscriptionQueries),
-    teamObservationState: { upsert: async (args) => { calls.state = args; return args.update; } },
+    creatorSale: noInlineHistory, creatorTip: noInlineHistory, creatorSubscriptionEvent: noInlineHistory,
+    analyticsIngestBatch: {
+      async aggregate(args) {
+        calls.receipts.push(args);
+        assert.deepEqual(args.where, { agencyId: "agency-1", creatorId: "creator-1", sourceJobId: "job-1",
+          dataType: "NOTIFICATIONS", idempotencyKey: { contains: ":run:scan-run-projection-0001:page:" } });
+        return { _sum: { receivedRows }, _count: { _all: receivedRows ? Math.ceil(receivedRows / 500) : 0 } };
+      },
+      async findFirst(args) { assert.equal(args.where.sourceJobId, "job-1"); return badReceipt ? { id: "failed-page" } : null; },
+    },
+    teamObservationState: { async upsert(args) { calls.state = args; return args.update; } },
   };
   inject("../prisma", db);
   inject("./job-idempotency", { buildJobIdempotencyKey: () => "key" });
-  inject("./traffic-service", {
-    projectCanonicalSubscriptionCompatibility: async (args) => { calls.subscriptions.push(args); return { ignored: args.fact.eventType === "subscription_refunded" }; },
-    markTrafficFanValueDirty: async (args) => {
-      calls.trafficDirty.push(args);
-      if (trafficError) throw new Error("traffic compatibility failed");
-      return { ok: true, matched: 1 };
-    },
-  });
-  inject("./bump-service", {
-    processRuntimeEvents: async (args) => { calls.bump.push(args); return { planned: args.events.length, errors: [] }; },
-  });
-  inject("./notification-facts-service", {
-    ingestNotificationFacts: async (args) => {
-      ingestAssertion?.(args);
-      return {
-        batchId: "batch-1", status: "COMMITTED", inserted: 0, updated: 0,
-        unchanged: sales.length + tips.length + subscriptions.length, rejected: 0,
-        coverageComplete: true,
-        coverageByType: { tips: "complete", subscriptions: "complete" }, replayed: false,
-        ...ingestResult,
-      };
-    },
-  });
+  inject("./notification-facts-service", { async ingestNotificationFacts(args) {
+    ingestAssertion?.(args);
+    return { batchId: "batch-1", status: "COMMITTED", inserted: 0, updated: 0, unchanged: 0, rejected: 0,
+      coverageComplete: true, coverageByType: { tips: "complete", subscriptions: "complete" }, replayed: false, ...ingestResult };
+  } });
+  inject("./notification-consequence-service", { async publishNotificationConsequences(args) {
+    calls.intents.push(args); if (intentError) throw Object.assign(new Error("required intent failed"), { code: "TEST_INTENT_FAILURE" });
+    return { published: true };
+  } });
   inject("./notification-sync-state-service", {
     assertNotificationCollectionResult() { return true; },
-    async completeNotificationSync(args) {
-      calls.sync.push(args);
-      return { id: "sync-1", status: args.successful ? "COMPLETE" : "PARTIAL" };
-    },
+    async completeNotificationSync(args) { calls.sync.push(args); return { status: args.successful ? "COMPLETE" : "PARTIAL" }; },
     async recordNotificationSyncFailure() { return null; },
   });
   delete require.cache[require.resolve("./team-observation-service")];
-  const { applyCatchupJobResult } = require("./team-observation-service");
-  return { applyCatchupJobResult, calls, db };
+  return { ...require("./team-observation-service"), calls, db };
 }
-
+async function complete(fx, count) {
+  return fx.applyCatchupJobResult({ db: fx.db, job: scopedJob(), deviceId: "device-1", userId: "user-1", result: completionResult(count) });
+}
 function completionResult(totalAcceptedEvents) {
   const scanRunId = "scan-run-projection-0001";
   return {
@@ -90,7 +67,7 @@ function completionResult(totalAcceptedEvents) {
 function scopedJob() {
   const scanRunId = "scan-run-projection-0001";
   return {
-    id: "job-1", agencyId: "agency-1", creatorId: "creator-1",
+    id: "job-1", jobKey: "catchup_notifications_scan", agencyId: "agency-1", creatorId: "creator-1",
     params: {
       accountId: "account-1",
       from: "2026-08-05T00:00:00.000Z",
@@ -107,133 +84,49 @@ function scopedJob() {
   };
 }
 
-test("completion preserves the collector run key and projects current-job facts", async () => {
-  const at = new Date("2026-08-05T12:00:00.000Z");
-  const tips = [{
-    id: "tip-1", eventFingerprint: "f".repeat(64), externalNotificationId: "tip-notification",
-    externalTransactionId: null, messageId: "message-1", amountCents: 500, currency: "USD", tippedAt: at,
-    fan: { onlyFansUserId: "fan-1", username: "fan_one", displayName: "Fan One" },
-  }];
-  const subscriptions = [{
-    id: "subscription-1", eventFingerprint: "e".repeat(64), externalNotificationId: "subscription-notification",
-    externalTransactionId: "subscription-transaction", eventType: "RENEWED", observedPriceCents: 1000,
-    currency: "USD", occurredAt: at,
-    fan: { onlyFansUserId: "fan-2", username: "fan_two", displayName: "Fan Two" },
-  }];
+test("full completion preserves collector identity and publishes required durable work on the same client", async () => {
   const result = completionResult(2);
-  const { applyCatchupJobResult, calls, db } = loadProjection({
-    tips, subscriptions,
-    ingestAssertion: ({ result: supplied }) => {
-      assert.equal(supplied.batchKey, result.batchKey);
-      assert.equal(supplied.scanRunId, result.scanRunId);
-      assert.equal(supplied.schemaVersion, 4);
-    },
-  });
-
-  const applied = await applyCatchupJobResult({ db, job: scopedJob(), deviceId: "device-1", userId: "user-1", result });
-  assert.equal(applied.ok, true);
-  assert.equal(applied.summary.compatibilityCandidates, 2);
-  assert.equal(applied.summary.compatibilityProcessed, 2);
-  assert.equal(applied.summary.compatibilityTruncated, false);
-  assert.equal(calls.trafficDirty.length, 1, "canonical tip may dirty Traffic but must not write Team money again");
-  assert.equal(calls.subscriptions.length, 1);
-  assert.equal(calls.tipQueries[0].where.sourceJobId, "job-1");
-  assert.equal(calls.subscriptionQueries[0].where.sourceJobId, "job-1");
-  assert.equal(calls.state.update.currentScanStatus, "idle");
+  const fx = loadProjection({ receivedRows: 2, ingestAssertion: ({ result: supplied }) => {
+    assert.equal(supplied.batchKey, result.batchKey); assert.equal(supplied.scanRunId, result.scanRunId); assert.equal(supplied.schemaVersion, 4);
+  } });
+  const applied = await complete(fx, 2);
+  assert.equal(applied.ok, true); assert.equal(applied.verified, true);
+  assert.equal(applied.compatibilityComplete, false); assert.equal(applied.summary.compatibilityDeferred, true);
+  assert.equal(fx.calls.intents.length, 1); assert.equal(fx.calls.intents[0].db, fx.db);
+  assert.equal(fx.calls.intents[0].job.id, "job-1"); assert.equal(fx.calls.state.update.currentScanStatus, "idle");
 });
 
-test("typed canonical non-money projection paginates beyond 2000 facts without truncation", async () => {
-  const at = new Date("2026-08-05T12:00:00.000Z");
-  const tips = Array.from({ length: 2101 }, (_, index) => ({
-    id: `tip-${String(index).padStart(5, "0")}`,
-    eventFingerprint: `tip-fingerprint-${index}`,
-    externalNotificationId: `tip-notification-${index}`,
-    externalTransactionId: null,
-    messageId: null,
-    amountCents: 100,
-    currency: "USD",
-    tippedAt: at,
-    fan: { onlyFansUserId: `fan-${index}`, username: null, displayName: null },
-  }));
-  const { applyCatchupJobResult, calls, db } = loadProjection({ tips, subscriptions: [] });
-  const applied = await applyCatchupJobResult({
-    db, job: scopedJob(), deviceId: "device-1", userId: "user-1", result: completionResult(tips.length),
-  });
-  assert.equal(applied.ok, true);
-  assert.equal(applied.summary.compatibilityCandidates, 2101);
-  assert.equal(applied.summary.compatibilityProcessed, 2101);
-  assert.equal(applied.summary.compatibilityTruncated, false);
-  assert.equal(calls.trafficDirty.length, 2101);
-  assert.ok(calls.tipQueries.length >= 5);
+test("full completion beyond 2000 facts performs receipt aggregation without synchronous history traversal", async () => {
+  const fx = loadProjection({ receivedRows: 2101 });
+  const applied = await complete(fx, 2101);
+  assert.equal(applied.verified, true); assert.equal(fx.calls.facts, 0); assert.equal(fx.calls.receipts.length, 1);
+  assert.equal(applied.summary.pageProof.receivedRows, 2101); assert.equal(applied.summary.compatibilityProcessed, 0);
 });
 
-test("typed subscription projection keeps refund only in the relational ledger and never inflates old paid revenue", async () => {
-  const at = new Date("2026-08-05T12:00:00.000Z");
-  const subscriptions = [
-    {
-      id: "sub-paid", eventFingerprint: "paid-fingerprint", externalNotificationId: null,
-      externalTransactionId: "shared-transaction", eventType: "SUBSCRIBED_PAID", observedPriceCents: 1000,
-      currency: "USD", occurredAt: at,
-      fan: { onlyFansUserId: "fan-1", username: null, displayName: null },
-    },
-    {
-      id: "sub-refund", eventFingerprint: "refund-fingerprint", externalNotificationId: null,
-      externalTransactionId: "shared-transaction", eventType: "REFUNDED", observedPriceCents: 1000,
-      currency: "USD", occurredAt: new Date("2026-08-05T13:00:00.000Z"),
-      fan: { onlyFansUserId: "fan-1", username: null, displayName: null },
-    },
-  ];
-  const { applyCatchupJobResult, calls, db } = loadProjection({ tips: [], subscriptions });
-  const applied = await applyCatchupJobResult({
-    db, job: scopedJob(), deviceId: "device-1", userId: "user-1", result: completionResult(2),
-  });
-  assert.equal(applied.ok, true);
-  assert.equal(calls.subscriptions.length, 2);
-  assert.deepEqual(calls.subscriptions.map((call) => call.fact.eventType), ["paid_subscribed", "subscription_refunded"]);
-  assert.ok(calls.subscriptions.every(call => call.db === db && call.job.id === "job-1"));
-  assert.equal(applied.summary.subscriptionRefundIgnored, 1);
-  assert.equal(applied.summary.skipped, 1);
+test("a full scan cannot mark omitted canonical page receipts as successful", async () => {
+  const fx = loadProjection({ receivedRows: 1 });
+  const applied = await complete(fx, 2);
+  assert.equal(applied.verified, false); assert.equal(applied.summary.pageProof.reason, "backend_page_receipt_count_mismatch");
+  assert.equal(Object.hasOwn(fx.calls.state.update, "lastTipScanTo"), false, "unproved pages cannot advance a per-type legacy frontier either");
+  assert.equal(fx.calls.sync[0].successful, false); assert.equal(fx.calls.state.update.currentScanStatus, "error");
 });
 
-
-test("compatibility projection failure cannot invalidate a proven notification collection", async () => {
-  const tips = [{
-    id: "tip-compat", eventFingerprint: "c".repeat(64), externalNotificationId: "tip-compat-notification",
-    externalTransactionId: null, messageId: null, amountCents: 500, currency: "USD",
-    tippedAt: new Date("2026-08-05T12:00:00.000Z"),
-    fan: { onlyFansUserId: "fan-compat", username: null, displayName: null },
-  }];
-  const { applyCatchupJobResult, calls, db } = loadProjection({ tips, subscriptions: [], trafficError: true });
-  const applied = await applyCatchupJobResult({
-    db, job: scopedJob(), deviceId: "device-1", userId: "user-1", result: completionResult(1),
-  });
-
-  assert.equal(applied.ok, true);
-  assert.equal(applied.verified, true);
-  assert.equal(applied.compatibilityComplete, false);
-  assert.equal(applied.summary.errors, 1);
-  assert.equal(calls.sync.length, 1);
-  assert.equal(calls.sync[0].successful, true, "canonical proof must ignore compatibility-only failures");
-  assert.equal(calls.state.update.currentScanStatus, "error", "compatibility failure remains visible in Team activity");
+test("required intent failure propagates before collection freshness is published", async () => {
+  const fx = loadProjection({ intentError: true });
+  await assert.rejects(complete(fx, 0), { code: "TEST_INTENT_FAILURE" });
+  assert.equal(fx.calls.sync.length, 0); assert.equal(fx.calls.state, null);
 });
 
-test("source-exhausted rejected notification facts remain PARTIAL and enter job retry semantics", async () => {
-  const { applyCatchupJobResult, calls, db } = loadProjection({
-    tips: [], subscriptions: [],
-    ingestResult: {
-      status: "PARTIAL",
-      rejected: 1,
-      coverageComplete: false,
-      coverageByType: { tips: "partial", subscriptions: "complete" },
-    },
-  });
-  const applied = await applyCatchupJobResult({
-    db, job: scopedJob(), deviceId: "device-1", userId: "user-1", result: completionResult(0),
-  });
+test("source-exhausted rejected canonical facts remain PARTIAL and enter job retry semantics", async () => {
+  const fx = loadProjection({ ingestResult: { status: "PARTIAL", rejected: 1, coverageComplete: false, coverageByType: { tips: "partial", subscriptions: "complete" } } });
+  const applied = await complete(fx, 0);
+  assert.equal(applied.sourceTraversalComplete, true); assert.equal(applied.ok, false); assert.equal(applied.verified, false);
+  assert.equal(fx.calls.sync[0].successful, false);
+});
 
-  assert.equal(applied.sourceTraversalComplete, true);
-  assert.equal(applied.ok, false);
-  assert.equal(applied.verified, false);
-  assert.equal(calls.sync.length, 1);
-  assert.equal(calls.sync[0].successful, false);
+test("a rejected persisted page prevents success despite clean collector completion flags", async () => {
+  const fx = loadProjection({ receivedRows: 2, badReceipt: true });
+  const applied = await complete(fx, 2);
+  assert.equal(applied.verified, false); assert.equal(applied.summary.pageProof.reason, "backend_page_receipt_partial");
+  assert.equal(fx.calls.sync[0].successful, false);
 });

@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -107,6 +109,9 @@ function memoryDb() {
     creatorAccount: { async findFirst({ where }) { return where.id === creatorId && where.agencyId === "agency-1" ? { id: creatorId } : null; } },
     workerDevice: { async findFirst({ where }) { return where.id === "device-1" && where.agencyId === "agency-1" ? { id: "device-1" } : null; } },
     analyticsIngestBatch: model("batch", store.batches),
+    // PostgreSQL triggers own Team money intents. This adapter models their
+    // publication through DomainWork, never the retired synchronous reconciler.
+    domainWorkItem: { async upsert(args) { return { id: "work", ...args.create }; } },
     creatorFan: model("fan", store.fans),
     creatorSale: model("sale", store.sales),
     creatorTip: model("tip", store.tips),
@@ -117,7 +122,7 @@ function memoryDb() {
     creatorNotificationSyncState: {
       async findUnique() { return clone(store.notificationSync); },
     },
-    async $transaction(callback) { return callback(db); },
+    async $transaction(callback) { return callback({ ...(db), $transaction: undefined }); },
   };
   return db;
 }
@@ -224,7 +229,7 @@ test("weaker subscribed frames cannot erase an authoritative notification identi
     amountCents: 0,
     subscribedAt: "2026-08-05T20:00:00.000Z",
   }]);
-  await ingestNotificationFacts({ job: job({ id: "job-subscription-strong" }), deviceId: "device-1", result: first, db });
+  await ingestNotificationFacts({ job: job({ id: "job-subscription-strong" }), deviceId: "device-1", result: first, db: commitDatabaseFixture(db) });
 
   const secondRunId = "scan-run-test-0002";
   const second = completeResult([{
@@ -235,7 +240,7 @@ test("weaker subscribed frames cannot erase an authoritative notification identi
   }]);
   second.scanRunId = secondRunId;
   second.batchKey = `run:${secondRunId}:completion`;
-  await ingestNotificationFacts({ job: job({ id: "job-subscription-weak" }), deviceId: "device-1", result: second, db });
+  await ingestNotificationFacts({ job: job({ id: "job-subscription-weak" }), deviceId: "device-1", result: second, db: commitDatabaseFixture(db) });
 
   assert.equal(db.store.subscriptions.length, 1);
   assert.equal(db.store.subscriptions[0].externalNotificationId, "110375912038");
@@ -260,7 +265,7 @@ test("same-batch subscription variants keep the richest source identity", async 
       subscribedAt: "2026-08-05T20:00:55.000Z",
     },
   ]);
-  await ingestNotificationFacts({ job: job({ id: "job-subscription-batch" }), deviceId: "device-1", result, db });
+  await ingestNotificationFacts({ job: job({ id: "job-subscription-batch" }), deviceId: "device-1", result, db: commitDatabaseFixture(db) });
 
   assert.equal(db.store.subscriptions.length, 1);
   assert.equal(db.store.subscriptions[0].externalNotificationId, "110375912038");
@@ -286,7 +291,7 @@ test("different strong subscription ids in the same semantic minute fail closed"
       subscribedAt: "2026-08-05T20:00:30.000Z",
     },
   ]);
-  const response = await ingestNotificationFacts({ job: job({ id: "job-subscription-collision" }), deviceId: "device-1", result, db });
+  const response = await ingestNotificationFacts({ job: job({ id: "job-subscription-collision" }), deviceId: "device-1", result, db: commitDatabaseFixture(db) });
 
   assert.equal(db.store.subscriptions.length, 1);
   assert.equal(response.rejected, 1);
@@ -323,7 +328,7 @@ test("likes and comments normalize and ingest as relational post facts without c
     comments: { status: "complete", reason: "source_exhausted", pages: 1, events: 1, rejected: 0 },
   });
   result.coverage = { likes: result.coverage.likes, comments: result.coverage.comments };
-  const ingested = await ingestNotificationFacts({ job: scopedJob, deviceId: "device-1", result, db });
+  const ingested = await ingestNotificationFacts({ job: scopedJob, deviceId: "device-1", result, db: commitDatabaseFixture(db) });
   assert.equal(ingested.status, "COMMITTED");
   assert.equal(db.store.likes.length, 1);
   assert.equal(db.store.comments.length, 1);
@@ -366,7 +371,7 @@ test("transactional ingest creates relational facts, subtype coverage and idempo
     { eventType: "tip_received", notificationId: "tip-n", fanId: "fan-1", amountCents: 500, currency: "USD", occurredAt },
     { eventType: "free_subscribed", notificationId: "sub-n", fanId: "fan-2", amountCents: 0, currency: "USD", occurredAt },
   ]);
-  const first = await ingestNotificationFacts({ job: job(), deviceId: "device-1", result, db });
+  const first = await ingestNotificationFacts({ job: job(), deviceId: "device-1", result, db: commitDatabaseFixture(db) });
   assert.equal(first.status, "COMMITTED");
   assert.deepEqual(first.coverageByType, { purchases: "complete", tips: "complete", subscriptions: "complete" });
   assert.equal(first.inserted, 3);
@@ -377,7 +382,7 @@ test("transactional ingest creates relational facts, subtype coverage and idempo
   assert.equal(db.store.coverage.length, 0, "notification cursor/frontier collectors must not write temporal AnalyticsCoverage");
   assert.ok(db.store.coverage.every((row) => row.status === "COMPLETE"));
 
-  const replay = await ingestNotificationFacts({ job: job(), deviceId: "device-1", result, db });
+  const replay = await ingestNotificationFacts({ job: job(), deviceId: "device-1", result, db: commitDatabaseFixture(db) });
   assert.equal(replay.replayed, true);
   assert.equal(db.store.sales.length, 1);
 });
@@ -388,7 +393,7 @@ test("a rejected tip keeps only tip coverage partial", async () => {
     { eventType: "ppv_purchase_unresolved", notificationId: "sale", fanId: "fan", messageId: "m", amountCents: 100, occurredAt },
     { eventType: "tip_received", notificationId: "tip", fanId: "fan", amountCents: null, occurredAt },
   ]);
-  const applied = await ingestNotificationFacts({ job: job(), deviceId: null, result, db });
+  const applied = await ingestNotificationFacts({ job: job(), deviceId: null, result, db: commitDatabaseFixture(db) });
   assert.equal(applied.status, "PARTIAL");
   assert.deepEqual(applied.coverageByType, { purchases: "complete", tips: "partial", subscriptions: "complete" });
 });
@@ -396,13 +401,13 @@ test("a rejected tip keeps only tip coverage partial", async () => {
 test("ingest requires explicit strict range and rejects events outside it", async () => {
   const db = memoryDb();
   await assert.rejects(
-    ingestNotificationFacts({ job: job({ params: { types: ["tips"] } }), result: completeResult([]), db }),
+    ingestNotificationFacts({ job: job({ params: { types: ["tips"] } }), result: completeResult([]), db: commitDatabaseFixture(db) }),
     (error) => error.code === "NOTIFICATION_RANGE_REQUIRED",
   );
   const applied = await ingestNotificationFacts({
     job: job({ id: "job-outside", params: { from: "2026-08-05T00:00:00.000Z", to: "2026-08-05T01:00:00.000Z", types: ["tips"] } }),
     result: completeResult([{ eventType: "tip_received", notificationId: "late", fanId: "fan", amountCents: 100, occurredAt: "2026-08-06T20:00:00.000Z" }]),
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(applied.rejected, 1);
   assert.equal(applied.coverageByType.tips, "partial");
@@ -411,7 +416,7 @@ test("ingest requires explicit strict range and rejects events outside it", asyn
 test("oversized final batches are rejected rather than silently truncated", async () => {
   const events = Array.from({ length: 2001 }, (_, index) => ({ eventType: "tip_received", notificationId: `n-${index}`, fanId: "fan", amountCents: 100, occurredAt }));
   await assert.rejects(
-    ingestNotificationFacts({ job: job(), result: completeResult(events), db: memoryDb() }),
+    ingestNotificationFacts({ job: job(), result: completeResult(events), db: commitDatabaseFixture(memoryDb()) }),
     (error) => error.code === "NOTIFICATION_BATCH_TOO_LARGE",
   );
 });
@@ -422,7 +427,7 @@ test("page batches commit facts incrementally and completion only finalizes cove
   const page = await ingestNotificationFacts({
     job: scopedJob,
     deviceId: null,
-    db,
+    db: commitDatabaseFixture(db),
     result: {
       batchKey: `run:${scanRunId}:page:tips:abc`,
       notificationType: "tips",
@@ -442,7 +447,7 @@ test("page batches commit facts incrementally and completion only finalizes cove
   const completion = await ingestNotificationFacts({
     job: scopedJob,
     deviceId: null,
-    db,
+    db: commitDatabaseFixture(db),
     result: {
       batchKey: `run:${scanRunId}:completion`,
       finalizeCoverage: true,
@@ -472,7 +477,7 @@ test("a rejected incremental page prevents final coverage from becoming complete
   });
   const page = await ingestNotificationFacts({
     job: scopedJob,
-    db,
+    db: commitDatabaseFixture(db),
     result: {
       batchKey: `run:${scanRunId}:page:tips:rejected`,
       notificationType: "tips",
@@ -490,7 +495,7 @@ test("a rejected incremental page prevents final coverage from becoming complete
 
   const completion = await ingestNotificationFacts({
     job: scopedJob,
-    db,
+    db: commitDatabaseFixture(db),
     result: {
       batchKey: `run:${scanRunId}:completion`,
       finalizeCoverage: true,
@@ -520,7 +525,7 @@ test("idempotent completion replay reads persisted partial coverage instead of t
   });
   await ingestNotificationFacts({
     job: scopedJob,
-    db,
+    db: commitDatabaseFixture(db),
     result: {
       batchKey: `run:${scanRunId}:page:tips:rejected`,
       notificationType: "tips",
@@ -543,10 +548,10 @@ test("idempotent completion replay reads persisted partial coverage instead of t
     coverage: { tips: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 } },
     events: [],
   };
-  const first = await ingestNotificationFacts({ job: scopedJob, db, result: finalResult });
+  const first = await ingestNotificationFacts({ job: scopedJob, db: commitDatabaseFixture(db), result: finalResult });
   assert.equal(first.status, "PARTIAL");
 
-  const replay = await ingestNotificationFacts({ job: scopedJob, db, result: finalResult });
+  const replay = await ingestNotificationFacts({ job: scopedJob, db: commitDatabaseFixture(db), result: finalResult });
   assert.equal(replay.replayed, true);
   assert.equal(replay.status, "PARTIAL");
   assert.equal(replay.coverageComplete, false);
@@ -558,7 +563,7 @@ test("unsupported job types and future schema versions fail closed", async () =>
     ingestNotificationFacts({
       job: job({ id: "job-invalid-type", params: { from: "2026-08-05T00:00:00.000Z", to: "2026-08-05T23:59:59.999Z", types: ["shares"] } }),
       result: completeResult([]),
-      db: memoryDb(),
+      db: commitDatabaseFixture(memoryDb()),
     }),
     (error) => error.code === "NOTIFICATION_JOB_TYPE_UNSUPPORTED",
   );
@@ -566,7 +571,7 @@ test("unsupported job types and future schema versions fail closed", async () =>
     ingestNotificationFacts({
       job: job({ id: "job-future-schema" }),
       result: { ...completeResult([]), schemaVersion: 999 },
-      db: memoryDb(),
+      db: commitDatabaseFixture(memoryDb()),
     }),
     (error) => error.code === "NOTIFICATION_SCHEMA_VERSION_UNSUPPORTED",
   );
@@ -584,7 +589,7 @@ test("duplicate identities inside one page collapse deterministically and keep t
   });
   const applied = await ingestNotificationFacts({
     job: scopedJob,
-    db,
+    db: commitDatabaseFixture(db),
     result: {
       batchKey: `run:${scanRunId}:page:tips:correction`,
       notificationType: "tips",
@@ -619,7 +624,7 @@ test("incremental pages fail closed when declared type, batch key and facts disa
   await assert.rejects(
     ingestNotificationFacts({
       job: scopedJob,
-      db: memoryDb(),
+      db: commitDatabaseFixture(memoryDb()),
       result: {
         batchKey: `run:${scanRunId}:page:tips:wrong-content`,
         notificationType: "tips",
@@ -636,7 +641,7 @@ test("incremental pages fail closed when declared type, batch key and facts disa
   await assert.rejects(
     ingestNotificationFacts({
       job: scopedJob,
-      db: memoryDb(),
+      db: commitDatabaseFixture(memoryDb()),
       result: {
         batchKey: `run:${scanRunId}:page:purchases:wrong-key`,
         notificationType: "tips",
@@ -675,7 +680,7 @@ test("failed pages from an earlier scan run do not poison the current repair run
   });
   const final = await ingestNotificationFacts({
     job: scopedJob,
-    db,
+    db: commitDatabaseFixture(db),
     result: {
       batchKey: `run:${scanRunId}:completion`,
       finalizeCoverage: true,
@@ -700,7 +705,7 @@ test("overlong identities and batch metadata are rejected instead of truncated i
   await assert.rejects(
     ingestNotificationFacts({
       job: job({ id: "job-long-batch" }),
-      db: memoryDb(),
+      db: commitDatabaseFixture(memoryDb()),
       result: { ...completeResult([]), batchKey: "x".repeat(121) },
     }),
     (error) => error.code === "NOTIFICATION_BATCH_KEY_INVALID",
@@ -708,7 +713,7 @@ test("overlong identities and batch metadata are rejected instead of truncated i
   await assert.rejects(
     ingestNotificationFacts({
       job: job({ id: "job-long-collector" }),
-      db: memoryDb(),
+      db: commitDatabaseFixture(memoryDb()),
       result: { ...completeResult([]), collectorVersion: "v".repeat(81) },
     }),
     (error) => error.code === "NOTIFICATION_COLLECTOR_VERSION_INVALID",
@@ -720,7 +725,7 @@ test("schema v3 rejects legacy protocol and missing or mismatched scan-run ident
   await assert.rejects(
     ingestNotificationFacts({
       job: scopedJob,
-      db: memoryDb(),
+      db: commitDatabaseFixture(memoryDb()),
       result: {
         batchKey: "completion",
         finalizeCoverage: true,
@@ -736,7 +741,7 @@ test("schema v3 rejects legacy protocol and missing or mismatched scan-run ident
   await assert.rejects(
     ingestNotificationFacts({
       job: scopedJob,
-      db: memoryDb(),
+      db: commitDatabaseFixture(memoryDb()),
       result: {
         batchKey: "run:different-run-id:completion",
         scanRunId: "scan-run-identity-1",
@@ -755,14 +760,14 @@ test("schema v3 rejects legacy protocol and missing or mismatched scan-run ident
 test("schema 3 rejects schema 2 desktops and non-UTC coverage", async () => {
   await assert.rejects(
     ingestNotificationFacts({
-      job: job({ id: "job-schema-2" }), db: memoryDb(),
+      job: job({ id: "job-schema-2" }), db: commitDatabaseFixture(memoryDb()),
       result: { ...completeResult([]), schemaVersion: 2 },
     }),
     (error) => error.code === "NOTIFICATION_SCHEMA_VERSION_UNSUPPORTED",
   );
   await assert.rejects(
     ingestNotificationFacts({
-      job: job({ id: "job-non-utc" }), db: memoryDb(),
+      job: job({ id: "job-non-utc" }), db: commitDatabaseFixture(memoryDb()),
       result: { ...completeResult([]), sourceTimezone: "Europe/Kiev" },
     }),
     (error) => error.code === "NOTIFICATION_TIMEZONE_UNSUPPORTED",
@@ -786,7 +791,7 @@ test("subscription payment and refund sharing one transaction remain two lifecyc
     { eventType: "paid_subscribed", notificationId: "sub-paid", transactionId: "tx-shared", fanId: "fan", amountCents: 1000, occurredAt },
     { eventType: "subscription_refunded", notificationId: "sub-refund", transactionId: "tx-shared", fanId: "fan", amountCents: 1000, occurredAt: "2026-08-05T21:00:00.000Z" },
   ], { purchases: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 }, tips: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 }, subscriptions: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 } });
-  const applied = await ingestNotificationFacts({ job: job({ id: "job-sub-lifecycle" }), deviceId: "device-1", result, db });
+  const applied = await ingestNotificationFacts({ job: job({ id: "job-sub-lifecycle" }), deviceId: "device-1", result, db: commitDatabaseFixture(db) });
   assert.equal(applied.status, "COMMITTED");
   assert.equal(db.store.subscriptions.length, 2);
   assert.deepEqual(new Set(db.store.subscriptions.map((row) => row.eventType)), new Set(["SUBSCRIBED_PAID", "REFUNDED"]));
@@ -803,7 +808,7 @@ test("notification completion uses scanner evidence without writing temporal Ana
     ...completeResult([]),
     coverage: { tips: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 } },
   };
-  const applied = await ingestNotificationFacts({ job: scopedJob, result, db });
+  const applied = await ingestNotificationFacts({ job: scopedJob, result, db: commitDatabaseFixture(db) });
   assert.equal(applied.status, "COMMITTED");
   assert.equal(applied.coverageComplete, true);
   assert.deepEqual(applied.coverageByType, { tips: "complete" });
@@ -820,7 +825,7 @@ test("events outside the exact requested interval are rejected", async () => {
     ...completeResult([{ eventType: "tip_received", notificationId: "too-late", fanId: "fan", amountCents: 100, occurredAt: "2026-08-05T12:00:00.001Z" }]),
     coverage: { tips: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 } },
   };
-  const applied = await ingestNotificationFacts({ job: scopedJob, result, db });
+  const applied = await ingestNotificationFacts({ job: scopedJob, result, db: commitDatabaseFixture(db) });
   assert.equal(applied.status, "PARTIAL");
   assert.equal(applied.rejected, 1);
   assert.equal(db.store.tips.length, 0);
@@ -842,7 +847,7 @@ test("full-history source exhaustion completes without manufacturing notificatio
     tips: { status: "complete", reason: "source_exhausted", pages: 10, events: 0, rejected: 0 },
   });
   result.coverage = { tips: result.coverage.tips };
-  const applied = await ingestNotificationFacts({ job: fullJob, result, db });
+  const applied = await ingestNotificationFacts({ job: fullJob, result, db: commitDatabaseFixture(db) });
   assert.equal(applied.status, "COMMITTED");
   assert.equal(applied.coverageComplete, true);
   assert.equal(db.store.coverage.length, 0);
@@ -863,7 +868,7 @@ test("an empty full-history stream reaches EOF without inventing pre-retention c
     tips: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 },
   });
   result.coverage = { tips: result.coverage.tips };
-  const applied = await ingestNotificationFacts({ job: fullJob, result, db });
+  const applied = await ingestNotificationFacts({ job: fullJob, result, db: commitDatabaseFixture(db) });
   assert.equal(applied.status, "COMMITTED");
   assert.equal(applied.coverageComplete, true);
   assert.equal(db.store.coverage.length, 0);
@@ -882,7 +887,7 @@ test("production transaction acquires the advisory lock before canonical fan/fac
       finalizeCoverage: false,
       events: [{ eventType: "tip_received", notificationId: "lock-n-1", fanId: "lock-fan", amountCents: 500, occurredAt }],
     },
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(result.status, "COMMITTED");
   assert.match(sqlCalls[0], /pg_advisory_xact_lock/);
@@ -907,7 +912,7 @@ test("a batch committed after ensureBatch is re-read under the transaction lock 
       finalizeCoverage: false,
       events: [{ eventType: "tip_received", notificationId: "concurrent-n-1", fanId: "fan", amountCents: 500, occurredAt }],
     },
-    db,
+    db: commitDatabaseFixture(db),
   });
   assert.equal(result.replayed, true);
   assert.equal(result.inserted, 7);
@@ -928,7 +933,7 @@ test("schema 3 requires explicit events, collector, timezone and finalization fi
     const malformed = { ...base };
     delete malformed[field];
     await assert.rejects(
-      ingestNotificationFacts({ job: job(), result: malformed, db: memoryDb() }),
+      ingestNotificationFacts({ job: job(), result: malformed, db: commitDatabaseFixture(memoryDb()) }),
       (error) => error?.code === expectedCode,
       field,
     );
@@ -947,7 +952,7 @@ test("legacy resume cursor params are ignored by current notification proof sema
   });
   const result = completeResult([], { tips: { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 0 } });
   result.coverage = { tips: result.coverage.tips };
-  const applied = await ingestNotificationFacts({ job: repairJob, result, db });
+  const applied = await ingestNotificationFacts({ job: repairJob, result, db: commitDatabaseFixture(db) });
   assert.equal(applied.status, "COMMITTED");
   assert.equal(applied.coverageComplete, true);
   assert.equal(db.store.coverage.length, 0);
@@ -957,12 +962,12 @@ test("completion coverage metadata is typed and cannot claim complete with rejec
   const invalid = completeResult([]);
   invalid.coverage.tips = { status: "complete", reason: "source_exhausted", pages: 1, events: 0, rejected: 1 };
   await assert.rejects(
-    ingestNotificationFacts({ job: job(), result: invalid, db: memoryDb() }),
+    ingestNotificationFacts({ job: job(), result: invalid, db: commitDatabaseFixture(memoryDb()) }),
     (error) => error?.code === "NOTIFICATION_COVERAGE_METADATA_INVALID",
   );
   const unknownCollector = { ...completeResult([]), collectorVersion: "notifications-catchup-v999" };
   await assert.rejects(
-    ingestNotificationFacts({ job: job(), result: unknownCollector, db: memoryDb() }),
+    ingestNotificationFacts({ job: job(), result: unknownCollector, db: commitDatabaseFixture(memoryDb()) }),
     (error) => error?.code === "NOTIFICATION_COLLECTOR_VERSION_INVALID",
   );
 });
@@ -977,13 +982,13 @@ test("completion idempotency checksum includes cursor and typed coverage evidenc
     tips: { status: "partial", reason: "page_limit", pages: 1, events: 0, rejected: 0, cursorEnd: "cursor-a" },
   });
   first.coverage = { tips: first.coverage.tips };
-  const applied = await ingestNotificationFacts({ job: scopedJob, result: first, db });
+  const applied = await ingestNotificationFacts({ job: scopedJob, result: first, db: commitDatabaseFixture(db) });
   assert.equal(applied.status, "PARTIAL");
 
   const changed = structuredClone(first);
   changed.coverage.tips.cursorEnd = "cursor-b";
   await assert.rejects(
-    ingestNotificationFacts({ job: scopedJob, result: changed, db }),
+    ingestNotificationFacts({ job: scopedJob, result: changed, db: commitDatabaseFixture(db) }),
     (error) => error?.code === "ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT",
   );
 });
@@ -998,7 +1003,7 @@ test("desktop-rejected scanner rows are counted in the completion audit and cove
     tips: { status: "partial", reason: "invalid_rows", pages: 1, events: 0, rejected: 3 },
   });
   result.coverage = { tips: result.coverage.tips };
-  const applied = await ingestNotificationFacts({ job: scopedJob, result, db });
+  const applied = await ingestNotificationFacts({ job: scopedJob, result, db: commitDatabaseFixture(db) });
   assert.equal(applied.status, "PARTIAL");
   assert.equal(applied.rejected, 3);
   assert.equal(db.store.batches[0].receivedRows, 3);

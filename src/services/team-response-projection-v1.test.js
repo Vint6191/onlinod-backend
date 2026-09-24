@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -193,7 +195,7 @@ function makeDb({ ledgers = [], events = [], coverages = [] } = {}) {
       },
     },
   };
-  return { db, responseCases, dialogSessions, coverageRows };
+  return { db: commitDatabaseFixture(db), responseCases, dialogSessions, coverageRows };
 }
 
 function reply(overrides = {}) {
@@ -521,7 +523,7 @@ test("bounded response v1 to v2 repair preserves old case as INCOMPLETE_HISTORY 
     projectionRevision: 4n, projectionState: "NEEDS_REPAIR", repairReason: "LEGACY_V1_REPAIR_REQUIRED",
   });
 
-  const result = await service.backfillTeamResponseRangeBatch({ db: fx.db, agencyId: "agency-1", limit: 100 });
+  const result = await service.backfillTeamResponseRangeBatch({ db: commitDatabaseFixture(fx.db), agencyId: "agency-1", limit: 100 });
   assert.equal(result.selected, 1);
   assert.equal(result.repaired, 0);
   assert.equal(result.unresolved, 1);
@@ -547,7 +549,7 @@ test("bounded response range repair derives FULL v2 when exact reply and incomin
     projectionRevision: 2n, projectionState: "NEEDS_REPAIR", repairReason: "LEGACY_V1_REPAIR_REQUIRED",
   });
 
-  const result = await service.backfillTeamResponseRangeBatch({ db: fx.db, agencyId: "agency-1", limit: 100 });
+  const result = await service.backfillTeamResponseRangeBatch({ db: commitDatabaseFixture(fx.db), agencyId: "agency-1", limit: 100 });
   assert.equal(result.repaired, 1);
   assert.equal(result.unresolved, 0);
   assert.equal(fx.responseCases[0].projectionState, "FULL");

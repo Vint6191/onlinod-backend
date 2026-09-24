@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -63,7 +65,7 @@ test("INT5.6A-2 manual campaign pause CAS-revokes the owner and exact read lease
     },
     async $transaction(work) {
       order.push("tx-begin");
-      const value = await work(this);
+      const value = await work({ ...(this), $transaction: undefined });
       order.push("tx-end");
       return value;
     },
@@ -85,7 +87,7 @@ test("INT5.6A-2 manual campaign pause CAS-revokes the owner and exact read lease
     },
   };
 
-  const result = await stopManualCampaignScan({ db, creatorId: "creator-1", now: authorityNow });
+  const result = await stopManualCampaignScan({ db: commitDatabaseFixture(db), creatorId: "creator-1", now: authorityNow });
   assert.equal(result.action, "paused");
   assert.equal(pauseWhere.leaseRevision, 7, "pause must CAS the owner revision it observed");
   assert.deepEqual(cleanupWhere, {
@@ -100,5 +102,5 @@ test("INT5.6A-2 manual campaign pause CAS-revokes the owner and exact read lease
 test("INT5.6A-2 source keeps campaign pause owner-loss cleanup inside the same transaction", () => {
   const control = source("src/services/campaign-scan-control-service.js");
   assert.match(control, /const pause = async \(tx\) => \{[\s\S]*jobInstance\.updateMany[\s\S]*leaseRevision: active\.leaseRevision[\s\S]*fanObservationReadLease\?\.deleteMany[\s\S]*jobId: active\.id[\s\S]*deviceId: active\.claimedByDeviceId[\s\S]*leaseRevision: active\.leaseRevision/);
-  assert.match(control, /db\.\$transaction\(pause\)/);
+  assert.match(control, /runDbTransaction\(db, pause\)/);
 });

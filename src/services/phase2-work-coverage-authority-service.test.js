@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const prismaPath = require.resolve("../prisma");
@@ -27,29 +29,29 @@ function makeDb() {
       workRows.set(k,next); return {...next};
     },
   };
-  const db={ phase2WorkCoverage:model, domainWorkItem, async $transaction(work){ return work(db); } };
-  return {db,rows,workRows};
+  const db={ phase2WorkCoverage:model, domainWorkItem, async $transaction(work){ return work({ ...(db), $transaction: undefined }); } };
+  return {db: commitDatabaseFixture(db),rows,workRows};
 }
 test("A11: Phase2 coverage readiness is isolated per agency", async () => {
   const fx=makeDb(); const family=cov.FAMILY.PROVIDER_OPERATIONAL, generation=cov.GENERATION.PROVIDER_OPERATIONAL;
-  await cov.markPhase2CoverageFailed({db:fx.db,agencyId:"agency-a",family,generation,unresolvedCount:3});
-  await cov.markPhase2CoverageComplete({db:fx.db,agencyId:"agency-b",family,generation,enumeratedThrough:"z",projectedThrough:"z"});
-  assert.equal((await cov.phase2CoverageStatus({db:fx.db,agencyId:"agency-a",family,generation})).ready,false);
-  assert.equal((await cov.phase2CoverageStatus({db:fx.db,agencyId:"agency-b",family,generation})).ready,true);
-  await assert.rejects(() => cov.requirePhase2CoverageReady({db:fx.db,agencyId:"agency-a",family,generation}), /not complete/);
-  assert.ok(await cov.requirePhase2CoverageReady({db:fx.db,agencyId:"agency-b",family,generation}));
+  await cov.markPhase2CoverageFailed({db:commitDatabaseFixture(fx.db),agencyId:"agency-a",family,generation,unresolvedCount:3});
+  await cov.markPhase2CoverageComplete({db:commitDatabaseFixture(fx.db),agencyId:"agency-b",family,generation,enumeratedThrough:"z",projectedThrough:"z"});
+  assert.equal((await cov.phase2CoverageStatus({db:commitDatabaseFixture(fx.db),agencyId:"agency-a",family,generation})).ready,false);
+  assert.equal((await cov.phase2CoverageStatus({db:commitDatabaseFixture(fx.db),agencyId:"agency-b",family,generation})).ready,true);
+  await assert.rejects(() => cov.requirePhase2CoverageReady({db:commitDatabaseFixture(fx.db),agencyId:"agency-a",family,generation}), /not complete/);
+  assert.ok(await cov.requirePhase2CoverageReady({db:commitDatabaseFixture(fx.db),agencyId:"agency-b",family,generation}));
 });
 
 
 test("manual coverage request is idempotent while historical work is already in flight", async () => {
   const fx=makeDb(); const family=cov.FAMILY.TEAM_MONEY_RECONCILIATION, generation=cov.GENERATION.TEAM_MONEY_RECONCILIATION;
-  const first=await cov.requestPhase2CoverageEnumeration({db:fx.db,agencyId:"agency-a",family,generation,now:new Date("2026-09-10T00:00:00Z")});
+  const first=await cov.requestPhase2CoverageEnumeration({db:commitDatabaseFixture(fx.db),agencyId:"agency-a",family,generation,now:new Date("2026-09-10T00:00:00Z")});
   assert.equal(first.requested,true);
   assert.equal(fx.workRows.size,1);
   const work=[...fx.workRows.values()][0];
   assert.equal(work.workClass,"HISTORICAL_ENUMERATION");
   assert.equal(work.requestedRevision,1n);
-  const second=await cov.requestPhase2CoverageEnumeration({db:fx.db,agencyId:"agency-a",family,generation,now:new Date("2026-09-10T00:00:01Z")});
+  const second=await cov.requestPhase2CoverageEnumeration({db:commitDatabaseFixture(fx.db),agencyId:"agency-a",family,generation,now:new Date("2026-09-10T00:00:01Z")});
   assert.equal(second.requested,false);
   assert.equal(second.inFlight,true);
   assert.equal([...fx.workRows.values()][0].requestedRevision,1n,"repeated admin sweep must not inflate revision while the same historical request is live");
@@ -57,8 +59,8 @@ test("manual coverage request is idempotent while historical work is already in 
 
 test("complete coverage is not republished by manual maintenance request", async () => {
   const fx=makeDb(); const family=cov.FAMILY.TEAM_MONEY_RECONCILIATION, generation=cov.GENERATION.TEAM_MONEY_RECONCILIATION;
-  await cov.markPhase2CoverageComplete({db:fx.db,agencyId:"agency-a",family,generation,enumeratedThrough:"done",projectedThrough:"done"});
-  const result=await cov.requestPhase2CoverageEnumeration({db:fx.db,agencyId:"agency-a",family,generation});
+  await cov.markPhase2CoverageComplete({db:commitDatabaseFixture(fx.db),agencyId:"agency-a",family,generation,enumeratedThrough:"done",projectedThrough:"done"});
+  const result=await cov.requestPhase2CoverageEnumeration({db:commitDatabaseFixture(fx.db),agencyId:"agency-a",family,generation});
   assert.equal(result.alreadyComplete,true);
   assert.equal(result.requested,false);
   assert.equal(fx.workRows.size,0);
@@ -79,16 +81,16 @@ test("INT6 current coverage guard rejects historical COMPLETE while live DomainW
     domainWorkItem: { async findFirst() { return live ? { id: "live-custom-external" } : null; } },
   };
 
-  let status = await cov.phase2CoverageStatus({ db, agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation });
+  let status = await cov.phase2CoverageStatus({ db: commitDatabaseFixture(db), agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation });
   assert.equal(status.ready, true, "historical compatibility bit remains COMPLETE");
   assert.equal(status.currentReady, false, "live outstanding work must keep current authority stale");
   await assert.rejects(
-    () => cov.requirePhase2CoverageReady({ db, agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation }),
+    () => cov.requirePhase2CoverageReady({ db: commitDatabaseFixture(db), agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation }),
     (error) => error?.code === "PHASE2_COVERAGE_INCOMPLETE",
   );
 
   live = false;
-  status = await cov.phase2CoverageStatus({ db, agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation });
+  status = await cov.phase2CoverageStatus({ db: commitDatabaseFixture(db), agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation });
   assert.equal(status.currentReady, true);
-  assert.ok(await cov.requirePhase2CoverageReady({ db, agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation }));
+  assert.ok(await cov.requirePhase2CoverageReady({ db: commitDatabaseFixture(db), agencyId: "agency-a", family: cov.FAMILY.CUSTOM_EXTERNAL_PROJECTION, generation }));
 });

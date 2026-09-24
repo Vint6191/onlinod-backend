@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -21,7 +23,7 @@ function dbFixture() {
     result: { programmaticWriteKind: "CUSTOM_RELAY_SEND", mediaId: "990701" },
   };
   const db = {
-    $transaction: async (work) => work(db),
+    $transaction: async (work) => work({ ...(db), $transaction: undefined }),
     customContentSubmission: {
       findMany: async ({ cursor } = {}) => cursor ? [] : [submission],
       findFirst: async ({ where }) => where.id === submission.id && where.agencyId === submission.agencyId ? submission : null,
@@ -39,12 +41,12 @@ function dbFixture() {
       },
     },
   };
-  return { db, submission, proof };
+  return { db: commitDatabaseFixture(db), submission, proof };
 }
 
 test("historical projector converges a retired/terminal submission without creator runtime or work resurrection", async () => {
   const { db, submission } = dbFixture();
-  const result = await convergeHistoricalCustomExternalProofs({ db, limit: 10 });
+  const result = await convergeHistoricalCustomExternalProofs({ db: commitDatabaseFixture(db), limit: 10 });
   assert.equal(result.ok, true);
   assert.equal(result.repaired, 1);
   assert.equal(result.projectedMedia, 1);
@@ -97,7 +99,7 @@ test("current external projection repairs one exact AutomationDelivery and clear
     return originalFindFirst(args);
   };
   db.customOrder = { findFirst: async () => null };
-  const result = await repairCustomExternalProjectionWorkItem({ db, agencyId: submission.agencyId, deliveryId: proof.id });
+  const result = await repairCustomExternalProjectionWorkItem({ db: commitDatabaseFixture(db), agencyId: submission.agencyId, deliveryId: proof.id });
   assert.equal(result.ok, true);
   assert.equal(result.obsolete, false);
   assert.equal(result.repaired, 1);

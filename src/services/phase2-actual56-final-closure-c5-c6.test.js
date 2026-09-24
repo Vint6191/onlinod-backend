@@ -31,7 +31,7 @@ test("C5 metadata and avatar mutations own Agency -> Creator -> actor commit fen
   const patch = creators.slice(creators.indexOf('router.patch("/:id",'), creators.indexOf('router.delete("/:id"'));
   const avatar = creators.slice(creators.indexOf('router.post("/:id/avatar"'), creators.indexOf('module.exports = router'));
   for (const source of [patch, avatar]) {
-    assert.match(source, /prisma\.\$transaction/);
+    assert.match(source, /runDbTransaction\(prisma,/);
     assert.match(source, /lockHumanCreatorMutation/);
   }
   const agency = human.indexOf("await lockAgencyLifecycle");

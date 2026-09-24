@@ -188,7 +188,7 @@ test("M1 legacy accessEpoch helpers cannot write AgencyMember outside the Team g
     async $transaction(work) {
       calls.push("transaction");
       const tx = {
-        async $executeRawUnsafe(sql) { calls.push(/pg_advisory_xact_lock_shared/.test(sql) ? "release-lock" : "execute"); return 1; },
+        async $executeRawUnsafe(sql) { if (sql.includes("set_config('lock_timeout'")) return 1; calls.push(/pg_advisory_xact_lock_shared/.test(sql) ? "release-lock" : "execute"); return 1; },
         async $queryRawUnsafe(sql) {
           if (/set_config/.test(sql)) { calls.push("generation-token"); return [{ value: release.TEAM_CONTROL_PLANE_GENERATION }]; }
           calls.push("release-row");
@@ -199,7 +199,7 @@ test("M1 legacy accessEpoch helpers cannot write AgencyMember outside the Team g
           async updateMany() { calls.push("agency-update"); return { count: 3 }; },
         },
       };
-      return work(tx);
+      return work({ ...(tx), $transaction: undefined });
     },
   };
   assert.equal(await bumpMemberAccessEpoch({ db, memberId: "member-1" }), 9);
@@ -248,7 +248,7 @@ test("M1 idempotent ACTIVE activation still fails closed when the physical DB fe
           }];
         },
       };
-      return work(tx);
+      return work({ ...(tx), $transaction: undefined });
     },
   };
   await assert.rejects(
@@ -299,7 +299,7 @@ test("M1 activation no longer trusts operator drain confirmation and takes the e
           return [{ scope: release.TEAM_CONTROL_PLANE_SCOPE, requiredGeneration: release.TEAM_CONTROL_PLANE_GENERATION, activationState: "DRAINING" }];
         },
       };
-      const result = await work(tx);
+      const result = await work({ ...(tx), $transaction: undefined });
       return { result, calls };
     },
   };
@@ -307,7 +307,7 @@ test("M1 activation no longer trusts operator drain confirmation and takes the e
   const wrapped = await release.activateTeamControlPlaneAfterDrain(db);
   assert.equal(transactions, 1);
   assert.equal(wrapped.result.activated, true);
-  const first = wrapped.calls[0];
+  const first = wrapped.calls.find(call => /pg_advisory_xact_lock\(hashtext/.test(call.sql));
   assert.equal(first.kind, "execute");
   assert.match(first.sql, /pg_advisory_xact_lock\(hashtext\(\$1\)\)/);
   assert.deepEqual(first.args, [release.TEAM_CONTROL_PLANE_RELEASE_FENCE_KEY]);
@@ -471,7 +471,7 @@ test("M1 activation preflight refuses ACTIVE when old-binary drain left a live A
           }];
         },
       };
-      return work(tx);
+      return work({ ...(tx), $transaction: undefined });
     },
   };
 

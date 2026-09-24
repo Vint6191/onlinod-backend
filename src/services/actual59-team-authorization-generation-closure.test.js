@@ -135,7 +135,7 @@ function loadService({
       if (/clock_timestamp/i.test(text)) return [{ authorityNow: new Date("2026-09-15T02:30:00.000Z") }];
       return [];
     },
-    async $transaction(work) { return work(prisma); },
+    async $transaction(work) { return work({ ...(prisma), $transaction: undefined }); },
     creatorAccount: {
       async findFirst({ where }) {
         if (where.agencyId !== "agency-1" || where.id !== "creator-1") return null;

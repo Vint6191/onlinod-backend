@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("../services/db-transaction-service");
+
 
 const express = require("express");
 const prisma = require("../prisma");
@@ -63,7 +65,7 @@ router.post("/observations", async (req, res) => {
       return res.status(400).json({ ok: false, code: "FAN_DATA_OBSERVATION_ACTION_SCOPE_REQUIRED", error: "Action-scoped profile observation requires delivery lease proof" });
     }
     const fanIds = [...new Set(items.map((item) => onlyFansUserId(item?.onlyFansUserId)).filter(Boolean))];
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await runDbTransaction(prisma, async (tx) => {
       const receivedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
       const scope = await authorizeActionProfileObservation({
         db: tx,

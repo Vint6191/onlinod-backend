@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
@@ -269,13 +271,7 @@ function comparable(row) {
 }
 
 async function runInTransaction(db, callback) {
-  // Job progress is already applied inside prisma.$transaction() and therefore
-  // passes Prisma's TransactionClient here. TransactionClient intentionally
-  // does not expose $transaction, so never try to nest one. Keep standalone
-  // callers atomic by opening a transaction only when the root Prisma client
-  // is supplied.
-  if (db && typeof db.$transaction === "function") return db.$transaction(callback);
-  return callback(db);
+  return runDbTransaction(db, callback);
 }
 
 async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, chunk }) {
@@ -365,7 +361,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
         storedOnly += 1;
       }
     }
-    return { superseded: false };
+    return { superseded: false, authorityNow: now };
   });
 
   if (transactionOutcome?.superseded) {
@@ -381,7 +377,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
     for (const day of uniqueDays) {
       const date = new Date(`${day}T00:00:00.000Z`);
       try {
-        await rebuildCreatorDailyMetrics({ db, agencyId: job.agencyId, creatorId: job.creatorId, from: date, to: date, now });
+        await rebuildCreatorDailyMetrics({ db, agencyId: job.agencyId, creatorId: job.creatorId, from: date, to: date, now: transactionOutcome.authorityNow });
       } catch (error) {
         console.warn("[creator-analytics] daily metrics projection failed after payout transaction ingest:", error?.message || error);
       }

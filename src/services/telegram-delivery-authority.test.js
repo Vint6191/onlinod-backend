@@ -1,3 +1,4 @@
+const { AsyncResource } = require("node:async_hooks");
 "use strict";
 
 const test = require("node:test");
@@ -190,7 +191,7 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
       },
     },
     auditLog: { async create({ data }) { const row={ id: `audit-${audits.length+1}`, ...clone(data) }; audits.push(row); return clone(row); } },
-    async $transaction(fn) { return fn(this); },
+    async $transaction(fn) { return fn({ ...(this), $transaction: undefined }); },
   };
   const billing = {};
   db._billing = billing; db._billingNow = now;
@@ -630,14 +631,15 @@ test("Telegram order context scans beyond 200 references for exact history autho
 });
 
 test("TASK commit permit atomically fences a business edit that passed pre-check while the task was only CLAIMED", async () => {
+  const otherRequest = new AsyncResource("fixture-competing-request");
   let planned; let claimed; let beginOnce = false; let fx;
   fx = dbFixture({
     beforeCustomOrderUpdateMany: async ({ data }) => {
       if (beginOnce || data.scenario === undefined) return;
       beginOnce = true;
-      const begun = await beginTelegramDeliveryIntent({
+      const begun = await otherRequest.runInAsyncScope(() => beginTelegramDeliveryIntent({
         agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: claimed.claimToken, now: new Date(fx.now.getTime() + 1_000), db: fx.db,
-      });
+      }));
       assert.equal(begun.begun, true);
       assert.equal(fx.intents[0].state, "COMMITTING");
     },
@@ -1043,6 +1045,7 @@ test("inbound observed before provider receipt is re-correlated after late CONFI
 
 
 test("two distinct claimed reminders racing begin cannot both cross the provider commit boundary", async () => {
+  const otherRequest = new AsyncResource("fixture-competing-request");
   let fx; let first; let second; let firstClaim; let secondClaim; let injected = false;
   fx = dbFixture({
     beforeCustomOrderUpdateMany: async ({ data }) => {
@@ -1050,9 +1053,9 @@ test("two distinct claimed reminders racing begin cannot both cross the provider
       const firstRow = fx.intents.find((row) => row.id === first?.intent?.id);
       if (!firstRow || firstRow.state !== "CLAIMED") return;
       injected = true;
-      const secondBegin = await beginTelegramDeliveryIntent({
+      const secondBegin = await otherRequest.runInAsyncScope(() => beginTelegramDeliveryIntent({
         agencyId: "agency-1", member: fx.member, intentId: second.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: secondClaim.claimToken, now: new Date(fx.now.getTime() + 2_000), db: fx.db,
-      });
+      }));
       assert.equal(secondBegin.begun, true);
     },
   });

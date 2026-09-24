@@ -1,4 +1,6 @@
 "use strict";
+const { runDbTransaction } = require("./db-transaction-service");
+
 
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 
@@ -153,7 +155,7 @@ async function activateAuthorizationHistoryPurgeAfterDrain(db) {
   if (!db || typeof db.$transaction !== "function") {
     throw Object.assign(new Error("Prisma transaction support is required for authorization-history activation"), { code: "AUTH_HISTORY_PURGE_ACTIVATION_DB_REQUIRED" });
   }
-  return db.$transaction(async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     await lockDbAdvisoryXact({ db: tx, key: AUTH_HISTORY_RELEASE_FENCE_KEY, mode: "exclusive" });
     const row = await readAuthorizationHistoryReleaseAuthority(tx, { forUpdate: true });
     if (!row || row.requiredGeneration !== AUTH_HISTORY_PUBLISHER_GENERATION) throw releaseUnavailable(row);

@@ -1,4 +1,6 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
+
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -114,7 +116,7 @@ test("INT5.4C-1B SFS discovery orders canonical facts by post-read server token,
   try {
   // Newer-created J2 reads first.
   await loaded.service.applySfsDiscoveryChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job: currentJob({ id: "job-j2", createdAt: "2026-09-17T00:00:20.000Z" }),
     deviceId: "device-1",
     chunkResult: chunk({ token: "token-j2", username: "read-first" }),
@@ -123,7 +125,7 @@ test("INT5.4C-1B SFS discovery orders canonical facts by post-read server token,
   });
   // Older-created J1 physically reads later and must win.
   await loaded.service.applySfsDiscoveryChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job: currentJob({ id: "job-j1", createdAt: "2026-09-17T00:00:10.000Z" }),
     deviceId: "device-1",
     chunkResult: chunk({ token: "token-j1", username: "read-later" }),
@@ -150,7 +152,7 @@ test("INT5.4C-1B current SFS discovery fails closed when the observation token i
   delete payload.observationToken;
   try {
   await assert.rejects(() => loaded.service.applySfsDiscoveryChunk({
-    db,
+    db: commitDatabaseFixture(db),
     job: currentJob({ id: "job-current", createdAt: "2026-09-17T00:00:00.000Z" }),
     deviceId: "device-1",
     chunkResult: payload,

@@ -83,8 +83,7 @@ test("financial catch-up re-observes statuses without stealing full-scan provena
 });
 
 test("financial ingest is safe when job lease passes a Prisma TransactionClient", () => {
-  assert.match(service, /typeof db\.\$transaction === "function"/);
-  assert.match(service, /return callback\(db\)/);
+  assert.match(service, /return runDbTransaction\(db, callback\)/);
   assert.match(service, /await runInTransaction\(db, async \(tx\) =>/);
   const ingestStart = service.indexOf("async function ingestFinancialTransactionsChunk");
   const chartStart = service.indexOf("async function ingestFinancialChartChunk", ingestStart);

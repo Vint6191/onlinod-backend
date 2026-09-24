@@ -74,7 +74,7 @@ test("agency removal revokes current access through canonical Creator lifecycle 
   const lifecycle = read("services/creator-lifecycle-authority-service.js");
   const scope = read("services/creator-access-scope-authority-service.js");
   const removal = source.slice(source.indexOf('router.delete("/:id"'), source.indexOf('router.post("/:id/complete-connection"'));
-  assert.match(removal, /prisma\.\$transaction/);
+  assert.match(removal, /runDbTransaction\(prisma,/);
   assert.match(removal, /retireCreatorWithinTransaction/);
   assert.doesNotMatch(removal, /scanRowsById|agencyMember\.findMany|agencyInvitation\.findMany/);
   assert.match(lifecycle, /retireCreatorCurrentAccess/);
