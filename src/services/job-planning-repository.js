@@ -4,6 +4,7 @@ const prisma = require("../prisma");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const { publishDesktopControlEvent } = require("./desktop-control-events");
 const { JOB_CATALOG } = require("./job-catalog");
+const { currentCommitContext, deferCommitHint } = require("./db-commit-kernel");
 
 const DEFAULT_PROTECTED_STATUSES = Object.freeze(["CLAIMED"]);
 const planningPublications = new AsyncLocalStorage();
@@ -46,6 +47,12 @@ function assertPlannableJobKey(value) {
 
 function publishPlannedJobAvailable(job) {
   if (!job?.id || !job?.agencyId) return null;
+  const context = currentCommitContext();
+  if (context) {
+    const hint = { id: job.id, agencyId: job.agencyId, creatorId: job.creatorId, jobKey: job.jobKey };
+    deferCommitHint(context, `job-available:${job.id}`, () => publishPlannedJobAvailable(hint));
+    return null;
+  }
   const pending = planningPublications.getStore();
   if (pending) { pending.set(job.id, job); return null; }
   try {

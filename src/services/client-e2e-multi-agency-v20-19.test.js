@@ -1,5 +1,7 @@
 "use strict";
 
+const { transactionClient } = require("../../test/helpers/prisma-transaction-client");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
@@ -118,10 +120,16 @@ test("pending device inventory binds user display to immutable agency crypto ide
     device: { id: "pc-1", deviceName: "OFFICE-PC", platform: "win32", appVersion: "20.19", lastSeenAt: new Date("2026-08-23T20:01:00.000Z"), userId: "agency-b-user" },
   };
   const db = {
-    $transaction: async (fn) => fn(db),
-    deviceCryptoIdentity: { findMany: async () => [structuredClone(identity)] },
+    $transaction: async (fn) => fn(transactionClient(db)),
+    deviceCryptoIdentity: { findMany: async () => [globalThis.structuredClone(identity)] },
     workerDevice: { findMany: async () => [{ id: "pc-1", deviceName: "OFFICE-PC", platform: "win32", appVersion: "20.19", lastSeenAt: new Date("2026-08-23T20:01:00.000Z") }] },
     agencyMember: {
+      findFirst: async ({ where }) => {
+        assert.deepEqual(where.user, { is: { disabledAt: null } });
+        assert.deepEqual(where.agency, { is: { deletedAt: null } });
+        const member = await db.agencyMember.findUnique({ where: { agencyId_userId: { agencyId: where.agencyId, userId: where.userId } } });
+        return member && !member.deletedAt && !member.deactivatedAt ? member : null;
+      },
       findUnique: async ({ where }) => {
         const key = where?.agencyId_userId || {};
         return key.agencyId === "agency-a" && key.userId === "agency-a-user"

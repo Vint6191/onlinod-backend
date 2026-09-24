@@ -1,5 +1,7 @@
 "use strict";
 
+const { runRootCommit } = require("./db-commit-kernel");
+
 const { canAccessCreator } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
@@ -14,7 +16,6 @@ const {
   assertHumanCreatorMutationAuthorityAfterLocks,
 } = require("./creator-human-management-authority-service");
 
-const SERIALIZABLE = Object.freeze({ isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 });
 
 function clean(value, max = 4096) {
   const text = String(value ?? "").trim();
@@ -69,21 +70,11 @@ function creatorUniqueViolation(error) {
 }
 
 async function runSerializable(db, work) {
-  let last = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      return await db.$transaction(work, SERIALIZABLE);
-    } catch (error) {
-      last = error;
-      if (String(error?.code || "") !== "P2034") throw error;
-    }
-  }
-  throw codedError(
-    "CREATOR_CONNECTION_CONCURRENT_CHANGE",
-    "Creator connection authority changed concurrently; refresh and retry",
-    409,
-    { cause: last },
-  );
+  return runRootCommit(db, (context) => work(context.tx), {
+    profile: "SECRET_WRITE", authority: { kind: "CREATOR_ENROLLMENT" },
+    conflictCode: "CREATOR_CONNECTION_CONCURRENT_CHANGE",
+    conflictMessage: "Creator connection authority changed concurrently; refresh and retry",
+  });
 }
 
 function translateConnectionManagementError(error) {

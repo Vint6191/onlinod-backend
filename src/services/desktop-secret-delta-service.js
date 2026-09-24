@@ -1,5 +1,7 @@
 "use strict";
 
+const { runRootCommit } = require("./db-commit-kernel");
+
 const { canAccessCreator } = require("../middleware/automation-permissions");
 const { isOwner } = require("./team-access-control");
 const { assertCreatorSessionTargetActive, publicState } = require("./creator-session-broker-service");
@@ -35,16 +37,9 @@ function normalizeRequests(input) {
 }
 
 async function serializableRead(db, work) {
-  let last = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      return await db.$transaction(work, { isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 });
-    } catch (error) {
-      last = error;
-      if (String(error?.code || "") !== "P2034" || attempt >= 2) throw error;
-    }
-  }
-  throw last;
+  return runRootCommit(db, (context) => work(context.tx), {
+    profile: "SECRET_READ", authority: { kind: "DESKTOP_SECRET" },
+  });
 }
 
 function assertIdentity(identity, { agencyId, userId }) {

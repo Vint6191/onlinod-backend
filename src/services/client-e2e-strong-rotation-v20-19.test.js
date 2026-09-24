@@ -1,5 +1,7 @@
 "use strict";
 
+const { transactionClient } = require("../../test/helpers/prisma-transaction-client");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
@@ -83,7 +85,7 @@ function rootBridgeEnvelope() {
 }
 
 function clone(value) {
-  return value == null ? value : structuredClone(value);
+  return value == null ? value : globalThis.structuredClone(value);
 }
 
 function makeDb({ targetOwner = false } = {}) {
@@ -159,7 +161,7 @@ function makeDb({ targetOwner = false } = {}) {
   }
 
   const db = {
-    $transaction: async (fn) => fn(db),
+    $transaction: async (fn) => fn(transactionClient(db)),
     $executeRawUnsafe: async () => 1,
     workerDevice: {
       findFirst: async ({ where }) => clone([...state.devices.values()].find((row) => match(where, row)) || null),
@@ -210,6 +212,13 @@ function makeDb({ targetOwner = false } = {}) {
       updateMany: async ({ where, data }) => { let count=0; for (const row of state.ownerWraps) if (match(where,row)) { applyData(row,data); count++; } return { count }; },
     },
     agencyMember: {
+      findFirst: async ({ where }) => {
+        assert.deepEqual(where.user, { is: { disabledAt: null } });
+        assert.deepEqual(where.agency, { is: { deletedAt: null } });
+        if (state.agencyDeleted || state.disabledUserIds?.has(where.userId)) return null;
+        return clone(state.members.find((row) => row.agencyId === where.agencyId
+          && row.userId === where.userId && !row.deletedAt && !row.deactivatedAt) || null);
+      },
       findMany: async ({ where }) => state.members.filter((row) => match(where,row)).map(clone),
       findUnique: async ({ where }) => {
         const key = where.agencyId_userId;
@@ -798,7 +807,7 @@ test("wrong recovery proof cannot activate or rewrite an owner device", async ()
   const identity = state.identities.get("owner-device");
   identity.status = "PENDING";
   identity.activatedAt = null;
-  const beforeWrap = structuredClone(state.ownerWraps.find((row) => row.deviceId === "owner-device" && row.rootVersion === 1));
+  const beforeWrap = globalThis.structuredClone(state.ownerWraps.find((row) => row.deviceId === "owner-device" && row.rootVersion === 1));
   await assert.rejects(
     recoverOwnerDevice({ db, agencyId: "agency-1", userId: "owner-user", member: ownerMember, deviceId: "owner-device", rootVersion: 1, ownerWrap: wrapEnvelope(), recoveryProof: crypto.randomBytes(32).toString("base64") }),
     (error) => error?.code === "CRYPTO_RECOVERY_PROOF_MISMATCH",

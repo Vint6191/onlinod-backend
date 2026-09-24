@@ -1,5 +1,7 @@
 "use strict";
 
+const { transactionClient } = require("../../test/helpers/prisma-transaction-client");
+
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -10,7 +12,7 @@ const {
 } = require("./creator-enrollment-authority-service");
 const { requireBoundAccessDevice } = require("../utils/device-binding");
 
-function clone(value) { return value == null ? value : structuredClone(value); }
+function clone(value) { return value == null ? value : globalThis.structuredClone(value); }
 function norm(value) { return String(value || "").trim().replace(/^@+/, "").toLowerCase(); }
 
 function makeConnectedDb() {
@@ -121,7 +123,7 @@ function makeConnectedDb() {
     },
   };
   tx.$transaction = (work) => {
-    const run = serial.catch(() => undefined).then(() => work(tx));
+    const run = serial.catch(() => undefined).then(() => work(transactionClient(tx)));
     serial = run.catch(() => undefined);
     return run;
   };

@@ -1,5 +1,7 @@
 "use strict";
 
+const { runRootCommit } = require("./db-commit-kernel");
+
 const { assertDeviceCanUseCreatorKey } = require("./client-e2e-keyring-service");
 const { canAccessCreator } = require("../middleware/automation-permissions");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
@@ -7,37 +9,19 @@ const { CREATOR_CONNECTION_STATES, creatorConnectionLockKey } = require("./creat
 const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
 
 async function runSessionSerializable(db, work) {
-  const options = { isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 };
-  let lastError = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try { return await db.$transaction(work, options); }
-    catch (error) {
-      lastError = error;
-      if (String(error?.code || "") !== "P2034") throw error;
-    }
-  }
-  const error = new Error("Creator session changed concurrently; refresh and retry");
-  error.code = "CREATOR_SESSION_WRITE_CONFLICT";
-  error.status = 409;
-  error.cause = lastError;
-  throw error;
+  return runRootCommit(db, (context) => work(context.tx), {
+    profile: "SECRET_WRITE", authority: { kind: "CREATOR_SESSION" },
+    conflictCode: "CREATOR_SESSION_WRITE_CONFLICT",
+    conflictMessage: "Creator session changed concurrently; refresh and retry",
+  });
 }
 
 async function runSessionReadSerializable(db, work) {
-  const options = { isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 };
-  let lastError = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try { return await db.$transaction(work, options); }
-    catch (error) {
-      lastError = error;
-      if (String(error?.code || "") !== "P2034") throw error;
-    }
-  }
-  const error = new Error("Creator session authorization changed concurrently; refresh and retry");
-  error.code = "CREATOR_SESSION_READ_CONFLICT";
-  error.status = 409;
-  error.cause = lastError;
-  throw error;
+  return runRootCommit(db, (context) => work(context.tx), {
+    profile: "SECRET_READ", authority: { kind: "CREATOR_SESSION" },
+    conflictCode: "CREATOR_SESSION_READ_CONFLICT",
+    conflictMessage: "Creator session authorization changed concurrently; refresh and retry",
+  });
 }
 
 function text(value, max = 4096) {

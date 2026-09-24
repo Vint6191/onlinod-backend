@@ -1,0 +1,69 @@
+PHASE 5A — COMMIT KERNEL / I1
+
+This is an incremental command-family cutover, not completion of Phase 5A.
+Migrated: Client E2E keyring Serializable roots, creator sessions, creator
+enrollment, creator network profiles, desktop secret delta, billing recovery.
+Other transaction roots still use their existing protocol and require later
+family-level migration. Do not assume every transaction in src is registered.
+
+runRootCommit(rootPrisma, async context => { ... }, options)
+  Receives a root client only. Callback receives an immutable kernel-issued
+  context. context.tx is a real TransactionClient, not another root.
+  Nested root calls are rejected. Whole callbacks may be retried; they must
+  re-read mutable authority and decisions and contain no external sends.
+
+joinCommit(context, requirements, async sameContext => { ... })
+  Explicit join. Verifies lifetime/scope, isolation and available execution
+  budget. Can require authorityKind, agencyId, creatorId, userId. Does not own
+  retries and does not translate transient errors into domain rejections.
+
+commitAuthorityNow(context)
+  Reads PostgreSQL clock_timestamp each time. Call after necessary domain
+  locks, at the actual grant/claim/renew boundary. It is not a cached start time.
+
+deferCommitHint(context, key, notify)
+  Advisory wakeups only. Coalesced within one attempt; dropped on rollback;
+  invoked only after root commit. Async failure is handled, not awaited as part
+  of the command. No guaranteed delivery: mandatory work needs a durable DB
+  intent/outbox in the domain transaction. Key count is bounded (default 1024).
+
+Profiles:
+  SECRET_READ/WRITE: Serializable, pool maxWait 10s, execution timeout 30s,
+    total command deadline 40s, lock timeout 5s, statement timeout 25s.
+  BILLING_RECOVERY/COMMAND: ReadCommitted, pool maxWait 5s, execution timeout 15s,
+    total command deadline 20s, lock timeout 5s, statement timeout 15s.
+  Every retry inherits remaining total budget. SQL settings are SET LOCAL via
+    set_config(..., true) and capped by the current execution timeout.
+  At most 3 attempts by default; exponential delay + jitter; maximum configurable 5.
+  Retry only P2034, SQLSTATE 40001/40P01, including Prisma P2010/meta.code and
+    ordinary cause wrappers. Business 4xx, uniqueness, timeout and connection
+    failures/unknown outcomes are not automatically retried.
+
+Domain permissions, lock ordering, idempotency and mandatory audits remain the
+responsibility of domain code. In I1, security authority is still freshly
+validated by existing domain helpers on each attempt. The generic context does
+not replace their live User/Agency/Member/Device/key checks.
+
+job-planning-repository now binds hints to an active kernel root. Its legacy
+afterPlanningCommit buffer remains for unconverted planner roots. Billing
+recovery is converted end-to-end. A wrapper buffer alone is not proof of root
+commit for every unconverted caller.
+
+Test doubles must supply a distinct tx without $transaction. The test-only
+test/helpers/prisma-transaction-client.js can produce that view; production
+code must never use it. It does not emulate rollback. Database rollback/error
+envelopes are covered separately by the disposable Prisma/PostgreSQL proof.
+
+Validation:
+  npm run test:phase5-commit
+  PHASE5_PROOF_RUNTIME=/path/to/audit-runtime npm run audit:phase5-commit-postgres
+The latter requires optional @electric-sql/pglite and pglite-socket in the
+specified runtime, creates an ephemeral database and never uses DATABASE_URL.
+It verifies protocol/rollback/isolation; it is not native multi-connection
+PostgreSQL contention or a Render load test.
+
+The gate explicitly lists the historical V20.19 enforcement test file that
+targets already removed APIs. Those tests are not silently counted as passes.
+
+Deployment: no schema/migration change; existing npm install && npm run
+prisma:migrate command is retained. No Desktop change in this package.

@@ -1,0 +1,34 @@
+{
+  "active": [
+    "src/services/client-e2e-final-plan-read-authority-v20-19.test.js",
+    "src/services/client-e2e-multi-agency-v20-19.test.js",
+    "src/services/client-e2e-owner-read-authority-v20-19.test.js",
+    "src/services/client-e2e-prisma-owner-wrap-schema-v20-19-1.test.js",
+    "src/services/client-e2e-rotation-secret-read-authority-v20-19.test.js",
+    "src/services/client-e2e-status-secret-read-v20-19.test.js",
+    "src/services/client-e2e-strong-rotation-v20-19.test.js",
+    "src/services/creator-enrollment-authority-closure2.test.js",
+    "src/services/creator-enrollment-authority-cutover.test.js",
+    "src/services/creator-enrollment-authority-source-closure.test.js",
+    "src/services/creator-network-profile-dedicated-proxy.test.js",
+    "src/services/creator-network-profile-secret-read-v20-19.test.js",
+    "src/services/creator-network-profile-v20-18.test.js",
+    "src/services/creator-network-profile-write-authority-v20-19.test.js",
+    "src/services/creator-session-broker-foundation.test.js",
+    "src/services/creator-session-broker-service.test.js",
+    "src/services/creator-session-heartbeat-manifest-v20-17.test.js",
+    "src/services/creator-session-manifest-v20-16.test.js",
+    "src/services/creator-session-revision-events-v20-22.test.js",
+    "src/services/creator-session-shadow-capture-foundation.test.js",
+    "src/services/db-time-authority-service.test.js",
+    "src/services/desktop-secret-delta-service.test.js",
+    "src/services/job-planning-repository-audit13.test.js",
+    "src/services/db-commit-kernel.test.js"
+  ],
+  "historicalOnly": [
+    {
+      "file": "src/services/client-e2e-enforcement-v20-19.test.js",
+      "reason": "V20.19 migration/enforcement API removed by the CLIENT_E2E-only V20.22 cutover; retained full diagnostic baseline has 14 failures in this file."
+    }
+  ]
+}

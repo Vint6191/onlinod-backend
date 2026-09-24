@@ -10,6 +10,12 @@ const worker = { ...owner, role: "WORKER", roleKey: "chatter", assignedCreators:
 function makeView(member, marker) {
   return {
     agencyMember: {
+      findFirst: async ({ where }) => {
+        assert.deepEqual(where.user, { is: { disabledAt: null } });
+        assert.deepEqual(where.agency, { is: { deletedAt: null } });
+        return where.agencyId === member.agencyId && where.userId === member.userId
+          && !member.deletedAt && !member.deactivatedAt ? { ...member } : null;
+      },
       findUnique: async () => ({ ...member }),
       findMany: async () => [
         { ...member },

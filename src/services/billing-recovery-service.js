@@ -1,5 +1,7 @@
 "use strict";
 
+const { runRootCommit } = require("./db-commit-kernel");
+
 const { readCurrentDesktopMemberAuthority } = require("./desktop-current-access-authority-service");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { isOwner } = require("./team-access-control");
@@ -27,7 +29,10 @@ async function planBillingEarningsRefresh({ db, agencyId, userId, memberId, crea
 }
 
 async function requestBillingEarningsRefresh(input) {
-  return input.db.$transaction(tx => planBillingEarningsRefresh({ ...input, db: tx }), { maxWait: 5000, timeout: 15000 });
+  return runRootCommit(input.db, (context) => planBillingEarningsRefresh({ ...input, db: context.tx }), {
+    profile: "BILLING_RECOVERY",
+    authority: { kind: "BILLING_CONTROL", agencyId: input.agencyId, userId: input.userId, creatorId: input.creatorId },
+  });
 }
 
 module.exports = { requestBillingEarningsRefresh };

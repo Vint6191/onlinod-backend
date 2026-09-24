@@ -1,5 +1,7 @@
 "use strict";
 
+const { runRootCommit } = require("./db-commit-kernel");
+
 const net = require("node:net");
 const {
   clearedProxyCredentials,
@@ -141,16 +143,10 @@ async function credentialReplacement({ db, agencyId, proxy, assignedCreatorId, n
 }
 
 async function runSerializable(db, work, conflictCode, conflictMessage) {
-  const options = { isolationLevel: "Serializable", maxWait: 10_000, timeout: 30_000 };
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      return await db.$transaction(work, options);
-    } catch (error) {
-      if (error?.code !== "P2034") throw error;
-      if (attempt >= 2) throw networkError(conflictCode, conflictMessage, 409);
-    }
-  }
-  throw networkError(conflictCode, conflictMessage, 409);
+  return runRootCommit(db, (context) => work(context.tx), {
+    profile: "SECRET_WRITE", authority: { kind: "CREATOR_NETWORK" },
+    conflictCode, conflictMessage,
+  });
 }
 
 async function runProxySecretReadSerializable(db, work) {

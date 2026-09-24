@@ -1,5 +1,7 @@
 "use strict";
 
+const { transactionClient } = require("../../test/helpers/prisma-transaction-client");
+
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
@@ -13,7 +15,7 @@ const liveWorker = { ...staleOwner, role: "WORKER", roleKey: "chatter", assigned
 
 function txDb(extra = {}) {
   const db = {
-    $transaction: async (fn) => fn(db),
+    $transaction: async (fn) => fn(transactionClient(db)),
     agencyMember: {
       findUnique: async ({ where }) => {
         const key = where?.agencyId_userId || {};

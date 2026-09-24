@@ -1,5 +1,7 @@
 "use strict";
 
+const { runRootCommit } = require("./db-commit-kernel");
+
 const crypto = require("node:crypto");
 const { isOwner } = require("./team-access-control");
 const { assignedCreatorIds, hasBroadCreatorAccess, canAccessCreator, allowedCreatorScope } = require("../middleware/automation-permissions");
@@ -43,19 +45,10 @@ function normalizeCreatorSecretEnvelope(input, expectedKeyVersion, label = "Crea
 }
 
 async function serializableTransaction(db, fn, conflictCode = "CRYPTO_ROTATION_WRITE_CONFLICT") {
-  let lastError = null;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      return await db.$transaction(fn, { isolationLevel: "Serializable" });
-    } catch (error) {
-      lastError = error;
-      if (String(error?.code || "") !== "P2034" || attempt >= 3) break;
-    }
-  }
-  if (String(lastError?.code || "") === "P2034") {
-    throw codedError(conflictCode, "Encryption state changed concurrently; refresh and retry", 409);
-  }
-  throw lastError;
+  return runRootCommit(db, (context) => fn(context.tx), {
+    profile: "SECRET_WRITE", authority: { kind: "CLIENT_E2E" }, conflictCode,
+    conflictMessage: "Encryption state changed concurrently; refresh and retry",
+  });
 }
 
 function clean(value, max = 4096) {
@@ -1816,7 +1809,6 @@ async function softRevokeDevice({ db, agencyId, userId, member, actorDeviceId, t
 }
 
 module.exports = {
-  normalizeWrapEnvelope,
   DEVICE_KEY_ALGORITHM,
   WRAP_ALGORITHM,
   RECOVERY_ALGORITHM,

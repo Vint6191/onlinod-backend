@@ -1,5 +1,7 @@
 "use strict";
 
+const { transactionClient } = require("../../test/helpers/prisma-transaction-client");
+
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const fs = require("node:fs");
@@ -13,7 +15,7 @@ const {
 } = require("./creator-network-profile-service");
 
 function clone(value) {
-  return value == null ? value : structuredClone(value);
+  return value == null ? value : globalThis.structuredClone(value);
 }
 
 function matchesProfile(row, where = {}) {
@@ -176,7 +178,7 @@ function makeDb({ hideProxyOwnerDuringPrecheck = false } = {}) {
       count: async ({ where }) => [...profiles.values()].filter((row) => matchesProfile(row, where)).length,
     },
   };
-  db.$transaction = async (fn) => fn(db);
+  db.$transaction = async (fn) => fn(transactionClient(db));
   return { db, creators, proxies, profiles, root };
 }
 
@@ -212,7 +214,7 @@ test("V20.18 schema and migration enforce one non-null proxy endpoint per creato
   assert.match(relationFixMigration, /CREATE UNIQUE INDEX "CreatorNetworkProfile_agencyId_proxyEndpointId_key"\s+ON "CreatorNetworkProfile"\("agencyId", "proxyEndpointId"\)/);
   assert.match(relationFixMigration, /CREATE UNIQUE INDEX "CreatorNetworkProfile_agencyId_creatorId_key"\s+ON "CreatorNetworkProfile"\("agencyId", "creatorId"\)/);
   assert.match(migration, /CREATE UNIQUE INDEX "AgencyProxyEndpoint_agencyId_id_key" ON "AgencyProxyEndpoint"\("agencyId", "id"\)/);
-  assert.match(migration, /FOREIGN KEY \(\"agencyId\", \"proxyEndpointId\"\) REFERENCES \"AgencyProxyEndpoint\"\(\"agencyId\", \"id\"\)/);
+  assert.match(migration, /FOREIGN KEY \("agencyId", "proxyEndpointId"\) REFERENCES "AgencyProxyEndpoint"\("agencyId", "id"\)/);
   assert.doesNotMatch(migration, /CREATE INDEX "CreatorNetworkProfile_proxyEndpointId_idx"/);
   assert.match(relationFixMigration, /DROP INDEX "CreatorNetworkProfile_creatorId_key"/);
   assert.match(relationFixMigration, /DROP INDEX "CreatorNetworkProfile_proxyEndpointId_key"/);

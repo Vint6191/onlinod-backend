@@ -45,7 +45,9 @@
     "audit:phase3-a26-render": "node scripts/audit/phase3-a26-render-disposable.js",
     "audit:phase3-a29-render": "node scripts/audit/phase3-a29-render-gate.js",
     "maintenance:subscriber-signals": "node scripts/maintenance/phase3-subscriber-maintenance-signals.js",
-    "audit:phase3-identifier-lint": "node scripts/audit/phase3-postgres-identifier-lint.js"
+    "audit:phase3-identifier-lint": "node scripts/audit/phase3-postgres-identifier-lint.js",
+    "test:phase5-commit": "node scripts/audit/phase5-commit-test-gate.js",
+    "audit:phase5-commit-postgres": "node scripts/audit/phase5-commit-postgres-proof.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

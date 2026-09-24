@@ -16,7 +16,15 @@ function view(member, options = {}) {
   const creatorKeyVersion = Number(options.creatorKeyVersion || 1);
   const creatorCiphertext = options.creatorCiphertext || `wrapped-cdk-v${creatorKeyVersion}`;
   return {
-    agencyMember: { findUnique: async () => ({ ...member }) },
+    agencyMember: {
+      findUnique: async () => ({ ...member }),
+      findFirst: async ({ where }) => {
+        assert.deepEqual(where.user, { is: { disabledAt: null } });
+        assert.deepEqual(where.agency, { is: { deletedAt: null } });
+        return where.agencyId === member.agencyId && where.userId === member.userId
+          && !member.deletedAt && !member.deactivatedAt ? { ...member } : null;
+      },
+    },
     deviceCryptoIdentity: { findUnique: async () => ({ ...identity }) },
     agencyCryptoRoot: { findUnique: async () => ({ agencyId: "agency-1", version: rootVersion, status: "ACTIVE", enforceOpaqueSecrets: true }) },
     agencyCryptoOwnerKeyWrap: {

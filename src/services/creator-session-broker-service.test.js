@@ -16,7 +16,7 @@ const {
   revokeCreatorSession,
 } = require("./creator-session-broker-service");
 
-function clone(value) { return value == null ? value : structuredClone(value); }
+function clone(value) { return value == null ? value : globalThis.structuredClone(value); }
 
 function opaquePayload(keyVersion = 1, byte = 0x7a) {
   return {
@@ -40,10 +40,11 @@ function makeDb() {
     connectionState: "CONNECTED", connectionGeneration: 1, connectionStartedAt: null, connectedSessionRevision: 1,
   };
   const liveMember = {
-    agencyId: "agency-1", userId: "user-1", role: "WORKER", roleKey: "worker",
+    id: "member-1", agencyId: "agency-1", userId: "user-1", role: "WORKER", roleKey: "worker",
     assignedCreators: ["creator-1"], deletedAt: null, deactivatedAt: null,
   };
   const devices = [{ id: "device-1", agencyId: "agency-1", userId: "user-1", lastSeenAt: new Date("2026-08-22T20:00:00.000Z") }];
+  const user = { disabledAt: null }, agency = { deletedAt: null };
 
   const tx = {
     creatorAccount: {
@@ -57,6 +58,14 @@ function makeDb() {
       },
     },
     agencyMember: {
+      findFirst: async ({ where }) => {
+        if (where.id && where.id !== liveMember.id) return null;
+        if (where.agencyId !== liveMember.agencyId || where.userId !== liveMember.userId) return null;
+        if (liveMember.deletedAt || liveMember.deactivatedAt || user.disabledAt || agency.deletedAt) return null;
+        assert.deepEqual(where.user, { is: { disabledAt: null } });
+        assert.deepEqual(where.agency, { is: { deletedAt: null } });
+        return clone(liveMember);
+      },
       findUnique: async ({ where }) => {
         const key = where.agencyId_userId || {};
         return key.agencyId === liveMember.agencyId && key.userId === liveMember.userId ? clone(liveMember) : null;
@@ -110,8 +119,8 @@ function makeDb() {
     },
   };
   tx.$executeRawUnsafe = async () => 1;
-  tx.$transaction = async (fn) => fn(tx);
-  return { db: tx, creator, liveMember, devices, getState: () => clone(state), setState: (next) => { state = clone(next); } };
+  const db = { ...tx, $transaction: async (fn) => fn(tx) };
+  return { db, tx, creator, liveMember, user, agency, devices, getState: () => clone(state), setState: (next) => { state = clone(next); } };
 }
 
 function writeArgs(ctx, overrides = {}) {
@@ -366,4 +375,66 @@ test("creator session secret reads use a Serializable transaction", () => {
   const start = source.indexOf("async function getCreatorSession");
   const end = source.indexOf("function sessionConflict", start);
   assert.match(source.slice(start, end), /runSessionReadSerializable/);
+});
+
+test("raw SQL serialization conflicts are retried by the shared root and keep the session contract", async () => {
+  const ctx = makeDb();
+  const original = ctx.db.$transaction;
+  let attempts = 0;
+  ctx.db.$transaction = async (work, options) => {
+    attempts += 1;
+    if (attempts === 1) throw Object.assign(new Error("serialization"), { code: "P2010", meta: { code: "40001" } });
+    return original(work, options);
+  };
+  const result = await writeCreatorSession(writeArgs(ctx));
+  assert.equal(attempts, 2);
+  assert.equal(result.state.revision, 1);
+  assert.equal(ctx.getState().encryptedPayload, opaquePayload().ciphertext);
+});
+
+test("session conflict exhaustion maps both raw SQLSTATEs to the existing domain 409", async () => {
+  for (const sqlState of ["40001", "40P01"]) {
+    const ctx = makeDb();
+    let attempts = 0;
+    ctx.db.$transaction = async () => {
+      attempts += 1;
+      throw Object.assign(new Error("database conflict"), { code: "P2010", meta: { code: sqlState } });
+    };
+    await assert.rejects(writeCreatorSession(writeArgs(ctx)), (error) => error.code === "CREATOR_SESSION_WRITE_CONFLICT" && error.status === 409 && error.cause.meta.code === sqlState);
+    assert.equal(attempts, 3);
+    assert.equal(ctx.getState(), null);
+  }
+});
+
+test("a user disabled after a failed attempt is rejected before the retry writes a session", async () => {
+  const ctx = makeDb();
+  const original = ctx.tx.creatorSessionState.findUnique;
+  let reads = 0, attempts = 0;
+  const transaction = ctx.db.$transaction;
+  ctx.db.$transaction = async (...args) => { attempts += 1; return transaction(...args); };
+  ctx.tx.creatorSessionState.findUnique = async (args) => {
+    reads += 1;
+    if (reads === 1) {
+      ctx.user.disabledAt = new Date();
+      throw Object.assign(new Error("serialization"), { code: "P2010", meta: { code: "40001" } });
+    }
+    return original(args);
+  };
+  await assert.rejects(writeCreatorSession(writeArgs(ctx)), { code: "CRYPTO_MEMBER_INACTIVE" });
+  assert.equal(attempts, 2);
+  assert.equal(reads, 1);
+  assert.equal(ctx.getState(), null);
+});
+
+test("live disabled User and retired Agency deny secret reads and writes with a stale route member", async () => {
+  for (const target of ["user", "agency"]) {
+    const ctx = makeDb();
+    await writeCreatorSession(writeArgs(ctx));
+    const member = clone(ctx.liveMember);
+    if (target === "user") ctx.user.disabledAt = new Date();
+    else ctx.agency.deletedAt = new Date();
+    await assert.rejects(getCreatorSession({ db: ctx.db, agencyId: "agency-1", creatorId: "creator-1", includePayload: true, deviceId: "device-1", member, userId: "user-1" }), { code: "CRYPTO_MEMBER_INACTIVE" });
+    await assert.rejects(writeCreatorSession(writeArgs(ctx, { baseRevision: 1, requestId: "denied-update", coherenceHash: HASH_C })), { code: "CRYPTO_MEMBER_INACTIVE" });
+    assert.equal(ctx.getState().revision, 1);
+  }
 });
