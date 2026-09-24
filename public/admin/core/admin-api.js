@@ -200,6 +200,8 @@
     dataArchiveDeliveries: (id, body) => request(`/api/admin/data/creators/${encodeURIComponent(id)}/archive-deliveries`, { method: "POST", body }),
 
     // ─── billing management (admin-billing.js) ────────────────
+    commercialPolicy: () => request("/api/admin/billing/commercial-policy"),
+    saveCommercialPolicy: body => request("/api/admin/billing/commercial-policy", { method: "PATCH", body }),
     billingOverview:   ()       => request("/api/admin/billing/overview"),
     billingAgency:     (id)     => request(`/api/admin/billing/agency/${encodeURIComponent(id)}`),
     billingTiers:      ()       => request("/api/admin/billing/tiers"),

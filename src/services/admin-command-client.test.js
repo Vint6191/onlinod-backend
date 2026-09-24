@@ -88,3 +88,12 @@ test("operational commands retain stable UUID across reload, including DELETE bo
    assert.ok(first.commandId);assert.equal((await browser(b.storage).commands.prepare(request)).commandId,first.commandId);
  }
 });
+
+test("global commercial policy uses a stable command identity and blocks changed retry intent", async () => {
+  const b = browser();
+  const args = { ...input, path: "/api/admin/billing/commercial-policy", body: { expectedRevision: 3, settings: { trialDays: 14 }, reason: "Global pricing" } };
+  const first = await b.commands.prepare(args);
+  assert.ok(first.commandId);
+  assert.equal((await browser(b.storage).commands.prepare(args)).commandId, first.commandId);
+  assert.equal((await b.commands.prepare({ ...args, body: { ...args.body, expectedRevision: 4 } })).blocked, true);
+});

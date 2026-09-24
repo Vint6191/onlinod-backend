@@ -17,10 +17,13 @@ const pricingSchema = z.object({
   tier: z.enum(["STARTER", "GROWTH", "PRO", "ELITE", "CUSTOM"]).optional(),
   tierMode: z.enum(["MANUAL", "AUTO"]).optional(),
   corePriceCents: centsSchema.optional(),
+  corePriceSource: z.enum(["CATALOG", "OVERRIDE"]).optional(),
   aiChatterEnabled: z.boolean().optional(),
   aiChatterPriceCents: centsSchema.optional(),
+  aiChatterPriceSource: z.enum(["CATALOG", "OVERRIDE"]).optional(),
   outreachEnabled: z.boolean().optional(),
   outreachPriceCents: centsSchema.optional(),
+  outreachPriceSource: z.enum(["CATALOG", "OVERRIDE"]).optional(),
   billingExcluded: z.boolean().optional(),
   notes: z.string().max(3000).nullable().optional(),
 }).strict().refine(value => Object.keys(value).some(key => !["expectedRevision", "reason"].includes(key)), "No pricing changes supplied");
@@ -67,6 +70,7 @@ const contentLifecycleSchema = z.object({
 const retentionVersion = { expectedRevision: revisionSchema, expectedPolicyHash: z.string().regex(/^[a-f0-9]{64}$/), reason: reasonSchema };
 const retentionSettings = z.object(Object.fromEntries(Object.entries(require("./retention-policy-definition").retentionSchema()).map(([key,spec]) => [key,z.number().int().min(spec.min).max(spec.max)]))).strict();
 const ACTIONS = Object.freeze({
+  "billing.commercial-policy.set": { roles: ["SUPER_ADMIN"], schema: z.object({ expectedRevision: revisionSchema, reason: reasonSchema, settings: require("./billing-commercial-policy-service").commercialSettingsSchema }).strict() },
   "retention.policy.set": { roles:["SUPER_ADMIN"], schema:z.object({...retentionVersion,settings:retentionSettings}).strict() },
   "retention.policy.reset": { roles:["SUPER_ADMIN"], schema:z.object(retentionVersion).strict() },
   "retention.run": { roles:["SUPER_ADMIN"], schema:z.object(retentionVersion).strict() },

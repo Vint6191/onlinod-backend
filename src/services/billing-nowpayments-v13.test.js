@@ -1,5 +1,6 @@
 "use strict";
 
+const { policyFixture, policyModelFixture } = require("../../scripts/test-support/commercial-policy-fixture");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
@@ -130,6 +131,8 @@ function makeProcessingDb({ failOrderUpdateOnce = false } = {}) {
   let subscription = { id: "sub-1", agencyId: "agency-1", status: "TRIAL", billingMode: "MANUAL", billingPeriod: "MONTHLY", currentPeriodStart: null, currentPeriodEnd: null };
 
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     billingOrder: {
       findUnique: async ({ where }) => where.id === order.id ? { ...order } : null,
       update: async ({ where, data }) => {
@@ -338,9 +341,11 @@ test("checkout snapshots real creator prices, creates a hosted invoice, and send
   const service = loadService();
   const created = [];
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: { findFirst: async () => ({ billingPeriod: "THREE_MONTHS", billingMode: "MANUAL", corePricePerCreatorCents: 2000 }) },
     creatorAccount: { findMany: async () => [
-      { id: "c1", displayName: "One", username: "one", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: true, aiChatterPriceCents: 1000, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } },
+      { id: "c1", displayName: "One", username: "one", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: true, aiChatterPriceCents: 1000, aiChatterPriceOverrideCents: 1000, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } },
       { id: "c2", displayName: "Excluded", username: "x", billingProfile: { tier: "CUSTOM", corePriceCents: 9000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: true } },
       { id: "c3", displayName: "No profile", username: "missing", billingProfile: null },
     ] },
@@ -376,6 +381,8 @@ test("checkout audit failure after provider invoice creation does not destroy a 
 }, async () => {
   let order = null;
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: { findFirst: async () => ({ billingPeriod: "MONTHLY", billingMode: "MANUAL", corePricePerCreatorCents: 2000 }) },
     creatorAccount: { findMany: async () => [{ id: "c1", displayName: "One", username: "one", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } }] },
     agency: { findUnique: async () => ({ id: "a1", name: "Agency", plan: "PRO" }) },
@@ -407,6 +414,8 @@ test("FREE_INTERNAL can use sandbox for testing but cannot accidentally create a
   const service = loadService();
   let orderCreates = 0;
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: { findFirst: async () => ({ billingPeriod: "MONTHLY", billingMode: "FREE_INTERNAL", corePricePerCreatorCents: 2000 }) },
     creatorAccount: { findMany: async () => [{ id: "c1", displayName: "One", username: "one", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } }] },
     agency: { findUnique: async () => ({ id: "a1", name: "Agency", plan: "PRO" }) },
@@ -430,7 +439,9 @@ test("checkout idempotency is persisted in BillingOrder and a retried request re
   global.fetch = async () => { providerCalls += 1; throw new Error("provider must not be called"); };
   try {
     const service = loadService();
-    const db = { billingOrder: { findUnique: async () => ({ ...existing }) } };
+    const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0, billingOrder: { findUnique: async () => ({ ...existing }) } };
     const result = await service.createCheckout({ agencyId: "a1", actorUserId: "u1", checkoutKey: existing.checkoutKey, selection: { billingPeriod: "MONTHLY", creators: [{ creatorId: "c1", tier: "STARTER", aiChatterEnabled: false, outreachEnabled: false }] }, db });
     assert.equal(result.replayed, true);
     assert.equal(result.order.id, existing.id);
@@ -449,6 +460,8 @@ test("a failed sandbox invoice request with no remote invoice can be retried wit
     paidAt: null, activatedAt: null, expiresAt: null, createdAt: new Date(), updatedAt: new Date(),
   };
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: { findFirst: async () => ({ billingPeriod: "MONTHLY", billingMode: "MANUAL", corePricePerCreatorCents: 2000 }) },
     creatorAccount: { findMany: async () => [{ id: "c1", displayName: "One", username: "one", billingProfile: null }] },
     agency: { findUnique: async () => ({ id: "a1", name: "Agency", plan: "PRO" }) },
@@ -661,6 +674,8 @@ test("a signed final event with mismatched amount is stored as a permanent rejec
 test("V13.3 quote charges only explicitly selected creators and server-prices tiers/add-ons/period", async () => {
   const service = loadService();
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: { findFirst: async () => ({ billingMode: "MANUAL", corePricePerCreatorCents: 2000 }) },
     creatorAccount: { findMany: async () => [
       { id: "c1", displayName: "One", username: "one", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterPriceCents: 10000, outreachPriceCents: 2900, billingExcluded: false } },
@@ -681,9 +696,11 @@ test("V13.3 quote charges only explicitly selected creators and server-prices ti
   assert.equal(quote.periodMonths, 3);
 });
 
-test("V13.3 quote preserves the existing agency core-price default for a creator without an explicit billing profile", async () => {
+test("V13.3 quote inherits the global catalog rather than a retired agency default", async () => {
   const service = loadService();
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: { findFirst: async () => ({ billingMode: "MANUAL", corePricePerCreatorCents: 2500 }) },
     creatorAccount: { findMany: async () => [{ id: "c1", displayName: "Defaulted", username: "defaulted", billingProfile: null }] },
     agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "dev" }) },
@@ -693,13 +710,15 @@ test("V13.3 quote preserves the existing agency core-price default for a creator
     selection: { billingPeriod: "MONTHLY", creators: [{ creatorId: "c1", tier: "STARTER", aiChatterEnabled: false, outreachEnabled: false }] },
     db,
   });
-  assert.equal(quote.lines[0].corePriceCents, 2500);
-  assert.equal(quote.amountCents, 2500);
+  assert.equal(quote.lines[0].corePriceCents, 2000);
+  assert.equal(quote.amountCents, 2000);
 });
 
 test("V13.3 quote fails closed when a selected creator is admin-excluded or belongs outside the agency selection", async () => {
   const service = loadService();
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: { findFirst: async () => ({ billingMode: "MANUAL", corePricePerCreatorCents: 2000 }) },
     creatorAccount: { findMany: async () => [{ id: "c1", displayName: "Excluded", username: "x", billingProfile: { tier: "STARTER", corePriceCents: 2000, billingExcluded: true } }] },
     agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "dev" }) },
@@ -716,7 +735,9 @@ test("V13.3 checkout idempotency key cannot be replayed with a different creator
   const firstSelection = { billingPeriod: "MONTHLY", creators: [{ creatorId: "c1", tier: "STARTER", aiChatterEnabled: false, outreachEnabled: false }] };
   const requestHash = crypto.createHash("sha256").update(service.stableJson(firstSelection)).digest("hex");
   const existing = { id: "existing", agencyId: "agency-1", provider: "NOWPAYMENTS", status: "CHECKOUT_CREATED", testMode: true, checkoutKey: "same_key_1234567890", requestHash, providerInvoiceUrl: "https://sandbox.nowpayments.io/payment/?iid=x" };
-  const db = { billingOrder: { findUnique: async () => existing } };
+  const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0, billingOrder: { findUnique: async () => existing } };
   await assert.rejects(service.createCheckout({ agencyId: "agency-1", actorUserId: "owner", checkoutKey: existing.checkoutKey, selection: { billingPeriod: "MONTHLY", creators: [{ creatorId: "c2", tier: "STARTER", aiChatterEnabled: false, outreachEnabled: false }] }, db }), /different billing selection/i);
 }));
 
@@ -730,6 +751,8 @@ test("V13.3 concurrent idempotency collision re-checks request binding before re
   let reads = 0;
   const raced = { id: "raced", agencyId: "agency-1", provider: "NOWPAYMENTS", status: "CHECKOUT_CREATED", testMode: true, checkoutKey: "race_key_1234567890", requestHash: otherHash, providerInvoiceUrl: "https://sandbox.nowpayments.io/payment/?iid=raced" };
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: { findFirst: async () => ({ billingPeriod: "MONTHLY", billingMode: "MANUAL", corePricePerCreatorCents: 2000 }) },
     creatorAccount: { findMany: async () => [{ id: "c1", displayName: "One", username: "one", billingProfile: null }] },
     agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "PRO" }) },
@@ -749,7 +772,9 @@ test("V13.3 refuses to reuse a pre-V13.3 checkout key that is not bound to an ex
 }, async () => {
   const service = loadService();
   const existing = { id: "legacy", agencyId: "agency-1", provider: "NOWPAYMENTS", status: "CHECKOUT_CREATED", testMode: true, checkoutKey: "legacy_key_1234567890", requestHash: null, providerInvoiceUrl: "https://sandbox.nowpayments.io/payment/?iid=legacy" };
-  const db = { billingOrder: { findUnique: async () => existing } };
+  const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0, billingOrder: { findUnique: async () => existing } };
   await assert.rejects(service.createCheckout({ agencyId: "agency-1", actorUserId: "owner", checkoutKey: existing.checkoutKey, selection: { billingPeriod: "MONTHLY", creators: [{ creatorId: "c1", tier: "STARTER", aiChatterEnabled: false, outreachEnabled: false }] }, db }), (err) => err?.code === "BILLING_LEGACY_CHECKOUT_KEY");
 }));
 
@@ -805,6 +830,8 @@ test("V13.3 expiry reconciliation marks a paid workspace PAST_DUE only when no c
   let agencyStatus = "ACTIVE";
   const subscription = { id: "sub-expired", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: new Date("2026-08-31T00:00:00Z"), createdAt: new Date("2026-01-01T00:00:00Z") };
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: {
       findMany: async () => [{ ...subscription }],
       findFirst: async () => ({ ...subscription }),
@@ -827,6 +854,8 @@ test("V13.3 expiry reconciliation repairs a stale agency period from the latest 
   let write = null;
   const subscription = { id: "sub-stale", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: new Date("2026-08-31T00:00:00Z"), createdAt: new Date("2026-01-01T00:00:00Z") };
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: { findMany: async () => [{ ...subscription }], findFirst: async () => ({ ...subscription }), update: async ({ data }) => { write = { ...data }; return { ...subscription, ...data }; } },
     creatorBillingEntitlement: { findFirst: async () => ({ creatorId: "creator-1", agencyId: "agency-1", coreValidUntil: activeUntil }) },
     agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async () => ({ id: "agency-1" }) },
@@ -867,6 +896,8 @@ test("V13.3.1 refund never resurrects a payment predecessor that was already ref
     ["order-b", { id: "order-b", status: "REFUNDED", paidAt: activatedB, activatedAt: activatedB }],
   ]);
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     billingOrder: { findUnique: async ({ where }) => { const row = orders.get(where.id); return row ? { ...row, agencyId: "agency-1" } : null; } },
     billingOrderLine: {
       findMany: async ({ where }) => lines.filter((row) => row.orderId === where.orderId).map((row) => ({ ...row })),
@@ -904,6 +935,8 @@ test("V14 refund restores an ADMIN predecessor without inheriting refunded walle
   const line = { id: "line-paid", orderId: "order-paid", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", corePriceCents: 3500, previousTier: "STARTER", corePreviousSource: "ADMIN", corePreviousPriceCents: 0, corePreviousValidUntil: adminUntil, coreGrantedUntil: paidUntil, activatedAt: activated, refundedAt: null };
   let entitlement = { id: "ent-1", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", coreSource: "PAYMENT", corePriceCents: 3500, coreValidUntil: paidUntil, coreLastOrderId: "order-paid", autoRenewEnabled: true, walletTestMode: false, amountChargedForPeriodCents: 3500, currentPeriodStartedAt: activated, currentPeriodEndsAt: paidUntil, nextRenewalAt: paidUntil, billingAnchorDay: 10 };
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     billingOrder: { findUnique: async () => ({ id: "order-paid", agencyId: "agency-1", status: "REFUNDED", paidAt: activated, activatedAt: activated, testMode: false }) },
     billingOrderLine: {
       findMany: async () => [{ ...line }],
@@ -946,6 +979,8 @@ test("V13.3.1 refund restores the latest still-paid predecessor but preserves a 
     ["order-b", { id: "order-b", status: "REFUNDED", paidAt: activatedB, activatedAt: activatedB }],
   ]);
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     billingOrder: { findUnique: async ({ where }) => { const row = orders.get(where.id); return row ? { ...row, agencyId: "agency-1" } : null; } },
     billingOrderLine: {
       findMany: async ({ where }) => lines.filter((row) => row.orderId === where.orderId).map((row) => ({ ...row })),
@@ -995,6 +1030,8 @@ test("V14 refund never auto-renews an already-expired paid predecessor", async (
   ]);
   let entitlement = { id: "ent-old", agencyId: "agency-1", creatorId: "creator-1", tier: "GROWTH", coreSource: "PAYMENT", corePriceCents: 3500, coreValidUntil: bUntil, coreLastOrderId: "order-b-old", autoRenewEnabled: true, walletTestMode: false, amountChargedForPeriodCents: 3500 };
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     billingOrder: { findUnique: async ({ where }) => { const row = orders.get(where.id); return row ? { ...row, agencyId: "agency-1" } : null; } },
     billingOrderLine: {
       findMany: async ({ where }) => lines.filter((row) => row.orderId === where.orderId).map((row) => ({ ...row })),
@@ -1019,6 +1056,8 @@ test("V13.3.1 aggregate lookup excludes soft-deleted creators", async () => {
   let entitlementWhere = null;
   const subscription = { id: "sub-1", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: new Date("2026-08-31T00:00:00Z"), createdAt: new Date("2026-01-01T00:00:00Z") };
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: { findFirst: async () => ({ ...subscription }), update: async ({ data }) => ({ ...subscription, ...data }) },
     creatorBillingEntitlement: { findFirst: async ({ where }) => { entitlementWhere = where; return null; } },
     agency: { findUnique: async () => ({ id: "agency-1", status: "ACTIVE", deletedAt: null, billingSupportHold: false, trialEndsAt: null }), update: async ({ data }) => ({ id: "agency-1", ...data }) },
@@ -1075,6 +1114,8 @@ test("V13.3.2 concurrent provider status update cannot regress REFUNDED back to 
   };
   let writes = 0;
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     billingOrder: {
       updateMany: async ({ where, data }) => {
         writes += 1;
@@ -1123,6 +1164,8 @@ test("V13.3.1 expiry scheduler reconciles future ACTIVE aggregates and does not 
   let updates = 0;
   const subscription = { id: "sub-future", agencyId: "agency-1", status: "ACTIVE", billingMode: "CRYPTO", currentPeriodEnd: activeUntil, createdAt: new Date("2026-01-01T00:00:00Z") };
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agencySubscription: {
       findMany: async (args) => { findManyArgs = args; return [{ ...subscription }]; },
       findFirst: async () => ({ ...subscription }),
@@ -1182,6 +1225,8 @@ test("V14.9 sandbox invoice creation rejects production NOWPayments hosted URLs 
 }, async () => {
   let order = null;
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "PRO" }) },
     agencySubscription: { findFirst: async () => ({ billingMode: "MANUAL" }) },
     billingOrder: {
@@ -1208,6 +1253,8 @@ test("V14.9 invoice amount remains bound to the ONLINOD top-up before any hosted
 }, async () => {
   let order = null;
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "PRO" }) },
     agencySubscription: { findFirst: async () => ({ billingMode: "MANUAL" }) },
     billingOrder: {

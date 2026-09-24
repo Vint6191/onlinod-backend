@@ -24,9 +24,12 @@
 
   // ── OVERVIEW ────────────────────────────────────────────────
   async function renderOverview(main) {
-    main.innerHTML = `<div class="adm-page"><div class="adm-loading">loading billing…</div></div>`;
+    main.innerHTML = '<div id="blCommercialPolicy"></div><div id="blOverview"></div>';
+    window.OnlinodAdminCommercialPolicy?.render(main.querySelector("#blCommercialPolicy"));
+    const overview = main.querySelector("#blOverview");
+    overview.innerHTML = `<div class="adm-page"><div class="adm-loading">loading billing…</div></div>`;
     const r = await A().billingOverview();
-    if (!r || !r.ok) { main.innerHTML = `<div class="adm-page"><div class="adm-error">failed to load billing</div></div>`; return; }
+    if (!r || !r.ok) { overview.innerHTML = `<div class="adm-page"><div class="adm-error">failed to load billing</div></div>`; return; }
 
     const m = r.mrr || {};
     const kpis = [
@@ -46,7 +49,7 @@
         <td class="adm-muted">${a.currentPeriodEnd ? esc(String(a.currentPeriodEnd).slice(0, 10)) : (a.trialEndsAt ? "trial→" + esc(String(a.trialEndsAt).slice(0, 10)) : "—")}</td>
       </tr>`).join("");
 
-    main.innerHTML = `
+    overview.innerHTML = `
       <div class="adm-page">
         <div class="adm-page-head">
           <h1>Billing</h1>
@@ -63,7 +66,7 @@
         <div class="adm-muted">MRR counts only billable statuses (ACTIVE / PAST_DUE / GRACE). Trial = potential, not yet charged.</div>
       </div>`;
 
-    main.querySelectorAll("tr[data-agency]").forEach((tr) => tr.addEventListener("click", () => {
+    overview.querySelectorAll("tr[data-agency]").forEach((tr) => tr.addEventListener("click", () => {
       local.view = "agency"; local.agencyId = tr.dataset.agency; render(main);
     }));
   }
@@ -78,21 +81,22 @@
     const tierOpts = (sel) => Object.entries(r.tiers).map(([k, v]) =>
       `<option value="${k}" ${k === sel ? "selected" : ""}>${esc(v.label)} (${k === "CUSTOM" ? "explicit price" : money(v.priceCents)})</option>`).join("");
 
+    const priceSource = (component, value) => `<select class="bl-${component}-source"><option value="CATALOG" ${value !== "OVERRIDE" ? "selected" : ""}>Global price</option><option value="OVERRIDE" ${value === "OVERRIDE" ? "selected" : ""}>Individual price</option></select>`;
     const rows = (r.models || []).map((m) => `
       <tr data-creator="${esc(m.creatorId)}" data-pricing-revision="${Number(m.pricingRevision || 0)}" class="${m.billingExcluded ? "adm-row-excluded" : ""}">
         <td>
           <label><input class="bl-select" type="checkbox" ${m.billingExcluded ? "disabled" : ""}> <b>${esc(m.displayName || m.username || m.creatorId.slice(-8))}</b></label>
           <div class="adm-muted">@${esc(m.username || "—")} · ${esc(m.creatorStatus || "")}</div>
         </td>
-        <td><select class="bl-tier">${tierOpts(m.tier || "STARTER")}</select></td>
-        <td><input class="bl-price" type="number" min="0" step="0.01" value="${(Number(m.corePriceCents || 0) / 100).toFixed(2)}" style="width:80px"> </td>
+        <td><select class="bl-mode"><option value="AUTO" ${m.tierMode !== "MANUAL" ? "selected" : ""}>Automatic tier</option><option value="MANUAL" ${m.tierMode === "MANUAL" ? "selected" : ""}>Fixed tier</option></select><select class="bl-tier">${tierOpts(m.tier || "STARTER")}</select></td>
+        <td>${priceSource("core", m.corePriceSource)}<input class="bl-price" type="number" min="0" step="0.01" value="${(Number(m.corePriceCents || 0) / 100).toFixed(2)}" style="width:80px"> </td>
         <td class="adm-addon-cell">
           <label><input type="checkbox" class="bl-ai" ${m.aiChatterEnabled ? "checked" : ""}> AI</label>
-          <input class="bl-ai-price" type="number" min="0" value="${(Number(m.aiChatterPriceCents || 0) / 100).toFixed(2)}" style="width:64px">
+          ${priceSource("ai", m.aiChatterPriceSource)}<input class="bl-ai-price" type="number" min="0" step="0.01" value="${(Number(m.aiChatterPriceCents || 0) / 100).toFixed(2)}" style="width:64px">
         </td>
         <td class="adm-addon-cell">
           <label><input type="checkbox" class="bl-or" ${m.outreachEnabled ? "checked" : ""}> OR</label>
-          <input class="bl-or-price" type="number" min="0" value="${(Number(m.outreachPriceCents || 0) / 100).toFixed(2)}" style="width:64px">
+          ${priceSource("or", m.outreachPriceSource)}<input class="bl-or-price" type="number" min="0" step="0.01" value="${(Number(m.outreachPriceCents || 0) / 100).toFixed(2)}" style="width:64px">
         </td>
         <td><label><input type="checkbox" class="bl-excl" ${m.billingExcluded ? "checked" : ""}> excl</label></td>
         <td class="adm-money bl-line">${money(m.configuredLineCents)}</td>
@@ -147,6 +151,18 @@
     main.querySelectorAll("tr[data-creator]").forEach((tr) => {
       const tierSel = tr.querySelector(".bl-tier");
       const priceInp = tr.querySelector(".bl-price");
+      const mode = tr.querySelector(".bl-mode");
+      const coreSource = tr.querySelector(".bl-core-source");
+      function applySources() {
+        const automatic = mode.value === "AUTO";
+        tierSel.disabled = automatic;
+        if (automatic) coreSource.value = "CATALOG";
+        coreSource.disabled = automatic;
+        for (const [component, selector] of [["core", ".bl-price"], ["ai", ".bl-ai-price"], ["or", ".bl-or-price"]]) tr.querySelector(selector).disabled = tr.querySelector(`.bl-${component}-source`).value === "CATALOG";
+      }
+      mode.addEventListener("change", applySources);
+      for (const component of ["core", "ai", "or"]) tr.querySelector(`.bl-${component}-source`).addEventListener("change", applySources);
+      applySources();
       tierSel.addEventListener("change", () => {
         const t = tierSel.value;
         if (t !== "CUSTOM" && r.tiers[t]) priceInp.value = (r.tiers[t].priceCents / 100).toFixed(2);
@@ -252,21 +268,23 @@
     btn.disabled = true; btn.textContent = "…";
     const body = {
       expectedRevision: Number(tr.dataset.pricingRevision),
-      tierMode: "MANUAL",
-      tier: tr.querySelector(".bl-tier").value,
-      corePriceCents: Math.round(Number(tr.querySelector(".bl-price").value || 0) * 100),
+      tierMode: tr.querySelector(".bl-mode").value,
       aiChatterEnabled: tr.querySelector(".bl-ai").checked,
-      aiChatterPriceCents: Math.round(Number(tr.querySelector(".bl-ai-price").value || 0) * 100),
       outreachEnabled: tr.querySelector(".bl-or").checked,
-      outreachPriceCents: Math.round(Number(tr.querySelector(".bl-or-price").value || 0) * 100),
       billingExcluded: tr.querySelector(".bl-excl").checked,
       reason: "admin billing edit",
     };
+    if (body.tierMode === "MANUAL") body.tier = tr.querySelector(".bl-tier").value;
+    for (const [component, ui, selector] of [["core", "core", ".bl-price"], ["aiChatter", "ai", ".bl-ai-price"], ["outreach", "or", ".bl-or-price"]]) {
+      body[component + "PriceSource"] = tr.querySelector(`.bl-${ui}-source`).value;
+      if (body[component + "PriceSource"] === "OVERRIDE") body[component + "PriceCents"] = Math.round(Number(tr.querySelector(selector).value) * 100);
+    }
     const res = await A().billingSetCreator(tr.dataset.creator, body);
     btn.disabled = false; btn.textContent = "save";
     tr.querySelector(".bl-check").hidden = !["NETWORK", "INVALID_JSON", "ADMIN_COMMAND_RESPONSE_UNKNOWN", "ADMIN_COMMAND_UNRESOLVED"].includes(res?.code);
     if (res?.ok) {
       tr.dataset.pricingRevision = String(res.billing.pricingRevision);
+      for (const [key, selector] of [["corePriceCents", ".bl-price"], ["aiChatterPriceCents", ".bl-ai-price"], ["outreachPriceCents", ".bl-or-price"]]) tr.querySelector(selector).value = (res.billing[key] / 100).toFixed(2);
       R().toast("saved " + money(res.lineCents), "ok");
       tr.querySelector(".bl-line").textContent = money(res.lineCents);
       tr.classList.toggle("adm-row-excluded", body.billingExcluded);

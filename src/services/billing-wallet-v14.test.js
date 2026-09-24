@@ -1,5 +1,6 @@
 "use strict";
 
+const { policyFixture, policyModelFixture } = require("../../scripts/test-support/commercial-policy-fixture");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -103,6 +104,8 @@ function makeDb({ balanceCents = 0n, revenue30dCents = 0, capturedAt = new Date(
   profiles.set("creator-1", baseProfile);
 
   const db = {
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
     $transaction: async (fn) => fn(db),
     creatorEarningsSnapshot: {
       findUnique: async () => snapshot ? { ...snapshot } : null,
@@ -210,7 +213,7 @@ test("automatic tier boundaries are server-defined and customer catalog is month
   assert.equal(automaticTierForRevenue(500_000), "PRO");
   assert.equal(automaticTierForRevenue(1_499_999), "PRO");
   assert.equal(automaticTierForRevenue(1_500_000), "ELITE");
-  const catalog = catalogForClient();
+  const catalog = catalogForClient(policyFixture());
   assert.deepEqual(catalog.periods.map((p) => p.key), ["MONTHLY"]);
   assert.ok(catalog.tiers.every((t) => t.customerSelectable === false));
 });
@@ -238,7 +241,7 @@ test("billing requires relational earnings proof; a fresh legacy snapshot alone 
   assert.equal(snapshotOnly.fresh, false);
   assert.equal(snapshotOnly.source, "UNAVAILABLE");
   assert.equal(snapshotOnly.revenue30dCents, null);
-  assert.throws(() => svc.pricingFromRevenue({ profile: db._profiles.get("creator-1"), revenue: snapshotOnly }), (e) => e.code === "BILLING_EARNINGS_30D_UNAVAILABLE");
+  assert.throws(() => svc.pricingFromRevenue({ policy: policyFixture(), profile: db._profiles.get("creator-1"), revenue: snapshotOnly }), (e) => e.code === "BILLING_EARNINGS_30D_UNAVAILABLE");
 
   db._setSnapshot(120_000, "2026-08-10T00:00:00Z");
   const stale = await svc.readRolling30dRevenue({ db, creatorId:"creator-1", now });
@@ -253,7 +256,7 @@ test("exported snapshot preview and quote helpers stay fail-closed for monetary 
   const svc = loadWalletService(db);
   const profile = db._profiles.get("creator-1");
   const snapshot = await db.creatorEarningsSnapshot.findUnique();
-  const snapshotPreview = svc.pricingPreviewFromSnapshot({ profile, snapshot, now });
+  const snapshotPreview = svc.pricingPreviewFromSnapshot({ policy: policyFixture(), profile, snapshot, now });
   assert.equal(snapshotPreview.available, false);
   assert.equal(snapshotPreview.revenueSource, "UNAVAILABLE");
   assert.equal(snapshotPreview.revenue30dCents, null);
@@ -329,7 +332,7 @@ test("batched Settings evidence uses the same complete 30-day fallback instead o
   assert.equal(revenue.fresh, true);
   assert.equal(revenue.source, "EARNINGS_DAILY_PROVEN_FRESH_30D");
   assert.equal(revenue.revenue30dCents, 120_000);
-  const preview = svc.pricingPreviewFromRevenue({ profile: db._profiles.get("creator-1"), revenue });
+  const preview = svc.pricingPreviewFromRevenue({ policy: policyFixture(), profile: db._profiles.get("creator-1"), revenue });
   assert.equal(preview.available, true);
   assert.equal(preview.tier, "GROWTH");
   assert.equal(preview.totalCents, 3000);
@@ -381,7 +384,7 @@ test("batched Settings evidence fails closed when even one coverage day is missi
   assert.equal(revenue.fresh, false);
   assert.equal(revenue.source, "UNAVAILABLE");
   assert.equal(revenue.revenue30dCents, null);
-  assert.equal(svc.pricingPreviewFromRevenue({ profile: db._profiles.get("creator-1"), revenue }).available, false);
+  assert.equal(svc.pricingPreviewFromRevenue({ policy: policyFixture(), profile: db._profiles.get("creator-1"), revenue }).available, false);
 });
 
 test("one paid month can move STARTER -> GROWTH next renewal without rewriting history", async () => {
@@ -590,10 +593,11 @@ test("V14.0.1 repair migration requires explicit wallet opt-in for legacy ADMIN/
   assert.doesNotMatch(sql, /'WALLET'::"BillingEntitlementSource"/);
 });
 
-test("admin helper defaults ordinary creator billing profiles to AUTO and only CUSTOM to MANUAL", () => {
-  const admin = fs.readFileSync(adminPath, "utf8");
-  assert.match(admin, /TIER_CATALOG.*billing-catalog-service/);
-  assert.match(admin, /tierMode: key === "CUSTOM" \? "MANUAL" : "AUTO"/);
+test("admin legacy plans read the global catalog and no longer carry independent price defaults", () => {
+  const source = fs.readFileSync(adminPath, "utf8");
+  assert.match(source, /readCommercialPolicy/);
+  assert.match(source, /catalogForPolicy/);
+  assert.doesNotMatch(source, /function defaultBilling/);
 });
 
 test("schema has wallet ledger and explicit subscription period dates", () => {
@@ -644,6 +648,8 @@ test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines
   try {
     let order=null;
     const db={
+    systemSetting: policyModelFixture(),
+    $executeRawUnsafe: async () => 0,
       $transaction: async (fn)=>fn(db),
       agency:{ findUnique:async()=>({id:"agency-1",name:"Agency",plan:"PRO"}) },
       agencySubscription:{ findFirst:async()=>({billingMode:"MANUAL"}) },
@@ -744,4 +750,51 @@ test("billing 30-day authority uses PostgreSQL clock instead of a poisoned calle
   assert.equal(revenue.revenue30dCents, 300_000);
   assert.equal(revenue.fresh, true);
   assert.equal(revenue.collectionState, "FRESH");
+});
+
+test("global price changes affect only future wallet periods, with revision recorded", async () => {
+  const now = new Date("2026-08-14T12:00:00Z");
+  const db = makeDb({ balanceCents: 50000n, revenue30dCents: 50000, capturedAt: now });
+  let policy = policyFixture();
+  db.systemSetting.findUnique = async () => ({ revision: policy.revision, value: policy.settings });
+  const svc = loadWalletService(db);
+  const first = await svc.startCreatorSubscription({ agencyId: "agency-1", creatorId: "creator-1", db, now });
+  assert.equal(first.period.totalCents, 2000); assert.equal(first.period.commercialPolicyRevision, 1);
+  policy = { revision: 2, settings: { ...policy.settings, starterPriceCents: 2700 } };
+  // Stale copies deliberately remain at $20; the new policy is the authority.
+  assert.equal(db._profiles.get("creator-1").corePriceCents, 2000);
+  db._setSnapshot(50000, "2026-09-14T11:55:00Z");
+  const second = await svc.renewCreatorSubscription({ entitlement: { ...db._entitlements.get("creator-1") }, db, now: new Date("2026-09-14T12:00:00Z") });
+  assert.equal(second.period.totalCents, 2700); assert.equal(second.period.commercialPolicyRevision, 2);
+  assert.equal(db._periods.get(first.period.id).totalCents, 2000); assert.equal(db._wallet().balanceCents, 45300n);
+});
+
+test("one policy snapshot prices core and enabled addons; explicit free addon survives", async () => {
+  const now = new Date("2026-08-14T12:00:00Z");
+  const db = makeDb({ balanceCents: 50000n, revenue30dCents: 50000, capturedAt: now });
+  const profile = db._profiles.get("creator-1");
+  Object.assign(profile, { aiChatterEnabled: true, outreachEnabled: true, aiChatterPriceCents: 1, outreachPriceCents: 1, outreachPriceOverrideCents: 0 });
+  let reads = 0;
+  db.systemSetting.findUnique = async () => { reads++; return { revision: 4, value: { ...policyFixture().settings, starterPriceCents: 2800, aiChatterPriceCents: 12000, outreachPriceCents: 3500 } }; };
+  const result = await loadWalletService(db).startCreatorSubscription({ agencyId: "agency-1", creatorId: "creator-1", db, now });
+  assert.equal(result.period.totalCents, 14800); assert.equal(result.period.aiChatterPriceCents, 12000); assert.equal(result.period.outreachPriceCents, 0);
+  assert.equal(reads, 1); assert.equal(result.period.commercialPolicyRevision, 4);
+});
+
+test("missing or corrupt global policy never debits a wallet", async () => {
+  for (const row of [null, { revision: 2, value: { ...policyFixture().settings, starterPriceCents: -1 } }]) {
+    const now = new Date("2026-08-14T12:00:00Z"), db = makeDb({ balanceCents: 50000n, revenue30dCents: 50000, capturedAt: now });
+    db.systemSetting.findUnique = async () => row;
+    await assert.rejects(loadWalletService(db).startCreatorSubscription({ agencyId: "agency-1", creatorId: "creator-1", db, now }), { code: "BILLING_COMMERCIAL_POLICY_UNAVAILABLE" });
+    assert.equal(db._wallet().balanceCents, 50000n); assert.equal(db._transactions.size, 0); assert.equal(db._periods.size, 0);
+  }
+});
+
+test("individual manual core price is explicit and independent of catalog revisions", () => {
+  const svc = loadWalletService();
+  const p = { revision: 9, settings: { ...policyFixture().settings, proPriceCents: 8700 } };
+  const revenue = { fresh: true, revenue30dCents: 50000, capturedAt: new Date(), source: "canonical" };
+  const base = { tierMode: "MANUAL", tier: "PRO", corePriceCents: 1 };
+  assert.equal(svc.pricingFromRevenue({ profile: base, revenue, policy: p }).corePriceCents, 8700);
+  assert.equal(svc.pricingFromRevenue({ profile: { ...base, corePriceOverrideCents: 4500 }, revenue, policy: p }).corePriceCents, 4500);
 });

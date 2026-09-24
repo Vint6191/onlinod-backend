@@ -39,6 +39,7 @@ function createMemoryDb(options = {}) {
       return copy(row);
     }
     const api = {
+      systemSetting: require("./commercial-policy-fixture").policyModelFixture(),
       async $queryRawUnsafe(sql, ...args) {
         const id = args[0];
         if (sql.includes('FROM "SfsTargetCandidate"')) return table("candidates").filter(row => id.includes(row.id)).map(copy);
@@ -85,7 +86,7 @@ function createMemoryDb(options = {}) {
         if (sql.startsWith("SAVEPOINT ")) savepoints.set(sql.slice(10),copy(read()));
         else if (sql.startsWith("ROLLBACK TO SAVEPOINT ")) write(copy(savepoints.get(sql.slice(22))));
         else if (sql.startsWith("RELEASE SAVEPOINT ")) savepoints.delete(sql.slice(18));
-        else if (!sql.includes("pg_advisory")) throw new Error(`Unexpected SQL ${sql}`);
+        else if (!sql.includes("pg_advisory") && !sql.includes("commercial_pricing_writer") && !sql.includes('FROM "SystemSetting"')) throw new Error(`Unexpected SQL ${sql}`);
         return 1;
       },
       automationDelivery: { findMany: async ({ where = {}, take = 500 }) => {

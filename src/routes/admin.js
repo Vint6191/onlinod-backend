@@ -63,7 +63,8 @@ const { adminRequired } = require("../middleware/admin");
 const { getRetentionSettings } = require("../services/retention-service");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
-const { TIER_CATALOG } = require("../services/billing-catalog-service");
+const { catalogForPolicy, configuredPrices } = require("../services/billing-catalog-service");
+const { readCommercialPolicy } = require("../services/billing-commercial-policy-service");
 const { retireCreatorWithinTransaction, publishCreatorRetirementControlEvents } = require("../services/creator-lifecycle-authority-service");
 const { assertTeamControlPlaneWriteAdmission } = require("../services/phase2-release-compatibility-authority-service");
 const { assertAgencyHasOperationalOwner } = require("../services/team-operational-owner-authority-service");
@@ -130,13 +131,6 @@ router.use(require("../middleware/admin-read-boundary").adminReadBoundary);
 // Shared helpers / constants
 // ════════════════════════════════════════════════════════════
 
-const TIERS = Object.freeze(Object.fromEntries(
-  Object.entries(TIER_CATALOG).map(([key, row]) => [key, {
-    label: row.label,
-    priceCents: Number(row.priceCents || 0),
-    revenueLabel: row.revenueLabel,
-  }]),
-));
 
 function sha256(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex");
@@ -207,21 +201,6 @@ function validationError(res, err) {
   });
 }
 
-function defaultBilling(tier) {
-  const key = TIERS[tier] ? tier : "STARTER";
-  return {
-    tier: key,
-    tierMode: key === "CUSTOM" ? "MANUAL" : "AUTO",
-    corePriceCents: TIERS[key].priceCents,
-    revenue30dCents: 0,
-    aiChatterEnabled: false,
-    aiChatterPriceCents: 10000,
-    outreachEnabled: false,
-    outreachPriceCents: 2900,
-    billingExcluded: false,
-    notes: null,
-  };
-}
 
 function health(agency) {
   const creators = agency.creators || [];
@@ -264,12 +243,15 @@ function health(agency) {
 // ════════════════════════════════════════════════════════════
 
 router.get("/plans", async (_req, res) => {
+  const policy = await readCommercialPolicy({ db: prisma });
+  const { tiers, addons } = catalogForPolicy(policy);
   return res.json({
     ok: true,
-    creatorTiers: TIERS,
+    creatorTiers: tiers,
+    commercialPolicyRevision: policy.revision,
     addons: {
-      AI_CHATTER: { label: "AI Chatter",          priceCents: 10000, scope: "creator/month" },
-      OUTREACH:   { label: "SFS + Comment Bot",   priceCents: 2900,  scope: "creator/month" },
+      AI_CHATTER: { label: "AI Chatter",          priceCents: addons.aiChatter.priceCents, scope: "creator/month" },
+      OUTREACH:   { label: "SFS + Comment Bot",   priceCents: addons.outreach.priceCents,  scope: "creator/month" },
     },
   });
 });
@@ -549,7 +531,9 @@ router.get("/agencies/:id", async (req, res) => {
   // debt to super-admins so the canonical recovery path is explicit:
   // restore -> converge/resolve work -> retire again.
   const customPipelineBlockers = await agencyCustomPipelineBlockers({ db: prisma, agencyId: agency.id });
-  return res.json({ ok: true, agency, health: health(agency), customPipelineBlockers, creatorTiers: TIERS });
+  const policy = await readCommercialPolicy({ db: prisma });
+  for (const creator of agency.creators) creator.billingProfile = { ...creator.billingProfile, ...configuredPrices(creator.billingProfile, policy) };
+  return res.json({ ok: true, agency, health: health(agency), customPipelineBlockers, creatorTiers: catalogForPolicy(policy).tiers, commercialPolicyRevision: policy.revision });
 });
 
 // PATCH /agencies/:id   — rename / change status notes

@@ -3,7 +3,8 @@ const { adminError, billingPolicySchema, billingHoldSchema, entitlementSchema } 
 const { executeAdminCommand } = require("./admin-commit-authority-service");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { lockAgencyBillingMutation, syncAgencyBillingAggregate, publicEntitlement } = require("./billing-entitlement-service");
-const { TIER_CATALOG, ADDON_CATALOG } = require("./billing-catalog-service");
+const { configuredPrices } = require("./billing-catalog-service");
+const { readCommercialPolicy } = require("./billing-commercial-policy-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 
 async function lockLiveAgency(tx, agencyId) {
@@ -30,6 +31,7 @@ async function latestSubscription(tx, agencyId) {
 }
 async function setAdminBillingPolicy({ db, actor, commandId, agencyId, payload }) {
   if (Object.hasOwn(payload || {}, "status") || Object.hasOwn(payload || {}, "currentPeriodEnd")) throw adminError("AGENCY_BILLING_STATE_DOMAIN_MANAGED", "Paid validity is derived from creator access. Use the support hold action to lock billing status.", 409);
+  if (payload?.corePricePerCreatorCents !== undefined) throw adminError("BILLING_AGENCY_PRICE_RETIRED", "Use the global catalog or an explicit per-model override", 409);
   const input = billingPolicySchema.parse(payload);
   return executeAdminCommand({ db, actor, commandId, action: "billing.policy.set", targetId: agencyId, payload: input, work: async ({ tx }) => {
     const agency = await lockLiveAgency(tx, agencyId);
@@ -41,7 +43,7 @@ async function setAdminBillingPolicy({ db, actor, commandId, agencyId, payload }
     if (input.trialEndsAt !== undefined) agencyPatch.trialEndsAt = input.trialEndsAt === null ? null : new Date(input.trialEndsAt);
     if (Object.keys(agencyPatch).length) await tx.agency.update({ where: { id: agencyId }, data: agencyPatch });
     const patch = {};
-    for (const key of ["billingMode", "billingPeriod", "corePricePerCreatorCents"]) if (input[key] !== undefined) patch[key] = input[key];
+    for (const key of ["billingMode", "billingPeriod"]) if (input[key] !== undefined) patch[key] = input[key];
     patch.trialEndsAt = input.trialEndsAt === undefined ? agency.trialEndsAt : agencyPatch.trialEndsAt;
     if (subscription) await tx.agencySubscription.update({ where: { id: subscription.id }, data: patch });
     else await tx.agencySubscription.create({ data: { agencyId, ...patch } });
@@ -81,12 +83,13 @@ async function setAdminEntitlement({ db, actor, commandId, creatorId, payload })
     const now = await dbAuthorityNow({ db: tx });
     const profile = creator.billingProfile;
     const tier = input.tier || before?.tier || profile?.tier || "STARTER";
+    const prices = configuredPrices(profile, await readCommercialPolicy({ db: tx, lock: true }), tier);
     const data = {};
     if (input.coreValidUntil !== undefined) {
       const until = input.coreValidUntil === null ? null : new Date(input.coreValidUntil);
       const active = until && until > now;
       const wasActive = before?.coreValidUntil && new Date(before.coreValidUntil) > now;
-      Object.assign(data, { tier, coreSource: "ADMIN", corePriceCents: profile?.corePriceCents ?? TIER_CATALOG[tier].priceCents ?? 0,
+      Object.assign(data, { tier, coreSource: "ADMIN", corePriceCents: prices.corePriceCents,
         coreValidFrom: active ? (wasActive ? before.coreValidFrom || now : now) : before?.coreValidFrom || null,
         coreValidUntil: until, coreLastOrderId: null,
         subscriptionStartedAt: before?.subscriptionStartedAt || before?.coreValidFrom || (active ? now : null),
@@ -97,8 +100,8 @@ async function setAdminEntitlement({ db, actor, commandId, creatorId, payload })
       });
     }
     // Only explicitly selected components lose their previous provenance.
-    if (input.aiChatterValidUntil !== undefined) Object.assign(data, { aiChatterSource: "ADMIN", aiChatterValidUntil: input.aiChatterValidUntil === null ? null : new Date(input.aiChatterValidUntil), aiLastOrderId: null, aiChatterPriceCents: profile?.aiChatterPriceCents ?? ADDON_CATALOG.aiChatter.priceCents });
-    if (input.outreachValidUntil !== undefined) Object.assign(data, { outreachSource: "ADMIN", outreachValidUntil: input.outreachValidUntil === null ? null : new Date(input.outreachValidUntil), outreachLastOrderId: null, outreachPriceCents: profile?.outreachPriceCents ?? ADDON_CATALOG.outreach.priceCents });
+    if (input.aiChatterValidUntil !== undefined) Object.assign(data, { aiChatterSource: "ADMIN", aiChatterValidUntil: input.aiChatterValidUntil === null ? null : new Date(input.aiChatterValidUntil), aiLastOrderId: null, aiChatterPriceCents: prices.aiChatterPriceCents });
+    if (input.outreachValidUntil !== undefined) Object.assign(data, { outreachSource: "ADMIN", outreachValidUntil: input.outreachValidUntil === null ? null : new Date(input.outreachValidUntil), outreachLastOrderId: null, outreachPriceCents: prices.outreachPriceCents });
     const entitlement = before ? await tx.creatorBillingEntitlement.update({ where: { creatorId }, data }) : await tx.creatorBillingEntitlement.create({ data: { agencyId: identity.agencyId, creatorId, ...data } });
     const aggregate = await syncAgencyBillingAggregate(tx, identity.agencyId, now);
     return { agencyId: identity.agencyId, body: { ok: true, entitlement: publicEntitlement(entitlement, now), aggregate }, audit: { before: publicEntitlement(before, now), after: publicEntitlement(entitlement, now), aggregate } };

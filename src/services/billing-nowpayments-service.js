@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { audit } = require("./audit-service");
+const { readCommercialPolicy } = require("./billing-commercial-policy-service");
 const { normalizeSelection, periodMonths, priceCreatorSelection } = require("./billing-catalog-service");
 const { activatePaidOrderEntitlements, refundOrderEntitlements } = require("./billing-entitlement-service");
 const { creditPaidTopUp, refundTopUp } = require("./billing-wallet-service");
@@ -368,10 +369,10 @@ async function calculateCheckoutSnapshot({ agencyId, selection, db = null }) {
     throw err;
   }
 
-  const defaultCorePriceCents = Math.max(0, Number(subscription?.corePricePerCreatorCents ?? 2000));
+  const policy = await readCommercialPolicy({ db: client });
   const months = periodMonths(normalized.billingPeriod);
   const lines = normalized.creators.map((requested) => {
-    const priced = priceCreatorSelection({ creator: byId.get(requested.creatorId), requested, defaultCorePriceCents });
+    const priced = priceCreatorSelection({ creator: byId.get(requested.creatorId), requested, policy });
     return { ...priced, periodMonths: months, lineTotalCents: priced.monthlyCents * months };
   });
   const monthlyTotalCents = lines.reduce((sum, row) => sum + row.monthlyCents, 0);
@@ -386,6 +387,7 @@ async function calculateCheckoutSnapshot({ agencyId, selection, db = null }) {
     agency,
     subscription,
     selection: normalized,
+    commercialPolicyRevision: policy.revision,
     requestHash: requestHashForSelection(normalized),
     billingPeriod: normalized.billingPeriod,
     periodMonths: months,
@@ -565,6 +567,7 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
                 agencyName: snapshot.agency.name,
                 plan: snapshot.agency.plan,
                 monthlyTotalCents: snapshot.monthlyTotalCents,
+                commercialPolicyRevision: snapshot.commercialPolicyRevision,
                 periodMonths: snapshot.periodMonths,
                 selection: snapshot.selection,
                 lines: snapshot.lines,
@@ -595,6 +598,7 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
               agencyName: snapshot.agency.name,
               plan: snapshot.agency.plan,
               monthlyTotalCents: snapshot.monthlyTotalCents,
+                commercialPolicyRevision: snapshot.commercialPolicyRevision,
               periodMonths: snapshot.periodMonths,
               selection: snapshot.selection,
               lines: snapshot.lines,

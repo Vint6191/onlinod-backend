@@ -4,7 +4,8 @@ const { adminError, pricingSchema } = require("./admin-command-contract");
 const { executeAdminCommand } = require("./admin-commit-authority-service");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { lockAgencyBillingMutation } = require("./billing-entitlement-service");
-const { TIER_CATALOG, ADDON_CATALOG } = require("./billing-catalog-service");
+const { configuredPrices } = require("./billing-catalog-service");
+const { readCommercialPolicy, enableCommercialPricingWrite } = require("./billing-commercial-policy-service");
 
 function lineCents(row) {
   return row.billingExcluded ? 0 : row.corePriceCents + (row.aiChatterEnabled ? row.aiChatterPriceCents : 0) + (row.outreachEnabled ? row.outreachPriceCents : 0);
@@ -26,21 +27,37 @@ async function setPricingWithinTransaction({ tx, creatorId, payload, expectedAge
   const revision = before?.pricingRevision || 0;
   if (revision !== payload.expectedRevision) throw adminError("ADMIN_PRICING_REVISION_CONFLICT", "Pricing changed; reload before editing", 409, { currentRevision: revision });
   const { expectedRevision: _revision, reason: _reason, ...patch } = payload;
-  // A deliberate tier/price edit switches to MANUAL unless explicitly rejected
-  // as a conflicting AUTO request. Revenue observations remain domain-owned.
-  if (patch.tierMode === "AUTO" && (patch.tier !== undefined || patch.corePriceCents !== undefined)) throw adminError("ADMIN_AUTO_PRICING_CONFLICT", "AUTO pricing cannot include a manual tier or core price", 400);
+  const policy = await readCommercialPolicy({ db: tx, lock: true });
+  if (patch.tierMode === "AUTO" && (patch.tier !== undefined || patch.corePriceCents !== undefined || patch.corePriceSource === "OVERRIDE")) throw adminError("ADMIN_AUTO_PRICING_CONFLICT", "AUTO pricing cannot include a manual tier or core price", 400);
   if ((patch.tier !== undefined || patch.corePriceCents !== undefined) && patch.tierMode === undefined) patch.tierMode = "MANUAL";
-  if (patch.tier === "CUSTOM" && patch.corePriceCents === undefined) throw adminError("ADMIN_CUSTOM_PRICE_REQUIRED", "CUSTOM tier requires an explicit core price", 400);
-  if (patch.tier && patch.tier !== "CUSTOM" && patch.corePriceCents === undefined) patch.corePriceCents = TIER_CATALOG[patch.tier].priceCents;
+  if (patch.tierMode === "AUTO") { patch.corePriceOverrideCents = null; if (before?.tier === "CUSTOM") patch.tier = "STARTER"; }
+  if (patch.tier && patch.corePriceCents === undefined) patch.corePriceOverrideCents = null;
+  for (const component of ["core", "aiChatter", "outreach"]) {
+    const sourceKey = component + "PriceSource", priceKey = component + "PriceCents", overrideKey = component + "PriceOverrideCents";
+    if (patch[sourceKey] === "CATALOG" && patch[priceKey] !== undefined) throw adminError("ADMIN_PRICE_SOURCE_CONFLICT", "Catalog pricing cannot include an explicit price", 400);
+    if (patch[sourceKey] === "OVERRIDE" && patch[priceKey] === undefined) throw adminError("ADMIN_OVERRIDE_PRICE_REQUIRED", "An override requires an explicit price", 400);
+    if (patch[sourceKey] === "CATALOG") patch[overrideKey] = null;
+    else if (patch[priceKey] !== undefined) patch[overrideKey] = patch[priceKey];
+    delete patch[sourceKey];
+  }
+  const effectiveTier = patch.tier || before?.tier || "STARTER";
+  const draft = { ...before, ...patch, tier: effectiveTier };
+  if (effectiveTier === "CUSTOM" && draft.corePriceOverrideCents == null) throw adminError("ADMIN_CUSTOM_PRICE_REQUIRED", "CUSTOM tier requires an explicit core price", 400);
+  const prices = configuredPrices(draft, policy);
+  // Compatibility fields are display snapshots only; nullable overrides are the
+  // sole source of individual exceptions to the current global catalog.
+  for (const key of ["corePriceCents", "aiChatterPriceCents", "outreachPriceCents"]) patch[key] = prices[key];
   const defaults = {
     agencyId: identity.agencyId, creatorId, tier: "STARTER", tierMode: "AUTO",
-    corePriceCents: TIER_CATALOG.STARTER.priceCents, aiChatterEnabled: false,
-    aiChatterPriceCents: ADDON_CATALOG.aiChatter.priceCents, outreachEnabled: false,
-    outreachPriceCents: ADDON_CATALOG.outreach.priceCents, billingExcluded: false,
+    corePriceCents: policy.settings.starterPriceCents, aiChatterEnabled: false,
+    aiChatterPriceCents: policy.settings.aiChatterPriceCents, outreachEnabled: false,
+    outreachPriceCents: policy.settings.outreachPriceCents, billingExcluded: false,
   };
+  await enableCommercialPricingWrite(tx);
   const billing = before
     ? await tx.creatorBillingProfile.update({ where: { creatorId }, data: patch })
     : await tx.creatorBillingProfile.create({ data: { ...defaults, ...patch } });
+  Object.assign(billing, configuredPrices(billing, policy));
   return { agencyId: identity.agencyId, body: { ok: true, billing, lineCents: lineCents(billing), configuredLineCents: lineCents(billing) }, audit: { before: before || null, after: billing } };
 }
 

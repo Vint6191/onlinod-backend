@@ -10,7 +10,8 @@ const { encryptTelegramCredentials, decryptTelegramCredentials } = require("./te
 const { SETTINGS_KEY: TELEGRAM_CUSTOM_REMINDERS_KEY, normalizeTelegramCustomReminders, reprojectCustomReminderSchedule } = require("./custom-order-reminders");
 const { assertTelegramProviderCapabilityCanRetire } = require("./telegram-provider-capability-control-authority-service");
 const { publicProviderConfig, recentOrders } = require("./billing-nowpayments-service");
-const { catalogForClient } = require("./billing-catalog-service");
+const { readCommercialPolicy } = require("./billing-commercial-policy-service");
+const { catalogForClient, configuredPrices } = require("./billing-catalog-service");
 const { publicEntitlement } = require("./billing-entitlement-service");
 const { getWalletState, readRolling30dRevenueBatch, pricingPreviewFromRevenue } = require("./billing-wallet-service");
 const { lockCustomExecutionDefaults, lockAgencyPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
@@ -356,7 +357,7 @@ async function canManageWorkspaceSettings(member, db = null) {
 async function getWorkspaceSettings({ agencyId, member, db = null }) {
   const client = db || prisma;
   const [agency, rows] = await Promise.all([
-    client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, trialEndsAt: true, currentPeriodEnd: true } }),
+    client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, billingSupportHold: true, deletedAt: true, trialEndsAt: true, currentPeriodEnd: true } }),
     client.workspaceSetting.findMany({ where: { agencyId, key: { in: ["timezone", "timeFormat", "dateFormat", "vaultUploadRecipient"] } } }),
   ]);
   const raw = settingsObject(rows);
@@ -468,15 +469,16 @@ async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, d
   return after;
 }
 
-function billingLine(creator, pricing, defaultCorePriceCents = 2000, now = new Date()) {
+function billingLine(creator, pricing, now, policy) {
   const profile = creator?.billingProfile || null;
   const excluded = profile?.billingExcluded === true;
   const preview = pricing || null;
-  const core = excluded ? 0 : Math.max(0, Number(preview?.corePriceCents ?? profile?.corePriceCents ?? defaultCorePriceCents ?? 2000));
+  const prices = configuredPrices(profile, policy);
+  const core = excluded ? 0 : Math.max(0, Number(preview?.corePriceCents ?? prices.corePriceCents));
   const aiEnabled = !excluded && profile?.aiChatterEnabled === true;
   const outreachEnabled = !excluded && profile?.outreachEnabled === true;
-  const ai = aiEnabled ? Math.max(0, Number(preview?.aiChatterPriceCents ?? profile?.aiChatterPriceCents ?? 10000)) : 0;
-  const outreach = outreachEnabled ? Math.max(0, Number(preview?.outreachPriceCents ?? profile?.outreachPriceCents ?? 2900)) : 0;
+  const ai = aiEnabled ? Math.max(0, Number(preview?.aiChatterPriceCents ?? prices.aiChatterPriceCents)) : 0;
+  const outreach = outreachEnabled ? Math.max(0, Number(preview?.outreachPriceCents ?? prices.outreachPriceCents)) : 0;
   return {
     creatorId: String(creator.id),
     creatorName: creator.displayName || creator.username || String(creator.id),
@@ -491,9 +493,9 @@ function billingLine(creator, pricing, defaultCorePriceCents = 2000, now = new D
     revenueSource: preview?.revenueSource || null,
     corePriceCents: core,
     aiChatterEnabled: aiEnabled,
-    aiChatterPriceCents: Math.max(0, Number(profile?.aiChatterPriceCents ?? 10000)),
+    aiChatterPriceCents: prices.aiChatterPriceCents,
     outreachEnabled,
-    outreachPriceCents: Math.max(0, Number(profile?.outreachPriceCents ?? 2900)),
+    outreachPriceCents: prices.outreachPriceCents,
     billingExcluded: excluded,
     lineTotalCents: core + ai + outreach,
     estimatedNextChargeCents: excluded || preview?.available !== true ? null : Math.max(0, Number(preview.totalCents || 0)),
@@ -931,8 +933,8 @@ async function getBillingSettings({ agencyId, member, db = null }) {
   if (!isOwner(member)) return { available: false, reason: "OWNER_ONLY" };
   const now = await dbAuthorityNow({ db: client, fallbackNow: new Date() });
   const providerBase = publicProviderConfig();
-  const [agency, subscription, creators, orders, walletState] = await Promise.all([
-    client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, trialEndsAt: true, currentPeriodEnd: true } }),
+  const [agency, subscription, creators, orders, walletState, policy] = await Promise.all([
+    client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true, billingSupportHold: true, deletedAt: true, trialEndsAt: true, currentPeriodEnd: true } }),
     client.agencySubscription.findFirst({ where: { agencyId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }),
     client.creatorAccount.findMany({
       where: { agencyId, deletedAt: null },
@@ -941,13 +943,13 @@ async function getBillingSettings({ agencyId, member, db = null }) {
     }),
     recentOrders({ agencyId, limit: 20, db: client }),
     getWalletState({ agencyId, testMode: providerBase.testMode === true, db: client, limit: 40 }),
+    readCommercialPolicy({ db: client }),
   ]);
   const creatorIds = creators.map((creator) => creator.id);
   const revenueByCreator = await readRolling30dRevenueBatch({ db: client, creatorIds, now });
-  const defaultCorePriceCents = Math.max(0, Number(subscription?.corePricePerCreatorCents ?? 2000));
   const rows = creators.map((creator) => {
-    const pricing = pricingPreviewFromRevenue({ profile: creator.billingProfile, revenue: revenueByCreator.get(String(creator.id)) || null });
-    return billingLine(creator, pricing, defaultCorePriceCents, now);
+    const pricing = pricingPreviewFromRevenue({ profile: creator.billingProfile, revenue: revenueByCreator.get(String(creator.id)) || null, policy });
+    return billingLine(creator, pricing, now, policy);
   });
   const monthlyTotalCents = rows.reduce((sum, row) => sum + row.lineTotalCents, 0);
   const activeRows = rows.filter((row) => row.entitlement.coreActive);
@@ -967,21 +969,22 @@ async function getBillingSettings({ agencyId, member, db = null }) {
     .sort((a, b) => b.getTime() - a.getTime())[0] || null;
   const billingMode = String(subscription?.billingMode || "MANUAL");
   const rawStatus = String(subscription?.status || agency?.status || "TRIAL");
-  const effectiveStatus = billingMode !== "FREE_INTERNAL" && rawStatus === "ACTIVE" && activeRows.length === 0
-    ? "PAST_DUE"
-    : activeRows.length > 0 ? "ACTIVE" : rawStatus;
+  const effectiveStatus = agency?.deletedAt || agency?.billingSupportHold ? "LOCKED"
+    : activeRows.length > 0 || billingMode === "FREE_INTERNAL" ? "ACTIVE"
+    : agency?.trialEndsAt && new Date(agency.trialEndsAt) > now ? "TRIAL"
+    : rawStatus === "CANCELLED" ? "CANCELLED" : "PAST_DUE";
   const liveCheckoutBlockedByInternalTestMode = billingMode === "FREE_INTERNAL" && providerBase.environment === "live";
 
   return {
     available: true,
-    agency,
+    agency: { ...agency, status: effectiveStatus },
     subscription: subscription ? {
       id: subscription.id,
       status: subscription.status,
       effectiveStatus,
       billingMode,
       billingPeriod: "MONTHLY",
-      corePricePerCreatorCents: subscription.corePricePerCreatorCents,
+      corePricePerCreatorCents: policy.settings.starterPriceCents,
       trialEndsAt: subscription.trialEndsAt,
       graceUntil: subscription.graceUntil,
       currentPeriodStart: subscription.currentPeriodStart,
@@ -997,7 +1000,7 @@ async function getBillingSettings({ agencyId, member, db = null }) {
     wallet: walletState.wallet,
     walletTransactions: walletState.transactions,
     creators: rows,
-    catalog: catalogForClient(),
+    catalog: catalogForClient(policy),
     provider: {
       mode: billingMode,
       internalTestMode: billingMode === "FREE_INTERNAL",

@@ -2,11 +2,13 @@
 
 const prisma = require("../prisma");
 const { audit } = require("./audit-service");
-const { TIER_CATALOG, ADDON_CATALOG, automaticTierForRevenue } = require("./billing-catalog-service");
+const { configuredPrices, automaticTierForRevenue } = require("./billing-catalog-service");
 const { isFuture, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("./billing-entitlement-service");
 const { evaluateAggregateCollectionState, stateVocabulary } = require("./analytics-state-evaluator");
 const { COLLECTION_FUTURE_SKEW_TOLERANCE_MS } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+
+const { readCommercialPolicy, enableCommercialPricingWrite } = require("./billing-commercial-policy-service");
 
 const DEFAULT_MAX_EARNINGS_AGE_HOURS = 48;
 const MAX_INT_CENTS = 2_147_483_647;
@@ -259,12 +261,12 @@ if (db.creatorEarningsDaily?.groupBy && db.analyticsCoverage?.groupBy) {
   return results;
 }
 
-function configuredAddonPrice(profile, key) {
-  if (key === "ai") return cents(profile?.aiChatterPriceCents, ADDON_CATALOG.aiChatter.priceCents);
-  return cents(profile?.outreachPriceCents, ADDON_CATALOG.outreach.priceCents);
+function configuredAddonPrice(profile, key, policy) {
+  const prices = configuredPrices(profile, policy);
+  return key === "ai" ? prices.aiChatterPriceCents : prices.outreachPriceCents;
 }
 
-function pricingFromRevenue({ profile, revenue }) {
+function pricingFromRevenue({ profile, revenue, policy }) {
   if (!revenue?.fresh || revenue.revenue30dCents === null) {
     throw billingError(
       "A complete earnings ledger for the previous 30 closed UTC days is required before starting or renewing this subscription",
@@ -278,19 +280,17 @@ function pricingFromRevenue({ profile, revenue }) {
   const configuredTier = String(profile?.tier || "STARTER").toUpperCase();
   const manual = mode === "MANUAL" && ["STARTER", "GROWTH", "PRO", "ELITE", "CUSTOM"].includes(configuredTier);
   const tier = manual ? configuredTier : automaticTierForRevenue(revenue.revenue30dCents);
-  const catalogPrice = TIER_CATALOG[tier]?.priceCents;
-  const corePriceCents = manual
-    ? cents(profile?.corePriceCents, catalogPrice || TIER_CATALOG.STARTER.priceCents)
-    : cents(catalogPrice, TIER_CATALOG.STARTER.priceCents);
+  const corePriceCents = configuredPrices(profile, policy, tier).corePriceCents;
   if (corePriceCents <= 0) throw billingError("Configured creator price is not billable", "BILLING_CORE_PRICE_INVALID");
 
   const aiChatterEnabled = profile?.aiChatterEnabled === true;
   const outreachEnabled = profile?.outreachEnabled === true;
-  const aiChatterPriceCents = aiChatterEnabled ? configuredAddonPrice(profile, "ai") : 0;
-  const outreachPriceCents = outreachEnabled ? configuredAddonPrice(profile, "outreach") : 0;
+  const aiChatterPriceCents = aiChatterEnabled ? configuredAddonPrice(profile, "ai", policy) : 0;
+  const outreachPriceCents = outreachEnabled ? configuredAddonPrice(profile, "outreach", policy) : 0;
   return {
     tier,
     pricingSource: manual ? "ADMIN_OVERRIDE" : "AUTO_30D",
+    commercialPolicyRevision: policy.revision,
     revenue30dCents: revenue.revenue30dCents,
     revenueCapturedAt: revenue.capturedAt,
     revenueSource: revenue.source,
@@ -303,25 +303,26 @@ function pricingFromRevenue({ profile, revenue }) {
   };
 }
 
-function pricingPreviewFromRevenue({ profile, revenue }) {
+function pricingPreviewFromRevenue({ profile, revenue, policy }) {
   const normalized = revenue || { revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false };
   if (normalized.fresh && normalized.revenue30dCents !== null) {
-    return { available: true, errorCode: null, ...pricingFromRevenue({ profile, revenue: normalized }) };
+    return { available: true, errorCode: null, ...pricingFromRevenue({ profile, revenue: normalized, policy }) };
   }
   const mode = String(profile?.tierMode || "AUTO").toUpperCase();
   const configuredTier = String(profile?.tier || "STARTER").toUpperCase();
   const manual = mode === "MANUAL" && ["STARTER", "GROWTH", "PRO", "ELITE", "CUSTOM"].includes(configuredTier);
   const tier = manual ? configuredTier : (normalized.revenue30dCents === null ? null : automaticTierForRevenue(normalized.revenue30dCents));
-  const corePriceCents = tier ? (manual ? cents(profile?.corePriceCents, TIER_CATALOG[tier]?.priceCents || TIER_CATALOG.STARTER.priceCents) : cents(TIER_CATALOG[tier]?.priceCents)) : 0;
+  const corePriceCents = tier ? configuredPrices(profile, policy, tier).corePriceCents : 0;
   const aiChatterEnabled = profile?.aiChatterEnabled === true;
   const outreachEnabled = profile?.outreachEnabled === true;
-  const aiChatterPriceCents = aiChatterEnabled ? configuredAddonPrice(profile, "ai") : 0;
-  const outreachPriceCents = outreachEnabled ? configuredAddonPrice(profile, "outreach") : 0;
+  const aiChatterPriceCents = aiChatterEnabled ? configuredAddonPrice(profile, "ai", policy) : 0;
+  const outreachPriceCents = outreachEnabled ? configuredAddonPrice(profile, "outreach", policy) : 0;
   return {
     available: false,
     errorCode: "BILLING_EARNINGS_30D_UNAVAILABLE",
     tier,
     pricingSource: manual ? "ADMIN_OVERRIDE" : "AUTO_30D",
+    commercialPolicyRevision: policy.revision,
     revenue30dCents: normalized.revenue30dCents,
     revenueCapturedAt: normalized.capturedAt || null,
     revenueSource: normalized.source || "UNAVAILABLE",
@@ -334,11 +335,11 @@ function pricingPreviewFromRevenue({ profile, revenue }) {
   };
 }
 
-function pricingPreviewFromSnapshot({ profile }) {
+function pricingPreviewFromSnapshot({ profile, policy }) {
   // Compatibility export only. Snapshot generations are retired and must not
   // contribute revenue, automatic tier selection, core price, or line total.
   return pricingPreviewFromRevenue({
-    profile,
+    profile, policy,
     revenue: { revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false },
   });
 }
@@ -349,7 +350,7 @@ async function quoteCreatorMonthlyPrice({ db = null, creator, now = new Date() }
   if (creator.deletedAt) throw billingError("Creator is deleted", "BILLING_CREATOR_NOT_FOUND", 404);
   if (creator.billingProfile?.billingExcluded === true) throw billingError("Creator is excluded from billing", "BILLING_CREATOR_EXCLUDED");
   const revenue = await readRolling30dRevenue({ db: client, creatorId: creator.id, now });
-  return pricingPreviewFromRevenue({ profile: creator.billingProfile, revenue });
+  return pricingPreviewFromRevenue({ profile: creator.billingProfile, revenue, policy: await readCommercialPolicy({ db: client }) });
 }
 
 function walletUniqueWhere(agencyId, testMode) {
@@ -593,6 +594,8 @@ async function setCreatorBillingPreferences({ agencyId, creatorId, aiChatterEnab
       aiChatterEnabled: aiChatterEnabled === true,
       outreachEnabled: outreachEnabled === true,
     };
+    const policy = await readCommercialPolicy({ db: tx, lock: true });
+    await enableCommercialPricingWrite(tx);
     const profile = await tx.creatorBillingProfile.upsert({
       where: { creatorId },
       create: {
@@ -600,11 +603,11 @@ async function setCreatorBillingPreferences({ agencyId, creatorId, aiChatterEnab
         creatorId,
         tier: "STARTER",
         tierMode: "AUTO",
-        corePriceCents: TIER_CATALOG.STARTER.priceCents,
+        corePriceCents: policy.settings.starterPriceCents,
         aiChatterEnabled: data.aiChatterEnabled,
-        aiChatterPriceCents: ADDON_CATALOG.aiChatter.priceCents,
+        aiChatterPriceCents: policy.settings.aiChatterPriceCents,
         outreachEnabled: data.outreachEnabled,
-        outreachPriceCents: ADDON_CATALOG.outreach.priceCents,
+        outreachPriceCents: policy.settings.outreachPriceCents,
         billingExcluded: false,
       },
       update: data,
@@ -620,7 +623,9 @@ async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMod
   await assertWalletDebitAllowed(tx, agencyId, testMode);
   const profile = creator.billingProfile || null;
   const revenue = await readRolling30dRevenue({ db: tx, creatorId: creator.id, now });
-  const pricing = pricingFromRevenue({ profile, revenue });
+  const policy = await readCommercialPolicy({ db: tx, lock: true });
+  const pricing = pricingFromRevenue({ profile, revenue, policy });
+  await enableCommercialPricingWrite(tx);
   const wallet = await ensureWallet(tx, agencyId, testMode);
   const balance = bigintCents(wallet.balanceCents);
   const required = BigInt(pricing.totalCents);
@@ -658,6 +663,7 @@ async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMod
       revenue30dCents: pricing.revenue30dCents,
       revenueCapturedAt: pricing.revenueCapturedAt,
       pricingSource: pricing.pricingSource,
+      commercialPolicyRevision: policy.revision,
       corePriceCents: pricing.corePriceCents,
       aiChatterEnabled: pricing.aiChatterEnabled,
       aiChatterPriceCents: pricing.aiChatterPriceCents,
@@ -680,7 +686,7 @@ async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMod
     creatorId: creator.id,
     periodId: period.id,
     description: `${creator.displayName || creator.username || creator.id} · ${pricing.tier} · ${start.toISOString().slice(0, 10)} → ${end.toISOString().slice(0, 10)}`,
-    metadata: { pricingSource: pricing.pricingSource, revenue30dCents: pricing.revenue30dCents, revenueSource: pricing.revenueSource },
+    metadata: { commercialPolicyRevision: policy.revision, pricingSource: pricing.pricingSource, revenue30dCents: pricing.revenue30dCents, revenueSource: pricing.revenueSource },
   });
   await tx.creatorBillingPeriod.update({ where: { id: period.id }, data: { walletTransactionId: debit.transaction.id } });
 
@@ -734,9 +740,9 @@ async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMod
         corePriceCents: pricing.corePriceCents,
         revenue30dCents: pricing.revenue30dCents,
         aiChatterEnabled: pricing.aiChatterEnabled,
-        aiChatterPriceCents: configuredAddonPrice(profile, "ai"),
+        aiChatterPriceCents: configuredAddonPrice(profile, "ai", policy),
         outreachEnabled: pricing.outreachEnabled,
-        outreachPriceCents: configuredAddonPrice(profile, "outreach"),
+        outreachPriceCents: configuredAddonPrice(profile, "outreach", policy),
         billingExcluded: false,
       },
       update: { tier: pricing.tier, tierMode: "AUTO", corePriceCents: pricing.corePriceCents, revenue30dCents: pricing.revenue30dCents },

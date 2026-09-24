@@ -1,11 +1,11 @@
 "use strict";
 
 const TIER_CATALOG = Object.freeze({
-  STARTER: Object.freeze({ key: "STARTER", label: "Starter", priceCents: 2000, revenueLabel: "$0–$1k" }),
-  GROWTH: Object.freeze({ key: "GROWTH", label: "Growth", priceCents: 3000, revenueLabel: "$1k–$5k" }),
-  PRO: Object.freeze({ key: "PRO", label: "Pro", priceCents: 5000, revenueLabel: "$5k–$15k" }),
-  ELITE: Object.freeze({ key: "ELITE", label: "Elite", priceCents: 15000, revenueLabel: "$15k+" }),
-  CUSTOM: Object.freeze({ key: "CUSTOM", label: "Custom", priceCents: null, revenueLabel: "manual" }),
+  STARTER: Object.freeze({ key: "STARTER", label: "Starter", revenueLabel: "$0–$1k" }),
+  GROWTH: Object.freeze({ key: "GROWTH", label: "Growth", revenueLabel: "$1k–$5k" }),
+  PRO: Object.freeze({ key: "PRO", label: "Pro", revenueLabel: "$5k–$15k" }),
+  ELITE: Object.freeze({ key: "ELITE", label: "Elite", revenueLabel: "$15k+" }),
+  CUSTOM: Object.freeze({ key: "CUSTOM", label: "Custom", revenueLabel: "manual" }),
 });
 
 const AUTO_TIER_RULES = Object.freeze([
@@ -16,8 +16,8 @@ const AUTO_TIER_RULES = Object.freeze([
 ]);
 
 const ADDON_CATALOG = Object.freeze({
-  aiChatter: Object.freeze({ key: "AI_CHATTER", label: "AI Chatter", priceCents: 10000 }),
-  outreach: Object.freeze({ key: "OUTREACH", label: "SFS + Comment Bot", priceCents: 2900 }),
+  aiChatter: Object.freeze({ key: "AI_CHATTER", label: "AI Chatter" }),
+  outreach: Object.freeze({ key: "OUTREACH", label: "SFS + Comment Bot" }),
 });
 
 const PERIOD_CATALOG = Object.freeze({
@@ -87,28 +87,46 @@ function automaticTierForRevenue(revenue30dCents) {
   return rule.key;
 }
 
-function catalogForClient() {
+function catalogForPolicy(policy) {
+  if (!policy?.settings || !Number.isInteger(policy.revision)) throw Object.assign(new Error("Billing policy is required"), { code: "BILLING_COMMERCIAL_POLICY_REQUIRED", status: 503 });
+  const settings = policy.settings;
+  const tiers = Object.fromEntries(Object.entries(TIER_CATALOG).map(([key, row]) => [key, { ...row, priceCents: key === "CUSTOM" ? null : settings[key.toLowerCase() + "PriceCents"] }]));
+  const addons = { aiChatter: { ...ADDON_CATALOG.aiChatter, priceCents: settings.aiChatterPriceCents }, outreach: { ...ADDON_CATALOG.outreach, priceCents: settings.outreachPriceCents } };
+  return { tiers, addons };
+}
+
+function configuredPrices(profile, policy, tier = profile?.tier || "STARTER") {
+  const { tiers, addons } = catalogForPolicy(policy);
+  return {
+    corePriceCents: profile?.corePriceOverrideCents ?? tiers[normalizeTier(tier)].priceCents ?? 0,
+    aiChatterPriceCents: profile?.aiChatterPriceOverrideCents ?? addons.aiChatter.priceCents,
+    outreachPriceCents: profile?.outreachPriceOverrideCents ?? addons.outreach.priceCents,
+    corePriceSource: profile?.corePriceOverrideCents != null ? "OVERRIDE" : "CATALOG",
+    aiChatterPriceSource: profile?.aiChatterPriceOverrideCents != null ? "OVERRIDE" : "CATALOG",
+    outreachPriceSource: profile?.outreachPriceOverrideCents != null ? "OVERRIDE" : "CATALOG",
+  };
+}
+
+function catalogForClient(policy) {
+  const { tiers, addons } = catalogForPolicy(policy);
   return {
     automaticPricing: true,
-    tiers: Object.values(TIER_CATALOG).map((row) => {
+    commercialPolicyRevision: policy.revision,
+    trialDays: policy.settings.trialDays,
+    tiers: Object.values(tiers).map((row) => {
       const rule = AUTO_TIER_RULES.find((candidate) => candidate.key === row.key);
       return { ...row, minRevenueCents: rule?.minRevenueCents ?? null, maxRevenueCentsExclusive: rule?.maxRevenueCentsExclusive ?? null, customerSelectable: false };
     }),
     addons: {
-      aiChatter: { ...ADDON_CATALOG.aiChatter },
-      outreach: { ...ADDON_CATALOG.outreach },
+      aiChatter: { ...addons.aiChatter },
+      outreach: { ...addons.outreach },
     },
     periods: [{ ...PERIOD_CATALOG.MONTHLY }],
   };
 }
 
-function positiveCents(value, fallback = 0) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return Math.max(0, Number(fallback || 0));
-  return Math.max(0, Math.min(10_000_000, Math.round(n)));
-}
 
-function priceCreatorSelection({ creator, requested, defaultCorePriceCents = 2000 }) {
+function priceCreatorSelection({ creator, requested, policy }) {
   if (!creator || !requested) throw badRequest("Creator checkout line is missing");
   const profile = creator.billingProfile || null;
   if (profile?.billingExcluded === true) {
@@ -120,27 +138,11 @@ function priceCreatorSelection({ creator, requested, defaultCorePriceCents = 200
   }
 
   const tier = normalizeTier(requested.tier || profile?.tier || "STARTER");
-  let corePriceCents;
-  if (tier === "CUSTOM") {
-    if (String(profile?.tier || "") !== "CUSTOM" || positiveCents(profile?.corePriceCents) <= 0) {
-      const err = new Error("CUSTOM tier is available only when an administrator has configured a custom creator price");
-      err.code = "BILLING_CUSTOM_TIER_NOT_CONFIGURED";
-      err.status = 409;
-      err.permanent = true;
-      throw err;
-    }
-    corePriceCents = positiveCents(profile.corePriceCents);
-  } else if (String(profile?.tier || "") === tier && profile?.corePriceCents != null) {
-    // Preserve an explicit per-creator admin override for the creator's current tier.
-    corePriceCents = positiveCents(profile.corePriceCents, TIER_CATALOG[tier].priceCents);
-  } else if (!profile && tier === "STARTER") {
-    // Preserve the existing agency-wide default for creators that have never had
-    // an explicit CreatorBillingProfile. V13.2 already used this value, and the
-    // Settings preview exposes the same fallback.
-    corePriceCents = positiveCents(defaultCorePriceCents, TIER_CATALOG.STARTER.priceCents);
-  } else {
-    corePriceCents = positiveCents(TIER_CATALOG[tier].priceCents, defaultCorePriceCents);
+  const prices = configuredPrices(profile && profile.tier !== tier ? { ...profile, corePriceOverrideCents: null } : profile, policy, tier);
+  if (tier === "CUSTOM" && (profile?.tier !== "CUSTOM" || profile.corePriceOverrideCents == null)) {
+    throw badRequest("CUSTOM tier requires an explicit administrator price", "BILLING_CUSTOM_TIER_NOT_CONFIGURED");
   }
+  const corePriceCents = prices.corePriceCents;
 
   if (corePriceCents <= 0) {
     const err = new Error("Selected creator tier has no billable core price");
@@ -151,10 +153,10 @@ function priceCreatorSelection({ creator, requested, defaultCorePriceCents = 200
   }
 
   const aiChatterPriceCents = requested.aiChatterEnabled
-    ? positiveCents(profile?.aiChatterPriceCents, ADDON_CATALOG.aiChatter.priceCents)
+    ? prices.aiChatterPriceCents
     : 0;
   const outreachPriceCents = requested.outreachEnabled
-    ? positiveCents(profile?.outreachPriceCents, ADDON_CATALOG.outreach.priceCents)
+    ? prices.outreachPriceCents
     : 0;
   const monthlyCents = corePriceCents + aiChatterPriceCents + outreachPriceCents;
 
@@ -175,6 +177,7 @@ function priceCreatorSelection({ creator, requested, defaultCorePriceCents = 200
 
 module.exports = {
   TIER_CATALOG,
+  catalogForPolicy, configuredPrices,
   AUTO_TIER_RULES,
   ADDON_CATALOG,
   PERIOD_CATALOG,

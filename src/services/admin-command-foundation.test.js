@@ -61,11 +61,11 @@ test("two intents with the same displayed revision cannot both overwrite pricing
   assert.equal(m.state.profiles[0].corePriceCents, 3210);
 });
 test("partial pricing updates preserve other configuration and domain revenue facts", async () => {
-  const m = createMemoryDb(); m.state.profiles[0].corePriceCents = 4999;
+  const m = createMemoryDb(); Object.assign(m.state.profiles[0], { corePriceCents: 4999, corePriceOverrideCents: 4999, tierMode: "MANUAL" });
   const result = await pricing(m.db, { payload: { expectedRevision: 1, reason: "Annotate", notes: "Reviewed" } });
   assert.equal(result.body.billing.corePriceCents, 4999);
   assert.equal(result.body.billing.revenue30dCents, 42);
-  assert.equal(result.body.billing.tierMode, "AUTO");
+  assert.equal(result.body.billing.tierMode, "MANUAL");
 });
 test("pricing validation rejects fractional prices, fact rewrites and conflicting AUTO intent", async () => {
   for (const extra of [{ corePriceCents: 1.2 }, { corePriceCents: "1" }, { revenue30dCents: 1 }, { corePriceCents: -1 }]) {

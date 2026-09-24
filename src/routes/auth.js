@@ -298,6 +298,8 @@ router.post("/register", async (req, res) => {
       // incompatible rolling release it must not become a new authority surface
       // until the old binary has been drained and TEAM_CONTROL_PLANE is ACTIVE.
       await assertTeamControlPlaneWriteAdmission(tx);
+      // phase4_issue_agency_trial issues the current global duration under the
+      // policy row lock using DB time; invitations never create another trial.
       const agency = await tx.agency.create({
         data: {
           name: input.agencyName || "Onlinod Agency",

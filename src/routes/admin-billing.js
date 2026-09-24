@@ -1,4 +1,4 @@
-const { setPricingHandler, bulkPricingHandler, cancelBulkPricingHandler } = require("./admin-command-handlers");
+const { setPricingHandler, bulkPricingHandler, cancelBulkPricingHandler, commercialPolicyHandler } = require("./admin-command-handlers");
 /* src/routes/admin-billing.js — Onlinod billing management
    ────────────────────────────────────────────────────────────
    Proper money view: subscription is on the AGENCY, but priced
@@ -29,8 +29,8 @@ router.use(require("../middleware/admin-read-boundary").adminReadBoundary);
 router.use(adminHttpAuditMiddleware);
 
 // All admin pricing readers and writers use the canonical domain catalog.
-const { TIER_CATALOG: TIERS, ADDON_CATALOG } = require("../services/billing-catalog-service");
-const ADDON_DEFAULTS = { aiChatterPriceCents: ADDON_CATALOG.aiChatter.priceCents, outreachPriceCents: ADDON_CATALOG.outreach.priceCents };
+const { catalogForPolicy, configuredPrices } = require("../services/billing-catalog-service");
+const { readCommercialPolicy } = require("../services/billing-commercial-policy-service");
 
 // Agency statuses that count as paying / billable.
 const BILLABLE_STATUSES = new Set(["ACTIVE", "PAST_DUE", "GRACE"]);
@@ -41,8 +41,9 @@ function sendErr(res, err, code = "ADMIN_BILLING_FAILED") {
 }
 
 // Line total for a single model's billing profile.
-function configuredLineCents(bp) {
-  if (!bp || bp.billingExcluded) return 0;
+function configuredLineCents(profile, policy) {
+  if (profile?.billingExcluded) return 0;
+  const bp = { ...profile, ...configuredPrices(profile, policy) };
   let c = Number(bp.corePriceCents || 0);
   if (bp.aiChatterEnabled) c += Number(bp.aiChatterPriceCents || 0);
   if (bp.outreachEnabled) c += Number(bp.outreachPriceCents || 0);
@@ -58,13 +59,20 @@ function activePaidLineCents(entitlement, now = new Date()) {
   return cents;
 }
 
-router.get("/tiers", (_req, res) => res.json({ ok: true, tiers: TIERS, addons: ADDON_DEFAULTS }));
+router.get("/commercial-policy", async (_req, res) => res.json(await readCommercialPolicy({ db: prisma })));
+router.patch("/commercial-policy", commercialPolicyHandler);
+router.get("/tiers", async (_req, res) => {
+  const policy = await readCommercialPolicy({ db: prisma });
+  const { tiers, addons } = catalogForPolicy(policy);
+  return res.json({ ok: true, tiers, addons: { aiChatterPriceCents: addons.aiChatter.priceCents, outreachPriceCents: addons.outreach.priceCents }, commercialPolicyRevision: policy.revision });
+});
 
 // ════════════════════════════════════════════════════════════════
 // GLOBAL OVERVIEW — real MRR with proper status filtering + rollup
 // ════════════════════════════════════════════════════════════════
 router.get("/overview", async (req, res) => {
   try {
+    const policy = await readCommercialPolicy({ db: prisma });
     // Pull every non-deleted agency with its latest subscription + creators' billing.
     const agencies = await prisma.agency.findMany({
       where: { deletedAt: null },
@@ -107,7 +115,7 @@ router.get("/overview", async (req, res) => {
 
       if (billable) { mrrCents += agencyCents; billedModels += modelsCounted; }
       else if (status === "TRIAL") {
-        trialMrrCents += a.creators.reduce((sum, creator) => sum + configuredLineCents(creator.billingProfile), 0);
+        trialMrrCents += a.creators.reduce((sum, creator) => sum + configuredLineCents(creator.billingProfile, policy), 0);
       }
 
       rows.push({
@@ -155,6 +163,7 @@ router.get("/agency/:id", async (req, res) => {
     });
     if (!agency) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND" });
 
+    const policy = await readCommercialPolicy({ db: prisma });
     const sub = agency.subscriptions[0] || null;
     const status = agency.status || sub?.status || "TRIAL";
 
@@ -166,16 +175,14 @@ router.get("/agency/:id", async (req, res) => {
         username: c.username,
         creatorStatus: c.status,
         tier: bp?.tier || null,
-        tierMode: bp?.tierMode || "MANUAL",
-        corePriceCents: bp ? Number(bp.corePriceCents || 0) : null,
+        tierMode: bp?.tierMode || "AUTO",
+        ...configuredPrices(bp, policy),
         aiChatterEnabled: !!bp?.aiChatterEnabled,
-        aiChatterPriceCents: Number(bp?.aiChatterPriceCents || ADDON_DEFAULTS.aiChatterPriceCents),
         outreachEnabled: !!bp?.outreachEnabled,
-        outreachPriceCents: Number(bp?.outreachPriceCents || ADDON_DEFAULTS.outreachPriceCents),
         billingExcluded: !!bp?.billingExcluded,
         hasProfile: !!bp,
         pricingRevision: bp?.pricingRevision || 0,
-        configuredLineCents: configuredLineCents(bp),
+        configuredLineCents: configuredLineCents(bp, policy),
         activeLineCents: activePaidLineCents(c.billingEntitlement),
         entitlement: publicEntitlement(c.billingEntitlement),
       };
@@ -190,7 +197,8 @@ router.get("/agency/:id", async (req, res) => {
       billable: BILLABLE_STATUSES.has(status),
       models,
       monthlyCents,
-      tiers: TIERS,
+      tiers: catalogForPolicy(policy).tiers,
+      commercialPolicyRevision: policy.revision,
     });
   } catch (err) { return sendErr(res, err); }
 });

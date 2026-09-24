@@ -1,4 +1,5 @@
 "use strict";
+const { enableCommercialPricingWrite } = require("./billing-commercial-policy-service");
 
 const prisma = require("../prisma");
 
@@ -298,6 +299,7 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
 
       // The billing profile is configuration/defaults for the next order. Access
       // itself is decided by CreatorBillingEntitlement dates, not these booleans.
+      await enableCommercialPricingWrite(tx);
       await tx.creatorBillingProfile.upsert({
         where: { creatorId: line.creatorId },
         create: {
@@ -305,6 +307,7 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
           creatorId: line.creatorId,
           tier: line.tier,
           tierMode: line.tier === "CUSTOM" ? "MANUAL" : "AUTO",
+          corePriceOverrideCents: line.tier === "CUSTOM" ? line.corePriceCents : null,
           corePriceCents: line.corePriceCents,
           aiChatterEnabled: line.aiChatterEnabled === true,
           aiChatterPriceCents: line.aiChatterPriceCents,
@@ -312,15 +315,9 @@ async function activatePaidOrderEntitlements({ orderId, sandboxActivationEnabled
           outreachPriceCents: line.outreachPriceCents,
           billingExcluded: false,
         },
-        update: {
-          tier: line.tier,
-          tierMode: line.tier === "CUSTOM" ? "MANUAL" : "AUTO",
-          corePriceCents: line.corePriceCents,
-          aiChatterEnabled: line.aiChatterEnabled === true,
-          aiChatterPriceCents: line.aiChatterPriceCents,
-          outreachEnabled: line.outreachEnabled === true,
-          outreachPriceCents: line.outreachPriceCents,
-        },
+        // The paid line is historical fact, not current pricing configuration.
+        // In particular it must not replace a later admin price or preference.
+        update: {},
       });
 
       await tx.billingOrderLine.update({
@@ -474,7 +471,7 @@ async function syncAgencyBillingAggregate(tx, agencyId, now = new Date(), { paym
   let status;
   if (agency.deletedAt || agency.billingSupportHold) status = "LOCKED";
   else if (maxEnd || billingMode === "FREE_INTERNAL") status = "ACTIVE";
-  else if (isFuture(agency.trialEndsAt, now) || (!agency.trialEndsAt && agency.status === "TRIAL")) status = "TRIAL";
+  else if (isFuture(agency.trialEndsAt, now)) status = "TRIAL";
   else if (subscription?.status === "CANCELLED") status = "CANCELLED";
   else status = "PAST_DUE";
   // Paid validity is a projection of live creator facts, even while held/free.

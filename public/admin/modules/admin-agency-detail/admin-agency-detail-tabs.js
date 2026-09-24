@@ -221,8 +221,8 @@
           </div>
 
           <div class="adm-field">
-            <label>core price per creator (cents)</label>
-            <input class="adm-input mono" id="admSubCore" type="number" min="0" value="${r.escapeAttr(String(sub?.corePricePerCreatorCents ?? 2000))}">
+            <label>Prices</label>
+            <div class="adm-muted">Managed in Billing: global catalog and explicit model overrides.</div>
           </div>
           <div class="adm-field">
             <label>trial ends at (ISO)</label>
@@ -266,7 +266,6 @@
 
     save.addEventListener("click", async () => {
       const plan      = main.querySelector("#admSubPlan").value.trim();
-      const coreRaw   = main.querySelector("#admSubCore").value.trim();
       const trialRaw  = main.querySelector("#admSubTrial").value.trim();
       const reason    = main.querySelector("#admSubReason").value.trim();
 
@@ -275,7 +274,6 @@
         expectedRevision: slice.data.agency.billingPolicyRevision,
         billingMode: main.querySelector("#admSubMode").value,
         billingPeriod: main.querySelector("#admSubBillingPeriod").value,
-        corePricePerCreatorCents: coreRaw ? Number(coreRaw) : undefined,
         trialEndsAt: trialRaw || null,
         reason: reason || undefined,
       };

@@ -257,6 +257,9 @@ model Agency {
   name             String
   plan             String    @default("trial")
   status           String    @default("TRIAL")
+  trialGrantedAt   DateTime?
+  trialGrantedDays Int?
+  trialPolicyRevision Int?
   trialEndsAt      DateTime?
   currentPeriodEnd DateTime?
   deletedAt        DateTime?
@@ -1440,6 +1443,9 @@ model AgencySubscription {
 }
 
 model CreatorBillingProfile {
+  corePriceOverrideCents Int?
+  aiChatterPriceOverrideCents Int?
+  outreachPriceOverrideCents Int?
   pricingRevision Int @default(1)
   id        String @id @default(cuid())
   agencyId  String
@@ -1648,6 +1654,7 @@ model BillingWalletTransaction {
 }
 
 model CreatorBillingPeriod {
+  commercialPolicyRevision Int?
   id                  String                     @id @default(cuid())
   agencyId            String
   creatorId           String
