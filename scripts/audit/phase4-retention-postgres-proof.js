@@ -17,11 +17,11 @@ async function main(){
  const baseline=fs.mkdtempSync(path.join(os.tmpdir(),"onlinod-retention-proof-"));
  fs.mkdirSync(path.join(baseline,"prisma"));
  fs.copyFileSync(path.join(root,"prisma/schema.prisma"),path.join(baseline,"prisma/schema.prisma"));
- fs.cpSync(path.join(root,"prisma/migrations"),path.join(baseline,"prisma/migrations"),{recursive:true,filter:p=>path.basename(p)!==migrationName});
+ require("./migration-proof-baseline").copyHistoricalMigrationPrefix(path.join(root,"prisma/migrations"),path.join(baseline,"prisma/migrations"),migrationName);
  const migrate=(schema)=>new Promise((resolve,reject)=>{
   const child=spawn(process.execPath,[path.join(root,"node_modules/prisma/build/index.js"),"migrate","deploy","--schema",schema],{cwd:root,env:{...process.env,DATABASE_URL:url},stdio:["ignore","pipe","pipe"]});
   let output="";child.stdout.on("data",b=>output+=b);child.stderr.on("data",b=>output+=b);
-  child.once("error",reject);child.once("close",code=>{if(code===0){console.log(JSON.stringify({migration:true,schema: schema.includes(baseline)?"baseline255":"current256",ok:true}));resolve();}else reject(new Error(output));});
+  child.once("error",reject);child.once("close",code=>{if(code===0){console.log(JSON.stringify({migration:true,schema: schema.includes(baseline)?"historical-prefix":"current-forward-chain",ok:true}));resolve();}else reject(new Error(output));});
  });
  let db;
  const passed=[];

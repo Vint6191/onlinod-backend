@@ -130,7 +130,7 @@
 
   // ── HEALTH (anomalies) ──────────────────────────────────────
   async function renderHealth(body) {
-    body.innerHTML = `<div class="adm-loading">scanning…</div>`;
+    body.innerHTML = `<div class="adm-loading">loading diagnostic results…</div>`;
     const r = await A().dataAnomalies();
     if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">failed to load anomalies</div>`; return; }
 
@@ -146,7 +146,7 @@
 
     body.innerHTML = `
       <div class="adm-anomaly-grid">${cards}</div>
-      <div class="adm-muted" style="margin-top:12px">checked ${esc(fmtDate(r.checkedAt))}</div>`;
+      <div class="adm-muted" style="margin-top:12px">${r.checkedAt ? `Observed ${esc(fmtDate(r.coverage?.observationFrom))} — ${esc(fmtDate(r.checkedAt))}` : 'Initial diagnostic pass is in progress'} · ${esc(r.coverage?.status || 'UNKNOWN')}<br>Rolling observation; changes during a pass are revisited on the next pass. ${r.coverage?.rebuilding ? `Next pass: ${esc(r.coverage.progressRows)} rows checked.` : ''}</div>`;
 
     body.insertAdjacentHTML("beforeend", '<p class="adm-muted">Inspect anomalies before acting. Stuck work uses its recovery flow. Terminal archival is available in Browse for one agency and creator.</p>');
   }

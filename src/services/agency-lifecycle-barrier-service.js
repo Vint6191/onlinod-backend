@@ -22,12 +22,10 @@ async function lockAgencyLifecycleBarrier({ db, agencyId, mode = "shared" }) {
   const key = agencyLifecycleBarrierKey(id);
   const normalizedMode = String(mode || "shared").toLowerCase() === "exclusive" ? "exclusive" : "shared";
 
-  // Canonical lifecycle coordination is the advisory RW barrier. The immediately
-  // previous Phase2 generation already acquired this same advisory key before touching
-  // the Agency row, so normal shared work no longer needs a compatibility FOR SHARE.
-  // This is the final scale cutover: unrelated billing/business updates to Agency must
-  // not serialize ordinary Custom/Team/provider work. Destructive lifecycle mutations
-  // may still lock the exact Agency row because they actually mutate that row.
+  // Lifecycle coordination is the advisory RW barrier. Product requests also
+  // acquire the billing read barrier before creator/member/business locks.
+  // Read holders stay concurrent; billing changes wait for admitted commits.
+  // Control and durable settlement paths retain their independent contracts.
   if (typeof db?.$executeRawUnsafe === "function") {
     await lockDbAdvisoryXact({ db, key, mode: normalizedMode });
   }
@@ -35,8 +33,11 @@ async function lockAgencyLifecycleBarrier({ db, agencyId, mode = "shared" }) {
   let row = null;
   if (typeof db?.$queryRawUnsafe === "function") {
     const rowLock = normalizedMode === "exclusive" ? " FOR UPDATE" : "";
+    // Product requests also coordinate with billing writers. Shared row holders
+    // remain concurrent across creators; control/settlement paths keep the RW barrier.
+    const billingLock = !rowLock && require("./product-billing-context-service").inProductBilling(id) ? " FOR SHARE" : "";
     const rows = await db.$queryRawUnsafe(
-      `SELECT "id", "deletedAt", "status" FROM "Agency" WHERE "id" = $1${rowLock}`,
+      `SELECT "id", "deletedAt", "status" FROM "Agency" WHERE "id" = $1${rowLock}${billingLock}`,
       id,
     );
     row = Array.isArray(rows) ? rows[0] || null : null;

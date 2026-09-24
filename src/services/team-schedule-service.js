@@ -4,7 +4,7 @@ const prisma = require("../prisma");
 const { resolveRange, rangeForClient } = require("./range-service");
 const { audit } = require("./audit-service");
 const { normalizeAssignedCreators } = require("./team-access-control");
-const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
 const { getRetentionSettings } = require("./retention-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { retainedDetailFrom, latestAvailableFrom, clampRangeToAvailableFrom, coverageState } = require("./team-historical-range-authority-service");
@@ -57,13 +57,13 @@ function validateShiftWindow(startsAtValue, endsAtValue) {
 
 function creatorScopeWhere(allowedCreatorIds) {
   if (!Array.isArray(allowedCreatorIds)) return {};
-  const ids = uniqueIds(allowedCreatorIds, 10000);
+  const ids = uniqueIds(allowedCreatorIds, Infinity);
   return { creatorId: { in: ids.length ? ids : ["__none__"] } };
 }
 
 function creatorAllowed(creatorId, allowedCreatorIds) {
   if (!Array.isArray(allowedCreatorIds)) return true;
-  return new Set(uniqueIds(allowedCreatorIds, 10000)).has(String(creatorId));
+  return new Set(uniqueIds(allowedCreatorIds, Infinity)).has(String(creatorId));
 }
 
 async function findAllById(model, args = {}, pageSize = 5000) {
@@ -195,7 +195,8 @@ async function loadWorkspaceTimezone(agencyId, db = prisma) {
 }
 
 async function loadScheduleContext({ agencyId, allowedCreatorIds = null, canManageSchedule = false, db = prisma }) {
-  const creatorWhere = { agencyId, deletedAt: null, ...creatorScopeWhere(allowedCreatorIds) };
+  const creatorWhere = { agencyId, deletedAt: null,
+    ...(Array.isArray(allowedCreatorIds) ? { id: { in: uniqueIds(allowedCreatorIds, Infinity) } } : {}) };
   const [timezone, creators, members] = await Promise.all([
     loadWorkspaceTimezone(agencyId, db),
     findAllById(db.creatorAccount, {
@@ -211,7 +212,7 @@ async function loadScheduleContext({ agencyId, allowedCreatorIds = null, canMana
       },
     }),
   ]);
-  const actorScope = Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, 10000) : null;
+  const actorScope = Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, Infinity) : null;
   const safeMembers = members.map((row) => {
     const targetScope = normalizeAssignedScope(row.assignedCreators);
     const visibleScope = intersectScope(targetScope, actorScope);
@@ -222,7 +223,7 @@ async function loadScheduleContext({ agencyId, allowedCreatorIds = null, canMana
       functions: (row.teamFunctions || []).map((item) => String(item.functionKey)),
       // Never disclose creator ids outside the acting member's own scope. "all"
       // is only safe when the acting member is also unscoped.
-      assignedCreators: visibleScope == null ? "all" : uniqueIds(visibleScope, 10000),
+      assignedCreators: visibleScope == null ? "all" : uniqueIds(visibleScope, Infinity),
     };
   });
   return {
@@ -247,7 +248,7 @@ function plannedShiftWhere(range, allowedCreatorIds) {
   // represented by creatorRefId *and* a live Creator relation. The explicit
   // relation predicate is defensive against pre-cutover soft-retirement rows.
   if (Array.isArray(allowedCreatorIds)) {
-    const ids = uniqueIds(allowedCreatorIds, 10000);
+    const ids = uniqueIds(allowedCreatorIds, Infinity);
     where.creators = { some: { creatorRefId: { in: ids.length ? ids : ["__none__"] }, creator: { is: { deletedAt: null } } } };
   } else {
     where.creators = { some: { creatorRefId: { not: null }, creator: { is: { deletedAt: null } } } };
@@ -373,7 +374,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
   const queryRange = retainedRange || { ...range, startAt: new Date(0), endAt: new Date(0) };
   const scheduleCoverage = { ...coverageState(range, detailAvailableFrom), source: "bounded_team_schedule_detail_v1" };
   const nowMs = authorityNow.getTime();
-  const scopedCreatorIds = Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, 10000) : null;
+  const scopedCreatorIds = Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, Infinity) : null;
   const includeCreatorWhere = Array.isArray(scopedCreatorIds)
     ? {
         where: { creatorRefId: { in: scopedCreatorIds.length ? scopedCreatorIds : ["__none__"] }, creator: { is: { deletedAt: null } } },
@@ -393,7 +394,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
       range: rangeForClient(range),
       retainedRange: retainedRange ? rangeForClient(retainedRange) : null,
       historicalCoverage: scheduleCoverage,
-      creatorScope: Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, 10000) : "all",
+      creatorScope: Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, Infinity) : "all",
       context,
       summary: scaled.summary,
       shifts: scaled.shifts,
@@ -596,7 +597,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
     range: rangeForClient(range),
     retainedRange: retainedRange ? rangeForClient(retainedRange) : null,
     historicalCoverage: scheduleCoverage,
-    creatorScope: Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, 10000) : "all",
+    creatorScope: Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, Infinity) : "all",
     context,
     summary: {
       plannedShifts: nonCancelled.length,
@@ -632,7 +633,7 @@ async function assertShiftTargets({ agencyId, memberId, creatorIds, actorAllowed
   if (!ids.length) throw error("TEAM_SCHEDULE_CREATORS_REQUIRED", "At least one creator is required");
 
   if (Array.isArray(actorAllowedCreatorIds)) {
-    const allowed = new Set(uniqueIds(actorAllowedCreatorIds, 10000));
+    const allowed = new Set(uniqueIds(actorAllowedCreatorIds, Infinity));
     const forbidden = ids.filter((id) => !allowed.has(id));
     if (forbidden.length) throw error("TEAM_SCHEDULE_CREATOR_FORBIDDEN", "Creator is outside your assigned scope", 403, { creatorIds: forbidden });
   }
@@ -666,6 +667,12 @@ function actorFence(actorMember, actorMemberId, actorUserId) {
 function liveActorCreatorScope(member) {
   const scope = normalizeAssignedCreators(member?.assignedCreators);
   return scope.mode === "all" ? null : scope.creatorIds;
+}
+
+function intersectCreatorScopes(current, admitted) {
+  if (!Array.isArray(admitted)) return current;
+  const allowed = new Set(admitted.map(String));
+  return Array.isArray(current) ? current.filter(id => allowed.has(String(id))) : [...allowed];
 }
 
 function requiredRevision(value) {
@@ -705,8 +712,9 @@ async function createTeamShift({ agencyId, actorUserId, actorMemberId, actorMemb
     });
     const targets = await assertShiftTargets({
       agencyId, memberId: input?.memberId, creatorIds: requestedCreatorIds,
-      actorAllowedCreatorIds: liveActorCreatorScope(commit.member), db: tx,
+      actorAllowedCreatorIds: intersectCreatorScopes(liveActorCreatorScope(commit.member), actorAllowedCreatorIds), db: tx,
     });
+    await require("./product-billing-context-service").assertProductBillingTargets({ db: tx, agencyId, creatorIds: targets.creatorIds });
     return tx.teamShift.create({
       data: {
         agencyId, memberId: targets.member.id, startsAt: window.startsAt, endsAt: window.endsAt, timezone,
@@ -728,6 +736,15 @@ async function updateTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, 
   const expected = requiredRevision(expectedRevision);
   const admittedActor = actorFence(actorMember, actorMemberId, actorUserId);
   const mutation = await db.$transaction(async (tx) => {
+    await lockAgencyLifecycle({ tx, agencyId });
+    if (require("./product-billing-context-service").inProductBilling(agencyId)) {
+      const observed = await tx.teamShift.findFirst({ where: { id, agencyId }, include: { creators: true } });
+      if (!observed) throw error("TEAM_SCHEDULE_SHIFT_NOT_FOUND", "Shift was not found", 404);
+      const prefixIds = uniqueIds([...(observed.creators || []).map(row => row.creatorRefId).filter(Boolean),
+        ...(typeof input !== "undefined" && Array.isArray(input?.creatorIds) ? input.creatorIds : [])], Infinity);
+      await assertManagementCommitAuthority({ tx, agencyId, actorMember: admittedActor,
+        permissionKey: "workspace.manage_schedule", creatorIds: prefixIds, agencyAlreadyLocked: true });
+    }
     const existing = await lockShiftForUpdate({ tx, agencyId, shiftId: id });
     const currentRevision = Number(existing.revision || 1);
     if (currentRevision !== expected) {
@@ -747,8 +764,9 @@ async function updateTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, 
     });
     const targets = await assertShiftTargets({
       agencyId, memberId, creatorIds: requestedCreatorIds,
-      actorAllowedCreatorIds: liveActorCreatorScope(commit.member), db: tx,
+      actorAllowedCreatorIds: intersectCreatorScopes(liveActorCreatorScope(commit.member), actorAllowedCreatorIds), db: tx,
     });
+    await require("./product-billing-context-service").assertProductBillingTargets({ db: tx, agencyId, creatorIds: [...new Set([...requestedCreatorIds, ...existing.creators.map(row => row.creatorRefId).filter(Boolean)])] });
     await tx.teamShiftCreator.deleteMany({ where: { shiftId: id } });
     if (targets.creatorIds.length) {
       await tx.teamShiftCreator.createMany({ data: targets.creatorIds.map((creatorId) => ({ shiftId: id, creatorId, creatorRefId: creatorId })), skipDuplicates: true });
@@ -777,6 +795,14 @@ async function cancelTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, 
   const cancellationReason = clean(reason, 500);
   const now = new Date();
   const mutation = await db.$transaction(async (tx) => {
+    await lockAgencyLifecycle({ tx, agencyId });
+    if (require("./product-billing-context-service").inProductBilling(agencyId)) {
+      const observed = await tx.teamShift.findFirst({ where: { id, agencyId }, include: { creators: true } });
+      if (!observed) throw error("TEAM_SCHEDULE_SHIFT_NOT_FOUND", "Shift was not found", 404);
+      const prefixIds = uniqueIds((observed.creators || []).map(row => row.creatorRefId).filter(Boolean), Infinity);
+      await assertManagementCommitAuthority({ tx, agencyId, actorMember: admittedActor,
+        permissionKey: "workspace.manage_schedule", creatorIds: prefixIds, agencyAlreadyLocked: true });
+    }
     const existing = await lockShiftForUpdate({ tx, agencyId, shiftId: id });
     const currentRevision = Number(existing.revision || 1);
     if (currentRevision !== expected) {
@@ -787,6 +813,7 @@ async function cancelTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, 
     await assertManagementCommitAuthority({
       tx, agencyId, actorMember: admittedActor, permissionKey: "workspace.manage_schedule", creatorIds,
     });
+    await require("./product-billing-context-service").assertProductBillingTargets({ db: tx, agencyId, creatorIds });
     const updated = await tx.teamShift.update({
       where: { id },
       data: { status: "CANCELLED", cancelledAt: now, cancelledByUserId: actorUserId || null, updatedByUserId: actorUserId || null, revision: { increment: 1 } },

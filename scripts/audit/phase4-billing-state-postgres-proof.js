@@ -18,7 +18,7 @@ async function main() {
   const baseline = fs.mkdtempSync(path.join(os.tmpdir(), "onlinod-billing-state-proof-"));
   fs.mkdirSync(path.join(baseline, "prisma"));
   fs.copyFileSync(path.join(root, "prisma/schema.prisma"), path.join(baseline, "prisma/schema.prisma"));
-  fs.cpSync(path.join(root, "prisma/migrations"), path.join(baseline, "prisma/migrations"), { recursive: true, filter: p => path.basename(p) !== migrationName });
+  require("./migration-proof-baseline").copyHistoricalMigrationPrefix(path.join(root,"prisma/migrations"),path.join(baseline,"prisma/migrations"),migrationName);
   const migrate = schema => new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(root, "node_modules/prisma/build/index.js"), "migrate", "deploy", "--schema", schema], { cwd: root, env: { ...process.env, DATABASE_URL: url }, stdio: ["ignore", "pipe", "pipe"] });
     let output = ""; child.stdout.on("data", b => output += b); child.stderr.on("data", b => output += b);

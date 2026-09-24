@@ -365,8 +365,10 @@ const httpServer = app.listen(port, () => {
 });
 
 startRecurringScheduler();
+const stopAdminDiagnostics = require("./services/admin-diagnostics-service").startAdminDiagnostics({ db: prisma, log: logger });
 
 async function gracefulShutdown(signal) {
+  stopAdminDiagnostics();
   logger.info("shutdown requested", { signal });
   httpServer.close(async () => {
     try {

@@ -376,72 +376,7 @@ router.get("/search", async (req, res) => {
 // ════════════════════════════════════════════════════════════════
 router.get("/anomalies", async (req, res) => {
   try {
-    const out = [];
-
-    // 1) Duplicate deliveries: same (creatorId, messageId) appearing more than once.
-    const dupes = await prisma.$queryRawUnsafe(`
-      SELECT "creatorId", "messageId", COUNT(*)::int AS n
-      FROM "AutomationDelivery"
-      WHERE "messageId" IS NOT NULL
-      GROUP BY "creatorId", "messageId"
-      HAVING COUNT(*) > 1
-      ORDER BY n DESC
-      LIMIT 50
-    `);
-    const dupeTotal = dupes.reduce((s, r) => s + (r.n - 1), 0);
-    out.push({
-      key: "delivery_clones",
-      level: dupeTotal > 0 ? "warn" : "ok",
-      title: "Duplicate bump deliveries",
-      detail: dupeTotal > 0 ? `${dupeTotal} clone rows across ${dupes.length} (creator, messageId) groups` : "No duplicate deliveries",
-      count: dupeTotal,
-      sample: dupes.slice(0, 10),
-    });
-
-    // 2) Stuck bumps: pending_reply / checking_reply older than 3 days.
-    const cutoff = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
-    const stuck = await prisma.automationDelivery.count({
-      where: { status: { in: ["pending_reply", "checking_reply"] }, OR: [{ sentAt: { lt: cutoff } }, { sentAt: null, createdAt: { lt: cutoff } }] },
-    });
-    out.push({
-      key: "stuck_bumps",
-      level: stuck > 0 ? "warn" : "ok",
-      title: "Stuck bumps (>3d, unresolved)",
-      detail: stuck > 0 ? `${stuck} deliveries stuck in pending/checking` : "No stuck bumps",
-      count: stuck,
-    });
-
-    // 3) CRM profiles with zero tags (never analyzed / empty).
-    const untagged = await prisma.crmProfile.count({ where: { tags: { none: {} } } });
-    out.push({
-      key: "untagged_profiles",
-      level: "info",
-      title: "CRM profiles without tags",
-      detail: `${untagged} profiles have no tags yet`,
-      count: untagged,
-    });
-
-    // 4) Raw tags needing review (unmapped fetish labels).
-    const needsReview = await prisma.crmProfileRawTag.count({ where: { status: "needs_review" } });
-    out.push({
-      key: "raw_tags_review",
-      level: needsReview > 0 ? "info" : "ok",
-      title: "Raw tags needing review",
-      detail: `${needsReview} raw fetish labels not yet mapped`,
-      count: needsReview,
-    });
-
-    // 5) Orphan-ish: deliveries with null messageId still in flight.
-    const noMsg = await prisma.automationDelivery.count({ where: { messageId: null, status: { in: ["pending_reply", "checking_reply", "sent"] } } });
-    out.push({
-      key: "deliveries_no_messageid",
-      level: noMsg > 0 ? "warn" : "ok",
-      title: "In-flight deliveries without messageId",
-      detail: noMsg > 0 ? `${noMsg} can never be canceled (no messageId)` : "None",
-      count: noMsg,
-    });
-
-    return res.json({ ok: true, anomalies: out, checkedAt: new Date().toISOString() });
+    return res.json(await require("../services/admin-diagnostics-service").readDiagnostics({ db: prisma }));
   } catch (err) { return sendErr(res, err); }
 });
 

@@ -27,4 +27,26 @@ async function productBillingScope({ db, agencyId, scope }) {
     ORDER BY c."id"`, agencyId, scope.broad === true, scope.creatorIds || []);
   return { ...scope, broad: false, creatorIds: rows.map(row => row.id) };
 }
-module.exports = { withProductBilling, inProductBilling, assertProductBilling, productBillingScope };
+// Re-read the canonical facts using DB time after authority/business lock waits.
+async function assertProductBillingTargets({ db, agencyId, creatorIds }) {
+  if (!inProductBilling(agencyId)) return;
+  const { readBillingExecutionAccess, BillingExecutionAccessError } = require("./billing-execution-access-service");
+  const ids = [...new Set((creatorIds || []).map(String).filter(Boolean))];
+  if (!ids.length) throw new BillingExecutionAccessError("PRODUCT_CREATOR_SCOPE_REQUIRED", "Product command requires an explicit creator scope", 403);
+  // Serializable callers may have opened their MVCC snapshot before waiting
+  // for Agency billing authority. Lock existing fact rows to reject a stale
+  // snapshot (40001) instead of accepting a grant revoked during that wait.
+  // Missing grants fail closed. Billing writers own Agency first, so these
+  // read locks cannot invert with a compliant entitlement/policy mutation.
+  await db.$queryRawUnsafe('SELECT "id" FROM "AgencySubscription" WHERE "agencyId"=$1 ORDER BY "createdAt" DESC,"id" DESC LIMIT 1 FOR SHARE', agencyId);
+  for (let offset=0;offset<ids.length;offset+=500) {
+    await db.$queryRawUnsafe('SELECT "id" FROM "CreatorBillingEntitlement" WHERE "agencyId"=$1 AND "creatorId"=ANY($2::text[]) ORDER BY "creatorId" FOR SHARE', agencyId, ids.slice(offset,offset+500));
+  }
+  const states = await readBillingExecutionAccess({ db, agencyId, creatorIds: ids });
+  for (const id of ids) {
+    const state = states.get(id);
+    if (!state) throw new BillingExecutionAccessError("BILLING_CREATOR_NOT_FOUND", "Creator is outside the live agency scope", 404);
+    if (!state.allowed) throw new BillingExecutionAccessError(state.reason, "Active creator access is required", state.recoverable ? 402 : 403);
+  }
+}
+module.exports = { assertProductBillingTargets, withProductBilling, inProductBilling, assertProductBilling, productBillingScope };

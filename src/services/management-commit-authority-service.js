@@ -130,6 +130,8 @@ async function assertManagementCommitAuthority({
     throw fail("MANAGEMENT_CREATOR_SCOPE_REVOKED", "Creator access changed while this request was in flight", 403, { creatorIds: denied });
   }
 
+  if (targets.length) await require("./product-billing-context-service").assertProductBillingTargets({ db: tx, agencyId, creatorIds: targets });
+
   return {
     member,
     accessEpoch: epoch(member.accessEpoch),

@@ -1,7 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
-const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
 const { resolveHistoricalAttributionTarget } = require("./historical-attribution-target-authority-service");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { reconcileMoneyForSentMessageEvidence } = require("./team-money-reconciliation-service");
@@ -618,6 +618,12 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
   }
 
   const outcome = await prisma.$transaction(async (tx) => {
+    await lockAgencyLifecycle({ tx, agencyId });
+    if (require("./product-billing-context-service").inProductBilling(agencyId)) {
+      const observed = await tx.$queryRawUnsafe('SELECT "creatorId" FROM "TeamPpvResolveJob" WHERE "agencyId"=$1 AND "id"=$2 LIMIT 1', agencyId, safeJobId);
+      if (observed[0]?.creatorId) await assertManagementCommitAuthority({ tx, agencyId, actorMember: admittedActor,
+        creatorIds: [observed[0].creatorId], agencyAlreadyLocked: true });
+    }
     const job = await findPpvResolveJobForUpdate(tx, { agencyId, jobId: safeJobId });
     if (!job) return "skipped";
     try {
@@ -630,6 +636,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
       throw authorityError;
     }
 
+    if (Array.isArray(allowedCreatorIds) && !allowedCreatorIds.includes(job.creatorId)) return "creator_forbidden";
     const purchaseBefore = await findPpvPurchaseForUpdate(tx, { agencyId, purchaseId: job.purchaseId });
 
     let selectedMember = null;
@@ -660,6 +667,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
       safeMemberId ? { memberId: safeMemberId, source: "manual_selected" } : null
     );
 
+    await require("./product-billing-context-service").assertProductBillingTargets({ db: tx, agencyId, creatorIds: [job.creatorId].filter(Boolean) });
     if (finalAction === "reopen") {
       await tx.teamPpvPurchaseLedger.upsert({
         where: { agencyId_purchaseId: { agencyId, purchaseId: job.purchaseId } },

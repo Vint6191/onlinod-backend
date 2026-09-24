@@ -1,7 +1,7 @@
 "use strict";
 
 const prisma = require("../prisma");
-const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
+const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
 const { resolveHistoricalAttributionTarget } = require("./historical-attribution-target-authority-service");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 const { classifySentSource } = require("./team-money-reconciliation-service");
@@ -477,6 +477,12 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = 
     : { id: byMemberId || null, userId: byUserId || null, accessEpoch: actorMember?.accessEpoch ?? null };
 
   const outcome = await prisma.$transaction(async (tx) => {
+    await lockAgencyLifecycle({ tx, agencyId });
+    if (require("./product-billing-context-service").inProductBilling(agencyId)) {
+      const observed = await tx.$queryRawUnsafe('SELECT "creatorId" FROM "TeamTipLedger" WHERE "agencyId"=$1 AND "eventHash"=$2 LIMIT 1', agencyId, safeHash);
+      if (observed[0]?.creatorId) await assertManagementCommitAuthority({ tx, agencyId, actorMember: admittedActor,
+        creatorIds: [observed[0].creatorId], agencyAlreadyLocked: true });
+    }
     const row = await findTipLedgerForUpdate(tx, { agencyId, eventHash: safeHash });
     if (!row) return { code: "TIP_NOT_FOUND" };
     const permissionKey = cleanAction === "manager_override"
@@ -494,6 +500,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = 
       }
       throw authorityError;
     }
+    if (Array.isArray(allowedCreatorIds) && !allowedCreatorIds.includes(row.creatorId)) return { code: "CREATOR_ACCESS_FORBIDDEN" };
     const actor = commit.member;
     if (!financiallyActive(row)) return { code: "TIP_FINANCIAL_REVERSED", error: "This tip was reversed in the financial ledger" };
     const migrationReview = isLegacyMigrationReviewRow(row);
@@ -585,6 +592,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = 
       });
     }
 
+    await require("./product-billing-context-service").assertProductBillingTargets({ db: tx, agencyId, creatorIds: [row.creatorId].filter(Boolean) });
     const updated = await tx.teamTipLedger.update({
       where: { id: row.id },
       data: {

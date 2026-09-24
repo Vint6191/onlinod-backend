@@ -79,11 +79,11 @@ async function createPhase3PostgresActorFixture(db, prefix) {
   const userId = `${id}-user`;
   const memberId = `${id}-member`;
   return withPhase3PostgresFixtureAuthority(db, async (tx) => {
-    await tx.agency.create({ data: { id: agencyId, name: `Phase3 ${id}` } });
-    await tx.user.create({ data: { id: userId, email: `${userId}@example.test`, passwordHash: "integration" } });
+    await tx.agency.create({ data: { id: agencyId, name: `Phase3 ${id}` }, select: { id: true } });
+    await tx.user.create({ data: { id: userId, email: `${userId}@example.test`, passwordHash: "integration" }, select: { id: true } });
     const member = await tx.agencyMember.create({ data: {
       id: memberId, agencyId, userId, role: "OWNER", roleKey: "owner",
-    } });
+    }, select: { id: true, accessEpoch: true } });
     const accessEpoch = Number(member.accessEpoch);
     if (!Number.isSafeInteger(accessEpoch) || accessEpoch < 1) {
       throw Object.assign(new Error("Phase3 actor fixture has no persisted access epoch"), { code: "PHASE3_POSTGRES_FIXTURE_ACCESS_EPOCH_REQUIRED" });
