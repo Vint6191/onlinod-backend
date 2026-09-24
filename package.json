@@ -11,7 +11,7 @@
     "dev": "node src/server.js",
     "start": "node src/server.js",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "node scripts/database/phase4-execution-indexes-online-preflight.js && node scripts/database/phase4-single-owner-preflight.js && node scripts/database/phase3-analytics-legacy-snapshot-online-preflight.js && node scripts/database/phase3-fandata-delivery-provenance-online-preflight.js && node scripts/database/phase3-campaign-coverage-generation-online-preflight.js && node scripts/database/phase3-a29-maintenance-check-online-preflight.js && node scripts/database/phase3-domain-work-claim-online-rollout.js --preflight && prisma migrate deploy && node scripts/database/phase3-domain-work-claim-online-rollout.js --activate && node scripts/database/phase3-subscriber-publication-schema-online-postflight.js && node scripts/database/phase3-analytics-legacy-snapshot-online-postflight.js && node scripts/database/actual60-refreshsession-online-index-preflight.js",
+    "prisma:migrate": "node scripts/database/phase5-notification-history-indexes-online-preflight.js && node scripts/database/phase4-execution-indexes-online-preflight.js && node scripts/database/phase4-single-owner-preflight.js && node scripts/database/phase3-analytics-legacy-snapshot-online-preflight.js && node scripts/database/phase3-fandata-delivery-provenance-online-preflight.js && node scripts/database/phase3-campaign-coverage-generation-online-preflight.js && node scripts/database/phase3-a29-maintenance-check-online-preflight.js && node scripts/database/phase3-domain-work-claim-online-rollout.js --preflight && prisma migrate deploy && node scripts/database/phase3-domain-work-claim-online-rollout.js --activate && node scripts/database/phase3-subscriber-publication-schema-online-postflight.js && node scripts/database/phase3-analytics-legacy-snapshot-online-postflight.js && node scripts/database/actual60-refreshsession-online-index-preflight.js",
     "prisma:dev": "prisma migrate dev",
     "prisma:push": "prisma db push",
     "postinstall": "prisma generate",
@@ -53,7 +53,9 @@
     "test:phase5-jobs": "node scripts/audit/phase5-commit-test-gate.js phase5-job-lease-tests.json",
     "audit:phase5-jobs-postgres": "node scripts/audit/phase5-job-lease-postgres-proof.js",
     "test:phase5-admin-background": "node scripts/audit/phase5-commit-test-gate.js phase5-admin-background-tests.json",
-    "audit:phase5-admin-background-postgres": "node scripts/audit/phase5-admin-background-postgres-proof.js"
+    "audit:phase5-admin-background-postgres": "node scripts/audit/phase5-admin-background-postgres-proof.js",
+    "test:phase5-history": "node scripts/audit/phase5-commit-test-gate.js phase5-notification-history-tests.json",
+    "audit:phase5-history-postgres": "node scripts/audit/phase5-notification-history-postgres-proof.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

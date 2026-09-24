@@ -3,6 +3,7 @@
 const crypto = require("node:crypto");
 const { Prisma } = require("@prisma/client");
 const prisma = require("../prisma");
+const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { ensureSingleJob, TRAFFIC_REFRESH_WINDOW_MS } = require("./job-scheduler");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { createPlannedJobIfAbsent } = require("./job-planning-repository");
@@ -176,6 +177,9 @@ async function recomputeTrafficDailyAggregate(tx, { agencyId, creatorId, sourceI
   if (!sourceId || !day) return null;
   const dayStart = utcDay(day);
   const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+  // Lock before reading: under ReadCommitted a waiter sees the preceding
+  // writer's committed ledger, rather than overwriting with an earlier sum.
+  await lockDbAdvisoryXact({ db: tx, key: `traffic-day:${JSON.stringify([agencyId, creatorId, sourceId, dayStart.toISOString()])}` });
   const [subscriptionAgg, source] = await Promise.all([
     tx.creatorSubscriptionLedger.aggregate({
       where: {
@@ -594,7 +598,7 @@ async function repairUnattributedSubscriptionAttribution({
     }
   }
 
-  const targets = Array.from(recomputeTargets.values());
+  const targets = Array.from(recomputeTargets.values()).sort(compareTrafficAggregateTargets);
   for (const chunk of chunkArray(targets, 30)) {
     await prisma.$transaction(
       async (tx) => {
@@ -910,22 +914,53 @@ async function markTrafficFanValueDirty({ agencyId, creatorId, fanId, occurredAt
   const updated = await db.trafficSourceMember.updateMany({
     where: { agencyId, creatorId, fanId: cleanFanId },
     data: {
-      lastRevenueAt: when,
       needsValueRefresh: true,
     },
   });
 
+  await db.trafficSourceMember.updateMany({
+    where: { agencyId, creatorId, fanId: cleanFanId, OR: [{ lastRevenueAt: null }, { lastRevenueAt: { lt: when } }] },
+    data: { lastRevenueAt: when },
+  });
   return { ok: true, matched: updated.count || 0, fanId: cleanFanId, reason: clean(reason, 80) };
 }
 
 // Internal canonical-fact projection. The caller owns the transaction and has
 // loaded the fact from its agency/creator scope; no device/session is impersonated.
-async function projectCanonicalSubscriptionCompatibility({ db, job, fact }) {
+function compareTrafficAggregateTargets(a, b) {
+  return a.sourceId < b.sourceId ? -1 : a.sourceId > b.sourceId ? 1 : a.day.getTime() - b.day.getTime();
+}
+
+async function queueCanonicalAggregate({ db, job, row, deferredAggregates, historyPolicy }) {
+  if (!row.sourceId) return false;
+  const aggregate = { agencyId: job.agencyId, creatorId: job.creatorId, sourceId: row.sourceId, day: utcDay(row.occurredAt) };
+  if (historyPolicy?.aggregateCutoff && aggregate.day < historyPolicy.aggregateCutoff) return true;
+  if (deferredAggregates) deferredAggregates.set(JSON.stringify([row.sourceId, aggregate.day.toISOString()]), aggregate);
+  else await recomputeTrafficDailyAggregate(db, aggregate);
+  return false;
+}
+
+async function projectCanonicalSubscriptionCompatibility({ db, job, fact, deferredAggregates = null, historyPolicy = null }) {
   const fanId = clean(fact.fanId, 180);
   const amount = cents(fact.amountCents);
   const eventType = String(fact.eventType || "").toLowerCase();
-  if (!fanId || amount <= 0 || /free|refund|chargeback|reversal/.test(eventType)) return { ignored: true };
   const eventHash = clean(fact.eventHash, 220);
+  if (!["paid_subscribed", "subscription_renewed", "subscription_resubscribed"].includes(eventType)) {
+    // Earlier canonical projections accepted a display price on expiry/renewal
+    // settings as revenue. Remove only our exact scoped compatibility receipt;
+    // preserve legacy receipts and canonical source facts.
+    if (!eventHash) return { ignored: true };
+    const wrong = await db.creatorSubscriptionLedger.findFirst({ where: {
+      agencyId: job.agencyId, creatorId: job.creatorId, eventHash, source: "canonical_subscription_fact",
+    } });
+    if (!wrong) return { ignored: true };
+    const removed = await db.creatorSubscriptionLedger.deleteMany({ where: {
+      id: wrong.id, agencyId: job.agencyId, creatorId: job.creatorId, source: "canonical_subscription_fact",
+    } });
+    if (removed.count) await queueCanonicalAggregate({ db, job, row: wrong, deferredAggregates, historyPolicy });
+    return { ignored: true, invalidReceiptRemoved: removed.count };
+  }
+  if (!fanId || amount <= 0) return { ignored: true };
   if (!eventHash) throw Object.assign(new Error("Canonical subscription fingerprint required"), { code: "NOTIFICATION_FACT_IDENTITY_REQUIRED" });
   const occurredAt = asDate(fact.subscribedAt || fact.occurredAt);
   if (!occurredAt) throw Object.assign(new Error("Canonical subscription time required"), { code: "NOTIFICATION_FACT_TIME_REQUIRED" });
@@ -933,6 +968,7 @@ async function projectCanonicalSubscriptionCompatibility({ db, job, fact }) {
     where: { agencyId: job.agencyId, creatorId: job.creatorId, fanId },
     orderBy: [{ lastSeenAt: "desc" }, { createdAt: "desc" }], select: { sourceId: true },
   });
+  if (historyPolicy && !source?.sourceId && historyPolicy.organicCutoff && occurredAt < historyPolicy.organicCutoff) return { ignored: true, retentionExcluded: true };
   const row = await db.creatorSubscriptionLedger.upsert({
     where: { agencyId_eventHash: { agencyId: job.agencyId, eventHash } },
     create: { agencyId: job.agencyId, creatorId: job.creatorId, accountId: job.params?.accountId || job.creatorId,
@@ -943,8 +979,16 @@ async function projectCanonicalSubscriptionCompatibility({ db, job, fact }) {
     update: {},
   });
   if (row.creatorId !== job.creatorId) throw Object.assign(new Error("Subscription projection scope mismatch"), { code: "NOTIFICATION_FACT_SCOPE_MISMATCH" });
-  await applySubscriptionSideEffects(db, { agencyId: job.agencyId, creatorId: job.creatorId, fanId,
-    sourceId: row.sourceId, occurredAt: row.occurredAt });
+  // Replays and historical pages must not move current attribution clocks back.
+  if (row.sourceId) {
+    await db.trafficSourceMember.updateMany({ where: { agencyId: job.agencyId, creatorId: job.creatorId, sourceId: row.sourceId, fanId }, data: { needsValueRefresh: true } });
+    await db.trafficSourceMember.updateMany({ where: { agencyId: job.agencyId, creatorId: job.creatorId, sourceId: row.sourceId, fanId,
+      OR: [{ lastRevenueAt: null }, { lastRevenueAt: { lt: row.occurredAt } }] }, data: { lastRevenueAt: row.occurredAt } });
+    await db.trafficSourceMember.updateMany({ where: { agencyId: job.agencyId, creatorId: job.creatorId, sourceId: row.sourceId, fanId,
+      OR: [{ convertedAt: null }, { convertedAt: { gt: row.occurredAt } }] }, data: { convertedAt: row.occurredAt } });
+    const aggregateRetentionExcluded = await queueCanonicalAggregate({ db, job, row, deferredAggregates, historyPolicy });
+    if (aggregateRetentionExcluded) return { ignored: false, ledgerId: row.id, aggregateRetentionExcluded: true };
+  }
   return { ignored: false, ledgerId: row.id };
 }
 
@@ -1858,7 +1902,7 @@ async function recomputeTrafficDailyAggregatesForSource({ agencyId, creatorId, s
   const days = await prisma.trafficDailyAggregate.findMany({
     where: { agencyId, creatorId, sourceId: cleanSourceId },
     select: { day: true },
-    orderBy: { day: "desc" },
+    orderBy: { day: "asc" },
     take: 10000,
   });
 
@@ -2061,6 +2105,8 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
 }
 
 module.exports = {
+  recomputeTrafficDailyAggregate,
+  compareTrafficAggregateTargets,
   TRAFFIC_SOURCES_SCAN_JOB_KEY,
   TRAFFIC_VALUE_REFRESH_JOB_KEY,
   VALUE_SNAPSHOT_TTL_MS,

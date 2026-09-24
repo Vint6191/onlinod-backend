@@ -2118,6 +2118,7 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
     const lanes = [
       ["messageLibraryTrash", () => require("./message-library-lifecycle-service").runMessageLibraryTrashMaintenance({ db })],
       ["adminBillingPricing", () => require("./admin-bulk-pricing-command-service").runAdminBulkPricingSweep({ db })],
+      ["notificationHistoryRepair", () => require("./notification-history-repair-service").runNotificationHistoryRepairSweep({ db })],
       ["notificationConsequences", () => require("./notification-consequence-service").runNotificationConsequenceSweep({ db })],
       ["agencyDestructiveCleanup", () => runAgencyDestructiveCleanupSweep({ db, now })],
       ["creatorDestructiveCleanup", () => runCreatorDestructiveCleanupSweep({ db, now })],

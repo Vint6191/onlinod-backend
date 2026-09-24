@@ -20,13 +20,15 @@ async function publishNotificationConsequences({ db, job }) {
   return published;
 }
 
-async function projectFacts({ db, job, table, rows }) {
+async function projectFacts({ db, job, table, rows, historical = false, historyPolicy = null }) {
   // Lazy imports avoid a cycle through job-result -> Team -> scheduler.
   const projection = require("./team-observation-service");
   const traffic = require("./traffic-service");
   const project = [projection.projectSaleProjectionFact, projection.projectTipProjectionFact,
     projection.projectSubscriptionProjectionFact][table];
   const subscriptions = [];
+  const deferredAggregates = new Map();
+  let retentionExcluded = 0;
   for (const row of rows) {
     const fact = project(row);
     if (fact.kind === "sale" || fact.kind === "tip") {
@@ -35,7 +37,8 @@ async function projectFacts({ db, job, table, rows }) {
         reason: `canonical_${fact.kind}` });
       continue;
     }
-    await traffic.projectCanonicalSubscriptionCompatibility({ db, job, fact });
+    const result = await traffic.projectCanonicalSubscriptionCompatibility({ db, job, fact, deferredAggregates, historyPolicy });
+    if (result.retentionExcluded || result.aggregateRetentionExcluded) retentionExcluded++;
     const type = String(fact.eventType || "").toLowerCase();
     if (fact.fanId && /(subscribed|resubscribed|renewed)/.test(type) && !/(expired|refund|chargeback|auto.?renew)/.test(type)) {
       subscriptions.push({ type: "subscription_created", fanId: fact.fanId, dialogId: fact.fanId,
@@ -43,12 +46,16 @@ async function projectFacts({ db, job, table, rows }) {
         providerEventId: fact.externalEventId || fact.notificationId || fact.eventHash });
     }
   }
+  for (const aggregate of Array.from(deferredAggregates.values()).sort(traffic.compareTrafficAggregateTargets)) {
+    await traffic.recomputeTrafficDailyAggregate(db, aggregate);
+  }
   if (subscriptions.length) {
     const result = await require("./bump-service").processRuntimeEvents({
-      db, agencyId: job.agencyId, creatorId: job.creatorId, events: subscriptions,
+      db, agencyId: job.agencyId, creatorId: job.creatorId, events: subscriptions, reconcileOnly: historical,
     });
     if (result?.errors?.length) throw error(`NOTIFICATION_BUMP_PROJECTION_FAILED:${result.errors[0].code}`);
   }
+  return { retentionExcluded };
 }
 
 async function processNotificationConsequencePage({ db, item, ownerToken }) {
@@ -143,4 +150,4 @@ async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntim
   return report;
 }
 
-module.exports = { WORK_CLASS, PAGE_SIZE, publishNotificationConsequences, processNotificationConsequencePage, runNotificationConsequenceSweep };
+module.exports = { projectFacts, WORK_CLASS, PAGE_SIZE, publishNotificationConsequences, processNotificationConsequencePage, runNotificationConsequenceSweep };

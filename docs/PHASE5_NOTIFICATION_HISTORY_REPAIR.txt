@@ -1,0 +1,87 @@
+ONLINOD / Phase 5A / I5 — retained notification history repair
+2026-09-24
+
+SCOPE
+Recover compatibility consequences from retained CreatorSale, CreatorTip and
+CreatorSubscriptionEvent facts, including facts whose source Job was deleted
+(ON DELETE SET NULL), facts never reassigned to a later source Job, and facts
+with a retained fan identity but no live Fan relation. This is a one-time durable
+generation, phase5_notification_history_v1. It does not reconstruct deleted facts.
+
+DEPLOY
+Apply this complete Backend delta over the accepted I4 actual. Desktop unchanged.
+Render build command remains: npm install && npm run prisma:migrate
+The migration script now starts the notification cursor index online preflight.
+It creates/verifies six indexes CONCURRENTLY on populated databases, preserves
+the prior verifier's session ownership and invalid-index recovery, and rejects
+a valid same-name index with a different definition. Fresh databases create the
+same indexes in migration 20260924220000_phase5_notification_history_repair.
+No dependency or environment changes. No synchronous platform-wide data backfill
+in migration: only indexes and one MaintenanceLaneState row with catalog upper
+bound and cutoffAt. The regular scheduler enumerates and consumes the backlog.
+
+AUTHORITY AND CURSOR
+Catalog enumeration: ten CreatorAccount IDs maximum per short JOB_CHUNK root;
+catalog row FOR UPDATE SKIP LOCKED; agency lifecycle then creator locks in stable
+order. Work publication and catalog cursor commit together. Existing identities
+are not republished or reset, including completed and poison work.
+Execution: creator-scoped DomainWorkItem, agency lifecycle -> creator -> claim;
+current generation/revision/owner checks use the existing DomainWork protocol.
+Tuple cursor (createdAt,id) within agency, creator and migration cutoff; fifty
+facts maximum per page, no OFFSET, no sourceJobId requirement. Selected IDs are
+loaded from the same scope and cardinality is checked. Effects and the durable
+cursor/ack are one JOB_CHUNK transaction with existing bounded conflict retry.
+Retired creators are acknowledged without reconstructing their operational data.
+Scheduler pass: one enumeration quantum and at most four claims by default (hard
+cap eight), one at a time; three-second soft admission budget. A started database
+transaction has its own JOB_CHUNK timeouts, not that soft scheduler budget.
+Catalog ENUMERATION_COMPLETE is not completion of all creator work.
+
+EFFECTS
+Sales/tips mark current fan values dirty. lastRevenueAt only moves forwards.
+Tip/subscription projection identity prefers fanOnlyFansUserIdAtEvent and falls
+back to the current relation only when the snapshot is absent.
+Only paid subscriptions, renewals and resubscriptions with positive price may
+create the compatibility paid ledger. An expired/free/renewal-setting event's
+display price is not revenue. A prior incorrect receipt is removed only when
+agency, creator, fingerprint and source=canonical_subscription_fact all match;
+legacy receipts and canonical source facts remain outside this repair operation.
+Affected daily totals are rebuilt in the same transaction.
+Current attribution lastRevenueAt is monotonic and convertedAt keeps the earliest
+known conversion. Multiple facts for one source/day produce one recomputation
+per page. The recomputation obtains a scoped transaction advisory lock before
+reading totals; all multi-day callers acquire these locks in source/day order.
+Historical subscription consequences request CURRENT durable FanData observation.
+They neither overwrite old Bump workflow metadata nor replay automatic sends.
+Collector frontier/generation, successful Job status and Team scan coverage are
+not manufactured from delayed repair work.
+
+RETENTION AND COVERAGE
+Current retention policy is read inside the page. Already expired organic paid
+ledger and daily aggregate history are not recreated outside their policy windows.
+Attributed paid receipts retain their existing retention semantics.
+The final DomainWorkItem.lastRepair records processed count, identityMissing and
+retentionExcluded, cutoff and generation. Coverage is RETAINED_FACTS_ONLY or
+RETAINED_FACTS_WITH_IDENTITY_GAPS; it never means recovered missing source history.
+Missing identities cannot be inferred. Existing poison/backoff/reconciliation
+paths remain authoritative; the enumerator does not silently reset failed work.
+
+VERIFICATION
+npm run test:phase5-history
+PHASE5_PROOF_RUNTIME=/path/to/audit-runtime npm run audit:phase5-history-postgres
+Optional proof runtime provides @electric-sql/pglite and @electric-sql/pglite-socket.
+The proof creates its own disposable SQL database and uses Prisma TCP with the
+full migration chain. It never connects to a production DATABASE_URL.
+Behavioral cases use production triggers. Only the 60000-row synthetic SELECT-plan
+fixture disables USER triggers while seeding; FK/CHECK constraints remain active
+and USER triggers are restored before EXPLAIN. This is not ingestion throughput.
+
+REMAINING PHASE GATES
+Daily sum reconstruction remains proportional to matching source/day history.
+Coalescing and serialization do not establish SCALE CLOSED for that aggregate.
+Native PostgreSQL concurrent sessions, physical process restarts, many agencies,
+500/4000 creators per agency and 100 workers still require a real load environment.
+Other transaction/clock/legacy notification and after-commit families in the
+cumulative roadmap remain OPEN. I5 acceptance requires a fresh deployed actual.
+The whole Phase 5A is neither SOURCE CLOSED nor SCALE CLOSED. Phase 5B Desktop
+LocalAI remains AUDITED / NOT IMPLEMENTED.

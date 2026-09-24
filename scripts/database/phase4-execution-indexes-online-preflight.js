@@ -11,7 +11,7 @@ const INDEXES = [
   ['CreatorAccount_live_catalog_idx','CreatorAccount','"agencyId","id"', '"deletedAt" IS NULL'],
   ['TelegramDeliveryIntent_pending_billing_idx','TelegramDeliveryIntent','"agencyId","creatorId","createdAt","id"', '"state" IN (\'PLANNED\',\'CLAIMED\',\'FAILED_PRECOMMIT\')'],
 ];
-const createSql = ([name,table,columns,predicate], online = true) => `CREATE INDEX ${online ? 'CONCURRENTLY ' : ''}IF NOT EXISTS "${name}" ON "${table}"(${columns}) WHERE ${predicate}`;
+const createSql = ([name,table,columns,predicate], online = true) => `CREATE INDEX ${online ? 'CONCURRENTLY ' : ''}IF NOT EXISTS "${name}" ON "${table}"(${columns})${predicate ? ` WHERE ${predicate}` : ""}`;
 async function indexState(db, name) {
   return (await db.$queryRawUnsafe(`SELECT i.indisvalid AS valid,i.indisready AS ready,
     pg_get_indexdef(i.indexrelid) AS definition,pg_backend_pid()::int AS pid,
@@ -34,15 +34,15 @@ function assertIndexDefinition(state, [name, table, columns, predicate]) {
     || JSON.stringify(state.options) !== JSON.stringify(columns.split(',').map(v => / DESC$/.test(v) ? 3 : 0))
     || state.keyCount !== keys.length || state.columnCount !== keys.length
     || JSON.stringify(state.columns.map(v => v.toLowerCase().replace(/["\s]/g,''))) !== JSON.stringify(keys)
-    || normalizedPredicate(state.predicate || '') !== normalizedPredicate(predicate)) {
+    || normalizedPredicate(state.predicate || '') !== normalizedPredicate(predicate || "")) {
     throw new Error(`PHASE4_INDEX_DEFINITION_MISMATCH:${name}`);
   }
 }
-async function ensureIndexes(db) {
-  const owner = (await db.$queryRawUnsafe('SELECT pg_try_advisory_lock(132987241,2026092415) AS acquired,pg_backend_pid()::int AS pid'))[0];
+async function ensureIndexes(db, { indexes = INDEXES, lockKey = 2026092415 } = {}) {
+  const owner = (await db.$queryRawUnsafe('SELECT pg_try_advisory_lock(132987241,$1::int) AS acquired,pg_backend_pid()::int AS pid', lockKey))[0];
   if (!owner?.acquired) throw new Error('PHASE4_INDEX_DEPLOY_ALREADY_RUNNING');
   try {
-    for (const spec of INDEXES) {
+    for (const spec of indexes) {
       const [name,table,columns,predicate] = spec;
       const exists = (await db.$queryRawUnsafe("SELECT to_regclass(format('%I.%I',current_schema(),$1))::text AS relation",table))[0]?.relation;
       if (!exists) continue; // Fresh database: the additive migration builds it.
@@ -58,7 +58,7 @@ async function ensureIndexes(db) {
       assertIndexDefinition(state,spec);
     }
   } finally {
-    const released = (await db.$queryRawUnsafe('SELECT pg_advisory_unlock(132987241,2026092415) AS released,pg_backend_pid()::int AS pid'))[0];
+    const released = (await db.$queryRawUnsafe('SELECT pg_advisory_unlock(132987241,$1::int) AS released,pg_backend_pid()::int AS pid', lockKey))[0];
     if (!released?.released || released.pid !== owner.pid) throw new Error('PHASE4_INDEX_SESSION_OWNERSHIP_LOST');
   }
 }

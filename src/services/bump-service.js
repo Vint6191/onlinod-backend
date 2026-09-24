@@ -914,7 +914,7 @@ async function triggerPendingReplyScan({ agencyId, creatorId, limit = 100, db = 
   return { ok: true, scheduled: changed.count, at: now };
 }
 
-async function processRuntimeEvents({ agencyId, creatorId, events = [], userId = null, sourceDeviceId = null, db = prisma, commitFence = null }) {
+async function processRuntimeEvents({ agencyId, creatorId, events = [], userId = null, sourceDeviceId = null, db = prisma, commitFence = null, reconcileOnly = false }) {
   const rows = Array.isArray(events) ? events.slice(0, 500) : [];
   const summary = { ok: true, received: rows.length, onlineObserved: 0, replies: 0, planned: 0, ignored: 0, errors: [] };
   const onlineIds = new Set();
@@ -1015,7 +1015,7 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
         // relationship from a new server-issued provider profile generation.
         fanObservation: null,
       }));
-      const observed = await runCommit((commitDb) => recordDetailedObservations({
+      const observed = reconcileOnly ? { fanIds: entries.map(([fanId]) => fanId) } : await runCommit((commitDb) => recordDetailedObservations({
         agencyId, creatorId, observations, sourceDeviceId, updateLastOnlineAt: false, db: commitDb,
       }));
 
@@ -1048,6 +1048,7 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
       }
 
       const plannedCount = await runCommit(async (commitDb) => {
+        if (reconcileOnly) return 0; // Historical repair requests current facts; it must not replay outbound automation.
         const control = await getAutomationControlSnapshot({ agencyId, creatorId, db: commitDb });
         if (!control.effective.bumpsEnabled || !control.modules.bumps.settings.automatic || !control.modules.bumps.settings.subscriptionEventsEnabled) return 0;
         const planned = await planBumps({

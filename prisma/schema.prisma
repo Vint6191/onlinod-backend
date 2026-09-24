@@ -2871,6 +2871,8 @@ model CreatorSale {
   @@index([creatorId, messageId])
   @@index([creatorId, postId])
   @@index([sourceJobId])
+  @@index([agencyId, creatorId, sourceJobId, id], map: "CreatorSale_consequence_job_cursor_idx")
+  @@index([agencyId, creatorId, createdAt, id], map: "CreatorSale_history_repair_cursor_idx")
 }
 
 model CreatorTip {
@@ -2915,6 +2917,8 @@ model CreatorTip {
   @@index([agencyId, creatorId, tippedAt])
   @@index([creatorId, fanRecordId, tippedAt])
   @@index([sourceJobId])
+  @@index([agencyId, creatorId, sourceJobId, id], map: "CreatorTip_consequence_job_cursor_idx")
+  @@index([agencyId, creatorId, createdAt, id], map: "CreatorTip_history_repair_cursor_idx")
 }
 
 model CreatorSubscriptionEvent {
@@ -2957,6 +2961,8 @@ model CreatorSubscriptionEvent {
   @@index([creatorId, fanRecordId, occurredAt])
   @@index([creatorId, eventType, occurredAt])
   @@index([sourceJobId])
+  @@index([agencyId, creatorId, sourceJobId, id], map: "CreatorSubscriptionEvent_consequence_job_cursor_idx")
+  @@index([agencyId, creatorId, createdAt, id], map: "CreatorSubscriptionEvent_history_repair_cursor_idx")
 }
 
 model CreatorSubscriptionState {
