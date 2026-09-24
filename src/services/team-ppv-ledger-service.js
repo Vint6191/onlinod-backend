@@ -852,7 +852,7 @@ async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS, now = new 
       where: { sentAt: { lt: before }, compactedAt: null },
       select: { id: true }, orderBy: [{ sentAt: "asc" }, { id: "asc" }], take: safeLimit,
     }),
-    prisma.teamPpvPurchaseLedger.findMany({
+    db.teamPpvPurchaseLedger.findMany({
       where: {
         purchasedAt: { lt: before },
         status: { in: ["resolved", "expired", "attributed", "unresolved", "rejected", "creator_revenue"] },
@@ -860,7 +860,7 @@ async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS, now = new 
       },
       select: { id: true }, orderBy: [{ purchasedAt: "asc" }, { id: "asc" }], take: safeLimit,
     }),
-    prisma.teamPpvResolveJob.findMany({
+    db.teamPpvResolveJob.findMany({
       where: {
         OR: [{ expiresAt: { lt: authorityNow } }, { createdAt: { lt: before } }],
         status: { in: ["resolved", "expired", "rejected"] },

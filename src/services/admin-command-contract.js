@@ -64,7 +64,12 @@ const contentLifecycleSchema = z.object({
   action: z.enum(["trash","restore","permanent"]), expectedUpdatedAt: z.string().datetime(), reason: reasonSchema,
 }).strict();
 
+const retentionVersion = { expectedRevision: revisionSchema, expectedPolicyHash: z.string().regex(/^[a-f0-9]{64}$/), reason: reasonSchema };
+const retentionSettings = z.object(Object.fromEntries(Object.entries(require("./retention-policy-definition").retentionSchema()).map(([key,spec]) => [key,z.number().int().min(spec.min).max(spec.max)]))).strict();
 const ACTIONS = Object.freeze({
+  "retention.policy.set": { roles:["SUPER_ADMIN"], schema:z.object({...retentionVersion,settings:retentionSettings}).strict() },
+  "retention.policy.reset": { roles:["SUPER_ADMIN"], schema:z.object(retentionVersion).strict() },
+  "retention.run": { roles:["SUPER_ADMIN"], schema:z.object(retentionVersion).strict() },
   "support.grant.open": {roles:["SUPER_ADMIN","SUPPORT"],schema:z.object({agencyId:z.string().trim().min(1).max(180),reason:reasonSchema,durationMinutes:z.number().int().min(5).max(30).default(15)}).strict()},
   "support.grant.revoke": {roles:["SUPER_ADMIN","SUPPORT"],schema:z.object({reason:reasonSchema}).strict()},
   ...require("./admin-operational-command-contract").OPERATIONAL_ACTIONS,

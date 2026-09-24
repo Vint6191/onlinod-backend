@@ -153,7 +153,9 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 500, db = nu
   let aggregateUpdates = 0;
   const take = Math.max(1, Math.min(500, Math.floor(Number(batchSize) || 500)));
   let cursor = null;
-  for (;;) {
+  let batches = 0;
+  let hasMore = false;
+  for (; batches < 4; batches += 1) {
     const lifecycleGuards = [
       { OR: [{ failureCode: null }, { failureCode: { not: "outcome_unresolved_do_not_retry" } }] },
       { OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: "SETTLED" }] },
@@ -191,14 +193,15 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 500, db = nu
         finishedAt: true,
       },
     });
-    if (!rows.length) break;
+    if (!rows.length) { hasMore = false; break; }
     cursor = { finishedAt: rows[rows.length - 1].finishedAt, id: rows[rows.length - 1].id };
     const committed = await db.$transaction(tx => archiveAutomationDeliveryBatch({ tx, rows, olderThan, commitGuard }), { maxWait: 5000, timeout: 15000, isolationLevel: "ReadCommitted" });
     archived += committed.archived;
     aggregateUpdates += committed.aggregateUpdates;
-    if (rows.length < take) break;
+    hasMore = rows.length >= take;
+    if (!hasMore) break;
   }
-  return { label: "automationDelivery.compacted", archived, deleted: archived, aggregateUpdates };
+  return { label: "automationDelivery.compacted", archived, deleted: archived, aggregateUpdates, hasMore };
 }
 
 function normalizeRange({ from = null, to = null, months = 12 } = {}) {

@@ -1440,7 +1440,7 @@ async function repairMigratedLegacyTipManualAuthority({ db = prisma, agencyId = 
   }
 }
 
-async function purgeExpiredTipLedger({ agencyId = null, retentionDays = TIP_LEDGER_RETENTION_DAYS, limit = 5000, dryRun = false, now = new Date() } = {}) {
+async function purgeExpiredTipLedger({ agencyId = null, retentionDays = TIP_LEDGER_RETENTION_DAYS, limit = 5000, dryRun = false, now = new Date(), db = prisma } = {}) {
   const cleanAgency = clean(agencyId, 160);
   const safeRetentionDays = Math.max(1, int(retentionDays, TIP_LEDGER_RETENTION_DAYS));
   const safeLimit = Math.min(20000, Math.max(1, int(limit, 5000)));
@@ -1450,12 +1450,13 @@ async function purgeExpiredTipLedger({ agencyId = null, retentionDays = TIP_LEDG
 
   const where = {
     receivedAt: { lt: cutoff },
+    compactedAt: null,
     historicalFactVersion: "team_money_fact_v2",
     historicalFactProjectedAt: { not: null },
     ...(cleanAgency ? { agencyId: cleanAgency } : {}),
   };
 
-  const rows = await prisma.teamTipLedger.findMany({
+  const rows = await db.teamTipLedger.findMany({
     where,
     select: { id: true },
     orderBy: { receivedAt: "asc" },
@@ -1466,8 +1467,8 @@ async function purgeExpiredTipLedger({ agencyId = null, retentionDays = TIP_LEDG
     return { ok: true, deleted: dryRun ? 0 : rows.length, matched: rows.length, hasMore: rows.length >= safeLimit, retentionDays: safeRetentionDays, cutoff, dryRun: Boolean(dryRun) };
   }
 
-  const result = await prisma.teamTipLedger.updateMany({
-    where: { id: { in: rows.map((row) => row.id) } },
+  const result = await db.teamTipLedger.updateMany({
+    where: { ...where, id: { in: rows.map((row) => row.id) } },
     // Keep the stable attribution/manual-decision root. Only discard rebuildable
     // candidate/result detail after the retention horizon; history remains durable.
     data: {

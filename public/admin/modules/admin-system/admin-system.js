@@ -26,9 +26,12 @@
     retentionData: null,
     retentionDraft: null,
     retentionDirty: false,
+    retentionReason: "",
+    retentionCommand: null,
   };
 
   async function load(force) {
+    void refreshRetentionCommand();
     if (state.loading) return;
     if (!force && state.data && Date.now() - state.lastLoadedAt < 5_000) return;
 
@@ -50,91 +53,72 @@
     rerender();
   }
 
+  let retentionGeneration = 0;
+  function clearRetentionSession() {
+    retentionGeneration += 1;
+    Object.assign(state, { retentionLoading:false, retentionSaving:false, retentionRunning:false,
+      retentionData:null, retentionDraft:null, retentionDirty:false, retentionReason:"",
+      retentionResult:null, retentionError:null, retentionCommand:null, retentionPolling:false });
+    rerender();
+  }
+  window.addEventListener("onlinod:admin-session-changed", clearRetentionSession);
+  window.addEventListener("storage", event => { if (event.key === "onlinod_admin_token") clearRetentionSession(); });
+  function currentRetentionRead(generation, token) { return generation === retentionGeneration && token === A().getToken(); }
+  async function refreshRetentionCommand() {
+    const command = state.retentionCommand;
+    if (!command || !["QUEUED", "RUNNING"].includes(command.status) || state.retentionPolling) return;
+    const generation = retentionGeneration, token = A().getToken();
+    state.retentionPolling = true;
+    try {
+      const result = await A().commandStatus(command.commandId);
+      if (!currentRetentionRead(generation, token)) return;
+      if (result?.ok) state.retentionCommand = result;
+      else state.retentionError = result?.error || "Could not read cleanup status";
+    } finally { state.retentionPolling = false; rerender(); }
+  }
   async function loadRetention(force) {
-    if (state.retentionLoading) return;
-    if (!force && state.retentionData) return;
+    if (state.retentionLoading || (!force && state.retentionData)) return;
     if (state.retentionDirty && !force) return;
-
-    state.retentionLoading = true;
-    state.retentionError = null;
-    rerender();
-
+    const generation = retentionGeneration, token = A().getToken();
+    state.retentionLoading = true; state.retentionError = null; rerender();
     const result = await A().retentionSettings();
+    if (!currentRetentionRead(generation, token)) return;
     state.retentionLoading = false;
-
-    if (!result?.ok) {
-      state.retentionError = result?.error || "Failed to load retention settings";
-    } else {
-      state.retentionData = result;
-      if (!state.retentionDirty) state.retentionDraft = { ...(result.settings || {}) };
-      state.retentionError = null;
-    }
-    rerender();
-  }
-
-  async function saveRetention() {
-    if (state.retentionSaving || !state.retentionDraft) return;
-    state.retentionSaving = true;
-    state.retentionError = null;
-    state.retentionResult = null;
-    rerender();
-
-    const result = await A().saveRetentionSettings({ settings: state.retentionDraft });
-    state.retentionSaving = false;
-
-    if (!result?.ok) {
-      state.retentionError = result?.error || "Failed to save retention settings";
-    } else {
+    if (!result?.ok) state.retentionError = result?.error || "Failed to load retention settings";
+    else {
       state.retentionData = result;
       state.retentionDraft = { ...(result.settings || {}) };
       state.retentionDirty = false;
-      state.retentionResult = { ok: true, message: "Retention settings saved" };
+      state.retentionCommand = result.lastRun || state.retentionCommand;
     }
     rerender();
   }
-
-  async function resetRetention() {
-    if (state.retentionSaving) return;
-    if (!confirm("Reset retention settings to env/default values?")) return;
-
-    state.retentionSaving = true;
-    state.retentionError = null;
-    state.retentionResult = null;
-    rerender();
-
-    const result = await A().resetRetentionSettings();
-    state.retentionSaving = false;
-
-    if (!result?.ok) {
-      state.retentionError = result?.error || "Failed to reset retention settings";
-    } else {
-      state.retentionData = result;
-      state.retentionDraft = { ...(result.settings || {}) };
-      state.retentionDirty = false;
-      state.retentionResult = { ok: true, message: "Retention settings reset" };
+  async function retentionMutation(action) {
+    if (state.retentionSaving || state.retentionRunning || !state.retentionData) return;
+    const reason = state.retentionReason.trim();
+    if (reason.length < 3) { state.retentionError = "Enter a reason (at least 3 characters)."; rerender(); return; }
+    if (action === "reset" && !confirm("Save current server defaults as the retention policy?")) return;
+    if (action === "run" && !confirm("Queue one cleanup pass? Eligible old data will be deleted under the displayed policy.")) return;
+    const generation = retentionGeneration, token = A().getToken();
+    const input = { expectedRevision:state.retentionData.revision, expectedPolicyHash:state.retentionData.policyHash, reason,
+      ...(action === "set" ? {settings:{...state.retentionDraft}} : {}) };
+    state.retentionSaving = action !== "run"; state.retentionRunning = action === "run";
+    state.retentionError = null; state.retentionResult = null; rerender();
+    const result = action === "set" ? await A().saveRetentionSettings(input)
+      : action === "reset" ? await A().resetRetentionSettings(input) : await A().runRetentionSweep(input);
+    if (!currentRetentionRead(generation, token)) return;
+    state.retentionSaving = false; state.retentionRunning = false;
+    if (!result?.ok) state.retentionError = result?.error || "Command failed; reload or retry the same change.";
+    else if (action === "run") state.retentionCommand = { commandId:result.commandId, status:result.status };
+    else {
+      state.retentionData = result; state.retentionDraft = {...result.settings}; state.retentionDirty = false;
+      state.retentionResult = { message:action === "reset" ? "Defaults saved as a new policy revision." : "Retention policy saved." };
     }
     rerender();
   }
-
-  async function runRetentionNow() {
-    if (state.retentionRunning) return;
-    if (!confirm("Run retention sweep now? This can delete old rows according to the current policy.")) return;
-
-    state.retentionRunning = true;
-    state.retentionError = null;
-    state.retentionResult = null;
-    rerender();
-
-    const result = await A().runRetentionSweep();
-    state.retentionRunning = false;
-
-    if (!result?.ok) {
-      state.retentionError = result?.error || "Retention sweep failed";
-    } else {
-      state.retentionResult = result;
-    }
-    rerender();
-  }
+  const saveRetention = () => retentionMutation("set");
+  const resetRetention = () => retentionMutation("reset");
+  const runRetentionNow = () => retentionMutation("run");
 
   function rerender() {
     const main = document.getElementById("admMain");
@@ -276,7 +260,11 @@
 
     const groups = [
       ["Core", ["retentionSweepWindowHours", "batchSize"]],
-      ["Team activity", ["teamIntermediateDays", "teamSessionDays", "teamNoticeDays", "teamAuditDays"]],
+      ["Team activity", ["teamIntermediateDays", "teamSessionDays", "teamNoticeDays", "teamAuditDays", "teamCanonicalDetailDays", "teamMoneyRawDetailDays"]],
+      ["Automation", ["automationDeliveryDetailedDays", "automationAggregateDays", "automationJobDoneDays", "automationEventDays", "automationTaskTrashDays"]],
+      ["Analytics", ["analyticsIngestBatchDays", "analyticsJobInstanceDays", "analyticsDemandHistoryDays", "analyticsSupersededScanProofDays", "analyticsNonEarningsJobDays", "analyticsNonEarningsIngestBatchDays", "analyticsNotificationScanAuditDays"]],
+      ["Sessions and audit", ["refreshSessionRawHistoryDays", "auditLogDays"]],
+      ["Dialog intelligence", ["dialogScanChunkDays", "dialogScanRunDays"]],
       ["Traffic", ["trafficSourceMemberNoRevenueDays", "trafficZeroSnapshotDays", "trafficDailyAggregateDays", "trafficPaidOrganicLedgerDays", "trafficFreeOrganicCleanupHours"]],
     ];
 
@@ -286,13 +274,13 @@
           <div>
             <div class="adm-card-title">Retention policy</div>
             <div style="color:var(--adm-muted);font-size:12px;margin-top:3px;">
-              Controls cleanup for TeamActivityEvent and Traffic tables. Source: ${r.escapeHtml(source)}${data.updatedAt ? ` · updated ${r.escapeHtml(U().timeAgo(data.updatedAt))}` : ""}
+              Retention periods for scheduled cleanup. Source: ${r.escapeHtml(source)}${data.updatedAt ? ` · updated ${r.escapeHtml(U().timeAgo(data.updatedAt))}` : ""}
             </div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
             <button class="adm-btn ghost" id="admRetentionReload" ${state.retentionLoading ? "disabled" : ""}>reload</button>
             <button class="adm-btn ghost" id="admRetentionReset" ${state.retentionSaving ? "disabled" : ""}>reset defaults</button>
-            <button class="adm-btn ghost" id="admRetentionRun" ${state.retentionRunning ? "disabled" : ""}>${state.retentionRunning ? "running…" : "run cleanup now"}</button>
+            <button class="adm-btn ghost" id="admRetentionRun" ${state.retentionRunning || ["QUEUED","RUNNING"].includes(state.retentionCommand?.status) ? "disabled" : ""}>${state.retentionRunning ? "submitting…" : "run cleanup now"}</button>
             <button class="adm-btn" id="admRetentionSave" ${state.retentionSaving || !state.retentionDirty ? "disabled" : ""}>${state.retentionSaving ? "saving…" : "save"}</button>
           </div>
         </div>
@@ -301,6 +289,7 @@
         ${renderRetentionResult()}
         ${state.retentionLoading && !state.retentionData ? `<div class="adm-loading">loading retention policy…</div>` : ""}
 
+        <label>Reason for change or cleanup<input class="adm-input" id="admRetentionReason" maxlength="500" value="${r.escapeAttr(state.retentionReason)}"></label>
         ${groups.map(([title, keys]) => `
           <div style="margin-top:12px;">
             <div style="font-weight:700;margin-bottom:8px;color:var(--adm-text);">${r.escapeHtml(title)}</div>
@@ -334,30 +323,24 @@
   }
 
   function renderRetentionResult() {
-    const r = R();
-    const result = state.retentionResult;
-    if (!result) return "";
-    if (result.message) {
-      return `<div class="adm-success" style="margin-bottom:10px;">${r.escapeHtml(result.message)}</div>`;
-    }
-    const total = Number(result.totalDeleted || 0);
-    const parts = [];
-    const addItems = (bucket) => {
-      for (const item of bucket?.items || []) {
-        parts.push(`${item.label}: ${item.deleted || 0}`);
-      }
-    };
-    addItems(result.teamActivity);
-    addItems(result.traffic);
-    return `
-      <div class="adm-success" style="margin-bottom:10px;">
-        Cleanup done: deleted ${r.escapeHtml(String(total))} rows${result.elapsedMs ? ` · ${r.escapeHtml(String(result.elapsedMs))}ms` : ""}
-        ${parts.length ? `<div style="font-family:var(--adm-mono);font-size:11px;margin-top:6px;color:var(--adm-text-soft);">${r.escapeHtml(parts.join(" · "))}</div>` : ""}
-      </div>
-    `;
+    const r = R(), command = state.retentionCommand;
+    const report = command?.execution?.progress?.report;
+    const status = command?.status;
+    const text = status === "QUEUED" ? "Cleanup queued. This page checks progress automatically."
+      : status === "RUNNING" ? "Cleanup is running."
+      : status === "PARTIAL" ? "Pass finished with remaining work. Scheduled cleanup will continue."
+      : status === "FAILED" ? "Cleanup pass failed or completed only partly. Review the result before retrying."
+      : status === "CANCELLED" ? "Cleanup cancelled: administrator access or policy changed before execution."
+      : status === "SUCCEEDED" ? "Cleanup pass completed." : "";
+    return `${state.retentionResult?.message ? `<div class="adm-success">${r.escapeHtml(state.retentionResult.message)}</div>` : ""}
+      ${text ? `<div class="${["FAILED","CANCELLED"].includes(status) ? "adm-error" : "adm-muted"}" style="margin:10px 0;">${r.escapeHtml(text)}
+      ${report ? `<div>Rows deleted in this attempt: ${Number(report.totalDeleted || 0)}. Remaining work: ${report.remainingWork ? "yes" : "no"}.</div>` : ""}
+      ${command?.execution?.progress?.code ? `<div>${r.escapeHtml(command.execution.progress.code)}</div>` : ""}
+      ${report?.laneErrors?.length ? `<div>${r.escapeHtml(report.laneErrors.map(item=>`${item.lane}: ${item.error}`).join("; "))}</div>` : ""}</div>` : ""}`;
   }
 
   function bindRetentionEvents(main) {
+    main.querySelector("#admRetentionReason")?.addEventListener("input", event => { state.retentionReason = event.target.value; });
     main.querySelector("#admRetentionReload")?.addEventListener("click", () => loadRetention(true));
     main.querySelector("#admRetentionSave")?.addEventListener("click", saveRetention);
     main.querySelector("#admRetentionReset")?.addEventListener("click", resetRetention);

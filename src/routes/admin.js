@@ -60,7 +60,7 @@ const bcrypt    = require("bcryptjs");
 const { z }     = require("zod");
 const prisma    = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
-const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, runRetentionSweep } = require("../services/retention-service");
+const { getRetentionSettings } = require("../services/retention-service");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
 const { TIER_CATALOG } = require("../services/billing-catalog-service");
@@ -447,67 +447,35 @@ router.get("/system/health", async (_req, res) => {
 // SUPER_ADMIN only for writes because these settings delete data.
 // ════════════════════════════════════════════════════════════
 
-router.get("/system/retention", async (_req, res) => {
+router.get("/system/retention", async (req, res) => {
   try {
     const result = await getRetentionSettings();
-    return res.json(result);
+    const last = await prisma.adminCommand.findFirst({ where: { actorId: req.admin.id, action: "retention.run" }, orderBy: [{ createdAt: "desc" }, { id: "desc" }], select: { commandId: true, status: true, executionProgress: true } });
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ ...result, lastRun: last ? { commandId: last.commandId, status: last.status, execution: { progress: last.executionProgress } } : null });
   } catch (err) {
     console.error("[admin/system/retention] failed:", err);
     return res.status(500).json({ ok: false, code: "RETENTION_SETTINGS_FAILED", error: err?.message || "Failed" });
   }
 });
 
-router.patch("/system/retention", async (req, res) => {
-  if (!ensureSuperAdmin(req, res)) return;
-  try {
-    const settings = req.body?.settings && typeof req.body.settings === "object" ? req.body.settings : req.body || {};
-    const result = await updateRetentionSettings({ settings, adminId: req.admin.id });
-    await adminLog(req, {
-      action: "RETENTION_SETTINGS_UPDATE",
-      targetType: "system",
-      targetId: "retention.policy.v1",
-      meta: { settings: result.settings },
-    });
-    return res.json(result);
-  } catch (err) {
-    console.error("[admin/system/retention PATCH] failed:", err);
-    return res.status(500).json({ ok: false, code: "RETENTION_SETTINGS_SAVE_FAILED", error: err?.message || "Failed" });
-  }
-});
+const { commandRequest } = require("../services/admin-command-contract");
+const { sendCommandError } = require("./admin-command-handlers");
+const { setAdminRetentionPolicy, submitAdminRetentionRun } = require("../services/admin-retention-command-service");
+function retentionCommand(action) {
+  return async (req, res) => {
+    try {
+      const input = { db: prisma, ...commandRequest(req), payload: req.body };
+      const result = action === "run" ? await submitAdminRetentionRun(input)
+        : await setAdminRetentionPolicy({ ...input, reset: action === "reset" });
+      return res.status(result.statusCode).json(result.body);
+    } catch (error) { return sendCommandError(res, error); }
+  };
+}
+router.patch("/system/retention", retentionCommand("set"));
+router.post("/system/retention/reset", retentionCommand("reset"));
+router.post("/system/retention/run", retentionCommand("run"));
 
-router.post("/system/retention/reset", async (req, res) => {
-  if (!ensureSuperAdmin(req, res)) return;
-  try {
-    const result = await resetRetentionSettings({ adminId: req.admin.id });
-    await adminLog(req, {
-      action: "RETENTION_SETTINGS_RESET",
-      targetType: "system",
-      targetId: "retention.policy.v1",
-      meta: { source: result.source, settings: result.settings },
-    });
-    return res.json(result);
-  } catch (err) {
-    console.error("[admin/system/retention reset] failed:", err);
-    return res.status(500).json({ ok: false, code: "RETENTION_SETTINGS_RESET_FAILED", error: err?.message || "Failed" });
-  }
-});
-
-router.post("/system/retention/run", async (req, res) => {
-  if (!ensureSuperAdmin(req, res)) return;
-  try {
-    const result = await runRetentionSweep({});
-    await adminLog(req, {
-      action: "RETENTION_SWEEP_RUN",
-      targetType: "system",
-      targetId: "retention.policy.v1",
-      meta: { totalDeleted: result.totalDeleted || 0, elapsedMs: result.elapsedMs || 0 },
-    });
-    return res.json(result);
-  } catch (err) {
-    console.error("[admin/system/retention run] failed:", err);
-    return res.status(500).json({ ok: false, code: "RETENTION_SWEEP_FAILED", error: err?.message || "Failed" });
-  }
-});
 
 
 // ════════════════════════════════════════════════════════════

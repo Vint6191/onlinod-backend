@@ -73,6 +73,7 @@ async function readAdminCommand({ db, actor, commandId }) {
       const item = await tx.domainWorkItem.findUnique({ where: { id: workId({ agencyId: row.scopeAgencyId, workClass: "ADMIN_BILLING_PRICING", objectType: "AdminCommand", objectId: row.id }) } });
       execution = { resume: row.status === "PAUSED_AUTH" ? { ...row.executionPayload, reason: undefined, items: row.executionPayload.items.slice(row.executionProgress.nextIndex), resumesCommandId: row.commandId } : null, progress: row.executionProgress, workState: item?.state || null, errorClass: item?.errorClass || null, terminalCause: item?.terminalCause || null, retryAt: item?.nextAttemptAt || null };
     }
+    if (row.action === "retention.run") execution = { progress: row.executionProgress };
     return { ok: true, execution, commandId, action: row.action, targetId: row.targetId, status: row.status, result: row.result, httpStatus: row.httpStatus, createdAt: row.createdAt, completedAt: row.completedAt };
   });
 }

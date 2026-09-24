@@ -198,7 +198,7 @@ test("non-earnings and failed-job retention has deterministic indexed terminal-a
   assert.match(sql, /CreatorNotificationScanItem_retention_idx/);
   assert.match(sql, /AnalyticsIngestBatch_retention_idx/);
 
-  const source = fs.readFileSync(servicePath, "utf8");
+  const source = fs.readFileSync(path.join(__dirname, "retention-policy-definition.js"), "utf8") + fs.readFileSync(servicePath, "utf8");
   assert.doesNotMatch(source, /COALESCE\(candidate\."completedAt", candidate\."updatedAt"\)/);
   assert.match(source, /candidate\."updatedAt" < \$1/);
   assert.match(source, /ORDER BY candidate\."updatedAt" ASC, candidate\."id" ASC/);
@@ -309,7 +309,7 @@ test("distributed closure migration adopts legacy analytics ordering onto DB-own
 });
 
 test("retention coordinator is durable, fail-closed and uses one DB-authority cutoff clock", () => {
-  const source = fs.readFileSync(servicePath, "utf8");
+  const source = fs.readFileSync(path.join(__dirname, "retention-policy-definition.js"), "utf8") + fs.readFileSync(servicePath, "utf8");
   const schema = fs.readFileSync(schemaPath, "utf8");
   assert.match(schema, /model RetentionSweepLease[\s\S]*ownerToken\s+String[\s\S]*leaseUntil\s+DateTime[\s\S]*completedAt\s+DateTime\?/);
   assert.match(source, /RETENTION_COORDINATION_SCHEMA_UNAVAILABLE/);
@@ -319,7 +319,7 @@ test("retention coordinator is durable, fail-closed and uses one DB-authority cu
   assert.match(source, /renewRetentionSweepLease/);
   assert.match(source, /const authorityNow = lease\?\.startedAt instanceof Date \? lease\.startedAt : sweepNow\(options\)/);
   assert.match(source, /const laneOptions = \{ \.\.\.options, authorityNow, retentionOwnerToken: lease\?\.acquired \? lease.ownerToken : null \}/);
-  assert.match(source, /commitGuard: options.retentionOwnerToken \? tx => lockRetentionCommit/);
+  assert.match(source, /commitGuard: options.retentionOwnerToken \? async tx => [\s\S]*?options.actorGuard[\s\S]*?await lockRetentionCommit/);
   assert.doesNotMatch(source, /pg_try_advisory_lock\(/);
   assert.doesNotMatch(source, /pg_advisory_unlock\(/);
 });
@@ -348,6 +348,7 @@ test("durable retention lease serializes replicas, reclaims expiry and fences st
       return 1;
     },
     async $queryRawUnsafe(sql) {
+      if (String(sql).includes('FROM "RetentionSweepLease"')) { assert.match(String(sql), /FOR UPDATE$/); return row ? [{key:row.key}] : []; }
       assert.match(String(sql), /clock_timestamp\(\)/);
       return [{ authorityNow }];
     },
@@ -358,7 +359,7 @@ test("durable retention lease serializes replicas, reclaims expiry and fences st
         return { ...row };
       },
       async updateMany({ where, data }) {
-        if (!row || row.key !== where.key || row.ownerToken !== where.ownerToken || row.completedAt !== null) return { count: 0 };
+        if (!row || row.key !== where.key || row.ownerToken !== where.ownerToken || row.completedAt !== null || (where.leaseUntil?.gt && row.leaseUntil <= where.leaseUntil.gt)) return { count: 0 };
         row = { ...row, ...data };
         return { count: 1 };
       },

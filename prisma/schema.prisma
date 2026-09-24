@@ -6399,6 +6399,7 @@ model TeamPpvResolveJob {
 }
 
 model SystemSetting {
+  revision         Int      @default(1)
   id               String   @id @default(cuid())
   key              String   @unique
   value            Json
@@ -6432,6 +6433,7 @@ model AdminCommand {
   completedAt      DateTime?
   audit            AdminCommandAudit[]
 
+  @@index([actorId, action, createdAt, id])
   @@unique([actorId, commandId])
   @@index([actorId, createdAt, id])
   @@index([scopeAgencyId, createdAt, id])

@@ -73,7 +73,7 @@ test("refresh-session retention materializes compact lineage boundary before del
 });
 
 test("retention source keeps raw tokens for an explicit post-expiry security horizon and is scheduler-owned", () => {
-  const retention = read("src/services/retention-service.js");
+  const retention = read("src/services/retention-policy-definition.js") + read("src/services/retention-service.js");
   const scheduler = read("src/services/job-scheduler.js");
   assert.match(retention, /refreshSessionRawHistoryDays:[\s\S]*fallback:\s*30[\s\S]*min:\s*7/);
   assert.match(retention, /ONLINOD_REFRESH_SESSION_RAW_HISTORY_DAYS/);
@@ -100,7 +100,7 @@ test("terminal authorization lookup retains compact-boundary fallback after raw 
 });
 
 test("refresh-session retention derives natural terminal time from the latest row in the whole lineage, not only purge candidates", () => {
-  const retention = read("src/services/retention-service.js");
+  const retention = read("src/services/retention-policy-definition.js") + read("src/services/retention-service.js");
   const start = retention.indexOf("async function purgeRefreshSessionHistoryBatch");
   const end = retention.indexOf("async function runRefreshSessionRetentionSweep", start);
   const block = retention.slice(start, end);
@@ -194,7 +194,7 @@ test("refresh-session retention has a non-bypassable hourly drain floor and PART
 });
 
 test("refresh-session retention exposes bounded catch-up capacity instead of hiding scheduler saturation", () => {
-  const retention = read("src/services/retention-service.js");
+  const retention = read("src/services/retention-policy-definition.js") + read("src/services/retention-service.js");
   const start = retention.indexOf("async function runRefreshSessionRetentionSweep");
   const end = retention.indexOf("function maxDate", start);
   const block = retention.slice(start, end);
@@ -206,7 +206,7 @@ test("refresh-session retention exposes bounded catch-up capacity instead of hid
 test("refresh-session purge candidate query is expiry-index shaped rather than lineage-history shaped", () => {
   const schema = read("prisma/schema.prisma");
   assert.match(schema, /model RefreshSession[\s\S]*@@index\(\[expiresAt\]\)/);
-  const retention = read("src/services/retention-service.js");
+  const retention = read("src/services/retention-policy-definition.js") + read("src/services/retention-service.js");
   const start = retention.indexOf("async function purgeRefreshSessionHistoryBatch");
   const end = retention.indexOf("async function runRefreshSessionRetentionSweep", start);
   const block = retention.slice(start, end);

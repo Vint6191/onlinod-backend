@@ -46,7 +46,7 @@ test("debug redaction removes nested login/reset/token secrets", () => {
   assert.doesNotMatch(JSON.stringify(safe), /private/);
 });
 test("unmigrated actions do not pretend to have durable command receipts", async () => {
-  const b = browser(); assert.equal(await b.commands.prepare({ ...input, path: "/api/admin/system/retention" }), null);
+  const b = browser(); assert.equal(await b.commands.prepare({ ...input, path: "/api/admin/unknown-legacy-action" }), null);
 });
 
 test("policy, support hold and entitlement mutations preserve UUID across browser reload", async () => {
@@ -79,5 +79,12 @@ test("archive command retains UUID on unknown response and blocks a changed sele
 test("operational commands retain stable UUID across reload, including DELETE bodies",async()=>{
  for(const [method,path] of [["PATCH","/api/admin/agencies/a"],["DELETE","/api/admin/agencies/a"],["PATCH","/api/admin/members/m/role"],["DELETE","/api/admin/members/m"],["POST","/api/admin/users/u/reset-password"],["POST","/api/admin/devices/d/kick"]]){
   const b=browser(),request={...input,method,path,body:{reason:"explicit",expectedUpdatedAt:"2026-01-01T00:00:00Z"}};const first=await b.commands.prepare(request);assert.ok(first.commandId);assert.equal((await browser(b.storage).commands.prepare(request)).commandId,first.commandId);assert.equal((await b.commands.prepare({...request,body:{...request.body,reason:"changed"}})).blocked,true);
+ }
+});
+
+ test("all retention commands retain UUID across reload and unknown outcome", async () => {
+ for (const [path,method] of [["/api/admin/system/retention","PATCH"],["/api/admin/system/retention/reset","POST"],["/api/admin/system/retention/run","POST"]]) {
+   const b=browser(), request={...input,path,method}; const first=await b.commands.prepare(request);
+   assert.ok(first.commandId);assert.equal((await browser(b.storage).commands.prepare(request)).commandId,first.commandId);
  }
 });

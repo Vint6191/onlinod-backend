@@ -175,7 +175,8 @@ async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) 
   const startedAt = Date.now();
 
   try {
-    const result = await runRetentionSweep({ minIntervalMs: force ? 0 : retentionWindowMs });
+    const requested = await require("./admin-retention-command-service").runAdminRetentionSweep();
+    const result = requested || await runRetentionSweep({ minIntervalMs: force ? 0 : retentionWindowMs });
     const laneNames = ["teamActivity", "teamLedgers", "traffic", "automation", "dialogIntelligence", "auditLogs", "authSessions", "creatorTaskActivity", "analyticsExecution"];
     const laneSummary = laneNames
       .map((name) => `${name}=${Number(result?.[name]?.totalDeleted || 0)}`)
