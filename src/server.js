@@ -276,6 +276,7 @@ app.use("/api/admin-auth", adminAuthRoutes);
 app.use("/api/admin/data", adminDataRoutes);
 app.use("/api/admin/billing", adminBillingRoutes);
 app.use("/api/admin/commands", require("./routes/admin-commands"));
+app.use("/api/admin/support", require("./routes/admin-support"));
 app.use("/api/admin", adminRoutes);
 app.use("/api/impersonate", impersonateRoutes);
 app.use("/api/workspace", workspaceRoutes);

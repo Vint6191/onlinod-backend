@@ -92,7 +92,10 @@ test("A31 maintenance failures/poison debt are visible and recoverable without R
   assert.match(admin, /maintenance\/subscriber-signals/);
   assert.match(admin, /maintenance\/subscriber-signals\/:id\/requeue/);
   assert.match(admin, /ensureSuperAdmin/);
-  assert.match(admin, /admin\.subscriber_maintenance_signal_requeued/);
+  assert.match(admin, /operationHandler\("maintenance\.subscriber\.requeue"\)/);
+  const command=source("src/services/admin-operational-command-service.js");
+  assert.match(command, /executeAdminCommand/);
+  assert.match(command, /maintenance\.subscriber\.requeue/);
 });
 
 test("A31 disposable cleanup cannot reap a parallel live proof during zero-connection gaps", () => {

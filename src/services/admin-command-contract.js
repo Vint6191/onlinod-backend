@@ -65,6 +65,8 @@ const contentLifecycleSchema = z.object({
 }).strict();
 
 const ACTIONS = Object.freeze({
+  "support.grant.open": {roles:["SUPER_ADMIN","SUPPORT"],schema:z.object({agencyId:z.string().trim().min(1).max(180),reason:reasonSchema,durationMinutes:z.number().int().min(5).max(30).default(15)}).strict()},
+  "support.grant.revoke": {roles:["SUPER_ADMIN","SUPPORT"],schema:z.object({reason:reasonSchema}).strict()},
   ...require("./admin-operational-command-contract").OPERATIONAL_ACTIONS,
   "data.content.lifecycle": { roles: ["SUPER_ADMIN"], schema: contentLifecycleSchema },
   "data.delivery.archive": { roles: ["SUPER_ADMIN"], schema: deliveryArchiveSchema },

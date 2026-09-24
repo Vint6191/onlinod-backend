@@ -101,3 +101,16 @@ test("legacy unbound refresh-token reuse retains account-wide fallback", async (
   assert.ok(updates[0].where.expiresAt?.gt instanceof Date, "legacy fallback must still only revoke live account sessions");
   assert.equal(updates[0].where.deviceId, undefined);
 });
+
+
+test("retired support refresh cannot rotate or revoke the real customer's direct sessions", async () => {
+  let writes=0;
+  const now=new Date();
+  const prisma={
+    refreshSession:{findUnique:async()=>({id:"legacy",userId:"u",agencyId:"a",expiresAt:new Date(now.getTime()+60000),revokedAt:now,impersonatedByAdminId:"support",user:{id:"u"}}),updateMany:async()=>{writes++;}},
+    $transaction:async()=>{writes++;},
+  };
+  const auth=loadAuthService(prisma);
+  const result=await auth.refreshAccessToken({refreshToken:"old-support",req:{headers:{}}});
+  assert.equal(result.code,"LEGACY_IMPERSONATION_RETIRED");assert.equal(writes,0);
+});

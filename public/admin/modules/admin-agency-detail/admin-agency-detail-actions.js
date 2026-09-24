@@ -29,14 +29,8 @@
 
   // ─── Header actions ────────────────────────────────────────
 
-  async function doImpersonate(agencyId) {
-    const result = await A().impersonate(agencyId, {});
-    if (!result?.ok) {
-      R().toast(result?.error || "Impersonate failed");
-      return;
-    }
-    window.open(result.url, "_blank", "noopener");
-    R().toast(`impersonating ${result.target?.userEmail || "owner"}`);
+  async function doSupport(agencyId) {
+    return window.OnlinodAdminSupport.open(agencyId);
   }
 
   async function doSoftDelete(agencyId) {
@@ -151,7 +145,7 @@
 
   window.OnlinodAdminAgencyDetailActions = {
     reloadDetail,
-    doImpersonate,
+    doSupport,
     doSoftDelete,
     doRestore,
     doHardDelete,

@@ -7,7 +7,7 @@
    
    Each row click opens agency detail (заход 3 will implement).
    Per-row actions:
-     - impersonate as owner → opens new tab with magic URL
+     - support diagnostics under the administrator identity
    
    We deliberately don't paginate — agencies count is small enough
    that one fetch is fine. We'll add cursor pagination if it ever
@@ -215,21 +215,14 @@
         <td class="adm-cell-mono">${r.escapeHtml(u.formatDate(a.createdAt))}</td>
 
         <td onclick="event.stopPropagation()">
-          <button class="adm-btn ghost" data-impersonate="${r.escapeAttr(a.id)}" title="open as owner in a new tab">⮕ impersonate</button>
+          <button class="adm-btn ghost" data-support="${r.escapeAttr(a.id)}" title="open agency diagnostics">Support</button>
         </td>
       </tr>
     `;
   }
 
-  async function doImpersonate(agencyId) {
-    const result = await A().impersonate(agencyId, {});
-    if (!result?.ok) {
-      R().toast(result?.error || "Impersonate failed");
-      return;
-    }
-    // Open in new tab. The page at "/" claims the token via /api/impersonate/claim.
-    window.open(result.url, "_blank", "noopener");
-    R().toast(`impersonating ${result.target?.userEmail || "owner"}`);
+  async function doSupport(agencyId) {
+    return window.OnlinodAdminSupport.open(agencyId);
   }
 
   function bind(main) {
@@ -270,11 +263,11 @@
     });
 
     // Impersonate buttons.
-    main.querySelectorAll("[data-impersonate]").forEach((btn) => {
+    main.querySelectorAll("[data-support]").forEach((btn) => {
       btn.addEventListener("click", (e) => {
         e.stopPropagation();
-        const id = btn.dataset.impersonate;
-        if (id) doImpersonate(id);
+        const id = btn.dataset.support;
+        if (id) doSupport(id);
       });
     });
   }

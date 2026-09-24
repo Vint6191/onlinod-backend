@@ -200,7 +200,7 @@
           ${
             isDeleted
               ? `<button class="adm-btn primary" data-action="restore">↺ restore</button>`
-              : `<button class="adm-btn" data-action="impersonate">⮕ impersonate owner</button>`
+              : `<button class="adm-btn" data-action="support">Support diagnostics</button>`
           }
 
           ${
@@ -278,7 +278,7 @@
         const a = slice.data.agency;
 
         if (action === "refresh") return load(true);
-        if (action === "impersonate")  return window.OnlinodAdminAgencyDetailActions.doImpersonate(a.id);
+        if (action === "support") return window.OnlinodAdminAgencyDetailActions.doSupport(a.id);
         if (action === "soft-delete")  return window.OnlinodAdminAgencyDetailActions.doSoftDelete(a.id);
         if (action === "hard-delete")  return window.OnlinodAdminAgencyDetailActions.doHardDelete(a.id);
         if (action === "restore")      return window.OnlinodAdminAgencyDetailActions.doRestore(a.id);

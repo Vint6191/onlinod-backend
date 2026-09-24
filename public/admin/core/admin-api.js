@@ -21,6 +21,7 @@
   function setToken(token) {
     if (token) localStorage.setItem(TOKEN_KEY, token);
     else localStorage.removeItem(TOKEN_KEY);
+    window.dispatchEvent?.(new window.CustomEvent("onlinod:admin-session-changed"));
   }
 
   function buildUrl(path, query) {
@@ -138,7 +139,9 @@
     patchAgency:     (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}`,         { method: "PATCH",  body }),
     deleteAgency:    (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}`,        { method: "DELETE", body }),
     restoreAgency:   (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/restore`, { method: "POST",   body }),
-    impersonate:     (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/impersonate`, { method: "POST", body }),
+    openSupport: (body) => request("/api/admin/support/grants", {method:"POST",body}),
+    readSupport: (id, query) => request(`/api/admin/support/grants/${encodeURIComponent(id)}`, {query}),
+    revokeSupport: (id, body) => request(`/api/admin/support/grants/${encodeURIComponent(id)}/revoke`, {method:"POST",body}),
     setBillingHold: (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/billing-hold`, { method: "PATCH", body }),
     patchCreatorEntitlement: (id, body) => request(`/api/admin/creators/${encodeURIComponent(id)}/entitlement`, { method: "PATCH", body }),
     patchSubscription: (id, body) => request(`/api/admin/agencies/${encodeURIComponent(id)}/subscription`, { method: "PATCH", body }),

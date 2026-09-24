@@ -60,7 +60,6 @@ const bcrypt    = require("bcryptjs");
 const { z }     = require("zod");
 const prisma    = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
-const { signAccessToken } = require("../utils/tokens");
 const { getRetentionSettings, updateRetentionSettings, resetRetentionSettings, runRetentionSweep } = require("../services/retention-service");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { publicEntitlement, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("../services/billing-entitlement-service");
@@ -599,83 +598,8 @@ router.delete("/agencies/:id", operationHandler("agency.retire"));
 // POST /agencies/:id/restore   — undo soft delete
 router.post("/agencies/:id/restore", operationHandler("agency.restore"));
 
-// POST /agencies/:id/impersonate
-//
-// Issues a short-lived ImpersonationToken bound to (admin → user, agency).
-// Frontend opens the customer console at /?impersonate=<token>; that page
-// claims the token via /api/admin/impersonate/claim and gets a real
-// access+refresh pair scoped to the target user.
-//
-// Body: { userId? }  — if omitted, falls back to the agency's OWNER.
-const impersonateBodySchema = z.object({
-  userId: z.string().optional(),
-});
-
-router.post("/agencies/:id/impersonate", async (req, res) => {
-  try {
-    const body = impersonateBodySchema.parse(req.body || {});
-
-    const agency = await prisma.agency.findUnique({
-      where: { id: req.params.id },
-      include: { members: { include: { user: true } } },
-    });
-    if (!agency) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND", error: "Agency not found" });
-
-    // Resolve target user.
-    let member = null;
-    if (body.userId) {
-      member = agency.members.find((m) => m.userId === body.userId) || null;
-    }
-    if (!member) {
-      member = agency.members.find((m) => m.role === "OWNER") || agency.members[0] || null;
-    }
-    if (!member) {
-      return res.status(409).json({ ok: false, code: "AGENCY_HAS_NO_MEMBER", error: "Agency has no members to impersonate" });
-    }
-
-    const rawToken = newToken(48);
-    const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
-
-    await prisma.impersonationToken.create({
-      data: {
-        tokenHash: sha256(rawToken),
-        adminUserId: req.admin.id,
-        targetUserId: member.userId,
-        targetAgencyId: agency.id,
-        expiresAt,
-      },
-    });
-
-    await adminLog(req, {
-      agencyId: agency.id,
-      action: "admin.impersonate_issued",
-      targetType: "user",
-      targetId: member.userId,
-      before: null,
-      after: { adminId: req.admin.id, expiresAt },
-      reason: req.body?.reason || null,
-    });
-
-    const baseUrl = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
-    const url = baseUrl ? `${baseUrl}/?impersonate=${rawToken}` : `/?impersonate=${rawToken}`;
-
-    return res.json({
-      ok: true,
-      url,
-      token: rawToken,
-      expiresAt,
-      target: {
-        userId: member.userId,
-        userEmail: member.user.email,
-        agencyId: agency.id,
-        agencyName: agency.name,
-      },
-    });
-  } catch (err) {
-    if (err?.issues) return validationError(res, err);
-    return res.status(500).json({ ok: false, code: "IMPERSONATE_FAILED", error: err?.message || "Failed" });
-  }
-});
+// Compatibility tombstone: support remains under the administrator identity.
+router.post("/agencies/:id/impersonate", (_req,res)=>res.status(410).json({ok:false,code:"LEGACY_IMPERSONATION_RETIRED",error:"Open the agency Support view in the admin console"}));
 
 // PATCH /agencies/:id/subscription — policy only; paid dates are domain-owned.
 router.patch("/agencies/:id/subscription", setBillingPolicyHandler);

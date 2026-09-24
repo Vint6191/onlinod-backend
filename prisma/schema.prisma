@@ -6455,3 +6455,19 @@ model AdminCommandAudit {
   @@index([scopeAgencyId, createdAt, id])
   @@index([actorId, createdAt, id])
 }
+
+// Admin-only support context; scalar identity snapshots are revalidated on read.
+model AdminSupportGrant {
+  id String @id @default(cuid())
+  actorId String
+  sessionId String
+  actorAccessEpoch Int
+  agencyId String
+  reason String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(dbgenerated("(CURRENT_TIMESTAMP AT TIME ZONE 'UTC'::text)"))
+  @@index([actorId, createdAt, id])
+  @@index([sessionId])
+  @@index([expiresAt])
+}

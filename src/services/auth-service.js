@@ -166,6 +166,7 @@ async function createRefreshSession({
   authorizationSessionId = null,
   db = prisma,
 }) {
+  if (impersonatedByAdminId) throw Object.assign(new Error("Customer impersonation is retired"), {code:"LEGACY_IMPERSONATION_RETIRED",status:410});
   const refreshToken = randomToken(48);
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
   const expiresAt = new Date(authorityNow.getTime() + refreshDaysForRememberDevice(rememberDevice) * 24 * 60 * 60 * 1000);
@@ -181,7 +182,7 @@ async function createRefreshSession({
       rememberDevice: rememberDevice === true,
       deviceId: deviceId || null,
       client: client || null,
-      impersonatedByAdminId: impersonatedByAdminId || null,
+      impersonatedByAdminId: null,
       authorizationSessionId: authorizationSessionId || null,
     },
     select: { id: true },
@@ -396,6 +397,9 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
     return { ok: false, code: "REFRESH_INVALID", error: "Refresh token is invalid or expired" };
   }
 
+  // Refuse legacy support before generic reuse handling: a stale support token
+  // must not revoke the real customer's direct sessions as a side effect.
+  if (session.impersonatedByAdminId) return {ok:false,code:"LEGACY_IMPERSONATION_RETIRED",error:"Support sessions cannot refresh customer access"};
   if (session.revokedAt) {
     await revokeRefreshReuseScope(session);
     return { ok: false, code: "REFRESH_REUSED", error: "Refresh token reuse detected. Please sign in again." };
@@ -458,6 +462,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
         userId: session.userId,
         agencyId: session.agencyId,
       });
+      if (sourceSession.impersonatedByAdminId) throw Object.assign(new Error("Customer impersonation is retired"), {code:"LEGACY_IMPERSONATION_RETIRED",status:410});
       const sourceLineage = String(sourceSession.authorizationSessionId || "").trim() || null;
       if (sourceLineage && requestedIncarnation && requestedIncarnation !== sourceLineage) {
         const error = new Error("Refresh session belongs to a different authorization generation");
@@ -505,7 +510,7 @@ async function refreshAccessToken({ refreshToken, req, deviceId = null, client =
           rememberDevice: session.rememberDevice === true,
           deviceId: effectiveDeviceId,
           client: client || session.client,
-          impersonatedByAdminId: session.impersonatedByAdminId || null,
+          impersonatedByAdminId: null,
           authorizationSessionId,
           lastUsedAt: rotationNow,
         },

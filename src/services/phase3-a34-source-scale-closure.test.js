@@ -601,7 +601,8 @@ test("A34 Hidden status has one canonical writer boundary and an atomic projecti
 
   assert.match(admin, /hiddenOnlineUser:[^\n]*deleteProtected:\s*true/);
   assert.match(admin, /followBackTask:[^\n]*deleteProtected:\s*true/);
-  assert.match(admin, /if \(m\.deleteProtected\)[\s\S]*ADMIN_DELETE_PROTECTED/);
+  assert.match(admin, /router\.delete\("\/record\/:model\/:id", retiredMutation\)/);
+  assert.match(admin, /ADMIN_DATA_MUTATION_RETIRED/);
   assert.match(admin, /hiddenOnlineUser\.findMany\(\{ where: \{ fanId: q \}/);
   assert.doesNotMatch(admin, /hiddenOnlineUser\.findMany\(\{ where: \{ OR:/);
 });

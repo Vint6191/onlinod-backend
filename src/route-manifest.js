@@ -36,6 +36,7 @@ const ROUTE_MANIFEST = Object.freeze([
   route("/api/admin/data", ROUTE_CLASS.ADMIN, "routes/admin-data.js", "admin authorization"),
   route("/api/admin/billing", ROUTE_CLASS.ADMIN, "routes/admin-billing.js", "admin authorization"),
   route("/api/admin", ROUTE_CLASS.ADMIN, "routes/admin.js", "admin authorization"),
+  route("/api/admin/support", ROUTE_CLASS.ADMIN, "routes/admin-support.js", "scoped admin support diagnostics"),
   route("/api/impersonate", ROUTE_CLASS.ADMIN, "routes/impersonate.js", "admin impersonation authority"),
   route("/api/workspace", ROUTE_CLASS.AGENCY, "routes/workspace.js", "current AgencyMember + workspace permissions"),
   route("/api/devices", ROUTE_CLASS.DEVICE, "routes/devices.js", "authenticated user/device lifecycle"),
