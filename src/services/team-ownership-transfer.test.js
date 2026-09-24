@@ -59,7 +59,24 @@ for(const mode of ["impersonated","expired","revoked","unbound","wrongLineage"])
 
 test("migration preflight supports empty bootstrap and blocks ambiguous legacy owners before migrate deploy",async()=>{
  const {preflight}=require("../../scripts/database/phase4-single-owner-preflight");
- const empty=await preflight({$queryRawUnsafe:async()=>[{agency:null,member:null,account:null}]});assert.equal(empty.bootstrap,true);
- let calls=0;await assert.rejects(()=>preflight({$queryRawUnsafe:async()=>++calls===1?[{agency:"Agency",member:"AgencyMember",account:"User"}]:[{agencyId:"a",owners:2,operationalOwners:2}]}),e=>e.code==="PHASE4_SINGLE_OWNER_PREFLIGHT_FAILED"&&e.blockers[0].owners===2);assert.equal(calls,2);
- await assert.rejects(()=>preflight({$queryRawUnsafe:async()=>[{agency:"Agency",member:null,account:"User"}]}),e=>e.code==="PHASE4_OWNER_SCHEMA_INCOMPLETE");
+ const empty=await preflight({$queryRawUnsafe:async()=>[{agency:false,member:false,account:false}]});assert.equal(empty.bootstrap,true);
+ let calls=0;await assert.rejects(()=>preflight({$queryRawUnsafe:async()=>++calls===1?[{agency:true,member:true,account:true}]:[{agencyId:"a",owners:2,operationalOwners:2}]}),e=>e.code==="PHASE4_SINGLE_OWNER_PREFLIGHT_FAILED"&&e.blockers[0].owners===2);assert.equal(calls,2);
+ await assert.rejects(()=>preflight({$queryRawUnsafe:async()=>[{agency:true,member:false,account:true}]}),e=>e.code==="PHASE4_OWNER_SCHEMA_INCOMPLETE");
+});
+
+test("schema probe fails closed on a malformed driver response instead of treating it as empty bootstrap",async()=>{
+ const {preflight}=require("../../scripts/database/phase4-single-owner-preflight");
+ for(const rows of [undefined,null,[],[{}],[{agency:null,member:null,account:null}],
+  [{agency:'Agency',member:'AgencyMember',account:'User'}],
+  [{agency:false,member:false,account:false},{agency:false,member:false,account:false}]]) {
+  let calls=0;
+  await assert.rejects(()=>preflight({$queryRawUnsafe:async()=>{calls++;return rows;}}),e=>e.code==="PHASE4_OWNER_SCHEMA_PROBE_INVALID");
+  assert.equal(calls,1);
+ }
+});
+
+test("schema probe preserves database failures and never skips ownership validation on error",async()=>{
+ const {preflight}=require("../../scripts/database/phase4-single-owner-preflight");
+ const failure=Object.assign(new Error("database unavailable"),{code:"P1001"});
+ await assert.rejects(()=>preflight({$queryRawUnsafe:async()=>{throw failure;}}),e=>e===failure);
 });
