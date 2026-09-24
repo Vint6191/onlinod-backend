@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { lockBillingWriteAdmission, assertBillingWriteAdmission } = require("./billing-write-admission-service");
 const prisma = require("../prisma");
 const { canUsePermission } = require("./team-access-control");
 const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./execution-access-fence-service");
@@ -408,6 +409,7 @@ async function reserveMassLogicalIntent(input) {
   assertProgrammaticIdempotencyNamespace("MASS_QUEUE_CREATE", config, creatorId, idempotencyKey);
   const now = new Date();
   return prisma.$transaction(async (tx) => {
+    await lockBillingWriteAdmission({ db: tx, agencyId });
     const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId });
@@ -462,6 +464,7 @@ async function reserveMassLogicalIntent(input) {
 
     let delivery;
     try {
+      await assertBillingWriteAdmission({ db: tx, agencyId, creatorId });
       delivery = await tx.automationDelivery.create({
         data: {
           agencyId, creatorId,
@@ -1189,6 +1192,7 @@ async function reserveProgrammaticWrite(input) {
   const now = new Date();
 
   return prisma.$transaction(async (tx) => {
+    await lockBillingWriteAdmission({ db: tx, agencyId });
     // CUSTOM_MANUAL_SEND is part of the durable Custom pipeline lifecycle.
     // Serialize NEW manual-write creation against agency/creator retirement so a
     // retire transaction cannot pass its blocker query and have a durable external
@@ -1212,10 +1216,13 @@ async function reserveProgrammaticWrite(input) {
     // with Automation semantics, then clear/transition expired programmatic
     // leases with programmatic semantics. Neither policy may process the other.
     const { sweepExpiredAutomationLeases } = require("./automation-action-delivery-service");
-    await sweepExpiredAutomationLeases({ now, agencyId, creatorIds: [creatorId] });
+    await sweepExpiredAutomationLeases({ db: tx, now, agencyId, creatorIds: [creatorId] });
     await sweepExpiredProgrammaticWriteLeases({ db: tx, agencyId, creatorId, now });
     let delivery = await tx.automationDelivery.findUnique({ where: { idempotencyKey } });
     const replay = Boolean(delivery);
+    if (!delivery || ["QUEUED", "RETRY_SCHEDULED", "CLAIMED", "RUNNING"].includes(delivery.status)) {
+      await assertBillingWriteAdmission({ db: tx, agencyId, creatorId });
+    }
     if (delivery) {
       const sameIdentity = delivery.agencyId === agencyId && delivery.creatorId === creatorId
         && delivery.actionType === config.actionType && delivery.originKind === config.originKind
@@ -1424,8 +1431,10 @@ async function requireProgrammaticLease(input, { db = prisma, allowTerminal = fa
 
 async function startProgrammaticWrite(input) {
   return prisma.$transaction(async (tx) => {
+    await lockBillingWriteAdmission({ db: tx, agencyId: input.agencyId });
     const delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
     if (delivery.status === "RECONCILE_REQUIRED") return { ok: true, reconciliationRequired: true, delivery: publicDelivery(delivery) };
+    if (["CLAIMED", "RUNNING"].includes(delivery.status)) await assertBillingWriteAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
     if (delivery.status === "RUNNING") return { ok: true, duplicate: true, delivery: publicDelivery(delivery) };
     if (delivery.status === "COMMITTING") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_ALREADY_COMMITTING", "Write already crossed the commit boundary", 409);
     if (delivery.status !== "CLAIMED") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_CLAIMED", `Programmatic write status is ${delivery.status}`, 409);
@@ -1457,6 +1466,7 @@ async function checkpointProgrammaticWrite(input) {
 
 async function prepareProgrammaticWrite(input) {
   return prisma.$transaction(async (tx) => {
+    await lockBillingWriteAdmission({ db: tx, agencyId: input.agencyId });
     let delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
     await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId });
     delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
@@ -1473,7 +1483,7 @@ async function prepareProgrammaticWrite(input) {
       const { assertCustomManualDeliveryCommitCurrent } = require("./custom-manual-delivery-authority-service");
       await assertCustomManualDeliveryCommitCurrent({ db: tx, delivery });
     }
-    const now = new Date();
+    const { now } = await assertBillingWriteAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
     const wantsCustomSettlement = storedProgrammaticKind(delivery) === "CUSTOM_MANUAL_SEND" && input.mintCustomManualSettlementCapability === true;
     const customSettlement = wantsCustomSettlement ? mintWriteSettlementToken() : null;
     const currentResult = object(delivery.result);

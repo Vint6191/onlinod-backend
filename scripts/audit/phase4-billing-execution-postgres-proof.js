@@ -188,6 +188,7 @@ async function main() {
       assert.equal((await state("unpaid")).allowed, true); assert.equal((await state("future")).allowed, false);
       await db.$executeRawUnsafe("SET TIME ZONE 'UTC'");
     });
+    await require("../test-support/billing-write-postgres-cases")({ db, check, member });
     console.log(JSON.stringify({ ok: true, passed: cases.length, cases, engine: "PGlite with Prisma 5.22", nativeConcurrency: false, productionScale: false }));
   } finally { gate?._test.reset(); await db.$disconnect(); await server.stop(); await engine.close(); }
 }

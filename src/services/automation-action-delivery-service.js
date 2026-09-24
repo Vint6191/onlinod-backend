@@ -1,6 +1,9 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { runDbTransaction } = require("./db-transaction-service");
+const { readBillingExecutionAccess } = require("./billing-execution-access-service");
+const { lockBillingWriteAdmission, assertBillingWriteAdmission, billingActionClaimWhere, isBillingAdmissionError } = require("./billing-write-admission-service");
 const prisma = require("../prisma");
 const { canUsePermission, isOwner, normalizeAssignedCreators } = require("./team-access-control");
 const { requireCreatorAccess, allowedCreatorScope } = require("../middleware/automation-permissions");
@@ -266,6 +269,7 @@ async function scopedReadyCreatorIds({ device, member }) {
 
 async function sweepExpiredAutomationLeases(input = new Date()) {
   const options = input instanceof Date ? { now: input } : (input || {});
+  const client = options.db || prisma;
   const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
   const agencyId = clean(options.agencyId, 180);
   const creatorIds = Array.isArray(options.creatorIds) ? [...new Set(options.creatorIds.map(String).filter(Boolean))] : null;
@@ -274,7 +278,7 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
     ...(agencyId ? { agencyId } : {}),
     ...(creatorIds ? { creatorId: { in: creatorIds.length ? creatorIds : ["__none__"] } } : {}),
   };
-  const rows = await prisma.automationDelivery.findMany({
+  const rows = await client.automationDelivery.findMany({
     where: { ...scopeWhere, status: { in: LEASED_STATUSES }, claimUntil: { lt: now } },
     select: {
       id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true,
@@ -286,7 +290,7 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
   const terminalizeUnresolved = async (row, where) => {
     const failureCode = "outcome_unresolved_do_not_retry";
     const result = { ...object(row.result), outcomeState: "UNRESOLVED_DO_NOT_RETRY", unresolvedClosedAt: now.toISOString(), unresolvedCloseReason: "MAINTENANCE_RECONCILIATION_WINDOW_EXPIRED" };
-    const updated = await prisma.$transaction(async (tx) => {
+    const updated = await runDbTransaction(client, async (tx) => {
       const changedRow = await tx.automationDelivery.updateMany({ where, data: {
         status: "FAILED", failureCode, failureCategory: FAILURE_CATEGORIES.TERMINAL,
         lastError: "Reconciliation evidence remained insufficient beyond the bounded verification window; logical commit closed permanently without retry",
@@ -328,7 +332,7 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
       ...(mustReconcile ? { reconciliationStartedAt: object(row.result).reconciliationStartedAt || row.writeCommitAt?.toISOString?.() || now.toISOString() } : {}),
       ...(row.actionType === "SEND_MESSAGE" && mustReconcile ? { phase: "send" } : {}),
     };
-    const latest = await prisma.$transaction(async (tx) => {
+    const latest = await runDbTransaction(client, async (tx) => {
       const updated = await tx.automationDelivery.updateMany({
         where: { id: row.id, status: row.status, leaseRevision: row.leaseRevision, claimUntil: { lt: now } },
         data: { status: nextStatus, failureCode, failureCategory, lastError: mustReconcile ? "Action outcome must be reconciled after lost commit/reconciliation lease" : "Action lease expired", notBefore: terminal ? row.notBefore : retryAt, finishedAt: terminal ? now : null, claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, result: nextResult },
@@ -353,7 +357,7 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
   }
   // Stranded reconciliation rows have no lease timestamp, so they need an
   // explicit bounded sweep or they would hold the global creator lane forever.
-  const stranded = await prisma.automationDelivery.findMany({
+  const stranded = await client.automationDelivery.findMany({
     where: { ...scopeWhere, status: "RECONCILE_REQUIRED", claimUntil: null },
     select: { id: true, agencyId: true, creatorId: true, moduleKey: true, actionType: true, fanId: true, targetId: true, payload: true, status: true, result: true, failureCode: true, writeCommitAt: true, leaseRevision: true, attempts: true, maxAttempts: true },
     take: 10000,
@@ -375,7 +379,7 @@ async function sweepExpiredActionLeases(input = new Date()) {
   return automationChanged + programmaticChanged;
 }
 
-async function fairCandidates({ agencyId, creatorIds, actionTypes, now }) {
+async function fairCandidates({ agencyId, creatorIds, actionTypes, now, billingWhere }) {
   const candidates = await prisma.automationDelivery.findMany({
     where: {
       agencyId,
@@ -384,6 +388,7 @@ async function fairCandidates({ agencyId, creatorIds, actionTypes, now }) {
       actionType: { in: actionTypes },
       status: { in: CLAIMABLE_STATUSES },
       notBefore: { lte: now },
+      AND: [billingWhere],
     },
     orderBy: [{ priority: "desc" }, { notBefore: "asc" }, { createdAt: "asc" }],
     take: 100,
@@ -700,7 +705,8 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
   // claimedAt is a fallback causal generation for action profile observations.
   // Keep it on the same PostgreSQL clock authority as attemptStartedAt.
   const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
-  const candidates = await fairCandidates({ agencyId: device.agencyId, creatorIds, actionTypes: allowedActionTypes, now });
+  const billingAccess = await readBillingExecutionAccess({ db: prisma, agencyId: device.agencyId, creatorIds });
+  const candidates = await fairCandidates({ agencyId: device.agencyId, creatorIds, actionTypes: allowedActionTypes, now, billingWhere: billingActionClaimWhere(billingAccess) });
   for (const candidate of candidates) {
     const reconciliationClaim = deliveryRequiresReconciliation(candidate);
     let control = null;
@@ -777,6 +783,9 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
     const claimUntil = new Date(now.getTime() + leaseDuration(leaseMs));
     try {
       const claimed = await prisma.$transaction(async (tx) => {
+        await lockBillingWriteAdmission({ db: tx, agencyId: candidate.agencyId });
+        await assertExecutionAccessFence({ db: tx, userId, agencyId: candidate.agencyId, memberId: member.id, accessEpoch: Number(member.accessEpoch || 1), creatorId: candidate.creatorId, lock: true });
+        if (!reconciliationClaim) await assertBillingWriteAdmission({ db: tx, agencyId: candidate.agencyId, creatorId: candidate.creatorId });
         // Legacy Audit13 rows may still be RETRY_SCHEDULED while carrying the
         // durable OUTCOME_UNKNOWN_RECONCILE category. They must block unrelated
         // writes just like RECONCILE_REQUIRED until they are reconciled.
@@ -826,6 +835,7 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
         },
       };
     } catch (error) {
+      if (isBillingAdmissionError(error)) continue;
       if (error?.code === "P2002" || String(error?.message || "").includes("creator_write_lease_unique")) continue;
       throw error;
     }
@@ -833,7 +843,7 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
   return { delivery: null, reason: "no_work" };
 }
 
-async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, allowTerminal = false, allowExpired = false, allowCommittedSettlement = false, lockAccess = false, db = prisma }) {
+async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, allowTerminal = false, allowExpired = false, allowCommittedSettlement = false, lockAccess = false, billingAdmission = false, db = prisma }) {
   const { device, member } = await requireOwnedSeniorDevice({ userId, deviceId, db });
   const delivery = await db.automationDelivery.findUnique({ where: { id: deliveryId } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
@@ -841,6 +851,7 @@ async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRev
     throw new ActionDeliveryError("DELIVERY_WRONG_AUTHORITY", "Programmatic write deliveries must use ProgrammaticOfWriteAuthority", 403);
   }
   if (delivery.agencyId !== device.agencyId) throw new ActionDeliveryError("DELIVERY_DEVICE_AGENCY_MISMATCH", "Delivery belongs to another agency", 403);
+  if (billingAdmission && lockAccess) await lockBillingWriteAdmission({ db, agencyId: delivery.agencyId });
   const terminal = TERMINAL_STATUSES.includes(delivery.status);
   if (!(LEASED_STATUSES.includes(delivery.status) || (allowTerminal && terminal))) {
     throw new ActionDeliveryError("DELIVERY_NOT_CLAIMED", `Delivery status is ${delivery.status}`);
@@ -862,6 +873,9 @@ async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRev
   } catch (error) {
     if (error instanceof ExecutionAccessFenceError) throw new ActionDeliveryError(error.code, error.message, error.status);
     throw error;
+  }
+  if (billingAdmission && delivery.status !== "COMMITTING" && !deliveryRequiresReconciliation(delivery)) {
+    await assertBillingWriteAdmission({ db, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
   }
   return delivery;
 }
@@ -1055,7 +1069,7 @@ async function startActionDelivery(input) {
     // profile-reading action the Backend itself marks post-provider-read tokens
     // mandatory; client capability input is informational, never chronology authority.
     const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
-    const delivery = await requireLease({ ...input, db: tx, lockAccess: true });
+    const delivery = await requireLease({ ...input, db: tx, lockAccess: true, billingAdmission: true });
     const reconciliationLease = deliveryRequiresReconciliation(delivery);
     if (!reconciliationLease) await assertDeliveryControl(delivery, { db: tx });
     if (delivery.notBefore.getTime() > now.getTime()) throw new ActionDeliveryError("DELIVERY_NOT_DUE", "Delivery is not due yet");
@@ -1127,7 +1141,7 @@ async function validateActionDelivery(input) {
 async function prepareWriteActionDelivery(input) {
   try {
     return await prisma.$transaction(async (tx) => {
-    let delivery = await requireLease({ ...input, db: tx, lockAccess: true });
+    let delivery = await requireLease({ ...input, db: tx, lockAccess: true, billingAdmission: true });
     await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId });
     // The control writer holds the same transaction-scoped fence. Re-read the
     // lease after acquiring it so a queued control/revoke transition cannot
@@ -1139,7 +1153,7 @@ async function prepareWriteActionDelivery(input) {
     if (deliveryRequiresReconciliation(delivery)) throw new ActionDeliveryError("DELIVERY_RECONCILIATION_REQUIRED", "Delivery must prove the previous external write outcome before another write permit");
     if (delivery.status !== "RUNNING") throw new ActionDeliveryError("DELIVERY_NOT_RUNNING", `Delivery status is ${delivery.status}`);
     const control = await assertDeliveryControl(delivery, { db: tx });
-    const now = new Date();
+    let now = (await assertBillingWriteAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId })).now;
     let fanCurrentFence = null;
     if (delivery.moduleKey === "follow_back") {
       const validation = await validateFollowBackDeliveryCurrent({
@@ -1183,6 +1197,9 @@ async function prepareWriteActionDelivery(input) {
         throw error;
       }
     }
+    // Re-read the DB clock after potentially slow consumer validation. The Agency
+    // share lock acquired before membership prevents a concurrent hold/refund.
+    now = (await assertBillingWriteAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId })).now;
     // Transaction-local proof for the DB release fence. Set only after current
     // consumer/access/field validation; old replicas cannot mint a new permit.
     await tx.$executeRawUnsafe(

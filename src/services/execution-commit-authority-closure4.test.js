@@ -64,9 +64,12 @@ test("Closure4 production has zero queryRaw transaction advisory locks and one s
   }
   assert.deepEqual(offenders, []);
   assert.deepEqual(lockSources.sort(), [
+    "services/admin-commit-authority-service.js",
+    "services/admin-operator-bootstrap-service.js",
     "services/automation-write-commit-fence-service.js",
     "services/creator-analytics-ledger-service.js",
     "services/db-transaction-service.js",
+    "services/message-library-lifecycle-service.js",
     "services/notification-facts-service.js",
   ]);
 
@@ -231,6 +234,7 @@ test("Closure4 prepareWriteActionDelivery reaches COMMITTING through executeRaw 
   const restores = [];
   const actionId = require.resolve("./automation-action-delivery-service");
   try {
+    require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(db, { clock: () => new Date() });
     restores.push(cacheModule("../prisma", db));
     restores.push(cacheModule("./team-access-control", {
       canUsePermission: async () => true,
@@ -278,10 +282,12 @@ test("Closure4 prepareWriteActionDelivery reaches COMMITTING through executeRaw 
     assert.equal(delivery.status, "COMMITTING");
     assert.equal(delivery.writeCommitRevision, 1);
     assert.equal(fx.calls.query.length, 0);
-    assert.equal(fx.calls.execute.length, 2);
-    assert.deepEqual(fx.calls.execute[0].args, ["onlinod:automation-write-commit:v1", "agency-1"]);
-    assert.equal(fx.calls.execute[1].sql, "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)");
-    assert.deepEqual(fx.calls.execute[1].args, ["phase3_fan_consumer_v1_current_bounded"]);
+    assert.equal(fx.calls.execute.length, 3);
+    assert.equal(fx.calls.execute[0].sql, "SELECT pg_advisory_xact_lock_shared(hashtext($1))");
+    assert.deepEqual(fx.calls.execute[0].args, ["agency-lifecycle:agency-1"]);
+    assert.deepEqual(fx.calls.execute[1].args, ["onlinod:automation-write-commit:v1", "agency-1"]);
+    assert.equal(fx.calls.execute[2].sql, "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)");
+    assert.deepEqual(fx.calls.execute[2].args, ["phase3_fan_consumer_v1_current_bounded"]);
   } finally {
     delete require.cache[actionId];
     for (const restore of restores.reverse()) restore();

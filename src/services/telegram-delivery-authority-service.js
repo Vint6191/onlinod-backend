@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { lockBillingWriteAdmission, assertBillingWriteAdmission, selectBillableTelegramWorkIds } = require("./billing-write-admission-service");
 const { audit } = require("./audit-service");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { assertExecutionAccessFence } = require("./execution-access-fence-service");
@@ -984,9 +985,10 @@ async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = ne
   // Stale precommit rows are repaired/cancelled here only inside that same finite budget;
   // we never keep paging through the tenant just to fill `limit`.
   const scanBudget = Math.min(200, Math.max(25, take * 4));
+  const billableIds = await selectBillableTelegramWorkIds({ db: client, agencyId, scope, take: scanBudget });
   const rows = await client.telegramDeliveryIntent.findMany({
     where: {
-      agencyId, ...scopeWhere(scope), state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] },
+      agencyId, ...scopeWhere(scope), id: { in: billableIds }, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] },
       NOT: { state: "PLANNED", commitStartedAt: null, outcomeReason: { startsWith: PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX } },
     },
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
@@ -1047,6 +1049,7 @@ async function claimTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
   }
   const currentClaimAlive = row.state === "CLAIMED" && row.claimUntil && new Date(row.claimUntil).getTime() > now.getTime();
   if (currentClaimAlive && String(row.deviceId || "") !== normalizedDeviceId) return { ok: true, claimed: false, busy: true, intent: publicIntent(row), claimToken: null };
+  await assertBillingWriteAdmission({ db: client, agencyId, creatorId: row.creatorId });
   const claimToken = crypto.randomUUID(); const claimUntil = new Date(now.getTime() + CLAIM_MS); const nextRevision = Number(row.claimRevision || 0) + 1;
   const changed = await client.telegramDeliveryIntent.updateMany({
     where: { id: row.id, agencyId, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: Number(row.claimRevision || 0), ...(row.state === "CLAIMED" && row.claimUntil ? { claimUntil: row.claimUntil } : {}) },
@@ -1162,6 +1165,7 @@ async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
   verifyStoredClaim(initial, { deviceId, claimToken });
 
   const beginPermit = async (tx) => {
+    await lockBillingWriteAdmission({ db: tx, agencyId });
     // Re-read inside the transaction. The TASK permit and the CustomOrder updatedAt fence must
     // become visible atomically, otherwise a business edit can pass its pre-check just before
     // COMMITTING and write a new model-visible revision after the external effect was permitted.
@@ -1195,9 +1199,11 @@ async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
       }
     }
 
+    const billing = await assertBillingWriteAdmission({ db: tx, agencyId, creatorId: row.creatorId });
+    if (!row.claimUntil || new Date(row.claimUntil) <= billing.now) throw fail("TELEGRAM_DELIVERY_CLAIM_STALE", "Telegram delivery claim expired before commit", 409);
     const changed = await tx.telegramDeliveryIntent.updateMany({
       where: { id: row.id, agencyId, state: "CLAIMED", claimRevision: row.claimRevision, claimTokenHash: row.claimTokenHash },
-      data: { state: "COMMITTING", commitStartedAt: now, claimUntil: null },
+      data: { state: "COMMITTING", commitStartedAt: billing.now, claimUntil: null },
     });
     if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_BEGIN_RACE", "Telegram delivery changed before commit permit", 409);
     const fresh = await tx.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });

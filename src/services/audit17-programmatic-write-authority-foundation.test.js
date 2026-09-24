@@ -103,7 +103,9 @@ function makeDb() {
     $transaction: async (fn) => fn(db),
     $executeRawUnsafe: async () => 1,
   };
-  return { db, getRow: () => row };
+  const billing = {};
+  require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(db, { billing });
+  return { db, billing, getRow: () => row };
 }
 
 async function withAuthority(run) {
@@ -679,7 +681,7 @@ test("Audit17 shared lease sweeper dispatches programmatic rows to programmatic 
   assert.match(automationService, /sweepExpiredProgrammaticWriteLeases\(\{ now, agencyId: options\.agencyId, creatorIds: options\.creatorIds \}\)/);
   assert.match(automationService, /async function sweepExpiredAutomationLeases/);
   assert.match(automationService, /scopeWhere[\s\S]*originKind:\s*"AUTOMATION"[\s\S]*status:\s*\{\s*in:\s*LEASED_STATUSES/);
-  assert.match(programmaticService, /sweepExpiredAutomationLeases\(\{ now, agencyId, creatorIds: \[creatorId\] \}\)/);
+  assert.match(programmaticService, /sweepExpiredAutomationLeases\(\{ db: tx, now, agencyId, creatorIds: \[creatorId\] \}\)/);
   assert.match(programmaticService, /originKind:\s*\{\s*not:\s*"AUTOMATION"\s*\}/);
   assert.match(programmaticService, /CLAIMED[\s\S]*RUNNING[\s\S]*COMMITTING[\s\S]*RECONCILE_REQUIRED/);
 });
@@ -895,4 +897,48 @@ test("Audit17 programmatic maintenance scans all expired/stranded rows with keys
   assert.match(sweep, /id:\s*\{ gt:\s*afterId \}/);
   assert.match(sweep, /take:\s*500/);
   assert.doesNotMatch(sweep, /take:\s*10000|take:\s*10_000/);
+});
+
+test("Phase4 billing blocks new programmatic reserve without creating a row", async () => {
+  await withAuthority(async ({ authority, billing, getRow }) => {
+    billing.trialEndsAt = new Date(Date.now() - 1000);
+    await assert.rejects(authority.reserveProgrammaticWrite(base), { code: "CREATOR_SUBSCRIPTION_REQUIRED" });
+    assert.equal(getRow(), null);
+  });
+});
+
+test("Phase4 billing rechecks reserve/start/commit and restores the same write after payment", async () => {
+  await withAuthority(async ({ authority, billing, getRow }) => {
+    const r = await authority.reserveProgrammaticWrite(base);
+    const input = { ...base, writeId: r.delivery.id, leaseToken: r.lease.token, leaseRevision: r.lease.revision };
+    billing.trialEndsAt = new Date(Date.now() - 1000);
+    await assert.rejects(authority.startProgrammaticWrite(input), { code: "CREATOR_SUBSCRIPTION_REQUIRED" });
+    assert.equal(getRow().status, "CLAIMED");
+    billing.coreValidFrom = new Date(Date.now() - 1000); billing.coreValidUntil = new Date(Date.now() + 60000);
+    await authority.startProgrammaticWrite(input);
+    billing.billingSupportHold = true;
+    await assert.rejects(authority.prepareProgrammaticWrite(input), { code: "BILLING_ACCESS_HELD" });
+    assert.equal(getRow().status, "RUNNING"); assert.equal(getRow().writeCommitRevision, 0);
+    billing.billingSupportHold = false;
+    await authority.prepareProgrammaticWrite(input);
+    billing.billingSupportHold = true;
+    const replay = await authority.prepareProgrammaticWrite(input);
+    assert.equal(replay.duplicate, true); assert.equal(replay.writeCommitRevision, 1);
+    const receipt = await authority.completeProgrammaticWrite({ ...input, result: { queueId: "receipt-after-hold" } });
+    assert.equal(receipt.delivery.status, "COMPLETED");
+  });
+});
+
+test("Phase4 billing does not authorize a new send from an unpaid reconciliation lease", async () => {
+  await withAuthority(async ({ authority, billing, getRow }) => {
+    const r = await authority.reserveProgrammaticWrite(base);
+    const input = { ...base, writeId: r.delivery.id, leaseToken: r.lease.token, leaseRevision: r.lease.revision };
+    await authority.startProgrammaticWrite(input); await authority.prepareProgrammaticWrite(input);
+    getRow().claimUntil = new Date(Date.now() - 1);
+    billing.trialEndsAt = new Date(Date.now() - 1000);
+    const recovered = await authority.reserveProgrammaticWrite(base);
+    assert.equal(recovered.reconciliationRequired, true);
+    await assert.rejects(authority.prepareProgrammaticWrite({ ...input, leaseToken: recovered.lease.token, leaseRevision: recovered.lease.revision }), { code: "PROGRAMMATIC_WRITE_RECONCILIATION_REQUIRED" });
+    assert.equal(getRow().writeCommitRevision, 1);
+  });
 });

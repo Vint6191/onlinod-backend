@@ -2,6 +2,18 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+// This historical in-memory fixture has no SQL adapter. Keep its existing ORM
+// paths, and adapt only the new billing dependency; SQL/locks have a real DB proof.
+const billingAdmission = require("./billing-write-admission-service");
+require.cache[require.resolve("./billing-write-admission-service")].exports = {
+  ...billingAdmission,
+  lockBillingWriteAdmission: async () => {},
+  selectBillableTelegramWorkIds: async ({ db }) => db._intents.map(row => row.id),
+  assertBillingWriteAdmission: ({ db, agencyId, creatorId }) => billingAdmission.assertBillingWriteAdmission({
+    agencyId, creatorId, db: { $queryRawUnsafe: async () => [{ creatorId, authorityNow: db._billingNow,
+      trialEndsAt: new Date(db._billingNow.getTime() + 86400000), billingMode: "MANUAL", ...db._billing }] },
+  }),
+};
 const {
   CLAIM_MS,
   planTelegramDeliveryIntent,
@@ -180,7 +192,9 @@ function dbFixture({ beforeCustomOrderUpdateMany = null } = {}) {
     auditLog: { async create({ data }) { const row={ id: `audit-${audits.length+1}`, ...clone(data) }; audits.push(row); return clone(row); } },
     async $transaction(fn) { return fn(this); },
   };
-  return { db, member, now, orders, intents, inboundEvents, submissions, accounts, creators, providerOperationalDebts };
+  const billing = {};
+  db._billing = billing; db._billingNow = now;
+  return { db, billing, member, now, orders, intents, inboundEvents, submissions, accounts, creators, providerOperationalDebts };
 }
 
 async function syncProviderOperationalBackfill(fx, { reminder = true } = {}) {
@@ -2768,4 +2782,34 @@ test("A42 committed old attempt keeps its exact late receipt after runtime owner
   assert.equal(plannedAgain.created, false);
   assert.equal(plannedAgain.intent.id, flow.planned.intent.id);
   assert.equal(plannedAgain.intent.state, "CONFIRMED", "late exact receipt must fence any second TASK send");
+});
+
+test("Phase4 expired billing prevents Telegram claim and payment restores the existing intent", async () => {
+  const fx = dbFixture();
+  const planned = await planTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, orderId: "order-1", kind: "TASK", now: fx.now, db: fx.db });
+  const input = { agencyId: "agency-1", member: fx.member, intentId: planned.intent.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", now: fx.now, db: fx.db };
+  fx.billing.trialEndsAt = new Date(fx.now.getTime() - 1);
+  await assert.rejects(claimTelegramDeliveryIntent(input), { code: "CREATOR_SUBSCRIPTION_REQUIRED" });
+  assert.equal(fx.intents[0].state, "PLANNED");
+  fx.billing.coreValidFrom = fx.now; fx.billing.coreValidUntil = new Date(fx.now.getTime() + 60000);
+  assert.equal((await claimTelegramDeliveryIntent(input)).claimed, true);
+  assert.equal(fx.intents.length, 1);
+});
+
+test("Phase4 hold between Telegram claim and begin cannot issue COMMITTING", async () => {
+  const fx = dbFixture(), flow = await revisionToClaimed(fx);
+  fx.billing.billingSupportHold = true;
+  await assert.rejects(beginTelegramDeliveryIntent({ agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: flow.claimed.claimToken, now: fx.now, db: fx.db }), { code: "BILLING_ACCESS_HELD" });
+  const row = fx.intents.find(r => r.id === flow.row.id);
+  assert.equal(row.state, "FAILED_PRECOMMIT"); assert.equal(row.commitStartedAt, null);
+});
+
+test("Phase4 Telegram exact receipt settles after hold; duplicate begin cannot issue a second send", async () => {
+  const fx = dbFixture(), flow = await revisionToClaimed(fx);
+  const input = { agencyId: "agency-1", member: fx.member, intentId: flow.row.id, deviceId: "device-1", runtimeClaimToken: "runtime-1", claimToken: flow.claimed.claimToken, now: fx.now, db: fx.db };
+  assert.equal((await beginTelegramDeliveryIntent(input)).begun, true);
+  fx.billing.billingSupportHold = true;
+  assert.equal((await beginTelegramDeliveryIntent(input)).begun, false);
+  const result = await confirmTelegramDeliveryIntent({ ...input, remoteMessageId: 12345, remoteRecipientTelegramUserId: "1001", remoteSentAt: fx.now });
+  assert.equal(result.intent.state, "CONFIRMED");
 });

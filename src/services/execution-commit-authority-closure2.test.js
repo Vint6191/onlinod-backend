@@ -43,9 +43,10 @@ function scalarMatches(actual, expected) {
 }
 
 function rowMatches(row, where = {}) {
+  if (Array.isArray(where.AND) && !where.AND.every((branch) => rowMatches(row, branch))) return false;
   if (Array.isArray(where.OR) && !where.OR.some((branch) => rowMatches(row, branch))) return false;
   for (const [key, expected] of Object.entries(where)) {
-    if (key === "OR") continue;
+    if (key === "OR" || key === "AND") continue;
     if (!scalarMatches(row[key], expected)) return false;
   }
   return true;
@@ -125,6 +126,7 @@ test("Closure2 TransactionClient without $transaction supports SFS completion an
 });
 
 function loadActionService(db) {
+  require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(db, { clock: () => new Date() });
   cacheModule("../prisma", db);
   cacheModule("./team-access-control", {
     canUsePermission: async () => true,
@@ -276,6 +278,7 @@ test("Closure2 COMMITTING expiry and reconciliation-worker crash retain creator 
 });
 
 function loadFollowBackForFence(db) {
+  require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(db, { clock: () => new Date() });
   cacheModule("../prisma", db);
   cacheModule("./automation-pacing-service", { nextAutomationWriteSlot: async () => new Date() });
   cacheModule("./automation-write-commit-fence-service", { runWithAutomationWriteCommitFence: async ({ work }) => work(db) });
@@ -307,6 +310,7 @@ test("Closure2 FollowBack ignore cannot cancel a COMMITTING delivery", async () 
 });
 
 function loadBumpForFence(db) {
+  require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(db, { clock: () => new Date() });
   cacheModule("../prisma", db);
   cacheModule("./automation-write-commit-fence-service", { runWithAutomationWriteCommitFence: async ({ work }) => work(db) });
   cacheModule("./automation-pacing-service", { nextAutomationWriteSlot: async () => new Date() });
@@ -385,6 +389,7 @@ test("Closure2 delayed SFS generation 1 scan is a no-op after candidate advances
 });
 
 function loadJobResultForTraffic(db, upsertTrafficSourceScan) {
+  require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(db, { clock: () => new Date() });
   cacheModule("../prisma", db);
   const stubs = {
     "./team-observation-service": { CATCHUP_JOB_KEY: "catchup", applyCatchupJobResult: async () => ({}), recordCatchupJobFailure: async () => ({}) },
@@ -436,6 +441,7 @@ function commitRaceDb({ moduleKey, targetId, actionType }) {
   };
   const db = {
     $executeRawUnsafe: async (sql, generation) => {
+      if (sql === "SELECT pg_advisory_xact_lock_shared(hashtext($1))") { assert.equal(generation, "agency-lifecycle:agency-1"); return 1; }
       assert.equal(sql, "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)");
       assert.equal(generation, "phase3_fan_consumer_v1_current_bounded");
       currentConsumerPermit = true;
@@ -495,6 +501,7 @@ test("Closure2 FollowBack ignore vs prepareWrite has one fence winner", async ()
 });
 
 function loadLikesForFence(db) {
+  require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(db, { clock: () => new Date() });
   cacheModule("../prisma", db);
   cacheModule("./automation-pacing-service", { nextAutomationWriteSlot: async () => new Date() });
   cacheModule("./job-planning-repository", { ensurePlannedJob: async () => ({ created: false, job: null }) });
