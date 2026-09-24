@@ -166,7 +166,7 @@ test("C2 role current-authority writers are topology -> Role -> actor -> bulk Me
 
 test("C2 invitation claim/restore is topology -> Role -> Creator -> User/Member materialization", () => {
   for (const [label, source, startNeedle] of [
-    ["authenticated claim", invitations, "const result = await prisma.$transaction"],
+    ["authenticated claim", invitations, "const result = await runRootCommit"],
     ["registration claim", auth, "if (inviteToken) {"],
   ]) {
     const branch = source.slice(source.indexOf(startNeedle));

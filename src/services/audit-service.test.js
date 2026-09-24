@@ -4,6 +4,13 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { audit, sanitizeAuditMetadata } = require("./audit-service");
 
+test("required audit cannot silently skip a missing scope or action", async () => {
+  for (const identity of [{ action: "required" }, { agencyId: "a1" }]) {
+    await assert.rejects(audit({ ...identity, required: true }), { code: "AUDIT_IDENTITY_REQUIRED" });
+    assert.equal(await audit(identity), null);
+  }
+});
+
 test("audit metadata strips secrets and message content", () => {
   const value = sanitizeAuditMetadata({
     creatorId: "c1",

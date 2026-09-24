@@ -495,7 +495,11 @@ function assertUserDisableOwnerSafetyPg(args) {
 }
 
 function updateMemberAccessByPlatformAdminPg(args) {
-  return require("./team-administration-service").updateMemberAccessByPlatformAdmin(args);
+  // This lock-topology fixture models an already authorized Admin parent. HTTP
+  // identity/receipt behavior is covered by the Admin command tests separately.
+  return require("./db-commit-kernel").runRootCommit(args.db, context =>
+    require("./team-administration-service").updateMemberAccessByPlatformAdmin({ ...args, db: context.tx, commitContext: context }),
+  { profile: "TEAM_MANAGEMENT", authority: { kind: "ADMIN_COMMAND", agencyId: args.agencyId } });
 }
 
 test("C2 PostgreSQL: direct disable of the sole operational OWNER is rejected in the User transaction", { skip: !enabled }, async () => {

@@ -32,7 +32,10 @@ function sanitizeAuditMetadata(metadata) {
 
 async function audit({ agencyId, actorUserId = null, action, targetType = null, targetId = null, metadata = null, db = null, required = false }) {
   try {
-    if (!agencyId || !action) return null;
+    if (!agencyId || !action) {
+      if (required === true) throw Object.assign(new Error("Required audit needs an agency and action"), { code: "AUDIT_IDENTITY_REQUIRED" });
+      return null;
+    }
 
     const client = db || require("../prisma");
     return await client.auditLog.create({

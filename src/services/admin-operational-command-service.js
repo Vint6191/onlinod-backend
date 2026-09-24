@@ -2,6 +2,7 @@
 const bcrypt=require("bcryptjs");
 const {z}=require("zod");
 const {executeAdminCommand}=require("./admin-commit-authority-service");
+const {deferCommitHint}=require("./db-commit-kernel");
 const {ACTIONS,adminError,passwordFingerprint,reasonSchema}=require("./admin-command-contract");
 const {passwordSchema}=require("./admin-identity-command-service");
 const {dbAuthorityNow}=require("./db-time-authority-service");
@@ -26,7 +27,7 @@ async function queueLogout({tx,command,actorId,userId,agencyId=null,deviceId=nul
  // can escape an audit/domain rollback. Push events remain latency hints only.
  return tx.$executeRawUnsafe(`INSERT INTO "DeviceCommand" ("id","deviceId","agencyId","command","payload","issuedByAdmin","createdAt") SELECT md5($1||':'||d."id"),d."id",d."agencyId",'FORCE_LOGOUT',$2::jsonb,$3,$4 FROM "WorkerDevice" d WHERE d."userId"=$5 AND ($6::text IS NULL OR d."agencyId"=$6) AND ($7::text IS NULL OR d."id"=$7) ORDER BY d."id" ON CONFLICT ("id") DO NOTHING`,command.id,JSON.stringify({reason,userId,issuedAt:now.toISOString()}),actorId,now,userId,agencyId,deviceId);
 }
-async function operationalWork({tx,action,targetId,input,command,actor,passwordHash,effects}){
+async function operationalWork({tx,commitContext,action,targetId,input,command,actor,passwordHash,effects}){
  const now=await dbAuthorityNow({db:tx});
  if(action.startsWith("agency.")){
   await assertTeamControlPlaneWriteAdmission(tx);
@@ -52,7 +53,7 @@ async function operationalWork({tx,action,targetId,input,command,actor,passwordH
   return {agencyId:targetId,statusCode:pending?202:200,body:{ok:true,agency:publicAgency(after),hard:input.hard===true,pending},audit:{before:publicAgency(before),after:publicAgency(after),cleanupScheduled:pending}};
  }
  if(action.startsWith("member.")){
-  const options={db:tx,agencyId:input.agencyId,memberId:targetId,expectedAccessEpoch:input.expectedAccessEpoch,publishEvents:false};
+  const options={db:tx,commitContext,agencyId:input.agencyId,memberId:targetId,expectedAccessEpoch:input.expectedAccessEpoch,publishEvents:false};
   let before,updated;
   if(action==="member.remove"){
    before=requireRow(await tx.agencyMember.findFirst({where:{id:targetId,agencyId:input.agencyId,deletedAt:null}}),"MEMBER");
@@ -126,9 +127,11 @@ async function executeAdminOperation({db,actor,commandId,action,targetId,payload
   const parsed=z.object({password:passwordSchema,reason:reasonSchema,expectedUpdatedAt:z.string().datetime()}).strict().parse(payload);
   const {password,...safe}=parsed;input={...safe,passwordFingerprint:passwordFingerprint(password)};passwordHash=await bcrypt.hash(password,12);
  }else input=ACTIONS[action].schema.parse(payload);
- const effects=[];
- const result=await executeAdminCommand({db,actor,commandId,action,targetId,payload:input,work:ctx=>operationalWork({...ctx,action,targetId,input,actor,passwordHash,effects})});
- if(!result.replayed&&result.statusCode<400)for(const effect of effects){try{effect();}catch(error){console.error("[admin-operation/control-hint]",error.code||"failed");}}
- return result;
+ return executeAdminCommand({db,actor,commandId,action,targetId,payload:input,work:async ctx=>{
+  const effects=[];
+  const outcome=await operationalWork({...ctx,action,targetId,input,actor,passwordHash,effects});
+  for(const [index,effect] of effects.entries())deferCommitHint(ctx.commitContext,`admin-operation:${commandId}:${index}`,effect);
+  return outcome;
+ }});
 }
 module.exports={executeAdminOperation,queueLogout,publicUser,publicMember,publicAgency};

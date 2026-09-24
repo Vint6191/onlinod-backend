@@ -1,0 +1,68 @@
+{
+  "active": [
+    "src/services/actual60-int60-10-rolling-time-authority.test.js",
+    "src/services/admin-billing-access-command.test.js",
+    "src/services/admin-billing-state-http.test.js",
+    "src/services/admin-bulk-pricing-command.test.js",
+    "src/services/admin-bulk-pricing-ui.test.js",
+    "src/services/admin-command-client.test.js",
+    "src/services/admin-command-foundation.test.js",
+    "src/services/admin-command-http.test.js",
+    "src/services/admin-commercial-policy-ui.test.js",
+    "src/services/admin-data-archive-http.test.js",
+    "src/services/admin-data-archive-ui.test.js",
+    "src/services/admin-entitlement-ui.test.js",
+    "src/services/admin-member-role-canonical-authority.test.js",
+    "src/services/admin-operational-command.test.js",
+    "src/services/admin-operational-http-ui.test.js",
+    "src/services/admin-retention-ui.test.js",
+    "src/services/admin-support-view.test.js",
+    "src/services/audit-service.test.js",
+    "src/services/desktop-control-events-checkpoint-r.test.js",
+    "src/services/phase2-actual56-control-wakeup-authority.test.js",
+    "src/services/phase2-actual56-durable-desktop-access-closure.test.js",
+    "src/services/phase2-actual56-final-closure-m1-team-activation.test.js",
+    "src/services/phase2-actual56-final-closure-owner-operational.test.js",
+    "src/services/phase2-management-command-commit-authority.test.js",
+    "src/services/team-administration-v8.test.js",
+    "src/services/team-invitation-role-lifecycle-authority.test.js",
+    "src/services/team-owner-actor-proof-v20-19.test.js",
+    "src/services/team-ownership-transfer.test.js",
+    "src/services/team-role-access-epoch-authority.test.js",
+    "src/services/admin-commit-kernel.test.js"
+  ],
+  "historicalOnly": [
+    {
+      "file": "src/services/access-epoch-checkpoint-d.test.js",
+      "reason": "Existing baseline source/inventory checks: 1 failures before I2; retained in full diagnostic, not counted as PASS."
+    },
+    {
+      "file": "src/services/actual60-int60-3-refreshsession-antimap.test.js",
+      "reason": "Existing baseline source/inventory checks: 2 failures before I2; retained in full diagnostic, not counted as PASS."
+    },
+    {
+      "file": "src/services/actual60-int60-4-current-session-writer-scale.test.js",
+      "reason": "Existing baseline source/inventory checks: 2 failures before I2; retained in full diagnostic, not counted as PASS."
+    },
+    {
+      "file": "src/services/authorization-projection-direct-writer-anti-map-int2-11b.test.js",
+      "reason": "Existing baseline source/inventory checks: 1 failures before I2; retained in full diagnostic, not counted as PASS."
+    },
+    {
+      "file": "src/services/phase2-actual56-cut-e-closure.test.js",
+      "reason": "Existing baseline source/inventory checks: 3 failures before I2; retained in full diagnostic, not counted as PASS."
+    },
+    {
+      "file": "src/services/phase2-actual56-final-closure-c2.test.js",
+      "reason": "Existing baseline source/inventory checks: 3 failures before I2; retained in full diagnostic, not counted as PASS."
+    },
+    {
+      "file": "src/services/phase2-actual56-source-final-antimap.test.js",
+      "reason": "Existing baseline source/inventory checks: 3 failures before I2; retained in full diagnostic, not counted as PASS."
+    },
+    {
+      "file": "src/services/phase2-lock-topology-authority.test.js",
+      "reason": "Existing baseline source/inventory checks: 1 failures before I2; retained in full diagnostic, not counted as PASS."
+    }
+  ]
+}

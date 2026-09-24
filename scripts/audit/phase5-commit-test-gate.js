@@ -2,7 +2,7 @@
 
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
-const selection = require("./phase5-commit-tests.json");
+const selection = require(process.argv[2] ? path.resolve(__dirname, process.argv[2]) : "./phase5-commit-tests.json");
 const root = path.resolve(__dirname, "../..");
 for (const item of selection.historicalOnly) {
   console.log(`[historical-only, not counted as PASS] ${item.file}: ${item.reason}`);

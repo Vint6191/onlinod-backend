@@ -95,9 +95,11 @@ test("C2 Serializable Team write conflicts surface as controlled 409 rather than
   const start = service.indexOf("async function serializableTeamTransaction");
   const end = service.indexOf("function requireLiveTeamActor", start);
   const block = service.slice(start, end);
-  assert.match(block, /P2034/);
+  assert.match(block, /runRootCommit/);
   assert.match(block, /TEAM_CONTROL_PLANE_SERIALIZATION_CONFLICT/);
-  assert.match(block, /conflict\.status = 409/);
+  const kernel = read("src/services/db-commit-kernel.js");
+  assert.match(kernel, /code === "P2034"/);
+  assert.match(kernel, /error\.status = 409/);
 });
 
 test("C2/M1 Agency restore and activation cannot expose a live Agency without an operational OWNER", async () => {

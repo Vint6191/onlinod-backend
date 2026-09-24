@@ -4,6 +4,8 @@ const express = require("express");
 const crypto = require("node:crypto");
 const { z } = require("zod");
 const prisma = require("../prisma");
+const { runRootCommit, classifyCommitConflict } = require("../services/db-commit-kernel");
+const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { authRequired } = require("../middleware/auth");
 const { audit } = require("../services/audit-service");
 const {
@@ -83,11 +85,9 @@ router.post("/claim", authRequired, async (req, res) => {
       return res.status(403).json({ ok: false, code: "EMAIL_MISMATCH", error: "This invitation was sent to a different email address" });
     }
 
-    const now = new Date();
-
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await runRootCommit(prisma, async ({ tx }) => {
       const currentInvite = await tx.agencyInvitation.findUnique({ where: { id: inv.id }, include: { agency: true } });
-      const currentFailure = invitationFailure(currentInvite, now);
+      const currentFailure = invitationFailure(currentInvite, await dbAuthorityNow({ db: tx }));
       if (currentFailure) {
         const error = new Error(currentFailure.error);
         error.status = currentFailure.status;
@@ -105,6 +105,7 @@ router.post("/claim", authRequired, async (req, res) => {
         await lockTeamRoleLifecycle({ tx, agencyId: currentInvite.agencyId, roleKey: currentInvite.roleKey, mode: "share", agencyAlreadyLocked: true });
         roleKey = await ensureRoleExists({ agencyId: currentInvite.agencyId, roleKey: currentInvite.roleKey, db: tx });
       } catch (lockError) {
+        if (classifyCommitConflict(lockError)) throw lockError;
         if (String(lockError?.code || "").startsWith("TEAM_CONTROL_PLANE_")) throw lockError;
         const error = new Error("Invitation role is no longer available");
         error.status = 409;
@@ -166,6 +167,7 @@ router.post("/claim", authRequired, async (req, res) => {
         });
       }
 
+      const now = await dbAuthorityNow({ db: tx });
       const claimed = await tx.agencyInvitation.updateMany({
         where: { id: inv.id, tokenHash, claimedAt: null, revokedAt: null, expiresAt: { gt: now } },
         data: { claimedAt: now, claimedByUserId: userId, claimedMemberId: member.id },
@@ -185,10 +187,11 @@ router.post("/claim", authRequired, async (req, res) => {
         targetId: member.id,
         metadata: { invitationId: currentInvite.id, roleKey, functions, restored },
         db: tx,
+        required: true,
       });
 
       return { member, restored, roleKey, functions, agency: currentInvite.agency };
-    });
+    }, { profile: "TEAM_MANAGEMENT", authority: { kind: "INVITATION_CLAIM", agencyId: inv.agencyId, userId }, conflictCode: "INVITE_CONCURRENT_CHANGE" });
 
     try {
       publishDesktopControlEvent({

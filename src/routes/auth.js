@@ -4,6 +4,7 @@ const crypto = require("node:crypto");
 const { z } = require("zod");
 
 const prisma = require("../prisma");
+const { runRootCommit, classifyCommitConflict } = require("../services/db-commit-kernel");
 const { authRequired } = require("../middleware/auth");
 const { sha256 } = require("../utils/crypto");
 const {
@@ -167,7 +168,7 @@ router.post("/register", async (req, res) => {
 
     const passwordHash = await bcrypt.hash(input.password, 12);
 
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await runRootCommit(prisma, async ({ tx }) => {
       const user = await tx.user.create({
         data: {
           email,
@@ -195,6 +196,7 @@ router.post("/register", async (req, res) => {
           await lockTeamRoleLifecycle({ tx, agencyId: inv.agencyId, roleKey: inv.roleKey, mode: "share", agencyAlreadyLocked: true });
           roleKey = await ensureRoleExists({ agencyId: inv.agencyId, roleKey: inv.roleKey, db: tx });
         } catch (lockError) {
+          if (classifyCommitConflict(lockError)) throw lockError;
           if (String(lockError?.code || "").startsWith("TEAM_CONTROL_PLANE_")) throw lockError;
           const err = new Error("Invitation role is no longer available");
           err.status = 409;
@@ -253,7 +255,7 @@ router.post("/register", async (req, res) => {
           });
         }
 
-        const now = new Date();
+        const now = await dbAuthorityNow({ db: tx });
         const claimed = await tx.agencyInvitation.updateMany({
           where: {
             id: inv.id,
@@ -283,6 +285,7 @@ router.post("/register", async (req, res) => {
           targetId: member.id,
           metadata: { invitationId: inv.id, roleKey, functions, registrationFlow: true },
           db: tx,
+          required: true,
         });
 
         return {
@@ -341,7 +344,7 @@ router.post("/register", async (req, res) => {
       });
 
       return { user, agency, member, invitationClaimed: false };
-    });
+    }, { profile: "TEAM_MANAGEMENT", authority: { kind: "REGISTRATION", agencyId: invitationCheck?.invitation?.agencyId || null }, conflictCode: "REGISTRATION_CONCURRENT_CHANGE" });
 
     if (result.invitationClaimed === true) {
       try {
@@ -373,6 +376,7 @@ router.post("/register", async (req, res) => {
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
+    if (err?.code === "REGISTRATION_CONCURRENT_CHANGE") return res.status(409).json({ ok: false, code: err.code, error: err.message });
     if (err?.code && String(err.code).startsWith("INVITE_")) {
       return res.status(err.status || 400).json({ ok: false, code: err.code, error: err.message });
     }

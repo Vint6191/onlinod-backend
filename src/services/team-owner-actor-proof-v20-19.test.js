@@ -1,4 +1,5 @@
 "use strict";
+const { transactionClient: prismaTransactionClient } = require("../../test/helpers/prisma-transaction-client");
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -21,7 +22,7 @@ const ACTOR_PROOF = Buffer.alloc(32, 0x4a).toString("base64");
 const WRONG_PROOF = Buffer.alloc(32, 0x4b).toString("base64");
 const proofHash = crypto.createHash("sha256").update(Buffer.from(ACTOR_PROOF, "base64")).digest("base64");
 
-function clone(value) { return value == null ? value : structuredClone(value); }
+function clone(value) { return value == null ? value : globalThis.structuredClone(value); }
 
 function makeMember(id, userId, roleKey = "owner") {
   return {
@@ -70,7 +71,7 @@ function makeDb({ withRoot = true } = {}) {
   }
 
   const db = {
-    $transaction: async (fn) => fn(db),
+    $transaction: async (fn) => fn(prismaTransactionClient(db)),
     agency: {
       findUnique: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null,
       findFirst: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null,

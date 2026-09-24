@@ -13,7 +13,8 @@ const {
   assertOperationalOwnerRemovalSafety,
   assertUserDisableOwnerSafety,
 } = require("./team-operational-owner-authority-service");
-const { audit } = require("./audit-service");
+const { audit: writeAudit } = require("./audit-service");
+const { runRootCommit, joinCommit, currentCommitContext, deferCommitHint } = require("./db-commit-kernel");
 const {
   revokeOwnerRootAccessForMember,
   requireOwnerCryptoCommitActor,
@@ -113,24 +114,45 @@ const DELEGATED_PERMISSION_KEYS = Object.freeze(
 );
 
 async function serializableTeamTransaction(db, fn) {
-  try {
-    return await require("./db-transaction-service").runDbTransaction(db, async (tx) => {
+  const context = currentCommitContext();
+  if (!context || context.tx !== db) throw Object.assign(new Error("Team mutation requires its command context"), { code: "DB_COMMIT_CONTEXT_REQUIRED" });
+  return joinCommit(context, { isolationLevel: "Serializable" }, async ({ tx }) => {
       // Rolling-release admission is wider than the steady-state topology mutex.
       // During DRAINING every Team control-plane writer must stop before its first
       // Role/Creator/User/Member lock, including invitation and role-metadata paths
       // that intentionally do not need Agency-wide topology serialization once ACTIVE.
       await assertTeamControlPlaneWriteAdmission(tx);
       return fn(tx);
-    }, { isolationLevel: "Serializable" });
-  } catch (error) {
-    if (String(error?.code || "") === "P2034") {
-      const conflict = new Error("Team control-plane state changed concurrently; refresh and retry");
-      conflict.code = "TEAM_CONTROL_PLANE_SERIALIZATION_CONFLICT";
-      conflict.status = 409;
-      throw conflict;
+  });
+}
+
+// The whole public command owns one transaction, including its preparatory
+// reads, result shaping and mandatory audit. Admin callers join explicitly;
+// inner Team operations never translate/retry a parent's transient error.
+function teamMutation(work, { adminOnly = false } = {}) {
+  return async function executeTeamMutation(input) {
+    const db = input.db || prisma;
+    const execute = (context) => work({ ...input, db: context.tx });
+    if ((adminOnly || input.platformAdmin === true) && input.commitContext?.authority?.kind !== "ADMIN_COMMAND") {
+      throw Object.assign(new Error("Platform member changes require their audited Admin command root"), { code: "TEAM_ADMIN_COMMIT_REQUIRED" });
     }
-    throw error;
-  }
+    if (input.commitContext) {
+      if (input.commitContext.tx !== db) throw Object.assign(new Error("Team client/context mismatch"), { code: "DB_COMMIT_CONTEXT_SCOPE_MISMATCH" });
+      return joinCommit(input.commitContext, { isolationLevel: "Serializable", agencyId: input.agencyId }, execute);
+    }
+    return runRootCommit(db, execute, {
+      profile: "TEAM_MANAGEMENT",
+      authority: { kind: "TEAM_MANAGEMENT", agencyId: input.agencyId, userId: input.actorUserId || null },
+      conflictCode: "TEAM_CONTROL_PLANE_SERIALIZATION_CONFLICT",
+      conflictMessage: "Team control-plane state changed concurrently; refresh and retry",
+    });
+  };
+}
+
+async function audit(input) {
+  const context = currentCommitContext();
+  if (!context || context.tx !== input.db) throw Object.assign(new Error("Team audit must join its mutation"), { code: "TEAM_AUDIT_TRANSACTION_REQUIRED" });
+  return writeAudit({ ...input, required: true });
 }
 
 function requireLiveTeamActor(actor) {
@@ -494,6 +516,12 @@ function normalizedEpoch(value, fallback = 1) {
 
 function publishMemberAccessEpoch({ agencyId, member, sourceDeviceId = null, requestId = null }) {
   if (!member?.id) return;
+  const context = currentCommitContext();
+  if (context) {
+    const hint = { id: member.id, userId: member.userId || member.user?.id || null, accessEpoch: member.accessEpoch };
+    deferCommitHint(context, `team-member:${agencyId}:${member.id}`, () => publishMemberAccessEpoch({ agencyId, member: hint, sourceDeviceId, requestId }));
+    return;
+  }
   try {
     publishDesktopControlEvent({
       type: "ACCESS_EPOCH_CHANGED",
@@ -606,7 +634,14 @@ async function bumpLiveRoleMemberAccessEpochs({ tx, agencyId, roleKey }) {
   });
 }
 
-function publishRoleMemberAccessEpochs({ agencyId, members, sourceDeviceId = null }) {
+function publishRoleMemberAccessEpochs({ agencyId, roleKey, members, sourceDeviceId = null }) {
+  const context = currentCommitContext();
+  if (context) {
+    // One hint slot per role, not per member. A large team must not exhaust the
+    // kernel hint budget merely because its role affects more than 1024 members.
+    deferCommitHint(context, `team-role:${agencyId}:${roleKey}`, () => publishRoleMemberAccessEpochs({ agencyId, roleKey, members, sourceDeviceId }));
+    return;
+  }
   for (const member of Array.isArray(members) ? members : []) {
     publishMemberAccessEpoch({ agencyId, member, sourceDeviceId });
   }
@@ -801,7 +836,6 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
 
   let deactivatedAt = null;
   const statusMutation = await serializableTeamTransaction(db, async (tx) => {
-    deactivatedAt = status === "deactivated" ? await dbAuthorityNow({ db: tx, fallbackNow: new Date() }) : null;
     await lockTeamControlPlaneTopology({ tx, agencyId });
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
@@ -825,6 +859,7 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
         tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof,
       });
     }
+    deactivatedAt = status === "deactivated" ? await dbAuthorityNow({ db: tx, fallbackNow: new Date() }) : null;
     const updatedMember = await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deactivatedAt, accessEpoch: { increment: 1 } } });
     if (status === "deactivated") {
       await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deactivatedAt });
@@ -869,7 +904,6 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
 
   let deletedAt = null;
   const removalMutation = await serializableTeamTransaction(db, async (tx) => {
-    deletedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     await lockTeamControlPlaneTopology({ tx, agencyId });
 
     let liveActor = null;
@@ -896,6 +930,7 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
     if (isOwner(liveTarget) && !platformAdmin) {
       await requireOwnerPossessionForCryptoDestructiveTeamMutation({ tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof });
     }
+    deletedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const updatedMember = await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deletedAt, deactivatedAt: deletedAt, accessEpoch: { increment: 1 } } });
     await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deletedAt });
     await tx.refreshSession.updateMany({ where: { userId: liveTarget.userId, agencyId, revokedAt: null, expiresAt: { gt: deletedAt } }, data: { revokedAt: deletedAt } });
@@ -1123,9 +1158,7 @@ async function createInvitation({ agencyId, input, actorMember, actorUserId: act
       include: { invitedBy: { select: { id: true, email: true, name: true } } },
     });
   };
-  const created = typeof db?.$transaction === "function"
-    ? await serializableTeamTransaction(db, createWithRoleFence)
-    : await createWithRoleFence(db);
+  const created = await serializableTeamTransaction(db, createWithRoleFence);
   await audit({
     agencyId,
     actorUserId: actorId,
@@ -1190,9 +1223,7 @@ async function reissueInvitation({ agencyId, invitationId, expiresInDays = 14, a
       include: { invitedBy: { select: { id: true, email: true, name: true } } },
     });
   };
-  const updated = typeof db?.$transaction === "function"
-    ? await serializableTeamTransaction(db, reissueWithRoleFence)
-    : await reissueWithRoleFence(db);
+  const updated = await serializableTeamTransaction(db, reissueWithRoleFence);
   await audit({
     agencyId,
     actorUserId: actorId,
@@ -1381,7 +1412,7 @@ async function setRoleAccess({ agencyId, roleKey, zoneKey, levelKey, actorMember
     const affectedMembers = await bumpLiveRoleMemberAccessEpochs({ tx, agencyId, roleKey: key });
     return { role: nextRole, affectedMembers };
   });
-  publishRoleMemberAccessEpochs({ agencyId, members: roleMutation.affectedMembers, sourceDeviceId: actorDeviceId });
+  publishRoleMemberAccessEpochs({ agencyId, roleKey: key, members: roleMutation.affectedMembers, sourceDeviceId: actorDeviceId });
   await audit({ agencyId, actorUserId: actorId, action: "team.role.access_changed", targetType: "team_role", targetId: key, metadata: { actorMemberId: actorMember?.id || null, zoneKey: zone.key, level }, db });
   return roleMutation.role;
 }
@@ -1421,7 +1452,7 @@ async function setRolePermission({ agencyId, roleKey, permissionKey, value, acto
     const affectedMembers = await bumpLiveRoleMemberAccessEpochs({ tx, agencyId, roleKey: key });
     return { role: nextRole, affectedMembers };
   });
-  publishRoleMemberAccessEpochs({ agencyId, members: roleMutation.affectedMembers, sourceDeviceId: actorDeviceId });
+  publishRoleMemberAccessEpochs({ agencyId, roleKey: key, members: roleMutation.affectedMembers, sourceDeviceId: actorDeviceId });
   await audit({ agencyId, actorUserId: actorId, action: "team.role.permission_changed", targetType: "team_role", targetId: key, metadata: { actorMemberId: actorMember?.id || null, permissionKey, value }, db });
   return roleMutation.role;
 }
@@ -1468,7 +1499,7 @@ async function resetRole({ agencyId, roleKey, actorMember, actorUserId: actorId,
     const affectedMembers = await bumpLiveRoleMemberAccessEpochs({ tx, agencyId, roleKey: key });
     return { role: nextRole, affectedMembers };
   });
-  publishRoleMemberAccessEpochs({ agencyId, members: roleMutation.affectedMembers, sourceDeviceId: actorDeviceId });
+  publishRoleMemberAccessEpochs({ agencyId, roleKey: key, members: roleMutation.affectedMembers, sourceDeviceId: actorDeviceId });
   await audit({ agencyId, actorUserId: actorId, action: "team.role.reset", targetType: "team_role", targetId: key, metadata: { actorMemberId: actorMember?.id || null }, db });
   return roleMutation.role;
 }
@@ -1524,20 +1555,20 @@ module.exports = {
   roleExists,
   ensureRoleExists,
   getTeamAdministrationState,
-  updateMemberSettings,
-  setMemberStatus,
-  removeMember,
-  updateMemberAccessByPlatformAdmin,
+  updateMemberSettings: teamMutation(updateMemberSettings),
+  setMemberStatus: teamMutation(setMemberStatus),
+  removeMember: teamMutation(removeMember),
+  updateMemberAccessByPlatformAdmin: teamMutation(updateMemberAccessByPlatformAdmin, { adminOnly: true }),
   assertUserDisableOwnerSafety,
   materializeInvitationMemberWithinTransaction,
-  createInvitation,
-  reissueInvitation,
-  revokeInvitation,
-  createCustomRole,
-  updateRoleMetadata,
-  setRoleAccess,
-  setRolePermission,
-  resetRole,
-  deleteCustomRole,
+  createInvitation: teamMutation(createInvitation),
+  reissueInvitation: teamMutation(reissueInvitation),
+  revokeInvitation: teamMutation(revokeInvitation),
+  createCustomRole: teamMutation(createCustomRole),
+  updateRoleMetadata: teamMutation(updateRoleMetadata),
+  setRoleAccess: teamMutation(setRoleAccess),
+  setRolePermission: teamMutation(setRolePermission),
+  resetRole: teamMutation(resetRole),
+  deleteCustomRole: teamMutation(deleteCustomRole),
   resolveEffectivePermissions,
 };

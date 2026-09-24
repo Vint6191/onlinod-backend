@@ -67,3 +67,6 @@ targets already removed APIs. Those tests are not silently counted as passes.
 
 Deployment: no schema/migration change; existing npm install && npm run
 prisma:migrate command is retained. No Desktop change in this package.
+
+I2 extends the migrated command families to Team/Owner/Admin and invitation
+claims. See PHASE5_TEAM_COMMAND_COMMIT.txt for that boundary and the new profiles.

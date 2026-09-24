@@ -19,6 +19,8 @@ const COMMIT_PROFILES = Object.freeze({
   SECRET_READ: Object.freeze({ isolationLevel: "Serializable", maxWait: 10000, timeout: 30000, deadlineMs: 40000, lockTimeoutMs: 5000, statementTimeoutMs: 25000 }),
   SECRET_WRITE: Object.freeze({ isolationLevel: "Serializable", maxWait: 10000, timeout: 30000, deadlineMs: 40000, lockTimeoutMs: 5000, statementTimeoutMs: 25000 }),
   BILLING_RECOVERY: Object.freeze({ isolationLevel: "ReadCommitted", maxWait: 5000, timeout: 15000, deadlineMs: 20000, lockTimeoutMs: 5000, statementTimeoutMs: 15000 }),
+  TEAM_MANAGEMENT: Object.freeze({ isolationLevel: "Serializable", maxWait: 5000, timeout: 15000, deadlineMs: 20000, lockTimeoutMs: 5000, statementTimeoutMs: 15000 }),
+  ADMIN_COMMAND: Object.freeze({ isolationLevel: "ReadCommitted", maxWait: 5000, timeout: 15000, deadlineMs: 20000, lockTimeoutMs: 5000, statementTimeoutMs: 15000 }),
 });
 
 function failure(code, message, cause = undefined) {
@@ -128,6 +130,12 @@ function deferCommitHint(context, key, notify) {
   state.hints.set(key, notify);
 }
 
+// A command may commit its rejection receipt after rolling its domain savepoint
+// back. That root must explicitly discard advisory effects of the rejected work.
+function discardCommitHints(context) {
+  stateFor(context).hints.clear();
+}
+
 function hintFailure(error) {
   // No payloads, credentials or query text. A failed advisory notification must
   // never turn a committed command into an HTTP error and cause command replay.
@@ -227,5 +235,5 @@ async function runRootCommit(db, work, options = {}) {
 
 module.exports = {
   COMMIT_PROFILES, runRootCommit, joinCommit, currentCommitContext,
-  isCommitTransaction, classifyCommitConflict, commitAuthorityNow, deferCommitHint,
+  isCommitTransaction, classifyCommitConflict, commitAuthorityNow, deferCommitHint, discardCommitHints,
 };

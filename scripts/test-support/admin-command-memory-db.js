@@ -83,6 +83,7 @@ function createMemoryDb(options = {}) {
         throw new Error(`Unexpected SQL ${sql}`);
       },
       async $executeRawUnsafe(sql) {
+        if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)") return 1;
         if (sql.startsWith("SAVEPOINT ")) savepoints.set(sql.slice(10),copy(read()));
         else if (sql.startsWith("ROLLBACK TO SAVEPOINT ")) write(copy(savepoints.get(sql.slice(22))));
         else if (sql.startsWith("RELEASE SAVEPOINT ")) savepoints.delete(sql.slice(18));

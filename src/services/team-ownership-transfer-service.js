@@ -1,7 +1,8 @@
 "use strict";
 const crypto = require("node:crypto");
 const { z } = require("zod");
-const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-service");
+const { lockDbAdvisoryXact } = require("./db-transaction-service");
+const { runRootCommit } = require("./db-commit-kernel");
 const { lockTeamControlPlaneTopology } = require("./team-control-plane-authority-service");
 const { lockTeamRoleLifecycle } = require("./team-administration-service");
 const { isOwner, memberRoleKey } = require("./team-access-control");
@@ -18,9 +19,12 @@ const transferSchema = z.object({
   ownerWrap: z.object({ algorithm:z.string().max(128), ephemeralPublicKey:z.string().max(4096), ciphertext:z.string().max(256), iv:z.string().max(64), tag:z.string().max(64) }).strict().optional(),
 }).strict();
 function fail(code, message, status=409) { throw Object.assign(new Error(message), {code,status}); }
-async function transaction(db, work) {
-  try { return await runDbTransaction(db, work, {isolationLevel:"Serializable"}); }
-  catch (error) { if (error?.code === "P2034") fail("OWNERSHIP_TRANSFER_CONFLICT", "Ownership changed concurrently; reload before retrying"); throw error; }
+async function transaction(db, authority, work) {
+  return runRootCommit(db, context => work(context.tx), {
+    profile: "TEAM_MANAGEMENT", authority: { kind: "OWNER_TRANSFER", ...authority },
+    conflictCode: "OWNERSHIP_TRANSFER_CONFLICT",
+    conflictMessage: "Ownership changed concurrently; reload before retrying",
+  });
 }
 async function requireDirectOwnerSession(tx, {agencyId,userId,actorDeviceId,authorizationSessionId}) {
   if (!actorDeviceId || !authorizationSessionId) fail("OWNERSHIP_DIRECT_SESSION_REQUIRED","Sign in with a current Desktop session before transferring ownership",403);
@@ -39,7 +43,7 @@ async function participants(tx, agencyId, userId, memberId) {
   return {actor,target};
 }
 async function ownershipTransferPlan({db,agencyId,userId,memberId,actorDeviceId=null,authorizationSessionId=null}) {
-  return transaction(db, async tx => {
+  return transaction(db, {agencyId,userId}, async tx => {
     await lockTeamControlPlaneTopology({tx,agencyId});
     await requireDirectOwnerSession(tx,{agencyId,userId,actorDeviceId,authorizationSessionId});
     const {actor,target} = await participants(tx,agencyId,userId,memberId);
@@ -64,7 +68,7 @@ async function transferOwnership({db,agencyId,userId,actorDeviceId=null,authoriz
     rootVersion:command.expectedRootVersion,targetDeviceId:command.targetDeviceId||null,targetFingerprint:command.targetFingerprint||null};
   const intentHash = crypto.createHash("sha256").update(JSON.stringify(intent)).digest("hex");
   const receiptId = `ownership:${command.commandId}`;
-  const outcome = await transaction(db, async tx => {
+  const outcome = await transaction(db, {agencyId,userId}, async tx => {
     await lockDbAdvisoryXact({db:tx,key:receiptId,mode:"exclusive"});
     await requireDirectOwnerSession(tx,{agencyId,userId,actorDeviceId,authorizationSessionId});
     const previous = await tx.auditLog.findUnique({where:{id:receiptId}});
@@ -88,6 +92,9 @@ async function transferOwnership({db,agencyId,userId,actorDeviceId=null,authoriz
     const root = await tx.agencyCryptoRoot.findUnique({where:{agencyId}});
     if ((root?.version ?? null)!==command.expectedRootVersion) fail("CRYPTO_APPROVAL_ROOT_VERSION_CONFLICT","Encryption generation changed; reload the transfer plan");
     const now = await dbAuthorityNow({db:tx});
+    // The direct session was checked for receipt access before topology locks.
+    // Recheck its expiry after those waits, at the actual handover boundary.
+    await requireDirectOwnerSession(tx,{agencyId,userId,actorDeviceId,authorizationSessionId});
     if (root) {
       const approver = await requireOwnerCryptoCommitActor({db:tx,agencyId,userId,member:actor,deviceId:actorDeviceId,actorProof:command.actorProof});
       const identity = command.targetDeviceId ? await tx.deviceCryptoIdentity.findUnique({where:{agencyId_deviceId:{agencyId,deviceId:command.targetDeviceId}}}) : null;
@@ -111,7 +118,7 @@ async function transferOwnership({db,agencyId,userId,actorDeviceId=null,authoriz
     await tx.auditLog.create({data:{id:receiptId,agencyId,actorUserId:userId,action:"team.ownership.transferred",targetType:"agency_member",targetId:target.id,metadata:{intentHash,result}}});
     return {body:result,replayed:false,members:[former,successor]};
   });
-  for (const member of outcome.members) { try { publishDesktopControlEvent({type:"ACCESS_EPOCH_CHANGED",agencyId,targetUserId:member.userId,targetMemberId:member.id,accessEpoch:member.accessEpoch}); } catch (_) {} }
+  for (const member of outcome.members) { try { publishDesktopControlEvent({type:"ACCESS_EPOCH_CHANGED",agencyId,targetUserId:member.userId,targetMemberId:member.id,accessEpoch:member.accessEpoch}); } catch { /* Durable revocation is already committed; this is only a wakeup. */ } }
   return {...outcome.body,replayed:outcome.replayed};
 }
 module.exports = {transferSchema,ownershipTransferPlan,transferOwnership};

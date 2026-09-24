@@ -1,4 +1,5 @@
 "use strict";
+const { transactionClient: prismaTransactionClient } = require("../../test/helpers/prisma-transaction-client");
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -44,7 +45,7 @@ function baseDb({ livePermissions }) {
       async updateMany() { mutations += 1; return { count: 1 }; },
     },
     refreshSession: { async updateMany() { mutations += 1; return { count: 0 }; } },
-    async $transaction(work) { return work(db); },
+    async $transaction(work) { return work(prismaTransactionClient(db)); },
     _mutations() { return mutations; },
   };
   return db;

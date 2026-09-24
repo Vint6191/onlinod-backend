@@ -1,0 +1,75 @@
+PHASE 5A / I2 — TEAM / OWNER / ADMIN COMMAND COMMIT
+
+The public Team mutation exports now own the ENTIRE command transaction:
+preparatory reads -> domain locks/authority -> mutation -> required audit ->
+result. The internal Serializable wrapper is a checked join, not a second root.
+The existing domain lock order and permission checks are retained. A conflict
+retries all command reads. Root-only input accepts a real Prisma root client.
+
+Admin composition passes BOTH db=context.tx and commitContext explicitly. A
+joined Team mutation requires Serializable and the same agency. The platform
+member-access entry point and platformAdmin removal require ADMIN_COMMAND intent;
+they cannot accidentally open an independent, unaudited Team root. Only the
+central Admin executor supplies that context in production. Context intent does
+not replace the executor's live AdminUser/AdminSession authorization.
+
+All 12 ordinary Team mutations require their AuditLog insert in the same root.
+Authenticated and registration invitation claims also require their audit.
+Registration still hashes the password before the retryable transaction and
+sends verification only after commit. Invitation grant CAS uses current DB time
+after the locks, and raw serialization/deadlock failures are not converted into
+false INVITE_ROLE_STALE rejections. Signup, trial issuance and the one-Owner
+bootstrap use the existing schema and triggers.
+
+Team access-epoch notifications join the root hint buffer. Role changes reserve
+one buffer entry for the whole affected role, avoiding a new 1024-member limit.
+Role queries retain their agency/role/live predicates; this cutover adds no
+global or historical scan. Production index selectivity remains a scale gate.
+The existing post-commit per-member event fan-out is retained; it is advisory.
+
+Admin execute/read commands use the kernel with the contract's existing isolation
+level. The command row is outside the domain savepoint. Domain 4xx rolls that
+savepoint back and preserves the audited rejection receipt. Transient conflicts
+escape to the root retry instead of becoming durable business rejections.
+discardCommitHints(context) clears advisory effects when a root commits its
+rejected-command receipt. Operational hint closures are per-attempt and flush
+after the confirmed root commit; replay does not publish another notification.
+Exhausted Admin conflicts retain the existing HTTP 409 conflict code.
+Admin rechecks session expiry after domain waits/work and before releasing the
+domain savepoint. Expiry rolls the mutation/hints back and records a rejection.
+
+Owner plan/transfer use the same kernel. Transfer still commits old-owner
+demotion, new-owner promotion, key-wrap changes, session revocation, durable
+logout commands and its idempotency audit receipt together. Exactly-one-owner
+database enforcement is unchanged. Owner notification data comes only from the
+final committed attempt, and notification failure cannot reverse the result.
+The direct Owner session is rechecked after topology/user locks at handover;
+an admission-time session that expired during those waits cannot grant ownership.
+
+TEAM_MANAGEMENT: Serializable, maxWait 5s, timeout 15s, total deadline 20s,
+lock timeout 5s, statement timeout 15s. ADMIN_COMMAND uses the same budgets and
+ReadCommitted unless its action contract requires Serializable. These are explicit
+bounded command profiles, not measured production latency guarantees.
+
+Validation commands:
+  npm run test:phase5-commit
+  npm run test:phase5-team
+  PHASE5_PROOF_RUNTIME=/path/to/audit-runtime npm run audit:phase5-team-postgres
+The proof runtime needs @electric-sql/pglite and @electric-sql/pglite-socket.
+The DB proof migrates a new disposable database using the full migration chain,
+uses the real Prisma Client and actual services, injects audit failures/conflicts,
+and checks DB rollback, receipts, authority, hint delivery and tenant isolation.
+Route-domain proofs supply a synthetic authenticated request; they do not bypass
+or claim to validate HTTP authentication middleware. No production URL is used.
+1100-member role proof exercises the hint-capacity boundary, not platform SLA.
+Native multi-connection contention/multi-replica/fault-load closure remains open.
+
+The active gate explicitly lists inherited historical inventory failures. Their
+full baseline/candidate diagnostic logs are preserved; they are not counted as
+passing tests. No audit/assertion is disabled in production for the test fixtures.
+
+Still outside this cutover: job-lease clock and durable catch-up consequences;
+remaining transaction families including Admin background execution/session/read
+helpers not routed through executeAdminCommand; Desktop LocalAI. Phase5A is NOT
+SOURCE CLOSED or SCALE CLOSED. No Desktop/schema/dependency/deployment-command
+change is required for I2. Render build remains npm install && npm run prisma:migrate.

@@ -352,7 +352,7 @@ test("M1 DRAINING covers every Team Administration write transaction without wid
   const teamAdmin = read("src/services/team-administration-service.js");
   const wrapper = teamAdmin.slice(teamAdmin.indexOf("async function serializableTeamTransaction"), teamAdmin.indexOf("function requireLiveTeamActor"));
   indexOrder(wrapper, [
-    "runDbTransaction(db, async (tx)",
+    "joinCommit(context, { isolationLevel: \"Serializable\" }",
     "await assertTeamControlPlaneWriteAdmission(tx)",
     "return fn(tx)",
   ], "Team Administration release wrapper");

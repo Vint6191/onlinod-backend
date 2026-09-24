@@ -5,10 +5,30 @@ const assert = require("node:assert/strict");
 const { setTimeout: delay } = require("node:timers/promises");
 const {
   runRootCommit, joinCommit, currentCommitContext, classifyCommitConflict,
-  commitAuthorityNow, deferCommitHint,
+  commitAuthorityNow, deferCommitHint, discardCommitHints,
 } = require("./db-commit-kernel");
 
 const retryOptions = { retryBaseMs: 1 };
+
+test("a rejected domain savepoint can discard hints while its receipt commits", async () => {
+  const published = [];
+  const db = rootDb();
+  await runRootCommit(db, async context => {
+    deferCommitHint(context, "domain", () => published.push("rolled-back-domain"));
+    discardCommitHints(context);
+    deferCommitHint(context, "receipt", () => published.push("receipt"));
+    return { rejected: true };
+  }, { maxHints: 1 });
+  assert.equal(db.calls[0].committed, true);
+  assert.deepEqual(published, ["receipt"]);
+});
+
+test("discarding hints requires the active owning context", async () => {
+  assert.throws(() => discardCommitHints({}), { code: "DB_COMMIT_CONTEXT_REQUIRED" });
+  let closed;
+  await runRootCommit(rootDb(), context => { closed = context; });
+  assert.throws(() => discardCommitHints(closed), { code: "DB_COMMIT_CONTEXT_CLOSED" });
+});
 function conflict(code = "40001") {
   return Object.assign(new Error("controlled DB conflict"), { code: "P2010", meta: { code } });
 }
