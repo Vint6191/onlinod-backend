@@ -1,6 +1,6 @@
 "use strict";
 
-const { runRootCommit } = require("./db-commit-kernel");
+const { runRootCommit, currentCommitContext, joinCommit } = require("./db-commit-kernel");
 
 const { canAccessCreator } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
@@ -70,6 +70,8 @@ function creatorUniqueViolation(error) {
 }
 
 async function runSerializable(db, work) {
+  const active = currentCommitContext();
+  if (active && active.tx === db) return joinCommit(active, { isolationLevel: "Serializable" }, ({ tx }) => work(tx));
   return runRootCommit(db, (context) => work(context.tx), {
     profile: "SECRET_WRITE", authority: { kind: "CREATOR_ENROLLMENT" },
     conflictCode: "CREATOR_CONNECTION_CONCURRENT_CHANGE",

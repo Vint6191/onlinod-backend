@@ -659,6 +659,7 @@ async function phase2CreatorResidualRowsRemain(tx, agencyId, creatorId) {
 const AGENCY_NON_FK_TENANT_TABLES = Object.freeze([
   "TeamMutationReceipt",
   "MessageLibraryCommandReceipt",
+  "ManagementCommandReceipt",
   "ProviderOperationalDebt",
   "TelegramDeliveryIntent",
   "TelegramInboundEvent",
@@ -695,7 +696,7 @@ async function purgeAgencyNonFkTenantBatch({ tx, agencyId, limit }) {
     const table = qident(tableName);
     const count = await rawDeleteBatch(
       tx,
-      ["TeamMutationReceipt", "MessageLibraryCommandReceipt"].includes(tableName)
+      ["TeamMutationReceipt", "MessageLibraryCommandReceipt", "ManagementCommandReceipt"].includes(tableName)
         ? `DELETE FROM ${table} t WHERE t."agencyId"=$1 AND t."id" IN (SELECT x."id" FROM ${table} x WHERE x."agencyId"=$1 ORDER BY x."id" LIMIT $2) RETURNING 1`
         : `DELETE FROM ${table} t WHERE t.ctid IN (SELECT x.ctid FROM ${table} x WHERE x."agencyId"=$1 ORDER BY x.ctid LIMIT $2) RETURNING 1`,
       [agencyId],

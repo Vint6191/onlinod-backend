@@ -1,6 +1,6 @@
 "use strict";
 
-const { runRootCommit } = require("./db-commit-kernel");
+const { runRootCommit, currentCommitContext, joinCommit } = require("./db-commit-kernel");
 
 const net = require("node:net");
 const {
@@ -144,6 +144,8 @@ async function credentialReplacement({ db, agencyId, proxy, assignedCreatorId, n
 }
 
 async function runSerializable(db, work, conflictCode, conflictMessage) {
+  const active = currentCommitContext();
+  if (active && active.tx === db) return joinCommit(active, { isolationLevel: "Serializable" }, ({ tx }) => work(tx));
   return runRootCommit(db, (context) => work(context.tx), {
     profile: "SECRET_WRITE", authority: { kind: "CREATOR_NETWORK" },
     conflictCode, conflictMessage,
@@ -687,6 +689,7 @@ async function getProxyTestMaterial({ db, agencyId, proxyId, deviceId, member, u
 }
 
 module.exports = {
+  proxyPublic,
   PROXY_TYPES,
   NETWORK_MODES,
   proxyPublic,

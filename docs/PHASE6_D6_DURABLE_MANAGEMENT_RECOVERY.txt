@@ -1,0 +1,269 @@
+================================================================================
+ONLINOD — PHASE 6 / D6 — DURABLE MANAGEMENT COMMANDS AND RECOVERY
+ПОЛНОСТЬЮ НАКОПИТЕЛЬНЫЙ ЧЕКПОИНТ / КРУПНЫЙ СВЯЗАННЫЙ ПРОХОД
+Продолжение D5 по Desktop93 и Backend 2026-09-29T233835.413.
+================================================================================
+
+0. ИТОГ И НЕИЗМЕННЫЕ ПРАВИЛА
+
+Реализован и проверен связанный участок 6D: профиль, workspace, создание модели,
+серверное изменение её метаданных и четыре операции Network/Proxy. Действие,
+квитанция на сервере, локальный журнал и восстановление в интерфейсе связаны
+в один путь. Это не утверждение о завершении всей 6D или шестой фазы.
+
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ D6: ПОКА НЕТ.
+
+Саша просит крупные законченные проходы и полностью накопительный TXT,
+Backend/Desktop changed-only ZIP, evidence и SHA256. Никаких микропакетов,
+повторных «принял» и недоказанных процентов готовности. Один OWNER на агентство
+сохраняется; остальные роли могут быть множественными. Внешние Render/Neon/SQL,
+деплой и загрузка рабочих данных не выполнялись. Все SQL-сценарии выполнялись
+только на одноразовой локальной БД с синтетическими данными.
+
+Этот TXT начинается точными 1 006 870 байтами полного D5 checkpoint:
+SHA256 00bc02ef7527cc3739cd12ec8426018c8249c83513c8ba7c97da60c64d57eb79.
+История I7, 5Б, 6A–6D5 не сокращена и не переписана. Этот раздел добавлен в конец.
+
+1. АКТУАЛ И ПРОИСХОЖДЕНИЕ
+
+93.zip:
+SHA256 94942b0614bd56def07b29ea58d0fe7a425cbdedd7ac4ea285c4d4230c6e4af6.
+1 199 файлов; каждый совпадает с соответствующим D5. Отсутствуют только
+17 исторических документов docs. Они сохранены из проверенного D5.
+
+onlinod-backend-main - 2026-09-29T233835.413.zip:
+SHA256 05bf1099d04fd91d2ffa05c6cf3a40048041eb78704d3d168c5bf77f5396bd3b.
+1 282 файла, точное совпадение с D5, пропусков и добавлений нет.
+AGENTS.md в этих архивах нет. Пути ZIP проверены перед распаковкой.
+Совпадение исходников не доказывает установку D5 в Render или на рабочих ПК.
+Нового Render-лога в этих двух вложениях нет.
+
+Рабочие корни: work/phase6-d6-backend и work/phase6-d6-desktop.
+Неизменные родители: work/phase6-d5-backend и work/phase6-d5-desktop.
+Накопительные ZIP рассчитаны относительно исходного I7 Backend и Desktop77.
+
+2. ПОДТВЕРЖДЁННЫЙ ПРОБЕЛ D5
+
+Серверные CAS/проверки прав не восстанавливали результат потерянного HTTP/IPC.
+Desktop отправлял профиль, workspace, создание creator и сетевые изменения
+на старые маршруты без сохранённого до отправки ID команды. После commit и
+потери ответа повтор мог получить duplicate/CAS conflict; после перезапуска
+не было надёжного способа подтвердить именно это действие. У зашифрованного
+proxy REPLACE повторная подготовка также создаёт другой случайный ciphertext.
+
+Дополнительно у профиля не было условия «имя, которое пользователь редактировал,
+всё ещё актуально». Два исполняемых сценария воспроизводят перезапись старым
+редактором на D5 (включая expectedName=null) и проходят на D6.
+Workspace теперь проверяет отпечаток именно редактируемого снимка настроек.
+Это сравнение значений, а не обещание нового глобального monotonic version.
+
+3. СЕРВЕРНЫЙ КОНТРАКТ
+
+Новый /api/management/commands/v1 и /v1/cancel, оба с authRequired.
+Восемь строго заданных действий:
+- account.profile: новое имя + expectedName.
+- workspace.update: patch + expectedRevision снимка name/preferences.
+- creator.create: displayName, username, notes; проверка broad creator scope.
+- creator.update: ограниченные метаданные + expectedUpdatedAt; запрет ручной
+  подмены username подключённой модели сохранён.
+- network.create: creator-bound proxy + expectedNetworkVersion + deviceId.
+- network.update: endpoint + expectedVersion + deviceId, KEEP/REPLACE/CLEAR.
+- network.delete: endpoint + expectedVersion.
+- network.assign: creator + expectedVersion + DIRECT/PROXY и endpoint.
+
+Fingerprint связывает action, target и точный payload, сохраняя различие intent.
+Ключ квитанции включает agencyId/userId/UUID. Отдельный ID нельзя использовать
+для другого тела, действия или цели. JSON строгий, payload не больше 1 100 KiB.
+Обычный endpoint не принимает plaintext password; REPLACE принимает только
+CLIENT_E2E_V1 envelope. Device-bound token должен совпадать с сохранённым deviceId.
+
+Корневой DB commit: Agency lifecycle barrier, mutex команды, чтение прежней
+квитанции, текущие creator scope/User/Member/permissions/accessEpoch, доменная
+операция, required audit и квитанция. Все части используют одну транзакцию.
+Network и enrollment теперь явно присоединяются к kernel-issued transaction
+с Serializable isolation; отдельный вложенный root по-прежнему запрещён.
+Автоматические повторы произвольных callbacks не включены: одна DB попытка,
+явный повтор клиента использует тот же сохранённый ID.
+
+Account setter сохраняет User advisory/row lock order. Workspace сериализует
+проверку snapshot digest и запись через workspace advisory lock. Network
+сохраняет прежние версии, dedicated ownership, E2E checks и запрет отключения/
+удаления назначенного proxy. Existing domain owners остаются владельцами этих
+правил; новая квитанция не заменяет их общим кешем HTTP-ответов.
+
+COMMITTED receipt хранит fingerprint и небольшой locator/digest результата,
+не исходное тело, пароль, ciphertext, заметки или копию профиля. На replay:
+- снова проверяются живые права и scope, включая исходный scope удалённого proxy;
+- по locator читается текущее каноническое состояние;
+- прежнее состояние не записывается повторно;
+- если состояние изменилось, возвращается подтверждение commit с
+  resultUnavailable=true и result=null. UI предлагает проверить текущие данные.
+Удаление proxy не выполняется второй раз даже после повторного использования ID.
+
+Канонический ответ ограничен 256 KiB, квитанция — 8 KiB. Слишком большой новый
+результат откатывает mutation; слишком большой/изменённый replay недоступен как
+снимок и не переписывает канонические данные. Network hint откладывается до commit.
+Отмена проверяет текущего участника, сохраняет ABANDONED tombstone даже для
+некорректного бизнес-payload и сериализуется с выполнением. Если действие уже
+завершено, возвращает alreadyCommitted без отмены его эффекта. Если действие
+ещё не выполнено, поздний исходный запрос больше не сможет его выполнить.
+Отмена не требует прежнего creator permission и не возвращает содержимое
+результата: участник с изменёнными правами может убрать собственный pending intent.
+Disabled/retired actor не получает эту возможность через старую сессию.
+
+Квитанции не очищаются по произвольному TTL, иначе старый запрос мог бы стать
+новым. Они включены в существующую ограниченную очистку при удалении Agency,
+с индексом (agencyId,id). Один OWNER не менялся и проверен SQL-fixture lifecycle.
+
+4. DESKTOP И UI
+
+Новый ManagementCommandTransport использует проверенный AtomicJsonStore и
+DurableCommandTransport. Журнал management-command-pending-v1.json сохраняется
+с fsync до POST. UUID и payload переживают потерю ответа, IPC и Main restart.
+Windows backup-only window восстанавливается; повреждение/ошибка диска не
+обнуляет intent и не приводит к отправке новой случайной команды.
+
+Сохранены лимиты общей инфраструктуры: 32 pending entry и 4 MiB всего журнала;
+account/backend/agency principal и login incarnation отделяют чужие результаты.
+Один unresolved resource slot не допускает другой intent. Одновременный
+одинаковый клик объединяется. Перед отправкой и после ответа проверяется текущий
+локальный permit; это дополняет, но не заменяет серверную проверку.
+
+Проверяются не только ok/commandId: action, флаги replay, наличие целевого
+user/creator/proxy/profile, ID и версии. Некорректный ответ не разрешает ACK.
+Команда остаётся до подтверждения получения Renderer. Потеря ответа на ACK
+не превращает уже полученный успех в ошибку, предлагающую повторное создание.
+Cancel удаляет запись только после подтверждённого terminal server result.
+
+Семь существующих Main/UI путей переведены: create creator, profile, workspace,
+create/update/delete proxy, assign network. Существующего Desktop-редактора
+общих creator metadata в источниках не найдено; серверная creator.update
+реализована и SQL-проверена, новый экран/кнопка метаданных не выдумывались.
+
+Панель Recover/Cancel доступна в Settings независимо от загрузки его остальных
+данных, в Creator Management и в Creator Overview. В списке моделей панель не
+дублируется в каждой строке. Восстановление обновляет нужные queries/network
+view; подтверждённая отмена тоже сбрасывает creator bootstrap cache. getState
+обновляет локальную проекцию user после проверки текущего presentation permit.
+
+Proxy credentials шифруются существующим keyring до journal/HTTP. В обычный
+журнал попадает уже CLIENT_E2E_V1 ciphertext и маскированный username hint.
+Recovery переиспользует именно этот ciphertext и не требует повторно вводить
+или сохранять plaintext password. Тест исполняет реальный Main network service
+с управляемым encryptor и проверяет отсутствие исходных username/password
+в файле. Это не native OS keychain proof и не новая криптосхема.
+D5 root-recovery journal по-прежнему отдельный, OS-protected; AMK/recovery key
+никогда не переносились в generic management journal.
+
+5. CUTOVER И МИГРАЦИЯ
+
+Новая additive migration:
+20260929233000_phase6_management_command_receipts/migration.sql.
+Добавлена только ManagementCommandReceipt и её constraints/index. Prisma model
+добавлена. Все прежние migrations побайтово неизменны. Новая таблица не содержит
+данных переписки; это не серверный переезд истории и не миграция архивов.
+
+Восемь старых unkeyed HTTP-записей имеют ранний 410 gateway до старых handlers:
+POST /api/creators; PATCH /api/creators/:id;
+PATCH /api/settings/account/profile; PATCH /api/settings/workspace;
+POST /api/network-profiles/creators/:creatorId/proxy;
+PATCH и DELETE /api/network-profiles/proxies/:proxyId;
+PUT /api/network-profiles/creators/:creatorId.
+Gateway учитывает default case-insensitive routing Express и trailing slash.
+Unowned POST /proxies уже был закрыт в D5. Старые тела handlers сохранены за
+явным gateway на период cutover, а не считаются достижимыми mutation paths.
+
+Backend + Desktop + migration являются согласованным исходным пакетом.
+Старый Desktop для этих восьми маршрутов получит 410; новый Desktop со старым
+сервером не делает тихий fallback на опасный unkeyed write. Это не инструкция
+устанавливать сейчас: вердикт «СТАВИТЬ: ПОКА НЕТ» сохраняется до общих gates.
+
+Password/avatar, root/device/creator rotations, Telegram challenges, creator
+connection/lifecycle/observations и provider secret-read/test-material не
+обёрнуты в этот протокол. Их текущие владельцы и replay/recovery правила
+рассматриваются отдельно; здесь их полное закрытие не заявляется.
+
+6. ПРОВЕРКИ И ЧЕСТНЫЕ ОГРАНИЧЕНИЯ
+
+Итоговый целевой набор:
+- 212 Backend PASS, 0 FAIL, 0 SKIP.
+- 122 Desktop PASS, 0 FAIL, 0 SKIP; из них 27 новых D6 сценариев.
+- 22 сценария actual Prisma + PGlite SQL PASS, полная цепочка migrations.
+- 2 D6 CAS-сценария воспроизвели дефект D5 (expected failures), на D6 проходят.
+- 20 JS/CJS/MJS syntax checks PASS и 20 TS/TSX parse checks PASS.
+- prisma validate PASS; отдельный Prisma Client 5.22 сгенерирован по текущей схеме.
+
+SQL проверил все восемь команд, lost-response replay, duplicate/collision,
+CAS, более новые результаты, tombstone/commit-before-cancel, disabled User,
+stale epoch, потерю исходного creator scope после delete, device mismatch,
+отказ записи receipt с rollback proxy+assignment, bounded agency purge и
+ограничение размера canonical result. Promise.all подтверждает поведение
+одно-соединительного SQL adapter, не независимых PostgreSQL sessions.
+
+Промежуточные логи сохранены: выявлен старый Prisma runtime client без полей
+актуальной схемы; собран отдельный текущий client в analysis/phase6-d6-runtime.
+Исправлены тестовые fixtures (creator generation и helper disable), устаревшее
+ожидание POST в тесте creator create заменено проверкой durable owner.
+Route-manifest gate теперь явно требует 51 семейство вместо 50 и сверяет
+точное множество mount/manifest; новая семья — management commands.
+Два локальных SQL старта завершились по deadline до первого результата;
+успешный итоговый полный прогон имеет 22 PASS. Это ограничение воспроизводимости
+локального adapter учтено; физическая PostgreSQL concurrency не заявляется.
+
+Отдельный legacy Settings-набор: 7 PASS / 4 FAIL на D5 и D6 с одинаковыми именами
+падений. Два устаревших шаблона admin/billing source и два неполных billing fakeDb
+не являются новыми дефектами D6 и не спрятаны в целевые PASS.
+
+npm run typecheck и npm run build запущены: оба BLOCKED, tsc: not found,
+код 127. TypeScript parse не выдаётся за полноценную проверку типов/сборку.
+Настоящие Electron/OS keychain, несколько рабочих ПК, независимые PostgreSQL
+sessions, реальные провайдеры, длительная нагрузка и production rollout не
+запускались. Имеющийся D5 dist-related encryption gate остаётся в истории;
+отсутствующий build не объявляется исправленным.
+
+7. ОБЪЁМ И СОСТАВ ПОСТАВКИ
+
+Backend target: 1291 файлов; изменений относительно D5:
+21; накопительно относительно исходного I7: 93.
+Desktop target: 1222 файлов; изменений относительно D5:
+23; накопительно относительно Desktop77: 142.
+В дельты входят текущий код, проверки и по одному документу D6.
+
+Проверка overlay: original, D1, D2, D3, D4, D5 и присланный актуал — семь
+состояний на каждую сторону. Наложение накопительного ZIP даёт одинаковый
+целевой manifest. Удалений файлов нет; прежние migrations неизменны.
+ZIP integrity, SHA256, manifests и родительский prefix проверены.
+Evidence содержит полный D5 evidence ZIP, текущие исходные дельты, сценарии,
+логи, inventory, owner review и обе текущие code-поставки.
+
+8. ЧТО ОСТАЁТСЯ
+
+Inventory: 392 literal mutation declarations = 296 mounted non-admin,
+59 unmounted, 37 admin outside 6D. Из mounted 229 пока INVENTORY_ONLY (232 в D5).
+Это очередь проверки владельцев, а не 229 найденных багов, не число равных
+по трудоёмкости задач и не основание для процента готовности. Многие сетевые
+маршруты уже были проверены на authority в D5, но только теперь получили
+durable command + UI recovery; снижение inventory-only отражает это частично.
+
+Оставшийся 6D:
+- Creator connection begin/complete, profile observations, Telegram contact и
+  retirement: сохранить существующие generations, quiesce/physical boundaries.
+- Settings avatar/password/logout/reset/email, Billing preferences/start/renewal
+  и другие специализированные управляющие действия.
+- Creator/device key rotations: D5 root recovery покрывает только собственный
+  root intent, это не автоматическое закрытие всех ключевых переходов.
+- Custom/Telegram/submission/delivery: существующие intents/leases/receipts,
+  восстановление неизвестных внешних исходов; никаких слепых resend.
+- Job progress/results, programmatic OF writes/settlement, observations/refresh
+  и module controls: сверить владельца каждой группы, не общий HTTP-cache.
+6E: Chromium pending bounds, fairness, host pressure.
+6F: реальная сборка, Electron/multi-PC, независимые PostgreSQL sessions, нагрузка.
+Серверное хранение переписки остаётся отдельным согласованным узлом.
+
+Продолжать крупным связанным проходом по оставшимся владельцам, опираясь на этот
+полный TXT и актуальные архивы. Не объявлять всю фазу законченной по зелёному
+узкому набору, не менять OWNER-инвариант, не выполнять деплой/внешний SQL.
+
+ВЕРДИКТ: связанная реализация D6 и её локальные доказательства готовы.
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ: ПОКА НЕТ.
+================================================================================

@@ -6586,3 +6586,17 @@ model MessageLibraryCommandReceipt {
  createdAt DateTime @default(now())
  @@index([agencyId, id])
 }
+
+// Non-secret effect locators; never automatically expire a replay identity.
+model ManagementCommandReceipt {
+ id String @id
+ agencyId String
+ userId String
+ action String
+ targetId String
+ fingerprint String
+ status String
+ reference Json
+ createdAt DateTime @default(now())
+ @@index([agencyId, id])
+}

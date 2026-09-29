@@ -23,6 +23,7 @@ const {
 
 const router = express.Router();
 router.use(authRequired);
+router.use(require("../middleware/retired-management-writes"));
 
 const proxyType = z.enum(["HTTP", "HTTPS", "SOCKS4", "SOCKS4A", "SOCKS5"]);
 const opaqueCredentials = z.object({

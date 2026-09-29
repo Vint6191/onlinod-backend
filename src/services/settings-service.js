@@ -1,9 +1,10 @@
 "use strict";
-const { runDbTransaction } = require("./db-transaction-service");
+const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-service");
 
 const { effectiveBillingState, liveEntitlementEnd, scopedEntitlement } = require("./billing-state-service");
 
 const bcrypt = require("bcryptjs");
+const { digest } = require("./team-command-contract");
 const prisma = require("../prisma");
 const { publicUser, issuePasswordReset } = require("./auth-service");
 const { acquireAuthorizationUserLock, withAuthorizationUserLock } = require("./authorization-session-authority-service");
@@ -195,7 +196,7 @@ async function lockEligibleAccountUser(db, userId) {
   return current;
 }
 
-async function updateAccountProfile({ agencyId, userId, name, db = null }) {
+async function updateAccountProfile({ agencyId, userId, name, expectedName = undefined, db = null }) {
   const client = db || prisma;
   const nextName = clean(name, 80);
   if (!nextName) {
@@ -205,6 +206,7 @@ async function updateAccountProfile({ agencyId, userId, name, db = null }) {
   }
   const { before, user } = await runDbTransaction(client, async (tx) => {
     const before = await lockEligibleAccountUser(tx, userId);
+    if (expectedName !== undefined && (before.name || null) !== expectedName) throw Object.assign(new Error("Profile changed; refresh before editing"), { code: "SETTINGS_PROFILE_VERSION_CONFLICT", status: 409 });
     const user = await tx.user.update({ where: { id: userId }, data: { name: nextName } });
     return { before, user };
   });
@@ -391,11 +393,12 @@ async function getWorkspaceSettings({ agencyId, member, db = null }) {
   return {
     agency,
     preferences: normalizeWorkspacePreferences(raw),
+    revision: digest([agency?.name || null, normalizeWorkspacePreferences(raw)]),
     canManage: await canManageWorkspaceSettings(member, client),
   };
 }
 
-async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, db = null }) {
+async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, expectedRevision = null, db = null }) {
   const client = db || prisma;
   if (!(await canManageWorkspaceSettings(member, client))) {
     const err = new Error("You do not have permission to edit workspace settings");
@@ -457,6 +460,8 @@ async function updateWorkspaceSettings({ agencyId, actorUserId, member, patch, d
 
   const before = await getWorkspaceSettings({ agencyId, member, db: client });
   const persist = async (tx) => {
+    await lockDbAdvisoryXact({ db: tx, key: `workspace-settings:${agencyId}` });
+    if (expectedRevision && (await getWorkspaceSettings({ db: tx, agencyId, member })).revision !== expectedRevision) throw Object.assign(new Error("Workspace changed; refresh before editing"), { code: "SETTINGS_WORKSPACE_VERSION_CONFLICT", status: 409 });
     await assertManagementCommitAuthority({
       tx, agencyId, actorMember: member, permissionKey: "workspace.manage_settings",
     });
@@ -1029,6 +1034,7 @@ async function getBillingSettings({ agencyId, member, db = null }) {
 }
 
 module.exports = {
+  lockEligibleAccountUser,
   WORKSPACE_SETTING_DEFAULTS,
   TIME_FORMATS,
   DATE_FORMATS,

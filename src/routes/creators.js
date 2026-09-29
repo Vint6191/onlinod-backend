@@ -200,6 +200,7 @@ async function creatorAccessRequired(req, res, next) {
 }
 
 router.use(authRequired);
+router.use(require("../middleware/retired-management-writes"));
 
 router.get("/", async (req, res) => {
   try {

@@ -36,3 +36,13 @@ test("D5 stale password verification cannot overwrite a concurrently replaced ha
   await assert.rejects(service.changeAccountPassword({userId:"user",currentPassword:"old-password",newPassword:"new-password",db:f.db}),e=>e.code==="SETTINGS_PASSWORD_CHANGED"&&e.status===409);
   assert.equal(f.user.passwordHash,"other-password-hash");assert.equal(f.writes.length,0);assert.equal(f.revokes,0);
 });
+test("D6 profile editor cannot overwrite a concurrently changed name",async()=>{
+  const f=fixture();f.beforeCommit=()=>{f.user.name="newer";};
+  await assert.rejects(service.updateAccountProfile({userId:"user",name:"stale edit",expectedName:"before",db:f.db}),e=>e.code==="SETTINGS_PROFILE_VERSION_CONFLICT");
+  assert.equal(f.writes.length,0);assert.equal(f.user.name,"newer");
+});
+test("D6 an expected empty name is still a real compare-and-set condition",async()=>{
+  const f=fixture();
+  await assert.rejects(service.updateAccountProfile({userId:"user",name:"stale edit",expectedName:null,db:f.db}),e=>e.code==="SETTINGS_PROFILE_VERSION_CONFLICT");
+  assert.equal(f.writes.length,0);
+});
