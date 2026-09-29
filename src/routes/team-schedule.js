@@ -6,9 +6,6 @@ const { TEAM_CAPABILITIES, canUseTeamCapability } = require("../services/team-ca
 const { canUsePermission } = require("../services/team-access-control");
 const {
   buildTeamSchedule,
-  createTeamShift,
-  updateTeamShift,
-  cancelTeamShift,
 } = require("../services/team-schedule-service");
 
 const router = express.Router();
@@ -93,56 +90,10 @@ router.get("/", async (req, res) => {
   }
 });
 
-router.post("/shifts", async (req, res) => {
-  try {
-    const actor = await viewer(req, res, { write: true }); if (!actor) return;
-    return res.status(201).json(await createTeamShift({
-      agencyId: actor.agencyId,
-      actorUserId: actor.member.userId,
-      actorMemberId: actor.member.id,
-      actorMember: actor.member,
-      actorAllowedCreatorIds: actor.allowedCreatorIds,
-      input: req.body || {},
-    }));
-  } catch (err) {
-    return sendError(res, err, "TEAM_SCHEDULE_CREATE_FAILED");
-  }
-});
-
-router.patch("/shifts/:shiftId", async (req, res) => {
-  try {
-    const actor = await viewer(req, res, { write: true }); if (!actor) return;
-    return res.json(await updateTeamShift({
-      agencyId: actor.agencyId,
-      shiftId: req.params.shiftId,
-      actorUserId: actor.member.userId,
-      actorMemberId: actor.member.id,
-      actorMember: actor.member,
-      actorAllowedCreatorIds: actor.allowedCreatorIds,
-      expectedRevision: req.body?.expectedRevision,
-      input: req.body || {},
-    }));
-  } catch (err) {
-    return sendError(res, err, "TEAM_SCHEDULE_UPDATE_FAILED");
-  }
-});
-
-router.post("/shifts/:shiftId/cancel", async (req, res) => {
-  try {
-    const actor = await viewer(req, res, { write: true }); if (!actor) return;
-    return res.json(await cancelTeamShift({
-      agencyId: actor.agencyId,
-      shiftId: req.params.shiftId,
-      actorUserId: actor.member.userId,
-      actorMemberId: actor.member.id,
-      actorMember: actor.member,
-      actorAllowedCreatorIds: actor.allowedCreatorIds,
-      expectedRevision: req.body?.expectedRevision,
-      reason: req.body?.reason || null,
-    }));
-  } catch (err) {
-    return sendError(res, err, "TEAM_SCHEDULE_CANCEL_FAILED");
-  }
-});
-
+function upgradeRequired(req, res) {
+  return res.status(410).json({ ok: false, code: "TEAM_COMMAND_V2_REQUIRED", error: "Update Desktop to use recoverable Team commands" });
+}
+router.post("/shifts", upgradeRequired);
+router.patch("/shifts/:shiftId", upgradeRequired);
+router.post("/shifts/:shiftId/cancel", upgradeRequired);
 module.exports = router;

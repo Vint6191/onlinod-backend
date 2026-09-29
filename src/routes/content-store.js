@@ -2,6 +2,7 @@
 const { normalizeUsageInput, recordMessageLibraryUsage } = require("../services/message-library-usage-service");
 
 const express = require("express");
+const { executeMessageLibraryCommand } = require("../services/message-library-command-service");
 const prisma = require("../prisma");
 const { canUsePermission } = require("../services/team-access-control");
 const { requireProductCreator } = require("../middleware/product-access");
@@ -49,8 +50,8 @@ const MESSAGE_LIBRARY_KIND = "message_library_script";
 
 const MESSAGE_LIBRARY_TRASH_RETENTION_DAYS = 14;
 function trashPurgeAfter(trashedAt = new Date()) { return new Date(trashedAt.getTime() + MESSAGE_LIBRARY_TRASH_RETENTION_DAYS * 86400000); }
-function mutationContext(req, creatorId, scriptId, action, manager = true) {
-  return { db: prisma, agencyId: req.auth.agencyId, creatorId, scriptId, action, manager,
+function mutationContext(req, creatorId, scriptId, action, manager = true, db = prisma) {
+  return { db, agencyId: req.auth.agencyId, creatorId, scriptId, action, manager,
     userId: req.auth.userId, actorMember: req.auth.membership || req.member,
     expectedUpdatedAt: req.body?.expectedUpdatedAt || (action === "save" && req.body?.serverId ? req.body?.updatedAt : null) };
 }
@@ -269,11 +270,12 @@ function normalizeMlMessage(message = {}, index = 0) {
   };
 }
 
-async function normalizeMlScriptPayload(req, { patch = false } = {}) {
+async function normalizeMlScriptPayload(req, { patch = false, db = prisma } = {}) {
   const body = req.body || {};
-  const scriptId = cleanString(body.id || body.clientId || body.scriptId, 120) || `script_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const scriptId = cleanString(body.id || body.clientId || body.scriptId, 120);
+  if (!scriptId) throw Object.assign(new Error("Stable script identity is required"), { code: "MESSAGE_LIBRARY_SCRIPT_ID_MISSING", status: 400 });
   const creatorId = cleanString(body.creatorId || body.accountId || req.query.creatorId, 100);
-  await requireProductCreator(req, creatorId, { db: prisma });
+  await requireProductCreator(req, creatorId, { db });
   const restoreFromTrash = body.trashedAt === null || body.status === "active";
   const trashedAt = restoreFromTrash ? null : asDateOrNull(body.trashedAt);
   const enabled = body.enabled !== false && !trashedAt;
@@ -318,8 +320,8 @@ async function normalizeMlScriptPayload(req, { patch = false } = {}) {
   return { scriptId, data, blocks: normalizedBlocks };
 }
 
-async function upsertMessageLibraryScript(req) {
-  const normalized = await normalizeMlScriptPayload(req);
+async function upsertMessageLibraryScript(req, db = prisma) {
+  const normalized = await normalizeMlScriptPayload(req, { db });
   const mediaIds = [...new Set(normalized.blocks.flatMap((block) => normalizeMlMedia(block.media).map((item) => String(item.id || "").trim())).filter(Boolean))];
   if (mediaIds.length > 2000) throw Object.assign(new Error("One script supports at most 2000 distinct media references"), {code:"MESSAGE_LIBRARY_SCRIPT_LIMIT",status:413});
   if (mediaIds.length) {
@@ -334,7 +336,7 @@ async function upsertMessageLibraryScript(req) {
         member: req.auth.membership || req.member,
         creatorId: normalized.data.creatorId,
         mediaIds: mediaIds.slice(offset, offset + 200),
-        db: prisma,
+        db,
       });
       if (!preflight?.ok || !Array.isArray(preflight.customMediaIds)) {
         const err = new Error("Message Library media provenance check returned an incomplete result");
@@ -352,7 +354,7 @@ async function upsertMessageLibraryScript(req) {
       throw err;
     }
   }
-  const context = mutationContext(req, normalized.data.creatorId, normalized.scriptId, "save");
+  const context = mutationContext(req, normalized.data.creatorId, normalized.scriptId, "save", true, db);
   if (req.body?.serverId && !context.expectedUpdatedAt) throw Object.assign(new Error("Reload the server script before saving"), {code:"MESSAGE_LIBRARY_REVISION_REQUIRED",status:428});
   return withMessageLibraryMutation({ ...context, work: async ({ tx, existing, now }) => {
     if (existing && isTrash(existing)) throw Object.assign(new Error("Restore the script before saving"), { code: "MESSAGE_LIBRARY_SCRIPT_TRASHED", status: 409 });
@@ -402,7 +404,7 @@ async function upsertMessageLibraryScript(req) {
 
     return tx.contentCollection.findFirst({
       where: { id: collection.id, agencyId: req.auth.agencyId },
-      include: { blocks: { where: { deletedAt: null, status: { notIn: ["trash","deleted"] } }, orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
+      include: { blocks: { where: { deletedAt: null, status: { notIn: ["trash","deleted"] } }, orderBy: [{ order: "asc" }, { id: "asc" }], take: 501 } },
     });
   } });
 }
@@ -448,43 +450,33 @@ router.get("/message-library/scripts", async (req, res) => {
   }
 });
 
-router.post("/message-library/scripts", async (req, res) => {
-  try {
-    await assertMessageLibraryManager(req);
-    const item = await upsertMessageLibraryScript(req);
-    return res.status(201).json({ ok: true, source: "server", item: scriptFromCollection(item) });
-  } catch (err) {
-    return sendError(res, err, "MESSAGE_LIBRARY_SCRIPT_SAVE_FAILED");
-  }
-});
-
-router.put("/message-library/scripts/:id", async (req, res) => {
-  try {
-    await assertMessageLibraryManager(req);
-    req.body = { ...(req.body || {}), id: req.params.id };
-    const item = await upsertMessageLibraryScript(req);
-    return res.json({ ok: true, source: "server", item: scriptFromCollection(item) });
-  } catch (err) {
-    return sendError(res, err, "MESSAGE_LIBRARY_SCRIPT_SAVE_FAILED");
-  }
-});
-
-function lifecycleRoute(action, block = false) {
+function mutationUpgradeRequired(_req, res) {
+  return res.status(410).json({ ok: false, code: "MESSAGE_LIBRARY_COMMAND_V3_REQUIRED", error: "Update Desktop to use recoverable Message Library commands" });
+}
+router.post("/message-library/scripts", mutationUpgradeRequired);
+router.put("/message-library/scripts/:id", mutationUpgradeRequired);
+router.delete("/message-library/scripts/:id", mutationUpgradeRequired);
+router.post("/message-library/scripts/:id/restore", mutationUpgradeRequired);
+router.delete("/message-library/scripts/:id/permanent", mutationUpgradeRequired);
+router.delete("/message-library/scripts/:scriptId/messages/:messageId", mutationUpgradeRequired);
+router.post("/message-library/scripts/:scriptId/messages/:messageId/restore", mutationUpgradeRequired);
+function messageLibraryCommandRoute(cancel) {
   return async (req, res) => {
     try {
-      await assertMessageLibraryManager(req);
-      const creatorId = await requireMessageLibraryCreator(req);
-      const scriptId = cleanString(block ? req.params.scriptId : req.params.id, 120);
-      const result = await withMessageLibraryMutation({ ...mutationContext(req, creatorId, scriptId, action), work: context => changeMessageLibraryLifecycle({ ...context, action, userId: req.auth.userId, messageId: block ? cleanString(req.params.messageId,120) : null }) });
-      return res.json({ ok: true, retentionDays: MESSAGE_LIBRARY_TRASH_RETENTION_DAYS, ...result, ...(result.item ? {item:scriptFromCollection(result.item)} : {}), ...(result.block ? {block:messageFromBlock(result.block)} : {}) });
-    } catch (err) { return sendError(res, err, "MESSAGE_LIBRARY_LIFECYCLE_FAILED"); }
+      const result = await executeMessageLibraryCommand({
+        db: prisma, agencyId: req.auth?.agencyId, userId: req.auth?.userId, actorMember: req.auth?.membership || req.member,
+        input: req.body, cancel, projectScript: scriptFromCollection, projectBlock: messageFromBlock,
+        saveScript: (body, db) => upsertMessageLibraryScript({ ...req, body }, db),
+      });
+      return res.json(result);
+    } catch (error) {
+      if (error?.issues) return res.status(400).json({ ok: false, code: "MESSAGE_LIBRARY_COMMAND_INVALID", error: "Invalid command" });
+      return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "MESSAGE_LIBRARY_COMMAND_FAILED", error: Number(error?.status) < 500 ? error.message : "Message Library command failed" });
+    }
   };
 }
-router.delete("/message-library/scripts/:id", lifecycleRoute("trash"));
-router.post("/message-library/scripts/:id/restore", lifecycleRoute("restore"));
-router.delete("/message-library/scripts/:id/permanent", lifecycleRoute("permanent"));
-router.delete("/message-library/scripts/:scriptId/messages/:messageId", lifecycleRoute("trash", true));
-router.post("/message-library/scripts/:scriptId/messages/:messageId/restore", lifecycleRoute("restore", true));
+router.post("/message-library/commands/v3", messageLibraryCommandRoute(false));
+router.post("/message-library/commands/v3/cancel", messageLibraryCommandRoute(true));
 
 router.post("/message-library/purge-expired", async (req, res) => {
   try {

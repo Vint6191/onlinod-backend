@@ -1,0 +1,228 @@
+================================================================================
+ONLINOD — PHASE 6 / D3 MESSAGE LIBRARY COMMAND RECOVERY
+Накопительное продолжение D2. Дата: 2026-09-29.
+================================================================================
+
+0. ОБЪЁМ И ВЕРДИКТ
+
+Выполнен один связанный проход по всему циклу управления Message Library:
+сохранение, серверное дублирование, корзина, восстановление, окончательное
+удаление, корзина и восстановление отдельного блока. Вместе изменены Backend,
+Desktop Main, Renderer, RPC-контракт, восстановление после перезапуска,
+отмена незавершённого действия, миграция и очистка tenant-данных.
+
+D3 является проверенным локальным исходным пакетом этого семейства команд.
+Это НЕ закрытие всех команд 6D и НЕ завершение шестой фазы.
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ D3: ПОКА НЕТ.
+Полные Desktop typecheck/build: BLOCKED, tsc отсутствует, exit 127.
+Реальный Electron и независимые PostgreSQL-сессии не запускались.
+ZIP содержат накопительные исходники, а не установщики.
+
+Работа продолжена с сохранённого D2. Нового исходного архива после D2 не было.
+Присланные ранее Desktop 90 и Backend 2026-09-29T201831.335 сверены в D2:
+production-содержимое соответствует D1; в Desktop90 отсутствуют 13 старых docs.
+Эта сверка не означает, что D2 или D3 уже установлен на сервере/компьютерах.
+Внешние DB/SQL/Render/Neon не открывались. Деплоя и production-нагрузки не было.
+
+1. ПОЧЕМУ ПОНАДОБИЛСЯ ЭТОТ УЗЕЛ
+
+У прежнего обычного save повтор после потери ответа конфликтовал с уже
+изменившейся updatedAt. Повтор lifecycle мог снова обновлять состояние/аудит.
+Desktop duplicate находил исходник через постраничный список и создавал новые
+идентификаторы при новом вызове. Потерянный HTTP/IPC-ответ не имел общей
+сохраняемой идентичности намерения, с которой пользователь мог восстановиться.
+
+Эти проблемы теперь решаются на владельце операции, а не кешированием всего
+HTTP-ответа. Ранее существующие проверки creator scope, текущих прав,
+GENERAL/CUSTOM, revision и невозможности обычным save воскресить trash/deleting
+сохранены. Usage v2 из D1, specialized Team ownership transfer и фоновые
+maintenance-протоколы не заменены новым receipt-wrapper.
+
+2. BACKEND: СЕМЬ КОМАНД И ОДИН АТОМАРНЫЙ COMMIT
+
+Новый владелец: src/services/message-library-command-service.js.
+POST /api/server/content/message-library/commands/v3
+POST /api/server/content/message-library/commands/v3/cancel
+Actions: save, duplicate, trash, restore, permanent, block.trash, block.restore.
+Envelope: UUID commandId, action, stable targetId, payload с creatorId.
+UUID нормализуется в lower-case. Fingerprint включает версию 3, action,
+targetId и полный канонический payload. Тот же ID с другим payload = conflict.
+Ключ квитанции разделён по agencyId, userId и commandId.
+
+Порядок: действующий actor/agency/creator/permission/billing -> receipt lock ->
+поиск квитанции -> доменная операция -> обязательный AuditLog -> квитанция ->
+один корневой commit. Вложенные существующие доменные транзакции присоединяются
+к переданному tx; отдельный connection из единственного слота не требуется.
+Профиль COMMAND / ReadCommitted / maxAttempts=1: существующие callbacks не
+подписаны на неявный автоматический replay корня. Явный retry использует UUID.
+
+Повтор проверяет актуальные права и billing ПЕРЕД чтением результата.
+Cancel сохраняет ABANDONED-тумбстоун, либо сообщает alreadyCommitted.
+Cancel не откатывает совершённое действие. После тумбстоуна поздний execute
+того же намерения не выполняет действие. Для cancel нужна текущая membership;
+потеря membership/аккаунта не даёт читать чужой журнал или чужую квитанцию.
+Отмена валидирует UUID/envelope, но не требует корректности уже отклонённых
+бизнес-полей: некорректная команда не должна навсегда занимать pending slot.
+Тот же UUID после отмены нельзя присвоить исправленному payload.
+Смена principal сохраняет незавершённую запись отдельно, не присваивает её
+новому аккаунту. Отдельный административный recovery для удалённой membership
+этим проходом не добавлялся.
+
+Save сохраняет прежнюю защиту expected revision/server identity. Replay
+распознаётся раньше повторной доменной проверки устаревшей версии.
+Duplicate читает исходник под серверными блокировками, ограничивает active
+blocks 500 и создаёт copy_<commandId> с детерминированными client IDs блоков.
+Пара source/target namespace блокируется в одном сортированном порядке.
+Нет Desktop-поиска по 100 страницам для операции duplicate.
+Все media проверяются существующим provenance classifier внутри того же tx;
+обхода GENERAL/CUSTOM при копировании нет. Проверка обходит ВСЕ чанки по 200,
+в пределах существующего лимита 2000 различных media IDs на script.
+
+Семь старых unkeyed HTTP management writes возвращают 410 с кодом
+MESSAGE_LIBRARY_COMMAND_V3_REQUIRED. Старый Desktop не сможет ими писать.
+При будущем внедрении Backend/Desktop требуют согласованного обновления;
+сейчас пакет устанавливать не предписано.
+
+3. КВИТАНЦИИ НЕ ПРЕВРАЩЕНЫ В СКРЫТЫЙ АРХИВ СОДЕРЖИМОГО
+
+Новая таблица MessageLibraryCommandReceipt содержит компактную ссылку на
+совершённый результат и его digest, а не копию title/text/media.
+Первый ответ содержит сам результат. Повтор читает только тот же server ID
+в том же agency/creator, берёт namespace/row lock и сверяет digest.
+Если результат изменён, очищен или client ID использован новым объектом,
+ответ подтверждает совершённую команду, возвращая resultUnavailable=true и
+item/block=null. Старое содержимое не перезаписывается и не воскрешается.
+Renderer после recovery обновляет канонический список.
+Содержимое удалённого скрипта не остаётся в этой новой серверной таблице.
+Это не утверждение о стирании внешних бэкапов или всех старых таблиц продукта.
+
+Новая миграция:
+prisma/migrations/20260929190000_phase6_message_library_command_receipts/migration.sql
+PK по id, индекс (agencyId,id), CHECK статуса, CHECK размера result <=4 MiB.
+Квитанции переживают удаление скрипта и не удаляются по короткому TTL: иначе
+поздний повтор мог бы снова выполнить операцию. Очистка Agency включает таблицу
+в существующий ограниченный non-FK purge с индексированным id-отбором.
+SQL-проверка purge с limit=2 оставляет квитанции другой agency нетронутыми.
+Все ранее выпущенные миграции неизменны; новая схема проверена Prisma validate.
+
+4. DESKTOP: СОХРАНЯЕМОЕ НАМЕРЕНИЕ ДО HTTP И RECOVERY В ИНТЕРФЕЙСЕ
+
+Из D2 выделен DurableCommandTransport с конфигурацией домена. Team сохраняет
+совместимый фасад TeamCommandTransport, прежний endpoint, proof и journal path.
+Message Library использует message-library-command-pending-v1.json и свой
+endpoint v3. Журнал: максимум 32 записи / 4 MiB; payload ML <=2 MiB.
+UUID и payload записываются атомарно до отправки HTTP. Ошибка записи не
+позволяет отправить запрос. Повреждённый журнал не сбрасывается молча.
+Ключ pending: backend/user/agency + creator/script. Незавершённое действие
+блокирует другое намерение для того же script; разные creators разделены.
+
+После HTTP reply запись помечается received, но не забывается до Renderer ACK.
+Потерянный IPC-ответ/перезапуск не порождает новый commandId. Потерянный ответ
+самого ACK не превращает известный успех в предложение повторить действие.
+Отмена сначала получает серверное подтверждение/тумбстоун, затем забывает запись.
+Проверка incarnation после proof/HTTP не публикует ответ в изменённый аккаунт.
+Media URL допустимы в payload, authentication/token/password поля отвергаются
+перед сохранением. Журнал намеренно содержит пользовательский черновик для
+recovery; это не серверный архив и не кеш всех завершённых scripts.
+
+Все пять Main management entrypoints используют общий transport. Duplicate
+больше не выполняет list-search и не генерирует новые IDs в Main.
+Renderer adapter подтверждает команды в своём RPC-домене. Общая панель
+незавершённых действий подключена к Message Library, предлагает Recover/Cancel
+и после подтверждения вызывает штатный refresh текущего creator. Этот refresh
+обновляет список и сохраняет существующий отдельный draft; generation-защита
+панели сбрасывается на смене authorization context.
+Фоновая maintenance/purge остаётся своей операцией, не новой пользовательской
+командой. D1 usage path и sidecar attribution сохранены.
+
+5. ПРОВЕРКИ И ИХ ПРАКТИЧЕСКИЕ ГРАНИЦЫ
+
+Backend Node tests: 101 PASS, 0 FAIL, 0 SKIP.
+Desktop behavior/architecture tests: 70 PASS, 0 FAIL, 0 SKIP.
+Новых Desktop recovery behavior-сценариев D3: 15.
+Доменный существующий service-test перенесён с отсутствующего TypeScript
+transpiler на native Node stripTypeScriptTypes; изменённые write/duplicate
+ожидания обновлены под command contract, остальные проверки сохранены.
+Route unit-tests явно изолируют save callback от нового command root;
+полный route/root дополнительно исполняется в настоящем локальном SQL-прогоне.
+
+SQL proof: 34 PASS. Настоящий Prisma 5.22 client + полный migrate deploy chain
+на disposable PGlite 0.5.8 / pglite-socket 0.2.11, connection_limit=1.
+Это SQL и реальные service/route callbacks, НЕ моки storage, но это НЕ обычный
+PostgreSQL с независимыми backend-сессиями и НЕ нагрузка на Render.
+
+Покрыты: обязательный audit rollback и one-effect replay всех 7 actions;
+повтор save со старой показанной версией; изменённый/удалённый результат;
+отсутствие тела/media в receipts; cancel до и после commit; fingerprint conflict;
+billing и stale membership epoch перед replay; >500 блоков; retired endpoints;
+ошибка INSERT receipt с откатом domain+audit; разделение agencies/users;
+CUSTOM на 205-й ссылке; смена provenance перед duplicate; creator collision;
+16000 посторонних квитанций с EXPLAIN indexed PK lookup; bounded tenant purge;
+повторный client ID у другого creator; fresh Prisma client и fresh route load.
+Смена module/client здесь не равна отдельному process-kill на физическом PG.
+Один повторный старт локального SQL-стенда завис до сценариев (в логе только
+PROOF_ENGINE_START/READY/SOCKET_READY). Он остановлен, частичный лог сохранён.
+В proof добавлены отметки стадий запуска; новый чистый прогон завершён exit 0,
+34 PASS. Это диагностический сбой локального harness, не доказанный дефект
+production и не успешно выполненный тест; финальные counts относятся к новому
+завершённому прогону. Ни один падающий assertion не был пропущен или отключён.
+
+Синтаксис изменённых файлов: 10 JS/CJS/MJS Node --check PASS;
+12 TS/TSX Prettier parser PASS. Это НЕ TypeScript typecheck.
+Prisma validate PASS; schema-only diff содержит только новую receipt table/index.
+Полные typecheck и build отдельно действительно запущены: exit 127, tsc missing.
+Новые зависимости не устанавливались, Electron/Windows/UI layout не проверялись.
+
+6. ОСТАТОК ФАЗЫ 6 — НЕ ПОДМЕНЯТЬ ИНВЕНТАРИЗАЦИЮ ВЕРДИКТОМ
+
+Обновлённая static inventory: 389 literal write declarations, из них 293 mounted,
+59 unmounted source, 37 admin вне 6D. В mounted 246 остаются INVENTORY_ONLY.
+Это количество объявлений маршрутов, НЕ 246 доказанных ошибок и НЕ число
+оставшихся правок: там есть POST-чтения, retired handlers и специальные owners.
+D3 добавил 2 typed endpoints и закрыл 7 прежних unkeyed management routes.
+Random fallback script ID больше не отмечен подтверждённым source gap.
+
+6D остаётся открытой для проверки остальных owners: custom orders/delivery,
+provider writes/settlement, creator session broker, billing, jobs/gate,
+fact/telemetry/media/vault/fan-data demands, настройки и остальные surfaces.
+UNKNOWN внешнего эффекта нельзя повторять как обычное DB-намерение.
+Существующий глобальный provider gate нельзя дублировать вторым scheduler.
+
+Отдельно остаются Message Library read-side concerns: GET scripts включает
+исторические child blocks; buildDraft по-прежнему использует findScript с
+пределом 100 страниц. D3 устранил этот search только из duplicate. Ограниченный
+replay/duplicate active-block read НЕ означает закрытие всех больших чтений.
+Нет заявления о завершённой квоте/retention всех receipt-таблиц; короткий TTL
+не вводился, чтобы не разрушить поздний replay. Нужен общий tenant-capacity review.
+
+Дальше 6E: Chromium pending bounds, starvation/fairness, host/AI pressure.
+6F: сборка и acceptance, реальные многосессионные гонки/нагрузка, Electron,
+стыки всех предыдущих фаз. S01..S07 server history и Phase7 purge — отдельные
+согласованные ветки, не часть этого изменения хранения scripts.
+Физический fleet-тест не заменяет source-review и не служит оправданием
+оставить source-пробелы; оба вида доказательств остаются явно разделены.
+
+7. НАКОПИТЕЛЬНЫЙ ПАКЕТ И ПРОДОЛЖЕНИЕ
+
+Backend target: 1275 файлов; delta к D2: 9;
+накопительно изменённых относительно Backend I7: 61.
+Desktop target: 1211 файлов; delta к D2: 17;
+накопительно изменённых относительно Desktop77: 111.
+Удалений файлов нет. ZIP paths относительны корню соответствующего проекта.
+Overlay проверен по SHA256 всех файлов для исходной базы, D1, D2 и присланного
+актуала. Отсутствующие в Desktop90 исторические docs включены в накопительный ZIP.
+TXT дословно сохраняет весь D2 checkpoint как байтовый prefix и добавляет D3.
+Evidence сохраняет D2 evidence целиком вложенным ZIP, текущие source anchors,
+логи, SQL proof, inventory, manifests, packaging script и текущие code ZIP.
+
+Рабочие деревья этого прохода:
+/workspace/scratch/0495154fe552/work/phase6-d3-backend
+/workspace/scratch/0495154fe552/work/phase6-d3-desktop
+Evidence: /workspace/scratch/0495154fe552/evidence-phase6-d3
+Следующее продолжение начинать с D3, а не с загруженного ранее D1-актуала.
+Нельзя выдавать проход за deployed/installed; новый Render-лог не получен.
+
+SOURCE CLOSED: НЕТ.
+SCALE CLOSED: НЕТ.
+СТАВИТЬ: ПОКА НЕТ.
+================================================================================

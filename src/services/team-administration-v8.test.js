@@ -18,13 +18,14 @@ test("V8 Team Administration schema migration is additive and reversible deactiv
   assert.match(schema, /functions\s+Json\?/);
 });
 
-test("V8 Team routes expose atomic member settings, status, reissue and explicit function compatibility", () => {
+test("Team legacy routes remain explicit upgrade fences and v2 validates function provenance", () => {
   const route = read("src/routes/team.js");
   assert.match(route, /router\.patch\("\/members\/:memberId\/settings"/);
   assert.match(route, /router\.patch\("\/members\/:memberId\/status"/);
   assert.match(route, /router\.post\("\/invitations\/:invitationId\/reissue"/);
   assert.ok(route.includes('router.patch("/members/:memberId/functions"'));
-  assert.ok(route.includes('const TEAM_FUNCTION_KEYS = Object.freeze(["CHATTER", "CONTENT", "SUPERVISOR"])'));
+  assert.ok(read("src/services/team-command-contract.js").includes('const TEAM_FUNCTION_KEYS = Object.freeze(["CHATTER", "CONTENT", "SUPERVISOR"])'));
+  assert.match(route, /TEAM_COMMAND_V2_REQUIRED/);
 });
 
 test("V8 service protects owner, self-removal, creator-scope escalation, session revocation and historical attribution", () => {

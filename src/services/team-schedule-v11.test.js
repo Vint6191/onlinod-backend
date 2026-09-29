@@ -51,7 +51,7 @@ function dbForRead({ shiftMemberScope = "all" } = {}) {
         { id: "creator-1", displayName: "Vilgelmina", username: "vilgelmina", avatarUrl: null },
         { id: "creator-2", displayName: "Mira", username: "mira", avatarUrl: null },
       ];
-      const ids = where?.creatorId?.in;
+      const ids = where?.id?.in;
       return Array.isArray(ids) ? rows.filter((row) => ids.includes(row.id)) : rows;
     } },
     agencyMember: { async findMany() { return [
@@ -157,8 +157,9 @@ test("Schedule is relational, additive and exposes an explicit granular manage p
   }
   assert.match(access, /workspace\.manage_schedule/);
   assert.match(route, /write && !canManageSchedule/);
-  assert.match(route, /actorAllowedCreatorIds: actor\.allowedCreatorIds/);
-  assert.match(server, /app\.use\("\/api\/team\/schedule", authRequired, teamScheduleRoutes\)/);
+  assert.match(route, /TEAM_COMMAND_V2_REQUIRED/);
+  assert.match(fs.readFileSync(path.join(__dirname, "team-command-service.js"), "utf8"), /withProductBilling\(agencyId, execute\)/);
+  assert.match(server, /app\.use\("\/api\/team\/schedule", authRequired, productBilling, teamScheduleRoutes\)/);
   assert.match(service, /findAllById\(db\.teamShift/);
   assert.match(service, /findAllById\(db\.teamResponseCase/);
   assert.doesNotMatch(service, /take:\s*(?:10000|50000)/, "Schedule reads must not silently truncate at legacy fixed caps");

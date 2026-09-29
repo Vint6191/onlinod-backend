@@ -27,6 +27,9 @@ function loadRoute(db) {
   const routePath = require.resolve("./content-store");
   delete require.cache[routePath];
   Module._load = function patchedLoad(request, parent, isMain) {
+    // These tests isolate the existing save domain callback. The full command
+    // root, receipts and authority run against SQL in the D3 offline proof.
+    if (request === "../services/message-library-command-service" && parent?.filename === routePath) return { executeMessageLibraryCommand: async ({input,saveScript,projectScript}) => ({ok:true,item:projectScript(await saveScript({...input.payload,id:input.targetId},db))}) };
     if (request === "express") return { Router: () => router };
     if (request === "../prisma" && parent?.filename === routePath) return db;
     return originalLoad.call(this, request, parent, isMain);
@@ -37,6 +40,10 @@ function loadRoute(db) {
     Module._load = originalLoad;
   }
   return {
+    save(req,res) {
+      const handler=router.routes.find(x=>x.path==='/message-library/commands/v3').handler;
+      return handler({...req,body:{commandId:'00000000-0000-4000-8000-000000000001',action:'save',targetId:req.params.id,payload:req.body}},res);
+    },
     route(method, path) {
       const item = router.routes.find((entry) => entry.method === method && entry.path === path);
       assert.ok(item, `${method} ${path} is missing`);
@@ -139,7 +146,7 @@ test("script update preserves original author and exact message whitespace", asy
   }), $transaction: undefined });
   const api = loadRoute(db);
   const res = response();
-  await api.route("PUT", "/message-library/scripts/:id")({
+  await api.save({
     auth: auth(), query: {}, params: { id: "script-1" },
     body: { creatorId: "creator-1", serverId:"server-script-1", updatedAt:"2026-01-01T00:00:00.000Z", title: "Flow", messages: [{ id: "block-1", text: "  first line\nsecond line  " }] },
   }, res);
@@ -156,7 +163,7 @@ test("reusable Message Library scripts reject canonical CUSTOM media before any 
   db.$transaction = async () => { transactionCalled = true; };
   const api = loadRoute(db);
   const res = response();
-  await api.route("PUT", "/message-library/scripts/:id")({
+  await api.save({
     auth: auth(), query: {}, params: { id: "script-1" },
     body: {
       creatorId: "creator-1", title: "Reusable flow",
@@ -186,7 +193,7 @@ test("Message Library provenance classification exhaustively crosses the 200-id 
     text: `block ${blockIndex + 1}`,
     media: ids.slice(blockIndex * 100, (blockIndex + 1) * 100).map((id) => ({ id, type: "photo" })),
   }));
-  await api.route("PUT", "/message-library/scripts/:id")({
+  await api.save({
     auth: auth(), query: {}, params: { id: "script-large" },
     body: { creatorId: "creator-1", title: "Large reusable flow", messages },
   }, res);
@@ -202,7 +209,7 @@ test("duplicate block ids are rejected before a transaction mutates data", async
   db.$transaction = async () => { transactionCalled = true; };
   const api = loadRoute(db);
   const res = response();
-  await api.route("PUT", "/message-library/scripts/:id")({
+  await api.save({
     auth: auth(), query: {}, params: { id: "script-1" },
     body: { creatorId: "creator-1", title: "Flow", messages: [{ id: "same", text: "a" }, { id: "same", text: "b" }] },
   }, res);
@@ -263,24 +270,8 @@ test("v2 route returns 201 first, 200 replay, and 409 changed intent data", asyn
   assert.equal(conflict.statusCode, 409); assert.equal(conflict.body.code, "MESSAGE_LIBRARY_USAGE_EVENT_CONFLICT"); assert.equal(auditCount, 1);
 });
 
-test("permanent deletion refuses an active script", async () => {
-  const db = baseDb();
-  let findWhere = null;
-  db.contentCollection.findFirst = async ({ where }) => {
-    findWhere = where;
-    return {
-      id: "server-script-1", clientId: "script-1", creatorId: "creator-1", title: "Flow", status: "active", deletedAt: null, tags: [], metadata: {}, blocks: [],
-    };
-  };
-  let deleted = false;
-  db.contentCollection.delete = async () => { deleted = true; };
-  const api = loadRoute(db);
-  const res = response();
-  await api.route("DELETE", "/message-library/scripts/:id/permanent")({ auth: auth(), query: { creatorId: "creator-1" }, params: { id: "script-1" }, body: {} }, res);
-  assert.equal(res.statusCode, 409);
-  assert.equal(res.body.code, "MESSAGE_LIBRARY_SCRIPT_NOT_TRASHED");
-  assert.equal(findWhere.agencyId, "agency-1");
-  assert.equal(deleted, false);
+test("unkeyed permanent deletion is retired before domain access",async()=>{
+ const db=baseDb();let reads=0;db.contentCollection.findFirst=async()=>{reads++;return null};const api=loadRoute(db),res=response();await api.route("DELETE","/message-library/scripts/:id/permanent")({},res);assert.equal(res.statusCode,410);assert.equal(reads,0);
 });
 
 test("script id collisions cannot move a script to another creator", async () => {
@@ -293,7 +284,7 @@ test("script id collisions cannot move a script to another creator", async () =>
   db.$transaction = async fn => { transactionCalled = true; return fn({ ...({}), $transaction: undefined }); };
   const api = loadRoute(db);
   const res = response();
-  await api.route("PUT", "/message-library/scripts/:id")({
+  await api.save({
     auth: auth(), query: {}, params: { id: "script-1" },
     body: { creatorId: "creator-b", title: "Wrong creator", messages: [] },
   }, res);
@@ -330,12 +321,12 @@ test("message-library listing and destructive actions require an explicit creato
 
   const deleteRes = response();
   await api.route("DELETE", "/message-library/scripts/:id")({ auth: auth(), query: {}, body: {}, params: { id: "script-1" } }, deleteRes);
-  assert.equal(deleteRes.statusCode, 400);
-  assert.equal(deleteRes.body.code, "CREATOR_ID_MISSING");
+  assert.equal(deleteRes.statusCode, 410);
+  assert.equal(deleteRes.body.code, "MESSAGE_LIBRARY_COMMAND_V3_REQUIRED");
   assert.equal(collectionLookup, false);
 });
 
-test("message block actions are creator-bound before looking up the script", async () => {
+test("unkeyed block mutation is retired before looking up the script", async () => {
   const db = baseDb();
   db.creatorAccount.findFirst = async ({ where }) => ({ id: where.id });
   let findWhere = null;
@@ -345,9 +336,8 @@ test("message block actions are creator-bound before looking up the script", asy
   await api.route("DELETE", "/message-library/scripts/:scriptId/messages/:messageId")({
     auth: auth(), query: { creatorId: "creator-b" }, body: {}, params: { scriptId: "script-1", messageId: "message-1" },
   }, res);
-  assert.equal(res.statusCode, 404);
-  assert.equal(findWhere.agencyId, "agency-1");
-  assert.equal(findWhere.clientId, "script-1");
+  assert.equal(res.statusCode, 410);
+  assert.equal(findWhere, null);
 });
 
 test("media raw sanitization drops prototype mutation keys", async () => {
@@ -405,28 +395,28 @@ test("a transient automatic purge failure does not make script listing unavailab
 test("a new Desktop draft with a local updatedAt is created without a false revision conflict",async()=>{
  const db=baseDb();let saved=null;db.contentCollection.findFirst=async()=>saved;
  db.contentCollection.create=async({data})=>{saved={id:"new-server-id",...data,updatedAt:new Date("2026-09-24"),blocks:[]};return saved;};
- const api=loadRoute(db),res=response();await api.route("PUT","/message-library/scripts/:id")({auth:auth(),query:{},params:{id:"new-script"},body:{creatorId:"creator-1",serverId:null,updatedAt:"2026-09-23T18:30:00Z",messages:[]}},res);
+ const api=loadRoute(db),res=response();await api.save({auth:auth(),query:{},params:{id:"new-script"},body:{creatorId:"creator-1",serverId:null,updatedAt:"2026-09-23T18:30:00Z",messages:[]}},res);
  assert.equal(res.statusCode,200);assert.equal(res.body.item.serverId,"new-server-id");
 });
 for(const state of ["trash","deleting"])test(`ordinary save cannot resurrect ${state} script`,async()=>{
  const db=baseDb();let writes=0;db.contentCollection.findFirst=async()=>({id:"server-script-1",clientId:"script-1",creatorId:"creator-1",status:state,deletedAt:new Date("2026-01-01"),updatedAt:new Date("2026-01-01")});db.contentCollection.update=async()=>{writes++;};
- const api=loadRoute(db),res=response();await api.route("PUT","/message-library/scripts/:id")({auth:auth(),query:{},params:{id:"script-1"},body:{creatorId:"creator-1",serverId:"server-script-1",updatedAt:"2026-01-01T00:00:00Z",status:"active",trashedAt:null,messages:[]}},res);
+ const api=loadRoute(db),res=response();await api.save({auth:auth(),query:{},params:{id:"script-1"},body:{creatorId:"creator-1",serverId:"server-script-1",updatedAt:"2026-01-01T00:00:00Z",status:"active",trashedAt:null,messages:[]}},res);
  assert.equal(res.statusCode,409);assert.equal(writes,0);
 });
 test("a stale Desktop revision fails before changing collection or messages",async()=>{
  const db=baseDb();let writes=0;db.contentCollection.findFirst=async()=>({id:"server-script-1",clientId:"script-1",creatorId:"creator-1",updatedAt:new Date("2026-02-01")});db.contentCollection.update=async()=>{writes++;};
- const api=loadRoute(db),res=response();await api.route("PUT","/message-library/scripts/:id")({auth:auth(),query:{},params:{id:"script-1"},body:{creatorId:"creator-1",serverId:"server-script-1",updatedAt:"2026-01-01T00:00:00Z",messages:[]}},res);
+ const api=loadRoute(db),res=response();await api.save({auth:auth(),query:{},params:{id:"script-1"},body:{creatorId:"creator-1",serverId:"server-script-1",updatedAt:"2026-01-01T00:00:00Z",messages:[]}},res);
  assert.equal(res.statusCode,409);assert.equal(res.body.code,"MESSAGE_LIBRARY_REVISION_CONFLICT");assert.equal(writes,0);
 });
 
 for (const present of [true, false]) test(`serverId without its shown revision cannot bypass save concurrency checks (existing=${present})`,async()=>{
  const db=baseDb();let writes=0;db.contentCollection.findFirst=async()=>present?{id:"server-script-1",clientId:"script-1",creatorId:"creator-1",updatedAt:new Date("2026-01-01")}:null;
  db.contentCollection.update=async()=>{writes++;};db.contentCollection.create=async()=>{writes++;};
- const api=loadRoute(db),res=response();await api.route("PUT","/message-library/scripts/:id")({auth:auth(),query:{},params:{id:"script-1"},body:{creatorId:"creator-1",serverId:"server-script-1",messages:[]}},res);
+ const api=loadRoute(db),res=response();await api.save({auth:auth(),query:{},params:{id:"script-1"},body:{creatorId:"creator-1",serverId:"server-script-1",messages:[]}},res);
  assert.equal(res.statusCode,428);assert.equal(res.body.code,"MESSAGE_LIBRARY_REVISION_REQUIRED");assert.equal(writes,0);
 });
 test("a server identity from another script cannot be reused even with the current timestamp",async()=>{
  const db=baseDb();let writes=0;db.contentCollection.findFirst=async()=>({id:"server-script-1",clientId:"script-1",creatorId:"creator-1",updatedAt:new Date("2026-01-01")});db.contentCollection.update=async()=>{writes++;};
- const api=loadRoute(db),res=response();await api.route("PUT","/message-library/scripts/:id")({auth:auth(),query:{},params:{id:"script-1"},body:{creatorId:"creator-1",serverId:"another-script",updatedAt:"2026-01-01T00:00:00Z",messages:[]}},res);
+ const api=loadRoute(db),res=response();await api.save({auth:auth(),query:{},params:{id:"script-1"},body:{creatorId:"creator-1",serverId:"another-script",updatedAt:"2026-01-01T00:00:00Z",messages:[]}},res);
  assert.equal(res.statusCode,409);assert.equal(res.body.code,"MESSAGE_LIBRARY_REVISION_CONFLICT");assert.equal(writes,0);
 });

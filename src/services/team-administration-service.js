@@ -1104,7 +1104,7 @@ function invitationUrl(rawToken) {
   return baseUrl ? `${baseUrl}/invite/${rawToken}` : `/invite/${rawToken}`;
 }
 
-async function createInvitation({ agencyId, input, actorMember, actorUserId: actorId, db = prisma }) {
+async function createInvitation({ agencyId, input, actorMember, actorUserId: actorId, invitationToken = null, db = prisma }) {
   const roleKey = await ensureRoleExists({ agencyId, roleKey: input.roleKey, db });
   if (roleKey === "owner") {
     const error = new Error("Cannot invite as owner. Transfer ownership after the member joins.");
@@ -1122,7 +1122,7 @@ async function createInvitation({ agencyId, input, actorMember, actorUserId: act
   }
   assertActorCanGrantCreatorScope({ actorMember, assignedCreators: creatorScope.value });
   const functions = cleanFunctions(input.functions);
-  const rawToken = newToken(24);
+  const rawToken = invitationToken || newToken(24);
   const expiresInDays = Math.max(1, Math.min(60, Number(input.expiresInDays) || 14));
   const expiresAt = new Date(Date.now() + expiresInDays * 24 * 60 * 60 * 1000);
   const createWithRoleFence = async (tx) => {
@@ -1171,7 +1171,7 @@ async function createInvitation({ agencyId, input, actorMember, actorUserId: act
   return { invitation: invitationToClient(created), url: invitationUrl(rawToken), token: rawToken };
 }
 
-async function reissueInvitation({ agencyId, invitationId, expiresInDays = 14, actorMember, actorUserId: actorId, db = prisma }) {
+async function reissueInvitation({ agencyId, invitationId, expiresInDays = 14, actorMember, actorUserId: actorId, invitationToken = null, db = prisma }) {
   const inv = await db.agencyInvitation.findFirst({ where: { id: invitationId, agencyId } });
   if (!inv) {
     const error = new Error("Invitation not found");
@@ -1193,7 +1193,7 @@ async function reissueInvitation({ agencyId, invitationId, expiresInDays = 14, a
   }
   await assertActorCanAssignRole({ agencyId, actorMember, roleKey: inv.roleKey, db });
   assertActorCanGrantCreatorScope({ actorMember, assignedCreators: inv.assignedCreators });
-  const rawToken = newToken(24);
+  const rawToken = invitationToken || newToken(24);
   const days = Math.max(1, Math.min(60, Number(expiresInDays) || 14));
   const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
   const reissueWithRoleFence = async (tx) => {
@@ -1552,6 +1552,7 @@ module.exports = {
   assertRoleConfigurationWithinActor,
   memberToClient,
   invitationToClient,
+  invitationUrl,
   roleExists,
   ensureRoleExists,
   getTeamAdministrationState,

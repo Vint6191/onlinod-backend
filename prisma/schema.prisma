@@ -6558,3 +6558,31 @@ model MaintenanceAdmissionClassState {
   @@unique([generation, ordinal], map: "MaintenanceAdmissionClassState_generation_ordinal_key")
   @@index([generation, turnCount, ordinal], map: "MaintenanceAdmissionClassState_turn_idx")
 }
+
+// Durable Team v2 effects/replay and abandon tombstones; agency purge owns cleanup.
+model TeamMutationReceipt {
+  id                 String   @id
+  agencyId           String
+  userId             String
+  action             String
+  targetId           String
+  fingerprint        String
+  status             String
+  result             Json
+  authorizationScope Json
+  createdAt          DateTime @default(now())
+
+  @@index([agencyId, id])
+}
+
+model MessageLibraryCommandReceipt {
+ id String @id
+ agencyId String
+ userId String
+ creatorId String
+ fingerprint String
+ status String
+ result Json
+ createdAt DateTime @default(now())
+ @@index([agencyId, id])
+}

@@ -1,0 +1,274 @@
+================================================================================
+ONLINOD — PHASE 6 / D2 TEAM COMMAND REPLAY + DESKTOP RECOVERY
+Накопительное продолжение D1. Дата: 2026-09-29.
+================================================================================
+
+0. ОБЪЁМ И ВЕРДИКТ
+
+По просьбе Саши не дробить работу выполнен целый связанный узел: все 12 команд
+Team Administration (участники, приглашения, роли) и все 3 команды Team Schedule.
+Серверный durable receipt, Desktop intent/journal, восстановление и отмена,
+обязательный транзакционный аудит смен, current-authority replay, совместимость
+и bounded cleanup новой таблицы реализованы вместе. Ownership transfer остаётся
+в своём ранее созданном специализированном протоколе.
+
+Это завершённый исходный пакет данного узла, не закрытие всех non-admin команд,
+не завершение 6D и не завершение шестой фазы.
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ D2: ПОКА НЕТ.
+Полные Desktop typecheck/build снова остановлены отсутствующим tsc (exit 127).
+Не выполнены реальный Electron, обычный PostgreSQL с независимыми сессиями,
+проверка многопроцессных гонок/целевой нагрузки и acceptance прежних узлов.
+Код ZIP — исходники для проверки, не готовые установщики.
+
+Внешние DB/SQL/Render/Neon не открывались. Деплой, production нагрузка,
+сообщения третьим лицам, установка новых зависимостей не выполнялись.
+SQL-прогоны ниже используют исключительно новый локальный disposable PGlite.
+
+1. ПОДТВЕРЖДЁННЫЙ АКТУАЛ
+
+Desktop 90.zip: SHA256
+fe06f9a5867a9f3012c3aadafdc3959df30e62cbecbe7bc243710064b4029c7a
+1187 исходных файлов, 1321 entries. Производственный код совпадает с D1.
+Отсутствовали 13 исторических документов: восстановлены из D1, код не смешивался.
+Backend onlinod-backend-main - 2026-09-29T201831.335.zip: SHA256
+06c081cc5e9dd6f0b7af235c149b043615a5b6d6eedda16b146aefc2f5e12862
+1264 файла, 1575 entries. Все файлы совпадают с D1.
+Присланный Render-лог: 17680 bytes, SHA256
+b12c457002221ad070b7138c320d0ac3f0e21dde4e5eda4aa15438d1fb1f849c
+Commit f7e71f54095cc35dc1e0985ab36aaa26380c3a57. Node 22.23.3.
+2026-09-29T17:18:10.966912959Z: No pending migrations to apply.
+2026-09-29T17:18:42.456689478Z: Your service is live.
+Адрес в логе: onlinod-backend.onrender.com. Последний postflight-фрагмент обрезан.
+Это подтверждение запуска D1; это не подтверждение функциональности D2,
+Desktop сборки или конкурентной приемки.
+
+УТОЧНЕНИЕ ПРЕЖНЕГО ВЫВОДА: в Team Administration обязательный аудит уже входил
+в общий Serializable root через teamMutation. Формулировку D1 о его отдельной
+записи после commit считать неверной. Исторический TXT сохранён побайтно;
+данное уточнение имеет приоритет. У Team Schedule аудит действительно был после
+транзакции и best-effort — именно эта проблема исправлена D2.
+
+2. СЕРВЕРНЫЙ КОНТРАКТ
+
+Новые POST /api/team/commands/v2 и /api/team/commands/v2/cancel.
+Agency, user, device берутся только из admitted auth. Envelope строгий:
+commandId UUID, action, targetId, payload, optional actorProof. UUID приводится
+к нижнему регистру. Payload проверяется отдельной строгой схемой каждого action;
+expectedRevision смен сохранён, обязательные поля/ограничения прежних команд
+сохранены. Команда и повтор одного намерения отличаются только replayed.
+Proof не является частью fingerprint и вычисляется заново, когда нужен.
+
+15 canonical actions:
+member.update / member.status / member.remove;
+invitation.create / invitation.reissue / invitation.revoke;
+role.create / role.update / role.access / role.permission / role.reset / role.delete;
+shift.create / shift.update / shift.cancel.
+Старые 16 Team Administration writers с aliases и 3 Schedule writers возвращают
+410 TEAM_COMMAND_V2_REQUIRED до доменного эффекта. GET и ownership transfer
+сохранены. Старый Backend не знает /commands/v2 и потому не сможет молча
+исполнить новую команду без receipt. Старый Desktop на новом Backend должен
+обновиться; атомарная установка связанных Backend/Desktop обязательна в плане
+развёртывания. До проверки сборки пакет не рекомендован к установке.
+
+TeamMutationReceipt — новая отдельная таблица, deterministic primary key
+sha256(agency, user, commandId), action/target/fingerprint, COMMITTED|ABANDONED,
+secret-free JSON result и authorizationScope, createdAt. Отсутствуют plaintext
+invitation token/URL, owner proof, access/refresh tokens. Никакого TTL, который
+мог бы превратить старую команду в новую: receipt живёт до удаления agency.
+Максимумы result и scope по 2 MiB, CHECK в БД. Это ограничение размера одной
+записи, не обещание фиксированного суммарного диска при бесконечном числе команд.
+Lookup только по PK, не скан истории команд. Результат нормализован как JSON,
+включая даты, поэтому первый ответ и повтор имеют один представимый контракт.
+
+Одна root Serializable transaction существующего db-commit-kernel:
+command-only advisory mutex -> receipt lookup -> branch-specific current authority
+-> доменная операция -> обязательный аудит -> receipt -> commit.
+Никаких network sends внутри callback. Существующие domain lock orders
+Agency/Role/Creator/User/Member не заменены ранним Member-lock. Новый mutex
+берётся только этим семейством до остальных блокировок. Team Administration
+присоединяется через kernel-issued commitContext. Schedule теперь аналогично
+владеет всем command root/join, включая audit(required:true). Hints Team Admin
+по-прежнему отложены до успешного commit; rollback их не публикует.
+
+При replay проверяются текущие active User/Member, permission action, исходный
+и текущий creator scope, broad-scope/OWNER ограничения, делегирование роли и
+доступные powers возвращаемой роли. Для смен также проверяются analytics view
+и product billing. Ответ не выдаётся только потому, что UUID уже существует.
+Сам SELECT receipt предшествует проверке scope, но данные не возвращаются до
+проверки current authority. Changed fingerprint -> 409 без доменного эффекта.
+Уже выполненная смена повторяется из receipt раньше проверки старой revision;
+новая команда с устаревшей revision всё ещё отклоняется.
+
+Cancel не означает откат выполненного действия. Сервер под тем же mutex:
+- если команда не выполнилась — сохраняет ABANDONED tombstone;
+- если COMMITTED — сообщает alreadyCommitted, не отменяя результат;
+- повтор cancellation безопасен; задержавшийся execute после ABANDONED запрещён.
+Для отказа от своего pending требуется актуальный active actor/agency, но не
+сохранение прежних бизнес-permissions: это позволяет убрать зависшее действие
+после отзыва права, не открывая содержимое прежнего результата.
+
+Восстановление приглашения: token выводится HMAC-SHA256 из существующего
+JWT_SECRET и отдельного cryptographic domain + agency/user/command/fingerprint.
+В AgencyInvitation остаётся только привычный tokenHash. Receipt хранит профиль
+приглашения. Повтор возвращает ссылку лишь если hash по-прежнему совпадает,
+приглашение не claimed/revoked/expired (DB clock). Перевыпуск другим намерением,
+истечение, отзыв, claim или смена JWT_SECRET -> успешное подтверждение прежнего
+действия с linkAvailable:false и null token/url; новый invite/token не создаётся.
+Ротация JWT_SECRET отключает recovery старых ссылок и не продлевает/не отзывает
+их сама. Новая environment-переменная или plaintext secret cache не введены.
+
+Cleanup новой таблицы добавлен в существующий bounded agency non-FK purge и
+residual inventory. Для receipt используется LIMIT + ORDER BY id через индекс
+(agencyId,id); прежние механизмы других таблиц не переписываются. Нормальные
+member/creator removals не стирают receipt и не оживляют старый command ID.
+Серверный переезд переписки и полная Phase7 purge остаются отдельными узлами.
+
+3. DESKTOP: НАМЕРЕНИЕ, ДОСТАВКА ОТВЕТА И RECOVERY
+
+Один shared TeamCommandTransport в Main обслуживает оба раздела. Все 15
+продуктовых вызовов переведены на него; ownership transfer остаётся отдельным.
+До первого HTTP-запроса durable AtomicJsonStore записывает UUID и точное
+нормализованное намерение. Namespace: apiBase + userId + activeAgencyId.
+Authorization incarnation дополнительно проверяется после ожидания owner proof
+и после HTTP; смена аккаунта не может представить поздний ответ другому actor.
+Relogin того же principal позволяет явное recovery с актуальным разрешением.
+
+Файл team-command-pending-v1.json: не более 32 unresolved intentions, общий
+serialized размер <=4 MiB, payload <=1 MiB. Нет actorProof/auth tokens,
+invitation tokens, URLs или response cache. Ошибка записи ДО HTTP блокирует
+отправку; ошибка чтения/повреждение не заменяется пустым журналом. Backup-only
+окно Windows replacement восстанавливает старый файл, сохраняя UUID.
+Это защита process restart, не отдельное доказательство power-loss/storage
+hardware durability; AtomicJsonStore использует существующий fsync+rename.
+
+Повтор того же action/target/payload получает прежний UUID. Одновременные
+одинаковые попытки объединяются. Пока результат не разобран, другая команда
+для того же resource family/target блокируется; новый payload нельзя отправить
+под старым ID. New create имеет собственный family create-slot. Ограничение
+журнала никогда не вытесняет старое неопределённое намерение автоматически.
+Ошибки сети/401/5xx и business rejection не удаляют ID без подтверждения.
+Пользователь может явно отменить pending серверным tombstone.
+
+Main сохраняет receipt-delivered state, но не забывает ID после HTTP success:
+сначала Renderer должен получить ответ и отправить acknowledge. Потеря Main->
+Renderer IPC reply/перезапуск Renderer до acknowledge сохраняет recovery.
+Потеря ответа самого acknowledge не показывается как ошибка уже полученного
+успешного действия; при несохранённом acknowledge pending остаётся доступен.
+После подтверждённого получения результата следующее действие с новым ID —
+новое намерение; система не запрещает осознанно создать ещё одну такую роль/смену.
+Удаление userData/потеря журнала целиком не входит в гарантию process restart.
+
+В Team Administration и Team Schedule добавлен общий Pending actions блок:
+Recover -> явный повтор того же намерения с current authority;
+Cancel pending action -> серверное ABANDONED или ответ alreadyCommitted.
+Ссылка приглашения может быть показана при recovery; unavailable URL корректно
+отображается, кнопка копирования пустой ссылки выключена. Account/auth event
+сбрасывает видимые pending/link и отсекает поздние ответы recovery.
+Если основной read временно недоступен, recovery остаётся на error surface;
+оно не запускает reload, который уничтожил бы только что восстановленную ссылку.
+Никакого скрытого auto-outbox/resend на startup не добавлено.
+
+4. ПРОВЕРКИ И ПРЕДЕЛЫ ДОКАЗАТЕЛЬСТВ
+
+Backend Node tests: 50 PASS / 0 FAIL / 0 SKIP.
+Desktop Node/native TypeScript behavior + прежние D1/A2/Team boundaries:
+40 PASS / 0 FAIL / 0 SKIP; из них 14 новых D2 сценариев.
+Проверены: stable UUID/disk-before-HTTP, Main restart, потерянный Renderer reply,
+ack boundary/ack reply loss, совместный in-flight, changed-intent blocking,
+fresh proof/no secret persistence, account switch, corrupt journal, backup
+recovery, disk failure, server-tombstone cancellation, 32-entry cap, все 15
+сервисных методов через транспорт и отдельный ownership protocol.
+
+Два прежних Schedule tests также падали на неизменённом D1. Исправлены их
+устаревшие fixtures/assertions: CreatorAccount filter должен учитывать where.id,
+mount должен включать существующий productBilling. Старые проверки строк
+Team routes/modules обновлены под D2; важные эффекты дополнительно проверяются
+поведенчески и SQL, а не удалением проверок безопасности.
+
+SQL: 44 PASS сценария, actual Prisma 5.22.0 + production services/kernel,
+PGlite 0.5.8 + pglite-socket 0.2.11, полная цепочка migrations включая D2.
+- 15 действий x audit failure: полный rollback domain/receipt.
+- 15 действий x success/replay: прежний результат, без добавления audit,
+  доступа/epoch/revision, invitation, role или shift effects.
+- receipt insert fault откатывает роль и аудит;
+- fingerprint mismatch, abandon-before-execute, cancel-after-commit;
+- secret-free receipt/audit, superseded invitation и JWT key rotation;
+- disabled User, отозванные permissions/creator scope, billing loss;
+- old shift receipt против нового stale intent;
+- root SQLSTATE 40001 retry -> один audit и один receipt;
+- изоляция namespace actor/agency;
+- новый Prisma client + повторная загрузка сервиса восстанавливают receipt;
+- 16000 старых receipt: EXPLAIN использует TeamMutationReceipt_pkey;
+  bounded tenant cleanup удаляет ровно 2 записи и не затрагивает другую agency.
+
+Это один сериализованный SQL backend, НЕ независимые физические PG sessions.
+Concurrent execute/cancel на двух соединениях и lock/deadlock throughput ещё
+не закрыты. Полный перезапуск самого SQL engine в этом D2-прогоне не делался;
+restart-доказательство здесь — новый application client/service над той же БД.
+В fixture отзыв OWNER учитывает действующий single-owner deferred constraint:
+сначала owner корректно передаётся другому member; persisted fields читаются
+повторно. Отрицательный fixture disable единственного OWNER не годится как
+модель успешного отзыва прав. Стенд не закрывает propagation ошибок deferred
+commit в обычном PostgreSQL.
+
+Prisma validate PASS. Offline schema diff: только новая TeamMutationReceipt
+и её индекс; migration дополнительно задаёт status/size CHECK. Ни один старый
+migration не изменён. Новых production migrations D2: 1, накопительно Phase6: 4.
+JS/CJS/MJS syntax: 14 изменённых файлов PASS.
+TypeScript/TSX parser: 14 изменённых файлов PASS (только синтаксис).
+npm run typecheck: BLOCKED (127, tsc: not found).
+npm run build: BLOCKED (127, tsc: not found).
+Фактический локальный Node 24.19.0, Render Node 22.23.3 известен только из лога.
+Реальный Electron/Windows UX и собранный preload/Main/Renderer не запускались.
+
+Ограничения масштаба: новый receipt lookup/cleanup имеют собственные bounded
+индексы; это не доказательство O(1) всего management authorization. Прежние
+membership JSON scopes, role membership fanout и чтения Team state не заменены
+A2 compact Home repository. Физическая нагрузка тысячи agency x тысячи creators
+и совместная AI/Chromium нагрузка здесь не измерялись.
+
+5. ИНВЕНТАРЬ И ОСТАВШИЙСЯ ОБЪЁМ
+
+D2 inventory: 387 literal write declarations: 291 mounted non-admin (34 файла),
+59 unmounted source, 37 admin вне 6D. Из mounted: 252 inventory-only,
+15 ранее retired, 1 D1 retired + 1 D1 reviewed usage endpoint,
+19 D2 retired, 2 D2 reviewed command endpoints, 1 подтверждённый оставшийся
+source gap (Message Library POST script fallback random ID).
+Статический HTTP verb inventory не равен списку дефектов: read POST, факты,
+lease renewal, billing/OF intents и cleanup требуют своих владельцев.
+
+Следующий крупный узел 6D: завершить согласованный review остальных mounted
+семейств из mutation-inventory.json, включая Message Library script create.
+Не ставить общую HTTP cache-обёртку на provider UNKNOWN effects, billing,
+leases/job settlements или crypto rotations. У них уже есть собственные owners.
+После 6D — 6E (Chromium pending bounds, starvation/приоритеты, общий host pressure),
+затем 6F с проверками всей фазы. B1 capacity, C1 maintenance, A2 Home и D1 usage
+сохранены. Не объявлять шестую фазу завершённой по одному Team узлу.
+Серверное хранение переписки S01..S07 и Phase7 purge — отдельно согласованные
+работы. Существующий global PostgreSQL OF gate повторно не строить.
+
+6. НАКОПИТЕЛЬНЫЕ АРТЕФАКТЫ И ЦЕЛОСТНОСТЬ
+
+Backend target 1270 файлов, D2 delta 14,
+накопительно от I7 56 изменённых/новых файлов.
+Desktop target 1207 файлов, D2 delta 19,
+накопительно от Desktop77 104 файлов.
+Удалений нет. Code ZIP содержит только накопленные изменённые/новые файлы;
+корни Backend/Desktop раздельные, generated/node_modules в них не включены.
+
+Overlay Backend cumulative на I7, D1 и присланный актуал даёт один target.
+Overlay Desktop cumulative на 77, D1 и 90 даёт один target, с восстановленными
+13 историческими документами и новой документацией D2. CRC/manifests проверены.
+
+TXT содержит полный прежний D1 checkpoint первыми 912823 байтами без изменений.
+SHA256 префикса:
+5f71d607a90bae46c2326a20fbb07fbf470b07de094bc63f239b05f4d3ce2fb8
+D1 cumulative evidence вложена целиком, SHA256:
+82f60ff5c9d0d57a06280972743daae39699f81d3023ec86f19f2e7aa1cd1ed5
+Вся история I7/Phase5/B12/Phase6 A1/B1/C1/A2/D1 сохранена. D2 evidence включает
+лог актуала, manifests, текущие source/delta, новый inventory, проверочные
+скрипты, результаты SQL/Node/parser/schema/build gates и package verification.
+
+Вердикт: цельный Team command/recovery узел подготовлен и локально проверен.
+SOURCE CLOSED — НЕТ. SCALE CLOSED — НЕТ. СТАВИТЬ D2 — ПОКА НЕТ.
+================================================================================

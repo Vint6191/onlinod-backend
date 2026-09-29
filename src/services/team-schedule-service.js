@@ -4,7 +4,23 @@ const { runDbTransaction } = require("./db-transaction-service");
 
 const prisma = require("../prisma");
 const { resolveRange, rangeForClient } = require("./range-service");
-const { audit } = require("./audit-service");
+const { audit: writeAudit } = require("./audit-service");
+const { runRootCommit, joinCommit, currentCommitContext } = require("./db-commit-kernel");
+async function audit(input) {
+  if (currentCommitContext()?.tx !== input.db) throw error("TEAM_SCHEDULE_AUDIT_CONTEXT_REQUIRED", "Schedule audit must join its command", 500);
+  return writeAudit({ ...input, required: true });
+}
+function scheduleMutation(work) {
+  return async input => {
+    const db = input.db || prisma;
+    const execute = context => work({ ...input, db: context.tx });
+    if (input.commitContext) {
+      if (input.commitContext.tx !== db) throw error("DB_COMMIT_CONTEXT_SCOPE_MISMATCH", "Schedule client/context mismatch", 500);
+      return joinCommit(input.commitContext, { isolationLevel: "Serializable", agencyId: input.agencyId }, execute);
+    }
+    return runRootCommit(db, execute, { profile: "TEAM_MANAGEMENT", authority: { kind: "TEAM_MANAGEMENT", agencyId: input.agencyId, userId: input.actorUserId }, conflictCode: "TEAM_SCHEDULE_RETRY" });
+  };
+}
 const { normalizeAssignedCreators } = require("./team-access-control");
 const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
 const { getRetentionSettings } = require("./retention-service");
@@ -839,9 +855,9 @@ module.exports = {
   MIN_SHIFT_MS,
   HANDOFF_WINDOW_MS,
   buildTeamSchedule,
-  createTeamShift,
-  updateTeamShift,
-  cancelTeamShift,
+  createTeamShift: scheduleMutation(createTeamShift),
+  updateTeamShift: scheduleMutation(updateTeamShift),
+  cancelTeamShift: scheduleMutation(cancelTeamShift),
   unionSeconds,
   clipCoverageSession,
   validateShiftWindow,
