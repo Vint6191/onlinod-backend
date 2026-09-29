@@ -39,7 +39,7 @@ async function lockAgencyLifecycle({ tx, agencyId }) {
   return row;
 }
 
-async function lockLiveActor({ tx, agencyId, actorMember }) {
+async function lockLiveActor({ tx, agencyId, actorMember, relationalCreatorScope = false }) {
   const memberId = clean(actorMember?.id);
   const userId = clean(actorMember?.userId);
   if (!memberId || !userId) throw fail("MANAGEMENT_ACTOR_REQUIRED", "Current agency membership is required", 403);
@@ -70,6 +70,7 @@ async function lockLiveActor({ tx, agencyId, actorMember }) {
   }
   const current = await tx.agencyMember.findFirst({
     where: { id: memberId, userId, agencyId: String(agencyId), deletedAt: null, deactivatedAt: null, user: { is: { disabledAt: null } } },
+    ...(relationalCreatorScope ? {select:{id:true,userId:true,agencyId:true,accessEpoch:true,role:true,roleKey:true,permissions:true}} : {}),
   });
   if (!current) throw fail("MANAGEMENT_ACCESS_REVOKED", "Agency membership is no longer active", 403);
 
@@ -96,6 +97,7 @@ async function assertManagementCommitAuthority({
   agencyAlreadyLocked = false,
   creatorRowsAlreadyLocked = false,
   requireBroadCreatorScope = false,
+  relationalCreatorScope = false,
 }) {
   if (!tx || !agencyId) throw fail("MANAGEMENT_COMMIT_CONTEXT_REQUIRED", "Management commit context is required", 500);
   if (!agencyAlreadyLocked) await lockAgencyLifecycle({ tx, agencyId });
@@ -113,7 +115,7 @@ async function assertManagementCommitAuthority({
     throw fail("MANAGEMENT_CREATOR_RETIRED", "Creator is no longer active", 409, { creatorIds: creatorLock.missingCreatorIds });
   }
 
-  const member = await lockLiveActor({ tx, agencyId, actorMember });
+  const member = await lockLiveActor({ tx, agencyId, actorMember, relationalCreatorScope });
 
   if (ownerOrAdmin && !isOwnerOrAdmin(member)) {
     throw fail("MANAGEMENT_OWNER_OR_ADMIN_REQUIRED", "OWNER or ADMIN authority is required", 403);
@@ -121,11 +123,21 @@ async function assertManagementCommitAuthority({
   if (permissionKey && !(await canUsePermission({ member, key: permissionKey, db: tx }))) {
     throw fail("MANAGEMENT_PERMISSION_REVOKED", `${permissionKey} permission is required`, 403, { permissionKey });
   }
-  if (requireBroadCreatorScope && !hasBroadCreatorAccess(member)) {
+  const scopeRepository = relationalCreatorScope ? require("./home-scope-repository") : null;
+  const compact = scopeRepository ? await scopeRepository.readHomeAuthority({db:tx,agencyId,member,billing:true}) : null;
+  if (requireBroadCreatorScope && !(compact ? compact.broad : hasBroadCreatorAccess(member))) {
     throw fail("MANAGEMENT_BROAD_CREATOR_SCOPE_REQUIRED", "All-creators scope is required for this management command", 403);
   }
 
-  const denied = targets.filter((creatorId) => !canAccessCreator(member, creatorId));
+  let denied;
+  if (scopeRepository) {
+    const allowed = await tx.$queryRawUnsafe(`${scopeRepository.scopeSql()} SELECT "id" FROM visible WHERE "id"=ANY($6::text[])`,
+      ...scopeRepository.scopeParams({agencyId,member,billing:true}),targets);
+    const ids = new Set(allowed.map(row=>row.id));
+    denied = targets.filter(id=>!ids.has(id));
+  } else {
+    denied = targets.filter((creatorId) => !canAccessCreator(member, creatorId));
+  }
   if (denied.length) {
     throw fail("MANAGEMENT_CREATOR_SCOPE_REVOKED", "Creator access changed while this request was in flight", 403, { creatorIds: denied });
   }

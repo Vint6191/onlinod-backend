@@ -903,3 +903,29 @@ test("Home demand rejects all-history admission and quarantines corrupt persiste
     assert.ok(f.store.get(queued.key).quarantinedAt);
   }
 });
+
+test("A2 member-current demand uses relational pages and resumes the persisted cursor across workers", async () => {
+  const db={creatorAccount:{findMany:async()=>{throw Error('legacy scope enumeration reached');}},analyticsCoverage:{findMany:async()=>[]}};
+  const store=addDemandStore(db);const actor=addDemandAuthority(db,{role:'OPERATOR',roleKey:'operator',permissions:{'creator_analytics.refresh':true}});
+  const read=db.agencyMember.findFirst;
+  db.agencyMember.findFirst=async args=>{if(args.select?.permissions)assert.equal(args.select.assignedCreators,undefined);return read(args);};
+  const scope=require('./home-scope-repository'),planning=require('./analytics-demand-planning-service');
+  const oldAuthority=scope.readHomeAuthority,oldPage=scope.readDemandCreatorPage,oldPlan=planning.planAnalyticsDemandCreator;
+  const pageCalls=[],planned=[];
+  scope.readHomeAuthority=async()=>({...actor.get(),assignedCreators:undefined});
+  scope.readDemandCreatorPage=async input=>{pageCalls.push(input);assert.equal(input.billing,true);return ['c1','c2','c3'].filter(id=>id>(input.cursor||'')).slice(0,input.take).map(id=>({id,agencyId:'agency-1'}));};
+  planning.planAnalyticsDemandCreator=async({demand,creator})=>{
+    planned.push(creator.id);await db.analyticsCollectionDemand.update({where:{key:demand.key},data:{cursorCreatorId:creator.id}});
+    return {created:0,reused:0,dueDays:0};
+  };
+  try {
+    const now=new Date('2026-09-29T12:00:00Z');
+    const queued=await planner.enqueueAgencyAnalyticsFreshnessDemand({db,agencyId:'agency-1',scopeMode:'MEMBER_CURRENT',...DEMAND_ACTOR,now});
+    const one=await planner.claimNextAnalyticsDemand({db,now,ownerToken:'worker-a'});
+    const first=await planner.processAnalyticsDemand({db,demand:one,pageSize:2,now});
+    assert.equal(first.settled.yielded,true);assert.equal(store.get(queued.key).cursorCreatorId,'c2');
+    const two=await planner.claimNextAnalyticsDemand({db,now,ownerToken:'worker-b'});
+    const second=await planner.processAnalyticsDemand({db,demand:two,pageSize:2,now});
+    assert.equal(second.settled.completed,true);assert.deepEqual(planned,['c1','c2','c3']);assert.equal(pageCalls.length,2);assert.equal(pageCalls[1].cursor,'c2');
+  } finally {scope.readHomeAuthority=oldAuthority;scope.readDemandCreatorPage=oldPage;planning.planAnalyticsDemandCreator=oldPlan;}
+});

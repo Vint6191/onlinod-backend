@@ -2718,6 +2718,7 @@ model AnalyticsPlanningBudget {
 }
 
 model AnalyticsCollectionDemand {
+  scopeMode            String    @default("LEGACY")
   key                  String    @id
   agencyId             String
   rangeKey             String

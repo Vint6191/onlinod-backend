@@ -2,8 +2,8 @@
 
 const express = require("express");
 const prisma = require("../prisma");
-const { buildHomeSummary } = require("../services/home-summary-service");
-const { allowedCreatorScope } = require("../middleware/automation-permissions");
+const { buildHomeSummary, buildHomeCreatorPage } = require("../services/home-summary-service");
+const { readHomeAuthority, MEMBER_CURRENT } = require("../services/home-scope-repository");
 const { canUsePermission } = require("../services/team-access-control");
 const { enqueueAgencyAnalyticsFreshnessDemand } = require("../services/analytics-collection-planner");
 
@@ -15,6 +15,7 @@ function currentMember(req) {
 
 router.get("/summary", async (req, res) => {
   try {
+    if (req.query.contractVersion !== "2") return res.status(409).json({ok:false,code:"HOME_CLIENT_UPDATE_REQUIRED",error:"Update Desktop to load Home."});
     const agencyId = String(req.query.agencyId || req.auth.agencyId || "");
     if (!agencyId) return res.status(400).json({ ok: false, code: "NO_AGENCY", error: "Agency is missing" });
     if (agencyId !== req.auth.agencyId) return res.status(403).json({ ok: false, code: "AGENCY_FORBIDDEN", error: "No access to agency" });
@@ -26,22 +27,34 @@ router.get("/summary", async (req, res) => {
   }
 });
 
+router.get("/creators", async (req, res) => {
+  try {
+    const agencyId = String(req.auth?.agencyId || "");
+    if (req.query.agencyId && String(req.query.agencyId) !== agencyId) return res.status(403).json({ok:false,code:"AGENCY_FORBIDDEN"});
+    return res.json(await buildHomeCreatorPage({ agencyId, member:currentMember(req), rangeKey:req.query.range||"7d",
+      after:req.query.after ?? null, limit:req.query.limit === undefined ? 50 : Number(req.query.limit) }));
+  } catch (error) {
+    return res.status(Number(error?.status)||500).json({ok:false,code:error?.code||"HOME_CREATORS_FAILED",error:error?.message||"Failed"});
+  }
+});
+
 router.post("/refresh", async (req, res) => {
   try {
     const agencyId = String(req.auth?.agencyId || "");
-    const member = currentMember(req);
+    let member = currentMember(req);
     if (!agencyId || !member || String(member.agencyId || "") !== agencyId) {
       return res.status(403).json({ ok: false, code: "AGENCY_FORBIDDEN", error: "Current agency membership is required" });
     }
+    member = await readHomeAuthority({ db: prisma, agencyId, member, billing: true });
     const allowed = await canUsePermission({ member, key: "creator_analytics.refresh", db: prisma });
     if (!allowed) {
       return res.status(403).json({ ok: false, code: "FEATURE_FORBIDDEN", permission: "creator_analytics.refresh", error: "creator_analytics.refresh permission is required" });
     }
-    const scope = await allowedCreatorScope({ agencyId, member, db: prisma });
     const demand = await enqueueAgencyAnalyticsFreshnessDemand({
       db: prisma,
       agencyId,
-      creatorIds: scope.broad ? null : scope.creatorIds,
+      creatorIds: null,
+      scopeMode: MEMBER_CURRENT,
       rangeKey: req.body?.rangeKey || req.query?.rangeKey || "7d",
       reason: "INTERACTIVE_REFRESH",
       priority: 100,

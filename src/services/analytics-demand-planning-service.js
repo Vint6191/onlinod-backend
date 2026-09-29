@@ -14,10 +14,15 @@ async function planAnalyticsDemandCreator({ db, demand, member, creator, startDa
     throw Object.assign(new Error("Home planning requires a root transaction"), { code: "ANALYTICS_DEMAND_TRANSACTION_REQUIRED" });
   }
   return afterPlanningCommit(() => runDbTransaction(db, async (tx) => {
+    if (demand.scopeMode === "MEMBER_CURRENT") {
+      // Billing writers own Agency before entitlement rows. Freeze that authority
+      // before Creator/User/Member locks, then re-evaluate the bounded target.
+      await require("./billing-write-admission-service").lockBillingWriteAdmission({db:tx,agencyId:demand.agencyId});
+    }
     // Canonical lifecycle order: Agency -> Creator -> User -> Member -> demand.
     // Revocation/retirement writers cannot pass these locks before our commit.
     await assertManagementCommitAuthority({ tx, agencyId: demand.agencyId, actorMember: member,
-      permissionKey: "creator_analytics.refresh", creatorIds: [creator.id] });
+      permissionKey: "creator_analytics.refresh", creatorIds: [creator.id], relationalCreatorScope: demand.scopeMode === "MEMBER_CURRENT" });
     const liveCreator = await tx.creatorAccount.findFirst({ where: {
       id: creator.id, agencyId: demand.agencyId, status: "READY", deletedAt: null,
     }, select: { id: true } });
@@ -34,6 +39,7 @@ async function planAnalyticsDemandCreator({ db, demand, member, creator, startDa
       || Number(current.requestedAccessEpoch) !== Number(member.accessEpoch)
       || (current.cursorCreatorId || null) !== (demand.cursorCreatorId || null)
       || current.completedAt || current.quarantinedAt || !(new Date(current.claimUntil) > at)) throw claimLost();
+    if ((current.scopeMode || "LEGACY") !== (demand.scopeMode || "LEGACY")) throw claimLost();
     if (current.creatorIds != null && (!Array.isArray(current.creatorIds) || !current.creatorIds.includes(creator.id))) throw claimLost();
 
     const { ensureAnalyticsWindowFreshness } = require("./analytics-collection-planner");

@@ -78,7 +78,7 @@ test("Audit16 generic Content API cannot mutate the current Message Library auth
 test("Audit16 current Home has no AnalyticsSnapshot runtime authority and exposes capability semantics", () => {
   const source = read("services/home-summary-service.js");
   assert.doesNotMatch(source, /analytics-snapshot-service|getLatestPayload|AnalyticsSnapshot/);
-  assert.match(source, /allowedCreatorScope/);
+  assert.match(source, /readHomeAuthority/);
   assert.match(source, /money\.view_earnings/);
   assert.match(source, /workspace\.view_team/);
   assert.match(source, /workspace\.view_audit/);

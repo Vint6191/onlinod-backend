@@ -588,9 +588,11 @@ function normalizedDemandCreatorIds(creatorIds) {
   return [...new Set(creatorIds.map((value) => String(value || "").trim()).filter(Boolean))].sort();
 }
 
-function analyticsDemandKey({ agencyId, creatorIds, rangeKey, includePrevious }) {
+function analyticsDemandKey({ agencyId, creatorIds, rangeKey, includePrevious, scopeMode = "LEGACY", requestedByMemberId, requestedAccessEpoch }) {
   const ids = normalizedDemandCreatorIds(creatorIds);
-  const scopeIdentity = ids == null ? "AGENCY" : `CREATORS:${ids.join(",")}`;
+  const scopeIdentity = scopeMode === "MEMBER_CURRENT"
+    ? `MEMBER_CURRENT:${requestedByMemberId}:${requestedAccessEpoch}`
+    : ids == null ? "AGENCY" : `CREATORS:${ids.join(",")}`;
   const scopeHash = createHash("sha256").update(scopeIdentity).digest("hex").slice(0, 24);
   return `earnings:${String(agencyId)}:${scopeHash}:${String(rangeKey)}:${includePrevious ? "prev" : "current"}`;
 }
@@ -603,6 +605,7 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
   db = prisma,
   agencyId,
   creatorIds = null,
+  scopeMode = "LEGACY",
   rangeKey = "7d",
   includePrevious = true,
   reason = "INTERACTIVE_REFRESH",
@@ -620,11 +623,12 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
   const fallbackNow = asDate(now);
   if (!fallbackNow) throw new Error("ANALYTICS_PLANNER_NOW_INVALID");
   const currentNow = await dbAuthorityNow({ db, fallbackNow });
+  if (!["LEGACY","MEMBER_CURRENT"].includes(scopeMode) || (scopeMode === "MEMBER_CURRENT" && creatorIds != null)) throw new Error("ANALYTICS_DEMAND_SCOPE_INVALID");
   const ids = normalizedDemandCreatorIds(creatorIds);
   const range = displayRangeBounds(normalizeHomeRangeKey(rangeKey), currentNow);
   const rangeDays = Math.floor((range.endDay.getTime() - range.startDay.getTime()) / DAY_MS) + 1;
   const coverageFrom = includePrevious ? new Date(range.startDay.getTime() - rangeDays * DAY_MS) : range.startDay;
-  const key = analyticsDemandKey({ agencyId, creatorIds: ids, rangeKey: range.rangeKey, includePrevious });
+  const key = analyticsDemandKey({ agencyId, creatorIds: ids, rangeKey: range.rangeKey, includePrevious, scopeMode, requestedByMemberId:actorMemberId, requestedAccessEpoch:actorAccessEpoch });
   return withDbAdvisoryXactLock({
     db,
     key: demandLockKey(key),
@@ -643,6 +647,7 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
             priority: priorityForReason(reason, priority),
             reason: String(reason || "INTERACTIVE_REFRESH").toUpperCase(),
             creatorIds: ids,
+            scopeMode,
             requestedByMemberId: actorMemberId,
             requestedAccessEpoch: actorAccessEpoch,
             requestRevision: 1,
@@ -664,6 +669,7 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
           priority: Math.max(Number(existing.priority || 0), priorityForReason(reason, priority)),
           reason: String(reason || "INTERACTIVE_REFRESH").toUpperCase(),
           creatorIds: ids,
+          scopeMode,
           requestedByMemberId: actorMemberId,
           requestedAccessEpoch: actorAccessEpoch,
           requestRevision: Number(existing.requestRevision || 0) + 1,
@@ -713,6 +719,9 @@ async function claimNextAnalyticsDemand({ db = prisma, now = new Date(), ownerTo
         || (asDate(row.claimUntil) && asDate(row.claimUntil) > claimNow)
         || (asDate(row.nextAttemptAt) && asDate(row.nextAttemptAt) > claimNow)) return null;
       const resumeSameRevision = Number(row.claimedRevision || 0) === Number(row.requestRevision || 0);
+      if (row.scopeMode === "MEMBER_CURRENT") {
+        await tx.$executeRawUnsafe("SELECT set_config('onlinod.home_member_scope_version','1',true)");
+      }
       const claimed = await tx.analyticsCollectionDemand.update({
         where: { key: row.key },
         data: {
@@ -869,7 +878,7 @@ async function resolveAnalyticsDemandExecutionScope({ db = prisma, demand } = {}
     },
     select: {
       id: true, userId: true, agencyId: true, role: true, roleKey: true, permissions: true,
-      assignedCreators: true, accessEpoch: true, deletedAt: true, deactivatedAt: true,
+      ...(demand.scopeMode === "MEMBER_CURRENT" ? {} : { assignedCreators: true }), accessEpoch: true, deletedAt: true, deactivatedAt: true,
     },
   });
   if (!member) return { authorized: false, reason: "ANALYTICS_DEMAND_MEMBER_REVOKED" };
@@ -878,6 +887,15 @@ async function resolveAnalyticsDemandExecutionScope({ db = prisma, demand } = {}
   }
   if (!await canUsePermission({ member, key: "creator_analytics.refresh", db })) {
     return { authorized: false, reason: "ANALYTICS_DEMAND_PERMISSION_REVOKED" };
+  }
+  if (demand.scopeMode === "MEMBER_CURRENT") {
+    try {
+      const current = await require("./home-scope-repository").readHomeAuthority({ db, agencyId:demand.agencyId, member, billing:true });
+      return { authorized:true, member:current, relational:true };
+    } catch (error) {
+      if (error.status === 403) return { authorized:false, reason:error.code };
+      throw error;
+    }
   }
   const scope = await allowedCreatorScope({ agencyId: demand.agencyId, member, db });
   return { authorized: true, member, creatorIds: scope.broad ? null : normalizedDemandCreatorIds(scope.creatorIds) };
@@ -920,6 +938,7 @@ async function processAnalyticsDemand({
     throw Object.assign(new Error("ANALYTICS_DEMAND_RANGE_INVALID", { cause }), { code: "ANALYTICS_DEMAND_RANGE_INVALID" });
   }
   const requestedIds = creatorIdsFromDemand(demand.creatorIds);
+  if (demand.scopeMode === "MEMBER_CURRENT" && requestedIds != null) throw Object.assign(new Error("ANALYTICS_DEMAND_SCOPE_CORRUPT"), {code:"ANALYTICS_DEMAND_SCOPE_CORRUPT"});
   let cursor = demand.cursorCreatorId || null;
   let creators = 0;
   let pages = 0;
@@ -945,7 +964,9 @@ async function processAnalyticsDemand({
 
   // One bounded page plus one lookahead. The persisted cursor is advanced only
   // after a creator's complete planning operation; no in-memory page is authority.
-  const candidates = await db.creatorAccount.findMany({
+  const candidates = authority.relational
+    ? await require("./home-scope-repository").readDemandCreatorPage({ db,agencyId:demand.agencyId,member:authority.member,cursor,take:size+1,billing:true })
+    : await db.creatorAccount.findMany({
     where: {
       agencyId: demand.agencyId, status: "READY", deletedAt: null, agency: { deletedAt: null },
       ...(scopedIds ? { id: { in: scopedIds, ...(cursor ? { gt: cursor } : {}) } } : cursor ? { id: { gt: cursor } } : {}),

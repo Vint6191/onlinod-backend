@@ -16,7 +16,7 @@ test("current Analytics read and billing entrypoints resolve PostgreSQL clock au
   const billing = source("billing-wallet-service.js");
   const settings = source("settings-service.js");
 
-  assert.match(home, /const now = await dbAuthorityNow\(\{ db: prisma, fallbackNow: new Date\(\) \}\);/);
+  assert.match(home, /const now = await dbAuthorityNow\(\{ db, fallbackNow: new Date\(\) \}\);/);
   assert.match(overview, /async function readCreatorOverview[\s\S]*?now = await dbAuthorityNow\(\{ db, fallbackNow: now \}\);/);
   assert.match(overview, /async function readCreatorTaskActivityDays[\s\S]*?if \(!authorityResolved\) now = await dbAuthorityNow/);
   assert.match(overview, /async function readCreatorTaskActivity[\s\S]*?if \(!authorityResolved\) now = await dbAuthorityNow/);

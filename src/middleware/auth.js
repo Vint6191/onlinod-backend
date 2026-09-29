@@ -3,7 +3,7 @@ const { verifyAccessToken } = require("../utils/tokens");
 const { requireBoundAccessDevice } = require("../utils/device-binding");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 
-async function authRequired(req, res, next) {
+async function authRequired(req, res, next, { compactMembership = false } = {}) {
   try {
     const header = req.headers.authorization || "";
     const match = header.match(/^Bearer\s+(.+)$/i);
@@ -22,15 +22,7 @@ async function authRequired(req, res, next) {
     const boundDeviceId = decoded.deviceId ? String(decoded.deviceId).trim().slice(0, 160) : null;
     const authorizationSessionId = decoded.authorizationSessionId ? String(decoded.authorizationSessionId).trim().slice(0, 220) : null;
     const authorizationNow = boundDeviceId ? await dbAuthorityNow({ db: prisma, fallbackNow: new Date() }) : null;
-    const membership = await prisma.agencyMember.findFirst({
-      where: {
-        userId: decoded.userId,
-        agencyId: decoded.agencyId,
-        deletedAt: null,
-        deactivatedAt: null,
-        agency: { deletedAt: null },
-      },
-      include: {
+    const relations = {
         user: boundDeviceId ? {
           include: {
             refreshSessions: {
@@ -49,7 +41,17 @@ async function authRequired(req, res, next) {
           },
         } : true,
         agency: true,
+      };
+    const membership = await prisma.agencyMember.findFirst({
+      where: {
+        userId: decoded.userId,
+        agencyId: decoded.agencyId,
+        deletedAt: null,
+        deactivatedAt: null,
+        agency: { deletedAt: null },
       },
+      ...(compactMembership ? { select: { id:true,agencyId:true,userId:true,role:true,roleKey:true,permissions:true,accessEpoch:true,
+        deletedAt:true,deactivatedAt:true, ...relations } } : { include: relations }),
     });
 
     if (!membership) {
@@ -143,5 +145,6 @@ function requireAuthDevice(req, suppliedDeviceId, options = {}) {
 
 module.exports = {
   authRequired,
+  homeAuthRequired: (req,res,next) => authRequired(req,res,next,{compactMembership:true}),
   requireAuthDevice,
 };

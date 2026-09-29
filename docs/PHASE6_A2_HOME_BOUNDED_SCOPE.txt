@@ -1,0 +1,333 @@
+================================================================================
+ONLINOD — PHASE 6 / A2 — HOME: BOUNDED READS + CURRENT MEMBER SCOPE
+Накопительное продолжение C1. Дата: 2026-09-29.
+================================================================================
+
+0. СТАТУС И ГРАНИЦА ЭТОГО ПРОХОДА
+
+Реализован связанный узел Home: серверное чтение сводки, страницы моделей,
+компактный запрос обновления аналитики, его обработка, общий DTO, Desktop Main
+и интерфейс. Это реализация после A1-аудита, не объявление закрытой всей фазы 6.
+
+SOURCE CLOSED: НЕТ.
+SCALE CLOSED: НЕТ.
+СТАВИТЬ НОВЫЙ A2: ПОКА НЕТ. Пакеты подготовлены для проверки; полные Desktop
+npm run typecheck / npm run build завершились 127: tsc: not found. Проверка
+TypeScript/TSX парсером и управляемые тесты не заменяют компиляцию. Обычный
+PostgreSQL с независимыми клиентами, Node 22 runtime нового кода, Electron UI
+и целевая нагрузка A2 здесь не запускались.
+
+Никаких изменений внешней БД, SQL против Render/Neon, production load,
+деплоя или запуска чужого backend-сервиса ассистент не выполнял.
+Базовый пользовательский режим сохранён: накопительный TXT, отдельные ZIP
+только изменённых файлов, накопительные доказательства и SHA256.
+
+1. ПРИСЛАННЫЙ АКТУАЛ И НОВОЕ СВИДЕТЕЛЬСТВО C1
+
+Backend: onlinod-backend-main - 2026-09-29T190439.092.zip.
+SHA256:
+e8b4770d3ee92b711b3bdf40cd1d1dab9be8d462ea93bcf36e5fa630d78d2a32
+Архив: 1562 entries, 1252 files; CRC без ошибки; безопасно извлечён отдельно.
+1252 файла побайтово совпали с предыдущим C1 target-manifest:
+changed=0, added=0, missing=0. Повторное сравнение выполнено до изменений.
+
+Лог: Вставленный текст(20260929-160401).txt, 17719 bytes.
+SHA256: 6d06c0bfd04ce5a2e44f731a7b6d1bc6877f70facefdc1cd6606ab3a1daae620.
+В предоставленном логе: commit 6db1f770e6ad924ed0765b98fd89674c690087d7,
+Node 22.23.3, Prisma client 5.22.0; в 16:03:08.795Z применяется
+20260929154000_phase6_maintenance_progress_v1; в 16:03:08.887Z все миграции
+успешно применены; в 16:03:41.231Z сервис live; указан адрес
+https://onlinod-backend.onrender.com.
+Это новое подтверждение миграции/деплоя C1 из пользовательского лога.
+Оно НЕ доказывает независимую конкуренцию владельцев, отсутствие всех
+runtime-ошибок или пропускную способность. Фрагмент postflight JSON обрывается;
+не реконструируем отсутствующее и не называем лог полным функциональным тестом.
+
+Новый Desktop не прислан. Основа — подтверждённый desktop88/88-2, совпадающий
+с B12 по 1185 рабочим файлам. Рабочая копия B12 также сохраняет 11 исторических
+документов, которых не было в присланном desktop88. В A2 они не переписывались.
+
+2. ЧТО ИМЕННО ИЗМЕНИЛОСЬ
+
+2.1. Compact membership authority / relation-based scope
+
+Новый home-scope-repository.js читает актуальные agency/member/user/accessEpoch,
+role/roleKey/permissions и вычисляет broad в PostgreSQL. Полный assignedCreators
+не возвращается в Node. Restricted scope использует существующую
+AgencyMemberCreatorAccessCurrent, сверяя agencyId, memberId, accessEpoch,
+creatorId и текущую живую CreatorAccount. Для restricted scope обязательно
+ACTIVE-поколение phase3_domain_work_claim_topology_a36_v1. Отсутствующая/неполная
+проекция даёт HOME_SCOPE_PROJECTION_NOT_READY 503; не превращается в пустой
+список или незаметное перечисление JSON.
+
+SQL отдельно проверяет живое агентство, активного участника и неотключённого
+пользователя. Broad owner остаётся независимым от списка назначений.
+Billing сохраняет текущую продуктовую семантику: support hold, FREE_INTERNAL,
+trial, coreValidFrom/coreValidUntil по времени PostgreSQL. Предикат применяется
+до page LIMIT и до итогового count. Страница не теряет оплаченные модели из-за
+того, что неоплаченные заняли лимит раньше фильтрации.
+
+Для /api/home подключён homeAuthRequired: те же проверки токена, device session,
+logout, disabled user, email verification, но членство выбирается без полного
+assignedCreators. Другие маршруты продолжают использовать прежний authRequired.
+Это не глобальная переделка входа и не ослабление авторизации.
+
+В начале и конце Home read проверяется актуальный membership epoch. Смена прав
+в ходе чтения отменяет ответ целиком. Это не обещание вечной актуальности уже
+отданного экрана; Desktop также отбрасывает ответы устаревшего local permit.
+Чтения Home read-only. Они не создают JobInstance и не запускают AI/OF сами.
+
+2.2. Summary and creator pages
+
+GET /api/home/summary?range=<today|7d|30d|90d>&contractVersion=2
+возвращает сводные значения. В Node не выгружаются все CreatorAccount,
+AgencyMember или WorkerDevice. Участники/устройства считаются SQL COUNT,
+очередь — SQL GROUP BY в текущем scope. audit по-прежнему максимум 5 записей.
+Чувствительные разделы по-прежнему зависят от money.view_earnings,
+workspace.view_team, workspace.view_audit, workspace.manage_settings;
+billing/seats — только owner. В текущей Prisma-модели AgencySubscription нет
+seatsLimit: не запрашиваем несуществующее поле; limit/remaining остаются unknown.
+
+Summary имеет contractVersion=2. creatorScope содержит mode, accessEpoch,
+totalCreators; creatorIds=[], creators=[], pending.creatorIds=[], pending.jobs=[].
+Это осознанный новый договор: полные списки перестали быть частью сводки.
+Старый клиент без contractVersion=2 получает 409 HOME_CLIENT_UPDATE_REQUIRED
+с просьбой обновить Desktop, а не ложный «пустой полный список».
+
+GET /api/home/creators?range=<key>&limit=50&after=<last-id>
+возвращает ровно страницу и явные nextCursor/limit/order/refreshedAt/accessEpoch.
+По умолчанию 50, разрешено 1..100, выборка с одним lookahead. Cursor — id,
+максимум 180 символов, управляющие символы отклоняются. Порядок id_asc;
+никакого OFFSET, no 5000/10000 correctness horizon. Фильтры agency/epoch,
+permissions и billing проверяются заново для каждой страницы.
+Это живой keyset-list, не зафиксированный архивный snapshot: вставка с id
+перед курсором станет видна после возврата на первую страницу. Удаление модели
+или курсора не блокирует продолжение. Сортировка по глобальному доходу не
+обещается: прежняя полная сортировка заменена стабильной пагинацией по id.
+
+2.3. Coverage-aware canonical revenue SQL
+
+home-read-repository.js сводит канонические AnalyticsCoverage + COMMITTED
+AnalyticsScanProof + CreatorEarningsDaily в PostgreSQL. Текущий/предыдущий
+периоды различаются; максимальный Home диапазон 90 дней, вместе до 180.
+Ответ summary содержит один aggregate и максимум 90 точек UTC-графика.
+Ответ страницы содержит показатели только её моделей, не весь scope.
+
+UNKNOWN != ZERO сохранено. Для reporting нужны И достаточное доказанное
+покрытие, И все дневные строки с COMMITTED proof. Найденный дополнительный
+разрыв старого алгоритма закрыт: COMPLETE coverage при пропавшей дневной строке
+больше не даёт «полный» headline KPI и график. Индивидуально подтверждённые
+модели остаются видимыми. Полный ноль для действительно пустого scope допустим;
+неизвестный доход неполного непустого scope — null.
+
+PARTIAL текущего дня с COMMITTED proof остаётся пригодным. Свежесть:
+15 минут today, 48 часов recent closed, 30 дней historical; timestamp > now+5min
+не считается свежим. Delta показывается только при полных и свежих текущем
+и предыдущем периодах и ненулевом предыдущем итоге. Большие суммы проверяются
+на Number.isSafeInteger; переполнение не округляется молча.
+
+Pending считается SQL EXISTS: активная materialized job либо актуальный demand,
+действительно включающий модель в scope запросившего участника. Нет прежнего
+take:50 для demands. Null creatorIds означает текущий scope этого участника,
+а не все модели агентства. Просроченный epoch/disabled/deactivated requester
+не расширяет индикатор ожидания. Полный список pending IDs не передаётся.
+Это индикатор наличия ожидающей работы, не обещание времени её завершения.
+
+SQL объём результата/параметров ограничен. Агрегация по агентству всё равно
+читает релевантные C×days канонические строки внутри PostgreSQL; её стоимость
+не объявляется O(1). Общая нагрузка многих агентств и 100 workers не доказана
+одним fixture. Audit metadata/строковые поля по-прежнему не имеют нового
+общего byte-budget; измеренные 13.6KB — размер конкретных тестовых данных,
+не универсальный жёсткий лимит HTTP-ответа.
+
+2.4. Query-plan finding during implementation
+
+На промежуточной версии явные константные предикаты agency/member заставили
+PostgreSQL без ANALYZE недооценить размер нового membership. Nested loop
+перечитывал агентство для каждой access-row. Длинный диагностический прогон
+остановлен; этот промежуточный вариант не выдан пользователю.
+
+В итоговом коде restricted scope имеет parameterized LATERAL CreatorAccount
+lookup с OFFSET 0 как барьером разворачивания подзапроса. Сортировочный ключ
+берётся из x.creatorId; cursor ограничивает сам индекс назначений. Для страницы
+из текущего authority выбирается broad или restricted ветка, причём SQL всё
+равно проверяет m.broad — входной hint не может расширить доступ. Billing lookup
+также ограничен одной записью по creatorId до проверки дат. Не добавлены
+глобальные блокировки или копии каталога. Используются существующие индексы.
+
+Проверен полный обход без предварительного ANALYZE и отдельный forced-index
+EXPLAIN после ANALYZE. Forced-index диагностика доказывает доступность пути,
+не гарантирует production planner choice/latency. Старый неудачный план
+сохранён в initial-statistics-plan.log как инженерное свидетельство.
+
+2.5. Durable MEMBER_CURRENT refresh intent
+
+Home refresh сохраняет один demand scopeMode=MEMBER_CURRENT, creatorIds=NULL,
+requestedByMemberId/requestedAccessEpoch. Identity включает member + epoch:
+два разных участника больше не коалесцируются в один agency-wide запрос,
+перезаписывая происхождение намерения. Повтор того же member/epoch/range
+сохраняет прежнюю модель coalescing/requestRevision.
+
+Worker получает membership без JSON списка, SQL выбирает ограниченную READY
+страницу. В каждой записи результатов планирования остаётся существующая
+атомарная граница jobs+cursor, claimToken, claimed/requestRevision, lease и epoch.
+Management commit authority получает узкую opt-in relationalCreatorScope ветку:
+Creator/User/Member locks и permission recheck сохранены; bounded targets
+сверяются SQL, не полным assignedCreators. Сначала берётся общий billing barrier
+Agency, затем Creator/User/Member/demand. Между проверкой core-access и commit
+billing writer не может незаметно отозвать разрешение.
+
+LEGACY demand не переосмысляется автоматически: уже сохранённый explicit scope,
+lease, cursor и revision сохраняют старый путь до завершения. Это контролируемая
+совместимость очереди, а не утверждение, что все потребители allowedCreatorScope
+во всём backend переписаны. Исторические reducers Home сохранены только как
+__test oracle для старых тестов; новый runtime buildHomeSummary их не вызывает.
+Общие legacy consumers и их окончательное удаление — отдельный инвентарь/Phase7.
+
+2.6. Migration and mixed deployment
+
+Новая миграция:
+20260929170000_phase6_home_member_scope_v1.
+Добавляет scopeMode TEXT NOT NULL DEFAULT LEGACY. Старые миграции не изменены.
+CHECK допускает только LEGACY/MEMBER_CURRENT; новый режим не допускает explicit
+creatorIds. CHECK созданы NOT VALID: новые/изменённые строки проверяются сразу,
+история не сканируется; прежние строки имеют заведомый constant default LEGACY.
+Каталожный convalidated для этих двух новых CHECK остаётся false намеренно.
+DDL в одной транзакции, lock_timeout 5s; новых индексов и backfill history нет.
+
+DB trigger phase6_home_member_scope_claim_guard запрещает выдачу MEMBER_CURRENT
+demand старому worker без transaction-local onlinod.home_member_scope_version=1.
+Новый claim устанавливает этот marker в своей существующей root transaction.
+Это не секрет/право пользователя, а fence версии исполнения для смешанного
+развёртывания. Старые workers могут завершать LEGACY work; попытка взять новый
+режим завершится HOME_MEMBER_SCOPE_WORKER_UPGRADE_REQUIRED. Во время rollout
+нужно обновить/перезапустить все backend scheduler processes; старые иначе могут
+логировать отказ и задерживать обслуживание, но не исполняют новый scope по
+старым правилам. Marker не остаётся на pooled connection после commit.
+
+Порядок после закрытия открытых gates: migration + Prisma generate + все Backend
+processes, затем совместимый Desktop. Откат одного только Backend на C1 после
+появления MEMBER_CURRENT demands не является функциональным rollback Home.
+Не удалять новую колонку/намерения ради отката. Нужен отдельный план сохранения
+очереди. В этом проходе ни rollout, ни rollback не выполнялся.
+
+2.7. Desktop Main / shared DTO / UI
+
+Добавлен home.getCreators RPC и общий HomeGetCreatorsInput/Result. Main проверяет
+range, size, cursor, contractVersion, order, уникальное продвижение id, максимальное
+число строк, согласованность nextCursor. Permit захватывается до запроса и
+перепроверяется после ответа. getSummary явно запрашивает contractVersion=2.
+
+HomeDashboard загружает текущую страницу отдельно от summary, держит максимум
+50 строк текущей страницы, даёт first/next. Query cache для неактивной страницы
+gcTime=0; накопления всей истории страниц нет. Смена range/authorization/member
+сбрасывает позицию. Локальный creators больше не дополняет серверную страницу.
+Refresh и Creator Management инвалидируют оба query. Ошибочный summary скрывается,
+а не продолжает показывать прежние цифры после неудачной перепроверки доступа.
+
+Дополнительно исправлен прежний дефект HomeDashboard: authorizationRevision
+использовался в queryKey, но не извлекался из props. Теперь извлекается явно.
+Убран выдуманный ETA pending.count*12. Team отображает число участников;
+количество online devices подписано отдельно — устройство не считается человеком.
+
+3. ПРОВЕРКИ ЭТОГО ПРОХОДА
+
+Backend Node tests: 99 PASS, 0 FAIL, 0 SKIP, Node 24.19.0.
+Desktop tests: 21 PASS, 0 FAIL, 0 SKIP. Из них 6 новых исполняют фактический
+Main HomeService через штатное удаление TS-аннотаций Node, 15 — существующие
+проверки текущей авторизации INT10. Это не Electron/UI render test.
+
+Offline PostgreSQL WASM (PGlite 0.5.8): 13 содержательных сценариев + parent test,
+14 PASS, 0 FAIL, 0 SKIP. Использованы реальные SQL новых repositories, реальная
+A2 migration, исходная A36 broad-access function и определения 13 таблиц/индексов
+из I7 Prisma SQL. Fixture не содержит всех внешних ключей, исторических triggers
+и полной цепочки production migrations. Нельзя называть это полной миграцией
+production schema или тестом независимых PostgreSQL sessions.
+
+SQL-сценарии:
+- 16000 restricted creators: все 160 страниц по 100 прочитаны, без повторов/потерь;
+  последний id c16000; каждый SQL результат <=100 строк; max parameter bytes 199.
+- Страница 50 моделей: 13646 bytes на фиксированных тестовых строках.
+- Existing-index EXPLAIN для membership/creator keyset и точечных lookup.
+- Broad owner и чужое агентство.
+- Stale epoch, deactivated membership, disabled user, BUILDING projection.
+- Trial expiry, entitlement, support hold; чужая ошибочно проецированная строка.
+- Today/7d/30d/90d: суммы, delta, UTC chart, PARTIAL today.
+- Пропавшая daily row при COMPLETE coverage.
+- Uncommitted proof, future/stale verification, неполный предыдущий период.
+- 61 pending demands: нет cutoff первых 50; текущий requester scope/epoch.
+- READY continuation после удаления и устаревшего projection epoch.
+- Некорректные границы страницы отклоняются до SQL.
+- Mixed-version claim fence и transaction-local marker.
+- Upgrade с прежней LEGACY строкой, CHECK-ограничения нового режима.
+
+Управляемые unit tests дополнительно проверяют скалярный no-money summary,
+отбрасывание целого ответа при отзыве прав, compact HTTP authorization,
+separate-member/epoch intent identity и продолжение MEMBER_CURRENT на двух
+последовательных logical workers. Заглушка исполнения бизнес-планирования
+в последнем тесте явно ограничивает вывод: это проверка orchestration/cursor,
+не physical concurrent workers и не provider execution.
+
+Prisma 5.22.0 validate: PASS; schema diff: только scopeMode (CHECK/trigger — raw SQL).
+JS/CJS/MJS node --check: 16 файлов PASS.
+TypeScript/TSX parser: 5 файлов PASS; это только синтаксис.
+Desktop npm run typecheck: BLOCKED, exit 127, tsc not found.
+Desktop npm run build: BLOCKED, exit 127, tsc not found.
+Ранее полные Electron/Ollama, Phase5 target load и соответствующие B12 gates
+остаются открытыми. Новый desktop source не превращает их в выполненные.
+
+Подробные команды/вывод: backend-tests.log, desktop-tests.log, sql-proof.log,
+prisma-validation.log, prisma-schema-diff.sql, syntax-checks.json,
+typescript-parse.log, desktop-typecheck.log, desktop-build.log.
+Промежуточные падавшие тесты/диагностика сохраняются отдельно; приведённые выше
+числа относятся к финальному коду и финальным одноимённым логам.
+
+4. НАКОПИТЕЛЬНЫЕ ПАКЕТЫ И ПРОВЕРКА ЦЕЛОСТНОСТИ
+
+Backend target: 1259 файлов.
+Delta относительно присланного C1: 18 файлов (включая документ).
+Накопительно относительно I7: 35 изменённых/новых файлов.
+Desktop target: 1198 файлов.
+Delta относительно B12: 8 файлов (включая документ).
+Накопительно относительно Desktop77: 79 файлов.
+Удалений нет. Старые миграции неизменны. Оба code ZIP — changed-only overlays,
+не полные исходные деревья и не установщики. Backend ZIP содержит B1+C1+A2;
+Desktop ZIP содержит накопленный B12 плюс A2 и прежние документы.
+
+Для каждого ZIP проверены CRC и результирующий manifest при наложении:
+Backend: на I7 и на присланный C1; Desktop: на Desktop77, B12 и desktop88-2.
+Overlay результат обязан быть побайтово равен соответствующему target manifest.
+Пакеты Backend и Desktop не смешиваются корнями друг друга.
+
+TXT начинается прежними 856012 байтами C1 checkpoint БЕЗ ИЗМЕНЕНИЙ.
+SHA256 предыдущего префикса:
+6fddad0dce76340f3710e756f66b975cef471054acebd63aeada8d64683f4419.
+Предыдущая накопительная evidence ZIP C1 вложена целиком:
+85da031f92eabbc3d8411cb89c86e8fc7e5aaf9b65087a502811b84aecd4b11a.
+Таким образом сохранена вся цепочка I7/Phase5/B12/A1/B1/C1 и новый A2.
+Этот раздел обновляет статус, но не редактирует прежние выводы задним числом.
+
+5. ОСТАВШИЕСЯ РАБОТЫ / ТОЧКА ПРОДОЛЖЕНИЯ
+
+P6-F1: новый current Home admission/worker/commit больше не перечисляет полный
+scope в Node; старые LEGACY demands намеренно дренируются прежним путём.
+P6-F2: текущий Home summary/list переведён на scalar SQL + keyset DTO/Desktop.
+Инсталляционные/функциональные gates A2 остаются открытыми.
+P6-F5/F6: B1 implementation сохранена, обычная PostgreSQL concurrent acceptance
+не появилась автоматически после migration log.
+P6-F8: C1 implementation сохранена; новый пользовательский лог подтверждает
+миграцию C1/Node22 deployment, но не отдельный concurrency/load proof.
+P6-F7: Message Library usage replay и полный non-admin mutation inventory — 6D.
+P6-F3/F4: Chromium pending bounds и starvation; shared host AI/Chromium pressure — 6E.
+6F: сводная проверка authority/bounds/recovery/fairness и оставшиеся gates.
+Server history S01..S07 и Phase7 purge не объявляются частью выполненного A2.
+
+Ближайший шаг: проверить присланный актуал/сборку A2 и обычную PostgreSQL
+совместимость новой migration/claim fence; затем продолжить согласованный 6D
+inventory/idempotency. Не начинать Phase7 purge и не переносить архивы на сервер
+под видом этого Home-узла. Не перестраивать существующий PostgreSQL OF gate.
+Целевые оси — тысячи агентств, тысячи creators В КАЖДОМ, memberships/history и
+100 workers; fixture 16000 creators одного агентства не равен всей этой нагрузке.
+
+ИТОГ: A2 реализован и локально проверен в указанных границах. Полная фаза 6,
+SOURCE CLOSED, SCALE CLOSED и разрешение на установку этим отчётом не закрыты.

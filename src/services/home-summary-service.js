@@ -1,7 +1,6 @@
 "use strict";
 
 const prisma = require("../prisma");
-const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { canUsePermission, isOwner } = require("./team-access-control");
 const {
   DAY_MS,
@@ -305,107 +304,68 @@ function emptyRevenueCreator(creator) {
   };
 }
 
-async function buildHomeSummary({ agencyId, member, rangeKey = "7d" }) {
-  if (!member || String(member.agencyId || "") !== String(agencyId || "")) {
-    const error = new Error("Current agency membership is required");
-    error.code = "AGENCY_FORBIDDEN";
-    error.status = 403;
-    throw error;
-  }
-  const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
-  let homeRangeKey;
-  try {
-    homeRangeKey = normalizeHomeRangeKey(rangeKey);
-  } catch (error) {
-    error.status = 400;
-    throw error;
-  }
-  const range = displayRangeBounds(homeRangeKey, now);
-  const previous = previousDisplayRange(range.rangeKey, now);
-  const scope = await allowedCreatorScope({ agencyId, member, db: prisma });
-  const creatorWhere = scope.broad ? {} : { id: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } };
-  const [canViewMoney, canViewTeam, canViewAudit, canManageWorkspace, canRefreshAnalytics] = await Promise.all([
-    canUsePermission({ member, key: "money.view_earnings", db: prisma }),
-    canUsePermission({ member, key: "workspace.view_team", db: prisma }),
-    canUsePermission({ member, key: "workspace.view_audit", db: prisma }),
-    canUsePermission({ member, key: "workspace.manage_settings", db: prisma }),
-    canUsePermission({ member, key: "creator_analytics.refresh", db: prisma }),
+async function homeReadContext({ db, agencyId, member, rangeKey }) {
+  const { inProductBilling } = require("./product-billing-context-service");
+  const billing = inProductBilling(agencyId);
+  const { readHomeAuthority } = require("./home-scope-repository");
+  const current = await readHomeAuthority({ db, agencyId, member, billing });
+  const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
+  let key;
+  try { key = normalizeHomeRangeKey(rangeKey); } catch (error) { error.status = 400; throw error; }
+  const [money, team, audit, manage, refresh] = await Promise.all([
+    "money.view_earnings", "workspace.view_team", "workspace.view_audit", "workspace.manage_settings", "creator_analytics.refresh",
+  ].map(key => canUsePermission({ member: current, key, db })));
+  return { db, agencyId, member: current, billing, now, range: displayRangeBounds(key, now),
+    previous: previousDisplayRange(key, now), money, team, audit, manage, refresh, owner: isOwner(current) };
+}
+async function buildHomeCreatorPage({ agencyId, member, rangeKey = "7d", after = null, limit = 50, db = prisma }) {
+  const { pageInput, readHomeCreatorPage } = require("./home-read-repository");
+  const page = pageInput({ after, limit });
+  const ctx = await homeReadContext({ db, agencyId, member, rangeKey });
+  const result = await readHomeCreatorPage({ ...ctx, ...page });
+  await require("./home-scope-repository").readHomeAuthority(ctx);
+  return { ok: true, contractVersion: 2, agencyId, accessEpoch: ctx.member.accessEpoch,
+    rangeKey: ctx.range.rangeKey, refreshedAt: ctx.now.toISOString(), ...result };
+}
+async function buildHomeSummary({ agencyId, member, rangeKey = "7d", db = prisma }) {
+  const ctx = await homeReadContext({ db, agencyId, member, rangeKey });
+  const { now, range, money, team, audit, manage, refresh, owner } = ctx;
+  const { readHomeTotals, readHomeJobCounts } = require("./home-read-repository");
+  const [agency, revenue, members, jobsByStatus, devices, onlineDevices, latestAudit, subscription] = await Promise.all([
+    db.agency.findUnique({ where: { id: agencyId }, select: { id:true, name:true, plan:true, status:true } }),
+    readHomeTotals(ctx),
+    team || owner ? db.agencyMember.count({ where: { agencyId, deletedAt:null, deactivatedAt:null } }) : 0,
+    manage ? readHomeJobCounts(ctx) : {},
+    manage ? db.workerDevice.count({ where: { agencyId } }) : null,
+    manage ? db.workerDevice.count({ where: { agencyId, lastSeenAt: { gt: new Date(now.getTime()-5*60*1000) } } }) : null,
+    audit ? db.auditLog.findMany({ where: { agencyId }, orderBy: [{createdAt:"desc"},{id:"desc"}], take:5,
+      select: { id:true,action:true,targetType:true,targetId:true,metadata:true,createdAt:true,actor:{select:{id:true,email:true,name:true}} } }) : [],
+    owner ? db.agencySubscription.findFirst({ where: { agencyId }, orderBy:[{createdAt:"desc"},{id:"desc"}], select:{id:true} }) : null,
   ]);
-  const owner = isOwner(member);
-
-  const [agency, creators, members, jobs, devices, latestAudit, subscription] = await Promise.all([
-    prisma.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true, status: true } }),
-    prisma.creatorAccount.findMany({
-      where: { agencyId, deletedAt: null, ...creatorWhere },
-      select: { id: true, displayName: true, username: true, avatarUrl: true, status: true, remoteId: true },
-      orderBy: { id: "asc" },
-    }),
-    canViewTeam || owner ? prisma.agencyMember.findMany({
-      where: { agencyId, deletedAt: null, deactivatedAt: null },
-      select: { id: true, roleKey: true, displayName: true, user: { select: { email: true, name: true } } },
-    }) : Promise.resolve([]),
-    canManageWorkspace ? prisma.jobInstance.groupBy({
-      by: ["status"],
-      where: { agencyId, status: { in: ["SCHEDULED", "CLAIMED"] }, ...(scope.broad ? {} : { creatorId: { in: scope.creatorIds.length ? scope.creatorIds : ["__none__"] } }) },
-      _count: { _all: true },
-    }).catch(() => []) : Promise.resolve([]),
-    canManageWorkspace ? prisma.workerDevice.findMany({
-      where: { agencyId }, select: { id: true, userId: true, deviceName: true, platform: true, appVersion: true, lastSeenAt: true },
-    }) : Promise.resolve([]),
-    canViewAudit ? prisma.auditLog.findMany({
-      where: { agencyId }, orderBy: { createdAt: "desc" }, take: 5,
-      include: { actor: { select: { id: true, email: true, name: true } } },
-    }) : Promise.resolve([]),
-    owner ? prisma.agencySubscription.findFirst({ where: { agencyId }, orderBy: { createdAt: "desc" } }) : Promise.resolve(null),
-  ]);
-
-  const revenue = canViewMoney ? await readCanonicalRevenue({ db: prisma, agencyId, creators, range, previous, now }) : null;
-  const visibleCreators = revenue ? revenue.creators : creators.map(emptyRevenueCreator);
-  const onlineDevices = canManageWorkspace ? devices.filter((d) => d.lastSeenAt && now.getTime() - new Date(d.lastSeenAt).getTime() < 5 * 60 * 1000).length : null;
-  const jobsByStatus = canManageWorkspace ? Object.fromEntries((jobs || []).map((row) => [row.status, row._count?._all || 0])) : {};
-  const seatsLimit = owner ? (subscription?.seatsLimit ?? null) : null;
-
+  // Discard every section if the admitted membership epoch changed during reads.
+  await require("./home-scope-repository").readHomeAuthority(ctx);
+  const seatsLimit = subscription?.seatsLimit ?? null;
   return {
-    ok: true,
-    agency: agency ? { id: agency.id, name: agency.name, plan: owner ? agency.plan : null, status: agency.status, billingAvailable: owner }
-      : { id: agencyId, name: null, plan: null, status: null, billingAvailable: owner },
-    range: {
-      key: range.rangeKey,
-      label: range.rangeKey === "today" ? "Today" : range.rangeKey,
-      from: range.startDay.toISOString(),
-      to: range.endAt.toISOString(),
-      previousKey: range.rangeKey,
-    },
-    refreshedAt: now.toISOString(),
-    creatorScope: { broad: scope.broad === true, creatorIds: creators.map((creator) => creator.id) },
-    revenue: canViewMoney ? {
-      ...availability(true), refreshAllowed: canRefreshAnalytics === true,
-      totalCents: revenue.totalCents, grossCents: null, deltaPct: revenue.deltaPct, currency: "USD",
-      salesCount: null, uniqueFans: null, creatorCount: revenue.reportingCreators,
-      points: revenue.points,
-      coverage: { totalCreators: creators.length, reportingCreators: revenue.reportingCreators, pendingCount: revenue.pendingCreatorIds.length, staleCreators: revenue.staleCreators },
-      pending: { count: revenue.pendingCreatorIds.length, creatorIds: revenue.pendingCreatorIds, jobs: revenue.pendingJobs, etaSeconds: null },
-      stalenessMs: CURRENT_DAY_FRESHNESS_MS,
-      source: "creator_earnings_daily",
-    } : {
-      ...availability(false, "FORBIDDEN"), refreshAllowed: false, totalCents: null, grossCents: null, deltaPct: null, currency: "USD",
-      salesCount: null, uniqueFans: null, creatorCount: 0, points: [],
-      coverage: { totalCreators: creators.length, reportingCreators: 0, pendingCount: 0, staleCreators: 0 },
-      pending: { count: 0, creatorIds: [], jobs: [], etaSeconds: null }, stalenessMs: CURRENT_DAY_FRESHNESS_MS, source: "forbidden",
-    },
-    seats: owner ? { ...availability(true), used: members.length, limit: seatsLimit, remaining: seatsLimit === null ? null : Math.max(0, Number(seatsLimit) - members.length), source: seatsLimit === null ? "members_only" : "subscription" }
-      : { ...availability(false, "FORBIDDEN"), used: null, limit: null, remaining: null, source: "forbidden" },
-    creators: visibleCreators,
-    workers: canViewTeam || owner ? { ...availability(true), totalMembers: members.length, onlineDevices: canManageWorkspace ? onlineDevices : null, devices: canManageWorkspace ? devices.length : null, activeMembers: null, runtimeDetailAvailable: canManageWorkspace === true, source: "current_membership" }
-      : { ...availability(false, "FORBIDDEN"), totalMembers: null, onlineDevices: null, devices: null, activeMembers: null, runtimeDetailAvailable: false, source: "forbidden" },
-    health: canManageWorkspace ? { ...availability(true), onlineDevices, jobs: jobsByStatus, source: "current_runtime" }
-      : { ...availability(false, "FORBIDDEN"), onlineDevices: null, jobs: {}, source: "forbidden" },
-    jobs: canManageWorkspace ? { ...availability(true), counts: jobsByStatus } : { ...availability(false, "FORBIDDEN"), counts: {} },
-    audit: {
-      ...availability(canViewAudit, canViewAudit ? null : "FORBIDDEN"),
-      items: canViewAudit ? latestAudit.map((row) => ({ id: row.id, action: row.action, targetType: row.targetType, targetId: row.targetId, metadata: row.metadata || {}, createdAt: row.createdAt, actor: row.actor ? { id: row.actor.id, email: row.actor.email, name: row.actor.name } : null })) : [],
-    },
+    ok:true, contractVersion:2,
+    agency: {id:agencyId,name:agency?.name ?? null,plan:owner ? agency?.plan ?? null:null,status:agency?.status ?? null,billingAvailable:owner},
+    range:{key:range.rangeKey,label:range.rangeKey==="today"?"Today":range.rangeKey,from:range.startDay.toISOString(),to:range.endAt.toISOString(),previousKey:range.rangeKey},
+    refreshedAt:now.toISOString(),
+    creatorScope:{broad:ctx.member.broad,mode:"current_membership",accessEpoch:ctx.member.accessEpoch,totalCreators:revenue.totalCreators,creatorIds:[]},
+    revenue:{...availability(money,money?null:"FORBIDDEN"),refreshAllowed:money&&refresh,totalCents:revenue.totalCents,grossCents:null,
+      deltaPct:revenue.deltaPct,currency:"USD",salesCount:null,uniqueFans:null,creatorCount:revenue.reportingCreators,points:revenue.points,
+      coverage:{totalCreators:revenue.totalCreators,reportingCreators:revenue.reportingCreators,pendingCount:revenue.pendingCount,staleCreators:revenue.staleCreators},
+      pending:{count:revenue.pendingCount,creatorIds:[],jobs:[],etaSeconds:null},stalenessMs:CURRENT_DAY_FRESHNESS_MS,source:money?"creator_earnings_daily":"forbidden"},
+    seats:owner?{...availability(true),used:members,limit:seatsLimit,remaining:seatsLimit===null?null:Math.max(0,Number(seatsLimit)-members),source:seatsLimit===null?"members_only":"subscription"}
+      :{...availability(false,"FORBIDDEN"),used:null,limit:null,remaining:null,source:"forbidden"},
+    // v2 list is exclusively GET /home/creators; never a truncated full list.
+    creators:[],
+    workers:team||owner?{...availability(true),totalMembers:members,onlineDevices:manage?onlineDevices:null,devices:manage?devices:null,activeMembers:null,runtimeDetailAvailable:manage,source:"current_membership"}
+      :{...availability(false,"FORBIDDEN"),totalMembers:null,onlineDevices:null,devices:null,activeMembers:null,runtimeDetailAvailable:false,source:"forbidden"},
+    health:manage?{...availability(true),onlineDevices,jobs:jobsByStatus,source:"current_runtime"}:{...availability(false,"FORBIDDEN"),onlineDevices:null,jobs:{},source:"forbidden"},
+    jobs:manage?{...availability(true),counts:jobsByStatus}:{...availability(false,"FORBIDDEN"),counts:{}},
+    audit:{...availability(audit,audit?null:"FORBIDDEN"),items:latestAudit.map(row=>({...row,metadata:row.metadata||{}}))},
   };
 }
 
-module.exports = { buildHomeSummary, __test: { readCoverageState, readCanonicalRevenue, projectCollectionLifecycle } };
+// Legacy reducers remain test-only oracles for historical acceptance suites.
+module.exports = { buildHomeSummary, buildHomeCreatorPage, __test: { readCoverageState, readCanonicalRevenue, projectCollectionLifecycle } };
