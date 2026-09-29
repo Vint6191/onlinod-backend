@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const { setCreatorNetworkProfile } = require("./creator-network-profile-service");
-const ownerActor = { userId: "owner-1", agencyId: "agency-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", permissions: {}, deletedAt: null, deactivatedAt: null };
+const ownerActor = { id: "member-owner", userId: "owner-1", agencyId: "agency-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", permissions: {}, deletedAt: null, deactivatedAt: null };
 
 function makeDb() {
   const creators = new Map([
@@ -18,8 +18,10 @@ function makeDb() {
   const profiles = new Map();
 
   const tx = {
-    agencyMember: { async findUnique() { return { ...ownerActor, userId: "admin", agencyId: "agency-1" }; } },
-    creatorAccount: {
+    agency: { async findUnique(){ return {id:"agency-1",deletedAt:null}; } },
+    user: { async findUnique(){ return {id:"owner-1",disabledAt:null}; } },
+    agencyMember: { async findFirst(){ return ownerActor; }, async findUnique() { return { ...ownerActor, userId: "admin", agencyId: "agency-1" }; } },
+    creatorAccount: { async findMany({where}){ return [...creators.values()].filter(row=>where.id.in.includes(row.id) && row.agencyId===where.agencyId && !row.deletedAt); },
       async findFirst({ where }) {
         const row = creators.get(where.id);
         return row && row.agencyId === where.agencyId && row.deletedAt === null ? { ...row } : null;
@@ -109,14 +111,14 @@ function makeDb() {
 test("V20.19 dedicated ownership: one endpoint cannot belong to two creators", async () => {
   const { db } = makeDb();
   const first = await setCreatorNetworkProfile({
-    db, agencyId: "agency-1", creatorId: "creator-a", actorUserId: "admin", expectedVersion: 0,
+    db, agencyId: "agency-1", creatorId: "creator-a", actorUserId: "owner-1", actorMember: ownerActor, expectedVersion: 0,
     mode: "PROXY", proxyEndpointId: "proxy-1",
   });
   assert.equal(first.profile.proxyEndpointId, "proxy-1");
 
   await assert.rejects(
     setCreatorNetworkProfile({
-      db, agencyId: "agency-1", creatorId: "creator-b", actorUserId: "admin", expectedVersion: 0,
+      db, agencyId: "agency-1", creatorId: "creator-b", actorUserId: "owner-1", actorMember: ownerActor, expectedVersion: 0,
       mode: "PROXY", proxyEndpointId: "proxy-1",
     }),
     (error) => error?.code === "PROXY_OWNED_BY_ANOTHER_CREATOR" && error?.status === 409,

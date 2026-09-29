@@ -88,6 +88,8 @@ function makeDb({ hideProxyOwnerDuringPrecheck = false } = {}) {
   }
 
   const db = {
+    agency: { async findUnique(){ return {id:"agency-1",deletedAt:null}; } },
+    user: { async findUnique(){ return {id:"user-1",disabledAt:null}; } },
     creatorAccount: {
       findFirst: async ({ where }) => {
         const row = creators.get(where.id);
@@ -135,8 +137,8 @@ function makeDb({ hideProxyOwnerDuringPrecheck = false } = {}) {
       },
     },
     agencyCryptoRoot: { findUnique: async ({ where }) => where.agencyId === "agency-1" ? clone(root) : null },
-    agencyMember: { findUnique: async () => ({ ...ownerMember, userId: "user-1", agencyId: "agency-1", deletedAt: null, deactivatedAt: null }) },
-    deviceCryptoIdentity: { findUnique: async ({ where }) => { const key = where.agencyId_deviceId || where; return key.deviceId === "device-1" && (!key.agencyId || key.agencyId === "agency-1") ? { deviceId: "device-1", agencyId: "agency-1", status: "ACTIVE", revokedAt: null } : null; } },
+    agencyMember: { findFirst: async () => ({ ...ownerMember, agencyId:"agency-1", deletedAt:null, deactivatedAt:null }), findUnique: async () => ({ ...ownerMember, userId: "user-1", agencyId: "agency-1", deletedAt: null, deactivatedAt: null }) },
+    deviceCryptoIdentity: { findUnique: async ({ where }) => { const key = where.agencyId_deviceId || where; return key.deviceId === "device-1" && (!key.agencyId || key.agencyId === "agency-1") ? { deviceId: "device-1", agencyId: "agency-1", userId: "user-1", status: "ACTIVE", revokedAt: null } : null; } },
     creatorCryptoKeyState: { findUnique: async ({ where }) => where.agencyId_creatorId?.agencyId === "agency-1" && where.agencyId_creatorId?.creatorId === "creator-1" ? { agencyId: "agency-1", creatorId: "creator-1", activeVersion: 1, rootVersion: 1 } : null },
     agencyCryptoOwnerKeyWrap: { findFirst: async ({ where }) => where.agencyId === "agency-1" && where.rootVersion === 1 && where.deviceId === "device-1" && where.revokedAt === null ? { id: "ow-1" } : null },
     creatorNetworkProfile: {
@@ -189,7 +191,7 @@ function opaqueCredentials(keyVersion = 1) {
   };
 }
 
-const ownerMember = { role: "OWNER", roleKey: "owner", assignedCreators: null };
+const ownerMember = { id: "member-owner", userId: "user-1", role: "OWNER", roleKey: "owner", assignedCreators: null };
 
 async function assign(db, creatorId, expectedVersion, proxyEndpointId) {
   return setCreatorNetworkProfile({

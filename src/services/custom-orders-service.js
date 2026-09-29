@@ -1,5 +1,5 @@
 "use strict";
-const { runDbTransaction } = require("./db-transaction-service");
+const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-service");
 
 
 const crypto = require("node:crypto");
@@ -298,16 +298,14 @@ function normalizeCreateInput(input = {}) {
 async function createCustomOrder({ agencyId, member, input, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_ORDER_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma"); const data = normalizeCreateInput(input || {});
-  await requireCreatorAccess({ agencyId, member, creatorId: data.creatorId, db: client });
   const fingerprint = stableCreateFingerprint(data);
-  const existing = await client.customOrder.findFirst({ where: { agencyId, clientMutationId: data.clientMutationId }, include: ORDER_INCLUDE });
-  if (existing) {
-    if (String(existing.clientMutationFingerprint || "") !== fingerprint) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "clientMutationId is already bound to a different CustomOrder payload", 409);
-    if (String(existing.creatorId) !== String(data.creatorId)) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "clientMutationId belongs to another creator", 409);
-    return { ok: true, idempotent: true, order: serializeOrder(existing, now) };
-  }
   const execute = async (tx) => {
     await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    // One intent can target different creators on competing requests. Lock the
+    // agency/intent before Creator -> User -> Member and re-read only after it.
+    // A unique violation aborts PostgreSQL's transaction; it cannot be used as
+    // an in-transaction replay lookup. Every replay also re-proves live access.
+    await lockDbAdvisoryXact({ db: tx, key: `custom-create:${agencyId}:${data.clientMutationId}` });
     const access = await assertCustomManagementCreatorAccess({
       agencyId, actorMember: member, creatorId: data.creatorId, permissionKey: null, db: tx,
     });
@@ -315,15 +313,14 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
     // creator row lock, retirement will observe this PENDING order as a blocker;
     // if retirement wins, this recheck fails after deletedAt commits.
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId: data.creatorId });
-    let row;
-    try {
-      row = await tx.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, clientMutationId: data.clientMutationId, clientMutationFingerprint: fingerprint, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, physicalStatusChangedAt: data.type === "PHYSICAL" ? now : null, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt: null }, include: ORDER_INCLUDE });
-    } catch (error) {
-      if (String(error?.code || "") !== "P2002") throw error;
-      const raced = await tx.customOrder.findFirst({ where: { agencyId, clientMutationId: data.clientMutationId }, include: ORDER_INCLUDE });
-      if (!raced || String(raced.clientMutationFingerprint || "") !== fingerprint) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "clientMutationId conflicted with a different CustomOrder payload", 409);
-      return { row: raced, idempotent: true };
+    const existing = await tx.customOrder.findFirst({ where: { agencyId, clientMutationId: data.clientMutationId }, include: ORDER_INCLUDE });
+    if (existing) {
+      if (String(existing.clientMutationFingerprint || "") !== fingerprint || String(existing.creatorId) !== data.creatorId) {
+        throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "clientMutationId is already bound to a different CustomOrder payload", 409);
+      }
+      return { row: existing, idempotent: true };
     }
+    let row = await tx.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, clientMutationId: data.clientMutationId, clientMutationFingerprint: fingerprint, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, physicalStatusChangedAt: data.type === "PHYSICAL" ? now : null, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt: null }, include: ORDER_INCLUDE });
     await reprojectCustomReminderSchedule({ agencyId, orderId: row.id, now, db: tx });
     row = await tx.customOrder.findFirst({ where: { id: row.id, agencyId }, include: ORDER_INCLUDE }) || row;
     await planTaskIntentForCommittedOrder({ agencyId, member: access.member, order: row, now, db: tx });
@@ -340,10 +337,16 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
 
 async function getCustomOrderByClientMutationId({ agencyId, member, clientMutationId: mutationId, now = new Date(), db = null } = {}) {
   const client = db || require("../prisma"); const normalized = clientMutationId(mutationId);
-  const row = await client.customOrder.findFirst({ where: { agencyId, clientMutationId: normalized }, include: ORDER_INCLUDE });
-  if (!row) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_NOT_FOUND", "Custom order create intent not found", 404);
-  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
-  return { ok: true, order: serializeOrder(row, now) };
+  return runDbTransaction(client, async (tx) => {
+    await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    await lockDbAdvisoryXact({ db: tx, key: `custom-create:${agencyId}:${normalized}` });
+    const binding = await tx.customOrder.findFirst({ where: { agencyId, clientMutationId: normalized }, select: { creatorId: true } });
+    if (!binding) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_NOT_FOUND", "Custom order create intent not found", 404);
+    await assertCustomManagementCreatorAccess({ agencyId, actorMember: member, creatorId: binding.creatorId, permissionKey: null, db: tx });
+    const row = await tx.customOrder.findFirst({ where: { agencyId, clientMutationId: normalized, creatorId: binding.creatorId }, include: ORDER_INCLUDE });
+    if (!row) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_NOT_FOUND", "Custom order create intent not found", 404);
+    return { ok: true, order: serializeOrder(row, now) };
+  });
 }
 
 async function loadOwnedOrder({ agencyId, member, orderId, db = null }) {

@@ -15,7 +15,7 @@ const {
   paymentSnapshot,
   serializeOrder,
   updateCustomOrder,
-} = require("./custom-orders-service");
+} = require(process.env.ONLINOD_AUDIT_SOURCE_ROOT ? require("node:path").join(process.env.ONLINOD_AUDIT_SOURCE_ROOT, "src/services/custom-orders-service.js") : "./custom-orders-service");
 
 function clone(value) {
   return value == null ? value : structuredClone(value);
@@ -292,7 +292,7 @@ test("custom order create is creator-scoped and starts pending", async () => {
   assert.equal("agencyId" in result.order, false);
   assert.equal("creatorId" in result.order, false);
   assert.equal("createdByMemberId" in result.order, false);
-  await assert.rejects(() => createCustomOrder({ agencyId: "agency-1", member, input: withCreateIntent({ creatorId: "creator-2", dialogId: "1", scenario: "x" }), db: commitDatabaseFixture(db) }), /do not have access/i);
+  await assert.rejects(() => createCustomOrder({ agencyId: "agency-1", member, input: withCreateIntent({ creatorId: "creator-2", dialogId: "1", scenario: "x" }), db: commitDatabaseFixture(db) }), error => error?.code === "CUSTOM_MANAGEMENT_CREATOR_ACCESS_FORBIDDEN");
 });
 
 
@@ -823,4 +823,48 @@ test("commit-time terminal payment correction also rejects stale management acce
     (error) => error?.code === "CUSTOM_MANAGEMENT_ACCESS_STALE" && error?.status === 409,
   );
   assert.equal(db._rows[0].paidAmountCents, 2000);
+});
+
+for (const [name, live, code] of [
+  ["membership revoked", null, "CUSTOM_MANAGEMENT_ACCESS_REVOKED"],
+  ["epoch advanced", { ...member, accessEpoch: 2 }, "CUSTOM_MANAGEMENT_ACCESS_STALE"],
+  ["creator scope removed", { ...member, assignedCreators: [] }, "CUSTOM_MANAGEMENT_CREATOR_ACCESS_FORBIDDEN"],
+]) test(`D5 create replay and intent readback reject ${name} after the original commit`, async () => {
+  const db = commitDatabaseFixture(fakeDb()), input = withCreateIntent({ creatorId: "creator-1", dialogId: "42", scenario: "recover" });
+  await createCustomOrder({ agencyId: "agency-1", member, input, db });
+  const deliveryCount = db._deliveryIntents.length;
+  db.agencyMember.findFirst = async () => live;
+  await assert.rejects(createCustomOrder({ agencyId: "agency-1", member, input, db }), e => e.code === code);
+  const { getCustomOrderByClientMutationId } = require("./custom-orders-service");
+  await assert.rejects(getCustomOrderByClientMutationId({ agencyId: "agency-1", member, clientMutationId: input.clientMutationId, db }), e => e.code === code);
+  assert.equal(db._rows.length, 1); assert.equal(db._deliveryIntents.length, deliveryCount);
+});
+
+test("D5 two admitted creates recheck the intent after waiting for its transaction owner", async () => {
+  const db = fakeDb(), input = withCreateIntent({ creatorId: "creator-1", dialogId: "42", scenario: "parallel" });
+  let tail = Promise.resolve(), aborted = false, transactions = 0;
+  const create = db.customOrder.create, read = db.customOrder.findFirst;
+  db.customOrder.create = async args => {
+    if (db._rows.some(x => x.clientMutationId === args.data.clientMutationId)) { aborted = true; throw Object.assign(Error("unique"), {code:"P2002"}); }
+    return create(args);
+  };
+  db.customOrder.findFirst = async args => { if (aborted) throw Error("current transaction is aborted"); return read(args); };
+  db.$transaction = async work => {
+    const prior = tail; let release; tail = new Promise(resolve => { release = resolve; });
+    await prior; aborted = false; transactions++;
+    try { return await work({ ...db, $transaction: undefined }); } finally { release(); }
+  };
+  const args = { agencyId: "agency-1", member, input, db: commitDatabaseFixture(db) };
+  const result = await Promise.all([createCustomOrder(args), createCustomOrder(args)]);
+  assert.equal(result[0].order.id, result[1].order.id); assert.equal(transactions, 2);
+  assert.equal(result.filter(x => x.idempotent).length, 1); assert.equal(db._rows.length, 1); assert.ok(db._deliveryIntents.length <= 1);
+});
+
+test("D5 create-intent readback refreshes the order after acquiring creator authority", async()=>{
+  const db=commitDatabaseFixture(fakeDb()),input=withCreateIntent({creatorId:"creator-1",dialogId:"42",scenario:"readback"});
+  const first=await createCustomOrder({agencyId:"agency-1",member,input,db});
+  const creatorRead=db.creatorAccount.findFirst;
+  db.creatorAccount.findFirst=async args=>{db._rows[0].status="CANCELLED";db._rows[0].cancelledAt=new Date();db._rows[0].cancelReason="Concurrent cancellation";return creatorRead(args);};
+  const result=await require("./custom-orders-service").getCustomOrderByClientMutationId({agencyId:"agency-1",member,clientMutationId:input.clientMutationId,db});
+  assert.equal(result.order.id,first.order.id);assert.equal(result.order.status,"CANCELLED");
 });

@@ -11,6 +11,7 @@ const {
 const { assertDeviceCanUseCreatorKey } = require("./client-e2e-keyring-service");
 const { canAccessCreator } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
+const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
 
 const PROXY_TYPES = new Set(["HTTP", "HTTPS", "SOCKS4", "SOCKS4A", "SOCKS5"]);
 const NETWORK_MODES = new Set(["DIRECT", "PROXY"]);
@@ -183,50 +184,41 @@ async function requireLiveProxySecretReader({ db, agencyId, userId = null, membe
 }
 
 async function requireLiveProxyManagementWriter({ db, agencyId, userId = null, member = null, creatorId = null }) {
-  const liveMember = userId
-    ? await db.agencyMember.findUnique({ where: { agencyId_userId: { agencyId, userId } } })
-    : member;
-  if (!liveMember || liveMember.deletedAt || liveMember.deactivatedAt) {
-    throw networkError("PROXY_MEMBER_INACTIVE", "Agency membership is no longer active", 403);
+  if (!member?.id || !member?.userId || (userId && member.userId !== userId)) {
+    throw networkError("PROXY_ACTOR_REQUIRED", "Current agency membership is required", 403);
   }
-  if (!(await canUsePermission({ member: liveMember, key: "creators.manage", db }))) {
-    throw networkError("PROXY_MANAGEMENT_REVOKED", "Creator-management permission was revoked before the proxy/network mutation could commit", 403);
-  }
-  let creator = null;
-  if (creatorId) {
-    creator = await db.creatorAccount.findFirst({
-      where: { id: creatorId, agencyId, deletedAt: null },
-      select: { id: true, agencyId: true, displayName: true, username: true, status: true },
+  // Hold the shared Agency -> Creator -> User/Member authority through COMMIT.
+  // A SERIALIZABLE snapshot by itself does not order a metadata-only write
+  // after a concurrent User disable or role/scope revocation.
+  let authority;
+  try {
+    authority = await assertManagementCommitAuthority({
+      tx: db, agencyId, actorMember: member, permissionKey: "creators.manage",
+      creatorIds: creatorId ? [creatorId] : [],
     });
-    if (!creator) throw networkError("CREATOR_NOT_FOUND", "Creator not found", 404);
-    if (!canAccessCreator(liveMember, creatorId)) {
-      throw networkError("PROXY_CREATOR_ACCESS_REVOKED", "Creator access was revoked before the proxy/network mutation could commit", 403);
-    }
+  } catch (error) {
+    const mapped = {
+      MANAGEMENT_ACCESS_REVOKED: "PROXY_MEMBER_INACTIVE",
+      MANAGEMENT_USER_DISABLED: "PROXY_MEMBER_INACTIVE",
+      MANAGEMENT_ACCESS_STALE: "PROXY_ACCESS_STALE",
+      MANAGEMENT_PERMISSION_REVOKED: "PROXY_MANAGEMENT_REVOKED",
+      MANAGEMENT_CREATOR_SCOPE_REVOKED: "PROXY_CREATOR_ACCESS_REVOKED",
+    }[error?.code];
+    if (mapped) error.code = mapped;
+    throw error;
   }
-  return { member: liveMember, creator };
+  const creator = creatorId ? await db.creatorAccount.findFirst({
+    where: { id: creatorId, agencyId, deletedAt: null },
+    select: { id: true, agencyId: true, displayName: true, username: true, status: true },
+  }) : null;
+  if (creatorId && !creator) throw networkError("CREATOR_NOT_FOUND", "Creator not found", 404);
+  return { member: authority.member, creator };
 }
 
-async function createProxyEndpoint({ db, agencyId, actorUserId, actorMember = null, input }) {
-  const type = normalizeType(input?.type);
-  if (input?.credentials || input?.opaqueCredentials) {
-    throw networkError("PROXY_CREATOR_REQUIRED_FOR_E2E", "Create authenticated proxies through a creator-scoped endpoint", 409);
-  }
-  return runSerializable(db, async (tx) => {
-    await requireLiveProxyManagementWriter({ db: tx, agencyId, userId: actorUserId, member: actorMember });
-    const row = await tx.agencyProxyEndpoint.create({
-      data: {
-        agencyId,
-        label: normalizeLabel(input?.label),
-        type,
-        host: normalizeHost(input?.host),
-        port: normalizePort(input?.port),
-        enabled: input?.enabled !== false,
-        version: 1,
-        ...clearedProxyCredentials(),
-      },
-    });
-    return { proxy: proxyPublic(row), actorUserId };
-  }, "PROXY_CREATE_CONFLICT", "Proxy creation conflicted with another writer");
+async function createProxyEndpoint() {
+  // All current Desktop creation is creator-bound and carries a profile CAS.
+  // The old unowned pool endpoint had neither a domain owner nor replay ID.
+  throw networkError("PROXY_POOL_CREATE_RETIRED", "Create a dedicated proxy through its creator network profile", 410);
 }
 
 async function createProxyForCreator({ db, agencyId, creatorId, actorUserId, actorMember, deviceId, expectedNetworkVersion, input }) {
@@ -280,7 +272,12 @@ async function createProxyForCreator({ db, agencyId, creatorId, actorUserId, act
       profile = await tx.creatorNetworkProfile.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } });
     }
     return { proxy: proxyPublic(proxy), profile: profilePublic(profile, creator), actorUserId };
-  }, "CREATOR_NETWORK_VERSION_CONFLICT", "Creator network assignment was changed concurrently");
+  }, "CREATOR_NETWORK_VERSION_CONFLICT", "Creator network assignment was changed concurrently").catch((error) => {
+    // The transaction has rolled back. Do not issue replay queries after a
+    // PostgreSQL unique violation, and never surface an ownership race as 500.
+    if (error?.code === "P2002") throw networkError("CREATOR_NETWORK_VERSION_CONFLICT", "Creator proxy or network assignment changed concurrently", 409);
+    throw error;
+  });
 }
 
 async function requireLiveProxyCreator({ db, agencyId, creatorId }) {
@@ -377,7 +374,10 @@ async function deleteProxyEndpoint({ db, agencyId, actorUserId = null, actorMemb
   if (!id || !Number.isInteger(version) || version <= 0) throw networkError("PROXY_DELETE_INPUT_INVALID", "Proxy id and expectedVersion are required", 400);
   return runSerializable(db, async (tx) => {
     const current = await tx.agencyProxyEndpoint.findFirst({ where: { id, agencyId } });
-    if (!current) return { deleted: false, alreadyDeleted: true };
+    if (!current) {
+      await requireLiveProxyManagementWriter({ db: tx, agencyId, userId: actorUserId, member: actorMember });
+      return { deleted: false, alreadyDeleted: true };
+    }
     const assignedProfile = await tx.creatorNetworkProfile.findFirst({
       where: { agencyId, proxyEndpointId: id, mode: "PROXY" },
       select: { creatorId: true },

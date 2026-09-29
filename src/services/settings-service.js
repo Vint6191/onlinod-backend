@@ -183,6 +183,18 @@ async function getAccountSettings({ userId, currentDeviceId = null, db = null })
   };
 }
 
+async function lockEligibleAccountUser(db, userId) {
+  await acquireAuthorizationUserLock(db, { userId });
+  if (typeof db.$queryRawUnsafe === "function") {
+    await db.$queryRawUnsafe('SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE', String(userId));
+  }
+  const current = await db.user.findUnique({ where: { id: userId } });
+  if (!current || current.disabledAt) {
+    throw Object.assign(new Error("Account is no longer operationally active"), { code: "SETTINGS_ACCOUNT_INACTIVE", status: 403 });
+  }
+  return current;
+}
+
 async function updateAccountProfile({ agencyId, userId, name, db = null }) {
   const client = db || prisma;
   const nextName = clean(name, 80);
@@ -191,16 +203,22 @@ async function updateAccountProfile({ agencyId, userId, name, db = null }) {
     err.code = "SETTINGS_NAME_REQUIRED";
     throw err;
   }
-  const before = await client.user.findUnique({ where: { id: userId }, select: { name: true } });
-  const user = await client.user.update({ where: { id: userId }, data: { name: nextName } });
-  await audit({ agencyId, actorUserId: userId, action: "settings.account.profile_updated", targetType: "user", targetId: userId, metadata: { beforeName: before?.name || null, afterName: nextName }, db: client });
+  const { before, user } = await runDbTransaction(client, async (tx) => {
+    const before = await lockEligibleAccountUser(tx, userId);
+    const user = await tx.user.update({ where: { id: userId }, data: { name: nextName } });
+    return { before, user };
+  });
+  await audit({ agencyId, actorUserId: userId, action: "settings.account.profile_updated", targetType: "user", targetId: userId, metadata: { beforeName: before.name || null, afterName: nextName }, db: client });
   return publicUser(user);
 }
 
 async function updateAccountAvatar({ agencyId, userId, avatarUrl, db = null }) {
   const client = db || prisma;
   const value = clean(avatarUrl, 2000) || null;
-  const user = await client.user.update({ where: { id: userId }, data: { avatarUrl: value } });
+  const user = await runDbTransaction(client, async (tx) => {
+    await lockEligibleAccountUser(tx, userId);
+    return tx.user.update({ where: { id: userId }, data: { avatarUrl: value } });
+  });
   await audit({ agencyId, actorUserId: userId, action: value ? "settings.account.avatar_updated" : "settings.account.avatar_removed", targetType: "user", targetId: userId, metadata: { avatarConfigured: !!value }, db: client });
   return publicUser(user);
 }
@@ -223,7 +241,13 @@ async function changeAccountPassword({ agencyId, userId, currentPassword, newPas
   const passwordHash = await bcrypt.hash(next, 12);
   const deviceId = clean(currentDeviceId, 160);
   await runDbTransaction(client, async (tx) => {
-    await acquireAuthorizationUserLock(tx, { userId });
+    const locked = await lockEligibleAccountUser(tx, userId);
+    // bcrypt is deliberately outside the transaction. Bind its successful
+    // verification to the exact hash observed there: another password change
+    // or reset cannot be overwritten using a formerly valid password.
+    if (locked.passwordHash !== user.passwordHash) {
+      throw Object.assign(new Error("Password changed while this request was being verified; sign in again"), { code: "SETTINGS_PASSWORD_CHANGED", status: 409 });
+    }
     const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     await tx.user.update({ where: { id: userId }, data: { passwordHash } });
     await tx.refreshSession.updateMany({
@@ -236,7 +260,7 @@ async function changeAccountPassword({ agencyId, userId, currentPassword, newPas
       data: { revokedAt: now },
     });
   });
-  await audit({ agencyId, actorUserId: userId, action: "settings.account.password_changed", targetType: "user", targetId: userId, metadata: { preservedCurrentDevice: !!deviceId } });
+  await audit({ agencyId, actorUserId: userId, action: "settings.account.password_changed", targetType: "user", targetId: userId, metadata: { preservedCurrentDevice: !!deviceId }, db: client });
   return { ok: true };
 }
 
