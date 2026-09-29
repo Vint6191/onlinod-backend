@@ -3498,6 +3498,8 @@ model OfProviderRequestGateWaiter {
 
 model ProviderCapacityDebtState {
   id                                       String    @id
+  projectionRevision                      BigInt    @default(0)
+  projectionCoverageStatus                String    @default("PARTIAL")
   sourceVersion                            String    @db.VarChar(120)
   sampledAt                                DateTime
   revision                                 BigInt    @default(0)
@@ -6499,4 +6501,47 @@ model AdminSupportGrant {
   @@index([actorId, createdAt, id])
   @@index([sessionId])
   @@index([expiresAt])
+}
+
+// Phase 6 capacity current projection. Partial indexes/checks/triggers live in SQL.
+model ProviderCapacityProjectionState {
+  jobKeys           String[]
+  id                String   @id
+  generation        String
+  revision          BigInt   @default(0)
+  directoryCursor   String?
+  directoryComplete Boolean  @default(false)
+  fanCursor         String?
+  fanComplete       Boolean  @default(false)
+  jobCursor         String?
+  jobComplete       Boolean  @default(false)
+  sampledAt         DateTime?
+  updatedAt         DateTime @default(now())
+}
+
+model ProviderCapacityDirty {
+  kind      String
+  sourceId  String
+  touchedAt DateTime @default(now())
+  @@id([kind, sourceId])
+  @@index([touchedAt, kind, sourceId], map: "ProviderCapacityDirty_turn_idx")
+}
+
+model ProviderCapacityContribution {
+  kind          String
+  sourceId      String
+  bucket        String
+  itemCount     BigInt    @default(0)
+  overdueCount  BigInt    @default(0)
+  requiredCalls BigInt    @default(0)
+  oldestAt      DateTime?
+  nextDueAt     DateTime?
+  @@id([kind, sourceId])
+}
+
+model ProviderCapacityBucket {
+  bucket        String @id
+  itemCount     BigInt @default(0)
+  overdueCount  BigInt @default(0)
+  requiredCalls BigInt @default(0)
 }

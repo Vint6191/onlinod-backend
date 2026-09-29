@@ -1,0 +1,210 @@
+================================================================================
+ONLINOD — PHASE 6 / B1 — CAPACITY INCREMENTAL OWNER — 2026-09-29
+Первый узел реализации после A1. Backend only. Desktop unchanged.
+================================================================================
+
+1. ПОРУЧЕНИЕ И РЕЗУЛЬТАТ
+После A1 пользователь прислал свежие Desktop/Backend и поручил «тогда приступай
+братик». Продолжена реализация первого предложенного узла 6B: current capacity
+projection + единственный владелец публикации. Остальные узлы шестой фазы не
+объявляются реализованными. Серверное хранение переписки и Phase7 не затрагивались.
+
+В рабочей копии реализованы P6-F5/P6-F6: bounded initial backfill, transactional
+source dirty signals, current per-source contributions, delta buckets, time-driven
+wakeup, conservative incomplete coverage и защищённая публикация. Полный canonical
+scan остался только явно вызываемой read-only диагностической функцией/оракулом
+теста. Scheduler, maintenance pump и CLI больше не вызывают его для refresh.
+
+SOURCE CLOSED всей Phase6: НЕТ.
+SCALE CLOSED: НЕТ.
+СТАВИТЬ: ПОКА НЕТ. Код и миграция подготовлены для review/приёмки; следующий
+installation gate — обычный PostgreSQL, два независимых клиента, конфликт
+canonical writer/repair, аварийное завершение процесса и rollout старой/новой версии.
+Локальный SQL proof не заменяет эту проверку. Production deployment не выполнялся.
+Открытые build/runtime gates Phase5B из B12 остаются открытыми, не закрыты этим узлом.
+
+2. ТОЧНЫЕ ВХОДЫ
+Desktop88(2).zip: SHA256
+5957276ab56256eee68e35b89a113b27184d964117714f65eace0e46f2f76aba.
+1319 ZIP entries, 1185 files; CRC PASS. ZIP и все файлы совпали с Desktop88 из A1.
+Это production код B12, без 11 исторических desktop docs. В Desktop ничего не
+менялось; отсутствующие docs не восстанавливались в присланном архиве.
+Backend onlinod-backend-main - 2026-09-29T175953.743.zip: SHA256
+eeebee84354d8f88aaa38fe56b75b6bbfd95627c4109734537aab0e4c0e45fb3.
+1549 ZIP entries, 1242 files; CRC PASS. Побайтно прежний I7; изменённых,
+добавленных или удалённых файлов относительно A1 нет. Факт повторной загрузки
+не выдаётся за подтверждение текущего live Render deployment.
+Исходные распакованные деревья не изменялись. Работа — work/phase6-b1-backend.
+
+3. ВЛАДЕЛЕЦ И ПРОТОКОЛ
+Новый provider-capacity-projection-service.js выполняет одну bounded transaction
+через существующий db-commit-kernel/runDbTransaction. Внутри:
+1) pg_try_advisory_xact_lock('phase6-capacity-projection-v1') и lock singleton
+   progress state. Занятый owner возвращает capacity_projection_busy до чтения
+   canonical relations; это cold projection lock, canonical writers его не берут.
+2) Проверка поколения и полного current job catalog. Изменённый каталог требует
+   отдельного перехода/повторного backfill; нельзя молча забыть старые JobInstance.
+3) DB authority time, ограниченные keyset страницы первичного обхода трёх таблиц.
+4) Индексированный wakeup nextDueAt и bounded dirty repair.
+5) Обновление contributions и aggregate deltas; удаление обработанных dirty keys.
+6) Новое DB время, revision, согласованный input read, derivation и публикация.
+Всё коммитится или откатывается вместе. Между вычислением и записью нет свободно
+живущего lease callback. По завершении/разрыве транзакции PostgreSQL освобождает
+owner lock. Старый вычислитель не может продолжить публикацию в новом owner.
+
+root timeout=15000ms, maxWait=2000ms, общий deadline=20000ms,
+lock_timeout=2000ms, statement_timeout<=12000ms; максимум 3 попытки только для
+известного rollback conflict/deadlock через существующий kernel. Неизвестный
+исход commit не повторяется автоматически. Bounded work содержит только DB facts,
+нет внешнего HTTP/OF/AI или недолговечных обязательных side effects.
+
+4. ИНКРЕМЕНТАЛЬНОЕ СОСТОЯНИЕ
+Новая additive migration20260929150000_phase6_capacity_incremental_v1:
+- ProviderCapacityProjectionState: generation, catalog, revision, три durable
+  keyset cursor/completion flags, sampledAt. Один существующий OF topology ID.
+- ProviderCapacityDirty: один ключ (kind,sourceId), FIFO по первоначальному
+  touchedAt. Повторное изменение горячего source не отправляет его в конец.
+- ProviderCapacityContribution: typed current вклад конкретного canonical row,
+  bucket, counts/calls, oldestAt и nextDueAt. Нет foreign key к source: удаление
+  должно успеть вычесть прежний вклад после исчезновения canonical row.
+- ProviderCapacityBucket: точные BigInt sums по directory, fan и конечному каталогу
+  job classes. Перед отрицательной delta создаётся нулевой bucket отдельно:
+  отрицательная INSERT строка не проходит PostgreSQL CHECK даже при ON CONFLICT.
+- Два поля результата: projectionRevision и projectionCoverageStatus.
+
+AFTER INSERT/DELETE/UPDATE OF релевантные поля на CreatorCampaignCollectionState,
+CreatorFanRefreshDemand и JobInstance сохраняют dirty в canonical transaction.
+Откат canonical mutation откатывает сигнал. Старые версии Backend тоже проходят
+через DB triggers; обход через прежний ORM или raw SQL не теряет изменение.
+Редкий rewrite id ставит dirty для старого и нового ключа. TRUNCATE не является
+поддерживаемым live mutation protocol; активных TRUNCATE этих таблиц в source
+call graph не найдено. Будущий purge/rebuild требует собственного согласования.
+
+Размер repair default96, runtime clamp3..128. На source kind backfill page =
+max(1,floor(batch/3)); суммарно не более batch source IDs за проход. Time wakeup
+не более batch и dirty claims не более batch. Ни cursor, ни dirty rows не живут
+только в RAM. Пустая завершающая страница корректно завершает точный кратный batch.
+Изменение/вставка позади cursor остаётся в trigger queue и не теряется.
+
+Repair берёт dirty rows FOR UPDATE SKIP LOCKED, читает canonical по PK IN/ANY
+ограниченного массива, читает прежние вклады, вычисляет разность и публикует её.
+Concurrent canonical writer может ждать конкретный dirty key. После commit repair
+его trigger снова создаёт key: pending изменение не стирается удалением очереди.
+Изменения нескольких ключей могут вызвать обычный deadlock — bounded timeout и
+rollback retry обязательны; реальное двухклиентное ожидание ещё требует gate.
+
+Time semantics прежние: due <= sampled time; overdue строго <. В точном равенстве
+ставится следующий wakeup на +1ms. При прошедшем deadline nextDueAt удаляется,
+поэтому уже overdue запись не перезапускает сама себя вечно. Новое изменение
+deadline снова пересчитывается через trigger. Во время final read любые ещё
+неотработанные deadlines сохраняют PARTIAL.
+
+Oldest dates читаются indexed ORDER BY/LIMIT1. Background class counts и суммы
+перебирают только фиксированный каталог job buckets; per-class minimum берётся
+через lateral indexed LIMIT1. Нет агрегирования всей истории/очереди в refresh.
+Таблицы current contributions/dirty растут с числом актуальных source facts;
+ограничен один проход и оперативный объём, не выдуман глобальный лимит canonical
+истории. Физическая пропускная способность и уборка MVCC/bloat не измерялись.
+
+5. CORRECTNESS И COVERAGE
+Partial bootstrap, непустая dirty queue или overdue wakeup => projection PARTIAL,
+future debt coverage PARTIAL, status UNKNOWN, admission CONSERVATIVE. Нулевой
+текущий partial sum не превращается в HEALTHY. COMPLETE_AT_SAMPLE означает
+состояние в момент наблюдения, а не обещание отсутствия будущих изменений.
+Даже при complete projection background_other pending jobs по-прежнему дают
+UNKNOWN, пока неизвестна точная будущая cardinality OF calls. Сохранён A18 contract:
+не подменять неизвестные calls числом Jobs. Actual usage accounting и topology
+v1, один of-global gate, 700ms физическая authority, weighted provider credits и
+conservative admission semantics не заменялись и не масштабировались шардированием.
+
+publication trigger проверяет новую sourceVersion, transaction-local marker,
+актуальную projection revision/generation. Повтор/регресс revision и sampledAt
+отклоняются. JS persist также требует kernel-issued transaction context и не
+возвращает success при пустом RETURNING. Marker выставляется только после
+incremental repair и input read. Старые binaries с прежней sourceVersion получают
+подавленную запись (RETURN NULL), поэтому не могут затереть новую authority.
+Миграция сразу переводит прежний singleton в UNKNOWN/CONSERVATIVE.
+Старый full scan может продолжаться на ещё не обновлённой реплике, но не публикует;
+после завершения rollout этот code path из автоматических вызовов исчезает.
+
+Migration обёрнута BEGIN/COMMIT с lock_timeout5s. Таблицы/индексы новые и пустые,
+нет bootstrap INSERT SELECT всей истории в DDL, нет DROP/TRUNCATE canonical data,
+старые migration bytes не изменены. DDL lock и roll-forward поведение надо проверить
+на обычном PostgreSQL. При откате только бинарника следует сохранить additive
+схему и ожидать conservative stale reporting; отключать guard ради старой записи
+не входит в этот пакет. Не выполнялись upgrade/downgrade production DB.
+
+6. ИНТЕГРАЦИЯ И ПРЕДЕЛЫ УЗЛА
+Hourly recurring scheduler и maintenance pump вызывают тот же refresh owner,
+внешний analytics_capacity_projection_v1 callback больше не владеет записью.
+CLI refresh делает одну bounded порцию, сообщает processed/scanned/completeness и
+busy reason. CLI JSON сериализует BigInt явно; прежний способ мог падать на BigInt.
+Публичных HTTP API и Desktop DTO не менялось; новые поля additive diagnostic data.
+
+Добавлена одна maintenance class:21->22. F8 не закрыт: выбор остальных классов
+по фазе wall clock остаётся следующим узлом6C. Старое A1 воспроизведение35s относится
+к21 lanes; после добавления lane конкретный alias period меняется, механизм остаётся.
+Ни больше worker replicas, ни новый capacity owner не доказывают fair admission.
+P6-F1/F2 Home, F3/F4 Chromium, F7 MessageLibrary idempotency и полный non-admin
+mutation inventory остаются OPEN. Shared host AI/Chromium pressure policy тоже OPEN.
+
+7. ПРОВЕРКИ И УРОВЕНЬ ДОКАЗАТЕЛЬСТВА
+Final Node regression:85 tests,85 PASS,0 FAIL,0 SKIP.
+Из них7 новых B1 unit/control cases;78 existing capacity/gate/domainwork/maintenance/
+job tests. Существующий A15 persistence test обновлён под настоящий обязательный
+transaction owner и дополнительно запрещает canonical full scan из refresh.
+Тест не удалён/не пропущен. Первый запуск выявил именно старую fixture без $transaction;
+initial-regression.log сохранён. Найденные локальные зависимости Prisma5.22.0/zod
+позволили выполнить job-scheduler-idempotency, который A1 блокировал missing zod.
+Это не проверка всей сборки Desktop и не закрывает TypeScript/runtime gates B12.
+
+Final SQL proof:11 tests,11 PASS,0 FAIL,0 SKIP.
+Движок @electric-sql/pglite0.5.8, только memory://, DATABASE_URL не читается,
+сетевых подключений/внешней DB нет. Исполняются настоящий production SQL, новая
+migration без переписывания и db-commit-kernel через Prisma-shaped adapter.
+База fixture — пять CREATE TABLE и enum declarations, извлечённые побайтно из
+Prisma5.22.0 diff пустой схемы к supplied I7. В fixture нет полного графа FK,
+исторических business triggers и всей migration chain. Это реальная проверка
+SQL/PLpgSQL/rollback на embedded PostgreSQL, НЕ обычный сервер с конкурирующими
+backends, НЕ complete Render upgrade rehearsal, НЕ нагрузочный benchmark.
+
+Сценарии: populated bootstrap + behind-cursor insert; повтор repair; satisfaction/
+delete/job class change; source/dirty rollback и rewrite id; all-or-nothing failed
+publication; time-only wakeup; equality of sums with full canonical diagnostic;
+legacy writer suppression/unowned/stale write rejection; независимость projection
+revision от OF-gate revision и игнорирование host now; catalog mismatch preserving
+dirty; индексированные keyset/due/minimum/order probes; controlled40P01 retry
+без двойного учёта и clamp большой порции.
+Индекс-проверки используют EXPLAIN с enable_seqscan=off на малой fixture: доказывают
+доступность нужного index path, не выбор planner на целевом объёме и не latency.
+40P01 намеренно инжектирован после настоящего SQL repair: это rollback/retry proof,
+не воспроизведённый physical deadlock двух независимых sessions.
+Первый SQL run нашёл ошибку типов в fixture (один placeholder использовался как
+text id и varchar fan ID); исправлены casts в fixture. Production SQL не подменялся.
+Отдельная ревизия SQL убрала SELECT u.*: OF-gate тоже имеет revision, и явный список
+usage fields исключает перекрытие projection revision. Есть dedicated regression.
+
+Prisma5.22.0 validate:PASS (dummy offline URL только для config validation).
+Prisma schema diff: только4 additive tables,2 поля результата,1 Prisma-declared
+index;2 partial indices, checks и triggers описаны SQL migration вручную.
+Changed JS/CJS syntax:7 files PASS. Input trees unchanged, existing migration bytes
+unchanged, changed-only archive application reconstructs target exactly — PASS.
+Полный npm test/lint всего monorepo, ordinary PostgreSQL multi-session contention,
+full-chain clean/rolling upgrade, real Electron/Ollama и axes A*C*M*H*W load НЕ RUN.
+
+8. ПЕРЕДАЧА И СЛЕДУЮЩИЙ ШАГ
+Code ZIP содержит только новые/изменённые Backend файлы относительно supplied I7,
+с полными относительными путями. Никаких node_modules, uploaded archives, env или
+секретов в code ZIP. Это cumulative Phase6 backend patch B1; Desktop B12 code остаётся
+прежним и доступен внутри цепочки предыдущих evidence. Исходный I7 не надо заменять
+одним ZIP без применения changed files к существующему проекту. Удаляемых файлов0.
+Полный cumulative TXT начинается всеми815277bytes A1 checkpoint побайтно.
+Evidence включает полный A1 cumulative evidence ZIP и новые логи/manifest/proof.
+Не заменять cumulative TXT краткой сводкой. Следующие checkpoints наращивают этот.
+
+Следующий содержательный узел —6C: progress-based work-class admission, durability/
+restart fairness; одновременно перед installation закрыть обычный PostgreSQL gate
+этого capacity owner. Затем6A Home scope/read cutover,6D полный mutation inventory
+и receipts,6E Desktop bounds/fairness/pressure,6F acceptance. Серверный архивный
+переездS01..S07, Phase7 purge и открытые5B runtime gates не потеряны и не закрыты.
+================================================================================

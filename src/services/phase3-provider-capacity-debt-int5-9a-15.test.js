@@ -66,22 +66,29 @@ test("A15 canonical input scan counts unsatisfied FanData revisions, not only cu
 
 test("A15 persistence is a typed singleton projection with monotonic revision", async () => {
   const calls = [];
-  const db = {
+  const tx = {
+    async $executeRawUnsafe() { return 1; },
     async $queryRawUnsafe(sql, ...params) {
       calls.push({ sql: String(sql), params });
-      if (/WITH directory AS/.test(String(sql))) {
-        return [{ dueCreators: 1n, overdueCreators: 1n, requiredCalls: 41n, oldestDueAt: new Date("2026-09-18T00:00:00Z"), unsatisfiedDemands: 5000n, pendingJobs: 32n, oldestRequestedAt: new Date("2026-09-18T00:00:00Z") }];
-      }
-      if (/INSERT INTO "ProviderCapacityDebtState"/.test(String(sql))) return [{ id: capacityDebt.PROVIDER_CAPACITY_STATE_ID, revision: 7n, status: "OVERLOADED" }];
+      if (/pg_try_advisory_xact_lock/.test(sql)) return [{ acquired: true }];
+      if (/SELECT clock_timestamp/.test(sql)) return [{ authorityNow: new Date("2026-09-29T00:00:00Z") }];
+      if (/SELECT \* FROM "ProviderCapacityProjectionState"/.test(sql)) return [{
+        generation: "phase6_capacity_incremental_v1", jobKeys: require("./job-catalog").CLAIMABLE_DESKTOP_JOB_KEYS,
+        directoryComplete: true, fanComplete: true, jobComplete: true,
+      }];
+      if (/WITH background_other AS/.test(sql)) return [{ revision: 7n, projectionComplete: true, dueCreators: 1n, overdueCreators: 1n, requiredCalls: 41n, unsatisfiedDemands: 5000n, pendingJobs: 32n }];
+      if (/INSERT INTO "ProviderCapacityDebtState"/.test(sql)) return [{ id: capacityDebt.PROVIDER_CAPACITY_STATE_ID, revision: 7n, status: "OVERLOADED" }];
       return [];
     },
   };
+  const db = { async $transaction(work) { return work(tx); } };
   const result = await capacityDebt.refreshProviderCapacityDebtSnapshot({ db, now: new Date("2026-09-19T00:00:00Z") });
   assert.equal(result.ok, true);
   const upsert = calls.find((call) => /INSERT INTO "ProviderCapacityDebtState"/.test(call.sql));
   assert.ok(upsert);
   assert.match(upsert.sql, /"revision"="ProviderCapacityDebtState"\."revision" \+ 1/);
   assert.doesNotMatch(upsert.sql, /Json|jsonb/i);
+  assert.ok(!calls.some((call) => /WITH directory AS/.test(call.sql)), "refresh must not scan canonical relations");
 });
 
 test("A15 schema/migration keep capacity debt relational and additive", () => {

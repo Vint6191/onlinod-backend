@@ -2116,6 +2116,7 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
     // this rotation is only a resource/fairness budget, never business truth. A restart may
     // change which lane runs first, but no lane loses work because claims/cursors stay durable.
     const lanes = [
+      ["providerCapacityProjection", () => refreshProviderCapacityDebtSnapshot({ db })],
       ["messageLibraryTrash", () => require("./message-library-lifecycle-service").runMessageLibraryTrashMaintenance({ db })],
       ["adminBillingPricing", () => require("./admin-bulk-pricing-command-service").runAdminBulkPricingSweep({ db })],
       ["notificationHistoryRepair", () => require("./notification-history-repair-service").runNotificationHistoryRepairSweep({ db })],
@@ -2201,15 +2202,10 @@ async function runRecurringSweepInternal() {
   // Retention owns the detailed 180d boundary. Run it before the historical
   // Team backfill so deleted old detail is not immediately recreated.
   const retention = await maybeRunRetentionSweep({ now });
-  // Capacity reporting remains a separate cold projection until its incremental
-  // cutover. It is no longer a prerequisite for per-creator job admission.
+  // Same bounded transactional owner as the maintenance pump and operator CLI.
   let capacityProjection;
   try {
-    capacityProjection = await runMaintenanceLane({
-      db: prisma, key: "analytics_capacity_projection_v1", generation: "analytics_capacity_projection_v1",
-      minIntervalMs: RECURRING_INTERVAL_MS, fallbackNow: now,
-      work: () => refreshProviderCapacityDebtSnapshot({ db: prisma, now }),
-    });
+    capacityProjection = await refreshProviderCapacityDebtSnapshot({ db: prisma });
   } catch (error) {
     capacityProjection = { ok: false, reason: "capacity_projection_failed", error: String(error?.message || error).slice(0, 500) };
   }

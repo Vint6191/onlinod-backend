@@ -14,13 +14,13 @@ async function main() {
     throw new Error("usage: npm run phase3:provider-capacity -- [diagnostics|refresh]");
   }
   if (command === "refresh") {
-    const result = await refreshProviderCapacityDebtSnapshot({ db: prisma, now: new Date() });
-    console.log(JSON.stringify({ command, ok: result.ok === true, snapshot: result.snapshot || result.computed || null, scaleContract: providerScaleContract() }, null, 2));
+    const result = await refreshProviderCapacityDebtSnapshot({ db: prisma });
+    console.log(JSON.stringify({ command, ok: result.ok === true, skipped: result.skipped === true, reason: result.reason || null, processed: result.processed, scanned: result.scanned, projectionComplete: result.projectionComplete, snapshot: result.snapshot || result.computed || null, scaleContract: providerScaleContract() }, (_key, value) => typeof value === "bigint" ? String(value) : value, 2));
     if (!result.ok) process.exitCode = 2;
     return;
   }
   const snapshot = await readProviderCapacityDebtSnapshot({ db: prisma });
-  console.log(JSON.stringify({ command, snapshot, scaleContract: providerScaleContract() }, null, 2));
+  console.log(JSON.stringify({ command, snapshot, scaleContract: providerScaleContract() }, (_key, value) => typeof value === "bigint" ? String(value) : value, 2));
 }
 
 main().catch((error) => {

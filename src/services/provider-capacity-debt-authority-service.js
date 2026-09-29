@@ -25,7 +25,7 @@ const {
 } = require("./provider-capacity-topology-control-service");
 
 const PROVIDER_CAPACITY_STATE_ID = "of-global-capacity-v1";
-const PROVIDER_CAPACITY_SOURCE_VERSION = "phase3_provider_capacity_debt_v4_a18";
+const PROVIDER_CAPACITY_SOURCE_VERSION = "phase6_provider_capacity_debt_v1";
 const BACKGROUND_OTHER_PROVIDER_JOB_KEYS = Object.freeze(
   CLAIMABLE_DESKTOP_JOB_KEYS.filter((key) => !["fetch_campaigns", "fan_data_point_refresh"].includes(String(key || "")))
 );
@@ -73,6 +73,7 @@ function deriveProviderCapacityDebtSnapshot({
   fanData = {},
   backgroundOther = {},
   actualUsage = {},
+  projection = { complete: true, revision: 0n },
   intervalMs = DEFAULT_PROVIDER_INTERVAL_MS,
   directoryTargetMs = DEFAULT_CAMPAIGN_DIRECTORY_TARGET_MS,
   fanDataTargetMs = CAMPAIGN_FAN_VALUE_FRESHNESS_MS,
@@ -95,8 +96,9 @@ function deriveProviderCapacityDebtSnapshot({
   // OF calls a domain-specific continuation will consume. Never invent
   // `1 job == 1 call` as an SLA forecast.
   const backgroundOtherCallCardinalityKnown = backgroundOtherPendingJobs === 0;
-  const futureDebtCoverageStatus = backgroundOtherCallCardinalityKnown ? "COMPLETE_AT_SAMPLE" : "PARTIAL";
-  const futureDebtCoverageReason = backgroundOtherCallCardinalityKnown ? null : "BACKGROUND_OTHER_CALL_CARDINALITY_UNKNOWN";
+  const projectionComplete = projection.complete === true;
+  const futureDebtCoverageStatus = backgroundOtherCallCardinalityKnown && projectionComplete ? "COMPLETE_AT_SAMPLE" : "PARTIAL";
+  const futureDebtCoverageReason = !projectionComplete ? "CAPACITY_PROJECTION_REBUILD_OR_LAG" : (backgroundOtherCallCardinalityKnown ? null : "BACKGROUND_OTHER_CALL_CARDINALITY_UNKNOWN");
 
   const actualUsageWindowStartedAt = asDate(actualUsage.windowStartedAt);
   const actualUsageTotalStarts = nonNegativeBigInt(actualUsage.totalStarts);
@@ -137,7 +139,8 @@ function deriveProviderCapacityDebtSnapshot({
   const hasWork = providerLowerBoundRequiredCalls > 0n || fanDataPendingJobs > 0 || campaignDirectoryDueCreators > 0;
   if (!actualUsageAccountingComplete) overloadedReasons.push("ACTUAL_USAGE_ACCOUNTING_INCOMPLETE");
   if (!backgroundOtherCallCardinalityKnown) overloadedReasons.push("FUTURE_DEBT_COVERAGE_PARTIAL");
-  const status = (!actualUsageAccountingComplete || !backgroundOtherCallCardinalityKnown)
+  if (!projectionComplete) overloadedReasons.push("CAPACITY_PROJECTION_REBUILD_OR_LAG");
+  const status = (!projectionComplete || !actualUsageAccountingComplete || !backgroundOtherCallCardinalityKnown)
     ? "UNKNOWN"
     : (overloadedReasons.length ? "OVERLOADED" : (hasWork ? "PRESSURED" : "HEALTHY"));
   const topology = providerCapacityTopologyContract();
@@ -150,6 +153,8 @@ function deriveProviderCapacityDebtSnapshot({
   return {
     id: PROVIDER_CAPACITY_STATE_ID,
     sourceVersion: PROVIDER_CAPACITY_SOURCE_VERSION,
+    projectionRevision: nonNegativeBigInt(projection.revision),
+    projectionCoverageStatus: projectionComplete ? "COMPLETE_AT_SAMPLE" : "PARTIAL",
     sampledAt,
     status,
     overloadReason: overloadedReasons.length ? overloadedReasons.join(",") : null,
@@ -272,6 +277,10 @@ async function readCanonicalCapacityInputs({ db, now = new Date() } = {}) {
     FROM directory CROSS JOIN fan CROSS JOIN jobs CROSS JOIN background_other LEFT JOIN usage ON TRUE
   `, authorityNow, DEFAULT_CAMPAIGN_DIRECTORY_PAGE_SIZE, BACKGROUND_OTHER_PROVIDER_JOB_KEYS);
   const row = Array.isArray(rows) ? rows[0] : rows;
+  return capacityInputsFromRow(row);
+}
+
+function capacityInputsFromRow(row) {
   return {
     supported: true,
     campaignDirectory: {
@@ -307,6 +316,8 @@ async function readCanonicalCapacityInputs({ db, now = new Date() } = {}) {
 }
 
 async function persistProviderCapacityDebtSnapshot({ db, snapshot } = {}) {
+  const context = require("./db-commit-kernel").currentCommitContext();
+  if (!context || context.tx !== db) throw Object.assign(new Error("CAPACITY_PUBLICATION_OWNER_REQUIRED"), { code: "CAPACITY_PUBLICATION_OWNER_REQUIRED" });
   if (typeof db?.$queryRawUnsafe !== "function") return { persisted: false, reason: "raw_sql_unavailable", snapshot };
   const rows = await db.$queryRawUnsafe(`
     INSERT INTO "ProviderCapacityDebtState" (
@@ -325,12 +336,14 @@ async function persistProviderCapacityDebtSnapshot({ db, snapshot } = {}) {
       "futureDebtCoverageStatus","futureDebtCoverageReason",
       "topologyVersion","topologyId","topologyScope","topologyShardCount","topologyShardingAllowed",
       "controlMode","controlReason","operatorActionRequired","campaignDirectoryAdmissionBudgetCalls","campaignDirectoryGuaranteedCallsPerSweep",
-      "createdAt","updatedAt"
+      "projectionRevision","projectionCoverageStatus","createdAt","updatedAt"
     ) VALUES (
-      $1,$2,$3,1,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+      $1,$2,$3,1,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,$52,$53,$54,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
     )
     ON CONFLICT ("id") DO UPDATE SET
       "sourceVersion"=EXCLUDED."sourceVersion",
+      "projectionRevision"=EXCLUDED."projectionRevision",
+      "projectionCoverageStatus"=EXCLUDED."projectionCoverageStatus",
       "sampledAt"=EXCLUDED."sampledAt",
       "revision"="ProviderCapacityDebtState"."revision" + 1,
       "status"=EXCLUDED."status",
@@ -399,16 +412,19 @@ async function persistProviderCapacityDebtSnapshot({ db, snapshot } = {}) {
   snapshot.backgroundOtherPendingJobs, snapshot.backgroundOtherOldestScheduledAt, snapshot.backgroundOtherPendingJobClasses, snapshot.backgroundOtherCallCardinalityKnown,
   snapshot.futureDebtCoverageStatus, snapshot.futureDebtCoverageReason,
   snapshot.topologyVersion, snapshot.topologyId, snapshot.topologyScope, snapshot.topologyShardCount, snapshot.topologyShardingAllowed,
-  snapshot.controlMode, snapshot.controlReason, snapshot.operatorActionRequired, snapshot.campaignDirectoryAdmissionBudgetCalls, snapshot.campaignDirectoryGuaranteedCallsPerSweep);
-  return { persisted: true, snapshot: (Array.isArray(rows) ? rows[0] : rows) || snapshot };
+  snapshot.controlMode, snapshot.controlReason, snapshot.operatorActionRequired, snapshot.campaignDirectoryAdmissionBudgetCalls, snapshot.campaignDirectoryGuaranteedCallsPerSweep, snapshot.projectionRevision, snapshot.projectionCoverageStatus);
+  const saved = (Array.isArray(rows) ? rows[0] : rows) || null;
+  return { persisted: Boolean(saved), snapshot: saved };
 }
 
-async function refreshProviderCapacityDebtSnapshot({ db, now = new Date() } = {}) {
-  const inputs = await readCanonicalCapacityInputs({ db, now });
-  if (!inputs.supported) return { ok: false, persisted: false, reason: inputs.reason };
-  const snapshot = deriveProviderCapacityDebtSnapshot({ now, ...inputs });
-  const persisted = await persistProviderCapacityDebtSnapshot({ db, snapshot });
-  return { ok: persisted.persisted === true, ...persisted, computed: snapshot };
+async function refreshProviderCapacityDebtSnapshot({ db, batchSize } = {}) {
+  const { runProviderCapacityProjectionBatch } = require("./provider-capacity-projection-service");
+  return runProviderCapacityProjectionBatch({ db, batchSize, publish: async ({ db: tx, row, now }) => {
+    const inputs = capacityInputsFromRow(row);
+    const snapshot = deriveProviderCapacityDebtSnapshot({ now, ...inputs, projection: { complete: row.projectionComplete === true, revision: row.revision } });
+    const persisted = await persistProviderCapacityDebtSnapshot({ db: tx, snapshot });
+    return { ok: persisted.persisted === true, ...persisted, computed: snapshot };
+  }});
 }
 
 async function readProviderCapacityDebtSnapshot({ db } = {}) {
