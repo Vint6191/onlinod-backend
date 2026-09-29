@@ -44,3 +44,14 @@ test("HTTP v2 identity comes exclusively from admitted auth, cancellation is exp
     assert.deepEqual(calls.map(c => [c.agencyId, c.userId, c.actorDeviceId, c.cancel]), [["auth-agency", "auth-user", "auth-device", false], ["auth-agency", "auth-user", "auth-device", true]]);
   } finally { if (previous) require.cache[servicePath] = previous; else delete require.cache[servicePath]; }
 });
+
+test('invalid business payload can be cancelled without weakening envelope or repurposing UUID', () => {
+  const invalid=command({payload:{label:[]}});
+  assert.throws(()=>parseCommand(invalid));
+  const cancelled=parseCommand(invalid,{cancel:true});
+  assert.notEqual(cancelled.fingerprint,parseCommand({...invalid,payload:{label:'Corrected'}}).fingerprint);
+  const valid=command();assert.equal(parseCommand(valid).fingerprint,parseCommand(valid,{cancel:true}).fingerprint);
+  assert.throws(()=>parseCommand({...invalid,commandId:'bad'},{cancel:true}));
+  assert.throws(()=>parseCommand({...invalid,payload:{label:'a'.repeat(1024*1024)}},{cancel:true}),{code:'TEAM_COMMAND_TOO_LARGE'});
+  assert.equal(parseCommand(command({targetId:'wrong'}),{cancel:true}).targetId,'wrong');
+});

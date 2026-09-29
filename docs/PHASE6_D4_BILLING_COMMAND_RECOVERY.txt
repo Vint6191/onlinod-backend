@@ -1,0 +1,251 @@
+================================================================================
+ONLINOD — PHASE 6 / D4 BILLING COMMAND RECOVERY
+Накопительное продолжение D3. Дата: 2026-09-29.
+================================================================================
+
+0. ЧТО СДЕЛАНО И ТЕКУЩИЙ ВЕРДИКТ
+
+Реализован связанный цикл пополнения баланса: Desktop -> сохранённое намерение
+-> серверная резервация BillingOrder -> один запрос создания внешнего счёта
+-> приём результата/неизвестного исхода -> восстановление после перезапуска
+-> подтверждение доставки результата Renderer. Проверены гонки с настоящей
+серверной обработкой подписанного IPN, пополнением и возвратом wallet ledger.
+Resume существующего счёта теперь проверяет актуальную серверную authority.
+В общий recovery включено исправление отмены некорректной Team-команды.
+
+Рабочие исходники изменены в копиях phase6-d4-backend / phase6-d4-desktop.
+D4 — исходный пакет указанного узла. Фаза 6 и весь узел 6D ещё открыты.
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ D4: ПОКА НЕТ.
+Архивы содержат накопительные исходники, не установщики и не готовый dist.
+Полные Desktop typecheck/build: BLOCKED — tsc отсутствует, exit 127.
+Реальные Electron/NOWPayments и многосессионная нагрузка PostgreSQL не запускались.
+Внешние DB/SQL/Render/Neon не открывались. Деплоя и production-нагрузки не было.
+
+1. АКТУАЛ, ПРЕЕМСТВЕННОСТЬ, ИСТОЧНИКИ
+
+Работа продолжена по двум новым присланным архивам:
+91.zip
+SHA256 9af7200b35cb06f83af472ce595b4ee5443bf6a1f4d9840c7b058b67452e911c
+1196 файлов: каждый предоставленный файл совпал с D3. Не хватает только
+15 исторических docs (13 предыдущих + D2/D3). Production-различий нет.
+
+onlinod-backend-main - 2026-09-29T220457.918.zip
+SHA256 63f3a51b4612bbb52e92f4ef87fe1dfb927e7118e2e84f02e459b3a5c0028661
+Все 1275 файлов совпали с D3. Новый Render-лог к этим архивам не предоставлен;
+совпадение исходников не подтверждает установку или применение миграций.
+
+Исторические docs восстановлены из проверенного D3. Предыдущий накопительный
+чекпоинт D3 сохранён полностью, без переписывания его байтов, перед этим разделом.
+D3 checkpoint: 957896 bytes,
+SHA256 f83fcd24b21f2e0157aa478762e4f4fc35e2b6dbc5480f1868063a06fdee4c9f.
+Предыдущий cumulative evidence D3 вложен целиком в новый evidence ZIP.
+Все исходные архивы и родительские деревья D3 сохранены без изменений.
+
+2. ПОДТВЕРЖДЁННЫЕ ПРОБЛЕМЫ ПРЕЖНЕГО КОДА
+
+В исходном активном createWalletTopUpCheckout результат /invoice записывался
+обычным update по id. При опережающем IPN поздний success менял PAID обратно
+на CHECKOUT_CREATED; поздняя ошибка меняла PAID на FAILED. Оба сценария
+воспроизведены на неизменённом D3, совпадающем с новым Backend-архивом:
+evidence/reproduce-input.cjs и reproduced-input.log. Провайдер был синтетическим.
+
+Существующий FAILED sandbox-заказ без invoice ID/URL мог быть сброшен в CREATED
+для нового POST. Ошибка транспорта не доказывает, что внешний счёт не создан.
+
+Desktop хранил checkoutKey/amount в памяти и очищал ключ после ответа Backend,
+до гарантированной доставки результата Renderer. После потери ответа/перезапуска
+другой вызов мог получить новый ID. Отдельного сохранённого recovery не было.
+
+Team cancel проверял бизнес-payload через тот же строгий parser, что execute.
+Отклонённая команда с ошибочными полями оставалась в Desktop journal и не могла
+быть отменена. D3 исправлял этот случай для Message Library; D4 закрыл его и
+для Team, сохранив нормализацию fingerprint валидных команд v2.
+
+3. BACKEND: ВЛАДЕЛЕЦ ОСТАЁТСЯ BILLINGORDER
+
+Новый маршрут POST /api/billing/wallet/top-up/v2 принимает:
+commandId UUID, action=wallet.topup, targetId="",
+payload={amountCents: целое 100..10000000, testMode: boolean}.
+Envelope и payload строгие. Agency/user берутся из auth, не из Renderer.
+UUID нормализуется в lower-case. Сумма связана с существующим requestHash.
+Существующий заказ также связан с createdByUserId; другой actor не присваивает
+его UUID. Sandbox/live не могут незаметно сменить смысл того же намерения.
+Серверный mutex на agency/UUID и проверка противоположного testMode защищают
+идентичность при смене окружения. Повтор старого окружения может вернуть
+метаданные своего заказа, но не чужой по окружению платёжный URL.
+
+Порядок создания:
+- Короткий commit: текущие agency/user/member/epoch, OWNER, поиск резервации,
+  проверки суммы/окружения/FREE_INTERNAL, создание BillingOrder CREATED.
+- После commit создатель резервации делает единственный provider POST.
+- Короткое сохранение метаданных. Статус CHECKOUT_CREATED присваивается только
+  через CAS по CREATED. Более поздние PROCESSING/PARTIALLY_PAID/PAID/REFUNDED/
+  EXPIRED/FAILED/CANCELLED не откатываются.
+- Перед выдачей результата/URL заново проверяются текущие права и accessEpoch.
+
+Один BillingOrder остаётся канонической резервацией; отдельная таблица HTTP-
+квитанций для денег не введена. P2002 читается после выхода из неудачной
+транзакции, на новом корне. Внешний HTTP не находится внутри DB retry callback.
+Ни HTTP replay, ни старый FAILED sandbox-заказ не запускают второй invoice POST.
+После таймаута/повреждённого ответа условная запись сохраняет
+providerStatus=INVOICE_OUTCOME_UNKNOWN лишь для ещё CREATED заказа без invoice.
+Это не отменяет и не затирает опережающий IPN.
+
+Ответ содержит commandId, canonical order, checkoutUrl, recoveryNote,
+recoveryPending. Терминальный заказ не открывается как новый checkout.
+Неизвестный или недоступный в текущем окружении незавершённый счёт остаётся
+recoveryPending=true. Повтор читает существующую резервацию.
+
+POST /wallet/top-up без v2 возвращает 410 BILLING_COMMAND_CLIENT_UPGRADE_REQUIRED.
+При будущем внедрении Backend/Desktop требуют согласованного обновления.
+POST /orders/:orderId/resume использует текущую live authority владельца.
+Старые /quote и /checkout остаются 410. Неиспользуемый legacy createCheckout
+не объявляется новым проверенным платёжным маршрутом.
+
+Обработка HMAC IPN, монотонный payment status, idempotency keys topup:<orderId>
+и topup-refund:<orderId>, раздельные sandbox/live wallets сохранены.
+Audit создания счёта остаётся существующим best effort. Его ошибка не является
+доказательством отсутствия платежа. Требование обязательного transactional
+AuditLog из Team/Message Library не перенесено механически на внешний invoice.
+Другие Billing-команды (preferences/start/cancel-renewal/reconcile) не объявлены
+полностью повторно проверенными этим D4.
+
+4. DESKTOP И ЧЕСТНОЕ ВОССТАНОВЛЕНИЕ НЕИЗВЕСТНОГО ИСХОДА
+
+Settings использует общий DurableCommandTransport и отдельный файл
+billing-checkout-pending-v1.json. До HTTP атомарно записываются UUID, amount,
+testMode и namespace principal (backend/user/agency). Один unresolved slot
+wallet.topup на principal. Журнал сохраняется при shutdown/logout/account switch.
+Новый principal не читает и не подтверждает записи предыдущего аккаунта.
+Общие лимиты 32 записи/4 MiB сохранены; payload Billing ограничен 1 KiB.
+Токены, платёжные URL, provider secrets в журнал не записываются.
+
+В Plan & Billing есть панель незавершённых действий с Recover.
+RPC: billingCheckoutCommands.listPending / retry / acknowledge.
+Автоматического provider resend при монтировании UI или старте Desktop нет.
+Cancel для Billing отсутствует в RPC/UI и запрещён самим transport config:
+неизвестный внешний результат нельзя объявить отменённым локальным действием.
+
+ACK разрешён только при recoveryPending=false. Неизвестный исход не удаляется
+из журнала даже после успешной доставки HTTP/IPC-ответа: повторный Top up той же
+суммы сохраняет UUID, новая сумма или окружение блокируются до разрешения
+старого действия. Renderer также не отправляет ACK для recoveryPending=true.
+После подтверждённого результата потеря ACK-ответа не превращается в ошибку,
+которая приглашала бы создать ещё один платёж.
+
+Перед открытием checkout и после асинхронного результата проверяется permit.
+Смена principal закрывает платёжное окно; поздний ответ не открывается в новой
+сессии. Resume тоже проверяет permit после HTTP. Ошибка открытия окна возвращает
+уже известный order с подсказкой открыть его из Payment history.
+
+Существенное ограничение: локальная резервация не способна восстановить
+потерянный invoice URL, если провайдер не вернул ни ответ, ни проверяемое
+уведомление. Такой случай остаётся unresolved до подтверждения исхода по
+существующему заказу/провайдеру. Новый автоматический счёт и фиктивная отмена
+не используются для обхода этой неопределённости. Самостоятельный операторский
+workflow доказанного NO_EFFECT этим проходом не добавлялся.
+
+5. TEAM: ОТМЕНА ОШИБОЧНОГО НАМЕРЕНИЯ
+
+parseCommand(input,{cancel}) всегда валидирует UUID/envelope и предел payload
+1 MiB. Валидный бизнес-payload нормализуется прежней схемой v2; его fingerprint
+не меняется. Для cancel ошибочный payload допускается как bounded raw intent.
+Текущая membership всё равно проверяется под серверной authority. Cancel
+сохраняет ABANDONED, повтор cancel возвращает ту же развязку. Исправленный payload
+с тем же UUID получает TEAM_COMMAND_INTENT_MISMATCH. Отмена после commit не
+откатывает выполненную операцию. SQL-проверка использует реальный receipt.
+
+6. ПРОВЕРКИ И ИХ ГРАНИЦЫ
+
+Backend целевой набор: 155 PASS, 0 FAIL, 0 SKIP.
+Включены новые Billing-сценарии, прежние NOWPayments/IPN/wallet проверки,
+Team v2, commit kernel и Message Library command service.
+Desktop целевой набор: 51 PASS, 0 FAIL, 0 SKIP.
+Реальный исходный TS исполняется через native stripTypeScriptTypes/VM;
+журнал работает с настоящей локальной файловой системой. Electron заменён
+управляемой границей. Проверены HTTP/IPC loss, restart, amount/mode conflict,
+неизвестный исход и запрет ACK/cancel, current authority, окно, disk failure,
+повреждение журнала и разделение principal. Проверены Team/Message Library
+после расширения общего transport и прежний Billing read recovery.
+
+SQL: 16 PASS на итоговом исходном пакете.
+Полная текущая цепочка миграций + Prisma 5.22 + PGlite 0.5.8 / socket 0.2.11.
+Настоящие route handlers, live authority, BillingOrder, TeamMutationReceipt,
+HMAC IPN и wallet ledger. Проверены success/error после PAID/REFUNDED, повторное
+подписанное уведомление с другим delivery payload, единственный кредит/возврат,
+повтор UUID, конкурентный читатель резервации во время внешнего I/O, смена
+окружения, отзыв/понижение OWNER, stale epoch, tenant isolation и legacy 410.
+BillingOrder lookup использует индекс. Это сериализованный локальный engine,
+не доказательство независимых PostgreSQL-сессий и не SCALE CLOSED.
+
+Сохранены промежуточные неуспешные запуски proof и объяснение fixture:
+- Повтор точно того же IPN event вызывал P2002 и обрыв PGlite wire connection.
+  Итоговый SQL повторяет финансовое событие с другим подписанным delivery
+  payload. Точный duplicate event покрывается существующими unit-тестами.
+- Disable sole owner нарушал уже существующий generation/single-owner gate.
+  Итоговая fixture передаёт ownership в той же транзакции и явно проверяет,
+  что disabledAt действительно сохранён. Триггеры не отключались.
+- Понижение OWNER увеличивает accessEpoch. Проверены оба ответа: stale admitted
+  membership отклоняется; свежий ADMIN также не получает owner-authority.
+
+Синтаксис изменённых файлов: 14 JS/CJS/MJS, 8 TS/TSX — PASS.
+TS parse не заменяет typecheck. Prisma validate — PASS. Новых миграций D4 нет;
+schema и все существующие migration.sql совпадают с D3.
+Полные npm run typecheck и npm run build — exit 127, tsc: not found.
+
+Дополнительно запущены старые Desktop billing suites: 10 PASS / 4 FAIL.
+Те же четыре блокирующих причины есть в неизменённом D3: отсутствующий dist,
+устаревший шаблон AuthSessionStore, два старых Browser SHA-pinning assertions.
+На D3 тот набор даёт 9 PASS / 5 FAIL: ещё один прежний шаблон scopeChanged
+обновлён на уже существующий principalScopeChanged. Изменённые ожидания
+текущего billing-контракта приведены к durable intent и recoveryPending.
+Артефакты этих запусков сохранены; весь исторический suite не объявлен зелёным.
+
+7. ОСТАТОК 6D И ДАЛЬШЕ
+
+Инвентаризация обновлена: 390 literal POST/PUT/PATCH/DELETE declarations:
+294 mounted non-admin, 59 unmounted source, 37 admin вне этого 6D scope.
+244 mounted declarations пока имеют INVENTORY_ONLY. Это счётчик поверхности:
+в него входят POST-чтения, факты наблюдения, heartbeat, lease/settlement и
+команды с уже существующими владельцами. Он не является оценкой числа багов.
+D4 отдельно помечает v2 top-up/resume и retired old top-up.
+
+owner-review.json/txt содержит исходные файлы, SHA256 и различённые статусы
+BEHAVIOR_SQL, SOURCE_REVIEW_OPEN, EXISTING_PROTOCOL_IDENTIFIED_OPEN,
+PENDING_DEEP_REVIEW. Source-only чтение не засчитано как тестовое закрытие.
+
+Следующий связанный объём 6D:
+1) Управляющие записи Settings/creator/network и secret/session/keyring recovery.
+   У generic pool proxy create нет command ID; Desktop использует другой,
+   creator-bound CAS маршрут. Нужно проверить допустимость первого маршрута,
+   live writer authority/disable race и сохранение результата второго вместе.
+   Секреты не должны попадать в общий JSON journal.
+2) Согласовать CustomOrder create/reconcile и delivery/Telegram owners. В create
+   есть P2002 catch с чтением того же tx — кандидат на PostgreSQL replay-gap;
+   он требует воспроизведения/исправления на своём владельце. Не считать
+   имеющийся clientMutationId доказательством закрытия остальных subcommands.
+3) Довести job/progress, programmatic writes/settlement, observations/refresh,
+   module controls по их существующим revision/token/generation контрактам.
+   Сохранить право узкого settlement после commit и запрет UNKNOWN resend.
+
+После 6D остаются 6E (Chromium: pending bounds, fairness, host pressure) и
+6F (сквозная приёмка, полноценный build, реальный Electron/несколько ПК,
+независимые PostgreSQL-сессии и целевая нагрузка). Полный аудит этих остаточных
+семейств и их реализация этим пакетом не заявляются. Процент завершённости
+по одному количеству маршрутов не рассчитывался.
+
+8. СОСТАВ НАКОПИТЕЛЬНОЙ ПОСТАВКИ
+
+Backend target: 1279 файлов; delta к D3: 11;
+cumulative changed-only к исходному I7: 69.
+Desktop target: 1213 файлов; delta к D3: 13;
+cumulative changed-only к исходному Desktop77: 121.
+Все ZIP проверены testzip и overlay manifest. Проверены исходные базисы,
+предыдущие D1/D2/D3 и новые присланные Backend/91. Удалений файлов нет.
+Накопительные ZIP включают предыдущие необходимые миграции/изменения; у D4
+собственной новой миграции нет. Контрольные суммы перечислены в SHA256.txt.
+
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ: ПОКА НЕТ.
+Продолжение начинает с итоговых D4 исходников и этого накопительного чекпоинта,
+сохраняя предыдущие решения и подтверждённые границы.
+================================================================================

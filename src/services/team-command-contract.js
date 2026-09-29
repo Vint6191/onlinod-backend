@@ -82,11 +82,17 @@ function canonical(value) {
   return value;
 }
 function digest(value) { return crypto.createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex"); }
-function parseCommand(input) {
+function parseCommand(input, { cancel = false } = {}) {
   const command = envelope.parse(input);
   command.commandId = command.commandId.toLowerCase();
-  command.payload = ACTIONS[command.action].parse(command.payload);
-  if (command.action.endsWith(".create") ? command.targetId !== "" : !command.targetId) {
+  if (Buffer.byteLength(JSON.stringify(command.payload)) > 1024 * 1024)
+    throw Object.assign(new Error("Command payload exceeds 1 MiB"), { status: 413, code: "TEAM_COMMAND_TOO_LARGE" });
+  const parsed = ACTIONS[command.action].safeParse(command.payload);
+  // Retain v2 canonical fingerprints for every valid intent. Invalid business
+  // input must still be cancellable, or a durable Desktop slot is stuck forever.
+  if (parsed.success) command.payload = parsed.data;
+  else if (!cancel) throw parsed.error;
+  if (!cancel && (command.action.endsWith(".create") ? command.targetId !== "" : !command.targetId)) {
     throw Object.assign(new Error("Command target does not match the action"), { status: 400, code: "TEAM_COMMAND_TARGET_INVALID" });
   }
   const fingerprint = digest({ version: 2, action: command.action, targetId: command.targetId, payload: command.payload });

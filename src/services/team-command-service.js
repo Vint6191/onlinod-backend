@@ -122,7 +122,7 @@ async function saveReceipt(tx, id, agencyId, userId, command, status, result, au
   if (inserted.length !== 1) throw Object.assign(new Error("Concurrent Team receipt"), { code: "40001" });
 }
 async function executeTeamCommand({ db = prisma, agencyId, userId, actorDeviceId = null, input, cancel = false }) {
-  const command = parseCommand(input);
+  const command = parseCommand(input, { cancel });
   if (!agencyId || !userId) throw fail("TEAM_COMMAND_IDENTITY_REQUIRED", "Authenticated agency and user are required", 403);
   const id = "team_v2_" + digest([agencyId, userId, command.commandId]);
   const execute = () => runRootCommit(db, async context => {

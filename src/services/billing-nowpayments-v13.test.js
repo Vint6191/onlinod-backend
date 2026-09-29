@@ -1234,11 +1234,13 @@ test("V14.9 sandbox invoice creation rejects production NOWPayments hosted URLs 
   const db = {
     systemSetting: policyModelFixture(),
     $executeRawUnsafe: async () => 0,
+    $transaction: async fn => fn({ ...db, $transaction: undefined }),
     agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "PRO" }) },
     agencySubscription: { findFirst: async () => ({ billingMode: "MANUAL" }) },
     billingOrder: {
-      findUnique: async () => null,
+      findUnique: async ({ where }) => order && where.id === order.id ? { ...order } : null,
       create: async ({ data }) => { order = { id: "order-safe", providerInvoiceId: null, providerInvoiceUrl: null, providerStatus: null, paidAt: null, activatedAt: null, expiresAt: null, createdAt: new Date(), updatedAt: new Date(), lines: [], ...data }; return { ...order }; },
+      updateMany: async ({ where, data }) => { if (!order || !Object.entries(where).every(([k,v]) => order[k] === v)) return { count: 0 }; order = { ...order, ...data }; return { count: 1 }; },
       update: async ({ data }) => { order = { ...order, ...data, updatedAt: new Date() }; return { ...order }; },
     },
   };
@@ -1250,7 +1252,8 @@ test("V14.9 sandbox invoice creation rejects production NOWPayments hosted URLs 
       service.createWalletTopUpCheckout({ agencyId: "agency-1", actorUserId: "owner-1", checkoutKey: "123e4567-e89b-42d3-a456-426614174999", amountCents: 6000, db }),
       (err) => err?.code === "BILLING_SANDBOX_HOSTED_CHECKOUT_UNAVAILABLE",
     );
-    assert.equal(order.status, "FAILED");
+    assert.equal(order.status, "CREATED");
+    assert.equal(order.providerStatus, "INVOICE_OUTCOME_UNKNOWN");
     assert.equal(order.providerInvoiceUrl, null);
   } finally { global.fetch = oldFetch; }
 }));
@@ -1262,11 +1265,13 @@ test("V14.9 invoice amount remains bound to the ONLINOD top-up before any hosted
   const db = {
     systemSetting: policyModelFixture(),
     $executeRawUnsafe: async () => 0,
+    $transaction: async fn => fn({ ...db, $transaction: undefined }),
     agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "PRO" }) },
     agencySubscription: { findFirst: async () => ({ billingMode: "MANUAL" }) },
     billingOrder: {
-      findUnique: async () => null,
+      findUnique: async ({ where }) => order && where.id === order.id ? { ...order } : null,
       create: async ({ data }) => { order = { id: "order-amount", providerInvoiceId: null, providerInvoiceUrl: null, providerStatus: null, paidAt: null, activatedAt: null, expiresAt: null, createdAt: new Date(), updatedAt: new Date(), lines: [], ...data }; return { ...order }; },
+      updateMany: async ({ where, data }) => { if (!order || !Object.entries(where).every(([k,v]) => order[k] === v)) return { count: 0 }; order = { ...order, ...data }; return { count: 1 }; },
       update: async ({ data }) => { order = { ...order, ...data, updatedAt: new Date() }; return { ...order }; },
     },
   };
@@ -1278,7 +1283,8 @@ test("V14.9 invoice amount remains bound to the ONLINOD top-up before any hosted
       service.createWalletTopUpCheckout({ agencyId: "agency-1", actorUserId: "owner-1", checkoutKey: "123e4567-e89b-42d3-a456-426614174998", amountCents: 6000, db }),
       (err) => err?.code === "BILLING_PROVIDER_AMOUNT_MISMATCH",
     );
-    assert.equal(order.status, "FAILED");
+    assert.equal(order.status, "CREATED");
+    assert.equal(order.providerStatus, "INVOICE_OUTCOME_UNKNOWN");
     assert.equal(order.providerInvoiceUrl, null);
   } finally { global.fetch = oldFetch; }
 }));

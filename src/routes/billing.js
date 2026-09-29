@@ -4,7 +4,6 @@ const express = require("express");
 const { authRequired } = require("../middleware/auth");
 const { isOwner } = require("../services/team-access-control");
 const {
-  createWalletTopUpCheckout,
   resumeCheckout,
   handleNowPaymentsIpn,
   reconcileOrder,
@@ -18,6 +17,7 @@ const {
   publicBillingPeriod,
 } = require("../services/billing-wallet-service");
 const { publicEntitlement } = require("../services/billing-entitlement-service");
+const { executeBillingCheckoutCommand, billingCheckoutAuthority } = require("../services/billing-checkout-command-service");
 
 const router = express.Router();
 
@@ -71,13 +71,15 @@ router.post("/checkout", (_req, res) => {
   return res.status(410).json({ ok: false, code: "BILLING_DIRECT_CHECKOUT_DEPRECATED", error: "Creator checkout was replaced by wallet billing. Top up the workspace balance and start a monthly creator subscription." });
 });
 
-router.post("/wallet/top-up", async (req, res) => {
+router.post("/wallet/top-up", (_req, res) => res.status(410).json({ ok: false, code: "BILLING_COMMAND_CLIENT_UPGRADE_REQUIRED", error: "Update ONLINOD to recover top-ups safely" }));
+
+router.post("/wallet/top-up/v2", async (req, res) => {
   try {
-    const result = await createWalletTopUpCheckout({
+    const result = await executeBillingCheckoutCommand({
       agencyId: req.auth.agencyId,
-      actorUserId: req.auth.userId,
-      checkoutKey: req.body?.checkoutKey,
-      amountCents: req.body?.amountCents,
+      userId: req.auth.userId,
+      actorMember: req.auth.membership,
+      input: req.body,
     });
     return res.status(201).json({ ok: true, ...result });
   } catch (err) {
@@ -87,7 +89,8 @@ router.post("/wallet/top-up", async (req, res) => {
 
 router.post("/orders/:orderId/resume", async (req, res) => {
   try {
-    const result = await resumeCheckout({ agencyId: req.auth.agencyId, orderId: req.params.orderId });
+    const result = await resumeCheckout({ agencyId: req.auth.agencyId, orderId: req.params.orderId,
+      authorize: billingCheckoutAuthority({ agencyId: req.auth.agencyId, userId: req.auth.userId, actorMember: req.auth.membership }) });
     return res.json({ ok: true, ...result });
   } catch (err) {
     return sendError(res, err, "BILLING_CHECKOUT_RESUME_FAILED");

@@ -496,10 +496,14 @@ function validateInvoiceResponseForOrder(order, invoice) {
   }
 }
 
-async function resumeCheckout({ agencyId, orderId, db = null }) {
+async function resumeCheckout({ agencyId, orderId, authorize = null, db = null }) {
   const client = db || prisma;
   const cfg = providerConfig();
-  const order = await client.billingOrder.findFirst({ where: { id: clean(orderId, 180), agencyId } });
+  const read = async tx => {
+    await authorize?.(tx);
+    return tx.billingOrder.findFirst({ where: { id: clean(orderId, 180), agencyId } });
+  };
+  const order = authorize ? await runTransaction(client, read) : await read(client);
   if (!order) {
     const err = new Error("Billing order not found");
     err.code = "BILLING_ORDER_NOT_FOUND";
@@ -681,98 +685,118 @@ function normalizeTopUpAmountCents(value) {
   return amount;
 }
 
-async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutKey, amountCents: rawAmountCents, db = null }) {
+// An invoice POST has an uncertain external outcome on timeout/crash. The
+// committed BillingOrder is the reservation: only its creator calls the provider.
+// Replays never resubmit that POST, including sandbox and old FAILED orders.
+async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutKey,
+  amountCents: rawAmountCents, expectedTestMode, authorize = null, recoverReserved = false, db = null }) {
   const client = db || prisma;
   const cfg = providerConfig();
-  if (!cfg.configured) {
-    const err = new Error("NOWPayments checkout is not configured on the backend");
-    err.code = "NOWPAYMENTS_NOT_CONFIGURED";
-    err.status = 503;
-    throw err;
-  }
   const checkoutKey = normalizeCheckoutKey(rawCheckoutKey);
   const amountCents = normalizeTopUpAmountCents(rawAmountCents);
+  const testMode = expectedTestMode === undefined ? cfg.sandbox : expectedTestMode;
   const requestHash = sha256(stableJson({ purpose: "WALLET_TOP_UP", amountCents, currency: "USD" }));
-  const existing = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
-  assertCheckoutRequestBinding(existing, requestHash);
-  const retryFailedSandboxOrder = !!(existing && cfg.sandbox && existing.status === "FAILED" && !existing.providerInvoiceId && !existing.providerInvoiceUrl);
-  if (existing && !retryFailedSandboxOrder) return replayExistingCheckout(existing);
-
-  const [agency, subscription] = await Promise.all([
-    client.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true } }),
-    client.agencySubscription.findFirst({ where: { agencyId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }),
-  ]);
-  if (!agency) {
-    const err = new Error("Agency not found");
-    err.code = "BILLING_AGENCY_NOT_FOUND";
-    err.status = 404;
-    throw err;
-  }
-  if (subscription?.billingMode === "FREE_INTERNAL" && cfg.live) {
-    const err = new Error("This workspace is in FREE_INTERNAL mode; live checkout is disabled to prevent accidental charges");
-    err.code = "BILLING_FREE_INTERNAL_LIVE_CHECKOUT_DISABLED";
-    err.status = 409;
-    throw err;
-  }
-
-  const snapshot = { purpose: "WALLET_TOP_UP", agencyName: agency.name, plan: agency.plan, amountCents, currency: "USD" };
-  let order;
+  const where = checkoutKeyWhere(agencyId, testMode, checkoutKey);
+  const bind = (order) => {
+    assertCheckoutRequestBinding(order, requestHash);
+    if (order && authorize && order.createdByUserId !== actorUserId)
+      throw permanentBindingError("Checkout belongs to another actor", "BILLING_CHECKOUT_ACTOR_MISMATCH");
+    return order;
+  };
+  const readCurrent = () => runTransaction(client, async tx => {
+    await authorize?.(tx);
+    return bind(await tx.billingOrder.findUnique({ where }));
+  });
+  const resultFor = (order, replayed) => {
+    if (!order) throw permanentBindingError("Billing order not found", "BILLING_ORDER_NOT_FOUND");
+    if (!recoverReserved) return replayExistingCheckout(order, cfg);
+    const sameEnvironment = cfg.configured && order.testMode === cfg.sandbox;
+    const checkoutUrl = sameEnvironment && !TERMINAL_ORDER_STATUSES.has(order.status)
+      ? checkoutUrlForOrder(order, cfg) : "";
+    const recoveryNote = checkoutUrl ? null : TERMINAL_ORDER_STATUSES.has(order.status)
+      ? `This order is ${String(order.status).toLowerCase()}. Review Payment history for its current status.`
+      : !sameEnvironment ? "The payment environment changed. Review this order in Payment history; no new invoice was requested."
+      : "The invoice request is recorded, but its outcome is not yet confirmed. Check Payment history before starting another top-up. Recovery will not create another invoice.";
+    const recoveryPending = !checkoutUrl && !TERMINAL_ORDER_STATUSES.has(order.status);
+    return { order: { ...publicOrder(order), ...(!sameEnvironment ? { providerInvoiceUrl: null } : {}) }, checkoutUrl, replayed, recoveryNote, recoveryPending };
+  };
+  let reservation;
   try {
-    order = retryFailedSandboxOrder
-      ? await runTransaction(client, async (tx) => tx.billingOrder.update({
-          where: { id: existing.id },
-          data: {
-            purpose: "WALLET_TOP_UP", status: "CREATED", providerStatus: null, amountCents, currency: "USD",
-            billingPeriod: "MONTHLY", periodMonths: 1, billedCreators: 0, pricingSnapshot: snapshot, requestHash,
-            providerInvoiceId: null, providerInvoiceUrl: null, paidAt: null, activatedAt: null,
-          },
-        }))
-      : await client.billingOrder.create({
-          data: {
-            agencyId, createdByUserId: actorUserId || null, provider: PROVIDER, purpose: "WALLET_TOP_UP", status: "CREATED",
-            amountCents, currency: "USD", billingPeriod: "MONTHLY", periodMonths: 1, billedCreators: 0,
-            pricingSnapshot: snapshot, requestHash, testMode: cfg.sandbox, checkoutKey,
-          },
-        });
+    reservation = await runTransaction(client, async tx => {
+      await authorize?.(tx);
+      if (recoverReserved) {
+        // UUID identity spans provider modes, including a rolling config change.
+        await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", `billing-topup-v2:${agencyId}:${checkoutKey}`);
+        const opposite = await tx.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, !testMode, checkoutKey) });
+        if (opposite) throw permanentBindingError("Checkout identity belongs to the other payment environment", "BILLING_PROVIDER_ENVIRONMENT_MISMATCH");
+      }
+      const prior = bind(await tx.billingOrder.findUnique({ where }));
+      if (prior) return { order: prior, created: false };
+      if (!cfg.configured) throw Object.assign(new Error("NOWPayments checkout is not configured on the backend"), { code: "NOWPAYMENTS_NOT_CONFIGURED", status: 503 });
+      if (testMode !== cfg.sandbox) throw permanentBindingError("Payment environment changed; refresh Plan & Billing", "BILLING_PROVIDER_ENVIRONMENT_MISMATCH");
+      const [agency, subscription] = await Promise.all([
+        tx.agency.findUnique({ where: { id: agencyId }, select: { id: true, name: true, plan: true } }),
+        tx.agencySubscription.findFirst({ where: { agencyId }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }),
+      ]);
+      if (!agency) throw Object.assign(new Error("Agency not found"), { code: "BILLING_AGENCY_NOT_FOUND", status: 404 });
+      if (subscription?.billingMode === "FREE_INTERNAL" && cfg.live)
+        throw permanentBindingError("This workspace is in FREE_INTERNAL mode; live checkout is disabled to prevent accidental charges", "BILLING_FREE_INTERNAL_LIVE_CHECKOUT_DISABLED");
+      const snapshot = { purpose: "WALLET_TOP_UP", agencyName: agency.name, plan: agency.plan, amountCents, currency: "USD" };
+      const order = await tx.billingOrder.create({ data: {
+        agencyId, createdByUserId: actorUserId || null, provider: PROVIDER, purpose: "WALLET_TOP_UP", status: "CREATED",
+        amountCents, currency: "USD", billingPeriod: "MONTHLY", periodMonths: 1, billedCreators: 0,
+        pricingSnapshot: snapshot, requestHash, testMode, checkoutKey,
+      } });
+      return { order, created: true };
+    });
   } catch (err) {
+    // The losing transaction must roll back before reading the unique winner.
     if (err?.code !== "P2002") throw err;
-    const raced = await client.billingOrder.findUnique({ where: checkoutKeyWhere(agencyId, cfg.sandbox, checkoutKey) });
+    const raced = await readCurrent();
     if (!raced) throw err;
-    assertCheckoutRequestBinding(raced, requestHash);
-    return replayExistingCheckout(raced);
+    return resultFor(raced, true);
   }
-
+  if (!reservation.created) return resultFor(reservation.order, true);
+  const order = reservation.order;
   const priceAmount = Number((amountCents / 100).toFixed(2));
   const body = {
-    price_amount: priceAmount,
-    price_currency: "usd",
-    order_id: order.id,
+    price_amount: priceAmount, price_currency: "usd", order_id: order.id,
     order_description: `ONLINOD balance top-up · $${priceAmount.toFixed(2)}`,
-    ...invoiceUrls(order.id, cfg),
-    is_fee_paid_by_user: cfg.feePaidByUser,
+    ...invoiceUrls(order.id, cfg), is_fee_paid_by_user: cfg.feePaidByUser,
   };
   try {
+    // External I/O is deliberately outside the database transaction/retry root.
     const invoice = await nowPaymentsRequest("/invoice", { method: "POST", body });
     const providerInvoiceId = clean(invoice.invoice_id ?? invoice.id, 180);
     const rawProviderInvoiceUrl = clean(invoice.invoice_url, 2000);
     validateInvoiceResponseForOrder(order, invoice);
-    if (!providerInvoiceId || !rawProviderInvoiceUrl) {
-      const err = new Error("NOWPayments invoice response did not contain invoice_id/invoice_url");
-      err.code = "NOWPAYMENTS_INVOICE_INVALID";
-      err.status = 502;
-      throw err;
-    }
+    if (!providerInvoiceId || !rawProviderInvoiceUrl)
+      throw Object.assign(new Error("NOWPayments invoice response did not contain invoice_id/invoice_url"), { code: "NOWPAYMENTS_INVOICE_INVALID", status: 502 });
     const providerInvoiceUrl = validateHostedCheckoutUrl(rawProviderInvoiceUrl, cfg);
-    const updated = await client.billingOrder.update({
-      where: { id: order.id },
-      data: { status: "CHECKOUT_CREATED", providerInvoiceId, providerInvoiceUrl, providerStatus: clean(invoice.payment_status || invoice.status, 80) || "waiting" },
+    await runTransaction(client, async tx => {
+      // IPN owns payment progress. A late invoice reply may attach metadata,
+      // but must never move PROCESSING/PAID/REFUNDED back to CHECKOUT_CREATED.
+      const fresh = await tx.billingOrder.findUnique({ where: { id: order.id } });
+      if (fresh?.providerInvoiceId && fresh.providerInvoiceId !== providerInvoiceId)
+        throw permanentBindingError("Invoice identity changed", "BILLING_PROVIDER_INVOICE_MISMATCH");
+      await tx.billingOrder.updateMany({
+        where: { id: order.id, providerInvoiceId: null }, data: { providerInvoiceId, providerInvoiceUrl },
+      });
+      await tx.billingOrder.updateMany({
+        where: { id: order.id, status: "CREATED", providerInvoiceId },
+        data: { status: "CHECKOUT_CREATED", providerStatus: clean(invoice.payment_status || invoice.status, 80) || "waiting" },
+      });
     });
-    await audit({ agencyId, actorUserId, action: "billing.wallet_top_up_checkout_created", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, testMode: cfg.sandbox, amountCents, currency: "USD" }, db: client }).catch(() => undefined);
-    return { order: publicOrder(updated), checkoutUrl: checkoutUrlForOrder(updated, cfg) };
+    await audit({ agencyId, actorUserId, action: "billing.wallet_top_up_checkout_created", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, testMode, amountCents, currency: "USD" }, db: client }).catch(() => undefined);
   } catch (err) {
-    await client.billingOrder.update({ where: { id: order.id }, data: { status: "FAILED", providerStatus: clean(err?.code || "CREATE_INVOICE_FAILED", 80) } }).catch(() => undefined);
-    throw err;
+    // Even a malformed response cannot prove that no external invoice exists.
+    // Do not label this FAILED or reopen the reservation for another POST.
+    await client.billingOrder.updateMany({ where: { id: order.id, status: "CREATED", providerInvoiceId: null },
+      data: { providerStatus: "INVOICE_OUTCOME_UNKNOWN" } }).catch(() => undefined);
+    if (!recoverReserved) throw err;
   }
+  // Revalidate the current owner/epoch before releasing an external checkout URL.
+  return resultFor(await readCurrent(), false);
 }
 
 function verifyIpnSignature(payload, signature) {

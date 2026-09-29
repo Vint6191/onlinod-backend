@@ -659,6 +659,7 @@ test("wallet top-up checkout creates a WALLET_TOP_UP order with no creator lines
           return order && where.agencyId_provider_testMode_checkoutKey && order.checkoutKey===where.agencyId_provider_testMode_checkoutKey.checkoutKey ? {...order} : null;
         },
         create:async ({data}) => { order={id:"order-top-1",providerInvoiceId:null,providerInvoiceUrl:null,providerStatus:null,paidAt:null,activatedAt:null,expiresAt:null,createdAt:new Date(),updatedAt:new Date(),lines:[],...data}; return {...order}; },
+        updateMany:async ({where,data}) => { if (!order || !Object.entries(where).every(([k,v])=>order[k]===v)) return {count:0}; order={...order,...data}; return {count:1}; },
         update:async ({where,data}) => { assert.equal(where.id,"order-top-1"); order={...order,...data,updatedAt:new Date()}; return {...order}; },
       },
     };
