@@ -58,6 +58,39 @@ const payloads = {
       vaultUploadRecipient: z.string().max(100).optional(),
     })
     .strict(),
+  "billing.preferences": z
+    .object({ expectedRevision: revision, aiChatterEnabled: z.boolean(), outreachEnabled: z.boolean() })
+    .strict(),
+  "billing.start": z
+    .object({
+      expectedRevision: revision,
+      testMode: z.boolean(),
+      expectedActive: z.boolean(),
+      expectedChargeCents: z.number().int().min(0).max(10_000_000),
+    })
+    .strict(),
+  "billing.cancelRenewal": z.object({ expectedRevision: revision }).strict(),
+  "creator.beginConnection": z
+    .object({
+      deviceId: id,
+      expectedGeneration: z.number().int().min(0),
+      expectedState: z.enum(["ENROLLMENT_REQUIRED", "CONNECTING", "CONNECTED", "RECONNECT_REQUIRED", "RECONNECTING"]),
+    })
+    .strict(),
+  "creator.telegramContact": z
+    .object({
+      telegramContact: z
+        .string()
+        .trim()
+        .max(160)
+        .regex(/^[^\r\n\t]*$/)
+        .nullable()
+        .transform((v) => v || null),
+      telegramAccountId: id.nullable(),
+      expectedContact: z.string().max(160).nullable(),
+      expectedAccountId: id.nullable(),
+    })
+    .strict(),
   "creator.create": creator,
   "creator.update": creator
     .partial()

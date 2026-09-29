@@ -48,7 +48,7 @@ async function retireCreatorWithinTransaction({
   if (!current) throw Object.assign(new Error("Creator not found"), { code: "CREATOR_NOT_FOUND", status: 404 });
 
   if (expectedUpdatedAt !== null && (!current.updatedAt || new Date(current.updatedAt).getTime() !== new Date(expectedUpdatedAt).getTime())) {
-    throw Object.assign(new Error("Creator changed; reload before removal"), {code:"ADMIN_TARGET_REVISION_CONFLICT",status:409});
+    throw Object.assign(new Error("Creator changed; reload before removal"), {code: managementActorMember ? "CREATOR_VERSION_CONFLICT" : "ADMIN_TARGET_REVISION_CONFLICT",status:409});
   }
 
   if (managementActorMember) {

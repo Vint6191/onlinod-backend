@@ -9,7 +9,7 @@ const {
   beginCreatorConnection,
   completeCreatorConnection,
   observeCreatorPlatformProfile,
-} = require("./creator-enrollment-authority-service");
+} = require(process.env.D7_ENROLLMENT_SOURCE || "./creator-enrollment-authority-service");
 const { revokeCreatorSession } = require("./creator-session-broker-service");
 
 function clone(value) { return value == null ? value : globalThis.structuredClone(value); }
@@ -68,6 +68,14 @@ function makeDb() {
 
   const tx = {
     $executeRawUnsafe: async () => 1,
+    $queryRawUnsafe: async (sql, id) => {
+      if (sql.includes('FROM "Agency"')) return [{ id: "agency-1", deletedAt: null, status: "ACTIVE" }];
+      if (sql.includes('FROM "User"')) return [{ id: "user-1" }];
+      if (sql.includes('FROM "CreatorAccount"')) return [{ id, agencyId: "agency-1" }];
+      if (sql.includes('FROM "AgencyMember"')) return [{ id: "member-1" }];
+      return [];
+    },
+    auditLog: { create: async ({ data }) => data },
     agency: { findUnique: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null },
     agencyMember: {
       findUnique: async ({ where }) => {
@@ -330,4 +338,14 @@ test("reconnect generation is an explicit crypto-shredded boundary before fresh 
   assert.ok(boundary.revision > before.revision);
   assert.equal(ctx.creator(creator.id).status, "READY");
   assert.equal(ctx.creator(creator.id).connectionState, "RECONNECTING");
+});
+
+test("D7: stale begin generation cannot advance a later connection", async () => {
+  const ctx=makeDb(),c=await draft(ctx,"stale-generation");
+  await assert.rejects(beginCreatorConnection({db:ctx.db,agencyId:"agency-1",creatorId:c.id,userId:"user-1",actorMember:ctx.member,expectedGeneration:99,expectedState:"ENROLLMENT_REQUIRED"}),{code:"CREATOR_CONNECTION_VERSION_CONFLICT"});
+  assert.equal(ctx.creator(c.id).connectionGeneration,0);
+});
+test("D7: stale begin state cannot turn a delayed click into a new enrollment", async () => {
+  const ctx=makeDb(),c=await draft(ctx,"stale-state");
+  await assert.rejects(beginCreatorConnection({db:ctx.db,agencyId:"agency-1",creatorId:c.id,userId:"user-1",actorMember:ctx.member,expectedGeneration:0,expectedState:"CONNECTED"}),{code:"CREATOR_CONNECTION_VERSION_CONFLICT"});
 });

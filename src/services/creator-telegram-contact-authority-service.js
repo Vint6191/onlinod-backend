@@ -1,4 +1,5 @@
 "use strict";
+const { currentCommitContext } = require("./db-commit-kernel");
 const { runDbTransaction } = require("./db-transaction-service");
 
 
@@ -10,8 +11,8 @@ const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 
-async function updateCreatorTelegramContact({ agencyId, actorMember, actorUserId = null, creatorId, telegramContact, telegramAccountId, db }) {
-  if (typeof db?.$transaction !== "function") throw fail("CREATOR_TELEGRAM_ACCOUNT_TRANSACTION_REQUIRED", "Telegram account assignment requires transactional storage", 503);
+async function updateCreatorTelegramContact({ agencyId, actorMember, actorUserId = null, creatorId, telegramContact, telegramAccountId, expectedContact = undefined, expectedAccountId = undefined, db }) {
+  if (typeof db?.$transaction !== "function" && currentCommitContext()?.tx !== db) throw fail("CREATOR_TELEGRAM_ACCOUNT_TRANSACTION_REQUIRED", "Telegram account assignment requires transactional storage", 503);
   return runDbTransaction(db, async (tx) => {
     // Current Telegram planning identity is a durable provider reference. Its publication must
     // serialize with both parent/creator retirement and Telegram-account retirement. Keep one
@@ -30,6 +31,10 @@ async function updateCreatorTelegramContact({ agencyId, actorMember, actorUserId
       select: { id: true, telegramContact: true, telegramUserId: true, telegramAccountId: true },
     });
     if (!existing) throw fail("CREATOR_NOT_FOUND", "Creator not found", 404);
+
+    if ((expectedContact !== undefined && (existing.telegramContact || null) !== expectedContact) ||
+        (expectedAccountId !== undefined && (existing.telegramAccountId || null) !== expectedAccountId))
+      throw fail("CREATOR_TELEGRAM_CONTACT_CHANGED", "Telegram contact changed. Refresh before saving.", 409);
 
     if (telegramAccountId) {
       await lockActiveTelegramAccountReference({

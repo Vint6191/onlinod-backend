@@ -620,13 +620,15 @@ async function setCreatorBillingPreferences({ agencyId, creatorId, aiChatterEnab
   return result.profile;
 }
 
-async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMode, now, reason, startAt = null }) {
+async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMode, now, reason, startAt = null, expectedChargeCents = undefined }) {
   now = await dbAuthorityNow({ db: tx, fallbackNow: now });
   await assertWalletDebitAllowed(tx, agencyId, testMode);
   const profile = creator.billingProfile || null;
   const revenue = await readRolling30dRevenue({ db: tx, creatorId: creator.id, now });
   const policy = await readCommercialPolicy({ db: tx, lock: true });
   const pricing = pricingFromRevenue({ profile, revenue, policy });
+  if (expectedChargeCents !== undefined && expectedChargeCents !== pricing.totalCents)
+    throw billingError("The monthly price changed. Refresh before starting.", "BILLING_QUOTE_CHANGED", 409);
   await enableCommercialPricingWrite(tx);
   const wallet = await ensureWallet(tx, agencyId, testMode);
   const balance = bigintCents(wallet.balanceCents);
@@ -757,7 +759,7 @@ async function chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMod
   return { period: { ...period, walletTransactionId: debit.transaction.id }, entitlement: updatedEntitlement, wallet: debit.wallet, pricing, transaction: debit.transaction };
 }
 
-async function startCreatorSubscription({ agencyId, creatorId, testMode = false, actorUserId = null, db = null, now = new Date() }) {
+async function startCreatorSubscription({ agencyId, creatorId, testMode = false, actorUserId = null, db = null, now = new Date(), expectedChargeCents = undefined }) {
   const client = db || prisma;
   const result = await runDbTransaction(client, async (tx) => {
     await lockAgencyBillingMutation(tx, agencyId);
@@ -767,6 +769,8 @@ async function startCreatorSubscription({ agencyId, creatorId, testMode = false,
     if (creator.billingProfile?.billingExcluded === true) throw billingError("Creator is excluded from billing", "BILLING_CREATOR_EXCLUDED");
     const entitlement = creator.billingEntitlement || null;
     if (entitlement && isFuture(entitlement.coreValidUntil, now)) {
+      if (expectedChargeCents !== undefined && expectedChargeCents !== 0)
+        throw billingError("This subscription is already active. Refresh before enabling renewal.", "BILLING_QUOTE_CHANGED", 409);
       const entitlementTestMode = entitlement.walletTestMode;
       if (entitlementTestMode !== null && entitlementTestMode !== undefined && (entitlementTestMode === true) !== (testMode === true)) {
         throw billingError("This active subscription belongs to a different billing environment", "BILLING_WALLET_ENVIRONMENT_MISMATCH", 409);
@@ -789,7 +793,7 @@ async function startCreatorSubscription({ agencyId, creatorId, testMode = false,
       });
       return { alreadyActive: true, entitlement: updated, wallet: await ensureWallet(tx, agencyId, resolvedTestMode), period: null, pricing: null, transaction: null };
     }
-    return { alreadyActive: false, ...(await chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMode, now, reason: "start" })) };
+    return { alreadyActive: false, ...(await chargeMonthlyPeriod(tx, { agencyId, creator, entitlement, testMode, now, reason: "start", expectedChargeCents })) };
   });
   await audit({ agencyId, actorUserId, action: "billing.creator_subscription_started", targetType: "creator", targetId: creatorId, metadata: { alreadyActive: result.alreadyActive === true, periodId: result.period?.id || null, amountCents: result.pricing?.totalCents || 0, testMode: testMode === true }, db: client }).catch(() => undefined);
   return result;
@@ -839,6 +843,8 @@ async function renewCreatorSubscription({ entitlement, db = null, now = new Date
       now = await dbAuthorityNow({ db: tx, fallbackNow: now });
       const freshEntitlement = await tx.creatorBillingEntitlement.findUnique({ where: { creatorId } });
       if (!freshEntitlement?.autoRenewEnabled) return { renewed: false, reason: "AUTO_RENEW_DISABLED" };
+      if (freshEntitlement.walletTestMode != null && (freshEntitlement.walletTestMode === true) !== providerSandbox)
+        return { renewed: false, reason: "BILLING_WALLET_ENVIRONMENT_MISMATCH" };
       if (isFuture(freshEntitlement.coreValidUntil, now)) return { renewed: false, reason: "NOT_DUE" };
       const creator = await tx.creatorAccount.findFirst({ where: { id: creatorId, agencyId, deletedAt: null }, include: { billingProfile: true, billingEntitlement: true } });
       if (!creator || creator.billingProfile?.billingExcluded === true) {

@@ -60,6 +60,7 @@ router.get("/checkout/cancel", (_req, res) => {
 
 router.use(authRequired);
 router.use(ownerOnly);
+router.use(require("../middleware/retired-management-writes"));
 
 router.get("/provider", (_req, res) => res.json({ ok: true, provider: publicProviderConfig() }));
 
@@ -138,7 +139,7 @@ router.post("/creators/:creatorId/refresh-earnings", async (req, res) => {
   try {
     const { requestBillingEarningsRefresh } = require("../services/billing-recovery-service");
     const recovery = await requestBillingEarningsRefresh({ db: require("../prisma"), agencyId: req.auth.agencyId,
-      userId: req.auth.userId, memberId: req.auth.membership.id, creatorId: req.params.creatorId });
+      userId: req.auth.userId, memberId: req.auth.membership.id, actorMember: req.auth.membership, creatorId: req.params.creatorId });
     return res.json({ ok: true, recovery });
   } catch (err) { return sendError(res, err, "BILLING_EARNINGS_REFRESH_FAILED"); }
 });
@@ -154,7 +155,7 @@ router.post("/creators/:creatorId/cancel-renewal", async (req, res) => {
 
 router.post("/orders/:orderId/reconcile", async (req, res) => {
   try {
-    const result = await reconcileOrder({ agencyId: req.auth.agencyId, orderId: req.params.orderId, actorUserId: req.auth.userId });
+    const result = await reconcileOrder({ agencyId: req.auth.agencyId, orderId: req.params.orderId, actorUserId: req.auth.userId, authorize: billingCheckoutAuthority({ agencyId: req.auth.agencyId, userId: req.auth.userId, actorMember: req.auth.membership }) });
     return res.json({ ok: true, ...result });
   } catch (err) {
     return sendError(res, err, "BILLING_RECONCILE_FAILED");

@@ -993,9 +993,13 @@ async function handleNowPaymentsIpn({ payload, signature, db = null }) {
   return applyProviderPayment(payload, { signature, signatureVerified: true, source: "IPN", db });
 }
 
-async function reconcileOrder({ agencyId, orderId, actorUserId = null, db = null }) {
+async function reconcileOrder({ agencyId, orderId, actorUserId = null, authorize = null, db = null }) {
   const client = db || prisma;
-  const order = await client.billingOrder.findFirst({ where: { id: clean(orderId, 180), agencyId } });
+  const read = async (tx) => {
+    await authorize?.(tx);
+    return tx.billingOrder.findFirst({ where: { id: clean(orderId, 180), agencyId } });
+  };
+  const order = authorize ? await runTransaction(client, read) : await read(client);
   if (!order) {
     const err = new Error("Billing order not found");
     err.code = "BILLING_ORDER_NOT_FOUND";
@@ -1011,7 +1015,9 @@ async function reconcileOrder({ agencyId, orderId, actorUserId = null, db = null
   }
   const attempt = await client.billingPaymentAttempt.findFirst({ where: { orderId: order.id }, orderBy: { updatedAt: "desc" } });
   if (!attempt?.providerPaymentId) {
-    return { order: publicOrder(order), reconciled: false, reason: "PAYMENT_NOT_DETECTED_YET" };
+    const current = authorize ? await runTransaction(client, read) : order;
+    if (!current) throw Object.assign(new Error("Billing order not found"), { code: "BILLING_ORDER_NOT_FOUND", status: 404 });
+    return { order: publicOrder(current), reconciled: false, reason: "PAYMENT_NOT_DETECTED_YET" };
   }
   const payload = await nowPaymentsRequest(`/payment/${encodeURIComponent(attempt.providerPaymentId)}`);
   const fetchedPaymentId = clean(payload?.payment_id ?? payload?.id, 180);
@@ -1034,7 +1040,17 @@ async function reconcileOrder({ agencyId, orderId, actorUserId = null, db = null
       : await activatePaidOrder(order.id, client);
     reconciledOrder = publicOrder(await client.billingOrder.findUnique({ where: { id: order.id } })) || reconciledOrder;
   }
-  await audit({ agencyId, actorUserId, action: "billing.payment_reconciled", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, providerPaymentId: attempt.providerPaymentId, providerStatus: normalizeStatus(payload.payment_status || payload.status), activated: activation?.activated === true }, db: client });
+  // Provider settlement is an independent financial fact and can converge
+  // after a role change. Disclosure of its result is still current-owner only.
+  const recordReadback = (tx) => audit({ agencyId, actorUserId, action: "billing.payment_reconciled", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, providerPaymentId: attempt.providerPaymentId, providerStatus: normalizeStatus(payload.payment_status || payload.status), activated: activation?.activated === true }, db: tx });
+  if (authorize) {
+    reconciledOrder = await runTransaction(client, async (tx) => {
+      const fresh = await read(tx);
+      if (!fresh) throw Object.assign(new Error("Billing order not found"), { code: "BILLING_ORDER_NOT_FOUND", status: 404 });
+      await recordReadback(tx);
+      return publicOrder(fresh);
+    });
+  } else await recordReadback(client);
   return { order: reconciledOrder, reconciled: true, activation };
 }
 

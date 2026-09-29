@@ -8,7 +8,7 @@ const path = require("node:path");
 const Module = require("node:module");
 
 const root = path.join(__dirname, "..", "..");
-const walletPath = path.join(__dirname, "billing-wallet-service.js");
+const walletPath = process.env.D7_WALLET_SOURCE || path.join(__dirname, "billing-wallet-service.js");
 const nowPaymentsPath = path.join(__dirname, "billing-nowpayments-service.js");
 const catalogPath = path.join(__dirname, "billing-catalog-service.js");
 const migrationPath = path.join(root, "prisma", "migrations", "20260814104000_billing_wallet_auto_pricing_v14", "migration.sql");
@@ -798,4 +798,25 @@ test("individual manual core price is explicit and independent of catalog revisi
   const base = { tierMode: "MANUAL", tier: "PRO", corePriceCents: 1 };
   assert.equal(svc.pricingFromRevenue({ profile: base, revenue, policy: p }).corePriceCents, 8700);
   assert.equal(svc.pricingFromRevenue({ profile: { ...base, corePriceOverrideCents: 4500 }, revenue, policy: p }).corePriceCents, 4500);
+});
+
+test("D7: a changed shown amount cannot debit a monthly period", async () => {
+  const db = makeDb({ balanceCents: 100000n }), svc=loadWalletService(db);
+  await assert.rejects(svc.startCreatorSubscription({agencyId:"agency-1",creatorId:"creator-1",db,now:new Date("2026-08-14T12:00:00Z"),expectedChargeCents:1}), {code:"BILLING_QUOTE_CHANGED"});
+});
+test("D7: an active renewal enable cannot consume an old purchase quote", async () => {
+  const db = makeDb({ balanceCents: 100000n }), svc=loadWalletService(db), now=new Date("2026-08-14T12:00:00Z");
+  await svc.startCreatorSubscription({agencyId:"agency-1",creatorId:"creator-1",db,now});
+  await assert.rejects(svc.startCreatorSubscription({agencyId:"agency-1",creatorId:"creator-1",db,now,expectedChargeCents:2000}),{code:"BILLING_QUOTE_CHANGED"});
+});
+
+test("D7: renewal rechecks the persisted billing environment after acquiring its lock", async () => {
+  const previous=process.env.NOWPAYMENTS_MODE;process.env.NOWPAYMENTS_MODE="sandbox";
+  try {
+    const db=makeDb({balanceCents:100000n}),svc=loadWalletService(db),now=new Date("2026-08-14T12:00:00Z");
+    const fresh={agencyId:"agency-1",creatorId:"creator-1",autoRenewEnabled:true,walletTestMode:false,coreValidUntil:new Date("2026-08-13T00:00:00Z")};
+    db._entitlements.set("creator-1",fresh);
+    const result=await svc.renewCreatorSubscription({db,now,entitlement:{...fresh,walletTestMode:true}});
+    assert.equal(result.renewed,false);assert.equal(result.reason,"BILLING_WALLET_ENVIRONMENT_MISMATCH");
+  } finally { if(previous===undefined)delete process.env.NOWPAYMENTS_MODE;else process.env.NOWPAYMENTS_MODE=previous; }
 });

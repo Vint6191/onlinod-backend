@@ -2,18 +2,20 @@
 
 const { runRootCommit } = require("./db-commit-kernel");
 
-const { readCurrentDesktopMemberAuthority } = require("./desktop-current-access-authority-service");
+const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
 const { requireCreatorAccess } = require("../middleware/automation-permissions");
 const { isOwner } = require("./team-access-control");
 const { creatorBillingAccess, BillingExecutionAccessError } = require("./billing-execution-access-service");
 
-async function planBillingEarningsRefresh({ db, agencyId, userId, memberId, creatorId }) {
+async function planBillingEarningsRefresh({ db, agencyId, userId, memberId, actorMember, creatorId }) {
   // Same order as billing/Owner mutations: agency before member. A transfer or
   // hold cannot commit between permission validation and durable job creation.
+  await lockAgencyLifecycle({ tx: db, agencyId });
   await db.$queryRawUnsafe('SELECT "id" FROM "Agency" WHERE "id"=$1 FOR SHARE', agencyId);
-  await db.$queryRawUnsafe('SELECT "id" FROM "AgencyMember" WHERE "id"=$1 AND "agencyId"=$2 AND "userId"=$3 FOR SHARE', memberId, agencyId, userId);
-  // Billing recovery survives expiry, but never membership/Owner revocation.
-  const member = await readCurrentDesktopMemberAuthority({ db, agencyId, userId, memberId });
+  // Agency -> Creator -> User -> Member, including disabled User and the
+  // admission epoch. Recovery survives expiry but never a revoked owner.
+  const { member } = await assertManagementCommitAuthority({ tx: db, agencyId,
+    actorMember: actorMember || { id: memberId, userId }, creatorIds: [creatorId], agencyAlreadyLocked: true });
   if (!isOwner(member)) throw new BillingExecutionAccessError("BILLING_OWNER_ONLY", "Billing recovery is available to the workspace owner", 403);
   const creator = await requireCreatorAccess({ db, agencyId, member, creatorId });
   if (creator.status !== "READY") throw new BillingExecutionAccessError("BILLING_RECOVERY_SESSION_REQUIRED", "Connect this creator before refreshing earnings", 409);

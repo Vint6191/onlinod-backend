@@ -507,6 +507,7 @@ router.delete("/:id", creatorManagementRequired, creatorAccessRequired, async (r
         revokeReason: "CREATOR_REMOVED_FROM_AGENCY",
         managementActorMember: req.auth.membership,
         managementPermissionKey: "creators.manage",
+        expectedUpdatedAt: existing.updatedAt,
       });
       await tx.auditLog.create({
         data: {
@@ -612,23 +613,9 @@ router.post("/:id/complete-connection", creatorManagementRequired, creatorAccess
       avatarUrl: input.avatarUrl || null,
     });
 
-    if (result.connectedNow) {
+    if (result.connectedNow || (result.unchanged && result.creator.connectionState === "CONNECTED")) {
       await scheduleInitialJobsForCreator({ creatorId: result.creator.id, agencyId: result.creator.agencyId, priority: 50 }).catch((error) => {
         console.warn("[creators/complete-connection] schedule jobs failed:", error?.message || error);
-      });
-      await audit({
-        agencyId: req.auth.agencyId,
-        actorUserId: req.auth.userId,
-        action: result.creator.remoteId ? "creator.connected" : "creator.connection_completed",
-        targetType: "creator",
-        targetId: result.creator.id,
-        metadata: {
-          remoteId: result.creator.remoteId,
-          username: result.creator.platformUsername || result.creator.username,
-          connectionGeneration: result.creator.connectionGeneration,
-          canonicalRevision: result.creator.connectedSessionRevision,
-          source: "desktop_runtime",
-        },
       });
     }
     return res.json({
@@ -654,6 +641,7 @@ router.post("/:id/platform-profile", creatorAccessRequired, async (req, res) => 
       creatorId: req.params.id,
       userId: req.auth.userId,
       sourceDeviceId,
+      actorMember: req.auth.membership,
       connectionGeneration: input.connectionGeneration,
       observedAt: input.observedAt,
       remoteId: input.remoteId,

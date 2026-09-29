@@ -5,6 +5,11 @@ const test = require("node:test"),
 const { parseManagementCommand, ACTIONS } = require("./management-command-contract");
 const retired = require("../middleware/retired-management-writes");
 const inputs = {
+  "billing.preferences": ["c", { expectedRevision: "a".repeat(64), aiChatterEnabled: false, outreachEnabled: true }],
+  "billing.start": ["c", { expectedRevision: "a".repeat(64), testMode: true, expectedActive: false, expectedChargeCents: 2000 }],
+  "billing.cancelRenewal": ["c", { expectedRevision: "a".repeat(64) }],
+  "creator.beginConnection": ["c", { deviceId: "d", expectedGeneration: 0, expectedState: "ENROLLMENT_REQUIRED" }],
+  "creator.telegramContact": ["c", { telegramContact: "@next", telegramAccountId: null, expectedContact: null, expectedAccountId: null }],
   "account.profile": ["", { name: "next", expectedName: null }],
   "workspace.update": ["", { expectedRevision: "a".repeat(64), name: "name" }],
   "creator.create": ["", { displayName: "draft", username: "draft" }],
@@ -89,6 +94,11 @@ test("bad identity, target and excessive cancelled payload are bounded", () => {
   );
 });
 for (const [method, url] of [
+  ["POST", "/api/creators/c/begin-connection"],
+  ["PATCH", "/api/creators/c/telegram-contact"],
+  ["PATCH", "/api/billing/creators/c/preferences"],
+  ["POST", "/api/billing/creators/c/start"],
+  ["POST", "/API/BILLING/creators/c/cancel-renewal/"],
   ["POST", "/api/creators/"],
   ["POST", "/API/Creators/"],
   ["PATCH", "/API/SETTINGS/Account/Profile/"],
@@ -118,10 +128,12 @@ for (const [method, url] of [
     assert.equal(status, 410);
   });
 for (const [method, path] of [
+  ["POST", "/api/billing/creators/c/refresh-earnings"],
+  ["POST", "/api/billing/orders/o/reconcile"],
+  ["POST", "/api/creators/c/complete-connection"],
+  ["POST", "/api/creators/c/platform-profile"],
   ["GET", "/api/creators/c"],
   ["DELETE", "/api/creators/c"],
-  ["POST", "/api/creators/c/begin-connection"],
-  ["PATCH", "/api/creators/c/telegram-contact"],
   ["POST", "/api/network-profiles/proxies/p/test-material"],
   ["POST", "/api/settings/account/password"],
   ["DELETE", "/api/settings/account/avatar"],

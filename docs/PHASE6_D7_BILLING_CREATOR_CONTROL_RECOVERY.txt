@@ -1,0 +1,294 @@
+================================================================================
+ONLINOD — PHASE 6 / D7 — BILLING + CREATOR CONTROL RECOVERY
+Продолжение D6 по актуалу 94 / Backend 2026-09-30T003152.020
+Полностью накопительный checkpoint. Предыдущий D6 сохранён точным префиксом.
+================================================================================
+
+0. РЕЗУЛЬТАТ И ГРАНИЦА ЭТОГО ПРОХОДА
+
+Крупный связанный проход D7 реализован и локально проверен: Billing preferences /
+start / cancel-renewal, begin connection и Telegram contact, а также смежные
+границы refresh earnings, reconcile, automatic renewal, completion, observations
+и подтверждения удаления модели. Это пять новых durable-команд и проверки
+существующих специализированных протоколов, а не переименование HTTP-маршрутов.
+
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ: ПОКА НЕТ.
+Готовность D7 не равна закрытию всей 6D или шестой фазы. Оставшиеся группы
+перечислены ниже. Деплоя, внешнего SQL, Render/Neon/реальных provider-вызовов нет.
+Инвариант ровно одного действующего OWNER на агентство сохранён.
+Серверное хранение переписки остаётся отдельным согласованным узлом.
+
+1. АКТУАЛ, РОДИТЕЛЬ И ВОСПРОИЗВОДИМОСТЬ
+
+Входы прочитаны из предоставленных локальных файлов:
+94.zip
+SHA256 4c22de0f1c3bf883eb94d7fcf8015e52c0952ba4209af31c73d92bc67978213a
+1204 файла; все присутствующие файлы побайтово совпали с D6. Новых/изменённых
+файлов нет. Отсутствуют 18 исторических docs, включая отчёт D6. Они сохранены
+в целевом накопительном Desktop; это не откат рабочего кода.
+
+onlinod-backend-main - 2026-09-30T003152.020.zip
+SHA256 7b189631bec732df7fb3ae204b6e0906de9e9eea6b5cb2443263c99518fe9564
+1291 файл, точное совпадение с D6 без пропусков/добавлений. AGENTS.md нет.
+
+Изолированные целевые деревья:
+/workspace/scratch/0495154fe552/work/phase6-d7-backend
+/workspace/scratch/0495154fe552/work/phase6-d7-desktop
+Родительские phase6-d6-* не менялись и сверены с прежними target manifests.
+Evidence: /workspace/scratch/0495154fe552/evidence-phase6-d7.
+
+2. ПОДТВЕРЖДЁННЫЕ РАЗРЫВЫ D6
+
+Семь новых поведенческих проверок запущены против D6 и D7 с одинаковыми
+управляемыми зависимостями. На D6: 0 PASS / 7 ожидаемых FAIL; на D7: 7 PASS.
+Это воспроизведения отсутствовавших гарантий, не семь production-инцидентов:
+- показанная цена не связывала последующее месячное списание;
+- старое намерение покупки не отличалось от включения продления активного периода;
+- automatic renewal проверял provider environment по входному entitlement,
+  но не повторял проверку по свежей записи после ожидания блокировки;
+- platform observation могла пройти при уже отключённом User и живом Member;
+- одинаковый ключ наблюдения с другим profile payload считался дубликатом;
+- begin connection не связывал действие с ожидаемой generation;
+- begin connection не связывал действие с состоянием, показанным пользователю.
+
+В сквозной проверке также устранены последствия повторных управляющих запросов:
+старый Start после Cancel больше не включает продление; старый Cancel после
+нового Resume не выключает его; replay Start после окончания оплаченного периода
+не покупает новый месяц. Новый UUID со старым snapshot отклоняется CAS-проверкой.
+Telegram contact не перезаписывает более новую правку после потери ответа.
+
+3. ЕДИНЫЙ COMMIT ДЛЯ ПЯТИ НОВЫХ УПРАВЛЯЮЩИХ ДЕЙСТВИЙ
+
+Использованы уже введённые в D6 POST /api/management/commands/v1 и /v1/cancel,
+ManagementCommandReceipt и существующий Desktop ManagementCommandTransport.
+Теперь поддерживаются 13 действий: прежние восемь плюс:
+- billing.preferences;
+- billing.start;
+- billing.cancelRenewal;
+- creator.beginConnection;
+- creator.telegramContact.
+
+Строгий bounded payload, UUID и fingerprint исходного intent сохраняются.
+Principal привязан к backend/user/agency, локальная login incarnation отсекает
+поздний ответ другой сессии. Журнал сохраняется с fsync до HTTP и остаётся до
+ACK получения результата. Пределы D6: 32 записи, 4 MiB journal, 1100 KiB payload,
+256 KiB canonical response, 8 KiB server reference; они не расширялись.
+Cancel-before-execute пишет ABANDONED, позднее исполнение запрещено.
+Commit-before-cancel подтверждает уже выполненное действие, не откатывает эффект.
+Отмена незавершённого Start не является возвратом денег; Cancel renewal выключает
+будущие продления и сохраняет уже оплаченный период.
+
+Внутри одного Serializable root: актуальные права/версии, доменная mutation,
+required management audit и receipt. При отказе вставки receipt SQL подтвердил
+откат debit, ledger transaction, period, entitlement, profile и audit.
+Receipt содержит locator/flags/digest, а не копию запроса или всего профиля.
+Повтор сначала проверяет текущие права, затем читает canonical result. Более
+новое состояние не восстанавливается из старого payload; возвращается
+resultUnavailable=true, result=null с подтверждением прежнего commit.
+
+Billing дополнительно требует действующего OWNER, включая replay. Старый
+владелец после передачи роли не получает финансовый результат по старой команде.
+User disable и stale accessEpoch отклоняются. Отмена собственного pending intent
+после потери прикладного разрешения доступна живому участнику без выдачи данных.
+Это не обход OWNER для исполнения финансового действия.
+
+Порядок блокировок сохранён по владельцам. Billing берёт Agency FOR UPDATE до
+Creator/User/Member и вложенных wallet operations. Creator-команды, которые
+обновят CreatorAccount, берут FOR UPDATE до actor locks; исключён промежуток
+FOR SHARE -> upgrade для двух записывающих команд. Domain helpers присоединяются
+только к kernel-issued transaction. Общая retry-петля внешних эффектов не введена.
+
+4. BILLING: ВЕРСИЯ, ЦЕНА, ВОССТАНОВЛЕНИЕ И PROVIDER
+
+Settings Billing выдаёт controlRevision для каждой модели. Это digest текущих
+DB-owned pricingRevision/entitlementRevision, значимых настроек, периода,
+режима provider и global policy revision. Balance и collector timestamps не
+включены: пополнение кошелька не должно инвалидировать редактор модели.
+Это составной snapshot, не новый общий счётчик версии всей базы.
+
+Все три управляющие команды несут исходный expectedRevision. Start дополнительно
+несёт testMode, expectedActive и expectedChargeCents из показанного состояния.
+Перед списанием цена проверяется повторно внутри существующего pricing/wallet
+владельца. Несовпадение суммы, периода или среды не списывает деньги. Для включения
+продления уже активной подписки ожидаемая текущая сумма списания равна нулю.
+Полные proven/fresh 30 закрытых UTC дней, баланс, live-pricing и FREE_INTERNAL
+ограничения прежнего владельца сохранены; тесты не заменяли их фиктивной ценой.
+
+Канонический результат Start берёт period по сохранённому locator и текущие
+wallet/entitlement. Поля цены периода остаются в period. У нового командного
+результата pricing=null: отдельный временный расчёт не выдаётся за канонический
+снимок. Изменившийся wallet/entitlement/policy может сделать прежний response
+недоступным; commit при этом подтверждён и повторного списания нет.
+
+Automatic renewal повторно проверяет persisted walletTestMode после lock.
+Refresh earnings сохраняет существующий planner/demand owner и reuse закрытых
+дней. Порядок Agency -> Creator -> User -> Member, current owner и admitted epoch
+проверены. Истечение подписки не блокирует разрешённое восстановление earnings.
+
+Reconcile сохраняет разделение:
+- текущий OWNER проверяется до provider GET;
+- существующий provider event/ledger принимает подтверждённый факт независимо
+  от того, сменился ли OWNER во время GET;
+- окончательное чтение результата и audit проходят под новой проверкой прав
+  в одной короткой транзакции;
+- отсутствие payment ID также проходит повторную проверку перед выдачей.
+Транзакция не удерживается во время HTTP, новый invoice POST не выполняется.
+D4 reservation/UNKNOWN/no-blind-retry поведение invoice осталось прежним.
+SQL-сценарий с подставленным GET подтвердил: финансовый факт может сохраниться,
+но отключённый пользователь уже не получает результат. Внешнего HTTP не было.
+
+5. CREATOR: ПОДКЛЮЧЕНИЕ, КОНТАКТ, НАБЛЮДЕНИЯ, RETIREMENT
+
+Begin connection сохраняет clicked expectedGeneration/expectedState/deviceId.
+Device сверяется с authenticated token. Повтор использует тот же intent;
+старый запрос после revoke не начинает следующую reconnect generation.
+Проверки immutable OnlyFans identity, canonical generation/session и crypto
+readiness сохранены. Код не выполняет вход в OnlyFans от имени пользователя.
+
+Telegram contact сохраняет исходные expectedContact/expectedAccountId. Вложенный
+доменный владелец по-прежнему сериализуется с lifecycle TelegramAccount, не
+разрешает назначение отсутствующего/retiring account и сбрасывает resolved
+telegramUserId при смене contact. Lookup/resolution самой Telegram identity
+остаётся самостоятельным протоколом и не объявлен закрытым этим изменением.
+
+Complete connection не превращён в ещё одну общую HTTP-команду: его идентичность
+по-прежнему задают connection generation, immutable identity и verified canonical
+session. Audit creator.connected перенесён в ту же транзакцию, что READY.
+Ошибка required audit откатывает READY; replay текущей generation не дублирует
+этот audit. Повторный complete вызывает идемпотентное initial planning и после
+lost acknowledgement. Recurring scheduler остаётся backstop при crash между
+commit и planning; новый transactional scheduler outbox здесь не создавался.
+Настоящий crash/многоузловой scheduler proof этим не заявляется.
+
+Platform profile observations теперь берут Agency/Creator/User/Member locks
+до connection fence, сверяют disable/accessEpoch и сохраняют порядок
+connectionGeneration + observedAt + deviceId. Точный повтор даёт duplicate;
+тот же ключ с другими username/name/avatar даёт conflict. Старое наблюдение
+остаётся stale no-op; новая generation не переписывается старой.
+
+Retirement получил проверку expectedUpdatedAt записи, по которой сверили
+confirmation phrase. Изменение модели до lifecycle lock не позволяет удалить
+уже другое текущее состояние. Существующие quiesce, provider MASS snapshot,
+crypto retirement и историческая атрибуция не обходились. Полное восстановление
+после потерянного DELETE-ответа, local partition cleanup и multi-PC drain ещё
+не закрыты; это явно частичная проверка retirement, не общий receipt вокруг него.
+
+6. DESKTOP И ПУТЬ ИЗ ИНТЕРФЕЙСА
+
+Все пять существующих Main/UI вызовов переведены на сохранённый intent и ACK:
+Settings add-ons / Start / Cancel renewal, Creator Connect, Telegram editor.
+Другой intent на тот же unresolved resource slot не обгоняет первый. Поломанный
+ответ не помечает запись полученной: проверяются creator, revision, currency,
+wallet environment, actual-active flag и сумма периода против сохранённого intent.
+Callback в общей DurableCommandTransport теперь получает исходный payload;
+совместимость Team/Message Library/top-up проверена регрессиями.
+
+Панели Recover/Cancel из D6 доступны в Settings и Creator Management/Overview.
+Billing recovery перезагружает Settings. Telegram editor хранит baseline начала
+редактирования; фоновое обновление props не подменяет версию старого черновика.
+Форма привязана key к creatorId, чтобы переключение модели сбрасывало её состояние.
+
+CONNECTING не гарантирует существование browser tab после crash или потери
+ответа. Поэтому вместо навсегда заблокированного «Login open…» есть Continue login.
+После восстановления pending action команда проверяет текущую generation,
+использует имеющийся tab либо открывает один через существующий reuseExisting
+путь. In-flight защита в WorkspaceShell сохранена. Ошибка открытия выводится
+пользователю и переводит в Settings, где доступны pending actions.
+
+После await Main проверяет permit для begin/contact/complete/observation,
+refresh earnings и reconcile. Смена сессии/доступа не разрешает late result
+пометить как текущий успешный эффект. Native Electron UI/OS не запускались.
+
+7. CUTOVER И СХЕМА
+
+Пять дополнительных unkeyed маршрутов закрыты ранним 410 gateway:
+PATCH /api/billing/creators/:creatorId/preferences
+POST /api/billing/creators/:creatorId/start
+POST /api/billing/creators/:creatorId/cancel-renewal
+POST /api/creators/:id/begin-connection
+PATCH /api/creators/:id/telegram-contact
+Gateway подключён в Billing router до старых handlers, как ранее в Creators.
+Case-insensitive routing и trailing slash сохранены. Старые тела handlers не
+считаются достижимыми mutation paths. Никакого silent fallback на unkeyed writes.
+
+Схема D7 побайтово совпадает с D6; новых миграций нет. Нужна уже входящая в
+накопительный пакет D6 migration ManagementCommandReceipt. Все прежние migrations
+неизменны. Backend и Desktop — согласованный пакет, не совет ставить одну сторону.
+Старый Desktop получит 410 на новых закрытых путях; новый Desktop не совместим
+с сервером, который не понимает новые actions. До общих gates установка не одобрена.
+
+8. ПРОВЕРКИ
+
+Итоговый целевой набор на D7:
+- 338 Backend PASS, 0 FAIL, 0 SKIP;
+- 137 Desktop PASS, 0 FAIL, 0 SKIP;
+- 27 новых SQL-сценариев D7 PASS;
+- 22 SQL-регрессии D6 на текущих исходниках PASS;
+- 7 воспроизведений: D6 0 PASS/7 ожидаемых FAIL, D7 7 PASS;
+- 23 JS/CJS/MJS syntax и 11 TS/TSX parse PASS;
+- prisma validate PASS.
+
+SQL: actual Prisma Client 5.22 + PGlite 0.5.8 + pglite-socket 0.2.11, полная
+цепочка migrations, новая disposable база на каждый прогон. Использован отдельный
+client, сгенерированный в D6, поскольку schema полностью неизменна. Параметр
+DATABASE_URL пользователя не использовался. Данные, ключи и provider GET —
+синтетические. Один сериализованный adapter не является доказательством
+независимых PostgreSQL sessions, deadlock-freedom в production или масштаба.
+
+Сохранены промежуточные прогоны, включая исправленную коллизию локального имени
+expectedState, обновлённые старые source-template ожидания, недостающие поля
+SQL fixture BillingOrder и ошибочное ожидание undefined вместо явного GET
+в подставленном provider. Эти падения не выданы за зелёный итог.
+
+Legacy Settings-набор отдельно: 7 PASS / 4 FAIL на D6 и D7 с одинаковыми именами
+падений. Они не включены в 338 PASS и не объявлены исправленными.
+npm run typecheck и npm run build: BLOCKED, tsc: not found, exit 127.
+TS parse и source-runtime проверки не являются полноценным typecheck/build.
+Настоящие Electron/OS keychain, multi-PC, независимый PostgreSQL, реальные
+providers, длительная целевая нагрузка и rollout не запускались.
+
+9. ПОСТАВКА И НАКОПЛЕНИЕ
+
+Backend target: 1294 файлов; delta от D6: 21;
+накопительно от исходного I7: 103.
+Desktop target: 1223 файлов; delta от D6: 15;
+накопительно от исходного Desktop77: 146.
+В delta включены исходники, проверки и текущий docs-отчёт.
+
+ZIP changed-only относителен исходным I7/Desktop77, а не только D6. Проверены
+восемь overlay-входов на каждую сторону: original, D1, D2, D3, D4, D5, D6,
+присланный актуал. Все дают одинаковый target manifest. Удалений файлов нет.
+ZIP integrity, SHA256, неизменность родителей/migrations и точный checkpoint
+prefix проверены. Предыдущий checkpoint D6: 1030349 байт,
+SHA256 1629c31f117fdc4e37228fbd9602313abc29da20c1ddb1d190c50441cc7fa611.
+Evidence включает целиком предыдущий D6 evidence ZIP, текущие code ZIP,
+исходные дельты, сценарии, логи, manifests, inventory и owner review.
+
+10. ЧТО ЕЩЁ ОТКРЫТО — НЕ СКРЫВАТЬ В СЛЕДУЮЩЕМ ДИАЛОГЕ
+
+Статический inventory по-прежнему 392 literal mutation declarations:
+296 mounted non-admin, 59 unmounted, 37 admin outside 6D.
+219 mounted остаются INVENTORY_ONLY; отдельная retirement строка помечена
+PARTIAL_OPEN. Это очередь review, не 219 багов, не процент и не прогноз сроков.
+
+Оставшаяся 6D:
+- Settings avatar/password/device logout/session revoke/reset/email и Telegram
+  reminders/account lifecycle/auth challenges: owner-specific durable recovery;
+- creator/device key rotations за пределами D5 root recovery;
+- creator retirement: потеря ответа, local cleanup, multi-PC quiesce/physical effect;
+  avatar и Telegram identity resolution — отдельные контракты;
+- Custom/Telegram/submission/delivery intents/leases/receipts и неизвестные
+  внешние исходы; не вводить blind resend или blanket HTTP receipt;
+- job progress/results, programmatic OF write admission/settlement,
+  наблюдения/refresh других доменов и module controls — сверить каждого владельца.
+6E: Chromium pending bounds, справедливость очередей и давление на host.
+6F: полноценная сборка, native Electron/multi-PC, независимый PostgreSQL, нагрузка.
+
+Следующий проход продолжать крупным связанным блоком, без повторного вопроса
+«продолжать ли» и без потери накопленной истории. Не объявлять SOURCE/SCALE
+закрытыми по количеству зелёных тестов. Один OWNER, отдельность server history
+migration и запрет несогласованного deploy/внешнего SQL сохраняются.
+
+ВЕРДИКТ: D7 реализован и локально доказан в описанных границах.
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ: ПОКА НЕТ.
+================================================================================

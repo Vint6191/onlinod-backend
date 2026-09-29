@@ -9,7 +9,7 @@ const test = require("node:test");
 const {
   observeCreatorPlatformProfile,
   revokeCreatorConnection,
-} = require("./creator-enrollment-authority-service");
+} = require(process.env.D7_ENROLLMENT_SOURCE || "./creator-enrollment-authority-service");
 const { requireBoundAccessDevice } = require("../utils/device-binding");
 
 function clone(value) { return value == null ? value : globalThis.structuredClone(value); }
@@ -53,6 +53,7 @@ function makeConnectedDb() {
     deletedAt: null, deactivatedAt: null,
   };
   let serial = Promise.resolve();
+  const user = { disabledAt: null };
 
   function matchesCreator(row, where = {}) {
     if (where.id && typeof where.id === "string" && row.id !== where.id) return false;
@@ -82,6 +83,14 @@ function makeConnectedDb() {
 
   const tx = {
     $executeRawUnsafe: async () => 1,
+    $queryRawUnsafe: async (sql, id) => {
+      if (sql.includes('FROM "Agency"')) return [{ id: "agency-1", deletedAt: null, status: "ACTIVE" }];
+      if (sql.includes('FROM "User"')) return user.disabledAt ? [] : [{ id: "user-1" }];
+      if (sql.includes('FROM "CreatorAccount"')) return [{ id, agencyId: "agency-1" }];
+      if (sql.includes('FROM "AgencyMember"')) return [{ id: "member-1" }];
+      return [];
+    },
+    auditLog: { create: async ({ data }) => data },
     agency: { findUnique: async ({ where }) => where.id === "agency-1" ? { id: "agency-1", deletedAt: null, status: "ACTIVE" } : null },
     agencyMember: {
       findUnique: async ({ where }) => {
@@ -129,7 +138,7 @@ function makeConnectedDb() {
   };
 
   return {
-    db: tx, creator, session, member,
+    db: tx, creator, session, member, user,
     creatorSnapshot: () => clone(creator),
     sessionSnapshot: () => clone(session),
   };
@@ -337,4 +346,14 @@ test("public revoke and profile routes are wired to live authority and device-bo
   assert.match(creators, /observedAt:\s*z\.string\(\)\.datetime\(\)/);
   assert.match(creators, /requireAuthDevice\(req, input\.deviceId/);
   assert.match(creators, /sourceDeviceId,/);
+});
+
+test("D7: a disabled User cannot commit a platform observation through a still-active membership",async()=>{
+ const ctx=makeConnectedDb();ctx.user.disabledAt=new Date();
+ await assert.rejects(observeCreatorPlatformProfile({db:ctx.db,...profileInput()}),{code:"CREATOR_CONNECTION_MEMBER_INACTIVE"});
+ assert.equal(ctx.creator.platformDisplayName,"Alice");
+});
+test("D7: reused observation key with another body is a conflict",async()=>{
+ const ctx=makeConnectedDb();await observeCreatorPlatformProfile({db:ctx.db,...profileInput()});
+ await assert.rejects(observeCreatorPlatformProfile({db:ctx.db,...profileInput(),platformDisplayName:"Different"}),{code:"CREATOR_PROFILE_OBSERVATION_CONFLICT"});
 });

@@ -512,6 +512,7 @@ function billingLine(creator, pricing, now, policy) {
   const outreach = outreachEnabled ? Math.max(0, Number(preview?.outreachPriceCents ?? prices.outreachPriceCents)) : 0;
   return {
     creatorId: String(creator.id),
+    controlRevision: require("./billing-control-command-service").billingControlRevision(creator, policy, publicProviderConfig().testMode === true),
     creatorName: creator.displayName || creator.username || String(creator.id),
     creatorUsername: creator.username || null,
     tier: String(preview?.tier || profile?.tier || "STARTER"),

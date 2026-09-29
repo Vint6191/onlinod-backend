@@ -9,10 +9,16 @@ function handler(cancel) {
   return async (req, res) => {
     try {
       let deviceId = req.auth.deviceId || null;
-      if (!cancel && ["network.create", "network.update"].includes(req.body?.action))
+      if (!cancel && ["network.create", "network.update", "creator.beginConnection"].includes(req.body?.action))
         deviceId = requireAuthDevice(req, req.body?.payload?.deviceId, {
-          requiredCode: "NETWORK_AUTH_DEVICE_BOUND_TOKEN_REQUIRED",
-          mismatchCode: "NETWORK_AUTH_DEVICE_MISMATCH",
+          requiredCode:
+            req.body.action === "creator.beginConnection"
+              ? "CREATOR_CONNECTION_AUTH_DEVICE_BOUND_TOKEN_REQUIRED"
+              : "NETWORK_AUTH_DEVICE_BOUND_TOKEN_REQUIRED",
+          mismatchCode:
+            req.body.action === "creator.beginConnection"
+              ? "CREATOR_CONNECTION_AUTH_DEVICE_MISMATCH"
+              : "NETWORK_AUTH_DEVICE_MISMATCH",
         });
       const result = await executeManagementCommand({
         db: prisma,
@@ -27,17 +33,15 @@ function handler(cancel) {
       return res.json(result);
     } catch (error) {
       // Never echo a malformed payload (it may contain credential fields).
-      return res
-        .status(error?.issues ? 400 : Number(error?.status) || 500)
-        .json({
-          ok: false,
-          code: error?.issues ? "VALIDATION_ERROR" : error?.code || "MANAGEMENT_COMMAND_FAILED",
-          error: error?.issues
-            ? "Invalid management command"
-            : error?.status
-              ? error.message
-              : "Management command failed; recover the pending action",
-        });
+      return res.status(error?.issues ? 400 : Number(error?.status) || 500).json({
+        ok: false,
+        code: error?.issues ? "VALIDATION_ERROR" : error?.code || "MANAGEMENT_COMMAND_FAILED",
+        error: error?.issues
+          ? "Invalid management command"
+          : error?.status
+            ? error.message
+            : "Management command failed; recover the pending action",
+      });
     }
   };
 }

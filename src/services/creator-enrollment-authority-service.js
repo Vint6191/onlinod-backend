@@ -3,6 +3,7 @@
 const { runRootCommit, currentCommitContext, joinCommit } = require("./db-commit-kernel");
 
 const { canAccessCreator } = require("../middleware/automation-permissions");
+const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
 const { canUsePermission } = require("./team-access-control");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const {
@@ -104,7 +105,9 @@ async function reassertHumanConnectionMutation(input) {
   }
 }
 
-async function requireLiveCreatorAccess({ tx, agencyId, creatorId, userId }) {
+async function requireLiveCreatorAccess({ tx, agencyId, creatorId, userId, actorMember }) {
+  await lockAgencyLifecycle({ tx, agencyId });
+  await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 AND "deletedAt" IS NULL FOR UPDATE', creatorId, agencyId);
   const member = await tx.agencyMember.findUnique({
     where: { agencyId_userId: { agencyId, userId } },
   });
@@ -115,6 +118,10 @@ async function requireLiveCreatorAccess({ tx, agencyId, creatorId, userId }) {
     where: { id: creatorId, agencyId, deletedAt: null },
   });
   if (!creator) throw codedError("CREATOR_NOT_FOUND", "Creator not found", 404);
+  try {
+    await assertManagementCommitAuthority({ tx, agencyId, actorMember: actorMember || member,
+      creatorIds: [creatorId], agencyAlreadyLocked: true, creatorRowsAlreadyLocked: true });
+  } catch (error) { throw translateConnectionManagementError(error); }
   if (!canAccessCreator(member, creator.id)) {
     throw codedError("CREATOR_ACCESS_FORBIDDEN", "Creator access was revoked", 403);
   }
@@ -156,11 +163,14 @@ async function createCreatorDraft({ db, agencyId, displayName, username, notes =
   }
 }
 
-async function beginCreatorConnection({ db, agencyId, creatorId, userId, actorMember, deviceId = null }) {
+async function beginCreatorConnection({ db, agencyId, creatorId, userId, actorMember, deviceId = null, expectedGeneration = undefined, expectedState = undefined }) {
   return runSerializable(db, async (tx) => {
     const { creator } = await lockHumanConnectionMutation({ tx, agencyId, creatorId, actorMember });
     await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
     const state = String(creator.connectionState || CREATOR_CONNECTION_STATES.ENROLLMENT_REQUIRED);
+    if ((expectedGeneration !== undefined && expectedGeneration !== Number(creator.connectionGeneration || 0)) ||
+        (expectedState !== undefined && expectedState !== state))
+      throw codedError("CREATOR_CONNECTION_VERSION_CONFLICT", "Creator connection changed. Refresh before connecting.");
     const hasImmutableIdentity = Boolean(clean(creator.remoteId, 160));
 
     if (hasImmutableIdentity && state === CREATOR_CONNECTION_STATES.CONNECTED) {
@@ -174,10 +184,10 @@ async function beginCreatorConnection({ db, agencyId, creatorId, userId, actorMe
     }
 
     const firstEnrollment = !hasImmutableIdentity;
-    const expectedState = firstEnrollment
+    const requiredState = firstEnrollment
       ? CREATOR_CONNECTION_STATES.ENROLLMENT_REQUIRED
       : CREATOR_CONNECTION_STATES.RECONNECT_REQUIRED;
-    if (state !== expectedState) {
+    if (state !== requiredState) {
       throw codedError(
         "CREATOR_CONNECTION_STATE_CONFLICT",
         `Creator connection cannot begin from ${state}`,
@@ -329,6 +339,10 @@ async function completeCreatorConnection({
           connectedSessionRevision: Number(canonical.revision),
         },
       });
+      await require("./audit-service").audit({ required: true, db: tx, agencyId, actorUserId: userId,
+        action: "creator.connected", targetType: "creator", targetId: updated.id,
+        metadata: { remoteId: updated.remoteId, connectionGeneration: generation,
+          canonicalRevision: updated.connectedSessionRevision, source: "desktop_runtime" } });
       return { creator: updated, unchanged: false, connectedNow: true };
     });
   } catch (error) {
@@ -340,7 +354,7 @@ async function completeCreatorConnection({
 }
 
 async function observeCreatorPlatformProfile({
-  db, agencyId, creatorId, userId, sourceDeviceId, connectionGeneration, observedAt,
+  db, agencyId, creatorId, userId, actorMember = null, sourceDeviceId, connectionGeneration, observedAt,
   remoteId, username, platformDisplayName = null, avatarUrl = null, beforeCommit = null,
 }) {
   const identity = clean(remoteId, 160);
@@ -353,8 +367,8 @@ async function observeCreatorPlatformProfile({
   if (!Number.isInteger(generation) || generation <= 0) throw codedError("CREATOR_PROFILE_GENERATION_INVALID", "A valid creator connection generation is required", 400);
   try {
     return await runSerializable(db, async (tx) => {
+      const { creator } = await requireLiveCreatorAccess({ tx, agencyId, creatorId, userId, actorMember });
       await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
-      const { creator } = await requireLiveCreatorAccess({ tx, agencyId, creatorId, userId });
       if (String(creator.remoteId || "") !== identity) {
         throw codedError("CREATOR_PROFILE_IDENTITY_MISMATCH", "Platform profile observation does not match the connected creator identity", 409);
       }
@@ -381,6 +395,10 @@ async function observeCreatorPlatformProfile({
         return { creator, unchanged: true, staleNoop: true, reason: "STALE_PROFILE_OBSERVATION" };
       }
       if (authority === 0) {
+        if (creator.platformUsername !== observedUsername ||
+            (creator.platformDisplayName || null) !== (clean(platformDisplayName, 120) || null) ||
+            (creator.platformAvatarUrl || null) !== (clean(avatarUrl, 2000) || null))
+          throw codedError("CREATOR_PROFILE_OBSERVATION_CONFLICT", "Observation identity was reused with different profile data");
         return { creator, unchanged: true, staleNoop: false, reason: "DUPLICATE_PROFILE_OBSERVATION" };
       }
 
@@ -402,7 +420,7 @@ async function observeCreatorPlatformProfile({
       // The access/member state may have changed while an external test hook or
       // future pre-commit work ran. Re-read inside the same transaction before
       // mutating the current projection.
-      const { creator: liveCreator } = await requireLiveCreatorAccess({ tx, agencyId, creatorId, userId });
+      const { creator: liveCreator } = await requireLiveCreatorAccess({ tx, agencyId, creatorId, userId, actorMember });
       if (String(liveCreator.remoteId || "") !== identity || Number(liveCreator.connectionGeneration || 0) !== generation) {
         throw codedError("CREATOR_PROFILE_AUTHORITY_CHANGED", "Creator profile authority changed before commit", 409);
       }

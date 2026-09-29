@@ -4,7 +4,7 @@ const { digest } = require("./team-command-contract");
 const { runRootCommit, deferCommitHint } = require("./db-commit-kernel");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
-const { createCreatorDraft } = require("./creator-enrollment-authority-service");
+const { createCreatorDraft, beginCreatorConnection } = require("./creator-enrollment-authority-service");
 const { updateCreatorMetadata } = require("./creator-metadata-service");
 const {
   lockEligibleAccountUser,
@@ -15,13 +15,26 @@ const {
 const { publicUser } = require("./auth-service");
 const { audit } = require("./audit-service");
 const network = require("./creator-network-profile-service");
+const billingControl = require("./billing-control-command-service");
+const { lockAgencyBillingMutation } = require("./billing-entitlement-service");
+const { updateCreatorTelegramContact } = require("./creator-telegram-contact-authority-service");
 const { publishDesktopControlEvent } = require("./desktop-control-events");
 
 const stable = (value) => JSON.parse(JSON.stringify(value));
 const boundedResult = (value) => value !== null && Buffer.byteLength(JSON.stringify(value)) <= 256 * 1024;
 async function creatorScope(tx, agencyId, c, ref) {
   const ids = new Set(ref?.creatorIds || []);
-  if (["creator.update", "network.create", "network.assign"].includes(c.action)) ids.add(c.targetId);
+  if (
+    [
+      "creator.update",
+      "creator.beginConnection",
+      "creator.telegramContact",
+      "network.create",
+      "network.assign",
+    ].includes(c.action) ||
+    c.action.startsWith("billing.")
+  )
+    ids.add(c.targetId);
   if (["network.update", "network.delete"].includes(c.action)) {
     const proxy = await tx.agencyProxyEndpoint.findFirst({ where: { agencyId, id: c.targetId } });
     if (proxy?.ownerCreatorId) ids.add(proxy.ownerCreatorId);
@@ -34,6 +47,7 @@ async function creatorScope(tx, agencyId, c, ref) {
   return [...ids].sort();
 }
 async function currentResult(tx, agencyId, userId, member, c, ref) {
+  if (c.action.startsWith("billing.")) return billingControl.currentBillingControl(tx, agencyId, c, ref);
   if (c.action === "account.profile") {
     const row = await tx.user.findUnique({ where: { id: userId } });
     return row ? { ok: true, user: publicUser(row) } : null;
@@ -42,7 +56,19 @@ async function currentResult(tx, agencyId, userId, member, c, ref) {
     return { ok: true, ...(await getWorkspaceSettings({ db: tx, agencyId, member })) };
   if (c.action.startsWith("creator.")) {
     const creator = await tx.creatorAccount.findFirst({ where: { id: ref.creatorId, agencyId, deletedAt: null } });
-    return creator ? { ok: true, creator } : null;
+    return creator
+      ? {
+          ok: true,
+          creator,
+          ...(c.action === "creator.beginConnection"
+            ? {
+                mode: ref.connectionMode,
+                connectionGeneration: ref.connectionGeneration,
+                unchanged: ref.unchanged,
+              }
+            : {}),
+        }
+      : null;
   }
   if (c.action === "network.delete") return ref.deletion;
   if (c.action === "network.assign")
@@ -63,6 +89,31 @@ async function currentResult(tx, agencyId, userId, member, c, ref) {
 }
 async function apply(tx, agencyId, userId, member, deviceId, c) {
   const p = c.payload;
+  if (c.action.startsWith("billing.")) return billingControl.applyBillingControl(tx, agencyId, userId, member, c);
+  if (c.action === "creator.beginConnection")
+    return {
+      ok: true,
+      ...(await beginCreatorConnection({
+        db: tx,
+        agencyId,
+        creatorId: c.targetId,
+        userId,
+        actorMember: member,
+        ...p,
+      })),
+    };
+  if (c.action === "creator.telegramContact")
+    return {
+      ok: true,
+      creator: await updateCreatorTelegramContact({
+        db: tx,
+        agencyId,
+        creatorId: c.targetId,
+        actorUserId: userId,
+        actorMember: member,
+        ...p,
+      }),
+    };
   if (c.action === "account.profile")
     return { ok: true, user: await updateAccountProfile({ db: tx, agencyId, userId, ...p }) };
   if (c.action === "workspace.update")
@@ -117,16 +168,24 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
   const c = parseManagementCommand(input, { cancel });
   if (
     !cancel &&
-    ["network.create", "network.update"].includes(c.action) &&
+    ["network.create", "network.update", "creator.beginConnection"].includes(c.action) &&
     (!deviceId || deviceId !== c.payload.deviceId)
   )
-    throw fail("NETWORK_AUTH_DEVICE_MISMATCH", "Command belongs to another device", 403);
+    throw fail(
+      c.action === "creator.beginConnection"
+        ? "CREATOR_CONNECTION_AUTH_DEVICE_MISMATCH"
+        : "NETWORK_AUTH_DEVICE_MISMATCH",
+      "Command belongs to another device",
+      403
+    );
   const id = "management_v1_" + digest([agencyId, userId, c.commandId]);
   return runRootCommit(
     db,
     async (context) => {
       const tx = context.tx;
       await lockAgencyLifecycle({ tx, agencyId });
+      // Billing owns Agency FOR UPDATE before creator/member/business rows.
+      if (!cancel && c.action.startsWith("billing.")) await lockAgencyBillingMutation(tx, agencyId);
       await lockDbAdvisoryXact({ db: tx, key: id });
       const [prior] = await tx.$queryRawUnsafe('SELECT * FROM "ManagementCommandReceipt" WHERE "id"=$1', id);
       if (prior && prior.fingerprint !== c.fingerprint)
@@ -137,6 +196,14 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
       if (!cancel && c.action === "account.profile") await lockEligibleAccountUser(tx, userId);
       if (!cancel && c.action === "workspace.update")
         await lockDbAdvisoryXact({ db: tx, key: `workspace-settings:${agencyId}` });
+      // Writers that later UPDATE CreatorAccount must not first take FOR SHARE
+      // and then deadlock while upgrading alongside another command.
+      if (!cancel && ["creator.update", "creator.beginConnection", "creator.telegramContact"].includes(c.action))
+        await tx.$queryRawUnsafe(
+          'SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 AND "deletedAt" IS NULL FOR UPDATE',
+          c.targetId,
+          agencyId
+        );
       const authority = await assertManagementCommitAuthority({
         tx,
         agencyId,
@@ -144,13 +211,14 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
         agencyAlreadyLocked: true,
         creatorIds,
         permissionKey:
-          cancel || c.action === "account.profile"
+          cancel || c.action === "account.profile" || c.action.startsWith("billing.")
             ? null
             : c.action === "workspace.update"
               ? "workspace.manage_settings"
               : "creators.manage",
         requireBroadCreatorScope: !cancel && c.action === "creator.create",
       });
+      if (!cancel && c.action.startsWith("billing.")) billingControl.assertBillingOwner(authority.member);
       const store = async (status, reference) => {
         const encoded = JSON.stringify(reference);
         if (Buffer.byteLength(encoded) > 8192)
@@ -194,6 +262,10 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
       // their canonical rows. Recovery compares a digest under fresh authority.
       const reference = {
         creatorIds,
+        ...(value.billingReference ? { billingReference: value.billingReference } : {}),
+        ...(c.action === "creator.beginConnection"
+          ? { connectionMode: value.mode, connectionGeneration: value.connectionGeneration }
+          : {}),
         ...(value.creator
           ? { creatorId: value.creator.id, creatorIds: [...new Set([...creatorIds, value.creator.id])] }
           : {}),
