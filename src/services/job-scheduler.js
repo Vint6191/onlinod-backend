@@ -2112,9 +2112,8 @@ async function runRecurringCreatorWork({
 async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) {
   if (phase2MaintenancePromise) return { ok: true, skipped: true, reason: "local_overlap" };
   phase2MaintenancePromise = (async () => {
-    // R6 final admission layer. Each lane remains its own durable distributed authority;
-    // this rotation is only a resource/fairness budget, never business truth. A restart may
-    // change which lane runs first, but no lane loses work because claims/cursors stay durable.
+    // Phase6: durable per-class dispatch progress; domain claims/leases remain
+    // inside each lane. A process restart cannot reset the fleet to a clock phase.
     const lanes = [
       ["providerCapacityProjection", () => refreshProviderCapacityDebtSnapshot({ db })],
       ["messageLibraryTrash", () => require("./message-library-lifecycle-service").runMessageLibraryTrashMaintenance({ db })],
@@ -2139,10 +2138,9 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
       ["teamResponseRangeRepair", () => runTeamResponseRangeRepairSweep({ db, now })],
       ["teamLegacyPendingRepair", () => maybeRepairLegacyTeamPendingBootstrap({ db, now })],
     ];
-    const admission = selectPhase2MaintenanceLanes({
+    const admission = await selectPhase2MaintenanceLanes({
+      db,
       laneNames: lanes.map(([name]) => name),
-      now,
-      intervalMs: PHASE2_MAINTENANCE_PUMP_INTERVAL_MS,
       lanesPerTick: PHASE2_MAINTENANCE_LANES_PER_TICK,
     });
     const selected = admission.selected.map((name) => lanes.find(([laneName]) => laneName === name)).filter(Boolean);

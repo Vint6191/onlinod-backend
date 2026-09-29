@@ -149,7 +149,8 @@ async function runProviderCapacityProjectionBatch({ db, batchSize = 96, publish 
   const size = Math.max(3, Math.min(128, Math.floor(Number(batchSize) || 96)));
   return runDbTransaction(db, async (tx) => {
     const lock = await tx.$queryRawUnsafe(`SELECT pg_try_advisory_xact_lock(hashtext('phase6-capacity-projection-v1')) AS acquired`);
-    if (lock[0]?.acquired !== true) return { ok: false, skipped: true, persisted: false, reason: "capacity_projection_busy" };
+    // Another owner is healthy contention, not a failed maintenance component.
+    if (lock[0]?.acquired !== true) return { ok: true, skipped: true, persisted: false, reason: "capacity_projection_busy" };
     const states = await tx.$queryRawUnsafe(`SELECT * FROM "ProviderCapacityProjectionState" WHERE id=$1 FOR UPDATE`, ID);
     const state = states[0];
     if (state?.generation !== GENERATION) throw failure("CAPACITY_PROJECTION_GENERATION_MISMATCH");

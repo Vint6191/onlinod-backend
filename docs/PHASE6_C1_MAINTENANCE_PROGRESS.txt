@@ -1,0 +1,224 @@
+================================================================================
+ONLINOD — PHASE 6 / C1 — MAINTENANCE PROGRESS / 2026-09-29
+Fresh B1 actual + provided Render evidence -> next cohesive Phase6 node (6C).
+================================================================================
+
+1. ПОРУЧЕНИЕ, ВХОД И ФАКТИЧЕСКИЙ СТАТУС B1
+Пользователь передал свежий Backend и Render-лог в продолжение реализации Phase6.
+Прежний активный план сохранён: после capacity6B — fairness6C, затем Home6A,
+idempotency6D, Desktop6E и acceptance6F. Работы вне текущего узла не объявляются
+завершёнными. Desktop не присылался заново и не менялся.
+
+onlinod-backend-main - 2026-09-29T183848.737.zip:
+SHA256 6687363a0036a60753c0ee0053b6d6ed3e3341a33311a8f6d3661c309d2214b4.
+1557 ZIP entries,1248 files,CRC PASS. ВСЕ1248 файлов побайтно совпали с B1 target;
+missing/changed/added относительно B1 =0. Исходное дерево не редактировалось.
+Рабочая копия: work/phase6-c1-backend.
+
+Присланный текст лога:
+SHA256 9fee241f8b627a4be03e06f97f3ba4858e470b0256cd85d56bcd5f8fa45f9f15.
+Render commit a3d7d2a2839f6e3079b692b8ad64d101615b8f1c, Node22.23.3,
+Prisma5.22.0. 2026-09-29T15:37:39Z начато применение
+20260929150000_phase6_capacity_incremental_v1; в15:37:40Z все migrations успешно
+применены. В15:38:14Z Render сообщил primary service URL. Ошибок migration
+в предоставленном фрагменте нет. Текст обрывает один postflight JSON и затем
+переходит к сообщению об URL: это не полный непрерывный журнал работы приложения.
+
+Обновление прежнего B1 статуса: schema rollout на настоящей пользовательской
+PostgreSQL подтверждён ПРИСЛАННЫМ логом; это не наше подключение/проверка сервера.
+Нет evidence capacity convergence totals, двух одновременных capacity owners,
+canonical writer versus repair или mixed-version contention. Старые Phase3 markers
+с двумя PID в этом логе относятся к их собственным preflight, не к Phase6 proof.
+Адрес сервиса не выдаётся за независимый health/HTTP/runtime запрос. Мы не
+подключались к Render/Neon и не выполняли внешние SQL.
+
+2. ИСПРАВЛЕННАЯ ПРИЧИНА P6-F8
+Прежний selectPhase2MaintenanceLanes вычислял startIndex из
+floor(now/5000)*quantum % lanes.length. Локальный overlap guard пропускает ticks,
+если предыдущий проход ещё выполняется. Поэтому шаг реального завершения мог
+попадать всегда в одно подмножество startIndex независимо от числа повторов.
+
+На ТЕКУЩЕМ B1 с22 lanes воспроизведено:100 завершённых проходов через55000ms,
+quantum5 => посещены10 классов из22;12 не получили ни одного предложения запуска.
+original-starvation.json содержит точные имена. Это управляемая временная модель
+на настоящем старом selector, не production latency/load. A1 пример21 lanes/35s
+сохраняется как историческое доказательство предыдущей версии; не подменяется.
+
+C1 заменяет wall-clock фазу durable per-class turnCount. Класс с меньшим числом
+предложенных запусков выбирается раньше; ordinal задаёт стабильное равенство.
+Счётчик хранится в PostgreSQL, поэтому новый процесс/реплика продолжает общее
+состояние. host now, часы, длительность прохода и кратность5s больше не определяют
+подмножество обслуживаемых классов.
+
+3. НОВАЯ AUTHORITY И ЕЁ ГРАНИЦА
+MaintenanceAdmissionClassState:
+(generation,laneName) primary key; ordinal; turnCount BigInt; lastAdmittedAt.
+Новая migration20260929154000_phase6_maintenance_progress_v1 создаёт одну таблицу,
+два supporting keys/indexes и22 фиксированные строки каталога. Размер каталога
+независим от agency count, creators per agency, memberships, history или backlog.
+Нет сканирования agency/creator/job/history таблиц и нет глобального business lock.
+
+Один admission выполняет собственный короткий runRootCommit:
+- Проверить runtime catalog и stored generation/ordinal catalog.
+- SELECT до5 строк ORDER BY turnCount,ordinal FOR UPDATE SKIP LOCKED.
+- Одним UPDATE увеличить счётчик выбранных строк и записать DB observation time.
+- Вернуть выбранные имена ТОЛЬКО после подтверждённого commit.
+- После commit pump последовательно вызывает соответствующие handlers.
+
+Нельзя присоединить admission к уже открытой business transaction: root commit
+kernel отклоняет nested root. Так class locks не остаются удержанными во время
+долгого выполнения handler, а предложение запуска не выдаётся до commit.
+Транзакционные budgets: maxWait1500ms, timeout3000ms, deadline5000ms,
+lock_timeout1000ms, statement_timeout2000ms; максимум2 попытки только для
+классифицированного rollback conflict. Unknown commit outcome не повторяется.
+В admission нет сетевых side effects и вызовов domain handlers.
+
+В каждой порции quantum clamp1..5, включая ошибочно огромный параметр. Catalog
+read имеет LIMIT65 для обнаружения превышения поддерживаемых64 metadata rows;
+текущий generation обязан содержать ровно22 ожидаемых класса и ordinal0..21.
+Отсутствующая схема/несовпадение каталога — явная ошибка, без fallback к прежним
+часам, RAM cursor или частичному списку. Заблокированные конкурентом строки
+пропускаются; если свободных меньше5, возвращается меньшая порция; при0 — healthy
+skipped/maintenance_admission_contended. Новых volatile truth owners нет.
+
+turnCount означает ПРЕДЛОЖЕНИЕ запуска, не успешное завершение задания и не lease
+на исполнение. После падения процесса между admission commit и вызовом callback
+может пропасть одно предложение, но canonical work не удалена/не подтверждена;
+класс получает последующие предложения. Это преднамеренный простой протокол,
+которому не требуется отдельная admission lease/reaper/ack или двойной job owner.
+JobInstance, DomainWorkItem и MaintenanceLaneState сохраняют свои claims, fences,
+leases, generation checks и recovery. Счётчики C1 не разрешают обход этих проверок.
+
+Fairness гарантия относится к предоставлению попыток при продолжающихся успешных
+admission transactions. На последовательном свободном balanced catalog22/quantum5
+все классы получают предложение за5 проходов; разница счётчиков <=1. Под настоящими
+конкурирующими row locks временная разница может быть больше1. Это не wall-clock
+SLA, не равное CPU-время и не обещание завершения зависшего domain callback.
+Постоянно зависший процесс требует действующих timeout/restart мер своего runtime;
+C1 не бросает незавершённый handler через Promise.race и не выдаёт его за остановленный.
+Ошибка/пустая работа callback расходует свою возможность и не возвращает poison
+класс в бесконечную голову очереди. Ограничения per-agency/per-partition остаются
+в соответствующих domain owners и не переносятся в22 глобальных business leases.
+
+4. ИНТЕГРАЦИЯ И ДИАГНОСТИКА
+В runPhase2MaintenancePump изменён единственный production call site selector:
+теперь await с db, без now/intervalMs для выбора. Сохраняются22 callbacks,
+последовательное выполнение максимум5 на одном процессе, локальный overlap guard
+и сброс guard в finally после успеха/ошибки admission. Другие scheduler timelines
+и cadence не менялись. Новая policy не заменяет distributed OF physical gate.
+
+Добавлен read-only command:
+  npm run phase6:maintenance-admission -- diagnostics
+Он делает один bounded SELECT и выводит generation,22 класса, точные BigInt turns
+строками, minimum/maximum/spread и lastAdmittedAt. meaning явно указан как
+ dispatch_opportunities_not_completed_work.
+Команда не продвигает очередь, не выполняет задания и не является runtime/load
+сертификатом. Большой spread при contention нельзя автоматически объявлять багом.
+Команда подготовлена; на пользовательской DB нами НЕ выполнялась.
+Новых npm dependencies нет; package-lock не менялся, добавлен только npm script.
+
+При проверке интеграции обнаружена B1 несовместимость health semantics:
+capacity_projection_busy возвращал ok:false при нормальном занятом owner. Pump
+и recurring health могли показывать ложный DEGRADED при штатной конкуренции.
+Исправлен результат owner service: ok:true,skipped:true,persisted:false, тот же
+reason; publish callback не вызывается, snapshot не обещается. Это общий результат
+owner для всех callers, а не подавление ошибок в логгере. Настоящие SQL/publication
+ошибки по-прежнему выбрасываются/попадают в failed health. Regression проверяет все
+четыре поля и отсутствие publication. B1 SQL, publication fence, generation,
+backfill/contribution formulas и УЖЕ ПРИМЕНЁННАЯ migration B1 не изменялись.
+
+5. SCHEMA/ROLLOUT
+C1 migration additive,BEGIN/COMMIT,lock_timeout5s; создаёт только новую маленькую
+metadata relation и фиксированные catalog rows. Нет canonical backfill, DROP,
+TRUNCATE, DELETE истории или изменения старых migrations. Все262 исходные
+migration файлы сохранены побайтно. После C1 migrations263.
+Существующая команда deployment остаётся npm install && npm run prisma:migrate.
+Мы её против пользовательской DB не запускали. Сначала применяется additive schema,
+затем новые binaries. Старые binaries используют прежний selector; общий balanced
+admission contract относится к C1 участникам и не объявляется полным fleet rollout,
+пока старые участники не заменены. Business lease fences остаются действовать.
+
+Будущее изменение списка классов требует явного нового generation с balanced
+начальными счётчиками. Нельзя незаметно вставить новую zero-turn строку к классам
+с миллионами исторических turns: это создало бы период догоняющего голодания.
+Текущий mismatch guard делает такое изменение заметным, не прячет его.
+C1 candidate rollback binaries может оставить additive таблицу; старый selector
+её не использует. Physical purge старого catalog generation не входит в этот узел.
+
+6. ПРОВЕРКИ
+Final Node suite:110 tests,110 PASS,0 FAIL,0 SKIP. Из них12 C1 boundary/control
+checks и98 существующих/ранее добавленных capacity,provider gate,DomainWork,
+maintenance lease,job idempotency,current-work/Telegram checks. Старые2 проверки
+wall-clock выбора заменены проверками нового контракта; не оставлены ложным green
+доказательством прежней модели. No tests silently skipped or waived.
+
+Final offline SQL suite:10 tests,10 PASS,0 FAIL,0 SKIP:
+1)100 admissions с совпадающим timestamp и55s alias:500 предложений, все22 класса,
+   все посещены в первые5 turns; итоговые counts22..23, spread1; read-only diagnostics.
+2)100 fresh logical client wrappers, один serialized WASM backend: общий прогресс,
+  500 offers, нет повтора класса внутри порции. Это НЕ100 физических PG sessions.
+3)Два отдельных Node процесса с file-backed PGlite: первый committed первые5,
+   закрыл DB; второй открыл её и получил следующие5. Это настоящий процессный
+   restart с disk persistence, но не SIGKILL во время commit/fsync.
+4)Ошибка после реального UPDATE до commit откатывает все counters; следующий
+   admission возвращает прежние ожидаемые классы.
+5)Discard committed offer не исключает класс из последующих попыток.
+6)Настоящее тело pump с управляемыми domain handlers: handlers вызваны после
+   закрытия admission transaction; ошибки всех handlers не мешают обслужить22.
+7)При удержанном callback локальный overlap skip сохраняется; отдельный client
+   wrapper продолжает admission; после освобождения хвост первой порции исполнен.
+8)Catalog mismatch не вызывает handlers и освобождает local guard; после
+   восстановления schema следующий pump работает.
+9)Counters >2^53 сохраняются точно; выбор и JSON diagnostics не округляют BigInt.
+10)EXPLAIN с enable_seqscan=off подтверждает доступный progress index path;
+   catalog SQL/code совпадают; admission не трогает business queue/lease relations.
+
+Движок @electric-sql/pglite0.5.8, только локальные memory/disposable file fixtures.
+Новая migration/CTE/UPDATE выполнялись настоящим PostgreSQL WASM, не переписанным
+симулятором SQL. Production service и существующий db-commit-kernel вызываются
+через Prisma-shaped adapter. Pump body извлечён из текущего job-scheduler и исполнен
+с управляемыми зависимостями; это не bootstrap полного Express/Render приложения.
+Node тестовый runtime24.19.0; присланный Render B1 —22.23.3. C1 на Node22/Render ещё
+не запускался. Prisma5.22.0 validate PASS (dummy local URL лишь для config validation).
+Schema diff: одна additive table и её keys/indexes. Changed JS/CJS syntax PASS7.
+Index proof на22 metadata rows подтверждает доступность index path, не целевой
+planner/latency many-large-agencies benchmark. Ordinary multi-backend contention,
+kill/reconnect ambiguity, physical worker fairness under lock churn НЕ RUN.
+B1 eleven SQL tests исторические PASS остаются в полной цепочке, не присвоены C1
+как заново выполненные. Его busy branch заново проверен в текущей Node suite.
+
+7. ПАКЕТ И ВОССТАНОВЛЕНИЕ
+C1 delta к свежему B1:11 новых/изменённых файлов, новая migration1, Desktop edits0.
+Полностью cumulative Phase6 backend changed-only от исходного I7:18 файлов,
+включая B1 и C1, всего additive Phase6 migrations2. Удаляемых файлов0.
+Исходный I7 и свежий B1 + cumulative overlay оба дают тот же target1252files.
+В code ZIP нет node_modules, env, logs или secret material. Пути относительно
+корня Backend сохранены. docs в TXT, не MD.
+
+Новый cumulative checkpoint начинается всеми835069bytes B1 TXT побайтно,
+SHA256 B1 checkpoint:
+967d807c26ccb7177c0759a5e2ab9e3a6a0c8d9f9743544199cd794ccd4fca67.
+Предыдущий cumulative evidence включён целиком, вместе с новой доказательной
+частью и текущим cumulative code ZIP. SHA/reconstruction manifest приложены.
+Последующие checkpoints должны наращивать этот полный документ.
+
+8. ВЕРДИКТ И СЛЕДУЮЩИЕ УЗЛЫ
+P6-F8: причина wall-clock starvation устранена в C1; source/control/embedded SQL
+proof PASS, обычная cross-session физическая приёмка пока OPEN.
+P6-F5/F6: B1 реализация сохранена, её migration rollout теперь подтверждён логом;
+ordinary capacity two-client/rollout-contention gate остаётся OPEN. Дополнительно
+уточнён health результат normal owner contention.
+P6-F1/F2 Home, F3/F4 Chromium, F7 MessageLibrary idempotency и полный non-admin
+mutation inventory ещё OPEN. AI/Chromium shared host pressure policy — OPEN.
+Phase5B B12 build/runtime gates, server history S01..S07 и Phase7 purge не закрыты.
+
+SOURCE CLOSED всей Phase6: НЕТ.
+SCALE CLOSED: НЕТ.
+СТАВИТЬ НОВЫЙ C1: ПОКА НЕТ; ordinary PostgreSQL independent-client acceptance
+для B1/C1 и C1 Node22 rollout не подтверждены. Присланный лог подтверждает только
+фактическое применение B1, не даёт задним числом всех missing gates.
+Полная физическая fleet A*C*M*H*W не превращается в обязательный барьер для
+архитектурного продолжения; SOURCE/SQL gate и физический SCALE статус разделены.
+Следующий функциональный узел по принятому порядку —6A Home: relational access
+scope + bounded summary/list API cutover с сохранением coverage/permissions.
+================================================================================

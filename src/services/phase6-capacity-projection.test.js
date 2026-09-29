@@ -37,7 +37,7 @@ test('B1 busy transaction owner returns before reading source or invoking public
  const tx={$executeRawUnsafe:async()=>1,$queryRawUnsafe:async(sql)=>{calls.push(sql);if(/pg_try_advisory_xact_lock/.test(sql))return[{acquired:false}];throw Error('unexpected read');}};
  const db={$transaction:async(work)=>work(tx)};
  const r=await runProviderCapacityProjectionBatch({db,publish:async()=>{published=true;}});
- assert.equal(r.reason,'capacity_projection_busy'); assert.equal(published,false);assert.equal(calls.length,1);
+ assert.equal(r.reason,'capacity_projection_busy'); assert.equal(r.ok,true); assert.equal(r.skipped,true); assert.equal(r.persisted,false); assert.equal(published,false);assert.equal(calls.length,1);
 });
 test('B1 raw client cannot publish outside the commit owner',async()=>{
  await assert.rejects(debt.persistProviderCapacityDebtSnapshot({db:{},snapshot:{}}),{code:'CAPACITY_PUBLICATION_OWNER_REQUIRED'});

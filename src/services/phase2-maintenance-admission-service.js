@@ -1,25 +1,100 @@
 "use strict";
 
-function bounded(value, fallback, max) {
-  const n = Math.floor(Number(value) || fallback);
-  return Math.max(1, Math.min(max, n));
+const { runRootCommit } = require("./db-commit-kernel");
+
+const MAINTENANCE_ADMISSION_GENERATION = "phase6_maintenance_progress_v1";
+const MAINTENANCE_LANE_NAMES = Object.freeze([
+  "providerCapacityProjection", "messageLibraryTrash", "adminBillingPricing",
+  "notificationHistoryRepair", "notificationConsequences", "agencyDestructiveCleanup",
+  "creatorDestructiveCleanup", "providerOperationalBackfill", "subscriberDirectoryMaintenance",
+  "creatorRecurringPlanning", "campaignFanRefreshPromotion", "dependencyFanout",
+  "customReminderWork", "providerOperationalDirty", "telegramConfirmedProjection",
+  "telegramInboundProjection", "customExternalProofConvergence", "teamMoneyReconciliation",
+  "teamReadSummary", "teamPendingBackfill", "teamResponseRangeRepair", "teamLegacyPendingRepair",
+]);
+const MAX_MAINTENANCE_LANES_PER_TICK = 5;
+const MAX_CATALOG_ROWS = 64;
+
+function failure(code) { return Object.assign(new Error(code), { code }); }
+function validateMaintenanceLaneNames(laneNames) {
+  if (!Array.isArray(laneNames) || laneNames.length !== MAINTENANCE_LANE_NAMES.length) throw failure("MAINTENANCE_ADMISSION_CATALOG_MISMATCH");
+  const names = new Set(laneNames);
+  if (names.size !== laneNames.length || MAINTENANCE_LANE_NAMES.some((name) => !names.has(name))) throw failure("MAINTENANCE_ADMISSION_CATALOG_MISMATCH");
 }
 
-function selectPhase2MaintenanceLanes({ laneNames, now = new Date(), intervalMs = 5_000, lanesPerTick = 5 } = {}) {
-  const names = Array.from(new Set((Array.isArray(laneNames) ? laneNames : []).map((v) => String(v || "").trim()).filter(Boolean)));
-  if (!names.length) return { generation: "phase2_fair_admission_v1", round: 0, startIndex: 0, lanesPerTick: 0, totalLanes: 0, selected: [] };
-  const at = now instanceof Date ? now : new Date(now);
-  if (!Number.isFinite(at.getTime())) throw new Error("PHASE2_MAINTENANCE_ADMISSION_TIME_REQUIRED");
-  const interval = bounded(intervalMs, 5_000, 60 * 60 * 1000);
-  const quantum = bounded(lanesPerTick, Math.min(5, names.length), names.length);
-  const round = Math.floor(at.getTime() / interval);
-  // Advance by the admitted quantum, not by one slot.  Under sustained load a
-  // ten-lane/five-slot pump therefore admits every lane within two ticks rather
-  // than making adjacent five-lane windows overlap for nine ticks.
-  const startIndex = ((((round * quantum) % names.length) + names.length) % names.length);
-  const selected = [];
-  for (let offset = 0; offset < quantum; offset += 1) selected.push(names[(startIndex + offset) % names.length]);
-  return { generation: "phase2_fair_admission_v1", round, startIndex, lanesPerTick: quantum, totalLanes: names.length, selected };
+function validateStoredCatalog(catalog) {
+  if (catalog.length !== MAINTENANCE_LANE_NAMES.length || catalog.some((row, i) =>
+    row.laneName !== MAINTENANCE_LANE_NAMES[i] || Number(row.ordinal) !== i)) {
+    throw failure("MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH");
+  }
 }
 
-module.exports = { selectPhase2MaintenanceLanes };
+async function readMaintenanceAdmissionProgress({ db } = {}) {
+  if (typeof db?.$queryRawUnsafe !== "function") throw failure("MAINTENANCE_ADMISSION_READ_CLIENT_REQUIRED");
+  const rows = await db.$queryRawUnsafe(`SELECT "laneName","ordinal","turnCount","lastAdmittedAt"
+    FROM "MaintenanceAdmissionClassState" WHERE "generation"=$1
+    ORDER BY "ordinal" LIMIT $2`, MAINTENANCE_ADMISSION_GENERATION, MAX_CATALOG_ROWS + 1);
+  validateStoredCatalog(rows);
+  const turns = rows.map((row) => BigInt(row.turnCount));
+  const minimum = turns.reduce((a, b) => a < b ? a : b);
+  const maximum = turns.reduce((a, b) => a > b ? a : b);
+  return {
+    generation: MAINTENANCE_ADMISSION_GENERATION,
+    readOnly: true,
+    meaning: "dispatch_opportunities_not_completed_work",
+    totalLanes: rows.length,
+    minimumTurns: String(minimum), maximumTurns: String(maximum), spread: String(maximum - minimum),
+    lanes: rows.map((row) => ({ name: row.laneName, turn: String(row.turnCount), lastAdmittedAt: row.lastAdmittedAt })),
+  };
+}
+
+async function selectPhase2MaintenanceLanes({ db, laneNames, lanesPerTick = MAX_MAINTENANCE_LANES_PER_TICK } = {}) {
+  validateMaintenanceLaneNames(laneNames);
+  const requested = Number(lanesPerTick);
+  const quantum = Number.isFinite(requested)
+    ? Math.max(1, Math.min(MAX_MAINTENANCE_LANES_PER_TICK, Math.floor(requested)))
+    : MAX_MAINTENANCE_LANES_PER_TICK;
+  // The progress counter records a dispatch opportunity, NOT a domain claim or
+  // successful business effect. A crash after this commit loses only an offer:
+  // canonical work/leases remain with each lane and the class is admitted again.
+  // Require its own root: joining a caller transaction could retain these class
+  // locks during business execution and report offers before their commit.
+  return runRootCommit(db, async ({ tx }) => {
+    const catalog = await tx.$queryRawUnsafe(`SELECT "laneName","ordinal"
+      FROM "MaintenanceAdmissionClassState" WHERE "generation"=$1
+      ORDER BY "ordinal" LIMIT $2`, MAINTENANCE_ADMISSION_GENERATION, MAX_CATALOG_ROWS + 1);
+    validateStoredCatalog(catalog);
+    // Per-class row locks only. No singleton cursor/clock lock and no lock held
+    // while executing a lane. Slow/failed callbacks consume their turn instead
+    // of resetting the fleet to a wall-clock phase after every restart.
+    const rows = await tx.$queryRawUnsafe(`WITH candidates AS MATERIALIZED (
+      SELECT "generation","laneName","ordinal","turnCount"
+      FROM "MaintenanceAdmissionClassState"
+      WHERE "generation"=$1
+      ORDER BY "turnCount","ordinal"
+      LIMIT $2 FOR UPDATE SKIP LOCKED
+    ), advanced AS (
+      UPDATE "MaintenanceAdmissionClassState" state SET
+        "turnCount"=state."turnCount"+1, "lastAdmittedAt"=clock_timestamp()
+      FROM candidates c
+      WHERE state."generation"=c."generation" AND state."laneName"=c."laneName"
+      RETURNING state."laneName",state."turnCount",state."lastAdmittedAt",c."ordinal",c."turnCount" AS "previousTurn"
+    ) SELECT * FROM advanced ORDER BY "previousTurn","ordinal"`, MAINTENANCE_ADMISSION_GENERATION, quantum);
+    if (rows.length > quantum || new Set(rows.map((row) => row.laneName)).size !== rows.length ||
+      rows.some((row) => !MAINTENANCE_LANE_NAMES.includes(row.laneName))) throw failure("MAINTENANCE_ADMISSION_RESULT_INVALID");
+    return {
+      ok: true,
+      generation: MAINTENANCE_ADMISSION_GENERATION,
+      policy: "least_admitted_class",
+      lanesPerTick: quantum,
+      totalLanes: MAINTENANCE_LANE_NAMES.length,
+      selected: rows.map((row) => row.laneName),
+      turns: rows.map((row) => ({ name: row.laneName, turn: String(row.turnCount), admittedAt: row.lastAdmittedAt })),
+      contended: quantum - rows.length,
+      skipped: rows.length === 0,
+      reason: rows.length === 0 ? "maintenance_admission_contended" : null,
+    };
+  }, { maxWait: 1500, timeout: 3000, deadlineMs: 5000, lockTimeoutMs: 1000, statementTimeoutMs: 2000, maxAttempts: 2 });
+}
+
+module.exports = { selectPhase2MaintenanceLanes, readMaintenanceAdmissionProgress, validateMaintenanceLaneNames, MAINTENANCE_ADMISSION_GENERATION, MAINTENANCE_LANE_NAMES, MAX_MAINTENANCE_LANES_PER_TICK };

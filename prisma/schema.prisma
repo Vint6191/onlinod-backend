@@ -6545,3 +6545,15 @@ model ProviderCapacityBucket {
   overdueCount  BigInt @default(0)
   requiredCalls BigInt @default(0)
 }
+
+// Dispatch opportunities only; DomainWork/MaintenanceLane still own execution.
+model MaintenanceAdmissionClassState {
+  generation     String    @db.VarChar(80)
+  laneName       String    @db.VarChar(120)
+  ordinal        Int
+  turnCount      BigInt    @default(0)
+  lastAdmittedAt DateTime?
+  @@id([generation, laneName])
+  @@unique([generation, ordinal], map: "MaintenanceAdmissionClassState_generation_ordinal_key")
+  @@index([generation, turnCount, ordinal], map: "MaintenanceAdmissionClassState_turn_idx")
+}

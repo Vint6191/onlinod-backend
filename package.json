@@ -57,7 +57,8 @@
     "test:phase5-history": "node scripts/audit/phase5-commit-test-gate.js phase5-notification-history-tests.json",
     "audit:phase5-history-postgres": "node scripts/audit/phase5-notification-history-postgres-proof.js",
     "test:phase5-receipts": "node scripts/audit/phase5-commit-test-gate.js phase5-subscription-receipt-tests.json",
-    "test:phase5-closure": "node scripts/audit/phase5-commit-test-gate.js phase5-closure-tests.json"
+    "test:phase5-closure": "node scripts/audit/phase5-commit-test-gate.js phase5-closure-tests.json",
+    "phase6:maintenance-admission": "node scripts/phase6-maintenance-admission.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",
