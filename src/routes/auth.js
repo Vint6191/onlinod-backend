@@ -65,8 +65,8 @@ const refreshSchema = z.object({
 });
 
 const resetPasswordSchema = z.object({
-  token: z.string().min(20),
-  password: z.string().min(8),
+  token: z.string().min(20).max(256),
+  password: z.string().min(8).max(200),
 });
 
 
@@ -601,45 +601,10 @@ router.post("/forgot-password", async (req, res) => {
 router.post("/reset-password", async (req, res) => {
   try {
     const input = resetPasswordSchema.parse(req.body);
-    const tokenHash = sha256(input.token);
-
-    const record = await prisma.authToken.findUnique({
-      where: { tokenHash },
-      include: { user: true },
-    });
-
-    if (!record || record.type !== "PASSWORD_RESET") {
-      return res.status(400).json({ ok: false, code: "TOKEN_INVALID", error: "Reset token is invalid" });
-    }
-    if (record.usedAt) {
-      return res.status(400).json({ ok: false, code: "TOKEN_USED", error: "Reset token was already used" });
-    }
-    if (record.expiresAt < new Date()) {
-      return res.status(400).json({ ok: false, code: "TOKEN_EXPIRED", error: "Reset token expired" });
-    }
-
-    const passwordHash = await bcrypt.hash(input.password, 12);
-
-    await runDbTransaction(prisma, async (tx) => {
-      await acquireAuthorizationUserLock(tx, { userId: record.userId });
-      const revokedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
-      await tx.authToken.update({ where: { id: record.id }, data: { usedAt: revokedAt } });
-      // Password reset is account recovery, so unlike an in-app password change
-      // it intentionally invalidates every device, including already-issued
-      // access JWTs. Device-bound clients are also cut off by refresh-session
-      // lineage; sessionsRevokedAt covers legacy/unbound access tokens.
-      await tx.user.update({ where: { id: record.userId }, data: { passwordHash, sessionsRevokedAt: revokedAt } });
-      await tx.refreshSession.updateMany({
-        where: { userId: record.userId, revokedAt: null, expiresAt: { gt: revokedAt } },
-        data: { revokedAt },
-      });
-    });
-
-    return res.json({ ok: true });
+    return res.json(await require("../services/account-password-reset-service").resetAccountPassword({ db: prisma, ...input }));
   } catch (err) {
     if (err?.issues) return validationError(res, err);
-    console.error("[auth/reset-password] failed:", err);
-    return res.status(500).json({ ok: false, code: "RESET_PASSWORD_FAILED", error: "Failed to reset password" });
+    return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "RESET_PASSWORD_FAILED", error: err?.status ? err.message : "Failed to reset password" });
   }
 });
 

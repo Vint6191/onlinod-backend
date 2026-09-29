@@ -4,6 +4,7 @@ const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-servi
 const { effectiveBillingState, liveEntitlementEnd, scopedEntitlement } = require("./billing-state-service");
 
 const bcrypt = require("bcryptjs");
+const { sessionRevision, readActiveSessions } = require("./account-security-state");
 const { digest } = require("./team-command-contract");
 const prisma = require("../prisma");
 const { publicUser, issuePasswordReset } = require("./auth-service");
@@ -142,6 +143,7 @@ function accountDevicesFromSessions({ sessions, workerDevices, currentDeviceId }
       expiresAt,
       rememberDevice: rows.some((row) => row.rememberDevice === true),
       activeSessionCount: rows.length,
+      revision: sessionRevision(rows),
       isThisDevice: !!currentDeviceId && id === currentDeviceId,
     });
   }
@@ -158,10 +160,7 @@ async function getAccountSettings({ userId, currentDeviceId = null, db = null })
   const now = await dbAuthorityNow({ db: client, fallbackNow: new Date() });
   const [user, sessions, workerDevices] = await Promise.all([
     client.user.findUnique({ where: { id: userId } }),
-    client.refreshSession.findMany({
-      where: { userId, revokedAt: null, expiresAt: { gt: now } },
-      orderBy: [{ lastUsedAt: "desc" }, { createdAt: "desc" }],
-    }),
+    readActiveSessions(client, userId, now),
     client.workerDevice?.findMany
       ? client.workerDevice.findMany({
         where: { userId },
@@ -178,9 +177,10 @@ async function getAccountSettings({ userId, currentDeviceId = null, db = null })
   return {
     user: publicUser(user),
     currentDeviceId: normalizedDeviceId,
+    otherDevicesRevision: sessionRevision(sessions.filter(row => row.deviceId !== normalizedDeviceId)),
     devices: accountDevicesFromSessions({ sessions, workerDevices, currentDeviceId: normalizedDeviceId }),
     // Kept for backward-compatible desktop builds. New UI is device-oriented.
-    sessions: sessions.map((row) => sessionPublic(row, currentSession?.id || null)),
+    sessions: sessions.map((row) => ({ ...sessionPublic(row, currentSession?.id || null), revision: sessionRevision(row.deviceId ? sessions.filter(r => r.deviceId === row.deviceId) : [row]) })),
   };
 }
 

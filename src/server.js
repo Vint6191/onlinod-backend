@@ -317,6 +317,7 @@ app.use("/api/modules", authRequired, legacyModulesRoutes);
 app.use("/api/billing", billingRoutes);
 app.use("/api/settings", authRequired, settingsRoutes);
 app.use("/api/management/commands", managementCommandRoutes);
+app.use("/api/account-security/commands", require("./routes/account-security-commands"));
 app.use("/api/message-library", authRequired, legacyMessageLibraryRoutes);
 app.use("/api/creators", creatorRoutes);
 app.use("/api/creator-sessions", creatorSessionRoutes);

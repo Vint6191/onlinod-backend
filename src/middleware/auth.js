@@ -20,6 +20,9 @@ async function authRequired(req, res, next, { compactMembership = false } = {}) 
     const decoded = verifyAccessToken(token);
 
     const boundDeviceId = decoded.deviceId ? String(decoded.deviceId).trim().slice(0, 160) : null;
+    // An unbound legacy access JWT cannot be fenced by account device logout.
+    // Re-authentication publishes a device-bound session; no crypto keys change.
+    if (!boundDeviceId) return res.status(401).json({ ok: false, code: "AUTH_DEVICE_BOUND_SESSION_REQUIRED", error: "Sign in again with an updated Desktop" });
     const authorizationSessionId = decoded.authorizationSessionId ? String(decoded.authorizationSessionId).trim().slice(0, 220) : null;
     const authorizationNow = boundDeviceId ? await dbAuthorityNow({ db: prisma, fallbackNow: new Date() }) : null;
     const relations = {

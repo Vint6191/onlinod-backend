@@ -33,6 +33,7 @@ const {
 const { requireProductDevice } = require("../middleware/product-access");
 
 const router = express.Router();
+router.use(require("../middleware/retired-account-security-writes"));
 router.use(require("../middleware/retired-management-writes"));
 const uploadsDir = path.join(__dirname, "..", "..", "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });

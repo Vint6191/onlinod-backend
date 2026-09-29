@@ -46,13 +46,20 @@ test("INT60.5 RefreshSession mutation anti-map: every broad production updateMan
       const whereEnd = block.indexOf("data:");
       const where = whereEnd >= 0 ? block.slice(0, whereEnd) : block;
       const exactId = /\bid\s*:\s*(?!\{\s*not\b)/.test(where);
-      const lifetimeBounded = /expiresAt\s*:\s*\{\s*gt\s*:/.test(where);
+      const delegatedLineage = rel(file) === "src/services/auth-service.js" && /where:\s*refreshRevocationScope\(/.test(where);
+      if (delegatedLineage) {
+        const helper = source.slice(source.indexOf("function refreshRevocationScope"), source.indexOf("async function revokeRefreshReuseScope"));
+        assert.match(helper, /expiresAt:\s*\{\s*gt:/);
+        assert.match(helper, /authorizationSessionId: session.authorizationSessionId/);
+        assert.match(helper, /id: session.id/);
+      }
+      const lifetimeBounded = delegatedLineage || /expiresAt\s*:\s*\{\s*gt\s*:/.test(where);
       if (!exactId && !lifetimeBounded) {
         findings.push({ file: rel(file), where: where.replace(/\s+/g, " ").slice(0, 500) });
       }
     }
   }
-  assert.equal(count, 18, `RefreshSession updateMany touchpoint count changed; re-audit mutation classification before updating this freeze gate (count=${count})`);
+  assert.equal(count, 19, `RefreshSession updateMany touchpoint count changed; re-audit mutation classification before updating this freeze gate (count=${count})`);
   assert.deepEqual(findings, [], `broad RefreshSession mutations must exclude expired history: ${JSON.stringify(findings)}`);
 });
 

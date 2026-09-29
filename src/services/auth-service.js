@@ -127,33 +127,21 @@ async function issueEmailVerification(user) {
 }
 
 async function issuePasswordReset(user) {
-  await prisma.authToken.updateMany({
-    where: {
-      userId: user.id,
-      type: "PASSWORD_RESET",
-      usedAt: null,
-    },
-    data: {
-      usedAt: new Date(),
-    },
-  });
-
-  const issued = await createAuthToken({
-    userId: user.id,
-    type: "PASSWORD_RESET",
-    ttlMinutes: 30,
-    withCode: false,
-  });
-
-  const emailResult = await passwordResetEmail({
-    email: user.email,
-    token: issued.token,
-  });
-
-  return {
-    token: issued.token,
-    emailResult,
-  };
+  const token = randomToken(32);
+  const issued = await withAuthorizationUserLock({ db: prisma, userId: user.id, work: async tx => {
+    await tx.$queryRawUnsafe('SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE', user.id);
+    const current = await tx.user.findUnique({ where: { id: user.id } });
+    // Do not issue a token from a stale pre-password-change snapshot.
+    if (!current || current.disabledAt || current.passwordHash !== user.passwordHash)
+      throw Object.assign(new Error("Account credentials changed; request a new reset email"), { code: "PASSWORD_RESET_STALE", status: 409 });
+    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+    await tx.authToken.updateMany({ where: { userId: user.id, type: "PASSWORD_RESET", usedAt: null }, data: { usedAt: now } });
+    await tx.authToken.create({ data: { userId: user.id, type: "PASSWORD_RESET", tokenHash: sha256(token), expiresAt: new Date(now.getTime() + 30 * 60_000) } });
+    return { email: current.email };
+  } });
+  // Delivery is an external effect. No automatic provider resend or transaction retry.
+  const emailResult = await passwordResetEmail({ email: issued.email, token });
+  return { token, emailResult };
 }
 
 async function createRefreshSession({
@@ -369,19 +357,20 @@ async function verifyEmailByCode({ email, code }) {
   };
 }
 
+function refreshRevocationScope(session, now) {
+  const base = { userId: session.userId, agencyId: session.agencyId, revokedAt: null, expiresAt: { gt: now } };
+  // Possession of an old token authorizes revocation of its own login lineage,
+  // never a fresh login on the same device or a different agency.
+  return session.authorizationSessionId
+    ? { ...base, deviceId: session.deviceId || null, authorizationSessionId: session.authorizationSessionId }
+    : { ...base, id: session.id }; // no inferred family for a legacy NULL lineage
+}
 async function revokeRefreshReuseScope(session) {
-  const boundDeviceId = String(session?.deviceId || "").trim();
   return withAuthorizationUserLock({ db: prisma, userId: session.userId, work: async (tx) => {
     const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
-    return tx.refreshSession.updateMany({
-      where: {
-        userId: session.userId,
-        revokedAt: null,
-        expiresAt: { gt: now },
-        ...(boundDeviceId ? { deviceId: boundDeviceId } : {}),
-      },
-      data: { revokedAt: now },
-    });
+    const current = await tx.refreshSession.findUnique({ where: { id: session.id } });
+    if (!current) return { count: 0 };
+    return tx.refreshSession.updateMany({ where: refreshRevocationScope(current, now), data: { revokedAt: now } });
   } });
 }
 
@@ -605,7 +594,7 @@ async function revokeRefreshToken(refreshToken) {
   if (!refreshToken) return { ok: true };
   const tokenHash = sha256(refreshToken);
   const session = await prisma.refreshSession.findUnique({ where: { tokenHash } });
-  if (!session || session.revokedAt) return { ok: true };
+  if (!session || session.impersonatedByAdminId) return { ok: true };
   const boundDeviceId = String(session.deviceId || "").trim();
   await withAuthorizationUserLock({ db: prisma, userId: session.userId, work: async (tx) => {
     await acquireAuthorizationDeviceLock(tx, {
@@ -614,10 +603,10 @@ async function revokeRefreshToken(refreshToken) {
       deviceId: boundDeviceId,
     });
     const revokeNow = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+    const current = await tx.refreshSession.findUnique({ where: { id: session.id } });
+    if (!current) return;
     await tx.refreshSession.updateMany({
-      where: boundDeviceId
-        ? { userId: session.userId, deviceId: boundDeviceId, revokedAt: null, expiresAt: { gt: revokeNow } }
-        : { id: session.id, revokedAt: null },
+      where: refreshRevocationScope(current, revokeNow),
       data: { revokedAt: revokeNow },
     });
   } });
@@ -626,6 +615,7 @@ async function revokeRefreshToken(refreshToken) {
 
 module.exports = {
   publicUser,
+  refreshRevocationScope,
   getPrimaryMembership,
   issueEmailVerification,
   issuePasswordReset,

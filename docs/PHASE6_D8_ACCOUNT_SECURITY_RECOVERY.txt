@@ -1,0 +1,284 @@
+================================================================================
+ONLINOD — PHASE 6 / D8 — ACCOUNT SECURITY + LOGIN LINEAGE RECOVERY
+Продолжение D7 по актуалу Desktop 95 / Backend 2026-09-30T012319.175
+Полностью накопительный checkpoint. Предыдущий D7 сохранён точным префиксом.
+================================================================================
+
+0. РЕЗУЛЬТАТ И ЧЕСТНАЯ ГРАНИЦА
+
+Крупный связанный D8 блок реализован: изменение пароля, выход с выбранного/других
+устройств и совместимые операции сессий, зашифрованное восстановление Desktop,
+оригинальная login lineage для token logout/reuse, одноразовое применение reset
+и сериализация его выдачи. Это развитие нашего ONLINOD по аудиту шестой фазы.
+Это не закрытие всех настроек, всех auth-протоколов или всей шестой фазы.
+
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ: ПОКА НЕТ.
+Деплоя, внешнего SQL, Render/Neon, настоящих email/providers и нативного Electron
+не было. Disposable offline SQL разрешён и использован. Ровно один OWNER на
+агентство сохраняется. Серверное хранение истории остаётся отдельным узлом.
+
+1. ПРОВЕРЕННЫЙ АКТУАЛ
+
+95.zip
+SHA256 60565f3aa69df7fcf9304e97314d134f4182d5653cc082695fefd4ae07ca4165
+1204 файла. Все присутствующие файлы побайтово равны D7, без новых/изменённых.
+Не включены 19 исторических docs. Они сохранены в целевом накопительном дереве;
+это не изменение рабочего кода со стороны пользователя.
+
+onlinod-backend-main - 2026-09-30T012319.175.zip
+SHA256 774afade23cfc886622475f4a5a4cd1deb165196b0420b2444d1e35515fa63ae
+1294 файла, полное совпадение D7 без добавлений/изменений/пропусков. AGENTS.md нет.
+Присланные файлы читались напрямую из upload; через Library не перечитывались.
+
+Корни:
+/workspace/scratch/0495154fe552/work/phase6-d8-backend
+/workspace/scratch/0495154fe552/work/phase6-d8-desktop
+Evidence: /workspace/scratch/0495154fe552/evidence-phase6-d8.
+Родительские phase6-d7-* неизменны. Исходные bases — Backend I7 и Desktop77.
+
+2. ВОСПРОИЗВЕДЁННЫЕ ДЕФЕКТЫ D7
+
+Одинаковые управляемые поведенческие сценарии против D7 и D8:
+D7 — 0 PASS / 6 ожидаемых FAIL. D8 — все шесть PASS в общем наборе.
+Это подтверждённые отсутствующие гарантии, не шесть известных production-инцидентов.
+
+- Reuse старого refresh token отзывал более новый login того же устройства.
+- Logout с уже ротированным токеном возвращал успех, не прекращая его живую lineage.
+- Запоздавший logout с ещё не отозванным токеном затрагивал другой новый login
+  и даже сессии этого устройства в другом агентстве.
+- Reset-token, использованный во время bcrypt, повторно менял пароль.
+- Reset-token, истёкший во время bcrypt, не перепроверялся перед записью.
+- Старый access JWT без device binding обходил проверку живой refresh lineage.
+
+Дополнительно новый SQL-набор доказал последствия идемпотентности: старое действие
+выхода больше не отзывает новые входы; replay смены пароля не заменяет более новый
+пароль и не требует заново принимать уже сменённый старый пароль. Старый snapshot
+списка устройств не применяется к новому входу до первого исполнения команды.
+
+3. ВЛАДЕЛЕЦ КОМАНД БЕЗОПАСНОСТИ АККАУНТА
+
+Новый специализированный endpoint POST /api/account-security/commands/v1 и /cancel.
+Пять строгих действий: account.password, account.logoutDevice, account.logoutOthers,
+account.revokeSession, account.revokeOthers. Старый общий management transport
+по-прежнему обслуживает свои 13 действий; секрет пароля туда не попадает.
+
+Применена существующая таблица ManagementCommandReceipt D6 без новой миграции.
+Отдельное пространство account_security_v1_ исключает пересечение идентификаторов
+с другими management-командами. UUID + SHA256 fingerprint исходного действия,
+target и payload; UUID входит в digest. В receipt нет plaintext пароля, bcrypt hash
+или refresh/access token. Для этого домена reference хранит малый результат
+исторического события: actor/устройство, исходная login lineage, counts и flags.
+Это не снимок актуального пароля/всех сессий. Replay подтверждает прежний commit.
+
+При новом исполнении payload связывается с deviceId и authorizationSessionId из
+подписанного access JWT. Старая ещё не выполненная команда не исполняется под
+новым login: ACCOUNT_SECURITY_ORIGIN_CHANGED; её можно отменить и создать новое
+осознанное действие. Уже выполненную команду новый login того же account/agency
+может подтвердить без повторного эффекта. Cancel-before-execute пишет ABANDONED;
+commit-before-cancel подтверждает commit и не возвращает прежний пароль/сессии.
+
+Внутри одного kernel root: общий Agency lifecycle barrier, mutex команды,
+authorization-user lock, User FOR UPDATE, актуальный User/Member/epoch и живая
+подписанная login lineage, изменение домена, required audit, receipt. Login,
+refresh, reset, logout используют тот же account lock. Результат не признаётся
+по request-time auth. Проверка actor и его текущей lineage нужна и при replay/cancel.
+Владелец не требуется для собственного пароля/выхода: любой живой участник меняет
+только свой аккаунт. Один OWNER агентства не нарушается.
+
+bcrypt выполняется до длинной SQL-транзакции. Прочитанный credential hash ещё раз
+сравнивается под User lock; чужой password change/reset не перезаписывается старой
+проверкой. Наличие receipt проверяется раньше повторной проверки старого пароля.
+Если commit произошёл параллельно bcrypt, receipt внутри root имеет приоритет
+перед сохранённой ошибкой подготовки. Повтор транзакции с внешними эффектами
+не вводился. Пароль и audit/receipt атомарны; требование audit обязательно.
+
+4. СПИСОК УСТРОЙСТВ И ВЕРСИЯ ПОКАЗАННОГО НАМЕРЕНИЯ
+
+Account settings выдаёт revision каждой группы устройства/legacy session и
+otherDevicesRevision. Snapshot состоит из agency/device/login lineage, сортируется
+и дедуплицируется. Обычная refresh rotation сохраняет revision; новый login меняет
+её. Для NULL-lineage строк используется точный row ID: выдуманной семьи токенов нет.
+lastUsedAt, worker heartbeat и смена срока при refresh не ломают версию редактора.
+
+Перед отзывом выбранных входов сервер повторно вычисляет этот snapshot под общим
+account lock. Новое устройство/новый login не отзывается старым delayed intent:
+возвращается ACCOUNT_SECURITY_SESSION_CHANGED без частичного logout.
+Account logout остаётся межагентским по самому user: выбранное устройство своего
+аккаунта отзывается во всех его агентствах, другие пользователи не затрагиваются.
+Все UPDATE ограничены живыми строками и точными id выбранного snapshot.
+
+Перечисление live RefreshSession ограничено 2048 строками на аккаунт; 2049-я
+вызывает явную ошибку и не даёт выполнить усечённый logout. Это локальный предел
+операции одного аккаунта, не утверждение о пределе агентств или моделей платформы.
+
+5. ТОКЕНЫ LOGIN И PASSWORD RESET
+
+/api/auth/logout и containment при refresh-token reuse теперь отзывают только
+исходную user/agency/device/authorizationSessionId. Поздний старый токен не получает
+власть над новым login. Ротированный токен всё ещё может прекратить собственную
+lineage. После account lock исходная строка перечитывается, в том числе после
+legacy adoption; request-time snapshot не определяет более широкое действие.
+
+NULL-lineage refresh token может отозвать только собственную строку. Исторической
+семьи у него нет; account/device-wide fallback удалён. Полная family-reuse защита
+возможна для lineage-aware login. Не выдавать это за реконструкцию legacy family.
+Logout всех логических входов устройства принадлежит явной security-команде.
+
+authRequired отклоняет access JWT без device binding: такой JWT не мог быть
+немедленно ограничен device logout. Код AUTH_DEVICE_BOUND_SESSION_REQUIRED требует
+повторного входа с актуального Desktop. Device-bound legacy NULL-lineage refresh
+сохраняет прежний upgrade/adoption путь; новые security-команды требуют явной
+lineage. Никакие WorkerDevice, AMK/CDK и криптопривязки logout не удаляет.
+
+Reset-token потребляется только после повторных usedAt/expiresAt проверок под
+User lock и по времени БД. Условный updateMany дополнительно проверяет usedAt=null
+и expiresAt>now. Пароль, потребление reset-token, закрытие всех прочих reset-tokens,
+sessionsRevokedAt и отзыв всех live refresh sessions — одна транзакция.
+Два конкурирующих запроса reset не могут оба записать пароль. Ошибка записи User
+откатывает потребление и отзыв. Lost reset response не воспроизводится как новый
+успех: TOKEN_USED требует проверить вход с уже заданным паролем либо новый reset.
+
+In-app password change тоже закрывает все старые неиспользованные reset-tokens.
+Выдача reset-token теперь сериализована тем же User lock, проверяет актуальную
+активность и исходный credential hash, заменяет старые tokens атомарно, использует
+DB clock для срока. Отправка email остаётся после commit и отдельным внешним
+эффектом: durable mail outbox/idempotency provider здесь не заявляется. Два явных
+запроса выдачи могут отправить два письма, но текущий token останется один.
+Email verification, полный login/registration lifecycle остаются вне закрытия D8.
+
+6. DESKTOP / UI И СЕКРЕТНЫЙ ЖУРНАЛ
+
+Новый AccountSecurityCommandTransport использует отдельный
+account-security-pending-v1.json. Весь журнал зашифрован Electron safeStorage;
+недоступный keychain или basic_text останавливает действие ДО HTTP. Нет plaintext
+fallback, пароли/хеши намерения не попадают в открытые labels или pending RPC.
+Коррупция/decrypt failure не очищает pending intent. AtomicJsonStore сохраняет
+fsync и восстановление Windows .bak. Ограничения: 32 записи / 4 MiB encrypted
+journal, 4 KiB payload, один unresolved security slot на backend/user/agency.
+
+DurableCommandTransport получил optional journal codec. Секретные payload допускает
+только явно защищённый transport; обычные Team/Message Library/Management журналы
+сохраняют прежнее поведение и дополнительно запрещают currentPassword/newPassword.
+Регрессионные проверки старых команд прошли. Не вводится общий обход запрета секретов.
+
+Изначальный UUID, payload и origin login сохраняются ДО запроса, остаются после
+HTTP/IPC loss и Main restart до ACK. Before/after CONTROL permit и local incarnation
+отсекают поздний ответ. Ответ проверяется по action, user, device, origin lineage,
+counts/flags, включая невозможность self logout для logoutOthers/password.
+
+Подтверждённый self logout сначала подтверждает запись локально, затем очищает
+текущий authStore. Replay старого self logout после нового входа никогда не очищает
+новую сессию. Если reply пришёл после смены сессии, он не получает ACK как текущий.
+Сбой ACK сохраняет возможность дальнейшего восстановления.
+
+Settings/Main/typed RPC/UI связаны целиком: password, logoutDevice, logoutOtherDevices
+вызывают новый owner; устройства передают показанную revision. Совместимые старые
+Main session methods тоже направлены в owner, хотя активный UI device-oriented.
+Панель восстановления Settings показывает отдельную группу account security с
+Recover/Cancel. UI использует ACK helper; self logout уже завершает ACK в Main.
+Native Electron/safeStorage/реальная OS keychain здесь не запускались: codec tests
+используют управляемый криптографический адаптер, не выдают его за физическую ОС.
+
+7. CUTOVER И СОВМЕСТИМОСТЬ
+
+Пять старых маршрутов закрыты ранним 410 до handler:
+POST /api/settings/account/password
+DELETE /api/settings/account/devices/:deviceId
+POST /api/settings/account/devices/logout-others
+DELETE /api/settings/account/sessions/:sessionId
+POST /api/settings/account/sessions/revoke-others
+Case-insensitive и trailing slash проверены. Avatar, forgot-password, Telegram
+и reads не задеты gateway. Нет silent fallback на старую незащищённую запись.
+
+Route manifest учитывает новый owner: 52 production families. Anti-map теперь
+классифицирует 19 refreshSession.updateMany: новый command writer, перенесённый
+reset writer, delegated bounded lineage revocation. Устаревшая source-template
+проверка auth lock order обновлена до действующих helper/Admin owner; это не
+новое изменение админского кода. Старые bodies Settings за410 сохранены для
+исторической совместимости исходников, публичным write path больше не являются.
+
+Схема D8 побайтово равна D7. Новых migrations нет; существующая D6 receipt migration
+входит в накопительный Backend. Backend/Desktop требуют согласованного cutover.
+Старый Desktop на указанных путях получит410; unbound JWT потребует новый вход.
+Это причина не ставить одну сторону отдельно. Установка всего пакета пока не одобрена.
+
+8. ПРОВЕРКИ И ФИЗИЧЕСКИЕ ОГРАНИЧЕНИЯ
+
+Итог D8:
+- 390 Backend PASS / 0 FAIL / 0 SKIP;
+- 180 Desktop PASS / 0 FAIL / 0 SKIP;
+- 30 новых SQL-сценариев D8 PASS;
+- 27 SQL-регрессий D7 на текущем D8 PASS;
+- 6 управляемых D7-дефектов воспроизведены, после исправления PASS;
+- 19 JS syntax и 9 TS/TSX parse PASS;
+- prisma validate PASS; schema unchanged, isolated Prisma Client5.22 соответствует ей.
+
+SQL: PGlite0.5.8 + pglite-socket0.2.11 и actual Prisma5.22; полная цепочка migrations
+в отдельной disposable базе на каждый прогон. Один сериализованный адаптер не
+доказывает deadlock freedom или interleavings независимых production PG sessions.
+Секреты/аккаунты/email-провайдер в proof синтетические. Пользовательский DATABASE_URL
+не использовался. Существующий isolated client D6 повторно использован, т.к. schema
+не менялась в D7/D8. Никакого внешнего подключения к БД.
+
+Промежуточные SQL-прогоны сохранены: два локальных deadline, две ошибки fixture
+(второе Agency без generation guard; enum CHATTER вместо OPERATOR). После исправления
+fixture и увеличения ограниченного общего времени proof финальные30 и27 прошли.
+Старые шаблонные проверки количества routes/writers и auth source anchors обновлены
+после классификации текущих owners; итоговые логи не смешаны с исходными падениями.
+
+Legacy Backend settings-v12: 7 PASS / 4 FAIL одинаково на D7 и D8, те же имена падений.
+Они вне390 PASS и не объявлены исправленными. Две дополнительные старые Desktop
+проверки не загрузились: auth-session-resilience требует compiled dist, а
+ auth-session-store-security-v20-22 требует typescript. Они вынесены в BLOCKED,
+не включены в180 PASS и не заменены имитацией компилятора.
+
+npm run typecheck и npm run build BLOCKED: tsc:not found, exit127.
+TS parse, VM/runtime-tests и synthetic safeStorage НЕ означают полноценный build,
+Electron UI, физическую OS keychain, два реальных ПК или independent PostgreSQL.
+Длительная целевая нагрузка не проводилась; никакие SOURCE/SCALE CLOSED не выданы.
+
+9. НАКОПИТЕЛЬНАЯ ПОСТАВКА И RECONSTRUCTION
+
+Backend target: 1302 файлов; delta от D7: 19;
+накопительно от исходного I7: 116.
+Desktop target: 1226 файлов; delta от D7: 11;
+накопительно от исходного Desktop77: 149.
+
+ZIP changed-only относительно исходных I7/Desktop77, содержит все прежние D1–D7
+изменения. Проверены девять overlay-входов на каждую сторону: original, D1,D2,D3,
+D4,D5,D6,D7, новый актуал. Каждый даёт один target manifest. Удалений нет.
+SHA256, ZIP integrity, неизменность родителей/migrations и точный checkpoint prefix
+проверены. D7 checkpoint:1055548 bytes,
+SHA256 5ccc6c710ead84bcec7d94b1a68cbe31e5b15023d114d20ee72dd5ae0e126079.
+Evidence содержит целиком D7 evidence, текущие code ZIP, логи, tests/source deltas,
+manifests, owner review и актуальный mutation inventory. Файлы доставки сами в себя
+не включаются; delivery verification хранится отдельно, чтобы не создавать hash cycle.
+
+10. ОСТАВШИЙСЯ ПЛАН, КОТОРЫЙ НЕЛЬЗЯ ТЕРЯТЬ
+
+Inventory:394 literal declarations =298 mounted non-admin +59 unmounted +37admin.
+210 mounted ещё INVENTORY_ONLY; 2 reset issuance PARTIAL_OPEN и1retirement partial.
+Это очередь семантического review, не число багов и не процент готовности.
+
+Остаток6D:
+- account/creator avatar: filesystem+DB/recovery, текущий editor/version/readback;
+- email issuance/delivery/verification и оставшийся account lifecycle;
+- Telegram reminders/account creation/lifecycle/authorization/session handoff;
+- creator/device key rotations за пределами уже проверенного D5 root recovery;
+- creator retirement: lost response, local cleanup, multi-PC quiesce/physical drain;
+  Telegram identity resolution — самостоятельный протокол;
+- Custom/Telegram/submission/delivery intents/leases/receipts и UNKNOWN external
+  outcomes; никаких слепых пересылок и blanket HTTP cache;
+- job progress/results, programmatic OF write admission/settlement, наблюдения,
+  refresh других доменов и module controls: текущих владельцев сверять отдельно.
+6E: Chromium pending bounds, fairness очередей и давление на host.
+6F: полноценная сборка, native Electron/multi-PC, independent PostgreSQL и нагрузка.
+
+Следующий проход продолжать крупным связанным блоком без вопроса «продолжать ли».
+Для продолжения после нового актуала: сверить все present file hashes с D8,
+не терять исторические docs и весь накопительный checkpoint/evidence.
+Не заявлять готовность установки по одному количеству зелёных тестов.
+
+ВЕРДИКТ: D8 реализован и локально проверен в перечисленных границах.
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ: ПОКА НЕТ.
+================================================================================

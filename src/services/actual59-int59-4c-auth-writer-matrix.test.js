@@ -44,10 +44,19 @@ test("INT59.4C login and refresh use one lock order: user then device then optio
 
 test("INT59.4C refresh-only account writers serialize with login/refresh publication", () => {
   assert.match(settings(), /withAuthorizationUserLock\([\s\S]*?refreshSession\.updateMany/);
-  assert.match(settings(), /acquireAuthorizationUserLock\(tx,\s*\{\s*userId\s*\}\)[\s\S]{0,500}?user\.update[\s\S]{0,700}?refreshSession\.updateMany/);
+  const lock = settings().slice(settings().indexOf("async function lockEligibleAccountUser"), settings().indexOf("async function updateAccountProfile"));
+  assert.match(lock, /acquireAuthorizationUserLock\(db,\s*\{\s*userId\s*\}\)/);
+  const password = settings().slice(settings().indexOf("async function changeAccountPassword"), settings().indexOf("async function requestAccountPasswordReset"));
+  assert.ok(password.indexOf("lockEligibleAccountUser") < password.indexOf("tx.user.update"));
+  for (const file of ["services/account-security-command-service.js", "services/account-password-reset-service.js"]) {
+    const body = source(file); assert.ok(body.indexOf("await acquireAuthorizationUserLock") < body.indexOf("tx.refreshSession.updateMany"));
+  }
   assert.match(crypto(), /retireCurrentDeviceIdentity[\s\S]{0,1400}?acquireAuthorizationUserLock\(tx,\s*\{\s*userId\s*\}\)/);
-  assert.match(admin(), /users\/:id\/force-logout[\s\S]{0,1200}?acquireAuthorizationUserLock\(tx,\s*\{\s*userId:\s*user\.id\s*\}\)/);
-  assert.match(admin(), /devices\/:id\/kick[\s\S]{0,1200}?acquireAuthorizationUserLock\(tx,\s*\{\s*userId:\s*device\.userId\s*\}\)/);
+  assert.match(admin(), /force-logout", operationHandler\("user.logout"\)/);
+  assert.match(admin(), /devices\/:id\/kick", operationHandler\("device.kick"\)/);
+  const operations = source("services/admin-operational-command-service.js");
+  assert.match(operations, /acquireAuthorizationUserLock\(tx,\{userId:targetId\}\)/);
+  assert.match(operations, /acquireAuthorizationUserLock\(tx,\{userId:input.userId\}\)/);
 });
 
 test("INT59.4C business-authority writers remain fenced by current User/Member/Agency rows rather than a second auth authority", () => {
