@@ -1,0 +1,312 @@
+================================================================================
+ONLINOD — PHASE 6 / D1 — MESSAGE LIBRARY USAGE: DURABLE EVENT REPLAY
+Накопительное продолжение A2. Дата: 2026-09-29.
+================================================================================
+
+0. СТАТУС ЭТОГО ПРОХОДА
+
+Реализован первый целостный узел 6D: запись и повтор события использования
+Message Library от Desktop intent до серверного атомарного commit. Проведён
+статический инвентарь подключённых non-admin маршрутов с разделением известных
+владельцев, закрытых старых адресов и областей дальнейшего анализа.
+Это НЕ завершение всех non-admin mutations и НЕ закрытие всей шестой фазы.
+
+SOURCE CLOSED: НЕТ.
+SCALE CLOSED: НЕТ.
+СТАВИТЬ D1: ПОКА НЕТ. Накопительные исходные пакеты готовы для проверки;
+полный Desktop typecheck/build здесь снова заблокирован отсутствующим tsc.
+Обычный PostgreSQL с независимыми сессиями и реальный Electron не запускались.
+
+Внешняя БД/Render/Neon не открывались, SQL против них не выполнялся. Деплой,
+рассылки и production нагрузка не запускались. Все SQL fixtures — локальный
+PGlite. Никаких новых npm-пакетов, исправления npm audit --force и изменений
+зависимостей нет. Архивы не являются готовыми установщиками.
+
+1. АКТУАЛ И ЛОГ A2
+
+Desktop: 89.zip, 1320 entries / 1186 files; CRC без ошибки.
+SHA256: 69df27e7f9dc25b5c731e8d5a2e3a5308913d302438ea837679162a5909ec4e8.
+По сравнению с A2 target: changed=0, added=0; отсутствуют только 12 документов
+(11 исторических Phase5 B2..B12 и PHASE6_A2_HOME_BOUNDED_SCOPE.txt).
+Рабочий код совпадает. D1 продолжен из соответствующего A2 дерева с сохранением
+этих накопительных документов; отсутствие документов не объявлено кодовой регрессией.
+
+Backend: onlinod-backend-main - 2026-09-29T195125.008.zip,
+1570 entries / 1259 files; CRC без ошибки.
+SHA256: 04876113500ae8d454fbcab37d8fba5bd55e70fcbc92bc757708a51294ebae39.
+Полное побайтовое совпадение с A2 target: changed=0, added=0, missing=0.
+D1 Backend скопирован из этого присланного актуала в отдельное рабочее дерево.
+
+Лог: Вставленный текст(20260929-165110).txt, 17713 bytes.
+SHA256: cc08fa373330cd327354b0e6a811abff30ac7a7b731f7051226bc86e4205a8f7.
+Commit 82f42c08db53374a05d31398607749059f1f1d88; Node 22.23.3;
+Prisma Client 5.22.0. В 16:50:16.04857922Z применена миграция
+20260929170000_phase6_home_member_scope_v1. В 16:50:16.110475731Z —
+All migrations have been successfully applied. В 16:50:51.12806828Z — live.
+Адрес из предоставленного лога: https://onlinod-backend.onrender.com.
+
+Это новое подтверждение применения A2 миграции и запуска присланного Backend.
+Оно не подтверждает Home UI, Desktop build, multi-session claim fence или
+функциональность D1: нового D1 кода на момент этого лога ещё не было.
+Фрагмент postflight JSON обрывается перед live; отсутствующее не достраиваем.
+Лог npm audit сообщает 2 moderate / 2 high: зависимостями в D1 не занимались.
+
+2. КОНКРЕТНЫЙ ЭФФЕКТ D1
+
+До D1 POST /api/server/content/message-library/usage каждый раз выполнял
+contentUsageEvent.create с новым серверным id внутри действующего lifecycle
+commit. Актуальная авторизация, script lock и audit уже существовали, но они
+не связывали два HTTP запроса с одним пользовательским действием.
+Потеря ответа после commit и повтор того же события создавали второй факт.
+Это исходный P6-F7, а не регрессия A2 или новой миграции.
+
+Новый контракт:
+- POST /api/server/content/message-library/usage/v2.
+- Обязательный eventId: строка 16..120 символов, [A-Za-z0-9:_-], первый символ
+  буквенно-цифровой. ID не обрезается и не генерируется на сервере/Main.
+- Один intent = один стабильный ID на всех повторах. Новое реальное действие
+  получает новый ID, даже если шаблон и dialog прежние.
+- Первая запись: HTTP 201, replayed:false, event.
+- Успешный повтор: HTTP 200, replayed:true, тот же event/id/createdAt.
+- Тот же ID с другими сохраняемыми данными: HTTP 409,
+  MESSAGE_LIBRARY_USAGE_EVENT_CONFLICT, без новой записи/аудита.
+- Отсутствующий/невалидный ID: 400 MESSAGE_LIBRARY_USAGE_EVENT_ID_REQUIRED.
+- Не конечные числовые суммы: 400 MESSAGE_LIBRARY_USAGE_NUMBER_INVALID.
+- Старый POST /message-library/usage возвращает 410
+  MESSAGE_LIBRARY_USAGE_CLIENT_UPDATE_REQUIRED. GET /usage сохранён.
+
+2.1 КВИТАНЦИЯ — САМО КАНОНИЧЕСКОЕ СОБЫТИЕ
+
+Новый message-library-usage-service.js формирует id:
+ml_usage_v2_ + SHA256(JSON([agencyId, userId, eventId])).
+Identity ограничена агентством и пользователем, но намеренно не script/creator:
+повтор ключа с другой целью конфликтует, если текущий доступ к ней допускает
+сам запрос. Другой агентство/пользователь — другое пространство ключей.
+Криптографический hash здесь идентичность, не credential или право доступа.
+
+Fingerprint версии 2 строится по фиксированному нормализованному представлению
+сохраняемых полей: creator, fan, dialog, тип события, source, script/message,
+draft/provider-message ids, amount/currency, mediaCount/price/lockedText.
+Сервер добавляет metadata.usageReceipt={version:2,eventId,fingerprint}.
+Клиент не может передать собственную квитанцию через metadata: разрешённый
+список её отбрасывает. Сырые chat text/rawEvent не сохраняются и не хешируются.
+Порядок произвольных ключей metadata на fingerprint не влияет.
+
+ContentUsageEvent уже имеет primary key. Новых таблиц/колонок/индексов/миграции
+в D1 не требуется; старая история не сканируется и не переписывается.
+Это сохраняемый доменный результат, а не Map/HTTP-cache с TTL.
+
+Последовательность одного commit:
+1) Agency lifecycle/billing read barrier, live Creator, User, current Member,
+   epoch и creator scope; в product HTTP context — текущие billing facts.
+2) Transaction-scoped advisory lock по event identity.
+3) Point lookup ContentUsageEvent по primary key.
+4) Если квитанция есть: сверить agency/user/creator, версию, ID и fingerprint;
+   вернуть исходный факт. Второй audit не добавлять.
+5) Если её нет: взять существующий script lock, проверить creator/kind,
+   существование и trash-статус script и выбранного block.
+   Читается только выбранный block, список всех blocks для usage не загружается.
+6) Взять время БД, создать событие и audit в том же transaction; вернуть 201.
+
+Ошибка audit откатывает и событие; повтор может записаться после устранения
+ошибки. Ошибка до commit не резервирует ключ навсегда. Потеря ответа после
+commit позволяет прочитать уже сохранённую квитанцию после перезапуска сервера.
+Основной unique PK остаётся последним ограничителем дублирования. Advisory lock
+позволяет штатному конкурентному повтору дождаться исхода и прочитать квитанцию.
+ReadCommitted callback использует общий commit kernel; скрытых внутренних
+повторов внешних эффектов или отдельного владельца transaction нет.
+
+Свежая авторизация проверяется ДО чтения квитанции. Повтор не возвращает
+сохранённый результат после отзыва membership/creator scope, смены epoch,
+отключения пользователя, retirement creator/agency либо billing hold.
+Этот контракт относится к новым usage-командам; его нельзя механически
+распространять на settlement уже совершённых OF/Telegram отправок, где другая
+политика сохранения внешнего факта после потери текущих пользовательских прав.
+
+Удаление/trash script или block после успешного события не уничтожает квитанцию:
+существующий факт можно повторно подтвердить при сохранённых текущих правах на
+creator. Новый intent к уже удалённому script отклоняется. ContentUsageEvent
+не имеет каскадной связи с script/block, что проверено по текущей схеме.
+
+СРОК ГАРАНТИИ: пока сохранён канонический ContentUsageEvent. В D1 нет TTL/GC
+квитанций и нет удаления старой истории. Полный destructive purge может удалить
+эти факты; доступ к retired/purged creator сейчас закрывает lifecycle authority.
+Будущий Phase7 purge событий живого creator обязан определить retention/tombstone
+и срок повтора, прежде чем удалять квитанции. После произвольного удаления event
+вечная дедупликация не обещается. Старые дубликаты не объединены задним числом.
+
+2.2 DESKTOP INTENT И СОХРАНЁННЫЕ ГРАНИЦЫ
+
+Shared MessageLibraryRecordUsageInput теперь требует eventId; UsageResult
+содержит replayed. Sidecar создаёт crypto.randomUUID один раз перед ожиданием
+applyMessageDraft. Только complete evidence запускает usage; тип остаётся
+'draft_inserted' — подтверждение фактической OF отправки этим не подменяется.
+
+Снимок creator/tab/webContents/dialog сравнивается после ожидания bridge.
+Поздний ответ после навигации не переносит статус/usage в другой диалог.
+Защита destroy/applyGeneration сохранена. Main по-прежнему связывает Sidecar
+с реальными текущими creator/dialog и не принимает подмену scope из renderer.
+Main проверяет переданный eventId и пересылает его неизменным на /usage/v2;
+обновление токена в BackendApiClient повторяет тот же body.
+
+Desktop НЕ получил durable outbox или новый автоматический retry. Использование
+шаблона по-прежнему доступно при недоступной telemetry, и offline event может
+не попасть на сервер. Дедупликация уже доставляемого intent не равна гарантии
+доставки каждого события. После закрытия Desktop незавершённый intent здесь не
+восстанавливается. Новая вставка после перезапуска — новое действие с новым ID.
+
+2.3 СМЕШАННЫЕ ВЕРСИИ И ВЫКАТКА
+
+Новый Desktop к старому Backend: /usage/v2 отсутствует, получит 404; старый
+сервер не сможет молча проигнорировать eventId и создать legacy event.
+Старый Desktop к новому Backend: старый POST даст 410; вставка черновика остаётся
+доступна, запись этой telemetry требует обновления Desktop.
+Старый Desktop + старый Backend во время rolling overlap сохраняют старую дыру.
+Нельзя объявлять весь deployment защищённым до обновления всех Backend реплик.
+После прохождения открытых gates: Backend D1 целиком, затем Desktop D1. Новая
+миграция D1 отсутствует; накопительный Backend ZIP содержит прежние B1/C1/A2.
+
+3. NON-ADMIN MUTATION INVENTORY
+
+mutation-inventory.json/txt и воспроизводимый inventory.py содержат обнаруженные
+литеральные router.post/put/patch/delete декларации и привязку к src/server.js,
+включая четыре реально подключённых automation helper registrar.
+385 деклараций: 289 в подключённых non-admin routers, 59 в неподключённых
+исходных routers, 37 admin вне 6D. Подключённых non-admin файлов: 34.
+Отдельно учтены 10 legacy mounts, которые направлены на 410 gateway, а не на
+оставшиеся старые исходники. Существование файла/таблицы не равно живому маршруту.
+
+В 289: 266 остаются INVENTORY_ONLY; 15 явно отмечены прежними 410;
+1 старый usage D1 закрыт 410; 1 usage v2 реализован/проверен; 6 declarations
+отмечены новыми source gaps. Это инвентарь поверхности и очередь проверки,
+не доказательство семантики всех 289 и не вывод «266 багов».
+POST read/query, heartbeat convergence, durable demand, leased worker protocol,
+жизненный цикл и additive command требуют разных критериев повторяемости.
+GET/background effects этим статическим перечислением не закрываются.
+
+Подтверждённые чтением исходника продолжения (в D1 НЕ исправлены и отдельно
+runtime НЕ воспроизводились, поэтому не включены в число тестов):
+- Team create shift: createTeamShift каждый раз создаёт TeamShift без stable
+  intent; audit выполняется после transaction. Ревизия update/cancel не делает
+  create идемпотентным. src/services/team-schedule-service.js:705.
+- Team invitation create/reissue: генерируют новый rawToken при каждом вызове.
+  Create добавляет приглашение; reissue повторно меняет tokenHash и может сделать
+  первый уже выданный URL недействительным после потери ответа.
+  src/services/team-administration-service.js:1107,1174.
+- Team custom role create/duplicate: random suffix ключа и новая role row при
+  повторном invocation. Тот же service обслуживает две route declarations.
+  src/services/team-administration-service.js:1290.
+- Message Library POST script без client id генерирует time/random identity.
+  Текущий Desktop передаёт стабильный id через PUT; прямой POST требует отдельного
+  контракта. Не объявлять эту дыру обычным текущим Desktop save сценарием.
+
+У стабильных setters/lifecycle отдельно проверить: повтор после последующего
+изменения, повторную запись audit/revision и получение исходного результата
+после successful commit с потерянным ответом. Idempotent effect и byte-identical
+HTTP response — разные свойства; нужный контракт задаёт владелец домена.
+
+Зафиксированы существующие специализированные owners: CustomOrder
+agency/clientMutationId unique + recovery lookup; ProgrammaticOfWrite
+requestKey/idempotencyKey/fingerprint + lease/revision + unresolved outcome;
+CreatorSession requestId/baseRevision/device binding; Billing checkoutKey и
+provider/order facts; JobInstance lease/result; Telegram intent/receipt.
+Эти механизмы не заменяются общей middleware. Детальный повторный аудит всех
+их subcommands в D1 не выполнен. x-request-id в публикации события сам по себе
+не доказывает существование сохраняемой квитанции команды.
+
+middleware/idempotency.js по-прежнему не имеет production consumers. Его Map
+не подключали и не называли причиной текущей ошибки. Старые automation routes,
+которые физически не регистрируются, не выданы за работающий второй scheduler.
+
+4. ПРОВЕРКИ И ИХ ПРЕДЕЛЫ
+
+Backend Node unit/route/lifecycle: 61 PASS, 0 FAIL, 0 SKIP.
+Включают 18 новых usage-service tests, 2 новые route tests и прежние сценарии
+lifecycle/content. Первый/повторный HTTP статусы, allowlist, конфликт цели/
+данных, distinct insertion, auth before replay, rollback audit, missing/invalid
+ID, nonfinite amount, script cleanup и канонизация fingerprint.
+
+Desktop native-TS behavior: 14 PASS, 0 FAIL, 0 SKIP.
+8 новых D1: missing ID, одинаковый повтор body, privacy allowlist, две реальные
+вставки/два UUID, incomplete evidence, navigation race, destroy race и реальный
+BackendApiClient auth-refresh body. Ещё 6 прежних A2 Home tests — regression.
+TypeScript исполнен native Node strip/transform с управляемыми зависимостями;
+это не проверка типов, не bundle и не реальный Electron.
+Два существующих compiler-based Message Library test файла обновлены под новый
+контракт, но их исходный compiler-run здесь недоступен из-за отсутствия TypeScript.
+
+PGlite SQL: 12 сценариев + 1 родитель = 13 PASS, 0 FAIL, 0 SKIP.
+Production usage service + management authority + DB commit kernel + billing
+context исполняются через узкий Prisma-shaped SQL adapter. Десять реальных
+baseline I7 таблиц, enum/index DDL; без полной цепочки исторических миграций,
+FK и triggers. Копия fixture не является production migration.
+- Один event + один audit после потерянного ответа и повтора.
+- File-backed engine close/reopen сохраняет event/id/createdAt.
+- Конфликт изменённого payload/target; независимые actor/agency namespaces.
+- Реальный SQL rollback события при fault audit и успешный повтор того же ключа.
+- Шесть current-authority отказов ДО SELECT receipt: epoch, disabled User,
+  deactivated Member, creator scope, billing hold, retired Creator.
+- Cleanup script/block не стирает receipt; новый intent отклоняется.
+- 16000 старых событий: один PK SELECT возвращает одну строку; EXPLAIN использует
+  ContentUsageEvent_pkey; повторная физическая вставка того же PK запрещена БД.
+Canonical event в fixture — 652 bytes, максимум результата одного query — 1 row.
+
+Это проверка SQL/storage/restart/transaction semantics на одном сериализованном
+WASM backend. Она НЕ моделирует блокировки двух независимых PostgreSQL сессий
+и НЕ заменяет concurrency acceptance старых B1/C1/A2. Никаких заявлений про
+физическую пропускную способность тысячи агентств x тысячи creators нет.
+Сам receipt lookup ограничен primary key; весь HTTP authorization путь сохраняет
+прежний membership/scope механизм. D1 не переносит все продуктовые маршруты на
+компактный Home scope repository и не объявляет общую стоимость прав O(1).
+
+Node фактически 24.19.0; Node 22.23.3 известен только из присланного A2 лога.
+Prisma 5.22.0 validate: PASS. Schema и все существующие migrations неизменны.
+JS/CJS/MJS syntax: 9 изменённых/новых файлов PASS.
+TS parser: 3 изменённых файла PASS, только синтаксис.
+Desktop npm run typecheck: BLOCKED, 127, tsc: not found.
+Desktop npm run build из monorepo: BLOCKED, 127, tsc: not found.
+Реальные Electron/Ollama, ordinary PostgreSQL, многопроцессные race и целевая
+нагрузка не выполнялись. Прежние B12 и A2 acceptance gates сохраняются.
+
+5. НАКОПИТЕЛЬНЫЕ ПАКЕТЫ
+
+Backend target: 1264 файлов, D1 delta от A2: 8;
+накопительно от I7: 43 изменённых/новых файлов.
+Desktop target: 1200 файлов, D1 delta от A2: 7;
+накопительно от Desktop77: 86 файлов.
+Удалений нет. Новых production migrations D1: 0. Ранее созданные B1/C1/A2
+migrations сохраняются неизменными. Code ZIP содержат только накопленные
+изменённые файлы с исходными корнями отдельно Backend/Desktop.
+
+Проверка CRC и overlay manifests:
+Backend cumulative накладывается на I7, A2 и присланный Backend актуал и даёт
+один target. Desktop cumulative накладывается на 77, A2 и 89 и даёт один target,
+включая восстановленные 12 документов. Новая D1 документация включена в оба.
+
+TXT начинается всеми прежними 885186 байтами A2 checkpoint БЕЗ ИЗМЕНЕНИЙ.
+SHA256 префикса: e97c1ccb930374605be095dd49e733c88781b364abe5804dbe03c09e1b2874b2.
+A2 cumulative evidence вложена целиком; SHA256:
+2db2346099d1270931fbed292e64858bed7a7899139638fc621f92c54e1e8d03.
+История I7/Phase5/B12/Phase6 A1/B1/C1/A2 не сокращена и не переписана задним числом.
+Новая evidence содержит исходный лог, manifests, route inventory/source anchors,
+новые source файлы, тесты, команды и результаты проверки integrity.
+
+6. ТОЧКА ПРОДОЛЖЕНИЯ
+
+D1 локально реализует P6-F7 с указанным сроком хранения канонического события.
+Полное 6D открыто: ближайший связанный D2 — Team shift/invitation/role create и
+reissue, затем незакрытые mutation families из inventory. Требуются стабильные
+Desktop intent IDs, конкретные domain receipts, fingerprint, scope/auth при
+повторе и атомарность эффекта/аудита. Reissue invitation включает секретный
+одноразовый URL: нельзя слепо сохранять token в обычном JSON-аудите ради replay.
+Сначала выбрать безопасный owner-specific recoverable result contract.
+
+Потом 6E: реальные лимиты pending Chromium, starvation разных классов и общий
+host pressure AI/Chromium. Затем 6F: сводная проверка всей фазы и открытых gates.
+B1 capacity/F5-F6, C1 maintenance/F8 и A2 Home/F1-F2 сохраняются. Новый лог
+подтверждает A2 deployment; он не закрывает concurrent/physical acceptance.
+Переезд серверной истории S01..S07 и Phase7 purge — отдельные согласованные узлы.
+Существующий глобальный Postgres OF gate не перестраивать.
+
+Вердикт D1: исходники и локальные доказательства готовы; SOURCE CLOSED — НЕТ,
+SCALE CLOSED — НЕТ; СТАВИТЬ — ПОКА НЕТ. Полная шестая фаза ещё не завершена.

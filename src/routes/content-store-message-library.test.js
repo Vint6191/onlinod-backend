@@ -74,7 +74,7 @@ function baseDb() {
     creatorMediaAsset: { findMany: async () => [] },
     customContentSubmission: { findMany: async () => [] },
     contentBlock: { findMany: async () => [], deleteMany: async () => ({ count: 0 }) },
-    contentUsageEvent: { findMany: async () => [], create: async ({ data }) => ({ id: "event-1", ...data }) },
+    contentUsageEvent: { findUnique: async () => null, findMany: async () => [], create: async ({ data }) => ({ id: "event-1", ...data }) },
     contentCollection: {
       findMany: async () => [],
       count: async () => 0,
@@ -217,14 +217,15 @@ test("usage attribution is creator-bound and stores only the safe metadata allow
     id: "server-script-1", creatorId: "creator-1",
     blocks: [{ id: "server-block-1", clientId: "block-1" }],
   });
+  db.contentBlock.findFirst = async () => ({ id: "server-block-1", clientId: "block-1" });
   let created = null;
   db.contentUsageEvent.create = async ({ data }) => { created = data; return { id: "event-1", ...data }; };
   const api = loadRoute(db);
   const res = response();
-  await api.route("POST", "/message-library/usage")({
+  await api.route("POST", "/message-library/usage/v2")({
     auth: auth(), query: {},
     body: {
-      creatorId: "creator-1", scriptId: "script-1", messageId: "block-1", dialogId: "dialog-1",
+      eventId: "usage-test-intent-0001", creatorId: "creator-1", scriptId: "script-1", messageId: "block-1", dialogId: "dialog-1",
       eventType: "draft_inserted", text: "secret", rawEvent: { conversation: "secret" },
       metadata: { mediaCount: 2, price: 15, currency: "USD", lockedText: true, text: "secret", arbitrary: "drop me" },
     },
@@ -232,8 +233,34 @@ test("usage attribution is creator-bound and stores only the safe metadata allow
   assert.equal(res.statusCode, 201);
   assert.equal(created.collectionId, "server-script-1");
   assert.equal(created.blockId, "server-block-1");
-  assert.deepEqual(Object.keys(created.metadata).sort(), ["product", "amount", "currency", "draftId", "lockedText", "mediaCount", "messageId", "price", "realMessageId", "scriptId", "source"].sort());
+  assert.deepEqual(Object.keys(created.metadata).sort(), ["usageReceipt", "product", "amount", "currency", "draftId", "lockedText", "mediaCount", "messageId", "price", "realMessageId", "scriptId", "source"].sort());
   assert.equal(JSON.stringify(created.metadata).includes("secret"), false);
+});
+
+test("old usage writes are retired; v2 refuses missing intent IDs without mutating", async () => {
+  const db = baseDb(); let writes = 0;
+  db.contentUsageEvent.create = async () => { writes++; };
+  const api = loadRoute(db), old = response(), missing = response();
+  await api.route("POST", "/message-library/usage")({ auth: auth(), body: {} }, old);
+  assert.equal(old.statusCode, 410); assert.equal(old.body.code, "MESSAGE_LIBRARY_USAGE_CLIENT_UPDATE_REQUIRED");
+  await api.route("POST", "/message-library/usage/v2")({ auth: auth(), body: { creatorId: "creator-1", scriptId: "script-1" } }, missing);
+  assert.equal(missing.statusCode, 400); assert.equal(missing.body.code, "MESSAGE_LIBRARY_USAGE_EVENT_ID_REQUIRED"); assert.equal(writes, 0);
+});
+
+test("v2 route returns 201 first, 200 replay, and 409 changed intent data", async () => {
+  const db = baseDb(); let row = null, auditCount = 0;
+  db.contentCollection.findFirst = async () => ({ id: "server-script-1", clientId: "script-1", creatorId: "creator-1" });
+  db.contentUsageEvent.findUnique = async ({ where }) => row?.id === where.id ? structuredClone(row) : null;
+  db.contentUsageEvent.create = async ({ data }) => (row = structuredClone(data));
+  db.auditLog.create = async () => { auditCount++; };
+  const api = loadRoute(db), handler = api.route("POST", "/message-library/usage/v2");
+  const body = { eventId: "http-usage-intent-0001", creatorId: "creator-1", scriptId: "script-1" };
+  const first = response(), replay = response(), conflict = response();
+  await handler({ auth: auth(), body }, first); await handler({ auth: auth(), body }, replay);
+  await handler({ auth: auth(), body: { ...body, dialogId: "changed" } }, conflict);
+  assert.equal(first.statusCode, 201); assert.equal(first.body.replayed, false);
+  assert.equal(replay.statusCode, 200); assert.equal(replay.body.replayed, true); assert.deepEqual(first.body.event, replay.body.event);
+  assert.equal(conflict.statusCode, 409); assert.equal(conflict.body.code, "MESSAGE_LIBRARY_USAGE_EVENT_CONFLICT"); assert.equal(auditCount, 1);
 });
 
 test("permanent deletion refuses an active script", async () => {

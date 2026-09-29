@@ -1,4 +1,5 @@
 "use strict";
+const { normalizeUsageInput, recordMessageLibraryUsage } = require("../services/message-library-usage-service");
 
 const express = require("express");
 const prisma = require("../prisma");
@@ -189,22 +190,6 @@ function assertUniqueMlBlockClientIds(blocks) {
   }
 }
 
-function normalizeMlUsageMetadata(body, scriptId, messageId) {
-  const metadata = jsonObject(body.metadata);
-  return {
-    product: MESSAGE_LIBRARY_KIND,
-    source: cleanString(body.source || metadata.source || "electron-message-library", 100) || "electron-message-library",
-    scriptId: scriptId || null,
-    messageId: messageId || null,
-    draftId: optionalString(body.draftId, 120),
-    realMessageId: optionalString(body.realMessageId || body.purchaseMessageId, 120),
-    amount: Math.max(0, Number(body.amount || metadata.amount || 0) || 0),
-    currency: cleanString(body.currency || metadata.currency || "USD", 10).toUpperCase() || "USD",
-    mediaCount: Math.max(0, Math.min(100, Math.floor(Number(metadata.mediaCount || 0) || 0))),
-    price: Math.max(0, Number(metadata.price || 0) || 0),
-    lockedText: metadata.lockedText === true,
-  };
-}
 
 function messageFromBlock(block = {}, index = 0) {
   const metadata = jsonObject(block.metadata);
@@ -526,56 +511,20 @@ router.get("/message-library/usage", async (req, res) => {
   }
 });
 
-router.post("/message-library/usage", async (req, res) => {
+// The old write URL cannot silently accept clients without a stable intent ID.
+router.post("/message-library/usage", (_req, res) => res.status(410).json({
+  ok: false, code: "MESSAGE_LIBRARY_USAGE_CLIENT_UPDATE_REQUIRED", error: "Update Desktop to record usage events",
+}));
+
+router.post("/message-library/usage/v2", async (req, res) => {
   try {
-    const body = req.body || {};
-    const scriptId = cleanString(body.scriptId || body.collectionId, 120);
-    const messageId = cleanString(body.messageId || body.blockId, 120);
-    const creatorId = cleanString(body.creatorId || body.accountId, 100);
-    if (!scriptId || !creatorId) {
-      const err = new Error("creatorId and scriptId are required");
-      err.status = 400;
-      err.code = "MESSAGE_LIBRARY_USAGE_KEYS_MISSING";
-      throw err;
-    }
-    await requireProductCreator(req, creatorId, { db: prisma });
-
-    const event = await withMessageLibraryMutation({ ...mutationContext(req, creatorId, scriptId, "usage", false), work: async ({ tx, existing: collection }) => {
-    if (!collection) {
-      const err = new Error("Message Library script not found for this creator");
-      err.status = 404;
-      err.code = "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND";
-      throw err;
-    }
-    if (isTrash(collection)) throw Object.assign(new Error("Script is not available"), {code:"MESSAGE_LIBRARY_SCRIPT_TRASHED",status:409});
-    const block = messageId
-      ? collection.blocks.find((item) => String(item.clientId || item.id) === String(messageId)) || null
-      : null;
-    if (block && isTrash(block)) throw Object.assign(new Error("Message is not available"), {code:"MESSAGE_LIBRARY_BLOCK_TRASHED",status:409});
-    if (messageId && !block) {
-      const err = new Error("Message Library block not found");
-      err.status = 404;
-      err.code = "MESSAGE_LIBRARY_BLOCK_NOT_FOUND";
-      throw err;
-    }
-
-    return tx.contentUsageEvent.create({
-      data: {
-        agencyId: req.auth.agencyId,
-        collectionId: collection.id,
-        blockId: block?.id || null,
-        creatorId,
-        fanId: optionalString(body.fanId, 80),
-        dialogId: optionalString(body.dialogId, 80),
-        eventType: cleanString(body.eventType || body.status || "used", 40) || "used",
-        metadata: normalizeMlUsageMetadata(body, scriptId, messageId),
-        createdByUserId: req.auth.userId,
-      },
+    const command = normalizeUsageInput(req.body);
+    await requireProductCreator(req, command.creatorId, { db: prisma });
+    const result = await recordMessageLibraryUsage({
+      db: prisma, agencyId: req.auth.agencyId, userId: req.auth.userId,
+      actorMember: req.auth.membership || req.member, input: req.body,
     });
-
-    } });
-
-    return res.status(201).json({ ok: true, source: "server", event });
+    return res.status(result.replayed ? 200 : 201).json({ ok: true, source: "server", ...result });
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_USAGE_EVENT_FAILED");
   }

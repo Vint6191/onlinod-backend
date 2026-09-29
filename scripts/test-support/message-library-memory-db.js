@@ -3,7 +3,7 @@ const {createMemoryDb}=require("./admin-command-memory-db");
 // Fault model only: does not emulate PostgreSQL lock contention.
 function createContentDb(options={}){
  const at=new Date("2026-01-01T00:00:00Z");
- return createMemoryDb({...options,extendState:{collections:[{id:"collection-a",agencyId:"agency-a",creatorId:"creator-a",clientId:"script-a",kind:"message_library_script",status:"active",deletedAt:null,purgeAfter:null,updatedAt:at,createdAt:at}],blocks:[{id:"block-a",collectionId:"collection-a",clientId:"message-a",status:"active",deletedAt:null,purgeAfter:null}],contentAudit:[],member:{id:"member-a",userId:"user-a",agencyId:"agency-a",role:"OWNER",roleKey:"owner",accessEpoch:1,assignedCreators:"all",deletedAt:null},...options.extendState},extendClient(api,{read,copy,clock}){
+ return createMemoryDb({...options,extendState:{collections:[{id:"collection-a",agencyId:"agency-a",creatorId:"creator-a",clientId:"script-a",kind:"message_library_script",status:"active",deletedAt:null,purgeAfter:null,updatedAt:at,createdAt:at}],blocks:[{id:"block-a",collectionId:"collection-a",clientId:"message-a",status:"active",deletedAt:null,purgeAfter:null}],contentAudit:[],usageEvents:[],member:{id:"member-a",userId:"user-a",agencyId:"agency-a",role:"OWNER",roleKey:"owner",accessEpoch:1,assignedCreators:"all",deletedAt:null},...options.extendState},extendClient(api,{read,copy,clock}){
   const raw=api.$queryRawUnsafe;
   api.$queryRawUnsafe=async(sql,...args)=>{
    if(sql.includes('FROM "User"'))return options.disabledUser?[]:[{id:args[0]}];
@@ -28,6 +28,10 @@ function createContentDb(options={}){
    deleteMany:async({where})=>{const rows=read()[name].filter(r=>matches(r,where));read()[name]=read()[name].filter(r=>!rows.includes(r));return {count:rows.length};},
   };}
   api.contentCollection=model("collections");api.contentBlock=model("blocks");
+  api.contentUsageEvent={
+   findUnique:async({where})=>copy(read().usageEvents.find(row=>row.id===where.id)||null),
+   create:async({data})=>{if(read().usageEvents.some(row=>row.id===data.id))throw Object.assign(Error("unique event"),{code:"P2002"});read().usageEvents.push(copy(data));return copy(data);},
+  };
   api.agencyMember={findFirst:async()=>read().member&&!read().member.deletedAt&&!read().member.deactivatedAt?copy(read().member):null};
   api.auditLog={create:async({data})=>{if(options.failContentAudit)throw Error("audit unavailable");read().contentAudit.push(copy(data));return data;}};
   return api;
