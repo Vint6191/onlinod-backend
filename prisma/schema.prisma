@@ -3871,7 +3871,7 @@ model MessageTemplateGroup {
   name      String
   sortOrder Int      @default(0)
   createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  updatedAt DateTime @default(now()) @updatedAt
 
   agency    Agency            @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   templates MessageTemplate[]
@@ -3891,7 +3891,7 @@ model MessageTemplate {
   status          String    @default("active")
   createdByUserId String?
   createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  updatedAt       DateTime  @default(now()) @updatedAt
   deletedAt       DateTime?
 
   agency      Agency                      @relation(fields: [agencyId], references: [id], onDelete: Cascade)
@@ -3936,7 +3936,7 @@ model AutomationRule {
   safety          Json?
   createdByUserId String?
   createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  updatedAt       DateTime  @default(now()) @updatedAt
   deletedAt       DateTime?
 
   agency Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
@@ -4086,7 +4086,7 @@ model CreatorPresenceSnapshot {
   updatedByDeviceId String?
   metadata          Json      @default("{}")
   createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  updatedAt         DateTime  @default(now()) @updatedAt
 
   agency          Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator         CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
@@ -4119,7 +4119,7 @@ model CreatorPresenceUser {
   updatedByDeviceId String?
   metadata          Json      @default("{}")
   createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  updatedAt         DateTime  @default(now()) @updatedAt
 
   agency          Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator         CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)

@@ -71,7 +71,7 @@ test('All three actual Render hashes are recovered SQL, remain byte mismatches, 
     assert.equal(migrationChecksumReport(bytesOf(entry.migration), entry.storedChecksum).matches, false);
   }
   const plan = await deployment().migrationPlan(db, { onHistorical: event => events.push(event) });
-  assert.equal(plan.names.length, 269); assert.equal(plan.names.includes(contract), false);
+  assert.equal(plan.names.length, 270); assert.equal(plan.names.includes(contract), false);
   assert.equal(events.length, 1); assert.equal(events[0].event, 'PHASE7_VERIFIED_HISTORICAL_MIGRATIONS');
   assert.equal(events[0].total, 3);
   assert.ok(events[0].migrations.every(item => item.byteEquivalent === false && item.repairs.length));
@@ -135,7 +135,7 @@ test('Recovered histories keep all hooks and stage only unchanged canonical SQL,
     calls.push(args);
     if (args[1] === 'migrate') {
       const dir = path.join(path.dirname(args.at(-1)), 'migrations');
-      assert.equal(fs.readdirSync(dir).filter(name => name !== 'migration_lock.toml').length, 269);
+      assert.equal(fs.readdirSync(dir).filter(name => name !== 'migration_lock.toml').length, 270);
       for (const entry of historical) assert.equal(sha(fs.readFileSync(path.join(dir, entry.migration, 'migration.sql'))), entry.currentChecksum);
       assert.equal(fs.existsSync(path.join(dir, contract)), false);
     }
@@ -194,14 +194,14 @@ test('Malformed checksums and invalid UTF8 cannot pass compatibility checks', ()
   }
   assert.throws(() => migrationChecksumReport(Buffer.from([0xff]), '0'.repeat(64)), /INVALID_UTF8/);
 });
-test('Planner validates the entire 268-migration history, reports compat, and selects expand only', async () => {
+test('Planner validates the entire 268-migration history, reports compat, and selects expand plus archive-default repair, without contract', async () => {
   const names = fs.readdirSync(migrations).filter(n => fs.statSync(path.join(migrations, n)).isDirectory() && n < '20260930180000_phase7_legacy_storage_expand_v1').sort();
   assert.equal(names.length, 268);
   const rows = names.map(name => row(name, name === traffic ? sha(crlf(bytesOf(name))) : sha(bytesOf(name))));
   const db = database(rows), notices = [];
   const plan = await deployment().migrationPlan(db, { onCompatibility: event => notices.push(event) });
   assert.equal(plan.fresh, false); assert.equal(plan.purged, false);
-  assert.equal(plan.names.length, 269); assert.equal(plan.names.includes(contract), false);
+  assert.equal(plan.names.length, 270); assert.equal(plan.names.includes(contract), false);
   assert.equal(notices.length, 1); assert.equal(notices[0].total, 1);
   assert.equal(notices[0].migrations[0].migration, traffic);
   assert.equal(notices[0].migrations[0].matchMode, 'CRLF');
@@ -241,12 +241,12 @@ test('Rolled-back attempts stay ignored; unfinished and unknown applied migratio
 test('Empty database, populated unbaselined database, explicit contract and PURGED plans retain their gates', async () => {
   const { migrationPlan } = deployment();
   const fresh = await migrationPlan(database([], { hasLedger: false }));
-  assert.equal(fresh.fresh, true); assert.equal(fresh.names.length, 269);
+  assert.equal(fresh.fresh, true); assert.equal(fresh.names.length, 270);
   await assert.rejects(migrationPlan(database([], { hasLedger: false, tables: [{ relname: 'existing_table' }] })), /UNBASELINED_DATABASE/);
   const purged = await migrationPlan(database([row(traffic), row(contract)]));
-  assert.equal(purged.purged, true); assert.equal(purged.names.length, 270);
+  assert.equal(purged.purged, true); assert.equal(purged.names.length, 271);
   const explicit = await migrationPlan(database([row(traffic)]), { contract: true });
-  assert.equal(explicit.names.length, 270);
+  assert.equal(explicit.names.length, 271);
 });
 test('A mismatch stops main before any role gate, hook, deployment command or storage action', async () => {
   const called = [];
@@ -271,7 +271,7 @@ test('Compatible history traverses every existing pre/post hook; staged Prisma t
       if (args[1] === 'migrate') {
         stagedDirectory = path.dirname(args.at(-1));
         const names = fs.readdirSync(path.join(stagedDirectory, 'migrations')).filter(n => n !== 'migration_lock.toml');
-        assert.equal(names.length, 269); assert.equal(names.includes(contract), false);
+        assert.equal(names.length, 270); assert.equal(names.includes(contract), false);
         assert.deepEqual(fs.readFileSync(path.join(stagedDirectory, 'migrations', traffic, 'migration.sql')), bytesOf(traffic));
       }
     },

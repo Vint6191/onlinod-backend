@@ -2,10 +2,10 @@
   "version": 1,
   "generation": "phase7_legacy_storage_v1",
   "planHash": "9fb409e3d948c17e3f71914de68c0ef2de116ffa250c73eb48191d1466eab2ac",
-  "packageId": "ONLINOD_PHASE7_SHAPE_DIAGNOSTICS_V4",
+  "packageId": "ONLINOD_PHASE7_ARCHIVE_DEFAULTS_FIX_V5",
   "baseBackendHash": "c966c17631dd1293964fd97fe3af697752f3ce638d3ca072af4e39abb24d5d00",
   "baseDesktopHash": "191b46830e4540699304f9ad50023d58c90fb23b1da526338381ed6506384017",
-  "backendHash": "79a46f15733009737fcaedaf45efd74e991342f9a2da28ffef26ef49ba99b3e4",
+  "backendHash": "5f07d6c77660825d8c7aec4c352c401f15cd7da5e009249854dcb7dd0b182bb2",
   "desktopHash": "c2dc5d4cef3857a734adbc0c0bb0adc61d28a52df87ccbac685597729131439d",
   "backendFiles": [
     {
@@ -1664,6 +1664,11 @@
       "sha256": "2e720f0e8d3db9801b15e7e1a04fcc7e4ddf1f0e6793a4ad4f9ed3abb095bab7"
     },
     {
+      "path": "prisma/migrations/20260930183000_phase7_archive_updated_at_defaults_v1/migration.sql",
+      "bytes": 2209,
+      "sha256": "00c1440a6c4706c85a086eb6c74c343183ac9eee640bbe80df9047ec8d0756d3"
+    },
+    {
       "path": "prisma/migrations/20260930190000_phase7_legacy_storage_contract_v1/migration.sql",
       "bytes": 5603,
       "sha256": "30084f228b500afa2c7b93df2c2c60084fb76f6dd099d95f3646891897400c14"
@@ -1675,8 +1680,8 @@
     },
     {
       "path": "prisma/schema.prisma",
-      "bytes": 260827,
-      "sha256": "3a9d7cf5f4c7e3a8912831588c125614f9830b633c4dd2b1ffee7d0e15704ae2"
+      "bytes": 260907,
+      "sha256": "b819da717b3cc30c5f307571f8e3aa8bc38e12af52a25b4b4c622c75a9ffdf41"
     },
     {
       "path": "public/admin/admin-app.js",
@@ -5875,8 +5880,8 @@
     },
     {
       "path": "src/services/phase7-migration-checksum.test.js",
-      "bytes": 18978,
-      "sha256": "6d5962050812344ed370f34d1495b4e5a90224d9e00e26acb229dc870abfb64c"
+      "bytes": 19019,
+      "sha256": "a40dcf6e8fcefdbd2f39fdc1a379cb554993d8fed1e69f2bcf8c4a52cd1081c6"
     },
     {
       "path": "src/services/phase7-obligation-handoff-service.js",
