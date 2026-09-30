@@ -162,7 +162,7 @@ app.get("/health", async (_req, res) => {
       ok: true,
       status: "healthy",
       service: "onlinod-backend",
-      version: "0.8.0-server-stores",
+      version: "phase7_legacy_storage_v1",
       database: "ok",
       time: new Date().toISOString(),
     });
@@ -172,7 +172,7 @@ app.get("/health", async (_req, res) => {
       ok: false,
       status: "unhealthy",
       service: "onlinod-backend",
-      version: "0.8.0-server-stores",
+      version: "phase7_legacy_storage_v1",
       database: "error",
       time: new Date().toISOString(),
     });
@@ -182,22 +182,26 @@ app.get("/health", async (_req, res) => {
 app.get("/ready", async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    const [release, dbFence] = await Promise.all([
+    const [release, dbFence, legacyStorage, archiveIndexes] = await Promise.all([
       readTeamControlPlaneReleaseAuthority(prisma),
       readTeamControlPlaneDbFenceStatus(prisma),
+      require("./services/phase7-legacy-storage-service").storageState(prisma),
+      require("../scripts/database/phase7-legacy-storage-indexes").ensureIndexes(prisma),
     ]);
     const teamReady = Boolean(
       release
       && release.requiredGeneration === TEAM_CONTROL_PLANE_GENERATION
       && String(release.activationState || "").toUpperCase() === "ACTIVE"
-      && dbFence.ready
+      && dbFence.ready && legacyStorage.ready && archiveIndexes.ready
     );
     return res.status(teamReady ? 200 : 503).json({
       ok: teamReady,
       status: teamReady ? "ready" : "not_ready",
       service: "onlinod-backend",
-      version: "0.8.0-server-stores",
+      version: "phase7_legacy_storage_v1",
       database: "ok",
+      legacyStorage,
+      targetReady: teamReady && legacyStorage.targetReady,
       teamControlPlane: {
         ready: teamReady,
         expectedGeneration: TEAM_CONTROL_PLANE_GENERATION,
@@ -223,7 +227,7 @@ app.get("/ready", async (_req, res) => {
       ok: false,
       status: "not_ready",
       service: "onlinod-backend",
-      version: "0.8.0-server-stores",
+      version: "phase7_legacy_storage_v1",
       database: "error",
       teamControlPlane: { ready: false, expectedGeneration: TEAM_CONTROL_PLANE_GENERATION, requiredGeneration: null, state: null, dbFence: null },
       time: new Date().toISOString(),
@@ -269,7 +273,7 @@ app.get("/api", (_req, res) => {
   res.json({
     ok: true,
     service: "onlinod-backend",
-    version: "0.8.0-server-stores",
+    version: "phase7_legacy_storage_v1",
   });
 });
 

@@ -22,10 +22,11 @@ function sfsCandidateId(row) {
 
 function candidateNoLongerNeedsFollowProof(candidate, row) {
   if (!candidate) return true;
-  if (candidate.completedAt || candidate.state === "COMPLETED" || candidate.usedForever === true) return true;
+  if (candidate.completedAt || candidate.state === "COMPLETED") return true;
+  if (candidate.usedForever === true && object(candidate.metadata).legacyMigration !== true) return true;
 
   const metadata = object(candidate.metadata);
-  if (metadata.legacyMigration === true) return true;
+  if (metadata.legacyMigration === true) return false; // Requires the same scoped attestation as cleanup admission.
   if (Number(candidate.generation) !== Number(row?.generation)) return true;
 
   // Current-generation cleanup carries the same proof in both the candidate and
@@ -41,7 +42,7 @@ function candidateNoLongerNeedsFollowProof(candidate, row) {
  * Partition already-bounded hard-delete candidates without scanning the
  * delivery table.  Only the intermediate pre-INT4.3C SFS generation needs its
  * completed FOLLOW receipt while an old cleanup remains active.  Current SFS
- * embeds proof in the cleanup/candidate; P14 legacy cleanup is self-adopted.
+ * embeds proof in the cleanup/candidate; legacy cleanup requires an immutable scoped attestation.
  *
  * Unknown/malformed SFS proof rows fail closed.  Every other delivery class is
  * passed through; its own lifecycle guards remain the caller's responsibility.
@@ -69,11 +70,13 @@ async function partitionAutomationDeliveryHardDeleteCandidates({ db, rows = [] }
           usedForever: true,
           completedAt: true,
           metadata: true,
+          agencyId: true, creatorId: true, targetUserId: true, safetyUnfollowDeliveryId: true,
         },
       })
     : [];
   const byId = new Map((candidates || []).map((candidate) => [candidate.id, candidate]));
 
+  const attested=await require("./phase7-legacy-storage-service").attestedCleanupCandidates(db,candidates.filter(c=>object(c.metadata).legacyMigration===true));
   const deletable = [];
   const protectedRows = [];
   for (const row of input) {
@@ -88,8 +91,10 @@ async function partitionAutomationDeliveryHardDeleteCandidates({ db, rows = [] }
       protectedRows.push(row);
       continue;
     }
-    if (candidateNoLongerNeedsFollowProof(byId.get(candidateId), row)) deletable.push(row);
-    else protectedRows.push(row);
+    const candidate = byId.get(candidateId);
+    let safe = candidateNoLongerNeedsFollowProof(candidate, row);
+    if (!safe && attested.has(candidateId)) safe=true;
+    if (safe) deletable.push(row); else protectedRows.push(row);
   }
   return { deletable, protected: protectedRows };
 }

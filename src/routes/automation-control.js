@@ -776,10 +776,12 @@ router.post("/worker/claim", async (req, res) => {
   try {
     const input = z.object({
       deviceId: z.string().min(3).max(160),
+      legacyStorageRetirementV1: z.boolean().optional().default(false),
       leaseMs: z.number().int().min(30_000).max(10 * 60_000).optional(),
       actionTypes: z.array(z.enum(["FOLLOW_BACK", "SEND_MESSAGE", "DELETE_MESSAGE", "LIKE_POST", "UNFOLLOW_FAN", "FOLLOW_FAN", "SFS_FOLLOW_TARGET", "SFS_COMMENT_POST", "SFS_LIKE_COMMENT", "SFS_UNFOLLOW_TARGET"])).min(1).max(20).optional(),
     }).parse(req.body || {});
-    return res.json({ ok: true, ...(await claimActionDelivery({ userId: req.auth.userId, deviceId: input.deviceId, leaseMs: input.leaseMs, actionTypes: input.actionTypes })) });
+    if (!input.legacyStorageRetirementV1) return res.status(426).json({ok:false,code:"DESKTOP_PHASE7_UPDATE_REQUIRED"});
+    return res.json({ ok: true, serverCapabilities: {legacyStorageRetirementV1:true}, ...(await claimActionDelivery({ userId: req.auth.userId, deviceId: input.deviceId, leaseMs: input.leaseMs, actionTypes: input.actionTypes })) });
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     return serviceError(res, error, "ACTION_DELIVERY_CLAIM_FAILED");

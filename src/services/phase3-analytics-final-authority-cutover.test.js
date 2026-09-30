@@ -61,11 +61,11 @@ test("final cut durable promotion claim never holds signal row while waiting for
   assert.match(maintenance, /runDbTransaction\(root,[\s\S]*acquireCampaignTransactionLock\(tx, creatorId\)[\s\S]*campaignFanRefreshPromotionSignal\.findFirst/);
 });
 
-test("Billing and legacy Analytics have no active snapshot generation reader/writer while Phase A preserves old writable tables", () => {
+test("Billing and legacy Analytics have no active snapshot generation reader/writer while Phase7 freezes then contracts legacy tables", () => {
   const billing = source("src/services/billing-wallet-service.js");
   const settings = source("src/services/settings-service.js");
-  const analyticsRoute = source("src/routes/analytics.js");
-  const analyticsService = source("src/services/analytics-snapshot-service.js");
+  const analyticsRoute = source("src/server.js");
+  const analyticsService = source("scripts/database/phase7-snapshot-compatibility.js");
   const schema = source("prisma/schema.prisma");
   const migration = source("prisma/migrations/20260920123000_phase3_analytics_final_authority_cutover_v1/migration.sql");
   const a21Migration = source("prisma/migrations/20260920223000_phase3_analytics_a21_publication_generation_cursor_scale_v1/migration.sql");
@@ -73,7 +73,7 @@ test("Billing and legacy Analytics have no active snapshot generation reader/wri
   const legacyPreflight = source("scripts/database/phase3-analytics-legacy-snapshot-online-preflight.js");
   const legacyPostflight = source("scripts/database/phase3-analytics-legacy-snapshot-online-postflight.js");
   const repairMigration = source("prisma/migrations/20260920191500_phase3_analytics_legacy_snapshot_phase_a_repair_v1/migration.sql");
-  const packageJson = source("package.json");
+  const packageJson = require("../../scripts/test-support/phase7-deploy-pipeline")(JSON.parse(source("package.json")));
   assert.doesNotMatch(billing, /creatorEarningsSnapshot\./);
   assert.match(billing, /source:\s*"UNAVAILABLE"/);
   assert.match(settings, /readRolling30dRevenueBatch/);

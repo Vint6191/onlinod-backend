@@ -370,7 +370,6 @@ model Agency {
   trafficSources                        TrafficSource[]
   trafficSourceMembers                  TrafficSourceMember[]
   creatorSubscriptionLedgers            CreatorSubscriptionLedger[]
-  trafficDailyAggregates                TrafficDailyAggregate[]
   customOrders                          CustomOrder[]
   customContentSubmissions              CustomContentSubmission[]
   customDeliveryReceipts                CustomDeliveryReceipt[]
@@ -579,7 +578,6 @@ model CreatorAccount {
   trafficSources                        TrafficSource[]
   trafficSourceMembers                  TrafficSourceMember[]
   creatorSubscriptionLedgers            CreatorSubscriptionLedger[]
-  trafficDailyAggregates                TrafficDailyAggregate[]
   fans                                  CreatorFan[]
   analyticsIngestBatches                AnalyticsIngestBatch[]
   analyticsCoverage                     AnalyticsCoverage[]
@@ -2432,6 +2430,7 @@ model Phase2ReleaseCompatibilityAuthority {
 }
 
 model DomainWorkItem {
+  legacyStorageGeneration String?
   id                       String    @id
   agencyId                 String
   workClass                String
@@ -3400,6 +3399,7 @@ model CreatorFanLocalCoverage {
 }
 
 model JobInstance {
+  legacyStorageGeneration String?
   id                String    @id @default(cuid())
   jobKey            String
   scope             String
@@ -3596,13 +3596,6 @@ model ProviderCapacityDebtState {
   @@index([status, sampledAt], map: "ProviderCapacityDebtState_status_sampled_idx")
 }
 
-model LegacyFanObservationClock {
-  id             Int      @id
-  lastObservedAt DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-
-  @@map("FanObservationClock")
-}
 
 model FanObservationCreatorClock {
   creatorId      String   @id
@@ -3693,19 +3686,6 @@ model DeviceCommand {
   @@index([deliveredAt])
 }
 
-model ImpersonationToken {
-  id             String    @id @default(cuid())
-  tokenHash      String    @unique
-  adminUserId    String
-  targetUserId   String
-  targetAgencyId String
-  expiresAt      DateTime
-  claimedAt      DateTime?
-  createdAt      DateTime  @default(now())
-
-  @@index([targetUserId])
-  @@index([expiresAt])
-}
 
 model DeviceCreatorBinding {
   id                  String    @id @default(cuid())
@@ -4043,43 +4023,6 @@ model AutomationTask {
   @@index([updatedAt])
 }
 
-model AutomationJob {
-  id                String    @id @default(cuid())
-  agencyId          String
-  taskId            String?
-  creatorId         String?
-  accountId         String?
-  fanId             String?
-  dialogId          String?
-  type              String
-  action            String    @default("run")
-  status            String    @default("scheduled") // scheduled | claimed | running | done | failed | canceled | expired
-  priority          Int       @default(0)
-  runAfter          DateTime  @default(now())
-  claimedByDeviceId String?
-  claimedAt         DateTime?
-  attempts          Int       @default(0)
-  maxAttempts       Int       @default(3)
-  dedupeKey         String?
-  payload           Json      @default("{}")
-  result            Json      @default("{}")
-  error             String?
-  completedAt       DateTime?
-  createdByUserId   String?
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-
-  @@unique([agencyId, dedupeKey])
-  @@index([agencyId, status, runAfter])
-  @@index([agencyId, type, status])
-  @@index([creatorId, status])
-  @@index([taskId, status])
-  @@index([claimedByDeviceId, claimedAt])
-  @@index([status, completedAt])
-  @@index([status, updatedAt])
-  @@index([fanId])
-  @@index([createdAt])
-}
 
 model AutomationEvent {
   id              String   @id @default(cuid())
@@ -4727,6 +4670,8 @@ model CampaignQueueStatus {
 }
 
 model AutomationDelivery {
+  legacyCleanupProofId String?
+  legacyStorageGeneration String?
   id                        String    @id @default(cuid())
   agencyId                  String
   creatorId                 String
@@ -6205,7 +6150,6 @@ model TrafficSource {
   creator             CreatorAccount              @relation(fields: [creatorId], references: [id], onDelete: Cascade)
   members             TrafficSourceMember[]
   subscriptionLedgers CreatorSubscriptionLedger[]
-  dailyAggregates     TrafficDailyAggregate[]
 
   @@unique([agencyId, creatorId, sourceType, externalId])
   @@index([agencyId, creatorId, sourceType])
@@ -6284,33 +6228,6 @@ model CreatorSubscriptionLedger {
 }
 
 /// Retired I6 compatibility cache: no active business reader/writer. Retention only.
-model TrafficDailyAggregate {
-  id        String   @id @default(cuid())
-  agencyId  String
-  creatorId String
-  sourceId  String
-  day       DateTime
-
-  claimers Int @default(0)
-  freeSubs Int @default(0)
-  paidSubs Int @default(0)
-  renewals Int @default(0)
-  refunds  Int @default(0)
-
-  grossCents Int @default(0)
-  netCents   Int @default(0)
-  costCents  Int @default(0)
-
-  updatedAt DateTime @updatedAt
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  source  TrafficSource  @relation(fields: [sourceId], references: [id], onDelete: Cascade)
-
-  @@unique([sourceId, day])
-  @@index([agencyId, creatorId, day])
-  @@index([day])
-}
 
 model TeamPpvPurchaseLedger {
   id         String  @id @default(cuid())
@@ -6664,4 +6581,94 @@ model DialogControlResumeDemand {
  updatedAt DateTime @updatedAt
  @@index([status,nextAttemptAt,id])
  @@index([agencyId,creatorId])
+}
+
+// Phase 7 maintenance records deliberately outlive Agency/Creator deletion.
+// Identities here are evidence, never grants of current tenant access.
+model Phase7RetirementCohort {
+  id                  String    @id
+  planHash            String
+  state               String
+  databaseEpoch       String    @default(dbgenerated("md5(((random())::text || (clock_timestamp())::text))"))
+  enumeration         Json      @default("{}")
+  enumerationComplete Boolean   @default(false)
+  revision            BigInt    @default(1)
+  rollbackClosedAt    DateTime?
+  releaseManifest     Json?
+  fingerprint         String?
+  fencedAt            DateTime  @default(now())
+  verifiedAt          DateTime?
+  purgedAt            DateTime?
+  updatedAt           DateTime  @default(now())
+  partitions          Phase7RetirementPartition[]
+  proofs              Phase7RetirementProof[]
+}
+model Phase7RetirementPartition {
+  id                String @id
+  cohortId          String
+  tableName         String
+  agencyKey         String
+  agencyId          String?
+  sourceEpoch       BigInt @default(1)
+  cursor            String?
+  upperBound        String?
+  rows              BigInt @default(0)
+  bytes             BigInt @default(0)
+  digest            String @default("")
+  sequence          Int @default(0)
+  state             String @default("PENDING")
+  ownerToken        String?
+  leaseRevision     BigInt @default(0)
+  leaseUntil        DateTime?
+  nextAt            DateTime @default(now())
+  lastError         String?
+  archiveRoot       String?
+  restoreRoot       String?
+  archiveVerifiedAt DateTime?
+  verifiedDigest    String?
+  verifiedSequence  Int @default(0)
+  updatedAt         DateTime @default(now())
+  cohort            Phase7RetirementCohort @relation(fields: [cohortId], references: [id], onDelete: Restrict)
+  chunks            Phase7RetirementChunk[]
+  @@unique([tableName,agencyKey])
+  @@index([state,nextAt,agencyKey,id], map: "phase7_partition_due")
+  @@index([cohortId,state,id], map: "phase7_partition_cohort")
+}
+model Phase7RetirementChunk {
+  id             String @id
+  partitionId    String
+  sourceEpoch    BigInt
+  sequence       Int
+  startCursor    String?
+  endCursor      String
+  rows           Int
+  bytes          Int
+  digest         String
+  previousDigest String
+  fileName       String
+  createdAt      DateTime @default(now())
+  partition      Phase7RetirementPartition @relation(fields: [partitionId], references: [id], onDelete: Restrict)
+  @@unique([partitionId,sourceEpoch,sequence])
+}
+model Phase7RetirementProof {
+  id                String @id
+  cohortId          String
+  sourceTable       String
+  sourceId          String
+  sourceHash        String
+  kind              String
+  agencyId          String?
+  creatorId         String?
+  providerSubject   String?
+  targetId          String?
+  generation        Int?
+  deliveryId        String?
+  consumptionKey    String?
+  evidence          Json @default("{}")
+  classifierVersion Int @default(1)
+  createdAt         DateTime @default(now())
+  cohort            Phase7RetirementCohort @relation(fields: [cohortId], references: [id], onDelete: Restrict)
+  @@unique([sourceTable,sourceId,sourceHash,kind])
+  @@index([deliveryId,kind], map: "phase7_proof_delivery")
+  @@index([agencyId,creatorId,targetId,kind], map: "phase7_proof_consumption")
 }

@@ -63,6 +63,8 @@ async function relationState(definition, db = prisma) {
 }
 
 async function main({ db = prisma } = {}) {
+  const phase7=await require("./phase7-snapshot-compatibility").check(db);
+  if (phase7) { console.log(JSON.stringify(phase7)); return phase7; }
   const states = [];
   for (const definition of LEGACY_RELATIONS) states.push(await relationState(definition, db));
   const invalid = states.filter((state) => !state.valid);

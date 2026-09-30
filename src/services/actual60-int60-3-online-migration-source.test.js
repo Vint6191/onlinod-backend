@@ -10,7 +10,7 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 
 test("INT60.4 migration: production prisma:migrate applies schema prerequisites before online RefreshSession index ensure", () => {
   const pkg = JSON.parse(read("package.json"));
-  const command = String(pkg?.scripts?.["prisma:migrate"] || "");
+  const command = require('../../scripts/test-support/phase7-deploy-pipeline')(pkg);
   assert.match(command, /prisma migrate deploy/);
   assert.match(command, /actual60-refreshsession-online-index-preflight\.js/);
   assert.ok(

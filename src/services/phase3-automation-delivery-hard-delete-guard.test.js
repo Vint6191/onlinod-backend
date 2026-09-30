@@ -41,13 +41,13 @@ test("Phase3 hard-delete guard retains the pre-INT4.3C SFS follow proof while cl
   assert.deepEqual(result.protected, [row]);
 });
 
-test("Phase3 hard-delete guard releases current, completed, legacy and superseded SFS proof", async () => {
+test("Phase3 hard-delete guard releases current, completed and superseded; legacy flags require attestation SFS proof", async () => {
   const row = follow();
   assert.equal(candidateNoLongerNeedsFollowProof(candidate({
     metadata: { followEffectOwnership: "OWNED", followEffectDeliveryId: row.id },
   }), row), true);
   assert.equal(candidateNoLongerNeedsFollowProof(candidate({ state: "COMPLETED", completedAt: new Date() }), row), true);
-  assert.equal(candidateNoLongerNeedsFollowProof(candidate({ metadata: { legacyMigration: true } }), row), true);
+  assert.equal(candidateNoLongerNeedsFollowProof(candidate({ metadata: { legacyMigration: true } }), row), false);
   assert.equal(candidateNoLongerNeedsFollowProof(candidate({ generation: 4 }), row), true);
 
   const db = { sfsTargetCandidate: { findMany: async () => [candidate({

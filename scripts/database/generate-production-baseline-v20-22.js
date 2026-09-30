@@ -6,7 +6,7 @@ const { spawnSync } = require("node:child_process");
 
 const root = path.resolve(__dirname, "../..");
 const schema = path.join(root, "prisma", "schema.prisma");
-const outDir = path.join(root, "artifacts", "database-baseline-v20-22");
+const outDir = path.join(root, "artifacts", "schema-comparison-only");
 const outFile = path.join(outDir, "migration.sql");
 
 if (!fs.existsSync(schema)) {
@@ -46,6 +46,6 @@ if (!sql) {
 }
 
 fs.mkdirSync(outDir, { recursive: true });
-fs.writeFileSync(outFile, `${sql}\n`, "utf8");
-console.log(`Wrote clean V20.22 baseline SQL: ${path.relative(root, outFile)}`);
-console.log("Review it before applying it to a brand-new production database.");
+fs.writeFileSync(outFile, `-- SCHEMA COMPARISON ONLY. NOT A BOOTSTRAP. SQL-only guards, views, controls and history are absent.\n${sql}\n`, "utf8");
+console.log(`Wrote unsupported-for-bootstrap Prisma schema comparison: ${path.relative(root, outFile)}`);
+console.log("Do not apply this as a database bootstrap. Use npm run prisma:migrate with the canonical migration history.");

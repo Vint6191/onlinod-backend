@@ -1,0 +1,4110 @@
+{
+  "AnalyticsSnapshot": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "payload",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "rangeKey",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "scope",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "AnalyticsSnapshot_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "AnalyticsSnapshot_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "AutomationJob": {
+    "columns": [
+      {
+        "column_name": "accountId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "action",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'run'::text"
+      },
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "attempts",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "claimedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "claimedByDeviceId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "completedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "dedupeKey",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "error",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "maxAttempts",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "3"
+      },
+      {
+        "column_name": "payload",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "priority",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "result",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "runAfter",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'scheduled'::text"
+      },
+      {
+        "column_name": "taskId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "type",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "AutomationJob_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "AutomationLog": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "level",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'info'::text"
+      },
+      {
+        "column_name": "message",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "runId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "AutomationLog_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "AutomationLog_createdByUserId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"createdByUserId\") REFERENCES \"User\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      },
+      {
+        "name": "AutomationLog_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "AutomationLog_runId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"runId\") REFERENCES \"AutomationRun\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      }
+    ]
+  },
+  "AutomationRule": {
+    "columns": [
+      {
+        "column_name": "action",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorScope",
+        "data_type": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "deletedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "enabled",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "name",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "safety",
+        "data_type": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "trigger",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "AutomationRule_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "AutomationRule_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "AutomationRun": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "completedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "error",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "result",
+        "data_type": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "ruleId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "startedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'SCHEDULED'::text"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "AutomationRun_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "AutomationRun_createdByUserId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"createdByUserId\") REFERENCES \"User\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      },
+      {
+        "name": "AutomationRun_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "AutomationRun_ruleId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"ruleId\") REFERENCES \"AutomationRule\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      }
+    ]
+  },
+  "CampaignDraft": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "contentCollectionId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "currency",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'USD'::text"
+      },
+      {
+        "column_name": "deletedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "filters",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "lockedText",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "manualUserIds",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'[]'::jsonb"
+      },
+      {
+        "column_name": "media",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'[]'::jsonb"
+      },
+      {
+        "column_name": "previews",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'[]'::jsonb"
+      },
+      {
+        "column_name": "priceCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "segmentId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'draft'::text"
+      },
+      {
+        "column_name": "text",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "column_name": "title",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CampaignDraft_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CampaignDraft_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CampaignDraft_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "CampaignDraft_segmentId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"segmentId\") REFERENCES \"SavedSegment\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      }
+    ]
+  },
+  "CampaignQueueStatus": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "audienceCount",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "draftId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "lastOfResponse",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "mediaCount",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "ofQueueId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "payload",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "priceCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'active'::text"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CampaignQueueStatus_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CampaignQueueStatus_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CampaignQueueStatus_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "CreatorCampaignsSnapshot": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "campaigns",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'[]'::jsonb"
+      },
+      {
+        "column_name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "capturedByDeviceId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "capturedByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "rangeKey",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'7d'::text"
+      },
+      {
+        "column_name": "totalActive",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "totalClaimers",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "totalClicks",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CreatorCampaignsSnapshot_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CreatorCampaignsSnapshot_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CreatorCampaignsSnapshot_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "CreatorEarningsSnapshot": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "avgSaleCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "capturedByDeviceId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "capturedByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "deltaCents",
+        "data_type": "bigint",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "fanLtvCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "grossCents",
+        "data_type": "bigint",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "rangeEndAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "rangeKey",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "rangeStartAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "raw",
+        "data_type": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "salesCount",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "totalCents",
+        "data_type": "bigint",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "uniqueFans",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CreatorEarningsSnapshot_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CreatorEarningsSnapshot_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CreatorEarningsSnapshot_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "CreatorFanLocalCoverage": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "deviceId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "isComplete",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "lastVerifiedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "newestMessageAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "oldestMessageAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CreatorFanLocalCoverage_creator_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CreatorFanLocalCoverage_dates_check",
+        "type": "c",
+        "definition": "CHECK (((\"oldestMessageAt\" IS NULL) OR (\"newestMessageAt\" IS NULL) OR (\"oldestMessageAt\" <= \"newestMessageAt\")))"
+      },
+      {
+        "name": "CreatorFanLocalCoverage_device_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"deviceId\") REFERENCES \"WorkerDevice\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CreatorFanLocalCoverage_fan_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\", \"fanId\") REFERENCES \"CreatorFan\"(\"creatorId\", id) ON UPDATE CASCADE"
+      },
+      {
+        "name": "CreatorFanLocalCoverage_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "CreatorPresenceSnapshot": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "expiresAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "offlineCount",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "onlineCount",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "source",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'backend'::text"
+      },
+      {
+        "column_name": "staleCount",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'FRESH'::text"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "updatedByDeviceId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CreatorPresenceSnapshot_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CreatorPresenceSnapshot_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CreatorPresenceSnapshot_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "CreatorPresenceSnapshot_updatedByDeviceId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"updatedByDeviceId\") REFERENCES \"WorkerDevice\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      }
+    ]
+  },
+  "CreatorPresenceUser": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "avatarUrl",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "duration",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "lastCheckedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "lastOfflineAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "lastOnlineAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "lastSnapshotAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "name",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "source",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'api_snapshot'::text"
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'online'::text"
+      },
+      {
+        "column_name": "subscribeAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "totalSpentCents",
+        "data_type": "integer",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "updatedByDeviceId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "username",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CreatorPresenceUser_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CreatorPresenceUser_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CreatorPresenceUser_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "CreatorPresenceUser_updatedByDeviceId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"updatedByDeviceId\") REFERENCES \"WorkerDevice\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      }
+    ]
+  },
+  "CrmAnalysisRun": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "analysis",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "completedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "error",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "model",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "profileId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "promptVersion",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "startedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'done'::text"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CrmAnalysisRun_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CrmAnalysisRun_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CrmAnalysisRun_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "CrmAnalysisRun_profileId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"profileId\") REFERENCES \"CrmProfile\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      }
+    ]
+  },
+  "CrmNote": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "deletedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "kind",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'auto'::text"
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "profileId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "text",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CrmNote_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CrmNote_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CrmNote_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "CrmNote_profileId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"profileId\") REFERENCES \"CrmProfile\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      }
+    ]
+  },
+  "CrmProfile": {
+    "columns": [
+      {
+        "column_name": "age",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "aiSummary",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "analyzedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "chatLanguage",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "city",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "controlPreference",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "country",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorRole",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "column_name": "dynamicSummary",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "fanRole",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "info",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "location",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "messageStats",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "name",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "nativeLanguage",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "ppvStats",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "preferredName",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "profession",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "source",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'electron'::text"
+      },
+      {
+        "column_name": "spenderTier",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "stage",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "timezone",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "tone",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "username",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CrmProfile_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CrmProfile_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CrmProfile_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "CrmProfileRawTag": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "confidence",
+        "data_type": "double precision",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "kind",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "mappedKey",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "profileId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "rawLabel",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'needs_review'::text"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CrmProfileRawTag_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CrmProfileRawTag_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "CrmProfileRawTag_profileId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"profileId\") REFERENCES \"CrmProfile\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      }
+    ]
+  },
+  "CrmProfileTag": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "broadcastPolicy",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "category",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "confidence",
+        "data_type": "double precision",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "facets",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'[]'::jsonb"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "intensity",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "kind",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'fetish'::text"
+      },
+      {
+        "column_name": "label",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "negative",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "nicheLevel",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "profileId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "source",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'ai'::text"
+      },
+      {
+        "column_name": "tagKey",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "CrmProfileTag_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "CrmProfileTag_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "CrmProfileTag_profileId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"profileId\") REFERENCES \"CrmProfile\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      }
+    ]
+  },
+  "DialogMessageLedger": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "changedAtOf",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "contentHash",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdAtOf",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "currency",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'USD'::text"
+      },
+      {
+        "column_name": "deletedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "direction",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "firstSeenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "isFree",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "isFromCreator",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "isFromFan",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "isOpened",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "lastSeenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "messageId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "messageType",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'message'::text"
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "priceCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "recipientId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "senderId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "source",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "text",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "DialogMessageLedger_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "DialogMessageLedger_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "DialogMessageLedger_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "DialogMessageMedia": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "assetId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "canView",
+        "data_type": "boolean",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "durationMs",
+        "data_type": "integer",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "firstSeenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "isFanMedia",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "lastSeenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "mediaId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "mediaType",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "messageId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "messageLedgerId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "ownerId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "ownership",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'UNKNOWN'::text"
+      },
+      {
+        "column_name": "preview",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "DialogMessageMedia_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "DialogMessageMedia_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "DialogMessageMedia_messageLedgerId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"messageLedgerId\") REFERENCES \"DialogMessageLedger\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "DialogMessageMedia_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "DialogPurchaseSignal": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "amountCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "buyerDeleted",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "buyerDisplayName",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "buyerId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "buyerUsername",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "currency",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'USD'::text"
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "firstSeenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "idempotencyKey",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "lastSeenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "resolveState",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'PENDING'::text"
+      },
+      {
+        "column_name": "resolvedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "source",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'notification'::text"
+      },
+      {
+        "column_name": "sourceEventId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "sourceMessageId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "DialogPurchaseSignal_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "DialogPurchaseSignal_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "DialogPurchaseSignal_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "FanList": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "deletedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "description",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "filters",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "name",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'active'::text"
+      },
+      {
+        "column_name": "type",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'manual'::text"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "FanList_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "FanList_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      },
+      {
+        "name": "FanList_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "FanListMember": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "listId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "matchedReasons",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'[]'::jsonb"
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "name",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "source",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'manual'::text"
+      },
+      {
+        "column_name": "username",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "FanListMember_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "FanListMember_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      },
+      {
+        "name": "FanListMember_listId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"listId\") REFERENCES \"FanList\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "FanListMember_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "FanObservationClock": {
+    "columns": [
+      {
+        "column_name": "id",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "lastObservedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "FanObservationClock_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "FollowBackTask": {
+    "columns": [
+      {
+        "column_name": "action",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'follow_back'::text"
+      },
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "error",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "lastResultAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "name",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "queuedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "reason",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "result",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'pending'::text"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "username",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "FollowBackTask_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "FollowBackTask_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "FollowBackTask_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "ImpersonationToken": {
+    "columns": [
+      {
+        "column_name": "adminUserId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "claimedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "expiresAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "targetAgencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "targetUserId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "tokenHash",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "ImpersonationToken_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "MessageTemplate": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "body",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorScope",
+        "data_type": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "deletedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "groupId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "priceCents",
+        "data_type": "integer",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'active'::text"
+      },
+      {
+        "column_name": "tags",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'[]'::jsonb"
+      },
+      {
+        "column_name": "title",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "MessageTemplate_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "MessageTemplate_groupId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"groupId\") REFERENCES \"MessageTemplateGroup\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      },
+      {
+        "name": "MessageTemplate_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "MessageTemplateGroup": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "name",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "sortOrder",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "MessageTemplateGroup_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "MessageTemplateGroup_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "MessageTemplateUsageEvent": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "memberId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "templateId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "usedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "userId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "MessageTemplateUsageEvent_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "MessageTemplateUsageEvent_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      },
+      {
+        "name": "MessageTemplateUsageEvent_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "MessageTemplateUsageEvent_templateId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"templateId\") REFERENCES \"MessageTemplate\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "MessageTemplateUsageEvent_userId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"userId\") REFERENCES \"User\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      }
+    ]
+  },
+  "SavedSegment": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "createdByUserId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "deletedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "description",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "filters",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "name",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "preview",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "safety",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'active'::text"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "SavedSegment_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "SavedSegment_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      },
+      {
+        "name": "SavedSegment_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "TeamPendingDialogState": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "derivationVersion",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'team_pending_v1'::text"
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "episodeKey",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "firstIncomingAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "firstIncomingEventId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "firstIncomingMessageId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "firstSeenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "firstSeenMemberId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "incomingCount",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "lastIncomingAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "lastIncomingEventId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "lastIncomingMessageId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "lastSeenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "lastSeenMemberId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "ownerAssignedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "ownerMemberId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "ownerReason",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "repliedByMemberId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "replyAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "replyMessageId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'CLEAR'::text"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "TeamPendingDialogStateLegacy_agency_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "TeamPendingDialogStateLegacy_creator_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "TeamPendingDialogStateLegacy_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "TeamResponseCase": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "classification",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'UNKNOWN'::text"
+      },
+      {
+        "column_name": "coverageId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "coverageResponseSeconds",
+        "data_type": "integer",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "coverageStartedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "derivationVersion",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'team_response_v1'::text"
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "firstIncomingMessageId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "handoffFromMemberId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "incomingAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "incomingCount",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "1"
+      },
+      {
+        "column_name": "lastIncomingAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "memberId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "replyAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "replyMessageId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "seenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "seenResponseSeconds",
+        "data_type": "integer",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "sla15Pass",
+        "data_type": "boolean",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "sla5Pass",
+        "data_type": "boolean",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "slaEligible",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "wallClockSeconds",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      }
+    ],
+    "constraints": [
+      {
+        "name": "TeamResponseCaseLegacy_agency_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "TeamResponseCaseLegacy_creator_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "TeamResponseCaseLegacy_member_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"memberId\") REFERENCES \"AgencyMember\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "TeamResponseCaseLegacy_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "TrafficDailyAggregate": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "claimers",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "costCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "day",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "freeSubs",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "grossCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "netCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "paidSubs",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "refunds",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "renewals",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "sourceId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "TrafficDailyAggregate_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "TrafficDailyAggregate_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "TrafficDailyAggregate_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "TrafficDailyAggregate_sourceId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"sourceId\") REFERENCES \"TrafficSource\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      }
+    ]
+  },
+  "VaultMediaSale": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "allocatedAmountCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "mediaId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "messageId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "packSize",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "1"
+      },
+      {
+        "column_name": "packagePriceCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "purchasedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "reason",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'sold'::text"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "VaultMediaSale_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "VaultMediaSale_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "VaultMediaSale_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "VaultPurchaseLedger": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "buyerDeleted",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "buyerDisplayName",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "buyerId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "buyerUsername",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "currency",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'USD'::text"
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "firstSeenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "idempotencyKey",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "isFree",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "isOpened",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "lastSeenAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "messageLedgerId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "priceCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "purchasedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "resolveState",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "resolvedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "sourceDeleted",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "sourceEventId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "sourceMessageId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "status",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "VaultPurchaseLedger_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "VaultPurchaseLedger_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "VaultPurchaseLedger_messageLedgerId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"messageLedgerId\") REFERENCES \"DialogMessageLedger\"(id) ON UPDATE CASCADE ON DELETE SET NULL"
+      },
+      {
+        "name": "VaultPurchaseLedger_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  },
+  "VaultPurchaseMedia": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "allocatedCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "assetId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "isFanMedia",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "mediaId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "mediaType",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "purchaseId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "resolutionStatus",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'RESOLVED'::text"
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "VaultPurchaseMedia_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "VaultPurchaseMedia_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "VaultPurchaseMedia_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "name": "VaultPurchaseMedia_purchaseId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"purchaseId\") REFERENCES \"VaultPurchaseLedger\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      }
+    ]
+  },
+  "VaultPurchaseMessage": {
+    "columns": [
+      {
+        "column_name": "agencyId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "amountCents",
+        "data_type": "integer",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "column_name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "column_name": "creatorId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "currency",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": "'USD'::text"
+      },
+      {
+        "column_name": "dialogId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "fanId",
+        "data_type": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "id",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "messageId",
+        "data_type": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "column_name": "metadata",
+        "data_type": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "column_name": "purchasedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "resolved",
+        "data_type": "boolean",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "column_name": "resolvedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "column_name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "is_nullable": "NO",
+        "column_default": null
+      }
+    ],
+    "constraints": [
+      {
+        "name": "VaultPurchaseMessage_agencyId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "VaultPurchaseMessage_creatorId_fkey",
+        "type": "f",
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "name": "VaultPurchaseMessage_pkey",
+        "type": "p",
+        "definition": "PRIMARY KEY (id)"
+      }
+    ]
+  }
+}

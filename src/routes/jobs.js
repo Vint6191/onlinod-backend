@@ -93,6 +93,7 @@ const claimSchema = z.object({
   // per-dialog jobs that belong to the batch pipeline.
   dialogDiscoveryOnly: z.boolean().optional(),
   capabilities: z.object({
+    legacyStorageRetirementV1: z.boolean().optional().default(false),
     campaignCausalObservationV1: z.boolean().optional().default(false),
     campaignServerFanRefreshV1: z.boolean().optional().default(false),
     campaignResumablePaginationV1: z.boolean().optional().default(false),
@@ -172,6 +173,7 @@ const failSchema = z.object({
 router.post("/claim", async (req, res, next) => {
   try {
     const input = claimSchema.parse(req.body);
+    if (!input.capabilities?.legacyStorageRetirementV1) return res.status(426).json({ok:false,code:"DESKTOP_PHASE7_UPDATE_REQUIRED"});
     const claimed = await claimJob({
       userId: actorUserId(req),
       deviceId: input.deviceId,
@@ -181,7 +183,7 @@ router.post("/claim", async (req, res, next) => {
       dialogDiscoveryOnly: input.dialogDiscoveryOnly === true,
       capabilities: input.capabilities,
     });
-    return res.json({ ok: true, ...claimed, serverCapabilities: JOB_SERVER_CAPABILITIES });
+    return res.json({ ok: true, ...claimed, serverCapabilities: { ...JOB_SERVER_CAPABILITIES, legacyStorageRetirementV1: true } });
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);
     try { return leaseError(res, error); } catch (unhandled) { return next(unhandled); }

@@ -170,7 +170,7 @@ test("INT5.8A-4 source retains server-refresh compatibility while current Campai
   assert.match(schema, /model CreatorCampaignFanRefreshWork/);
   assert.match(schema, /@@unique\(\[creatorId, scanRunId, onlyFansUserId\]/);
   assert.match(route, /campaignServerFanRefreshV1/);
-  assert.match(route, /serverCapabilities: JOB_SERVER_CAPABILITIES/);
+  assert.match(route, /serverCapabilities: \{ \.\.\.JOB_SERVER_CAPABILITIES, legacyStorageRetirementV1: true \}/);
   assert.match(lease, /campaignServerFanRefreshV1 !== true/);
   assert.match(control, /const manualFanRefreshDelegated = result\.fanRefreshDelegated === true \|\| \["campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", "campaigns-v13"\]\.includes\(continuation\.collectorVersion\)/);
   assert.match(control, /const fanRefreshDelegated = canonicalCoveragePresent \? currentCoverageDelegated : manualFanRefreshDelegated/);

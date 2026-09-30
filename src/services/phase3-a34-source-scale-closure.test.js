@@ -171,7 +171,7 @@ test("A36 DomainWork admission is bounded on both Agency and creator axes withou
   const release = source("src/services/phase2-release-compatibility-authority-service.js");
   const customSubmissions = source("src/services/custom-content-submissions-service.js");
   const permissions = source("src/middleware/automation-permissions.js");
-  const packageJson = source("package.json");
+  const packageJson = require("../../scripts/test-support/phase7-deploy-pipeline")(JSON.parse(source("package.json")));
   const postgresProof = source("scripts/audit/phase3-a20-postgres-proof.js");
   const physical = source("src/services/phase3-a34-source-scale-closure.integration.test.js");
   const broadStart = domain.indexOf('if (rawCapable && typeof db?.$transaction === "function")');

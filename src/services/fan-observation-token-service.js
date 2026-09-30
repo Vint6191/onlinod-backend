@@ -35,77 +35,15 @@ async function nextObservationTime(db, { creatorId }) {
   const normalizedCreatorId = clean(creatorId, 180);
   if (!normalizedCreatorId) throw new Error("FAN_OBSERVATION_TOKEN_CREATOR_REQUIRED");
   const rows = await db.$queryRawUnsafe(`
-    WITH clock_mode AS MATERIALIZED (
-      SELECT
-        COALESCE(("value"->>'active')::boolean, false) AS "active",
-        CASE
-          WHEN COALESCE(("value"->>'active')::boolean, false)
-          THEN ((NULLIF("value"->>'floorObservedAt', ''))::timestamptz AT TIME ZONE 'UTC')::timestamp(3)
-          ELSE NULL
-        END AS "floorObservedAt"
-      FROM "SystemSetting"
-      WHERE "key" = 'phase3.fanObservationCreatorClockV1'
-      FOR SHARE
-    ),
-    bridge_legacy_lock AS MATERIALIZED (
-      SELECT g."lastObservedAt"
-      FROM "FanObservationClock" AS g
-      CROSS JOIN clock_mode AS m
-      WHERE g."id" = 1
-        AND m."active" = false
-      FOR UPDATE OF g
-    ),
-    bridge_creator_step AS MATERIALIZED (
-      INSERT INTO "FanObservationCreatorClock" ("creatorId", "lastObservedAt", "updatedAt")
-      SELECT
-        $1,
-        GREATEST(
-          CURRENT_TIMESTAMP,
-          b."lastObservedAt" + INTERVAL '1 millisecond'
-        ),
-        CURRENT_TIMESTAMP
-      FROM bridge_legacy_lock AS b
-      ON CONFLICT ("creatorId") DO UPDATE
-      SET "lastObservedAt" = GREATEST(
-            CURRENT_TIMESTAMP,
-            "FanObservationCreatorClock"."lastObservedAt" + INTERVAL '1 millisecond',
-            EXCLUDED."lastObservedAt"
-          ),
-          "updatedAt" = CURRENT_TIMESTAMP
+    WITH mode AS MATERIALIZED (
+      SELECT ((NULLIF("value"->>'floorObservedAt',''))::timestamptz AT TIME ZONE 'UTC')::timestamp(3) AS floor
+      FROM "SystemSetting" WHERE "key"='phase3.fanObservationCreatorClockV1'
+      AND "value"->>'active'='true' AND ("value"->>'epoch')::int>0 FOR SHARE
+    ) INSERT INTO "FanObservationCreatorClock"("creatorId","lastObservedAt","updatedAt")
+      SELECT $1,GREATEST(clock_timestamp(),floor+INTERVAL '1 millisecond'),clock_timestamp() FROM mode WHERE floor IS NOT NULL
+      ON CONFLICT ("creatorId") DO UPDATE SET "lastObservedAt"=GREATEST(clock_timestamp(),
+        "FanObservationCreatorClock"."lastObservedAt"+INTERVAL '1 millisecond',EXCLUDED."lastObservedAt"),"updatedAt"=clock_timestamp()
       RETURNING "lastObservedAt"
-    ),
-    bridge_global_sync AS MATERIALIZED (
-      UPDATE "FanObservationClock" AS g
-      SET "lastObservedAt" = GREATEST(g."lastObservedAt", c."lastObservedAt"),
-          "updatedAt" = CURRENT_TIMESTAMP
-      FROM bridge_creator_step AS c
-      WHERE g."id" = 1
-      RETURNING c."lastObservedAt"
-    ),
-    active_creator_step AS MATERIALIZED (
-      INSERT INTO "FanObservationCreatorClock" ("creatorId", "lastObservedAt", "updatedAt")
-      SELECT
-        $1,
-        GREATEST(
-          CURRENT_TIMESTAMP,
-          m."floorObservedAt" + INTERVAL '1 millisecond'
-        ),
-        CURRENT_TIMESTAMP
-      FROM clock_mode AS m
-      WHERE m."active" = true
-        AND m."floorObservedAt" IS NOT NULL
-      ON CONFLICT ("creatorId") DO UPDATE
-      SET "lastObservedAt" = GREATEST(
-            CURRENT_TIMESTAMP,
-            "FanObservationCreatorClock"."lastObservedAt" + INTERVAL '1 millisecond',
-            EXCLUDED."lastObservedAt"
-          ),
-          "updatedAt" = CURRENT_TIMESTAMP
-      RETURNING "lastObservedAt"
-    )
-    SELECT "lastObservedAt" FROM bridge_global_sync
-    UNION ALL
-    SELECT "lastObservedAt" FROM active_creator_step
   `, normalizedCreatorId);
   const observedAt = rows?.[0]?.lastObservedAt instanceof Date
     ? rows[0].lastObservedAt

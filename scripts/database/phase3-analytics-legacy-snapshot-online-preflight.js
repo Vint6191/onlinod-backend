@@ -64,8 +64,8 @@ async function relationState(definition, db = prisma) {
 
   let rowCount = null;
   if (relkind === "r" || relkind === "v") {
-    const counts = await db.$queryRawUnsafe(`SELECT COUNT(*)::bigint AS "count" FROM ${quoteIdentifier(name)}`);
-    rowCount = Number(counts?.[0]?.count || 0);
+    const counts = await db.$queryRawUnsafe(`SELECT 1 AS "present" FROM ${quoteIdentifier(name)} LIMIT 1`);
+    rowCount = counts.length ? 1 : 0; // Presence probe; never scan history for an exact count.
   }
 
   const classification = classifyLegacyRelation({ relkind, rowCount, comment, columns, requiredColumns });
@@ -80,6 +80,8 @@ async function relationState(definition, db = prisma) {
 }
 
 async function main({ db = prisma } = {}) {
+  const phase7=await require("./phase7-snapshot-compatibility").check(db);
+  if (phase7) { console.log(JSON.stringify(phase7)); return phase7; }
   const states = [];
   for (const definition of LEGACY_RELATIONS) states.push(await relationState(definition, db));
   const invalid = states.filter((state) => !state.phaseASafe);

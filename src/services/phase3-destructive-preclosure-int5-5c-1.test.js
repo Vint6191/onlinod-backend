@@ -62,7 +62,7 @@ test("INT5.5C-1 snapshot/cohort stores are not promoted back into canonical curr
 
 test("INT5.5C-1 production migration command keeps online preflights ahead of Prisma deploy", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(SRC, "..", "package.json"), "utf8"));
-  const migrate = String(pkg.scripts?.["prisma:migrate"] || "");
+  const migrate = require('../../scripts/test-support/phase7-deploy-pipeline')(pkg);
   const provenance = migrate.indexOf("phase3-fandata-delivery-provenance-online-preflight.js");
   const campaignCoverage = migrate.indexOf("phase3-campaign-coverage-generation-online-preflight.js");
   const deploy = migrate.indexOf("prisma migrate deploy");

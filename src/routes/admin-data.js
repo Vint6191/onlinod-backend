@@ -39,6 +39,8 @@ const { listHiddenOnline } = require("../services/subscriber-directory-service")
 const { listFollowBack } = require("../services/follow-back-service");
 const { archiveDeliveriesHandler, contentLifecycleHandler } = require("./admin-command-handlers");
 
+const archive = require("../services/phase7-admin-archive-service");
+
 const router = require("./admin-router").createAdminRouter();
 router.use(adminRequired);
 router.use(require("../middleware/admin-read-boundary").adminReadBoundary);
@@ -98,68 +100,23 @@ const MODELS = {
 // ════════════════════════════════════════════════════════════════
 
 router.get("/crm-profiles", async (req, res) => {
-  try {
-    const where = {};
-    if (str(req.query.agencyId)) where.agencyId = str(req.query.agencyId);
-    if (str(req.query.creatorId)) where.creatorId = str(req.query.creatorId);
-    if (str(req.query.fanId)) where.fanId = str(req.query.fanId);
-    const q = str(req.query.q);
-    if (q) where.OR = [
-      { username: { contains: q, mode: "insensitive" } },
-      { name: { contains: q, mode: "insensitive" } },
-      { fanId: { contains: q } },
-    ];
-    const [items, total] = await Promise.all([
-      prisma.crmProfile.findMany({
-        where, orderBy: { updatedAt: "desc" }, take: limitOf(req.query), skip: offsetOf(req.query),
-        include: { _count: { select: { tags: true, notes: true, rawTags: true } } },
-      }),
-      prisma.crmProfile.count({ where }),
-    ]);
-    return res.json({ ok: true, total, items });
-  } catch (err) { return sendErr(res, err); }
+  try { return res.json(await archive.list({db:prisma,table:"CrmProfile",query:req.query})); }
+  catch (err) { return sendErr(res,err); }
 });
 
-router.get("/crm-profiles/:id", async (req, res) => {
-  try {
-    const profile = await prisma.crmProfile.findUnique({
-      where: { id: req.params.id },
-      include: {
-        tags: { orderBy: { createdAt: "desc" } },
-        rawTags: { orderBy: { createdAt: "desc" } },
-        notes: { where: { deletedAt: null }, orderBy: { createdAt: "desc" } },
-        runs: { orderBy: { createdAt: "desc" }, take: 10 },
-      },
-    });
-    if (!profile) return res.status(404).json({ ok: false, code: "NOT_FOUND" });
-    return res.json({ ok: true, profile });
-  } catch (err) { return sendErr(res, err); }
+router.get("/crm-profiles/:id", async (req,res) => {
+  try { return res.json(await archive.profile({db:prisma,id:req.params.id,query:req.query})); }
+  catch(err) { return sendErr(res,err); }
 });
 
 router.get("/crm-tags", async (req, res) => {
-  try {
-    const where = {};
-    if (str(req.query.agencyId)) where.agencyId = str(req.query.agencyId);
-    if (str(req.query.profileId)) where.profileId = str(req.query.profileId);
-    if (str(req.query.kind)) where.kind = str(req.query.kind);
-    const q = str(req.query.q);
-    if (q) where.OR = [{ label: { contains: q, mode: "insensitive" } }, { tagKey: { contains: q, mode: "insensitive" } }];
-    const [items, total] = await Promise.all([
-      prisma.crmProfileTag.findMany({ where, orderBy: { createdAt: "desc" }, take: limitOf(req.query), skip: offsetOf(req.query) }),
-      prisma.crmProfileTag.count({ where }),
-    ]);
-    return res.json({ ok: true, total, items });
-  } catch (err) { return sendErr(res, err); }
+  try { return res.json(await archive.list({db:prisma,table:"CrmProfileTag",query:req.query})); }
+  catch (err) { return sendErr(res,err); }
 });
 
 router.get("/crm-notes", async (req, res) => {
-  try {
-    const where = { deletedAt: null };
-    if (str(req.query.creatorId)) where.creatorId = str(req.query.creatorId);
-    if (str(req.query.profileId)) where.profileId = str(req.query.profileId);
-    const items = await prisma.crmNote.findMany({ where, orderBy: { createdAt: "desc" }, take: limitOf(req.query), skip: offsetOf(req.query) });
-    return res.json({ ok: true, items });
-  } catch (err) { return sendErr(res, err); }
+  try { return res.json(await archive.list({db:prisma,table:"CrmNote",query:req.query})); }
+  catch (err) { return sendErr(res,err); }
 });
 
 router.get("/deliveries", async (req, res) => {
@@ -231,30 +188,13 @@ router.get("/follow-back", async (req, res) => {
 });
 
 router.get("/vault-sales", async (req, res) => {
-  try {
-    const where = {};
-    if (str(req.query.creatorId)) where.creatorId = str(req.query.creatorId);
-    if (str(req.query.agencyId)) where.agencyId = str(req.query.agencyId);
-    if (str(req.query.status)) where.status = str(req.query.status);
-    const [items, total] = await Promise.all([
-      prisma.vaultMediaSale.findMany({ where, orderBy: { createdAt: "desc" }, take: limitOf(req.query), skip: offsetOf(req.query) }),
-      prisma.vaultMediaSale.count({ where }),
-    ]);
-    return res.json({ ok: true, total, items });
-  } catch (err) { return sendErr(res, err); }
+  try { return res.json(await archive.list({db:prisma,table:"VaultMediaSale",query:req.query})); }
+  catch (err) { return sendErr(res,err); }
 });
 
 router.get("/vault-purchases", async (req, res) => {
-  try {
-    const where = {};
-    if (str(req.query.creatorId)) where.creatorId = str(req.query.creatorId);
-    if (str(req.query.agencyId)) where.agencyId = str(req.query.agencyId);
-    const [items, total] = await Promise.all([
-      prisma.vaultPurchaseMessage.findMany({ where, orderBy: { createdAt: "desc" }, take: limitOf(req.query), skip: offsetOf(req.query) }),
-      prisma.vaultPurchaseMessage.count({ where }),
-    ]);
-    return res.json({ ok: true, total, items });
-  } catch (err) { return sendErr(res, err); }
+  try { return res.json(await archive.list({db:prisma,table:"VaultPurchaseMessage",query:req.query})); }
+  catch (err) { return sendErr(res,err); }
 });
 
 router.get("/money", async (req, res) => {
@@ -304,13 +244,13 @@ router.get("/creator/:id/overview", async (req, res) => {
       contentCollections, bumpStatRows,
       moneySum,
     ] = await Promise.all([
-      prisma.crmProfile.count({ where: { creatorId } }),
-      prisma.crmProfileTag.count({ where: { profile: { creatorId } } }),
-      prisma.crmNote.count({ where: { creatorId, deletedAt: null } }),
+      Promise.resolve(null), // Historical archive: exact counts are intentionally not on this read path.
+      Promise.resolve(null), // Historical archive: exact counts are intentionally not on this read path.
+      Promise.resolve(null), // Historical archive: exact counts are intentionally not on this read path.
       prisma.automationDelivery.count({ where: { creatorId } }),
       prisma.automationDelivery.groupBy({ by: ["status"], where: { creatorId }, _count: { _all: true } }),
-      prisma.vaultMediaSale.count({ where: { creatorId } }),
-      prisma.vaultPurchaseMessage.count({ where: { creatorId } }),
+      Promise.resolve(null), // Historical archive: exact counts are intentionally not on this read path.
+      Promise.resolve(null), // Historical archive: exact counts are intentionally not on this read path.
       prisma.contentCollection.count({ where: { creatorId, deletedAt: null } }),
       prisma.bumpDeliveryStat.findMany({ where: { creatorId } , take: 10000}),
       prisma.moneyAttribution.aggregate({ where: { creatorId }, _sum: { amountCents: true } }),
@@ -333,6 +273,7 @@ router.get("/creator/:id/overview", async (req, res) => {
     return res.json({
       ok: true,
       creator,
+      historicalArchives: {authority:"historical_archive",countsAvailable:false},
       counts: {
         crmProfiles, crmTags, crmNotes,
         deliveries, deliveriesByStatus: dStatus,
@@ -359,7 +300,7 @@ router.get("/search", async (req, res) => {
       prisma.agency.findMany({ where: { OR: [{ name: ci }, { id: q }] }, take, select: { id: true, name: true, plan: true, status: true } }),
       prisma.creatorAccount.findMany({ where: { OR: [{ displayName: ci }, { username: ci }, { id: q }, { remoteId: q }] }, take, select: { id: true, displayName: true, username: true, agencyId: true, status: true } }),
       prisma.user.findMany({ where: { OR: [{ email: ci }, { name: ci }, { id: q }] }, take, select: { id: true, email: true, name: true } }),
-      prisma.crmProfile.findMany({ where: { OR: [{ fanId: q }, { username: ci }, { name: ci }] }, take, select: { id: true, fanId: true, username: true, name: true, creatorId: true, agencyId: true } }),
+      Promise.resolve(null),
       // Hidden status is canonical current authority, not a historical fuzzy-search
       // table. Exact fanId lookup stays index-backed across creators; username search
       // belongs to canonical fan identity/CRM surfaces above.
@@ -367,7 +308,7 @@ router.get("/search", async (req, res) => {
       prisma.automationDelivery.findMany({ where: { OR: [{ messageId: q }, { fanId: q }] }, take, select: { id: true, fanId: true, messageId: true, status: true, creatorId: true } }),
     ]);
 
-    return res.json({ ok: true, q, results: { agencies, creators, users, crmProfiles, hiddenOnline: hidden, hiddenOnlineHistoricalCompatibility: hidden, deliveries: deliveriesByMsg } });
+    return res.json({ ok: true, q, archiveSearch: {requiresAgencyScope:true,path:"/api/admin/data/crm-profiles"}, results: { agencies, creators, users, crmProfiles, hiddenOnline: hidden, hiddenOnlineHistoricalCompatibility: hidden, deliveries: deliveriesByMsg } });
   } catch (err) { return sendErr(res, err); }
 });
 
@@ -387,7 +328,8 @@ router.get("/inspect/:model/:id", async (req, res) => {
   try {
     const m = MODELS[req.params.model];
     if (!m) return res.status(400).json({ ok: false, code: "MODEL_NOT_ALLOWED", error: `Unknown model: ${req.params.model}` });
-    const record = await m.d().findUnique({ where: { id: req.params.id } });
+    const archiveTable=archive.tableForModel(req.params.model);
+    const record = archiveTable ? await archive.inspect({db:prisma,table:archiveTable,id:req.params.id}) : await m.d().findUnique({ where: { id: req.params.id } });
     if (!record) return res.status(404).json({ ok: false, code: "NOT_FOUND" });
     return res.json({ ok: true, model: req.params.model, record });
   } catch (err) { return sendErr(res, err); }

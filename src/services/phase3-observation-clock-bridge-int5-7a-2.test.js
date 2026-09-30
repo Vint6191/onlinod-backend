@@ -34,16 +34,12 @@ function clockDb({ globalMs = 1_000, creators = {}, active = false, floorMs = nu
     async $queryRawUnsafe(sql, creatorId) {
       assert.match(sql, /phase3\.fanObservationCreatorClockV1/);
       assert.match(sql, /FOR SHARE/);
-      assert.match(sql, /bridge_legacy_lock/);
-      assert.match(sql, /bridge_global_sync/);
-      assert.match(sql, /active_creator_step/);
+      assert.doesNotMatch(sql, /"FanObservationClock"/);
+      assert.match(sql, /RETURNING "lastObservedAt"/);
       const previous = state.creators.get(creatorId);
       let next;
-      if (!state.active) {
-        next = Math.max(state.globalMs + 1, Number.isFinite(previous) ? previous + 1 : -Infinity);
-        state.creators.set(creatorId, next);
-        state.globalMs = Math.max(state.globalMs, next);
-      } else {
+      if (!state.active) return [];
+      else {
         assert.ok(Number.isFinite(state.floorMs), "active creator clock requires captured activation floor");
         next = Math.max(state.floorMs + 1, Number.isFinite(previous) ? previous + 1 : -Infinity);
         state.creators.set(creatorId, next);
@@ -68,38 +64,17 @@ async function issue(db, creatorId, id) {
   });
 }
 
-test("INT5.7A-2 bridge synchronizes legacy global clock upward when an existing creator row is already ahead", async () => {
-  const db = clockDb({ globalMs: 1_000, creators: { "creator-1": 1_010 }, active: false });
-  const first = await issue(db, "creator-1", "1");
-  assert.equal(millis(first.observedAt), 1_011);
-  assert.equal(db.state.globalMs, 1_011, "bridge must pull legacy global clock up to the creator result");
-
-  // Simulate an old Backend binary issuing from the legacy singleton after the
-  // new bridge-capable replica. It must now advance from the synchronized floor.
-  db.state.globalMs += 1;
-  assert.equal(db.state.globalMs, 1_012);
-
-  const second = await issue(db, "creator-1", "2");
-  assert.equal(millis(second.observedAt), 1_013);
-  assert.equal(db.state.globalMs, 1_013);
+test("Phase7 inactive creator clock refuses token publication", async () => {
+ const db=clockDb({active:false,globalMs:1000});
+ await assert.rejects(issue(db,'creator-1','1'),/FAN_OBSERVATION_CLOCK_UNAVAILABLE/);
+ assert.equal(db.tokens.length,0);assert.equal(db.state.globalMs,1000);
 });
 
-test("INT5.7A-2 bridge serializes unrelated creators only before activation", async () => {
-  const db = clockDb({ globalMs: 2_000, active: false });
-  const c1 = await issue(db, "creator-1", "1");
-  const c2 = await issue(db, "creator-2", "2");
-  assert.equal(millis(c1.observedAt), 2_001);
-  assert.equal(millis(c2.observedAt), 2_002, "bridge mode intentionally shares legacy order while old replicas exist");
-
-  const activationFloor = db.state.globalMs;
-  db.state.active = true;
-  db.state.floorMs = activationFloor;
-  const globalBeforeActiveIssues = db.state.globalMs;
-  const c1Active = await issue(db, "creator-1", "3");
-  const c2Active = await issue(db, "creator-2", "4");
-  assert.ok(millis(c1Active.observedAt) > activationFloor);
-  assert.ok(millis(c2Active.observedAt) > activationFloor);
-  assert.equal(db.state.globalMs, globalBeforeActiveIssues, "active mode must stop advancing the singleton");
+test("Phase7 unrelated creators advance independently above the captured floor", async () => {
+ const db=clockDb({active:true,floorMs:2000,globalMs:2000});
+ const a=await issue(db,'a','1'),b=await issue(db,'b','2'),a2=await issue(db,'a','3');
+ assert.equal(millis(a.observedAt),2001);assert.equal(millis(b.observedAt),2001);
+ assert.equal(millis(a2.observedAt),2002);assert.equal(db.state.globalMs,2000);
 });
 
 test("INT5.7A-2 first creator token after activation is strictly greater than the captured legacy floor", async () => {
@@ -173,7 +148,7 @@ test("INT5.7A-2 activation waits out small future skew while the barrier and leg
     },
     async $executeRawUnsafe(sql, arg) {
       // Transaction-local budget setup is not a domain mutation/lock.
-      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)") return 1;
+      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true)") return 1;
 
       assert.match(sql, /SELECT pg_sleep/);
       events.push(["sleep", arg]);
@@ -227,11 +202,9 @@ test("INT5.7A-2 source contains an inactive durable bridge and explicit operator
   assert.match(migration, /BEFORE UPDATE ON "FanObservationClock"/);
   assert.match(migration, /FAN_OBSERVATION_LEGACY_CLOCK_RETIRED/);
   assert.match(migration, /COALESCE\(\("value"->>'active'\)::boolean, false\) = true/);
-  assert.match(service, /bridge_legacy_lock[\s\S]*FOR UPDATE OF g/);
-  assert.match(service, /m\."active" = false/);
-  assert.match(service, /bridge_global_sync/);
-  assert.match(service, /m\."active" = true/);
-  assert.match(service, /m\."floorObservedAt" \+ INTERVAL '1 millisecond'/);
+  assert.doesNotMatch(service, /"FanObservationClock"|bridge_global_sync/);
+  assert.match(service, /"value"->>'active'='true'/);
+  assert.match(service, /floor\+INTERVAL '1 millisecond'/);
   assert.match(activation, /SystemSetting[\s\S]*FOR UPDATE/);
   assert.match(activation, /FanObservationClock[\s\S]*FOR UPDATE/);
   assert.match(activation, /FAN_OBSERVATION_CLOCK_ACTIVATION_FUTURE_SKEW/);

@@ -691,7 +691,6 @@ async function runAutomationRetentionSweep(options = {}) {
   const authorityNow = sweepNow(options);
   const cfg = await resolveSweepConfig(options);
   const out = [];
-  const jobOlderThan = daysAgo(cfg.automationJobDoneDays, authorityNow);
 
   out.push(await compactAutomationDeliveries({
     olderThan: daysAgo(cfg.automationDeliveryDetailedDays, authorityNow),
@@ -710,19 +709,7 @@ async function runAutomationRetentionSweep(options = {}) {
     where: { periodStart: { lt: daysAgo(cfg.automationAggregateDays, authorityNow) } },
   }));
 
-  out.push(await deleteByIdsInBatches({
-    modelName: "automationJob",
-    batchSize: cfg.batchSize,
-    label: `automationJob.terminal_${cfg.automationJobDoneDays}d`,
-    orderBy: { updatedAt: "asc" },
-    where: {
-      status: { in: ["done", "failed", "canceled", "expired"] },
-      OR: [
-        { completedAt: { lt: jobOlderThan } },
-        { completedAt: null, updatedAt: { lt: jobOlderThan } },
-      ],
-    },
-  }));
+
 
   out.push(await deleteByIdsInBatches({
     modelName: "automationEvent",
@@ -770,13 +757,7 @@ async function runTrafficRetentionSweep(options = {}) {
   }));
 
 
-  out.push(await deleteByIdsInBatches({
-    modelName: "trafficDailyAggregate",
-    batchSize: cfg.batchSize,
-    label: `trafficDailyAggregate.old_${cfg.trafficDailyAggregateDays}d`,
-    orderBy: { day: "asc" },
-    where: { day: { lt: daysAgo(cfg.trafficDailyAggregateDays, authorityNow) } },
-  }));
+
 
   return summarizeSweep("traffic", out);
 }

@@ -1,0 +1,28 @@
+{
+  "functions": [
+    {
+      "name": "phase7_immutable_receipt",
+      "bodyHash": "690d4d787743f38ec3400c60283cb323ac40bbdb0311bac462d817e2d81c25eb"
+    },
+    {
+      "name": "phase7_legacy_storage_fence",
+      "bodyHash": "3acd4840824867f8f0c72b4781e340108d7acb7b8dd4e179873c58260ef1678b"
+    },
+    {
+      "name": "phase7_legacy_truncate_fence",
+      "bodyHash": "3750bc42b054737a4d3fb365b07d99d00b055d9d67ad91d4193f08ea0b918502"
+    },
+    {
+      "name": "phase7_sfs_acquisition_fence",
+      "bodyHash": "fc1f49767703f0f872f57e4d1bd123012f61ea51d08a9b0277fd1f370d9ea126"
+    },
+    {
+      "name": "phase7_new_execution_generation",
+      "bodyHash": "e2e0c6ff7726591d3d71dca18e708e408d53f1ff379a154eb85f7540e87caee2"
+    },
+    {
+      "name": "phase7_storage_fingerprint",
+      "bodyHash": "d684f5bf848b6393a3af88a507d641d3ca5b7091699ab060d1f97379710c7316"
+    }
+  ]
+}

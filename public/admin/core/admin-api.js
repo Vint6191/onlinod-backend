@@ -184,7 +184,7 @@
     dataAnomalies:     ()       => request("/api/admin/data/anomalies"),
     creatorOverview:   (id)     => request(`/api/admin/data/creator/${encodeURIComponent(id)}/overview`),
     crmProfiles:       (query)  => request("/api/admin/data/crm-profiles", { query }),
-    crmProfile:        (id)     => request(`/api/admin/data/crm-profiles/${encodeURIComponent(id)}`),
+    crmProfile:        (id, query) => request(`/api/admin/data/crm-profiles/${encodeURIComponent(id)}`, { query }),
     crmTags:           (query)  => request("/api/admin/data/crm-tags", { query }),
     crmNotes:          (query)  => request("/api/admin/data/crm-notes", { query }),
     dataDeliveries:    (query)  => request("/api/admin/data/deliveries", { query }),

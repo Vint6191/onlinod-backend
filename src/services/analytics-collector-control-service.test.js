@@ -50,7 +50,7 @@ function stateDb(kind) {
   const tx = {
     $executeRawUnsafe: async (sql, key) => {
       // Transaction-local budget setup is not a domain mutation/lock.
-      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)") return 1;
+      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true)") return 1;
  locks.push([sql, key]); return 1; },
     creatorFinancialCollectionState: kind === "financial" ? delegate : undefined,
     creatorCampaignCollectionState: kind === "campaign" ? delegate : undefined,

@@ -168,15 +168,6 @@ const RETENTION_FIELDS = Object.freeze({
     hint: "Per-page notification scan audit rows; current catch-up frontier lives in CreatorNotificationSyncState.",
   },
 
-  automationJobDoneDays: {
-    label: "Automation completed jobs",
-    unit: "days",
-    env: "ONLINOD_AUTOMATION_JOB_DONE_DAYS",
-    fallback: 30,
-    min: 1,
-    max: 3650,
-    hint: "Done/failed/canceled/expired AutomationJob rows.",
-  },
   automationEventDays: {
     label: "Automation audit events",
     unit: "days",
@@ -241,15 +232,6 @@ const RETENTION_FIELDS = Object.freeze({
     min: 7,
     max: 3650,
     hint: "Deletes zero-value snapshots that are not tied to a source member or ledger.",
-  },
-  trafficDailyAggregateDays: {
-    label: "Traffic daily aggregates",
-    unit: "days",
-    env: "ONLINOD_TRAFFIC_DAILY_AGGREGATE_DAYS",
-    fallback: 1095,
-    min: 365,
-    max: 3650,
-    hint: "Old traffic daily aggregate rows. Keep long by default.",
   },
   trafficPaidOrganicLedgerDays: {
     label: "Paid organic subscription ledger",

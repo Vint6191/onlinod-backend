@@ -404,12 +404,13 @@ test("Team pending identity comes only from canonical CreatorFan, not Follow can
   assert.match(team, /platformIdentity/);
 });
 
-test("server CRM is explicitly isolated from canonical fan authority", () => {
-  const crm = read("src/routes/crm-store.js");
-  assert.match(crm, /SERVER_CRM_ISOLATED/);
-  assert.match(crm, /not a writer for canonical OnlyFans platform/);
+test("Phase7 historical CRM is read-only and isolated from canonical fan authority", () => {
+ const archive=read("src/services/phase7-admin-archive-service.js");
+ assert.match(archive,/readArchivePage/);assert.match(archive,/readOnly:true/);
+ assert.doesNotMatch(archive,/\.(create|update|delete|upsert|createMany|updateMany|deleteMany)\(/);
+ const server=read("src/server.js");assert.match(server,/createLegacyGoneRouter/);
+ assert.doesNotMatch(server,/require\(["']\.\/routes\/crm-store/);
 });
-
 
 test("historical event actor snapshots remain explicit while current identity advances", () => {
   const schema = read("prisma/schema.prisma");

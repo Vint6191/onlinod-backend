@@ -20,8 +20,8 @@ function tokenDb(start = "2026-09-17T18:00:00.000Z") {
       queries.push({ sql, creatorId });
       assert.match(sql, /INSERT INTO "FanObservationCreatorClock"/);
       assert.match(sql, /ON CONFLICT \("creatorId"\) DO UPDATE/);
-      assert.match(sql, /clock_mode/);
-      assert.match(sql, /active_creator_step/);
+      assert.match(sql, /WITH mode AS MATERIALIZED/);
+      assert.match(sql, /RETURNING "lastObservedAt"/);
       const previous = clocks.get(creatorId) || new Date(start);
       const next = new Date(previous.getTime() + 1);
       clocks.set(creatorId, next);
@@ -90,10 +90,10 @@ test("INT5.6A-1 creator clock remains the steady-state writer behind the explici
   assert.match(migration, /"creatorId" TEXT PRIMARY KEY/);
   assert.doesNotMatch(migration, /DROP TABLE.*FanObservationClock/i);
   assert.match(schema, /model FanObservationCreatorClock[\s\S]*creatorId\s+String\s+@id/);
-  assert.match(schema, /model LegacyFanObservationClock[\s\S]*@@map\("FanObservationClock"\)/);
+  assert.doesNotMatch(schema, /model LegacyFanObservationClock/);
   assert.match(service, /INSERT INTO "FanObservationCreatorClock"/);
-  assert.match(service, /active_creator_step/);
+  assert.match(service, /RETURNING "lastObservedAt"/);
   assert.match(service, /phase3\.fanObservationCreatorClockV1/);
   assert.match(service, /normalizedCreatorId/);
-  assert.match(service, /m\."active" = true/);
+  assert.match(service, /"value"->>'active'='true'/);
 });

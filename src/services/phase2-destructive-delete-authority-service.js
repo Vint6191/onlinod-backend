@@ -1,4 +1,5 @@
 "use strict";
+const { drainLifecycleLegacyJobs } = require("./phase7-lifecycle-archive-service");
 
 const { runDbTransaction } = require("./db-transaction-service");
 const {
@@ -187,7 +188,6 @@ async function purgeCreatorNonFkPhase2Batch({ tx, agencyId, creatorId, limit }) 
   await run("Phase2DependencyState", `x."dependencyKind"='CREATOR_BINDING' AND x."dependencyKey"=$2 OR (x."dependencyKind"='REMINDER_OUTCOME' AND EXISTS (SELECT 1 FROM "CustomOrder" o WHERE o."id"=x."dependencyKey" AND o."agencyId"=$1 AND o."creatorId"=$2))`);
   // Legacy server automation queues are executable work, not historical facts. They
   // are not FK-backed to CreatorAccount, so hard delete must drain jobs before tasks.
-  await run("AutomationJob", `x."creatorId"=$2 OR x."accountId"=$2 OR EXISTS (SELECT 1 FROM "AutomationTask" t WHERE t."id"=x."taskId" AND t."agencyId"=$1 AND t."creatorId"=$2)`);
   await run("AutomationTask", `x."creatorId"=$2`);
   await run("TeamSentMessageLedger", `x."creatorId"=$2`);
   await run("TeamPpvPurchaseLedger", `x."creatorId"=$2`);
@@ -637,7 +637,6 @@ async function phase2CreatorResidualRowsRemain(tx, agencyId, creatorId) {
     [`"ProviderOperationalDebt"`, `x."creatorId"=$2 OR EXISTS (SELECT 1 FROM "CustomOrder" o WHERE o."id"=x."customOrderId" AND o."agencyId"=$1 AND o."creatorId"=$2) OR EXISTS (SELECT 1 FROM "CustomContentSubmission" s WHERE s."id"=x."customSubmissionId" AND s."agencyId"=$1 AND s."creatorId"=$2)`],
     [`"DomainWorkItem"`, `x."creatorId"=$2 OR (x."objectType"='CreatorAccount' AND x."objectId"=$2) OR (x."dependencyKind"='CREATOR_BINDING' AND x."dependencyKey"=$2) OR EXISTS (SELECT 1 FROM "CustomOrder" o WHERE x."objectType"='CustomOrder' AND o."id"=x."objectId" AND o."agencyId"=$1 AND o."creatorId"=$2) OR EXISTS (SELECT 1 FROM "CustomContentSubmission" s WHERE x."objectType"='CustomContentSubmission' AND s."id"=x."objectId" AND s."agencyId"=$1 AND s."creatorId"=$2)`],
     [`"Phase2DependencyState"`, `x."dependencyKind"='CREATOR_BINDING' AND x."dependencyKey"=$2 OR (x."dependencyKind"='REMINDER_OUTCOME' AND EXISTS (SELECT 1 FROM "CustomOrder" o WHERE o."id"=x."dependencyKey" AND o."agencyId"=$1 AND o."creatorId"=$2))`],
-    [`"AutomationJob"`, `x."creatorId"=$2 OR x."accountId"=$2 OR EXISTS (SELECT 1 FROM "AutomationTask" t WHERE t."id"=x."taskId" AND t."agencyId"=$1 AND t."creatorId"=$2)`],
     [`"AutomationTask"`, `x."creatorId"=$2`],
     [`"TeamSentMessageLedger"`, `x."creatorId"=$2`],
     [`"TeamPpvPurchaseLedger"`, `x."creatorId"=$2`],
@@ -670,7 +669,6 @@ const AGENCY_NON_FK_TENANT_TABLES = Object.freeze([
   "AnalyticsCollectionDemand",
   "DeviceCommand",
   "AutomationTask",
-  "AutomationJob",
   "AutomationEvent",
   "ContentUsageEvent",
   "BumpDeliveryStat",
@@ -852,6 +850,8 @@ async function processAgencyHardDeleteWorkItem({ db, item, ownerToken, batchSize
       return { ok: true, complete: false, deleted: 0, phase: "WAIT_CREATOR_LIFECYCLES" };
     }
 
+    const legacy = await drainLifecycleLegacyJobs({tx,agencyId,limit:Math.min(limit,10)});
+    if (legacy.deleted || legacy.hasMore) return {ok:true,complete:false,deleted:legacy.deleted,phase:"LEGACY_SCOPED_HANDOFF"};
     let remaining = limit;
     const nonFk = await purgeAgencyNonFkTenantBatch({ tx, agencyId, limit: remaining });
     remaining -= nonFk.deleted;
@@ -933,6 +933,8 @@ async function processCreatorHardDeleteWorkItem({ db, item, ownerToken, batchSiz
       `, creatorId, agencyId, String(item.id), String(ownerToken || item.ownerToken || ""));
     }
 
+    const legacy = await drainLifecycleLegacyJobs({tx,agencyId,creatorId,limit:Math.min(limit,10)});
+    if (legacy.deleted || legacy.hasMore) return {ok:true,complete:false,deleted:legacy.deleted,phase:"LEGACY_SCOPED_HANDOFF"};
     let remaining = limit;
     const nonFk = await purgeCreatorNonFkPhase2Batch({ tx, agencyId, creatorId, limit: remaining });
     remaining -= nonFk.deleted;

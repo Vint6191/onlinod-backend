@@ -22,7 +22,7 @@ test("INT5.4C-3A keeps the already-issued provenance migration byte-for-byte unc
 
 test("INT5.4C-3A production migrate runs provenance online preflight before prisma migrate deploy", () => {
   const pkg = JSON.parse(read("package.json"));
-  const command = String(pkg?.scripts?.["prisma:migrate"] || "");
+  const command = require('../../scripts/test-support/phase7-deploy-pipeline')(pkg);
   assert.match(command, /phase3-fandata-delivery-provenance-online-preflight\.js/);
   assert.match(command, /prisma migrate deploy/);
   assert.ok(

@@ -3,7 +3,7 @@ const test=require("node:test"),assert=require("node:assert/strict"),fs=require(
 function ui(){
  const sent=[], values={"#admArchiveReason":{value:"reviewed"},"#admArchiveCutoff":{value:"2026-01-01T00:00"},"#admBulkDel":{}};
  const window={OnlinodAdminApi:{dataArchiveDeliveries:async(id,body)=>{sent.push({id,body});return {ok:false,error:"stop before reload"};}},OnlinodAdminRouter:{toast:()=>{},escapeHtml:String}};
- const source=fs.readFileSync(path.join(__dirname,"../../public/admin/modules/admin-data/admin-data.js"),"utf8").replace("window.OnlinodAdminData = { render };","window.OnlinodAdminData = { render, view, archiveSelected, toggleSel, canSelect, renderTable };");
+ const source=fs.readFileSync(path.join(__dirname,"../../public/admin/modules/admin-data/admin-data.js"),"utf8").replace("window.OnlinodAdminData = { render, inspectCrmProfile };","window.OnlinodAdminData = { render, view, archiveSelected, toggleSel, canSelect, renderTable };");
  vm.runInNewContext(source,{window,Date,confirm:()=>true});const mod=window.OnlinodAdminData;
  Object.assign(mod.view,{entity:"deliveries",filters:{agencyId:"a",creatorId:"c"},rows:[{id:"d",agencyId:"a",creatorId:"c",originKind:"AUTOMATION",status:"COMPLETED",finishedAt:"2025-01-01T00:00:00Z",updatedAt:"2025-02-01T00:00:00Z"}]});mod.view.selected.add("d");
  return {...mod,sent,body:{querySelector:k=>values[k]},values,source};
@@ -24,7 +24,7 @@ test("creator detail retains inspect without a second generic delete caller",()=
 
 test("actual content UI sends only scope, displayed version, action and reason",async()=>{
  let sent;const window={OnlinodAdminApi:{dataContentLifecycle:async(id,body)=>{sent={id,body};return {ok:false,error:"stop before reload"};}},OnlinodAdminRouter:{toast:()=>{},escapeHtml:String}};
- const source=fs.readFileSync(path.join(__dirname,"../../public/admin/modules/admin-data/admin-data.js"),"utf8").replace("window.OnlinodAdminData = { render };","window.OnlinodAdminData = {view,changeContent};");
+ const source=fs.readFileSync(path.join(__dirname,"../../public/admin/modules/admin-data/admin-data.js"),"utf8").replace("window.OnlinodAdminData = { render, inspectCrmProfile };","window.OnlinodAdminData = {view,changeContent};");
  vm.runInNewContext(source,{window,Date,prompt:()=>"reviewed",confirm:()=>true});const m=window.OnlinodAdminData;
  m.view.rows=[{id:"script",agencyId:"a",creatorId:"c",updatedAt:"2026-01-01T00:00:00Z",text:"private"}];await m.changeContent({},"script","permanent");
  assert.equal(sent.id,"script");assert.equal(sent.body.expectedUpdatedAt,"2026-01-01T00:00:00Z");assert.equal(sent.body.action,"permanent");assert.equal(sent.body.reason,"reviewed");assert.equal(sent.body.text,undefined);

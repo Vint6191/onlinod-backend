@@ -16,7 +16,7 @@ function activeValue(value) {
 }
 
 function asDate(value, code) {
-  const date = value instanceof Date ? value : new Date(value);
+  const date = value == null || value === "" ? new Date(NaN) : value instanceof Date ? value : new Date(value);
   if (!Number.isFinite(date.getTime())) throw new Error(code);
   return date;
 }
@@ -45,6 +45,8 @@ async function activateFanObservationCreatorClockV1({
     }
     const previous = object(settingRows[0].value);
     if (activeValue(previous)) {
+      asDate(previous.floorObservedAt, "FAN_OBSERVATION_CLOCK_ACTIVE_FLOOR_INVALID");
+      if (Number(previous.epoch) < 1) throw new Error("FAN_OBSERVATION_CLOCK_ACTIVE_EPOCH_INVALID");
       return {
         active: true,
         alreadyActive: true,

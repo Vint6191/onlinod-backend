@@ -114,7 +114,7 @@ test("A31 pre-migrate repair normalizes A26 signal drift before A29 constraints 
   assert.match(preflight, /ELSE 'RECOVERY'/);
   assert.match(preflight, /GREATEST\(COALESCE\("revision", 0\), 1\)/);
   assert.match(preflight, /GREATEST\(COALESCE\("attempts", 0\), 0\)/);
-  const command = String(pkg.scripts["prisma:migrate"] || "");
+  const command = require('../../scripts/test-support/phase7-deploy-pipeline')(pkg);
   const preflightPos = command.indexOf("phase3-a29-maintenance-check-online-preflight.js");
   const deployPos = command.indexOf("prisma migrate deploy");
   assert.ok(preflightPos >= 0 && deployPos > preflightPos, "signal drift repair must run before migrate deploy");

@@ -46,15 +46,15 @@
     const bs = o.bumpStats || {};
 
     const kpis = [
-      { label: "CRM profiles", val: counts.crmProfiles },
-      { label: "CRM tags", val: counts.crmTags },
+      { label: "CRM profiles (archive)", val: counts.crmProfiles },
+      { label: "CRM tags (archive)", val: counts.crmTags },
       { label: "Deliveries", val: counts.deliveries },
       { label: "Reply rate", val: (bs.replyRate || 0) + "%" },
       { label: "Hidden online", val: counts.hiddenOnline },
       { label: "Follow back", val: counts.followBack },
-      { label: "Vault sales", val: counts.vaultSales },
+      { label: "Vault sales (archive)", val: counts.vaultSales },
       { label: "Money", val: fmtMoney(counts.moneyCents) },
-    ].map((k) => `<div class="adm-kpi"><div class="adm-kpi-label">${esc(k.label)}</div><div class="adm-kpi-val">${esc(k.val)}</div></div>`).join("");
+    ].map((k) => `<div class="adm-kpi"><div class="adm-kpi-label">${esc(k.label)}</div><div class="adm-kpi-val">${esc(k.val ?? "—")}</div></div>`).join("");
 
     const dStatus = counts.deliveriesByStatus || {};
     const statusChips = Object.keys(dStatus).length
@@ -115,7 +115,7 @@
   function renderReplyRate(body) {
     body.innerHTML = `<div class="adm-loading">loading…</div>`;
     A().dataBumpStats({ creatorId: local.creatorId }).then((r) => {
-      if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">failed</div>`; return; }
+      if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">${esc(r?.error||r?.code||"failed")}</div>`; return; }
       const t = r.totals || {};
       const tpl = (r.perTemplate || []).map((p) => `
         <tr><td>${esc(trunc(p.templateId || "(none)", 24))}</td><td>${esc(p.sent)}</td><td>${esc(p.replied)}</td>
@@ -137,11 +137,13 @@
   }
 
   // Generic list renderer for a tab. Defines columns + api per kind.
-  function renderList(body, kind) {
+  function renderList(body, kind, cursor=null) {
+    const creatorId=local.creatorId,tab=local.tab,requestId=local.listRequest=(local.listRequest||0)+1;
     const cfg = listConfig(kind);
     body.innerHTML = `<div class="adm-loading">loading…</div>`;
-    cfg.api().then((r) => {
-      if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">failed</div>`; return; }
+    cfg.api(cursor).then((r) => {
+      if(!body.isConnected||creatorId!==local.creatorId||tab!==local.tab||requestId!==local.listRequest)return;
+      if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">${esc(r?.error||r?.code||"failed")}</div>`; return; }
       const items = r.items || [];
       const readOnly = !cfg.model;
       const head = cfg.cols.map((c) => `<th>${esc(c.label)}</th>`).join("");
@@ -152,10 +154,12 @@
           : `<tr>${tds}<td class="adm-row-actions"><button class="adm-link" data-inspect="${esc(row.id)}">inspect</button></td></tr>`;
       }).join("");
       body.innerHTML = `
-        <div class="adm-muted" style="margin:6px 0">${items.length} shown${r.total != null ? " of " + r.total + " total" : ""}${readOnly ? " · canonical current · read-only" : ""}</div>
-        <table class="adm-table"><thead><tr>${head}${readOnly ? "" : "<th></th>"}</tr></thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows</td></tr>`}</tbody></table>`;
+        <div class="adm-muted" style="margin:6px 0">${items.length} on this page${r.authority==="historical_archive"?" · historical archive · read-only":""}${r.total != null ? " of " + r.total + " total" : ""}${readOnly ? " · canonical current · read-only" : ""}</div>
+        <table class="adm-table"><thead><tr>${head}${readOnly ? "" : "<th></th>"}</tr></thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows</td></tr>`}</tbody></table>${r.hasMore?'<button class="adm-btn adm-btn-sm" data-archive-next>next page</button>':""}`;
+      body.querySelector("[data-archive-next]")?.addEventListener("click",()=>renderList(body,kind,r.nextCursor));
       if (readOnly) return;
       body.querySelectorAll("[data-inspect]").forEach((b) => b.addEventListener("click", async () => {
+        if(cfg.model==="crmProfile"&&window.OnlinodAdminData?.inspectCrmProfile)return window.OnlinodAdminData.inspectCrmProfile(b.dataset.inspect);
         const rr = await A().dataInspect(cfg.model, b.dataset.inspect);
         if (rr?.ok) showModal(`${cfg.model} · ${b.dataset.inspect}`, `<pre class="adm-json">${esc(JSON.stringify(rr.record, null, 2))}</pre>`);
       }));
@@ -167,11 +171,11 @@
     const cid = local.creatorId;
     switch (kind) {
       case "crm": return {
-        model: "crmProfile", api: () => A().crmProfiles({ creatorId: cid, limit: 200 }),
-        cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "name", label: "Name" }, { k: "spenderTier", label: "Tier" }, { k: "fanRole", label: "Role" }, { k: "_count", label: "Tags", fmt: (v) => (v ? v.tags : 0) }, { k: "updatedAt", label: "Updated", fmt: fmtDate }],
+        model: "crmProfile", api: (cursor) => A().crmProfiles({ cursor, creatorId: cid, limit: 200 }),
+        cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "name", label: "Name" }, { k: "spenderTier", label: "Tier" }, { k: "fanRole", label: "Role" }, { k: "_count", label: "Tags", fmt: (v) => (v?.tags ?? "—") }, { k: "updatedAt", label: "Updated", fmt: fmtDate }],
       };
       case "tags": return {
-        model: "crmProfileTag", api: () => A().crmTags({ creatorId: cid, limit: 300 }),
+        model: "crmProfileTag", api: (cursor) => A().crmTags({ cursor, creatorId: cid, limit: 300 }),
         cols: [{ k: "label", label: "Label" }, { k: "kind", label: "Kind" }, { k: "category", label: "Category" }, { k: "nicheLevel", label: "Niche" }, { k: "broadcastPolicy", label: "Broadcast" }, { k: "negative", label: "Neg", fmt: (v) => (v ? "yes" : "") }],
       };
       case "deliveries": return {
@@ -187,7 +191,7 @@
         cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "latestActionType", label: "Action" }, { k: "latestStatus", label: "Delivery status" }, { k: "state", label: "Candidate state" }, { k: "currentEligibility", label: "Eligibility" }, { k: "updatedAt", label: "Updated", fmt: fmtDate }],
       };
       case "vault": return {
-        model: "vaultMediaSale", api: () => A().dataVaultSales({ creatorId: cid, limit: 300 }),
+        model: "vaultMediaSale", api: (cursor) => A().dataVaultSales({ cursor, creatorId: cid, limit: 300 }),
         cols: [{ k: "messageId", label: "MsgId" }, { k: "mediaId", label: "Media" }, { k: "status", label: "Status" }, { k: "allocatedAmountCents", label: "Amount", fmt: fmtMoney }, { k: "purchasedAt", label: "Purchased", fmt: fmtDate }],
       };
       default: return { model: "crmProfile", api: () => A().crmProfiles({ creatorId: cid }), cols: [] };

@@ -4,7 +4,6 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const express = require("express");
 const { createMemoryDb } = require("../../scripts/test-support/admin-command-memory-db");
-const { createIdempotencyMiddleware } = require("../middleware/idempotency");
 
 test("both pricing HTTP aliases share receipts; revoked token cannot replay through process cache", async t => {
   const m = createMemoryDb();
@@ -15,7 +14,7 @@ test("both pricing HTTP aliases share receipts; revoked token cannot replay thro
   t.after(() => { if (original) require.cache[prismaPath] = original; else delete require.cache[prismaPath]; });
   const { adminSessionRequired } = require("../middleware/admin-session");
   const { bulkPricingHandler, setPricingHandler, setBillingPolicyHandler, setBillingHoldHandler, setEntitlementHandler } = require("../routes/admin-command-handlers");
-  const app = express(); app.use(express.json()); app.use(createIdempotencyMiddleware());
+  const app = express(); app.use(express.json());
   app.patch("/api/admin/billing/creator/:id", adminSessionRequired, setPricingHandler);
   app.patch("/api/admin/creators/:id/billing", adminSessionRequired, setPricingHandler);
   app.patch("/api/admin/agencies/:id/subscription", adminSessionRequired, setBillingPolicyHandler);

@@ -10,7 +10,7 @@ function commitDatabaseFixture(db) {
     // Model the real Prisma interface, never present a root as TransactionClient.
     const tx = { ...raw }; delete tx.$transaction;
     if (typeof raw.$executeRawUnsafe === "function") tx.$executeRawUnsafe = (sql, ...args) => {
-      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)") {
+      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true)") {
         assert.equal(args.length, 2); for (const value of args) assert.match(value, /^[1-9][0-9]*ms$/);
         return Promise.resolve(1);
       }

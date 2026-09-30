@@ -214,19 +214,12 @@ test("Audit16 raw task id cannot retarget its clientId onto another creator task
   assert.equal(tasks[1].clientId, "client-b");
 });
 
-test("Audit16 dormant SFS Hunter task writer is creator-fenced before any future remount", async () => {
-  const collision = "sfs_hunter_settings:creator-a";
-  const { tasks, db } = taskDb([
-    { id: "settings-b", agencyId: "agency-1", creatorId: "creator-b", clientId: collision, type: "sfs_hunter", title: "B", enabled: true, status: "active", config: {}, triggers: {}, rules: {}, stats: {}, metadata: {}, deletedAt: null, createdAt: new Date(), updatedAt: new Date() },
-  ]);
-  const service = loadAutomationServiceWithDb(db);
-  await assert.rejects(
-    service.saveSfsHunterSettings({ agencyId: "agency-1", userId: "user-1", creatorId: "creator-a", input: { enabled: true } }),
-    (error) => error?.code === "AUTOMATION_TASK_ID_CONFLICT" && error?.status === 409,
-  );
-  assert.equal(tasks[0].creatorId, "creator-b");
-  assert.equal(tasks[0].clientId, collision);
+test("Phase7 dormant SFS Hunter task writer is physically unavailable", () => {
+ const {db}=taskDb([]);const service=loadAutomationServiceWithDb(db);
+ assert.equal(service.saveSfsHunterSettings,undefined);
+ assert.doesNotMatch(read("services/automation-server-service.js"),/function saveSfsHunterSettings/);
 });
+
 test("Audit16 foreign bump/SFS ids cannot trash, restore or delete outside creator predicate", async () => {
   const { tasks, db } = taskDb([
     { id: "bump-b", agencyId: "agency-1", creatorId: "creator-b", clientId: "bump-client-b", type: "bump_online", metadata: {}, status: "active", enabled: true, deletedAt: null },
@@ -283,7 +276,7 @@ test("Audit16 source closure recursively covers registered automation subrouters
   assert.match(service, /findFirst\(\{ where: \{ agencyId, creatorId: canonicalAccountId, OR:/);
   assert.match(service, /updateMany\(\{ where, data \}\)/);
   assert.match(service, /deleteMany\(\{ where \}\)/);
-  assert.match(service, /findFirst\(\{ where: \{ agencyId, creatorId: cid, clientId \} \}\)/);
+  assert.doesNotMatch(service, /saveSfsHunterSettings/);
 
   const manifest = read("route-manifest.js");
   assert.match(manifest, /generic AutomationTask customer API retired/);

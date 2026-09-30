@@ -99,7 +99,7 @@ test("A15 schema/migration keep capacity debt relational and additive", () => {
     assert.match(schema, new RegExp(`${field}\\s+`));
     assert.match(migration, new RegExp(`"${field}"`));
   }
-  assert.doesNotMatch(schema.slice(schema.indexOf("model ProviderCapacityDebtState"), schema.indexOf("model LegacyFanObservationClock")), /\bJson\??\b/);
+  assert.doesNotMatch(schema.slice(schema.indexOf("model ProviderCapacityDebtState"), schema.indexOf("\n}",schema.indexOf("model ProviderCapacityDebtState"))+2), /\bJson\??\b/);
   assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM/i);
   assert.match(migration, /HEALTHY.*PRESSURED.*OVERLOADED.*UNKNOWN/);
 });

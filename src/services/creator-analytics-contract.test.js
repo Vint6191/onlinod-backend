@@ -27,7 +27,7 @@ test("all changed Creator Analytics backend files pass syntax checks", () => {
   for (const relative of [
     "middleware/agency-member-role.js",
     "middleware/team-permissions.js",
-    "services/creator-analytics-sanitize.js",
+    "services/phase7-admin-archive-service.js",
     "routes/stats.js",
     "services/traffic-service.js",
     "routes/traffic.js",

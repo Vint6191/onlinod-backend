@@ -169,7 +169,7 @@ function flushHints(state) {
 async function applySqlBudgets(tx, config, timeout) {
   if (typeof tx.$executeRawUnsafe !== "function") return; // Small unit doubles only.
   await tx.$executeRawUnsafe(
-    "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true)",
+    "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true)",
     `${Math.min(config.lockTimeoutMs, timeout)}ms`,
     `${Math.min(config.statementTimeoutMs, timeout)}ms`,
   );

@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { readSfsAttestation, hasHistoricalConsumption } = require("./phase7-legacy-storage-service");
 const { readFanConsumerPage } = require("./fan-consumer-cursor-service");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
@@ -54,9 +55,6 @@ function monthStart(date = new Date()) { return new Date(date.getFullYear(), dat
 function currentSfsCleanupOwnership(delivery, candidate) {
   const payload = object(delivery?.payload);
   const metadata = object(candidate?.metadata);
-  if (payload.legacyMigration === true && metadata.legacyMigration === true) {
-    return { owned: true, kind: "LEGACY_ADOPTED", followDeliveryId: null };
-  }
   const followDeliveryId = clean(payload.followDeliveryId, 160);
   const owned = payload.safetyCleanup === true
     && payload.effectOwnership === "OWNED"
@@ -70,6 +68,11 @@ function currentSfsCleanupOwnership(delivery, candidate) {
 
 async function resolveSfsCleanupOwnership({ delivery, candidate, db }) {
   const explicit = currentSfsCleanupOwnership(delivery, candidate);
+  if (object(delivery?.payload).legacyMigration === true) {
+    const proof = await readSfsAttestation({ db, delivery, candidate });
+    return proof ? { owned: true, kind: "RETIRED_ATTESTED", proofId: proof.id, followDeliveryId: proof.evidence.followDeliveryId || null }
+      : { owned: false, kind: "UNPROVEN", followDeliveryId: null };
+  }
   if (explicit.owned) return explicit;
   if (!delivery || !candidate || !db?.automationDelivery?.findFirst) return explicit;
 
@@ -235,9 +238,9 @@ async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunk
         }
       }
 
-      const usedForever = existing?.usedForever === true;
+      const usedForever = existing?.usedForever === true || await hasHistoricalConsumption(tx, { agencyId: job.agencyId, creatorId: job.creatorId, targetId: target.targetUserId });
       const data = {
-        targetUserId: target.targetUserId, username: target.username, displayName: target.displayName, avatarUrl: target.avatarUrl,
+        usedForever, targetUserId: target.targetUserId, username: target.username, displayName: target.displayName, avatarUrl: target.avatarUrl,
         subscribePriceCents: target.subscribePriceCents, isWantComments: target.isWantComments,
         creatorFollowing: target.creatorFollowing, sourcePostIds: target.sourcePostIds, lastSeenAt: observedAt,
         discoveryObservedAt: observedAt, discoverySourceJobId: sourceJobId,
@@ -251,7 +254,7 @@ async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunk
         ? await tx.sfsTargetCandidate.update({ where: { id: existing.id }, data })
         : await tx.sfsTargetCandidate.create({ data: {
           agencyId: job.agencyId, creatorId: job.creatorId, ...data,
-          state: "CANDIDATE", phase: "DISCOVERY", eligibilityReason: null, discoveredAt: observedAt,
+          state: usedForever ? "COMPLETED" : "CANDIDATE", phase: usedForever ? "DONE" : "DISCOVERY", eligibilityReason: usedForever ? "used_forever" : null, discoveredAt: observedAt,
         } });
       return { applied: 1, candidateId: row.id, observedAt: observedAt.toISOString(), targetUserId: target.targetUserId };
     },
@@ -882,58 +885,6 @@ async function setSfsCandidateState({ agencyId, creatorId, candidateId, action, 
   } });
 }
 
-async function adoptLegacySfsUnfollow({ agencyId, creatorId, targetUserId, targetUsername = null, runAfter = null, sourceJobId = null, db = prisma }) {
-  const targetId = clean(targetUserId, 160);
-  if (!agencyId || !creatorId || !targetId) return { ok: false, created: false, reason: "invalid_target" };
-  await requireCreator(agencyId, creatorId, db);
-  const username = String(clean(targetUsername, 80) || `legacy_${targetId}`).replace(/^@+/, "").toLowerCase();
-  const dueAt = dateOrNull(runAfter) || new Date();
-  return withDbAdvisoryXactLock({
-    db,
-    key: `p14:sfs-target:${agencyId}:${creatorId}:${targetId}`,
-    options: { timeout: 30_000 },
-    work: async (tx) => {
-    let candidate = await tx.sfsTargetCandidate.findFirst({ where: { creatorId, targetUserId: targetId } });
-    if (!candidate) candidate = await tx.sfsTargetCandidate.findFirst({ where: { creatorId, username, targetUserId: null } });
-    candidate = candidate
-      ? await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
-        targetUserId: targetId, username, state: "UNFOLLOW_DUE", phase: "UNFOLLOW", creatorFollowing: true,
-        usedForever: true, unfollowAt: dueAt, metadata: { ...object(candidate.metadata), legacyMigration: true, sourceJobId },
-      } })
-      : await tx.sfsTargetCandidate.create({ data: {
-        agencyId, creatorId, targetUserId: targetId, username, state: "UNFOLLOW_DUE", phase: "UNFOLLOW",
-        creatorFollowing: true, usedForever: true, generation: 1, unfollowAt: dueAt,
-        metadata: { legacyMigration: true, sourceJobId },
-      } });
-    const generation = Math.max(1, candidate.generation || 1);
-    const idempotencyKey = sfsUnfollowKey(creatorId, targetId, generation);
-    let delivery;
-    try {
-      delivery = await tx.automationDelivery.create({ data: {
-        agencyId, creatorId, originKind: "AUTOMATION", moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE,
-        targetId, fanId: targetId, idempotencyKey, generation, priority: 120,
-        payload: { candidateId: candidate.id, safetyCleanup: true, legacyMigration: true, sourceJobId },
-        status: "QUEUED", scheduledAt: new Date(), notBefore: dueAt, maxAttempts: 20,
-      } });
-    } catch (error) {
-      if (error?.code !== "P2002") throw error;
-      delivery = assertAutomationDeliveryAdoption(await tx.automationDelivery.findUnique({ where: { idempotencyKey } }), { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE });
-    }
-    await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
-      safetyUnfollowDeliveryId: delivery?.id || candidate.safetyUnfollowDeliveryId,
-      latestDeliveryId: delivery?.id || candidate.latestDeliveryId, latestActionType: SFS_UNFOLLOW_TARGET_ACTION_TYPE,
-      latestStatus: delivery?.status || candidate.latestStatus,
-    } });
-    await tx.automationJob.updateMany({
-      where: { agencyId, creatorId, type: "sfs_hunter", action: "sfs_unfollow_due", status: { in: ["scheduled", "claimed", "running"] },
-        OR: [{ fanId: targetId }, { payload: { path: ["targetUserId"], equals: targetId } }] },
-      data: { status: "canceled", claimedByDeviceId: null, claimedAt: null, completedAt: new Date(), error: "P14_SFS_UNFOLLOW_ADOPTED" },
-    }).catch(() => null);
-    return { ok: true, created: true, candidateId: candidate.id, deliveryId: delivery?.id || null, notBefore: dueAt };
-    },
-  });
-}
-
 function resolveAutomaticSfsResult({ discovery, planning }) {
   const created = Boolean(discovery?.created || planning?.created);
   if (planning?.fanRefresh?.requested > 0 && planning.fanRefresh.durable !== true) {
@@ -959,7 +910,7 @@ module.exports = {
   SFS_MODULE_KEY, SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY,
   scheduleSfsDiscovery, applySfsDiscoveryChunk, applySfsDiscoveryCompletion, applySfsTargetScanCompletion,
   recordSfsJobFailure, planSfsTargets, validateSfsDelivery, finalizeSfsSuccess, finalizeSfsFailure,
-  finalizeSfsTerminal, prepareSfsRetry, listSfs, setSfsCandidateState, adoptLegacySfsUnfollow, ensureAutomaticSfs,
+  finalizeSfsTerminal, prepareSfsRetry, listSfs, setSfsCandidateState, ensureAutomaticSfs,
   RETRYABLE_FAILURES,
   _test: { resolveAutomaticSfsResult },
 };

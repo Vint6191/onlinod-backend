@@ -26,7 +26,7 @@ function sha256(file) {
 test("A20.6 keeps the already-shipped A20.2 migration byte-identical and inserts bounded online preflight before migrate deploy", () => {
   assert.equal(sha256(TARGET_MIGRATION), TARGET_MIGRATION_SHA256, "historical migration checksum must never be rewritten");
   const pkg = JSON.parse(source("package.json"));
-  const command = String(pkg.scripts?.["prisma:migrate"] || "");
+  const command = require('../../scripts/test-support/phase7-deploy-pipeline')(pkg);
   const preflightIndex = command.indexOf("phase3-campaign-coverage-generation-online-preflight.js");
   const deployIndex = command.indexOf("prisma migrate deploy");
   assert.ok(preflightIndex >= 0, "coverage-generation online preflight must be part of deployment");

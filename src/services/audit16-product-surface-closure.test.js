@@ -272,6 +272,7 @@ test("Audit16 direct Dialog Intelligence machine ingress requires a signed auth 
 test("Audit16 retired archive Prisma generations have no current runtime reader/writer outside explicit legacy/admin files", () => {
   const allowed = new Set([
     "routes/admin-data.js",
+    "services/phase7-admin-archive-service.js",
     "routes/campaigns.js",
     "routes/crm-store.js",
     "routes/fan-lists.js",
