@@ -2,10 +2,10 @@
   "version": 1,
   "generation": "phase7_legacy_storage_v1",
   "planHash": "9fb409e3d948c17e3f71914de68c0ef2de116ffa250c73eb48191d1466eab2ac",
-  "packageId": "ONLINOD_PHASE7_ACTUAL101_CHECKSUM_COMPAT_V2",
+  "packageId": "ONLINOD_PHASE7_ACTUAL101_VERIFIED_HISTORY_V3",
   "baseBackendHash": "c966c17631dd1293964fd97fe3af697752f3ce638d3ca072af4e39abb24d5d00",
   "baseDesktopHash": "191b46830e4540699304f9ad50023d58c90fb23b1da526338381ed6506384017",
-  "backendHash": "83692c2ee2e167d9efb102657d245951fb9ecb5162e572fa08a52c3357f871a9",
+  "backendHash": "90d76d28cb5038804f1cb96ec46b0dc6c813c134893639c2572bc6b4123cfd83",
   "desktopHash": "c2dc5d4cef3857a734adbc0c0bb0adc61d28a52df87ccbac685597729131439d",
   "backendFiles": [
     {
@@ -252,6 +252,11 @@
       "path": "docs/PHASE7_OPERATOR_EVIDENCE_EXAMPLE.json",
       "bytes": 1143,
       "sha256": "fcd522b5dc2266145282bc2a78cc3470204e103d40d649e80de1c8327733fa2b"
+    },
+    {
+      "path": "docs/PHASE7_VERIFIED_APPLIED_HISTORY.md",
+      "bytes": 3413,
+      "sha256": "15e87bbcc2b9a8360b22b9472af05404912d03347c175a2876377851f9173956"
     },
     {
       "path": "docs/PRODUCTION_DATABASE_BASELINE_V20_22.md",
@@ -2344,9 +2349,34 @@
       "sha256": "54168962fb9d1ac4584ff9c9dc20573c289c02580768e77cbd2ad5b63b7f5d2b"
     },
     {
+      "path": "scripts/database/phase7-applied-history.json",
+      "bytes": 3272,
+      "sha256": "2119761ba4598067b7c8ca40bc9af91318890551cf20dee4a62499357461d5ca"
+    },
+    {
+      "path": "scripts/database/phase7-applied-history/20260614_traffic_core_v1/07ccab5f3600e53ae278993e05aa6dac24a9150f8b8b547dadabdd07b9a8fb50.sql",
+      "bytes": 7736,
+      "sha256": "07ccab5f3600e53ae278993e05aa6dac24a9150f8b8b547dadabdd07b9a8fb50"
+    },
+    {
+      "path": "scripts/database/phase7-applied-history/20260831223000_event_team_money_authority_cutover/36ea7497c93c0168f1479165eb711cd199f1ff2f352480bb8049b32de5e06152.sql",
+      "bytes": 3679,
+      "sha256": "36ea7497c93c0168f1479165eb711cd199f1ff2f352480bb8049b32de5e06152"
+    },
+    {
+      "path": "scripts/database/phase7-applied-history/20260920123000_phase3_analytics_final_authority_cutover_v1/726f7e6e4423a8c3203528194160c3c3008dc194f0bc32f99177234e63ba2976.sql",
+      "bytes": 6351,
+      "sha256": "726f7e6e4423a8c3203528194160c3c3008dc194f0bc32f99177234e63ba2976"
+    },
+    {
       "path": "scripts/database/phase7-deploy.js",
-      "bytes": 6004,
-      "sha256": "3825b30d6ef9eb60023032ae3e3bf3d9eaf05cb294d76a4dc8b14a131f87f8fd"
+      "bytes": 6723,
+      "sha256": "12142d081abe2b3ef6e64439882ad4b5fb364bbe53b4fa0676e0b52955880d2a"
+    },
+    {
+      "path": "scripts/database/phase7-historical-migrations.js",
+      "bytes": 1891,
+      "sha256": "239f8c40524292d7ca7963bcbf2fa58e5359e6a39700b1bbfe813d140b4e119d"
     },
     {
       "path": "scripts/database/phase7-legacy-storage-indexes.js",
@@ -5840,8 +5870,8 @@
     },
     {
       "path": "src/services/phase7-migration-checksum.test.js",
-      "bytes": 12082,
-      "sha256": "3be5631a0e72a965e027f836e59fc31a8f7d78652af80a61fdbe5d8b8054493f"
+      "bytes": 18978,
+      "sha256": "6d5962050812344ed370f34d1495b4e5a90224d9e00e26acb229dc870abfb64c"
     },
     {
       "path": "src/services/phase7-obligation-handoff-service.js",

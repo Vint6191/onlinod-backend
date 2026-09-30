@@ -7,6 +7,8 @@ const crypto = require('node:crypto');
 const vm = require('node:vm');
 const { createRequire } = require('node:module');
 const { migrationChecksumReport } = require('../../scripts/database/phase7-migration-checksum');
+const { reviewHistoricalMigration } = require('../../scripts/database/phase7-historical-migrations');
+const historical = require('../../scripts/database/phase7-applied-history.json').migrations;
 const root = path.resolve(__dirname, '../..');
 const migrations = path.join(root, 'prisma/migrations');
 const traffic = '20260614_traffic_core_v1';
@@ -51,6 +53,104 @@ function database(applied, { hasLedger = true, tables = [] } = {}) {
     async $executeRawUnsafe() { throw new Error('Migration history must not be written by the checksum gate'); },
   };
 }
+
+function historicalRows() {
+  return fs.readdirSync(migrations).filter(name => name < '20260930180000_phase7_legacy_storage_expand_v1'
+    && fs.existsSync(path.join(migrations, name, 'migration.sql'))).sort().map(name => {
+    const entry = historical.find(item => item.migration === name);
+    return row(name, entry ? entry.storedChecksum : sha(bytesOf(name)));
+  });
+}
+
+test('All three actual Render hashes are recovered SQL, remain byte mismatches, and pass with verified completed repairs', async () => {
+  const events = [], db = database(historicalRows());
+  for (const entry of historical) {
+    const archived = fs.readFileSync(path.join(root, 'scripts/database/phase7-applied-history', entry.migration, entry.storedChecksum + '.sql'));
+    assert.equal(sha(archived), entry.storedChecksum);
+    assert.equal(sha(bytesOf(entry.migration)), entry.currentChecksum);
+    assert.equal(migrationChecksumReport(bytesOf(entry.migration), entry.storedChecksum).matches, false);
+  }
+  const plan = await deployment().migrationPlan(db, { onHistorical: event => events.push(event) });
+  assert.equal(plan.names.length, 269); assert.equal(plan.names.includes(contract), false);
+  assert.equal(events.length, 1); assert.equal(events[0].event, 'PHASE7_VERIFIED_HISTORICAL_MIGRATIONS');
+  assert.equal(events[0].total, 3);
+  assert.ok(events[0].migrations.every(item => item.byteEquivalent === false && item.repairs.length));
+  assert.equal(db.queries.length, 2);
+});
+test('Each of the six repair prerequisites is mandatory, including when a repair was rolled back', async () => {
+  for (const entry of historical) for (const repair of entry.repairs) for (const rolledBack of [false, true]) {
+    const rows = historicalRows().filter(item => item.migration_name !== repair.migration);
+    if (rolledBack) rows.push({ ...row(repair.migration), rolled_back_at: new Date() });
+    await assert.rejects(deployment().migrationPlan(database(rows)), error => {
+      const diagnostic = error.phase7Diagnostics.migrations.find(item => item.migration === entry.migration);
+      assert.equal(diagnostic.historicalReason, 'FORWARD_REPAIRS_NOT_VERIFIED');
+      assert.ok(diagnostic.missingRepairs.includes(repair.migration));
+      return true;
+    });
+  }
+});
+test('A modified repair checksum blocks both itself and dependent historical recognition', async () => {
+  const repair = historical[0].repairs[0].migration;
+  const rows = historicalRows().map(item => item.migration_name === repair ? { ...item, checksum: 'f'.repeat(64) } : item);
+  await assert.rejects(deployment().migrationPlan(database(rows)), error => {
+    assert.equal(error.phase7Diagnostics.total, 2);
+    assert.ok(error.phase7Diagnostics.migrations.some(item => item.migration === repair));
+    return true;
+  });
+});
+test('Historical recognition pins the migration name, current source, and repair source even if a changed repair matches its ledger', async () => {
+  const entry = historical[0];
+  const verified = new Map(entry.repairs.map(repair => [repair.migration, migrationChecksumReport(bytesOf(repair.migration), repair.checksum)]));
+  const report = migrationChecksumReport(bytesOf(entry.migration), entry.storedChecksum);
+  assert.equal((await reviewHistoricalMigration('wrong-name', report, verified)).accepted, false);
+  assert.equal((await reviewHistoricalMigration(entry.migration, migrationChecksumReport(Buffer.concat([bytesOf(entry.migration), Buffer.from('-- changed\n')]), entry.storedChecksum), verified)).reason, 'CANONICAL_SOURCE_CHANGED');
+  const altered = Buffer.from('SELECT 1;');
+  verified.set(entry.repairs[0].migration, migrationChecksumReport(altered, sha(altered)));
+  assert.equal((await reviewHistoricalMigration(entry.migration, report, verified)).reason, 'FORWARD_REPAIRS_NOT_VERIFIED');
+});
+test('Historical recognition preserves supported current-source and repair-source CRLF handling', async () => {
+  for (const entry of historical) {
+    const verified = new Map(entry.repairs.map(repair => [repair.migration, migrationChecksumReport(crlf(bytesOf(repair.migration)), repair.checksum)]));
+    const result = await reviewHistoricalMigration(entry.migration, migrationChecksumReport(crlf(bytesOf(entry.migration)), entry.storedChecksum), verified);
+    assert.equal(result.accepted, true);
+  }
+});
+test('Corrupt recovered SQL fails closed instead of authorizing a checksum pair', async () => {
+  const file = path.join(root, 'scripts/database/phase7-historical-migrations.js');
+  const nativeRequire = createRequire(file), module = { exports: {} };
+  vm.runInNewContext(fs.readFileSync(file, 'utf8'), { module, exports: module.exports, __dirname: path.dirname(file),
+    require: id => id === 'node:fs/promises' ? { readFile: async () => Buffer.from('-- damaged evidence\n') } : nativeRequire(id),
+  }, { filename: file });
+  const entry = historical[0];
+  const result = await module.exports.reviewHistoricalMigration(entry.migration, migrationChecksumReport(bytesOf(entry.migration), entry.storedChecksum), new Map());
+  assert.equal(result.accepted, false); assert.equal(result.reason, 'ARCHIVED_SOURCE_CHANGED');
+});
+test('Recovered histories keep all hooks and stage only unchanged canonical SQL, never evidence SQL or contract', async () => {
+  const calls = [];
+  const { main } = deployment({
+    './phase7-role-preflight': { inspectRoles: async () => ({ verified: true }) },
+    '../../src/services/phase7-legacy-storage-service': { storageState: async () => ({ state: 'BRIDGE' }) },
+  });
+  await main({ db: database(historicalRows()), contract: false, commandRunner: async args => {
+    calls.push(args);
+    if (args[1] === 'migrate') {
+      const dir = path.join(path.dirname(args.at(-1)), 'migrations');
+      assert.equal(fs.readdirSync(dir).filter(name => name !== 'migration_lock.toml').length, 269);
+      for (const entry of historical) assert.equal(sha(fs.readFileSync(path.join(dir, entry.migration, 'migration.sql'))), entry.currentChecksum);
+      assert.equal(fs.existsSync(path.join(dir, contract)), false);
+    }
+  } });
+  assert.equal(calls.length, 14);
+});
+test('Recovered histories still require the explicit contract readiness gate', async () => {
+  let deployCalled = false;
+  const { main } = deployment({
+    './phase7-role-preflight': { inspectRoles: async () => ({ verified: true }) },
+    '../../src/services/phase7-retirement-finalizer': { checkContractReady: async () => { throw new Error('PHASE7_CONTRACT_NOT_PREPARED'); } },
+  });
+  await assert.rejects(main({ db: database(historicalRows()), contract: true, commandRunner: async args => { if (args[1] === 'migrate') deployCalled = true; } }), /CONTRACT_NOT_PREPARED/);
+  assert.equal(deployCalled, false);
+});
 
 test('Phase7 checksum retains SHA256 golden vector and exact raw matching', () => {
   const report = migrationChecksumReport(Buffer.from('hello'), '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824');
