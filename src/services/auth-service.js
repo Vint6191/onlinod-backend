@@ -5,7 +5,8 @@ const prisma = require("../prisma");
 const { randomToken, randomCode, sha256, addMinutes, addDays } = require("../utils/crypto");
 const { signAccessToken, refreshTokenDays } = require("../utils/tokens");
 const { resolveRefreshDeviceBinding } = require("../utils/device-binding");
-const { verificationEmail, passwordResetEmail } = require("./email-service");
+const { verificationPayload, passwordResetPayload } = require("./email-service");
+const { enqueueAuthMail, deliverAuthMail } = require("./auth-mail-outbox-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { authorizeAuthorizationHistoryPublisher } = require("./actual60-authorization-history-rollout-service");
 const {
@@ -23,6 +24,7 @@ function publicUser(user) {
     email: user.email,
     name: user.name,
     avatarUrl: user.avatarUrl,
+    avatarRevision: user.avatarRevision,
     emailVerifiedAt: user.emailVerifiedAt,
     lastLoginAt: user.lastLoginAt,
     disabledAt: user.disabledAt || null,
@@ -94,55 +96,29 @@ async function createAuthToken({ userId, type, ttlMinutes = 30, withCode = false
   return { token, code };
 }
 
-async function issueEmailVerification(user) {
-  await prisma.authToken.updateMany({
-    where: {
-      userId: user.id,
-      type: "EMAIL_VERIFY",
-      usedAt: null,
-    },
-    data: {
-      usedAt: new Date(),
-    },
-  });
-
-  const issued = await createAuthToken({
-    userId: user.id,
-    type: "EMAIL_VERIFY",
-    ttlMinutes: 30,
-    withCode: true,
-  });
-
-  const emailResult = await verificationEmail({
-    email: user.email,
-    token: issued.token,
-    code: issued.code,
-  });
-
-  return {
-    token: issued.token,
-    code: issued.code,
-    emailResult,
-  };
-}
-
-async function issuePasswordReset(user) {
-  const token = randomToken(32);
-  const issued = await withAuthorizationUserLock({ db: prisma, userId: user.id, work: async tx => {
+async function issueAuthMail(user, kind) {
+  const id = await withAuthorizationUserLock({ db: prisma, userId: user.id, work: async tx => {
     await tx.$queryRawUnsafe('SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE', user.id);
-    const current = await tx.user.findUnique({ where: { id: user.id } });
-    // Do not issue a token from a stale pre-password-change snapshot.
-    if (!current || current.disabledAt || current.passwordHash !== user.passwordHash)
-      throw Object.assign(new Error("Account credentials changed; request a new reset email"), { code: "PASSWORD_RESET_STALE", status: 409 });
-    const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
-    await tx.authToken.updateMany({ where: { userId: user.id, type: "PASSWORD_RESET", usedAt: null }, data: { usedAt: now } });
-    await tx.authToken.create({ data: { userId: user.id, type: "PASSWORD_RESET", tokenHash: sha256(token), expiresAt: new Date(now.getTime() + 30 * 60_000) } });
-    return { email: current.email };
-  } });
-  // Delivery is an external effect. No automatic provider resend or transaction retry.
-  const emailResult = await passwordResetEmail({ email: issued.email, token });
-  return { token, emailResult };
+    const current = await tx.user.findUnique({where:{id:user.id}});
+    if (!current || current.disabledAt || (kind === "PASSWORD_RESET" && current.passwordHash !== user.passwordHash))
+      throw Object.assign(new Error("Account credentials changed; request a new email"), {code:"AUTH_MAIL_STALE",status:409});
+    if (kind === "EMAIL_VERIFY" && current.emailVerifiedAt) return null;
+    const now = await dbAuthorityNow({db:tx});
+    // Duplicate submits and a lost HTTP reply reuse one valid issuance during
+    // the cooldown. No second token or provider identity is created.
+    const [recent] = await tx.$queryRawUnsafe('SELECT m."id" FROM "AuthMailOutbox" m JOIN "AuthToken" t ON t."id"=m."authTokenId" WHERE m."userId"=$1 AND m."kind"=$2 AND m."createdAt">$3 AND t."usedAt" IS NULL AND t."expiresAt">$4 AND m."status" NOT IN (\'FAILED\',\'EXPIRED\') ORDER BY m."createdAt" DESC LIMIT 1',user.id,kind,new Date(now.getTime()-60_000),now);
+    if(recent) return recent.id;
+    const token=randomToken(32),code=kind === "EMAIL_VERIFY" ? String(require("node:crypto").randomInt(100000,1000000)) : null;
+    const expiresAt=new Date(now.getTime()+30*60_000);
+    await tx.authToken.updateMany({where:{userId:user.id,type:kind,usedAt:null},data:{usedAt:now}});
+    const row=await tx.authToken.create({data:{userId:user.id,type:kind,tokenHash:sha256(token),codeHash:code?sha256(code):null,expiresAt}});
+    return enqueueAuthMail(tx,{userId:user.id,authTokenId:row.id,kind,expiresAt,payload:kind === "EMAIL_VERIFY" ? verificationPayload({email:current.email,token,code}) : passwordResetPayload({email:current.email,token})});
+  }});
+  const emailResult=id ? await deliverAuthMail({db:prisma,id}) : {ok:true,alreadyVerified:true};
+  return { emailResult };
 }
+async function issueEmailVerification(user) { return issueAuthMail(user,"EMAIL_VERIFY"); }
+async function issuePasswordReset(user) { return issueAuthMail(user,"PASSWORD_RESET"); }
 
 async function createRefreshSession({
   userId,
@@ -275,86 +251,32 @@ async function issueLoginTokens({
   };
 }
 
-async function verifyEmailByToken(token) {
-  const tokenHash = sha256(token);
-
-  const record = await prisma.authToken.findUnique({
-    where: { tokenHash },
-    include: { user: true },
-  });
-
-  if (!record || record.type !== "EMAIL_VERIFY") {
-    return { ok: false, code: "TOKEN_INVALID", error: "Verification token is invalid" };
-  }
-
-  if (record.usedAt) {
-    return { ok: false, code: "TOKEN_USED", error: "Verification token was already used" };
-  }
-
-  if (record.expiresAt < new Date()) {
-    return { ok: false, code: "TOKEN_EXPIRED", error: "Verification token expired" };
-  }
-
-  const user = await runDbTransaction(prisma, async (tx) => {
-    await tx.authToken.update({
-      where: { id: record.id },
-      data: { usedAt: new Date() },
-    });
-
-    return tx.user.update({
-      where: { id: record.userId },
-      data: { emailVerifiedAt: record.user.emailVerifiedAt || new Date() },
-    });
-  });
-
-  return {
-    ok: true,
-    user,
-  };
+async function consumeEmailVerification(userId, where) {
+  return withAuthorizationUserLock({db:prisma,userId,work:async tx=>{
+    await tx.$queryRawUnsafe('SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE',userId);
+    const user=await tx.user.findUnique({where:{id:userId}});
+    if(!user||user.disabledAt)return {ok:false,code:"TOKEN_INVALID",error:"Verification is unavailable"};
+    const now=await dbAuthorityNow({db:tx});
+    const record=await tx.authToken.findFirst({where:{...where,userId,type:"EMAIL_VERIFY",usedAt:null,expiresAt:{gt:now}},orderBy:{createdAt:"desc"}});
+    if(!record)return {ok:false,code:"TOKEN_INVALID",error:"Verification token is invalid, used or expired"};
+    const changed=await tx.authToken.updateMany({where:{id:record.id,usedAt:null,expiresAt:{gt:now}},data:{usedAt:now}});
+    if(changed.count!==1)return {ok:false,code:"TOKEN_USED",error:"Verification token was already used"};
+    // Consume every sibling code under the same User fence. A stale pre-read
+    // cannot overwrite a newer email verification timestamp.
+    await tx.authToken.updateMany({where:{userId,type:"EMAIL_VERIFY",usedAt:null},data:{usedAt:now}});
+    return {ok:true,user:await tx.user.update({where:{id:userId},data:{emailVerifiedAt:user.emailVerifiedAt||now}})};
+  }});
 }
-
-async function verifyEmailByCode({ email, code }) {
-  const user = await prisma.user.findUnique({
-    where: { email: String(email).toLowerCase().trim() },
-  });
-
-  if (!user) {
-    return { ok: false, code: "USER_NOT_FOUND", error: "User not found" };
-  }
-
-  const records = await prisma.authToken.findMany({
-    where: {
-      userId: user.id,
-      type: "EMAIL_VERIFY",
-      usedAt: null,
-      expiresAt: { gt: new Date() },
-    },
-    orderBy: { createdAt: "desc" },
-    take: 10000});
-
-  const codeHash = sha256(code);
-  const record = records.find((item) => item.codeHash === codeHash);
-
-  if (!record) {
-    return { ok: false, code: "CODE_INVALID", error: "Verification code is invalid or expired" };
-  }
-
-  const updated = await runDbTransaction(prisma, async (tx) => {
-    await tx.authToken.update({
-      where: { id: record.id },
-      data: { usedAt: new Date() },
-    });
-
-    return tx.user.update({
-      where: { id: user.id },
-      data: { emailVerifiedAt: user.emailVerifiedAt || new Date() },
-    });
-  });
-
-  return {
-    ok: true,
-    user: updated,
-  };
+async function verifyEmailByToken(token) {
+  const tokenHash=sha256(token);
+  const record=await prisma.authToken.findUnique({where:{tokenHash},select:{userId:true,type:true}});
+  if(!record||record.type!=="EMAIL_VERIFY")return {ok:false,code:"TOKEN_INVALID",error:"Verification token is invalid"};
+  return consumeEmailVerification(record.userId,{tokenHash});
+}
+async function verifyEmailByCode({email,code}) {
+  const user=await prisma.user.findUnique({where:{email:String(email).toLowerCase().trim()},select:{id:true}});
+  if(!user)return {ok:false,code:"CODE_INVALID",error:"Verification code is invalid or expired"};
+  return consumeEmailVerification(user.id,{codeHash:sha256(code)});
 }
 
 function refreshRevocationScope(session, now) {

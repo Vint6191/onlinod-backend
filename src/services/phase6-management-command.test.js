@@ -5,6 +5,20 @@ const test = require("node:test"),
 const { parseManagementCommand, ACTIONS } = require("./management-command-contract");
 const retired = require("../middleware/retired-management-writes");
 const inputs = {
+ "operation.control":["c",{family:"vault",operation:"start",input:{},expectedRevision:"a".repeat(64)}],
+ "claims.tip":["tip",{expectedUpdatedAt:"2026-09-30T00:00:00.000Z",action:"manager_override",targetMemberId:"m",reason:"reviewed"}],
+ "claims.ppv":["ppv",{expectedUpdatedAt:"2026-09-30T00:00:00.000Z",action:"assign",memberId:"m",reason:"reviewed"}],
+ "account.avatar":["",{expectedRevision:0,mimeType:null,dataBase64:null}],
+ "creator.avatar":["c",{expectedRevision:0,mimeType:null,dataBase64:null}],
+ "automation.control":["c",{scope:"creator",expectedUpdatedAt:null,enabled:false}],
+ "automation.template":["c",{kind:"bump",operation:"save",templateId:"",expectedTaskId:null,expectedUpdatedAt:null,input:{messageText:"test"}}],
+ "traffic.cost":["c",{sourceId:"s",expectedRevision:0,costCents:100,currency:"USD"}],
+ "media.metadata":["c",{mediaId:"m",expectedAssetId:null,expectedUpdatedAt:null,metadata:{mediaType:"photo",description:"",manualTags:[],visibleBodyParts:[],accessType:"paid",minPrice:1,idealPrice:2}}],
+ "media.folder":["c",{mediaIds:["m"],folderId:"f",action:"add"}],
+ "media.delete":["c",{mediaIds:["m"]}],
+ "custom.update":["c",{orderId:"o",expectedUpdatedAt:"2026-09-29T00:00:00.000Z",patch:{internalNote:"new"}}],
+ "custom.destination":["c",{folderId:"f",expectedFolderId:null,expectedRevision:0}],
+ "creator.retire":["c",{expectedUpdatedAt:"2026-09-29T00:00:00.000Z",phrase:"DELETE @c",acknowledgeAgencyRemoval:true,acknowledgeSessionRevocation:true}],
   "billing.preferences": ["c", { expectedRevision: "a".repeat(64), aiChatterEnabled: false, outreachEnabled: true }],
   "billing.start": ["c", { expectedRevision: "a".repeat(64), testMode: true, expectedActive: false, expectedChargeCents: 2000 }],
   "billing.cancelRenewal": ["c", { expectedRevision: "a".repeat(64) }],
@@ -89,11 +103,15 @@ test("bad identity, target and excessive cancelled payload are bounded", () => {
   assert.throws(() => parseManagementCommand({ ...c, commandId: "invalid" }));
   assert.throws(() => parseManagementCommand({ ...c, targetId: "another" }));
   assert.throws(
-    () => parseManagementCommand({ ...c, payload: { value: "x".repeat(1100 * 1024) } }, { cancel: true }),
+    () => parseManagementCommand({ ...c, payload: { value: "x".repeat(1400 * 1024) } }, { cancel: true }),
     (e) => e.code === "MANAGEMENT_COMMAND_TOO_LARGE"
   );
 });
 for (const [method, url] of [
+  ["DELETE", "/api/creators/c"],
+  ["DELETE", "/api/settings/account/avatar"],
+  ["PUT", "/api/server/media-library/c/assets/m/metadata"],
+  ["PATCH", "/api/custom-orders/vault-destination"],
   ["POST", "/api/creators/c/begin-connection"],
   ["PATCH", "/api/creators/c/telegram-contact"],
   ["PATCH", "/api/billing/creators/c/preferences"],
@@ -133,10 +151,8 @@ for (const [method, path] of [
   ["POST", "/api/creators/c/complete-connection"],
   ["POST", "/api/creators/c/platform-profile"],
   ["GET", "/api/creators/c"],
-  ["DELETE", "/api/creators/c"],
   ["POST", "/api/network-profiles/proxies/p/test-material"],
   ["POST", "/api/settings/account/password"],
-  ["DELETE", "/api/settings/account/avatar"],
 ])
   test(`${method} ${path} retains its domain owner`, () => {
     let next = false;

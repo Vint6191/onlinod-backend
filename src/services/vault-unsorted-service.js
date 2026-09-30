@@ -385,18 +385,19 @@ async function listVaultUnsortedMedia({ agencyId, creatorId, offset = 0, limit =
   };
 }
 
-async function scheduleVaultUnsortedScan({ agencyId, creatorId, userId, mode = "incremental", source = "vault_ui", priority = 80 }) {
+async function scheduleVaultUnsortedScan({ agencyId, creatorId, userId, mode = "incremental", source = "vault_ui", priority = 80, db = prisma }) {
   const normalizedMode = normalizeMode(mode);
-  const active = await loadActiveJob(prisma, creatorId);
+  const active = await loadActiveJob(db, creatorId);
   if (active) {
-    const snapshot = await prisma.vaultUnsortedSnapshot.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } });
+    const snapshot = await db.vaultUnsortedSnapshot.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } });
     return { ok: true, created: false, reason: "already_in_flight", job: publicJob(active), snapshot: publicSnapshot(snapshot) };
   }
-  const existingSnapshot = await prisma.vaultUnsortedSnapshot.findUnique({
+  const existingSnapshot = await db.vaultUnsortedSnapshot.findUnique({
     where: { agencyId_creatorId: { agencyId, creatorId } },
   });
   const preferredMessagesFolderId = clean(snapshotPayload(existingSnapshot).messagesFolderId, 240);
   const scheduled = await scheduleJobNow({
+    db,
     jobKey: VAULT_UNSORTED_JOB_KEY,
     creatorId,
     agencyId,
@@ -412,7 +413,7 @@ async function scheduleVaultUnsortedScan({ agencyId, creatorId, userId, mode = "
     priority: integer(priority, 80, 0, 200),
     bucketMs: 30_000,
   });
-  const snapshot = await updateSnapshot(prisma, {
+  const snapshot = await updateSnapshot(db, {
     agencyId,
     creatorId,
     userId,
@@ -431,11 +432,11 @@ async function scheduleVaultUnsortedScan({ agencyId, creatorId, userId, mode = "
   return { ok: true, created: scheduled.created, reason: scheduled.reason, job: publicJob(scheduled.job), snapshot: publicSnapshot(snapshot) };
 }
 
-async function pauseVaultUnsortedScan({ agencyId, creatorId, userId }) {
-  const job = await loadActiveJob(prisma, creatorId);
+async function pauseVaultUnsortedScan({ agencyId, creatorId, userId, db = prisma }) {
+  const job = await loadActiveJob(db, creatorId);
   if (!job) return { ok: false, code: "VAULT_UNSORTED_JOB_NOT_ACTIVE", error: "Unsorted scan is not active" };
   const now = new Date();
-  await runDbTransaction(prisma, async (tx) => {
+  await runDbTransaction(db, async (tx) => {
     await tx.jobInstance.updateMany({
       where: { id: job.id, status: { in: ACTIVE_JOB_STATUSES } },
       data: {
@@ -455,19 +456,19 @@ async function pauseVaultUnsortedScan({ agencyId, creatorId, userId }) {
       patch: { scanStatus: "PAUSED", jobId: job.id, completedAt: null, lastError: null },
     });
   });
-  return getVaultUnsortedState({ agencyId, creatorId });
+  return getVaultUnsortedState({ agencyId, creatorId, db });
 }
 
-async function resumeVaultUnsortedScan({ agencyId, creatorId, userId }) {
-  const active = await loadActiveJob(prisma, creatorId);
+async function resumeVaultUnsortedScan({ agencyId, creatorId, userId, db = prisma }) {
+  const active = await loadActiveJob(db, creatorId);
   if (active) return { ok: true, created: false, reason: "already_in_flight", job: publicJob(active) };
-  const paused = await prisma.jobInstance.findFirst({
+  const paused = await db.jobInstance.findFirst({
     where: { creatorId, agencyId, jobKey: VAULT_UNSORTED_JOB_KEY, status: "CANCELLED", lastError: "paused by user" },
     orderBy: { updatedAt: "desc" },
   });
   if (!paused) return { ok: false, code: "VAULT_UNSORTED_PAUSED_JOB_NOT_FOUND", error: "Paused Unsorted scan was not found" };
   const now = new Date();
-  const result = await runDbTransaction(prisma, async (tx) => {
+  const result = await runDbTransaction(db, async (tx) => {
     const job = await createPlannedJob({
       db: tx,
       publish: false,
@@ -499,10 +500,10 @@ async function resumeVaultUnsortedScan({ agencyId, creatorId, userId }) {
   return { ok: true, created: true, reason: "resumed", job: publicJob(result.job), snapshot: publicSnapshot(result.snapshot) };
 }
 
-async function cancelVaultUnsortedScan({ agencyId, creatorId, userId }) {
-  const job = await loadActiveJob(prisma, creatorId);
+async function cancelVaultUnsortedScan({ agencyId, creatorId, userId, db = prisma }) {
+  const job = await loadActiveJob(db, creatorId);
   if (job) {
-    await prisma.jobInstance.updateMany({
+    await db.jobInstance.updateMany({
       where: { id: job.id, status: { in: ACTIVE_JOB_STATUSES } },
       data: {
         status: "CANCELLED",
@@ -515,8 +516,8 @@ async function cancelVaultUnsortedScan({ agencyId, creatorId, userId }) {
       },
     });
   }
-  await prisma.mediaLibraryScanItem.deleteMany({ where: { agencyId, creatorId } });
-  const snapshot = await updateSnapshot(prisma, {
+  await db.mediaLibraryScanItem.deleteMany({ where: { agencyId, creatorId } });
+  const snapshot = await updateSnapshot(db, {
     agencyId,
     creatorId,
     userId,

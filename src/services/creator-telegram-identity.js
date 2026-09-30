@@ -35,10 +35,12 @@ function normalizeExpectedTelegramContact(value) {
   return text;
 }
 
-async function setCreatorTelegramUserId({ agencyId, actorMember, creatorId, telegramUserId, expectedTelegramContact, db = null }) {
+async function setCreatorTelegramUserId({ agencyId, actorMember, creatorId, telegramUserId, expectedTelegramContact, expectedCreatorUpdatedAt, db = null }) {
   const client = db || require("../prisma");
   const normalized = normalizeTelegramUserId(telegramUserId);
   const expectedContact = normalizeExpectedTelegramContact(expectedTelegramContact);
+  const expectedVersion = new Date(expectedCreatorUpdatedAt);
+  if (!expectedCreatorUpdatedAt || !Number.isFinite(expectedVersion.getTime())) throw Object.assign(new Error("Creator version is required for identity resolution"), {code:"CREATOR_TELEGRAM_VERSION_REQUIRED", status:400});
   const id = String(creatorId || "");
   const agency = String(agencyId || "");
   if (typeof client?.$transaction !== "function") {
@@ -67,13 +69,13 @@ async function setCreatorTelegramUserId({ agencyId, actorMember, creatorId, tele
     // contact that Desktop resolved. The commit-time management guard above and
     // this CAS solve different races and are both required.
     const result = await tx.creatorAccount.updateMany({
-      where: { id, agencyId: agency, deletedAt: null, telegramContact: expectedContact },
+      where: { id, agencyId: agency, deletedAt: null, telegramContact: expectedContact, updatedAt: expectedVersion },
       data: { telegramUserId: normalized },
     });
     if (Number(result?.count || 0) !== 1) {
       const current = await tx.creatorAccount.findFirst({
         where: { id, agencyId: agency, deletedAt: null },
-        select: { id: true, telegramContact: true },
+        select: { id: true, telegramContact: true, updatedAt: true },
       });
       if (!current) {
         const err = new Error("Creator not found");
@@ -81,6 +83,7 @@ async function setCreatorTelegramUserId({ agencyId, actorMember, creatorId, tele
         err.status = 404;
         throw err;
       }
+      if (current.telegramContact === expectedContact) throw Object.assign(new Error("Creator changed while Telegram identity was being resolved; resolve again"), {code:"CREATOR_TELEGRAM_VERSION_CHANGED",status:409});
       const err = new Error("Telegram contact changed while its identity was being resolved");
       err.code = "CREATOR_TELEGRAM_CONTACT_CHANGED";
       err.status = 409;

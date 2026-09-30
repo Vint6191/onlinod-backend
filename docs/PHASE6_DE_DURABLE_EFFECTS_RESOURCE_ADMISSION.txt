@@ -1,0 +1,261 @@
+ONLINOD — PHASE 6D + 6E
+DURABLE EFFECTS, RECOVERY AND SHARED HOST RESOURCE ADMISSION
+НАКОПИТЕЛЬНЫЙ КАНДИДАТ ДЛЯ ОБЩЕГО ПРОГОНА 6F — 2026-09-30
+
+Это один связанный выпуск 6D+6E поверх D1–D9. Отдельных D10/D11 и отдельных
+установочных хотфиксов нет. Предыдущий накопительный checkpoint сохранён
+побайтово в начале нового файла; прежние документы и evidence не удалены.
+При противоречии исторического статуса текущему действует этот последний раздел.
+
+СТАТУС
+SOURCE CLOSED (реализация и локальная проверка границ 6D+6E): ДА.
+SCALE CLOSED: НЕТ.
+Фаза 6 в целом: НЕ ЗАКРЫТА — остаётся приёмка 6F на реальном окружении.
+СТАВИТЬ: единый накопительный Backend + Desktop как кандидат для общего прогона.
+Это не заявление о пройденной производственной нагрузке или безошибочности.
+
+Разрешённый объём завершён в одном комплекте: серверные команды и квитанции,
+Desktop-восстановление, профиль/аватар/почта/ключи/CRM-потребители, управление
+сканированием и автоматизацией, единая реакция Chromium/AI/compute/SQLite на host.
+Удалённые Render/Neon/OF/Telegram/почтовый provider не вызывались; деплоя не было.
+Ровно один OWNER на агентство сохранён. Перенос истории на сервер и Phase 7
+с её purge/retention activation остаются отдельными согласованными работами.
+
+1. АКТУАЛ, С КОТОРОГО НАЧАЛСЯ ПРОХОД
+
+Backend: onlinod-backend-main - 2026-09-30T032345.850.zip, 3 927 521 байт.
+SHA256 81f831a94da4f3af7cc8b194ac9445e2b083d626c045574050af4f8e76a0f325.
+1309 файлов, побайтово соответствует рабочему D9.
+Desktop: 97(1).zip, 4 576 782 байт.
+SHA256 465fca1900fc5528dcceaad09e0b4b4e58ad27bc65eed16dfa6ec4f3b791c1b1.
+1206 файлов: код соответствует D8, а не последнему D9. Новых пользовательских
+изменений относительно этой базы не найдено. Восстановлены 12 изменённых и два
+недостающих кодовых/тестовых файла D9, а также 21 накопительный документ.
+Эта разница учтена в итоговом Desktop-архиве; вручную доставлять D9 не нужно.
+
+Накопительная база Backend — I7 / handoff/backend-20260929; Desktop — 77 /
+handoff/desktop. ZIP содержит только отличающиеся от этих баз и новые файлы.
+Всего целевых файлов: Backend 1322, Desktop 1236.
+Отличий от D9: Backend 51, Desktop 109.
+В накопительных ZIP: Backend 160, Desktop 232.
+Ничего не удаляется. Проверены 11 исходных наборов на каждую сторону:
+исходная база, D1…D9 и присланный актуал. Все 22 наложения дают точно один
+и тот же целевой manifest. Старые 267 миграций побайтово неизменны.
+
+2. ОБЩАЯ ГРАНИЦА 6D
+
+Сохранён исходный принцип: намерение пользователя имеет неизменяемые UUID,
+тип действия, цель, payload и fingerprint. Main сохраняет его до HTTP.
+Потерянный ответ, перезапуск Main и Recover продолжают тот же экземпляр.
+Окончательное серверное решение заново проверяет актуальные права и версии.
+Изменение состояния, обязательный аудит и квитанция находятся в одном корневом
+commit. Отмена сохраняет ABANDONED; это не удаление истории команды.
+Устаревшая форма не перебазируется автоматически на новые данные.
+
+В management-контракте теперь 27 типизированных действий. Вместе с прежними
+Team/Schedule/Message Library/Billing/Security/Telegram owners это покрывает
+проверенный пользовательский контур. Для платформенных отправок, лизов worker,
+фактов, login/token и cryptographic generation сохранены собственные протоколы:
+универсальная HTTP-квитанция не выдаёт новую физическую возможность отправки.
+
+Инвентаризация текущих деклараций: 302 смонтированных клиентских маршрута,
+59 исходников без монтажа и 37 административных вне объёма 6D. Для каждого
+клиентского маршрута назначен конкретный владелец состояния/идентичности.
+74 старые декларации проверены исполнением общего 410-gateway. Отдельные
+legacy-gone handlers и D1–D9 tombstones также сохранены. Классификация маршрута
+не равна отдельному физическому concurrency-тесту каждого endpoint.
+
+3. ЗАВЕРШЁННЫЕ ЧАСТИ 6D
+
+Аватары:
+- Содержимое небольшого публичного JPEG/PNG/WebP хранится в AvatarAsset,
+  а не в разрыве filesystem rename → DB pointer. Проверяется magic/type/размер.
+- Pointer, содержимое, avatarRevision и квитанция фиксируются атомарно.
+  Старый ответ не меняет более новый аватар; удаление также версия команды.
+- Выдача по content hash, immutable cache, nosniff/CSP. Старые локальные файлы
+  не удалялись: их очистка относится к согласованной retention-работе.
+
+Письма и аккаунт:
+- AuthToken и зашифрованный неизменяемый AuthMailOutbox создаются вместе.
+- Cooldown повторного запроса переиспользует живое намерение. Worker восстанавливает
+  PENDING/UNKNOWN/COMMITTING после restart; lease и settlement ограждены leaseId.
+- HTTP timeout 15 секунд, ответ не более 16 KiB, проверяется provider id.
+  Один provider Idempotency-Key и точный payload сохраняются при повторе.
+- 30-минутный срок токена короче документированного 24-часового окна Resend.
+  Применимость этого контракта к настоящему provider проверяется на 6F.
+- User lock, DB time, consumed/disabled/expired проверки и одноразовое потребление
+  verification/reset. Поздняя отправка не создаёт новый действующий токен.
+- Публичные ответы не раскрывают debug-коды и ссылки. Документация обновлена.
+
+Шифрование и удаление модели:
+- Creator key rotation имеет отдельный UUID/fingerprint/receipt с прежними
+  key/root/session/proxy версиями. Свежий actor proof не хранится в журнале.
+- Desktop-журнал ротации защищён OS codec; сохраняет точный encrypted payload,
+  пределы числа и объёма записей, cancellation tombstone, restart/replay.
+- После recovered rotation перечитывается нынешний долг отзыва устройства,
+  чтобы старая успешная ротация не закрыла более новый долг.
+- Retirement имеет единый серверный commit, проверку показанной версии/фразы,
+  сохранённый результат и восстановление локальной очистки после потери ответа.
+  Существующие запреты при незавершённых внешних эффектах сохранены.
+- Telegram identity привязана к исходным contact + updatedAt. Даже возврат
+  контакта к прежнему тексту не позволяет запоздалому разрешению сменить identity.
+
+Автоматизация, шаблоны, Media, Customs, деньги:
+- Automation settings сохраняются с версией показанной формы. Polling не
+  подменяет версию редактируемого Bump/Follow/Like/SFS значения. Dirty Bump draft
+  не затирается свежим polling. Версия шаблона включает id + updatedAt.
+- Bump/SFS save/trash/restore/delete пользуются единым command owner и исходными
+  проверками reusable media/provenance. Новый template id связан с commandId.
+- Traffic costRevision отделена от наблюдений сканера, которые её не затирают.
+- Media metadata/folder/delete имеют сохранённые намерения. Repair продолжает
+  исходный commandId; отсутствие уже подтверждённой команды не создаёт новый
+  запрос. Upload metadata подтверждается только после известного результата.
+- Custom patch и Vault destination используют версии. Внешнее создание папки
+  сохраняет свой intent; локальное продолжение не теряется при restart.
+- Назначение unassigned Custom сохраняет исходную bindingRevision до второго
+  чтения внутри специализированного владельца: параллельное назначение не
+  превращается в разрешение переписать чужую новую привязку.
+- TIP/PPV решение привязано к открытым в форме данным ledger/job; polling
+  не обновляет evidence под незавершённым выбором. Проверка, бизнес-изменение,
+  аудит и квитанция атомарны, текущие разрешения проверяются заново.
+
+4. УПРАВЛЕНИЕ ОПЕРАЦИЯМИ — ЕДИНЫЙ ПРОТОКОЛ
+
+operation.control обслуживает notification, financial, campaign, vault, dialog,
+subscriber, hidden status, automation candidate/delivery/planning, analytics
+refresh, traffic refresh, single dialog и общий dialog module.
+Read-only preview выдаёт digest нынешнего состояния. Main фиксирует его до
+мутации. Сервер сравнивает native job/run/lease version и OperationalControlState.
+Ревизия остаётся даже при удалении квитанции: старую команду нельзя исполнить
+как новую. Повтор stop/cancel/release не затрагивает новый run или новый lease.
+
+Нативные планировщики и refresh-demand вызываются с тем же tx. Команда не может
+сохранить одну часть и потерять другую при ошибке receipt/audit. Scope и порядок
+общих lifecycle/automation fences сохранены. Typed readback остаётся свежим;
+короткая квитанция не подменяет полную нынешнюю модель интерфейса.
+
+Ручной retry доставки с неизвестным исходом запрещён: нужна reconciliation.
+Для неидемпотентной FAILED-доставки требуется доказанная безопасная категория.
+Это относится и к retry из карточки кандидата. Bulk safe retry ограничен 100
+и атомарен, старый запрос не переигрывается на новом наборе доставок.
+
+Dialog resume использует set-based SQL без старого обрезания первых 1000 строк.
+Global module enable сохраняет DialogControlResumeDemand в том же commit.
+Worker продолжает их после restart, проверяет module version и creator control
+revision. Поздний ручной pause/cancel supersedes demand. Ранее явно поставленная
+пользователем пауза также сохраняется при глобальном off/on.
+Сохранённый cursor/generation не объявляет непрочитанный хвост завершённым.
+
+5. 6E — ЕДИНЫЙ HOST И ОГРАНИЧЕННЫЕ ВЛАДЕЛЬЦЫ РАБОТЫ
+
+HostResourceBudgetService — общий источник NORMAL/ELEVATED/CRITICAL для
+Chromium admission, browser pressure controller, compute, AI и SQLite client.
+Сэмпл каждые 5 секунд; повышение давления сразу, снижение после трёх здоровых
+сэмплов. Ошибка сэмпла не означает NORMAL. CPU учитывает OS counters, включая
+внешний Ollama, а не только процессы Electron. GPU telemetry не добавлялась.
+
+Chromium:
+- admission до async session preparation и materialization;
+- максимум 256 ожидающих / 2 MiB, 8 на creator; фон 224 и 6 на creator;
+- 30 секунд monotonic queue TTL; пользовательский резерв и взвешенные классы;
+- round robin creator, aging, явное освобождение очереди и listener при отмене;
+- максимум 3 запуска подготовки; ELEVATED 2, CRITICAL только UI 1;
+- active lease удерживается до фактического завершения подготовки/loadURL.
+
+Compute:
+- 32 удерживаемых / 16 MiB, 8 на creator; фон 24 / 12 MiB и 6 на creator;
+- при ELEVATED меньше, при CRITICAL тяжёлая работа не стартует;
+- 4 MiB input до clone, 8 MiB output, один физический native task;
+- очередь 30 секунд, execution 60 секунд, foreground/background 3:1 и creator RR;
+- отмена и потеря полномочий отзывают demand, но не притворяются физическим exit;
+- stalled terminate/close даёт UNKNOWN, удерживает ownership до реального exit.
+
+AI:
+- общий прежний AiDispatcher сохранён и подключён к host pressure;
+- предел по количеству/байтам, creator/model lane и резерв foreground;
+- monotonic TTL проверяется и перед фактическим dispatch, а не только таймером;
+- transport cancellation удерживает физический слот до settlement.
+
+SQLite:
+- один физический worker и FIFO для сохранения причинного порядка записей;
+- нормальный предел 256 запросов / 32 MiB, 4 MiB request, 8 MiB response;
+- pressure снижает admission и темп dispatch; history/analysis оставляют резерв;
+- creator учитывается и для обычных reads/scan writes, а не только CRM permit;
+- authority control/ACK не стоят за переполненной очередью данных;
+- ошибка admission не портит сохранённый cursor и не выдаётся за успешную запись.
+
+6. ДОКАЗАТЕЛЬСТВА И ГРАНИЦЫ
+
+Объединённый целевой прогон Backend: 1057/1057, 0 fail, 0 skip, 62 файла проверок.
+Объединённый целевой прогон Desktop: 326/326, 0 fail, 0 skip; включает recovery и ресурсы.
+Resource-only промежуточный проход 76/76 уже входит в объединённые 326;
+его не надо ещё раз прибавлять к общему числу.
+60 SQL-сценариев с реальным сгенерированным Prisma Client 5.22 и всей цепочкой
+268 миграций. Отдельно Prisma migrate deploy применил все 268 на пустой базе.
+SQL engine: disposable PGlite 0.5.8 + pglite-socket 0.2.11, один сериализованный
+backend. Это не независимые concurrent PostgreSQL sessions и не боевой Neon.
+В SQL-fixture ровно один OWNER на агентство; внешние fetch запрещены.
+
+Проверены fault injection перед receipt, потерянный ответ, replay после новой
+версии, stale permission, tombstone, key rotation и revoke debt, mail lease,
+worker restart/global demand, 16 000 paused dialog states и ручная пауза.
+Chromium admission проверен 20 000 demands через реальную функцию materialize
+с управляемой session preparation. Это не 20 000 живых окон Chromium.
+В SQLite gate есть настоящий Worker и native SQLite: 100 производителей,
+500 записей, четыре creator и сохранение одиночного физического порядка.
+
+Полный Desktop typecheck: shared, Electron, page runtimes и renderer — PASS.
+Полный npm run build: PASS, включая Audit17 built-runtime 1/1.
+Найденные в D9 прежние TS ошибки исправлены без ослабления tsconfig. Сборочные
+зависимости установлены только в отдельную рабочую копию; package/lock-файлы
+проекта и поставляемый node_modules этим не менялись. Linux Rollup optional
+binary установлен только для этой проверки. Windows/macOS installer не собран.
+Все 55 изменённых JS/CJS/MJS проверены node --check.
+В evidence сохранены и неудачные промежуточные запуски с причинами; финальные
+release gates обозначены отдельно. Правки устаревших test fixtures не считаются
+новыми исправлениями runtime; они отражают current login/device/version contract.
+
+Прежние специализированные owners не заменены:
+CreatorSession requestId/baseRevision, AutomationDelivery и Job leaseRevision,
+Custom review/binding/one-time terminalization, Telegram delivery/source/runtime
+lease, provider commit/UNKNOWN settlement, wallet ledger/IPN, Team ownership.
+418 соответствующих регрессионных сценариев включены в общий Backend-прогон.
+Отдельные SOURCE findings и hashes перечислены в evidence; 302 строка inventory
+сама по себе не является 302 отдельными behavioural/concurrency proofs.
+
+Не выполнено: реальный Electron UI/OS safeStorage, несколько ПК, настоящий
+Ollama и provider, физические Telegram/OF/mail эффекты, независимые PostgreSQL
+sessions, production-sized mixed workload и измерение p95/RSS/GPU в целевой ОС.
+SOURCE CLOSED относится к проверенной реализации 6D+6E, а не к этим 6F-гейтам.
+
+7. КАК ПРИМЕНЯТЬ ОДИН КОМПЛЕКТ
+
+1) Сохранить резервные копии текущих исходников, БД и Desktop user-data.
+2) Backend ZIP распаковать с заменой в корень Backend, Desktop ZIP — в корень
+   Desktop. Применять оба из этого выпуска; не собирать цепочку микропатчей.
+3) Использовать штатный Backend install/generate/migration deploy pipeline.
+   Новая миграция: 20260930060000_phase6_durable_assets_and_auth_mail.
+   Старые миграции не редактировать и не запускать prisma db push вместо deploy.
+   Во время cutover не оставлять старые Backend writers параллельно новым.
+4) Для production mail нужны существующий стабильный SNAPSHOT_ENCRYPTION_KEY
+   (32 bytes base64), RESEND_API_KEY, подтверждённый EMAIL_FROM и корректный APP_URL.
+   Ключ нельзя произвольно заменить, пока от него зависят сохранённые envelopes.
+5) Собрать Desktop штатным процессом. Перезапустить рабочие Desktop вместе
+   с серверным cutover: старые unkeyed writes теперь получают 410.
+6) Начать общий 6F-прогон именно этого cumulative target. При обнаружении дефекта
+   фиксировать исходное состояние и всю связанную цепочку, не лечить одиночный
+   симптом отдельным установочным хотфиксом.
+
+Макросценарии приёмки: параллельные действия двух ПК; отзыв доступа во время
+работы; потеря HTTP/IPC ответа и restart; stop/resume на новом поколении;
+UNKNOWN physical send/reconcile; длительное смешанное browser/AI/SQLite
+давление; сохранение dirty UI; восстановление ротации и retirement cleanup.
+Проверять результат на сервере, UI и после restart, а не только успешный ответ.
+
+8. ДАЛЬНЕЙШИЙ КОНТЕКСТ
+
+6D+6E не дробить обратно на D10/D11. Следующая работа — 6F: единый архитектурный
+и функциональный прогон накопительного кандидата. Полное закрытие фазы6 зависит
+от этих измерений. Phase7 и перенос серверной истории в этот пакет не подмешаны.
+Desktop продолжает существующий локальный источник истории и его интерфейсы.
+Сам факт SQL-теста 16 000 состояний не закрывает target scale продукта.

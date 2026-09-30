@@ -347,7 +347,7 @@ async function scheduleRefollowCurrentRefresh({
   priority = 65,
   trigger = "planning",
   refreshFields = [],
-  scheduleFanRefresh = scheduleFanDataPointRefresh,
+  scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }),
 } = {}) {
   return scheduleDurableFanDataRefreshDebt({
     agencyId, creatorId, fanIds, consumer: "follow_automation", reason: "refollow_current_unknown",
@@ -370,13 +370,13 @@ async function planFollowAutomation(input) {
     priority: input.priority || 65,
     trigger: "planning",
     refreshFields: result.refreshFields || [],
-    scheduleFanRefresh: input.scheduleFanRefresh || scheduleFanDataPointRefresh,
+    scheduleFanRefresh: input.scheduleFanRefresh || ((args) => scheduleFanDataPointRefresh({ ...args, db })),
   });
   if (!fanRefresh.requested) return { ...result, refreshFanIds: [] };
   return { ...result, refreshFanIds: fanRefresh.fanIds, fanRefresh };
 }
 
-async function ensureAutomaticFollowAutomation({ agencyId, creatorId, source = "recurring_sweep", db = prisma, scheduleFanRefresh = scheduleFanDataPointRefresh }) {
+async function ensureAutomaticFollowAutomation({ agencyId, creatorId, source = "recurring_sweep", db = prisma, scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }) }) {
   const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
   const settings = control.modules.follow.settings;
   if (!control.effective.followEnabled) return { ok: true, created: false, reason: "module_disabled" };

@@ -333,6 +333,7 @@ async function completeCreatorConnection({
           platformProfileSourceDeviceId: clean(canonical.capturedByDeviceId, 180) || null,
           platformProfileConnectionGeneration: generation,
           avatarUrl: clean(avatarUrl, 2000) || creator.avatarUrl,
+          ...(clean(avatarUrl, 2000) && clean(avatarUrl, 2000) !== creator.avatarUrl ? {avatarRevision:{increment:1}} : {}),
           status: "READY",
           connectionState: CREATOR_CONNECTION_STATES.CONNECTED,
           connectionStartedAt: null,
@@ -436,7 +437,7 @@ async function observeCreatorPlatformProfile({
           platformProfileObservedAt: observationTime,
           platformProfileSourceDeviceId: deviceId,
           platformProfileConnectionGeneration: generation,
-          ...(nextAvatar ? { avatarUrl: nextAvatar } : {}),
+          ...(nextAvatar ? { avatarUrl: nextAvatar, ...(nextAvatar !== creator.avatarUrl ? {avatarRevision:{increment:1}} : {}) } : {}),
         },
       });
       return { creator: updated, unchanged: false, staleNoop: false, reason: null };

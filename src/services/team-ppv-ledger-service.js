@@ -596,7 +596,7 @@ async function createPpvClaimAudit(tx, { agencyId, actorMemberId, job, action, s
   });
 }
 
-async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = null, actorMember = null, action = "assign", deviceId, reason = null, allowedCreatorIds = null }) {
+async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = null, actorMember = null, action = "assign", deviceId, reason = null, allowedCreatorIds = null, db = prisma }) {
   const safeJobId = clean(jobId, 160);
   const safeAction = clean(action || (memberId ? "assign" : "unresolved"), 40) || "assign";
   const safeMemberId = clean(memberId, 160);
@@ -619,7 +619,7 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
     return { resolved: 0, skipped: 1, code: "RESOLUTION_REASON_REQUIRED" };
   }
 
-  const outcome = await runDbTransaction(prisma, async (tx) => {
+  const outcome = await runDbTransaction(db, async (tx) => {
     await lockAgencyLifecycle({ tx, agencyId });
     if (require("./product-billing-context-service").inProductBilling(agencyId)) {
       const observed = await tx.$queryRawUnsafe('SELECT "creatorId" FROM "TeamPpvResolveJob" WHERE "agencyId"=$1 AND "id"=$2 LIMIT 1', agencyId, safeJobId);

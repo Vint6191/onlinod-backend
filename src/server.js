@@ -137,10 +137,13 @@ const authLimiter = rateLimit({
 app.use("/api", apiLimiter);
 app.use("/api/auth/login", authLimiter);
 
+app.use("/api/management/commands", express.json({ limit: "4400kb" }));
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(createRequestObservabilityMiddleware());
+app.use(require("./middleware/retired-management-writes"));
 
+app.use("/api/assets", require("./routes/avatar-assets"));
 app.use("/uploads", express.static(path.join(__dirname, "..", "uploads"), {
   setHeaders(res) {
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -369,13 +372,18 @@ const httpServer = app.listen(port, () => {
 });
 
 startRecurringScheduler();
+const stopDialogControlWorker = require("./services/dialog-module-control-service").startDialogControlWorker({db:prisma});
+const stopAuthMailWorker = require("./services/auth-mail-outbox-service").startAuthMailWorker({ db: prisma });
 const stopAdminDiagnostics = require("./services/admin-diagnostics-service").startAdminDiagnostics({ db: prisma, log: logger });
 
 async function gracefulShutdown(signal) {
   stopAdminDiagnostics();
+  const authMailStopped = stopAuthMailWorker();
+  const dialogControlStopped = stopDialogControlWorker();
   logger.info("shutdown requested", { signal });
   httpServer.close(async () => {
     try {
+      await Promise.all([authMailStopped,dialogControlStopped]);
       await prisma.$disconnect();
     } catch (err) {
       console.warn("[server] prisma disconnect failed:", err?.message || err);
@@ -387,7 +395,7 @@ async function gracefulShutdown(signal) {
   setTimeout(() => {
     logger.warn("graceful shutdown timed out");
     process.exit(1);
-  }, 10_000).unref?.();
+  }, 25_000).unref?.();
 }
 
 process.once("SIGTERM", () => void gracefulShutdown("SIGTERM"));

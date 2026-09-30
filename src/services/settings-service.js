@@ -275,7 +275,6 @@ async function requestAccountPasswordReset({ userId, db = null }) {
   return {
     ok: true,
     emailSent: reset.emailResult?.ok === true && !reset.emailResult?.skipped,
-    devResetUrl: reset.emailResult?.skipped ? reset.emailResult?.resetUrl : undefined,
   };
 }
 

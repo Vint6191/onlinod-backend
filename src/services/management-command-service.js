@@ -20,12 +20,17 @@ const { lockAgencyBillingMutation } = require("./billing-entitlement-service");
 const { updateCreatorTelegramContact } = require("./creator-telegram-contact-authority-service");
 const { publishDesktopControlEvent } = require("./desktop-control-events");
 
+const human = require("./human-control-command-service");
+const { applyAvatar } = require("./avatar-asset-service");
 const stable = (value) => JSON.parse(JSON.stringify(value));
 const boundedResult = (value) => value !== null && Buffer.byteLength(JSON.stringify(value)) <= 256 * 1024;
 async function creatorScope(tx, agencyId, c, ref) {
+  if (c.action === "creator.retire" && ref) return [];
   const ids = new Set(ref?.creatorIds || []);
+  if(human.has(c)) for(const id of await human.targets(tx,agencyId,c))ids.add(id);
   if (
     [
+      "creator.avatar",
       "creator.update",
       "creator.beginConnection",
       "creator.telegramContact",
@@ -47,8 +52,9 @@ async function creatorScope(tx, agencyId, c, ref) {
   return [...ids].sort();
 }
 async function currentResult(tx, agencyId, userId, member, c, ref) {
+  if(human.has(c)) return human.current(tx,agencyId,member,c,ref);
   if (c.action.startsWith("billing.")) return billingControl.currentBillingControl(tx, agencyId, c, ref);
-  if (c.action === "account.profile") {
+  if (c.action === "account.profile" || c.action === "account.avatar") {
     const row = await tx.user.findUnique({ where: { id: userId } });
     return row ? { ok: true, user: publicUser(row) } : null;
   }
@@ -87,8 +93,10 @@ async function currentResult(tx, agencyId, userId, member, c, ref) {
       : { unchanged: ref.unchanged, runtimeChanged: ref.runtimeChanged }),
   };
 }
-async function apply(tx, agencyId, userId, member, deviceId, c) {
+async function apply(tx, agencyId, userId, member, deviceId, c, context) {
+  if(human.has(c)) return human.apply(tx,agencyId,userId,member,c,context,deviceId);
   const p = c.payload;
+  if(c.action.endsWith(".avatar")) return {ok:true,...await applyAvatar(tx,{agencyId,userId,creatorId:c.action === "creator.avatar" ? c.targetId : null,payload:p})};
   if (c.action.startsWith("billing.")) return billingControl.applyBillingControl(tx, agencyId, userId, member, c);
   if (c.action === "creator.beginConnection")
     return {
@@ -183,6 +191,7 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
     db,
     async (context) => {
       const tx = context.tx;
+      if(!cancel) await human.admission(tx,c);
       await lockAgencyLifecycle({ tx, agencyId });
       // Billing owns Agency FOR UPDATE before creator/member/business rows.
       if (!cancel && c.action.startsWith("billing.")) await lockAgencyBillingMutation(tx, agencyId);
@@ -191,14 +200,16 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
       if (prior && prior.fingerprint !== c.fingerprint)
         throw fail("MANAGEMENT_COMMAND_CONFLICT", "Command ID belongs to a different intent");
       const creatorIds = cancel ? [] : await creatorScope(tx, agencyId, c, prior?.reference);
+      if(!cancel) await human.lockPrefix(tx,agencyId,c);
+      if(!cancel && human.has(c)) for(const creatorId of creatorIds) await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE',creatorId,agencyId);
       // Match account setters' User-lock order, including across agencies. No User
       // FOR SHARE -> advisory-lock inversion when the existing setter joins.
-      if (!cancel && c.action === "account.profile") await lockEligibleAccountUser(tx, userId);
+      if (!cancel && (c.action === "account.profile" || c.action === "account.avatar")) await lockEligibleAccountUser(tx, userId);
       if (!cancel && c.action === "workspace.update")
         await lockDbAdvisoryXact({ db: tx, key: `workspace-settings:${agencyId}` });
       // Writers that later UPDATE CreatorAccount must not first take FOR SHARE
       // and then deadlock while upgrading alongside another command.
-      if (!cancel && ["creator.update", "creator.beginConnection", "creator.telegramContact"].includes(c.action))
+      if (!cancel && ["creator.avatar", "creator.update", "creator.beginConnection", "creator.telegramContact"].includes(c.action))
         await tx.$queryRawUnsafe(
           'SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 AND "deletedAt" IS NULL FOR UPDATE',
           c.targetId,
@@ -211,7 +222,8 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
         agencyAlreadyLocked: true,
         creatorIds,
         permissionKey:
-          cancel || c.action === "account.profile" || c.action.startsWith("billing.")
+          !cancel && human.has(c) ? human.permission(c) :
+          cancel || c.action.startsWith("account.") || c.action.startsWith("billing.")
             ? null
             : c.action === "workspace.update"
               ? "workspace.manage_settings"
@@ -219,6 +231,7 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
         requireBroadCreatorScope: !cancel && c.action === "creator.create",
       });
       if (!cancel && c.action.startsWith("billing.")) billingControl.assertBillingOwner(authority.member);
+      if(!cancel && c.action === "operation.control") await require("./operational-command-service").authorizeExtra(tx,authority.member,c.payload);
       const store = async (status, reference) => {
         const encoded = JSON.stringify(reference);
         if (Buffer.byteLength(encoded) > 8192)
@@ -257,11 +270,12 @@ async function executeManagementCommand({ db, agencyId, userId, actorMember, dev
           result: available ? stable(current) : null,
         };
       }
-      const value = await apply(tx, agencyId, userId, authority.member, deviceId, c);
+      const value = await apply(tx, agencyId, userId, authority.member, deviceId, c, context);
       // No snapshots of notes, names or ciphertext in the receipt. These belong to
       // their canonical rows. Recovery compares a digest under fresh authority.
       const reference = {
         creatorIds,
+        ...(value.humanReference ? {humanReference:value.humanReference} : {}),
         ...(value.billingReference ? { billingReference: value.billingReference } : {}),
         ...(c.action === "creator.beginConnection"
           ? { connectionMode: value.mode, connectionGeneration: value.connectionGeneration }

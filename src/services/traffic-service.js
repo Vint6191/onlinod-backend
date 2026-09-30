@@ -619,8 +619,8 @@ async function upsertTrafficSourceScan({
         "startedAt" = x."startedAt",
         "endedAt" = x."endedAt",
         "lastScannedAt" = ${now},
-        "costCents" = COALESCE(x."costCents", 0),
-        "currency" = COALESCE(x."currency", s."currency", 'USD'),
+        "costCents" = CASE WHEN s."costRevision">0 THEN s."costCents" ELSE COALESCE(x."costCents", 0) END,
+        "currency" = CASE WHEN s."costRevision">0 THEN s."currency" ELSE COALESCE(x."currency", s."currency", 'USD') END,
         "stats" = x."stats",
         "metadata" = x."metadata",
         "updatedAt" = NOW()
@@ -923,8 +923,8 @@ async function scheduleTrafficValueRefresh({
   });
 }
 
-async function assertTrafficViewer({ userId, creatorId }) {
-  const creator = await prisma.creatorAccount.findUnique({ where: { id: creatorId } });
+async function assertTrafficViewer({ userId, creatorId, db = prisma }) {
+  const creator = await db.creatorAccount.findUnique({ where: { id: creatorId } });
   if (!creator || creator.deletedAt) {
     const err = new Error("Creator not found");
     err.code = "CREATOR_NOT_FOUND";
@@ -932,7 +932,7 @@ async function assertTrafficViewer({ userId, creatorId }) {
     throw err;
   }
 
-  const member = await prisma.agencyMember.findFirst({
+  const member = await db.agencyMember.findFirst({
     where: { userId, agencyId: creator.agencyId, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
   });
   if (!member) {
@@ -942,10 +942,10 @@ async function assertTrafficViewer({ userId, creatorId }) {
     throw err;
   }
 
-  await requireCreatorAccess({ agencyId: creator.agencyId, member, creatorId: creator.id, db: prisma });
-  const effectivePermissions = await resolveEffectivePermissions({ member, db: prisma });
+  await requireCreatorAccess({ agencyId: creator.agencyId, member, creatorId: creator.id, db });
+  const effectivePermissions = await resolveEffectivePermissions({ member, db });
   const effectiveMember = { ...member, permissions: effectivePermissions };
-  if (!(await canUsePermission({ member: effectiveMember, key: "traffic.view", db: prisma }))) {
+  if (!(await canUsePermission({ member: effectiveMember, key: "traffic.view", db }))) {
     const err = new Error("Traffic analytics permission is required");
     err.code = "TRAFFIC_VIEW_FORBIDDEN";
     err.status = 403;
@@ -1181,6 +1181,7 @@ async function getTrafficSourceMembers({
       name: true,
       status: true,
       url: true,
+      costRevision: true,
       costCents: true,
       currency: true,
       lastScannedAt: true,
@@ -1430,6 +1431,7 @@ async function getTrafficOverview({ userId, creatorId, rangeKey = "all" }) {
       lastValueFetchedAt: value.lastValueFetchedAt,
       lastScannedAt: source.lastScannedAt,
       updatedAt: source.updatedAt,
+      costRevision: source.costRevision,
       bucket: "tracked_source",
     };
   });
@@ -1631,9 +1633,9 @@ function cleanHint(value, max = 255) {
   return s ? s.slice(0, max) : null;
 }
 
-async function scheduleTrafficRefresh({ userId, creatorId, force = false, accountHints = {} } = {}) {
-  const { creator, member } = await assertTrafficViewer({ userId, creatorId });
-  if (!(await canUsePermission({ member, key: "traffic.refresh", db: prisma }))) {
+async function scheduleTrafficRefresh({ userId, creatorId, force = false, accountHints = {}, db = prisma } = {}) {
+  const { creator, member } = await assertTrafficViewer({ userId, creatorId, db });
+  if (!(await canUsePermission({ member, key: "traffic.refresh", db }))) {
     const err = new Error("Traffic refresh permission is required");
     err.code = "TRAFFIC_REFRESH_FORBIDDEN";
     err.status = 403;
@@ -1684,7 +1686,7 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
       bucketMs: 0,
     });
     const planned = await createPlannedJobIfAbsent({
-      db: prisma,
+      db,
       jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
       scope: "creator",
       creatorId: creator.id,
@@ -1701,6 +1703,7 @@ async function scheduleTrafficRefresh({ userId, creatorId, force = false, accoun
   }
 
   const decision = await ensureSingleJob({
+    db,
     jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
     creatorId: creator.id,
     agencyId: creator.agencyId,

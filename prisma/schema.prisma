@@ -219,11 +219,13 @@ enum AuthTokenType {
 }
 
 model User {
+  authMailOutbox AuthMailOutbox[]
   id                String    @id @default(cuid())
   email             String    @unique
   passwordHash      String
   name              String?
   avatarUrl         String?
+  avatarRevision    Int @default(0)
   emailVerifiedAt   DateTime?
   isSuperAdmin      Boolean   @default(false)
   lastLoginAt       DateTime?
@@ -499,6 +501,7 @@ model CreatorAccount {
   platformProfileSourceDeviceId       String?
   platformProfileConnectionGeneration Int?
   avatarUrl                           String?
+  avatarRevision                      Int @default(0)
   remoteId                            String?
   status                              CreatorStatus          @default(DRAFT)
   connectionState                     CreatorConnectionState @default(ENROLLMENT_REQUIRED)
@@ -510,6 +513,7 @@ model CreatorAccount {
   telegramUserId                      String?
   telegramAccountId                   String?
   customsVaultFolderId                String?
+  customsVaultRevision                Int @default(0)
   deletedAt                           DateTime?
   createdAt                           DateTime               @default(now())
   updatedAt                           DateTime               @updatedAt
@@ -935,11 +939,43 @@ model TelegramInboundEvent {
   @@index([submissionId])
 }
 
+// Auth mail uses raw SQL to claim across replicas; Prisma exposes the same schema.
+model AvatarAsset {
+  id String @id
+  mimeType String
+  bytes Bytes
+  createdAt DateTime @default(now())
+}
+
+model AuthMailOutbox {
+  id String @id
+  userId String
+  authTokenId String @unique
+  kind String
+  payload Json?
+  fingerprint String
+  status String @default("PENDING")
+  attempt Int @default(0)
+  leaseId String?
+  leaseUntil DateTime?
+  nextAttemptAt DateTime @default(now())
+  expiresAt DateTime
+  providerId String?
+  lastCode String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  authToken AuthToken @relation(fields: [authTokenId], references: [id], onDelete: Cascade)
+  @@index([status, nextAttemptAt], map: "AuthMailOutbox_due_idx")
+  @@index([userId, kind, createdAt], map: "AuthMailOutbox_user_idx")
+}
+
 model AuthToken {
   id        String        @id @default(cuid())
   userId    String
   type      AuthTokenType
   tokenHash String        @unique
+  mail AuthMailOutbox?
   codeHash  String?
   expiresAt DateTime
   usedAt    DateTime?
@@ -950,6 +986,7 @@ model AuthToken {
   @@index([userId])
   @@index([type])
   @@index([expiresAt])
+  @@index([userId, type, codeHash, createdAt], map: "AuthToken_verification_code_idx")
 }
 
 model RefreshSession {
@@ -6154,6 +6191,7 @@ model TrafficSource {
   endedAt       DateTime?
   lastScannedAt DateTime?
 
+  costRevision Int @default(0)
   costCents Int    @default(0)
   currency  String @default("USD")
 
@@ -6599,4 +6637,31 @@ model ManagementCommandReceipt {
  reference Json
  createdAt DateTime @default(now())
  @@index([agencyId, id])
+}
+
+// Human operation version is retained with agency history; receipt GC cannot make old intent new.
+model OperationalControlState {
+  id String @id
+  agencyId String
+  creatorId String
+  family String
+  revision Int @default(0)
+  lastOperation String?
+  updatedAt DateTime @updatedAt
+  @@unique([agencyId, creatorId, family])
+  @@index([agencyId, creatorId])
+}
+
+model DialogControlResumeDemand {
+ id String @id
+ agencyId String
+ creatorId String
+ moduleUpdatedAt DateTime
+ creatorControlRevision Int @default(0)
+ status String @default("PENDING")
+ attempts Int @default(0)
+ nextAttemptAt DateTime @default(now())
+ updatedAt DateTime @updatedAt
+ @@index([status,nextAttemptAt,id])
+ @@index([agencyId,creatorId])
 }

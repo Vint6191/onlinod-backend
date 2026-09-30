@@ -44,7 +44,11 @@ const creator = z
     notes: z.string().trim().max(2000).nullable().optional(),
   })
   .strict();
+const avatar = z.object({expectedRevision:z.number().int().min(0), mimeType:z.enum(["image/jpeg","image/png","image/webp"]).nullable(), dataBase64:z.string().max(4*1024*1024).nullable()}).strict().refine(p=>(p.dataBase64===null)===(p.mimeType===null));
 const payloads = {
+  ...require("./human-control-command-contract").payloads,
+  "account.avatar": avatar,
+  "creator.avatar": avatar,
   "account.profile": z
     .object({ name: z.string().trim().min(1).max(80), expectedName: z.string().max(80).nullable() })
     .strict(),
@@ -134,13 +138,13 @@ const envelope = z
 const fail = (code, message, status = 409) => Object.assign(new Error(message), { code, status });
 function parseManagementCommand(input, { cancel = false } = {}) {
   const c = envelope.parse(input);
-  if (Buffer.byteLength(JSON.stringify(c.payload)) > 1100 * 1024)
+  if (Buffer.byteLength(JSON.stringify(c.payload)) > (c.action.endsWith(".avatar") ? 4300 * 1024 : 1400 * 1024))
     throw fail("MANAGEMENT_COMMAND_TOO_LARGE", "Command exceeds payload limit", 413);
   // Fingerprint the exact persisted intent, not a normalized subset. Cancellation
   // must also tombstone invalid business payloads without changing their identity.
   const fingerprint = digest([1, c.action, c.targetId, c.payload]);
   if (!cancel) {
-    if (["account.profile", "workspace.update", "creator.create"].includes(c.action) ? c.targetId !== "" : !c.targetId)
+    if ((["account.profile", "account.avatar", "workspace.update", "creator.create"].includes(c.action) || (c.action === "operation.control" && c.payload.family === "dialog_module") || (c.action === "automation.control" && c.payload.scope === "workspace")) ? c.targetId !== "" : !c.targetId)
       throw fail("MANAGEMENT_COMMAND_TARGET_INVALID", "Invalid command target", 400);
     return { ...c, payload: payloads[c.action].parse(c.payload), fingerprint };
   }

@@ -24,7 +24,7 @@ const now = new Date("2026-08-22T12:00:00.000Z");
 
 function submission(overrides = {}) {
   return {
-    id: "sub-unassigned", agencyId: "agency-1", creatorId: "creator-1", customOrderId: null,
+    id: "sub-unassigned", bindingRevision: 1, agencyId: "agency-1", creatorId: "creator-1", customOrderId: null,
     telegramMessageIds: [101, 102], ofMediaIds: ["9001"], comment: "second angle",
     pipelineDisposition: "ACTIVE", reviewStatus: "WAITING_REVIEW", reviewComment: null, reviewedAt: null, reviewedByMemberId: null,
     receivedAt: new Date("2026-08-22T11:00:00.000Z"), createdAt: new Date("2026-08-22T11:00:00.000Z"), updatedAt: new Date("2026-08-22T11:00:00.000Z"),
@@ -823,4 +823,13 @@ test("commit-time Pipeline Resolution rejects a stale management actor and prese
   );
   assert.equal(row.pipelineDisposition, "ACTIVE", "stale management work must not terminalize the submission");
   assert.equal(row.pipelineDispositionReason ?? null, null);
+});
+
+
+test("unassigned assignment freezes its binding before the inner owner reads it", async () => {
+  const row=submission({telegramMessageIds:[101],ofMediaIds:[]}),a=order('custom-a'),b=order('custom-b');
+  const db=fakeDb({submissions:[row],orders:[a,b]});
+  const original=db.customContentSubmission.findFirst;let reads=0;
+  db.customContentSubmission.findFirst=async args=>{const result=await original(args);if(args.where?.id===row.id && ++reads===2)return {...result,customOrderId:b.id,bindingRevision:2};return result;};
+  await assert.rejects(assignUnassignedCustomContentSubmission({agencyId:'agency-1',member:manager,submissionId:row.id,customOrderId:a.id,db:commitDatabaseFixture(db)}),{code:'CUSTOM_SUBMISSION_ASSIGNMENT_STALE'});
 });

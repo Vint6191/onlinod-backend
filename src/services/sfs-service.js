@@ -106,7 +106,7 @@ async function withCreatorLock(db, agencyId, creatorId, fn) {
 
 async function scheduleSfsCurrentRefresh({
   agencyId, creatorId, fanIds = [], refreshFields = [], reason = "sfs_current_refresh_required",
-  priority = 90, trigger = "planning", scheduleFanRefresh = scheduleFanDataPointRefresh,
+  priority = 90, trigger = "planning", scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }),
 } = {}) {
   return scheduleDurableFanDataRefreshDebt({
     agencyId, creatorId, fanIds, consumer: "sfs", reason, priority, trigger, refreshFields, scheduleFanRefresh,
@@ -328,7 +328,7 @@ function pickTemplate(templates, lastTemplateId = null) {
   return rows[rows.length - 1] || null;
 }
 
-async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId = null, source = "manual", priority = 70, limit = 20, db = prisma, scheduleFanRefresh = scheduleFanDataPointRefresh }) {
+async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId = null, source = "manual", priority = 70, limit = 20, db = prisma, scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }) }) {
   await requireCreator(agencyId, creatorId, db);
   const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: SFS_MODULE_KEY, db });
   const settings = normalizeSfsSettings(control.modules.sfs.settings);

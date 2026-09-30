@@ -382,13 +382,13 @@ async function updateTaskWithFence({ db = prisma, where, data, notFoundCode = "A
   return db.automationTask.findFirst({ where });
 }
 
-async function upsertTask({ agencyId, userId, input = {}, expectedCreatorId = null }) {
+async function upsertTask({ agencyId, userId, input = {}, expectedCreatorId = null, db = prisma }) {
   const requestedCreatorId = clean(input.creatorId || input.accountId, 100);
   const canonicalCreatorId = clean(expectedCreatorId || requestedCreatorId, 100);
   if (expectedCreatorId && requestedCreatorId && requestedCreatorId !== canonicalCreatorId) {
     throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Automation task creator does not match the validated creator", 409);
   }
-  if (canonicalCreatorId) await requireCreator(agencyId, canonicalCreatorId);
+  if (canonicalCreatorId) await sharedRequireCreator(db, agencyId, canonicalCreatorId);
 
   const rawId = clean(input.id || input.taskId, 120);
   const clientId = clean(input.clientId || input.id, 120);
@@ -403,37 +403,37 @@ async function upsertTask({ agencyId, userId, input = {}, expectedCreatorId = nu
 
   let item;
   if (rawId && !rawId.startsWith("bump_") && !rawId.startsWith("local") && !rawId.startsWith("tmp")) {
-    const existingById = await prisma.automationTask.findFirst({ where: { id: rawId, agencyId }, select: { id: true, creatorId: true } });
+    const existingById = await db.automationTask.findFirst({ where: { id: rawId, agencyId }, select: { id: true, creatorId: true } });
     if (existingById) {
       if (canonicalCreatorId && String(existingById.creatorId || "") !== canonicalCreatorId) {
         throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Automation task id belongs to another creator", 409);
       }
       const where = creatorTaskWhere({ agencyId, creatorId: canonicalCreatorId || existingById.creatorId, id: existingById.id });
-      item = await updateTaskWithFence({ where, data: update, notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH" });
+      item = await updateTaskWithFence({ db, where, data: update, notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH" });
     }
   }
 
   if (!item && clientId) {
     const scopedWhere = creatorTaskWhere({ agencyId, creatorId: canonicalCreatorId, clientId });
-    const existingScoped = await prisma.automationTask.findFirst({ where: scopedWhere, select: { id: true, creatorId: true } });
+    const existingScoped = await db.automationTask.findFirst({ where: scopedWhere, select: { id: true, creatorId: true } });
     if (existingScoped) {
       const where = creatorTaskWhere({ agencyId, creatorId: canonicalCreatorId || existingScoped.creatorId, id: existingScoped.id });
-      item = await updateTaskWithFence({ where, data: update, notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH" });
+      item = await updateTaskWithFence({ db, where, data: update, notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH" });
     } else {
-      const existingAgencyClient = await prisma.automationTask.findFirst({ where: { agencyId, clientId }, select: { id: true, creatorId: true } });
+      const existingAgencyClient = await db.automationTask.findFirst({ where: { agencyId, clientId }, select: { id: true, creatorId: true } });
       if (existingAgencyClient) {
         if (canonicalCreatorId && String(existingAgencyClient.creatorId || "") !== canonicalCreatorId) {
           throw automationTaskError("AUTOMATION_TASK_ID_CONFLICT", "Automation task clientId already belongs to another creator", 409);
         }
         const where = creatorTaskWhere({ agencyId, creatorId: canonicalCreatorId || existingAgencyClient.creatorId, id: existingAgencyClient.id });
-        item = await updateTaskWithFence({ where, data: update, notFoundCode: "AUTOMATION_TASK_ID_CONFLICT" });
+        item = await updateTaskWithFence({ db, where, data: update, notFoundCode: "AUTOMATION_TASK_ID_CONFLICT" });
       }
     }
   }
 
   if (!item) {
     try {
-      item = await prisma.automationTask.create({ data: { ...data, clientId: data.clientId || null } });
+      item = await db.automationTask.create({ data: { ...data, clientId: data.clientId || null } });
     } catch (err) {
       if (err?.code === "P2002") {
         throw automationTaskError("AUTOMATION_TASK_ID_CONFLICT", "Automation task id/clientId conflicts with another creator task", 409);
@@ -467,23 +467,23 @@ async function patchTask({ agencyId, userId, taskId, patch = {}, creatorId = nul
   return { ok: true, item };
 }
 
-async function trashTask({ agencyId, userId, taskId, creatorId = null, permanent = false }) {
+async function trashTask({ agencyId, userId, taskId, creatorId = null, permanent = false, db = prisma }) {
   const id = clean(taskId, 120);
   const cid = clean(creatorId, 100);
-  const existing = await prisma.automationTask.findFirst({ where: { id, agencyId } });
+  const existing = await db.automationTask.findFirst({ where: { id, agencyId } });
   if (!existing) throw automationTaskError("AUTOMATION_TASK_NOT_FOUND", "Automation task not found", 404);
   if (existing.creatorId && (!cid || String(existing.creatorId) !== cid)) {
     throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Creator-owned task is outside the requested creator boundary", 409);
   }
   const where = creatorTaskWhere({ agencyId, creatorId: existing.creatorId || null, id: existing.id });
   if (permanent) {
-    const deleted = await prisma.automationTask.deleteMany({ where });
+    const deleted = await db.automationTask.deleteMany({ where });
     if (Number(deleted?.count || 0) !== 1) throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Automation task delete lost creator authority", 409);
     return { ok: true, deleted: true };
   }
   const deletedAt = new Date();
   const meta = toPlainObject(existing.metadata);
-  const item = await updateTaskWithFence({
+  const item = await updateTaskWithFence({ db,
     where,
     notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH",
     data: {
@@ -502,10 +502,10 @@ async function trashTask({ agencyId, userId, taskId, creatorId = null, permanent
   return { ok: true, item };
 }
 
-async function restoreTask({ agencyId, userId, taskId, creatorId = null }) {
+async function restoreTask({ agencyId, userId, taskId, creatorId = null, db = prisma }) {
   const id = clean(taskId, 120);
   const cid = clean(creatorId, 100);
-  const existing = await prisma.automationTask.findFirst({ where: { id, agencyId } });
+  const existing = await db.automationTask.findFirst({ where: { id, agencyId } });
   if (!existing) throw automationTaskError("AUTOMATION_TASK_NOT_FOUND", "Automation task not found", 404);
   if (existing.creatorId && (!cid || String(existing.creatorId) !== cid)) {
     throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Creator-owned task is outside the requested creator boundary", 409);
@@ -515,7 +515,7 @@ async function restoreTask({ agencyId, userId, taskId, creatorId = null }) {
   delete meta.purgeAfter;
   delete meta.trashRetentionDays;
   const where = creatorTaskWhere({ agencyId, creatorId: existing.creatorId || null, id: existing.id });
-  const item = await updateTaskWithFence({
+  const item = await updateTaskWithFence({ db,
     where,
     notFoundCode: "AUTOMATION_TASK_CREATOR_MISMATCH",
     data: { status: "active", deletedAt: null, metadata: cleanJsonForPrisma(meta), updatedByUserId: userId || null },
@@ -1938,4 +1938,5 @@ module.exports = {
   listEvents,
   listActivity,
   taskToBump,
+  taskToSfsComment, normalizeBumpToTask, normalizeSfsCommentToTask, assertReusableBumpMediaAllowed,
 };

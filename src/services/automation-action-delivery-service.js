@@ -99,13 +99,14 @@ class ActionDeliveryError extends Error {
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 
-async function scheduleValidationFanRefresh(delivery, validation, trigger = "validation") {
+async function scheduleValidationFanRefresh(delivery, validation, trigger = "validation", db = prisma) {
   if (!delivery || validation?.refreshRequired !== true) return null;
   const fanIds = [...new Set((validation.refreshFanIds || [delivery.fanId || delivery.targetId])
     .map((value) => clean(value, 160)).filter(Boolean))].slice(0, 500);
   if (!fanIds.length) return null;
   try {
     return await scheduleFanDataPointRefresh({
+      db,
       agencyId: delivery.agencyId,
       creatorId: delivery.creatorId,
       onlyFansUserIds: fanIds,
@@ -1507,34 +1508,38 @@ async function listActionDeliveries({ agencyId, creatorId, creatorIds = null, mo
   return { ok: true, items, count, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < count };
 }
 
-async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
-  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
+async function retryActionDelivery({ agencyId, actorUserId, deliveryId, db = prisma }) {
+  const delivery = await db.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
-  await requireLiveAutomationManagementActor({ agencyId, actorUserId, creatorId: delivery.creatorId });
+  await requireLiveAutomationManagementActor({ db, agencyId, actorUserId, creatorId: delivery.creatorId });
   if (!["FAILED", "SKIPPED", "CANCELED", "PAUSED"].includes(delivery.status)) {
     throw new ActionDeliveryError("DELIVERY_NOT_RETRYABLE", `Delivery status ${delivery.status} cannot be retried`);
   }
   if (delivery.failureCode && ["permission_denied", "invalid_payload", "fan_not_found", "blocked", "creator_revoked", "custom_media_programmatic_forbidden"].includes(delivery.failureCode)) {
     throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Failure ${delivery.failureCode} requires a new action generation`);
   }
-  const control = await assertDeliveryControl(delivery);
+  if (delivery.failureCategory === FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE ||
+      (delivery.status === "FAILED" && automationActionWriteSemantics(delivery.actionType) === "NON_IDEMPOTENT_WRITE" && !SAFE_RETRY_CATEGORIES.includes(delivery.failureCategory))) {
+    throw new ActionDeliveryError("DELIVERY_RECONCILIATION_REQUIRED", "Unknown provider outcome must be reconciled before retry");
+  }
+  const control = await assertDeliveryControl(delivery, {db});
   let retryAt = new Date();
   if (delivery.moduleKey === "bumps") {
-    const validation = await validateBumpDelivery({ delivery, control, now: retryAt });
-    if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "retry");
+    const validation = await validateBumpDelivery({ delivery, control, now: retryAt, db });
+    if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "retry", db);
     if (validation.ok === false && validation.terminal === true) {
       throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Bump delivery is no longer valid: ${validation.code || "validation_failed"}`);
     }
     if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
   }
   if (delivery.moduleKey === "likes") {
-    const validation = await validateLikeDelivery({ delivery, control, now: retryAt });
+    const validation = await validateLikeDelivery({ delivery, control, now: retryAt, db });
     if (validation.ok === false && validation.terminal === true && validation.code !== "already_liked") {
       throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Like delivery is no longer valid: ${validation.code || "validation_failed"}`);
     }
     if (validation.ok === false && validation.code === "already_liked") {
       const now = new Date();
-      const latest = await runDbTransaction(prisma, async (tx) => {
+      const latest = await runDbTransaction(db, async (tx) => {
         await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
         const changed = await tx.automationDelivery.updateMany({
           where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1561,22 +1566,22 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
     if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
   }
   if (delivery.moduleKey === FOLLOW_AUTOMATION_MODULE_KEY) {
-    const validation = await validateFollowAutomationDelivery({ delivery, control, now: retryAt });
-    if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "retry");
+    const validation = await validateFollowAutomationDelivery({ delivery, control, now: retryAt, db });
+    if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "retry", db);
     if (validation.ok === false && validation.terminal === true) {
       throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Follow Automation delivery is no longer valid: ${validation.code || "validation_failed"}`);
     }
     if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
   }
   if (delivery.moduleKey === SFS_MODULE_KEY) {
-    const validation = await validateSfsDelivery({ delivery, control, now: retryAt });
-    if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "retry");
+    const validation = await validateSfsDelivery({ delivery, control, now: retryAt, db });
+    if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "retry", db);
     if (validation.ok === false && validation.terminal === true && !["already_unfollowed", "already_followed"].includes(validation.code)) {
       throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `SFS delivery is no longer valid: ${validation.code || "validation_failed"}`);
     }
     if (validation.ok === false && validation.code === "already_followed") {
       const now = new Date();
-      const latest = await runDbTransaction(prisma, async (tx) => {
+      const latest = await runDbTransaction(db, async (tx) => {
         await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
         const changed = await tx.automationDelivery.updateMany({
           where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1595,7 +1600,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
     }
     if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
   }
-  const updated = await runDbTransaction(prisma, async (tx) => {
+  const updated = await runDbTransaction(db, async (tx) => {
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1629,10 +1634,10 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId }) {
   return { ok: true, delivery: updated };
 }
 
-async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason = "manual_cancel" }) {
-  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
+async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason = "manual_cancel", db = prisma }) {
+  const delivery = await db.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
-  await requireLiveAutomationManagementActor({ agencyId, actorUserId, creatorId: delivery.creatorId });
+  await requireLiveAutomationManagementActor({ db, agencyId, actorUserId, creatorId: delivery.creatorId });
   if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
   if (["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status)) {
     throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before cancellation");
@@ -1647,7 +1652,7 @@ async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason 
     throw new ActionDeliveryError("UNSAFE_REFOLLOW_CANCEL", "A started refollow cycle cannot be canceled before recovery");
   }
   const finishedAt = new Date();
-  const updated = await runDbTransaction(prisma, async (tx) => {
+  const updated = await runDbTransaction(db, async (tx) => {
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1688,13 +1693,13 @@ async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason 
   return { ok: true, duplicate: false, delivery: updated };
 }
 
-async function releaseClaimByAdmin({ agencyId, actorUserId, deliveryId }) {
-  const delivery = await prisma.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
+async function releaseClaimByAdmin({ agencyId, actorUserId, deliveryId, db = prisma }) {
+  const delivery = await db.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
-  await requireLiveAutomationManagementActor({ agencyId, actorUserId, creatorId: delivery.creatorId });
+  await requireLiveAutomationManagementActor({ db, agencyId, actorUserId, creatorId: delivery.creatorId });
   if (["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status)) throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before administrative release");
   if (!["CLAIMED", "RUNNING"].includes(delivery.status)) return { ok: true, duplicate: true, delivery };
-  const updated = await runDbTransaction(prisma, async (tx) => {
+  const updated = await runDbTransaction(db, async (tx) => {
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, originKind: "AUTOMATION", status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },

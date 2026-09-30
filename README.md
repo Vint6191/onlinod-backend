@@ -45,10 +45,13 @@ APP_URL=https://onlinod-backend.onrender.com
 ACCESS_TOKEN_TTL=15m
 REFRESH_TOKEN_TTL_DAYS=30
 RESEND_API_KEY=
+SNAPSHOT_ENCRYPTION_KEY=32-byte-base64-server-key
 EMAIL_FROM=Onlinod <onboarding@resend.dev>
 ```
 
-For first tests, `RESEND_API_KEY` may be empty. Then `/api/auth/register` returns `devVerificationUrl` and `devVerificationCode` in the Web Console debug panel.
+Verification and reset mail use the durable encrypted `AuthMailOutbox`. Production requires a stable 32-byte base64 `SNAPSHOT_ENCRYPTION_KEY`, plus `RESEND_API_KEY` and a verified `EMAIL_FROM` for delivery. With mail unconfigured, delivery stays pending until token expiry; public responses never disclose verification codes or reset links. Do not rotate the server encryption key while encrypted pending mail still needs delivery.
+
+The cumulative 6D+6E candidate and its rollout/acceptance limits are described in `docs/PHASE6_DE_DURABLE_EFFECTS_RESOURCE_ADMISSION.txt`. Apply Backend and Desktop as one coordinated version, using the normal migration deploy pipeline; old unkeyed management routes return 410.
 
 ## Console
 

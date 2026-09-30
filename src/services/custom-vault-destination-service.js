@@ -24,19 +24,19 @@ function folderId(value) {
 }
 function serialize(row) {
   const value = row?.customsVaultFolderId == null ? null : String(row.customsVaultFolderId).trim() || null;
-  return { ok: true, creatorId: String(row?.id || ""), folderId: value, configured: Boolean(value) };
+  return { ok: true, creatorId: String(row?.id || ""), folderId: value, configured: Boolean(value), revision: Number(row?.customsVaultRevision || 0) };
 }
 
 async function getCustomVaultDestination({ agencyId, member, creatorId: rawCreatorId, db = null } = {}) {
   const client = db || require("../prisma");
   const cid = creatorId(rawCreatorId);
   await requireCreatorAccess({ agencyId, member, creatorId: cid, db: client });
-  const row = await client.creatorAccount.findFirst({ where: { id: cid, agencyId, deletedAt: null }, select: { id: true, customsVaultFolderId: true } });
+  const row = await client.creatorAccount.findFirst({ where: { id: cid, agencyId, deletedAt: null }, select: { id: true, customsVaultFolderId: true, customsVaultRevision: true } });
   if (!row) throw fail("CUSTOM_VAULT_CREATOR_NOT_FOUND", "Creator not found", 404);
   return serialize(row);
 }
 
-async function setCustomVaultDestination({ agencyId, member, creatorId: rawCreatorId, folderId: rawFolderId, db = null } = {}) {
+async function setCustomVaultDestination({ agencyId, member, creatorId: rawCreatorId, folderId: rawFolderId, expectedRevision, expectedFolderId, db = null } = {}) {
   const client = db || require("../prisma");
   const cid = creatorId(rawCreatorId);
   const nextFolderId = folderId(rawFolderId);
@@ -58,28 +58,31 @@ async function setCustomVaultDestination({ agencyId, member, creatorId: rawCreat
     // its Creator update is uncommitted/invisible. A pin that owns the advisory lock can
     // only observe the old committed default and commits first; otherwise this setter
     // acquires the fence and commits before the pin, which then observes the new default.
-    const current = await tx.creatorAccount.findFirst({ where: { id: cid, agencyId, deletedAt: null }, select: { id: true, customsVaultFolderId: true, updatedAt: true } });
+    const current = await tx.creatorAccount.findFirst({ where: { id: cid, agencyId, deletedAt: null }, select: { id: true, customsVaultFolderId: true, customsVaultRevision: true, updatedAt: true } });
     if (!current) throw fail("CUSTOM_VAULT_CREATOR_NOT_FOUND", "Creator not found", 404);
     const previousFolderId = current.customsVaultFolderId == null ? null : String(current.customsVaultFolderId).trim() || null;
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== current.customsVaultRevision || expectedFolderId !== previousFolderId) throw fail("CUSTOM_VAULT_DESTINATION_CONFLICT", "Vault destination changed; reload before editing", 409);
     if (previousFolderId === nextFolderId) {
-      return { previousFolderId, creator: { id: cid, customsVaultFolderId: nextFolderId } };
+      return { previousFolderId, creator: { id: cid, customsVaultFolderId: nextFolderId, customsVaultRevision: current.customsVaultRevision } };
     }
     await authorizeCreatorAccountWrite(tx);
-    const changed = await tx.creatorAccount.updateMany({ where: { id: cid, agencyId, deletedAt: null, updatedAt: current.updatedAt }, data: { customsVaultFolderId: nextFolderId } });
+    const changed = await tx.creatorAccount.updateMany({ where: { id: cid, agencyId, deletedAt: null, updatedAt: current.updatedAt }, data: { customsVaultFolderId: nextFolderId, customsVaultRevision: {increment:1} } });
     if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_VAULT_DESTINATION_CONFLICT", "Creator Vault destination changed concurrently; reload and retry", 409);
     await lockCustomExecutionDefaults({ db: tx, agencyId });
-    return { previousFolderId, creator: { id: cid, customsVaultFolderId: nextFolderId } };
+    return { previousFolderId, creator: { id: cid, customsVaultFolderId: nextFolderId, customsVaultRevision:current.customsVaultRevision+1 } };
   };
 
   const outcome = await runDbTransaction(client, apply, { timeout: 35_000 });
   await audit({
+    db: client,
+    required: true,
     agencyId,
     actorUserId: member?.userId || null,
     action: "custom_order.vault_destination_update",
     entityType: "creator_account",
     entityId: cid,
     metadata: { previousFolderId: outcome.previousFolderId, folderId: nextFolderId },
-  }).catch(() => undefined);
+  });
   return serialize(outcome.creator);
 }
 

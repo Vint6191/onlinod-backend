@@ -29,6 +29,7 @@ const route = (path, className, source, authority, extra = {}) => Object.freeze(
 });
 
 const ROUTE_MANIFEST = Object.freeze([
+  route("/api/assets", ROUTE_CLASS.PUBLIC, "routes/avatar-assets.js", "immutable validated public raster avatar by content hash"),
   route("/api/system", ROUTE_CLASS.PUBLIC, "routes/system.js", "public system health/version contract"),
   route("/api/auth", ROUTE_CLASS.PUBLIC, "routes/auth.js", "authentication/enrollment boundary"),
   route("/api/admin-auth", ROUTE_CLASS.ADMIN, "routes/admin-auth.js", "admin authentication"),

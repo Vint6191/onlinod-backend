@@ -358,9 +358,11 @@ router.get("/creators/:creatorId/rotation-plan", async (req, res) => {
   } catch (error) { return fail(res, error, "CRYPTO_CREATOR_ROTATION_PLAN_FAILED"); }
 });
 
-router.post("/creators/:creatorId/rotate", async (req, res) => {
+async function creatorRotationCommand(req,res) {
+  const cancel=req.path.endsWith("/cancel");
   try {
     const input = z.object({
+      commandId: z.string().uuid(),
       actorDeviceId: deviceId,
       actorProof,
       expectedKeyVersion: z.number().int().positive(),
@@ -375,9 +377,10 @@ router.post("/creators/:creatorId/rotate", async (req, res) => {
       }).strict().optional().nullable(),
       deviceWraps: z.array(z.object({ deviceId, envelope: wrapEnvelope }).strict()).max(10000).default([]),
     }).strict().parse(req.body || {});
-    const creator = await requireCreatorAccess({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, creatorId: req.params.creatorId, db: prisma });
+    const creator = {id:req.params.creatorId}; // Owner authority is rechecked in the receipt transaction, including recovery after retirement.
     const result = await commitCreatorKeyRotation({
       db: prisma,
+      commandId: input.commandId, cancel,
       ...actor(req),
       actorDeviceId: actorDevice(req, input.actorDeviceId),
       actorProof: input.actorProof,
@@ -389,28 +392,12 @@ router.post("/creators/:creatorId/rotate", async (req, res) => {
       proxy: input.proxy || null,
       deviceWraps: input.deviceWraps,
     });
-    await audit({
-      agencyId: req.auth.agencyId,
-      actorUserId: req.auth.userId,
-      action: "crypto.creator_key_rotated",
-      targetType: "creator",
-      targetId: creator.id,
-      metadata: {
-        actorDeviceId: input.actorDeviceId,
-        previousKeyVersion: result.previousKeyVersion,
-        activeKeyVersion: result.activeKeyVersion,
-        previousRootVersion: result.previousRootVersion,
-        activeRootVersion: result.activeRootVersion,
-        wrappedDeviceCount: result.wrappedDeviceCount,
-        sessionRevision: result.sessionRevision,
-        proxyVersion: result.proxyVersion,
-        networkProfileVersion: result.networkProfileVersion,
-      },
-    });
-    publishCreatorCryptoHints(req, creator.id, result);
+    if(!cancel) publishCreatorCryptoHints(req, creator.id, result);
     return res.json({ ok: true, ...result });
   } catch (error) { return fail(res, error, "CRYPTO_CREATOR_ROTATION_FAILED"); }
-});
+}
+router.post("/creators/:creatorId/rotate",creatorRotationCommand);
+router.post("/creators/:creatorId/rotate/cancel",creatorRotationCommand);
 
 router.post("/devices/:deviceId/revoke", async (req, res) => {
   try {

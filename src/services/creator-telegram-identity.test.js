@@ -7,10 +7,11 @@ const { normalizeTelegramUserId, setCreatorTelegramUserId } = require("./creator
 const fs = require("node:fs");
 const path = require("node:path");
 
+const version=new Date("2026-09-30T00:00:00Z");
 const owner = { id: "owner-1", userId: "user-owner", agencyId: "agency_1", role: "OWNER", roleKey: "owner", permissions: { "creators.manage": true }, assignedCreators: "all", accessEpoch: 1 };
 
 function identityDb({ contact = "@model", updateCount = 1 } = {}) {
-  const creator = { id: "creator_1", agencyId: "agency_1", deletedAt: null, status: "READY", telegramContact: contact, telegramUserId: null };
+  const creator = { id: "creator_1", agencyId: "agency_1", deletedAt: null, updatedAt: version, status: "READY", telegramContact: contact, telegramUserId: null };
   const updates = [];
   const db = {
     agency: { async findUnique({ where }) { return where.id === "agency_1" ? { id: "agency_1", deletedAt: null, status: "ACTIVE" } : null; } },
@@ -22,7 +23,7 @@ function identityDb({ contact = "@model", updateCount = 1 } = {}) {
       },
       async updateMany({ where, data }) {
         updates.push({ where, data });
-        if (updateCount !== 1 || where.id !== creator.id || where.agencyId !== creator.agencyId || where.telegramContact !== creator.telegramContact) return { count: 0 };
+        if (updateCount !== 1 || where.id !== creator.id || where.agencyId !== creator.agencyId || where.telegramContact !== creator.telegramContact || where.updatedAt.getTime() !== creator.updatedAt.getTime()) return { count: 0 };
         Object.assign(creator, data);
         return { count: 1 };
       },
@@ -66,12 +67,12 @@ test("resolved Telegram user id is atomically bound only while the resolved cont
     actorMember: owner,
     creatorId: "creator_1",
     telegramUserId: "999999999999999999",
-    expectedTelegramContact: "@model",
+    expectedTelegramContact: "@model", expectedCreatorUpdatedAt: version.toISOString(),
     db,
   });
   assert.equal(result.telegramUserId, "999999999999999999");
   assert.deepEqual(db._updates[0], {
-    where: { id: "creator_1", agencyId: "agency_1", deletedAt: null, telegramContact: "@model" },
+    where: { id: "creator_1", agencyId: "agency_1", deletedAt: null, telegramContact: "@model", updatedAt: version },
     data: { telegramUserId: "999999999999999999" },
   });
 });
@@ -84,7 +85,7 @@ test("resolved Telegram identity is rejected if the model contact changed during
       actorMember: owner,
       creatorId: "creator_1",
       telegramUserId: "123",
-      expectedTelegramContact: "@old_model",
+      expectedTelegramContact: "@old_model", expectedCreatorUpdatedAt: version.toISOString(),
       db,
     }),
     (error) => error?.code === "CREATOR_TELEGRAM_CONTACT_CHANGED" && error?.status === 409,
@@ -99,4 +100,8 @@ test("creator API exposes a scoped contact-bound Telegram identity persistence r
   assert.match(route, /expectedTelegramContact: input\.telegramContact/);
   assert.match(route, /creator\.telegram_identity\.resolved/);
   assert.doesNotMatch(route, /telegram-identity[\s\S]{0,1800}(apiHash|session)/);
+});
+
+test("same Telegram contact cannot accept a late resolution from an older creator version", async()=>{
+ const db=identityDb();await assert.rejects(setCreatorTelegramUserId({agencyId:'agency_1',actorMember:owner,creatorId:'creator_1',telegramUserId:'123',expectedTelegramContact:'@model',expectedCreatorUpdatedAt:'2026-09-29T00:00:00Z',db}),{code:'CREATOR_TELEGRAM_VERSION_CHANGED'});
 });

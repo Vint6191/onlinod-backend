@@ -373,8 +373,6 @@ router.post("/register", async (req, res) => {
       role: result.member.role,
       roleKey: result.member.roleKey || result.inviteRoleKey || null,
       invitationClaimed: result.invitationClaimed === true,
-      devVerificationUrl: verification.emailResult?.skipped ? verification.emailResult?.verifyUrl : undefined,
-      devVerificationCode: verification.emailResult?.skipped ? verification.code : undefined,
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
@@ -453,8 +451,6 @@ router.post("/resend-verification", async (req, res) => {
     return res.json({
       ok: true,
       emailSent: verification.emailResult?.ok === true && !verification.emailResult?.skipped,
-      devVerificationUrl: verification.emailResult?.skipped ? verification.emailResult?.verifyUrl : undefined,
-      devVerificationCode: verification.emailResult?.skipped ? verification.code : undefined,
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
@@ -588,8 +584,6 @@ router.post("/forgot-password", async (req, res) => {
     return res.json({
       ok: true,
       emailSent: reset.emailResult?.ok === true && !reset.emailResult?.skipped,
-      devResetUrl: reset.emailResult?.skipped ? reset.emailResult?.resetUrl : undefined,
-      devResetToken: reset.emailResult?.skipped ? reset.token : undefined,
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);

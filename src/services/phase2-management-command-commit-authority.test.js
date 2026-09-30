@@ -72,7 +72,7 @@ test("A40 creator Telegram contact commit rejects creators.manage revoked after 
 test("A40 creator Telegram identity commit keeps contact CAS behind current creators.manage authority", async () => {
   const db = baseDb({ livePermissions: { "workspace.manage_members": true, "creators.manage": false } });
   await assert.rejects(
-    () => setCreatorTelegramUserId({ agencyId: "agency-1", actorMember: admittedTeamActor, creatorId: "creator-1", telegramUserId: "123456", expectedTelegramContact: "@old", db }),
+    () => setCreatorTelegramUserId({ agencyId: "agency-1", actorMember: admittedTeamActor, creatorId: "creator-1", telegramUserId: "123456", expectedTelegramContact: "@old", expectedCreatorUpdatedAt: "2026-09-30T00:00:00Z", db }),
     (error) => error?.code === "MANAGEMENT_PERMISSION_REVOKED" && error?.status === 403,
   );
   assert.equal(db._mutations(), 0);

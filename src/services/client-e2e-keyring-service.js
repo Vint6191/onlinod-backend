@@ -1595,8 +1595,12 @@ function normalizeRotationDeviceWraps(input, { agencyId, creatorId, nextKeyVersi
 
 async function commitCreatorKeyRotation({
   db, agencyId, userId, member, actorDeviceId, creatorId, expectedKeyVersion, expectedCurrentRootVersion, expectedTargetRootVersion,
-  session: sessionInput, proxy: proxyInput, deviceWraps, actorProof,
+  session: sessionInput, proxy: proxyInput, deviceWraps, actorProof, commandId, cancel = false,
 }) {
+  if(typeof commandId!=="string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(commandId)) throw codedError("CRYPTO_ROTATION_COMMAND_REQUIRED","A stable rotation command ID is required",400);
+  const {digest}=require("./team-command-contract");
+  const receiptId="crypto_creator_rotate_v1_"+digest([agencyId,userId,commandId.toLowerCase()]);
+  const fingerprint=digest([1,actorDeviceId,creatorId,expectedKeyVersion,expectedCurrentRootVersion,expectedTargetRootVersion,sessionInput||null,proxyInput||null,deviceWraps]);
   const expectedVersion = Math.floor(Number(expectedKeyVersion));
   if (!Number.isInteger(expectedVersion) || expectedVersion < 1) throw codedError("CRYPTO_ROTATION_VERSION_INVALID", "expectedKeyVersion must be positive", 400);
   const currentRootVersion = Math.floor(Number(expectedCurrentRootVersion));
@@ -1607,6 +1611,13 @@ async function commitCreatorKeyRotation({
   const nextKeyVersion = expectedVersion + 1;
   return serializableTransaction(db, async (tx) => {
     const actor = await requireOwnerCryptoCommitActor({ db: tx, agencyId, userId, member, deviceId: actorDeviceId, actorProof });
+    await require("./db-transaction-service").lockDbAdvisoryXact({db:tx,key:receiptId});
+    const [prior]=await tx.$queryRawUnsafe('SELECT * FROM "ManagementCommandReceipt" WHERE "id"=$1',receiptId);
+    if(prior && prior.fingerprint!==fingerprint) throw codedError("CRYPTO_ROTATION_COMMAND_CONFLICT","Rotation ID belongs to another payload",409);
+    const store=async(status,reference)=>tx.$executeRawUnsafe('INSERT INTO "ManagementCommandReceipt" ("id","agencyId","userId","action","targetId","fingerprint","status","reference") VALUES ($1,$2,$3,\'crypto.creatorRotate\',$4,$5,$6,$7::jsonb)',receiptId,agencyId,userId,creatorId,fingerprint,status,JSON.stringify(reference));
+    if(cancel){if(!prior)await store("ABANDONED",{});return {commandId,abandoned:!prior||prior.status==="ABANDONED",alreadyCommitted:prior?.status==="COMMITTED",result:prior?.status==="COMMITTED"?prior.reference.result:null};}
+    if(prior?.status==="ABANDONED")throw codedError("CRYPTO_ROTATION_COMMAND_ABANDONED","Rotation command was cancelled",409);
+    if(prior)return {...prior.reference.result,commandId,replayed:true};
     const creator = await tx.creatorAccount.findFirst({ where: { id: creatorId, agencyId, deletedAt: null }, select: { id: true } });
     if (!creator) throw codedError("CREATOR_NOT_FOUND", "Creator not found", 404);
     const state = await tx.creatorCryptoKeyState.findUnique({ where: { agencyId_creatorId: { agencyId, creatorId } } });
@@ -1694,7 +1705,7 @@ async function commitCreatorKeyRotation({
       data: { revokedAt: new Date() },
     });
 
-    return {
+    const result = {
       rotated: true,
       creatorId,
       previousKeyVersion: expectedVersion,
@@ -1706,6 +1717,9 @@ async function commitCreatorKeyRotation({
       networkProfileVersion: nextProfileVersion,
       wrappedDeviceCount: wraps.length,
     };
+    await require("./audit-service").audit({required:true,db:tx,agencyId,actorUserId:userId,action:"crypto.creator_key_rotated",targetType:"creator",targetId:creatorId,metadata:{commandId,actorDeviceId,...result}});
+    await store("COMMITTED",{result});
+    return {...result,commandId,replayed:false};
   }, "CRYPTO_ROTATION_WRITE_CONFLICT");
 }
 

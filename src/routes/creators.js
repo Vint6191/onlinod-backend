@@ -117,6 +117,7 @@ const telegramContactSchema = z.object({
 });
 
 const telegramIdentitySchema = z.object({
+  expectedCreatorUpdatedAt: z.string().datetime({ offset: true }),
   telegramUserId: z.string().trim().regex(/^\d{1,20}$/, "Invalid Telegram user id"),
   telegramContact: z.string().trim().min(1).max(160).regex(/^[^\r\n\t]+$/, "Invalid Telegram contact"),
 });
@@ -367,6 +368,7 @@ router.patch("/:id/telegram-identity", creatorManagementRequired, creatorAccessR
       creatorId: before.id,
       telegramUserId: input.telegramUserId,
       expectedTelegramContact: input.telegramContact,
+      expectedCreatorUpdatedAt: input.expectedCreatorUpdatedAt,
       db: prisma,
     });
 

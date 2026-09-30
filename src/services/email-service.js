@@ -1,4 +1,3 @@
-const { Resend } = require("resend");
 
 function getAppUrl() {
   return (process.env.APP_URL || process.env.PUBLIC_BASE_URL || "http://localhost:10000").replace(/\/+$/, "");
@@ -8,47 +7,34 @@ function getFrom() {
   return process.env.EMAIL_FROM || "Onlinod <onboarding@resend.dev>";
 }
 
-function getResendClient() {
-  const key = process.env.RESEND_API_KEY;
-  if (!key) return null;
-  return new Resend(key);
-}
-
-async function sendMail({ to, subject, html, text }) {
-  const resend = getResendClient();
-
-  if (!resend) {
-    console.warn("[email] RESEND_API_KEY missing. Email not sent.");
-    console.warn("[email] to:", to);
-    console.warn("[email] subject:", subject);
-    console.warn("[email] text:", text);
-    return { ok: true, skipped: true };
-  }
-
+async function sendMail(payload, { idempotencyKey, fetchImpl = globalThis.fetch } = {}) {
+  if (!process.env.RESEND_API_KEY) return { ok: false, code: "EMAIL_NOT_CONFIGURED", outcome: "not_started" };
+  if (!idempotencyKey || idempotencyKey.length > 256) throw new Error("EMAIL_IDENTITY_REQUIRED");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000); timer.unref?.();
+  let reader;
   try {
-    const result = await resend.emails.send({
-      from: getFrom(),
-      to,
-      subject,
-      html,
-      text,
+    const response = await fetchImpl("https://api.resend.com/emails", {
+      method: "POST", headers: { "Authorization": `Bearer ${process.env.RESEND_API_KEY}`, "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify(payload), signal: controller.signal, redirect: "error",
     });
-
-    return { ok: true, result };
-  } catch (err) {
-    console.error("[email] send failed:", err);
-    return {
-      ok: false,
-      error: String(err?.message || err),
-    };
-  }
+    if (!response.ok) return { ok: false, code: `EMAIL_HTTP_${response.status}`, outcome: response.status >= 500 || [408,409,429].includes(response.status) ? "unknown" : "rejected" };
+    reader = response.body?.getReader(); if (!reader) return { ok: false, code: "EMAIL_RESPONSE_INVALID", outcome: "unknown" };
+    let size = 0; const chunks = [];
+    for (;;) { const {done,value} = await reader.read(); if (done) break; size += value.byteLength; if (size > 16 * 1024) throw new Error("EMAIL_RESPONSE_TOO_LARGE"); chunks.push(Buffer.from(value)); }
+    const result = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    if (typeof result?.id !== "string" || !result.id || result.id.length > 180) return { ok: false, code: "EMAIL_RESPONSE_INVALID", outcome: "unknown" };
+    return { ok: true, providerId: result.id, outcome: "confirmed" };
+  } catch (_) { return { ok: false, code: controller.signal.aborted ? "EMAIL_TIMEOUT" : "EMAIL_TRANSPORT_UNKNOWN", outcome: "unknown" }; }
+  finally { controller.abort(); clearTimeout(timer); try { await reader?.cancel(); } catch (_) {} }
 }
 
-function verificationEmail({ email, token, code }) {
+function verificationPayload({ email, token, code }) {
   const base = getAppUrl();
   const verifyUrl = `${base}/api/auth/verify-email?token=${encodeURIComponent(token)}`;
 
-  return sendMail({
+  return {
+    from: getFrom(),
     to: email,
     subject: "Verify your Onlinod email",
     text:
@@ -66,17 +52,15 @@ function verificationEmail({ email, token, code }) {
         <p style="color:#666">This link expires in 30 minutes.</p>
       </div>
     `,
-  }).then((result) => ({
-    ...result,
-    verifyUrl,
-  }));
+  };
 }
 
-function passwordResetEmail({ email, token }) {
+function passwordResetPayload({ email, token }) {
   const base = getAppUrl();
   const resetUrl = `${base}/reset-password?token=${encodeURIComponent(token)}`;
 
-  return sendMail({
+  return {
+    from: getFrom(),
     to: email,
     subject: "Reset your Onlinod password",
     text:
@@ -89,14 +73,11 @@ function passwordResetEmail({ email, token }) {
         <p style="color:#666">This link expires in 30 minutes. If you did not request this, ignore this email.</p>
       </div>
     `,
-  }).then((result) => ({
-    ...result,
-    resetUrl,
-  }));
+  };
 }
 
 module.exports = {
   sendMail,
-  verificationEmail,
-  passwordResetEmail,
+  verificationPayload,
+  passwordResetPayload,
 };

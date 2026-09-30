@@ -15,16 +15,17 @@ function mountedFamilies() {
   const re = /app\.use\(\s*["'](\/api[^"']*)["']/g;
   for (const match of source.matchAll(re)) {
     const mounted = match[1];
+    if (source.slice(match.index, source.indexOf("\n", match.index)).includes("express.json(")) continue; // parser, not a second route family
     if (mounted === "/api" || mounted === "/api/auth/login") continue;
     out.push(mounted);
   }
   return out;
 }
 
-test("Audit16 route manifest exactly classifies all 53 production route families including 6D commands", () => {
+test("Audit16 route manifest exactly classifies all 54 production route families including 6D commands", () => {
   const mounted = mountedFamilies();
-  assert.equal(mounted.length, 53, `expected 53 route families, got ${mounted.length}`);
-  assert.equal(ROUTE_MANIFEST.length, 53, "manifest must classify exactly 53 route families");
+  assert.equal(mounted.length, 54, `expected 54 route families, got ${mounted.length}`);
+  assert.equal(ROUTE_MANIFEST.length, 54, "manifest must classify exactly 54 route families");
   assert.deepEqual(new Set(ROUTE_MANIFEST.map((x) => x.path)), new Set(mounted));
   const valid = new Set(Object.values(ROUTE_CLASS));
   for (const entry of ROUTE_MANIFEST) {

@@ -665,12 +665,15 @@ async function listCustomContentSubmissions({ agencyId, member, creatorId, custo
   return { ok: true, items: rows.map(serializeSubmission), count, nextOffset: skip + rows.length, hasMore: skip + rows.length < count };
 }
 
-async function assignCustomContentSubmission({ agencyId, member, submissionId, customOrderId, now = new Date(), db = null } = {}) {
+async function assignCustomContentSubmission({ agencyId, member, submissionId, customOrderId, expectedUnassignedBindingRevision = null, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const normalizedSubmissionId = identifier(submissionId, "submissionId", { max: 180 });
   const row = await client.customContentSubmission.findFirst({ where: { id: normalizedSubmissionId, agencyId } });
   if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+  if (expectedUnassignedBindingRevision !== null && (row.customOrderId || Number(row.bindingRevision || 1) !== expectedUnassignedBindingRevision)) {
+    throw fail("CUSTOM_SUBMISSION_ASSIGNMENT_STALE", "Unassigned submission changed; refresh before choosing a target", 409);
+  }
   await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
   if (String(row.pipelineDisposition || ACTIVE) !== ACTIVE) {
     throw fail("CUSTOM_SUBMISSION_PIPELINE_NOT_ACTIVE", "Resolved or salvaged content cannot be assigned to an active Custom order", 409);
@@ -706,7 +709,7 @@ async function assignCustomContentSubmission({ agencyId, member, submissionId, c
         await supersedePrecommitInitialReferences({ agencyId, orderId: normalizedOrderId, now: new Date(new Date(now).getTime() + 2), reason: "MANUAL_RESPONSE_ASSIGNMENT_ACCEPTED", db: tx });
       }
       const changed = await tx.customContentSubmission.updateMany({
-        where: { id: row.id, agencyId, pipelineDisposition: ACTIVE, reviewStatus: REVIEW_WAITING, customOrderId: row.customOrderId, updatedAt: row.updatedAt },
+        where: { id: row.id, agencyId, pipelineDisposition: ACTIVE, reviewStatus: REVIEW_WAITING, customOrderId: row.customOrderId, updatedAt: row.updatedAt, ...(expectedUnassignedBindingRevision !== null ? {bindingRevision: expectedUnassignedBindingRevision} : {}) },
         data: { customOrderId: normalizedOrderId, bindingRevision: { increment: 1 } },
       });
       if (Number(changed?.count || 0) !== 1) throw fail("CUSTOM_SUBMISSION_ASSIGNMENT_STALE", "Submission assignment changed while this manager action was being applied", 409);

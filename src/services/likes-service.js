@@ -485,7 +485,7 @@ async function scheduleLikesCurrentRefresh({
   trigger = "planning",
   reason = "likes_current_unknown",
   refreshFields = [],
-  scheduleFanRefresh = scheduleFanDataPointRefresh,
+  scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }),
 } = {}) {
   return scheduleDurableFanDataRefreshDebt({
     agencyId, creatorId, fanIds, consumer: "likes", reason,
@@ -499,7 +499,7 @@ async function planLikes(input) {
     agencyId,
     creatorId,
     priority = 60,
-    scheduleFanRefresh = scheduleFanDataPointRefresh,
+    scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }),
   } = input;
   const result = await withCreatorLock(db, agencyId, creatorId, (tx) => planLikesLocked({ ...input, db: tx }));
 

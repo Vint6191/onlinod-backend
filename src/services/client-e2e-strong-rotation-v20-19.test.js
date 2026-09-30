@@ -32,7 +32,7 @@ function actorProofHash() { return crypto.createHash("sha256").update(Buffer.fro
 function approveDevice(args) { return approveDeviceRaw({ ...args, actorProof: args.actorProof ?? ACTOR_PROOF }); }
 function beginRootRotation(args) { return beginRootRotationRaw({ ...args, actorProof: args.actorProof ?? ACTOR_PROOF }); }
 function finalizeRootRotation(args) { return finalizeRootRotationRaw({ ...args, actorProof: args.actorProof ?? ACTOR_PROOF }); }
-function commitCreatorKeyRotation(args) { return commitCreatorKeyRotationRaw({ ...args, actorProof: args.actorProof ?? ACTOR_PROOF }); }
+function commitCreatorKeyRotation(args) { return commitCreatorKeyRotationRaw({ commandId:crypto.randomUUID(), ...args, actorProof: args.actorProof ?? ACTOR_PROOF }); }
 function softRevokeDevice(args) { return softRevokeDeviceRaw({ ...args, actorProof: args.actorProof ?? ACTOR_PROOF }); }
 
 function x25519PublicKey() {
@@ -160,9 +160,12 @@ function makeDb({ targetOwner = false } = {}) {
     return row;
   }
 
+  const receipts=new Map();
   const db = {
+    $queryRawUnsafe: async (sql,id) => sql.includes('clock_timestamp()') ? [{authorityNow:new Date()}] : sql.includes('ManagementCommandReceipt') ? (receipts.has(id)?[clone(receipts.get(id))]:[]) : [],
+    auditLog: {create: async ({data}) => clone(data)},
     $transaction: async (fn) => fn(transactionClient(db)),
-    $executeRawUnsafe: async () => 1,
+    $executeRawUnsafe: async (sql,...args) => {if(sql.startsWith('INSERT INTO "ManagementCommandReceipt"')){const [id,agencyId,userId,targetId,fingerprint,status,reference]=args;receipts.set(id,{id,agencyId,userId,targetId,fingerprint,status,reference:JSON.parse(reference)});}return 1;},
     workerDevice: {
       findFirst: async ({ where }) => clone([...state.devices.values()].find((row) => match(where, row)) || null),
       findMany: async ({ where }) => [...state.devices.values()].filter((row) => match(where, row)).map(clone),

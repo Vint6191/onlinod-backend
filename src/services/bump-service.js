@@ -231,7 +231,7 @@ async function scheduleBumpCurrentRefresh({
   priority = 60,
   trigger = "planning",
   refreshFields = [],
-  scheduleFanRefresh = scheduleFanDataPointRefresh,
+  scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }),
 } = {}) {
   return scheduleDurableFanDataRefreshDebt({
     agencyId, creatorId, fanIds, consumer: "bumps", reason: "bump_current_unknown",
@@ -239,7 +239,7 @@ async function scheduleBumpCurrentRefresh({
   });
 }
 
-async function planBumps({ agencyId, creatorId, userId = null, source = "manual", fanIds = [], limit = null, manual = false, db = prisma, scheduleFanRefresh = scheduleFanDataPointRefresh }) {
+async function planBumps({ agencyId, creatorId, userId = null, source = "manual", fanIds = [], limit = null, manual = false, db = prisma, scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }) }) {
   const normalizedSource = sourceKey(source);
   await requireCreator(agencyId, creatorId, db);
   const result = await withDbAdvisoryXactLock({ db, key: `p11:bumps:${agencyId}:${creatorId}`, work: async (tx) => {
@@ -1073,7 +1073,7 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
 
 async function planConfiguredBumpSources({
   agencyId, creatorId, userId = null, source = "manual", requireAutomatic = true, manual = false, db = prisma,
-  scheduleFanRefresh = scheduleFanDataPointRefresh,
+  scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }),
 }) {
   const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
   if (!control.effective.bumpsEnabled) {
@@ -1124,7 +1124,7 @@ async function planConfiguredBumpSources({
 
 async function ensureAutomaticBumps({
   agencyId, creatorId, userId = null, source = "recurring_scheduler", db = prisma,
-  scheduleFanRefresh = scheduleFanDataPointRefresh,
+  scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }),
 }) {
   return planConfiguredBumpSources({
     agencyId, creatorId, userId, source, requireAutomatic: true, manual: false, db, scheduleFanRefresh,

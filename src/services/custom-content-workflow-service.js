@@ -262,7 +262,7 @@ async function assignUnassignedCustomContentSubmission({ agencyId, member, submi
   const targetId = identifier(customOrderId, "customOrderId");
   // Candidate pages are a UI read model only. The exact assignment mutation
   // re-validates target existence/type/status/current version atomically.
-  return assignCustomContentSubmission({ agencyId, member, submissionId: row.id, customOrderId: targetId, db: client });
+  return assignCustomContentSubmission({ agencyId, member, submissionId: row.id, customOrderId: targetId, expectedUnassignedBindingRevision: Number(row.bindingRevision || 1), db: client });
 }
 
 async function listAwaitingCustomRevisions({ agencyId, member, limit = 50, cursor = null, db = null } = {}) {

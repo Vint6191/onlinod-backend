@@ -373,7 +373,7 @@ async function scheduleFollowBackCurrentRefresh({
   priority = 60,
   trigger = "planning",
   refreshFields = [],
-  scheduleFanRefresh = scheduleFanDataPointRefresh,
+  scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }),
 } = {}) {
   return scheduleDurableFanDataRefreshDebt({
     agencyId, creatorId, fanIds, consumer: "follow_back", reason: "follow_back_current_unknown",
@@ -395,13 +395,13 @@ async function planFollowBack(input) {
     fanIds: result.refreshFanIds,
     priority: input.priority || 60,
     trigger: "planning",
-    scheduleFanRefresh: input.scheduleFanRefresh || scheduleFanDataPointRefresh,
+    scheduleFanRefresh: input.scheduleFanRefresh || ((args) => scheduleFanDataPointRefresh({ ...args, db })),
   });
   if (!fanRefresh.requested) return { ...result, refreshFanIds: [] };
   return { ...result, refreshFanIds: fanRefresh.fanIds, fanRefresh };
 }
 
-async function ensureAutomaticFollowBack({ agencyId, creatorId, source = "recurring_sweep", db = prisma, scheduleFanRefresh = scheduleFanDataPointRefresh }) {
+async function ensureAutomaticFollowBack({ agencyId, creatorId, source = "recurring_sweep", db = prisma, scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }) }) {
   const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
   if (!control.effective.followBackEnabled) return { ok: true, created: false, reason: "module_disabled" };
   if (!control.modules.follow_back.settings.automatic) return { ok: true, created: false, reason: "automatic_disabled" };
@@ -420,8 +420,8 @@ async function ensureAutomaticFollowBack({ agencyId, creatorId, source = "recurr
   };
 }
 
-async function retryCandidateDelivery({ agencyId, creatorId, fanId, actorUserId }) {
-  const candidate = await prisma.followBackCandidate.findFirst({
+async function retryCandidateDelivery({ agencyId, creatorId, fanId, actorUserId, db = prisma }) {
+  const candidate = await db.followBackCandidate.findFirst({
     where: { agencyId, creatorId, fanId },
     select: { id: true, latestDeliveryId: true },
   });
@@ -431,8 +431,8 @@ async function retryCandidateDelivery({ agencyId, creatorId, fanId, actorUserId 
   if (!candidate.latestDeliveryId) {
     throw Object.assign(new Error("Candidate has no delivery to retry"), { code: "candidate_delivery_not_found", status: 409 });
   }
-  const retried = await retryActionDelivery({ agencyId, actorUserId, deliveryId: candidate.latestDeliveryId });
-  await prisma.followBackCandidate.update({
+  const retried = await retryActionDelivery({ db, agencyId, actorUserId, deliveryId: candidate.latestDeliveryId });
+  await db.followBackCandidate.update({
     where: { id: candidate.id },
     data: {
       state: "QUEUED",
@@ -443,16 +443,16 @@ async function retryCandidateDelivery({ agencyId, creatorId, fanId, actorUserId 
   return retried;
 }
 
-async function setCandidateState({ agencyId, creatorId, fanId, action }) {
+async function setCandidateState({ agencyId, creatorId, fanId, action, db = prisma }) {
   const normalized = clean(action, 40);
   if (!["ignore", "block", "restore"].includes(normalized)) {
     throw Object.assign(new Error("Invalid candidate action"), { code: "invalid_candidate_action", status: 400 });
   }
 
   if (normalized === "restore") {
-    const candidate = await prisma.followBackCandidate.findFirst({ where: { agencyId, creatorId, fanId } });
+    const candidate = await db.followBackCandidate.findFirst({ where: { agencyId, creatorId, fanId } });
     if (!candidate) throw Object.assign(new Error("Follow Back candidate not found"), { code: "candidate_not_found", status: 404 });
-    const updated = await prisma.followBackCandidate.update({
+    const updated = await db.followBackCandidate.update({
       where: { id: candidate.id },
       data: {
         blocked: false,
@@ -465,7 +465,7 @@ async function setCandidateState({ agencyId, creatorId, fanId, action }) {
   }
 
   return runWithAutomationWriteCommitFence({
-    db: prisma,
+    db,
     agencyId, creatorId,
     options: { timeout: 30_000 },
     work: async (tx) => {

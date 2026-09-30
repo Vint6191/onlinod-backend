@@ -218,7 +218,7 @@ function expiresAtMs(row) {
   return Number.isFinite(received) && received > 0 ? received + TIP_CLAIM_GRACE_PERIOD_MS : null;
 }
 
-async function findRecentDialogCandidates({ agencyId, accountId, fanId, dialogId, receivedAt }) {
+async function findRecentDialogCandidates({ agencyId, accountId, fanId, dialogId, receivedAt, db = prisma }) {
   const to = safeDate(receivedAt);
   const from = new Date(to.getTime() - TIP_SOFT_REVIEW_WINDOW_MS);
   const ors = [];
@@ -235,7 +235,7 @@ async function findRecentDialogCandidates({ agencyId, accountId, fanId, dialogId
     ...(ors.length ? { OR: ors } : {}),
   };
 
-  const rows = await prisma.teamSentMessageLedger.findMany({
+  const rows = await db.teamSentMessageLedger.findMany({
     where,
     select: { memberId: true, userId: true, deviceId: true, shiftKey: true, sentAt: true, source: true },
     orderBy: { sentAt: "desc" },
@@ -260,7 +260,7 @@ async function findRecentDialogCandidates({ agencyId, accountId, fanId, dialogId
 // Audit15: live client tip ingest was retired; canonical CreatorTip reconciliation
 // is the only production TeamTipLedger money writer.
 
-async function canActorClaimTip({ agencyId, row, actor }) {
+async function canActorClaimTip({ agencyId, row, actor, db = prisma }) {
   if (!row || !actor || !financiallyActive(row)) return false;
   if (row.attributedMemberId === actor.id) return true;
   if (String(row.status || "") === "conflict") return false;
@@ -273,7 +273,7 @@ async function canActorClaimTip({ agencyId, row, actor }) {
     accountId: row.accountId,
     fanId: row.fanId,
     dialogId: row.dialogId,
-    receivedAt: row.receivedAt,
+    receivedAt: row.receivedAt, db,
   });
   return mergeCandidates(primary, weak).some((c) => c.memberId === actor.id);
 }
@@ -338,13 +338,13 @@ function tipRowForClaims(row, membersById = new Map()) {
   };
 }
 
-async function enrichTipRows(rows, agencyId) {
+async function enrichTipRows(rows, agencyId, db = prisma) {
   const memberIds = Array.from(new Set((rows || []).flatMap((row) => {
     const candidates = mergeCandidates(row.candidates, row.weakCandidates, row.result?.candidates, row.result?.weakCandidates);
     return [row.attributedMemberId, ...candidates.map((c) => c.memberId)].filter(Boolean);
   })));
   const members = memberIds.length
-    ? await prisma.agencyMember.findMany({
+    ? await db.agencyMember.findMany({
         where: { agencyId, id: { in: memberIds }, deletedAt: null },
         include: { user: { select: { id: true, email: true, name: true } } },
         take: 10000}).catch(() => [])
@@ -463,7 +463,7 @@ async function createTipClaimNoticeEvents(tx, { agencyId, row, action, selectedM
   }
 }
 
-async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = null, eventHash, action, targetMemberId, reason, senior = false, allowedCreatorIds = null }) {
+async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = null, eventHash, action, targetMemberId, reason, senior = false, allowedCreatorIds = null, db = prisma }) {
   const safeHash = clean(eventHash, 120);
   const cleanAction = clean(action, 24);
   if (!safeHash) return { ok: false, code: "TIP_NOT_FOUND" };
@@ -478,7 +478,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = 
     ? actorMember
     : { id: byMemberId || null, userId: byUserId || null, accessEpoch: actorMember?.accessEpoch ?? null };
 
-  const outcome = await runDbTransaction(prisma, async (tx) => {
+  const outcome = await runDbTransaction(db, async (tx) => {
     await lockAgencyLifecycle({ tx, agencyId });
     if (require("./product-billing-context-service").inProductBilling(agencyId)) {
       const observed = await tx.$queryRawUnsafe('SELECT "creatorId" FROM "TeamTipLedger" WHERE "agencyId"=$1 AND "eventHash"=$2 LIMIT 1', agencyId, safeHash);
@@ -518,7 +518,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = 
       if (String(row.status || "") === "conflict") {
         return { code: "TIP_CONFLICT_MANAGER_REQUIRED", error: "Tip conflicts must be resolved by owner / manager / admin" };
       }
-      const eligible = await canActorClaimTip({ agencyId, row, actor });
+      const eligible = await canActorClaimTip({ agencyId, row, actor, db: tx });
       if (!eligible) {
         return { code: "CLAIM_NOT_ELIGIBLE", error: "You can claim only tips from dialogs you worked within the 15-minute soft review window" };
       }
@@ -625,7 +625,7 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = 
   }, serializableTxOptions());
 
   if (!outcome?.ok) return { ok: false, code: outcome?.code || "TIP_OVERRIDE_FAILED", error: outcome?.error || "Failed" };
-  const [attribution] = await enrichTipRows([outcome.row], agencyId);
+  const [attribution] = await enrichTipRows([outcome.row], agencyId, db);
   return { ok: true, attribution };
 }
 
@@ -1506,5 +1506,5 @@ module.exports = {
   migrateLegacyTipsToTipLedger,
   repairMigratedLegacyTipManualAuthority,
   purgeExpiredTipLedger,
-  tipRowForClaims,
+  tipRowForClaims, enrichTipRows,
 };
