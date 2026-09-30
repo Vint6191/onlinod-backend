@@ -1,0 +1,301 @@
+================================================================================
+ONLINOD — PHASE 6 / D9 — TELEGRAM CONTROL RECOVERY
+Продолжение D8 по актуалу Desktop 96 / Backend 2026-09-30T020121.030
+Полностью накопительный checkpoint. Предыдущий D8 сохранён точным префиксом.
+================================================================================
+
+0. РЕЗУЛЬТАТ И ГРАНИЦА
+
+Крупный связанный блок D9 реализован: создание Telegram-подключения, настройки
+напоминаний, обычное/принудительное удаление и сохранение MTProto-сессии получили
+единый специализированный протокол с durable intent, receipt, текущими правами,
+версиями намерения и восстановлением Desktop. QR helper подтверждает передачу
+готовой сессии только после её записи Main в зашифрованный локальный журнал.
+Это продолжение нашего ONLINOD; вся фаза6D и весь Telegram-домен ещё не закрыты.
+
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ: ПОКА НЕТ.
+Деплоя, Render/Neon, внешнего SQL, настоящего Telegram/provider и нативного Electron
+не было. Применялась разрешённая disposable offline SQL-проверка. Ровно один OWNER
+на агентство сохраняется; ADMIN и остальные роли могут быть множественными.
+Перенос истории на сервер остаётся отдельным согласованным узлом.
+
+1. ПРОВЕРЕННЫЙ АКТУАЛ
+
+96.zip
+SHA256 bfda322d7d8135f7620623c6f1adaa41aa3d86e0aac538510b9354c879ee33b0
+1206 файлов. Все присутствующие файлы побайтово равны D8, новых/изменённых нет.
+Не включены 20 исторических docs; они сохранены в накопительном целевом дереве.
+Это не потеря рабочего кода и не пользовательское изменение его содержимого.
+
+onlinod-backend-main - 2026-09-30T020121.030.zip
+SHA256 ce41e66279349894f5cdf809e68fed99da682b0289f50cbea9737bbdcefd875e
+1302 файла, полное совпадение D8, без добавлений, изменений или пропусков.
+AGENTS.md в рабочих архивах нет. Присланные файлы читались напрямую из upload.
+
+Корни:
+/workspace/scratch/0495154fe552/work/phase6-d9-backend
+/workspace/scratch/0495154fe552/work/phase6-d9-desktop
+Evidence: /workspace/scratch/0495154fe552/evidence-phase6-d9.
+Родительские phase6-d8-* неизменны. Исходные bases — Backend I7 и Desktop77.
+
+2. ЧЕТЫРЕ ВОСПРОИЗВЕДЁННЫХ ДЕФЕКТА D8
+
+Одинаковые управляемые поведенческие сценарии: D8 — 0 PASS / 4 ожидаемых FAIL;
+на D9 все четыре PASS в общем Desktop-наборе. Это source/runtime-воспроизведения
+с управляемыми зависимостями, не утверждение о четырёх production-инцидентах.
+
+- Готовая MTProto-сессия не была durable до выхода helper и отправки HTTP.
+- Поздний успешный ответ handoff переводил локальный CANCELLED в AUTHORIZED.
+- Слишком длинная сессия молча усекалась вместо отказа.
+- Повторное сообщение helper заменяло первое уже начатое сохранение сессии.
+
+Дополнительные проверки закрывают потерянный reply, restart до ACK, повторные
+cancel/retry, смену login/прав во время запуска helper и синхронной записи,
+поздний ответ старого challenge и передачу сессии перед штатным выходом helper.
+
+3. ВЛАДЕЛЕЦ TELEGRAM CONTROL
+
+POST /api/telegram-control/commands/v1 и /v1/cancel, authRequired, no-store.
+Пять строгих действий: telegram.create, telegram.reminders, telegram.retire,
+telegram.forceRetire, telegram.session. UUID, target и payload проверяются;
+ошибки валидации не возвращают сырые присланные API hash/сессию.
+Предел payload — 272 KiB. API ID — положительное целое до2147483647, API hash —
+32 hex-символа, сессия — от1 до262144 символов, без молчаливого усечения.
+Интервалы напоминаний:1–525600; список offsets:1–12; текст:до2000 символов.
+Force требует явного acknowledgment и непустой причины до1000 символов.
+
+Использована существующая таблица ManagementCommandReceipt D6, новой миграции нет.
+Отдельное пространство telegram_control_v1_; идентичность включает agency/user/UUID.
+Fingerprint учитывает namespace, UUID, действие, target и исходный payload.
+Receipt хранит только locator accountId либо пустой reference для reminders.
+API hash, MTProto session и зашифрованные credential bytes в receipt не пишутся.
+
+Replay подтверждает уже зафиксированное событие и выдаёт текущий безопасный readback.
+Если подключение уже удалено, account:null подтверждает прежнее исполнение;
+старый receipt не воссоздаёт аккаунт и не возвращает прежнюю сессию/настройки.
+Cancel-before-execute фиксирует ABANDONED; commit-before-cancel подтверждает commit.
+Отмена не откатывает уже выполненную запись и не создаёт компенсирующее удаление.
+
+Новое исполнение связано с исходными deviceId и authorizationSessionId из signed
+login, добавленными Main. Новый login может подтвердить прежний commit, но не может
+выполнить ещё не исполненное намерение старого login. Его можно отменить и создать
+новое осознанное действие. Replay/cancel тоже требуют актуальных прав и живого login.
+
+Один kernel root SECRET_WRITE, serializable, maxAttempts1. Порядок:
+общий Agency lifecycle barrier -> command advisory lock -> authorization-user lock
+-> User FOR UPDATE -> текущие User/Member/epoch и роль OWNER/ADMIN -> живая signed
+RefreshSession lineage -> целевые policy/account/count locks -> запись домена,
+обязательный audit и receipt. Request-time auth не заменяет commit-time проверку.
+Receipt failure/audit failure откатывает доменный эффект в этой же транзакции.
+
+4. ВЕРСИИ И ОГРАНИЧЕННЫЙ READBACK
+
+credentialRevision вычисляется по encrypted bytes/IV/tag/algorithm/version/API ID/id.
+Это версия сохранённого ciphertext, не публичный хеш низкоэнтропийного plaintext.
+accountRevision включает credentialRevision, lifecycle/retirement и runtime
+owner/claim token/claim generation/drain generation. Runtime heartbeat TTL из версии
+исключён, чтобы продление lease не ломало редактор; force проверяет TTL по DB clock.
+
+Reminder policy и dependency generation читаются одним SQL LEFT JOIN snapshot;
+версия учитывает обе части, поэтому возврат значения A->B->A не обходит CAS.
+Ошибка чтения policy больше не маскируется как успешный read defaults.
+Account readback не раскрывает apiHash/session/runtime claim token.
+Повреждённый ciphertext остаётся видимым с sessionReady:false, чтобы подключение
+можно было вывести из эксплуатации; он не превращается в скрытое исчезновение.
+
+Список подключений ограничен128: запрашивается129-я строка для явного отказа
+при переполнении, без выдачи усечённого «полного» списка. Create сериализует счётчик
+агентства и не создаёт129-е подключение. Это новая явная граница ёмкости;
+её пригодность для целевой нагрузки ещё не является SCALE-приёмкой.
+
+5. УДАЛЕНИЕ, DRAIN И АВТОРИЗАЦИОННЫЙ МАТЕРИАЛ
+
+Переиспользованы существующие владельцы blockers, retirement и bounded fanout.
+Две прежние части remove теперь могут присоединиться к текущему command root
+только при currentCommitContext().tx === переданному client. Проверка препятствует
+выдаче произвольного транзакционного клиента за текущий kernel root.
+Normal/force retirement, fanout, required audit и receipt атомарны относительно
+этой команды. Падение receipt не оставляет отдельно committed retirement.
+
+Проверки lifecycle/runtime generation и деловых blockers сохранены. Начальное
+удаление может вернуть RETIRING/drainRequired. После фактического drain действие
+Finish removal использует свежую accountRevision и новый UUID. Replay начального
+receipt подтверждает первоначальную команду, а не запускает новую работу.
+Физический multi-PC drain и независимые PG sessions этим проходом не доказаны.
+Протоколы runtime claim/release и внешней Telegram-доставки здесь не переписаны.
+
+У существующего local-material нормализованный purpose=authorize (trim/lowercase)
+направлен в новый reader с текущими User/Member/epoch/OWNER-or-ADMIN/live login.
+Account row блокируется; нужны ACTIVE и idle/drained runtime. Повторная авторизация
+не разрешена при runtime owner, живом lease либо несовпадении claim/drain generation.
+Выдаются Main-only apiHash, пустая предыдущая session и credentialRevision.
+Commit новой сессии снова проверяет те же условия и expectedCredentialRevision.
+Messaging/source/delivery material остаются у прежних специализированных владельцев;
+эта ветка local-material не означает закрытие всех его purpose.
+
+6. ЗАЩИЩЁННЫЙ DESKTOP ЖУРНАЛ И ОБЩИЙ TRANSPORT
+
+Новый telegram-control-pending-v1.json зашифрован целиком через safeStorage.
+Недоступная защита и basic_text отклоняются; plaintext fallback нет.
+Пределы журнала:32 записи и4 MiB; payload272 KiB. Pending list содержит постоянные
+безопасные подписи, без apiHash/session. Секретные payload остаются в Main.
+Общий slot аккаунта исключает перекрывающиеся session/retire/force; create и policy
+имеют собственные slots. QR/setup блокируются при незавершённых Telegram-командах.
+
+DurableCommandTransport получил синхронный prepare(): запись/fsync до любого HTTP,
+возврат UUID уже сохранённой команды. Обычный execute сохраняет прежний lifecycle;
+afterRecovery не вызывается для каждого обычного исполнения. Незащищённый журнал
+дополнительно отклоняет поля apiHash и session.
+
+Перед/после отправки проверяются CONTROL permit, auth scope и local incarnation.
+Результат подтверждается только после проверки формы/action/target/current readback.
+Main restart, потерянный HTTP/IPC reply и сбой ACK оставляют тот же UUID для recovery.
+Cancel проходит beforeSend guard и повторную проверку до удаления локальной записи.
+Во время cancel запрещены параллельные send/retry, второй cancel и преждевременный ACK;
+локальная отметка отмены снимается в finally, включая ошибочные ветки.
+Регрессии существующих Team/Billing/Management/Account security transports прошли.
+
+7. QR HELPER: DURABLE ПЕРЕДАЧА И ЗАВЕРШЕНИЕ
+
+Main принимает законченную сессию один раз и синхронно сохраняет зашифрованный intent.
+Дубликаты/stale helper messages не заменяют первый handoff. Oversize отклоняется.
+После подготовки отменяются старые challenge timers. Только после durable prepare
+Main посылает helper сообщение auth-session-staged с его ID.
+
+Helper создаёт ожидание подтверждения перед отправкой сессии и ждёт соответствующий
+ID перед штатным qr-auth-complete/exit. Ожидание ограничено15 секундами; cancel его
+прерывает. Main начинает backend handoff после наблюдаемого выхода helper; сохранён
+2-секундный kill backstop. Disconnect helper ограничен прежними1200 ms.
+Сбой durable storage останавливает helper без записи на backend и ложного успеха.
+При retry отправляется прежняя подготовленная команда; после restart она доступна
+в pending panel без прежнего in-memory challenge.
+
+Поздние success/error не превращают CANCELLED в AUTHORIZED и не очищают более новый
+challenge. Карта challenges ограничена32 с уборкой завершённых. Settings проверяет
+форму материала, пустую прежнюю session и право/происхождение после асинхронного
+запуска helper; при изменении authority новый helper отменяется. Stale provenance
+records очищаются при новом запуске. Terminal status можно опрашивать повторно.
+
+Локальный Cancel завершает QR-процесс. Уже подготовленная durable-команда остаётся
+отдельно восстанавливаемой/отменяемой через pending panel; локальный cancel не обещает
+отменить состоявшийся server commit. Crash до получения/подготовки сессии Main не
+восстанавливается этим журналом. Exactly-once внешнего Telegram login не заявлен.
+
+8. UI, RPC И CUTOVER
+
+Settings/Main/module constructor/typed RPC подключены к новому transport.
+Renderer передаёт показанные account/reminder revisions и получает safe result/UUID.
+Pending panel Settings дополняется Telegram-группой с list/retry/ack/cancel;
+существующие management и account security панели сохранены.
+После подтверждённой авторизации выполняется ACK и свежий Settings read с UI epoch
+guard. Старая оптимистичная sessionReady-подстановка убрана. Текст подтверждает
+сохранение авторизации, а актуальное состояние показывает список подключений:
+исторический receipt может относиться к уже удалённой/заменённой записи.
+Локальный cancel обновляет pending panel. Portal closed допустим без commandId.
+
+Ранний410 закрывает пять прежних публичных write routes:
+PATCH /api/settings/telegram/reminders
+POST /api/settings/telegram/accounts
+DELETE /api/settings/telegram/accounts/:accountId
+POST /api/settings/telegram/accounts/:accountId/force-retire
+PUT /api/settings/telegram/accounts/:accountId/session
+Case/trailing slash учтены; reads, runtime и local-material не перекрыты этим gate.
+Старые bodies сохранены за410. Route manifest:53 production families.
+Backend/Desktop требуют согласованного cutover: старый Desktop на этих writes
+получит410. Это changed-only исходники, не собранный установщик.
+
+9. ПРОВЕРКИ И ОГРАНИЧЕНИЯ ДОКАЗАТЕЛЬСТВА
+
+Итог D9:
+- 437 Backend PASS / 0 FAIL / 0 SKIP;
+- 227 Desktop PASS / 0 FAIL / 0 SKIP;
+- 31 новый D9 SQL-сценарий PASS;
+- 30 D8 SQL-регрессий на финальном D9 PASS;
+- четыре прежних D8 helper-дефекта воспроизведены и исправлены;
+- 15 JS syntax и 11 TS/TSX parse PASS;
+- prisma validate PASS, schema/migrations неизменны.
+
+Backend gate включает предыдущие390,21 существующую Telegram-проверку и26 новых.
+Desktop gate включает предыдущие180,5 существующих Settings Telegram и42 новых.
+Это целевой набор, не утверждение «все проверки всего репозитория зелёные».
+Хеши финального исходника, тестов, SQL owners и синтаксических входов сохранены.
+
+SQL: PGlite0.5.8+pglite-socket0.2.11, actual Prisma5.22.0, все267 migrations в отдельной
+disposable базе на proof, один сериализованный socket backend. global.fetch бросает
+ошибку; реальных провайдеров и пользовательского DATABASE_URL нет. Полная схема
+не менялась: isolated Prisma Client D6 повторно использован. Datamodel сверена
+с нормализацией generator output, whitespace и порядка @@-атрибутов одной модели;
+это не ложное утверждение о побайтовом совпадении с отформатированной client schema.
+
+SQL покрывает replay/deleted replay/cancel/fingerprint, rollback audit/receipt,
+policy ABA/fanout, CAS сессии, runtime busy/drain/generation, normal/force retirement,
+clock/TTL, current role/epoch/live login/disabled user/cross-agency/new login и128 cap.
+Fixture ADMIN имеет отдельного единственного OWNER; demotion/disabled отказывают.
+Он не доказывает физические interleavings/deadlocks независимых production sessions.
+
+Промежуточные логи сохранены отдельно. Первый D9 SQL-прогон выявил дублирование
+миграцией уже созданной Phase2WorkCoverage в fixture; fixture исправлен на upsert.
+Первый параллельный D8 regression встретил локальный P1001 до migrations, после
+зависшего cleanup прерван (exit130). Причина не установлена. Последовательный финальный
+прогон прошёл30/30; финальный D9 прошёл31/31, оба завершились exit0.
+Старые source assertions URL/manifest и read fixture обновлены под нового owner.
+
+Legacy Backend settings-v12:7 PASS/4 FAIL на D9 и D8, одинаковые имена падений.
+Legacy Desktop telegram-local-mtproto:3 PASS/1 FAIL на D9 и D8. Старая проверка
+ожидает уже выведенный из обращения Renderer RPC telegramMessaging.resolveCreator.
+Эти результаты вынесены отдельно, не включены в437/227 PASS и не объявлены починенными.
+Две исторически заблокированные D8 проверки auth-session-resilience (нужен dist)
+и auth-session-store-security-v20-22 (нужен typescript) в D9 заново не запускались.
+
+npm run typecheck и npm run build: BLOCKED, tsc:not found, exit127.
+Parse/VM tests не равны полноценной сборке. safeStorage в tests заменён управляемым
+криптографическим адаптером; настоящая OS keychain не проверялась. Не запускались
+native Electron/UI, Telegram, независимый PostgreSQL, два реальных ПК и целевая
+длительная нагрузка. Никакие SOURCE/SCALE CLOSED этим набором не выданы.
+
+10. НАКОПИТЕЛЬНЫЙ КОМПЛЕКТ
+
+Backend target:1309 файлов; delta от D8:13;
+накопительно от исходного I7:124.
+Desktop target:1229 файлов; delta от D8:15;
+накопительно от исходного Desktop77:156.
+
+Changed-only ZIP строятся относительно исходных I7/Desktop77 и включают D1–D8.
+Проверены10 overlay-входов на сторону: original,D1,D2,D3,D4,D5,D6,D7,D8,новый актуал.
+Каждый даёт один target manifest; удалений нет. SHA256, ZIP integrity, неизменность
+родителей/миграций и точный checkpoint prefix проверены.
+D8 checkpoint:1080859 bytes,
+SHA256 335ac4713e992a8f8f4eedc60f5d39b1a03d3c8d44163c9084a271c6850b99fb.
+Evidence содержит целиком D8 evidence, текущие code ZIP, логи, воспроизведения,
+final diffs/changed-source, manifests, owner review и актуальный mutation inventory.
+Delivery verification хранится отдельно, чтобы не создавать циклические хеши.
+
+11. ОСТАВШИЙСЯ ПЛАН
+
+Inventory:396 literal declarations =300 mounted non-admin +59 unmounted +37 admin.
+204 mounted остаются INVENTORY_ONLY. Отдельные partial: authorize material1,
+reset issuance2, creator retirement1. Это очередь семантического review, а не число
+багов, законченных фич или процент готовности. GET/background mutations такой
+literal route scan сам по себе не доказывает.
+
+Остаток6D:
+- account/creator avatar: filesystem+DB, editor/version/readback и recovery;
+- email issuance/delivery/verification и оставшийся account lifecycle;
+- creator/device key rotations вне проверенного D5 root recovery;
+- creator retirement: lost reply, local cleanup, multi-PC quiesce/physical drain;
+- Telegram identity, runtime claim/release, messaging/source/delivery material,
+  intents/leases/receipts и UNKNOWN external outcomes;
+- Custom/submission/provider delivery; не пересылать вслепую неизвестный эффект;
+- jobs progress/results, programmatic OF admission/settlement, остальные
+  observations/refresh/module controls — текущих владельцев проверять отдельно.
+6E: Chromium pending bounds, справедливость очередей и давление на host.
+6F: полноценная сборка, native Electron/multi-PC, independent PostgreSQL и нагрузка.
+Серверное хранение истории — отдельный согласованный узел, не скрытая часть D9.
+
+Продолжать крупным связанным блоком без вопроса «продолжать ли» после сверки нового
+актуала с D9; сохранять исторические docs и весь накопительный checkpoint/evidence.
+Количество зелёных целевых tests не является основанием разрешить установку.
+
+ВЕРДИКТ: D9 реализован и локально проверен в перечисленных границах.
+SOURCE CLOSED: НЕТ. SCALE CLOSED: НЕТ. СТАВИТЬ: ПОКА НЕТ.
+================================================================================

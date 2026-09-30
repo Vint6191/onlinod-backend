@@ -73,6 +73,7 @@ const ROUTE_MANIFEST = Object.freeze([
   route("/api/modules", ROUTE_CLASS.LEGACY_GONE, "routes/modules.js", "410 tombstone; ModuleSetting remains internal product storage", { replacement: "dedicated product control APIs" }),
   route("/api/billing", ROUTE_CLASS.OWNER, "routes/billing.js", "owner/billing authority"),
   route("/api/management/commands", ROUTE_CLASS.AGENCY, "routes/management-commands.js", "durable management identity, current actor/scope, device-bound network ciphertext"),
+  route("/api/telegram-control/commands", ROUTE_CLASS.AGENCY, "routes/telegram-control-commands.js", "current owner/admin, protected intent, versioned Telegram control and atomic receipt"),
   route("/api/account-security/commands", ROUTE_CLASS.AGENCY, "routes/account-security-commands.js", "current account/login lineage, durable security intent and atomic receipt"),
   route("/api/settings", ROUTE_CLASS.AGENCY, "routes/settings.js", "current member/settings permissions; Telegram runtime subroutes are device-bound", { retiredSubroutes: ["/runtime"] }),
   route("/api/message-library", ROUTE_CLASS.LEGACY_GONE, "routes/message-library.js", "410 tombstone; legacy MessageTemplate generation retired", { replacement: "/api/server/content/message-library" }),

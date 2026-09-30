@@ -196,12 +196,19 @@ test("Telegram MTProto storage is agency-scoped, owner/admin managed and never r
   assert.equal(stored.encryptedPayload.includes("0123456789abcdef"), false);
   assert.equal(stored.algorithm, "aes-256-gcm");
 
-  const listed = await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: owner, db: commitDatabaseFixture(db) });
-  assert.deepEqual(listed, { available: true, accounts: [{ id: "tg-1", apiId: 12345678, sessionReady: true, lifecycleState: "ACTIVE", retirementRequestedAt: null, drainRequired: false, drainCompleted: false, forceRetireAvailable: false }], reminders: DEFAULT_REMINDERS });
+  const telegramReadDb = { ...commitDatabaseFixture(db), $queryRawUnsafe: async sql => {
+    if (sql.includes('clock_timestamp')) return [{ authorityNow: new Date() }];
+    if (sql.includes('LEFT JOIN "WorkspaceSetting"')) return [{ value: null, revision: '0' }];
+    throw new Error('Unexpected Telegram view query');
+  } };
+  const listed = await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: owner, db: telegramReadDb });
+  assert.match(listed.remindersRevision, /^[a-f0-9]{64}$/);
+  assert.match(listed.accounts[0].revision, /^[a-f0-9]{64}$/);
+  assert.deepEqual(listed, { available: true, remindersRevision: listed.remindersRevision, accounts: [{ revision: listed.accounts[0].revision, id: "tg-1", apiId: 12345678, sessionReady: true, lifecycleState: "ACTIVE", retirementRequestedAt: null, drainRequired: false, drainCompleted: false, forceRetireAvailable: false }], reminders: DEFAULT_REMINDERS });
   assert.equal(JSON.stringify(listed).includes("SESSION_SECRET_VALUE"), false);
   assert.equal(JSON.stringify(listed).includes("0123456789abcdef"), false);
 
-  const adminListed = await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: admin, db: commitDatabaseFixture(db) });
+  const adminListed = await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: admin, db: telegramReadDb });
   assert.equal(adminListed.available, true);
   assert.deepEqual(await service.getTelegramMtprotoSettings({ agencyId: "agency-1", member: { role: "CHATTER" }, db: commitDatabaseFixture(db) }), { available: false, reason: "OWNER_OR_ADMIN_ONLY", accounts: [], reminders: DEFAULT_REMINDERS });
   await assert.rejects(() => service.addTelegramMtprotoAccount({ agencyId: "agency-1", member: { role: "MANAGER" }, apiId: 1, apiHash: "0123456789abcdef0123456789abcdef", session: "x", db: commitDatabaseFixture(db) }), /owner or administrator/);

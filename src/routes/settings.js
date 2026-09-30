@@ -34,6 +34,7 @@ const { requireProductDevice } = require("../middleware/product-access");
 
 const router = express.Router();
 router.use(require("../middleware/retired-account-security-writes"));
+router.use(require("../middleware/retired-telegram-control-writes"));
 router.use(require("../middleware/retired-management-writes"));
 const uploadsDir = path.join(__dirname, "..", "..", "uploads");
 fs.mkdirSync(uploadsDir, { recursive: true });
@@ -308,7 +309,11 @@ router.post("/telegram/accounts/:accountId/force-retire", async (req, res) => {
 router.post("/telegram/accounts/:accountId/local-material", async (req, res) => {
   try {
     const boundDeviceId = requireProductDevice(req, req.body?.deviceId);
-    const material = await issueTelegramMtprotoLocalMaterial({
+    const material = String(req.body?.purpose || "").trim().toLowerCase() === "authorize"
+      ? await require("../services/telegram-control-command-service").readTelegramAuthorizationMaterial({
+          db: require("../prisma"), ...req.auth, actorMember: req.auth.membership, accountId: req.params.accountId, deviceId: boundDeviceId,
+        })
+      : await issueTelegramMtprotoLocalMaterial({
       agencyId: req.auth.agencyId,
       member: req.auth.membership,
       accountId: req.params.accountId,

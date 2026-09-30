@@ -1,4 +1,5 @@
 "use strict";
+const { currentCommitContext } = require("./db-commit-kernel");
 const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-service");
 
 const { effectiveBillingState, liveEntitlementEnd, scopedEntitlement } = require("./billing-state-service");
@@ -581,20 +582,14 @@ async function assertTelegramAccountNoBusinessBlockers({ agencyId, accountId, db
 async function getTelegramMtprotoSettings({ agencyId, member, db = null }) {
   if (!canManageTelegram(member)) return { available: false, reason: "OWNER_OR_ADMIN_ONLY", accounts: [], reminders: normalizeTelegramCustomReminders(null) };
   const client = db || prisma;
-  const [rows, reminderRow] = await Promise.all([
-    client.agencyTelegramMtprotoAccount.findMany({
-      where: { agencyId },
-      select: { id: true, apiId: true, encryptedPayload: true, iv: true, tag: true, algorithm: true, payloadVersion: true, lifecycleState: true, retirementRequestedAt: true, retirementDrainCompletedAt: true, runtimeClaimedByDeviceId: true, runtimeClaimUntil: true },
-      orderBy: { id: "asc" },
-    }),
-    client.workspaceSetting.findUnique({ where: { agencyId_key: { agencyId, key: TELEGRAM_CUSTOM_REMINDERS_KEY } } }).catch(() => null),
+  const { ACCOUNT_LIMIT, publicAccount, readReminderState, fail } = require("./telegram-control-state");
+  const now = await dbAuthorityNow({ db: client, fallbackNow: new Date() });
+  const [rows, reminderState] = await Promise.all([
+    client.agencyTelegramMtprotoAccount.findMany({ where: { agencyId }, orderBy: { id: "asc" }, take: ACCOUNT_LIMIT + 1 }),
+    readReminderState(client, agencyId),
   ]);
-  const accounts = rows.map((row) => {
-    let sessionReady = false;
-    try { sessionReady = Boolean(String(decryptTelegramCredentials(row).session || "").trim()); } catch (_) {}
-    return publicTelegramAccount(row, sessionReady);
-  });
-  return { available: true, accounts, reminders: normalizeTelegramCustomReminders(reminderRow?.value) };
+  if (rows.length > ACCOUNT_LIMIT) throw fail("TELEGRAM_CONTROL_ACCOUNT_LIMIT", "Telegram connection list exceeds its supported bound", 503);
+  return { available: true, accounts: rows.map(row => publicAccount(row, now)), ...reminderState };
 }
 
 async function updateTelegramCustomReminderSettings({ agencyId, member, reminders, db = null }) {
@@ -707,7 +702,7 @@ async function removeTelegramMtprotoAccount({ agencyId, member, accountId, db = 
   const id = String(accountId || "").trim();
   if (!id || id.length > 180) throw telegramInputError("Telegram connection id is required", "SETTINGS_TELEGRAM_ACCOUNT_INVALID");
   const client = db || prisma;
-  if (typeof client?.$transaction !== "function") {
+  if (typeof client?.$transaction !== "function" && currentCommitContext()?.tx !== client) {
     throw Object.assign(new Error("Telegram connection retirement requires transactional storage"), { code: "SETTINGS_TELEGRAM_ACCOUNT_RETIRE_TRANSACTION_REQUIRED", status: 503 });
   }
   const existing = await client.agencyTelegramMtprotoAccount.findFirst({
@@ -805,7 +800,7 @@ async function forceRetireLostTelegramMtprotoAccount({ agencyId, member, account
   if (acknowledgeLostObservations !== true) throw Object.assign(new Error("Explicit acknowledgement of possible lost local Telegram observations is required"), { code: "SETTINGS_TELEGRAM_FORCE_RETIRE_ACK_REQUIRED", status: 400 });
   if (!why) throw Object.assign(new Error("A reason is required to force-retire a lost Telegram runtime"), { code: "SETTINGS_TELEGRAM_FORCE_RETIRE_REASON_REQUIRED", status: 400 });
   const client = db || prisma;
-  if (typeof client?.$transaction !== "function") throw Object.assign(new Error("Force retirement requires transactional storage"), { code: "SETTINGS_TELEGRAM_FORCE_RETIRE_TRANSACTION_REQUIRED", status: 503 });
+  if (typeof client?.$transaction !== "function" && currentCommitContext()?.tx !== client) throw Object.assign(new Error("Force retirement requires transactional storage"), { code: "SETTINGS_TELEGRAM_FORCE_RETIRE_TRANSACTION_REQUIRED", status: 503 });
   return runDbTransaction(client, async (tx) => {
     // Force retirement participates in the exact same Agency -> TelegramAccount ->
     // CustomOrder serialization order as normal retirement.
