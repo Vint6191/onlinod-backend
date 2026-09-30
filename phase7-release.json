@@ -2,10 +2,10 @@
   "version": 1,
   "generation": "phase7_legacy_storage_v1",
   "planHash": "9fb409e3d948c17e3f71914de68c0ef2de116ffa250c73eb48191d1466eab2ac",
-  "packageId": "ONLINOD_PHASE7_ACTUAL99_CUMULATIVE_V1",
+  "packageId": "ONLINOD_PHASE7_ACTUAL101_CHECKSUM_COMPAT_V2",
   "baseBackendHash": "c966c17631dd1293964fd97fe3af697752f3ce638d3ca072af4e39abb24d5d00",
   "baseDesktopHash": "191b46830e4540699304f9ad50023d58c90fb23b1da526338381ed6506384017",
-  "backendHash": "a6289fc40c183d5df8478ed08a52429caa105aad36a4b1378f4519bc50ca6db8",
+  "backendHash": "83692c2ee2e167d9efb102657d245951fb9ecb5162e572fa08a52c3357f871a9",
   "desktopHash": "c2dc5d4cef3857a734adbc0c0bb0adc61d28a52df87ccbac685597729131439d",
   "backendFiles": [
     {
@@ -2345,13 +2345,18 @@
     },
     {
       "path": "scripts/database/phase7-deploy.js",
-      "bytes": 5163,
-      "sha256": "9f8433f7750d802052d8d56ce909da05952fba1dbb547c9106ca3d104d7925a7"
+      "bytes": 6004,
+      "sha256": "3825b30d6ef9eb60023032ae3e3bf3d9eaf05cb294d76a4dc8b14a131f87f8fd"
     },
     {
       "path": "scripts/database/phase7-legacy-storage-indexes.js",
       "bytes": 4639,
       "sha256": "9efd7c3df89e2ed1f9b7ec53ae99da29158a53be99b7c701d1ce3ab354ee7349"
+    },
+    {
+      "path": "scripts/database/phase7-migration-checksum.js",
+      "bytes": 1818,
+      "sha256": "f474590000963d02e848089075bca8e277285b76038b05bdca6aa5a5efa44054"
     },
     {
       "path": "scripts/database/phase7-role-preflight.js",
@@ -5832,6 +5837,11 @@
       "path": "src/services/phase7-lifecycle-archive-service.js",
       "bytes": 2715,
       "sha256": "9e5db5eacb330d74a421a1ab2c7a3a5ac3a0a06acaed27040b5514ffb2dfd8b7"
+    },
+    {
+      "path": "src/services/phase7-migration-checksum.test.js",
+      "bytes": 12082,
+      "sha256": "3be5631a0e72a965e027f836e59fc31a8f7d78652af80a61fdbe5d8b8054493f"
     },
     {
       "path": "src/services/phase7-obligation-handoff-service.js",
