@@ -68,5 +68,19 @@ async function main({db=require('../../src/prisma'),contract=process.argv.includ
   const storage=await require('../../src/services/phase7-legacy-storage-service').storageState(db);
   console.log(JSON.stringify({ok:true,fresh:plan.fresh,migrations:plan.names.length,storage}));return storage;
 }
-module.exports={main,migrationPlan,CONTRACT,PRE,POST};
-if(require.main===module){const db=require('../../src/prisma');main({db}).catch(e=>{if(e.phase7Diagnostics)console.error(JSON.stringify(e.phase7Diagnostics));console.error(e.code||e.message);process.exitCode=1;}).finally(()=>db.$disconnect());}
+function reportFailure(error,write=line=>console.error(line)){
+  const diagnostic=error.phase7Diagnostics;
+  if(diagnostic?.event==='PHASE7_ARCHIVE_PHYSICAL_SHAPE_MISMATCH'&&Array.isArray(diagnostic.tables)){
+    const {tables,...summary}=diagnostic;
+    write(JSON.stringify(summary));
+    // Emit every table and difference separately so one large JSON line cannot
+    // hide later mismatches in a hosted build log.
+    for(const {differences,...table} of tables){
+      write(JSON.stringify({event:'PHASE7_ARCHIVE_TABLE_SHAPE_DIFF',...table,totalDifferences:differences.length}));
+      for(const difference of differences)write(JSON.stringify({event:'PHASE7_ARCHIVE_SHAPE_DETAIL',table:table.table,...difference}));
+    }
+  }else if(diagnostic)write(JSON.stringify(diagnostic));
+  write(error.code||error.message);
+}
+module.exports={main,migrationPlan,reportFailure,CONTRACT,PRE,POST};
+if(require.main===module){const db=require('../../src/prisma');main({db}).catch(e=>{reportFailure(e);process.exitCode=1;}).finally(()=>db.$disconnect());}
