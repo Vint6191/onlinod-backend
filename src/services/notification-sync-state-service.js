@@ -1,5 +1,7 @@
 "use strict";
 
+const { observationStartForJob } = require("./analytics-observation-time");
+
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 const { collectionCommand, COLLECTOR_TYPES, withCollectorStateLock, commandAuthority, sameGeneration } = require("./analytics-collector-control-service");
@@ -264,10 +266,12 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
       ...(sourceTraversalComplete && mode === "full" ? {
         fullBackfillCompletedAt: existing?.fullBackfillCompletedAt || now,
         fullBackfillVerifiedAt: verified ? now : (trustedPriorFullHistoryVerifiedAt ? existing?.fullBackfillVerifiedAt : null),
+        fullBackfillObservedAt: verified ? observationStartForJob(job)
+          : (trustedPriorFullHistoryVerifiedAt ? existing?.fullBackfillObservedAt || null : null),
       } : {}),
       ...(sourceTraversalComplete && mode === "catchup" ? {
         lastCatchupCompletedAt: now,
-        ...(verified ? { lastCatchupVerifiedAt: now } : {}),
+        ...(verified ? { lastCatchupVerifiedAt: now, lastCatchupObservedAt: observationStartForJob(job) } : {}),
       } : {}),
     };
     return tx.creatorNotificationSyncState.upsert({

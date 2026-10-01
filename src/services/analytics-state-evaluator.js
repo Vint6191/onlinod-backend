@@ -105,6 +105,8 @@ function evaluateDurableCollectorState({
   baselineCompletedAt = null,
   baselineVerifiedAt = null,
   lastVerifiedAt = null,
+  baselineObservedAt = null,
+  lastObservedAt = null,
   retryAfterAt = null,
   now = new Date(),
   freshnessMs = null,
@@ -113,7 +115,8 @@ function evaluateDurableCollectorState({
   const normalizedStatus = String(status || "MISSING").toUpperCase();
   const completedAt = date(baselineCompletedAt) || date(baselineVerifiedAt);
   const provenAt = date(baselineVerifiedAt);
-  const proof = selectDurableCollectionProof({ baselineVerifiedAt: provenAt, catchupVerifiedAt: date(lastVerifiedAt), now: currentNow });
+  const proof = selectDurableCollectionProof({ baselineVerifiedAt: provenAt, catchupVerifiedAt: date(lastVerifiedAt),
+    baselineObservedAt, catchupObservedAt: lastObservedAt, now: currentNow });
   const verifiedAt = proof.latestAt;
   const complete = Boolean(completedAt);
   const trustedProvenAt = proof.baselineAt;

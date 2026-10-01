@@ -6,9 +6,11 @@ const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { CLAIMABLE_DESKTOP_JOB_KEYS } = require("./job-catalog");
 const { DEFAULT_CAMPAIGN_DIRECTORY_PAGE_SIZE } = require("./provider-capacity-sla-service");
+const { CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS } = require("./analytics-freshness-policy");
+const { directoryDiscoveryDeadline } = require("./analytics-observation-time");
 const { ID, GENERATION, assertCapacityProjectionCatalog } = require("./provider-capacity-catalog-contract");
 const SOURCE = Object.freeze({
-  directory: { table: "CreatorCampaignCollectionState", columns: '"id","baselineVerifiedAt","campaignDirectoryDiscoveryRequestedRevision","campaignDirectoryDiscoveryCompletedRevision","campaignDirectoryDiscoveryDueAt","campaignDirectoryCampaignCount"' },
+  directory: { table: "CreatorCampaignCollectionState", columns: '"id","baselineVerifiedAt","campaignDirectoryDiscoveryRequestedRevision","campaignDirectoryDiscoveryCompletedRevision","campaignDirectoryDiscoveryDueAt","campaignDirectoryCampaignCount","campaignDirectoryVerifiedAt","campaignDirectoryRequestedAt"' },
   fan: { table: "CreatorFanRefreshDemand", columns: '"id","requestedRevision","satisfiedRevision","lastRequestedAt"' },
   job: { table: "JobInstance", columns: '"id","jobKey","status","scheduledAt"' },
 });
@@ -24,7 +26,7 @@ function contributionFor(kind, row, now) {
   const c = { kind, sourceId: row.id, bucket: kind, itemCount: 0n, overdueCount: 0n, requiredCalls: 0n, oldestAt: null, nextDueAt: null };
   if (kind === "directory") {
     if (!row.baselineVerifiedAt) return null;
-    const dueAt = date(row.campaignDirectoryDiscoveryDueAt);
+    const dueAt = directoryDiscoveryDeadline(row, CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS, now);
     const due = integer(row.campaignDirectoryDiscoveryRequestedRevision) > integer(row.campaignDirectoryDiscoveryCompletedRevision) || !dueAt || dueAt <= now;
     c.itemCount = due ? 1n : 0n;
     c.overdueCount = dueAt && dueAt < now ? 1n : 0n;

@@ -261,7 +261,7 @@ test("earnings pages use protocol v4 and remain pending until completion proof",
   assert.equal(dailyUpserts[0].create.sourceScanRunId, "run-earnings-1");
   assert.deepEqual(harness.coverage.map((entry) => entry.create.status), ["PARTIAL", "PARTIAL"]);
   assert.equal(harness.coverage[0].create.lastErrorCode, "EARNINGS_SCAN_PENDING");
-  assert.equal(harness.coverage[1].create.lastErrorCode, "EARNINGS_SCAN_PENDING");
+  assert.equal(harness.coverage[1].create.lastErrorCode, "EARNINGS_DAY_IN_PROGRESS", "the source command day stays open even if this page arrives days later");
   assert.equal(harness.updated.at(-1).status, "COMMITTED");
   assert.equal(harness.updated.at(-1).receivedRows, 2);
   assert.equal(harness.updated.at(-1).insertedRows, 2);

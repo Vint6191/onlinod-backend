@@ -1,5 +1,8 @@
 "use strict";
 
+const { directoryObservationAt, directoryDiscoveryDeadline } = require("./analytics-observation-time");
+const { CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS } = require("./analytics-freshness-policy");
+
 // Phase 3 INT5.9A-14
 // Pure capacity arithmetic + honest Campaign-directory due/overdue projection.
 // This service does not schedule work and therefore cannot become a second
@@ -117,14 +120,13 @@ function providerScaleContract({
   };
 }
 
-function campaignDirectoryDiscoveryCapacityState(state, now = new Date(), targetMs = DEFAULT_CAMPAIGN_DIRECTORY_TARGET_MS) {
+function campaignDirectoryDiscoveryCapacityState(state, now = new Date(), targetMs = CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS) {
   const authorityNow = asDate(now) || new Date();
   const requestedRevision = Math.max(0, finiteInt(state?.campaignDirectoryDiscoveryRequestedRevision, 0, 0));
   const completedRevision = Math.max(0, finiteInt(state?.campaignDirectoryDiscoveryCompletedRevision, 0, 0));
   const pendingDemand = requestedRevision > completedRevision;
-  const verifiedAt = asDate(state?.campaignDirectoryVerifiedAt);
-  let dueAt = asDate(state?.campaignDirectoryDiscoveryDueAt);
-  if (!dueAt && verifiedAt) dueAt = new Date(verifiedAt.getTime() + Math.max(1, Number(targetMs) || DEFAULT_CAMPAIGN_DIRECTORY_TARGET_MS));
+  const verifiedAt = directoryObservationAt(state, authorityNow);
+  const dueAt = directoryDiscoveryDeadline(state, Math.max(1, Number(targetMs) || CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS), authorityNow);
   const campaignCount = Math.max(0, finiteInt(state?.campaignDirectoryCampaignCount, 0, 0));
   const overdueByMs = dueAt && authorityNow.getTime() > dueAt.getTime()
     ? authorityNow.getTime() - dueAt.getTime()

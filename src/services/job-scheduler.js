@@ -74,6 +74,8 @@ const {
   coverageManifestFingerprint,
 } = require("./phase2-coverage-manifest");
 const { stampCollectionAuthorityParams } = require("./analytics-collector-control-service");
+const { directoryDiscoveryDeadline } = require("./analytics-observation-time");
+const { CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS } = require("./analytics-freshness-policy");
 const { refreshProviderCapacityDebtSnapshot } = require("./provider-capacity-debt-authority-service");
 const {
   ensureOperationalAnalyticsFreshness,
@@ -1802,16 +1804,23 @@ async function selectCampaignDirectoryDiscoveryAdmissions({ db = prisma, now = n
   if (!Array.isArray(creatorIds) || creatorIds.length > 100) throw Object.assign(new Error("Discovery requires at most 100 explicit creators"), { code: "ANALYTICS_BOUNDED_SCOPE_REQUIRED" });
   const admittedCreatorIds = new Set();
   if (!creatorIds.length) return { admittedCreatorIds, estimatedProviderPages: 0, considered: 0 };
-  const candidates = await db.creatorCampaignCollectionState.findMany({
+  const rows = await db.creatorCampaignCollectionState.findMany({
+    // Explicit creator page is bounded at 100. Compare source age after reading
+    // this page; old stored dueAt values may describe publication time.
     where: { creatorId: { in: creatorIds }, baselineVerifiedAt: { not: null }, AND: [
-      { OR: [{ campaignDirectoryDiscoveryDueAt: null }, { campaignDirectoryDiscoveryDueAt: { lte: now } }] },
       { OR: [{ retryAfterAt: null }, { retryAfterAt: { lte: now } }] },
       { OR: [{ status: { not: "FAILED" } }, { retryAfterAt: { not: null } }] },
     ] },
     orderBy: [{ campaignDirectoryDiscoveryDueAt: { sort: "asc", nulls: "first" } }, { creatorId: "asc" }],
     take: creatorIds.length,
-    select: { creatorId: true, campaignDirectoryCampaignCount: true, status: true, retryAfterAt: true },
+    select: { creatorId: true, campaignDirectoryCampaignCount: true, status: true, retryAfterAt: true,
+      campaignDirectoryDiscoveryDueAt: true, campaignDirectoryRequestedAt: true, campaignDirectoryVerifiedAt: true,
+      campaignDirectoryDiscoveryRequestedRevision: true, campaignDirectoryDiscoveryCompletedRevision: true },
   });
+  const candidates = rows.map(row => ({ ...row, dueAt: directoryDiscoveryDeadline(row, CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS, now) }))
+    .filter(row => !row.dueAt || row.dueAt <= now
+      || row.campaignDirectoryDiscoveryRequestedRevision > row.campaignDirectoryDiscoveryCompletedRevision)
+    .sort((a, b) => Number(a.dueAt || 0) - Number(b.dueAt || 0) || a.creatorId.localeCompare(b.creatorId));
   const active = candidates.length ? await db.jobInstance.findMany({
     where: { creatorId: { in: candidates.map((r) => r.creatorId) }, jobKey: "fetch_campaigns", status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"] } },
     distinct: ["creatorId"], select: { creatorId: true }, take: candidates.length,

@@ -42,14 +42,28 @@ function trustedCollectionTimestamp(value, now = new Date()) {
 // FULL proves the historical baseline; either a later FULL or a verified
 // catch-up can refresh its head. Attempt status and completed-but-unverified
 // traversals are not proof. Keep the stored timestamps intact for provenance.
-function selectDurableCollectionProof({ baselineVerifiedAt = null, catchupVerifiedAt = null, now = new Date() } = {}) {
+function selectDurableCollectionProof({ baselineVerifiedAt = null, catchupVerifiedAt = null,
+  baselineObservedAt = null, catchupObservedAt = null, now = new Date() } = {}) {
   const baselineAt = trustedCollectionTimestamp(baselineVerifiedAt, now);
   const catchupAt = trustedCollectionTimestamp(catchupVerifiedAt, now);
-  const latestAt = baselineAt && catchupAt && catchupAt > baselineAt ? catchupAt : baselineAt;
+  const observed = (value, completedAt) => {
+    const at = trustedCollectionTimestamp(value, now);
+    return at && completedAt && at <= completedAt ? at : null;
+  };
+  const baselineObservationAt = observed(baselineObservedAt, baselineAt);
+  const catchupObservationAt = observed(catchupObservedAt, catchupAt);
+  // Completion proves that history is usable. Only a source observation proves
+  // freshness. Legacy rows without this evidence remain usable and due for a
+  // bounded catch-up; they must not lose their historical baseline.
+  const latestAt = !baselineAt ? null : baselineObservationAt && catchupObservationAt
+    ? new Date(Math.max(+baselineObservationAt, +catchupObservationAt))
+    : baselineObservationAt || catchupObservationAt;
   return Object.freeze({
     baselineAt,
+    baselineObservationAt,
     latestAt,
-    futurePoisoned: Boolean((baselineVerifiedAt && !baselineAt) || (catchupVerifiedAt && !catchupAt)),
+    futurePoisoned: Boolean((baselineVerifiedAt && !baselineAt) || (catchupVerifiedAt && !catchupAt)
+      || (baselineObservedAt && !baselineObservationAt) || (catchupObservedAt && !catchupObservationAt)),
   });
 }
 

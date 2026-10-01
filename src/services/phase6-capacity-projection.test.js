@@ -7,9 +7,9 @@ const now = new Date('2026-09-29T00:00:00.000Z');
 const directory = (extra={}) => ({id:'d',baselineVerifiedAt:now,campaignDirectoryDiscoveryRequestedRevision:0,campaignDirectoryDiscoveryCompletedRevision:0,campaignDirectoryCampaignCount:100,...extra});
 
 test('B1 exact due boundary schedules the later overdue transition',()=>{
- const c=contributionFor('directory',directory({campaignDirectoryDiscoveryDueAt:now}),now);
+ const c=contributionFor('directory',directory({campaignDirectoryDiscoveryDueAt:now,campaignDirectoryVerifiedAt:new Date(+now-72*3600000),campaignDirectoryRequestedAt:new Date(+now-72*3600000)}),now);
  assert.equal(c.itemCount,1n); assert.equal(c.overdueCount,0n); assert.equal(c.nextDueAt.getTime(),now.getTime()+1);
- const later=contributionFor('directory',directory({campaignDirectoryDiscoveryDueAt:now}),new Date(now.getTime()+1));
+ const later=contributionFor('directory',directory({campaignDirectoryDiscoveryDueAt:now,campaignDirectoryVerifiedAt:new Date(+now-72*3600000),campaignDirectoryRequestedAt:new Date(+now-72*3600000)}),new Date(now.getTime()+1));
  assert.equal(later.overdueCount,1n); assert.equal(later.nextDueAt,null);
 });
 test('B1 unverified directory contributes nothing; null due and explicit demand contribute',()=>{

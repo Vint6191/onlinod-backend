@@ -1,4 +1,6 @@
 "use strict";
+
+const { observationStartForJob } = require("./analytics-observation-time");
 const { runDbTransaction } = require("./db-transaction-service");
 
 
@@ -578,7 +580,8 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
     let inserted = 0;
     let updated = 0;
     let unchanged = 0;
-    const currentDay = utcDay(serverReceivedAt);
+    const observationStartedAt = observationStartForJob(job);
+    const currentDay = utcDay(observationStartedAt || serverReceivedAt);
     for (const row of rows) {
       const where = { creatorId_date_sourceTimezone: { creatorId: job.creatorId, date: row.date, sourceTimezone: row.sourceTimezone } };
       const existing = await tx.creatorEarningsDaily.findUnique({
@@ -617,7 +620,7 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
         coveredFromAt: row.date,
         coveredToAt: isCurrentDay ? serverReceivedAt : utcDayEnd(row.date),
         errorCode: isCurrentDay ? "EARNINGS_DAY_IN_PROGRESS" : "EARNINGS_SCAN_PENDING",
-        verifiedAt: serverReceivedAt,
+        verifiedAt: observationStartedAt,
       });
     }
     const rejected = scannerRejected + rejectedRows;
@@ -765,6 +768,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result, public
           data: {
             status: desiredStatus,
             proofVersion: 2,
+            observationStartedAt: scanProof.observationStartedAt || observationStartForJob(job),
             committedAt: desiredStatus === "COMMITTED" ? serverReceivedAt : null,
             serverReceivedAt,
             clientObservedAt: observedAt,
@@ -786,6 +790,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result, public
           scanFrom: requestedRange.dayStart,
           scanTo: requestedRange.dayEnd,
           requestedAt: requestedRange.contract.requestedAt,
+          observationStartedAt: observationStartForJob(job),
           clientObservedAt: observedAt,
           serverReceivedAt,
           committedAt: desiredStatus === "COMMITTED" ? serverReceivedAt : null,
@@ -829,7 +834,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result, public
         data: {
           status: "COMPLETE",
           scanProofId: scanProof.id,
-          lastVerifiedAt: serverReceivedAt,
+          lastVerifiedAt: observationStartForJob(job),
           lastErrorCode: null,
           lastErrorMessage: null,
           retryAfterAt: null,
@@ -1360,8 +1365,9 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         },
         data: {
           claimerVerifiedRevision: verifiedRevision,
-          claimersVerifiedAt: serverReceivedAt,
-          claimersNextDueAt: new Date(serverReceivedAt.getTime() + verificationIntervalMs),
+          claimersVerifiedAt: observationStartForJob(job),
+          claimersNextDueAt: observationStartForJob(job)
+            ? new Date(observationStartForJob(job).getTime() + verificationIntervalMs) : serverReceivedAt,
           claimersLastVerifiedRunId: scanRunId,
           claimersTargetRunId: null,
         },
@@ -1788,7 +1794,8 @@ async function campaignDirectoryAuthority(tx, { job, command, scanRunId, durable
         where: { creatorId: job.creatorId },
         data: {
           campaignDirectoryDiscoveryCompletedRevision: requestedDiscoveryRevision,
-          campaignDirectoryDiscoveryDueAt: new Date(now.getTime() + CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS),
+          campaignDirectoryDiscoveryDueAt: observationStartForJob(job)
+            ? new Date(observationStartForJob(job).getTime() + CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS) : now,
         },
       });
     }
@@ -1801,11 +1808,12 @@ async function campaignDirectoryAuthority(tx, { job, command, scanRunId, durable
     data: {
       campaignDirectoryGeneration: scanRunId,
       campaignDirectoryRequestedAt: command.requestedAt,
-      campaignDirectoryVerifiedAt: now,
+      campaignDirectoryVerifiedAt: observationStartForJob(job),
       campaignDirectoryRevision: revision,
       campaignDirectoryCampaignCount: campaignCount,
       campaignDirectoryDiscoveryCompletedRevision: requestedDiscoveryRevision,
-      campaignDirectoryDiscoveryDueAt: new Date(now.getTime() + CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS),
+      campaignDirectoryDiscoveryDueAt: observationStartForJob(job)
+            ? new Date(observationStartForJob(job).getTime() + CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS) : now,
     },
   });
   return { generation: scanRunId, requestedAt: command.requestedAt, revision: Number(updated?.campaignDirectoryRevision || revision), campaignCount, reused: false };
@@ -2496,10 +2504,12 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
       ignoredEvents: notificationSync.ignoredEvents,
       fullBackfillCompletedAt: notificationSync.fullBackfillCompletedAt,
       fullBackfillVerifiedAt: notificationSync.fullBackfillVerifiedAt,
+      fullBackfillObservedAt: notificationSync.fullBackfillObservedAt,
       oldestOccurredAt: notificationSync.oldestOccurredAt,
       newestOccurredAt: notificationSync.newestOccurredAt,
       lastCatchupCompletedAt: notificationSync.lastCatchupCompletedAt,
       lastCatchupVerifiedAt: notificationSync.lastCatchupVerifiedAt,
+      lastCatchupObservedAt: notificationSync.lastCatchupObservedAt,
       retryAfterAt: notificationSync.retryAfterAt,
       lastSocketEventAt: notificationSync.lastSocketEventAt,
       lastErrorCode: notificationSync.lastErrorCode,

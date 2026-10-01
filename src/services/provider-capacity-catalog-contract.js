@@ -4,7 +4,7 @@
 // are explicit forward migrations, never a self-upgrade by a running replica.
 const { CLAIMABLE_DESKTOP_JOB_KEYS } = require("./job-catalog");
 const ID = "of-global-capacity-v1";
-const GENERATION = "phase6_capacity_incremental_v1";
+const GENERATION = "phase6_capacity_observation_v2";
 const EXPECTED_KEYS = Object.freeze([...CLAIMABLE_DESKTOP_JOB_KEYS].sort());
 const fail = code => Object.assign(new Error(code), { code });
 

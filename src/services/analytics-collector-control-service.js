@@ -5,6 +5,7 @@ const prisma = require("../prisma");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { selectDurableCollectionProof } = require("./analytics-freshness-policy");
+const { stampObservationStart, observationStartForJob, parseObservationTime } = require("./analytics-observation-time");
 const { campaignTransactionLockKey } = require("./campaign-transaction-lock-service");
 
 const COLLECTION_CONTRACT_VERSION = 1;
@@ -58,7 +59,13 @@ function collectorPlanningProofAt(collectorType, collectionMode, state, now = ne
     baselineVerifiedAt = state?.baselineVerifiedAt;
     catchupVerifiedAt = state?.lastCatchupCompletedAt;
   } else return null;
-  const proof = selectDurableCollectionProof({ baselineVerifiedAt, catchupVerifiedAt, now });
+  const baselineObservedAt = collectorType === COLLECTOR_TYPES.NOTIFICATIONS
+    ? state?.fullBackfillObservedAt : state?.baselineObservedAt;
+  const proof = selectDurableCollectionProof({ baselineVerifiedAt, catchupVerifiedAt,
+    baselineObservedAt, catchupObservedAt: state?.lastCatchupObservedAt, now });
+  // FULL callers use this as the historical-baseline readiness/dedupe proof;
+  // missing source age must not send a migrated creator through full history.
+  // Catch-up admission is the independent freshness decision.
   return requestedMode === "catchup" ? proof.latestAt : proof.baselineAt;
 }
 
@@ -112,7 +119,7 @@ function stampCollectionAuthorityParams(params, authorityNow, orderingAfter = nu
     ? new Date(previous.getTime() + 1)
     : at;
   const type = clean(source.collectionType, 40);
-  const stamped = { ...source, collectionAuthorityRequestedAt: orderingAt.toISOString() };
+  const stamped = stampObservationStart({ ...source, collectionAuthorityRequestedAt: orderingAt.toISOString() }, at);
   if (type === COLLECTOR_TYPES.FINANCIAL) {
     const marker = Math.floor(at.getTime() / 1000);
     stamped.initialMarker = marker;
@@ -231,6 +238,9 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
     }
     const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const success = complete === true;
+    const sourceStart = observationStartForJob(job);
+    const end = parseObservationTime(rangeTo);
+    const observedAt = sourceStart && end ? new Date(Math.min(+sourceStart, +end)) : sourceStart;
     const common = {
       status: success ? "COMPLETE" : "PARTIAL", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt,
       retryAfterAt: null, lastErrorCode: success ? null : "FINANCIAL_COLLECTION_PARTIAL",
@@ -238,9 +248,9 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
       sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220),
     };
     const successData = success && command.mode === "full" ? {
-      baselineVerifiedAt: now, baselineGeneration: command.generation, baselineRangeFrom: date(rangeFrom), baselineRangeTo: date(rangeTo),
+      baselineVerifiedAt: now, baselineObservedAt: observedAt, baselineGeneration: command.generation, baselineRangeFrom: date(rangeFrom), baselineRangeTo: date(rangeTo),
     } : success && command.mode === "catchup" ? {
-      lastCatchupCompletedAt: now, lastCatchupGeneration: command.generation, lastBoundary: clean(boundary, 220),
+      lastCatchupCompletedAt: now, lastCatchupObservedAt: observedAt, lastCatchupGeneration: command.generation, lastBoundary: clean(boundary, 220),
     } : {};
     const state = await tx.creatorFinancialCollectionState.upsert({
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData }, update: { ...common, ...successData },
@@ -281,7 +291,7 @@ async function acceptCampaignGeneration({ db = prisma, job, deviceId = null, cam
     const coverageAuthority = campaignFanCoverageAuthorityFromJob(job);
     const data = {
       status: "SCANNING", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: null,
-      membershipCoverageStatus: "SCANNING", membershipCoverageCompletedAt: null,
+      membershipCoverageStatus: "SCANNING", membershipCoverageCompletedAt: null, membershipObservedAt: null,
       fanValueCoverageScanRunId: command.generation,
       fanValueCoverageDelegated: coverageAuthority.delegated,
       fanValueCoverageOwnerKind: coverageAuthority.ownerKind,
@@ -321,6 +331,7 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
       fanValueCoverageCollectorVersion: coverageAuthority.collectorVersion, fanValueCoverageSourceJobId: coverageAuthority.sourceJobId,
       membershipCoverageStatus: membershipComplete ? "COMPLETE" : "PARTIAL",
       membershipCoverageCompletedAt: membershipComplete ? now : null,
+      membershipObservedAt: membershipComplete ? observationStartForJob(job) : null,
       retryAfterAt: null,
       lastErrorCode: success ? null : (membershipComplete ? "CAMPAIGN_FAN_VALUE_REFRESH_PENDING" : "CAMPAIGN_COLLECTION_PARTIAL"),
       lastErrorMessage: success ? null : (membershipComplete
@@ -328,8 +339,9 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
         : "Campaign collection did not prove all requested campaign/claimer frontiers"),
       sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220), ...(success ? { lastCompleteScanRunId: clean(scanRunId, 120) } : {}),
     };
-    const successData = success && command.mode === "full" ? { baselineVerifiedAt: now, baselineGeneration: command.generation }
-      : success && command.mode === "catchup" ? { lastCatchupCompletedAt: now, lastCatchupGeneration: command.generation } : {};
+    const observedAt = observationStartForJob(job);
+    const successData = success && command.mode === "full" ? { baselineVerifiedAt: now, baselineObservedAt: observedAt, baselineGeneration: command.generation }
+      : success && command.mode === "catchup" ? { lastCatchupCompletedAt: now, lastCatchupObservedAt: observedAt, lastCatchupGeneration: command.generation } : {};
     const state = await tx.creatorCampaignCollectionState.upsert({
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData }, update: { ...common, ...successData },
     });

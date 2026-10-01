@@ -68,7 +68,9 @@ test("collection planning identity excludes trigger provenance and random comman
   const state = {
     activeGeneration: "accepted-generation",
     baselineVerifiedAt: new Date("2026-09-08T19:00:00.000Z"),
+    baselineObservedAt: new Date("2026-09-08T19:00:00.000Z"),
     lastCatchupCompletedAt: new Date("2026-09-08T20:00:00.000Z"),
+    lastCatchupObservedAt: new Date("2026-09-08T20:00:00.000Z"),
     activeRequestedAt: new Date("2026-09-08T20:01:00.123Z"),
   };
   assert.deepEqual(buildCollectionPlanningDedupeParams({

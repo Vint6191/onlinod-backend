@@ -7,6 +7,7 @@ const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-servi
 const { acquireCampaignTransactionLock } = require("./campaign-transaction-lock-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { collectionCommand, COLLECTOR_TYPES } = require("./analytics-collector-control-service");
+const { stampObservationStart, observationStartForJob } = require("./analytics-observation-time");
 const { publishDomainWork, claimDomainWorkBatch, lockDomainWorkClaimForCommit,
   ackDomainWorkClaim, yieldDomainWorkClaim, failDomainWorkClaim } = require("./domain-work-authority-service");
 
@@ -159,7 +160,7 @@ async function earningsUnit(db, job, row, now) {
       if (proof.complete) await db.analyticsCoverage.updateMany({ where: { ...where, id: { in: ids },
         coverageDate: { gte: input.startDate, lte: input.endDate, lt: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate())) },
         status: "PARTIAL", lastErrorCode: "EARNINGS_SCAN_PENDING" }, data: {
-        status: "COMPLETE", lastVerifiedAt: now, lastErrorCode: null, lastErrorMessage: null, retryAfterAt: null,
+        status: "COMPLETE", lastVerifiedAt: observationStartForJob(job), lastErrorCode: null, lastErrorMessage: null, retryAfterAt: null,
       } });
     }
     return save(db, row, { cursor: rows.length === PAGE ? nextCursor(rows) : {}, stage: rows.length === PAGE ? row.stage : "FINALIZE" }, now);
@@ -224,7 +225,7 @@ function repairParams(job, now) {
   if (job.jobKey === "fetch_earnings") {
     const old = new Date(previous.authorityRequestedAt || previous.requestedAt);
     const next = new Date(Math.max(now.getTime(), old.getTime() + 1));
-    return { ...previous, requestedAt: now.toISOString(), authorityRequestedAt: next.toISOString(), scanGeneration: crypto.randomUUID() };
+    return stampObservationStart({ ...previous, requestedAt: now.toISOString(), authorityRequestedAt: next.toISOString(), scanGeneration: crypto.randomUUID() }, now);
   }
   const control = require("./analytics-collector-control-service");
   const type = job.jobKey === "fetch_campaigns" ? COLLECTOR_TYPES.CAMPAIGNS : COLLECTOR_TYPES.FINANCIAL;

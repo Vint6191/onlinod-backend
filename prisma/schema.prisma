@@ -2052,8 +2052,10 @@ model CreatorNotificationSyncState {
   ignoredEvents           Int                     @default(0)
   fullBackfillCompletedAt DateTime?
   fullBackfillVerifiedAt  DateTime?
+  fullBackfillObservedAt  DateTime?
   lastCatchupCompletedAt  DateTime?
   lastCatchupVerifiedAt   DateTime?
+  lastCatchupObservedAt   DateTime?
   lastSocketEventAt       DateTime?
   knownNotificationIds    Json                    @default("[]")
   lastErrorCode           String?
@@ -2080,10 +2082,12 @@ model CreatorFinancialCollectionState {
   activeGeneration       String?
   activeRequestedAt      DateTime?
   baselineVerifiedAt     DateTime?
+  baselineObservedAt     DateTime?
   baselineGeneration     String?
   baselineRangeFrom      DateTime?
   baselineRangeTo        DateTime?
   lastCatchupCompletedAt DateTime?
+  lastCatchupObservedAt  DateTime?
   lastCatchupGeneration  String?
   lastBoundary           String?
   retryAfterAt           DateTime?
@@ -2200,8 +2204,10 @@ model CreatorCampaignCollectionState {
   activeGeneration                            String?
   activeRequestedAt                           DateTime?
   baselineVerifiedAt                          DateTime?
+  baselineObservedAt                          DateTime?
   baselineGeneration                          String?
   lastCatchupCompletedAt                      DateTime?
+  lastCatchupObservedAt                       DateTime?
   lastCatchupGeneration                       String?
   lastCompleteScanRunId                       String?
   campaignProofScanRunId                      String?                 @db.VarChar(120)
@@ -2212,6 +2218,7 @@ model CreatorCampaignCollectionState {
   campaignProofRejectedRows                   Int                     @default(0)
   membershipCoverageStatus                    AnalyticsCoverageStatus @default(MISSING)
   membershipCoverageCompletedAt               DateTime?
+  membershipObservedAt                        DateTime?
   fanValueCoverageScanRunId                   String?                 @db.VarChar(120)
   fanValueCoverageDelegated                   Boolean                 @default(false)
   fanValueCoverageOwnerKind                   String?                 @db.VarChar(32)
@@ -2384,6 +2391,7 @@ model AnalyticsScanProof {
   scanFrom         DateTime              @db.Date
   scanTo           DateTime              @db.Date
   requestedAt      DateTime
+  observationStartedAt DateTime?
   clientObservedAt DateTime?
   serverReceivedAt DateTime
   committedAt      DateTime?

@@ -47,7 +47,7 @@ async function freshness(db, creator) {
     workClass: { in: ["TRAFFIC_FAN", "TRAFFIC_BACKFILL"] }, isOutstanding: true }, select: { id: true, state: true, lastError: true } });
   const coverage = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: creator.id }, select: {
     status: true, membershipCoverageStatus: true, baselineVerifiedAt: true, lastCatchupCompletedAt: true,
-    membershipCoverageCompletedAt: true, fanValueFreshnessStatus: true, retryAfterAt: true,
+    membershipCoverageCompletedAt: true, membershipObservedAt: true, baselineObservedAt: true, lastCatchupObservedAt: true, fanValueFreshnessStatus: true, retryAfterAt: true,
   } });
   return { providerCoverage: coverage, ready: Boolean(state?.completedAt) && !pending, rebuilding: !state?.completedAt,
     pending: Boolean(pending), failure: pending?.state === "RECONCILE_REQUIRED" ? pending.lastError : null,

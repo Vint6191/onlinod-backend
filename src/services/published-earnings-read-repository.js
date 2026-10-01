@@ -1,6 +1,7 @@
 "use strict";
 
 const { COLLECTION_FUTURE_SKEW_TOLERANCE_MS } = require("./analytics-freshness-policy");
+const { earningsObservationSql } = require("./analytics-observation-time");
 const CREATOR_BATCH = 250;
 const DAY = 86400000;
 
@@ -34,18 +35,18 @@ async function readPublishedEarningsDays({ db, creatorId, from, to, now }) {
   const today = new Date(now.toISOString().slice(0, 10));
   const rows = await db.$queryRawUnsafe(`/* published_earnings_days_v1 */
     WITH published AS MATERIALIZED (
-      SELECT d.* FROM "CreatorEarningsDaily" d ${publishedEarningsJoins()}
+      SELECT d.*,${earningsObservationSql()} AS "publishedObservedAt" FROM "CreatorEarningsDaily" d ${publishedEarningsJoins()}
       WHERE d."creatorId"=$1 AND d."sourceTimezone"='UTC' AND d."date" BETWEEN $2::date AND $3::date
         AND (v."status"='COMPLETE' OR (d."date"=$4::date AND v."status"='PARTIAL'))
     )
-    SELECT d.*,c."coverageDate" AS "stateDate",c."status" AS "coverageStatus",c."lastVerifiedAt" AS "coverageVerifiedAt",
+    SELECT d.*,c."coverageDate" AS "stateDate",c."status" AS "coverageStatus",d."publishedObservedAt" AS "coverageVerifiedAt",
       c."retryAfterAt" AS "coverageRetryAfterAt",c."lastErrorCode" AS "coverageErrorCode"
     FROM "AnalyticsCoverage" c LEFT JOIN published d ON d."creatorId"=c."creatorId" AND d."date"=c."coverageDate"
     WHERE c."creatorId"=$1 AND c."dataType"='EARNINGS' AND c."sourceTimezone"='UTC'
       AND c."coverageDate" BETWEEN $2::date AND $3::date ORDER BY c."coverageDate"`, creatorId, from, to, today);
   // Retry/partial hints survive even when amounts are unavailable. They can
   // never certify money: only the joined published row supplies proof status.
-  return rows.map(({ stateDate, coverageStatus, coverageVerifiedAt, coverageRetryAfterAt, coverageErrorCode, ...daily }) => ({
+  return rows.map(({ stateDate, coverageStatus, coverageVerifiedAt, coverageRetryAfterAt, coverageErrorCode, publishedObservedAt, ...daily }) => ({
     daily: daily.id ? daily : null,
     coverage: { coverageDate: stateDate, status: coverageStatus, lastVerifiedAt: coverageVerifiedAt,
       retryAfterAt: coverageRetryAfterAt, lastErrorCode: coverageErrorCode, scanProofId: daily.scanProofId,
@@ -65,7 +66,7 @@ async function readPublishedEarningsAggregates({ db, creatorIds, from, to, now, 
     const batch = await db.$queryRawUnsafe(`/* published_earnings_aggregate_v1 */
       SELECT d."creatorId",COUNT(*)::bigint AS days,SUM(d."totalCents")::bigint AS cents,
         MAX(d."collectedAt") AS captured,
-        COUNT(*) FILTER (WHERE v."lastVerifiedAt" BETWEEN $4::timestamp AND $5::timestamp)::bigint AS fresh
+        COUNT(*) FILTER (WHERE ${earningsObservationSql()} BETWEEN $4::timestamp AND $5::timestamp)::bigint AS fresh
       FROM "CreatorEarningsDaily" d ${publishedEarningsJoins()}
       WHERE d."creatorId"=ANY($1::text[]) AND d."sourceTimezone"='UTC' AND d."date" BETWEEN $2::date AND $3::date
         AND v."status"='COMPLETE'

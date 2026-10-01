@@ -73,7 +73,7 @@ test("A15 persistence is a typed singleton projection with monotonic revision", 
       if (/pg_try_advisory_xact_lock/.test(sql)) return [{ acquired: true }];
       if (/SELECT clock_timestamp/.test(sql)) return [{ authorityNow: new Date("2026-09-29T00:00:00Z") }];
       if (/SELECT \* FROM "ProviderCapacityProjectionState"/.test(sql)) return [{
-        generation: "phase6_capacity_incremental_v1", jobKeys: require("./job-catalog").CLAIMABLE_DESKTOP_JOB_KEYS,
+        generation: require("./provider-capacity-projection-service").GENERATION, jobKeys: require("./job-catalog").CLAIMABLE_DESKTOP_JOB_KEYS,
         directoryComplete: true, fanComplete: true, jobComplete: true,
       }];
       if (/WITH background_other AS/.test(sql)) return [{ revision: 7n, projectionComplete: true, dueCreators: 1n, overdueCreators: 1n, requiredCalls: 41n, unsatisfiedDemands: 5000n, pendingJobs: 32n }];

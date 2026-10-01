@@ -1,6 +1,7 @@
 "use strict";
 const { scopeSql, scopeParams } = require('./home-scope-repository');
 const { CURRENT_DAY_FRESHNESS_MS, RECENT_CLOSED_FRESHNESS_MS, HISTORICAL_FRESHNESS_MS } = require('./analytics-freshness-policy');
+const { earningsObservationSql } = require('./analytics-observation-time');
 const MAX_PAGE_SIZE = 100;
 function pageInput({ after = null, limit = 50 } = {}) {
   if (after != null && (typeof after !== 'string' || after.length > 180 || /[\x00-\x1f]/.test(after))) {
@@ -19,9 +20,9 @@ function revenueSql(source = 'visible') {
   return `, periods AS (SELECT 0 AS period,$6::date AS start_day,$7::date AS end_day
     UNION ALL SELECT 1,$8::date,$9::date),
   daily AS MATERIALIZED (
-    SELECT d."creatorId",r.period,d."date",d."totalCents",d."collectedAt",
-      (v."lastVerifiedAt"<=$11::timestamp+interval '5 minutes'
-        AND v."lastVerifiedAt">=$11::timestamp-(CASE WHEN d."date"=$10::date THEN ${CURRENT_DAY_FRESHNESS_MS}
+    SELECT d."creatorId",r.period,d."date",d."totalCents",d."collectedAt",${earningsObservationSql()} AS observed,
+      (${earningsObservationSql()}<=$11::timestamp+interval '5 minutes'
+        AND ${earningsObservationSql()}>=$11::timestamp-(CASE WHEN d."date"=$10::date THEN ${CURRENT_DAY_FRESHNESS_MS}
           WHEN d."date">=$10::date-30 THEN ${RECENT_CLOSED_FRESHNESS_MS} ELSE ${HISTORICAL_FRESHNESS_MS} END)*interval '1 millisecond') AS fresh
     FROM ${source} c JOIN "CreatorEarningsDaily" d ON d."creatorId"=c."id" AND d."agencyId"=$1 AND d."sourceTimezone"='UTC'
       JOIN periods r ON d."date" BETWEEN r.start_day AND r.end_day
@@ -29,10 +30,10 @@ function revenueSql(source = 'visible') {
     WHERE v."status"='COMPLETE' OR (d."date"=$10::date AND v."status"='PARTIAL')
   ), earnings AS (
     SELECT "creatorId",period,COUNT(*) AS days,COUNT(*) FILTER (WHERE fresh) AS fresh_days,
-      SUM("totalCents") AS cents,MAX("collectedAt") AS captured FROM daily GROUP BY "creatorId",period
+      SUM("totalCents") AS cents,MAX("collectedAt") AS captured,MIN(observed) AS observed FROM daily GROUP BY "creatorId",period
   ), facts AS MATERIALIZED (
     SELECT c."id",r.period,(COALESCE(e.days,0)=r.end_day-r.start_day+1) AS usable,
-      (COALESCE(e.fresh_days,0)=r.end_day-r.start_day+1) AS fresh,COALESCE(e.cents,0) AS cents,e.captured
+      (COALESCE(e.fresh_days,0)=r.end_day-r.start_day+1) AS fresh,COALESCE(e.cents,0) AS cents,e.captured,e.observed
     FROM ${source} c CROSS JOIN periods r LEFT JOIN earnings e ON e."creatorId"=c."id" AND e.period=r.period
   )`;
 }
@@ -95,7 +96,7 @@ async function readHomeCreatorPage(input) {
   const prefix = `${scopeSql({ cursor:true, cursorParameter:12, broad:typeof input.member.broad === "boolean" ? input.member.broad : null })}, page_candidates AS MATERIALIZED (SELECT "id","displayName","username","avatarUrl","status","remoteId" FROM visible
     WHERE "id">$12::text ORDER BY "id" LIMIT $13), page AS MATERIALIZED (SELECT * FROM page_candidates ORDER BY "id" LIMIT $14)`;
   const sql = money ? `${prefix}${revenueSql('page')}${pendingSql('page')}
-    SELECT c.*,f.usable,f.fresh,f.cents,f.captured,(p."id" IS NOT NULL) AS pending,
+    SELECT c.*,f.usable,f.fresh,f.cents,f.captured,f.observed,(p."id" IS NOT NULL) AS pending,
       (SELECT COUNT(*)>$14 FROM page_candidates) AS more FROM page c
     JOIN facts f ON f."id"=c."id" AND f.period=0 LEFT JOIN pending p ON p."id"=c."id" ORDER BY c."id"`
     : `${prefix} SELECT c.*,false AS usable,false AS fresh,false AS pending,(SELECT COUNT(*)>$14 FROM page_candidates) AS more FROM page c ORDER BY c."id"`;
@@ -105,7 +106,7 @@ async function readHomeCreatorPage(input) {
   const creators = rows.map(c=>({id:c.id,name:c.displayName,displayName:c.displayName,username:c.username,avatarUrl:c.avatarUrl,status:c.status,remoteId:c.remoteId,
     revenueCents:c.usable?number(c.cents):null,salesCount:null,uniqueFans:null,capturedAt:c.usable?c.captured:null,
     hasRevenue:c.usable===true,pending:c.pending===true,stale:c.usable===true&&!c.fresh,
-    staleSeconds:c.usable&&!c.fresh&&c.captured?Math.max(0,Math.floor((input.now-new Date(c.captured))/1000)):null}));
+    staleSeconds:c.usable&&!c.fresh&&c.observed?Math.max(0,Math.floor((input.now-new Date(c.observed))/1000)):null}));
   return { creators, nextCursor:rows[0]?.more?rows.at(-1).id:null, limit:page.limit, order:'id_asc' };
 }
 async function readHomeJobCounts(input) {

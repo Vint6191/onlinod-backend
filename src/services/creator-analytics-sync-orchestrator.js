@@ -1,5 +1,7 @@
 "use strict";
 
+const { directoryObservationAt, directoryDiscoveryDeadline } = require("./analytics-observation-time");
+
 const prisma = require("../prisma");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { buildNotificationScanParams, loadNotificationSyncState } = require("./notification-sync-state-service");
@@ -222,11 +224,10 @@ function campaignDirectoryDiscoveryPending(state) {
 function campaignDirectoryDiscoveryDue(state, now = new Date()) {
   if (!state) return true;
   if (campaignDirectoryDiscoveryPending(state)) return true;
-  const explicitDueAt = state?.campaignDirectoryDiscoveryDueAt ? new Date(state.campaignDirectoryDiscoveryDueAt) : null;
-  if (explicitDueAt && Number.isFinite(explicitDueAt.getTime())) return explicitDueAt.getTime() <= now.getTime();
-  const verifiedAt = trustedCollectionTimestamp(state?.campaignDirectoryVerifiedAt, now);
+  const verifiedAt = directoryObservationAt(state, now);
   if (!verifiedAt) return true;
-  return verifiedAt.getTime() <= now.getTime() - CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS;
+  const dueAt = directoryDiscoveryDeadline(state, CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS, now);
+  return !dueAt || dueAt.getTime() <= now.getTime();
 }
 
 function campaignFrontierWorkDue(state, now = new Date()) {
@@ -239,7 +240,7 @@ function campaignDirectoryReuseBinding(state, now = new Date()) {
   if (campaignDirectoryDiscoveryDue(state, now)) return null;
   const generation = clean(state?.campaignDirectoryGeneration, 120);
   const requestedAt = state?.campaignDirectoryRequestedAt ? new Date(state.campaignDirectoryRequestedAt) : null;
-  const verifiedAt = state?.campaignDirectoryVerifiedAt ? new Date(state.campaignDirectoryVerifiedAt) : null;
+  const verifiedAt = directoryObservationAt(state, now);
   const revision = Number(state?.campaignDirectoryRevision || 0);
   const campaignCount = Number(state?.campaignDirectoryCampaignCount || 0);
   if (!generation || !requestedAt || !Number.isFinite(requestedAt.getTime()) || !verifiedProofTimestampReady(verifiedAt, now)) return null;

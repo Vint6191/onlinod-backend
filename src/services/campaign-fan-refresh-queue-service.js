@@ -294,9 +294,11 @@ async function reconcileCampaignFanValueCoverage({ db, creatorId, scanRunId, now
     update.lastCompleteScanRunId = scanRunId;
     if (String(state.mode || "") === "full") {
       update.baselineVerifiedAt = effectiveNow;
+      update.baselineObservedAt = state.membershipObservedAt || null;
       update.baselineGeneration = state.activeGeneration;
     } else if (String(state.mode || "") === "catchup") {
       update.lastCatchupCompletedAt = effectiveNow;
+      update.lastCatchupObservedAt = state.membershipObservedAt || null;
       update.lastCatchupGeneration = state.activeGeneration;
     }
   }
@@ -556,6 +558,13 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
              AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
              AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
               THEN $3 ELSE s."baselineVerifiedAt" END,
+          "baselineObservedAt" = CASE
+            WHEN s."mode" = 'full'
+             AND s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
+             AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+              THEN s."membershipObservedAt" ELSE s."baselineObservedAt" END,
           "baselineGeneration" = CASE
             WHEN s."mode" = 'full'
              AND s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
@@ -570,6 +579,13 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
              AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
              AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
               THEN $3 ELSE s."lastCatchupCompletedAt" END,
+          "lastCatchupObservedAt" = CASE
+            WHEN s."mode" = 'catchup'
+             AND s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
+             AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
+             AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+              THEN s."membershipObservedAt" ELSE s."lastCatchupObservedAt" END,
           "lastCatchupGeneration" = CASE
             WHEN s."mode" = 'catchup'
              AND s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"

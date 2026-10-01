@@ -17,7 +17,8 @@ const {
   providerCategoryGuaranteedStartsPerHour,
   estimatedCampaignDirectoryCalls,
 } = require("./provider-capacity-sla-service");
-const { CAMPAIGN_FAN_VALUE_FRESHNESS_MS } = require("./analytics-freshness-policy");
+const { CAMPAIGN_FAN_VALUE_FRESHNESS_MS, CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS,
+  COLLECTION_FUTURE_SKEW_TOLERANCE_MS } = require("./analytics-freshness-policy");
 const { CLAIMABLE_DESKTOP_JOB_KEYS } = require("./job-catalog");
 const {
   providerCapacityTopologyContract,
@@ -214,40 +215,46 @@ async function readCanonicalCapacityInputs({ db, now = new Date() } = {}) {
   }
   const authorityNow = asDate(now) || new Date();
   const rows = await db.$queryRawUnsafe(`
-    WITH directory AS (
+    WITH source_directory AS (
+      SELECT *,CASE WHEN "campaignDirectoryVerifiedAt" IS NOT NULL AND "campaignDirectoryRequestedAt" IS NOT NULL
+        AND LEAST("campaignDirectoryVerifiedAt","campaignDirectoryRequestedAt") <= $1::timestamp + ${COLLECTION_FUTURE_SKEW_TOLERANCE_MS} * interval '1 millisecond'
+        THEN LEAST("campaignDirectoryDiscoveryDueAt", LEAST("campaignDirectoryVerifiedAt","campaignDirectoryRequestedAt")
+          + $4::bigint * interval '1 millisecond') ELSE NULL END AS "observationDueAt"
+      FROM "CreatorCampaignCollectionState"
+    ), directory AS (
       SELECT
         COUNT(*) FILTER (
           WHERE "baselineVerifiedAt" IS NOT NULL
             AND (
               "campaignDirectoryDiscoveryRequestedRevision" > "campaignDirectoryDiscoveryCompletedRevision"
-              OR "campaignDirectoryDiscoveryDueAt" IS NULL
-              OR "campaignDirectoryDiscoveryDueAt" <= $1
+              OR "observationDueAt" IS NULL
+              OR "observationDueAt" <= $1
             )
         )::bigint AS "dueCreators",
         COUNT(*) FILTER (
           WHERE "baselineVerifiedAt" IS NOT NULL
-            AND "campaignDirectoryDiscoveryDueAt" IS NOT NULL
-            AND "campaignDirectoryDiscoveryDueAt" < $1
+            AND "observationDueAt" IS NOT NULL
+            AND "observationDueAt" < $1
         )::bigint AS "overdueCreators",
         COALESCE(SUM(
           CASE WHEN "baselineVerifiedAt" IS NOT NULL
             AND (
               "campaignDirectoryDiscoveryRequestedRevision" > "campaignDirectoryDiscoveryCompletedRevision"
-              OR "campaignDirectoryDiscoveryDueAt" IS NULL
-              OR "campaignDirectoryDiscoveryDueAt" <= $1
+              OR "observationDueAt" IS NULL
+              OR "observationDueAt" <= $1
             )
           THEN GREATEST(1, CEIL(GREATEST(0, "campaignDirectoryCampaignCount")::numeric / $2::numeric)::bigint + 1)
           ELSE 0 END
         ), 0)::bigint AS "requiredCalls",
-        MIN("campaignDirectoryDiscoveryDueAt") FILTER (
+        MIN("observationDueAt") FILTER (
           WHERE "baselineVerifiedAt" IS NOT NULL
             AND (
               "campaignDirectoryDiscoveryRequestedRevision" > "campaignDirectoryDiscoveryCompletedRevision"
-              OR "campaignDirectoryDiscoveryDueAt" IS NULL
-              OR "campaignDirectoryDiscoveryDueAt" <= $1
+              OR "observationDueAt" IS NULL
+              OR "observationDueAt" <= $1
             )
         ) AS "oldestDueAt"
-      FROM "CreatorCampaignCollectionState"
+      FROM source_directory
     ), fan AS (
       SELECT
         COUNT(*) FILTER (WHERE "requestedRevision" > "satisfiedRevision")::bigint AS "unsatisfiedDemands",
@@ -275,7 +282,7 @@ async function readCanonicalCapacityInputs({ db, now = new Date() } = {}) {
     )
     SELECT directory.*, fan.*, jobs."pendingJobs", background_other.*, usage.*
     FROM directory CROSS JOIN fan CROSS JOIN jobs CROSS JOIN background_other LEFT JOIN usage ON TRUE
-  `, authorityNow, DEFAULT_CAMPAIGN_DIRECTORY_PAGE_SIZE, BACKGROUND_OTHER_PROVIDER_JOB_KEYS);
+  `, authorityNow, DEFAULT_CAMPAIGN_DIRECTORY_PAGE_SIZE, BACKGROUND_OTHER_PROVIDER_JOB_KEYS, CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS);
   const row = Array.isArray(rows) ? rows[0] : rows;
   return capacityInputsFromRow(row);
 }
