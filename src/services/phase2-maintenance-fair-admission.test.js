@@ -22,7 +22,7 @@ function fixture({catalog = lanes.map((laneName,ordinal)=>({laneName,ordinal})),
 
 test("C1 admission has a hard per-pump budget and stable registered catalog",async()=>{
  const fx=fixture();const r=await selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes,lanesPerTick:1000000});
- assert.equal(r.selected.length,5);assert.equal(r.lanesPerTick,5);assert.equal(r.totalLanes,24);assert.equal(r.generation,MAINTENANCE_ADMISSION_GENERATION);assert.equal(fx.committed,true);
+ assert.equal(r.selected.length,5);assert.equal(r.lanesPerTick,5);assert.equal(r.totalLanes,25);assert.equal(r.generation,MAINTENANCE_ADMISSION_GENERATION);assert.equal(fx.committed,true);
  assert.equal(fx.calls[0].params[1],65);assert.equal(fx.calls[1].params[1],5);
 });
 test("C1 admission does not require or use wall-clock phase",async()=>{
@@ -70,7 +70,7 @@ test("C1 read-only diagnostics count opportunities without advancing progress",a
   calls++;assert.match(sql,/^SELECT/);assert.equal(params[1],65);
   return lanes.map((laneName,ordinal)=>({laneName,ordinal,turnCount:ordinal?9007199254740993n:9007199254740994n,lastAdmittedAt:null}));
  }};
- const result=await readMaintenanceAdmissionProgress({db});assert.equal(calls,1);assert.equal(result.readOnly,true);assert.equal(result.spread,'1');assert.equal(result.minimumTurns,'9007199254740993');assert.equal(result.lanes.length,24);assert.doesNotThrow(()=>JSON.stringify(result));
+ const result=await readMaintenanceAdmissionProgress({db});assert.equal(calls,1);assert.equal(result.readOnly,true);assert.equal(result.spread,'1');assert.equal(result.minimumTurns,'9007199254740993');assert.equal(result.lanes.length,25);assert.doesNotThrow(()=>JSON.stringify(result));
 });
 
 test("C1 admission cannot join business transaction and retain class locks across execution",async()=>{

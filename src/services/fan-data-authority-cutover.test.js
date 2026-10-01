@@ -438,20 +438,22 @@ test("historical event actor snapshots remain explicit while current identity ad
 
 
 test("campaign current value read model preserves unknown instead of coercing it to zero", () => {
-  const ledger = read("src/services/creator-analytics-ledger-service.js");
-  assert.match(ledger, /availability:\s*valueCurrent\.availability/);
-  assert.match(ledger, /platformReportedTotalSpendCents:\s*valueCurrent\.platformReportedTotalSpendCents == null \? null/);
-  assert.doesNotMatch(ledger, /totalNetCents:\s*Number\(valueCurrent\.platformReportedTotalSpendCents \|\| 0\)/);
+  const {fanValueDto}=require('./campaign-read-repository');
+  const now=new Date('2026-08-08');
+  const value=fanValueDto({availability:'AVAILABLE',valueObservedAt:now,platformReportedTotalSpendCents:null,source:'USER_PROFILE'},now);
+  assert.equal(value.available,true);assert.equal(value.platformReportedTotalSpendCents,null);assert.equal(value.messagesSpentCents,null);
+  const ledger=read('src/services/creator-analytics-ledger-service.js');
   assert.match(ledger, /avatarUrl:\s*text\(item\.avatarUrl, 1200\)/);
   assert.match(ledger, /headerUrl:\s*text\(item\.headerUrl, 1200\)/);
 });
 
 
 test("current value aggregates exclude unavailable or malformed observations", () => {
-  const overview = read("src/services/creator-overview-service.js");
-  const ledger = read("src/services/creator-analytics-ledger-service.js");
-  assert.match(overview, /value\."availability" = 'AVAILABLE'/);
-  assert.match(ledger, /value\."availability" = 'AVAILABLE'/);
+  const {valueMetrics}=require('./campaign-read-projection-service');
+  const now=new Date('2026-08-08');
+  for(const row of [{availability:'UNAVAILABLE',fetchedAt:now,totalNetCents:9000n},{availability:'AVAILABLE',fetchedAt:null,totalNetCents:9000n}]) {
+    const {metrics}=valueMetrics(row,now);assert.equal(metrics.ofValueKnownFans,'0');assert.equal(metrics.knownPlatformReportedFanSpendCents,'0');assert.equal(metrics.ofValueUnknownFans,'1');
+  }
 });
 
 

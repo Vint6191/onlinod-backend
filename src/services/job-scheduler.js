@@ -2090,6 +2090,7 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
       ["messageLibraryTrash", () => require("./message-library-lifecycle-service").runMessageLibraryTrashMaintenance({ db })],
       ["adminBillingPricing", () => require("./admin-bulk-pricing-command-service").runAdminBulkPricingSweep({ db })],
       ["notificationHistoryRepair", () => require("./notification-history-repair-service").runNotificationHistoryRepairSweep({ db })],
+      ["campaignReadProjection", () => require("./campaign-read-projection-service").runCampaignProjectionSweep({ db })],
       ["trafficProjection", () => require("./traffic-projection-service").runTrafficProjectionSweep({ db })],
       ["analyticsPublication", () => require("./analytics-publication-service").runAnalyticsPublicationSweep({ db })],
       ["notificationConsequences", () => require("./notification-consequence-service").runNotificationConsequenceSweep({ db })],

@@ -102,5 +102,7 @@ test("campaign transport is page-oriented and notification engagement is accepte
   assert.match(liveRoute, /workerDevice\.findFirst/);
   assert.match(liveRoute, /deviceCreatorBinding\.findFirst/);
   assert.match(liveRoute, /recordNotificationSocketEvent/);
-  assert.match(ledger, /creatorCampaign\.findMany[\s\S]*take: 2000/);
+  assert.doesNotMatch(ledger, /take: 2000/);
+  const repository=fs.readFileSync(path.join(root,'src/services/campaign-read-repository.js'),'utf8');
+  assert.match(repository,/take:take\+1/);assert.match(repository,/nextCursor/);
 });

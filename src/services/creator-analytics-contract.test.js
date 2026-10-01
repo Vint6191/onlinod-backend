@@ -43,7 +43,6 @@ test("snapshot-era Stats surfaces are explicit 410 tombstones and current overvi
     ["post", "/earnings/upsert"],
     ["post", "/campaigns/upsert"],
     ["get", "/creators/:creatorId/earnings"],
-    ["get", "/creators/:creatorId/campaigns"],
     ["get", "/creators/:creatorId/overview"],
     ["get", "/agencies/:agencyId/earnings/summary"],
     ["post", "/agencies/:agencyId/refresh"],
@@ -55,6 +54,11 @@ test("snapshot-era Stats surfaces are explicit 410 tombstones and current overvi
   assert.match(stats, /status\(410\)/);
   assert.match(stats, /ANALYTICS_LEGACY_STATS_RETIRED/);
 
+  const directory = routeBody(stats, "get", "/creators/:creatorId/campaigns");
+  assert.match(directory, /requireCampaignReadVersion/);
+  assert.match(directory, /loadCreatorWithAccess/);assert.match(directory, /requireEarningsPermission/);assert.match(directory, /readStatsSnapshot/);
+  assert.match(stats, /CAMPAIGN_READ_CLIENT_UPDATE_REQUIRED/);
+  assert.doesNotMatch(directory, /CreatorCampaignSnapshot|creatorCampaignSnapshot/);
   const overview = routeBody(stats, "get", "/creators/:creatorId/overview-v2");
   assert.match(overview, /requireEarningsPermission\(res, ctx\.member\)/);
   assert.match(overview, /readCreatorOverview\(/);
@@ -75,6 +79,7 @@ test("current creator refresh is the sole Stats refresh control plane", () => {
 
 test("every live creator-scoped Stats route resolves current creator access before business work", () => {
   const liveRoutes = [
+    ["get", "/creators/:creatorId/campaigns"],
     ["post", "/creators/:creatorId/refresh"],
     ["get", "/creators/:creatorId/overview-v2"],
     ["get", "/creators/:creatorId/current-task"],

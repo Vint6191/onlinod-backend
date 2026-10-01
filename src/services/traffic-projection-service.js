@@ -105,6 +105,7 @@ async function runTrafficProjectionUnit({ db, item, ownerToken }) {
   return runRootCommit(db, async ({ tx }) => {
     const lifecycle = await lockAgencyLifecycleBarrier({ db: tx, agencyId: item.agencyId });
     const creators = await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 AND "deletedAt" IS NULL FOR SHARE', item.creatorId, item.agencyId);
+    if (creators.length && await require("./analytics-projection-lifecycle-service").pauseDeletedAgencyProjection({ db: tx, lifecycle, item, ownerToken })) return { done: false, paused: true };
     const cursor = item.progressCursor && String(item.progressCursor.revision) === String(item.claimedRevision) ? item.progressCursor : {};
     const result = !lifecycle.row || lifecycle.row.deletedAt || !creators.length ? { done: true, retired: true }
       : item.workClass === "TRAFFIC_BACKFILL" ? await backfillUnit(tx, item) : await fanUnit(tx, item, cursor);

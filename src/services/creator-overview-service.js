@@ -9,7 +9,6 @@ const {
   NOTIFICATION_COLLECTION_FRESHNESS_MS,
   FINANCIAL_COLLECTION_FRESHNESS_MS,
   CAMPAIGN_COLLECTION_FRESHNESS_MS,
-  CAMPAIGN_FAN_VALUE_FRESHNESS_MS,
   trustedCollectionTimestamp,
 } = require("./analytics-freshness-policy");
 
@@ -265,89 +264,6 @@ function financeSummary(groups) {
   };
 }
 
-async function readCampaignPayingFanCount({ db, creatorId, start, end, fallback }) {
-  if (typeof db?.$queryRawUnsafe !== "function") return fallback;
-  const rows = await db.$queryRawUnsafe(`
-    WITH attributed AS (
-      SELECT event."fanId", membership."campaignId"
-      FROM "CreatorFinancialTransaction" event
-      JOIN LATERAL (
-        SELECT link."campaignId"
-        FROM "CreatorCampaignFan" link
-        WHERE link."creatorId" = $1
-          AND link."fanId" = event."fanId"
-          AND link."attributedAt" IS NOT NULL
-          AND link."attributedAt" <= event."occurredAt"
-        ORDER BY link."attributedAt" DESC, link."id" DESC
-        LIMIT 1
-      ) membership ON TRUE
-      WHERE event."creatorId" = $1
-        AND event."fanId" IS NOT NULL
-        AND event."occurredAt" >= $2::timestamptz
-        AND event."occurredAt" <= $3::timestamptz
-        AND LOWER(COALESCE(event."transactionStatus", '')) <> 'undo'
-    )
-    SELECT COUNT(DISTINCT "fanId")::bigint AS count FROM attributed
-  `, creatorId, start, end);
-  return int(rows?.[0]?.count ?? fallback);
-}
-
-
-async function readCampaignCurrentValues({ db, creatorId }) {
-  if (typeof db?.$queryRawUnsafe !== "function") {
-    return { byCampaign: new Map(), summary: { ofValueKnownFans: 0, ofValuePayingFans: 0, platformReportedFanSpendCents: 0, ofValueFetchedAt: null, ofValueFreshnessCutoffAt: null } };
-  }
-  const authorityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
-  const valueFreshnessCutoff = new Date(authorityNow.getTime() - CAMPAIGN_FAN_VALUE_FRESHNESS_MS);
-  const [rows, summaryRows] = await Promise.all([
-    db.$queryRawUnsafe(`
-      SELECT
-        membership."campaignId",
-        COUNT(value."id")::bigint AS "ofValueKnownFans",
-        COUNT(*) FILTER (WHERE value."totalNetCents" > 0)::bigint AS "ofValuePayingFans",
-        COALESCE(SUM(value."totalNetCents"), 0)::bigint AS "platformReportedFanSpendCents",
-        MAX(value."fetchedAt") AS "ofValueFetchedAt"
-      FROM "CreatorCampaignFan" membership
-      LEFT JOIN "CreatorFanValueCurrent" value
-        ON value."creatorId" = membership."creatorId" AND value."fanId" = membership."fanId"
-       AND value."availability" = 'AVAILABLE'
-       AND value."fetchedAt" >= $2::timestamptz
-      WHERE membership."creatorId" = $1
-      GROUP BY membership."campaignId"
-    `, creatorId, valueFreshnessCutoff),
-    db.$queryRawUnsafe(`
-      SELECT
-        COUNT(value."id")::bigint AS "ofValueKnownFans",
-        COUNT(*) FILTER (WHERE value."totalNetCents" > 0)::bigint AS "ofValuePayingFans",
-        COALESCE(SUM(value."totalNetCents"), 0)::bigint AS "platformReportedFanSpendCents",
-        MAX(value."fetchedAt") AS "ofValueFetchedAt"
-      FROM "CreatorFanValueCurrent" value
-      WHERE value."creatorId" = $1
-        AND value."availability" = 'AVAILABLE'
-        AND value."fetchedAt" >= $2::timestamptz
-        AND EXISTS (
-          SELECT 1 FROM "CreatorCampaignFan" membership
-          WHERE membership."creatorId" = $1 AND membership."fanId" = value."fanId"
-        )
-    `, creatorId, valueFreshnessCutoff),
-  ]);
-  return {
-    byCampaign: new Map((rows || []).map((row) => [String(row.campaignId), {
-      ofValueKnownFans: int(row.ofValueKnownFans),
-      ofValuePayingFans: int(row.ofValuePayingFans),
-      platformReportedFanSpendCents: cents(row.platformReportedFanSpendCents),
-      ofValueFetchedAt: iso(row.ofValueFetchedAt),
-    }])),
-    summary: {
-      ofValueKnownFans: int(summaryRows?.[0]?.ofValueKnownFans),
-      ofValuePayingFans: int(summaryRows?.[0]?.ofValuePayingFans),
-      platformReportedFanSpendCents: cents(summaryRows?.[0]?.platformReportedFanSpendCents),
-      ofValueFetchedAt: iso(summaryRows?.[0]?.ofValueFetchedAt),
-      ofValueFreshnessCutoffAt: valueFreshnessCutoff.toISOString(),
-    },
-  };
-}
-
 function collectorStatePayload(state) {
   return {
     complete: state.complete === true,
@@ -372,7 +288,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
   const end = new Date(ledger.range.endAt);
   const eventBetween = { gte: start, lte: end };
 
-  const [creator, financialGroups, campaignFanGroups, campaignCurrent, financialCollectionState, campaignCollectionState] = await Promise.all([
+  const [creator, financialGroups, campaignPage, financialCollectionState, campaignCollectionState] = await Promise.all([
     db.creatorAccount.findUnique({ where: { id: creatorId }, select: { id: true, createdAt: true, updatedAt: true } }),
     db.creatorFinancialTransaction.groupBy({
       by: ["transactionType", "transactionStatus"],
@@ -380,45 +296,10 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
       _count: { _all: true },
       _sum: { amountCents: true, netCents: true },
     }),
-    db.creatorCampaignFan.groupBy({
-      by: ["campaignId"],
-      where: { creatorId, attributedAt: eventBetween },
-      _count: { _all: true },
-    }),
-    readCampaignCurrentValues({ db, creatorId }),
+    require("./campaign-read-repository").readCampaignPage({ db, creatorId, rangeKey: range, now }),
     db.creatorFinancialCollectionState?.findUnique ? db.creatorFinancialCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
     db.creatorCampaignCollectionState?.findUnique ? db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
   ]);
-
-  const joinedByCampaign = new Map(campaignFanGroups.map((row) => [String(row.campaignId), int(row?._count?._all)]));
-  const currentByCampaign = campaignCurrent.byCampaign;
-  const campaigns = (ledger.campaigns || []).map((row) => {
-    const current = currentByCampaign.get(String(row.id)) || {};
-    return ({
-    id: row.id,
-    externalCampaignId: row.externalCampaignId,
-    name: row.name,
-    isActive: row.isActive === true,
-    startedAt: iso(row.startedAt),
-    endedAt: iso(row.endedAt),
-    fansCount: int(row.fansCount),
-    newFans: joinedByCampaign.get(String(row.id)) || 0,
-    payingFans: int(row.payingFans),
-    netCents: cents(row.netCents),
-    grossCents: cents(row.grossCents),
-    transactions: int(row.transactionsCount),
-    messageNetCents: cents(row.salesRevenueCents),
-    tipsNetCents: cents(row.tipsRevenueCents),
-    subscriptionsNetCents: cents(row.subscriptionRevenueCents),
-    unknownAttributionFans: int(row.unknownAttributionFans),
-    ofValueKnownFans: int(current.ofValueKnownFans),
-    ofValuePayingFans: int(current.ofValuePayingFans),
-    platformReportedFanSpendCents: cents(current.platformReportedFanSpendCents),
-    ofValueFetchedAt: iso(current.ofValueFetchedAt),
-  });
-  }).sort((a, b) => b.platformReportedFanSpendCents - a.platformReportedFanSpendCents || b.netCents - a.netCents || b.newFans - a.newFans || a.name.localeCompare(b.name));
-  const campaignFallbackPayers = campaigns.reduce((sum, row) => sum + row.payingFans, 0);
-  const payingFans = await readCampaignPayingFanCount({ db, creatorId, start, end, fallback: campaignFallbackPayers });
 
   const notificationBaselineAtRaw = ledger.notificationSync?.fullBackfillVerifiedAt || null;
   const notificationBaselineAt = trustedCollectionTimestamp(notificationBaselineAtRaw, now);
@@ -460,22 +341,6 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
   activity.comments = int(ledger.totals.commentsCount);
 
   const finance = financeSummary(financialGroups);
-  const campaignTotals = {
-    activeCampaigns: campaigns.filter((row) => row.isActive).length,
-    campaigns: campaigns.length,
-    fans: campaigns.reduce((sum, row) => sum + row.fansCount, 0),
-    newFans: campaigns.reduce((sum, row) => sum + row.newFans, 0),
-    payingFans,
-    netCents: campaigns.reduce((sum, row) => sum + row.netCents, 0),
-    grossCents: campaigns.reduce((sum, row) => sum + row.grossCents, 0),
-    transactions: campaigns.reduce((sum, row) => sum + row.transactions, 0),
-    unknownAttributionFans: campaigns.reduce((sum, row) => sum + row.unknownAttributionFans, 0),
-    ofValueKnownFans: int(campaignCurrent.summary.ofValueKnownFans),
-    ofValuePayingFans: int(campaignCurrent.summary.ofValuePayingFans),
-    platformReportedFanSpendCents: cents(campaignCurrent.summary.platformReportedFanSpendCents),
-    ofValueFetchedAt: iso(campaignCurrent.summary.ofValueFetchedAt),
-    ofValueFreshnessCutoffAt: iso(campaignCurrent.summary.ofValueFreshnessCutoffAt),
-  };
 
   return {
     ok: true,
@@ -510,7 +375,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     },
     activity,
     finance,
-    campaigns: { totals: campaignTotals, rows: campaigns },
+    campaigns: campaignPage,
     daily: {
       metrics: (ledger.daily?.metrics || []).map((row) => ({
         date: row.date,

@@ -149,7 +149,20 @@ function legacyStatsGone(_req, res) {
 router.post("/earnings/upsert", legacyStatsGone);
 router.post("/campaigns/upsert", legacyStatsGone);
 router.get("/creators/:creatorId/earnings", legacyStatsGone);
-router.get("/creators/:creatorId/campaigns", legacyStatsGone);
+function requireCampaignReadVersion(req,res,next) {
+  if(String(req.query.campaignReadVersion||'')!=='1') return res.status(409).json({ok:false,code:'CAMPAIGN_READ_CLIENT_UPDATE_REQUIRED',error:'Update Desktop and Backend together for Campaign analytics.'});
+  next();
+}
+router.get("/creators/:creatorId/campaigns", requireCampaignReadVersion, async (req,res)=>{
+  try {
+    const ctx=await loadCreatorWithAccess(req,res,String(req.params.creatorId||''));
+    if(!ctx||!requireEarningsPermission(res,ctx.member))return;
+    const page=await readStatsSnapshot(req,ctx,({db})=>require('../services/campaign-read-repository').readCampaignPage({
+      db,creatorId:ctx.creator.id,rangeKey:req.query.range||'all',cursor:req.query.cursor||null,limit:req.query.limit,offset:req.query.offset||0,
+    }));
+    return res.json(page);
+  }catch(error){return res.status(Number(error?.status)||500).json({ok:false,code:error?.code||'CAMPAIGN_READ_FAILED',error:error.message});}
+});
 router.get("/creators/:creatorId/overview", legacyStatsGone);
 router.get("/agencies/:agencyId/earnings/summary", legacyStatsGone);
 router.post("/agencies/:agencyId/refresh", legacyStatsGone);
@@ -229,7 +242,7 @@ const liveNotificationSchema = z.object({
   events: z.array(z.record(z.unknown())).min(1).max(100),
 });
 
-router.get("/creators/:creatorId/overview-v2", async (req, res) => {
+router.get("/creators/:creatorId/overview-v2", requireCampaignReadVersion, async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
     if (!ctx) return;
@@ -282,7 +295,7 @@ router.get("/creators/:creatorId/task-activity", async (req, res) => {
   }
 });
 
-router.get("/creators/:creatorId/campaigns/:campaignId/fans", async (req, res) => {
+router.get("/creators/:creatorId/campaigns/:campaignId/fans", requireCampaignReadVersion, async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
     if (!ctx) return;
@@ -296,7 +309,7 @@ router.get("/creators/:creatorId/campaigns/:campaignId/fans", async (req, res) =
     let rangeKey = null;
     if (String(req.query.range || "").trim()) {
       try {
-        rangeKey = normalizeCreatorOverviewRangeKey(req.query.range);
+        rangeKey = require("../services/campaign-read-repository").rangeKey(req.query.range);
       } catch {
         return res.status(400).json({ ok: false, code: "INVALID_CAMPAIGN_FAN_RANGE", error: `Invalid campaign fan range: ${String(req.query.range || "")}` });
       }
@@ -307,6 +320,8 @@ router.get("/creators/:creatorId/campaigns/:campaignId/fans", async (req, res) =
       limit,
       offset,
       rangeKey,
+      cursor: req.query.cursor || null,
+      filter: String(req.query.filter || "ALL"),
     }));
     if (!result) return res.status(404).json({ ok: false, code: "CAMPAIGN_NOT_FOUND", error: "Campaign not found for this creator" });
     return res.json({ ok: true, creatorId: ctx.creator.id, ...result });
@@ -427,14 +442,14 @@ router.post("/creators/:creatorId/financial-transaction-scan/stop", async (req, 
 // all-in-one refresh endpoint so campaign development never replays unrelated
 // sources. The underlying fetch_campaigns collector already walks campaign
 // pages and each campaign's claimer pages to source exhaustion.
-router.get("/creators/:creatorId/campaign-scan", async (req, res) => {
+router.get("/creators/:creatorId/campaign-scan", requireCampaignReadVersion, async (req, res) => {
   try {
     const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
     if (!ctx) return;
     if (!requireEarningsPermission(res, ctx.member)) return;
     const limit = Math.max(1, Math.min(200, Number.parseInt(String(req.query.limit || "100"), 10) || 100));
     const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
-    return res.json(await readStatsSnapshot(req, ctx, ({ db, creator }) => readManualCampaignScan({ db, creator, limit, offset })));
+    return res.json(await readStatsSnapshot(req, ctx, ({ db, creator }) => readManualCampaignScan({ db, creator, limit, offset, cursor: req.query.cursor || null })));
   } catch (error) {
     console.error("[stats/campaign-scan] failed:", error);
     return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "CAMPAIGN_SCAN_READ_FAILED", error: error?.message || "Failed" });

@@ -10,6 +10,9 @@ const Module = require("node:module");
 // an explicit production-shaped db adapter and never uses this stub.
 const originalLoad = Module._load;
 Module._load = function patchedLoad(request, parent, isMain) {
+  // The unit isolates collector-generation presentation; the real repository
+  // and scope/money invariants are exercised by campaign-read/proof.cjs.
+  if (request === "./creator-analytics-ledger-service") return {readCampaignsWithRevenue:async()=>({ok:true,contractVersion:1,totals:null,rows:[],projection:{ready:false,state:'REBUILDING'},pagination:{limit:50,returned:0,nextCursor:null,hasMore:false}})};
   if (request === "../prisma" || request.endsWith("/prisma")) return {};
   return originalLoad.call(this, request, parent, isMain);
 };

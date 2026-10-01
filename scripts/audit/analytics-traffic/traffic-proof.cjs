@@ -107,7 +107,7 @@ async function main(){
    const result=await traffic.getTrafficOverview({db,userId:s.userId,creatorId:s.creatorId});assert.equal(result.totals.fanValueCents,0);assert.equal(result.totals.sourceMembers,201);assert.equal(result.totals.valuePendingMembers,1);
   });
   await check('online index contracts are valid on repeated verification including descending attribution keys',async()=>{
-   const indexes=require(path.join(root,'scripts/database/analytics-traffic-indexes'));assert.equal((await indexes.ensureIndexes(db,{create:true})).contracts,16);
+   const indexes=require(path.join(root,'scripts/database/analytics-traffic-indexes'));assert.equal((await indexes.ensureIndexes(db,{create:true})).contracts,20);
    await db.$disconnect();await pg.exec('DISCARD ALL');
    await pg.exec('DROP INDEX "TrafficSourceMember_attribution_v2"; CREATE INDEX "TrafficSourceMember_attribution_v2" ON "TrafficSourceMember"("creatorId","fanId","lastSeenAt","id")');
    await assert.rejects(()=>indexes.ensureIndexes(db),e=>e.code==='ANALYTICS_TRAFFIC_INDEX_INVALID');

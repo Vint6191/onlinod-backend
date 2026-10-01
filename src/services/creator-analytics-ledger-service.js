@@ -2342,76 +2342,6 @@ async function upsertMessagesDaily({ db = prisma, agencyId, creatorId, rows, syn
   return result;
 }
 
-async function readCampaignRevenue({ db, creatorId, start = null, end = null }) {
-  const queryRaw = typeof db.$queryRawUnsafe === "function"
-    ? db.$queryRawUnsafe.bind(db)
-    : typeof db.$queryRaw === "function" ? db.$queryRaw.bind(db) : null;
-  if (!queryRaw) return new Map();
-  const rows = await queryRaw(`
-    WITH attributed AS (
-      SELECT
-        event."fanId",
-        event."amountCents",
-        event."netCents",
-        event."transactionStatus",
-        event."transactionType",
-        event."occurredAt" AS occurred_at,
-        membership."campaignId"
-      FROM "CreatorFinancialTransaction" AS event
-      JOIN LATERAL (
-        SELECT link."campaignId"
-        FROM "CreatorCampaignFan" AS link
-        WHERE link."creatorId" = $1
-          AND link."fanId" = event."fanId"
-          AND link."attributedAt" IS NOT NULL
-          AND link."attributedAt" <= event."occurredAt"
-        ORDER BY link."attributedAt" DESC, link."id" DESC
-        LIMIT 1
-      ) AS membership ON TRUE
-      WHERE event."creatorId" = $1
-        AND event."fanId" IS NOT NULL
-        AND ($2::timestamptz IS NULL OR event."occurredAt" >= $2::timestamptz)
-        AND ($3::timestamptz IS NULL OR event."occurredAt" <= $3::timestamptz)
-    )
-    SELECT
-      "campaignId",
-      COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "grossCents",
-      COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "netCents",
-      COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo')::bigint AS "transactionsCount",
-      COUNT(DISTINCT "fanId") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo')::bigint AS "payingFans",
-      COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledGrossCents",
-      COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledNetCents",
-      COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done')::bigint AS "settledTransactionsCount",
-      COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading'), 0)::bigint AS "pendingGrossCents",
-      COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading'), 0)::bigint AS "pendingNetCents",
-      COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading')::bigint AS "pendingTransactionsCount",
-      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" IN ('message','post','stream') AND LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "salesRevenueCents",
-      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" IN ('tip','tips') AND LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "tipsRevenueCents",
-      COALESCE(SUM("netCents") FILTER (WHERE "transactionType" LIKE 'subscription%' AND LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "subscriptionRevenueCents"
-    FROM attributed
-    GROUP BY "campaignId"
-  `, creatorId, start, end);
-  return new Map(rows.map((row) => [String(row.campaignId), {
-    // Preserve the old overview field name as settled NET revenue: this is the
-    // amount the creator actually earned, while gross/pending remain available
-    // explicitly for the new campaign scanner.
-    totalRevenueCents: Number(row.settledNetCents ?? row.totalRevenueCents ?? 0),
-    grossCents: Number(row.grossCents ?? row.totalRevenueCents ?? 0),
-    netCents: Number(row.netCents ?? row.totalRevenueCents ?? 0),
-    transactionsCount: Number(row.transactionsCount || 0),
-    payingFans: Number(row.payingFans || 0),
-    settledGrossCents: Number(row.settledGrossCents ?? row.totalRevenueCents ?? 0),
-    settledNetCents: Number(row.settledNetCents ?? row.totalRevenueCents ?? 0),
-    settledTransactionsCount: Number(row.settledTransactionsCount ?? row.transactionsCount ?? 0),
-    pendingGrossCents: Number(row.pendingGrossCents || 0),
-    pendingNetCents: Number(row.pendingNetCents || 0),
-    pendingTransactionsCount: Number(row.pendingTransactionsCount || 0),
-    salesRevenueCents: Number(row.salesRevenueCents || 0),
-    tipsRevenueCents: Number(row.tipsRevenueCents || 0),
-    subscriptionRevenueCents: Number(row.subscriptionRevenueCents || 0),
-  }]));
-}
-
 async function readCreatorCoverage({ db = prisma, creatorId, rangeKey, limit = 120, offset = 0, now = new Date(), authorityResolved = false }) {
   if (!authorityResolved) now = await dbAuthorityNow({ db, fallbackNow: now });
   const range = rangeBounds(rangeKey, now);
@@ -2446,7 +2376,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
   const dayBetween = { gte: range.dayStart, lte: range.dayEnd };
   const currentDay = utcDay(now);
   const currentDayInRange = currentDay >= range.dayStart && currentDay <= range.dayEnd;
-  const [publishedEarnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, campaigns, coveragePage, completeMessageDays, inProgressMessageDays, campaignRevenue, unknownCampaignAttribution, notificationSync, dailyMetrics, paidSubscriptions, subscriptionStates, localMessageCoverage] = await Promise.all([
+  const [publishedEarnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, coveragePage, completeMessageDays, inProgressMessageDays, notificationSync, dailyMetrics, paidSubscriptions, subscriptionStates, localMessageCoverage] = await Promise.all([
     require("./published-earnings-read-repository").readPublishedEarningsDays({ db, creatorId, from: range.dayStart, to: range.dayEnd, now }),
     includeMessages ? db.creatorMessagesDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }) : Promise.resolve([]),
     db.creatorPostLike.groupBy({ by: ["onlyFansPostId"], where: { creatorId, likedAt: eventBetween }, _count: { _all: true }, orderBy: { _count: { onlyFansPostId: "desc" } }, take: 50 }),
@@ -2456,12 +2386,9 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     db.creatorSale.aggregate({ where: { creatorId, purchasedAt: eventBetween }, _sum: { amountCents: true }, _count: { _all: true } }),
     db.creatorTip.aggregate({ where: { creatorId, tippedAt: eventBetween }, _sum: { amountCents: true }, _count: { _all: true } }),
     db.creatorSubscriptionEvent.groupBy({ by: ["eventType"], where: { creatorId, occurredAt: eventBetween }, _count: { _all: true }, _sum: { observedPriceCents: true } }),
-    db.creatorCampaign.findMany({ where: { creatorId }, include: { _count: { select: { fans: true } } }, orderBy: [{ isActive: "desc" }, { collectedAt: "desc" }], take: 2000 }),
     includeCoveragePage ? readCreatorCoverage({ db, creatorId, rangeKey, limit: 120, offset: 0, now, authorityResolved: true }) : Promise.resolve({ rows: [], pagination: { limit: 0, offset: 0, returned: 0, total: 0, hasMore: false } }),
     includeMessages ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "COMPLETE", coverageDate: dayBetween } }) : Promise.resolve(0),
     includeMessages && currentDayInRange ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "PARTIAL", coverageDate: currentDay, lastErrorCode: "MESSAGES_DAY_IN_PROGRESS" } }) : Promise.resolve(0),
-    readCampaignRevenue({ db, creatorId, start: range.start, end: range.end }),
-    db.creatorCampaignFan.groupBy({ by: ["campaignId"], where: { creatorId, attributedAt: null }, _count: { _all: true } }),
     db.creatorNotificationSyncState?.findUnique
       ? db.creatorNotificationSyncState.findUnique({ where: { creatorId } })
       : Promise.resolve(null),
@@ -2501,13 +2428,6 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     for (const key of ["incomingMessages", "outgoingMessages", "totalMessages", "uniqueDialogs", "uniqueIncomingFans", "uniqueOutgoingFans"]) acc[key] += row[key];
     return acc;
   }, { incomingMessages: 0, outgoingMessages: 0, totalMessages: 0, uniqueDialogs: 0, uniqueIncomingFans: 0, uniqueOutgoingFans: 0 });
-  const unknownAttributionByCampaign = new Map(unknownCampaignAttribution.map((row) => [String(row.campaignId), Number(row._count?._all || 0)]));
-  const campaignRows = campaigns.map((row) => {
-    const revenue = campaignRevenue.get(row.id) || { totalRevenueCents: 0, salesRevenueCents: 0, tipsRevenueCents: 0, subscriptionRevenueCents: 0, transactionsCount: 0 };
-    const unknownAttributionFans = unknownAttributionByCampaign.get(row.id) || 0;
-    const { _count, ...plain } = row;
-    return { ...plain, fansCount: _count.fans, unknownAttributionFans, revenueVerified: unknownAttributionFans === 0, ...revenue };
-  });
   const expectedEarningsDays = Math.floor((range.dayEnd.getTime() - range.dayStart.getTime()) / 86_400_000) + 1;
   let completeEarningsDays = 0;
   let provenEarningsDays = 0;
@@ -2630,249 +2550,17 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     localMessageCoverage,
     engagement: { likes, comments },
     subscriptions,
-    campaigns: campaignRows,
     coverage: coveragePage.rows,
     coveragePagination: coveragePage.pagination,
   };
 }
 
-async function readCampaignFans({ db = prisma, creatorId, campaignId, limit = 50, offset = 0, rangeKey = null, now = new Date(), authorityResolved = false }) {
-  if (!authorityResolved) now = await dbAuthorityNow({ db, fallbackNow: now });
-  const fanValueFreshnessCutoff = new Date(now.getTime() - CAMPAIGN_FAN_VALUE_FRESHNESS_MS);
-  const take = Math.max(1, Math.min(100, Number(limit) || 50));
-  const skip = Math.max(0, Math.min(1_000_000, Number(offset) || 0));
-  const campaign = await db.creatorCampaign.findFirst({
-    where: { id: campaignId, creatorId },
-    select: { id: true, externalCampaignId: true, name: true, isActive: true },
-  });
-  if (!campaign) return null;
-
-  // Read the page through Prisma so fan identity remains strongly typed, then
-  // aggregate money only for those fan ids. A payment belongs to the latest
-  // campaign attribution that existed before the payment, which prevents one
-  // transaction from being counted for multiple campaigns when the same fan
-  // later enters another tracking campaign.
-  const rows = await db.creatorCampaignFan.findMany({
-    where: { creatorId, campaignId: campaign.id },
-    include: {
-      fan: {
-        select: {
-          id: true,
-          onlyFansUserId: true,
-          username: true,
-          displayName: true,
-          firstSeenAt: true,
-          lastSeenAt: true,
-          valueCurrent: {
-            select: {
-              availability: true,
-              platformReportedTotalSpendCents: true,
-              messagesSpentCents: true,
-              subscriptionsSpentCents: true,
-              tipsSpentCents: true,
-              postsSpentCents: true,
-              streamsSpentCents: true,
-              lastActivityAt: true,
-              valueObservedAt: true,
-              source: true,
-            },
-          },
-        },
-      },
-    },
-    orderBy: [{ attributedAt: "desc" }, { collectedAt: "desc" }, { id: "desc" }],
-    skip,
-    take: take + 1,
-  });
-  const pageRows = rows.slice(0, take);
-  const fanRecordIds = pageRows.map((row) => row.fanRecordId).filter(Boolean);
-  const range = rangeKey ? rangeBounds(rangeKey, now) : null;
-  let moneyByFan = new Map();
-  const queryRaw = typeof db.$queryRawUnsafe === "function"
-    ? db.$queryRawUnsafe.bind(db)
-    : typeof db.$queryRaw === "function" ? db.$queryRaw.bind(db) : null;
-  if (fanRecordIds.length && queryRaw) {
-    const moneyRows = await queryRaw(`
-      WITH attributed AS (
-        SELECT
-          event."fanId",
-          event."amountCents",
-          event."netCents",
-          event."transactionStatus",
-          membership."campaignId"
-        FROM "CreatorFinancialTransaction" AS event
-        JOIN LATERAL (
-          SELECT link."campaignId"
-          FROM "CreatorCampaignFan" AS link
-          WHERE link."creatorId" = $1
-            AND link."fanId" = event."fanId"
-            AND link."attributedAt" IS NOT NULL
-            AND link."attributedAt" <= event."occurredAt"
-          ORDER BY link."attributedAt" DESC, link."id" DESC
-          LIMIT 1
-        ) AS membership ON TRUE
-        WHERE event."creatorId" = $1
-          AND event."fanId" = ANY($3::text[])
-          AND ($4::timestamptz IS NULL OR event."occurredAt" >= $4::timestamptz)
-          AND ($5::timestamptz IS NULL OR event."occurredAt" <= $5::timestamptz)
-      )
-      SELECT
-        "fanId",
-        COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "grossCents",
-        COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo'), 0)::bigint AS "netCents",
-        COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) <> 'undo')::bigint AS "transactionsCount",
-        COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledGrossCents",
-        COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done'), 0)::bigint AS "settledNetCents",
-        COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'done')::bigint AS "settledTransactionsCount",
-        COALESCE(SUM("amountCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading'), 0)::bigint AS "pendingGrossCents",
-        COALESCE(SUM("netCents") FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading'), 0)::bigint AS "pendingNetCents",
-        COUNT(*) FILTER (WHERE LOWER(COALESCE("transactionStatus", '')) = 'loading')::bigint AS "pendingTransactionsCount"
-      FROM attributed
-      WHERE "campaignId" = $2
-      GROUP BY "fanId"
-    `, creatorId, campaign.id, fanRecordIds, range?.start || null, range?.end || null);
-    moneyByFan = new Map(moneyRows.map((row) => [String(row.fanId), {
-      grossCents: Number(row.grossCents || 0),
-      netCents: Number(row.netCents || 0),
-      transactionsCount: Number(row.transactionsCount || 0),
-      settledGrossCents: Number(row.settledGrossCents || 0),
-      settledNetCents: Number(row.settledNetCents || 0),
-      settledTransactionsCount: Number(row.settledTransactionsCount || 0),
-      pendingGrossCents: Number(row.pendingGrossCents || 0),
-      pendingNetCents: Number(row.pendingNetCents || 0),
-      pendingTransactionsCount: Number(row.pendingTransactionsCount || 0),
-    }]));
-  }
-  const zeroMoney = {
-    grossCents: 0, netCents: 0, transactionsCount: 0,
-    settledGrossCents: 0, settledNetCents: 0, settledTransactionsCount: 0,
-    pendingGrossCents: 0, pendingNetCents: 0, pendingTransactionsCount: 0,
-  };
-  const hasMore = rows.length > take;
-  return {
-    campaign,
-    range: range ? { key: range.key, startAt: range.start.toISOString(), endAt: range.end.toISOString() } : null,
-    fans: pageRows.map((row) => {
-      const { valueCurrent, ...fan } = row.fan;
-      const valueObservedAt = valueCurrent?.valueObservedAt ? new Date(valueCurrent.valueObservedAt) : null;
-      const valueFresh = Boolean(
-        valueCurrent && valueObservedAt && Number.isFinite(valueObservedAt.getTime()) &&
-        valueObservedAt.getTime() >= fanValueFreshnessCutoff.getTime()
-      );
-      return {
-        id: row.id,
-        externalClaimerId: row.externalClaimerId,
-        attributedAt: row.attributedAt,
-        collectedAt: row.collectedAt,
-        fan,
-        fanValue: valueFresh ? {
-          available: valueCurrent.availability === "AVAILABLE",
-          availability: valueCurrent.availability,
-          platformReportedTotalSpendCents: valueCurrent.platformReportedTotalSpendCents == null ? null : Number(valueCurrent.platformReportedTotalSpendCents),
-          messagesSpentCents: valueCurrent.messagesSpentCents == null ? null : Number(valueCurrent.messagesSpentCents),
-          subscriptionsSpentCents: valueCurrent.subscriptionsSpentCents == null ? null : Number(valueCurrent.subscriptionsSpentCents),
-          tipsSpentCents: valueCurrent.tipsSpentCents == null ? null : Number(valueCurrent.tipsSpentCents),
-          postsSpentCents: valueCurrent.postsSpentCents == null ? null : Number(valueCurrent.postsSpentCents),
-          streamsSpentCents: valueCurrent.streamsSpentCents == null ? null : Number(valueCurrent.streamsSpentCents),
-          lastActivityAt: valueCurrent.lastActivityAt,
-          observedAt: valueCurrent.valueObservedAt,
-          source: valueCurrent.source,
-        } : null,
-        fanValueStaleObservedAt: !valueFresh && valueObservedAt ? valueObservedAt : null,
-        fanValueFreshnessCutoffAt: fanValueFreshnessCutoff,
-        revenue: moneyByFan.get(String(row.fanRecordId)) || zeroMoney,
-      };
-    }),
-    pagination: { limit: take, offset: skip, returned: pageRows.length, hasMore },
-  };
+// Compatibility exports delegate to the single bounded Campaign repository.
+async function readCampaignFans({ db = prisma, ...input }) {
+  return require("./campaign-read-repository").readCampaignFanPage({ db, ...input });
 }
-
-async function readCampaignsWithRevenue({ db = prisma, creatorId, limit = 100, offset = 0 }) {
-  const take = Math.max(1, Math.min(200, Number(limit) || 100));
-  const skip = Math.max(0, Math.min(1_000_000, Number(offset) || 0));
-  const authorityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
-  const valueFreshnessCutoff = new Date(authorityNow.getTime() - CAMPAIGN_FAN_VALUE_FRESHNESS_MS);
-  const [rows, total, totalFans] = await Promise.all([
-    db.creatorCampaign.findMany({
-      where: { creatorId },
-      include: { _count: { select: { fans: true } } },
-      orderBy: [{ isActive: "desc" }, { startedAt: "desc" }, { collectedAt: "desc" }, { id: "desc" }],
-      skip,
-      take: take + 1,
-    }),
-    db.creatorCampaign.count({ where: { creatorId } }),
-    db.creatorCampaignFan.count({ where: { creatorId } }),
-  ]);
-  const revenue = await readCampaignRevenue({ db, creatorId, start: null, end: null });
-  const currentValueRows = typeof db.$queryRawUnsafe === "function" ? await db.$queryRawUnsafe(`
-    SELECT
-      membership."campaignId",
-      COUNT(value."id")::bigint AS "ofValueKnownFans",
-      COUNT(*) FILTER (WHERE value."totalNetCents" > 0)::bigint AS "ofValuePayingFans",
-      COALESCE(SUM(value."totalNetCents"), 0)::bigint AS "platformReportedFanSpendCents",
-      MAX(value."fetchedAt") AS "ofValueFetchedAt"
-    FROM "CreatorCampaignFan" AS membership
-    LEFT JOIN "CreatorFanValueCurrent" AS value
-      ON value."creatorId" = membership."creatorId" AND value."fanId" = membership."fanId"
-     AND value."availability" = 'AVAILABLE'
-     AND value."fetchedAt" >= $2::timestamptz
-    WHERE membership."creatorId" = $1
-    GROUP BY membership."campaignId"
-  `, creatorId, valueFreshnessCutoff) : [];
-  const currentValueByCampaign = new Map(currentValueRows.map((row) => [String(row.campaignId), {
-    ofValueKnownFans: Number(row.ofValueKnownFans || 0),
-    ofValuePayingFans: Number(row.ofValuePayingFans || 0),
-    platformReportedFanSpendCents: Number(row.platformReportedFanSpendCents || 0),
-    ofValueFetchedAt: row.ofValueFetchedAt || null,
-  }]));
-  const pageRows = rows.slice(0, take).map((row) => {
-    const { _count, ...campaign } = row;
-    const money = revenue.get(row.id) || {
-      totalRevenueCents: 0, grossCents: 0, netCents: 0, transactionsCount: 0, payingFans: 0,
-      settledGrossCents: 0, settledNetCents: 0, settledTransactionsCount: 0,
-      pendingGrossCents: 0, pendingNetCents: 0, pendingTransactionsCount: 0,
-      salesRevenueCents: 0, tipsRevenueCents: 0, subscriptionRevenueCents: 0,
-    };
-    const currentValue = currentValueByCampaign.get(row.id) || { ofValueKnownFans: 0, ofValuePayingFans: 0, platformReportedFanSpendCents: 0, ofValueFetchedAt: null };
-    return { ...campaign, fansCount: Number(_count?.fans || 0), ...money, ...currentValue };
-  });
-  const revenueSummary = [...revenue.values()].reduce((acc, item) => {
-    acc.payingFans += Number(item.payingFans || 0);
-    acc.settledNetCents += Number(item.settledNetCents || 0);
-    acc.pendingNetCents += Number(item.pendingNetCents || 0);
-    acc.transactionsCount += Number(item.transactionsCount || 0);
-    return acc;
-  }, { payingFans: 0, settledNetCents: 0, pendingNetCents: 0, transactionsCount: 0 });
-  const currentValueSummaryRows = typeof db.$queryRawUnsafe === "function" ? await db.$queryRawUnsafe(`
-    SELECT
-      COUNT(value."id")::bigint AS "ofValueKnownFans",
-      COUNT(*) FILTER (WHERE value."totalNetCents" > 0)::bigint AS "ofValuePayingFans",
-      COALESCE(SUM(value."totalNetCents"), 0)::bigint AS "platformReportedFanSpendCents",
-      MAX(value."fetchedAt") AS "ofValueFetchedAt"
-    FROM "CreatorFanValueCurrent" AS value
-    WHERE value."creatorId" = $1
-      AND value."availability" = 'AVAILABLE'
-      AND value."fetchedAt" >= $2::timestamptz
-      AND EXISTS (
-        SELECT 1 FROM "CreatorCampaignFan" AS membership
-        WHERE membership."creatorId" = $1 AND membership."fanId" = value."fanId"
-      )
-  `, creatorId, valueFreshnessCutoff) : [];
-  const currentValueSummary = currentValueSummaryRows[0] || {};
-  return {
-    campaigns: pageRows,
-    summary: {
-      campaigns: total,
-      fans: totalFans,
-      ...revenueSummary,
-      ofValueKnownFans: Number(currentValueSummary.ofValueKnownFans || 0),
-      ofValuePayingFans: Number(currentValueSummary.ofValuePayingFans || 0),
-      platformReportedFanSpendCents: Number(currentValueSummary.platformReportedFanSpendCents || 0),
-      ofValueFetchedAt: currentValueSummary.ofValueFetchedAt || null,
-      ofValueFreshnessCutoffAt: valueFreshnessCutoff,
-    },
-    pagination: { limit: take, offset: skip, returned: pageRows.length, total, hasMore: rows.length > take },
-  };
+async function readCampaignsWithRevenue({ db = prisma, ...input }) {
+  return require("./campaign-read-repository").readCampaignPage({ db, ...input });
 }
 
 module.exports = {

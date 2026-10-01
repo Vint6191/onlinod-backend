@@ -2,7 +2,7 @@
 
 const { runRootCommit } = require("./db-commit-kernel");
 
-const MAINTENANCE_ADMISSION_GENERATION = "phase6_maintenance_analytics_traffic_v2";
+const MAINTENANCE_ADMISSION_GENERATION = "phase6_maintenance_campaign_read_v3";
 const MAINTENANCE_LANE_NAMES = Object.freeze([
   "providerCapacityProjection", "messageLibraryTrash", "adminBillingPricing",
   "notificationHistoryRepair", "notificationConsequences", "agencyDestructiveCleanup",
@@ -11,7 +11,7 @@ const MAINTENANCE_LANE_NAMES = Object.freeze([
   "customReminderWork", "providerOperationalDirty", "telegramConfirmedProjection",
   "telegramInboundProjection", "customExternalProofConvergence", "teamMoneyReconciliation",
   "teamReadSummary", "teamPendingBackfill", "teamResponseRangeRepair", "teamLegacyPendingRepair",
-  "analyticsPublication", "trafficProjection",
+  "analyticsPublication", "trafficProjection", "campaignReadProjection",
 ]);
 const MAX_MAINTENANCE_LANES_PER_TICK = 5;
 const MAX_CATALOG_ROWS = 64;

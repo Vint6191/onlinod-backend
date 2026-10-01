@@ -242,38 +242,7 @@ async function stopManualCampaignScan({ db = prisma, creatorId, now = new Date()
   return { job: await db.jobInstance.findUnique({ where: { id: active.id } }), action: "paused" };
 }
 
-function campaignForClient(row) {
-  return {
-    id: row.id,
-    externalCampaignId: row.externalCampaignId,
-    name: row.name,
-    campaignType: row.campaignType,
-    trackingCode: row.trackingCode,
-    trackingUrl: row.trackingUrl,
-    isActive: row.isActive === true,
-    startedAt: iso(row.startedAt),
-    endedAt: iso(row.endedAt),
-    claimersCount: row.claimersCount,
-    clicksCount: row.clicksCount,
-    fansCount: integer(row.fansCount, 0),
-    payingFans: integer(row.payingFans, 0),
-    transactionsCount: integer(row.transactionsCount, 0),
-    grossCents: Number(row.grossCents || 0),
-    netCents: Number(row.netCents || 0),
-    settledTransactionsCount: integer(row.settledTransactionsCount, 0),
-    settledGrossCents: Number(row.settledGrossCents || 0),
-    settledNetCents: Number(row.settledNetCents || 0),
-    pendingTransactionsCount: integer(row.pendingTransactionsCount, 0),
-    pendingGrossCents: Number(row.pendingGrossCents || 0),
-    pendingNetCents: Number(row.pendingNetCents || 0),
-    ofValueKnownFans: integer(row.ofValueKnownFans, 0),
-    ofValuePayingFans: integer(row.ofValuePayingFans, 0),
-    platformReportedFanSpendCents: Number(row.platformReportedFanSpendCents || 0),
-    ofValueFetchedAt: iso(row.ofValueFetchedAt),
-  };
-}
-
-async function readManualCampaignScan({ db = prisma, creator, limit = 100, offset = 0, generationReadAttempt = 0 }) {
+async function readManualCampaignScan({ db = prisma, creator, limit = 50, offset = 0, cursor = null, generationReadAttempt = 0 }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   const jobs = await recentJobs(db, creator.id, null, 60);
   const job = jobs[0] || null;
@@ -284,9 +253,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
   const result = object(job?.result);
   const continuationEnvelope = object(job?.continuation);
   const continuation = continuationEnvelope.driverPhase === "execute" ? object(continuationEnvelope.jobContinuation) : continuationEnvelope;
-  const page = await readCampaignsWithRevenue({ db, creatorId: creator.id, limit: safeLimit, offset: safeOffset });
-  const campaignRows = page.campaigns.map(campaignForClient);
-  const totals = page.summary || { campaigns: campaignRows.length, fans: 0, payingFans: 0, settledNetCents: 0, pendingNetCents: 0, transactionsCount: 0, ofValueKnownFans: 0, ofValuePayingFans: 0, platformReportedFanSpendCents: 0, ofValueFetchedAt: null };
+  const page = await readCampaignsWithRevenue({ db, creatorId: creator.id, limit: safeLimit, offset: safeOffset, cursor });
   const onlineWorkers = await countOnlineBindings(db, creator);
   const collectionState = await db.creatorCampaignCollectionState?.findUnique?.({ where: { creatorId: creator.id } }) || null;
   const capacityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
@@ -385,7 +352,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
     const endCoverageScanRunId = clean(endState?.fanValueCoverageScanRunId, 120);
     if (endCoverageScanRunId !== currentCoverageScanRunId) {
       if (generationReadAttempt < 2) {
-        return readManualCampaignScan({ db, creator, limit, offset, generationReadAttempt: generationReadAttempt + 1 });
+        return readManualCampaignScan({ db, creator, limit, offset, cursor, generationReadAttempt: generationReadAttempt + 1 });
       }
       const error = new Error("CAMPAIGN_COVERAGE_READ_GENERATION_UNSTABLE");
       error.code = "CAMPAIGN_COVERAGE_READ_GENERATION_UNSTABLE";
@@ -463,21 +430,8 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 100, offse
     lastErrorMessage: status === "FAILED" ? clean(job?.lastError, 1000) : (status === "PARTIAL" ? stateErrorMessage : null),
     currentMessage: clean(progress.message, 500),
     onlineWorkers,
-    summary: {
-      campaigns: integer(totals.campaigns, campaignRows.length, 100_000),
-      fans: integer(totals.fans, 0, 100_000_000),
-      payingFans: integer(totals.payingFans, 0, 100_000_000),
-      transactionsCount: integer(totals.transactionsCount, 0, 100_000_000),
-      settledNetCents: Number(totals.settledNetCents || 0),
-      pendingNetCents: Number(totals.pendingNetCents || 0),
-      ofValueKnownFans: integer(totals.ofValueKnownFans, 0, 100_000_000),
-      ofValuePayingFans: integer(totals.ofValuePayingFans, 0, 100_000_000),
-      platformReportedFanSpendCents: Number(totals.platformReportedFanSpendCents || 0),
-      ofValueFetchedAt: iso(totals.ofValueFetchedAt),
-      ofValueFreshnessCutoffAt: iso(totals.ofValueFreshnessCutoffAt),
-    },
-    campaigns: campaignRows,
-    pagination: page.pagination,
+    campaignPage: page,
+
   };
 }
 

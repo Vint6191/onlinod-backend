@@ -1547,9 +1547,7 @@ test("ledger overview preserves nullable earnings categories and counts only com
   assert.equal(result.totals.commentsCount, 2);
   assert.equal(result.coveragePagination.total, 1);
   assert.equal(result.coveragePagination.hasMore, false);
-  assert.equal(result.campaigns[0].totalRevenueCents, 1000);
-  assert.equal(result.campaigns[0].unknownAttributionFans, 1);
-  assert.equal(result.campaigns[0].revenueVerified, false);
+  assert.equal(result.campaigns, undefined, "Campaign read authority is the shared repository, separate from the earnings ledger");
   assert.equal(result.notificationSync.lastCatchupVerifiedAt.toISOString(), "2026-08-06T10:00:30.000Z");
   assert.equal(result.notificationSync.retryAfterAt.toISOString(), "2026-08-06T12:30:00.000Z");
   assert.equal(result.availability.activityFromAt.toISOString(), "2026-02-05T08:00:00.000Z");
@@ -1674,7 +1672,16 @@ test("today earnings are official only when the row and in-progress proof both e
 });
 
 test("campaign fan reader scopes the campaign to the creator and pages concrete fan identities", async () => {
+  const queries=[];
   const db = {
+    $queryRawUnsafe: async (sql,...args) => {
+      queries.push({sql,args});
+      if(sql.includes('clock_timestamp'))return [{authorityNow:new Date('2026-08-08')}];
+      if(sql.includes('FROM "CampaignReadState"'))return [{completedAt:new Date('2026-08-08'),valueFreshnessMs:require('./analytics-freshness-policy').CAMPAIGN_FAN_VALUE_FRESHNESS_MS,pending:false,expired:false}];
+      if(sql.includes('FROM "CreatorCampaignFan" m'))return [{id:'link-1',fanId:'fan-1'},{id:'link-2',fanId:'fan-2'}];
+      if(sql.includes('FROM "CampaignReadMetric"'))return [];
+      throw Error('Unexpected Campaign SQL: '+sql);
+    },
     creatorCampaign: { findFirst: async ({ where }) => where.creatorId === "creator-1" ? { id: "campaign-1", externalCampaignId: "of-campaign", name: "Link A", isActive: true } : null },
     creatorCampaignFan: {
       findMany: async () => [
@@ -1688,6 +1695,11 @@ test("campaign fan reader scopes the campaign to the creator and pages concrete 
   assert.equal(result.fans.length, 1);
   assert.equal(result.fans[0].fan.onlyFansUserId, "123");
   assert.equal(result.pagination.hasMore, true);
+  assert(result.pagination.nextCursor);
+  assert.equal(result.contractVersion,1);
+  assert(queries.every(q=>!q.sql.includes('CreatorFinancialTransaction')));
+  const selection=queries.find(q=>q.sql.includes('FROM "CreatorCampaignFan" m'));
+  assert.deepEqual(selection.args.slice(0,2),['creator-1','campaign-1']);
   assert.equal(await readCampaignFans({ db: commitDatabaseFixture(db), creatorId: "other", campaignId: "campaign-1" }), null);
 });
 

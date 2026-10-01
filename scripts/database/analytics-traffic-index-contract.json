@@ -110,5 +110,33 @@
     "unique": false,
     "expression": "\"creatorId\",\"workClass\"",
     "where": "\"isOutstanding\""
+  },
+  {
+    "name": "CampaignFan_read_fan_page_v1",
+    "table": "CreatorCampaignFan",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CampaignFan_read_attribution_v1",
+    "table": "CreatorCampaignFan",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"attributedAt\" DESC,\"id\" DESC",
+    "where": null
+  },
+  {
+    "name": "Financial_read_repair_v1",
+    "table": "CreatorFinancialTransaction",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"occurredAt\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "Financial_read_backfill_v1",
+    "table": "CreatorFinancialTransaction",
+    "unique": false,
+    "expression": "\"creatorId\",\"id\"",
+    "where": null
   }
 ]

@@ -8,25 +8,29 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const ledger = read("services/creator-analytics-ledger-service.js");
+const repository = read("services/campaign-read-repository.js");
+const projection = read("services/campaign-read-projection-service.js");
 const control = read("services/campaign-scan-control-service.js");
 const routes = read("routes/stats.js");
 const financial = read("services/financial-transactions-service.js");
 
 test("campaign money is derived from atomic financial transactions, not copied onto memberships", () => {
-  assert.match(ledger, /FROM "CreatorFinancialTransaction" AS event/);
-  assert.match(ledger, /JOIN LATERAL/);
-  assert.match(ledger, /link\."attributedAt" <= event\."occurredAt"/);
-  assert.match(ledger, /ORDER BY link\."attributedAt" DESC, link\."id" DESC/);
+  assert.match(projection, /FINANCIAL: "CreatorFinancialTransaction"/);
+  assert.match(projection, /"attributedAt"<=\$4/);
+  assert.match(projection, /ORDER BY "attributedAt" DESC,"id" DESC LIMIT 1/);
+  assert.match(projection, /financialMetrics\(row\)/);
+  assert.doesNotMatch(repository, /FROM "CreatorFinancialTransaction"/);
+  assert.doesNotMatch(projection, /(?:UPDATE|INSERT INTO) "CreatorFinancialTransaction"/);
   assert.doesNotMatch(ledger, /creatorCampaignFan\.(?:create|update|upsert)[\s\S]{0,500}(?:revenue|amountCents|netCents)/i);
 });
 
 test("campaign fan rows expose arrival time and settled/pending money", () => {
-  assert.match(ledger, /attributedAt: row\.attributedAt/);
-  assert.match(ledger, /settledNetCents/);
-  assert.match(ledger, /pendingNetCents/);
-  assert.match(ledger, /transactionsCount/);
-  assert.match(ledger, /readCampaignsWithRevenue/);
-  assert.match(ledger, /module\.exports[\s\S]*readCampaignsWithRevenue/);
+  assert.match(repository, /attributedAt:row\.attributedAt/);
+  const {financialMetrics}=require('./campaign-read-projection-service');
+  const {metricsDto}=require('./campaign-read-repository');
+  const m=metricsDto(financialMetrics({amountCents:100,netCents:80,transactionStatus:'done'}));
+  assert.equal(m.settledNetCents,80);assert.equal(m.pendingNetCents,0);assert.equal(m.transactionsCount,1);
+  assert.match(ledger, /readCampaignFanPage/);assert.match(ledger, /readCampaignPage/);
 });
 
 test("manual campaign scanner is isolated and has independent routes", () => {
@@ -63,6 +67,6 @@ test("campaign scanner persists fresh OF fan value as typed current state, not o
   assert.doesNotMatch(ledger, /valueSource: text\(item\.valueSource \?\? item\.source/);
   assert.match(ledger, /source: "CAMPAIGN_CLAIMER"/);
   assert.match(ledger, /CAMPAIGN_FAN_VALUE_SCOPE_MISMATCH/);
-  assert.match(ledger, /platformReportedFanSpendCents/);
+  assert.match(repository, /platformReportedFanSpendCents/);
   assert.doesNotMatch(schema.slice(schema.indexOf("model CreatorCampaignFan"), schema.indexOf("model CreatorEarningsDaily")), /totalNetCents|messagesNetCents|tipsNetCents/);
 });

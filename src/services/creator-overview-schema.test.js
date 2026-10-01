@@ -16,7 +16,8 @@ const migration = read("../prisma/migrations/20260809121500_creator_overview_v1/
 test("creator overview is a composed read model, not another raw analytics store", () => {
   assert.match(service, /readCreatorLedgerOverview/);
   assert.match(service, /creatorFinancialTransaction\.groupBy/);
-  assert.match(service, /creatorCampaignFan\.groupBy/);
+  assert.match(service, /readCampaignPage/);
+  assert.doesNotMatch(service, /creatorCampaignFan\.groupBy/);
   assert.match(service, /transactionStatus/);
   assert.match(service, /status === "undo"/);
   assert.match(service, /status === "loading"/);
@@ -82,21 +83,24 @@ test("task activity day index is queried separately so the renderer never needs 
 });
 
 test("campaign fan drill-down accepts the overview range and filters money by transaction occurredAt", () => {
-  const ledger = read("services/creator-analytics-ledger-service.js");
   assert.match(routes, /INVALID_CAMPAIGN_FAN_RANGE/);
-  assert.match(routes, /rangeKey/);
-  assert.match(ledger, /rangeKey = null/);
-  assert.match(ledger, /event\."occurredAt" >= \$4::timestamptz/);
-  assert.match(ledger, /event\."occurredAt" <= \$5::timestamptz/);
+  const {windowMembership}=require('./campaign-read-projection-service');
+  assert.deepEqual(windowMembership(new Date('2026-08-01'),new Date('2026-08-08')).ranges.includes('7d'),false);
+  assert.equal(windowMembership(new Date('2026-08-08'),new Date('2026-08-08')).ranges.includes('7d'),true);
+  const repository=read('services/campaign-read-repository.js');
+  assert.match(repository, /p\."rangeKey"=\$3/);
+  assert.match(repository, /CAMPAIGN_RANGE_UNSUPPORTED/);
 });
 
 test("campaign overview exposes current OF fan value even when claimer arrival timestamps are unavailable", () => {
-  assert.match(service, /readCampaignCurrentValues/);
-  assert.match(service, /CreatorFanValueCurrent/);
-  assert.match(service, /unknownAttributionFans/);
-  assert.match(service, /ofValueKnownFans/);
-  assert.match(service, /ofValuePayingFans/);
-  assert.match(service, /platformReportedFanSpendCents/);
+  assert.match(service, /campaigns: campaignPage/);
+  const projection=read('services/campaign-read-projection-service.js');
+  assert.match(projection, /CreatorFanValueCurrent/);
+  assert.match(projection, /unknownAttributionFans:row\.attributedAt==null\?1:0/);
+  const {valueMetrics}=require('./campaign-read-projection-service');
+  const now=new Date('2026-08-08');
+  const result=valueMetrics({availability:'AVAILABLE',fetchedAt:now,totalNetCents:123n},now);
+  assert.equal(result.metrics.ofValueKnownFans,'1');assert.equal(result.metrics.knownPlatformReportedFanSpendCents,'123');
 });
 
 

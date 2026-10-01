@@ -22,7 +22,9 @@ test("current Analytics read and billing entrypoints resolve PostgreSQL clock au
   assert.match(overview, /async function readCreatorTaskActivity[\s\S]*?if \(!authorityResolved\) now = await dbAuthorityNow/);
   assert.match(ledger, /async function readCreatorCoverage[\s\S]*?if \(!authorityResolved\) now = await dbAuthorityNow/);
   assert.match(ledger, /async function readCreatorLedgerOverview[\s\S]*?if \(!authorityResolved\) now = await dbAuthorityNow/);
-  assert.match(ledger, /async function readCampaignFans[\s\S]*?if \(!authorityResolved\) now = await dbAuthorityNow/);
+  assert.match(ledger, /readCampaignFanPage/);
+  const campaign = source("campaign-read-repository.js");
+  assert.match(campaign, /async function readCampaignFanPage[\s\S]*?await dbAuthorityNow\(\{db\}\)/);
   assert.match(billing, /async function readRolling30dRevenue[\s\S]*?if \(!authorityResolved\) now = await dbAuthorityNow/);
   assert.match(billing, /async function readRolling30dRevenueBatch[\s\S]*?now = await dbAuthorityNow/);
   assert.match(billing, /async function chargeMonthlyPeriod[\s\S]*?now = await dbAuthorityNow\(\{ db: tx, fallbackNow: now \}\);/);
