@@ -8,9 +8,12 @@ const {PGLiteSocketServer}=require(path.join(runtime,'node_modules/@electric-sql
 const baseFile=process.env.ONLINOD_PROOF_BASE_TAR || null;
 async function fixture({newMigrations=true}={}){
  let pg;
- if(baseFile&&fs.existsSync(baseFile))pg=await PGlite.create({loadDataDir:new Blob([fs.readFileSync(baseFile)])});
+ // Large read/index fixtures can use disposable disk storage instead of
+ // retaining every relation in WASM memory. Never points at a production DB.
+ const storage=process.env.ONLINOD_PROOF_DATA_DIR?{dataDir:path.resolve(process.env.ONLINOD_PROOF_DATA_DIR)}:{};
+ if(baseFile&&fs.existsSync(baseFile))pg=await PGlite.create({...storage,loadDataDir:new Blob([fs.readFileSync(baseFile)])});
  else{
-  pg=await PGlite.create();
+  pg=await PGlite.create(storage);
   const history=require(path.join(root,'scripts/database/phase7-applied-history.json')).migrations;
   const names=fs.readdirSync(path.join(root,'prisma/migrations')).filter(n=>n<'20261001'&&n!=='20260930190000_phase7_legacy_storage_contract_v1'&&fs.existsSync(path.join(root,'prisma/migrations',n,'migration.sql'))).sort();
   for(const name of names){

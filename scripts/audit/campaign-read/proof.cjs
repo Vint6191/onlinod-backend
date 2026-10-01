@@ -129,11 +129,10 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
  await check('maintenance catalog includes projection without resetting prior dispatch progress',async()=>{
   const progress=await require(path.join(root,'src/services/phase2-maintenance-admission-service')).readMaintenanceAdmissionProgress({db});assert.equal(progress.totalLanes,25);assert(progress.lanes.some(x=>x.name==='campaignReadProjection'));return{lanes:progress.totalLanes};
  });
- await check('a freshness-policy change rebuilds values without declaring old cached totals ready',async()=>{
-  const ttl=require(path.join(root,'src/services/analytics-freshness-policy')).CAMPAIGN_FAN_VALUE_FRESHNESS_MS;
-  await db.$executeRawUnsafe('UPDATE "CampaignReadState" SET "valueFreshnessMs"=$2 WHERE "creatorId"=$1',s.creatorId,Math.floor(ttl/2));
-  await db.$executeRawUnsafe('UPDATE "CampaignReadSeed" SET "valueFreshnessMs"=$1',Math.floor(ttl/2));
-  assert.equal((await page()).totals,null);const turns=await drain();const p=await page();assert.equal(p.totals.netCents,170);assert.equal(p.projection.valueFreshnessMs,ttl);assert(turns<=4);return{turns,netUnchanged:170};
+ await check('a database policy transition rebuilds cache without declaring previous generation ready',async()=>{
+  const before=await page(),ttl=before.projection.valueFreshnessMs;
+  await require(path.join(root,'src/services/campaign-projection-policy')).changeCampaignProjectionPolicy({db,expectedGeneration:before.projection.generation,valueFreshnessMs:Math.floor(ttl/2)});
+  assert.equal((await page()).totals,null);const turns=await drain();const p=await page();assert.equal(p.totals.netCents,170);assert.equal(p.projection.valueFreshnessMs,Math.floor(ttl/2));return{turns,netUnchanged:170};
  });
  await check('UTC rollover expires only due contributions; partially processed windows stay unavailable',async()=>{
   const day=new Date(new Date().toISOString().slice(0,10)+'T00:00:00Z'),tomorrow=new Date(+day+86400000),at=new Date(+day-6*86400000);
@@ -177,5 +176,5 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
   await drain();assert.equal((await page()).totals.netCents,215);
   return{pausedWithoutAcknowledgement:true,wakeBatch:1,postRestoreNet:215};
  });
- fs.writeFileSync(path.join(evidence,'campaign-sql-proof.json'),JSON.stringify({runtime:process.version,schema:'local disposable PGlite, 274 migrations',checks},null,2));
+ fs.writeFileSync(path.join(evidence,'campaign-sql-proof.json'),JSON.stringify({runtime:process.version,schema:'local disposable PGlite; all non-destructive migrations through Campaign execution v2',checks},null,2));
 }finally{await f.close()}})().catch(e=>{console.error(e.stack);process.exitCode=1}).finally(()=>{clearInterval(alive);clearTimeout(deadline)});

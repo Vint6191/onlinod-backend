@@ -2090,7 +2090,7 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
       ["messageLibraryTrash", () => require("./message-library-lifecycle-service").runMessageLibraryTrashMaintenance({ db })],
       ["adminBillingPricing", () => require("./admin-bulk-pricing-command-service").runAdminBulkPricingSweep({ db })],
       ["notificationHistoryRepair", () => require("./notification-history-repair-service").runNotificationHistoryRepairSweep({ db })],
-      ["campaignReadProjection", () => require("./campaign-read-projection-service").runCampaignProjectionSweep({ db })],
+      ["campaignReadProjection", () => require("./campaign-read-projection-service").seedCampaignProjection({ db })],
       ["trafficProjection", () => require("./traffic-projection-service").runTrafficProjectionSweep({ db })],
       ["analyticsPublication", () => require("./analytics-publication-service").runAnalyticsPublicationSweep({ db })],
       ["notificationConsequences", () => require("./notification-consequence-service").runNotificationConsequenceSweep({ db })],
@@ -2290,6 +2290,7 @@ function getRecurringSchedulerHealthSnapshot() {
     ...recurringSchedulerHealth,
     ...(analyticsDemandHealth.status === "DEGRADED" ? { status: "DEGRADED", lastReason: analyticsDemandHealth.lastReason } : {}),
     analyticsDemand: { ...analyticsDemandHealth },
+    campaignProjection: campaignProjectionExecutor?.snapshot() || null,
     lastDegraded: recurringSchedulerHealth.lastDegraded.map((entry) => ({ ...entry })),
   };
 }
@@ -2328,6 +2329,7 @@ function handleRecurringSweepTickResult(result) {
 let recurringTimer = null;
 let analyticsDemandTimer = null;
 let phase2MaintenanceTimer = null;
+let campaignProjectionExecutor = null;
 
 /**
  * Start the recurring scheduler. Call once at server startup.
@@ -2354,6 +2356,9 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
   }
 
   recurringTimer = setInterval(tick, intervalMs);
+  campaignProjectionExecutor = require("./campaign-projection-executor").startCampaignProjectionExecutor({
+    db: prisma, onError: error => console.error("[scheduler] Campaign projection degraded:", error),
+  });
 
   const analyticsDemandTick = () => {
     runAnalyticsCollectionDemandSweep({ db: prisma })
@@ -2394,6 +2399,8 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
 }
 
 function stopRecurringScheduler() {
+  campaignProjectionExecutor?.stop();
+  campaignProjectionExecutor = null;
   if (recurringTimer) {
     clearInterval(recurringTimer);
     recurringTimer = null;

@@ -16,7 +16,7 @@ const financial = read("services/financial-transactions-service.js");
 
 test("campaign money is derived from atomic financial transactions, not copied onto memberships", () => {
   assert.match(projection, /FINANCIAL: "CreatorFinancialTransaction"/);
-  assert.match(projection, /"attributedAt"<=\$4/);
+  assert.match(projection, /"attributedAt"<="phase3_utc_timestamp"\(\$4::timestamptz\)/);
   assert.match(projection, /ORDER BY "attributedAt" DESC,"id" DESC LIMIT 1/);
   assert.match(projection, /financialMetrics\(row\)/);
   assert.doesNotMatch(repository, /FROM "CreatorFinancialTransaction"/);

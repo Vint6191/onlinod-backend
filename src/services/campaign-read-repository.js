@@ -58,15 +58,18 @@ function decodeCursor(value,scope) {
 const encodeCursor=(scope,id)=>Buffer.from(JSON.stringify([...scope,id])).toString("base64url");
 const pageSize=value=>Math.max(1,Math.min(100,Math.floor(Number(value)||50)));
 async function readiness(db,creatorId,now) {
-  const [row]=await db.$queryRawUnsafe(`SELECT s."completedAt",s."valueFreshnessMs",
+  const [row]=await db.$queryRawUnsafe(`SELECT s."completedAt",s."generation",p."generation" AS "activeGeneration",p."valueFreshnessMs",
+    NOT EXISTS(SELECT 1 FROM "CreatorCampaign" c WHERE c."creatorId"=$1) AS empty,
     EXISTS(SELECT 1 FROM "DomainWorkItem" w WHERE w."creatorId"=$1 AND w."isOutstanding" AND w."workClass"=ANY($2::text[])
       AND w."workClass"<>'CAMPAIGN_CLOCK') AS pending,
-    EXISTS(SELECT 1 FROM "CampaignReadReceipt" r WHERE r."creatorId"=$1 AND r."nextDueAt"<=$3) AS expired,
+    EXISTS(SELECT 1 FROM "CampaignReadReceipt" r WHERE r."creatorId"=$1 AND r."nextDueAt"<="phase3_utc_timestamp"($3::timestamptz)) AS expired,
     (SELECT r."nextDueAt" FROM "CampaignReadReceipt" r WHERE r."creatorId"=$1 AND r."nextDueAt" IS NOT NULL ORDER BY r."nextDueAt","kind","sourceId" LIMIT 1) AS "nextChangeAt"
-    FROM "CampaignReadState" s WHERE s."creatorId"=$1`,creatorId,CLASSES,now);
-  const ready=Boolean(row?.completedAt&&row.valueFreshnessMs===CAMPAIGN_FAN_VALUE_FRESHNESS_MS&&!row.pending&&!row.expired);
-  return {ready,state:!row?.completedAt?"REBUILDING":ready?"READY":"PENDING",asOf:now.toISOString(),
-    valueFreshnessMs:CAMPAIGN_FAN_VALUE_FRESHNESS_MS,nextChangeAt:row?.nextChangeAt?.toISOString()||null};
+    FROM "CampaignProjectionPolicy" p LEFT JOIN "CampaignReadStateData" s ON s."creatorId"=$1 WHERE p."id"='active'`,creatorId,CLASSES,now);
+  if(!row)throw fault("CAMPAIGN_PROJECTION_POLICY_MISSING",503);
+  const current=row.generation===row.activeGeneration;
+  const ready=Boolean(row.empty || (current&&row.completedAt&&!row.pending&&!row.expired));
+  return {ready,empty:row.empty,generation:row.activeGeneration,state:ready?"READY":!current||!row.completedAt?"REBUILDING":"PENDING",asOf:now.toISOString(),
+    valueFreshnessMs:row.valueFreshnessMs,nextChangeAt:!row.empty&&current?row.nextChangeAt?.toISOString()||null:null};
 }
 async function sourceCoverage(db,creatorId,now) {
   const [financial,campaigns]=await Promise.all([
@@ -91,7 +94,7 @@ async function readCampaignPage({db,creatorId,rangeKey:key="all",cursor=null,lim
     db.creatorCampaign.findMany({where:{creatorId,id:{gt:after}},orderBy:{id:"asc"},take:take+1,
       select:{id:true,externalCampaignId:true,name:true,isActive:true,startedAt:true,endedAt:true,collectedAt:true,campaignType:true,trackingCode:true,trackingUrl:true,claimersCount:true,clicksCount:true}})]);
   const page=rows.slice(0,take),ids=["",...page.map(r=>r.id)];
-  const metrics=await db.$queryRawUnsafe('SELECT "campaignId","metrics" FROM "CampaignReadMetric" WHERE "creatorId"=$1 AND "rangeKey" IN ($2,\'current\') AND "fanId"=\'\' AND "campaignId"=ANY($3::text[])',creatorId,key,ids);
+  const metrics=projection.empty?[]:await db.$queryRawUnsafe('SELECT "campaignId","metrics" FROM "CampaignReadMetric" WHERE "creatorId"=$1 AND "rangeKey" IN ($2,\'current\') AND "fanId"=\'\' AND "campaignId"=ANY($3::text[])',creatorId,key,ids);
   const byId=combineMetrics(metrics,"campaignId");
   const bounds=displayRangeBounds(key,now);
   return {ok:true,contractVersion:VERSION,creatorId,range:{key,startAt:bounds.startAt.toISOString(),endAt:bounds.endAt.toISOString()},
@@ -99,15 +102,15 @@ async function readCampaignPage({db,creatorId,rangeKey:key="all",cursor=null,lim
     rows:page.map(row=>({...row,...metricsDto(byId.get(row.id),projection.ready)})),
     pagination:{limit:take,returned:page.length,hasMore:rows.length>take,nextCursor:rows.length>take?encodeCursor(scope,page.at(-1).id):null,order:"IMMUTABLE_ID",semantics:"LIVE_PAGES"}};
 }
-function fanValueDto(value,now) {
+function fanValueDto(value,now,freshnessMs=CAMPAIGN_FAN_VALUE_FRESHNESS_MS) {
   if(!value)return null;
   const observed=trustedCollectionTimestamp(value.valueObservedAt,now);
-  const available=Boolean(observed&&+observed+CAMPAIGN_FAN_VALUE_FRESHNESS_MS>+now&&value.availability==="AVAILABLE");
+  const available=Boolean(observed&&+observed+freshnessMs>+now&&value.availability==="AVAILABLE");
   const money=field=>available?safeInteger(value[field]):null;
   return {available,availability:value.availability,
     platformReportedTotalSpendCents:money("platformReportedTotalSpendCents"),messagesSpentCents:money("messagesSpentCents"),
     subscriptionsSpentCents:money("subscriptionsSpentCents"),tipsSpentCents:money("tipsSpentCents"),postsSpentCents:money("postsSpentCents"),streamsSpentCents:money("streamsSpentCents"),
-    observedAt:value.valueObservedAt.toISOString(),expiresAt:observed?new Date(+observed+CAMPAIGN_FAN_VALUE_FRESHNESS_MS).toISOString():null,
+    observedAt:value.valueObservedAt.toISOString(),expiresAt:observed?new Date(+observed+freshnessMs).toISOString():null,
     lastActivityAt:value.lastActivityAt?.toISOString()||null,source:value.source};
 }
 async function readCampaignFanPage({db,creatorId,campaignId,rangeKey:key="all",filter="ALL",cursor=null,limit=50,offset=0,now=null}) {
@@ -143,7 +146,7 @@ async function readCampaignFanPage({db,creatorId,campaignId,rangeKey:key="all",f
       const fan=row.fan;
       return [{id:row.id,externalClaimerId:row.externalClaimerId,attributedAt:row.attributedAt?.toISOString()||null,collectedAt:row.collectedAt.toISOString(),
         fan:{id:fan.id,onlyFansUserId:fan.onlyFansUserId,username:fan.username,displayName:fan.displayName,firstSeenAt:fan.firstSeenAt.toISOString(),lastSeenAt:fan.lastSeenAt.toISOString()},
-        fanValue:fanValueDto(fan.valueCurrent,now),revenue:metricsDto(byFan.get(row.fanRecordId),projection.ready)}];
+        fanValue:fanValueDto(fan.valueCurrent,now,projection.valueFreshnessMs),revenue:metricsDto(byFan.get(row.fanRecordId),projection.ready)}];
     }),pagination:{limit:take,returned:pageIds.length,hasMore:ids.length>take,nextCursor:ids.length>take?encodeCursor(scope,pageIds.at(-1).fanId):null,order:"IMMUTABLE_FAN_ID",semantics:"LIVE_PAGES"}};
 }
 module.exports={VERSION,safeInteger,metricsDto,rangeKey,decodeCursor,encodeCursor,readiness,fanValueDto,readCampaignPage,readCampaignFanPage};

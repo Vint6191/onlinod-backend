@@ -493,6 +493,7 @@ model CreatorAccount {
   campaignReadReceipts CampaignReadReceipt[]
   campaignReadMetrics CampaignReadMetric[]
   campaignReadRepairs CampaignReadRepair[]
+  campaignReadRepairIntervals CampaignReadRepairInterval[]
   trafficMetrics TrafficMetric[]
   trafficFanProjections TrafficFanProjection[]
   trafficReceiptProjections TrafficReceiptProjection[]
@@ -6799,6 +6800,8 @@ model TrafficProjectionSeed {
 }
 
 model CampaignReadState {
+  generation Int @default(0)
+  @@map("CampaignReadStateData")
   valueFreshnessMs Int?
   creatorId String @id
   agencyId String
@@ -6809,6 +6812,7 @@ model CampaignReadState {
   creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
 }
 model CampaignReadSeed {
+  generation Int @default(0)
   valueFreshnessMs Int?
   id String @id
   cursor String @default("")
@@ -6855,4 +6859,23 @@ model CampaignReadRepair {
   fromAt DateTime
   creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
   @@id([creatorId,fanId])
+}
+
+model CampaignProjectionPolicy {
+  id String @id
+  generation Int
+  valueFreshnessMs Int
+}
+
+model CampaignReadRepairInterval {
+  id BigInt @id @default(autoincrement())
+  agencyId String
+  creatorId String
+  fanId String
+  fromAt DateTime @db.Timestamp(3)
+  untilAt DateTime? @db.Timestamp(3)
+  cursorAt DateTime? @db.Timestamp(3)
+  cursorId String @default("")
+  creator CreatorAccount @relation(fields: [agencyId,creatorId], references: [agencyId,id], onDelete: Cascade)
+  @@index([creatorId,fanId,id], map: "CampaignReadRepairInterval_queue_v2")
 }

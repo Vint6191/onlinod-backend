@@ -5,7 +5,7 @@ function withTransactionClient(db) {
   db.$transaction = async work => {
     const { $transaction, ...tx } = db;
     const execute = tx.$executeRawUnsafe;
-    if (execute) tx.$executeRawUnsafe = (sql, ...args) => sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true)" ? 1 : execute(sql, ...args);
+    if (execute) tx.$executeRawUnsafe = (sql, ...args) => sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)" ? 1 : execute(sql, ...args);
     return work(tx);
   };
   return db;
