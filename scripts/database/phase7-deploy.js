@@ -8,7 +8,7 @@ const {reviewHistoricalMigration}=require('./phase7-historical-migrations');
 const root=path.resolve(__dirname,'../..');
 const CONTRACT='20260930190000_phase7_legacy_storage_contract_v1';
 const PRE=[['phase5-notification-history-indexes-online-preflight.js'],['phase4-execution-indexes-online-preflight.js'],['phase4-single-owner-preflight.js'],['phase3-analytics-legacy-snapshot-online-preflight.js'],['phase3-fandata-delivery-provenance-online-preflight.js'],['phase3-campaign-coverage-generation-online-preflight.js'],['phase3-a29-maintenance-check-online-preflight.js'],['phase3-domain-work-claim-online-rollout.js','--preflight']];
-const POST=[['phase3-domain-work-claim-online-rollout.js','--activate'],['phase3-subscriber-publication-schema-online-postflight.js'],['phase3-analytics-legacy-snapshot-online-postflight.js'],['actual60-refreshsession-online-index-preflight.js']];
+const POST=[['analytics-traffic-indexes.js','--create'],['phase3-domain-work-claim-online-rollout.js','--activate'],['phase3-subscriber-publication-schema-online-postflight.js'],['phase3-analytics-legacy-snapshot-online-postflight.js'],['actual60-refreshsession-online-index-preflight.js']];
 function run(args){return new Promise((resolve,reject)=>{const child=spawn(process.execPath,args,{cwd:root,env:process.env,stdio:'inherit'});child.on('error',reject);child.on('exit',code=>code===0?resolve():reject(new Error('PHASE7_DEPLOY_CHILD_FAILED:'+code)));});}
 async function migrationPlan(db,{contract=false,onCompatibility=report=>console.log(JSON.stringify(report)),onHistorical=report=>console.log(JSON.stringify(report))}={}){
   const dir=path.join(root,'prisma/migrations');const names=(await fs.readdir(dir,{withFileTypes:true})).filter(d=>d.isDirectory()).map(d=>d.name).sort();
@@ -43,7 +43,7 @@ async function migrationPlan(db,{contract=false,onCompatibility=report=>console.
   const purged=applied.some(x=>x.migration_name===CONTRACT&&x.finished_at&&!x.rolled_back_at);
   const fresh=!applied.some(x=>x.finished_at&&!x.rolled_back_at);
   if(fresh){const tables=await db.$queryRawUnsafe(`SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind IN ('r','p','v') AND c.relname<>'_prisma_migrations' LIMIT 1`);if(tables.length)throw new Error('PHASE7_UNBASELINED_DATABASE');}
-  return {fresh,purged,names:(contract||purged)?names:names.filter(x=>x<CONTRACT)};
+  return {fresh,purged,names:(contract||purged)?names:names.filter(x=>x!==CONTRACT)};
 }
 async function main({db=require('../../src/prisma'),contract=process.argv.includes('--contract'),hooks=true,commandRunner=run}={}){
   const plan=await migrationPlan(db,{contract});

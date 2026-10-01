@@ -83,7 +83,7 @@ test("agency removal revokes current access through canonical Creator lifecycle 
   assert.match(lifecycle, /retireCreatorCryptoMaterialOnRemoval/);
   assert.match(lifecycle, /deviceCreatorBinding\.updateMany/);
   assert.match(lifecycle, /jobInstance\.updateMany/);
-  assert.match(lifecycle, /status: \{ in: \["SCHEDULED", "CLAIMED", "FAILED"\] \}/);
+  assert.match(lifecycle, /status: \{ in: \["SCHEDULED", "PUBLISHING", "CLAIMED", "FAILED"\] \}/);
   assert.match(lifecycle, /creatorAccount\.update/);
   assert.match(lifecycle, /status: "DISABLED", deletedAt: retiredAt/);
   assert.doesNotMatch(removal, /creatorAccount\.delete|crmProfile\.(?:delete|deleteMany)|crmNote\.(?:delete|deleteMany)|dialogMessageLedger\.(?:delete|deleteMany)/);

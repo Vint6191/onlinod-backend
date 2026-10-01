@@ -427,14 +427,24 @@ async function ingestFinancialChartChunk({ db = prisma, job, deviceId, chunk }) 
   return { type: "financial_chart_total", category, grossCents, netCents, transactionsCount };
 }
 
-async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, result }) {
+function validateFinancialCompletion(job, result) {
   const payload = object(result);
   const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   const scanRunId = clean(payload.scanRunId, 120);
   if (!scanRunId || scanRunId !== command.generation) throw new Error("Financial transaction completion is missing server generation metadata");
+  if (payload.scannerRejected !== undefined && (!Number.isSafeInteger(payload.scannerRejected) || payload.scannerRejected < 0 || payload.scannerRejected > 100_000_000)) throw new Error("Financial completion counters are invalid");
+  return { payload, command, scanRunId };
+}
+
+async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, result, publication = null }) {
+  const { payload, command, scanRunId } = validateFinancialCompletion(job, result);
   const mode = command.mode;
   const baseWhere = { creatorId: job.creatorId, sourceJobId: job.id, scanRunId };
-  const [aggregate, count, statusGroups, chartTotal, storedOnly] = await Promise.all([
+  const [aggregate, count, statusGroups, chartTotal, storedOnly] = publication
+    ? [{ _sum: { amountCents: publication.grossCents, netCents: publication.netCents, feeCents: publication.feeCents } },
+      publication.count, Object.values(publication.statusGroups || {}),
+      await db.creatorEarningsTotal.findUnique({ where: { creatorId_category: { creatorId: job.creatorId, category: "TOTAL" } } }), publication.storedOnly]
+    : await Promise.all([
     db.creatorFinancialTransaction.aggregate({
       where: baseWhere,
       _sum: { amountCents: true, netCents: true, feeCents: true },
@@ -530,6 +540,7 @@ module.exports = {
   ingestFinancialTransactionsChunk,
   ingestFinancialChartChunk,
   completeFinancialTransactionsScan,
+  validateFinancialCompletion,
   recordFinancialCollectionFailure,
   summarizeStatusGroups,
   REFUND_TRANSACTION_STATUSES,

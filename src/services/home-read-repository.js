@@ -19,9 +19,9 @@ function revenueSql(source = 'visible') {
     UNION ALL SELECT 1,$8::date,$9::date),
   covered AS (
     SELECT c."id",r.period,r.end_day-r.start_day+1 AS expected,
-      COUNT(v."id") FILTER (WHERE p."status"='COMMITTED' AND
+      COUNT(v."id") FILTER (WHERE p."status"='COMMITTED' AND p."proofVersion"=2 AND
         (v."status"='COMPLETE' OR (v."coverageDate"=$10::date AND v."status"='PARTIAL'))) AS usable,
-      COUNT(v."id") FILTER (WHERE p."status"='COMMITTED' AND
+      COUNT(v."id") FILTER (WHERE p."status"='COMMITTED' AND p."proofVersion"=2 AND
         (v."status"='COMPLETE' OR (v."coverageDate"=$10::date AND v."status"='PARTIAL'))
         AND v."lastVerifiedAt"<=$11::timestamp+interval '5 minutes'
         AND v."lastVerifiedAt">=$11::timestamp-(CASE WHEN v."coverageDate"=$10::date THEN ${CURRENT_DAY_FRESHNESS_MS}
@@ -34,7 +34,7 @@ function revenueSql(source = 'visible') {
     SELECT d."creatorId",r.period,d."date",d."totalCents",d."collectedAt"
     FROM ${source} c JOIN "CreatorEarningsDaily" d ON d."creatorId"=c."id" AND d."agencyId"=$1 AND d."sourceTimezone"='UTC'
       JOIN periods r ON d."date" BETWEEN r.start_day AND r.end_day
-      JOIN "AnalyticsScanProof" p ON p."id"=d."scanProofId" AND p."status"='COMMITTED' AND p."agencyId"=$1 AND p."creatorId"=c."id"
+      JOIN "AnalyticsScanProof" p ON p."id"=d."scanProofId" AND p."status"='COMMITTED' AND p."proofVersion"=2 AND p."agencyId"=$1 AND p."creatorId"=c."id"
   ), earnings AS (
     SELECT "creatorId",period,COUNT(*) AS days,SUM("totalCents") AS cents,MAX("collectedAt") AS captured
     FROM daily GROUP BY "creatorId",period
@@ -57,7 +57,7 @@ function pendingSql(source = 'visible') {
       AND d."coverageFrom"<=$6::date AND d."coverageTo">=$7::date
   ), pending AS (
     SELECT c."id" FROM ${source} c WHERE EXISTS (SELECT 1 FROM "JobInstance" j WHERE j."agencyId"=$1
-      AND j."creatorId"=c."id" AND j."jobKey"='fetch_earnings' AND j."status" IN ('SCHEDULED','CLAIMED'))
+      AND j."creatorId"=c."id" AND j."jobKey"='fetch_earnings' AND j."status" IN ('SCHEDULED','CLAIMED','PUBLISHING'))
     OR EXISTS (SELECT 1 FROM live_demands d WHERE (d."creatorIds" IS NULL OR d."creatorIds"='null'::jsonb OR d."creatorIds" ? c."id")
       AND (d.broad OR EXISTS (SELECT 1 FROM "AgencyMemberCreatorAccessCurrent" x
         WHERE x."memberId"=d."requestedByMemberId" AND x."agencyId"=$1
@@ -118,7 +118,7 @@ async function readHomeCreatorPage(input) {
 }
 async function readHomeJobCounts(input) {
   const rows = await input.db.$queryRawUnsafe(`${scopeSql()} SELECT j."status",COUNT(*) AS count FROM "JobInstance" j
-    JOIN visible c ON c."id"=j."creatorId" WHERE j."agencyId"=$1 AND j."status" IN ('SCHEDULED','CLAIMED') GROUP BY j."status"`,...scopeParams(input));
+    JOIN visible c ON c."id"=j."creatorId" WHERE j."agencyId"=$1 AND j."status" IN ('SCHEDULED','CLAIMED','PUBLISHING') GROUP BY j."status"`,...scopeParams(input));
   return Object.fromEntries(rows.map(r=>[r.status,number(r.count)]));
 }
 module.exports = { MAX_PAGE_SIZE, pageInput, readHomeTotals, readHomeCreatorPage, readHomeJobCounts, __test:{revenueSql,pendingSql,revenueParams} };

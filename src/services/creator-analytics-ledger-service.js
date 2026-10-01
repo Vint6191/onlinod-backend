@@ -464,6 +464,7 @@ async function setCoverage(tx, { agencyId, creatorId, job, batchId, dataType, da
     },
     update: {
       ingestBatchId: batchId,
+      ...(dataType === "EARNINGS" ? { scanProofId: null } : {}),
       status,
       coveredFromAt: from,
       coveredToAt: to,
@@ -631,7 +632,7 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
   });
 }
 
-async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
+function validateEarningsCompletion(job, result) {
   requireJob(job);
   const payload = object(result);
   const scanRunId = text(payload.scanRunId, 120);
@@ -658,7 +659,13 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
   }
   const key = `earnings:${job.id}:run:${scanRunId}:completion:v4`;
   if (key.length > 240) throw new Error("Earnings completion idempotency key exceeds 240 characters");
+  return { payload, scanRunId, expectedDailyBatches, expectedDailyCount, scannerRejected, observedAt, requestedRange, startDate, endDate, key };
+}
+
+async function completeEarningsScan({ db = prisma, job, deviceId, result, publication = null }) {
+  const { payload, scanRunId, expectedDailyBatches, expectedDailyCount, scannerRejected, observedAt, requestedRange, startDate, endDate, key } = validateEarningsCompletion(job, result);
   return inTransaction(db, async (tx) => {
+    await acquireAnalyticsLock(tx, "creator-earnings", job.creatorId);
     const serverReceivedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const { batch, replay } = await beginBatch(tx, {
       job,
@@ -672,7 +679,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
       payload,
     });
     const prefix = `earnings:${job.id}:run:${scanRunId}:daily:`;
-    const pageBatches = await tx.analyticsIngestBatch.findMany({
+    const pageBatches = publication ? [] : await tx.analyticsIngestBatch.findMany({
       where: {
         sourceJobId: job.id,
         dataType: "EARNINGS",
@@ -680,15 +687,16 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
       },
       select: { id: true, status: true, receivedRows: true, rejectedRows: true },
     });
-    const acceptedRows = pageBatches.reduce((sum, row) => sum + row.receivedRows - row.rejectedRows, 0);
-    const allCommitted = pageBatches.every((row) => row.status === "COMMITTED" && row.rejectedRows === 0);
-    const persistedDailyCount = await tx.creatorEarningsDaily.count({
-      where: { creatorId: job.creatorId, date: { gte: startDate, lte: endDate } },
+    const observedDailyBatches = publication ? publication.batches : pageBatches.length;
+    const acceptedRows = publication ? publication.acceptedRows : pageBatches.reduce((sum, row) => sum + row.receivedRows - row.rejectedRows, 0);
+    const allCommitted = publication ? publication.rejectedBatches === 0 : pageBatches.every((row) => row.status === "COMMITTED" && row.rejectedRows === 0);
+    const persistedDailyCount = publication ? publication.persistedDailyCount : await tx.creatorEarningsDaily.count({
+      where: { creatorId: job.creatorId, sourceJobId: job.id, sourceScanRunId: scanRunId, sourceTimezone: "UTC", date: { gte: startDate, lte: endDate } },
     });
     const requestedDayCount = Math.floor((requestedRange.dayEnd.getTime() - requestedRange.dayStart.getTime()) / 86_400_000) + 1;
     const proof = {
       expectedDailyBatches,
-      observedDailyBatches: pageBatches.length,
+      observedDailyBatches,
       expectedDailyCount,
       requestedDayCount,
       acceptedRows,
@@ -703,7 +711,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
       payload.dailyComplete === true &&
       scannerRejected === 0 &&
       allCommitted &&
-      pageBatches.length === expectedDailyBatches &&
+      observedDailyBatches === expectedDailyBatches &&
       expectedDailyCount === requestedDayCount &&
       acceptedRows === expectedDailyCount &&
       persistedDailyCount === expectedDailyCount;
@@ -716,7 +724,8 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
       where: { creatorId_dataType_scanRunId: { creatorId: job.creatorId, dataType: "EARNINGS", scanRunId } },
     });
     if (scanProof) {
-      if (scanProof.payloadChecksum !== batch.payloadChecksum
+      if (scanProof.agencyId !== job.agencyId || scanProof.sourceJobId !== job.id
+        || scanProof.payloadChecksum !== batch.payloadChecksum
         || utcDay(scanProof.scanFrom).getTime() !== requestedRange.dayStart.getTime()
         || utcDay(scanProof.scanTo).getTime() !== requestedRange.dayEnd.getTime()) {
         throw new Error("Analytics scan proof idempotency conflict");
@@ -726,9 +735,9 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
     // A late replay may therefore arrive after retention removed both page and
     // completion batches. Matching COMMITTED durable proof remains sufficient
     // business evidence; technical history must never be required to re-prove it.
-    const durableCommittedReplay = scanProof?.status === "COMMITTED";
+    const durableCommittedReplay = scanProof?.status === "COMMITTED" && scanProof?.proofVersion === 2;
     const complete = evaluatedComplete || durableCommittedReplay;
-    const desiredStatus = complete ? "COMMITTED" : "PARTIAL";
+    const desiredStatus = complete && publication?.prepareOnly !== true ? "COMMITTED" : "PARTIAL";
     const completionBatch = (!replay || batch.status !== desiredStatus)
       ? await finishBatch(
         tx,
@@ -740,7 +749,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
       )
       : batch;
 
-    const proofRejectedRows = pageBatches.reduce((sum, row) => sum + Number(row.rejectedRows || 0), 0) + scannerRejected;
+    const proofRejectedRows = (publication ? publication.rejectedRows : pageBatches.reduce((sum, row) => sum + Number(row.rejectedRows || 0), 0)) + scannerRejected;
     if (scanProof) {
 
       // Completion is intentionally replayable. A first attempt may arrive before
@@ -750,12 +759,13 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
       // promoted to COMMITTED, but an already-COMMITTED durable proof is never
       // downgraded because operational page history was compacted or a stale retry
       // observed less transient execution evidence.
-      if (scanProof.status !== "COMMITTED") {
+      if (scanProof.status !== "COMMITTED" || scanProof.proofVersion !== 2) {
         scanProof = await tx.analyticsScanProof.update({
           where: { id: scanProof.id },
           data: {
             status: desiredStatus,
-            committedAt: complete ? serverReceivedAt : null,
+            proofVersion: 2,
+            committedAt: desiredStatus === "COMMITTED" ? serverReceivedAt : null,
             serverReceivedAt,
             clientObservedAt: observedAt,
             sourceDeviceId: deviceId || scanProof.sourceDeviceId || null,
@@ -778,8 +788,9 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
           requestedAt: requestedRange.contract.requestedAt,
           clientObservedAt: observedAt,
           serverReceivedAt,
-          committedAt: complete ? serverReceivedAt : null,
+          committedAt: desiredStatus === "COMMITTED" ? serverReceivedAt : null,
           status: desiredStatus,
+            proofVersion: 2,
           collectorVersion: EARNINGS_COLLECTOR_VERSION,
           schemaVersion: EARNINGS_SCHEMA_VERSION,
           scanGeneration: requestedRange.contract.scanGeneration,
@@ -793,6 +804,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
       });
     }
 
+    if (!publication) {
     await tx.creatorEarningsDaily.updateMany({
       where: { creatorId: job.creatorId, sourceJobId: job.id, sourceScanRunId: scanRunId },
       data: { scanProofId: scanProof.id, sourceScanRequestedAt: requestedRange.contract.requestedAt },
@@ -823,6 +835,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result }) {
           retryAfterAt: null,
         },
       });
+    }
     }
     return { batchId: batch.id, scanProofId: scanProof.id, complete, replay: replay || durableCommittedReplay, proof };
   });
@@ -1995,14 +2008,13 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaign
   };
 }
 
-async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
+function validateCampaignCompletion(job, result) {
   requireJob(job);
   const payload = object(result);
   const command = collectionCommand(job, COLLECTOR_TYPES.CAMPAIGNS);
   const scanRunId = text(payload.scanRunId, 120);
   const scanStartedAt = command.requestedAt;
   const directoryReuse = campaignDirectoryReuseBinding(job);
-  const processObservedAt = new Date();
   if (
     payload.schemaVersion !== CAMPAIGN_SCHEMA_VERSION || !CAMPAIGN_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion) ||
     !scanRunId || scanRunId !== command.generation
@@ -2018,6 +2030,12 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
   }
   const key = `campaigns:${job.id}:run:${scanRunId}:completion:${payload.collectorVersion}`;
   if (key.length > 240) throw new Error("Campaign completion idempotency key exceeds 240 characters");
+  return { payload, command, scanRunId, scanStartedAt, directoryReuse, protocolCurrent, expectedCampaignBatches, expectedClaimerBatches, expectedCampaignCount, key };
+}
+
+async function completeCampaignScan({ db = prisma, job, deviceId, result, publication = null }) {
+  const { payload, command, scanRunId, scanStartedAt, directoryReuse, protocolCurrent, expectedCampaignBatches, expectedClaimerBatches, expectedCampaignCount, key } = validateCampaignCompletion(job, result);
+  const processObservedAt = new Date();
   return inTransaction(db, async (tx) => {
     await enterCampaignWriterGeneration({ db: tx });
     await acquireCampaignTransactionLock(tx, job.creatorId);
@@ -2055,7 +2073,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
       directoryGeneration = directoryReuse.generation;
       directoryRequestedAt = directoryReuse.requestedAt;
     }
-    const observedCampaignCount = await tx.creatorCampaign.count({
+    const observedCampaignCount = publication ? publication.observedCampaignCount : await tx.creatorCampaign.count({
       where: { creatorId: job.creatorId, sourceScanRunId: directoryGeneration, sourceScanStartedAt: directoryRequestedAt },
     });
     const directoryProofComplete = directoryReuse
@@ -2146,6 +2164,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
     const providerTraversalComplete = membershipComplete;
     const currentMembershipComplete = membershipComplete && frontierFreshnessComplete;
     const complete = currentMembershipComplete && fanValuesComplete;
+    if (publication?.prepareOnly === true) return { complete, providerTraversalComplete, protocolCurrent, proof };
     const desiredBatchStatus = complete ? "COMMITTED" : providerTraversalComplete ? "COMMITTED" : "PARTIAL";
     if (!replay || batch.status !== desiredBatchStatus) {
       await finishBatch(
@@ -2157,7 +2176,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result }) {
         complete ? null : proofMessage(proof),
       );
     }
-    if (membershipComplete && !directoryReuse) {
+    if (membershipComplete && !directoryReuse && !publication) {
       await tx.creatorCampaign.updateMany({
         where: {
           creatorId: job.creatorId,
@@ -2446,7 +2465,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
       },
       select: {
         coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, lastErrorCode: true,
-        scanProofId: true, scanProof: { select: { status: true } },
+        scanProofId: true, scanProof: { select: { status: true, proofVersion: true } },
       },
       orderBy: { coverageDate: "asc" },
     }),
@@ -2510,7 +2529,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     const isCurrentDay = day.getTime() === currentDay.getTime();
     const state = evaluateCollectionState({
       status: row.status,
-      proofStatus: row.scanProof?.status || null,
+      proofStatus: row.scanProof?.proofVersion === 2 ? row.scanProof.status : null,
       lastVerifiedAt: row.lastVerifiedAt || null,
       retryAfterAt: row.retryAfterAt || null,
       now,
@@ -2865,6 +2884,8 @@ async function readCampaignsWithRevenue({ db = prisma, creatorId, limit = 100, o
 }
 
 module.exports = {
+  validateEarningsCompletion,
+  validateCampaignCompletion,
   ingestEarningsChunk,
   completeEarningsScan,
   ingestCampaignChunk,

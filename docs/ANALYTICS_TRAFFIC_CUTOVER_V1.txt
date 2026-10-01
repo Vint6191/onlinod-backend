@@ -1,0 +1,74 @@
+ANALYTICS / TRAFFIC AUTHORITY CONSOLIDATION V1
+Base: Actual102 / ONLINOD_PHASE7_ARCHIVE_DEFAULTS_FIX_V5. 2026-10-01.
+
+Deployment scope
+Apply matching Backend and Desktop sources. Existing Node requirements remain unchanged.
+Use the normal npm install / npm run prisma:migrate Backend path and npm run build
+for Desktop. Do not edit applied migration files or invoke the Phase7 --contract.
+The normal wrapper preserves its existing pre/postflight checks, selects both new
+forward migrations, and then builds 16 indexes CONCURRENTLY outside migration TX.
+An invalid existing index is a deployment error; the installer never drops it silently.
+
+Publication protocol
+The three Analytics /complete commands atomically accept an immutable receipt and
+move the leased JobInstance to PUBLISHING. From that commit, the server publishes
+already accepted facts. Actor revocation after acceptance does not orphan the work;
+creator/agency retirement and explicit cancellation still stop it. Identical replay
+requires the original actor/device/token/revision and canonical payload checksum.
+A client that lost the response may replay while its access fence remains current.
+Publication consumes durable DomainWork and bounded transactions. Successful
+completion and the final proof commit together. A partial provider traversal creates
+a fresh scan generation and retry boundary. Repeated rejected traversals eventually
+fail visibly; infrastructure/contract failures are recorded rather than reported DONE.
+
+Earnings proof v2 counts unique UTC days from the exact source job and scan run.
+Another run's retained row cannot fill a hole. Input revision changes restart the walk.
+Coverage links are provisional until the final COMMITTED proof. Historical v1 proofs
+remain in storage but cannot establish current Home freshness; affected ranges need
+reverification. Data is retained. Temporary pending coverage after deployment is expected.
+Campaign traversal proof is separate from delegated FanData freshness. Financial
+reconciliation accumulates bounded pages from the current run. Desktop shows the
+server publication stage as active and prevents the manual stop race at that boundary.
+
+Traffic protocol
+Campaigns are the provider source; FanData is the current value source; canonical
+subscription receipts supply subscription revenue. The independent Traffic collector
+and direct source/subscription/value-refresh writer routes are retired. Old requests
+receive 410. Database guards also block old direct provider writes.
+Source IDs, manual costs, cost revision and currency are retained. Projections capture
+old/new deltas, with a durable resumable backfill. Creator-wide fan value is deduplicated;
+per-source attribution can legitimately include the same fan in several sources.
+Reads use cached aggregate points / bounded calendar windows and keyset pages. Receipt
+attribution repair does not run an unbounded historical UPDATE. Retained memberships
+are not deleted just because an old value refresh is overdue. Creator retirement
+continues to own lifecycle deletion.
+
+External Traffic read contract is version 2. 'projection.ready' means the projection
+queue is caught up; it does not claim provider completeness. 'providerCoverage' reports
+Campaign evidence separately. Desktop retains projection state and pagination cursors.
+Overview and member inputs accept limit <=500, after, or offset <=10000 (not both).
+Overview defaults to 100 sources. Consumers must follow nextCursor / hasMore.
+Range windows are UTC calendar days with an exclusive end. '24h' means the current UTC
+day, 7d/30d/etc include today, all means all retained receipts. This calendar contract
+must be respected by external clients; old rolling-hour semantics are not implied.
+Fan value remains lifetime provider-reported value, while receipt revenue uses the
+selected calendar range. No FX conversion is introduced by this change.
+
+Verification
+Portable SQL proofs: scripts/audit/analytics-traffic/{publication,traffic,deploy}-proof.cjs.
+Generate the matching Prisma client first. Set ONLINOD_SQL_PROOF_RUNTIME to a local
+installation containing @electric-sql/pglite and @electric-sql/pglite-socket. Proofs
+create a disposable loopback database; they do not use an external DATABASE_URL.
+An optional ONLINOD_PROOF_BASE_TAR caches the 270 prior migrations for repeated proofs.
+The migration proof disables Prisma checkpoint telemetry, uses actual Prisma CLI,
+checks repeat installation, all old checksums and exclusion of the destructive contract.
+Its hooks=false is TEST-ONLY: PGlite cannot prove the existing distinct-session
+preflight. Production phase7-deploy.js still runs every hook by default.
+
+Acceptance boundary
+Local SQL / service / failure-injection checks and a production Desktop build pass.
+The full suite retains pre-existing failures; see the accompanying verification report.
+Native multi-session PostgreSQL, actual Node22/Render deployment, Windows, sustained
+load and the project-wide provider/maintenance capacity budget remain OPEN.
+Do not label this SOURCE CLOSED + SCALE CLOSED or the whole project migrated/closed.
+The next step is applying to the test installation and auditing its new actual.

@@ -27,7 +27,7 @@ function deriveCampaignPresentationStatus({
     : refreshPending ? "PENDING"
       : (normalizedMembership === "MISSING" && normalizedFan === "MISSING" ? "MISSING" : "PARTIAL");
   let status = normalizedCollector;
-  const collectorActive = ["RUNNING", "QUEUED", "PAUSED"].includes(normalizedCollector);
+  const collectorActive = ["RUNNING", "QUEUED", "PUBLISHING", "PAUSED"].includes(normalizedCollector);
   if (currentCoverageAuthoritative === true && !collectorActive) {
     // Current canonical coverage is the operational authority. A stale/missing
     // manual collector must not hide automatic delegated debt or keep an old

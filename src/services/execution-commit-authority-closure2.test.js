@@ -410,22 +410,13 @@ function loadJobResultForTraffic(db, upsertTrafficSourceScan) {
   return fresh("./job-result-service");
 }
 
-test("Closure2 delayed Traffic T1 cannot replace a newer T2 projection", async () => {
+test("Traffic legacy completion refuses both older and newer independent writers", async () => {
   let writes = 0;
-  const tx = {
-    $queryRawUnsafe: async (sql) => { if (/pg_advisory_xact_lock/.test(String(sql))) throw new Error("void deserialization"); return []; },
-    $executeRawUnsafe: async () => 1,
-    jobInstance: { findMany: async () => [{ id: "T2", result: { scanStartedAt: "2026-08-31T10:02:00.000Z" }, createdAt: new Date("2026-08-31T10:01:00.000Z") }] },
-  };
-  const service = loadJobResultForTraffic({}, async () => { writes += 1; return { ok: true }; });
-  const result = await withTestCommit(tx, () => service.applyJobResult({
-    db: tx,
-    job: { id: "T1", jobKey: "traffic_sources_scan", agencyId: "agency-1", creatorId: "creator-1", createdAt: new Date("2026-08-31T10:00:00.000Z") },
-    deviceId: "device-1", userId: "user-1",
-    result: { scanStartedAt: "2026-08-31T10:00:30.000Z", sources: [] },
-  }));
-  assert.equal(result.sideEffect, "STALE_NOOP");
-  assert.equal(result.newerJobId, "T2");
+  const tx = { $executeRawUnsafe: async () => 1 };
+  const service = loadJobResultForTraffic({}, async () => { writes++; });
+  for (const id of ["T1", "T2"]) await assert.rejects(() => withTestCommit(tx, () => service.applyJobResult({
+    db: tx, job: { id, jobKey: "traffic_sources_scan", agencyId: "agency-1", creatorId: "creator-1" }, result: { sources: [] },
+  })), e => e.status === 410);
   assert.equal(writes, 0);
 });
 

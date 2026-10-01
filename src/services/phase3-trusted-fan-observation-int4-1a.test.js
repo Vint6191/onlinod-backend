@@ -220,7 +220,7 @@ test("INT4.4A point refresh requires a server-requested fan scope", async () => 
 });
 
 
-test("INT4.4A point refresh value bookkeeping uses PostgreSQL receipt time, not producer/process wall clock", async () => {
+test("Traffic value projection follows canonical FanData; point refresh has no parallel member writer", async () => {
   const db = makeDb();
   const authorityNow = new Date("2026-09-16T18:45:00.000Z");
   db.$queryRawUnsafe = async () => [{ authorityNow }];
@@ -241,9 +241,9 @@ test("INT4.4A point refresh value bookkeeping uses PostgreSQL receipt time, not 
       }],
     },
   });
-  assert.ok(trafficUpdate?.data?.lastValueFetchedAt instanceof Date);
-  assert.equal(trafficUpdate.data.lastValueFetchedAt.toISOString(), authorityNow.toISOString());
-  assert.notEqual(trafficUpdate.data.lastValueFetchedAt.toISOString(), "2099-01-01T00:00:00.000Z");
+  assert.equal(trafficUpdate, null, "canonical value trigger owns bounded Traffic projection");
+  assert.equal(db.value.platformReportedTotalSpendCents, 123n);
+  assert.equal(db.value.valueObservedAt.toISOString(), "2026-09-16T15:00:00.000Z");
 });
 
 test("INT5.1A point refresh canonical time is server job generation, not delayed receipt or client clock", async () => {

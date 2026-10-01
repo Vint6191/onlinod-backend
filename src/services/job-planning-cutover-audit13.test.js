@@ -36,7 +36,6 @@ test("scheduler and domain planners use the planning repository instead of hand-
     "services/likes-service.js",
     "services/sfs-service.js",
     "services/subscriber-directory-service.js",
-    "services/traffic-service.js",
     "services/vault-unsorted-service.js",
     "services/dialog-intelligence-service.js",
     "routes/dialog-intelligence.js",
@@ -48,6 +47,13 @@ test("scheduler and domain planners use the planning repository instead of hand-
     const source = fs.readFileSync(path.join(ROOT, rel), "utf8");
     assert.match(source, /job-planning-repository/, rel);
   }
+});
+
+test("Traffic refresh delegates to the canonical Campaign planning command", () => {
+  const source = fs.readFileSync(path.join(ROOT, "services/traffic-service.js"), "utf8");
+  assert.match(source, /startManualCampaignScan/);
+  assert.match(source, /isCommitTransaction/);
+  assert.doesNotMatch(source, /traffic_sources_scan|jobInstance\.(?:create|upsert|update)/);
 });
 
 test("only execution/recovery authorities may directly return JobInstance to SCHEDULED", () => {

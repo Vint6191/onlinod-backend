@@ -242,14 +242,15 @@ test("freshness requires a COMMITTED durable scan proof, not merely a proof id",
     retryAfterAt: null,
     scanProofId: "proof-1",
   };
-  assert.equal(planner.coverageFresh({ ...base, scanProof: { status: "PARTIAL" } }, day, now), false);
-  assert.equal(planner.coverageFresh({ ...base, scanProof: { status: "COMMITTED" } }, day, now), true);
+  assert.equal(planner.coverageFresh({ ...base, scanProof: { status: "PARTIAL", proofVersion: 2 } }, day, now), false);
+  assert.equal(planner.coverageFresh({ ...base, scanProof: { status: "COMMITTED", proofVersion: 1 } }, day, now), false, "legacy proof cannot verify current coverage");
+  assert.equal(planner.coverageFresh({ ...base, scanProof: { status: "COMMITTED", proofVersion: 2 } }, day, now), true);
 });
 
 test("old earnings are never FINAL and are periodically reverified for provider corrections", () => {
   const now = new Date("2026-09-08T12:00:00.000Z");
   const oldDay = new Date("2026-05-01T00:00:00.000Z");
-  const proof = { status: "COMMITTED" };
+  const proof = { status: "COMMITTED", proofVersion: 2 };
   const freshOld = {
     coverageDate: oldDay, status: "COMPLETE", scanProofId: "proof-old", scanProof: proof,
     lastVerifiedAt: new Date(now.getTime() - 29 * 86_400_000), retryAfterAt: null,
@@ -583,7 +584,7 @@ test("Home demand yields bounded slices and resumes its durable cursor across th
           lastVerifiedAt: now,
           retryAfterAt: null,
           scanProofId: `proof-${creator.id}-${isoDay(coverageDate)}`,
-          scanProof: { status: "COMMITTED" },
+          scanProof: { status: "COMMITTED", proofVersion: 2 },
         })));
       },
     },
@@ -670,7 +671,7 @@ test("accessEpoch revocation during demand processing is checked before each cre
       const ids = new Set(where.creatorId.in);
       return creators.filter((creator) => ids.has(creator.id)).flatMap((creator) => daysInclusive(where.coverageDate.gte, where.coverageDate.lte).map((coverageDate) => ({
         creatorId: creator.id, coverageDate, status: isoDay(coverageDate) === isoDay(where.coverageDate.lte) ? "PARTIAL" : "COMPLETE",
-        lastVerifiedAt: now, retryAfterAt: null, scanProofId: `proof-${creator.id}-${isoDay(coverageDate)}`, scanProof: { status: "COMMITTED" },
+        lastVerifiedAt: now, retryAfterAt: null, scanProofId: `proof-${creator.id}-${isoDay(coverageDate)}`, scanProof: { status: "COMMITTED", proofVersion: 2 },
       })));
     } },
   };
@@ -804,7 +805,7 @@ function boundedDemandFixture(count = 10, member = {}) {
       covered.push(...where.creatorId.in);
       return where.creatorId.in.flatMap((creatorId) => daysInclusive(where.coverageDate.gte, where.coverageDate.lte).map((coverageDate) => ({
         creatorId, coverageDate, status: "COMPLETE", lastVerifiedAt: now,
-        scanProofId: "committed", scanProof: { status: "COMMITTED" },
+        scanProofId: "committed", scanProof: { status: "COMMITTED", proofVersion: 2 },
       })));
     } },
   };

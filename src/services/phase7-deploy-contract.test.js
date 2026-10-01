@@ -4,7 +4,8 @@ const {validateEvidence}=require('./phase7-contract-evidence');
 const {GENERATION}=require('./phase7-legacy-storage-service');
 const {PRE,POST}=require('../../scripts/database/phase7-deploy');
 test('Phase7 deploy retains every preflight and postflight in the production wrapper',()=>{
- assert.equal(PRE.length,8);assert.equal(POST.length,4);
+ assert.deepEqual(POST[0], ["analytics-traffic-indexes.js", "--create"]);
+ assert.equal(PRE.length,8);assert.equal(POST.length,5);
  const source=fs.readFileSync(path.join(__dirname,'../../scripts/database/phase7-deploy.js'),'utf8');
  assert(source.indexOf('if(hooks&&!plan.fresh)')<source.indexOf("'migrate','deploy'"));
  assert(source.indexOf("'migrate','deploy'")<source.indexOf('if(hooks){if(plan.fresh)'));

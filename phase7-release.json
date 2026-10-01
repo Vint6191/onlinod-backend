@@ -2,11 +2,11 @@
   "version": 1,
   "generation": "phase7_legacy_storage_v1",
   "planHash": "9fb409e3d948c17e3f71914de68c0ef2de116ffa250c73eb48191d1466eab2ac",
-  "packageId": "ONLINOD_PHASE7_ARCHIVE_DEFAULTS_FIX_V5",
-  "baseBackendHash": "c966c17631dd1293964fd97fe3af697752f3ce638d3ca072af4e39abb24d5d00",
-  "baseDesktopHash": "191b46830e4540699304f9ad50023d58c90fb23b1da526338381ed6506384017",
-  "backendHash": "5f07d6c77660825d8c7aec4c352c401f15cd7da5e009249854dcb7dd0b182bb2",
-  "desktopHash": "c2dc5d4cef3857a734adbc0c0bb0adc61d28a52df87ccbac685597729131439d",
+  "packageId": "ONLINOD_ANALYTICS_TRAFFIC_AUTHORITY_V1",
+  "baseBackendHash": "5f07d6c77660825d8c7aec4c352c401f15cd7da5e009249854dcb7dd0b182bb2",
+  "baseDesktopHash": "c2dc5d4cef3857a734adbc0c0bb0adc61d28a52df87ccbac685597729131439d",
+  "backendHash": "5d65023dbc123f7a1fe7898838a4025b4c03db5fe903d91c4a043e0417b9a4a5",
+  "desktopHash": "1fee6ee00f5de138d00b833dd9537deb251e1ea22868246f9770108c4d884707",
   "backendFiles": [
     {
       "path": ".prettierrc.json",
@@ -122,6 +122,11 @@
       "path": "dedupe-deliveries.js",
       "bytes": 397,
       "sha256": "d1a5bfcd388cefb0de3861408d559faad3acacee28fc644cc46dde84769ae1db"
+    },
+    {
+      "path": "docs/ANALYTICS_TRAFFIC_CUTOVER_V1.txt",
+      "bytes": 5182,
+      "sha256": "9d1887a6af167c4c9384559d488598e3aaf7641169aa09a9d8b6f1dd19853c12"
     },
     {
       "path": "docs/P17_LOCAL_DIALOG_LEDGER_ROLLBACK.md",
@@ -1674,14 +1679,24 @@
       "sha256": "30084f228b500afa2c7b93df2c2c60084fb76f6dd099d95f3646891897400c14"
     },
     {
+      "path": "prisma/migrations/20261001000000_analytics_publication_authority_v1/migration.sql",
+      "bytes": 8971,
+      "sha256": "203f8ba4582eafd7d415a78e046d65b8331cc55f06f34bee2573ec5bccfb42e6"
+    },
+    {
+      "path": "prisma/migrations/20261001001000_traffic_canonical_projection_v2/migration.sql",
+      "bytes": 21608,
+      "sha256": "921a841e24347ab3b2af28bc6a04896f2dd32d04a7ad3988d7308a6a3db71c86"
+    },
+    {
       "path": "prisma/migrations/migration_lock.toml",
       "bytes": 24,
       "sha256": "1db17a8d051aa136110736752c5e1f8b7ed92b6ea8e803112fbbe2497047c210"
     },
     {
       "path": "prisma/schema.prisma",
-      "bytes": 260907,
-      "sha256": "b819da717b3cc30c5f307571f8e3aa8bc38e12af52a25b4b4c622c75a9ffdf41"
+      "bytes": 264987,
+      "sha256": "bba8b8a8811ef99721f63aeae4cf98f2514e364489517ae41660264023efbec1"
     },
     {
       "path": "public/admin/admin-app.js",
@@ -1994,6 +2009,26 @@
       "sha256": "93c5e7e9e8dc7c5d39abdc8b78f1902bba8f2ce31f2da5c61bf9e1fd181625dc"
     },
     {
+      "path": "scripts/audit/analytics-traffic/deploy-proof.cjs",
+      "bytes": 2702,
+      "sha256": "e99d1400eda774782839835cf9118cb5d0015b88e580958535a5fe0abad0938d"
+    },
+    {
+      "path": "scripts/audit/analytics-traffic/fixture.cjs",
+      "bytes": 5051,
+      "sha256": "ba68400be744218c889807be3f390fc8b987e8844bd31266ddf872a295402ec3"
+    },
+    {
+      "path": "scripts/audit/analytics-traffic/publication-proof.cjs",
+      "bytes": 15447,
+      "sha256": "8c3805e231254b513c3c0d8f27270e93f43c8c3628bf374db0ad8a70bb4e2b0a"
+    },
+    {
+      "path": "scripts/audit/analytics-traffic/traffic-proof.cjs",
+      "bytes": 13666,
+      "sha256": "b6eb169b609dd2530acbbacc93435fed85e3b4f146ede31651134de217ca8065"
+    },
+    {
       "path": "scripts/audit/migration-proof-baseline.js",
       "bytes": 602,
       "sha256": "76b50a998f4243308ad774d87b567547c41776ded719db34a70d8ad23ab4dad1"
@@ -2299,6 +2334,16 @@
       "sha256": "fb2c9f338d3a3f1cf915ebff378cada0469a5ae4bc8e4b8f3b0fd66d311d1fb1"
     },
     {
+      "path": "scripts/database/analytics-traffic-index-contract.json",
+      "bytes": 3059,
+      "sha256": "021aa0c982ac418b9c5da4ba05249bbf941f9038877c6449345c11ad2f2bdf12"
+    },
+    {
+      "path": "scripts/database/analytics-traffic-indexes.js",
+      "bytes": 3220,
+      "sha256": "808e27b0070dfc3a3dbe924f4e747a46f82129cd477c1ad611cb191ac745f198"
+    },
+    {
       "path": "scripts/database/generate-production-baseline-v20-22.js",
       "bytes": 1721,
       "sha256": "54f6786c479b6a6f8c49e6629fc1c04092eb6cbb3498c62bce4914fd60925571"
@@ -2375,8 +2420,8 @@
     },
     {
       "path": "scripts/database/phase7-deploy.js",
-      "bytes": 7469,
-      "sha256": "bfc6ae1200098c5289fab256bec06dc1695699261bf5cfed4fc55693c1a2af75"
+      "bytes": 7515,
+      "sha256": "075e0178da87c5f5fdb934fbad74da87aaeea9014fcc528ba3aa2e936d70f593"
     },
     {
       "path": "scripts/database/phase7-historical-migrations.js",
@@ -2845,8 +2890,8 @@
     },
     {
       "path": "src/routes/jobs.js",
-      "bytes": 14878,
-      "sha256": "d60960e312162c21b88c5e1eb3067152ba03a6a234eb49ab662c4a4db81ab9ee"
+      "bytes": 14906,
+      "sha256": "93ab6ecab09317cd4eb3026eeec914a922387bcc64c1112aed147ffb099de029"
     },
     {
       "path": "src/routes/legacy-gone.js",
@@ -2935,8 +2980,8 @@
     },
     {
       "path": "src/routes/traffic.js",
-      "bytes": 9149,
-      "sha256": "8897781eeabd4b0530e8b547407cd57217021b17abd2d2cfe31bb2a4f52db267"
+      "bytes": 2122,
+      "sha256": "ae7ee6a881a213de90527852ecc9b7055083fac72b57d15c2c7fc27c3193ff1a"
     },
     {
       "path": "src/routes/vault-directory.js",
@@ -3295,13 +3340,13 @@
     },
     {
       "path": "src/services/analytics-collection-planner.js",
-      "bytes": 47099,
-      "sha256": "635656e4959be9de7edfc4c2e49a00c3b44f339077ad723d9a54c7f17e0d4926"
+      "bytes": 47201,
+      "sha256": "18a2c27fb51d0be72510e91f760b01b31e1a1c75bbdaab57c99551aea5838451"
     },
     {
       "path": "src/services/analytics-collection-planner.test.js",
-      "bytes": 48710,
-      "sha256": "d804f3b20359076f8369bc3b3c38e36930983d940dc24446d4d9ac8553937818"
+      "bytes": 48981,
+      "sha256": "e27b57d7f624a60f56450ced0274df285978eb05a0b25da4253d667aeb4807b2"
     },
     {
       "path": "src/services/analytics-collector-control-service.js",
@@ -3352,6 +3397,11 @@
       "path": "src/services/analytics-manual-planning-authority.test.js",
       "bytes": 5918,
       "sha256": "ff82111109f63cb2c975de2c1e16e461f76462541859ef1a261f7501623cded1"
+    },
+    {
+      "path": "src/services/analytics-publication-service.js",
+      "bytes": 25990,
+      "sha256": "089cc2ac586b11c7103ab9d17e55b737509be235caff5ed5fb4f22a0e499ba14"
     },
     {
       "path": "src/services/analytics-range-contract.js",
@@ -3405,8 +3455,8 @@
     },
     {
       "path": "src/services/audit16-product-surface-closure.test.js",
-      "bytes": 20416,
-      "sha256": "6fb136a30ede21baafcbe1e168c4d5315907af886522aaf656a762563e6ddb8c"
+      "bytes": 20571,
+      "sha256": "b961a6bfeafcb2dde7ab2ea00d37337ccea966559d3ecc9b7c9fdd2ba3dc5522"
     },
     {
       "path": "src/services/audit17-failure-taxonomy-policy.test.js",
@@ -3680,13 +3730,13 @@
     },
     {
       "path": "src/services/campaign-scan-control-service.js",
-      "bytes": 27264,
-      "sha256": "904d23aee40f267ca6069b1477c19d3d475b88b9dcbe366a445fe4b76293aebf"
+      "bytes": 27390,
+      "sha256": "c0cc7e8d9422f618f5ab8d6b2502ce306ace0324a6cb9bd120465dfe837d4ef6"
     },
     {
       "path": "src/services/campaign-scan-status-authority.js",
-      "bytes": 3016,
-      "sha256": "210d11e19b075e3aa9efe6a8eab053bf4ed5ebd66d2e6eb817abdc76c91e26d1"
+      "bytes": 3030,
+      "sha256": "c90605161c53ffcc4583d71f4d4303fdb4779138d62357de85fa72cbf68ba766"
     },
     {
       "path": "src/services/campaign-transaction-lock-service.js",
@@ -3775,13 +3825,13 @@
     },
     {
       "path": "src/services/creator-analytics-ledger-service.js",
-      "bytes": 144131,
-      "sha256": "ddf35aaaae2eeefcdab3fad40fd9208dff6840b6cc7be8e35bb6f76f92680369"
+      "bytes": 146075,
+      "sha256": "add807afdd0209805667cbe84faa0036b744fc15d70a9dbf97d55b9ba6ff952b"
     },
     {
       "path": "src/services/creator-analytics-ledger-service.test.js",
-      "bytes": 105893,
-      "sha256": "b7bcb154ef6aa2811152ba77431c143f54f4869f695aa8a3072706ae34315b89"
+      "bytes": 106194,
+      "sha256": "3d92bdfa9747acca2945cf80c3164d7236a8db3f8c456b94d058b05dcd685340"
     },
     {
       "path": "src/services/creator-analytics-migrations.test.js",
@@ -3810,8 +3860,8 @@
     },
     {
       "path": "src/services/creator-analytics-sync-orchestrator.js",
-      "bytes": 26873,
-      "sha256": "3136e399cf66f9e1fac6caa9fc51b19ba8cccb8f5c7d69c287ac5861d994aa68"
+      "bytes": 26915,
+      "sha256": "09f185bd035cb170d95c0c488836d255506272327987ecf7c5c4aea1543a19a9"
     },
     {
       "path": "src/services/creator-analytics-sync-orchestrator.test.js",
@@ -3855,13 +3905,13 @@
     },
     {
       "path": "src/services/creator-lifecycle-authority-service.js",
-      "bytes": 8308,
-      "sha256": "73db4d1676d6a84244d06bbfa99f6140c4859957dbf952736cf232c1d5ecde8d"
+      "bytes": 8322,
+      "sha256": "0760b114ba440c68813f62375a5fb00a0432d3ddb2f445d3988b069ea95cb531"
     },
     {
       "path": "src/services/creator-management-contract.test.js",
-      "bytes": 6758,
-      "sha256": "da63f5671ab74038cc989390231140fb2a4d3c31d7b1d3c55382e7803888e0ba"
+      "bytes": 6772,
+      "sha256": "3dcd5de793b9a10fab7088cde99137f80b9ed8dffc010041f2cc28159d6455c5"
     },
     {
       "path": "src/services/creator-metadata-service.js",
@@ -3900,8 +3950,8 @@
     },
     {
       "path": "src/services/creator-overview-service.js",
-      "bytes": 23770,
-      "sha256": "6ca3df9f3451c57810e01d76d3000847364f253a11374eee88235cd3da27b3ef"
+      "bytes": 23799,
+      "sha256": "15bd79a93462f534bb6717996d4a0320a386575ae387fbb25dc6ee3ccaf0955d"
     },
     {
       "path": "src/services/creator-removal-crypto-v20-19.test.js",
@@ -4410,8 +4460,8 @@
     },
     {
       "path": "src/services/domain-work-authority-service.js",
-      "bytes": 88731,
-      "sha256": "5d01f2b358a2e94f150fbc1dce09d5e0c469c0045f6baf0c58ee7e01674b2897"
+      "bytes": 88851,
+      "sha256": "9f2bbb1ea4b606bafea2342f517e742676e44e70e71d9e8dac13f56f85c565e8"
     },
     {
       "path": "src/services/domain-work-authority-service.test.js",
@@ -4495,13 +4545,13 @@
     },
     {
       "path": "src/services/execution-commit-authority-closure2.test.js",
-      "bytes": 34722,
-      "sha256": "d138722b887ae7780fcebd92124e954c110d0d6a2795289604ca1b0e114239fd"
+      "bytes": 34219,
+      "sha256": "adf1c0f693806ed7a95b384ddf3e8477675d09fea634b2638f126ed5207baeeb"
     },
     {
       "path": "src/services/execution-commit-authority-closure3.test.js",
-      "bytes": 9106,
-      "sha256": "a14365f5db7bf7a25494af2b82a31bd73b6b4923c4c0e9882570996503eda3ca"
+      "bytes": 9155,
+      "sha256": "1b43dc2a58b03a14cd33b15e144bdc23f68387df4219026919e98d321987a26a"
     },
     {
       "path": "src/services/execution-commit-authority-closure4-postgres.integration.test.js",
@@ -4530,8 +4580,8 @@
     },
     {
       "path": "src/services/fan-data-authority-service.js",
-      "bytes": 102635,
-      "sha256": "7ac9d55a4d8285cfd9b133d24893f00dbd592ade858c431a98b36c7ac30b6902"
+      "bytes": 102143,
+      "sha256": "fadd966acedb0725e6e3be7bd38831f8be6070cf3c5b59b9b7a9d8045f0f0f1a"
     },
     {
       "path": "src/services/fan-observation-clock-activation-service.js",
@@ -4550,8 +4600,8 @@
     },
     {
       "path": "src/services/financial-transaction-scan-control-service.js",
-      "bytes": 15495,
-      "sha256": "38f31e1dc61bb657a916bb4f727d802a5c07c0356edbe6744a7832f5685900b7"
+      "bytes": 15621,
+      "sha256": "0620125a5376fdbdca07fa7b04b005bdffd980acfd2fc3e035e106a96b2ab118"
     },
     {
       "path": "src/services/financial-transactions-schema.test.js",
@@ -4560,8 +4610,8 @@
     },
     {
       "path": "src/services/financial-transactions-service.js",
-      "bytes": 28110,
-      "sha256": "7d671014b2b60c56baec64f3c5727cfec68fc395d84942ea340c71fcc6439d65"
+      "bytes": 28941,
+      "sha256": "51542e1d6d61eebb7a38d71b11fc65c0ee891d952d0b5ca57fadb0530fe0ed78"
     },
     {
       "path": "src/services/follow-automation-constants.js",
@@ -4615,8 +4665,8 @@
     },
     {
       "path": "src/services/home-read-repository.js",
-      "bytes": 9787,
-      "sha256": "aa766a58fb5b4fa5a42ca9db935b2709138313e1608c4ea1dad63357859b4daa"
+      "bytes": 9882,
+      "sha256": "14f81220bdbe3282a1e8c99e5b812ec615098de14eac57bbecbf31e5ef92065a"
     },
     {
       "path": "src/services/home-scope-repository.js",
@@ -4625,8 +4675,8 @@
     },
     {
       "path": "src/services/home-summary-service.js",
-      "bytes": 19028,
-      "sha256": "6108001de7d8d7988269d289430f2241d9874a30fc0bf967526fcf3fea7bd348"
+      "bytes": 19144,
+      "sha256": "96ecc9f31c21208f97feaf17afb8ef12969d623aebf6ea1d115184a8244acb0a"
     },
     {
       "path": "src/services/human-control-command-contract.js",
@@ -4640,8 +4690,8 @@
     },
     {
       "path": "src/services/job-catalog.js",
-      "bytes": 1524,
-      "sha256": "5fa164c94acd9b4a478f1d632bdee4c1df5c5992592210064fabc9818addb740"
+      "bytes": 1444,
+      "sha256": "8c126e8a5d1ceb3b00b7cc6fa2cfa090df14fbbf2511c331016286b7d9335e22"
     },
     {
       "path": "src/services/job-idempotency.js",
@@ -4655,18 +4705,18 @@
     },
     {
       "path": "src/services/job-lease-release.test.js",
-      "bytes": 76196,
-      "sha256": "14a01c613277d454f03f2f7c5f2f6f6d0bb8172bcc3397bd747559d6e1f65fad"
+      "bytes": 71100,
+      "sha256": "540b213d83a48a82b1fe91feabe4ff248193f49c3e265b31b05881b1969525ac"
     },
     {
       "path": "src/services/job-lease-service.js",
-      "bytes": 73937,
-      "sha256": "3d3f644fc850642040112b7551d5574c45d21bd6ed3448c6ce890957294f0c24"
+      "bytes": 71623,
+      "sha256": "36e46e4608374cb8cab192241dc1d92768ab3e18fcbc719c18782902d0415f3b"
     },
     {
       "path": "src/services/job-planning-cutover-audit13.test.js",
-      "bytes": 2538,
-      "sha256": "cabe3280e44bf39707a8878ff26ca7ad0de913cbe18bcf126b82bd31f1504141"
+      "bytes": 2874,
+      "sha256": "ece8536e2282f99eb410f33294d1afe22b92f02567144bde90d2cb7ad6f54b4c"
     },
     {
       "path": "src/services/job-planning-repository-audit13.test.js",
@@ -4675,13 +4725,13 @@
     },
     {
       "path": "src/services/job-planning-repository.js",
-      "bytes": 10639,
-      "sha256": "cd2231b087ff4f0b59c4322a5de89dfa8353b3622c31a20b5bfcb17e482e3ce3"
+      "bytes": 10653,
+      "sha256": "6d7d575fa497e02f947e20cd44ccef18dcf1ec907acab167fb2f432c1eeec0f1"
     },
     {
       "path": "src/services/job-result-service.js",
-      "bytes": 18816,
-      "sha256": "6a7256047a4e5bd51c3335b7e555e3393c987644881fbd686ec4874140ea916b"
+      "bytes": 15609,
+      "sha256": "b48373c5d50f4a5468a9fd060aa6780ae078cf6cdd3ca425acc1b46436ee7c4f"
     },
     {
       "path": "src/services/job-scheduler-daily-cycle.test.js",
@@ -4700,8 +4750,8 @@
     },
     {
       "path": "src/services/job-scheduler.js",
-      "bytes": 135897,
-      "sha256": "5e7343441b381dd4018eff93b908ec8fbd4fb6f3ed28c29d3c84637b376cba09"
+      "bytes": 135478,
+      "sha256": "6af13783402e639889a09184592b8b7c1c2880f589d628c188205299fdcc5f1b"
     },
     {
       "path": "src/services/legacy-access-snapshot-opaque-v20-19.test.js",
@@ -5115,8 +5165,8 @@
     },
     {
       "path": "src/services/phase2-maintenance-admission-service.js",
-      "bytes": 5820,
-      "sha256": "294bf143411581f1268cde072a345bf5ec9c6ed785977bb7238f9ebad606769a"
+      "bytes": 5876,
+      "sha256": "2f715ea9394582b606cc2c5aac207680d9860a7d430e717f39063395b6b7fae3"
     },
     {
       "path": "src/services/phase2-maintenance-cluster-ownership.test.js",
@@ -5126,7 +5176,7 @@
     {
       "path": "src/services/phase2-maintenance-fair-admission.test.js",
       "bytes": 6068,
-      "sha256": "33b5f2cede80a7471f9f2e38e19743f338436464ddfdb2d9f65ce3cb98bdcd22"
+      "sha256": "0413934f9e7d24f6930d42d7e19e4c3c52b8aff9c75d013ff524809db1ae230f"
     },
     {
       "path": "src/services/phase2-maintenance-postgres.integration.test.js",
@@ -5300,8 +5350,8 @@
     },
     {
       "path": "src/services/phase3-analytics-final-authority-cutover.test.js",
-      "bytes": 24845,
-      "sha256": "8a2e16b45319bbcadf6402e5f6ad4f3304fb102ceea99b3639431e9c1b094c22"
+      "bytes": 24878,
+      "sha256": "f3065217e7edb4c44f21165f2ebfbc5316a2cc1955bba52078721af7d96b91bf"
     },
     {
       "path": "src/services/phase3-automation-delivery-hard-delete-guard.test.js",
@@ -5495,8 +5545,8 @@
     },
     {
       "path": "src/services/phase3-campaign-provider-order-int5-9a-5.test.js",
-      "bytes": 3335,
-      "sha256": "8e289d187318ae0574b4989d288a7dedbda581a9a48fc156c97f371fcf341a57"
+      "bytes": 3483,
+      "sha256": "7ab493db2bde0bdcd44654c9b30d4985b91099ba44680a5607156f045a95dc27"
     },
     {
       "path": "src/services/phase3-campaign-read-authority-int5-6a-2.test.js",
@@ -5675,8 +5725,8 @@
     },
     {
       "path": "src/services/phase3-provider-future-debt-int5-9a-18.test.js",
-      "bytes": 4156,
-      "sha256": "9e042df3146607aa107d9228ae693829f33ecea2a20a57aa1e914bafcce1b207"
+      "bytes": 4128,
+      "sha256": "8899e03018efe60c1aabd1af4006f9fb130f6ebf4b31e00490f545214211086f"
     },
     {
       "path": "src/services/phase3-provider-future-debt-postgres-int5-9a-18.integration.test.js",
@@ -5780,8 +5830,8 @@
     },
     {
       "path": "src/services/phase3-trusted-fan-observation-int4-1a.test.js",
-      "bytes": 15844,
-      "sha256": "64ae0bd84b87b434d690ca431ba5802c662ffd7705607b566ba102e9cd53053a"
+      "bytes": 15815,
+      "sha256": "c76e49a08894442e15742e9fb0c9187eafb34f1f3dde21d58b5fc7dc769ca227"
     },
     {
       "path": "src/services/phase4-product-billing-closure.test.js",
@@ -5860,8 +5910,8 @@
     },
     {
       "path": "src/services/phase7-deploy-contract.test.js",
-      "bytes": 3616,
-      "sha256": "380c2b418d0c12bb130a764e2c6c48a4265767f1ae1d0d36374444e9e7eb2dca"
+      "bytes": 3690,
+      "sha256": "cfea5318c3e4e26c17bc53e049e8712a1832233ce95f60f63f24f69959c1754f"
     },
     {
       "path": "src/services/phase7-legacy-storage-manifest.json",
@@ -5881,7 +5931,7 @@
     {
       "path": "src/services/phase7-migration-checksum.test.js",
       "bytes": 19019,
-      "sha256": "a40dcf6e8fcefdbd2f39fdc1a379cb554993d8fed1e69f2bcf8c4a52cd1081c6"
+      "sha256": "b5ec1899f91bed5b1fe279270787a78a3f78060484658e3d01d12519a46fb688"
     },
     {
       "path": "src/services/phase7-obligation-handoff-service.js",
@@ -6000,8 +6050,8 @@
     },
     {
       "path": "src/services/retention-service.js",
-      "bytes": 55820,
-      "sha256": "b7f630b84a137d3046bdaeb20e762f9325a25c02dc4f0f8da4e66047b4f6313b"
+      "bytes": 55131,
+      "sha256": "a675390aba7a0d3d3df8c5cbc3d64b4ddb9b15ca5e0205567818379012c9f545"
     },
     {
       "path": "src/services/retention-work-context-service.js",
@@ -6549,9 +6599,19 @@
       "sha256": "12ea6d610df8ea7edeea3494565ad27ec4a1e93d22fb99a77dcd2ba4f9f527bb"
     },
     {
+      "path": "src/services/traffic-projection-service.js",
+      "bytes": 10052,
+      "sha256": "794ea5e9424b3cd78d19f598b5f85c5aacb5209ac371cd92fbf490dc1ba75872"
+    },
+    {
+      "path": "src/services/traffic-read-service.js",
+      "bytes": 12601,
+      "sha256": "13a75a63423487c42581094be6e643414a7309a272d2fc7c10c9721dd06512e7"
+    },
+    {
       "path": "src/services/traffic-service.js",
-      "bytes": 60951,
-      "sha256": "e9c921815bbb35165e049beb437f2484d7d03539b89e08373472ccb8f3ffa393"
+      "bytes": 3694,
+      "sha256": "cbaac7ae101bff952a524625f16665959e413776127318f07eff0417d355244c"
     },
     {
       "path": "src/services/vault-directory-service.js",
@@ -7127,8 +7187,8 @@
     },
     {
       "path": "apps/desktop/electron/main/services/backend-jobs/backend-job-types.ts",
-      "bytes": 4580,
-      "sha256": "d5f6b4055dc1846178e91c537b358b7d18396326de498b8d1a1b8c21f1b58eb3"
+      "bytes": 4554,
+      "sha256": "9238e793f8ba5c6e9b54002a8d7e271b7225ed3212742676177c3860aa914b91"
     },
     {
       "path": "apps/desktop/electron/main/services/backend-jobs/backend-readonly-job-worker.ts",
@@ -7206,11 +7266,6 @@
       "sha256": "9c377b66b79a3076293e2e30b43ec936ce694e5507508323f51836160fe3a367"
     },
     {
-      "path": "apps/desktop/electron/main/services/backend-jobs/handlers/traffic-sources-handler.ts",
-      "bytes": 7186,
-      "sha256": "c0faff5d59e55fbb511a38795cfe5b7b5628023d635445e59a3a6285683bfbe8"
-    },
-    {
       "path": "apps/desktop/electron/main/services/backend-jobs/handlers/vault-unsorted-handler.ts",
       "bytes": 11775,
       "sha256": "7e8dffa4e38899413df76896f24e3676ceaa33187716f29cc9cc2ee93533cc56"
@@ -7222,8 +7277,8 @@
     },
     {
       "path": "apps/desktop/electron/main/services/backend-jobs/read-only-job-handler-registry.ts",
-      "bytes": 2036,
-      "sha256": "231c6ece3d9b8df6d78311b638537b508c888e814967323024041e651774d2ef"
+      "bytes": 1934,
+      "sha256": "e4fc40c3959b6fcf2dcc82dba774c11ce4fcf2c9c61bcb179f5a6b587c805eb5"
     },
     {
       "path": "apps/desktop/electron/main/services/backend-jobs/read-only-job-handler.ts",
@@ -7507,8 +7562,8 @@
     },
     {
       "path": "apps/desktop/electron/main/services/creator-analytics/creator-analytics-service.ts",
-      "bytes": 68429,
-      "sha256": "c23d2d7cf81c57f424e41ad9c37eeca8a5ac0f780cc0768c681499eb96129bae"
+      "bytes": 70100,
+      "sha256": "a32d8e635f932572fb8fa40134808d6b13a048a0c5560d7859b8c2187d272276"
     },
     {
       "path": "apps/desktop/electron/main/services/creator-analytics/index.ts",
@@ -9217,8 +9272,8 @@
     },
     {
       "path": "apps/desktop/renderer/src/features/creator-analytics/CampaignScanner.tsx",
-      "bytes": 22275,
-      "sha256": "5da003830197c4b707c33b605be22fa7c385f201483b8d80dc1a73f22929a3d9"
+      "bytes": 22396,
+      "sha256": "285a4b45284149ad762de70a3b8b8cf3ec851c374d38e990884cc66872136847"
     },
     {
       "path": "apps/desktop/renderer/src/features/creator-analytics/CreatorAnalyticsHost.css",
@@ -9247,8 +9302,8 @@
     },
     {
       "path": "apps/desktop/renderer/src/features/creator-analytics/FinancialTransactionsScanner.tsx",
-      "bytes": 13726,
-      "sha256": "6caca277c7c868142988b2e8811858e9deacf3aa62ba534d640aea272abb0f12"
+      "bytes": 13847,
+      "sha256": "6397e93797fc2a43e33dea3844ec78de49f179e86fd29914c96dcf11515520e5"
     },
     {
       "path": "apps/desktop/renderer/src/features/creator-analytics/RelationalCreatorAnalyticsPanel.css",
@@ -9922,8 +9977,8 @@
     },
     {
       "path": "apps/desktop/scripts/backend-job-producer-closure-audit13.test.mjs",
-      "bytes": 2741,
-      "sha256": "97298e23beb5bdb23dd4fcb77ce8e29b91492afa55d62e9585a9155dc9441804"
+      "bytes": 2715,
+      "sha256": "6196aa1c5f29aabc5a21ea241c268d0656c1100200347141e901b9ebfbaf4bb5"
     },
     {
       "path": "apps/desktop/scripts/background-runtime-v10-scope-fence.test.mjs",
@@ -10212,8 +10267,8 @@
     },
     {
       "path": "apps/desktop/scripts/creator-analytics-service.test.mjs",
-      "bytes": 8949,
-      "sha256": "6ec1e23b113bc294f52bf9eec01eb500afa601a4e43ee4919afe1ddcd291d76e"
+      "bytes": 11760,
+      "sha256": "c3ba01bd55d212808dfb4ca5da6b936470d89e5c88f82861082bfc523d4cfeda"
     },
     {
       "path": "apps/desktop/scripts/creator-connection-state.test.mjs",
@@ -10772,8 +10827,8 @@
     },
     {
       "path": "apps/desktop/scripts/phase3-provider-future-debt-int5-9a-18.test.mjs",
-      "bytes": 2054,
-      "sha256": "3de39485dacc0ca37651982f208a3010d3d264c2701b9550dff38abc5756d55c"
+      "bytes": 2031,
+      "sha256": "0c57a6b3ed35bfcfd43cf37d02ec3a706a3c45ac94b3c266481ea6258e17d050"
     },
     {
       "path": "apps/desktop/scripts/phase3-provider-read-order-int5-4c-1a.test.mjs",
@@ -11312,8 +11367,8 @@
     },
     {
       "path": "packages/shared/src/creator-analytics.ts",
-      "bytes": 23435,
-      "sha256": "02e51bec48e90f937c8d4b6e0474133a4c099b2f6d6895f1afd8d4b692e1ec0e"
+      "bytes": 24114,
+      "sha256": "bca09cecb7af9694a1eb422d3c1a19ddaa4cf195f21913fc40fc66ee944a5d50"
     },
     {
       "path": "packages/shared/src/creator-runtime.ts",

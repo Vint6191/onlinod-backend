@@ -488,6 +488,10 @@ model TeamMemberFunction {
 }
 
 model CreatorAccount {
+  trafficMetrics TrafficMetric[]
+  trafficFanProjections TrafficFanProjection[]
+  trafficReceiptProjections TrafficReceiptProjection[]
+  trafficProjectionBackfills TrafficProjectionBackfill[]
   id                                  String                 @id @default(cuid())
   agencyId                            String
   displayName                         String
@@ -2326,6 +2330,8 @@ model AnalyticsIngestBatch {
   @@index([sourceDeviceId, startedAt])
   @@index([sourceJobId])
   @@index([dataType, completedAt, id], map: "AnalyticsIngestBatch_retention_idx")
+  @@index([sourceJobId, dataType, id], map: "AnalyticsIngestBatch_publication_idx")
+
 }
 
 model AnalyticsCoverage {
@@ -2358,6 +2364,8 @@ model AnalyticsCoverage {
   @@index([creatorId, dataType, status, coverageDate], map: "AnalyticsCoverage_creator_type_status_day_idx")
   @@index([ingestBatchId])
   @@index([scanProofId])
+  @@index([creatorId, dataType, id], map: "AnalyticsCoverage_publication_idx")
+
 }
 
 model AnalyticsScanProof {
@@ -2395,6 +2403,8 @@ model AnalyticsScanProof {
   @@index([creatorId, dataType, scanFrom, scanTo], map: "AnalyticsScanProof_creator_type_window_idx")
   @@index([sourceJobId], map: "AnalyticsScanProof_sourceJobId_idx")
   @@index([createdAt, id], map: "AnalyticsScanProof_createdAt_id_idx")
+  proofVersion Int @default(1)
+
 }
 
 model MaintenanceLaneState {
@@ -2832,6 +2842,8 @@ model CreatorFinancialTransaction {
   @@index([creatorId, sourceJobId, page])
   @@index([creatorId, scanRunId, page])
   @@index([sourceJobId])
+  @@index([creatorId, sourceJobId, scanRunId, id], map: "CreatorFinancialTransaction_publication_idx")
+
 }
 
 model CreatorEarningsTotal {
@@ -3177,6 +3189,8 @@ model CreatorEarningsDaily {
   @@index([creatorId, sourceScanRunId])
   @@index([sourceJobId])
   @@index([scanProofId])
+  @@index([creatorId, sourceJobId, sourceScanRunId, id], map: "CreatorEarningsDaily_publication_idx")
+
 }
 
 model CreatorCampaign {
@@ -3229,6 +3243,11 @@ model CreatorCampaign {
   @@index([creatorId, claimersNextDueAt, externalCampaignId], map: "CreatorCampaign_frontier_due_idx")
   @@index([creatorId, claimersTargetRunId, externalCampaignId], map: "CreatorCampaign_frontier_target_idx")
   @@index([sourceJobId])
+  @@index([creatorId, sourceScanRunId, id], map: "CreatorCampaign_publication_idx")
+  @@index([creatorId, isActive, id], map: "CreatorCampaign_retire_page_idx")
+
+  @@index([creatorId, id], map: "Campaign_traffic_page_v2")
+
 }
 
 model CreatorCampaignFrontierFan {
@@ -3286,6 +3305,8 @@ model CreatorCampaignFan {
   @@index([creatorId, campaignId, sourceScanStartedAt])
   @@index([creatorId, campaignId, sourceScanRunId])
   @@index([sourceJobId])
+  @@index([creatorId, id], map: "CampaignFan_traffic_page_v2")
+
 }
 
 model CreatorMessagesDaily {
@@ -3461,6 +3482,9 @@ model JobInstance {
   @@index([leaseUntil])
   @@index([jobKey, status, completedAt, id], map: "JobInstance_analytics_retention_idx")
   @@index([jobKey, status, updatedAt, id], map: "JobInstance_analytics_terminal_updated_retention_idx")
+  analyticsPublications AnalyticsPublication[]
+  analyticsPublicationInputClock AnalyticsPublicationInputClock?
+
 }
 
 // Legacy singleton clock retained only so an old binary can finish a rolling
@@ -6121,6 +6145,8 @@ model TeamObservationState {
 }
 
 model TrafficSource {
+  canonicalCampaignId String? @unique(map: "TrafficSource_canonical_key")
+  projectionMetrics Json @default("{}")
   id        String @id @default(cuid())
   agencyId  String
   creatorId String
@@ -6154,9 +6180,12 @@ model TrafficSource {
   @@unique([agencyId, creatorId, sourceType, externalId])
   @@index([agencyId, creatorId, sourceType])
   @@index([agencyId, creatorId, status])
+  @@index([agencyId, creatorId, id], map: "TrafficSource_page_v2")
+
 }
 
 model TrafficSourceMember {
+  projectionMetrics Json @default("{}")
   id        String @id @default(cuid())
   agencyId  String
   creatorId String
@@ -6187,6 +6216,10 @@ model TrafficSourceMember {
   @@index([sourceId, fanId])
   @@index([needsValueRefresh, lastValueFetchedAt])
   @@index([lastRevenueAt, lastSeenAt, needsValueRefresh])
+  @@index([creatorId, fanId, id], map: "TrafficSourceMember_fan_page_v2")
+
+  @@index([creatorId, fanId, lastSeenAt(sort: Desc), id(sort: Desc)], map: "TrafficSourceMember_attribution_v2")
+
 }
 
 model CreatorSubscriptionLedger {
@@ -6225,6 +6258,8 @@ model CreatorSubscriptionLedger {
   @@index([agencyId, creatorId, sourceId, occurredAt])
   @@index([agencyId, creatorId, organicConfirmed, attributionAttempts])
   @@index([sourceId, organicConfirmed, amountCents, occurredAt])
+  @@index([creatorId, id], map: "TrafficReceipt_backfill_page_v2")
+
 }
 
 /// Retired I6 compatibility cache: no active business reader/writer. Retention only.
@@ -6671,4 +6706,85 @@ model Phase7RetirementProof {
   @@unique([sourceTable,sourceId,sourceHash,kind])
   @@index([deliveryId,kind], map: "phase7_proof_delivery")
   @@index([agencyId,creatorId,targetId,kind], map: "phase7_proof_consumption")
+}
+
+
+model AnalyticsPublication {
+  id             String @id
+  jobId          String
+  agencyId       String
+  creatorId      String
+  userId         String
+  deviceId       String
+  leaseRevision  Int
+  leaseTokenHash String
+  payloadHash    String
+  payload        Json
+  state          String @default("PENDING")
+  stage          String
+  cursor         Json @default("{}")
+  proof          Json @default("{}")
+  inputRevision  BigInt @default(0)
+  response       Json?
+  attempts       Int @default(0)
+  availableAt    DateTime @default(now())
+  completedAt    DateTime?
+  lastError      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now()) @updatedAt
+  job            JobInstance @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  @@unique([jobId, leaseRevision], map: "AnalyticsPublication_execution_key")
+  @@index([state, availableAt, jobId], map: "AnalyticsPublication_due_idx")
+  @@index([agencyId, creatorId, state], map: "AnalyticsPublication_scope_idx")
+}
+
+model AnalyticsPublicationInputClock {
+  jobId    String @id
+  revision BigInt @default(0)
+  job      JobInstance @relation(fields: [jobId], references: [id], onDelete: Cascade)
+}
+
+model TrafficMetric {
+  agencyId String
+  creatorId String
+  kind String
+  objectId String @default("")
+  period String @default("*")
+  metrics Json @default("{}")
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId,id], onDelete: Cascade)
+  @@id([creatorId,kind,objectId,period])
+  @@index([creatorId,kind,period,objectId],map:"TrafficMetric_period_v2")
+}
+model TrafficFanProjection {
+  lastRevenueAt DateTime?
+  id String @id
+  agencyId String
+  creatorId String
+  fanId String
+  metrics Json @default("{}")
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId,creatorId], references:[agencyId,id], onDelete: Cascade)
+  @@unique([creatorId,fanId])
+}
+model TrafficReceiptProjection {
+  id String @id
+  agencyId String
+  creatorId String
+  fact Json @default("{}")
+  creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+}
+model TrafficProjectionBackfill {
+  creatorId String @id
+  agencyId String
+  stage String @default("RETIRE")
+  cursor String @default("")
+  completedAt DateTime?
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+}
+model TrafficProjectionSeed {
+  id String @id
+  cursor String @default("")
+  complete Boolean @default(false)
 }

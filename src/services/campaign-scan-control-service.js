@@ -18,7 +18,7 @@ const {
 
 const JOB_KEY = "fetch_campaigns";
 const MANUAL_REASON = "manual_creator_analytics_campaign_scan";
-const ACTIVE_STATUSES = new Set(["SCHEDULED", "CLAIMED", "PAUSED"]);
+const ACTIVE_STATUSES = new Set(["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"]);
 const MANUAL_VERSION = 1;
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
@@ -68,12 +68,12 @@ async function recentJobs(db, creatorId, statuses = null, take = 40) {
   return rows.filter(isManualJob);
 }
 async function activeJob(db, creatorId) {
-  const rows = await recentJobs(db, creatorId, ["SCHEDULED", "CLAIMED", "PAUSED"], 40);
+  const rows = await recentJobs(db, creatorId, ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"], 40);
   return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
 }
 async function activeCollectorJob(db, creatorId) {
   const rows = await db.jobInstance.findMany({
-    where: { creatorId, jobKey: JOB_KEY, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+    where: { creatorId, jobKey: JOB_KEY, status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"] } },
     orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
     take: 40,
   });
@@ -198,6 +198,7 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
 async function stopManualCampaignScan({ db = prisma, creatorId, now = new Date() }) {
   const active = await activeJob(db, creatorId);
   if (!active) return { job: null, action: "idle" };
+  if (active.status === "PUBLISHING") return { job: active, action: "publishing" };
   if (active.status === "PAUSED") return { job: active, action: "already_paused" };
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
   const pause = async (tx) => {

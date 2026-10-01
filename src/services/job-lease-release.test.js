@@ -47,6 +47,8 @@ function loadService(fixture) {
   fixture.db.$transaction = (callback, options) => transaction(async () => {
     const tx = { ...fixture.db }; delete tx.$transaction;
     if (fixture.db.$queryRawUnsafe) tx.$queryRawUnsafe = async (sql, ...args) => {
+      if (/FROM "User"/.test(sql)) return fixture.disabledUser ? [] : [{ id: args[0] }];
+      if (/FROM "CreatorAccount"/.test(sql) && /FOR SHARE/.test(sql)) return [{ id: args[0] }];
       if (/FROM "JobInstance" WHERE "id"=\$1 FOR UPDATE/.test(sql)) {
         const row = discovered.has(args[0])
           ? { ...discovered.get(args[0]), ...(rows.get(args[0]) || {}) }
@@ -112,6 +114,9 @@ function loadService(fixture) {
       assertExecutionAccessFence: fixture.assertExecutionAccessFence || (async () => ({ ok: true })),
     },
   };
+  const publicationModule = require.resolve("./analytics-publication-service");
+  delete require.cache[publicationModule];
+  if (fixture.publication) require.cache[publicationModule] = { exports: fixture.publication };
   delete require.cache[require.resolve("./job-lease-service")];
   return require("./job-lease-service");
 }
@@ -1065,158 +1070,34 @@ test("fifth non-resumable partial notification attempt becomes FAILED instead of
   assert.equal(result.job.retryAt, null);
 });
 
-test("earnings completion reserves lease ownership before relational projection", async () => {
-  const token = "earnings-fence-token";
-  const now = new Date();
-  const job = {
-    id: "earnings-fence-job", agencyId: "agency-1", creatorId: "creator-1", jobKey: "fetch_earnings",
-    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 9,
-    leaseUntil: new Date(now.getTime() + 60_000), attempts: 0, params: { rangeKey: "7d" },
-    continuation: { driverPhase: "complete" }, workId: "earnings-work",
-  };
-  const order = [];
-  const updates = [];
-  const db = {
-    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
-    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    jobInstance: {
-      findUnique: async () => job,
-      updateMany: async (args) => { updates.push(args); order.push(updates.length === 1 ? "reserved" : "completed"); return { count: 1 }; },
-    },
-  };
-  const { completeJob } = loadService({
-    db,
-    applyJobResult: async () => { order.push("projection"); return { ok: true, type: "earnings" }; },
+// Completion proof/retry semantics now run in the durable server publisher.
+// Its real SQL suite covers partial financial/campaign proofs and protocol repair.
+for (const jobKey of ["fetch_earnings", "fetch_campaigns", "financial_transactions_scan"]) {
+  test(`${jobKey} completion transfers a locked authorized lease into server publication`, async () => {
+    const f = fixture(); Object.assign(f.job, { jobKey, creatorId: "creator-1" });
+    f.db.analyticsPublication = { findUnique: async () => null };
+    let accepted = 0, projected = 0;
+    f.applyJobResult = async () => { projected++; };
+    f.publication = {
+      isAnalyticsPublicationJob: row => row.jobKey === jobKey,
+      acceptAnalyticsPublication: async ({ db, job, leaseRevision }) => {
+        assert.notEqual(db, f.db); assert.equal(job.id, f.job.id);
+        assert.equal(leaseRevision, 3); accepted++;
+        return { accepted: true, publicationPending: true, job: { id: job.id, status: "PUBLISHING" } };
+      },
+    };
+    const result = await loadService(f).completeJob({ jobId: f.job.id, userId: "user-1", deviceId: "device-1", leaseToken: f.token, leaseRevision: 3, result: {} });
+    assert.equal(result.job.status, "PUBLISHING"); assert.equal(accepted, 1); assert.equal(projected, 0);
+    await assert.rejects(() => loadService(f).completeJob({ jobId: f.job.id, userId: "user-1", deviceId: "device-1", leaseToken: "stale", leaseRevision: 3, result: {} }));
+    assert.equal(accepted, 1, "stale lease cannot publish an intent");
   });
-  const result = await completeJob({
-    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 9,
-    workId: job.workId, result: { schemaVersion: 3 }, progress: { percent: 100 },
-  });
-  assert.deepEqual(order, ["reserved", "projection", "completed"]);
-  assert.deepEqual(updates[0].data.leaseRevision, { increment: 1 });
-  assert.equal(updates[1].where.leaseRevision, 10);
-  assert.equal(updates[1].data.status, "DONE");
-  assert.equal(result.job.status, "DONE");
-});
-
-
-
-test("partial financial proof is rescheduled and persists the same durable retry boundary", async () => {
-  const token = "financial-partial-token";
-  const now = new Date();
-  const job = {
-    id: "financial-partial-job", agencyId: "agency-1", creatorId: "creator-1", jobKey: "financial_transactions_scan",
-    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 6,
-    leaseUntil: new Date(now.getTime() + 60_000), attempts: 0, params: { financialMode: "catchup" },
-    continuation: { driverPhase: "complete" }, workId: "financial-work",
-  };
-  const updates = [];
-  const failures = [];
-  const db = {
-    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
-    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    jobInstance: {
-      findUnique: async () => job,
-      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
-    },
-  };
-  const { completeJob } = loadService({
-    db,
-    applyJobResult: async () => ({ ok: false, type: "financial_transactions", complete: false }),
-    recordJobFailure: async (args) => { failures.push(args); return {}; },
-  });
-  const result = await completeJob({
-    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 6,
-    workId: job.workId, result: { complete: false }, progress: { percent: 100 },
-  });
-  assert.equal(updates.length, 2);
-  assert.equal(updates[1].where.leaseRevision, 7);
-  assert.equal(updates[1].data.status, "SCHEDULED");
-  assert.equal(updates[1].data.attempts, 1);
-  assert.equal(updates[1].data.lastError, "financial_transactions_scan_partial");
-  assert.equal(result.job.status, "SCHEDULED");
-  assert.equal(failures.length, 1);
-  assert.equal(failures[0].terminal, false);
-  assert.equal(failures[0].retryAfterAt.getTime(), result.job.retryAt.getTime());
-});
-
-test("partial campaign proof is rescheduled instead of publishing DONE", async () => {
-  const token = "campaign-partial-token";
-  const now = new Date();
-  const job = {
-    id: "campaign-partial-job", agencyId: "agency-1", creatorId: "creator-1", jobKey: "fetch_campaigns",
-    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 4,
-    leaseUntil: new Date(now.getTime() + 60_000), attempts: 1, params: { rangeKey: "30d" },
-    continuation: { driverPhase: "complete" }, workId: "campaign-work",
-  };
-  const updates = [];
-  const failures = [];
-  const db = {
-    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
-    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    jobInstance: {
-      findUnique: async () => job,
-      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
-    },
-  };
-  const { completeJob } = loadService({
-    db,
-    applyJobResult: async () => ({ ok: false, type: "campaigns", completion: { complete: false } }),
-    recordJobFailure: async (args) => { failures.push(args); return {}; },
-  });
-  const result = await completeJob({
-    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 4,
-    workId: job.workId, result: { scanRunId: "scan-partial" }, progress: { percent: 100 },
-  });
-  assert.equal(updates.length, 2);
-  assert.equal(updates[1].where.leaseRevision, 5);
-  assert.equal(updates[1].data.status, "SCHEDULED");
-  assert.equal(updates[1].data.attempts, 2);
-  assert.equal(updates[1].data.continuation, null);
-  assert.equal(updates[1].data.lastError, "fetch_campaigns_partial");
-  assert.equal(result.job.status, "SCHEDULED");
-  assert.equal(failures.length, 1);
-  assert.equal(failures[0].terminal, false);
-  assert.equal(failures[0].retryAfterAt.getTime(), result.job.retryAt.getTime());
-});
-
-test("pre-v12 Campaign completion is requeued as protocol superseded without consuming attempts", async () => {
-  const token = "campaign-protocol-superseded-token";
-  const now = new Date();
-  const job = {
-    id: "campaign-protocol-superseded-job", agencyId: "agency-1", creatorId: "creator-1", jobKey: "fetch_campaigns",
-    status: "CLAIMED", claimedByDeviceId: "device-1", leaseTokenHash: tokenHash(token), leaseRevision: 8,
-    leaseUntil: new Date(now.getTime() + 60_000), attempts: 4, params: { rangeKey: "30d" },
-    continuation: { driverPhase: "complete", jobContinuation: { collectorVersion: "campaigns-v11" } }, workId: "campaign-work",
-  };
-  const updates = [];
-  const failures = [];
-  const db = {
-    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
-    agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    jobInstance: {
-      findUnique: async () => job,
-      updateMany: async (args) => { updates.push(args); return { count: 1 }; },
-    },
-  };
-  const { completeJob } = loadService({
-    db,
-    applyJobResult: async () => ({ ok: false, type: "campaigns", completion: { complete: false, protocolCurrent: false } }),
-    recordJobFailure: async (args) => { failures.push(args); return {}; },
-  });
-  const result = await completeJob({
-    jobId: job.id, userId: "user-1", deviceId: "device-1", leaseToken: token, leaseRevision: 8,
-    workId: job.workId, result: { collectorVersion: "campaigns-v11", scanRunId: "scan-old" }, progress: { percent: 100 },
-  });
-  assert.equal(updates.length, 2);
-  assert.equal(updates[1].where.leaseRevision, 9);
-  assert.equal(updates[1].data.status, "SCHEDULED");
-  assert.equal(Object.prototype.hasOwnProperty.call(updates[1].data, "attempts"), false, "protocol cutover must not consume an attempt");
-  assert.equal(updates[1].data.continuation, null);
-  assert.equal(updates[1].data.lastError, "fetch_campaigns_protocol_superseded");
-  assert.equal(result.job.status, "SCHEDULED");
-  assert.equal(result.protocolSuperseded, true);
-  assert.equal(failures.length, 0, "controlled protocol supersession is not a job failure");
+}
+test("disabled actor cannot transfer an analytics lease to server publication", async () => {
+  const f = fixture(); Object.assign(f.job, { jobKey: "fetch_earnings", creatorId: "creator-1" });
+  f.disabledUser = true; let accepted = false;
+  f.publication = { isAnalyticsPublicationJob: () => true, acceptAnalyticsPublication: async () => { accepted = true; } };
+  await assert.rejects(() => loadService(f).completeJob({ jobId: f.job.id, userId: "user-1", deviceId: "device-1", leaseToken: f.token, leaseRevision: 3, result: {} }), e => e.code === "EXECUTION_ACCESS_REVOKED");
+  assert.equal(accepted, false);
 });
 
 test("claim fence cancels a legacy no-mode notification FULL once historical baseline is verified", async () => {

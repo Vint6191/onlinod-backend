@@ -93,7 +93,7 @@ async function retireCreatorWithinTransaction({
   });
   await tx.deviceCreatorBinding.updateMany({ where: { creatorId: creator }, data: { status: "REVOKED" } });
   await tx.jobInstance.updateMany({
-    where: { creatorId: creator, status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } },
+    where: { creatorId: creator, status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "FAILED"] } },
     data: { status: "CANCELLED", completedAt: retiredAt, leaseUntil: null, leaseTokenHash: null, claimedAt: null, claimedByDeviceId: null },
   });
   if (typeof tx.fanObservationReadLease?.deleteMany === "function") {

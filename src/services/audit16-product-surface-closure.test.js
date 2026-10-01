@@ -120,11 +120,13 @@ test("Audit16 Stats, Traffic and Fan Data use canonical creator scope and canoni
   assert.match(stats, /router\.post\("\/creators\/:creatorId\/messages-daily", legacyStatsGone\)/);
 
   assert.match(trafficRoute, /requireProductCreator/);
-  assert.match(trafficRoute, /requireProductDevice/);
+  assert.match(trafficRoute, /TRAFFIC_SOURCE_INGEST_RETIRED/);
+  assert.match(trafficRoute, /res.status\(410\)/);
+  assert.doesNotMatch(trafficRoute, /upsertTrafficSources|ingestTrafficSubscriptions/);
   assert.match(trafficService, /requireCreatorAccess/);
   assert.match(trafficService, /traffic\.view/);
   assert.match(trafficService, /traffic\.refresh/);
-  assert.match(trafficService, /traffic\.manage_costs/);
+  assert.match(read("services/human-control-command-contract.js"), /traffic\.cost/);
   assert.doesNotMatch(trafficService, /creator-analytics-permissions/);
   assert.match(fan, /requireProductCreator/);
 });
@@ -157,7 +159,7 @@ test("Audit16 feature mutation routes no longer resurrect manager role shortcuts
 });
 
 test("Audit16 machine routes bind supplied device identity and current long-lived Customs/Telegram work is access-fenced", () => {
-  for (const file of ["routes/custom-orders.js", "routes/settings.js", "routes/traffic.js"]) assert.match(read(file), /requireProductDevice/);
+  for (const file of ["routes/custom-orders.js", "routes/settings.js"]) assert.match(read(file), /requireProductDevice/);
   const telegramRuntime = read("services/telegram-execution-runtime.js");
   const telegramDelivery = read("services/telegram-delivery-authority-service.js");
   const uploadWork = read("services/custom-content-submissions-service.js");

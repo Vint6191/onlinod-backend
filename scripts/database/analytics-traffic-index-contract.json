@@ -1,0 +1,114 @@
+[
+  {
+    "name": "AnalyticsIngestBatch_publication_idx",
+    "table": "AnalyticsIngestBatch",
+    "unique": false,
+    "expression": "\"sourceJobId\",\"dataType\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorEarningsDaily_publication_idx",
+    "table": "CreatorEarningsDaily",
+    "unique": false,
+    "expression": "\"creatorId\",\"sourceJobId\",\"sourceScanRunId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "AnalyticsCoverage_publication_idx",
+    "table": "AnalyticsCoverage",
+    "unique": false,
+    "expression": "\"creatorId\",\"dataType\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorCampaign_publication_idx",
+    "table": "CreatorCampaign",
+    "unique": false,
+    "expression": "\"creatorId\",\"sourceScanRunId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorCampaign_retire_page_idx",
+    "table": "CreatorCampaign",
+    "unique": false,
+    "expression": "\"creatorId\",\"isActive\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorFinancialTransaction_publication_idx",
+    "table": "CreatorFinancialTransaction",
+    "unique": false,
+    "expression": "\"creatorId\",\"sourceJobId\",\"scanRunId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "TrafficSource_canonical_key",
+    "table": "TrafficSource",
+    "unique": true,
+    "expression": "\"canonicalCampaignId\"",
+    "where": null
+  },
+  {
+    "name": "TrafficSource_page_v2",
+    "table": "TrafficSource",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "TrafficSourceMember_fan_page_v2",
+    "table": "TrafficSourceMember",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "TrafficSourceMember_buyers_page_v2",
+    "table": "TrafficSourceMember",
+    "unique": false,
+    "expression": "\"creatorId\",\"sourceId\",\"fanId\"",
+    "where": "(\"projectionMetrics\"->>'valuePayingFans')='1'"
+  },
+  {
+    "name": "TrafficSourceMember_attribution_v2",
+    "table": "TrafficSourceMember",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"lastSeenAt\" DESC,\"id\" DESC",
+    "where": null
+  },
+  {
+    "name": "TrafficReceipt_repair_page_v2",
+    "table": "CreatorSubscriptionLedger",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"id\"",
+    "where": "\"sourceId\" IS NULL"
+  },
+  {
+    "name": "TrafficReceipt_backfill_page_v2",
+    "table": "CreatorSubscriptionLedger",
+    "unique": false,
+    "expression": "\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CampaignFan_traffic_page_v2",
+    "table": "CreatorCampaignFan",
+    "unique": false,
+    "expression": "\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "Campaign_traffic_page_v2",
+    "table": "CreatorCampaign",
+    "unique": false,
+    "expression": "\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "TrafficDomainWork_pending_v2",
+    "table": "DomainWorkItem",
+    "unique": false,
+    "expression": "\"creatorId\",\"workClass\"",
+    "where": "\"isOutstanding\""
+  }
+]

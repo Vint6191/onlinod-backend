@@ -21,7 +21,6 @@ test("A18 catalogs every claimable readonly provider job outside Campaign/FanDat
     "sfs_target_discovery",
     "sfs_target_scan",
     "subscriber_directory_scan",
-    "traffic_sources_scan",
     "vault_unsorted_scan",
   ]);
 });

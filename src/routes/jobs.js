@@ -398,12 +398,12 @@ router.get("/pending", async (req, res, next) => {
     }
 
     const status = String(req.query.status || "").trim().toUpperCase();
-    const allowedStatuses = new Set(["SCHEDULED", "CLAIMED", "DONE", "FAILED", "CANCELLED"]);
+    const allowedStatuses = new Set(["SCHEDULED", "PUBLISHING", "CLAIMED", "DONE", "FAILED", "CANCELLED"]);
     const limit = Math.max(1, Math.min(500, Number(req.query.limit) || 100));
     const jobs = await prisma.jobInstance.findMany({
       where: {
         agencyId,
-        ...(allowedStatuses.has(status) ? { status } : { status: { in: ["SCHEDULED", "CLAIMED", "FAILED"] } }),
+        ...(allowedStatuses.has(status) ? { status } : { status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "FAILED"] } }),
       },
       orderBy: [{ status: "asc" }, { priority: "desc" }, { nextRunAt: "asc" }],
       take: limit,

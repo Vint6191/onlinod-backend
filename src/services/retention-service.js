@@ -627,35 +627,10 @@ async function deleteOldPaidOrganicLedger({ batchSize, olderThan }) {
   return { label: "creatorSubscriptionLedger.paid_organic_retention", deleted: total, hasMore: total >= batchSize * RETENTION_BATCH_BUDGET };
 }
 
-async function deleteDeadTrafficSourceMembers({ batchSize, olderThan }) {
-  let total = 0;
-  for (let batch = 0; batch < RETENTION_BATCH_BUDGET; batch += 1) {
-    const affected = await runRetentionMutation(tx => tx.$executeRaw`
-      WITH doomed AS (
-        SELECT m."id"
-        FROM "TrafficSourceMember" AS m
-        WHERE m."lastRevenueAt" IS NULL
-          AND m."lastSeenAt" < ${olderThan}
-          AND m."needsValueRefresh" = FALSE
-          AND NOT EXISTS (
-            SELECT 1
-            FROM "CreatorSubscriptionLedger" AS l
-            WHERE l."agencyId" = m."agencyId"
-              AND l."creatorId" = m."creatorId"
-              AND l."fanId" = m."fanId"
-              AND l."amountCents" > 0
-          )
-        ORDER BY m."lastSeenAt" ASC
-        LIMIT ${batchSize}
-      )
-      DELETE FROM "TrafficSourceMember" AS m
-      USING doomed
-      WHERE m."id" = doomed."id"
-    `);
-    total += Number(affected || 0);
-    if (Number(affected || 0) < batchSize) break;
-  }
-  return { label: "trafficSourceMember.dead_no_revenue", deleted: total, hasMore: total >= batchSize * RETENTION_BATCH_BUDGET };
+async function deleteDeadTrafficSourceMembers() {
+  // Membership is a canonical historical projection. Creator retirement owns
+  // its deletion; a cache age cutoff cannot erase canonical attribution.
+  return { label: "trafficSourceMember.dead_no_revenue", deleted: 0, hasMore: false, retired: true };
 }
 
 async function runTeamLedgerRetentionSweep(options = {}) {
@@ -837,6 +812,7 @@ async function runAnalyticsExecutionRetentionSweep(options = {}) {
          AND p."dataType" = 'EARNINGS'::"AnalyticsDataType"
          AND p."scanRunId" = substring(ib."idempotencyKey" from 'run:([^:]+):')
         WHERE ib."dataType" = 'EARNINGS'::"AnalyticsDataType"
+          AND NOT EXISTS (SELECT 1 FROM "AnalyticsPublication" ap WHERE ap."jobId"=ib."sourceJobId" AND ap."state"='PENDING')
           AND ib."completedAt" IS NOT NULL
           AND ib."completedAt" < $1
         ORDER BY ib."completedAt" ASC

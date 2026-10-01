@@ -1481,16 +1481,7 @@ async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult })
     receivedAt,
     causalObservedAt,
   });
-  const successfulValueIds = items
-    .filter((item) => item?.value && typeof item.value === "object" && normalizeAvailability(item.value.availability) === VALUE_AVAILABILITY.AVAILABLE)
-    .map((item) => onlyFansUserId(item.onlyFansUserId))
-    .filter(Boolean);
-  if (successfulValueIds.length && db.trafficSourceMember?.updateMany) {
-    await db.trafficSourceMember.updateMany({
-      where: { agencyId: job.agencyId, creatorId: job.creatorId, fanId: { in: successfulValueIds } },
-      data: { needsValueRefresh: false, lastValueFetchedAt: receivedAt },
-    });
-  }
+  // Current FanData changes publish bounded Traffic projection work in the DB.
   return { type: "fan_data_point_refresh", ...result };
 }
 

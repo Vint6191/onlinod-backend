@@ -984,6 +984,31 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
 }
 
 async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, result, progress }) {
+  const publication = require("./analytics-publication-service");
+  const observedJob = await prisma.jobInstance.findUnique({ where: { id: jobId } });
+  if (publication.isAnalyticsPublicationJob(observedJob)) {
+    return runRootCommit(prisma, async ({ tx }) => {
+      const lifecycle = await require("./agency-lifecycle-barrier-service").lockAgencyLifecycleBarrier({ db: tx, agencyId: observedJob.agencyId });
+      if (!lifecycle.row || lifecycle.row.deletedAt) throw new JobLeaseError("EXECUTION_ACCESS_REVOKED", "Agency is retired", 403);
+      const users = await tx.$queryRawUnsafe('SELECT "id" FROM "User" WHERE "id"=$1 AND "disabledAt" IS NULL FOR SHARE', userId);
+      if (!users.length) throw new JobLeaseError("EXECUTION_ACCESS_REVOKED", "User is disabled", 403);
+      const { device } = await requireOwnedDevice({ userId, deviceId, db: tx });
+      if (device.agencyId !== observedJob.agencyId) throw new JobLeaseError("JOB_DEVICE_AGENCY_MISMATCH", "Job belongs to another agency", 403);
+      await assertExecutionAccessFence({ db: tx, userId, agencyId: observedJob.agencyId,
+        memberId: observedJob.leaseMemberId, accessEpoch: observedJob.leaseAccessEpoch,
+        creatorId: observedJob.creatorId, lock: true });
+      const creators = await tx.$queryRawUnsafe(`SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 AND "deletedAt" IS NULL AND "status"='READY' FOR SHARE`, observedJob.creatorId, observedJob.agencyId);
+      if (!creators.length) throw new JobLeaseError("EXECUTION_CREATOR_NOT_READY", "Creator is retired or unavailable", 409);
+      const locked = (await tx.$queryRawUnsafe('SELECT * FROM "JobInstance" WHERE "id"=$1 FOR UPDATE', jobId))?.[0];
+      if (!locked) throw new JobLeaseError("JOB_NOT_FOUND", "Job not found", 404);
+      const receipt = await tx.analyticsPublication.findUnique({ where: { jobId_leaseRevision: { jobId, leaseRevision } } });
+      if (receipt) return publication.assertReplay(receipt, { userId, deviceId, leaseToken, leaseRevision, result });
+      const current = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, db: tx });
+      const acceptedAt = await dbAuthorityNow({ db: tx });
+      return publication.acceptAnalyticsPublication({ db: tx, job: current, userId, deviceId,
+        leaseToken, leaseRevision, result, now: acceptedAt });
+    }, { profile: "JOB_CHUNK", authority: { kind: "ANALYTICS_PUBLICATION_ACCEPT", userId, agencyId: observedJob.agencyId, creatorId: observedJob.creatorId } });
+  }
   let now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   let job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, now });
   let fenceWhere = {
@@ -1103,107 +1128,6 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       return updated;
     }, { reserved: true, profile: "JOB_CHUNK" });
     if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Subscriber completion fence was lost");
-    return { job: { id: job.id, status: "DONE" }, sideEffect };
-  }
-
-  if (["fetch_earnings", "fetch_campaigns", "financial_transactions_scan"].includes(job.jobKey)) {
-    // These jobs write durable relational projections. Reserve completion
-    // ownership before any side effect so a reclaimed worker cannot publish a
-    // stale earnings/campaign snapshot after another device takes the lease.
-    const completionLeaseRevision = leaseRevision + 1;
-    const reserved = await phaseCommit(async (tx) => tx.jobInstance.updateMany({
-      where: fenceWhere,
-      data: {
-        leaseRevision: { increment: 1 },
-        leaseUntil: new Date(now.getTime() + MAX_LEASE_MS),
-        lastProgressAt: now,
-      },
-    }), { reserved: false });
-    if (!reserved.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before analytics completion");
-
-    const sideEffect = await applyJobResult({ job, deviceId, userId, result: result || {} });
-    const completionFence = {
-      id: job.id,
-      status: "CLAIMED",
-      claimedByDeviceId: deviceId,
-      leaseTokenHash: hashToken(leaseToken),
-      leaseRevision: completionLeaseRevision,
-    };
-    if (sideEffect?.ok !== true) {
-      const campaignProtocolSuperseded =
-        job.jobKey === "fetch_campaigns" &&
-        sideEffect?.type === "campaigns" &&
-        sideEffect?.completion?.protocolCurrent === false;
-      if (campaignProtocolSuperseded) {
-        const retryAt = new Date(now.getTime() + 1_000);
-        const superseded = await phaseCommit(async (tx) => tx.jobInstance.updateMany({
-          where: completionFence,
-          data: {
-            status: "SCHEDULED",
-            nextRunAt: retryAt,
-            completedAt: null,
-            claimedAt: null,
-            claimedByDeviceId: null,
-            leaseUntil: null,
-            leaseTokenHash: null,
-            continuation: null,
-            workId: null,
-            result: { ...(result || {}), completionSideEffect: sideEffect || null },
-            lastError: "fetch_campaigns_protocol_superseded",
-            progress: { percent: 0, message: "fetch_campaigns protocol upgraded; scheduled for current collector" },
-          },
-        }), { reserved: true });
-        if (!superseded.count) throw new JobLeaseError("JOB_LEASE_STALE", "Campaign protocol supersession fence was lost");
-        return { job: { id: job.id, status: "SCHEDULED", retryAt }, sideEffect, protocolSuperseded: true };
-      }
-      const attempts = Number(job.attempts || 0) + 1;
-      const terminal = attempts >= MAX_ATTEMPTS;
-      const retryAt = terminal ? null : new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
-      const partial = await phaseCommit(async (tx) => {
-        const updated = await tx.jobInstance.updateMany({
-          where: completionFence,
-          data: terminal ? {
-            status: "FAILED",
-            attempts,
-            completedAt: now,
-            claimedAt: null,
-            claimedByDeviceId: null,
-            leaseUntil: null,
-            leaseTokenHash: null,
-            continuation: null,
-            workId: null,
-            result: { ...(result || {}), completionSideEffect: sideEffect || null },
-            lastError: `${job.jobKey}_partial`,
-          } : {
-            status: "SCHEDULED",
-            attempts,
-            nextRunAt: retryAt,
-            completedAt: null,
-            claimedAt: null,
-            claimedByDeviceId: null,
-            leaseUntil: null,
-            leaseTokenHash: null,
-            continuation: null,
-            workId: null,
-            result: { ...(result || {}), completionSideEffect: sideEffect || null },
-            lastError: `${job.jobKey}_partial`,
-            progress: { percent: 0, message: `${job.jobKey} scheduled for repair` },
-          },
-        });
-        if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Analytics partial-completion fence was lost");
-        // Durable collector state must carry the exact same retry/quarantine
-        // decision as JobInstance. Otherwise terminal technical history can be
-        // cleaned while the planner immediately emits a fresh generation.
-        await recordJobFailure({
-          db: tx, job, error: `${job.jobKey}_partial`, terminal, retryAfterAt: retryAt,
-        });
-        return updated;
-      }, { reserved: true, profile: "JOB_COMPLETION" });
-      return { job: { id: job.id, status: terminal ? "FAILED" : "SCHEDULED", retryAt }, sideEffect };
-    }
-    const completed = await phaseCommit(async (tx) => tx.jobInstance.updateMany({ where: completionFence, data: completionData }), { reserved: true });
-    if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Analytics completion fence was lost");
-    await maybeAdvanceCreatorAnalyticsInitialSync(job, sideEffect);
     return { job: { id: job.id, status: "DONE" }, sideEffect };
   }
 

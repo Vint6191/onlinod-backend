@@ -47,7 +47,9 @@ test("INT5.9A-5 rolling wire requires explicit order-independent traversal capab
   assert.match(route, /campaignOrderIndependentTraversalV1: z\.boolean\(\)\.optional\(\)\.default\(false\)/);
   assert.match(lease, /capabilities\?\.campaignOrderIndependentTraversalV1 !== true/);
   assert.match(lease, /campaignOrderIndependentTraversalVersion: 1/);
-  assert.match(lease, /sideEffect\?\.completion\?\.protocolCurrent === false/);
-  assert.match(lease, /fetch_campaigns_protocol_superseded/);
-  assert.match(lease, /protocolSuperseded: true/);
+  const publication = read("src/services/analytics-publication-service.js");
+  assert.match(lease, /acceptAnalyticsPublication/);
+  assert.match(publication, /sideEffect\?\.completion\?\.protocolCurrent === false/);
+  assert.match(publication, /fetch_campaigns_protocol_superseded/);
+  assert.match(publication, /protocolSuperseded: true/);
 });

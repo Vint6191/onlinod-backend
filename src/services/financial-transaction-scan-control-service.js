@@ -12,7 +12,7 @@ const {
 } = require("./analytics-collector-control-service");
 
 const MANUAL_REASON = "manual_creator_analytics_financial_transactions_scan";
-const ACTIVE_STATUSES = new Set(["SCHEDULED", "CLAIMED", "PAUSED"]);
+const ACTIVE_STATUSES = new Set(["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"]);
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function clean(value, max = 220) {
@@ -61,12 +61,12 @@ async function recentJobs(db, creatorId, statuses = null, take = 40) {
   return rows.filter(isManualJob);
 }
 async function activeJob(db, creatorId) {
-  const rows = await recentJobs(db, creatorId, ["SCHEDULED", "CLAIMED", "PAUSED"], 40);
+  const rows = await recentJobs(db, creatorId, ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"], 40);
   return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
 }
 async function activeCollectorJob(db, creatorId) {
   const rows = await db.jobInstance.findMany({
-    where: { creatorId, jobKey: JOB_KEY, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+    where: { creatorId, jobKey: JOB_KEY, status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"] } },
     orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
     take: 40,
   });
@@ -134,6 +134,7 @@ async function startManualFinancialTransactionScan({ db = prisma, creator, reque
 async function stopManualFinancialTransactionScan({ db = prisma, creatorId, now = new Date() }) {
   const active = await activeJob(db, creatorId);
   if (!active) return { job: null, action: "idle" };
+  if (active.status === "PUBLISHING") return { job: active, action: "publishing" };
   if (active.status === "PAUSED") return { job: active, action: "already_paused" };
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
   const result = await db.jobInstance.updateMany({

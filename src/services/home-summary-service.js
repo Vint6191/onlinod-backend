@@ -67,7 +67,7 @@ async function readCoverageState({ db, creatorIds, range, now }) {
       where: {
         creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC",
         status: "COMPLETE", scanProofId: { not: null },
-        scanProof: { is: { status: "COMMITTED" } },
+        scanProof: { is: { status: "COMMITTED", proofVersion: 2 } },
         coverageDate: { gte: range.startDay, lte: oldClosedEnd },
       },
       _count: { _all: true },
@@ -81,7 +81,7 @@ async function readCoverageState({ db, creatorIds, range, now }) {
       where: {
         creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC",
         status: "COMPLETE", scanProofId: { not: null },
-        scanProof: { is: { status: "COMMITTED" } },
+        scanProof: { is: { status: "COMMITTED", proofVersion: 2 } },
         coverageDate: { gte: recentClosedStart, lte: closedEnd },
       },
       _count: { _all: true },
@@ -94,7 +94,7 @@ async function readCoverageState({ db, creatorIds, range, now }) {
       where: {
         creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC",
         coverageDate: today, status: { in: ["PARTIAL", "COMPLETE"] }, scanProofId: { not: null },
-        scanProof: { is: { status: "COMMITTED" } },
+        scanProof: { is: { status: "COMMITTED", proofVersion: 2 } },
       },
       select: { creatorId: true, status: true, lastVerifiedAt: true },
     }).then((rows) => ({ kind: "today", rows })));
@@ -151,7 +151,7 @@ async function readCanonicalRevenue({ db, agencyId, creators, range, previous, n
     readCoverageState({ db, creatorIds, range, now }),
     previous ? readCoverageState({ db, creatorIds, range: previous, now }) : Promise.resolve(null),
     db.jobInstance.findMany({
-      where: { creatorId: { in: creatorIds }, jobKey: "fetch_earnings", status: { in: ["SCHEDULED", "CLAIMED"] } },
+      where: { creatorId: { in: creatorIds }, jobKey: "fetch_earnings", status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED"] } },
       select: { id: true, creatorId: true, status: true },
     }),
     db.analyticsCollectionDemand?.findMany ? db.analyticsCollectionDemand.findMany({
@@ -174,7 +174,7 @@ async function readCanonicalRevenue({ db, agencyId, creators, range, previous, n
       by: ["creatorId"],
       where: {
         agencyId, creatorId: { in: reportingIds }, sourceTimezone: "UTC", scanProofId: { not: null },
-        scanProof: { is: { status: "COMMITTED" } }, date: { gte: range.startDay, lte: range.endDay },
+        scanProof: { is: { status: "COMMITTED", proofVersion: 2 } }, date: { gte: range.startDay, lte: range.endDay },
       },
       _count: { _all: true }, _sum: { totalCents: true }, _max: { collectedAt: true },
     }) : Promise.resolve([]),
@@ -182,14 +182,14 @@ async function readCanonicalRevenue({ db, agencyId, creators, range, previous, n
       by: ["date"],
       where: {
         agencyId, creatorId: { in: reportingIds }, sourceTimezone: "UTC", scanProofId: { not: null },
-        scanProof: { is: { status: "COMMITTED" } }, date: { gte: range.startDay, lte: range.endDay },
+        scanProof: { is: { status: "COMMITTED", proofVersion: 2 } }, date: { gte: range.startDay, lte: range.endDay },
       },
       _sum: { totalCents: true },
     }) : Promise.resolve([]),
     previous && previousReportingIds.length === creatorIds.length ? db.creatorEarningsDaily.aggregate({
       where: {
         agencyId, creatorId: { in: previousReportingIds }, sourceTimezone: "UTC", scanProofId: { not: null },
-        scanProof: { is: { status: "COMMITTED" } }, date: { gte: previous.startDay, lte: previous.endDay },
+        scanProof: { is: { status: "COMMITTED", proofVersion: 2 } }, date: { gte: previous.startDay, lte: previous.endDay },
       },
       _sum: { totalCents: true },
     }) : Promise.resolve(null),

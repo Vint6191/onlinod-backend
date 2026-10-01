@@ -150,7 +150,7 @@ test("Subscriber publication is restartable bounded work outside generic complet
   assert.match(subscriber, /publicationTopology:\s*"durable_chunked_generation_v2"/);
   assert.match(schema, /publicationStatus\s+String\s+@default\("PENDING"\)/);
   assert.match(schema, /publicationCursorId\s+String\?/);
-  const subscriberCompletion = leases.slice(leases.indexOf('if (job.jobKey === "subscriber_directory_scan")'), leases.indexOf('if (["fetch_earnings"'));
+  const subscriberCompletion = leases.slice(leases.indexOf('if (job.jobKey === "subscriber_directory_scan")'), leases.indexOf("if (boundedNotificationCatchupCompletion(job, result))"));
   assert.match(subscriberCompletion, /profile: "JOB_CHUNK"/);
   assert.match(subscriberCompletion, /applyJobResult\(\{ db: prisma/);
   assert.doesNotMatch(subscriberCompletion, /applyJobResult\(\{ db: tx/);

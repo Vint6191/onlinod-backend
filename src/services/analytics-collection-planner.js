@@ -216,7 +216,7 @@ function coverageState(row, day, now, force = false) {
   const isCurrentDay = day.getTime() === today.getTime();
   return evaluateCollectionState({
     status: row?.status || "MISSING",
-    proofStatus: row?.scanProof?.status || null,
+    proofStatus: row?.scanProof?.proofVersion === 2 ? row.scanProof.status : null,
     lastVerifiedAt: row?.lastVerifiedAt || null,
     retryAfterAt: row?.retryAfterAt || null,
     now,
@@ -343,7 +343,7 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           creatorId,
           agencyId,
           jobKey: "fetch_earnings",
-          status: { in: ["SCHEDULED", "CLAIMED"] },
+          status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED"] },
         },
         orderBy: [{ priority: "desc" }, { scheduledAt: "asc" }],
         select: {
@@ -392,7 +392,7 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
         scheduledAt: authorityNow,
         nextRunAt: authorityNow,
       });
-      if (!planned.created && planned.job && ["SCHEDULED", "CLAIMED"].includes(planned.job.status)) {
+      if (!planned.created && planned.job && ["SCHEDULED", "PUBLISHING", "CLAIMED"].includes(planned.job.status)) {
         const demand = await updatePlannedJobDemand({
           db: tx,
           job: planned.job,
@@ -472,7 +472,7 @@ async function ensureAnalyticsWindowFreshness({
         sourceTimezone: ANALYTICS_SOURCE_TIMEZONE,
         coverageDate: { gte: from, lte: to },
       },
-      select: { coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, scanProofId: true, scanProof: { select: { status: true } } },
+      select: { coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, scanProofId: true, scanProof: { select: { status: true, proofVersion: true } } },
     });
   const byDay = new Map(rows.map((row) => [dateKey(row.coverageDate), row]));
   const evaluatedDays = days.map((day) => ({ day, state: coverageState(byDay.get(dateKey(day)), day, currentNow, force) }));
@@ -981,7 +981,7 @@ async function processAnalyticsDemand({
       creatorId: { in: rows.map((row) => row.id) }, dataType: "EARNINGS",
       sourceTimezone: ANALYTICS_SOURCE_TIMEZONE, coverageDate: { gte: from, lte: to },
     },
-    select: { creatorId: true, coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, scanProofId: true, scanProof: { select: { status: true } } },
+    select: { creatorId: true, coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, scanProofId: true, scanProof: { select: { status: true, proofVersion: true } } },
   });
   const byCreator = new Map();
   for (const item of coverage) {

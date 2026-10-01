@@ -47,7 +47,7 @@ function catchupParams(params) {
 }
 async function inFlightJob(db, creatorId, jobKey) {
   return db.jobInstance.findFirst({
-    where: { creatorId, jobKey, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+    where: { creatorId, jobKey, status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"] } },
     orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
   });
 }
@@ -119,7 +119,7 @@ async function cancelRedundantInitialNotificationJobs(db, creatorId, now = new D
     where: {
       creatorId,
       jobKey: NOTIFICATION_JOB_KEY,
-      status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] },
+      status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"] },
     },
     orderBy: [{ createdAt: "desc" }],
     take: 20,
@@ -132,7 +132,7 @@ async function cancelRedundantInitialNotificationJobs(db, creatorId, now = new D
     // request is allowed to cross this fence.
     if (params.forceNotificationFullRebuild === true || notificationJobMode(params) !== "full") continue;
     const result = await db.jobInstance.updateMany({
-      where: { id: job.id, status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+      where: { id: job.id, status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"] } },
       data: {
         status: "CANCELLED",
         completedAt: now,

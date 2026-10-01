@@ -93,7 +93,7 @@ function progressSnapshot(progress) {
 
 async function readCreatorCurrentTask({ db = prisma, creatorId }) {
   const claimed = await db.jobInstance.findFirst({
-    where: { creatorId, status: "CLAIMED" },
+    where: { creatorId, status: { in: ["CLAIMED", "PUBLISHING"] } },
     orderBy: [{ lastProgressAt: "desc" }, { priority: "desc" }, { claimedAt: "desc" }],
   });
   const job = claimed || await db.jobInstance.findFirst({
@@ -104,7 +104,7 @@ async function readCreatorCurrentTask({ db = prisma, creatorId }) {
   const params = object(job.params);
   const progress = progressSnapshot(job.progress);
   return {
-    active: job.status === "CLAIMED" || job.status === "PAUSED",
+    active: ["CLAIMED", "PUBLISHING", "PAUSED"].includes(job.status),
     id: job.id,
     jobKey: job.jobKey,
     status: statusClass(job.status),

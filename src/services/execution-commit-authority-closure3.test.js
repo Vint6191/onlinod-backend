@@ -26,7 +26,6 @@ function restore(id) {
 const EXPECTED_JOB_CATALOG = [
   "fetch_earnings",
   "fetch_campaigns",
-  "traffic_sources_scan",
   "fan_data_point_refresh",
   "catchup_notifications_scan",
   "financial_transactions_scan",
@@ -38,10 +37,11 @@ const EXPECTED_JOB_CATALOG = [
   "sfs_target_scan",
 ];
 
-test("Closure3 backend JOB_CATALOG is exactly the 12 executable Desktop job generation", () => {
+test("Closure3 backend JOB_CATALOG is exactly the 11 executable Desktop job generation", () => {
   const { JOB_CATALOG } = require("./job-catalog");
   assert.deepEqual(Object.keys(JOB_CATALOG), EXPECTED_JOB_CATALOG);
   assert.equal(Object.hasOwn(JOB_CATALOG, "refresh_online_presence"), false);
+  assert.equal(Object.hasOwn(JOB_CATALOG, "traffic_sources_scan"), false);
 });
 
 test("Closure3 retires legacy Presence execution/control surface but retains Presence schema facts", () => {

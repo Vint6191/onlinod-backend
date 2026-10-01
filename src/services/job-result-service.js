@@ -8,8 +8,6 @@ const { ingestNotificationFacts } = require("./notification-facts-service");
 const { recordNotificationPageProgress, assertNotificationCollectionResult } = require("./notification-sync-state-service");
 const { recordNotificationScanItems } = require("./notification-scan-control-service");
 const { JOB_KEY: FINANCIAL_TRANSACTIONS_JOB_KEY, ingestFinancialTransactionsChunk, ingestFinancialChartChunk, completeFinancialTransactionsScan, recordFinancialCollectionFailure } = require("./financial-transactions-service");
-const { TRAFFIC_SOURCES_SCAN_JOB_KEY, upsertTrafficSourceScan } = require("./traffic-service");
-const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { FAN_DATA_POINT_REFRESH_JOB_KEY, applyFanDataPointRefreshChunk } = require("./fan-data-authority-service");
 const { recordCampaignFanRefreshChunk, finalizeCampaignFanRefreshJob, recordCampaignFanRefreshJobFailure } = require("./campaign-fan-refresh-queue-service");
 const { ingestEarningsChunk, completeEarningsScan, ingestCampaignChunk, loadCampaignDirectorySegment, ingestCampaignFanValueChunk, ingestCampaignFanValuesBatchChunk, completeCampaignScan } = require("./creator-analytics-ledger-service");
@@ -67,11 +65,11 @@ function dateOrNull(value) {
   return Number.isFinite(date.getTime()) ? date : null;
 }
 
-async function applyEarningsResult({ db = prisma, job, deviceId, result }) {
+async function applyEarningsResult({ db = prisma, job, deviceId, result, publication }) {
   if (!job.creatorId || !job.agencyId) throw new Error("Earnings job is missing creator scope");
   const payload = asObject(result);
   const summary = asObject(payload.summary);
-  const dailyLedger = await completeEarningsScan({ db, job, deviceId, result: payload });
+  const dailyLedger = await completeEarningsScan({ db, job, deviceId, result: payload, publication });
   return {
     ok: dailyLedger.complete === true,
     type: "earnings",
@@ -81,10 +79,10 @@ async function applyEarningsResult({ db = prisma, job, deviceId, result }) {
   };
 }
 
-async function applyCampaignsResult({ db = prisma, job, deviceId, userId, result }) {
+async function applyCampaignsResult({ db = prisma, job, deviceId, userId, result, publication }) {
   if (!job.creatorId || !job.agencyId) throw new Error("Campaigns job is missing creator scope");
   const payload = asObject(result);
-  const completion = await completeCampaignScan({ db, job, deviceId, result: payload });
+  const completion = await completeCampaignScan({ db, job, deviceId, result: payload, publication });
   const rangeKey = String(payload.rangeKey || job.params?.rangeKey || "7d").trim() || "7d";
   // FanData refresh is delegated to a separate durable queue. Once provider
   // membership traversal is proven, finish this OF-reading job even if that
@@ -97,89 +95,18 @@ async function applyCampaignsResult({ db = prisma, job, deviceId, userId, result
   // The relational campaign/fan tables are the sole source of truth. Do not
   // re-materialize the full campaign list into the legacy Json snapshot: that
   // would recreate the opaque storage architecture this ledger replaces.
-  const [campaignCount, totalActive, fanGroups] = await Promise.all([
-    db.creatorCampaign.count({ where: { creatorId: job.creatorId } }),
-    db.creatorCampaign.count({ where: { creatorId: job.creatorId, isActive: true } }),
-    db.creatorCampaignFan.groupBy({
-      by: ["campaignId"],
-      where: { creatorId: job.creatorId },
-      _count: { _all: true },
-    }),
-  ]);
-  const totalClaimers = fanGroups.reduce((sum, row) => sum + Number(row._count?._all || 0), 0);
+  // Provider completion is independent of summary/history projections.
+  const campaignCount = completion.proof?.observedCampaignCount ?? 0;
   return {
     ok: true,
     type: "campaigns",
     snapshotId: null,
     rangeKey,
     campaignCount,
-    totalActive,
-    totalClaimers,
+    summaryPending: true,
     refreshPending: completion.complete !== true,
     completion,
   };
-}
-
-function trafficScanAuthority(job, result = {}) {
-  const payload = asObject(result);
-  return dateOrNull(payload.scanStartedAt)
-    || dateOrNull(job?.startedAt)
-    || dateOrNull(job?.claimedAt)
-    || dateOrNull(job?.scheduledAt)
-    || dateOrNull(job?.createdAt)
-    || new Date(0);
-}
-function trafficJobIsNewer(candidate, candidateResult, currentJob, currentResult) {
-  const candidateAt = trafficScanAuthority(candidate, candidateResult).getTime();
-  const currentAt = trafficScanAuthority(currentJob, currentResult).getTime();
-  if (candidateAt !== currentAt) return candidateAt > currentAt;
-  const candidateCreated = dateOrNull(candidate?.createdAt)?.getTime() || 0;
-  const currentCreated = dateOrNull(currentJob?.createdAt)?.getTime() || 0;
-  if (candidateCreated !== currentCreated) return candidateCreated > currentCreated;
-  return String(candidate?.id || "").localeCompare(String(currentJob?.id || "")) > 0;
-}
-
-async function applyTrafficResult({ db = prisma, job, deviceId, userId, result }) {
-  if (!job.creatorId || !job.agencyId) throw new Error("Traffic job is missing creator scope");
-  const payload = asObject(result);
-  const params = asObject(job.params);
-  return withDbAdvisoryXactLock({
-    db,
-    key: `a13:traffic-projection:${job.agencyId}:${job.creatorId}`,
-    work: async (tx) => {
-      const completed = await tx.jobInstance.findMany({
-        where: {
-          agencyId: job.agencyId,
-          creatorId: job.creatorId,
-          jobKey: TRAFFIC_SOURCES_SCAN_JOB_KEY,
-          status: "DONE",
-          id: { not: job.id },
-        },
-        orderBy: [{ completedAt: "desc" }, { createdAt: "desc" }],
-        take: 50,
-        select: { id: true, result: true, startedAt: true, claimedAt: true, scheduledAt: true, createdAt: true },
-      });
-      const newer = completed.find((candidate) => trafficJobIsNewer(candidate, asObject(candidate.result), job, payload));
-      if (newer) {
-        return {
-          type: "traffic", ok: true, applied: false, stale: true, sideEffect: "STALE_NOOP",
-          scanStartedAt: trafficScanAuthority(job, payload).toISOString(), newerJobId: newer.id,
-        };
-      }
-      const applied = await upsertTrafficSourceScan({
-        deviceId,
-        userId,
-        creatorId: job.creatorId,
-        accountId: payload.accountId || params.localAccountId || params.accountId || null,
-        sources: Array.isArray(payload.sources) ? payload.sources : [],
-        members: Array.isArray(payload.members) ? payload.members : [],
-        hydrateLimit: integer(payload.hydrateLimit ?? params.hydrateLimit, 0),
-        forceHydrate: payload.forceHydrate === true || params.forceHydrate === true,
-        db: tx,
-      });
-      return { type: "traffic", applied: true, scanStartedAt: trafficScanAuthority(job, payload).toISOString(), ...asObject(applied) };
-    },
-  });
 }
 
 async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
@@ -314,17 +241,17 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
   return null;
 }
 
-async function applyJobResult({ db = prisma, job, deviceId, userId, result }) {
+async function applyJobResult({ db = prisma, job, deviceId, userId, result, publication }) {
   if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
     return completeDialogIntelligenceJob({ db, job, deviceId, userId, result: result || {} });
   }
   if (job.jobKey === VAULT_UNSORTED_JOB_KEY) {
     return applyVaultUnsortedCompletion({ db, job, deviceId, userId, result: result || {} });
   }
-  if (job.jobKey === FINANCIAL_TRANSACTIONS_JOB_KEY) return completeFinancialTransactionsScan({ db, job, deviceId, result: result || {} });
-  if (job.jobKey === EARNINGS_JOB_KEY) return applyEarningsResult({ db, job, deviceId, userId, result });
-  if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ db, job, deviceId, userId, result });
-  if (job.jobKey === TRAFFIC_SOURCES_SCAN_JOB_KEY) return applyTrafficResult({ db, job, deviceId, userId, result });
+  if (job.jobKey === FINANCIAL_TRANSACTIONS_JOB_KEY) return completeFinancialTransactionsScan({ db, job, deviceId, result: result || {}, publication });
+  if (job.jobKey === EARNINGS_JOB_KEY) return applyEarningsResult({ db, job, deviceId, userId, result, publication });
+  if (job.jobKey === CAMPAIGNS_JOB_KEY) return applyCampaignsResult({ db, job, deviceId, userId, result, publication });
+  if (job.jobKey === "traffic_sources_scan") throw Object.assign(new Error("TRAFFIC_SOURCE_INGEST_RETIRED"), { code: "TRAFFIC_SOURCE_INGEST_RETIRED", status: 410 });
   if (job.jobKey === CATCHUP_JOB_KEY) return applyCatchupJobResult({ db, job, deviceId, userId, result: result || {} });
   if (job.jobKey === LIKES_DISCOVERY_JOB_KEY) return applyLikesDiscoveryCompletion({ db, job, deviceId, userId, result: result || {} });
   if (job.jobKey === SFS_DISCOVERY_JOB_KEY) return applySfsDiscoveryCompletion({ db, job, deviceId, userId, result: result || {} });

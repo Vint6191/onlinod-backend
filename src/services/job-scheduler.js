@@ -425,36 +425,7 @@ async function scheduleInitialJobsForCreator({
     });
   }
 
-  // Traffic/member attribution stays independent once bootstrap no longer owns
-  // the read lane.
-  await executeSchedulerConsumer({
-    work: "traffic_sources_scan",
-    created,
-    skipped,
-    degraded,
-    outcomes,
-    requireOk: false,
-    execute: () => ensureSingleJob({
-      db,
-      jobKey: "traffic_sources_scan",
-      creatorId,
-      agencyId,
-      params: {
-        hydrateFanValues: false,
-        hydrateLimit: 0,
-        valueTtlHours: 6,
-        creatorRemoteId,
-        remoteId: creatorRemoteId,
-        creatorUsername,
-        username: creatorUsername,
-        creatorDisplayName,
-        reason: "recurring_traffic_refresh",
-      },
-      priority: Math.max(10, priority - 20),
-      now,
-      freshnessWindowMs: TRAFFIC_REFRESH_WINDOW_MS,
-    }),
-  });
+  // Traffic is derived from the canonical Campaigns collector.
 
   // Subscriber Directory — one shared weekly source for Hidden Online,
   // Follow Back candidates and future subscriber-driven modules.
@@ -533,7 +504,7 @@ async function ensureSingleJob({ db = prisma, jobKey, creatorId, agencyId, param
   // are still considered by the compatibility rangeKey scan below.
   const keyed = await db.jobInstance.findUnique({ where: { idempotencyKey } });
   if (keyed) {
-    if (keyed.status === "SCHEDULED" || keyed.status === "CLAIMED") {
+    if (["SCHEDULED", "CLAIMED", "PUBLISHING"].includes(keyed.status)) {
       return { created: false, reason: "already_in_flight", jobId: keyed.id };
     }
     if (keyed.status === "DONE" && keyed.completedAt && keyed.completedAt > new Date(now.getTime() - window)) {
@@ -563,7 +534,7 @@ async function ensureSingleJob({ db = prisma, jobKey, creatorId, agencyId, param
   });
 
   // Check: already scheduled or claimed?
-  const inFlight = matching.find((j) => j.status === "SCHEDULED" || j.status === "CLAIMED");
+  const inFlight = matching.find((j) => ["SCHEDULED", "CLAIMED", "PUBLISHING"].includes(j.status));
   if (inFlight) {
     return { created: false, reason: "already_in_flight", jobId: inFlight.id };
   }
@@ -649,14 +620,14 @@ async function scheduleJobNow({
     scheduledAt: authorityNow,
     nextRunAt: authorityNow,
     shouldResetExisting: (existing) => {
-      if (!hasStableDedupe) return existing.status !== "CLAIMED";
+      if (!hasStableDedupe) return !["CLAIMED", "PUBLISHING"].includes(existing.status);
       // Same planning epoch + active row means another replica already owns the
       // command. A terminal row with no durable epoch advance, however, must be
       // recoverable; otherwise cancellation/expiry before collector acceptance
       // would permanently strand automatic collection on this epoch.
-      return !["SCHEDULED", "CLAIMED", "PAUSED"].includes(String(existing.status || "").toUpperCase());
+      return !["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"].includes(String(existing.status || "").toUpperCase());
     },
-    protectedStatuses: ["CLAIMED"],
+    protectedStatuses: ["CLAIMED", "PUBLISHING"],
   });
   if (!planned.job) throw new Error(`Failed to schedule ${jobKey}: planning race did not converge`);
   return {
@@ -1842,7 +1813,7 @@ async function selectCampaignDirectoryDiscoveryAdmissions({ db = prisma, now = n
     select: { creatorId: true, campaignDirectoryCampaignCount: true, status: true, retryAfterAt: true },
   });
   const active = candidates.length ? await db.jobInstance.findMany({
-    where: { creatorId: { in: candidates.map((r) => r.creatorId) }, jobKey: "fetch_campaigns", status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] } },
+    where: { creatorId: { in: candidates.map((r) => r.creatorId) }, jobKey: "fetch_campaigns", status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"] } },
     distinct: ["creatorId"], select: { creatorId: true }, take: candidates.length,
   }) : [];
   const busy = new Set(active.map((r) => r.creatorId));
@@ -2119,6 +2090,8 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
       ["messageLibraryTrash", () => require("./message-library-lifecycle-service").runMessageLibraryTrashMaintenance({ db })],
       ["adminBillingPricing", () => require("./admin-bulk-pricing-command-service").runAdminBulkPricingSweep({ db })],
       ["notificationHistoryRepair", () => require("./notification-history-repair-service").runNotificationHistoryRepairSweep({ db })],
+      ["trafficProjection", () => require("./traffic-projection-service").runTrafficProjectionSweep({ db })],
+      ["analyticsPublication", () => require("./analytics-publication-service").runAnalyticsPublicationSweep({ db })],
       ["notificationConsequences", () => require("./notification-consequence-service").runNotificationConsequenceSweep({ db })],
       ["agencyDestructiveCleanup", () => runAgencyDestructiveCleanupSweep({ db, now })],
       ["creatorDestructiveCleanup", () => runCreatorDestructiveCleanupSweep({ db, now })],

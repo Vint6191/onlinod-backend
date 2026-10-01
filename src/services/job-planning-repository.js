@@ -6,7 +6,7 @@ const { publishDesktopControlEvent } = require("./desktop-control-events");
 const { JOB_CATALOG } = require("./job-catalog");
 const { currentCommitContext, deferCommitHint } = require("./db-commit-kernel");
 
-const DEFAULT_PROTECTED_STATUSES = Object.freeze(["CLAIMED"]);
+const DEFAULT_PROTECTED_STATUSES = Object.freeze(["CLAIMED", "PUBLISHING"]);
 const planningPublications = new AsyncLocalStorage();
 
 async function afterPlanningCommit(work) {

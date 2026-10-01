@@ -321,7 +321,7 @@ test("earnings completion replay monotonically promotes a durable PARTIAL scan p
   const harness = batchHarness({
     existingBatch: { id: "completion-batch", status: "PARTIAL", payloadChecksum },
     existingScanProof: {
-      id: "proof-existing",
+      id: "proof-existing", agencyId: "agency-1", creatorId: "creator-1", proofVersion: 2,
       status: "PARTIAL",
       payloadChecksum,
       scanFrom: new Date("2026-07-31T00:00:00.000Z"),
@@ -362,7 +362,7 @@ test("committed earnings proof remains authoritative after operational page-batc
   const harness = batchHarness({
     existingBatch: { id: "completion-batch", status: "COMMITTED", payloadChecksum },
     existingScanProof: {
-      id: "proof-existing",
+      id: "proof-existing", agencyId: "agency-1", creatorId: "creator-1", proofVersion: 2,
       status: "COMMITTED",
       payloadChecksum,
       scanFrom: new Date("2026-07-31T00:00:00.000Z"),
@@ -400,7 +400,7 @@ test("committed earnings proof remains authoritative after full ingest-batch com
   const harness = batchHarness({
     existingBatch: null,
     existingScanProof: {
-      id: "proof-existing",
+      id: "proof-existing", agencyId: "agency-1", creatorId: "creator-1", proofVersion: 2,
       status: "COMMITTED",
       payloadChecksum,
       scanFrom: new Date("2026-07-31T00:00:00.000Z"),
@@ -1519,7 +1519,7 @@ test("ledger overview preserves nullable earnings categories and counts only com
     },
     analyticsCoverage: {
       findMany: async ({ where }) => where?.dataType === "EARNINGS"
-        ? [{ dataType: "EARNINGS", coverageDate: date, status: "COMPLETE", lastVerifiedAt: new Date("2026-08-06T11:55:00.000Z"), retryAfterAt: null, scanProofId: "proof-1", scanProof: { status: "COMMITTED" } }]
+        ? [{ dataType: "EARNINGS", coverageDate: date, status: "COMPLETE", lastVerifiedAt: new Date("2026-08-06T11:55:00.000Z"), retryAfterAt: null, scanProofId: "proof-1", scanProof: { status: "COMMITTED", proofVersion: 2 } }]
         : [{ dataType: "EARNINGS", coverageDate: date, status: "COMPLETE" }],
       count: async ({ where }) => !where.dataType ? 1 : where.dataType === "EARNINGS" && where.status === "COMPLETE" ? 1 : 0,
     },
@@ -1627,7 +1627,7 @@ test("today earnings are official only when the row and in-progress proof both e
     },
     analyticsCoverage: {
       findMany: async ({ where }) => where?.dataType === "EARNINGS"
-        ? [{ dataType: "EARNINGS", coverageDate: date, sourceTimezone: "UTC", status: "PARTIAL", lastErrorCode: "EARNINGS_DAY_IN_PROGRESS", lastVerifiedAt: new Date("2026-08-06T11:55:00.000Z"), retryAfterAt: null, scanProofId: "proof-current", scanProof: { status: "COMMITTED" } }]
+        ? [{ dataType: "EARNINGS", coverageDate: date, sourceTimezone: "UTC", status: "PARTIAL", lastErrorCode: "EARNINGS_DAY_IN_PROGRESS", lastVerifiedAt: new Date("2026-08-06T11:55:00.000Z"), retryAfterAt: null, scanProofId: "proof-current", scanProof: { status: "COMMITTED", proofVersion: 2 } }]
         : [],
       count: async ({ where }) => !where.dataType ? 1 : where.dataType === "EARNINGS" && where.status === "PARTIAL" ? 1 : 0,
     },
@@ -1903,11 +1903,11 @@ test("earnings ingest serializes writers and never lets an older observation ove
   assert.equal(harness.updated.at(-1).unchangedRows, 1);
 });
 
-test("earnings completion accepts rows preserved or superseded by another overlapping range", async () => {
+test("earnings completion refuses to borrow days from another job or scan run", async () => {
   const harness = batchHarness({ pageBatches: [{ id: "page-a", status: "COMMITTED", receivedRows: 7, rejectedRows: 0 }] });
   let countWhere = null;
   harness.tx.creatorEarningsDaily = {
-    count: async ({ where }) => { countWhere = where; return 7; },
+    count: async ({ where }) => { countWhere = where; return where.sourceJobId === job.id && where.sourceScanRunId === "run-overlap" ? 6 : 7; },
     updateMany: async () => ({ count: 7 }),
   };
   const result = await completeEarningsScan({
@@ -1926,9 +1926,10 @@ test("earnings completion accepts rows preserved or superseded by another overla
       dailyComplete: true,
     },
   });
-  assert.equal(result.complete, true);
-  assert.equal(Object.hasOwn(countWhere, "sourceScanRunId"), false);
-  assert.deepEqual(Object.keys(countWhere).sort(), ["creatorId", "date"]);
+  assert.equal(result.complete, false);
+  assert.equal(countWhere.sourceJobId, job.id);
+  assert.equal(countWhere.sourceScanRunId, "run-overlap");
+  assert.equal(countWhere.sourceTimezone, "UTC");
 });
 
 test("an incomplete message ledger cannot downgrade a complete day from another device", async () => {
