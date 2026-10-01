@@ -30,6 +30,9 @@ function loadWalletService(prismaMock = {}) {
   const original = Module._load;
   Module._load = function(request, parent, isMain) {
     if (request === "../prisma") return prismaMock;
+    if (request === "./published-earnings-read-repository") return {
+      readPublishedEarningsAggregates: args => args.db._readPublishedEarningsAggregates(args),
+    };
     if (request === "./audit-service") return { audit: async () => null };
     if (request === "./billing-entitlement-service") return {
       addMonthsUtc,
@@ -104,6 +107,15 @@ function makeDb({ balanceCents = 0n, revenue30dCents = 0, capturedAt = new Date(
   profiles.set("creator-1", baseProfile);
 
   const db = {
+    // Billing unit tests consume repository results. The real join, publication
+    // boundary and old-proof rejection are exercised by reader-proof.cjs.
+    _readPublishedEarningsAggregates: async ({ creatorIds, from, to, now, freshnessMs }) => {
+      const rows = dailyRows.filter(row => row.date >= from && row.date <= to);
+      if (!rows.length || !creatorIds.includes("creator-1")) return new Map();
+      return new Map([["creator-1", { creatorId: "creator-1", days: rows.length,
+        cents: rows.reduce((sum,row) => sum+row.totalCents,0), captured: rows[0].collectedAt,
+        fresh: rows.filter(row => row.collectedAt >= new Date(now-freshnessMs) && row.collectedAt <= new Date(+now+300000)).length }]]);
+    },
     systemSetting: policyModelFixture(),
     $executeRawUnsafe: async () => 0,
     $transaction: async (fn) => fn({ ...(db), $transaction: undefined }),
@@ -220,8 +232,8 @@ test("automatic tier boundaries are server-defined and customer catalog is month
 
 test("billable earnings provenance requires durable COMMITTED AnalyticsScanProof and not scheduler history", () => {
   const source = fs.readFileSync(walletPath, "utf8");
-  assert.match(source, /scanProofId: \{ not: null \}/);
-  assert.match(source, /scanProof: \{ is: \{ dataType: "EARNINGS", status: "COMMITTED", committedAt: \{ not: null \} \} \}/);
+  assert.match(source, /readPublishedEarningsAggregates/);
+  assert.match(source, /row.days !== 30/);
   assert.doesNotMatch(source, /sourceJob: \{ is: \{ jobKey: "fetch_earnings"/);
   assert.doesNotMatch(source, /ingestBatch: \{ is: \{ status: "COMMITTED"/);
 });
@@ -235,8 +247,7 @@ test("billing requires relational earnings proof; a fresh legacy snapshot alone 
   assert.equal(verified.source, "EARNINGS_DAILY_PROVEN_FRESH_30D");
   assert.equal(verified.revenue30dCents, 120_000);
 
-  db.creatorEarningsDaily.findMany = async () => [];
-  db.analyticsCoverage.count = async () => 0;
+  db._setSnapshot(null);
   const snapshotOnly = await svc.readRolling30dRevenue({ db, creatorId:"creator-1", now });
   assert.equal(snapshotOnly.fresh, false);
   assert.equal(snapshotOnly.source, "UNAVAILABLE");
@@ -263,8 +274,7 @@ test("exported snapshot preview and quote helpers stay fail-closed for monetary 
   assert.equal(snapshotPreview.tier, null);
   assert.equal(snapshotPreview.totalCents, 0);
 
-  db.creatorEarningsDaily.findMany = async () => [];
-  db.analyticsCoverage.count = async () => 0;
+  db._setSnapshot(null);
   const quoted = await svc.quoteCreatorMonthlyPrice({
     db,
     creator: { id: "creator-1", deletedAt: null, billingProfile: profile },
@@ -277,114 +287,48 @@ test("exported snapshot preview and quote helpers stay fail-closed for monetary 
   assert.equal(quoted.totalCents, 0);
 });
 
-test("durable relational proof uses the last 30 fully closed UTC days and requires complete fresh coverage", async () => {
-  const now = new Date("2026-08-14T12:00:00Z");
-  const db = makeDb(); db._setSnapshot(null);
-  const rows=[]; for (let i=0;i<30;i++){ const d=new Date(Date.UTC(2026,7,13-i)); rows.push({date:d,totalCents:1000,collectedAt:now}); }
-  let dailyWhere = null;
-  const coverageWheres = [];
-  db.creatorEarningsDaily.findMany=async({where})=>{ dailyWhere=where; return rows; };
-  db.analyticsCoverage.count=async({where})=>{ coverageWheres.push(where); return 30; };
-  const svc=loadWalletService(db);
-  const ok=await svc.readRolling30dRevenue({db,creatorId:"creator-1",now});
-  assert.equal(ok.fresh,true); assert.equal(ok.revenue30dCents,30_000); assert.equal(ok.source,"EARNINGS_DAILY_PROVEN_FRESH_30D");
-  assert.equal(dailyWhere.date.gte.toISOString(), "2026-07-15T00:00:00.000Z");
-  assert.equal(dailyWhere.date.lte.toISOString(), "2026-08-13T00:00:00.000Z");
-  assert.deepEqual(dailyWhere.sourceScanRunId, { not: null });
-  assert.deepEqual(dailyWhere.scanProofId, { not: null });
-  assert.equal(dailyWhere.scanProof.is.status, "COMMITTED");
-  assert.equal(coverageWheres.length, 3);
-  for (const coverageWhere of coverageWheres) {
-    assert.equal(coverageWhere.coverageDate.gte.toISOString(), "2026-07-15T00:00:00.000Z");
-    assert.equal(coverageWhere.coverageDate.lte.toISOString(), "2026-08-13T00:00:00.000Z");
-  }
-  assert.equal(coverageWheres[0].scanProofId, undefined);
-  assert.equal(coverageWheres[0].scanProof, undefined);
-  assert.equal(coverageWheres[0].lastVerifiedAt, undefined);
-  for (const coverageWhere of coverageWheres.slice(1)) {
-    assert.deepEqual(coverageWhere.scanProofId, { not: null });
-    assert.equal(coverageWhere.scanProof.is.status, "COMMITTED");
-  }
-  assert.deepEqual(coverageWheres[1].lastVerifiedAt, { not: null });
-  assert.ok(coverageWheres[2].lastVerifiedAt.gte instanceof Date);
-  assert.equal(coverageWheres[2].lastVerifiedAt.lte.toISOString(), "2026-08-14T12:05:00.000Z");
-  db.analyticsCoverage.count=async()=>29;
-  const no=await svc.readRolling30dRevenue({db,creatorId:"creator-1",now});
-  assert.equal(no.fresh,false); assert.equal(no.revenue30dCents,null);
-});
-
-test("batched Settings evidence uses the same complete 30-day fallback instead of disagreeing with renewal", async () => {
-  const now = new Date("2026-08-14T12:00:00Z");
-  const db = makeDb({ revenue30dCents: 120_000, capturedAt: new Date("2026-08-10T00:00:00Z") });
-  const dailyRows = [];
-  const coverageRows = [];
-  for (let i = 0; i < 30; i += 1) {
-    const day = new Date(Date.UTC(2026, 7, 13 - i));
-    dailyRows.push({ creatorId: "creator-1", date: day, totalCents: 4_000, collectedAt: now });
-    coverageRows.push({ creatorId: "creator-1", coverageDate: day });
-  }
-  db.creatorEarningsDaily.findMany = async () => dailyRows;
-  db.analyticsCoverage.findMany = async () => coverageRows;
-  db.analyticsCoverage.count = async () => 30;
-  const svc = loadWalletService(db);
-  const result = await svc.readRolling30dRevenueBatch({ db, creatorIds: ["creator-1"], now });
-  const revenue = result.get("creator-1");
-  assert.equal(revenue.fresh, true);
-  assert.equal(revenue.source, "EARNINGS_DAILY_PROVEN_FRESH_30D");
-  assert.equal(revenue.revenue30dCents, 120_000);
-  const preview = svc.pricingPreviewFromRevenue({ policy: policyFixture(), profile: db._profiles.get("creator-1"), revenue });
-  assert.equal(preview.available, true);
-  assert.equal(preview.tier, "GROWTH");
-  assert.equal(preview.totalCents, 3000);
-});
-
-test("batched Settings evidence uses bounded grouped queries over the same 30 closed days", async () => {
-  const now = new Date("2026-08-14T12:00:00Z");
-  const db = makeDb({ revenue30dCents: 120_000, capturedAt: new Date("2026-08-10T00:00:00Z") });
-  db.creatorEarningsDaily.findMany = async () => { throw new Error("batch aggregation must not materialize daily rows"); };
-  db.creatorEarningsDaily.groupBy = async ({ where, by }) => {
-    assert.deepEqual(by, ["creatorId"]);
-    assert.equal(where.date.gte.toISOString(), "2026-07-15T00:00:00.000Z");
-    assert.equal(where.date.lte.toISOString(), "2026-08-13T00:00:00.000Z");
-    return [{ creatorId: "creator-1", _count: { _all: 30 }, _sum: { totalCents: 120_000 }, _max: { collectedAt: now } }];
+test("single billing evidence requires exactly 30 closed UTC days from the published repository", async () => {
+  const now=new Date("2026-08-14T12:00:00Z"), db=makeDb();
+  let calls=0;
+  db._readPublishedEarningsAggregates=async input=>{
+    calls++; assert.deepEqual(input.creatorIds,["creator-1"]);
+    assert.equal(input.from.toISOString(),"2026-07-15T00:00:00.000Z");
+    assert.equal(input.to.toISOString(),"2026-08-13T00:00:00.000Z");
+    assert(input.freshnessMs>0);
+    return new Map([["creator-1",{days:30,cents:30000,captured:now,fresh:30}]]);
   };
-  const groupedCoverageWheres = [];
-  db.analyticsCoverage.groupBy = async ({ where, by }) => {
-    groupedCoverageWheres.push(where);
-    assert.deepEqual(by, ["creatorId"]);
-    assert.equal(where.coverageDate.gte.toISOString(), "2026-07-15T00:00:00.000Z");
-    assert.equal(where.coverageDate.lte.toISOString(), "2026-08-13T00:00:00.000Z");
-    return [{ creatorId: "creator-1", _count: { _all: 30 } }];
-  };
-  const svc = loadWalletService(db);
-  const revenue = (await svc.readRolling30dRevenueBatch({ db, creatorIds: ["creator-1"], now })).get("creator-1");
-  assert.equal(revenue.fresh, true);
-  assert.equal(revenue.source, "EARNINGS_DAILY_PROVEN_FRESH_30D");
-  assert.equal(revenue.revenue30dCents, 120_000);
-  const freshWhere = groupedCoverageWheres.find((where) => where.lastVerifiedAt?.gte);
-  assert.ok(freshWhere);
-  assert.equal(freshWhere.lastVerifiedAt.lte.toISOString(), "2026-08-14T12:05:00.000Z");
+  const svc=loadWalletService(db), result=await svc.readRolling30dRevenue({db,creatorId:"creator-1",now});
+  assert.equal(calls,1);assert.equal(result.revenue30dCents,30000);assert.equal(result.fresh,true);
+  db._readPublishedEarningsAggregates=async()=>new Map([["creator-1",{days:29,cents:29000,captured:now,fresh:29}]]);
+  assert.equal((await svc.readRolling30dRevenue({db,creatorId:"creator-1",now})).revenue30dCents,null);
 });
 
-test("batched Settings evidence fails closed when even one coverage day is missing", async () => {
-  const now = new Date("2026-08-14T12:00:00Z");
-  const db = makeDb({ revenue30dCents: 120_000, capturedAt: new Date("2026-08-10T00:00:00Z") });
-  const dailyRows = [];
-  const coverageRows = [];
-  for (let i = 0; i < 30; i += 1) {
-    const day = new Date(Date.UTC(2026, 7, 13 - i));
-    dailyRows.push({ creatorId: "creator-1", date: day, totalCents: 4_000, collectedAt: now });
-    if (i < 29) coverageRows.push({ creatorId: "creator-1", coverageDate: day });
+test("Settings and renewal share published evidence and preserve unknown creator results", async () => {
+  const now=new Date("2026-08-14T12:00:00Z"),db=makeDb(),svc=loadWalletService(db);
+  db._readPublishedEarningsAggregates=async()=>new Map([["creator-1",{days:30,cents:120000,captured:now,fresh:30}]]);
+  const single=await svc.readRolling30dRevenue({db,creatorId:"creator-1",now});
+  const batch=await svc.readRolling30dRevenueBatch({db,creatorIds:["creator-1","creator-2","creator-1"],now});
+  assert.deepEqual(batch.get("creator-1"),single);assert.equal(batch.size,2);
+  assert.equal(batch.get("creator-2").revenue30dCents,null);
+  assert.equal(svc.pricingPreviewFromRevenue({policy:policyFixture(),profile:db._profiles.get("creator-1"),revenue:single}).tier,"GROWTH");
+});
+
+test("incomplete published evidence never guesses a price", async () => {
+  const now=new Date("2026-08-14T12:00:00Z"),db=makeDb(),svc=loadWalletService(db);
+  for(const days of [0,1,29,31]) {
+    db._readPublishedEarningsAggregates=async()=>new Map([["creator-1",{days,cents:120000,captured:now,fresh:days}]]);
+    const revenue=(await svc.readRolling30dRevenueBatch({db,creatorIds:["creator-1"],now})).get("creator-1");
+    assert.equal(revenue.revenue30dCents,null);
+    assert.equal(svc.pricingPreviewFromRevenue({policy:policyFixture(),profile:db._profiles.get("creator-1"),revenue}).available,false);
   }
-  db.creatorEarningsDaily.findMany = async () => dailyRows;
-  db.analyticsCoverage.findMany = async () => coverageRows;
-  db.analyticsCoverage.count = async () => 29;
-  const svc = loadWalletService(db);
-  const revenue = (await svc.readRolling30dRevenueBatch({ db, creatorIds: ["creator-1"], now })).get("creator-1");
-  assert.equal(revenue.fresh, false);
-  assert.equal(revenue.source, "UNAVAILABLE");
-  assert.equal(revenue.revenue30dCents, null);
-  assert.equal(svc.pricingPreviewFromRevenue({ policy: policyFixture(), profile: db._profiles.get("creator-1"), revenue }).available, false);
+});
+
+test("published but stale evidence remains an estimate and cannot debit a wallet", async () => {
+  const now=new Date("2026-08-14T12:00:00Z"),db=makeDb(),svc=loadWalletService(db);
+  db._readPublishedEarningsAggregates=async()=>new Map([["creator-1",{days:30,cents:120000,captured:new Date("2026-08-10"),fresh:29}]]);
+  const revenue=(await svc.readRolling30dRevenueBatch({db,creatorIds:["creator-1"],now})).get("creator-1");
+  assert.equal(revenue.fresh,false);assert.equal(revenue.stale,true);assert.equal(revenue.revenue30dCents,120000);
+  assert.throws(()=>svc.pricingFromRevenue({policy:policyFixture(),profile:db._profiles.get("creator-1"),revenue}),{code:"BILLING_EARNINGS_30D_UNAVAILABLE"});
 });
 
 test("one paid month can move STARTER -> GROWTH next renewal without rewriting history", async () => {

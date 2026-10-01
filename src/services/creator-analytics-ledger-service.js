@@ -2446,8 +2446,8 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
   const dayBetween = { gte: range.dayStart, lte: range.dayEnd };
   const currentDay = utcDay(now);
   const currentDayInRange = currentDay >= range.dayStart && currentDay <= range.dayEnd;
-  const [earnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, campaigns, coveragePage, earningsCoverageRows, completeMessageDays, inProgressMessageDays, campaignRevenue, unknownCampaignAttribution, notificationSync, dailyMetrics, paidSubscriptions, subscriptionStates, localMessageCoverage] = await Promise.all([
-    db.creatorEarningsDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }),
+  const [publishedEarnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, campaigns, coveragePage, completeMessageDays, inProgressMessageDays, campaignRevenue, unknownCampaignAttribution, notificationSync, dailyMetrics, paidSubscriptions, subscriptionStates, localMessageCoverage] = await Promise.all([
+    require("./published-earnings-read-repository").readPublishedEarningsDays({ db, creatorId, from: range.dayStart, to: range.dayEnd, now }),
     includeMessages ? db.creatorMessagesDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }) : Promise.resolve([]),
     db.creatorPostLike.groupBy({ by: ["onlyFansPostId"], where: { creatorId, likedAt: eventBetween }, _count: { _all: true }, orderBy: { _count: { onlyFansPostId: "desc" } }, take: 50 }),
     db.creatorPostComment.groupBy({ by: ["onlyFansPostId"], where: { creatorId, commentedAt: eventBetween }, _count: { _all: true }, orderBy: { _count: { onlyFansPostId: "desc" } }, take: 50 }),
@@ -2458,17 +2458,6 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     db.creatorSubscriptionEvent.groupBy({ by: ["eventType"], where: { creatorId, occurredAt: eventBetween }, _count: { _all: true }, _sum: { observedPriceCents: true } }),
     db.creatorCampaign.findMany({ where: { creatorId }, include: { _count: { select: { fans: true } } }, orderBy: [{ isActive: "desc" }, { collectedAt: "desc" }], take: 2000 }),
     includeCoveragePage ? readCreatorCoverage({ db, creatorId, rangeKey, limit: 120, offset: 0, now, authorityResolved: true }) : Promise.resolve({ rows: [], pagination: { limit: 0, offset: 0, returned: 0, total: 0, hasMore: false } }),
-    db.analyticsCoverage.findMany({
-      where: {
-        creatorId, dataType: "EARNINGS", sourceTimezone: "UTC",
-        coverageDate: dayBetween, status: { in: ["COMPLETE", "PARTIAL"] },
-      },
-      select: {
-        coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, lastErrorCode: true,
-        scanProofId: true, scanProof: { select: { status: true, proofVersion: true } },
-      },
-      orderBy: { coverageDate: "asc" },
-    }),
     includeMessages ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "COMPLETE", coverageDate: dayBetween } }) : Promise.resolve(0),
     includeMessages && currentDayInRange ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "PARTIAL", coverageDate: currentDay, lastErrorCode: "MESSAGES_DAY_IN_PROGRESS" } }) : Promise.resolve(0),
     readCampaignRevenue({ db, creatorId, start: range.start, end: range.end }),
@@ -2493,6 +2482,8 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
       ? db.creatorLocalMessageCoverage.findMany({ where: { creatorId }, orderBy: { lastVerifiedAt: "desc" } })
       : Promise.resolve([]),
   ]);
+  const earnings = publishedEarnings.flatMap(row => row.daily ? [row.daily] : []);
+  const earningsCoverageRows = publishedEarnings.map(row => row.coverage);
   const earningsKeys = ["subscriptionsCents", "messagesCents", "tipsCents", "postsCents", "streamsCents", "referralsCents", "totalCents"];
   const earningsAccumulator = earnings.reduce((acc, row) => {
     for (const key of earningsKeys) {
@@ -2506,7 +2497,6 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     sums: { subscriptionsCents: 0, messagesCents: 0, tipsCents: 0, postsCents: 0, streamsCents: 0, referralsCents: 0, totalCents: 0 },
     known: { subscriptionsCents: 0, messagesCents: 0, tipsCents: 0, postsCents: 0, streamsCents: 0, referralsCents: 0, totalCents: 0 },
   });
-  const earningsTotals = Object.fromEntries(earningsKeys.map((key) => [key, earningsAccumulator.known[key] ? earningsAccumulator.sums[key] : null]));
   const messageTotals = messages.reduce((acc, row) => {
     for (const key of ["incomingMessages", "outgoingMessages", "totalMessages", "uniqueDialogs", "uniqueIncomingFans", "uniqueOutgoingFans"]) acc[key] += row[key];
     return acc;
@@ -2556,6 +2546,8 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
   const verifiedEarningsDays = earningsCollectionState.provenUsableUnits;
   const verifiedMessageDays = completeMessageDays + inProgressMessageDays;
   const officialEarnings = earnings.length === expectedEarningsDays && earningsCollectionState.usable;
+  const earningsTotals = Object.fromEntries(earningsKeys.map(key => [key,
+    officialEarnings && earningsAccumulator.known[key] === expectedEarningsDays ? earningsAccumulator.sums[key] : null]));
   const officialMessages = messages.length === expectedEarningsDays && verifiedMessageDays === expectedEarningsDays;
   return {
     ok: true,

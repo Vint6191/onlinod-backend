@@ -10,6 +10,7 @@ const member={id:'m',userId:'u',agencyId:'a',accessEpoch:1,broad:false}, small={
 test('A2 PostgreSQL Home read/permission/pagination proof',async t=>{
  const pg=new PGlite();await pg.waitReady;t.after(()=>pg.close());
  await pg.exec(fs.readFileSync(path.join(root,'test/fixtures/phase6-home-I7-baseline.sql'),'utf8'));
+ await pg.exec('ALTER TABLE "AnalyticsScanProof" ADD COLUMN "proofVersion" INTEGER NOT NULL DEFAULT 1');
  await pg.exec(`INSERT INTO "AnalyticsCollectionDemand"(key,"agencyId","rangeKey","coverageFrom","coverageTo",reason,"creatorIds","requestedByMemberId","requestedAccessEpoch","requestedAt","updatedAt")
  VALUES ('preexisting','preexisting','7d','2026-09-01','2026-09-29','test','["historical-creator"]','old-member',7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`);
  await pg.exec(fs.readFileSync(path.join(root,'prisma/migrations/20260929170000_phase6_home_member_scope_v1/migration.sql'),'utf8'));
@@ -64,9 +65,9 @@ test('A2 PostgreSQL Home read/permission/pagination proof',async t=>{
   await pg.exec(`UPDATE "Agency" SET "trialEndsAt"='2099-01-01',"billingSupportHold"=false WHERE id='a'`);
  });
  for(const id of ['c00001','c00002']){
-  await insert('AnalyticsScanProof',{id:'proof-'+id,agencyId:'a',creatorId:id,dataType:'EARNINGS',scanRunId:'scan-'+id,sourceTimezone:'UTC',scanFrom:'2026-04-03',scanTo:'2026-09-29',requestedAt:now,serverReceivedAt:now,status:'COMMITTED',collectorVersion:'fixture',schemaVersion:1,scanGeneration:'fixture',collectionReason:'fixture',payloadChecksum:'fixture',updatedAt:now});
+  await insert('AnalyticsScanProof',{id:'proof-'+id,agencyId:'a',creatorId:id,dataType:'EARNINGS',scanRunId:'scan-'+id,sourceTimezone:'UTC',scanFrom:'2026-04-03',scanTo:'2026-09-29',requestedAt:now,serverReceivedAt:now,committedAt:now,proofVersion:2,status:'COMMITTED',collectorVersion:'fixture',schemaVersion:1,scanGeneration:'fixture',collectionReason:'fixture',payloadChecksum:'fixture',updatedAt:now});
   await pg.query(`INSERT INTO "AnalyticsCoverage"(id,"agencyId","creatorId","scanProofId","dataType","coverageDate","sourceTimezone",status,"lastVerifiedAt","updatedAt") SELECT $1||day::text,'a',$1,$2,'EARNINGS',day,'UTC',CASE WHEN day='2026-09-29'::date THEN 'PARTIAL'::"AnalyticsCoverageStatus" ELSE 'COMPLETE'::"AnalyticsCoverageStatus" END,$3,$3 FROM generate_series('2026-04-03'::date,'2026-09-29'::date,'1 day')day`,[id,'proof-'+id,now]);
-  await pg.query(`INSERT INTO "CreatorEarningsDaily"(id,"agencyId","creatorId","scanProofId",date,"totalCents","collectedAt","updatedAt") SELECT $1||day::text,'a',$1,$2,day,100,$3,$3 FROM generate_series('2026-04-03'::date,'2026-09-29'::date,'1 day')day`,[id,'proof-'+id,now]);
+  await pg.query(`INSERT INTO "CreatorEarningsDaily"(id,"agencyId","creatorId","scanProofId","sourceScanRunId",date,"totalCents","collectedAt","updatedAt") SELECT $1||day::text,'a',$1,$2,'scan-'||$1,day,100,$3,$3 FROM generate_series('2026-04-03'::date,'2026-09-29'::date,'1 day')day`,[id,'proof-'+id,now]);
  }
  await t.test('all four ranges: exact complete total, previous delta, bounded UTC chart; today PARTIAL is usable',async()=>{
   for(const [key,days] of [['today',1],['7d',7],['30d',30],['90d',90]]){
@@ -77,7 +78,7 @@ test('A2 PostgreSQL Home read/permission/pagination proof',async t=>{
   await pg.exec(`DELETE FROM "CreatorEarningsDaily" WHERE "creatorId"='c00002' AND date='2026-09-28'`);
   const r=await repo.readHomeTotals(input(db,small));assert.equal(r.totalCents,null);assert.equal(r.reportingCreators,1);assert.deepEqual(r.points,[]);assert.equal(r.deltaPct,null);
   const p=await repo.readHomeCreatorPage({...input(db,small),limit:50});assert.equal(p.creators[0].revenueCents,700);assert.equal(p.creators[1].revenueCents,null);
-  await pg.exec(`INSERT INTO "CreatorEarningsDaily"(id,"agencyId","creatorId","scanProofId",date,"totalCents","collectedAt","updatedAt") VALUES ('restored','a','c00002','proof-c00002','2026-09-28',100,'2026-09-29 12:00:00',CURRENT_TIMESTAMP)`);
+  await pg.exec(`INSERT INTO "CreatorEarningsDaily"(id,"agencyId","creatorId","scanProofId","sourceScanRunId",date,"totalCents","collectedAt","updatedAt") VALUES ('restored','a','c00002','proof-c00002','scan-c00002','2026-09-28',100,'2026-09-29 12:00:00',CURRENT_TIMESTAMP)`);
  });
  await t.test('uncommitted proof, stale/future verification and missing previous facts preserve UNKNOWN and freshness semantics',async()=>{
   await pg.exec(`UPDATE "AnalyticsScanProof" SET status='RECEIVED' WHERE id='proof-c00002'`);

@@ -1525,8 +1525,20 @@ test("ledger overview preserves nullable earnings categories and counts only com
     },
     $queryRaw: async () => [{ campaignId: "campaign-1", totalRevenueCents: 1000n, salesRevenueCents: 700n, tipsRevenueCents: 300n, subscriptionRevenueCents: 0n, transactionsCount: 2n }],
   };
+  db.$queryRawUnsafe = async (sql) => {
+    if (sql.includes('clock_timestamp')) return [{ authorityNow: new Date("2026-08-06T12:00:00Z") }];
+    if (sql.includes('published_earnings_days_v1')) {
+      const rows = await db.creatorEarningsDaily.findMany();
+      const coverage = await db.analyticsCoverage.findMany({ where: { dataType: "EARNINGS" } });
+      return rows.map(row => ({ ...row, id: row.id || "fixture-day", stateDate: row.date, scanProofId: coverage[0]?.scanProofId,
+        coverageStatus: coverage[0]?.status, coverageVerifiedAt: coverage[0]?.lastVerifiedAt,
+        coverageRetryAfterAt: coverage[0]?.retryAfterAt, coverageErrorCode: coverage[0]?.lastErrorCode }));
+    }
+    return db.$queryRaw();
+  };
   const result = await readCreatorLedgerOverview({ db: commitDatabaseFixture(db), creatorId: "creator-1", rangeKey: "7d", now: new Date("2026-08-06T12:00:00.000Z") });
-  assert.equal(result.totals.totalCents, 1000);
+  assert.equal(result.totals.totalCents, null, "partial range is not an official total");
+  assert.equal(result.daily.earnings[0].totalCents, 1000);
   assert.equal(result.totals.subscriptionsCents, null);
   assert.equal(result.verification.earningsDays, 1);
   assert.equal(result.verification.officialEarnings, false);
@@ -1584,6 +1596,17 @@ test("current overview ledger mode does not read dormant server message authorit
     },
     $queryRaw: async () => [],
   };
+  db.$queryRawUnsafe = async (sql) => {
+    if (sql.includes('clock_timestamp')) return [{ authorityNow: new Date("2026-08-06T12:00:00Z") }];
+    if (sql.includes('published_earnings_days_v1')) {
+      const rows = await db.creatorEarningsDaily.findMany();
+      const coverage = await db.analyticsCoverage.findMany({ where: { dataType: "EARNINGS" } });
+      return rows.map(row => ({ ...row, id: row.id || "fixture-day", stateDate: row.date, scanProofId: coverage[0]?.scanProofId,
+        coverageStatus: coverage[0]?.status, coverageVerifiedAt: coverage[0]?.lastVerifiedAt,
+        coverageRetryAfterAt: coverage[0]?.retryAfterAt, coverageErrorCode: coverage[0]?.lastErrorCode }));
+    }
+    return db.$queryRaw();
+  };
   const result = await readCreatorLedgerOverview({
     db: commitDatabaseFixture(db),
     creatorId: "creator-1",
@@ -1632,6 +1655,17 @@ test("today earnings are official only when the row and in-progress proof both e
       count: async ({ where }) => !where.dataType ? 1 : where.dataType === "EARNINGS" && where.status === "PARTIAL" ? 1 : 0,
     },
     $queryRaw: async () => [],
+  };
+  db.$queryRawUnsafe = async (sql) => {
+    if (sql.includes('clock_timestamp')) return [{ authorityNow: new Date("2026-08-06T12:00:00Z") }];
+    if (sql.includes('published_earnings_days_v1')) {
+      const rows = await db.creatorEarningsDaily.findMany();
+      const coverage = await db.analyticsCoverage.findMany({ where: { dataType: "EARNINGS" } });
+      return rows.map(row => ({ ...row, id: row.id || "fixture-day", stateDate: row.date, scanProofId: coverage[0]?.scanProofId,
+        coverageStatus: coverage[0]?.status, coverageVerifiedAt: coverage[0]?.lastVerifiedAt,
+        coverageRetryAfterAt: coverage[0]?.retryAfterAt, coverageErrorCode: coverage[0]?.lastErrorCode }));
+    }
+    return db.$queryRaw();
   };
   const result = await readCreatorLedgerOverview({ db: commitDatabaseFixture(db), creatorId: "creator-1", rangeKey: "24h", now: new Date("2026-08-06T12:00:00.000Z") });
   assert.equal(result.verification.officialEarnings, true);

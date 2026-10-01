@@ -1,5 +1,5 @@
 "use strict";
-const { runRootCommit } = require("./db-commit-kernel");
+const { readWithAnalyticsViewer } = require("./analytics-viewer-read-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const DAY = 86400000, UNKNOWN = "unattributed_paid_subscriptions";
 const fault = (code, status = 400) => Object.assign(new Error(code), { code, status });
@@ -54,13 +54,12 @@ async function freshness(db, creator) {
     providerAuthority: "CAMPAIGNS", valueAuthority: "FAN_DATA_CURRENT", projectionVersion: 2 };
 }
 async function readSnapshot(db, input, reader) {
-  return runRootCommit(db, async ({ tx }) => {
-    const { creator } = await require("./traffic-service").assertTrafficViewer({ ...input, db: tx });
+  return readWithAnalyticsViewer({ ...input, db, permission: "traffic.view" }, async ({ db: tx, creator }) => {
     const now = await dbAuthorityNow({ db: tx });
     const result = await reader(tx, creator, rangeWindow(input.rangeKey, now));
     return { ok: true, contractVersion: 2, creatorId: creator.id, asOf: now.toISOString(), ...result,
       projection: await freshness(tx, creator) };
-  }, { profile: "COMMAND", isolationLevel: "RepeatableRead", authority: { kind: "TRAFFIC_READ", creatorId: input.creatorId, userId: input.userId } });
+  });
 }
 function rowFor(source, value = {}, rev = {}) {
   const cost = num(source.costCents), money = num(rev.revenueCents);

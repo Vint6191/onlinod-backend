@@ -105,6 +105,12 @@ async function loadCreatorWithAccess(req, res, creatorId) {
   }
 }
 
+function readStatsSnapshot(req, ctx, read) {
+  return require("../services/analytics-viewer-read-service").readWithAnalyticsViewer({
+    db: prisma, userId: actorUserId(req), creatorId: ctx.creator.id, member: ctx.member, permission: "money.view_earnings",
+  }, read);
+}
+
 // Agency convenience endpoints are still member-scoped: membership never
 // implies access to every creator in the agency.
 async function loadAgencyAccess(req, res, agencyId) {
@@ -234,11 +240,11 @@ router.get("/creators/:creatorId/overview-v2", async (req, res) => {
     } catch {
       return res.status(400).json({ ok: false, code: "INVALID_OVERVIEW_RANGE", error: `Invalid overview range: ${String(req.query.range || "")}` });
     }
-    const overview = await readCreatorOverview({ creatorId: ctx.creator.id, rangeKey });
+    const overview = await readStatsSnapshot(req, ctx, ({ db }) => readCreatorOverview({ db, creatorId: ctx.creator.id, rangeKey }));
     return res.json(overview);
   } catch (error) {
     console.error("[stats/overview-v2] failed:", error);
-    return res.status(500).json({ ok: false, code: "CREATOR_OVERVIEW_FAILED", error: error?.message || "Failed" });
+    return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "CREATOR_OVERVIEW_FAILED", error: error?.message || "Failed" });
   }
 });
 
@@ -247,11 +253,11 @@ router.get("/creators/:creatorId/current-task", async (req, res) => {
     const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
     if (!ctx) return;
     if (!requireEarningsPermission(res, ctx.member)) return;
-    const task = await readCreatorCurrentTask({ creatorId: ctx.creator.id });
+    const task = await readStatsSnapshot(req, ctx, ({ db }) => readCreatorCurrentTask({ db, creatorId: ctx.creator.id }));
     return res.json({ ok: true, creatorId: ctx.creator.id, task });
   } catch (error) {
     console.error("[stats/current-task] failed:", error);
-    return res.status(500).json({ ok: false, code: "CREATOR_CURRENT_TASK_FAILED", error: error?.message || "Failed" });
+    return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "CREATOR_CURRENT_TASK_FAILED", error: error?.message || "Failed" });
   }
 });
 
@@ -265,14 +271,14 @@ router.get("/creators/:creatorId/task-activity", async (req, res) => {
       return res.status(400).json({ ok: false, code: "INVALID_ACTIVITY_DAY", error: "day must be YYYY-MM-DD" });
     }
     const limit = Math.max(1, Math.min(5000, Number.parseInt(String(req.query.limit || "240"), 10) || 240));
-    const [items, days] = await Promise.all([
-      readCreatorTaskActivity({ creatorId: ctx.creator.id, day, limit }),
-      readCreatorTaskActivityDays({ creatorId: ctx.creator.id }),
-    ]);
+    const [items, days] = await readStatsSnapshot(req, ctx, ({ db }) => Promise.all([
+      readCreatorTaskActivity({ db, creatorId: ctx.creator.id, day, limit }),
+      readCreatorTaskActivityDays({ db, creatorId: ctx.creator.id }),
+    ]));
     return res.json({ ok: true, creatorId: ctx.creator.id, retentionDays: 30, days, items });
   } catch (error) {
     console.error("[stats/task-activity] failed:", error);
-    return res.status(500).json({ ok: false, code: "CREATOR_TASK_ACTIVITY_FAILED", error: error?.message || "Failed" });
+    return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "CREATOR_TASK_ACTIVITY_FAILED", error: error?.message || "Failed" });
   }
 });
 
@@ -295,18 +301,18 @@ router.get("/creators/:creatorId/campaigns/:campaignId/fans", async (req, res) =
         return res.status(400).json({ ok: false, code: "INVALID_CAMPAIGN_FAN_RANGE", error: `Invalid campaign fan range: ${String(req.query.range || "")}` });
       }
     }
-    const result = await readCampaignFans({
-      creatorId: ctx.creator.id,
+    const result = await readStatsSnapshot(req, ctx, ({ db }) => readCampaignFans({
+      db, creatorId: ctx.creator.id,
       campaignId,
       limit,
       offset,
       rangeKey,
-    });
+    }));
     if (!result) return res.status(404).json({ ok: false, code: "CAMPAIGN_NOT_FOUND", error: "Campaign not found for this creator" });
     return res.json({ ok: true, creatorId: ctx.creator.id, ...result });
   } catch (error) {
     console.error("[stats/campaign-fans] failed:", error);
-    return res.status(500).json({ ok: false, code: "CAMPAIGN_FANS_FAILED", error: error?.message || "Failed" });
+    return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "CAMPAIGN_FANS_FAILED", error: error?.message || "Failed" });
   }
 });
 
@@ -323,15 +329,15 @@ router.get("/creators/:creatorId/notification-scan", async (req, res) => {
     const outcome = String(req.query.outcome || "ALL").trim().toUpperCase();
     const limit = Math.max(1, Math.min(200, Number.parseInt(String(req.query.limit || "100"), 10) || 100));
     const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
-    const result = await readManualNotificationScan({ creator: ctx.creator, outcome, limit, offset });
+    const result = await readStatsSnapshot(req, ctx, ({ db, creator }) => readManualNotificationScan({ db, creator, outcome, limit, offset }));
     return res.json(result);
   } catch (error) {
     const message = error?.message || "Failed";
     const validation = /invalid notification scan outcome/i.test(message);
     console.error("[stats/notification-scan] failed:", error);
-    return res.status(validation ? 400 : 500).json({
+    return res.status(Number(error?.status) || (validation ? 400 : 500)).json({
       ok: false,
-      code: validation ? "INVALID_NOTIFICATION_SCAN_FILTER" : "NOTIFICATION_SCAN_READ_FAILED",
+      code: error?.code || (validation ? "INVALID_NOTIFICATION_SCAN_FILTER" : "NOTIFICATION_SCAN_READ_FAILED"),
       error: message,
     });
   }
@@ -380,10 +386,10 @@ router.get("/creators/:creatorId/financial-transaction-scan", async (req, res) =
     if (!requireEarningsPermission(res, ctx.member)) return;
     const limit = Math.max(1, Math.min(200, Number.parseInt(String(req.query.limit || "100"), 10) || 100));
     const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
-    return res.json(await readManualFinancialTransactionScan({ creator: ctx.creator, limit, offset }));
+    return res.json(await readStatsSnapshot(req, ctx, ({ db, creator }) => readManualFinancialTransactionScan({ db, creator, limit, offset })));
   } catch (error) {
     console.error("[stats/financial-transaction-scan] failed:", error);
-    return res.status(500).json({ ok: false, code: "FINANCIAL_TRANSACTION_SCAN_READ_FAILED", error: error?.message || "Failed" });
+    return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "FINANCIAL_TRANSACTION_SCAN_READ_FAILED", error: error?.message || "Failed" });
   }
 });
 
@@ -428,10 +434,10 @@ router.get("/creators/:creatorId/campaign-scan", async (req, res) => {
     if (!requireEarningsPermission(res, ctx.member)) return;
     const limit = Math.max(1, Math.min(200, Number.parseInt(String(req.query.limit || "100"), 10) || 100));
     const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
-    return res.json(await readManualCampaignScan({ creator: ctx.creator, limit, offset }));
+    return res.json(await readStatsSnapshot(req, ctx, ({ db, creator }) => readManualCampaignScan({ db, creator, limit, offset })));
   } catch (error) {
     console.error("[stats/campaign-scan] failed:", error);
-    return res.status(500).json({ ok: false, code: "CAMPAIGN_SCAN_READ_FAILED", error: error?.message || "Failed" });
+    return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "CAMPAIGN_SCAN_READ_FAILED", error: error?.message || "Failed" });
   }
 });
 

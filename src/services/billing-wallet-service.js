@@ -7,7 +7,7 @@ const { audit } = require("./audit-service");
 const { configuredPrices, automaticTierForRevenue } = require("./billing-catalog-service");
 const { isFuture, lockAgencyBillingMutation, syncAgencyBillingAggregate } = require("./billing-entitlement-service");
 const { evaluateAggregateCollectionState, stateVocabulary } = require("./analytics-state-evaluator");
-const { COLLECTION_FUTURE_SKEW_TOLERANCE_MS } = require("./analytics-freshness-policy");
+const { readPublishedEarningsAggregates } = require("./published-earnings-read-repository");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 
 const { readCommercialPolicy, enableCommercialPricingWrite } = require("./billing-commercial-policy-service");
@@ -104,163 +104,37 @@ function earningsMaxAgeMs() {
   return hours * 60 * 60 * 1000;
 }
 
+function unavailableRevenue() {
+  return { revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false,
+    collectionState: "UNAVAILABLE", complete: false, proven: false, stale: false, due: true, deferred: false };
+}
+
+async function readRevenueWindow({ db, creatorIds, now }) {
+  const { startDay, endDay } = closedRevenueWindow(now);
+  const aggregates = await readPublishedEarningsAggregates({
+    db, creatorIds, from: startDay, to: endDay, now, freshnessMs: earningsMaxAgeMs(),
+  });
+  return new Map(creatorIds.map(creatorId => {
+    const row = aggregates.get(creatorId);
+    if (!row || row.days !== 30) return [creatorId, unavailableRevenue()];
+    const state = evaluateAggregateCollectionState({ expectedUnits: 30, completeUnits: row.days,
+      provenUsableUnits: row.days, freshUsableUnits: row.fresh, now });
+    return [creatorId, { revenue30dCents: row.cents, capturedAt: asDate(row.captured) || endDay,
+      source: state.fresh ? "EARNINGS_DAILY_PROVEN_FRESH_30D" : "EARNINGS_DAILY_PROVEN_STALE_30D",
+      fresh: state.fresh, collectionState: stateVocabulary(state), complete: state.complete,
+      proven: state.proven, stale: state.stale, due: state.due, deferred: state.deferred }];
+  }));
+}
+
 async function readRolling30dRevenue({ db, creatorId, now = new Date(), authorityResolved = false }) {
   if (!authorityResolved) now = await dbAuthorityNow({ db, fallbackNow: now });
-  // Billing is authorized only by durable relational facts + durable scan proof.
-  // Operational JobInstance/ingest history may be retained or compacted independently.
-  if (db.creatorEarningsDaily?.findMany && db.analyticsCoverage?.count) {
-    const closed = closedRevenueWindow(now);
-    const freshThreshold = new Date(now.getTime() - earningsMaxAgeMs());
-    const trustedClockCeiling = new Date(now.getTime() + COLLECTION_FUTURE_SKEW_TOLERANCE_MS);
-    const [rows, completeDays, provenDays, freshDays] = await Promise.all([
-      db.creatorEarningsDaily.findMany({
-        where: {
-          creatorId,
-          sourceTimezone: "UTC",
-          sourceScanRunId: { not: null },
-          scanProofId: { not: null },
-          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
-          date: { gte: closed.startDay, lte: closed.endDay },
-        },
-        orderBy: { date: "asc" },
-      }),
-      db.analyticsCoverage.count({
-        where: {
-          creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
-          coverageDate: { gte: closed.startDay, lte: closed.endDay },
-        },
-      }),
-      db.analyticsCoverage.count({
-        where: {
-          creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
-          scanProofId: { not: null }, lastVerifiedAt: { not: null },
-          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
-          coverageDate: { gte: closed.startDay, lte: closed.endDay },
-        },
-      }),
-      db.analyticsCoverage.count({
-        where: {
-          creatorId, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
-          scanProofId: { not: null }, lastVerifiedAt: { gte: freshThreshold, lte: trustedClockCeiling },
-          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
-          coverageDate: { gte: closed.startDay, lte: closed.endDay },
-        },
-      }),
-    ]);
-    const uniqueDays = new Set(rows.map((row) => asDate(row.date)?.toISOString().slice(0, 10)).filter(Boolean));
-    const collectionState = evaluateAggregateCollectionState({
-      expectedUnits: 30,
-      completeUnits: completeDays,
-      provenUsableUnits: Math.min(provenDays, uniqueDays.size),
-      freshUsableUnits: Math.min(freshDays, uniqueDays.size),
-      now,
-    });
-    if (collectionState.usable) {
-      const newest = rows.reduce((latest, row) => {
-        const candidate = asDate(row.collectedAt || row.updatedAt || row.date);
-        return candidate && (!latest || candidate > latest) ? candidate : latest;
-      }, null);
-      return {
-        revenue30dCents: cents(rows.reduce((sum, row) => sum + cents(row.totalCents), 0)),
-        capturedAt: newest || closed.endDay,
-        source: collectionState.fresh ? "EARNINGS_DAILY_PROVEN_FRESH_30D" : "EARNINGS_DAILY_PROVEN_STALE_30D",
-        fresh: collectionState.fresh,
-        collectionState: stateVocabulary(collectionState),
-        complete: collectionState.complete,
-        proven: collectionState.proven,
-        stale: collectionState.stale,
-        due: collectionState.due,
-        deferred: collectionState.deferred,
-      };
-    }
-  }
-  // The legacy CreatorEarningsSnapshot generation is physically retired by
-  // the Phase-3 final cutover. Missing canonical daily proof is UNAVAILABLE;
-  // no display or pricing reader may reconstruct revenue/tier from snapshots.
-  return {
-    revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false,
-    collectionState: "UNAVAILABLE", complete: false, proven: false, stale: false, due: true, deferred: false,
-  };
+  return (await readRevenueWindow({ db, creatorIds: [String(creatorId)], now })).get(String(creatorId));
 }
 
 async function readRolling30dRevenueBatch({ db, creatorIds, now = new Date() }) {
   now = await dbAuthorityNow({ db, fallbackNow: now });
-  const ids = [...new Set((creatorIds || []).map((value) => String(value || "").trim()).filter(Boolean))];
-  const results = new Map(ids.map((creatorId) => [creatorId, { revenue30dCents: null, capturedAt: null, source: "UNAVAILABLE", fresh: false, collectionState: "UNAVAILABLE", complete: false, proven: false, stale: false, due: true, deferred: false }]));
-  if (!ids.length) return results;
-
-if (db.creatorEarningsDaily?.groupBy && db.analyticsCoverage?.groupBy) {
-    const closed = closedRevenueWindow(now);
-    const freshThreshold = new Date(now.getTime() - earningsMaxAgeMs());
-    const trustedClockCeiling = new Date(now.getTime() + COLLECTION_FUTURE_SKEW_TOLERANCE_MS);
-    const [dailyGroups, completeCoverageGroups, provenCoverageGroups, freshCoverageGroups] = await Promise.all([
-      db.creatorEarningsDaily.groupBy({
-        by: ["creatorId"],
-        where: {
-          creatorId: { in: ids }, sourceTimezone: "UTC", sourceScanRunId: { not: null }, scanProofId: { not: null },
-          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
-          date: { gte: closed.startDay, lte: closed.endDay },
-        },
-        _count: { _all: true }, _sum: { totalCents: true }, _max: { collectedAt: true },
-      }),
-      db.analyticsCoverage.groupBy({
-        by: ["creatorId"],
-        where: {
-          creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
-          coverageDate: { gte: closed.startDay, lte: closed.endDay },
-        },
-        _count: { _all: true },
-      }),
-      db.analyticsCoverage.groupBy({
-        by: ["creatorId"],
-        where: {
-          creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
-          scanProofId: { not: null }, lastVerifiedAt: { not: null },
-          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
-          coverageDate: { gte: closed.startDay, lte: closed.endDay },
-        },
-        _count: { _all: true },
-      }),
-      db.analyticsCoverage.groupBy({
-        by: ["creatorId"],
-        where: {
-          creatorId: { in: ids }, dataType: "EARNINGS", sourceTimezone: "UTC", status: "COMPLETE",
-          scanProofId: { not: null }, lastVerifiedAt: { gte: freshThreshold, lte: trustedClockCeiling },
-          scanProof: { is: { dataType: "EARNINGS", status: "COMMITTED", committedAt: { not: null } } },
-          coverageDate: { gte: closed.startDay, lte: closed.endDay },
-        },
-        _count: { _all: true },
-      }),
-    ]);
-    const dailyByCreator = new Map(dailyGroups.map((row) => [String(row.creatorId), row]));
-    const completeByCreator = new Map(completeCoverageGroups.map((row) => [String(row.creatorId), Number(row?._count?._all || 0)]));
-    const provenByCreator = new Map(provenCoverageGroups.map((row) => [String(row.creatorId), Number(row?._count?._all || 0)]));
-    const freshByCreator = new Map(freshCoverageGroups.map((row) => [String(row.creatorId), Number(row?._count?._all || 0)]));
-    for (const creatorId of ids) {
-      const daily = dailyByCreator.get(creatorId);
-      const dailyCount = Number(daily?._count?._all || 0);
-      const collectionState = evaluateAggregateCollectionState({
-        expectedUnits: 30,
-        completeUnits: completeByCreator.get(creatorId) || 0,
-        provenUsableUnits: Math.min(provenByCreator.get(creatorId) || 0, dailyCount),
-        freshUsableUnits: Math.min(freshByCreator.get(creatorId) || 0, dailyCount),
-        now,
-      });
-      if (!collectionState.usable) continue;
-      results.set(creatorId, {
-        revenue30dCents: cents(daily?._sum?.totalCents),
-        capturedAt: asDate(daily?._max?.collectedAt) || closed.endDay,
-        source: collectionState.fresh ? "EARNINGS_DAILY_PROVEN_FRESH_30D" : "EARNINGS_DAILY_PROVEN_STALE_30D",
-        fresh: collectionState.fresh,
-        collectionState: stateVocabulary(collectionState),
-        complete: collectionState.complete, proven: collectionState.proven, stale: collectionState.stale, due: collectionState.due, deferred: collectionState.deferred,
-      });
-    }
-    return results;
-  }
-
-  for (const creatorId of ids) results.set(creatorId, await readRolling30dRevenue({ db, creatorId, now, authorityResolved: true }));
-  return results;
+  const ids = [...new Set((creatorIds || []).map(value => String(value || "").trim()).filter(Boolean))];
+  return readRevenueWindow({ db, creatorIds: ids, now });
 }
 
 function configuredAddonPrice(profile, key, policy) {

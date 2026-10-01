@@ -15,33 +15,25 @@ function pageInput({ after = null, limit = 50 } = {}) {
 // Each period is at most 90 days. SQL reduces all visible canonical rows to one
 // aggregate and at most 90 chart points; no creator-sized arrays cross the wire.
 function revenueSql(source = 'visible') {
+  const { publishedEarningsJoins } = require('./published-earnings-read-repository');
   return `, periods AS (SELECT 0 AS period,$6::date AS start_day,$7::date AS end_day
     UNION ALL SELECT 1,$8::date,$9::date),
-  covered AS (
-    SELECT c."id",r.period,r.end_day-r.start_day+1 AS expected,
-      COUNT(v."id") FILTER (WHERE p."status"='COMMITTED' AND p."proofVersion"=2 AND
-        (v."status"='COMPLETE' OR (v."coverageDate"=$10::date AND v."status"='PARTIAL'))) AS usable,
-      COUNT(v."id") FILTER (WHERE p."status"='COMMITTED' AND p."proofVersion"=2 AND
-        (v."status"='COMPLETE' OR (v."coverageDate"=$10::date AND v."status"='PARTIAL'))
-        AND v."lastVerifiedAt"<=$11::timestamp+interval '5 minutes'
-        AND v."lastVerifiedAt">=$11::timestamp-(CASE WHEN v."coverageDate"=$10::date THEN ${CURRENT_DAY_FRESHNESS_MS}
-          WHEN v."coverageDate">=$10::date-30 THEN ${RECENT_CLOSED_FRESHNESS_MS} ELSE ${HISTORICAL_FRESHNESS_MS} END)*interval '1 millisecond') AS fresh
-    FROM ${source} c CROSS JOIN periods r LEFT JOIN "AnalyticsCoverage" v ON v."agencyId"=$1 AND v."creatorId"=c."id"
-      AND v."dataType"='EARNINGS' AND v."sourceTimezone"='UTC' AND v."coverageDate" BETWEEN r.start_day AND r.end_day
-    LEFT JOIN "AnalyticsScanProof" p ON p."id"=v."scanProofId" AND p."agencyId"=$1 AND p."creatorId"=c."id"
-    GROUP BY c."id",r.period,r.start_day,r.end_day
-  ), daily AS MATERIALIZED (
-    SELECT d."creatorId",r.period,d."date",d."totalCents",d."collectedAt"
+  daily AS MATERIALIZED (
+    SELECT d."creatorId",r.period,d."date",d."totalCents",d."collectedAt",
+      (v."lastVerifiedAt"<=$11::timestamp+interval '5 minutes'
+        AND v."lastVerifiedAt">=$11::timestamp-(CASE WHEN d."date"=$10::date THEN ${CURRENT_DAY_FRESHNESS_MS}
+          WHEN d."date">=$10::date-30 THEN ${RECENT_CLOSED_FRESHNESS_MS} ELSE ${HISTORICAL_FRESHNESS_MS} END)*interval '1 millisecond') AS fresh
     FROM ${source} c JOIN "CreatorEarningsDaily" d ON d."creatorId"=c."id" AND d."agencyId"=$1 AND d."sourceTimezone"='UTC'
       JOIN periods r ON d."date" BETWEEN r.start_day AND r.end_day
-      JOIN "AnalyticsScanProof" p ON p."id"=d."scanProofId" AND p."status"='COMMITTED' AND p."proofVersion"=2 AND p."agencyId"=$1 AND p."creatorId"=c."id"
+      ${publishedEarningsJoins()}
+    WHERE v."status"='COMPLETE' OR (d."date"=$10::date AND v."status"='PARTIAL')
   ), earnings AS (
-    SELECT "creatorId",period,COUNT(*) AS days,SUM("totalCents") AS cents,MAX("collectedAt") AS captured
-    FROM daily GROUP BY "creatorId",period
+    SELECT "creatorId",period,COUNT(*) AS days,COUNT(*) FILTER (WHERE fresh) AS fresh_days,
+      SUM("totalCents") AS cents,MAX("collectedAt") AS captured FROM daily GROUP BY "creatorId",period
   ), facts AS MATERIALIZED (
-    SELECT v."id",v.period,(v.usable=v.expected AND COALESCE(e.days,0)=v.expected) AS usable,
-      (v.fresh=v.expected AND COALESCE(e.days,0)=v.expected) AS fresh,COALESCE(e.cents,0) AS cents,e.captured
-    FROM covered v LEFT JOIN earnings e ON e."creatorId"=v."id" AND e.period=v.period
+    SELECT c."id",r.period,(COALESCE(e.days,0)=r.end_day-r.start_day+1) AS usable,
+      (COALESCE(e.fresh_days,0)=r.end_day-r.start_day+1) AS fresh,COALESCE(e.cents,0) AS cents,e.captured
+    FROM ${source} c CROSS JOIN periods r LEFT JOIN earnings e ON e."creatorId"=c."id" AND e.period=r.period
   )`;
 }
 // A demand is pending only for its still-current member scope. Null creatorIds
