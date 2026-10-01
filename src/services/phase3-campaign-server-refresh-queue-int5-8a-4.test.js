@@ -115,6 +115,24 @@ test("INT5.8A-4 freshness policy reuses current FanData for six hours across rec
   assert.equal(campaignFanRefreshIsFresh(null, cutoff), false);
 });
 
+for (const previous of ["QUEUED", "PARTIAL", "COMPLETE"]) test(`fresh-only Campaign page preserves accumulated ${previous} coverage and replay`, async () => {
+  const { db, coverage, planner } = queueHarness();
+  const scanStartedAt = new Date("2026-09-18T00:00:00Z");
+  Object.assign(coverage, { fanValueCoverageScanRunId: "run-1", fanValueFreshnessCutoffAt: scanStartedAt,
+    fanValueExpected: 1, fanValueQueued: 1, fanValueOutstanding: previous === "QUEUED" ? 1 : 0,
+    fanValueFailed: previous === "PARTIAL" ? 1 : 0, fanValueSucceeded: previous === "COMPLETE" ? 1 : 0,
+    fanValueFreshnessStatus: previous });
+  const input = { db, planner, job: { id: "campaign-job", agencyId: "agency-1", creatorId: "creator-1" },
+    scanRunId: "run-1", scanStartedAt, now: scanStartedAt,
+    candidates: [{ onlyFansUserId: "already-fresh-fan", valueObservedAt: scanStartedAt }] };
+  await enqueueUniqueCampaignFanRefreshes(input);
+  assert.equal(coverage.fanValueFreshnessStatus, previous);
+  assert.equal(coverage.fanValueExpected, 2); assert.equal(coverage.fanValueAlreadyFresh, 1);
+  const saved = { ...coverage };
+  await enqueueUniqueCampaignFanRefreshes(input);
+  assert.deepEqual(coverage, saved);
+});
+
 test("INT5.8A-4 one fan in many Campaign memberships creates one durable per-run refresh identity", async () => {
   const { db, work, jobsByKey, planner } = queueHarness();
   const job = { id: "campaign-job", agencyId: "agency-1", creatorId: "creator-1", priority: 80 };

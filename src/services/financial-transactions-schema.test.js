@@ -114,7 +114,8 @@ test("financial scanner has its own manual job and endpoints, independent of not
   assert.match(control, /const snapshotMarker = Math\.floor\(authorityNow\.getTime\(\) \/ 1000\)/);
   assert.match(control, /initialMarker:\s*snapshotMarker/);
   assert.match(control, /endDate:\s*onlyFansUtcDateTime\(new Date\(snapshotMarker \* 1000\)\)/);
-  assert.match(control, /status:\s*"PAUSED"/);
+  assert.match(control, /pauseCollectorJob\(\{ db, creatorId, jobKey: JOB_KEY, collectorType: COLLECTOR_TYPES.FINANCIAL/);
+  assert.match(read("src/services/analytics-scan-job-authority.js"), /status:\s*"PAUSED"/);
   assert.match(routes, /financial-transaction-scan\/start/);
   assert.match(routes, /financial-transaction-scan\/stop/);
   const financialBlockStart = routes.indexOf("Manual all-time payout transaction scanner");

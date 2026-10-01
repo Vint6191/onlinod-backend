@@ -81,7 +81,7 @@ async function sourceCoverage(db,creatorId,now) {
   const evidence=(row,freshnessMs)=>{
     if(!row)return null;
     const state=evaluateDurableCollectorState({status:row.status,baselineCompletedAt:row.baselineVerifiedAt,baselineVerifiedAt:row.baselineVerifiedAt,
-      lastVerifiedAt:row.lastCatchupCompletedAt||row.baselineVerifiedAt,retryAfterAt:row.retryAfterAt,now,freshnessMs});
+      lastVerifiedAt:row.lastCatchupCompletedAt,retryAfterAt:row.retryAfterAt,now,freshnessMs});
     return {...row,status:stateVocabulary(state),proven:state.proven,fresh:state.fresh};
   };
   return {financial:evidence(financial,FINANCIAL_COLLECTION_FRESHNESS_MS),campaigns:evidence(campaigns,CAMPAIGN_COLLECTION_FRESHNESS_MS)};

@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { activeCollectorJob, pauseCollectorJob } = require("./analytics-scan-job-authority");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
@@ -14,7 +15,6 @@ const {
 
 const JOB_KEY = "catchup_notifications_scan";
 const MANUAL_REASON = "manual_creator_analytics_notification_scan";
-const ACTIVE_STATUSES = new Set(["SCHEDULED", "CLAIMED", "PAUSED"]);
 const OUTCOMES = new Set(["ACCEPTED", "REJECTED", "IGNORED"]);
 const MAX_AUDIT_ITEMS_PER_SOURCE_PAGE = 100;
 
@@ -103,23 +103,6 @@ async function recentManualJobs(db, creatorId, statuses = null, take = 40) {
   return rows.filter(isManualJob);
 }
 
-async function findActiveManualJob(db, creatorId) {
-  const rows = await recentManualJobs(db, creatorId, ["SCHEDULED", "CLAIMED", "PAUSED"], 40);
-  return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
-}
-async function findActiveNotificationJob(db, creatorId) {
-  const rows = await db.jobInstance.findMany({
-    where: {
-      creatorId,
-      jobKey: JOB_KEY,
-      status: { in: ["SCHEDULED", "CLAIMED", "PAUSED"] },
-    },
-    orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
-    take: 40,
-  });
-  return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
-}
-
 async function startManualNotificationScan({ db = prisma, creator, requestedByUserId = null, now = new Date(), forceFull = false }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.NOTIFICATIONS, creatorId: creator.id, work: async (tx) => {
@@ -129,8 +112,8 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
     // START must never create a second notification walk beside an automatic
     // initial/catch-up job. The read and possible creation are serialized by the
     // same collector advisory lock used by generation accept/complete.
-    const activeManual = await findActiveManualJob(tx, creator.id);
-    const active = activeManual || await findActiveNotificationJob(tx, creator.id);
+    const active = await activeCollectorJob(tx, creator.id, JOB_KEY);
+    if (active?.status === "PUBLISHING") return { job: active, action: "publishing" };
 
     if (active) {
       const activeParams = object(active.params);
@@ -205,7 +188,7 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
       now: authorityNow,
       bucketMs: 1,
       dedupeParams: buildCollectionPlanningDedupeParams({
-        collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: desiredMode, state: syncState,
+        collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: desiredMode, state: syncState, now: authorityNow,
       }),
     });
     return { job: scheduled.job, action: scheduled.reason === "already_claimed" ? "already_running" : "created" };
@@ -213,32 +196,7 @@ async function startManualNotificationScan({ db = prisma, creator, requestedByUs
 }
 
 async function stopManualNotificationScan({ db = prisma, creatorId, now = new Date() }) {
-  const active = await findActiveManualJob(db, creatorId);
-  if (!active) return { job: null, action: "idle" };
-  if (active.status === "PAUSED") return { job: active, action: "already_paused" };
-  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
-
-  const result = await db.jobInstance.updateMany({
-    where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED"] } },
-    data: {
-      status: "PAUSED",
-      claimedAt: null,
-      claimedByDeviceId: null,
-      leaseUntil: null,
-      leaseTokenHash: null,
-      leaseRevision: { increment: 1 },
-      workId: null,
-      completedAt: null,
-      lastError: null,
-      lastProgressAt: active.lastProgressAt || authorityNow,
-    },
-  });
-  if (!result.count) {
-    const current = await db.jobInstance.findUnique({ where: { id: active.id } });
-    return { job: current, action: current?.status === "PAUSED" ? "already_paused" : "changed" };
-  }
-  const paused = await db.jobInstance.findUnique({ where: { id: active.id } });
-  return { job: paused, action: "paused" };
+  return pauseCollectorJob({ db, creatorId, jobKey: JOB_KEY, collectorType: COLLECTOR_TYPES.NOTIFICATIONS, now });
 }
 
 function normalizeAuditRow(row, index) {
@@ -351,7 +309,7 @@ async function countOnlineBindings(db, creator, now = null) {
 
 async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL", limit = 100, offset = 0 }) {
   const manualJobs = await recentManualJobs(db, creator.id, null, 60);
-  const job = manualJobs[0] || null;
+  const job = await activeCollectorJob(db, creator.id, JOB_KEY) || manualJobs[0] || null;
   const sync = await loadNotificationSyncState(db, creator.id);
   const syncBelongsToJob = Boolean(job && sync?.sourceJobId === job.id);
   const linkedSync = syncBelongsToJob ? sync : null;
@@ -444,7 +402,7 @@ async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL
     jobId: job?.id || null,
     status: currentStatus,
     mode: scanMode(job, linkedSync),
-    manual: Boolean(job),
+    manual: isManualJob(job),
     pagesScanned,
     processed: accepted + rejected + ignored,
     accepted,

@@ -149,7 +149,7 @@ test("automatic creator scheduling delegates notification history to the strict 
   assert.match(analyticsOrchestrator, /analyticsSyncStage:\s*"campaigns"/);
   assert.match(scanControl, /manualNotificationScan:\s*true/);
   assert.match(scanControl, /scheduleJobNow/);
-  assert.match(scanControl, /status:\s*"PAUSED"/);
+  assert.match(scanControl, /pauseCollectorJob\(\{ db, creatorId, jobKey: JOB_KEY, collectorType: COLLECTOR_TYPES.NOTIFICATIONS/);
 });
 
 test("completion preserves run identity, publishes durable consequences and proves exact run page receipts", () => {

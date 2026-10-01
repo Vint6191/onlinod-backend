@@ -108,6 +108,39 @@ test.beforeEach(() => {
   notificationState = null;
 });
 
+test("new full proof suppresses redundant notification and financial catch-ups", async () => {
+  const now = new Date("2026-10-01T12:00:00Z"), old = new Date("2026-09-20T12:00:00Z");
+  notificationState = { fullBackfillVerifiedAt: now, lastCatchupVerifiedAt: old };
+  const db = dbFixture({ financialReady: true, campaignReady: true });
+  db.creatorFinancialCollectionState.findUnique = async () => ({ status: "COMPLETE", baselineGeneration: "full-proof", baselineVerifiedAt: now, lastCatchupCompletedAt: old });
+  const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
+  assert(result.skipped.includes("notifications_catchup:fresh"));
+  assert(result.skipped.includes("financial_catchup:fresh"));
+  assert(!scheduled.some(j => ["catchup_notifications_scan", "financial_transactions_scan"].includes(j.jobKey)));
+});
+
+for (const completion of ["full", "deferred", "terminal"]) test("recurring planner rechecks " + completion + " after its collector lock", async () => {
+  const now = new Date("2026-10-01T12:00:00Z"), old = new Date("2026-09-20T12:00:00Z");
+  notificationState = { fullBackfillVerifiedAt: now };
+  const db = dbFixture({ financialReady: true, campaignReady: true });
+  let reads = 0;
+  db.creatorFinancialCollectionState.findUnique = async () => {
+    reads++;
+    const state = { status: "COMPLETE", baselineGeneration: "full-proof", baselineVerifiedAt: old, lastCatchupCompletedAt: old };
+    // Initial readiness and pre-lock due check see the old state. The third
+    // read is in scheduleIfIdle after acquiring collector authority.
+    if (reads >= 3) {
+      if (completion === "full") state.baselineVerifiedAt = now;
+      else { state.status = "FAILED"; state.retryAfterAt = completion === "deferred" ? new Date(+now + 3600000) : null; }
+    }
+    return state;
+  };
+  const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
+  assert(reads >= 3);
+  assert(!scheduled.some(j => j.jobKey === "financial_transactions_scan"));
+  assert(result.skipped.includes("financial_catchup:" + ({ full: "fresh", deferred: "deferred", terminal: "failed_terminal" }[completion])));
+});
+
 function rawQueryWithAuthorityNow(result, now = new Date("2026-08-09T12:00:00.000Z")) {
   return async (sql, ...args) => {
     if (String(sql || "").includes("clock_timestamp()")) {
@@ -115,6 +148,72 @@ function rawQueryWithAuthorityNow(result, now = new Date("2026-08-09T12:00:00.00
     }
     return typeof result === "function" ? result(sql, ...args) : result;
   };
+}
+
+for (const kind of ["notifications", "financial", "campaigns"]) for (const change of ["completion", "deferred", "terminal"]) {
+  test(`initial ${kind} revalidates ${change} after acquiring collector authority`, async () => {
+    const now = new Date("2026-10-01T12:00:00Z");
+    const db = dbFixture({ financialReady: kind === "campaigns" });
+    notificationState = kind === "notifications" ? null : { fullBackfillVerifiedAt: now };
+    let current = null;
+    const key = { notifications: "catchup_notifications_scan", financial: "financial_transactions_scan", campaigns: "fetch_campaigns" }[kind];
+    const delegate = { notifications: "creatorNotificationSyncState", financial: "creatorFinancialCollectionState", campaigns: "creatorCampaignCollectionState" }[kind];
+    db[delegate] = { async findUnique() { return current; } };
+    db.jobInstance.findFirst = async ({ where }) => {
+      if (where.jobKey === key) {
+        current = change === "completion"
+          ? { status: "COMPLETE", baselineGeneration: "new-full", baselineVerifiedAt: now, fullBackfillVerifiedAt: now }
+          : { status: "FAILED", retryAfterAt: change === "deferred" ? new Date(+now + 60000) : null };
+        if (kind === "notifications") notificationState = current;
+      }
+      return null;
+    };
+    const result = await ensureInitialCreatorAnalyticsSync({ db, creatorId: "creator-1", agencyId: "agency-1", now });
+    assert.equal(result.created, false);
+    assert.equal(result.reason, { completion: "baseline_verified", deferred: "deferred", terminal: "failed_terminal" }[change]);
+    assert.equal(scheduled.length, 0);
+  });
+}
+
+for (const change of ["fresh", "debt", "deferred", "directory", "generation"]) {
+  test(`Campaign recurring plan is reconstructed from locked ${change} state`, async () => {
+    const now = new Date("2026-10-01T12:00:00Z");
+    notificationState = { fullBackfillVerifiedAt: now };
+    const db = dbFixture({ financialReady: true, campaignReady: true, financialCatchupAt: now });
+    let current = { status: "COMPLETE", baselineGeneration: "full", baselineVerifiedAt: now,
+      campaignDirectoryGeneration: "directory-old", campaignDirectoryRevision: 1,
+      campaignDirectoryRequestedAt: new Date(+now - 10000), campaignDirectoryVerifiedAt: now,
+      campaignDirectoryCampaignCount: 7, campaignDirectoryDiscoveryDueAt: new Date(+now + 3600000),
+      campaignFrontierFreshnessStatus: "PARTIAL", activeGeneration: "run-a" };
+    db.creatorCampaignCollectionState.findUnique = async () => current;
+    db.jobInstance.findFirst = async ({ where }) => {
+      if (where.jobKey === "fetch_campaigns") {
+        current = { ...current };
+        if (change === "fresh") current.campaignFrontierFreshnessStatus = "COMPLETE";
+        if (change === "debt") Object.assign(current, { fanValueCoverageScanRunId: "run-a", fanValueExpected: 1, fanValueFreshnessStatus: "QUEUED" });
+        if (change === "deferred") current.retryAfterAt = new Date(+now + 60000);
+        if (change === "directory") current.campaignDirectoryDiscoveryRequestedRevision = 2;
+        if (change === "generation") Object.assign(current, { campaignDirectoryGeneration: "directory-new", campaignDirectoryRevision: 2 });
+      }
+      return null;
+    };
+    let reservations = 0;
+    const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now,
+      reserveCampaignDirectory: async state => { reservations++; assert.equal(state, current); return true; } });
+    const job = scheduled.find(row => row.jobKey === "fetch_campaigns");
+    if (["fresh", "debt", "deferred"].includes(change)) {
+      assert.equal(job, undefined); assert.equal(reservations, 0);
+      assert(result.skipped.includes(`campaigns_catchup:${change === "debt" ? "fan_refresh_pending" : change}`));
+    } else if (change === "directory") {
+      assert.equal(job.params.campaignDirectoryReuseGeneration, undefined);
+      assert.equal(job.params.campaignDirectoryDiscoveryVersion, 1);
+      assert.equal(reservations, 1); assert(result.created.includes("campaigns_directory_discovery"));
+    } else {
+      assert.equal(job.params.campaignDirectoryReuseGeneration, "directory-new");
+      assert.equal(job.params.campaignDirectoryReuseRevision, 2);
+      assert.equal(reservations, 0); assert(result.created.includes("campaigns_frontier_reuse"));
+    }
+  });
 }
 
 test("initial analytics sync is strictly Notifications -> Financial -> Campaigns", async () => {

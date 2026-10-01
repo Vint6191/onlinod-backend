@@ -1,8 +1,8 @@
 "use strict";
-const { runDbTransaction } = require("./db-transaction-service");
 
 
 const crypto = require("node:crypto");
+const { activeCollectorJob, pauseCollectorJob } = require("./analytics-scan-job-authority");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
@@ -18,7 +18,6 @@ const {
 
 const JOB_KEY = "fetch_campaigns";
 const MANUAL_REASON = "manual_creator_analytics_campaign_scan";
-const ACTIVE_STATUSES = new Set(["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"]);
 const MANUAL_VERSION = 1;
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
@@ -67,18 +66,6 @@ async function recentJobs(db, creatorId, statuses = null, take = 40) {
   });
   return rows.filter(isManualJob);
 }
-async function activeJob(db, creatorId) {
-  const rows = await recentJobs(db, creatorId, ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"], 40);
-  return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
-}
-async function activeCollectorJob(db, creatorId) {
-  const rows = await db.jobInstance.findMany({
-    where: { creatorId, jobKey: JOB_KEY, status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"] } },
-    orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
-    take: 40,
-  });
-  return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
-}
 async function countOnlineBindings(db, creator, now = null) {
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: now || new Date() });
   const freshnessWindow = capabilityFreshnessWindow(authorityNow, 2 * 60 * 1000);
@@ -98,7 +85,7 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: creator.id, work: async (tx) => {
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow: now });
-    const active = await activeCollectorJob(tx, creator.id);
+    const active = await activeCollectorJob(tx, creator.id, JOB_KEY);
     const activeParams = object(active?.params);
     const activeUsesDirectoryReuse = Number(activeParams.campaignDirectoryReuseVersion || 0) >= 1
       && Boolean(clean(activeParams.campaignDirectoryReuseGeneration, 120));
@@ -188,7 +175,7 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
     const scheduled = await scheduleJobNow({
       db: tx, jobKey: JOB_KEY, creatorId: creator.id, agencyId: creator.agencyId, params, priority: 100, now: authorityNow, bucketMs: 1,
       dedupeParams: buildCollectionPlanningDedupeParams({
-        collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "full", state,
+        collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "full", state, now: authorityNow,
       }),
     });
     return { job: scheduled.job, action: scheduled.reason === "already_claimed" ? "already_running" : "created" };
@@ -196,57 +183,16 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
 }
 
 async function stopManualCampaignScan({ db = prisma, creatorId, now = new Date() }) {
-  const active = await activeJob(db, creatorId);
-  if (!active) return { job: null, action: "idle" };
-  if (active.status === "PUBLISHING") return { job: active, action: "publishing" };
-  if (active.status === "PAUSED") return { job: active, action: "already_paused" };
-  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
-  const pause = async (tx) => {
-    const result = await tx.jobInstance.updateMany({
-      where: {
-        id: active.id,
-        status: { in: ["SCHEDULED", "CLAIMED"] },
-        leaseRevision: active.leaseRevision,
-      },
-      data: {
-        status: "PAUSED",
-        claimedAt: null,
-        claimedByDeviceId: null,
-        leaseUntil: null,
-        leaseTokenHash: null,
-        leaseRevision: { increment: 1 },
-        workId: null,
-        completedAt: null,
-        lastError: null,
-        lastProgressAt: active.lastProgressAt || authorityNow,
-      },
-    });
-    if (!result.count) return { changed: false };
-    if (active.status === "CLAIMED" && active.claimedByDeviceId && typeof tx.fanObservationReadLease?.deleteMany === "function") {
-      await tx.fanObservationReadLease.deleteMany({
-        where: {
-          creatorId,
-          jobId: active.id,
-          deviceId: active.claimedByDeviceId,
-          leaseRevision: active.leaseRevision,
-        },
-      });
-    }
-    return { changed: true };
-  };
-  const outcome = await runDbTransaction(db, pause);
-  if (!outcome.changed) {
-    const current = await db.jobInstance.findUnique({ where: { id: active.id } });
-    return { job: current, action: current?.status === "PAUSED" ? "already_paused" : "changed" };
-  }
-  return { job: await db.jobInstance.findUnique({ where: { id: active.id } }), action: "paused" };
+  return pauseCollectorJob({ db, creatorId, jobKey: JOB_KEY, collectorType: COLLECTOR_TYPES.CAMPAIGNS, now });
 }
 
 async function readManualCampaignScan({ db = prisma, creator, limit = 50, offset = 0, cursor = null, generationReadAttempt = 0 }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
   const jobs = await recentJobs(db, creator.id, null, 60);
-  const job = jobs[0] || null;
-  const manualCollectorStatus = jobStatus(job);
+  const manualJob = jobs[0] || null;
+  const active = await activeCollectorJob(db, creator.id, JOB_KEY);
+  const job = active || manualJob;
+  const manualCollectorStatus = jobStatus(manualJob);
   const safeLimit = Math.max(1, Math.min(200, integer(limit, 100, 200)));
   const safeOffset = Math.max(0, Math.min(1_000_000, integer(offset, 0, 1_000_000)));
   const progress = object(job?.progress);
@@ -259,7 +205,9 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 50, offset
   const capacityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
   const directoryDiscovery = campaignDirectoryDiscoveryCapacityState(collectionState, capacityNow);
   const campaignRefs = Array.isArray(continuation.campaigns) ? continuation.campaigns : [];
-  const resultScanRunId = clean(result.scanRunId ?? continuation.scanRunId, 120);
+  const manualEnvelope = object(manualJob?.continuation);
+  const manualContinuation = manualEnvelope.driverPhase === "execute" ? object(manualEnvelope.jobContinuation) : manualEnvelope;
+  const resultScanRunId = clean(object(manualJob?.result).scanRunId ?? manualContinuation.scanRunId, 120);
   const currentCoverageScanRunId = clean(collectionState?.fanValueCoverageScanRunId, 120);
   const coverageMatches = Boolean(resultScanRunId && currentCoverageScanRunId === resultScanRunId);
   const canonicalCoveragePresent = Boolean(currentCoverageScanRunId);
@@ -274,7 +222,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 50, offset
   }
   const currentCoverageCollectorStatus = currentCoverageJob ? jobStatus(currentCoverageJob) : null;
   const currentCoverageOwnsPresentation = canonicalCoveragePresent && (!coverageMatches || !job);
-  const collectorStatus = currentCoverageOwnsPresentation
+  const collectorStatus = active ? jobStatus(active) : currentCoverageOwnsPresentation
     ? (currentCoverageCollectorStatus || manualCollectorStatus)
     : manualCollectorStatus;
   // The endpoint presents two independent authorities: the selected manual job
@@ -367,7 +315,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 50, offset
     collectorStatus,
     coverageStatus,
     refreshPending,
-    manual: Boolean(job),
+    manual: isManualJob(job),
     manualCollectorStatus,
     currentCoverageCollectorStatus,
     currentCoverageOwnerKind,

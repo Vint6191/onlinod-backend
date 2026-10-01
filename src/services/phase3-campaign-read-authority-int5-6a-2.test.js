@@ -59,6 +59,12 @@ test("INT5.6A-2 manual campaign pause CAS-revokes the owner and exact read lease
   let pauseWhere = null;
   let cleanupWhere = null;
   const db = {
+    async $executeRawUnsafe(sql, key) {
+      assert.match(String(sql), /pg_advisory_xact_lock/);
+      assert.equal(key, "analytics-collector:campaigns:creator-1");
+      order.push("collector-lock");
+      return 1;
+    },
     async $queryRawUnsafe(sql) {
       assert.match(String(sql), /clock_timestamp\(\)/);
       return [{ authorityNow }];
@@ -96,11 +102,12 @@ test("INT5.6A-2 manual campaign pause CAS-revokes the owner and exact read lease
     deviceId: "device-1",
     leaseRevision: 7,
   });
-  assert.deepEqual(order.slice(0, 4), ["tx-begin", "pause-cas", "read-lease-cleanup", "tx-end"]);
+  assert.deepEqual(order, ["tx-begin", "collector-lock", "pause-cas", "read-lease-cleanup", "tx-end"]);
 });
 
 test("INT5.6A-2 source keeps campaign pause owner-loss cleanup inside the same transaction", () => {
   const control = source("src/services/campaign-scan-control-service.js");
-  assert.match(control, /const pause = async \(tx\) => \{[\s\S]*jobInstance\.updateMany[\s\S]*leaseRevision: active\.leaseRevision[\s\S]*fanObservationReadLease\?\.deleteMany[\s\S]*jobId: active\.id[\s\S]*deviceId: active\.claimedByDeviceId[\s\S]*leaseRevision: active\.leaseRevision/);
-  assert.match(control, /runDbTransaction\(db, pause\)/);
+  const authority = source("src/services/analytics-scan-job-authority.js");
+  assert.match(control, /return pauseCollectorJob\(\{ db, creatorId, jobKey: JOB_KEY, collectorType: COLLECTOR_TYPES.CAMPAIGNS/);
+  assert.match(authority, /withCollectorStateLock\([\s\S]*work: async tx => \{[\s\S]*jobInstance\.updateMany[\s\S]*leaseRevision: active\.leaseRevision[\s\S]*fanObservationReadLease\?\.deleteMany[\s\S]*jobId: active\.id[\s\S]*deviceId: active\.claimedByDeviceId[\s\S]*leaseRevision: active\.leaseRevision/);
 });

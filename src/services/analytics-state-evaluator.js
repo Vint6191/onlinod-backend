@@ -1,6 +1,6 @@
 "use strict";
 
-const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
+const { trustedCollectionTimestamp, selectDurableCollectionProof } = require("./analytics-freshness-policy");
 
 function date(value) {
   if (!value) return null;
@@ -113,15 +113,16 @@ function evaluateDurableCollectorState({
   const normalizedStatus = String(status || "MISSING").toUpperCase();
   const completedAt = date(baselineCompletedAt) || date(baselineVerifiedAt);
   const provenAt = date(baselineVerifiedAt);
-  const verifiedAt = date(lastVerifiedAt) || provenAt;
+  const proof = selectDurableCollectionProof({ baselineVerifiedAt: provenAt, catchupVerifiedAt: date(lastVerifiedAt), now: currentNow });
+  const verifiedAt = proof.latestAt;
   const complete = Boolean(completedAt);
-  const trustedProvenAt = trustedCollectionTimestamp(provenAt, currentNow);
-  const trustedVerifiedAt = trustedCollectionTimestamp(verifiedAt, currentNow);
+  const trustedProvenAt = proof.baselineAt;
+  const trustedVerifiedAt = proof.latestAt;
   const proven = Boolean(trustedProvenAt);
   const usable = proven;
   const partial = complete && !proven;
   const policyMs = Number(freshnessMs);
-  const futurePoisoned = Boolean((provenAt && !trustedProvenAt) || (verifiedAt && !trustedVerifiedAt));
+  const futurePoisoned = proof.futurePoisoned;
   const fresh = Boolean(
     usable && trustedVerifiedAt && Number.isFinite(policyMs) && policyMs >= 0
     && currentNow.getTime() - trustedVerifiedAt.getTime() <= policyMs

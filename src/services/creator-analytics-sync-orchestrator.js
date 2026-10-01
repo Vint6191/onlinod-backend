@@ -6,6 +6,7 @@ const { buildNotificationScanParams, loadNotificationSyncState } = require("./no
 const {
   buildCollectionCommand,
   buildCollectionPlanningDedupeParams,
+  collectorPlanningProofAt,
   withCollectorStateLock,
   COLLECTOR_TYPES,
 } = require("./analytics-collector-control-service");
@@ -71,31 +72,62 @@ async function loadCollectorPlanningState(db, collectorType, creatorId, fallback
   // every current collector-state model, so only tests use the supplied state.
   return fallbackState || null;
 }
-async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priority, now, bucketMs, collectorType, collectorState, reserveDirectory = null }) {
+async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priority, now, bucketMs, collectorType, collectorState, reserveDirectory = null, campaignDirectoryDiscoveryAdmitted = true, catchupFreshnessMs = null }) {
   return withCollectorStateLock({ db, type: collectorType, creatorId, work: async (tx) => {
     const active = await inFlightJob(tx, creatorId, jobKey);
     if (active) return { created: false, reason: "already_in_flight", job: active };
-    // The state used for planning identity/order must be read *after* acquiring
-    // the same collector lock used by accept/complete. A pre-lock snapshot can
-    // race a completion on another replica and issue work for an obsolete epoch.
+    // Pre-lock reads are admission hints only. Reconstruct the whole command
+    // from the current proof, debt, retry and directory authority under the same
+    // lock as accept/complete; dedupe alone cannot reject obsolete work.
     const currentCollectorState = await loadCollectorPlanningState(tx, collectorType, creatorId, collectorState);
-    if (reserveDirectory && !await reserveDirectory(currentCollectorState)) return { created: false, reason: "directory_capacity_deferred" };
-    return scheduleNow({
-      db: tx,
-      jobKey,
-      creatorId,
-      agencyId,
-      params,
-      priority,
-      now,
-      bucketMs,
-      // Trigger provenance and the random server command UUID are excluded.
-      // The shared collector lock prevents a manual/automatic cross-mode race;
-      // stable dedupe closes same-mode replica races even after the lock releases.
+    now = await dbAuthorityNow({ db: tx, fallbackNow: now });
+    const initial = lifecycleParams(params);
+    const baseline = collectorPlanningProofAt(collectorType, "full", currentCollectorState, now);
+    const baselineReady = Boolean(baseline && (collectorType === COLLECTOR_TYPES.NOTIFICATIONS || currentCollectorState?.baselineGeneration));
+    if (initial && baselineReady) return { created: false, reason: "baseline_verified" };
+    if (!initial && !baselineReady) return { created: false, reason: "baseline_unverified" };
+    if (collectorType === COLLECTOR_TYPES.CAMPAIGNS && campaignDelegatedRefreshPending(currentCollectorState)) {
+      return { created: false, reason: "fan_refresh_pending" };
+    }
+    if (catchupFreshnessMs != null && !due(collectorPlanningProofAt(collectorType, "catchup", currentCollectorState, now), catchupFreshnessMs, now)) {
+      return { created: false, reason: "fresh" };
+    }
+    const retry = retryDisposition(currentCollectorState, now);
+    if (retry.deferred || retry.terminal) return { created: false, reason: retry.deferred ? "deferred" : "failed_terminal", retryAfterAt: retry.retryAfterAt };
+
+    params = { ...params, ...buildCollectionCommand({ collectorType, collectionMode: initial ? "full" : "catchup", reason: params.reason, now }) };
+    let collectionPlan = null;
+    if (collectorType === COLLECTOR_TYPES.NOTIFICATIONS) {
+      params = { ...params, ...buildNotificationScanParams({ state: initial ? null : currentCollectorState, now, reason: params.reason, analyticsRangeKey: "all" }) };
+      if (!initial) params.knownNotificationIds = recentKnownNotificationIdsFromState(currentCollectorState);
+    } else if (collectorType === COLLECTOR_TYPES.FINANCIAL) {
+      if (!initial) params.knownTransactionIds = await recentKnownTransactionIds(tx, creatorId);
+    } else if (collectorType === COLLECTOR_TYPES.CAMPAIGNS && !initial) {
+      const frontierDue = campaignFrontierWorkDue(currentCollectorState, now);
+      const directoryDue = campaignDirectoryDiscoveryDue(currentCollectorState, now);
+      if (!frontierDue && !directoryDue) return { created: false, reason: "fresh" };
+      const reuse = campaignDirectoryReuseBinding(currentCollectorState, now);
+      for (const key of ["campaignDirectoryReuseGeneration", "campaignDirectoryReuseRequestedAt", "campaignDirectoryReuseRevision", "campaignDirectoryReuseCampaignCount", "campaignDirectoryDiscoveryVersion"]) delete params[key];
+      if (reuse) {
+        Object.assign(params, reuse);
+        bucketMs = CAMPAIGN_COLLECTION_FRESHNESS_MS;
+        collectionPlan = "campaigns_frontier_reuse";
+      } else {
+        if (typeof reserveDirectory === "function") {
+          if (!await reserveDirectory(currentCollectorState)) return { created: false, reason: "directory_capacity_deferred" };
+        } else if (campaignDirectoryDiscoveryAdmitted !== true) return { created: false, reason: "directory_capacity_deferred" };
+        params.campaignDirectoryDiscoveryVersion = 1;
+        bucketMs = CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS;
+        collectionPlan = "campaigns_directory_discovery";
+      }
+    }
+    const scheduled = await scheduleNow({
+      db: tx, jobKey, creatorId, agencyId, params, priority, now, bucketMs,
       dedupeParams: buildCollectionPlanningDedupeParams({
-        collectorType, collectionMode: params?.collectionMode, state: currentCollectorState,
+        collectorType, collectionMode: params.collectionMode, state: currentCollectorState, now,
       }),
     });
+    return { ...scheduled, collectionPlan };
   }});
 }
 
@@ -368,7 +400,7 @@ function due(lastVerifiedAt, intervalMs, now) {
   // poisoned durable timestamp must be DUE for repair, never silently treated
   // as fresh by the planner while read models report it as untrusted.
   if (!trustedCollectionTimestamp(verifiedAt, now)) return true;
-  return verifiedAt.getTime() <= now.getTime() - intervalMs;
+  return verifiedAt.getTime() < now.getTime() - intervalMs;
 }
 
 async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20, campaignDirectoryDiscoveryAdmitted = true, reserveCampaignDirectory = null } = {}) {
@@ -384,7 +416,7 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }),
   ]);
 
-  if (notificationHistoricalBaselineReady(notificationState, now) && due(notificationState.lastCatchupVerifiedAt, NOTIFICATION_COLLECTION_FRESHNESS_MS, now)) {
+  if (notificationHistoricalBaselineReady(notificationState, now) && due(collectorPlanningProofAt(COLLECTOR_TYPES.NOTIFICATIONS, "catchup", notificationState, now), NOTIFICATION_COLLECTION_FRESHNESS_MS, now)) {
     const retry = retryDisposition(notificationState, now);
     if (retry.deferred) skipped.push("notifications_catchup:deferred");
     else if (retry.terminal) skipped.push("notifications_catchup:failed_terminal");
@@ -401,12 +433,13 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     const scheduled = await scheduleIfIdle({
       db, creatorId, agencyId, jobKey: NOTIFICATION_JOB_KEY, params, priority, now, bucketMs: NOTIFICATION_COLLECTION_FRESHNESS_MS,
       collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectorState: notificationState,
+      catchupFreshnessMs: NOTIFICATION_COLLECTION_FRESHNESS_MS,
     });
     if (scheduled.created) created.push("notifications_catchup"); else skipped.push(`notifications_catchup:${scheduled.reason || "skipped"}`);
     }
   } else skipped.push("notifications_catchup:fresh");
 
-  if (due(financialState?.lastCatchupCompletedAt, FINANCIAL_COLLECTION_FRESHNESS_MS, now)) {
+  if (due(collectorPlanningProofAt(COLLECTOR_TYPES.FINANCIAL, "catchup", financialState, now), FINANCIAL_COLLECTION_FRESHNESS_MS, now)) {
     const retry = retryDisposition(financialState, now);
     if (retry.deferred) skipped.push("financial_catchup:deferred");
     else if (retry.terminal) skipped.push("financial_catchup:failed_terminal");
@@ -431,6 +464,7 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     const scheduled = await scheduleIfIdle({
       db, creatorId, agencyId, jobKey: FINANCIAL_JOB_KEY, params, priority, now, bucketMs: FINANCIAL_COLLECTION_FRESHNESS_MS,
       collectorType: COLLECTOR_TYPES.FINANCIAL, collectorState: financialState,
+      catchupFreshnessMs: FINANCIAL_COLLECTION_FRESHNESS_MS,
     });
     if (scheduled.created) created.push("financial_catchup"); else skipped.push(`financial_catchup:${scheduled.reason || "skipped"}`);
     }
@@ -478,9 +512,9 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
         const scheduled = await scheduleIfIdle({
           db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: directoryReuse ? CAMPAIGN_COLLECTION_FRESHNESS_MS : CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS,
           collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectorState: campaignState,
-          reserveDirectory: requiresDirectoryDiscovery ? reserveCampaignDirectory : null,
+          reserveDirectory: reserveCampaignDirectory, campaignDirectoryDiscoveryAdmitted,
         });
-        if (scheduled.created) created.push(directoryReuse ? "campaigns_frontier_reuse" : "campaigns_directory_discovery");
+        if (scheduled.created) created.push(scheduled.collectionPlan);
         else skipped.push(`campaigns_catchup:${scheduled.reason || "skipped"}`);
       }
     }

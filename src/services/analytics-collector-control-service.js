@@ -4,6 +4,7 @@ const { randomUUID } = require("node:crypto");
 const prisma = require("../prisma");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { selectDurableCollectionProof } = require("./analytics-freshness-policy");
 const { campaignTransactionLockKey } = require("./campaign-transaction-lock-service");
 
 const COLLECTION_CONTRACT_VERSION = 1;
@@ -47,25 +48,24 @@ function campaignFanCoverageAuthorityFromJob(job) {
 }
 
 
-function collectorPlanningProofAt(collectorType, collectionMode, state) {
+function collectorPlanningProofAt(collectorType, collectionMode, state, now = new Date()) {
   const requestedMode = mode(collectionMode);
+  let baselineVerifiedAt, catchupVerifiedAt;
   if (collectorType === COLLECTOR_TYPES.NOTIFICATIONS) {
-    return requestedMode === "catchup"
-      ? date(state?.lastCatchupVerifiedAt) || date(state?.fullBackfillVerifiedAt)
-      : date(state?.fullBackfillVerifiedAt);
-  }
-  if (collectorType === COLLECTOR_TYPES.FINANCIAL || collectorType === COLLECTOR_TYPES.CAMPAIGNS) {
-    return requestedMode === "catchup"
-      ? date(state?.lastCatchupCompletedAt) || date(state?.baselineVerifiedAt)
-      : date(state?.baselineVerifiedAt);
-  }
-  return null;
+    baselineVerifiedAt = state?.fullBackfillVerifiedAt;
+    catchupVerifiedAt = state?.lastCatchupVerifiedAt;
+  } else if (collectorType === COLLECTOR_TYPES.FINANCIAL || collectorType === COLLECTOR_TYPES.CAMPAIGNS) {
+    baselineVerifiedAt = state?.baselineVerifiedAt;
+    catchupVerifiedAt = state?.lastCatchupCompletedAt;
+  } else return null;
+  const proof = selectDurableCollectionProof({ baselineVerifiedAt, catchupVerifiedAt, now });
+  return requestedMode === "catchup" ? proof.latestAt : proof.baselineAt;
 }
 
-function buildCollectionPlanningDedupeParams({ collectorType, collectionMode = "full", state = null } = {}) {
+function buildCollectionPlanningDedupeParams({ collectorType, collectionMode = "full", state = null, now = new Date() } = {}) {
   if (!Object.values(COLLECTOR_TYPES).includes(collectorType)) throw new Error("ANALYTICS_COLLECTOR_TYPE_INVALID");
   const requestedMode = mode(collectionMode);
-  const proofAt = collectorPlanningProofAt(collectorType, requestedMode, state);
+  const proofAt = collectorPlanningProofAt(collectorType, requestedMode, state, now);
   const generation = clean(state?.activeGeneration, 120) || "none";
   const orderingAfter = date(state?.activeRequestedAt);
   // Planning identity describes the durable collection epoch and requested
@@ -364,6 +364,7 @@ module.exports = {
   COLLECTOR_TYPES,
   buildCollectionCommand,
   buildCollectionPlanningDedupeParams,
+  collectorPlanningProofAt,
   stampCollectionAuthorityParams,
   collectionCommand,
   withCollectorStateLock,

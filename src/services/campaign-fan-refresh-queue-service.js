@@ -248,8 +248,13 @@ async function ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, covera
 }
 
 async function incrementCoverage(db, { creatorId, scanRunId, cutoff, expected = 0, alreadyFresh = 0, queued = 0, outstanding = 0, now, coverageAuthority = null }) {
-  await ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, coverageAuthority });
+  const state = await ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, coverageAuthority });
   if (!(expected || alreadyFresh || queued || outstanding)) return;
+  // All callers hold creator Campaign authority. Classify the accumulated run,
+  // not just this page: fresh-only arrivals cannot erase older queued/failed
+  // debt. Keep proof publication with its existing completion authority.
+  const totalOutstanding = Math.max(0, Number(state?.fanValueOutstanding || 0)) + outstanding;
+  const totalFailed = Math.max(0, Number(state?.fanValueFailed || 0));
   await db.creatorCampaignCollectionState.updateMany({
     where: { creatorId, fanValueCoverageScanRunId: scanRunId },
     data: {
@@ -257,7 +262,7 @@ async function incrementCoverage(db, { creatorId, scanRunId, cutoff, expected = 
       fanValueAlreadyFresh: { increment: alreadyFresh },
       fanValueQueued: { increment: queued },
       fanValueOutstanding: { increment: outstanding },
-      fanValueFreshnessStatus: outstanding > 0 ? "QUEUED" : "COMPLETE",
+      fanValueFreshnessStatus: totalOutstanding > 0 ? "QUEUED" : totalFailed > 0 ? "PARTIAL" : "COMPLETE",
       fanValueCoverageUpdatedAt: now,
     },
   });

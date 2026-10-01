@@ -39,6 +39,20 @@ function trustedCollectionTimestamp(value, now = new Date()) {
   return timestamp;
 }
 
+// FULL proves the historical baseline; either a later FULL or a verified
+// catch-up can refresh its head. Attempt status and completed-but-unverified
+// traversals are not proof. Keep the stored timestamps intact for provenance.
+function selectDurableCollectionProof({ baselineVerifiedAt = null, catchupVerifiedAt = null, now = new Date() } = {}) {
+  const baselineAt = trustedCollectionTimestamp(baselineVerifiedAt, now);
+  const catchupAt = trustedCollectionTimestamp(catchupVerifiedAt, now);
+  const latestAt = baselineAt && catchupAt && catchupAt > baselineAt ? catchupAt : baselineAt;
+  return Object.freeze({
+    baselineAt,
+    latestAt,
+    futurePoisoned: Boolean((baselineVerifiedAt && !baselineAt) || (catchupVerifiedAt && !catchupAt)),
+  });
+}
+
 function earningsFreshnessLimitMs(day, now = new Date()) {
   const targetDay = utcDay(day);
   const today = utcDay(now);
@@ -62,5 +76,6 @@ module.exports = {
   CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS,
   CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS,
   trustedCollectionTimestamp,
+  selectDurableCollectionProof,
   earningsFreshnessLimitMs,
 };

@@ -109,13 +109,11 @@ async function projectSource(tx, item, kind, id, now) {
   }
   if (row && kind === "FINANCIAL") {
     const window = windowMembership(row.occurredAt,now); schedule(window.due);
-    const [attribution] = row.fanId ? await tx.$queryRawUnsafe(`SELECT "campaignId" FROM "CreatorCampaignFan"
-      WHERE "creatorId"=$1 AND "agencyId"=$2 AND "fanId"=$3 AND "attributedAt"<="phase3_utc_timestamp"($4::timestamptz)
-      ORDER BY "attributedAt" DESC,"id" DESC LIMIT 1`,item.creatorId,item.agencyId,row.fanId,row.occurredAt) : [];
+    const [attribution] = row.fanId ? await tx.$queryRawUnsafe(`SELECT "onlinod_campaign_read_attribution_v3"($2::text,$1::text,$3::text,"phase3_utc_timestamp"($4::timestamptz)) AS "campaignId"`,item.creatorId,item.agencyId,row.fanId,row.occurredAt) : [];
     const money = financialMetrics(row);
-    if (attribution && Object.keys(money).length) for (const w of window.ranges) for (const p of ["",attribution.campaignId]) add(p,w,row.fanId,money);
+    if (attribution?.campaignId && Object.keys(money).length) for (const w of window.ranges) for (const p of ["",attribution.campaignId]) add(p,w,row.fanId,money);
     // Unattributed facts are found by the membership interval repair later.
-    if (!attribution || !Object.keys(money).length) due.length=0;
+    if (!attribution?.campaignId || !Object.keys(money).length) due.length=0;
   }
   await replaceReceipt(tx,item,kind,id,entries,due.length?new Date(Math.min(...due)):null);
 }

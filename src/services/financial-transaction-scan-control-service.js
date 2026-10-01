@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { activeCollectorJob, pauseCollectorJob } = require("./analytics-scan-job-authority");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
@@ -12,7 +13,6 @@ const {
 } = require("./analytics-collector-control-service");
 
 const MANUAL_REASON = "manual_creator_analytics_financial_transactions_scan";
-const ACTIVE_STATUSES = new Set(["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"]);
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function clean(value, max = 220) {
@@ -60,18 +60,6 @@ async function recentJobs(db, creatorId, statuses = null, take = 40) {
   });
   return rows.filter(isManualJob);
 }
-async function activeJob(db, creatorId) {
-  const rows = await recentJobs(db, creatorId, ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"], 40);
-  return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
-}
-async function activeCollectorJob(db, creatorId) {
-  const rows = await db.jobInstance.findMany({
-    where: { creatorId, jobKey: JOB_KEY, status: { in: ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"] } },
-    orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
-    take: 40,
-  });
-  return rows.find((row) => ACTIVE_STATUSES.has(row.status)) || null;
-}
 async function countOnlineBindings(db, creator, now = null) {
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: now || new Date() });
   const freshnessWindow = capabilityFreshnessWindow(authorityNow, 2 * 60 * 1000);
@@ -90,7 +78,7 @@ async function startManualFinancialTransactionScan({ db = prisma, creator, reque
     // Manual and automatic starts share one collector planning boundary. The
     // read is repeated under the same advisory lock used by accept/complete, so
     // a cross-replica manual click cannot create a second provider traversal.
-    const active = await activeCollectorJob(tx, creator.id);
+    const active = await activeCollectorJob(tx, creator.id, JOB_KEY);
     if (active?.status === "PAUSED") {
       const planned = await reschedulePlannedJob({
         db: tx, job: active, params: active.params || {}, priority: active.priority || 0,
@@ -124,7 +112,7 @@ async function startManualFinancialTransactionScan({ db = prisma, creator, reque
       db: tx, jobKey: JOB_KEY, creatorId: creator.id, agencyId: creator.agencyId,
       params, priority: 100, now: authorityNow, bucketMs: 1,
       dedupeParams: buildCollectionPlanningDedupeParams({
-        collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "full", state,
+        collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "full", state, now: authorityNow,
       }),
     });
     return { job: scheduled.job, action: scheduled.reason === "already_claimed" ? "already_running" : "created" };
@@ -132,24 +120,7 @@ async function startManualFinancialTransactionScan({ db = prisma, creator, reque
 }
 
 async function stopManualFinancialTransactionScan({ db = prisma, creatorId, now = new Date() }) {
-  const active = await activeJob(db, creatorId);
-  if (!active) return { job: null, action: "idle" };
-  if (active.status === "PUBLISHING") return { job: active, action: "publishing" };
-  if (active.status === "PAUSED") return { job: active, action: "already_paused" };
-  const authorityNow = await dbAuthorityNow({ db, fallbackNow: now });
-  const result = await db.jobInstance.updateMany({
-    where: { id: active.id, status: { in: ["SCHEDULED", "CLAIMED"] } },
-    data: {
-      status: "PAUSED", claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null,
-      leaseRevision: { increment: 1 }, workId: null, completedAt: null, lastError: null,
-      lastProgressAt: active.lastProgressAt || authorityNow,
-    },
-  });
-  if (!result.count) {
-    const current = await db.jobInstance.findUnique({ where: { id: active.id } });
-    return { job: current, action: current?.status === "PAUSED" ? "already_paused" : "changed" };
-  }
-  return { job: await db.jobInstance.findUnique({ where: { id: active.id } }), action: "paused" };
+  return pauseCollectorJob({ db, creatorId, jobKey: JOB_KEY, collectorType: COLLECTOR_TYPES.FINANCIAL, now });
 }
 
 function transactionForClient(row) {
@@ -174,7 +145,7 @@ function transactionForClient(row) {
 
 async function readManualFinancialTransactionScan({ db = prisma, creator, limit = 100, offset = 0 }) {
   const jobs = await recentJobs(db, creator.id, null, 60);
-  const job = jobs[0] || null;
+  const job = await activeCollectorJob(db, creator.id, JOB_KEY) || jobs[0] || null;
   const safeLimit = Math.max(1, Math.min(200, integer(limit, 100, 200)));
   const safeOffset = Math.max(0, Math.min(1_000_000, integer(offset, 0, 1_000_000)));
   const progress = object(job?.progress);
@@ -272,7 +243,7 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     creatorId: creator.id,
     jobId: job?.id || null,
     status,
-    manual: Boolean(job),
+    manual: isManualJob(job),
     phase: clean(continuation.phase, 40) || (status === "COMPLETE" || status === "PARTIAL" ? "complete" : "transactions"),
     pagesScanned: integer(continuation.page ?? progress.current, 0, 1_000_000),
     marker: clean(continuation.marker, 220),

@@ -10,14 +10,16 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const ledger = read("services/creator-analytics-ledger-service.js");
 const repository = read("services/campaign-read-repository.js");
 const projection = read("services/campaign-read-projection-service.js");
+const temporalSeek = read("../prisma/migrations/20261001170000_campaign_temporal_seek_v3/migration.sql");
 const control = read("services/campaign-scan-control-service.js");
 const routes = read("routes/stats.js");
 const financial = read("services/financial-transactions-service.js");
 
 test("campaign money is derived from atomic financial transactions, not copied onto memberships", () => {
   assert.match(projection, /FINANCIAL: "CreatorFinancialTransaction"/);
-  assert.match(projection, /"attributedAt"<="phase3_utc_timestamp"\(\$4::timestamptz\)/);
-  assert.match(projection, /ORDER BY "attributedAt" DESC,"id" DESC LIMIT 1/);
+  assert.match(projection, /"onlinod_campaign_read_attribution_v3"\(\$2::text,\$1::text,\$3::text,"phase3_utc_timestamp"\(\$4::timestamptz\)\)/);
+  assert.match(temporalSeek, /m\."attributedAt"<=t/);
+  assert.match(temporalSeek, /ORDER BY m\."attributedAt" DESC,m\."id" DESC LIMIT 1/);
   assert.match(projection, /financialMetrics\(row\)/);
   assert.doesNotMatch(repository, /FROM "CreatorFinancialTransaction"/);
   assert.doesNotMatch(projection, /(?:UPDATE|INSERT INTO) "CreatorFinancialTransaction"/);
