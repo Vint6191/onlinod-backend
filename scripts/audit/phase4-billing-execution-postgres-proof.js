@@ -52,7 +52,7 @@ async function main() {
     const member = await db.agencyMember.findUnique({ where: { id: "owner-a" } });
     const actor = { agencyId: "a", userId: "owner", deviceId: "device", creatorId: "unpaid", member, capability: "read", operation: "earnings.chart" };
     const paidToken = "paid-test-lease";
-    await db.jobInstance.create({ data: { id: "paid-job", agencyId: "a", creatorId: "paid", scope: "creator", jobKey: "traffic_sources_scan", status: "CLAIMED",
+    await db.jobInstance.create({ data: { id: "paid-job", agencyId: "a", creatorId: "paid", scope: "creator", jobKey: "dialog_intelligence_scan", status: "CLAIMED",
       claimedByDeviceId: "device", leaseTokenHash: crypto.createHash("sha256").update(paidToken).digest("hex"), leaseRevision: 1,
       leaseMemberId: member.id, leaseAccessEpoch: member.accessEpoch, leaseUntil: new Date(Date.now() + 600000) } });
     const paidActor = { ...actor, creatorId: "paid", operation: "chats.list", priority: "normal", timeoutMs: 5000,
@@ -110,11 +110,11 @@ async function main() {
       assert.equal(await db.jobInstance.count(), count);
     });
     await check("legacy Desktop cannot claim unpaid work; typed Desktop can claim recovery despite higher-priority unpaid jobs", async () => {
-      await db.jobInstance.create({ data: { id: "unpaid-product", creatorId: "unpaid", agencyId: "a", jobKey: "traffic_sources_scan", scope: "creator", priority: 1000 } });
+      await db.jobInstance.create({ data: { id: "unpaid-product", creatorId: "unpaid", agencyId: "a", jobKey: "dialog_intelligence_scan", scope: "creator", priority: 1000 } });
       await db.jobInstance.create({ data: { id: "old-earnings", creatorId: "unpaid", agencyId: "a", jobKey: "fetch_earnings", scope: "creator", params: { ...params, scanFrom: "2020-01-01" }, priority: 1001 } });
-      const old = await lease.claimJob({ userId: "owner", deviceId: "device", jobKeys: ["traffic_sources_scan", "fetch_earnings"], capabilities: {} });
+      const old = await lease.claimJob({ userId: "owner", deviceId: "device", jobKeys: ["dialog_intelligence_scan", "fetch_earnings"], capabilities: {} });
       assert.equal(old.job, null);
-      const modern = await lease.claimJob({ userId: "owner", deviceId: "device", jobKeys: ["traffic_sources_scan", "fetch_earnings"], capabilities: { billingRecoveryLeaseV1: true } });
+      const modern = await lease.claimJob({ userId: "owner", deviceId: "device", jobKeys: ["dialog_intelligence_scan", "fetch_earnings"], capabilities: { billingRecoveryLeaseV1: true } });
       assert.ok(modern.job, JSON.stringify({ reason: modern.reason, jobs: await db.jobInstance.findMany({ where: { creatorId: "unpaid" }, select: { id: true, status: true, jobKey: true, params: true, nextRunAt: true } }) }));
       assert.equal(modern.job.jobKey, "fetch_earnings"); assert.notEqual(modern.job.id, "old-earnings");
       recovery = { jobId: modern.job.id, leaseToken: modern.job.leaseToken, leaseRevision: modern.job.leaseRevision, scanFrom: modern.job.params.scanFrom, scanTo: modern.job.params.scanTo };

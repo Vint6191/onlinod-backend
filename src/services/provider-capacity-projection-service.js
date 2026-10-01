@@ -6,8 +6,7 @@ const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { CLAIMABLE_DESKTOP_JOB_KEYS } = require("./job-catalog");
 const { DEFAULT_CAMPAIGN_DIRECTORY_PAGE_SIZE } = require("./provider-capacity-sla-service");
-const ID = "of-global-capacity-v1";
-const GENERATION = "phase6_capacity_incremental_v1";
+const { ID, GENERATION, assertCapacityProjectionCatalog } = require("./provider-capacity-catalog-contract");
 const SOURCE = Object.freeze({
   directory: { table: "CreatorCampaignCollectionState", columns: '"id","baselineVerifiedAt","campaignDirectoryDiscoveryRequestedRevision","campaignDirectoryDiscoveryCompletedRevision","campaignDirectoryDiscoveryDueAt","campaignDirectoryCampaignCount"' },
   fan: { table: "CreatorFanRefreshDemand", columns: '"id","requestedRevision","satisfiedRevision","lastRequestedAt"' },
@@ -153,8 +152,7 @@ async function runProviderCapacityProjectionBatch({ db, batchSize = 96, publish 
     if (lock[0]?.acquired !== true) return { ok: true, skipped: true, persisted: false, reason: "capacity_projection_busy" };
     const states = await tx.$queryRawUnsafe(`SELECT * FROM "ProviderCapacityProjectionState" WHERE id=$1 FOR UPDATE`, ID);
     const state = states[0];
-    if (state?.generation !== GENERATION) throw failure("CAPACITY_PROJECTION_GENERATION_MISMATCH");
-    if ([...(state.jobKeys || [])].sort().join("|") !== [...CLAIMABLE_DESKTOP_JOB_KEYS].sort().join("|")) throw failure("CAPACITY_PROJECTION_CATALOG_CHANGED");
+    assertCapacityProjectionCatalog(state);
     const now = await dbAuthorityNow({ db: tx });
     const scanned = await seedBackfill(tx, state, Math.max(1, Math.floor(size / 3)));
     const processed = await repairDirty(tx, now, size);

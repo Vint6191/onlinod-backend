@@ -2,10 +2,10 @@
   "version": 1,
   "generation": "phase7_legacy_storage_v1",
   "planHash": "9fb409e3d948c17e3f71914de68c0ef2de116ffa250c73eb48191d1466eab2ac",
-  "packageId": "ONLINOD_ANALYTICS_TRAFFIC_AUTHORITY_V1",
-  "baseBackendHash": "5f07d6c77660825d8c7aec4c352c401f15cd7da5e009249854dcb7dd0b182bb2",
-  "baseDesktopHash": "c2dc5d4cef3857a734adbc0c0bb0adc61d28a52df87ccbac685597729131439d",
-  "backendHash": "5d65023dbc123f7a1fe7898838a4025b4c03db5fe903d91c4a043e0417b9a4a5",
+  "packageId": "ONLINOD_ACTUAL103_CAPACITY_FIX_V1",
+  "baseBackendHash": "5d65023dbc123f7a1fe7898838a4025b4c03db5fe903d91c4a043e0417b9a4a5",
+  "baseDesktopHash": "1fee6ee00f5de138d00b833dd9537deb251e1ea22868246f9770108c4d884707",
+  "backendHash": "962678f56f25bd2a56a2b60facc785b7eb37050d4f0ead266ffd8c9899ac1126",
   "desktopHash": "1fee6ee00f5de138d00b833dd9537deb251e1ea22868246f9770108c4d884707",
   "backendFiles": [
     {
@@ -122,6 +122,11 @@
       "path": "dedupe-deliveries.js",
       "bytes": 397,
       "sha256": "d1a5bfcd388cefb0de3861408d559faad3acacee28fc644cc46dde84769ae1db"
+    },
+    {
+      "path": "docs/ACTUAL103_CAPACITY_CATALOG_TRANSITION.txt",
+      "bytes": 4319,
+      "sha256": "0236b896fbff8610f1148b36df749ea98d45498c060dc96b1e1c82b7bbd62850"
     },
     {
       "path": "docs/ANALYTICS_TRAFFIC_CUTOVER_V1.txt",
@@ -1689,6 +1694,11 @@
       "sha256": "921a841e24347ab3b2af28bc6a04896f2dd32d04a7ad3988d7308a6a3db71c86"
     },
     {
+      "path": "prisma/migrations/20261001003000_capacity_catalog_traffic_retirement_v1/migration.sql",
+      "bytes": 3358,
+      "sha256": "343e242ac6a9c5e5e5dff460fd75d3b68ab6d5ffe390ffcee4857fd12da2a7d1"
+    },
+    {
       "path": "prisma/migrations/migration_lock.toml",
       "bytes": 24,
       "sha256": "1db17a8d051aa136110736752c5e1f8b7ed92b6ea8e803112fbbe2497047c210"
@@ -1980,8 +1990,8 @@
     },
     {
       "path": "scripts/audit-p9-readonly.js",
-      "bytes": 4829,
-      "sha256": "7f78f1909a1b2861f960398fcbefec0625ad1f2772b285e99b028a4974a6797b"
+      "bytes": 4833,
+      "sha256": "a7f69e03c5f7838e045342d2692879473ad934ecfd68fe6bc2148b0eeb8d23cb"
     },
     {
       "path": "scripts/audit/actual59-auth-lifecycle-gate.js",
@@ -2009,9 +2019,14 @@
       "sha256": "93c5e7e9e8dc7c5d39abdc8b78f1902bba8f2ce31f2da5c61bf9e1fd181625dc"
     },
     {
+      "path": "scripts/audit/analytics-traffic/capacity-catalog-proof.cjs",
+      "bytes": 11031,
+      "sha256": "c3b9c97fc73fe0ff85a7f445c8d3377f52fdc20efc732c8a996dc341d9a24764"
+    },
+    {
       "path": "scripts/audit/analytics-traffic/deploy-proof.cjs",
-      "bytes": 2702,
-      "sha256": "e99d1400eda774782839835cf9118cb5d0015b88e580958535a5fe0abad0938d"
+      "bytes": 3900,
+      "sha256": "cc322331ee242280ca854315b73d9a680e4192e389417bb8f75e978cf4c1ad37"
     },
     {
       "path": "scripts/audit/analytics-traffic/fixture.cjs",
@@ -2145,8 +2160,8 @@
     },
     {
       "path": "scripts/audit/phase4-billing-execution-postgres-proof.js",
-      "bytes": 18919,
-      "sha256": "977afc0ffc3f4a8b4a7be67d06dea2610b77216f3dece9747237bf2bf8523ed1"
+      "bytes": 18935,
+      "sha256": "b6b2882d751c3b7b60d65db7352b066d2566d2c7d1629e2c7cedd51b26e2e99b"
     },
     {
       "path": "scripts/audit/phase4-billing-state-postgres-proof.js",
@@ -2160,13 +2175,13 @@
     },
     {
       "path": "scripts/audit/phase4-r17-closure-postgres-proof.js",
-      "bytes": 18966,
-      "sha256": "e958e6157f4124dd981294beb602543272bb2118cc538f8722499f697b1703c3"
+      "bytes": 18970,
+      "sha256": "2f7f56612d144ab5a4f9b9e8d8a39fe1c3c80504a8d4c76f5a61cffcea63c177"
     },
     {
       "path": "scripts/audit/phase4-r17-diagnostics-postgres-proof.js",
-      "bytes": 8104,
-      "sha256": "18f98d026519a86a6b4afadf612bf6e36099b0ec50beea7dbd3bb4dbe7cc0c71"
+      "bytes": 8108,
+      "sha256": "e38f796805797c89aa38a97bfc2be48836a8bd8e970d8eb09c8b5b4377686d61"
     },
     {
       "path": "scripts/audit/phase4-retention-postgres-proof.js",
@@ -2270,8 +2285,8 @@
     },
     {
       "path": "scripts/audit/phase6-capacity-offline-proof.cjs",
-      "bytes": 12568,
-      "sha256": "99e42e151dfdf332cfa318298d77bb90c7d89b9c0302d8798a46d3985dca3bd8"
+      "bytes": 12724,
+      "sha256": "4d6a3b1d26e216232d0b39567d17ba75bc610a915b3bff68f41ac96bc0586273"
     },
     {
       "path": "scripts/audit/phase6-de-migrations-offline.cjs",
@@ -2420,8 +2435,8 @@
     },
     {
       "path": "scripts/database/phase7-deploy.js",
-      "bytes": 7515,
-      "sha256": "075e0178da87c5f5fdb934fbad74da87aaeea9014fcc528ba3aa2e936d70f593"
+      "bytes": 7559,
+      "sha256": "f5ee24546823f67077489d73d8207a1919c7301f4cd286784081b888c85fc7f7"
     },
     {
       "path": "scripts/database/phase7-historical-migrations.js",
@@ -2452,6 +2467,11 @@
       "path": "scripts/database/phase7-source-inventory.js",
       "bytes": 1122,
       "sha256": "6519755a4f819d7c431c79a9828dbca9dd47f793d70900728ec1e43257ab4dd0"
+    },
+    {
+      "path": "scripts/database/provider-capacity-catalog-postflight.js",
+      "bytes": 851,
+      "sha256": "8e9906ae4a7492cbc3a108ac8c9e697b40f0c0ce35d01dc56ee80d0a53b35a6c"
     },
     {
       "path": "scripts/maintenance/README.md",
@@ -5910,8 +5930,8 @@
     },
     {
       "path": "src/services/phase7-deploy-contract.test.js",
-      "bytes": 3690,
-      "sha256": "cfea5318c3e4e26c17bc53e049e8712a1832233ce95f60f63f24f69959c1754f"
+      "bytes": 3763,
+      "sha256": "af2249551d145214e8e35654ba31d1df942157407503993c8f4e15a6a387fd1a"
     },
     {
       "path": "src/services/phase7-legacy-storage-manifest.json",
@@ -5931,7 +5951,7 @@
     {
       "path": "src/services/phase7-migration-checksum.test.js",
       "bytes": 19019,
-      "sha256": "b5ec1899f91bed5b1fe279270787a78a3f78060484658e3d01d12519a46fb688"
+      "sha256": "ff849f2ee9c2547b58ae24f03cca7d8cb4177102e3113ce7d205fa301000d824"
     },
     {
       "path": "src/services/phase7-obligation-handoff-service.js",
@@ -5969,14 +5989,24 @@
       "sha256": "fd6949900ca3b49a3598416a68b8a1b7300b398e4f53b1afed3637c78e26006c"
     },
     {
+      "path": "src/services/provider-capacity-catalog-contract.js",
+      "bytes": 1491,
+      "sha256": "611c64ab00a05a0c47fe5219c53d7c0dd26bb92713071ca88caf5a8fbd45ac39"
+    },
+    {
+      "path": "src/services/provider-capacity-catalog-contract.test.js",
+      "bytes": 2099,
+      "sha256": "750045fa733fe30e77da7aefa9c371e777fb943e76cfc23a1125200af461609c"
+    },
+    {
       "path": "src/services/provider-capacity-debt-authority-service.js",
       "bytes": 25676,
       "sha256": "a1f13a7b9dfa4bd6019344355ee6967908bbd14a55e7268404cdac6445b6e9d7"
     },
     {
       "path": "src/services/provider-capacity-projection-service.js",
-      "bytes": 12177,
-      "sha256": "c9fdb9d2e5116f69f960cbabe5ee2cde9a285a2b5aad0a1b5371ca4baa96ef25"
+      "bytes": 11981,
+      "sha256": "782b08c8cd378b1238647af1c1bc3919f4ca9688c13c56a52e33dfee422e9b2d"
     },
     {
       "path": "src/services/provider-capacity-sla-service.js",

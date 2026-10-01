@@ -25,7 +25,7 @@ check('migration exists', exists('prisma/migrations/20260714170000_p9_job_leases
 const migration = read('prisma/migrations/20260714170000_p9_job_leases/migration.sql');
 check('migration creates unique idempotency index', migration.includes('CREATE UNIQUE INDEX') && migration.includes('JobInstance_idempotencyKey_key'));
 check('claim requires capabilities', jobs.includes('jobKeys: z.array') && lease.includes('jobKey: { in: allowedJobKeys }'));
-check('server catalog limits desktop claim keys', ['fetch_earnings','fetch_campaigns','traffic_sources_scan','catchup_notifications_scan'].every((key) => catalog.includes(key)) && lease.includes('filterClaimableDesktopJobKeys'));
+check('server catalog limits desktop claim keys', ['fetch_earnings','fetch_campaigns','dialog_intelligence_scan','catchup_notifications_scan'].every((key) => catalog.includes(key)) && lease.includes('filterClaimableDesktopJobKeys'));
 check('claim requires fresh READY device binding', lease.includes('lastSeenAt: { gte: freshAfter }') && lease.includes('return bindings.map'));
 check('release route is fenced', jobs.includes('/:id/release') && lease.includes('async function releaseJob') && lease.includes('leaseRevision'));
 check('expired lease sweep is bulk and bounded', lease.includes('attempts: { increment: 1 }') && !lease.includes('Promise.all(expired.map'));

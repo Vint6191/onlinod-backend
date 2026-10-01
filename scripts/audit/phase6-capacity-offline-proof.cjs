@@ -18,6 +18,7 @@ async function fixture(t, beforeMigration) {
   await pg.exec(baseline);
   if (beforeMigration) await beforeMigration(pg);
   await pg.exec(migration);
+  await pg.exec(fs.readFileSync(path.join(ROOT, "prisma/migrations/20261001003000_capacity_catalog_traffic_retirement_v1/migration.sql"), "utf8"));
   const calls = [];
   const db = { async $transaction(work) { return pg.transaction(async (client) => {
     const tx = {
@@ -63,7 +64,7 @@ test("B1 SQL: populated I7 upgrade; bounded restartable bootstrap stays conserva
 test("B1 SQL: duplicate repair, satisfaction, deletion and job-class changes apply exact deltas", async (t) => {
   const fx=await fixture(t); await fan(fx.pg,'f'); await job(fx.pg,'j','fetch_earnings','SCHEDULED');
   await drain(fx); assert.equal(String((await fx.snapshot()).fanDataUnsatisfiedDemands),'1');
-  await fx.pg.exec(`UPDATE "CreatorFanRefreshDemand" SET "requestedRevision"="requestedRevision" WHERE id='f'; UPDATE "JobInstance" SET "jobKey"='traffic_sources_scan' WHERE id='j'`);
+  await fx.pg.exec(`UPDATE "CreatorFanRefreshDemand" SET "requestedRevision"="requestedRevision" WHERE id='f'; UPDATE "JobInstance" SET "jobKey"='dialog_intelligence_scan' WHERE id='j'`);
   await drain(fx); const second=await fx.snapshot(); assert.equal(String(second.fanDataUnsatisfiedDemands),'1'); assert.equal(second.backgroundOtherPendingJobs,1); assert.equal(second.backgroundOtherPendingJobClasses,1);
   await fx.pg.exec(`UPDATE "CreatorFanRefreshDemand" SET "satisfiedRevision"=1 WHERE id='f'; DELETE FROM "JobInstance" WHERE id='j'`);
   await drain(fx); const third=await fx.snapshot(); assert.equal(String(third.fanDataUnsatisfiedDemands),'0'); assert.equal(third.backgroundOtherPendingJobs,0); assert.equal(third.status,'HEALTHY');
@@ -84,7 +85,7 @@ test("B1 SQL: publication failure rolls back projection, dirty deletion and curs
   await assert.rejects(projection.runProviderCapacityProjectionBatch({db:fx.db,publish:async()=>{throw Error('publication-failed');}}),/publication-failed/);
   assert.equal((await fx.pg.query('SELECT * FROM "ProviderCapacityDirty"')).rows.length,1);
   assert.equal((await fx.pg.query('SELECT * FROM "ProviderCapacityBucket"')).rows.length,0);
-  assert.equal(String((await fx.pg.query('SELECT revision FROM "ProviderCapacityProjectionState"')).rows[0].revision),'0');
+  assert.equal(String((await fx.pg.query('SELECT revision FROM "ProviderCapacityProjectionState"')).rows[0].revision),'1');
   assert.equal(await fx.snapshot(),undefined); await drain(fx); assert.equal(String((await fx.snapshot()).fanDataUnsatisfiedDemands),'1');
 });
 
@@ -101,7 +102,7 @@ test("B1 SQL: time index wakes a due contribution without an event key", async (
 test("B1 SQL: incremental totals equal the canonical diagnostic query", async (t) => {
   const fx=await fixture(t); for(let i=0;i<37;i++) await fan(fx.pg,`f${i}`,i%3+1,i%2);
   for(let i=0;i<13;i++) await directory(fx.pg,`d${i}`,i%2?'2000-01-01':'2099-01-01',i*50);
-  await job(fx.pg,'j0','fan_data_point_refresh','SCHEDULED'); await job(fx.pg,'j1','fan_data_point_refresh','PAUSED'); await job(fx.pg,'j2','traffic_sources_scan','PAUSED'); await job(fx.pg,'j3','fetch_earnings','DONE');
+  await job(fx.pg,'j0','fan_data_point_refresh','SCHEDULED'); await job(fx.pg,'j1','fan_data_point_refresh','PAUSED'); await job(fx.pg,'j2','dialog_intelligence_scan','PAUSED'); await job(fx.pg,'j3','fetch_earnings','DONE');
   await drain(fx,12); const saved=await fx.snapshot();
   const inputs=await debt.readCanonicalCapacityInputs({db:{$queryRawUnsafe:async(s,...a)=>(await fx.pg.query(s,normalize(a))).rows}, now:saved.sampledAt});
   assert.deepEqual(lower(saved),lower(debt.deriveProviderCapacityDebtSnapshot({now:saved.sampledAt,...inputs})));
@@ -120,7 +121,7 @@ test("B1 SQL: old writers cannot overwrite; unowned and stale publication reject
 test("B1 SQL: projection revision differs from OF-gate revision; host now ignored", async (t) => {
   const fx=await fixture(t); await fx.pg.exec(`INSERT INTO "OfProviderRequestGateState" (id,revision,"updatedAt") VALUES ('of-global',99999,CURRENT_TIMESTAMP)`);
   await fx.refresh({now:new Date('2099-01-01')}); const saved=await fx.snapshot();
-  assert.equal(String(saved.projectionRevision),'1'); assert.ok(new Date(saved.sampledAt)<new Date('2099-01-01'));
+  assert.equal(String(saved.projectionRevision),'2'); assert.ok(new Date(saved.sampledAt)<new Date('2099-01-01'));
 });
 
 test("B1 SQL: changed catalog fails closed and retains queued work", async (t) => {
@@ -148,6 +149,6 @@ test("B1 SQL: controlled deadlock retry does not double count; oversized batch i
    return debt.persistProviderCapacityDebtSnapshot({db,snapshot});
  }});
  assert.equal(attempts,2);assert.equal(String((await fx.snapshot()).fanDataUnsatisfiedDemands),'1');
- assert.equal(String((await fx.snapshot()).projectionRevision),'1');
+ assert.equal(String((await fx.snapshot()).projectionRevision),'2');
  assert.ok(fx.calls.filter(c=>/LIMIT \$1 FOR UPDATE SKIP LOCKED/.test(c.sql)).every(c=>c.params[0]===128));
 });
