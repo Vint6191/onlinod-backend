@@ -1,4 +1,6 @@
 "use strict";
+const directoryCounts = require("./campaign-directory-count-authority");
+const boundedFrontiers = require("./campaign-bounded-frontier-service");
 
 const { observationStartForJob } = require("./analytics-observation-time");
 const { FRONTIER_OBSERVATION_VERSION, frontierDueWhere } = require("./campaign-freshness-service");
@@ -1762,6 +1764,7 @@ function campaignDirectoryReuseStateMatches(state, reuse, command) {
     reuse &&
     command?.mode === "catchup" &&
     state?.campaignDirectoryGeneration === reuse.generation &&
+    !directoryCounts.directoryCountInvalidated(state) &&
     sameTime(state?.campaignDirectoryRequestedAt, reuse.requestedAt) &&
     Number(state?.campaignDirectoryRevision || 0) === reuse.revision &&
     Number(state?.campaignDirectoryCampaignCount || 0) === reuse.campaignCount &&
@@ -1779,6 +1782,9 @@ async function campaignDirectoryAuthority(tx, { job, command, scanRunId, durable
       error.code = "CAMPAIGN_DIRECTORY_REUSE_STALE";
       throw error;
     }
+    const sealed = directoryCounts.sealedDirectoryCount(state, reuse);
+    if (sealed !== null) return { ...reuse, reused: true };
+    if (directoryCounts.directoryCountInvalidated(state)) throw new Error("CAMPAIGN_DIRECTORY_REUSE_FACTS_CHANGED");
     const persistedCount = await tx.creatorCampaign.count({
       where: { creatorId: job.creatorId, sourceScanRunId: reuse.generation, sourceScanStartedAt: reuse.requestedAt },
     });
@@ -1787,6 +1793,9 @@ async function campaignDirectoryAuthority(tx, { job, command, scanRunId, durable
       error.code = "CAMPAIGN_DIRECTORY_REUSE_COUNT_MISMATCH";
       throw error;
     }
+    await tx.creatorCampaignCollectionState.update({ where: { creatorId: job.creatorId }, data: {
+      campaignDirectoryCountRevision: directoryCounts.revision(state.campaignDirectoryFactsRevision) ?? 0n,
+    } });
     return { ...reuse, reused: true };
   }
 
@@ -1797,7 +1806,8 @@ async function campaignDirectoryAuthority(tx, { job, command, scanRunId, durable
     error.code = "CAMPAIGN_DIRECTORY_PROOF_INCOMPLETE";
     throw error;
   }
-  const campaignCount = await tx.creatorCampaign.count({
+  const sealed = directoryCounts.sealedDirectoryCount(state, { generation: scanRunId, requestedAt: command.requestedAt });
+  const campaignCount = sealed ?? await tx.creatorCampaign.count({
     where: { creatorId: job.creatorId, sourceScanRunId: scanRunId, sourceScanStartedAt: command.requestedAt },
   });
   if (state?.campaignDirectoryGeneration === scanRunId && sameTime(state?.campaignDirectoryRequestedAt, command.requestedAt)) {
@@ -1807,10 +1817,11 @@ async function campaignDirectoryAuthority(tx, { job, command, scanRunId, durable
       throw error;
     }
     const requestedDiscoveryRevision = Math.max(0, Number(state?.campaignDirectoryDiscoveryRequestedRevision || 0));
-    if (Math.max(0, Number(state?.campaignDirectoryDiscoveryCompletedRevision || 0)) < requestedDiscoveryRevision || !state?.campaignDirectoryDiscoveryDueAt) {
+    if (sealed === null || Math.max(0, Number(state?.campaignDirectoryDiscoveryCompletedRevision || 0)) < requestedDiscoveryRevision || !state?.campaignDirectoryDiscoveryDueAt) {
       await tx.creatorCampaignCollectionState.update({
         where: { creatorId: job.creatorId },
         data: {
+          campaignDirectoryCountRevision: directoryCounts.revision(state.campaignDirectoryFactsRevision) ?? 0n,
           campaignDirectoryDiscoveryCompletedRevision: requestedDiscoveryRevision,
           campaignDirectoryDiscoveryDueAt: observationStartForJob(job)
             ? new Date(observationStartForJob(job).getTime() + CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS) : now,
@@ -1829,6 +1840,7 @@ async function campaignDirectoryAuthority(tx, { job, command, scanRunId, durable
       campaignDirectoryVerifiedAt: observationStartForJob(job),
       campaignDirectoryRevision: revision,
       campaignDirectoryCampaignCount: campaignCount,
+      campaignDirectoryCountRevision: directoryCounts.revision(state.campaignDirectoryFactsRevision) ?? 0n,
       campaignDirectoryDiscoveryCompletedRevision: requestedDiscoveryRevision,
       campaignDirectoryDiscoveryDueAt: observationStartForJob(job)
             ? new Date(observationStartForJob(job).getTime() + CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS) : now,
@@ -1852,17 +1864,25 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
     sourceScanRunId: directoryAuthority.generation,
     sourceScanStartedAt: directoryAuthority.requestedAt,
   };
-  const allCount = await tx.creatorCampaign.count({ where: exactGeneration });
-  if (allCount !== directoryAuthority.campaignCount) throw new Error("CAMPAIGN_DIRECTORY_AUTHORITY_COUNT_CHANGED");
+  // Directory authority already checked the count under this same creator lock.
+  const allCount = directoryAuthority.campaignCount;
   const schedulingCurrent = Number(object(job.params).campaignFrontierSchedulingVersion || 0) >= CAMPAIGN_FRONTIER_SCHEDULING_VERSION;
+  const bounded = command.mode === "catchup" && schedulingCurrent && boundedFrontiers.enabled(job)
+    && directoryCounts.sealedDirectoryCount(current, directoryAuthority) !== null;
   let dueCount = allCount;
   let targetCount = allCount;
   let targetIds = [];
+  let selected = null;
 
   if (command.mode === "full" || !schedulingCurrent) {
     // Full/rolling-compat traversal already scans every row. Do not materialize
     // the entire directory merely to attach target markers.
     targetCount = allCount;
+  } else if (bounded) {
+    selected = await boundedFrontiers.selectTargets(tx, exactGeneration, now, campaignFrontierBudget(job));
+    targetIds = selected.targets.map(row => row.id);
+    targetCount = targetIds.length;
+    dueCount = selected.dueCount;
   } else {
     // Prisma cannot compare two columns in a portable where-clause. Revision
     // mismatch is therefore selected with the due timestamp authority: every
@@ -1880,13 +1900,14 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
   }
 
   if (targetIds.length) {
-    await tx.creatorCampaign.updateMany({
+    const assigned = await tx.creatorCampaign.updateMany({
       where: { id: { in: targetIds }, creatorId: job.creatorId },
       data: { claimersTargetRunId: scanRunId },
     });
+    if (assigned.count !== targetIds.length) throw new Error("CAMPAIGN_FRONTIER_TARGET_ASSIGNMENT_CHANGED");
   }
   const deferred = Math.max(0, dueCount - targetCount);
-  const oldestDue = dueCount > 0
+  const oldestDue = selected ? { claimersNextDueAt: selected.oldestDueAt } : dueCount > 0
     ? await tx.creatorCampaign.findFirst({
       where: frontierDueWhere(exactGeneration, now),
       orderBy: [{ claimersNextDueAt: "asc" }, { externalCampaignId: "asc" }],
@@ -1904,6 +1925,8 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
     where: { creatorId: job.creatorId },
     data: {
       campaignFrontierPlanRunId: scanRunId,
+      campaignFrontierSelection: selected
+        ? boundedFrontiers.createSelection(current, directoryAuthority, scanRunId, selected.targets, selected.countExact) : {},
       campaignFrontierObservationVersion: FRONTIER_OBSERVATION_VERSION,
       // Reuse has zero directory pages. Initialize the exact empty counter set
       // only after validating its binding and accepting this generation. Page
@@ -1983,6 +2006,9 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaign
   const freshAdvance = phase === "segment" && requestedCursor === durableCursor;
   const lostResponseReplay = phase === "claimers" && requestedCursor === durableRequestCursor;
   if (!freshAdvance && !lostResponseReplay) throw new Error("Campaign directory segment cursor does not match durable traversal");
+  if (lostResponseReplay && (Number(durable.campaignIndex || 0) > 0 || Number(durable.claimerPage || 0) > 0 || Number(durable.claimerOffset || 0) > 0)) {
+    throw new Error("CAMPAIGN_SEGMENT_REPLAY_ALREADY_ADVANCED");
+  }
 
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
   let directory = null;
@@ -2005,6 +2031,8 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaign
     directory = { generation: scanRunId, requestedAt: command.requestedAt, revision: 0, campaignCount: count, reused: false };
   }
   const frontierPlan = await ensureCampaignFrontierPlan(db, { job, command, scanRunId, now: authorityNow, directoryAuthority: directory });
+  const selection = boundedFrontiers.selection(frontierPlan, scanRunId);
+  if (selection) boundedFrontiers.assertBinding(frontierPlan, selection, directory);
 
   const where = {
     creatorId: job.creatorId,
@@ -2012,7 +2040,8 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaign
     sourceScanStartedAt: directory.requestedAt,
     ...(requestedCursor ? { externalCampaignId: { gt: requestedCursor } } : {}),
   };
-  const rows = await db.creatorCampaign.findMany({
+  const selectedPage = selection ? boundedFrontiers.pageSelection(selection, requestedCursor) : null;
+  const rows = selectedPage ? selectedPage.page : await db.creatorCampaign.findMany({
     where,
     orderBy: { externalCampaignId: "asc" },
     take: 51,
@@ -2025,10 +2054,11 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaign
     campaignDirectorySegment: {
       requestCursor: requestedCursor,
       cursor: nextCursor,
-      hasMore: rows.length > 50,
+      hasMore: selectedPage ? selectedPage.hasMore : rows.length > 50,
+      ...(selection ? { segmentTargetCount: selection.ids.length } : {}),
       campaigns: page.map((row) => ({
         id: text(row.externalCampaignId, 220),
-        scanClaimers: command.mode === "full" || Number(object(job.params).campaignFrontierSchedulingVersion || 0) < CAMPAIGN_FRONTIER_SCHEDULING_VERSION || row.claimersTargetRunId === scanRunId,
+        scanClaimers: Boolean(selection) || command.mode === "full" || Number(object(job.params).campaignFrontierSchedulingVersion || 0) < CAMPAIGN_FRONTIER_SCHEDULING_VERSION || row.claimersTargetRunId === scanRunId,
       })).filter((row) => Boolean(row.id)),
       frontierPlan: {
         status: text(frontierPlan?.campaignFrontierFreshnessStatus, 40) || "MISSING",
@@ -2036,6 +2066,7 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaign
         target: Math.max(0, Number(frontierPlan?.campaignFrontierTargetCount || 0)),
         completed: Math.max(0, Number(frontierPlan?.campaignFrontierCompletedCount || 0)),
         deferred: Math.max(0, Number(frontierPlan?.campaignFrontierDeferredCount || 0)),
+        ...(selection ? { countExact: selection.countExact } : {}),
       },
       ...(totalCampaignCount !== null ? { totalCampaignCount } : {}),
     },
@@ -2107,7 +2138,13 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result, public
       directoryGeneration = directoryReuse.generation;
       directoryRequestedAt = directoryReuse.requestedAt;
     }
-    const observedCampaignCount = publication ? publication.observedCampaignCount : await tx.creatorCampaign.count({
+    const directoryState = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
+    const sealedCount = directoryCounts.sealedDirectoryCount(directoryState, {
+      generation: directoryGeneration, requestedAt: directoryRequestedAt,
+    });
+    const publicationRevisionValid = publication?.directoryCountRevision === undefined
+      || (sealedCount !== null && directoryCounts.revision(publication.directoryCountRevision) === directoryCounts.revision(directoryState.campaignDirectoryCountRevision));
+    const observedCampaignCount = publication ? publication.observedCampaignCount : sealedCount ?? await tx.creatorCampaign.count({
       where: { creatorId: job.creatorId, sourceScanRunId: directoryGeneration, sourceScanStartedAt: directoryRequestedAt },
     });
     const directoryProofComplete = directoryReuse
@@ -2119,6 +2156,8 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result, public
       payload.claimersComplete === true &&
       payload.truncated !== true &&
       allCommitted &&
+      publicationRevisionValid &&
+      !directoryCounts.directoryCountInvalidated(directoryState) &&
       directoryProofComplete &&
       incrementalProof.claimerBatches === expectedClaimerBatches &&
       observedCampaignCount === expectedCampaignCount;
@@ -2180,6 +2219,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result, public
       campaignFrontierTarget: frontierTarget,
       campaignFrontierCompleted: frontierCompleted,
       campaignFrontierDeferred: frontierDeferred,
+      campaignFrontierCountsExact: boundedFrontiers.countsExact(frontierState),
       fanValuesComplete,
       fanValueFreshnessStatus: fanValueCoverage?.matches ? fanValueCoverage.status : emptyCurrentFreshnessComplete ? "COMPLETE" : null,
       fanValuesExpected: fanValueCoverage?.expected ?? integer(payload.fanValuesTotal, 100_000_000),

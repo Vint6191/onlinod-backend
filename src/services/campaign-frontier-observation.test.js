@@ -72,8 +72,10 @@ function matches(row, where = {}) {
     return value === wanted;
   });
 }
-function fixture({ versions = [1], count = versions.length, budget = 50 } = {}) {
+function fixture({ versions = [1], count = versions.length, budget = 50, bounded = false, sealed = false } = {}) {
   let current = state({ campaignDirectoryCampaignCount: count }), at = new Date(now);
+  current.campaignDirectoryFactsRevision = 0n;
+  current.campaignDirectoryCountRevision = sealed ? 0n : null;
   const batches = [], operations = [];
   const rows = versions.map((version, i) => ({ id: 'campaign-' + i, agencyId: 'agency', creatorId: 'creator',
     externalCampaignId: String(i + 1), isActive: true, claimerRevision: 1, claimerVerifiedRevision: 1,
@@ -91,7 +93,10 @@ function fixture({ versions = [1], count = versions.length, budget = 50 } = {}) 
     });
     return selected.slice(0,take);
   };
-  const tx = { $executeRawUnsafe: async sql => { operations.push(String(sql)); return 1; }, $queryRawUnsafe: async () => [],
+  const tx = { $executeRawUnsafe: async sql => { operations.push(String(sql)); return 1; },
+    $queryRawUnsafe: async (sql,creatorId,sourceScanRunId,sourceScanStartedAt,take) => sql.includes('FROM "CreatorCampaign"')
+      ? structuredClone(query({where:{creatorId,sourceScanRunId,sourceScanStartedAt,claimersObservationVersion:{lt:1}},
+        orderBy:[{claimersNextDueAt:'asc'},{externalCampaignId:'asc'}],take})) : [],
     creatorCampaignCollectionState: {
       findUnique: async () => structuredClone(current),
       upsert: async ({ update }) => { Object.assign(current, update); return structuredClone(current); },
@@ -123,7 +128,8 @@ function fixture({ versions = [1], count = versions.length, budget = 50 } = {}) 
   const ledger = () => load('creator-analytics-ledger-service',modules);
   const params = {...localControl.buildCollectionCommand({collectorType:'CAMPAIGNS',collectionMode:'catchup',now}),
     ...orchestrator.campaignDirectoryReuseBinding(current,now), campaignMode:'catchup',campaignFrontierSchedulingVersion:1,
-    campaignDirectoryReuseVersion:1, campaignFrontierBudget:budget, analyticsObservationStartedAt:now.toISOString()};
+    campaignDirectoryReuseVersion:1, campaignFrontierBudget:budget, analyticsObservationStartedAt:now.toISOString(),
+    ...(bounded ? {campaignBoundedTraversalVersion:1} : {})};
   const job = {id:'job',jobKey:'fetch_campaigns',agencyId:'agency',creatorId:'creator',params,
     continuation:{driverPhase:'execute',jobContinuation:{collectorVersion:'campaigns-v13',scanRunId:params.collectionGeneration,
       phase:'segment',directorySourceExhausted:true,campaignPagesComplete:true,truncated:false,
@@ -226,9 +232,9 @@ test('Replay after a newer generation acknowledges only its receipt and cannot r
   const f=fixture({versions:[0]});await f.segment();const chunk=f.page();
   await f.ledger().ingestCampaignChunk({db:f.db,job:f.job,chunk});
   Object.assign(f.state,{activeGeneration:'new-generation',activeRequestedAt:new Date(+now+3600000),campaignDirectoryRevision:2});
-  const before=JSON.stringify(f.state);f.restart();
+  const before=structuredClone(f.state);f.restart();
   const replay=await f.ledger().ingestCampaignChunk({db:f.db,job:f.job,chunk});
-  assert.equal(replay.replay,true);assert.equal(JSON.stringify(f.state),before);
+  assert.equal(replay.replay,true);assert.deepEqual(f.state,before);
   f.batches[0].agencyId='foreign-agency';
   await assert.rejects(()=>f.ledger().ingestCampaignChunk({db:f.db,job:f.job,chunk}),/RECEIPT_SCOPE_MISMATCH/);
 });
@@ -245,7 +251,8 @@ test('Observation marker does not acquire an activation-row lock inside a Campai
   const activation=load('campaign-causal-activation-service',{'../prisma':{}}),calls=[];
   await activation.enterCampaignObservationWriter({db:{$executeRawUnsafe:async sql=>calls.push(sql),
     $queryRawUnsafe:async()=>{throw new Error('Activation lock order reversed');}}});
-  assert.deepEqual(calls,["SELECT set_config('onlinod.campaign_observation_version', '1', true)"]);
+  assert.deepEqual(calls,["SELECT set_config('onlinod.campaign_observation_version', '1', true)",
+    "SELECT set_config('onlinod.campaign_directory_count_version', '1', true)"]);
 });
 test('Postflight rejects missing, disabled and mismatched rolling-deploy guards',async()=>{
   const {verify,SPECS}=require('../../scripts/database/campaign-observation-postflight');
@@ -256,4 +263,97 @@ test('Postflight rejects missing, disabled and mismatched rolling-deploy guards'
     [{...rows[0],body:'RETURN NEW;'},rows[1]],[{...rows[0],table:'foreign'},rows[1]]]){
     await assert.rejects(()=>verify({$queryRawUnsafe:async()=>invalid}),/CAMPAIGN_OBSERVATION_FENCE_INVALID/);
   }
+});
+
+function trackDirectoryIO(f) {
+  const calls={counts:0,reads:[]};const original=f.db.$transaction;
+  f.db.$transaction=work=>original(async tx=>{
+    const count=tx.creatorCampaign.count,many=tx.creatorCampaign.findMany,raw=tx.$queryRawUnsafe;
+    tx.creatorCampaign.count=async args=>{calls.counts++;return count(args);};
+    tx.creatorCampaign.findMany=async args=>{calls.reads.push(structuredClone(args));return many(args);};
+    tx.$queryRawUnsafe=async (...args)=>{if(args[0].includes('FROM "CreatorCampaign"'))calls.reads.push({raw:true,take:args[4]});return raw(...args);};
+    try{return await work(tx);}finally{tx.creatorCampaign.count=count;tx.creatorCampaign.findMany=many;tx.$queryRawUnsafe=raw;}
+  });return calls;
+}
+function nextSegment(f,cursor) {
+  f.job.continuation.jobContinuation.phase='segment';f.job.continuation.jobContinuation.segmentCursor=cursor;
+  return f.ledger().loadCampaignDirectorySegment({db:f.db,job:f.job,chunk:{kind:'campaign_directory_segment',schemaVersion:4,
+    collectorVersion:'campaigns-v13',scanRunId:f.job.params.collectionGeneration,cursor}});
+}
+test('Bounded reuse of 4000 campaigns returns only 10 targets without COUNT or catalog traversal',async()=>{
+  const f=fixture({versions:[...Array(3990).fill(1),...Array(10).fill(0)],bounded:true,sealed:true});
+  const io=trackDirectoryIO(f),r=(await f.segment()).campaignDirectorySegment;
+  assert.equal(r.campaigns.length,10);assert.equal(r.totalCampaignCount,4000);assert.equal(r.segmentTargetCount,10);
+  assert.equal(r.hasMore,false);assert(r.campaigns.every(c=>c.scanClaimers));assert.equal(r.frontierPlan.countExact,true);
+  assert.equal(io.counts,0);assert.equal(io.reads.length,3);assert(io.reads.every(q=>q.take===51));
+});
+test('Saturated due population has bounded lookahead and explicit lower-bound counts',async()=>{
+  const f=fixture({versions:Array(4000).fill(0),bounded:true,sealed:true});const io=trackDirectoryIO(f);
+  const s=(await f.segment()).campaignDirectorySegment;
+  assert.equal(s.campaigns.length,50);assert.equal(s.hasMore,false);assert.equal(s.frontierPlan.countExact,false);
+  assert.equal(s.frontierPlan.due,51);assert.equal(s.frontierPlan.deferred,1);assert.equal(io.counts,0);
+  assert.equal(f.rows.filter(r=>r.claimersTargetRunId).length,50);
+});
+test('Empty selected tranche is an exact zero and does not scan a nonempty catalog',async()=>{
+  const f=fixture({versions:Array(4000).fill(1),bounded:true,sealed:true});const io=trackDirectoryIO(f);
+  const s=(await f.segment()).campaignDirectorySegment;
+  assert.equal(s.campaigns.length,0);assert.equal(s.totalCampaignCount,4000);assert.equal(s.segmentTargetCount,0);
+  assert.equal(s.hasMore,false);assert.equal(s.frontierPlan.countExact,true);assert.equal(io.counts,0);
+  assert.equal((await f.completion()).complete,true);assert.equal(io.counts,0);
+});
+test('A cold historical directory is counted once; restart and subsequent segments use its sealed revision',async()=>{
+  const f=fixture({versions:Array(120).fill(0),budget:120,bounded:true});const io=trackDirectoryIO(f);
+  let s=(await f.segment()).campaignDirectorySegment;assert.equal(io.counts,1);
+  f.restart();s=(await nextSegment(f,s.cursor)).campaignDirectorySegment;
+  assert.equal(s.campaigns.length,50);assert.equal(io.counts,1);
+  f.restart();s=(await nextSegment(f,s.cursor)).campaignDirectorySegment;
+  assert.equal(s.campaigns.length,20);assert.equal(s.hasMore,false);assert.equal(io.counts,1);
+});
+test('Target-clearing cannot change a saved segment after restart or a lost response',async()=>{
+  const f=fixture({versions:Array(60).fill(0),budget:60,bounded:true,sealed:true});
+  const s=(await f.segment()).campaignDirectorySegment;
+  f.rows.forEach(row=>row.claimersTargetRunId=null);
+  Object.assign(f.job.continuation.jobContinuation,{phase:'claimers',segmentRequestCursor:null,segmentCursor:s.cursor,
+    campaigns:s.campaigns,campaignIndex:0,claimerPage:0,claimerOffset:0});f.restart();
+  const retry=(await f.segment()).campaignDirectorySegment;
+  assert.deepEqual(structuredClone(retry.campaigns),structuredClone(s.campaigns));assert.equal(retry.cursor,s.cursor);assert.equal(retry.hasMore,true);
+});
+for(const advance of [{campaignIndex:1},{claimerPage:1},{claimerOffset:50}])test('Late segment replay cannot rewind committed traversal '+JSON.stringify(advance),async()=>{
+  const f=fixture({versions:[0],bounded:true,sealed:true});const s=(await f.segment()).campaignDirectorySegment;
+  Object.assign(f.job.continuation.jobContinuation,{phase:'claimers',segmentRequestCursor:null,segmentCursor:s.cursor,...advance});
+  const before=structuredClone(f.state);await assert.rejects(()=>f.segment(),/REPLAY_ALREADY_ADVANCED/);assert.deepEqual(f.state,before);
+});
+test('Directory fact mutation invalidates cached count, plan, reader freshness and claimer admission',async()=>{
+  const f=fixture({versions:[0],bounded:true,sealed:true});await f.segment();
+  f.state.campaignDirectoryFactsRevision=1n;const before=structuredClone(f.state);
+  assert.equal(freshness.directoryDue(f.state,now),true);
+  await assert.rejects(()=>f.segment(),e=>e.code==='CAMPAIGN_DIRECTORY_REUSE_STALE');
+  await assert.rejects(()=>f.ledger().ingestCampaignChunk({db:f.db,job:f.job,chunk:f.page()}),e=>e.code==='CAMPAIGN_DIRECTORY_REUSE_STALE');
+  assert.deepEqual(f.state,before);
+});
+test('A stale publication count revision cannot complete even if its numeric count is unchanged',async()=>{
+  const f=fixture({bounded:true,sealed:true});await f.segment();
+  const result={schemaVersion:4,collectorVersion:'campaigns-v13',scanRunId:f.job.params.collectionGeneration,
+    campaignBatchCount:0,claimerBatchCount:0,campaignCount:1,campaignPagesComplete:true,claimersComplete:true,truncated:false};
+  const r=await f.ledger().completeCampaignScan({db:f.db,job:f.job,result,publication:{observedCampaignCount:1,directoryCountRevision:'99',prepareOnly:true}});
+  assert.equal(r.complete,false);assert.equal(r.providerTraversalComplete,false);
+});
+test('Three due ranges deduplicate campaigns and preserve exact no-debt proof',async()=>{
+  const f=fixture({versions:[0,0,1,1],bounded:true,sealed:true});
+  f.rows[0].claimersNextDueAt=null;f.rows[1].claimersNextDueAt=now;f.rows[2].claimersNextDueAt=now;
+  const s=(await f.segment()).campaignDirectorySegment;
+  assert.equal(s.campaigns.length,3);assert.equal(new Set(s.campaigns.map(c=>c.id)).size,3);
+  assert.equal(s.frontierPlan.countExact,true);assert.equal(s.frontierPlan.deferred,0);
+});
+test('Malformed selected IDs or directory binding fail closed',async()=>{
+  const f=fixture({versions:[0],bounded:true,sealed:true});await f.segment();
+  f.state.campaignFrontierSelection.ids.push('1');await assert.rejects(()=>f.segment(),/SELECTION_INVALID/);
+  f.state.campaignFrontierSelection.ids.pop();f.state.campaignFrontierSelection.countRevision='99';
+  await assert.rejects(()=>f.segment(),/SELECTION_STALE/);
+});
+test('A durable target plan is reused without reevaluating time or expanding its budget',async()=>{
+  const f=fixture({versions:[0,1],bounded:true,sealed:true});const io=trackDirectoryIO(f);
+  const before=(await f.segment()).campaignDirectorySegment;f.setClock(new Date(+now+12*3600000));f.restart();
+  const after=(await f.segment()).campaignDirectorySegment;
+  assert.deepEqual(structuredClone(after.campaigns),structuredClone(before.campaigns));assert.equal(io.reads.length,3);assert.equal(io.counts,0);
 });

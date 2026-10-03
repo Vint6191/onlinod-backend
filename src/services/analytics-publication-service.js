@@ -8,6 +8,7 @@ const { acquireCampaignTransactionLock } = require("./campaign-transaction-lock-
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { collectionCommand, COLLECTOR_TYPES } = require("./analytics-collector-control-service");
 const { stampObservationStart, observationStartForJob } = require("./analytics-observation-time");
+const directoryCounts = require("./campaign-directory-count-authority");
 const { publishDomainWork, claimDomainWorkBatch, lockDomainWorkClaimForCommit,
   ackDomainWorkClaim, yieldDomainWorkClaim, failDomainWorkClaim } = require("./domain-work-authority-service");
 
@@ -177,6 +178,12 @@ async function campaignUnit(db, job, row, now) {
   const requestedAt = reuse ? new Date(params.campaignDirectoryReuseRequestedAt) : command.requestedAt;
   const proof = { observedCampaignCount: 0, ...row.proof };
   if (row.stage === "CAMPAIGN_DIRECTORY") {
+    const state = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
+    const sealed = directoryCounts.sealedDirectoryCount(state, { generation, requestedAt });
+    if (sealed !== null) {
+      return save(db, row, { proof: { observedCampaignCount: sealed,
+        directoryCountRevision: String(state.campaignDirectoryCountRevision) }, cursor: {}, stage: "CAMPAIGN_PREPARE" }, now);
+    }
     const rows = await db.creatorCampaign.findMany({ where: { creatorId: job.creatorId, sourceScanRunId: generation,
       sourceScanStartedAt: requestedAt, ...afterId(row.cursor) }, orderBy: { id: "asc" }, take: PAGE, select: { id: true } });
     proof.observedCampaignCount += rows.length;

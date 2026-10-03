@@ -2236,6 +2236,9 @@ model CreatorCampaignCollectionState {
   fanValueCoverageUpdatedAt                   DateTime?
   campaignFrontierPlanRunId                   String?                 @db.VarChar(120)
   campaignFrontierObservationVersion          Int                     @default(0)
+  campaignFrontierSelection                   Json                    @default("{}")
+  campaignDirectoryFactsRevision              BigInt                  @default(0)
+  campaignDirectoryCountRevision              BigInt?
   campaignFrontierFreshnessStatus             AnalyticsCoverageStatus @default(MISSING)
   campaignFrontierDueCount                    Int                     @default(0)
   campaignFrontierTargetCount                 Int                     @default(0)

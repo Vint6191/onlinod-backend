@@ -22,7 +22,7 @@ const {
   FAN_DATA_REFRESH_MAX_ACTIVE_CLAIMS_PER_CREATOR,
   fanDataRefreshClaimAvailable,
 } = require("./provider-capacity-authority-service");
-const { enterCampaignClaimGeneration } = require("./campaign-causal-activation-service");
+const { enterCampaignClaimGeneration, enterCampaignBoundedExecution } = require("./campaign-causal-activation-service");
 const { capabilityFreshnessWindow, isCapabilityTimestampFresh } = require("./capability-freshness-authority-service");
 const { createFanObservationToken } = require("./fan-observation-token-service");
 const {
@@ -235,6 +235,8 @@ function campaignDirectorySegmentContinuation(value, segmentValue) {
     segmentCursor: cursor,
     segmentHasMore: segment.hasMore === true,
     totalCampaignCount,
+    ...(Number.isInteger(segment.segmentTargetCount) && segment.segmentTargetCount >= 0 && segment.segmentTargetCount <= 200
+      ? { segmentTargetCount: segment.segmentTargetCount } : {}),
   };
 }
 
@@ -538,7 +540,8 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     capabilities?.campaignOrderIndependentTraversalV1 !== true ||
     capabilities?.campaignSegmentedFairTraversalV1 !== true ||
     capabilities?.campaignFrontierSchedulingV1 !== true ||
-    capabilities?.campaignDirectoryReuseV1 !== true
+    capabilities?.campaignDirectoryReuseV1 !== true ||
+    capabilities?.campaignBoundedTraversalV1 !== true
   ) {
     allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
   }
@@ -597,6 +600,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
           ...(String(candidate.jobKey || "") === "fetch_campaigns" ? campaignClaimParams(candidate.params) : object(candidate.params)),
           observationTokenVersion: 1,
           observationReadLeaseVersion: 1,
+          ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignBoundedTraversalVersion: 1 } : {}),
           ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignResumablePaginationVersion: 1, campaignFreshnessCoverageVersion: 1, campaignOrderIndependentTraversalVersion: 1, campaignSegmentedFairTraversalVersion: 1, campaignFrontierSchedulingVersion: 1, campaignDirectoryReuseVersion: 1 } : {}),
         },
       } : {}),
@@ -846,6 +850,7 @@ async function issueFanObservationToken({ jobId, userId, deviceId, leaseToken, l
 
 async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation }) {
   const outcome = await leaseCommit({ jobId, userId, deviceId, leaseToken, leaseRevision }, async (tx, { job, now }) => {
+  if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
   const tokenHash = hashToken(leaseToken);
   const data = {
     leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),
@@ -895,6 +900,7 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
 }
 async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation, chunkResult }) {
   return leaseCommit({ jobId, userId, deviceId, leaseToken, leaseRevision }, async (tx, { job, now }) => {
+  if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
   const tokenHash = hashToken(leaseToken);
   const nextLeaseUntil = new Date(now.getTime() + leaseDuration(leaseMs));
   const normalizedProgress = safeProgress(progress) ?? job.progress;

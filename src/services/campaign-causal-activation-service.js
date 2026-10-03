@@ -94,6 +94,7 @@ async function enterCampaignObservationWriter({ db = prisma } = {}) {
   // binaries during a rolling deploy. This marker is transaction-local.
   if (typeof db.$executeRawUnsafe === "function") {
     await db.$executeRawUnsafe("SELECT set_config('onlinod.campaign_observation_version', '1', true)");
+    await db.$executeRawUnsafe("SELECT set_config('onlinod.campaign_directory_count_version', '1', true)");
   }
 }
 
@@ -132,7 +133,13 @@ async function enterCampaignWriterGeneration({ db = prisma } = {}) {
   return state;
 }
 
+async function enterCampaignBoundedExecution({ db = prisma } = {}) {
+  if (typeof db.$executeRawUnsafe === "function") {
+    await db.$executeRawUnsafe("SELECT set_config('onlinod.campaign_bounded_traversal_version', '1', true)");
+  }
+}
 async function enterCampaignClaimGeneration({ db = prisma } = {}) {
+  await enterCampaignBoundedExecution({ db });
   const state = await campaignCausalV1State({ db, lockForCommit: false });
   if (!state.claimGenerationActive) return state;
   if (!state.writerGeneration) throw new Error("CAMPAIGN_CLAIM_GENERATION_INVALID");
@@ -400,6 +407,7 @@ module.exports = {
   enterCampaignWriterGeneration,
   enterCampaignObservationWriter,
   enterCampaignClaimGeneration,
+  enterCampaignBoundedExecution,
   assertCampaignActivationPhysicalFences,
   retryableActivationError,
   activateCampaignCausalV1,

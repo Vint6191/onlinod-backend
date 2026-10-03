@@ -3,6 +3,7 @@
 const { directoryObservationAt, directoryDiscoveryDeadline, parseObservationTime } = require("./analytics-observation-time");
 const { CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS } = require("./analytics-freshness-policy");
 const { evaluateDurableCollectorState } = require("./analytics-state-evaluator");
+const { directoryCountInvalidated } = require("./campaign-directory-count-authority");
 
 const FRONTIER_OBSERVATION_VERSION = 1;
 const CAMPAIGN_COVERAGE_SELECT = Object.freeze(Object.fromEntries([
@@ -10,6 +11,7 @@ const CAMPAIGN_COVERAGE_SELECT = Object.freeze(Object.fromEntries([
   "activeGeneration", "membershipCoverageStatus", "membershipObservedAt",
   "campaignDirectoryGeneration", "campaignDirectoryRequestedAt", "campaignDirectoryVerifiedAt", "campaignDirectoryRevision",
   "campaignDirectoryCampaignCount", "campaignDirectoryDiscoveryDueAt", "campaignDirectoryDiscoveryRequestedRevision", "campaignDirectoryDiscoveryCompletedRevision",
+  "campaignDirectoryFactsRevision", "campaignDirectoryCountRevision",
   "campaignFrontierPlanRunId", "campaignFrontierObservationVersion", "campaignFrontierFreshnessStatus", "campaignFrontierNextDueAt",
   "campaignFrontierTargetCount", "campaignFrontierCompletedCount", "campaignFrontierDeferredCount",
   "fanValueCoverageScanRunId", "fanValueExpected", "fanValueFreshnessStatus", "fanValueOutstanding", "fanValueFailed",
@@ -21,7 +23,7 @@ function directoryPending(state) {
 function directoryDue(state, now = new Date()) {
   const deadline = directoryDiscoveryDeadline(state, CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS, now);
   return !state?.campaignDirectoryGeneration || !(Number(state.campaignDirectoryRevision) > 0)
-    || directoryPending(state) || !deadline || +deadline <= +now;
+    || directoryPending(state) || directoryCountInvalidated(state) || !deadline || +deadline <= +now;
 }
 function frontierDue(state, now = new Date()) {
   // A completed old plan did not include unknown source ages in its due set.

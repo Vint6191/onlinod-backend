@@ -302,6 +302,7 @@ async function acceptCampaignGeneration({ db = prisma, job, deviceId = null, cam
       fanValueUnavailable: 0, fanValueFailed: 0, fanValueOutstanding: 0, fanValueCoverageUpdatedAt: null,
       campaignFrontierPlanRunId: null, campaignFrontierFreshnessStatus: "MISSING",
       campaignFrontierObservationVersion: 0,
+      campaignFrontierSelection: {},
       campaignFrontierDueCount: 0, campaignFrontierTargetCount: 0, campaignFrontierCompletedCount: 0, campaignFrontierDeferredCount: 0,
       campaignFrontierOldestDueAt: null, campaignFrontierNextDueAt: null, campaignFrontierUpdatedAt: null,
       lastErrorCode: null, lastErrorMessage: null, sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220),

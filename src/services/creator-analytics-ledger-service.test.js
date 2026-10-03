@@ -1877,10 +1877,11 @@ test("campaign ingest takes a transaction-scoped advisory lock before reading ge
     },
   });
   for (let i = calls.length - 1; i >= 0; i--) if (calls[i][0].includes("set_config('lock_timeout'")) calls.splice(i, 1);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   assert.equal(calls[0][0], "SELECT set_config('onlinod.campaign_observation_version', '1', true)");
-  assert.match(calls[1][0], /pg_advisory_xact_lock/);
-  assert.equal(calls[1][1], "analytics-collector:campaigns:creator-1");
+  assert.equal(calls[1][0], "SELECT set_config('onlinod.campaign_directory_count_version', '1', true)");
+  assert.match(calls[2][0], /pg_advisory_xact_lock/);
+  assert.equal(calls[2][1], "analytics-collector:campaigns:creator-1");
 });
 
 

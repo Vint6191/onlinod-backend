@@ -145,5 +145,19 @@
     "unique": false,
     "expression": "\"creatorId\",\"sourceScanRunId\",\"claimersNextDueAt\",\"externalCampaignId\"",
     "where": "\"claimersObservationVersion\" < 1"
+  },
+  {
+    "name": "Campaign_directory_due_v2",
+    "table": "CreatorCampaign",
+    "unique": false,
+    "expression": "\"creatorId\",\"sourceScanRunId\",\"sourceScanStartedAt\",\"claimersNextDueAt\",\"externalCampaignId\"",
+    "where": null
+  },
+  {
+    "name": "Campaign_directory_unknown_v2",
+    "table": "CreatorCampaign",
+    "unique": false,
+    "expression": "\"creatorId\",\"sourceScanRunId\",\"sourceScanStartedAt\",\"claimersNextDueAt\",\"externalCampaignId\"",
+    "where": "\"claimersObservationVersion\" < 1"
   }
 ]
