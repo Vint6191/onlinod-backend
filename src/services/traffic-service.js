@@ -42,10 +42,11 @@ async function assertTrafficViewer({ userId, creatorId, db = prisma }) {
 async function markTrafficFanValueDirty({ db = prisma, agencyId, creatorId, fanId, occurredAt = null, reason = null }) {
   if (!agencyId || !creatorId || !fanId) throw fail("BAD_TRAFFIC_DIRTY_INPUT", 400);
   if (!isCommitTransaction(db)) throw fail("TRAFFIC_DIRTY_COMMIT_REQUIRED");
-  await db.$executeRawUnsafe('SELECT "onlinod_traffic_dirty_fan_v2"($1,$2,$3)', agencyId, creatorId, String(fanId));
   const when = occurredAt ? new Date(occurredAt) : new Date();
   if (!Number.isFinite(when.getTime())) throw fail("TRAFFIC_DIRTY_DATE_INVALID", 400);
-  await db.$executeRawUnsafe('UPDATE "TrafficFanProjection" SET "lastRevenueAt"=GREATEST("lastRevenueAt",$4::timestamp),"updatedAt"=CURRENT_TIMESTAMP WHERE "agencyId"=$1 AND "creatorId"=$2 AND "fanId"=$3', agencyId, creatorId, String(fanId), when);
+  // Timestamp-only producer state is separate from worker-owned aggregates.
+  // A producer never waits for a derived fan row while holding DomainWork.
+  await db.$executeRawUnsafe('SELECT "onlinod_traffic_observe_revenue_v3"($1,$2,$3,$4::timestamptz)', agencyId, creatorId, String(fanId), when);
   return { ok: true, queued: true, fanId: String(fanId), reason };
 }
 async function scheduleTrafficRefresh({ db = prisma, userId, creatorId }) {

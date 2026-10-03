@@ -170,6 +170,7 @@ async function apply(tx, agencyId, userId, member, c, context, deviceId) {
     return { humanReference: { taskId: value.item?.id || row?.id, deleted: p.operation === "delete" } };
   }
   if (c.action === "traffic.cost") {
+    await require("./traffic-projection-authority").enterTrafficProjection(tx, c.targetId);
     const changed = await tx.trafficSource.updateMany({
       where: { id: p.sourceId, agencyId, creatorId: c.targetId, costRevision: p.expectedRevision },
       data: { costCents: p.costCents, currency: p.currency, costRevision: { increment: 1 } },

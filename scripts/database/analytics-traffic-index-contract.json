@@ -180,5 +180,12 @@
     "unique": false,
     "expression": "\"creatorId\",\"id\"",
     "where": "\"status\"::text = ANY (ARRAY['QUEUED'::text,'FAILED'::text])"
+  },
+  {
+    "name": "TrafficSourceMember_backfill_page_v3",
+    "table": "TrafficSourceMember",
+    "unique": false,
+    "expression": "\"creatorId\",\"id\"",
+    "where": null
   }
 ]

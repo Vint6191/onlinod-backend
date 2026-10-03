@@ -498,6 +498,7 @@ model CreatorAccount {
   trafficFanProjections TrafficFanProjection[]
   trafficReceiptProjections TrafficReceiptProjection[]
   trafficProjectionBackfills TrafficProjectionBackfill[]
+  trafficFanSignals TrafficFanSignal[]
   id                                  String                 @id @default(cuid())
   agencyId                            String
   displayName                         String
@@ -6248,6 +6249,7 @@ model TrafficSourceMember {
 
   @@index([creatorId, fanId, lastSeenAt(sort: Desc), id(sort: Desc)], map: "TrafficSourceMember_attribution_v2")
 
+  @@index([creatorId, id], map: "TrafficSourceMember_backfill_page_v3")
 }
 
 model CreatorSubscriptionLedger {
@@ -6803,12 +6805,22 @@ model TrafficReceiptProjection {
   creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
 }
 model TrafficProjectionBackfill {
+  @@map("TrafficProjectionBackfillData")
   creatorId String @id
   agencyId String
   stage String @default("RETIRE")
   cursor String @default("")
   completedAt DateTime?
   updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+}
+model TrafficFanSignal {
+  id String @id
+  agencyId String
+  creatorId String
+  fanId String
+  lastRevenueAt DateTime?
+  @@unique([creatorId, fanId])
   creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
 }
 model TrafficProjectionSeed {

@@ -24,9 +24,16 @@ for(const eventType of ["paid_subscribed","subscription_renewed","subscription_r
   const fx=fixture(),result=await project({db:fx.db,job,fact:{...fact,eventType}});
   assert.equal(result.ignored,false);assert.equal(fx.row().source,"canonical_subscription_fact");assert.equal(fx.row().eventType,eventType);
 });
-test("member mutation failure propagates to the owning transaction",async()=>{
+test("canonical receipt commit does not mutate derived Traffic members",async()=>{
   const fx=fixture();fx.db.trafficSourceMember.updateMany=async()=>{throw new Error("required effect failed");};
-  await assert.rejects(project({db:fx.db,job,fact}),/required effect failed/);
+  const result=await project({db:fx.db,job,fact});
+  assert.equal(result.ignored,false);assert.equal(fx.effects(),0);
+  const replay=await project({db:fx.db,job,fact});assert.equal(replay.duplicate,true);
+});
+test("receipt persistence failure propagates to the owning transaction",async()=>{
+  const fx=fixture();fx.db.creatorSubscriptionLedger.createMany=async()=>{throw new Error("receipt capture failed");};
+  await assert.rejects(project({db:fx.db,job,fact}),/receipt capture failed/);
+  assert.equal(fx.effects(),0);
 });
 test("missing fingerprint cannot silently create a receipt with a synthetic identity",async()=>{
   const fx=fixture();await assert.rejects(project({db:fx.db,job,fact:{...fact,eventHash:null}}),{code:"NOTIFICATION_FACT_IDENTITY_REQUIRED"});

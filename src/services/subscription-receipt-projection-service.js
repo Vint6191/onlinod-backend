@@ -45,14 +45,9 @@ async function projectWithinTransaction({ db, job, fact, historyPolicy }) {
   const row = await db.creatorSubscriptionLedger.findUnique({ where: { agencyId_eventHash: { agencyId, eventHash } } });
   if (!row) throw fault("NOTIFICATION_RECEIPT_MISSING");
   if (row.creatorId !== creatorId || row.fanId !== fanId) throw fault("NOTIFICATION_FACT_SCOPE_MISMATCH");
-  if (row.sourceId) {
-    const where = { agencyId, creatorId, sourceId: row.sourceId, fanId };
-    await db.trafficSourceMember.updateMany({ where, data: { needsValueRefresh: true } });
-    await db.trafficSourceMember.updateMany({ where: { ...where,
-      OR: [{ lastRevenueAt: null }, { lastRevenueAt: { lt: row.occurredAt } }] }, data: { lastRevenueAt: row.occurredAt } });
-    await db.trafficSourceMember.updateMany({ where: { ...where,
-      OR: [{ convertedAt: null }, { convertedAt: { gt: row.occurredAt } }] }, data: { convertedAt: row.occurredAt } });
-  }
+  // The receipt capture trigger publishes TRAFFIC_FACT in this transaction.
+  // The Traffic worker owns member conversion metadata and monetary deltas.
+  // A canonical producer must not lock derived member rows after publishing.
   return { ignored: false, ledgerId: row.id, sourceId: row.sourceId, duplicate: inserted.count === 0 };
 }
 

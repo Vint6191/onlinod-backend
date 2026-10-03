@@ -29,6 +29,7 @@ const WORK_CLASS = Object.freeze({
   CAMPAIGN_CLOCK: "CAMPAIGN_CLOCK",
   CAMPAIGN_BACKFILL: "CAMPAIGN_BACKFILL",
   TRAFFIC_FAN: "TRAFFIC_FAN",
+  TRAFFIC_FACT: "TRAFFIC_FACT",
   TRAFFIC_BACKFILL: "TRAFFIC_BACKFILL",
   NOTIFICATION_HISTORY_REPAIR: "NOTIFICATION_HISTORY_REPAIR",
   NOTIFICATION_RECEIPT_REPAIR: "NOTIFICATION_RECEIPT_REPAIR",
@@ -56,6 +57,12 @@ const WORK_CLASS = Object.freeze({
 
 const STATE = Object.freeze({ READY: "READY", CLAIMED: "CLAIMED", BLOCKED: "BLOCKED", RECONCILE_REQUIRED: "RECONCILE_REQUIRED", DONE: "DONE" });
 
+async function authorizeProjectionClass(tx, workClass) {
+  if (typeof tx?.$queryRawUnsafe === "function"
+    && [WORK_CLASS.TRAFFIC_FACT, WORK_CLASS.TRAFFIC_FAN, WORK_CLASS.TRAFFIC_BACKFILL].includes(workClass)) {
+    await require("./traffic-projection-authority").authorizeTrafficExecutor(tx);
+  }
+}
 
 // During a rolling Actual52 -> DomainWork cutover, the old maintenance authority can
 // still be present on another replica. Actual52 does not understand activeGeneration
@@ -625,6 +632,7 @@ async function claimDomainWorkBatchInternal({
       await (dependencyWakeBridge
         ? authorizeDomainWorkDependencyWakeBridge(tx)
         : authorizeDomainWorkExecutor(tx));
+      await authorizeProjectionClass(tx, klass);
       return true;
     } catch (error) {
       if (error?.code === "DOMAIN_WORK_DEPENDENCY_WAKE_BRIDGE_TRANSITION") return false;
@@ -1266,6 +1274,7 @@ async function lockDomainWorkClaimForCommit({ db = null, item, ownerToken = null
   if (!db) db = require("../prisma");
   if (!item?.id) return { current: false, lost: true };
   return runDbTransaction(db, async (tx) => {
+    await authorizeProjectionClass(tx, item.workClass);
     let current = null;
     if (typeof tx?.$queryRawUnsafe === "function") {
       const rows = await tx.$queryRawUnsafe(

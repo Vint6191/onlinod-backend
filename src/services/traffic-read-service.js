@@ -45,14 +45,14 @@ async function revenue(db, scope, kind, ids, range) {
 async function freshness(db, creator, now) {
   const state = await db.trafficProjectionBackfill.findUnique({ where: { creatorId: creator.id } });
   const pending = await db.domainWorkItem.findFirst({ where: { agencyId: creator.agencyId, creatorId: creator.id,
-    workClass: { in: ["TRAFFIC_FAN", "TRAFFIC_BACKFILL"] }, isOutstanding: true }, select: { id: true, state: true, lastError: true } });
+    workClass: { in: ["TRAFFIC_FACT", "TRAFFIC_FAN", "TRAFFIC_BACKFILL"] }, isOutstanding: true }, select: { id: true, state: true, lastError: true } });
   const coverage = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: creator.id }, select: {
     ...CAMPAIGN_COVERAGE_SELECT, membershipCoverageCompletedAt: true,
   } });
   return { providerCoverage: coverage, ready: Boolean(state?.completedAt) && !pending, rebuilding: !state?.completedAt,
     providerFreshness: evaluateCampaignCollectionState(coverage, now),
     pending: Boolean(pending), failure: pending?.state === "RECONCILE_REQUIRED" ? pending.lastError : null,
-    providerAuthority: "CAMPAIGNS", valueAuthority: "FAN_DATA_CURRENT", projectionVersion: 2 };
+    providerAuthority: "CAMPAIGNS", valueAuthority: "FAN_DATA_CURRENT", projectionVersion: 3 };
 }
 async function readSnapshot(db, input, reader) {
   return readWithAnalyticsViewer({ ...input, db, permission: "traffic.view" }, async ({ db: tx, creator }) => {

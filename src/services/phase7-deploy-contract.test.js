@@ -5,8 +5,15 @@ const {GENERATION}=require('./phase7-legacy-storage-service');
 const {PRE,POST}=require('../../scripts/database/phase7-deploy');
 test('Phase7 deploy retains every preflight and postflight in the production wrapper',()=>{
  assert.deepEqual(POST[0], ["analytics-traffic-indexes.js", "--create"]);
- assert.deepEqual(POST[1], ["provider-capacity-catalog-postflight.js"]);
- assert.equal(PRE.length,8);assert.equal(POST.length,6);
+ assert(POST.some(([script]) => script === "provider-capacity-catalog-postflight.js"));
+ assert.equal(PRE.length,8);
+ assert.deepEqual(POST.map(([script]) => script), [
+  "analytics-traffic-indexes.js", "campaign-observation-postflight.js", "campaign-bounded-postflight.js",
+  "campaign-traversal-postflight.js", "campaign-value-refresh-postflight.js", "traffic-projection-postflight.js",
+  "provider-capacity-catalog-postflight.js", "phase3-domain-work-claim-online-rollout.js",
+  "phase3-subscriber-publication-schema-online-postflight.js", "phase3-analytics-legacy-snapshot-online-postflight.js",
+  "actual60-refreshsession-online-index-preflight.js"
+ ]);
  const source=fs.readFileSync(path.join(__dirname,'../../scripts/database/phase7-deploy.js'),'utf8');
  assert(source.indexOf('if(hooks&&!plan.fresh)')<source.indexOf("'migrate','deploy'"));
  assert(source.indexOf("'migrate','deploy'")<source.indexOf('if(hooks){if(plan.fresh)'));

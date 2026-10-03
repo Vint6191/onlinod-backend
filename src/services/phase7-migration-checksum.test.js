@@ -13,6 +13,14 @@ const root = path.resolve(__dirname, '../..');
 const migrations = path.join(root, 'prisma/migrations');
 const traffic = '20260614_traffic_core_v1';
 const contract = '20260930190000_phase7_legacy_storage_contract_v1';
+const allMigrations = fs.readdirSync(migrations).filter(n => fs.statSync(path.join(migrations, n)).isDirectory()).sort();
+const expandMigrations = allMigrations.filter(n => n !== contract);
+function assertHooks(calls, PRE, POST) {
+  assert.deepEqual(calls.map(args => args[1] === 'migrate' ? 'migrate' : path.basename(args[0])),
+    [...PRE.map(args => args[0]), 'migrate', ...POST.map(args => args[0]), 'phase7-legacy-storage-indexes.js']);
+  assert(POST.some(args => args[0] === 'traffic-projection-postflight.js'));
+}
+
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 const bytesOf = name => fs.readFileSync(path.join(migrations, name, 'migration.sql'));
 const crlf = bytes => Buffer.from(bytes.toString('utf8').replace(/\n/g, '\r\n'));
@@ -71,7 +79,7 @@ test('All three actual Render hashes are recovered SQL, remain byte mismatches, 
     assert.equal(migrationChecksumReport(bytesOf(entry.migration), entry.storedChecksum).matches, false);
   }
   const plan = await deployment().migrationPlan(db, { onHistorical: event => events.push(event) });
-  assert.equal(plan.names.length, 276); assert.equal(plan.names.includes(contract), false);
+  assert.deepEqual([...plan.names], expandMigrations); assert.equal(plan.names.includes(contract), false);
   assert.equal(events.length, 1); assert.equal(events[0].event, 'PHASE7_VERIFIED_HISTORICAL_MIGRATIONS');
   assert.equal(events[0].total, 3);
   assert.ok(events[0].migrations.every(item => item.byteEquivalent === false && item.repairs.length));
@@ -127,7 +135,7 @@ test('Corrupt recovered SQL fails closed instead of authorizing a checksum pair'
 });
 test('Recovered histories keep all hooks and stage only unchanged canonical SQL, never evidence SQL or contract', async () => {
   const calls = [];
-  const { main } = deployment({
+  const { main, PRE, POST } = deployment({
     './phase7-role-preflight': { inspectRoles: async () => ({ verified: true }) },
     '../../src/services/phase7-legacy-storage-service': { storageState: async () => ({ state: 'BRIDGE' }) },
   });
@@ -135,12 +143,12 @@ test('Recovered histories keep all hooks and stage only unchanged canonical SQL,
     calls.push(args);
     if (args[1] === 'migrate') {
       const dir = path.join(path.dirname(args.at(-1)), 'migrations');
-      assert.equal(fs.readdirSync(dir).filter(name => name !== 'migration_lock.toml').length, 276);
+      assert.deepEqual(fs.readdirSync(dir).filter(name => name !== 'migration_lock.toml').sort(), expandMigrations);
       for (const entry of historical) assert.equal(sha(fs.readFileSync(path.join(dir, entry.migration, 'migration.sql'))), entry.currentChecksum);
       assert.equal(fs.existsSync(path.join(dir, contract)), false);
     }
   } });
-  assert.equal(calls.length, 16);
+  assertHooks(calls, PRE, POST);
 });
 test('Recovered histories still require the explicit contract readiness gate', async () => {
   let deployCalled = false;
@@ -201,7 +209,7 @@ test('Planner validates the entire 268-migration history, reports compat, and se
   const db = database(rows), notices = [];
   const plan = await deployment().migrationPlan(db, { onCompatibility: event => notices.push(event) });
   assert.equal(plan.fresh, false); assert.equal(plan.purged, false);
-  assert.equal(plan.names.length, 276); assert.equal(plan.names.includes(contract), false);
+  assert.deepEqual([...plan.names], expandMigrations); assert.equal(plan.names.includes(contract), false);
   assert.equal(notices.length, 1); assert.equal(notices[0].total, 1);
   assert.equal(notices[0].migrations[0].migration, traffic);
   assert.equal(notices[0].migrations[0].matchMode, 'CRLF');
@@ -241,12 +249,12 @@ test('Rolled-back attempts stay ignored; unfinished and unknown applied migratio
 test('Empty database, populated unbaselined database, explicit contract and PURGED plans retain their gates', async () => {
   const { migrationPlan } = deployment();
   const fresh = await migrationPlan(database([], { hasLedger: false }));
-  assert.equal(fresh.fresh, true); assert.equal(fresh.names.length, 276);
+  assert.equal(fresh.fresh, true); assert.deepEqual([...fresh.names], expandMigrations);
   await assert.rejects(migrationPlan(database([], { hasLedger: false, tables: [{ relname: 'existing_table' }] })), /UNBASELINED_DATABASE/);
   const purged = await migrationPlan(database([row(traffic), row(contract)]));
-  assert.equal(purged.purged, true); assert.equal(purged.names.length, 277);
+  assert.equal(purged.purged, true); assert.deepEqual([...purged.names], allMigrations);
   const explicit = await migrationPlan(database([row(traffic)]), { contract: true });
-  assert.equal(explicit.names.length, 277);
+  assert.deepEqual([...explicit.names], allMigrations);
 });
 test('A mismatch stops main before any role gate, hook, deployment command or storage action', async () => {
   const called = [];
@@ -271,13 +279,13 @@ test('Compatible history traverses every existing pre/post hook; staged Prisma t
       if (args[1] === 'migrate') {
         stagedDirectory = path.dirname(args.at(-1));
         const names = fs.readdirSync(path.join(stagedDirectory, 'migrations')).filter(n => n !== 'migration_lock.toml');
-        assert.equal(names.length, 276); assert.equal(names.includes(contract), false);
+        assert.deepEqual(names.sort(), expandMigrations); assert.equal(names.includes(contract), false);
         assert.deepEqual(fs.readFileSync(path.join(stagedDirectory, 'migrations', traffic, 'migration.sql')), bytesOf(traffic));
       }
     },
   });
   assert.equal(result.state, 'BRIDGE'); assert.equal(roles[0].strict, false);
-  assert.equal(PRE.length, 8); assert.equal(POST.length, 6); assert.equal(calls.length, 16);
+  assert.equal(PRE.length, 8); assertHooks(calls, PRE, POST);
   assert.equal(calls[8][1], 'migrate');
   assert.equal(path.basename(calls.at(-1)[0]), 'phase7-legacy-storage-indexes.js');
   assert.equal(fs.existsSync(stagedDirectory), false);
