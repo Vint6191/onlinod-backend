@@ -135,6 +135,6 @@ test("INT5.9A-8 source fences catch-up claimer writes to the server-selected run
   assert.match(ledger, /campaignFrontierFreshnessStatus: completed >= target \? \(deferred > 0 \? "PARTIAL" : "COMPLETE"\) : "SCANNING"/);
   assert.match(ledger, /const currentMembershipComplete = membershipComplete && frontierFreshnessComplete/);
   const queue = read("src/services/campaign-fan-refresh-queue-service.js");
-  assert.match(queue, /const cutoff = new Date\(runStartedAt\.getTime\(\) - CAMPAIGN_FAN_VALUE_FRESHNESS_MS\)/);
+  assert.match(queue, /const cutoff = new Date\(scheduledAt\.getTime\(\) - CAMPAIGN_FAN_VALUE_FRESHNESS_MS \+ 1\)/);
   assert.match(ledger, /const fanCutoff = new Date\(command\.requestedAt\.getTime\(\) - CAMPAIGN_FAN_VALUE_FRESHNESS_MS\)/);
 });

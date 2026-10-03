@@ -95,6 +95,7 @@ async function enterCampaignObservationWriter({ db = prisma } = {}) {
   if (typeof db.$executeRawUnsafe === "function") {
     await db.$executeRawUnsafe("SELECT set_config('onlinod.campaign_observation_version', '1', true)");
     await db.$executeRawUnsafe("SELECT set_config('onlinod.campaign_directory_count_version', '1', true)");
+    await db.$executeRawUnsafe("SELECT set_config('onlinod.campaign_traversal_authority_version', '1', true)");
   }
 }
 
@@ -136,6 +137,7 @@ async function enterCampaignWriterGeneration({ db = prisma } = {}) {
 async function enterCampaignBoundedExecution({ db = prisma } = {}) {
   if (typeof db.$executeRawUnsafe === "function") {
     await db.$executeRawUnsafe("SELECT set_config('onlinod.campaign_bounded_traversal_version', '1', true)");
+    await db.$executeRawUnsafe("SELECT set_config('onlinod.campaign_traversal_authority_version', '1', true)");
   }
 }
 async function enterCampaignClaimGeneration({ db = prisma } = {}) {

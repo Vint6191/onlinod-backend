@@ -9,6 +9,8 @@ const { CAMPAIGN_FAN_VALUE_FRESHNESS_MS, COLLECTION_FUTURE_SKEW_TOLERANCE_MS } =
 const { utcDay, DAY_MS } = require("./analytics-range-contract");
 
 const { enterCampaignProjection, admitProjectionWorkClass } = require("./campaign-projection-policy");
+const { acquireCampaignTransactionLock } = require("./campaign-transaction-lock-service");
+const { requestExpiredCampaignValues } = require("./campaign-value-refresh-service");
 const PAGE = 100;
 const RANGES = Object.freeze(["7d", "30d", "90d", "180d", "365d", "all"]);
 const CLASSES = Object.freeze(["CAMPAIGN_FACT", "CAMPAIGN_VALUE", "CAMPAIGN_ATTRIBUTION", "CAMPAIGN_CLOCK", "CAMPAIGN_BACKFILL"]);
@@ -32,14 +34,17 @@ function valueMetrics(value, now, freshnessMs = CAMPAIGN_FAN_VALUE_FRESHNESS_MS)
   const observed = value?.fetchedAt ? new Date(value.fetchedAt) : null;
   const trusted = observed && +observed <= +now + COLLECTION_FUTURE_SKEW_TOLERANCE_MS;
   const expires = observed ? new Date(+observed + freshnessMs) : null;
-  const available = Boolean(trusted && +expires > +now && value.availability === "AVAILABLE");
+  const fresh = Boolean(trusted && +expires > +now);
+  const available = fresh && value.availability === "AVAILABLE";
   const known = available && value.totalNetCents != null;
   return {
-    metrics: textMetrics({ ofValueKnownFans: known ? 1 : 0, ofValueUnknownFans: known ? 0 : 1,
+    fresh,
+    metrics: textMetrics({ ofValueFreshFans: fresh ? 1 : 0, ofValueStaleFans: fresh ? 0 : 1,
+      ofValueKnownFans: known ? 1 : 0, ofValueUnknownFans: known ? 0 : 1,
       ofValuePayingFans: known && BigInt(value.totalNetCents) > 0n ? 1 : 0,
       knownPlatformReportedFanSpendCents: known ? value.totalNetCents : 0 }),
     due: observed && !trusted ? new Date(+observed - COLLECTION_FUTURE_SKEW_TOLERANCE_MS)
-      : available ? expires : null,
+      : fresh ? expires : null,
   };
 }
 function financialMetrics(row) {
@@ -95,6 +100,7 @@ async function projectSource(tx, item, kind, id, now) {
   if (row && (kind === "MEMBER" || kind === "VALUE")) {
     const [value] = await tx.$queryRawUnsafe('SELECT "availability","totalNetCents","fetchedAt" FROM "CreatorFanValueCurrent" WHERE "creatorId"=$1 AND "agencyId"=$2 AND "fanId"=$3',item.creatorId,item.agencyId,row.fanId);
     const current = valueMetrics(value,now,policy.valueFreshnessMs); schedule(current.due);
+    if (kind === "VALUE" && !current.fresh) (item.valueRefreshFans ||= new Set()).add(row.fanId);
     const membership = windowMembership(row.attributedAt,now);
     if (kind === "MEMBER") schedule(membership.due);
     // Current directory/value/membership facts exist once, independent of the
@@ -239,6 +245,9 @@ async function runCampaignProjectionUnit({db,item,ownerToken}) {
     if (creators.length && await require("./analytics-projection-lifecycle-service").pauseDeletedAgencyProjection({db:tx,lifecycle,item,ownerToken})) return {done:false,paused:true};
     let result = {done:true,retired:true};
     if (lifecycle.row && !lifecycle.row.deletedAt && creators.length) {
+      // Match canonical value writers: Campaign authority precedes demand and
+      // read-cache changes. The projection never locks/schedules provider jobs.
+      await acquireCampaignTransactionLock(tx,item.creatorId);
       await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtextextended('campaign-read-v1:'||$1,0))",item.creatorId);
       const now = await dbAuthorityNow({db:tx});
       const cursor = String(item.progressCursor?.revision)===String(item.claimedRevision)?item.progressCursor:{};
@@ -256,6 +265,9 @@ async function runCampaignProjectionUnit({db,item,ownerToken}) {
       else if (item.workClass==="CAMPAIGN_CLOCK") result=await clockUnit(tx,item,now);
       else if (item.workClass==="CAMPAIGN_FACT") result=await factUnit(tx,item,now);
       else throw fault("CAMPAIGN_WORK_CLASS_INVALID");
+      if (item.valueRefreshFans?.size) await requestExpiredCampaignValues({
+        tx,agencyId:item.agencyId,creatorId:item.creatorId,fanIds:[...item.valueRefreshFans],now,freshnessMs:policy.valueFreshnessMs,
+      });
       if (item.workClass!=="CAMPAIGN_CLOCK") await scheduleClock(tx,item);
     }
     const fence=await lockDomainWorkClaimForCommit({db:tx,item,ownerToken});

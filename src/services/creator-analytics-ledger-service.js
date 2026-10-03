@@ -1,6 +1,7 @@
 "use strict";
 const directoryCounts = require("./campaign-directory-count-authority");
 const boundedFrontiers = require("./campaign-bounded-frontier-service");
+const traversalAuthority = require("./campaign-traversal-authority-service");
 
 const { observationStartForJob } = require("./analytics-observation-time");
 const { FRONTIER_OBSERVATION_VERSION, frontierDueWhere } = require("./campaign-freshness-service");
@@ -970,6 +971,8 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       }
     }
 
+    if (kind === "campaign_claimers_page" && traversalAuthority.enabled(job)) traversalAuthority.assertPage(job, payload);
+
     // Current selective Campaign claimer writes are only legal after the server
     // has issued this exact Campaign as a target for this scanRun. Perform this
     // preflight before generation acceptance so a direct/stale claimer write
@@ -1114,6 +1117,11 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         claimerRevision: true,
         claimerVerifiedRevision: true,
         claimersTargetRunId: true,
+        claimersLastVerifiedRunId: true,
+        claimersTraversalRunId: true,
+        claimersTraversalStartedAt: true,
+        claimersTraversalRevision: true,
+        claimersTraversalRejectedRows: true,
       },
     });
     if (!saved) throw new Error("Campaign claimer page references an unknown campaign");
@@ -1261,7 +1269,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     let fanRefreshQueue = null;
     if (CAMPAIGN_SERVER_REFRESH_COLLECTOR_VERSIONS.has(payload.collectorVersion)) {
       // Every accepted fan participates in per-run freshness coverage. Embedded
-      // subscribedOnData and already-fresh canonical values are terminal
+      // subscribedOnData must first have a fresh canonical timestamp; those values are terminal
       // ALREADY_FRESH evidence; stale/missing values attach to a cross-run
       // coalesced refresh demand instead of spawning one job per Campaign run.
       const refreshCandidates = [...uniqueClaimers.values()].map((claimer) => ({
@@ -1302,8 +1310,18 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     const knownBoundaryReached = orderIndependentTraversal
       ? false
       : payload.knownBoundaryReached === true || serverDeepBoundaryReached;
+    const traversalCurrent = traversalAuthority.enabled(job);
+    if (traversalCurrent) {
+      traversalAuthority.observation(job, saved);
+      // Persist all rejects, including server normalization failures. A clean
+      // later page cannot hide an earlier page that failed on the Backend.
+      if (rejected > 0) await tx.creatorCampaign.update({ where: { id: saved.id }, data: {
+        claimersTraversalRejectedRows: { increment: rejected },
+      } });
+    }
     const campaignComplete = orderIndependentTraversal
       ? payload.sourceHasMore !== true && payload.campaignComplete === true && rejected === 0
+        && (!traversalCurrent || (saved.claimersTraversalRejectedRows === 0 && traversalAuthority.canCompletePage(job, payload)))
       : (payload.campaignComplete === true || serverDeepBoundaryReached) && rejected === 0;
     const firstPageFrontierFanIds = claimerPageNumber === 1 && rejected === 0 ? pageFrontierFanIds : null;
     const firstPageFrontierHash = firstPageFrontierFanIds
@@ -1376,7 +1394,11 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       const verificationIntervalMs = saved.isActive === false
         ? CAMPAIGN_INACTIVE_FRONTIER_FRESHNESS_MS
         : CAMPAIGN_ACTIVE_FRONTIER_FRESHNESS_MS;
-      const verifiedRevision = Math.max(1, Number(saved.claimerRevision || 1));
+      const observation = traversalAuthority.observation(job, saved);
+      const verifiedRevision = observation.revision;
+      // One terminal proof per campaign/run, including FULL mode. Distinct
+      // batch keys for the same terminal page cannot stand in for other targets.
+      const alreadyVerified = saved.claimersLastVerifiedRunId === scanRunId;
       const verified = await tx.creatorCampaign.updateMany({
         where: {
           id: saved.id, creatorId: job.creatorId,
@@ -1385,9 +1407,9 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         data: {
           claimerVerifiedRevision: verifiedRevision,
           claimersObservationVersion: FRONTIER_OBSERVATION_VERSION,
-          claimersVerifiedAt: observationStartForJob(job),
-          claimersNextDueAt: observationStartForJob(job)
-            ? new Date(observationStartForJob(job).getTime() + verificationIntervalMs) : serverReceivedAt,
+          claimersVerifiedAt: observation.observedAt,
+          claimersNextDueAt: observation.observedAt && verifiedRevision === Math.max(1, Number(saved.claimerRevision || 1))
+            ? new Date(observation.observedAt.getTime() + verificationIntervalMs) : serverReceivedAt,
           claimersLastVerifiedRunId: scanRunId,
           claimersTargetRunId: null,
         },
@@ -1397,7 +1419,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         error.code = "CAMPAIGN_FRONTIER_TARGET_STALE";
         throw error;
       }
-      if (verified.count && typeof tx.creatorCampaignCollectionState?.findUnique === "function") {
+      if (verified.count && !alreadyVerified && typeof tx.creatorCampaignCollectionState?.findUnique === "function") {
         const frontierState = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
         if (frontierState?.campaignFrontierPlanRunId === scanRunId) {
           const completed = Math.min(

@@ -25,6 +25,8 @@ const {
 const { enterCampaignClaimGeneration, enterCampaignBoundedExecution } = require("./campaign-causal-activation-service");
 const { capabilityFreshnessWindow, isCapabilityTimestampFresh } = require("./capability-freshness-authority-service");
 const { createFanObservationToken } = require("./fan-observation-token-service");
+const campaignTraversal = require("./campaign-traversal-authority-service");
+const { acquireCampaignTransactionLock } = require("./campaign-transaction-lock-service");
 const {
   FanObservationReadLeaseError,
   FAN_OBSERVATION_READ_LEASE_TTL_MS,
@@ -191,6 +193,7 @@ function campaignServerBoundaryContinuation(value, externalCampaignId, previousV
     campaignIndex: matchedIndex + 1,
     claimerOffset: 0,
     claimerPage: 0,
+    ...(Object.hasOwn(current, "claimerRejected") ? { claimerRejected: 0 } : {}),
     // A proven deep boundary preserves prior truncation. Exact server no-progress
     // detection instead marks this Campaign partial so a buggy provider cannot
     // loop forever after the old page-count cap is removed.
@@ -231,6 +234,7 @@ function campaignDirectorySegmentContinuation(value, segmentValue) {
     campaignIndex: 0,
     claimerOffset: 0,
     claimerPage: 0,
+    ...(Object.hasOwn(current, "claimerRejected") ? { claimerRejected: 0 } : {}),
     segmentRequestCursor: requestCursor,
     segmentCursor: cursor,
     segmentHasMore: segment.hasMore === true,
@@ -541,7 +545,8 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     capabilities?.campaignSegmentedFairTraversalV1 !== true ||
     capabilities?.campaignFrontierSchedulingV1 !== true ||
     capabilities?.campaignDirectoryReuseV1 !== true ||
-    capabilities?.campaignBoundedTraversalV1 !== true
+    capabilities?.campaignBoundedTraversalV1 !== true ||
+    capabilities?.campaignTraversalAuthorityV1 !== true
   ) {
     allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
   }
@@ -600,7 +605,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
           ...(String(candidate.jobKey || "") === "fetch_campaigns" ? campaignClaimParams(candidate.params) : object(candidate.params)),
           observationTokenVersion: 1,
           observationReadLeaseVersion: 1,
-          ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignBoundedTraversalVersion: 1 } : {}),
+          ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignBoundedTraversalVersion: 1, campaignTraversalAuthorityVersion: 1 } : {}),
           ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignResumablePaginationVersion: 1, campaignFreshnessCoverageVersion: 1, campaignOrderIndependentTraversalVersion: 1, campaignSegmentedFairTraversalVersion: 1, campaignFrontierSchedulingVersion: 1, campaignDirectoryReuseVersion: 1 } : {}),
         },
       } : {}),
@@ -768,7 +773,7 @@ function readLeaseError(error) {
   return error;
 }
 
-async function acquireJobFanObservationReadLease({ jobId, userId, deviceId, leaseToken, leaseRevision, purpose, requestId }) {
+async function acquireJobFanObservationReadLease({ jobId, userId, deviceId, leaseToken, leaseRevision, purpose, requestId, campaignPage }) {
   return leaseCommit({ jobId, userId, deviceId, leaseToken, leaseRevision }, async (tx, { job, now }) => {
   if (Number(job?.params?.observationReadLeaseVersion || 0) < 1) {
     throw new JobLeaseError("FAN_OBSERVATION_READ_LEASE_NOT_REQUIRED", "Job does not use the cross-device observation read lease", 409);
@@ -787,10 +792,20 @@ async function acquireJobFanObservationReadLease({ jobId, userId, deviceId, leas
         select: { id: true },
       });
       if (!current) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before observation read acquisition", 409);
+      if (normalizedPurpose === "campaign_claimers_page" && campaignTraversal.enabled(job)) {
+        campaignTraversal.assertPage(job, campaignPage);
+        // Global order remains job -> Campaign -> creator observation lease.
+        // No provider request runs while these transaction locks are held.
+        await enterCampaignBoundedExecution({ db: tx });
+        await acquireCampaignTransactionLock(tx, job.creatorId);
+      }
       const acquired = await acquireCreatorObservationReadLease({
         db: tx, jobId: job.id, agencyId: job.agencyId, creatorId: job.creatorId, deviceId, leaseRevision,
         purpose: normalizedPurpose, requestId,
       });
+      if (acquired.acquired && normalizedPurpose === "campaign_claimers_page") {
+        await campaignTraversal.beginRead({ db: tx, job, campaignPage, acquiredAt: acquired.acquiredAt });
+      }
       await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, db: tx, lock: true });
       return acquired;
     } catch (error) {
@@ -851,6 +866,10 @@ async function issueFanObservationToken({ jobId, userId, deviceId, leaseToken, l
 async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation }) {
   const outcome = await leaseCommit({ jobId, userId, deviceId, leaseToken, leaseRevision }, async (tx, { job, now }) => {
   if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
+  if (campaignTraversal.enabled(job) && continuation !== undefined
+    && !campaignTraversal.expectedMatches(job, continuation)) {
+    throw new JobLeaseError("CAMPAIGN_PROGRESS_ENDPOINT_REQUIRED", "Campaign continuation advances only through progress", 409);
+  }
   const tokenHash = hashToken(leaseToken);
   const data = {
     leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),
@@ -898,7 +917,7 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
     continuation: normalizeLeaseContinuation(updated.continuation),
   };
 }
-async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation, chunkResult }) {
+async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation, chunkResult, expectedContinuation }) {
   return leaseCommit({ jobId, userId, deviceId, leaseToken, leaseRevision }, async (tx, { job, now }) => {
   if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
   const tokenHash = hashToken(leaseToken);
@@ -907,6 +926,17 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   const requestedContinuation = continuation === undefined
     ? job.continuation
     : normalizeLeaseContinuation(continuation);
+
+    if (campaignTraversal.enabled(job)) {
+      if (!campaignTraversal.expectedMatches(job, expectedContinuation)) {
+        // Another request already advanced this lease. Return its durable state
+        // without consuming tokens, re-applying facts or overwriting progress.
+        return { id: job.id, status: job.status, leaseUntil: job.leaseUntil,
+          leaseRevision: job.leaseRevision, progress: job.progress, continuation: job.continuation,
+          sideEffect: { staleProgress: true } };
+      }
+      campaignTraversal.assertProgress(job, chunkResult, requestedContinuation);
+    }
 
     const updatedFence = await tx.jobInstance.updateMany({
       where: {
@@ -941,7 +971,13 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       throw new JobLeaseError("CAMPAIGN_SEGMENT_CONTINUATION_INVALID", "Campaign directory segment could not be bound to requested continuation", 409);
     }
     let updated = null;
-    if (sideEffect?.completeAfterCommit === true) {
+    if (job.jobKey === "fetch_campaigns" && sideEffect?.replay === true) {
+      // Receipts prove data was already ingested; they do not authorize an old
+      // continuation to replace a newer cursor. Also protects legacy leases.
+      updated = await tx.jobInstance.update({ where: { id: job.id }, data: {
+        continuation: job.continuation, progress: job.progress,
+      } });
+    } else if (sideEffect?.completeAfterCommit === true) {
       updated = await tx.jobInstance.update({
         where: { id: job.id },
         data: {

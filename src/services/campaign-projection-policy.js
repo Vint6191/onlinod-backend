@@ -9,6 +9,7 @@ async function enterCampaignProjection(tx) {
   const [policy] = await tx.$queryRawUnsafe('SELECT "generation","valueFreshnessMs" FROM "CampaignProjectionPolicy" WHERE "id"=\'active\' FOR SHARE');
   if (!policy) throw new Error("CAMPAIGN_PROJECTION_POLICY_MISSING");
   await tx.$queryRawUnsafe("SELECT set_config('onlinod.campaign_projection_writer',$1,true),set_config('onlinod.campaign_projection_generation',$2,true)",WRITER,String(policy.generation));
+  await tx.$queryRawUnsafe("SELECT set_config('onlinod.campaign_value_refresh_version','1',true)");
   return policy;
 }
 

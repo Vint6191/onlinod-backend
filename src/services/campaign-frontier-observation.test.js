@@ -146,6 +146,16 @@ function fixture({ versions = [1], count = versions.length, budget = 50, bounded
     restart(){current=structuredClone(current);},setClock(value){at=new Date(value);}};
 }
 
+test('FULL legacy terminal pages with distinct receipt keys count each campaign only once',async()=>{
+  const f=fixture({versions:[0,0],sealed:true});await f.segment();
+  f.job.params.collectionMode='full';f.job.params.campaignMode='full';
+  const page=f.page('1');
+  await f.ledger().ingestCampaignChunk({db:f.db,job:f.job,chunk:page});
+  await f.ledger().ingestCampaignChunk({db:f.db,job:f.job,chunk:{...page,batchKey:page.batchKey+':another',pageNumber:2}});
+  assert.equal(f.state.campaignFrontierCompletedCount,1);
+  assert.equal(f.rows[1].claimersLastVerifiedRunId,undefined);
+});
+
 test('Campaign reader and planner share the independent directory/frontier deadlines',async()=>{
   const r=await comparison(false);
   assert.equal(r.coverage.fresh,true);assert(r.skipped.includes('campaigns_catchup:fresh'));assert.equal(r.scheduled.length,0);
@@ -252,7 +262,8 @@ test('Observation marker does not acquire an activation-row lock inside a Campai
   await activation.enterCampaignObservationWriter({db:{$executeRawUnsafe:async sql=>calls.push(sql),
     $queryRawUnsafe:async()=>{throw new Error('Activation lock order reversed');}}});
   assert.deepEqual(calls,["SELECT set_config('onlinod.campaign_observation_version', '1', true)",
-    "SELECT set_config('onlinod.campaign_directory_count_version', '1', true)"]);
+    "SELECT set_config('onlinod.campaign_directory_count_version', '1', true)",
+    "SELECT set_config('onlinod.campaign_traversal_authority_version', '1', true)"]);
 });
 test('Postflight rejects missing, disabled and mismatched rolling-deploy guards',async()=>{
   const {verify,SPECS}=require('../../scripts/database/campaign-observation-postflight');

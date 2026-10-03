@@ -30,6 +30,7 @@ function metricsDto(m={},ready=true) {
     salesRevenueCents:amount("salesKnownNetCents","salesUnknownNetTransactions"),tipsRevenueCents:amount("tipsKnownNetCents","tipsUnknownNetTransactions"),
     subscriptionRevenueCents:amount("subscriptionKnownNetCents","subscriptionUnknownNetTransactions"),
     ofValueKnownFans:n(m,"ofValueKnownFans"),ofValueUnknownFans:n(m,"ofValueUnknownFans"),ofValuePayingFans:n(m,"ofValuePayingFans"),
+    ofValueFreshFans:ready?n(m,"ofValueFreshFans"):null,ofValueStaleFans:ready?n(m,"ofValueStaleFans"):null,
     knownPlatformReportedFanSpendCents:ready?n(m,"knownPlatformReportedFanSpendCents"):null,
     platformReportedFanSpendCents:amount("knownPlatformReportedFanSpendCents","ofValueUnknownFans"),
   };
@@ -60,16 +61,20 @@ const encodeCursor=(scope,id)=>Buffer.from(JSON.stringify([...scope,id])).toStri
 const pageSize=value=>Math.max(1,Math.min(100,Math.floor(Number(value)||50)));
 async function readiness(db,creatorId,now) {
   const [row]=await db.$queryRawUnsafe(`SELECT s."completedAt",s."generation",p."generation" AS "activeGeneration",p."valueFreshnessMs",
+    COALESCE(m."metrics"->>'ofValueStaleFans','0') AS "staleFans",
     NOT EXISTS(SELECT 1 FROM "CreatorCampaign" c WHERE c."creatorId"=$1) AS empty,
     EXISTS(SELECT 1 FROM "DomainWorkItem" w WHERE w."creatorId"=$1 AND w."isOutstanding" AND w."workClass"=ANY($2::text[])
       AND w."workClass"<>'CAMPAIGN_CLOCK') AS pending,
     EXISTS(SELECT 1 FROM "CampaignReadReceipt" r WHERE r."creatorId"=$1 AND r."nextDueAt"<="phase3_utc_timestamp"($3::timestamptz)) AS expired,
     (SELECT r."nextDueAt" FROM "CampaignReadReceipt" r WHERE r."creatorId"=$1 AND r."nextDueAt" IS NOT NULL ORDER BY r."nextDueAt","kind","sourceId" LIMIT 1) AS "nextChangeAt"
-    FROM "CampaignProjectionPolicy" p LEFT JOIN "CampaignReadStateData" s ON s."creatorId"=$1 WHERE p."id"='active'`,creatorId,CLASSES,now);
+    FROM "CampaignProjectionPolicy" p LEFT JOIN "CampaignReadStateData" s ON s."creatorId"=$1
+    LEFT JOIN "CampaignReadMetric" m ON m."creatorId"=$1 AND m."campaignId"='' AND m."rangeKey"='current' AND m."fanId"=''
+    WHERE p."id"='active'`,creatorId,CLASSES,now);
   if(!row)throw fault("CAMPAIGN_PROJECTION_POLICY_MISSING",503);
   const current=row.generation===row.activeGeneration;
   const ready=Boolean(row.empty || (current&&row.completedAt&&!row.pending&&!row.expired));
   return {ready,empty:row.empty,generation:row.activeGeneration,state:ready?"READY":!current||!row.completedAt?"REBUILDING":"PENDING",asOf:now.toISOString(),
+    fanValueStatus:!ready?"PENDING":!row.empty&&BigInt(row.staleFans||0)>0n?"STALE":"FRESH",
     valueFreshnessMs:row.valueFreshnessMs,nextChangeAt:!row.empty&&current?row.nextChangeAt?.toISOString()||null:null};
 }
 async function sourceCoverage(db,creatorId,now) {
@@ -89,6 +94,7 @@ async function sourceCoverage(db,creatorId,now) {
   return {financial:evidence(financial,FINANCIAL_COLLECTION_FRESHNESS_MS),campaigns:campaigns?{
     ...campaigns,status:stateVocabulary(campaignState),proven:campaignState.proven,fresh:campaignState.fresh,
     due:campaignState.due,freshnessAuthority:campaignState.freshnessAuthority,
+    fanValueCoverageAuthority:"TRAVERSAL_RECEIPT",
     directoryDue:campaignState.directoryDue,frontierDue:campaignState.frontierDue,fanRefreshPending:campaignState.fanRefreshPending,
   }:null};
 }
@@ -102,6 +108,13 @@ async function readCampaignPage({db,creatorId,rangeKey:key="all",cursor=null,lim
   const page=rows.slice(0,take),ids=["",...page.map(r=>r.id)];
   const metrics=projection.empty?[]:await db.$queryRawUnsafe('SELECT "campaignId","metrics" FROM "CampaignReadMetric" WHERE "creatorId"=$1 AND "rangeKey" IN ($2,\'current\') AND "fanId"=\'\' AND "campaignId"=ANY($3::text[])',creatorId,key,ids);
   const byId=combineMetrics(metrics,"campaignId");
+  coverage.fanValues = {
+    authority:"CANONICAL_VALUE_TTL",scope:"CURRENT_CAMPAIGN_MEMBERS",freshnessMs:projection.valueFreshnessMs,
+    status:!projection.ready?"PENDING":n(byId.get(""),"ofValueStaleFans")>0?"STALE":"FRESH",
+    fresh:projection.ready&&n(byId.get(""),"ofValueStaleFans")===0,
+    freshFans:projection.ready?n(byId.get(""),"ofValueFreshFans"):null,
+    staleFans:projection.ready?n(byId.get(""),"ofValueStaleFans"):null,
+  };
   const bounds=displayRangeBounds(key,now);
   return {ok:true,contractVersion:VERSION,creatorId,range:{key,startAt:bounds.startAt.toISOString(),endAt:bounds.endAt.toISOString()},
     projection,sourceCoverage:coverage,totals:projection.ready?metricsDto(byId.get("")):null,

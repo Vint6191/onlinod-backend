@@ -3,7 +3,7 @@ const { runDbTransaction } = require("./db-transaction-service");
 
 
 const crypto = require("node:crypto");
-const { CAMPAIGN_FAN_VALUE_FRESHNESS_MS } = require("./analytics-freshness-policy");
+const { CAMPAIGN_FAN_VALUE_FRESHNESS_MS, COLLECTION_FUTURE_SKEW_TOLERANCE_MS } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { fanDataRefreshScheduleAvailable } = require("./provider-capacity-authority-service");
 const {
@@ -49,10 +49,11 @@ function uniqueCandidates(values) {
   }
   return [...byId.values()].sort((a, b) => a.onlyFansUserId.localeCompare(b.onlyFansUserId));
 }
-function campaignFanRefreshIsFresh(valueObservedAt, freshnessCutoffAt) {
+function campaignFanRefreshIsFresh(valueObservedAt, freshnessCutoffAt, now = null) {
   const observed = asDate(valueObservedAt);
   const cutoff = asDate(freshnessCutoffAt);
-  return Boolean(observed && cutoff && observed.getTime() >= cutoff.getTime());
+  return Boolean(observed && cutoff && observed.getTime() >= cutoff.getTime()
+    && (!now || +observed <= +now + COLLECTION_FUTURE_SKEW_TOLERANCE_MS));
 }
 function maxDate(left, right) {
   const a = asDate(left);
@@ -133,33 +134,35 @@ async function signalCampaignFanRefreshPromotion({ db, agencyId, creatorId, dueA
   return { signaled: false, reason: "adapter_unsupported" };
 }
 
-async function healExistingCanonicalCampaignDebt({ db, creatorId, now = null, limit = 500 } = {}) {
+async function healExistingCanonicalCampaignDebt({ db, creatorId, now = null, limit = 500, afterId = "" } = {}) {
   const scopedCreatorId = clean(creatorId, 180);
   if (!scopedCreatorId || typeof db?.$queryRawUnsafe !== "function") return { healedFans: 0, reason: "adapter_unsupported" };
   const take = Math.max(1, Math.min(500, Number(limit) || 500));
   const rows = await db.$queryRawUnsafe(`
-    SELECT d."onlyFansUserId"
-    FROM "CreatorFanRefreshDemand" d
-    JOIN "CreatorFan" f
+    WITH page AS MATERIALIZED (
+      SELECT d."id", d."creatorId", d."onlyFansUserId", d."requestedFreshnessCutoffAt"
+      FROM "CreatorFanRefreshDemand" d
+      WHERE d."creatorId"=$1 AND d."status" IN ('QUEUED','FAILED') AND d."id">$4
+      ORDER BY d."id" LIMIT $2 FOR UPDATE OF d SKIP LOCKED
+    )
+    SELECT d."id", d."onlyFansUserId",
+      (v."fetchedAt">=d."requestedFreshnessCutoffAt" AND v."fetchedAt"<=$3) AS fresh
+    FROM page d
+    LEFT JOIN "CreatorFan" f
       ON f."creatorId" = d."creatorId"
      AND f."onlyFansUserId" = d."onlyFansUserId"
-    JOIN "CreatorFanValueCurrent" v
+    LEFT JOIN "CreatorFanValueCurrent" v
       ON v."creatorId" = f."creatorId"
      AND v."fanId" = f."id"
-    WHERE d."creatorId" = $1
-      AND d."status" IN ('QUEUED','FAILED')
-      AND v."fetchedAt" IS NOT NULL
-      AND v."fetchedAt" >= d."requestedFreshnessCutoffAt"
-    ORDER BY d."updatedAt" ASC, d."id" ASC
-    FOR UPDATE OF d SKIP LOCKED
-    LIMIT $2
-  `, scopedCreatorId, take);
-  const fanIds = [...new Set((rows || []).map((row) => clean(row?.onlyFansUserId, 180)).filter(Boolean))];
-  if (!fanIds.length) return { healedFans: 0, reason: "none_due" };
+    ORDER BY d."id"
+  `, scopedCreatorId, take, new Date(+(asDate(now) || await dbAuthorityNow({ db })) + COLLECTION_FUTURE_SKEW_TOLERANCE_MS), clean(afterId,180) || "");
+  const progress = { scanned: rows.length, nextCursor: rows.length === take ? rows.at(-1).id : "" };
+  const fanIds = [...new Set((rows || []).filter(row => row.fresh).map((row) => clean(row?.onlyFansUserId, 180)).filter(Boolean))];
+  if (!fanIds.length) return { ...progress, healedFans: 0, reason: "none_due" };
   const result = await reconcileCampaignFanRefreshDemandsFromCanonicalObservations({
     db, creatorId: scopedCreatorId, fanIds, now: asDate(now) || new Date(), _campaignLockHeld: true,
   });
-  return { healedFans: fanIds.length, result, reason: "canonical_backfill" };
+  return { ...progress, healedFans: fanIds.length, result, reason: "canonical_backfill" };
 }
 
 function shouldResetCampaignRefreshJob(existing) {
@@ -247,14 +250,14 @@ async function ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, covera
   return state;
 }
 
-async function incrementCoverage(db, { creatorId, scanRunId, cutoff, expected = 0, alreadyFresh = 0, queued = 0, outstanding = 0, now, coverageAuthority = null }) {
+async function incrementCoverage(db, { creatorId, scanRunId, cutoff, expected = 0, alreadyFresh = 0, queued = 0, outstanding = 0, failed = 0, now, coverageAuthority = null }) {
   const state = await ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, coverageAuthority });
   if (!(expected || alreadyFresh || queued || outstanding)) return;
   // All callers hold creator Campaign authority. Classify the accumulated run,
   // not just this page: fresh-only arrivals cannot erase older queued/failed
   // debt. Keep proof publication with its existing completion authority.
   const totalOutstanding = Math.max(0, Number(state?.fanValueOutstanding || 0)) + outstanding;
-  const totalFailed = Math.max(0, Number(state?.fanValueFailed || 0));
+  const totalFailed = Math.max(0, Number(state?.fanValueFailed || 0)) + failed;
   await db.creatorCampaignCollectionState.updateMany({
     where: { creatorId, fanValueCoverageScanRunId: scanRunId },
     data: {
@@ -262,6 +265,7 @@ async function incrementCoverage(db, { creatorId, scanRunId, cutoff, expected = 
       fanValueAlreadyFresh: { increment: alreadyFresh },
       fanValueQueued: { increment: queued },
       fanValueOutstanding: { increment: outstanding },
+      fanValueFailed: { increment: failed },
       fanValueFreshnessStatus: totalOutstanding > 0 ? "QUEUED" : totalFailed > 0 ? "PARTIAL" : "COMPLETE",
       fanValueCoverageUpdatedAt: now,
     },
@@ -451,6 +455,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
         AND d."status" IN ('QUEUED', 'FAILED')
         AND d."satisfiedRevision" < d."requestedRevision"
         AND v."fetchedAt" >= d."requestedFreshnessCutoffAt"
+        AND v."fetchedAt" <= $4
       ORDER BY d."id"
       FOR UPDATE OF d
     ), demand_update AS (
@@ -606,7 +611,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
       (SELECT COUNT(*)::int FROM work_update) AS "workTransitioned",
       (SELECT COUNT(*)::int FROM coverage_update) AS "coverageRunsUpdated",
       (SELECT COUNT(*)::int FROM coverage_guard WHERE NOT "outstandingSafe" OR NOT "failedSafe") AS "coverageTransitionLost"
-  `, creatorId, fanIds, effectiveNow);
+  `, creatorId, fanIds, effectiveNow, new Date(+effectiveNow + COLLECTION_FUTURE_SKEW_TOLERANCE_MS));
   const result = Array.isArray(rows) && rows[0] ? rows[0] : {};
   const lost = Math.max(0, Number(result.coverageTransitionLost || 0));
   if (lost > 0) throw new Error("CAMPAIGN_FAN_REFRESH_RECOVERY_COVERAGE_TRANSITION_LOST");
@@ -665,7 +670,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservations({ db,
     if (satisfiedRevision >= requestedRevision) continue;
     const value = currentByFan.get(String(demand.onlyFansUserId));
     const observedAt = asDate(value?.valueObservedAt);
-    if (!observedAt || !campaignFanRefreshIsFresh(observedAt, demand.requestedFreshnessCutoffAt)) continue;
+    if (!observedAt || !campaignFanRefreshIsFresh(observedAt, demand.requestedFreshnessCutoffAt, effectiveNow)) continue;
     const outcome = String(value?.availability || "").toUpperCase() === "AVAILABLE" ? WORK_STATUS.SUCCEEDED : WORK_STATUS.UNAVAILABLE;
     await db.creatorFanRefreshDemand.update({
       where: { id: demand.id },
@@ -761,13 +766,13 @@ async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creator
       FROM "CreatorFanRefreshDemand" d
       WHERE d."status" = 'FAILED'
         AND d."activeRefreshJobId" IS NULL
-        AND ($2::boolean = TRUE OR (
+        ${force ? "" : `AND (
           d."quarantinedAt" IS NULL
           AND d."nextRetryAt" IS NOT NULL
           AND d."nextRetryAt" <= $1
-        ))
+        )`}
         AND d."creatorId" = $3
-      ORDER BY COALESCE(d."nextRetryAt", d."lastFailedAt", d."updatedAt") ASC, d."id" ASC
+      ORDER BY ${force ? 'COALESCE(d."nextRetryAt", d."lastFailedAt", d."updatedAt")' : 'd."nextRetryAt"'} ASC, d."id" ASC
       FOR UPDATE SKIP LOCKED
       LIMIT $4
     ), failed_work AS (
@@ -806,10 +811,6 @@ async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creator
       WHERE w."id" = fw."id"
         AND (SELECT "count" FROM unsafe) = 0
       RETURNING w."id", fw."demandId", fw."creatorId", fw."scanRunId"
-    ), work_per_demand AS (
-      SELECT "demandId", COUNT(*)::int AS "workCount"
-      FROM work_update
-      GROUP BY "demandId"
     ), demand_update AS (
       UPDATE "CreatorFanRefreshDemand" d
       SET "status" = 'QUEUED',
@@ -822,8 +823,9 @@ async function recoverFailedCampaignFanRefreshDemandsSetBased({ db, now, creator
           "lastOutcome" = CASE WHEN $2::boolean THEN 'MANUAL_REPAIR_QUEUED' ELSE 'RETRY_QUEUED' END,
           "lastError" = NULL,
           "updatedAt" = $1
-      FROM work_per_demand wd
-      WHERE d."id" = wd."demandId"
+      FROM candidate c
+      WHERE d."id" = c."id"
+        AND (SELECT "count" FROM unsafe) = 0
       RETURNING d."id"
     ), coverage_update AS (
       UPDATE "CreatorCampaignCollectionState" s
@@ -893,7 +895,6 @@ async function recoverFailedCampaignFanRefreshDemands({ db, now = null, creatorI
   let requeuedWork = 0;
   for (const demand of candidates) {
     const work = await requeueFailedWorkForDemand(db, { demand, now: effectiveNow });
-    if (!work.requeued) continue;
     await db.creatorFanRefreshDemand.update({
       where: { id: demand.id },
       data: {
@@ -975,9 +976,9 @@ async function advanceCampaignFanRefreshDemandsSetBased({ db, agencyId, creatorI
             WHEN d."requestedFreshnessCutoffAt" < $4 THEN d."requestedRevision" + 1
             ELSE d."requestedRevision"
           END,
-          "status" = 'QUEUED',
+          "status" = CASE WHEN d."status"='FAILED' THEN 'FAILED' ELSE 'QUEUED' END,
           "lastRequestedAt" = $5,
-          "lastError" = NULL,
+          "lastError" = CASE WHEN d."status"='FAILED' THEN d."lastError" ELSE NULL END,
           "activeRefreshJobId" = c."retainedRefreshJobId",
           "activeRefreshRevision" = CASE
             WHEN c."retainedRefreshJobId" IS NULL THEN NULL
@@ -986,9 +987,9 @@ async function advanceCampaignFanRefreshDemandsSetBased({ db, agencyId, creatorI
           "updatedAt" = $5
       FROM candidate c
       WHERE d."id" = c."id"
-      RETURNING d."id", d."onlyFansUserId", d."requestedRevision", d."activeRefreshJobId", d."activeRefreshRevision"
+      RETURNING d."id", d."onlyFansUserId", d."requestedRevision", d."activeRefreshJobId", d."activeRefreshRevision", d."status", d."lastError"
     )
-    SELECT "id", "onlyFansUserId", "requestedRevision", "activeRefreshJobId", "activeRefreshRevision"
+    SELECT "id", "onlyFansUserId", "requestedRevision", "activeRefreshJobId", "activeRefreshRevision", "status", "lastError"
     FROM demand_update
     ORDER BY "id" ASC
   `, creatorId, ids, agencyId, cutoff, scheduledAt);
@@ -1058,7 +1059,7 @@ async function bindDemandRefreshJobSetBased({ db, demandIds, revisions, refreshJ
   };
 }
 
-async function scheduleDemandRefreshJob({ db, job, demands, scheduledAt, planner = null }) {
+async function scheduleDemandRefreshJob({ db, job, demands, scheduledAt, planner = null, signalDeferred = true }) {
   const rows = (Array.isArray(demands) ? demands : []).filter((row) => row?.demand?.id && row?.fanId && Number(row?.revision || 0) >= 1);
   if (!rows.length) return null;
   if (rows.length > CAMPAIGN_FAN_REFRESH_JOB_MAX) throw new Error("CAMPAIGN_FAN_REFRESH_DEMAND_BATCH_TOO_LARGE");
@@ -1084,7 +1085,7 @@ async function scheduleDemandRefreshJob({ db, job, demands, scheduledAt, planner
       where: { demandId: { in: demandIds }, status: WORK_STATUS.QUEUED },
       data: { refreshJobId: null },
     });
-    await signalCampaignFanRefreshPromotion({ db, agencyId, creatorId, dueAt: scheduledAt, reason: "CAPACITY_DEFERRED" });
+    if (signalDeferred) await signalCampaignFanRefreshPromotion({ db, agencyId, creatorId, dueAt: scheduledAt, reason: "CAPACITY_DEFERRED" });
     return null;
   }
   const planRefreshJob = planner || require("./job-planning-repository").ensurePlannedJob;
@@ -1149,8 +1150,8 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
   const runId = clean(scanRunId, 120);
   const runStartedAt = asDate(scanStartedAt);
   const scheduledAt = asDate(now) || new Date();
-  const cutoff = new Date(runStartedAt.getTime() - CAMPAIGN_FAN_VALUE_FRESHNESS_MS);
   if (!db || !creatorId || !agencyId || !campaignJobId || !runId || !runStartedAt) throw new Error("CAMPAIGN_FAN_REFRESH_QUEUE_SCOPE_INVALID");
+  const cutoff = new Date(scheduledAt.getTime() - CAMPAIGN_FAN_VALUE_FRESHNESS_MS + 1);
   if (!_campaignLockHeld && typeof db?.$transaction === "function") {
     return withCampaignTransactionLock({
       db,
@@ -1202,7 +1203,9 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
     return { expected: 0, alreadyFresh: 0, queued: 0, scheduled: 0, deduped: normalized.length, fanIds: [] };
   }
 
-  const fresh = newCandidates.filter((row) => row.embeddedValueAvailable || campaignFanRefreshIsFresh(row.valueObservedAt, cutoff));
+  // Even embedded values may come from an aged read lease. Only committed
+  // canonical observation time proves freshness at this page's admission.
+  const fresh = newCandidates.filter((row) => campaignFanRefreshIsFresh(row.valueObservedAt, cutoff, scheduledAt));
   const stale = newCandidates.filter((row) => !fresh.includes(row));
   let freshCreated = 0;
   if (fresh.length) {
@@ -1249,9 +1252,9 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
         if (!fanId || !demandId) throw new Error("CAMPAIGN_FAN_REFRESH_DEMAND_CREATE_FAILED");
         const revision = Math.max(1, Number(demand?.requestedRevision || 1));
         const activeRefreshJobId = clean(demand?.activeRefreshJobId, 180);
-        demandRows.set(fanId, { demand: { id: demandId }, revision, activeRefreshJobId });
+        demandRows.set(fanId, { demand, revision, activeRefreshJobId });
         if (activeRefreshJobId) coalesced.push(fanId);
-        else needsJob.push(fanId);
+        else if (demand.status !== DEMAND_STATUS.FAILED) needsJob.push(fanId);
       }
     } else {
       // Compatibility path for the older in-memory transaction adapters used by
@@ -1275,15 +1278,15 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
             agencyId, creatorId, onlyFansUserId: row.onlyFansUserId,
             requestedFreshnessCutoffAt: maxDate(existing.requestedFreshnessCutoffAt, cutoff) || cutoff,
             requestedRevision: revision,
-            status: DEMAND_STATUS.QUEUED,
+            status: existing.status === DEMAND_STATUS.FAILED ? DEMAND_STATUS.FAILED : DEMAND_STATUS.QUEUED,
             lastRequestedAt: scheduledAt,
-            lastError: null,
+            lastError: existing.status === DEMAND_STATUS.FAILED ? existing.lastError : null,
             ...(active ? {} : { activeRefreshJobId: null, activeRefreshRevision: null }),
           },
         });
         demandRows.set(row.onlyFansUserId, { demand, revision, activeRefreshJobId: active ? existing.activeRefreshJobId : null });
         if (active) coalesced.push(row.onlyFansUserId);
-        else needsJob.push(row.onlyFansUserId);
+        else if (existing.status !== DEMAND_STATUS.FAILED) needsJob.push(row.onlyFansUserId);
       }
     }
   }
@@ -1302,19 +1305,24 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
   }
 
   let staleCreated = 0;
+  let failedCreated = 0;
   if (stale.length) {
     const created = await db.creatorCampaignFanRefreshWork.createMany({
       data: stale.map((row) => {
         const info = demandRows.get(row.onlyFansUserId);
+        const failed = info?.demand?.status === DEMAND_STATUS.FAILED;
         return {
           agencyId, creatorId, scanRunId: runId, scanStartedAt: runStartedAt, onlyFansUserId: row.onlyFansUserId,
           campaignJobId, refreshJobId: info?.activeRefreshJobId || null, demandId: info?.demand?.id || null,
-          requestedRevision: info?.revision || 1, freshnessCutoffAt: cutoff, status: WORK_STATUS.QUEUED, scheduledAt,
+          requestedRevision: info?.revision || 1, freshnessCutoffAt: cutoff, status: failed ? WORK_STATUS.FAILED : WORK_STATUS.QUEUED, scheduledAt,
+          ...(failed ? { outcome: WORK_STATUS.FAILED, lastError: info.demand.lastError, completedAt: scheduledAt } : {}),
         };
       }),
       skipDuplicates: true,
     });
     staleCreated = Number(created?.count || 0);
+    if (staleCreated !== stale.length) throw new Error("CAMPAIGN_FAN_REFRESH_WORK_CREATE_RACE");
+    failedCreated = stale.filter(row => demandRows.get(row.onlyFansUserId)?.demand?.status === DEMAND_STATUS.FAILED).length;
   }
 
   await incrementCoverage(db, {
@@ -1322,7 +1330,8 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
     expected: freshCreated + staleCreated,
     alreadyFresh: freshCreated,
     queued: staleCreated,
-    outstanding: staleCreated,
+    outstanding: staleCreated - failedCreated,
+    failed: failedCreated,
     now: scheduledAt,
     coverageAuthority,
   });
@@ -1341,24 +1350,29 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
   };
 }
 
-async function promoteQueuedCampaignFanRefreshDemands({ db, creatorId, now = null, maxJobs = 4, planner = null, inTransaction = false, _campaignLockHeld = false } = {}) {
+async function promoteQueuedCampaignFanRefreshDemands({ db, creatorId, now = null, maxJobs = 4, planner = null, inTransaction = false, _campaignLockHeld = false, signalDeferred = true } = {}) {
   const scopedCreatorId = clean(creatorId, 180);
   if (!scopedCreatorId) return { promotedJobs: 0, promotedFans: 0, reason: "creator_required" };
   if (!inTransaction && typeof db?.$transaction === "function") {
     return runDbTransaction(db, (tx) => promoteQueuedCampaignFanRefreshDemands({
-      db: tx, creatorId: scopedCreatorId, now, maxJobs, planner, inTransaction: true, _campaignLockHeld,
+      db: tx, creatorId: scopedCreatorId, now, maxJobs, planner, inTransaction: true, _campaignLockHeld, signalDeferred,
     }), { maxWait: 30_000, timeout: 60_000 });
   }
   if (!db?.creatorFanRefreshDemand?.findMany || !db?.jobInstance) return { promotedJobs: 0, promotedFans: 0, reason: "adapter_unsupported" };
   if (!_campaignLockHeld) await acquireCampaignTransactionLock(db, scopedCreatorId);
   const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
   const limit = Math.max(1, Math.min(16, Number(maxJobs) || 4));
-  const pending = await db.creatorFanRefreshDemand.findMany({
+  // Literal eligibility predicates retain the partial-index plan even after
+  // PostgreSQL switches prepared statements to a generic plan.
+  const pending = typeof db.$queryRawUnsafe === "function" ? await db.$queryRawUnsafe(`
+    SELECT * FROM "CreatorFanRefreshDemand"
+    WHERE "creatorId"=$1 AND "status"='QUEUED' AND "activeRefreshJobId" IS NULL
+    ORDER BY "lastRequestedAt","id" LIMIT $2
+  `,scopedCreatorId,limit * CAMPAIGN_FAN_REFRESH_JOB_MAX) : await db.creatorFanRefreshDemand.findMany({
     where: {
       creatorId: scopedCreatorId,
       status: DEMAND_STATUS.QUEUED,
       activeRefreshJobId: null,
-      campaignWork: { some: { status: WORK_STATUS.QUEUED } },
     },
     orderBy: [{ lastRequestedAt: "asc" }, { id: "asc" }],
     take: limit * CAMPAIGN_FAN_REFRESH_JOB_MAX,
@@ -1380,6 +1394,7 @@ async function promoteQueuedCampaignFanRefreshDemands({ db, creatorId, now = nul
       demands: batch,
       scheduledAt: effectiveNow,
       planner,
+      signalDeferred,
     });
     if (!refreshJobId) break;
     promotedJobs += 1;
@@ -1491,14 +1506,9 @@ async function runCampaignFanRefreshPromotionMaintenance({
         // creator authority is held; every final signal mutation is token-guarded.
         await acquireCampaignTransactionLock(tx, creatorId);
         const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
-        const current = await tx.campaignFanRefreshPromotionSignal.findFirst({
-          where: {
-            id: signal.id,
-            claimToken: signal.claimToken,
-            claimUntil: { gt: authorityNow },
-            revision: Number(signal.revision || 0),
-          },
-        });
+        const [current] = await tx.$queryRawUnsafe(`SELECT * FROM "CampaignFanRefreshPromotionSignal"
+          WHERE "id"=$1 AND "claimToken"=$2 AND "claimUntil">"phase3_utc_timestamp"($3::timestamptz) AND "revision"=$4`,
+        signal.id,signal.claimToken,authorityNow,Number(signal.revision || 0));
         if (!current) {
           // The lease expired or a producer incremented revision after claim.
           // Release only our token; preserve the producer-owned dueAt/revision.
@@ -1509,32 +1519,34 @@ async function runCampaignFanRefreshPromotionMaintenance({
           return { stale: true };
         }
 
-        const healed = await healExistingCanonicalCampaignDebt({ db: tx, creatorId, now: authorityNow, limit: 500 });
+        const healed = await healExistingCanonicalCampaignDebt({ db: tx, creatorId, now: authorityNow, limit: 500, afterId: current.healAfterId });
+        await tx.$executeRawUnsafe('UPDATE "CampaignFanRefreshPromotionSignal" SET "healAfterId"=$2 WHERE "id"=$1 AND "claimToken"=$3',signal.id,healed.nextCursor,signal.claimToken);
         const recovered = await recoverFailedCampaignFanRefreshDemands({
           db: tx, creatorId, now: authorityNow, force: false, maxDemands: 500,
           _transactionWrapped: true, _campaignLockHeld: true,
         });
         const promoted = await promoteQueuedCampaignFanRefreshDemands({
           db: tx, creatorId, now: authorityNow, maxJobs: maxJobsPerCreator, inTransaction: true, _campaignLockHeld: true,
+          // This claimant owns the retry schedule below. Re-signalling itself
+          // would invalidate its own revision and spin immediately under load.
+          signalDeferred: false,
         });
-        const [queuedCount, failedDueCount, nextFailed] = await Promise.all([
-          tx.creatorFanRefreshDemand.count({ where: { creatorId, status: DEMAND_STATUS.QUEUED, activeRefreshJobId: null } }),
-          tx.creatorFanRefreshDemand.count({ where: { creatorId, status: DEMAND_STATUS.FAILED, activeRefreshJobId: null, quarantinedAt: null, nextRetryAt: { lte: authorityNow } } }),
-          tx.creatorFanRefreshDemand.findFirst({
-            where: { creatorId, status: DEMAND_STATUS.FAILED, activeRefreshJobId: null, quarantinedAt: null, nextRetryAt: { gt: authorityNow } },
-            orderBy: { nextRetryAt: "asc" }, select: { nextRetryAt: true },
-          }),
-        ]);
+        const [debt] = await tx.$queryRawUnsafe(`SELECT
+          EXISTS(SELECT 1 FROM "CreatorFanRefreshDemand" WHERE "creatorId"=$1 AND "status"='QUEUED' AND "activeRefreshJobId" IS NULL) AS queued,
+          EXISTS(SELECT 1 FROM "CreatorFanRefreshDemand" WHERE "creatorId"=$1 AND "status"='FAILED' AND "activeRefreshJobId" IS NULL
+            AND "quarantinedAt" IS NULL AND "nextRetryAt"<="phase3_utc_timestamp"($2::timestamptz)) AS "failedDue",
+          (SELECT "nextRetryAt" FROM "CreatorFanRefreshDemand" WHERE "creatorId"=$1 AND "status"='FAILED' AND "activeRefreshJobId" IS NULL
+            AND "quarantinedAt" IS NULL AND "nextRetryAt">"phase3_utc_timestamp"($2::timestamptz) ORDER BY "nextRetryAt","id" LIMIT 1) AS "nextRetryAt"`,creatorId,authorityNow);
         let signalMutation;
-        if (queuedCount > 0 || failedDueCount > 0 || healed.healedFans >= 500) {
+        if (debt.queued || debt.failedDue || healed.nextCursor) {
           signalMutation = await tx.campaignFanRefreshPromotionSignal.updateMany({
             where: { id: signal.id, claimToken: signal.claimToken, revision: Number(signal.revision || 0) },
             data: { dueAt: new Date(authorityNow.getTime() + 5_000), claimToken: null, claimUntil: null, attempts: { increment: 1 }, lastError: null },
           });
-        } else if (nextFailed?.nextRetryAt) {
+        } else if (debt.nextRetryAt) {
           signalMutation = await tx.campaignFanRefreshPromotionSignal.updateMany({
             where: { id: signal.id, claimToken: signal.claimToken, revision: Number(signal.revision || 0) },
-            data: { dueAt: nextFailed.nextRetryAt, claimToken: null, claimUntil: null, attempts: 0, lastError: null },
+            data: { dueAt: debt.nextRetryAt, claimToken: null, claimUntil: null, attempts: 0, lastError: null },
           });
         } else {
           signalMutation = await tx.campaignFanRefreshPromotionSignal.deleteMany({
@@ -1820,7 +1832,7 @@ async function recordCampaignFanRefreshChunk({ db, job, chunkResult, applied: pr
   for (const demand of demands) {
     const value = currentByFan.get(String(demand.onlyFansUserId));
     const observedAt = asDate(value?.valueObservedAt);
-    if (!observedAt || !campaignFanRefreshIsFresh(observedAt, demand.requestedFreshnessCutoffAt)) continue;
+    if (!observedAt || !campaignFanRefreshIsFresh(observedAt, demand.requestedFreshnessCutoffAt, now)) continue;
     const outcome = String(value?.availability || "").toUpperCase() === "AVAILABLE" ? WORK_STATUS.SUCCEEDED : WORK_STATUS.UNAVAILABLE;
     await db.creatorFanRefreshDemand.update({
       where: { id: demand.id },

@@ -4,6 +4,7 @@ const express = require("express");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { requireAuthDevice } = require("../middleware/auth");
+const { CampaignTraversalError } = require("../services/campaign-traversal-authority-service");
 const {
   JobLeaseError,
   claimJob,
@@ -29,6 +30,7 @@ const JOB_SERVER_CAPABILITIES = Object.freeze({
   campaignFrontierSchedulingV1: true,
   campaignDirectoryReuseV1: true,
   campaignBoundedTraversalV1: true,
+  campaignTraversalAuthorityV1: true,
 });
 
 router.use((req, res, next) => {
@@ -62,7 +64,7 @@ function validationError(res, error) {
 }
 
 function leaseError(res, error) {
-  if (error instanceof JobLeaseError) {
+  if (error instanceof JobLeaseError || error instanceof CampaignTraversalError) {
     return res.status(error.status || 409).json({
       ok: false,
       code: error.code,
@@ -104,6 +106,7 @@ const claimSchema = z.object({
     campaignFrontierSchedulingV1: z.boolean().optional().default(false),
     campaignDirectoryReuseV1: z.boolean().optional().default(false),
     campaignBoundedTraversalV1: z.boolean().optional().default(false),
+    campaignTraversalAuthorityV1: z.boolean().optional().default(false),
   }).passthrough().optional().default({}),
 });
 
@@ -116,6 +119,7 @@ const leaseMutationSchema = z.object({
   progress: progressSchema,
   continuation: z.unknown().optional(),
   chunkResult: z.unknown().optional(),
+  expectedContinuation: z.unknown().optional(),
 });
 
 
@@ -134,6 +138,8 @@ const observationReadLeaseAcquireSchema = z.object({
   leaseRevision: leaseRevisionSchema,
   purpose: z.string().min(1).max(120),
   requestId: z.string().min(16).max(200),
+  campaignPage: z.object({ externalCampaignId: z.string().min(1).max(220),
+    pageNumber: z.number().int().min(1).max(2147483647), sourceOffset: z.number().int().min(0).max(2147483647) }).optional(),
 });
 
 const observationReadLeaseReleaseSchema = z.object({
@@ -225,6 +231,7 @@ router.post("/:id/observation-read-lease/acquire", async (req, res, next) => {
       leaseRevision: input.leaseRevision,
       purpose: input.purpose,
       requestId: input.requestId,
+      campaignPage: input.campaignPage,
     });
     return res.json({ ok: true, ...lease });
   } catch (error) {
@@ -285,6 +292,7 @@ router.post("/:id/progress", async (req, res, next) => {
       progress: input.progress,
       continuation: input.continuation,
       chunkResult: input.chunkResult,
+      expectedContinuation: input.expectedContinuation,
     });
     return res.json({ ok: true, lease });
   } catch (error) {

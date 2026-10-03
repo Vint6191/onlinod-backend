@@ -184,6 +184,7 @@ function topologyRecoveryDb(rawResult, counter) {
       assert.equal(creatorId, "c1");
       assert.ok(limit >= 1);
       assert.match(sql, /d\."creatorId" = \$3/);
+      assert.match(sql, /ORDER BY d\."nextRetryAt" ASC, d\."id" ASC[\s\S]*FOR UPDATE SKIP LOCKED/);
       assert.doesNotMatch(sql, /ANY\(\$5::text\[\]\)|SELECT DISTINCT d\."creatorId"/);
       return [rawResult];
     },
@@ -226,7 +227,6 @@ test("A20.3 failed-demand recovery fails closed on current coverage counter mism
 test("A20.3 source has deterministic set-based queue/recovery locking and no production per-demand binding loop", () => {
   const source = fs.readFileSync(path.join(__dirname, "campaign-fan-refresh-queue-service.js"), "utf8");
   assert.match(source, /advanceCampaignFanRefreshDemandsSetBased[\s\S]*ORDER BY d\."id" ASC[\s\S]*FOR UPDATE OF d/);
-  assert.match(source, /recoverFailedCampaignFanRefreshDemandsSetBased[\s\S]*ORDER BY COALESCE[\s\S]*FOR UPDATE SKIP LOCKED/);
   assert.match(source, /failed_work AS \([\s\S]*ORDER BY w\."id" ASC[\s\S]*FOR UPDATE OF w/);
   assert.match(source, /bindDemandRefreshJobSetBased[\s\S]*work_update AS/);
   assert.match(source, /supportsSetBasedCampaignFanRefreshQueue\(db\)/);

@@ -47,6 +47,10 @@ async function acceptAnalyticsPublication({ db, job, userId, deviceId, leaseToke
   const existing = await db.analyticsPublication.findUnique({ where: { jobId_leaseRevision: { jobId: job.id, leaseRevision } } });
   if (existing) return assertReplay(existing, { userId, deviceId, leaseToken, leaseRevision, result });
   const payload = result || {};
+  if (job.jobKey === "fetch_campaigns") {
+    require("./campaign-traversal-authority-service").assertCompletion(job, payload);
+    await require("./campaign-causal-activation-service").enterCampaignBoundedExecution({ db });
+  }
   if (Buffer.byteLength(canonical(payload), "utf8") > 128 * 1024) throw fault("ANALYTICS_COMPLETION_TOO_LARGE", 400);
   if (job.jobKey === "fetch_earnings") earningsInput(job, payload);
   else if (job.jobKey === "fetch_campaigns") require("./creator-analytics-ledger-service").validateCampaignCompletion(job, payload);

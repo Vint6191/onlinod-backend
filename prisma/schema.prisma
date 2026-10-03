@@ -2107,6 +2107,7 @@ model CreatorFinancialCollectionState {
 }
 
 model CampaignFanRefreshPromotionSignal {
+  healAfterId String @default("") @db.VarChar(180)
   id         String    @id @default(cuid())
   agencyId   String
   creatorId  String    @unique
@@ -3240,6 +3241,10 @@ model CreatorCampaign {
   claimersNextDueAt              DateTime?
   claimersTargetRunId            String?   @db.VarChar(120)
   claimersLastVerifiedRunId      String?   @db.VarChar(120)
+  claimersTraversalRunId         String?   @db.VarChar(120)
+  claimersTraversalStartedAt     DateTime?
+  claimersTraversalRevision      Int?
+  claimersTraversalRejectedRows  Int       @default(0)
   sourceScanRunId                String?
   sourceScanStartedAt            DateTime?
   collectedAt                    DateTime  @default(now())

@@ -159,5 +159,26 @@
     "unique": false,
     "expression": "\"creatorId\",\"sourceScanRunId\",\"sourceScanStartedAt\",\"claimersNextDueAt\",\"externalCampaignId\"",
     "where": "\"claimersObservationVersion\" < 1"
+  },
+  {
+    "name": "Campaign_fan_refresh_ready_v1",
+    "table": "CreatorFanRefreshDemand",
+    "unique": false,
+    "expression": "\"creatorId\",\"lastRequestedAt\",\"id\"",
+    "where": "\"status\" = 'QUEUED' AND \"activeRefreshJobId\" IS NULL"
+  },
+  {
+    "name": "Campaign_fan_refresh_retry_v1",
+    "table": "CreatorFanRefreshDemand",
+    "unique": false,
+    "expression": "\"creatorId\",\"nextRetryAt\",\"id\"",
+    "where": "\"status\" = 'FAILED' AND \"activeRefreshJobId\" IS NULL AND \"quarantinedAt\" IS NULL AND \"nextRetryAt\" IS NOT NULL"
+  },
+  {
+    "name": "Campaign_fan_refresh_heal_v1",
+    "table": "CreatorFanRefreshDemand",
+    "unique": false,
+    "expression": "\"creatorId\",\"id\"",
+    "where": "\"status\"::text = ANY (ARRAY['QUEUED'::text,'FAILED'::text])"
   }
 ]
