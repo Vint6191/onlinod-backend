@@ -50,7 +50,10 @@ function reuseDb() {
   let segmentReads = 0;
   let upserts = 0;
   const db = {
-    async $executeRawUnsafe(sql) { assert.match(sql, /pg_advisory_xact_lock/); return 1; },
+    async $executeRawUnsafe(sql) {
+      if (sql === "SELECT set_config('onlinod.campaign_observation_version', '1', true)") return 1;
+      assert.match(sql, /pg_advisory_xact_lock/); return 1;
+    },
     creatorCampaignCollectionState: {
       findUnique: async () => ({ ...state }),
       upsert: async ({ update }) => { upserts += 1; Object.assign(state, update); return { ...state }; },
@@ -113,7 +116,10 @@ test("INT5.9A-9 same SCANNING Campaign generation is replay, not destructive rei
     fanValueExpected: 77, campaignFrontierTargetCount: 50,
   };
   const db = {
-    async $executeRawUnsafe(sql) { assert.match(sql, /pg_advisory_xact_lock/); return 1; }, creatorCampaignCollectionState: {
+    async $executeRawUnsafe(sql) {
+      if (sql === "SELECT set_config('onlinod.campaign_observation_version', '1', true)") return 1;
+      assert.match(sql, /pg_advisory_xact_lock/); return 1;
+    }, creatorCampaignCollectionState: {
     findUnique: async () => ({ ...existing }),
     upsert: async () => { upserts += 1; throw new Error("must not reinitialize current SCANNING generation"); },
   } };
@@ -183,7 +189,11 @@ test("INT5.9A-9 stale reuse claimer write fails before collection generation acc
     activeRequestedAt: new Date("2026-09-18T19:00:00.000Z"),
   };
   const db = {
-    async $executeRawUnsafe(sql) { assert.match(sql, /pg_advisory_xact_lock/); return 1; },
+    analyticsIngestBatch: { findUnique: async () => null },
+    async $executeRawUnsafe(sql) {
+      if (sql === "SELECT set_config('onlinod.campaign_observation_version', '1', true)") return 1;
+      assert.match(sql, /pg_advisory_xact_lock/); return 1;
+    },
     creatorCampaignCollectionState: {
       findUnique: async () => ({ ...state }),
       upsert: async () => { stateUpserts += 1; throw new Error("stale reuse must fail before generation acceptance"); },
@@ -215,7 +225,11 @@ test("INT5.9A-9 non-target claimer write fails before collection generation acce
     activeRequestedAt: new Date("2026-09-18T19:00:00.000Z"),
   };
   const db = {
-    async $executeRawUnsafe(sql) { assert.match(sql, /pg_advisory_xact_lock/); return 1; },
+    analyticsIngestBatch: { findUnique: async () => null },
+    async $executeRawUnsafe(sql) {
+      if (sql === "SELECT set_config('onlinod.campaign_observation_version', '1', true)") return 1;
+      assert.match(sql, /pg_advisory_xact_lock/); return 1;
+    },
     creatorCampaignCollectionState: {
       findUnique: async () => ({ ...state }),
       upsert: async () => { stateUpserts += 1; throw new Error("non-target write must fail before generation acceptance"); },

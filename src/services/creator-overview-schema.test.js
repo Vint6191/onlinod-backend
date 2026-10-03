@@ -108,7 +108,7 @@ test("collector read states use one COMPLETE PROVEN FRESH vocabulary without col
   assert.match(service, /evaluateDurableCollectorState/);
   assert.match(service, /NOTIFICATION_COLLECTION_FRESHNESS_MS/);
   assert.match(service, /FINANCIAL_COLLECTION_FRESHNESS_MS/);
-  assert.match(service, /CAMPAIGN_COLLECTION_FRESHNESS_MS/);
+  assert.match(service, /evaluateCampaignCollectionState\(campaignCollectionState, now\)/);
   assert.match(service, /collectors:\s*\{/);
   assert.match(service, /financial: collectorStatePayload\(financialCollection\)/);
   assert.match(service, /campaigns: collectorStatePayload\(campaignCollection\)/);

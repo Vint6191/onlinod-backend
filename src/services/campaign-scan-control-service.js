@@ -1,4 +1,5 @@
 "use strict";
+const { evaluateCampaignCollectionState } = require("./campaign-freshness-service");
 
 
 const crypto = require("node:crypto");
@@ -351,6 +352,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 50, offset
     campaignFrontierDeferred,
     campaignFrontierOldestDueAt: iso(collectionState?.campaignFrontierOldestDueAt),
     campaignFrontierNextDueAt: iso(collectionState?.campaignFrontierNextDueAt),
+    currentSourceFreshness: evaluateCampaignCollectionState(collectionState, capacityNow),
     campaignMembershipCoverageStatus: membershipCoverageStatus,
     campaignDirectoryDiscoveryStatus: directoryDiscovery.status,
     campaignDirectoryDiscoveryDueAt: iso(directoryDiscovery.dueAt),

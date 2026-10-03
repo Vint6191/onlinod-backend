@@ -89,7 +89,16 @@ async function campaignCausalV1State({ db = prisma, lockForCommit = false } = {}
 // write and rejects sessions whose transaction-local generation marker does not
 // equal the activated writer generation. Old Backend binaries never set this GUC
 // and therefore fail closed after writerGenerationActive becomes true.
+async function enterCampaignObservationWriter({ db = prisma } = {}) {
+  // Observation-version triggers invalidate frontier proofs written by older
+  // binaries during a rolling deploy. This marker is transaction-local.
+  if (typeof db.$executeRawUnsafe === "function") {
+    await db.$executeRawUnsafe("SELECT set_config('onlinod.campaign_observation_version', '1', true)");
+  }
+}
+
 async function enterCampaignWriterGeneration({ db = prisma } = {}) {
+  await enterCampaignObservationWriter({ db });
   if (typeof db.$queryRawUnsafe !== "function") {
     const state = await campaignCausalV1State({ db, lockForCommit: false });
     if (state.writerGenerationActive) throw new Error("CAMPAIGN_WRITER_GENERATION_SESSION_UNAVAILABLE");
@@ -389,6 +398,7 @@ module.exports = {
   CAMPAIGN_CLAIM_FENCE_MIGRATION,
   campaignCausalV1State,
   enterCampaignWriterGeneration,
+  enterCampaignObservationWriter,
   enterCampaignClaimGeneration,
   assertCampaignActivationPhysicalFences,
   retryableActivationError,

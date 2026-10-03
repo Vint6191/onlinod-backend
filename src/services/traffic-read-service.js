@@ -1,6 +1,7 @@
 "use strict";
 const { readWithAnalyticsViewer } = require("./analytics-viewer-read-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { CAMPAIGN_COVERAGE_SELECT, evaluateCampaignCollectionState } = require("./campaign-freshness-service");
 const DAY = 86400000, UNKNOWN = "unattributed_paid_subscriptions";
 const fault = (code, status = 400) => Object.assign(new Error(code), { code, status });
 const day = at => at.toISOString().slice(0, 10);
@@ -41,15 +42,15 @@ async function revenue(db, scope, kind, ids, range) {
       AND "period">=$5 AND "period"<$6 GROUP BY "objectId"`, scope.agencyId, scope.id, kind, ids, range.startAt.slice(0, 10), range.endAt.slice(0, 10));
   return new Map(rows.map(r => [r.objectId, { revenueCents: num(r.revenue), paidSubscriptions: num(r.count) }]));
 }
-async function freshness(db, creator) {
+async function freshness(db, creator, now) {
   const state = await db.trafficProjectionBackfill.findUnique({ where: { creatorId: creator.id } });
   const pending = await db.domainWorkItem.findFirst({ where: { agencyId: creator.agencyId, creatorId: creator.id,
     workClass: { in: ["TRAFFIC_FAN", "TRAFFIC_BACKFILL"] }, isOutstanding: true }, select: { id: true, state: true, lastError: true } });
   const coverage = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: creator.id }, select: {
-    status: true, membershipCoverageStatus: true, baselineVerifiedAt: true, lastCatchupCompletedAt: true,
-    membershipCoverageCompletedAt: true, membershipObservedAt: true, baselineObservedAt: true, lastCatchupObservedAt: true, fanValueFreshnessStatus: true, retryAfterAt: true,
+    ...CAMPAIGN_COVERAGE_SELECT, membershipCoverageCompletedAt: true,
   } });
   return { providerCoverage: coverage, ready: Boolean(state?.completedAt) && !pending, rebuilding: !state?.completedAt,
+    providerFreshness: evaluateCampaignCollectionState(coverage, now),
     pending: Boolean(pending), failure: pending?.state === "RECONCILE_REQUIRED" ? pending.lastError : null,
     providerAuthority: "CAMPAIGNS", valueAuthority: "FAN_DATA_CURRENT", projectionVersion: 2 };
 }
@@ -58,7 +59,7 @@ async function readSnapshot(db, input, reader) {
     const now = await dbAuthorityNow({ db: tx });
     const result = await reader(tx, creator, rangeWindow(input.rangeKey, now));
     return { ok: true, contractVersion: 2, creatorId: creator.id, asOf: now.toISOString(), ...result,
-      projection: await freshness(tx, creator) };
+      projection: await freshness(tx, creator, now) };
   });
 }
 function rowFor(source, value = {}, rev = {}) {

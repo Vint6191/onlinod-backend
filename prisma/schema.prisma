@@ -2235,6 +2235,7 @@ model CreatorCampaignCollectionState {
   fanValueOutstanding                         Int                     @default(0)
   fanValueCoverageUpdatedAt                   DateTime?
   campaignFrontierPlanRunId                   String?                 @db.VarChar(120)
+  campaignFrontierObservationVersion          Int                     @default(0)
   campaignFrontierFreshnessStatus             AnalyticsCoverageStatus @default(MISSING)
   campaignFrontierDueCount                    Int                     @default(0)
   campaignFrontierTargetCount                 Int                     @default(0)
@@ -3232,6 +3233,7 @@ model CreatorCampaign {
   claimerRevision                Int       @default(1)
   claimerVerifiedRevision        Int       @default(0)
   claimersVerifiedAt             DateTime?
+  claimersObservationVersion     Int       @default(0)
   claimersNextDueAt              DateTime?
   claimersTargetRunId            String?   @db.VarChar(120)
   claimersLastVerifiedRunId      String?   @db.VarChar(120)

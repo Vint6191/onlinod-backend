@@ -21,7 +21,11 @@ test("INT5.9A-8 decouples provider traversal success from delegated FanData fres
 
 test("INT5.9A-8 planner refuses a second Campaign provider job while delegated refresh is outstanding", () => {
   assert.match(orchestrator, /function campaignDelegatedRefreshPending\(state\)/);
-  assert.match(orchestrator, /coverageRunId === activeGeneration && expected > 0 && freshness !== "COMPLETE"/);
+  assert.match(orchestrator, /campaignFreshness\.fanRefreshPending\(state\)/);
+  const { fanRefreshPending } = require("./campaign-freshness-service");
+  assert.equal(fanRefreshPending({ activeGeneration: "g", fanValueCoverageScanRunId: "g", fanValueExpected: 2, fanValueFreshnessStatus: "QUEUED" }), true);
+  assert.equal(fanRefreshPending({ activeGeneration: "g", fanValueCoverageScanRunId: "old", fanValueExpected: 2, fanValueFreshnessStatus: "QUEUED" }), false);
+  assert.equal(fanRefreshPending({ activeGeneration: "g", fanValueCoverageScanRunId: "g", fanValueExpected: 2, fanValueFreshnessStatus: "COMPLETE" }), false);
   assert.match(orchestrator, /campaigns_catchup:fan_refresh_pending/);
   assert.match(orchestrator, /reason: "fan_refresh_pending"/);
   assert.match(orchestrator, /sideEffect\?\.completion\?\.complete !== true/);

@@ -18,6 +18,8 @@ function positiveMs(value, fallback) {
 
 const NOTIFICATION_COLLECTION_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANALYTICS_NOTIFICATION_CATCHUP_MS, 3 * 60 * 60 * 1000);
 const FINANCIAL_COLLECTION_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANALYTICS_FINANCIAL_CATCHUP_MS, 24 * 60 * 60 * 1000);
+// Campaign command dedupe bucket. Actual freshness uses independent directory
+// and active/inactive frontier deadlines, shared by readers and the planner.
 const CAMPAIGN_COLLECTION_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANALYTICS_CAMPAIGN_CATCHUP_MS, 60 * 60 * 1000);
 const CAMPAIGN_FAN_VALUE_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANALYTICS_CAMPAIGN_FAN_VALUE_FRESHNESS_MS, 6 * 60 * 60 * 1000);
 const CAMPAIGN_ACTIVE_FRONTIER_FRESHNESS_MS = positiveMs(process.env.CREATOR_ANALYTICS_CAMPAIGN_ACTIVE_FRONTIER_FRESHNESS_MS, 6 * 60 * 60 * 1000);

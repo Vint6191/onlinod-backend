@@ -4,11 +4,11 @@ const prisma = require("../prisma");
 const { readCreatorLedgerOverview } = require("./creator-analytics-ledger-service");
 const { normalizeCreatorOverviewRangeKey } = require("./analytics-range-contract");
 const { evaluateDurableCollectorState, stateVocabulary } = require("./analytics-state-evaluator");
+const { evaluateCampaignCollectionState } = require("./campaign-freshness-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const {
   NOTIFICATION_COLLECTION_FRESHNESS_MS,
   FINANCIAL_COLLECTION_FRESHNESS_MS,
-  CAMPAIGN_COLLECTION_FRESHNESS_MS,
   trustedCollectionTimestamp,
 } = require("./analytics-freshness-policy");
 
@@ -277,6 +277,9 @@ function collectorStatePayload(state) {
     state: stateVocabulary(state),
     lastVerifiedAt: iso(state.lastVerifiedAt),
     retryAfterAt: iso(state.retryAfterAt),
+    ...(state.freshnessAuthority ? { freshnessAuthority: state.freshnessAuthority,
+      directoryDue: state.directoryDue, frontierDue: state.frontierDue, fanRefreshPending: state.fanRefreshPending,
+      directoryNextDueAt: iso(state.directoryNextDueAt), frontierNextDueAt: iso(state.frontierNextDueAt) } : {}),
   };
 }
 
@@ -325,17 +328,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     now,
     freshnessMs: FINANCIAL_COLLECTION_FRESHNESS_MS,
   });
-  const campaignCollection = evaluateDurableCollectorState({
-    status: campaignCollectionState?.status,
-    baselineCompletedAt: campaignCollectionState?.baselineVerifiedAt,
-    baselineVerifiedAt: campaignCollectionState?.baselineVerifiedAt,
-    lastVerifiedAt: campaignCollectionState?.lastCatchupCompletedAt,
-    baselineObservedAt: campaignCollectionState?.baselineObservedAt,
-    lastObservedAt: campaignCollectionState?.lastCatchupObservedAt,
-    retryAfterAt: campaignCollectionState?.retryAfterAt,
-    now,
-    freshnessMs: CAMPAIGN_COLLECTION_FRESHNESS_MS,
-  });
+  const campaignCollection = evaluateCampaignCollectionState(campaignCollectionState, now);
   const oldestNotificationAt = ledger.notificationSync?.oldestOccurredAt ? new Date(ledger.notificationSync.oldestOccurredAt) : null;
   const oneYearStart = new Date(now.getTime() - 365 * DAY_MS);
   const accumulatedFromInitialHalfYear = notificationBaselineAt && notificationBaselineAt.getTime() <= now.getTime() - 185 * DAY_MS;

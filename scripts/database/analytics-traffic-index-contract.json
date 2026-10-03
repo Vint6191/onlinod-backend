@@ -138,5 +138,12 @@
     "unique": false,
     "expression": "\"creatorId\",\"id\"",
     "where": null
+  },
+  {
+    "name": "Campaign_frontier_unknown_v1",
+    "table": "CreatorCampaign",
+    "unique": false,
+    "expression": "\"creatorId\",\"sourceScanRunId\",\"claimersNextDueAt\",\"externalCampaignId\"",
+    "where": "\"claimersObservationVersion\" < 1"
   }
 ]

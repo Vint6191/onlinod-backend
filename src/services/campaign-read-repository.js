@@ -2,7 +2,8 @@
 
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { displayRangeBounds } = require("./analytics-range-contract");
-const { CAMPAIGN_FAN_VALUE_FRESHNESS_MS, FINANCIAL_COLLECTION_FRESHNESS_MS, CAMPAIGN_COLLECTION_FRESHNESS_MS, trustedCollectionTimestamp } = require("./analytics-freshness-policy");
+const { CAMPAIGN_FAN_VALUE_FRESHNESS_MS, FINANCIAL_COLLECTION_FRESHNESS_MS, trustedCollectionTimestamp } = require("./analytics-freshness-policy");
+const { CAMPAIGN_COVERAGE_SELECT, evaluateCampaignCollectionState } = require("./campaign-freshness-service");
 const { evaluateDurableCollectorState, stateVocabulary } = require("./analytics-state-evaluator");
 const { RANGES, CLASSES } = require("./campaign-read-projection-service");
 const VERSION = 1;
@@ -74,7 +75,7 @@ async function readiness(db,creatorId,now) {
 async function sourceCoverage(db,creatorId,now) {
   const [financial,campaigns]=await Promise.all([
     db.creatorFinancialCollectionState.findUnique({where:{creatorId},select:{status:true,baselineVerifiedAt:true,lastCatchupCompletedAt:true,baselineObservedAt:true,lastCatchupObservedAt:true,retryAfterAt:true}}),
-    db.creatorCampaignCollectionState.findUnique({where:{creatorId},select:{status:true,baselineVerifiedAt:true,lastCatchupCompletedAt:true,baselineObservedAt:true,lastCatchupObservedAt:true,retryAfterAt:true}}),
+    db.creatorCampaignCollectionState.findUnique({where:{creatorId},select:CAMPAIGN_COVERAGE_SELECT}),
   ]);
   // Provider coverage evidence is separate from processing all locally known
   // facts. READY never fabricates a completed provider scan.
@@ -84,7 +85,12 @@ async function sourceCoverage(db,creatorId,now) {
       lastVerifiedAt:row.lastCatchupCompletedAt,baselineObservedAt:row.baselineObservedAt,lastObservedAt:row.lastCatchupObservedAt,retryAfterAt:row.retryAfterAt,now,freshnessMs});
     return {...row,status:stateVocabulary(state),proven:state.proven,fresh:state.fresh};
   };
-  return {financial:evidence(financial,FINANCIAL_COLLECTION_FRESHNESS_MS),campaigns:evidence(campaigns,CAMPAIGN_COLLECTION_FRESHNESS_MS)};
+  const campaignState=evaluateCampaignCollectionState(campaigns,now);
+  return {financial:evidence(financial,FINANCIAL_COLLECTION_FRESHNESS_MS),campaigns:campaigns?{
+    ...campaigns,status:stateVocabulary(campaignState),proven:campaignState.proven,fresh:campaignState.fresh,
+    due:campaignState.due,freshnessAuthority:campaignState.freshnessAuthority,
+    directoryDue:campaignState.directoryDue,frontierDue:campaignState.frontierDue,fanRefreshPending:campaignState.fanRefreshPending,
+  }:null};
 }
 async function readCampaignPage({db,creatorId,rangeKey:key="all",cursor=null,limit=50,now=null,offset=0}) {
   if(Number(offset)!==0)throw fault("CAMPAIGN_CURSOR_REQUIRED");

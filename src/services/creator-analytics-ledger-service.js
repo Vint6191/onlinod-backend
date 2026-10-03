@@ -1,6 +1,7 @@
 "use strict";
 
 const { observationStartForJob } = require("./analytics-observation-time");
+const { FRONTIER_OBSERVATION_VERSION, frontierDueWhere } = require("./campaign-freshness-service");
 const { runDbTransaction } = require("./db-transaction-service");
 
 
@@ -21,7 +22,7 @@ const {
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { acquireCampaignTransactionLock, withCampaignTransactionLock } = require("./campaign-transaction-lock-service");
 const { consumeFanObservationToken, consumeFanObservationTokensBatch } = require("./fan-observation-token-service");
-const { campaignCausalV1State, enterCampaignWriterGeneration } = require("./campaign-causal-activation-service");
+const { campaignCausalV1State, enterCampaignWriterGeneration, enterCampaignObservationWriter } = require("./campaign-causal-activation-service");
 const { enqueueUniqueCampaignFanRefreshes, campaignFanValueCoverageFromState } = require("./campaign-fan-refresh-queue-service");
 
 const CAMPAIGN_COLLECTOR_VERSION = "campaigns-v13";
@@ -382,9 +383,9 @@ async function inTransaction(db, callback) {
   return runDbTransaction(db, callback, { maxWait: 10_000, timeout: 60_000 });
 }
 
-async function beginBatch(tx, { job, agencyId, creatorId, deviceId, idempotencyKey, dataType, rangeFrom, rangeTo, sourceTimezone = "UTC", collectorVersion, schemaVersion, payload }) {
+async function beginBatch(tx, { job, agencyId, creatorId, deviceId, idempotencyKey, dataType, rangeFrom, rangeTo, sourceTimezone = "UTC", collectorVersion, schemaVersion, payload, existingBatch = undefined }) {
   const payloadChecksum = checksum(payload);
-  const existing = await tx.analyticsIngestBatch.findUnique({ where: { idempotencyKey } });
+  const existing = existingBatch === undefined ? await tx.analyticsIngestBatch.findUnique({ where: { idempotencyKey } }) : existingBatch;
   if (existing) {
     if (existing.payloadChecksum !== payloadChecksum) {
       throw new Error(`Analytics idempotency conflict for ${idempotencyKey}`);
@@ -952,6 +953,21 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     await enterCampaignWriterGeneration({ db: tx });
     await acquireCampaignTransactionLock(tx, job.creatorId);
 
+    // A terminal claimer page clears its target in this same transaction. Lost
+    // responses must be acknowledged from the immutable receipt before target
+    // or directory admission for new work. Replays never accept a generation,
+    // consume an observation token or mutate facts/counters a second time.
+    const existingBatch = await tx.analyticsIngestBatch.findUnique({ where: { idempotencyKey } });
+    if (existingBatch) {
+      if (existingBatch.payloadChecksum !== checksum(payload)) throw new Error(`Analytics idempotency conflict for ${idempotencyKey}`);
+      if (existingBatch.agencyId !== job.agencyId || existingBatch.creatorId !== job.creatorId || existingBatch.sourceJobId !== job.id) {
+        throw new Error("CAMPAIGN_INGEST_RECEIPT_SCOPE_MISMATCH");
+      }
+      if (["COMMITTED", "PARTIAL"].includes(existingBatch.status)) {
+        return { replay: true, batchId: existingBatch.id, status: existingBatch.status };
+      }
+    }
+
     // Current selective Campaign claimer writes are only legal after the server
     // has issued this exact Campaign as a target for this scanRun. Perform this
     // preflight before generation acceptance so a direct/stale claimer write
@@ -996,6 +1012,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       collectorVersion: payload.collectorVersion,
       schemaVersion: payload.schemaVersion,
       payload,
+      existingBatch,
     });
     if (replay && ["COMMITTED", "PARTIAL"].includes(batch.status)) {
       return { replay: true, batchId: batch.id, status: batch.status };
@@ -1365,6 +1382,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         },
         data: {
           claimerVerifiedRevision: verifiedRevision,
+          claimersObservationVersion: FRONTIER_OBSERVATION_VERSION,
           claimersVerifiedAt: observationStartForJob(job),
           claimersNextDueAt: observationStartForJob(job)
             ? new Date(observationStartForJob(job).getTime() + verificationIntervalMs) : serverReceivedAt,
@@ -1849,10 +1867,7 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
     // Prisma cannot compare two columns in a portable where-clause. Revision
     // mismatch is therefore selected with the due timestamp authority: every
     // metadata revision bump sets claimersNextDueAt=server DB time atomically.
-    const dueWhere = {
-      ...exactGeneration,
-      OR: [{ claimersNextDueAt: null }, { claimersNextDueAt: { lte: now } }],
-    };
+    const dueWhere = frontierDueWhere(exactGeneration, now);
     dueCount = await tx.creatorCampaign.count({ where: dueWhere });
     const targets = await tx.creatorCampaign.findMany({
       where: dueWhere,
@@ -1873,10 +1888,7 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
   const deferred = Math.max(0, dueCount - targetCount);
   const oldestDue = dueCount > 0
     ? await tx.creatorCampaign.findFirst({
-      where: {
-        ...exactGeneration,
-        OR: [{ claimersNextDueAt: null }, { claimersNextDueAt: { lte: now } }],
-      },
+      where: frontierDueWhere(exactGeneration, now),
       orderBy: [{ claimersNextDueAt: "asc" }, { externalCampaignId: "asc" }],
       select: { claimersNextDueAt: true },
     })
@@ -1887,10 +1899,20 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
     select: { claimersNextDueAt: true },
   });
   const fanCutoff = new Date(command.requestedAt.getTime() - CAMPAIGN_FAN_VALUE_FRESHNESS_MS);
+  const previousProof = campaignCompletionProofFromState(current, scanRunId, CAMPAIGN_COLLECTOR_VERSION);
   return tx.creatorCampaignCollectionState.update({
     where: { creatorId: job.creatorId },
     data: {
       campaignFrontierPlanRunId: scanRunId,
+      campaignFrontierObservationVersion: FRONTIER_OBSERVATION_VERSION,
+      // Reuse has zero directory pages. Initialize the exact empty counter set
+      // only after validating its binding and accepting this generation. Page
+      // ingestion advances it; replay of an existing plan never resets it.
+      ...(directoryAuthority.reused && !previousProof.matches ? {
+        campaignProofScanRunId: scanRunId, campaignProofCollectorVersion: CAMPAIGN_COLLECTOR_VERSION,
+        campaignProofCampaignBatches: 0, campaignProofClaimerBatches: 0,
+        campaignProofRejectedBatches: 0, campaignProofRejectedRows: 0,
+      } : {}),
       campaignFrontierFreshnessStatus: targetCount ? "QUEUED" : (deferred > 0 ? "PARTIAL" : "COMPLETE"),
       campaignFrontierDueCount: dueCount,
       campaignFrontierTargetCount: targetCount,
@@ -1939,6 +1961,10 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaign
     });
   }
   if (!_campaignLockHeld) await acquireCampaignTransactionLock(db, job.creatorId);
+  // Only stamp a transaction-local capability here. This path already owns the
+  // Campaign lock; taking the activation-row lock here would reverse the
+  // ingest lock order (activation -> Campaign).
+  await enterCampaignObservationWriter({ db });
 
   const driver = object(job.continuation);
   const durable = driver.driverPhase === "execute" ? object(driver.jobContinuation) : {};

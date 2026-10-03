@@ -1,6 +1,7 @@
 "use strict";
 
-const { directoryObservationAt, directoryDiscoveryDeadline } = require("./analytics-observation-time");
+const { directoryObservationAt } = require("./analytics-observation-time");
+const campaignFreshness = require("./campaign-freshness-service");
 
 const prisma = require("../prisma");
 const { dbAuthorityNow } = require("./db-time-authority-service");
@@ -203,37 +204,20 @@ async function campaignInitialCoverageReady(db, creatorId, now = new Date()) {
 }
 
 function campaignDelegatedRefreshPending(state) {
-  const activeGeneration = String(state?.activeGeneration || "").trim();
-  const coverageRunId = String(state?.fanValueCoverageScanRunId || "").trim();
-  const expected = Math.max(0, Number(state?.fanValueExpected || 0));
-  const freshness = String(state?.fanValueFreshnessStatus || "MISSING").toUpperCase();
   // FanData coverage is a generation-bound post-traversal authority. Do not
   // launch another Campaign provider generation while the current generation's
   // delegated refresh is QUEUED/PARTIAL, even when frontier budgeting leaves
   // membershipCoverageStatus PARTIAL. Otherwise a later frontier tranche can
   // reset the run ledger and hide older outstanding/failed freshness work.
-  return Boolean(activeGeneration && coverageRunId === activeGeneration && expected > 0 && freshness !== "COMPLETE");
-}
-
-function campaignDirectoryDiscoveryPending(state) {
-  const requested = Math.max(0, Number(state?.campaignDirectoryDiscoveryRequestedRevision || 0));
-  const completed = Math.max(0, Number(state?.campaignDirectoryDiscoveryCompletedRevision || 0));
-  return requested > completed;
+  return campaignFreshness.fanRefreshPending(state);
 }
 
 function campaignDirectoryDiscoveryDue(state, now = new Date()) {
-  if (!state) return true;
-  if (campaignDirectoryDiscoveryPending(state)) return true;
-  const verifiedAt = directoryObservationAt(state, now);
-  if (!verifiedAt) return true;
-  const dueAt = directoryDiscoveryDeadline(state, CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS, now);
-  return !dueAt || dueAt.getTime() <= now.getTime();
+  return campaignFreshness.directoryDue(state, now);
 }
 
 function campaignFrontierWorkDue(state, now = new Date()) {
-  if (String(state?.campaignFrontierFreshnessStatus || "MISSING").toUpperCase() !== "COMPLETE") return true;
-  const nextDueAt = state?.campaignFrontierNextDueAt ? new Date(state.campaignFrontierNextDueAt) : null;
-  return Boolean(nextDueAt && Number.isFinite(nextDueAt.getTime()) && nextDueAt.getTime() <= now.getTime());
+  return campaignFreshness.frontierDue(state, now);
 }
 
 function campaignDirectoryReuseBinding(state, now = new Date()) {

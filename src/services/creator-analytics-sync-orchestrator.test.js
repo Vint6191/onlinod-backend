@@ -212,7 +212,9 @@ for (const change of ["fresh", "debt", "deferred", "directory", "generation"]) {
     db.jobInstance.findFirst = async ({ where }) => {
       if (where.jobKey === "fetch_campaigns") {
         current = { ...current };
-        if (change === "fresh") current.campaignFrontierFreshnessStatus = "COMPLETE";
+        if (change === "fresh") Object.assign(current, { campaignFrontierFreshnessStatus: "COMPLETE",
+          campaignFrontierObservationVersion: 1, campaignFrontierPlanRunId: "run-a", membershipCoverageStatus: "COMPLETE",
+          campaignFrontierNextDueAt: new Date(+now + 3600000) });
         if (change === "debt") Object.assign(current, { fanValueCoverageScanRunId: "run-a", fanValueExpected: 1, fanValueFreshnessStatus: "QUEUED" });
         if (change === "deferred") current.retryAfterAt = new Date(+now + 60000);
         if (change === "directory") current.campaignDirectoryDiscoveryRequestedRevision = 2;

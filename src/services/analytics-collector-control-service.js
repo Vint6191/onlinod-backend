@@ -5,7 +5,7 @@ const prisma = require("../prisma");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { selectDurableCollectionProof } = require("./analytics-freshness-policy");
-const { stampObservationStart, observationStartForJob, parseObservationTime } = require("./analytics-observation-time");
+const { stampObservationStart, observationStartForJob, parseObservationTime, directoryObservationAt } = require("./analytics-observation-time");
 const { campaignTransactionLockKey } = require("./campaign-transaction-lock-service");
 
 const COLLECTION_CONTRACT_VERSION = 1;
@@ -301,6 +301,7 @@ async function acceptCampaignGeneration({ db = prisma, job, deviceId = null, cam
       fanValueExpected: 0, fanValueAlreadyFresh: 0, fanValueQueued: 0, fanValueSucceeded: 0,
       fanValueUnavailable: 0, fanValueFailed: 0, fanValueOutstanding: 0, fanValueCoverageUpdatedAt: null,
       campaignFrontierPlanRunId: null, campaignFrontierFreshnessStatus: "MISSING",
+      campaignFrontierObservationVersion: 0,
       campaignFrontierDueCount: 0, campaignFrontierTargetCount: 0, campaignFrontierCompletedCount: 0, campaignFrontierDeferredCount: 0,
       campaignFrontierOldestDueAt: null, campaignFrontierNextDueAt: null, campaignFrontierUpdatedAt: null,
       lastErrorCode: null, lastErrorMessage: null, sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220),
@@ -325,13 +326,27 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
     const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const success = complete === true;
     const coverageAuthority = campaignFanCoverageAuthorityFromJob(job);
+    let observedAt = observationStartForJob(job);
+    if (job.params?.campaignDirectoryReuseGeneration && current?.campaignFrontierPlanRunId === command.generation
+        && Number(current.campaignFrontierTargetCount) === 0) {
+      // This server-planned run did not observe the provider. Reuse the retained
+      // source bound, never the time of this command or completion. Individual
+      // frontiers and directory retain their own independent expiry deadlines.
+      const prior = selectDurableCollectionProof({ baselineVerifiedAt: current.baselineVerifiedAt,
+        catchupVerifiedAt: current.lastCatchupCompletedAt, baselineObservedAt: current.baselineObservedAt,
+        catchupObservedAt: current.lastCatchupObservedAt, now }).latestAt;
+      const directory = directoryObservationAt(current, now);
+      const inherited = current.campaignDirectoryCampaignCount === 0 ? directory
+        : prior && directory ? new Date(Math.min(+prior, +directory)) : null;
+      observedAt = observedAt && inherited ? new Date(Math.min(+observedAt, +inherited)) : null;
+    }
     const common = {
       status: success ? "COMPLETE" : "PARTIAL", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt,
       fanValueCoverageDelegated: coverageAuthority.delegated, fanValueCoverageOwnerKind: coverageAuthority.ownerKind,
       fanValueCoverageCollectorVersion: coverageAuthority.collectorVersion, fanValueCoverageSourceJobId: coverageAuthority.sourceJobId,
       membershipCoverageStatus: membershipComplete ? "COMPLETE" : "PARTIAL",
       membershipCoverageCompletedAt: membershipComplete ? now : null,
-      membershipObservedAt: membershipComplete ? observationStartForJob(job) : null,
+      membershipObservedAt: membershipComplete ? observedAt : null,
       retryAfterAt: null,
       lastErrorCode: success ? null : (membershipComplete ? "CAMPAIGN_FAN_VALUE_REFRESH_PENDING" : "CAMPAIGN_COLLECTION_PARTIAL"),
       lastErrorMessage: success ? null : (membershipComplete
@@ -339,7 +354,6 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
         : "Campaign collection did not prove all requested campaign/claimer frontiers"),
       sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220), ...(success ? { lastCompleteScanRunId: clean(scanRunId, 120) } : {}),
     };
-    const observedAt = observationStartForJob(job);
     const successData = success && command.mode === "full" ? { baselineVerifiedAt: now, baselineObservedAt: observedAt, baselineGeneration: command.generation }
       : success && command.mode === "catchup" ? { lastCatchupCompletedAt: now, lastCatchupObservedAt: observedAt, lastCatchupGeneration: command.generation } : {};
     const state = await tx.creatorCampaignCollectionState.upsert({
