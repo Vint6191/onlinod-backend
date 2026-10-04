@@ -38,6 +38,8 @@
 
   async function request(path, options = {}) {
     const token = getToken();
+    const sessionChanged = () => options.auth !== false && getToken() !== token;
+    const changedResult = command => ({ ok: false, code: "ADMIN_SESSION_CHANGED", commandId: command?.commandId, error: "Admin session changed. Reload the current view before continuing." });
     const url = buildUrl(path, options.query);
 
     const headers = {
@@ -52,12 +54,15 @@
     try {
       command = await window.OnlinodAdminCommands.prepare({ path, method: options.method || "GET", body: options.body, token });
       if (command?.blocked) {
+        if (sessionChanged()) return changedResult(command);
         const resolved = await window.OnlinodAdminCommands.resolve(path, options.method || "GET", token);
+        if (sessionChanged()) return changedResult(command);
         if (!resolved.pending) return { ok: false, code: "ADMIN_PREVIOUS_COMMAND_COMPLETED", error: "Previous change completed. Reload current values before editing again.", commandId: command.commandId };
         return command.result;
       }
       if (command) headers["Idempotency-Key"] = command.commandId;
     } catch (_) { return { ok: false, code: "ADMIN_COMMAND_CLIENT_FAILED", error: "Could not prepare command; no change submitted" }; }
+    if (sessionChanged()) return changedResult(command);
     let res;
     try {
       res = await fetch(url, {
@@ -66,6 +71,7 @@
         body: options.body ? JSON.stringify(options.body) : undefined,
       });
     } catch (err) {
+      if (sessionChanged()) return changedResult(command);
       const errResult = { ok: false, code: "NETWORK", commandId: command?.commandId, error: command ? "Result unknown. Retry the same change or check its status." : String(err?.message || err) };
       stashDebug({ url, method: options.method || "GET", body: options.body }, errResult);
       return errResult;
@@ -86,6 +92,10 @@
 
     if (command && res.ok && (data?.ok !== true || data.commandId !== command.commandId)) data = { ok: false, code: "ADMIN_COMMAND_RESPONSE_UNKNOWN", commandId: command.commandId, error: "Result could not be confirmed. Retry the same change or check its status." };
     window.OnlinodAdminCommands.settle(command, res, data);
+    // A response belonging to a previous login may settle only its own command.
+    // It cannot render old data, overwrite current debug state or log out the
+    // administrator who signed in while this request was awaiting the network.
+    if (sessionChanged()) return changedResult(command);
     if (!res.ok && !data?.httpStatus) data.httpStatus = res.status;
 
     stashDebug({ url, method: options.method || "GET", body: options.body }, data);

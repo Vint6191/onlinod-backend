@@ -13,7 +13,7 @@ router.post("/login", async (req, res) => {
   try { return res.json(await loginAdmin({ db: prisma, ...loginSchema.parse(req.body), ip: req.ip || null, userAgent: String(req.headers["user-agent"] || "").slice(0, 1000) || null })); }
   catch (error) { return sendCommandError(res, error); }
 });
-router.get("/me", adminSessionRequired, (req, res) => res.json({ ok: true, admin: publicAdmin(req.admin) }));
+router.get("/me", adminSessionRequired, require("../middleware/admin-read-boundary").adminReadBoundary, (req, res) => res.json({ ok: true, admin: publicAdmin(req.admin) }));
 router.post("/logout", adminSessionRequired, async (req, res) => {
   try { return res.json(await logoutAdmin({ db: prisma, actor: { adminId: req.admin.id, sessionId: req.adminSession.id, accessEpoch: req.adminSession.issuedAccessEpoch } })); }
   catch (error) { return sendCommandError(res, error); }

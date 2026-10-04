@@ -25,6 +25,14 @@ function createOperationalDb(options={}){
   };
   api.$executeRawUnsafe=async(sql,...args)=>{
    if(sql.includes("set_config("))return 1;
+   if(sql.startsWith('UPDATE "MassCreatorDeliveryState"')){
+    const rows=(read().massStates||[]).filter(row=>row.agencyId===args[0]&&row.retirementId!=null);
+    for(const row of rows){
+     for(const key of ["retirementId","retirementStartedAt","retirementProofId","retirementProofRevision","retirementProofObservedAt","retirementProviderId"])row[key]=null;
+     row.sourceRevision++;
+    }
+    return rows.length;
+   }
    if(sql.startsWith('UPDATE "AgencyMember"')){const rows=table("members").filter(r=>r.userId===args[0]&&!r.deletedAt);rows.forEach(r=>{r.accessEpoch++;});return rows.length;}
    if(sql.startsWith('INSERT INTO "DeviceCommand"')){
     if(options.failOutbox)throw Error("outbox unavailable");

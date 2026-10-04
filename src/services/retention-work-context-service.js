@@ -7,8 +7,8 @@ const context = new AsyncLocalStorage();
 function withRetentionWork(ownerToken, work, actorGuard = null) { return context.run({ ownerToken, actorGuard }, work); }
 async function guardRetentionTransaction(tx) {
   const current = context.getStore();
-  if (current?.actorGuard) await current.actorGuard(tx);
-  if (current?.ownerToken) await lockRetentionCommit({ tx, ownerToken: current.ownerToken });
+  const adminAuthority = current?.actorGuard ? await current.actorGuard(tx) : null;
+  if (current?.ownerToken) await lockRetentionCommit({ tx, ownerToken: current.ownerToken, adminAuthority });
 }
 async function runRetentionMutation(work, db = require("../prisma")) {
   return runRootCommit(db, async ({ tx }) => {

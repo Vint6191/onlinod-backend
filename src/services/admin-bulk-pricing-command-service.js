@@ -129,7 +129,7 @@ async function processAdminBulkPricingItem({ db, item, ownerToken, keepClaim = f
       // The savepoint includes pricing, receipt, progress and claim settlement.
       // Expiry while waiting or writing must never advance the target cursor.
       await assertAdminSessionLifetime(tx, authority);
-      await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_bulk_item");
+      // COMMIT releases this savepoint; keep the authority check last.
       return { status, outcome, nextIndex: progress.nextIndex };
     } catch (error) {
       if (classifyCommitConflict(error) || error.code !== "ADMIN_AUTH_INVALID") throw error;

@@ -4,7 +4,7 @@ const crypto = require("node:crypto");
 const bcrypt = require("bcryptjs");
 const { runRootCommit } = require("./db-commit-kernel");
 const { adminError, publicAdmin } = require("./admin-command-contract");
-const { dbAuthorityNow } = require("./db-time-authority-service");
+const { dbAuthorityNow, asDate } = require("./db-time-authority-service");
 
 const KNOWN_ROLES = new Set(["SUPER_ADMIN", "SUPPORT"]);
 const sha256 = value => crypto.createHash("sha256").update(String(value)).digest("hex");
@@ -23,7 +23,7 @@ async function lockAdminActor(tx, actor, { roles = ["SUPER_ADMIN", "SUPPORT"], t
   const session = await tx.adminSession.findUnique({ where: { id: actor.sessionId }, include: { adminUser: true } });
   const now = await dbAuthorityNow({ db: tx });
   const admin = session?.adminUser;
-  if (!session || session.adminUserId !== actor.adminId || session.revokedAt || new Date(session.expiresAt) <= now) throw adminError("ADMIN_AUTH_INVALID", "Admin session is expired or revoked", 401);
+  if (!session || session.adminUserId !== actor.adminId || session.revokedAt || !asDate(session.expiresAt) || asDate(session.expiresAt) <= now) throw adminError("ADMIN_AUTH_INVALID", "Admin session is expired or revoked", 401);
   if (!admin?.active || !KNOWN_ROLES.has(admin.role)) throw adminError("ADMIN_DISABLED", "Admin authority is inactive", 403);
   if (admin.accessEpoch !== session.issuedAccessEpoch || actor.accessEpoch !== admin.accessEpoch) throw adminError("ADMIN_AUTH_GENERATION_CHANGED", "Admin access changed; sign in again", 401);
   if (!roles.includes(admin.role)) throw adminError("ADMIN_INSUFFICIENT_ROLE", "This action is not permitted for this admin role", 403);
@@ -33,9 +33,26 @@ async function lockAdminActor(tx, actor, { roles = ["SUPER_ADMIN", "SUPPORT"], t
 async function assertAdminSessionLifetime(tx, authority) {
   // The identity/session rows remain locked, but time still advances during
   // domain and audit work. Call immediately before authorizing their commit.
-  if (!authority?.session || new Date(authority.session.expiresAt) <= await dbAuthorityNow({ db: tx })) {
+  const now = await dbAuthorityNow({ db: tx });
+  assertAdminSessionLifetimeAt(authority, now);
+  return now;
+}
+
+// Combine locked deadlines at one DB instant when another authority (for
+// example a retention lease) owns the final clock query.
+function assertAdminSessionLifetimeAt(authority, now) {
+  const expiresAt = asDate(authority?.session?.expiresAt);
+  const authorityNow = asDate(now);
+  if (!authorityNow || !expiresAt || expiresAt <= authorityNow) {
     throw adminError("ADMIN_AUTH_INVALID", "Admin session expired while the operation was in progress", 401);
   }
+}
+
+async function authorizeAdminReadResult({ db, actor }) {
+  return runRootCommit(db, async ({ tx }) => {
+    const authority = await lockAdminActor(tx, actor);
+    return assertAdminSessionLifetime(tx, authority);
+  }, { profile: "ADMIN_SUPPORT_READ", authority: { kind: "ADMIN_READ_RESULT", adminId: actor?.adminId } });
 }
 
 async function loginAdmin({ db, email, password, ip = null, userAgent = null }) {
@@ -53,6 +70,7 @@ async function loginAdmin({ db, email, password, ip = null, userAgent = null }) 
     const session = await tx.adminSession.create({ data: { adminUserId: admin.id, issuedAccessEpoch: admin.accessEpoch, tokenHash: sha256(token), expiresAt, ip, userAgent } });
     await tx.adminUser.update({ where: { id: admin.id }, data: { lastLoginAt: now } });
     await tx.adminActionLog.create({ data: { adminUserId: admin.id, action: "admin.session_created", targetType: "admin_session", targetId: session.id, after: { accessEpoch: admin.accessEpoch, expiresAt: expiresAt.toISOString() } } });
+    await assertAdminSessionLifetime(tx, { session });
     return { ok: true, token, expiresAt, admin: publicAdmin({ ...admin, lastLoginAt: now }) };
   }, { profile: "ADMIN_SESSION", authority: { kind: "ADMIN_LOGIN", adminId: before.id }, conflictCode: "ADMIN_SESSION_CONFLICT" });
 }
@@ -73,4 +91,4 @@ async function logoutAdmin({ db, actor }) {
   }, { profile: "ADMIN_SESSION", authority: { kind: "ADMIN_LOGOUT", adminId: actor.adminId }, conflictCode: "ADMIN_SESSION_CONFLICT" });
 }
 
-module.exports = { KNOWN_ROLES, sha256, lockAdminRows, lockAdminActor, assertAdminSessionLifetime, loginAdmin, logoutAdmin };
+module.exports = { KNOWN_ROLES, sha256, lockAdminRows, lockAdminActor, assertAdminSessionLifetime, assertAdminSessionLifetimeAt, authorizeAdminReadResult, loginAdmin, logoutAdmin };

@@ -74,3 +74,16 @@ test("agency restore rejects committed hard deletion and lack of operational own
   const r=await call(m,"agency.restore","agency-a",{expectedUpdatedAt:revision});assert.equal(r.statusCode,409);assert.equal(r.body.code,hard?"AGENCY_DESTRUCTIVE_DELETE_IRREVERSIBLE":"AGENCY_OPERATIONAL_OWNER_REQUIRED");assert.ok(m.state.agencies[0].deletedAt);
  }
 });
+
+test("agency restore clears only its MASS holds and mandatory-audit failure restores every hold",async()=>{
+ for(const failAudit of[false,true]){
+  const held=agencyId=>({creatorId:agencyId+"-creator",agencyId,retirementId:"held",retirementProofId:"proof",retirementStartedAt:new Date(revision),retirementProofObservedAt:new Date(revision),retirementProofRevision:7,retirementProviderId:"provider",sourceRevision:7});
+  const m=createOperationalDb({failAudit,extendState:{massStates:[held("agency-a"),held("agency-b")]}});
+  Object.assign(m.state.agencies[0],{updatedAt:new Date(revision),deletedAt:new Date(revision),status:"LOCKED"});Object.assign(m.state.members[0],{role:"OWNER",roleKey:"owner"});
+  const run=()=>call(m,"agency.restore","agency-a",{expectedUpdatedAt:revision});
+  if(failAudit)await assert.rejects(run,/audit unavailable/);else assert.equal((await run()).statusCode,200);
+  assert.equal(m.state.massStates[0].retirementId,failAudit?"held":null);
+  assert.equal(m.state.massStates[0].sourceRevision,failAudit?7:8);
+  assert.equal(m.state.massStates[1].retirementId,"held");assert.equal(m.state.massStates[1].sourceRevision,7);
+ }
+});

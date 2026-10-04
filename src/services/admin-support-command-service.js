@@ -2,7 +2,7 @@
 const {executeAdminCommand} = require("./admin-commit-authority-service");
 const {lockAdminActor,assertAdminSessionLifetime} = require("./admin-session-authority-service");
 const {adminError} = require("./admin-command-contract");
-const {dbAuthorityNow} = require("./db-time-authority-service");
+const {dbAuthorityNow,asDate} = require("./db-time-authority-service");
 const {z} = require("zod");
 const {runRootCommit} = require("./db-commit-kernel");
 
@@ -50,13 +50,14 @@ async function readAdminSupport({db,actor,grantId,query={}}) {
     await tx.$queryRawUnsafe('SELECT "id" FROM "AdminSupportGrant" WHERE "id"=$1 FOR SHARE',grantId);
     const grant=await tx.adminSupportGrant.findUnique({where:{id:grantId}});
     const now=await dbAuthorityNow({db:tx});
-    if(!grant || grant.revokedAt || new Date(grant.expiresAt)<=now || grant.actorAccessEpoch!==actor.accessEpoch) throw adminError("SUPPORT_GRANT_EXPIRED","Support access expired or was revoked",403);
+    if(!grant || grant.revokedAt || !asDate(grant.expiresAt) || asDate(grant.expiresAt)<=now || grant.actorAccessEpoch!==actor.accessEpoch) throw adminError("SUPPORT_GRANT_EXPIRED","Support access expired or was revoked",403);
     // Agency/id unique index bounds each page independently of tenant count,
     // history size and other tenants. Retired creators remain visible as diagnostics.
     const rows=await tx.creatorAccount.findMany({where:{agencyId:grant.agencyId,...(page.cursor?{id:{gt:page.cursor}}:{})},orderBy:{id:"asc"},take:page.limit+1,select:creatorSelect});
-    const responseNow=await dbAuthorityNow({db:tx});
-    if(new Date(grant.expiresAt)<=responseNow) throw adminError("SUPPORT_GRANT_EXPIRED","Support access expired while reading diagnostics",403);
-    await assertAdminSessionLifetime(tx,authority);
+    // Both locked deadlines are evaluated against the same final DB instant.
+    // A separate session-clock await after checking the grant could outlive it.
+    const responseNow=await assertAdminSessionLifetime(tx,authority);
+    if(asDate(grant.expiresAt)<=responseNow) throw adminError("SUPPORT_GRANT_EXPIRED","Support access expired while reading diagnostics",403);
     const creators=rows.slice(0,page.limit);
     return {ok:true,grant:publicGrant(grant),agency,creators,nextCursor:rows.length>page.limit?creators.at(-1).id:null,authorityNow:responseNow};
   },{profile:"ADMIN_SUPPORT_READ",authority:{kind:"ADMIN_SUPPORT_READ",adminId:actor.adminId},conflictCode:"ADMIN_SUPPORT_READ_CONFLICT"});

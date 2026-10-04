@@ -114,7 +114,7 @@ async function claimAdminRetentionRun({ db, row: identity }) {
         actorId: row.actorId, action: row.action, targetId: row.targetId, event: "PASS_STARTED", reason: row.reason, detail: progress } });
       const claimedRow = await tx.adminCommand.update({ where: { id: row.id }, data: { status: "RUNNING", executionProgress: progress } });
       await assertAdminSessionLifetime(tx, authority);
-      await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_retention_claim");
+      // COMMIT releases this savepoint; keep the authority check last.
       return { row: claimedRow, lease, policySettings: policy.settings };
     } catch (error) {
       if (classifyCommitConflict(error) || error.code !== "ADMIN_AUTH_INVALID") throw error;

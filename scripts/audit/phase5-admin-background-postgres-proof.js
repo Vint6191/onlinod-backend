@@ -1,34 +1,16 @@
 "use strict";
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const path = require("node:path");
 const crypto = require("node:crypto");
-const { createRequire } = require("node:module");
-const { spawn } = require("node:child_process");
-const { PrismaClient } = require("@prisma/client");
-const root = path.resolve(__dirname, "../..");
 async function main() {
   if (!process.env.PHASE5_PROOF_RUNTIME) throw new Error("PHASE5_PROOF_RUNTIME required");
-  const load = createRequire(path.resolve(process.env.PHASE5_PROOF_RUNTIME, "package.json"));
-  const { PGlite } = load("@electric-sql/pglite");
-  const { PGLiteSocketServer } = load("@electric-sql/pglite-socket");
   console.log("[I4 proof] starting disposable SQL engine");
-  const engine = await PGlite.create();
-  const server = new PGLiteSocketServer({ db: engine, host: "127.0.0.1", port: 0 });
-  await server.start();
-  const url = `postgresql://postgres:postgres@${server.getServerConn()}/postgres?connection_limit=1&sslmode=disable`;
-  const db = new PrismaClient({ datasources: { db: { url } } });
+  const fixture = await require("../test-support/admin-sql-runtime.cjs").createAdminSqlRuntime({ runtimePath: process.env.PHASE5_PROOF_RUNTIME });
+  const { engine, db, queries } = fixture;
   const cases = [];
   const check = async (name, fn) => { await fn(); cases.push({ name, status: "PASS" }); console.log(JSON.stringify(cases.at(-1))); };
   try {
-    await new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [path.join(root, "node_modules/prisma/build/index.js"), "migrate", "deploy"], {
-        cwd: root, env: { ...process.env, DATABASE_URL: url }, stdio: ["ignore", "pipe", "pipe"],
-      });
-      let output = ""; child.stdout.on("data", b => { output += b; }); child.stderr.on("data", b => { output += b; });
-      child.once("error", reject); child.once("close", code => code ? reject(new Error(output)) : resolve());
-    });
-    console.log("[I4 proof] full migration chain applied");
+    console.log("[I4 proof] normal retained-schema deployment plan applied");
     await engine.exec("DISCARD ALL");
     await engine.exec("SET TIME ZONE 'UTC'");
     await engine.exec(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`);
@@ -161,6 +143,7 @@ async function main() {
     for (const code of ["40001", "40P01"]) await check(`bulk ${code} commits one price, cursor, item audit and claim settlement`, async () => {
       const s = await queuedBulk(), before = attempts; fault = code;
       assert.equal((await processItem(s)).status, "SUCCEEDED"); assert.equal(attempts - before, 2);
+      assert.match(queries.at(-2).query, /clock_timestamp/); assert.equal(queries.at(-1).query, "COMMIT");
       assert.equal((await db.creatorBillingProfile.findUnique({ where: { creatorId: s.creator.id } })).pricingRevision, 2);
       const row = await db.adminCommand.findUnique({ where: { id: s.item.objectId } });
       assert.equal(row.executionProgress.nextIndex, 1);
@@ -213,6 +196,7 @@ async function main() {
     await check("retention claim conflict retries from immutable identity with one start receipt", async () => {
       const s = await queuedRetention(); fault = "40001"; const before = attempts;
       const claim = await adminRetention.claimAdminRetentionRun({ db: proxy, row: s.row });
+      assert.match(queries.at(-2).query, /clock_timestamp/); assert.equal(queries.at(-1).query, "COMMIT");
       assert.equal(attempts - before, 2); assert.ok(claim.lease.acquired); assert.equal(claim.row.executionProgress.attempts, 1);
       assert.equal(await db.adminCommandAudit.count({ where: { commandId: s.row.id, event: "PASS_STARTED" } }), 1);
       await retention.finalizeRetentionSweepLease({ db: proxy, ownerToken: claim.lease.ownerToken, outcome: "COMPLETE", onFinalize: tx => tx.adminCommand.update({ where: { id: s.row.id }, data: { status: "SUCCEEDED" } }) });
@@ -271,12 +255,12 @@ async function main() {
       assert.equal((await compactAutomationDeliveries({ db: proxy, olderThan, commitGuard })).archived, 1); assert.equal(attempts - before, 2);
       assert.equal((await db.automationMonthlyAggregate.findFirst({ where: { creatorId: s.creator.id } })).total, 1);
     });
-    const report = { ok: true, engine: "PGlite PostgreSQL WASM + TCP + Prisma 5.22", migrations: fs.readdirSync(path.join(root, "prisma/migrations")).filter(name => fs.existsSync(path.join(root, "prisma/migrations", name, "migration.sql"))).length, cases: cases.length,
+    const report = { ok: true, engine: "PGlite PostgreSQL WASM + TCP + Prisma 5.22", migrations: fixture.migrations.length, excludedContract: fixture.excludedContract, cases: cases.length,
       limits: ["Single physical SQL connection; no native PostgreSQL contention or multi-replica load proof", "Clock advancement is injected at production query boundaries; not an OS clock or live wait", "No production database, Render restart, historical notification backfill or Desktop LocalAI validation"], results: cases };
     const output = process.env.PHASE5_PROOF_OUTPUT;
     if (output) fs.writeFileSync(output, JSON.stringify(report, null, 2) + "\n");
     console.log(JSON.stringify(report));
-  } finally { await db.$disconnect(); await server.stop(); await engine.close(); }
+  } finally { await fixture.close(); }
 }
 const watchdog = setTimeout(() => { console.error("I4_PROOF_DEADLINE_EXCEEDED"); process.exit(1); }, 180000);
 main().then(() => clearTimeout(watchdog), error => { clearTimeout(watchdog); console.error(error); process.exitCode = 1; });

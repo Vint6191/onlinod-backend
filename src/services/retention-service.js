@@ -671,8 +671,8 @@ async function runAutomationRetentionSweep(options = {}) {
     olderThan: daysAgo(cfg.automationDeliveryDetailedDays, authorityNow),
     batchSize: cfg.batchSize,
     commitGuard: options.retentionOwnerToken ? async tx => {
-      if (options.actorGuard) await options.actorGuard(tx);
-      await lockRetentionCommit({ tx, ownerToken: options.retentionOwnerToken });
+      const adminAuthority = options.actorGuard ? await options.actorGuard(tx) : null;
+      await lockRetentionCommit({ tx, ownerToken: options.retentionOwnerToken, adminAuthority });
     } : null,
   }));
 

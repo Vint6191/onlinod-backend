@@ -42,29 +42,50 @@ async function executeAdminCommand({ db, actor, commandId, action, targetId, pay
       actorAccessEpoch: actor.accessEpoch, action, targetId, payloadHash: hash,
       reason: normalized.reason, status: "RUNNING",
     } });
-    // Domain errors must not retain a partial mutation. Keep the command row
-    // outside the savepoint so a terminal rejection has a stable receipt too.
+    // Domain work, mandatory audit and success receipt share one rollback
+    // boundary. The initial row stays outside it so an expired command can
+    // retain a rejection without retaining its effects or a success audit.
     await tx.$executeRawUnsafe("SAVEPOINT admin_domain_mutation");
-    let outcome;
+    const rejectedOutcome = error => ({ statusCode: error.status, body: { ok: false, code: error.code, error: error.message, ...(error.details ? { details: error.details } : {}) }, audit: { outcome: "REJECTED", code: error.code } });
+    const persistOutcome = async outcome => {
+      const statusCode = outcome.statusCode || 200;
+      const queued = statusCode < 400 && outcome.queued === true;
+      const body = safeJson({ ...outcome.body, commandId });
+      const audit = safeJson(outcome.audit || {});
+      await tx.adminCommandAudit.create({ data: { commandId: command.id, sequence: 1, actorId: actor.adminId, action, targetId, scopeAgencyId: outcome.agencyId || null, event: queued ? "ACCEPTED" : statusCode < 400 ? "COMMITTED" : "REJECTED", detail: audit, reason: normalized.reason } });
+      await tx.adminCommand.update({ where: { id: command.id }, data: { status: queued ? "QUEUED" : statusCode < 400 ? "SUCCEEDED" : "REJECTED", httpStatus: statusCode, result: body, scopeAgencyId: outcome.agencyId || null, completedAt: queued ? null : await dbAuthorityNow({ db: tx }) } });
+      return { commandId, replayed: false, statusCode, body };
+    };
+    let outcome, rejected = false;
     try {
       outcome = await work({ tx, commitContext: context, authority, payload: normalized, command });
       await assertCommandSessionLifetime(tx, authority);
-      await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_domain_mutation");
+      rejected = (outcome.statusCode || 200) >= 400;
     } catch (error) {
       if (classifyCommitConflict(error)) throw error;
       if (!(Number(error.status) >= 400 && Number(error.status) < 500 && error.code)) throw error;
-      await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT admin_domain_mutation");
-      await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_domain_mutation");
-      discardCommitHints(context);
-      outcome = { statusCode: error.status, body: { ok: false, code: error.code, error: error.message, ...(error.details ? { details: error.details } : {}) }, audit: { outcome: "REJECTED", code: error.code } };
+      outcome = rejectedOutcome(error);
+      rejected = true;
     }
-    const statusCode = outcome.statusCode || 200;
-    if (statusCode >= 400) discardCommitHints(context);
-    const body = safeJson({ ...outcome.body, commandId });
-    const audit = safeJson(outcome.audit || {});
-    await tx.adminCommandAudit.create({ data: { commandId: command.id, sequence: 1, actorId: actor.adminId, action, targetId, scopeAgencyId: outcome.agencyId || null, event: outcome.queued ? "ACCEPTED" : statusCode < 400 ? "COMMITTED" : "REJECTED", detail: audit, reason: normalized.reason } });
-    await tx.adminCommand.update({ where: { id: command.id }, data: { status: outcome.queued ? "QUEUED" : statusCode < 400 ? "SUCCEEDED" : "REJECTED", httpStatus: statusCode, result: body, scopeAgencyId: outcome.agencyId || null, completedAt: outcome.queued ? null : await dbAuthorityNow({ db: tx }) } });
-    return { commandId, replayed: false, statusCode, body };
+    if (!rejected) {
+      // Receipt storage failures abort the root; they are never converted to
+      // business rejections. Only our final lifetime check can reject here.
+      const result = await persistOutcome(outcome);
+      try {
+        await assertCommandSessionLifetime(tx, authority);
+        // COMMIT releases the savepoint. No awaited audit, receipt update or
+        // RELEASE follows this final authority decision on the success path.
+        return result;
+      } catch (error) {
+        if (error.code !== "ADMIN_AUTH_INVALID") throw error;
+        outcome = rejectedOutcome(error);
+      }
+    }
+    await tx.$executeRawUnsafe("ROLLBACK TO SAVEPOINT admin_domain_mutation");
+    await tx.$executeRawUnsafe("RELEASE SAVEPOINT admin_domain_mutation");
+    discardCommitHints(context);
+    // A denial receipt grants no authority and may survive session expiry.
+    return persistOutcome(outcome);
   }, {
     profile: "ADMIN_COMMAND", isolationLevel: contract.isolationLevel || "ReadCommitted",
     authority: { kind: "ADMIN_COMMAND", adminId: actor.adminId, agencyId: normalized.agencyId || null },
@@ -75,7 +96,11 @@ async function executeAdminCommand({ db, actor, commandId, action, targetId, pay
 
 async function readAdminCommand({ db, actor, commandId }) {
   commandIdSchema.parse(commandId);
+  if (!actor?.adminId) throw adminError("ADMIN_AUTH_REQUIRED", "Admin context is required", 401);
   return runRootCommit(db, async ({ tx }) => {
+    // Use the same order as execution. A status read waits for an in-flight
+    // command instead of presenting its uncommitted receipt as absent.
+    await lockCommandIdentity(tx, actor.adminId, commandId);
     const authority = await lockAdminActor(tx, actor);
     const row = await tx.adminCommand.findUnique({ where: { actorId_commandId: { actorId: actor.adminId, commandId } } });
     if (!row) throw adminError("ADMIN_COMMAND_NOT_FOUND", "Command not found", 404);

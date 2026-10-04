@@ -14,6 +14,9 @@
     if (value) memory.set(key, value); else memory.delete(key);
     try { if (value) sessionStorage.setItem(key, JSON.stringify(value)); else sessionStorage.removeItem(key); } catch (_) { /* Session-only memory fallback. */ }
   }
+  function forgetIfCurrent(command) {
+    if (command?.key && get(command.key)?.commandId === command.commandId) set(command.key, null);
+  }
   function isCommand(path, method) {
     const operational = (method === "PATCH" && /^\/api\/admin\/(?:agencies\/[^/]+|members\/[^/]+\/(?:role|permissions)|users\/[^/]+)$/.test(path)) || (method === "DELETE" && /^\/api\/admin\/(?:agencies|members|creators)\/[^/]+$/.test(path)) || (method === "POST" && /^\/api\/admin\/(?:agencies\/[^/]+\/restore|users\/[^/]+\/(?:force-logout|reset-password)|devices\/[^/]+\/kick|maintenance\/subscriber-signals\/[^/]+\/requeue)$/.test(path));
     return (method === "PATCH" && path === "/api/admin/billing/commercial-policy") || (method === "PATCH" && path === "/api/admin/system/retention") || (method === "POST" && /^\/api\/admin\/system\/retention\/(?:reset|run)$/.test(path)) || (method === "POST" && /^\/api\/admin\/support\/grants(?:\/[^/]+\/revoke)?$/.test(path)) || operational || (method === "PATCH" && /^\/api\/admin\/(?:billing\/creator\/[^/]+|creators\/[^/]+\/(?:billing|entitlement)|agencies\/[^/]+\/(?:subscription|billing-hold)|admin-users\/[^/]+)$/.test(path)) ||
@@ -30,13 +33,18 @@
     if (previous && previous.fingerprint !== fingerprint) {
       return { blocked: true, commandId: previous.commandId, result: { ok: false, code: "ADMIN_COMMAND_UNRESOLVED", commandId: previous.commandId, error: "A previous change has an uncertain result. Check its status or retry the same change before editing again." } };
     }
-    const record = previous || { commandId: crypto.randomUUID(), fingerprint };
+    const record = { ...(previous || { commandId: crypto.randomUUID(), fingerprint }), attempts: (previous?.attempts || 0) + 1 };
     set(key, record);
-    return { key, ...record };
+    return { key, ...record, hadPending: Boolean(previous) };
   }
   function settle(command, response, data) {
     // A proxy HTML error or truncated JSON response does not prove the outcome.
-    if (command && response.status < 500 && data && typeof data.ok === "boolean" && !["INVALID_JSON", "ADMIN_COMMAND_RESPONSE_UNKNOWN"].includes(data.code) && !data.text && (data.commandId === command.commandId || (!data.ok && [400, 401, 403, 404, 428].includes(response.status)))) set(command.key, null);
+    if (!command || response.status < 200 || response.status >= 500 || !data || typeof data.ok !== "boolean" || ["INVALID_JSON", "ADMIN_COMMAND_RESPONSE_UNKNOWN"].includes(data.code) || data.text) return;
+    const current = get(command.key);
+    // A denied retry does not establish the outcome of an earlier request.
+    // An old reply also must not erase a newer intent on the same resource.
+    const firstValidation = !command.hadPending && current?.attempts === 1 && !data.ok && data.commandId == null && [400, 404, 428].includes(response.status);
+    if (data.commandId === command.commandId || firstValidation) forgetIfCurrent(command);
   }
   async function resolve(path, method, token) {
     const resource = path.replace(/^\/api\/admin\/creators\/([^/]+)\/billing$/, "/api/admin/billing/creator/$1");
@@ -45,7 +53,7 @@
     if (!pending) return { ok: true, pending: false };
     const res = await fetch(`/api/admin/commands/${pending.commandId}`, { headers: { Authorization: `Bearer ${token}` } });
     const data = await res.json();
-    if (res.ok && data.commandId === pending.commandId && (["SUCCEEDED", "REJECTED"].includes(data.status) || data.result?.accepted === true)) { set(key, null); return { ...data, pending: false }; }
+    if (res.ok && data.commandId === pending.commandId && (["SUCCEEDED", "REJECTED"].includes(data.status) || data.result?.accepted === true)) { forgetIfCurrent({ key, commandId: pending.commandId }); return { ...data, pending: Boolean(get(key)) }; }
     return { ...data, pending: true, commandId: pending.commandId };
   }
   function redact(value, key = "") {
