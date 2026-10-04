@@ -448,6 +448,23 @@ async function assertTelegramInboundRuntimeLease(args) {
   return runtime;
 }
 
+// A live runtime may be retained solely to replay accepted effects and drain
+// inbound observations. That capability must never mint a new send permit.
+// assertTelegramRuntimeLease re-reads under the account SHARE lock, which is
+// held by the caller's transaction until its claim/COMMITTING transition commits.
+async function assertTelegramSendRuntimeLease(args) {
+  const runtime = await assertTelegramRuntimeLease(args);
+  // messagingEligible is GENERIC creator messaging, not the authority for a
+  // pinned Custom follow-up after creator/account reassignment. Delivery callers
+  // separately resolve the current intent/thread binding at claim and begin.
+  // ACTIVE source-only anchors grant nothing without that typed binding.
+  if (runtime.account?.lifecycleState !== "ACTIVE" || runtime.drainOnly === true || runtime.retiring === true) {
+    throw fail("TELEGRAM_EXECUTION_NEW_SEND_FORBIDDEN", "Telegram runtime is draining or no longer eligible for new sends", 409);
+  }
+  await args.db.$executeRawUnsafe("SELECT set_config('onlinod.telegram_send_generation','external_delivery_v2',true)");
+  return runtime;
+}
+
 async function releaseTelegramExecutionRuntime({ agencyId, member, accountId, deviceId, claimToken, drained = false, now = new Date(), db }) {
   const normalizedAccountId = clean(accountId);
   const normalizedDeviceId = clean(deviceId);
@@ -489,6 +506,7 @@ module.exports = {
   assertTelegramMessagingAccess,
   claimTelegramExecutionRuntimes,
   assertTelegramRuntimeLease,
+  assertTelegramSendRuntimeLease,
   assertTelegramInboundRuntimeLease,
   releaseTelegramExecutionRuntime,
 };

@@ -115,6 +115,11 @@ async function withAuthority(run) {
   const restores = [];
   try {
     restores.push(cacheModule("../prisma", fx.db));
+    // This unit fixture exercises lease/billing authority; physical MASS hold and
+    // revision semantics run against PostgreSQL in scripts/audit/external-delivery.
+    restores.push(cacheModule("./mass-delivery-scope-service", {
+      isMass: kind => /MASS_/.test(kind), lockMassDeliveryScope: async () => {}, assertMassCreateAdmission: async () => {},
+    }));
     restores.push(cacheModule("./team-access-control", {
       canUsePermission: async ({ key }) => { permissions.push(key); return key === "chats.mass_message" || key === "content.manage_vault" || key === "chats.reply"; },
     }));

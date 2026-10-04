@@ -18,7 +18,8 @@ const migration = fs.readFileSync(path.join(ROOT,'prisma/migrations/202609291540
     const sql=fs.readFileSync(path.join(ROOT,'prisma/migrations',name,'migration.sql'),'utf8');
     return '\nBEGIN;\n'+sql.slice(sql.indexOf('INSERT INTO "MaintenanceAdmissionClassState"'));
   }).join('\n')
-  + fs.readFileSync(path.join(ROOT,'prisma/migrations/20261004220000_maintenance_registry_v4/migration.sql'),'utf8');
+  + fs.readFileSync(path.join(ROOT,'prisma/migrations/20261004220000_maintenance_registry_v4/migration.sql'),'utf8')
+  + fs.readFileSync(path.join(ROOT,'prisma/migrations/20261005001000_external_delivery_maintenance_v5/migration.sql'),'utf8');
 const scheduler = fs.readFileSync(path.join(ROOT,'src/services/job-scheduler.js'),'utf8');
 function adapter(pg,{rollback=false}={}) {
  let transactionOpen=false;const trace=[];
@@ -36,7 +37,7 @@ function adapter(pg,{rollback=false}={}) {
 async function fixture(t) {
  const pg=new PGlite();await pg.waitReady;t.after(()=>pg.close());await pg.exec(migration);
  const fx=adapter(pg);
- return {pg,...fx,adapter:fx,select:(extra={})=>admission.selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes,...extra}),counts:async()=>(await pg.query('SELECT "laneName","turnCount" FROM "MaintenanceAdmissionClassState" WHERE generation=\'phase6_maintenance_registry_v4\' ORDER BY "ordinal"')).rows};
+ return {pg,...fx,adapter:fx,select:(extra={})=>admission.selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes,...extra}),counts:async()=>(await pg.query('SELECT "laneName","turnCount" FROM "MaintenanceAdmissionClassState" WHERE generation=\'phase6_maintenance_registry_v5\' ORDER BY "ordinal"')).rows};
 }
 function pumpHarness(db,invoke) {
  require.cache[path.join(ROOT,'src/prisma.js')]={exports:db};

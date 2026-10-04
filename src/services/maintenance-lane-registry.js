@@ -2,7 +2,7 @@
 
 // Executable catalog: names, ordinals and callbacks come from the same source.
 // Existing ordinals are append-only within this generation's migration contract.
-const MAINTENANCE_ADMISSION_GENERATION = "phase6_maintenance_registry_v4";
+const MAINTENANCE_ADMISSION_GENERATION = "phase6_maintenance_registry_v5";
 const scheduler = "./job-scheduler";
 const MAINTENANCE_LANES = Object.freeze([
   ["providerCapacityProjection", "./provider-capacity-debt-authority-service", "refreshProviderCapacityDebtSnapshot"],
@@ -34,6 +34,7 @@ const MAINTENANCE_LANES = Object.freeze([
   ["analyticsFactPublication", "./analytics-fact-publication-service", "runSweep"],
   ["fanObservationTokenRetention", "./background-retention-service", "runFanObservationTokenRetention"],
   ["providerWaiterRetention", "./background-retention-service", "runProviderWaiterRetention"],
+  ["massObservationRetention", "./mass-queue-observation-service", "runMassObservationRetention"],
 ].map(([name, module, method, options = {}], ordinal) => Object.freeze({ name, module, method, ordinal, options: Object.freeze(options) })));
 const MAINTENANCE_LANE_NAMES = Object.freeze(MAINTENANCE_LANES.map(lane => lane.name));
 if (new Set(MAINTENANCE_LANE_NAMES).size !== MAINTENANCE_LANES.length || MAINTENANCE_LANES.length > 64) {

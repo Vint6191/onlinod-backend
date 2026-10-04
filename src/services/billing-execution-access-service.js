@@ -104,7 +104,10 @@ async function assertJobBillingAccess({ db, job, recoveryCapable = true }) {
   throw denied(state);
 }
 
-async function assertProviderBillingAccess({ db, agencyId, creatorId, userId, deviceId, member, capability, operation, billingRecovery, jobLease, operationReadback, physicalRequest }) {
+async function assertProviderBillingAccess({ db, agencyId, creatorId, userId, deviceId, member, capability, operation, billingRecovery, jobLease, operationReadback, physicalRequest, retirementSnapshot }) {
+  if (retirementSnapshot) return require("./mass-queue-observation-service").assertMassRetirementRead({
+    db, agencyId, creatorId, userId, deviceId, member, capability, operation, retirementSnapshot, physicalRequest,
+  });
   const state = await creatorBillingAccess({ db, agencyId, creatorId });
   if (operationReadback) return require("./billing-operation-readback-service").assertOperationReadback({
     db, agencyId, creatorId, userId, deviceId, member, capability, operation, operationReadback, physicalRequest,

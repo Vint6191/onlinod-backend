@@ -42,7 +42,7 @@ test('campaign executor stop waits for running commit and never schedules anothe
  const running=scheduled[0]();let stopped=false;const stop=executor.stop().then(()=>stopped=true);
  await Promise.resolve();assert.equal(stopped,false);work.resolve({ok:true,processed:1});await running;await stop;assert.equal(scheduled.length,1);assert.equal(executor.snapshot().running,false);
 });
-function serverHarness({brokenStop=false}={}){
+function serverHarness({brokenStop=false,badExternal=false}={}){
  const source=fs.readFileSync(path.join(__dirname,'../server.js'),'utf8');const ready=deferred(),drain=deferred(),calls=[],signals={};let close;
  const context={Promise,console:{error(...args){calls.push(['error',...args]);},warn(){}},
   process:{env:{},once(name,fn){signals[name]=fn;},exit(code){calls.push(['exit',code]);}},
@@ -51,6 +51,7 @@ function serverHarness({brokenStop=false}={}){
   startRecurringScheduler(){calls.push('scheduler-start');return()=>{calls.push('scheduler-stop');return drain.promise;};},
   setTimeout(){return{unref(){}};},clearTimeout(){},
   require(name){
+   if(name==='./services/external-delivery-runtime-contract')return{verifyExternalDeliveryRuntime:async()=>{if(badExternal)throw Error("EXTERNAL_DELIVERY_PHYSICAL_GUARD_REQUIRED");}};
    if(name==='./services/maintenance-runtime-contract')return{verifyMaintenanceRuntime(){calls.push('verify');return ready.promise;}};
    const method=name.includes('dialog-module')?'startDialogControlWorker':name.includes('auth-mail')?'startAuthMailWorker':'startAdminDiagnostics';
    return{[method](){return()=>{calls.push(method+'-stop');if(brokenStop&&method==='startAdminDiagnostics')throw Error('controlled stop failure');};}};
@@ -61,12 +62,12 @@ function serverHarness({brokenStop=false}={}){
 }
 const turn=()=>new Promise(resolve=>setImmediate(resolve));
 test('server does not listen or start workers until runtime verification succeeds',async()=>{
- const h=serverHarness();assert.deepEqual(h.calls,['verify']);h.ready.resolve({ready:true});await turn();assert.deepEqual(h.calls,['verify','scheduler-start','listen']);
+ const h=serverHarness();await turn();assert.deepEqual(h.calls,['verify']);h.ready.resolve({ready:true});await turn();assert.deepEqual(h.calls,['verify','scheduler-start','listen']);
  h.signals.SIGTERM();h.signals.SIGINT();assert.equal(h.calls.filter(x=>x==='scheduler-stop').length,1);h.close();await turn();assert.ok(!h.calls.includes('disconnect'));
  h.drain.resolve();await turn();assert.equal(h.calls.at(-2),'disconnect');assert.deepEqual(h.calls.at(-1),['exit',0]);
 });
 test('bad runtime catalog fails startup before listen, no maintenance loop crashes after a green start',async()=>{
- const h=serverHarness();h.ready.reject(Error('MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH'));await turn();assert.ok(!h.calls.includes('listen'));assert.ok(!h.calls.includes('scheduler-start'));assert.equal(h.calls.at(-2),'disconnect');assert.deepEqual(h.calls.at(-1),['exit',1]);
+ const h=serverHarness();await turn();h.ready.reject(Error('MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH'));await turn();assert.ok(!h.calls.includes('listen'));assert.ok(!h.calls.includes('scheduler-start'));assert.equal(h.calls.at(-2),'disconnect');assert.deepEqual(h.calls.at(-1),['exit',1]);
 });
 test('maintenance degradation appears in the actual scheduler health snapshot and recovers',()=>{
  require.cache[require.resolve('../prisma')]={exports:{}};
@@ -80,4 +81,8 @@ test('one synchronous worker stop failure does not prevent other drains or Prism
  assert.ok(h.calls.includes('startAuthMailWorker-stop'));assert.ok(h.calls.includes('startDialogControlWorker-stop'));
  await turn();assert.ok(!h.calls.includes('disconnect'));h.drain.resolve();await turn();
  assert.equal(h.calls.at(-2),'disconnect');assert.deepEqual(h.calls.at(-1),['exit',1]);
+});
+
+test('missing external-delivery guard fails startup before maintenance or listen',async()=>{
+ const h=serverHarness({badExternal:true});await turn();assert.ok(!h.calls.includes('verify'));assert.ok(!h.calls.includes('listen'));assert.equal(h.calls.at(-2),'disconnect');assert.deepEqual(h.calls.at(-1),['exit',1]);
 });

@@ -10,8 +10,6 @@ const {
   getCurrentMassLogicalIntent,
   acknowledgeMassLogicalIntent,
   abandonMassLogicalIntentPrecommit,
-  beginMassRemoteQueueSnapshot,
-  reconcileMassRemoteQueueSnapshot,
   authorizeNativeMassWrite,
   completeNativeMassWrite,
   reserveProgrammaticWrite,
@@ -146,30 +144,33 @@ router.post("/mass-intent/:dispatchId/abandon-precommit", async (req, res) => {
 });
 
 
-router.post("/mass-queue/snapshot-fence", async (req, res) => {
-  try {
-    const input = z.object({ creatorId: z.string().min(1).max(180), deviceId: z.string().min(1).max(180), purpose: z.enum(["BROWSE", "RETIREMENT"]).default("BROWSE") }).parse(req.body || {});
-    // Snapshot authority has its own purpose-bound permission check inside the
-    // service: BROWSE -> chats.mass_message; RETIREMENT -> creators.manage.
-    // Do not force retirement through the send permission.
-    return res.json(await beginMassRemoteQueueSnapshot({ ...actor(req), ...input }));
-  } catch (error) {
-    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
-    return sendError(res, error, "MASS_QUEUE_SNAPSHOT_FENCE_FAILED");
-  }
-});
-
-router.post("/mass-queue/reconcile-snapshot", async (req, res) => {
-  try {
-    const input = z.object({
-      creatorId: z.string().min(1).max(180), deviceId: z.string().min(1).max(180), queueIds: z.array(z.string().min(1).max(180)).max(100000), snapshotItemCount: z.number().int().min(0).max(100000), snapshotFenceToken: z.string().min(1).max(180), purpose: z.enum(["BROWSE", "RETIREMENT"]).default("BROWSE"),
-    }).parse(req.body || {});
-    return res.json(await reconcileMassRemoteQueueSnapshot({ ...actor(req), ...input }));
-  } catch (error) {
-    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
-    return sendError(res, error, "MASS_QUEUE_SNAPSHOT_RECONCILE_FAILED");
-  }
-});
+const massObservation = require("../services/mass-queue-observation-service");
+const massIdentity = {
+  creatorId: z.string().min(1).max(180), deviceId: z.string().min(1).max(180),
+  purpose: z.enum(["BROWSE", "RETIREMENT"]).default("BROWSE"),
+};
+const massToken = z.string().min(1).max(180);
+function massRoute(path, schema, method) {
+  router.post(path, async (req, res) => {
+    try {
+      const input = schema.parse(req.body || {});
+      requireProductDevice(req, input.deviceId, { requiredCode: "PROGRAMMATIC_WRITE_DEVICE_REQUIRED", mismatchCode: "PROGRAMMATIC_WRITE_DEVICE_IDENTITY_MISMATCH" });
+      return res.json(await method({ ...actor(req), ...input }));
+    }
+    catch (error) {
+      if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
+      return sendError(res, error, "MASS_QUEUE_OBSERVATION_FAILED");
+    }
+  });
+}
+massRoute("/mass-queue/retirement-state", z.object({ deviceId: z.string().min(1).max(180), cursor: z.string().max(180).optional().nullable() }).strict(), massObservation.listMassRetirementState);
+massRoute("/mass-queue/snapshot-fence", z.object({ ...massIdentity, protocol: z.string().optional(), snapshotRequestId: z.string().uuid().optional() }).strict(), massObservation.beginMassRemoteQueueSnapshot);
+massRoute("/mass-queue/snapshot-page", z.object({ ...massIdentity, snapshotFenceToken: massToken,
+  page: z.number().int().min(0).max(200), snapshotItemCount: z.number().int().min(0).max(100000),
+  queueIds: z.array(z.string().min(1).max(180)).max(500), final: z.boolean(),
+}).strict(), massObservation.appendMassRemoteQueueSnapshot);
+massRoute("/mass-queue/reconcile-snapshot", z.object({ ...massIdentity, snapshotFenceToken: massToken }).strict(), massObservation.reconcileMassRemoteQueueSnapshot);
+massRoute("/mass-queue/release-retirement", z.object({ ...massIdentity, retirementId: massToken, abortOwnPreparation: z.boolean().optional() }).strict(), massObservation.releaseMassRetirement);
 
 router.post("/reserve", async (req, res) => {
   try {
@@ -184,6 +185,20 @@ router.post("/reserve", async (req, res) => {
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
     return sendError(res, error, "PROGRAMMATIC_WRITE_RESERVE_FAILED");
+  }
+});
+
+// Versioned route: an older backend returns404 before mutating COMMITTING.
+// A new Desktop must never discover a missing receipt capability after an old
+// replica has already issued a physical-write permit.
+router.post("/:writeId/prepare-mass-write", async (req, res) => {
+  try {
+    const input = leaseSchema.extend({ creatorId: z.string().min(1).max(180), kind: z.enum(["MASS_QUEUE_CREATE", "MASS_QUEUE_CANCEL"]), protocol: z.literal("MASS_RECEIPT_V1") }).strict().parse(req.body || {});
+    const { normalized, config } = await publicKindAccess(req, input.kind, input.creatorId, input.deviceId);
+    return res.json(await prepareProgrammaticWrite({ ...actor(req), ...input, writeId: req.params.writeId, kind: normalized, permissionKey: config.permissionKey }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: "Invalid MASS receipt protocol" });
+    return sendError(res, error, "MASS_PREPARE_FAILED");
   }
 });
 

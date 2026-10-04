@@ -10,6 +10,7 @@ const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./exe
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { classifyAutomationFailure, FAILURE_CATEGORIES } = require("./automation-failure-taxonomy");
 const { isProviderStatusProvenNoEffect } = require("./provider-http-outcome-proof");
+const { isMass, lockMassDeliveryScope, assertMassCreateAdmission } = require("./mass-delivery-scope-service");
 
 const ACTIVE_LEASE_STATUSES = new Set(["CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED"]);
 const TERMINAL_STATUSES = new Set(["COMPLETED", "FAILED", "SKIPPED", "CANCELED"]);
@@ -17,16 +18,7 @@ const DEFAULT_LEASE_MS = 3 * 60_000;
 const MIN_LEASE_MS = 30_000;
 const MAX_LEASE_MS = 10 * 60_000;
 const MAX_RECONCILIATION_WAIT_MS = 30 * 60_000;
-const MASS_QUEUE_SNAPSHOT_FENCE_TTL_MS = 60 * 60_000;
-const MASS_PROVIDER_SNAPSHOT_PROOF_ACTION = "MASS_PROVIDER_SNAPSHOT_PROOF";
-const massQueueSnapshotFences = new Map();
-
-function purgeMassQueueSnapshotFences(nowMs = Date.now()) {
-  for (const [token, fence] of massQueueSnapshotFences.entries()) {
-    if (!fence || Number(fence.expiresAtMs || 0) <= nowMs) massQueueSnapshotFences.delete(token);
-  }
-}
-
+const { beginMassRemoteQueueSnapshot, reconcileMassRemoteQueueSnapshot } = require("./mass-queue-observation-service");
 
 const PRODUCT_WRITE_KINDS = Object.freeze({
   MASS_QUEUE_CREATE: Object.freeze({
@@ -407,10 +399,6 @@ async function reserveMassLogicalIntent(input) {
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId });
     await assertDevice({ db: tx, agencyId, userId, deviceId });
     await assertLiveActor({ db: tx, agencyId, userId, memberId, accessEpoch, creatorId, permissionKey: config.permissionKey });
-    const { invalidateCreatorMassProviderRetirementProof } = require("./mass-campaign-authority-service");
-    await invalidateCreatorMassProviderRetirementProof({
-      db: tx, agencyId, creatorId, reason: "MASS logical intent reserved/replayed after retirement snapshot", now,
-    });
 
     const current = await tx.automationDelivery.findFirst({
       where: { agencyId, creatorId, actionType: "MASS_QUEUE_CREATE", intentAcknowledgedAt: null },
@@ -456,6 +444,7 @@ async function reserveMassLogicalIntent(input) {
 
     let delivery;
     try {
+      await assertMassCreateAdmission({ db: tx, agencyId, creatorId });
       await assertBillingWriteAdmission({ db: tx, agencyId, creatorId });
       delivery = await tx.automationDelivery.create({
         data: {
@@ -575,254 +564,6 @@ async function abandonMassLogicalIntentPrecommit(input) {
   }, { timeout: 30_000 });
 }
 
-function massQueueSnapshotPurpose(value) {
-  const purpose = clean(value, 40)?.toUpperCase() || "BROWSE";
-  if (!["BROWSE", "RETIREMENT"].includes(purpose)) {
-    throw new ProgrammaticOfWriteAuthorityError("MASS_QUEUE_SNAPSHOT_PURPOSE_INVALID", "MASS queue snapshot purpose must be BROWSE or RETIREMENT", 400);
-  }
-  return purpose;
-}
-
-function massQueueSnapshotPermission(purpose) {
-  return purpose === "RETIREMENT" ? "creators.manage" : "chats.mass_message";
-}
-
-async function beginMassRemoteQueueSnapshot(input) {
-  const agencyId = clean(input.agencyId, 180); const userId = clean(input.userId, 180); const memberId = clean(input.memberId, 180);
-  const creatorId = clean(input.creatorId, 180); const deviceId = clean(input.deviceId, 180); const accessEpoch = Number(input.accessEpoch);
-  const purpose = massQueueSnapshotPurpose(input.purpose);
-  if (!agencyId || !userId || !memberId || !creatorId || !deviceId || !Number.isInteger(accessEpoch) || accessEpoch < 0) {
-    throw new ProgrammaticOfWriteAuthorityError("MASS_QUEUE_SNAPSHOT_FENCE_INVALID", "MASS queue snapshot actor/device identity is required", 400);
-  }
-  await assertDevice({ db: prisma, agencyId, userId, deviceId });
-  await assertLiveActor({ db: prisma, agencyId, userId, memberId, accessEpoch, creatorId, permissionKey: massQueueSnapshotPermission(purpose) });
-  const now = new Date();
-  purgeMassQueueSnapshotFences(now.getTime());
-  const token = crypto.randomUUID();
-  massQueueSnapshotFences.set(token, { agencyId, userId, memberId, creatorId, deviceId, accessEpoch, purpose, fenceAt: now, expiresAtMs: now.getTime() + MASS_QUEUE_SNAPSHOT_FENCE_TTL_MS });
-  return { ok: true, purpose, snapshotFenceToken: token, fenceAt: now.toISOString(), expiresAt: new Date(now.getTime() + MASS_QUEUE_SNAPSHOT_FENCE_TTL_MS).toISOString() };
-}
-
-function consumeMassQueueSnapshotFence(input) {
-  const token = clean(input.snapshotFenceToken, 180);
-  if (!token) throw new ProgrammaticOfWriteAuthorityError("MASS_QUEUE_SNAPSHOT_FENCE_REQUIRED", "A server-issued MASS queue snapshot fence is required", 400);
-  purgeMassQueueSnapshotFences();
-  const fence = massQueueSnapshotFences.get(token);
-  massQueueSnapshotFences.delete(token);
-  if (!fence) throw new ProgrammaticOfWriteAuthorityError("MASS_QUEUE_SNAPSHOT_FENCE_EXPIRED", "MASS queue snapshot fence is missing, expired, consumed, or belongs to another backend process; refresh the queue again", 409);
-  for (const key of ["agencyId", "userId", "memberId", "creatorId", "deviceId"]) {
-    if (String(fence[key] || "") !== String(input[key] || "")) throw new ProgrammaticOfWriteAuthorityError("MASS_QUEUE_SNAPSHOT_FENCE_MISMATCH", "MASS queue snapshot fence belongs to another actor/device/creator", 403);
-  }
-  if (Number(fence.accessEpoch) !== Number(input.accessEpoch)) throw new ProgrammaticOfWriteAuthorityError("MASS_QUEUE_SNAPSHOT_FENCE_MISMATCH", "MASS queue snapshot fence belongs to another access epoch", 403);
-  if (String(fence.purpose || "BROWSE") !== massQueueSnapshotPurpose(input.purpose)) throw new ProgrammaticOfWriteAuthorityError("MASS_QUEUE_SNAPSHOT_FENCE_MISMATCH", "MASS queue snapshot fence belongs to another purpose", 403);
-  return fence;
-}
-
-async function reconcileMassRemoteQueueSnapshot(input) {
-  const agencyId = clean(input.agencyId, 180); const userId = clean(input.userId, 180); const memberId = clean(input.memberId, 180);
-  const creatorId = clean(input.creatorId, 180); const deviceId = clean(input.deviceId, 180); const accessEpoch = Number(input.accessEpoch);
-  const purpose = massQueueSnapshotPurpose(input.purpose);
-  if (!agencyId || !userId || !memberId || !creatorId || !deviceId || !Number.isInteger(accessEpoch) || accessEpoch < 0) {
-    throw new ProgrammaticOfWriteAuthorityError("MASS_QUEUE_SNAPSHOT_INVALID", "A complete live MASS queue snapshot and actor/device identity are required", 400);
-  }
-  const fence = consumeMassQueueSnapshotFence({ ...input, agencyId, userId, memberId, creatorId, deviceId, accessEpoch, purpose });
-  const rawQueueIds = (Array.isArray(input.queueIds) ? input.queueIds : []).map((value) => clean(value, 180)).filter(Boolean);
-  const liveQueueIds = Array.from(new Set(rawQueueIds));
-  const snapshotItemCount = Number(input.snapshotItemCount);
-  if (!Number.isInteger(snapshotItemCount) || snapshotItemCount < 0 || snapshotItemCount !== rawQueueIds.length || liveQueueIds.length !== rawQueueIds.length) {
-    throw new ProgrammaticOfWriteAuthorityError("MASS_QUEUE_SNAPSHOT_IDENTITY_INCOMPLETE", "Every provider queue row must have one unique exact queue id before absence may settle lifecycle state", 409);
-  }
-  return runDbTransaction(prisma, async (tx) => {
-    const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
-    await lockAgencyPipelineLifecycle({ db: tx, agencyId });
-    await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId });
-    await assertDevice({ db: tx, agencyId, userId, deviceId });
-    await assertLiveActor({ db: tx, agencyId, userId, memberId, accessEpoch, creatorId, permissionKey: massQueueSnapshotPermission(purpose) });
-    const now = new Date();
-    const { invalidateCreatorMassProviderRetirementProof } = require("./mass-campaign-authority-service");
-    await invalidateCreatorMassProviderRetirementProof({
-      db: tx, agencyId, creatorId, reason: `MASS ${purpose} provider reconciliation superseded the prior retirement snapshot`, now,
-    });
-
-    // A complete provider snapshot is itself durable evidence. Queues that were
-    // created manually, by an older client, or before this authority existed
-    // must become server-visible retirement blockers instead of disappearing
-    // merely because no AutomationDelivery happened to exist yet. Do not put
-    // the provider's whole set into Prisma IN/NOT IN predicates: a complete
-    // snapshot may legitimately contain tens of thousands of ids and exceed
-    // PostgreSQL's bind-parameter ceiling. Compare in memory, then mutate by
-    // bounded primary-key chunks.
-    const liveQueueIdSet = new Set(liveQueueIds);
-    const knownRemoteRows = await tx.automationDelivery.findMany({
-      where: { agencyId, creatorId, actionType: { in: [...MASS_REMOTE_QUEUE_KINDS] }, remoteTargetId: { not: null } },
-      select: { id: true, remoteTargetId: true, remoteLifecycleState: true, remoteLifecycleObservedAt: true },
-    });
-    const knownIds = new Set(knownRemoteRows.map((row) => clean(row.remoteTargetId, 180)).filter(Boolean));
-    const missing = liveQueueIds.filter((queueId) => !knownIds.has(queueId));
-    let providerObservedCreated = 0;
-    for (let offset = 0; offset < missing.length; offset += 500) {
-      const chunk = missing.slice(offset, offset + 500);
-      if (!chunk.length) continue;
-      const created = await tx.automationDelivery.createMany({
-        data: chunk.map((queueId) => ({
-          agencyId, creatorId, moduleKey: "mass", actionType: MASS_PROVIDER_OBSERVED_KIND, targetId: queueId,
-          idempotencyKey: `mass-provider-observed:${agencyId}:${creatorId}:${queueId}`,
-          payload: { providerObservedQueueId: queueId }, status: "COMPLETED", scheduledAt: now, notBefore: now,
-          maxAttempts: 1, createdByUserId: userId, originKind: "PROVIDER_OBSERVATION", sourceDeviceId: deviceId,
-          executionKind: "NONE", reconciliationKind: "MASS_QUEUE", intentAcknowledgedAt: now,
-          remoteLifecycleState: "PENDING", remoteTargetId: queueId, remoteLifecycleObservedAt: now, remoteSettledAt: null,
-          result: { outcomeState: "PROVIDER_OBSERVED", providerObservedAt: now.toISOString(), queueId }, finishedAt: now,
-        })),
-        skipDuplicates: true,
-      });
-      providerObservedCreated += Number(created?.count || 0);
-    }
-
-    const updateRemoteRowsByIds = async (ids, data) => {
-      let count = 0;
-      for (let offset = 0; offset < ids.length; offset += 1000) {
-        const chunk = ids.slice(offset, offset + 1000);
-        if (!chunk.length) continue;
-        const result = await tx.automationDelivery.updateMany({ where: { id: { in: chunk } }, data });
-        count += Number(result?.count || 0);
-      }
-      return count;
-    };
-    const observedBeforeFence = (row) => row.remoteLifecycleObservedAt instanceof Date && row.remoteLifecycleObservedAt <= fence.fenceAt;
-    const fencedKnownRemote = knownRemoteRows.filter((row) => observedBeforeFence(row));
-
-    // The fresh complete provider snapshot is the authority for remote presence.
-    // A previously SETTLED row must reopen when its exact queue id is live again
-    // (for example after provider read inconsistency/resurrection), otherwise the
-    // historical projection could incorrectly release retirement while OF still
-    // has a pending queue. Conversely, exact known ids that are absent may settle
-    // regardless of whether their previous projection was PENDING, migration, or
-    // UNKNOWN. UNKNOWN without a target id remains unattributable and is handled
-    // separately below.
-    const pendingIds = fencedKnownRemote
-      .filter((row) => liveQueueIdSet.has(clean(row.remoteTargetId, 180)))
-      .map((row) => row.id);
-    const settledIds = fencedKnownRemote
-      .filter((row) => clean(row.remoteTargetId, 180) && !liveQueueIdSet.has(clean(row.remoteTargetId, 180)))
-      .map((row) => row.id);
-
-    let pending = providerObservedCreated;
-    let settled = 0;
-    pending += await updateRemoteRowsByIds(pendingIds, { remoteLifecycleState: "PENDING", remoteLifecycleObservedAt: now, remoteSettledAt: null });
-    settled += await updateRemoteRowsByIds(settledIds, { remoteLifecycleState: "SETTLED", remoteLifecycleObservedAt: now, remoteSettledAt: now });
-
-    if (!liveQueueIds.length) {
-      // UNKNOWN without an exact remote target cannot be attributed while any
-      // provider queue exists. A complete empty snapshot proves only the narrower
-      // future-effect fact: no MASS queue remains for this creator. Keep logical
-      // write history unresolved forever, but release its remote lifecycle debt.
-      const unknownRows = await tx.automationDelivery.findMany({
-        where: {
-          agencyId, creatorId, actionType: { in: [...MASS_REMOTE_QUEUE_KINDS] },
-          remoteLifecycleState: "UNKNOWN", remoteTargetId: null, remoteLifecycleObservedAt: { lte: fence.fenceAt },
-        },
-        select: { id: true },
-      });
-      settled += await updateRemoteRowsByIds(unknownRows.map((row) => row.id), { remoteLifecycleState: "SETTLED", remoteLifecycleObservedAt: now, remoteSettledAt: now });
-    }
-
-    // A committed cancel is an idempotent desired-state write. A stable complete
-    // provider snapshot that no longer contains its exact target queue proves the
-    // desired state (queue absent), even when the DELETE response itself was lost.
-    // Fence on writeCommitAt so a snapshot that started before a newer cancel was
-    // permitted cannot settle that newer write from stale observation.
-    const committedCancelBase = {
-      agencyId,
-      creatorId,
-      actionType: { in: [...MASS_QUEUE_CANCEL_KINDS] },
-      writeCommitAt: { not: null, lte: fence.fenceAt },
-      targetId: { not: null },
-      OR: [
-        { status: { in: ["COMMITTING", "RECONCILE_REQUIRED"] } },
-        { status: "FAILED", failureCode: "outcome_unresolved_do_not_retry" },
-      ],
-    };
-    const committedCancels = await tx.automationDelivery.findMany({
-      where: committedCancelBase,
-      select: { id: true, targetId: true },
-    });
-    const settledCancelIds = committedCancels
-      .filter((row) => !liveQueueIdSet.has(clean(row.targetId, 180)))
-      .map((row) => row.id);
-    const cancelSettled = await updateRemoteRowsByIds(settledCancelIds, {
-      status: "COMPLETED",
-      failureCode: null,
-      failureCategory: null,
-      lastError: null,
-      remoteLifecycleState: "SETTLED",
-      remoteLifecycleObservedAt: now,
-      remoteSettledAt: now,
-      finishedAt: now,
-      claimUntil: null,
-      leaseTokenHash: null,
-      lastCheckedAt: now,
-    });
-
-    const unknown = await tx.automationDelivery.count({
-      where: {
-        agencyId, creatorId, actionType: { in: [...MASS_REMOTE_QUEUE_KINDS] },
-        remoteLifecycleState: "UNKNOWN", remoteLifecycleObservedAt: { lte: fence.fenceAt },
-      },
-    });
-
-    // Successful repeated-complete provider observation is also the retirement
-    // proof. Keep one durable row per creator and refresh it only after the same
-    // lifecycle transaction has reconciled every exact provider queue id. Delete
-    // authority can therefore fail closed when nobody has actually observed OF.
-    // BROWSE and RETIREMENT are different authorities. Never let a normal queue
-    // refresh overwrite or satisfy the destructive retirement proof. Separate
-    // durable identities also make a concurrent BROWSE refresh unable to erase
-    // a just-completed RETIREMENT observation.
-    const snapshotProofKey = `mass-provider-snapshot-proof:${agencyId}:${creatorId}:${purpose}`;
-    const snapshotProofResult = {
-      outcomeState: "PROVIDER_SNAPSHOT_PROVEN", purpose, providerSnapshotObservedAt: now.toISOString(),
-      snapshotFenceAt: fence.fenceAt.toISOString(), snapshotItemCount, queueIdDigest: crypto.createHash("sha256").update(JSON.stringify(liveQueueIds)).digest("hex"),
-    };
-    const existingProof = await tx.automationDelivery.findUnique({ where: { idempotencyKey: snapshotProofKey } });
-    if (existingProof) {
-      await tx.automationDelivery.updateMany({
-        where: { id: existingProof.id },
-        data: {
-          status: "COMPLETED", failureCode: null, failureCategory: null, lastError: null,
-          sourceDeviceId: deviceId, createdByUserId: userId, payload: { snapshotPurpose: purpose },
-          remoteLifecycleObservedAt: now, remoteSettledAt: now, result: snapshotProofResult, finishedAt: now, lastCheckedAt: now,
-        },
-      });
-    } else {
-      try {
-        await tx.automationDelivery.create({
-          data: {
-            agencyId, creatorId, moduleKey: "mass", actionType: MASS_PROVIDER_SNAPSHOT_PROOF_ACTION, targetId: creatorId,
-            idempotencyKey: snapshotProofKey, payload: { snapshotPurpose: purpose }, status: "COMPLETED", scheduledAt: now, notBefore: now,
-            maxAttempts: 1, createdByUserId: userId, originKind: "PROVIDER_OBSERVATION", sourceDeviceId: deviceId, executionKind: "NONE",
-            reconciliationKind: "MASS_PROVIDER_SNAPSHOT", intentAcknowledgedAt: now, remoteLifecycleState: "SETTLED",
-            remoteLifecycleObservedAt: now, remoteSettledAt: now, result: snapshotProofResult, finishedAt: now, lastCheckedAt: now,
-          },
-        });
-      } catch (error) {
-        if (error?.code !== "P2002") throw error;
-        const racedProof = await tx.automationDelivery.findUnique({ where: { idempotencyKey: snapshotProofKey } });
-        if (!racedProof) throw error;
-        await tx.automationDelivery.updateMany({
-          where: { id: racedProof.id },
-          data: {
-            status: "COMPLETED", failureCode: null, failureCategory: null, lastError: null,
-            sourceDeviceId: deviceId, createdByUserId: userId, payload: { snapshotPurpose: purpose },
-            remoteLifecycleObservedAt: now, remoteSettledAt: now, result: snapshotProofResult, finishedAt: now, lastCheckedAt: now,
-          },
-        });
-      }
-    }
-    return { ok: true, purpose, liveQueueIds, pending, settled, cancelSettled, unknown, snapshotFenceAt: fence.fenceAt.toISOString(), observedAt: now.toISOString() };
-  }, { timeout: 30_000 });
-}
-
-
 function mintWriteSettlementToken() {
   const token = crypto.randomBytes(32).toString("base64url");
   return { token, hash: hashToken(token) };
@@ -850,6 +591,7 @@ async function readBoundNativeMassCommitGrant(input) {
     // commit fence. Without this serialization two simultaneous duplicate
     // preflights could both read the same result JSON and last-write-wins one
     // another's token hash, retroactively invalidating an already-issued grant.
+    await lockMassDeliveryScope({ db: tx, agencyId, creatorId });
     await lockAutomationWriteCommitFence({ db: tx, agencyId, creatorId });
     const delivery = expectedWriteId
       ? await tx.automationDelivery.findUnique({ where: { id: expectedWriteId } })
@@ -967,6 +709,7 @@ async function settleNativeMassWriteProvenNoEffect(input) {
   return runDbTransaction(prisma, async (tx) => {
     const initial = await tx.automationDelivery.findUnique({ where: { id: writeId } });
     if (!initial) throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_WRITE_NOT_FOUND", "Native MASS write authority was not found", 404);
+    await lockMassDeliveryScope({ db: tx, agencyId: initial.agencyId, creatorId: initial.creatorId });
     await lockAutomationWriteCommitFence({ db: tx, agencyId: initial.agencyId, creatorId: initial.creatorId });
     const delivery = await tx.automationDelivery.findUnique({ where: { id: writeId } });
     const result = object(delivery?.result);
@@ -1066,6 +809,7 @@ async function settleNativeMassWriteExact(input, db) {
   if (!agencyId || !userId || !creatorId || !deviceId || !writeId || !requestKey || !queueId || !Number.isInteger(revision) || revision < 1) {
     throw new ProgrammaticOfWriteAuthorityError("MASS_NATIVE_SETTLEMENT_INVALID", "Exact native MASS write/queue/request proof is required", 400);
   }
+  await lockMassDeliveryScope({ db, agencyId, creatorId });
   await lockAutomationWriteCommitFence({ db, agencyId, creatorId });
   const delivery = await db.automationDelivery.findUnique({ where: { id: writeId } });
   if (!delivery || delivery.agencyId !== agencyId || delivery.creatorId !== creatorId) {
@@ -1121,6 +865,57 @@ async function settleNativeMassWriteExact(input, db) {
 
 async function completeNativeMassWrite(input) {
   return runDbTransaction(prisma, async (tx) => settleNativeMassWriteExact(input, tx), { timeout: 30_000 });
+}
+
+// A post-commit capability records one exact response; it never grants another
+// provider call. Scope/lease/billing revocation cannot erase an accepted effect.
+async function completeMassWriteWithSettlementToken(input) {
+  const writeId = clean(input.writeId, 180);
+  const queueId = clean(input.queueId, 180);
+  const revision = Number(input.writeCommitRevision);
+  if (!writeId || !queueId || !input.settlementToken || !Number.isSafeInteger(revision) || revision < 1) {
+    throw new ProgrammaticOfWriteAuthorityError("MASS_SETTLEMENT_INVALID", "Exact committed MASS response is required", 400);
+  }
+  return runDbTransaction(prisma, async (tx) => {
+    const initial = await tx.automationDelivery.findUnique({ where: { id: writeId } });
+    if (!initial) throw new ProgrammaticOfWriteAuthorityError("MASS_WRITE_NOT_FOUND", "MASS write was not found", 404);
+    await lockMassDeliveryScope({ db: tx, agencyId: initial.agencyId, creatorId: initial.creatorId });
+    await lockAutomationWriteCommitFence({ db: tx, agencyId: initial.agencyId, creatorId: initial.creatorId });
+    const delivery = await tx.automationDelivery.findUnique({ where: { id: writeId } });
+    const result = object(delivery?.result);
+    const kind = storedProgrammaticKind(delivery);
+    if (!delivery || !["MASS_QUEUE_CREATE", "MASS_QUEUE_CANCEL"].includes(kind)
+        || !tokenMatches(input.settlementToken, result.massSettlementTokenHash)
+        || result.massSettlementDeviceId !== input.deviceId || delivery.idempotencyKey !== input.requestKey
+        || kind !== input.kind || Number(delivery.writeCommitRevision) !== revision || !delivery.writeCommitAt) {
+      throw new ProgrammaticOfWriteAuthorityError("MASS_SETTLEMENT_BINDING_INVALID", "MASS settlement capability does not match this committed request", 403);
+    }
+    if (kind === "MASS_QUEUE_CANCEL" && delivery.targetId !== queueId) {
+      throw new ProgrammaticOfWriteAuthorityError("MASS_CANCEL_QUEUE_MISMATCH", "Cancel response belongs to another queue", 409);
+    }
+    if (delivery.status === "COMPLETED") {
+      if (delivery.remoteTargetId !== queueId) throw new ProgrammaticOfWriteAuthorityError("MASS_SETTLEMENT_CONFLICT", "MASS write already settled with another queue", 409);
+      return { ok: true, duplicate: true, writeId, queueId };
+    }
+    const lateUnknown = delivery.status === "FAILED" && delivery.failureCode === "outcome_unresolved_do_not_retry";
+    if (!["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status) && !lateUnknown) {
+      throw new ProgrammaticOfWriteAuthorityError("MASS_WRITE_NOT_SETTLEABLE", "MASS write is not awaiting a committed response", 409);
+    }
+    const now = new Date();
+    await tx.automationDelivery.update({ where: { id: writeId }, data: {
+      status: "COMPLETED", failureCode: null, failureCategory: null, lastError: null,
+      remoteLifecycleState: kind === "MASS_QUEUE_CREATE" ? "PENDING" : "SETTLED", remoteTargetId: queueId,
+      remoteLifecycleObservedAt: now, remoteSettledAt: kind === "MASS_QUEUE_CANCEL" ? now : null,
+      result: { ...result, queueId, outcomeState: "PROVEN_SUCCESS", exactResponseProof: true, completedAt: now.toISOString() },
+      finishedAt: now, claimUntil: null, leaseTokenHash: null, lastCheckedAt: now,
+    } });
+    if (kind === "MASS_QUEUE_CANCEL") await tx.automationDelivery.updateMany({
+      where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, actionType: { in: [...MASS_REMOTE_QUEUE_KINDS] }, remoteTargetId: queueId,
+        OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: { not: "SETTLED" } }] },
+      data: { remoteLifecycleState: "SETTLED", remoteLifecycleObservedAt: now, remoteSettledAt: now },
+    });
+    return { ok: true, writeId, queueId };
+  }, { timeout: 30_000 });
 }
 
 async function completeNativeMassWriteWithSettlementToken(input) {
@@ -1197,12 +992,6 @@ async function reserveProgrammaticWrite(input) {
     }
     await assertDevice({ db: tx, agencyId, userId, deviceId });
     await assertLiveActor({ db: tx, agencyId, userId, memberId, accessEpoch, creatorId, permissionKey: input.permissionKeyOverride === undefined ? config.permissionKey : input.permissionKeyOverride });
-    if ([...MASS_QUEUE_CREATE_KINDS, ...MASS_QUEUE_CANCEL_KINDS].includes(kind)) {
-      const { invalidateCreatorMassProviderRetirementProof } = require("./mass-campaign-authority-service");
-      await invalidateCreatorMassProviderRetirementProof({
-        db: tx, agencyId, creatorId, reason: `${kind} authority reserved/replayed after retirement snapshot`, now,
-      });
-    }
     // The creator write lane is global across origins. Before a programmatic
     // reserve tries to acquire it, clear expired Automation precommit leases
     // with Automation semantics, then clear/transition expired programmatic
@@ -1212,6 +1001,9 @@ async function reserveProgrammaticWrite(input) {
     await sweepExpiredProgrammaticWriteLeases({ db: tx, agencyId, creatorId, now });
     let delivery = await tx.automationDelivery.findUnique({ where: { idempotencyKey } });
     const replay = Boolean(delivery);
+    if (isMassQueueCreateKind(kind) && (!delivery || ["QUEUED", "RETRY_SCHEDULED", "CLAIMED", "RUNNING"].includes(delivery.status))) {
+      await assertMassCreateAdmission({ db: tx, agencyId, creatorId });
+    }
     if (!delivery || ["QUEUED", "RETRY_SCHEDULED", "CLAIMED", "RUNNING"].includes(delivery.status)) {
       await assertBillingWriteAdmission({ db: tx, agencyId, creatorId });
     }
@@ -1369,7 +1161,7 @@ async function reserveProgrammaticWrite(input) {
 }
 
 async function requireProgrammaticLease(input, { db = prisma, allowTerminal = false, allowCommittedSettlement = false, lock = false } = {}) {
-  const delivery = await db.automationDelivery.findUnique({ where: { id: clean(input.writeId, 180) || "__missing__" } });
+  let delivery = await db.automationDelivery.findUnique({ where: { id: clean(input.writeId, 180) || "__missing__" } });
   if (!delivery) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_FOUND", "Programmatic write not found", 404);
   if (delivery.originKind === "AUTOMATION") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_WRONG_AUTHORITY", "Automation-origin delivery must use automation worker authority", 403);
   if (delivery.agencyId !== input.agencyId) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_AGENCY_MISMATCH", "Programmatic write belongs to another agency", 403);
@@ -1382,6 +1174,12 @@ async function requireProgrammaticLease(input, { db = prisma, allowTerminal = fa
   }
   if (input.creatorId && delivery.creatorId !== String(input.creatorId)) {
     throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_CREATOR_MISMATCH", "Programmatic write belongs to another creator", 403);
+  }
+
+  if (lock && isMass(kind)) {
+    await lockMassDeliveryScope({ db, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
+    delivery = await db.automationDelivery.findUnique({ where: { id: delivery.id } });
+    if (!delivery) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_FOUND", "Programmatic write no longer exists", 404);
   }
 
   const terminal = TERMINAL_STATUSES.has(delivery.status);
@@ -1475,9 +1273,11 @@ async function prepareProgrammaticWrite(input) {
       const { assertCustomManualDeliveryCommitCurrent } = require("./custom-manual-delivery-authority-service");
       await assertCustomManualDeliveryCommitCurrent({ db: tx, delivery });
     }
+    if (isMassQueueCreateKind(storedProgrammaticKind(delivery))) await assertMassCreateAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
     const { now } = await assertBillingWriteAdmission({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
     const wantsCustomSettlement = storedProgrammaticKind(delivery) === "CUSTOM_MANUAL_SEND" && input.mintCustomManualSettlementCapability === true;
     const customSettlement = wantsCustomSettlement ? mintWriteSettlementToken() : null;
+    const massSettlement = ["MASS_QUEUE_CREATE", "MASS_QUEUE_CANCEL"].includes(storedProgrammaticKind(delivery)) ? mintWriteSettlementToken() : null;
     const currentResult = object(delivery.result);
     const priorCustomHashes = (Array.isArray(currentResult.customManualSettlementTokenHashes) ? currentResult.customManualSettlementTokenHashes : [])
       .map((value) => clean(value, 200)).filter(Boolean);
@@ -1492,12 +1292,13 @@ async function prepareProgrammaticWrite(input) {
           ...currentResult,
           writeCommitGrantedAt: now.toISOString(), writeCommitLeaseRevision: delivery.leaseRevision,
           ...(customSettlement ? { customManualSettlementTokenHashes: [...priorCustomHashes, customSettlement.hash] } : {}),
+          ...(massSettlement ? { massSettlementTokenHash: massSettlement.hash, massSettlementDeviceId: input.deviceId } : {}),
         },
       },
     });
     if (!changed.count) throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_COMMIT_PERMIT_STALE", "Programmatic write changed before commit permit", 409);
     delivery = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
-    return { ok: true, duplicate: false, writeCommitRevision: delivery.writeCommitRevision, writeCommitAt: delivery.writeCommitAt, delivery: publicDelivery(delivery), ...(customSettlement ? { settlementToken: customSettlement.token } : {}) };
+    return { ok: true, duplicate: false, writeCommitRevision: delivery.writeCommitRevision, writeCommitAt: delivery.writeCommitAt, delivery: publicDelivery(delivery), ...(customSettlement ? { settlementToken: customSettlement.token } : massSettlement ? { settlementToken: massSettlement.token } : {}) };
   }, { timeout: 30_000 });
 }
 
@@ -1888,6 +1689,7 @@ module.exports = {
   attachCustomManualSettlementCapability,
   completeNativeMassWrite,
   completeNativeMassWriteWithSettlementToken,
+  completeMassWriteWithSettlementToken,
   settleNativeMassWriteProvenNoEffect,
   projectNativeMassWriteFromTeamEvent,
   reserveProgrammaticWrite,

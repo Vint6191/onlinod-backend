@@ -4,11 +4,12 @@ const {validateEvidence}=require('./phase7-contract-evidence');
 const {GENERATION}=require('./phase7-legacy-storage-service');
 const {PRE,POST}=require('../../scripts/database/phase7-deploy');
 test('Phase7 deploy retains every preflight and postflight in the production wrapper',()=>{
- assert.deepEqual(POST[0], ["background-maintenance-indexes.js", "--create"]);
- assert.deepEqual(POST[1], ["maintenance-runtime-postflight.js"]);
+ assert.deepEqual(POST[0], ["external-delivery-indexes.js", "--create"]);
+ assert.deepEqual(POST[1], ["external-delivery-postflight.js"]);
  assert(POST.some(([script]) => script === "provider-capacity-catalog-postflight.js"));
  assert.equal(PRE.length,8);
  assert.deepEqual(POST.map(([script]) => script), [
+  "external-delivery-indexes.js", "external-delivery-postflight.js",
   "background-maintenance-indexes.js", "maintenance-runtime-postflight.js",
   "analytics-traffic-indexes.js", "campaign-observation-postflight.js", "campaign-bounded-postflight.js",
   "campaign-traversal-postflight.js", "campaign-value-refresh-postflight.js", "traffic-projection-postflight.js", "campaign-refresh-work-postflight.js", "campaign-membership-proof-postflight.js", "campaign-fair-pages-postflight.js", "analytics-fact-publication-postflight.js",

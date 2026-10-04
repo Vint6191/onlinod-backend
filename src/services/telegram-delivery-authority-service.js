@@ -6,7 +6,7 @@ const { lockBillingWriteAdmission, assertBillingWriteAdmission, selectBillableTe
 const { audit } = require("./audit-service");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const { assertExecutionAccessFence } = require("./execution-access-fence-service");
-const { assertTelegramRuntimeLease } = require("./telegram-execution-runtime");
+const { assertTelegramSendRuntimeLease } = require("./telegram-execution-runtime");
 const { reconcilePendingInboundForConfirmedDelivery } = require("./telegram-inbound-authority-service");
 const { canUsePermission } = require("./team-access-control");
 const { lockActiveTelegramAccountReference, isActiveTelegramAccount } = require("./telegram-account-reference-authority-service");
@@ -1036,7 +1036,7 @@ async function claimTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
     }
   }
   await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
-  const runtime = await assertTelegramRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId: normalizedDeviceId, claimToken: runtimeClaimToken, now, db: client });
+  const runtime = await assertTelegramSendRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId: normalizedDeviceId, claimToken: runtimeClaimToken, now, db: client });
   const fence = actor(member);
   await assertExecutionAccessFence({ db: client, agencyId, creatorId: row.creatorId, ...fence, lock: true });
   if (row.state === "CONFIRMED" || row.state === "RECONCILE_REQUIRED" || row.state === "COMMITTING" || row.state === "CANCELLED") return { ok: true, claimed: false, intent: publicIntent(row), claimToken: null };
@@ -1118,7 +1118,7 @@ async function currentBeginGuard({ row, member, agencyId, runtimeClaimToken, dev
       throw fail("TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED", "Telegram provider thread changed before commit; refresh the existing delivery intent", 409);
     }
   }
-  const runtime = await assertTelegramRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId, claimToken: runtimeClaimToken, now, db });
+  const runtime = await assertTelegramSendRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId, claimToken: runtimeClaimToken, now, db });
   await assertExecutionAccessFence({ db, agencyId, creatorId: row.creatorId, userId: row.userId, memberId: row.memberId, accessEpoch: row.accessEpoch, lock: true });
   const kind = String(row.kind);
   if (kind === "REVISION_REQUEST") {

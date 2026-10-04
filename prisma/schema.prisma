@@ -251,6 +251,8 @@ model User {
 }
 
 model Agency {
+  massDeliveryStates MassCreatorDeliveryState[]
+  massQueueObservations MassQueueObservation[]
   billingPolicyRevision Int @default(1)
   billingSupportHold Boolean @default(false)
   billingSupportHoldReason String?
@@ -488,6 +490,8 @@ model TeamMemberFunction {
 }
 
 model CreatorAccount {
+  massDeliveryState MassCreatorDeliveryState?
+  massQueueObservations MassQueueObservation[]
   campaignReadStates CampaignReadState[]
   campaignReadChanges CampaignReadChange[]
   campaignReadReceipts CampaignReadReceipt[]
@@ -7051,4 +7055,73 @@ model FinancialObservedFact {
   run FinancialReceiptRun @relation(fields: [runId], references: [id], onDelete: Cascade)
   @@id([runId, windowIndex, externalId])
   @@index([runId, windowIndex, occurredAt, externalId], map: "FinancialObservedFact_time_idx")
+}
+
+// External Delivery v2: current creator frontier and bounded durable observations.
+model MassCreatorDeliveryState {
+  creatorId String @id
+  agencyId String
+  sourceRevision BigInt @default(0)
+  observationSequence BigInt @default(0)
+  activeSequence BigInt @default(0)
+  activeObservationId String?
+  retirementId String?
+  retirementStartedAt DateTime?
+  retirementProofId String?
+  retirementProofRevision BigInt?
+  retirementProofObservedAt DateTime?
+  retirementProviderId String?
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  @@index([agencyId, creatorId], map: "MassCreatorDeliveryState_agency_creator_idx")
+}
+model MassQueueObservation {
+  id String @id
+  agencyId String
+  creatorId String
+  userId String
+  memberId String
+  deviceId String
+  accessEpoch Int
+  purpose String
+  sequence BigInt
+  sourceRevision BigInt
+  retirementId String?
+  providerId String?
+  fenceAt DateTime
+  expiresAt DateTime
+  retainUntil DateTime
+  acceptedAt DateTime?
+  publishedAt DateTime?
+  status String @default("OPEN")
+  itemCount Int?
+  receivedCount Int @default(0)
+  pageCount Int @default(0)
+  lastQueueId String?
+  phase String @default("PRESENT")
+  cursor String?
+  pending Int @default(0)
+  settled Int @default(0)
+  cancelSettled Int @default(0)
+  response Json?
+  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+  agency Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  pages MassQueueObservationPage[]
+  items MassQueueObservationItem[]
+  @@index([retainUntil, id], map: "MassQueueObservation_retention_idx")
+  @@index([agencyId, creatorId, sequence], map: "MassQueueObservation_creator_idx")
+}
+model MassQueueObservationPage {
+  observationId String
+  ordinal Int
+  digest String
+  observation MassQueueObservation @relation(fields: [observationId], references: [id], onDelete: Cascade)
+  @@id([observationId, ordinal])
+}
+model MassQueueObservationItem {
+  observationId String
+  queueId String
+  observation MassQueueObservation @relation(fields: [observationId], references: [id], onDelete: Cascade)
+  @@id([observationId, queueId])
 }

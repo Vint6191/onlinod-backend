@@ -374,6 +374,7 @@ const port = Number(process.env.PORT || 10000);
 async function startServer() {
   // Fail before listening or starting any worker: build success alone cannot
   // establish that executable maintenance, versioned admission and indexes agree.
+  await require("./services/external-delivery-runtime-contract").verifyExternalDeliveryRuntime({ db: prisma });
   const maintenance = await require("./services/maintenance-runtime-contract").verifyMaintenanceRuntime({ db: prisma });
   logger.info("maintenance runtime ready", maintenance);
   const stopScheduler = startRecurringScheduler();

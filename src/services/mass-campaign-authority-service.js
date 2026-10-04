@@ -1,226 +1,63 @@
 "use strict";
+const { ACTIVE, CREATE_ACTIONS, CANCEL_ACTIONS, CURRENT_PREDICATE, RETIREMENT_ACCEPT_MS, error } = require("./mass-delivery-contract");
 
-const ACTIVE_MASS_WRITE_STATUSES = ["QUEUED", "CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED", "RETRY_SCHEDULED", "PAUSED"];
-const REMOTE_BLOCKING_STATES = ["PENDING", "MIGRATION_RECONCILE_REQUIRED", "UNKNOWN"];
-const MASS_CREATE_ACTIONS = ["MASS_QUEUE_CREATE", "MASS_NATIVE_QUEUE_CREATE", "MASS_PROVIDER_QUEUE_OBSERVED"];
-const MASS_CANCEL_ACTIONS = ["MASS_QUEUE_CANCEL", "MASS_NATIVE_QUEUE_CANCEL"];
-const MASS_PROVIDER_SNAPSHOT_PROOF_ACTION = "MASS_PROVIDER_SNAPSHOT_PROOF";
-const MASS_PROVIDER_SNAPSHOT_PROOF_MAX_AGE_MS = 2 * 60_000;
-const MASS_RETIREMENT_SNAPSHOT_PURPOSE = "RETIREMENT";
-
-const MASS_PROVIDER_STATE_ACTIONS = [...new Set([...MASS_CREATE_ACTIONS, ...MASS_CANCEL_ACTIONS, MASS_PROVIDER_SNAPSHOT_PROOF_ACTION])];
-
-function proofSnapshotEmpty(proof) {
-  return Number(proof?.result?.snapshotItemCount) === 0;
-}
-
-function dateAfter(value, threshold) {
-  return value instanceof Date && threshold instanceof Date && value > threshold;
-}
-
-async function creatorMassProviderStateAdvancedAfterProof({ db, agencyId, creatorId, proof }) {
-  const proofAt = proof?.remoteLifecycleObservedAt instanceof Date ? proof.remoteLifecycleObservedAt : null;
-  if (!proofAt) return true;
-  const later = await db.automationDelivery.findFirst({
-    where: {
-      agencyId, creatorId, id: { not: proof.id }, actionType: { in: MASS_PROVIDER_STATE_ACTIONS },
-      OR: [
-        { remoteLifecycleObservedAt: { gt: proofAt } },
-        { actionType: { in: [...MASS_CREATE_ACTIONS, ...MASS_CANCEL_ACTIONS] }, writeCommitAt: { gt: proofAt } },
-      ],
-    },
-    select: { id: true },
-  });
-  return Boolean(later);
-}
-
-class MassCampaignAuthorityError extends Error {
-  constructor(code, message, status = 409, details = null) {
-    super(message); this.name = "MassCampaignAuthorityError"; this.code = code; this.status = status; this.details = details;
+async function blockers({ db, agencyId, creatorId = null }) {
+  const rows = await db.$queryRawUnsafe(`SELECT "actionType","status","failureCode","remoteLifecycleState",count(*)::int AS n
+    FROM "AutomationDelivery" WHERE ${CURRENT_PREDICATE} AND "agencyId"=$1 ${creatorId ? 'AND "creatorId"=$2' : ''}
+    GROUP BY "actionType","status","failureCode","remoteLifecycleState"`, ...[agencyId, ...(creatorId ? [creatorId] : [])]);
+  const out = { activeCreates: 0, unresolvedCreates: 0, remoteQueues: 0, activeCancels: 0, total: 0 };
+  for (const row of rows) {
+    out.total += row.n;
+    if (CANCEL_ACTIONS.includes(row.actionType)) out.activeCancels += row.n;
+    else if (ACTIVE.includes(row.status)) out.activeCreates += row.n;
+    else if (row.status === "FAILED" && row.failureCode === "outcome_unresolved_do_not_retry") out.unresolvedCreates += row.n;
+    else out.remoteQueues += row.n;
   }
+  return out;
 }
-
-async function creatorMassCampaignBlockers({ db, agencyId, creatorId }) {
-  const [activeCreates, unresolvedCreates, remoteQueues, activeCancels] = await Promise.all([
-    db.automationDelivery.count({ where: { agencyId, creatorId, actionType: { in: MASS_CREATE_ACTIONS }, status: { in: ACTIVE_MASS_WRITE_STATUSES } } }),
-    db.automationDelivery.count({ where: {
-      agencyId, creatorId, actionType: { in: MASS_CREATE_ACTIONS }, status: "FAILED", failureCode: "outcome_unresolved_do_not_retry",
-      OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: { not: "SETTLED" } }],
-    } }),
-    db.automationDelivery.count({ where: { agencyId, creatorId, actionType: { in: MASS_CREATE_ACTIONS }, remoteLifecycleState: { in: REMOTE_BLOCKING_STATES } } }),
-    db.automationDelivery.count({ where: {
-      agencyId, creatorId, actionType: { in: MASS_CANCEL_ACTIONS },
-      OR: [
-        { status: { in: ACTIVE_MASS_WRITE_STATUSES } },
-        { status: "FAILED", failureCode: "outcome_unresolved_do_not_retry" },
-      ],
-    } }),
-  ]);
-  return { activeCreates, unresolvedCreates, remoteQueues, activeCancels, total: activeCreates + unresolvedCreates + remoteQueues + activeCancels };
-}
-
-async function agencyMassCampaignBlockers({ db, agencyId }) {
-  const [activeCreates, unresolvedCreates, remoteQueues, activeCancels] = await Promise.all([
-    db.automationDelivery.count({ where: { agencyId, actionType: { in: MASS_CREATE_ACTIONS }, status: { in: ACTIVE_MASS_WRITE_STATUSES } } }),
-    db.automationDelivery.count({ where: {
-      agencyId, actionType: { in: MASS_CREATE_ACTIONS }, status: "FAILED", failureCode: "outcome_unresolved_do_not_retry",
-      OR: [{ remoteLifecycleState: null }, { remoteLifecycleState: { not: "SETTLED" } }],
-    } }),
-    db.automationDelivery.count({ where: { agencyId, actionType: { in: MASS_CREATE_ACTIONS }, remoteLifecycleState: { in: REMOTE_BLOCKING_STATES } } }),
-    db.automationDelivery.count({ where: {
-      agencyId, actionType: { in: MASS_CANCEL_ACTIONS },
-      OR: [
-        { status: { in: ACTIVE_MASS_WRITE_STATUSES } },
-        { status: "FAILED", failureCode: "outcome_unresolved_do_not_retry" },
-      ],
-    } }),
-  ]);
-  return { activeCreates, unresolvedCreates, remoteQueues, activeCancels, total: activeCreates + unresolvedCreates + remoteQueues + activeCancels };
-}
-
-function freshSnapshotThreshold(now = new Date()) {
-  return new Date(now.getTime() - MASS_PROVIDER_SNAPSHOT_PROOF_MAX_AGE_MS);
-}
-
-function massProviderSnapshotProofKey(agencyIdInput, creatorIdInput, purposeInput = MASS_RETIREMENT_SNAPSHOT_PURPOSE) {
-  const agencyId = String(agencyIdInput || "").trim();
-  const creatorId = String(creatorIdInput || "").trim();
-  const purpose = String(purposeInput || "").trim().toUpperCase();
-  if (!agencyId || !creatorId || !["BROWSE", MASS_RETIREMENT_SNAPSHOT_PURPOSE].includes(purpose)) return null;
-  return `mass-provider-snapshot-proof:${agencyId}:${creatorId}:${purpose}`;
-}
-
-
-async function invalidateCreatorMassProviderRetirementProof({ db, agencyId, creatorId, reason = "mass provider state advanced", now = new Date() }) {
-  const idempotencyKey = massProviderSnapshotProofKey(agencyId, creatorId, MASS_RETIREMENT_SNAPSHOT_PURPOSE);
-  if (!idempotencyKey) return { count: 0 };
-  return db.automationDelivery.updateMany({
-    where: {
-      agencyId, creatorId, idempotencyKey, actionType: MASS_PROVIDER_SNAPSHOT_PROOF_ACTION, status: "COMPLETED",
-    },
-    data: {
-      status: "CANCELED",
-      failureCode: "mass_provider_snapshot_stale",
-      failureCategory: "TERMINAL",
-      lastError: String(reason || "mass provider state advanced").slice(0, 1000),
-      result: {
-        outcomeState: "PROVIDER_SNAPSHOT_STALE",
-        purpose: MASS_RETIREMENT_SNAPSHOT_PURPOSE,
-        invalidatedAt: now.toISOString(),
-        invalidatedReason: String(reason || "mass provider state advanced").slice(0, 500),
-      },
-      finishedAt: now,
-      lastCheckedAt: now,
-    },
-  });
-}
-
 async function creatorHasProviderIdentity({ db, agencyId, creatorId }) {
-  const creator = await db.creatorAccount.findFirst({
-    where: { id: creatorId, agencyId },
-    select: { id: true, remoteId: true },
-  });
-  return Boolean(String(creator?.remoteId || "").trim());
+  const row = await db.creatorAccount.findFirst({ where: { id: creatorId, agencyId }, select: { remoteId: true } });
+  return Boolean(String(row?.remoteId || "").trim());
 }
-
-async function creatorMassProviderSnapshotProof({ db, agencyId, creatorId, now = new Date() }) {
-  const idempotencyKey = massProviderSnapshotProofKey(agencyId, creatorId, MASS_RETIREMENT_SNAPSHOT_PURPOSE);
-  if (!idempotencyKey) return null;
-  const proof = await db.automationDelivery.findUnique({ where: { idempotencyKey } });
-  if (!proof || proof.agencyId !== agencyId || proof.creatorId !== creatorId
-      || proof.actionType !== MASS_PROVIDER_SNAPSHOT_PROOF_ACTION || proof.status !== "COMPLETED"
-      || !(proof.remoteLifecycleObservedAt instanceof Date) || proof.remoteLifecycleObservedAt <= freshSnapshotThreshold(now)
-      || String(proof?.result?.purpose || "").toUpperCase() !== MASS_RETIREMENT_SNAPSHOT_PURPOSE
-      || !proofSnapshotEmpty(proof)) {
-    return null;
-  }
-  if (await creatorMassProviderStateAdvancedAfterProof({ db, agencyId, creatorId, proof })) return null;
-  return proof;
+async function creatorMassProviderSnapshotProof({ db, agencyId, creatorId }) {
+  const [row] = await db.$queryRawUnsafe(`SELECT s."retirementProofId" AS id,s."retirementProofObservedAt" AS "remoteLifecycleObservedAt"
+    FROM "MassCreatorDeliveryState" s JOIN "CreatorAccount" c ON c."id"=s."creatorId" AND c."agencyId"=s."agencyId"
+    WHERE s."agencyId"=$1 AND s."creatorId"=$2 AND s."retirementId" IS NOT NULL AND s."retirementProofId" IS NOT NULL
+      AND s."retirementProofRevision"=s."sourceRevision" AND s."retirementProviderId" IS NOT DISTINCT FROM c."remoteId"`, agencyId, creatorId);
+  return row || null;
 }
-
 async function assertCreatorMassCampaignRetirable(input) {
-  const blockers = await creatorMassCampaignBlockers(input);
-  if (blockers.total > 0) throw new MassCampaignAuthorityError("CREATOR_HAS_ACTIVE_MASS", "Resolve active/unknown MASS writes and pending native OnlyFans queues before removing this creator", 409, blockers);
+  const current = await blockers(input);
+  if (current.total) throw error("CREATOR_HAS_ACTIVE_MASS", "Resolve active/unknown MASS writes and native provider queues before removing the creator", 409, current);
   if (input.requireFreshProviderSnapshot !== false && await creatorHasProviderIdentity(input)) {
     const proof = await creatorMassProviderSnapshotProof(input);
-    if (!proof) {
-      throw new MassCampaignAuthorityError(
-        "CREATOR_MASS_PROVIDER_SNAPSHOT_REQUIRED",
-        "Refresh this creator's complete OnlyFans MASS queue immediately before removal so provider-side queues cannot be orphaned",
-        409,
-        { ...blockers, snapshotMaxAgeMs: MASS_PROVIDER_SNAPSHOT_PROOF_MAX_AGE_MS },
-      );
-    }
-    return { ...blockers, providerSnapshotObservedAt: proof.remoteLifecycleObservedAt };
+    if (!proof) throw error("CREATOR_MASS_PROVIDER_SNAPSHOT_REQUIRED", "Prepare creator retirement with a complete empty provider queue observation", 409, current);
+    return { ...current, providerSnapshotObservedAt: proof.remoteLifecycleObservedAt };
   }
-  return blockers;
+  return current;
 }
-
 async function assertAgencyMassCampaignRetirable(input) {
-  const blockers = await agencyMassCampaignBlockers(input);
-  if (blockers.total > 0) throw new MassCampaignAuthorityError("AGENCY_HAS_ACTIVE_MASS", "Resolve active/unknown MASS writes and pending native OnlyFans queues before removing this agency", 409, blockers);
+  const current = await blockers(input);
+  if (current.total) throw error("AGENCY_HAS_ACTIVE_MASS", "Resolve active/unknown MASS writes and native provider queues before removing the agency", 409, current);
   if (input.requireFreshProviderSnapshot !== false) {
-    const creators = await input.db.creatorAccount.findMany({
-      where: { agencyId: input.agencyId, deletedAt: null, remoteId: { not: null } },
-      select: { id: true },
-    });
-    if (creators.length) {
-      const freshProofs = await input.db.automationDelivery.findMany({
-        where: {
-          agencyId: input.agencyId, actionType: MASS_PROVIDER_SNAPSHOT_PROOF_ACTION, status: "COMPLETED",
-          remoteLifecycleObservedAt: { gt: freshSnapshotThreshold(input.now || new Date()) },
-        },
-        select: { creatorId: true, idempotencyKey: true, remoteLifecycleObservedAt: true, result: true },
-      });
-      const threshold = freshSnapshotThreshold(input.now || new Date());
-      const recentProviderState = await input.db.automationDelivery.findMany({
-        where: {
-          agencyId: input.agencyId, actionType: { in: MASS_PROVIDER_STATE_ACTIONS },
-          OR: [
-            { remoteLifecycleObservedAt: { gt: threshold } },
-            { actionType: { in: [...MASS_CREATE_ACTIONS, ...MASS_CANCEL_ACTIONS] }, writeCommitAt: { gt: threshold } },
-          ],
-        },
-        select: { id: true, creatorId: true, actionType: true, remoteLifecycleObservedAt: true, writeCommitAt: true },
-      });
-      const proven = new Set(freshProofs
-        .filter((row) => String(row?.result?.purpose || "").toUpperCase() === MASS_RETIREMENT_SNAPSHOT_PURPOSE
-          && String(row.idempotencyKey || "") === String(massProviderSnapshotProofKey(input.agencyId, row.creatorId, MASS_RETIREMENT_SNAPSHOT_PURPOSE) || "")
-          && proofSnapshotEmpty(row)
-          && !recentProviderState.some((activity) => String(activity.creatorId || "") === String(row.creatorId || "")
-            && String(activity.id || "") !== String(row.id || "")
-            && (dateAfter(activity.remoteLifecycleObservedAt, row.remoteLifecycleObservedAt) || dateAfter(activity.writeCommitAt, row.remoteLifecycleObservedAt))))
-        .map((row) => String(row.creatorId || ""))
-        .filter(Boolean));
-      const missingCreatorIds = creators.map((row) => String(row.id || "")).filter((id) => id && !proven.has(id));
-      if (missingCreatorIds.length) {
-        throw new MassCampaignAuthorityError(
-          "AGENCY_MASS_PROVIDER_SNAPSHOT_REQUIRED",
-          "Refresh the complete OnlyFans MASS queue for every live creator immediately before removing this agency",
-          409,
-          { ...blockers, snapshotMaxAgeMs: MASS_PROVIDER_SNAPSHOT_PROOF_MAX_AGE_MS, missingCreatorIds },
-        );
-      }
-    }
+    // Proofs accumulate under individual creator admission barriers. Each is
+    // invalidated atomically by accepted MASS state changes or explicit resume.
+    // No all-creators freshness intersection and no historical delivery scan.
+    const missing = await input.db.$queryRawUnsafe(`SELECT c."id" FROM "CreatorAccount" c
+      LEFT JOIN "MassCreatorDeliveryState" s ON s."creatorId"=c."id" AND s."agencyId"=c."agencyId"
+      WHERE c."agencyId"=$1 AND c."deletedAt" IS NULL AND NULLIF(btrim(c."remoteId"),'') IS NOT NULL
+        AND (s."retirementId" IS NULL OR s."retirementProofId" IS NULL OR s."retirementProofRevision" IS DISTINCT FROM s."sourceRevision"
+          OR s."retirementProviderId" IS DISTINCT FROM c."remoteId")
+      ORDER BY c."id" LIMIT 101`, input.agencyId);
+    if (missing.length) throw error("AGENCY_MASS_PROVIDER_SNAPSHOT_REQUIRED", "Prepare retirement for the remaining creators; completed preparations remain paused", 409,
+      { ...current, missingCreatorIds: missing.slice(0, 100).map(row => row.id), hasMore: missing.length > 100 });
   }
-  return blockers;
+  return current;
 }
-
 module.exports = {
-  ACTIVE_MASS_WRITE_STATUSES,
-  REMOTE_BLOCKING_STATES,
-  MASS_CREATE_ACTIONS,
-  MASS_CANCEL_ACTIONS,
-  MASS_PROVIDER_SNAPSHOT_PROOF_ACTION,
-  MASS_PROVIDER_SNAPSHOT_PROOF_MAX_AGE_MS,
-  MASS_RETIREMENT_SNAPSHOT_PURPOSE,
-  massProviderSnapshotProofKey,
-  invalidateCreatorMassProviderRetirementProof,
-  MassCampaignAuthorityError,
-  creatorMassCampaignBlockers,
-  agencyMassCampaignBlockers,
-  creatorHasProviderIdentity,
-  creatorMassProviderSnapshotProof,
-  assertCreatorMassCampaignRetirable,
-  assertAgencyMassCampaignRetirable,
+  ACTIVE_MASS_WRITE_STATUSES: ACTIVE, REMOTE_BLOCKING_STATES: ["PENDING", "MIGRATION_RECONCILE_REQUIRED", "UNKNOWN"],
+  MASS_CREATE_ACTIONS: CREATE_ACTIONS, MASS_CANCEL_ACTIONS: CANCEL_ACTIONS,
+  MASS_PROVIDER_SNAPSHOT_PROOF_MAX_AGE_MS: RETIREMENT_ACCEPT_MS, MASS_RETIREMENT_SNAPSHOT_PURPOSE: "RETIREMENT",
+  creatorMassCampaignBlockers: blockers, agencyMassCampaignBlockers: blockers,
+  creatorHasProviderIdentity, creatorMassProviderSnapshotProof, assertCreatorMassCampaignRetirable, assertAgencyMassCampaignRetirable,
 };

@@ -528,7 +528,7 @@ async function acquireOfRequestSlot(input) {
   const capability = ["security_probe", "read", "write"].includes(input.capability) ? input.capability : "read";
   const operation = clean(input.operation, 160) || "unknown";
   const source = clean(input.source, 240) || null;
-  const billingContext = { userId, member: input.member, billingRecovery: input.billingRecovery || null, jobLease: input.jobLease || null, operationReadback: input.operationReadback || null, physicalRequest: input.physicalRequest || null };
+  const billingContext = { userId, member: input.member, retirementSnapshot: input.retirementSnapshot || null, billingRecovery: input.billingRecovery || null, jobLease: input.jobLease || null, operationReadback: input.operationReadback || null, physicalRequest: input.physicalRequest || null };
   await readJobBillingAdmission({ ...billingContext, agencyId: access.agencyId, creatorId,
     deviceId: access.deviceId, capability, operation });
   return new Promise((resolve, reject) => {

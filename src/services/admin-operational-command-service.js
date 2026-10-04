@@ -40,6 +40,9 @@ async function operationalWork({tx,commitContext,action,targetId,input,command,a
    const destructive=await tx.domainWorkItem.findFirst({where:{agencyId:targetId,workClass:WORK_CLASS.DESTRUCTIVE_AGENCY_CLEANUP,objectType:"Phase2AgencyDestructiveCleanup",objectId:targetId},select:{id:true}});
    if(destructive)throw adminError("AGENCY_DESTRUCTIVE_DELETE_IRREVERSIBLE","Hard deletion has started");
    await assertAgencyHasOperationalOwner({db:tx,agencyId:targetId});
+   await tx.$executeRawUnsafe(`UPDATE "MassCreatorDeliveryState" SET "retirementId"=NULL,"retirementStartedAt"=NULL,"retirementProofId"=NULL,
+     "retirementProofRevision"=NULL,"retirementProofObservedAt"=NULL,"retirementProviderId"=NULL,"sourceRevision"="sourceRevision"+1
+     WHERE "agencyId"=$1 AND "retirementId" IS NOT NULL`,targetId);
    await lockAgencyBillingMutation(tx,targetId);
    await tx.agency.update({where:{id:targetId},data:{deletedAt:null,deletedReason:null}});
    await syncAgencyBillingAggregate(tx,targetId,now);after=await tx.agency.findUnique({where:{id:targetId}});

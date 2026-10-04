@@ -5,6 +5,7 @@ const { z } = require("zod");
 const {
   ProgrammaticOfWriteAuthorityError,
   completeNativeMassWriteWithSettlementToken,
+  completeMassWriteWithSettlementToken,
   settleNativeMassWriteProvenNoEffect,
 } = require("../services/programmatic-of-write-authority-service");
 const { settleCustomManualDeliveryWithCapability } = require("../services/custom-content-delivery-tracking-service");
@@ -75,6 +76,20 @@ router.post("/custom-manual/:writeId/settle", async (req, res) => {
   } catch (error) {
     if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues?.[0]?.message || "Validation error" });
     return sendError(res, error, "CUSTOM_MANUAL_SETTLEMENT_FAILED");
+  }
+});
+
+router.post("/mass/:writeId/complete", async (req, res) => {
+  try {
+    const input = z.object({
+      authorityVersion: z.literal("MASS_RECEIPT_V1"), settlementToken: z.string().min(20).max(500), deviceId: z.string().min(1).max(180),
+      requestKey: z.string().min(3).max(500), queueId: z.string().min(1).max(180), writeCommitRevision: z.number().int().min(1),
+      kind: z.enum(["MASS_QUEUE_CREATE", "MASS_QUEUE_CANCEL"]),
+    }).strict().parse(req.body || {});
+    return res.json(await completeMassWriteWithSettlementToken({ ...input, writeId: req.params.writeId }));
+  } catch (error) {
+    if (error instanceof z.ZodError) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: "Invalid MASS receipt" });
+    return sendError(res, error, "MASS_SETTLEMENT_FAILED");
   }
 });
 

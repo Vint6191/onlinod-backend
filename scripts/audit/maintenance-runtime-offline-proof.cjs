@@ -6,7 +6,7 @@ process.env.TZ='UTC';
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
 const {createRequire}=require('node:module');
 const {PGlite}=require(process.env.ONLINOD_PGLITE_MODULE||'@electric-sql/pglite');
-const ROOT=path.resolve(__dirname,'../..'),MIGRATION='20261004220000_maintenance_registry_v4';
+const ROOT=path.resolve(__dirname,'../..'),MIGRATION='20261005001000_external_delivery_maintenance_v5';
 const report=[],trace=[];
 const check=async(name,fn)=>{const details=await fn();report.push({name,details});console.log('PASS',name,JSON.stringify(details||{}));};
 const adapter=client=>({
@@ -26,20 +26,20 @@ const adapter=client=>({
   const verify=require('../../src/services/maintenance-runtime-contract').verifyMaintenanceRuntime;
   const indexes=require('../database/background-maintenance-indexes');
   const generation=registry.MAINTENANCE_ADMISSION_GENERATION;
-  await check('full prior history loads; pre-listen contract rejects unmigrated v3',async()=>{
+  await check('full prior history loads; pre-listen contract rejects unmigrated v4',async()=>{
     await assert.rejects(verify({db}),{code:'MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH'});return{priorMigrations:names.length,handlers:registry.resolveMaintenanceLanes({db}).size};
   });
-  await check('v4 preserves v3 counters and initializes all four new classes at the minimum',async()=>{
-    await pg.exec(`UPDATE "MaintenanceAdmissionClassState" SET "turnCount"=100+ordinal,"lastAdmittedAt"='2026-01-01' WHERE generation='phase6_maintenance_campaign_read_v3'`);
+  await check('v5 preserves v4 counters and initializes MASS retention at the minimum',async()=>{
+    await pg.exec(`UPDATE "MaintenanceAdmissionClassState" SET "turnCount"=100+ordinal,"lastAdmittedAt"='2026-01-01' WHERE generation='phase6_maintenance_registry_v4'`);
     await pg.exec(migration);
     const rows=await db.$queryRawUnsafe(`SELECT * FROM "MaintenanceAdmissionClassState" WHERE generation=$1 ORDER BY ordinal`,generation);
     assert.deepEqual(rows.map(r=>r.laneName),registry.MAINTENANCE_LANE_NAMES);
-    assert.deepEqual(rows.map(r=>Number(r.turnCount)),[...Array.from({length:25},(_,i)=>100+i),100,100,100,100]);
+    assert.deepEqual(rows.map(r=>Number(r.turnCount)),[...Array.from({length:29},(_,i)=>100+i),100]);
     await assert.rejects(verify({db}),/MAINTENANCE_INDEX_REQUIRED/);return{classes:rows.length};
   });
   await check('online index postflight is repeatable and catches wrong physical definitions',async()=>{
     await indexes.ensureIndexes(db,{create:true});await indexes.ensureIndexes(db,{create:true});
-    assert.equal((await verify({db})).handlers,29);
+    assert.equal((await verify({db})).handlers,30);
     await pg.exec('DROP INDEX "FanObservationToken_expiry_id_idx"; CREATE INDEX "FanObservationToken_expiry_id_idx" ON "FanObservationToken"("id","createdAt")');
     await assert.rejects(verify({db}),/MAINTENANCE_INDEX_INVALID/);
     await pg.exec('DROP INDEX "FanObservationToken_expiry_id_idx"');await indexes.ensureIndexes(db,{create:true});
@@ -48,20 +48,20 @@ const adapter=client=>({
     const load=createRequire(path.join(ROOT,'src/services/maintenance-lane-registry.js'));
     const target=load('./analytics-fact-publication-service'),original=target.runSweep;target.runSweep=undefined;
     const before=trace.length;try{await assert.rejects(verify({db}),/MAINTENANCE_HANDLER_MISSING:analyticsFactPublication/);assert.equal(trace.length,before);}finally{target.runSweep=original;}
-    const {POST}=require('../database/phase7-deploy');assert.deepEqual(POST.slice(0,2),[['background-maintenance-indexes.js','--create'],['maintenance-runtime-postflight.js']]);
+    const {POST}=require('../database/phase7-deploy');assert.deepEqual(POST.slice(0,4),[['external-delivery-indexes.js','--create'],['external-delivery-postflight.js'],['background-maintenance-indexes.js','--create'],['maintenance-runtime-postflight.js']]);
   });
-  await check('actual pump runs all29 registered callbacks; old generation is untouched',async()=>{
+  await check('actual pump runs all30 registered callbacks; old generation is untouched',async()=>{
     await pg.query('UPDATE "MaintenanceAdmissionClassState" SET "turnCount"=0 WHERE generation=$1',[generation]);
     const load=createRequire(path.join(ROOT,'src/services/maintenance-lane-registry.js')),restore=[],calls=[];
     const pump=require('../../src/services/job-scheduler').runPhase2MaintenancePump;
     try{
       for(const lane of registry.MAINTENANCE_LANES){const module=load(lane.module),original=module[lane.method];restore.push(()=>module[lane.method]=original);module[lane.method]=async options=>{assert.equal(options.db,db);calls.push(lane.name);if(lane.name==='financialReceiptRetention')throw Error('controlled lane failure');return{ok:true};};}
       for(let i=0;i<6;i++){const result=await pump({db});assert.equal(result.admission.selected.length,5);}
-      assert.equal(new Set(calls).size,29);assert.equal(calls.length,30);
+      assert.equal(new Set(calls).size,30);assert.equal(calls.length,30);
     }finally{restore.reverse().forEach(fn=>fn());}
     await pg.exec(migration); // Retry does not reset the now advanced generation.
     assert.equal((await admission.readMaintenanceAdmissionProgress({db})).minimumTurns,'1');
-    const old=await pg.query(`SELECT min("turnCount") AS n FROM "MaintenanceAdmissionClassState" WHERE generation='phase6_maintenance_campaign_read_v3'`);assert.equal(Number(old.rows[0].n),100);
+    const old=await pg.query(`SELECT min("turnCount") AS n FROM "MaintenanceAdmissionClassState" WHERE generation='phase6_maintenance_registry_v4'`);assert.equal(Number(old.rows[0].n),100);
   });
   const retention=require('../../src/services/background-retention-service'),credit=require('../../src/services/provider-request-credit-authority-service');
   const tokenRows=async(count,age)=>pg.query(`INSERT INTO "FanObservationToken"("token","jobId","deviceId","leaseRevision","purpose","scopeHash","observedAt","createdAt") SELECT 'token-'||g,'offline-job','d',1,'p','h',clock_timestamp(),statement_timestamp()-$2::interval FROM generate_series(1,$1::int) g`,[count,age]);

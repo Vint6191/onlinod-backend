@@ -1,5 +1,7 @@
 "use strict";
 
+const { hasMassCurrentDebt } = require("./mass-delivery-contract");
+
 const SFS_MODULE_KEY = "sfs";
 const SFS_FOLLOW_TARGET_ACTION_TYPE = "SFS_FOLLOW_TARGET";
 
@@ -44,18 +46,20 @@ function candidateNoLongerNeedsFollowProof(candidate, row) {
  * completed FOLLOW receipt while an old cleanup remains active.  Current SFS
  * embeds proof in the cleanup/candidate; legacy cleanup requires an immutable scoped attestation.
  *
- * Unknown/malformed SFS proof rows fail closed.  Every other delivery class is
- * passed through; its own lifecycle guards remain the caller's responsibility.
+ * Unknown/malformed SFS proof rows fail closed.  Current MASS debt is always retained, including legacy NULL remote lifecycle.
+ * Other delivery classes retain their own lifecycle guards.
  */
 async function partitionAutomationDeliveryHardDeleteCandidates({ db, rows = [] } = {}) {
-  const input = Array.isArray(rows) ? rows.filter(Boolean) : [];
+  const all = Array.isArray(rows) ? rows.filter(Boolean) : [];
+  const massProtected = all.filter(hasMassCurrentDebt);
+  const input = all.filter((row) => !hasMassCurrentDebt(row));
   const relevant = input.filter(isSfsFollowProof);
-  if (!relevant.length) return { deletable: input, protected: [] };
+  if (!relevant.length) return { deletable: input, protected: massProtected };
 
   if (!db?.sfsTargetCandidate?.findMany) {
     return {
       deletable: input.filter((row) => !isSfsFollowProof(row)),
-      protected: relevant,
+      protected: [...massProtected, ...relevant],
     };
   }
 
@@ -78,7 +82,7 @@ async function partitionAutomationDeliveryHardDeleteCandidates({ db, rows = [] }
 
   const attested=await require("./phase7-legacy-storage-service").attestedCleanupCandidates(db,candidates.filter(c=>object(c.metadata).legacyMigration===true));
   const deletable = [];
-  const protectedRows = [];
+  const protectedRows = [...massProtected];
   for (const row of input) {
     if (!isSfsFollowProof(row)) {
       deletable.push(row);
