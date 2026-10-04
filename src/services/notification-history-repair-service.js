@@ -6,6 +6,8 @@ const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-servi
 const work = require("./domain-work-authority-service");
 const { projectFacts, PAGE_SIZE } = require("./notification-consequence-service");
 const KEY = "phase5_notification_history_v1";
+const RETAINED_KEY = "phase5_notification_history_v3";
+const RETAINED_CLASS = "NOTIFICATION_RETAINED_REPAIR_V3";
 const RECEIPT_KEY = "phase5_notification_history_v2";
 const RECEIPT_WORK_CLASS = work.WORK_CLASS.NOTIFICATION_RECEIPT_REPAIR;
 const WORK_CLASS = work.WORK_CLASS.NOTIFICATION_HISTORY_REPAIR;
@@ -26,8 +28,8 @@ function pageSql(table) {
 }
 
 async function enumerateHistoryCreators({ db, receiptRepair = false }) {
-  const key = receiptRepair ? RECEIPT_KEY : KEY;
-  const workClass = receiptRepair ? RECEIPT_WORK_CLASS : WORK_CLASS;
+  const key = receiptRepair === "v3" ? RETAINED_KEY : receiptRepair ? RECEIPT_KEY : KEY;
+  const workClass = receiptRepair === "v3" ? RETAINED_CLASS : receiptRepair ? RECEIPT_WORK_CLASS : WORK_CLASS;
   return runRootCommit(db, async ({ tx }) => {
     const rows = await tx.$queryRawUnsafe('SELECT * FROM "MaintenanceLaneState" WHERE "key"=$1 FOR UPDATE SKIP LOCKED', key);
     const state = rows[0];
@@ -68,7 +70,7 @@ async function enumerateHistoryCreators({ db, receiptRepair = false }) {
 }
 
 async function processHistoryPage({ db, item, ownerToken }) {
-  if (![WORK_CLASS, RECEIPT_WORK_CLASS].includes(item.workClass) || item.objectType !== "CreatorAccount" || item.objectId !== item.creatorId) throw fault("NOTIFICATION_HISTORY_SCOPE_INVALID");
+  if (![WORK_CLASS, RECEIPT_WORK_CLASS, RETAINED_CLASS].includes(item.workClass) || item.objectType !== "CreatorAccount" || item.objectId !== item.creatorId) throw fault("NOTIFICATION_HISTORY_SCOPE_INVALID");
   return runRootCommit(db, async ({ tx }) => {
     const lifecycle = await lockAgencyLifecycleBarrier({ db: tx, agencyId: item.agencyId });
     await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 FOR SHARE', item.creatorId, item.agencyId);
@@ -116,9 +118,10 @@ async function runNotificationHistoryRepairSweep({ db = require("../prisma"), li
   const started = performance.now();
   const enumeration = await enumerateHistoryCreators({ db });
   const receiptEnumeration = await enumerateHistoryCreators({ db, receiptRepair: true });
-  const report = { ok: true, enumeration, receiptEnumeration, processed: 0, completed: 0, yielded: 0, failed: 0, identityMissing: 0 };
+  const retainedEnumeration = await enumerateHistoryCreators({ db, receiptRepair: "v3" });
+  const report = { ok: true, enumeration, receiptEnumeration, retainedEnumeration, processed: 0, completed: 0, yielded: 0, failed: 0, identityMissing: 0 };
   for (let step = 0; step < Math.max(1, Math.min(8, Number(limit) || 4)) && performance.now() - started < maxRuntimeMs; step++) {
-    const claim = await work.claimDomainWorkBatch({ db, workClass: step % 2 ? RECEIPT_WORK_CLASS : WORK_CLASS, limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
+    const claim = await work.claimDomainWorkBatch({ db, workClass: [RETAINED_CLASS, RECEIPT_WORK_CLASS, WORK_CLASS][step % 3], limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
     if (claim.skipped) { report.ok = false; report.reason = claim.reason; break; }
     const item = claim.items?.[0]; if (!item) continue;
     try {

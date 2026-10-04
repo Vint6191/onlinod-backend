@@ -12,7 +12,6 @@ Module._load = function(request, parent, isMain) {
 const {
   projectSubscriptionState,
   projectSubscriptionFacts,
-  rebuildCreatorDailyMetrics,
   upsertLocalMessageCoverage,
 } = require("./creator-analytics-projection-service");
 Module._load = originalLoad;
@@ -72,29 +71,10 @@ test("subscription projection materializes one current state and typed paid rows
   assert.equal(states[0].create.updatedFromEventId, "e2");
 });
 
-test("daily metrics are a derived relational cache, including paid subscriptions", async () => {
-  const upserts = [];
-  const db = {
-    async $queryRawUnsafe(sql) {
-      if (sql.includes('"CreatorMessagesDaily"')) return [{ day: new Date("2026-08-01T00:00:00Z"), incoming: 2n, outgoing: 3n, dialogs: 2n }];
-      if (sql.includes('"CreatorPostLike"')) return [{ day: new Date("2026-08-01T00:00:00Z"), count: 4n, fans: 3n }];
-      if (sql.includes('"CreatorPostComment"')) return [{ day: new Date("2026-08-01T00:00:00Z"), count: 2n, fans: 2n }];
-      if (sql.includes('"CreatorSubscriptionEvent"')) return [{ day: new Date("2026-08-01T00:00:00Z"), subscribed: 1n, renewed: 1n, expired: 0n, auto_renew_disabled: 1n }];
-      if (sql.includes('"CreatorSale"')) return [{ day: new Date("2026-08-01T00:00:00Z"), message_sales: 2n, post_sales: 1n, buyers: 2n, cents: 4000n }];
-      if (sql.includes('"CreatorTip"')) return [{ day: new Date("2026-08-01T00:00:00Z"), count: 1n, cents: 500n }];
-      if (sql.includes('"CreatorPaidSubscription"')) return [{ day: new Date("2026-08-01T00:00:00Z"), count: 1n, cents: 1000n }];
-      return [];
-    },
-    creatorDailyMetrics: { upsert: async (args) => { upserts.push(args); return args.create; } },
-  };
-  const result = await rebuildCreatorDailyMetrics({ db, agencyId: "a", creatorId: "c", from: new Date("2026-08-01T00:00:00Z"), to: new Date("2026-08-01T23:59:00Z"), now: new Date("2026-08-02T00:00:00Z"), includeMessages: true });
-  assert.equal(result.days, 1);
-  const row = upserts[0].create;
-  assert.equal(row.likes, 4);
-  assert.equal(row.messageSales, 2);
-  assert.equal(row.tipsCents, 500);
-  assert.equal(row.paidSubscriptionsCents, 1000);
-  assert.equal(row.totalObservedRevenueCents, 5500);
+test("the old best-effort daily writer is retired", () => {
+  assert.equal(require("./creator-analytics-projection-service").rebuildCreatorDailyMetrics, undefined);
+  const { contribution } = require("./analytics-fact-publication-service");
+  assert.equal(contribution("CreatorPaidSubscription", { paidAt: "2026-08-01", amountCents: 1000 }).values.paidSubscriptionsCents, 1000);
 });
 
 test("local message coverage stores only metadata, never message payloads", async () => {

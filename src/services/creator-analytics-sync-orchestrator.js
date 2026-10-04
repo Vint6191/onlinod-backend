@@ -31,7 +31,6 @@ const NOTIFICATION_JOB_KEY = "catchup_notifications_scan";
 const CAMPAIGN_JOB_KEY = "fetch_campaigns";
 const ANALYTICS_SYNC_VERSION = 1;
 const NOTIFICATION_KNOWN_ID_LIMIT = 300;
-const FINANCIAL_KNOWN_ID_LIMIT = 300;
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -103,7 +102,7 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
       params = { ...params, ...buildNotificationScanParams({ state: initial ? null : currentCollectorState, now, reason: params.reason, analyticsRangeKey: "all" }) };
       if (!initial) params.knownNotificationIds = recentKnownNotificationIdsFromState(currentCollectorState);
     } else if (collectorType === COLLECTOR_TYPES.FINANCIAL) {
-      if (!initial) params.knownTransactionIds = await recentKnownTransactionIds(tx, creatorId);
+      // Financial windows are bound under the claim fence to current coverage.
     } else if (collectorType === COLLECTOR_TYPES.CAMPAIGNS && !initial) {
       const frontierDue = campaignFrontierWorkDue(currentCollectorState, now);
       const directoryDue = campaignDirectoryDiscoveryDue(currentCollectorState, now);
@@ -343,17 +342,6 @@ function recentKnownNotificationIdsFromState(state) {
   return out;
 }
 
-async function recentKnownTransactionIds(db, creatorId) {
-  if (!db?.creatorFinancialTransaction?.findMany) return [];
-  const rows = await db.creatorFinancialTransaction.findMany({
-    where: { creatorId },
-    orderBy: [{ occurredAt: "desc" }, { createdAt: "desc" }],
-    take: FINANCIAL_KNOWN_ID_LIMIT,
-    select: { externalTransactionId: true },
-  });
-  return rows.map((row) => clean(row.externalTransactionId, 220)).filter(Boolean);
-}
-
 function retryDisposition(state, now = new Date()) {
   const retryAt = state?.retryAfterAt ? new Date(state.retryAfterAt) : null;
   if (retryAt && Number.isFinite(retryAt.getTime()) && retryAt > now) {
@@ -432,7 +420,6 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     if (retry.deferred) skipped.push("financial_catchup:deferred");
     else if (retry.terminal) skipped.push("financial_catchup:failed_terminal");
     else {
-    const knownTransactionIds = await recentKnownTransactionIds(db, creatorId);
     const snapshotMarker = Math.floor(now.getTime() / 1000);
     const params = {
       analyticsSyncKind: "catchup",
@@ -444,8 +431,6 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
       startDate: "2016-01-01 00:00:00",
       endDate: onlyFansUtcDateTime(new Date(snapshotMarker * 1000)),
       initialMarker: snapshotMarker,
-      knownTransactionIds,
-      catchupMaxPages: 100,
       schemaVersion: FINANCIAL_SCHEMA_VERSION,
       collectorVersion: FINANCIAL_COLLECTOR_VERSION,
     };
@@ -533,7 +518,6 @@ module.exports = {
   ensureRecurringCreatorAnalyticsCatchups,
   advanceCreatorAnalyticsInitialSyncAfterCompletion,
   recentKnownNotificationIdsFromState,
-  recentKnownTransactionIds,
   financialInitialCoverageReady,
   campaignInitialCoverageReady,
   creatorAnalyticsInitialSyncReady,

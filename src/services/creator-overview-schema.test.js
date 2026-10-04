@@ -15,7 +15,8 @@ const migration = read("../prisma/migrations/20260809121500_creator_overview_v1/
 
 test("creator overview is a composed read model, not another raw analytics store", () => {
   assert.match(service, /readCreatorLedgerOverview/);
-  assert.match(service, /creatorFinancialTransaction\.groupBy/);
+  assert.match(service, /ledger\.financialGroups/);
+  assert.doesNotMatch(service, /creatorFinancialTransaction\.groupBy/);
   assert.match(service, /readCampaignPage/);
   assert.doesNotMatch(service, /creatorCampaignFan\.groupBy/);
   assert.match(service, /transactionStatus/);

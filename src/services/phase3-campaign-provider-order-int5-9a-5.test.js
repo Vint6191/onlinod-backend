@@ -50,6 +50,6 @@ test("INT5.9A-5 rolling wire requires explicit order-independent traversal capab
   const publication = read("src/services/analytics-publication-service.js");
   assert.match(lease, /acceptAnalyticsPublication/);
   assert.match(publication, /sideEffect\?\.completion\?\.protocolCurrent === false/);
-  assert.match(publication, /fetch_campaigns_protocol_superseded/);
+  assert.match(publication, /\$\{job\.jobKey\}_protocol_superseded/);
   assert.match(publication, /protocolSuperseded: true/);
 });

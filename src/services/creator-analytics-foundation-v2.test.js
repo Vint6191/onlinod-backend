@@ -61,7 +61,7 @@ test("subscription state and money are separate relational projections", () => {
   assert.match(projection, /PAID_EVENT_TYPES/);
 });
 
-test("daily metrics are explicitly a rebuildable relational cache", () => {
+test("canonical facts feed durable rebuildable daily publication", () => {
   const metrics = modelBody("CreatorDailyMetrics");
   for (const column of [
     "incomingMessages", "outgoingMessages", "uniqueDialogs", "likes", "comments",
@@ -69,9 +69,9 @@ test("daily metrics are explicitly a rebuildable relational cache", () => {
     "tipsCount", "tipsCents", "paidSubscriptions", "paidSubscriptionsCents",
     "salesCents", "totalObservedRevenueCents", "dataVersion",
   ]) assert.match(metrics, new RegExp(`\\b${column}\\b`));
-  assert.match(projection, /rebuildCreatorDailyMetrics/);
-  assert.match(ledger, /disposable read cache/);
-  assert.match(notifications, /disposable read cache/);
+  assert.doesNotMatch(projection, /rebuildCreatorDailyMetrics/);
+  assert.match(ledger, /readPublishedDays/);
+  assert.doesNotMatch(notifications, /rebuildCreatorDailyMetrics/);
 });
 
 test("local message coverage stores only metadata and never message bodies", () => {

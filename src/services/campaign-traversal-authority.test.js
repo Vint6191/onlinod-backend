@@ -56,8 +56,8 @@ test("missing expected continuation fails closed; initial empty envelope is cano
 test("the jobs route reports traversal conflicts as 409 without masking unrelated errors",()=>{
   const source=fs.readFileSync(path.join(__dirname,"../routes/jobs.js"),"utf8");
   const body=source.slice(source.indexOf("function leaseError("),source.indexOf("const deviceSchema"));
-  const respond=new Function("JobLeaseError","CampaignTraversalError","return ("+body+")")(
-    class JobLeaseError extends Error {},authority.CampaignTraversalError);
+  const respond=new Function("JobLeaseError","CampaignTraversalError","FinancialReceiptError","return ("+body+")")(
+    class JobLeaseError extends Error {},authority.CampaignTraversalError,require("./financial-receipt-authority").FinancialReceiptError);
   const response={statusCode:null,body:null,status(code){this.statusCode=code;return this;},json(body){this.body=body;return this;}};
   let conflict;try{authority.expectedMatches(fixture().job,undefined);}catch(error){conflict=error;}
   respond(response,conflict);
@@ -101,7 +101,7 @@ function progressFixture(job, apply) {
   let writes=0;
   const tx={jobInstance:{updateMany:async({data})=>{writes++;Object.assign(job,structuredClone(data));return{count:1};},
     update:async({data})=>{writes++;Object.assign(job,structuredClone(data));return structuredClone(job);}}};
-  const deps={campaignTraversal:authority,leaseCommit:async(_,work)=>work(tx,{job:structuredClone(job),now}),
+  const deps={require,campaignTraversal:authority,leaseCommit:async(_,work)=>work(tx,{job:structuredClone(job),now}),
     enterCampaignBoundedExecution:async()=>{},hashToken:()=>"hash",leaseDuration:()=>60000,safeProgress:x=>x,
     normalizeLeaseContinuation:x=>x,clean:x=>x,applyJobChunk:apply,publishNotificationConsequences:async()=>{},
     campaignServerBoundaryContinuation:()=>null,campaignDirectorySegmentContinuation:()=>null,JobLeaseError:Error};

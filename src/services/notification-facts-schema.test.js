@@ -108,7 +108,7 @@ test("ingest is version-fenced, transactional, page-oriented and interval-aware"
   assert.match(service, /const LEGACY_COLLECTOR_VERSION = "notifications-catchup-v4"/);
   assert.match(service, /schemaVersion === ALL_SCHEMA_VERSION \? "v5" : "v6"/);
   assert.match(service, /notification-facts:\$\{job\.id\}:\$\{batchKey\}:\$\{protocolSuffix\}/);
-  assert.match(service, /db\.\$transaction/);
+  assert.match(service, /runDbTransaction/);
   assert.match(service, /createMany\(\{ data: creates\.map/);
   assert.doesNotMatch(service, /analyticsCoverage\.(?:findMany|createMany|updateMany)/);
   assert.match(service, /Notifications are a cursor\/frontier collector/);
@@ -182,6 +182,6 @@ test("notification catch-up has one scheduler owner and page ingest does not reb
   assert.match(observation, /creator_analytics_orchestrator_owned/);
   assert.doesNotMatch(observation, /buildJobIdempotencyKey/);
   assert.doesNotMatch(observation, /jobInstance\.create\(/);
-  assert.match(service, /const ownsTransactionBoundary = typeof db\.\$transaction === "function"/);
-  assert.match(service, /if \(ownsTransactionBoundary && \(finalizeCoverage \|\| metricDates\.length > 0\) && db\.creatorDailyMetrics\)/);
+  assert.doesNotMatch(service, /rebuildCreatorDailyMetrics|ownsTransactionBoundary/);
+  assert.match(service, /notification-fact-receipt-service/);
 });

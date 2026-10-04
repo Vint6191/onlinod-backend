@@ -555,6 +555,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   ) {
     allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
   }
+  if (capabilities?.financialWindowReceiptsV1 !== true) allowedJobKeys = allowedJobKeys.filter(key => key !== "financial_transactions_scan");
   if (!allowedJobKeys.length) return { job: null, reason: "no-capabilities" };
   const explicitlyExcluded = new Set(
     (Array.isArray(excludedCreatorIds) ? excludedCreatorIds : [])
@@ -654,6 +655,12 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       if (!readyBindings.length) return null;
       const attemptClaimData = { ...claimData, claimedAt: claimNow,
         leaseUntil: new Date(claimNow.getTime() + leaseDuration(leaseMs)), startedAt: candidate.startedAt || claimNow };
+      if (candidate.jobKey === "financial_transactions_scan") {
+        const authority = require("./financial-receipt-authority");
+        await authority.enter(db);
+        attemptClaimData.params = await authority.claimParams(db, candidate);
+        attemptClaimData.continuation = await authority.restoreContinuation(db, { ...candidate, params: attemptClaimData.params });
+      }
       const updated = await db.jobInstance.updateMany({
         where: {
           id: candidate.id,
@@ -755,6 +762,7 @@ async function leaseCommit(input, work, { profile = "JOB_CHUNK", allowExpired = 
     return await runRootCommit(prisma, async ({ tx }) => {
       const job = await requireLease({ ...input, db: tx, lock: true, allowExpired });
       if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
+      if (job.jobKey === "financial_transactions_scan") await require("./financial-receipt-authority").enter(tx);
       const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
       return work(tx, { job, now });
     }, { profile, authority: { kind: "JOB_LEASE", userId: input.userId }, conflictCode: "JOB_LEASE_CONFLICT" });
@@ -878,6 +886,8 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
     && !campaignTraversal.expectedMatches(job, continuation)) {
     throw new JobLeaseError("CAMPAIGN_PROGRESS_ENDPOINT_REQUIRED", "Campaign continuation advances only through progress", 409);
   }
+  if (require("./financial-receipt-authority").enabled(job) && continuation !== undefined
+    && !require("./financial-receipt-authority").expectedMatches(job, continuation)) throw new JobLeaseError("FINANCIAL_PROGRESS_ENDPOINT_REQUIRED", "Financial cursor advances only with a receipt", 409);
   const tokenHash = hashToken(leaseToken);
   const data = {
     leaseUntil: new Date(now.getTime() + leaseDuration(leaseMs)),
@@ -946,6 +956,13 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       campaignTraversal.assertProgress(job, chunkResult, requestedContinuation);
     }
 
+    const financialAuthority = require("./financial-receipt-authority");
+    if (financialAuthority.enabled(job) && !financialAuthority.expectedMatches(job, expectedContinuation)) {
+      return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
+        progress: job.progress, continuation: job.continuation, sideEffect: { staleProgress: true } };
+    }
+    if (financialAuthority.enabled(job) && !["financial_transactions_page", "financial_chart_total"].includes(chunkResult?.kind))
+      throw new JobLeaseError("FINANCIAL_PAGE_RECEIPT_REQUIRED", "Financial progress requires a source receipt", 409);
     const updatedFence = await tx.jobInstance.updateMany({
       where: {
         id: job.id,
@@ -979,7 +996,9 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       throw new JobLeaseError("CAMPAIGN_SEGMENT_CONTINUATION_INVALID", "Campaign directory segment could not be bound to requested continuation", 409);
     }
     let updated = null;
-    if (job.jobKey === "fetch_campaigns" && sideEffect?.replay === true) {
+    if (financialAuthority.enabled(job) && sideEffect?.financialContinuation) {
+      updated = await tx.jobInstance.update({ where: { id: job.id }, data: { continuation: sideEffect.financialContinuation } });
+    } else if (job.jobKey === "fetch_campaigns" && sideEffect?.replay === true) {
       // Receipts prove data was already ingested; they do not authorize an old
       // continuation to replace a newer cursor. Also protects legacy leases.
       updated = await tx.jobInstance.update({ where: { id: job.id }, data: {

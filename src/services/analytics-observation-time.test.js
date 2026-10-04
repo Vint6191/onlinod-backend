@@ -23,15 +23,16 @@ function job(type, mode = "full", at = old) {
 }
 function stateDb(kind, initial = null) {
   let state = initial;
-  return { [kind]: {
+  return require("../../scripts/test-support/commit-database-fixture").commitDatabaseFixture({ [kind]: {
     findUnique: async () => state,
     upsert: async ({ create, update }) => (state = { ...(state || create), ...(state ? update : {}) }),
     update: async ({ data }) => (state = { ...state, ...data }),
   }, creatorNotificationScanItem: { findMany: async () => [] }, read: () => state,
+  $executeRawUnsafe: async sql => { assert.match(sql, /onlinod\.financial_receipts_v1|pg_advisory_xact_lock|onlinod\.campaign_projection_writer/); return 1; },
   $queryRawUnsafe: async sql => {
     assert.equal(sql, 'SELECT clock_timestamp() AS "authorityNow"');
     return [{ authorityNow: now }];
-  } };
+  } });
 }
 function evaluate(state, at = now) {
   return evaluateDurableCollectorState({ status: state.status, baselineVerifiedAt: state.baselineVerifiedAt,
@@ -73,7 +74,7 @@ test("completed legacy baseline remains usable and schedules catch-up without fr
 });
 
 test("new verified catch-up refreshes a legacy baseline without re-reading full history", () => {
-  const state = { status: "COMPLETE", baselineVerifiedAt: old, lastCatchupCompletedAt: now, lastCatchupObservedAt: now };
+  const state = { receiptCoverageVersion: 1, status: "COMPLETE", baselineVerifiedAt: old, lastCatchupCompletedAt: now, lastCatchupObservedAt: now };
   assert.equal(evaluate(state).fresh, true);
   assert.equal(iso(collectorPlanningProofAt("FINANCIAL", "catchup", state, now)), now.toISOString());
   assert.equal(evaluate({ ...state, baselineVerifiedAt: null }).proven, false);
@@ -90,7 +91,7 @@ test("publication and future observation cannot fabricate a fresh proof", () => 
 
 for (const mode of ["full", "catchup"]) test(`financial ${mode} completion and replay preserve source age`, async () => {
   const db = stateDb("creatorFinancialCollectionState", { baselineVerifiedAt: old, baselineObservedAt: old });
-  const input = { db, job: job("FINANCIAL", mode), complete: true, scanRunId: "generation", rangeTo: old };
+  const input = { db, job: job("FINANCIAL", mode), complete: true, scanRunId: "generation", receiptRun: { proof: { complete: true }, windows: [{ kind: mode === "full" ? "FULL" : "HEAD", from: new Date(+old - hour).toISOString(), to: old.toISOString() }] }, rangeTo: old };
   await completeFinancialCollection(input);
   const timestamp = db.read()[mode === "full" ? "baselineObservedAt" : "lastCatchupObservedAt"];
   assert.equal(iso(timestamp), old.toISOString());

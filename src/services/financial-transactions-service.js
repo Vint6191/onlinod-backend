@@ -5,7 +5,6 @@ const { runDbTransaction } = require("./db-transaction-service");
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { dbAuthorityNow } = require("./db-time-authority-service");
-const { rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
 const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
 const { projectFanIdentity } = require("./fan-data-authority-service");
 const { lockCreatorFacts, retainKnownFan } = require("./creator-fact-write-authority");
@@ -13,8 +12,9 @@ const {
   COLLECTOR_TYPES, collectionCommand, acceptFinancialGeneration, completeFinancialCollection, recordFinancialCollectionFailure,
 } = require("./analytics-collector-control-service");
 
+const receipts = require("./financial-receipt-authority");
 const JOB_KEY = "financial_transactions_scan";
-const COLLECTOR_VERSION = "payout-transactions-v2-catchup";
+const COLLECTOR_VERSION = receipts.COLLECTOR;
 const SCHEMA_VERSION = 1;
 const KNOWN_SALE_TYPES = new Map([
   ["message", "MESSAGE"],
@@ -288,7 +288,12 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
   if (page < 1) throw new Error("Financial transaction chunk has invalid pageNumber");
   const rawRows = Array.isArray(chunk?.transactions) ? chunk.transactions : [];
   if (rawRows.length > 100) throw new Error("Financial transaction page exceeds 100 rows");
-  const normalized = rawRows.map((row, index) => normalizeTransaction(row, index, page));
+  const normalized = rawRows.map((row, index) => {
+    const normalizedRow = normalizeTransaction(row, index, page);
+    if (!normalizedRow.rejected && receipts.enabled(job) && !receipts.withinWindow(job, chunk, normalizedRow))
+      return { ...normalizedRow, rejected: true, reasonCode: "OUTSIDE_REQUESTED_FINANCIAL_WINDOW" };
+    return normalizedRow;
+  });
   const rejected = normalized.filter((row) => row.rejected);
   // A source page should not normally repeat a transaction id, but replayed or
   // corrected rows must never explode the creator-scoped unique key. Keep the
@@ -301,12 +306,14 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
   const accepted = [...acceptedByTransactionId.values()];
   const processReceivedAt = new Date();
   let inserted = 0; let updated = 0; let unchanged = 0; let projected = 0; let storedOnly = 0;
-  const affectedDates = [];
 
   const transactionOutcome = await runInTransaction(db, async (tx) => {
     const generation = await acceptFinancialGeneration({ db: tx, job, deviceId });
+    if (!generation.accepted && receipts.enabled(job)) throw Object.assign(new Error("FINANCIAL_GENERATION_SUPERSEDED"), { code: "FINANCIAL_GENERATION_SUPERSEDED", status: 409 });
     if (!generation.accepted) return { superseded: true, generation: generation.command.generation };
     const now = await dbAuthorityNow({ db: tx, fallbackNow: processReceivedAt });
+    const receipt = receipts.enabled(job) ? await receipts.beforePage(tx, job, chunk) : null;
+    if (receipt?.replay) return { receiptReplay: true, financialContinuation: receipt.financialContinuation };
     await lockCreatorFacts(tx, job.agencyId, job.creatorId);
     const ids = accepted.map((row) => row.externalTransactionId);
     const existingRows = ids.length ? await tx.creatorFinancialTransaction.findMany({
@@ -363,36 +370,23 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
           await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "TIP", sourceId: projectedFact.id, now });
         }
         projected += 1;
-        affectedDates.push(row.occurredAt);
       } else {
         storedOnly += 1;
       }
     }
-    return { superseded: false, authorityNow: now };
+    const financialContinuation = receipt ? await receipts.commitPage(tx, job, chunk, receipt, accepted, rejected.length) : null;
+    return { superseded: false, authorityNow: now, financialContinuation };
   });
 
+  if (transactionOutcome?.receiptReplay) return { type: "financial_transactions_page", replay: true, financialContinuation: transactionOutcome.financialContinuation };
   if (transactionOutcome?.superseded) {
     return { type: "financial_transactions_page", scanRunId, page, superseded: true, received: rawRows.length, accepted: 0, rejected: 0, inserted: 0, updated: 0, unchanged: rawRows.length, projected: 0, storedOnly: 0, rejectedRows: [] };
   }
 
-  if (affectedDates.length) {
-    // A sparse payout page can span more than a year on low-volume historical
-    // accounts. CreatorDailyMetrics is a disposable cache, so rebuild only the
-    // UTC days that actually changed instead of filling the entire min..max
-    // interval and tripping the 370-day safety bound.
-    const uniqueDays = [...new Set(affectedDates.map((date) => date.toISOString().slice(0, 10)))].sort();
-    for (const day of uniqueDays) {
-      const date = new Date(`${day}T00:00:00.000Z`);
-      try {
-        await rebuildCreatorDailyMetrics({ db, agencyId: job.agencyId, creatorId: job.creatorId, from: date, to: date, now: transactionOutcome.authorityNow });
-      } catch (error) {
-        console.warn("[creator-analytics] daily metrics projection failed after payout transaction ingest:", error?.message || error);
-      }
-    }
-  }
 
   return {
     type: "financial_transactions_page",
+    ...(transactionOutcome.financialContinuation ? { financialContinuation: transactionOutcome.financialContinuation } : {}),
     scanRunId, page,
     received: rawRows.length,
     accepted: accepted.length,
@@ -406,32 +400,11 @@ async function ingestFinancialChartChunk({ db = prisma, job, deviceId, chunk }) 
   const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   const category = CHART_CATEGORY_MAP[String(chunk?.category || "").trim().toLowerCase()];
   if (!category) throw new Error("Unsupported financial chart category");
-  const grossCents = signedInteger(chunk?.grossCents, Number.NaN, 2_147_483_647);
-  const netCents = signedInteger(chunk?.netCents, Number.NaN, 2_147_483_647);
-  const transactionsCount = integer(chunk?.transactionsCount, -1, 100_000_000);
-  if (!Number.isInteger(grossCents) || !Number.isInteger(netCents) || transactionsCount < 0) throw new Error("Financial chart totals are invalid");
-  const rangeFrom = strictDate(chunk?.rangeFrom);
-  const rangeTo = strictDate(chunk?.rangeTo);
-  const scanRunId = clean(chunk?.scanRunId, 120);
-  if (!rangeFrom || !rangeTo || !scanRunId || scanRunId !== command.generation) throw new Error("Financial chart chunk is missing server generation metadata");
-  const processReceivedAt = new Date();
+  if (!receipts.enabled(job)) return { type: "financial_chart_total", category, superseded: true, protocolCurrent: false };
+  if (chunk.scanRunId !== command.generation) throw new receipts.FinancialReceiptError("FINANCIAL_CHART_GENERATION_INVALID");
   const generation = await acceptFinancialGeneration({ db, job, deviceId });
-  if (!generation.accepted) return { type: "financial_chart_total", category, superseded: true, grossCents, netCents, transactionsCount };
-  const now = await dbAuthorityNow({ db, fallbackNow: processReceivedAt });
-  await db.creatorEarningsTotal.upsert({
-    where: { creatorId_category: { creatorId: job.creatorId, category } },
-    create: {
-      id: crypto.randomUUID(), agencyId: job.agencyId, creatorId: job.creatorId, category,
-      rangeFrom, rangeTo, grossCents, netCents, transactionsCount, currency: "USD",
-      collectedAt: now, sourceDeviceId: deviceId || null, sourceJobId: job.id, scanRunId,
-      createdAt: now, updatedAt: now,
-    },
-    update: {
-      rangeFrom, rangeTo, grossCents, netCents, transactionsCount, currency: "USD",
-      collectedAt: now, sourceDeviceId: deviceId || null, sourceJobId: job.id, scanRunId, updatedAt: now,
-    },
-  });
-  return { type: "financial_chart_total", category, grossCents, netCents, transactionsCount };
+  if (!generation.accepted) throw new receipts.FinancialReceiptError("FINANCIAL_GENERATION_SUPERSEDED");
+  return { type: "financial_chart_total", category, ...await receipts.commitChart(db, job, chunk) };
 }
 
 function validateFinancialCompletion(job, result) {
@@ -446,26 +419,13 @@ function validateFinancialCompletion(job, result) {
 async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, result, publication = null }) {
   const { payload, command, scanRunId } = validateFinancialCompletion(job, result);
   const mode = command.mode;
-  const baseWhere = { creatorId: job.creatorId, sourceJobId: job.id, scanRunId };
-  const [aggregate, count, statusGroups, chartTotal, storedOnly] = publication
-    ? [{ _sum: { amountCents: publication.grossCents, netCents: publication.netCents, feeCents: publication.feeCents } },
-      publication.count, Object.values(publication.statusGroups || {}),
-      await db.creatorEarningsTotal.findUnique({ where: { creatorId_category: { creatorId: job.creatorId, category: "TOTAL" } } }), publication.storedOnly]
-    : await Promise.all([
-    db.creatorFinancialTransaction.aggregate({
-      where: baseWhere,
-      _sum: { amountCents: true, netCents: true, feeCents: true },
-    }),
-    db.creatorFinancialTransaction.count({ where: baseWhere }),
-    db.creatorFinancialTransaction.groupBy({
-      by: ["transactionStatus"],
-      where: baseWhere,
-      _count: { _all: true },
-      _sum: { amountCents: true, netCents: true, feeCents: true },
-    }),
-    db.creatorEarningsTotal.findUnique({ where: { creatorId_category: { creatorId: job.creatorId, category: "TOTAL" } } }),
-    db.creatorFinancialTransaction.count({ where: { ...baseWhere, projectionStatus: "STORED_ONLY" } }),
-  ]);
+  const receipt = await receipts.completionProof(db, job);
+  if (!receipt.protocolCurrent) return { ok: false, complete: false, protocolCurrent: false, type: "financial_transactions", error: "FINANCIAL_RECEIPT_PROTOCOL_REQUIRED" };
+  const proof = receipt.row?.proof.windows[0];
+  if (!proof) return { ok: false, complete: false, protocolCurrent: true, type: "financial_transactions", error: "FINANCIAL_RECEIPTS_MISSING" };
+  const aggregate = { _sum: { amountCents: proof.grossCents, netCents: proof.netCents, feeCents: proof.feeCents } };
+  const count = proof.count, statusGroups = Object.values(proof.statusGroups), storedOnly = proof.storedOnly;
+  const chartTotal = proof.charts.total ? { ...proof.charts.total, sourceJobId: job.id, scanRunId } : null;
   const grossCents = Number(aggregate?._sum?.amountCents || 0);
   const netCents = Number(aggregate?._sum?.netCents || 0);
   const feeCents = Number(aggregate?._sum?.feeCents || 0);
@@ -474,8 +434,8 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   const earningsGrossCents = grossCents - statusTotals.refundGrossCents;
   const earningsNetCents = netCents - statusTotals.refundNetCents;
   const earningsFeeCents = feeCents - statusTotals.refundFeeCents;
-  const sourceBoundaryReached = payload.sourceBoundaryReached === true;
-  const scannerRejected = integer(payload.scannerRejected, 0, 100_000_000);
+  const sourceBoundaryReached = receipt.row.cursor.phase === "done";
+  const scannerRejected = receipt.row.proof.windows.reduce((sum, window) => sum + window.rejected, 0);
   const chartReady = Boolean(chartTotal && chartTotal.sourceJobId === job.id && chartTotal.scanRunId === scanRunId);
   // Live OF evidence from multiple creators shows earnings/chart includes both
   // cleared (done) and payout-pending (loading) earnings, while status=undo is
@@ -483,20 +443,21 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   const countMatched = chartReady ? earningsTransactionsCount === Number(chartTotal.transactionsCount || 0) : false;
   const grossMatched = chartReady ? earningsGrossCents === Number(chartTotal.grossCents || 0) : false;
   const netMatched = chartReady ? earningsNetCents === Number(chartTotal.netCents || 0) : false;
-  const complete = mode === "catchup"
-    ? sourceBoundaryReached && scannerRejected === 0
-    : sourceBoundaryReached && scannerRejected === 0 && chartReady && countMatched && grossMatched && netMatched;
+  const complete = receipt.complete && sourceBoundaryReached && scannerRejected === 0 && chartReady && countMatched && grossMatched && netMatched;
   const stateResult = await completeFinancialCollection({
     db, job, deviceId, complete, scanRunId,
-    boundary: payload.knownBoundaryReached === true ? "KNOWN_TRANSACTION_IDS" : sourceBoundaryReached ? "SOURCE_EXHAUSTED" : null,
-    rangeFrom: object(job.params).startDate || chartTotal?.rangeFrom || null,
-    rangeTo: object(job.params).endDate || chartTotal?.rangeTo || null,
+    boundary: sourceBoundaryReached ? "RECEIPT_VERIFIED_WINDOWS" : null,
+    rangeFrom: receipt.row.windows[0].from,
+    rangeTo: receipt.row.windows[0].to,
+    receiptRun: receipt.row,
   });
   const authoritativeComplete = complete && stateResult?.applied !== false;
   return {
     // Reaching the source boundary is not enough for a successful execution:
     // the JobInstance retry/quarantine lifecycle must see incomplete proof.
     ok: authoritativeComplete,
+    protocolCurrent: true,
+    windows: receipt.row.windows.map((window, index) => ({ ...window, ...receipt.row.proof.windows[index] })),
     type: "financial_transactions",
     mode,
     complete: authoritativeComplete,

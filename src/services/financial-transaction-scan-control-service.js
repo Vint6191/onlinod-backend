@@ -25,11 +25,6 @@ function integer(value, fallback = 0, max = 100_000_000) {
   if (!Number.isInteger(parsed) || parsed < 0) return fallback;
   return Math.min(max, parsed);
 }
-function signedInteger(value, fallback = 0, max = 2_147_483_647) {
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || Math.abs(parsed) > max) return fallback;
-  return parsed;
-}
 function iso(value) {
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value);
@@ -143,13 +138,13 @@ function transactionForClient(row) {
   };
 }
 
-async function readManualFinancialTransactionScan({ db = prisma, creator, limit = 100, offset = 0 }) {
+async function readManualFinancialTransactionScan({ db = prisma, creator, limit = 100, offset = 0, cursor = null }) {
   const jobs = await recentJobs(db, creator.id, null, 60);
   const job = await activeCollectorJob(db, creator.id, JOB_KEY) || jobs[0] || null;
   const safeLimit = Math.max(1, Math.min(200, integer(limit, 100, 200)));
-  const safeOffset = Math.max(0, Math.min(1_000_000, integer(offset, 0, 1_000_000)));
+  if (Number(offset) !== 0) throw Object.assign(new Error("Use the returned Financial page cursor"), { code: "FINANCIAL_CURSOR_REQUIRED", status: 409 });
+  const safeOffset = 0;
   const progress = object(job?.progress);
-  const result = object(job?.result);
   let rows = [];
   let total = 0;
   let summary = {
@@ -163,66 +158,30 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
   let typeSummary = [];
   let charts = [];
   let bounds = null;
-  if (job) {
-    const where = { creatorId: creator.id, sourceJobId: job.id, ...(clean(result.scanRunId, 120) ? { scanRunId: clean(result.scanRunId, 120) } : {}) };
-    const [items, count, aggregate, statusGroups, projectionGroups, typeGroups, chartRows, minMax] = await Promise.all([
-      db.creatorFinancialTransaction.findMany({ where, orderBy: [{ page: "desc" }, { ordinal: "asc" }, { occurredAt: "desc" }], skip: safeOffset, take: safeLimit }),
-      db.creatorFinancialTransaction.count({ where }),
-      db.creatorFinancialTransaction.aggregate({ where, _sum: { amountCents: true, netCents: true, feeCents: true } }),
-      db.creatorFinancialTransaction.groupBy({ by: ["transactionStatus"], where, _count: { _all: true }, _sum: { amountCents: true, netCents: true, feeCents: true } }),
-      db.creatorFinancialTransaction.groupBy({ by: ["projectionStatus"], where, _count: { _all: true } }),
-      db.creatorFinancialTransaction.groupBy({ by: ["transactionType", "factType", "projectionStatus", "reasonCode"], where, _count: { _all: true }, _sum: { amountCents: true, netCents: true } }),
-      db.creatorEarningsTotal.findMany({ where: { creatorId: creator.id, sourceJobId: job.id }, orderBy: { category: "asc" } }),
-      db.creatorFinancialTransaction.aggregate({ where, _min: { occurredAt: true }, _max: { occurredAt: true } }),
-    ]);
-    rows = items.map(transactionForClient);
-    total = count;
-    const grossCents = Number(aggregate?._sum?.amountCents || 0);
-    const netCents = Number(aggregate?._sum?.netCents || 0);
-    const feeCents = Number(aggregate?._sum?.feeCents || 0);
-    const statusTotals = summarizeStatusGroups(statusGroups);
+  const receipt = await require("./financial-receipt-read-service").read({ db, job, creator, limit: safeLimit, cursor });
+  const run = receipt.run, proof = run?.proof.windows[0];
+  if (proof) {
+    rows = receipt.items.map(transactionForClient); total = proof.count; bounds = receipt.bounds;
+    const statusTotals = summarizeStatusGroups(Object.values(proof.statusGroups));
     statusSummary = statusTotals.statusSummary;
-    summary = {
-      transactionsCount: count,
-      grossCents,
-      netCents,
-      feeCents,
-      projected: Number(projectionGroups.find((group) => group.projectionStatus === "PROJECTED")?._count?._all || 0),
-      storedOnly: Number(projectionGroups.find((group) => group.projectionStatus === "STORED_ONLY")?._count?._all || 0),
-      earningsTransactionsCount: Math.max(0, count - statusTotals.refundTransactionsCount),
-      earningsGrossCents: grossCents - statusTotals.refundGrossCents,
-      earningsNetCents: netCents - statusTotals.refundNetCents,
-      settledTransactionsCount: statusTotals.settledTransactionsCount,
-      settledGrossCents: statusTotals.settledGrossCents,
-      settledNetCents: statusTotals.settledNetCents,
-      pendingTransactionsCount: statusTotals.pendingTransactionsCount,
-      pendingGrossCents: statusTotals.pendingGrossCents,
-      pendingNetCents: statusTotals.pendingNetCents,
-      refundTransactionsCount: statusTotals.refundTransactionsCount,
-      refundGrossCents: statusTotals.refundGrossCents,
-      refundNetCents: statusTotals.refundNetCents,
+    summary = { transactionsCount: total, grossCents: proof.grossCents, netCents: proof.netCents, feeCents: proof.feeCents,
+      projected: total - proof.storedOnly, storedOnly: proof.storedOnly,
+      earningsTransactionsCount: Math.max(0, total - statusTotals.refundTransactionsCount),
+      earningsGrossCents: proof.grossCents - statusTotals.refundGrossCents,
+      earningsNetCents: proof.netCents - statusTotals.refundNetCents,
+      ...Object.fromEntries(Object.entries(statusTotals).filter(([key]) => key !== "statusSummary")),
     };
-    typeSummary = typeGroups.map((group) => ({
-      transactionType: group.transactionType,
-      factType: group.factType,
-      projectionStatus: group.projectionStatus,
-      reasonCode: group.reasonCode,
-      count: Number(group._count?._all || 0),
-      grossCents: Number(group._sum?.amountCents || 0),
-      netCents: Number(group._sum?.netCents || 0),
-    })).sort((a, b) => b.count - a.count || a.transactionType.localeCompare(b.transactionType));
-    charts = chartRows.map((row) => ({
-      category: row.category, grossCents: row.grossCents, netCents: row.netCents,
-      transactionsCount: row.transactionsCount, rangeFrom: iso(row.rangeFrom), rangeTo: iso(row.rangeTo), collectedAt: iso(row.collectedAt),
-    }));
-    bounds = minMax;
+    typeSummary = Object.values(proof.typeGroups || {}).sort((a,b) => b.count-a.count || a.transactionType.localeCompare(b.transactionType));
+    const categories = { total: "TOTAL", subscribes: "SUBSCRIPTIONS", tips: "TIPS", messages: "MESSAGES", post: "POSTS", stream: "STREAMS" };
+    charts = Object.entries(proof.charts).map(([key, value]) => ({ ...value, category: categories[key],
+      rangeFrom: run.windows[0].from, rangeTo: run.windows[0].to, collectedAt: null }));
   }
   const onlineWorkers = await countOnlineBindings(db, creator);
   const continuationEnvelope = object(job?.continuation);
-  const continuation = continuationEnvelope.driverPhase === "execute" ? object(continuationEnvelope.jobContinuation) : continuationEnvelope;
+  const continuation = run?.cursor || (continuationEnvelope.driverPhase === "execute" ? object(continuationEnvelope.jobContinuation) : continuationEnvelope);
   const totalChart = charts.find((row) => row.category === "TOTAL") || null;
-  const sourceBoundaryReached = result.sourceBoundaryReached === true;
-  const scannerRejected = integer(result.scannerRejected ?? continuation.scannerRejected, 0, 100_000_000);
+  const sourceBoundaryReached = run?.cursor.phase === "done";
+  const scannerRejected = run ? run.proof.windows.reduce((sum, window) => sum + window.rejected, 0) : 0;
   const computedReconciliation = {
     chartReady: Boolean(totalChart),
     countMatched: Boolean(totalChart) && summary.earningsTransactionsCount === Number(totalChart.transactionsCount || 0),
@@ -234,7 +193,7 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
   };
   let status = jobStatus(job);
   if (job?.status === "DONE") {
-    const verified = sourceBoundaryReached && scannerRejected === 0 && computedReconciliation.chartReady
+    const verified = run?.proof.complete === true && sourceBoundaryReached && scannerRejected === 0 && computedReconciliation.chartReady
       && computedReconciliation.countMatched && computedReconciliation.grossMatched && computedReconciliation.netMatched;
     status = verified ? "COMPLETE" : "PARTIAL";
   }
@@ -244,8 +203,11 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     jobId: job?.id || null,
     status,
     manual: isManualJob(job),
+    receiptRunId: run?.id || null,
+    receiptReady: Boolean(run), detailsExpired: receipt.detailsExpired,
+    rangeFrom: run?.windows[0]?.from || null, rangeTo: run?.windows[0]?.to || null,
     phase: clean(continuation.phase, 40) || (status === "COMPLETE" || status === "PARTIAL" ? "complete" : "transactions"),
-    pagesScanned: integer(continuation.page ?? progress.current, 0, 1_000_000),
+    pagesScanned: run ? run.proof.windows.reduce((sum, window) => sum + window.pages, 0) : integer(progress.current, 0, 1_000_000),
     marker: clean(continuation.marker, 220),
     sourceBoundaryReached,
     scannerRejected,
@@ -264,7 +226,7 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     charts,
     reconciliation: computedReconciliation,
     items: rows,
-    pagination: { limit: safeLimit, offset: safeOffset, returned: rows.length, total, hasMore: safeOffset + rows.length < total },
+    pagination: { limit: safeLimit, offset: safeOffset, returned: rows.length, total, hasMore: receipt.hasMore, nextCursor: receipt.nextCursor },
   };
 }
 

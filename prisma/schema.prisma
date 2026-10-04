@@ -607,11 +607,17 @@ model CreatorAccount {
   fanRefreshDemands                     CreatorFanRefreshDemand[]
   messagesDaily                         CreatorMessagesDaily[]
   dailyMetrics                          CreatorDailyMetrics[]
+  analyticsFactPublications              CreatorAnalyticsFactPublication[]
+  analyticsPublicationState              CreatorAnalyticsPublicationState?
+  analyticsDays                         CreatorAnalyticsDay[]
+  analyticsDayMembers                   CreatorAnalyticsDayMember[]
+  notificationFactReceipts              NotificationFactReceipt[]
   localMessageCoverage                  CreatorLocalMessageCoverage[]
   fanLocalCoverage                      CreatorFanLocalCoverage[]
   fanObservationClock                   FanObservationCreatorClock?
   notificationSyncState                 CreatorNotificationSyncState?
   financialCollectionState              CreatorFinancialCollectionState?
+  financialReceiptRuns                  FinancialReceiptRun[]
   campaignCollectionState               CreatorCampaignCollectionState?
   notificationScanItems                 CreatorNotificationScanItem[]
   financialTransactions                 CreatorFinancialTransaction[]
@@ -2098,6 +2104,15 @@ model CreatorFinancialCollectionState {
   sourceJobId            String?
   createdAt              DateTime                @default(now())
   updatedAt              DateTime                @updatedAt
+
+  receiptCoverageVersion   Int @default(0)
+  coverageThrough          DateTime?
+  recentRangeFrom          DateTime?
+  recentRangeTo            DateTime?
+  historyAuditCursor       DateTime?
+  historyAuditCycleStartedAt DateTime?
+  historyAuditObservedAt   DateTime?
+  historyAuditCompletedAt  DateTime?
 
   creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
 
@@ -6925,4 +6940,113 @@ model CampaignReadRepairInterval {
   cursorId String @default("")
   creator CreatorAccount @relation(fields: [agencyId,creatorId], references: [agencyId,id], onDelete: Cascade)
   @@index([creatorId,fanId,id], map: "CampaignReadRepairInterval_queue_v2")
+}
+
+
+// Current canonical contribution and its last published value. A producer never
+// mutates publishedValue; bounded workers reconcile the difference atomically.
+model CreatorAnalyticsFactPublication {
+  agencyId       String
+  creatorId      String
+  kind           String @db.VarChar(40)
+  factId         String
+  currentValue   Json?
+  publishedValue Json?
+  revision       BigInt @default(1)
+  dirty          Boolean @default(true)
+  updatedAt      DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@id([creatorId, kind, factId])
+  @@index([creatorId, dirty, kind, factId], map: "AnalyticsFactPublication_dirty_idx")
+}
+
+model CreatorAnalyticsPublicationState {
+  creatorId   String @id
+  agencyId    String
+  initialized Boolean @default(false)
+  updatedAt   DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@unique([agencyId, creatorId])
+}
+
+model CreatorAnalyticsDay {
+  creatorId String
+  agencyId  String
+  date      DateTime @db.Date
+  values    Json @default("{}")
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@id([creatorId, date])
+}
+
+model CreatorAnalyticsDayMember {
+  creatorId String
+  agencyId  String
+  date      DateTime @db.Date
+  metric    String @db.VarChar(40)
+  memberId  String
+  refs      Int
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@id([creatorId, date, metric, memberId])
+}
+
+// Immutable pending delivery identity. Source job reassignment cannot remove it.
+// Rows are deleted only together with successful effects (or creator destruction).
+model NotificationFactReceipt {
+  jobId      String
+  kind       String @db.VarChar(40)
+  factId     String
+  agencyId   String
+  creatorId  String
+  historical Boolean
+  createdAt  DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@id([jobId, kind, factId])
+  @@index([creatorId, jobId])
+}
+
+model FinancialReceiptRun {
+  id          String @id
+  jobId       String
+  agencyId    String
+  creatorId   String
+  generation  String
+  windows     Json
+  cursor      Json
+  proof       Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now())
+  compactedAt DateTime?
+  detailsRetiredAt DateTime?
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  pages FinancialPageReceipt[]
+  facts FinancialObservedFact[]
+  @@unique([jobId, generation])
+  @@index([agencyId, creatorId, id])
+  @@index([creatorId, createdAt, id], map: "FinancialReceiptRun_retention_idx")
+}
+model FinancialPageReceipt {
+  runId       String
+  windowIndex Int
+  page        Int
+  markerStart String @db.VarChar(220)
+  markerEnd   String? @db.VarChar(220)
+  sourceHasMore Boolean
+  payloadHash String @db.VarChar(64)
+  received    Int
+  rejected    Int
+  createdAt   DateTime @default(now())
+  run FinancialReceiptRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  @@id([runId, windowIndex, page])
+  @@unique([runId, windowIndex, markerStart])
+}
+model FinancialObservedFact {
+  runId       String
+  windowIndex Int
+  externalId  String @db.VarChar(220)
+  occurredAt  DateTime
+  value       Json
+  run FinancialReceiptRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  @@id([runId, windowIndex, externalId])
+  @@index([runId, windowIndex, occurredAt, externalId], map: "FinancialObservedFact_time_idx")
 }

@@ -77,7 +77,7 @@ function dbFixture({
     creatorFinancialCollectionState: {
       async findUnique() {
         return financialReady ? {
-          status: financialStatus,
+          status: financialStatus, receiptCoverageVersion: 1,
           baselineVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), baselineObservedAt: new Date("2026-08-01T00:00:00.000Z"),
           baselineGeneration: "financial-baseline-generation",
           lastCatchupCompletedAt: financialCatchupAt, lastCatchupObservedAt: financialCatchupAt,
@@ -413,7 +413,8 @@ test("recurring analytics uses fixed head catch-ups only after initial history i
   assert.equal(notification.notificationMode, "catchup");
   assert.deepEqual(notification.knownNotificationIds, ["n-3", "n-2", "n-1"]);
   assert.equal(financial.financialMode, "catchup");
-  assert.deepEqual(financial.knownTransactionIds, ["t-3", "t-2"]);
+  assert.equal(financial.knownTransactionIds, undefined);
+  assert.equal(financial.catchupMaxPages, undefined);
   assert.equal(financial.collectionType, "FINANCIAL");
   assert.equal(financial.collectionRequestedAt, "2026-08-09T12:00:00.000Z");
   assert.ok(financial.collectionGeneration);

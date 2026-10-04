@@ -12,7 +12,7 @@ const { runDbTransaction } = require("./db-transaction-service");
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
-const { rebuildCreatorDailyMetrics, upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
+const { upsertLocalMessageCoverage } = require("./creator-analytics-projection-service");
 const { projectFanIdentity, projectFanObservationBatch } = require("./fan-data-authority-service");
 const { displayRangeBounds, scanContractFromJob } = require("./analytics-range-contract");
 const {
@@ -2441,18 +2441,7 @@ async function upsertMessagesDaily({ db = prisma, agencyId, creatorId, rows, syn
     await finishBatch(tx, batch.id, { received: rawRows.length, inserted, updated, unchanged, rejected }, status, rejected ? "MESSAGES_DAILY_REJECTED_ROWS" : null);
     return { received: rawRows.length, accepted: normalized.length, rejected, inserted, updated, unchanged, replay: false, localCoverageComplete, knownDialogs, incompleteDialogs, messagesIndexed, oldestMessageAt, newestMessageAt };
   });
-  // CreatorDailyMetrics is a disposable read cache. Rebuild only after the
-  // durable message-day transaction commits, so a cache SQL failure can never
-  // roll back primary message aggregates or local coverage metadata.
-  if (!result.replay && normalized.length && db.creatorDailyMetrics) {
-    try {
-      await rebuildCreatorDailyMetrics({
-        db, agencyId, creatorId, from: normalized[0].date, to: normalized.at(-1).date, now: observed, includeMessages: true,
-      });
-    } catch (projectionError) {
-      console.warn("[creator-analytics] daily metrics projection failed after messages ingest:", projectionError?.message || projectionError);
-    }
-  }
+  // Canonical message-day writes also enter the durable publication queue.
   return result;
 }
 
@@ -2487,38 +2476,30 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
   if (!authorityResolved) now = await dbAuthorityNow({ db, fallbackNow: now });
   const range = rangeBounds(rangeKey, now);
   const eventBetween = { gte: range.start, lte: range.end };
+  const publishedFacts = await require("./analytics-fact-publication-service").readPublishedDays({ db, creatorId, from: range.dayStart, to: range.dayEnd });
+  const factTotals = publishedFacts.totals;
   const dayBetween = { gte: range.dayStart, lte: range.dayEnd };
   const currentDay = utcDay(now);
   const currentDayInRange = currentDay >= range.dayStart && currentDay <= range.dayEnd;
   const [publishedEarnings, messages, likes, comments, likesCount, commentsCount, sales, tips, subscriptions, coveragePage, completeMessageDays, inProgressMessageDays, notificationSync, dailyMetrics, paidSubscriptions, subscriptionStates, localMessageCoverage] = await Promise.all([
     require("./published-earnings-read-repository").readPublishedEarningsDays({ db, creatorId, from: range.dayStart, to: range.dayEnd, now }),
     includeMessages ? db.creatorMessagesDaily.findMany({ where: { creatorId, date: dayBetween }, orderBy: { date: "asc" } }) : Promise.resolve([]),
-    db.creatorPostLike.groupBy({ by: ["onlyFansPostId"], where: { creatorId, likedAt: eventBetween }, _count: { _all: true }, orderBy: { _count: { onlyFansPostId: "desc" } }, take: 50 }),
-    db.creatorPostComment.groupBy({ by: ["onlyFansPostId"], where: { creatorId, commentedAt: eventBetween }, _count: { _all: true }, orderBy: { _count: { onlyFansPostId: "desc" } }, take: 50 }),
-    db.creatorPostLike.count({ where: { creatorId, likedAt: eventBetween } }),
-    db.creatorPostComment.count({ where: { creatorId, commentedAt: eventBetween } }),
-    db.creatorSale.aggregate({ where: { creatorId, purchasedAt: eventBetween }, _sum: { amountCents: true }, _count: { _all: true } }),
-    db.creatorTip.aggregate({ where: { creatorId, tippedAt: eventBetween }, _sum: { amountCents: true }, _count: { _all: true } }),
-    db.creatorSubscriptionEvent.groupBy({ by: ["eventType"], where: { creatorId, occurredAt: eventBetween }, _count: { _all: true }, _sum: { observedPriceCents: true } }),
+    Promise.resolve([]), // No live consumer of post rankings in Creator Overview.
+    Promise.resolve([]),
+    Promise.resolve(factTotals.likes || 0),
+    Promise.resolve(factTotals.comments || 0),
+    Promise.resolve({ _sum: { amountCents: factTotals.salesCents || 0 }, _count: { _all: factTotals.salesCount || 0 } }),
+    Promise.resolve({ _sum: { amountCents: factTotals.tipsCents || 0 }, _count: { _all: factTotals.tipsCount || 0 } }),
+    Promise.resolve(publishedFacts.subscriptions),
     includeCoveragePage ? readCreatorCoverage({ db, creatorId, rangeKey, limit: 120, offset: 0, now, authorityResolved: true }) : Promise.resolve({ rows: [], pagination: { limit: 0, offset: 0, returned: 0, total: 0, hasMore: false } }),
     includeMessages ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "COMPLETE", coverageDate: dayBetween } }) : Promise.resolve(0),
     includeMessages && currentDayInRange ? db.analyticsCoverage.count({ where: { creatorId, dataType: "MESSAGES_DAILY", sourceTimezone: "UTC", status: "PARTIAL", coverageDate: currentDay, lastErrorCode: "MESSAGES_DAY_IN_PROGRESS" } }) : Promise.resolve(0),
     db.creatorNotificationSyncState?.findUnique
       ? db.creatorNotificationSyncState.findUnique({ where: { creatorId } })
       : Promise.resolve(null),
-    db.creatorDailyMetrics?.findMany
-      ? db.creatorDailyMetrics.findMany({
-          where: { creatorId, date: dayBetween, sourceTimezone: "UTC" },
-          orderBy: { date: "asc" },
-          ...(includeMessages ? {} : { select: { date: true, likes: true, comments: true, newSubscribers: true, renewals: true } }),
-        })
-      : Promise.resolve([]),
-    db.creatorPaidSubscription?.aggregate
-      ? db.creatorPaidSubscription.aggregate({ where: { creatorId, paidAt: eventBetween }, _sum: { amountCents: true }, _count: { _all: true } })
-      : Promise.resolve({ _sum: { amountCents: 0 }, _count: { _all: 0 } }),
-    db.creatorSubscriptionState?.groupBy
-      ? db.creatorSubscriptionState.groupBy({ by: ["status"], where: { creatorId }, _count: { _all: true } })
-      : Promise.resolve([]),
+    Promise.resolve(publishedFacts.days),
+    Promise.resolve({ _sum: { amountCents: factTotals.paidSubscriptionsCents || 0 }, _count: { _all: factTotals.paidSubscriptions || 0 } }),
+    Promise.resolve([]), // Subscription status is served by its dedicated reader.
     includeMessages && db.creatorLocalMessageCoverage?.findMany
       ? db.creatorLocalMessageCoverage.findMany({ where: { creatorId }, orderBy: { lastVerifiedAt: "desc" } })
       : Promise.resolve([]),
@@ -2587,6 +2568,8 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     ok: true,
     creatorId,
     range: { key: range.key, startAt: range.start.toISOString(), endAt: range.end.toISOString() },
+    factPublication: { ready: publishedFacts.ready, state: publishedFacts.state },
+    financialGroups: publishedFacts.financialGroups,
     verification: {
       officialEarnings,
       officialMessages,

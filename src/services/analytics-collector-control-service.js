@@ -58,7 +58,7 @@ function collectorPlanningProofAt(collectorType, collectionMode, state, now = ne
     catchupVerifiedAt = state?.lastCatchupVerifiedAt;
   } else if (collectorType === COLLECTOR_TYPES.FINANCIAL || collectorType === COLLECTOR_TYPES.CAMPAIGNS) {
     baselineVerifiedAt = state?.baselineVerifiedAt;
-    catchupVerifiedAt = state?.lastCatchupCompletedAt;
+    catchupVerifiedAt = collectorType === COLLECTOR_TYPES.FINANCIAL && state?.receiptCoverageVersion !== 1 ? null : state?.lastCatchupCompletedAt;
   } else return null;
   const baselineObservedAt = collectorType === COLLECTOR_TYPES.NOTIFICATIONS
     ? state?.fullBackfillObservedAt : state?.baselineObservedAt;
@@ -123,6 +123,7 @@ function stampCollectionAuthorityParams(params, authorityNow, orderingAfter = nu
   const stamped = stampObservationStart({ ...source, collectionAuthorityRequestedAt: orderingAt.toISOString() }, at);
   if (type === COLLECTOR_TYPES.FINANCIAL) {
     const marker = Math.floor(at.getTime() / 1000);
+    stamped.financialReceiptVersion = 1;
     stamped.initialMarker = marker;
     stamped.endDate = onlyFansUtcDateTime(new Date(marker * 1000));
   } else if (type === COLLECTOR_TYPES.NOTIFICATIONS) {
@@ -230,7 +231,7 @@ async function acceptFinancialGeneration({ db = prisma, job, deviceId = null } =
   }});
 }
 
-async function completeFinancialCollection({ db = prisma, job, deviceId = null, complete, scanRunId, boundary = null, rangeFrom = null, rangeTo = null } = {}) {
+async function completeFinancialCollection({ db = prisma, job, deviceId = null, complete, scanRunId, boundary = null, rangeFrom = null, rangeTo = null, receiptRun = null } = {}) {
   const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: job.creatorId, work: async (tx) => {
     const current = await tx.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
@@ -243,7 +244,13 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
     const sourceStart = observationStartForJob(job);
     const end = parseObservationTime(rangeTo);
     const observedAt = sourceStart && end ? new Date(Math.min(+sourceStart, +end)) : sourceStart;
+    const receiptAuthority = require("./financial-receipt-authority");
+    if (success) {
+      if (!receiptRun || receiptRun.proof.complete !== true) throw new Error("FINANCIAL_RECEIPT_COVERAGE_REQUIRED");
+      await receiptAuthority.enter(tx);
+    }
     const common = {
+      ...(success ? receiptAuthority.coverageUpdate(job, current, receiptRun, observedAt, now) : {}),
       status: success ? "COMPLETE" : "PARTIAL", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt,
       retryAfterAt: null, lastErrorCode: success ? null : "FINANCIAL_COLLECTION_PARTIAL",
       lastErrorMessage: success ? null : "Financial collection did not prove its requested source boundary",

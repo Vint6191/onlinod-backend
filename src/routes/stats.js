@@ -401,7 +401,7 @@ router.get("/creators/:creatorId/financial-transaction-scan", async (req, res) =
     if (!requireEarningsPermission(res, ctx.member)) return;
     const limit = Math.max(1, Math.min(200, Number.parseInt(String(req.query.limit || "100"), 10) || 100));
     const offset = Math.max(0, Math.min(1_000_000, Number.parseInt(String(req.query.offset || "0"), 10) || 0));
-    return res.json(await readStatsSnapshot(req, ctx, ({ db, creator }) => readManualFinancialTransactionScan({ db, creator, limit, offset })));
+    return res.json(await readStatsSnapshot(req, ctx, ({ db, creator }) => readManualFinancialTransactionScan({ db, creator, limit, offset, cursor: req.query.cursor || null })));
   } catch (error) {
     console.error("[stats/financial-transaction-scan] failed:", error);
     return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "FINANCIAL_TRANSACTION_SCAN_READ_FAILED", error: error?.message || "Failed" });

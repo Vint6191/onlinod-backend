@@ -46,9 +46,9 @@ test("manual campaign scanner is isolated and has independent routes", () => {
   assert.doesNotMatch(control, /catchup_notifications_scan|financial_transactions_scan/);
 });
 
-test("payout daily cache rebuild touches only actually changed UTC days", () => {
-  assert.match(financial, /const uniqueDays = \[\.\.\.new Set/);
-  assert.match(financial, /from: date, to: date/);
+test("payout canonical writes publish durable deltas through database capture", () => {
+  assert.doesNotMatch(financial, /rebuildCreatorDailyMetrics/);
+  assert.match(read("../prisma/migrations/20261004030000_analytics_fact_publication_v1/migration.sql"), /analytics_capture_fact_v1/);
   assert.doesNotMatch(financial, /from: normalized\[0\]\.occurredAt, to: normalized\.at\(-1\)\.occurredAt/);
 });
 

@@ -7,7 +7,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
-const { projectSubscriptionFacts, rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
+const { projectSubscriptionFacts } = require("./creator-analytics-projection-service");
 const { lockCreatorFacts, mergeNotificationMoney, transactionIdentityConflict } = require("./creator-fact-write-authority");
 const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
 const { projectFanIdentityBatch } = require("./fan-data-authority-service");
@@ -505,6 +505,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
   const seenInput = new Map();
   const creates = [];
   const updates = [];
+  const canonicalIds = new Set();
   let unchanged = duplicateInputRows;
   let rejected = conflictingInputRows;
   for (const fact of facts) {
@@ -533,6 +534,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
       row,
       buildFactData({ fact, job, deviceId, fanRecordIds, now }),
     );
+    if (row) canonicalIds.add(row.id);
     if (!row) creates.push({ fact, data });
     else if (valuesEqual(row, data, compareKeys)) unchanged += 1;
     else updates.push({ id: row.id, data });
@@ -543,6 +545,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
   if (creates.length) {
     const result = await tx[model].createMany({ data: creates.map((item) => item.data), skipDuplicates: true });
     inserted = Number(result?.count || 0);
+    if (inserted === creates.length) for (const item of creates) canonicalIds.add(item.data.id);
 
     // A different overlapping job may win a unique-key race between the
     // prefetch and createMany. Reload only when createMany skipped something;
@@ -572,6 +575,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
           raceRejected += 1;
           continue;
         }
+        canonicalIds.add(row.id);
         const mergedData = mergeFactDataWithExisting(model, row, item.data);
         if (!valuesEqual(row, mergedData, compareKeys)) {
           updates.push({ id: row.id, data: mergedData });
@@ -590,7 +594,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
     delete data.createdAt;
     await tx[model].update({ where: { id: update.id }, data });
   }
-  return { inserted, updated: uniqueUpdates.size, unchanged, rejected };
+  return { inserted, updated: uniqueUpdates.size, unchanged, rejected, canonicalIds: [...canonicalIds] };
 }
 
 async function ensureBatch(db, data) {
@@ -876,6 +880,10 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
         model: "creatorPostComment", facts: groups.comment, job, deviceId, fanRecordIds, now,
         compareKeys: ["fanRecordId", "externalNotificationId", "onlyFansCommentId", "onlyFansPostId", "commentedAt"],
       });
+      await require("./notification-fact-receipt-service").capture({ db: tx, job, groups: [
+        { kind: "CreatorSale", ids: sale.canonicalIds }, { kind: "CreatorTip", ids: tip.canonicalIds },
+        { kind: "CreatorSubscriptionEvent", ids: subscription.canonicalIds },
+      ] });
       const perTypePersistenceRejected = {
         purchases: sale.rejected,
         tips: tip.rejected,
@@ -940,41 +948,10 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       });
       return { replayed: false, batch, counts, complete, coverageByType };
     };
-    const ownsTransactionBoundary = typeof db.$transaction === "function";
     const applied = await runDbTransaction(db, applyFacts, { maxWait: 10_000, timeout: 60_000 });
 
     if (applied.replayed) return applied.response;
-    // CreatorDailyMetrics is a disposable read cache. Page chunks are already
-    // executed inside the fenced /jobs/:id/progress transaction, so rebuilding
-    // that cache there unnecessarily keeps the lease transaction open and can
-    // make a committed notification page look hung to Desktop. Defer projection
-    // until a top-level ingest boundary (completion/realtime), where db owns its
-    // own transaction lifecycle. Primary facts remain authoritative either way.
-    const metricDates = facts.map((fact) => fact.occurredAt).filter(Boolean);
-    if (ownsTransactionBoundary && (finalizeCoverage || metricDates.length > 0) && db.creatorDailyMetrics) {
-      let metricsFrom = metricDates.length
-        ? new Date(Math.min(...metricDates.map((date) => date.getTime())))
-        : rangeFrom;
-      const metricsTo = finalizeCoverage
-        ? rangeTo
-        : new Date(Math.max(...metricDates.map((date) => date.getTime())));
-      if (finalizeCoverage && typeof db.creatorNotificationSyncState?.findUnique === "function") {
-        try {
-          const sync = await db.creatorNotificationSyncState.findUnique({
-            where: { creatorId: job.creatorId },
-            select: { oldestOccurredAt: true },
-          });
-          metricsFrom = strictDate(sync?.oldestOccurredAt) || metricsFrom;
-        } catch {
-          // Read-model projection remains best-effort; primary facts are already durable.
-        }
-      }
-      try {
-        await rebuildCreatorDailyMetrics({ db, agencyId: job.agencyId, creatorId: job.creatorId, from: metricsFrom, to: metricsTo, now });
-      } catch (projectionError) {
-        console.warn("[creator-analytics] daily metrics projection failed after notification ingest:", projectionError?.message || projectionError);
-      }
-    }
+    // SQL capture publishes every changed fact with this commit; no best-effort rebuild.
     return { batchId: applied.batch.id, replayed: false, status: applied.batch.status, ...applied.counts, coverageComplete: applied.complete, coverageByType: applied.coverageByType };
   } catch (error) {
     await db.analyticsIngestBatch.update({

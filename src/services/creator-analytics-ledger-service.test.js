@@ -1434,7 +1434,7 @@ test("message-day sync records the reporting device and never closes the current
 
 
 
-test("message-day sync commits primary facts even when disposable daily cache rebuild fails", async () => {
+test("message-day sync never invokes the retired best-effort cache writer", async () => {
   const harness = batchHarness();
   harness.tx.creatorMessagesDaily = {
     findUnique: async () => null,
@@ -1454,8 +1454,7 @@ test("message-day sync commits primary facts even when disposable daily cache re
     });
     assert.equal(result.accepted, 1);
     assert.equal(harness.updated.at(-1).status, "COMMITTED");
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /daily metrics projection failed after messages ingest/);
+    assert.equal(warnings.length, 0);
   } finally {
     console.warn = originalWarn;
   }
@@ -1526,6 +1525,7 @@ test("ledger overview preserves nullable earnings categories and counts only com
     $queryRaw: async () => [{ campaignId: "campaign-1", totalRevenueCents: 1000n, salesRevenueCents: 700n, tipsRevenueCents: 300n, subscriptionRevenueCents: 0n, transactionsCount: 2n }],
   };
   db.$queryRawUnsafe = async (sql) => {
+    if (sql.includes('CreatorAnalyticsPublicationState')) return [{ initialized: true, pending: false, days: [{ date: '2026-08-06', values: { likes: 4, comments: 2 } }] }];
     if (sql.includes('clock_timestamp')) return [{ authorityNow: new Date("2026-08-06T12:00:00Z") }];
     if (sql.includes('published_earnings_days_v1')) {
       const rows = await db.creatorEarningsDaily.findMany();
@@ -1595,6 +1595,7 @@ test("current overview ledger mode does not read dormant server message authorit
     $queryRaw: async () => [],
   };
   db.$queryRawUnsafe = async (sql) => {
+    if (sql.includes('CreatorAnalyticsPublicationState')) return [{ initialized: true, pending: false, days: [{ date: '2026-08-06', values: { likes: 4, comments: 2 } }] }];
     if (sql.includes('clock_timestamp')) return [{ authorityNow: new Date("2026-08-06T12:00:00Z") }];
     if (sql.includes('published_earnings_days_v1')) {
       const rows = await db.creatorEarningsDaily.findMany();
@@ -1618,7 +1619,8 @@ test("current overview ledger mode does not read dormant server message authorit
   assert.deepEqual(result.localMessageCoverage, []);
   assert.deepEqual(result.coverage, []);
   assert.equal(result.coveragePagination.total, 0);
-  assert.deepEqual(dailyMetricSelect, { date: true, likes: true, comments: true, newSubscribers: true, renewals: true });
+  assert.equal(dailyMetricSelect, null, "retired cache is never queried");
+  assert.equal(result.factPublication.ready, true);
 });
 
 
@@ -1655,6 +1657,7 @@ test("today earnings are official only when the row and in-progress proof both e
     $queryRaw: async () => [],
   };
   db.$queryRawUnsafe = async (sql) => {
+    if (sql.includes('CreatorAnalyticsPublicationState')) return [{ initialized: true, pending: false, days: [{ date: '2026-08-06', values: { likes: 4, comments: 2 } }] }];
     if (sql.includes('clock_timestamp')) return [{ authorityNow: new Date("2026-08-06T12:00:00Z") }];
     if (sql.includes('published_earnings_days_v1')) {
       const rows = await db.creatorEarningsDaily.findMany();

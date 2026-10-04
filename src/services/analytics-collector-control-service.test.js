@@ -51,6 +51,7 @@ function stateDb(kind) {
     $executeRawUnsafe: async (sql, key) => {
       // Transaction-local budget setup is not a domain mutation/lock.
       if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)") return 1;
+ if (sql.includes("onlinod.financial_receipts_v1")) return 1;
  locks.push([sql, key]); return 1; },
     creatorFinancialCollectionState: kind === "financial" ? delegate : undefined,
     creatorCampaignCollectionState: kind === "campaign" ? delegate : undefined,
@@ -66,7 +67,7 @@ function stateDb(kind) {
 
 test("collection planning identity excludes trigger provenance and random command generation", () => {
   const state = {
-    activeGeneration: "accepted-generation",
+    activeGeneration: "accepted-generation", receiptCoverageVersion: 1,
     baselineVerifiedAt: new Date("2026-09-08T19:00:00.000Z"),
     baselineObservedAt: new Date("2026-09-08T19:00:00.000Z"),
     lastCatchupCompletedAt: new Date("2026-09-08T20:00:00.000Z"),
@@ -105,7 +106,7 @@ test("financial collection state serializes exact server generations and rejects
   assert.equal(db._state().activeGeneration, "generation-A");
   assert.equal(db._state().status, "SCANNING");
 
-  const completed = await completeFinancialCollection({ db, job: first, complete: true, scanRunId: "generation-A", rangeFrom: "2016-01-01T00:00:00Z", rangeTo: at });
+  const completed = await completeFinancialCollection({ db, job: first, complete: true, scanRunId: "generation-A", receiptRun: { proof: { complete: true }, windows: [{ kind: "FULL", from: "2016-01-01T00:00:00Z", to: at }] }, rangeFrom: "2016-01-01T00:00:00Z", rangeTo: at });
   assert.equal(completed.applied, true);
   assert.equal(db._state().status, "COMPLETE");
   assert.equal(db._state().baselineGeneration, "generation-A");
@@ -113,7 +114,7 @@ test("financial collection state serializes exact server generations and rejects
   const replay = await acceptFinancialGeneration({ db, job: first });
   assert.equal(replay.replay, true);
   assert.equal(db._state().status, "COMPLETE");
-  const completionReplay = await completeFinancialCollection({ db, job: first, complete: true, scanRunId: "generation-A", rangeFrom: "2016-01-01T00:00:00Z", rangeTo: at });
+  const completionReplay = await completeFinancialCollection({ db, job: first, complete: true, scanRunId: "generation-A", receiptRun: { proof: { complete: true }, windows: [{ kind: "FULL", from: "2016-01-01T00:00:00Z", to: at }] }, rangeFrom: "2016-01-01T00:00:00Z", rangeTo: at });
   assert.equal(completionReplay.replay, true);
   assert.equal(db._state().baselineVerifiedAt, verifiedAt);
   await recordFinancialCollectionFailure({ db, job: first, error: new Error("late same-generation failure") });

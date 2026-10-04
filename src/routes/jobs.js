@@ -18,6 +18,7 @@ const {
   releaseJob,
 } = require("../services/job-lease-service");
 
+const { FinancialReceiptError } = require("../services/financial-receipt-authority");
 const router = express.Router();
 
 const JOB_SERVER_CAPABILITIES = Object.freeze({
@@ -32,6 +33,7 @@ const JOB_SERVER_CAPABILITIES = Object.freeze({
   campaignBoundedTraversalV1: true,
   campaignTraversalAuthorityV1: true,
   campaignFairPagesV1: true,
+  financialWindowReceiptsV1: true,
 });
 
 router.use((req, res, next) => {
@@ -65,7 +67,7 @@ function validationError(res, error) {
 }
 
 function leaseError(res, error) {
-  if (error instanceof JobLeaseError || error instanceof CampaignTraversalError) {
+  if (error instanceof JobLeaseError || error instanceof CampaignTraversalError || error instanceof FinancialReceiptError) {
     return res.status(error.status || 409).json({
       ok: false,
       code: error.code,
@@ -109,6 +111,7 @@ const claimSchema = z.object({
     campaignBoundedTraversalV1: z.boolean().optional().default(false),
     campaignTraversalAuthorityV1: z.boolean().optional().default(false),
     campaignFairPagesV1: z.boolean().optional().default(false),
+    financialWindowReceiptsV1: z.boolean().optional().default(false),
   }).passthrough().optional().default({}),
 });
 

@@ -292,5 +292,61 @@
     "unique": false,
     "expression": "\"creatorId\",\"fanId\",\"occurredAt\" DESC,\"id\" DESC",
     "where": "\"eventType\" IN ('AUTO_RENEW_ENABLED'::\"CreatorSubscriptionEventType\",'AUTO_RENEW_DISABLED'::\"CreatorSubscriptionEventType\")"
+  },
+  {
+    "name": "CreatorSale_analytics_adoption_idx",
+    "table": "CreatorSale",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorTip_analytics_adoption_idx",
+    "table": "CreatorTip",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorSubscriptionEvent_analytics_adoption_idx",
+    "table": "CreatorSubscriptionEvent",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorPaidSubscription_analytics_adoption_idx",
+    "table": "CreatorPaidSubscription",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorPostLike_analytics_adoption_idx",
+    "table": "CreatorPostLike",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorPostComment_analytics_adoption_idx",
+    "table": "CreatorPostComment",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorFinancialTransaction_analytics_adoption_idx",
+    "table": "CreatorFinancialTransaction",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"id\"",
+    "where": null
+  },
+  {
+    "name": "CreatorMessagesDaily_analytics_adoption_idx",
+    "table": "CreatorMessagesDaily",
+    "unique": false,
+    "expression": "\"agencyId\",\"creatorId\",\"id\"",
+    "where": null
   }
 ]

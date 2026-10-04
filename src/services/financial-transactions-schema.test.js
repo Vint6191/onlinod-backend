@@ -79,7 +79,8 @@ test("financial catch-up re-observes statuses without stealing full-scan provena
   assert.match(service, /financialMode\(job\) === "catchup"/);
   assert.match(service, /Catch-up re-observes the head/);
   assert.match(service, /\? commonData\s*:\s*\{ \.\.\.commonData, sourceJobId: job\.id, scanRunId/);
-  assert.match(service, /mode === "catchup"[\s\S]*sourceBoundaryReached && scannerRejected === 0/);
+  assert.match(service, /receipts\.completionProof/);
+  assert.match(service, /receipt\.complete/);
 });
 
 test("financial ingest is safe when job lease passes a Prisma TransactionClient", () => {

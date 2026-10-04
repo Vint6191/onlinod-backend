@@ -34,11 +34,18 @@ test("current Analytics read and billing entrypoints resolve PostgreSQL clock au
 
 test("Financial, Campaign and Notification receipt metadata uses PostgreSQL receipt time", () => {
   const financial = source("financial-transactions-service.js");
+  const receipts = source("financial-receipt-authority.js");
   const ledger = source("creator-analytics-ledger-service.js");
   const notifications = source("notification-facts-service.js");
 
   assert.match(financial, /acceptFinancialGeneration[\s\S]*?const now = await dbAuthorityNow\(\{ db: tx, fallbackNow: processReceivedAt \}\);/);
-  assert.match(financial, /ingestFinancialChartChunk[\s\S]*?const now = await dbAuthorityNow\(\{ db, fallbackNow: processReceivedAt \}\);/);
+  assert.match(financial, /ingestFinancialChartChunk[\s\S]*?receipts\.commitChart\(db, job, chunk\)/);
+  for (const name of ["commitPage", "commitChart"]) {
+    const body = receipts.split(`async function ${name}(`)[1].split("\nasync function ")[0];
+    assert.match(body, /const receivedAt = await dbAuthorityNow\(\{ db \}\)/);
+    assert.match(body, /updatedAt: receivedAt/);
+    assert.doesNotMatch(body, /updatedAt: new Date/);
+  }
   assert.match(ledger, /campaign page receipt uses PostgreSQL time|const serverReceivedAt = await dbAuthorityNow/);
   assert.match(notifications, /const now = await dbAuthorityNow\(\{ db, fallbackNow: new Date\(\) \}\);/);
   assert.doesNotMatch(notifications, /status: "FAILED", completedAt: new Date\(\)/);

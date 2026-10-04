@@ -2101,6 +2101,8 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
       ["notificationHistoryRepair", () => require("./notification-history-repair-service").runNotificationHistoryRepairSweep({ db })],
       ["campaignReadProjection", () => require("./campaign-read-projection-service").seedCampaignProjection({ db })],
       ["trafficProjection", () => require("./traffic-projection-service").runTrafficProjectionSweep({ db })],
+      ["financialReceiptRetention", () => require("./financial-receipt-retention-service").runSweep({ db })],
+      ["analyticsFactPublication", () => require("./analytics-fact-publication-service").runSweep({ db })],
       ["analyticsPublication", () => require("./analytics-publication-service").runAnalyticsPublicationSweep({ db })],
       ["notificationConsequences", () => require("./notification-consequence-service").runNotificationConsequenceSweep({ db })],
       ["agencyDestructiveCleanup", () => runAgencyDestructiveCleanupSweep({ db, now })],

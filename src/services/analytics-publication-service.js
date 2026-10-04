@@ -47,6 +47,11 @@ async function acceptAnalyticsPublication({ db, job, userId, deviceId, leaseToke
   const existing = await db.analyticsPublication.findUnique({ where: { jobId_leaseRevision: { jobId: job.id, leaseRevision } } });
   if (existing) return assertReplay(existing, { userId, deviceId, leaseToken, leaseRevision, result });
   const payload = result || {};
+  if (job.jobKey === "financial_transactions_scan") {
+    const authority = require("./financial-receipt-authority");
+    await authority.enter(db);
+    if (authority.enabled(job) && (await authority.completionProof(db, job)).row?.cursor.phase !== "done") throw fault("FINANCIAL_TRAVERSAL_NOT_FINISHED");
+  }
   if (job.jobKey === "fetch_campaigns") {
     require("./campaign-traversal-authority-service").assertCompletion(job, payload);
     await require("./campaign-causal-activation-service").enterCampaignBoundedExecution({ db });
@@ -83,6 +88,7 @@ async function lockDomain(db, job) {
     return require("./campaign-causal-activation-service").enterCampaignBoundedExecution({ db });
   }
   if (job.jobKey === "financial_transactions_scan") {
+    await require("./financial-receipt-authority").enter(db);
     return lockDbAdvisoryXact({ db, key: `analytics-collector:financial:${job.creatorId}` });
   }
   // Same lock identity used by earnings page ingestion.
@@ -218,20 +224,10 @@ async function campaignUnit(db, job, row, now) {
 async function financialUnit(db, job, row, now) {
   const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   if (String(row.payload.scanRunId || "") !== command.generation) throw fault("FINANCIAL_PUBLICATION_RUN_MISMATCH");
-  const rows = await db.creatorFinancialTransaction.findMany({ where: { creatorId: job.creatorId,
-    sourceJobId: job.id, scanRunId: command.generation, ...afterId(row.cursor) }, orderBy: { id: "asc" }, take: PAGE,
-    select: { id: true, amountCents: true, netCents: true, feeCents: true, transactionStatus: true, projectionStatus: true } });
-  const proof = { count: 0, storedOnly: 0, grossCents: 0, netCents: 0, feeCents: 0, statusGroups: {}, ...row.proof };
-  for (const item of rows) {
-    proof.count++; if (item.projectionStatus === "STORED_ONLY") proof.storedOnly++;
-    proof.grossCents = sumSafe(proof.grossCents, item.amountCents); proof.netCents = sumSafe(proof.netCents, item.netCents); proof.feeCents = sumSafe(proof.feeCents, item.feeCents);
-    const raw = String(item.transactionStatus || "").trim().toLowerCase();
-    const key = ["done", "loading", "undo", ""].includes(raw) ? raw : "other";
-    const group = proof.statusGroups[key] || { transactionStatus: key, _count: { _all: 0 }, _sum: { amountCents: 0, netCents: 0, feeCents: 0 } };
-    group._count._all++; for (const field of ["amountCents", "netCents", "feeCents"]) group._sum[field] = sumSafe(group._sum[field], item[field]);
-    proof.statusGroups[key] = group;
-  }
-  return save(db, row, { proof, cursor: rows.length === PAGE ? nextCursor(rows) : {}, stage: rows.length === PAGE ? row.stage : "FINALIZE" }, now);
+  // Page commits already maintain distinct transaction totals and chart proof
+  // in the immutable run scope. Publication never enumerates mutable sourceJobId.
+  const proof = await require("./financial-receipt-authority").completionProof(db, job);
+  return save(db, row, { proof: { receiptRunId: proof.row?.id || null, complete: proof.complete }, cursor: {}, stage: "FINALIZE" }, now);
 }
 
 function repairParams(job, now) {
@@ -253,7 +249,8 @@ function repairParams(job, now) {
 }
 async function settle(db, job, row, sideEffect, now, { forceTerminal = false } = {}) {
   const complete = sideEffect?.ok === true;
-  const protocolSuperseded = !complete && job.jobKey === "fetch_campaigns" && sideEffect?.completion?.protocolCurrent === false;
+  const protocolSuperseded = !complete && ((job.jobKey === "fetch_campaigns" && sideEffect?.completion?.protocolCurrent === false)
+    || (job.jobKey === "financial_transactions_scan" && sideEffect?.protocolCurrent === false));
   const attempts = Number(job.attempts || 0) + (!complete && !protocolSuperseded ? 1 : 0);
   const terminal = forceTerminal || (!protocolSuperseded && attempts >= MAX_JOB_ATTEMPTS);
   const retryAt = complete || terminal ? null : new Date(now.getTime() + (protocolSuperseded ? 1000 : 60000 * 2 ** Math.max(0, attempts - 1)));
@@ -267,15 +264,16 @@ async function settle(db, job, row, sideEffect, now, { forceTerminal = false } =
     completedAt: now, lastError: complete ? null : String(sideEffect?.error || `${job.jobKey}_partial`),
   } });
   if (!complete && !protocolSuperseded) await require("./job-result-service").recordJobFailure({ db, job,
-    error: protocolSuperseded ? "fetch_campaigns_protocol_superseded" : `${job.jobKey}_partial`, terminal, retryAfterAt: retryAt });
+    error: protocolSuperseded ? `${job.jobKey}_protocol_superseded` : `${job.jobKey}_partial`, terminal, retryAfterAt: retryAt });
   const updated = await db.jobInstance.update({ where: { id: job.id }, data: {
     status, completedAt: retryAt ? null : now, attempts, leaseUntil: null, leaseTokenHash: null, continuation: null,
     claimedAt: null, claimedByDeviceId: null, workId: null,
     ...(retryAt ? { nextRunAt: retryAt, params: repairParams(job, now) } : {}),
     lastProgressAt: now, result: { ...row.payload, completionSideEffect: sideEffect },
     progress: { percent: complete ? 100 : retryAt ? 0 : 99, message: complete ? "completed" : retryAt ? "scheduled for analytics repair" : "analytics publication failed" },
-    lastError: complete ? null : protocolSuperseded ? "fetch_campaigns_protocol_superseded" : String(sideEffect?.error || `${job.jobKey}_partial`),
+    lastError: complete ? null : protocolSuperseded ? `${job.jobKey}_protocol_superseded` : String(sideEffect?.error || `${job.jobKey}_partial`),
   } });
+  if (job.jobKey === "financial_transactions_scan") await require("./financial-receipt-retention-service").publish({ db, job, now });
   if (retryAt) require("./job-planning-repository").publishPlannedJobAvailable(updated);
   return result;
 }

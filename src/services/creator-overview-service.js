@@ -293,12 +293,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
 
   const [creator, financialGroups, campaignPage, financialCollectionState, campaignCollectionState] = await Promise.all([
     db.creatorAccount.findUnique({ where: { id: creatorId }, select: { id: true, createdAt: true, updatedAt: true } }),
-    db.creatorFinancialTransaction.groupBy({
-      by: ["transactionType", "transactionStatus"],
-      where: { creatorId, occurredAt: eventBetween },
-      _count: { _all: true },
-      _sum: { amountCents: true, netCents: true },
-    }),
+    Promise.resolve(ledger.financialGroups),
     require("./campaign-read-repository").readCampaignPage({ db, creatorId, rangeKey: range, now }),
     db.creatorFinancialCollectionState?.findUnique ? db.creatorFinancialCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
     db.creatorCampaignCollectionState?.findUnique ? db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
@@ -317,17 +312,9 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     now,
     freshnessMs: NOTIFICATION_COLLECTION_FRESHNESS_MS,
   });
-  const financialCollection = evaluateDurableCollectorState({
-    status: financialCollectionState?.status,
-    baselineCompletedAt: financialCollectionState?.baselineVerifiedAt,
-    baselineVerifiedAt: financialCollectionState?.baselineVerifiedAt,
-    lastVerifiedAt: financialCollectionState?.lastCatchupCompletedAt,
-    baselineObservedAt: financialCollectionState?.baselineObservedAt,
-    lastObservedAt: financialCollectionState?.lastCatchupObservedAt,
-    retryAfterAt: financialCollectionState?.retryAfterAt,
-    now,
-    freshnessMs: FINANCIAL_COLLECTION_FRESHNESS_MS,
-  });
+  const financialAuthority = require("./financial-receipt-authority");
+  const financialCollection = financialAuthority.evaluateCollection(financialCollectionState, now, FINANCIAL_COLLECTION_FRESHNESS_MS);
+  const financialCoverage = financialAuthority.coverageView(financialCollectionState, now);
   const campaignCollection = evaluateCampaignCollectionState(campaignCollectionState, now, campaignPage?.sourceCoverage?.campaigns?.refreshDebt);
   const oldestNotificationAt = ledger.notificationSync?.oldestOccurredAt ? new Date(ledger.notificationSync.oldestOccurredAt) : null;
   const oneYearStart = new Date(now.getTime() - 365 * DAY_MS);
@@ -354,6 +341,9 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     ],
     coverage: {
       notificationVerified: notificationCollection.proven === true,
+      financialWindows: financialCoverage,
+      factPublicationReady: ledger.factPublication?.ready === true,
+      factPublicationState: ledger.factPublication?.state || "REBUILDING",
       earningsVerified: ledger.verification.officialEarnings,
       earningsComplete: ledger.verification.earningsComplete === true,
       earningsProven: ledger.verification.earningsProven === true,
