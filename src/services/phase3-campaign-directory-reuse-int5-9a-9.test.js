@@ -52,7 +52,7 @@ function reuseDb() {
   const db = {
     async $executeRawUnsafe(sql) {
       if (["campaign_observation_version", "campaign_directory_count_version", "campaign_traversal_authority_version"]
-        .some(marker => sql === `SELECT set_config('onlinod.${marker}', '1', true)`)) return 1;
+        .some(marker => sql.startsWith(`SELECT set_config('onlinod.${marker}', '1', true)`))) return 1;
       assert.match(sql, /pg_advisory_xact_lock/); return 1;
     },
     creatorCampaignCollectionState: {
@@ -119,7 +119,7 @@ test("INT5.9A-9 same SCANNING Campaign generation is replay, not destructive rei
   const db = {
     async $executeRawUnsafe(sql) {
       if (["campaign_observation_version", "campaign_directory_count_version", "campaign_traversal_authority_version"]
-        .some(marker => sql === `SELECT set_config('onlinod.${marker}', '1', true)`)) return 1;
+        .some(marker => sql.startsWith(`SELECT set_config('onlinod.${marker}', '1', true)`))) return 1;
       assert.match(sql, /pg_advisory_xact_lock/); return 1;
     }, creatorCampaignCollectionState: {
     findUnique: async () => ({ ...existing }),
@@ -194,7 +194,7 @@ test("INT5.9A-9 stale reuse claimer write fails before collection generation acc
     analyticsIngestBatch: { findUnique: async () => null },
     async $executeRawUnsafe(sql) {
       if (["campaign_observation_version", "campaign_directory_count_version", "campaign_traversal_authority_version"]
-        .some(marker => sql === `SELECT set_config('onlinod.${marker}', '1', true)`)) return 1;
+        .some(marker => sql.startsWith(`SELECT set_config('onlinod.${marker}', '1', true)`))) return 1;
       assert.match(sql, /pg_advisory_xact_lock/); return 1;
     },
     creatorCampaignCollectionState: {
@@ -231,7 +231,7 @@ test("INT5.9A-9 non-target claimer write fails before collection generation acce
     analyticsIngestBatch: { findUnique: async () => null },
     async $executeRawUnsafe(sql) {
       if (["campaign_observation_version", "campaign_directory_count_version", "campaign_traversal_authority_version"]
-        .some(marker => sql === `SELECT set_config('onlinod.${marker}', '1', true)`)) return 1;
+        .some(marker => sql.startsWith(`SELECT set_config('onlinod.${marker}', '1', true)`))) return 1;
       assert.match(sql, /pg_advisory_xact_lock/); return 1;
     },
     creatorCampaignCollectionState: {

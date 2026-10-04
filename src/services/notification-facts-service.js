@@ -8,6 +8,7 @@ const prisma = require("../prisma");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { projectSubscriptionFacts, rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
+const { lockCreatorFacts, mergeNotificationMoney, transactionIdentityConflict } = require("./creator-fact-write-authority");
 const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
 const { projectFanIdentityBatch } = require("./fan-data-authority-service");
 
@@ -318,13 +319,6 @@ function coverageComplete(result, job) {
   const states = resultCoverage(result, job);
   return Object.values(states).length > 0 && Object.values(states).every((status) => status === "complete");
 }
-async function acquireIngestTransactionLock(db, idempotencyKey) {
-  if (typeof db?.$executeRawUnsafe !== "function") return;
-  const hex = sha256(idempotencyKey).slice(0, 16);
-  let value = BigInt(`0x${hex}`);
-  if (value > 0x7fffffffffffffffn) value -= 0x10000000000000000n;
-  await db.$executeRawUnsafe("SELECT pg_advisory_xact_lock($1::bigint)", value.toString());
-}
 function factIdentityTokens(fact) {
   return [
     `f:${fact.fingerprint}`,
@@ -365,7 +359,7 @@ function mergeSubscriptionFacts(current, incoming) {
   };
 }
 function mergeFactDataWithExisting(model, existing, incoming) {
-  if (model !== "creatorSubscriptionEvent" || !existing) return incoming;
+  if (model !== "creatorSubscriptionEvent" || !existing) return mergeNotificationMoney(model, existing, incoming);
   const existingHasStrongIdentity = Boolean(existing.externalTransactionId || existing.externalNotificationId);
   const incomingHasStrongIdentity = Boolean(incoming.externalTransactionId || incoming.externalNotificationId);
   const preserveExistingSource = existingHasStrongIdentity && !incomingHasStrongIdentity;
@@ -530,7 +524,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
     }
     if (existingMatches.size > 1) { rejected += 1; continue; }
     const row = existingMatches.size === 1 ? [...existingMatches.values()][0] : null;
-    if (model === "creatorSubscriptionEvent" && row && subscriptionIdentityConflict(row, fact)) {
+    if (transactionIdentityConflict(row, fact) || (model === "creatorSubscriptionEvent" && row && subscriptionIdentityConflict(row, fact))) {
       rejected += 1;
       continue;
     }
@@ -574,7 +568,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
         }
         if (matches.size !== 1) { raceRejected += 1; continue; }
         const row = [...matches.values()][0];
-        if (model === "creatorSubscriptionEvent" && subscriptionIdentityConflict(row, item.fact)) {
+        if (transactionIdentityConflict(row, item.fact) || (model === "creatorSubscriptionEvent" && subscriptionIdentityConflict(row, item.fact))) {
           raceRejected += 1;
           continue;
         }
@@ -823,7 +817,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       // Serialize duplicate deliveries inside the same database transaction.
       // Re-read after acquiring the lock: another request may have committed
       // after our pre-transaction ensureBatch() read.
-      await acquireIngestTransactionLock(tx, `notification-facts:${job.agencyId}:${job.creatorId}`);
+      await lockCreatorFacts(tx, job.agencyId, job.creatorId);
       const lockedBatch = await tx.analyticsIngestBatch.findUnique({ where: { idempotencyKey } });
       if (lockedBatch?.status === "COMMITTED" || lockedBatch?.status === "PARTIAL") {
         return { replayed: true, response: terminalReplayResponse(lockedBatch, result, job) };
@@ -856,6 +850,8 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
         const persistedTips = await existingFacts(tx, "creatorTip", job.creatorId, groups.tip);
         for (const row of persistedTips) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "TIP", sourceId: row.id, now });
       }
+      const previousSubscriptions = groups.subscription.length
+        ? await existingFacts(tx, "creatorSubscriptionEvent", job.creatorId, groups.subscription) : [];
       const subscription = await persistFactGroup(tx, {
         model: "creatorSubscriptionEvent", facts: groups.subscription, job, deviceId, fanRecordIds, now,
         compareKeys: ["fanRecordId", "externalNotificationId", "externalTransactionId", "eventType", "observedPriceCents", "currency", "occurredAt"],
@@ -864,14 +860,13 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
         && tx.creatorSubscriptionState
         && tx.creatorPaidSubscription
         && typeof tx.creatorSubscriptionEvent?.findMany === "function") {
-        const affectedFanIds = [...new Set(groups.subscription
-          .map((fact) => fact.externalFanId ? fanRecordIds.get(fact.externalFanId) || null : null)
-          .filter(Boolean))];
-        if (affectedFanIds.length) {
-          await projectSubscriptionFacts({
-            db: tx, agencyId: job.agencyId, creatorId: job.creatorId, fanRecordIds: affectedFanIds, now,
-          });
-        }
+        const persistedSubscriptions = await existingFacts(tx, "creatorSubscriptionEvent", job.creatorId, groups.subscription);
+        const affectedFanIds = [...new Set([...previousSubscriptions, ...persistedSubscriptions]
+          .map(row => row.fanRecordId).filter(Boolean))];
+        // Include both former and current owners; one page repairs at most
+        // twice its bounded event count, including two events exchanging fans.
+        await projectSubscriptionFacts({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId,
+          fanRecordIds: affectedFanIds, eventIds: persistedSubscriptions.map(row => row.id), now });
       }
       const like = await persistFactGroup(tx, {
         model: "creatorPostLike", facts: groups.like, job, deviceId, fanRecordIds, now,

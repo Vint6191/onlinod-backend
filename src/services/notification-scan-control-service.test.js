@@ -2,6 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 
 function cacheModule(path, exports) {
   require.cache[path] = { id: path, filename: path, loaded: true, exports };
@@ -85,7 +86,7 @@ function manualJob(overrides = {}) {
 test("manual START uses bounded catch-up when historical notification coverage already exists", async () => {
   scheduledInput = null;
   buildStateSeen = undefined;
-  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") };
+  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z") };
   const db = { jobInstance: { async findMany() { return []; } } };
   const result = await startManualNotificationScan({ db, creator, requestedByUserId: "user-1", now: new Date("2026-08-07T12:00:00.000Z") });
   assert.equal(result.action, "created");
@@ -154,7 +155,7 @@ test("manual START treats a future-poisoned baseline as FULL repair work", async
 test("an explicit forceFull request can deliberately re-prove full history", async () => {
   scheduledInput = null;
   buildStateSeen = undefined;
-  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") };
+  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z") };
   const db = { jobInstance: { async findMany() { return []; } } };
   await startManualNotificationScan({ db, creator, requestedByUserId: "user-1", now: new Date("2026-08-07T12:00:00.000Z"), forceFull: true });
   assert.equal(scheduledInput.params.notificationMode, "full");
@@ -163,7 +164,7 @@ test("an explicit forceFull request can deliberately re-prove full history", asy
 });
 
 test("manual start resumes the same current-v8 paused catch-up without clearing its cursor", async () => {
-  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") };
+  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z") };
   const paused = manualJob({
     status: "PAUSED",
     params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "catchup", ...notificationCommand("scan-run-1234", "catchup") },
@@ -190,7 +191,7 @@ test("manual start resumes the same current-v8 paused catch-up without clearing 
 });
 
 test("a stale paused full scan is fenced and replaced by catch-up once the baseline is verified", async () => {
-  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") };
+  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z") };
   const paused = manualJob({
     status: "PAUSED",
     params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "full" },
@@ -213,7 +214,7 @@ test("a stale paused full scan is fenced and replaced by catch-up once the basel
 });
 
 test("pre-v8 paused catch-up is restarted cleanly as catch-up, not promoted to full", async () => {
-  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") };
+  syncState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z") };
   const paused = manualJob({
     status: "PAUSED",
     params: { manualNotificationScan: true, manualNotificationScanVersion: 1, notificationMode: "catchup", ...notificationCommand("scan-run-v7", "catchup") },
@@ -249,7 +250,7 @@ test("manual stop fences a claimed lease but preserves progress and continuation
       async findUnique() { return { ...current, ...updateData, status: "PAUSED" }; },
     },
   };
-  const result = await stopManualNotificationScan({ db, creatorId: creator.id });
+  const result = await stopManualNotificationScan({ db: commitDatabaseFixture(db), creatorId: creator.id });
   assert.equal(result.action, "paused");
   assert.equal(updateData.status, "PAUSED");
   assert.deepEqual(current.continuation.jobContinuation, { fromId: "n-100", page: 7 });

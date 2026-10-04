@@ -15,7 +15,7 @@ const CAMPAIGN_COVERAGE_SELECT = Object.freeze(Object.fromEntries([
   "campaignDirectoryGeneration", "campaignDirectoryRequestedAt", "campaignDirectoryVerifiedAt", "campaignDirectoryRevision",
   "campaignDirectoryCampaignCount", "campaignDirectoryDiscoveryDueAt", "campaignDirectoryDiscoveryRequestedRevision", "campaignDirectoryDiscoveryCompletedRevision",
   "campaignDirectoryFactsRevision", "campaignDirectoryCountRevision",
-  "campaignFrontierPlanRunId", "campaignFrontierObservationVersion", "campaignFrontierFreshnessStatus", "campaignFrontierNextDueAt",
+  "campaignFrontierNextEligibleAt", "campaignFrontierScheduleVersion", "campaignFrontierPlanRunId", "campaignFrontierObservationVersion", "campaignFrontierFreshnessStatus", "campaignFrontierNextDueAt",
   "campaignFrontierTargetCount", "campaignFrontierCompletedCount", "campaignFrontierDeferredCount",
   "fanValueCoverageScanRunId", "fanValueExpected", "fanValueFreshnessStatus", "fanValueOutstanding", "fanValueFailed",
 ].map(key => [key, true])));
@@ -49,6 +49,11 @@ function frontierDue(state, now = new Date()) {
   // No deadline is valid only for an exactly empty, verified directory.
   return next ? +next <= +now : state.campaignDirectoryCampaignCount !== 0;
 }
+function frontierAdmissionDue(state, now = new Date()) {
+  if (state?.campaignFrontierScheduleVersion !== 1) return frontierDue(state, now);
+  const next = parseObservationTime(state.campaignFrontierNextEligibleAt);
+  return next ? +next <= +now : frontierDue(state, now);
+}
 function fanRefreshPending(state) {
   return Boolean(state?.activeGeneration && state.fanValueCoverageScanRunId === state.activeGeneration
     && Number(state.fanValueExpected || 0) > 0 && state.fanValueFreshnessStatus !== "COMPLETE");
@@ -68,7 +73,8 @@ function evaluateCampaignCollectionState(state, now = new Date(), refreshDebt = 
   const delegatedPending = fanRefreshPending(state) || refreshDebt?.queued === true || refreshDebt?.failed === true;
   const providerFresh = base.proven && !discoveryDue && !membershipDue;
   const fresh = providerFresh && !delegatedPending;
-  const deferred = !fresh && Boolean(base.retryAfterAt && +base.retryAfterAt > +now);
+  const scheduledLater = membershipDue && !discoveryDue && !frontierAdmissionDue(state, now);
+  const deferred = !fresh && (Boolean(base.retryAfterAt && +base.retryAfterAt > +now) || scheduledLater);
   return Object.freeze({ ...base, fresh, stale: base.usable && !fresh, deferred,
     // Only provider debt admits another provider traversal. FanData has its own queue.
     due: !providerFresh && !deferred && !base.failed, providerFresh,
@@ -77,9 +83,10 @@ function evaluateCampaignCollectionState(state, now = new Date(), refreshDebt = 
     directoryDue: discoveryDue, frontierDue: membershipDue, fanRefreshPending: delegatedPending,
     directoryObservedAt: directoryObservationAt(state, now),
     directoryNextDueAt: directoryDiscoveryDeadline(state, CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS, now),
+    frontierNextEligibleAt: parseObservationTime(state?.campaignFrontierNextEligibleAt),
     frontierNextDueAt: parseObservationTime(state?.campaignFrontierNextDueAt),
   });
 }
 
-module.exports = { coverageDto, FRONTIER_OBSERVATION_VERSION, CAMPAIGN_COVERAGE_SELECT, directoryPending, directoryDue, frontierDue,
+module.exports = { coverageDto, FRONTIER_OBSERVATION_VERSION, CAMPAIGN_COVERAGE_SELECT, directoryPending, directoryDue, frontierDue, frontierAdmissionDue,
   fanRefreshPending, frontierDueWhere, evaluateCampaignCollectionState };

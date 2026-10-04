@@ -263,7 +263,7 @@ test('Observation marker does not acquire an activation-row lock inside a Campai
     $queryRawUnsafe:async()=>{throw new Error('Activation lock order reversed');}}});
   assert.deepEqual(calls,["SELECT set_config('onlinod.campaign_observation_version', '1', true)",
     "SELECT set_config('onlinod.campaign_directory_count_version', '1', true)",
-    "SELECT set_config('onlinod.campaign_traversal_authority_version', '1', true)"]);
+    "SELECT set_config('onlinod.campaign_traversal_authority_version', '1', true), set_config('onlinod.campaign_fair_pages_version', '1', true)"]);
 });
 test('Postflight rejects missing, disabled and mismatched rolling-deploy guards',async()=>{
   const {verify,SPECS}=require('../../scripts/database/campaign-observation-postflight');

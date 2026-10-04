@@ -5,6 +5,7 @@ function stub(name, exports) {
   const id = require.resolve(name); require.cache[id] = { id, filename: id, loaded: true, exports };
 }
 stub("../prisma", {});
+stub("./db-transaction-service", { runDbTransaction: async (db, work) => work(db) });
 stub("./job-scheduler", { scheduleJobNow() { throw new Error("unexpected second traversal"); } });
 stub("./job-planning-repository", { async reschedulePlannedJob({ db, job, ...input }) {
   assert.deepEqual(input.continuation, job.continuation);

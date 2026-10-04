@@ -1,6 +1,7 @@
 "use strict";
 const directoryCounts = require("./campaign-directory-count-authority");
 const boundedFrontiers = require("./campaign-bounded-frontier-service");
+const fairPages = require("./campaign-fair-pages-service");
 const traversalAuthority = require("./campaign-traversal-authority-service");
 
 const { observationStartForJob } = require("./analytics-observation-time");
@@ -1040,7 +1041,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
         const where = { creatorId_externalCampaignId: { creatorId: job.creatorId, externalCampaignId: campaign.externalCampaignId } };
         const existing = await tx.creatorCampaign.findUnique({
           where,
-          select: { id: true, sourceScanStartedAt: true, isActive: true, claimersCount: true, claimerRevision: true },
+          select: { id: true, claimersCursorRunId: true, sourceScanStartedAt: true, isActive: true, claimersCount: true, claimerRevision: true },
         });
         if (isNewerGeneration(existing, scanStartedAt)) {
           unchanged += 1;
@@ -1066,9 +1067,11 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
           existing.isActive !== campaign.isActive ||
           (campaign.claimersCount !== null && existing.claimersCount !== campaign.claimersCount)
         );
+        if (fairPages.enabled(job) && command.mode === "full" && existing?.claimersCursorRunId !== scanRunId) Object.assign(common, fairPages.initialCursor(scanRunId));
         if (frontierSignalChanged) {
           common.claimerRevision = { increment: 1 };
           common.claimersNextDueAt = serverReceivedAt;
+          common.claimersEligibleAt = serverReceivedAt;
         }
         await tx.creatorCampaign.upsert({
           where,
@@ -1081,9 +1084,11 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
             collectedAt: serverReceivedAt,
             sourceDeviceId: deviceId || null,
             sourceJobId: job.id,
+            ...(fairPages.enabled(job) && command.mode === "full" ? fairPages.initialCursor(scanRunId) : {}),
             claimerRevision: 1,
             claimerVerifiedRevision: 0,
             claimersNextDueAt: serverReceivedAt,
+            claimersEligibleAt: serverReceivedAt,
           },
           update: common,
         });
@@ -1307,6 +1312,7 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       payload.sourceHasMore === true &&
       serverDeepBoundaryReached !== true &&
       currentRunMembershipProgress === 0;
+    await fairPages.commitPage(tx, job, payload, serverNoProgressDetected);
     const knownBoundaryReached = orderIndependentTraversal
       ? false
       : payload.knownBoundaryReached === true || serverDeepBoundaryReached;
@@ -1410,6 +1416,9 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
           claimersVerifiedAt: observation.observedAt,
           claimersNextDueAt: observation.observedAt && verifiedRevision === Math.max(1, Number(saved.claimerRevision || 1))
             ? new Date(observation.observedAt.getTime() + verificationIntervalMs) : serverReceivedAt,
+          ...(fairPages.enabled(job) ? { claimersEligibleAt: fairPages.eligibleAt(
+            observation.observedAt && verifiedRevision === Math.max(1, Number(saved.claimerRevision || 1))
+              ? new Date(+observation.observedAt + verificationIntervalMs) : serverReceivedAt, serverReceivedAt) } : {}),
           claimersLastVerifiedRunId: scanRunId,
           claimersTargetRunId: null,
         },
@@ -1901,7 +1910,7 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
     // the entire directory merely to attach target markers.
     targetCount = allCount;
   } else if (bounded) {
-    selected = await boundedFrontiers.selectTargets(tx, exactGeneration, now, campaignFrontierBudget(job));
+    selected = await (fairPages.enabled(job) ? fairPages : boundedFrontiers).selectTargets(tx, exactGeneration, now, campaignFrontierBudget(job));
     targetIds = selected.targets.map(row => row.id);
     targetCount = targetIds.length;
     dueCount = selected.dueCount;
@@ -1924,7 +1933,7 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
   if (targetIds.length) {
     const assigned = await tx.creatorCampaign.updateMany({
       where: { id: { in: targetIds }, creatorId: job.creatorId },
-      data: { claimersTargetRunId: scanRunId },
+      data: { claimersTargetRunId: scanRunId, ...(fairPages.enabled(job) ? fairPages.initialCursor(scanRunId) : {}) },
     });
     if (assigned.count !== targetIds.length) throw new Error("CAMPAIGN_FRONTIER_TARGET_ASSIGNMENT_CHANGED");
   }
@@ -2018,7 +2027,7 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaign
     durable.scanRunId !== scanRunId ||
     durable.directorySourceExhausted !== true ||
     durable.campaignPagesComplete !== true ||
-    durable.truncated === true
+    (durable.truncated === true && !fairPages.enabled(job))
   ) throw new Error("Campaign directory segment requested before durable directory completion");
 
   const requestedCursor = text(payload.cursor, 220) || null;
@@ -2056,6 +2065,11 @@ async function loadCampaignDirectorySegment({ db = prisma, job, chunk, _campaign
   const selection = boundedFrontiers.selection(frontierPlan, scanRunId);
   if (selection) boundedFrontiers.assertBinding(frontierPlan, selection, directory);
 
+  if (fairPages.enabled(job)) {
+    const issued = await fairPages.segment(db, job, requestedCursor);
+    return { campaignDirectorySegment: { ...issued, totalCampaignCount: directory.campaignCount,
+      ...(selection ? { segmentTargetCount: selection.ids.length } : {}) } };
+  }
   const where = {
     creatorId: job.creatorId,
     sourceScanRunId: directory.generation,
@@ -2204,6 +2218,10 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result, public
         where: { creatorId: job.creatorId },
         data: {
           campaignFrontierNextDueAt: nextDueRow?.claimersNextDueAt || null,
+          ...(fairPages.enabled(job) ? { campaignFrontierScheduleVersion: 1,
+            campaignFrontierNextEligibleAt: await fairPages.nextEligible(tx,
+              { creatorId: job.creatorId, sourceScanRunId: directoryGeneration, sourceScanStartedAt: directoryRequestedAt }, serverReceivedAt)
+          } : { campaignFrontierScheduleVersion: 0, campaignFrontierNextEligibleAt: null }),
           ...(Math.max(0, Number(frontierState?.campaignFrontierDeferredCount || 0)) === 0 ? { campaignFrontierOldestDueAt: null } : {}),
           campaignFrontierUpdatedAt: serverReceivedAt,
         },

@@ -222,5 +222,75 @@
     "unique": false,
     "expression": "\"creatorId\",COALESCE(\"nextRetryAt\",\"lastFailedAt\",\"updatedAt\"),\"id\"",
     "where": "\"status\" = 'FAILED' AND \"activeRefreshJobId\" IS NULL"
+  },
+  {
+    "name": "Campaign_fair_pages_v1",
+    "table": "CreatorCampaign",
+    "unique": false,
+    "expression": "\"creatorId\",\"claimersCursorRunId\",\"claimersCursorPending\",\"claimersCursorPage\",\"externalCampaignId\"",
+    "where": null
+  },
+  {
+    "name": "Campaign_fair_schedule_v1",
+    "table": "CreatorCampaign",
+    "unique": false,
+    "expression": "\"creatorId\",\"sourceScanRunId\",\"claimersEligibleAt\",\"externalCampaignId\"",
+    "where": null
+  },
+  {
+    "name": "Campaign_directory_due_v1",
+    "table": "CreatorCampaign",
+    "unique": false,
+    "expression": "\"creatorId\",\"sourceScanRunId\",\"claimersNextDueAt\",\"externalCampaignId\"",
+    "where": null
+  },
+  {
+    "name": "Subscription_state_latest_v1",
+    "table": "CreatorSubscriptionEvent",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"occurredAt\" DESC,\"id\" DESC",
+    "where": null
+  },
+  {
+    "name": "Subscription_state_currency_v1",
+    "table": "CreatorSubscriptionEvent",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"occurredAt\" DESC,\"id\" DESC",
+    "where": "\"currency\" ~ '^[A-Z]{3}$'"
+  },
+  {
+    "name": "Subscription_state_price_v1",
+    "table": "CreatorSubscriptionEvent",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"occurredAt\" DESC,\"id\" DESC",
+    "where": "\"observedPriceCents\" >= 0"
+  },
+  {
+    "name": "Subscription_state_status_v1",
+    "table": "CreatorSubscriptionEvent",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"occurredAt\" DESC,\"id\" DESC",
+    "where": "\"eventType\" IN ('SUBSCRIBED_FREE'::\"CreatorSubscriptionEventType\",'SUBSCRIBED_PAID'::\"CreatorSubscriptionEventType\",'SUBSCRIBED_UNKNOWN'::\"CreatorSubscriptionEventType\",'RENEWED'::\"CreatorSubscriptionEventType\",'RESUBSCRIBED'::\"CreatorSubscriptionEventType\",'EXPIRED'::\"CreatorSubscriptionEventType\")"
+  },
+  {
+    "name": "Subscription_state_started_v1",
+    "table": "CreatorSubscriptionEvent",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"occurredAt\" DESC,\"id\" DESC",
+    "where": "\"eventType\" IN ('SUBSCRIBED_FREE'::\"CreatorSubscriptionEventType\",'SUBSCRIBED_PAID'::\"CreatorSubscriptionEventType\",'SUBSCRIBED_UNKNOWN'::\"CreatorSubscriptionEventType\",'RESUBSCRIBED'::\"CreatorSubscriptionEventType\")"
+  },
+  {
+    "name": "Subscription_state_renewed_v1",
+    "table": "CreatorSubscriptionEvent",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"occurredAt\" DESC,\"id\" DESC",
+    "where": "\"eventType\" = 'RENEWED'::\"CreatorSubscriptionEventType\""
+  },
+  {
+    "name": "Subscription_state_renewal_v1",
+    "table": "CreatorSubscriptionEvent",
+    "unique": false,
+    "expression": "\"creatorId\",\"fanId\",\"occurredAt\" DESC,\"id\" DESC",
+    "where": "\"eventType\" IN ('AUTO_RENEW_ENABLED'::\"CreatorSubscriptionEventType\",'AUTO_RENEW_DISABLED'::\"CreatorSubscriptionEventType\")"
   }
 ]

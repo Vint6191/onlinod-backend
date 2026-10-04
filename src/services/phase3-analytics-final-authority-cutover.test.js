@@ -58,7 +58,7 @@ test("final cut durable promotion claim never holds signal row while waiting for
   assert.match(claim, /FOR UPDATE OF s SKIP LOCKED/);
   assert.match(claim, /UPDATE "CampaignFanRefreshPromotionSignal"/);
   assert.match(maintenance, /claimCampaignFanRefreshPromotionSignal\(\{ db: root/);
-  assert.match(maintenance, /runDbTransaction\(root,[\s\S]*acquireCampaignTransactionLock\(tx, creatorId\)[\s\S]*campaignFanRefreshPromotionSignal\.findFirst/);
+  assert.match(maintenance, /runDbTransaction\(root,[\s\S]*acquireCampaignTransactionLock\(tx, creatorId\)[\s\S]*SELECT \* FROM "CampaignFanRefreshPromotionSignal"/);
 });
 
 test("Billing and legacy Analytics have no active snapshot generation reader/writer while Phase7 freezes then contracts legacy tables", () => {
@@ -271,6 +271,9 @@ test("Campaign promotion claim chronology is PostgreSQL-owned and stale claimant
   const queuePath = require.resolve("./campaign-fan-refresh-queue-service", { paths: [__dirname] });
   const dbTimePath = require.resolve("./db-time-authority-service", { paths: [__dirname] });
   const lockPath = require.resolve("./campaign-transaction-lock-service", { paths: [__dirname] });
+  const kernelPath = require.resolve("./db-transaction-service");
+  const previousKernel = require.cache[kernelPath];
+  require.cache[kernelPath] = { exports: { runDbTransaction: async (db, work) => db.$transaction(work) } };
   const previousQueue = require.cache[queuePath];
   const previousTime = require.cache[dbTimePath];
   const previousLock = require.cache[lockPath];
@@ -294,6 +297,11 @@ test("Campaign promotion claim chronology is PostgreSQL-owned and stale claimant
       },
     };
     const processTx = {
+      $queryRawUnsafe: async (sql,id,token,at,revision) => {
+        assert.match(sql, /SELECT \* FROM "CampaignFanRefreshPromotionSignal"/);
+        assert.equal(id, "signal-1"); assert.equal(token, "claim-old");
+        assert.equal(+at, +authorityNow); assert.equal(revision, 1); return [];
+      },
       campaignFanRefreshPromotionSignal: {
         findFirst: async ({ where }) => {
           assert.equal(where.claimToken, "claim-old");
@@ -332,6 +340,7 @@ test("Campaign promotion claim chronology is PostgreSQL-owned and stale claimant
     else delete require.cache[queuePath];
     if (previousTime) require.cache[dbTimePath] = previousTime;
     else delete require.cache[dbTimePath];
+    if (previousKernel) require.cache[kernelPath] = previousKernel; else delete require.cache[kernelPath];
     if (previousLock) require.cache[lockPath] = previousLock;
     else delete require.cache[lockPath];
   }

@@ -9,7 +9,7 @@ test('Phase7 deploy retains every preflight and postflight in the production wra
  assert.equal(PRE.length,8);
  assert.deepEqual(POST.map(([script]) => script), [
   "analytics-traffic-indexes.js", "campaign-observation-postflight.js", "campaign-bounded-postflight.js",
-  "campaign-traversal-postflight.js", "campaign-value-refresh-postflight.js", "traffic-projection-postflight.js", "campaign-refresh-work-postflight.js", "campaign-membership-proof-postflight.js",
+  "campaign-traversal-postflight.js", "campaign-value-refresh-postflight.js", "traffic-projection-postflight.js", "campaign-refresh-work-postflight.js", "campaign-membership-proof-postflight.js", "campaign-fair-pages-postflight.js",
   "provider-capacity-catalog-postflight.js", "phase3-domain-work-claim-online-rollout.js",
   "phase3-subscriber-publication-schema-online-postflight.js", "phase3-analytics-legacy-snapshot-online-postflight.js",
   "actual60-refreshsession-online-index-preflight.js"

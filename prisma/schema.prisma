@@ -2253,6 +2253,8 @@ model CreatorCampaignCollectionState {
   campaignFrontierCompletedCount              Int                     @default(0)
   campaignFrontierDeferredCount               Int                     @default(0)
   campaignFrontierOldestDueAt                 DateTime?
+  campaignFrontierNextEligibleAt DateTime?
+  campaignFrontierScheduleVersion Int @default(0)
   campaignFrontierNextDueAt                   DateTime?
   campaignFrontierUpdatedAt                   DateTime?
   campaignDirectoryGeneration                 String?                 @db.VarChar(120)
@@ -3031,6 +3033,7 @@ model CreatorSubscriptionEvent {
   campaignAttributions CreatorCampaignFan[]      @relation("CreatorCampaignFanSubscriptionEvent")
 
   @@unique([creatorId, id], map: "CreatorSubscriptionEvent_creatorId_id_key")
+  @@index([creatorId, fanRecordId, occurredAt(sort: Desc), id(sort: Desc)], map: "Subscription_state_latest_v1")
   @@unique([creatorId, eventFingerprint])
   @@unique([creatorId, externalNotificationId])
   @@index([creatorId, externalTransactionId])
@@ -3248,6 +3251,11 @@ model CreatorCampaign {
   claimersNextDueAt              DateTime?
   claimersTargetRunId            String?   @db.VarChar(120)
   claimersLastVerifiedRunId      String?   @db.VarChar(120)
+  claimersCursorRunId            String?   @db.VarChar(120)
+  claimersCursorPage             Int       @default(0)
+  claimersCursorOffset           Int       @default(0)
+  claimersCursorPending          Boolean   @default(false)
+  claimersEligibleAt             DateTime?
   claimersTraversalRunId         String?   @db.VarChar(120)
   claimersTraversalStartedAt     DateTime?
   claimersTraversalRevision      Int?
@@ -3273,6 +3281,9 @@ model CreatorCampaign {
   @@index([creatorId, sourceScanStartedAt])
   @@index([creatorId, sourceScanRunId])
   @@index([creatorId, sourceScanRunId, externalCampaignId], map: "CreatorCampaign_run_segment_idx")
+  @@index([creatorId, claimersCursorRunId, claimersCursorPending, claimersCursorPage, externalCampaignId], map: "Campaign_fair_pages_v1")
+  @@index([creatorId, sourceScanRunId, claimersEligibleAt, externalCampaignId], map: "Campaign_fair_schedule_v1")
+  @@index([creatorId, sourceScanRunId, claimersNextDueAt, externalCampaignId], map: "Campaign_directory_due_v1")
   @@index([creatorId, claimersNextDueAt, externalCampaignId], map: "CreatorCampaign_frontier_due_idx")
   @@index([creatorId, claimersTargetRunId, externalCampaignId], map: "CreatorCampaign_frontier_target_idx")
   @@index([sourceJobId])

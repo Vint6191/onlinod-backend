@@ -41,17 +41,29 @@ test("subscription projection materializes one current state and typed paid rows
   const createdPaid = [];
   const states = [];
   const db = {
-    creatorSubscriptionEvent: { findMany: async () => events },
+    $queryRawUnsafe: async () => events.map(event => ({ ...event, fanId: event.fanRecordId })),
+    $executeRawUnsafe: async (sql, payload) => {
+      const rows = JSON.parse(payload);
+      if (sql.includes('INSERT INTO "CreatorPaidSubscription"')) createdPaid.push(...rows);
+      else if (sql.includes('INSERT INTO "CreatorSubscriptionState"')) states.push(...rows.map(create => ({create})));
+      else throw new Error("unexpected SQL");
+    },
+    creatorSubscriptionEvent: { findMany: async args => {
+      assert.deepEqual(args.where.id.in, ["e1", "e2"]);
+      assert.equal(args.take, 2);
+      return events;
+    } },
     creatorPaidSubscription: {
-      findFirst: async () => null,
+      findMany: async () => [],
       create: async ({ data }) => { createdPaid.push(data); return data; },
       update: async () => { throw new Error("unexpected update"); },
     },
     creatorSubscriptionState: {
+      updateMany: async () => ({count: 0}),
       upsert: async (args) => { states.push(args); return args.create; },
     },
   };
-  const result = await projectSubscriptionFacts({ db, agencyId: "a", creatorId: "c", fanRecordIds: ["f"], now: new Date("2026-03-01T00:00:00Z") });
+  const result = await projectSubscriptionFacts({ db, agencyId: "a", creatorId: "c", fanRecordIds: ["f"], eventIds: ["e1", "e2"], now: new Date("2026-03-01T00:00:00Z") });
   assert.equal(result.stateUpserts, 1);
   assert.equal(result.paidInserted, 2);
   assert.equal(createdPaid[1].paymentType, "RENEWAL");

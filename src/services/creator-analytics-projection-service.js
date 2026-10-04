@@ -1,6 +1,8 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { boundedIds, stateEvents } = require("./subscription-projection-source");
+const { writeStates, writePayments } = require("./subscription-projection-store");
 
 const DAILY_METRICS_VERSION = 1;
 const PAID_EVENT_TYPES = new Set(["SUBSCRIBED_PAID", "RENEWED", "RESUBSCRIBED"]);
@@ -101,38 +103,48 @@ function defaultDb(db) {
   return db || require("../prisma");
 }
 
-async function projectSubscriptionFacts({ db = null, agencyId, creatorId, fanRecordIds = null, now = new Date() }) {
+async function projectSubscriptionFacts({ db = null, agencyId, creatorId, fanRecordIds, eventIds, now = new Date() }) {
   db = defaultDb(db);
-  const filter = { creatorId, fanRecordId: { not: null } };
-  if (Array.isArray(fanRecordIds) && fanRecordIds.length) filter.fanRecordId = { in: [...new Set(fanRecordIds.filter(Boolean))] };
+  const fans = boundedIds(fanRecordIds, "FANS");
+  const ids = boundedIds(eventIds, "EVENTS");
+  // The caller holds the creator notification-ingest transaction lock. Only
+  // this committed batch's canonical events can change paid projections.
   const events = await db.creatorSubscriptionEvent.findMany({
-    where: filter,
-    orderBy: [{ fanRecordId: "asc" }, { occurredAt: "asc" }, { id: "asc" }],
+    where: { agencyId, creatorId, id: { in: ids } },
+    orderBy: [{ occurredAt: "asc" }, { id: "asc" }], take: ids.length,
   });
   const byFan = new Map();
   let paidInserted = 0;
   let paidUpdated = 0;
+  const payments = [], inactive = [];
+  const fingerprints = events.map(event => sha256(`paid-subscription|${creatorId}|${event.eventFingerprint}`));
+  const existingRows = ids.length ? await db.creatorPaidSubscription.findMany({
+    where: { creatorId, OR: [{ subscriptionEventId: { in: ids } }, { eventFingerprint: { in: fingerprints } },
+      { externalTransactionId: { in: events.map(event => event.externalTransactionId).filter(Boolean) } }] },
+    // Three independent unique identities can each resolve one row per event.
+    take: ids.length * 3,
+  }) : [];
+  const byIdentity = new Map();
+  function index(row) {
+    for (const key of [`f:${row.eventFingerprint}`, ...(row.subscriptionEventId ? [`e:${row.subscriptionEventId}`] : []),
+      ...(row.externalTransactionId ? [`t:${row.externalTransactionId}`] : [])]) byIdentity.set(key, row);
+  }
+  existingRows.forEach(index);
 
   for (const event of events) {
-    if (!event.fanRecordId) continue;
-    const rows = byFan.get(event.fanRecordId) || [];
-    rows.push(event);
-    byFan.set(event.fanRecordId, rows);
-
-    if (!PAID_EVENT_TYPES.has(event.eventType) || !Number.isInteger(event.observedPriceCents) || event.observedPriceCents <= 0) continue;
+    if (!PAID_EVENT_TYPES.has(event.eventType) || !Number.isInteger(event.observedPriceCents) || event.observedPriceCents <= 0) {
+      // A corrected source event can cease to prove a payment. Remove only its
+      // own projection; never remove a different transaction's canonical row.
+      inactive.push(event.id);
+      continue;
+    }
     const fingerprint = sha256(`paid-subscription|${creatorId}|${event.eventFingerprint}`);
-    const transactionOr = event.externalTransactionId ? [{ externalTransactionId: event.externalTransactionId }] : [];
-    const existing = await db.creatorPaidSubscription.findFirst({
-      where: {
-        creatorId,
-        OR: [
-          { eventFingerprint: fingerprint },
-          { subscriptionEventId: event.id },
-          ...transactionOr,
-        ],
-      },
-      select: { id: true },
-    });
+    const matches = [...new Map([`f:${fingerprint}`, `e:${event.id}`, ...(event.externalTransactionId ? [`t:${event.externalTransactionId}`] : [])]
+      .map(key => byIdentity.get(key)).filter(Boolean).map(row => [row.id, row])).values()];
+    if (matches.length > 1 || (matches[0]?.subscriptionEventId && matches[0].subscriptionEventId !== event.id)) {
+      throw Object.assign(new Error("Subscription payment identities disagree"), { code: "SUBSCRIPTION_PAYMENT_IDENTITY_CONFLICT" });
+    }
+    const existing = matches[0];
     const data = {
       agencyId,
       creatorId,
@@ -158,25 +170,40 @@ async function projectSubscriptionFacts({ db = null, agencyId, creatorId, fanRec
       updatedAt: now,
     };
     if (existing) {
-      await db.creatorPaidSubscription.update({ where: { id: existing.id }, data });
+      payments.push({ id: existing.id, createdAt: existing.createdAt || now, ...data });
       paidUpdated += 1;
     } else {
-      await db.creatorPaidSubscription.create({ data: { id: crypto.randomUUID(), createdAt: now, ...data } });
+      payments.push({ id: crypto.randomUUID(), createdAt: now, ...data });
       paidInserted += 1;
     }
+    index(payments[payments.length - 1]);
   }
+  if (inactive.length) await db.creatorPaidSubscription.deleteMany({ where: { creatorId, subscriptionEventId: { in: inactive } } });
+  await writePayments(db, payments);
 
+  for (const event of await stateEvents(db, creatorId, fans)) {
+    const rows = byFan.get(event.fanRecordId) || [];
+    rows.push(event);
+    byFan.set(event.fanRecordId, rows);
+  }
   let stateUpserts = 0;
-  for (const [fanRecordId, fanEvents] of byFan) {
+  const states = [], emptyFans = [];
+  for (const fanRecordId of fans) {
+    const fanEvents = byFan.get(fanRecordId) || [];
     const projected = projectSubscriptionState(fanEvents);
-    if (!projected) continue;
-    await db.creatorSubscriptionState.upsert({
-      where: { creatorId_fanRecordId: { creatorId, fanRecordId } },
-      create: { id: crypto.randomUUID(), agencyId, creatorId, fanRecordId, ...projected, createdAt: now, updatedAt: now },
-      update: { ...projected, updatedAt: now },
-    });
+    if (!projected) {
+      emptyFans.push(fanRecordId);
+      continue;
+    }
+    states.push({ id: crypto.randomUUID(), agencyId, creatorId, fanRecordId, ...projected, createdAt: now, updatedAt: now });
     stateUpserts += 1;
   }
+  // Release old unique event pointers before assigning the whole affected set.
+  // Two corrected events can exchange fans in one batch. This stays within the
+  // caller's creator fact transaction, so readers never see the interim state.
+  if (fans.length) await db.creatorSubscriptionState.updateMany({ where: { creatorId, fanRecordId: { in: fans } }, data: { updatedFromEventId: null } });
+  if (emptyFans.length) await db.creatorSubscriptionState.deleteMany({ where: { creatorId, fanRecordId: { in: emptyFans } } });
+  await writeStates(db, states);
 
   return { stateUpserts, paidInserted, paidUpdated };
 }

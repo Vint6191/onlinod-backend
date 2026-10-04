@@ -35,7 +35,7 @@ test("notification facts are typed relational tables without JSON business stora
     assert.doesNotMatch(body, /\bJson\??\b/);
     assert.match(body, /eventFingerprint\s+String/);
     assert.match(body, /fanRecordId\s+String\?\s+@map\("fanId"\)/);
-    assert.match(body, /CreatorAccount @relation\(fields: \[agencyId, creatorId\], references: \[agencyId, id\], onDelete: Cascade\)/);
+    assert.match(body, /CreatorAccount\s+@relation\(fields: \[agencyId, creatorId\], references: \[agencyId, id\], onDelete: Cascade\)/);
     assert.match(body, /CreatorFan\?\s+@relation\(fields: \[creatorId, fanRecordId\], references: \[creatorId, id\], onDelete: NoAction\)/);
   }
   assert.match(modelBody("CreatorFan"), /@@unique\(\[creatorId, id\], map: "CreatorFan_creatorId_id_key"\)/);
@@ -115,7 +115,8 @@ test("ingest is version-fenced, transactional, page-oriented and interval-aware"
   assert.match(service, /onlyFansLikeId/);
   assert.match(service, /`l:\$\{fact\.likeId\}`/);
   assert.match(service, /NOTIFICATION_TIMEZONE_UNSUPPORTED/);
-  assert.match(service, /pg_advisory_xact_lock/);
+  assert.match(service, /lockCreatorFacts\(tx, job.agencyId, job.creatorId\)/);
+  assert.match(read("src/services/creator-fact-write-authority.js"), /pg_advisory_xact_lock/);
   assert.match(service, /NOTIFICATION_FINALIZE_FLAG_REQUIRED/);
   assert.match(service, /NOTIFICATION_COVERAGE_METADATA_INVALID/);
   assert.match(strictDates, /getUTCDate\(\) !== day/);
@@ -137,7 +138,7 @@ test("automatic creator scheduling delegates notification history to the strict 
   assert.match(body, /ensureInitialCreatorAnalyticsSync/);
   assert.match(body, /ensureRecurringCreatorAnalyticsCatchups/);
   assert.match(body, /if \(!initial\.ready\)[\s\S]*schedulerPlanningResult\(created, skipped, degraded, outcomes\)/);
-  assert.ok(body.indexOf("ensureInitialCreatorAnalyticsSync") < body.indexOf("ensureOperationalAnalyticsFreshness"), "bootstrap gate must run before canonical earnings freshness planning");
+  assert.ok(body.indexOf("ensureOperationalAnalyticsFreshness") < body.indexOf("ensureInitialCreatorAnalyticsSync"), "canonical earnings refresh must remain independent of another collector bootstrap");
   assert.match(body, /ensureOperationalAnalyticsFreshness/);
   assert.match(body, /includeEarningsFreshness/);
   assert.doesNotMatch(body, /TRACKED_RANGES/);

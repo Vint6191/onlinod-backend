@@ -78,7 +78,10 @@ async function acceptAnalyticsPublication({ db, job, userId, deviceId, leaseToke
 }
 
 async function lockDomain(db, job) {
-  if (job.jobKey === "fetch_campaigns") return acquireCampaignTransactionLock(db, job.creatorId);
+  if (job.jobKey === "fetch_campaigns") {
+    await acquireCampaignTransactionLock(db, job.creatorId);
+    return require("./campaign-causal-activation-service").enterCampaignBoundedExecution({ db });
+  }
   if (job.jobKey === "financial_transactions_scan") {
     return lockDbAdvisoryXact({ db, key: `analytics-collector:financial:${job.creatorId}` });
   }

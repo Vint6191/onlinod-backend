@@ -1880,7 +1880,7 @@ test("campaign ingest takes a transaction-scoped advisory lock before reading ge
   assert.equal(calls.length, 4);
   assert.equal(calls[0][0], "SELECT set_config('onlinod.campaign_observation_version', '1', true)");
   assert.equal(calls[1][0], "SELECT set_config('onlinod.campaign_directory_count_version', '1', true)");
-  assert.equal(calls[2][0], "SELECT set_config('onlinod.campaign_traversal_authority_version', '1', true)");
+  assert.equal(calls[2][0], "SELECT set_config('onlinod.campaign_traversal_authority_version', '1', true), set_config('onlinod.campaign_fair_pages_version', '1', true)");
   assert.match(calls[3][0], /pg_advisory_xact_lock/);
   assert.equal(calls[3][1], "analytics-collector:campaigns:creator-1");
 });

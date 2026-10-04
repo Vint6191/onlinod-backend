@@ -341,6 +341,7 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 50, offset
     campaignFrontierCountsExact: countsExact(collectionState),
     campaignFrontierOldestDueAt: iso(collectionState?.campaignFrontierOldestDueAt),
     campaignFrontierNextDueAt: iso(collectionState?.campaignFrontierNextDueAt),
+    campaignFrontierNextEligibleAt: iso(collectionState?.campaignFrontierNextEligibleAt),
     currentSourceFreshness: evaluateCampaignCollectionState(collectionState, capacityNow, refreshDebt),
     creatorRefreshQueued: refreshDebt.queued,
     campaignMembershipCoverageStatus: membershipCoverageStatus,

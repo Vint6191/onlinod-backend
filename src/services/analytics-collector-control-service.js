@@ -306,7 +306,7 @@ async function acceptCampaignGeneration({ db = prisma, job, deviceId = null, cam
       campaignFrontierObservationVersion: 0,
       campaignFrontierSelection: {},
       campaignFrontierDueCount: 0, campaignFrontierTargetCount: 0, campaignFrontierCompletedCount: 0, campaignFrontierDeferredCount: 0,
-      campaignFrontierOldestDueAt: null, campaignFrontierNextDueAt: null, campaignFrontierUpdatedAt: null,
+      campaignFrontierOldestDueAt: null, campaignFrontierNextDueAt: null, campaignFrontierNextEligibleAt: null, campaignFrontierScheduleVersion: 0, campaignFrontierUpdatedAt: null,
       lastErrorCode: null, lastErrorMessage: null, sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220),
     };
     const state = await tx.creatorCampaignCollectionState.upsert({

@@ -25,6 +25,7 @@ const {
 const { enterCampaignClaimGeneration, enterCampaignBoundedExecution } = require("./campaign-causal-activation-service");
 const { capabilityFreshnessWindow, isCapabilityTimestampFresh } = require("./capability-freshness-authority-service");
 const { createFanObservationToken } = require("./fan-observation-token-service");
+const fairPages = require("./campaign-fair-pages-service");
 const campaignTraversal = require("./campaign-traversal-authority-service");
 const { acquireCampaignTransactionLock } = require("./campaign-transaction-lock-service");
 const {
@@ -159,6 +160,7 @@ function campaignDirectoryReuseInitialContinuation(value) {
   return {
     driverPhase: "execute",
     jobContinuation: {
+      ...(Number(params.campaignFairPagesVersion) === 1 ? { fairPagesVersion: 1 } : {}),
       collectorVersion: "campaigns-v13", scanRunId: generation, scanStartedAt: new Date(requestedAt).toISOString(),
       phase: "segment", campaignMode: "catchup", offset: 0, page: 0, campaigns: [],
       segmentCursor: null, segmentRequestCursor: null, segmentHasMore: false, campaignIndex: 0,
@@ -172,6 +174,7 @@ function campaignServerBoundaryContinuation(value, externalCampaignId, previousV
   const driver = object(value);
   if (driver.driverPhase !== "execute") return null;
   const current = object(driver.jobContinuation);
+  if (current.fairPagesVersion === 1) return { ...current, truncated: forceTruncated === true || object(object(previousValue).jobContinuation).truncated === true };
   if (!["campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", "campaigns-v13"].includes(String(current.collectorVersion || ""))) return null;
   const campaignId = clean(externalCampaignId, 220);
   if (!campaignId || !Array.isArray(current.campaigns)) return null;
@@ -210,7 +213,7 @@ function campaignDirectorySegmentContinuation(value, segmentValue) {
     current.phase !== "segment" ||
     current.directorySourceExhausted !== true ||
     current.campaignPagesComplete !== true ||
-    current.truncated === true
+    (current.truncated === true && current.fairPagesVersion !== 1)
   ) return null;
   const segment = object(segmentValue);
   const requestCursor = clean(segment.requestCursor, 220) || null;
@@ -220,11 +223,11 @@ function campaignDirectorySegmentContinuation(value, segmentValue) {
     ? segment.campaigns.slice(0, 50).map((item) => {
       const row = object(item);
       const id = clean(row.id, 220);
-      return id && typeof row.scanClaimers === "boolean" ? { id, scanClaimers: row.scanClaimers } : null;
+      return id && typeof row.scanClaimers === "boolean" ? { id, scanClaimers: row.scanClaimers, ...(current.fairPagesVersion === 1 ? { page: row.page, offset: row.offset, rejected: row.rejected } : {}) } : null;
     }).filter(Boolean)
     : [];
   const cursor = clean(segment.cursor, 220) || requestCursor;
-  const totalCampaignCount = Number.isInteger(Number(segment.totalCampaignCount)) && Number(segment.totalCampaignCount) >= 0
+  const totalCampaignCount = segment.totalCampaignCount != null && Number.isInteger(Number(segment.totalCampaignCount)) && Number(segment.totalCampaignCount) >= 0
     ? Number(segment.totalCampaignCount)
     : Number(current.totalCampaignCount || 0);
   return {
@@ -232,9 +235,9 @@ function campaignDirectorySegmentContinuation(value, segmentValue) {
     phase: "claimers",
     campaigns,
     campaignIndex: 0,
-    claimerOffset: 0,
-    claimerPage: 0,
-    ...(Object.hasOwn(current, "claimerRejected") ? { claimerRejected: 0 } : {}),
+    claimerOffset: current.fairPagesVersion === 1 ? campaigns[0]?.offset || 0 : 0,
+    claimerPage: current.fairPagesVersion === 1 ? campaigns[0]?.page || 0 : 0,
+    ...(Object.hasOwn(current, "claimerRejected") ? { claimerRejected: current.fairPagesVersion === 1 ? campaigns[0]?.rejected || 0 : 0 } : {}),
     segmentRequestCursor: requestCursor,
     segmentCursor: cursor,
     segmentHasMore: segment.hasMore === true,
@@ -503,6 +506,7 @@ async function sweepExpiredLeases(now = null, { agencyId = null, limit = 100 } =
       if (!locked || locked.status !== "CLAIMED" || locked.leaseRevision !== candidate.leaseRevision
           || !locked.leaseUntil || new Date(locked.leaseUntil) > currentNow) return false;
       const job = locked;
+      if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
       const attempts = Number(job.attempts || 0) + 1;
       const terminal = attempts >= MAX_ATTEMPTS;
       const retryAt = terminal ? null : new Date(currentNow.getTime() + RETRY_BACKOFF_MS);
@@ -546,7 +550,8 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     capabilities?.campaignFrontierSchedulingV1 !== true ||
     capabilities?.campaignDirectoryReuseV1 !== true ||
     capabilities?.campaignBoundedTraversalV1 !== true ||
-    capabilities?.campaignTraversalAuthorityV1 !== true
+    capabilities?.campaignTraversalAuthorityV1 !== true ||
+    capabilities?.campaignFairPagesV1 !== true
   ) {
     allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
   }
@@ -593,8 +598,10 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     if (await cancelRedundantNotificationFull(candidate, now)) continue;
     const leaseToken = crypto.randomBytes(32).toString("base64url");
     const until = new Date(now.getTime() + leaseDuration(leaseMs));
+    const fairCampaign = String(candidate.jobKey || "") === "fetch_campaigns"
+      && (fairPages.enabled(candidate) || (candidate.continuation == null && candidate.startedAt == null));
     const reuseContinuation = String(candidate.jobKey || "") === "fetch_campaigns" && candidate.continuation == null
-      ? campaignDirectoryReuseInitialContinuation(candidate.params)
+      ? campaignDirectoryReuseInitialContinuation({ ...object(candidate.params), ...(fairCampaign ? { campaignFairPagesVersion: 1 } : {}) })
       : null;
     const claimData = {
       status: "CLAIMED", claimedAt: now, claimedByDeviceId: device.id, leaseUntil: until,
@@ -605,7 +612,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
           ...(String(candidate.jobKey || "") === "fetch_campaigns" ? campaignClaimParams(candidate.params) : object(candidate.params)),
           observationTokenVersion: 1,
           observationReadLeaseVersion: 1,
-          ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignBoundedTraversalVersion: 1, campaignTraversalAuthorityVersion: 1 } : {}),
+          ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignBoundedTraversalVersion: 1, campaignTraversalAuthorityVersion: 1, ...(fairCampaign ? { campaignFairPagesVersion: 1 } : {}) } : {}),
           ...(String(candidate.jobKey || "") === "fetch_campaigns" ? { campaignResumablePaginationVersion: 1, campaignFreshnessCoverageVersion: 1, campaignOrderIndependentTraversalVersion: 1, campaignSegmentedFairTraversalVersion: 1, campaignFrontierSchedulingVersion: 1, campaignDirectoryReuseVersion: 1 } : {}),
         },
       } : {}),
@@ -747,6 +754,7 @@ async function leaseCommit(input, work, { profile = "JOB_CHUNK", allowExpired = 
   try {
     return await runRootCommit(prisma, async ({ tx }) => {
       const job = await requireLease({ ...input, db: tx, lock: true, allowExpired });
+      if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
       const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
       return work(tx, { job, now });
     }, { profile, authority: { kind: "JOB_LEASE", userId: input.userId }, conflictCode: "JOB_LEASE_CONFLICT" });

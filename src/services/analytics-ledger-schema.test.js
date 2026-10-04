@@ -33,7 +33,7 @@ test("creator fan identity is creator-scoped and normal soft deletion preserves 
   const fan = modelBody("CreatorFan");
   assert.match(fan, /onlyFansUserId\s+String/);
   assert.match(fan, /@@unique\(\[creatorId, onlyFansUserId\]\)/);
-  assert.match(fan, /creator CreatorAccount @relation\(fields: \[agencyId, creatorId\], references: \[agencyId, id\], onDelete: Cascade\)/);
+  assert.match(fan, /creator\s+CreatorAccount\s+@relation\(fields: \[agencyId, creatorId\], references: \[agencyId, id\], onDelete: Cascade\)/);
   assert.match(hardeningMigration, /CreatorFan_seen_range_check/);
   assert.match(hardeningMigration, /CreatorFan_identity_length_check/);
 });

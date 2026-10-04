@@ -208,7 +208,7 @@ function campaignDirectoryDiscoveryDue(state, now = new Date()) {
 }
 
 function campaignFrontierWorkDue(state, now = new Date()) {
-  return campaignFreshness.frontierDue(state, now);
+  return campaignFreshness.frontierAdmissionDue(state, now);
 }
 
 function campaignDirectoryReuseBinding(state, now = new Date()) {

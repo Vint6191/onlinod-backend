@@ -3,11 +3,10 @@
 const { isDeepStrictEqual } = require("node:util");
 const { observationStartForJob } = require("./analytics-observation-time");
 
+const fairPages = require("./campaign-fair-pages-service");
 const VERSION = 1;
 const object = value => value && typeof value === "object" && !Array.isArray(value) ? value : {};
-class CampaignTraversalError extends Error {
-  constructor(code) { super(code); this.name = "CampaignTraversalError"; this.code = code; this.status = 409; }
-}
+const { CampaignTraversalError } = require("./campaign-traversal-errors");
 function fault(code) { return new CampaignTraversalError(code); }
 function enabled(job) { return job?.jobKey === "fetch_campaigns" && Number(job.params?.campaignTraversalAuthorityVersion || 0) >= VERSION; }
 function envelope(value) {
@@ -32,12 +31,12 @@ function integer(value, code = "CAMPAIGN_PAGE_POSITION_INVALID") {
 const CURSOR_FIELDS = ["collectorVersion", "scanRunId", "scanStartedAt", "phase", "campaignMode", "offset", "page", "campaigns",
   "segmentCursor", "segmentRequestCursor", "segmentHasMore", "campaignIndex", "claimerOffset", "claimerPage", "claimerRejected",
   "directorySourceExhausted", "campaignPagesComplete", "truncated", "totalCampaignCount", "segmentTargetCount",
-  "campaignBatchCount", "claimerBatchCount", "campaignScannerRejected", "claimerScannerRejected"];
+  "campaignBatchCount", "claimerBatchCount", "campaignScannerRejected", "claimerScannerRejected", "fairPagesVersion"];
 function state(job) {
   const driver = envelope(job.continuation);
   if (driver.driverPhase !== "execute") throw fault("CAMPAIGN_TRAVERSAL_ALREADY_COMPLETE");
   const raw = object(driver.jobContinuation), params = object(job.params);
-  const initial = { collectorVersion: "campaigns-v13", scanRunId: params.collectionGeneration,
+  const initial = { ...(fairPages.enabled(job) ? { fairPagesVersion: 1 } : {}), collectorVersion: "campaigns-v13", scanRunId: params.collectionGeneration,
     scanStartedAt: new Date(params.collectionRequestedAt).toISOString(), phase: "campaigns",
     campaignMode: params.collectionMode === "catchup" ? "catchup" : "full", offset: 0, page: 0, campaigns: [],
     segmentCursor: null, segmentRequestCursor: null, segmentHasMore: false, campaignIndex: 0, claimerOffset: 0, claimerPage: 0, claimerRejected: 0,
@@ -46,6 +45,7 @@ function state(job) {
   // Upgrading a leased legacy continuation is safe: existing pages retain the
   // older job observation bound until a genuinely new campaign begins.
   if (!raw.collectorVersion || raw.collectorVersion !== "campaigns-v13") return initial;
+  if (raw.fairPagesVersion !== initial.fairPagesVersion) throw fault("CAMPAIGN_FAIR_PROTOCOL_MISMATCH");
   if (raw.collectorVersion !== initial.collectorVersion || raw.scanRunId !== initial.scanRunId
     || raw.scanStartedAt !== initial.scanStartedAt) throw fault("CAMPAIGN_TRAVERSAL_GENERATION_MISMATCH");
   return { ...initial, ...raw, claimerRejected: raw.claimerRejected ?? raw.claimerScannerRejected ?? 0,
@@ -124,7 +124,8 @@ function assertProgress(job, chunk, continuation) {
     current.claimerBatchCount++; current.claimerScannerRejected += payload.scannerRejected;
     current.claimerRejected += payload.scannerRejected;
     current.truncated ||= payload.sourceHasMore && count === 0;
-    if (payload.sourceHasMore && count > 0) { current.claimerOffset += count; current.claimerPage++; }
+    if (fairPages.enabled(job)) { current.campaignIndex++; fairPages.nextRef(current); }
+    else if (payload.sourceHasMore && count > 0) { current.claimerOffset += count; current.claimerPage++; }
     else { current.campaignIndex++; current.claimerOffset = 0; current.claimerPage = 0; current.claimerRejected = 0; }
     if (current.campaignIndex >= current.campaigns.length) {
       if (!current.segmentHasMore) return compareCompletion(current, next);
@@ -155,6 +156,8 @@ async function beginRead({ db, job, campaignPage, acquiredAt }) {
     creatorId: job.creatorId, externalCampaignId: page.externalCampaignId } } });
   if (!campaign || campaign.agencyId !== job.agencyId) throw fault("CAMPAIGN_READ_SCOPE_INVALID");
   const generation = job.params.collectionGeneration;
+  if (fairPages.enabled(job) && (campaign.claimersCursorRunId !== generation || campaign.claimersCursorPending !== true
+      || campaign.claimersCursorPage !== page.pageNumber - 1 || campaign.claimersCursorOffset !== page.sourceOffset)) throw fault("CAMPAIGN_FAIR_PAGE_CURSOR_STALE");
   if (campaign.claimersTraversalRunId === generation && campaign.claimersTraversalStartedAt) return;
   const observedAt = page.pageNumber === 1 ? new Date(acquiredAt) : observationStartForJob(job);
   if (!observedAt || !Number.isFinite(+observedAt)) throw fault("CAMPAIGN_READ_OBSERVATION_MISSING");

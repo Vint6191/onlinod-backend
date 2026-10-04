@@ -172,6 +172,6 @@ test("INT5.9A-2 claim path sets DB generation marker inside the same transaction
   const enterAt = slice.indexOf("enterCampaignClaimGeneration({ db })");
   const updateAt = slice.indexOf("db.jobInstance.updateMany");
   assert.ok(enterAt >= 0 && updateAt > enterAt);
-  assert.match(slice, /prisma\.\$transaction\(claimWork, JOB_CHUNK_TRANSACTION_OPTIONS\)/);
+  assert.match(slice, /runRootCommit\(prisma, \(\{ tx \}\) => claimWork\(tx\)/);
   assert.match(source, /CAMPAIGN_CLAIM_GENERATION_RETIRED/);
 });

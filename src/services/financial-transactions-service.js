@@ -8,6 +8,7 @@ const { dbAuthorityNow } = require("./db-time-authority-service");
 const { rebuildCreatorDailyMetrics } = require("./creator-analytics-projection-service");
 const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
 const { projectFanIdentity } = require("./fan-data-authority-service");
+const { lockCreatorFacts, retainKnownFan } = require("./creator-fact-write-authority");
 const {
   COLLECTOR_TYPES, collectionCommand, acceptFinancialGeneration, completeFinancialCollection, recordFinancialCollectionFailure,
 } = require("./analytics-collector-control-service");
@@ -85,6 +86,11 @@ function moneyCents(value) {
   const cents = Math.round(parsed * 100);
   return Number.isSafeInteger(cents) && Math.abs(cents) <= 2_147_483_647 ? cents : null;
 }
+function sourceCents(value, raw) {
+  if (value === undefined) return moneyCents(raw);
+  if (value === null) return null;
+  return typeof value === "number" && Number.isSafeInteger(value) && Math.abs(value) <= 2_147_483_647 ? value : null;
+}
 function integer(value, fallback = 0, max = 100_000_000) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 0) return fallback;
@@ -113,8 +119,7 @@ function normalizeTransaction(row, index, page) {
   const externalTransactionId = clean(source.externalTransactionId ?? source.id ?? source.transactionId ?? source.transaction_id, 220);
   const transactionType = clean(source.transactionType ?? details.type ?? source.type, 120);
   const occurredAt = strictDate(source.occurredAt ?? source.createdAt ?? source.created_at ?? source.date);
-  const explicitAmountCents = Number(source.amountCents);
-  const amountCents = Number.isSafeInteger(explicitAmountCents) && Math.abs(explicitAmountCents) <= 2_147_483_647 ? explicitAmountCents : moneyCents(source.amount);
+  const amountCents = sourceCents(source.amountCents, source.amount);
   const currency = (clean(source.currency, 10) || "USD").toUpperCase();
   if (!externalTransactionId) return { rejected: true, reasonCode: "transaction_id_missing", page, ordinal: index };
   if (!transactionType) return { rejected: true, reasonCode: "transaction_type_missing", page, ordinal: index, externalTransactionId };
@@ -142,11 +147,11 @@ function normalizeTransaction(row, index, page) {
     fanDisplayName: clean(source.fanDisplayName ?? user.name ?? user.displayName, 255),
     fanAvatarUrl: clean(source.fanAvatarUrl ?? user.avatar ?? user.avatarUrl ?? user.avatarThumbs?.c144 ?? user.avatarThumbs?.c50, 1200),
     amountCents,
-    feeCents: Number.isSafeInteger(Number(source.feeCents)) && Math.abs(Number(source.feeCents)) <= 2_147_483_647 ? Number(source.feeCents) : moneyCents(source.fee),
-    netCents: Number.isSafeInteger(Number(source.netCents)) && Math.abs(Number(source.netCents)) <= 2_147_483_647 ? Number(source.netCents) : moneyCents(source.net),
-    taxCents: Number.isSafeInteger(Number(source.taxCents)) && Math.abs(Number(source.taxCents)) <= 2_147_483_647 ? Number(source.taxCents) : moneyCents(source.taxAmount ?? source.tax_amount),
-    vatCents: Number.isSafeInteger(Number(source.vatCents)) && Math.abs(Number(source.vatCents)) <= 2_147_483_647 ? Number(source.vatCents) : moneyCents(source.vatAmount ?? source.vat_amount),
-    mediaTaxCents: Number.isSafeInteger(Number(source.mediaTaxCents)) && Math.abs(Number(source.mediaTaxCents)) <= 2_147_483_647 ? Number(source.mediaTaxCents) : moneyCents(source.mediaTaxAmount ?? source.media_tax_amount),
+    feeCents: sourceCents(source.feeCents, source.fee),
+    netCents: sourceCents(source.netCents, source.net),
+    taxCents: sourceCents(source.taxCents, source.taxAmount ?? source.tax_amount),
+    vatCents: sourceCents(source.vatCents, source.vatAmount ?? source.vat_amount),
+    mediaTaxCents: sourceCents(source.mediaTaxCents, source.mediaTaxAmount ?? source.media_tax_amount),
     currency,
     occurredAt,
     transactionStatus: clean(source.transactionStatus ?? source.status, 80),
@@ -240,7 +245,7 @@ async function projectKnownFact(tx, job, deviceId, row, fanRecordId, now) {
     const existing = await tx.creatorSale.findUnique({
       where: { creatorId_externalTransactionId: { creatorId: job.creatorId, externalTransactionId: row.externalTransactionId } },
     });
-    if (existing) return tx.creatorSale.update({ where: { id: existing.id }, data: update });
+    if (existing) return tx.creatorSale.update({ where: { id: existing.id }, data: retainKnownFan(existing, update) });
     const legacy = await uniqueLegacyProjectionCandidate(tx, job, row, fanRecordId);
     if (legacy) return tx.creatorSale.update({ where: { id: legacy.id }, data: update });
     return tx.creatorSale.create({
@@ -252,7 +257,7 @@ async function projectKnownFact(tx, job, deviceId, row, fanRecordId, now) {
     const existing = await tx.creatorTip.findUnique({
       where: { creatorId_externalTransactionId: { creatorId: job.creatorId, externalTransactionId: row.externalTransactionId } },
     });
-    if (existing) return tx.creatorTip.update({ where: { id: existing.id }, data: update });
+    if (existing) return tx.creatorTip.update({ where: { id: existing.id }, data: retainKnownFan(existing, update) });
     const legacy = await uniqueLegacyProjectionCandidate(tx, job, row, fanRecordId);
     if (legacy) return tx.creatorTip.update({ where: { id: legacy.id }, data: update });
     return tx.creatorTip.create({
@@ -302,6 +307,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
     const generation = await acceptFinancialGeneration({ db: tx, job, deviceId });
     if (!generation.accepted) return { superseded: true, generation: generation.command.generation };
     const now = await dbAuthorityNow({ db: tx, fallbackNow: processReceivedAt });
+    await lockCreatorFacts(tx, job.agencyId, job.creatorId);
     const ids = accepted.map((row) => row.externalTransactionId);
     const existingRows = ids.length ? await tx.creatorFinancialTransaction.findMany({
       where: { creatorId: job.creatorId, externalTransactionId: { in: ids } },
@@ -340,8 +346,9 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
           ? commonData
           : { ...commonData, sourceJobId: job.id, scanRunId, page: row.page, ordinal: row.ordinal };
         const previousComparable = comparable(previous);
-        const nextComparable = comparable({ ...commonData, occurredAt: row.occurredAt });
-        await tx.creatorFinancialTransaction.update({ where: { id: previous.id }, data });
+        const canonicalData = retainKnownFan(previous, data);
+        const nextComparable = comparable({ ...canonicalData, occurredAt: row.occurredAt });
+        await tx.creatorFinancialTransaction.update({ where: { id: previous.id }, data: canonicalData });
         if (previousComparable === nextComparable) unchanged += 1; else updated += 1;
       }
       if (row.projectionStatus === "PROJECTED") {
@@ -534,6 +541,7 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
 }
 
 module.exports = {
+  normalizeTransaction,
   JOB_KEY,
   COLLECTOR_VERSION,
   SCHEMA_VERSION,

@@ -1,6 +1,6 @@
 "use strict";
 
-const { withCollectorStateLock } = require("./analytics-collector-control-service");
+const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const ACTIVE_STATUSES = ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"];
 
@@ -17,7 +17,11 @@ async function activeCollectorJob(db, creatorId, jobKey) {
 }
 
 async function pauseCollectorJob({ db, creatorId, jobKey, collectorType, now = new Date() }) {
-  return withCollectorStateLock({ db, creatorId, type: collectorType, work: async tx => {
+  // STOP mutates only the leased job and its observation lease. It neither
+  // plans nor publishes collector state. Taking the collector lock here made
+  // STOP wait for Job while a progress/publication transaction held Job and
+  // waited for Collector. The job status+revision CAS is the STOP authority.
+  return runDbTransaction(db, async tx => {
     const active = await activeCollectorJob(tx, creatorId, jobKey);
     if (!active) return { job: null, action: "idle" };
     if (active.status === "PUBLISHING") return { job: active, action: "publishing" };
@@ -39,7 +43,7 @@ async function pauseCollectorJob({ db, creatorId, jobKey, collectorType, now = n
     }
     const current = await tx.jobInstance.findUnique({ where: { id: active.id } });
     return { job: current, action: result.count ? "paused" : current?.status === "PAUSED" ? "already_paused" : "changed" };
-  } });
+  });
 }
 
 module.exports = { activeCollectorJob, pauseCollectorJob };

@@ -31,6 +31,7 @@ const JOB_SERVER_CAPABILITIES = Object.freeze({
   campaignDirectoryReuseV1: true,
   campaignBoundedTraversalV1: true,
   campaignTraversalAuthorityV1: true,
+  campaignFairPagesV1: true,
 });
 
 router.use((req, res, next) => {
@@ -107,6 +108,7 @@ const claimSchema = z.object({
     campaignDirectoryReuseV1: z.boolean().optional().default(false),
     campaignBoundedTraversalV1: z.boolean().optional().default(false),
     campaignTraversalAuthorityV1: z.boolean().optional().default(false),
+    campaignFairPagesV1: z.boolean().optional().default(false),
   }).passthrough().optional().default({}),
 });
 

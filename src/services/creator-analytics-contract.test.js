@@ -104,20 +104,20 @@ test("every live creator-scoped Stats route resolves current creator access befo
   assert.match(routeBody(stats, "post", "/creators/:creatorId/messages-daily"), /legacyStatsGone/);
 });
 
-test("traffic reads and writes stay creator-bound and permission guarded", () => {
-  assert.match(trafficService, /requireCreatorAccess\(\{ agencyId: creator\.agencyId, member, creatorId: creator\.id, db: prisma \}\)/);
-  assert.match(trafficService, /resolveEffectivePermissions\(\{ member, db: prisma \}\)/);
+test("traffic reads and cost/refresh commands remain creator-scoped through their current authorities", () => {
+  assert.match(trafficService, /requireCreatorAccess\(\{ agencyId: creator\.agencyId, member, creatorId: creator\.id, db \}\)/);
+  assert.match(trafficService, /resolveEffectivePermissions\(\{ member, db \}\)/);
   assert.match(trafficService, /key: "traffic\.view"/);
-  assert.match(trafficService, /key: "traffic\.manage_costs"/);
   assert.match(trafficService, /key: "traffic\.refresh"/);
-  assert.match(trafficService, /id:\s*cleanSourceId/);
-  assert.match(trafficService, /agencyId:\s*creator\.agencyId,[\s\S]*creatorId:\s*creator\.id/);
-  assert.match(trafficService, /agencyId: creator\.agencyId,[\s\S]*creatorId: creator\.id,[\s\S]*sourceId: source\.id/);
+  const contract=read("services/human-control-command-contract.js"), command=read("services/human-control-command-service.js"), reader=read("services/traffic-read-service.js");
+  assert.match(contract, /"traffic\.cost": "traffic\.manage_costs"/);
+  assert.match(command, /id: p\.sourceId, agencyId, creatorId: c\.targetId, costRevision: p\.expectedRevision/);
+  assert.match(reader, /id: input\.sourceId, agencyId: creator\.agencyId, creatorId: creator\.id/);
   assert.match(trafficRoute, /requireProductCreator/);
-  assert.match(trafficRoute, /requireProductDevice/);
-  assert.match(trafficRoute, /TRAFFIC_VIEW_FORBIDDEN/);
-  assert.match(trafficRoute, /TRAFFIC_REFRESH_FORBIDDEN/);
-  assert.doesNotMatch(trafficService, /creator-analytics-permissions/);
+  assert.match(trafficRoute, /MANAGEMENT_COMMAND_REQUIRED/);
+  assert.match(trafficRoute, /requireProductCreator\(req, req.params.creatorId\)/);
+  assert.match(trafficService, /TRAFFIC_VIEW_FORBIDDEN/);
+  assert.match(trafficService, /TRAFFIC_REFRESH_FORBIDDEN/);
 });
 
 test("senior role semantics are shared without loading Prisma", () => {
