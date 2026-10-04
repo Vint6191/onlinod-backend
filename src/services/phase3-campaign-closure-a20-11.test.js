@@ -9,7 +9,7 @@ const preflight = require("../../scripts/database/phase3-campaign-coverage-gener
 const ROOT = path.resolve(__dirname, "../..");
 function source(relative) { return fs.readFileSync(path.join(ROOT, relative), "utf8"); }
 
-test("A20.11 enqueue moves collection-state mutation behind demand/work authority", () => {
+test("Current refresh generation is established under Campaign authority before Work binding", () => {
   const text = source("src/services/campaign-fan-refresh-queue-service.js");
   const start = text.indexOf("async function enqueueUniqueCampaignFanRefreshes");
   const end = text.indexOf("\nasync function promoteQueuedCampaignFanRefreshDemands", start);
@@ -18,7 +18,10 @@ test("A20.11 enqueue moves collection-state mutation behind demand/work authorit
   const workCreate = body.indexOf("creatorCampaignFanRefreshWork.createMany", demandAdvance);
   const coverageIncrement = body.lastIndexOf("incrementCoverage(db");
   assert.ok(demandAdvance >= 0 && workCreate > demandAdvance && coverageIncrement > workCreate);
-  assert.match(body.slice(coverageIncrement), /coverageAuthority/);
+  assert.match(body.slice(coverageIncrement), /state: coverageState/);
+  const lock = body.indexOf("acquireCampaignTransactionLock(db, creatorId)");
+  const coverage = body.indexOf("const coverageState = await ensureCoverageRun");
+  assert.ok(lock >= 0 && coverage > lock && coverage < demandAdvance);
   const normalStart = body.indexOf("const fresh = newCandidates.filter");
   assert.ok(normalStart >= 0 && normalStart < demandAdvance);
   assert.doesNotMatch(body.slice(normalStart, demandAdvance), /ensureCoverageRun\(db/, "mutating enqueue path must not lock collection state before demand rows");

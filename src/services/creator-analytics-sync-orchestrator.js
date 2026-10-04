@@ -2,6 +2,7 @@
 
 const { directoryObservationAt } = require("./analytics-observation-time");
 const campaignFreshness = require("./campaign-freshness-service");
+const { membershipProofState, recoverPublishedMembershipProof } = require("./campaign-membership-proof-service");
 
 const prisma = require("../prisma");
 const { dbAuthorityNow } = require("./db-time-authority-service");
@@ -82,16 +83,14 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     // Pre-lock reads are admission hints only. Reconstruct the whole command
     // from the current proof, debt, retry and directory authority under the same
     // lock as accept/complete; dedupe alone cannot reject obsolete work.
-    const currentCollectorState = await loadCollectorPlanningState(tx, collectorType, creatorId, collectorState);
+    let currentCollectorState = await loadCollectorPlanningState(tx, collectorType, creatorId, collectorState);
     now = await dbAuthorityNow({ db: tx, fallbackNow: now });
+    if (collectorType === COLLECTOR_TYPES.CAMPAIGNS) currentCollectorState = await recoverPublishedMembershipProof({ db: tx, state: currentCollectorState, now });
     const initial = lifecycleParams(params);
     const baseline = collectorPlanningProofAt(collectorType, "full", currentCollectorState, now);
-    const baselineReady = Boolean(baseline && (collectorType === COLLECTOR_TYPES.NOTIFICATIONS || currentCollectorState?.baselineGeneration));
+    const baselineReady = Boolean(baseline && (collectorType === COLLECTOR_TYPES.NOTIFICATIONS || (collectorType === COLLECTOR_TYPES.CAMPAIGNS ? membershipProofState(currentCollectorState).baselineGeneration : currentCollectorState?.baselineGeneration)));
     if (initial && baselineReady) return { created: false, reason: "baseline_verified" };
     if (!initial && !baselineReady) return { created: false, reason: "baseline_unverified" };
-    if (collectorType === COLLECTOR_TYPES.CAMPAIGNS && campaignDelegatedRefreshPending(currentCollectorState)) {
-      return { created: false, reason: "fan_refresh_pending" };
-    }
     if (catchupFreshnessMs != null && !due(collectorPlanningProofAt(collectorType, "catchup", currentCollectorState, now), catchupFreshnessMs, now)) {
       return { created: false, reason: "fresh" };
     }
@@ -196,20 +195,12 @@ async function financialInitialCoverageReady(db, creatorId, now = new Date()) {
 
 async function campaignInitialCoverageReady(db, creatorId, now = new Date()) {
   if (!db?.creatorCampaignCollectionState?.findUnique) return false;
-  const state = await db.creatorCampaignCollectionState.findUnique({
-    where: { creatorId },
-    select: { status: true, baselineVerifiedAt: true, baselineGeneration: true },
-  });
-  return Boolean(state?.baselineGeneration && verifiedProofTimestampReady(state?.baselineVerifiedAt, now));
-}
-
-function campaignDelegatedRefreshPending(state) {
-  // FanData coverage is a generation-bound post-traversal authority. Do not
-  // launch another Campaign provider generation while the current generation's
-  // delegated refresh is QUEUED/PARTIAL, even when frontier budgeting leaves
-  // membershipCoverageStatus PARTIAL. Otherwise a later frontier tranche can
-  // reset the run ledger and hide older outstanding/failed freshness work.
-  return campaignFreshness.fanRefreshPending(state);
+  // Readiness is read-only. Publication callers may already own a later
+  // collector lock; do not acquire Campaign authority during this predicate.
+  const state = await recoverPublishedMembershipProof({ db, persist: false,
+    state: await db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }), now });
+  const proof = membershipProofState(state);
+  return Boolean(proof.baselineGeneration && verifiedProofTimestampReady(proof.baselineVerifiedAt, now));
 }
 
 function campaignDirectoryDiscoveryDue(state, now = new Date()) {
@@ -303,9 +294,6 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
 
   if (!(await campaignInitialCoverageReady(db, creatorId, now))) {
     const campaignState = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId } });
-    if (campaignDelegatedRefreshPending(campaignState)) {
-      return { ready: false, stage: "campaigns", created: false, reason: "fan_refresh_pending", retryAfterAt: null, jobId: campaignState?.sourceJobId || null };
-    }
     const retry = retryDisposition(campaignState, now);
     if (retry.deferred) return { ready: false, stage: "campaigns", created: false, reason: "deferred", retryAfterAt: retry.retryAfterAt, jobId: null };
     if (retry.terminal) return { ready: false, stage: "campaigns", created: false, reason: "failed_terminal", retryAfterAt: null, jobId: null };
@@ -388,18 +376,32 @@ function due(lastVerifiedAt, intervalMs, now) {
   return verifiedAt.getTime() < now.getTime() - intervalMs;
 }
 
-async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20, campaignDirectoryDiscoveryAdmitted = true, reserveCampaignDirectory = null } = {}) {
+async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20, campaignDirectoryDiscoveryAdmitted = true, reserveCampaignDirectory = null, _planningLocksHeld = false } = {}) {
+  if (!creatorId || !agencyId) return { ready: false, initial: { ready: false, reason: "missing_scope" }, created: [], skipped: [] };
+  // One creator plan owns collector locks in Notifications -> Financial ->
+  // Campaigns order before bootstrap can take its stage lock. Otherwise an
+  // unfinished Campaign bootstrap followed by a Notification catch-up reverses
+  // the order used by completion/next-stage planning in another replica.
+  if (!_planningLocksHeld) return withCollectorStateLock({ db, type: COLLECTOR_TYPES.NOTIFICATIONS, creatorId, work: notificationTx =>
+    withCollectorStateLock({ db: notificationTx, type: COLLECTOR_TYPES.FINANCIAL, creatorId, work: financialTx =>
+      withCollectorStateLock({ db: financialTx, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId, work: campaignTx =>
+        ensureRecurringCreatorAnalyticsCatchups({ db: campaignTx, creatorId, agencyId, now, priority,
+          campaignDirectoryDiscoveryAdmitted, reserveCampaignDirectory, _planningLocksHeld: true }) }) }) });
   now = await dbAuthorityNow({ db, fallbackNow: now });
   const initial = await ensureInitialCreatorAnalyticsSync({ db, creatorId, agencyId, now, priority: Math.max(priority, 80) });
-  if (!initial.ready) return { ready: false, initial, created: [], skipped: [] };
+  // Bootstrap order remains staged. Each already-proven stream can refresh
+  // while a later bootstrap stage is pending or terminally failed.
+  if (initial.reason === "missing_scope") return { ready: false, initial, created: [], skipped: [] };
   const created = [];
   const skipped = [];
 
-  const [notificationState, financialState, campaignState] = await Promise.all([
+  const [notificationState, financialState, storedCampaignState] = await Promise.all([
     loadNotificationSyncState(db, creatorId),
     db.creatorFinancialCollectionState.findUnique({ where: { creatorId } }),
     db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }),
   ]);
+
+  const campaignState = await recoverPublishedMembershipProof({ db, state: storedCampaignState, now });
 
   if (notificationHistoricalBaselineReady(notificationState, now) && due(collectorPlanningProofAt(COLLECTOR_TYPES.NOTIFICATIONS, "catchup", notificationState, now), NOTIFICATION_COLLECTION_FRESHNESS_MS, now)) {
     const retry = retryDisposition(notificationState, now);
@@ -422,9 +424,10 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     });
     if (scheduled.created) created.push("notifications_catchup"); else skipped.push(`notifications_catchup:${scheduled.reason || "skipped"}`);
     }
-  } else skipped.push("notifications_catchup:fresh");
+  } else skipped.push(notificationHistoricalBaselineReady(notificationState, now) ? "notifications_catchup:fresh" : "notifications_catchup:baseline_unverified");
 
-  if (due(collectorPlanningProofAt(COLLECTOR_TYPES.FINANCIAL, "catchup", financialState, now), FINANCIAL_COLLECTION_FRESHNESS_MS, now)) {
+  const financialReady = Boolean(financialState?.baselineGeneration && collectorPlanningProofAt(COLLECTOR_TYPES.FINANCIAL, "full", financialState, now));
+  if (financialReady && due(collectorPlanningProofAt(COLLECTOR_TYPES.FINANCIAL, "catchup", financialState, now), FINANCIAL_COLLECTION_FRESHNESS_MS, now)) {
     const retry = retryDisposition(financialState, now);
     if (retry.deferred) skipped.push("financial_catchup:deferred");
     else if (retry.terminal) skipped.push("financial_catchup:failed_terminal");
@@ -453,10 +456,11 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     });
     if (scheduled.created) created.push("financial_catchup"); else skipped.push(`financial_catchup:${scheduled.reason || "skipped"}`);
     }
-  } else skipped.push("financial_catchup:fresh");
+  } else skipped.push(financialReady ? "financial_catchup:fresh" : "financial_catchup:baseline_unverified");
 
-  if (campaignDelegatedRefreshPending(campaignState)) {
-    skipped.push("campaigns_catchup:fan_refresh_pending");
+  const campaignReady = Boolean(membershipProofState(campaignState).baselineGeneration && collectorPlanningProofAt(COLLECTOR_TYPES.CAMPAIGNS, "full", campaignState, now));
+  if (!campaignReady) {
+    skipped.push("campaigns_catchup:baseline_unverified");
   } else {
     const frontierDue = campaignFrontierWorkDue(campaignState, now);
     const directoryDue = campaignDirectoryDiscoveryDue(campaignState, now);
@@ -505,15 +509,15 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     }
   }
 
-  return { ready: true, initial, created, skipped };
+  return { ready: initial.ready, initial, created, skipped };
 }
 
 async function advanceCreatorAnalyticsInitialSyncAfterCompletion({ db = prisma, job, sideEffect = null, now = new Date() } = {}) {
   if (!job?.creatorId || !job?.agencyId || !lifecycleParams(job.params)) return { advanced: false, reason: "not_initial_analytics_job" };
   if (job.jobKey === NOTIFICATION_JOB_KEY && sideEffect?.verified !== true) return { advanced: false, reason: "notifications_not_verified" };
   if (job.jobKey === FINANCIAL_JOB_KEY && sideEffect?.complete !== true) return { advanced: false, reason: "financial_not_verified" };
-  if (job.jobKey === CAMPAIGN_JOB_KEY && sideEffect?.completion?.complete !== true) {
-    return { advanced: false, reason: sideEffect?.ok === true ? "campaign_fan_refresh_pending" : "campaigns_not_verified" };
+  if (job.jobKey === CAMPAIGN_JOB_KEY && sideEffect?.completion?.membershipComplete !== true) {
+    return { advanced: false, reason: "campaigns_not_verified" };
   }
   const next = await ensureInitialCreatorAnalyticsSync({ db, creatorId: job.creatorId, agencyId: job.agencyId, now, priority: 95 });
   return { advanced: true, next };

@@ -30,8 +30,8 @@ test("INT5.9A-5 current planner and claim fence publish no historical claimer sk
   const orchestrator = read("src/services/creator-analytics-sync-orchestrator.js");
   const lease = read("src/services/job-lease-service.js");
   assert.doesNotMatch(orchestrator, /async function campaignCatchupState/);
-  const schedulingStart = orchestrator.indexOf('if (campaignDelegatedRefreshPending(campaignState))');
-  const schedulingEnd = orchestrator.indexOf('return { ready: true, initial, created, skipped };', schedulingStart);
+  const schedulingStart = orchestrator.indexOf('const campaignReady =');
+  const schedulingEnd = orchestrator.indexOf('return { ready: initial.ready, initial, created, skipped };', schedulingStart);
   const scheduling = orchestrator.slice(schedulingStart, schedulingEnd);
   assert.doesNotMatch(scheduling, /knownClaimerFrontierHashes|knownClaimersByCampaign|knownCampaignFanCounts/);
   assert.match(scheduling, /campaignOrderIndependentTraversalVersion: 1/);

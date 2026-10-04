@@ -5,8 +5,11 @@ const { CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS } = require("./analytics-freshness-p
 const { evaluateDurableCollectorState } = require("./analytics-state-evaluator");
 const { directoryCountInvalidated } = require("./campaign-directory-count-authority");
 
+const { membershipProofState } = require("./campaign-membership-proof-service");
 const FRONTIER_OBSERVATION_VERSION = 1;
 const CAMPAIGN_COVERAGE_SELECT = Object.freeze(Object.fromEntries([
+  "membershipBaselineVerifiedAt", "membershipBaselineObservedAt", "membershipBaselineGeneration",
+  "membershipCatchupVerifiedAt", "membershipCatchupObservedAt", "membershipCatchupGeneration",
   "status", "baselineVerifiedAt", "lastCatchupCompletedAt", "baselineObservedAt", "lastCatchupObservedAt", "retryAfterAt",
   "activeGeneration", "membershipCoverageStatus", "membershipObservedAt",
   "campaignDirectoryGeneration", "campaignDirectoryRequestedAt", "campaignDirectoryVerifiedAt", "campaignDirectoryRevision",
@@ -16,6 +19,14 @@ const CAMPAIGN_COVERAGE_SELECT = Object.freeze(Object.fromEntries([
   "campaignFrontierTargetCount", "campaignFrontierCompletedCount", "campaignFrontierDeferredCount",
   "fanValueCoverageScanRunId", "fanValueExpected", "fanValueFreshnessStatus", "fanValueOutstanding", "fanValueFailed",
 ].map(key => [key, true])));
+
+function coverageDto(row) {
+  // DB revision counters are bigint. Keep exact opaque revisions on the wire;
+  // spreading Prisma rows directly made populated Campaign/Scanner/Home/Traffic JSON
+  // fail to serialize, and conversion to Number would lose revision identity.
+  return Object.fromEntries(Object.entries(row || {}).map(([key,value]) =>
+    [key,typeof value === "bigint" ? value.toString() : value]));
+}
 
 function directoryPending(state) {
   return Number(state?.campaignDirectoryDiscoveryRequestedRevision || 0) > Number(state?.campaignDirectoryDiscoveryCompletedRevision || 0);
@@ -48,16 +59,20 @@ function frontierDueWhere(exactGeneration, now) {
     { claimersObservationVersion: { lt: FRONTIER_OBSERVATION_VERSION } },
   ] };
 }
-function evaluateCampaignCollectionState(state, now = new Date()) {
-  const base = evaluateDurableCollectorState({ status: state?.status, baselineVerifiedAt: state?.baselineVerifiedAt,
-    lastVerifiedAt: state?.lastCatchupCompletedAt, baselineObservedAt: state?.baselineObservedAt,
-    lastObservedAt: state?.lastCatchupObservedAt, retryAfterAt: state?.retryAfterAt, now });
+function evaluateCampaignCollectionState(state, now = new Date(), refreshDebt = null) {
+  const proof = membershipProofState(state);
+  const base = evaluateDurableCollectorState({ status: state?.status, baselineVerifiedAt: proof.baselineVerifiedAt,
+    lastVerifiedAt: proof.lastCatchupCompletedAt, baselineObservedAt: proof.baselineObservedAt,
+    lastObservedAt: proof.lastCatchupObservedAt, retryAfterAt: state?.retryAfterAt, now });
   const discoveryDue = directoryDue(state, now), membershipDue = frontierDue(state, now);
-  const delegatedPending = fanRefreshPending(state);
-  const fresh = base.proven && !discoveryDue && !membershipDue && !delegatedPending;
+  const delegatedPending = fanRefreshPending(state) || refreshDebt?.queued === true || refreshDebt?.failed === true;
+  const providerFresh = base.proven && !discoveryDue && !membershipDue;
+  const fresh = providerFresh && !delegatedPending;
   const deferred = !fresh && Boolean(base.retryAfterAt && +base.retryAfterAt > +now);
   return Object.freeze({ ...base, fresh, stale: base.usable && !fresh, deferred,
-    due: !fresh && !deferred && !base.failed && !delegatedPending,
+    // Only provider debt admits another provider traversal. FanData has its own queue.
+    due: !providerFresh && !deferred && !base.failed, providerFresh,
+    refreshDebt: refreshDebt || null,
     freshnessAuthority: "DIRECTORY_AND_FRONTIERS",
     directoryDue: discoveryDue, frontierDue: membershipDue, fanRefreshPending: delegatedPending,
     directoryObservedAt: directoryObservationAt(state, now),
@@ -66,5 +81,5 @@ function evaluateCampaignCollectionState(state, now = new Date()) {
   });
 }
 
-module.exports = { FRONTIER_OBSERVATION_VERSION, CAMPAIGN_COVERAGE_SELECT, directoryPending, directoryDue, frontierDue,
+module.exports = { coverageDto, FRONTIER_OBSERVATION_VERSION, CAMPAIGN_COVERAGE_SELECT, directoryPending, directoryDue, frontierDue,
   fanRefreshPending, frontierDueWhere, evaluateCampaignCollectionState };

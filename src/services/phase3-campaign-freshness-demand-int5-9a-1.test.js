@@ -18,7 +18,7 @@ function harness() {
   const demands = new Map();
   const jobs = new Map();
   const state = {
-    creatorId: "creator-1", mode: "catchup", activeGeneration: "run-2",
+    creatorId: "creator-1", mode: "catchup", activeGeneration: "run-1",
     membershipCoverageStatus: "COMPLETE", membershipCoverageCompletedAt: new Date("2026-09-18T10:00:00.000Z"),
     campaignFrontierFreshnessStatus: "COMPLETE", campaignFrontierDueCount: 0, campaignFrontierTargetCount: 0,
     campaignFrontierCompletedCount: 0, campaignFrontierDeferredCount: 0,
@@ -73,6 +73,10 @@ function harness() {
         let count = 0;
         for (const row of works.values()) {
           if (ids && !ids.has(row.id)) continue;
+          if (where.creatorId && row.creatorId !== where.creatorId) continue;
+          if (where.scanRunId && row.scanRunId !== where.scanRunId) continue;
+          if (where.demandId && row.demandId !== where.demandId) continue;
+          if (typeof where.onlyFansUserId === "string" && row.onlyFansUserId !== where.onlyFansUserId) continue;
           if (where.status && row.status !== where.status) continue;
           apply(row, data); count += 1;
         }
@@ -140,6 +144,7 @@ test("INT5.9A-1 coalesces the same stale fan across Campaign runs into one activ
     db: h.db, job: campaignJob, scanRunId: "run-1", scanStartedAt: new Date("2026-09-18T10:00:00Z"),
     candidates: [{ onlyFansUserId: "fan-1", valueObservedAt: null }], planner: h.planner, now: new Date("2026-09-18T10:00:01Z"),
   });
+  h.state.activeGeneration = "run-2";
   await enqueueUniqueCampaignFanRefreshes({
     db: h.db, job: { ...campaignJob, id: "campaign-job-2" }, scanRunId: "run-2", scanStartedAt: new Date("2026-09-18T11:00:00Z"),
     candidates: [{ onlyFansUserId: "fan-1", valueObservedAt: null }], planner: h.planner, now: new Date("2026-09-18T11:00:01Z"),
@@ -154,10 +159,11 @@ test("INT5.9A-1 coalesces the same stale fan across Campaign runs into one activ
   assert.equal(h.state.fanValueOutstanding, 1);
 });
 
-test("INT5.9A-1 one fresh point-refresh observation satisfies every waiting run and promotes current coverage", async () => {
+test("INT5.9A-1 one fresh observation settles the shared demand and current coverage, preserving superseded receipts", async () => {
   const h = harness();
   const campaignJob = { id: "campaign-job-1", agencyId: "agency-1", creatorId: "creator-1", priority: 80 };
   await enqueueUniqueCampaignFanRefreshes({ db: h.db, job: campaignJob, scanRunId: "run-1", scanStartedAt: new Date("2026-09-18T10:00:00Z"), candidates: [{ onlyFansUserId: "fan-1" }], planner: h.planner, now: new Date("2026-09-18T10:00:01Z") });
+  h.state.activeGeneration = "run-2";
   await enqueueUniqueCampaignFanRefreshes({ db: h.db, job: { ...campaignJob, id: "campaign-job-2" }, scanRunId: "run-2", scanStartedAt: new Date("2026-09-18T11:00:00Z"), candidates: [{ onlyFansUserId: "fan-1" }], planner: h.planner, now: new Date("2026-09-18T11:00:01Z") });
   const refreshJob = [...h.jobs.values()][0];
   h.setValue({ valueObservedAt: new Date("2026-09-18T11:30:00Z"), availability: "AVAILABLE" });
@@ -165,7 +171,8 @@ test("INT5.9A-1 one fresh point-refresh observation satisfies every waiting run 
   const demand = [...h.demands.values()][0];
   assert.equal(demand.status, "COMPLETE");
   assert.equal(demand.satisfiedRevision, demand.requestedRevision);
-  assert.equal([...h.works.values()].filter((row) => row.status === "SUCCEEDED").length, 2);
+  assert.equal([...h.works.values()].filter((row) => row.status === "SUCCEEDED").length, 1);
+  assert.equal([...h.works.values()].find(row => row.scanRunId === "run-1").status, "QUEUED", "superseded receipt is not rewritten by a later observation");
   const coverage = campaignFanValueCoverageFromState(h.state, "run-2");
   assert.equal(coverage.outstanding, 0);
   assert.equal(coverage.succeeded, 1);
@@ -177,6 +184,7 @@ test("INT5.9A-1 raised cross-run revision schedules one sequential follow-up onl
   const h = harness();
   const campaignJob = { id: "campaign-job-1", agencyId: "agency-1", creatorId: "creator-1", priority: 80 };
   await enqueueUniqueCampaignFanRefreshes({ db: h.db, job: campaignJob, scanRunId: "run-1", scanStartedAt: new Date("2026-09-18T10:00:00Z"), candidates: [{ onlyFansUserId: "fan-1" }], planner: h.planner, now: new Date("2026-09-18T10:00:01Z") });
+  h.state.activeGeneration = "run-2";
   await enqueueUniqueCampaignFanRefreshes({ db: h.db, job: { ...campaignJob, id: "campaign-job-2" }, scanRunId: "run-2", scanStartedAt: new Date("2026-09-18T11:00:00Z"), candidates: [{ onlyFansUserId: "fan-1" }], planner: h.planner, now: new Date("2026-09-18T11:00:01Z") });
   const demandBefore = [...h.demands.values()][0];
   assert.equal(demandBefore.requestedRevision, 2);
@@ -198,7 +206,7 @@ test("INT5.9A-1 raised cross-run revision schedules one sequential follow-up onl
 });
 
 test("INT5.9A-1 source removes fake delegated completion and makes Campaign/overview value reads freshness-cutoff aware", () => {
-  const desktop = fs.readFileSync(path.join(root, "../../desktop/apps/desktop/electron/main/services/backend-jobs/handlers/campaigns-handler.ts"), "utf8");
+  const desktop = fs.readFileSync(path.join(process.env.ONLINOD_DESKTOP_ROOT || path.resolve(root, "../desktop"), "apps/desktop/electron/main/services/backend-jobs/handlers/campaigns-handler.ts"), "utf8");
   const ledger = fs.readFileSync(path.join(root, "src/services/creator-analytics-ledger-service.js"), "utf8");
   const overview = fs.readFileSync(path.join(root, "src/services/creator-overview-service.js"), "utf8");
   const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
@@ -213,8 +221,8 @@ test("INT5.9A-1 source removes fake delegated completion and makes Campaign/over
   assert.match(schema, /activeRefreshRevision\s+Int\?/);
   assert.match(schema, /@@unique\(\[creatorId, onlyFansUserId\]/);
   assert.match(schema, /fanValueOutstanding\s+Int\s+@default\(0\)/);
-  assert.match(ledger, /value\."fetchedAt" >= \$2::timestamptz/);
-  assert.match(overview, /value\."fetchedAt" >= \$2::timestamptz/);
+  assert.match(ledger, /require\("\.\/campaign-read-repository"\)\.readCampaignFanPage/);
+  assert.match(overview, /require\("\.\/campaign-read-repository"\)\.readCampaignPage/);
   assert.match(ledger, /currentMembershipComplete = membershipComplete && frontierFreshnessComplete/);
   assert.match(ledger, /complete = currentMembershipComplete && fanValuesComplete/);
   assert.match(ledger, /CAMPAIGN_COLLECTOR_VERSION = "campaigns-v13"/);

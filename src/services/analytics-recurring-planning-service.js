@@ -58,14 +58,17 @@ async function planRecurringCreatorAnalytics({ db, item, ownerToken, now = new D
       campaignDirectoryDiscoveryAdmitted: false,
       reserveCampaignDirectory: (state) => reserveDirectoryAdmission({ db: tx, state, now: ownership.authorityNow }),
     });
-    if (analytics?.initial?.reason === "failed_terminal" || analytics?.initial?.reason === "missing_scope") {
+    // A terminal collector is a recorded domain outcome, not a transaction
+    // failure that should erase other streams' valid plans. Scope/claim and
+    // unexpected database failures still roll back the complete transaction.
+    if (analytics?.initial?.reason === "missing_scope") {
       throw Object.assign(new Error(`Analytics initial sync: ${analytics.initial.reason}`), { code: "ANALYTICS_INITIAL_SYNC_BLOCKED" });
     }
     // A lease can expire during planning even while its row is locked. No jobs
     // or admission budget survive this failed final fence; notifications wait.
     const final = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow: now });
     if (!final.current || final.newerRevision) throw Object.assign(new Error("Analytics planning lease expired before commit"), { code: "ANALYTICS_PLANNING_CLAIM_LOST" });
-    return { created: Number(earnings.created || 0) + Number(analytics.created?.length || 0) + (analytics.initial?.created ? 1 : 0), skipped: Number(analytics.skipped?.length || 0), retired: false };
+    return { created: Number(earnings.created || 0) + Number(analytics.created?.length || 0) + (analytics.initial?.created ? 1 : 0), skipped: Number(analytics.skipped?.length || 0), retired: false, initial: analytics.initial };
   }, { maxWait: 5000, timeout: 20_000 }));
 }
 

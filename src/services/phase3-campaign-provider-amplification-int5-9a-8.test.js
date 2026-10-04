@@ -13,20 +13,22 @@ const orchestrator = fs.readFileSync(path.join(root, "src/services/creator-analy
 test("INT5.9A-8 decouples provider traversal success from delegated FanData freshness", () => {
   assert.match(ledger, /const providerTraversalComplete = membershipComplete;/);
   assert.match(ledger, /const complete = currentMembershipComplete && fanValuesComplete;/);
-  assert.match(ledger, /return \{ batchId: batch\.id, complete, providerTraversalComplete,/);
+  assert.match(ledger, /return \{ batchId: batch\.id, complete, membershipComplete: currentMembershipComplete, providerTraversalComplete,/);
   assert.match(resultService, /if \(completion\.providerTraversalComplete !== true\)/);
   assert.match(resultService, /refreshPending: completion\.complete !== true/);
   assert.doesNotMatch(resultService, /if \(completion\.complete !== true\) \{\s*return \{ ok: false, type: "campaigns"/);
 });
 
-test("INT5.9A-8 planner refuses a second Campaign provider job while delegated refresh is outstanding", () => {
-  assert.match(orchestrator, /function campaignDelegatedRefreshPending\(state\)/);
-  assert.match(orchestrator, /campaignFreshness\.fanRefreshPending\(state\)/);
-  const { fanRefreshPending } = require("./campaign-freshness-service");
-  assert.equal(fanRefreshPending({ activeGeneration: "g", fanValueCoverageScanRunId: "g", fanValueExpected: 2, fanValueFreshnessStatus: "QUEUED" }), true);
-  assert.equal(fanRefreshPending({ activeGeneration: "g", fanValueCoverageScanRunId: "old", fanValueExpected: 2, fanValueFreshnessStatus: "QUEUED" }), false);
-  assert.equal(fanRefreshPending({ activeGeneration: "g", fanValueCoverageScanRunId: "g", fanValueExpected: 2, fanValueFreshnessStatus: "COMPLETE" }), false);
-  assert.match(orchestrator, /campaigns_catchup:fan_refresh_pending/);
-  assert.match(orchestrator, /reason: "fan_refresh_pending"/);
-  assert.match(orchestrator, /sideEffect\?\.completion\?\.complete !== true/);
+test("current traversal debt and global FanData debt retain separate freshness decisions", () => {
+  const { evaluateCampaignCollectionState } = require("./campaign-freshness-service");
+  const now = new Date("2026-10-04T12:00:00Z");
+  const state = {status:"PARTIAL", membershipBaselineVerifiedAt:now, membershipBaselineObservedAt:now, membershipBaselineGeneration:"g",
+    activeGeneration:"g",campaignFrontierPlanRunId:"g",campaignFrontierObservationVersion:1,
+    campaignFrontierFreshnessStatus:"COMPLETE",membershipCoverageStatus:"COMPLETE",campaignDirectoryGeneration:"d",
+    campaignDirectoryRevision:1,campaignDirectoryRequestedAt:now,campaignDirectoryVerifiedAt:now,
+    campaignDirectoryDiscoveryDueAt:new Date(+now+3600000),campaignDirectoryCampaignCount:0};
+  const pending = evaluateCampaignCollectionState(state, now, {queued:true,failed:false});
+  assert.equal(pending.providerFresh,true); assert.equal(pending.fresh,false); assert.equal(pending.due,false);
+  const due = evaluateCampaignCollectionState({...state,campaignFrontierDeferredCount:1}, now, {queued:true,failed:false});
+  assert.equal(due.providerFresh,false); assert.equal(due.due,true); assert.equal(due.fanRefreshPending,true);
 });

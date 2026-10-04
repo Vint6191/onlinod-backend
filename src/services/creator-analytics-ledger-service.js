@@ -2260,7 +2260,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result, public
     const providerTraversalComplete = membershipComplete;
     const currentMembershipComplete = membershipComplete && frontierFreshnessComplete;
     const complete = currentMembershipComplete && fanValuesComplete;
-    if (publication?.prepareOnly === true) return { complete, providerTraversalComplete, protocolCurrent, proof };
+    if (publication?.prepareOnly === true) return { complete, membershipComplete: currentMembershipComplete, providerTraversalComplete, protocolCurrent, proof };
     const desiredBatchStatus = complete ? "COMMITTED" : providerTraversalComplete ? "COMMITTED" : "PARTIAL";
     if (!replay || batch.status !== desiredBatchStatus) {
       await finishBatch(
@@ -2284,7 +2284,7 @@ async function completeCampaignScan({ db = prisma, job, deviceId, result, public
     const collectionState = await completeCampaignCollection({
       db: tx, job, deviceId, complete, membershipComplete: currentMembershipComplete, scanRunId, campaignLockHeld: true,
     });
-    return { batchId: batch.id, complete, providerTraversalComplete, replay, superseded: false, protocolCurrent, proof, collectionStateId: collectionState?.state?.id || null };
+    return { batchId: batch.id, complete, membershipComplete: currentMembershipComplete, providerTraversalComplete, replay, superseded: false, protocolCurrent, proof, collectionStateId: collectionState?.state?.id || null };
   });
 }
 function normalizeMessageDay(raw) {

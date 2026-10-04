@@ -164,6 +164,7 @@ test("INT5.8A-4 queue schedules only stale/unknown values and remains bounded to
     onlyFansUserId: `fan-${i}`,
     valueObservedAt: i === 0 ? new Date("2026-09-17T20:00:00.000Z") : null,
   }));
+  await db.creatorCampaignCollectionState.update({ data: { activeGeneration: "run-2" } });
   const result = await enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId: "run-2", scanStartedAt, candidates, planner, now });
   assert.equal(result.fanIds.length, 49);
   assert.equal(result.fanIds.includes("fan-0"), false, "fresh fan is not queued");

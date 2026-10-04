@@ -51,8 +51,8 @@ test("INT5.8A-5 exact deep-boundary machinery remains bounded as pre-v12 compati
 
   const planner = read("src/services/creator-analytics-sync-orchestrator.js");
   assert.doesNotMatch(planner, /async function campaignCatchupState/);
-  const schedulingStart = planner.indexOf('if (campaignDelegatedRefreshPending(campaignState))');
-  const schedulingEnd = planner.indexOf('return { ready: true, initial, created, skipped };', schedulingStart);
+  const schedulingStart = planner.indexOf('const campaignReady =');
+  const schedulingEnd = planner.indexOf('return { ready: initial.ready, initial, created, skipped };', schedulingStart);
   const plannerSlice = planner.slice(schedulingStart, schedulingEnd);
   assert.doesNotMatch(plannerSlice, /catchupFrontierHash|knownClaimerFrontierHashes|catchupFrontierFanIds/);
   assert.match(plannerSlice, /campaignOrderIndependentTraversalVersion: 1/);

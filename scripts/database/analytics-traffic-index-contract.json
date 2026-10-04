@@ -187,5 +187,40 @@
     "unique": false,
     "expression": "\"creatorId\",\"id\"",
     "where": null
+  },
+  {
+    "name": "Campaign_refresh_retryable_status_v2",
+    "table": "CreatorFanRefreshDemand",
+    "unique": false,
+    "expression": "\"creatorId\",\"id\"",
+    "where": "\"status\" = 'FAILED' AND \"quarantinedAt\" IS NULL"
+  },
+  {
+    "name": "Campaign_refresh_quarantine_status_v2",
+    "table": "CreatorFanRefreshDemand",
+    "unique": false,
+    "expression": "\"creatorId\",\"id\"",
+    "where": "\"status\" = 'FAILED' AND \"quarantinedAt\" IS NOT NULL"
+  },
+  {
+    "name": "Campaign_refresh_latest_failure_v2",
+    "table": "CreatorFanRefreshDemand",
+    "unique": false,
+    "expression": "\"creatorId\",\"lastFailedAt\" DESC,\"id\"",
+    "where": "\"status\" = 'FAILED'"
+  },
+  {
+    "name": "Campaign_refresh_next_retry_v2",
+    "table": "CreatorFanRefreshDemand",
+    "unique": false,
+    "expression": "\"creatorId\",\"nextRetryAt\",\"id\"",
+    "where": "\"status\" = 'FAILED' AND \"quarantinedAt\" IS NULL AND \"nextRetryAt\" IS NOT NULL"
+  },
+  {
+    "name": "Campaign_refresh_force_repair_v2",
+    "table": "CreatorFanRefreshDemand",
+    "unique": false,
+    "expression": "\"creatorId\",COALESCE(\"nextRetryAt\",\"lastFailedAt\",\"updatedAt\"),\"id\"",
+    "where": "\"status\" = 'FAILED' AND \"activeRefreshJobId\" IS NULL"
   }
 ]

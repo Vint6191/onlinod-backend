@@ -19,6 +19,7 @@ function assertHooks(calls, PRE, POST) {
   assert.deepEqual(calls.map(args => args[1] === 'migrate' ? 'migrate' : path.basename(args[0])),
     [...PRE.map(args => args[0]), 'migrate', ...POST.map(args => args[0]), 'phase7-legacy-storage-indexes.js']);
   assert(POST.some(args => args[0] === 'traffic-projection-postflight.js'));
+  assert(POST.some(args => args[0] === 'campaign-refresh-work-postflight.js'));
 }
 
 const sha = bytes => crypto.createHash('sha256').update(bytes).digest('hex');

@@ -6,7 +6,7 @@ const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { selectDurableCollectionProof } = require("./analytics-freshness-policy");
 const { stampObservationStart, observationStartForJob, parseObservationTime, directoryObservationAt } = require("./analytics-observation-time");
-const { campaignTransactionLockKey } = require("./campaign-transaction-lock-service");
+const { campaignTransactionLockKey, withCampaignTransactionLock } = require("./campaign-transaction-lock-service");
 
 const COLLECTION_CONTRACT_VERSION = 1;
 const COLLECTOR_TYPES = Object.freeze({
@@ -51,6 +51,7 @@ function campaignFanCoverageAuthorityFromJob(job) {
 
 function collectorPlanningProofAt(collectorType, collectionMode, state, now = new Date()) {
   const requestedMode = mode(collectionMode);
+  if (collectorType === COLLECTOR_TYPES.CAMPAIGNS) state = require("./campaign-membership-proof-service").membershipProofState(state);
   let baselineVerifiedAt, catchupVerifiedAt;
   if (collectorType === COLLECTOR_TYPES.NOTIFICATIONS) {
     baselineVerifiedAt = state?.fullBackfillVerifiedAt;
@@ -169,6 +170,7 @@ async function withCollectorStateLock({ db, type, creatorId, work }) {
   // doubles may not; they exercise the authority state machine without
   // pretending to validate PostgreSQL lock behavior.
   if (typeof db?.$executeRawUnsafe !== "function" && typeof db?.$transaction !== "function") return work(db);
+  if (type === COLLECTOR_TYPES.CAMPAIGNS) return withCampaignTransactionLock({ db, creatorId, work });
   return withDbAdvisoryXactLock({ db, key: collectorLockKey(type, creatorId), work });
 }
 
@@ -333,9 +335,10 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
       // This server-planned run did not observe the provider. Reuse the retained
       // source bound, never the time of this command or completion. Individual
       // frontiers and directory retain their own independent expiry deadlines.
-      const prior = selectDurableCollectionProof({ baselineVerifiedAt: current.baselineVerifiedAt,
-        catchupVerifiedAt: current.lastCatchupCompletedAt, baselineObservedAt: current.baselineObservedAt,
-        catchupObservedAt: current.lastCatchupObservedAt, now }).latestAt;
+      const membership = require("./campaign-membership-proof-service").membershipProofState(current);
+      const prior = selectDurableCollectionProof({ baselineVerifiedAt: membership.baselineVerifiedAt,
+        catchupVerifiedAt: membership.lastCatchupCompletedAt, baselineObservedAt: membership.baselineObservedAt,
+        catchupObservedAt: membership.lastCatchupObservedAt, now }).latestAt;
       const directory = directoryObservationAt(current, now);
       const inherited = current.campaignDirectoryCampaignCount === 0 ? directory
         : prior && directory ? new Date(Math.min(+prior, +directory)) : null;
@@ -355,10 +358,12 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
         : "Campaign collection did not prove all requested campaign/claimer frontiers"),
       sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220), ...(success ? { lastCompleteScanRunId: clean(scanRunId, 120) } : {}),
     };
+    const membershipData = membershipComplete
+      ? require("./campaign-membership-proof-service").membershipProofData(command.mode, command.generation, now, observedAt) : {};
     const successData = success && command.mode === "full" ? { baselineVerifiedAt: now, baselineObservedAt: observedAt, baselineGeneration: command.generation }
       : success && command.mode === "catchup" ? { lastCatchupCompletedAt: now, lastCatchupObservedAt: observedAt, lastCatchupGeneration: command.generation } : {};
     const state = await tx.creatorCampaignCollectionState.upsert({
-      where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData }, update: { ...common, ...successData },
+      where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData, ...membershipData }, update: { ...common, ...successData, ...membershipData },
     });
     return { applied: true, stale: false, command, state };
   };

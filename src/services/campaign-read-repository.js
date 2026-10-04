@@ -1,9 +1,10 @@
 "use strict";
+const { readCampaignRefreshDebt } = require("./campaign-refresh-debt-service");
 
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { displayRangeBounds } = require("./analytics-range-contract");
 const { CAMPAIGN_FAN_VALUE_FRESHNESS_MS, FINANCIAL_COLLECTION_FRESHNESS_MS, trustedCollectionTimestamp } = require("./analytics-freshness-policy");
-const { CAMPAIGN_COVERAGE_SELECT, evaluateCampaignCollectionState } = require("./campaign-freshness-service");
+const { CAMPAIGN_COVERAGE_SELECT, evaluateCampaignCollectionState, coverageDto } = require("./campaign-freshness-service");
 const { evaluateDurableCollectorState, stateVocabulary } = require("./analytics-state-evaluator");
 const { RANGES, CLASSES } = require("./campaign-read-projection-service");
 const VERSION = 1;
@@ -78,9 +79,12 @@ async function readiness(db,creatorId,now) {
     valueFreshnessMs:row.valueFreshnessMs,nextChangeAt:!row.empty&&current?row.nextChangeAt?.toISOString()||null:null};
 }
 async function sourceCoverage(db,creatorId,now) {
-  const [financial,campaigns]=await Promise.all([
+  const [financial,campaigns,refreshDebt]=await Promise.all([
+    // Creator Demand survives current coverage generation changes.
+
     db.creatorFinancialCollectionState.findUnique({where:{creatorId},select:{status:true,baselineVerifiedAt:true,lastCatchupCompletedAt:true,baselineObservedAt:true,lastCatchupObservedAt:true,retryAfterAt:true}}),
     db.creatorCampaignCollectionState.findUnique({where:{creatorId},select:CAMPAIGN_COVERAGE_SELECT}),
+    readCampaignRefreshDebt({db,creatorId}),
   ]);
   // Provider coverage evidence is separate from processing all locally known
   // facts. READY never fabricates a completed provider scan.
@@ -88,11 +92,12 @@ async function sourceCoverage(db,creatorId,now) {
     if(!row)return null;
     const state=evaluateDurableCollectorState({status:row.status,baselineCompletedAt:row.baselineVerifiedAt,baselineVerifiedAt:row.baselineVerifiedAt,
       lastVerifiedAt:row.lastCatchupCompletedAt,baselineObservedAt:row.baselineObservedAt,lastObservedAt:row.lastCatchupObservedAt,retryAfterAt:row.retryAfterAt,now,freshnessMs});
-    return {...row,status:stateVocabulary(state),proven:state.proven,fresh:state.fresh};
+    return {...coverageDto(row),status:stateVocabulary(state),proven:state.proven,fresh:state.fresh};
   };
-  const campaignState=evaluateCampaignCollectionState(campaigns,now);
+  const campaignState=evaluateCampaignCollectionState(campaigns,now,refreshDebt);
   return {financial:evidence(financial,FINANCIAL_COLLECTION_FRESHNESS_MS),campaigns:campaigns?{
-    ...campaigns,status:stateVocabulary(campaignState),proven:campaignState.proven,fresh:campaignState.fresh,
+    ...coverageDto(campaigns),status:stateVocabulary(campaignState),proven:campaignState.proven,fresh:campaignState.fresh,
+    providerFresh:campaignState.providerFresh,refreshDebt,
     due:campaignState.due,freshnessAuthority:campaignState.freshnessAuthority,
     fanValueCoverageAuthority:"TRAVERSAL_RECEIPT",
     directoryDue:campaignState.directoryDue,frontierDue:campaignState.frontierDue,fanRefreshPending:campaignState.fanRefreshPending,

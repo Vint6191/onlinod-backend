@@ -13,7 +13,7 @@ const { deriveCampaignPresentationStatus, deriveManualCampaignStartDebtAction } 
 const { providerScaleContract } = require("./provider-capacity-sla-service");
 
 const root = path.resolve(__dirname, "../..");
-const desktopRoot = path.resolve(root, "../../desktop");
+const desktopRoot = process.env.ONLINOD_DESKTOP_ROOT || path.resolve(root, "../desktop");
 
 test("A19 end-to-end Campaign status follows live delegated coverage, not frozen job.result fanValuesComplete", () => {
   const pending = deriveCampaignPresentationStatus({
@@ -133,6 +133,7 @@ test("A19 due failed debt requeues atomically from failed to outstanding under b
       updateMany: async ({ data }) => { workUpdates.push(data); return { count: 1 }; },
     },
     creatorCampaignCollectionState: {
+      findUnique: async () => ({ creatorId: "c1", fanValueCoverageScanRunId: "run1" }),
       updateMany: async ({ data }) => { coverageUpdates.push(data); return { count: 1 }; },
     },
   };
@@ -264,7 +265,9 @@ test("A19 source contracts keep recovery multi-replica safe, sample capacity bef
   assert.match(normalizer, /CAMPAIGN_SCAN_STATUSES/);
   assert.match(normalizer, /refreshRecoveryAvailable/);
   assert.match(normalizer, /refreshLastFailureMessage/);
-  assert.match(ui, /data\?\.refreshPending !== true/);
+  const poller = fs.readFileSync(path.join(desktopRoot, "apps/desktop/renderer/src/features/creator-analytics/campaignScannerController.ts"), "utf8");
+  assert.match(ui, /createCampaignScannerController/);
+  assert.match(poller, /state\.data\.refreshPending === true/);
   assert.match(ui, /RETRY FAILED REFRESH/);
   assert.match(ui, /refreshLastFailureMessage/);
   assert.match(ui, /QUARANTINED/);

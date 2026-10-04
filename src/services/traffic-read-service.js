@@ -1,7 +1,8 @@
 "use strict";
+const { readCampaignRefreshDebt } = require("./campaign-refresh-debt-service");
 const { readWithAnalyticsViewer } = require("./analytics-viewer-read-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
-const { CAMPAIGN_COVERAGE_SELECT, evaluateCampaignCollectionState } = require("./campaign-freshness-service");
+const { CAMPAIGN_COVERAGE_SELECT, evaluateCampaignCollectionState, coverageDto } = require("./campaign-freshness-service");
 const DAY = 86400000, UNKNOWN = "unattributed_paid_subscriptions";
 const fault = (code, status = 400) => Object.assign(new Error(code), { code, status });
 const day = at => at.toISOString().slice(0, 10);
@@ -49,8 +50,8 @@ async function freshness(db, creator, now) {
   const coverage = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: creator.id }, select: {
     ...CAMPAIGN_COVERAGE_SELECT, membershipCoverageCompletedAt: true,
   } });
-  return { providerCoverage: coverage, ready: Boolean(state?.completedAt) && !pending, rebuilding: !state?.completedAt,
-    providerFreshness: evaluateCampaignCollectionState(coverage, now),
+  return { providerCoverage: coverage ? coverageDto(coverage) : null, ready: Boolean(state?.completedAt) && !pending, rebuilding: !state?.completedAt,
+    providerFreshness: evaluateCampaignCollectionState(coverage, now, await readCampaignRefreshDebt({ db, creatorId: creator.id })),
     pending: Boolean(pending), failure: pending?.state === "RECONCILE_REQUIRED" ? pending.lastError : null,
     providerAuthority: "CAMPAIGNS", valueAuthority: "FAN_DATA_CURRENT", projectionVersion: 3 };
 }

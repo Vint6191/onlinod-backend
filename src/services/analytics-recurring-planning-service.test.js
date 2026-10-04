@@ -109,3 +109,16 @@ test("directory admission sends a fixed-size reservation independent of catalog 
   assert.match(calls[0].sql, /ON CONFLICT/);
   assert.match(calls[0].sql, /"reservedJobs" < 100/);
 });
+
+for (const expireAtFinal of [false,true]) test(`terminal bootstrap preserves eligible jobs only under live work fence: expired=${expireAtFinal}`, async (t) => {
+  const f=fixture({expireAtFinal});events.length=0;
+  t.mock.method(require("./analytics-collection-planner"),"ensureOperationalAnalyticsFreshness",async()=>{
+    repo.publishPlannedJobAvailable({id:"independent-earnings",agencyId:"agency"});return {created:1};
+  });
+  t.mock.method(require("./creator-analytics-sync-orchestrator"),"ensureRecurringCreatorAnalyticsCatchups",async()=>({
+    ready:false,initial:{ready:false,stage:"campaigns",reason:"failed_terminal"},created:["notifications_catchup"],skipped:[],
+  }));
+  const call=()=>service.planRecurringCreatorAnalytics({db:f.db,item:f.item,now:f.now});
+  if(expireAtFinal){await assert.rejects(call,{code:"ANALYTICS_PLANNING_CLAIM_LOST"});assert.equal(events.length,0);}
+  else {const r=await call();assert.equal(r.created,2);assert.equal(r.initial.reason,"failed_terminal");assert.equal(events.length,1);assert.equal(f.rolledBack,false);}
+});

@@ -49,7 +49,7 @@ async function comparison(legacy) {
   const db = { creatorCampaignCollectionState: { findUnique: async () => structuredClone(current) },
     creatorFinancialCollectionState: { findUnique: async () => financial },
     creatorCampaign: { findMany: async () => [] }, jobInstance: { findFirst: async () => null, findMany: async () => [] },
-    $queryRawUnsafe: async () => [{ empty: true }], $executeRawUnsafe: async () => 1 };
+    $queryRawUnsafe: async (sql) => sql.includes('FROM "CreatorFanRefreshDemand"') ? [{queued:false,failed:false}] : [{ empty: true }], $executeRawUnsafe: async () => 1 };
   db.$transaction = async work => { const tx = { ...db }; delete tx.$transaction; return work(tx); };
   const page = await read.readCampaignPage({ db, creatorId: 'creator', now });
   const plan = await orchestrator.ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: 'creator', agencyId: 'agency', now });

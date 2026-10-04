@@ -207,10 +207,10 @@ test("A20.2 terminal collector outcomes keep delegated debt live and current COM
   assert.equal(complete.collectorStatus, "FAILED");
 });
 
-test("A20.2 production set-based healing has deterministic demand/work row lock order and adapter capability fence", () => {
+test("A20.2 production healing locks demands in order and only the unique current Work under Campaign authority", () => {
   const source = fs.readFileSync(path.join(__dirname, "campaign-fan-refresh-queue-service.js"), "utf8");
   assert.match(source, /ORDER BY d\."id"\s+FOR UPDATE OF d/);
-  assert.match(source, /ORDER BY w\."id"\s+FOR UPDATE OF w/);
+  assert.match(source, /CROSS JOIN LATERAL \([\s\S]*w\."scanRunId"=current_run\."fanValueCoverageScanRunId"[\s\S]*LIMIT 1 FOR UPDATE OF w/);
   assert.match(source, /const productionSetBasedAdapter = typeof db\?\.\$queryRawUnsafe === "function"[\s\S]*creatorFanRefreshDemand\?\.findMany[\s\S]*creatorCampaignFanRefreshWork[\s\S]*creatorCampaignCollectionState/);
 });
 
@@ -222,4 +222,12 @@ test("A20.2 migration installs and backfills durable current-coverage generation
   assert.match(migration, /CreatorCampaignFanRefreshWork/);
   assert.match(migration, /s\."fanValueCoverageScanRunId" = coverage_job\."scanRunId"/);
   assert.match(migration, /campaignFreshnessCoverageVersion/);
+});
+
+test("current empty coverage cannot hide queued or quarantined creator FanData debt", () => {
+  const complete={collectorStatus:"COMPLETE",fanRefreshDelegated:true,membershipCoverageStatus:"COMPLETE",campaignFrontierFreshnessStatus:"COMPLETE",fanValuesComplete:true,currentCoverageAuthoritative:true};
+  const queued=deriveCampaignPresentationStatus({...complete,creatorRefreshQueued:true});
+  assert.equal(queued.status,"REFRESH_PENDING");assert.equal(queued.coverageComplete,false);
+  const failed=deriveCampaignPresentationStatus({...complete,creatorRefreshFailed:true});
+  assert.equal(failed.status,"PARTIAL");assert.equal(failed.coverageStatus,"PARTIAL");assert.equal(failed.refreshPending,false);
 });

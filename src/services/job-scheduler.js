@@ -349,6 +349,23 @@ async function scheduleInitialJobsForCreator({
   const outcomes = [];
   const now = new Date();
 
+  // Earnings collection is no longer display-range scheduling. A single
+  // coverage/freshness planner owns exact provider windows.
+  if (includeEarningsFreshness) {
+    await executeSchedulerConsumer({
+      work: "earnings_freshness",
+      created,
+      skipped,
+      degraded,
+      outcomes,
+      requireOk: false,
+      createdLabel: "fetch_earnings",
+      execute: () => ensureOperationalAnalyticsFreshness({
+        db, creatorId, agencyId, reason: "INITIAL_SYNC", priority, now,
+      }),
+    });
+  }
+
   // Creator Analytics bootstrap owns the creator background-read lane until its
   // strict Notifications -> Financial -> Campaigns history sequence is proven.
   // The recurring scheduler can delegate the actual Analytics planning to its
@@ -362,11 +379,18 @@ async function scheduleInitialJobsForCreator({
     } = require("./creator-analytics-sync-orchestrator");
 
     if (includeCreatorAnalytics) {
-      const initial = await ensureInitialCreatorAnalyticsSync({
+      const catchups = includeAnalyticsCatchups ? await ensureRecurringCreatorAnalyticsCatchups({
+        db, creatorId, agencyId, now, priority: Math.max(15, priority - 10),
+      }) : null;
+      const initial = catchups?.initial || await ensureInitialCreatorAnalyticsSync({
         db, creatorId, agencyId, now, priority: Math.max(80, priority),
       });
       if (initial.created) created.push(`creator_analytics_initial:${initial.stage}`);
       else skipped.push(`creator_analytics_initial:${initial.stage}:${initial.reason || "waiting"}`);
+      if (catchups) {
+        created.push(...(catchups.created || []));
+        skipped.push(...(catchups.skipped || []));
+      }
       if (!initial.ready) {
         const failedTerminal = ["failed_terminal", "missing_scope"].includes(String(initial.reason || ""));
         const normalized = {
@@ -383,13 +407,6 @@ async function scheduleInitialJobsForCreator({
       }
       outcomes.push({ work: "creator_analytics_initial", outcome: initial.created ? SCHEDULER_OUTCOME.CREATED : SCHEDULER_OUTCOME.NOOP, ok: true, created: Boolean(initial.created), reason: initial.reason || "initial_sync_complete", failures: [] });
 
-      if (includeAnalyticsCatchups) {
-        const catchups = await ensureRecurringCreatorAnalyticsCatchups({
-          db, creatorId, agencyId, now, priority: Math.max(15, priority - 10),
-        });
-        created.push(...(catchups.created || []));
-        skipped.push(...(catchups.skipped || []));
-      }
     } else {
       const ready = await creatorAnalyticsInitialSyncReady({ db, creatorId, now });
       if (!ready) {
@@ -408,23 +425,6 @@ async function scheduleInitialJobsForCreator({
     // Fail closed for automatic read work. If bootstrap state cannot be proven,
     // do not start other creator-wide OF scans that can race its recovery.
     return schedulerPlanningResult(created, skipped, degraded, outcomes);
-  }
-
-  // Earnings collection is no longer display-range scheduling. A single
-  // coverage/freshness planner owns exact provider windows.
-  if (includeEarningsFreshness) {
-    await executeSchedulerConsumer({
-      work: "earnings_freshness",
-      created,
-      skipped,
-      degraded,
-      outcomes,
-      requireOk: false,
-      createdLabel: "fetch_earnings",
-      execute: () => ensureOperationalAnalyticsFreshness({
-        db, creatorId, agencyId, reason: "INITIAL_SYNC", priority, now,
-      }),
-    });
   }
 
   // Traffic is derived from the canonical Campaigns collector.

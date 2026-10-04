@@ -37,7 +37,8 @@ function terminalDb(demandCount, rawResult, calls) {
       }
       if (/transitionCampaignFanRefreshTerminalSetBased/.test("transitionCampaignFanRefreshTerminalSetBased") && /planned_delta AS/.test(sql) && /coverage_update AS/.test(sql)) {
         assert.match(sql, /ORDER BY d\."id" ASC[\s\S]*FOR UPDATE OF d/);
-        assert.match(sql, /ORDER BY w\."id" ASC[\s\S]*FOR UPDATE OF w/);
+        assert.match(sql, /CROSS JOIN LATERAL[\s\S]*LIMIT 1 FOR UPDATE OF w/);
+        assert.equal(args[3], "creator-1");
         assert.match(sql, /"retryAttempts" = d\."retryAttempts" \+ 1/);
         assert.match(sql, /'QUARANTINED'/);
         assert.match(sql, /CAMPAIGN_FAN_VALUE_REFRESH_PENDING/);

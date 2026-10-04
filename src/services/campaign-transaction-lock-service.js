@@ -1,6 +1,6 @@
 "use strict";
 
-const { lockDbAdvisoryXact, withDbAdvisoryXactLock } = require("./db-transaction-service");
+const { runDbTransaction } = require("./db-transaction-service");
 
 const CAMPAIGN_TRANSACTION_LOCK_NAMESPACE = "analytics-collector:campaigns";
 
@@ -17,15 +17,21 @@ function campaignTransactionLockKey(creatorId) {
 async function acquireCampaignTransactionLock(db, creatorId) {
   if (typeof db?.$executeRawUnsafe !== "function") return { key: campaignTransactionLockKey(creatorId), adapterFallback: true };
   const key = campaignTransactionLockKey(creatorId);
-  await lockDbAdvisoryXact({ db, key });
+  // The version fence is transaction-local and scoped to the same creator as
+  // the lock. Old binaries cannot update retained refresh work after cutover.
+  await db.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(hashtext($1)),
+    set_config('onlinod.campaign_refresh_work_version','2',true),
+    set_config('onlinod.campaign_refresh_creator',$2,true)`, key, String(creatorId).trim());
   return { key, adapterFallback: false };
 }
 
 async function withCampaignTransactionLock({ db, creatorId, work, options = undefined } = {}) {
   if (typeof work !== "function") throw new TypeError("Campaign transaction lock requires work callback");
-  const key = campaignTransactionLockKey(creatorId);
   if (typeof db?.$executeRawUnsafe !== "function" && typeof db?.$transaction !== "function") return work(db);
-  return withDbAdvisoryXactLock({ db, key, work, options });
+  return runDbTransaction(db, async (tx) => {
+    await acquireCampaignTransactionLock(tx, creatorId);
+    return work(tx);
+  }, options);
 }
 
 module.exports = {

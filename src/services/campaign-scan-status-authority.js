@@ -10,6 +10,8 @@ function deriveCampaignPresentationStatus({
   fanValueFreshnessStatus = "MISSING",
   retryableFailedDemands = 0,
   currentCoverageAuthoritative = false,
+  creatorRefreshQueued = false,
+  creatorRefreshFailed = false,
 } = {}) {
   const normalizedCollector = String(collectorStatus || "IDLE").toUpperCase();
   const normalizedMembership = String(membershipCoverageStatus || "MISSING").toUpperCase();
@@ -17,12 +19,12 @@ function deriveCampaignPresentationStatus({
   const normalizedFan = String(fanValueFreshnessStatus || "MISSING").toUpperCase();
   const coverageComplete = normalizedMembership === "COMPLETE"
     && normalizedFrontier === "COMPLETE"
-    && fanValuesComplete === true;
+    && fanValuesComplete === true && creatorRefreshQueued !== true && creatorRefreshFailed !== true && Number(retryableFailedDemands || 0) === 0;
   // Delegated FanData debt has its own lifecycle. A terminal provider collector
   // (COMPLETE/PARTIAL/FAILED/CANCELLED) must never hide outstanding or retryable
   // server-side work from the reader/UI.
   const refreshPending = fanRefreshDelegated === true && !coverageComplete
-    && (Math.max(0, Number(fanValuesOutstanding || 0)) > 0 || normalizedFan === "QUEUED" || Math.max(0, Number(retryableFailedDemands || 0)) > 0);
+    && (creatorRefreshQueued === true || Math.max(0, Number(fanValuesOutstanding || 0)) > 0 || normalizedFan === "QUEUED" || Math.max(0, Number(retryableFailedDemands || 0)) > 0);
   const coverageStatus = coverageComplete ? "COMPLETE"
     : refreshPending ? "PENDING"
       : (normalizedMembership === "MISSING" && normalizedFan === "MISSING" ? "MISSING" : "PARTIAL");
@@ -32,7 +34,8 @@ function deriveCampaignPresentationStatus({
     // Current canonical coverage is the operational authority. A stale/missing
     // manual collector must not hide automatic delegated debt or keep an old
     // FAILED/PARTIAL header after a newer generation becomes complete.
-    status = coverageComplete ? "COMPLETE" : refreshPending ? "REFRESH_PENDING" : normalizedCollector;
+    status = coverageComplete ? "COMPLETE" : refreshPending ? "REFRESH_PENDING"
+      : normalizedCollector === "COMPLETE" ? "PARTIAL" : normalizedCollector;
   } else if (normalizedCollector === "COMPLETE") {
     if (fanRefreshDelegated === true) {
       status = coverageComplete ? "COMPLETE" : refreshPending ? "REFRESH_PENDING" : "PARTIAL";

@@ -1,5 +1,7 @@
 "use strict";
+const { readCampaignRefreshDebt } = require("./campaign-refresh-debt-service");
 const { evaluateCampaignCollectionState } = require("./campaign-freshness-service");
+const { readCampaignRefreshFailureStatus } = require("./campaign-refresh-status-service");
 const { countsExact } = require("./campaign-bounded-frontier-service");
 
 
@@ -83,10 +85,17 @@ async function countOnlineBindings(db, creator, now = null) {
   });
 }
 
-async function startManualCampaignScan({ db = prisma, creator, requestedByUserId = null, now = new Date() }) {
+async function startManualCampaignScan({ db = prisma, creator, requestedByUserId = null, intent = "legacy", now = new Date() }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
+  if (!["source", "repair", "legacy"].includes(intent)) throw new Error("CAMPAIGN_SCAN_INTENT_INVALID");
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: creator.id, work: async (tx) => {
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow: now });
+    // The durable management receipt fixes intent before retries. Repair never
+    // falls through into provider traversal, even after another replica heals it.
+    if (intent === "repair") {
+      const repaired = await repairFailedCampaignFanRefreshDemands({ db: tx, creatorId: creator.id, now: authorityNow, maxDemands: 500 });
+      return { job: null, action: repaired.recovered > 0 || repaired.promotedJobs > 0 ? "refresh_repair_queued" : "refresh_repair_noop", repaired };
+    }
     const active = await activeCollectorJob(tx, creator.id, JOB_KEY);
     const activeParams = object(active?.params);
     const activeUsesDirectoryReuse = Number(activeParams.campaignDirectoryReuseVersion || 0) >= 1
@@ -127,12 +136,12 @@ async function startManualCampaignScan({ db = prisma, creator, requestedByUserId
     // the Campaign directory/claimer traversal. This is deliberately fail-closed
     // across lost HTTP responses: once FAILED debt is requeued, a repeated START
     // sees QUEUED debt and returns refresh_pending instead of launching a full scan.
-    if (typeof tx.creatorFanRefreshDemand?.count === "function") {
+    if (intent === "legacy" && typeof tx.creatorFanRefreshDemand?.findFirst === "function") {
       const [failedDebt, queuedDebtBeforeRepair] = await Promise.all([
-        tx.creatorFanRefreshDemand.count({ where: { creatorId: creator.id, status: "FAILED" } }),
-        tx.creatorFanRefreshDemand.count({ where: { creatorId: creator.id, status: "QUEUED" } }),
+        tx.creatorFanRefreshDemand.findFirst({ where: { creatorId: creator.id, status: "FAILED" }, select: { id: true } }),
+        tx.creatorFanRefreshDemand.findFirst({ where: { creatorId: creator.id, status: "QUEUED" }, select: { id: true } }),
       ]);
-      const debtAction = deriveManualCampaignStartDebtAction({ failedDebt, queuedDebt: queuedDebtBeforeRepair });
+      const debtAction = deriveManualCampaignStartDebtAction({ failedDebt: Boolean(failedDebt), queuedDebt: Boolean(queuedDebtBeforeRepair) });
       if (debtAction === "repair") {
         const repaired = await repairFailedCampaignFanRefreshDemands({ db: tx, creatorId: creator.id, now: authorityNow, maxDemands: 500 });
         // Even if another replica won the SKIP LOCKED race and repaired the rows
@@ -249,44 +258,22 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 50, offset
   const fanValuesComplete = canonicalCoveragePresent
     ? fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"
     : fanRefreshDelegated ? false : result.fanValuesComplete === true;
-  let failedRefreshDemands = 0;
-  let quarantinedRefreshDemands = 0;
-  let refreshNextRetryAt = null;
-  let refreshLastFailureFanId = null;
-  let refreshLastFailureMessage = null;
-  let refreshLastFailureAt = null;
-  let refreshLastFailureAttempts = 0;
-  let refreshLastFailureQuarantined = false;
-  if (typeof db.creatorFanRefreshDemand?.count === "function") {
-    const counts = await Promise.all([
-      db.creatorFanRefreshDemand.count({ where: { creatorId: creator.id, status: "FAILED", quarantinedAt: null } }),
-      db.creatorFanRefreshDemand.count({ where: { creatorId: creator.id, status: "FAILED", quarantinedAt: { not: null } } }),
-    ]);
-    failedRefreshDemands = counts[0];
-    quarantinedRefreshDemands = counts[1];
-  }
-  if (failedRefreshDemands > 0 && typeof db.creatorFanRefreshDemand?.findFirst === "function") {
-    const retry = await db.creatorFanRefreshDemand.findFirst({
-      where: { creatorId: creator.id, status: "FAILED", quarantinedAt: null, nextRetryAt: { not: null } },
-      orderBy: [{ nextRetryAt: "asc" }, { id: "asc" }],
-      select: { nextRetryAt: true },
-    });
-    refreshNextRetryAt = iso(retry?.nextRetryAt);
-  }
-  if ((failedRefreshDemands > 0 || quarantinedRefreshDemands > 0) && typeof db.creatorFanRefreshDemand?.findFirst === "function") {
-    const latestFailure = await db.creatorFanRefreshDemand.findFirst({
-      where: { creatorId: creator.id, status: "FAILED" },
-      orderBy: [{ lastFailedAt: "desc" }, { id: "asc" }],
-      select: { onlyFansUserId: true, lastError: true, lastFailedAt: true, retryAttempts: true, quarantinedAt: true },
-    });
-    refreshLastFailureFanId = clean(latestFailure?.onlyFansUserId, 180);
-    refreshLastFailureMessage = clean(latestFailure?.lastError, 1000);
-    refreshLastFailureAt = iso(latestFailure?.lastFailedAt);
-    refreshLastFailureAttempts = integer(latestFailure?.retryAttempts, 0, CAMPAIGN_FAN_REFRESH_MAX_RETRIES);
-    refreshLastFailureQuarantined = Boolean(latestFailure?.quarantinedAt);
-  }
+  const [failures, refreshDebt] = await Promise.all([
+    readCampaignRefreshFailureStatus({ db, creatorId: creator.id }),
+    readCampaignRefreshDebt({ db, creatorId: creator.id }),
+  ]);
+  const failedRefreshDemands = failures.failed;
+  const quarantinedRefreshDemands = failures.quarantined;
+  const failedRefreshDemandsExact = failures.failedExact;
+  const quarantinedRefreshDemandsExact = failures.quarantinedExact;
+  const refreshNextRetryAt = iso(failures.nextRetryAt);
+  const refreshLastFailureFanId = clean(failures.onlyFansUserId, 180);
+  const refreshLastFailureMessage = clean(failures.lastError, 1000);
+  const refreshLastFailureAt = iso(failures.lastFailedAt);
+  const refreshLastFailureAttempts = integer(failures.retryAttempts, 0, CAMPAIGN_FAN_REFRESH_MAX_RETRIES);
+  const refreshLastFailureQuarantined = Boolean(failures.quarantinedAt);
   const presentation = deriveCampaignPresentationStatus({
-    collectorStatus, fanRefreshDelegated, membershipCoverageStatus, campaignFrontierFreshnessStatus,
+    collectorStatus, fanRefreshDelegated, creatorRefreshQueued: refreshDebt.queued, creatorRefreshFailed: refreshDebt.failed, membershipCoverageStatus, campaignFrontierFreshnessStatus,
     fanValuesComplete, fanValuesOutstanding, fanValueFreshnessStatus, retryableFailedDemands: failedRefreshDemands,
     currentCoverageAuthoritative: canonicalCoveragePresent,
   });
@@ -354,7 +341,8 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 50, offset
     campaignFrontierCountsExact: countsExact(collectionState),
     campaignFrontierOldestDueAt: iso(collectionState?.campaignFrontierOldestDueAt),
     campaignFrontierNextDueAt: iso(collectionState?.campaignFrontierNextDueAt),
-    currentSourceFreshness: evaluateCampaignCollectionState(collectionState, capacityNow),
+    currentSourceFreshness: evaluateCampaignCollectionState(collectionState, capacityNow, refreshDebt),
+    creatorRefreshQueued: refreshDebt.queued,
     campaignMembershipCoverageStatus: membershipCoverageStatus,
     campaignDirectoryDiscoveryStatus: directoryDiscovery.status,
     campaignDirectoryDiscoveryDueAt: iso(directoryDiscovery.dueAt),
@@ -366,7 +354,9 @@ async function readManualCampaignScan({ db = prisma, creator, limit = 50, offset
     fanValuesComplete,
     fanRefreshDelegated,
     failedRefreshDemands,
+    failedRefreshDemandsExact,
     quarantinedRefreshDemands,
+    quarantinedRefreshDemandsExact,
     refreshNextRetryAt,
     refreshRetryMaxAttempts: CAMPAIGN_FAN_REFRESH_MAX_RETRIES,
     refreshRecoveryAvailable,

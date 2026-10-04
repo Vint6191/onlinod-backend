@@ -226,16 +226,16 @@ for (const change of ["fresh", "debt", "deferred", "directory", "generation"]) {
     const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now,
       reserveCampaignDirectory: async state => { reservations++; assert.equal(state, current); return true; } });
     const job = scheduled.find(row => row.jobKey === "fetch_campaigns");
-    if (["fresh", "debt", "deferred"].includes(change)) {
+    if (["fresh", "deferred"].includes(change)) {
       assert.equal(job, undefined); assert.equal(reservations, 0);
-      assert(result.skipped.includes(`campaigns_catchup:${change === "debt" ? "fan_refresh_pending" : change}`));
+      assert(result.skipped.includes(`campaigns_catchup:${change}`));
     } else if (change === "directory") {
       assert.equal(job.params.campaignDirectoryReuseGeneration, undefined);
       assert.equal(job.params.campaignDirectoryDiscoveryVersion, 1);
       assert.equal(reservations, 1); assert(result.created.includes("campaigns_directory_discovery"));
     } else {
-      assert.equal(job.params.campaignDirectoryReuseGeneration, "directory-new");
-      assert.equal(job.params.campaignDirectoryReuseRevision, 2);
+      assert.equal(job.params.campaignDirectoryReuseGeneration, change === "debt" ? "directory-old" : "directory-new");
+      assert.equal(job.params.campaignDirectoryReuseRevision, change === "debt" ? 1 : 2);
       assert.equal(reservations, 0); assert(result.created.includes("campaigns_frontier_reuse"));
     }
   });
@@ -713,83 +713,72 @@ test("collector planning reloads durable state under the collector lock before d
 });
 
 
-test("pending delegated Campaign FanData refresh never schedules a second provider traversal", async () => {
-  const now = new Date("2026-08-09T12:00:00.000Z");
-  notificationState = { fullBackfillVerifiedAt: new Date("2026-08-09T10:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-09T10:00:00.000Z"), lastCatchupVerifiedAt: now , lastCatchupObservedAt: now};
-  const db = dbFixture({ financialReady: true, campaignReady: false, financialCatchupAt: now });
-  db.creatorCampaignCollectionState.findUnique = async () => ({
-    status: "PARTIAL",
-    baselineVerifiedAt: null, baselineObservedAt: null,
-    baselineGeneration: null,
-    lastCatchupCompletedAt: null,
-    activeGeneration: "campaign-membership-generation",
-    membershipCoverageStatus: "PARTIAL",
-    fanValueCoverageScanRunId: "campaign-membership-generation",
-    fanValueFreshnessStatus: "QUEUED",
-    fanValueExpected: 17,
-    fanValueOutstanding: 17,
-    sourceJobId: "campaign-membership-job",
+for (const fanStatus of ["QUEUED", "PARTIAL"]) test(`FanData ${fanStatus} cannot block a due Campaign frontier`, async () => {
+  const now = new Date("2026-10-04T12:00:00Z");
+  notificationState = { fullBackfillVerifiedAt: now, fullBackfillObservedAt: now };
+  const db = dbFixture({ financialReady: true, campaignReady: true, financialCatchupAt: now });
+  const original = db.creatorCampaignCollectionState.findUnique;
+  db.creatorCampaignCollectionState.findUnique = async () => ({ ...await original(),
+    status: "PARTIAL", activeGeneration: "old", fanValueCoverageScanRunId: "old",
+    fanValueExpected: 5, fanValueFreshnessStatus: fanStatus,
+    fanValueOutstanding: fanStatus === "QUEUED" ? 5 : 0, fanValueFailed: fanStatus === "PARTIAL" ? 5 : 0,
   });
-
-  let result = await ensureInitialCreatorAnalyticsSync({ db, creatorId: "creator-1", agencyId: "agency-1", now });
-  assert.equal(result.ready, false);
-  assert.equal(result.stage, "campaigns");
-  assert.equal(result.reason, "fan_refresh_pending");
-  assert.equal(result.jobId, "campaign-membership-job");
-  assert.equal(scheduled.filter((row) => row.jobKey === "fetch_campaigns").length, 0);
-
-  // Pretend the baseline proof exists but the latest catch-up FanData queue is
-  // still draining. Recurring planning must also wait rather than re-read OF.
-  db.creatorCampaignCollectionState.findUnique = async () => ({
-    status: "PARTIAL",
-    baselineVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), baselineObservedAt: new Date("2026-08-01T00:00:00.000Z"),
-    baselineGeneration: "campaign-baseline-generation",
-    lastCatchupCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
-    activeGeneration: "campaign-catchup-generation",
-    membershipCoverageStatus: "PARTIAL",
-    fanValueCoverageScanRunId: "campaign-catchup-generation",
-    fanValueFreshnessStatus: "QUEUED",
-    fanValueExpected: 17,
-    fanValueOutstanding: 17,
-    sourceJobId: "campaign-catchup-job",
-  });
-  scheduled = [];
-  result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
-  assert.ok(result.skipped.includes("campaigns_catchup:fan_refresh_pending"));
-  assert.equal(scheduled.filter((row) => row.jobKey === "fetch_campaigns").length, 0);
-
-  // A terminal refresh failure is still unsettled freshness. Never hide it by
-  // starting a new Campaign generation and resetting run-level coverage.
-  db.creatorCampaignCollectionState.findUnique = async () => ({
-    status: "PARTIAL", baselineVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), baselineObservedAt: new Date("2026-08-01T00:00:00.000Z"),
-    baselineGeneration: "campaign-baseline-generation", lastCatchupCompletedAt: null,
-    activeGeneration: "campaign-failed-generation", membershipCoverageStatus: "PARTIAL",
-    fanValueCoverageScanRunId: "campaign-failed-generation", fanValueFreshnessStatus: "PARTIAL",
-    fanValueExpected: 3, fanValueFailed: 3, fanValueOutstanding: 0, sourceJobId: "campaign-failed-job",
-  });
-  scheduled = [];
-  result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
-  assert.ok(result.skipped.includes("campaigns_catchup:fan_refresh_pending"));
-  assert.equal(scheduled.filter((row) => row.jobKey === "fetch_campaigns").length, 0);
+  const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
+  assert.equal(result.ready, true);
+  assert.equal(scheduled.filter(j => j.jobKey === "fetch_campaigns").length, 1);
+  assert.equal(scheduled[0].params.collectionMode, "catchup");
 });
 
-test("initial pipeline does not immediately reschedule Campaign provider reads after membership succeeds but FanData is pending", async () => {
-  const db = dbFixture({ financialReady: true, campaignReady: false });
-  const job = {
-    id: "campaign-initial",
-    jobKey: "fetch_campaigns",
-    creatorId: "creator-1",
-    agencyId: "agency-1",
-    params: { analyticsSyncKind: "initial", analyticsSyncVersion: 1, analyticsSyncStage: "campaigns" },
-  };
-  scheduled = [];
-  const result = await advanceCreatorAnalyticsInitialSyncAfterCompletion({
-    db,
-    job,
-    sideEffect: { ok: true, completion: { providerTraversalComplete: true, complete: false } },
-    now: new Date("2026-08-09T12:00:00.000Z"),
-  });
-  assert.equal(result.advanced, false);
-  assert.equal(result.reason, "campaign_fan_refresh_pending");
-  assert.equal(scheduled.filter((row) => row.jobKey === "fetch_campaigns").length, 0);
+for (const activeStatus of ["SCHEDULED", "CLAIMED", "PAUSED"]) test(`FanData independence retains ${activeStatus} provider exclusion`, async () => {
+  const now = new Date("2026-10-04T12:00:00Z");
+  notificationState = { fullBackfillVerifiedAt: now, fullBackfillObservedAt: now };
+  const db = dbFixture({ financialReady: true, campaignReady: true, financialCatchupAt: now,
+    active: [{id:"existing",jobKey:"fetch_campaigns",status:activeStatus}] });
+  const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
+  assert(result.skipped.includes("campaigns_catchup:already_in_flight"));
+  assert.equal(scheduled.length, 0);
+});
+
+for (const status of ["SCANNING", "FAILED"]) test(`verified streams catch up while Campaign bootstrap is ${status}`, async () => {
+  const now = new Date("2026-10-04T12:00:00Z"), old = new Date("2026-09-01T00:00:00Z");
+  notificationState = { fullBackfillVerifiedAt: old, fullBackfillObservedAt: old };
+  const db = dbFixture({ financialReady: true, campaignReady: false,
+    active: status === "SCANNING" ? [{id:"bootstrap",jobKey:"fetch_campaigns",status:"CLAIMED"}] : [] });
+  db.creatorCampaignCollectionState.findUnique = async () => ({ status, baselineVerifiedAt: null });
+  const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
+  assert.equal(result.ready, false);
+  assert.deepEqual(scheduled.map(j => j.jobKey).sort(), ["catchup_notifications_scan", "financial_transactions_scan"]);
+  assert(scheduled.every(j => j.params.collectionMode === "catchup"));
+});
+
+test("membership baseline advances bootstrap with FanData still pending", async () => {
+  const now = new Date("2026-10-04T12:00:00Z");
+  notificationState = { fullBackfillVerifiedAt: now, fullBackfillObservedAt: now };
+  const db = dbFixture({ financialReady: true });
+  db.creatorCampaignCollectionState.findUnique = async () => ({status:"PARTIAL", membershipBaselineVerifiedAt:now,
+    membershipBaselineObservedAt:now, membershipBaselineGeneration:"member-proof", fanValueOutstanding:5});
+  const result = await advanceCreatorAnalyticsInitialSyncAfterCompletion({db, now,
+    job:{jobKey:"fetch_campaigns",creatorId:"creator-1",agencyId:"agency-1",params:{analyticsSyncKind:"initial",analyticsSyncVersion:1}},
+    sideEffect:{ok:true,completion:{membershipComplete:true,providerTraversalComplete:true,complete:false}}});
+  assert.equal(result.advanced,true); assert.equal(result.next.ready,true); assert.equal(scheduled.length,0);
+});
+
+test("provider exhaustion without complete membership cannot advance bootstrap", async () => {
+  const result = await advanceCreatorAnalyticsInitialSyncAfterCompletion({db:dbFixture(),
+    job:{jobKey:"fetch_campaigns",creatorId:"creator-1",agencyId:"agency-1",params:{analyticsSyncKind:"initial",analyticsSyncVersion:1}},
+    sideEffect:{ok:true,completion:{membershipComplete:false,providerTraversalComplete:true,complete:false}}});
+  assert.equal(result.advanced,false);assert.equal(result.reason,"campaigns_not_verified");assert.equal(scheduled.length,0);
+});
+
+test("recurring planning acquires Notifications, Financial, Campaigns before any stage write", async () => {
+  const now=new Date("2026-10-04T12:00:00Z"), old=new Date("2026-09-01T00:00:00Z"), locks=[];
+  notificationState={fullBackfillVerifiedAt:old,fullBackfillObservedAt:old};
+  const db=dbFixture({financialReady:true,campaignReady:false});
+  const check=()=>assert.deepEqual(locks.slice(0,3),["analytics-collector:notifications:creator-1","analytics-collector:financial:creator-1","analytics-collector:campaigns:creator-1"]);
+  db.$executeRawUnsafe=async(sql,key)=>{if(sql.includes('pg_advisory_xact_lock'))locks.push(key);return 1;};
+  db.$queryRawUnsafe=async()=>[{authorityNow:now}];
+  db.$transaction=async work=>{const tx={...db};delete tx.$transaction;return work(tx);};
+  const read=db.jobInstance.findFirst;db.jobInstance.findFirst=async arg=>{check();return read(arg);};
+  await ensureRecurringCreatorAnalyticsCatchups({db,creatorId:"creator-1",agencyId:"agency-1",now});
+  check();assert(scheduled.some(j=>j.jobKey==="fetch_campaigns"));assert(scheduled.some(j=>j.jobKey==="catchup_notifications_scan"));
 });

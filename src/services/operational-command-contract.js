@@ -42,7 +42,7 @@ const schemas = {
   dialog_module: { configure: z.object({ enabled: z.boolean(), settings: z.record(z.unknown()).optional() }) },
   notification: { start: z.object({ forceFull: z.boolean().optional() }), stop: z.object({}) },
   financial: { start: z.object({}), stop: z.object({}) },
-  campaign: { start: z.object({}), stop: z.object({}) },
+  campaign: { start: z.object({ intent: z.enum(["source", "repair"]).optional() }), stop: z.object({}) },
   vault: {
     start: z.object({
       mode: z.enum(["incremental", "full"]).optional(),

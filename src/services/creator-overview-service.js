@@ -328,7 +328,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     now,
     freshnessMs: FINANCIAL_COLLECTION_FRESHNESS_MS,
   });
-  const campaignCollection = evaluateCampaignCollectionState(campaignCollectionState, now);
+  const campaignCollection = evaluateCampaignCollectionState(campaignCollectionState, now, campaignPage?.sourceCoverage?.campaigns?.refreshDebt);
   const oldestNotificationAt = ledger.notificationSync?.oldestOccurredAt ? new Date(ledger.notificationSync.oldestOccurredAt) : null;
   const oneYearStart = new Date(now.getTime() - 365 * DAY_MS);
   const accumulatedFromInitialHalfYear = notificationBaselineAt && notificationBaselineAt.getTime() <= now.getTime() - 185 * DAY_MS;

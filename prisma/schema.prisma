@@ -2218,6 +2218,12 @@ model CreatorCampaignCollectionState {
   campaignProofClaimerBatches                 Int                     @default(0)
   campaignProofRejectedBatches                Int                     @default(0)
   campaignProofRejectedRows                   Int                     @default(0)
+  membershipBaselineVerifiedAt                DateTime?
+  membershipBaselineObservedAt                DateTime?
+  membershipBaselineGeneration                String?
+  membershipCatchupVerifiedAt                 DateTime?
+  membershipCatchupObservedAt                 DateTime?
+  membershipCatchupGeneration                 String?
   membershipCoverageStatus                    AnalyticsCoverageStatus @default(MISSING)
   membershipCoverageCompletedAt               DateTime?
   membershipObservedAt                        DateTime?
