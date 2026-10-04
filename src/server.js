@@ -371,36 +371,41 @@ app.use((err, _req, res, _next) => {
 
 const port = Number(process.env.PORT || 10000);
 
-const httpServer = app.listen(port, () => {
-  logger.info("backend listening", { port });
-});
-
-startRecurringScheduler();
-const stopDialogControlWorker = require("./services/dialog-module-control-service").startDialogControlWorker({db:prisma});
-const stopAuthMailWorker = require("./services/auth-mail-outbox-service").startAuthMailWorker({ db: prisma });
-const stopAdminDiagnostics = require("./services/admin-diagnostics-service").startAdminDiagnostics({ db: prisma, log: logger });
-
-async function gracefulShutdown(signal) {
-  stopAdminDiagnostics();
-  const authMailStopped = stopAuthMailWorker();
-  const dialogControlStopped = stopDialogControlWorker();
-  logger.info("shutdown requested", { signal });
-  httpServer.close(async () => {
-    try {
-      await Promise.all([authMailStopped,dialogControlStopped]);
-      await prisma.$disconnect();
-    } catch (err) {
-      console.warn("[server] prisma disconnect failed:", err?.message || err);
-    } finally {
-      process.exit(0);
-    }
-  });
-
-  setTimeout(() => {
-    logger.warn("graceful shutdown timed out");
-    process.exit(1);
-  }, 25_000).unref?.();
+async function startServer() {
+  // Fail before listening or starting any worker: build success alone cannot
+  // establish that executable maintenance, versioned admission and indexes agree.
+  const maintenance = await require("./services/maintenance-runtime-contract").verifyMaintenanceRuntime({ db: prisma });
+  logger.info("maintenance runtime ready", maintenance);
+  const stopScheduler = startRecurringScheduler();
+  const stopDialogControlWorker = require("./services/dialog-module-control-service").startDialogControlWorker({db:prisma});
+  const stopAuthMailWorker = require("./services/auth-mail-outbox-service").startAuthMailWorker({ db: prisma });
+  const stopAdminDiagnostics = require("./services/admin-diagnostics-service").startAdminDiagnostics({ db: prisma, log: logger });
+  const httpServer = app.listen(port, () => { logger.info("backend listening", { port }); });
+  let stopping = false;
+  async function gracefulShutdown(signal) {
+    if (stopping) return;
+    stopping = true;
+    logger.info("shutdown requested", { signal });
+    const timeout = setTimeout(() => { logger.warn("graceful shutdown timed out"); process.exit(1); }, 25_000);
+    timeout.unref?.();
+    // Cancel every producer immediately, then drain both HTTP and outstanding
+    // scheduler roots before disconnecting Prisma. A second signal is idempotent.
+    const stopped = [stopScheduler, stopAdminDiagnostics, stopAuthMailWorker, stopDialogControlWorker].map(stop => {
+      try { return Promise.resolve(stop()); }
+      catch (error) { return Promise.reject(error); }
+    });
+    stopped.push(new Promise(resolve => httpServer.close(resolve)));
+    const results = await Promise.allSettled(stopped);
+    let failed = results.some(result => result.status === "rejected");
+    try { await prisma.$disconnect(); }
+    catch (error) { failed = true; console.warn("[server] prisma disconnect failed:", error?.message || error); }
+    clearTimeout(timeout);
+    process.exit(failed ? 1 : 0);
+  }
+  process.once("SIGTERM", () => void gracefulShutdown("SIGTERM"));
+  process.once("SIGINT", () => void gracefulShutdown("SIGINT"));
 }
-
-process.once("SIGTERM", () => void gracefulShutdown("SIGTERM"));
-process.once("SIGINT", () => void gracefulShutdown("SIGINT"));
+startServer().catch(async error => {
+  console.error("[server] startup failed:", error?.message || error);
+  try { await prisma.$disconnect(); } finally { process.exit(1); }
+});

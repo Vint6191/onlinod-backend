@@ -3614,6 +3614,7 @@ model OfProviderRequestGateWaiter {
   updatedAt       DateTime @updatedAt
 
   @@index([leaseUntil], map: "OfProviderRequestGateWaiter_lease_idx")
+  @@index([leaseUntil, waiterId], map: "OfProviderRequestGateWaiter_expiry_id_idx")
   @@index([priority, category, ticket], map: "OfProviderRequestGateWaiter_bucket_ticket_idx")
   @@index([ownerInstanceId, leaseUntil], map: "OfProviderRequestGateWaiter_owner_lease_idx")
   @@index([creatorId, ticket], map: "OfProviderRequestGateWaiter_creator_ticket_idx")
@@ -3709,6 +3710,7 @@ model FanObservationToken {
   @@index([jobId, consumedAt])
   @@index([creatorId, observedAt])
   @@index([createdAt])
+  @@index([createdAt, id], map: "FanObservationToken_expiry_id_idx")
 }
 
 model FanObservationReadLease {

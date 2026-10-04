@@ -41,7 +41,8 @@ test("final cut recovery is creator-scoped durable signal work, not worker-trigg
   const scheduler = source("src/services/job-scheduler.js");
   const locks = source("src/services/campaign-transaction-lock-service.js");
   assert.doesNotMatch(leases, /promoteQueuedCampaignFanRefreshDemands/);
-  assert.match(scheduler, /campaignFanRefreshPromotion[\s\S]*runCampaignFanRefreshPromotionMaintenance/);
+  assert.match(scheduler, /resolveMaintenanceLanes/);
+  assert.equal(require("./maintenance-lane-registry").MAINTENANCE_LANES.find(lane=>lane.name==="campaignFanRefreshPromotion").method,"runCampaignFanRefreshPromotionMaintenance");
   assert.match(queue, /claimCampaignFanRefreshPromotionSignal[\s\S]*FOR UPDATE OF s SKIP LOCKED[\s\S]*LIMIT 1/);
   assert.match(queue, /claimToken[\s\S]*claimUntil/);
   assert.match(queue, /runCampaignFanRefreshPromotionMaintenance[\s\S]*acquireCampaignTransactionLock\(tx, creatorId\)/);
@@ -164,7 +165,8 @@ test("Subscriber publication is restartable bounded work outside generic complet
   assert.match(subscriber, /publicationJobReconciledAt/);
   assert.match(subscriber, /status:\s*\{ in:\s*\["PUBLISHED", "SUPERSEDED"\] \}[\s\S]*publicationStatus:\s*"COMPLETE"[\s\S]*publicationJobReconciledAt:\s*null/);
   assert.match(subscriber, /planSubscriberDerivedAutomation[\s\S]*subscriber_snapshot_recovered/);
-  assert.match(scheduler, /subscriberDirectoryMaintenance[\s\S]*runSubscriberDirectoryMaintenance/);
+  assert.match(scheduler, /resolveMaintenanceLanes/);
+  assert.equal(require("./maintenance-lane-registry").MAINTENANCE_LANES.find(lane=>lane.name==="subscriberDirectoryMaintenance").method,"runSubscriberDirectoryMaintenance");
   assert.match(subscriber, /SUBSCRIBER_RECOVERY_CREATOR_SCOPE_REQUIRED/);
 });
 

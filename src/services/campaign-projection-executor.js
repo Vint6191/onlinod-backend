@@ -7,7 +7,7 @@ const { runCampaignProjectionSweep } = require("./campaign-read-projection-servi
 // At most two commits use the pool concurrently; no recursive unbounded drain.
 function startCampaignProjectionExecutor({db,run=runCampaignProjectionSweep,
   schedule=setTimeout,cancel=clearTimeout,now=Date.now,onError=()=>{},idleMs=1000,budgetMs=2000}={}) {
-  let stopped=false,timer=null;
+  let stopped=false,timer=null,running=null;
   const health={running:false,rounds:0,units:0,seedRows:0,errors:0,lastCompletedAt:null,lastDurationMs:0};
   async function tick(){
     timer=null;if(stopped)return;
@@ -25,11 +25,17 @@ function startCampaignProjectionExecutor({db,run=runCampaignProjectionSweep,
     }catch(error){failed=true;health.errors++;onError(error);}
     finally{
       health.running=false;health.lastCompletedAt=now();health.lastDurationMs=now()-started;
-      if(!stopped)timer=schedule(tick,failed?idleMs:busy?10:idleMs);
+      if(!stopped)timer=schedule(dispatch,failed?idleMs:busy?10:idleMs);
     }
   }
-  timer=schedule(tick,0);
-  return {stop(){stopped=true;if(timer!==null)cancel(timer);timer=null;},snapshot(){return {...health,stopped};}};
+  function dispatch(){
+    if(stopped)return Promise.resolve();
+    if(running)return running;
+    running=tick().finally(()=>{running=null;});
+    return running;
+  }
+  timer=schedule(dispatch,0);
+  return {stop(){stopped=true;if(timer!==null)cancel(timer);timer=null;return running||Promise.resolve();},snapshot(){return {...health,stopped};}};
 }
 
 module.exports={startCampaignProjectionExecutor};

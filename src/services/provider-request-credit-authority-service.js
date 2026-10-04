@@ -35,6 +35,12 @@ const PROVIDER_GATE_BACKGROUND_CATEGORY_CYCLE = Object.freeze([
 const ALLOWED_PRIORITIES = new Set([...new Set(PROVIDER_GATE_PRIORITY_CYCLE)]);
 const ALLOWED_BACKGROUND_CATEGORIES = new Set([...new Set(PROVIDER_GATE_BACKGROUND_CATEGORY_CYCLE)]);
 
+const PROVIDER_GATE_HEAD_PAGE_SIZE = 32;
+const PROVIDER_GATE_BUCKETS = Object.freeze([
+  ...[...ALLOWED_PRIORITIES].filter(priority => priority !== "background").map(priority => Object.freeze({ priority, category: "default" })),
+  ...[...ALLOWED_BACKGROUND_CATEGORIES].map(category => Object.freeze({ priority: "background", category })),
+]);
+
 function clean(value, max = 240) {
   const text = String(value ?? "").trim();
   return text ? text.slice(0, max) : null;
@@ -475,24 +481,48 @@ async function cancelDurableProviderWaiter({ db, waiterId, ownerInstanceId } = {
   return { cancelled: Boolean(row) };
 }
 
-async function deleteExpiredWaiters(tx, authorityNow) {
-  await tx.$queryRawUnsafe(`
-    DELETE FROM "OfProviderRequestGateWaiter"
-    WHERE "leaseUntil" <= $1
-  `, authorityNow);
-}
-
 async function waiterHeads(tx, authorityNow) {
+  // Limit BEFORE filtering expiry: an arbitrary stale prefix cannot make one
+  // admission scan the whole queue under the global gate lock. Eight fixed
+  // buckets x32 ticket rows, backed by the bucket_ticket index.
+  // Full tuple bounds cover exactly one bucket, including every bigint ticket.
+  // Retain all three order keys: equality + ORDER BY ticket alone lets the
+  // planner walk/filter the global PK across entire preceding clustered buckets.
+  // Try-lock only those exact tickets. Heartbeats may lock several waiters in
+  // another order, so never wait on their rows while holding the global gate.
+  // If any prefix row is locked/disappeared, yield the offer instead of jumping
+  // over an unseen FIFO head. Read lease/identity from the locked current row.
   const rows = await tx.$queryRawUnsafe(`
-    SELECT DISTINCT ON (w."priority", w."category")
-      w."waiterId", w."ownerInstanceId", w."agencyId", w."creatorId", w."deviceId",
-      w."capability", w."priority", w."category", w."operation", w."source",
-      w."ticket", w."enqueuedAt", w."leaseUntil"
-    FROM "OfProviderRequestGateWaiter" w
-    WHERE w."leaseUntil" > $1
-    ORDER BY w."priority" ASC, w."category" ASC, w."ticket" ASC
-  `, authorityNow);
-  return Array.isArray(rows) ? rows : (rows ? [rows] : []);
+    SELECT locked.*, prefix."ticket" AS "prefixTicket"
+    FROM jsonb_to_recordset($1::jsonb) AS bucket(priority text,category text)
+    CROSS JOIN LATERAL (
+      SELECT w."ticket" FROM "OfProviderRequestGateWaiter" w
+      WHERE (w."priority",w."category",w."ticket") >= (bucket.priority,bucket.category,'-9223372036854775808'::bigint)
+        AND (w."priority",w."category",w."ticket") <= (bucket.priority,bucket.category,'9223372036854775807'::bigint)
+      ORDER BY w."priority",w."category",w."ticket" LIMIT $2
+    ) prefix
+    LEFT JOIN LATERAL (
+      SELECT w."waiterId", w."ownerInstanceId", w."agencyId", w."creatorId", w."deviceId",
+        w."capability", w."priority", w."category", w."operation", w."source",
+        w."ticket", w."enqueuedAt", w."leaseUntil"
+      FROM "OfProviderRequestGateWaiter" w WHERE w."ticket"=prefix."ticket"
+      FOR UPDATE OF w SKIP LOCKED
+    ) locked ON true
+  `, JSON.stringify(PROVIDER_GATE_BUCKETS), PROVIDER_GATE_HEAD_PAGE_SIZE);
+  if (rows.some(row => !row.waiterId)) return [];
+  const expired = [], heads = new Map();
+  for (const row of rows) {
+    if (new Date(row.leaseUntil).getTime() <= authorityNow.getTime()) { expired.push(row.waiterId); continue; }
+    const key = `${row.priority}:${row.category}`;
+    const prior = heads.get(key);
+    if (!prior || BigInt(row.ticket) < BigInt(prior.ticket)) heads.set(key, row);
+  }
+  if (expired.length) {
+    await tx.$queryRawUnsafe(`DELETE FROM "OfProviderRequestGateWaiter"
+      WHERE "waiterId" IN (SELECT jsonb_array_elements_text($1::jsonb)) AND "leaseUntil" <= $2
+      RETURNING "waiterId"`, JSON.stringify(expired), authorityNow);
+  }
+  return [...heads.values()];
 }
 
 function chooseDurableWaiter(state, heads) {
@@ -560,7 +590,6 @@ async function tryAcquireDurableProviderPermit({
     const state = await lockedState(tx);
     const authorityNow = asDate(state.authorityNow);
     if (!authorityNow) throw new Error("OF_PROVIDER_GATE_DB_TIME_INVALID");
-    await deleteExpiredWaiters(tx, authorityNow);
 
     const callerRows = await tx.$queryRawUnsafe(`
       SELECT "waiterId", "ownerInstanceId", "agencyId", "creatorId", "deviceId", "capability", "priority", "category", "ticket", "leaseUntil"
@@ -847,5 +876,7 @@ module.exports = {
   acknowledgeDurableProviderStarted,
   cancelDurableProviderPermit,
   readDurableProviderGateState,
-  _test: { cycleChoice, chooseDurableWaiter, normalizePriority, normalizeCategory, normalizeFairnessActivationState, fairnessAuthorityFromRow },
+  PROVIDER_GATE_HEAD_PAGE_SIZE,
+  PROVIDER_GATE_BUCKETS,
+  _test: { waiterHeads, cycleChoice, chooseDurableWaiter, normalizePriority, normalizeCategory, normalizeFairnessActivationState, fairnessAuthorityFromRow },
 };

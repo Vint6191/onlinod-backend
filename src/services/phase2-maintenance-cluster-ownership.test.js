@@ -76,13 +76,11 @@ test("Phase2 maintenance ownership: Team dialog projection is exact current work
 
 test("Phase2 maintenance pump owns distributed lanes; process-local promises are overlap optimization only", () => {
   const pump = functionBlock("runPhase2MaintenancePump", "runRecurringSweepInternal");
-  assert.match(pump, /runTelegramConfirmedProjectionMaintenanceSweep\(\{ now, db \}\)/);
-  assert.match(pump, /runTeamMoneyReconciliationSweep\(\{ now, db \}\)/);
-  assert.match(pump, /runTeamReadSummarySweep\(\{ now, db \}\)/);
-  assert.match(pump, /maybeBackfillTeamPendingProjection\(\{ db, now \}\)/);
-  assert.match(pump, /runTelegramInboundProjectionMaintenanceSweep\(\{ now, db \}\)/);
-  assert.match(pump, /maybeBackfillProviderOperationalDebt\(\{ db, now \}\)/);
-  assert.match(pump, /maybeRepairProviderOperationalDirty\(\{ db, now \}\)/);
+  assert.match(pump, /resolveMaintenanceLanes\(\{ db, now \}\)/);
+  const { MAINTENANCE_LANES } = require("./maintenance-lane-registry");
+  for (const method of ["runTelegramConfirmedProjectionMaintenanceSweep", "runTeamMoneyReconciliationSweep", "runTeamReadSummarySweep", "maybeBackfillTeamPendingProjection", "runTelegramInboundProjectionMaintenanceSweep", "maybeBackfillProviderOperationalDebt", "maybeRepairProviderOperationalDirty"]) {
+    assert.equal(MAINTENANCE_LANES.filter(lane => lane.module === "./job-scheduler" && lane.method === method).length, 1);
+  }
   assert.match(scheduler, /PHASE2_MAINTENANCE_PUMP_INTERVAL_MS\s*=\s*5\s*\*\s*1000/);
   assert.match(scheduler, /phase2MaintenanceTimer\s*=\s*setInterval\(phase2MaintenanceTick, PHASE2_MAINTENANCE_PUMP_INTERVAL_MS\)/);
   const recurring = functionBlock("runRecurringSweep", "startRecurringScheduler");

@@ -30,7 +30,6 @@ const { runRetentionSweep, getRetentionSettings } = require("./retention-service
 const { selectPhase2MaintenanceLanes } = require("./phase2-maintenance-admission-service");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { ensureSubscriberScanDue } = require("./subscriber-directory-service");
-const { runSubscriberDirectoryMaintenance } = require("./subscriber-directory-maintenance-service");
 const { ensureAutomaticFollowBack } = require("./follow-back-service");
 const { ensureAutomaticBumps } = require("./bump-service");
 const { ensureAutomaticLikes } = require("./likes-service");
@@ -41,7 +40,6 @@ const { renewDueCreatorSubscriptions } = require("./billing-wallet-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { runMaintenanceLane } = require("./maintenance-work-authority");
-const { runCampaignFanRefreshPromotionMaintenance } = require("./campaign-fan-refresh-queue-service");
 const {
   WORK_CLASS: PHASE2_WORK_CLASS,
   claimDomainWorkBatch,
@@ -2094,41 +2092,11 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
   phase2MaintenancePromise = (async () => {
     // Phase6: durable per-class dispatch progress; domain claims/leases remain
     // inside each lane. A process restart cannot reset the fleet to a clock phase.
-    const lanes = [
-      ["providerCapacityProjection", () => refreshProviderCapacityDebtSnapshot({ db })],
-      ["messageLibraryTrash", () => require("./message-library-lifecycle-service").runMessageLibraryTrashMaintenance({ db })],
-      ["adminBillingPricing", () => require("./admin-bulk-pricing-command-service").runAdminBulkPricingSweep({ db })],
-      ["notificationHistoryRepair", () => require("./notification-history-repair-service").runNotificationHistoryRepairSweep({ db })],
-      ["campaignReadProjection", () => require("./campaign-read-projection-service").seedCampaignProjection({ db })],
-      ["trafficProjection", () => require("./traffic-projection-service").runTrafficProjectionSweep({ db })],
-      ["financialReceiptRetention", () => require("./financial-receipt-retention-service").runSweep({ db })],
-      ["analyticsFactPublication", () => require("./analytics-fact-publication-service").runSweep({ db })],
-      ["analyticsPublication", () => require("./analytics-publication-service").runAnalyticsPublicationSweep({ db })],
-      ["notificationConsequences", () => require("./notification-consequence-service").runNotificationConsequenceSweep({ db })],
-      ["agencyDestructiveCleanup", () => runAgencyDestructiveCleanupSweep({ db, now })],
-      ["creatorDestructiveCleanup", () => runCreatorDestructiveCleanupSweep({ db, now })],
-      ["providerOperationalBackfill", () => maybeBackfillProviderOperationalDebt({ db, now })],
-      ["subscriberDirectoryMaintenance", () => runSubscriberDirectoryMaintenance({ db, now, maxSignals: 16, concurrency: 4, maxRuntimeMs: 5_000, recoveryStepsPerRun: 4, retentionBatch: 50 })],
-      ["creatorRecurringPlanning", () => runRecurringCreatorWork({ db, now })],
-      ["campaignFanRefreshPromotion", () => runCampaignFanRefreshPromotionMaintenance({ db, now, maxCreators: 200, maxJobsPerCreator: 4, concurrency: 4, maxRuntimeMs: 8_000 })],
-      ["dependencyFanout", () => maybeRunPhase2DependencyFanout({ db, now })],
-      ["customReminderWork", () => maybePlanDueCustomReminderWork({ db, now })],
-      ["providerOperationalDirty", () => maybeRepairProviderOperationalDirty({ db, now })],
-      ["telegramConfirmedProjection", () => runTelegramConfirmedProjectionMaintenanceSweep({ now, db })],
-      ["telegramInboundProjection", () => runTelegramInboundProjectionMaintenanceSweep({ now, db })],
-      ["customExternalProofConvergence", () => runCustomExternalProofConvergenceSweep({ now, db })],
-      ["teamMoneyReconciliation", () => runTeamMoneyReconciliationSweep({ now, db })],
-      ["teamReadSummary", () => runTeamReadSummarySweep({ now, db })],
-      ["teamPendingBackfill", () => maybeBackfillTeamPendingProjection({ db, now })],
-      ["teamResponseRangeRepair", () => runTeamResponseRangeRepairSweep({ db, now })],
-      ["teamLegacyPendingRepair", () => maybeRepairLegacyTeamPendingBootstrap({ db, now })],
-    ];
+    const lanes = require("./maintenance-lane-registry").resolveMaintenanceLanes({ db, now });
     const admission = await selectPhase2MaintenanceLanes({
-      db,
-      laneNames: lanes.map(([name]) => name),
-      lanesPerTick: PHASE2_MAINTENANCE_LANES_PER_TICK,
+      db, laneNames: [...lanes.keys()], lanesPerTick: PHASE2_MAINTENANCE_LANES_PER_TICK,
     });
-    const selected = admission.selected.map((name) => lanes.find(([laneName]) => laneName === name)).filter(Boolean);
+    const selected = admission.selected.map(name => [name, lanes.get(name)]);
     const result = { ok: true, admission };
     // Sequential admission deliberately avoids a fixed Promise.all connection burst. Every
     // admitted lane executes one already-bounded work unit, then yields to the next lane.
@@ -2300,9 +2268,21 @@ function getRecurringSchedulerHealthSnapshot() {
   return {
     ...recurringSchedulerHealth,
     ...(analyticsDemandHealth.status === "DEGRADED" ? { status: "DEGRADED", lastReason: analyticsDemandHealth.lastReason } : {}),
+    ...(maintenanceHealth.status === "DEGRADED" ? { status: "DEGRADED", lastReason: maintenanceHealth.lastReason } : {}),
+    maintenance: { ...maintenanceHealth },
     analyticsDemand: { ...analyticsDemandHealth },
     campaignProjection: campaignProjectionExecutor?.snapshot() || null,
     lastDegraded: recurringSchedulerHealth.lastDegraded.map((entry) => ({ ...entry })),
+  };
+}
+
+let maintenanceHealth = { status: "UNKNOWN", lastCompletedAt: null, lastReason: null };
+function handleMaintenanceTickResult(result, error = null) {
+  if (!error && result?.skipped) return;
+  maintenanceHealth = {
+    status: error || result?.ok === false ? "DEGRADED" : "HEALTHY",
+    lastCompletedAt: new Date().toISOString(),
+    lastReason: error ? String(error.code || error.message).slice(0,240) : result?.ok === false ? "maintenance_lane_failed" : null,
   };
 }
 
@@ -2341,6 +2321,14 @@ let recurringTimer = null;
 let analyticsDemandTimer = null;
 let phase2MaintenanceTimer = null;
 let campaignProjectionExecutor = null;
+let schedulerEpoch = 0;
+let schedulerStopPromise = null;
+let analyticsDemandPromise = null;
+const initialSchedulerTimers = new Set();
+function scheduleInitialTick(tick, delay) {
+  const timer = setTimeout(() => { initialSchedulerTimers.delete(timer); tick(); }, delay);
+  initialSchedulerTimers.add(timer);
+}
 
 /**
  * Start the recurring scheduler. Call once at server startup.
@@ -2352,8 +2340,12 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
     return () => stopRecurringScheduler();
   }
 
+  if (schedulerStopPromise) throw new Error("SCHEDULER_STOPPING");
+  require("./maintenance-lane-registry").resolveMaintenanceLanes({ db: prisma });
+  const epoch = ++schedulerEpoch;
   const tick = () => {
-    runRecurringSweep()
+    if (epoch !== schedulerEpoch) return;
+    return runRecurringSweep()
       .then(handleRecurringSweepTickResult)
       .catch((err) => {
         console.error("[scheduler] sweep crashed:", err);
@@ -2363,7 +2355,7 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
   if (runImmediately) {
     // Small delay so DB pool is fully ready and we don't compete with
     // first-request handling for connections.
-    setTimeout(tick, 30 * 1000);
+    scheduleInitialTick(tick, 30 * 1000);
   }
 
   recurringTimer = setInterval(tick, intervalMs);
@@ -2372,16 +2364,21 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
   });
 
   const analyticsDemandTick = () => {
-    runAnalyticsCollectionDemandSweep({ db: prisma })
+    if (epoch !== schedulerEpoch || analyticsDemandPromise) return;
+    analyticsDemandPromise = runAnalyticsCollectionDemandSweep({ db: prisma })
       .then((result) => handleAnalyticsDemandTickResult(result))
-      .catch((err) => handleAnalyticsDemandTickResult(null, err));
+      .catch((err) => handleAnalyticsDemandTickResult(null, err))
+      .finally(() => { analyticsDemandPromise = null; });
+    return analyticsDemandPromise;
   };
-  if (runImmediately) setTimeout(analyticsDemandTick, 2 * 1000);
+  if (runImmediately) scheduleInitialTick(analyticsDemandTick, 2 * 1000);
   analyticsDemandTimer = setInterval(analyticsDemandTick, ANALYTICS_DEMAND_INTERVAL_MS);
 
   const phase2MaintenanceTick = () => {
-    runPhase2MaintenancePump({ db: prisma })
+    if (epoch !== schedulerEpoch) return;
+    return runPhase2MaintenancePump({ db: prisma })
       .then((result) => {
+        handleMaintenanceTickResult(result);
         if (result?.ok !== false) return;
         const degraded = {};
         for (const [name, lane] of Object.entries(result || {})) {
@@ -2398,10 +2395,11 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
         console.error(`[scheduler] Phase2 maintenance degraded: ${JSON.stringify(degraded)}`);
       })
       .catch((err) => {
+        handleMaintenanceTickResult(null, err);
         console.error("[scheduler] Phase2 maintenance pump crashed:", err);
       });
   };
-  if (runImmediately) setTimeout(phase2MaintenanceTick, 5 * 1000);
+  if (runImmediately) scheduleInitialTick(phase2MaintenanceTick, 5 * 1000);
   phase2MaintenanceTimer = setInterval(phase2MaintenanceTick, PHASE2_MAINTENANCE_PUMP_INTERVAL_MS);
 
   console.log(`[scheduler] started (interval=${intervalMs}ms, phase2MaintenanceInterval=${PHASE2_MAINTENANCE_PUMP_INTERVAL_MS}ms, immediate=${runImmediately})`);
@@ -2410,7 +2408,11 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
 }
 
 function stopRecurringScheduler() {
-  campaignProjectionExecutor?.stop();
+  if (schedulerStopPromise) return schedulerStopPromise;
+  ++schedulerEpoch;
+  for (const timer of initialSchedulerTimers) clearTimeout(timer);
+  initialSchedulerTimers.clear();
+  const campaignStopped = campaignProjectionExecutor?.stop();
   campaignProjectionExecutor = null;
   if (recurringTimer) {
     clearInterval(recurringTimer);
@@ -2424,7 +2426,10 @@ function stopRecurringScheduler() {
     clearInterval(phase2MaintenanceTimer);
     phase2MaintenanceTimer = null;
   }
-  console.log("[scheduler] stopped");
+  schedulerStopPromise = Promise.allSettled([recurringSweepPromise, phase2MaintenancePromise, analyticsDemandPromise, campaignStopped])
+    .then(() => { console.log("[scheduler] stopped"); })
+    .finally(() => { schedulerStopPromise = null; });
+  return schedulerStopPromise;
 }
 
 
@@ -2465,6 +2470,7 @@ module.exports = {
   maybeReconcileHistoricalTeamMoney,
   maybeRepairLegacyTeamPendingBootstrap,
   maybeBackfillProviderOperationalDebt,
+  maybeBackfillTeamPendingProjection,
   maybeSeedPhase2CoverageWork,
   maybeRunPhase2HistoricalEnumeration,
   maybePlanDueCustomReminderWork,
@@ -2478,6 +2484,7 @@ module.exports = {
     recordRecurringSchedulerHealth,
     handleRecurringSweepTickResult,
     handleAnalyticsDemandTickResult,
+    handleMaintenanceTickResult,
     wakeDomainDependencyBatch,
   },
 };

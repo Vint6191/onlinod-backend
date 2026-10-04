@@ -13,7 +13,12 @@ const { PGlite } = require(process.env.ONLINOD_PGLITE_MODULE || '@electric-sql/p
 const admission = require('../../src/services/phase2-maintenance-admission-service');
 const lanes = admission.MAINTENANCE_LANE_NAMES;
 const ROOT = path.resolve(__dirname,'../..');
-const migration = fs.readFileSync(path.join(ROOT,'prisma/migrations/20260929154000_phase6_maintenance_progress_v1/migration.sql'),'utf8');
+const migration = fs.readFileSync(path.join(ROOT,'prisma/migrations/20260929154000_phase6_maintenance_progress_v1/migration.sql'),'utf8')
+  + ['20261001000000_analytics_publication_authority_v1','20261001113000_campaign_read_projection_v1'].map(name => {
+    const sql=fs.readFileSync(path.join(ROOT,'prisma/migrations',name,'migration.sql'),'utf8');
+    return '\nBEGIN;\n'+sql.slice(sql.indexOf('INSERT INTO "MaintenanceAdmissionClassState"'));
+  }).join('\n')
+  + fs.readFileSync(path.join(ROOT,'prisma/migrations/20261004220000_maintenance_registry_v4/migration.sql'),'utf8');
 const scheduler = fs.readFileSync(path.join(ROOT,'src/services/job-scheduler.js'),'utf8');
 function adapter(pg,{rollback=false}={}) {
  let transactionOpen=false;const trace=[];
@@ -31,25 +36,26 @@ function adapter(pg,{rollback=false}={}) {
 async function fixture(t) {
  const pg=new PGlite();await pg.waitReady;t.after(()=>pg.close());await pg.exec(migration);
  const fx=adapter(pg);
- return {pg,...fx,adapter:fx,select:(extra={})=>admission.selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes,...extra}),counts:async()=>(await pg.query('SELECT "laneName","turnCount" FROM "MaintenanceAdmissionClassState" ORDER BY "ordinal"')).rows};
+ return {pg,...fx,adapter:fx,select:(extra={})=>admission.selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes,...extra}),counts:async()=>(await pg.query('SELECT "laneName","turnCount" FROM "MaintenanceAdmissionClassState" WHERE generation=\'phase6_maintenance_registry_v4\' ORDER BY "ordinal"')).rows};
 }
 function pumpHarness(db,invoke) {
- const start=scheduler.indexOf('async function runPhase2MaintenancePump(');
- const end=scheduler.indexOf('\nasync function runRecurringSweepInternal',start);
- assert.ok(start>=0&&end>start);
- const block=scheduler.slice(start,end);
- const bindings={db,prisma:db,selectPhase2MaintenanceLanes:admission.selectPhase2MaintenanceLanes,PHASE2_MAINTENANCE_LANES_PER_TICK:5};
- for(const match of block.matchAll(/\["([A-Za-z]+)", \(\) => ([A-Za-z][A-Za-z0-9]+)\(/g)) bindings[match[2]]=()=>invoke(match[1]);
- const modules={
-  './message-library-lifecycle-service':['runMessageLibraryTrashMaintenance','messageLibraryTrash'],
-  './admin-bulk-pricing-command-service':['runAdminBulkPricingSweep','adminBillingPricing'],
-  './notification-history-repair-service':['runNotificationHistoryRepairSweep','notificationHistoryRepair'],
-  './notification-consequence-service':['runNotificationConsequenceSweep','notificationConsequences'],
+ require.cache[path.join(ROOT,'src/prisma.js')]={exports:db};
+ const registry=require('../../src/services/maintenance-lane-registry');
+ const {createRequire}=require('node:module');
+ const load=createRequire(path.join(ROOT,'src/services/maintenance-lane-registry.js'));
+ registry.resolveMaintenanceLanes({db}); // Real exports must exist before stubbing business effects.
+ const pump=require('../../src/services/job-scheduler').runPhase2MaintenancePump;
+ return args=>{
+   const restore=[];
+   try {
+     for(const lane of registry.MAINTENANCE_LANES){
+       const module=load(lane.module),original=module[lane.method];
+       restore.push(()=>{module[lane.method]=original;});
+       module[lane.method]=()=>invoke(lane.name);
+     }
+     return pump(args); // The actual resolver binds every callback before its first await.
+   } finally {restore.reverse().forEach(run=>run());}
  };
- bindings.require=(name)=>{assert.ok(modules[name],name);const [fn,lane]=modules[name];return {[fn]:()=>invoke(lane)};};
- const context=vm.createContext(bindings);
- new vm.Script('let phase2MaintenancePromise=null;\n'+block+'\nglobalThis.pump=runPhase2MaintenancePump;').runInContext(context);
- return context.pump;
 }
 async function restartWorker() {
  const directory=process.argv[3], initialize=process.argv[4]==='initialize';
@@ -62,24 +68,24 @@ async function restartWorker() {
  }finally{await pg.close();}
 }
 function registerTests(){
- test('C1 SQL: same timestamp and 55s alias cannot starve any of 22 classes',async(t)=>{
+ test('C1 SQL: same timestamp and 55s alias cannot starve every registered class',async(t)=>{
   const fx=await fixture(t);const seen=new Set();
   for(let i=0;i<100;i++){
    const r=await fx.select({now:new Date(i%2?0:i*55000),intervalMs:5000});
    assert.equal(r.selected.length,5);assert.equal(new Set(r.selected).size,5);
-   r.selected.forEach(n=>seen.add(n));if(i===4)assert.equal(seen.size,22);
+   r.selected.forEach(n=>seen.add(n));if(i===Math.ceil(lanes.length/5)-1)assert.equal(seen.size,lanes.length);
   }
   const counts=(await fx.counts()).map(r=>Number(r.turnCount));
-  assert.equal(seen.size,22);assert.equal(counts.reduce((a,b)=>a+b,0),500);assert.ok(Math.max(...counts)-Math.min(...counts)<=1);
+  assert.equal(seen.size,lanes.length);assert.equal(counts.reduce((a,b)=>a+b,0),500);assert.ok(Math.max(...counts)-Math.min(...counts)<=1);
   const diagnostics=await admission.readMaintenanceAdmissionProgress({db:{$queryRawUnsafe:async(sql,...params)=>(await fx.pg.query(sql,params)).rows}});
-  assert.equal(diagnostics.minimumTurns,'22');assert.equal(diagnostics.maximumTurns,'23');assert.equal(diagnostics.spread,'1');assert.equal(diagnostics.readOnly,true);
+  assert.equal(diagnostics.minimumTurns,String(Math.floor(500/lanes.length)));assert.equal(diagnostics.maximumTurns,String(Math.ceil(500/lanes.length)));assert.equal(diagnostics.spread,'1');assert.equal(diagnostics.readOnly,true);
 
  });
  test('C1 SQL: 100 fresh client wrappers share progress (serialized WASM backend)',async(t)=>{
   const fx=await fixture(t);const all=await Promise.all(Array.from({length:100},()=>{
    const client=adapter(fx.pg);return admission.selectPhase2MaintenanceLanes({db:client.db,laneNames:lanes});
   }));
-  assert.equal(new Set(all.flatMap(r=>r.selected)).size,22);
+  assert.equal(new Set(all.flatMap(r=>r.selected)).size,lanes.length);
   assert.ok(all.every(r=>r.selected.length===5&&new Set(r.selected).size===5));
   assert.equal((await fx.counts()).reduce((n,r)=>n+Number(r.turnCount),0),500);
  });
@@ -98,13 +104,13 @@ function registerTests(){
  test('C1 SQL: an abandoned committed offer does not suppress a class forever',async(t)=>{
   const fx=await fixture(t);const abandoned=await fx.select();const seen=new Set();
   for(let i=0;i<9;i++)(await fx.select()).selected.forEach(n=>seen.add(n));
-  assert.ok(abandoned.selected.every(n=>seen.has(n)));assert.equal(seen.size,22);
+  assert.ok(abandoned.selected.every(n=>seen.has(n)));assert.equal(seen.size,lanes.length);
  });
  test('C1 actual pump: callback executes after admission transaction; failure does not reset fairness',async(t)=>{
   const fx=await fixture(t);const called=[];
   const pump=pumpHarness(fx.db,async(name)=>{assert.equal(fx.adapter.transactionOpen,false);called.push(name);throw Error('controlled lane failure');});
-  for(let i=0;i<5;i++){const r=await pump({db:fx.db,now:new Date(i*55000)});assert.equal(r.ok,false);assert.equal(r.admission.selected.length,5);}
-  assert.equal(new Set(called).size,22);assert.equal(called.length,25);
+  for(let i=0;i<Math.ceil(lanes.length/5);i++){const r=await pump({db:fx.db,now:new Date(i*55000)});assert.equal(r.ok,false);assert.equal(r.admission.selected.length,5);}
+  assert.equal(new Set(called).size,lanes.length);assert.equal(called.length,Math.ceil(lanes.length/5)*5);
  });
  test('C1 actual pump: local overlap skips; a separate replica still advances progress',async(t)=>{
   const fx=await fixture(t);let started,finish;

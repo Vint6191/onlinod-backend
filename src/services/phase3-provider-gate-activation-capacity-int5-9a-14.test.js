@@ -173,6 +173,7 @@ test("A14 physical capacity math proves 72h is a deadline signal, not a universa
 
 test("A14 directory read status becomes explicitly OVERDUE without pretending source freshness", () => {
   const state = capacity.campaignDirectoryDiscoveryCapacityState({
+    campaignDirectoryRequestedAt: new Date("2026-09-15T00:00:00Z"),
     campaignDirectoryVerifiedAt: new Date("2026-09-15T00:00:00Z"),
     campaignDirectoryDiscoveryDueAt: new Date("2026-09-18T00:00:00Z"),
     campaignDirectoryDiscoveryRequestedRevision: 3,

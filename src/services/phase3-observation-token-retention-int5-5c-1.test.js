@@ -77,16 +77,12 @@ test("INT5.5C-1 consumed observation tokens are physically removed and replay fa
   }), /FAN_OBSERVATION_TOKEN_INVALID/);
 });
 
-test("INT5.5C-1 abandoned token cleanup is time bounded and preserves live tokens", async () => {
-  const now = new Date("2026-09-17T12:00:00.000Z");
-  const db = tokenDb([
-    { token: "stale", createdAt: new Date(now.getTime() - FAN_OBSERVATION_TOKEN_STALE_RETENTION_MS - 1) },
-    { token: "edge", createdAt: new Date(now.getTime() - FAN_OBSERVATION_TOKEN_STALE_RETENTION_MS) },
-    { token: "live", createdAt: new Date(now.getTime() - 60_000) },
-  ]);
-  const result = await cleanupStaleFanObservationTokens(db, { now, force: true });
-  assert.equal(result.deleted, 1);
-  assert.deepEqual(db.state.map((row) => row.token).sort(), ["edge", "live"]);
+test("INT5.5C-1 mint never performs global retention; compatibility cleanup requires its own transaction", async () => {
+  await assert.rejects(cleanupStaleFanObservationTokens(tokenDb([])), { code: "DB_COMMIT_ROOT_REQUIRED" });
+  const source = fs.readFileSync(path.join(__dirname, "fan-observation-token-service.js"), "utf8");
+  const mint = source.slice(source.indexOf("async function createScopedFanObservationToken"), source.indexOf("async function consumeScopedFanObservationToken"));
+  assert.doesNotMatch(mint, /cleanupStale|deleteMany|Retention/);
+  assert.equal(FAN_OBSERVATION_TOKEN_STALE_RETENTION_MS, 86400000);
 });
 
 test("INT5.5C-1 token retention has a createdAt index and remains one authority table", () => {
@@ -96,5 +92,5 @@ test("INT5.5C-1 token retention has a createdAt index and remains one authority 
   assert.match(schema, /model FanObservationToken[\s\S]*@@index\(\[createdAt\]\)/);
   assert.match(migration, /FanObservationToken_createdAt_idx/);
   assert.match(service, /deleteMany\(\{ where: consumeWhere \}\)/);
-  assert.match(service, /FAN_OBSERVATION_TOKEN_STALE_RETENTION_MS\s*=\s*24\s*\*\s*60\s*\*\s*60_000/);
+  assert.match(schema, /@@index\(\[createdAt, id\], map: "FanObservationToken_expiry_id_idx"\)/);
 });

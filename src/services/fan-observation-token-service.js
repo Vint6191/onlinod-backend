@@ -2,10 +2,8 @@
 
 const crypto = require("node:crypto");
 
-const FAN_OBSERVATION_TOKEN_STALE_RETENTION_MS = 24 * 60 * 60_000;
-const FAN_OBSERVATION_TOKEN_CLEANUP_INTERVAL_MS = 5 * 60_000;
+const { runFanObservationTokenRetention, FAN_OBSERVATION_TOKEN_STALE_RETENTION_MS } = require("./background-retention-service");
 const FAN_OBSERVATION_TOKEN_MAX_SUBJECTS = 500;
-let nextFanObservationTokenCleanupAt = 0;
 
 function clean(value, max = 500) {
   const out = String(value ?? "").trim();
@@ -63,17 +61,10 @@ function tokenOwner({ jobId = null, deliveryId = null }) {
   return { jobId: normalizedJobId, deliveryId: normalizedDeliveryId };
 }
 
-async function cleanupStaleFanObservationTokens(db, { now = new Date(), force = false } = {}) {
-  const deleteMany = db?.fanObservationToken?.deleteMany;
-  if (typeof deleteMany !== "function") return { deleted: 0, skipped: true };
-  const authorityNow = now instanceof Date ? now : new Date(now);
-  const nowMs = authorityNow.getTime();
-  if (!Number.isFinite(nowMs)) throw new Error("FAN_OBSERVATION_TOKEN_CLEANUP_TIME_INVALID");
-  if (!force && nowMs < nextFanObservationTokenCleanupAt) return { deleted: 0, skipped: true };
-  const cutoff = new Date(nowMs - FAN_OBSERVATION_TOKEN_STALE_RETENTION_MS);
-  const result = await db.fanObservationToken.deleteMany({ where: { createdAt: { lt: cutoff } } });
-  nextFanObservationTokenCleanupAt = nowMs + FAN_OBSERVATION_TOKEN_CLEANUP_INTERVAL_MS;
-  return { deleted: Number(result?.count || 0), skipped: false, cutoff };
+// Compatibility entry point is bounded and requires its own root transaction.
+// Token minting/consumption never invokes retention.
+function cleanupStaleFanObservationTokens(db) {
+  return runFanObservationTokenRetention({ db });
 }
 
 async function createScopedFanObservationToken({ db, jobId = null, deliveryId = null, agencyId = null, creatorId = null, deviceId, leaseRevision, purpose, subjects }) {
@@ -86,7 +77,6 @@ async function createScopedFanObservationToken({ db, jobId = null, deliveryId = 
   }
   if (!normalizedSubjects.length) throw new Error("FAN_OBSERVATION_TOKEN_SUBJECT_REQUIRED");
   const scopeHash = observationScopeHash({ purpose: normalizedPurpose, subjects: normalizedSubjects });
-  await cleanupStaleFanObservationTokens(db);
   const observedAt = await nextObservationTime(db, { creatorId: normalizedCreatorId });
   const token = crypto.randomBytes(32).toString("base64url");
   await db.fanObservationToken.create({
@@ -258,6 +248,5 @@ module.exports = {
   consumeActionFanObservationToken,
   cleanupStaleFanObservationTokens,
   FAN_OBSERVATION_TOKEN_STALE_RETENTION_MS,
-  FAN_OBSERVATION_TOKEN_CLEANUP_INTERVAL_MS,
   FAN_OBSERVATION_TOKEN_MAX_SUBJECTS,
 };

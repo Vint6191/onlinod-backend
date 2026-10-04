@@ -106,7 +106,7 @@ test("A13 migration creates typed waiter authority, durable cursors and rolling 
 
 test("A13 authority prunes expired dead-process waiters before winner selection", () => {
   const source = fs.readFileSync(path.join(__dirname, "provider-request-credit-authority-service.js"), "utf8");
-  assert.match(source, /DELETE FROM "OfProviderRequestGateWaiter"[\s\S]*"leaseUntil" <= \$1/);
+  assert.match(source, /DELETE FROM "OfProviderRequestGateWaiter"[\s\S]*"leaseUntil" <= \$2/);
   assert.match(source, /PROVIDER_GATE_WAITER_LEASE_MS/);
   assert.match(source, /PROVIDER_GATE_WAITER_HEARTBEAT_MS/);
   assert.match(source, /WHERE "ownerInstanceId" = \$1[\s\S]*"waiterId" IN \(SELECT jsonb_array_elements_text\(\$2::jsonb\)\)[\s\S]*"leaseUntil" > clock_timestamp\(\)/);
@@ -127,4 +127,36 @@ test("A13 durable permit acquisition rejects arbitrary permit ids that are not t
     }),
     (error) => error?.code === "OF_PROVIDER_GATE_WAITER_PERMIT_REQUIRED",
   );
+});
+
+test("S2 a contended or disappeared prefix head yields without bypassing FIFO or pruning unlocked rows", async () => {
+  const credit = require("./provider-request-credit-authority-service");
+  let calls = 0;
+  const now = new Date("2026-10-04T00:00:00Z");
+  // Query-boundary fixture, not a native PostgreSQL contention simulation.
+  const tx = { async $queryRawUnsafe(sql, ...args) {
+    calls++;
+    assert.equal(calls, 1, "a missing lock prevents every subsequent prune/grant");
+    assert.match(sql, /LEFT JOIN LATERAL[\s\S]*FOR UPDATE OF w SKIP LOCKED/);
+    assert.equal(JSON.parse(args[0]).length, 8); assert.equal(args[1], 32);
+    return [{ prefixTicket: 1n, waiterId: null }, { prefixTicket: 2n, ticket: 2n, waiterId: "later", priority: "normal", category: "default", leaseUntil: new Date(+now + 60000) }];
+  } };
+  assert.deepEqual(await credit._test.waiterHeads(tx, now), []);
+});
+
+test("S2 renewed current lease preserves the earliest exact bigint ticket; cleanup only removes observed expired IDs", async () => {
+  const credit = require("./provider-request-credit-authority-service");
+  const now = new Date("2026-10-04T00:00:00Z"), future = new Date(+now + 10000);
+  let calls = 0;
+  const tx = { async $queryRawUnsafe(sql, ...args) {
+    if (++calls === 1) return [
+      { waiterId: "later", ticket: 9007199254740994n, priority: "normal", category: "default", leaseUntil: future },
+      { waiterId: "renewed", ticket: 9007199254740993n, priority: "normal", category: "default", leaseUntil: future },
+      { waiterId: "expired", ticket: 4n, priority: "background", category: "fan_data", leaseUntil: now },
+    ];
+    assert.deepEqual(JSON.parse(args[0]), ["expired"]); assert.equal(args[1], now);
+    assert.match(sql, /"waiterId" IN[\s\S]*"leaseUntil" <= \$2/); return [];
+  } };
+  const heads = await credit._test.waiterHeads(tx, now);
+  assert.equal(calls, 2); assert.equal(heads.length, 1); assert.equal(heads[0].waiterId, "renewed");
 });

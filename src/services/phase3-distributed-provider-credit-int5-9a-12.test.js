@@ -52,9 +52,9 @@ function fakeDurableDb(start = new Date("2038-02-03T04:05:06.000Z")) {
         db.waiters.set(waiterId, row);
         return [{ ...row }];
       }
-      if (/DELETE FROM "OfProviderRequestGateWaiter"[\s\S]*"leaseUntil" <= \$1/.test(text)) {
-        const cutoff = args[0];
-        for (const [id, row] of db.waiters) if (row.leaseUntil <= cutoff) db.waiters.delete(id);
+      if (/DELETE FROM "OfProviderRequestGateWaiter"[\s\S]*jsonb_array_elements_text/.test(text)) {
+        const ids = JSON.parse(args[0]), cutoff = args[1];
+        for (const id of ids) if (db.waiters.get(id)?.leaseUntil <= cutoff) db.waiters.delete(id);
         return [];
       }
       if (/SELECT "waiterId", "ownerInstanceId"[\s\S]*WHERE "waiterId" = \$1/.test(text)) {
@@ -62,16 +62,10 @@ function fakeDurableDb(start = new Date("2038-02-03T04:05:06.000Z")) {
         if (!row || row.leaseUntil <= args[1]) return [];
         return [{ ...row }];
       }
-      if (/SELECT DISTINCT ON \(w\."priority", w\."category"\)/.test(text)) {
-        const cutoff = args[0];
-        const heads = new Map();
-        for (const row of db.waiters.values()) {
-          if (row.leaseUntil <= cutoff) continue;
-          const key = `${row.priority}:${row.category}`;
-          const prev = heads.get(key);
-          if (!prev || row.ticket < prev.ticket) heads.set(key, row);
-        }
-        return [...heads.values()].map((row) => ({ ...row }));
+      if (/CROSS JOIN LATERAL/.test(text)) {
+        return JSON.parse(args[0]).flatMap(bucket => [...db.waiters.values()]
+          .filter(row => row.priority === bucket.priority && row.category === bucket.category)
+          .sort((a,b) => a.ticket < b.ticket ? -1 : 1).slice(0,args[1]).map(row => ({...row})));
       }
       if (/DELETE FROM "OfProviderRequestGateWaiter"[\s\S]*"waiterId" = \$1 AND "ownerInstanceId" = \$2/.test(text)) {
         const row = db.waiters.get(args[0]);
@@ -211,6 +205,7 @@ function liveGateDb() {
   db.$queryRawUnsafe = async (sql, ...args) => {
     const text = String(sql);
     if (/SELECT\s+clock_timestamp\(\)\s+AS\s+"authorityNow"/i.test(text) && !/OfProviderRequestGateState/.test(text)) return [{ authorityNow: new Date() }];
+    if (/FROM "Agency" a CROSS JOIN clock/.test(text)) return args[1].map(creatorId => ({creatorId,authorityNow:new Date(),billingMode:"FREE_INTERNAL",deletedAt:null,billingSupportHold:false}));
     return raw(sql, ...args);
   };
   db.workerDevice = { findFirst: async ({ where }) => ({ id: where.id, userId: where.userId, agencyId: "agency-1", lastSeenAt: new Date() }) };
