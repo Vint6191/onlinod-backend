@@ -1,5 +1,7 @@
 "use strict";
 
+const { boundedFanIds } = require("./fan-data-input");
+
 const { readFanCurrent } = require("./fan-data-authority-service");
 const { evaluateCandidate, subscriptionBucket } = require("./follow-back-rules");
 const { evaluateRefollowCandidate } = require("./follow-automation-rules");
@@ -257,7 +259,7 @@ async function assertFanCurrentFieldFence({ db, agencyId, fence }) {
 
 
 async function readFanCurrentMap(db, { agencyId, creatorId, fanIds = [] } = {}) {
-  const ids = [...new Set((fanIds || []).map(key).filter(Boolean))];
+  const ids = boundedFanIds(fanIds, "FAN_DATA_CURRENT_REQUEST_TOO_LARGE");
   if (!ids.length) return new Map();
   const rows = await readFanCurrent(db, { agencyId, creatorId, onlyFansUserIds: ids });
   return new Map(rows.map((row) => [key(row.onlyFansUserId), row]));

@@ -19,7 +19,7 @@ function capacityDb({ pendingGlobal, pendingCreator }) {
     locks,
     $executeRawUnsafe: async (sql, key) => { locks.push({ sql: String(sql), key }); return 1; },
     $queryRawUnsafe: async (sql, creatorId) => {
-      assert.match(String(sql), /status" IN \('SCHEDULED','CLAIMED'\)/);
+      assert.match(String(sql), /status" IN \('SCHEDULED','CLAIMED','PUBLISHING'\)/);
       assert.equal(creatorId, "creator-a");
       return [{ pendingGlobal: BigInt(pendingGlobal), pendingCreator: BigInt(pendingCreator) }];
     },
@@ -48,7 +48,10 @@ test("A12 saturated campaign refresh scheduling preserves durable demand and wor
   const workUpdates = [];
   let plannerCalls = 0;
   const db = {
-    $executeRawUnsafe: async () => 1,
+    $executeRawUnsafe: async (sql, ...args) => {
+      if (String(sql).includes('UPDATE "CreatorCampaignFanRefreshWork"')) workUpdates.push({ sql: String(sql), args });
+      return 1;
+    },
     $queryRawUnsafe: async (sql, ...args) => {
       if (/FROM "JobInstance"/.test(String(sql))) return [{ pendingGlobal: BigInt(FAN_DATA_REFRESH_MAX_PENDING_JOBS), pendingCreator: 0n }];
       if (/INSERT INTO "CampaignFanRefreshPromotionSignal"/.test(String(sql))) {
@@ -79,12 +82,14 @@ test("A12 saturated campaign refresh scheduling preserves durable demand and wor
   assert.equal(demandUpdates.length, 1);
   assert.deepEqual(demandUpdates[0].data, { activeRefreshJobId: null, activeRefreshRevision: null, status: "QUEUED" });
   assert.equal(workUpdates.length, 1);
-  assert.deepEqual(workUpdates[0].data, { refreshJobId: null });
+  assert.match(workUpdates[0].sql, /SET "refreshJobId"=NULL/);
+  assert.match(workUpdates[0].sql, /target\."status"='QUEUED'/);
+  assert.deepEqual(workUpdates[0].args, ["creator-a", ["d1", "d2"]]);
 });
 
 test("A12/final cut job claim never runs global Campaign promotion; bounded maintenance owns durable signals", () => {
   const leaseSource = fs.readFileSync(path.join(__dirname, "job-lease-service.js"), "utf8");
-  const schedulerSource = fs.readFileSync(path.join(__dirname, "job-scheduler.js"), "utf8");
+  const schedulerSource = fs.readFileSync(path.join(__dirname, "maintenance-lane-registry.js"), "utf8");
   const queue = fs.readFileSync(path.join(__dirname, "campaign-fan-refresh-queue-service.js"), "utf8");
   assert.doesNotMatch(leaseSource, /promoteQueuedCampaignFanRefreshDemands|runCampaignFanRefreshPromotionMaintenance/);
   assert.match(schedulerSource, /campaignFanRefreshPromotion[\s\S]*runCampaignFanRefreshPromotionMaintenance/);
@@ -103,7 +108,14 @@ test("A12/final cut creator-scoped promoter rematerializes bounded oldest debt o
   const db = {
     jobInstance: {},
     $executeRawUnsafe: async () => 1,
-    $queryRawUnsafe: async (sql, creatorId) => {
+    creatorCampaignCollectionState: { findUnique: async () => ({ fanValueCoverageScanRunId: 'current-run' }) },
+    $queryRawUnsafe: async (sql, creatorId, limit) => {
+      if (/FROM "CreatorFanRefreshDemand"/.test(String(sql))) {
+        assert.equal(creatorId, 'creator-a'); assert.equal(limit, 100);
+        assert.match(String(sql), /"status"='QUEUED' AND "activeRefreshJobId" IS NULL/);
+        assert.match(String(sql), /ORDER BY "lastRequestedAt","id" LIMIT/);
+        return rows;
+      }
       if (/FROM "JobInstance"/.test(String(sql))) {
         assert.equal(creatorId, "creator-a");
         return [{ pendingGlobal: 0n, pendingCreator: 0n }];

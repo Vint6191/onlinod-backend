@@ -1,4 +1,6 @@
 "use strict";
+
+const { exactFanId, boundedFanIds } = require("./fan-data-input");
 const { runDbTransaction } = require("./db-transaction-service");
 
 
@@ -39,7 +41,7 @@ function text(value, max = 500) {
 }
 function onlyFansUserId(value) {
   // OF ids are domain identifiers, not JavaScript numbers. Keep them opaque.
-  return text(value, 180);
+  return exactFanId(value);
 }
 function date(value) {
   if (value instanceof Date && Number.isFinite(value.getTime())) return value;
@@ -1505,8 +1507,11 @@ async function scheduleDurableFanDataRefreshDebt({
   params = {},
   scheduleFanRefresh = scheduleFanDataPointRefresh,
 } = {}) {
-  const ids = [...new Set((fanIds || []).map(onlyFansUserId).filter(Boolean))].sort().slice(0, FAN_DATA_POINT_REFRESH_MAX_FANS);
+  let ids;
+  try { ids = boundedFanIds(fanIds, "FAN_DATA_POINT_REFRESH_TOO_LARGE").sort(); }
+  catch (error) { return { fanIds: [], requested: Array.isArray(fanIds) ? fanIds.length : 0, durable: false, decision: null, error: error.code }; }
   if (!ids.length) return { fanIds: [], requested: 0, durable: true, decision: null };
+  if (!Array.isArray(refreshFields) || refreshFields.length > 32) return { fanIds: ids, requested: ids.length, durable: false, decision: null, error: "FAN_DATA_FIELDS_TOO_LARGE" };
   const fields = [...new Set((refreshFields || []).map((value) => text(value, 120)).filter(Boolean))].sort();
   try {
     const decision = await scheduleFanRefresh({
@@ -1543,14 +1548,7 @@ async function scheduleDurableFanDataRefreshDebt({
 
 async function scheduleFanDataPointRefresh({ db = null, agencyId, creatorId, onlyFansUserIds = [], reason = "fan_data_point_refresh", priority = 95, now = new Date(), params = {} } = {}) {
   if (!text(agencyId, 180) || !text(creatorId, 180)) return { created: false, reason: "missing_scope" };
-  const ids = [...new Set((onlyFansUserIds || []).map(onlyFansUserId).filter(Boolean))].sort();
-  if (ids.length > FAN_DATA_POINT_REFRESH_MAX_FANS) {
-    throw new FanDataObservationBoundaryError(
-      "FAN_DATA_POINT_REFRESH_TOO_LARGE",
-      `Fan data point refresh exceeds ${FAN_DATA_POINT_REFRESH_MAX_FANS} fans`,
-      413,
-    );
-  }
+  const ids = boundedFanIds(onlyFansUserIds, "FAN_DATA_POINT_REFRESH_TOO_LARGE").sort();
   if (!ids.length) return { created: false, reason: "no_fan_ids" };
   const { ensureSingleJob } = require("./job-scheduler");
   // Generic creator-wide coalescing would drop a second refresh batch while a
@@ -1565,6 +1563,7 @@ async function scheduleFanDataPointRefresh({ db = null, agencyId, creatorId, onl
   const consumerHash = consumerIdentity
     ? crypto.createHash("sha256").update(consumerIdentity).digest("hex").slice(0, 12)
     : null;
+  if (params?.refreshFields !== undefined && (!Array.isArray(params.refreshFields) || params.refreshFields.length > 32)) throw Object.assign(new Error("FAN_DATA_FIELDS_TOO_LARGE"), { code: "FAN_DATA_FIELDS_TOO_LARGE", status: 413 });
   const refreshFieldSet = [...new Set((Array.isArray(params?.refreshFields) ? params.refreshFields : [])
     .map((value) => text(value, 120))
     .filter(Boolean))].sort();
@@ -1592,7 +1591,7 @@ async function scheduleFanDataPointRefresh({ db = null, agencyId, creatorId, onl
 
 
 async function readFanCurrent(db, { agencyId, creatorId, onlyFansUserIds }) {
-  const ids = [...new Set((onlyFansUserIds || []).map(onlyFansUserId).filter(Boolean))];
+  const ids = boundedFanIds(onlyFansUserIds, "FAN_DATA_CURRENT_REQUEST_TOO_LARGE");
   if (!ids.length) return [];
   const fans = await db.creatorFan.findMany({
     where: { agencyId, creatorId, onlyFansUserId: { in: ids } },

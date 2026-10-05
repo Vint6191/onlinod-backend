@@ -1,5 +1,9 @@
 "use strict";
 
+const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-service");
+const { fanDataRefreshScheduleAvailable, FAN_DATA_REFRESH_SCHEDULE_LOCK_KEY } = require("./provider-capacity-authority-service");
+const { boundedFanIds } = require("./fan-data-input");
+
 const prisma = require("../prisma");
 const { AsyncLocalStorage } = require("node:async_hooks");
 const { publishDesktopControlEvent } = require("./desktop-control-events");
@@ -136,13 +140,13 @@ function scheduledResetData({
   return data;
 }
 
-async function createPlannedJob({ db = prisma, publish = true, ...input } = {}) {
+async function createPlannedJobUnchecked({ db = prisma, publish = true, ...input } = {}) {
   const job = await db.jobInstance.create({ data: scheduledCreateData(input) });
   if (publish) publishPlannedJobAvailable(job);
   return job;
 }
 
-async function createPlannedJobIfAbsent({ db = prisma, publish = true, ...input } = {}) {
+async function createPlannedJobIfAbsentUnchecked({ db = prisma, publish = true, ...input } = {}) {
   const data = scheduledCreateData(input);
   if (!data.idempotencyKey) {
     const job = await db.jobInstance.create({ data });
@@ -169,7 +173,7 @@ async function createPlannedJobIfAbsent({ db = prisma, publish = true, ...input 
   return { job, created: inserted, reason: inserted ? "created" : "idempotency_reused" };
 }
 
-async function reschedulePlannedJob({
+async function reschedulePlannedJobUnchecked({
   db = prisma,
   job,
   jobId = job?.id,
@@ -300,3 +304,46 @@ module.exports = {
   updatePlannedJobDemand,
   ensurePlannedJob,
 };
+
+async function withFanRefreshAdmission(input, work, reuseDemand = false) {
+  const db = input.db || prisma;
+  let identity = input.job;
+  if (!identity?.jobKey && input.jobId) identity = await db.jobInstance.findUnique({ where: { id: input.jobId } });
+  if ((input.jobKey || identity?.jobKey) !== "fan_data_point_refresh") return work(input);
+  const params = input.params ?? identity?.params ?? {};
+  const ids = boundedFanIds(params.fanIds ?? [], "FAN_DATA_POINT_REFRESH_TOO_LARGE");
+  if (!ids.length) throw Object.assign(new Error("FAN_DATA_REFRESH_FANS_REQUIRED"), { code: "FAN_DATA_REFRESH_FANS_REQUIRED", status: 400 });
+  const creatorId = input.creatorId || identity?.creatorId;
+  if (!creatorId) throw Object.assign(new Error("FAN_DATA_REFRESH_SCOPE_REQUIRED"), { code: "FAN_DATA_REFRESH_SCOPE_REQUIRED", status: 400 });
+  return runDbTransaction(db, async tx => {
+    if (currentCommitContext()?.isolationLevel === "RepeatableRead") throw Object.assign(new Error("FAN_DATA_ADMISSION_ISOLATION_UNSUPPORTED"), { code: "FAN_DATA_ADMISSION_ISOLATION_UNSUPPORTED" });
+    // Recheck current state after acquiring the global scheduling lock. Keeping
+    // the count and write in this transaction makes the limit cross-worker.
+    await lockDbAdvisoryXact({ db: tx, key: FAN_DATA_REFRESH_SCHEDULE_LOCK_KEY });
+    const current = identity?.id
+      ? await tx.jobInstance.findUnique({ where: { id: identity.id } })
+      : input.idempotencyKey ? await tx.jobInstance.findUnique({ where: { idempotencyKey: input.idempotencyKey } }) : null;
+    if (reuseDemand && !identity) {
+      if (current) return { job: current, created: false, reason: "idempotency_reused" };
+      // The pending set is globally bounded. Filter before LIMIT so old pending
+      // demand cannot disappear behind 20 newer terminal jobs or a bucket change.
+      if (typeof params.rangeKey === "string" && params.rangeKey) {
+        const pending = await tx.jobInstance.findFirst({ where: {
+          jobKey: "fan_data_point_refresh", creatorId, agencyId: input.agencyId,
+          status: { in: ["SCHEDULED", "CLAIMED", "PUBLISHING"] }, params: { path: ["rangeKey"], equals: params.rangeKey },
+        } });
+        if (pending && JSON.stringify(boundedFanIds(pending.params?.fanIds ?? []).sort()) === JSON.stringify([...ids].sort())) return { job: pending, created: false, reason: "idempotency_reused" };
+      }
+    }
+    const replayCreate = !identity && current;
+    const alreadyPending = current && ["SCHEDULED", "CLAIMED", "PUBLISHING"].includes(current.status);
+    if (!replayCreate && !alreadyPending) {
+      const capacity = await fanDataRefreshScheduleAvailable(tx, creatorId);
+      if (!capacity.available) throw Object.assign(new Error("FAN_DATA_REFRESH_BACKLOG_FULL"), { code: "FAN_DATA_REFRESH_BACKLOG_FULL", status: 503, retryable: true });
+    }
+    return work({ ...input, ...(identity && !input.job ? { job: identity } : {}), db: tx, params: { ...params, fanIds: ids } });
+  });
+}
+async function createPlannedJob(input = {}) { return withFanRefreshAdmission(input, createPlannedJobUnchecked); }
+async function createPlannedJobIfAbsent(input = {}) { return withFanRefreshAdmission(input, createPlannedJobIfAbsentUnchecked, true); }
+async function reschedulePlannedJob(input = {}) { return withFanRefreshAdmission(input, reschedulePlannedJobUnchecked); }

@@ -367,6 +367,7 @@ async function planFollowBackLocked({ db, agencyId, creatorId, userId, fanId = n
 }
 
 async function scheduleFollowBackCurrentRefresh({
+  db = prisma,
   agencyId,
   creatorId,
   fanIds = [],

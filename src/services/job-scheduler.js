@@ -560,6 +560,12 @@ async function ensureSingleJob({ db = prisma, jobKey, creatorId, agencyId, param
     scheduledAt: now,
     nextRunAt: now,
   });
+  if (jobKey === "fan_data_point_refresh" && !planned.created) {
+    const job = planned.job;
+    if (["SCHEDULED", "CLAIMED", "PUBLISHING"].includes(job?.status)) return { created: false, reason: "already_in_flight", jobId: job.id };
+    if (job?.status === "DONE" && job.completedAt > new Date(now.getTime() - window)) return { created: false, reason: "recently_done", jobId: job.id };
+    return { created: false, reason: `same_bucket_${String(job?.status || "unknown").toLowerCase()}`, jobId: job?.id || null };
+  }
   return planned.created
     ? { created: true, jobId: planned.job?.id || null }
     : { created: false, reason: "idempotency_race", jobId: planned.job?.id || null };

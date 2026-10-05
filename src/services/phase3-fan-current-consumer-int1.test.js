@@ -221,7 +221,7 @@ test("Phase3 Likes point refresh request is one bounded deduplicated batch, neve
   const { scheduleLikesCurrentRefresh } = require("./likes-service");
   const calls = [];
   const fanIds = [];
-  for (let index = 0; index < 620; index += 1) fanIds.push(`fan-${index}`);
+  for (let index = 0; index < 497; index += 1) fanIds.push(`fan-${index}`);
   fanIds.push("fan-1", "fan-2", "fan-3");
 
   const result = await scheduleLikesCurrentRefresh({
@@ -231,18 +231,18 @@ test("Phase3 Likes point refresh request is one bounded deduplicated batch, neve
     priority: 40,
     scheduleFanRefresh: async (input) => {
       calls.push(input);
-      return { created: true, id: "refresh-job-1" };
+      return { created: true, jobId: "refresh-job-1" };
     },
   });
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].onlyFansUserIds.length, 500);
-  assert.equal(new Set(calls[0].onlyFansUserIds).size, 500);
+  assert.equal(calls[0].onlyFansUserIds.length, 497);
+  assert.equal(new Set(calls[0].onlyFansUserIds).size, 497);
   assert.equal(calls[0].reason, "likes_current_unknown");
   assert.equal(calls[0].priority, 85);
   assert.deepEqual(calls[0].params, { consumer: "likes", trigger: "planning" });
-  assert.equal(result.requested, 500);
-  assert.equal(result.fanIds.length, 500);
+  assert.equal(result.requested, 497);
+  assert.equal(result.fanIds.length, 497);
 });
 
 test("Phase3 Likes planning collects only refresh-required current failures before out-of-transaction scheduling", () => {
@@ -324,7 +324,7 @@ test("Phase3 Follow Back point refresh request is one bounded deduplicated batch
   const { scheduleFollowBackCurrentRefresh } = require("./follow-back-service");
   const calls = [];
   const fanIds = [];
-  for (let index = 0; index < 620; index += 1) fanIds.push(`follow-fan-${index}`);
+  for (let index = 0; index < 498; index += 1) fanIds.push(`follow-fan-${index}`);
   fanIds.push("follow-fan-1", "follow-fan-2");
 
   const result = await scheduleFollowBackCurrentRefresh({
@@ -335,17 +335,17 @@ test("Phase3 Follow Back point refresh request is one bounded deduplicated batch
     trigger: "planning",
     scheduleFanRefresh: async (input) => {
       calls.push(input);
-      return { created: true, id: "follow-refresh-job-1" };
+      return { created: true, jobId: "follow-refresh-job-1" };
     },
   });
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].onlyFansUserIds.length, 500);
-  assert.equal(new Set(calls[0].onlyFansUserIds).size, 500);
+  assert.equal(calls[0].onlyFansUserIds.length, 498);
+  assert.equal(new Set(calls[0].onlyFansUserIds).size, 498);
   assert.equal(calls[0].reason, "follow_back_current_unknown");
   assert.equal(calls[0].priority, 85);
   assert.deepEqual(calls[0].params, { consumer: "follow_back", trigger: "planning" });
-  assert.equal(result.requested, 500);
+  assert.equal(result.requested, 498);
 });
 
 test("Phase3 Refollow missing/unprovenanced canonical current fails closed and requests bounded point refresh", () => {
@@ -391,22 +391,22 @@ test("Phase3 Refollow refreshes only the edge required for expired-fan UNFOLLOW 
 test("Phase3 Refollow planning schedules one bounded deduplicated refresh batch after advisory lock", async () => {
   const { scheduleRefollowCurrentRefresh } = require("./follow-automation-service");
   const calls = [];
-  const fanIds = Array.from({ length: 620 }, (_, index) => `refollow-fan-${index}`);
+  const fanIds = Array.from({ length: 498 }, (_, index) => `refollow-fan-${index}`);
   fanIds.push("refollow-fan-1", "refollow-fan-2");
   const result = await scheduleRefollowCurrentRefresh({
     agencyId: "agency-1",
     creatorId: "creator-1",
     fanIds,
     priority: 45,
-    scheduleFanRefresh: async (input) => { calls.push(input); return { created: true, id: "refresh-refollow-1" }; },
+    scheduleFanRefresh: async (input) => { calls.push(input); return { created: true, jobId: "refresh-refollow-1" }; },
   });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].onlyFansUserIds.length, 500);
-  assert.equal(new Set(calls[0].onlyFansUserIds).size, 500);
+  assert.equal(calls[0].onlyFansUserIds.length, 498);
+  assert.equal(new Set(calls[0].onlyFansUserIds).size, 498);
   assert.equal(calls[0].reason, "refollow_current_unknown");
   assert.equal(calls[0].priority, 85);
   assert.deepEqual(calls[0].params, { consumer: "follow_automation", trigger: "planning" });
-  assert.equal(result.requested, 500);
+  assert.equal(result.requested, 498);
 });
 
 test("Phase3 Refollow source preserves compensation-safe FOLLOW while UNFOLLOW refresh is out of transaction", () => {
@@ -458,7 +458,7 @@ test("Phase3 Bump unknown required field refreshes while known negative current 
 test("Phase3 Bump planning point refresh is one bounded deduplicated batch", async () => {
   const { scheduleBumpCurrentRefresh } = require("./bump-service");
   const calls = [];
-  const fanIds = Array.from({ length: 620 }, (_, index) => `bump-fan-${index}`);
+  const fanIds = Array.from({ length: 498 }, (_, index) => `bump-fan-${index}`);
   fanIds.push("bump-fan-1", "bump-fan-2");
   const result = await scheduleBumpCurrentRefresh({
     agencyId: "agency-1",
@@ -466,11 +466,11 @@ test("Phase3 Bump planning point refresh is one bounded deduplicated batch", asy
     fanIds,
     priority: 45,
     refreshFields: ["canReceiveChatMessage", "fanSubscriptionActive"],
-    scheduleFanRefresh: async (input) => { calls.push(input); return { created: true, id: "refresh-bump-1" }; },
+    scheduleFanRefresh: async (input) => { calls.push(input); return { created: true, jobId: "refresh-bump-1" }; },
   });
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].onlyFansUserIds.length, 500);
-  assert.equal(new Set(calls[0].onlyFansUserIds).size, 500);
+  assert.equal(calls[0].onlyFansUserIds.length, 498);
+  assert.equal(new Set(calls[0].onlyFansUserIds).size, 498);
   assert.equal(calls[0].reason, "bump_current_unknown");
   assert.equal(calls[0].priority, 85);
   assert.deepEqual(calls[0].params, {
@@ -478,7 +478,7 @@ test("Phase3 Bump planning point refresh is one bounded deduplicated batch", asy
     trigger: "planning",
     refreshFields: ["canReceiveChatMessage", "fanSubscriptionActive"],
   });
-  assert.equal(result.requested, 500);
+  assert.equal(result.requested, 498);
 });
 
 test("Phase3 Bump planning + commit refresh scheduling remains outside write transactions", () => {

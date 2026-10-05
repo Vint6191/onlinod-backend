@@ -478,6 +478,7 @@ async function planLikesLocked({ db, agencyId, creatorId, userId = null, candida
 }
 
 async function scheduleLikesCurrentRefresh({
+  db = prisma,
   agencyId,
   creatorId,
   fanIds = [],

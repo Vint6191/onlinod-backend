@@ -225,6 +225,7 @@ async function loadCandidates({ agencyId, creatorId, source, fanIds = [], limit 
 
 
 async function scheduleBumpCurrentRefresh({
+  db = prisma,
   agencyId,
   creatorId,
   fanIds = [],

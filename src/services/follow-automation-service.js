@@ -341,6 +341,7 @@ async function planFollowAutomationLocked({ db, agencyId, creatorId, userId, fan
 }
 
 async function scheduleRefollowCurrentRefresh({
+  db = prisma,
   agencyId,
   creatorId,
   fanIds = [],

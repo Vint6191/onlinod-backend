@@ -108,6 +108,7 @@ async function withCreatorLock(db, agencyId, creatorId, fn) {
 }
 
 async function scheduleSfsCurrentRefresh({
+  db = prisma,
   agencyId, creatorId, fanIds = [], refreshFields = [], reason = "sfs_current_refresh_required",
   priority = 90, trigger = "planning", scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }),
 } = {}) {
@@ -912,5 +913,5 @@ module.exports = {
   recordSfsJobFailure, planSfsTargets, validateSfsDelivery, finalizeSfsSuccess, finalizeSfsFailure,
   finalizeSfsTerminal, prepareSfsRetry, listSfs, setSfsCandidateState, ensureAutomaticSfs,
   RETRYABLE_FAILURES,
-  _test: { resolveAutomaticSfsResult },
+  _test: { resolveAutomaticSfsResult, scheduleSfsCurrentRefresh },
 };

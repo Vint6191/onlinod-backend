@@ -259,7 +259,7 @@ test("A32 ensureSingleJob honors an explicit transaction-scoped db instead of es
   };
   const result = await ensureSingleJob({
     db: localDb,
-    jobKey: "fan_data_point_refresh",
+    jobKey: "catchup_notifications_scan",
     creatorId: "creator-a32",
     agencyId: "agency-a32",
     params: { rangeKey: "fan-data:a32" },

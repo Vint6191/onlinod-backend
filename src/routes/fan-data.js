@@ -1,4 +1,6 @@
 "use strict";
+
+const { boundedFanIds } = require("../services/fan-data-input");
 const { runDbTransaction } = require("../services/db-transaction-service");
 
 
@@ -25,14 +27,7 @@ router.post("/current", async (req, res) => {
   try {
     const creatorId = clean(req.body?.creatorId);
     const creator = await requireProductCreator(req, creatorId);
-    const ids = [...new Set((Array.isArray(req.body?.onlyFansUserIds) ? req.body.onlyFansUserIds : []).map(onlyFansUserId).filter(Boolean))];
-    if (ids.length > FAN_DATA_POINT_REFRESH_MAX_FANS) {
-      return res.status(413).json({
-        ok: false,
-        code: "FAN_DATA_CURRENT_REQUEST_TOO_LARGE",
-        error: `Fan data current request exceeds ${FAN_DATA_POINT_REFRESH_MAX_FANS} fans`,
-      });
-    }
+    const ids = boundedFanIds(req.body?.onlyFansUserIds ?? [], "FAN_DATA_CURRENT_REQUEST_TOO_LARGE");
     const items = await readFanCurrent(prisma, { agencyId: creator.agencyId, creatorId: creator.id, onlyFansUserIds: ids });
     return res.json({ ok: true, creatorId: creator.id, items });
   } catch (error) {
@@ -129,14 +124,7 @@ router.post("/refresh", async (req, res) => {
   try {
     const creatorId = clean(req.body?.creatorId);
     const creator = await requireProductCreator(req, creatorId);
-    const ids = [...new Set((Array.isArray(req.body?.onlyFansUserIds) ? req.body.onlyFansUserIds : []).map(onlyFansUserId).filter(Boolean))];
-    if (ids.length > FAN_DATA_POINT_REFRESH_MAX_FANS) {
-      return res.status(413).json({
-        ok: false,
-        code: "FAN_DATA_REFRESH_REQUEST_TOO_LARGE",
-        error: `Fan data refresh request exceeds ${FAN_DATA_POINT_REFRESH_MAX_FANS} fans`,
-      });
-    }
+    const ids = boundedFanIds(req.body?.onlyFansUserIds ?? [], "FAN_DATA_REFRESH_REQUEST_TOO_LARGE");
     const decision = await scheduleFanDataPointRefresh({ agencyId: creator.agencyId, creatorId: creator.id, onlyFansUserIds: ids, reason: clean(req.body?.reason, 120) || "fan_data_api_refresh", priority: Number(req.body?.priority || 95) });
     return res.json({ ok: true, creatorId: creator.id, fanIds: ids, decision });
   } catch (error) {

@@ -1,5 +1,7 @@
 "use strict";
 
+const { boundedFanIds } = require("./fan-data-input");
+
 const crypto = require("node:crypto");
 
 const { runFanObservationTokenRetention, FAN_OBSERVATION_TOKEN_STALE_RETENTION_MS } = require("./background-retention-service");
@@ -11,14 +13,7 @@ function clean(value, max = 500) {
 }
 
 function normalizeSubjects(subjects) {
-  const normalized = [...new Set((Array.isArray(subjects) ? subjects : [])
-    .map((value) => clean(value, 180))
-    .filter(Boolean))]
-    .sort();
-  if (normalized.length > FAN_OBSERVATION_TOKEN_MAX_SUBJECTS) {
-    throw new Error("FAN_OBSERVATION_TOKEN_SCOPE_TOO_LARGE");
-  }
-  return normalized;
+  return boundedFanIds(subjects ?? [], "FAN_OBSERVATION_TOKEN_SCOPE_TOO_LARGE").sort();
 }
 
 function observationScopeHash({ purpose, subjects }) {

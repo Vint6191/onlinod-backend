@@ -54,7 +54,7 @@ async function fanDataRefreshScheduleAvailable(db, creatorId) {
       COUNT(*) FILTER (WHERE "creatorId" = $1)::bigint AS "pendingCreator"
     FROM "JobInstance"
     WHERE "jobKey" = 'fan_data_point_refresh'
-      AND "status" IN ('SCHEDULED','CLAIMED')
+      AND "status" IN ('SCHEDULED','CLAIMED','PUBLISHING')
   `, scopedCreatorId);
   const row = Array.isArray(rows) ? rows[0] : rows;
   const pendingGlobal = Number(row?.pendingGlobal ?? row?.pendingglobal ?? 0);
