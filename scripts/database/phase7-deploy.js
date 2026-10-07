@@ -45,13 +45,26 @@ async function migrationPlan(db,{contract=false,onCompatibility=report=>console.
   if(fresh){const tables=await db.$queryRawUnsafe(`SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=current_schema() AND c.relkind IN ('r','p','v') AND c.relname<>'_prisma_migrations' LIMIT 1`);if(tables.length)throw new Error('PHASE7_UNBASELINED_DATABASE');}
   return {fresh,purged,names:(contract||purged)?names:names.filter(x=>x!==CONTRACT)};
 }
-async function main({db=require('../../src/prisma'),contract=process.argv.includes('--contract'),hooks=true,commandRunner=run}={}){
+function deployArguments(argv){
+  const options={contract:false};const seen=new Set();
+  for(const arg of argv){
+    const key=arg.split('=',1)[0];
+    if(seen.has(key))throw new Error('PHASE7_DEPLOY_ARGUMENT_DUPLICATE');seen.add(key);
+    if(arg==='--contract')options.contract=true;
+    else if(arg.startsWith('--release-file=')&&arg.length>'--release-file='.length)options.releaseFile=arg.slice('--release-file='.length);
+    else throw new Error('PHASE7_DEPLOY_ARGUMENT_INVALID');
+  }
+  if(options.releaseFile&&!options.contract)throw new Error('PHASE7_RELEASE_REQUIRES_CONTRACT');
+  return options;
+}
+async function main({db=require('../../src/prisma'),contract=false,releaseFile,hooks=true,commandRunner=run}={}){
   const plan=await migrationPlan(db,{contract});
   const rolesBefore=await require('./phase7-role-preflight').inspectRoles(db,{strict:contract});
   console.log(JSON.stringify({phase7Roles:rolesBefore}));
   await db.$disconnect();
   if(hooks&&!plan.fresh)for(const [script,...args]of PRE)await commandRunner([path.join(__dirname,script),...args]);
-  if(contract&&!plan.purged){await require('../../src/services/phase7-retirement-finalizer').checkContractReady(db);}
+  let admission=null;
+  if(contract&&!plan.purged){admission=await require('../../src/services/phase7-retirement-finalizer').checkContractReady(db,{root,releaseFile});if(!admission?.ready)throw new Error('PHASE7_CONTRACT_NOT_PREPARED');}
   await db.$disconnect();
   const temp=await fs.mkdtemp(path.join(os.tmpdir(),'onlinod-phase7-deploy-'));
   try{
@@ -59,6 +72,12 @@ async function main({db=require('../../src/prisma'),contract=process.argv.includ
     await fs.mkdir(path.join(temp,'migrations'));
     await fs.copyFile(path.join(root,'prisma/migrations/migration_lock.toml'),path.join(temp,'migrations/migration_lock.toml'));
     for(const name of plan.names)await fs.cp(path.join(root,'prisma/migrations',name),path.join(temp,'migrations',name),{recursive:true});
+    if(admission){
+      await require('./phase7-release-source').verifyStagedRelease(root,temp,plan.names,{file:releaseFile,expectedRelease:admission.release});
+      const latest=await require('../../src/services/phase7-retirement-finalizer').checkContractReady(db,{root,releaseFile});
+      require('./phase7-release-source').sameRelease(admission.release,latest.release);
+      await db.$disconnect();
+    }
     await commandRunner([path.join(root,'node_modules/prisma/build/index.js'),'migrate','deploy','--schema',path.join(temp,'schema.prisma')]);
   }finally{await fs.rm(temp,{recursive:true,force:true});}
   // Fresh installs pass the same guards after the canonical history creates
@@ -82,5 +101,5 @@ function reportFailure(error,write=line=>console.error(line)){
   }else if(diagnostic)write(JSON.stringify(diagnostic));
   write(error.code||error.message);
 }
-module.exports={main,migrationPlan,reportFailure,CONTRACT,PRE,POST};
-if(require.main===module){const db=require('../../src/prisma');main({db}).catch(e=>{reportFailure(e);process.exitCode=1;}).finally(()=>db.$disconnect());}
+module.exports={main,migrationPlan,reportFailure,deployArguments,CONTRACT,PRE,POST};
+if(require.main===module){const db=require('../../src/prisma');Promise.resolve().then(()=>main({db,...deployArguments(process.argv.slice(2))})).catch(e=>{reportFailure(e);process.exitCode=1;}).finally(()=>db.$disconnect());}

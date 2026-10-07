@@ -4,7 +4,7 @@
 const fs = require("node:fs"), path = require("node:path");
 const { createRequire } = require("node:module");
 const { PrismaClient } = require("@prisma/client");
-async function createAdminSqlRuntime({ runtimePath } = {}) {
+async function createAdminSqlRuntime({ runtimePath, beforeMigration } = {}) {
   if (!runtimePath) throw Error("An explicit local proof runtime is required");
   const root = path.resolve(__dirname, "../..");
   const load = createRequire(path.resolve(runtimePath, "package.json"));
@@ -24,6 +24,7 @@ async function createAdminSqlRuntime({ runtimePath } = {}) {
     await db.$disconnect(); await server.stop();
     await engine.exec("DISCARD ALL");
     for (const name of plan.names) {
+      if (beforeMigration) await beforeMigration({ name, engine });
       try { await engine.exec(fs.readFileSync(path.join(root, "prisma/migrations", name, "migration.sql"), "utf8")); }
       catch (error) { error.message = name + ": " + error.message; throw error; }
     }

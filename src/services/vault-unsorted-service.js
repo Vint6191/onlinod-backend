@@ -1,4 +1,5 @@
 "use strict";
+const { mediaOffset, readMediaPage } = require("./media-read-page");
 const { runDbTransaction } = require("./db-transaction-service");
 
 
@@ -346,22 +347,16 @@ async function getVaultUnsortedState({ agencyId, creatorId, db = prisma }) {
   return { ok: true, creatorId, snapshot: publicSnapshot(snapshot), activeJob: publicJob(activeJob) };
 }
 
-async function listVaultUnsortedMedia({ agencyId, creatorId, offset = 0, limit = 40, type = null }) {
-  const safeOffset = integer(offset, 0, 0, 1_000_000);
+async function listVaultUnsortedMedia({ agencyId, creatorId, offset = 0, limit = 40, type = null, db = prisma }) {
+  const safeOffset = mediaOffset(offset);
   const safeLimit = integer(limit, 40, 1, 100);
   const mediaType = ["photo", "video", "audio", "gif", "unknown"].includes(clean(type, 20).toLowerCase())
     ? clean(type, 20).toLowerCase()
     : null;
   const where = { agencyId, creatorId, catalogActive: true, sortingStatus: "UNSORTED", ...(mediaType ? { mediaType } : {}) };
-  const [rows, total] = await Promise.all([
-    prisma.creatorMediaAsset.findMany({
-      where,
-      orderBy: [{ lastSeenAt: "desc" }, { mediaId: "desc" }],
-      skip: safeOffset,
-      take: safeLimit,
-    }),
-    prisma.creatorMediaAsset.count({ where }),
-  ]);
+  const { rows, count: total } = await readMediaPage(db, {
+    where, orderBy: [{ lastSeenAt: "desc" }, { mediaId: "desc" }], offset: safeOffset, limit: safeLimit,
+  });
   const items = rows.map((row) => ({
     id: row.mediaId,
     type: row.mediaType || "unknown",
@@ -719,7 +714,7 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
   const nextContinuation = {
     ...continuation,
     phase: "media",
-    offset: integer(chunk.nextOffset, integer(continuation.offset, 0) + items.length, 0, 10_000_000),
+    offset: mediaOffset(chunk.nextOffset ?? (mediaOffset(continuation.offset) + items.length)),
     pages,
     scanned,
     knownStreak,

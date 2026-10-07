@@ -1,6 +1,7 @@
 "use strict";
 
 const express = require("express");
+const { MAX_MEDIA_OFFSET } = require("../services/media-read-page");
 const { z } = require("zod");
 const {
   getVaultDirectoryIntelligence,
@@ -30,12 +31,12 @@ const unsortedStartSchema = z.object({
   priority: z.number().int().min(0).max(200).optional(),
 });
 const unsortedListSchema = z.object({
-  offset: z.number().int().min(0).max(1_000_000).optional(),
+  offset: z.number().int().min(0).max(MAX_MEDIA_OFFSET).optional(),
   limit: z.number().int().min(1).max(100).optional(),
   type: z.enum(["photo", "video", "audio", "gif", "unknown"]).optional().nullable(),
 });
 const neverUsedListSchema = z.object({
-  offset: z.number().int().min(0).max(10_000_000).optional(),
+  offset: z.number().int().min(0).max(MAX_MEDIA_OFFSET).optional(),
   limit: z.number().int().min(1).max(100).optional(),
   type: z.enum(["photo", "video", "audio", "gif", "unknown"]).optional().nullable(),
 });

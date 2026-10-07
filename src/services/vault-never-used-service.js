@@ -1,4 +1,5 @@
 "use strict";
+const { mediaOffset, exactMediaCount, readMediaPage, readMediaSnapshot } = require("./media-read-page");
 
 const prisma = require("../prisma");
 const { getVaultUnsortedState } = require("./vault-unsorted-service");
@@ -20,7 +21,6 @@ const LIST_SCAN_CHUNK_SIZE = 500;
 const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
 const PROJECTION_CACHE_LIMIT = 500;
 const MEDIA_TYPES = new Set(["photo", "video", "audio", "gif", "unknown"]);
-const projectionCache = new Map();
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -127,29 +127,49 @@ async function resolveLegacyTerminalDialogFailures(db, agencyId, creatorId) {
   return number(result?.count);
 }
 
+async function readDialogPlanStats(db, agencyId, creatorId, selection, generation, startedAt) {
+  const [row] = await db.$queryRawUnsafe(`
+    WITH plan AS NOT MATERIALIZED (
+      SELECT "dialogId", status, "initialScanComplete", "pagesProcessed", "messagesProcessed",
+        "lastIncrementalScanAt", "lastFullScanAt", "lastError", "updatedAt"
+      FROM "DialogScanState"
+      WHERE "agencyId"=$1 AND "creatorId"=$2 AND "dialogId" <> '__dialog_discovery__'
+        AND ($3::text='all' OR ($3::text='generation' AND generation=$4::integer)
+          OR ($3::text='since' AND "updatedAt">=$5::timestamp))
+    )
+    SELECT COUNT(*) AS discovered,
+      COUNT(*) FILTER (WHERE "initialScanComplete") AS "initialComplete",
+      COUNT(*) FILTER (WHERE UPPER(BTRIM(status)) IN ('READY','COMPLETED')) AS completed,
+      COUNT(*) FILTER (WHERE status='PAUSED') AS "pausedCount",
+      COUNT(*) FILTER (WHERE status='FAILED') AS failed,
+      COUNT(*) FILTER (WHERE status='UNAVAILABLE') AS unavailable,
+      COUNT(*) FILTER (WHERE status='PLANNED') AS planned,
+      COUNT(*) FILTER (WHERE status='QUEUED') AS "queuedStates",
+      COUNT(*) FILTER (WHERE status='RUNNING') AS "runningStates",
+      COALESCE(SUM("pagesProcessed"),0) AS "pagesCommitted",
+      COALESCE(SUM("messagesProcessed"),0) AS "messagesCommitted",
+      MAX("updatedAt") AS "lastUpdatedAt",
+      MAX(COALESCE("lastIncrementalScanAt","lastFullScanAt"))
+        FILTER (WHERE "initialScanComplete") AS "lastSuccessfulScanAt",
+      -- Prisma's timestamp columns store UTC. JSON must carry an explicit zone
+      -- too, rather than being parsed as the Node host's local wall-clock time.
+      (SELECT jsonb_build_object('dialogId',p."dialogId",'lastError',p."lastError",'updatedAt',p."updatedAt" AT TIME ZONE 'UTC')
+       FROM plan p WHERE status='FAILED' AND "lastError" IS NOT NULL AND "lastError"<>''
+       ORDER BY "updatedAt" DESC,"dialogId" DESC LIMIT 1) AS "failedState"
+    FROM plan
+  `, agencyId, creatorId, selection, generation, startedAt);
+  const result = { ...row };
+  for (const key of ["discovered","initialComplete","completed","pausedCount","failed","unavailable",
+    "planned","queuedStates","runningStates","pagesCommitted","messagesCommitted"]) result[key] = exactMediaCount(row[key]);
+  return result;
+}
+
 async function dialogPipelineState(db, agencyId, creatorId) {
-  const [states, discoveryRuns, activeRuns, activeJobs, latestRun] = await Promise.all([
-    db.dialogScanState.findMany({
-      where: { agencyId, creatorId, dialogId: { not: "__dialog_discovery__" } },
-      select: {
-        dialogId: true,
-        fanId: true,
-        scanMode: true,
-        generation: true,
-        initialScanComplete: true,
-        status: true,
-        activeRunId: true,
-        activeJobId: true,
-        pagesProcessed: true,
-        messagesProcessed: true,
-        lastError: true,
-        lastFullScanAt: true,
-        lastIncrementalScanAt: true,
-        createdAt: true,
-        updatedAt: true,
-      },
-      take: 100000,
-    }),
+  return readMediaSnapshot(db, tx => readDialogPipelineState(tx, agencyId, creatorId));
+}
+
+async function readDialogPipelineState(db, agencyId, creatorId) {
+  const [discoveryRuns, activeRuns, activeJobs, latestRun] = await Promise.all([
     db.dialogScanRun.findMany({
       where: { agencyId, creatorId, dialogId: "__dialog_discovery__" },
       orderBy: { createdAt: "desc" },
@@ -317,21 +337,13 @@ async function dialogPipelineState(db, agencyId, creatorId) {
 
   const planGeneration = number(latestInitialDiscoveryRun?.generation);
   const discoveryStartedAt = timestamp(latestInitialDiscoveryRun?.createdAt);
-  const planStates = !latestInitialDiscoveryRun
-    ? []
-    // While a new shuffled-list discovery is being built, keep projecting the
-    // already published creator state instead of visually resetting 16k dialogs
-    // and hundreds of thousands of messages to zero. DialogScanState is one row
-    // per dialog, so `states` is the stable union of the previous frozen plan
-    // and the rows already touched by the in-flight generation. Claiming still
-    // remains fenced on the completed generation below.
-    : discoveryActive
-      ? states
-      : planGeneration > 0
-        ? states.filter((state) => number(state.generation) === planGeneration)
-        : Number.isFinite(discoveryStartedAt)
-          ? states.filter((state) => timestamp(state.updatedAt) >= discoveryStartedAt)
-          : states;
+  // Count the whole selected plan in SQL. A capped array of states can hide
+  // a pending tail and falsely authorize the Never Used projection.
+  const planSelection = !latestInitialDiscoveryRun ? "empty"
+    : discoveryActive ? "all" : planGeneration > 0 ? "generation"
+      : Number.isFinite(discoveryStartedAt) ? "since" : "all";
+  const stats = await readDialogPlanStats(db, agencyId, creatorId, planSelection,
+    planGeneration, Number.isFinite(discoveryStartedAt) ? new Date(discoveryStartedAt) : null);
 
   const historyActiveJobs = activeJobs.filter((job) => {
     const params = object(job.params);
@@ -382,28 +394,12 @@ async function dialogPipelineState(db, agencyId, creatorId) {
   };
   const currentFailure = object(object(currentJob?.result).failure);
 
-  const discovered = planStates.length;
-  const initialComplete = planStates.filter((state) => state.initialScanComplete === true).length;
-  const completed = planStates.filter((state) => ["READY", "COMPLETED"].includes(clean(state.status, 40).toUpperCase())).length;
-  const pausedCount = planStates.filter((state) => state.status === "PAUSED").length;
-  const failed = planStates.filter((state) => state.status === "FAILED").length;
-  const unavailable = planStates.filter((state) => state.status === "UNAVAILABLE").length;
-  const planned = planStates.filter((state) => state.status === "PLANNED").length;
-  const queuedStates = planStates.filter((state) => state.status === "QUEUED").length;
-  const runningStates = planStates.filter((state) => state.status === "RUNNING").length;
-  // Pending must describe executable or explicitly paused work. The previous
-  // subtraction formula counted legacy IDLE rows as pending even though neither
-  // claim nor pause could select them, producing an eternal phantom worker wait.
+  const { discovered, initialComplete, completed, pausedCount, failed, unavailable,
+    planned, queuedStates, runningStates, pagesCommitted, messagesCommitted, failedState } = stats;
   const pending = planned + queuedStates + runningStates + pausedCount;
-  const pagesCommitted = planStates.reduce((sum, state) => sum + number(state.pagesProcessed), 0);
-  const messagesCommitted = planStates.reduce((sum, state) => sum + number(state.messagesProcessed), 0);
-  const successfulStateTimes = planStates
-    .filter((state) => state.initialScanComplete === true)
-    .map((state) => state.lastIncrementalScanAt || state.lastFullScanAt)
-    .filter(Boolean);
-  const failedState = planStates
-    .filter((state) => state.status === "FAILED" && state.lastError)
-    .sort((a, b) => timestamp(b.updatedAt) - timestamp(a.updatedAt))[0] || null;
+  // Active rows are diagnostic samples. Saturation must never prove that all
+  // workers have drained, even if no sampled row matches the selected plan.
+  const activitySampleComplete = activeJobs.length < 1000 && activeRuns.length < 1000;
 
   const structuredFailure = (raw, fallback = {}) => {
     const source = object(raw);
@@ -459,12 +455,13 @@ async function dialogPipelineState(db, agencyId, creatorId) {
     currentJob?.updatedAt,
     currentRun?.updatedAt,
     latestRun?.updatedAt,
-    ...planStates.slice(0, 20).map((state) => state.updatedAt),
+    stats.lastUpdatedAt,
   ]);
 
   return {
     discovered,
     initialComplete,
+    activitySampleComplete,
     active: historyActiveJobs.length + activeBatchRuns.length + (discoveryActive ? 1 : 0) + pausedCount,
     paused: pausedCount > 0 || discoveryPaused || historyControlState === "PAUSED",
     failed,
@@ -482,7 +479,7 @@ async function dialogPipelineState(db, agencyId, creatorId) {
     lastUpdatedAt,
     lastSuccessfulScanAt: mostRecent([
       discoveryCompleted ? latestInitialDiscoveryRun?.completedAt || latestInitialDiscoveryRun?.updatedAt : null,
-      ...successfulStateTimes,
+      stats.lastSuccessfulScanAt,
     ]),
     discoveryActive,
     historyActive: runningJobs.length > 0 || activeBatchRuns.length > 0,
@@ -641,44 +638,31 @@ async function projectionCounts(db, agencyId, creatorId) {
   const neverUsedByType = emptyByType();
   let catalogMedia = 0;
   let usedCreatorMedia = 0;
-  let newestEvidenceAt = NaN;
-  let cursorId = null;
-
-  for (;;) {
-    const page = await db.creatorMediaAsset.findMany({
-      where: { agencyId, creatorId, catalogActive: true },
-      select: { id: true, mediaId: true, mediaType: true, updatedAt: true, usageUpdatedAt: true, sentCount: true },
-      orderBy: { id: "asc" },
-      take: PROJECTION_CHUNK_SIZE,
-      ...(cursorId ? { cursor: { id: cursorId }, skip: 1 } : {}),
-    });
-    if (!page.length) break;
-
-    for (const row of page) {
-      const id = clean(row.mediaId);
-      if (!id) continue;
-      const type = normalizeMediaType(row.mediaType);
-      catalogMedia += 1;
-      byType.all += 1;
-      byType[type] += 1;
-
-      const rowAt = timestamp(row.updatedAt);
-      if (Number.isFinite(rowAt)) newestEvidenceAt = Math.max(newestEvidenceAt, rowAt);
-      const usageAt = timestamp(row.usageUpdatedAt);
-      if (Number.isFinite(usageAt)) newestEvidenceAt = Math.max(newestEvidenceAt, usageAt);
-
-      if (number(row.sentCount) > 0) {
-        usedCreatorMedia += 1;
-      } else {
-        neverUsedByType.all += 1;
-        neverUsedByType[type] += 1;
-      }
+  let newestEvidenceAt = Number.NEGATIVE_INFINITY;
+  // One database aggregate replaces a full catalog walk across unrelated
+  // snapshots. No asset IDs need to leave the database to count media.
+  const rows = await db.$queryRawUnsafe(`
+    SELECT "mediaType", COUNT(*) AS total,
+      COUNT(*) FILTER (WHERE "sentCount" > 0) AS used,
+      MAX("updatedAt") AS "updatedAt", MAX("usageUpdatedAt") AS "usageUpdatedAt"
+    FROM "CreatorMediaAsset"
+    WHERE "agencyId" = $1 AND "creatorId" = $2 AND "catalogActive" = true
+      AND BTRIM("mediaId") <> ''
+    GROUP BY "mediaType"
+  `, agencyId, creatorId);
+  for (const row of rows) {
+    const type = normalizeMediaType(row.mediaType);
+    const total = exactMediaCount(row.total), used = exactMediaCount(row.used);
+    catalogMedia = exactMediaCount(catalogMedia + total);
+    usedCreatorMedia = exactMediaCount(usedCreatorMedia + used);
+    byType.all = exactMediaCount(byType.all + total);
+    byType[type] = exactMediaCount(byType[type] + total);
+    neverUsedByType.all = exactMediaCount(neverUsedByType.all + total - used);
+    neverUsedByType[type] = exactMediaCount(neverUsedByType[type] + total - used);
+    for (const value of [row.updatedAt, row.usageUpdatedAt]) {
+      const at = timestamp(value);
+      if (Number.isFinite(at)) newestEvidenceAt = Math.max(newestEvidenceAt, at);
     }
-
-    if (page.length < PROJECTION_CHUNK_SIZE) break;
-    const nextCursor = clean(page[page.length - 1]?.id);
-    if (!nextCursor || nextCursor === cursorId) break;
-    cursorId = nextCursor;
   }
 
   return {
@@ -698,18 +682,6 @@ async function projectionCounts(db, agencyId, creatorId) {
   };
 }
 
-function projectionFingerprint(messagesSnapshot, dialogs, salesUpdatedAt) {
-  return [
-    messagesSnapshot?.updatedAt || "",
-    messagesSnapshot?.lastFullScanAt || "",
-    messagesSnapshot?.lastIncrementalScanAt || "",
-    messagesSnapshot?.lastMergeScanAt || "",
-    dialogs.lastUpdatedAt || "",
-    dialogs.lastSuccessfulScanAt || "",
-    salesUpdatedAt || "",
-  ].join("|");
-}
-
 async function latestSalesUpdatedAt(db, agencyId, creatorId) {
   const row = await db.creatorMediaAsset.findFirst({
     where: { agencyId, creatorId, catalogActive: true, usageUpdatedAt: { not: null } },
@@ -719,18 +691,6 @@ async function latestSalesUpdatedAt(db, agencyId, creatorId) {
   return iso(row?.usageUpdatedAt);
 }
 
-async function cachedProjection(db, agencyId, creatorId, fingerprint) {
-  const key = `${agencyId}:${creatorId}`;
-  const cached = projectionCache.get(key);
-  if (cached?.fingerprint === fingerprint) return cached.projection;
-  const projection = await projectionCounts(db, agencyId, creatorId);
-  if (!projectionCache.has(key) && projectionCache.size >= PROJECTION_CACHE_LIMIT) {
-    const oldestKey = projectionCache.keys().next().value;
-    if (oldestKey) projectionCache.delete(oldestKey);
-  }
-  projectionCache.set(key, { fingerprint, projection });
-  return projection;
-}
 
 function jobStatus(value) {
   return clean(value, 40).toUpperCase();
@@ -822,6 +782,7 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
   const messagesComplete = Boolean(messages.snapshot?.lastFullScanAt && messages.snapshot?.scan?.status === "COMPLETED");
   const dialogsDrained = Boolean(
     dialogs.discoveryCompleted
+      && dialogs.activitySampleComplete
       && dialogs.active === 0
       && dialogs.failed === 0
       && dialogs.pending === 0,
@@ -860,9 +821,8 @@ async function getNeverUsedPipelineState({ agencyId, creatorId, db = prisma, now
     "RETRYING",
     "STALLED",
   ].includes(stage);
-  const fingerprint = projectionFingerprint(messages.snapshot, dialogs, salesAt);
   const projection = authoritative && !workActive
-    ? await cachedProjection(db, agencyId, creatorId, fingerprint)
+    ? await projectionCounts(db, agencyId, creatorId)
     : emptyProjection(messages.snapshot, { deferred: workActive || !authoritative });
 
   let progressPercent = 0;
@@ -968,7 +928,7 @@ async function listVaultNeverUsedMedia({ agencyId, creatorId, offset = 0, limit 
     };
   }
 
-  const safeOffset = integer(offset, 0, 0, 10_000_000);
+  const safeOffset = mediaOffset(offset);
   const safeLimit = integer(limit, 40, 1, 100);
   const mediaType = type ? normalizeMediaType(type) : null;
   const where = {
@@ -978,15 +938,9 @@ async function listVaultNeverUsedMedia({ agencyId, creatorId, offset = 0, limit 
     sentCount: 0,
     ...(mediaType ? { mediaType } : {}),
   };
-  const [rows, total] = await Promise.all([
-    db.creatorMediaAsset.findMany({
-      where,
-      orderBy: [{ lastSeenAt: "desc" }, { mediaId: "desc" }],
-      skip: safeOffset,
-      take: safeLimit,
-    }),
-    db.creatorMediaAsset.count({ where }),
-  ]);
+  const { rows, count: total } = await readMediaPage(db, {
+    where, orderBy: [{ lastSeenAt: "desc" }, { mediaId: "desc" }], offset: safeOffset, limit: safeLimit,
+  });
   const media = rows.map(rowToMedia);
   const nextOffset = safeOffset + media.length;
   return {

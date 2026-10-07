@@ -1,6 +1,7 @@
 ONLINOD — PHASE 7 — LEGACY STORAGE RETIREMENT
 Generation: phase7_legacy_storage_v1
-Implementation against frozen Desktop99 + Backend 2026-09-30T145724.447.
+Original retirement implementation: Desktop99 + Backend 2026-09-30T145724.447.
+Admission update126: exact current source receipt and staged migration verification.
 
 PURPOSE AND OWNERSHIP
 Phase 7 retires old producers, transfers outstanding effects and consumption
@@ -8,28 +9,22 @@ receipts, freezes historical archives, and permits a separately gated DROP of
 nine legacy physical tables. It does not migrate raw dialog history to a server.
 Current CRM/FanData, Team *Current, ModuleSetting, ContentCollection, HiddenOnline,
 financial facts, leases, typed commands and access authority retain their owners.
-The 268 historical migration SQL files are unchanged. There are two new forward
-migrations. Never use db push, schema-only baselines or a direct unqualified
+All291 existing migration SQL files remain unchanged in126. The Phase7 expand
+and contract are already part of that history;126 adds no database migration. Never use db push, schema-only baselines or a direct unqualified
 prisma migrate deploy for this transition: that would include the contract.
 
 INSTALLATION
-Use the companion changed-only source installer against the exact supplied base.
-Back up the live database and application state separately. Stop Backend and
-Desktop processes before applying source. Review CHECK_ONLY before APPLY. The
-installer verifies every base source hash, payload, new-file absence and listed
-physical deletion before its first source write. It refuses extra executable
-source files and symlinks. It does not edit userData, local databases, sessions,
-credentials, node_modules or dist. It records a source rollback journal outside
-the project. A source rollback is not a database rollback.
+Use the cumulative changed-only Backend/Desktop ZIPs on the matching supplied
+actual124 base;125 is included in126. See onlinod126_result.txt for source overlay
+and build instructions. Checkpoint ZIPs are recovery archives, not install patches.
+This ordinary source update does not require a new phase7-release.json and does
+not authorize a production contract. Existing historical manifests are retained.
+Keep backups and the actual stopped-source deployment procedure. Old source-only
+rollback is never a database rollback after a separately authorized DROP.
 
-  node APPLY_ONLINOD_PHASE7.cjs --root=/absolute/project --check
-  node APPLY_ONLINOD_PHASE7.cjs --root=/absolute/project --apply --stopped
-
-Backend: npm install; npm run prisma:generate. The supplied Backend has no npm
-lockfile; dependencies here were tested from the retained local dependency tree.
-Desktop: npm run clean; npm ci; npm run build; npm run typecheck. Old dist files
-must be removed before building. This package contains source, not Windows or
-Electron binaries. Linux compilation is not a native Electron acceptance test.
+Backend: npm install; npm run prisma:generate; npm run prisma:migrate.
+Desktop: use the existing BAT/build workflow. The patch contains source, not
+Windows/Electron binaries. This pass did not validate native installation.
 
 DEPLOYMENT AND ROLLING COMPATIBILITY
   npm run prisma:migrate
@@ -40,12 +35,13 @@ types, nullability, defaults and PK/unique/FK/check constraints against the froz
 Unknown changes to that selected physical shape fail closed.
 The wrapper validates canonical migration checksums and rejects unknown, failed
 or unbaselined populated histories. Ordinary deployment applies the exact
-canonical 269-migration prefix (expand only). A proven empty database runs the
+canonical retained-schema history (290 migrations in126). A proven empty database runs the
 canonical history before preflights that require base tables. Existing databases
 retain all eight previous preflights and four postflights. Online Phase7 indexes
 are built outside transactions; invalid named indexes require operator repair.
 After the contract has already been recorded, ordinary redeploy accepts the
-canonical 270-migration history and the PURGED physical state.
+complete history including the recorded contract (291 migrations in126) and
+the PURGED physical state.
 
 Expand freezes INSERT/UPDATE on all 36 legacy/archive tables and TRUNCATE even
 when empty. Authorized lifecycle deletion is exact agency/creator scoped, keeps
@@ -145,22 +141,70 @@ does not grant/revoke or pretend to defeat a malicious DB owner. Ordinary deploy
 reports role state; preparation and contract require safe configured runtime
 roles. Grants for application DML/sequence use must be provisioned by the DBA.
 
+Before the separately authorized contract rehearsal/deployment, keep Backend
+and Desktop source roots immutable and generate a paired source receipt OUTSIDE
+all four source trees. The base roots are the factual previously deployed sources;
+this command does not discover a fleet or decide permitted rollback generations.
+The output must not already exist. It is local evidence, not a production action:
+
+  node scripts/database/phase7-release-source.js --backend-root=/release/backend --desktop-root=/release/desktop --base-backend-root=/previous/backend --base-desktop-root=/previous/desktop --package-id=REVIEWED_RELEASE_ID --output=/secure/release-source.json
+
+The tool hashes both current and both base trees, checks them again, rejects
+symlinks and oversized/unbounded source inventories, and never rewrites historical
+phase7-release.json. Runtime data, credentials, node_modules and dist retain the
+existing source-inventory exclusions. This is source evidence, not a binary
+signature or proof that a running fleet was upgraded. The Backend later verifies
+its own actual tree and the internal Desktop inventory hash; it cannot inspect
+remote Desktop installations. Fleet/native acceptance stays a separate gate.
+
 Copy PHASE7_OPERATOR_EVIDENCE_EXAMPLE.json outside source, replace every field
-with real inventory/backup evidence, and remove placeholder hashes. Get base and
-current source hashes from phase7-release.json. Hash absolute real archive paths
-with SHA256 UTF-8, no newline. stoppedBinaries must include both supplied base
-hashes and any other allowed rollback binary fleet entries; noOldBinariesRemain
-is an operator attestation, not a process-discovery feature.
+with real inventory/backup evidence, and remove placeholder hashes. Use base and
+current hashes from the newly generated external receipt. Hash absolute real
+archive paths with SHA256 UTF-8, no newline. stoppedBinaries must include both
+supplied base hashes AND every older permitted rollback generation; the generator
+cannot discover them. noOldBinariesRemain remains an operator attestation.
 
-  node scripts/maintenance/phase7-legacy-storage.js prepare-contract --close-rollback --operator-evidence=/secure/operator-evidence.json
-  npm run prisma:migrate -- --contract
+Only after the operator prerequisites above and the separate production decision:
 
-The contract rechecks current catalog fingerprint, same plan/release/evidence,
-role privileges, old executions, missing cleanup proof and all verified scopes.
-It takes the nine named tables in stable order with lock_timeout=5s and
-statement_timeout=60s, then drops them with RESTRICT in one transaction. Unknown
-dependencies or lock contention fail; CASCADE is never used. Re-prepare after a
-legitimate catalog change, restoring all relevant verification if needed.
+  node scripts/maintenance/phase7-legacy-storage.js prepare-contract --close-rollback --release-file=/secure/release-source.json --operator-evidence=/secure/operator-evidence.json
+  npm run prisma:migrate -- --contract --release-file=/secure/release-source.json
+
+Use the same external receipt for both steps. The default historical
+phase7-release.json remains supported only when it actually matches the entire
+current source tree; stale metadata is never refreshed or ignored automatically.
+Unknown/duplicate CLI arguments, misspelled options, boolean values such as
+--contract=false/--create=false and invalid maintenance step limits fail explicitly.
+An external receipt without --contract is rejected by the deploy CLI.
+
+Contract admission checks the prepared database receipt against the current
+release's Backend/Desktop hashes, base hashes, package ID, generation and plan.
+After staging it verifies the exact schema/migration file set and bytes, rereads
+source evidence, and repeats database admission before launching Prisma. A source
+replacement, different prepared receipt or expired backup stops that launch.
+Temporary migration staging is removed on both success and failure.
+
+The SQL contract independently rechecks catalog fingerprint, same cohort receipt,
+role privileges, old executions, cleanup proofs and verified scopes while holding
+its own locks. It takes the nine named tables in stable order with
+lock_timeout=5s and statement_timeout=60s, then drops them with RESTRICT in one
+transaction. Unknown dependencies or contention fail; CASCADE is never used.
+Do not replace sources during this operation. Filesystem checks do not make live
+source replacement or a changed running process safe. Re-prepare after legitimate
+source/catalog changes and restore affected archive verification when necessary.
+
+OFFLINE ADMISSION PROOF126
+  PHASE7_PROOF_RUNTIME=/isolated/dependencies node scripts/audit/phase7-contract-admission-proof.cjs
+
+Optional PHASE7_PROOF_OUTPUT writes JSON. PHASE7_PROOF_BASELINE points to frozen125
+Backend to reproduce the prior admission defect. The proof creates only its own
+PGlite database and accepts no external database URL. It loads290 unchanged SQL
+migrations, seeds506 rows before expand, exports/restores bounded tenant partitions,
+and invokes real Prisma5.22 for retained redeploy, explicit isolated contract and
+post-contract redeploy. Synthetic backup/fleet statements are confined to this
+fixture and never constitute production approval. The test resets PGlite's single
+physical session between independent Prisma Client/schema-engine clients; this
+is not native PostgreSQL session/concurrency evidence. Production PRE/POST hooks
+are covered by source regressions; the PGlite migration proof uses hooks=false.
 
 DROP TABLES (physical names)
 AnalyticsSnapshot, CreatorEarningsSnapshot, CreatorCampaignsSnapshot,

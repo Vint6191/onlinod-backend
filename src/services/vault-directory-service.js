@@ -1,4 +1,5 @@
 "use strict";
+const { readMediaSnapshot, exactMediaCount } = require("./media-read-page");
 
 const {
   getNeverUsedPipelineState,
@@ -115,29 +116,31 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
   const ids = cleanMediaIds(mediaIds, MAX_MEDIA_IDS);
   const activeWhere = { agencyId, creatorId: cleanCreatorId, catalogActive: true };
 
-  const [catalogCount, usedCount, totals, soldAssets, topRows, assetRows, latestAsset, pipelineResult] = await Promise.all([
-    client.creatorMediaAsset.count({ where: activeWhere }),
-    client.creatorMediaAsset.count({ where: { ...activeWhere, sentCount: { gt: 0 } } }),
-    client.creatorMediaAsset.aggregate({
-      where: activeWhere,
-      _sum: { soldCount: true, revenueCents: true },
-      _max: { lastSoldAt: true },
-    }),
-    client.creatorMediaAsset.count({ where: { ...activeWhere, soldCount: { gt: 0 } } }),
-    client.creatorMediaAsset.findMany({
-      where: { ...activeWhere, soldCount: { gt: 0 } },
-      orderBy: [{ revenueCents: "desc" }, { soldCount: "desc" }, { lastSoldAt: "desc" }, { mediaId: "asc" }],
-      take: TOP_ASSET_LIMIT,
-    }),
-    ids.length ? client.creatorMediaAsset.findMany({
-      where: { ...activeWhere, mediaId: { in: ids } },
-      take: ids.length,
-    }) : Promise.resolve([]),
-    client.creatorMediaAsset.findFirst({
-      where: activeWhere,
-      orderBy: { updatedAt: "desc" },
-      select: { updatedAt: true, usageUpdatedAt: true },
-    }),
+  const [[catalogCount, usedCount, totals, soldAssets, topRows, assetRows, latestAsset], pipelineResult] = await Promise.all([
+    readMediaSnapshot(client, tx => Promise.all([
+      tx.creatorMediaAsset.count({ where: activeWhere }),
+      tx.creatorMediaAsset.count({ where: { ...activeWhere, sentCount: { gt: 0 } } }),
+      tx.creatorMediaAsset.aggregate({
+        where: activeWhere,
+        _sum: { soldCount: true, revenueCents: true },
+        _max: { lastSoldAt: true },
+      }),
+      tx.creatorMediaAsset.count({ where: { ...activeWhere, soldCount: { gt: 0 } } }),
+      tx.creatorMediaAsset.findMany({
+        where: { ...activeWhere, soldCount: { gt: 0 } },
+        orderBy: [{ revenueCents: "desc" }, { soldCount: "desc" }, { lastSoldAt: "desc" }, { mediaId: "asc" }],
+        take: TOP_ASSET_LIMIT,
+      }),
+      ids.length ? tx.creatorMediaAsset.findMany({
+        where: { ...activeWhere, mediaId: { in: ids } },
+        take: ids.length,
+      }) : Promise.resolve([]),
+      tx.creatorMediaAsset.findFirst({
+        where: activeWhere,
+        orderBy: { updatedAt: "desc" },
+        select: { updatedAt: true, usageUpdatedAt: true },
+      }),
+    ])),
     includePipeline
       ? getNeverUsedPipelineState({ agencyId, creatorId: cleanCreatorId, db: client })
       : Promise.resolve({ pipeline: null }),
@@ -169,8 +172,8 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
       usedMediaCount: usedCount,
       protectedMediaCount: catalogCount,
       soldAssets,
-      totalSales: integer(totals?._sum?.soldCount),
-      revenueCents: integer(totals?._sum?.revenueCents),
+      totalSales: exactMediaCount(totals?._sum?.soldCount),
+      revenueCents: exactMediaCount(totals?._sum?.revenueCents),
       lastSaleAt: iso(totals?._max?.lastSoldAt),
     },
     analytics,

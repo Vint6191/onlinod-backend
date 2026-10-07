@@ -1,5 +1,6 @@
 "use strict";
 const { runDbTransaction } = require("./db-transaction-service");
+const { mediaOffset, exactMediaCount, readMediaPage } = require("./media-read-page");
 
 
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
@@ -215,7 +216,7 @@ async function searchMediaLibrary({
   const searchScope = ["everything", "description", "tags", "folders"].includes(clean(scope, 30).toLowerCase())
     ? clean(scope, 30).toLowerCase()
     : "everything";
-  const skip = integer(offset, 0, 0, 10_000_000);
+  const skip = mediaOffset(offset);
   const take = integer(limit, 40, 1, 100);
   const activeFolderId = clean(folderId, 240);
   const matchedFolders = uniqueStrings(folderMatchIds, 500, 240);
@@ -258,15 +259,9 @@ async function searchMediaLibrary({
   }
 
   const where = { AND: and };
-  const [assets, count] = await Promise.all([
-    db.creatorMediaAsset.findMany({
-      where,
-      orderBy: [{ lastSeenAt: "desc" }, { mediaId: "desc" }],
-      skip,
-      take,
-    }),
-    db.creatorMediaAsset.count({ where }),
-  ]);
+  const { rows: assets, count } = await readMediaPage(db, {
+    where, orderBy: [{ lastSeenAt: "desc" }, { mediaId: "desc" }], offset: skip, limit: take,
+  });
   const items = assets.map(assetToSearchItem);
   return {
     ok: true,
@@ -320,10 +315,16 @@ async function upsertMediaMetadata({ agencyId, creatorId, mediaId, input, userId
 
 async function listStorylines({ agencyId, creatorId, db = prisma }) {
   const id = await requireCreator(db, agencyId, creatorId);
-  const rows = await db.creatorMediaAsset.findMany({
+  // Aggregate in the database; the dropdown contains every distinct name,
+  // regardless of how many media belong to it. Normalize names in JS to keep
+  // the existing trim/case/numeric-sort semantics for historical metadata.
+  const rows = await db.creatorMediaAsset.groupBy({
+    by: ["storylineName", "storylineRole"],
     where: { agencyId, creatorId: id, catalogActive: true, storylineName: { not: null } },
-    select: { storylineName: true, storylineOrder: true, storylineRole: true },
-    take: 100000,
+    _count: { _all: true },
+    _min: { storylineOrder: true },
+    _max: { storylineOrder: true },
+    orderBy: [{ storylineName: "asc" }, { storylineRole: "asc" }],
   });
   const byName = new Map();
   for (const row of rows) {
@@ -338,12 +339,13 @@ async function listStorylines({ agencyId, creatorId, db = prisma }) {
       minOrder: null,
       maxOrder: null,
     };
-    item.mediaCount += 1;
-    if (row.storylineRole === "main") item.mainCount += 1;
-    if (row.storylineRole === "additional") item.additionalCount += 1;
-    if (row.storylineOrder != null) {
-      item.minOrder = item.minOrder == null ? row.storylineOrder : Math.min(item.minOrder, row.storylineOrder);
-      item.maxOrder = item.maxOrder == null ? row.storylineOrder : Math.max(item.maxOrder, row.storylineOrder);
+    const count = exactMediaCount(row._count._all);
+    item.mediaCount = exactMediaCount(item.mediaCount + count);
+    if (row.storylineRole === "main") item.mainCount = exactMediaCount(item.mainCount + count);
+    if (row.storylineRole === "additional") item.additionalCount = exactMediaCount(item.additionalCount + count);
+    if (row._min.storylineOrder != null) {
+      item.minOrder = item.minOrder == null ? row._min.storylineOrder : Math.min(item.minOrder, row._min.storylineOrder);
+      item.maxOrder = item.maxOrder == null ? row._max.storylineOrder : Math.max(item.maxOrder, row._max.storylineOrder);
     }
     byName.set(key, item);
   }
@@ -748,39 +750,38 @@ async function deleteMediaAssets({ agencyId, creatorId, mediaIds, db = prisma })
 
 async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {
   const id = await requireCreator(db, agencyId, creatorId);
-  const where = { agencyId, creatorId: id, catalogActive: true };
-  const [aggregate, soldAssets, buyers, lastSale] = await Promise.all([
-    db.creatorMediaAsset.aggregate({
-      where,
-      _sum: { soldCount: true, revenueCents: true, notOpenedCount: true, freeCount: true },
-    }),
-    db.creatorMediaAsset.count({ where: { ...where, soldCount: { gt: 0 } } }),
-    db.creatorMediaUsageContribution.findMany({
-      where: { agencyId, creatorId: id, soldCount: { gt: 0 }, asset: { is: { catalogActive: true } } },
-      distinct: ["sourceKey"],
-      select: { sourceKey: true },
-      take: 100000,
-    }),
-    db.creatorMediaAsset.findFirst({
-      where: { ...where, lastSoldAt: { not: null } },
-      orderBy: { lastSoldAt: "desc" },
-      select: { lastSoldAt: true },
-    }),
-  ]);
+  // One statement gives the sums and distinct opaque usage sources one MVCC
+  // snapshot. No buyer keys or source rows are materialized in application RAM.
+  const [totals] = await db.$queryRawUnsafe(`
+    SELECT COUNT(*) FILTER (WHERE a."soldCount" > 0) AS "soldAssets",
+      COALESCE(SUM(a."soldCount"), 0) AS "totalSales",
+      COALESCE(SUM(a."revenueCents"), 0) AS "revenueCents",
+      COALESCE(SUM(a."notOpenedCount"), 0) AS "notOpened",
+      COALESCE(SUM(a."freeCount"), 0) AS "free",
+      MAX(a."lastSoldAt") AS "lastSaleAt",
+      (SELECT COUNT(DISTINCT u."sourceKey")
+       FROM "CreatorMediaUsageContribution" u
+       JOIN "CreatorMediaAsset" sold ON sold.id = u."assetId"
+       WHERE u."agencyId" = $1 AND u."creatorId" = $2 AND u."soldCount" > 0
+         AND sold."agencyId" = $1 AND sold."creatorId" = $2 AND sold."catalogActive" = true
+      ) AS "uniqueBuyers"
+    FROM "CreatorMediaAsset" a
+    WHERE a."agencyId" = $1 AND a."creatorId" = $2 AND a."catalogActive" = true
+  `, agencyId, id);
   return {
     ok: true,
     summary: {
       creatorId: id,
-      soldAssets,
-      totalSales: integer(aggregate._sum?.soldCount),
-      revenueCents: integer(aggregate._sum?.revenueCents),
-      opened: integer(aggregate._sum?.soldCount),
-      notOpened: integer(aggregate._sum?.notOpenedCount),
-      free: integer(aggregate._sum?.freeCount),
+      soldAssets: exactMediaCount(totals.soldAssets),
+      totalSales: exactMediaCount(totals.totalSales),
+      revenueCents: exactMediaCount(totals.revenueCents),
+      opened: exactMediaCount(totals.totalSales),
+      notOpened: exactMediaCount(totals.notOpened),
+      free: exactMediaCount(totals.free),
       unresolved: 0,
-      uniqueBuyers: buyers.length,
+      uniqueBuyers: exactMediaCount(totals.uniqueBuyers),
       deletedBuyers: 0,
-      lastSaleAt: iso(lastSale?.lastSoldAt),
+      lastSaleAt: iso(totals.lastSaleAt),
     },
   };
 }
@@ -826,7 +827,7 @@ function assetToSalesAsset(asset) {
 
 async function listMediaSalesAssets({ agencyId, creatorId, offset = 0, limit = 100, mediaType = null, db = prisma }) {
   const id = await requireCreator(db, agencyId, creatorId);
-  const skip = integer(offset, 0, 0, 10_000_000);
+  const skip = mediaOffset(offset);
   const take = integer(limit, 100, 1, 500);
   const normalizedType = mediaType ? normalizeMediaType(mediaType) : null;
   const where = {
@@ -836,15 +837,9 @@ async function listMediaSalesAssets({ agencyId, creatorId, offset = 0, limit = 1
     soldCount: { gt: 0 },
     ...(normalizedType ? { mediaType: normalizedType } : {}),
   };
-  const [assets, count] = await Promise.all([
-    db.creatorMediaAsset.findMany({
-      where,
-      orderBy: [{ revenueCents: "desc" }, { soldCount: "desc" }, { lastSoldAt: "desc" }, { mediaId: "asc" }],
-      skip,
-      take,
-    }),
-    db.creatorMediaAsset.count({ where }),
-  ]);
+  const { rows: assets, count } = await readMediaPage(db, {
+    where, orderBy: [{ revenueCents: "desc" }, { soldCount: "desc" }, { lastSoldAt: "desc" }, { mediaId: "asc" }], offset: skip, limit: take,
+  });
   const items = assets.map(assetToSalesAsset);
   return { ok: true, items, count, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < count };
 }

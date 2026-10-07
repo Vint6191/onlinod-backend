@@ -1,4 +1,5 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -71,7 +72,35 @@ function dbFixture({
     return rows;
   }
 
-  return {
+  return commitDatabaseFixture({
+    async $queryRawUnsafe(sql, ...params) {
+      if (sql.includes('FROM "DialogScanState"')) {
+        const [agency,creator,selection,generation,startedAt] = params;
+        assert.equal(agency,"agency-1"); assert.equal(creator,"creator-1");
+        const all = await this.dialogScanState.findMany({});
+        const rows = all.filter(r => selection === 'all' || selection === 'generation' && Number(r.generation || 0) === generation || selection === 'since' && new Date(r.updatedAt) >= startedAt);
+        const count = predicate => BigInt(rows.filter(predicate).length);
+        const mostRecent = values => values.filter(Boolean).sort((a,b)=>Number(new Date(b))-Number(new Date(a)))[0] || null;
+        return [{ discovered: BigInt(rows.length), initialComplete: count(r=>r.initialScanComplete===true),
+          completed: count(r=>['READY','COMPLETED'].includes(String(r.status).trim().toUpperCase())),
+          pausedCount: count(r=>r.status==='PAUSED'), failed: count(r=>r.status==='FAILED'), unavailable: count(r=>r.status==='UNAVAILABLE'),
+          planned: count(r=>r.status==='PLANNED'), queuedStates: count(r=>r.status==='QUEUED'), runningStates: count(r=>r.status==='RUNNING'),
+          pagesCommitted: rows.reduce((n,r)=>n+Number(r.pagesProcessed||0),0),messagesCommitted: rows.reduce((n,r)=>n+Number(r.messagesProcessed||0),0),
+          lastUpdatedAt: mostRecent(rows.map(r=>r.updatedAt)), lastSuccessfulScanAt: mostRecent(rows.filter(r=>r.initialScanComplete).map(r=>r.lastIncrementalScanAt||r.lastFullScanAt)),
+          failedState: rows.filter(r=>r.status==='FAILED'&&r.lastError).sort((a,b)=>Number(new Date(b.updatedAt))-Number(new Date(a.updatedAt)))[0] || null }];
+      }
+
+      assert.match(sql, /GROUP BY "mediaType"/);
+      assert.deepEqual(params, ["agency-1", "creator-1"]);
+      const byType = new Map();
+      for (const row of visibleCatalog) {
+        if (!String(row.mediaId || '').trim()) continue;
+        const item = byType.get(row.mediaType) || { mediaType: row.mediaType, total: 0n, used: 0n, updatedAt: date(), usageUpdatedAt: date() };
+        item.total += 1n; if (row.sentCount > 0) item.used += 1n;
+        byType.set(row.mediaType, item);
+      }
+      return [...byType.values()];
+    },
     creatorAccount: { async findFirst() { return { id: "creator-1" }; } },
     vaultUnsortedSnapshot: {
       async findUnique() {
@@ -149,7 +178,7 @@ function dbFixture({
         return null;
       },
     },
-  };
+  });
 }
 
 test("zero committed pages cannot be reported as ready", async () => {
@@ -535,7 +564,7 @@ test("a real failed attempt is shown as RETRYING with queue diagnostics", async 
   assert.equal(result.pipeline.dialogs.current.lastError, "HTTP 500");
 });
 
-test("projection reads canonical Media Library rows in bounded chunks", async () => {
+test("projection aggregates the complete catalog without materializing asset rows", async () => {
   const count = PROJECTION_CHUNK_SIZE + 1;
   const rows = Array.from({ length: count }, (_, index) => ({
     id: `row-${String(index).padStart(6, "0")}`, mediaId: `media-${index}`, mediaType: "photo", sortingStatus: index % 2 ? "SORTED" : "UNSORTED", updatedAt: date(), lastSeenAt: date(), folderIds: [], durationSec: 0,
@@ -550,8 +579,8 @@ test("projection reads canonical Media Library rows in bounded chunks", async ()
   const result = await projectionCounts(db, "agency-1", "creator-1");
   assert.equal(result.catalogMedia, count);
   assert.equal(result.neverUsed, count);
-  assert.deepEqual(batchSizes, [PROJECTION_CHUNK_SIZE, PROJECTION_CHUNK_SIZE]);
-  assert.ok(batchSizes.every((size) => size <= PROJECTION_CHUNK_SIZE));
+  assert.deepEqual(batchSizes, []);
+  assert.equal(result.rebuiltAt, date().toISOString());
 });
 
 
@@ -676,4 +705,17 @@ test("an untouched discovery run keeps hasMore unknown and excludes stale genera
   assert.equal(result.pipeline.dialogs.messagesCommitted, 0);
   assert.equal(result.pipeline.dialogs.pagesCommitted, 0);
   assert.equal(result.pipeline.authoritative, false);
+});
+
+
+test("a saturated activity sample cannot prove that all history workers have drained", async () => {
+  const result = await getNeverUsedPipelineState({ agencyId: "agency-1", creatorId: "creator-1", now: date(),
+    db: dbFixture({ complete: true,
+      discoveryRuns: [{ id: "disc", mode: "discovery", dialogId: "__dialog_discovery__", status: "COMPLETED", generation: 7, pagesProcessed: 1, progress: { hasMore: false }, updatedAt: date() }],
+      dialogStates: [{ dialogId: "d", generation: 7, initialScanComplete: true, status: "COMPLETED", updatedAt: date(), lastFullScanAt: date() }],
+      activeRuns: Array.from({length: 1000}, (_, i) => ({id: `unselected-${i}`, generation: 6, status: "RUNNING", dialogId: `other-${i}`, updatedAt: date()})),
+    }),
+  });
+  assert.equal(result.pipeline.authoritative, false);
+  assert.equal(result.pipeline.projection.complete, false);
 });

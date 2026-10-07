@@ -3,14 +3,29 @@
 require('dotenv').config();
 const path=require('node:path');const {COHORTS,storageState,failure,runDbTransaction}=require('../../src/services/phase7-legacy-storage-service');
 const runner=require('../../src/services/phase7-retirement-runner');const finalizer=require('../../src/services/phase7-retirement-finalizer');
-function args(argv){const o={command:argv[0]||'status'};for(const arg of argv.slice(1)){if(!arg.startsWith('--'))throw failure('PHASE7_UNKNOWN_ARGUMENT');const [k,...v]=arg.slice(2).split('=');o[k]=v.length?v.join('='):true;}return o;}
+function args(argv){
+ const command=argv[0]||'status';
+ const allowed={status:['after','state'],indexes:['create'],resume:['id'],'prepare-contract':['close-rollback','operator-evidence','release-file'],
+  run:['steps','archive-dir'],enumerate:['steps'],verify:['steps','restore-dir'],handoff:['steps']};
+ if(!Object.hasOwn(allowed,command))throw failure('PHASE7_UNKNOWN_COMMAND');
+ const o={command};
+ for(const arg of argv.slice(1)){
+  const match=/^--([^=]+)(?:=(.*))?$/.exec(arg),key=match?.[1],value=match?.[2];
+  if(!key||!allowed[command].includes(key)||Object.hasOwn(o,key))throw failure('PHASE7_UNKNOWN_ARGUMENT');
+  if(['create','close-rollback'].includes(key)){if(value!==undefined)throw failure('PHASE7_BOOLEAN_ARGUMENT_INVALID');o[key]=true;}
+  else {if(!value||value.length>4096)throw failure('PHASE7_ARGUMENT_VALUE_REQUIRED');o[key]=value;}
+ }
+ if(o.steps!==undefined&&(!/^[1-9][0-9]*$/.test(o.steps)||Number(o.steps)>100))throw failure('PHASE7_STEPS_INVALID');
+ if(o.state!==undefined&&!['PENDING','RUNNING','BLOCKED','EXPORTED','VERIFIED'].includes(o.state))throw failure('PHASE7_PARTITION_STATE_INVALID');
+ return o;
+}
 const json=x=>JSON.stringify(x,(_k,v)=>typeof v==='bigint'?String(v):v);
 async function main({db=require('../../src/prisma'),options=args(process.argv.slice(2)),emit=x=>console.log(json(x))}={}){
  const o=options,steps=Math.max(1,Math.min(100,Number(o.steps)||1));
  if(o.command==='status'){const result={...await storageState(db),partitions:await db.phase7RetirementPartition.findMany({where:{...(o.after?{id:{gt:o.after}}:{}),...(o.state?{state:o.state}:{})},orderBy:{id:'asc'},take:51})};result.hasMore=result.partitions.length>50;result.partitions=result.partitions.slice(0,50);result.nextCursor=result.hasMore?result.partitions.at(-1).id:null;emit(result);return result;}
  if(o.command==='indexes'){const result=await require('../database/phase7-legacy-storage-indexes').ensureIndexes(db,{create:!!o.create});emit(result);return result;}
  if(o.command==='resume'){if(!o.id)throw failure('PHASE7_PARTITION_ID_REQUIRED');const r=await runner.resumePartition({db,id:o.id});emit(r);return r;}
- if(o.command==='prepare-contract'){const release=await finalizer.readRelease(path.resolve(__dirname,'../..'));const {evidence}=await require('../../src/services/phase7-contract-evidence').readEvidence(o['operator-evidence'],release);const r=await finalizer.prepareContract({db,release,closeRollback:o['close-rollback']===true,operatorEvidence:evidence});emit(r);return r;}
+ if(o.command==='prepare-contract'){const release=await finalizer.readRelease(path.resolve(__dirname,'../..'),{file:o['release-file']});const {evidence}=await require('../../src/services/phase7-contract-evidence').readEvidence(o['operator-evidence'],release);const r=await finalizer.prepareContract({db,release,closeRollback:o['close-rollback']===true,operatorEvidence:evidence});emit(r);return r;}
  if(!['run','enumerate','verify','handoff'].includes(o.command))throw failure('PHASE7_UNKNOWN_COMMAND');
  await require('../database/phase7-legacy-storage-indexes').ensureIndexes(db);
  if(o.command==='run'&&!o['archive-dir'])throw failure('PHASE7_ARCHIVE_DIRECTORY_REQUIRED');

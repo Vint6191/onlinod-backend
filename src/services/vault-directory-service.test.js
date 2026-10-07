@@ -1,4 +1,5 @@
 "use strict";
+const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -43,7 +44,35 @@ function fakeDb() {
       updatedAt: date(), usageUpdatedAt: date(), lastSeenAt: date(),
     },
   ];
-  return {
+  return commitDatabaseFixture({
+    async $queryRawUnsafe(sql, ...params) {
+      if (sql.includes('FROM "DialogScanState"')) {
+        const [agency,creator,selection,generation,startedAt] = params;
+        assert.equal(agency,"agency-1"); assert.equal(creator,"creator-1");
+        const all = await this.dialogScanState.findMany({});
+        const rows = all.filter(r => selection === 'all' || selection === 'generation' && Number(r.generation || 0) === generation || selection === 'since' && new Date(r.updatedAt) >= startedAt);
+        const count = predicate => BigInt(rows.filter(predicate).length);
+        const mostRecent = values => values.filter(Boolean).sort((a,b)=>Number(new Date(b))-Number(new Date(a)))[0] || null;
+        return [{ discovered: BigInt(rows.length), initialComplete: count(r=>r.initialScanComplete===true),
+          completed: count(r=>['READY','COMPLETED'].includes(String(r.status).trim().toUpperCase())),
+          pausedCount: count(r=>r.status==='PAUSED'), failed: count(r=>r.status==='FAILED'), unavailable: count(r=>r.status==='UNAVAILABLE'),
+          planned: count(r=>r.status==='PLANNED'), queuedStates: count(r=>r.status==='QUEUED'), runningStates: count(r=>r.status==='RUNNING'),
+          pagesCommitted: rows.reduce((n,r)=>n+Number(r.pagesProcessed||0),0),messagesCommitted: rows.reduce((n,r)=>n+Number(r.messagesProcessed||0),0),
+          lastUpdatedAt: mostRecent(rows.map(r=>r.updatedAt)), lastSuccessfulScanAt: mostRecent(rows.filter(r=>r.initialScanComplete).map(r=>r.lastIncrementalScanAt||r.lastFullScanAt)),
+          failedState: rows.filter(r=>r.status==='FAILED'&&r.lastError).sort((a,b)=>Number(new Date(b.updatedAt))-Number(new Date(a.updatedAt)))[0] || null }];
+      }
+
+      assert.match(sql, /GROUP BY "mediaType"/);
+      assert.deepEqual(params, ["agency-1", "creator-1"]);
+      const byType = new Map();
+      for (const row of catalog) {
+        if (!String(row.mediaId || '').trim()) continue;
+        const item = byType.get(row.mediaType) || { mediaType: row.mediaType, total: 0n, used: 0n, updatedAt: date(), usageUpdatedAt: date() };
+        item.total += 1n; if (row.sentCount > 0) item.used += 1n;
+        byType.set(row.mediaType, item);
+      }
+      return [...byType.values()];
+    },
     creatorAccount: { async findFirst() { return { id: "creator-1" }; } },
     creatorMediaAsset: {
       async count({ where }) { return catalog.filter((row) => matchesWhere(row, where)).length; },
@@ -91,7 +120,7 @@ function fakeDb() {
       },
       async findFirst() { return null; },
     },
-  };
+  });
 }
 
 test("cleanMediaIds deduplicates and bounds input", () => {

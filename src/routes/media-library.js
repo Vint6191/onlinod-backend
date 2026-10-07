@@ -1,6 +1,7 @@
 "use strict";
 
 const express = require("express");
+const { MAX_MEDIA_OFFSET } = require("../services/media-read-page");
 const { z } = require("zod");
 const { automationCreatorParamRequired } = require("../middleware/automation-permissions");
 const { requireProductPermission, requireProductDevice, currentAccessEpoch } = require("../middleware/product-access");
@@ -28,7 +29,7 @@ const searchSchema = z.object({
   folderId: z.string().max(240).nullable().optional(),
   folderMatchIds: z.array(z.string().min(1).max(240)).max(500).optional(),
   mediaType: z.enum(["all", "photo", "video", "audio", "gif", "unknown"]).nullable().optional(),
-  offset: z.number().int().min(0).max(10_000_000).optional(),
+  offset: z.number().int().min(0).max(MAX_MEDIA_OFFSET).optional(),
   limit: z.number().int().min(1).max(100).optional(),
 });
 const metadataSchema = z.object({
@@ -69,7 +70,7 @@ const folderMutationSchema = z.object({
   action: z.enum(["add", "remove"]),
 });
 const salesListSchema = z.object({
-  offset: z.number().int().min(0).max(10_000_000).optional(),
+  offset: z.number().int().min(0).max(MAX_MEDIA_OFFSET).optional(),
   limit: z.number().int().min(1).max(500).optional(),
   mediaType: z.enum(["photo", "video", "audio", "gif", "unknown"]).nullable().optional(),
 });

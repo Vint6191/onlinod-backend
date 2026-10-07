@@ -1,5 +1,5 @@
 'use strict';
-const {COHORTS,GENERATION,manifest,failure,runDbTransaction,sha}=require('./phase7-legacy-storage-service');
+const {COHORTS,GENERATION,manifest,failure,runDbTransaction}=require('./phase7-legacy-storage-service');
 async function assertNoOldExecutions(db){
   const checks=[`SELECT "id" FROM "AutomationDelivery" WHERE "legacyStorageGeneration" IS DISTINCT FROM '${GENERATION}' AND "status" IN ('CLAIMED','RUNNING','COMMITTING','RECONCILE_REQUIRED') LIMIT 1`,
     `SELECT "id" FROM "JobInstance" WHERE "legacyStorageGeneration" IS DISTINCT FROM '${GENERATION}' AND "status" IN ('CLAIMED','RUNNING') LIMIT 1`,
@@ -7,7 +7,7 @@ async function assertNoOldExecutions(db){
     `SELECT "id" FROM "AutomationDelivery" WHERE "moduleKey"='sfs' AND "actionType"='SFS_UNFOLLOW_TARGET' AND "payload"->>'legacyMigration'='true' AND "legacyCleanupProofId" IS NULL AND "status" IN ('QUEUED','CLAIMED','RUNNING','COMMITTING','RECONCILE_REQUIRED','RETRY_SCHEDULED','PAUSED') LIMIT 1`];
   for(let i=0;i<checks.length;i++){const rows=await db.$queryRawUnsafe(checks[i]);if(rows.length)throw failure(i===3?'PHASE7_CLEANUP_HANDOFF_INCOMPLETE':'PHASE7_OLD_EXECUTION_NOT_DRAINED',{objectId:rows[0].id});}
 }
-async function checkContractReady(db){
+async function checkContractReady(db,{root=require('node:path').resolve(__dirname,'../..'),releaseFile}={}){
   await require('./phase7-legacy-storage-service').storageState(db);
   await require('../../scripts/database/phase7-legacy-storage-indexes').ensureIndexes(db);
   const rows=await db.phase7RetirementCohort.findMany({where:{id:{in:COHORTS}}});
@@ -17,29 +17,17 @@ async function checkContractReady(db){
   const invalid=await db.phase7RetirementPartition.findFirst({where:{cohortId:{in:COHORTS},state:{not:'VERIFIED'}},select:{id:true}});
   if(invalid)throw failure('PHASE7_PARTITION_UNVERIFIED',{partitionId:invalid.id});
   const receipt=rows[0].releaseManifest;
+  const release=await readRelease(root,{file:releaseFile});
+  require('../../scripts/database/phase7-release-source').sameRelease(receipt,release);
   const checked=require('./phase7-contract-evidence').validateEvidence(receipt.operatorEvidence,receipt);
   if(checked.evidenceHash!==receipt.operatorEvidenceHash)throw failure('PHASE7_OPERATOR_EVIDENCE_HASH_MISMATCH');
   await require('../../scripts/database/phase7-role-preflight').inspectRoles(db,{roles:receipt.roleReport?.runtimeRoles?.map(r=>r.name),strict:true});
-  await assertNoOldExecutions(db);return {ready:true,fingerprint};
+  await assertNoOldExecutions(db);return {ready:true,fingerprint,release};
 }
-async function readRelease(root){
-  const fs=require('node:fs/promises'),path=require('node:path');const name=path.join(root,'phase7-release.json');
-  const st=await fs.lstat(name);if(!st.isFile()||st.isSymbolicLink()||st.size>2097152)throw failure('PHASE7_RELEASE_MANIFEST_INVALID');
-  const release=JSON.parse(await fs.readFile(name,'utf8'));
-  if(release.generation!==GENERATION||release.planHash!==manifest.planHash||!Array.isArray(release.backendFiles)||release.backendFiles.length>5000||!['desktopHash','baseBackendHash','baseDesktopHash'].every(k=>/^[a-f0-9]{64}$/.test(release[k]||'')))throw failure('PHASE7_RELEASE_MANIFEST_INVALID');
-  const actual=await require('../../scripts/database/phase7-source-inventory').sourcePaths(root);
-  if(JSON.stringify(actual)!==JSON.stringify(release.backendFiles.map(e=>e.path)))throw failure('PHASE7_RELEASE_SOURCE_SET_MISMATCH');
-  for(const entry of release.backendFiles){
-    if(!entry.path||entry.path.includes('\\')||entry.path.split('/').some(x=>!x||x==='..'||x==='.')||path.isAbsolute(entry.path))throw failure('PHASE7_RELEASE_PATH_INVALID');
-    const full=path.join(root,entry.path);if(await fs.realpath(full)!==full)throw failure('PHASE7_RELEASE_SYMLINK');
-    const file=await fs.stat(full);if(!file.isFile()||file.size!==entry.bytes||file.size>16777216||sha(await fs.readFile(full))!==entry.sha256)throw failure('PHASE7_RELEASE_SOURCE_MISMATCH',{file:entry.path});
-  }
-  if(sha(JSON.stringify(release.backendFiles))!==release.backendHash)throw failure('PHASE7_RELEASE_HASH_INVALID');
-  return {generation:release.generation,planHash:release.planHash,backendHash:release.backendHash,desktopHash:release.desktopHash,packageId:release.packageId,baseBackendHash:release.baseBackendHash,baseDesktopHash:release.baseDesktopHash};
-}
+const {readRelease}=require('../../scripts/database/phase7-release-source');
 async function prepareContract({db,release,closeRollback=false,operatorEvidence,runtimeRoles}){
   if(!closeRollback)throw failure('PHASE7_EXPLICIT_ROLLBACK_CLOSURE_REQUIRED');
-  if(release.generation!==GENERATION||release.planHash!==manifest.planHash||![release.backendHash,release.desktopHash].every(x=>/^[a-f0-9]{64}$/.test(x||'')))throw failure('PHASE7_RELEASE_MANIFEST_INVALID');
+  release=require('../../scripts/database/phase7-release-source').identity(release);
   if(!operatorEvidence)throw failure('PHASE7_OPERATOR_EVIDENCE_REQUIRED');
   const checked=require('./phase7-contract-evidence').validateEvidence(operatorEvidence,release);
   const roleReport=await require('../../scripts/database/phase7-role-preflight').inspectRoles(db,{roles:runtimeRoles,strict:true});
