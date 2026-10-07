@@ -1,0 +1,7 @@
+{
+  "name": "DomainWorkItem_notification_identity_recovery_idx",
+  "table": "DomainWorkItem",
+  "expression": "\"id\"",
+  "unique": false,
+  "where": "\"state\"='RECONCILE_REQUIRED' AND \"terminalCause\"='RETRY_EXHAUSTED:BAD_TRAFFIC_DIRTY_INPUT' AND \"workClass\" IN ('NOTIFICATION_HISTORY_REPAIR','NOTIFICATION_RECEIPT_REPAIR','NOTIFICATION_RETAINED_REPAIR_V3','NOTIFICATION_CONSEQUENCES','NOTIFICATION_CONSEQUENCES_V2','NOTIFICATION_FACT_RECEIPTS') AND (\"lastRepair\"->>'kind') IS DISTINCT FROM 'notification_identity_recovery_v1'"
+}

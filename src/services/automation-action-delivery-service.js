@@ -25,6 +25,7 @@ const {
   releaseDeliveryFanObservationReadLease,
 } = require("./fan-observation-read-lease-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { isOnlineBumpSend, commitOnlineBumpWrite } = require("./bump-write-window-service");
 const { CREATOR_WRITE_LANE_STATUSES } = require("./automation-delivery-statuses");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
 const {
@@ -553,11 +554,11 @@ async function deferOrSkipFollowBackClaim(delivery, control, now) {
   return false;
 }
 
-async function applyBumpValidationTransition(delivery, validation, now = new Date(), executionAccess = null) {
+async function applyBumpValidationTransition(delivery, validation, now = new Date(), executionAccess = null, db = prisma) {
   if (!delivery || delivery.moduleKey !== "bumps" || validation?.ok !== false) return false;
   const terminal = validation.terminal === true;
   const status = terminal ? (validation.status || "SKIPPED") : "RETRY_SCHEDULED";
-  return runDbTransaction(prisma, async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: {
@@ -1110,10 +1111,11 @@ async function validateActionDelivery(input) {
     }
   }
   if (delivery.moduleKey === "bumps") {
-    const validation = await validateBumpDelivery({ delivery, control, now: new Date() });
+    const now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
+    const validation = await validateBumpDelivery({ delivery, control, now });
     if (validation.ok === false) {
       if (validation.refreshRequired === true) await scheduleValidationFanRefresh(delivery, validation, "validate");
-      await applyBumpValidationTransition(delivery, validation, new Date(), { userId: input.userId });
+      await applyBumpValidationTransition(delivery, validation, now, { userId: input.userId });
       throw validationActionError(delivery, validation, "BUMP_VALIDATION_FAILED", "Bump delivery validation failed");
     }
   }
@@ -1146,7 +1148,7 @@ async function validateActionDelivery(input) {
 
 async function prepareWriteActionDelivery(input) {
   try {
-    return await runDbTransaction(prisma, async (tx) => {
+    const outcome = await runDbTransaction(prisma, async (tx) => {
     let delivery = await requireLease({ ...input, db: tx, lockAccess: true, billingAdmission: true });
     await lockAutomationWriteCommitFence({ db: tx, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
     // The control writer holds the same transaction-scoped fence. Re-read the
@@ -1173,7 +1175,10 @@ async function prepareWriteActionDelivery(input) {
     }
     if (delivery.moduleKey === "bumps") {
       const validation = await validateBumpDelivery({ delivery, control, now, db: tx });
-      if (validation.ok === false) throw validationActionError(delivery, validation, "BUMP_VALIDATION_FAILED", "Bump delivery validation failed");
+      if (validation.ok === false) {
+        await applyBumpValidationTransition(delivery, validation, now, null, tx);
+        return { bumpDenied: validation, delivery };
+      }
       fanCurrentFence = validation.fanCurrentFence || fanCurrentFence;
     }
     if (delivery.moduleKey === "likes") {
@@ -1213,6 +1218,18 @@ async function prepareWriteActionDelivery(input) {
       "phase3_fan_consumer_v1_current_bounded",
     );
     if (delivery.moduleKey === SFS_MODULE_KEY) await authorizeSfsGeneration(tx);
+    if (isOnlineBumpSend(delivery)) {
+      const committing = await commitOnlineBumpWrite({ db: tx, delivery,
+        deviceId: input.deviceId, leaseToken: input.leaseToken, leaseRevision: input.leaseRevision,
+        ttlMs: control.modules.bumps.settings.onlineObservationTtlMs });
+      if (!committing) throw new ActionDeliveryError("DELIVERY_COMMIT_PERMIT_STALE", "Delivery changed before write commit permit");
+      if (committing.status === "SKIPPED") {
+        await finalizeBumpTerminal({ delivery: committing, status: "SKIPPED", failureCode: "stale_candidate", db: tx });
+        return { bumpDenied: { ok: false, terminal: true, status: "SKIPPED", code: "stale_candidate" }, delivery };
+      }
+      return { ok: true, duplicate: false, id: committing.id, status: committing.status,
+        leaseRevision: committing.leaseRevision, writeCommitRevision: committing.writeCommitRevision, writeCommitAt: committing.writeCommitAt };
+    }
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: "RUNNING", claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision, claimUntil: { gt: now } },
       data: {
@@ -1224,6 +1241,10 @@ async function prepareWriteActionDelivery(input) {
     const committing = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
     return { ok: true, duplicate: false, id: committing.id, status: committing.status, leaseRevision: committing.leaseRevision, writeCommitRevision: committing.writeCommitRevision, writeCommitAt: committing.writeCommitAt };
     }, { timeout: 30_000 });
+    // Denial is returned through COMMIT so the terminal/retry transition and fan
+    // reservation cleanup survive; the HTTP error is emitted only afterwards.
+    if (outcome.bumpDenied) throw validationActionError(outcome.delivery, outcome.bumpDenied, "BUMP_VALIDATION_FAILED", "Bump delivery validation failed");
+    return outcome;
   } catch (error) {
     if (error?.sfsTerminal?.delivery && error?.sfsTerminal?.validation) {
       await applySfsValidationTransition(error.sfsTerminal.delivery, error.sfsTerminal.validation, new Date(), { userId: input.userId });

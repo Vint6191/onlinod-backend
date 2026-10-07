@@ -7,6 +7,7 @@ const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { projectFanObservationBatch, scheduleFanDataPointRefresh, scheduleDurableFanDataRefreshDebt, FAN_DATA_OBSERVATION_BATCH_MAX } = require("./fan-data-authority-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { onlineObservationFresh } = require("./bump-write-window-service");
 const { assertSubscriberPublicationIdle, validateSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
@@ -491,9 +492,13 @@ async function recordDetailedObservations({
       },
       update: {
         dialogId,
-        ...(updateLastOnlineAt ? { lastOnlineAt: row.observedAt } : {}),
         metadata: mergedMetadata,
       },
+    });
+    if (updateLastOnlineAt) await db.automationBumpFanState.updateMany({
+      where: { agencyId, creatorId, fanId: row.fanId,
+        OR: [{ lastOnlineAt: null }, { lastOnlineAt: { lt: row.observedAt } }] },
+      data: { lastOnlineAt: row.observedAt },
     });
   }
   return { ok: true, count: rows.length, fanIds: ids, authorityProjected };
@@ -589,7 +594,7 @@ async function validateBumpDelivery({ delivery, control = null, now = new Date()
     fanCurrentFence = buildFanCurrentFieldFence(current, bumpRequiredFields(source));
     if (source === "online") {
       const observed = state?.lastOnlineAt;
-      if (!observed || observed.getTime() < now.getTime() - snapshot.modules.bumps.settings.onlineObservationTtlMs) {
+      if (!onlineObservationFresh(observed, snapshot.modules.bumps.settings.onlineObservationTtlMs, now)) {
         return { ok: false, terminal: true, status: "SKIPPED", code: "stale_candidate" };
       }
     }

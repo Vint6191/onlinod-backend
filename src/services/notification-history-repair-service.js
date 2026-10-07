@@ -116,20 +116,35 @@ async function processHistoryPage({ db, item, ownerToken }) {
 
 async function runNotificationHistoryRepairSweep({ db = require("../prisma"), limit = 4, maxRuntimeMs = 3000 } = {}) {
   const started = performance.now();
+  const recovery = await require("./notification-identity-recovery-service").recoverNotificationIdentityWork({ db });
   const enumeration = await enumerateHistoryCreators({ db });
   const receiptEnumeration = await enumerateHistoryCreators({ db, receiptRepair: true });
   const retainedEnumeration = await enumerateHistoryCreators({ db, receiptRepair: "v3" });
-  const report = { ok: true, enumeration, receiptEnumeration, retainedEnumeration, processed: 0, completed: 0, yielded: 0, failed: 0, identityMissing: 0 };
+  const report = { ok: true, recovery, enumeration, receiptEnumeration, retainedEnumeration, selected: 0, processed: 0, completed: 0, yielded: 0, failed: 0, contended: 0, poisonedSignals: 0, errorDetails: [], identityMissing: 0 };
   for (let step = 0; step < Math.max(1, Math.min(8, Number(limit) || 4)) && performance.now() - started < maxRuntimeMs; step++) {
     const claim = await work.claimDomainWorkBatch({ db, workClass: [RETAINED_CLASS, RECEIPT_WORK_CLASS, WORK_CLASS][step % 3], limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
-    if (claim.skipped) { report.ok = false; report.reason = claim.reason; break; }
+    if (claim.skipped) {
+      report.skipped = true; report.reason ||= claim.reason;
+      if (claim.reason !== "domain_work_dependency_wake_bridge_transition") report.ok = false;
+      break;
+    }
     const item = claim.items?.[0]; if (!item) continue;
+    report.selected++;
     try {
       const result = await processHistoryPage({ db, item, ownerToken: claim.ownerToken });
       report.processed += result.processed; report.identityMissing += result.identityMissing || 0;
       if (result.completed) report.completed++; if (result.yielded) report.yielded++;
     } catch (error) {
-      await work.failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error }); report.failed++; report.ok = false;
+      const failed = await work.failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error });
+      if (failed.lost) { report.contended++; continue; }
+      report.failed++; report.ok = false;
+      report.reason ||= String(error?.code || error?.name || "NOTIFICATION_HISTORY_PAGE_FAILED").slice(0, 160);
+      if (failed.reconcileRequired) report.poisonedSignals++;
+      if (report.errorDetails.length < 5) report.errorDetails.push({
+        workId: item.id, workClass: item.workClass, table: item.progressCursor?.table ?? null,
+        code: String(error?.code || error?.name || "NOTIFICATION_HISTORY_PAGE_FAILED").slice(0, 160),
+        state: failed.state || null, consecutiveFailures: failed.consecutiveFailures || 0,
+      });
     }
   }
   return report;

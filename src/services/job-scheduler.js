@@ -2283,12 +2283,29 @@ function getRecurringSchedulerHealthSnapshot() {
 }
 
 let maintenanceHealth = { status: "UNKNOWN", lastCompletedAt: null, lastReason: null };
+function maintenanceDegradedDetails(result) {
+  const degraded = {};
+  for (const [name, lane] of Object.entries(result || {})) {
+    if (!lane || typeof lane !== "object" || lane.ok !== false) continue;
+    degraded[name] = {
+      reason: lane.reason ? String(lane.reason).slice(0, 240) : null,
+      failed: Number(lane.failed || 0), skipped: lane.skipped === true,
+      errors: Number(lane.errors || 0), contended: Number(lane.contended || 0),
+      poisonedSignals: Number(lane.poisonedSignals || 0),
+      errorDetails: Array.isArray(lane.errorDetails) ? lane.errorDetails.slice(0, 5) : [],
+      poisonedSample: Array.isArray(lane.poisonedSample) ? lane.poisonedSample.slice(0, 5) : [],
+      error: lane.error || null,
+    };
+  }
+  return degraded;
+}
 function handleMaintenanceTickResult(result, error = null) {
   if (!error && result?.skipped) return;
   maintenanceHealth = {
     status: error || result?.ok === false ? "DEGRADED" : "HEALTHY",
     lastCompletedAt: new Date().toISOString(),
-    lastReason: error ? String(error.code || error.message).slice(0,240) : result?.ok === false ? "maintenance_lane_failed" : null,
+    lastReason: error ? String(error.code || error.message).slice(0,240) : result?.ok === false
+      ? Object.entries(maintenanceDegradedDetails(result)).map(([name, lane]) => `${name}:${lane.reason || lane.error || "maintenance_lane_failed"}`).join(",").slice(0, 240) || "maintenance_lane_failed" : null,
   };
 }
 
@@ -2386,18 +2403,7 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
       .then((result) => {
         handleMaintenanceTickResult(result);
         if (result?.ok !== false) return;
-        const degraded = {};
-        for (const [name, lane] of Object.entries(result || {})) {
-          if (!lane || typeof lane !== "object" || lane.ok !== false) continue;
-          degraded[name] = {
-            errors: Number(lane.errors || 0),
-            contended: Number(lane.contended || 0),
-            poisonedSignals: Number(lane.poisonedSignals || 0),
-            errorDetails: Array.isArray(lane.errorDetails) ? lane.errorDetails.slice(0, 5) : [],
-            poisonedSample: Array.isArray(lane.poisonedSample) ? lane.poisonedSample.slice(0, 5) : [],
-            error: lane.error || null,
-          };
-        }
+        const degraded = maintenanceDegradedDetails(result);
         console.error(`[scheduler] Phase2 maintenance degraded: ${JSON.stringify(degraded)}`);
       })
       .catch((err) => {
@@ -2491,6 +2497,7 @@ module.exports = {
     handleRecurringSweepTickResult,
     handleAnalyticsDemandTickResult,
     handleMaintenanceTickResult,
+    maintenanceDegradedDetails,
     wakeDomainDependencyBatch,
   },
 };

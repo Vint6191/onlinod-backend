@@ -4,6 +4,7 @@ const definitions = Object.freeze([
   { name: "FanObservationToken_expiry_id_idx", table: "FanObservationToken", expression: '"createdAt","id"', unique: false },
   { name: "OfProviderRequestGateWaiter_expiry_id_idx", table: "OfProviderRequestGateWaiter", expression: '"leaseUntil","waiterId"', unique: false },
   { name: "OfProviderRequestGateWaiter_bucket_ticket_idx", table: "OfProviderRequestGateWaiter", expression: '"priority","category","ticket"', unique: false },
+  require("../../src/services/notification-identity-recovery-contract.json"),
 ].map(Object.freeze));
 async function ensureIndexes(db, { create = false } = {}) {
   for (const spec of definitions) {
@@ -11,7 +12,7 @@ async function ensureIndexes(db, { create = false } = {}) {
     if (current.valid) continue;
     if (current.exists) throw new Error(`MAINTENANCE_INDEX_INVALID:${spec.name}`);
     if (!create) throw new Error(`MAINTENANCE_INDEX_REQUIRED:${spec.name}`);
-    await db.$executeRawUnsafe(`CREATE INDEX CONCURRENTLY "${spec.name}" ON "${spec.table}" (${spec.expression})`);
+    await db.$executeRawUnsafe(`CREATE INDEX CONCURRENTLY "${spec.name}" ON "${spec.table}" (${spec.expression})${spec.where ? " WHERE " + spec.where : ""}`);
     current = await state(db, spec);
     if (!current.valid) throw new Error(`MAINTENANCE_INDEX_BUILD_INVALID:${spec.name}`);
   }

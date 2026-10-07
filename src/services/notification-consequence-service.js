@@ -34,6 +34,10 @@ async function projectFacts({ db, job, table, rows, historical = false, historyP
   for (const row of rows) {
     const fact = project(row);
     if (fact.kind === "sale" || fact.kind === "tip") {
+      // Retained facts may outlive both the fan relation and the event identity.
+      // The financial fact remains canonical; there is no fan-scoped Traffic
+      // projection to invalidate in that case. History records the identity gap.
+      if (!fact.fanId) continue;
       await traffic.markTrafficFanValueDirty({ db, agencyId: job.agencyId, creatorId: job.creatorId,
         fanId: fact.fanId, occurredAt: fact.purchasedAt || fact.receivedAt || fact.occurredAt,
         reason: `canonical_${fact.kind}` });

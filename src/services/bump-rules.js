@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { onlineObservationFresh } = require("./bump-write-window-service");
 
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function int(value, fallback, min, max) { const n = Number(value); return Number.isFinite(n) ? Math.max(min, Math.min(max, Math.floor(n))) : fallback; }
@@ -98,7 +99,7 @@ function eligibility({ candidate, fanState, settings, source, now }) {
   if (fanState?.cooldownUntil && fanState.cooldownUntil > now) return "fan_cooldown";
   if (source === "online") {
     const observed = date(candidate.observedAt || fanState?.lastOnlineAt);
-    if (!observed || observed.getTime() < now.getTime() - settings.onlineObservationTtlMs) return "stale_candidate";
+    if (!onlineObservationFresh(observed, settings.onlineObservationTtlMs, now)) return "stale_candidate";
   }
   if (source === "hidden_online" && candidate.metadata?.lastSeenIsNull !== true) return "stale_candidate";
   return null;
