@@ -8,7 +8,7 @@ const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adop
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob, createPlannedJobIfAbsent } = require("./job-planning-repository");
 const { runDbTransaction, withDbAdvisoryXactLock } = require("./db-transaction-service");
-const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
+const { lockSfsScope, sfsCandidateWhere } = require("./sfs-mutation-authority-service");
 const { projectFanObservationBatch, scheduleFanDataPointRefresh, scheduleDurableFanDataRefreshDebt } = require("./fan-data-authority-service");
 const { consumeFanObservationToken } = require("./fan-observation-token-service");
 const { PRECOMMIT_MUTABLE_STATUSES, ACTIVE_WRITE_WORKFLOW_STATUSES } = require("./automation-delivery-statuses");
@@ -104,7 +104,10 @@ async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
   });
 }
 async function withCreatorLock(db, agencyId, creatorId, fn) {
-  return withDbAdvisoryXactLock({ db, key: `p14:sfs:${agencyId}:${creatorId}`, work: fn, options: { timeout: 30_000 } });
+  return runDbTransaction(db, async tx => {
+    await lockSfsScope(tx,{agencyId,creatorId});
+    return withDbAdvisoryXactLock({ db:tx, key: `p14:sfs:${agencyId}:${creatorId}`, work: fn, options: { timeout: 30_000 } });
+  }, {timeout:30_000});
 }
 
 async function scheduleSfsCurrentRefresh({
@@ -118,6 +121,7 @@ async function scheduleSfsCurrentRefresh({
 }
 
 async function scheduleSfsDiscovery({ agencyId, creatorId, userId = null, force = false, source = "manual", priority = 75, db = prisma }) {
+  return withCreatorLock(db,agencyId,creatorId,async db => {
   await requireCreator(agencyId, creatorId, db);
   const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: SFS_MODULE_KEY, db });
   const settings = normalizeSfsSettings(control.modules.sfs.settings);
@@ -142,6 +146,7 @@ async function scheduleSfsDiscovery({ agencyId, creatorId, userId = null, force 
   });
   const job = planned.job;
   return { ok: true, created: job?.status === "SCHEDULED", reason: "scheduled", job };
+  });
 }
 
 async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunkResult, projectFanObservations = projectFanObservationBatch, consumeObservationToken = consumeFanObservationToken }) {
@@ -199,11 +204,10 @@ async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunk
     ...(Object.keys(valueFacts).length ? { value: { ...valueFacts, source: "USER_PROFILE", observedAt } } : {}),
   };
 
-  // Keep SFS projection locking separate from FanData locking. Automation
-  // settlement can touch FanData before SFS workflow state; overlapping those
-  // lock orders here would create an avoidable cross-domain deadlock class.
-  const candidateResult = await withDbAdvisoryXactLock({
-    db,
+  // Direct calls finish the candidate phase before FanData projection. When
+  // composed into a job commit, its SFS scope precedes both projections.
+  const candidateResult = await withCreatorLock(db,job.agencyId,job.creatorId,scopedTx => withDbAdvisoryXactLock({
+    db:scopedTx,
     key: `p14:sfs-target:${job.agencyId}:${job.creatorId}:${target.targetUserId}`,
     options: { timeout: 30_000 },
     work: async (tx) => {
@@ -259,7 +263,7 @@ async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunk
         } });
       return { applied: 1, candidateId: row.id, observedAt: observedAt.toISOString(), targetUserId: target.targetUserId };
     },
-  });
+  }));
 
   if (candidateResult.applied !== 1) return candidateResult;
   const fanProjection = await projectFanObservations(db, {
@@ -296,7 +300,7 @@ async function recordSfsJobFailure({ job, error, terminal = true, db = prisma })
       const updated = await db.sfsTargetCandidate.updateMany({
         where: {
           id: candidateId, agencyId: job.agencyId, creatorId: job.creatorId,
-          generation: candidateGeneration, scanJobId: job.id,
+          generation: candidateGeneration, scanJobId: job.id, completedAt: null, state: { not: "COMPLETED" },
         },
         data: { state: terminal ? "RECOVERY_REQUIRED" : "SCAN_RETRY", phase: "SCAN", latestError: clean(error, 1000) },
       });
@@ -333,11 +337,11 @@ function pickTemplate(templates, lastTemplateId = null) {
 }
 
 async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId = null, source = "manual", priority = 70, limit = 20, db = prisma, scheduleFanRefresh = (args) => scheduleFanDataPointRefresh({ ...args, db }) }) {
-  await requireCreator(agencyId, creatorId, db);
-  const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: SFS_MODULE_KEY, db });
-  const settings = normalizeSfsSettings(control.modules.sfs.settings);
-  if (!settings.huntingEnabled) return { ok: false, created: 0, reason: "hunting_disabled" };
   const result = await withCreatorLock(db, agencyId, creatorId, async (tx) => {
+    await requireCreator(agencyId, creatorId, tx);
+    const control = await assertAutomationEnabled({ agencyId, creatorId, moduleKey: SFS_MODULE_KEY, db: tx });
+    const settings = normalizeSfsSettings(control.modules.sfs.settings);
+    if (!settings.huntingEnabled) return { ok: false, created: 0, reason: "hunting_disabled" };
     const today = dayStart();
     const startedToday = await tx.automationDelivery.count({
       where: { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_FOLLOW_TARGET_ACTION_TYPE, createdAt: { gte: today }, status: { not: "CANCELED" } },
@@ -412,7 +416,7 @@ async function planSfsTargets({ agencyId, creatorId, userId = null, candidateId 
         delivery = assertAutomationDeliveryAdoption(await tx.automationDelivery.findUnique({ where: { idempotencyKey } }), { agencyId, creatorId, moduleKey: SFS_MODULE_KEY, actionType: SFS_FOLLOW_TARGET_ACTION_TYPE });
       }
       await tx.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
-        generation, state: "QUEUED", phase: "FOLLOW", eligibilityReason: null,
+        generation, state: "QUEUED", phase: "FOLLOW", eligibilityReason: null, completedAt: null,
         latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: delivery.status, latestError: null,
       } });
       created.push({ candidateId: candidate.id, deliveryId: delivery.id, notBefore }); remaining -= 1;
@@ -487,14 +491,14 @@ async function applySfsTargetScanCompletion({ job, result, db = prisma }) {
     return { type: "sfs_target_scan", applied: false, stale: true, reason: "scan_authority_missing", sideEffect: "STALE_NOOP" };
   }
 
-  return runDbTransaction(db, async (tx) => {
+  return withCreatorLock(db,job.agencyId,job.creatorId,async (tx) => {
     if (typeof tx.$queryRawUnsafe === "function") {
-      await tx.$queryRawUnsafe('SELECT "id" FROM "SfsTargetCandidate" WHERE "id" = $1 FOR UPDATE', candidateId);
+      await tx.$queryRawUnsafe('SELECT "id" FROM "SfsTargetCandidate" WHERE "id" = $1 AND "agencyId"=$2 AND "creatorId"=$3 FOR UPDATE', candidateId, job.agencyId, job.creatorId);
     }
     const candidate = await tx.sfsTargetCandidate.findFirst({
       where: {
         id: candidateId, agencyId: job.agencyId, creatorId: job.creatorId,
-        generation: candidateGeneration, scanJobId: job.id,
+        generation: candidateGeneration, scanJobId: job.id, completedAt: null, state: { not: "COMPLETED" },
       },
     });
     if (!candidate) {
@@ -625,6 +629,7 @@ async function validateSfsDelivery({ delivery, control, now = new Date(), db = p
   const candidateId = clean(object(delivery.payload).candidateId, 160);
   const candidate = candidateId ? await db.sfsTargetCandidate.findFirst({ where: { id: candidateId, agencyId: delivery.agencyId, creatorId: delivery.creatorId } }) : null;
   if (!candidate) return { ok: false, terminal: true, code: "invalid_target" };
+  if (candidate.generation !== delivery.generation) return { ok: false, terminal: true, code: "stale_candidate" };
   if (isSfsCleanupDelivery(delivery)) {
     if (candidate.completedAt || candidate.state === "COMPLETED") return { ok: false, terminal: true, code: "already_unfollowed" };
     const cleanupOwnership = await resolveSfsCleanupOwnership({ delivery, candidate, db });
@@ -634,9 +639,9 @@ async function validateSfsDelivery({ delivery, control, now = new Date(), db = p
     return { ok: true, candidate, cleanupOwnership };
   }
   if (!control?.effective?.sfsEnabled) return { ok: false, terminal: true, code: "module_disabled" };
+  if (candidate.completedAt || candidate.state === "COMPLETED") return { ok: false, terminal: true, code: "cycle_completed" };
   if (candidate.blocked) return { ok: false, terminal: true, code: "blocked" };
   if (candidate.ignored) return { ok: false, terminal: true, code: "ignored" };
-  if (candidate.generation !== delivery.generation) return { ok: false, terminal: true, code: "stale_candidate" };
   if (delivery.notBefore && delivery.notBefore.getTime() > now.getTime()) return { ok: false, terminal: false, code: "not_before", retryAt: delivery.notBefore };
   if (delivery.actionType !== SFS_FOLLOW_TARGET_ACTION_TYPE) return { ok: true, candidate };
 
@@ -675,7 +680,7 @@ async function validateSfsDelivery({ delivery, control, now = new Date(), db = p
 async function finalizeSfsSuccess({ delivery, outcomeCode, result = {}, db = prisma, now = new Date() }) {
   if (!delivery || delivery.moduleKey !== SFS_MODULE_KEY) return null;
   const candidateId = clean(object(delivery.payload).candidateId, 160);
-  const candidate = candidateId ? await db.sfsTargetCandidate.findUnique({ where: { id: candidateId } }) : null;
+  const candidate = candidateId ? await db.sfsTargetCandidate.findUnique({ where: sfsCandidateWhere(delivery, { includeCompleted: isSfsCleanupDelivery(delivery) }) }) : null;
   if (!candidate) return null;
   if (delivery.actionType === SFS_FOLLOW_TARGET_ACTION_TYPE) {
     const effectOwnership = classifySfsFollowEffectOwnership({ outcomeCode, result, delivery });
@@ -745,7 +750,7 @@ async function finalizeSfsFailure({ delivery, failureCode, retryable, db = prism
   if (!delivery || delivery.moduleKey !== SFS_MODULE_KEY) return null;
   const candidateId = clean(object(delivery.payload).candidateId, 160); if (!candidateId) return null;
   const cleanup = isSfsCleanupDelivery(delivery);
-  return db.sfsTargetCandidate.updateMany({ where: { id: candidateId, agencyId: delivery.agencyId, creatorId: delivery.creatorId }, data: {
+  return db.sfsTargetCandidate.updateMany({ where: sfsCandidateWhere(delivery), data: {
     state: cleanup && !retryable ? "RECOVERY_REQUIRED" : retryable ? "RETRY_SCHEDULED" : "FAILED",
     phase: cleanup ? "UNFOLLOW" : delivery.actionType === SFS_FOLLOW_TARGET_ACTION_TYPE ? "FOLLOW" : "ACTIONS",
     latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: retryable ? "RETRY_SCHEDULED" : "FAILED", latestError: failureCode,
@@ -757,9 +762,9 @@ async function finalizeSfsTerminal({ delivery, status, failureCode, db = prisma,
   if (delivery.actionType === SFS_FOLLOW_TARGET_ACTION_TYPE && status === "SKIPPED" && ["already_followed", "followed_recovered"].includes(failureCode)) {
     const effectOwnership = failureCode === "already_followed" ? "PREEXISTING" : "AMBIGUOUS_UNOWNED";
     const candidate = typeof db.sfsTargetCandidate.findFirst === "function"
-      ? await db.sfsTargetCandidate.findFirst({ where: { id: candidateId, agencyId: delivery.agencyId, creatorId: delivery.creatorId } })
+      ? await db.sfsTargetCandidate.findFirst({ where: sfsCandidateWhere(delivery) })
       : null;
-    return db.sfsTargetCandidate.updateMany({ where: { id: candidateId, agencyId: delivery.agencyId, creatorId: delivery.creatorId }, data: {
+    return db.sfsTargetCandidate.updateMany({ where: sfsCandidateWhere(delivery), data: {
       state: "SKIPPED", phase: "DONE", creatorFollowing: true, usedForever: false, completedAt: null,
       eligibilityReason: failureCode === "already_followed" ? "already_following" : "follow_ownership_unproven",
       latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: "SKIPPED", latestError: null,
@@ -769,7 +774,7 @@ async function finalizeSfsTerminal({ delivery, status, failureCode, db = prisma,
       },
     } });
   }
-  return db.sfsTargetCandidate.updateMany({ where: { id: candidateId }, data: {
+  return db.sfsTargetCandidate.updateMany({ where: sfsCandidateWhere(delivery), data: {
     state: isSfsCleanupDelivery(delivery) ? "RECOVERY_REQUIRED" : status,
     latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode,
   } });
@@ -777,7 +782,7 @@ async function finalizeSfsTerminal({ delivery, status, failureCode, db = prisma,
 async function prepareSfsRetry({ delivery, db = prisma }) {
   if (!delivery || delivery.moduleKey !== SFS_MODULE_KEY) return null;
   const candidateId = clean(object(delivery.payload).candidateId, 160); if (!candidateId) return null;
-  return db.sfsTargetCandidate.updateMany({ where: { id: candidateId }, data: {
+  return db.sfsTargetCandidate.updateMany({ where: sfsCandidateWhere(delivery), data: {
     state: isSfsCleanupDelivery(delivery) ? "UNFOLLOW_DUE" : "QUEUED", latestDeliveryId: delivery.id,
     latestActionType: delivery.actionType, latestStatus: "QUEUED", latestError: null,
   } });
@@ -844,7 +849,7 @@ async function setSfsCandidateState({ agencyId, creatorId, candidateId, action, 
     return { ok: true, deliveryId: delivery.id, requiresQueueRetry: true };
   }
 
-  return runWithAutomationWriteCommitFence({ db, agencyId, creatorId, options: { timeout: 30_000 }, work: async (tx) => {
+  return withCreatorLock(db,agencyId,creatorId,async (tx) => {
     const candidate = await tx.sfsTargetCandidate.findFirst({ where: { id: candidateId, agencyId, creatorId } });
     if (!candidate) throw Object.assign(new Error("SFS candidate not found"), { code: "candidate_not_found", status: 404 });
     const data = action === "ignore" ? { ignored: true, blocked: false, state: "IGNORED" }
@@ -888,7 +893,7 @@ async function setSfsCandidateState({ agencyId, creatorId, candidateId, action, 
       }
     }
     return { ok: true, item: updated };
-  } });
+  });
 }
 
 function resolveAutomaticSfsResult({ discovery, planning }) {

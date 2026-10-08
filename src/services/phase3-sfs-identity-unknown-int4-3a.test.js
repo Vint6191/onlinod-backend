@@ -20,6 +20,12 @@ function memoryDb() {
   const rows = [];
   return {
     rows,
+    $queryRawUnsafe: async (sql, id, agencyId) => {
+      if (/pg_advisory_xact_lock/.test(String(sql))) throw new Error("void deserialization");
+      if (/FROM "Agency"/.test(sql)) return [{ id, deletedAt: null, status: "ACTIVE" }];
+      if (/FROM "CreatorAccount"/.test(sql)) return [{ id, agencyId, deletedAt: null }];
+      return [];
+    },
     $executeRawUnsafe: async () => 1,
     sfsTargetCandidate: {
       async findFirst({ where }) {

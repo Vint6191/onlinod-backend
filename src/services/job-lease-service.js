@@ -499,6 +499,7 @@ async function sweepExpiredLeases(now = null, { agencyId = null, limit = 100 } =
   let changed = 0;
   for (const candidate of rows) {
     const applied = await runRootCommit(prisma, async ({ tx }) => {
+      await require("./sfs-mutation-authority-service").lockSfsJobMutation(tx,candidate);
       const locked = typeof tx.$queryRawUnsafe === "function"
         ? (await tx.$queryRawUnsafe('SELECT * FROM "JobInstance" WHERE "id"=$1 FOR UPDATE SKIP LOCKED', candidate.id))?.[0]
         : await tx.jobInstance.findUnique({ where: { id: candidate.id } });
@@ -730,6 +731,7 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   let job = await db.jobInstance.findUnique({ where: { id: jobId } });
   if (!job) throw new JobLeaseError("JOB_NOT_FOUND", "Job not found", 404);
   if (job.agencyId && job.agencyId !== device.agencyId) throw new JobLeaseError("JOB_DEVICE_AGENCY_MISMATCH", "Job belongs to a different device agency", 403);
+  if (lock) await require("./sfs-mutation-authority-service").lockSfsJobMutation(db,job);
   try {
     await assertExecutionAccessFence({ db, userId, agencyId: device.agencyId,
       memberId: job.leaseMemberId, accessEpoch: job.leaseAccessEpoch, creatorId: job.creatorId, lock });

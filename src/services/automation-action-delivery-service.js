@@ -469,7 +469,7 @@ async function updateSfsCandidateProgress(delivery, status, failureCode = null, 
   if (!candidateId) return;
   await db.sfsTargetCandidate.updateMany({
     where: {
-      id: candidateId, agencyId: delivery.agencyId, creatorId: delivery.creatorId,
+      ...require('./sfs-mutation-authority-service').sfsCandidateWhere(delivery),
       ...(claimOwnership ? {} : { OR: [{ latestDeliveryId: null }, { latestDeliveryId: delivery.id }] }),
     },
     data: {
@@ -674,10 +674,21 @@ async function applyFollowAutomationValidationTransition(delivery, validation, n
 }
 
 async function applySfsValidationTransition(delivery, validation, now = new Date(), executionAccess = null) {
-  const status = validation.terminal === true ? (validation.code === "already_unfollowed" ? "COMPLETED" : "SKIPPED") : "RETRY_SCHEDULED";
-  const retryAt = validation.retryAt || new Date(now.getTime() + 30_000);
   return runDbTransaction(prisma, async (tx) => {
     await lockCleanupMutation(tx,delivery);
+    // The supplied validation is only a pre-lock hint. Control, candidate and
+    // ownership may have changed while this transaction waited for admission.
+    const current = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
+    if (!current || current.leaseRevision !== delivery.leaseRevision
+      || current.agencyId !== delivery.agencyId || current.creatorId !== delivery.creatorId
+      || current.moduleKey !== delivery.moduleKey || current.originKind !== delivery.originKind
+      || !PRECOMMIT_EXECUTABLE_STATUSES.includes(current.status)) return false;
+    delivery = current;
+    const control = await getAutomationControlSnapshot({ agencyId: delivery.agencyId, creatorId: delivery.creatorId, db: tx });
+    validation = await validateSfsDelivery({ delivery, control, now, db: tx });
+    if (validation.ok !== false) return false;
+    const status = validation.terminal === true ? (validation.code === "already_unfollowed" ? "COMPLETED" : "SKIPPED") : "RETRY_SCHEDULED";
+    const retryAt = validation.retryAt || new Date(now.getTime() + 30_000);
     if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: PRECOMMIT_EXECUTABLE_STATUSES }, leaseRevision: delivery.leaseRevision },
@@ -794,7 +805,13 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
     const claimUntil = new Date(now.getTime() + leaseDuration(leaseMs));
     try {
       const claimed = await runDbTransaction(prisma, async (tx) => {
-        await lockBillingWriteAdmission({ db: tx, agencyId: candidate.agencyId });
+        await lockCleanupMutation(tx,candidate);
+        if (candidate.moduleKey !== SFS_MODULE_KEY) await lockBillingWriteAdmission({ db: tx, agencyId: candidate.agencyId });
+        if (candidate.moduleKey === SFS_MODULE_KEY && !reconciliationClaim) {
+          const liveControl = await assertDeliveryControl(candidate, { db: tx });
+          const liveValidation = await validateSfsDelivery({ delivery: candidate, control: liveControl, now, db: tx });
+          if (liveValidation.ok === false) return null;
+        }
         await assertExecutionAccessFence({ db: tx, userId, agencyId: candidate.agencyId, memberId: member.id, accessEpoch: Number(member.accessEpoch || 1), creatorId: candidate.creatorId, lock: true });
         if (!reconciliationClaim) await assertBillingWriteAdmission({ db: tx, agencyId: candidate.agencyId, creatorId: candidate.creatorId });
         // Legacy Audit13 rows may still be RETRY_SCHEDULED while carrying the
@@ -857,13 +874,22 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
 
 async function requireLease({ deliveryId, userId, deviceId, leaseToken, leaseRevision, allowTerminal = false, allowExpired = false, allowCommittedSettlement = false, lockAccess = false, billingAdmission = false, db = prisma }) {
   const { device, member } = await requireOwnedSeniorDevice({ userId, deviceId, db });
-  const delivery = await db.automationDelivery.findUnique({ where: { id: deliveryId } });
+  let delivery = await db.automationDelivery.findUnique({ where: { id: deliveryId } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   if (delivery.originKind !== "AUTOMATION") {
     throw new ActionDeliveryError("DELIVERY_WRONG_AUTHORITY", "Programmatic write deliveries must use ProgrammaticOfWriteAuthority", 403);
   }
   if (delivery.agencyId !== device.agencyId) throw new ActionDeliveryError("DELIVERY_DEVICE_AGENCY_MISMATCH", "Delivery belongs to another agency", 403);
-  if (billingAdmission && lockAccess) await lockBillingWriteAdmission({ db, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
+  if (billingAdmission && lockAccess && delivery.moduleKey !== SFS_MODULE_KEY) await lockBillingWriteAdmission({ db, agencyId: delivery.agencyId, creatorId: delivery.creatorId });
+  if (lockAccess) await lockCleanupMutation(db,delivery);
+  if (lockAccess && delivery.moduleKey === SFS_MODULE_KEY) {
+    const current = await db.automationDelivery.findUnique({ where: { id: deliveryId } });
+    if (!current || current.agencyId !== delivery.agencyId || current.creatorId !== delivery.creatorId
+      || current.moduleKey !== delivery.moduleKey || current.originKind !== delivery.originKind) {
+      throw new ActionDeliveryError("DELIVERY_LEASE_STALE", "Delivery scope changed before admission");
+    }
+    delivery = current;
+  }
   const terminal = TERMINAL_STATUSES.includes(delivery.status);
   if (!(LEASED_STATUSES.includes(delivery.status) || (allowTerminal && terminal))) {
     throw new ActionDeliveryError("DELIVERY_NOT_CLAIMED", `Delivery status is ${delivery.status}`);
@@ -1485,6 +1511,7 @@ async function releaseActionDelivery(input) {
   const runAfterMs = Math.max(0, Math.min(24 * 60 * 60_000, Number(input.runAfterMs) || 0));
   const nextStatus = reconciliationLease ? "RECONCILE_REQUIRED" : "QUEUED";
   const updated = await runDbTransaction(prisma, async (tx) => {
+    await lockCleanupMutation(tx,delivery);
     await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: ["CLAIMED", "RUNNING"] }, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision },
@@ -1574,6 +1601,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId, db = pri
     if (validation.ok === false && validation.code === "already_liked") {
       const now = new Date();
       const latest = await runDbTransaction(db, async (tx) => {
+        await lockCleanupMutation(tx,delivery);
         await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
         const changed = await tx.automationDelivery.updateMany({
           where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1616,6 +1644,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId, db = pri
     if (validation.ok === false && validation.code === "already_followed") {
       const now = new Date();
       const latest = await runDbTransaction(db, async (tx) => {
+        await lockCleanupMutation(tx,delivery);
         await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
         const changed = await tx.automationDelivery.updateMany({
           where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1635,6 +1664,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId, db = pri
     if (validation.ok === false && validation.retryAt) retryAt = validation.retryAt;
   }
   const updated = await runDbTransaction(db, async (tx) => {
+    await lockCleanupMutation(tx,delivery);
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1687,6 +1717,7 @@ async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason 
   }
   const finishedAt = new Date();
   const updated = await runDbTransaction(db, async (tx) => {
+    await lockCleanupMutation(tx,delivery);
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
@@ -1734,6 +1765,7 @@ async function releaseClaimByAdmin({ agencyId, actorUserId, deliveryId, db = pri
   if (["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status)) throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before administrative release");
   if (!["CLAIMED", "RUNNING"].includes(delivery.status)) return { ok: true, duplicate: true, delivery };
   const updated = await runDbTransaction(db, async (tx) => {
+    await lockCleanupMutation(tx,delivery);
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, originKind: "AUTOMATION", status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },

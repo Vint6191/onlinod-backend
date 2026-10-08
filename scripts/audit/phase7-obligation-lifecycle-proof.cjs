@@ -126,6 +126,11 @@ async function main(){
    require('node:vm').runInNewContext(await fs.readFile(file,'utf8')+'\nmodule.exports.proofTransition=applySfsValidationTransition;',
     {module:m,exports:m.exports,require:id=>id==='../prisma'?db:load(id),__dirname:path.dirname(file),process,console,Buffer,Date,setTimeout,clearTimeout,setInterval,clearInterval},{filename:file});
    const before=await db.automationDelivery.findUnique({where:{id:cleanupId('oldcanonical')}});
+   // A caller hint is insufficient: only the state read under SFS authority
+   // can prove already_unfollowed. First exercise the rejected stale hint.
+   assert.equal(await m.exports.proofTransition(before,{terminal:true,code:'already_unfollowed'}),false);
+   assert.equal((await db.automationDelivery.findUnique({where:{id:before.id}})).status,'QUEUED');
+   await db.sfsTargetCandidate.update({where:{id:'candidate-oldcanonical'},data:{state:'COMPLETED',completedAt:new Date()}});
    assert.equal(await m.exports.proofTransition(before,{terminal:true,code:'already_unfollowed'}),true);
    const finished=await db.automationDelivery.findUnique({where:{id:before.id}});assert.equal(finished.result.code,'already_unfollowed');assert.equal(finished.writeCommitAt,null);
    const rows=await db.automationDelivery.findMany({where:{creatorId:'c-oldcanonical'}});
@@ -174,7 +179,16 @@ async function main(){
    assert.equal((await finalizer.checkContractReady(db,{root,releaseFile})).ready,true);
   });
   const contractSql=await fs.readFile(path.join(root,'prisma/migrations',f.excludedContract,'migration.sql'),'utf8');
-  const refusedContract=async pattern=>{await db.$disconnect();try{await assert.rejects(f.engine.exec(contractSql),pattern);}finally{await f.engine.exec('ROLLBACK');}assert.equal((await storage.storageState(db)).phase,'BRIDGE');assert.equal(await db.phase7RetirementCohort.count({where:{state:'PURGE_READY'}}),6);};
+  // PGlite has one physical session. Fully detach the wire-protocol endpoint
+  // before direct multi-statement SQL, then discard session state and restart
+  // it. A Prisma disconnect alone can leave a pending protocol detach racing
+  // the direct engine call and reject the next connection nondeterministically.
+  const directContract=async work=>{
+   await db.$disconnect();await f.server.stop();
+   try{await f.engine.exec('DISCARD ALL');return await work();}
+   finally{await f.engine.exec('ROLLBACK');await f.engine.exec('DISCARD ALL');await f.server.start();}
+  };
+  const refusedContract=async pattern=>{await directContract(()=>assert.rejects(f.engine.exec(contractSql),pattern));assert.equal((await storage.storageState(db)).phase,'BRIDGE');assert.equal(await db.phase7RetirementCohort.count({where:{state:'PURGE_READY'}}),6);};
   await check('archive tampering after preparation rolls back all nine DROP statements in the unchanged contract',async()=>{
    const p=await db.phase7RetirementPartition.findFirst({where:{sequence:{gt:0}}});await db.phase7RetirementPartition.update({where:{id:p.id},data:{rows:p.rows+1n}});
    await refusedContract(/PHASE7_ARCHIVE_ADMISSION_INCONSISTENT/);await db.phase7RetirementPartition.update({where:{id:p.id},data:{rows:p.rows}});
@@ -187,7 +201,7 @@ async function main(){
    await refusedContract(/PHASE7_CLEANUP_HANDOFF_INCOMPLETE/);await db.sfsTargetCandidate.update({where:{id:'candidate-rebind'},data:{metadata:{legacyMigration:true}}});
   });
   await check('valid unchanged contract removes exactly the nine compatibility tables and retains all obligations',async()=>{
-   const before=await db.phase7RetirementProof.count();await db.$disconnect();await f.engine.exec(contractSql);
+   const before=await db.phase7RetirementProof.count();await directContract(()=>f.engine.exec(contractSql));
    const state=await storage.storageState(db);assert.equal(state.phase,'PURGED');assert.equal(state.targetReady,true);assert.equal(await db.phase7RetirementProof.count(),before);
    assert.equal(await db.creatorAccount.count({where:{agencyId:'a135'}}),keys.length);
   });

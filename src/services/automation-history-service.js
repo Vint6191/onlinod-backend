@@ -101,12 +101,23 @@ async function archiveAutomationDeliveryBatch({ tx, rows, olderThan, strict = fa
   const liveAgencies = new Set();
   for (const agencyId of agencies) {
     const lifecycle = await lockAgencyLifecycleBarrier({ db: tx, agencyId });
-    if (lifecycle.row && !lifecycle.row.deletedAt) liveAgencies.add(agencyId);
+    if (lifecycle.row && !lifecycle.row.deletedAt) {
+      // The lifecycle barrier is already held; take the billing row lock before
+      // creator rows without repeating the lifecycle queries for this agency.
+      const admitted = await tx.$queryRawUnsafe('SELECT "id" FROM "Agency" WHERE "id"=$1 FOR SHARE', agencyId);
+      if (admitted.length) liveAgencies.add(agencyId);
+    }
   }
   const creatorIds = [...new Set(rows.filter(row => liveAgencies.has(row.agencyId)).map(row => row.creatorId))].sort();
   const creators = creatorIds.length ? await tx.$queryRawUnsafe('SELECT "id", "agencyId", "deletedAt" FROM "CreatorAccount" WHERE "id" = ANY($1::text[]) ORDER BY "id" FOR SHARE', creatorIds) : [];
   const liveCreators = new Map(creators.filter(row => !row.deletedAt).map(row => [row.id, row.agencyId]));
   const eligible = rows.filter(row => liveCreators.get(row.creatorId) === row.agencyId);
+  // Retention joins SFS control/execution before taking candidate or delivery
+  // rows. Every multi-creator batch uses the same sorted acquisition order.
+  const sfsCreators = [...new Set(eligible.filter(row => row.moduleKey === 'sfs').map(row => row.creatorId))].sort();
+  await require('./automation-write-commit-fence-service').lockAutomationWriteCommitFences({
+    db: tx, scopes: sfsCreators.map(creatorId => ({ agencyId: liveCreators.get(creatorId), creatorId })),
+  });
   // SFS settlement locks candidate before delivery. Preserve that order and
   // retain missing/malformed candidate proofs conservatively.
   const cleanupContract = require('./phase7-cleanup-contract');

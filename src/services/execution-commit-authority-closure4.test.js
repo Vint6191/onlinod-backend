@@ -114,8 +114,10 @@ test("Closure4 recurring automatic modules route lock semantics through shared a
     ["follow-automation-service.js", /withDbAdvisoryXactLock/],
     ["bump-service.js", /runWithAutomationWriteCommitFence/],
     ["likes-service.js", /runWithAutomationWriteCommitFence/],
-    ["sfs-service.js", /runWithAutomationWriteCommitFence/],
+    ["sfs-service.js", /lockSfsScope/],
   ]);
+  const sfsAuthority = fs.readFileSync(path.resolve(__dirname, "sfs-mutation-authority-service.js"), "utf8");
+  assert.match(sfsAuthority, /lockAutomationWriteCommitFence/);
   for (const [file, authority] of expected) {
     const source = fs.readFileSync(path.resolve(__dirname, file), "utf8");
     assert.match(source, authority, file);

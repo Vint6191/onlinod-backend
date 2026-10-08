@@ -6,21 +6,14 @@ const contract=require('./phase7-cleanup-contract');
 async function lockScope(tx,{agencyId,creatorId}) {
   transactionRequired(tx);
   if(!agencyId)throw failure('PHASE7_LIFECYCLE_SCOPE_REQUIRED');
+  if(creatorId)return require('./sfs-mutation-authority-service').lockSfsScope(tx,{agencyId,creatorId});
   const agency=await lockAgencyLifecycleBarrier({db:tx,agencyId});
   if(!agency.row)throw failure('PHASE7_OBLIGATION_AGENCY_ABSENT');
-  if(!creatorId)return null;
-  const rows=await tx.$queryRawUnsafe('SELECT "id","agencyId","remoteId","deletedAt" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 FOR SHARE',creatorId,agencyId);
-  return rows[0]||null;
+  return null;
 }
-// Every legacy cleanup settlement/failure writer takes this prefix before the
-// delivery row or access-member locks, matching handoff and retention ordering.
+// Compatibility entry point for the shared current/legacy SFS mutation prefix.
 async function lockCleanupMutation(tx,delivery) {
-  if(!contract.isLegacyCleanup(delivery))return;
-  await lockScope(tx,{agencyId:delivery.agencyId,creatorId:delivery.creatorId});
-  await require('./phase7-legacy-storage-service').lockDbAdvisoryXact({db:tx,
-    key:`p14:sfs-target:${delivery.agencyId}:${delivery.creatorId}:${delivery.targetId}`});
-  const candidate=await lockCandidate(tx,{agencyId:delivery.agencyId,creatorId:delivery.creatorId,targetId:delivery.targetId});
-  if(candidate.id!==delivery.payload.candidateId)throw failure('PHASE7_SFS_OWNER_UNPROVEN');
+  return require('./sfs-mutation-authority-service').lockSfsDeliveryMutation(tx,delivery);
 }
 async function readLegacySource(tx,{id,agencyId,sourceHash,optional=false}) {
   transactionRequired(tx);

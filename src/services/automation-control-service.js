@@ -352,7 +352,7 @@ async function projectControlDeliveryState(db, delivery, status, failureCode = n
   if (delivery.moduleKey === SFS_MODULE_KEY) {
     const candidateId = delivery.payload && typeof delivery.payload === "object" ? delivery.payload.candidateId : null;
     if (candidateId) await db.sfsTargetCandidate.updateMany({
-      where: { id: String(candidateId), agencyId: delivery.agencyId, creatorId: delivery.creatorId, ...staleFence },
+      where: { ...require('./sfs-mutation-authority-service').sfsCandidateWhere(delivery), ...staleFence },
       data: { latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: status, latestError: failureCode },
     });
   }
@@ -475,11 +475,19 @@ async function setAutomationControl({ agencyId, userId, scope, creatorId = null,
       agencyId, userId, scope, creatorId, moduleKey, enabled, settings, db: tx, _commitFenceHeld: true,
     }), { timeout: 30_000 });
   }
-  await lockAutomationWriteCommitFence({ db, agencyId, creatorId: scope === "workspace" ? null : creatorId });
-
   const normalizedScope = clean(scope, 40);
   if (!normalizedScope || !["workspace", "creator", "module"].includes(normalizedScope)) {
     throw Object.assign(new Error("Invalid automation control scope"), { code: "INVALID_CONTROL_SCOPE", status: 400 });
+  }
+  // Creator retirement takes the creator row before this fence. Match it before
+  // the control upsert can acquire a CreatorAccount foreign-key row lock.
+  // Workspace control has no creator FK and never acquires creator rows after
+  // its exclusive agency fence, including failure projection below.
+  if (normalizedScope !== "workspace" && creatorId) {
+    await require('./sfs-mutation-authority-service').lockSfsScope(db,{agencyId,creatorId});
+  } else {
+    await require('./billing-write-admission-service').lockBillingWriteAdmission({db,agencyId});
+    await lockAutomationWriteCommitFence({ db, agencyId, creatorId: null });
   }
   if (normalizedScope !== "workspace") await requireCreator(agencyId, creatorId, db);
   if (normalizedScope === "module" && !SUPPORTED_MODULE_KEYS.has(moduleKey)) {

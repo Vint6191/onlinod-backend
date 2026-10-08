@@ -96,7 +96,12 @@ function loadPlanningServices(rootDb) {
 
 test("Closure2 TransactionClient without $transaction supports SFS completion and Likes/SFS/Bumps planning", async () => {
   const tx = {
-    $queryRawUnsafe: async (sql) => { if (/pg_advisory_xact_lock/.test(String(sql))) throw new Error("void deserialization"); return []; },
+    $queryRawUnsafe: async (sql, id, agencyId) => {
+      if (/pg_advisory_xact_lock/.test(String(sql))) throw new Error("void deserialization");
+      if (/FROM "Agency"/.test(sql)) return [{ id, deletedAt: null, status: "ACTIVE" }];
+      if (/FROM "CreatorAccount"/.test(sql)) return [{ id, agencyId, deletedAt: null }];
+      return [];
+    },
     $executeRawUnsafe: async () => 1,
     subscriberDirectoryState: { findFirst: async () => null },
     sfsTargetCandidate: { findFirst: async () => null, findMany: async () => [] },
@@ -371,7 +376,12 @@ test("Closure2 Likes S1 completion/failure cannot overwrite current S2", async (
 test("Closure2 delayed SFS generation 1 scan is a no-op after candidate advances to generation 2", async () => {
   let deliveryCreates = 0;
   const tx = {
-    $queryRawUnsafe: async (sql) => { if (/pg_advisory_xact_lock/.test(String(sql))) throw new Error("void deserialization"); return []; },
+    $queryRawUnsafe: async (sql, id, agencyId) => {
+      if (/pg_advisory_xact_lock/.test(String(sql))) throw new Error("void deserialization");
+      if (/FROM "Agency"/.test(sql)) return [{ id, deletedAt: null, status: "ACTIVE" }];
+      if (/FROM "CreatorAccount"/.test(sql)) return [{ id, agencyId, deletedAt: null }];
+      return [];
+    },
     $executeRawUnsafe: async () => 1,
     sfsTargetCandidate: {
       findFirst: async () => null,
