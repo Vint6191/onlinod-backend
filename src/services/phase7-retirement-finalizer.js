@@ -21,6 +21,7 @@ async function checkContractReady(db,{root=require('node:path').resolve(__dirnam
   require('../../scripts/database/phase7-release-source').sameRelease(receipt,release);
   const checked=require('./phase7-contract-evidence').validateEvidence(receipt.operatorEvidence,receipt);
   if(checked.evidenceHash!==receipt.operatorEvidenceHash)throw failure('PHASE7_OPERATOR_EVIDENCE_HASH_MISMATCH');
+  await require('./phase7-archive-integrity').assertArchiveAdmission(db,checked.evidence.archive);
   await require('../../scripts/database/phase7-role-preflight').inspectRoles(db,{roles:receipt.roleReport?.runtimeRoles?.map(r=>r.name),strict:true});
   await assertNoOldExecutions(db);return {ready:true,fingerprint,release};
 }
@@ -40,6 +41,7 @@ async function prepareContract({db,release,closeRollback=false,operatorEvidence,
     for(const c of rows){const invalid=await tx.phase7RetirementPartition.findFirst({where:{cohortId:c.id,state:{not:'VERIFIED'}},select:{id:true}});if(invalid)throw failure('PHASE7_PARTITION_UNVERIFIED',{partitionId:invalid.id});}
     const mismatch=await tx.phase7RetirementPartition.findFirst({where:{cohortId:{in:COHORTS},sequence:{gt:0},OR:[{archiveRoot:{not:checked.evidence.archive.exportRoot}},{archiveRoot:null},{restoreRoot:{not:checked.evidence.archive.restoreRoot}},{restoreRoot:null}]},select:{id:true}});
     if(mismatch)throw failure('PHASE7_ARCHIVE_EVIDENCE_ROOT_MISMATCH',{partitionId:mismatch.id});
+    await require('./phase7-archive-integrity').assertArchiveAdmission(tx,checked.evidence.archive);
     await assertNoOldExecutions(tx);
     const fingerprint=(await tx.$queryRawUnsafe('SELECT phase7_storage_fingerprint() AS value'))[0].value;
     await tx.phase7RetirementCohort.updateMany({where:{id:{in:COHORTS}},data:{state:'PURGE_READY',fingerprint,releaseManifest:receipt,verifiedAt:new Date(),rollbackClosedAt:new Date(),revision:{increment:1}}});

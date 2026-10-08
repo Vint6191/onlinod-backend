@@ -4,6 +4,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { manifest, DESTRUCTIVE, COHORTS, q, sha, failure, tableContract, readArchivePage, runDbTransaction } = require('./phase7-legacy-storage-service');
 const { handoffLegacyJob } = require('./phase7-obligation-handoff-service');
+const integrity = require('./phase7-archive-integrity');
 const md5 = x => crypto.createHash('md5').update(x).digest('hex');
 const agencyKey = (t, id) => !t.scopeColumn ? 'g:GLOBAL' : id === null ? 'q:NULL' : 'a:' + id;
 const partitionId = (table, key) => table + ':' + md5(key);
@@ -82,41 +83,79 @@ async function claimPartition(db, { leaseMs = 30000, onlyId = null } = {}) {
     return p;
   }, { timeout:10000 });
 }
-async function archiveDirectory(directory) {
+async function archiveDirectory(directory, { create = true } = {}) {
+  if (typeof directory !== 'string' || !directory.trim()) throw failure('PHASE7_ARCHIVE_DIRECTORY_INVALID');
   const root = path.resolve(directory);
-  await fs.mkdir(root,{recursive:true,mode:0o700});
+  if (create) await fs.mkdir(root,{recursive:true,mode:0o700});
   const st = await fs.lstat(root);
   if (!st.isDirectory() || st.isSymbolicLink() || await fs.realpath(root) !== root) throw failure('PHASE7_ARCHIVE_DIRECTORY_INVALID');
   return root;
 }
+function artifactName(name) {
+  if (typeof name !== 'string' || !/^[a-f0-9]{64}\.(jsonl|manifest\.json)$/.test(name)) throw failure('PHASE7_ARCHIVE_NAME_INVALID');
+}
+function unchanged(a, b) {
+  return a.isFile() && b.isFile() && a.dev === b.dev && a.ino === b.ino
+    && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+}
+function retainCleanup(error, cleanup) {
+  if (!error) return cleanup;
+  error.phase7CleanupErrors ||= [];
+  error.phase7CleanupErrors.push({ code: cleanup.code || 'PHASE7_ARCHIVE_CLEANUP_FAILED' });
+  return error;
+}
 async function readArtifact(root, name, cap = manifest.pageBytes) {
-  if (!/^[a-f0-9]{64}\.(jsonl|manifest\.json)$/.test(name)) throw failure('PHASE7_ARCHIVE_NAME_INVALID');
+  artifactName(name);
+  if (!Number.isSafeInteger(cap) || cap < 1 || cap > manifest.pageBytes) throw failure('PHASE7_ARCHIVE_LIMIT_INVALID');
+  await archiveDirectory(root, { create: false });
   const file = path.join(root,name), st = await fs.lstat(file);
   if (!st.isFile() || st.isSymbolicLink() || st.size > cap) throw failure('PHASE7_ARCHIVE_FILE_INVALID');
   const h = await fs.open(file, require('node:fs').constants.O_RDONLY | (require('node:fs').constants.O_NOFOLLOW || 0));
-  try { const actual = await h.stat(); if (actual.size > cap) throw failure('PHASE7_ARCHIVE_FILE_OVERSIZE'); const buffer=Buffer.alloc(Math.min(cap+1,actual.size+1)); let offset=0;
+  let error;
+  try {
+    const actual = await h.stat();
+    if (!unchanged(st, actual)) throw failure('PHASE7_ARCHIVE_FILE_CHANGED');
+    const buffer=Buffer.alloc(Math.min(cap+1,actual.size+1)); let offset=0;
     while (offset<buffer.length) { const r=await h.read(buffer,offset,buffer.length-offset,null); if (!r.bytesRead) break; offset+=r.bytesRead; }
     if (offset>cap || offset!==actual.size) throw failure('PHASE7_ARCHIVE_FILE_CHANGED');
     const extra=Buffer.alloc(1); if ((await h.read(extra,0,1,null)).bytesRead) throw failure('PHASE7_ARCHIVE_FILE_CHANGED');
-    return buffer.subarray(0,offset); }
-  finally { await h.close(); }
+    if (!unchanged(actual, await h.stat()) || !unchanged(actual, await fs.lstat(file))) throw failure('PHASE7_ARCHIVE_FILE_CHANGED');
+    await archiveDirectory(root, { create: false });
+    return buffer.subarray(0,offset);
+  } catch (cause) { error = cause; throw cause; }
+  finally { try { await h.close(); } catch (cause) { if (error) retainCleanup(error, cause); else throw cause; } }
 }
 async function durableArtifact(root,name,bytes) {
-  if (bytes.length > manifest.pageBytes) throw failure('PHASE7_ARCHIVE_CHUNK_OVERSIZE');
+  artifactName(name);
+  if (!Buffer.isBuffer(bytes) || bytes.length > manifest.pageBytes) throw failure('PHASE7_ARCHIVE_CHUNK_OVERSIZE');
+  await archiveDirectory(root, { create: false });
   const temp = path.join(root,'.pending-' + crypto.randomUUID());
-  const h = await fs.open(temp,'wx',0o600);
-  try { await h.writeFile(bytes); await h.sync(); } finally { await h.close(); }
-  try { await fs.link(temp,path.join(root,name)); }
-  catch(error) { if (error.code !== 'EEXIST') throw error; if (sha(await readArtifact(root,name)) !== sha(bytes)) throw failure('PHASE7_ARCHIVE_CHUNK_CONFLICT'); }
-  finally { await fs.unlink(temp).catch(()=>{}); }
-  // fsync the directory makes the committed name survive a host crash.
-  const d = await fs.open(root,'r'); try { await d.sync(); } finally { await d.close(); }
+  let h, error, owned = false;
+  try {
+    h = await fs.open(temp,'wx',0o600);
+    owned = true;
+    await h.writeFile(bytes); await h.sync(); await h.close(); h = null;
+    try { await fs.link(temp,path.join(root,name)); }
+    catch (cause) { if (cause.code !== 'EEXIST') throw cause; if (sha(await readArtifact(root,name)) !== sha(bytes)) throw failure('PHASE7_ARCHIVE_CHUNK_CONFLICT'); }
+  } catch (cause) { error = cause; }
+  finally {
+    if (h) { try { await h.close(); } catch (cause) { error = retainCleanup(error, cause); } }
+    if (owned) { try { await fs.unlink(temp); } catch (cause) { if (cause.code !== 'ENOENT') error = retainCleanup(error, cause); } }
+  }
+  if (error) throw error;
+  // No receipt can commit before the linked name and temporary-file removal
+  // are durably represented in the directory.
+  const d = await fs.open(root,'r');
+  try { await d.sync(); } catch (cause) { error = cause; throw cause; }
+  finally { try { await d.close(); } catch (cause) { if (error) retainCleanup(error, cause); else throw cause; } }
 }
 function chunkManifest(p,c){return {version:1,generation:manifest.generation,planHash:manifest.planHash,partitionId:p.id,tableName:p.tableName,agencyId:p.agencyId,
   sourceEpoch:String(p.sourceEpoch),sequence:c.sequence,startCursor:c.startCursor,endCursor:c.endCursor,rows:c.rows,bytes:c.bytes,digest:c.digest,previousDigest:c.previousDigest};}
 async function processPartition({ db, partition, directory, limit = 100 }) {
-  const p = partition; if (p.empty) return { partitionId:p.id,empty:true };
+  const p = partition;
   try {
+    integrity.inspectPartition(p);
+    if (p.empty) return { partitionId:p.id,empty:true };
     const page = await readArchivePage({ db,table:p.tableName,agencyId:p.agencyId,cursor:p.cursor,upperBound:p.upperBound,limit,orphanScope:p.agencyId===null });
     if (p.tableName === 'AutomationJob') {
       for (let i=0;i<page.items.length;i++) await handoffLegacyJob({ db,job:page.items[i],sourceHash:page.sourceHashes[i] });
@@ -149,24 +188,38 @@ async function processPartition({ db, partition, directory, limit = 100 }) {
       return { partitionId:p.id,rows:page.items.length,bytes:data.length,state:page.hasMore?'PENDING':'EXPORTED' };
     },{timeout:10000});
   } catch(error) {
-    await runDbTransaction(db, tx => tx.$executeRawUnsafe(`UPDATE "Phase7RetirementPartition" SET "state"='BLOCKED',"lastError"=$5,"ownerToken"=NULL,"leaseUntil"=NULL
+    try { await runDbTransaction(db, tx => tx.$executeRawUnsafe(`UPDATE "Phase7RetirementPartition" SET "state"='BLOCKED',"lastError"=$5,"ownerToken"=NULL,"leaseUntil"=NULL
       WHERE "id"=$1 AND "ownerToken"=$2 AND "leaseRevision"=$3 AND "sourceEpoch"=$4 AND "leaseUntil">clock_timestamp()`,
-      p.id,p.ownerToken,p.leaseRevision,p.sourceEpoch,String(error.code || error.message).slice(0,500)));
+      p.id,p.ownerToken,p.leaseRevision,p.sourceEpoch,String(error.code || error.message).slice(0,500))); }
+    catch (cleanup) { retainCleanup(error, cleanup); }
     throw error;
   }
 }
 async function verifyPartitionPage({ db, directory, partitionId: id }) {
   const p = await db.phase7RetirementPartition.findUnique({where:{id}});
   if (!p || !['EXPORTED','VERIFIED'].includes(p.state)) throw failure('PHASE7_ARCHIVE_NOT_EXPORTED');
-  if (p.state === 'VERIFIED') return {verified:true};
-  const chunks = await db.phase7RetirementChunk.findMany({where:{partitionId:id,sourceEpoch:p.sourceEpoch,sequence:{gt:p.verifiedSequence}},orderBy:{sequence:'asc'},take:1});
-  let next = p.verifiedSequence, chain = p.verifiedDigest || '', restoreRoot=p.restoreRoot;
-  const root = await archiveDirectory(directory);
-  if(p.restoreRoot && p.restoreRoot!==sha(root))throw failure('PHASE7_RESTORE_ROOT_CHANGED');
-  restoreRoot=sha(root);
+  integrity.inspectPartition(p);
+  const root = await archiveDirectory(directory, { create: false });
+  if (p.restoreRoot && p.restoreRoot !== sha(root)) throw failure('PHASE7_RESTORE_ROOT_CHANGED');
+  if (p.sequence > 0 && sha(root) === p.archiveRoot) throw failure('PHASE7_INDEPENDENT_RESTORE_DIRECTORY_REQUIRED');
+  if (p.state === 'VERIFIED') {
+    await integrity.verifyTotals(db, p);
+    return { partitionId:id, verified:true, alreadyVerified:true, verifiedSequence:p.verifiedSequence };
+  }
+  const window = await db.phase7RetirementChunk.findMany({where:{partitionId:id,sourceEpoch:p.sourceEpoch,sequence:{gte:Math.max(1,p.verifiedSequence)}},orderBy:{sequence:'asc'},take:3});
+  for (const c of window) integrity.inspectChunk(p, c);
+  const previous = p.verifiedSequence > 0 ? window.shift() : null;
+  if (p.verifiedSequence > 0 && previous?.sequence !== p.verifiedSequence) throw failure('PHASE7_ARCHIVE_CHUNK_MISSING');
+  const chunks = window.slice(0,1);
+  if (p.verifiedSequence < p.sequence && chunks[0]?.sequence !== p.verifiedSequence+1) throw failure('PHASE7_ARCHIVE_CHUNK_MISSING');
+  if (p.verifiedSequence === p.sequence && chunks.length) throw failure('PHASE7_ARCHIVE_CHUNK_INCONSISTENT');
+  let next = p.verifiedSequence, chain = p.verifiedDigest || '';
+  const restoreRoot=sha(root);
   if (chunks.length) {
     if (!p.archiveRoot || sha(root) === p.archiveRoot) throw failure('PHASE7_INDEPENDENT_RESTORE_DIRECTORY_REQUIRED');
-    const chunk = chunks[0], data = await readArtifact(root,chunk.fileName);
+    const chunk = chunks[0];
+    if (chunk.startCursor !== (previous?.endCursor ?? null)) throw failure('PHASE7_ARCHIVE_CURSOR_MISMATCH');
+    const data = await readArtifact(root,chunk.fileName);
     const descriptor=JSON.parse((await readArtifact(root,chunk.fileName.replace('.jsonl','.manifest.json'),65536)).toString('utf8'));
     if(JSON.stringify(descriptor)!==JSON.stringify(chunkManifest(p,chunk)))throw failure('PHASE7_ARCHIVE_MANIFEST_MISMATCH');
     const bodies = data.toString('utf8').split('\n'); if (bodies.pop() !== '') throw failure('PHASE7_ARCHIVE_FORMAT_INVALID');
@@ -174,12 +227,22 @@ async function verifyPartitionPage({ db, directory, partitionId: id }) {
         || chunk.sequence !== next+1 || chunk.previousDigest !== chain) throw failure('PHASE7_ARCHIVE_RESTORE_MISMATCH');
     // Restore-decode every row; validate identity/scope, not just equal byte counts.
     const t = tableContract(p.tableName);
-    for (const body of bodies) { const row=JSON.parse(body); if (row.id === undefined || (t.scopeColumn && row[t.scopeColumn] !== p.agencyId) || t.secretColumns.some(k=>k in row)) throw failure('PHASE7_ARCHIVE_SCOPE_MISMATCH'); }
+    const ids = new Set();
+    for (const body of bodies) { const row=JSON.parse(body);
+      if (!row || typeof row !== 'object' || Array.isArray(row) || (t.idType === 'integer' ? !Number.isSafeInteger(row.id) : typeof row.id !== 'string')
+          || ids.has(String(row.id)) || String(row.id) === chunk.startCursor
+          || (t.scopeColumn && row[t.scopeColumn] !== p.agencyId) || t.secretColumns.some(k=>Object.hasOwn(row,k))) throw failure('PHASE7_ARCHIVE_SCOPE_MISMATCH');
+      ids.add(String(row.id));
+    }
     if (String(JSON.parse(bodies.at(-1)).id) !== chunk.endCursor) throw failure('PHASE7_ARCHIVE_CURSOR_MISMATCH');
     chain = sha(JSON.stringify([chain,chunk.digest,chunk.endCursor,chunk.rows,chunk.bytes])); next++;
   }
   const done = next === p.sequence;
   if (done && chain !== p.digest) throw failure('PHASE7_ARCHIVE_CHAIN_MISMATCH');
+  if (done) {
+    if (p.sequence > 0 && (chunks[0]?.endCursor ?? previous?.endCursor) !== p.cursor) throw failure('PHASE7_ARCHIVE_CURSOR_MISMATCH');
+    await integrity.verifyTotals(db, p);
+  }
   await runDbTransaction(db, async tx => {
     const n = await tx.phase7RetirementPartition.updateMany({where:{id,sourceEpoch:p.sourceEpoch,state:'EXPORTED',verifiedSequence:p.verifiedSequence},
       data:{restoreRoot,verifiedSequence:next,verifiedDigest:chain,...(done?{state:'VERIFIED',archiveVerifiedAt:new Date()}:{} )}});
