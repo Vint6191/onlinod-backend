@@ -43,7 +43,7 @@ test("Audit17 final: both origins have bounded stranded reconciliation maintenan
 test("Audit17 final: interactive lease maintenance is scoped to current agency and creators", () => {
   const programmatic = read("services/programmatic-of-write-authority-service.js");
   const automation = read("services/automation-action-delivery-service.js");
-  assert.match(programmatic, /sweepExpiredAutomationLeases\(\{ now, agencyId, creatorIds: \[creatorId\] \}\)/);
+  assert.match(programmatic, /sweepExpiredAutomationLeases\(\{ db: tx, now, agencyId, creatorIds: \[creatorId\] \}\)/);
   assert.match(automation, /sweepExpiredActionLeases\(\{ now: new Date\(\), agencyId: device\.agencyId, creatorIds \}\)/);
   assert.match(automation, /sweepExpiredProgrammaticWriteLeases\(\{ now, agencyId: options\.agencyId, creatorIds: options\.creatorIds \}\)/);
 });

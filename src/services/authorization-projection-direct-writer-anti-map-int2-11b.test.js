@@ -46,10 +46,10 @@ test("INT2.11B anti-map: accessEpoch increment writers remain the classified aut
   assert.deepEqual(
     filesMatching(/accessEpoch\s*:\s*\{\s*increment\s*:\s*1\s*\}/),
     [
-      "routes/admin.js",
       "services/access-epoch-service.js",
       "services/creator-access-scope-authority-service.js",
       "services/team-administration-service.js",
+      "services/team-ownership-transfer-service.js",
     ],
   );
 });
@@ -77,7 +77,18 @@ test("INT2.11C anti-map: creator-wide realtime watermark readers stay explicit a
 });
 
 test("INT2.11C anti-map: authorization/capability projections have no hidden raw-SQL writers", () => {
-  const production = productionJsFiles(srcRoot).map((file) => fs.readFileSync(file, "utf8")).join("\n");
-  assert.doesNotMatch(production, /\$executeRaw(?:Unsafe)?[\s\S]{0,500}(?:TeamObservationState|DeviceCreatorBinding)/i);
-  assert.doesNotMatch(production, /(?:TeamObservationState|DeviceCreatorBinding)[\s\S]{0,500}\$executeRaw(?:Unsafe)?/i);
+  // Match SQL write statements within each source file. Proximity across
+  // concatenated modules (or a SELECT next to unrelated SQL) is not a writer.
+  for (const file of productionJsFiles(srcRoot)) {
+    const source = fs.readFileSync(file, 'utf8');
+    if (['notification-consequence-service.js', 'notification-fact-receipt-service.js'].includes(path.basename(file))) {
+      assert.match(source, /runRootCommit[\s\S]*lockAgencyLifecycleBarrier[\s\S]*lockDomainWorkClaimForCommit/);
+      const sql = source.match(/UPDATE "TeamObservationState"([\s\S]*?)`/)?.[1];
+      assert(sql); assert.match(sql, /SET "lastScanSummary"=/);
+      assert.match(sql, /WHERE "agencyId"=\$1 AND "creatorId"=\$2 AND "lastScanSummary"->>'jobId'=\$3/);
+      assert.doesNotMatch(sql, /SET[\s\S]*(?:lastRealtimeEventAt|lastFullScanAt|realtimeReady)\s*=/);
+      continue;
+    }
+    assert.doesNotMatch(source, /(?:UPDATE\s+|INSERT\s+INTO\s+|DELETE\s+FROM\s+)["`']?(?:TeamObservationState|DeviceCreatorBinding)\b/i, path.relative(srcRoot, file));
+  }
 });

@@ -63,6 +63,13 @@ function loadBumpWithStubs(captures) {
 function fakeDb(captures) {
   return {
     automationBumpFanState: {
+      async updateMany({ where, data }) {
+        assert.equal(where.agencyId, 'agency-1');
+        assert.equal(where.creatorId, 'creator-1');
+        assert.deepEqual(where.OR, [{ lastOnlineAt: null }, { lastOnlineAt: { lt: data.lastOnlineAt } }]);
+        assert(data.lastOnlineAt instanceof Date);
+        return { count: 1 };
+      },
       async findMany() { return []; },
       async upsert(args) { captures.bumpState.push(args); return args.create || args.update; },
     },

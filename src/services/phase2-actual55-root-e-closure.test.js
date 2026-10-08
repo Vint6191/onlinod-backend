@@ -229,10 +229,12 @@ test("F55-06 Creator non-FK anti-map classifies every non-cascade creatorId carr
     .map((edge) => edge.child);
   const operationalCleanup = [
     "ProviderOperationalDebt", "TelegramDeliveryIntent", "TelegramInboundEvent", "DomainWorkItem",
-    "AutomationTask", "AutomationJob", "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob",
+    "AutomationTask", "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob",
     "AgencyMemberCreatorAccessCurrent", "FanObservationReadLease", "FanObservationToken", "OfProviderRequestGateWaiter",
+    "OperationalControlState", "DialogControlResumeDemand",
   ];
   const retainedHistory = [
+    "MessageLibraryCommandReceipt", "Phase7RetirementProof",
     "BillingOrderLine", "BillingWalletTransaction", "CreatorBillingPeriod", "AutomationEvent",
     "MoneyAttribution", "ContentUsageEvent", "BumpDeliveryStat", "TeamActivityContribution",
     "TeamMemberActivityDaily", "TeamMoneyAttributionFact", "TeamMoneyDailyRollup",
@@ -242,9 +244,8 @@ test("F55-06 Creator non-FK anti-map classifies every non-cascade creatorId carr
   assert.deepEqual(nonCascadeCreatorCarriers, classified);
 
   const destructive = source("phase2-destructive-delete-authority-service.js");
-  assert.match(destructive, /await run\("AutomationJob"[\s\S]*await run\("AutomationTask"/);
-  assert.match(destructive, /x\."accountId"=\$2/);
-  assert.match(destructive, /FROM "AutomationTask" t/);
+  assert.match(destructive, /await run\("AutomationTask"/);
+  assert.doesNotMatch(destructive, /await run\("AutomationJob"/);
   for (const table of ["AgencyMemberCreatorAccessCurrent", "FanObservationReadLease", "FanObservationToken", "OfProviderRequestGateWaiter"]) {
     assert.match(destructive, new RegExp(`await run\\("${table}"`));
   }
@@ -279,9 +280,10 @@ test("F55-07 Agency non-FK anti-map classifies every non-cascade agencyId carrie
     .sort();
   const directSetNull = relationEdges.filter((edge) => edge.parent === "Agency" && edge.action === "SetNull").map((edge) => edge.child);
   const boundedTenantRoots = [
+    "OperationalControlState", "DialogControlResumeDemand", "TeamMutationReceipt", "MessageLibraryCommandReceipt", "ManagementCommandReceipt",
     "ProviderOperationalDebt", "TelegramDeliveryIntent", "TelegramInboundEvent", "RefreshSession",
     "AuthorizationSessionBoundary", "AgencyMemberAccessEpochBoundary", "AgencyCreatorCatalogGenerationBoundary",
-    "AnalyticsCollectionDemand", "DeviceCommand", "AutomationTask", "AutomationJob", "AutomationEvent",
+    "AnalyticsCollectionDemand", "DeviceCommand", "AutomationTask", "AutomationEvent",
     "ContentUsageEvent", "BumpDeliveryStat", "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob",
     "AgencyMemberCreatorAccessCurrent", "DomainWorkMemberScopeShardState",
   ];
@@ -293,8 +295,15 @@ test("F55-07 Agency non-FK anti-map classifies every non-cascade agencyId carrie
   // deferred flush deletes the parent batch, whose FK cascade removes intents.
   const transactionScopedRoots = ["DomainWorkClaimLocatorMutationIntent"];
   const postCascadeCurrentRoots = ["Phase2WorkFamilyState", "DomainWorkReadyPartition", "DomainWorkReadyAgency"];
+  // Support grants remain audit history; every read joins a live Agency.
+  // Retirement proofs/partitions belong to an immutable archival cohort, not
+  // a current tenant capability, and must survive tenant deletion.
+  const retainedAudit = ['AdminSupportGrant', 'Phase7RetirementProof', 'Phase7RetirementPartition'];
+  assert.match(source('admin-support-command-service.js'), /!agency \|\| agency\.deletedAt/);
+  assert.match(models.get('Phase7RetirementProof'), /Phase7RetirementCohort.*onDelete: Restrict/);
+  assert.match(models.get('Phase7RetirementPartition'), /Phase7RetirementCohort.*onDelete: Restrict/);
   const classified = Array.from(new Set([
-    ...directSetNull, ...boundedTenantRoots, ...creatorDrainedTenantRoots,
+    ...retainedAudit, ...directSetNull, ...boundedTenantRoots, ...creatorDrainedTenantRoots,
     ...transactionScopedRoots, ...postCascadeCurrentRoots,
   ])).sort();
   assert.deepEqual(actual, classified);
@@ -310,31 +319,20 @@ test("F55-07 Agency non-FK anti-map classifies every non-cascade agencyId carrie
 });
 
 test("F55-07 Agency route establishes deletion barrier and publishes durable cleanup without tenant-wide cascade", () => {
-  const admin = source("../routes/admin.js");
-  const start = admin.indexOf('router.delete("/agencies/:id"');
-  const restore = admin.indexOf('router.post("/agencies/:id/restore"', start);
-  const route = admin.slice(start, restore);
-  const hardStart = route.indexOf("if (hard) {");
-  const softStart = route.indexOf("const deletedAt", hardStart);
-  const hard = route.slice(hardStart, softStart);
-
-  assert.match(hard, /lockAgencyPipelineLifecycleExclusive/);
-  assert.match(hard, /assertAgencyCustomPipelineRetirable/);
-  assert.match(hard, /assertAgencyMassCampaignRetirable/);
-  assert.match(hard, /deletedAt: scheduledAt/);
-  assert.match(hard, /refreshSession\.updateMany/);
-  assert.match(hard, /DESTRUCTIVE_AGENCY_CLEANUP/);
-  assert.match(hard, /Phase2AgencyDestructiveCleanup/);
-  assert.match(hard, /res\.status\(202\)/);
-  assert.doesNotMatch(hard, /tx\.agency\.delete/);
-  assert.doesNotMatch(hard, /purgeAgencyPhase2ProviderLedgersForHardDelete/);
-
-  const hardSelectStart = route.indexOf("...(hard ? {");
-  const hardSelectEnd = route.indexOf("} : {", hardSelectStart);
-  const hardSelect = route.slice(hardSelectStart, hardSelectEnd);
-  assert.doesNotMatch(hardSelect, /members:\s*true/);
-  assert.doesNotMatch(hardSelect, /creators:/);
+  assert.match(source('../routes/admin.js'), /router\.delete\("\/agencies\/:id", operationHandler\("agency\.retire"\)\)/);
+  const command = source('admin-operational-command-service.js');
+  const agency = command.slice(command.indexOf('if(action.startsWith("agency."))'), command.indexOf('if(action.startsWith("member."))'));
+  assert.match(agency, /lockAgencyPipelineLifecycleExclusive/);
+  for (const barrier of ['assertAgencyCustomPipelineRetirable', 'assertAgencyMassCampaignRetirable', 'assertSfsRetirable']) assert.ok(agency.includes(barrier));
+  assert.match(agency, /deletedAt:now/);
+  assert.match(agency, /refreshSession\.updateMany/);
+  assert.match(agency, /if\(input\.hard\).*publishDomainWork.*DESTRUCTIVE_AGENCY_CLEANUP/);
+  assert.match(agency, /objectType:"Phase2AgencyDestructiveCleanup"/);
+  assert.match(agency, /statusCode:pending\?202:200/);
+  assert.doesNotMatch(agency, /tx\.agency\.delete|purgeAgencyPhase2ProviderLedgersForHardDelete|members:\s*true|creators:/);
+  assert.match(command, /executeAdminCommand/);
 });
+
 
 test("F55-07 Agency worker composes Creator cleanup, bounded non-FK/history cleanup, proof-zero, then near-empty identity delete", () => {
   const destructive = source("phase2-destructive-delete-authority-service.js");
@@ -361,21 +359,20 @@ test("F55-07 Agency worker composes Creator cleanup, bounded non-FK/history clea
 
 
 test("F55-07 hard Agency destructive intent cannot race with soft restore", () => {
-  const admin = source("../routes/admin.js");
-  const start = admin.indexOf('router.post("/agencies/:id/restore"');
-  const end = admin.indexOf('router.post("/agencies/:id/impersonate"', start);
-  const restore = admin.slice(start, end);
-  assert.match(restore, /lockAgencyPipelineLifecycleExclusive/);
-  assert.match(restore, /DESTRUCTIVE_AGENCY_CLEANUP/);
-  assert.match(restore, /Phase2AgencyDestructiveCleanup/);
-  assert.match(restore, /AGENCY_DESTRUCTIVE_DELETE_IRREVERSIBLE/);
-  assert.match(restore, /select: \{ id: true, state: true, isOutstanding: true \}/);
-  assert.doesNotMatch(restore, /select: \{ id: true, status: true, isOutstanding: true \}/);
-  assert.ok(restore.indexOf("domainWorkItem.findFirst") < restore.indexOf("tx.agency.update"));
-
-  const ui = fs.readFileSync(path.join(__dirname, "../../public/admin/modules/admin-agency-detail/admin-agency-detail-actions.js"), "utf8");
-  assert.match(ui, /hard-delete scheduled — cleanup is running/);
+  assert.match(source('../routes/admin.js'), /operationHandler\("agency\.restore"\)/);
+  const command = source('admin-operational-command-service.js');
+  const lock = command.indexOf('await lockAgencyPipelineLifecycleExclusive');
+  const start = command.indexOf('else if(action==="agency.restore")');
+  assert.ok(lock >= 0 && start > lock);
+  const restore = command.slice(start, command.indexOf('}else{', start));
+  for (const marker of ['DESTRUCTIVE_AGENCY_CLEANUP', 'Phase2AgencyDestructiveCleanup', 'AGENCY_DESTRUCTIVE_DELETE_IRREVERSIBLE']) assert.ok(restore.includes(marker));
+  // Any durable hard-delete intent blocks restore, including a terminal one.
+  assert.match(restore, /select:\{id:true\}/);
+  assert.doesNotMatch(restore, /isOutstanding|state:/);
+  assert.ok(restore.indexOf('domainWorkItem.findFirst') < restore.indexOf('tx.agency.update'));
+  assert.match(source('../../public/admin/modules/admin-agency-detail/admin-agency-detail-actions.js'), /hard-delete scheduled — cleanup is running/);
 });
+
 
 test("F55-07 scheduler treats final Agency identity deletion as terminal without ACKing a cascaded-away DWI", () => {
   const scheduler = source("job-scheduler.js");
@@ -388,8 +385,10 @@ test("F55-07 scheduler treats final Agency identity deletion as terminal without
   assert.match(sweep, /if \(result\?\.identityDeleted\) report\.completed \+= 1/);
   assert.match(sweep, /yieldDomainWorkClaim/);
 
-  const laneAt = scheduler.indexOf('["agencyDestructiveCleanup"');
-  const creatorLaneAt = scheduler.indexOf('["creatorDestructiveCleanup"');
+  const names = require('./maintenance-lane-registry').MAINTENANCE_LANE_NAMES;
+  const laneAt = names.indexOf('agencyDestructiveCleanup');
+  const creatorLaneAt = names.indexOf('creatorDestructiveCleanup');
+  assert.match(scheduler, /resolveMaintenanceLanes/);
   assert.ok(laneAt >= 0 && creatorLaneAt > laneAt);
 });
 
@@ -411,7 +410,7 @@ test("F55-07 fresh-source DB fence blocks late inserts into non-FK tenant roots 
   assert.match(migration, /PHASE2_AGENCY_DESTRUCTIVE_DELETE_IN_PROGRESS/);
   for (const table of [
     "ProviderOperationalDebt", "TelegramDeliveryIntent", "TelegramInboundEvent", "RefreshSession",
-    "AnalyticsCollectionDemand", "DeviceCommand", "AutomationTask", "AutomationJob", "AutomationEvent",
+    "AnalyticsCollectionDemand", "DeviceCommand", "AutomationTask", "AutomationEvent",
     "ContentUsageEvent", "BumpDeliveryStat", "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob",
   ]) assert.match(migration, new RegExp(`'${table}'`));
   const boundaryFence = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260916034500_actual60_int60_8_authorization_boundary_destructive_fence/migration.sql"), "utf8");
@@ -443,7 +442,7 @@ test("F55-06 fresh-source creator proof-zero fences direct and indirect residual
   assert.match(migration, /PHASE2_CREATOR_DESTRUCTIVE_DELETE_IN_PROGRESS/);
   for (const table of [
     "ProviderOperationalDebt", "TelegramDeliveryIntent", "TelegramInboundEvent", "DomainWorkItem",
-    "AutomationTask", "AutomationJob",
+    "AutomationTask",
     "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob", "TeamShiftCreator",
   ]) assert.match(migration, new RegExp(`'${table}'`));
   for (const identity of ["customOrderId", "customSubmissionId", "submissionId", "objectType", "accountId", "taskId", "CREATOR_BINDING", "REMINDER_OUTCOME"]) {

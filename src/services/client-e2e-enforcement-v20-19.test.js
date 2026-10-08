@@ -1,19 +1,16 @@
 "use strict";
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const { verifyActorProof, findRootExposureDebt, findUntrustedCreatorExposureDebt } = require('./client-e2e-keyring-service');
+const ACTOR_PROOF = Buffer.alloc(32, 0x07).toString('base64');
+const ACTOR_PROOF_HASH = crypto.createHash('sha256').update(Buffer.from(ACTOR_PROOF, 'base64')).digest('base64');
 
-const test = require("node:test");
-const assert = require("node:assert/strict");
-const crypto = require("node:crypto");
-const {
-  enforceOpaqueSecrets: enforceOpaqueSecretsRaw,
-  getCryptoMigrationStatus,
-} = require("./client-e2e-keyring-service");
-
-const ACTOR_PROOF = Buffer.alloc(32, 0x07).toString("base64");
-const ACTOR_PROOF_HASH = crypto.createHash("sha256").update(Buffer.from(ACTOR_PROOF, "base64")).digest("base64");
-function enforceOpaqueSecrets(args) { return enforceOpaqueSecretsRaw({ ...args, actorProof: args.actorProof ?? ACTOR_PROOF }); }
-
-const owner = { role: "OWNER", roleKey: "owner" };
-
+// The optional V20.19 migration endpoint was permanently removed in V20.22.
+// Its continuing security obligations are tested through current debt readers,
+// actor proof and the irreversible schema fence; no legacy API is reintroduced.
 function makeDb({ legacySessions = 0, legacyProxies = 0, legacyAccessSnapshots = 0, residualSessionSecret = false, residualProxySecret = false, rootExposure = false, creatorExposure = false, creatorDeleted = false } = {}) {
   const root = {
     agencyId: "agency-1",
@@ -150,164 +147,62 @@ function makeDb({ legacySessions = 0, legacyProxies = 0, legacyAccessSnapshots =
   return { root, proxies, identities, ownerWraps, accessSnapshots, db };
 }
 
-test("opaque enforcement is forbidden until a recovery proof is pinned", async () => {
-  const { db, root } = makeDb({ legacySessions: 0, legacyProxies: 0 });
-  root.recoveryProofHash = null;
-  const status = await getCryptoMigrationStatus({ db, agencyId: "agency-1", userId: "owner-user", member: owner });
-  assert.equal(status.root.recoveryProofAvailable, false);
-  assert.equal(status.readyToEnforce, false);
-  await assert.rejects(
-    enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" }),
-    (error) => error?.code === "CRYPTO_ACTOR_PROOF_UNAVAILABLE",
-  );
-  assert.equal(root.enforceOpaqueSecrets, false);
+test('owner key changes still require a pinned recovery proof', () => {
+  const { root } = makeDb(); root.recoveryProofHash = null;
+  assert.throws(() => verifyActorProof(root, ACTOR_PROOF), error => error.code === 'CRYPTO_ACTOR_PROOF_UNAVAILABLE');
 });
-
-test("opaque enforcement is forbidden while any legacy creator session remains", async () => {
-  const { db, root } = makeDb({ legacySessions: 1, legacyProxies: 0 });
-  await assert.rejects(
-    enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" }),
-    (error) => error?.code === "CRYPTO_MIGRATION_INCOMPLETE" && error?.legacySessions === 1 && error?.legacyProxyCredentials === 0,
-  );
-  assert.equal(root.enforceOpaqueSecrets, false);
+test('owner proof rejects a wrong secret and accepts the pinned value', () => {
+  const { root } = makeDb();
+  assert.throws(() => verifyActorProof(root, Buffer.alloc(32, 9).toString('base64')), error => error.code === 'CRYPTO_ACTOR_PROOF_MISMATCH');
+  assert.doesNotThrow(() => verifyActorProof(root, ACTOR_PROOF));
 });
-
-test("opaque enforcement is forbidden while any legacy proxy credential remains", async () => {
-  const { db, root } = makeDb({ legacySessions: 0, legacyProxies: 1 });
-  await assert.rejects(
-    enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" }),
-    (error) => error?.code === "CRYPTO_MIGRATION_INCOMPLETE" && error?.legacySessions === 0 && error?.legacyProxyCredentials === 1,
-  );
-  assert.equal(root.enforceOpaqueSecrets, false);
+test('former-owner knowledge remains root exposure after wrap revocation', async () => {
+  const { db } = makeDb({ rootExposure: true });
+  assert.deepEqual(await findRootExposureDebt({ db, agencyId: 'agency-1' }), {
+    deviceIds: ['former-owner-device'], exposures: [{ deviceId: 'former-owner-device', rootVersion: 2 }],
+  });
 });
-
-test("opaque enforcement becomes irreversible only after both legacy counts reach zero", async () => {
-  const { db, root } = makeDb({ legacySessions: 0, legacyProxies: 0 });
-  const result = await enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" });
-  assert.equal(result.enforced, true);
-  assert.equal(root.enforceOpaqueSecrets, true);
-  assert.ok(root.enforcedAt instanceof Date);
+test('an active device that lost creator scope retains current CDK exposure debt', async () => {
+  const { db } = makeDb({ creatorExposure: true });
+  assert.deepEqual(await findUntrustedCreatorExposureDebt({ db, agencyId: 'agency-1' }), {
+    deviceIds: ['access-revoked-device'], creatorIds: ['creator-1'],
+    exposures: [{ deviceId: 'access-revoked-device', creatorId: 'creator-1', keyVersion: 1 }],
+  });
 });
-
-test("migration status reports exact counts and blocks unclaimed legacy proxy credentials", async () => {
-  const { db } = makeDb({ legacySessions: 2, legacyProxies: 2 });
-  const result = await getCryptoMigrationStatus({ db, agencyId: "agency-1", userId: "owner-user", member: owner });
-  assert.equal(result.legacySessionCount, 2);
-  assert.equal(result.legacyProxyCredentialCount, 2);
-  assert.equal(result.totalLegacyCount, 4);
-  assert.equal(result.readyToEnforce, false);
-  assert.equal(result.proxies[0].autoMigratable, false);
-  assert.equal(result.proxies[0].blocker, "PROXY_OWNER_REQUIRED");
-  assert.equal(result.proxies[1].autoMigratable, true);
-  assert.equal(result.proxies[1].blocker, null);
+test('soft-deleted creators are excluded from active CDK exposure debt', async () => {
+  const { db } = makeDb({ creatorExposure: true, creatorDeleted: true });
+  assert.deepEqual(await findUntrustedCreatorExposureDebt({ db, agencyId: 'agency-1' }), { deviceIds: [], creatorIds: [], exposures: [] });
 });
-
-
-test("migration status treats a DIRECT creator's owned dedicated legacy proxy as auto-migratable", async () => {
-  const { db, proxies } = makeDb({ legacySessions: 0, legacyProxies: 2 });
-  proxies[1].creatorProfile = { creatorId: "creator-2", mode: "DIRECT", creator: { displayName: "Creator 2", username: "creator2" } };
-  const result = await getCryptoMigrationStatus({ db, agencyId: "agency-1", userId: "owner-user", member: owner });
-  const owned = result.proxies.find((row) => row.proxyId === "proxy-2");
-  assert.equal(owned.ownerCreatorId, "creator-2");
-  assert.equal(owned.assignedCreatorId, null);
-  assert.equal(owned.autoMigratable, true);
-  assert.equal(owned.blocker, null);
+test('current crypto trust uses immutable identity independently of WorkerDevice telemetry', async () => {
+  const { db } = makeDb();
+  db.workerDevice.findFirst = () => { throw Error('telemetry must not decide key knowledge'); };
+  assert.deepEqual((await findRootExposureDebt({ db, agencyId: 'agency-1' })).deviceIds, []);
 });
-
-test("opaque enforcement is forbidden when a former owner still knows a root generation protecting active state", async () => {
-  const { db, root } = makeDb({ legacySessions: 0, legacyProxies: 0, rootExposure: true });
-  const status = await getCryptoMigrationStatus({ db, agencyId: "agency-1", userId: "owner-user", member: owner });
-  assert.equal(status.rootRotationRequired, true);
-  assert.equal(status.rootExposureDeviceCount, 1);
-  assert.equal(status.readyToEnforce, false);
-  await assert.rejects(
-    enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" }),
-    (error) => error?.code === "CRYPTO_ROOT_ROTATION_REQUIRED" && error?.rootExposureCount === 1,
-  );
-  assert.equal(root.enforceOpaqueSecrets, false);
+test('deleted identity cannot erase historical owner-root exposure', async () => {
+  const { db, identities, ownerWraps } = makeDb(); identities.length = 0;
+  ownerWraps.push({ agencyId: 'agency-1', rootVersion: 2, deviceId: 'lost-owner-device', revokedAt: new Date() });
+  assert.deepEqual((await findRootExposureDebt({ db, agencyId: 'agency-1' })).deviceIds, ['lost-owner-device', 'owner-device']);
 });
-
-
-test("opaque enforcement is forbidden while a still-active device that lost creator access knows the current CDK", async () => {
-  const { db, root } = makeDb({ creatorExposure: true });
-  const status = await getCryptoMigrationStatus({ db, agencyId: "agency-1", userId: "owner-user", member: owner });
-  assert.equal(status.untrustedCreatorRotationRequired, true);
-  assert.equal(status.untrustedCreatorExposureDeviceCount, 1);
-  assert.deepEqual(status.untrustedCreatorExposureCreatorIds, ["creator-1"]);
-  assert.equal(status.readyToEnforce, false);
-  await assert.rejects(
-    enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" }),
-    (error) => error?.code === "CRYPTO_CREATOR_ROTATION_REQUIRED"
-      && error?.creatorExposureCount === 1
-      && error?.creatorExposureCreatorIds?.[0] === "creator-1",
-  );
-  assert.equal(root.enforceOpaqueSecrets, false);
+test('rotating the root alone cannot clear knowledge while a live creator still references its old generation', async () => {
+  const { db, root } = makeDb({ rootExposure: true }); root.version = 3;
+  assert.deepEqual((await findRootExposureDebt({ db, agencyId: 'agency-1' })).exposures, [{ deviceId: 'former-owner-device', rootVersion: 2 }]);
 });
-
-test("soft-deleted creators are not active creator-key exposure debt for irreversible enforcement", async () => {
-  const { db, root } = makeDb({ creatorExposure: true, creatorDeleted: true });
-  const status = await getCryptoMigrationStatus({ db, agencyId: "agency-1", userId: "owner-user", member: owner });
-  assert.equal(status.untrustedCreatorRotationRequired, false);
-  assert.deepEqual(status.untrustedCreatorExposureCreatorIds, []);
-  assert.equal(status.readyToEnforce, true);
-  const result = await enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" });
-  assert.equal(result.enforced, true);
-  assert.equal(root.enforceOpaqueSecrets, true);
+test('current security debt does not inspect or mutate retired legacy secret stores', async () => {
+  const { db } = makeDb({ legacySessions: 2, legacyProxies: 3, legacyAccessSnapshots: 4 });
+  for (const key of ['creatorSessionState', 'agencyProxyEndpoint', 'accessSnapshot']) db[key] = new Proxy({}, { get() { throw Error('legacy secret store accessed'); } });
+  assert.deepEqual((await findRootExposureDebt({ db, agencyId: 'agency-1' })).exposures, []);
+  assert.deepEqual((await findUntrustedCreatorExposureDebt({ db, agencyId: 'agency-1' })).exposures, []);
 });
-
-test("opaque enforcement uses immutable crypto identity even when WorkerDevice telemetry moved away", async () => {
-  const { db, root } = makeDb({ legacySessions: 0, legacyProxies: 0 });
-  db.workerDevice.findFirst = async () => null;
-  const result = await enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" });
-  assert.equal(result.enforced, true);
-  assert.equal(root.enforceOpaqueSecrets, true);
-});
-
-test("deleted crypto identity cannot erase historical owner-root exposure debt", async () => {
-  const { db, identities, ownerWraps } = makeDb({ legacySessions: 0, legacyProxies: 0 });
-  identities.splice(0, identities.length);
-  ownerWraps.push({ id: "orphan-owner-wrap", agencyId: "agency-1", rootVersion: 2, deviceId: "lost-owner-device", revokedAt: new Date("2026-08-23T19:00:00Z") });
-  const status = await getCryptoMigrationStatus({ db, agencyId: "agency-1", userId: "owner-user", member: owner });
-  assert.equal(status.rootRotationRequired, true);
-  assert.ok(status.rootExposureDeviceCount >= 1);
-  assert.equal(status.readyToEnforce, false);
-});
-
-test("opaque enforcement crypto-shreds legacy AccessSnapshot secret material atomically instead of treating it as canonical migration debt", async () => {
-  const { db, root, accessSnapshots } = makeDb({ legacyAccessSnapshots: 2 });
-  const status = await getCryptoMigrationStatus({ db, agencyId: "agency-1", userId: "owner-user", member: owner });
-  assert.equal(status.legacyAccessSnapshotSecretCount, 2);
-  assert.equal(status.legacyAccessSnapshotRetirementRequired, true);
-  assert.equal(status.readyToEnforce, true);
-
-  const result = await enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" });
-  assert.equal(result.retiredLegacyAccessSnapshots, 2);
-  assert.equal(root.enforceOpaqueSecrets, true);
-  for (const row of accessSnapshots) {
-    assert.equal(row.encryptedPayload, null);
-    assert.equal(row.iv, null);
-    assert.equal(row.tag, null);
-    assert.equal(row.algorithm, null);
-    assert.equal(row.active, false);
-    assert.ok(row.payloadRetiredAt instanceof Date);
-  }
-});
-
-test("idempotent enforcement cleans residual AccessSnapshot ciphertext from an earlier V20.19 intermediate", async () => {
-  const { db, root, accessSnapshots } = makeDb({ legacyAccessSnapshots: 1 });
-  root.enforceOpaqueSecrets = true;
-  root.enforcedAt = new Date("2026-08-23T20:00:00Z");
-  const result = await enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" });
-  assert.equal(result.enforced, true);
-  assert.equal(result.idempotent, true);
-  assert.equal(result.retiredLegacyAccessSnapshots, 1);
-  assert.equal(accessSnapshots[0].encryptedPayload, null);
-  assert.ok(accessSnapshots[0].payloadRetiredAt instanceof Date);
-});
-
-test("opaque enforcement retires inconsistent residual SERVER_V1 ciphertext even when active migration counters are zero", async () => {
-  const { db } = makeDb({ residualSessionSecret: true, residualProxySecret: true });
-  const result = await enforceOpaqueSecrets({ db, agencyId: "agency-1", userId: "owner-user", member: owner, deviceId: "owner-device" });
-  assert.equal(result.retiredLegacySessionResiduals, 1);
-  assert.equal(result.retiredLegacyProxyResiduals, 1);
+test('CLIENT_E2E is structurally mandatory and cannot be downgraded through a migration API', () => {
+  const root = path.resolve(__dirname, '../..');
+  const schema = fs.readFileSync(path.join(root, 'prisma/schema.prisma'), 'utf8');
+  const mode = schema.match(/enum SecretEncryptionMode \{([\s\S]*?)\n\}/)?.[1];
+  assert(mode); assert.match(mode, /CLIENT_E2E_V1/); assert.doesNotMatch(mode, /SERVER_V1/);
+  const route = fs.readFileSync(path.join(root, 'src/routes/client-e2e-keyring.js'), 'utf8');
+  assert.match(route, /getCryptoSecurityDebt/); assert.doesNotMatch(route, /migration-status|enforce-opaque|migrate-opaque/);
+  const exports = require('./client-e2e-keyring-service');
+  assert.equal(exports.enforceOpaqueSecrets, undefined); assert.equal(exports.getCryptoMigrationStatus, undefined);
+  const migration = fs.readFileSync(path.join(root, 'prisma/migrations/20260825010000_client_e2e_enum_finalization_v20_22/migration.sql'), 'utf8');
+  assert.match(migration, /SERVER_V1 creator session rows remain/); assert.match(migration, /SERVER_V1 proxy rows remain/);
+  assert.match(migration, /CREATE TYPE "SecretEncryptionMode" AS ENUM \('CLIENT_E2E_V1'\)/);
 });

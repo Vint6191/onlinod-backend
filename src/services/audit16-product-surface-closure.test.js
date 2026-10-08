@@ -177,7 +177,7 @@ test("Audit16 machine routes bind supplied device identity and current long-live
   for (const field of ["deviceId", "userId", "memberId", "accessEpoch", "claimTokenHash", "commitStartedAt"]) {
     assert.match(telegramDelivery, new RegExp(field), `TelegramDeliveryIntent authority must carry ${field}`);
   }
-  assert.match(telegramDelivery, /assertTelegramRuntimeLease/);
+  assert.match(telegramDelivery, /assertTelegramSendRuntimeLease/);
   assert.match(uploadWork, /scope\.broad \|\| scopedCreatorIds\.has\(anchorCreatorId\)/);
 });
 

@@ -7,7 +7,10 @@ test('V14.2 hosted payment browser supersedes the rejected V14.1 native top-up r
   const root = path.resolve(__dirname, '..');
   const route = fs.readFileSync(path.join(root, 'routes', 'billing.js'), 'utf8');
   const service = fs.readFileSync(path.join(__dirname, 'billing-nowpayments-service.js'), 'utf8');
-  assert.match(route, /createWalletTopUpCheckout/);
+  assert.match(route, /executeBillingCheckoutCommand/);
+  assert.match(route, /BILLING_COMMAND_CLIENT_UPGRADE_REQUIRED/);
+  const command = fs.readFileSync(path.join(__dirname, 'billing-checkout-command-service.js'), 'utf8');
+  assert.match(command, /createWalletTopUpCheckout/);
   assert.match(route, /router\.post\("\/wallet\/top-up"/);
   assert.doesNotMatch(route, /wallet\/top-up\/currencies|createWalletTopUpPayment|mode:\s*"native"/);
   assert.match(service, /async function createWalletTopUpCheckout/);

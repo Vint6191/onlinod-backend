@@ -15,34 +15,37 @@ function block(source, startNeedle, endNeedle) {
   return source.slice(start, end);
 }
 
+// Operations moved from inline routes to the command receipt transaction.
+// Keep route reachability and the live-only WHERE predicate in the same check.
+function adminSource(actions) {
+  const routes = read('src/routes/admin.js');
+  const handlers = read('src/routes/admin-command-handlers.js');
+  for (const action of actions) assert(routes.includes(`operationHandler("${action}"`), action);
+  assert.match(handlers, /admin-operational-command-service[\s\S]*executeAdminOperation/);
+  const source = read('src/services/admin-operational-command-service.js');
+  assert.match(source, /executeAdminCommand\(\{db,actor,commandId,action,targetId/);
+  return source;
+}
 test("INT60.4 scale: agency retirement revokes only live RefreshSession rows", () => {
-  const source = read("src/routes/admin.js");
-  const agencyDelete = block(source, 'router.delete("/agencies/:id"', 'router.post("/agencies/:id/restore"');
-  assert.match(agencyDelete, /agencyId:\s*before\.id,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*scheduledAt\s*\}/);
-  assert.match(agencyDelete, /agencyId:\s*before\.id,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*deletedAt\s*\}/);
+  const source = adminSource(['agency.retire']);
+  const retire = block(source, 'if(action.startsWith("agency."))', 'if(action.startsWith("member."))');
+  assert.match(retire, /refreshSession\.updateMany\(\{where:\{agencyId:targetId,revokedAt:null,expiresAt:\{gt:now\}\},data:\{revokedAt:now\}/);
+  assert.match(retire, /if\(input.hard\).*publishDomainWork/);
 });
-
 test("INT60.4 scale: admin account lifecycle writers exclude expired-unrevoked history", () => {
-  const source = read("src/routes/admin.js");
-  const userPatch = block(source, 'router.patch("/users/:id"', 'router.post("/users/:id/force-logout"');
-  assert.match(userPatch, /sessionRevokedAt[\s\S]*userId:\s*before\.id,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*sessionRevokedAt\s*\}/);
-
-  const forceLogout = block(source, 'router.post("/users/:id/force-logout"', 'router.post("/users/:id/reset-password"');
-  assert.match(forceLogout, /userId:\s*user\.id,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*now\s*\}/);
-
-  const resetPassword = block(source, 'router.post("/users/:id/reset-password"', 'router.get("/creators"');
-  assert.match(resetPassword, /userId:\s*user\.id,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*revokedAt\s*\}/);
-
-  const kickStart = source.indexOf('payload: { reason: req.body?.reason || "admin kick" }');
-  assert.ok(kickStart >= 0);
-  const kick = source.slice(kickStart, kickStart + 1800);
-  assert.match(kick, /sessionRevokedAt[\s\S]*userId:\s*device\.userId,\s*agencyId:\s*device\.agencyId,\s*deviceId:\s*device\.id,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*sessionRevokedAt\s*\}/);
+  const source = adminSource(['user.update','user.logout','user.password.reset','device.kick']);
+  const user = block(source, 'if(action.startsWith("user."))', 'if(action==="creator.retire")');
+  assert.match(user, /refreshSession\.updateMany\(\{where:\{userId:targetId,revokedAt:null,expiresAt:\{gt:now\}\}/);
+  assert.match(user, /const revoke=action!=="user.update"\|\|input.disabled===true/);
+  const kick = block(source, 'if(action==="device.kick")', 'if(action==="maintenance.subscriber.requeue")');
+  assert.match(kick, /refreshSession\.updateMany\(\{where:\{userId:input.userId,agencyId:input.agencyId,deviceId:targetId,revokedAt:null,expiresAt:\{gt:now\}\}/);
 });
 
 test("INT60.4 scale: account recovery, crypto retirement and Team removal mutate only live session rows", () => {
   const authRoute = read("src/routes/auth.js");
-  const reset = block(authRoute, 'router.post("/reset-password"', 'module.exports');
-  assert.match(reset, /userId:\s*record\.userId,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*revokedAt\s*\}/);
+  assert.match(authRoute, /account-password-reset-service[\s\S]*resetAccountPassword/);
+  const reset = read("src/services/account-password-reset-service.js");
+  assert.match(reset, /userId:\s*(?:record\.userId|userId),\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*now\s*\}/);
 
   const crypto = read("src/services/client-e2e-keyring-service.js");
   const retireStart = crypto.indexOf("async function retireCurrentDeviceIdentity");

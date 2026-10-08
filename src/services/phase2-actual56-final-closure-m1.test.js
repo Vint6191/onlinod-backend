@@ -194,7 +194,7 @@ test("M1 every direct new-binary CreatorAccount mutation is release-authorized o
   for (const entry of productionCreatorMutationFiles()) {
     const covered = entry.source.includes("authorizeCreatorAccountWrite")
       || entry.source.includes("runCreatorAccountWriteTransaction")
-      || (entry.rel === "src/routes/creators.js" && entry.source.includes("lockHumanCreatorMutation"))
+      || (["src/routes/creators.js", "src/services/creator-metadata-service.js"].includes(entry.rel) && entry.source.includes("lockHumanCreatorMutation"))
       || (entry.rel === "src/services/phase2-destructive-delete-authority-service.js"
           && entry.source.includes("phase2_destructive_creator_id")
           && entry.source.includes("phase2_destructive_agency_id"));

@@ -146,7 +146,9 @@ test("creator crypto retirement is idempotent and does not keep incrementing an 
 
 test("both agency and platform-admin soft-delete paths share canonical crypto retirement inside creator lifecycle", () => {
   const creators = fs.readFileSync(path.join(__dirname, "..", "routes", "creators.js"), "utf8");
-  const admin = fs.readFileSync(path.join(__dirname, "..", "routes", "admin.js"), "utf8");
+  const admin = fs.readFileSync(path.join(__dirname, "admin-operational-command-service.js"), "utf8");
+  const route = fs.readFileSync(path.join(__dirname, "..", "routes", "admin.js"), "utf8");
+  assert.match(route, /router\.delete\("\/creators\/:id", operationHandler\("creator.retire"\)\)/);
   const lifecycle = fs.readFileSync(path.join(__dirname, "creator-lifecycle-authority-service.js"), "utf8");
   assert.match(creators, /retireCreatorWithinTransaction\(\{/);
   assert.match(admin, /retireCreatorWithinTransaction\(\{/);

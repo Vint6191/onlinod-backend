@@ -129,7 +129,7 @@ test("INT2.5 routes fence each durable realtime commit without replacing busines
   const ingestStart = notifications.indexOf("async function ingestNotificationFacts");
   const ingest = notifications.slice(ingestStart, notifications.indexOf("\nmodule.exports", ingestStart));
   const guardAt = ingest.indexOf('if (typeof commitGuard === "function") await commitGuard(tx)');
-  const ingestLockAt = ingest.indexOf("acquireIngestTransactionLock", guardAt);
+  const ingestLockAt = ingest.indexOf("lockCreatorFacts(tx, job.agencyId, job.creatorId)", guardAt);
   const persistenceAt = ingest.indexOf("persistFactGroup", guardAt);
   assert.ok(guardAt >= 0 && ingestLockAt > guardAt && persistenceAt > guardAt);
 });

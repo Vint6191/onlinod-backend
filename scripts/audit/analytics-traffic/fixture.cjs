@@ -7,6 +7,17 @@ const {PGlite}=require(path.join(runtime,'node_modules/@electric-sql/pglite'));
 const {PGLiteSocketServer}=require(path.join(runtime,'node_modules/@electric-sql/pglite-socket'));
 const baseFile=process.env.ONLINOD_PROOF_BASE_TAR || null;
 async function fixture({newMigrations=true}={}){
+ if(newMigrations){
+  // Current-code proofs must use the current deployment plan, not a date-pinned
+  // subset of migrations or a stale optional base archive. Historical upgrade
+  // rehearsals below keep their explicit newMigrations:false baseline.
+  const current=await require('../../test-support/admin-sql-runtime.cjs').createAdminSqlRuntime({runtimePath:runtime});
+  try{
+   await require(path.join(root,'scripts/database/analytics-traffic-indexes')).ensureIndexes(current.db,{create:true});
+   console.log('CURRENT_SCHEMA',current.migrations.length);
+   return {...current,pg:current.engine,socket:current.server};
+  }catch(error){await current.close();throw error;}
+ }
  let pg;
  // Large read/index fixtures can use disposable disk storage instead of
  // retaining every relation in WASM memory. Never points at a production DB.
@@ -24,14 +35,10 @@ async function fixture({newMigrations=true}={}){
   if(baseFile)fs.writeFileSync(baseFile,Buffer.from(await(await pg.dumpDataDir()).arrayBuffer()));
   console.log('BASE',names.length);
  }
- if(newMigrations){
-  const names=fs.readdirSync(path.join(root,'prisma/migrations')).filter(n=>n.startsWith('20261001')).sort();
-  for(const name of names){await pg.exec(fs.readFileSync(path.join(root,'prisma/migrations',name,'migration.sql'),'utf8'));console.log('MIGRATION',name);}
- }
  // Install the same immutable history ledger used by the deploy wrapper.
  await pg.exec('CREATE TABLE IF NOT EXISTS "_prisma_migrations" (id varchar(36) PRIMARY KEY,checksum varchar(64) NOT NULL,finished_at timestamptz,migration_name varchar(255) UNIQUE NOT NULL,logs text,rolled_back_at timestamptz,started_at timestamptz NOT NULL DEFAULT now(),applied_steps_count integer NOT NULL DEFAULT 0)');
  const history=require(path.join(root,'scripts/database/phase7-applied-history.json')).migrations;
- for(const name of fs.readdirSync(path.join(root,'prisma/migrations')).filter(n=>n!=='20260930190000_phase7_legacy_storage_contract_v1'&&fs.existsSync(path.join(root,'prisma/migrations',n,'migration.sql'))&&(newMigrations||n<'20261001')).sort()){
+ for(const name of fs.readdirSync(path.join(root,'prisma/migrations')).filter(n=>n!=='20260930190000_phase7_legacy_storage_contract_v1'&&fs.existsSync(path.join(root,'prisma/migrations',n,'migration.sql'))&&n<'20261001').sort()){
   const old=history.find(h=>h.migration===name),file=old?path.join(root,'scripts/database/phase7-applied-history',name,old.storedChecksum+'.sql'):path.join(root,'prisma/migrations',name,'migration.sql');
   const crypto=require('node:crypto');await pg.query('INSERT INTO "_prisma_migrations"(id,checksum,migration_name,finished_at,applied_steps_count) VALUES($1,$2,$3,now(),1) ON CONFLICT(migration_name) DO NOTHING',[crypto.randomUUID(),crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'),name]);
  }
@@ -39,7 +46,6 @@ async function fixture({newMigrations=true}={}){
  const url=`postgresql://postgres:postgres@${socket.getServerConn()}/postgres?connection_limit=1&sslmode=disable`;
  process.env.DATABASE_URL=url;process.env.DIRECT_URL=url;
  const {PrismaClient}=require(path.join(root,'node_modules/@prisma/client'));const db=new PrismaClient({datasources:{db:{url}}});
- if(newMigrations)await require(path.join(root,'scripts/database/analytics-traffic-indexes')).ensureIndexes(db,{create:true});
  return {pg,db,root,socket,url,async close(){await db.$disconnect();await socket.stop();await pg.close();}};
 }
 async function scope(db,{agencyId='qa-agency',creatorId='qa-creator',userId='qa-user'}={}){

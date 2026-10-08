@@ -122,8 +122,12 @@ function scopedProxyDb() {
     deactivatedAt: null,
   };
   const db = {
-    agencyMember: { async findUnique() { return { ...manager }; } },
+    _member: manager,
+    agency: { async findUnique() { return { id: 'agency-1', deletedAt: null }; } },
+    user: { async findUnique() { return { id: 'user-1', disabledAt: null }; } },
+    agencyMember: { async findUnique() { return { ...manager }; }, async findFirst() { return { ...manager }; } },
     creatorAccount: {
+      async findMany({where}) { assert.equal(where.agencyId, 'agency-1'); return where.id.in.map(id => ({id})); },
       async findFirst({ where }) {
         if (where.id === "creator-b" && where.agencyId === "agency-1") {
           return { id: "creator-b", agencyId: "agency-1", displayName: "B", username: "b", status: "READY" };
@@ -149,11 +153,11 @@ function scopedProxyDb() {
 test("Audit16 scoped manager cannot patch or delete another creator-owned proxy", async () => {
   const db = scopedProxyDb();
   await assert.rejects(
-    updateProxyEndpoint({ db, agencyId: "agency-1", actorUserId: "user-1", proxyId: "proxy-b", expectedVersion: 1, patch: { label: "changed" } }),
+    updateProxyEndpoint({ db, actorMember: db._member, agencyId: "agency-1", actorUserId: "user-1", proxyId: "proxy-b", expectedVersion: 1, patch: { label: "changed" } }),
     (error) => error?.code === "PROXY_CREATOR_ACCESS_REVOKED" && error?.status === 403,
   );
   await assert.rejects(
-    deleteProxyEndpoint({ db, agencyId: "agency-1", actorUserId: "user-1", proxyId: "proxy-b", expectedVersion: 1 }),
+    deleteProxyEndpoint({ db, actorMember: db._member, agencyId: "agency-1", actorUserId: "user-1", proxyId: "proxy-b", expectedVersion: 1 }),
     (error) => error?.code === "PROXY_CREATOR_ACCESS_REVOKED" && error?.status === 403,
   );
 });
@@ -191,9 +195,9 @@ test("Audit16 delivery admin routes propagate actor and service rechecks scope a
   for (const call of ["retryActionDelivery", "cancelActionDelivery", "releaseClaimByAdmin", "retrySafeFailures"]) {
     assert.match(route, new RegExp(`${call}\\([\\s\\S]{0,220}actorUserId:\\s*req\\.auth\\.userId`));
   }
-  assert.match(service, /retryActionDelivery\(\{ agencyId, actorUserId, deliveryId \}\)[\s\S]*requireLiveAutomationManagementActor\(\{ agencyId, actorUserId, creatorId: delivery\.creatorId \}\)[\s\S]*runDbTransaction\(prisma, async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
-  assert.match(service, /cancelActionDelivery\(\{ agencyId, actorUserId[\s\S]*runDbTransaction\(prisma, async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
-  assert.match(service, /releaseClaimByAdmin\(\{ agencyId, actorUserId[\s\S]*runDbTransaction\(prisma, async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
+  assert.match(service, /retryActionDelivery\(\{ agencyId, actorUserId, deliveryId, db = prisma \}\)[\s\S]*requireLiveAutomationManagementActor\(\{ db, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)[\s\S]*runDbTransaction\(db, async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
+  assert.match(service, /cancelActionDelivery\(\{ agencyId, actorUserId[\s\S]*runDbTransaction\(db, async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
+  assert.match(service, /releaseClaimByAdmin\(\{ agencyId, actorUserId[\s\S]*runDbTransaction\(db, async \(tx\) => \{[\s\S]*requireLiveAutomationManagementActor\(\{ db: tx, agencyId, actorUserId, creatorId: delivery\.creatorId \}\)/);
   assert.match(service, /retrySafeFailures\(\{ agencyId, actorUserId[\s\S]*allowedCreatorScope\([\s\S]*creatorId:\s*\{ in: scope\.creatorIds/);
 });
 

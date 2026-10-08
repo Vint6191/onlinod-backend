@@ -126,8 +126,14 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
   const p=await page({limit:1});await assert.rejects(()=>read.readCampaignPage({db,creatorId:'other-creator',cursor:p.pagination.nextCursor}),/CURSOR_SCOPE/);
   return{crossTenantDenied:true};
  });
- await check('maintenance catalog includes projection without resetting prior dispatch progress',async()=>{
-  const progress=await require(path.join(root,'src/services/phase2-maintenance-admission-service')).readMaintenanceAdmissionProgress({db});assert.equal(progress.totalLanes,25);assert(progress.lanes.some(x=>x.name==='campaignReadProjection'));return{lanes:progress.totalLanes};
+ await check('maintenance catalog matches current lanes and a progress read cannot reset dispatch turns',async()=>{
+  const maintenance=require(path.join(root,'src/services/phase2-maintenance-admission-service'));
+  await maintenance.selectPhase2MaintenanceLanes({db,laneNames:maintenance.MAINTENANCE_LANE_NAMES,lanesPerTick:1});
+  const progress=await maintenance.readMaintenanceAdmissionProgress({db});
+  assert.deepEqual(progress.lanes.map(x=>x.name),[...maintenance.MAINTENANCE_LANE_NAMES]);
+  assert(progress.lanes.some(x=>x.name==='campaignReadProjection'));assert(progress.lanes.some(x=>BigInt(x.turn)>0n));
+  assert.deepEqual(await maintenance.readMaintenanceAdmissionProgress({db}),progress);
+  return{lanes:progress.totalLanes,progressPreserved:true};
  });
  await check('a database policy transition rebuilds cache without declaring previous generation ready',async()=>{
   const before=await page(),ttl=before.projection.valueFreshnessMs;
@@ -150,6 +156,14 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
   throw Error('rollover failed to converge');
  });
  await check('soft-deleted Agency preserves Campaign and Traffic debt; restore wakes bounded durable work',async()=>{
+  // Traffic membership is projected by its durable worker in the current
+  // contract. A canonical campaign insertion alone no longer creates it.
+  const trafficProjection=require(path.join(root,'src/services/traffic-projection-service'));
+  for(let i=0;i<100;i++){
+   if(await db.trafficSourceMember.count({where:{creatorId:s.creatorId,fanId:'ext-fan-a'}}))break;
+   const step=await trafficProjection.runTrafficProjectionSweep({db,limit:8});assert(step.ok,JSON.stringify(step));
+  }
+  assert(await db.trafficSourceMember.count({where:{creatorId:s.creatorId,fanId:'ext-fan-a'}}),'current Traffic membership must exist before value-change debt');
   await write(async tx=>{
    await tx.creatorFinancialTransaction.update({where:{id:'money-late'},data:{netCents:175}});
    await tx.creatorFanValueCurrent.update({where:{id:'value-a'},data:{valueObservedAt:new Date()}});
@@ -161,12 +175,26 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
    await require(path.join(root,'src/services/custom-content-pipeline-authority-service')).lockAgencyPipelineLifecycleExclusive({db:tx,agencyId:s.agencyId,allowDeleted:true});
    await tx.agency.update({where:{id:s.agencyId},data:{deletedAt:value}});
   });}
-  const signals=await db.campaignReadChange.count();await deleted(new Date());
+  const signals=await db.campaignReadChange.count();
+  await assert.rejects(deleted(new Date()),/AGENCY_MASS_PROVIDER_SNAPSHOT_REQUIRED/);
+  // Exercise the current retirement protocol against an explicitly empty
+  // fixture provider queue. Never bypass the physical Agency retirement guard.
+  await db.workerDevice.create({data:{id:'campaign-proof-device',agencyId:s.agencyId,userId:s.userId}});
+  const snapshots=require(path.join(root,'src/services/mass-queue-observation-service'));
+  const actor={db,...s,memberId:'member-'+s.agencyId,deviceId:'campaign-proof-device',accessEpoch:1};
+  const retirement=await snapshots.beginMassRemoteQueueSnapshot({...actor,protocol:'MASS_OBSERVATION_V2',snapshotRequestId:require('node:crypto').randomUUID(),purpose:'RETIREMENT'});
+  const observation={...actor,purpose:retirement.purpose,snapshotFenceToken:retirement.snapshotFenceToken};
+  await snapshots.appendMassRemoteQueueSnapshot({...observation,page:0,queueIds:[],snapshotItemCount:0,final:true});
+  let retirementResult;
+  for(let i=0;i<10;i++){retirementResult=await snapshots.reconcileMassRemoteQueueSnapshot(observation);if(retirementResult.applied)break;}
+  assert.equal(retirementResult.retirementProven,true);
+  await deleted(new Date());
   assert((await projection.runCampaignProjectionUnit({db,item:campaign.items[0],ownerToken:campaign.ownerToken})).paused);
-  assert((await require(path.join(root,'src/services/traffic-projection-service')).runTrafficProjectionUnit({db,item:traffic.items[0],ownerToken:traffic.ownerToken})).paused);
+  assert((await trafficProjection.runTrafficProjectionUnit({db,item:traffic.items[0],ownerToken:traffic.ownerToken})).paused);
   for(const claim of [campaign,traffic]){const row=await db.domainWorkItem.findUnique({where:{id:claim.items[0].id}});assert.equal(row.state,'BLOCKED');assert(row.isOutstanding);assert(row.completedRevision<row.requestedRevision);}
   assert.equal(await db.campaignReadChange.count(),signals);
   await deleted(null);
+  await snapshots.releaseMassRetirement({...actor,retirementId:retirement.retirementId});
   for(let i=0;i<20;i++){
    await work.runDomainDependencyWakeSweep({db,claimLimit:20,wakeLimit:1});
    const rows=await db.domainWorkItem.findMany({where:{id:{in:[campaign.items[0].id,traffic.items[0].id]}}});
@@ -176,5 +204,5 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
   await drain();assert.equal((await page()).totals.netCents,215);
   return{pausedWithoutAcknowledgement:true,wakeBatch:1,postRestoreNet:215};
  });
- fs.writeFileSync(path.join(evidence,'campaign-sql-proof.json'),JSON.stringify({runtime:process.version,schema:'local disposable PGlite; all non-destructive migrations through Campaign execution v2',checks},null,2));
+ fs.writeFileSync(path.join(evidence,'campaign-sql-proof.json'),JSON.stringify({ok:true,runtime:process.version,schema:'local disposable PGlite; current retained-schema deployment plan',migrations:f.migrations.length,nativePostgres:false,productionAccessed:false,checks},null,2));
 }finally{await f.close()}})().catch(e=>{console.error(e.stack);process.exitCode=1}).finally(()=>{clearInterval(alive);clearTimeout(deadline)});

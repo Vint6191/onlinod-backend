@@ -132,7 +132,9 @@ test("A34 recurring creator planning is durable, bounded, fair and timer-visible
   assert.match(scheduler, /ensureSubscriberScanDue\(\{\s*db,/);
   assert.match(subscriber, /async function ensureSubscriberScanDue\(\{ db = prisma,/);
   assert.match(subscriber, /async function scheduleSubscriberScan\(\{\s*db = prisma,/);
-  assert.match(scheduler, /\["creatorRecurringPlanning", \(\) => runRecurringCreatorWork/);
+  const lane = require('./maintenance-lane-registry').MAINTENANCE_LANES.find(lane => lane.name === 'creatorRecurringPlanning');
+  assert.equal(lane.module, './job-scheduler'); assert.equal(lane.method, 'runRecurringCreatorWork');
+  assert.match(scheduler, /resolveMaintenanceLanes/);
   assert.match(scheduler, /runRecurringSweep\(\)[\s\S]*\.then\(handleRecurringSweepTickResult\)/);
   assert.match(scheduler, /sweep resolved degraded/);
   assert.match(scheduler, /getRecurringSchedulerHealthSnapshot/);

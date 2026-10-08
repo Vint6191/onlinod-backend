@@ -25,7 +25,7 @@ Backend API + built-in debug Web Console for Onlinod.
 Build command:
 
 ```bash
-npm install && npm run prisma:migrate
+npm ci && npm run prisma:migrate
 ```
 
 Start command:
@@ -95,70 +95,36 @@ Register → Verify Email → Login → Creator Analytics → + Add Account
 ```
 
 
-## v6 Creator Connect + encrypted snapshots
+## Current creator session authority
 
-New backend flow:
+Desktop connects through the authenticated Session Broker. The Backend stores a
+revisioned canonical CreatorSessionState with a CLIENT_E2E_V1 opaque envelope.
+Only the authorized Desktop device decrypts creator session and proxy secrets.
+Worker-device telemetry is not crypto identity or permission authority.
 
-```txt
-Web + Add Account
-→ POST /api/creator-connect/start
-→ backend creates draft creator + connect session
-→ browser opens onlinod://connect?token=...
-→ Electron claims token later
-→ Electron logs into OF, collects cookies snapshot
-→ Electron POST /api/creator-connect/:id/complete
-→ backend encrypts snapshot and marks creator READY
-```
+Changes to Team, billing, account security and management use durable command
+receipts and current actor checks at commit. A lost HTTP response must be
+recovered with the same command identity. Retired unkeyed routes return 410.
 
-New env variable:
+## Runtime and verification
 
-```env
-SNAPSHOT_ENCRYPTION_KEY=
-```
+Use Node.js 22 and the committed lockfile (`npm ci`). Run `npm test` for service
+regressions and `npm run test:auth-boundary` for authentication boundaries.
+Desktop has its own build and test gates; update the two projects together.
+Native PostgreSQL and Windows/Electron acceptance require their named proof
+runners and environments; Node-only unit tests do not replace those gates.
 
-Generate:
+## Database deployment and retirement
 
-```bash
-node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
-```
+`npm run prisma:migrate` runs the guarded Phase 7 deployment pipeline. Preserve
+all historical migrations and existing database receipts. Review
+`docs/PHASE7_LEGACY_STORAGE_RETIREMENT.txt` before using any contract/retirement
+option. An ordinary source update does not authorize destructive retirement.
 
-New API:
+A release manifest describes one exact source pair. Generate a new manifest only
+for its documented retirement workflow; old release manifests are kept with
+historical checkpoints, not shipped as evidence for later source changes.
 
-```txt
-POST /api/creator-connect/start
-POST /api/creator-connect/claim
-GET  /api/creator-connect/:id/status
-POST /api/creator-connect/:id/complete
-POST /api/creator-connect/:id/simulate-complete
-GET  /api/creators/:creatorId/access-snapshots
-GET  /api/access-snapshots/:id/payload
-POST /api/access-snapshots/:id/revoke
-```
-
-For web-only testing, use the `Dev: simulate complete` button in the Add Account modal.
-
-
-## v6.1 public connect token flow
-
-Electron does not need to log into Onlinod for the first connect flow.
-
-New public endpoints:
-
-```txt
-POST /api/creator-connect/claim-public
-GET  /api/creator-connect/status-public?token=...
-POST /api/creator-connect/complete-public
-POST /api/creator-connect/simulate-complete-public
-```
-
-These endpoints are authorized by the short-lived one-time connect token generated from the authenticated Web Console `POST /api/creator-connect/start`.
-
-Electron flow:
-
-```txt
-onlinod://connect?token=...
-→ POST /api/creator-connect/claim-public { token, deviceId, ... }
-→ open returned partition + loginUrl
-→ collect OF cookies/users.me
-→ POST /api/creator-connect/complete-public { token, deviceId, snapshot }
-```
+The old root delivery cleanup commands remain explicit non-mutating tombstones.
+For current cleanup and recovery use the audited domain operations documented in
+`docs/PHASE6_DE_DURABLE_EFFECTS_RESOURCE_ADMISSION.txt`.

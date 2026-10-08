@@ -111,11 +111,11 @@ const repoRoot = path.join(__dirname, "..", "..");
 test('billing HTTP routes derive tenant only from authenticated session, never from request body', () => {
   const route = fs.readFileSync(path.join(repoRoot, 'src/routes/billing.js'), 'utf8');
   assert.match(route, /router\.use\(authRequired\);[\s\S]*router\.use\(ownerOnly\);/);
-  const topUp = route.match(/router\.post\("\/wallet\/top-up"[\s\S]*?\n\}\);/)?.[0] || '';
+  const topUp = route.match(/router\.post\("\/wallet\/top-up\/v2"[\s\S]*?\n\}\);/)?.[0] || '';
   assert.match(topUp, /agencyId: req\.auth\.agencyId/);
   assert.doesNotMatch(topUp, /req\.body\?\.agencyId|req\.body\.agencyId/);
   const resume = route.match(/router\.post\("\/orders\/:orderId\/resume"[\s\S]*?\n\}\);/)?.[0] || '';
-  assert.match(resume, /resumeCheckout\(\{ agencyId: req\.auth\.agencyId, orderId: req\.params\.orderId \}\)/);
+  assert.match(resume, /resumeCheckout\(\{ agencyId: req\.auth\.agencyId, orderId: req\.params\.orderId,[\s\S]*authorize: billingCheckoutAuthority/);
   const reconcile = route.match(/router\.post\("\/orders\/:orderId\/reconcile"[\s\S]*?\n\}\);/)?.[0] || '';
   assert.match(reconcile, /reconcileOrder\(\{ agencyId: req\.auth\.agencyId, orderId: req\.params\.orderId/);
 });

@@ -7,9 +7,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 function fakeDb(initial = null, currentMember = null) {
-  let row = { id: "creator-1", agencyId: "agency-1", deletedAt: null, customsVaultFolderId: initial, updatedAt: new Date("2026-08-21T12:00:00.000Z") };
+  let row = { id: "creator-1", agencyId: "agency-1", deletedAt: null, customsVaultFolderId: initial, customsVaultRevision: 0, updatedAt: new Date("2026-08-21T12:00:00.000Z") };
   const canonicalMember = currentMember || member;
   const db = {
+    auditLog: { create: async ({ data }) => { assert.equal(data.agencyId, 'agency-1'); return { id: 'audit-1', ...data }; } },
     $executeRawUnsafe: async (sql) => { assert.match(String(sql), /pg_advisory_xact_lock/); return 0; },
     // Production Custom management writes now join the Agency lifecycle fence before
     // the member/scope fence. Keep this fake production-shaped instead of bypassing
@@ -27,7 +28,7 @@ function fakeDb(initial = null, currentMember = null) {
       findFirst: async ({ where }) => row && where.id === row.id && where.agencyId === row.agencyId ? { ...row } : null,
       updateMany: async ({ where, data }) => {
         if (!row || where.id !== row.id || where.agencyId !== row.agencyId || (where.updatedAt && +new Date(where.updatedAt) !== +row.updatedAt)) return { count: 0 };
-        row = { ...row, ...data, updatedAt: new Date(row.updatedAt.getTime() + 1) }; return { count: 1 };
+        row = { ...row, ...data, customsVaultRevision: row.customsVaultRevision + Number(data.customsVaultRevision?.increment || 0), updatedAt: new Date(row.updatedAt.getTime() + 1) }; return { count: 1 };
       },
     },
     _row: () => row,
@@ -48,11 +49,11 @@ test("get/set stores only the folder id and supports explicit clear", async () =
   const { getCustomVaultDestination, setCustomVaultDestination } = require("./custom-vault-destination-service");
   const db = fakeDb();
   const empty = await getCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", db: commitDatabaseFixture(db) });
-  assert.deepEqual(empty, { ok: true, creatorId: "creator-1", folderId: null, configured: false });
-  const saved = await setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: "987654", db: commitDatabaseFixture(db) });
-  assert.equal(saved.folderId, "987654"); assert.equal(db._row().customsVaultFolderId, "987654");
-  const cleared = await setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: null, db: commitDatabaseFixture(db) });
-  assert.equal(cleared.folderId, null); assert.equal(cleared.configured, false);
+  assert.deepEqual(empty, { ok: true, creatorId: "creator-1", folderId: null, configured: false, revision: 0 });
+  const saved = await setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: "987654", expectedRevision: 0, expectedFolderId: null, db: commitDatabaseFixture(db) });
+  assert.equal(saved.revision, 1); assert.equal(saved.folderId, "987654"); assert.equal(db._row().customsVaultFolderId, "987654");
+  const cleared = await setCustomVaultDestination({ agencyId: "agency-1", member, creatorId: "creator-1", folderId: null, expectedRevision: 1, expectedFolderId: "987654", db: commitDatabaseFixture(db) });
+  assert.equal(cleared.revision, 2); assert.equal(cleared.folderId, null); assert.equal(cleared.configured, false);
 });
 
 test("system pseudo folders are never accepted as Customs destination", async () => {

@@ -189,7 +189,9 @@ async function purgeCreatorNonFkPhase2Batch({ tx, agencyId, creatorId, limit }) 
   await run("DomainWorkItem", `x."creatorId"=$2 OR (x."objectType"='CreatorAccount' AND x."objectId"=$2) OR (x."dependencyKind"='CREATOR_BINDING' AND x."dependencyKey"=$2) OR EXISTS (SELECT 1 FROM "CustomOrder" o WHERE x."objectType"='CustomOrder' AND o."id"=x."objectId" AND o."agencyId"=$1 AND o."creatorId"=$2) OR EXISTS (SELECT 1 FROM "CustomContentSubmission" s WHERE x."objectType"='CustomContentSubmission' AND s."id"=x."objectId" AND s."agencyId"=$1 AND s."creatorId"=$2)`);
   await run("Phase2DependencyState", `x."dependencyKind"='CREATOR_BINDING' AND x."dependencyKey"=$2 OR (x."dependencyKind"='REMINDER_OUTCOME' AND EXISTS (SELECT 1 FROM "CustomOrder" o WHERE o."id"=x."dependencyKey" AND o."agencyId"=$1 AND o."creatorId"=$2))`);
   // Legacy server automation queues are executable work, not historical facts. They
-  // are not FK-backed to CreatorAccount, so hard delete must drain jobs before tasks.
+  // are not FK-backed to CreatorAccount and must drain before identity deletion.
+  await run("OperationalControlState", `x."creatorId"=$2`);
+  await run("DialogControlResumeDemand", `x."creatorId"=$2`);
   await run("AutomationTask", `x."creatorId"=$2`);
   await run("TeamSentMessageLedger", `x."creatorId"=$2`);
   await run("TeamPpvPurchaseLedger", `x."creatorId"=$2`);
@@ -639,6 +641,8 @@ async function phase2CreatorResidualRowsRemain(tx, agencyId, creatorId) {
     [`"ProviderOperationalDebt"`, `x."creatorId"=$2 OR EXISTS (SELECT 1 FROM "CustomOrder" o WHERE o."id"=x."customOrderId" AND o."agencyId"=$1 AND o."creatorId"=$2) OR EXISTS (SELECT 1 FROM "CustomContentSubmission" s WHERE s."id"=x."customSubmissionId" AND s."agencyId"=$1 AND s."creatorId"=$2)`],
     [`"DomainWorkItem"`, `x."creatorId"=$2 OR (x."objectType"='CreatorAccount' AND x."objectId"=$2) OR (x."dependencyKind"='CREATOR_BINDING' AND x."dependencyKey"=$2) OR EXISTS (SELECT 1 FROM "CustomOrder" o WHERE x."objectType"='CustomOrder' AND o."id"=x."objectId" AND o."agencyId"=$1 AND o."creatorId"=$2) OR EXISTS (SELECT 1 FROM "CustomContentSubmission" s WHERE x."objectType"='CustomContentSubmission' AND s."id"=x."objectId" AND s."agencyId"=$1 AND s."creatorId"=$2)`],
     [`"Phase2DependencyState"`, `x."dependencyKind"='CREATOR_BINDING' AND x."dependencyKey"=$2 OR (x."dependencyKind"='REMINDER_OUTCOME' AND EXISTS (SELECT 1 FROM "CustomOrder" o WHERE o."id"=x."dependencyKey" AND o."agencyId"=$1 AND o."creatorId"=$2))`],
+    [`"OperationalControlState"`, `x."creatorId"=$2`],
+    [`"DialogControlResumeDemand"`, `x."creatorId"=$2`],
     [`"AutomationTask"`, `x."creatorId"=$2`],
     [`"TeamSentMessageLedger"`, `x."creatorId"=$2`],
     [`"TeamPpvPurchaseLedger"`, `x."creatorId"=$2`],
@@ -658,6 +662,8 @@ async function phase2CreatorResidualRowsRemain(tx, agencyId, creatorId) {
 
 
 const AGENCY_NON_FK_TENANT_TABLES = Object.freeze([
+  "OperationalControlState",
+  "DialogControlResumeDemand",
   "TeamMutationReceipt",
   "MessageLibraryCommandReceipt",
   "ManagementCommandReceipt",

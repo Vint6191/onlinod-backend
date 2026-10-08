@@ -10,7 +10,8 @@ const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
 const schema = read("prisma/schema.prisma");
 const migration = read("prisma/migrations/20260827113000_desktop_access_epoch_bootstrap/migration.sql");
 const creators = read("src/routes/creators.js");
-const admin = read("src/routes/admin.js");
+const admin = read("src/services/admin-operational-command-service.js");
+const adminRoute = read("src/routes/admin.js");
 const team = read("src/services/team-administration-service.js");
 const invitations = read("src/routes/invitations.js");
 const desktopRoute = read("src/routes/desktop.js");
@@ -35,8 +36,10 @@ test("D creator-set changes use bounded catalog generation while scoped revoke s
 });
 
 test("D member role, permission, assignment and lifecycle changes increment accessEpoch through canonical Team authority", () => {
+  assert.match(adminRoute, /operationHandler\("member.role.set"/);
+  assert.match(adminRoute, /operationHandler\("member.remove"/);
   assert.match(admin, /updateMemberAccessByPlatformAdmin\(\{/);
-  assert.match(admin, /removeTeamMember\(\{/);
+  assert.match(admin, /removeMember\(\{/);
   assert.doesNotMatch(admin, /agencyMember\.delete\(/);
   assert.match(team, /patch\.roleKey !== undefined \|\| creatorScope[\s\S]*accessEpoch: \{ increment: 1 \}/);
   assert.match(team, /const data = \{ accessEpoch: \{ increment: 1 \} \};[\s\S]*if \(permissions !== undefined\) data\.permissions = permissions/);

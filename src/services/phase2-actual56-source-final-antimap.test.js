@@ -35,17 +35,21 @@ test("SOURCE FINAL anti-map: every DomainWorkItem storage mutator is classified"
   exact(filesMatching(/domainWorkItem\.(?:create|createMany|upsert|update|updateMany|delete|deleteMany)\s*\(|(?:INSERT INTO|UPDATE|DELETE FROM)\s+"DomainWorkItem"/), [
     "src/services/custom-order-reminders.js",
     "src/services/domain-work-authority-service.js",
+    "src/services/domain-work-repair-service.js",
+    "src/services/notification-history-repair-service.js",
+    "src/services/notification-identity-recovery-service.js",
     "src/services/phase2-destructive-delete-authority-service.js",
   ], "A new DomainWorkItem writer must join C1 conservation + M1 executor review");
 });
 
 test("SOURCE FINAL anti-map: every AgencyMember storage mutator is classified", () => {
   exact(filesMatching(/agencyMember\.(?:create|createMany|upsert|update|updateMany|delete|deleteMany)\s*\(|(?:INSERT INTO|UPDATE|DELETE FROM)\s+"AgencyMember"/), [
-    "src/routes/admin.js",
     "src/routes/auth.js",
+    "src/services/admin-operational-command-service.js",
     "src/services/access-epoch-service.js",
     "src/services/creator-access-scope-authority-service.js",
     "src/services/team-administration-service.js",
+    "src/services/team-ownership-transfer-service.js",
   ], "A new AgencyMember writer must join the C2 Team control-plane lock graph");
 });
 
@@ -83,6 +87,8 @@ test("SOURCE FINAL anti-map: every DB-fenced Team topology table writer is class
 test("SOURCE FINAL anti-map: every CreatorAccount storage mutator is classified", () => {
   exact(filesMatching(/creatorAccount\.(?:create|createMany|upsert|update|updateMany|delete|deleteMany)\s*\(|(?:INSERT INTO|UPDATE|DELETE FROM)\s+"CreatorAccount"/), [
     "src/routes/creators.js",
+    "src/services/avatar-asset-service.js",
+    "src/services/creator-metadata-service.js",
     "src/services/creator-enrollment-authority-service.js",
     "src/services/creator-lifecycle-authority-service.js",
     "src/services/creator-session-broker-service.js",
@@ -108,6 +114,8 @@ test("SOURCE FINAL anti-map: authority-changing rolling-release admission is con
     "src/services/creator-lifecycle-authority-service.js",
     "src/services/phase2-destructive-delete-authority-service.js",
     "src/services/access-epoch-service.js",
+    "src/services/admin-operational-command-service.js",
+    "src/services/human-control-command-service.js",
     "src/services/phase2-release-compatibility-authority-service.js",
     "src/services/team-administration-service.js",
     "src/services/team-control-plane-authority-service.js",

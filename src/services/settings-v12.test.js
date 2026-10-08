@@ -83,21 +83,29 @@ test("billing settings read model is owner-only and supports explicit free inter
   assert.match(serviceSource, /billingMode === "FREE_INTERNAL"/);
   assert.match(serviceSource, /publicProviderConfig\(\)/);
   assert.match(serviceSource, /recentOrders\(/);
-  assert.match(adminSource, /"FREE_INTERNAL"/);
-  assert.match(adminSource, /billingMode: input\.billingMode/);
-  assert.match(adminSource, /billingPeriod: input\.billingPeriod/);
+  const { billingPolicySchema } = require('./admin-command-contract');
+  assert.equal(billingPolicySchema.parse({ expectedRevision: 0, reason: 'Internal workspace', billingMode: 'FREE_INTERNAL', billingPeriod: 'MONTHLY' }).billingMode, 'FREE_INTERNAL');
+  assert.match(adminSource, /router\.patch\("\/agencies\/:id\/subscription", setBillingPolicyHandler\)/);
+  const command = fs.readFileSync(path.join(__dirname, 'admin-billing-access-command-service.js'), 'utf8');
+  assert.match(command, /billingPolicySchema\.parse\(payload\)/);
+  assert.match(command, /for \(const key of \["billingMode", "billingPeriod"\]\)/);
+  assert.match(command, /executeAdminCommand\([\s\S]*action: "billing\.policy\.set"/);
   assert.doesNotMatch(routeSource, /checkout|payment-method|invoice\/create/i);
 });
 
 test("admin creator access entitlement is dated, auditable and separate from pricing configuration", () => {
   assert.match(adminSource, /router\.patch\("\/creators\/:id\/entitlement"/);
-  assert.match(adminSource, /coreValidUntil: z\.string\(\)\.datetime\(\)\.optional\(\)\.nullable\(\)/);
-  assert.match(adminSource, /aiChatterValidUntil: z\.string\(\)\.datetime\(\)\.optional\(\)\.nullable\(\)/);
-  assert.match(adminSource, /outreachValidUntil: z\.string\(\)\.datetime\(\)\.optional\(\)\.nullable\(\)/);
-  assert.match(adminSource, /reason: z\.string\(\)\.min\(1\)\.max\(500\)/);
-  assert.match(adminSource, /coreSource: "ADMIN"/);
-  assert.match(adminSource, /action: "admin\.creator_entitlement_changed"/);
-  assert.match(adminSource, /syncAgencyBillingAggregate\(tx, creator\.agencyId, now\)/);
+  const { entitlementSchema } = require('./admin-command-contract');
+  const input = { expectedRevision: 0, reason: 'Access correction', coreValidUntil: '2027-01-01T00:00:00Z', aiChatterValidUntil: null, outreachValidUntil: null };
+  assert.deepEqual(entitlementSchema.parse(input), input);
+  assert.equal(entitlementSchema.safeParse({ ...input, reason: '' }).success, false);
+  assert.equal(entitlementSchema.safeParse({ ...input, expectedRevision: undefined }).success, false);
+  assert.match(adminSource, /router\.patch\("\/creators\/:id\/entitlement", setEntitlementHandler\)/);
+  const command = fs.readFileSync(path.join(__dirname, 'admin-billing-access-command-service.js'), 'utf8');
+  assert.match(command, /action: "billing\.entitlement\.set"/);
+  assert.match(command, /coreSource: "ADMIN"/);
+  assert.match(command, /syncAgencyBillingAggregate\(tx, identity\.agencyId, now\)/);
+  assert.match(fs.readFileSync(path.join(__dirname, 'admin-commit-authority-service.js'), 'utf8'), /tx\.adminCommandAudit\.create/);
 });
 
 test("settings audit never includes plaintext passwords", () => {
@@ -110,6 +118,15 @@ test("workspace patch validates all fields before any persistent write", async (
   const service = loadSettingsService();
   let writes = 0;
   const db = {
+    $queryRawUnsafe: async (sql, ids) => {
+      if (String(sql).includes('clock_timestamp')) return [{ authorityNow: new Date() }];
+      assert.match(String(sql), /published_earnings_aggregate_v1/);
+      return ids.filter(id => ['creator-near', 'creator-far'].includes(id)).map(creatorId => ({ creatorId, days: 30n, cents: 30000n, fresh: 30n, captured: new Date() }));
+    },
+    systemSetting: { findUnique: async ({ where }) => {
+      assert.equal(where.key, 'billing.commercial.policy.v1');
+      return { revision: 1, value: require('./billing-commercial-policy-service').DEFAULT_SETTINGS };
+    } },
     agency: {
       findUnique: async () => ({ id: "agency-1", name: "Original", plan: "PRO", status: "ACTIVE", trialEndsAt: null, currentPeriodEnd: null }),
       update: async () => { writes += 1; return {}; },
@@ -130,11 +147,20 @@ test("workspace patch validates all fields before any persistent write", async (
 test("billing read model is owner-only, filters deleted creators and keeps FREE_INTERNAL explicit", async () => {
   const service = loadSettingsService();
   const db = {
+    $queryRawUnsafe: async (sql, ids) => {
+      if (String(sql).includes('clock_timestamp')) return [{ authorityNow: new Date() }];
+      assert.match(String(sql), /published_earnings_aggregate_v1/);
+      return ids.filter(id => ['creator-near', 'creator-far'].includes(id)).map(creatorId => ({ creatorId, days: 30n, cents: 30000n, fresh: 30n, captured: new Date() }));
+    },
+    systemSetting: { findUnique: async ({ where }) => {
+      assert.equal(where.key, 'billing.commercial.policy.v1');
+      return { revision: 1, value: require('./billing-commercial-policy-service').DEFAULT_SETTINGS };
+    } },
     agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "PRO", status: "ACTIVE" }) },
     agencySubscription: { findFirst: async () => ({ id: "sub-1", status: "ACTIVE", billingMode: "FREE_INTERNAL", billingPeriod: "MONTHLY", corePricePerCreatorCents: 2000, trialEndsAt: null, graceUntil: null, currentPeriodStart: null, currentPeriodEnd: null }) },
     creatorAccount: { findMany: async () => [
-      { id: "creator-1", displayName: "Alive", username: "alive", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } },
-      { id: "creator-2", displayName: "No profile", username: "missing", billingProfile: null },
+      { id: "creator-1", agencyId: "agency-1", displayName: "Alive", username: "alive", billingProfile: { tier: "STARTER", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false } },
+      { id: "creator-2", agencyId: "agency-1", displayName: "No profile", username: "missing", billingProfile: null },
     ] },
     creatorEarningsSnapshot: { findMany: async () => [] },
     agencyBillingWallet: { findUnique: async () => null },
@@ -162,11 +188,20 @@ test("next-30-days billing estimate excludes prepaid renewals outside the horizo
   const profile = { tier: "STARTER", tierMode: "AUTO", corePriceCents: 2000, aiChatterEnabled: false, aiChatterPriceCents: 0, outreachEnabled: false, outreachPriceCents: 0, billingExcluded: false };
   const entitlement = (creatorId, end) => ({ id: `ent-${creatorId}`, agencyId: "agency-1", creatorId, tier: "STARTER", coreSource: "PAYMENT", coreValidFrom: now, coreValidUntil: end, subscriptionStartedAt: now, currentPeriodStartedAt: now, currentPeriodEndsAt: end, nextRenewalAt: end, autoRenewEnabled: true, walletTestMode: false });
   const db = {
+    $queryRawUnsafe: async (sql, ids) => {
+      if (String(sql).includes('clock_timestamp')) return [{ authorityNow: new Date() }];
+      assert.match(String(sql), /published_earnings_aggregate_v1/);
+      return ids.filter(id => ['creator-near', 'creator-far'].includes(id)).map(creatorId => ({ creatorId, days: 30n, cents: 30000n, fresh: 30n, captured: new Date() }));
+    },
+    systemSetting: { findUnique: async ({ where }) => {
+      assert.equal(where.key, 'billing.commercial.policy.v1');
+      return { revision: 1, value: require('./billing-commercial-policy-service').DEFAULT_SETTINGS };
+    } },
     agency: { findUnique: async () => ({ id: "agency-1", name: "Agency", plan: "PRO", status: "ACTIVE" }) },
     agencySubscription: { findFirst: async () => ({ id: "sub-1", status: "ACTIVE", billingMode: "MANUAL", billingPeriod: "MONTHLY", corePricePerCreatorCents: 2000 }) },
     creatorAccount: { findMany: async () => [
-      { id: "creator-near", displayName: "Near", username: "near", billingProfile: { ...profile }, billingEntitlement: entitlement("creator-near", upcoming) },
-      { id: "creator-far", displayName: "Far", username: "far", billingProfile: { ...profile }, billingEntitlement: entitlement("creator-far", far) },
+      { id: "creator-near", agencyId: "agency-1", displayName: "Near", username: "near", billingProfile: { ...profile }, billingEntitlement: entitlement("creator-near", upcoming) },
+      { id: "creator-far", agencyId: "agency-1", displayName: "Far", username: "far", billingProfile: { ...profile }, billingEntitlement: entitlement("creator-far", far) },
     ] },
     creatorEarningsSnapshot: { findUnique: async () => null },
     creatorEarningsDaily: {

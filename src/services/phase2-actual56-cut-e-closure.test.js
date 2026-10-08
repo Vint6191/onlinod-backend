@@ -47,15 +47,19 @@ test("F56-09/F56-10 creator retirement uses indexed inverse scope and one commit
 test("F56-11 platform admin member lifecycle/access delegates to Team authority and preserves history", () => {
   const admin = read("routes/admin.js");
   const team = read("services/team-administration-service.js");
+  const command = read("services/admin-operational-command-service.js");
+  assert.match(admin, /operationHandler\("member\.remove", "memberId"\)/);
+  assert.match(admin, /operationHandler\("member\.role\.set", "memberId"\)/);
+  assert.match(admin, /operationHandler\("member\.permissions\.set", "memberId"\)/);
   const deletion = slice(admin, 'router.delete("/members/:memberId"', '// ════════════════════════════════════════════════════════════\n// USERS');
   const role = slice(admin, 'router.patch("/members/:memberId/role"', 'const memberPermsSchema');
   const perms = slice(admin, 'router.patch("/members/:memberId/permissions"', 'router.delete("/members/:memberId"');
 
-  assert.match(deletion, /removeTeamMember/);
-  assert.match(deletion, /platformAdmin:\s*true/);
+  assert.match(command, /removeMember\(\{\.\.\.options,platformAdmin:true\}/);
+  assert.match(command, /platformAdmin:\s*true/);
   assert.doesNotMatch(deletion, /agencyMember\.delete/);
-  assert.match(role, /updateMemberAccessByPlatformAdmin/);
-  assert.match(perms, /updateMemberAccessByPlatformAdmin/);
+  assert.match(command, /updateMemberAccessByPlatformAdmin/);
+  assert.match(command, /expectedAccessEpoch:input\.expectedAccessEpoch/);
   assert.match(team, /lockTeamControlPlaneTopology/);
   assert.doesNotMatch(team, /team-owner-safety:/);
   assert.match(team, /assertOwnerSafety\([\s\S]*removing:\s*true/);
@@ -66,7 +70,8 @@ test("F56-11 platform admin member lifecycle/access delegates to Team authority 
 test("F56-12 all Creator removal entry points converge on CreatorLifecycleAuthority", () => {
   const admin = read("routes/admin.js");
   const destructive = read("services/phase2-destructive-delete-authority-service.js");
-  assert.match(admin, /retireCreatorWithinTransaction\([\s\S]*mode: hard \? "HARD" : "SOFT"/);
+  assert.match(admin, /operationHandler\("creator\.retire"\)/);
+  assert.match(read("services/admin-operational-command-service.js"), /retireCreatorWithinTransaction\([\s\S]*mode:input\.hard\?"HARD":"SOFT"/);
   assert.match(destructive, /ensureAgencyCreatorCleanupBatch[\s\S]*retireCreatorWithinTransaction/);
   assert.doesNotMatch(destructive, /ensureAgencyCreatorCleanupBatch[\s\S]{0,1800}creatorAccount\.update\(\{ where: \{ id: creatorId \}, data: \{ deletedAt/);
 });
@@ -90,8 +95,8 @@ test("F56-06/F56-07 Team current reads consume live Creator Member User and acce
   const operationalMigration = read("../prisma/migrations/20260912003000_phase2_actual56_operational_pending_authority/migration.sql");
   assert.match(operationalMigration, /phase2_scope_allows_creator/);
   assert.match(pending, /TeamOperationalPendingCurrent/);
-  assert.match(admin, /UPDATE "AgencyMember"[\s\S]*"accessEpoch"="accessEpoch"\+1/);
-  assert.match(admin, /SELECT "id" FROM "User" WHERE "id"=\$1 FOR UPDATE/);
+  assert.match(read("services/admin-operational-command-service.js"), /UPDATE "AgencyMember"[\s\S]*"accessEpoch"="accessEpoch"\+1/);
+  assert.match(read("services/admin-operational-command-service.js"), /SELECT "id" FROM "User" WHERE "id"=\$1 FOR UPDATE/);
 });
 
 test("F56-05/F56-08 destructive internal authority is explicit and narrow", () => {

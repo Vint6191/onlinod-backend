@@ -89,9 +89,11 @@ test("A32 fixture leak authority is schema-derived across tenant roots/FK descen
   const admin = source("src/routes/admin.js");
   const start = admin.indexOf('router.post("/maintenance/subscriber-signals/:id/requeue"');
   const body = admin.slice(start, admin.indexOf("module.exports = router", start));
-  assert.match(body, /prisma\.\$transaction\(async \(tx\)/);
-  assert.match(body, /requeuePoisonedSubscriberMaintenanceSignal\(\{[\s\S]*db: tx/);
-  assert.match(body, /tx\.adminActionLog\.create/);
+  assert.match(body, /operationHandler\("maintenance\.subscriber\.requeue"\)/);
+  const operation = source('src/services/admin-operational-command-service.js');
+  assert.match(operation, /executeAdminCommand/);
+  assert.match(operation, /requeuePoisonedSubscriberMaintenanceSignal\(\{db:tx/);
+  assert.match(source('src/services/admin-commit-authority-service.js'), /tx\.adminCommandAudit\.create/);
   assert.doesNotMatch(body, /await adminLog\(req/);
 });
 

@@ -28,7 +28,7 @@ test("A33 Likes and SFS expose non-durable refresh debt as planner failure", () 
   assert.match(likes, /reason: "fan_refresh_debt_not_durable"/);
   assert.match(sfs, /planning\?\.fanRefresh\?\.requested > 0 && planning\.fanRefresh\.durable !== true/);
   assert.match(sfs, /reason: "fan_refresh_debt_not_durable"/);
-  assert.match(sfs, /scheduleFanRefresh = scheduleFanDataPointRefresh/);
+  assert.match(sfs, /scheduleFanRefresh = \(args\) => scheduleFanDataPointRefresh\(\{ \.\.\.args, db \}\)/);
 });
 
 test("A33 common refresh authority preserves requested debt on scheduler throw and rejects terminal same-bucket failures", async () => {
@@ -108,11 +108,18 @@ test("A33 refresh debt stays bounded to 500 and canonicalizes consumer field ide
     refreshFields: ["value", "identity", "value"],
     scheduleFanRefresh: async (input) => { captured = input; return { created: true, jobId: "j1" }; },
   });
-  assert.equal(result.requested, 500);
-  assert.equal(result.durable, true);
+  assert.equal(result.requested, 700, 'oversized debt must not silently discard 200 fans');
+  assert.equal(result.durable, false);
+  assert.equal(captured, null, 'oversized request cannot call the scheduler');
+  const bounded = await scheduleDurableFanDataRefreshDebt({ agencyId: 'a', creatorId: 'c',
+    fanIds: Array.from({ length: 500 }, (_, i) => String(i + 1)), consumer: 'likes',
+    refreshFields: ['value', 'identity', 'value'],
+    scheduleFanRefresh: async input => { captured = input; return { created: true, jobId: 'j1' }; } });
+  assert.equal(bounded.requested, 500);
+  assert.equal(bounded.durable, true);
   assert.equal(captured.onlyFansUserIds.length, 500);
-  assert.deepEqual(captured.params.refreshFields, ["identity", "value"]);
-  assert.equal(captured.params.consumer, "likes");
+  assert.deepEqual(captured.params.refreshFields, ['identity', 'value']);
+  assert.equal(captured.params.consumer, 'likes');
 });
 
 test("A33 Admin current Hidden Online and Follow Back routes no longer read raw legacy tables", () => {

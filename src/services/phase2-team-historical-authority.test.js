@@ -7,7 +7,7 @@ const path = require("node:path");
 
 const root = path.resolve(__dirname, "../..");
 const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
-const desktopRoot = path.resolve(root, "../../phase2_desktop");
+const desktopRoot = path.resolve(process.env.ONLINOD_DESKTOP_ROOT || path.join(root, "../desktop"));
 const readDesktop = (rel) => fs.readFileSync(path.join(desktopRoot, rel), "utf8");
 
 test("Phase2 historical authority has durable schema and proof markers", () => {

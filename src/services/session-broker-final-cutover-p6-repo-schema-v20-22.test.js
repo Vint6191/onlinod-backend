@@ -68,16 +68,16 @@ test("V20.22 keeps historical migrations while clean baseline generation is expl
   assert.doesNotMatch(generator, /DATABASE_URL|migrate deploy|db push/);
 });
 
-test("V20.22 maintenance tools are isolated and dry-run by default", () => {
-  assert.equal(exists("dedupe-deliveries.js"), false);
-  assert.equal(exists("purge-stuck-deliveries.js"), false);
-  for (const rel of [
-    "scripts/maintenance/dedupe-deliveries.js",
-    "scripts/maintenance/purge-stuck-deliveries.js",
-  ]) {
+test("retired delivery cleanup entry points fail without loading a database or mutating data", () => {
+  const { spawnSync } = require('node:child_process');
+  for (const rel of ['dedupe-deliveries.js', 'purge-stuck-deliveries.js', 'scripts/maintenance/dedupe-deliveries.js', 'scripts/maintenance/purge-stuck-deliveries.js']) {
     const src = read(rel);
-    assert.match(src, /require\("\.\.\/\.\.\/src\/prisma"\)/);
-    assert.match(src, /process\.argv\.includes\("--apply"\)/);
+    assert.doesNotMatch(src, /require\(|deleteMany|\$executeRaw/);
+    for (const args of [[], ['--apply']]) {
+      const result = spawnSync(process.execPath, [path.join(root, rel), ...args], { encoding: 'utf8', env: { PATH: process.env.PATH } });
+      assert.equal(result.status, 1);
+      assert.equal(JSON.parse(result.stderr.trim()).code, 'LEGACY_DELIVERY_CLEANUP_RETIRED');
+    }
   }
 });
 

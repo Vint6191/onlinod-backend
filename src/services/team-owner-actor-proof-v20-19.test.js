@@ -192,14 +192,15 @@ test("pre-E2E agencies also require explicit ownership transfer",async()=>{
   assert.deepEqual(ctx.snapshotTarget(),before);
 });
 
-test("all destructive Team compatibility paths accept actorProof and derive device only from signed auth claim", () => {
+test("destructive Team commands preserve actor proof and signed device identity; compatibility writes are retired", () => {
   const route = fs.readFileSync(path.join(__dirname, "../routes/team.js"), "utf8");
-  assert.match(route, /actorProofSchema/);
-  assert.match(route, /actorDeviceId:\s*req\.auth\?\.deviceId \|\| null/);
-  assert.match(route, /router\.patch\("\/members\/:memberId\/settings"[\s\S]*actorProof/);
-  assert.match(route, /router\.patch\("\/members\/:memberId\/status"[\s\S]*actorProof/);
-  assert.match(route, /Compatibility endpoint retained for older desktops[\s\S]*actorProof/);
-  assert.match(route, /router\.patch\("\/members\/:memberId\/role"[\s\S]*actorProof/);
-  assert.match(route, /router\.delete\("\/members\/:memberId"[\s\S]*actorProof/);
+  const contract = fs.readFileSync(path.join(__dirname, 'team-command-contract.js'), 'utf8');
+  const service = fs.readFileSync(path.join(__dirname, 'team-command-service.js'), 'utf8');
+  assert.match(contract, /actorProof: actorProofSchema/);
+  assert.match(service, /actorDeviceId, actorProof: command\.actorProof/);
+  assert.match(route, /actorDeviceId:\s*req\.auth\?\.deviceId/);
+  assert.match(route, /router\.post\("\/commands\/v2", commandHandler\(false\)\)/);
+  assert.match(route, /status\(410\)[\s\S]*TEAM_COMMAND_V2_REQUIRED/);
   assert.doesNotMatch(route, /actorDeviceId:\s*(?:req\.body|input\.)/);
 });
+

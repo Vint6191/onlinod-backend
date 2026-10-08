@@ -61,7 +61,7 @@ test("C5 connection begin/complete/manual revoke share the same human commit aut
 
 test("C6 Creator catalog membership is one bounded Agency generation, not O(all members)", () => {
   assert.match(schema, /model AgencyCreatorCatalogState/);
-  assert.match(schema, /creatorCatalogState AgencyCreatorCatalogState\?/);
+  assert.match(schema, /creatorCatalogState\s+AgencyCreatorCatalogState\?/);
   assert.match(migration, /CREATE TABLE IF NOT EXISTS "AgencyCreatorCatalogState"/);
   assert.match(migration, /CREATE TRIGGER trg_phase2_creator_catalog_generation/);
   assert.match(migration, /AFTER INSERT OR DELETE OR UPDATE OF "agencyId", "deletedAt"/);
@@ -96,6 +96,8 @@ function productionCreatorMutationFiles() {
 test("C5 every direct human CreatorAccount writer remains behind a commit-time authority", () => {
   const writers = productionCreatorMutationFiles();
   const required = {
+    "src/services/creator-metadata-service.js": ["lockHumanCreatorMutation", "CREATOR_METADATA_VERSION_CONFLICT"],
+    "src/services/avatar-asset-service.js": ["authorizeCreatorAccountWrite", "AVATAR_REVISION_CHANGED"],
     "src/routes/creators.js": ["assertHumanCreatorCreateAuthority", "lockHumanCreatorMutation", "retireCreatorWithinTransaction"],
     "src/services/creator-enrollment-authority-service.js": ["lockHumanConnectionMutation", "authorizeCreatorAccountWrite"],
     "src/services/creator-telegram-contact-authority-service.js": ["lockCreatorPipelineLifecycle", "assertManagementCommitAuthority"],
@@ -109,6 +111,10 @@ test("C5 every direct human CreatorAccount writer remains behind a commit-time a
     for (const marker of markers) assert.match(source, new RegExp(marker));
   }
 
+  const commands = read('src/services/management-command-service.js');
+  assert.match(commands, /assertManagementCommitAuthority/);
+  assert.match(commands, /creator.avatar/);
+  assert.match(commands, /applyAvatar\(tx/);
   const classifiedInternal = new Set([
     "src/services/creator-session-broker-service.js",
     "src/services/phase2-destructive-delete-authority-service.js",
@@ -142,6 +148,8 @@ test("C6 stable catalog reader retries a raced membership change and never pairs
   let listRead = 0;
   const member = { id: "m1", userId: "u1", agencyId: "a1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 7 };
   const db = {
+    agencyRoleOverride: { async findUnique() { return null; } },
+    agencySubPermissionOverride: { async findMany() { return []; } },
     agencyMember: { async findFirst() { return { ...member }; } },
     agencyCreatorCatalogState: {
       async findUnique() { return { generation: generations[generationRead++] }; },
@@ -158,7 +166,7 @@ test("C6 stable catalog reader retries a raced membership change and never pairs
   });
   assert.equal(listRead, 2);
   assert.equal(result.creatorCatalogGeneration, 5);
-  assert.deepEqual(result.creators.map((row) => row.id), ["old", "new"]);
+  assert.deepEqual(result.creators.map((row) => row.id).sort(), ["new", "old"]);
 });
 
 test("C6 stable catalog reader fails closed under continuous membership churn", async () => {
@@ -166,6 +174,8 @@ test("C6 stable catalog reader fails closed under continuous membership churn", 
   let generation = 0;
   const member = { id: "m1", userId: "u1", agencyId: "a1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 7 };
   const db = {
+    agencyRoleOverride: { async findUnique() { return null; } },
+    agencySubPermissionOverride: { async findMany() { return []; } },
     agencyMember: { async findFirst() { return { ...member }; } },
     agencyCreatorCatalogState: { async findUnique() { generation += 1; return { generation }; } },
     creatorAccount: { async findMany() { return []; } },
@@ -185,6 +195,8 @@ test("C6 stable bootstrap retries member-scope churn and returns the new accessE
   let memberRead = 0;
   let listRead = 0;
   const db = {
+    agencyRoleOverride: { async findUnique() { return null; } },
+    agencySubPermissionOverride: { async findMany() { return []; } },
     agencyMember: { async findFirst() { return { ...memberReads[Math.min(memberRead++, memberReads.length - 1)] }; } },
     agencyCreatorCatalogState: { async findUnique() { return { generation: 5 }; } },
     creatorAccount: {
@@ -206,6 +218,8 @@ test("C6 stable bootstrap fails closed if member/User authority disappears mid-r
   const member = { id: "m1", userId: "u1", agencyId: "a1", role: "OPERATOR", roleKey: "chatter", assignedCreators: { creatorIds: ["c1"] }, accessEpoch: 9 };
   let reads = 0;
   const db = {
+    agencyRoleOverride: { async findUnique() { return null; } },
+    agencySubPermissionOverride: { async findMany() { return []; } },
     agencyMember: { async findFirst() { reads += 1; return reads === 1 ? { ...member } : null; } },
     agencyCreatorCatalogState: { async findUnique() { return { generation: 5 }; } },
     creatorAccount: { async findMany() { return [{ id: "c1" }]; } },

@@ -79,7 +79,9 @@ test("Team performance functions are relational and independent from RBAC role",
 
   const teamRoute = read("src/routes/team.js");
   assert.ok(teamRoute.includes('router.patch("/members/:memberId/functions"'));
-  assert.ok(teamRoute.includes('const TEAM_FUNCTION_KEYS = Object.freeze(["CHATTER", "CONTENT", "SUPERVISOR"])'));
+  assert.ok(read('src/services/team-command-contract.js').includes('const TEAM_FUNCTION_KEYS = Object.freeze(["CHATTER", "CONTENT", "SUPERVISOR"])'));
+  assert.match(teamRoute, /TEAM_COMMAND_V2_REQUIRED/);
+  assert.match(teamRoute, /router\.post\("\/commands\/v2", commandHandler\(false\)\)/);
 });
 
 test("Team read models do not silently truncate activity or attribution ledgers", () => {

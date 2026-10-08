@@ -84,14 +84,13 @@ test("Phase2 lock topology: shared lifecycle no longer couples normal work to bi
 });
 
 test("Phase2 lock topology: destructive Agency delete and restore use the exclusive lifecycle capability", () => {
-  const admin = source("../routes/admin.js");
-  const removeStart = admin.indexOf('router.delete("/agencies/:id"');
-  const restoreStart = admin.indexOf('router.post("/agencies/:id/restore"');
-  const next = admin.indexOf("// ═", restoreStart);
-  assert.ok(removeStart >= 0 && restoreStart > removeStart);
-  const remove = admin.slice(removeStart, restoreStart);
-  const restore = admin.slice(restoreStart, next > restoreStart ? next : undefined);
-  const deleteCalls = remove.match(/lockAgencyPipelineLifecycleExclusive/g) || [];
-  assert.ok(deleteCalls.length >= 2, "soft and hard delete must both take exclusive Agency lifecycle");
-  assert.match(restore, /lockAgencyPipelineLifecycleExclusive/);
+  const admin = source('../routes/admin.js');
+  for (const action of ['agency.retire', 'agency.restore']) assert.ok(admin.includes(`operationHandler("${action}")`));
+  const command = source('admin-operational-command-service.js');
+  const agency = command.slice(command.indexOf('if(action.startsWith("agency."))'), command.indexOf('if(action.startsWith("member."))'));
+  const lock = agency.indexOf('await lockAgencyPipelineLifecycleExclusive');
+  assert.ok(lock >= 0 && lock < agency.indexOf('if(action==="agency.update")'));
+  assert.ok(lock < agency.indexOf('else if(action==="agency.restore")'));
+  assert.match(agency, /allowDeleted:true/);
 });
+

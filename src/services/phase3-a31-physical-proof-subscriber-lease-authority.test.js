@@ -33,7 +33,7 @@ test("A31 recovered automation planning remains durable debt and Bumps cannot es
   assert.match(subscriber, /subscriberDerivedPlanningConverged/);
   assert.match(subscriber, /reason: "planning_failed", durableRetryRequired: true/);
   assert.match(subscriber, /fencedMaintenance[\s\S]*scheduleFanRefresh: fencedRefreshScheduler/);
-  assert.match(bumps, /scheduleFanRefresh = scheduleFanDataPointRefresh/);
+  assert.match(bumps, /scheduleFanRefresh = \(args\) => scheduleFanDataPointRefresh\(\{ \.\.\.args, db \}\)/);
   assert.match(bumps, /planBumps\([\s\S]*scheduleFanRefresh/);
   assert.match(subscriber, /DERIVED_AUTOMATION_PLANNING_FAILED/);
   assert.match(subscriber, /publicationJobReconciledAt:\s*null/);
@@ -88,7 +88,8 @@ test("A31 maintenance failures/poison debt are visible and recoverable without R
   assert.match(subscriberMaintenance, /ok: totals\.errors === 0 && poisonedSignals === 0/);
   assert.match(campaign, /ok: totals\.errors === 0/);
   assert.match(scheduler, /Phase2 maintenance degraded/);
-  assert.match(scheduler, /poisonedSignals/);
+  assert.match(scheduler, /result\[name\] = laneResult/);
+  assert.match(scheduler, /laneResult\?\.ok === false\) result\.ok = false/);
   assert.match(admin, /maintenance\/subscriber-signals/);
   assert.match(admin, /maintenance\/subscriber-signals\/:id\/requeue/);
   assert.match(admin, /ensureSuperAdmin/);

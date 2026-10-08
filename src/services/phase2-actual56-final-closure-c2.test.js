@@ -198,7 +198,9 @@ test("C2 ordinary Creator-scoped business authorities do not acquire the Team to
 
 
 test("C2-D admin Creator retirement joins Agency lifecycle before billing row lock", () => {
-  const route = admin.slice(admin.indexOf('router.delete("/creators/:id"'));
+  assert.match(admin, /operationHandler\("creator\.retire"\)/);
+  const command = fs.readFileSync(path.join(root, 'src/services/admin-operational-command-service.js'), 'utf8');
+  const route = command.slice(command.indexOf('if(action==="creator.retire")'));
   const agencyBarrier = route.indexOf("await lockAgencyPipelineLifecycle");
   const billing = route.indexOf("await lockAgencyBillingMutation");
   const retire = route.indexOf("await retireCreatorWithinTransaction");
@@ -210,7 +212,9 @@ test("C2-D admin Creator retirement joins Agency lifecycle before billing row lo
 
 
 test("C2 User disable remains cross-agency User -> Member and does not acquire per-Agency topology", () => {
-  const route = admin.slice(admin.indexOf('router.patch("/users/:id"'));
+  assert.match(admin, /operationHandler\("user\.update"\)/);
+  const command = fs.readFileSync(path.join(root, 'src/services/admin-operational-command-service.js'), 'utf8');
+  const route = command.slice(command.indexOf('if(action.startsWith("user."))'), command.indexOf('if(action==="creator.retire")'));
   ordered(route, ['SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE', 'UPDATE "AgencyMember"'], "User disable suffix");
   assert.doesNotMatch(route, /lockTeamControlPlaneTopology/);
 });
@@ -234,11 +238,12 @@ test("C2 anti-map inventories every direct AgencyMember writer and keeps legacy 
     .map((file) => path.relative(root, file).replaceAll(path.sep, "/"))
     .sort();
   assert.deepEqual(writers, [
-    "src/routes/admin.js",                  // cross-Agency User lifecycle: User -> Member
     "src/routes/auth.js",                   // brand-new Agency + OWNER in one creating transaction
     "src/services/access-epoch-service.js", // legacy helpers; production bump callers forbidden below
+    "src/services/admin-operational-command-service.js", // User -> Member under durable admin commit
     "src/services/creator-access-scope-authority-service.js", // Creator retirement under topology
     "src/services/team-administration-service.js",            // canonical Team topology writers
+    "src/services/team-ownership-transfer-service.js", // shared topology and per-role lifecycle locks
   ]);
 
   for (const file of productionFiles) {

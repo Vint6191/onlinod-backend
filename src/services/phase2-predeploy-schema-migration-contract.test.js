@@ -28,6 +28,7 @@ const migrationFiles = [
   "20260912007000_phase2_actual56_team_control_plane_release_activation",
 ].map((name) => fs.readFileSync(path.join(ROOT, "prisma", "migrations", name, "migration.sql"), "utf8"));
 const migration = migrationFiles.join("\n");
+const allMigrationFiles = fs.readdirSync(path.join(ROOT, 'prisma/migrations')).sort().map(name => path.join(ROOT, 'prisma/migrations', name, 'migration.sql')).filter(file => fs.existsSync(file)).map(file => fs.readFileSync(file, 'utf8'));
 
 function schemaModels() {
   const models = new Map();
@@ -67,14 +68,16 @@ function updateOfTriggers() {
 
 function cumulativeTableColumns(table) {
   const columns = new Set();
-  for (const text of migrationFiles) {
-    const create = text.match(new RegExp(`CREATE TABLE IF NOT EXISTS "${table}" \\(([\\s\\S]*?)\\n\\);`));
+  for (const text of allMigrationFiles) {
+    const create = text.match(new RegExp(`CREATE TABLE(?: IF NOT EXISTS)? "${table}" \\(([\\s\\S]*?)\\n\\);`));
     if (create) {
       for (const match of create[1].matchAll(/^\s*"([^"]+)"\s+/gm)) columns.add(match[1]);
     }
     const alterBlocks = new RegExp(String.raw`ALTER TABLE "${table}"([\s\S]*?);`, "g");
     for (const block of text.matchAll(alterBlocks)) {
-      for (const match of block[1].matchAll(/ADD COLUMN IF NOT EXISTS "([^"]+)"/g)) columns.add(match[1]);
+      for (const match of block[1].matchAll(/ADD COLUMN(?: IF NOT EXISTS)? "([^"]+)"/g)) columns.add(match[1]);
+      for (const match of block[1].matchAll(/DROP COLUMN(?: IF EXISTS)? "([^"]+)"/g)) columns.delete(match[1]);
+      for (const match of block[1].matchAll(/RENAME COLUMN "([^"]+)" TO "([^"]+)"/g)) { columns.delete(match[1]); columns.add(match[2]); }
     }
   }
   assert.ok(columns.size > 0, `missing cumulative DDL for ${table}`);
