@@ -1,5 +1,6 @@
 'use strict';
 const {COHORTS,GENERATION,manifest,failure,runDbTransaction}=require('./phase7-legacy-storage-service');
+const {lockRetirementSources,lockRetirementCohort,retirementError}=require('./phase7-retirement-authority-service');
 async function assertNoOldExecutions(db){
   const checks=[`SELECT "id" FROM "AutomationDelivery" WHERE "legacyStorageGeneration" IS DISTINCT FROM '${GENERATION}' AND "status" IN ('CLAIMED','RUNNING','COMMITTING','RECONCILE_REQUIRED') LIMIT 1`,
     `SELECT "id" FROM "JobInstance" WHERE "legacyStorageGeneration" IS DISTINCT FROM '${GENERATION}' AND "status" IN ('CLAIMED','RUNNING') LIMIT 1`,
@@ -37,7 +38,9 @@ async function prepareContract({db,release,closeRollback=false,operatorEvidence,
   await require('./phase7-legacy-storage-service').storageState(db);
   await require('../../scripts/database/phase7-legacy-storage-indexes').ensureIndexes(db);
   return runDbTransaction(db,async tx=>{
-    const rows=await tx.$queryRawUnsafe('SELECT * FROM "Phase7RetirementCohort" WHERE "id"=ANY($1::text[]) ORDER BY "id" FOR UPDATE',COHORTS);
+    await lockRetirementSources(tx);
+    const rows=[];
+    for(const id of [...COHORTS].sort())rows.push(await lockRetirementCohort(tx,id));
     if(rows.length!==COHORTS.length||rows.some(r=>r.planHash!==manifest.planHash||!r.enumerationComplete||r.state==='PURGED'))throw failure('PHASE7_ENUMERATION_INCOMPLETE');
     for(const c of rows){const invalid=await tx.phase7RetirementPartition.findFirst({where:{cohortId:c.id,state:{not:'VERIFIED'}},select:{id:true}});if(invalid)throw failure('PHASE7_PARTITION_UNVERIFIED',{partitionId:invalid.id});}
     const mismatch=await tx.phase7RetirementPartition.findFirst({where:{cohortId:{in:COHORTS},sequence:{gt:0},OR:[{archiveRoot:{not:checked.evidence.archive.exportRoot}},{archiveRoot:null},{restoreRoot:{not:checked.evidence.archive.restoreRoot}},{restoreRoot:null}]},select:{id:true}});
@@ -47,6 +50,6 @@ async function prepareContract({db,release,closeRollback=false,operatorEvidence,
     const fingerprint=(await tx.$queryRawUnsafe('SELECT phase7_storage_fingerprint() AS value'))[0].value;
     await tx.phase7RetirementCohort.updateMany({where:{id:{in:COHORTS}},data:{state:'PURGE_READY',fingerprint,releaseManifest:receipt,verifiedAt:new Date(),rollbackClosedAt:new Date(),revision:{increment:1}}});
     return {ready:true,fingerprint};
-  },{timeout:15000});
+  },{timeout:15000}).catch(error=>{throw retirementError(error);});
 }
 module.exports={assertNoOldExecutions,checkContractReady,readRelease,prepareContract};

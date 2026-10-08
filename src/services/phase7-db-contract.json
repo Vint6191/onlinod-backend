@@ -6,7 +6,7 @@
     },
     {
       "name": "phase7_legacy_storage_fence",
-      "bodyHash": "3acd4840824867f8f0c72b4781e340108d7acb7b8dd4e179873c58260ef1678b"
+      "bodyHash": "d8d1c079c71c71aade132362164a0d195cf61aac384621b02f511054931e9baf"
     },
     {
       "name": "phase7_legacy_truncate_fence",
@@ -34,7 +34,15 @@
     },
     {
       "name": "phase7_retirement_admission_guard",
-      "bodyHash": "d02ac37b852d5abc17124ccf8ce7d74cf8a3cf01beb12d27c4f39c46b958a524"
+      "bodyHash": "5cd9b1fff42b0b0a6f0297959013fd8b648ba099d24bfca6e9b6fa9d9e29c5c2"
+    },
+    {
+      "name": "phase7_lock_retirement_sources",
+      "bodyHash": "99b4445186347b16688594bdbb071f786c1a27c80cff1b90fd3031bccb1d41b4"
+    },
+    {
+      "name": "phase7_lock_retirement_cohort",
+      "bodyHash": "47c49e4fd67462e8a9dce86f090344ef6224042c2e4d2e23988910b43041c283"
     }
   ]
 }

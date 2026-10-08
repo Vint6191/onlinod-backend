@@ -52,8 +52,8 @@ async function main(){
    const d=await tx.automationDelivery.update({where:{id:cleanupId(k)},data:{status:'COMPLETED',result:{code},writeCommitAt:code==='already_unfollowed'?null:new Date(),finishedAt:new Date()}});
    if(finalize)await require('../../src/services/sfs-service').finalizeSfsSuccess({db:tx,delivery:d,outcomeCode:code});return d;
   });
-  await check('291 retained migrations, storage fences and online index definitions agree',async()=>{
-   assert.equal(f.migrations.length,291);await require('../database/phase7-legacy-storage-indexes').ensureIndexes(db,{create:true});
+  await check('292 retained migrations, storage fences and online index definitions agree',async()=>{
+   assert.equal(f.migrations.length,292);await require('../database/phase7-legacy-storage-indexes').ensureIndexes(db,{create:true});
    assert.equal((await storage.storageState(db)).phase,'BRIDGE');
   });
   await check('creator and agency retirement refuse unresolved effects before credentials can be revoked',async()=>{

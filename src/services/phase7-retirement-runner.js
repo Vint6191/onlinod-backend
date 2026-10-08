@@ -5,6 +5,7 @@ const crypto = require('node:crypto');
 const { manifest, DESTRUCTIVE, COHORTS, q, sha, failure, tableContract, readArchivePage, runDbTransaction } = require('./phase7-legacy-storage-service');
 const { handoffLegacyJob } = require('./phase7-obligation-handoff-service');
 const integrity = require('./phase7-archive-integrity');
+const { lockRetirementSources, lockRetirementCohort, lockRetirementPartition, isRetirementBusy } = require('./phase7-retirement-authority-service');
 const md5 = x => crypto.createHash('md5').update(x).digest('hex');
 const agencyKey = (t, id) => !t.scopeColumn ? 'g:GLOBAL' : id === null ? 'q:NULL' : 'a:' + id;
 const partitionId = (table, key) => table + ':' + md5(key);
@@ -16,8 +17,8 @@ function scope(t, agencyId, values) {
 async function enumerateCohort({ db, cohortId, budget = 32 }) {
   if (!COHORTS.includes(cohortId)) throw failure('PHASE7_COHORT_INVALID');
   return runDbTransaction(db, async tx => {
-    const rows = await tx.$queryRawUnsafe('SELECT * FROM "Phase7RetirementCohort" WHERE "id"=$1 FOR UPDATE', cohortId);
-    const c = rows[0];
+    await lockRetirementSources(tx);
+    const c = await lockRetirementCohort(tx, cohortId);
     if (!c || c.planHash !== manifest.planHash) throw failure('PHASE7_STORAGE_MANIFEST_MISMATCH');
     if (c.enumerationComplete || c.state === 'PURGED') return { complete: true, discovered: 0 };
     const progress = { ...c.enumeration }; let left = Math.max(1, Math.min(64, budget)), discovered = 0;
@@ -59,6 +60,16 @@ async function enumerateCohort({ db, cohortId, budget = 32 }) {
 }
 async function claimPartition(db, { leaseMs = 30000, onlyId = null } = {}) {
   return runDbTransaction(db, async tx => {
+    await lockRetirementSources(tx);
+    const hints = await tx.$queryRawUnsafe(`SELECT p."id",p."cohortId" FROM "Phase7RetirementPartition" p
+      JOIN "Phase7RetirementCohort" c ON c."id"=p."cohortId"
+      WHERE c."planHash"=$1 AND c."state" NOT IN ('PURGED','PURGE_READY')
+      AND (p."state"='PENDING' OR (p."state"='RUNNING' AND p."leaseUntil"<=clock_timestamp()))
+      AND p."nextAt"<=clock_timestamp() AND ($2::text IS NULL OR p."id"=$2)
+      ORDER BY p."nextAt",p."agencyKey",p."id" LIMIT 1`, manifest.planHash, onlyId);
+    if (!hints.length) return null;
+    const cohort = await lockRetirementCohort(tx, hints[0].cohortId);
+    if (['PURGED', 'PURGE_READY'].includes(cohort.state)) return null;
     const token = crypto.randomUUID();
     const rows = await tx.$queryRawUnsafe(`WITH candidate AS (
       SELECT p."id" FROM "Phase7RetirementPartition" p JOIN "Phase7RetirementCohort" c ON c."id"=p."cohortId"
@@ -68,7 +79,7 @@ async function claimPartition(db, { leaseMs = 30000, onlyId = null } = {}) {
       ORDER BY p."nextAt",p."agencyKey",p."id" FOR UPDATE OF p SKIP LOCKED LIMIT 1
     ) UPDATE "Phase7RetirementPartition" p SET "state"='RUNNING',"ownerToken"=$2,"leaseRevision"=p."leaseRevision"+1,
       "leaseUntil"=clock_timestamp()+($3::int*interval '1 millisecond'),"lastError"=NULL,"updatedAt"=clock_timestamp()
-      FROM candidate c WHERE p."id"=c."id" RETURNING p.*`, manifest.planHash,token,Math.max(5000,Math.min(60000,leaseMs)),onlyId);
+      FROM candidate c WHERE p."id"=c."id" RETURNING p.*`, manifest.planHash,token,Math.max(5000,Math.min(60000,leaseMs)),hints[0].id);
     const p = rows[0]; if (!p) return null;
     if (p.upperBound === null) {
       const t = tableContract(p.tableName), values = [];
@@ -151,6 +162,11 @@ async function durableArtifact(root,name,bytes) {
 }
 function chunkManifest(p,c){return {version:1,generation:manifest.generation,planHash:manifest.planHash,partitionId:p.id,tableName:p.tableName,agencyId:p.agencyId,
   sourceEpoch:String(p.sourceEpoch),sequence:c.sequence,startCursor:c.startCursor,endCursor:c.endCursor,rows:c.rows,bytes:c.bytes,digest:c.digest,previousDigest:c.previousDigest};}
+function assertVerificationSnapshot(p, current) {
+  const keys = ['cohortId','tableName','agencyId','sourceEpoch','state','sequence','rows','bytes','digest','cursor','upperBound',
+    'archiveRoot','restoreRoot','verifiedSequence','verifiedDigest'];
+  if (!current || keys.some(key => current[key] !== p[key])) throw failure('PHASE7_ARCHIVE_VERIFY_STALE');
+}
 async function processPartition({ db, partition, directory, limit = 100 }) {
   const p = partition;
   try {
@@ -165,6 +181,7 @@ async function processPartition({ db, partition, directory, limit = 100 }) {
     if (!page.items.length) {
       // No unaccounted deletion may silently look like end-of-input.
       return await runDbTransaction(db, async tx => {
+        await lockRetirementPartition(tx, p.id);
         const changed = await tx.$executeRawUnsafe(`UPDATE "Phase7RetirementPartition" SET "state"='EXPORTED',"ownerToken"=NULL,"leaseUntil"=NULL
           WHERE "id"=$1 AND "ownerToken"=$2 AND "leaseRevision"=$3 AND "sourceEpoch"=$4 AND "leaseUntil">clock_timestamp()`,p.id,p.ownerToken,p.leaseRevision,p.sourceEpoch);
         if (!changed) throw failure('PHASE7_STALE_PARTITION_OWNER'); return {partitionId:p.id,empty:true};
@@ -177,6 +194,7 @@ async function processPartition({ db, partition, directory, limit = 100 }) {
     await durableArtifact(root,name.replace('.jsonl','.manifest.json'),Buffer.from(JSON.stringify(descriptor)+'\n'));
     const chain = sha(JSON.stringify([p.digest,digest,page.nextCursor,page.items.length,data.length]));
     return await runDbTransaction(db, async tx => {
+      await lockRetirementPartition(tx, p.id);
       const changed = await tx.$executeRawUnsafe(`UPDATE "Phase7RetirementPartition" SET "cursor"=$5,"sequence"=$6,
         "rows"="rows"+$7,"bytes"="bytes"+$8,"digest"=$9,"state"=$10,"archiveRoot"=$11,"ownerToken"=NULL,"leaseUntil"=NULL,
         "nextAt"=clock_timestamp(),"updatedAt"=clock_timestamp()
@@ -188,9 +206,14 @@ async function processPartition({ db, partition, directory, limit = 100 }) {
       return { partitionId:p.id,rows:page.items.length,bytes:data.length,state:page.hasMore?'PENDING':'EXPORTED' };
     },{timeout:10000});
   } catch(error) {
-    try { await runDbTransaction(db, tx => tx.$executeRawUnsafe(`UPDATE "Phase7RetirementPartition" SET "state"='BLOCKED',"lastError"=$5,"ownerToken"=NULL,"leaseUntil"=NULL
+    // A busy authority is a retry from the existing durable lease/cursor, not a
+    // corrupt archive. Let the lease expire/reclaim without poisoning the row.
+    if (isRetirementBusy(error) || error.code === 'PHASE7_COHORT_CLOSED') throw error;
+    try { await runDbTransaction(db, async tx => {
+      await lockRetirementPartition(tx, p.id);
+      return tx.$executeRawUnsafe(`UPDATE "Phase7RetirementPartition" SET "state"='BLOCKED',"lastError"=$5,"ownerToken"=NULL,"leaseUntil"=NULL
       WHERE "id"=$1 AND "ownerToken"=$2 AND "leaseRevision"=$3 AND "sourceEpoch"=$4 AND "leaseUntil">clock_timestamp()`,
-      p.id,p.ownerToken,p.leaseRevision,p.sourceEpoch,String(error.code || error.message).slice(0,500))); }
+      p.id,p.ownerToken,p.leaseRevision,p.sourceEpoch,String(error.code || error.message).slice(0,500)); }); }
     catch (cleanup) { retainCleanup(error, cleanup); }
     throw error;
   }
@@ -203,7 +226,12 @@ async function verifyPartitionPage({ db, directory, partitionId: id }) {
   if (p.restoreRoot && p.restoreRoot !== sha(root)) throw failure('PHASE7_RESTORE_ROOT_CHANGED');
   if (p.sequence > 0 && sha(root) === p.archiveRoot) throw failure('PHASE7_INDEPENDENT_RESTORE_DIRECTORY_REQUIRED');
   if (p.state === 'VERIFIED') {
-    await integrity.verifyTotals(db, p);
+    await runDbTransaction(db, async tx => {
+      const current = await lockRetirementPartition(tx, id, { allowClosed: true });
+      assertVerificationSnapshot(p, current);
+      integrity.inspectPartition(current);
+      await integrity.verifyTotals(tx, current);
+    });
     return { partitionId:id, verified:true, alreadyVerified:true, verifiedSequence:p.verifiedSequence };
   }
   const window = await db.phase7RetirementChunk.findMany({where:{partitionId:id,sourceEpoch:p.sourceEpoch,sequence:{gte:Math.max(1,p.verifiedSequence)}},orderBy:{sequence:'asc'},take:3});
@@ -244,6 +272,10 @@ async function verifyPartitionPage({ db, directory, partitionId: id }) {
     await integrity.verifyTotals(db, p);
   }
   await runDbTransaction(db, async tx => {
+    const current = await lockRetirementPartition(tx, id);
+    assertVerificationSnapshot(p, current);
+    integrity.inspectPartition(current);
+    if (done) await integrity.verifyTotals(tx, current);
     const n = await tx.phase7RetirementPartition.updateMany({where:{id,sourceEpoch:p.sourceEpoch,state:'EXPORTED',verifiedSequence:p.verifiedSequence},
       data:{restoreRoot,verifiedSequence:next,verifiedDigest:chain,...(done?{state:'VERIFIED',archiveVerifiedAt:new Date()}:{} )}});
     if (!n.count) throw failure('PHASE7_ARCHIVE_VERIFY_STALE');
@@ -251,7 +283,10 @@ async function verifyPartitionPage({ db, directory, partitionId: id }) {
   return { partitionId:id,verified:done,verifiedSequence:next };
 }
 async function resumePartition({ db, id }) {
-  return runDbTransaction(db,tx=>tx.phase7RetirementPartition.updateMany({where:{id,state:'BLOCKED'},data:{state:'PENDING',lastError:null,nextAt:new Date()}}));
+  return runDbTransaction(db, async tx => {
+    if (!await lockRetirementPartition(tx, id)) return { count: 0 };
+    return tx.phase7RetirementPartition.updateMany({where:{id,state:'BLOCKED'},data:{state:'PENDING',lastError:null,nextAt:new Date()}});
+  });
 }
 module.exports = { enumerateCohort,claimPartition,processPartition,verifyPartitionPage,resumePartition,
   archiveDirectory,readArtifact,durableArtifact,agencyKey,partitionId };

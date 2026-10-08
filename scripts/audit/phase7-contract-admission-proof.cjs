@@ -9,7 +9,23 @@ const { sha, manifest, COHORTS, storageState } = require('../../src/services/pha
 const runner = require('../../src/services/phase7-retirement-runner');
 const finalizer = require('../../src/services/phase7-retirement-finalizer');
 const sources = require('../database/phase7-release-source');
-const { main: deploy, migrationPlan, CONTRACT } = require('../database/phase7-deploy');
+const { migrationPlan, CONTRACT } = require('../database/phase7-deploy');
+// The keeper requires an independent physical PG session. PGlite cannot supply
+// that, so exercise the real deployment SQL/source/Prisma pipeline with an
+// explicitly inert keeper callback. Separate authority tests cover its protocol;
+// this fixture must never claim native session exclusion or heartbeat evidence.
+const deploy = (() => {
+  const filename = path.join(root, 'scripts/database/phase7-deploy.js'), module = { exports: {} }, load = createRequire(filename);
+  require('node:vm').runInNewContext(require('node:fs').readFileSync(filename, 'utf8'), {
+    module, exports: module.exports, __dirname: path.dirname(filename), process, console, Buffer,
+    require(id) {
+      if (id === './phase7-deploy-authority') return { withDeploymentAuthority: async (options, work) =>
+        work({ signal: options.signal, assertCurrent: async () => {} }) };
+      return load(id);
+    }
+  }, { filename });
+  return module.exports.main;
+})();
 const expand = '20260930180000_phase7_legacy_storage_expand_v1';
 
 async function seed({ name, engine }) {
@@ -83,8 +99,8 @@ async function child(argv, env) {
     await sources.writeRelease({ backendRoot: root, desktopRoot, baseBackendRoot: root, baseDesktopRoot: desktopRoot, packageId: 'DISPOSABLE_PHASE7_PROOF', output: releaseFile });
     const release = await finalizer.readRelease(root, { file: releaseFile }), operatorEvidence = evidence(release, exportRoot, restoreRoot);
     const prepare = overrides => finalizer.prepareContract({ db, release, closeRollback: true, operatorEvidence, runtimeRoles: ['p7_proof_runtime'], ...overrides });
-    await check('291 canonical retained migrations preserve 506 pre-expand archive rows across two agencies', async () => {
-      assert.equal(f.migrations.length, 291); assert.equal(f.migrations.includes(CONTRACT), false);
+    await check('292 canonical retained migrations preserve 506 pre-expand archive rows across two agencies', async () => {
+      assert.equal(f.migrations.length, 292); assert.equal(f.migrations.includes(CONTRACT), false);
       assert.equal(Number((await db.$queryRawUnsafe('SELECT count(*) AS n FROM "AnalyticsSnapshot"'))[0].n), 506);
       assert.equal((await storageState(db)).phase, 'BRIDGE');
       await assert.rejects(db.$executeRawUnsafe(`UPDATE "AnalyticsSnapshot" SET payload='{}' WHERE id='p7-a-0001'`), /PHASE7/);
@@ -144,7 +160,7 @@ async function child(argv, env) {
       assert.equal(await db.phase7RetirementCohort.count({ where: { state: 'PURGE_READY' } }), 6);
       assert.equal((await finalizer.checkContractReady(db, { root, releaseFile })).ready, true);
     });
-    await check('BASELINE ready DB still admits a stale source identity; candidate blocks it before Prisma', async () => {
+    await check('stored ready state cannot admit a different source identity before Prisma', async () => {
       const other = { ...release, packageId: 'DIFFERENT_SOURCE_RELEASE' };
       await prepare({ release: other });
       if (process.env.PHASE7_PROOF_BASELINE) {
@@ -163,7 +179,7 @@ async function child(argv, env) {
       // state between the disconnected Prisma Client and schema-engine clients;
       // otherwise their independent prepared-statement names collide.
       await f.server.stop(); await f.engine.exec('DISCARD ALL'); await f.server.start();
-      try { output.push(await child([path.join(runtime, 'node_modules/prisma/build/index.js'), ...argv.slice(1)], { ...process.env, DATABASE_URL: f.url })); }
+      try { output.push(await child([path.join(root, 'node_modules/prisma/build/index.js'), ...argv.slice(1)], { ...process.env, DATABASE_URL: f.url })); }
       finally { await f.server.stop(); await f.engine.exec('DISCARD ALL'); await f.server.start(); }
     };
     await check('ordinary real Prisma redeploy preserves all nine legacy tables after preparation', async () => {
@@ -190,7 +206,8 @@ async function child(argv, env) {
     if (process.env.PHASE7_PROOF_OUTPUT) {
       await fs.writeFile(process.env.PHASE7_PROOF_OUTPUT, JSON.stringify({ runtime: process.version, engine: 'PGlite 0.5.8 + real Prisma 5.22; serialized connection',
         migrations: f?.migrations.length, baselineExecuted: Boolean(process.env.PHASE7_PROOF_BASELINE), scope: 'synthetic pre-expand data; NOT production-copy/native-PG/100-worker evidence',
-        hooks: false, syntheticBackup: true, cases, error: error ? { message: error.message, code: error.code, output: error.output } : null, prismaOutput: output }, null, 2));
+        hooks: false, syntheticBackup: true, nativeConcurrency: false, deploymentSessionAuthority: 'NOT_EXERCISED: inert keeper callback in disposable single-session fixture',
+        cases, error: error ? { message: error.message, code: error.code, output: error.output } : null, prismaOutput: output }, null, 2));
     }
     if (f) await f.close(); await fs.rm(temp, { recursive: true, force: true }); clearInterval(keepAlive);
   }

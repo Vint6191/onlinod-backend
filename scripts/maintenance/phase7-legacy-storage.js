@@ -3,6 +3,7 @@
 require('dotenv').config();
 const path=require('node:path');const {COHORTS,storageState,failure,runDbTransaction}=require('../../src/services/phase7-legacy-storage-service');
 const runner=require('../../src/services/phase7-retirement-runner');const finalizer=require('../../src/services/phase7-retirement-finalizer');
+const {isRetirementBusy,retirementError}=require('../../src/services/phase7-retirement-authority-service');
 function args(argv){
  const command=argv[0]||'status';
  const allowed={status:['after','state'],indexes:['create'],resume:['id'],'prepare-contract':['close-rollback','operator-evidence','release-file'],
@@ -33,7 +34,7 @@ async function main({db=require('../../src/prisma'),options=args(process.argv.sl
  let blocked=0;
  for(let step=0;step<steps;step++){
   if(['run','enumerate'].includes(o.command))for(const cohortId of COHORTS)emit({cohortId,...await runner.enumerateCohort({db,cohortId,budget:8})});
-  if(o.command==='run'){const partition=await runner.claimPartition(db);if(!partition){emit({idle:true});break;}try{emit(await runner.processPartition({db,partition,directory:o['archive-dir'],limit:100}));}catch(error){blocked++;emit({ok:false,partitionId:partition.id,code:error.code||error.message});}}
+  if(o.command==='run'){const partition=await runner.claimPartition(db);if(!partition){emit({idle:true});break;}try{emit(await runner.processPartition({db,partition,directory:o['archive-dir'],limit:100}));}catch(error){if(isRetirementBusy(error))throw retirementError(error);blocked++;emit({ok:false,partitionId:partition.id,code:error.code||error.message});}}
   if(o.command==='verify'){const p=await db.phase7RetirementPartition.findFirst({where:{state:'EXPORTED'},orderBy:[{updatedAt:'asc'},{id:'asc'}],select:{id:true}});if(!p){emit({idle:true});break;}emit(await runner.verifyPartitionPage({db,partitionId:p.id,directory:o['restore-dir']}));}
   if(o.command==='handoff'){
    const cohort=await db.phase7RetirementCohort.findUnique({where:{id:'automation_job'}});
@@ -48,4 +49,4 @@ async function main({db=require('../../src/prisma'),options=args(process.argv.sl
  if(blocked)throw failure(o.command==='handoff'?'PHASE7_HANDOFF_BLOCKED':'PHASE7_PARTITIONS_BLOCKED',{count:blocked});
 }
 module.exports={main,args};
-if(require.main===module){const db=require('../../src/prisma');main({db}).catch(e=>{console.error(json({ok:false,code:e.code||e.message,partitionId:e.partitionId,rowId:e.rowId,sourceId:e.sourceId}));process.exitCode=1;}).finally(()=>db.$disconnect());}
+if(require.main===module){const db=require('../../src/prisma');main({db}).catch(error=>{const e=retirementError(error);console.error(json({ok:false,code:e.code||e.message,...(isRetirementBusy(e)?{retryable:true}:{}),partitionId:e.partitionId,rowId:e.rowId,sourceId:e.sourceId}));process.exitCode=1;}).finally(()=>db.$disconnect());}

@@ -43,7 +43,15 @@ async function fixture(t, { groups = 2 } = {}) {
     }
   }
   let writes = 0;
-  const db = { phase7RetirementPartition: {
+  const db = { async $queryRawUnsafe(sql, id) {
+    if (sql.includes('phase7_lock_retirement_cohort')) {
+      assert.equal(id, p.cohortId); return [{id:p.cohortId,state:'DRAINING'}];
+    }
+    if (sql.includes('"Phase7RetirementPartition"') && sql.includes('FOR UPDATE')) {
+      assert.equal(id, p.id); return [structuredClone(p)];
+    }
+    throw Error('Unexpected SQL: '+sql);
+  }, phase7RetirementPartition: {
     findUnique: async () => structuredClone(p),
     updateMany: async ({ where, data }) => {
       for (const [key, value] of Object.entries(where)) if (p[key] !== value) return { count: 0 };
