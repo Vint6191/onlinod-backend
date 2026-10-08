@@ -126,16 +126,8 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: Number(process.env.AUTH_RATE_LIMIT_PER_15_MIN || 10),
-  standardHeaders: true,
-  legacyHeaders: false,
-  skipSuccessfulRequests: true,
-});
-
 app.use("/api", apiLimiter);
-app.use("/api/auth/login", authLimiter);
+app.use(["/api/auth/login", "/api/admin-auth/login"], express.json({ limit: "16kb" }));
 
 app.use("/api/management/commands", express.json({ limit: "4400kb" }));
 app.use(express.json({ limit: "2mb" }));

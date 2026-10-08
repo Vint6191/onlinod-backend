@@ -459,7 +459,7 @@ router.post("/resend-verification", async (req, res) => {
   }
 });
 
-router.post("/login", async (req, res) => {
+router.post("/login", require("../middleware/login-admission").loginAdmission({ db: prisma, surface: "member" }), async (req, res) => {
   try {
     const input = loginSchema.parse(req.body);
     const email = input.email.toLowerCase().trim();

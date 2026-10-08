@@ -2,23 +2,24 @@ const prisma = require("../prisma");
 const { verifyAccessToken } = require("../utils/tokens");
 const { requireBoundAccessDevice } = require("../utils/device-binding");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
+const { authUnavailable } = require("./auth-unavailable");
 
 async function authRequired(req, res, next, { compactMembership = false } = {}) {
+  const header = typeof req.headers.authorization === "string" ? req.headers.authorization : "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match) return res.status(401).json({ ok: false, code: "AUTH_REQUIRED", error: "Authorization token is required" });
+  let decoded;
   try {
-    const header = req.headers.authorization || "";
-    const match = header.match(/^Bearer\s+(.+)$/i);
-
-    if (!match) {
-      return res.status(401).json({
-        ok: false,
-        code: "AUTH_REQUIRED",
-        error: "Authorization token is required",
-      });
-    }
-
-    const token = match[1];
-    const decoded = verifyAccessToken(token);
-
+    decoded = verifyAccessToken(match[1]);
+  } catch (error) {
+    if (["JsonWebTokenError", "TokenExpiredError", "NotBeforeError"].includes(error?.name))
+      return res.status(401).json({ ok: false, code: "AUTH_INVALID", error: "Invalid or expired access token" });
+    return authUnavailable(res, error);
+  }
+  if (!decoded || typeof decoded !== "object" || typeof decoded.userId !== "string" || !decoded.userId
+    || typeof decoded.agencyId !== "string" || !decoded.agencyId)
+    return res.status(401).json({ ok: false, code: "AUTH_INVALID", error: "Invalid access token claims" });
+  try {
     const boundDeviceId = decoded.deviceId ? String(decoded.deviceId).trim().slice(0, 160) : null;
     // An unbound legacy access JWT cannot be fenced by account device logout.
     // Re-authentication publishes a device-bound session; no crypto keys change.
@@ -132,14 +133,11 @@ async function authRequired(req, res, next, { compactMembership = false } = {}) 
       membership,
     };
 
-    return next();
   } catch (err) {
-    return res.status(401).json({
-      ok: false,
-      code: "AUTH_INVALID",
-      error: "Invalid or expired access token",
-    });
+    return authUnavailable(res, err);
   }
+  // Downstream handler exceptions are not authorization errors.
+  return next();
 }
 
 function requireAuthDevice(req, suppliedDeviceId, options = {}) {

@@ -9,7 +9,7 @@ const { sendCommandError } = require("./admin-command-handlers");
 const router = express.Router();
 // Login still accepts old long passwords; newly set credentials reject bcrypt truncation.
 const loginSchema = z.object({ email: z.string().trim().email().max(254), password: z.string().min(8).max(1024) }).strict();
-router.post("/login", async (req, res) => {
+router.post("/login", require("../middleware/login-admission").loginAdmission({ db: prisma, surface: "admin" }), async (req, res) => {
   try { return res.json(await loginAdmin({ db: prisma, ...loginSchema.parse(req.body), ip: req.ip || null, userAgent: String(req.headers["user-agent"] || "").slice(0, 1000) || null })); }
   catch (error) { return sendCommandError(res, error); }
 });

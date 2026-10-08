@@ -2,6 +2,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { KNOWN_ROLES } = require("../services/admin-session-authority-service");
+const { authUnavailable } = require("./auth-unavailable");
 
 function sha256(value) {
   return crypto.createHash("sha256").update(String(value || "")).digest("hex");
@@ -36,11 +37,10 @@ async function adminSessionRequired(req, res, next) {
 
     req.admin = session.adminUser;
     req.adminSession = session;
-    return next();
   } catch (err) {
-    console.error("[adminSessionRequired] failed:", err);
-    return res.status(500).json({ ok: false, code: "ADMIN_AUTH_FAILED", error: "Admin auth failed" });
+    return authUnavailable(res, err, "ADMIN_AUTH_AUTHORITY_UNAVAILABLE");
   }
+  return next();
 }
 
 module.exports = { adminSessionRequired };

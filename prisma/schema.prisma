@@ -7125,3 +7125,13 @@ model MassQueueObservationItem {
   observation MassQueueObservation @relation(fields: [observationId], references: [id], onDelete: Cascade)
   @@id([observationId, queueId])
 }
+
+// Shared login admission; identity keys are hashed and expired buckets are pruned in bounded batches.
+model LoginAdmissionBucket {
+  id              String   @id
+  windowStartedAt DateTime @db.Timestamptz(3)
+  expiresAt       DateTime @db.Timestamptz(3)
+  attempts        Int
+
+  @@index([expiresAt, id])
+}
