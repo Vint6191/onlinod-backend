@@ -28,6 +28,7 @@
 const prisma = require("../prisma");
 const { runRetentionSweep, getRetentionSettings } = require("./retention-service");
 const { selectPhase2MaintenanceLanes } = require("./phase2-maintenance-admission-service");
+const { createMaintenanceHealth, maintenanceDegradedDetails } = require("./maintenance-health-service");
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { ensureSubscriberScanDue } = require("./subscriber-directory-service");
 const { ensureAutomaticFollowBack } = require("./follow-back-service");
@@ -2113,7 +2114,7 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
         if (laneResult?.ok === false) result.ok = false;
       } catch (error) {
         result.ok = false;
-        result[name] = { ok: false, error: error?.message || String(error) };
+        result[name] = { ok: false, reason: String(error?.code || "maintenance_lane_crashed").slice(0, 240), error: String(error?.message || error).slice(0, 500) };
       }
     }
     return result;
@@ -2271,42 +2272,21 @@ function recordRecurringSchedulerHealth(result, error = null) {
 }
 
 function getRecurringSchedulerHealthSnapshot() {
+  const maintenance = maintenanceHealth.snapshot();
   return {
     ...recurringSchedulerHealth,
     ...(analyticsDemandHealth.status === "DEGRADED" ? { status: "DEGRADED", lastReason: analyticsDemandHealth.lastReason } : {}),
-    ...(maintenanceHealth.status === "DEGRADED" ? { status: "DEGRADED", lastReason: maintenanceHealth.lastReason } : {}),
-    maintenance: { ...maintenanceHealth },
+    ...(maintenance.status === "DEGRADED" ? { status: "DEGRADED", lastReason: maintenance.lastReason } : {}),
+    maintenance,
     analyticsDemand: { ...analyticsDemandHealth },
     campaignProjection: campaignProjectionExecutor?.snapshot() || null,
     lastDegraded: recurringSchedulerHealth.lastDegraded.map((entry) => ({ ...entry })),
   };
 }
 
-let maintenanceHealth = { status: "UNKNOWN", lastCompletedAt: null, lastReason: null };
-function maintenanceDegradedDetails(result) {
-  const degraded = {};
-  for (const [name, lane] of Object.entries(result || {})) {
-    if (!lane || typeof lane !== "object" || lane.ok !== false) continue;
-    degraded[name] = {
-      reason: lane.reason ? String(lane.reason).slice(0, 240) : null,
-      failed: Number(lane.failed || 0), skipped: lane.skipped === true,
-      errors: Number(lane.errors || 0), contended: Number(lane.contended || 0),
-      poisonedSignals: Number(lane.poisonedSignals || 0),
-      errorDetails: Array.isArray(lane.errorDetails) ? lane.errorDetails.slice(0, 5) : [],
-      poisonedSample: Array.isArray(lane.poisonedSample) ? lane.poisonedSample.slice(0, 5) : [],
-      error: lane.error || null,
-    };
-  }
-  return degraded;
-}
+const maintenanceHealth = createMaintenanceHealth();
 function handleMaintenanceTickResult(result, error = null) {
-  if (!error && result?.skipped) return;
-  maintenanceHealth = {
-    status: error || result?.ok === false ? "DEGRADED" : "HEALTHY",
-    lastCompletedAt: new Date().toISOString(),
-    lastReason: error ? String(error.code || error.message).slice(0,240) : result?.ok === false
-      ? Object.entries(maintenanceDegradedDetails(result)).map(([name, lane]) => `${name}:${lane.reason || lane.error || "maintenance_lane_failed"}`).join(",").slice(0, 240) || "maintenance_lane_failed" : null,
-  };
+  maintenanceHealth.record(result, error);
 }
 
 function handleAnalyticsDemandTickResult(result, error = null) {

@@ -1337,7 +1337,7 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
     },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true } });
   assert.equal(result.reason, "claimed");
   assert.equal(updateData.claimedAt.toISOString(), authorityNow.toISOString());
   assert.equal(updateData.startedAt.toISOString(), authorityNow.toISOString());
@@ -1351,6 +1351,9 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
     campaignSegmentedFairTraversalVersion: 1,
     campaignFrontierSchedulingVersion: 1,
     campaignDirectoryReuseVersion: 1,
+    campaignBoundedTraversalVersion: 1,
+    campaignTraversalAuthorityVersion: 1,
+    campaignFairPagesVersion: 1,
   }, "legacy queued campaign jobs must drop provider-order catch-up hints/page caps and upgrade to current causal/resumable/order-independent protocol at claim time");
 });
 
@@ -1391,7 +1394,7 @@ test("Campaign claim sets active physical claim generation before SCHEDULED to C
   const { claimJob } = loadService({ db });
   const result = await claimJob({
     userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"],
-    capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true },
+    capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true },
   });
   assert.equal(result.reason, "claimed");
   const markerAt = events.findIndex((event) => event[0] === "marker");
@@ -1447,11 +1450,32 @@ test("job claim creator capability freshness uses the same PostgreSQL authority 
     jobInstance: { findMany: async () => [], findFirst: async () => null },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true } });
   assert.equal(result.reason, "no-work");
   assert.equal(bindingWhere.lastSeenAt.gte.toISOString(), new Date(authorityNow.getTime() - 2 * 60_000).toISOString());
   assert.equal(bindingWhere.lastSeenAt.lte.toISOString(), new Date(authorityNow.getTime() + 5 * 60_000).toISOString());
 });
+
+for (const missing of ["campaignBoundedTraversalV1", "campaignTraversalAuthorityV1", "campaignFairPagesV1"]) {
+  test(`Campaign claim without ${missing} never reaches a lease mutation`, async () => {
+    const authorityNow = new Date("2039-03-04T05:06:07.800Z");
+    const capabilities = { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true,
+      campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true,
+      campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true,
+      campaignTraversalAuthorityV1: true, campaignFairPagesV1: true };
+    delete capabilities[missing];
+    const db = {
+      $queryRawUnsafe: async () => [{ authorityNow }],
+      workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: authorityNow }) },
+      agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 1 }) },
+      creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
+      deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
+      jobInstance: { findMany: async () => [], findFirst: async () => assert.fail("incompatible worker must not select work"), updateMany: async () => assert.fail("incompatible worker must not receive a lease") },
+    };
+    const { claimJob } = loadService({ db });
+    assert.equal((await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60000, jobKeys: ["fetch_campaigns"], capabilities })).reason, "no-capabilities");
+  });
+}
 
 test("job claim rejects future-poisoned device heartbeat before creator capability admission", async () => {
   const authorityNow = new Date("2039-03-04T05:06:07.800Z");

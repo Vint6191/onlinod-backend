@@ -58,5 +58,5 @@ test("scheduler log and health retain failed/reason even when errors=0", () => {
   assert.equal(summary.errors, 0); assert.equal(summary.failed, 1); assert.equal(summary.reason, "BAD_TRAFFIC_DIRTY_INPUT"); assert.equal(summary.errorDetails.length, 5);
   scheduler._test.handleMaintenanceTickResult(result);
   assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.lastReason, "notificationHistoryRepair:BAD_TRAFFIC_DIRTY_INPUT");
-  scheduler._test.handleMaintenanceTickResult({ ok: true }); assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.lastReason, null);
+  scheduler._test.handleMaintenanceTickResult({ ok: true, notificationHistoryRepair: { ok: true, failed: 0 } }); assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.lastReason, null);
 });

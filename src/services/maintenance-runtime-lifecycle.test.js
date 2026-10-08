@@ -73,7 +73,7 @@ test('maintenance degradation appears in the actual scheduler health snapshot an
  require.cache[require.resolve('../prisma')]={exports:{}};
  const scheduler=require('./job-scheduler');scheduler._test.handleMaintenanceTickResult(null,Object.assign(Error('catalog'),{code:'MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH'}));
  assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().status,'DEGRADED');assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.status,'DEGRADED');
- scheduler._test.handleMaintenanceTickResult({ok:true});assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.status,'HEALTHY');
+ scheduler._test.handleMaintenanceTickResult({ok:true,admission:{ok:true,selected:[]}});assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.status,'HEALTHY');
 });
 
 test('one synchronous worker stop failure does not prevent other drains or Prisma disconnect',async()=>{

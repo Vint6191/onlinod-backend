@@ -198,9 +198,14 @@ async function main() {
       assert.ok(rows.every(r => r.state === "READY" && r.requestedRevision === 2n && r.lastRepair.kind === recovery.KIND));
     });
     await check("recovery uses its partial index behind 10000 completed work records", async () => {
-      await runRootCommit(db, async ({ tx }) => {
-        for (let start = 0; start < 10000; start += 500) await tx.domainWorkItem.createMany({ data: Array.from({ length: 500 }, (_, i) => ({ id: `noise:${start + i}`, agencyId: s.agencyId, creatorId: s.creatorId, workClass: historyClasses[0], objectType: "FixtureNoise", objectId: String(start + i), partitionKey: s.creatorId, state: "DONE", isOutstanding: false })) });
-      }, { profile: "JOB_CHUNK" });
+      // Fixture loading is not the operation under measurement. Keep each seed
+      // root bounded instead of extending production JOB_CHUNK deadlines.
+      for (let start = 0; start < 10000; start += 500) {
+        await runRootCommit(db, async ({ tx }) => {
+          await tx.domainWorkItem.createMany({ data: Array.from({ length: 500 }, (_, i) => ({ id: `noise:${start + i}`, agencyId: s.agencyId, creatorId: s.creatorId, workClass: historyClasses[0], objectType: "FixtureNoise", objectId: String(start + i), partitionKey: s.creatorId, state: "DONE", isOutstanding: false })) });
+        }, { profile: "JOB_CHUNK" });
+      }
+      assert.equal(await db.domainWorkItem.count({ where: { objectType: "FixtureNoise", agencyId: s.agencyId, creatorId: s.creatorId } }), 10000);
       await db.$executeRawUnsafe('ANALYZE "DomainWorkItem"');
       plans.recovery = await db.$queryRawUnsafe(`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT "id","agencyId","creatorId" FROM "DomainWorkItem" WHERE ${recovery.PREDICATE} ORDER BY "id" LIMIT 4`);
       assert.match(JSON.stringify(plans.recovery), /DomainWorkItem_notification_identity_recovery_idx/); assert.doesNotMatch(JSON.stringify(plans.recovery), /Seq Scan/);

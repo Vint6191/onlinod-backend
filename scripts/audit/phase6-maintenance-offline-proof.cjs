@@ -69,6 +69,22 @@ async function restartWorker() {
  }finally{await pg.close();}
 }
 function registerTests(){
+ test('C1 SQL + actual pump: a failed class stays degraded across other batches until its own retry succeeds',async(t)=>{
+  const fx=await fixture(t);let failed=false;
+  const pump=pumpHarness(fx.db,async name=>{
+   if(name==='notificationHistoryRepair'&&!failed){failed=true;throw Object.assign(Error('controlled repair failure'),{code:'NOTIFICATION_HISTORY_CURSOR_INVALID'});}
+   return{ok:true};
+  });
+  const scheduler=require('../../src/services/job-scheduler');
+  for(let i=0;i<Math.ceil(lanes.length/5);i++){
+   const result=await pump({db:fx.db});scheduler._test.handleMaintenanceTickResult(result);
+   assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.status,'DEGRADED');
+   assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.lastReason,'notificationHistoryRepair:NOTIFICATION_HISTORY_CURSOR_INVALID');
+  }
+  const retry=await pump({db:fx.db});assert.equal(retry.notificationHistoryRepair.ok,true);
+  scheduler._test.handleMaintenanceTickResult(retry);
+  assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.status,'HEALTHY');
+ });
  test('C1 SQL: same timestamp and 55s alias cannot starve every registered class',async(t)=>{
   const fx=await fixture(t);const seen=new Set();
   for(let i=0;i<100;i++){
