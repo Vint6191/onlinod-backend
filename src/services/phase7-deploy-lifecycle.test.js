@@ -9,7 +9,7 @@ const root = path.resolve(__dirname, '../..');
 
 async function deployment(t, { point, existing = false, contract = false, cleanupFails = false } = {}) {
   const controller = new AbortController(), events = [], receipts = [];
-  let staged, admission = 0, firstCommand = true;
+  let staged, admission = 0, firstCommand = true, migrated = false;
   const hit = name => { events.push(name); if (point === name) controller.abort('SIGTERM'); };
   const names = (await fs.readdir(path.join(root, 'prisma/migrations'), { withFileTypes: true }))
     .filter(x => x.isDirectory()).map(x => x.name).sort();
@@ -17,8 +17,8 @@ async function deployment(t, { point, existing = false, contract = false, cleanu
   const db = {
     async $disconnect() { hit('disconnect'); },
     async $queryRawUnsafe(sql) {
-      if (sql.includes("to_regclass('public._prisma_migrations')")) { hit('history'); return [{ name: existing ? '_prisma_migrations' : null }]; }
-      if (sql.startsWith('SELECT migration_name,checksum,')) { hit('receipts'); return [{ migration_name: first, checksum: createHash('sha256').update(bytes).digest('hex'), finished_at: new Date(), rolled_back_at: null }]; }
+      if (sql.includes("to_regclass('public._prisma_migrations')")) { hit('history'); return [{ name: existing || migrated ? '_prisma_migrations' : null }]; }
+      if (sql.startsWith('SELECT migration_name,checksum,')) { hit('receipts'); return (migrated ? names.filter(name => contract || name !== '20260930190000_phase7_legacy_storage_contract_v1') : [first]).map(name => ({ migration_name: name, checksum: createHash('sha256').update(sync.readFileSync(path.join(root, 'prisma/migrations', name, 'migration.sql'))).digest('hex'), finished_at: new Date('2026-10-08T00:00:00Z'), rolled_back_at: null })); }
       if (sql.includes("c.relname<>'_prisma_migrations'")) { hit('empty-catalog'); return []; }
       throw new Error('unexpected fixture SQL');
     },
@@ -27,6 +27,7 @@ async function deployment(t, { point, existing = false, contract = false, cleanu
   vm.runInNewContext(sync.readFileSync(entry, 'utf8'), {
     module, exports: module.exports, __dirname: path.dirname(entry), process,
     console: { log() {} }, require(id) {
+      if (id === './phase7-deploy-authority') return { withDeploymentAuthority: async (options, work) => work({ signal: options.signal, assertCurrent: async () => {} }) };
       if (id === 'node:fs/promises') return { ...fs,
         async mkdtemp(...args) { staged = await fs.mkdtemp(...args); hit('allocate'); return staged; },
         async copyFile(...args) { await fs.copyFile(...args); if (args[1].endsWith('schema.prisma')) hit('stage-schema'); },
@@ -44,6 +45,7 @@ async function deployment(t, { point, existing = false, contract = false, cleanu
   return { events, receipts, get staged() { return staged; }, async run() {
     if (point === 'pre-aborted') controller.abort('SIGTERM');
     return module.exports.main({ db, contract, signal: controller.signal, emitResult: value => receipts.push(value), commandRunner: async args => {
+      if (args[1] === 'migrate') migrated = true;
       hit(args[1] === 'migrate' ? 'migration-child' : path.basename(args[0]) === 'phase7-legacy-storage-indexes.js' ? 'final-child' : 'hook');
       if (firstCommand) { firstCommand = false; hit('first-child'); }
     } });

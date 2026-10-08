@@ -142,16 +142,18 @@ async function deploymentFixture(t, { corruptStage = false, afterFirstAdmission,
   await fs.unlink(f.output); await source.writeRelease(f.options);
   f.release = await source.readRelease(f.roots.backendRoot, { file: f.output });
   const db = readyDatabase(f.release), readyQuery = db.$queryRawUnsafe;
+  let applied = [names[0]];
   db.$disconnect = async () => {};
   db.$queryRawUnsafe = async sql => {
     if (sql.includes("to_regclass('public._prisma_migrations')")) return [{ name: '_prisma_migrations' }];
-    if (sql.startsWith('SELECT migration_name,checksum,')) return [{ migration_name: names[0], checksum: sha('SELECT 1;'), finished_at: new Date(), rolled_back_at: null }];
+    if (sql.startsWith('SELECT migration_name,checksum,')) return applied.map(name => ({ migration_name: name, checksum: sha('SELECT 1;'), finished_at: new Date('2026-10-08T00:00:00Z'), rolled_back_at: null }));
     return readyQuery(sql);
   };
   let checks = 0, staged;
   const finalizer = admissionModule(), file = path.join(codeRoot, 'scripts/database/phase7-deploy.js'), load = createRequire(file), module = { exports: {} };
   vm.runInNewContext(sync.readFileSync(file, 'utf8'), { module, exports: module.exports, __dirname: path.join(f.roots.backendRoot, 'scripts/database'), process,
     console: { log() {} }, require(id) {
+      if (id === './phase7-deploy-authority') return { withDeploymentAuthority: async (options, work) => work({ signal: options.signal, assertCurrent: async () => {} }) };
       if (id === 'node:fs/promises') return { ...fs, async copyFile(from, to) { await fs.copyFile(from, to); if (path.basename(to) === 'schema.prisma') { staged = path.dirname(to); if (corruptStage) await fs.writeFile(to, 'unattested schema'); } } };
       if (id === './phase7-role-preflight') return { inspectRoles: async () => ({ verified: true }) };
       if (id === '../../src/services/phase7-legacy-storage-service') return { storageState: async () => ({ ready: true }) };
@@ -170,6 +172,7 @@ async function deploymentFixture(t, { corruptStage = false, afterFirstAdmission,
       calls.push(argv); assert.equal(argv[1], 'migrate'); assert.equal(argv[2], 'deploy');
       const present = await fs.readdir(path.join(path.dirname(argv.at(-1)), 'migrations'));
       assert.equal(present.includes(CONTRACT), contract);
+      applied = present.filter(name => name !== 'migration_lock.toml');
     } }); },
   };
 }
@@ -184,7 +187,7 @@ test('source replacement after first admission stops deployment before the migra
 });
 test('corrupted staged bytes stop deployment while original source still matches', async t => {
   const f = await deploymentFixture(t, { corruptStage: true });
-  await assert.rejects(f.run(), { code: 'PHASE7_RELEASE_SOURCE_MISMATCH' }); assert.equal(f.calls.length, 0);
+  await assert.rejects(f.run(), { code: 'PHASE7_STAGED_SOURCE_MISMATCH' }); assert.equal(f.calls.length, 0);
   await source.readRelease(f.roots.backendRoot, { file: f.output });
 });
 test('different prepared DB release after staging is rejected before the migration child', async t => {

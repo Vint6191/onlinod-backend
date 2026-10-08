@@ -53,7 +53,7 @@ function productionJsFiles(dir) {
   return out;
 }
 
-test("Closure4 production has zero queryRaw transaction advisory locks and one shared single-key lock authority", () => {
+test("Closure4 advisory lock callers use executeRaw and the current reviewed authority inventory", () => {
   const srcDir = path.resolve(__dirname, "..");
   const offenders = [];
   const lockSources = [];
@@ -63,21 +63,31 @@ test("Closure4 production has zero queryRaw transaction advisory locks and one s
     if (/pg_advisory_xact_lock/.test(source)) lockSources.push(path.relative(srcDir, file));
   }
   assert.deepEqual(offenders, []);
+  // Current retained-schema authorities add scoped publication, billing and
+  // message-library locks. Keep an exact inventory so new callers need review.
   assert.deepEqual(lockSources.sort(), [
     "services/admin-commit-authority-service.js",
     "services/admin-operator-bootstrap-service.js",
+    "services/analytics-publication-service.js",
     "services/automation-write-commit-fence-service.js",
+    "services/billing-nowpayments-service.js",
+    "services/campaign-read-projection-service.js",
+    "services/campaign-transaction-lock-service.js",
     "services/creator-analytics-ledger-service.js",
+    "services/creator-fact-write-authority.js",
     "services/db-transaction-service.js",
+    "services/message-library-command-service.js",
     "services/message-library-lifecycle-service.js",
-    "services/notification-facts-service.js",
+    "services/message-library-usage-service.js",
   ]);
 
-
   const campaignLock = fs.readFileSync(path.resolve(__dirname, "campaign-transaction-lock-service.js"), "utf8");
-  assert.match(campaignLock, /lockDbAdvisoryXact/);
-  assert.match(campaignLock, /withDbAdvisoryXactLock/);
-  assert.doesNotMatch(campaignLock, /pg_advisory_xact_lock/);
+  assert.match(campaignLock, /runDbTransaction/);
+  assert.match(campaignLock, /acquireCampaignTransactionLock\(tx, creatorId\)/);
+  assert.match(campaignLock, /\$executeRawUnsafe\(`SELECT pg_advisory_xact_lock\(hashtext\(\$1\)\)/);
+  assert.match(campaignLock, /set_config\('onlinod.campaign_refresh_work_version','2',true\)/);
+  assert.match(campaignLock, /set_config\('onlinod.campaign_refresh_creator',\$2,true\)/);
+
 
   const followBack = fs.readFileSync(path.resolve(__dirname, "follow-back-service.js"), "utf8");
   const follow = fs.readFileSync(path.resolve(__dirname, "follow-automation-service.js"), "utf8");

@@ -16,7 +16,7 @@ async function rehearsal(t, point) {
   t.after(() => fs.rm(parent, { recursive: true, force: true }));
   const output = path.join(parent, 'proof'), controller = new AbortController();
   const events = [], printed = [], disconnects = [], mutations = [];
-  let exists = false, database, lockOwner = null, unbaselined = false, deployed = false, clients = 0, inventories = 0, disposed = false;
+  let exists = false, database, lockOwner = null, deploymentHeld = false, unbaselined = false, deployed = false, clients = 0, inventories = 0, disposed = false;
   const migration = '20200101000000_fixture', sql = 'SELECT 1;';
   const baseline = { id: 'receipt', migration_name: migration, checksum: createHash('sha256').update(sql).digest('hex'), finished_at: '2020-01-01T00:00:00.000Z', rolled_back_at: null };
   const row = { ...baseline };
@@ -63,6 +63,11 @@ async function rehearsal(t, point) {
     console: { log(value) { printed.push(JSON.parse(value)); } },
     require(id) {
       if (id === '@prisma/client') return { PrismaClient };
+      if (id === '../database/phase7-deploy-authority') return { async withDeploymentAuthority(options, work) {
+        lifecycle.checkInterrupted(options.signal, 'fixture-owner', 'PHASE7_REHEARSAL_INTERRUPTED');
+        deploymentHeld = true;
+        try { return await work(); } finally { deploymentHeld = false; }
+      } };
       if (id === 'node:fs/promises') return { ...fs,
         async readdir(dir, options) {
           if (dir === path.join(root, 'prisma/migrations')) return [migration, CONTRACT].map(name => ({ name, isDirectory: () => true }));
@@ -81,7 +86,7 @@ async function rehearsal(t, point) {
       if (id === '../database/phase7-release-source') return { async inventory() { hit(++inventories === 1 ? 'initial-inventory' : 'final-inventory'); return { hash: 'fixture' }; } };
       if (id === '../database/phase7-deploy-child') return { stageName, async runStage(args, options) {
         hit('deploy');
-        const refusal = unbaselined ? 'PHASE7_UNBASELINED_DATABASE'
+        const refusal = deploymentHeld ? 'PHASE7_DEPLOY_ALREADY_RUNNING' : unbaselined ? 'PHASE7_UNBASELINED_DATABASE'
           : row.checksum !== baseline.checksum ? 'PHASE7_MIGRATION_CHECKSUM_MISMATCH'
           : row.finished_at === null ? 'PHASE7_FAILED_MIGRATION_REQUIRES_RESOLUTION'
           : row.migration_name !== migration ? 'PHASE7_UNKNOWN_APPLIED_MIGRATION' : null;
@@ -115,7 +120,8 @@ for (const point of ['initial-inventory', 'server-version', 'create', 'first-loc
     assert.equal(f.exists, false); assert.equal(f.lockOwner, null); assert.equal(f.disposed, true);
     if (point !== 'initial-inventory') assert(f.disconnects.includes(1));
     if (point.startsWith('inject-')) { assert.deepEqual(f.row, f.baseline); assert(f.events.includes('restore-' + point.slice(7))); }
-    if (['create', 'first-lock', 'unbaselined-create'].includes(point)) assert(!f.events.includes('deploy'));
+    if (['create', 'first-lock'].includes(point)) assert(!f.events.includes('deploy'));
+    if (point === 'unbaselined-create') assert.equal(f.events.filter(value => value === 'deploy').length, 1, 'only the read-only competing-deploy refusal has run');
     if (point === 'create') assert.equal(f.disconnects.length, 1, 'work clients must not be created after cancellation');
   });
 }
@@ -135,7 +141,7 @@ test('rehearsal success is committed after fixture drop, final source check and 
   assert.equal(report.ok, true); assert.equal((await f.report()).ok, true);
   assert.deepEqual(f.events.slice(-3), ['drop', 'final-inventory', 'admin-disconnect']);
   assert.equal(f.printed.at(-1).event, 'PHASE7_REHEARSAL_PASS'); assert.equal(f.exists, false); assert.equal(f.disposed, true);
-  assert.equal(report.stages.length, 7); assert.deepEqual(f.row, f.baseline);
+  assert.equal(report.stages.length, 8); assert.equal(report.deploymentAuthorityExclusion, true); assert.deepEqual(f.row, f.baseline);
 });
 
 test('pre-aborted rehearsal never creates a database', async () => {

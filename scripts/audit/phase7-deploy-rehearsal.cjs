@@ -13,6 +13,7 @@ const { runStage, stageName } = require('../database/phase7-deploy-child');
 const { checkInterrupted, processInterrupts, disconnectAll, completeCleanup, retainFailure } = require('../database/phase7-deploy-lifecycle');
 const { inventory } = require('../database/phase7-release-source');
 const { CONTRACT, PRE, POST } = require('../database/phase7-deploy');
+const { withDeploymentAuthority } = require('../database/phase7-deploy-authority');
 const ROOT = path.resolve(__dirname, '../..');
 const PREFIX = 'onlinod_p7_rehearsal_';
 
@@ -215,6 +216,13 @@ async function main(argv = process.argv.slice(2), env = ENTRY_ENV) {
       try {
         report.sessions = await verifyIndependentSessions(db, other, database, { signal: control.signal });
         await other.$disconnect(); check('sessions-disconnected'); await save();
+        // A separate direct keeper must survive disconnection of the fixture's
+        // ordinary clients and refuse a competing REAL deploy CLI before any
+        // migration/preflight child starts. Releasing it admits the next run.
+        await withDeploymentAuthority({ databaseUrl: url, signal: control.signal }, async () => {
+          await deploy('00-deploy-owner-refusal', 'PHASE7_DEPLOY_ALREADY_RUNNING');
+        });
+        report.deploymentAuthorityExclusion = true; await save();
         await write('CREATE TABLE "Phase7RehearsalUnbaselined" (id integer PRIMARY KEY)');
         await deploy('00-unbaselined-refusal', 'PHASE7_UNBASELINED_DATABASE');
         await write('DROP TABLE "Phase7RehearsalUnbaselined"');

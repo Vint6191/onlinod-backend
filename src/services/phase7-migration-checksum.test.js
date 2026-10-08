@@ -37,6 +37,7 @@ function deployment(overrides = {}) {
   const output = [];
   const requireForTest = id => {
     if (id === 'dotenv') return { config() {} };
+    if (id === './phase7-deploy-authority') return { withDeploymentAuthority: async (options, work) => work({ signal: options.signal, assertCurrent: async () => {} }) };
     if (Object.prototype.hasOwnProperty.call(overrides, id)) return overrides[id];
     return nativeRequire(id);
   };
@@ -51,6 +52,15 @@ function database(applied, { hasLedger = true, tables = [] } = {}) {
   let disconnects = 0;
   return {
     queries, get disconnects() { return disconnects; },
+    applyStaged(args) {
+      if (args[1] !== 'migrate') return;
+      const staged = path.join(path.dirname(args.at(-1)), 'migrations');
+      for (const name of fs.readdirSync(staged).filter(name => name !== 'migration_lock.toml')) {
+        if (!applied.some(item => item.migration_name === name && item.finished_at && !item.rolled_back_at)) {
+          applied.push(row(name, sha(fs.readFileSync(path.join(staged, name, 'migration.sql')))));
+        }
+      }
+    },
     async $disconnect() { disconnects++; },
     async $queryRawUnsafe(sql) {
       queries.push(sql);
@@ -135,13 +145,14 @@ test('Corrupt recovered SQL fails closed instead of authorizing a checksum pair'
   assert.equal(result.accepted, false); assert.equal(result.reason, 'ARCHIVED_SOURCE_CHANGED');
 });
 test('Recovered histories keep all hooks and stage only unchanged canonical SQL, never evidence SQL or contract', async () => {
-  const calls = [];
+  const calls = [], db = database(historicalRows());
   const { main, PRE, POST } = deployment({
     './phase7-role-preflight': { inspectRoles: async () => ({ verified: true }) },
     '../../src/services/phase7-legacy-storage-service': { storageState: async () => ({ state: 'BRIDGE' }) },
   });
-  await main({ db: database(historicalRows()), contract: false, commandRunner: async args => {
+  await main({ db, contract: false, commandRunner: async args => {
     calls.push(args);
+    db.applyStaged(args);
     if (args[1] === 'migrate') {
       const dir = path.join(path.dirname(args.at(-1)), 'migrations');
       assert.deepEqual(fs.readdirSync(dir).filter(name => name !== 'migration_lock.toml').sort(), expandMigrations);
@@ -267,16 +278,17 @@ test('A mismatch stops main before any role gate, hook, deployment command or st
   assert.deepEqual(called, []);
 });
 test('Compatible history traverses every existing pre/post hook; staged Prisma tree excludes DROP contract', async () => {
-  const roles = [], calls = [];
+  const roles = [], calls = [], db = database([row(traffic, sha(crlf(bytesOf(traffic))))]);
   const { main, PRE, POST } = deployment({
     './phase7-role-preflight': { inspectRoles: async (db, options) => { roles.push(options); return { verified: true }; } },
     '../../src/services/phase7-legacy-storage-service': { storageState: async () => ({ ready: true, targetReady: false, state: 'BRIDGE' }) },
   });
   let stagedDirectory;
   const result = await main({
-    db: database([row(traffic, sha(crlf(bytesOf(traffic))))]), contract: false,
+    db, contract: false,
     commandRunner: async args => {
       calls.push(args);
+      db.applyStaged(args);
       if (args[1] === 'migrate') {
         stagedDirectory = path.dirname(args.at(-1));
         const names = fs.readdirSync(path.join(stagedDirectory, 'migrations')).filter(n => n !== 'migration_lock.toml');

@@ -102,7 +102,16 @@ test('POSIX cancellation also kills an engine descendant after its parent exits'
 });
 
 test('production orchestrator removes staged SQL and never starts hooks after a migration child timeout', async () => {
-  const { main } = require('../../scripts/database/phase7-deploy');
+  const entry = path.resolve(__dirname, '../../scripts/database/phase7-deploy.js');
+  const nativeRequire = require('node:module').createRequire(entry), module = { exports: {} };
+  require('node:vm').runInNewContext(await fs.readFile(entry, 'utf8'), {
+    module, exports: module.exports, __dirname: path.dirname(entry), process, console,
+    require(id) {
+      if (id === './phase7-deploy-authority') return { withDeploymentAuthority: async (options, work) => work({ signal: options.signal, assertCurrent: async () => {} }) };
+      return nativeRequire(id);
+    },
+  }, { filename: entry });
+  const { main } = module.exports;
   const calls = []; let staged;
   const db = { async $disconnect() {}, async $queryRawUnsafe(sql, role) {
     if (sql.includes("to_regclass('public._prisma_migrations')")) return [{ name: null }];

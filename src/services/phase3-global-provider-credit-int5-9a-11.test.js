@@ -53,7 +53,8 @@ test("job claim source skips saturated fan refresh work without blocking other j
   assert.match(source, /fanRefreshBlockedCreatorIds/);
   assert.match(source, /fanRefreshGlobalBlocked/);
   assert.match(source, /NOT:\s*\{\s*jobKey:\s*"fan_data_point_refresh"/);
-  assert.match(source, /\["fetch_campaigns",\s*"fan_data_point_refresh"\]\.includes/);
+  assert.match(source, /if \(String\(candidate\.jobKey \|\| ""\) === "fan_data_point_refresh"\) \{\s*const admission = await fanDataRefreshClaimAvailable/);
+  assert.match(source, /if \(!admission\.available\) return \{ __fanDataRefreshCapacityBlocked: true/);
   assert.match(source, /fanDataRefreshClaimAvailable\(db, candidate\.creatorId\)/);
 });
 

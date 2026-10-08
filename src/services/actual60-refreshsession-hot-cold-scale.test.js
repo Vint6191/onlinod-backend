@@ -95,15 +95,25 @@ test("Actual60 F60-SCALE-1: real-PG EXPLAIN gate rejects seq scans and unbounded
 });
 
 
-test("Actual60 F60-SCALE-1: Settings current-session listing is current-state filtered and has a user-live index", () => {
+test("Actual60 F60-SCALE-1: Settings delegates bounded current-session listing and retains a user-live index", async () => {
   const source = read("src/services/settings-service.js");
   const start = source.indexOf("async function getAccountSettings");
   const end = source.indexOf("async function updateAccountProfile", start);
   assert.ok(start >= 0 && end > start);
   const block = source.slice(start, end);
-  assert.match(block, /refreshSession\.findMany/);
-  assert.match(block, /where:\s*\{\s*userId,\s*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*now\s*\}/);
-  assert.match(block, /orderBy:\s*\[\{\s*lastUsedAt:\s*"desc"\s*\},\s*\{\s*createdAt:\s*"desc"\s*\}\]/);
+  assert.match(block, /readActiveSessions\(client, userId, now\)/);
+  const { LIMIT, readActiveSessions } = require("./account-security-state");
+  const now = new Date("2026-10-08T00:00:00Z");
+  const rows = [{ id: "live-session" }];
+  let query;
+  const tx = { refreshSession: { findMany: async input => { query = input; return rows; } } };
+  assert.equal(await readActiveSessions(tx, "user-1", now), rows);
+  assert.deepEqual(query, {
+    where: { userId: "user-1", revokedAt: null, expiresAt: { gt: now } },
+    take: LIMIT + 1, orderBy: { id: "asc" },
+  });
+  tx.refreshSession.findMany = async () => Array.from({ length: LIMIT + 1 }, (_, i) => ({ id: String(i) }));
+  await assert.rejects(readActiveSessions(tx, "user-1", now), { code: "ACCOUNT_SECURITY_SESSION_LIMIT" });
   const migration = read("prisma/migrations/20260916013000_actual60_refreshsession_live_user_scale/migration.sql");
   assert.match(migration, /RefreshSession_live_user_lookup_idx/);
 });
@@ -133,7 +143,13 @@ test("Actual60 F60-SCALE-1: current-session mutation paths ignore expired-unrevo
   const reuseStart = auth.indexOf("async function revokeRefreshReuseScope");
   const reuseEnd = auth.indexOf("async function refreshAccessToken", reuseStart);
   const reuse = auth.slice(reuseStart, reuseEnd);
-  assert.match(reuse, /revokedAt:\s*null[\s\S]*expiresAt:\s*\{\s*gt:\s*now\s*\}/);
+  assert.match(reuse, /where:\s*refreshRevocationScope\(current, now\)/);
+  const scopeStart = auth.indexOf("function refreshRevocationScope");
+  assert.ok(scopeStart >= 0 && scopeStart < reuseStart);
+  const scope = auth.slice(scopeStart, reuseStart);
+  assert.match(scope, /revokedAt:\s*null[\s\S]*expiresAt:\s*\{\s*gt:\s*now\s*\}/);
+  assert.match(scope, /authorizationSessionId:\s*session\.authorizationSessionId/);
+  assert.match(scope, /id:\s*session\.id/);
 
   const refreshStart = auth.indexOf("async function refreshAccessToken");
   const refreshEnd = auth.indexOf("async function revokeRefreshToken", refreshStart);

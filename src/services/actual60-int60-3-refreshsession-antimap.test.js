@@ -24,16 +24,22 @@ function rel(file) {
 const expectedTouchpoints = [
   "src/middleware/auth.js",
   "src/routes/admin.js",
-  "src/routes/auth.js",
-  "src/routes/impersonate.js",
+  // Current account/administration command authorities and bounded live state.
+  "src/services/account-password-reset-service.js",
+  "src/services/account-security-command-service.js",
+  "src/services/account-security-state.js",
+  "src/services/admin-operational-command-service.js",
   "src/services/actual60-authorization-history-rollout-service.js",
   "src/services/auth-service.js",
   "src/services/authorization-session-authority-service.js",
   "src/services/client-e2e-keyring-service.js",
   "src/services/phase2-destructive-delete-authority-service.js",
   "src/services/retention-service.js",
+  "src/services/retention-policy-definition.js", // policy definition, no DB access
   "src/services/settings-service.js",
   "src/services/team-administration-service.js",
+  "src/services/team-ownership-transfer-service.js",
+  "src/services/telegram-control-command-service.js",
   "src/services/telemetry-ingest-service.js",
 ].sort();
 
@@ -50,6 +56,7 @@ test("INT60.3 RefreshSession anti-map: hot/current readers remain distinct from 
   const auth = fs.readFileSync(path.join(root, "src/middleware/auth.js"), "utf8");
   const telemetry = fs.readFileSync(path.join(root, "src/services/telemetry-ingest-service.js"), "utf8");
   const settings = fs.readFileSync(path.join(root, "src/services/settings-service.js"), "utf8");
+  const state = fs.readFileSync(path.join(root, "src/services/account-security-state.js"), "utf8");
   const retention = fs.readFileSync(path.join(root, "src/services/retention-service.js"), "utf8");
   const impersonate = fs.readFileSync(path.join(root, "src/routes/impersonate.js"), "utf8");
 
@@ -57,12 +64,13 @@ test("INT60.3 RefreshSession anti-map: hot/current readers remain distinct from 
   assert.match(telemetry, /lockLiveAuthorizationSession[\s\S]*"revokedAt" IS NULL[\s\S]*"expiresAt" > clock_timestamp\(\)/);
   assert.doesNotMatch(telemetry, /MAX\s*\(\s*r\."expiresAt"\s*\)/i);
   assert.match(telemetry, /ORDER BY r\."expiresAt" DESC[\s\S]*LIMIT 1/);
-  assert.match(settings, /getAccountSettings[\s\S]*refreshSession\.findMany[\s\S]*expiresAt:\s*\{\s*gt:\s*now/);
+  assert.match(settings, /getAccountSettings[\s\S]*readActiveSessions\(client, userId, now\)/);
+  assert.match(state, /readActiveSessions[\s\S]*refreshSession\.findMany[\s\S]*revokedAt:\s*null,\s*expiresAt:\s*\{\s*gt:\s*now/);
   assert.match(retention, /runRefreshSessionRetentionSweep/);
   assert.match(retention, /INSERT INTO "AuthorizationSessionBoundary"[\s\S]*refreshSession\.deleteMany/);
 
-  // Admin impersonation remains a separate, intentionally-unbound product
-  // surface carried as a master-roadmap lead. It must not be silently folded
-  // into the Desktop device-lineage authority by this closure.
-  assert.match(impersonate, /impersonatedByAdminId/);
+  // The legacy unbound login route was retired by the management cutover.
+  assert.match(impersonate, /status\(410\)/);
+  assert.match(impersonate, /LEGACY_IMPERSONATION_RETIRED/);
+  assert.doesNotMatch(impersonate, /refreshSession|signAccessToken|issueLoginTokens/);
 });
