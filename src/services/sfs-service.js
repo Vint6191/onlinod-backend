@@ -724,6 +724,11 @@ async function finalizeSfsSuccess({ delivery, outcomeCode, result = {}, db = pri
         },
       } });
     }
+    if(!require('./phase7-cleanup-contract').SETTLED_CODES.includes(String(outcomeCode||'').toLowerCase())) {
+      return db.sfsTargetCandidate.update({where:{id:candidate.id},data:{state:'RECOVERY_REQUIRED',phase:'UNFOLLOW',completedAt:null,
+        latestDeliveryId:delivery.id,latestStatus:'COMPLETED',latestError:'cleanup_settlement_outcome_unproven'}});
+    }
+    if(object(delivery.payload).legacyMigration===true)await require('./phase7-obligation-authority-service').recordCleanupSettlement(db,{delivery});
     return db.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
       state: "COMPLETED", phase: "DONE", creatorFollowing: false, usedForever: true, completedAt: now, unfollowAt: null,
       latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: "COMPLETED", latestError: null,

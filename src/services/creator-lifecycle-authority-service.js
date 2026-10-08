@@ -70,6 +70,7 @@ async function retireCreatorWithinTransaction({
   if (!current.deletedAt || hard) {
     await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: agency, creatorId: creator });
     await assertCreatorMassCampaignRetirable({ db: tx, agencyId: agency, creatorId: creator, requireFreshProviderSnapshot: hard ? !current.deletedAt : true });
+    await require('./phase7-obligation-authority-service').assertSfsRetirable({db:tx,agencyId:agency,creatorId:creator});
   }
 
   const scope = await retireCreatorCurrentAccess({ tx, agencyId: agency, creatorId: creator });

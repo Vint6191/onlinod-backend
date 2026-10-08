@@ -1602,7 +1602,7 @@ async function runAgencyDestructiveCleanupSweep({ now = new Date(), db = prisma 
           if (ack?.lost) report.lostOwnership += 1; else report.completed += 1;
         }
       } else {
-        const delayMs = String(result?.phase || "").startsWith("WAIT_") ? 1000 : 250;
+        const delayMs = result?.phase === "WAIT_LEGACY_CLEANUP" ? 30000 : String(result?.phase || "").startsWith("WAIT_") ? 1000 : 250;
         const yielded = await yieldDomainWorkClaim({
           db, item, ownerToken: claim.ownerToken,
           progressCursor: { phase: result?.phase || "CLEANUP", deletedRows: report.deletedRows, workUnits: report.workUnits },
@@ -1640,7 +1640,7 @@ async function runCreatorDestructiveCleanupSweep({ now = new Date(), db = prisma
         const yielded = await yieldDomainWorkClaim({
           db, item, ownerToken: claim.ownerToken,
           progressCursor: { phase: result?.phase || "CLEANUP", deletedRows: report.deletedRows },
-          availableAt: new Date(now.getTime() + 250), fallbackNow: new Date(),
+          availableAt: new Date(now.getTime() + (result?.phase === "WAIT_LEGACY_CLEANUP" ? 30000 : 250)), fallbackNow: new Date(),
         });
         if (yielded?.lost) report.lostOwnership += 1; else report.yielded += 1;
       }

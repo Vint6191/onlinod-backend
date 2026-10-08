@@ -38,13 +38,14 @@ async function main({db=require('../../src/prisma'),options=args(process.argv.sl
   if(o.command==='handoff'){
    const cohort=await db.phase7RetirementCohort.findUnique({where:{id:'automation_job'}});
    const r=await require('../../src/services/phase7-obligation-handoff-service').handoffCleanupPage({db,after:cohort.enumeration?._cleanup||null,limit:20});
+   blocked+=r.results.filter(x=>x.blocked).length;
    // Repeated/concurrent runs are idempotent. Completed sweeps rotate back to
    // blocked identities; the contract independently checks the missing-proof index.
-   await runDbTransaction(db,tx=>tx.$executeRawUnsafe(`UPDATE "Phase7RetirementCohort" SET "enumeration"=jsonb_set("enumeration",'{_cleanup}',$1::jsonb),"revision"="revision"+1 WHERE "id"='automation_job'`,json(r.hasMore?r.nextCursor:null)));
+   await runDbTransaction(db,tx=>tx.$executeRawUnsafe(`UPDATE "Phase7RetirementCohort" SET "enumeration"=jsonb_set("enumeration",'{_cleanup}',$1::jsonb),"revision"="revision"+1 WHERE "id"='automation_job' AND "revision"=$2`,json(r.hasMore?r.nextCursor:null),cohort.revision));
    emit(r);if(!r.hasMore)break;
   }
  }
- if(blocked)throw failure('PHASE7_PARTITIONS_BLOCKED',{count:blocked});
+ if(blocked)throw failure(o.command==='handoff'?'PHASE7_HANDOFF_BLOCKED':'PHASE7_PARTITIONS_BLOCKED',{count:blocked});
 }
 module.exports={main,args};
 if(require.main===module){const db=require('../../src/prisma');main({db}).catch(e=>{console.error(json({ok:false,code:e.code||e.message,partitionId:e.partitionId,rowId:e.rowId,sourceId:e.sourceId}));process.exitCode=1;}).finally(()=>db.$disconnect());}

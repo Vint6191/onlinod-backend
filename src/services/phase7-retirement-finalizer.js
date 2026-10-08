@@ -4,7 +4,8 @@ async function assertNoOldExecutions(db){
   const checks=[`SELECT "id" FROM "AutomationDelivery" WHERE "legacyStorageGeneration" IS DISTINCT FROM '${GENERATION}' AND "status" IN ('CLAIMED','RUNNING','COMMITTING','RECONCILE_REQUIRED') LIMIT 1`,
     `SELECT "id" FROM "JobInstance" WHERE "legacyStorageGeneration" IS DISTINCT FROM '${GENERATION}' AND "status" IN ('CLAIMED','RUNNING') LIMIT 1`,
     `SELECT "id" FROM "DomainWorkItem" WHERE "legacyStorageGeneration" IS DISTINCT FROM '${GENERATION}' AND "state"='CLAIMED' LIMIT 1`,
-    `SELECT "id" FROM "AutomationDelivery" WHERE "moduleKey"='sfs' AND "actionType"='SFS_UNFOLLOW_TARGET' AND "payload"->>'legacyMigration'='true' AND "legacyCleanupProofId" IS NULL AND "status" IN ('QUEUED','CLAIMED','RUNNING','COMMITTING','RECONCILE_REQUIRED','RETRY_SCHEDULED','PAUSED') LIMIT 1`];
+    `SELECT "id" FROM "AutomationDelivery" WHERE ${require('./phase7-cleanup-contract').LEGACY_SQL}
+      AND NOT (${require('./phase7-cleanup-contract').SETTLED_SQL}) AND NOT phase7_cleanup_attested("id") LIMIT 1`];
   for(let i=0;i<checks.length;i++){const rows=await db.$queryRawUnsafe(checks[i]);if(rows.length)throw failure(i===3?'PHASE7_CLEANUP_HANDOFF_INCOMPLETE':'PHASE7_OLD_EXECUTION_NOT_DRAINED',{objectId:rows[0].id});}
 }
 async function checkContractReady(db,{root=require('node:path').resolve(__dirname,'../..'),releaseFile}={}){

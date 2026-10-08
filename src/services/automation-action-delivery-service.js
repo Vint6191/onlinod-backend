@@ -1,4 +1,5 @@
 "use strict";
+const { lockCleanupMutation } = require("./phase7-obligation-authority-service");
 const { authorizeSfsGeneration } = require("./phase7-legacy-storage-service");
 
 const crypto = require("node:crypto");
@@ -292,6 +293,7 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
     const failureCode = "outcome_unresolved_do_not_retry";
     const result = { ...object(row.result), outcomeState: "UNRESOLVED_DO_NOT_RETRY", unresolvedClosedAt: now.toISOString(), unresolvedCloseReason: "MAINTENANCE_RECONCILIATION_WINDOW_EXPIRED" };
     const updated = await runDbTransaction(client, async (tx) => {
+      await lockCleanupMutation(tx,row);
       const changedRow = await tx.automationDelivery.updateMany({ where, data: {
         status: "FAILED", failureCode, failureCategory: FAILURE_CATEGORIES.TERMINAL,
         lastError: "Reconciliation evidence remained insufficient beyond the bounded verification window; logical commit closed permanently without retry",
@@ -334,6 +336,7 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
       ...(row.actionType === "SEND_MESSAGE" && mustReconcile ? { phase: "send" } : {}),
     };
     const latest = await runDbTransaction(client, async (tx) => {
+      await lockCleanupMutation(tx,row);
       const updated = await tx.automationDelivery.updateMany({
         where: { id: row.id, status: row.status, leaseRevision: row.leaseRevision, claimUntil: { lt: now } },
         data: { status: nextStatus, failureCode, failureCategory, lastError: mustReconcile ? "Action outcome must be reconciled after lost commit/reconciliation lease" : "Action lease expired", notBefore: terminal ? row.notBefore : retryAt, finishedAt: terminal ? now : null, claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, result: nextResult },
@@ -674,11 +677,13 @@ async function applySfsValidationTransition(delivery, validation, now = new Date
   const status = validation.terminal === true ? (validation.code === "already_unfollowed" ? "COMPLETED" : "SKIPPED") : "RETRY_SCHEDULED";
   const retryAt = validation.retryAt || new Date(now.getTime() + 30_000);
   return runDbTransaction(prisma, async (tx) => {
+    await lockCleanupMutation(tx,delivery);
     if (executionAccess?.userId) await lockDeliveryExecutionAccess({ db: tx, delivery, userId: executionAccess.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: PRECOMMIT_EXECUTABLE_STATUSES }, leaseRevision: delivery.leaseRevision },
       data: {
         status,
+        ...(status === "COMPLETED" ? {result:{...object(delivery.result),code:validation.code,idempotent:true}} : {}),
         notBefore: status === "RETRY_SCHEDULED" ? retryAt : delivery.notBefore,
         failureCode: validation.code || "sfs_validation_failed",
         lastError: validation.code || "SFS validation failed",
@@ -1327,11 +1332,15 @@ async function completeActionDelivery(input) {
   const effectTime = buildAutomationEffectTimeEvidence(delivery, clientResult, now);
   const result = sanitizeAutomationSettlementResult(clientResult, effectTime);
   const outcomeCode = clean(input.outcomeCode, 120) || clean(result.code, 120) || null;
+  // Preserve the accepted SFS outcome in the durable receipt used by cleanup
+  // handoff and retirement, including clients that send outcomeCode separately.
+  if(delivery.moduleKey===SFS_MODULE_KEY&&outcomeCode)result.code=outcomeCode.trim().toLowerCase();
   let terminalStatus = input.status === "SKIPPED" ? "SKIPPED" : "COMPLETED";
   if (delivery.moduleKey === SFS_MODULE_KEY && delivery.actionType === "SFS_FOLLOW_TARGET" && String(outcomeCode || "").trim().toLowerCase() !== "followed") {
     terminalStatus = "SKIPPED";
   }
   const finalDelivery = await runDbTransaction(prisma, async (tx) => {
+    await lockCleanupMutation(tx,delivery);
     await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: {
@@ -1432,6 +1441,7 @@ async function failActionDelivery(input) {
     failedAt: now.toISOString(), retryable,
   };
   const updated = await runDbTransaction(prisma, async (tx) => {
+    await lockCleanupMutation(tx,delivery);
     await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: { in: LEASED_STATUSES }, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision },

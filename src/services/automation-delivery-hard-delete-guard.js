@@ -1,6 +1,7 @@
 "use strict";
 
 const { hasMassCurrentDebt } = require("./mass-delivery-contract");
+const cleanupContract = require("./phase7-cleanup-contract");
 
 const SFS_MODULE_KEY = "sfs";
 const SFS_FOLLOW_TARGET_ACTION_TYPE = "SFS_FOLLOW_TARGET";
@@ -52,7 +53,15 @@ function candidateNoLongerNeedsFollowProof(candidate, row) {
 async function partitionAutomationDeliveryHardDeleteCandidates({ db, rows = [] } = {}) {
   const all = Array.isArray(rows) ? rows.filter(Boolean) : [];
   const massProtected = all.filter(hasMassCurrentDebt);
-  const input = all.filter((row) => !hasMassCurrentDebt(row));
+  const remaining = all.filter((row) => !hasMassCurrentDebt(row));
+  const legacyCleanup = remaining.filter(cleanupContract.isLegacyCleanup);
+  const receipts = legacyCleanup.length && db?.phase7RetirementProof?.findMany
+    ? await db.phase7RetirementProof.findMany({where:{sourceTable:'AutomationDelivery',kind:'SETTLED',deliveryId:{in:legacyCleanup.map(d=>d.id)}},take:500}) : [];
+  const settlement = new Map(receipts.map(p=>[p.deliveryId,p]));
+  const protectedCleanup = legacyCleanup.filter(d=>!cleanupContract.isSettledCleanup(d)||!cleanupContract.matchesSettlementProof(settlement.get(d.id),d));
+  const blockedIds = new Set(protectedCleanup.map(d=>d.id));
+  const input = remaining.filter(d=>!blockedIds.has(d.id));
+  massProtected.push(...protectedCleanup);
   const relevant = input.filter(isSfsFollowProof);
   if (!relevant.length) return { deletable: input, protected: massProtected };
 

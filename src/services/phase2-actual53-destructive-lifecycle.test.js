@@ -78,6 +78,6 @@ test("F53-12 scheduler yields incomplete Creator cleanup instead of holding one 
   assert.match(sweep, /limit:\s*10/);
   assert.match(sweep, /batchSize:\s*250/);
   assert.match(sweep, /yieldDomainWorkClaim/);
-  assert.match(sweep, /availableAt:\s*new Date\(now\.getTime\(\) \+ 250\)/);
+  assert.match(sweep, /availableAt:\s*new Date\(now\.getTime\(\) \+ \(result\?\.phase === "WAIT_LEGACY_CLEANUP" \? 30000 : 250\)\)/);
   assert.doesNotMatch(sweep, /collectCreatorPhase2DestructiveScope/);
 });

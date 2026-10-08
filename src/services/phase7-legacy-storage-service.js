@@ -38,6 +38,7 @@ async function storageState(db) {
 }
 async function verifyStorageFence(db,states) {
   const expected=[];
+  expected.push({table:'Phase7RetirementCohort',name:'phase7_retirement_admission',fn:'phase7_retirement_admission_guard',type:19,args:[]});
   for(const t of manifest.tables) if(states.get(t.cohort)!=='PURGED') {
     expected.push({table:t.table,name:'phase7_storage_fence',fn:'phase7_legacy_storage_fence',type:31,args:[t.cohort,t.scopeColumn||'',t.disposition]});
     expected.push({table:t.table,name:'phase7_truncate_fence',fn:'phase7_legacy_truncate_fence',type:34,args:[]});
@@ -141,17 +142,7 @@ async function putProof(db, input) {
   return found;
 }
 function matchesSfsAttestation({proof,delivery,candidate,providerSubject}) {
-  if (!proof || !delivery || !candidate || !providerSubject || proof.id!==delivery.legacyCleanupProofId
-      || proof.kind!=='SFS_CLEANUP' || proof.deliveryId!==delivery.id
-      || proof.agencyId!==delivery.agencyId || proof.creatorId!==delivery.creatorId
-      || proof.targetId!==delivery.targetId || proof.generation!==delivery.generation
-      || candidate.agencyId!==delivery.agencyId || candidate.creatorId!==delivery.creatorId
-      || candidate.targetUserId!==delivery.targetId || delivery.fanId!==delivery.targetId
-      || candidate.safetyUnfollowDeliveryId!==delivery.id || proof.evidence?.candidateId!==candidate.id
-      || proof.providerSubject!==providerSubject) return false;
-  const meta=object(candidate.metadata);
-  return !(meta.followEffectOwnership==='OWNED' && meta.followEffectDeliveryId
-    && meta.followEffectDeliveryId!==proof.evidence.followDeliveryId);
+  return require('./phase7-cleanup-contract').matchesSfsAttestation({proof,delivery,candidate,providerSubject});
 }
 async function readSfsAttestation({db,delivery,candidate}) {
   if (!db?.phase7RetirementProof?.findMany || !delivery?.legacyCleanupProofId || !candidate) return null;
@@ -166,7 +157,7 @@ async function attestedCleanupCandidates(db,candidates) {
   for(let offset=0;offset<candidates.length;offset+=100){
     const batch=candidates.slice(offset,offset+100),ids=batch.map(c=>c.safetyUnfollowDeliveryId).filter(Boolean);
     if(!ids.length)continue;
-    const deliveries=await db.automationDelivery.findMany({where:{id:{in:ids}},select:{id:true,agencyId:true,creatorId:true,fanId:true,targetId:true,generation:true,legacyCleanupProofId:true}});
+    const deliveries=await db.automationDelivery.findMany({where:{id:{in:ids}},select:{id:true,agencyId:true,creatorId:true,fanId:true,targetId:true,generation:true,legacyCleanupProofId:true,moduleKey:true,actionType:true,payload:true}});
     const proofs=await db.phase7RetirementProof.findMany({where:{deliveryId:{in:ids},kind:'SFS_CLEANUP'},take:100});
     const creators=await db.creatorAccount.findMany({where:{id:{in:[...new Set(batch.map(c=>c.creatorId))]}},select:{id:true,agencyId:true,remoteId:true}});
     const dm=new Map(deliveries.map(d=>[d.id,d])),pm=new Map(proofs.map(p=>[p.deliveryId,p])),cm=new Map(creators.map(c=>[c.id,c]));

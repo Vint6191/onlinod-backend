@@ -83,8 +83,8 @@ async function child(argv, env) {
     await sources.writeRelease({ backendRoot: root, desktopRoot, baseBackendRoot: root, baseDesktopRoot: desktopRoot, packageId: 'DISPOSABLE_PHASE7_PROOF', output: releaseFile });
     const release = await finalizer.readRelease(root, { file: releaseFile }), operatorEvidence = evidence(release, exportRoot, restoreRoot);
     const prepare = overrides => finalizer.prepareContract({ db, release, closeRollback: true, operatorEvidence, runtimeRoles: ['p7_proof_runtime'], ...overrides });
-    await check('290 canonical retained migrations preserve 506 pre-expand archive rows across two agencies', async () => {
-      assert.equal(f.migrations.length, 290); assert.equal(f.migrations.includes(CONTRACT), false);
+    await check('291 canonical retained migrations preserve 506 pre-expand archive rows across two agencies', async () => {
+      assert.equal(f.migrations.length, 291); assert.equal(f.migrations.includes(CONTRACT), false);
       assert.equal(Number((await db.$queryRawUnsafe('SELECT count(*) AS n FROM "AnalyticsSnapshot"'))[0].n), 506);
       assert.equal((await storageState(db)).phase, 'BRIDGE');
       await assert.rejects(db.$executeRawUnsafe(`UPDATE "AnalyticsSnapshot" SET payload='{}' WHERE id='p7-a-0001'`), /PHASE7/);

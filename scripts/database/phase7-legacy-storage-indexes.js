@@ -8,6 +8,11 @@ for(const t of manifest.tables) if(t.scopeColumn) {
 }
 for(const [table,column,states] of [['AutomationDelivery','status',"'CLAIMED','RUNNING','COMMITTING','RECONCILE_REQUIRED'"],['JobInstance','status',"'CLAIMED','RUNNING'"],['DomainWorkItem','state',"'CLAIMED'"]]) definitions.push({table,keys:['id'],name:'phase7_old_executor_'+table.toLowerCase(),where:`"legacyStorageGeneration" IS DISTINCT FROM 'phase7_legacy_storage_v1' AND ${q(column)} ${states.includes(',')?'IN ('+states+')':'='+states}`});
 definitions.push({table:'AutomationDelivery',keys:['agencyId','id'],name:'phase7_missing_cleanup_proof',where:`"moduleKey"='sfs' AND "actionType"='SFS_UNFOLLOW_TARGET' AND "payload"->>'legacyMigration'='true' AND "legacyCleanupProofId" IS NULL AND "status" IN ('QUEUED','CLAIMED','RUNNING','COMMITTING','RECONCILE_REQUIRED','RETRY_SCHEDULED','PAUSED')`});
+const cleanup=require('../../src/services/phase7-cleanup-contract');
+definitions.push({table:'AutomationDelivery',keys:['agencyId','id'],name:'phase7_cleanup_lifecycle',where:cleanup.LEGACY_SQL});
+definitions.push({table:'AutomationDelivery',keys:['agencyId','creatorId','id'],name:'phase7_cleanup_unsettled',where:cleanup.UNSETTLED_SQL});
+definitions.push({table:'AutomationDelivery',keys:['agencyId','creatorId','id'],name:'phase7_follow_inflight',where:`"moduleKey"='sfs' AND "actionType"='SFS_FOLLOW_TARGET' AND "status" IN ('CLAIMED','RUNNING','COMMITTING','RECONCILE_REQUIRED')`});
+definitions.push({table:'SfsTargetCandidate',keys:['agencyId','creatorId','id'],name:'phase7_owned_candidate',where:`"completedAt" IS NULL AND ("metadata"->>'followEffectOwnership'='OWNED' OR "metadata"->>'legacyMigration'='true')`});
 function normalizePredicate(value){
   const literals=[];
   const masked=String(value||'').replace(/'(?:[^']|'')*'/g,s=>{literals.push(s);return `__L${literals.length-1}__`;});

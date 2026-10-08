@@ -49,6 +49,7 @@ async function operationalWork({tx,commitContext,action,targetId,input,command,a
   }else{
    await assertAgencyCustomPipelineRetirable({db:tx,agencyId:targetId});
    await assertAgencyMassCampaignRetirable({db:tx,agencyId:targetId,requireFreshProviderSnapshot:!before.deletedAt});
+   await require('./phase7-obligation-authority-service').assertSfsRetirable({db:tx,agencyId:targetId});
    after=before.deletedAt?before:await tx.agency.update({where:{id:targetId},data:{deletedAt:now,deletedReason:input.reason,status:"LOCKED"}});
    await tx.refreshSession.updateMany({where:{agencyId:targetId,revokedAt:null,expiresAt:{gt:now}},data:{revokedAt:now}});
    if(input.hard){await publishDomainWork({db:tx,agencyId:targetId,workClass:WORK_CLASS.DESTRUCTIVE_AGENCY_CLEANUP,objectType:"Phase2AgencyDestructiveCleanup",objectId:targetId,partitionKey:targetId,creatorId:null,availableAt:now});pending=true;}

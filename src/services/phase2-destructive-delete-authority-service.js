@@ -1,4 +1,5 @@
 "use strict";
+const { assertSfsRetirable } = require("./phase7-obligation-authority-service");
 const { drainLifecycleLegacyJobs } = require("./phase7-lifecycle-archive-service");
 
 const { runDbTransaction } = require("./db-transaction-service");
@@ -11,6 +12,7 @@ const {
   assertAgencyCustomPipelineRetirable,
   assertCreatorCustomPipelineRetirable,
   lockAgencyPipelineLifecycleExclusive,
+  lockAgencyPipelineLifecycle,
   lockCreatorPipelineLifecycle,
 } = require("./custom-content-pipeline-authority-service");
 const { assertAgencyMassCampaignRetirable, assertCreatorMassCampaignRetirable } = require("./mass-campaign-authority-service");
@@ -851,7 +853,9 @@ async function processAgencyHardDeleteWorkItem({ db, item, ownerToken, batchSize
     }
 
     const legacy = await drainLifecycleLegacyJobs({tx,agencyId,limit:Math.min(limit,10)});
+    if (legacy.waiting) return {ok:true,complete:false,deleted:0,phase:"WAIT_LEGACY_CLEANUP",retryAfterMs:legacy.retryAfterMs};
     if (legacy.deleted || legacy.hasMore) return {ok:true,complete:false,deleted:legacy.deleted,phase:"LEGACY_SCOPED_HANDOFF"};
+    await assertSfsRetirable({db:tx,agencyId});
     let remaining = limit;
     const nonFk = await purgeAgencyNonFkTenantBatch({ tx, agencyId, limit: remaining });
     remaining -= nonFk.deleted;
@@ -911,6 +915,7 @@ async function processCreatorHardDeleteWorkItem({ db, item, ownerToken, batchSiz
   return runDbTransaction(db, async (tx) => {
     // Shared lifecycle/Creator row precedes the work claim, matching normal Phase2
     // producer lock order. deletedAt is the durable DELETING barrier for this v1 API.
+    await lockAgencyPipelineLifecycle({ db: tx, agencyId, allowDeleted: true });
     await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId, allowDeleted: true });
     const creator = await tx.creatorAccount.findFirst({ where: { id: creatorId, agencyId }, select: { id: true, deletedAt: true } });
     if (!creator) return { ok: true, complete: true, alreadyDeleted: true };
@@ -934,7 +939,9 @@ async function processCreatorHardDeleteWorkItem({ db, item, ownerToken, batchSiz
     }
 
     const legacy = await drainLifecycleLegacyJobs({tx,agencyId,creatorId,limit:Math.min(limit,10)});
+    if (legacy.waiting) return {ok:true,complete:false,deleted:0,phase:"WAIT_LEGACY_CLEANUP",retryAfterMs:legacy.retryAfterMs};
     if (legacy.deleted || legacy.hasMore) return {ok:true,complete:false,deleted:legacy.deleted,phase:"LEGACY_SCOPED_HANDOFF"};
+    await assertSfsRetirable({db:tx,agencyId,creatorId});
     let remaining = limit;
     const nonFk = await purgeCreatorNonFkPhase2Batch({ tx, agencyId, creatorId, limit: remaining });
     remaining -= nonFk.deleted;

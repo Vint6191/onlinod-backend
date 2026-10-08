@@ -232,7 +232,7 @@ test("INT4.3B SFS exact field fence and refresh are wired through claim/validate
   assert.ok(sfsValidationAt >= 0 && fenceAssignAt > sfsValidationAt && fenceAssertAt > fenceAssignAt && committingAt > fenceAssertAt);
   assert.match(source, /scheduleValidationFanRefresh\(candidate, validation, "claim"\)/);
   assert.match(source, /scheduleValidationFanRefresh\(delivery, validation, "validate"\)/);
-  assert.match(source, /scheduleValidationFanRefresh\(delivery, validation, "retry"\)/);
+  assert.match(source, /scheduleValidationFanRefresh\(delivery, validation, "retry", db\)/);
   assert.match(prepare, /validationActionError\(delivery, validation, "SFS_VALIDATION_FAILED"/);
   assert.match(prepare, /validation\.code === "already_followed"[\s\S]*error\.sfsTerminal/);
   assert.match(prepare, /applySfsValidationTransition\(error\.sfsTerminal\.delivery/);

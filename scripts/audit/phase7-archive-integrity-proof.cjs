@@ -47,8 +47,8 @@ async function main() {
     await fs.mkdir(exported); await fs.mkdir(restored);
     const baseline = process.env.ONLINOD_PHASE7_BASELINE_ROOT
       ? createRequire(path.resolve(process.env.ONLINOD_PHASE7_BASELINE_ROOT,'package.json')) : null;
-    await check('all 290 retained migrations apply; safe isolated runtime role remains admissible', async () => {
-      assert.equal(fixture.migrations.length, 290);
+    await check('all 291 retained migrations apply; safe isolated runtime role remains admissible', async () => {
+      assert.equal(fixture.migrations.length, 291);
       assert.equal((await roles.inspectRoles(db,{roles:['p7_runtime'],strict:true})).verified,true);
     });
     await check('BYPASSRLS membership and CREATEDB/REPLICATION privileges cannot pass runtime admission', async () => {

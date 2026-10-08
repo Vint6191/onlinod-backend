@@ -109,7 +109,8 @@ async function archiveAutomationDeliveryBatch({ tx, rows, olderThan, strict = fa
   const eligible = rows.filter(row => liveCreators.get(row.creatorId) === row.agencyId);
   // SFS settlement locks candidate before delivery. Preserve that order and
   // retain missing/malformed candidate proofs conservatively.
-  const candidateIds = [...new Set(eligible.filter(isSfsFollowProof).map(sfsCandidateId).filter(Boolean))].sort();
+  const cleanupContract = require('./phase7-cleanup-contract');
+  const candidateIds = [...new Set(eligible.filter(row=>isSfsFollowProof(row)||cleanupContract.isLegacyCleanup(row)).map(sfsCandidateId).filter(Boolean))].sort();
   const lockedCandidates = candidateIds.length ? await tx.$queryRawUnsafe('SELECT "id" FROM "SfsTargetCandidate" WHERE "id" = ANY($1::text[]) ORDER BY "id" FOR SHARE', candidateIds) : [];
   const knownCandidates = new Set(lockedCandidates.map(row => row.id));
   const manifest = eligible.map(row => ({ id: row.id, agencyId: row.agencyId, creatorId: row.creatorId, expectedUpdatedAt: row.updatedAt }));
@@ -119,6 +120,8 @@ async function archiveAutomationDeliveryBatch({ tx, rows, olderThan, strict = fa
       ON d."id"=m.id AND d."agencyId"=m."agencyId" AND d."creatorId"=m."creatorId" AND d."updatedAt"=m."expectedUpdatedAt"
     ORDER BY d."id" FOR UPDATE OF d`, JSON.stringify(manifest)) : [];
   const proofSafe = locked.filter(row => !isSfsFollowProof(row) || knownCandidates.has(sfsCandidateId(row)));
+  const settledCleanupIds = proofSafe.filter(row=>cleanupContract.isLegacyCleanup(row)&&cleanupContract.isSettledCleanup(row)).map(row=>row.id);
+  if(settledCleanupIds.length)await require('./phase7-obligation-authority-service').preserveCleanupSettlements(tx,settledCleanupIds);
   const partition = await partitionAutomationDeliveryHardDeleteCandidates({ db: tx, rows: proofSafe });
   const ids = partition.deletable.map(row => row.id);
   const deletedRows = ids.length ? await tx.$queryRawUnsafe(`

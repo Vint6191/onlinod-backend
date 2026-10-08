@@ -16,12 +16,16 @@ test("Agency soft-delete is serialized with Custom work and refuses active pipel
   assert.ok(start >= 0 && end > start, "Agency delete route must exist");
   const route = admin.slice(start, end);
 
-  assert.match(route, /prisma\.\$transaction\s*\(\s*async\s*\(tx\)/);
-  assert.match(route, /lockAgencyPipelineLifecycleExclusive\(\{\s*db:\s*tx,\s*agencyId:\s*before\.id,\s*allowDeleted:\s*true\s*\}\)/);
-  assert.match(route, /assertAgencyCustomPipelineRetirable\(\{\s*db:\s*tx,\s*agencyId:\s*before\.id\s*\}\)/);
-  assert.match(route, /tx\.agency\.update\([\s\S]*deletedAt[\s\S]*status:\s*"LOCKED"/);
-  assert.match(route, /tx\.refreshSession\.updateMany\([\s\S]*revokedAt:\s*deletedAt/);
-  assert.match(route, /isolationLevel:\s*"Serializable"/);
+  assert.match(route, /operationHandler\("agency.retire"\)/);
+  const command = source("services/admin-operational-command-service.js");
+  const retire = command.slice(command.indexOf('}else{'), command.indexOf('if(action.startsWith("member."'));
+  assert.match(command, /executeAdminCommand\(\{db,actor,commandId,action,targetId/);
+  assert.match(command, /lockAgencyPipelineLifecycleExclusive\(\{db:tx,agencyId:targetId,allowDeleted:true\}\)/);
+  assert.match(retire, /assertAgencyCustomPipelineRetirable\(\{db:tx,agencyId:targetId\}\)/);
+  assert.ok(retire.indexOf("assertSfsRetirable") < retire.indexOf("tx.agency.update"));
+  assert.match(retire, /tx\.agency\.update\([\s\S]*deletedAt[\s\S]*status:"LOCKED"/);
+  assert.match(retire, /tx\.refreshSession\.updateMany\([\s\S]*revokedAt:now/);
+
 });
 
 test("every production NEW Custom/provider work origin takes the Agency lifecycle fence", () => {
@@ -160,7 +164,8 @@ test("super-admin hard creator delete delegates to the same durable bounded life
   const routeStart = admin.indexOf('router.delete("/creators/:id"');
   const routeEnd = admin.indexOf("// ════════════════════════════════════════════════════════════\n// DEVICES", routeStart);
   const route = admin.slice(routeStart, routeEnd);
-  assert.match(route, /retireCreatorWithinTransaction\(\{[\s\S]*?mode: hard \? "HARD" : "SOFT"/);
+  assert.match(route, /operationHandler\("creator.retire"\)/);
+  assert.match(source("services/admin-operational-command-service.js"), /retireCreatorWithinTransaction\(\{[\s\S]*?mode:input.hard\?"HARD":"SOFT"/);
   const customFence = lifecycle.indexOf("assertCreatorCustomPipelineRetirable");
   const massFence = lifecycle.indexOf("assertCreatorMassCampaignRetirable");
   const barrier = lifecycle.indexOf("creatorAccount.update");
@@ -177,15 +182,16 @@ test("super-admin hard Agency delete publishes bounded destructive authority aft
   const routeStart = admin.indexOf('router.delete("/agencies/:id"');
   const routeEnd = admin.indexOf('router.post("/agencies/:id/restore"', routeStart);
   const route = admin.slice(routeStart, routeEnd);
-  const hardAt = route.indexOf("if (hard) {");
-  const softAt = route.indexOf("const deletedAt", hardAt);
-  const block = route.slice(hardAt, softAt);
-  assert.match(block, /prisma\.\$transaction\s*\(\s*async\s*\(tx\)/);
+  assert.match(route, /operationHandler\("agency.retire"\)/);
+  const command = source("services/admin-operational-command-service.js");
+  const block = command.slice(command.indexOf('}else{'), command.indexOf('if(action.startsWith("member."'));
+  assert.match(command, /return executeAdminCommand\(/);
   const customFence = block.indexOf("assertAgencyCustomPipelineRetirable");
   const massFence = block.indexOf("assertAgencyMassCampaignRetirable");
   const barrier = block.indexOf("tx.agency.update");
   const publishCleanup = block.indexOf("DESTRUCTIVE_AGENCY_CLEANUP");
   assert.ok(customFence >= 0 && massFence > customFence, "hard Agency delete must converge Custom then MASS authority first");
+  assert.ok(block.indexOf("assertSfsRetirable") > massFence && block.indexOf("assertSfsRetirable") < barrier);
   assert.ok(barrier > massFence, "durable Agency DELETING barrier must follow blockers");
   assert.ok(publishCleanup > barrier, "bounded Agency cleanup must be published after the barrier in the same transaction");
   assert.doesNotMatch(block, /tx\.agency\.delete/);
