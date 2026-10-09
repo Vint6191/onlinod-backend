@@ -10,6 +10,7 @@ const {
   assertCustomSubmissionTelegramSourceAccess,
   claimCustomContentSubmissionUploadWork,
   heartbeatCustomContentSubmissionSourceWork,
+  releaseCustomContentSubmissionSourceWork,
   reportCustomContentSubmissionExecutionAttempt,
   commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
@@ -2289,4 +2290,78 @@ test("A43 standalone source work is claimed from DomainWork, heartbeated, and AC
   assert.equal(settled.sourceWorkLost, false);
   assert.equal(db._domainWorkItems[0].state, "DONE");
   assert.equal(BigInt(db._domainWorkItems[0].completedRevision), 1n);
+});
+
+// Capacity release uses the real DomainWork owner/fence implementation with the
+// existing in-memory DB adapter. These cases do not claim native PG concurrency.
+for (const newerRevision of [false, true]) {
+  test(`source capacity release preserves canonical media and diagnostics (newer revision: ${newerRevision})`, async () => {
+    const submission = baseSubmission({ id: 'source-release', telegramMessageIds: [901, 902], ofMediaIds: ['9901'], pipelineBlockedCode: 'HISTORICAL', pipelineNextAttemptAt: new Date('2026-08-21T12:30:00Z') });
+    const row = claimedSourceDomainWork(submission.id, { requestedRevision: newerRevision ? 2n : 1n });
+    const db = fakeDb({ submissions: [submission], domainWorkItems: [row] });
+    const before = clone(db._submissions[0]);
+    const result = await releaseCustomContentSubmissionSourceWork({ agencyId: 'agency-1', member, deviceId: 'device-1', submissionId: submission.id,
+      sourceWorkClaim: sourceClaim(row), now: new Date('2026-08-21T12:00:30Z'), db: commitDatabaseFixture(db) });
+    assert.equal(result.released, true); assert.equal(result.sourceWorkSuperseded, newerRevision);
+    assert.deepEqual(db._submissions[0], before);
+    assert.equal(db._domainWorkItems[0].state, 'READY'); assert.equal(db._domainWorkItems[0].ownerToken, null);
+    assert.equal(BigInt(db._domainWorkItems[0].completedRevision), 0n);
+    assert.equal(BigInt(db._domainWorkItems[0].requestedRevision), newerRevision ? 2n : 1n);
+    assert.equal(db._domainWorkItems[0].nextAttemptAt, null);
+  });
+}
+for (const [label, override] of [
+  ['owner', { ownerToken: 'later-owner' }], ['fence', { claimFence: '2' }], ['claimed revision', { claimedRevision: '2' }],
+]) {
+  test(`source capacity release rejects another ${label}`, async () => {
+    const submission = baseSubmission({ id: 'source-release-fenced' }), row = claimedSourceDomainWork(submission.id);
+    const db = fakeDb({ submissions: [submission], domainWorkItems: [row] }), before = clone(db._domainWorkItems[0]);
+    await assert.rejects(() => releaseCustomContentSubmissionSourceWork({ agencyId: 'agency-1', member, deviceId: 'device-1', submissionId: submission.id,
+      sourceWorkClaim: { ...sourceClaim(row), ...override }, now: new Date('2026-08-21T12:00:30Z'), db: commitDatabaseFixture(db) }), { code: 'CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE' });
+    assert.deepEqual(db._domainWorkItems[0], before);
+  });
+}
+for (const [label, override] of [
+  ['expired lease', { leaseUntil: new Date('2026-08-21T12:00:00Z') }],
+  ['different submission', { objectId: 'another-submission' }],
+  ['different work family', { workClass: 'CUSTOM_COMMUNICATION' }],
+  ['different agency', { agencyId: 'another-agency' }],
+]) {
+  test(`source capacity release cannot release ${label}`, async () => {
+    const submission = baseSubmission({ id: 'source-release-scope' }), row = claimedSourceDomainWork(submission.id, override);
+    const db = fakeDb({ submissions: [submission], domainWorkItems: [row] }), before = clone(db._domainWorkItems[0]);
+    await assert.rejects(() => releaseCustomContentSubmissionSourceWork({ agencyId: 'agency-1', member, deviceId: 'device-1', submissionId: submission.id,
+      sourceWorkClaim: sourceClaim(row), now: new Date('2026-08-21T12:00:30Z'), db: commitDatabaseFixture(db) }), { code: 'CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE' });
+    assert.deepEqual(db._domainWorkItems[0], before);
+  });
+}
+test('source capacity release requires current creator access and a claim', async () => {
+  const submission = baseSubmission({ id: 'source-release-access' }), row = claimedSourceDomainWork(submission.id);
+  const db = fakeDb({ submissions: [submission], domainWorkItems: [row] });
+  const input = { agencyId: 'agency-1', member, deviceId: 'device-1', submissionId: submission.id, now: new Date('2026-08-21T12:00:30Z'), db: commitDatabaseFixture(db) };
+  await assert.rejects(() => releaseCustomContentSubmissionSourceWork(input), { code: 'CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_REQUIRED' });
+  await assert.rejects(() => releaseCustomContentSubmissionSourceWork({ ...input, member: { ...member, assignedCreators: [] }, sourceWorkClaim: sourceClaim(row) }));
+  assert.equal(db._domainWorkItems[0].state, 'CLAIMED');
+});
+test('a delayed duplicate release cannot evict a later worker', async () => {
+  const submission = baseSubmission({ id: 'source-release-replayed' }), row = claimedSourceDomainWork(submission.id);
+  const db = fakeDb({ submissions: [submission], domainWorkItems: [row] });
+  const input = { agencyId: 'agency-1', member, deviceId: 'device-1', submissionId: submission.id, sourceWorkClaim: sourceClaim(row), now: new Date('2026-08-21T12:00:30Z'), db: commitDatabaseFixture(db) };
+  await releaseCustomContentSubmissionSourceWork(input);
+  Object.assign(db._domainWorkItems[0], { state: 'CLAIMED', ownerToken: 'next-worker', claimFence: 2n, leaseUntil: new Date('2026-08-21T12:04:00Z') });
+  await assert.rejects(() => releaseCustomContentSubmissionSourceWork(input), { code: 'CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE' });
+  assert.equal(db._domainWorkItems[0].ownerToken, 'next-worker'); assert.equal(db._domainWorkItems[0].state, 'CLAIMED');
+});
+test('source heartbeat exposes its authoritative relative lease duration', async () => {
+  const submission = baseSubmission({ id: 'source-heartbeat-clock' }), row = claimedSourceDomainWork(submission.id);
+  const db = fakeDb({ submissions: [submission], domainWorkItems: [row] });
+  const result = await heartbeatCustomContentSubmissionSourceWork({ agencyId: 'agency-1', member, deviceId: 'device-1', submissionId: submission.id,
+    sourceWorkClaim: sourceClaim(row), now: new Date('2026-08-21T12:00:30Z'), db: commitDatabaseFixture(db) });
+  assert.equal(Date.parse(result.leaseUntil) - Date.parse(result.serverNow), 180000);
+});
+test('source capacity release is a billing drain, without widening ordinary mutation access', () => {
+  const { isDrainRequest } = require('../middleware/product-billing');
+  assert.equal(isDrainRequest({ baseUrl: '/api/custom-orders', path: '/submissions/source-1/source-work/release' }), true);
+  assert.equal(isDrainRequest({ baseUrl: '/api/custom-orders', path: '/submissions/source-1/disposition' }), false);
+  assert.equal(isDrainRequest({ baseUrl: '/api/custom-orders', path: '/submissions/source-1/source-work/force-release' }), false);
 });

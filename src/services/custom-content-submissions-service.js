@@ -1921,8 +1921,36 @@ async function heartbeatCustomContentSubmissionSourceWork({ agencyId, member, de
   await requireCreatorAccess({ agencyId, member, creatorId: submission.creatorId, db: client });
   const item = await assertSourcePipelineDomainClaim({ db: client, agencyId, submissionId: id, claim: sourceWorkClaim });
   const result = await heartbeatDomainWorkClaim({ db: client, item, ownerToken: item.ownerToken, leaseMs: SOURCE_PIPELINE_HEARTBEAT_LEASE_MS, fallbackNow: now });
-  if (result?.lost) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim was lost", 409);
-  return { ok: true, leaseUntil: result.leaseUntil ? new Date(result.leaseUntil).toISOString() : null };
+  if (!result?.renewed || result?.lost) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim was lost", 409);
+  return { ok: true, leaseUntil: result.leaseUntil ? new Date(result.leaseUntil).toISOString() : null,
+    serverNow: new Date(result.authorityNow || now).toISOString() };
+}
+
+async function releaseCustomContentSubmissionSourceWork({ agencyId, member, deviceId, submissionId, sourceWorkClaim, now = new Date(), db = null } = {}) {
+  if (!agencyId || !member?.id) throw fail("CUSTOM_SUBMISSION_ACTOR_REQUIRED", "Agency membership is required", 403);
+  identifier(deviceId, "deviceId", { max: 180 });
+  const id = identifier(submissionId, "submissionId", { max: 180 });
+  const claim = parseSourcePipelineDomainClaim(sourceWorkClaim);
+  if (!claim) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_REQUIRED", "A current source-pipeline work claim is required", 409);
+  const client = db || require("../prisma");
+  return withSubmissionPipelineLock({ db: client, agencyId, submissionId: id, work: async (lockedClient) => {
+    const row = await lockedClient.customContentSubmission.findFirst({ where: { id, agencyId }, select: { id: true, creatorId: true } });
+    if (!row) throw fail("CUSTOM_SUBMISSION_NOT_FOUND", "Content submission was not found", 404);
+    await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: lockedClient });
+    const guarded = await lockDomainWorkClaimForCommit({ db: lockedClient, item: claim, ownerToken: claim.ownerToken, fallbackNow: now });
+    if (guarded?.lost
+        || String(guarded?.item?.agencyId || "") !== String(agencyId)
+        || String(guarded?.item?.workClass || "") !== PHASE2_WORK_CLASS.CUSTOM_SOURCE_PIPELINE
+        || String(guarded?.item?.objectType || "") !== "CustomContentSubmission"
+        || String(guarded?.item?.objectId || "") !== id) {
+      throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline work claim is no longer current", 409);
+    }
+    // Capacity handoff is not an execution failure or completion. Preserve
+    // submission diagnostics and unfinished/newer work; never touch provider rows.
+    const released = await yieldDomainWorkClaim({ db: lockedClient, item: guarded.item, ownerToken: claim.ownerToken, fallbackNow: guarded.authorityNow || now });
+    if (!released?.yielded || released?.lost) throw fail("CUSTOM_SUBMISSION_SOURCE_WORK_CLAIM_STALE", "The source-pipeline claim was lost before release", 409);
+    return { ok: true, released: true, sourceWorkSuperseded: released.newerRevision === true };
+  } });
 }
 
 async function reportCustomContentSubmissionExecutionAttempt({
@@ -2069,6 +2097,7 @@ module.exports = {
   assertCustomSubmissionTelegramSourceAccess,
   claimCustomContentSubmissionUploadWork,
   heartbeatCustomContentSubmissionSourceWork,
+  releaseCustomContentSubmissionSourceWork,
   commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
   createCustomContentSubmissionFromInboundEvent,

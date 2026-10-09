@@ -12,6 +12,7 @@ const {
 const {
   claimCustomContentSubmissionUploadWork,
   heartbeatCustomContentSubmissionSourceWork,
+  releaseCustomContentSubmissionSourceWork,
   commitCustomContentSubmissionMedia,
   createCustomContentSubmission,
   listCustomContentSubmissions,
@@ -225,6 +226,20 @@ router.post("/submissions/:submissionId/source-work/heartbeat", async (req, res)
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_SOURCE_WORK_HEARTBEAT_FAILED"); }
+});
+
+router.post("/submissions/:submissionId/source-work/release", async (req, res) => {
+  try {
+    requireProductDevice(req, req.body?.deviceId);
+    return res.json(await releaseCustomContentSubmissionSourceWork({
+      agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member,
+      deviceId: req.body?.deviceId,
+      submissionId: req.params.submissionId,
+      sourceWorkClaim: req.body?.sourceWorkClaim,
+      db: prisma,
+    }));
+  } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_SOURCE_WORK_RELEASE_FAILED"); }
 });
 
 router.post("/submissions/:submissionId/disposition", async (req, res) => {
