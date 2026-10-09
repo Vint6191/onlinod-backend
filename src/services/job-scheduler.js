@@ -2404,8 +2404,6 @@ function stopRecurringScheduler() {
   ++schedulerEpoch;
   for (const timer of initialSchedulerTimers) clearTimeout(timer);
   initialSchedulerTimers.clear();
-  const campaignStopped = campaignProjectionExecutor?.stop();
-  campaignProjectionExecutor = null;
   if (recurringTimer) {
     clearInterval(recurringTimer);
     recurringTimer = null;
@@ -2418,9 +2416,17 @@ function stopRecurringScheduler() {
     clearInterval(phase2MaintenanceTimer);
     phase2MaintenanceTimer = null;
   }
+  let campaignStopped;
+  try { campaignStopped = campaignProjectionExecutor?.stop(); }
+  catch (error) { campaignStopped = Promise.reject(error); }
   schedulerStopPromise = Promise.allSettled([recurringSweepPromise, phase2MaintenancePromise, analyticsDemandPromise, campaignStopped])
-    .then(() => { console.log("[scheduler] stopped"); })
-    .finally(() => { schedulerStopPromise = null; });
+    .then(results => {
+      const failures = results.filter(result => result.status === "rejected");
+      if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Scheduler drain failed");
+      campaignProjectionExecutor = null;
+      console.log("[scheduler] stopped");
+      schedulerStopPromise = null;
+    });
   return schedulerStopPromise;
 }
 

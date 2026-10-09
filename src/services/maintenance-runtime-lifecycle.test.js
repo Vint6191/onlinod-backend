@@ -44,15 +44,19 @@ test('campaign executor stop waits for running commit and never schedules anothe
 });
 function serverHarness({brokenStop=false,badExternal=false}={}){
  const source=fs.readFileSync(path.join(__dirname,'../server.js'),'utf8');const ready=deferred(),drain=deferred(),calls=[],signals={};let close;
- const context={Promise,console:{error(...args){calls.push(['error',...args]);},warn(){}},
-  process:{env:{},once(name,fn){signals[name]=fn;},exit(code){calls.push(['exit',code]);}},
-  logger:{info(){},warn(){}},prisma:{$disconnect:async()=>{calls.push('disconnect');}},
-  app:{listen(){calls.push('listen');return{close(fn){close=fn;calls.push('close');}};}},
-  startRecurringScheduler(){calls.push('scheduler-start');return()=>{calls.push('scheduler-stop');return drain.promise;};},
-  setTimeout(){return{unref(){}};},clearTimeout(){},
+ const {EventEmitter}=require('node:events');const processPort=Object.assign(new EventEmitter(),{env:{},exit(code){calls.push(['exit',code]);}});
+ for(const name of ['SIGTERM','SIGINT']) signals[name]=()=>processPort.emit(name);
+ const db={$disconnect:async()=>{calls.push('disconnect');}};
+ const log={info(){},warn(){},error(...args){calls.push(['error',...args]);}};
+ const lifecycle=require('./backend-process-lifecycle').createBackendProcessLifecycle({db,log,processPort,schedule:()=>({}),cancel(){}});
+ const context={Promise,console:{error(...args){calls.push(['error',...args]);},warn(){}},process:processPort,logger:log,prisma:db,app:{},lifecycle,
+  startRecurringScheduler(){calls.push('scheduler-start');},stopRecurringScheduler(){calls.push('scheduler-stop');return drain.promise;},
   require(name){
-   if(name==='./services/external-delivery-runtime-contract')return{verifyExternalDeliveryRuntime:async()=>{if(badExternal)throw Error("EXTERNAL_DELIVERY_PHYSICAL_GUARD_REQUIRED");}};
+   if(name==='./services/external-delivery-runtime-contract')return{verifyExternalDeliveryRuntime:async()=>{if(badExternal)throw Error('EXTERNAL_DELIVERY_PHYSICAL_GUARD_REQUIRED');}};
    if(name==='./services/maintenance-runtime-contract')return{verifyMaintenanceRuntime(){calls.push('verify');return ready.promise;}};
+   if(name==='./services/of-request-gate-service')return{stopOfRequestGate(){}};
+   if(name==='./services/desktop-control-events')return{stopDesktopControlEvents(){}};
+   if(name==='node:http')return{createServer(){const server=new EventEmitter();server.listening=false;server.listen=(_port,callback)=>{server.listening=true;calls.push('listen');callback();};server.close=callback=>{calls.push('close');close=()=>{server.listening=false;callback();};};return server;}};
    const method=name.includes('dialog-module')?'startDialogControlWorker':name.includes('auth-mail')?'startAuthMailWorker':'startAdminDiagnostics';
    return{[method](){return()=>{calls.push(method+'-stop');if(brokenStop&&method==='startAdminDiagnostics')throw Error('controlled stop failure');};}};
   },
@@ -60,10 +64,11 @@ function serverHarness({brokenStop=false,badExternal=false}={}){
  vm.runInNewContext(source.slice(source.indexOf('const port = Number(process.env.PORT')),context);
  return{ready,drain,calls,signals,close:()=>close()};
 }
+
 const turn=()=>new Promise(resolve=>setImmediate(resolve));
 test('server does not listen or start workers until runtime verification succeeds',async()=>{
  const h=serverHarness();await turn();assert.deepEqual(h.calls,['verify']);h.ready.resolve({ready:true});await turn();assert.deepEqual(h.calls,['verify','scheduler-start','listen']);
- h.signals.SIGTERM();h.signals.SIGINT();assert.equal(h.calls.filter(x=>x==='scheduler-stop').length,1);h.close();await turn();assert.ok(!h.calls.includes('disconnect'));
+ h.signals.SIGTERM();h.signals.SIGINT();assert.equal(h.calls.filter(x=>x==='scheduler-stop').length,1);await turn();h.close();await turn();assert.ok(!h.calls.includes('disconnect'));
  h.drain.resolve();await turn();assert.equal(h.calls.at(-2),'disconnect');assert.deepEqual(h.calls.at(-1),['exit',0]);
 });
 test('bad runtime catalog fails startup before listen, no maintenance loop crashes after a green start',async()=>{
@@ -76,13 +81,25 @@ test('maintenance degradation appears in the actual scheduler health snapshot an
  scheduler._test.handleMaintenanceTickResult({ok:true,admission:{ok:true,selected:[]}});assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.status,'HEALTHY');
 });
 
-test('one synchronous worker stop failure does not prevent other drains or Prisma disconnect',async()=>{
- const h=serverHarness({brokenStop:true});h.ready.resolve({ready:true});await turn();h.signals.SIGTERM();h.close();
+test('one synchronous worker stop failure drains independent owners and preserves Prisma for unconfirmed work',async()=>{
+ const h=serverHarness({brokenStop:true});h.ready.resolve({ready:true});await turn();h.signals.SIGTERM();await turn();h.close();
  assert.ok(h.calls.includes('startAuthMailWorker-stop'));assert.ok(h.calls.includes('startDialogControlWorker-stop'));
  await turn();assert.ok(!h.calls.includes('disconnect'));h.drain.resolve();await turn();
- assert.equal(h.calls.at(-2),'disconnect');assert.deepEqual(h.calls.at(-1),['exit',1]);
+ assert.ok(!h.calls.includes('disconnect'));assert.deepEqual(h.calls.at(-1),['exit',1]);
 });
 
 test('missing external-delivery guard fails startup before maintenance or listen',async()=>{
  const h=serverHarness({badExternal:true});await turn();assert.ok(!h.calls.includes('verify'));assert.ok(!h.calls.includes('listen'));assert.equal(h.calls.at(-2),'disconnect');assert.deepEqual(h.calls.at(-1),['exit',1]);
+});
+test('scheduler cancels its other timers even when campaign stop throws synchronously',async()=>{
+ const h=schedulerHarness(),original=h.context.require;
+ h.context.require=name=>name==='./campaign-projection-executor'?{startCampaignProjectionExecutor:()=>({stop(){throw Error('campaign still active');}})}:original(name);
+ h.context.start();const stopping=h.context.stop();assert.equal(h.timers.size,0);await assert.rejects(stopping,/Scheduler drain failed/);
+ assert.equal(h.context.stop(),stopping);assert.throws(()=>h.context.start(),/SCHEDULER_STOPPING/);
+});
+test('scheduler propagates a failed owned sweep after joining all other roots',async()=>{
+ const h=schedulerHarness();h.context.start();for(const timer of h.timers.values())if(timer.type==='initial')timer.fn();
+ const stopping=h.context.stop();let finished=false;const observed=stopping.then(()=>finished=true,error=>{finished=true;return error;});
+ h.maintenance.reject(Error('commit unknown'));h.recurring.resolve({ok:true});h.demand.resolve({ok:true});await turn();assert.equal(finished,false);
+ h.campaign.resolve();assert.match((await observed).message,/Scheduler drain failed/);
 });

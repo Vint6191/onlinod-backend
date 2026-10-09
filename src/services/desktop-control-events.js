@@ -16,6 +16,15 @@ const streamId = randomUUID();
 let sequence = 0;
 const events = [];
 const waitersByAgency = new Map();
+let stopping = false;
+function controlError(code) { return Object.assign(new Error(code), { code, status: 503 }); }
+
+function stopDesktopControlEvents() {
+  stopping = true;
+  for (const waiters of [...waitersByAgency.values()]) {
+    for (const finish of [...waiters]) finish(controlError("BACKEND_STOPPING"));
+  }
+}
 
 function clean(value, max = 220) {
   return String(value ?? "").trim().slice(0, max);
@@ -134,7 +143,9 @@ function publishDesktopControlEvent(input) {
   return visible(event);
 }
 
-async function waitForDesktopControlEvents({ agencyId, userId = null, memberId = null, deviceId = null, streamId: clientStreamId, afterSeq = 0, waitMs = 20_000 }) {
+async function waitForDesktopControlEvents({ agencyId, userId = null, memberId = null, deviceId = null, streamId: clientStreamId, afterSeq = 0, waitMs = 20_000, signal = null }) {
+  if (stopping) throw controlError("BACKEND_STOPPING");
+  if (signal?.aborted) throw controlError("DESKTOP_CONTROL_CANCELLED");
   const normalizedAgencyId = clean(agencyId, 180);
   if (!normalizedAgencyId) throw new Error("agencyId is required");
   const normalizedAfterSeq = clientStreamId && clean(clientStreamId, 180) !== streamId
@@ -145,24 +156,29 @@ async function waitForDesktopControlEvents({ agencyId, userId = null, memberId =
   if (current.events.length > 0 || (clientStreamId && clean(clientStreamId, 180) !== streamId)) return current;
 
   const boundedWaitMs = Math.max(250, Math.min(MAX_WAIT_MS, Math.floor(Number(waitMs) || 20_000)));
-  await new Promise((resolve) => {
+  await new Promise((resolve, reject) => {
     const key = normalizedAgencyId;
     let finished = false;
-    const finish = () => {
+    const finish = (error) => {
       if (finished) return;
       finished = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       const waiters = waitersByAgency.get(key);
       waiters?.delete(finish);
       if (waiters && waiters.size === 0) waitersByAgency.delete(key);
-      resolve();
+      if (error) reject(error); else resolve();
     };
-    const timer = setTimeout(finish, boundedWaitMs);
+    const onAbort = () => finish(controlError("DESKTOP_CONTROL_CANCELLED"));
+    const timer = setTimeout(() => finish(), boundedWaitMs);
     timer.unref?.();
     const waiters = waitersByAgency.get(key) || new Set();
     waiters.add(finish);
     waitersByAgency.set(key, waiters);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
+  if (stopping) throw controlError("BACKEND_STOPPING");
+  if (signal?.aborted) throw controlError("DESKTOP_CONTROL_CANCELLED");
   return read();
 }
 
@@ -173,4 +189,5 @@ module.exports = {
   publishDesktopControlEvent,
   waitForDesktopControlEvents,
   currentDesktopControlStreamId,
+  stopDesktopControlEvents,
 };

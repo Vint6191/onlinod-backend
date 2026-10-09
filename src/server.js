@@ -53,7 +53,9 @@ const prisma = require("./prisma");
 const logger = require("./utils/logger");
 const { buildBackendHealthSnapshot } = require("./utils/health-snapshot");
 const { TEAM_CONTROL_PLANE_GENERATION, readTeamControlPlaneReleaseAuthority, readTeamControlPlaneDbFenceStatus } = require("./services/phase2-release-compatibility-authority-service");
-const { startRecurringScheduler, getRecurringSchedulerHealthSnapshot } = require("./services/job-scheduler");
+const { startRecurringScheduler, stopRecurringScheduler, getRecurringSchedulerHealthSnapshot } = require("./services/job-scheduler");
+const { createBackendProcessLifecycle } = require("./services/backend-process-lifecycle");
+const lifecycle = createBackendProcessLifecycle({ db: prisma, log: logger });
 
 const legacyAnalyticsRoutes = createLegacyGoneRouter("analytics_snapshots", "/api/home + /api/stats");
 const legacyCrmRoutes = createLegacyGoneRouter("server_crm", "Desktop local CRM authority");
@@ -66,15 +68,8 @@ const legacyAuditRoutes = createLegacyGoneRouter("generic_agency_audit", "/api/t
 const legacyModulesRoutes = createLegacyGoneRouter("generic_modules", "dedicated product control APIs");
 const legacyMessageLibraryRoutes = createLegacyGoneRouter("legacy_message_library", "/api/server/content/message-library");
 
-process.on("unhandledRejection", (reason) => {
-  logger.error("unhandled promise rejection", { error: String(reason?.message || reason), stack: reason?.stack || null });
-});
-
-process.on("uncaughtException", (err) => {
-  logger.error("uncaught exception", { error: String(err?.message || err), stack: err?.stack || null });
-});
-
 const app = express();
+app.use(lifecycle.middleware);
 
 app.set("trust proxy", 1);
 
@@ -363,42 +358,35 @@ app.use((err, _req, res, _next) => {
 
 const port = Number(process.env.PORT || 10000);
 
-async function startServer() {
+async function startServer({ own, checkpoint }) {
   // Fail before listening or starting any worker: build success alone cannot
   // establish that executable maintenance, versioned admission and indexes agree.
   await require("./services/external-delivery-runtime-contract").verifyExternalDeliveryRuntime({ db: prisma });
+  checkpoint();
   const maintenance = await require("./services/maintenance-runtime-contract").verifyMaintenanceRuntime({ db: prisma });
+  checkpoint();
   logger.info("maintenance runtime ready", maintenance);
-  const stopScheduler = startRecurringScheduler();
-  const stopDialogControlWorker = require("./services/dialog-module-control-service").startDialogControlWorker({db:prisma});
-  const stopAuthMailWorker = require("./services/auth-mail-outbox-service").startAuthMailWorker({ db: prisma });
-  const stopAdminDiagnostics = require("./services/admin-diagnostics-service").startAdminDiagnostics({ db: prisma, log: logger });
-  const httpServer = app.listen(port, () => { logger.info("backend listening", { port }); });
-  let stopping = false;
-  async function gracefulShutdown(signal) {
-    if (stopping) return;
-    stopping = true;
-    logger.info("shutdown requested", { signal });
-    const timeout = setTimeout(() => { logger.warn("graceful shutdown timed out"); process.exit(1); }, 25_000);
-    timeout.unref?.();
-    // Cancel every producer immediately, then drain both HTTP and outstanding
-    // scheduler roots before disconnecting Prisma. A second signal is idempotent.
-    const stopped = [stopScheduler, stopAdminDiagnostics, stopAuthMailWorker, stopDialogControlWorker].map(stop => {
-      try { return Promise.resolve(stop()); }
-      catch (error) { return Promise.reject(error); }
-    });
-    stopped.push(new Promise(resolve => httpServer.close(resolve)));
-    const results = await Promise.allSettled(stopped);
-    let failed = results.some(result => result.status === "rejected");
-    try { await prisma.$disconnect(); }
-    catch (error) { failed = true; console.warn("[server] prisma disconnect failed:", error?.message || error); }
-    clearTimeout(timeout);
-    process.exit(failed ? 1 : 0);
-  }
-  process.once("SIGTERM", () => void gracefulShutdown("SIGTERM"));
-  process.once("SIGINT", () => void gracefulShutdown("SIGINT"));
+  own("provider-gate", require("./services/of-request-gate-service").stopOfRequestGate);
+  own("desktop-control", require("./services/desktop-control-events").stopDesktopControlEvents);
+  // Register this owner before start, so a partial scheduler startup rolls back.
+  own("scheduler", stopRecurringScheduler);
+  startRecurringScheduler();
+  own("dialog-control", require("./services/dialog-module-control-service").startDialogControlWorker({ db: prisma }));
+  own("auth-mail", require("./services/auth-mail-outbox-service").startAuthMailWorker({ db: prisma }));
+  own("admin-diagnostics", require("./services/admin-diagnostics-service").startAdminDiagnostics({ db: prisma, log: logger }));
+  const httpServer = require("node:http").createServer(app);
+  const listening = new Promise((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(port, () => { httpServer.removeListener("error", reject); resolve(); });
+  });
+  own("http", async () => {
+    await listening.catch(() => undefined);
+    if (!httpServer.listening) return;
+    await new Promise((resolve, reject) => httpServer.close(error => error ? reject(error) : resolve()));
+  });
+  httpServer.on("error", error => { void lifecycle.stop("http-error", error); });
+  await listening;
+  checkpoint();
+  logger.info("backend listening", { port });
 }
-startServer().catch(async error => {
-  console.error("[server] startup failed:", error?.message || error);
-  try { await prisma.$disconnect(); } finally { process.exit(1); }
-});
+void lifecycle.start(startServer);

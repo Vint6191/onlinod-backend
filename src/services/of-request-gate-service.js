@@ -64,6 +64,24 @@ const PRIORITY_CYCLE = [
 ];
 
 const accessCache = new Map();
+let stopping = false;
+let stopPromise = null;
+let stopController = new AbortController();
+let retryTimer = null;
+let heartbeatFlight = null;
+const pendingEntries = new Set();
+const backgroundFlights = new Set();
+function stoppingError() { return Object.assign(new Error("BACKEND_STOPPING"), { code: "BACKEND_STOPPING", status: 503 }); }
+function trackWork(promise) {
+  const flight = Promise.resolve(promise).finally(() => backgroundFlights.delete(flight));
+  backgroundFlights.add(flight);
+  void flight.catch(() => undefined);
+  return flight;
+}
+function assertEntryCurrent(entry) {
+  if (stopping) throw stoppingError();
+  if (entry.cancelled || entry.signal?.aborted) throw Object.assign(new Error("Global OF gate request was cancelled"), { code: "OF_GATE_CANCELLED" });
+}
 
 // One local coordinator only wakes local HTTP waiters; PostgreSQL owns global waiter order and every physical permit in production.
 // The previous implementation had one 700ms clock per creator, which allowed
@@ -223,19 +241,20 @@ function stopWaiterHeartbeatIfIdle() {
   coordinator.waiterHeartbeatTimer = null;
 }
 function ensureWaiterHeartbeat() {
-  if (!durableGateAvailable() || coordinator.waiterHeartbeatTimer) return;
+  if (stopping || !durableGateAvailable() || coordinator.waiterHeartbeatTimer) return;
   coordinator.waiterHeartbeatTimer = setInterval(() => {
+    if (stopping || heartbeatFlight) return;
     const waiterIds = liveLocalWaiterIds();
     if (!waiterIds.length) {
       stopWaiterHeartbeatIfIdle();
       return;
     }
-    void heartbeatDurableProviderWaiters({
+    heartbeatFlight = trackWork(heartbeatDurableProviderWaiters({
       db: prisma,
       ownerInstanceId: BACKEND_INSTANCE_ID,
       waiterIds,
       waiterTtlMs: PROVIDER_GATE_WAITER_LEASE_MS,
-    }).catch(() => null);
+    }).catch(() => null)).finally(() => { heartbeatFlight = null; });
   }, PROVIDER_GATE_WAITER_HEARTBEAT_MS);
   coordinator.waiterHeartbeatTimer.unref?.();
 }
@@ -304,6 +323,7 @@ async function requireGateAccess({ userId, agencyId, member, deviceId, creatorId
 }
 
 function waitUntil(targetMs, signal) {
+  if (signal?.aborted) return Promise.reject(stopping ? stoppingError() : Object.assign(new Error("OF_GATE_CANCELLED"), { code: "OF_GATE_CANCELLED" }));
   const delay = Math.max(0, targetMs - Date.now());
   if (delay <= 0) return Promise.resolve();
   return new Promise((resolve, reject) => {
@@ -341,6 +361,7 @@ function expirePermit(permit) {
 }
 
 function pump() {
+  if (stopping) return;
   const durable = durableGateAvailable();
   if (coordinator.running || (!durable && coordinator.activePermit)) return;
   const entry = takeNext();
@@ -348,7 +369,7 @@ function pump() {
   coordinator.running = true;
   coordinator.runningEntryId = entry.id;
   let durableRetryAtMs = 0;
-  void (async () => {
+  trackWork((async () => {
     try {
       let permit;
       if (durable) {
@@ -359,6 +380,7 @@ function pump() {
           throw error;
         }
         const fairness = await readProviderGateFairnessAuthority({ db: prisma });
+        assertEntryCurrent(entry);
         coordinator.fairnessActivationState = fairness.activationState;
         coordinator.fairnessGeneration = fairness.generation || PROVIDER_GATE_FAIRNESS_GENERATION;
         let admission;
@@ -374,6 +396,12 @@ function pump() {
             });
             entry.waiterRegistered = true;
             coordinator.runningWaiterRegistered = true;
+            if (stopping || entry.cancelled || entry.signal?.aborted) {
+              await cancelDurableProviderWaiter({ db: prisma, waiterId: entry.id, ownerInstanceId: BACKEND_INSTANCE_ID }).catch(() => null);
+              entry.waiterRegistered = false;
+              coordinator.runningWaiterRegistered = false;
+              assertEntryCurrent(entry);
+            }
             ensureWaiterHeartbeat();
           }
           admission = await tryAcquireDurableProviderPermit({
@@ -437,7 +465,7 @@ function pump() {
         }, Math.max(0, permit.expiresAt - Date.now()) + 50);
         permit.expiryTimer.unref?.();
       } else {
-        await waitUntil(Math.max(Date.now(), coordinator.nextAllowedAt || 0), entry.signal);
+        await waitUntil(Math.max(Date.now(), coordinator.nextAllowedAt || 0), AbortSignal.any([stopController.signal, ...(entry.signal ? [entry.signal] : [])]));
         if (entry.cancelled) return;
         permit = {
           id: crypto.randomUUID(),
@@ -464,6 +492,7 @@ function pump() {
         await requireGateAccess(entry);
         const billing = await readJobBillingAdmission(entry);
         if (billing?.validUntil) permit.expiresAt = Math.min(permit.expiresAt, billing.validUntil.getTime());
+        assertEntryCurrent(entry);
       } catch (error) {
         clearTimeout(permit.expiryTimer);
         if (permit.durable) await cancelDurableProviderPermit({
@@ -493,17 +522,20 @@ function pump() {
       coordinator.runningEntryId = null;
       coordinator.runningWaiterRegistered = false;
       stopWaiterHeartbeatIfIdle();
+      if (stopping) return;
       if (durableRetryAtMs > 0) {
         const delay = Math.max(0, durableRetryAtMs - Date.now());
-        setTimeout(pump, delay);
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => { retryTimer = null; pump(); }, delay);
       } else if (durable || !coordinator.activePermit) {
         setImmediate(pump);
       }
     }
-  })();
+  })());
 }
 
 async function acquireOfRequestSlot(input) {
+  if (stopping) throw stoppingError();
   const creatorId = clean(input.creatorId, 200);
   const deviceId = clean(input.deviceId, 200);
   const userId = clean(input.userId, 200);
@@ -531,6 +563,7 @@ async function acquireOfRequestSlot(input) {
   const billingContext = { userId, member: input.member, retirementSnapshot: input.retirementSnapshot || null, billingRecovery: input.billingRecovery || null, jobLease: input.jobLease || null, operationReadback: input.operationReadback || null, physicalRequest: input.physicalRequest || null };
   await readJobBillingAdmission({ ...billingContext, agencyId: access.agencyId, creatorId,
     deviceId: access.deviceId, capability, operation });
+  if (stopping) throw stoppingError();
   return new Promise((resolve, reject) => {
     const entry = {
       ...billingContext,
@@ -555,11 +588,12 @@ async function acquireOfRequestSlot(input) {
     const settleReject = (error) => {
       if (entry.settled) return;
       entry.settled = true;
+      pendingEntries.delete(entry);
       entry.cancelled = true;
       clearTimeout(timer);
       entry.signal?.removeEventListener("abort", onAbort);
       if (durableGateAvailable() && entry.waiterRegistered === true) {
-        void cancelDurableProviderWaiter({ db: prisma, waiterId: entry.id, ownerInstanceId: BACKEND_INSTANCE_ID }).catch(() => null);
+        trackWork(cancelDurableProviderWaiter({ db: prisma, waiterId: entry.id, ownerInstanceId: BACKEND_INSTANCE_ID }).catch(() => null));
         entry.waiterRegistered = false;
       }
       reject(error);
@@ -580,14 +614,35 @@ async function acquireOfRequestSlot(input) {
     entry.resolve = (value) => {
       if (entry.settled) return;
       entry.settled = true;
+      pendingEntries.delete(entry);
       clearTimeout(timer);
       entry.signal?.removeEventListener("abort", onAbort);
       resolve(value);
     };
     entry.reject = settleReject;
+    pendingEntries.add(entry);
     enqueue(entry);
     setImmediate(pump);
   });
+}
+
+function stopOfRequestGate() {
+  if (stopPromise) return stopPromise;
+  stopping = true;
+  stopController.abort();
+  if (retryTimer) clearTimeout(retryTimer);
+  retryTimer = null;
+  if (coordinator.waiterHeartbeatTimer) clearInterval(coordinator.waiterHeartbeatTimer);
+  coordinator.waiterHeartbeatTimer = null;
+  for (const entry of [...pendingEntries]) entry.reject(stoppingError());
+  for (const bucket of coordinator.buckets.values()) { bucket.byCreator.clear(); bucket.order.length = 0; }
+  // A permit already returned to a Desktop may have crossed physical dispatch.
+  // Retain its PostgreSQL expiry/spacing authority; only discard the local hint.
+  clearActivePermit(coordinator.activePermit);
+  stopPromise = (async () => {
+    while (backgroundFlights.size) await Promise.allSettled([...backgroundFlights]);
+  })();
+  return stopPromise;
 }
 
 async function acknowledgeOfRequestStarted(input) {
@@ -767,9 +822,18 @@ module.exports = {
   acknowledgeOfRequestStarted,
   cancelOfRequestPermit,
   getOfRequestGateSnapshot,
+  stopOfRequestGate,
   _test: {
     providerWaiterCategory,
     reset() {
+      stopping = false;
+      stopPromise = null;
+      stopController = new AbortController();
+      if (retryTimer) clearTimeout(retryTimer);
+      retryTimer = null;
+      heartbeatFlight = null;
+      pendingEntries.clear();
+      backgroundFlights.clear();
       if (coordinator.activePermit?.expiryTimer) clearTimeout(coordinator.activePermit.expiryTimer);
       if (coordinator.waiterHeartbeatTimer) clearInterval(coordinator.waiterHeartbeatTimer);
       coordinator.buckets = new Map(PRIORITIES.map((priority) => [priority, { byCreator: new Map(), order: [], cursor: 0, lastServedKey: null }]));

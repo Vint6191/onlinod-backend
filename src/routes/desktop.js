@@ -63,6 +63,10 @@ async function filterAuthorizedControlEventsStable(req, events, maxAttempts = CO
 }
 
 router.get("/control/events", async (req, res) => {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  req.once?.("aborted", abort);
+  res.once?.("close", abort);
   try {
     const deviceId = requireAuthDevice(req, controlDeviceSchema.parse(req.query.deviceId), {
       requiredCode: "DESKTOP_CONTROL_DEVICE_BOUND_TOKEN_REQUIRED",
@@ -79,6 +83,7 @@ router.get("/control/events", async (req, res) => {
       streamId: clientStreamId || null,
       afterSeq,
       waitMs,
+      signal: controller.signal,
     });
     // The long-poll may outlive the auth-middleware Member snapshot by up to
     // 25 seconds. Re-read current Member/User/Agency authority after the wait
@@ -93,10 +98,14 @@ router.get("/control/events", async (req, res) => {
       authority: filtered.authority,
     });
   } catch (error) {
+    if (controller.signal.aborted || res.destroyed) return;
     if (error?.issues) return res.status(400).json({ ok: false, code: "VALIDATION_ERROR", error: error.issues[0]?.message || "Validation error", issues: error.issues });
     const status = Number(error?.status) || 500;
     if (status >= 500) console.error("[desktop/control/events] failed:", error);
     return res.status(status).json({ ok: false, code: error?.code || "DESKTOP_CONTROL_EVENTS_FAILED", error: error?.message || "Desktop control channel failed" });
+  } finally {
+    req.removeListener?.("aborted", abort);
+    res.removeListener?.("close", abort);
   }
 });
 

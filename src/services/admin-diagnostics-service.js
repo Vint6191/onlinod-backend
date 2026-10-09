@@ -84,9 +84,13 @@ async function readDiagnostics({ db }) {
       ...(key==="delivery_clones"?{sample:done?.sample || []}:{})})) };
 }
 function startAdminDiagnostics({ db, log }) {
-  let running=false, stopped=false;
-  const tick=async()=>{ if(running || stopped)return;running=true;try{await diagnosticsStep({db});}catch(err){log.warn("admin diagnostics step failed",{error:String(err?.message || err)});}finally{running=false;} };
+  let flight=null, stopped=false;
+  const tick=()=>{
+    if(stopped || flight)return flight;
+    flight=diagnosticsStep({db}).catch(err=>{log.warn("admin diagnostics step failed",{error:String(err?.message || err)});}).finally(()=>{flight=null;});
+    return flight;
+  };
   const timer=setInterval(tick,STEP_MS);timer.unref?.();void tick();
-  return ()=>{stopped=true;clearInterval(timer);};
+  return ()=>{stopped=true;clearInterval(timer);return flight || Promise.resolve();};
 }
 module.exports={KEY,BATCH,DELIVERY_PAGE_SQL,PROFILE_PAGE_SQL,diagnosticsStep,readDiagnostics,startAdminDiagnostics};
