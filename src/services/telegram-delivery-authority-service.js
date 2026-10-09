@@ -992,7 +992,14 @@ async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = ne
   const rows = await client.telegramDeliveryIntent.findMany({
     where: {
       agencyId, ...scopeWhere(scope), id: { in: billableIds }, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] },
-      NOT: { state: "PLANNED", commitStartedAt: null, outcomeReason: { startsWith: PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX } },
+      // A new PLANNED intent has a NULL outcomeReason. Negating startsWith
+      // produces SQL UNKNOWN for that row and silently hides ordinary work.
+      // Preserve NULL explicitly while rechecking the provider-blocked state
+      // that may have changed since the bounded billing discovery query.
+      OR: [
+        { outcomeReason: null },
+        { NOT: { state: "PLANNED", commitStartedAt: null, outcomeReason: { startsWith: PRECOMMIT_PROVIDER_UNAVAILABLE_PREFIX } } },
+      ],
     },
     orderBy: [{ createdAt: "asc" }, { id: "asc" }],
     take: scanBudget,

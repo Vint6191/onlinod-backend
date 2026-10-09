@@ -424,7 +424,9 @@ test("follow projections expose explicit relationship vocabulary while legacy DB
   assert.match(schema, /fanSubscriptionActive\s+Boolean\?\s+@map\("isActive"\)/);
   assert.match(schema, /creatorFollowsFan\s+Boolean\?\s+@map\("subscribedByCreator"\)/);
   assert.match(schema, /fanSubscribesToCreator\s+Boolean\?\s+@map\("subscribedOn"\)/);
-  for (const source of [followBackRules, followAutomationRules]) {
+  const actionDelivery = read("src/services/automation-action-delivery-service.js");
+  assert.doesNotMatch(actionDelivery, /subscribedByCreator\s*:/);
+  for (const source of [followBackRules, followAutomationRules, actionDelivery]) {
     assert.doesNotMatch(source, /candidate\.(?:isActive|subscribedByCreator|subscribedOn|subscriptionType)/);
   }
   assert.match(followBack, /fanSubscriptionActive/);

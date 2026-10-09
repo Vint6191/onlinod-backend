@@ -1287,7 +1287,7 @@ async function reserveCustomContentSubmissionRelayWrite({ agencyId, member, devi
       permissionKeyOverride: null,
       leaseMs: 10 * 60_000,
       maxAttempts: 20,
-    });
+    }, { db: lockedClient });
     return { ...authority, relayRecipient: recipient, executionVaultFolderId: vaultFolderId, executionProfileRevision: Number(row.executionProfileRevision || 0), submissionId: id, expectedIndex: index, telegramSourceAccountId, telegramSourceUserId, telegramMessageId };
   } });
 }
@@ -1320,7 +1320,7 @@ async function closeCustomContentSubmissionRelayWriteUnresolved({ agencyId, memb
     permissionKey: null,
     reason,
     expectedIdempotencyKey: `custom-relay:${id}:${index}`,
-  });
+  }, { db: client });
 }
 
 async function resolveCustomContentSubmissionRelayWriteMatched({ agencyId, member, deviceId, submissionId, expectedIndex, writeId, mediaId, messageId = null, accessEpoch = null, db = null } = {}) {
@@ -1344,7 +1344,7 @@ async function resolveCustomContentSubmissionRelayWriteMatched({ agencyId, membe
     kind: "CUSTOM_RELAY_SEND", permissionKey: null,
     result: { mediaId: normalizedMediaId, ...(messageId ? { messageId: identifier(messageId, "messageId", { max: 180 }) } : {}) },
     expectedIdempotencyKey: `custom-relay:${id}:${index}`,
-  });
+  }, { db: client });
 }
 
 async function claimCustomContentSubmissionUploadWorkLegacyDiscovery({ agencyId, member, deviceId, leases, limit = 1, now = new Date(), db = null } = {}) {

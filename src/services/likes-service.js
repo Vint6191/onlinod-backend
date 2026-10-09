@@ -214,14 +214,14 @@ async function applyLikesDiscoveryChunk({ db = prisma, job, chunkResult }) {
         where: { creatorId_contentType_contentId: { creatorId: job.creatorId, contentType: "post", contentId: post.contentId } },
         create: {
           agencyId: job.agencyId, creatorId: job.creatorId, ownerFanId: fanId, contentType: "post", contentId: post.contentId,
-          username: clean(fan.username, 160), displayName: clean(fan.displayName || fan.name, 200), contentUrl: post.contentUrl,
-          postedAt: post.postedAt, canViewMedia: post.canViewMedia, isFavorite: post.isFavorite, state: post.state,
+          username: clean(fan.username, 160), displayName: clean(fan.displayName || fan.name, 200), avatarUrl: post.avatarUrl,
+          publishedAt: post.publishedAt, canToggleFavorite: post.canToggleFavorite, canViewMedia: post.canViewMedia, isFavorite: post.isFavorite, state: post.state,
           eligibilityReason: post.reason, skipReason: post.state === "SKIPPED" ? post.reason : null,
           snapshotRunId, metadata: { ...post.metadata, ...likesAuthorityMetadata(job) },
         },
         update: {
-          ownerFanId: fanId, username: clean(fan.username, 160), displayName: clean(fan.displayName || fan.name, 200), contentUrl: post.contentUrl,
-          postedAt: post.postedAt, canViewMedia: post.canViewMedia, isFavorite: preserveLiked ? true : post.isFavorite,
+          ownerFanId: fanId, username: clean(fan.username, 160), displayName: clean(fan.displayName || fan.name, 200), avatarUrl: post.avatarUrl,
+          publishedAt: post.publishedAt, canToggleFavorite: post.canToggleFavorite, canViewMedia: post.canViewMedia, isFavorite: preserveLiked ? true : post.isFavorite,
           state: preserveLiked ? existing.state : post.state,
           eligibilityReason: preserveLiked ? existing.eligibilityReason : post.reason,
           skipReason: preserveLiked ? existing.skipReason : (post.state === "SKIPPED" ? post.reason : null),

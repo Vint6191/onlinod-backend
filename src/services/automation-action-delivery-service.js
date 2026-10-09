@@ -383,13 +383,16 @@ async function sweepExpiredActionLeases(input = new Date()) {
   return automationChanged + programmaticChanged;
 }
 
+// Prisma binds a JS Date as timestamptz; persisted delivery dates are UTC
+// timestamp-without-time-zone. Cast the bound value explicitly, preserving the
+// indexed column and keeping admission independent of the session TimeZone.
 const ACTION_FAIR_CANDIDATES_SQL = `/* phase4_action_fairness */
     SELECT candidate.* FROM unnest($2::text[]) AS scope(id)
     CROSS JOIN LATERAL (
       SELECT d.* FROM "AutomationDelivery" d
       WHERE d."agencyId"=$1 AND d."creatorId"=scope.id AND d."originKind"='AUTOMATION'
         AND d."status" IN ('QUEUED','RETRY_SCHEDULED','RECONCILE_REQUIRED')
-        AND d."actionType"=ANY($3::text[]) AND d."notBefore"<=$4 AND d."claimUntil" IS NULL
+        AND d."actionType"=ANY($3::text[]) AND d."notBefore"<=($4::timestamptz AT TIME ZONE 'UTC') AND d."claimUntil" IS NULL
         AND NOT EXISTS (SELECT 1 FROM "AutomationDelivery" busy WHERE busy."agencyId"=d."agencyId" AND busy."creatorId"=d."creatorId"
           AND busy."id"<>d."id" AND busy."status" IN ('CLAIMED','RUNNING','COMMITTING','RECONCILE_REQUIRED'))
         AND (d."creatorId"=ANY($5::text[]) OR d."status"='RECONCILE_REQUIRED'
@@ -502,7 +505,9 @@ async function deferOrSkipFollowBackClaim(delivery, control, now) {
   else if (candidate.blocked) { code = "blocked"; terminalStatus = "CANCELED"; }
   else if (candidate.ignored) { code = "ignored"; terminalStatus = "CANCELED"; }
   else if (!state?.currentRunId || candidate.snapshotRunId !== state.currentRunId || candidate.state === "STALE") code = "stale_candidate";
-  else if (candidate.subscribedByCreator === true) code = "already_followed";
+  // Candidate rows own workflow controls and snapshot membership. Following
+  // eligibility comes from current FanData at validation/prepare-write, never
+  // from a historical candidate relationship projection.
 
   if (code) {
     return runDbTransaction(prisma, async (tx) => {
@@ -761,7 +766,7 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
       });
       if (pacingRetryAt) {
         await prisma.automationDelivery.updateMany({
-          where: { id: candidate.id, status: candidate.status, leaseRevision: candidate.leaseRevision },
+          where: { id: candidate.id, status: candidate.status, leaseRevision: candidate.leaseRevision, notBefore: { lt: pacingRetryAt } },
           data: { status: "RETRY_SCHEDULED", notBefore: pacingRetryAt, failureCode: "write_pacing", lastError: null },
         });
         continue;
@@ -1336,11 +1341,11 @@ async function updateCandidateFromTerminal(delivery, status, failureCode, db = p
     where: { agencyId: delivery.agencyId, creatorId: delivery.creatorId, fanId: delivery.targetId, OR: [{ latestDeliveryId: null }, { latestDeliveryId: delivery.id }] },
     data: {
       state: candidateState,
-      subscribedByCreator: status === "COMPLETED" || failureCode === "already_followed" ? true : undefined,
+      creatorFollowsFan: status === "COMPLETED" || failureCode === "already_followed" ? true : undefined,
       latestDeliveryId: delivery.id,
       latestActionType: delivery.actionType,
       latestStatus: status,
-      latestError: failureCode || null,
+      latestError: status === "COMPLETED" || failureCode === "already_followed" ? null : failureCode || null,
       eligibilityReason: status === "COMPLETED" || failureCode === "already_followed" ? "already_followed" : undefined,
     },
   });
@@ -1378,6 +1383,10 @@ async function completeActionDelivery(input) {
       data: {
         status: terminalStatus,
         failureCode: terminalStatus === "SKIPPED" ? outcomeCode : null,
+        // A known completion/readback settles the old unknown outcome. Keeping
+        // that category would make unrelated future claims see a write barrier.
+        failureCategory: null,
+        reportedFailureCategory: null,
         lastError: null,
         result,
         messageId: clean(result.messageId, 160) || delivery.messageId,

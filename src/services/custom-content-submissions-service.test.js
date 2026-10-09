@@ -824,7 +824,13 @@ test("relay reservation binds canonical CUSTOM_RELAY_SEND payload to the full Te
   const result = await reserveCustomContentSubmissionRelayWrite({
     agencyId: "agency-1", member, deviceId: "device-1", submissionId: "source-bound",
     expectedIndex: 0, expectedTelegramMessageId: "731", sourceWorkClaim: sourceClaim(sourceWork), accessEpoch: 1, now: new Date("2026-08-21T13:00:00.000Z"), db: commitDatabaseFixture(db),
-    reserveWrite: async (input) => { assert.equal(locked, true, "source row must be locked before Audit17 reservation"); captured = input; return { delivery: { id: "write-731", status: "READY" }, lease: null }; },
+    reserveWrite: async (input, context) => {
+      assert.equal(locked, true, "source row must be locked before relay reservation");
+      assert.equal(context?.db, require("./db-commit-kernel").currentCommitContext()?.tx,
+        "relay reservation must join the locked source transaction");
+      captured = input;
+      return { delivery: { id: "write-731", status: "READY" }, lease: null };
+    },
   });
   assert.equal(captured.idempotencyKey, "custom-relay:source-bound:0");
   assert.equal(captured.payload.telegramSourceAccountId, "tg-1");

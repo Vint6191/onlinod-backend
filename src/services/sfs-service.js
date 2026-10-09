@@ -624,7 +624,7 @@ async function validateSfsDelivery({ delivery, control, now = new Date(), db = p
     fanIds: [candidate.targetUserId || delivery.targetId || delivery.fanId].filter(Boolean),
   });
   const current = currentByFan.get(String(candidate.targetUserId || delivery.targetId || delivery.fanId || "")) || null;
-  const eligibility = evaluateSfsFollowCurrent(candidate, current, settings, now);
+  const eligibility = evaluateSfsFollowCurrent(candidate, current, settings, now, {}, { activeFollowDeliveryId: delivery.id });
   if (!eligibility.eligible) {
     if (eligibility.code === "already_following") {
       return { ok: false, terminal: true, code: "already_followed", candidate, current };

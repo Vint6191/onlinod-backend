@@ -961,7 +961,9 @@ async function projectNativeMassWriteFromTeamEvent(event, { db = prisma } = {}) 
   }, db);
 }
 
-async function reserveProgrammaticWrite(input) {
+async function reserveProgrammaticWrite(input, { db = prisma } = {}) {
+  // Product owners pass their current transaction explicitly so source claims,
+  // execution profiles and the durable write reservation have one commit owner.
   const { key: kind, config } = productKind(input.kind);
   const agencyId = clean(input.agencyId, 180);
   const userId = clean(input.userId, 180);
@@ -978,7 +980,7 @@ async function reserveProgrammaticWrite(input) {
   const leaseMs = leaseDuration(input.leaseMs);
   const now = new Date();
 
-  return runDbTransaction(prisma, async (tx) => {
+  return runDbTransaction(db, async (tx) => {
     await lockBillingWriteAdmission({ db: tx, agencyId });
     // CUSTOM_MANUAL_SEND is part of the durable Custom pipeline lifecycle.
     // Serialize NEW manual-write creation against agency/creator retirement so a
@@ -1558,8 +1560,8 @@ async function reconcileProgrammaticWrite(input) {
   }, { timeout: 30_000 });
 }
 
-async function closeProgrammaticWriteUnresolved(input) {
-  return runDbTransaction(prisma, async (tx) => {
+async function closeProgrammaticWriteUnresolved(input, { db = prisma } = {}) {
+  return runDbTransaction(db, async (tx) => {
     const delivery = await requireProgrammaticLease(input, { db: tx, lock: true });
     if (delivery.status !== "RECONCILE_REQUIRED") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_RECONCILING", `Programmatic write status is ${delivery.status}`, 409);
     if (input.expectedIdempotencyKey && delivery.idempotencyKey !== input.expectedIdempotencyKey) {
@@ -1594,8 +1596,8 @@ async function closeProgrammaticWriteUnresolved(input) {
   }, { timeout: 30_000 });
 }
 
-async function resolveProgrammaticWriteUnresolvedMatched(input) {
-  return runDbTransaction(prisma, async (tx) => {
+async function resolveProgrammaticWriteUnresolvedMatched(input, { db = prisma } = {}) {
+  return runDbTransaction(db, async (tx) => {
     const writeId = clean(input.writeId, 180);
     const delivery = await tx.automationDelivery.findUnique({ where: { id: writeId || "__missing__" } });
     if (!delivery || delivery.originKind === "AUTOMATION") throw new ProgrammaticOfWriteAuthorityError("PROGRAMMATIC_WRITE_NOT_FOUND", "Programmatic write not found", 404);

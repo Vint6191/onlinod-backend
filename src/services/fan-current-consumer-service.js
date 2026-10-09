@@ -526,7 +526,7 @@ function sfsRefreshRequired(code, fields, freshnessClass = FAN_CURRENT_FRESHNESS
   };
 }
 
-function evaluateSfsFollowCurrent(candidate, current, settings = {}, now = new Date(), freshnessPolicy = {}) {
+function evaluateSfsFollowCurrent(candidate, current, settings = {}, now = new Date(), freshnessPolicy = {}, execution = {}) {
   const requiredFields = sfsRequiredFields(settings);
   const freshness = classifyRelationshipFreshness(current, { now, requiredFields, ...freshnessPolicy });
   if (freshness.refreshRequired) {
@@ -550,7 +550,7 @@ function evaluateSfsFollowCurrent(candidate, current, settings = {}, now = new D
     creatorFollowing: rel.creatorFollowsFan,
     subscribePriceCents: rel.subscribePriceCents,
   };
-  const code = targetEligibility(canonicalCandidate, settings, now);
+  const code = targetEligibility(canonicalCandidate, settings, now, execution);
   if (code === "following_unknown") {
     return { ...sfsRefreshRequired("sfs_follow_edge_unknown", ["creatorFollowsFan"], freshness.freshnessClass), candidate: canonicalCandidate, current };
   }

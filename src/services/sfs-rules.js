@@ -141,7 +141,7 @@ function normalizeSfsTarget(value, sourcePostIds = []) {
   };
 }
 
-function targetEligibility(candidate, settings, now = new Date()) {
+function targetEligibility(candidate, settings, now = new Date(), { activeFollowDeliveryId = null } = {}) {
   if (!candidate) return "invalid_target";
   if (settings?.commentsEnabled === false && settings?.commentLikesEnabled === false) return "actions_disabled";
   if (candidate.blocked) return "blocked";
@@ -168,7 +168,14 @@ function targetEligibility(candidate, settings, now = new Date()) {
     if (candidate.isWantComments === false) return "comments_disabled";
   }
   if (candidate.cooldownUntil && new Date(candidate.cooldownUntil).getTime() > now.getTime()) return "cooldown";
-  if (["QUEUED", "FOLLOWING", "SCANNING", "ACTING", "UNFOLLOW_DUE", "UNFOLLOWING", "RECOVERY_REQUIRED"].includes(String(candidate.state || ""))) return "active_delivery";
+  // Planning must reject an active cycle; executing its own FOLLOW must retain
+  // every eligibility guard without rejecting the queue entry it is validating.
+  const ownsActiveFollow = Boolean(activeFollowDeliveryId)
+    && candidate.latestDeliveryId === activeFollowDeliveryId
+    && candidate.latestActionType === "SFS_FOLLOW_TARGET"
+    && candidate.phase === "FOLLOW"
+    && ["QUEUED", "FOLLOWING"].includes(candidate.state);
+  if (!ownsActiveFollow && ["QUEUED", "FOLLOWING", "SCANNING", "ACTING", "UNFOLLOW_DUE", "UNFOLLOWING", "RECOVERY_REQUIRED"].includes(String(candidate.state || ""))) return "active_delivery";
   return "eligible";
 }
 

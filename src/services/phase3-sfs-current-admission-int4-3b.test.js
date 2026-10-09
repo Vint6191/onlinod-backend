@@ -100,8 +100,8 @@ function relationshipRow({ followed = false, price = 0 } = {}) {
   };
 }
 
-function validationDb({ followed = false, price = 0 } = {}) {
-  const row = candidate();
+function validationDb({ followed = false, price = 0, workflow = {} } = {}) {
+  const row = candidate(workflow);
   return {
     sfsTargetCandidate: {
       async findFirst() { return { ...row }; },
@@ -182,6 +182,41 @@ test("INT4.3B SFS eligible prepare validation returns exact fanCurrentFence", as
     assert.equal(validation.ok, true);
     assert.deepEqual(Object.keys(validation.fanCurrentFence.versions).sort(), ["creatorFollowsFan", "subscribePriceCents"]);
   } finally { loaded.cleanup(); }
+});
+
+test("159 SFS validates its queued FOLLOW without admitting another delivery or losing current guards", async () => {
+  const owned = { state: "QUEUED", phase: "FOLLOW", latestDeliveryId: "delivery-1", latestActionType: "SFS_FOLLOW_TARGET" };
+  const cases = [
+    { workflow: owned, ok: true },
+    { workflow: { ...owned, state: "FOLLOWING" }, ok: true },
+    { workflow: { ...owned, latestDeliveryId: "delivery-2" }, code: "active_delivery" },
+    { workflow: { ...owned, phase: "ACTIONS" }, code: "active_delivery" },
+    { workflow: { ...owned, latestActionType: "SFS_COMMENT" }, code: "active_delivery" },
+    { workflow: { ...owned, state: "SCANNING" }, code: "active_delivery" },
+    { workflow: { ...owned, generation: 4 }, code: "stale_candidate" },
+    { workflow: { ...owned, blocked: true }, code: "blocked" },
+    { workflow: owned, followed: true, code: "already_followed" },
+    { workflow: owned, price: 100, code: "paid_target" },
+  ];
+  assert.equal(evaluateSfsFollowCurrent(candidate(owned), current(), settings, now).code, "active_delivery", "planning still rejects the active cycle");
+  for (const expected of cases) {
+    const db = validationDb(expected);
+    const loaded = loadSfs(db);
+    try {
+      const validation = await loaded.service.validateSfsDelivery({
+        db,
+        delivery: {
+          id: "delivery-1", agencyId: "agency-1", creatorId: "creator-1", moduleKey: "sfs", actionType: "SFS_FOLLOW_TARGET",
+          generation: 3, targetId: "fan-1", fanId: "fan-1", payload: { candidateId: "candidate-1" }, notBefore: null,
+        },
+        control: { effective: { sfsEnabled: true }, modules: { sfs: { settings: { freeTargetsOnly: true } } } },
+        now,
+      });
+      assert.equal(validation.ok, expected.ok === true, JSON.stringify(expected));
+      if (!expected.ok) assert.equal(validation.code, expected.code);
+      else assert.deepEqual(Object.keys(validation.fanCurrentFence.versions).sort(), ["creatorFollowsFan", "subscribePriceCents"]);
+    } finally { loaded.cleanup(); }
+  }
 });
 
 test("INT4.3B already-followed SKIPPED heals workflow state without claiming usedForever", async () => {
