@@ -122,9 +122,12 @@ controls. Repeating the command on the same current installation is safe.
 Old migration receipts or nonempty unbaselined databases are rejected without
 changing data. Use a separate empty database for this pre-release architecture.
 
-After applying a source patch, run its deletion-only BAT in the project root to
-remove retired migration files before installation. `prisma db push` is not an
-installation path: it cannot install the required business SQL.
+The installer gives Prisma an isolated copy of the verified current migration.
+Retired directories left by a source overlay are never applied and cannot block
+installation. Windows CRLF checkouts produce the same canonical migration receipt.
+The installer never deletes repository files. Run the deletion-only BAT in each
+project root to remove retired source files, then commit those deletions to Git.
+`prisma db push` is not an installation path: it cannot install the required business SQL.
 
 `/health` checks the connection. `/ready` and startup verify the applied baseline,
 business functions, triggers, constraints, indexes and current control rows. These
@@ -132,3 +135,5 @@ checks are read-only and never perform activation, backfill or archive operation
 
 The reproducible clean-install SQL proof is `npm run test:database`; see
 `TESTING141.md` for its isolated runtime and the complete source verification order.
+`npm run test:database-overlay` additionally verifies mixed migration directories,
+repeat installation, CRLF files, and rejection of an existing old database.

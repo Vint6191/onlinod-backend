@@ -41,7 +41,8 @@
     "test:auth-boundary": "node --test src/services/auth-boundary-recovery.test.js src/middleware/auth-device-logout-v20-21.test.js src/services/auth-device-session-isolation-v20-21.test.js src/services/actual59-int59-3-auth-lineage.test.js src/services/admin-session-client-races.test.js src/services/phase6-home-contract.test.js",
     "test:auth-sql": "node scripts/audit/auth-boundary-sql-proof.cjs",
     "test:all": "node scripts/test-all.cjs",
-    "test:database": "node scripts/audit/current-clean-install-proof.cjs"
+    "test:database": "node scripts/audit/current-clean-install-proof.cjs",
+    "test:database-overlay": "node scripts/audit/current-install-overlay-proof.cjs"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",
