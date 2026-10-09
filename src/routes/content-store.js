@@ -215,11 +215,11 @@ function messageFromBlock(block = {}, index = 0) {
   };
 }
 
-function scriptFromCollection(collection = {}) {
+function scriptFromCollection(collection = {}, { includeTrashedBlocks = false } = {}) {
   const metadata = jsonObject(collection.metadata);
   const collectionInTrash = !!collection.deletedAt || collection.status === "trash" || collection.status === "deleted";
   const messages = (Array.isArray(collection.blocks) ? collection.blocks : [])
-    .filter((block) => collectionInTrash || !(block.deletedAt || block.status === "trash" || block.status === "deleted"))
+    .filter((block) => includeTrashedBlocks || collectionInTrash || !(block.deletedAt || block.status === "trash" || block.status === "deleted"))
     .map(messageFromBlock)
     .sort((a, b) => Number(a.order || 0) - Number(b.order || 0))
     .map((message, index) => ({ ...message, order: index }));
@@ -440,7 +440,7 @@ router.get("/message-library/scripts", async (req, res) => {
       source: "server",
       creatorId: creatorId || null,
       accountId: creatorId || null,
-      items: items.map(scriptFromCollection),
+      items: items.map(item => scriptFromCollection(item, { includeTrashedBlocks: includeTrash })),
       count,
       nextOffset: skip + items.length,
       hasMore: skip + items.length < count,

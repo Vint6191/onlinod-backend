@@ -490,3 +490,17 @@ test("a server identity from another script cannot be reused even with the curre
  const api=loadRoute(db),res=response();await api.save({auth:auth(),query:{},params:{id:"script-1"},body:{creatorId:"creator-1",serverId:"another-script",updatedAt:"2026-01-01T00:00:00Z",messages:[]}},res);
  assert.equal(res.statusCode,409);assert.equal(res.body.code,"MESSAGE_LIBRARY_REVISION_CONFLICT");assert.equal(writes,0);
 });
+
+test('HQ trash projection includes deleted blocks while the ordinary composer list excludes them', async () => {
+  const db = baseDb();
+  db.contentCollection.findMany = async () => [{ id:'server-script',clientId:'script',creatorId:'creator-1',status:'active',blocks:[
+    {id:'live',clientId:'live',text:'Visible',status:'active'},
+    {id:'deleted',clientId:'deleted',text:'Recoverable',status:'trash',deletedAt:new Date('2026-10-09')},
+  ] }];
+  db.contentCollection.count=async()=>1;
+  const api=loadRoute(db);
+  for(const includeTrash of ['false','true']) {
+    const res=response();await api.route('GET','/message-library/scripts')({auth:auth(),query:{creatorId:'creator-1',includeTrash}},res);
+    assert.equal(res.statusCode,200);assert.deepEqual(res.body.items[0].messages.map(m=>m.id),includeTrash==='true'?['live','deleted']:['live']);
+  }
+});
