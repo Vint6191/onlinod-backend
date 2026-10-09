@@ -1,6 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { performance } = require("node:perf_hooks");
 const { runRootCommit } = require("./db-commit-kernel");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
@@ -332,7 +333,10 @@ async function runAnalyticsPublicationUnit({ db, publicationId, claim = null }) 
   }, { profile: "JOB_CHUNK", authority: { kind: "ANALYTICS_PUBLICATION", agencyId: candidate.agencyId, creatorId: candidate.creatorId } });
 }
 
-async function runAnalyticsPublicationSweep({ db, limit = 8 } = {}) {
+async function runAnalyticsPublicationSweep({ db, limit = 8, maxRuntimeMs = 5000, maxUnitsPerClaim = 8 } = {}) {
+  const started = performance.now();
+  const budget = Math.max(1, Math.min(5000, Number(maxRuntimeMs) || 5000));
+  const quantum = Math.max(1, Math.min(8, Math.floor(Number(maxUnitsPerClaim) || 8)));
   const batch = await claimDomainWorkBatch({ db, workClass: "ANALYTICS_PUBLICATION",
     limit: Math.max(1, Math.min(16, limit)), perAgencyQuantum: 2, perPartitionQuantum: 1 });
   const results = [];
@@ -342,8 +346,24 @@ async function runAnalyticsPublicationSweep({ db, limit = 8 } = {}) {
     const jobId = candidate?.jobId;
     try {
       if (!candidate) { await ackDomainWorkClaim({ db, item, ownerToken: batch.ownerToken }); continue; }
-      const result = await runAnalyticsPublicationUnit({ db, publicationId, claim: { item, ownerToken: batch.ownerToken } }); results.push(result);
-      const current = await db.analyticsPublication.findUnique({ where: { id: publicationId } });
+      let current = candidate, result = { publicationPending: true, job: { id: jobId, status: "PUBLISHING" } }, units = 0;
+      // A maintenance lane gets a turn only once per catalog rotation. Advance
+      // a bounded quantum while we own this claim, instead of waiting another
+      // full rotation between tiny publication stages. Every unit still has its
+      // own transaction, input revision check and before/after ownership fence.
+      while (current?.state === "PENDING" && units < quantum && performance.now() - started < budget) {
+        // The database decides whether work is due. Do not compare its clock
+        // with the application clock; only pace continuation between units.
+        if (units) {
+          if (performance.now() - started + 25 >= budget) break;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        result = await runAnalyticsPublicationUnit({ db, publicationId, claim: { item, ownerToken: batch.ownerToken } });
+        units++;
+        current = await db.analyticsPublication.findUnique({ where: { id: publicationId } });
+        if (result.skipped) break;
+      }
+      results.push({ ...result, units });
       if (!current || current.state !== "PENDING") await ackDomainWorkClaim({ db, item, ownerToken: batch.ownerToken });
       else await yieldDomainWorkClaim({ db, item, ownerToken: batch.ownerToken, availableAt: current.availableAt,
         progressCursor: { stage: current.stage, cursor: current.cursor, inputRevision: String(current.inputRevision), updatedAt: current.updatedAt.toISOString() } });

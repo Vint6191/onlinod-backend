@@ -68,3 +68,14 @@ OF и нативные Electron-порты контролируются стен
 Сценарии:225 подписчиков / три страницы; остановка и повторное открытие SQLite между страницами; атомарная видимость опубликованного списка; неизвестные деньги и generic isActive; UI Ignore/Block; смена состава при rescan; потеря progress/complete ACK; обновление имени/суммы и поиск/сортировка по текущим данным; изменение допуска Bump во время preflight; Backend SIGKILL; изоляция моделей; явный пустой terminal source. Обычные паузы и lease-сроки не подменяются. Предел600 секунд. Результат — `evidence/subscriber-acceptance` (JSON, журналы, снимки UI).
 
 Это локальная связанная проверка с одним физическим SQL-сеансом PGlite. Настоящие Windows/Electron, OF и многосессионная конкуренция PostgreSQL ею не подтверждаются. Команда только для разработки; Render build остаётся `npm install && npm run prisma:migrate`.
+
+
+## Home / Analytics / Campaigns / Traffic (161)
+
+`npm run test:analytics-acceptance` использует те же изолированные SQL/browser runtime и переменные, что Subscriber160. Нужны текущие Backend/Desktop, Node22, SQLite для Node и Chromium. Начальные деньги, кампании, Traffic и FanData не создаются в БД напрямую: их записывают реальные сборщики через текущие HTTP lease/progress/complete и серверную публикацию.
+
+Проверяются пустые Home/Overview, сбор дохода двух моделей, payout pagination и возвраты, typed notifications, 51 кампания/52 участия/51 уникальный фанат, потеря Campaign progress ACK, настоящий Overview и accordion, Traffic source/member pagination, неизвестные суммы, стоимость и её currency/revision, восстановление потерянного ответа, переключение периода и модели с задержанным ответом, коррекция существующей транзакции, повторный сбор, SQLite reopen и Backend SIGKILL. Снимки React и JSON записываются в `evidence/analytics-acceptance`. Лимит стенда — 900 секунд; штатные часы, очереди и сроки lease не ускоряются.
+
+Отдельная SQL-проверка публикации: `node scripts/audit/current-publication-quantum-proof.cjs` с `ONLINOD_SQL_PROOF_RUNTIME` и `ONLINOD_SQL_PROOF_OUTPUT`. Проверяет 201 день, ограниченный квант публикации, однодневную публикацию за один допуск, Home и чтение опубликованных earnings в UTC, UTC+3 и America/New_York, а также отсутствие сумм в выдаче без money-доступа. Результат — `evidence/publication-quantum.json`.
+
+Контролируются физические OF-ответы и native capability/session-reconcile порты. Реальных внешних записей нет. Используется один SQL-сеанс PGlite; нативные Windows/Electron, OF и многосессионная конкуренция PostgreSQL остаются отдельной целевой приёмкой. Эти команды нужны только разработчику; обычный Render build остаётся `npm install && npm run prisma:migrate`.

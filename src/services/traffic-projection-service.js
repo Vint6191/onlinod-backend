@@ -1,12 +1,14 @@
 "use strict";
 
 const { runRootCommit } = require("./db-commit-kernel");
+const { performance } = require("node:perf_hooks");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { authorizeTrafficExecutor, enterTrafficProjection } = require("./traffic-projection-authority");
 const { claimDomainWorkBatch, lockDomainWorkClaimForCommit, ackDomainWorkClaim,
   yieldDomainWorkClaim, failDomainWorkClaim } = require("./domain-work-authority-service");
 const PAGE = 100;
 const FACT_PAGE = 25;
+const FAN_QUANTUM = 50;
 const fault = code => Object.assign(new Error(code), { code, status: 409 });
 
 async function ensureTrafficProjection({ db, agencyId, creatorId }) {
@@ -166,26 +168,42 @@ async function runTrafficProjectionUnit({db,item,ownerToken}) {
   return (await runTrafficProjectionItems({db,items:[item],ownerToken}))[0];
 }
 
-async function runTrafficProjectionSweep({ db, limit = 4 }) {
+async function runTrafficProjectionSweep({ db, limit = 4, maxRuntimeMs = 5000 }) {
   const seed = await seedTrafficProjection({ db });
   const results = [];
+  const classBudget = Math.max(1, Math.min(5000, Number(maxRuntimeMs) || 5000)) / 3;
   // Separate queues prevent a large rebuild from starving current observations.
   for (const workClass of ["TRAFFIC_FACT", "TRAFFIC_FAN", "TRAFFIC_BACKFILL"]) {
+    const started = performance.now();
     const facts=workClass==="TRAFFIC_FACT";
+    const fans=workClass==="TRAFFIC_FAN";
     const take=Math.max(1,Math.min(8,Number(limit)||4));
-    const batch = await claimDomainWorkBatch({ db, workClass, limit:facts?Math.min(PAGE,take*FACT_PAGE):take,
-      perAgencyQuantum:facts?FACT_PAGE:2,perPartitionQuantum:facts?FACT_PAGE:1 });
+    // Fan work is partitioned by creator, so quantum=1 made a populated model
+    // wait an entire maintenance rotation between every fan. Admit a bounded
+    // page, retaining a separate fenced transaction for each fan. Each class
+    // has its own time budget so live observations cannot starve backfill.
+    const quantum = facts ? FACT_PAGE : fans ? FAN_QUANTUM : 1;
+    const batch = await claimDomainWorkBatch({ db, workClass, limit:facts||fans?Math.min(PAGE,take*quantum):take,
+      perAgencyQuantum:facts||fans?quantum:2,perPartitionQuantum:quantum });
     const groups=[];
     for(const item of batch.items||[]) {
       let group=facts&&groups.find(rows=>rows.length<FACT_PAGE && rows[0].agencyId===item.agencyId && rows[0].creatorId===item.creatorId);
       if(!group){group=[];groups.push(group);}group.push(item);
     }
     for (const items of groups) {
+      if (performance.now() - started >= classBudget) {
+        for (const item of items) await yieldDomainWorkClaim({ db, item, ownerToken: batch.ownerToken });
+        continue;
+      }
       if(items.length>1) {
         try {results.push(...await runTrafficProjectionItems({db,items,ownerToken:batch.ownerToken}));continue;}
         catch (_) { /* The whole batch rolled back. Isolate a bad/stolen item below. */ }
       }
       for (const item of items) {
+        if (performance.now() - started >= classBudget) {
+          await yieldDomainWorkClaim({ db, item, ownerToken: batch.ownerToken });
+          continue;
+        }
         try { results.push(await runTrafficProjectionUnit({ db, item, ownerToken: batch.ownerToken })); }
         catch (error) {
           await failDomainWorkClaim({ db, item, ownerToken: batch.ownerToken, error });

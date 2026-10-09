@@ -308,6 +308,16 @@ function sameScanWindow(job, identityParams) {
     && String(params.sourceTimezone || "") === ANALYTICS_SOURCE_TIMEZONE;
 }
 
+function overlappingScanWindow(job, identityParams) {
+  const params = job?.params || {};
+  return Number(params.analyticsContractVersion) === ANALYTICS_CONTRACT_VERSION
+    && params.sourceTimezone === ANALYTICS_SOURCE_TIMEZONE
+    && /^\d{4}-\d{2}-\d{2}$/.test(params.scanFrom || '')
+    && /^\d{4}-\d{2}-\d{2}$/.test(params.scanTo || '')
+    && params.scanFrom <= params.scanTo
+    && params.scanFrom <= identityParams.scanTo && params.scanTo >= identityParams.scanFrom;
+}
+
 async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, scanTo, collectionReason, priority, now }) {
   const identityParams = {
     analyticsContractVersion: ANALYTICS_CONTRACT_VERSION,
@@ -361,7 +371,12 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           leaseRevision: true,
         },
       });
-      const existing = active.find((job) => sameScanWindow(job, identityParams)) || null;
+      // Daily rows belong to one current scan. Overlapping runs must not replace
+      // each other's rows while a server-owned publication is still verifying
+      // them. Keep the existing contract immutable; the durable demand replans
+      // any uncovered days after it publishes. This shares the planner lock.
+      const existing = active.find((job) => sameScanWindow(job, identityParams))
+        || active.find((job) => overlappingScanWindow(job, identityParams)) || null;
       if (existing) {
         const demand = await updatePlannedJobDemand({
           db: tx,
@@ -377,7 +392,8 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           job: demand.job || existing,
           created: false,
           publish: demand.updated === true && String((demand.job || existing).status) === "SCHEDULED",
-          reason: demand.updated ? "active_window_merged" : "active_window_reused",
+          reason: !sameScanWindow(existing, identityParams) ? "active_window_overlap_deferred"
+            : demand.updated ? "active_window_merged" : "active_window_reused",
         };
       }
 

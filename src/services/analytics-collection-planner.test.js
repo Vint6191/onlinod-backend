@@ -17,6 +17,25 @@ function isoDay(value) {
   return new Date(value).toISOString().slice(0, 10);
 }
 
+for (const [label, from, to] of [['covered', '2026-09-07', '2026-09-13'], ['partially overlapping', '2026-08-30', '2026-09-04']]) {
+  test(`${label} earnings demand waits for an active scan instead of invalidating its publication`, async () => {
+    for (const status of ['SCHEDULED', 'CLAIMED', 'PUBLISHING']) {
+      let current = { id: 'active', idempotencyKey: 'original', agencyId: 'a', creatorId: 'c', jobKey: 'fetch_earnings',
+        status, priority: 100, nextRunAt: new Date('2026-09-01'), leaseRevision: 1,
+        params: { analyticsContractVersion: 1, scanFrom: '2026-09-01', scanTo: '2026-09-30', sourceTimezone: 'UTC', requestedAt: '2026-09-01T00:00:00Z' } };
+      const original = structuredClone(current.params);
+      const db = { $transaction: async work => work({ ...db, $transaction: undefined }), $executeRawUnsafe: async () => 1,
+        jobInstance: { findMany: async () => [current], findUnique: async () => current,
+          updateMany: async ({ data }) => { current = { ...current, ...data }; return { count: 1 }; },
+          createMany: async () => { throw Error('An overlapping scan must not be created'); } } };
+      const result = await planner.planWindow({ db, creatorId: 'c', agencyId: 'a', displayRangeKey: '7d',
+        scanFrom: new Date(from), scanTo: new Date(to), collectionReason: 'INTERACTIVE_REFRESH', priority: 100, now: new Date('2026-09-30') });
+      assert.equal(result.created, false); assert.equal(result.job.id, 'active');
+      assert.equal(result.reason, 'active_window_overlap_deferred'); assert.deepEqual(current.params, original);
+    }
+  });
+}
+
 function daysInclusive(start, end) {
   const rows = [];
   for (let day = new Date(start); day <= end; day = new Date(day.getTime() + 86_400_000)) rows.push(new Date(day));

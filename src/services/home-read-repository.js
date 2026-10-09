@@ -17,17 +17,17 @@ function pageInput({ after = null, limit = 50 } = {}) {
 // aggregate and at most 90 chart points; no creator-sized arrays cross the wire.
 function revenueSql(source = 'visible') {
   const { publishedEarningsJoins } = require('./published-earnings-read-repository');
-  return `, periods AS (SELECT 0 AS period,$6::date AS start_day,$7::date AS end_day
-    UNION ALL SELECT 1,$8::date,$9::date),
+  return `, periods AS (SELECT 0 AS period,($6::timestamptz AT TIME ZONE 'UTC')::date AS start_day,($7::timestamptz AT TIME ZONE 'UTC')::date AS end_day
+    UNION ALL SELECT 1,($8::timestamptz AT TIME ZONE 'UTC')::date,($9::timestamptz AT TIME ZONE 'UTC')::date),
   daily AS MATERIALIZED (
     SELECT d."creatorId",r.period,d."date",d."totalCents",d."collectedAt",${earningsObservationSql()} AS observed,
-      (${earningsObservationSql()}<=$11::timestamp+interval '5 minutes'
-        AND ${earningsObservationSql()}>=$11::timestamp-(CASE WHEN d."date"=$10::date THEN ${CURRENT_DAY_FRESHNESS_MS}
-          WHEN d."date">=$10::date-30 THEN ${RECENT_CLOSED_FRESHNESS_MS} ELSE ${HISTORICAL_FRESHNESS_MS} END)*interval '1 millisecond') AS fresh
+      (${earningsObservationSql()}<=($11::timestamptz AT TIME ZONE 'UTC')+interval '5 minutes'
+        AND ${earningsObservationSql()}>=($11::timestamptz AT TIME ZONE 'UTC')-(CASE WHEN d."date"=($10::timestamptz AT TIME ZONE 'UTC')::date THEN ${CURRENT_DAY_FRESHNESS_MS}
+          WHEN d."date">=($10::timestamptz AT TIME ZONE 'UTC')::date-30 THEN ${RECENT_CLOSED_FRESHNESS_MS} ELSE ${HISTORICAL_FRESHNESS_MS} END)*interval '1 millisecond') AS fresh
     FROM ${source} c JOIN "CreatorEarningsDaily" d ON d."creatorId"=c."id" AND d."agencyId"=$1 AND d."sourceTimezone"='UTC'
       JOIN periods r ON d."date" BETWEEN r.start_day AND r.end_day
       ${publishedEarningsJoins()}
-    WHERE v."status"='COMPLETE' OR (d."date"=$10::date AND v."status"='PARTIAL')
+    WHERE v."status"='COMPLETE' OR (d."date"=($10::timestamptz AT TIME ZONE 'UTC')::date AND v."status"='PARTIAL')
   ), earnings AS (
     SELECT "creatorId",period,COUNT(*) AS days,COUNT(*) FILTER (WHERE fresh) AS fresh_days,
       SUM("totalCents") AS cents,MAX("collectedAt") AS captured,MIN(observed) AS observed FROM daily GROUP BY "creatorId",period
@@ -47,7 +47,7 @@ function pendingSql(source = 'visible') {
       AND m."deletedAt" IS NULL AND m."deactivatedAt" IS NULL
       JOIN "User" u ON u."id"=m."userId" AND u."disabledAt" IS NULL
     WHERE d."agencyId"=$1 AND d."completedAt" IS NULL AND d."quarantinedAt" IS NULL
-      AND d."coverageFrom"<=$6::date AND d."coverageTo">=$7::date
+      AND d."coverageFrom"<=($6::timestamptz AT TIME ZONE 'UTC')::date AND d."coverageTo">=($7::timestamptz AT TIME ZONE 'UTC')::date
   ), pending AS (
     SELECT c."id" FROM ${source} c WHERE EXISTS (SELECT 1 FROM "JobInstance" j WHERE j."agencyId"=$1
       AND j."creatorId"=c."id" AND j."jobKey"='fetch_earnings' AND j."status" IN ('SCHEDULED','CLAIMED','PUBLISHING'))
@@ -101,7 +101,7 @@ async function readHomeCreatorPage(input) {
     JOIN facts f ON f."id"=c."id" AND f.period=0 LEFT JOIN pending p ON p."id"=c."id" ORDER BY c."id"`
     : `${prefix} SELECT c.*,false AS usable,false AS fresh,false AS pending,(SELECT COUNT(*)>$14 FROM page_candidates) AS more FROM page c ORDER BY c."id"`;
   // Parameters are typed even on the no-money branch (PostgreSQL extended protocol).
-  const query = money ? sql : sql.replace('SELECT c.*,false', 'SELECT $6::date AS unused6,$7::date AS unused7,$8::date AS unused8,$9::date AS unused9,$10::date AS unused10,$11::timestamp AS unused11,c.*,false');
+  const query = money ? sql : sql.replace('SELECT c.*,false', `SELECT ($6::timestamptz AT TIME ZONE 'UTC')::date AS unused6,($7::timestamptz AT TIME ZONE 'UTC')::date AS unused7,($8::timestamptz AT TIME ZONE 'UTC')::date AS unused8,($9::timestamptz AT TIME ZONE 'UTC')::date AS unused9,($10::timestamptz AT TIME ZONE 'UTC')::date AS unused10,($11::timestamptz AT TIME ZONE 'UTC') AS unused11,c.*,false`);
   const rows = await db.$queryRawUnsafe(query,...revenueParams(input),page.after,page.limit+1,page.limit);
   const creators = rows.map(c=>({id:c.id,name:c.displayName,displayName:c.displayName,username:c.username,avatarUrl:c.avatarUrl,status:c.status,remoteId:c.remoteId,
     revenueCents:c.usable?number(c.cents):null,salesCount:null,uniqueFans:null,capturedAt:c.usable?c.captured:null,
