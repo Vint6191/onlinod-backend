@@ -155,7 +155,7 @@ test("INT4.3C direct committed SFS follow creates cleanup with durable ownership
   } finally { loaded.cleanup(); }
 });
 
-test("INT4.3C cleanup validation rejects ambiguous ownership and adopts only prior direct server-proven follow", async () => {
+test("INT4.3C cleanup validation requires current ownership and refuses receipt-only adoption", async () => {
   const candidate = baseCandidate({ state: "UNFOLLOW_DUE", phase: "UNFOLLOW", safetyUnfollowDeliveryId: "cleanup-1" });
   let originalResultCode = "followed_recovered";
   const db = {
@@ -175,9 +175,8 @@ test("INT4.3C cleanup validation rejects ambiguous ownership and adopts only pri
 
     originalResultCode = "followed";
     const adopted = await loaded.service.validateSfsDelivery({ db, delivery: cleanupDelivery(), control: null });
-    assert.equal(adopted.ok, true);
-    assert.equal(adopted.cleanupOwnership.kind, "ADOPTED_SERVER_PROOF");
-    assert.equal(adopted.cleanupOwnership.followDeliveryId, "follow-1");
+    assert.equal(adopted.ok, false);
+    assert.equal(adopted.code, "cleanup_effect_ownership_unproven");
   } finally { loaded.cleanup(); }
 });
 
@@ -210,20 +209,7 @@ test("INT4.3C completed cleanup marks usedForever only with ownership proof", as
   } finally { loaded.cleanup(); }
 });
 
-test("INT4.3C transient paid/comments-disabled skip is not forever and migration heals historical rows", () => {
-  const service = fs.readFileSync(path.join(__dirname, "sfs-service.js"), "utf8");
-  const planner = service.slice(service.indexOf("async function planSfsTargets"), service.indexOf("async function scheduleTargetScan"));
-  const transientAt = planner.indexOf('["paid_target", "comments_disabled"].includes(reason)');
-  assert.ok(transientAt >= 0);
-  const transientBlock = planner.slice(transientAt, transientAt + 850);
-  assert.match(transientBlock, /usedForever:\s*false/);
-  assert.doesNotMatch(transientBlock, /usedForever:\s*true/);
-  assert.match(transientBlock, /completedAt:\s*null/);
 
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260916203000_phase3_sfs_consumption_semantics/migration.sql"), "utf8");
-  assert.match(migration, /"usedForever" = false/);
-  assert.match(migration, /"eligibilityReason" IN \('paid_target', 'comments_disabled'\)/);
-});
 
 test("INT4.3C backend does not convert ambiguous SFS readback into owned AUTOMATION_WRITE_RESULT", () => {
   const source = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");

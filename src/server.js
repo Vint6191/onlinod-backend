@@ -52,7 +52,7 @@ const { createRequestObservabilityMiddleware } = require("./middleware/request-o
 const prisma = require("./prisma");
 const logger = require("./utils/logger");
 const { buildBackendHealthSnapshot } = require("./utils/health-snapshot");
-const { TEAM_CONTROL_PLANE_GENERATION, readTeamControlPlaneReleaseAuthority, readTeamControlPlaneDbFenceStatus } = require("./services/phase2-release-compatibility-authority-service");
+const { readDatabaseContract, assertDatabaseContract } = require("./services/database-contract-service");
 const { startRecurringScheduler, stopRecurringScheduler, getRecurringSchedulerHealthSnapshot } = require("./services/job-scheduler");
 const { createBackendProcessLifecycle } = require("./services/backend-process-lifecycle");
 const lifecycle = createBackendProcessLifecycle({ db: prisma, log: logger });
@@ -142,14 +142,12 @@ app.use(express.static(path.join(__dirname, "..", "public")));
 app.get("/health", async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    // Liveness is deliberately independent from release readiness. A process
-    // in TEAM_CONTROL_PLANE=DRAINING must stay observable while operators
-    // diagnose/repair/activate it. Use /ready for authority-write readiness.
+    // Liveness is independent from the full schema check at /ready.
     return res.json({
       ok: true,
       status: "healthy",
       service: "onlinod-backend",
-      version: "phase7_legacy_storage_v1",
+      version: "onlinod_current_v1",
       database: "ok",
       time: new Date().toISOString(),
     });
@@ -159,7 +157,7 @@ app.get("/health", async (_req, res) => {
       ok: false,
       status: "unhealthy",
       service: "onlinod-backend",
-      version: "phase7_legacy_storage_v1",
+      version: "onlinod_current_v1",
       database: "error",
       time: new Date().toISOString(),
     });
@@ -169,54 +167,21 @@ app.get("/health", async (_req, res) => {
 app.get("/ready", async (_req, res) => {
   try {
     await prisma.$queryRaw`SELECT 1`;
-    const [release, dbFence, legacyStorage, archiveIndexes] = await Promise.all([
-      readTeamControlPlaneReleaseAuthority(prisma),
-      readTeamControlPlaneDbFenceStatus(prisma),
-      require("./services/phase7-legacy-storage-service").storageState(prisma),
-      require("../scripts/database/phase7-legacy-storage-indexes").ensureIndexes(prisma),
-    ]);
-    const teamReady = Boolean(
-      release
-      && release.requiredGeneration === TEAM_CONTROL_PLANE_GENERATION
-      && String(release.activationState || "").toUpperCase() === "ACTIVE"
-      && dbFence.ready && legacyStorage.ready && archiveIndexes.ready
-    );
-    return res.status(teamReady ? 200 : 503).json({
-      ok: teamReady,
-      status: teamReady ? "ready" : "not_ready",
-      service: "onlinod-backend",
-      version: "phase7_legacy_storage_v1",
-      database: "ok",
-      legacyStorage,
-      targetReady: teamReady && legacyStorage.targetReady,
-      teamControlPlane: {
-        ready: teamReady,
-        expectedGeneration: TEAM_CONTROL_PLANE_GENERATION,
-        requiredGeneration: release?.requiredGeneration || null,
-        state: release?.activationState || null,
-        drainStartedAt: release?.drainStartedAt || null,
-        activatedAt: release?.activatedAt || null,
-        dbFence: {
-          ready: dbFence.ready,
-          expectedTriggerCount: dbFence.expectedTriggerCount,
-          observedTriggerCount: dbFence.observedTriggerCount,
-          missingTriggers: dbFence.missingTriggers,
-          mismatchedTriggers: dbFence.mismatchedTriggers,
-          unexpectedTriggers: dbFence.unexpectedTriggers,
-          functionProofValid: dbFence.functionProofValid,
-        },
-      },
+    const schema = await readDatabaseContract(prisma);
+    return res.status(schema.ready ? 200 : 503).json({
+      ok: schema.ready, status: schema.ready ? "ready" : "not_ready",
+      service: "onlinod-backend", version: schema.version, database: "ok", schema,
       time: new Date().toISOString(),
     });
   } catch (err) {
-    console.error("[ready] database/release check failed:", err?.message || err);
+    console.error("[ready] database schema check failed:", err?.message || err);
     return res.status(503).json({
       ok: false,
       status: "not_ready",
       service: "onlinod-backend",
-      version: "phase7_legacy_storage_v1",
+      version: "onlinod_current_v1",
       database: "error",
-      teamControlPlane: { ready: false, expectedGeneration: TEAM_CONTROL_PLANE_GENERATION, requiredGeneration: null, state: null, dbFence: null },
+      schema: { ready: false },
       time: new Date().toISOString(),
     });
   }
@@ -228,29 +193,15 @@ app.get("/health/details", async (_req, res) => {
   }
   try {
     await prisma.$queryRaw`SELECT 1`;
-    const [release, dbFence] = await Promise.all([
-      readTeamControlPlaneReleaseAuthority(prisma),
-      readTeamControlPlaneDbFenceStatus(prisma),
-    ]);
-    const teamReady = Boolean(
-      release
-      && release.requiredGeneration === TEAM_CONTROL_PLANE_GENERATION
-      && String(release.activationState || "").toUpperCase() === "ACTIVE"
-      && dbFence.ready
-    );
+    const schema = await readDatabaseContract(prisma);
     const snapshot = buildBackendHealthSnapshot({ database: "ok" });
-    snapshot.teamControlPlane = {
-      ready: teamReady,
-      expectedGeneration: TEAM_CONTROL_PLANE_GENERATION,
-      authority: release,
-      dbFence,
-    };
+    snapshot.schema = schema;
     snapshot.recurringScheduler = getRecurringSchedulerHealthSnapshot();
     return res.json(snapshot);
   } catch (err) {
-    logger.warn("health details database/release check failed", { error: err?.message || String(err) });
+    logger.warn("health details database schema check failed", { error: err?.message || String(err) });
     const snapshot = buildBackendHealthSnapshot({ database: "error" });
-    snapshot.teamControlPlane = { ready: false, expectedGeneration: TEAM_CONTROL_PLANE_GENERATION, authority: null, dbFence: null };
+    snapshot.schema = { ready: false };
     snapshot.recurringScheduler = getRecurringSchedulerHealthSnapshot();
     return res.status(503).json(snapshot);
   }
@@ -260,7 +211,7 @@ app.get("/api", (_req, res) => {
   res.json({
     ok: true,
     service: "onlinod-backend",
-    version: "phase7_legacy_storage_v1",
+    version: "onlinod_current_v1",
   });
 });
 
@@ -359,6 +310,8 @@ app.use((err, _req, res, _next) => {
 const port = Number(process.env.PORT || 10000);
 
 async function startServer({ own, checkpoint }) {
+  await assertDatabaseContract(prisma);
+  checkpoint();
   // Fail before listening or starting any worker: build success alone cannot
   // establish that executable maintenance, versioned admission and indexes agree.
   await require("./services/external-delivery-runtime-contract").verifyExternalDeliveryRuntime({ db: prisma });

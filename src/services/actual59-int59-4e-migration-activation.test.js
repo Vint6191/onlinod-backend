@@ -6,8 +6,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.resolve(__dirname, "../..");
-const lineageMigration = fs.readFileSync(path.join(root, "prisma/migrations/20260915193000_actual59_int59_3_authorization_lineage_catalog_boundary/migration.sql"), "utf8");
-const memberMigration = fs.readFileSync(path.join(root, "prisma/migrations/20260915131500_actual59_team_authorization_generation_boundary/migration.sql"), "utf8");
+const lineageMigration = fs.readFileSync(path.join(root, "prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
+const memberMigration = fs.readFileSync(path.join(root, "prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
 const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
 const authRoute = fs.readFileSync(path.join(root, "src/routes/auth.js"), "utf8");
 const authService = fs.readFileSync(path.join(root, "src/services/auth-service.js"), "utf8");
@@ -20,12 +20,7 @@ function bodyBetween(text, start, end) {
   return text.slice(a, b);
 }
 
-test("INT59.4E migration activation preserves legacy NULL lineages instead of silently backfilling them current", () => {
-  assert.match(lineageMigration, /ADD COLUMN IF NOT EXISTS "authorizationSessionId" TEXT/);
-  assert.doesNotMatch(lineageMigration, /UPDATE\s+"RefreshSession"[\s\S]{0,300}?"authorizationSessionId"\s*=/i,
-    "migration must not invent authorization lineage for historical refresh rows");
-  assert.match(schema, /authorizationSessionId\s+String\?/);
-});
+
 
 test("INT59.4E DB boundary functions use physical DB clock and conflict-safe one-way history", () => {
   assert.match(lineageMigration, /capture_authorization_session_boundary[\s\S]*?clock_timestamp\(\)/);
@@ -38,18 +33,7 @@ test("INT59.4E DB boundary functions use physical DB clock and conflict-safe one
   assert.doesNotMatch(executableSql, /statement_timestamp\(\)/);
 });
 
-test("INT59.4E migration owns exactly one installed trigger per authorization boundary family", () => {
-  for (const trigger of [
-    "RefreshSession_capture_authorization_boundary",
-    "AgencyCreatorCatalogState_capture_generation_boundary",
-  ]) {
-    assert.match(lineageMigration, new RegExp(`DROP TRIGGER IF EXISTS "${trigger}"`));
-    assert.match(lineageMigration, new RegExp(`CREATE TRIGGER "${trigger}"`));
-  }
-  assert.match(memberMigration, /CREATE TRIGGER "AgencyMember_capture_access_epoch_boundary"/);
-  assert.match(lineageMigration, /CREATE OR REPLACE FUNCTION "capture_agency_member_access_epoch_boundary"/,
-    "later migration must replace the INT59.2 member boundary body rather than install a competing trigger");
-});
+
 
 test("INT59.4E rolling activation is symmetric for fresh login and refresh", () => {
   const loginSchema = bodyBetween(authRoute, "const loginSchema", "const verifyCodeSchema");

@@ -1,7 +1,7 @@
 "use strict";
 
 const { randomUUID } = require("node:crypto");
-const release = require("../../src/services/phase2-release-compatibility-authority-service");
+const release = require("../../src/services/database-write-contract-service");
 
 async function authorizeFixtureTransaction(tx, { team = false, creator = false, domainExecutor = false } = {}) {
   if (team) await release.assertTeamControlPlaneWriteAdmission(tx);

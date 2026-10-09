@@ -12,8 +12,6 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
  const kernel=require(path.join(root,'src/services/db-commit-kernel')),work=require(path.join(root,'src/services/domain-work-authority-service')),
   projection=require(path.join(root,'src/services/campaign-read-projection-service')),read=require(path.join(root,'src/services/campaign-read-repository')),
   policy=require(path.join(root,'src/services/campaign-projection-policy'));
- const rollout=require(path.join(root,'scripts/database/phase3-domain-work-claim-online-rollout'));
- await rollout.withRolloutAuthority(db,async()=>{await rollout.runPreflight(db);await rollout.activateTopology(db,{pauseMs:0});});
  async function write(fn){return kernel.runRootCommit(db,async({tx})=>{await require(path.join(root,'src/services/campaign-causal-activation-service')).enterCampaignWriterGeneration({db:tx});return fn(tx);},{profile:'JOB_CHUNK'});}
  const page=()=>read.readCampaignPage({db,creatorId:s.creatorId,rangeKey:'30d'});
  async function drain(){for(let i=0;i<160;i++){

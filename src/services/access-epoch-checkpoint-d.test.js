@@ -8,7 +8,7 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "..", "..");
 const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
 const schema = read("prisma/schema.prisma");
-const migration = read("prisma/migrations/20260827113000_desktop_access_epoch_bootstrap/migration.sql");
+const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
 const creators = read("src/routes/creators.js");
 const admin = read("src/services/admin-operational-command-service.js");
 const adminRoute = read("src/routes/admin.js");
@@ -17,13 +17,10 @@ const invitations = read("src/routes/invitations.js");
 const desktopRoute = read("src/routes/desktop.js");
 const server = read("src/server.js");
 
-test("D accessEpoch is a durable monotonic AgencyMember field", () => {
-  assert.match(schema, /accessEpoch\s+Int\s+@default\(1\)/);
-  assert.match(migration, /ALTER TABLE "AgencyMember"[\s\S]*ADD COLUMN "accessEpoch" INTEGER NOT NULL DEFAULT 1/);
-});
+
 
 test("D creator-set changes use bounded catalog generation while scoped revoke still bumps affected member epochs", () => {
-  const catalogMigration = read("prisma/migrations/20260912004000_phase2_actual56_creator_management_catalog_authority/migration.sql");
+  const catalogMigration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
   assert.match(creators, /createCreatorDraft\(\{[\s\S]*beforeCreate: async \(tx\) => \{[\s\S]*assertHumanCreatorCreateAuthority/);
   assert.doesNotMatch(creators, /bumpAgencyAccessEpoch|publishAgencyAccessEpochEvents|scanRowsById/);
   assert.match(catalogMigration, /AgencyCreatorCatalogState/);

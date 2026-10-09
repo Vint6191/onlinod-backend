@@ -17,10 +17,7 @@ test("V20.22 P3 schema has one canonical session architecture and no backend Chr
   assert.doesNotMatch(root, /enforceOpaqueSecrets|enforcedAt/);
 });
 
-test("V20.22 P3 migration destroys legacy tables and removes migration columns/types", () => {
-  const migration = read("prisma/migrations/20260824223000_remove_legacy_session_subsystem_v20_22/migration.sql");
-  for (const token of ["DROP TABLE IF EXISTS \"AccessSnapshot\"", "DROP TABLE IF EXISTS \"CreatorConnectSession\"", "DROP COLUMN IF EXISTS \"partition\"", "DROP COLUMN IF EXISTS \"sessionMode\"", "DROP TYPE IF EXISTS \"CreatorSessionMode\""]) assert.match(migration, new RegExp(token.replace(/[.*+?^${}()|[\\]\\]/g, "\\$&")));
-});
+
 
 test("V20.22 P3 production sources no longer query legacy AccessSnapshot/CreatorConnectSession models", () => {
   for (const rel of ["src/routes/creators.js", "src/routes/workspace.js", "src/routes/admin.js", "src/services/creator-agency-removal.js", "src/services/job-lease-service.js", "src/services/client-e2e-keyring-service.js"]) {

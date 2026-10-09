@@ -25,14 +25,7 @@ test("legacy enrollment generation is physically absent from the production tree
   assert.equal(packageJson.scripts?.start, "node src/server.js");
 });
 
-test("DB migration is the final active identity uniqueness authority", () => {
-  const migration = read("prisma/migrations/20260831190000_creator_enrollment_authority_cutover/migration.sql");
-  assert.match(migration, /CreatorAccount_active_remote_identity_unique/);
-  assert.match(migration, /ON "CreatorAccount" \("agencyId", "remoteId"\)/);
-  assert.match(migration, /WHERE "deletedAt" IS NULL AND "remoteId" IS NOT NULL/);
-  assert.match(migration, /CreatorAccount_active_username_identity_unique/);
-  assert.match(migration, /lower\(COALESCE\("platformUsername", "enrollmentExpectedUsername", "username"\)\)/);
-});
+
 
 test("connection routes delegate lifecycle authority to one enrollment service", () => {
   const routes = read("src/routes/creators.js");

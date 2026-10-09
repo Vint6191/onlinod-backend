@@ -7,7 +7,7 @@ const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./mana
 const { lockTeamControlPlaneTopology, lockLiveTeamControlPlaneCreators } = require("./team-control-plane-authority-service");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
-const { assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
+const { assertTeamControlPlaneWriteAdmission } = require("./database-write-contract-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const {
   assertOperationalOwnerRemovalSafety,

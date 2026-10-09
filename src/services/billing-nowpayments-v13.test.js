@@ -18,10 +18,10 @@ const routeSource = fs.readFileSync(path.join(root, "src", "routes", "billing.js
 const serverSource = fs.readFileSync(path.join(root, "src", "server.js"), "utf8");
 const adminSource = fs.readFileSync(path.join(root, "src", "routes", "admin.js"), "utf8");
 const schemaSource = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
-const migrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20260813143000_nowpayments_billing_v1", "migration.sql"), "utf8");
-const hardeningMigrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20260813190000_nowpayments_billing_hardening_v13_1", "migration.sql"), "utf8");
-const entitlementMigrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20260813223000_per_creator_billing_entitlements_v13_3", "migration.sql"), "utf8");
-const entitlementRepairMigrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20260814002000_billing_v13_3_1_repair", "migration.sql"), "utf8");
+const migrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20261009000000_current_baseline", "migration.sql"), "utf8");
+const hardeningMigrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20261009000000_current_baseline", "migration.sql"), "utf8");
+const entitlementMigrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20261009000000_current_baseline", "migration.sql"), "utf8");
+const entitlementRepairMigrationSource = fs.readFileSync(path.join(root, "prisma", "migrations", "20261009000000_current_baseline", "migration.sql"), "utf8");
 
 function withEnv(values, fn) {
   const previous = {};
@@ -229,40 +229,7 @@ function makeProcessingDb({ failOrderUpdateOnce = false } = {}) {
   return db;
 }
 
-test("V13 Prisma billing schema and migration are additive and every declared model index references real fields", () => {
-  for (const name of ["BillingOrder", "BillingOrderLine", "CreatorBillingEntitlement", "BillingPaymentAttempt", "BillingProviderEvent"]) assert.match(schemaSource, new RegExp(`model ${name}\\s*\\{`));
-  assert.match(schemaSource, /billingOrders\s+BillingOrder\[\]/);
-  assert.match(migrationSource, /CREATE TABLE "BillingOrder"/);
-  assert.match(migrationSource, /CREATE TABLE "BillingPaymentAttempt"/);
-  assert.match(migrationSource, /CREATE TABLE "BillingProviderEvent"/);
-  assert.match(schemaSource, /@@unique\(\[provider, testMode, providerInvoiceId\]\)/);
-  assert.match(schemaSource, /@@unique\(\[provider, testMode, providerPaymentId\]\)/);
-  assert.match(schemaSource, /checkoutKey\s+String\?/);
-  assert.match(schemaSource, /@@unique\(\[agencyId, provider, testMode, checkoutKey\]\)/);
-  assert.match(migrationSource, /BillingOrder_provider_testMode_providerInvoiceId_key/);
-  assert.match(migrationSource, /BillingPaymentAttempt_provider_testMode_providerPaymentId_key/);
-  assert.match(hardeningMigrationSource, /ADD COLUMN "checkoutKey" TEXT/);
-  assert.match(hardeningMigrationSource, /BillingOrder_agencyId_provider_testMode_checkoutKey_key/);
-  assert.match(entitlementMigrationSource, /CREATE TABLE "BillingOrderLine"/);
-  assert.match(entitlementMigrationSource, /CREATE TABLE "CreatorBillingEntitlement"/);
-  assert.match(entitlementMigrationSource, /ADD COLUMN "requestHash" TEXT/);
-  assert.match(entitlementMigrationSource, /"currentPeriodEnd" > CURRENT_TIMESTAMP/);
-  assert.doesNotMatch(migrationSource + hardeningMigrationSource + entitlementMigrationSource, /\bDROP\s+(?:TABLE|COLUMN)\b|\bTRUNCATE\b|\bDELETE\s+FROM\b/i);
 
-  const models = parsePrismaModelFields(schemaSource);
-  const errors = [];
-  for (const [name, model] of models) {
-    const indexRe = /@@(?:index|unique|id)\s*\(\s*\[([^\]]+)\]/g;
-    let m;
-    while ((m = indexRe.exec(model.body))) {
-      for (const raw of m[1].split(",")) {
-        const field = raw.trim().match(/^(\w+)/)?.[1];
-        if (field && !model.fields.has(field)) errors.push(`${name}.${field}`);
-      }
-    }
-  }
-  assert.deepEqual(errors, []);
-});
 
 test("NOWPayments sandbox/live configuration never leaks secrets and uses official default API bases", () => withEnv({
   NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NOWPAYMENTS_API_BASE: undefined,
@@ -872,18 +839,7 @@ test("V13.3 expiry reconciliation repairs a stale agency period from the latest 
   assert.equal(write.currentPeriodEnd.toISOString(), activeUntil.toISOString());
 });
 
-test("V13.3 migration relationalizes legacy V13 order lines, backfills paid creator access first and never revives an expired legacy period", () => {
-  assert.match(entitlementMigrationSource, /INSERT INTO "BillingOrderLine"/);
-  assert.match(entitlementMigrationSource, /ON CONFLICT \("orderId", "creatorId"\) DO NOTHING/);
-  assert.match(entitlementMigrationSource, /jsonb_array_elements\(COALESCE\(o\."pricingSnapshot"->'lines'/);
-  assert.match(entitlementMigrationSource, /o\."status" = 'PAID'/);
-  assert.match(entitlementMigrationSource, /o\."activatedAt" IS NOT NULL/);
-  assert.match(entitlementMigrationSource, /ls\."currentPeriodEnd" > CURRENT_TIMESTAMP/);
-  assert.match(entitlementMigrationSource, /JOIN "CreatorBillingProfile" bp/);
-  assert.match(entitlementMigrationSource, /ls\."billingMode" <> 'FREE_INTERNAL'/);
-  assert.match(entitlementMigrationSource, /'PAYMENT'::"BillingEntitlementSource"/);
-  assert.match(entitlementMigrationSource, /'LEGACY'::"BillingEntitlementSource"/);
-});
+
 
 test("V13.3.1 refund never resurrects a payment predecessor that was already refunded", async () => {
   const activatedA = new Date("2026-08-01T00:00:00Z");
@@ -1072,14 +1028,7 @@ test("V13.3.1 aggregate lookup excludes soft-deleted creators", async () => {
   assert.deepEqual(entitlementWhere.creator, { agencyId: "agency-1", deletedAt: null });
 });
 
-test("V13.3.1 repair migration activates migrated lines and makes already-refunded legacy owners fail closed", () => {
-  assert.match(entitlementRepairMigrationSource, /UPDATE "BillingOrderLine" l[\s\S]*"activatedAt" = o\."activatedAt"/);
-  assert.match(entitlementRepairMigrationSource, /"coreGrantedUntil" = e\."coreValidUntil"/);
-  assert.match(entitlementRepairMigrationSource, /e\."coreLastOrderId" = o\."id"[\s\S]*o\."status" = 'REFUNDED'/);
-  assert.match(entitlementRepairMigrationSource, /"coreValidUntil" = NULL/);
-  assert.match(entitlementRepairMigrationSource, /"refundedAt" = COALESCE/);
-  for (const destructive of [/DROP TABLE/i, /DROP COLUMN/i, /TRUNCATE/i, /DELETE FROM/i]) assert.doesNotMatch(entitlementRepairMigrationSource, destructive);
-});
+
 
 test("V13.3.2 billing entitlement mutations serialize on the agency row before touching creator grants", async () => {
   const service = loadEntitlementService({});

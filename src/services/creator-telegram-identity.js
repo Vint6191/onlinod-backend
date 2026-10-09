@@ -4,7 +4,7 @@ const { runDbTransaction } = require("./db-transaction-service");
 
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
 const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
-const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
+const { authorizeCreatorAccountWrite } = require("./database-write-contract-service");
 
 function normalizeTelegramUserId(value) {
   const text = String(value ?? "").trim();

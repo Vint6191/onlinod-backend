@@ -67,7 +67,7 @@ const { effectiveBillingState, liveEntitlementEnd, readBillingDashboard } = requ
 const { catalogForPolicy, configuredPrices } = require("../services/billing-catalog-service");
 const { readCommercialPolicy } = require("../services/billing-commercial-policy-service");
 const { retireCreatorWithinTransaction, publishCreatorRetirementControlEvents } = require("../services/creator-lifecycle-authority-service");
-const { assertTeamControlPlaneWriteAdmission } = require("../services/phase2-release-compatibility-authority-service");
+const { assertTeamControlPlaneWriteAdmission } = require("../services/database-write-contract-service");
 const { assertAgencyHasOperationalOwner } = require("../services/team-operational-owner-authority-service");
 const {
   removeMember: removeTeamMember,

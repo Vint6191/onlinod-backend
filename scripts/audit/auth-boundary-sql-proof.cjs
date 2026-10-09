@@ -4,14 +4,14 @@ const root=path.resolve(__dirname,'../..'),load=createRequire(path.join(root,'pa
 const runtimePath=process.env.ONLINOD_SQL_PROOF_RUNTIME;
 if(!runtimePath)throw new Error('Set ONLINOD_SQL_PROOF_RUNTIME to an isolated local package containing @electric-sql/pglite and @electric-sql/pglite-socket');
 const {createAdminSqlRuntime}=load('./scripts/test-support/admin-sql-runtime.cjs');
-const keep=setInterval(()=>{},1000),result={ok:false,nativePostgres:false,productionAccessed:false,scope:'real retained SQL/Prisma on disposable PGlite; not native multi-session concurrency',cases:[]};
+const keep=setInterval(()=>{},1000),result={ok:false,nativePostgres:false,productionAccessed:false,scope:'real current SQL/Prisma on disposable PGlite; not native multi-session concurrency',cases:[]};
 (async()=>{let f;try{
  f=await createAdminSqlRuntime({runtimePath});const db=f.db;
  let service=load('./src/services/login-admission-service');const ip='192.0.2.1',email='owner@example.test';
  const count=async()=>db.$queryRawUnsafe('SELECT "id","attempts","windowStartedAt" FROM "LoginAdmissionBucket" ORDER BY "id"');
  const base={db,surface:'admin',ip,email};
  async function caseRun(name,fn){await fn();result.cases.push({name,ok:true});}
- await caseRun('all retained migrations include new admission table',async()=>{assert.ok(f.migrations.includes('20261008220000_login_admission_authority'));assert.equal(await db.loginAdmissionBucket.count(),0);});
+ await caseRun('current baseline includes durable login admission',async()=>{assert.ok(f.migrations.includes('20261009000000_current_baseline'));assert.equal(await db.loginAdmissionBucket.count(),0);});
  await caseRun('10 reservations accepted; 11th rejected; a new service instance sees same durable state',async()=>{
   for(let i=0;i<10;i++)await service.reserveLoginAttempt(base);
   delete require.cache[load.resolve('./src/services/login-admission-service')];service=load('./src/services/login-admission-service');

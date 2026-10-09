@@ -5,12 +5,11 @@ const { randomUUID } = require("node:crypto");
 const {
   assertTeamControlPlaneWriteAdmission,
   authorizeCreatorAccountWrite,
-} = require("../../src/services/phase2-release-compatibility-authority-service");
+} = require("../../src/services/database-write-contract-service");
 
-const PHASE3_CLAIM_TOPOLOGY_MIGRATION = "20260922183000_phase3_a36_domain_work_claim_shard_closure_v1";
-const PHASE3_EXACT_DESTRUCTIVE_CLAIM_MIGRATION = "20260922214500_phase3_a36_destructive_claim_authority_closure_v3";
+const PHASE3_CLAIM_TOPOLOGY_MIGRATION = "20261009000000_current_baseline";
+const PHASE3_EXACT_DESTRUCTIVE_CLAIM_MIGRATION = "20261009000000_current_baseline";
 const PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE = Object.freeze({
-  LEGACY_AGENCY_MARKER: "LEGACY_AGENCY_MARKER",
   EXACT_LIVE_CLAIM: "EXACT_LIVE_CLAIM",
 });
 
@@ -107,26 +106,10 @@ function classifyPhase3PostgresDestructiveFixtureAuthority(row = {}) {
     topologyTablePresent: row.topologyTablePresent === true,
     exactFunctionInstalled: row.exactFunctionInstalled === true,
   };
-  const legacy = !capabilities.topologyMigrationApplied
-    && !capabilities.exactMigrationApplied
-    && !capabilities.topologyTablePresent
-    && !capabilities.exactFunctionInstalled;
-  const exact = capabilities.topologyMigrationApplied
-    && capabilities.exactMigrationApplied
-    && capabilities.topologyTablePresent
-    && capabilities.exactFunctionInstalled;
-  if (!legacy && !exact) {
-    const error = new Error(`Phase3 PostgreSQL fixture schema generation is internally inconsistent: ${JSON.stringify(capabilities)}`);
-    error.code = "PHASE3_POSTGRES_FIXTURE_GENERATION_DRIFT";
-    error.capabilities = capabilities;
-    throw error;
-  }
-  return {
-    mode: exact
-      ? PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.EXACT_LIVE_CLAIM
-      : PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.LEGACY_AGENCY_MARKER,
-    ...capabilities,
-  };
+  if (!Object.values(capabilities).every(Boolean)) throw Object.assign(new Error("Current fixture schema is incomplete"), {
+    code: "PHASE3_POSTGRES_FIXTURE_GENERATION_DRIFT", capabilities,
+  });
+  return { mode: PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.EXACT_LIVE_CLAIM, ...capabilities };
 }
 
 async function resolvePhase3PostgresDestructiveFixtureAuthority(db) {
@@ -162,12 +145,7 @@ async function resolvePhase3PostgresDestructiveFixtureAuthority(db) {
   });
 }
 
-async function installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority(tx, agencyId) {
-  await tx.$queryRawUnsafe(
-    `SELECT set_config('onlinod.phase2_destructive_agency_id',$1,true) AS "agencyId"`,
-    String(agencyId),
-  );
-}
+
 
 async function claimPhase3PostgresAgencyDestructiveFixture(db, agencyId) {
   const id = String(agencyId || "").trim();
@@ -239,20 +217,7 @@ async function cleanupPhase3PostgresAgencyFixture(db, agencyId) {
   const id = String(agencyId || "").trim();
   if (!id) return { agencyDeleted: 0, creatorsDeleted: 0, domainWorkDeleted: 0 };
   const authority = await resolvePhase3PostgresDestructiveFixtureAuthority(db);
-  if (authority.mode === PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.LEGACY_AGENCY_MARKER) {
-    return withPhase3PostgresFixtureAuthority(db, async (tx) => {
-      await installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority(tx, id);
-      const domainWorkDeleted = await drainPhase3PostgresAgencyDomainWork(tx, id);
-      const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
-      await purgePhase3PostgresFixtureTenantResidue(tx, id);
-      const agencyResult = await tx.agency.deleteMany({ where: { id } });
-      return {
-        agencyDeleted: Number(agencyResult?.count || 0),
-        creatorsDeleted: Number(creatorResult?.count || 0),
-        domainWorkDeleted,
-      };
-    }, { maxWait: 10_000, timeout: 120_000 });
-  }
+  
   const domainWorkDeleted = await withPhase3PostgresFixtureAuthority(
     db,
     (tx) => drainPhase3PostgresAgencyDomainWork(tx, id),
@@ -284,24 +249,7 @@ async function cleanupPhase3PostgresFixtureGraph(db, {
   const users = [...new Set((Array.isArray(userIds) ? userIds : []).map((value) => String(value || "").trim()).filter(Boolean))];
   if (!id && !users.length) return { agencyDeleted: 0, creatorsDeleted: 0, domainWorkDeleted: 0, usersDeleted: 0 };
   const authority = id ? await resolvePhase3PostgresDestructiveFixtureAuthority(db) : null;
-  if (id && authority.mode === PHASE3_DESTRUCTIVE_FIXTURE_AUTHORITY_MODE.LEGACY_AGENCY_MARKER) {
-    return withPhase3PostgresFixtureAuthority(db, async (tx) => {
-      await installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority(tx, id);
-      const domainWorkDeleted = await drainPhase3PostgresAgencyDomainWork(tx, id);
-      const creatorResult = await tx.creatorAccount.deleteMany({ where: { agencyId: id } });
-      await purgePhase3PostgresFixtureTenantResidue(tx, id);
-      const agencyResult = await tx.agency.deleteMany({ where: { id } });
-      const userResult = users.length
-        ? await tx.user.deleteMany({ where: { id: { in: users } } })
-        : { count: 0 };
-      return {
-        agencyDeleted: Number(agencyResult?.count || 0),
-        creatorsDeleted: Number(creatorResult?.count || 0),
-        domainWorkDeleted,
-        usersDeleted: Number(userResult?.count || 0),
-      };
-    }, { maxWait: 10_000, timeout: 120_000 });
-  }
+  
   let destructiveClaim = null;
   let predrainedDomainWork = 0;
   if (id) {
@@ -347,7 +295,6 @@ module.exports = {
   createPhase3PostgresActorFixture,
   drainPhase3PostgresAgencyDomainWork,
   resolvePhase3PostgresDestructiveFixtureAuthority,
-  installLegacyPhase3PostgresAgencyDestructiveFixtureAuthority,
   claimPhase3PostgresAgencyDestructiveFixture,
   installPhase3PostgresAgencyDestructiveFixtureAuthority,
   purgePhase3PostgresFixtureTenantResidue,

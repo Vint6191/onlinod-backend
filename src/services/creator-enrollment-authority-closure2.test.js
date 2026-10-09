@@ -321,18 +321,7 @@ test("device-bound profile provenance rejects a mismatched supplied source devic
   );
 });
 
-test("Closure2 schema stores explicit profile observation provenance without fabricating a migration clock", () => {
-  const root = path.join(__dirname, "../..");
-  const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260831210000_creator_enrollment_authority_closure2/migration.sql"), "utf8");
-  assert.match(schema, /platformProfileObservedAt\s+DateTime\?/);
-  assert.match(schema, /platformProfileSourceDeviceId\s+String\?/);
-  assert.match(schema, /platformProfileConnectionGeneration\s+Int\?/);
-  assert.match(migration, /ADD COLUMN "platformProfileObservedAt" TIMESTAMP\(3\)/);
-  assert.match(migration, /ADD COLUMN "platformProfileSourceDeviceId" TEXT/);
-  assert.match(migration, /ADD COLUMN "platformProfileConnectionGeneration" INTEGER/);
-  assert.doesNotMatch(migration, /UPDATE[\s\S]*platformProfileObservedAt/i);
-});
+
 
 test("public revoke and profile routes are wired to live authority and device-bound provenance", () => {
   const routes = fs.readFileSync(path.join(__dirname, "../routes/creator-sessions.js"), "utf8");

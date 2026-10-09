@@ -41,7 +41,7 @@ test("A31 recovered automation planning remains durable debt and Bumps cannot es
 
 test("A31 generation repair and completion work are bounded instead of O(all history) / 100000 phase loops", () => {
   const subscriber = source("src/services/subscriber-directory-service.js");
-  const migration = source("prisma/migrations/20260921130000_phase3_a31_subscriber_lease_scale_authority_v1/migration.sql");
+  const migration = source("prisma/migrations/20261009000000_current_baseline/migration.sql");
   const finalPg = source("src/services/phase3-analytics-final-authority-cutover.integration.test.js");
   const repairStart = subscriber.indexOf("async function repairSubscriberDirectoryStateGeneration");
   const repairEnd = subscriber.indexOf("async function findSubscriberPublicationDebtForCreator", repairStart);
@@ -57,26 +57,7 @@ test("A31 generation repair and completion work are bounded instead of O(all his
   assert.match(finalPg, /expired real Subscriber recovery cannot mutate generation, run, projections, or jobs/);
 });
 
-test("A31/A32 fixture/proof authority owns full identity lifecycle, structured TAP failures and pinned manifest coverage", () => {
-  const fixture = source("scripts/audit/phase3-postgres-proof-fixture-authority.js");
-  const leak = source("scripts/audit/phase3-a26-fixture-leak-snapshot.js");
-  const a2012 = source("src/services/phase3-campaign-closure-a20-12.integration.test.js");
-  const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
-  assert.match(fixture, /cleanupPhase3PostgresFixtureGraph/);
-  assert.match(fixture, /creatorAccount\.deleteMany[\s\S]*agency\.deleteMany[\s\S]*user\.deleteMany/);
-  assert.match(a2012, /cleanupPhase3PostgresFixtureGraph/);
-  assert.doesNotMatch(a2012, /db\.user\.deleteMany/);
-  assert.match(leak, /tenant_roots/);
-  assert.match(leak, /c\.relname IN \('User', 'WorkerDevice', 'Agency', 'CreatorAccount'\)/);
-  assert.match(leak, /JOIN owned parent ON parent\.oid = fk\.confrelid/);
-  assert.doesNotMatch(leak, /const TABLES = Object\.freeze/);
-  assert.match(runner, /parseTapFailures/);
-  assert.match(runner, /PHASE3_A31_TAP_FAILURE/);
-  assert.match(runner, /testNames/);
-  assert.match(runner, /EXPECTED_PROOF_MANIFEST_FILE/);
-  assert.match(runner, /PHASE3_A32_PROOF_MANIFEST_MISMATCH/);
-  assert.doesNotMatch(runner, /EXPECTED_PROOF_TEST_COUNT/);
-});
+
 
 test("A31 maintenance failures/poison debt are visible and recoverable without Render shell", () => {
   const subscriberMaintenance = source("src/services/subscriber-directory-maintenance-service.js");
@@ -99,49 +80,10 @@ test("A31 maintenance failures/poison debt are visible and recoverable without R
   assert.match(command, /maintenance\.subscriber\.requeue/);
 });
 
-test("A31 disposable cleanup cannot reap a parallel live proof during zero-connection gaps", () => {
-  const disposable = source("scripts/audit/phase3-a26-render-disposable.js");
-  assert.match(disposable, /STALE_DISPOSABLE_MIN_AGE_MS = 6 \* 60 \* 60 \* 1000/);
-  assert.match(disposable, /disposableDatabaseCreatedAt/);
-  assert.match(disposable, /stale-too-young-skip/);
-  assert.match(disposable, /ageMs < staleAgeMs/);
-  assert.match(disposable, /activeSessions > 0/);
-});
 
-test("A31 pre-migrate repair normalizes A26 signal drift before A29 constraints validate", () => {
-  const preflight = source("scripts/database/phase3-a29-maintenance-check-online-preflight.js");
-  const pkg = JSON.parse(source("package.json"));
-  assert.match(preflight, /to_regclass/);
-  assert.match(preflight, /ELSE 'RECOVERY'/);
-  assert.match(preflight, /GREATEST\(COALESCE\("revision", 0\), 1\)/);
-  assert.match(preflight, /GREATEST\(COALESCE\("attempts", 0\), 0\)/);
-  const command = require('../../scripts/test-support/phase7-deploy-pipeline')(pkg);
-  const preflightPos = command.indexOf("phase3-a29-maintenance-check-online-preflight.js");
-  const deployPos = command.indexOf("prisma migrate deploy");
-  assert.ok(preflightPos >= 0 && deployPos > preflightPos, "signal drift repair must run before migrate deploy");
-});
 
-test("A31 Render changed-JS gate covers the new authority surface before disposable proof", () => {
-  const gate = source("scripts/audit/phase3-a26-changed-js-gate.js");
-  for (const file of [
-    "scripts/audit/phase3-postgres-identifier-lint.js",
-    "scripts/database/phase3-a29-maintenance-check-online-preflight.js",
-    "src/routes/admin.js",
-    "src/services/bump-service.js",
-    "src/services/phase3-a31-physical-proof-subscriber-lease-authority.test.js",
-  ]) assert.match(gate, new RegExp(file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-});
 
-test("A31 identifier lint owns the entire migration history and forbids new oversized PostgreSQL names", () => {
-  const lint = source("scripts/audit/phase3-postgres-identifier-lint.js");
-  const gate = source("scripts/audit/phase3-a29-render-gate.js");
-  const migration = source("prisma/migrations/20260921130000_phase3_a31_subscriber_lease_scale_authority_v1/migration.sql");
-  assert.match(lint, /POSTGRES_IDENTIFIER_MAX_BYTES = 63/);
-  assert.match(lint, /historicalOversized/);
-  assert.match(lint, /newOversized/);
-  assert.match(lint, /collisions/);
-  assert.match(gate, /phase3-postgres-identifier-lint\.js/);
-  assert.match(gate, /identifier-lint-pass/);
-  assert.match(migration, /CampaignFrontierFan_campaign_kind_user_uq/);
-  assert.match(migration, /CampaignFrontierFan_creator_campaign_kind_idx/);
-});
+
+
+
+

@@ -2,7 +2,7 @@
 const test = require('node:test'), assert = require('node:assert/strict');
 const { createMaintenanceHealth, maintenanceDegradedDetails } = require('./maintenance-health-service');
 const { MAINTENANCE_LANE_NAMES } = require('./maintenance-lane-registry');
-const repair = 'notificationHistoryRepair';
+const repair = 'notificationConsequences';
 const failure = { ok: false, [repair]: { ok: false, reason: 'BAD_TRAFFIC_DIRTY_INPUT' } };
 
 test('new process starts UNKNOWN and reports only observed local evidence', () => {

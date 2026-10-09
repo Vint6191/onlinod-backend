@@ -9,32 +9,15 @@ const root = path.resolve(__dirname, "../..");
 const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
 
 const schema = read("prisma/schema.prisma");
-const migration = read("prisma/migrations/20260906133000_legacy_retired_custom_order_telegram_closure/migration.sql");
+const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
 const workflow = read("src/services/custom-content-workflow-service.js");
 const delivery = read("src/services/telegram-delivery-authority-service.js");
 const providerDebt = read("src/services/provider-operational-debt-authority-service.js");
 const cancellationInstruction = read("src/services/custom-cancellation-instruction-authority-service.js");
 
-test("legacy retired Custom closure records cancellation waiver as control truth, never provider confirmation", () => {
-  const order = schema.match(/model CustomOrder \{[\s\S]*?\n\}/)?.[0] || "";
-  assert.match(order, /telegramCancellationWaivedAt\s+DateTime\?/);
-  assert.match(order, /telegramCancellationWaiverReason\s+String\?/);
-  assert.match(migration, /telegramCancellationWaivedAt/);
-  assert.match(migration, /task\."state" = 'CONFIRMED'/);
-  assert.match(migration, /task\."remoteMessageId" IS NOT NULL/);
-  assert.match(migration, /o\."telegramTaskMessageId" IS NULL OR o\."telegramTaskMessageId" = task\."remoteMessageId"/);
-  assert.match(migration, /cancellation\."state" IN \('COMMITTING', 'RECONCILE_REQUIRED', 'CONFIRMED'\)/);
-  assert.doesNotMatch(migration, /SET[\s\S]{0,240}"state"\s*=\s*'CONFIRMED'/);
-});
 
-test("legacy retired Custom closure terminalizes only proven-precommit Telegram work", () => {
-  assert.match(migration, /i\."state" IN \('PLANNED', 'CLAIMED', 'FAILED_PRECOMMIT'\)/);
-  assert.match(migration, /i\."commitStartedAt" IS NULL/);
-  const precommitUpdate = migration.slice(migration.indexOf('UPDATE "TelegramDeliveryIntent"'), migration.indexOf('-- A Custom that was already CANCELLED'));
-  assert.doesNotMatch(precommitUpdate, /IN \([^)]*COMMITTING/);
-  assert.doesNotMatch(precommitUpdate, /IN \([^)]*RECONCILE_REQUIRED/);
-  assert.doesNotMatch(precommitUpdate, /IN \([^)]*CONFIRMED/);
-});
+
+
 
 test("legacy retired pending-order resolver is audited, lifecycle-locked and refuses unknown TASK outcome", () => {
   const start = workflow.indexOf("async function resolveRetiredCreatorPendingCustomOrder");

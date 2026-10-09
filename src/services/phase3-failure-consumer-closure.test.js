@@ -82,12 +82,11 @@ test("Phase3 closure: active_free never enters the paid audience, irrespective o
 test("Phase3 closure: executor activation shares one generation and DB prevents rollback to the infinite retry worker", () => {
   const root = path.resolve(__dirname, "../..");
   const read = (name) => fs.readFileSync(path.join(root, name), "utf8");
-  const migration = read("prisma/migrations/20260923210000_phase3_failure_consumer_closure_v1/migration.sql");
-  const { DOMAIN_WORK_EXECUTOR_GENERATION } = require("./phase2-release-compatibility-authority-service");
+  const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
+  const { DOMAIN_WORK_EXECUTOR_GENERATION } = require("./database-write-contract-service");
   assert.equal(DOMAIN_WORK_EXECUTOR_GENERATION, "phase3_domain_executor_v6_failure_policy");
   assert.ok(migration.includes(`OLD."requiredGeneration"='${DOMAIN_WORK_EXECUTOR_GENERATION}'`));
   assert.match(migration, /PHASE3_DOMAIN_EXECUTOR_DOWNGRADE_FORBIDDEN/);
-  assert.match(read("scripts/database/phase3-domain-work-claim-online-rollout.js"), /require\("\.\.\/\.\.\/src\/services\/phase2-release-compatibility-authority-service"\)/);
   assert.doesNotMatch(read("src/services/bump-service.js"), /where\.subscriptionType|where\.lastSeenIsNull|subscriberScanItem\.count/);
   assert.match(read("src/services/bump-service.js"), /buildFanCurrentFieldFence\(current, bumpRequiredFields\(source\)\)/);
   const actions = read("src/services/automation-action-delivery-service.js");

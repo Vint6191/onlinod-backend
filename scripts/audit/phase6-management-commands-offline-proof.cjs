@@ -47,9 +47,6 @@ async function main() {
     await engine.exec("DISCARD ALL");
     console.log("PROOF_WIRE_RESET");
     await engine.exec("SET TIME ZONE 'UTC'");
-    await engine.exec(
-      `UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`
-    );
     console.log("PROOF_FIXTURE_DDL_READY");
     require.cache[require.resolve("../../src/prisma")] = { exports: db };
     const { executeManagementCommand } = require("../../src/services/management-command-service");
@@ -67,7 +64,7 @@ async function main() {
     async function seed() {
       return db.$transaction(async (tx) => {
         await generation(tx);
-        await require("../../src/services/phase2-release-compatibility-authority-service").authorizeCreatorAccountWrite(
+        await require("../../src/services/database-write-contract-service").authorizeCreatorAccountWrite(
           tx
         );
         const tag = "d6-" + ++seq;
@@ -463,7 +460,7 @@ async function main() {
       await run(s, c);
       await db.$transaction(async (tx) => {
         await generation(tx);
-        await require("../../src/services/phase2-release-compatibility-authority-service").authorizeCreatorAccountWrite(
+        await require("../../src/services/database-write-contract-service").authorizeCreatorAccountWrite(
           tx
         );
         await tx.creatorAccount.update({ where: { id: s.creatorId }, data: { notes: "x".repeat(260 * 1024) } });

@@ -7,7 +7,7 @@ const path = require("node:path");
 const ROOT = path.resolve(__dirname, "../..");
 const MIGRATIONS = path.join(ROOT, "prisma", "migrations");
 const POSTGRES_IDENTIFIER_MAX_BYTES = 63;
-const LEGACY_CUTOFF = "20260921111500_phase3_a30_constraint_name_render_gate_repair_v1";
+const LEGACY_CUTOFF = "20261009000000_current_baseline";
 
 function quotedIdentifiers(sql) {
   return [...String(sql || "").matchAll(/"([^"]+)"/g)].map((match) => match[1]);

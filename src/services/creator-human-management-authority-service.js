@@ -1,7 +1,7 @@
 "use strict";
 
 const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./management-commit-authority-service");
-const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
+const { authorizeCreatorAccountWrite } = require("./database-write-contract-service");
 
 function codedError(code, message, status = 409, details = null) {
   const error = Object.assign(new Error(message), { code, status });

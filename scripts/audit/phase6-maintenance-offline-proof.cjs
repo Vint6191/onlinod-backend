@@ -13,13 +13,13 @@ const { PGlite } = require(process.env.ONLINOD_PGLITE_MODULE || '@electric-sql/p
 const admission = require('../../src/services/phase2-maintenance-admission-service');
 const lanes = admission.MAINTENANCE_LANE_NAMES;
 const ROOT = path.resolve(__dirname,'../..');
-const migration = fs.readFileSync(path.join(ROOT,'prisma/migrations/20260929154000_phase6_maintenance_progress_v1/migration.sql'),'utf8')
-  + ['20261001000000_analytics_publication_authority_v1','20261001113000_campaign_read_projection_v1'].map(name => {
+const migration = fs.readFileSync(path.join(ROOT,'prisma/migrations/20261009000000_current_baseline/migration.sql'),'utf8')
+  + ['20261009000000_current_baseline','20261009000000_current_baseline'].map(name => {
     const sql=fs.readFileSync(path.join(ROOT,'prisma/migrations',name,'migration.sql'),'utf8');
     return '\nBEGIN;\n'+sql.slice(sql.indexOf('INSERT INTO "MaintenanceAdmissionClassState"'));
   }).join('\n')
-  + fs.readFileSync(path.join(ROOT,'prisma/migrations/20261004220000_maintenance_registry_v4/migration.sql'),'utf8')
-  + fs.readFileSync(path.join(ROOT,'prisma/migrations/20261005001000_external_delivery_maintenance_v5/migration.sql'),'utf8');
+  + fs.readFileSync(path.join(ROOT,'prisma/migrations/20261009000000_current_baseline/migration.sql'),'utf8')
+  + fs.readFileSync(path.join(ROOT,'prisma/migrations/20261009000000_current_baseline/migration.sql'),'utf8');
 const scheduler = fs.readFileSync(path.join(ROOT,'src/services/job-scheduler.js'),'utf8');
 function adapter(pg,{rollback=false}={}) {
  let transactionOpen=false;const trace=[];

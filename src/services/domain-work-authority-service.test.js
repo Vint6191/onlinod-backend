@@ -404,33 +404,12 @@ test("A5/A18 foundation: partition fairness admits valid work and future due wor
 });
 
 
-test("A46: retired Actual52 maintenance owner drains before new DomainWork can execute", async () => {
-  const fx = makeDb();
-  const t0 = new Date("2026-09-10T00:00:00.000Z");
-  await authority.publishDomainWork({ db: fx.db, ...base, availableAt: t0 });
-
-  fx.db.phase2LegacyExecutorFence = {
-    async findMany() { return [{ laneKey: "provider_operational_dirty_v1" }]; },
-  };
-  let legacyOwner = "actual52-worker";
-  fx.db.maintenanceLaneState = {
-    async findMany() {
-      return legacyOwner ? [{ key: "provider_operational_dirty_v1", generation: "provider_operational_debt_v1", ownerToken: legacyOwner, leaseUntil: new Date(t0.getTime() + 60_000) }] : [];
-    },
-  };
-
-  const blocked = await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, ownerToken: "new-worker", fallbackNow: t0 });
-  assert.equal(blocked.items.length, 0);
-  assert.equal(blocked.skipped, true);
-  assert.equal(blocked.reason, "legacy_executor_drain");
-  assert.equal(fx.rows.values().next().value.state, authority.STATE.READY);
-
-  // The already-held Actual52 unit is allowed to finish; the migration trigger
-  // prevents it (or any other old replica) from acquiring a new owner token.
-  legacyOwner = null;
-  const admitted = await authority.claimDomainWorkBatch({ db: fx.db, workClass: base.workClass, ownerToken: "new-worker", fallbackNow: new Date(t0.getTime() + 1_000) });
-  assert.equal(admitted.items.length, 1);
-  assert.equal(admitted.items[0].ownerToken, "new-worker");
+test("current work claims without consulting a retired fleet", async () => {
+ const fx=makeDb(),t0=new Date('2026-09-10T00:00:00Z');
+ await authority.publishDomainWork({db:fx.db,...base,availableAt:t0});
+ Object.defineProperty(fx.db,'phase2LegacyExecutorFence',{get(){throw Error('retired authority accessed');}});
+ const claim=await authority.claimDomainWorkBatch({db:fx.db,workClass:base.workClass,ownerToken:'current-worker',fallbackNow:t0});
+ assert.equal(claim.items.length,1);assert.equal(claim.items[0].ownerToken,'current-worker');
 });
 
 test("F55-04: bounded repair may preserve a semantic cursor across a newer live-tail revision", async () => {

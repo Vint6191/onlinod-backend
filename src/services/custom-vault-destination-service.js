@@ -7,7 +7,7 @@ const { requireCreatorAccess } = require("../middleware/automation-permissions")
 const { canUsePermission } = require("./team-access-control");
 const { lockCustomExecutionDefaults } = require("./custom-content-pipeline-authority-service");
 const { assertCustomManagementCreatorAccess } = require("./custom-management-access-authority-service");
-const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
+const { authorizeCreatorAccountWrite } = require("./database-write-contract-service");
 
 const MAX_FOLDER_ID = 180;
 

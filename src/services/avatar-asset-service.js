@@ -1,7 +1,7 @@
 "use strict";
 const { createHash } = require("node:crypto");
 const { fail } = require("./management-command-contract");
-const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
+const { authorizeCreatorAccountWrite } = require("./database-write-contract-service");
 function avatarBytes(payload) {
   if (payload.dataBase64 === null) return null;
   const text = payload.dataBase64;

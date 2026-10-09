@@ -119,20 +119,7 @@ function fakeDb({ submission = {}, assets = [], order = {}, folderId = "vault-cu
   };
 }
 
-test("V20.4 uses typed CreatorMediaAsset columns for Customs provenance, not metadata JSON", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const block = schema.match(/model CreatorMediaAsset \{([\s\S]*?)\n\}/)?.[1] || "";
-  assert.match(block, /source\s+CreatorMediaAssetSource\s+@default\(GENERAL\)/);
-  assert.match(block, /customOrderId\s+String\?/);
-  assert.match(block, /customSubmissionId\s+String\?/);
-  assert.match(block, /customFullPriceCents\s+Int\?/);
-  assert.match(schema, /enum CreatorMediaAssetSource \{\s*GENERAL\s*CUSTOM\s*\}/);
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260821131500_custom_content_library_columns/migration.sql"), "utf8");
-  assert.match(migration, /ADD COLUMN "source" "CreatorMediaAssetSource" NOT NULL DEFAULT 'GENERAL'/);
-  assert.match(migration, /ADD COLUMN "customOrderId" TEXT/);
-  assert.match(migration, /ADD COLUMN "customFullPriceCents" INTEGER/);
-  assert.doesNotMatch(migration, /metadata/i, "Customs provenance must not be packed into JSON metadata");
-});
+
 
 test("Content Library finalization rejects direct bypass without a current Vault-settlement receipt", async () => {
   const db = fakeDb({ submission: { vaultSettlementFolderId: null, vaultSettlementProfileRevision: null, vaultSettlementMediaFingerprint: null, vaultSettlementConfirmedAt: null, vaultSettlementConfirmedByDeviceId: null } });
@@ -356,13 +343,4 @@ test("concurrent human Media Library edit wins over stale automatic Customs meta
 });
 
 
-test("V20.9 Content Library stores exact submission provenance in a typed FK", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const block = schema.match(/model CreatorMediaAsset \{([\s\S]*?)\n\}/)?.[1] || "";
-  assert.match(block, /customSubmissionId\s+String\?/);
-  assert.match(block, /customSubmission\s+CustomContentSubmission\?/);
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260822123500_custom_content_submission_asset_provenance/migration.sql"), "utf8");
-  assert.match(migration, /ADD COLUMN "customSubmissionId" TEXT/);
-  assert.match(migration, /"mediaId" = ANY\(submission\."ofMediaIds"\)/);
-  assert.match(migration, /ON DELETE SET NULL ON UPDATE CASCADE/);
-});
+

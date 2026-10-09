@@ -160,12 +160,5 @@ test("INT5.4C-1C subscriber scheduling opts into token chronology and publicatio
   assert.match(subscriber, /jobs created before the token cutover|created before the token cutover|before the token cutover/);
   assert.match(authority, /observedAt[,:]\s*item\?*\.observedAt|const observedAt = date\(item\?\.observedAt\)/);
 });
-test("INT5.4C-1C Subscriber Directory also has a physical one-active-run creator fence", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260714190000_subscriber_directory_hidden_online_v1", "migration.sql"), "utf8");
-  const subscriber = fs.readFileSync(path.join(__dirname, "subscriber-directory-service.js"), "utf8");
-  assert.match(migration, /CREATE UNIQUE INDEX "SubscriberScanRun_one_active_creator_key"/);
-  assert.match(migration, /WHERE "status" IN \('QUEUED', 'RUNNING'\)/);
-  assert.match(subscriber, /error\?\.code !== "P2002"/);
-  assert.match(subscriber, /reason:\s*"concurrent_scan_won"/);
-});
+
 

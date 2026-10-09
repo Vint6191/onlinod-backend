@@ -8,8 +8,7 @@ const PROVIDER_GATE_PERMIT_TTL_MS = Math.max(5_000, Math.min(60_000, Number.pars
 const PROVIDER_GATE_WAITER_LEASE_MS = Math.max(10_000, Math.min(60_000, Number.parseInt(process.env.OF_PROVIDER_GATE_WAITER_LEASE_MS || "20000", 10) || 20_000));
 const PROVIDER_GATE_WAITER_HEARTBEAT_MS = Math.max(2_000, Math.min(Math.floor(PROVIDER_GATE_WAITER_LEASE_MS / 2), Number.parseInt(process.env.OF_PROVIDER_GATE_WAITER_HEARTBEAT_MS || "5000", 10) || 5_000));
 const PROVIDER_GATE_FAIRNESS_GENERATION = "phase3_provider_gate_fairness_v2_a14";
-const PROVIDER_GATE_FAIRNESS_STATES = Object.freeze(["DRAINING", "QUIESCING", "ACTIVE"]);
-const PROVIDER_GATE_LEGACY_QUIET_MS = Math.max(15_000, Math.min(5 * 60_000, Number.parseInt(process.env.OF_PROVIDER_GATE_LEGACY_QUIET_MS || String(PROVIDER_GATE_PERMIT_TTL_MS * 2), 10) || (PROVIDER_GATE_PERMIT_TTL_MS * 2)));
+const PROVIDER_GATE_FAIRNESS_STATES = Object.freeze(["ACTIVE"]);
 
 // Preserve the A11 weighted user-facing priority policy, but make the cursor
 // PostgreSQL-owned so two Backend replicas cannot each restart the cycle.
@@ -81,9 +80,9 @@ async function ensureStateRow(db) {
   await db.$queryRawUnsafe(`
     INSERT INTO "OfProviderRequestGateState" (
       "id", "revision", "priorityCursor", "backgroundCategoryCursor",
-      "fairnessGeneration", "fairnessActivationState", "fairnessDrainStartedAt", "legacyPermitCount",
+      "fairnessGeneration", "fairnessActivationState",
       "createdAt", "updatedAt"
-    ) VALUES ($1, 0, 0, 0, $2, 'DRAINING', clock_timestamp(), 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    ) VALUES ($1, 0, 0, 0, $2, 'ACTIVE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     ON CONFLICT ("id") DO NOTHING
   `, PROVIDER_GATE_STATE_ID, PROVIDER_GATE_FAIRNESS_GENERATION);
 }
@@ -111,11 +110,6 @@ async function lockedState(db) {
       s."backgroundCategoryCursor",
       s."fairnessGeneration",
       s."fairnessActivationState",
-      s."fairnessDrainStartedAt",
-      s."fairnessActivatedAt",
-      s."fairnessActivationConfirmedAt",
-      s."legacyPermitLastSeenAt",
-      s."legacyPermitCount",
       s."usageWindowStartedAt",
       s."usageTotalStarts",
       s."usageCriticalWriteStarts",
@@ -151,18 +145,13 @@ function exactPermitMatch(row, input) {
   );
 }
 function normalizeFairnessActivationState(value) {
-  const state = String(value || "DRAINING").trim().toUpperCase();
-  return PROVIDER_GATE_FAIRNESS_STATES.includes(state) ? state : "DRAINING";
+  const state = String(value || "UNAVAILABLE").trim().toUpperCase();
+  return PROVIDER_GATE_FAIRNESS_STATES.includes(state) ? state : "UNAVAILABLE";
 }
 function fairnessAuthorityFromRow(row) {
   return {
     generation: clean(row?.fairnessGeneration, 120) || null,
     activationState: normalizeFairnessActivationState(row?.fairnessActivationState),
-    drainStartedAt: asDate(row?.fairnessDrainStartedAt),
-    activatedAt: asDate(row?.fairnessActivatedAt),
-    activationConfirmedAt: asDate(row?.fairnessActivationConfirmedAt),
-    legacyPermitLastSeenAt: asDate(row?.legacyPermitLastSeenAt),
-    legacyPermitCount: Math.max(0, asNumber(row?.legacyPermitCount, 0)),
     authorityNow: asDate(row?.authorityNow),
   };
 }
@@ -186,9 +175,7 @@ async function readProviderGateFairnessAuthority({ db, forUpdate = false } = {})
   await ensureStateRow(db);
   const rows = await db.$queryRawUnsafe(`
     SELECT
-      s."fairnessGeneration", s."fairnessActivationState", s."fairnessDrainStartedAt",
-      s."fairnessActivatedAt", s."fairnessActivationConfirmedAt", s."legacyPermitLastSeenAt",
-      s."legacyPermitCount", clock_timestamp() AS "authorityNow"
+      s."fairnessGeneration", s."fairnessActivationState", clock_timestamp() AS "authorityNow"
     FROM "OfProviderRequestGateState" s
     WHERE s."id"=$1
     LIMIT 1
@@ -196,78 +183,6 @@ async function readProviderGateFairnessAuthority({ db, forUpdate = false } = {})
   const row = Array.isArray(rows) ? rows[0] : rows;
   if (!row) throw Object.assign(new Error("Durable provider gate singleton is missing"), { code: "OF_PROVIDER_GATE_STATE_MISSING", status: 503 });
   return fairnessAuthorityFromRow(row);
-}
-
-async function tryAcquireLegacyCompatibleProviderPermit({
-  db, permitId, ownerInstanceId, agencyId, creatorId, deviceId, capability,
-  intervalMs, permitTtlMs = PROVIDER_GATE_PERMIT_TTL_MS,
-} = {}) {
-  assertDurableClient(db);
-  const normalized = {
-    permitId: clean(permitId, 200), ownerInstanceId: clean(ownerInstanceId, 200),
-    agencyId: clean(agencyId, 200), creatorId: clean(creatorId, 200),
-    deviceId: clean(deviceId, 200), capability: clean(capability, 40),
-  };
-  if (!normalized.permitId || !normalized.ownerInstanceId || !normalized.agencyId || !normalized.creatorId || !normalized.deviceId || !normalized.capability) {
-    const error = new Error("Legacy-compatible provider permit scope is incomplete");
-    error.code = "OF_PROVIDER_GATE_SCOPE_REQUIRED";
-    throw error;
-  }
-  const spacingMs = Math.max(1, Math.floor(asNumber(intervalMs, 700)));
-  const ttlMs = Math.max(5_000, Math.floor(asNumber(permitTtlMs, PROVIDER_GATE_PERMIT_TTL_MS)));
-  return runDbTransaction(db, async (tx) => {
-    await ensureStateRow(tx);
-    const state = await lockedState(tx);
-    const authorityNow = asDate(state.authorityNow);
-    if (!authorityNow) throw new Error("OF_PROVIDER_GATE_DB_TIME_INVALID");
-    const fairness = fairnessAuthorityFromRow(state);
-    if (fairness.generation !== PROVIDER_GATE_FAIRNESS_GENERATION) {
-      return { granted: false, reason: "fairness_generation_mismatch", authorityNow, retryAt: new Date(authorityNow.getTime() + PROVIDER_GATE_POLL_MS), revision: asNumber(state.revision, 0), fairness };
-    }
-    if (fairness.activationState === "ACTIVE") {
-      return { granted: false, reason: "fairness_active", authorityNow, retryAt: new Date(authorityNow.getTime() + PROVIDER_GATE_POLL_MS), revision: asNumber(state.revision, 0), fairness };
-    }
-    if (fairness.activationState === "QUIESCING") {
-      return { granted: false, reason: "fairness_quiescing", authorityNow, retryAt: new Date(authorityNow.getTime() + PROVIDER_GATE_POLL_MS), revision: asNumber(state.revision, 0), fairness };
-    }
-    const activeExpiresAt = asDate(state.activeExpiresAt);
-    if (state.activePermitId && activeExpiresAt && activeExpiresAt.getTime() <= authorityNow.getTime()) {
-      const failSafeNext = new Date(authorityNow.getTime() + spacingMs);
-      const rows = await tx.$queryRawUnsafe(`
-        UPDATE "OfProviderRequestGateState"
-        SET "activePermitId"=NULL,"activeOwnerInstanceId"=NULL,"activeAgencyId"=NULL,"activeCreatorId"=NULL,
-            "activeDeviceId"=NULL,"activeCapability"=NULL,"activePriority"=NULL,"activeCategory"=NULL,"activeIntervalMs"=NULL,"activeGrantedAt"=NULL,
-            "activeExpiresAt"=NULL,"nextAllowedAt"=GREATEST(COALESCE("nextAllowedAt",$2),$2),
-            "revision"="revision"+1,"updatedAt"=CURRENT_TIMESTAMP
-        WHERE "id"=$1 RETURNING "revision","nextAllowedAt"
-      `, PROVIDER_GATE_STATE_ID, failSafeNext);
-      const updated = Array.isArray(rows) ? rows[0] : rows;
-      return { granted: false, reason: "expired_unknown_outcome", authorityNow, retryAt: asDate(updated?.nextAllowedAt) || failSafeNext, revision: asNumber(updated?.revision, asNumber(state.revision, 0) + 1), fairness };
-    }
-    if (state.activePermitId) {
-      const pollAt = new Date(authorityNow.getTime() + PROVIDER_GATE_POLL_MS);
-      return { granted: false, reason: "active_permit", authorityNow, retryAt: minDate(activeExpiresAt, pollAt) || pollAt, revision: asNumber(state.revision, 0), fairness };
-    }
-    const nextAllowedAt = asDate(state.nextAllowedAt);
-    if (nextAllowedAt && nextAllowedAt.getTime() > authorityNow.getTime()) {
-      return { granted: false, reason: "spacing", authorityNow, retryAt: nextAllowedAt, revision: asNumber(state.revision, 0), fairness };
-    }
-    const expiresAt = new Date(authorityNow.getTime() + ttlMs);
-    const rows = await tx.$queryRawUnsafe(`
-      UPDATE "OfProviderRequestGateState"
-      SET "activePermitId"=$2,"activeOwnerInstanceId"=$3,"activeAgencyId"=$4,"activeCreatorId"=$5,
-          "activeDeviceId"=$6,"activeCapability"=$7,"activePriority"='legacy',"activeCategory"='legacy',"activeIntervalMs"=$8,"activeGrantedAt"=$9,
-          "activeExpiresAt"=$10,"revision"="revision"+1,"updatedAt"=CURRENT_TIMESTAMP
-      WHERE "id"=$1 RETURNING "revision","legacyPermitLastSeenAt","legacyPermitCount"
-    `, PROVIDER_GATE_STATE_ID, normalized.permitId, normalized.ownerInstanceId, normalized.agencyId,
-    normalized.creatorId, normalized.deviceId, normalized.capability, spacingMs, authorityNow, expiresAt);
-    const updated = Array.isArray(rows) ? rows[0] : rows;
-    return {
-      granted: true, reason: "granted_legacy_compat", authorityNow, grantedAt: authorityNow, expiresAt,
-      revision: asNumber(updated?.revision, asNumber(state.revision, 0) + 1), intervalMs: spacingMs,
-      fairness: { ...fairness, legacyPermitLastSeenAt: asDate(updated?.legacyPermitLastSeenAt) || authorityNow, legacyPermitCount: Math.max(fairness.legacyPermitCount + 1, asNumber(updated?.legacyPermitCount, 0)) },
-    };
-  });
 }
 
 async function readProviderGateFairnessDbFenceStatus(db) {
@@ -285,95 +200,9 @@ async function readProviderGateFairnessDbFenceStatus(db) {
   const row = Array.isArray(rows) ? rows[0] : rows;
   const fn = String(row?.functionDefinition || "");
   const enabled = String(row?.enabled || "").toUpperCase();
-  const functionProofValid = fn.includes('fairnessActivationState') && fn.includes("'ACTIVE'") && fn.includes('ONLINOD_PROVIDER_GATE_WAITER_REQUIRED') && fn.includes('legacyPermitLastSeenAt');
+  const functionProofValid = fn.includes('OfProviderRequestGateWaiter') && fn.includes('ONLINOD_PROVIDER_GATE_WAITER_REQUIRED');
   const triggerReady = Boolean(row && ["O", "A"].includes(enabled) && String(row?.functionName || "") === "onlinod_enforce_provider_gate_waiter_registration");
   return { supported: true, ready: triggerReady && functionProofValid, functionProofValid, triggerReady, enabled: row?.enabled || null };
-}
-
-async function beginProviderGateFairnessDrain(db) {
-  assertDurableClient(db);
-  return runDbTransaction(db, async (tx) => {
-    await ensureStateRow(tx);
-    const state = await lockedState(tx);
-    const fairness = fairnessAuthorityFromRow(state);
-    if (fairness.generation !== PROVIDER_GATE_FAIRNESS_GENERATION) {
-      throw Object.assign(new Error("Provider gate fairness generation mismatch"), { code: "OF_PROVIDER_GATE_FAIRNESS_GENERATION_MISMATCH", status: 503 });
-    }
-    if (fairness.activationState === "ACTIVE") return { changed: false, alreadyActive: true, row: fairness };
-    if (fairness.activationState === "QUIESCING") return { changed: false, alreadyQuiescing: true, row: fairness };
-    const rows = await tx.$queryRawUnsafe(`
-      UPDATE "OfProviderRequestGateState"
-      SET "fairnessActivationState"='QUIESCING',"fairnessDrainStartedAt"=clock_timestamp(),
-          "fairnessActivatedAt"=NULL,"fairnessActivationConfirmedAt"=NULL,"updatedAt"=CURRENT_TIMESTAMP
-      WHERE "id"=$1 AND "fairnessGeneration"=$2 AND "fairnessActivationState"='DRAINING'
-      RETURNING "fairnessGeneration","fairnessActivationState","fairnessDrainStartedAt","legacyPermitLastSeenAt","legacyPermitCount",clock_timestamp() AS "authorityNow"
-    `, PROVIDER_GATE_STATE_ID, PROVIDER_GATE_FAIRNESS_GENERATION);
-    const row = Array.isArray(rows) ? rows[0] : rows;
-    if (!row) throw Object.assign(new Error("Provider gate fairness drain state changed concurrently"), { code: "OF_PROVIDER_GATE_FAIRNESS_DRAIN_RACE", status: 409 });
-    return { changed: true, alreadyActive: false, row: fairnessAuthorityFromRow(row) };
-  });
-}
-
-async function providerGateFairnessActivationDiagnostics(db) {
-  assertDurableClient(db);
-  const [authority, fence] = await Promise.all([
-    readProviderGateFairnessAuthority({ db }),
-    readProviderGateFairnessDbFenceStatus(db),
-  ]);
-  const now = authority.authorityNow || new Date();
-  const quietFloor = new Date(now.getTime() - PROVIDER_GATE_LEGACY_QUIET_MS);
-  const legacyQuiet = !authority.legacyPermitLastSeenAt || authority.legacyPermitLastSeenAt.getTime() <= quietFloor.getTime();
-  const rows = await db.$queryRawUnsafe(`
-    SELECT "activePermitId","activeExpiresAt",
-           (SELECT COUNT(*)::int FROM "OfProviderRequestGateWaiter" WHERE "leaseUntil" > clock_timestamp()) AS "liveWaiters",
-           clock_timestamp() AS "authorityNow"
-    FROM "OfProviderRequestGateState" WHERE "id"=$1 LIMIT 1
-  `, PROVIDER_GATE_STATE_ID);
-  const state = Array.isArray(rows) ? rows[0] : rows;
-  const noActivePermit = !clean(state?.activePermitId, 200);
-  const noLiveWaiters = Math.max(0, asNumber(state?.liveWaiters, 0)) === 0;
-  const drainOldEnough = Boolean(authority.drainStartedAt && authority.drainStartedAt.getTime() <= quietFloor.getTime());
-  return {
-    authority, dbFence: fence, legacyQuiet, noActivePermit, noLiveWaiters, drainOldEnough,
-    quietMs: PROVIDER_GATE_LEGACY_QUIET_MS,
-    readyToActivate: authority.generation === PROVIDER_GATE_FAIRNESS_GENERATION
-      && authority.activationState === "QUIESCING" && fence.ready && legacyQuiet && noActivePermit && noLiveWaiters && drainOldEnough,
-  };
-}
-
-async function activateProviderGateFairnessAfterDrain(db) {
-  assertDurableClient(db);
-  return runDbTransaction(db, async (tx) => {
-    await ensureStateRow(tx);
-    const state = await lockedState(tx);
-    const fairness = fairnessAuthorityFromRow(state);
-    const fence = await readProviderGateFairnessDbFenceStatus(tx);
-    if (!fence.ready) throw Object.assign(new Error("Provider gate fairness PostgreSQL fence is incomplete"), { code: "OF_PROVIDER_GATE_FAIRNESS_DB_FENCE_INCOMPLETE", status: 503, details: fence });
-    if (fairness.generation !== PROVIDER_GATE_FAIRNESS_GENERATION) throw Object.assign(new Error("Provider gate fairness generation mismatch"), { code: "OF_PROVIDER_GATE_FAIRNESS_GENERATION_MISMATCH", status: 503 });
-    if (fairness.activationState === "ACTIVE") return { activated: false, alreadyActive: true, row: fairness };
-    if (fairness.activationState !== "QUIESCING") throw Object.assign(new Error("Provider gate fairness must be quiescing before activation"), { code: "OF_PROVIDER_GATE_FAIRNESS_NOT_QUIESCING", status: 409 });
-    const authorityNow = asDate(state.authorityNow);
-    const quietFloor = new Date(authorityNow.getTime() - PROVIDER_GATE_LEGACY_QUIET_MS);
-    const legacySeen = asDate(state.legacyPermitLastSeenAt);
-    const drainStarted = asDate(state.fairnessDrainStartedAt);
-    if (state.activePermitId) throw Object.assign(new Error("Provider gate still has an active permit"), { code: "OF_PROVIDER_GATE_FAIRNESS_ACTIVE_PERMIT", status: 409, retryable: true });
-    if (!drainStarted || drainStarted.getTime() > quietFloor.getTime() || (legacySeen && legacySeen.getTime() > quietFloor.getTime())) {
-      throw Object.assign(new Error("Provider gate legacy compatibility traffic has not been quiet long enough"), { code: "OF_PROVIDER_GATE_FAIRNESS_LEGACY_NOT_DRAINED", status: 409, retryable: true, quietMs: PROVIDER_GATE_LEGACY_QUIET_MS });
-    }
-    const liveRows = await tx.$queryRawUnsafe(`SELECT COUNT(*)::int AS count FROM "OfProviderRequestGateWaiter" WHERE "leaseUntil" > $1`, authorityNow);
-    const liveCount = Math.max(0, asNumber((Array.isArray(liveRows) ? liveRows[0] : liveRows)?.count, 0));
-    if (liveCount > 0) throw Object.assign(new Error("Provider gate still has live durable waiters"), { code: "OF_PROVIDER_GATE_FAIRNESS_WAITERS_NOT_DRAINED", status: 409, retryable: true, liveCount });
-    const rows = await tx.$queryRawUnsafe(`
-      UPDATE "OfProviderRequestGateState"
-      SET "fairnessActivationState"='ACTIVE',"fairnessActivatedAt"=clock_timestamp(),
-          "fairnessActivationConfirmedAt"=clock_timestamp(),"updatedAt"=CURRENT_TIMESTAMP
-      WHERE "id"=$1 AND "fairnessGeneration"=$2 AND "fairnessActivationState"='QUIESCING'
-      RETURNING "fairnessGeneration","fairnessActivationState","fairnessDrainStartedAt","fairnessActivatedAt","fairnessActivationConfirmedAt","legacyPermitLastSeenAt","legacyPermitCount",clock_timestamp() AS "authorityNow"
-    `, PROVIDER_GATE_STATE_ID, PROVIDER_GATE_FAIRNESS_GENERATION);
-    const row = Array.isArray(rows) ? rows[0] : rows;
-    if (!row) throw Object.assign(new Error("Provider gate fairness activation raced with another transition"), { code: "OF_PROVIDER_GATE_FAIRNESS_ACTIVATION_RACE", status: 409 });
-    return { activated: true, alreadyActive: false, row: fairnessAuthorityFromRow(row) };
-  });
 }
 
 async function registerDurableProviderWaiter({
@@ -860,15 +689,10 @@ module.exports = {
   PROVIDER_GATE_WAITER_HEARTBEAT_MS,
   PROVIDER_GATE_FAIRNESS_GENERATION,
   PROVIDER_GATE_FAIRNESS_STATES,
-  PROVIDER_GATE_LEGACY_QUIET_MS,
   PROVIDER_GATE_PRIORITY_CYCLE,
   PROVIDER_GATE_BACKGROUND_CATEGORY_CYCLE,
   readProviderGateFairnessAuthority,
   readProviderGateFairnessDbFenceStatus,
-  beginProviderGateFairnessDrain,
-  providerGateFairnessActivationDiagnostics,
-  activateProviderGateFairnessAfterDrain,
-  tryAcquireLegacyCompatibleProviderPermit,
   registerDurableProviderWaiter,
   heartbeatDurableProviderWaiters,
   cancelDurableProviderWaiter,

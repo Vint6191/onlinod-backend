@@ -8,8 +8,8 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "../..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const schema = read("prisma/schema.prisma");
-const enumMigration = read("prisma/migrations/20260808101000_creator_analytics_data_types_v2/migration.sql");
-const foundationMigration = read("prisma/migrations/20260808101500_creator_analytics_relational_foundation_v2/migration.sql");
+const enumMigration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
+const foundationMigration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
 const projection = read("src/services/creator-analytics-projection-service.js");
 const ledger = read("src/services/creator-analytics-ledger-service.js");
 const notifications = read("src/services/notification-facts-service.js");
@@ -40,7 +40,6 @@ test("creator analytics V2 keeps every business fact in typed relational models"
     "AnalyticsCoverage",
     "AnalyticsIngestBatch",
     "CreatorLocalMessageCoverage",
-    "CreatorFanLocalCoverage",
   ];
   for (const model of primaryModels) {
     assert.doesNotMatch(modelBody(model), /\bJson\??\b/, `${model} must not store business JSON`);
@@ -76,28 +75,17 @@ test("canonical facts feed durable rebuildable daily publication", () => {
 
 test("local message coverage stores only metadata and never message bodies", () => {
   const coverage = modelBody("CreatorLocalMessageCoverage");
-  const fanCoverage = modelBody("CreatorFanLocalCoverage");
   for (const column of ["deviceId", "oldestMessageAt", "newestMessageAt", "dialogsCovered", "messagesIndexed", "coverageStatus", "lastVerifiedAt"]) {
     assert.match(coverage, new RegExp(`\\b${column}\\b`));
   }
-  assert.match(fanCoverage, /@@unique\(\[creatorId, fanRecordId, deviceId\]\)/);
-  assert.doesNotMatch(`${coverage}\n${fanCoverage}`, /messageText|bodyText|content|payload/i);
+  assert.doesNotMatch(coverage, /messageText|bodyText|content|payload/i);
   assert.match(ledger, /messagesIndexed/);
   assert.match(ledger, /oldestMessageAt/);
   assert.match(ledger, /newestMessageAt/);
   assert.match(routes, /router\.post\("\/creators\/:creatorId\/messages-daily", legacyStatsGone\)/);
 });
 
-test("V2 migrations split enum additions from relational table use and contain no JSON business columns", () => {
-  assert.match(enumMigration, /ADD VALUE IF NOT EXISTS 'SALES'/);
-  assert.match(enumMigration, /ADD VALUE IF NOT EXISTS 'PAID_SUBSCRIPTIONS'/);
-  assert.doesNotMatch(foundationMigration, /ALTER TYPE "AnalyticsDataType" ADD VALUE/);
-  for (const table of ["CreatorSubscriptionState", "CreatorPaidSubscription", "CreatorDailyMetrics", "CreatorLocalMessageCoverage", "CreatorFanLocalCoverage"]) {
-    assert.match(foundationMigration, new RegExp(`CREATE TABLE "${table}"`));
-  }
-  assert.doesNotMatch(foundationMigration, /\bJSONB?\b/i);
-  assert.match(foundationMigration, /DELETE FROM "AnalyticsCoverage" AS coverage[\s\S]*"oldestOccurredAt"/);
-});
+
 
 test("notification history proof is owned by durable cursor/frontier state, not temporal AnalyticsCoverage", () => {
   assert.match(notifications, /Notifications are a cursor\/frontier collector, not a temporal-day collector/);

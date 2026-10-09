@@ -8,11 +8,9 @@ async function main() {
   require.cache[require.resolve("../../src/prisma")] = { exports: db };
   const check = async (name, run) => { await run(); cases.push({name,status:"PASS"}); console.log(JSON.stringify(cases.at(-1))); };
   try {
-    await db.$executeRawUnsafe(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`);
     // Match the explicit current executor activation in the disposable fixture;
     // no production release state is read or changed by this script.
-    const { DOMAIN_WORK_EXECUTOR_GENERATION } = require("../../src/services/phase2-release-compatibility-authority-service");
-    await db.$executeRawUnsafe(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "requiredGeneration"=$1,"activationState"='ACTIVE' WHERE "scope"='DOMAIN_WORK_EXECUTOR'`,DOMAIN_WORK_EXECUTOR_GENERATION);
+    const { DOMAIN_WORK_EXECUTOR_GENERATION } = require("../../src/services/database-write-contract-service");
     const { runRootCommit } = require("../../src/services/db-commit-kernel");
     const job = require("../../src/services/job-lease-service"), actions = require("../../src/services/automation-action-delivery-service");
     const work = require("../../src/services/domain-work-authority-service"), lane = require("../../src/services/maintenance-work-authority");

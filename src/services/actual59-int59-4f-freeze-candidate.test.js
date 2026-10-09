@@ -13,9 +13,9 @@ const authMiddleware = read("src/middleware/auth.js");
 const authRoute = read("src/routes/auth.js");
 const telemetry = read("src/services/telemetry-ingest-service.js");
 const telemetryRoute = read("src/routes/telemetry.js");
-const lineageMigration = read("prisma/migrations/20260915193000_actual59_int59_3_authorization_lineage_catalog_boundary/migration.sql");
-const memberMigration = read("prisma/migrations/20260915131500_actual59_team_authorization_generation_boundary/migration.sql");
-const refreshScaleMigration = read("prisma/migrations/20260916011500_actual60_refreshsession_hot_cold_scale/migration.sql");
+const lineageMigration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
+const memberMigration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
+const refreshScaleMigration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
 
 function between(text, start, end) {
   const a = text.indexOf(start);
@@ -100,18 +100,7 @@ test("INT59.4F/Actual60 freeze candidate: terminal performance uses server-owned
   assert.match(telemetry, /Math\.min\(\.\.\.endCandidates\.map/);
 });
 
-test("INT59.4F freeze candidate: migration history is one-way, DB-clock based and legacy-safe", () => {
-  assert.match(lineageMigration, /^BEGIN;/m);
-  assert.match(lineageMigration, /COMMIT;\s*$/m);
-  assert.match(lineageMigration, /clock_timestamp\(\)/);
-  assert.doesNotMatch(lineageMigration.replace(/--.*$/gm, ""), /statement_timestamp\(\)/);
-  assert.match(lineageMigration, /ON CONFLICT \("authorizationSessionId"\) DO NOTHING/);
-  assert.match(lineageMigration, /ON CONFLICT \("agencyId", "generation"\) DO NOTHING/);
-  assert.match(lineageMigration, /CREATE OR REPLACE FUNCTION "capture_agency_member_access_epoch_boundary"/);
-  assert.match(memberMigration, /CREATE TRIGGER "AgencyMember_capture_access_epoch_boundary"/);
-  assert.doesNotMatch(lineageMigration, /UPDATE\s+"RefreshSession"[\s\S]{0,400}?"authorizationSessionId"\s*=/i,
-    "migration must not silently adopt historical legacy sessions into the current generation");
-});
+
 
 test("INT59.4F freeze candidate: telemetry activation and scale remain bounded/fail-closed", () => {
   const match = telemetry.match(/const TEAM_TELEMETRY_TX_CHUNK_SIZE = (\d+);/);

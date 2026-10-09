@@ -18,7 +18,7 @@ function percentile(values, p) {
 }
 
 async function withTeamGeneration(db, workFn) {
-  const release = require("./phase2-release-compatibility-authority-service");
+  const release = require("./database-write-contract-service");
   return db.$transaction(async (tx) => {
     await tx.$queryRawUnsafe(
       `SELECT set_config($1,$2,true) AS value`,
@@ -79,7 +79,7 @@ async function seedWorker({ db, agencyId, creatorId, ordinal }) {
 async function setupScaleFixture({ workers = 1 } = {}) {
   const { PrismaClient } = require("@prisma/client");
   const db = new PrismaClient();
-  const release = require("./phase2-release-compatibility-authority-service");
+  const release = require("./database-write-contract-service");
   const { currentCreatorCatalogGeneration } = require("./creator-human-management-authority-service");
   const agencyId = token("a59_scale_agency");
   const creatorId = token("a59_scale_creator");

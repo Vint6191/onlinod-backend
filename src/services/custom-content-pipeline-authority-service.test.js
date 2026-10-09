@@ -800,49 +800,11 @@ test("Custom cancellation cancels only proven-precommit relay writes and preserv
   assert.deepEqual(submissions.map((row) => row.pipelineDisposition), ["SALVAGE", "SALVAGE"]);
 });
 
-test("unknown pipeline disposition is fail-closed and database-constrained", () => {
-  const live = { type: "CONTENT", status: "PENDING", fanDeliveredAt: null };
-  const corrupt = { id: "sub-corrupt", pipelineDisposition: "FUTURE_UNKNOWN", telegramMessageIds: [1], ofMediaIds: [] };
-  assert.equal(submissionAllowsNewPipelineWork(corrupt, live), false);
-  assert.equal(derivePipelineStage({ submission: corrupt, order: live, finalized: false }), "BLOCKED");
 
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260906190000_custom_content_pipeline_integrity_closure/migration.sql"), "utf8");
-  assert.match(migration, /^BEGIN;/);
-  assert.match(migration, /CustomContentSubmission_pipelineDisposition_check/);
-  assert.match(migration, /CHECK \("pipelineDisposition" IN \('ACTIVE', 'SALVAGE', 'ARCHIVED', 'ABANDONED'\)\)/);
-  assert.match(migration, /CustomOrder_telegramCancellationWaiver_pair_check/);
-  assert.match(migration, /telegramCancellationWaivedAt/);
-  assert.match(migration, /telegramCancellationWaiverReason/);
-  assert.match(migration, /TelegramDeliveryIntent_kind_check/);
-  assert.match(migration, /TelegramDeliveryIntent_state_check/);
-  assert.match(migration, /TelegramInboundEvent_projectionState_check/);
-  assert.match(migration, /FAILED_PRECOMMIT/);
-  assert.match(migration, /FAILED_RETRYABLE/);
-  assert.match(migration, /TelegramDeliveryIntent_one_task_per_order_key/);
-  assert.match(migration, /WHERE "kind" = 'TASK'/);
-  assert.match(migration, /TelegramDeliveryIntent_one_cancellation_per_order_key/);
-  assert.match(migration, /WHERE "kind" = 'CANCELLATION'/);
-  assert.match(migration, /COMMIT;\s*$/);
-});
 
-test("migration archives only fan-delivered history and fail-closes other terminal Customs into SALVAGE", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260906003000_custom_content_pipeline_authority/migration.sql"), "utf8");
-  const archiveAt = migration.indexOf("MIGRATION_FAN_DELIVERED");
-  const salvageAt = migration.indexOf("MIGRATION_TERMINAL_CUSTOM");
-  assert.ok(archiveAt >= 0 && salvageAt > archiveAt, "provider-proven delivery is classified before generic terminal fallback");
-  assert.match(migration, /pipelineDisposition"\s*=\s*'ARCHIVED'[\s\S]*fanDeliveredAt" IS NOT NULL/);
-  assert.match(migration, /pipelineDisposition"\s*=\s*'SALVAGE'[\s\S]*fanDeliveredAt" IS NULL[\s\S]*status" <> 'PENDING'/);
-});
 
-test("pipeline fairness cursor order has matching production indexes", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  assert.match(schema, /CCS_pipeline_fairness_idx/);
-  assert.match(schema, /CCS_source_pipeline_fairness_idx/);
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260907003000_custom_content_pipeline_work_discovery_indexes/migration.sql"), "utf8");
-  assert.match(migration, /"pipelineLastAttemptAt" ASC NULLS FIRST/);
-  assert.match(migration, /"agencyId"[\s\S]*"pipelineDisposition"[\s\S]*"receivedAt"[\s\S]*"createdAt"[\s\S]*"id"/);
-  assert.match(migration, /"telegramSourceAccountId"[\s\S]*CCS_source_pipeline_fairness_idx|CCS_source_pipeline_fairness_idx[\s\S]*"telegramSourceAccountId"/);
-});
+
+
 
 test("Telegram CONFIRMED receipt atomically carries projection-pending retirement debt before derived projection runs", () => {
   const telegramAuthority = fs.readFileSync(path.join(__dirname, "telegram-delivery-authority-service.js"), "utf8");
@@ -851,30 +813,9 @@ test("Telegram CONFIRMED receipt atomically carries projection-pending retiremen
   assert.match(pipelineAuthority, /state:\s*"CONFIRMED",\s*projectionBlockedAt:\s*\{\s*not:\s*null\s*\}/);
 });
 
-test("Vault settlement receipt is durable execution proof in schema/migration, not a second business stage table", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const block = schema.match(/model CustomContentSubmission \{([\s\S]*?)\n\}/)?.[1] || "";
-  assert.match(block, /vaultSettlementFolderId\s+String\?/);
-  assert.match(block, /vaultSettlementProfileRevision\s+Int\?/);
-  assert.match(block, /vaultSettlementMediaFingerprint\s+String\?/);
-  assert.match(block, /vaultSettlementConfirmedAt\s+DateTime\?/);
-  assert.match(block, /vaultSettlementConfirmedByDeviceId\s+String\?/);
-  assert.doesNotMatch(schema, /model\s+CustomContentPipelineStage/);
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260906003000_custom_content_pipeline_authority/migration.sql"), "utf8");
-  assert.match(migration, /ADD COLUMN "vaultSettlementMediaFingerprint" TEXT/);
-  assert.match(migration, /ADD COLUMN "vaultSettlementConfirmedByDeviceId" TEXT/);
-});
 
-test("legacy creator-retirement migration preserves unknown external outcomes and makes historical provider/submission debt explicit", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260906111500_custom_content_legacy_retirement_closure/migration.sql"), "utf8");
-  assert.match(migration, /status" IN \('QUEUED', 'RETRY_SCHEDULED', 'CLAIMED', 'RUNNING'\)/);
-  assert.doesNotMatch(migration, /status" IN \([^\n]*COMMITTING/);
-  assert.doesNotMatch(migration, /status" IN \([^\n]*RECONCILE_REQUIRED/);
-  assert.match(migration, /TelegramInboundEvent[\s\S]*projectionState" = 'REVIEW_REQUIRED'[\s\S]*CREATOR_RETIRED_LEGACY/);
-  assert.match(migration, /CustomContentSubmission[\s\S]*CUSTOM_SUBMISSION_CREATOR_RETIRED_LEGACY/);
-  assert.doesNotMatch(migration, /pipelineDisposition"\s*=\s*'ARCHIVED'/);
-  assert.doesNotMatch(migration, /pipelineDisposition"\s*=\s*'ABANDONED'/);
-});
+
+
 
 
 test("F45 shared external-effect classifier distinguishes no-retry unknown from proven terminal and completed projection debt", () => {

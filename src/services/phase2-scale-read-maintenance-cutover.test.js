@@ -18,20 +18,7 @@ test("Team snapshot authority aggregates heavy summary work in PostgreSQL", () =
   assert.doesNotMatch(analytics, /for \(let i = 0; i < num\(m\.responseSamples/);
 });
 
-test("Team pending GET is a pure read and legacy bootstrap repair is maintenance-owned", () => {
-  const pending = source("team-pending-read-service.js");
-  const listStart = pending.indexOf("async function listTeamPendingDialogs");
-  const listEnd = pending.indexOf("module.exports", listStart);
-  const listBody = pending.slice(listStart, listEnd);
-  assert.doesNotMatch(listBody, /repairStaleLegacyBootstrapPending\(/);
-  assert.match(pending, /repairStaleLegacyBootstrapPendingBatch/);
-  assert.match(pending, /FOR UPDATE OF p SKIP LOCKED/);
 
-  const scheduler = source("job-scheduler.js");
-  assert.match(scheduler, /TEAM_LEGACY_PENDING_REPAIR_LANE_KEY/);
-  assert.match(scheduler, /runMaintenanceLane/);
-  assert.match(scheduler, /maybeRepairLegacyTeamPendingBootstrap/);
-});
 
 test("maintenance ownership is durable DB state rather than recurringSweepPromise", () => {
   const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");

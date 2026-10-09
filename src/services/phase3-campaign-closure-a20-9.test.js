@@ -42,13 +42,4 @@ test("A20.9/A20.11 coverage preflight overrides Prisma 5s default for both seria
   assert.equal(callsByTx[1].some((row) => /ALTER TABLE/.test(row)), false);
 });
 
-test("A20.9 physical preflight concurrency proof must hold a contender beyond the historical 5s Prisma timeout", () => {
-  const physical = source("scripts/audit/phase3-a20-preflight-concurrency.js");
-  const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
-  assert.match(physical, /defaultTimeoutFenceMs = 6_250/);
-  assert.match(physical, /historical 5s interactive-transaction default/);
-  assert.match(physical, /PREFLIGHT_TRANSACTION_TIMEOUT_MS/);
-  assert.match(physical, /A20_9_PREFLIGHT_CONCURRENCY_PASS/);
-  assert.match(runner, /A20_9_PREFLIGHT_CONCURRENCY_PASS/);
-  assert.doesNotMatch(runner, /A20_8_PREFLIGHT_CONCURRENCY_PASS/);
-});
+

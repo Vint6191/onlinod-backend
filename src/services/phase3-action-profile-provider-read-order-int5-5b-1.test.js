@@ -133,16 +133,7 @@ test("INT5.5B-1 action observation ingest consumes post-read token while preserv
   assert.match(route, /causalObservedAt,\s*\n\s*\}\);/);
 });
 
-test("INT5.5B-1 migration extends one token authority to mutually-exclusive JobInstance or AutomationDelivery owner", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260917010000_phase3_action_profile_observation_token/migration.sql"), "utf8");
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "deliveryId" TEXT/);
-  assert.match(migration, /ALTER COLUMN "jobId" DROP NOT NULL/);
-  assert.match(migration, /num_nonnulls\("jobId", "deliveryId"\) = 1/);
-  assert.match(migration, /NOT VALID/);
-  assert.match(migration, /VALIDATE CONSTRAINT/);
-  assert.match(schema, /model FanObservationToken[\s\S]*jobId\s+String\?[\s\S]*deliveryId\s+String\?/);
-});
+
 
 test("INT5.5C-3 Backend, not client negotiation, owns the action-profile token cutover for newly-started deliveries", () => {
   const actions = fs.readFileSync(path.join(__dirname, "automation-action-delivery-service.js"), "utf8");

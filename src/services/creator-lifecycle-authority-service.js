@@ -8,7 +8,7 @@ const { assertCreatorMassCampaignRetirable } = require("./mass-campaign-authorit
 const { publishDomainWork, WORK_CLASS } = require("./domain-work-authority-service");
 const { publishDesktopControlEvent } = require("./desktop-control-events");
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
-const { authorizeCreatorAccountWrite, assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
+const { authorizeCreatorAccountWrite, assertTeamControlPlaneWriteAdmission } = require("./database-write-contract-service");
 
 function clean(value, max = 220) {
   const text = String(value == null ? "" : value).trim();
@@ -70,7 +70,7 @@ async function retireCreatorWithinTransaction({
   if (!current.deletedAt || hard) {
     await assertCreatorCustomPipelineRetirable({ db: tx, agencyId: agency, creatorId: creator });
     await assertCreatorMassCampaignRetirable({ db: tx, agencyId: agency, creatorId: creator, requireFreshProviderSnapshot: hard ? !current.deletedAt : true });
-    await require('./phase7-obligation-authority-service').assertSfsRetirable({db:tx,agencyId:agency,creatorId:creator});
+    await require('./sfs-retirement-guard').assertSfsRetirable({db:tx,agencyId:agency,creatorId:creator});
   }
 
   const scope = await retireCreatorCurrentAccess({ tx, agencyId: agency, creatorId: creator });

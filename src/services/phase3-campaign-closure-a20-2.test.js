@@ -214,15 +214,7 @@ test("A20.2 production healing locks demands in order and only the unique curren
   assert.match(source, /const productionSetBasedAdapter = typeof db\?\.\$queryRawUnsafe === "function"[\s\S]*creatorFanRefreshDemand\?\.findMany[\s\S]*creatorCampaignFanRefreshWork[\s\S]*creatorCampaignCollectionState/);
 });
 
-test("A20.2 migration installs and backfills durable current-coverage generation authority", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260919173000_phase3_campaign_coverage_generation_authority_v1/migration.sql"), "utf8");
-  for (const field of ["fanValueCoverageDelegated", "fanValueCoverageOwnerKind", "fanValueCoverageCollectorVersion", "fanValueCoverageSourceJobId"]) {
-    assert.match(migration, new RegExp(`ADD COLUMN IF NOT EXISTS "${field}"`));
-  }
-  assert.match(migration, /CreatorCampaignFanRefreshWork/);
-  assert.match(migration, /s\."fanValueCoverageScanRunId" = coverage_job\."scanRunId"/);
-  assert.match(migration, /campaignFreshnessCoverageVersion/);
-});
+
 
 test("current empty coverage cannot hide queued or quarantined creator FanData debt", () => {
   const complete={collectorStatus:"COMPLETE",fanRefreshDelegated:true,membershipCoverageStatus:"COMPLETE",campaignFrontierFreshnessStatus:"COMPLETE",fanValuesComplete:true,currentCoverageAuthoritative:true};

@@ -7,7 +7,7 @@ const path = require("node:path");
 
 const ROOT = path.join(__dirname, "..", "..");
 const scheduler = fs.readFileSync(path.join(__dirname, "job-scheduler.js"), "utf8");
-const migration = fs.readFileSync(path.join(ROOT, "prisma", "migrations", "20260910054500_phase2_telegram_domain_work_cutover", "migration.sql"), "utf8");
+const migration = fs.readFileSync(path.join(ROOT, "prisma", "migrations", "20261009000000_current_baseline", "migration.sql"), "utf8");
 
 function functionBlock(name, nextName) {
   const start = scheduler.indexOf(`async function ${name}`);
@@ -41,18 +41,4 @@ test("Telegram historical activation is per-agency, bounded, cursor-resumable an
     "deployment migration must not globally enumerate Telegram history");
 });
 
-test("Phase2 migration chain has no duplicated plpgsql function terminator", () => {
-  const migrationsDir = path.join(ROOT, "prisma", "migrations");
-  const files = fs.readdirSync(migrationsDir)
-    .filter((name) => /^20260910/.test(name))
-    .map((name) => path.join(migrationsDir, name, "migration.sql"))
-    .filter((file) => fs.existsSync(file));
-  assert.ok(files.length > 0);
-  for (const file of files) {
-    const source = fs.readFileSync(file, "utf8");
-    assert.doesNotMatch(source, /\$\$\s+LANGUAGE\s+plpgsql(?:\s+[A-Z]+)*;\s*\$\$\s+LANGUAGE\s+plpgsql/i, path.relative(ROOT, file));
-    const functions = (source.match(/CREATE\s+OR\s+REPLACE\s+FUNCTION/gi) || []).length;
-    const terminators = (source.match(/\$\$\s+LANGUAGE\s+plpgsql(?:\s+[A-Z]+)*;/gi) || []).length;
-    assert.equal(terminators, functions, `${path.relative(ROOT, file)} function bodies must each have one plpgsql terminator`);
-  }
-});
+

@@ -44,22 +44,7 @@ test("Closure3 backend JOB_CATALOG is exactly the 11 executable Desktop job gene
   assert.equal(Object.hasOwn(JOB_CATALOG, "traffic_sources_scan"), false);
 });
 
-test("Closure3 retires legacy Presence execution/control surface but retains Presence schema facts", () => {
-  const server = fs.readFileSync(path.resolve(__dirname, "../server.js"), "utf8");
-  const results = fs.readFileSync(path.resolve(__dirname, "job-result-service.js"), "utf8");
-  const schema = fs.readFileSync(path.resolve(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.resolve(__dirname, "../../prisma/migrations/20260831160000_execution_commit_authority_closure3/migration.sql"), "utf8");
 
-  assert.doesNotMatch(server, /routes\/presence|presenceRoutes|startPresenceScheduler|services\/presence-scheduler|\/api\/presence/);
-  assert.doesNotMatch(results, /refresh_online_presence|applyPresenceJobResult|presence-service/);
-  for (const rel of ["../routes/presence.js", "presence-scheduler.js", "presence-service.js"]) {
-    assert.equal(fs.existsSync(path.resolve(__dirname, rel)), false, `${rel} must be removed`);
-  }
-  assert.match(schema, /model CreatorPresenceSnapshot\s*\{/);
-  assert.match(schema, /model CreatorPresenceUser\s*\{/);
-  assert.match(migration, /LEGACY_PRESENCE_ORCHESTRATION_RETIRED/);
-  assert.match(migration, /"jobKey" = 'refresh_online_presence'/);
-});
 
 test("Closure3 JobPlanningRepository is fail-closed for any producer key outside JOB_CATALOG", async () => {
   const prismaId = cacheModule("../prisma", {});

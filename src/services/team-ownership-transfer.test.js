@@ -54,8 +54,8 @@ test("different command with old owner authority cannot execute a second transfe
 test("plan requires current owner and approved recipient device; empty-root agency needs no key material",async()=>{
  const plain=makeOwnershipDb(),encrypted=makeOwnershipDb({crypto:true});const p=await ownershipTransferPlan({db:plain.db,agencyId:"a",userId:"u1",memberId:"m2",actorDeviceId:"d1",authorizationSessionId:"lineage1"});assert.equal(p.targetDevice,null);const q=await ownershipTransferPlan({db:encrypted.db,agencyId:"a",userId:"u1",memberId:"m2",actorDeviceId:"d1",authorizationSessionId:"lineage1"});assert.equal(q.targetDevice.deviceId,"d2");assert.equal(q.expectedRootVersion,1);await assert.rejects(()=>ownershipTransferPlan({db:plain.db,agencyId:"a",userId:"u3",memberId:"m2"}));
 });
-test("release drain and serialization failure leave ownership unchanged",async()=>{
- for(const opt of["draining","serializationConflict"]){const m=makeOwnershipDb({[opt]:true}),before=globalThis.structuredClone(m.state);await assert.rejects(()=>call(m),e=>opt==="draining"||e.status===409);assert.deepEqual(m.state,before);}
+test("serialization failure leaves ownership unchanged",async()=>{
+ for(const opt of["serializationConflict"]){const m=makeOwnershipDb({[opt]:true}),before=globalThis.structuredClone(m.state);await assert.rejects(()=>call(m),e=>e.status===409);assert.deepEqual(m.state,before);}
 });
 test("platform SUPER_ADMIN cannot add a second OWNER through ordinary role command",async()=>{
  const m=createOperationalDb();const r=await executeAdminOperation({db:m.db,actor:{adminId:"admin-a",sessionId:"session-a",accessEpoch:1},commandId:crypto.randomUUID(),action:"member.role.set",targetId:"member-a",payload:{agencyId:"agency-a",expectedAccessEpoch:1,role:"OWNER",reason:"role edit"}});assert.equal(r.statusCode,409);assert.equal(r.body.code,"OWNERSHIP_TRANSFER_REQUIRED");assert.equal(m.state.members[0].roleKey,"chatter");assert.equal(m.state.deviceCommands.length,0);

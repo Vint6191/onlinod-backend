@@ -93,19 +93,6 @@ test("periodic directory admission uses one fleet budget under conservative capa
   assert.doesNotMatch(service, /deleteMany|readCanonicalCapacityInputs/);
 });
 
-test("A16 schema and migration encode an additive one-shard topology/control projection", () => {
-  const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260919043000_phase3_provider_capacity_topology_control_v1/migration.sql");
-  assert.match(schema, /topologyId\s+String\s+@default\("of-global"\)/);
-  assert.match(schema, /topologyShardCount\s+Int\s+@default\(1\)/);
-  assert.match(schema, /topologyShardingAllowed\s+Boolean\s+@default\(false\)/);
-  assert.match(schema, /controlMode\s+String\s+@default\("CONSERVATIVE"\)/);
-  assert.match(migration, /CHECK \([\s\S]*"topologyId" = 'of-global'[\s\S]*"topologyShardCount" = 1[\s\S]*"topologyShardingAllowed" = FALSE/);
-  assert.doesNotMatch(migration, /DROP TABLE|DROP COLUMN|TRUNCATE|DELETE FROM/i);
-});
 
-test("A16 preserves historical A13/A14/A15 migrations byte-for-byte", () => {
-  assert.equal(sha("prisma/migrations/20260919010000_phase3_provider_gate_durable_waiter_fairness_v1/migration.sql"), "fd56bc1cf7a816aecc9e7a05ea9f2561656b2589206348a40f771ee1c6baaf89");
-  assert.equal(sha("prisma/migrations/20260919023000_phase3_provider_gate_fairness_activation_v2/migration.sql"), "749039ebe1bf579a98e751be685e35df5a8c9b5ad61cc862bcdef16de637dd77");
-  assert.equal(sha("prisma/migrations/20260919031500_phase3_provider_capacity_debt_v1/migration.sql"), "bed2b91a8f18764f1d4abb11c6001210a1f9339656361ee7fbc08c2b56b235b0");
-});
+
+

@@ -11,7 +11,7 @@ function bulkDb() {
   const tx = {
     async $executeRawUnsafe(sql, ...args) {
       // Transaction-local budget setup is not a domain mutation/lock.
-      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)") return 1;
+      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)") return 1;
 
       calls.push({ sql: String(sql), args });
       return 1;
@@ -111,17 +111,4 @@ test("INT5.3A generic bulk rows are ordered by opaque fan id for deterministic l
   }
 });
 
-test("INT5.3A schema and direct route keep job and delivery provenance as distinct authorities", () => {
-  const root = path.resolve(__dirname, "../..");
-  const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
-  const route = fs.readFileSync(path.join(root, "src/routes/fan-data.js"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260916222000_phase3_fan_observation_delivery_provenance/migration.sql"), "utf8");
 
-  assert.match(schema, /sourceJob\s+JobInstance\?/);
-  assert.match(schema, /sourceDelivery\s+AutomationDelivery\?/);
-  assert.match(schema, /CreatorFanRelationshipCurrentCollectedByDelivery/);
-  assert.match(schema, /CreatorFanValueCurrentCollectedByDelivery/);
-  assert.match(route, /sourceDeliveryId:\s*scope\.delivery\.id/);
-  assert.doesNotMatch(route, /sourceJobId:\s*scope\.delivery\.id/);
-  assert.match(migration, /REFERENCES "AutomationDelivery"\("id"\)/);
-});

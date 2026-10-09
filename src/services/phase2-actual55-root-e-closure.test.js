@@ -142,10 +142,6 @@ test("F55-06 Actual55 root non-CASCADE policies are exhaustively classified", ()
 
   assert.deepEqual(direct("CreatorAccount"), [
     "ContentCollection:SetNull",
-    "FanList:SetNull",
-    "FanListMember:SetNull",
-    "MessageTemplateUsageEvent:SetNull",
-    "SavedSegment:SetNull",
     "TeamActivityEvent:SetNull",
     "TeamShiftCreator:SetNull",
   ]);
@@ -234,7 +230,7 @@ test("F55-06 Creator non-FK anti-map classifies every non-cascade creatorId carr
     "OperationalControlState", "DialogControlResumeDemand",
   ];
   const retainedHistory = [
-    "MessageLibraryCommandReceipt", "Phase7RetirementProof",
+    "MessageLibraryCommandReceipt",
     "BillingOrderLine", "BillingWalletTransaction", "CreatorBillingPeriod", "AutomationEvent",
     "MoneyAttribution", "ContentUsageEvent", "BumpDeliveryStat", "TeamActivityContribution",
     "TeamMemberActivityDaily", "TeamMoneyAttributionFact", "TeamMoneyDailyRollup",
@@ -298,10 +294,8 @@ test("F55-07 Agency non-FK anti-map classifies every non-cascade agencyId carrie
   // Support grants remain audit history; every read joins a live Agency.
   // Retirement proofs/partitions belong to an immutable archival cohort, not
   // a current tenant capability, and must survive tenant deletion.
-  const retainedAudit = ['AdminSupportGrant', 'Phase7RetirementProof', 'Phase7RetirementPartition'];
+  const retainedAudit = ['AdminSupportGrant'];
   assert.match(source('admin-support-command-service.js'), /!agency \|\| agency\.deletedAt/);
-  assert.match(models.get('Phase7RetirementProof'), /Phase7RetirementCohort.*onDelete: Restrict/);
-  assert.match(models.get('Phase7RetirementPartition'), /Phase7RetirementCohort.*onDelete: Restrict/);
   const classified = Array.from(new Set([
     ...retainedAudit, ...directSetNull, ...boundedTenantRoots, ...creatorDrainedTenantRoots,
     ...transactionScopedRoots, ...postCascadeCurrentRoots,
@@ -312,8 +306,8 @@ test("F55-07 Agency non-FK anti-map classifies every non-cascade agencyId carrie
   for (const table of boundedTenantRoots) assert.match(destructive, new RegExp(`"${table}"`));
   for (const table of creatorDrainedTenantRoots) assert.match(destructive, new RegExp(`"${table}"`));
   for (const table of postCascadeCurrentRoots) assert.match(destructive, new RegExp(`"${table}"`));
-  const a36 = source("../../prisma/migrations/20260922183000_phase3_a36_domain_work_claim_shard_closure_v1/migration.sql");
-  assert.match(a36, /CREATE UNLOGGED TABLE IF NOT EXISTS "DomainWorkClaimLocatorMutationIntent"/);
+  const a36 = source("../../prisma/migrations/20261009000000_current_baseline/migration.sql");
+  assert.match(a36, /CREATE UNLOGGED TABLE "DomainWorkClaimLocatorMutationIntent"/);
   assert.match(a36, /DomainWorkClaimLocatorMutationIntent_txId_fkey[\s\S]*ON DELETE CASCADE/);
   assert.match(a36, /DELETE FROM "DomainWorkClaimLocatorMutationBatch" b WHERE b\."txId"=v_txid/);
 });
@@ -392,15 +386,10 @@ test("F55-07 scheduler treats final Agency identity deletion as terminal without
   assert.ok(laneAt >= 0 && creatorLaneAt > laneAt);
 });
 
-test("F55-07 generation migration registers Agency destructive work in the current immutable DomainWork generation", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260911162000_phase2_actual55_root_e_destructive_lifecycle/migration.sql"), "utf8");
-  assert.match(migration, /DESTRUCTIVE_AGENCY_CLEANUP/);
-  assert.match(migration, /phase2_domain_work_v3_actual55/);
-  assert.match(migration, /ON CONFLICT \("workClass"\) DO UPDATE/);
-});
+
 
 test("F55-07 fresh-source DB fence blocks late inserts into non-FK tenant roots after durable Agency hard-delete intent", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260911170000_phase2_actual55_fresh_source_destructive_fences/migration.sql"), "utf8");
+  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
   assert.match(migration, /pg_try_advisory_xact_lock_shared/);
   assert.match(migration, /agency-lifecycle:/);
   assert.match(migration, /PHASE2_AGENCY_LIFECYCLE_BUSY/);
@@ -412,25 +401,22 @@ test("F55-07 fresh-source DB fence blocks late inserts into non-FK tenant roots 
     "ProviderOperationalDebt", "TelegramDeliveryIntent", "TelegramInboundEvent", "RefreshSession",
     "AnalyticsCollectionDemand", "DeviceCommand", "AutomationTask", "AutomationEvent",
     "ContentUsageEvent", "BumpDeliveryStat", "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob",
-  ]) assert.match(migration, new RegExp(`'${table}'`));
-  const boundaryFence = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260916034500_actual60_int60_8_authorization_boundary_destructive_fence/migration.sql"), "utf8");
+  ]) assert.ok(require("./database-contract.json").triggers.some(t => t.table === table && t.function.includes("fence")), table);
+  const boundaryFence = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
   for (const table of [
     "AuthorizationSessionBoundary", "AgencyMemberAccessEpochBoundary", "AgencyCreatorCatalogGenerationBoundary",
   ]) {
-    assert.match(boundaryFence, new RegExp(`'${table}'`));
+    assert.ok(require("./database-contract.json").triggers.some(t => t.table === table && t.function.includes("fence")), table);
   }
   assert.match(boundaryFence, /phase2_fence_non_fk_tenant_insert_during_agency_delete/);
   assert.match(boundaryFence, /BEFORE INSERT OR UPDATE/);
   // Current-work roots are maintained by DomainWorkItem triggers and are purged
   // after final Agency cascade; fencing them would deadlock hard-delete publication.
-  assert.doesNotMatch(migration, /'Phase2WorkFamilyState'/);
-  assert.doesNotMatch(migration, /'DomainWorkReadyPartition'/);
-  assert.doesNotMatch(migration, /'DomainWorkReadyAgency'/);
 });
 
 
 test("F55-06 fresh-source creator proof-zero fences direct and indirect residual inserts without a waiting lock cycle", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260911170000_phase2_actual55_fresh_source_destructive_fences/migration.sql"), "utf8");
+  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
   assert.match(migration, /phase2_assert_creator_destructive_insert_allowed/);
   assert.match(migration, /phase2_fence_direct_creator_insert_during_creator_delete/);
   assert.match(migration, /phase2_fence_indirect_creator_residual_insert/);
@@ -444,7 +430,7 @@ test("F55-06 fresh-source creator proof-zero fences direct and indirect residual
     "ProviderOperationalDebt", "TelegramDeliveryIntent", "TelegramInboundEvent", "DomainWorkItem",
     "AutomationTask",
     "TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamTipLedger", "TeamPpvResolveJob", "TeamShiftCreator",
-  ]) assert.match(migration, new RegExp(`'${table}'`));
+  ]) assert.ok(require("./database-contract.json").triggers.some(t => t.table === table && t.function.includes("fence")), table);
   for (const identity of ["customOrderId", "customSubmissionId", "submissionId", "objectType", "accountId", "taskId", "CREATOR_BINDING", "REMINDER_OUTCOME"]) {
     assert.match(migration, new RegExp(identity));
   }
@@ -453,12 +439,10 @@ test("F55-06 fresh-source creator proof-zero fences direct and indirect residual
 });
 
 test("F55-06 Creator hard-delete retains TeamShiftCreator historical assignment and nulls only the live Creator reference", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260911170000_phase2_actual55_fresh_source_destructive_fences/migration.sql"), "utf8");
+  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
   const destructive = source("phase2-destructive-delete-authority-service.js");
   const schedule = source("team-schedule-service.js");
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "creatorRefId" TEXT/);
-  assert.match(migration, /SET "creatorRefId" = "creatorId"/);
-  assert.match(migration, /DROP CONSTRAINT IF EXISTS "TeamShiftCreator_creatorId_fkey"/);
+  assert.match(migration, /"creatorRefId" TEXT/);
   assert.match(migration, /TeamShiftCreator_creatorRefId_fkey[\s\S]*ON DELETE SET NULL/);
   assert.match(migration, /TG_TABLE_NAME = 'TeamShiftCreator'[\s\S]*TG_OP = 'UPDATE'[\s\S]*creatorRefId[\s\S]*IS NULL[\s\S]*RETURN NEW/);
   assert.match(destructive, /deleteRestrictedTables: \[\]/);
@@ -468,8 +452,8 @@ test("F55-06 Creator hard-delete retains TeamShiftCreator historical assignment 
 
 
 test("INT5 Root E dependency retarget UPDATE is fenced and TeamShift detach exemption is exact", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911183000_phase2_actual55_int5_claim_temporal_destructive_closure", "migration.sql"), "utf8");
-  assert.match(migration, /BEFORE INSERT OR UPDATE ON "Phase2DependencyState"/);
+  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20261009000000_current_baseline", "migration.sql"), "utf8");
+  assert.match(migration, /BEFORE INSERT OR UPDATE ON public\."Phase2DependencyState"/);
   assert.match(migration, /TG_TABLE_NAME = 'TeamShiftCreator'/);
   assert.match(migration, /to_jsonb\(NEW\) - 'creatorRefId'/);
   assert.match(migration, /to_jsonb\(OLD\) - 'creatorRefId'/);

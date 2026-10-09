@@ -17,13 +17,7 @@ test("V20.22 current schema keeps canonical CreatorSessionState and removes the 
   assert.doesNotMatch(schema, /enum CreatorSessionMode|sessionMode\s+CreatorSessionMode|LOCAL_PERSISTENT/);
 });
 
-test("V20.11 migration is additive and never rewrites existing creator partitions", () => {
-  const migration = read("prisma/migrations/20260822213000_creator_session_broker_foundation/migration.sql");
-  assert.match(migration, /DEFAULT 'LOCAL_PERSISTENT'/);
-  assert.match(migration, /CREATE TABLE "CreatorSessionState"/);
-  assert.doesNotMatch(migration, /UPDATE\s+"CreatorAccount"/i);
-  assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN|TYPE)/i);
-});
+
 
 test("V20.22 server exposes canonical broker with legacy AccessSnapshot routes physically removed", () => {
   const server = read("src/server.js");

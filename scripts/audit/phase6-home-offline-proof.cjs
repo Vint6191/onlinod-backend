@@ -13,7 +13,7 @@ test('A2 PostgreSQL Home read/permission/pagination proof',async t=>{
  await pg.exec('ALTER TABLE "AnalyticsScanProof" ADD COLUMN "proofVersion" INTEGER NOT NULL DEFAULT 1');
  await pg.exec(`INSERT INTO "AnalyticsCollectionDemand"(key,"agencyId","rangeKey","coverageFrom","coverageTo",reason,"creatorIds","requestedByMemberId","requestedAccessEpoch","requestedAt","updatedAt")
  VALUES ('preexisting','preexisting','7d','2026-09-01','2026-09-29','test','["historical-creator"]','old-member',7,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`);
- await pg.exec(fs.readFileSync(path.join(root,'prisma/migrations/20260929170000_phase6_home_member_scope_v1/migration.sql'),'utf8'));
+ await pg.exec(fs.readFileSync(path.join(root,'prisma/migrations/20261009000000_current_baseline/migration.sql'),'utf8'));
  const calls=[];const db={$queryRawUnsafe:async(sql,...params)=>{const r=await pg.query(sql,params);calls.push({rows:r.rows.length,paramBytes:JSON.stringify(params).length,sql});return r.rows;}};
  async function insert(table,data){const fields=Object.keys(data);return pg.query(`INSERT INTO "${table}" (${fields.map(f=>`"${f}"`).join(',')}) VALUES (${fields.map((_,i)=>`$${i+1}`).join(',')})`,Object.values(data));}
  await pg.exec(`INSERT INTO "Agency"(id,name,"trialEndsAt","updatedAt") VALUES ('a','Agency','2099-01-01',CURRENT_TIMESTAMP),('foreign','Other','2099-01-01',CURRENT_TIMESTAMP);

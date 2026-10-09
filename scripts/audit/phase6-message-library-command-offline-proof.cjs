@@ -40,12 +40,6 @@ async function main() {
     await engine.exec("DISCARD ALL");
     console.log("PROOF_WIRE_RESET");
     await engine.exec("SET TIME ZONE 'UTC'");
-    await engine.exec(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE';
-      CREATE TABLE "Phase5AuditFault" (enabled boolean NOT NULL);
-      INSERT INTO "Phase5AuditFault" VALUES (false);
-      CREATE FUNCTION phase5_fail_required_audit() RETURNS trigger LANGUAGE plpgsql AS $$
-      BEGIN IF (SELECT enabled FROM "Phase5AuditFault") THEN RAISE EXCEPTION 'PHASE5_CONTROLLED_AUDIT_FAILURE'; END IF; RETURN NEW; END $$;
-      CREATE TRIGGER phase5_audit_fault BEFORE INSERT ON "AuditLog" FOR EACH ROW EXECUTE FUNCTION phase5_fail_required_audit();`);
     console.log("PROOF_FIXTURE_DDL_READY");
     require.cache[require.resolve("../../src/prisma")] = { exports: db };
     const team = require("../../src/services/team-administration-service");

@@ -13,8 +13,6 @@ async function main() {
     console.log("[I4 proof] normal retained-schema deployment plan applied");
     await engine.exec("DISCARD ALL");
     await engine.exec("SET TIME ZONE 'UTC'");
-    await engine.exec(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`);
-    await engine.exec(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "requiredGeneration"='phase3_domain_executor_v6_failure_policy',"activationState"='ACTIVE' WHERE "scope"='DOMAIN_WORK_EXECUTOR'`);
     let attempts = 0, fault = null, afterRollback = null, hook = null, offsetMs = 0;
     const proxy = new Proxy({}, { get(_unused, key) {
       if (key === "$transaction") return async (fn, options) => {

@@ -7,7 +7,7 @@ const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
 const {
   TEAM_CONTROL_PLANE_GENERATION,
   teamControlPlaneActivationDiagnostics,
-} = require("./phase2-release-compatibility-authority-service");
+} = require("./database-write-contract-service");
 const { withPhase3PostgresFixtureAuthority, cleanupPhase3PostgresAgencyFixture } = require("../../scripts/audit/phase3-postgres-proof-fixture-authority");
 
 function id(prefix) {

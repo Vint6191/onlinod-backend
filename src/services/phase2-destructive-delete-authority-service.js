@@ -1,6 +1,5 @@
 "use strict";
-const { assertSfsRetirable } = require("./phase7-obligation-authority-service");
-const { drainLifecycleLegacyJobs } = require("./phase7-lifecycle-archive-service");
+const { assertSfsRetirable } = require("./sfs-retirement-guard");
 
 const { runDbTransaction } = require("./db-transaction-service");
 const {
@@ -17,7 +16,7 @@ const {
 } = require("./custom-content-pipeline-authority-service");
 const { assertAgencyMassCampaignRetirable, assertCreatorMassCampaignRetirable } = require("./mass-campaign-authority-service");
 const { retireCreatorWithinTransaction } = require("./creator-lifecycle-authority-service");
-const { assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
+const { assertTeamControlPlaneWriteAdmission } = require("./database-write-contract-service");
 
 const CREATOR_DELETE_BATCH = 250;
 const AGENCY_DELETE_BATCH = 250;
@@ -858,9 +857,6 @@ async function processAgencyHardDeleteWorkItem({ db, item, ownerToken, batchSize
       return { ok: true, complete: false, deleted: 0, phase: "WAIT_CREATOR_LIFECYCLES" };
     }
 
-    const legacy = await drainLifecycleLegacyJobs({tx,agencyId,limit:Math.min(limit,10)});
-    if (legacy.waiting) return {ok:true,complete:false,deleted:0,phase:"WAIT_LEGACY_CLEANUP",retryAfterMs:legacy.retryAfterMs};
-    if (legacy.deleted || legacy.hasMore) return {ok:true,complete:false,deleted:legacy.deleted,phase:"LEGACY_SCOPED_HANDOFF"};
     await assertSfsRetirable({db:tx,agencyId});
     let remaining = limit;
     const nonFk = await purgeAgencyNonFkTenantBatch({ tx, agencyId, limit: remaining });
@@ -944,9 +940,6 @@ async function processCreatorHardDeleteWorkItem({ db, item, ownerToken, batchSiz
       `, creatorId, agencyId, String(item.id), String(ownerToken || item.ownerToken || ""));
     }
 
-    const legacy = await drainLifecycleLegacyJobs({tx,agencyId,creatorId,limit:Math.min(limit,10)});
-    if (legacy.waiting) return {ok:true,complete:false,deleted:0,phase:"WAIT_LEGACY_CLEANUP",retryAfterMs:legacy.retryAfterMs};
-    if (legacy.deleted || legacy.hasMore) return {ok:true,complete:false,deleted:legacy.deleted,phase:"LEGACY_SCOPED_HANDOFF"};
     await assertSfsRetirable({db:tx,agencyId,creatorId});
     let remaining = limit;
     const nonFk = await purgeCreatorNonFkPhase2Batch({ tx, agencyId, creatorId, limit: remaining });

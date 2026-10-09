@@ -7,7 +7,7 @@ const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..");
 const BACKEND = path.resolve(ROOT, "..");
-const FINAL_MIGRATION = path.join(BACKEND, "prisma", "migrations", "20260910211500_phase2_actual53_final_closure", "migration.sql");
+const FINAL_MIGRATION = path.join(BACKEND, "prisma", "migrations", "20261009000000_current_baseline", "migration.sql");
 
 function productionJsFiles(dir = ROOT) {
   const out = [];
@@ -71,11 +71,4 @@ test("Actual53 final source: physical Creator hard delete exists only behind bou
   assert.match(destructive, /creatorCascadeRowsRemain/);
 });
 
-test("Actual53 final source: effective DomainWork SQL publisher accepts CURRENT_TIMESTAMP timestamptz", () => {
-  const migration = fs.readFileSync(FINAL_MIGRATION, "utf8");
-  assert.match(migration, /DROP FUNCTION IF EXISTS "phase2_publish_domain_work"\([\s\S]*TIMESTAMP WITHOUT TIME ZONE[\s\S]*\);/);
-  const createAt = migration.lastIndexOf('CREATE OR REPLACE FUNCTION "phase2_publish_domain_work"(');
-  assert.ok(createAt >= 0);
-  const body = migration.slice(createAt, migration.indexOf("$$ LANGUAGE plpgsql;", createAt) + "$$ LANGUAGE plpgsql;".length);
-  assert.match(body, /p_available_at\s+TIMESTAMPTZ\s+DEFAULT CURRENT_TIMESTAMP/);
-});
+

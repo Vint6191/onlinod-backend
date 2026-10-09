@@ -97,8 +97,6 @@ const PHASE2_HISTORICAL_ENUMERATION_BATCH_SIZE = 20;
 const PHASE2_CUSTOM_REMINDER_BATCH_SIZE = 50;
 const TEAM_PENDING_PROJECTION_LANE_KEY = "team_pending_projection_v1";
 const TEAM_PENDING_PROJECTION_LANE_GENERATION = "team_pending_projection_v1";
-const TEAM_LEGACY_PENDING_REPAIR_LANE_KEY = "team_legacy_pending_bootstrap_repair_v1";
-const TEAM_LEGACY_PENDING_REPAIR_LANE_GENERATION = "team_legacy_pending_bootstrap_repair_v1";
 const ANALYTICS_DEMAND_INTERVAL_MS = 15 * 1000; // durable interactive Home freshness demands
 const TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS = 30 * 1000; // lane cadence; pump checks due state more frequently
 const PHASE2_MAINTENANCE_PUMP_INTERVAL_MS = 5 * 1000;
@@ -1774,28 +1772,6 @@ async function maybeBackfillTeamPendingProjection({ db = prisma, now = new Date(
   return runTeamDialogProjectionSweep({ db, now });
 }
 
-async function maybeRepairLegacyTeamPendingBootstrap({ db = prisma, now = new Date() } = {}) {
-  try {
-    const { repairStaleLegacyBootstrapPendingBatch } = require("./team-pending-read-service");
-    const result = await runMaintenanceLane({
-      db,
-      key: TEAM_LEGACY_PENDING_REPAIR_LANE_KEY,
-      generation: TEAM_LEGACY_PENDING_REPAIR_LANE_GENERATION,
-      oneTime: true,
-      fallbackNow: now,
-      work: async () => repairStaleLegacyBootstrapPendingBatch({ db, limit: TEAM_PENDING_BACKFILL_BATCH_SIZE, fallbackNow: now }),
-    });
-    if (!result?.skipped && (Number(result?.selected || 0) > 0 || result?.complete)) {
-      console.log(`[scheduler] Team legacy pending repair — cleared=${result.cleared || 0}/${result.selected || 0}, remaining=${result.remaining || 0}, complete=${result.complete === true}`);
-    }
-    return result;
-  } catch (err) {
-    console.warn("[scheduler] Team legacy pending repair failed:", err?.message || err);
-    return { ok: false, error: err?.message || String(err) };
-  }
-}
-
-
 function estimatedCampaignDirectoryPages(state) {
   const count = Math.max(0, Number(state?.campaignDirectoryCampaignCount || 0));
   // Source-exhaustive traversal needs the terminal page as well. Existing exact
@@ -2466,7 +2442,6 @@ module.exports = {
   runCreatorDestructiveCleanupSweep,
   maybeRunRetentionSweep,
   maybeReconcileHistoricalTeamMoney,
-  maybeRepairLegacyTeamPendingBootstrap,
   maybeBackfillProviderOperationalDebt,
   maybeBackfillTeamPendingProjection,
   maybeSeedPhase2CoverageWork,

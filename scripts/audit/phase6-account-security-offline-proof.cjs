@@ -49,9 +49,6 @@ async function main() {
     await engine.exec("DISCARD ALL");
     console.log("PROOF_WIRE_RESET");
     await engine.exec("SET TIME ZONE 'UTC'");
-    await engine.exec(
-      `UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`
-    );
     await engine.exec(`CREATE TABLE "D8AuditFault" (enabled boolean NOT NULL); INSERT INTO "D8AuditFault" VALUES(false);
       CREATE FUNCTION d7_receipt_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
         IF (SELECT enabled FROM "D8AuditFault") THEN RAISE EXCEPTION 'D8_RECEIPT_FAULT'; END IF; RETURN NEW; END $$;
@@ -78,7 +75,7 @@ async function main() {
     const { sessionRevision, selectSessions, readActiveSessions } = require('../../src/services/account-security-state');
     const { resetAccountPassword } = require('../../src/services/account-password-reset-service');
     const auth = require('../../src/services/auth-service'), settings = require('../../src/services/settings-service');
-    const { authorizeAuthorizationHistoryPublisher } = require('../../src/services/actual60-authorization-history-rollout-service');
+    const { authorizeAuthorizationHistoryPublisher } = require('../../src/services/authorization-history-write-contract');
     const bcrypt = require('bcryptjs');
     const oldHash = await bcrypt.hash('original-password', 4);
     let seq=0;

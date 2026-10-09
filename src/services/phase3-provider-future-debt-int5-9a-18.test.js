@@ -66,12 +66,4 @@ test("A18 canonical capacity scan projects JobInstance durable debt but never as
   assert.doesNotMatch(read("src/services/provider-capacity-debt-authority-service.js"), /backgroundOtherRequiredCalls\s*=\s*backgroundOtherPendingJobs/);
 });
 
-test("A18 schema/migration are additive typed future-debt coverage", () => {
-  const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260919060000_phase3_provider_future_debt_coverage_v1/migration.sql");
-  for (const field of ["backgroundOtherPendingJobs","backgroundOtherPendingJobClasses","backgroundOtherCallCardinalityKnown","futureDebtCoverageStatus","futureDebtCoverageReason"]) {
-    assert.match(schema, new RegExp(`${field}\\s+`));
-    assert.match(migration, new RegExp(`"${field}"`));
-  }
-  assert.doesNotMatch(migration, /DROP TABLE|DROP COLUMN|TRUNCATE|DELETE FROM/i);
-});
+

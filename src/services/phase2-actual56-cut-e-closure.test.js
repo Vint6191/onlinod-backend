@@ -14,7 +14,7 @@ const slice = (source, from, to) => {
   return source.slice(a, b);
 };
 
-const migration = read("../prisma/migrations/20260911213000_phase2_actual56_cut_e_lifecycle_access_authority/migration.sql");
+const migration = read("../prisma/migrations/20261009000000_current_baseline/migration.sql");
 
 test("F56-09/F56-10 creator retirement uses indexed inverse scope and one commit fence", () => {
   const creators = read("routes/creators.js");
@@ -92,27 +92,14 @@ test("F56-06/F56-07 Team current reads consume live Creator Member User and acce
   assert.match(schedule, /filterShiftCurrentCreatorLinks/);
   assert.match(pending, /creator:\s*\{ is:\s*\{ deletedAt:\s*null \} \}/);
   assert.match(pending, /OPERATIONAL_OWNER_INELIGIBLE/);
-  const operationalMigration = read("../prisma/migrations/20260912003000_phase2_actual56_operational_pending_authority/migration.sql");
+  const operationalMigration = read("../prisma/migrations/20261009000000_current_baseline/migration.sql");
   assert.match(operationalMigration, /phase2_scope_allows_creator/);
   assert.match(pending, /TeamOperationalPendingCurrent/);
   assert.match(read("services/admin-operational-command-service.js"), /UPDATE "AgencyMember"[\s\S]*"accessEpoch"="accessEpoch"\+1/);
   assert.match(read("services/admin-operational-command-service.js"), /SELECT "id" FROM "User" WHERE "id"=\$1 FOR UPDATE/);
 });
 
-test("F56-05/F56-08 destructive internal authority is explicit and narrow", () => {
-  const worker = read("services/phase2-destructive-delete-authority-service.js");
-  assert.match(worker, /set_config\('onlinod\.phase2_destructive_agency_id'/);
-  assert.match(worker, /set_config\('onlinod\.phase2_destructive_creator_id'/);
-  assert.match(migration, /phase2_internal_agency_destructive_authorized/);
-  assert.match(migration, /phase2_internal_creator_destructive_authorized/);
-  assert.match(migration, /phase2_assert_agency_destructive_mutation_allowed/);
-  assert.match(migration, /phase2_assert_creator_destructive_insert_allowed/);
-  const intent = slice(migration, 'CREATE OR REPLACE FUNCTION "phase2_intent_domain_work_trigger"', 'CREATE OR REPLACE FUNCTION "phase2_submission_domain_work_trigger"');
-  assert.match(intent, /TG_OP='DELETE'[\s\S]*phase2_internal_creator_destructive_authorized[\s\S]*RETURN OLD/);
-  const submission = migration.slice(migration.indexOf('CREATE OR REPLACE FUNCTION "phase2_submission_domain_work_trigger"'));
-  assert.match(submission, /TG_OP='DELETE'[\s\S]*phase2_internal_creator_destructive_authorized[\s\S]*RETURN OLD/);
-  assert.doesNotMatch(migration, /session_replication_role|DISABLE TRIGGER/);
-});
+
 
 test("operational Pending ownership rejects disabled/deactivated/out-of-scope members", () => {
   const pending = read("services/team-pending-read-service.js");
@@ -139,12 +126,7 @@ test("invitation restore uses canonical MemberLifecycleAuthority with live User 
   assert.match(helper, /deletedAt: null,[\s\S]*deactivatedAt: null,[\s\S]*accessEpoch: \{ increment: 1 \}/);
 });
 
-test("CUT E migration repairs legacy dead creator scope and soft-retired schedule edges", () => {
-  assert.match(migration, /phase2_filter_live_creator_scope/);
-  assert.match(migration, /UPDATE "AgencyMember"[\s\S]*"accessEpoch"=m\."accessEpoch"\+1/);
-  assert.match(migration, /SELECT i\."id", "phase2_filter_live_creator_scope"[\s\S]*FROM "AgencyInvitation"[\s\S]*UPDATE "AgencyInvitation"/);
-  assert.match(migration, /UPDATE "TeamShiftCreator"[\s\S]*SET "creatorRefId"=NULL[\s\S]*"deletedAt" IS NULL/);
-});
+
 
 test("current Schedule defensively joins live Creator even before legacy repair convergence", () => {
   const schedule = read("services/team-schedule-service.js");

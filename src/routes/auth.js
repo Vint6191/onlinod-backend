@@ -25,7 +25,7 @@ const { cleanFunctions, ensureRoleExists, lockTeamRoleLifecycle, materializeInvi
 const { audit } = require("../services/audit-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
 const { lockTeamControlPlaneTopology, lockLiveTeamControlPlaneCreators } = require("../services/team-control-plane-authority-service");
-const { assertTeamControlPlaneWriteAdmission } = require("../services/phase2-release-compatibility-authority-service");
+const { assertTeamControlPlaneWriteAdmission } = require("../services/database-write-contract-service");
 const { acquireAuthorizationUserLock } = require("../services/authorization-session-authority-service");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 

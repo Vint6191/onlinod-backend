@@ -151,20 +151,7 @@ test("INT4.3A SFS identity follows opaque targetUserId across username rename an
   }
 });
 
-test("INT4.3A migration merges username-era duplicates before enforcing opaque target uniqueness", () => {
-  const schema = fs.readFileSync(path.resolve(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.resolve(__dirname, "../../prisma/migrations/20260916190000_phase3_sfs_opaque_target_identity/migration.sql"), "utf8");
-  assert.match(schema, /model SfsTargetCandidate[\s\S]*subscribePriceCents\s+Int\?/);
-  assert.doesNotMatch(schema, /@@unique\(\[creatorId, username\]\)/);
-  assert.match(schema, /@@index\(\[creatorId, username\]\)/);
-  assert.match(migration, /SfsTargetCandidate_creatorId_targetUserId_key/);
-  assert.match(migration, /AutomationDelivery[\s\S]*candidateId/);
-  assert.match(migration, /JobInstance[\s\S]*candidateId/);
-  assert.match(migration, /UNFOLLOW_DUE[\s\S]*RECOVERY_REQUIRED/);
-  assert.match(migration, /DROP NOT NULL/);
-  assert.match(migration, /legacyRelationshipProjectionInvalidatedAt/);
-  assert.match(migration, /"subscribePriceCents" = NULL[\s\S]*"creatorFollowing" = NULL/);
-});
+
 
 test("INT4.3A discovery lock and lookup are target-id based, never username authority", () => {
   const source = fs.readFileSync(path.resolve(__dirname, "sfs-service.js"), "utf8");

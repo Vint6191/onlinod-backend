@@ -29,7 +29,7 @@ const expectedTouchpoints = [
   "src/services/account-security-command-service.js",
   "src/services/account-security-state.js",
   "src/services/admin-operational-command-service.js",
-  "src/services/actual60-authorization-history-rollout-service.js",
+  "src/services/authorization-history-write-contract.js",
   "src/services/auth-service.js",
   "src/services/authorization-session-authority-service.js",
   "src/services/client-e2e-keyring-service.js",

@@ -8,15 +8,7 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "../..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 
-test("V8 Team Administration schema migration is additive and reversible deactivation is separate from delete", () => {
-  const migration = read("prisma/migrations/20260812222000_team_administration_v1/migration.sql");
-  const schema = read("prisma/schema.prisma");
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "deactivatedAt"/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "functions" JSONB/);
-  assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN)/i);
-  assert.match(schema, /deactivatedAt\s+DateTime\?/);
-  assert.match(schema, /functions\s+Json\?/);
-});
+
 
 test("Team legacy routes remain explicit upgrade fences and v2 validates function provenance", () => {
   const route = read("src/routes/team.js");

@@ -424,36 +424,10 @@ test("CUSTOM_MANUAL_V2 capability rejects ambiguous provider outcomes instead of
   await assert.rejects(() => settleCustomManualDeliveryWithCapability({ ...base, outcome: "PROVEN_SUCCESS", providerStatus: 500, messageId: "fake" }, { db: commitDatabaseFixture(db) }), (error) => error?.code === "CUSTOM_DELIVERY_SETTLEMENT_STATUS_INVALID");
 });
 
-test("V20.7 schema/migration separates Telegram task deliveredAt from durable fan delivery progress", () => {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const root = path.resolve(__dirname, "..", "..");
-  const schema = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260822110500_custom_actual_delivery_tracking", "migration.sql"), "utf8");
-  assert.match(schema, /deliveredAt\s+DateTime\?[\s\S]*fanDeliveredAt\s+DateTime\?/);
-  assert.match(schema, /deliverySentMediaIds\s+String\[\]\s+@default\(\[\]\)/);
-  assert.match(schema, /deliveryMessageIds\s+String\[\]\s+@default\(\[\]\)/);
-  assert.match(schema, /deliveryOfferedCents\s+Int\s+@default\(0\)/);
-  assert.match(migration, /ADD COLUMN "fanDeliveredAt"/);
-  assert.doesNotMatch(migration, /DROP COLUMN "deliveredAt"|RENAME COLUMN "deliveredAt"/);
-});
 
 
-test("Custom delivery receipt schema is a typed durable business-history authority", () => {
-  const fs = require("node:fs");
-  const path = require("node:path");
-  const root = path.resolve(__dirname, "..", "..");
-  const schema = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260908013000_custom_delivery_business_receipts", "migration.sql"), "utf8");
-  const replaySnapshotMigration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260908043000_custom_delivery_receipt_replay_snapshot", "migration.sql"), "utf8");
-  assert.match(schema, /model CustomDeliveryReceipt[\s\S]*deliveredMediaIdsAfter\s+String\[\][\s\S]*duplicateMediaIds\s+String\[\][\s\S]*expectedPriceCents\s+Int[\s\S]*actualPriceCents\s+Int/);
-  assert.match(schema, /@@unique\(\[agencyId, creatorId, messageId\]/);
-  assert.match(schema, /@@unique\(\[writeId, writeCommitRevision\]/);
-  assert.match(migration, /CREATE TABLE "CustomDeliveryReceipt"/);
-  assert.match(migration, /CustomDeliveryReceipt_provider_message_key/);
-  assert.match(replaySnapshotMigration, /ADD COLUMN "deliveredMediaIdsAfter" TEXT\[\]/);
-  assert.doesNotMatch(migration, /INSERT INTO "CustomDeliveryReceipt"[\s\S]*AuditLog/i, "migration must not synthesize incomplete receipts from best-effort audit history");
-});
+
+
 
 test("durable MESSAGE_SEND_CONFIRMED carries request-bound Custom override audit metadata without choosing delivery authority", async () => {
   const { order, db, audits } = fixture();

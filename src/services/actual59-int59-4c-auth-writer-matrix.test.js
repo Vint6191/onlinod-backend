@@ -83,15 +83,4 @@ test("INT59.4D refresh source token is a commit-time DB-clock fence after USER/D
   assert.ok(user >= 0 && user < device && device < authorityFence && authorityFence < sourceFence && sourceFence < create);
 });
 
-test("INT59.4D migration contract keeps legacy lineage nullable and boundary triggers DB-clock/idempotent", () => {
-  const schema = source("../prisma/schema.prisma");
-  const migration = source("../prisma/migrations/20260915193000_actual59_int59_3_authorization_lineage_catalog_boundary/migration.sql");
-  assert.match(schema, /authorizationSessionId\s+String\?/);
-  assert.match(migration, /^BEGIN;/m);
-  assert.match(migration, /COMMIT;\s*$/m);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "authorizationSessionId" TEXT/);
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS "AuthorizationSessionBoundary"/);
-  assert.match(migration, /CREATE OR REPLACE FUNCTION "capture_authorization_session_boundary"/);
-  assert.match(migration, /clock_timestamp\(\)/);
-  assert.match(migration, /ON CONFLICT \("authorizationSessionId"\) DO NOTHING/);
-});
+

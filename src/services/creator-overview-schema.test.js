@@ -11,7 +11,7 @@ const service = read("services/creator-overview-service.js");
 const routes = read("routes/stats.js");
 const retention = read("services/retention-service.js");
 const schema = read("../prisma/schema.prisma");
-const migration = read("../prisma/migrations/20260809121500_creator_overview_v1/migration.sql");
+const migration = read("../prisma/migrations/20261009000000_current_baseline/migration.sql");
 
 test("creator overview is a composed read model, not another raw analytics store", () => {
   assert.match(service, /readCreatorLedgerOverview/);
@@ -43,18 +43,7 @@ test("one-year audience range stays locked until six-month backfill has accumula
   assert.match(service, /365d/);
 });
 
-test("task activity is a compact relational 30-day projection with one row per backend job", () => {
-  assert.match(schema, /model CreatorTaskActivity/);
-  assert.match(schema, /jobId\s+String\s+@unique/);
-  assert.doesNotMatch(schema.slice(schema.indexOf("model CreatorTaskActivity"), schema.indexOf("model DeviceCommand")), /\bJson\??/);
-  assert.match(migration, /CREATE TABLE "CreatorTaskActivity"/);
-  assert.match(migration, /ON CONFLICT \("jobId"\) DO UPDATE/);
-  assert.match(migration, /NEW\."id" \|\| ':activity'/);
-  assert.match(migration, /status" = 'SCHEDULED'.*startedAt/s);
-  assert.doesNotMatch(migration, /CreatorTaskActivity_jobId_fkey/);
-  assert.match(migration, /INTERVAL '30 days'/);
-  assert.match(migration, /FROM "JobInstance" j/);
-});
+
 
 test("activity retention is fixed at 30 days and independent of temperature heuristics", () => {
   assert.match(service, /ACTIVITY_RETENTION_DAYS = 30/);

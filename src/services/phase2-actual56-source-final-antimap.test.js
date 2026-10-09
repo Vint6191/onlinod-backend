@@ -36,7 +36,6 @@ test("SOURCE FINAL anti-map: every DomainWorkItem storage mutator is classified"
     "src/services/custom-order-reminders.js",
     "src/services/domain-work-authority-service.js",
     "src/services/domain-work-repair-service.js",
-    "src/services/notification-history-repair-service.js",
     "src/services/notification-identity-recovery-service.js",
     "src/services/phase2-destructive-delete-authority-service.js",
   ], "A new DomainWorkItem writer must join C1 conservation + M1 executor review");
@@ -116,7 +115,7 @@ test("SOURCE FINAL anti-map: authority-changing rolling-release admission is con
     "src/services/access-epoch-service.js",
     "src/services/admin-operational-command-service.js",
     "src/services/human-control-command-service.js",
-    "src/services/phase2-release-compatibility-authority-service.js",
+    "src/services/database-write-contract-service.js",
     "src/services/team-administration-service.js",
     "src/services/team-control-plane-authority-service.js",
   ], "A new release-gated authority writer must be explicitly classified under M1");

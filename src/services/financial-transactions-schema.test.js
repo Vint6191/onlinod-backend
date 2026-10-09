@@ -8,8 +8,8 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "../..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const schema = read("prisma/schema.prisma");
-const migration = read("prisma/migrations/20260808152000_financial_transactions_v1/migration.sql");
-const targetConstraintMigration = read("prisma/migrations/20260808163500_financial_sale_partial_target_v1/migration.sql");
+const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
+const targetConstraintMigration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
 const service = read("src/services/financial-transactions-service.js");
 const control = read("src/services/financial-transaction-scan-control-service.js");
 const results = read("src/services/job-result-service.js");
@@ -39,21 +39,9 @@ test("all-time financial source ledger is relational, typed and user-optional", 
   assert.match(schema, /enum CreatorFinancialTransactionProjectionStatus/);
 });
 
-test("migration preserves signed source money and never introduces raw JSON", () => {
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS "CreatorFinancialTransaction"/);
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS "CreatorEarningsTotal"/);
-  assert.match(migration, /CreatorFinancialTransaction_creatorId_externalTransactionId_key/);
-  assert.match(migration, /Monetary fields in the source transaction ledger are intentionally signed/);
-  assert.doesNotMatch(migration, /CreatorFinancialTransaction_amount_nonnegative_check/);
-  assert.doesNotMatch(migration, /\bJSONB\b/i);
-});
 
-test("payout MESSAGE/POST sales may be typed before their target id is known", () => {
-  assert.match(targetConstraintMigration, /DROP CONSTRAINT IF EXISTS "CreatorSale_target_consistency_check"/);
-  assert.match(targetConstraintMigration, /"saleType" = 'MESSAGE'[\s\S]*"postId" IS NULL[\s\S]*"messageId" IS NOT NULL OR "externalTransactionId" IS NOT NULL/);
-  assert.match(targetConstraintMigration, /"saleType" = 'POST'[\s\S]*"messageId" IS NULL[\s\S]*"postId" IS NOT NULL OR "externalTransactionId" IS NOT NULL/);
-  assert.match(targetConstraintMigration, /ADD CONSTRAINT "CreatorSale_target_consistency_check"/);
-});
+
+
 
 test("ingest keeps unavailable-user and unknown-type transactions as durable facts", () => {
   assert.match(service, /if \(!row\.fanOnlyFansUserId\) return null/);

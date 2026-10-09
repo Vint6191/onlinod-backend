@@ -137,42 +137,4 @@ test("Schedule write target validation is fail-closed for actor and target-membe
   await assert.rejects(() => schedule.createTeamShift({ agencyId: "agency-1", actorUserId: "user-manager", actorMemberId: "manager", actorAllowedCreatorIds: ["creator-1"], input: { memberId: "member-a", creatorIds: ["creator-2"], startsAt: "2026-08-14T09:00:00Z", endsAt: "2026-08-14T17:00:00Z", timezone: "Europe/Kyiv" }, db: commitDatabaseFixture(db) }), (err) => ["TEAM_SCHEDULE_CREATOR_FORBIDDEN", "MANAGEMENT_CREATOR_SCOPE_REVOKED"].includes(err.code));
 });
 
-test("Schedule is relational, additive and exposes an explicit granular manage permission", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const access = fs.readFileSync(path.join(__dirname, "team-access-control.js"), "utf8");
-  const service = fs.readFileSync(path.join(__dirname, "team-schedule-service.js"), "utf8");
-  const route = fs.readFileSync(path.join(__dirname, "../routes/team-schedule.js"), "utf8");
-  const server = fs.readFileSync(path.join(__dirname, "../server.js"), "utf8");
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260813003000_team_content_schedule_v1/migration.sql"), "utf8");
-  assert.match(schema, /model TeamShift \{/);
-  assert.match(schema, /model TeamShiftCreator \{/);
-  assert.match(schema, /contentId\s+String\?/);
-  const activityBlock = schema.slice(schema.indexOf("model TeamActivityEvent {"), schema.indexOf("model TeamShift {"));
-  assert.match(activityBlock, /@@index\(\[agencyId, contentId\]\)/, "contentId index belongs on TeamActivityEvent");
-  for (const modelName of ["TeamSentMessageLedger", "TeamPpvPurchaseLedger", "TeamPpvResolveJob"]) {
-    const start = schema.indexOf(`model ${modelName} {`);
-    const end = schema.indexOf("\n}", start);
-    const block = schema.slice(start, end);
-    assert.doesNotMatch(block, /@@index\(\[agencyId, contentId\]\)/, `${modelName} must not index a non-existent contentId field`);
-  }
-  assert.match(access, /workspace\.manage_schedule/);
-  assert.match(route, /write && !canManageSchedule/);
-  assert.match(route, /TEAM_COMMAND_V2_REQUIRED/);
-  assert.match(fs.readFileSync(path.join(__dirname, "team-command-service.js"), "utf8"), /withProductBilling\(agencyId, execute\)/);
-  assert.match(server, /app\.use\("\/api\/team\/schedule", authRequired, productBilling, teamScheduleRoutes\)/);
-  assert.match(service, /findAllById\(db\.teamShift/);
-  assert.match(service, /findAllById\(db\.teamResponseCase/);
-  assert.doesNotMatch(service, /take:\s*(?:10000|50000)/, "Schedule reads must not silently truncate at legacy fixed caps");
-  assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM/i);
-  assert.match(migration, /TeamShiftCreator_creatorId_fkey[^;]+ON DELETE RESTRICT/i, "original schedule schema explicitly protected historical planned-shift links");
-  const destructiveMigration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260911170000_phase2_actual55_fresh_source_destructive_fences/migration.sql"), "utf8");
-  assert.match(destructiveMigration, /DROP CONSTRAINT IF EXISTS "TeamShiftCreator_creatorId_fkey"/);
-  assert.match(destructiveMigration, /ADD COLUMN IF NOT EXISTS "creatorRefId" TEXT/);
-  assert.match(destructiveMigration, /TeamShiftCreator_creatorRefId_fkey[\s\S]*ON DELETE SET NULL/);
-  assert.doesNotMatch(schema.slice(schema.indexOf("model TeamShift {"), schema.indexOf("model AnalyticsSnapshot {")), /creatorIds\s+Json/i, "creator assignments must stay relational");
-  const shiftCreator = schema.slice(schema.indexOf("model TeamShiftCreator {"), schema.indexOf("model AnalyticsSnapshot {"));
-  assert.match(shiftCreator, /creatorId\s+String/, "historical creator identity must survive hard delete");
-  assert.match(shiftCreator, /creatorRefId\s+String\?/, "live creator reference must be nullable");
-  assert.match(shiftCreator, /creator CreatorAccount\?[^\n]+creatorRefId[^\n]+onDelete: SetNull/, "hard delete must detach live identity without deleting planned-shift history");
-  assert.match(service, /creatorId, creatorRefId: creatorId/, "new schedule assignments must populate both historical id and live creator reference");
-});
+

@@ -275,8 +275,7 @@ test("legacy adoption serializes both the device replacement and the globally un
   });
   assert.equal(result.ok, true);
   const locks = calls.filter(([kind, args]) => kind === "exec" && /pg_advisory_xact_lock/.test(args.sql)).map(([, args]) => args.params[0]);
-  assert.deepEqual(locks.slice(0, 4), [
-    "actual60:release-activation:AUTHORIZATION_HISTORY_PURGE",
+  assert.deepEqual(locks.slice(0, 3), [
     "authorization-user:user-1",
     "authorization-device:user-1:agency-1:device-a",
     "authorization-lineage:desktop-scope-A",

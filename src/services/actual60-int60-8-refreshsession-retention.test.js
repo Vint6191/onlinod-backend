@@ -124,23 +124,7 @@ test("refresh-session retention fails closed when exact raw-delete cardinality c
   );
 });
 
-test("agency hard-delete owns compact authorization-history rows and fences late boundary recreation", () => {
-  const destructive = read("src/services/phase2-destructive-delete-authority-service.js");
-  for (const table of [
-    "AuthorizationSessionBoundary",
-    "AgencyMemberAccessEpochBoundary",
-    "AgencyCreatorCatalogGenerationBoundary",
-  ]) assert.match(destructive, new RegExp(`"${table}"`));
 
-  const migration = read("prisma/migrations/20260916034500_actual60_int60_8_authorization_boundary_destructive_fence/migration.sql");
-  for (const table of [
-    "AuthorizationSessionBoundary",
-    "AgencyMemberAccessEpochBoundary",
-    "AgencyCreatorCatalogGenerationBoundary",
-  ]) assert.match(migration, new RegExp(`'${table}'`));
-  assert.match(migration, /phase2_fence_non_fk_tenant_insert_during_agency_delete/);
-  assert.match(migration, /BEFORE INSERT OR UPDATE/);
-});
 
 test("refresh-session retention has a non-bypassable hourly drain floor and PARTIAL sweeps bypass the normal completion cooldown", async () => {
   const source = read("src/services/retention-service.js");

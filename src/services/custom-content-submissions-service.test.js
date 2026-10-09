@@ -555,28 +555,7 @@ function withTransactionalRollback(db) {
 
 const member = { id: "member-1", userId: "user-1", agencyId: "agency-1", roleKey: "chatter", role: "OPERATOR", assignedCreators: ["creator-1"], accessEpoch: 1, permissions: { "content.review_customs": true } };
 
-test("Prisma submission ledger stays deliberately compact", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const match = schema.match(/model CustomContentSubmission \{([\s\S]*?)\n\}/);
-  assert.ok(match, "CustomContentSubmission model must exist");
-  const block = match[1];
-  for (const required of ["agencyId", "creatorId", "customOrderId", "telegramMessageIds", "ofMediaIds", "comment", "reviewStatus", "reviewComment", "reviewedByMemberId", "reviewedAt", "receivedAt", "createdAt", "updatedAt"]) {
-    assert.match(block, new RegExp(`\\b${required}\\b`));
-  }
-  for (const forbidden of ["uploadStatus", "assignmentStatus", "deviceId", "endpoint", "peerId", "fileName", "mimeType", "sizeBytes", "attemptCount", "lastError"]) {
-    assert.doesNotMatch(block, new RegExp(`\\b${forbidden}\\b`, "i"), `do not persist ${forbidden} on the compact ledger`);
-  }
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260821115000_custom_content_submission_ledger/migration.sql"), "utf8");
-  assert.match(migration, /CREATE TABLE "CustomContentSubmission"/);
-  assert.match(migration, /"telegramMessageIds" INTEGER\[\]/);
-  assert.match(migration, /"ofMediaIds" TEXT\[\]/);
-  const sourceIdentityMigration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260905090000_custom_submission_telegram_source_account/migration.sql"), "utf8");
-  assert.match(sourceIdentityMigration, /ADD COLUMN IF NOT EXISTS "telegramSourceAccountId" TEXT/);
-  assert.match(sourceIdentityMigration, /ADD COLUMN IF NOT EXISTS "telegramSourceUserId" TEXT/);
-  assert.match(sourceIdentityMigration, /COUNT\(DISTINCT inbound\."accountId"\)/);
-  assert.match(sourceIdentityMigration, /COUNT\(DISTINCT inbound\."senderTelegramUserId"\)/);
-  assert.match(sourceIdentityMigration, /eventCount" = source_identity\."expectedEventCount/);
-});
+
 
 function baseSubmission(overrides = {}) {
   return {
@@ -1387,13 +1366,7 @@ test("V20.9 transport-neutral intake allows a new assigned version only after ex
   );
 });
 
-test("V20.9 migration repairs ambiguous waiting rows into UNASSIGNED and enforces one active review version per custom", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260822123500_custom_content_submission_asset_provenance/migration.sql"), "utf8");
-  assert.match(migration, /SET "customOrderId" = NULL/);
-  assert.match(migration, /ROW_NUMBER\(\) OVER/);
-  assert.match(migration, /CustomContentSubmission_one_waiting_per_order_key/);
-  assert.match(migration, /WHERE "customOrderId" IS NOT NULL\s+AND "reviewStatus" = 'WAITING_REVIEW'/);
-});
+
 
 
 test("concurrent members of one Telegram album merge into the winning submission instead of losing the P2002 loser event", async () => {

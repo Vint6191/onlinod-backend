@@ -235,16 +235,7 @@ test("Audit16 route files that directly consume request deviceId contain an auth
   }
 });
 
-test("Audit16 permission migration preserves legacy explicit decision precedence without promoting ineffective role aliases", () => {
-  const migration = fs.readFileSync(path.resolve(ROOT, "../prisma/migrations/20260902012000_audit16_permission_cutover/migration.sql"), "utf8");
-  assert.match(migration, /any explicit TRUE among aliases wins/i);
-  assert.match(migration, /creatorAnalytics\.viewMoney/);
-  assert.match(migration, /stats\.refresh/);
-  assert.match(migration, /creator_analytics\.manage_traffic_costs/);
-  assert.match(migration, /jsonb_build_object\('analytics', 'hidden'\)/);
-  assert.match(migration, /Legacy AgencySubPermissionOverride alias rows are intentionally retained/);
-  assert.doesNotMatch(migration, /INSERT INTO "AgencySubPermissionOverride"/);
-});
+
 
 test("Audit16 current Dialog Intelligence cannot write retired server raw-message or Vault purchase projections", () => {
   const source = read("services/dialog-intelligence-service.js");

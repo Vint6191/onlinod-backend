@@ -7,7 +7,7 @@ const path = require("node:path");
 
 const root = path.resolve(__dirname, "..", "..");
 const schema = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
-const migration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260823190000_client_e2e_key_hierarchy", "migration.sql"), "utf8");
+const migration = fs.readFileSync(path.join(root, "prisma", "migrations", "20261009000000_current_baseline", "migration.sql"), "utf8");
 
 function modelBlock(name) {
   const start = schema.indexOf(`model ${name} {`);

@@ -232,7 +232,7 @@ test("A19 source contracts keep recovery multi-replica safe, sample capacity bef
   const queue = fs.readFileSync(path.join(root, "src/services/campaign-fan-refresh-queue-service.js"), "utf8");
   const scheduler = fs.readFileSync(path.join(root, "src/services/job-scheduler.js"), "utf8");
   const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260919113000_phase3_campaign_refresh_recovery_status_v1/migration.sql"), "utf8");
+  const migration = fs.readFileSync(path.join(root, "prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
   const shared = fs.readFileSync(path.join(desktopRoot, "packages/shared/src/creator-analytics.ts"), "utf8");
   const normalizer = fs.readFileSync(path.join(desktopRoot, "apps/desktop/electron/main/services/creator-analytics/creator-analytics-service.ts"), "utf8");
   const ui = fs.readFileSync(path.join(desktopRoot, "apps/desktop/renderer/src/features/creator-analytics/CampaignScanner.tsx"), "utf8");
@@ -284,7 +284,4 @@ test("A19 source contracts keep recovery multi-replica safe, sample capacity bef
 });
 
 
-test("A19 migration makes pre-existing FAILED refresh debt immediately retryable", () => {
-  const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260919113000_phase3_campaign_refresh_recovery_status_v1/migration.sql"), "utf8");
-  assert.match(migration, /UPDATE\s+"CreatorFanRefreshDemand"[\s\S]*SET\s+"nextRetryAt"\s*=\s*CURRENT_TIMESTAMP[\s\S]*"status"\s*=\s*'FAILED'[\s\S]*"activeRefreshJobId"\s+IS\s+NULL[\s\S]*"nextRetryAt"\s+IS\s+NULL/i);
-});
+

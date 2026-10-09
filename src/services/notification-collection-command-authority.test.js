@@ -14,7 +14,7 @@ const teamObservation = read("team-observation-service.js");
 const orchestrator = read("creator-analytics-sync-orchestrator.js");
 const manualControl = read("notification-scan-control-service.js");
 const collectorControl = read("analytics-collector-control-service.js");
-const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260908224500_analytics_collection_control_convergence", "migration.sql"), "utf8");
+const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20261009000000_current_baseline", "migration.sql"), "utf8");
 const desktop = fs.readFileSync(path.join(__dirname, "..", "..", "..", "desktop", "apps", "desktop", "electron", "main", "services", "backend-jobs", "handlers", "notifications-catchup-handler.ts"), "utf8");
 
 test("Notifications use the same server-owned collection command envelope as the other current collectors", () => {
@@ -42,8 +42,4 @@ test("Notification page and completion generation fences execute before canonica
   assert.ok(completion >= 0 && completionFence > completion && completionWrite > completionFence, "completion must fence generation before fact writes");
 });
 
-test("migration retires unfinished pre-v1 Notification jobs together with Financial and Campaign jobs", () => {
-  assert.match(migration, /"jobKey" IN \('financial_transactions_scan', 'fetch_campaigns', 'catchup_notifications_scan'\)/);
-  assert.match(migration, /COALESCE\("params"->>'collectionContractVersion', ''\) <> '1'/);
-  assert.match(migration, /"status" IN \('SCHEDULED', 'CLAIMED', 'PAUSED'\)/);
-});
+

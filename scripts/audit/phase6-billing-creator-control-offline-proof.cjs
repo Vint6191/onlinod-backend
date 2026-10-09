@@ -47,9 +47,6 @@ async function main() {
     await engine.exec("DISCARD ALL");
     console.log("PROOF_WIRE_RESET");
     await engine.exec("SET TIME ZONE 'UTC'");
-    await engine.exec(
-      `UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`
-    );
     await engine.exec(`CREATE TABLE "D7AuditFault" (enabled boolean NOT NULL); INSERT INTO "D7AuditFault" VALUES(false);
       CREATE FUNCTION d7_receipt_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
         IF (SELECT enabled FROM "D7AuditFault") THEN RAISE EXCEPTION 'D7_RECEIPT_FAULT'; END IF; RETURN NEW; END $$;
@@ -85,7 +82,7 @@ async function main() {
     async function seed() {
       return db.$transaction(async (tx) => {
         await generation(tx);
-        await require("../../src/services/phase2-release-compatibility-authority-service").authorizeCreatorAccountWrite(
+        await require("../../src/services/database-write-contract-service").authorizeCreatorAccountWrite(
           tx
         );
         const tag = "d7-" + ++seq;
@@ -190,7 +187,7 @@ async function main() {
       command("billing.cancelRenewal", s.creatorId, { expectedRevision: await revision(s) });
     async function creatorData(s, data) {
       return db.$transaction(async (tx) => {
-        await require("../../src/services/phase2-release-compatibility-authority-service").authorizeCreatorAccountWrite(
+        await require("../../src/services/database-write-contract-service").authorizeCreatorAccountWrite(
           tx
         );
         return tx.creatorAccount.update({ where: { id: s.creatorId }, data });

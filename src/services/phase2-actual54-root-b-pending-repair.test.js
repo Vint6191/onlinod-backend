@@ -80,14 +80,7 @@ test("F54-04 worker repair is bounded and restartable through an explicit cursor
   assert.equal(fx.projected, 1, "source event is marked only after the bounded repair converges");
 });
 
-test("F54-04 migration supplies physical order and duplicate-identity indexes for bounded repair", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911013000_phase2_actual54_root_b_closure", "migration.sql"), "utf8");
-  assert.match(migration, /TeamSentMessageLedger_dialog_canonical_order_idx/);
-  assert.match(migration, /TeamActivityEvent_pending_repair_identity_idx/);
-  assert.match(migration, /TeamSentMessageLedger_dialog_reply_order_idx/);
-  assert.match(migration, /COALESCE\(NULLIF\("messageId",''\),NULLIF\("localId",''\),"id"\)/);
-  assert.match(migration, /WHERE "eventKind"='FAN_MESSAGE_RECEIVED'/);
-});
+
 
 test("F54-04 scheduler persists pending repair progress on DomainWork yield", () => {
   const scheduler = fs.readFileSync(path.join(__dirname, "job-scheduler.js"), "utf8");

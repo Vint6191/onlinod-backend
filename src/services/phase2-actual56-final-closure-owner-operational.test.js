@@ -102,7 +102,7 @@ test("C2 Serializable Team write conflicts surface as controlled 409 rather than
   assert.match(kernel, /error\.status = 409/);
 });
 
-test("C2/M1 Agency restore and activation cannot expose a live Agency without an operational OWNER", async () => {
+test("C2/M1 Agency restore cannot expose a live Agency without an operational OWNER", async () => {
   const admin = read("src/routes/admin.js");
   assert.match(admin, /operationHandler\("agency.restore"/);
   const source=read("src/services/admin-operational-command-service.js");
@@ -113,13 +113,7 @@ test("C2/M1 Agency restore and activation cannot expose a live Agency without an
   const update = restore.indexOf("tx.agency.update", owner);
   assert.ok(admission >= 0 && lifecycle > admission && owner > lifecycle && update > owner);
 
-  const release = read("src/services/phase2-release-compatibility-authority-service.js");
-  const activationStart = release.indexOf("async function activateTeamControlPlaneAfterDrain");
-  const activationEnd = release.indexOf("async function runCreatorAccountWriteTransaction", activationStart);
-  const activation = release.slice(activationStart, activationEnd);
-  assert.match(activation, /lockDbAdvisoryXact[\s\S]*mode: "exclusive"/);
-  assert.match(activation, /assertAllLiveAgenciesHaveOperationalOwner/);
-  assert.ok(activation.indexOf("assertAllLiveAgenciesHaveOperationalOwner") < activation.indexOf('"activationState"=\'ACTIVE\''));
+
 });
 
 test("M1 new-Agency OWNER bootstrap joins release admission before Agency/Member creation", () => {

@@ -193,16 +193,4 @@ test('current security debt does not inspect or mutate retired legacy secret sto
   assert.deepEqual((await findRootExposureDebt({ db, agencyId: 'agency-1' })).exposures, []);
   assert.deepEqual((await findUntrustedCreatorExposureDebt({ db, agencyId: 'agency-1' })).exposures, []);
 });
-test('CLIENT_E2E is structurally mandatory and cannot be downgraded through a migration API', () => {
-  const root = path.resolve(__dirname, '../..');
-  const schema = fs.readFileSync(path.join(root, 'prisma/schema.prisma'), 'utf8');
-  const mode = schema.match(/enum SecretEncryptionMode \{([\s\S]*?)\n\}/)?.[1];
-  assert(mode); assert.match(mode, /CLIENT_E2E_V1/); assert.doesNotMatch(mode, /SERVER_V1/);
-  const route = fs.readFileSync(path.join(root, 'src/routes/client-e2e-keyring.js'), 'utf8');
-  assert.match(route, /getCryptoSecurityDebt/); assert.doesNotMatch(route, /migration-status|enforce-opaque|migrate-opaque/);
-  const exports = require('./client-e2e-keyring-service');
-  assert.equal(exports.enforceOpaqueSecrets, undefined); assert.equal(exports.getCryptoMigrationStatus, undefined);
-  const migration = fs.readFileSync(path.join(root, 'prisma/migrations/20260825010000_client_e2e_enum_finalization_v20_22/migration.sql'), 'utf8');
-  assert.match(migration, /SERVER_V1 creator session rows remain/); assert.match(migration, /SERVER_V1 proxy rows remain/);
-  assert.match(migration, /CREATE TYPE "SecretEncryptionMode" AS ENUM \('CLIENT_E2E_V1'\)/);
-});
+

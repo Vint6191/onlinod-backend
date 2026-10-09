@@ -55,9 +55,6 @@ async function main() {
     await engine.exec("DISCARD ALL");
     console.log("PROOF_WIRE_RESET");
     await engine.exec("SET TIME ZONE 'UTC'");
-    await engine.exec(
-      `UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`
-    );
     await engine.exec(`CREATE TABLE "D9ReceiptFault" (enabled boolean NOT NULL); INSERT INTO "D9ReceiptFault" VALUES(false);
       CREATE FUNCTION d9_receipt_fault() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
         IF (SELECT enabled FROM "D9ReceiptFault") THEN RAISE EXCEPTION 'D9_RECEIPT_FAULT'; END IF; RETURN NEW; END $$;
@@ -83,7 +80,7 @@ async function main() {
     const settings = require("../../src/services/settings-service");
     const {
       authorizeAuthorizationHistoryPublisher,
-    } = require("../../src/services/actual60-authorization-history-rollout-service");
+    } = require("../../src/services/authorization-history-write-contract");
     const { FAMILY, GENERATION } = require("../../src/services/phase2-work-coverage-authority-service");
     let seq = 0;
     const generation = (tx) =>

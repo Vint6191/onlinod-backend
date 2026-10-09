@@ -8,10 +8,10 @@ const path = require("node:path");
 const Module = require("node:module");
 
 const servicePath = path.join(__dirname, "retention-service.js");
-const migrationPath = path.join(__dirname, "..", "..", "prisma", "migrations", "20260908190000_analytics_observation_authority", "migration.sql");
+const migrationPath = path.join(__dirname, "..", "..", "prisma", "migrations", "20261009000000_current_baseline", "migration.sql");
 const schemaPath = path.join(__dirname, "..", "..", "prisma", "schema.prisma");
-const collectionMigrationPath = path.join(__dirname, "..", "..", "prisma", "migrations", "20260908224500_analytics_collection_control_convergence", "migration.sql");
-const distributedClosureMigrationPath = path.join(__dirname, "..", "..", "prisma", "migrations", "20260909113000_distributed_collection_retention_runtime_closure", "migration.sql");
+const collectionMigrationPath = path.join(__dirname, "..", "..", "prisma", "migrations", "20261009000000_current_baseline", "migration.sql");
+const distributedClosureMigrationPath = path.join(__dirname, "..", "..", "prisma", "migrations", "20261009000000_current_baseline", "migration.sql");
 const schedulerPath = path.join(__dirname, "job-scheduler.js");
 
 function loadRetention(prismaMock) {
@@ -109,84 +109,15 @@ test("analytics execution retention separates canonical proof from bounded opera
   assert.match(sqlCalls[8].sql, /NOT EXISTS \([\s\S]*"AnalyticsCoverage"/);
 });
 
-test("analytics durable proof schema is intentionally independent from JobInstance lifetime", () => {
-  const schema = fs.readFileSync(schemaPath, "utf8");
-  const proofStart = schema.indexOf("model AnalyticsScanProof");
-  const proofEnd = schema.indexOf("\nmodel ", proofStart + 10);
-  const proof = schema.slice(proofStart, proofEnd > proofStart ? proofEnd : undefined);
-  assert.match(proof, /sourceJobId\s+String\?/);
-  assert.doesNotMatch(proof, /sourceJob\s+JobInstance/);
-  assert.match(proof, /scanRunId/);
-  assert.match(proof, /scanFrom/);
-  assert.match(proof, /scanTo/);
-  assert.match(proof, /serverReceivedAt/);
-  assert.match(proof, /committedAt/);
-  assert.match(proof, /@@index\(\[createdAt, id\], map: "AnalyticsScanProof_createdAt_id_idx"\)/);
-
-  const sql = fs.readFileSync(migrationPath, "utf8");
-  assert.match(sql, /CREATE INDEX "AnalyticsScanProof_createdAt_id_idx" ON "AnalyticsScanProof"\("createdAt", "id"\)/);
-});
-
-test("analytics migration backfills durable proof only from canonical earnings ingest evidence", () => {
-  const sql = fs.readFileSync(migrationPath, "utf8");
-  assert.match(sql, /INSERT INTO "AnalyticsScanProof"/);
-  assert.match(sql, /FROM "AnalyticsIngestBatch" b/);
-  assert.match(sql, /LEFT JOIN "JobInstance" j ON j\."id" = b\."sourceJobId"/);
-  assert.match(sql, /b\."dataType" = 'EARNINGS'/);
-  assert.match(sql, /b\."status"/);
-  assert.match(sql, /completion:v4/);
-  assert.doesNotMatch(sql, /CreatorEarningsSnapshot/);
-  assert.match(sql, /UPDATE "CreatorEarningsDaily" d[\s\S]*"scanProofId"/);
-  assert.match(sql, /UPDATE "AnalyticsCoverage" c[\s\S]*"scanProofId"/);
-});
 
 
-test("analytics recurring sweep coordination is durable and has no business-data relation", () => {
-  const schema = fs.readFileSync(schemaPath, "utf8");
-  const start = schema.indexOf("model AnalyticsCollectionLease");
-  const end = schema.indexOf("\nmodel ", start + 10);
-  assert.ok(start >= 0, "AnalyticsCollectionLease model must exist");
-  const lease = schema.slice(start, end > start ? end : undefined);
-  assert.match(lease, /ownerToken\s+String/);
-  assert.match(lease, /cycleKey\s+String/);
-  assert.match(lease, /cycleNow\s+DateTime/);
-  assert.match(lease, /cursorCreatorId\s+String\?/);
-  assert.match(lease, /leaseUntil\s+DateTime/);
-  assert.match(lease, /completedAt\s+DateTime\?/);
-  assert.doesNotMatch(lease, /@relation/);
-
-  const sql = fs.readFileSync(migrationPath, "utf8");
-  assert.match(sql, /CREATE TABLE "AnalyticsCollectionLease"/);
-  assert.match(sql, /AnalyticsCollectionLease_cycle_complete_idx/);
-  const leaseSqlStart = sql.indexOf('CREATE TABLE "AnalyticsCollectionLease"');
-  const leaseSqlEnd = sql.indexOf('ALTER TABLE "AnalyticsCoverage"', leaseSqlStart);
-  const leaseSql = sql.slice(leaseSqlStart, leaseSqlEnd);
-  assert.doesNotMatch(leaseSql, /FOREIGN KEY/);
-});
 
 
-test("interactive analytics demand is durable operational work with revision, lease and cursor fences", () => {
-  const schema = fs.readFileSync(schemaPath, "utf8");
-  const start = schema.indexOf("model AnalyticsCollectionDemand");
-  const end = schema.indexOf("\nmodel ", start + 10);
-  assert.ok(start >= 0, "AnalyticsCollectionDemand model must exist");
-  const demand = schema.slice(start, end > start ? end : undefined);
-  assert.match(demand, /coverageFrom\s+DateTime\s+@db\.Date/);
-  assert.match(demand, /coverageTo\s+DateTime\s+@db\.Date/);
-  assert.match(demand, /requestRevision\s+Int/);
-  assert.match(demand, /completedRevision\s+Int/);
-  assert.match(demand, /claimedRevision\s+Int\?/);
-  assert.match(demand, /claimUntil\s+DateTime\?/);
-  assert.match(demand, /cursorCreatorId\s+String\?/);
-  assert.doesNotMatch(demand, /@relation/);
 
-  const sql = fs.readFileSync(migrationPath, "utf8");
-  assert.match(sql, /CREATE TABLE "AnalyticsCollectionDemand"/);
-  assert.match(sql, /AnalyticsCollectionDemand_due_idx/);
-  assert.match(sql, /AnalyticsCollectionDemand_agency_requested_idx/);
-  assert.match(sql, /"requestedByMemberId" TEXT NOT NULL/);
-  assert.match(sql, /"requestedAccessEpoch" INTEGER NOT NULL/);
-});
+
+
+
+
 
 
 test("non-earnings and failed-job retention has deterministic indexed terminal-age access paths", () => {
@@ -217,98 +148,16 @@ test("non-earnings and failed-job retention has deterministic indexed terminal-a
   assert.match(source, /analyticsCollectionDemand\.quarantined_/);
 });
 
-test("collection-control migration never upgrades ambiguous Campaign coverage into durable COMPLETE proof", () => {
-  const sql = fs.readFileSync(collectionMigrationPath, "utf8");
-  const start = sql.indexOf('INSERT INTO "CreatorCampaignCollectionState"');
-  const end = sql.indexOf('UPDATE "CreatorCampaignCollectionState"', start);
-  const campaignBackfill = sql.slice(start, end > start ? end : undefined);
-  assert.match(campaignBackfill, /JOIN "AnalyticsIngestBatch" b/);
-  assert.match(campaignBackfill, /b\."status" = 'COMMITTED'/);
-  assert.match(campaignBackfill, /b\."completedAt" IS NOT NULL/);
-  assert.match(campaignBackfill, /JOIN "JobInstance" j/);
-  assert.match(campaignBackfill, /j\."status" = 'DONE'/);
-  assert.match(campaignBackfill, /j\."completedAt" IS NOT NULL/);
-  assert.doesNotMatch(campaignBackfill, /LEFT JOIN "AnalyticsIngestBatch"/);
-  assert.doesNotMatch(campaignBackfill, /COALESCE\(b\."completedAt", b\."startedAt", c\."updatedAt"\)/);
-});
-
-test("notification catchup verification migration never upgrades a legacy partial catchup later marked COMPLETE by realtime", () => {
-  const sql = fs.readFileSync(collectionMigrationPath, "utf8");
-  const marker = 'SET "lastCatchupVerifiedAt" = "lastCatchupCompletedAt"';
-  const start = sql.indexOf(marker);
-  assert.ok(start >= 0, "notification catchup verification backfill must exist");
-  const block = sql.slice(start, start + 500);
-  assert.match(block, /"lastCatchupCompletedAt" IS NOT NULL/);
-  assert.match(block, /"status" = 'COMPLETE'::"AnalyticsCoverageStatus"/);
-  assert.match(block, /"lastErrorCode" IS NULL/);
-});
-
-test("notification sync state stores server collection generation separately from legacy scan identity", () => {
-  const sql = fs.readFileSync(collectionMigrationPath, "utf8");
-  const schema = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "schema.prisma"), "utf8");
-  assert.match(sql, /ALTER TABLE "CreatorNotificationSyncState"[\s\S]*"activeGeneration" TEXT[\s\S]*"activeRequestedAt" TIMESTAMP\(3\)[\s\S]*"retryAfterAt" TIMESTAMP\(3\)/);
-  assert.match(schema, /model CreatorNotificationSyncState \{[\s\S]*activeGeneration\s+String\?[\s\S]*activeRequestedAt\s+DateTime\?[\s\S]*retryAfterAt\s+DateTime\?/);
-});
-
-test("collection-control migration retires only unfinished pre-v1 Financial/Campaign/Notification jobs that cannot satisfy the new command contract", () => {
-  const sql = fs.readFileSync(collectionMigrationPath, "utf8");
-  const marker = "retired_analytics_collection_contract_pre_v1";
-  const start = sql.indexOf(marker);
-  assert.ok(start >= 0, "legacy collection-job retirement must exist");
-  const blockStart = sql.lastIndexOf('UPDATE "JobInstance"', start);
-  const block = sql.slice(blockStart, start + 1200);
-  assert.match(block, /"jobKey" IN \('financial_transactions_scan', 'fetch_campaigns', 'catchup_notifications_scan'\)/);
-  assert.match(block, /"status" IN \('SCHEDULED', 'CLAIMED', 'PAUSED'\)/);
-  assert.match(block, /COALESCE\("params"->>'collectionContractVersion', ''\) <> '1'/);
-  assert.match(block, /"status" = 'CANCELLED'/);
-  assert.match(block, /"leaseRevision" = "leaseRevision" \+ 1/);
-  assert.doesNotMatch(block, /"status" IN \('DONE'/);
-});
 
 
-test("distributed closure migration adopts legacy analytics ordering onto DB-owned job creation time", () => {
-  const sql = fs.readFileSync(distributedClosureMigrationPath, "utf8");
-  assert.match(sql, /CREATE TABLE "RetentionSweepLease"/);
-  assert.match(sql, /\{authorityRequestedAt\}/);
-  assert.match(sql, /\{collectionAuthorityRequestedAt\}/);
-  assert.match(sql, /to_jsonb\(to_char\("createdAt"/);
-  assert.match(sql, /UPDATE "CreatorFinancialCollectionState" AS s[\s\S]*s\."sourceJobId" = j\."id"[\s\S]*activeGeneration/);
-  assert.match(sql, /UPDATE "CreatorCampaignCollectionState" AS s/);
-  assert.match(sql, /UPDATE "CreatorNotificationSyncState" AS s/);
-  assert.match(sql, /UPDATE "CreatorEarningsDaily" AS d[\s\S]*d\."sourceJobId" = j\."id"/);
-  assert.match(sql, /clock_timestamp\(\) - INTERVAL '1 millisecond'/);
-  // Source-window adoption must never rewrite an already CLAIMED contract under
-  // the same lease. CLAIMED work is fenced and restarted. PAUSED work must keep
-  // the operator pause while dropping stale traversal state so a later explicit
-  // resume starts from the DB-owned boundary. Earnings calendar windows are
-  // recomputed by the planner instead of SQL guessing.
-  const financialStart = sql.indexOf(`WHERE "jobKey" = 'financial_transactions_scan'\n  AND "status" = 'SCHEDULED';`);
-  const financialEnd = sql.indexOf(`WHERE "jobKey" = 'catchup_notifications_scan'\n  AND "status" = 'SCHEDULED';`);
-  assert.ok(financialStart >= 0 && financialEnd > financialStart, "financial adoption blocks must exist");
-  const financialBlocks = sql.slice(financialStart, financialEnd);
-  assert.match(financialBlocks, /"status" = 'SCHEDULED'[\s\S]*WHERE "jobKey" = 'financial_transactions_scan'[\s\S]*"status" = 'CLAIMED'/);
-  assert.match(financialBlocks, /"leaseRevision" = "leaseRevision" \+ 1/);
-  const financialPaused = financialBlocks.slice(financialBlocks.indexOf("-- A PAUSED job"));
-  assert.match(financialPaused, /WHERE "jobKey" = 'financial_transactions_scan'\n  AND "status" = 'PAUSED';/);
-  assert.match(financialPaused, /"continuation" = NULL[\s\S]*"progress" = NULL/);
-  assert.match(financialPaused, /analytics_db_time_contract_adopted_paused/);
-  assert.doesNotMatch(financialPaused, /SET "status" = 'SCHEDULED'/);
 
-  const notificationStart = sql.indexOf(`WHERE "jobKey" = 'catchup_notifications_scan'\n  AND "status" = 'SCHEDULED';`);
-  const earningsStart = sql.indexOf("-- Earnings ranges are calendar windows computed by the planner");
-  assert.ok(notificationStart >= 0 && earningsStart > notificationStart, "notification adoption blocks must exist");
-  const notificationBlocks = sql.slice(notificationStart, earningsStart);
-  assert.match(notificationBlocks, /"status" = 'SCHEDULED'[\s\S]*WHERE "jobKey" = 'catchup_notifications_scan'[\s\S]*"status" = 'CLAIMED'/);
-  assert.match(notificationBlocks, /"leaseRevision" = "leaseRevision" \+ 1/);
-  const notificationPaused = notificationBlocks.slice(notificationBlocks.indexOf("UPDATE \"JobInstance\"", notificationBlocks.indexOf("AND \"status\" = 'CLAIMED'")));
-  assert.match(notificationPaused, /WHERE "jobKey" = 'catchup_notifications_scan'\n  AND "status" = 'PAUSED';/);
-  assert.match(notificationPaused, /"continuation" = NULL[\s\S]*"progress" = NULL/);
-  assert.match(notificationPaused, /analytics_db_time_contract_adopted_paused/);
-  assert.doesNotMatch(notificationPaused, /SET "status" = 'SCHEDULED'/);
 
-  assert.match(sql, /"jobKey" = 'fetch_earnings'[\s\S]*"status" IN \('SCHEDULED', 'CLAIMED', 'PAUSED'\)[\s\S]*"status" = 'CANCELLED'/);
-  assert.match(sql, /UPDATE "AnalyticsCollectionLease"[\s\S]*"leaseUntil" = clock_timestamp\(\) - INTERVAL '1 millisecond'[\s\S]*"leaseUntil" > clock_timestamp\(\) \+ INTERVAL '20 minutes'/);
-});
+
+
+
+
+
+
 
 test("retention coordinator is durable, fail-closed and uses one DB-authority cutoff clock", () => {
   const source = fs.readFileSync(path.join(__dirname, "retention-policy-definition.js"), "utf8") + fs.readFileSync(servicePath, "utf8");

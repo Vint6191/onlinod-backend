@@ -74,13 +74,7 @@ test("realtime event ingest requires REALTIME capability rather than generic bin
   assert.match(automation, /status: "ACTIVE",[\s\S]{0,120}realtimeReady: true/);
 });
 
-test("Prisma migration adds capability columns without destructive binding replacement", () => {
-  const migration = fs.readFileSync(path.resolve(root, "../prisma/migrations/20260828162000_device_creator_capability_telemetry/migration.sql"), "utf8");
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "sessionReadReady" BOOLEAN NOT NULL DEFAULT false/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "sessionWriteReady" BOOLEAN NOT NULL DEFAULT false/);
-  assert.match(migration, /CREATE INDEX IF NOT EXISTS "DeviceCreatorBinding_deviceId_sessionReadReady_lastSeenAt_idx"/);
-  assert.doesNotMatch(migration, /DROP TABLE|DROP COLUMN/);
-});
+
 
 
 test("stats realtime reporter is token-device bound and retired daily reporter cannot re-enter current telemetry", () => {

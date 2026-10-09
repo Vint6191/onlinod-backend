@@ -2,13 +2,12 @@
 
 // Executable catalog: names, ordinals and callbacks come from the same source.
 // Existing ordinals are append-only within this generation's migration contract.
-const MAINTENANCE_ADMISSION_GENERATION = "phase6_maintenance_registry_v5";
+const MAINTENANCE_ADMISSION_GENERATION = "onlinod_maintenance_v1";
 const scheduler = "./job-scheduler";
 const MAINTENANCE_LANES = Object.freeze([
   ["providerCapacityProjection", "./provider-capacity-debt-authority-service", "refreshProviderCapacityDebtSnapshot"],
   ["messageLibraryTrash", "./message-library-lifecycle-service", "runMessageLibraryTrashMaintenance"],
   ["adminBillingPricing", "./admin-bulk-pricing-command-service", "runAdminBulkPricingSweep"],
-  ["notificationHistoryRepair", "./notification-history-repair-service", "runNotificationHistoryRepairSweep"],
   ["notificationConsequences", "./notification-consequence-service", "runNotificationConsequenceSweep"],
   ["agencyDestructiveCleanup", scheduler, "runAgencyDestructiveCleanupSweep"],
   ["creatorDestructiveCleanup", scheduler, "runCreatorDestructiveCleanupSweep"],
@@ -26,7 +25,6 @@ const MAINTENANCE_LANES = Object.freeze([
   ["teamReadSummary", scheduler, "runTeamReadSummarySweep"],
   ["teamPendingBackfill", scheduler, "maybeBackfillTeamPendingProjection"],
   ["teamResponseRangeRepair", scheduler, "runTeamResponseRangeRepairSweep"],
-  ["teamLegacyPendingRepair", scheduler, "maybeRepairLegacyTeamPendingBootstrap"],
   ["analyticsPublication", "./analytics-publication-service", "runAnalyticsPublicationSweep"],
   ["trafficProjection", "./traffic-projection-service", "runTrafficProjectionSweep"],
   ["campaignReadProjection", "./campaign-read-projection-service", "seedCampaignProjection"],

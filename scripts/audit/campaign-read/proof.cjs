@@ -11,14 +11,14 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
   read=require(path.join(root,'src/services/campaign-read-repository')),overview=require(path.join(root,'src/services/creator-overview-service')),
   control=require(path.join(root,'src/services/campaign-scan-control-service')),access=require(path.join(root,'src/services/analytics-viewer-read-service')),
   work=require(path.join(root,'src/services/domain-work-authority-service'));
- const rollout=require(path.join(root,'scripts/database/phase3-domain-work-claim-online-rollout'));
- await rollout.withRolloutAuthority(db,async()=>{await rollout.runPreflight(db);await rollout.activateTopology(db,{pauseMs:0});});
  async function write(fn){return kernel.runRootCommit(db,async({tx})=>{await require(path.join(root,'src/services/campaign-causal-activation-service')).enterCampaignWriterGeneration({db:tx});return fn(tx);},{profile:'JOB_CHUNK'});}
  const page=(input={})=>access.readWithAnalyticsViewer({db,userId:s.userId,creatorId:s.creatorId,permission:'money.view_earnings'},({db:tx})=>read.readCampaignPage({db:tx,creatorId:s.creatorId,rangeKey:'30d',...input}));
  async function drain(max=200){for(let i=0;i<max;i++){
   const result=await projection.runCampaignProjectionSweep({db});assert(result.ok,JSON.stringify(result));
   const ready=await read.readiness(db,s.creatorId,new Date());if(ready.ready)return i+1;
- }throw Error('Campaign queue did not drain');}
+ }
+ const pending=await db.domainWorkItem.findMany({where:{creatorId:s.creatorId,workClass:{in:projection.CLASSES},isOutstanding:true},take:12});
+ throw Error('Campaign queue did not drain: '+JSON.stringify({readiness:await read.readiness(db,s.creatorId,new Date()),pending},(_,value)=>typeof value==='bigint'?String(value):value));}
  for(let begin=0;begin<2001;begin+=100)await write(tx=>tx.creatorCampaign.createMany({data:Array.from({length:Math.min(100,2001-begin)},(_,i)=>({
   id:'campaign-'+String(begin+i).padStart(4,'0'),agencyId:s.agencyId,creatorId:s.creatorId,externalCampaignId:'ext-'+(begin+i),name:'Campaign '+(begin+i),startedAt:ago(30),
  }))}));
@@ -171,7 +171,7 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
   const campaign=await work.claimDomainWorkBatch({db,workClass:'CAMPAIGN_FACT',limit:1});assert(campaign.items[0]);
   const traffic=await work.claimDomainWorkBatch({db,workClass:'TRAFFIC_FAN',limit:1});assert(traffic.items[0]);
   async function deleted(value){await kernel.runRootCommit(db,async({tx})=>{
-   await require(path.join(root,'src/services/phase2-release-compatibility-authority-service')).assertTeamControlPlaneWriteAdmission(tx);
+   await require(path.join(root,'src/services/database-write-contract-service')).assertTeamControlPlaneWriteAdmission(tx);
    await require(path.join(root,'src/services/custom-content-pipeline-authority-service')).lockAgencyPipelineLifecycleExclusive({db:tx,agencyId:s.agencyId,allowDeleted:true});
    await tx.agency.update({where:{id:s.agencyId},data:{deletedAt:value}});
   });}
@@ -204,5 +204,5 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
   await drain();assert.equal((await page()).totals.netCents,215);
   return{pausedWithoutAcknowledgement:true,wakeBatch:1,postRestoreNet:215};
  });
- fs.writeFileSync(path.join(evidence,'campaign-sql-proof.json'),JSON.stringify({ok:true,runtime:process.version,schema:'local disposable PGlite; current retained-schema deployment plan',migrations:f.migrations.length,nativePostgres:false,productionAccessed:false,checks},null,2));
+ fs.writeFileSync(path.join(evidence,'campaign-sql-proof.json'),JSON.stringify({ok:true,runtime:process.version,schema:'local disposable PGlite; current atomic baseline',migrations:f.migrations.length,nativePostgres:false,productionAccessed:false,checks},null,2));
 }finally{await f.close()}})().catch(e=>{console.error(e.stack);process.exitCode=1}).finally(()=>{clearInterval(alive);clearTimeout(deadline)});

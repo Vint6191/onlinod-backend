@@ -5,18 +5,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 const root = path.join(__dirname, "..", "..");
 const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
-const migration = read("prisma/migrations/20260912003000_phase2_actual56_operational_pending_authority/migration.sql");
+const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
 const pending = read("src/services/team-pending-read-service.js");
 const analytics = read("src/services/team-analytics-service.js");
 
-test("C3/C4 one DB OperationalPendingOwner authority owns current eligibility", () => {
-  assert.match(migration, /CREATE OR REPLACE VIEW "TeamOperationalPendingCurrent"/);
-  assert.match(migration, /JOIN "CreatorAccount" c[\s\S]*c\."deletedAt" IS NULL/);
-  assert.match(migration, /LEFT JOIN "AgencyMember" m[\s\S]*m\."deletedAt" IS NULL[\s\S]*m\."deactivatedAt" IS NULL/);
-  assert.match(migration, /LEFT JOIN "User" u[\s\S]*u\."disabledAt" IS NULL/);
-  assert.match(migration, /"phase2_scope_allows_creator"\(m\."assignedCreators",p\."creatorId"\)/);
-  assert.match(migration, /AS "operationalOwnerMemberId"/);
-});
+
 
 test("C3 member/unassigned list filtering occurs before LIMIT in SQL", () => {
   const block = pending.slice(pending.indexOf("async function loadOperationalPendingRows"), pending.indexOf("async function summarizeOperationalPending"));

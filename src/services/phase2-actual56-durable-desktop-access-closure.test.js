@@ -40,7 +40,7 @@ test("crypto secret/key-state reads reuse current Member + User + Agency desktop
 });
 
 test("creator catalog generation is durable DB truth for membership changes", () => {
-  const migration = read("prisma/migrations/20260912004000_phase2_actual56_creator_management_catalog_authority/migration.sql");
+  const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
   assert.match(migration, /AFTER INSERT OR DELETE OR UPDATE OF "agencyId", "deletedAt"/);
   assert.match(migration, /"generation" = "AgencyCreatorCatalogState"\."generation" \+ 1/);
 });

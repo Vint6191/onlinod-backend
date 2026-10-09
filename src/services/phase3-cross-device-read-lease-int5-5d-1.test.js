@@ -168,7 +168,7 @@ test("INT5.5D-1 source wiring makes new point-refresh jobs read-lease required a
   const jobs = fs.readFileSync(path.join(root, "src/services/job-lease-service.js"), "utf8");
   const routes = fs.readFileSync(path.join(root, "src/routes/jobs.js"), "utf8");
   const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260917150000_phase3_fan_observation_read_lease/migration.sql"), "utf8");
+  const migration = fs.readFileSync(path.join(root, "prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
 
   assert.match(authority, /observationTokenVersion:\s*1,\s*observationReadLeaseVersion:\s*1/);
   assert.match(jobs, /FAN_OBSERVATION_READ_LEASE_JOB_KEYS\.has\(String\(candidate\.jobKey[\s\S]*observationTokenVersion:\s*1,\s*observationReadLeaseVersion:\s*1/, "first claim after cutover must upgrade all causal-read jobs before execution");

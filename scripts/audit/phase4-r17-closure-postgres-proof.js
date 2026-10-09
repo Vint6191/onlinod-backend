@@ -24,7 +24,6 @@ async function main() {
     await engine.exec("DISCARD ALL");
     await engine.exec("SET TIME ZONE 'UTC'");
     await engine.exec(`BEGIN;
-      UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE';
       SELECT set_config('onlinod.phase2_team_control_plane_generation','phase2_team_control_plane_v2_durable_access',true);
       INSERT INTO "User" ("id","email","passwordHash","updatedAt") VALUES ('owner','owner@example.test','proof',now());
       INSERT INTO "Agency" ("id","name","updatedAt") VALUES ('a','A',now()),('b','B',now());

@@ -2,6 +2,8 @@
 const assert=require('node:assert/strict'),crypto=require('node:crypto'),fs=require('node:fs');
 const {fixture,scope}=require('./fixture.cjs');
 const results=[];
+const historyRows=Number(process.env.ONLINOD_EXTERNAL_HISTORY_ROWS||200000);
+assert.ok(Number.isSafeInteger(historyRows)&&historyRows>=1000&&historyRows<=200000);
 async function check(name,fn){await fn();results.push({name,passed:true});console.log('PASS',name);}
 (async()=>{
  const f=await fixture();
@@ -9,10 +11,7 @@ async function check(name,fn){await fn();results.push({name,passed:true});consol
   const {db}=f;await scope(db);
   await db.workerDevice.create({data:{id:'qa-device',agencyId:'qa-agency',userId:'qa-user'}});
   const actor={db,agencyId:'qa-agency',creatorId:'qa-creator',userId:'qa-user',memberId:'member-qa-agency',deviceId:'qa-device',accessEpoch:1};
-  await db.$executeRawUnsafe(`INSERT INTO "AutomationDelivery"("id","agencyId","creatorId","actionType","status","remoteLifecycleState","remoteTargetId","remoteLifecycleObservedAt","remoteSettledAt","intentAcknowledgedAt","updatedAt") SELECT 'old-'||g,'qa-agency','qa-creator','MASS_QUEUE_CREATE','COMPLETED','SETTLED','old-queue-'||g,'2026-01-01'::timestamp,'2026-01-01'::timestamp,'2026-01-01'::timestamp,'2026-01-01'::timestamp FROM generate_series(1,200000)g`);
-  await f.migrate();
-  const specs=require(f.root+'/scripts/database/external-delivery-indexes').definitions;
-  for(const s of specs)await db.$executeRawUnsafe(`CREATE INDEX "${s.name}" ON "${s.table}" (${s.expression}) WHERE ${s.where}`);
+  await db.$executeRawUnsafe(`INSERT INTO "AutomationDelivery"("id","agencyId","creatorId","actionType","status","remoteLifecycleState","remoteTargetId","remoteLifecycleObservedAt","remoteSettledAt","intentAcknowledgedAt","updatedAt") SELECT 'old-'||g,'qa-agency','qa-creator','MASS_QUEUE_CREATE','COMPLETED','SETTLED','old-queue-'||g,'2026-01-01'::timestamp,'2026-01-01'::timestamp,'2026-01-01'::timestamp,'2026-01-01'::timestamp FROM generate_series(1,${historyRows})g`);
   await check('deployment verifies physical guards and index before runtime admission',async()=>{assert.equal((await require(f.root+'/src/services/external-delivery-runtime-contract').verifyExternalDeliveryRuntime({db})).guards,5);});
   const api=require(f.root+'/src/services/mass-queue-observation-service'),retire=require(f.root+'/src/services/mass-campaign-authority-service');
   const begin=(purpose='BROWSE',more={})=>api.beginMassRemoteQueueSnapshot({...actor,protocol:'MASS_OBSERVATION_V2',snapshotRequestId:crypto.randomUUID(),purpose,...more});
@@ -25,7 +24,7 @@ async function check(name,fn){await fn();results.push({name,passed:true});consol
   await check('begin identity is durable and replay-idempotent',async()=>{const id=crypto.randomUUID(),a=await begin('BROWSE',{snapshotRequestId:id}),b=await begin('BROWSE',{snapshotRequestId:id});assert.deepEqual(a,b);});
   await check('wrong purpose cannot consume the valid session',async()=>{const s=await begin();await assert.rejects(upload({...s,purpose:'RETIREMENT'}),{code:'MASS_QUEUE_SNAPSHOT_FENCE_MISMATCH'});await upload(s);await apply(s);});
   await check('page digest conflict and exact replay',async()=>{const s=await begin();await upload(s,['one']);assert.equal((await upload(s,['one'])).duplicate,true);await assert.rejects(upload(s,['two']),{code:'MASS_QUEUE_SNAPSHOT_REPLAY_CONFLICT'});await apply(s);});
-  await check('empty refresh touches current debt and preserves settled history timestamps',async()=>{const out=await observe();assert.equal(out.out.settled,1);const [r]=await db.$queryRawUnsafe(`SELECT count(*)::int AS n FROM "AutomationDelivery" WHERE "id" LIKE 'old-%' AND "remoteSettledAt"='2026-01-01'::timestamp`);assert.equal(r.n,200000);});
+  await check('empty refresh touches current debt and preserves settled history timestamps',async()=>{const out=await observe();assert.equal(out.out.settled,1);const [r]=await db.$queryRawUnsafe(`SELECT count(*)::int AS n FROM "AutomationDelivery" WHERE "id" LIKE 'old-%' AND "remoteSettledAt"='2026-01-01'::timestamp`);assert.equal(r.n,historyRows);});
   await check('provider reappearance reopens one observed identity',async()=>{await observe(['one']);await observe([]);await observe(['one']);const found=await db.automationDelivery.findMany({where:{actionType:'MASS_PROVIDER_QUEUE_OBSERVED',remoteTargetId:'one'}});assert.equal(found.length,1);assert.equal(found[0].remoteLifecycleState,'PENDING');await observe([]);});
   await check('later admitted state supersedes an older observation',async()=>{const s=await begin();await raw('new-queue');await assert.rejects(upload(s),{code:'MASS_QUEUE_SNAPSHOT_SUPERSEDED'});assert.equal((await db.automationDelivery.findUnique({where:{id:'new-queue'}})).remoteLifecycleState,'PENDING');await observe([]);});
   await check('late publication cannot manufacture fresh retirement evidence',async()=>{const s=await begin('RETIREMENT');await db.$executeRawUnsafe(`UPDATE "MassQueueObservation" SET "fenceAt"="fenceAt"-interval '55 minutes' WHERE "id"=$1`,s.snapshotFenceToken);await assert.rejects(upload(s),{code:'MASS_QUEUE_SNAPSHOT_OBSERVATION_STALE'});await api.releaseMassRetirement({...actor,retirementId:s.retirementId});});
@@ -167,7 +166,7 @@ async function check(name,fn){await fn();results.push({name,passed:true});consol
     await tx(t=>t.telegramDeliveryIntent.update({where:{id:'qa-tg-send'},data:{state:'CONFIRMED',remoteMessageId:42,confirmedAt:new Date()}}));
     await assert.rejects(begin(),e=>e.message.includes('TELEGRAM_SEND_REPLAY_NOT_ALLOWED'));await reconnect();
   });
-  await check('current-debt plan avoids200000 settled history rows',async()=>{
+  await check(`current-debt plan avoids${historyRows} settled history rows`,async()=>{
     await raw('scale-current');await db.$executeRawUnsafe('ANALYZE "AutomationDelivery"');
     const predicate=require(f.root+'/src/services/mass-delivery-contract').CURRENT_PREDICATE;
     const plan=await db.$queryRawUnsafe(`EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) SELECT id FROM "AutomationDelivery" WHERE ${predicate} AND "agencyId"=$1 AND "creatorId"=$2 AND id>$3 ORDER BY id LIMIT 500`,actor.agencyId,actor.creatorId,'');

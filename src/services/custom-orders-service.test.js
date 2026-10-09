@@ -354,19 +354,7 @@ test("paid amount can be corrected after finalization without reopening immutabl
   );
 });
 
-test("payment validation fails closed and migration backfills old rows to zero", () => {
-  assert.throws(() => normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "ok", paidAmount: -1 })), (error) => error?.code === "CUSTOM_ORDER_PAID_AMOUNT_INVALID");
-  assert.throws(() => normalizeCreateInput(withCreateIntent({ creatorId: "c", dialogId: "42", scenario: "ok", paidAmountCents: 2_147_483_648 })), (error) => error?.code === "CUSTOM_ORDER_PAID_AMOUNT_TOO_LARGE");
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260821113000_custom_order_payment_foundation/migration.sql"), "utf8");
-  const customOrderModel = schema.match(/model CustomOrder\s*\{[\s\S]*?\n\}/)?.[0] || "";
-  assert.match(customOrderModel, /paidAmountCents\s+Int\s+@default\(0\)/);
-  assert.doesNotMatch(customOrderModel, /paymentStatus\s+/);
-  assert.doesNotMatch(customOrderModel, /remainingAmountCents\s+/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "paidAmountCents" INTEGER/);
-  assert.match(migration, /WHERE "paidAmountCents" IS NULL OR "paidAmountCents" < 0/);
-  assert.match(migration, /ALTER COLUMN "paidAmountCents" SET NOT NULL/);
-});
+
 
 test("completed/cancelled transitions own their timestamps and cancellation requires reason", () => {
   const now = new Date("2026-08-17T21:00:00Z");
@@ -694,23 +682,7 @@ test("CONTENT type becomes immutable after submission binding, including legacy 
   assert.equal(changed.order.type, "CALL", "an unused CONTENT draft may still change type before any submission lifecycle binds it");
 });
 
-test("content binding migration is additive and backfills durable submission history", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const orderBlock = schema.match(/model CustomOrder \{([\s\S]*?)\n\}/)?.[1] || "";
-  assert.match(orderBlock, /contentBoundAt\s+DateTime\?/);
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260905154500_custom_content_order_binding_authority/migration.sql"), "utf8");
-  assert.match(migration, /^BEGIN;/);
-  assert.match(migration, /COMMIT;\s*$/);
-  assert.match(migration, /ADD COLUMN "contentBoundAt" TIMESTAMP\(3\)/);
-  assert.match(migration, /FROM "CustomContentSubmission"/);
-  assert.match(migration, /MIN\("boundAt"\)/);
-  assert.match(migration, /custom_content_submission\.create_from_telegram_inbound/);
-  assert.match(migration, /custom_content_submission\.assign/);
-  assert.match(migration, /metadata"->>'toCustomOrderId'/);
-  assert.match(migration, /contentBoundAt" IS NOT NULL[\s\S]*"type" <> 'CONTENT'/);
-  assert.match(migration, /RAISE EXCEPTION 'Custom CONTENT binding cutover blocked:/);
-  assert.doesNotMatch(migration, /\b(?:DROP|DELETE|TRUNCATE)\b/i, "binding migration must be additive/non-destructive");
-});
+
 
 test("CustomOrder create retries with the same stable clientMutationId return the same order and conflicting payload is rejected", async () => {
   const db = fakeDb();

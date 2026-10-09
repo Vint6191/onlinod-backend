@@ -14,35 +14,7 @@ function publicKey() {
   return Buffer.from(pair.publicKey.export({ format: "der", type: "spki" })).toString("base64");
 }
 
-test("V20.19 DeviceCryptoIdentity is agency-scoped instead of globally keyed by physical device id", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260823210000_client_e2e_device_identity_agency_scope/migration.sql"), "utf8");
-  const model = schema.slice(schema.indexOf("model DeviceCryptoIdentity"), schema.indexOf("model AgencyCryptoRoot"));
-  assert.match(model, /deviceId\s+String\s*\n/);
-  assert.doesNotMatch(model, /deviceId\s+String\s+@id/);
-  assert.match(model, /userId\s+String/);
-  assert.match(model, /@@id\(\[agencyId, deviceId\]\)/);
-  assert.match(model, /@@index\(\[agencyId, userId\]\)/);
-  assert.doesNotMatch(schema, /cryptoIdentities\s+DeviceCryptoIdentity\[\]/, "crypto identity lifecycle must not be owned by mutable WorkerDevice");
-  assert.match(migration, /DROP CONSTRAINT "DeviceCryptoIdentity_pkey"/);
-  assert.match(migration, /PRIMARY KEY \("agencyId", "deviceId"\)/);
-  const userScopeMigration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260823211500_client_e2e_identity_registered_user/migration.sql"), "utf8");
-  assert.match(userScopeMigration, /ADD COLUMN "userId" TEXT/);
-  assert.doesNotMatch(userScopeMigration, /SET "userId" = device\."userId"/, "mutable WorkerDevice ownership must never be guessed during migration");
-  assert.match(userScopeMigration, /UPDATE "AgencyCryptoOwnerKeyWrap"[\s\S]*"revokedAt"/);
-  assert.match(userScopeMigration, /UPDATE "CreatorDeviceKeyWrap"[\s\S]*"revokedAt"/);
-  assert.match(userScopeMigration, /DELETE FROM "DeviceCryptoIdentity"[\s\S]*"userId" IS NULL/);
-  assert.match(userScopeMigration, /ALTER COLUMN "userId" SET NOT NULL/);
-  const detachMigration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260823213000_client_e2e_detach_mutable_worker_device_fks/migration.sql"), "utf8");
-  assert.match(detachMigration, /DROP CONSTRAINT IF EXISTS "DeviceCryptoIdentity_deviceId_fkey"/);
-  assert.match(detachMigration, /DROP CONSTRAINT IF EXISTS "AgencyCryptoOwnerKeyWrap_deviceId_fkey"/);
-  assert.match(detachMigration, /DROP CONSTRAINT IF EXISTS "CreatorDeviceKeyWrap_deviceId_fkey"/);
-  assert.doesNotMatch(model, /device\s+WorkerDevice\s+@relation/);
-  const ownerWrapModel = schema.slice(schema.indexOf("model AgencyCryptoOwnerKeyWrap"), schema.indexOf("model AgencyCryptoRootBridge"));
-  const creatorWrapModel = schema.slice(schema.indexOf("model CreatorDeviceKeyWrap"), schema.indexOf("model WorkerDevice"));
-  assert.doesNotMatch(ownerWrapModel, /device\s+WorkerDevice\s+@relation\("AgencyCryptoOwnerWrapDevice"/, "owner wraps must survive mutable WorkerDevice deletion");
-  assert.doesNotMatch(creatorWrapModel, /device\s+WorkerDevice\s+@relation\("CreatorCryptoWrapDevice"/, "creator wraps must survive mutable WorkerDevice deletion");
-});
+
 
 test("the same physical device can pin the same X25519 identity independently in two agencies", async () => {
   const device = { id: "pc-1", agencyId: "agency-a", userId: "user-1" };

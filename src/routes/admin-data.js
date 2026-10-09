@@ -6,16 +6,10 @@
 
    Read:
      GET  /data/creator/:id/overview        — everything about one creator
-     GET  /data/crm-profiles                — ?agencyId&creatorId&q&fanId&limit&offset
-     GET  /data/crm-profiles/:id            — single profile + tags + notes + rawTags
-     GET  /data/crm-tags                    — ?agencyId&creatorId&profileId&kind&q
-     GET  /data/crm-notes                   — ?creatorId&profileId
      GET  /data/deliveries                  — ?agencyId&creatorId&status&fanId
      GET  /data/bump-stats                  — ?creatorId&from&to (reply-rate aggregate)
      GET  /data/hidden-online               — ?creatorId&status&q
      GET  /data/follow-back                 — ?creatorId&status&q
-     GET  /data/vault-sales                 — ?creatorId&status
-     GET  /data/vault-purchases             — ?creatorId
      GET  /data/money                       — ?agencyId&creatorId (MoneyAttribution)
      GET  /data/content                     — ?agencyId&creatorId&kind (collections)
      GET  /data/inspect/:model/:id          — raw record of any whitelisted model
@@ -38,8 +32,6 @@ const { adminHttpAuditMiddleware } = require("../middleware/admin-audit");
 const { listHiddenOnline } = require("../services/subscriber-directory-service");
 const { listFollowBack } = require("../services/follow-back-service");
 const { archiveDeliveriesHandler, contentLifecycleHandler } = require("./admin-command-handlers");
-
-const archive = require("../services/phase7-admin-archive-service");
 
 const router = require("./admin-router").createAdminRouter();
 router.use(adminRequired);
@@ -77,47 +69,16 @@ function sendErr(res, err, code = "ADMIN_DATA_FAILED") {
 
 // Whitelist for inspection only. Mutations belong to typed domain commands.
 const MODELS = {
-  crmProfile:         { d: () => prisma.crmProfile,         soft: false },
-  crmProfileTag:      { d: () => prisma.crmProfileTag,      soft: false },
-  crmProfileRawTag:   { d: () => prisma.crmProfileRawTag,   soft: false },
-  crmNote:            { d: () => prisma.crmNote,            soft: true  },
-  crmAnalysisRun:     { d: () => prisma.crmAnalysisRun,     soft: false },
   automationDelivery: { d: () => prisma.automationDelivery, soft: false, deleteProtected: true },
   bumpDeliveryStat:   { d: () => prisma.bumpDeliveryStat,   soft: false },
   hiddenOnlineUser:   { d: () => prisma.hiddenOnlineUser,   soft: false, deleteProtected: true },
-  followBackTask:     { d: () => prisma.followBackTask,     soft: false, deleteProtected: true },
-  vaultMediaSale:     { d: () => prisma.vaultMediaSale,     soft: false },
-  vaultPurchaseMessage:{d: () => prisma.vaultPurchaseMessage,soft: false },
   moneyAttribution:   { d: () => prisma.moneyAttribution,   soft: false },
   contentCollection:  { d: () => prisma.contentCollection,  soft: true  },
-  fanList:            { d: () => prisma.fanList,            soft: true  },
-  savedSegment:       { d: () => prisma.savedSegment,       soft: true  },
-  campaignDraft:      { d: () => prisma.campaignDraft,      soft: true  },
 };
 
 // ════════════════════════════════════════════════════════════════
 // READ — per entity (all support agency/creator filters + pagination)
 // ════════════════════════════════════════════════════════════════
-
-router.get("/crm-profiles", async (req, res) => {
-  try { return res.json(await archive.list({db:prisma,table:"CrmProfile",query:req.query})); }
-  catch (err) { return sendErr(res,err); }
-});
-
-router.get("/crm-profiles/:id", async (req,res) => {
-  try { return res.json(await archive.profile({db:prisma,id:req.params.id,query:req.query})); }
-  catch(err) { return sendErr(res,err); }
-});
-
-router.get("/crm-tags", async (req, res) => {
-  try { return res.json(await archive.list({db:prisma,table:"CrmProfileTag",query:req.query})); }
-  catch (err) { return sendErr(res,err); }
-});
-
-router.get("/crm-notes", async (req, res) => {
-  try { return res.json(await archive.list({db:prisma,table:"CrmNote",query:req.query})); }
-  catch (err) { return sendErr(res,err); }
-});
 
 router.get("/deliveries", async (req, res) => {
   try {
@@ -187,16 +148,6 @@ router.get("/follow-back", async (req, res) => {
   } catch (err) { return sendErr(res, err); }
 });
 
-router.get("/vault-sales", async (req, res) => {
-  try { return res.json(await archive.list({db:prisma,table:"VaultMediaSale",query:req.query})); }
-  catch (err) { return sendErr(res,err); }
-});
-
-router.get("/vault-purchases", async (req, res) => {
-  try { return res.json(await archive.list({db:prisma,table:"VaultPurchaseMessage",query:req.query})); }
-  catch (err) { return sendErr(res,err); }
-});
-
 router.get("/money", async (req, res) => {
   try {
     const where = {};
@@ -238,19 +189,17 @@ router.get("/creator/:id/overview", async (req, res) => {
     if (!creator) return res.status(404).json({ ok: false, code: "CREATOR_NOT_FOUND" });
 
     const [
-      crmProfiles, crmTags, crmNotes,
+
       deliveries, deliveriesByStatus,
-      vaultSales, vaultPurchases,
+
       contentCollections, bumpStatRows,
       moneySum,
     ] = await Promise.all([
-      Promise.resolve(null), // Historical archive: exact counts are intentionally not on this read path.
-      Promise.resolve(null), // Historical archive: exact counts are intentionally not on this read path.
-      Promise.resolve(null), // Historical archive: exact counts are intentionally not on this read path.
+
+
       prisma.automationDelivery.count({ where: { creatorId } }),
       prisma.automationDelivery.groupBy({ by: ["status"], where: { creatorId }, _count: { _all: true } }),
-      Promise.resolve(null), // Historical archive: exact counts are intentionally not on this read path.
-      Promise.resolve(null), // Historical archive: exact counts are intentionally not on this read path.
+
       prisma.contentCollection.count({ where: { creatorId, deletedAt: null } }),
       prisma.bumpDeliveryStat.findMany({ where: { creatorId } , take: 10000}),
       prisma.moneyAttribution.aggregate({ where: { creatorId }, _sum: { amountCents: true } }),
@@ -273,12 +222,11 @@ router.get("/creator/:id/overview", async (req, res) => {
     return res.json({
       ok: true,
       creator,
-      historicalArchives: {authority:"historical_archive",countsAvailable:false},
+
       counts: {
-        crmProfiles, crmTags, crmNotes,
+
         deliveries, deliveriesByStatus: dStatus,
-        hiddenOnline, followBack,
-        vaultSales, vaultPurchases, contentCollections,
+        hiddenOnline, followBack, contentCollections,
         moneyCents: moneySum._sum.amountCents || 0,
       },
       bumpStats: bs,
@@ -296,11 +244,10 @@ router.get("/search", async (req, res) => {
     const ci = { contains: q, mode: "insensitive" };
     const take = 15;
 
-    const [agencies, creators, users, crmProfiles, hidden, deliveriesByMsg] = await Promise.all([
+    const [agencies, creators, users, hidden, deliveriesByMsg] = await Promise.all([
       prisma.agency.findMany({ where: { OR: [{ name: ci }, { id: q }] }, take, select: { id: true, name: true, plan: true, status: true } }),
       prisma.creatorAccount.findMany({ where: { OR: [{ displayName: ci }, { username: ci }, { id: q }, { remoteId: q }] }, take, select: { id: true, displayName: true, username: true, agencyId: true, status: true } }),
       prisma.user.findMany({ where: { OR: [{ email: ci }, { name: ci }, { id: q }] }, take, select: { id: true, email: true, name: true } }),
-      Promise.resolve(null),
       // Hidden status is canonical current authority, not a historical fuzzy-search
       // table. Exact fanId lookup stays index-backed across creators; username search
       // belongs to canonical fan identity/CRM surfaces above.
@@ -308,7 +255,7 @@ router.get("/search", async (req, res) => {
       prisma.automationDelivery.findMany({ where: { OR: [{ messageId: q }, { fanId: q }] }, take, select: { id: true, fanId: true, messageId: true, status: true, creatorId: true } }),
     ]);
 
-    return res.json({ ok: true, q, archiveSearch: {requiresAgencyScope:true,path:"/api/admin/data/crm-profiles"}, results: { agencies, creators, users, crmProfiles, hiddenOnline: hidden, hiddenOnlineHistoricalCompatibility: hidden, deliveries: deliveriesByMsg } });
+    return res.json({ ok: true, q, results: { agencies, creators, users, hiddenOnline: hidden, deliveries: deliveriesByMsg } });
   } catch (err) { return sendErr(res, err); }
 });
 
@@ -328,8 +275,7 @@ router.get("/inspect/:model/:id", async (req, res) => {
   try {
     const m = MODELS[req.params.model];
     if (!m) return res.status(400).json({ ok: false, code: "MODEL_NOT_ALLOWED", error: `Unknown model: ${req.params.model}` });
-    const archiveTable=archive.tableForModel(req.params.model);
-    const record = archiveTable ? await archive.inspect({db:prisma,table:archiveTable,id:req.params.id}) : await m.d().findUnique({ where: { id: req.params.id } });
+    const record = await m.d().findUnique({ where: { id: req.params.id } });
     if (!record) return res.status(404).json({ ok: false, code: "NOT_FOUND" });
     return res.json({ ok: true, model: req.params.model, record });
   } catch (err) { return sendErr(res, err); }

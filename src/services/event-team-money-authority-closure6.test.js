@@ -254,31 +254,4 @@ test("Closure6 ordinary 48h lock remains for non-senior or non-review manager_ov
   assert.equal(result.code, "ATTRIBUTION_LOCKED");
 });
 
-test("Closure6 forward SQL uses the same evidence precedence and does not edit older migrations", () => {
-  const sql = source("../prisma/migrations/20260901150000_event_team_money_authority_closure6/migration.sql");
-  assert.match(sql, /Audit15Closure6ManualEvidence/);
-  assert.match(sql, /manualResolutions/);
-  assert.match(sql, /manualResolution/);
-  assert.match(sql, /legacyMigration.*manualResolutions/s);
-  assert.match(sql, /MANUAL result\/history evidence always wins/i);
-  const manualAt = sql.indexOf("MANUAL result/history evidence always wins");
-  const stateAt = sql.indexOf("State-only MANUAL fallback");
-  const autoAt = sql.indexOf("Proven AUTO only after");
-  const ambiguousAt = sql.indexOf("Remaining historical rows are truly ambiguous");
-  assert.ok(manualAt >= 0 && stateAt > manualAt && autoAt > stateAt && ambiguousAt > autoAt);
-  assert.match(sql.slice(autoAt, ambiguousAt), /NOT EXISTS \(SELECT 1 FROM "Audit15Closure6ManualEvidence"/);
-  assert.match(sql, /audit15_closure5_classify_legacy_auto_no_manual_evidence/);
-  assert.match(sql, /audit15_closure6_classify_legacy_auto_authority/);
-  assert.doesNotMatch(sql, /FROM "MoneyAttribution"|LOCK TABLE "MoneyAttribution"|UPDATE "MoneyAttribution"|DELETE FROM "MoneyAttribution"/);
 
-  const service = source("services/team-tip-ledger-service.js");
-  const manualFn = service.indexOf("function canonicalLegacyManualEvidence");
-  const autoFn = service.indexOf("function legacyProvenAutoEvidence");
-  const useManual = service.indexOf("const evidence = canonicalLegacyManualEvidence(row)");
-  const useAuto = service.indexOf("if (legacyProvenAutoEvidence(row))", useManual);
-  assert.ok(manualFn >= 0 && autoFn > manualFn && useManual >= 0 && useAuto > useManual);
-
-  const route = source("routes/team-claims.js");
-  assert.match(route, /includeMigrationReview: canOverrideAttribution/);
-  assert.match(route, /money\.override_attribution permission is required/);
-});

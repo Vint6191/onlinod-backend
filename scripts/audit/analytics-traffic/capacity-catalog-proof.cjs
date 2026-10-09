@@ -14,7 +14,7 @@ async function main() {
     const debt = require(path.join(root, 'src/services/provider-capacity-debt-authority-service'));
     const projection = require(path.join(root, 'src/services/provider-capacity-projection-service'));
     const postflight = require(path.join(root, 'scripts/database/provider-capacity-catalog-postflight'));
-    const migration = fs.readFileSync(path.join(root, 'prisma/migrations/20261001003000_capacity_catalog_traffic_retirement_v1/migration.sql'), 'utf8');
+    const migration = fs.readFileSync(path.join(root, 'prisma/migrations/20261009000000_current_baseline/migration.sql'), 'utf8');
     const sql = async query => { await db.$disconnect(); await pg.exec('DISCARD ALL'); return pg.exec(query); };
     const state = async () => (await db.$queryRawUnsafe('SELECT * FROM "ProviderCapacityProjectionState"'))[0];
     const snapshot = () => debt.readProviderCapacityDebtSnapshot({ db });
@@ -40,7 +40,7 @@ async function main() {
         backgroundOther: { pendingJobs: 207, pendingJobClasses: 3 }, fanData: { pendingJobs: 1 }, projection: { complete: true, revision: 8n },
       }) });
     });
-    for (const name of ['20261001000000_analytics_publication_authority_v1', '20261001001000_traffic_canonical_projection_v2'])
+    for (const name of ['20261009000000_current_baseline', '20261009000000_current_baseline'])
       await sql(fs.readFileSync(path.join(root, 'prisma/migrations', name, 'migration.sql'), 'utf8'));
     await require(path.join(root, 'scripts/database/analytics-traffic-indexes')).ensureIndexes(db, { create: true });
     const before = await state(), originalDebt = await snapshot();
@@ -84,8 +84,6 @@ async function main() {
       assert.equal((await db.providerCapacityBucket.findUnique({ where: { bucket: 'job:traffic_sources_scan' } })).itemCount, 0n);
     });
     await check('existing Traffic retirement drains 205 old jobs in bounded work and leaves current jobs untouched', async () => {
-      const rollout = require(path.join(root, 'scripts/database/phase3-domain-work-claim-online-rollout'));
-      await rollout.withRolloutAuthority(db, async () => { await rollout.runPreflight(db); await rollout.activateTopology(db, { pauseMs: 0 }); });
       const traffic = require(path.join(root, 'src/services/traffic-projection-service'));
       let turns = 0;
       for (; turns < 30; turns++) {

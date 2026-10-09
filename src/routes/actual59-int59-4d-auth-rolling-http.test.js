@@ -56,7 +56,7 @@ function loadAuthRouter({ refreshImpl = async () => ({ ok: false }), loginImpl =
     if (request === "../services/team-control-plane-authority-service") return {
       lockTeamControlPlaneTopology: async () => {}, lockLiveTeamControlPlaneCreators: async () => {},
     };
-    if (request === "../services/phase2-release-compatibility-authority-service") return { assertTeamControlPlaneWriteAdmission: async () => {} };
+    if (request === "../services/database-write-contract-service") return { assertTeamControlPlaneWriteAdmission: async () => {} };
     if (request === "../services/authorization-session-authority-service") return { acquireAuthorizationUserLock: async () => {} };
     return original.call(this, request, parent, isMain);
   };

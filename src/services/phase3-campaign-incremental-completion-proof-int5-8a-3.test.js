@@ -15,21 +15,7 @@ function sliceBetween(source, startNeedle, endNeedle) {
   return source.slice(start, end);
 }
 
-test("INT5.8A-3 schema persists bounded per-generation Campaign completion counters", () => {
-  const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260918015500_phase3_campaign_incremental_completion_proof/migration.sql");
-  for (const field of [
-    "campaignProofScanRunId", "campaignProofCollectorVersion", "campaignProofCampaignBatches",
-    "campaignProofClaimerBatches", "campaignProofRejectedBatches", "campaignProofRejectedRows",
-  ]) assert.match(schema, new RegExp(`${field}\\s+`));
-  assert.match(migration, /campaignProofCampaignBatches/);
-  assert.match(migration, /completion_proof_nonnegative_check/);
-  assert.match(migration, /Adopt already-running Actual66 campaigns-v8 jobs/);
-  assert.match(migration, /b\."sourceJobId" = a\.source_job_id/);
-  assert.match(migration, /b\."collectorVersion" = 'campaigns-v8'/);
-  assert.match(migration, /campaigns-v8:campaigns:%/);
-  assert.match(migration, /campaigns-v8:claimers:%/);
-});
+
 
 test("INT5.8A-3 page commits advance durable proof while terminal replay returns before a second increment", () => {
   const ledger = read("src/services/creator-analytics-ledger-service.js");

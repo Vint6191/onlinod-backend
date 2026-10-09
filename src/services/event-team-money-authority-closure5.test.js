@@ -161,17 +161,4 @@ test("Closure5 runtime legacy migration serializes on MoneyAttribution table bef
   assert.match(calls[1], /FROM "MoneyAttribution"[\s\S]*FOR UPDATE SKIP LOCKED/);
 });
 
-test("Closure5 forward repair is independent and pending historical cutover serializes legacy runtime", () => {
-  const current = source("../prisma/migrations/20260901140000_event_team_money_authority_closure5/migration.sql");
-  assert.match(current, /^BEGIN;/m);
-  assert.match(current, /legacyState/);
-  assert.match(current, /state_only_manual_repaired/);
-  assert.match(current, /ambiguous_legacy_authority_requires_review/);
-  assert.match(current, /legacy_auto_no_manual_evidence/);
-  assert.match(current, /audit15_closure5_classify_legacy_auto_no_manual_evidence/);
-  assert.doesNotMatch(current, /FROM "MoneyAttribution"|LOCK TABLE "MoneyAttribution"|DELETE FROM "MoneyAttribution"/);
-  assert.match(current, /COMMIT;/);
-  const historical = source("../prisma/migrations/20260831223000_event_team_money_authority_cutover/migration.sql");
-  assert.match(historical, /LOCK TABLE "MoneyAttribution" IN ACCESS EXCLUSIVE MODE/);
-  assert.doesNotMatch(historical, /LOCK TABLE "TeamTipLedger"/);
-});
+

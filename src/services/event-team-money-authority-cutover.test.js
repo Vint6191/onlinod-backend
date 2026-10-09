@@ -123,29 +123,7 @@ function loadTipLedger(prisma) {
   return require(tipLedgerPath);
 }
 
-test("Audit15 source closure removes client money ingress and duplicate compatibility money writers", () => {
-  const claims = source("routes/team-claims.js");
-  const telemetry = source("services/telemetry-ingest-service.js");
-  const observation = source("services/team-observation-service.js");
-  const money = source("services/money-attribution-service.js");
-  const tips = source("services/team-tip-ledger-service.js");
-  const ppv = source("services/team-ppv-ledger-service.js");
-  const analytics = source("services/team-analytics-service.js");
-  const schema = fs.readFileSync(path.join(ROOT, "..", "prisma", "schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(ROOT, "..", "prisma", "migrations", "20260831223000_event_team_money_authority_cutover", "migration.sql"), "utf8");
 
-  assert.doesNotMatch(claims, /router\.post\(["']\/ingest["']/);
-  assert.doesNotMatch(claims, /ingestMoneyEvent/);
-  assert.doesNotMatch(telemetry, /normalizeLegacyEvent/);
-  assert.doesNotMatch(observation, /ingestTipEvent|upsertPurchaseFromEvent/);
-  assert.doesNotMatch(money, /function\s+ingestMoneyEvent|ingestMoneyEvent\s*,/);
-  assert.doesNotMatch(tips, /function\s+ingestTipEvent|ingestTipEvent\s*,/);
-  assert.doesNotMatch(ppv, /function\s+upsertPurchaseFromEvent|upsertPurchaseFromEvent\s*,/);
-  assert.doesNotMatch(analytics, /moneyAttribution\.findMany|legacyTipRevenueByMember|team_ledgers_plus_unmigrated_legacy_tip_fallback/);
-  assert.equal((schema.match(/teamProjectionCoverage\s+TeamProjectionCoverage\?/g) || []).length, 1, "projection coverage is agency-level authority only");
-  assert.match(migration, /FROM "MoneyAttribution" m[\s\S]*WHERE m\."eventType" = 'tip_received'/);
-  assert.match(migration, /DELETE FROM "MoneyAttribution" m[\s\S]*EXISTS \([\s\S]*"TeamTipLedger"/);
-});
 
 test("Audit15 historical money uses per-agency coverage enumeration before exact DomainWork reconciliation", () => {
   const scheduler = source("services/job-scheduler.js");

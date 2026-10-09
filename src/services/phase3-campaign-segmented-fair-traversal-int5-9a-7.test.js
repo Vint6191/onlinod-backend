@@ -24,7 +24,7 @@ test("INT5.9A-7 Backend current Campaign protocol is v13 with v12 order-independ
   assert.match(ledger, /take: 51/);
   assert.match(ledger, /emptyCurrentFreshnessComplete = protocolCurrent && membershipComplete && observedCampaignCount === 0/);
   const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260918134500_phase3_campaign_segmented_directory_v13/migration.sql");
+  const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
   assert.match(schema, /@@index\(\[creatorId, sourceScanRunId, externalCampaignId\], map: "CreatorCampaign_run_segment_idx"\)/);
   assert.match(migration, /CreatorCampaign_run_segment_idx/);
 });

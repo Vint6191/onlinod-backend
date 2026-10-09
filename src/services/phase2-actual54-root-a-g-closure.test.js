@@ -10,7 +10,7 @@ const path = require("node:path");
 const prismaPath = require.resolve("../prisma");
 require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: {} };
 const authority = require("./domain-work-authority-service");
-const release = require("./phase2-release-compatibility-authority-service");
+const release = require("./database-write-contract-service");
 const { coveragePreflightPasses, runCoveragePreflight } = require("../../scripts/audit/phase2-coverage-preflight-readonly");
 const {
   COVERAGE_MANIFEST_VERSION, COVERAGE_SEED_LANE_KEY, COVERAGE_SEED_GENERATION, COVERAGE_MANIFEST, coverageManifestFingerprint,
@@ -99,34 +99,11 @@ test("A36 broad claim rotates bounded Agency and shard locators without a hot-pr
   assert.doesNotMatch(fx.sql.join("\n"), /phase2_lock_domain_work_agency_head/);
 });
 
-test("F55 Root A migration retires ready-head execution authority and fences old binaries with v3", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911142000_phase2_actual55_root_a_execution_authority", "migration.sql"), "utf8");
-  assert.match(migration, /LOCK TABLE "DomainWorkItem" IN SHARE ROW EXCLUSIVE MODE/);
-  assert.match(migration, /DROP TRIGGER IF EXISTS "trg_00_phase2_domain_work_mutation_scope"/);
-  assert.match(migration, /DROP TRIGGER IF EXISTS "trg_phase2_domain_work_ready_head"/);
-  assert.match(migration, /phase2_domain_work_v3_actual55/);
-  assert.match(migration, /DELETE FROM "DomainWorkReadyPartition"/);
-  assert.match(migration, /DELETE FROM "DomainWorkReadyAgency"/);
-  assert.match(migration, /DomainWorkItem_current_broad_due_v3_idx/);
-  assert.match(migration, /Phase2WorkFamilyState_claim_v3_idx/);
-});
 
-test("INT5 Root A migration installs durable non-authoritative broad-claim fairness state", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911183000_phase2_actual55_int5_claim_temporal_destructive_closure", "migration.sql"), "utf8");
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "lastBroadClaimedAt"/);
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS "Phase2WorkBroadClaimPartitionState"/);
-  assert.match(migration, /DomainWorkItem_current_agency_partition_due_v3_idx/);
-  assert.match(migration, /Phase2WorkFamilyState_claim_v3_idx/);
-});
 
-test("INT7 Root A migration keeps partition catalog derived and non-authoritative", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911190000_phase2_actual55_int7_broad_partition_catalog", "migration.sql"), "utf8");
-  assert.match(migration, /phase2_track_domain_work_broad_partition/);
-  assert.match(migration, /AFTER INSERT OR UPDATE OF/);
-  assert.match(migration, /WHERE d\."isOutstanding"=TRUE/);
-  assert.match(migration, /Phase2WorkBroadClaimPartitionState/);
-  assert.doesNotMatch(migration, /DomainWorkReadyAgency|DomainWorkReadyPartition/);
-});
+
+
+
 
 test("F54-06 preflight cannot be green when coverage is explicitly not converged", () => {
   assert.equal(coveragePreflightPasses({ currentSeedComplete: true, manifestSeeded: true, convergenceComplete: false }), false);

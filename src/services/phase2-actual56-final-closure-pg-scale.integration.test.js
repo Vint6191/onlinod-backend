@@ -37,7 +37,7 @@ async function bounded(promise, label, ms = 10_000) {
 }
 
 async function withTeamGeneration(db, workFn, options = undefined) {
-  const release = require("./phase2-release-compatibility-authority-service");
+  const release = require("./database-write-contract-service");
   return db.$transaction(async (tx) => {
     await release.assertTeamControlPlaneWriteAdmission(tx);
     return workFn(tx);
@@ -157,7 +157,7 @@ test("C1 PostgreSQL: settle-vs-republish and delete-vs-settle end exactly at phy
 });
 
 test("C3/C4 PostgreSQL: operational owner filtering is complete beyond 500 global rows and follows live User/Creator state", { skip: !enabled }, async () => {
-  const release = require("./phase2-release-compatibility-authority-service");
+  const release = require("./database-write-contract-service");
   const { listTeamPendingDialogs } = require("./team-pending-read-service");
   await withClients(1, async (db) => {
     const agencyId = token("pending_agency");

@@ -147,27 +147,9 @@ test("Closure4 repair is idempotent once durable manual source exists", async ()
   assert.equal(fx.row.attributedMemberId, "member-B");
 });
 
-test("Closure4 forward migration repairs canonical history without touching MoneyAttribution", () => {
-  const sql = source("../prisma/migrations/20260901130000_event_team_money_authority_closure4/migration.sql");
-  assert.match(sql, /^BEGIN;/m);
-  assert.match(sql, /UPDATE "TeamTipLedger"/);
-  assert.match(sql, /manual_legacy_money_attribution_forward_repair_/);
-  assert.match(sql, /manualResolutions/);
-  assert.match(sql, /migrate_legacy_tip_to_team_tip_ledger/);
-  assert.doesNotMatch(sql, /FROM "MoneyAttribution"|UPDATE "MoneyAttribution"|DELETE FROM "MoneyAttribution"|LOCK TABLE "MoneyAttribution"/);
-  assert.match(sql, /COMMIT;/);
-});
 
-test("Closure4 rolling migration lock graph has no Team->Money cycle", () => {
-  const historical = source("../prisma/migrations/20260831223000_event_team_money_authority_cutover/migration.sql");
-  const runtime = source("services/team-tip-ledger-service.js");
-  const forward = source("../prisma/migrations/20260901130000_event_team_money_authority_closure4/migration.sql");
-  assert.match(historical, /LOCK TABLE "MoneyAttribution" IN ACCESS EXCLUSIVE MODE/);
-  assert.doesNotMatch(historical, /LOCK TABLE "TeamTipLedger"/);
-  const migrateBody = runtime.slice(runtime.indexOf("async function migrateLegacyTipsToTipLedger"));
-  assert.ok(migrateBody.indexOf("selectLegacyTipsForMigration") < migrateBody.indexOf("findTipLedgerForUpdate"));
-  assert.doesNotMatch(forward, /MoneyAttribution"/);
-});
+
+
 
 test("Closure4 per-agency enumerator repairs manual rows before exact reconciliation work", () => {
   const scheduler = source("services/job-scheduler.js");

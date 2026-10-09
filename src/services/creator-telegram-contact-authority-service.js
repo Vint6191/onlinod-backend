@@ -7,7 +7,7 @@ const { audit } = require("./audit-service");
 const { lockActiveTelegramAccountReference } = require("./telegram-account-reference-authority-service");
 const { lockAgencyPipelineLifecycle, lockCreatorPipelineLifecycle } = require("./custom-content-pipeline-authority-service");
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
-const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
+const { authorizeCreatorAccountWrite } = require("./database-write-contract-service");
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 

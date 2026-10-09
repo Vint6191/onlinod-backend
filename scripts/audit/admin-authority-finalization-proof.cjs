@@ -77,8 +77,6 @@ async function main() {
     return row;
   }
   try {
-    await db.$executeRawUnsafe(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`);
-    await db.$executeRawUnsafe(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "requiredGeneration"='phase3_domain_executor_v6_failure_policy',"activationState"='ACTIVE' WHERE "scope"='DOMAIN_WORK_EXECUTOR'`);
     for (const boundary of ["audit", "receipt", "completion-clock"]) await check(`SQL expiry after ${boundary} rolls back mutation plus success audit and keeps one denial`, async () => {
       const s = await seed(); let audited = false, armed = true;
       hook = async ({ key, args }) => {

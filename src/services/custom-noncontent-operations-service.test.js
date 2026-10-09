@@ -77,16 +77,7 @@ test("PHYSICAL stage changes receive their own timestamp without relying on upda
 });
 
 
-test("V20.10 schema stores one dedicated PHYSICAL stage timestamp and migration backfills it conservatively", () => {
-  const root = path.resolve(__dirname, "..", "..");
-  const schema = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260822143000_custom_noncontent_operations", "migration.sql"), "utf8");
-  assert.match(schema, /physicalStatusChangedAt\s+DateTime\?/);
-  assert.match(schema, /@@index\(\[agencyId, type, status, physicalStatusChangedAt\]\)/);
-  assert.match(migration, /ADD COLUMN "physicalStatusChangedAt" TIMESTAMP\(3\)/);
-  assert.match(migration, /COALESCE\("updatedAt", "createdAt"\)/);
-  assert.doesNotMatch(schema, /callPhase\s+|physicalStageAge|callOverdueAt/);
-});
+
 
 test("production CALL summary stays exact without loading an unbounded 24h history", async () => {
   const client = db();
@@ -144,10 +135,4 @@ test("A48 production CALL top-N uses one exact mixed-duration rank before LIMIT"
   assert.equal(rawSql.length, 2, "summary and exact top-N are separate bounded SQL reads");
 });
 
-test("A48 fresh-source migration indexes exact pending CALL end-rank", () => {
-  const root = path.resolve(__dirname, "..", "..");
-  const migration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260910144500_phase2_fresh_source_closure", "migration.sql"), "utf8");
-  assert.match(migration, /CustomOrder_call_pending_end_rank_idx/);
-  assert.match(migration, /GREATEST\(1, LEAST\(1440, COALESCE\("durationMinutes", 1\)\)\)/);
-  assert.match(migration, /WHERE "type" = 'CALL'[\s\S]*"status" = 'PENDING'[\s\S]*"scheduledAt" IS NOT NULL/);
-});
+

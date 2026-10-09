@@ -2,7 +2,7 @@
 const { runDbTransaction } = require("./db-transaction-service");
 
 
-const { assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
+const { assertTeamControlPlaneWriteAdmission } = require("./database-write-contract-service");
 
 function normalizedAccessEpoch(value) {
   const parsed = Number(value);

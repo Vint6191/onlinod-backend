@@ -1,5 +1,5 @@
 'use strict';
-// Actual Prisma + product services on a disposable retained-schema database.
+// Actual Prisma + product services on a disposable current-baseline database.
 // Single-session PGlite does NOT prove native PostgreSQL concurrency or scale.
 const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),crypto=require('node:crypto');
 const {createRequire}=require('node:module');
@@ -15,7 +15,6 @@ async function main(){
   const file=path.join(fixture.root,'src/services/automation-action-delivery-service.js'),m={exports:{}},load=createRequire(file);
   vm.runInNewContext(fs.readFileSync(file,'utf8')+'\nmodule.exports.transition=applySfsValidationTransition;',
    {module:m,exports:m.exports,require:load,__dirname:path.dirname(file),process,console,Buffer,Date,setTimeout,clearTimeout,setInterval,clearInterval},{filename:file});
-  await db.$executeRawUnsafe(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`);
   const base=await db.$transaction(async tx=>{
    await tx.$executeRawUnsafe("SELECT set_config('onlinod.phase2_team_control_plane_generation',$1,true)",'phase2_team_control_plane_v2_durable_access');
    const user=await tx.user.create({data:{email:'sfs-136@example.test',passwordHash:'synthetic'}});
@@ -30,7 +29,7 @@ async function main(){
    await control.setAutomationControl({...scope,db,userId:base.user.id,scope:'module',moduleKey:'sfs',enabled:true,settings:{huntingEnabled:true}});
    const candidate=await db.sfsTargetCandidate.create({data:{...scope,targetUserId:'target-'+n,username:'target'+n,generation:2,state:'ACTING',phase:'ACTIONS'}});
    const delivery=await runDbTransaction(db,async tx=>{
-    await require('../../src/services/phase7-legacy-storage-service').authorizeSfsGeneration(tx);
+    
     return tx.automationDelivery.create({data:{...scope,originKind:'AUTOMATION',moduleKey:'sfs',actionType:'SFS_COMMENT_POST',targetId:'post-'+n,fanId:candidate.targetUserId,
      generation:2,payload:{candidateId:candidate.id},idempotencyKey:'sfs136:'+n,status:'CLAIMED',notBefore:new Date(0),claimedByDeviceId:base.device.id,
      leaseMemberId:base.member.id,leaseAccessEpoch:base.member.accessEpoch,leaseTokenHash:hash,leaseRevision:1,claimUntil:new Date(Date.now()+120000),attempts:1}});
@@ -163,7 +162,7 @@ async function main(){
   });
  }catch(e){error={code:e.code||null,message:e.message,stack:e.stack};console.error(e);}
  finally{if(fixture)await fixture.close();clearInterval(keep);}
- const result={ok:!error,runtime:process.version,engine:'PGlite 0.5.8 + real Prisma 5.22',nativeConcurrency:false,productionAccessed:false,baselineReplay:'uploaded135 function bodies; current dependencies and SQL fixture',baselineEvidence,cases,error};
+ const result={ok:!error,runtime:process.version,engine:'PGlite 0.5.8 + real Prisma 5.22',nativeConcurrency:false,productionAccessed:false,baselineReplay:process.env.SFS_BASELINE_FUNCTIONS?'uploaded135 function bodies; current dependencies and SQL fixture':'not requested',baselineEvidence,cases,error};
  if(process.env.SFS_PROOF_OUTPUT)fs.writeFileSync(process.env.SFS_PROOF_OUTPUT,JSON.stringify(result,null,2)+'\n');
  console.log(JSON.stringify(result));if(error)process.exitCode=1;
 }

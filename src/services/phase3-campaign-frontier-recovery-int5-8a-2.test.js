@@ -15,17 +15,7 @@ function sliceBetween(source, startNeedle, endNeedle) {
   return source.slice(start, end);
 }
 
-test("INT5.8A-2 schema and migration add generation-bound staged Campaign frontier fields", () => {
-  const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260918011500_phase3_campaign_staged_frontier_recovery/migration.sql");
-  assert.match(schema, /catchupFrontierHash\s+String\?\s+@db\.VarChar\(64\)/);
-  assert.match(schema, /stagedCatchupFrontierHash\s+String\?\s+@db\.VarChar\(64\)/);
-  assert.match(schema, /stagedCatchupFrontierRunId\s+String\?\s+@db\.VarChar\(120\)/);
-  assert.match(schema, /stagedCatchupFrontierStartedAt\s+DateTime\?/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "stagedCatchupFrontierHash" VARCHAR\(64\)/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "stagedCatchupFrontierRunId" VARCHAR\(120\)/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "stagedCatchupFrontierStartedAt" TIMESTAMP\(3\)/);
-});
+
 
 test("INT5.8A-2 page-1 hash is staged and canonical frontier publishes only after a proven Campaign boundary", () => {
   const ledger = read("src/services/creator-analytics-ledger-service.js");

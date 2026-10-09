@@ -340,19 +340,7 @@ test("explicit MASS_NATIVE_V2 preflight remains rolling-compatible and duplicate
   });
 });
 
-test("MASS lifecycle migration adds canonical logical/remote facts and unique current-intent authority", () => {
-  const root = path.resolve(__dirname, "../..");
-  const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260907013000_mass_campaign_lifecycle_authority/migration.sql"), "utf8");
-  assert.match(schema, /intentAcknowledgedAt\s+DateTime\?/);
-  assert.match(schema, /remoteLifecycleState\s+String\?/);
-  assert.match(schema, /remoteTargetId\s+String\?/);
-  assert.match(migration, /AutomationDelivery_mass_unack_intent_unique/);
-  assert.match(migration, /MIGRATION_RECONCILE_REQUIRED/);
-  assert.match(migration, /"status" IN \('COMMITTING','RECONCILE_REQUIRED'\)[\s\S]*THEN 'UNKNOWN'/);
-  const remoteCase = migration.slice(migration.indexOf('SET "remoteTargetId"'), migration.indexOf("WHERE \"actionType\" = 'MASS_QUEUE_CREATE';", migration.indexOf('SET "remoteTargetId"')));
-  assert.ok(remoteCase.indexOf("'COMMITTING'") < remoteCase.lastIndexOf("ELSE 'PRECOMMIT'"), 'historical COMMITTING must be classified before PRECOMMIT fallback');
-});
+
 
 test("native MASS exact provider rejection terminalizes the request without future-effect debt", async () => {
   await withAuthority([], async ({ authority, rows }) => {

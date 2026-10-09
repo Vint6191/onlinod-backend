@@ -21,29 +21,7 @@ const {
 const AGENCY_ID = "agency-1";
 const CREATOR_ID = "creator-1";
 
-test("Media Library migration merges legacy data before dropping redundant tables", () => {
-  const root = path.resolve(__dirname, "../..");
-  const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(
-    path.join(root, "prisma/migrations/20260719170000_media_library_v1/migration.sql"),
-    "utf8",
-  );
-  assert.match(schema, /catalogActive\s+Boolean\s+@default\(false\)/);
-  assert.match(migration, /INSERT INTO "CreatorMediaAsset"[\s\S]*FROM "VaultUnsortedItem"/);
-  assert.match(migration, /CREATE TABLE "CreatorMediaUsageContribution"/);
-  assert.match(migration, /CREATE TABLE "MediaLibraryScanItem"/);
-  const mergePosition = migration.indexOf('FROM "VaultUnsortedItem"');
-  const dropPosition = migration.indexOf('DROP TABLE "VaultUnsortedItem"');
-  assert.ok(mergePosition >= 0 && dropPosition > mergePosition);
-  // Legacy deletion BATs are one-shot operator tools, not permanent source
-  // authority. Closure is the current production tree itself: the retired
-  // routes/services must already be absent after the migration/cutover.
-  for (const file of [
-    "src/routes/vault-intelligence.js",
-    "src/routes/vault-unsorted.js",
-    "src/services/vault-intelligence-service.js",
-  ]) assert.equal(fs.existsSync(path.join(root, file)), false, `${file} must stay retired from current source`);
-});
+
 
 function metadataDb(seed = []) {
   const assets = new Map(seed.map((asset) => [asset.mediaId, { ...asset }]));

@@ -102,7 +102,7 @@ test("INT5.4C-2A bulk batch rejects contradictory duplicate facts before any SQL
   const writes = [];
   const tx = { async $executeRawUnsafe(sql, ...args) {
       // Transaction-local budget setup is not a domain mutation/lock.
-      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)") return 1;
+      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)") return 1;
  writes.push({ sql, args }); return 1; } };
   const db = { async $transaction(work) { return work(tx); } };
   await expectConflict(projectFanObservationBatch(db, {
@@ -129,7 +129,7 @@ test("INT5.4C-2A production bulk fence rejects contradiction against persisted c
     async $queryRawUnsafe() { return []; },
     async $executeRawUnsafe(sql, ...args) {
       // Transaction-local budget setup is not a domain mutation/lock.
-      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)") return 1;
+      if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)") return 1;
 
       const statement = String(sql);
       if (/pg_advisory_xact_lock/.test(statement)) locks.push({ sql: statement, args });

@@ -157,17 +157,4 @@ test("INT5.4C-1A current point-refresh jobs fail closed on missing/replayed obse
   }), /FAN_OBSERVATION_TOKEN_REQUIRED|observation token/i);
 });
 
-test("INT5.4C-1A backend route and migration expose lease-bound monotonic observation-token authority", () => {
-  const backendRoute = fs.readFileSync(path.join(__dirname, "../routes/jobs.js"), "utf8");
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260916234500_phase3_provider_observation_token/migration.sql"), "utf8");
-  const creatorClockMigration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260917190000_phase3_creator_partitioned_observation_clock/migration.sql"), "utf8");
-  const tokenService = fs.readFileSync(path.join(__dirname, "fan-observation-token-service.js"), "utf8");
-  assert.match(backendRoute, /\/:id\/observation-token/);
-  assert.match(backendRoute, /leaseToken: input\.leaseToken/);
-  assert.match(backendRoute, /leaseRevision: input\.leaseRevision/);
-  assert.match(migration, /FanObservationClock/);
-  assert.match(creatorClockMigration, /FanObservationCreatorClock/);
-  assert.match(creatorClockMigration, /"creatorId" TEXT PRIMARY KEY/);
-  assert.match(tokenService, /FanObservationCreatorClock/);
-  assert.match(tokenService, /INTERVAL '1 millisecond'/);
-});
+

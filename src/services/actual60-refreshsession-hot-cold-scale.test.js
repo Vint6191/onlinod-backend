@@ -8,21 +8,7 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "../..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 
-test("Actual60 F60-SCALE-1: migration separates live authorization lookup from lineage history", () => {
-  const migration = read("prisma/migrations/20260916011500_actual60_refreshsession_hot_cold_scale/migration.sql");
-  assert.match(migration, /CREATE INDEX IF NOT EXISTS "RefreshSession_live_authorization_lookup_idx"/);
-  assert.match(migration, /"userId"[\s\S]*"agencyId"[\s\S]*"deviceId"[\s\S]*"authorizationSessionId"[\s\S]*"expiresAt" DESC/);
-  assert.match(migration, /WHERE "revokedAt" IS NULL/);
-  assert.match(migration, /CREATE INDEX IF NOT EXISTS "RefreshSession_live_lineage_lookup_idx"/);
-  assert.match(migration, /"authorizationSessionId"[\s\S]*"userId"[\s\S]*"agencyId"[\s\S]*"deviceId"[\s\S]*"expiresAt" DESC/);
-  assert.match(migration, /CREATE INDEX IF NOT EXISTS "RefreshSession_authorization_history_idx"/);
-  assert.match(migration, /"authorizationSessionId"[\s\S]*"agencyId"[\s\S]*"userId"[\s\S]*"expiresAt" DESC/);
-  assert.match(migration, /WHERE "authorizationSessionId" IS NOT NULL/);
-  const liveUserMigration = read("prisma/migrations/20260916013000_actual60_refreshsession_live_user_scale/migration.sql");
-  assert.match(liveUserMigration, /RefreshSession_live_user_lookup_idx/);
-  assert.match(liveUserMigration, /"userId"[\s\S]*"expiresAt" DESC[\s\S]*"lastUsedAt" DESC[\s\S]*"createdAt" DESC/);
-  assert.match(liveUserMigration, /WHERE "revokedAt" IS NULL/);
-});
+
 
 test("Actual60 F60-SCALE-1: authRequired live lineage proof has exact current-state predicates", () => {
   const source = read("src/middleware/auth.js");
@@ -67,19 +53,7 @@ test("Actual60 F60-SCALE-1: natural lineage end is top-1 indexed history lookup,
 });
 
 
-test("Actual60 F60-SCALE-1: boundary trigger's live-lineage existence check is covered by current-state predicates", () => {
-  const migration = read("prisma/migrations/20260915193000_actual59_int59_3_authorization_lineage_catalog_boundary/migration.sql");
-  const start = migration.indexOf('CREATE OR REPLACE FUNCTION "capture_authorization_session_boundary"');
-  const end = migration.indexOf('DROP TRIGGER IF EXISTS "RefreshSession_capture_authorization_boundary"', start);
-  assert.ok(start >= 0 && end > start);
-  const block = migration.slice(start, end);
-  assert.match(block, /r\."authorizationSessionId" = NEW\."authorizationSessionId"/);
-  assert.match(block, /r\."revokedAt" IS NULL/);
-  assert.match(block, /r\."expiresAt" > clock_timestamp\(\)/);
-  const scaleMigration = read("prisma/migrations/20260916011500_actual60_refreshsession_hot_cold_scale/migration.sql");
-  assert.match(scaleMigration, /RefreshSession_live_lineage_lookup_idx/);
-  assert.match(scaleMigration, /WHERE "revokedAt" IS NULL[\s\S]*"authorizationSessionId" IS NOT NULL/);
-});
+
 
 test("Actual60 F60-SCALE-1: real-PG EXPLAIN gate rejects seq scans and unbounded filtered-row work", () => {
   const source = read("src/services/actual60-refreshsession-scale-postgres.integration.test.js");
@@ -114,7 +88,7 @@ test("Actual60 F60-SCALE-1: Settings delegates bounded current-session listing a
   });
   tx.refreshSession.findMany = async () => Array.from({ length: LIMIT + 1 }, (_, i) => ({ id: String(i) }));
   await assert.rejects(readActiveSessions(tx, "user-1", now), { code: "ACCOUNT_SECURITY_SESSION_LIMIT" });
-  const migration = read("prisma/migrations/20260916013000_actual60_refreshsession_live_user_scale/migration.sql");
+  const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
   assert.match(migration, /RefreshSession_live_user_lookup_idx/);
 });
 
@@ -172,11 +146,4 @@ test("Actual60 F60-SCALE-1: current-session mutation paths ignore expired-unrevo
 });
 
 
-test("Actual60 INT60.4: agency-wide live lifecycle work and user history have dedicated bounded indexes", () => {
-  const migration = read("prisma/migrations/20260916014500_actual60_refreshsession_current_write_history_scale/migration.sql");
-  assert.match(migration, /RefreshSession_live_agency_lookup_idx/);
-  assert.match(migration, /"agencyId"[\s\S]*"expiresAt" DESC[\s\S]*"userId"[\s\S]*"deviceId"/);
-  assert.match(migration, /WHERE "revokedAt" IS NULL/);
-  assert.match(migration, /RefreshSession_user_history_created_idx/);
-  assert.match(migration, /"userId", "createdAt" DESC/);
-});
+

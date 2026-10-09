@@ -1,6 +1,6 @@
 "use strict";
 const definitions = require("./analytics-traffic-index-contract.json");
-const { normalizePredicate } = require("./phase7-legacy-storage-indexes");
+const { normalizePredicate } = require("./index-predicate");
 const q = s => '"' + s.replaceAll('"', '""') + '"';
 const normalizeKeys = s => String(s || "").replace(/[\s"]/g, "");
 const fail = (code, name) => Object.assign(new Error(`${code}:${name}`), { code, index: name });

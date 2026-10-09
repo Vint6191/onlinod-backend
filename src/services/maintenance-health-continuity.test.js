@@ -18,34 +18,34 @@ const fail = (name, reason = 'FIXTURE_FAILURE') => ({ ok: false, [name]: { ok: f
 const pass = name => ({ ok: true, [name]: { ok: true, processed: 1 } });
 
 test('an unrelated healthy maintenance batch cannot erase the notification repair failure', () => {
-  const s = scheduler(); s.record(fail('notificationHistoryRepair', 'BAD_TRAFFIC_DIRTY_INPUT'));
+  const s = scheduler(); s.record(fail('notificationConsequences', 'BAD_TRAFFIC_DIRTY_INPUT'));
   s.record(pass('messageLibraryTrash'));
-  assert.equal(s.snapshot().status, 'DEGRADED'); assert.equal(s.snapshot().lastReason, 'notificationHistoryRepair:BAD_TRAFFIC_DIRTY_INPUT');
+  assert.equal(s.snapshot().status, 'DEGRADED'); assert.equal(s.snapshot().lastReason, 'notificationConsequences:BAD_TRAFFIC_DIRTY_INPUT');
 });
 test('an empty aggregate result is not proof that a failed lane recovered', () => {
-  const s = scheduler(); s.record(fail('notificationHistoryRepair')); s.record({ ok: true });
+  const s = scheduler(); s.record(fail('notificationConsequences')); s.record({ ok: true });
   assert.equal(s.snapshot().status, 'DEGRADED');
 });
 for (const reason of ['lease_held', 'not_due', 'domain_work_dependency_wake_bridge_transition']) {
   test(`skipped ${reason} cannot erase the last actual failure of that lane`, () => {
-    const s = scheduler(); s.record(fail('notificationHistoryRepair'));
-    s.record({ ok: true, notificationHistoryRepair: { ok: true, skipped: true, reason } });
+    const s = scheduler(); s.record(fail('notificationConsequences'));
+    s.record({ ok: true, notificationConsequences: { ok: true, skipped: true, reason } });
     assert.equal(s.snapshot().status, 'DEGRADED');
   });
 }
 test('each failed lane needs its own recovery; one successful retry does not clear another', () => {
-  const s = scheduler(); s.record({ ok: false, ...fail('notificationHistoryRepair'), ...fail('trafficProjection') });
-  s.record(pass('notificationHistoryRepair')); assert.equal(s.snapshot().status, 'DEGRADED'); assert.equal(s.snapshot().lastReason, 'trafficProjection:FIXTURE_FAILURE');
+  const s = scheduler(); s.record({ ok: false, ...fail('notificationConsequences'), ...fail('trafficProjection') });
+  s.record(pass('notificationConsequences')); assert.equal(s.snapshot().status, 'DEGRADED'); assert.equal(s.snapshot().lastReason, 'trafficProjection:FIXTURE_FAILURE');
   s.record(pass('trafficProjection')); assert.equal(s.snapshot().status, 'HEALTHY'); assert.equal(s.snapshot().lastReason, null);
 });
 test('admission failure persists until a subsequent successful admission is actually present', () => {
   const s = scheduler(); s.record(null, Object.assign(new Error('catalog'), { code: 'MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH' }));
-  s.record(pass('notificationHistoryRepair')); assert.equal(s.snapshot().status, 'DEGRADED');
+  s.record(pass('notificationConsequences')); assert.equal(s.snapshot().status, 'DEGRADED');
   s.record({ ok: true, admission: { ok: true, generation: registry.MAINTENANCE_ADMISSION_GENERATION, selected: [] } });
   assert.equal(s.snapshot().status, 'HEALTHY');
 });
 test('local overlap has no new evidence and preserves the complete health snapshot', () => {
-  const s = scheduler(); s.record(fail('notificationHistoryRepair')); const before = s.snapshot();
+  const s = scheduler(); s.record(fail('notificationConsequences')); const before = s.snapshot();
   s.record({ ok: true, skipped: true, reason: 'local_overlap' }); assert.deepEqual(s.snapshot(), before);
 });
 test('scheduler diagnostic counts array errors as errors, never NaN/null', () => {
@@ -55,11 +55,11 @@ test('scheduler diagnostic counts array errors as errors, never NaN/null', () =>
 });
 test('actual pump preserves a thrown error code and still attempts later admitted lanes', async () => {
   const calls = [], s = scheduler({ callbacks: {
-    notificationHistoryRepair: async () => { calls.push('repair'); throw Object.assign(new Error('fixture failure detail'), { code: 'NOTIFICATION_HISTORY_CURSOR_INVALID' }); },
+    notificationConsequences: async () => { calls.push('repair'); throw Object.assign(new Error('fixture failure detail'), { code: 'NOTIFICATION_HISTORY_CURSOR_INVALID' }); },
     messageLibraryTrash: async () => { calls.push('trash'); return { ok: true }; },
   } });
   const result = await s.runPhase2MaintenancePump({ db: {} });
   assert.deepEqual(calls, ['repair', 'trash']); assert.equal(result.ok, false);
-  assert.equal(result.notificationHistoryRepair.reason, 'NOTIFICATION_HISTORY_CURSOR_INVALID');
-  s.record(result); assert.equal(s.snapshot().lastReason, 'notificationHistoryRepair:NOTIFICATION_HISTORY_CURSOR_INVALID');
+  assert.equal(result.notificationConsequences.reason, 'NOTIFICATION_HISTORY_CURSOR_INVALID');
+  s.record(result); assert.equal(s.snapshot().lastReason, 'notificationConsequences:NOTIFICATION_HISTORY_CURSOR_INVALID');
 });

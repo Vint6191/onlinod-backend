@@ -30,28 +30,6 @@ test("INT5.2A mixed-history repair preserves genuine oneTargetForever after tran
   assert.equal(repaired.usedForever, true, "durable completed-cycle proof must restore oneTargetForever");
 });
 
-test("INT5.2A migration derives restoration from completed SFS cleanup history, not winner state", () => {
-  const opaque = migration("20260916190000_phase3_sfs_opaque_target_identity");
-  const transient = migration("20260916203000_phase3_sfs_consumption_semantics");
-  const repair = migration("20260916211500_phase3_sfs_mixed_history_consumption_repair");
 
-  assert.match(opaque, /AutomationDelivery[\s\S]*candidateId[\s\S]*winner_id/, "duplicate merge must repoint delivery history before loser deletion");
-  assert.match(opaque, /bool_or\(c\."usedForever"\)/, "duplicate merge preserves the scalar bit before transient cleanup");
-  assert.match(transient, /"usedForever" = false[\s\S]*paid_target[\s\S]*comments_disabled/, "transient legacy bug remains cleaned");
 
-  assert.match(repair, /"moduleKey" = 'sfs'/);
-  assert.match(repair, /"actionType" = 'SFS_UNFOLLOW_TARGET'/);
-  assert.match(repair, /"status" = 'COMPLETED'/);
-  assert.match(repair, /"payload"->>'candidateId' = c\."id"/);
-  assert.match(repair, /"usedForever" = true/);
-  assert.match(repair, /historicalConsumptionProofDeliveryId/);
-  assert.doesNotMatch(repair, /"state"\s*=|"phase"\s*=/, "repair must not rewrite current workflow lifecycle");
-});
 
-test("INT5.2A repair remains target-id aware after opaque identity cutover", () => {
-  const repair = migration("20260916211500_phase3_sfs_mixed_history_consumption_repair");
-  assert.match(repair, /c\."targetUserId" IS NOT NULL/);
-  assert.match(repair, /d\."fanId" = c\."targetUserId"/);
-  assert.match(repair, /d\."targetId" = c\."targetUserId"/);
-  assert.match(repair, /d\."payload"->>'targetUserId' = c\."targetUserId"/);
-});

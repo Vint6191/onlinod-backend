@@ -11,7 +11,6 @@ const load = file => require(path.join(root, file));
   require.cache[require.resolve(path.join(root,'src/prisma'))]={exports:db};
   require.cache[require.resolve(path.join(root,'src/services/job-scheduler'))]={exports:{scheduleJobNow:async()=>{throw Error('not used');}}};
   try {
-    await db.$executeRawUnsafe(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`);
     const {agency,creator,other} = await db.$transaction(async tx => {
       await tx.$executeRawUnsafe("SELECT set_config('onlinod.phase2_team_control_plane_generation',$1,true)", "phase2_team_control_plane_v2_durable_access");
       const user=await tx.user.create({data:{email:'n4-proof@example.test',passwordHash:'fixture'}});

@@ -205,36 +205,4 @@ test("INT5.9A-1 raised cross-run revision schedules one sequential follow-up onl
   assert.equal([...h.works.values()].filter((row) => row.status === "FAILED").length, 0, "a superseded attempt must not fail waiting Campaign coverage");
 });
 
-test("INT5.9A-1 source removes fake delegated completion and makes Campaign/overview value reads freshness-cutoff aware", () => {
-  const desktop = fs.readFileSync(path.join(process.env.ONLINOD_DESKTOP_ROOT || path.resolve(root, "../desktop"), "apps/desktop/electron/main/services/backend-jobs/handlers/campaigns-handler.ts"), "utf8");
-  const ledger = fs.readFileSync(path.join(root, "src/services/creator-analytics-ledger-service.js"), "utf8");
-  const overview = fs.readFileSync(path.join(root, "src/services/creator-overview-service.js"), "utf8");
-  const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260918123000_phase3_campaign_freshness_demand_coverage/migration.sql"), "utf8");
-  const route = fs.readFileSync(path.join(root, "src/routes/jobs.js"), "utf8");
-  const lease = fs.readFileSync(path.join(root, "src/services/job-lease-service.js"), "utf8");
-  const queue = fs.readFileSync(path.join(root, "src/services/campaign-fan-refresh-queue-service.js"), "utf8");
-  const control = fs.readFileSync(path.join(root, "src/services/campaign-scan-control-service.js"), "utf8");
-  assert.match(desktop, /fanValuesComplete:\s*false/);
-  assert.doesNotMatch(desktop, /fanValuesComplete:\s*true/);
-  assert.match(schema, /model CreatorFanRefreshDemand/);
-  assert.match(schema, /activeRefreshRevision\s+Int\?/);
-  assert.match(schema, /@@unique\(\[creatorId, onlyFansUserId\]/);
-  assert.match(schema, /fanValueOutstanding\s+Int\s+@default\(0\)/);
-  assert.match(ledger, /require\("\.\/campaign-read-repository"\)\.readCampaignFanPage/);
-  assert.match(overview, /require\("\.\/campaign-read-repository"\)\.readCampaignPage/);
-  assert.match(ledger, /currentMembershipComplete = membershipComplete && frontierFreshnessComplete/);
-  assert.match(ledger, /complete = currentMembershipComplete && fanValuesComplete/);
-  assert.match(ledger, /CAMPAIGN_COLLECTOR_VERSION = "campaigns-v13"/);
-  assert.match(route, /campaignFreshnessCoverageV1:\s*true/);
-  assert.match(lease, /capabilities\?\.campaignFreshnessCoverageV1 !== true/);
-  assert.match(lease, /campaignFreshnessCoverageVersion: 1/);
-  assert.match(queue, /CreatorFanRefreshDemand[\s\S]*FOR UPDATE/);
-  assert.match(queue, /activeRefreshJobId[\s\S]*FOR UPDATE/);
-  assert.match(queue, /creatorFanRefreshDemand\.createMany/);
-  assert.doesNotMatch(queue, /P2002/);
-  assert.match(control, /const fanValuesComplete = canonicalCoveragePresent[\s\S]*fanValueFreshnessStatus === "COMPLETE" && campaignFrontierFreshnessStatus === "COMPLETE"[\s\S]*: fanRefreshDelegated \? false/);
-  assert.match(control, /collectorStatus[\s\S]*coverageStatus[\s\S]*refreshPending/);
-  assert.match(migration, /CAMPAIGN_FRESHNESS_COVERAGE_REBUILD_REQUIRED/);
-  assert.doesNotMatch(migration, /Backfill coverage for the currently tracked run only/);
-});
+

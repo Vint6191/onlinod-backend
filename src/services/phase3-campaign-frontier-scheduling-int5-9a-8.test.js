@@ -11,18 +11,7 @@ const prismaModulePath = require.resolve("../prisma");
 require.cache[prismaModulePath] = { id: prismaModulePath, filename: prismaModulePath, loaded: true, exports: {} };
 const { loadCampaignDirectorySegment } = require("./creator-analytics-ledger-service");
 
-test("INT5.9A-8 schema/migration installs revisioned frontier authority and bounded plan state", () => {
-  const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260918194500_phase3_campaign_frontier_scheduling_v1/migration.sql");
-  assert.match(schema, /claimerRevision\s+Int\s+@default\(1\)/);
-  assert.match(schema, /claimerVerifiedRevision\s+Int\s+@default\(0\)/);
-  assert.match(schema, /claimersNextDueAt\s+DateTime\?/);
-  assert.match(schema, /claimersTargetRunId\s+String\?\s+@db\.VarChar\(120\)/);
-  assert.match(schema, /campaignFrontierDeferredCount\s+Int\s+@default\(0\)/);
-  assert.match(schema, /CreatorCampaign_frontier_due_idx/);
-  assert.match(migration, /UPDATE "CreatorCampaign"[\s\S]*"claimersNextDueAt" = COALESCE/);
-  assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM/i);
-});
+
 
 test("INT5.9A-8 claim wire fences selective frontier scheduling behind a seventh capability", () => {
   const route = read("src/routes/jobs.js");

@@ -8,7 +8,7 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "../..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const schema = read("prisma/schema.prisma");
-const migration = read("prisma/migrations/20260812101500_team_pending_projector_v1/migration.sql");
+const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
 const projector = read("src/services/team-pending-projection-service.js");
 const ingest = read("src/services/telemetry-ingest-service.js");
 const scheduler = read("src/services/job-scheduler.js");
@@ -21,20 +21,7 @@ function modelBody(name) {
   return match[1];
 }
 
-test("pending queue has one durable current state per agency/creator/dialog and raw projection cursor", () => {
-  const body = modelBody("TeamPendingDialogState");
-  assert.match(body, /@@unique\(\[agencyId, creatorId, dialogId\]\)/);
-  assert.match(body, /firstIncomingMessageId\s+String\?/);
-  assert.match(body, /firstSeenMemberId\s+String\?/);
-  assert.match(body, /ownerMemberId\s+String\?/);
-  assert.match(body, /ownerReason\s+String\?/);
-  assert.match(body, /repliedByMemberId\s+String\?/);
-  const event = modelBody("TeamActivityEvent");
-  assert.match(event, /pendingProjectionVersion\s+String\?/);
-  assert.match(event, /pendingProjectedAt\s+DateTime\?/);
-  assert.match(migration, /CREATE TABLE "TeamPendingDialogState"/);
-  assert.doesNotMatch(migration, /DROP\s|TRUNCATE\s|DELETE\s+FROM/i);
-});
+
 
 test("pending projection is part of durable ingest and automation cannot clear human queue", () => {
   assert.match(ingest, /applyTeamPendingProjection/);

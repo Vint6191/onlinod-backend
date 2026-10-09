@@ -53,14 +53,7 @@ test("order-bound live communication uses revision/fence work; historical enumer
   assert.match(claimedCommit, /reconcileProviderOperationalDebtForOrder/);
 });
 
-test("creator/provider binding changes reopen only affected pending Custom work", () => {
-  const migration = read("../prisma/migrations/20260909211500_phase2_current_work_coordination/migration.sql");
-  assert.match(migration, /CreatorAccount_provider_operational_dirty/);
-  assert.match(migration, /AFTER UPDATE OF "telegramContact", "telegramUserId", "telegramAccountId", "status", "deletedAt"/);
-  assert.match(migration, /AgencyTelegramMtprotoAccount_provider_operational_dirty/);
-  assert.match(migration, /AFTER UPDATE OF "lifecycleState"/);
-  assert.match(migration, /"providerOperationalDirty" = TRUE/);
-});
+
 
 test("Telegram confirmed current work retries through DomainWork due time on the fast Phase2 pump", () => {
   const scheduler = read("services/job-scheduler.js");
@@ -111,23 +104,4 @@ test("retired provider/current-work compatibility authorities cannot be reintrod
 });
 
 
-test("A46 rolling cutover retires Actual52 executable lanes at the DB boundary", () => {
-  const migration = read("../prisma/migrations/20260910144500_phase2_fresh_source_closure/migration.sql");
-  const authority = read("services/domain-work-authority-service.js");
-  for (const key of [
-    "provider_operational_debt_backfill_v1",
-    "provider_operational_dirty_v1",
-    "custom_external_proof_backfill_v1",
-    "custom_external_projection_debt_v1",
-    "telegram_inbound_projection_v1",
-    "telegram_custom_convergence_v1",
-    "team_pending_projection_v1",
-    "team_money_backfill_v1",
-  ]) assert.match(migration, new RegExp(key));
-  assert.match(migration, /Phase2LegacyExecutorFence/);
-  assert.match(migration, /phase2_fence_retired_maintenance_claim/);
-  assert.match(migration, /OLD\."ownerToken" IS DISTINCT FROM NEW\."ownerToken"/);
-  assert.match(migration, /RAISE EXCEPTION 'PHASE2_LEGACY_EXECUTOR_RETIRED/);
-  assert.match(authority, /legacyExecutorDrainStatus/);
-  assert.match(authority, /legacy_executor_drain/);
-});
+

@@ -19,7 +19,6 @@ const {
   PROVIDER_GATE_WAITER_HEARTBEAT_MS,
   PROVIDER_GATE_FAIRNESS_GENERATION,
   readProviderGateFairnessAuthority,
-  tryAcquireLegacyCompatibleProviderPermit,
   registerDurableProviderWaiter,
   heartbeatDurableProviderWaiters,
   cancelDurableProviderWaiter,
@@ -104,7 +103,7 @@ const coordinator = {
   waiterHeartbeatTimer: null,
   runningEntryId: null,
   runningWaiterRegistered: false,
-  fairnessActivationState: "DRAINING",
+  fairnessActivationState: "UNAVAILABLE",
   fairnessGeneration: PROVIDER_GATE_FAIRNESS_GENERATION,
 };
 
@@ -409,15 +408,10 @@ function pump() {
             agencyId: entry.agencyId, creatorId: entry.creatorId, deviceId: entry.deviceId,
             capability: entry.capability, intervalMs: entry.intervalMs, permitTtlMs: PERMIT_TTL_MS,
           });
-        } else if (fairness.activationState === "QUIESCING") {
-          admission = { granted: false, reason: "fairness_quiescing", retryAt: new Date(Date.now() + 250) };
         } else {
-          admission = await tryAcquireLegacyCompatibleProviderPermit({
-            db: prisma, permitId, ownerInstanceId: BACKEND_INSTANCE_ID, agencyId: entry.agencyId,
-            creatorId: entry.creatorId, deviceId: entry.deviceId, capability: entry.capability,
-            intervalMs: entry.intervalMs, permitTtlMs: PERMIT_TTL_MS,
-          });
+          throw Object.assign(new Error("Provider queue schema is unavailable"), { code: "OF_PROVIDER_GATE_NOT_READY", status: 503 });
         }
+
         if (!admission.granted) {
           if (admission.reason === "waiter_missing") {
             entry.waiterRegistered = false;
@@ -786,7 +780,7 @@ function getOfRequestGateSnapshot() {
     intervalMs: DEFAULT_INTERVAL_MS,
     permitTtlMs: PERMIT_TTL_MS,
     coordinator: durableGateAvailable()
-      ? (coordinator.fairnessActivationState === "ACTIVE" ? "postgres_durable_waiter_weighted_fair_global_two_phase" : "postgres_rolling_legacy_compatible_global_two_phase")
+      ? (coordinator.fairnessActivationState === "ACTIVE" ? "postgres_durable_waiter_weighted_fair_global_two_phase" : "postgres_durable_waiter_unavailable")
       : "single_backend_process_global_two_phase_creator_round_robin",
     fairnessGeneration: coordinator.fairnessGeneration,
     fairnessActivationState: coordinator.fairnessActivationState,
@@ -850,7 +844,7 @@ module.exports = {
       coordinator.waiterHeartbeatTimer = null;
       coordinator.runningEntryId = null;
       coordinator.runningWaiterRegistered = false;
-      coordinator.fairnessActivationState = "DRAINING";
+      coordinator.fairnessActivationState = "UNAVAILABLE";
       coordinator.fairnessGeneration = PROVIDER_GATE_FAIRNESS_GENERATION;
       accessCache.clear();
     },

@@ -8,7 +8,7 @@ const { resolveRefreshDeviceBinding } = require("../utils/device-binding");
 const { verificationPayload, passwordResetPayload } = require("./email-service");
 const { enqueueAuthMail, deliverAuthMail } = require("./auth-mail-outbox-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
-const { authorizeAuthorizationHistoryPublisher } = require("./actual60-authorization-history-rollout-service");
+const { authorizeAuthorizationHistoryPublisher } = require("./authorization-history-write-contract");
 const {
   acquireAuthorizationUserLock,
   acquireAuthorizationDeviceLock,

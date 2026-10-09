@@ -40,8 +40,8 @@ test("message day contract proves total equals incoming plus outgoing", () => {
 });
 
 test("relational migration is typed, split after enum migration, and keeps message text out", () => {
-  const enumSql = fs.readFileSync(path.join(root, "prisma/migrations/20260806170000_creator_analytics_data_types/migration.sql"), "utf8");
-  const tableSql = fs.readFileSync(path.join(root, "prisma/migrations/20260806180000_creator_analytics_relational_v1/migration.sql"), "utf8");
+  const enumSql = fs.readFileSync(path.join(root, "prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
+  const tableSql = fs.readFileSync(path.join(root, "prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
   for (const value of ["NOTIFICATION_LIKES", "NOTIFICATION_COMMENTS", "CAMPAIGNS", "MESSAGES_DAILY"]) assert.match(enumSql, new RegExp(value));
   assert.doesNotMatch(tableSql, /ADD VALUE/);
   for (const table of ["CreatorPostLike", "CreatorPostComment", "CreatorEarningsDaily", "CreatorCampaign", "CreatorCampaignFan", "CreatorMessagesDaily"]) assert.match(tableSql, new RegExp(`CREATE TABLE "${table}"`));

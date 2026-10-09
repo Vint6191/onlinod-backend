@@ -11,8 +11,8 @@ const root = path.join(__dirname, "..", "..");
 const walletPath = process.env.D7_WALLET_SOURCE || path.join(__dirname, "billing-wallet-service.js");
 const nowPaymentsPath = path.join(__dirname, "billing-nowpayments-service.js");
 const catalogPath = path.join(__dirname, "billing-catalog-service.js");
-const migrationPath = path.join(root, "prisma", "migrations", "20260814104000_billing_wallet_auto_pricing_v14", "migration.sql");
-const repairMigrationPath = path.join(root, "prisma", "migrations", "20260814113000_billing_wallet_v14_0_1_repair", "migration.sql");
+const migrationPath = path.join(root, "prisma", "migrations", "20261009000000_current_baseline", "migration.sql");
+const repairMigrationPath = path.join(root, "prisma", "migrations", "20261009000000_current_baseline", "migration.sql");
 const routePath = path.join(root, "src", "routes", "billing.js");
 const schemaPath = path.join(root, "prisma", "schema.prisma");
 const adminPath = path.join(root, "src", "routes", "admin.js");
@@ -512,30 +512,9 @@ test("monthly billing preserves the anniversary day across short months and rese
   assert.equal(db._entitlements.get("creator-1").billingAnchorDay, 3);
 });
 
-test("V14 migration is additive, dates legacy access, keeps FREE_INTERNAL out of automatic wallet renewal", () => {
-  const sql=fs.readFileSync(migrationPath,"utf8");
-  assert.doesNotMatch(sql,/\bDROP\s+(?:TABLE|COLUMN)\b/i); assert.doesNotMatch(sql,/\bTRUNCATE\b/i); assert.doesNotMatch(sql,/\bDELETE\s+FROM\b/i);
-  assert.match(sql,/CREATE TABLE "AgencyBillingWallet"/); assert.match(sql,/CREATE TABLE "BillingWalletTransaction"/); assert.match(sql,/CREATE TABLE "CreatorBillingPeriod"/);
-  assert.match(sql,/"currentPeriodStartedAt" = COALESCE\(e\."currentPeriodStartedAt", e\."coreValidFrom"\)/);
-  assert.match(sql,/SELECT l\."lineTotalCents" FROM "BillingOrderLine" l WHERE l\."orderId" = e\."coreLastOrderId"/);
-  assert.match(sql,/"billingMode" <> 'FREE_INTERNAL'::"BillingMode"/);
-  assert.match(sql,/WHERE "tier" <> 'CUSTOM'::"CreatorBillingTier"/);
-});
 
-test("V14.0.1 repair migration requires explicit wallet opt-in for legacy ADMIN/LEGACY/PAYMENT access", () => {
-  const sql = fs.readFileSync(repairMigrationPath, "utf8");
-  assert.doesNotMatch(sql, /\bDROP\s+(?:TABLE|COLUMN)\b/i);
-  assert.doesNotMatch(sql, /\bTRUNCATE\b/i);
-  assert.doesNotMatch(sql, /\bDELETE\s+FROM\b/i);
-  assert.match(sql, /ADD COLUMN "billingAnchorDay" INTEGER/);
-  assert.match(sql, /EXTRACT\(DAY FROM COALESCE\(e\."currentPeriodStartedAt", e\."coreValidFrom", e\."subscriptionStartedAt"\)\)/);
-  assert.match(sql, /"autoRenewEnabled" = false/);
-  assert.doesNotMatch(sql, /SET\s+(?:(?!WHERE)[\s\S])*"autoRenewEnabled"\s*=\s*true/i);
-  assert.match(sql, /'ADMIN'::"BillingEntitlementSource"/);
-  assert.match(sql, /'LEGACY'::"BillingEntitlementSource"/);
-  assert.match(sql, /'PAYMENT'::"BillingEntitlementSource"/);
-  assert.doesNotMatch(sql, /'WALLET'::"BillingEntitlementSource"/);
-});
+
+
 
 test("admin legacy plans read the global catalog and no longer carry independent price defaults", () => {
   const source = fs.readFileSync(adminPath, "utf8");
@@ -557,13 +536,7 @@ test("customer direct tier/period checkout endpoints are retired", () => {
   assert.match(route,/router\.post\("\/creators\/:creatorId\/start"/);
 });
 
-test("future creator profiles default to AUTO and migration preserves legacy sandbox/live wallet identity", () => {
-  const schema=fs.readFileSync(schemaPath,"utf8");
-  const sql=fs.readFileSync(migrationPath,"utf8");
-  assert.match(schema,/tierMode\s+String\s+@default\("AUTO"\)/);
-  assert.match(sql,/ALTER COLUMN "tierMode" SET DEFAULT 'AUTO'/);
-  assert.match(sql,/SELECT o\."testMode" FROM "BillingOrder" o WHERE o\."id" = e\."coreLastOrderId"/);
-});
+
 
 test("an active paid period cannot be silently switched between sandbox and live wallets", async () => {
   const now = new Date("2026-08-14T12:00:00Z");

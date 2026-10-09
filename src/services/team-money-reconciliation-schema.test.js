@@ -8,7 +8,7 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "../..");
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const schema = read("prisma/schema.prisma");
-const migration = read("prisma/migrations/20260812024500_team_money_reconciliation_v1/migration.sql");
+const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
 const reconciliation = read("src/services/team-money-reconciliation-service.js");
 const notifications = read("src/services/notification-facts-service.js");
 const financial = read("src/services/financial-transactions-service.js");

@@ -118,16 +118,4 @@ test("A17 capacity projection persists actual other/unclassified starts instead 
   assert.match(snapshot.overloadReason, /ACTUAL_USAGE_ACCOUNTING_INCOMPLETE/);
 });
 
-test("A17 schema/migration are additive and freeze category on the active permit", () => {
-  const root = path.join(__dirname, "..", "..");
-  const schema = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260919051500_phase3_provider_actual_category_accounting_v1", "migration.sql"), "utf8");
-  const source = fs.readFileSync(path.join(__dirname, "provider-request-credit-authority-service.js"), "utf8");
-  assert.match(schema, /activePriority\s+String\?/);
-  assert.match(schema, /actualUsageBackgroundOtherStarts\s+BigInt/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "usageTotalStarts"/);
-  assert.doesNotMatch(migration, /DROP\s+(?:TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM/i);
-  assert.match(source, /"activePriority" = \$13/);
-  assert.match(source, /"activeCategory" = \$14/);
-  assert.match(source, /"usageBackgroundOtherStarts"/);
-});
+

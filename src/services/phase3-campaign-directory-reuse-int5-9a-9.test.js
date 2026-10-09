@@ -86,15 +86,7 @@ function reuseDb() {
   return { db: commitDatabaseFixture(db), state, selected, exactGenerations, get segmentReads() { return segmentReads; }, get upserts() { return upserts; } };
 }
 
-test("INT5.9A-9 schema/migration persists exact reusable Campaign directory authority", () => {
-  const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260918210500_phase3_campaign_directory_reuse_v1/migration.sql");
-  for (const field of ["campaignDirectoryGeneration", "campaignDirectoryRequestedAt", "campaignDirectoryVerifiedAt", "campaignDirectoryRevision", "campaignDirectoryCampaignCount"]) {
-    assert.match(schema, new RegExp(`${field}\\s+`));
-    assert.match(migration, new RegExp(`"${field}"`));
-  }
-  assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM/i);
-});
+
 
 test("INT5.9A-9 rolling claim wire requires directory-reuse capability and seeds provider-free segment continuation", () => {
   const route = read("src/routes/jobs.js");

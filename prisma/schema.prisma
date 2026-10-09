@@ -242,9 +242,6 @@ model User {
   workerDevices                WorkerDevice[]
   auditLogs                    AuditLog[]
   teamActivityEvents           TeamActivityEvent[]
-  messageTemplateUsageEvents   MessageTemplateUsageEvent[]
-  automationRuns               AutomationRun[]
-  automationLogs               AutomationLog[]
   invitationsSent              AgencyInvitation[]          @relation("AgencyInvitationInvitedBy")
 
   @@index([disabledAt])
@@ -318,31 +315,13 @@ model Agency {
   teamShifts                            TeamShift[]
   workspaceSettings                     WorkspaceSetting[]
   moduleSettings                        ModuleSetting[]
-  messageTemplateGroups                 MessageTemplateGroup[]
-  messageTemplates                      MessageTemplate[]
-  messageTemplateUsageEvents            MessageTemplateUsageEvent[]
-  automationRules                       AutomationRule[]
-  automationRuns                        AutomationRun[]
-  automationLogs                        AutomationLog[]
   vaultUnsortedSnapshots                VaultUnsortedSnapshot[]
-  presenceSnapshots                     CreatorPresenceSnapshot[]
-  presenceUsers                         CreatorPresenceUser[]
   moneyAttributions                     MoneyAttribution[]
   mediaAssets                           CreatorMediaAsset[]
   mediaUsageContributions               CreatorMediaUsageContribution[]
   mediaUsageSourceStates                CreatorMediaUsageSourceState[]
   mediaLibraryScanItems                 MediaLibraryScanItem[]
   contentCollections                    ContentCollection[]
-  crmProfiles                           CrmProfile[]
-  crmProfileTags                        CrmProfileTag[]
-  crmProfileRawTags                     CrmProfileRawTag[]
-  crmNotes                              CrmNote[]
-  crmAnalysisRuns                       CrmAnalysisRun[]
-  fanLists                              FanList[]
-  fanListMembers                        FanListMember[]
-  savedSegments                         SavedSegment[]
-  campaignDrafts                        CampaignDraft[]
-  campaignQueueStatuses                 CampaignQueueStatus[]
   automationDeliveries                  AutomationDelivery[]
   automationMonthlyAggregates           AutomationMonthlyAggregate[]
   automationControls                    AutomationControlState[]
@@ -356,18 +335,10 @@ model Agency {
   subscriberScanRuns                    SubscriberScanRun[]
   subscriberDirectoryStates             SubscriberDirectoryState[]
   subscriberDirectoryMaintenanceSignals SubscriberDirectoryMaintenanceSignal[]
-  followBackTasks                       FollowBackTask[]
-  vaultPurchaseMessages                 VaultPurchaseMessage[]
-  vaultMediaSales                       VaultMediaSale[]
   dialogScanStates                      DialogScanState[]
   dialogScanRuns                        DialogScanRun[]
   dialogScanChunkCommits                DialogScanChunkCommit[]
   dialogReconciliationTargets           DialogReconciliationTarget[]
-  dialogMessageLedgers                  DialogMessageLedger[]
-  dialogMessageMedia                    DialogMessageMedia[]
-  dialogPurchaseSignals                 DialogPurchaseSignal[]
-  vaultPurchaseLedgers                  VaultPurchaseLedger[]
-  vaultPurchaseMediaRelations           VaultPurchaseMedia[]
   teamObservationStates                 TeamObservationState[]
   trafficSources                        TrafficSource[]
   trafficSourceMembers                  TrafficSourceMember[]
@@ -545,23 +516,12 @@ model CreatorAccount {
   teamDialogSessions                    TeamDialogSession[]
   teamResponseCases                     TeamResponseCase[]
   teamPendingDialogStates               TeamPendingDialogState[]
-  messageTemplateUsageEvents            MessageTemplateUsageEvent[]
   vaultUnsortedSnapshots                VaultUnsortedSnapshot[]
-  presenceSnapshot                      CreatorPresenceSnapshot?
-  presenceUsers                         CreatorPresenceUser[]
   mediaAssets                           CreatorMediaAsset[]
   mediaUsageContributions               CreatorMediaUsageContribution[]
   mediaUsageSourceStates                CreatorMediaUsageSourceState[]
   mediaLibraryScanItems                 MediaLibraryScanItem[]
   contentCollections                    ContentCollection[]
-  crmProfiles                           CrmProfile[]
-  crmNotes                              CrmNote[]
-  crmAnalysisRuns                       CrmAnalysisRun[]
-  fanLists                              FanList[]
-  fanListMembers                        FanListMember[]
-  savedSegments                         SavedSegment[]
-  campaignDrafts                        CampaignDraft[]
-  campaignQueueStatuses                 CampaignQueueStatus[]
   automationDeliveries                  AutomationDelivery[]
   automationMonthlyAggregates           AutomationMonthlyAggregate[]
   automationControls                    AutomationControlState[]
@@ -577,18 +537,10 @@ model CreatorAccount {
   subscriberDirectoryMaintenanceSignals SubscriberDirectoryMaintenanceSignal[]
   campaignFanRefreshPromotionSignal     CampaignFanRefreshPromotionSignal?
   fanConsumerCursors             FanConsumerCursor[]
-  followBackTasks                       FollowBackTask[]
-  vaultPurchaseMessages                 VaultPurchaseMessage[]
-  vaultMediaSales                       VaultMediaSale[]
   dialogScanStates                      DialogScanState[]
   dialogScanRuns                        DialogScanRun[]
   dialogScanChunkCommits                DialogScanChunkCommit[]
   dialogReconciliationTargets           DialogReconciliationTarget[]
-  dialogMessageLedgers                  DialogMessageLedger[]
-  dialogMessageMedia                    DialogMessageMedia[]
-  dialogPurchaseSignals                 DialogPurchaseSignal[]
-  vaultPurchaseLedgers                  VaultPurchaseLedger[]
-  vaultPurchaseMediaRelations           VaultPurchaseMedia[]
   teamObservationStates                 TeamObservationState[]
   trafficSources                        TrafficSource[]
   trafficSourceMembers                  TrafficSourceMember[]
@@ -617,7 +569,6 @@ model CreatorAccount {
   analyticsDayMembers                   CreatorAnalyticsDayMember[]
   notificationFactReceipts              NotificationFactReceipt[]
   localMessageCoverage                  CreatorLocalMessageCoverage[]
-  fanLocalCoverage                      CreatorFanLocalCoverage[]
   fanObservationClock                   FanObservationCreatorClock?
   notificationSyncState                 CreatorNotificationSyncState?
   financialCollectionState              CreatorFinancialCollectionState?
@@ -1318,8 +1269,6 @@ model WorkerDevice {
   cryptoRootsInitialized                AgencyCryptoRoot[]              @relation("AgencyCryptoRootInitializedByDevice")
   cryptoRootBridgesCreated              AgencyCryptoRootBridge[]        @relation("AgencyCryptoRootBridgeCreatedByDevice")
   teamActivityEvents                    TeamActivityEvent[]
-  presenceSnapshotsUpdated              CreatorPresenceSnapshot[]       @relation("PresenceSnapshotUpdatedByDevice")
-  presenceUsersUpdated                  CreatorPresenceUser[]           @relation("PresenceUserUpdatedByDevice")
   analyticsIngestBatches                AnalyticsIngestBatch[]
   creatorSalesCollected                 CreatorSale[]                   @relation("CreatorSaleCollectedByDevice")
   creatorTipsCollected                  CreatorTip[]                    @relation("CreatorTipCollectedByDevice")
@@ -1336,7 +1285,6 @@ model WorkerDevice {
   creatorFanRelationshipsCollected      CreatorFanRelationshipCurrent[] @relation("CreatorFanRelationshipCurrentCollectedByDevice")
   creatorEarningsTotalsCollected        CreatorEarningsTotal[]          @relation("CreatorEarningsTotalCollectedByDevice")
   creatorLocalMessageCoverage           CreatorLocalMessageCoverage[]
-  creatorFanLocalCoverage               CreatorFanLocalCoverage[]
 
   @@index([agencyId])
   @@index([userId])
@@ -1931,7 +1879,6 @@ model CreatorFan {
   postLikes             CreatorPostLike[]
   postComments          CreatorPostComment[]
   campaignMemberships   CreatorCampaignFan[]
-  localCoverage         CreatorFanLocalCoverage[]
   financialTransactions CreatorFinancialTransaction[]
   valueCurrent          CreatorFanValueCurrent?
   relationshipCurrent   CreatorFanRelationshipCurrent?
@@ -2475,19 +2422,7 @@ model MaintenanceLaneState {
   @@index([nextRunAt, completedAt], map: "MaintenanceLaneState_due_idx")
 }
 
-model Phase2ReleaseCompatibilityAuthority {
-  scope                 String    @id
-  requiredGeneration    String
-  activationState       String    @default("ACTIVE")
-  drainStartedAt        DateTime?
-  activatedAt           DateTime? @default(now())
-  activationConfirmedAt DateTime?
-  createdAt             DateTime  @default(now())
-  updatedAt             DateTime  @updatedAt
-}
-
 model DomainWorkItem {
-  legacyStorageGeneration String?
   id                       String    @id
   agencyId                 String
   workClass                String
@@ -2746,15 +2681,6 @@ model Phase2WorkCoverage {
 
   @@unique([agencyId, family, generation], map: "Phase2WorkCoverage_identity_key")
   @@index([agencyId, family, active], map: "Phase2WorkCoverage_active_idx")
-}
-
-model Phase2LegacyExecutorFence {
-  laneKey           String   @id
-  retiredGeneration String?
-  retiredAt         DateTime @default(now())
-  reason            String?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
 }
 
 model Phase2DependencyState {
@@ -3462,30 +3388,7 @@ model CreatorLocalMessageCoverage {
   @@index([deviceId, lastVerifiedAt])
 }
 
-model CreatorFanLocalCoverage {
-  id              String    @id @default(cuid())
-  agencyId        String
-  creatorId       String
-  fanRecordId     String    @map("fanId")
-  deviceId        String
-  oldestMessageAt DateTime?
-  newestMessageAt DateTime?
-  isComplete      Boolean   @default(false)
-  lastVerifiedAt  DateTime
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-
-  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  fan     CreatorFan     @relation(fields: [creatorId, fanRecordId], references: [creatorId, id], onDelete: NoAction)
-  device  WorkerDevice   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
-
-  @@unique([creatorId, fanRecordId, deviceId])
-  @@index([agencyId, creatorId, isComplete])
-  @@index([deviceId, lastVerifiedAt])
-}
-
 model JobInstance {
-  legacyStorageGeneration String?
   id                String    @id @default(cuid())
   jobKey            String
   scope             String
@@ -3576,12 +3479,7 @@ model OfProviderRequestGateState {
   priorityCursor                Int       @default(0)
   backgroundCategoryCursor      Int       @default(0)
   fairnessGeneration            String    @default("phase3_provider_gate_fairness_v2_a14")
-  fairnessActivationState       String    @default("DRAINING")
-  fairnessDrainStartedAt        DateTime?
-  fairnessActivatedAt           DateTime?
-  fairnessActivationConfirmedAt DateTime?
-  legacyPermitLastSeenAt        DateTime?
-  legacyPermitCount             BigInt    @default(0)
+  fairnessActivationState       String    @default("ACTIVE")
   usageWindowStartedAt          DateTime?
   usageTotalStarts              BigInt    @default(0)
   usageCriticalWriteStarts      BigInt    @default(0)
@@ -3956,128 +3854,6 @@ model ModuleSetting {
   @@index([moduleKey])
 }
 
-model MessageTemplateGroup {
-  id        String   @id @default(cuid())
-  agencyId  String
-  name      String
-  sortOrder Int      @default(0)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @default(now()) @updatedAt
-
-  agency    Agency            @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  templates MessageTemplate[]
-
-  @@index([agencyId])
-}
-
-model MessageTemplate {
-  id              String    @id @default(cuid())
-  agencyId        String
-  groupId         String?
-  title           String
-  body            String
-  priceCents      Int?
-  tags            Json      @default("[]")
-  creatorScope    Json?
-  status          String    @default("active")
-  createdByUserId String?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @default(now()) @updatedAt
-  deletedAt       DateTime?
-
-  agency      Agency                      @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  group       MessageTemplateGroup?       @relation(fields: [groupId], references: [id], onDelete: SetNull)
-  usageEvents MessageTemplateUsageEvent[]
-
-  @@index([agencyId])
-  @@index([groupId])
-  @@index([status])
-  @@index([deletedAt])
-}
-
-model MessageTemplateUsageEvent {
-  id         String   @id @default(cuid())
-  agencyId   String
-  templateId String
-  userId     String?
-  memberId   String?
-  creatorId  String?
-  fanId      String?
-  usedAt     DateTime @default(now())
-  metadata   Json?
-
-  agency   Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  template MessageTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
-  user     User?           @relation(fields: [userId], references: [id], onDelete: SetNull)
-  creator  CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
-
-  @@index([agencyId, usedAt])
-  @@index([templateId])
-  @@index([memberId])
-}
-
-model AutomationRule {
-  id              String    @id @default(cuid())
-  agencyId        String
-  name            String
-  enabled         Boolean   @default(false)
-  trigger         Json      @default("{}")
-  action          Json      @default("{}")
-  creatorScope    Json?
-  safety          Json?
-  createdByUserId String?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @default(now()) @updatedAt
-  deletedAt       DateTime?
-
-  agency Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  runs   AutomationRun[]
-
-  @@index([agencyId])
-  @@index([enabled])
-  @@index([deletedAt])
-}
-
-model AutomationRun {
-  id              String    @id @default(cuid())
-  agencyId        String
-  ruleId          String?
-  status          String    @default("SCHEDULED")
-  startedAt       DateTime?
-  completedAt     DateTime?
-  result          Json?
-  error           String?
-  createdByUserId String?
-  createdAt       DateTime  @default(now())
-
-  agency Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  rule   AutomationRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
-  user   User?           @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
-  logs   AutomationLog[]
-
-  @@index([agencyId, status])
-  @@index([ruleId])
-  @@index([createdAt])
-}
-
-model AutomationLog {
-  id              String   @id @default(cuid())
-  agencyId        String
-  runId           String?
-  level           String   @default("info")
-  message         String
-  metadata        Json?
-  createdByUserId String?
-  createdAt       DateTime @default(now())
-
-  agency Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  run    AutomationRun? @relation(fields: [runId], references: [id], onDelete: SetNull)
-  user   User?          @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
-
-  @@index([agencyId, createdAt])
-  @@index([runId])
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // ONLINOD AUTOMATION SERVER CORE v1
 // Server-side source of truth for automation tasks/jobs/events. Electron remains
@@ -4161,68 +3937,6 @@ model VaultUnsortedSnapshot {
   @@index([agencyId])
   @@index([creatorId])
   @@index([capturedAt])
-}
-
-model CreatorPresenceSnapshot {
-  id                String    @id @default(cuid())
-  agencyId          String
-  creatorId         String    @unique
-  status            String    @default("FRESH")
-  onlineCount       Int       @default(0)
-  staleCount        Int       @default(0)
-  offlineCount      Int       @default(0)
-  capturedAt        DateTime  @default(now())
-  expiresAt         DateTime?
-  source            String    @default("backend")
-  updatedByDeviceId String?
-  metadata          Json      @default("{}")
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @default(now()) @updatedAt
-
-  agency          Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator         CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  updatedByDevice WorkerDevice?  @relation("PresenceSnapshotUpdatedByDevice", fields: [updatedByDeviceId], references: [id], onDelete: SetNull)
-
-  @@unique([agencyId, creatorId])
-  @@index([agencyId])
-  @@index([capturedAt])
-  @@index([expiresAt])
-  @@index([updatedByDeviceId])
-}
-
-model CreatorPresenceUser {
-  id                String    @id @default(cuid())
-  agencyId          String
-  creatorId         String
-  fanId             String
-  username          String?
-  name              String?
-  avatarUrl         String?
-  totalSpentCents   Int?
-  subscribeAt       DateTime?
-  duration          String?
-  status            String    @default("online")
-  source            String    @default("api_snapshot")
-  lastOnlineAt      DateTime?
-  lastOfflineAt     DateTime?
-  lastCheckedAt     DateTime?
-  lastSnapshotAt    DateTime?
-  updatedByDeviceId String?
-  metadata          Json      @default("{}")
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @default(now()) @updatedAt
-
-  agency          Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator         CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  updatedByDevice WorkerDevice?  @relation("PresenceUserUpdatedByDevice", fields: [updatedByDeviceId], references: [id], onDelete: SetNull)
-
-  @@unique([creatorId, fanId])
-  @@index([agencyId])
-  @@index([creatorId, status])
-  @@index([fanId])
-  @@index([lastOnlineAt])
-  @@index([lastCheckedAt])
-  @@index([updatedByDeviceId])
 }
 
 model MoneyAttribution {
@@ -4484,285 +4198,7 @@ model ContentUsageEvent {
   @@index([creatorId, fanId])
 }
 
-model CrmProfile {
-  id                String    @id @default(cuid())
-  agencyId          String
-  creatorId         String
-  fanId             String
-  dialogId          String    @default("")
-  username          String?
-  name              String?
-  preferredName     String?
-  age               String?
-  location          String?
-  country           String?
-  city              String?
-  timezone          String?
-  nativeLanguage    String?
-  chatLanguage      String?
-  profession        String?
-  spenderTier       String?
-  stage             String?
-  fanRole           String?
-  controlPreference String?
-  creatorRole       String?
-  tone              String?
-  dynamicSummary    String?
-  aiSummary         String?
-  info              Json      @default("{}")
-  ppvStats          Json      @default("{}")
-  messageStats      Json      @default("{}")
-  source            String    @default("electron")
-  analyzedAt        DateTime?
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-
-  agency  Agency             @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount     @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  tags    CrmProfileTag[]
-  rawTags CrmProfileRawTag[]
-  notes   CrmNote[]
-  runs    CrmAnalysisRun[]
-
-  @@unique([creatorId, fanId])
-  @@index([agencyId])
-  @@index([creatorId])
-  @@index([creatorId, dialogId])
-  @@index([country])
-  @@index([city])
-  @@index([nativeLanguage])
-  @@index([chatLanguage])
-  @@index([fanRole])
-  @@index([updatedAt])
-}
-
-model CrmProfileTag {
-  id              String   @id @default(cuid())
-  agencyId        String
-  profileId       String
-  tagKey          String
-  label           String
-  kind            String   @default("fetish") // fetish | content | preference | tool | format | dynamic
-  category        String?
-  facets          Json     @default("[]")
-  intensity       String?
-  nicheLevel      String?
-  broadcastPolicy String?
-  confidence      Float?
-  source          String   @default("ai")
-  negative        Boolean  @default(false)
-  metadata        Json     @default("{}")
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-
-  agency  Agency     @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  profile CrmProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
-
-  @@unique([profileId, tagKey, kind, source])
-  @@index([agencyId, tagKey])
-  @@index([agencyId, category])
-  @@index([agencyId, kind])
-  @@index([broadcastPolicy])
-  @@index([nicheLevel])
-}
-
-model CrmProfileRawTag {
-  id         String   @id @default(cuid())
-  agencyId   String
-  profileId  String
-  rawLabel   String
-  mappedKey  String?
-  kind       String?
-  status     String   @default("needs_review") // mapped | needs_review | negative | ignored
-  confidence Float?
-  metadata   Json     @default("{}")
-  createdAt  DateTime @default(now())
-
-  agency  Agency     @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  profile CrmProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
-
-  @@index([agencyId, status])
-  @@index([profileId])
-  @@index([mappedKey])
-}
-
-model CrmNote {
-  id              String    @id @default(cuid())
-  agencyId        String
-  creatorId       String
-  profileId       String
-  kind            String    @default("auto") // auto | manual | summary | warning
-  text            String
-  metadata        Json      @default("{}")
-  createdByUserId String?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-  deletedAt       DateTime?
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  profile CrmProfile     @relation(fields: [profileId], references: [id], onDelete: Cascade)
-
-  @@index([agencyId, creatorId])
-  @@index([profileId, kind])
-  @@index([deletedAt])
-}
-
-model CrmAnalysisRun {
-  id              String    @id @default(cuid())
-  agencyId        String
-  creatorId       String
-  profileId       String?
-  dialogId        String?
-  fanId           String?
-  status          String    @default("done") // queued | running | done | failed
-  model           String?
-  promptVersion   String?
-  analysis        Json      @default("{}")
-  error           String?
-  startedAt       DateTime?
-  completedAt     DateTime?
-  createdByUserId String?
-  createdAt       DateTime  @default(now())
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  profile CrmProfile?    @relation(fields: [profileId], references: [id], onDelete: SetNull)
-
-  @@index([agencyId, creatorId, createdAt])
-  @@index([profileId])
-  @@index([status])
-}
-
-model FanList {
-  id              String    @id @default(cuid())
-  agencyId        String
-  creatorId       String?
-  name            String
-  description     String?
-  type            String    @default("manual") // manual | dynamic | imported | system
-  filters         Json      @default("{}")
-  status          String    @default("active")
-  createdByUserId String?
-  deletedAt       DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-
-  agency  Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
-  members FanListMember[]
-
-  @@index([agencyId, type, status])
-  @@index([creatorId])
-  @@index([deletedAt])
-}
-
-model FanListMember {
-  id              String   @id @default(cuid())
-  agencyId        String
-  listId          String
-  creatorId       String?
-  fanId           String
-  dialogId        String?
-  username        String?
-  name            String?
-  source          String   @default("manual")
-  matchedReasons  Json     @default("[]")
-  metadata        Json     @default("{}")
-  createdByUserId String?
-  createdAt       DateTime @default(now())
-
-  agency  Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  list    FanList         @relation(fields: [listId], references: [id], onDelete: Cascade)
-  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
-
-  @@unique([listId, fanId])
-  @@index([agencyId, fanId])
-  @@index([creatorId, fanId])
-}
-
-model SavedSegment {
-  id              String    @id @default(cuid())
-  agencyId        String
-  creatorId       String?
-  name            String
-  description     String?
-  filters         Json      @default("{}")
-  safety          Json      @default("{}")
-  preview         Json      @default("{}")
-  status          String    @default("active")
-  createdByUserId String?
-  deletedAt       DateTime?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-
-  agency         Agency          @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator        CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: SetNull)
-  campaignDrafts CampaignDraft[]
-
-  @@index([agencyId, status])
-  @@index([creatorId])
-  @@index([deletedAt])
-}
-
-model CampaignDraft {
-  id                  String    @id @default(cuid())
-  agencyId            String
-  creatorId           String
-  segmentId           String?
-  contentCollectionId String?
-  title               String?
-  text                String    @default("")
-  priceCents          Int       @default(0)
-  currency            String    @default("USD")
-  lockedText          Boolean   @default(false)
-  media               Json      @default("[]")
-  previews            Json      @default("[]")
-  filters             Json      @default("{}")
-  manualUserIds       Json      @default("[]")
-  status              String    @default("draft") // draft | queued | sent | archived | deleted
-  createdByUserId     String?
-  deletedAt           DateTime?
-  createdAt           DateTime  @default(now())
-  updatedAt           DateTime  @updatedAt
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  segment SavedSegment?  @relation(fields: [segmentId], references: [id], onDelete: SetNull)
-
-  @@index([agencyId, status])
-  @@index([creatorId, status])
-  @@index([segmentId])
-  @@index([deletedAt])
-}
-
-model CampaignQueueStatus {
-  id              String   @id @default(cuid())
-  agencyId        String
-  creatorId       String
-  draftId         String?
-  ofQueueId       String
-  status          String   @default("active") // active | done | canceled | failed
-  audienceCount   Int      @default(0)
-  priceCents      Int      @default(0)
-  mediaCount      Int      @default(0)
-  payload         Json     @default("{}")
-  lastOfResponse  Json     @default("{}")
-  createdByUserId String?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-
-  @@unique([creatorId, ofQueueId])
-  @@index([agencyId, status])
-  @@index([creatorId, status])
-}
-
 model AutomationDelivery {
-  legacyCleanupProofId String?
-  legacyStorageGeneration String?
   id                        String    @id @default(cuid())
   agencyId                  String
   creatorId                 String
@@ -5361,85 +4797,6 @@ model HiddenOnlineUser {
   @@index([lastSignalAt])
 }
 
-model FollowBackTask {
-  id              String    @id @default(cuid())
-  agencyId        String
-  creatorId       String
-  fanId           String
-  dialogId        String?
-  username        String?
-  name            String?
-  action          String    @default("follow_back")
-  status          String    @default("pending") // pending | running | done | skipped | failed
-  reason          String?
-  result          Json      @default("{}")
-  error           String?
-  queuedAt        DateTime  @default(now())
-  lastResultAt    DateTime?
-  createdByUserId String?
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-
-  @@unique([creatorId, fanId, action])
-  @@index([agencyId, status])
-  @@index([creatorId, status])
-}
-
-model VaultPurchaseMessage {
-  id          String    @id @default(cuid())
-  agencyId    String
-  creatorId   String
-  fanId       String?
-  dialogId    String?
-  messageId   String
-  amountCents Int       @default(0)
-  currency    String    @default("USD")
-  purchasedAt DateTime?
-  resolved    Boolean   @default(false)
-  resolvedAt  DateTime?
-  metadata    Json      @default("{}")
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-
-  @@unique([creatorId, messageId])
-  @@index([agencyId])
-  @@index([creatorId, fanId])
-  @@index([purchasedAt])
-}
-
-model VaultMediaSale {
-  id                   String    @id @default(cuid())
-  agencyId             String
-  creatorId            String
-  messageId            String
-  mediaId              String
-  fanId                String?
-  dialogId             String?
-  status               String    @default("sold") // sold | not_opened | refunded | unknown
-  allocatedAmountCents Int       @default(0)
-  packagePriceCents    Int       @default(0)
-  packSize             Int       @default(1)
-  reason               String?
-  purchasedAt          DateTime?
-  metadata             Json      @default("{}")
-  createdAt            DateTime  @default(now())
-  updatedAt            DateTime  @updatedAt
-
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-
-  @@unique([creatorId, messageId, mediaId])
-  @@index([agencyId])
-  @@index([creatorId, mediaId])
-  @@index([creatorId, status])
-}
-
 model DialogScanState {
   id                          String    @id @default(cuid())
   agencyId                    String
@@ -5576,181 +4933,23 @@ model DialogScanChunkCommit {
 /// LEGACY/DORMANT P17 table. New builds keep full chat history in Desktop
 /// dialog-messages.sqlite and do not write new rows here. Retained temporarily
 /// only for safe forward migration/cleanup of already-deployed databases.
-model DialogMessageLedger {
-  id            String    @id @default(cuid())
-  agencyId      String
-  creatorId     String
-  dialogId      String
-  messageId     String
-  fanId         String?
-  senderId      String?
-  recipientId   String?
-  direction     String
-  messageType   String    @default("message")
-  text          String?
-  priceCents    Int       @default(0)
-  currency      String    @default("USD")
-  isFree        Boolean   @default(false)
-  isOpened      Boolean   @default(false)
-  isFromCreator Boolean   @default(false)
-  isFromFan     Boolean   @default(false)
-  createdAtOf   DateTime
-  changedAtOf   DateTime?
-  deletedAt     DateTime?
-  source        String
-  firstSeenAt   DateTime  @default(now())
-  lastSeenAt    DateTime  @default(now())
-  contentHash   String?
-  metadata      Json      @default("{}")
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
 
-  agency    Agency                @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator   CreatorAccount        @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  media     DialogMessageMedia[]
-  purchases VaultPurchaseLedger[]
-
-  @@unique([creatorId, messageId])
-  @@index([agencyId, dialogId, createdAtOf])
-  @@index([creatorId, dialogId, createdAtOf])
-  @@index([creatorId, fanId, createdAtOf])
-  @@index([creatorId, isOpened, changedAtOf])
-  @@index([deletedAt])
-}
 
 /// LEGACY/DORMANT server media relation. New message-media relations are
 /// local-only in Desktop SQLite. Do not reactivate without an explicit storage
 /// migration plan and capacity review.
-model DialogMessageMedia {
-  id              String   @id @default(cuid())
-  agencyId        String
-  creatorId       String
-  messageLedgerId String
-  messageId       String
-  mediaId         String
-  assetId         String?
-  mediaType       String?
-  ownerId         String?
-  ownership       String   @default("UNKNOWN")
-  isFanMedia      Boolean  @default(false)
-  preview         Json     @default("{}")
-  durationMs      Int?
-  canView         Boolean?
-  firstSeenAt     DateTime @default(now())
-  lastSeenAt      DateTime @default(now())
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
 
-  agency        Agency              @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator       CreatorAccount      @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  messageLedger DialogMessageLedger @relation(fields: [messageLedgerId], references: [id], onDelete: Cascade)
-
-  @@unique([messageLedgerId, mediaId])
-  @@unique([creatorId, messageId, mediaId])
-  @@index([creatorId, assetId])
-  @@index([creatorId, isFanMedia])
-}
 
 /// LEGACY/DORMANT purchase payload table. New purchase facts and amounts are
 /// local-only; the backend stores only reconciliation targets/jobs.
-model DialogPurchaseSignal {
-  id               String    @id @default(cuid())
-  agencyId         String
-  creatorId        String
-  idempotencyKey   String    @unique
-  sourceEventId    String?
-  sourceMessageId  String?
-  dialogId         String?
-  buyerId          String?
-  buyerUsername    String?
-  buyerDisplayName String?
-  buyerDeleted     Boolean   @default(false)
-  occurredAt       DateTime
-  amountCents      Int       @default(0)
-  currency         String    @default("USD")
-  source           String    @default("notification")
-  resolveState     String    @default("PENDING")
-  firstSeenAt      DateTime  @default(now())
-  lastSeenAt       DateTime  @default(now())
-  resolvedAt       DateTime?
-  metadata         Json      @default("{}")
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
 
-  agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-
-  @@unique([creatorId, sourceEventId])
-  @@index([creatorId, sourceMessageId])
-  @@index([creatorId, dialogId, occurredAt])
-  @@index([resolveState, lastSeenAt])
-}
 
 /// LEGACY/DORMANT server Vault projection retained for existing rows only.
 /// Current Vault Asset Sales is projected from local dialog-messages.sqlite.
-model VaultPurchaseLedger {
-  id               String    @id @default(cuid())
-  agencyId         String
-  creatorId        String
-  messageLedgerId  String?
-  idempotencyKey   String    @unique
-  sourceEventId    String?
-  sourceMessageId  String?
-  dialogId         String?
-  buyerId          String?
-  buyerUsername    String?
-  buyerDisplayName String?
-  purchasedAt      DateTime
-  priceCents       Int       @default(0)
-  currency         String    @default("USD")
-  isOpened         Boolean   @default(false)
-  isFree           Boolean   @default(false)
-  status           String
-  resolveState     String
-  buyerDeleted     Boolean   @default(false)
-  sourceDeleted    Boolean   @default(false)
-  firstSeenAt      DateTime  @default(now())
-  lastSeenAt       DateTime  @default(now())
-  resolvedAt       DateTime?
-  metadata         Json      @default("{}")
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
 
-  agency        Agency               @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator       CreatorAccount       @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  messageLedger DialogMessageLedger? @relation(fields: [messageLedgerId], references: [id], onDelete: SetNull)
-  media         VaultPurchaseMedia[]
-
-  @@unique([creatorId, sourceEventId])
-  @@index([agencyId, creatorId, purchasedAt])
-  @@index([creatorId, status, purchasedAt])
-  @@index([creatorId, sourceMessageId])
-  @@index([creatorId, buyerId])
-}
 
 /// LEGACY/DORMANT server Vault media projection retained for cleanup/migration.
-model VaultPurchaseMedia {
-  id               String   @id @default(cuid())
-  agencyId         String
-  creatorId        String
-  purchaseId       String
-  mediaId          String
-  assetId          String?
-  mediaType        String?
-  isFanMedia       Boolean  @default(false)
-  resolutionStatus String   @default("RESOLVED")
-  allocatedCents   Int      @default(0)
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
 
-  agency   Agency              @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  creator  CreatorAccount      @relation(fields: [creatorId], references: [id], onDelete: Cascade)
-  purchase VaultPurchaseLedger @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
-
-  @@unique([purchaseId, mediaId])
-  @@index([creatorId, assetId])
-  @@index([creatorId, resolutionStatus])
-}
 
 model BumpDeliveryStat {
   id         String   @id @default(cuid())
@@ -6688,94 +5887,6 @@ model DialogControlResumeDemand {
 
 // Phase 7 maintenance records deliberately outlive Agency/Creator deletion.
 // Identities here are evidence, never grants of current tenant access.
-model Phase7RetirementCohort {
-  id                  String    @id
-  planHash            String
-  state               String
-  databaseEpoch       String    @default(dbgenerated("md5(((random())::text || (clock_timestamp())::text))"))
-  enumeration         Json      @default("{}")
-  enumerationComplete Boolean   @default(false)
-  revision            BigInt    @default(1)
-  rollbackClosedAt    DateTime?
-  releaseManifest     Json?
-  fingerprint         String?
-  fencedAt            DateTime  @default(now())
-  verifiedAt          DateTime?
-  purgedAt            DateTime?
-  updatedAt           DateTime  @default(now())
-  partitions          Phase7RetirementPartition[]
-  proofs              Phase7RetirementProof[]
-}
-model Phase7RetirementPartition {
-  id                String @id
-  cohortId          String
-  tableName         String
-  agencyKey         String
-  agencyId          String?
-  sourceEpoch       BigInt @default(1)
-  cursor            String?
-  upperBound        String?
-  rows              BigInt @default(0)
-  bytes             BigInt @default(0)
-  digest            String @default("")
-  sequence          Int @default(0)
-  state             String @default("PENDING")
-  ownerToken        String?
-  leaseRevision     BigInt @default(0)
-  leaseUntil        DateTime?
-  nextAt            DateTime @default(now())
-  lastError         String?
-  archiveRoot       String?
-  restoreRoot       String?
-  archiveVerifiedAt DateTime?
-  verifiedDigest    String?
-  verifiedSequence  Int @default(0)
-  updatedAt         DateTime @default(now())
-  cohort            Phase7RetirementCohort @relation(fields: [cohortId], references: [id], onDelete: Restrict)
-  chunks            Phase7RetirementChunk[]
-  @@unique([tableName,agencyKey])
-  @@index([state,nextAt,agencyKey,id], map: "phase7_partition_due")
-  @@index([cohortId,state,id], map: "phase7_partition_cohort")
-}
-model Phase7RetirementChunk {
-  id             String @id
-  partitionId    String
-  sourceEpoch    BigInt
-  sequence       Int
-  startCursor    String?
-  endCursor      String
-  rows           Int
-  bytes          Int
-  digest         String
-  previousDigest String
-  fileName       String
-  createdAt      DateTime @default(now())
-  partition      Phase7RetirementPartition @relation(fields: [partitionId], references: [id], onDelete: Restrict)
-  @@unique([partitionId,sourceEpoch,sequence])
-}
-model Phase7RetirementProof {
-  id                String @id
-  cohortId          String
-  sourceTable       String
-  sourceId          String
-  sourceHash        String
-  kind              String
-  agencyId          String?
-  creatorId         String?
-  providerSubject   String?
-  targetId          String?
-  generation        Int?
-  deliveryId        String?
-  consumptionKey    String?
-  evidence          Json @default("{}")
-  classifierVersion Int @default(1)
-  createdAt         DateTime @default(now())
-  cohort            Phase7RetirementCohort @relation(fields: [cohortId], references: [id], onDelete: Restrict)
-  @@unique([sourceTable,sourceId,sourceHash,kind])
-  @@index([deliveryId,kind], map: "phase7_proof_delivery")
-  @@index([agencyId,creatorId,targetId,kind], map: "phase7_proof_consumption")
-}
-
 
 model AnalyticsPublication {
   id             String @id

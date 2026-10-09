@@ -1,6 +1,5 @@
 "use strict";
-const { lockCleanupMutation } = require("./phase7-obligation-authority-service");
-const { authorizeSfsGeneration } = require("./phase7-legacy-storage-service");
+const { lockSfsDeliveryMutation: lockCleanupMutation } = require("./sfs-mutation-authority-service");
 
 const crypto = require("node:crypto");
 const { runDbTransaction } = require("./db-transaction-service");
@@ -832,7 +831,7 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
           });
           if (unresolved) return null;
         }
-        if (candidate.moduleKey === SFS_MODULE_KEY) await authorizeSfsGeneration(tx);
+
         const updated = await tx.automationDelivery.updateMany({
           where: { id: candidate.id, status: candidate.status, notBefore: { lte: now }, claimUntil: null, leaseRevision: candidate.leaseRevision },
           data: {
@@ -1248,7 +1247,7 @@ async function prepareWriteActionDelivery(input) {
       "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)",
       "phase3_fan_consumer_v1_current_bounded",
     );
-    if (delivery.moduleKey === SFS_MODULE_KEY) await authorizeSfsGeneration(tx);
+
     if (isOnlineBumpSend(delivery)) {
       const committing = await commitOnlineBumpWrite({ db: tx, delivery,
         deviceId: input.deviceId, leaseToken: input.leaseToken, leaseRevision: input.leaseRevision,

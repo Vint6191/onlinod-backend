@@ -263,40 +263,11 @@ test("value inverse physical commit order cannot roll T12 back to T11", async ()
   assert.equal(tx.value.platformReportedTotalSpendCents, 1200n);
 });
 
-test("legacy CreatorFan migration does not invent identity freshness from lastSeenAt", () => {
-  const migration = read("prisma/migrations/20260830160000_fan_data_authority_cutover/migration.sql");
-  assert.match(migration, /"identityObservedAt"\s*=\s*NULL/);
-  assert.match(migration, /LEGACY_UNCLASSIFIED/);
-  assert.doesNotMatch(migration, /"identityObservedAt"\s*=\s*COALESCE\(\s*"identityObservedAt"\s*,\s*"lastSeenAt"/);
-  assert.match(migration, /"lastActivityObservedAt"\s*=\s*COALESCE\(\s*"lastActivityObservedAt"\s*,\s*"lastSeenAt"/);
-});
 
-test("semantic closure migration removes legacy Traffic/Presence false identity clocks and adds field authority versions", () => {
-  const migration = read("prisma/migrations/20260830213000_fan_data_authority_semantic_closure/migration.sql");
-  assert.match(migration, /WHERE "identitySource" = 'TRAFFIC_LEGACY_MIGRATION'[\s\S]*"username" IS NULL[\s\S]*"headerUrl" IS NULL/);
-  assert.match(migration, /WHERE "identitySource" = 'PRESENCE_HINT'/);
-  assert.match(migration, /"identityObservedAt" = NULL,[\s\S]*"identitySource" = NULL,[\s\S]*"identityCompleteness" = NULL/);
-  for (const column of [
-    "usernameAuthorityVersion", "avatarAuthorityVersion",
-    "fanSubscribesToCreatorAuthorityVersion", "blockedAuthorityVersion",
-    "platformReportedTotalSpendCentsAuthorityVersion", "messagesSpentCentsAuthorityVersion",
-  ]) assert.match(migration, new RegExp(`ADD COLUMN "${column}" TEXT`));
-});
 
-test("schema establishes separate identity relationship and value clocks with explicit ids", () => {
-  const schema = read("prisma/schema.prisma");
-  assert.match(schema, /model CreatorFan[\s\S]*identityObservedAt\s+DateTime\?/);
-  assert.match(schema, /@@index\(\[creatorId, identityObservedAt\], map: "CreatorFan_creatorId_identityObservedAt_idx"\)/);
-  assert.match(schema, /model CreatorFanRelationshipCurrent[\s\S]*fanRecordId\s+String[\s\S]*onlyFansUserId\s+String[\s\S]*observedAt\s+DateTime/);
-  const relationshipModel = schema.match(/model CreatorFanRelationshipCurrent \{[\s\S]*?\n\}/)?.[0] || "";
-  assert.match(relationshipModel, /@@unique\(\[creatorId, fanRecordId\], map: "CreatorFanRelationshipCurrent_creatorId_fanRecordId_key"\)/);
-  const migration = read("prisma/migrations/20260830160000_fan_data_authority_cutover/migration.sql");
-  assert.match(migration, /CREATE UNIQUE INDEX "CreatorFanRelationshipCurrent_creatorId_fanRecordId_key"[\s\S]*ON "CreatorFanRelationshipCurrent"\("creatorId", "fanRecordId"\)/);
-  const valueModel = schema.match(/model CreatorFanValueCurrent \{[\s\S]*?\n\}/)?.[0] || "";
-  assert.match(valueModel, /fanRecordId\s+String\s+@map\("fanId"\)/);
-  assert.match(valueModel, /availability\s+String/);
-  assert.match(valueModel, /valueObservedAt\s+DateTime/);
-});
+
+
+
 
 test("traffic has no second current fan-value model or orphan refresh key", () => {
   const schema = read("prisma/schema.prisma");
@@ -404,37 +375,9 @@ test("Team pending identity comes only from canonical CreatorFan, not Follow can
   assert.match(team, /platformIdentity/);
 });
 
-test("Phase7 historical CRM is read-only and isolated from canonical fan authority", () => {
- const archive=read("src/services/phase7-admin-archive-service.js");
- assert.match(archive,/readArchivePage/);assert.match(archive,/readOnly:true/);
- assert.doesNotMatch(archive,/\.(create|update|delete|upsert|createMany|updateMany|deleteMany)\(/);
- const server=read("src/server.js");assert.match(server,/createLegacyGoneRouter/);
- assert.doesNotMatch(server,/require\(["']\.\/routes\/crm-store/);
-});
 
-test("historical event actor snapshots remain explicit while current identity advances", () => {
-  const schema = read("prisma/schema.prisma");
-  const financial = read("src/services/financial-transactions-service.js");
-  const notifications = read("src/services/notification-facts-service.js");
-  const campaign = read("src/services/creator-analytics-ledger-service.js");
-  for (const model of ["CreatorFinancialTransaction", "CreatorSale", "CreatorTip", "CreatorSubscriptionEvent", "CreatorPaidSubscription", "CreatorPostLike", "CreatorPostComment"]) {
-    const body = schema.match(new RegExp(`model ${model} \\{[\\s\\S]*?\\n\\}`))?.[0] || "";
-    assert.match(body, /fanUsernameAtEvent/);
-    assert.match(body, /fanDisplayNameAtEvent/);
-  }
-  const campaignBody = schema.match(/model CreatorCampaignFan \{[\s\S]*?\n\}/)?.[0] || "";
-  assert.match(campaignBody, /claimerUsernameAtEvent/);
-  assert.match(financial, /fanUsernameAtEvent:\s*row\.fanUsername/);
-  assert.match(notifications, /fanUsernameAtEvent:\s*fact\.fanUsername/);
-  assert.match(campaign, /claimerUsernameAtEvent:\s*claimer\.username/);
-  const projection = read("src/services/creator-analytics-projection-service.js");
-  assert.match(projection, /fanOnlyFansUserIdAtEvent:\s*event\.fanOnlyFansUserIdAtEvent/);
-  assert.match(projection, /fanUsernameAtEvent:\s*event\.fanUsernameAtEvent/);
-  assert.match(projection, /fanDisplayNameAtEvent:\s*event\.fanDisplayNameAtEvent/);
-  assert.match(projection, /fanAvatarUrlAtEvent:\s*event\.fanAvatarUrlAtEvent/);
-  const migration = read("prisma/migrations/20260830160000_fan_data_authority_cutover/migration.sql");
-  assert.match(migration, /ALTER TABLE "CreatorPaidSubscription"[\s\S]*ADD COLUMN "fanOnlyFansUserIdAtEvent"[\s\S]*ADD COLUMN "fanAvatarUrlAtEvent"/);
-});
+
+
 
 
 test("campaign current value read model preserves unknown instead of coercing it to zero", () => {

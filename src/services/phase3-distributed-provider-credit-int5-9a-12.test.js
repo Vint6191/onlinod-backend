@@ -27,7 +27,7 @@ function fakeDurableDb(start = new Date("2038-02-03T04:05:06.000Z")) {
       nextAllowedAt: null, revision: 0n, lastStartedAt: null, lastStartedCreatorId: null, lastStartedDeviceId: null,
       priorityCursor: 0, backgroundCategoryCursor: 0,
       fairnessGeneration: "phase3_provider_gate_fairness_v2_a14",
-      fairnessActivationState: "DRAINING",
+      fairnessActivationState: "ACTIVE",
       fairnessDrainStartedAt: new Date(start),
       fairnessActivatedAt: null,
       fairnessActivationConfirmedAt: null,
@@ -173,14 +173,7 @@ test("A12 durable started/cancel are exact-scope CAS and cannot settle another d
   assert.equal(db.state.activePermitId, null);
 });
 
-test("A12 migration/schema carry one durable gate singleton and additive indexes", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260918234500_phase3_provider_gate_distributed_credit_v1/migration.sql"), "utf8");
-  assert.match(schema, /model OfProviderRequestGateState[\s\S]*activePermitId[\s\S]*activeExpiresAt[\s\S]*nextAllowedAt[\s\S]*revision\s+BigInt/);
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS "OfProviderRequestGateState"/);
-  assert.match(migration, /VALUES \('of-global', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP\)/);
-  assert.doesNotMatch(migration, /DROP TABLE|DROP COLUMN|TRUNCATE|DELETE FROM/i);
-});
+
 
 test("A12 gate service uses PostgreSQL authority when transaction support exists and local permit is fallback-only", () => {
   const source = fs.readFileSync(path.join(__dirname, "of-request-gate-service.js"), "utf8");

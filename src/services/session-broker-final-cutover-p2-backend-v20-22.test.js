@@ -32,20 +32,4 @@ test("V20.22 proxy credential runtime is CLIENT_E2E-only", () => {
   assert.match(credentials, /CLIENT_E2E_V1/);
 });
 
-test("V20.22 schema defaults and deploy guard enforce CLIENT_E2E-only", () => {
-  const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260824213000_client_e2e_only_runtime_v20_22/migration.sql");
-  const keyringRoute = read("src/routes/client-e2e-keyring.js");
 
-  const defaults = schema.match(/encryptionMode\s+SecretEncryptionMode\s+@default\(CLIENT_E2E_V1\)/g) || [];
-  assert.equal(defaults.length, 2);
-  const enumStart = schema.indexOf("enum SecretEncryptionMode {");
-  const enumEnd = schema.indexOf("\n}", enumStart);
-  const enumBlock = schema.slice(enumStart, enumEnd + 2);
-  assert.doesNotMatch(enumBlock, /SERVER_V1/);
-  assert.match(enumBlock, /CLIENT_E2E_V1/);
-  assert.match(migration, /ACTIVE SERVER_V1 creator sessions remain/);
-  assert.match(migration, /SERVER_V1 proxy credentials remain/);
-  assert.match(migration, /RAISE EXCEPTION/);
-  assert.doesNotMatch(keyringRoute, /\/enforce-opaque/);
-});

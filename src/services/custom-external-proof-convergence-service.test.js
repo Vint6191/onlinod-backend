@@ -114,7 +114,7 @@ test("external current-work cutover keeps history one-time and creates DB-side d
   assert.match(scheduler, /PHASE2_WORK_CLASS\.CUSTOM_EXTERNAL_PROJECTION/);
   assert.match(scheduler, /repairCustomExternalProjectionWorkItem/);
   assert.doesNotMatch(scheduler.slice(scheduler.indexOf("async function runCustomExternalProofConvergenceSweep"), scheduler.indexOf("async function runTelegramInboundProjectionSweep")), /repairCurrentCustomExternalProjectionDebt|runMaintenanceLane/);
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260910130000_phase2_final_current_work_ownership", "migration.sql"), "utf8");
+  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20261009000000_current_baseline", "migration.sql"), "utf8");
   assert.match(migration, /AutomationDelivery_custom_external_projection_debt/);
   assert.match(migration, /CUSTOM_EXTERNAL_PROJECTION_DEBT/);
   assert.match(migration, /CUSTOM_RELAY_SEND/);

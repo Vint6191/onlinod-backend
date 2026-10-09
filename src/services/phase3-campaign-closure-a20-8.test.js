@@ -43,15 +43,4 @@ test("A20.8/A20.11 coverage preflight serializes both phases and releases DDL lo
   assert.ok(backfillCalls.some((row) => /FROM "JobInstance" j/.test(row.sql)));
 });
 
-test("A20.8 physical proof runner executes dedicated overlapping-preflight concurrency proof", () => {
-  const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
-  const physical = source("scripts/audit/phase3-a20-preflight-concurrency.js");
-  assert.match(runner, /PREFLIGHT_CONCURRENCY_PROOF/);
-  assert.match(runner, /clean-current-preflight-concurrency/);
-  assert.match(runner, /A20_(?:8|9)_PREFLIGHT_CONCURRENCY_PASS/);
-  assert.match(physical, /pg_locks/);
-  assert.match(physical, /NOT granted/);
-  assert.match(physical, /contender must remain blocked/);
-  assert.match(physical, /await owner/);
-  assert.match(physical, /await contender/);
-});
+

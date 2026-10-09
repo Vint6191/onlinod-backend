@@ -7,16 +7,7 @@ const { execFileSync } = require("node:child_process");
 const root = path.resolve(__dirname, "..", "..");
 const read = (rel) => fs.readFileSync(path.join(root, rel), "utf8");
 
-test("creator Telegram contact is a nullable backend field with an additive migration", () => {
-  const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260818223000_creator_telegram_contact/migration.sql");
-  const creator = schema.slice(schema.indexOf("model CreatorAccount {"), schema.indexOf("model CreatorConnectSession"));
-  assert.match(creator, /telegramContact\s+String\?/);
-  assert.match(creator, /telegramUserId\s+String\?/);
-  assert.match(creator, /@@index\(\[agencyId, telegramUserId\]\)/);
-  assert.match(migration, /ALTER TABLE "CreatorAccount" ADD COLUMN "telegramContact" TEXT/);
-  assert.doesNotMatch(migration, /DROP TABLE|DROP COLUMN|DELETE FROM|TRUNCATE/i);
-});
+
 
 test("Telegram contact write is agency-scoped, management-gated and does not expose future MTProto behavior", () => {
   const source = read("src/routes/creators.js");

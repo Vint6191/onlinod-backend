@@ -108,7 +108,7 @@ recovered with the same command identity. Retired unkeyed routes return 410.
 
 ## Runtime and verification
 
-Use Node.js 22 and the committed lockfile (`npm ci`). Run `npm test` for service
+Use Node.js 22 and the committed lockfile (`npm ci`). Run `npm run test:all` for
 regressions and `npm run test:auth-boundary` for authentication boundaries.
 Desktop has its own build and test gates; update the two projects together.
 Native PostgreSQL and Windows/Electron acceptance require their named proof
@@ -116,15 +116,19 @@ runners and environments; Node-only unit tests do not replace those gates.
 
 ## Database deployment and retirement
 
-`npm run prisma:migrate` runs the guarded Phase 7 deployment pipeline. Preserve
-all historical migrations and existing database receipts. Review
-`docs/PHASE7_LEGACY_STORAGE_RETIREMENT.txt` before using any contract/retirement
-option. An ordinary source update does not authorize destructive retirement.
+`npm run prisma:migrate` installs the current baseline into an empty PostgreSQL database using the public schema.
+It includes the schema, business triggers, functions, queues, indexes and initial
+controls. Repeating the command on the same current installation is safe.
+Old migration receipts or nonempty unbaselined databases are rejected without
+changing data. Use a separate empty database for this pre-release architecture.
 
-A release manifest describes one exact source pair. Generate a new manifest only
-for its documented retirement workflow; old release manifests are kept with
-historical checkpoints, not shipped as evidence for later source changes.
+After applying a source patch, run its deletion-only BAT in the project root to
+remove retired migration files before installation. `prisma db push` is not an
+installation path: it cannot install the required business SQL.
 
-The old root delivery cleanup commands remain explicit non-mutating tombstones.
-For current cleanup and recovery use the audited domain operations documented in
-`docs/PHASE6_DE_DURABLE_EFFECTS_RESOURCE_ADMISSION.txt`.
+`/health` checks the connection. `/ready` and startup verify the applied baseline,
+business functions, triggers, constraints, indexes and current control rows. These
+checks are read-only and never perform activation, backfill or archive operations.
+
+The reproducible clean-install SQL proof is `npm run test:database`; see
+`TESTING141.md` for its isolated runtime and the complete source verification order.

@@ -9,7 +9,7 @@ const { PGlite } = require(process.env.ONLINOD_PGLITE_MODULE || "@electric-sql/p
 const debt = require("../../src/services/provider-capacity-debt-authority-service");
 const projection = require("../../src/services/provider-capacity-projection-service");
 const ROOT = path.resolve(__dirname, "../..");
-const migration = fs.readFileSync(path.join(ROOT, "prisma/migrations/20260929150000_phase6_capacity_incremental_v1/migration.sql"), "utf8");
+const migration = fs.readFileSync(path.join(ROOT, "prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
 const baseline = fs.readFileSync(path.join(ROOT, "test/fixtures/phase6-capacity-I7-baseline.sql"), "utf8");
 const normalize = (values) => values.map((v) => typeof v === "bigint" ? String(v) : v);
 async function fixture(t, beforeMigration) {
@@ -18,7 +18,7 @@ async function fixture(t, beforeMigration) {
   await pg.exec(baseline);
   if (beforeMigration) await beforeMigration(pg);
   await pg.exec(migration);
-  await pg.exec(fs.readFileSync(path.join(ROOT, "prisma/migrations/20261001003000_capacity_catalog_traffic_retirement_v1/migration.sql"), "utf8"));
+  await pg.exec(fs.readFileSync(path.join(ROOT, "prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8"));
   const calls = [];
   const db = { async $transaction(work) { return pg.transaction(async (client) => {
     const tx = {

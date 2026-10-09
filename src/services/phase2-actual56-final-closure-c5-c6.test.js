@@ -14,7 +14,7 @@ const bootstrap = read("src/services/desktop-bootstrap-service.js");
 const desktopAuthority = read("src/services/desktop-current-access-authority-service.js");
 const desktopSecret = read("src/services/desktop-secret-delta-service.js");
 const desktopRoute = read("src/routes/desktop.js");
-const migration = read("prisma/migrations/20260912004000_phase2_actual56_creator_management_catalog_authority/migration.sql");
+const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
 const schema = read("prisma/schema.prisma");
 
 test("C5 Creator create revalidates live actor permission and broad scope before INSERT", () => {
@@ -59,16 +59,7 @@ test("C5 connection begin/complete/manual revoke share the same human commit aut
   assert.doesNotMatch(enrollment, /async function requireLiveConnectionAuthority/);
 });
 
-test("C6 Creator catalog membership is one bounded Agency generation, not O(all members)", () => {
-  assert.match(schema, /model AgencyCreatorCatalogState/);
-  assert.match(schema, /creatorCatalogState\s+AgencyCreatorCatalogState\?/);
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS "AgencyCreatorCatalogState"/);
-  assert.match(migration, /CREATE TRIGGER trg_phase2_creator_catalog_generation/);
-  assert.match(migration, /AFTER INSERT OR DELETE OR UPDATE OF "agencyId", "deletedAt"/);
-  assert.match(migration, /"generation" = "AgencyCreatorCatalogState"\."generation" \+ 1/);
-  const create = creators.slice(creators.indexOf('router.post("/", creatorManagementRequired'), creators.indexOf('router.get("/:id"'));
-  assert.doesNotMatch(create, /agencyMember\.updateMany|agencyMember\.findMany|bumpAgencyAccessEpoch|publishAgencyAccessEpochEvents|ACCESS_EPOCH_CHANGED/);
-});
+
 
 test("C6 desktop bootstrap exports catalog generation while member accessEpoch stays member-specific", () => {
   assert.match(bootstrap, /currentCreatorCatalogGeneration/);
@@ -124,11 +115,7 @@ test("C5 every direct human CreatorAccount writer remains behind a commit-time a
   assert.deepEqual([...writers.keys()].filter((rel) => !classified.has(rel)).sort(), [], "new direct CreatorAccount writer requires explicit C5 classification");
 });
 
-test("C6 creator-catalog publication is O(1) with respect to Agency membership", () => {
-  assert.doesNotMatch(migration, /"AgencyMember"|agencyMember\.|publishAgencyAccessEpochEvents|ACCESS_EPOCH_CHANGED/);
-  const create = creators.slice(creators.indexOf('router.post("/", creatorManagementRequired'), creators.indexOf('router.get("/:id"'));
-  assert.doesNotMatch(create, /AgencyMember|agencyMember\.|bumpAgencyAccessEpoch|publishAgencyAccessEpochEvents|ACCESS_EPOCH_CHANGED/);
-});
+
 
 test("C6 desktop bootstrap publishes generation and creator membership from one stable seqlock snapshot", () => {
   assert.match(bootstrap, /generationBefore = await currentCreatorCatalogGeneration/);

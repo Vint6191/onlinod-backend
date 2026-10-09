@@ -15,28 +15,7 @@ function sliceBetween(source, startNeedle, endNeedle) {
   return source.slice(start, end);
 }
 
-test("INT5.9A-4 CreatorCampaign frontier anchors are typed relational and business JSON is physically removed", () => {
-  const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260918163000_phase3_campaign_typed_frontier_fans/migration.sql");
-  const creatorCampaign = sliceBetween(schema, "model CreatorCampaign {", "model CreatorCampaignFrontierFan {");
-  const frontier = sliceBetween(schema, "model CreatorCampaignFrontierFan {", "model CreatorCampaignFan {");
 
-  assert.doesNotMatch(creatorCampaign, /\bJson\??\b/);
-  assert.match(creatorCampaign, /frontierFans\s+CreatorCampaignFrontierFan\[\]/);
-  assert.match(frontier, /frontierKind\s+CreatorCampaignFrontierKind/);
-  assert.match(frontier, /onlyFansUserId\s+String\s+@db\.VarChar\(180\)/);
-  assert.match(frontier, /sourceScanRunId\s+String\?/);
-  assert.match(frontier, /sourceScanStartedAt\s+DateTime\?/);
-  assert.match(frontier, /@@unique\(\[campaignId, frontierKind, onlyFansUserId\]\)/);
-
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS "CreatorCampaignFrontierFan"/);
-  assert.match(migration, /jsonb_array_elements_text/);
-  assert.equal((migration.match(/WHERE rn <= 50/g) || []).length, 2);
-  assert.match(migration, /'CANONICAL'::"CreatorCampaignFrontierKind"/);
-  assert.match(migration, /'STAGED'::"CreatorCampaignFrontierKind"/);
-  assert.match(migration, /DROP COLUMN IF EXISTS "catchupFrontierFanIds"/);
-  assert.match(migration, /DROP COLUMN IF EXISTS "stagedCatchupFrontierFanIds"/);
-});
 
 test("INT5.9A-4 ledger reads at most 100 typed frontier rows and replaces canonical/staged anchors transactionally", () => {
   const ledger = read("src/services/creator-analytics-ledger-service.js");

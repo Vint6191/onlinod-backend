@@ -8,8 +8,7 @@ const { dbAuthorityNow } = require("./db-time-authority-service");
 const {
   DOMAIN_WORK_EXECUTOR_GENERATION,
   authorizeDomainWorkExecutor,
-  authorizeDomainWorkDependencyWakeBridge,
-} = require("./phase2-release-compatibility-authority-service");
+} = require("./database-write-contract-service");
 
 const DOMAIN_WORK_GENERATION = "phase2_domain_work_v3_actual55";
 const DOMAIN_WORK_PROJECTION_VERSION = "phase2_domain_work_v3_actual55";
@@ -27,7 +26,6 @@ const WORK_CLASS = Object.freeze({
   ANALYTICS_FACT_PUBLICATION: "ANALYTICS_FACT_PUBLICATION",
   ANALYTICS_FACT_ADOPTION: "ANALYTICS_FACT_ADOPTION",
   NOTIFICATION_FACT_RECEIPTS: "NOTIFICATION_FACT_RECEIPTS",
-  NOTIFICATION_RETAINED_REPAIR_V3: "NOTIFICATION_RETAINED_REPAIR_V3",
   CAMPAIGN_FACT: "CAMPAIGN_FACT",
   CAMPAIGN_VALUE: "CAMPAIGN_VALUE",
   CAMPAIGN_ATTRIBUTION: "CAMPAIGN_ATTRIBUTION",
@@ -36,8 +34,6 @@ const WORK_CLASS = Object.freeze({
   TRAFFIC_FAN: "TRAFFIC_FAN",
   TRAFFIC_FACT: "TRAFFIC_FACT",
   TRAFFIC_BACKFILL: "TRAFFIC_BACKFILL",
-  NOTIFICATION_HISTORY_REPAIR: "NOTIFICATION_HISTORY_REPAIR",
-  NOTIFICATION_RECEIPT_REPAIR: "NOTIFICATION_RECEIPT_REPAIR",
   NOTIFICATION_CONSEQUENCES: "NOTIFICATION_CONSEQUENCES",
   NOTIFICATION_CONSEQUENCES_V2: "NOTIFICATION_CONSEQUENCES_V2",
   ADMIN_BILLING_PRICING: "ADMIN_BILLING_PRICING",
@@ -74,18 +70,6 @@ async function authorizeProjectionClass(tx, workClass) {
 // and can rewrite a lane row under its own generation, so new current-business work
 // must not start until every already-held retired legacy lane has drained. The DB
 // migration separately prevents any NEW owner token from being acquired on those keys.
-const LEGACY_DRAIN_WORK_CLASSES = new Set([
-  WORK_CLASS.CUSTOM_COMMUNICATION,
-  WORK_CLASS.CUSTOM_REMINDER,
-  WORK_CLASS.CUSTOM_SOURCE_PIPELINE,
-  WORK_CLASS.TELEGRAM_CONFIRMED_PROJECTION,
-  WORK_CLASS.TELEGRAM_INBOUND_PROJECTION,
-  WORK_CLASS.CUSTOM_EXTERNAL_PROJECTION,
-  WORK_CLASS.TEAM_DIALOG_PROJECTION,
-  WORK_CLASS.TEAM_RESPONSE_RANGE_REPAIR,
-  WORK_CLASS.TEAM_MONEY_RECONCILIATION,
-  WORK_CLASS.TEAM_READ_SUMMARY,
-]);
 
 function clean(value, max = 240) {
   const out = String(value ?? "").trim();
@@ -342,94 +326,6 @@ async function hasOutstandingDomainWork({ db = null, agencyId, workClass } = {})
   return status.outstandingCount == null ? null : status.outstandingCount > 0;
 }
 
-async function legacyExecutorDrainStatus({ db, workClass, fallbackNow = new Date() }) {
-  const klass = clean(workClass, 120);
-  const needsLegacyLaneDrain = LEGACY_DRAIN_WORK_CLASSES.has(klass);
-  const authorityNow = await dbAuthorityNow({ db, fallbackNow });
-
-  // Two independent rolling fences coexist here:
-  // 1) the older maintenance-lane generation fence only applies to the historical
-  //    lane-backed work classes listed in LEGACY_DRAIN_WORK_CLASSES;
-  // 2) the Actual56 release-generation fence applies to EVERY DomainWork class.
-  // A live pre-migration DWI claim must drain before the new binary acquires any
-  // work of the same class, including DEPENDENCY_FANOUT and destructive classes.
-  if (db?.phase2LegacyExecutorFence?.findMany && db?.maintenanceLaneState?.findMany) {
-    let rows = [];
-    if (needsLegacyLaneDrain) {
-      const fences = await db.phase2LegacyExecutorFence.findMany({ select: { laneKey: true } });
-      const keys = (fences || []).map((row) => clean(row?.laneKey, 180)).filter(Boolean);
-      if (!keys.length) return { ready: false, lanes: [], reason: "legacy_executor_fence_uninitialized" };
-      rows = await db.maintenanceLaneState.findMany({
-        where: { key: { in: keys }, ownerToken: { not: null }, leaseUntil: { gt: authorityNow } },
-        select: { key: true, generation: true, ownerToken: true, leaseUntil: true },
-      });
-    }
-
-    let domainRows = [];
-    if (db?.phase2ReleaseCompatibilityAuthority?.findUnique && db?.domainWorkItem?.findMany) {
-      const authority = await db.phase2ReleaseCompatibilityAuthority.findUnique({
-        where: { scope: "DOMAIN_WORK_EXECUTOR" }, select: { requiredGeneration: true },
-      });
-      const required = clean(authority?.requiredGeneration, 120);
-      if (!required) return { ready: false, lanes: [], reason: "release_executor_fence_uninitialized" };
-      domainRows = await db.domainWorkItem.findMany({
-        where: {
-          workClass: klass, isOutstanding: true, state: STATE.CLAIMED, leaseUntil: { gt: authorityNow },
-          OR: [{ claimExecutionGeneration: null }, { claimExecutionGeneration: { not: required } }],
-        },
-        select: { id: true, claimExecutionGeneration: true, ownerToken: true, leaseUntil: true },
-        orderBy: [{ leaseUntil: "asc" }, { id: "asc" }], take: 100,
-      });
-    }
-    const legacy = [
-      ...(rows || []),
-      ...(domainRows || []).map((row) => ({ key: row.id, generation: row.claimExecutionGeneration || "legacy", ownerToken: row.ownerToken, leaseUntil: row.leaseUntil, domainWork: true })),
-    ];
-    return { ready: legacy.length === 0, lanes: legacy, reason: legacy.length ? "legacy_executor_drain" : null };
-  }
-
-  if (typeof db?.$queryRawUnsafe === "function") {
-    try {
-      let rows = [];
-      if (needsLegacyLaneDrain) {
-        rows = await db.$queryRawUnsafe(`
-          SELECT m."key",m."generation",m."ownerToken",m."leaseUntil"
-            FROM "MaintenanceLaneState" m
-            JOIN "Phase2LegacyExecutorFence" f ON f."laneKey"=m."key"
-           WHERE m."ownerToken" IS NOT NULL
-             AND m."leaseUntil" > $1
-           ORDER BY m."key" ASC`, authorityNow);
-      }
-      const domainRows = await db.$queryRawUnsafe(`
-        WITH release_authority AS (
-          SELECT "requiredGeneration"
-            FROM "Phase2ReleaseCompatibilityAuthority"
-           WHERE "scope"='DOMAIN_WORK_EXECUTOR'
-           LIMIT 1
-        )
-        SELECT d."id" AS "key",COALESCE(d."claimExecutionGeneration",'legacy') AS "generation",d."ownerToken",d."leaseUntil"
-          FROM "DomainWorkItem" d
-          CROSS JOIN release_authority a
-         WHERE d."workClass"=$2
-           AND d."isOutstanding"=TRUE
-           AND d."state"='CLAIMED'
-           AND d."leaseUntil">$1
-           AND d."claimExecutionGeneration" IS DISTINCT FROM a."requiredGeneration"
-         ORDER BY d."leaseUntil" ASC,d."id" ASC
-         LIMIT 100`, authorityNow, klass);
-      const legacy = [...(rows || []), ...(domainRows || []).map((row) => ({ ...row, domainWork: true }))];
-      return { ready: legacy.length === 0, lanes: legacy, reason: legacy.length ? "legacy_executor_drain" : null };
-    } catch (error) {
-      const wrapped = new Error("Phase2 rolling executor fence is unavailable");
-      wrapped.code = "PHASE2_RELEASE_EXECUTOR_FENCE_REQUIRED";
-      wrapped.cause = error;
-      throw wrapped;
-    }
-  }
-
-  return { ready: true, lanes: [], skipped: true, reason: "legacy_executor_fence_adapter_unavailable" };
-}
-
 function normalizeMemberClaimScope(value, agencyId) {
   if (!value || typeof value !== "object") return null;
   const memberId = clean(value.memberId, 180);
@@ -598,29 +494,16 @@ async function claimDomainWorkBatchInternal({
   if (String(activeGeneration) !== String(generation)) {
     return { ownerToken, authorityNow: null, leaseUntil: null, items: [], skipped: true, reason: "unsupported_domain_work_generation", activeGeneration };
   }
-  const drain = await legacyExecutorDrainStatus({ db, workClass: klass, fallbackNow });
-  if (!drain.ready) {
-    return { ownerToken, authorityNow: null, leaseUntil: null, items: [], skipped: true, reason: drain.reason || "legacy_executor_drain", legacyExecutors: drain.lanes || [] };
-  }
-
   const rawCapable = typeof db?.$queryRawUnsafe === "function";
 
   // Both broad and member-scoped production claims depend on the same online
-  // current-only topology. During BUILDING old rolling replicas may continue,
-  // while the new binary fails closed instead of observing a partial backfill.
-  let dependencyWakeBridge = false;
+  // current topology. A rebuilding projection cannot admit work until ACTIVE.
   if (rawCapable && typeof db?.domainWorkClaimTopologyState?.findUnique === "function") {
     const topology = await db.domainWorkClaimTopologyState.findUnique({
       where: { id: DOMAIN_WORK_CLAIM_TOPOLOGY_ID },
       select: { generation: true, activationState: true, revision: true },
     });
-    dependencyWakeBridge = Boolean(
-      topology?.generation === DOMAIN_WORK_CLAIM_TOPOLOGY_ID
-      && topology?.activationState === "BUILDING"
-      && klass === WORK_CLASS.DEPENDENCY_WAKE,
-    );
-    if ((!topology || topology.generation !== DOMAIN_WORK_CLAIM_TOPOLOGY_ID || topology.activationState !== "ACTIVE")
-        && !dependencyWakeBridge) {
+    if (!topology || topology.generation !== DOMAIN_WORK_CLAIM_TOPOLOGY_ID || topology.activationState !== "ACTIVE") {
       return {
         ownerToken,
         authorityNow: null,
@@ -633,16 +516,8 @@ async function claimDomainWorkBatchInternal({
     }
   }
   const authorizeClaimExecutor = async (tx) => {
-    try {
-      await (dependencyWakeBridge
-        ? authorizeDomainWorkDependencyWakeBridge(tx)
-        : authorizeDomainWorkExecutor(tx));
-      await authorizeProjectionClass(tx, klass);
-      return true;
-    } catch (error) {
-      if (error?.code === "DOMAIN_WORK_DEPENDENCY_WAKE_BRIDGE_TRANSITION") return false;
-      throw error;
-    }
+    await authorizeDomainWorkExecutor(tx);
+    await authorizeProjectionClass(tx, klass);
   };
 
   if (memberAuthority) {
@@ -689,12 +564,7 @@ async function claimDomainWorkBatchInternal({
       if (typeof tx?.$queryRawUnsafe !== "function") {
         return { ownerToken, authorityNow, leaseUntil, items: [], skipped: true, reason: "domain_work_raw_storage_unavailable" };
       }
-      if (!await authorizeClaimExecutor(tx)) {
-        return {
-          ownerToken, authorityNow, leaseUntil: null, items: [], skipped: true,
-          reason: "domain_work_dependency_wake_bridge_transition",
-        };
-      }
+      await authorizeClaimExecutor(tx);
       if (memberAuthority) {
         const access = await lockMemberClaimAuthority(tx, memberAuthority, "scoped");
         if (!access.authorized) {
@@ -784,7 +654,6 @@ async function claimDomainWorkBatchInternal({
     const claimedByAgency = new Map();
     const suppressedAgencies = [];
     const suppressedShards = [];
-    let bridgeTransitioned = false;
     // Normal cost is three short bounded transactions per tranche: Agency
     // reservation, shard reservation, and physical claim. The fixed repair
     // margin can rotate every shard of one corrupt Agency without depending on
@@ -805,9 +674,7 @@ async function claimDomainWorkBatchInternal({
         const agencyReservation = await runDbTransaction(db, async (tx) => {
           const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
           if (typeof tx?.$queryRawUnsafe !== "function") return { agencyId: null, authorityNow };
-          if (!await authorizeClaimExecutor(tx)) {
-            return { agencyId: null, authorityNow, bridgeTransitioned: true };
-          }
+          await authorizeClaimExecutor(tx);
 
           const excluded = Array.from(new Set([...exhaustedAgencies, ...suppressedAgencies]));
           const params = [klass, authorityNow, String(generation)];
@@ -889,10 +756,7 @@ async function claimDomainWorkBatchInternal({
           }
           return { agencyId: reservedAgency, authorityNow };
         });
-        if (agencyReservation.bridgeTransitioned) {
-          bridgeTransitioned = true;
-          break;
-        }
+        
         if (agencyReservation.contended) continue;
         selectedAgency = clean(agencyReservation.agencyId, 180);
         if (!firstAuthorityNow) firstAuthorityNow = agencyReservation.authorityNow || null;
@@ -902,9 +766,7 @@ async function claimDomainWorkBatchInternal({
       const shardReservation = await runDbTransaction(db, async (tx) => {
         const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
         if (typeof tx?.$queryRawUnsafe !== "function") return { claimShard: null, authorityNow };
-        if (!await authorizeClaimExecutor(tx)) {
-          return { claimShard: null, authorityNow, bridgeTransitioned: true };
-        }
+        await authorizeClaimExecutor(tx);
 
         const shardParams = [klass, authorityNow, String(generation), selectedAgency];
         let shardFilter = "";
@@ -992,10 +854,7 @@ async function claimDomainWorkBatchInternal({
         return { claimShard: selectedShard, authorityNow };
       });
 
-      if (shardReservation.bridgeTransitioned) {
-        bridgeTransitioned = true;
-        break;
-      }
+      
       if (shardReservation.contended) continue;
 
       const selectedShard = shardReservation.claimShard == null ? Number.NaN : Number(shardReservation.claimShard);
@@ -1010,12 +869,7 @@ async function claimDomainWorkBatchInternal({
         const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
         const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
         if (typeof tx?.$queryRawUnsafe !== "function") return { agencyId: selectedAgency, claimShard: selectedShard, authorityNow, leaseUntil, items: [] };
-        if (!await authorizeClaimExecutor(tx)) {
-          return {
-            agencyId: selectedAgency, claimShard: selectedShard, authorityNow,
-            leaseUntil: null, items: [], bridgeTransitioned: true,
-          };
-        }
+        await authorizeClaimExecutor(tx);
         if (memberAuthorityMode === "broad") {
           const access = await lockMemberClaimAuthority(tx, memberAuthority, "broad");
           if (!access.authorized) {
@@ -1155,10 +1009,7 @@ async function claimDomainWorkBatchInternal({
       });
 
       if (!firstAuthorityNow) firstAuthorityNow = tranche.authorityNow || null;
-      if (tranche.bridgeTransitioned) {
-        bridgeTransitioned = true;
-        break;
-      }
+      
       if (tranche.accessDenied) {
         return {
           ownerToken,
@@ -1184,11 +1035,7 @@ async function claimDomainWorkBatchInternal({
       authorityNow: firstAuthorityNow,
       leaseUntil: lastLeaseUntil,
       items: claimed.slice(0, take),
-      ...(bridgeTransitioned ? {
-        bridgeTransitioned: true,
-        skipped: claimed.length === 0,
-        reason: "domain_work_dependency_wake_bridge_transition",
-      } : {}),
+      
     };
   }
 
@@ -1197,12 +1044,7 @@ async function claimDomainWorkBatchInternal({
   return runDbTransaction(db, async (tx) => {
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     const leaseUntil = new Date(authorityNow.getTime() + Math.max(30_000, Number(leaseMs) || DEFAULT_LEASE_MS));
-    if (!await authorizeClaimExecutor(tx)) {
-      return {
-        ownerToken, authorityNow, leaseUntil: null, items: [], skipped: true,
-        reason: "domain_work_dependency_wake_bridge_transition",
-      };
-    }
+    await authorizeClaimExecutor(tx);
     if (!tx?.domainWorkItem?.findMany || !tx?.domainWorkItem?.updateMany) {
       return { ownerToken, authorityNow, leaseUntil, items: [], skipped: true, reason: "domain_work_storage_unavailable" };
     }
@@ -1253,16 +1095,7 @@ async function claimDomainWorkBatch(input = {}) {
     // Activation may win the topology row between the initial BUILDING read and
     // the first short reservation transaction. No work was acquired: retry on
     // the next pump through the normal ACTIVE/v5 path.
-    if (error?.code === "DOMAIN_WORK_DEPENDENCY_WAKE_BRIDGE_TRANSITION") {
-      return {
-        ownerToken,
-        authorityNow: null,
-        leaseUntil: null,
-        items: [],
-        skipped: true,
-        reason: "domain_work_dependency_wake_bridge_transition",
-      };
-    }
+    
     throw error;
   }
 }
@@ -1646,7 +1479,6 @@ async function runDomainDependencyWakeSweep({
     lostOwnership: 0,
     skipped: claim?.skipped === true,
     reason: claim?.reason || null,
-    bridgeTransitioned: claim?.bridgeTransitioned === true,
   };
   for (const item of claim?.items || []) {
     try {
@@ -1709,8 +1541,8 @@ module.exports = {
   DOMAIN_WORK_GENERATION, DOMAIN_WORK_PROJECTION_VERSION, DEFAULT_LEASE_MS, MAX_BATCH, DOMAIN_WORK_CLAIM_TOPOLOGY_ID,
   DOMAIN_WORK_MEMBER_SCOPE_SHARD_PROBE, DOMAIN_WORK_MEMBER_SCOPE_CREATOR_PROBE,
   DOMAIN_DEPENDENCY_WAKE_OBJECT_TYPE,
-  WORK_CLASS, STATE, LEGACY_DRAIN_WORK_CLASSES,
-  workId, publishDomainWork, activeDomainWorkGeneration, domainWorkFamilyState, hasOutstandingDomainWork, legacyExecutorDrainStatus, claimDomainWorkBatch, lockDomainWorkClaimForCommit, heartbeatDomainWorkClaim, ackDomainWorkClaim,
+  WORK_CLASS, STATE,
+  workId, publishDomainWork, activeDomainWorkGeneration, domainWorkFamilyState, hasOutstandingDomainWork, claimDomainWorkBatch, lockDomainWorkClaimForCommit, heartbeatDomainWorkClaim, ackDomainWorkClaim,
   blockDomainWorkClaim, failDomainWorkClaim, saveDomainWorkProgress, yieldDomainWorkClaim, wakeDomainDependencyBatch, bumpDomainDependency, runDomainDependencyWakeSweep, currentDependencyRevision,
   normalizeMemberClaimScope, lockMemberClaimAuthority, reserveMemberScopeCreatorProbe,
 };

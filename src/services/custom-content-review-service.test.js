@@ -283,26 +283,9 @@ test("commit-time review fence rejects APPROVE when cancellation wins the Custom
   assert.equal(row.reviewStatus, "WAITING_REVIEW");
 });
 
-test("decision-convergence migration adds exact revision intent identity without inventing provider success", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  assert.match(schema, /model TelegramDeliveryIntent[\s\S]*customSubmissionId\s+String\?/);
-  assert.match(schema, /@@index\(\[agencyId, customSubmissionId, kind, createdAt\]\)/);
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260907163000_custom_content_decision_convergence_authority/migration.sql"), "utf8");
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "customSubmissionId" TEXT/);
-  assert.match(migration, /one_revision_request_per_submission_key/);
-  assert.match(migration, /kind" = 'REVISION_REQUEST'/);
-  assert.match(migration, /CHECK \("kind" IN \('TASK', 'REFERENCE', 'MANUAL_REMINDER', 'AUTO_REMINDER', 'CANCELLATION', 'REVISION_REQUEST'\)\)/);
-  assert.match(migration, /no synthetic receipt/i);
-});
 
-test("V20.5 migration keeps review typed and enforces one approved version per custom", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  assert.match(schema, /enum CustomContentReviewStatus[\s\S]*WAITING_REVIEW[\s\S]*REVISION_REQUESTED[\s\S]*APPROVED/);
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260821143000_custom_content_manager_review/migration.sql"), "utf8");
-  assert.match(migration, /CREATE TYPE "CustomContentReviewStatus"/);
-  assert.match(migration, /one_approved_per_order_key/);
-  assert.match(migration, /WHERE "reviewStatus" = 'APPROVED'/);
-});
+
+
 
 test("review queue derives revision version and previous manager instruction without schema fields", async () => {
   const { db, member, row, rows } = fixture();

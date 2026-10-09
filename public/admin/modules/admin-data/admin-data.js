@@ -17,31 +17,6 @@
   // entity key → { label, api(query), columns:[{k,label,fmt?}], model (for inspection) }
   const ENTITIES = {
     "content": { label: "Message Library", model: "contentCollection", api: q => A().dataContent({...q,kind:"message_library_script",includeTrash:"true"}), cols: [{k:"title",label:"Title"},{k:"status",label:"Status"},{k:"creatorId",label:"Creator"},{k:"updatedAt",label:"Updated",fmt:fmtDate}] },
-    "crm-profiles": {
-      label: "CRM Profiles — Archive", archive: true, model: "crmProfile",
-      api: (q) => A().crmProfiles(q),
-      cols: [
-        { k: "fanId", label: "Fan" },
-        { k: "username", label: "Username" },
-        { k: "name", label: "Name" },
-        { k: "spenderTier", label: "Tier" },
-        { k: "_count", label: "Tags", fmt: (v) => (v?.tags ?? "—") },
-        { k: "updatedAt", label: "Updated", fmt: fmtDate },
-      ],
-    },
-    "crm-tags": {
-      label: "CRM Tags — Archive", archive: true, model: "crmProfileTag",
-      api: (q) => A().crmTags(q),
-      cols: [
-        { k: "label", label: "Label" },
-        { k: "kind", label: "Kind" },
-        { k: "category", label: "Category" },
-        { k: "nicheLevel", label: "Niche" },
-        { k: "negative", label: "Neg", fmt: (v) => (v ? "yes" : "") },
-      ],
-    },
-    "crm-notes": {label:"CRM Notes — Archive",archive:true,model:"crmNote",api:q=>A().crmNotes(q),cols:[{k:"profileId",label:"Profile"},{k:"creatorId",label:"Creator"},{k:"createdAt",label:"Created",fmt:fmtDate}]},
-    "vault-purchases": {label:"Vault Purchases — Archive",archive:true,model:"vaultPurchaseMessage",api:q=>A().dataVaultPurch(q),cols:[{k:"messageId",label:"Message"},{k:"creatorId",label:"Creator"},{k:"createdAt",label:"Created",fmt:fmtDate}]},
     "deliveries": {
       label: "Automation Deliveries", model: "automationDelivery",
       api: (q) => A().dataDeliveries(q),
@@ -76,17 +51,6 @@
         { k: "state", label: "Candidate state" },
         { k: "currentEligibility", label: "Eligibility" },
         { k: "updatedAt", label: "Updated", fmt: fmtDate },
-      ],
-    },
-    "vault-sales": {
-      label: "Vault Sales — Archive", archive: true, model: "vaultMediaSale",
-      api: (q) => A().dataVaultSales(q),
-      cols: [
-        { k: "messageId", label: "MsgId" },
-        { k: "mediaId", label: "Media" },
-        { k: "status", label: "Status" },
-        { k: "allocatedAmountCents", label: "Amount", fmt: fmtMoney },
-        { k: "purchasedAt", label: "Purchased", fmt: fmtDate },
       ],
     },
     "money": {
@@ -193,7 +157,6 @@
     const table = body.querySelector("#admDataTable");
     table.innerHTML = `<div class="adm-loading">loading…</div>`;
     const ent = ENTITIES[view.entity];
-    if(ent.archive&&!view.filters.agencyId&&!view.filters.creatorId){table.innerHTML='<div class="adm-muted">Select an agency or creator to browse the historical archive.</div>';return;}
     const r = await ent.api({ cursor:cursor||undefined, agencyId: view.filters.agencyId || undefined, creatorId: view.filters.creatorId || undefined, limit: 200 });
     if (requestId !== view.requestId) return;
     if (!r || !r.ok) { table.innerHTML = `<div class="adm-error">${esc(r?.error||r?.code||"load failed")}</div>`; return; }
@@ -231,7 +194,7 @@
 
     table.innerHTML = `
       ${statusBar}
-      <div class="adm-muted" style="margin:6px 0">${view.rows.length} on this page${view.total==null?"":` of ${view.total} total`}${ent.archive?" · historical archive":""}${readOnly ? " · read-only" : ""}</div>
+      <div class="adm-muted" style="margin:6px 0">${view.rows.length} on this page${view.total==null?"":` of ${view.total} total`}${readOnly ? " · read-only" : ""}</div>
       <table class="adm-table"><thead>${head}</thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows on this page</td></tr>`}</tbody></table>
       ${view.hasMore?'<button class="adm-btn adm-btn-sm" id="admNextPage">next page</button>':""}`;
 
@@ -264,29 +227,9 @@
 
   async function inspect(model, id) {
     if (!model) return;
-    if(model==="crmProfile")return inspectCrmProfile(id);
     const r = await A().dataInspect(model, id);
     if (!r || !r.ok) { R().toast("inspect failed", "error"); return; }
     showModal(`${model} · ${id}`, `<pre class="adm-json">${esc(JSON.stringify(r.record, null, 2))}</pre>`);
-  }
-
-  async function inspectCrmProfile(id){
-    const r=await A().crmProfile(id);
-    if(!r?.ok){R().toast(r?.error||"inspect failed","error");return;}
-    const keys=["tags","rawTags","notes","runs"],base={...r.profile};for(const key of keys)delete base[key];
-    const m=showModal(`CRM archive · ${id}`,`<p class="adm-muted">Historical profile. Each section shows one page.</p><pre class="adm-json">${esc(JSON.stringify(base,null,2))}</pre>${keys.map(key=>`<section data-archive-section="${key}"></section>`).join("")}`);
-    function renderSection(key,items,page){
-      const section=m.querySelector(`[data-archive-section="${key}"]`);
-      section.innerHTML=`<h3>${esc(key)}</h3><pre class="adm-json">${esc(JSON.stringify(items,null,2))}</pre>${page?.hasMore?'<button class="adm-btn adm-btn-sm">next page</button>':'<p class="adm-muted">End of section</p>'}`;
-      section.querySelector("button")?.addEventListener("click",async e=>{
-        e.currentTarget.disabled=true;
-        const result=await A().crmProfile(id,{section:key,cursor:page.nextCursor});
-        if(!m.isConnected)return;
-        if(!result?.ok){e.target.disabled=false;R().toast(result?.error||"Page unavailable","error");return;}
-        renderSection(key,result.items,result);
-      });
-    }
-    for(const key of keys)renderSection(key,r.profile[key]||[],r.pages[key]);
   }
 
   async function changeContent(body, id, action) {
@@ -336,5 +279,5 @@
     return m;
   }
 
-  window.OnlinodAdminData = { render, inspectCrmProfile };
+  window.OnlinodAdminData = { render };
 })();

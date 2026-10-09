@@ -30,7 +30,7 @@ if (fs.existsSync(path.join(root, 'apps/desktop'))) {
   }
 }
 console.log(`Full corpus: ${files.length} JS test/spec files; native acceptance remains a separate gate.`);
-const result = spawnSync(process.execPath, ['--experimental-strip-types', '--test', '--test-concurrency=4', ...files], {
+const result = spawnSync(process.execPath, ['--experimental-strip-types', '--test', '--test-concurrency=4', '--test-timeout=60000', ...files], {
   cwd: root, stdio: 'inherit', env: { ...process.env, CI: '1' }, timeout: 600_000,
 });
 if (result.error) console.error(result.error.message);

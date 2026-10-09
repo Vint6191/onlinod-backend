@@ -87,7 +87,7 @@ test("INT5.5C-1 mint never performs global retention; compatibility cleanup requ
 
 test("INT5.5C-1 token retention has a createdAt index and remains one authority table", () => {
   const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260917113000_phase3_observation_token_retention/migration.sql"), "utf8");
+  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
   const service = fs.readFileSync(path.join(__dirname, "fan-observation-token-service.js"), "utf8");
   assert.match(schema, /model FanObservationToken[\s\S]*@@index\(\[createdAt\]\)/);
   assert.match(migration, /FanObservationToken_createdAt_idx/);

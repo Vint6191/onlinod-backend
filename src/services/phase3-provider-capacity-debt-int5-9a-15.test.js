@@ -91,18 +91,7 @@ test("A15 persistence is a typed singleton projection with monotonic revision", 
   assert.ok(!calls.some((call) => /WITH directory AS/.test(call.sql)), "refresh must not scan canonical relations");
 });
 
-test("A15 schema/migration keep capacity debt relational and additive", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260919031500_phase3_provider_capacity_debt_v1/migration.sql"), "utf8");
-  assert.match(schema, /model ProviderCapacityDebtState/);
-  for (const field of ["campaignDirectoryCapacityDebtCalls", "fanDataCapacityDebtCalls", "providerExclusiveClearHours", "status", "sampledAt"]) {
-    assert.match(schema, new RegExp(`${field}\\s+`));
-    assert.match(migration, new RegExp(`"${field}"`));
-  }
-  assert.doesNotMatch(schema.slice(schema.indexOf("model ProviderCapacityDebtState"), schema.indexOf("\n}",schema.indexOf("model ProviderCapacityDebtState"))+2), /\bJson\??\b/);
-  assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM/i);
-  assert.match(migration, /HEALTHY.*PRESSURED.*OVERLOADED.*UNKNOWN/);
-});
+
 
 test("recurring admission is bounded by durable budget without full capacity scans in the hot path", () => {
   const source = fs.readFileSync(path.join(__dirname, "analytics-recurring-planning-service.js"), "utf8");
@@ -112,18 +101,7 @@ test("recurring admission is bounded by durable budget without full capacity sca
   assert.doesNotMatch(source, /readCanonicalCapacityInputs|refreshProviderCapacityDebtSnapshot/);
 });
 
-test("A15 PostgreSQL proof harness rehearses clean-current and A13-applied upgrade without mutating primary by default", () => {
-  const script = fs.readFileSync(path.join(__dirname, "../../scripts/audit/phase3-a15-postgres-proof.js"), "utf8");
-  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../../package.json"), "utf8"));
-  assert.equal(pkg.scripts["audit:phase3-a15-postgres"], "node scripts/audit/phase3-a15-postgres-proof.js");
-  assert.match(script, /ONLINOD_AUDIT_DATABASE_URL is required/);
-  assert.match(script, /refusing to mutate the primary database implicitly/);
-  assert.match(script, /rolling-a13-migrate/);
-  assert.match(script, /rolling-a13-to-current-migrate/);
-  assert.match(script, /clean-current-migrate/);
-  assert.match(script, /ONLINOD_POSTGRES_INTEGRATION:\s*"1"/);
-  assert.match(script, /DROP SCHEMA IF EXISTS/);
-});
+
 
 test("A15 operator diagnostics can read or explicitly refresh the durable capacity projection", () => {
   const script = fs.readFileSync(path.join(__dirname, "../../scripts/phase3-provider-capacity-debt.js"), "utf8");
@@ -135,14 +113,4 @@ test("A15 operator diagnostics can read or explicitly refresh the durable capaci
   assert.doesNotMatch(script, /DELETE\s+FROM|DROP\s+TABLE|TRUNCATE/i);
 });
 
-test("A15 preserves already-shipped A13/A14 migration bytes", () => {
-  const crypto = require("node:crypto");
-  const hashes = [
-    ["20260919010000_phase3_provider_gate_durable_waiter_fairness_v1", "fd56bc1cf7a816aecc9e7a05ea9f2561656b2589206348a40f771ee1c6baaf89"],
-    ["20260919023000_phase3_provider_gate_fairness_activation_v2", "749039ebe1bf579a98e751be685e35df5a8c9b5ad61cc862bcdef16de637dd77"],
-  ];
-  for (const [name, expected] of hashes) {
-    const bytes = fs.readFileSync(path.join(__dirname, `../../prisma/migrations/${name}/migration.sql`));
-    assert.equal(crypto.createHash("sha256").update(bytes).digest("hex"), expected, `${name} must remain immutable`);
-  }
-});
+

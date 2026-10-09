@@ -4,7 +4,7 @@ const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-servi
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { DOMAIN_WORK_GENERATION } = require("./domain-work-authority-service");
 const KIND = "notification_identity_recovery_v1";
-// The exact predicate is indexed by the existing online deploy postflight. Only this known,
+// The exact predicate is indexed by the current baseline. Only this known,
 // corrected cause gets one automatic recovery; other quarantine stays intact.
 const PREDICATE = require("./notification-identity-recovery-contract.json").where;
 async function recoverNotificationIdentityWork({ db } = {}) {
@@ -17,17 +17,11 @@ async function recoverNotificationIdentityWork({ db } = {}) {
       const creators = row.creatorId ? await tx.$queryRawUnsafe('SELECT "id","deletedAt" FROM "CreatorAccount" WHERE "agencyId"=$1 AND "id"=$2 FOR SHARE', row.agencyId, row.creatorId) : [];
       const locked = await tx.$queryRawUnsafe(`SELECT * FROM "DomainWorkItem" WHERE "id"=$1 AND "agencyId"=$2 AND ${PREDICATE} FOR UPDATE SKIP LOCKED`, row.id, row.agencyId);
       const item = locked[0]; if (!item) return "contended";
-      const cursor = item.progressCursor;
-      const history = item.workClass.includes("REPAIR");
       const resumable = lifecycle.row && !lifecycle.row.deletedAt && creators[0] && !creators[0].deletedAt
-        && item.activeGeneration === DOMAIN_WORK_GENERATION && item.isOutstanding
-        && (!history || (item.objectType === "CreatorAccount" && item.objectId === item.creatorId
-          && cursor && Number.isInteger(cursor.table) && cursor.table >= 0 && cursor.table < 3
-          && Number.isFinite(Date.parse(cursor.cutoffAt))));
+        && item.activeGeneration === DOMAIN_WORK_GENERATION && item.isOutstanding;
       const at = await dbAuthorityNow({ db: tx });
       await tx.domainWorkItem.update({ where: { id: item.id }, data: {
-        // Keep the history keyset and cutoff! Generic operator repair resets the
-        // cursor, which would turn a recoverable history page into invalid work.
+        // Preserve the current consumer cursor when retrying the corrected cause.
         ...(resumable ? { requestedRevision: { increment: 1n }, claimFence: { increment: 1n }, state: "READY",
           ownerToken: null, leaseUntil: at, availableAt: at, nextAttemptAt: null,
           consecutiveFailures: 0, failureRevision: 0n, lastFailureAt: null,

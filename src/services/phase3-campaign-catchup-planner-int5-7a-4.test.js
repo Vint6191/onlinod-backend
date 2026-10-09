@@ -10,7 +10,7 @@ const orchestrator = fs.readFileSync(path.join(root, "src/services/creator-analy
 const ledger = fs.readFileSync(path.join(root, "src/services/creator-analytics-ledger-service.js"), "utf8");
 const lease = fs.readFileSync(path.join(root, "src/services/job-lease-service.js"), "utf8");
 const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
-const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260917234500_phase3_campaign_catchup_frontier_hash/migration.sql"), "utf8");
+const migration = fs.readFileSync(path.join(root, "prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
 
 function functionSlice(source, name, nextName) {
   const start = source.indexOf(`async function ${name}`);
@@ -29,13 +29,7 @@ test("INT5.7A-4 current Campaign planner retires ordering-dependent frontier hin
   assert.doesNotMatch(orchestrator, /async function campaignCatchupState/);
 });
 
-test("INT5.7A-4 stores a compact server-derived first-page frontier fingerprint, never fan-id history", () => {
-  assert.match(schema, /catchupFrontierHash\s+String\?\s+@db\.VarChar\(64\)/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "catchupFrontierHash" VARCHAR\(64\)/);
-  assert.match(ledger, /function campaignClaimerFrontierFanIds\(value\)[\s\S]*new Set[\s\S]*\.sort\(\)[\s\S]*slice\(0, 50\)/);
-  assert.match(ledger, /function campaignClaimerFrontierHash\(fanIds\)[\s\S]*checksum\(campaignClaimerFrontierFanIds\(fanIds\)\)/);
-  assert.match(ledger, /firstPageFrontierFanIds = claimerPageNumber === 1 && rejected === 0[\s\S]*firstPageFrontierHash = firstPageFrontierFanIds[\s\S]*campaignClaimerFrontierHash\(firstPageFrontierFanIds\)/);
-});
+
 
 test("INT5.7A-4 claim fence strips all historical claimer skip hints from already queued Campaign jobs", () => {
   assert.match(lease, /delete params\.knownCampaignFanCounts/);

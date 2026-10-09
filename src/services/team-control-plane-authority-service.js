@@ -2,7 +2,7 @@
 
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
-const { assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
+const { assertTeamControlPlaneWriteAdmission } = require("./database-write-contract-service");
 
 function clean(value, max = 180) {
   const text = String(value == null ? "" : value).trim();

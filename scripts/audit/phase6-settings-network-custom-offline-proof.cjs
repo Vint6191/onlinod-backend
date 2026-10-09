@@ -17,7 +17,6 @@ async function main(){
   try{
     await new Promise((resolve,reject)=>{const child=spawn(process.execPath,[require.resolve('prisma/build/index.js'),'migrate','deploy'],{cwd:path.resolve(__dirname,'../..'),env:{...process.env,DATABASE_URL:url},stdio:['ignore','pipe','pipe']});let output='';child.stdout.on('data',b=>output+=b);child.stderr.on('data',b=>output+=b);child.once('error',reject);child.once('close',code=>code?reject(Error(output)):resolve());});
     console.log('PROOF_MIGRATIONS_APPLIED');await engine.exec('DISCARD ALL');console.log('PROOF_WIRE_RESET');await engine.exec("SET TIME ZONE 'UTC'");
-    await engine.exec(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`);
     console.log('PROOF_FIXTURE_DDL_READY');
     require.cache[require.resolve('../../src/prisma')]={exports:db};
     const custom=require('../../src/services/custom-orders-service'),network=require('../../src/services/creator-network-profile-service'),settings=require('../../src/services/settings-service'),bcrypt=require('bcryptjs');

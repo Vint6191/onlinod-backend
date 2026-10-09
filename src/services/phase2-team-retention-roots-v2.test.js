@@ -79,17 +79,7 @@ test("bounded v1 baseline enumeration installs dedup identity without incrementi
   assert.equal(updates.length, 1);
 });
 
-test("retention-roots migration uses contribution ON CONFLICT and never performs global money root history scan", () => {
-  const sql = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260910034500_phase2_team_retention_roots/migration.sql"), "utf8");
-  assert.match(sql, /TeamActivityContribution/);
-  assert.match(sql, /ON CONFLICT \("agencyId","eventKind","semanticKey"\) DO NOTHING/);
-  assert.match(sql, /GET DIAGNOSTICS v_inserted = ROW_COUNT/);
-  assert.match(sql, /SEALED_LEGACY/);
-  assert.doesNotMatch(sql, /INSERT INTO "TeamPpvPurchaseLedger"[\s\S]*SELECT f\./);
-  assert.doesNotMatch(sql, /INSERT INTO "TeamTipLedger"[\s\S]*SELECT f\./);
-  assert.match(sql, /TeamResponseCase[\s\S]*projectionState[\s\S]*NEEDS_REPAIR/);
-  assert.match(sql, /TeamResponseCase_agency_projection_state_reply_idx/);
-});
+
 
 test("stable Team money roots are compacted, not deleted by retention", () => {
   const ppv = fs.readFileSync(path.join(__dirname, "team-ppv-ledger-service.js"), "utf8");

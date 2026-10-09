@@ -11,7 +11,7 @@ const {
   revokeCreatorSessionInTransaction,
 } = require("./creator-session-broker-service");
 const { CREATOR_CONNECTION_STATES, creatorConnectionLockKey } = require("./creator-connection-authority");
-const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
+const { authorizeCreatorAccountWrite } = require("./database-write-contract-service");
 const {
   lockHumanCreatorMutation,
   assertHumanCreatorMutationAuthorityAfterLocks,

@@ -30,9 +30,4 @@ test("active Media Library catalog is the only Never Used candidate inventory", 
   assert.equal(fs.existsSync(path.join(root, "src/services/vault-inventory-normalizer.js")), false);
 });
 
-test("redundant creator inventory tables are removed by a safe follow-up migration", () => {
-  const migration = read("prisma/migrations/20260716224500_drop_redundant_creator_inventory/migration.sql");
-  assert.match(migration, /DROP TABLE IF EXISTS "CreatorVaultMediaInventory"/);
-  assert.match(migration, /DROP TABLE IF EXISTS "CreatorVaultInventorySnapshot"/);
-  assert.match(migration, /WHERE "jobKey" = 'vault_creator_inventory_scan'/);
-});
+

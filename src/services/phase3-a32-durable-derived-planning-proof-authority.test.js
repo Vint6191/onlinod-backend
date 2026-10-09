@@ -36,47 +36,9 @@ test("A32 Follow Back / Follow Automation / Bumps cannot report planning converg
   assert.match(bumps, /refreshDebt[\s\S]*ok: !refreshDebt[\s\S]*fan_refresh_debt_not_durable/);
 });
 
-test("A32 physical proof uses a pinned file/test-name manifest and preserves actual totals on red scenarios", () => {
-  const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
-  const manifest = JSON.parse(source("scripts/audit/phase3-a32-expected-proof-manifest.json"));
-  assert.equal(manifest.version, "A37-R6");
-  assert.equal(manifest.testCount, 81);
-  assert.equal(manifest.files.length, 13);
-  assert.match(runner, /EXPECTED_PROOF_MANIFEST_FILE/);
-  assert.match(runner, /manifestSha256/);
-  assert.match(runner, /PHASE3_A32_PROOF_MANIFEST_MISMATCH/);
-  assert.match(runner, /error\.proof = partialProof/);
-  assert.match(runner, /scenarios\[name\] = \{ ok: false, failure, proof: failure\.proof \|\| null \}/);
-  assert.match(runner, /expectedProofTestsPerScenario/);
-  assert.match(runner, /proofTestsPerScenario: Object\.fromEntries/);
-});
 
-test("A32 TAP failure parser emits self-contained error/location/stack instead of nullable diagnostics", () => {
-  const { parseTapFailures } = require("../../scripts/audit/phase3-a20-postgres-proof");
-  const tap = [
-    "TAP version 13",
-    "# Subtest: index eligibility",
-    "not ok 9 - index eligibility",
-    "  ---",
-    "  duration_ms: 12.3",
-    "  location: '/srv/test.js:55:3'",
-    "  failureType: 'testCodeFailure'",
-    "  error: `expected planner eligibility but got Seq Scan`",
-    "  code: 'ERR_ASSERTION'",
-    "  stack: |-",
-    "    AssertionError: expected planner eligibility",
-    "        at TestContext.<anonymous> (/srv/test.js:55:3)",
-    "  ...",
-    "1..1",
-  ].join("\n");
-  const failures = parseTapFailures(tap);
-  assert.equal(failures.length, 1);
-  assert.equal(failures[0].name, "index eligibility");
-  assert.equal(failures[0].code, "ERR_ASSERTION");
-  assert.equal(failures[0].error, "expected planner eligibility but got Seq Scan");
-  assert.equal(failures[0].location, "/srv/test.js:55:3");
-  assert.match(failures[0].stack, /AssertionError/);
-});
+
+
 
 test("A32 fixture leak authority is schema-derived across tenant roots/FK descendants and break-glass mutation+audit is atomic", () => {
   const leak = source("scripts/audit/phase3-a26-fixture-leak-snapshot.js");
@@ -139,14 +101,4 @@ test("A32 INT2 FanData refresh identity owns consumer and required field set ins
   assert.match(fanData, /stableParams\.refreshFields = refreshFieldSet/);
 });
 
-test("A32 INT2 creator observation clock follows production retirement and physical CreatorAccount deletion", () => {
-  const schema = source("prisma/schema.prisma");
-  const migration = source("prisma/migrations/20260921150500_phase3_a32_int2_subscriber_recovery_refresh_identity_clock_lifecycle_v1/migration.sql");
-  const lifecycle = source("src/services/creator-lifecycle-authority-service.js");
-  assert.match(schema, /model FanObservationCreatorClock[\s\S]*creator CreatorAccount @relation\(fields: \[creatorId\], references: \[id\], onDelete: Cascade\)/);
-  assert.match(schema, /fanObservationClock\s+FanObservationCreatorClock\?/);
-  assert.match(migration, /a\."deletedAt" IS NOT NULL/);
-  assert.match(migration, /WHERE NOT EXISTS[\s\S]*"CreatorAccount"/);
-  assert.match(migration, /FOREIGN KEY \("creatorId"\) REFERENCES "CreatorAccount"\("id"\)[\s\S]*ON DELETE CASCADE/);
-  assert.match(lifecycle, /fanObservationCreatorClock\?\.deleteMany[\s\S]*creatorId: creator/);
-});
+

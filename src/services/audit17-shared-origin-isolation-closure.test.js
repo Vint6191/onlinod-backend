@@ -35,7 +35,7 @@ test("Audit17 generic admin mutations are retired and typed archive is origin-is
 });
 
 test("Audit17 origin isolation never splits the global creator physical-write lane", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260831140000_execution_commit_authority_closure2", "migration.sql"), "utf8");
+  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20261009000000_current_baseline", "migration.sql"), "utf8");
   assert.match(migration, /CREATE UNIQUE INDEX "AutomationDelivery_creator_write_lease_unique"[\s\S]*\("creatorId"\)[\s\S]*CLAIMED[\s\S]*RUNNING[\s\S]*COMMITTING[\s\S]*RECONCILE_REQUIRED/);
   assert.doesNotMatch(migration, /AutomationDelivery_creator_write_lease_unique[\s\S]{0,240}originKind/);
 });
@@ -68,5 +68,5 @@ test("Phase3 lifecycle protections remain at the shared archive delete fence", (
   const guard = read("automation-delivery-hard-delete-guard.js");
   assert.match(guard, /followEffectOwnership === "OWNED"/);
   assert.match(guard, /followEffectDeliveryId/);
-  assert.match(guard, /metadata\.legacyMigration === true/);
+  assert.doesNotMatch(guard, /metadata\.legacyMigration/);
 });

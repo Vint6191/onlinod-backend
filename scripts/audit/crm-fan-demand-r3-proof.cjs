@@ -8,7 +8,6 @@ async function main(){
  const repo=require('../../src/services/job-planning-repository'),authority=require('../../src/services/fan-data-authority-service');
  const {runDbTransaction}=require('../../src/services/db-transaction-service');
  const {ensureSingleJob}=require('../../src/services/job-scheduler');
- await db.$executeRawUnsafe(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`);
  const {agency,creators}=await db.$transaction(async tx=>{
   await tx.$executeRawUnsafe("SELECT set_config('onlinod.phase2_team_control_plane_generation',$1,true)",'phase2_team_control_plane_v2_durable_access');
   const user=await tx.user.create({data:{email:'r3-sql@example.test',passwordHash:'fixture'}});

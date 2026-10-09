@@ -162,16 +162,4 @@ test("A20.5 source keeps terminal demand/work locks deterministic and retry/quar
   }), true);
 });
 
-test("A20.5 proof runner includes terminal concurrency and seeded pre-A20.2 rolling backfill verification", () => {
-  const runner = fs.readFileSync(path.join(__dirname, "../../scripts/audit/phase3-a20-postgres-proof.js"), "utf8");
-  const seeded = fs.readFileSync(path.join(__dirname, "../../scripts/audit/phase3-a20-seeded-rolling-coverage.js"), "utf8");
-  assert.match(runner, /phase3-campaign-closure-a20-5\.integration\.test\.js/);
-  assert.match(runner, /PRE_A20_2_CUTOFF/);
-  assert.match(runner, /seeded-pre-a20-2-data/);
-  assert.match(runner, /seeded-a20-2-backfill-verify/);
-  assert.match(seeded, /campaigns-v13-wrapped/);
-  assert.match(seeded, /campaigns-v13-unwrapped/);
-  assert.match(seeded, /superseded historical work must not win/);
-  assert.match(seeded, /CURRENT_STATE_FALLBACK_EXPLAIN_SQL/);
-  assert.match(runner, /seeded-a20-2-online-preflight/);
-});
+

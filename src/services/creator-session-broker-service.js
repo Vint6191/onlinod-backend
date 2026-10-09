@@ -6,7 +6,7 @@ const { assertDeviceCanUseCreatorKey } = require("./client-e2e-keyring-service")
 const { canAccessCreator } = require("../middleware/automation-permissions");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { CREATOR_CONNECTION_STATES, creatorConnectionLockKey } = require("./creator-connection-authority");
-const { authorizeCreatorAccountWrite } = require("./phase2-release-compatibility-authority-service");
+const { authorizeCreatorAccountWrite } = require("./database-write-contract-service");
 
 async function runSessionSerializable(db, work) {
   return runRootCommit(db, (context) => work(context.tx), {

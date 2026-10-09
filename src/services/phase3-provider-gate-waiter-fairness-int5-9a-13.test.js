@@ -92,17 +92,7 @@ test("A13 gate classifies Campaign/FanData background calls server-side while pr
   assert.match(gateSource, /heartbeatDurableProviderWaiters/);
 });
 
-test("A13 migration creates typed waiter authority, durable cursors and rolling legacy-bypass fence", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260919010000_phase3_provider_gate_durable_waiter_fairness_v1/migration.sql"), "utf8");
-  assert.match(schema, /model OfProviderRequestGateWaiter[\s\S]*ticket\s+BigInt[\s\S]*waiterId\s+String\s+@unique[\s\S]*leaseUntil\s+DateTime/);
-  assert.match(schema, /model OfProviderRequestGateState[\s\S]*priorityCursor\s+Int[\s\S]*backgroundCategoryCursor\s+Int/);
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS "OfProviderRequestGateWaiter"/);
-  assert.match(migration, /onlinod_provider_gate_waiter_registration/);
-  assert.match(migration, /NEW\."activePermitId"[\s\S]*OfProviderRequestGateWaiter[\s\S]*waiterId/);
-  assert.match(migration, /leaseUntil" > clock_timestamp\(\)/);
-  assert.doesNotMatch(migration, /DROP TABLE|DROP COLUMN|TRUNCATE|DELETE FROM/i);
-});
+
 
 test("A13 authority prunes expired dead-process waiters before winner selection", () => {
   const source = fs.readFileSync(path.join(__dirname, "provider-request-credit-authority-service.js"), "utf8");

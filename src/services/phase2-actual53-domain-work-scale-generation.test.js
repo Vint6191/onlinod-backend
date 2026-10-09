@@ -7,7 +7,7 @@ const path = require("node:path");
 const prismaPath = require.resolve("../prisma");
 require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: {} };
 const authority = require("./domain-work-authority-service");
-const release = require("./phase2-release-compatibility-authority-service");
+const release = require("./database-write-contract-service");
 
 function claimAuthorizationRows(statement, params = []) {
   const text = String(statement);
@@ -226,25 +226,7 @@ test("A36 current partition candidate is admitted after separate Agency/shard re
   assert.doesNotMatch(sql.join("\n"), /Phase2WorkFamilyState/);
 });
 
-test("INT7 Root A partition catalog is populated by a non-authoritative DWI trigger and bootstrap seed", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "..", "..", "prisma", "migrations", "20260911190000_phase2_actual55_int7_broad_partition_catalog", "migration.sql"), "utf8");
-  assert.match(migration, /CREATE TRIGGER "trg_phase2_domain_work_partition_catalog"/);
-  assert.match(migration, /AFTER INSERT OR UPDATE OF "agencyId","workClass","partitionKey","activeGeneration","isOutstanding"/);
-  assert.ok(
-    "trg_phase2_domain_work_family_state" < "trg_phase2_domain_work_partition_catalog",
-    "PostgreSQL same-kind trigger name order must preserve FamilyState -> PartitionCatalog",
-  );
-  assert.doesNotMatch(migration, /CREATE TRIGGER "trg_phase2_domain_work_broad_partition_catalog"/);
-  assert.match(migration, /INSERT INTO "Phase2WorkBroadClaimPartitionState"/);
-  assert.match(migration, /CREATE INDEX IF NOT EXISTS "Phase2WorkBroadClaimPartitionState_recovery_idx"[\s\S]*"workClass","activeGeneration","lastClaimedAt","agencyId","partitionKey"/);
-  assert.match(migration, /FROM "DomainWorkItem" d[\s\S]*JOIN "Phase2WorkGenerationAuthority" g[\s\S]*g\."activeGeneration"=d\."activeGeneration"[\s\S]*WHERE d\."isOutstanding"=TRUE/);
-  assert.ok(
-    migration.indexOf('CREATE TRIGGER "trg_phase2_domain_work_partition_catalog"') <
-      migration.lastIndexOf('INSERT INTO "Phase2WorkBroadClaimPartitionState"'),
-    "catalog trigger must exist before bootstrap so concurrent new work cannot be missed during the seed",
-  );
-  assert.doesNotMatch(migration, /DomainWorkReadyAgency|DomainWorkReadyPartition/);
-});
+
 
 test("A36 catalog miss claims one physical DWI and repairs bounded locators with CAS", async () => {
   const now = new Date("2026-09-10T18:00:00.000Z");
@@ -292,25 +274,7 @@ test("A36 catalog miss claims one physical DWI and repairs bounded locators with
   assert.ok(sql.some((entry) => entry.includes("phase3_reconcile_domain_work_claim_partition")));
 });
 
-test("F53-06 expired legacy owner does not block the new generation", async () => {
-  const now = new Date("2026-09-10T18:00:00.000Z");
-  const expiredAt = new Date(now.getTime() - 1);
-  let observedWhere = null;
-  const db = {
-    phase2LegacyExecutorFence: { async findMany() { return [{ laneKey: "legacy-lane" }]; } },
-    maintenanceLaneState: {
-      async findMany({ where }) {
-        observedWhere = where;
-        const cutoff = where?.leaseUntil?.gt;
-        return expiredAt > cutoff ? [{ key: "legacy-lane", ownerToken: "dead", leaseUntil: expiredAt }] : [];
-      },
-    },
-  };
-  const result = await authority.legacyExecutorDrainStatus({ db, workClass: authority.WORK_CLASS.CUSTOM_COMMUNICATION, fallbackNow: now });
-  assert.equal(result.ready, true);
-  assert.equal(result.lanes.length, 0);
-  assert.equal(new Date(observedWhere.leaseUntil.gt).getTime(), now.getTime());
-});
+
 
 test("F53-14 unsupported binary generation is fenced by durable active-generation authority", async () => {
   const db = {

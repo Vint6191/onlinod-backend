@@ -49,9 +49,10 @@ function serverHarness({brokenStop=false,badExternal=false}={}){
  const db={$disconnect:async()=>{calls.push('disconnect');}};
  const log={info(){},warn(){},error(...args){calls.push(['error',...args]);}};
  const lifecycle=require('./backend-process-lifecycle').createBackendProcessLifecycle({db,log,processPort,schedule:()=>({}),cancel(){}});
- const context={Promise,console:{error(...args){calls.push(['error',...args]);},warn(){}},process:processPort,logger:log,prisma:db,app:{},lifecycle,
+ const context={Promise,console:{error(...args){calls.push(['error',...args]);},warn(){}},process:processPort,logger:log,prisma:db,app:{},lifecycle,assertDatabaseContract:async()=>({ready:true}),
   startRecurringScheduler(){calls.push('scheduler-start');},stopRecurringScheduler(){calls.push('scheduler-stop');return drain.promise;},
   require(name){
+   if(name==='./services/database-contract-service')return{assertDatabaseContract:async()=>({ready:true})};
    if(name==='./services/external-delivery-runtime-contract')return{verifyExternalDeliveryRuntime:async()=>{if(badExternal)throw Error('EXTERNAL_DELIVERY_PHYSICAL_GUARD_REQUIRED');}};
    if(name==='./services/maintenance-runtime-contract')return{verifyMaintenanceRuntime(){calls.push('verify');return ready.promise;}};
    if(name==='./services/of-request-gate-service')return{stopOfRequestGate(){}};

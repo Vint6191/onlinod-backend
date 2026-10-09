@@ -25,7 +25,7 @@ async function structuralProof(expected) {
 
   const relationRows = await prisma.$queryRawUnsafe(`
     SELECT x.name, n.nspname AS schema
-      FROM (VALUES ('Agency'),('CreatorAccount'),('Phase2WorkCoverage'),('Phase2ReleaseCompatibilityAuthority')) AS x(name)
+      FROM (VALUES ('Agency'),('CreatorAccount'),('Phase2WorkCoverage'),('DomainWorkClaimTopologyState')) AS x(name)
       LEFT JOIN pg_class c ON c.oid = to_regclass(format('%I', x.name))
       LEFT JOIN pg_namespace n ON n.oid = c.relnamespace
      ORDER BY x.name

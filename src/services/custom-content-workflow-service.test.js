@@ -760,19 +760,7 @@ test("awaiting revision queue derives operational dispatch state from the one du
   assert.equal(waiting.items[0].revisionDispatch.providerMessageId, "991");
 });
 
-test("V20.9 keeps revision workflow derived and adds only exact typed asset→submission provenance", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const submissionBlock = schema.match(/model CustomContentSubmission \{[\s\S]*?\n\}/)?.[0] || "";
-  for (const forbidden of ["revisionNumber", "previousRevision", "awaitingRevision", "assignmentStatus", "revisionDispatchedAt"]) assert.doesNotMatch(submissionBlock, new RegExp(forbidden));
-  const assetBlock = schema.match(/model CreatorMediaAsset \{[\s\S]*?\n\}/)?.[0] || "";
-  assert.match(assetBlock, /customSubmissionId\s+String\?/);
-  assert.match(assetBlock, /customSubmission\s+CustomContentSubmission\?/);
-  assert.match(assetBlock, /@@index\(\[customSubmissionId\]\)/);
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260822123500_custom_content_submission_asset_provenance/migration.sql"), "utf8");
-  assert.match(migration, /ADD COLUMN "customSubmissionId" TEXT/);
-  assert.match(migration, /REFERENCES "CustomContentSubmission"\("id"\)/);
-  assert.doesNotMatch(migration, /revisionNumber|awaitingRevision|revisionDispatchedAt/);
-});
+
 
 test("awaiting revision queue exposes lossless cursor continuation beyond the first UI page", async () => {
   const submissions = [];

@@ -22,7 +22,7 @@ const ordered = (source, needles, label) => {
   }
 };
 
-const migration = read("prisma/migrations/20260912002000_phase2_actual56_management_lock_topology/migration.sql");
+const migration = read("prisma/migrations/20261009000000_current_baseline/migration.sql");
 const customAccess = read("src/services/custom-management-access-authority-service.js");
 const telegramContact = read("src/services/creator-telegram-contact-authority-service.js");
 const telegramIdentity = read("src/services/creator-telegram-identity.js");

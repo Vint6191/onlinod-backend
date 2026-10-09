@@ -224,16 +224,4 @@ test("A20.3 failed-demand recovery fails closed on current coverage counter mism
   assert.equal(counter.execute, 1);
 });
 
-test("A20.3 source has deterministic set-based queue/recovery locking and no production per-demand binding loop", () => {
-  const source = fs.readFileSync(path.join(__dirname, "campaign-fan-refresh-queue-service.js"), "utf8");
-  assert.match(source, /advanceCampaignFanRefreshDemandsSetBased[\s\S]*ORDER BY d\."id" ASC[\s\S]*FOR UPDATE OF d/);
-  assert.match(source, /failed_work AS \([\s\S]*ORDER BY w\."id" ASC[\s\S]*FOR UPDATE OF w/);
-  assert.match(source, /bindDemandRefreshJobSetBased[\s\S]*work_update AS/);
-  assert.match(source, /supportsSetBasedCampaignFanRefreshQueue\(db\)/);
-  assert.match(source, /supportsSetBasedCampaignFanRefreshRecovery\(db\)/);
-  const auditScript = fs.readFileSync(path.join(__dirname, "../../scripts/audit/phase3-a20-postgres-proof.js"), "utf8");
-  const packageJson = fs.readFileSync(path.join(__dirname, "../../package.json"), "utf8");
-  assert.match(auditScript, /phase3-campaign-closure-a20-3\.integration\.test\.js/);
-  assert.match(auditScript, /phase3-campaign-closure-a19\.integration\.test\.js/);
-  assert.match(packageJson, /audit:phase3-a20-postgres/);
-});
+

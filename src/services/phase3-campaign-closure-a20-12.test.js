@@ -222,10 +222,4 @@ test("A20.12 index repair waits for an active peer build before treating an inva
   assert.doesNotThrow(() => preflight.assertCurrentRunIndex(index));
 });
 
-test("A20.12 proof contract includes full ingest race and full preflight lifecycle concurrency", () => {
-  const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
-  assert.match(runner, /phase3-campaign-closure-a20-12\.integration\.test\.js/);
-  assert.match(runner, /phase3-a20-index-lifecycle-concurrency\.js/);
-  assert.match(runner, /A20_12_INDEX_ABSENT_CONCURRENCY_PASS/);
-  assert.match(runner, /A20_12_INDEX_INVALID_RECOVERY_PASS/);
-});
+

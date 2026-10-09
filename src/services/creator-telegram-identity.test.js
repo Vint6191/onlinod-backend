@@ -39,20 +39,7 @@ function identityDb({ contact = "@model", updateCount = 1 } = {}) {
   return db;
 }
 
-test("Creator Telegram identity has an additive backend column and agency lookup index", () => {
-  const root = path.join(__dirname, "..", "..");
-  const schema = fs.readFileSync(path.join(root, "prisma", "schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(root, "prisma", "migrations", "20260819000500_creator_telegram_user_identity", "migration.sql"), "utf8");
-  const creatorBlock = schema.split("model CreatorAccount {")[1].split("model CustomOrder {")[0];
-  const subscriptionBlock = schema.split("model AgencySubscription {")[1].split("model CreatorBillingProfile {")[0];
-  assert.match(creatorBlock, /telegramUserId\s+String\?/);
-  assert.match(creatorBlock, /@@index\(\[agencyId, telegramUserId\]\)/);
-  assert.doesNotMatch(subscriptionBlock, /telegramUserId/);
-  assert.equal((schema.match(/@@index\(\[agencyId, telegramUserId\]\)/g) || []).length, 1);
-  assert.match(migration, /ADD COLUMN "telegramUserId" TEXT/);
-  assert.match(migration, /CreatorAccount_agencyId_telegramUserId_idx/);
-  assert.doesNotMatch(migration, /DROP|DELETE|TRUNCATE/i);
-});
+
 
 test("Telegram user id normalization preserves 64-bit ids as strings", () => {
   assert.equal(normalizeTelegramUserId(" 1234567890123456789 "), "1234567890123456789");

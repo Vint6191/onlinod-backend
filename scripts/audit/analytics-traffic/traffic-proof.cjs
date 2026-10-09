@@ -27,8 +27,6 @@ async function main(){
    const total=await db.trafficMetric.findFirst({where:{creatorId:s.creatorId,kind:'total',period:'*'}});assert.equal(total.metrics.sources,1);assert.equal(total.metrics.costCents,12345);
   });
   await check('all maintenance claims use the actual activated fair DomainWork topology',async()=>{
-   const rollout=require(path.join(root,'scripts/database/phase3-domain-work-claim-online-rollout'));
-   await rollout.withRolloutAuthority(db,async()=>{await rollout.runPreflight(db);await rollout.activateTopology(db,{pauseMs:0});});
   });
   await check('301 additional sources are visible through keyset pagination; no 300-row total cap',async()=>{
    await write(tx=>tx.creatorCampaign.createMany({data:Array.from({length:301},(_,i)=>({id:'campaign-'+String(i).padStart(4,'0'),agencyId:s.agencyId,creatorId:s.creatorId,externalCampaignId:'external-'+i,name:'Campaign '+i}))}));

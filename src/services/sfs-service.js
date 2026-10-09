@@ -2,7 +2,6 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
-const { readSfsAttestation, hasHistoricalConsumption } = require("./phase7-legacy-storage-service");
 const { readFanConsumerPage } = require("./fan-consumer-cursor-service");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
@@ -66,35 +65,8 @@ function currentSfsCleanupOwnership(delivery, candidate) {
   return { owned: Boolean(owned), kind: owned ? "OWNED" : "UNPROVEN", followDeliveryId };
 }
 
-async function resolveSfsCleanupOwnership({ delivery, candidate, db }) {
-  const explicit = currentSfsCleanupOwnership(delivery, candidate);
-  if (object(delivery?.payload).legacyMigration === true) {
-    const proof = await readSfsAttestation({ db, delivery, candidate });
-    return proof ? { owned: true, kind: "RETIRED_ATTESTED", proofId: proof.id, followDeliveryId: proof.evidence.followDeliveryId || null }
-      : { owned: false, kind: "UNPROVEN", followDeliveryId: null };
-  }
-  if (explicit.owned) return explicit;
-  if (!delivery || !candidate || !db?.automationDelivery?.findFirst) return explicit;
-
-  // Backward-compatible proof for cleanup rows created before INT4.3C. We only
-  // adopt a cleanup when the original SFS FOLLOW is itself a server-recorded
-  // completed write with a writeCommitAt and an explicit direct provider success
-  // code. Ambiguous/recovered/already-followed outcomes are intentionally excluded.
-  const original = await db.automationDelivery.findFirst({
-    where: {
-      agencyId: delivery.agencyId,
-      creatorId: delivery.creatorId,
-      moduleKey: SFS_MODULE_KEY,
-      actionType: SFS_FOLLOW_TARGET_ACTION_TYPE,
-      fanId: candidate.targetUserId,
-      generation: delivery.generation,
-      status: "COMPLETED",
-    },
-    orderBy: { finishedAt: "desc" },
-    select: { id: true, result: true, writeCommitAt: true },
-  });
-  if (!original?.writeCommitAt || String(object(original.result).code || "").trim().toLowerCase() !== "followed") return explicit;
-  return { owned: true, kind: "ADOPTED_SERVER_PROOF", followDeliveryId: original.id };
+async function resolveSfsCleanupOwnership({ delivery, candidate }) {
+  return currentSfsCleanupOwnership(delivery, candidate);
 }
 
 async function sessionWriteWorkerCount({ agencyId, creatorId, db = prisma }) {
@@ -243,7 +215,7 @@ async function applySfsDiscoveryChunk({ db = prisma, job, deviceId = null, chunk
         }
       }
 
-      const usedForever = existing?.usedForever === true || await hasHistoricalConsumption(tx, { agencyId: job.agencyId, creatorId: job.creatorId, targetId: target.targetUserId });
+      const usedForever = existing?.usedForever === true;
       const data = {
         usedForever, targetUserId: target.targetUserId, username: target.username, displayName: target.displayName, avatarUrl: target.avatarUrl,
         subscribePriceCents: target.subscribePriceCents, isWantComments: target.isWantComments,
@@ -729,11 +701,11 @@ async function finalizeSfsSuccess({ delivery, outcomeCode, result = {}, db = pri
         },
       } });
     }
-    if(!require('./phase7-cleanup-contract').SETTLED_CODES.includes(String(outcomeCode||'').toLowerCase())) {
+    if(!require('./sfs-cleanup-contract').SETTLED_CODES.includes(String(outcomeCode||'').toLowerCase())) {
       return db.sfsTargetCandidate.update({where:{id:candidate.id},data:{state:'RECOVERY_REQUIRED',phase:'UNFOLLOW',completedAt:null,
         latestDeliveryId:delivery.id,latestStatus:'COMPLETED',latestError:'cleanup_settlement_outcome_unproven'}});
     }
-    if(object(delivery.payload).legacyMigration===true)await require('./phase7-obligation-authority-service').recordCleanupSettlement(db,{delivery});
+
     return db.sfsTargetCandidate.update({ where: { id: candidate.id }, data: {
       state: "COMPLETED", phase: "DONE", creatorFollowing: false, usedForever: true, completedAt: now, unfollowAt: null,
       latestDeliveryId: delivery.id, latestActionType: delivery.actionType, latestStatus: "COMPLETED", latestError: null,

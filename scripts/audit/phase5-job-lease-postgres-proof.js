@@ -34,8 +34,6 @@ async function main() {
     console.log("[I7 proof] migrations applied");
     await engine.exec("DISCARD ALL");
     await engine.exec("SET TIME ZONE 'UTC'");
-    await engine.exec(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "activationState"='ACTIVE' WHERE "scope"='TEAM_CONTROL_PLANE'`);
-    await engine.exec(`UPDATE "Phase2ReleaseCompatibilityAuthority" SET "requiredGeneration"='phase3_domain_executor_v6_failure_policy',"activationState"='ACTIVE' WHERE "scope"='DOMAIN_WORK_EXECUTOR'`);
     // Controlled failures execute AFTER production effects and BEFORE the
     // durable intent/cursor commit. This database is entirely disposable.
     await engine.exec(`CREATE TABLE "I3ProofFault" (kind text PRIMARY KEY);
@@ -109,7 +107,7 @@ async function main() {
         const user = await tx.user.create({ data: { email: label + "@example.test", passwordHash: "proof" } });
         const agency = await tx.agency.create({ data: { name: label, trialEndsAt: new Date(Date.now() + 86400000) } });
         const member = await tx.agencyMember.create({ data: { agencyId: agency.id, userId: user.id, role: "OWNER", roleKey: "owner", assignedCreators: "all" } });
-        await require("../../src/services/phase2-release-compatibility-authority-service").authorizeCreatorAccountWrite(tx);
+        await require("../../src/services/database-write-contract-service").authorizeCreatorAccountWrite(tx);
         const creator = await tx.creatorAccount.create({ data: { agencyId: agency.id, displayName: label, status: "READY" } });
         const device = await tx.workerDevice.create({ data: { agencyId: agency.id, userId: user.id, id: label, lastSeenAt: new Date() } });
         const token = crypto.randomBytes(32).toString("base64url");
@@ -410,7 +408,7 @@ async function main() {
       const account = await db.agencyTelegramMtprotoAccount.create({ data: { agencyId: scope.agency.id,
         apiId: 1, encryptedPayload: "fixture", iv: "fixture", tag: "fixture" } });
       await runDbTransaction(db, async tx => {
-        await require("../../src/services/phase2-release-compatibility-authority-service").authorizeCreatorAccountWrite(tx);
+        await require("../../src/services/database-write-contract-service").authorizeCreatorAccountWrite(tx);
         await tx.creatorAccount.update({ where: { id: scope.creator.id }, data: { telegramContact: "@proof", telegramAccountId: account.id } });
       });
       // This disposable tenant has no Custom orders: its empty historical coverage is complete.

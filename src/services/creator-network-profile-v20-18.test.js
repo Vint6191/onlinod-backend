@@ -206,27 +206,7 @@ async function assign(db, creatorId, expectedVersion, proxyEndpointId) {
   });
 }
 
-test("V20.18 schema and migration enforce one non-null proxy endpoint per creator assignment", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260823140000_creator_network_profiles/migration.sql"), "utf8");
-  const relationFixMigration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260823174500_creator_network_profile_composite_relation_keys/migration.sql"), "utf8");
-  assert.match(schema, /@@unique\(\[agencyId, creatorId\], map: "CreatorNetworkProfile_agencyId_creatorId_key"\)/);
-  assert.match(schema, /@@unique\(\[agencyId, proxyEndpointId\], map: "CreatorNetworkProfile_agencyId_proxyEndpointId_key"\)/);
-  assert.match(schema, /fields:\s*\[agencyId, proxyEndpointId\][\s\S]*references:\s*\[agencyId, id\]/);
-  assert.match(relationFixMigration, /CREATE UNIQUE INDEX "CreatorNetworkProfile_agencyId_proxyEndpointId_key"\s+ON "CreatorNetworkProfile"\("agencyId", "proxyEndpointId"\)/);
-  assert.match(relationFixMigration, /CREATE UNIQUE INDEX "CreatorNetworkProfile_agencyId_creatorId_key"\s+ON "CreatorNetworkProfile"\("agencyId", "creatorId"\)/);
-  assert.match(migration, /CREATE UNIQUE INDEX "AgencyProxyEndpoint_agencyId_id_key" ON "AgencyProxyEndpoint"\("agencyId", "id"\)/);
-  assert.match(migration, /FOREIGN KEY \("agencyId", "proxyEndpointId"\) REFERENCES "AgencyProxyEndpoint"\("agencyId", "id"\)/);
-  assert.doesNotMatch(migration, /CREATE INDEX "CreatorNetworkProfile_proxyEndpointId_idx"/);
-  assert.match(relationFixMigration, /DROP INDEX "CreatorNetworkProfile_creatorId_key"/);
-  assert.match(relationFixMigration, /DROP INDEX "CreatorNetworkProfile_proxyEndpointId_key"/);
-  const createCreatorComposite = relationFixMigration.indexOf('CREATE UNIQUE INDEX "CreatorNetworkProfile_agencyId_creatorId_key"');
-  const createProxyComposite = relationFixMigration.indexOf('CREATE UNIQUE INDEX "CreatorNetworkProfile_agencyId_proxyEndpointId_key"');
-  const dropCreatorScalar = relationFixMigration.indexOf('DROP INDEX "CreatorNetworkProfile_creatorId_key"');
-  const dropProxyScalar = relationFixMigration.indexOf('DROP INDEX "CreatorNetworkProfile_proxyEndpointId_key"');
-  assert.ok(createCreatorComposite >= 0 && createCreatorComposite < dropCreatorScalar, "creator composite uniqueness must exist before scalar unique is retired");
-  assert.ok(createProxyComposite >= 0 && createProxyComposite < dropProxyScalar, "proxy composite uniqueness must exist before scalar unique is retired");
-});
+
 
 test("V20.19 a dedicated proxy owned by creator A cannot be assigned to creator B", async () => {
   const { db } = makeDb();

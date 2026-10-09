@@ -386,25 +386,7 @@ test("INT59.4B differing lineage with no revoke and a future natural expiry stil
   assert.equal(rows.some((row) => row.localId === "terminal-1"), false);
 });
 
-test("Actual59 migration creates trigger-owned access epoch boundary ledger and versioned telemetry endpoint", () => {
-  const root = path.resolve(__dirname, "../..");
-  const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260915131500_actual59_team_authorization_generation_boundary/migration.sql"), "utf8");
-  const int593 = fs.readFileSync(path.join(root, "prisma/migrations/20260915193000_actual59_int59_3_authorization_lineage_catalog_boundary/migration.sql"), "utf8");
-  const schema = fs.readFileSync(path.join(root, "prisma/schema.prisma"), "utf8");
-  const route = fs.readFileSync(path.join(root, "src/routes/telemetry.js"), "utf8");
-  const creatorLifecycle = fs.readFileSync(path.join(root, "src/services/creator-lifecycle-authority-service.js"), "utf8");
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS "AgencyMemberAccessEpochBoundary"/);
-  assert.match(migration, /AFTER UPDATE OF "accessEpoch" ON "AgencyMember"/);
-  assert.match(migration, /OLD\."accessEpoch"[\s\S]*NEW\."accessEpoch"/);
-  assert.match(int593, /capture_agency_member_access_epoch_boundary[\s\S]*clock_timestamp\(\)/, "INT59.3 must move the physical epoch-end boundary to post-lock DB time");
-  assert.match(int593, /AuthorizationSessionBoundary/);
-  assert.match(int593, /AgencyCreatorCatalogGenerationBoundary/);
-  assert.match(schema, /model AgencyMemberAccessEpochBoundary[\s\S]*@@id\(\[memberId, accessEpoch\]\)/);
-  assert.match(route, /router\.post\("\/events\/ingest\/current-authorized"[\s\S]*AUTHORIZATION_SESSION_REQUIRED/);
-  assert.match(route, /router\.post\("\/events\/ingest"[\s\S]*TELEMETRY_CLIENT_UPGRADE_REQUIRED/, "legacy human telemetry must be retry-gated during rolling activation instead of dead-lettered");
-  assert.match(creatorLifecycle, /if \(!current\.deletedAt\)[\s\S]*deletedAt: retiredAt/, "creator retirement timestamp must be written once by canonical retirement authority");
-  assert.match(creatorLifecycle, /type: "CREATOR_REVOKED"/, "broad-scope retirement remains a creator-wide access boundary even without member epoch bump");
-});
+
 
 test("F59-C terminal dialog projection cannot preserve client wall/active counters beyond server-bounded chronology", async () => {
   const projectionPath = require.resolve("./team-response-projection-service");

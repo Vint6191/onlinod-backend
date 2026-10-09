@@ -190,14 +190,7 @@ const base = {
   payloadFingerprint: "sha256:aaaaaaaaaaaaaaaa",
 };
 
-test("Audit17 schema generalizes AutomationDelivery instead of creating a second write table", () => {
-  const schema = fs.readFileSync(path.resolve(ROOT, "../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.resolve(ROOT, "../prisma/migrations/20260902183000_audit17_programmatic_write_authority/migration.sql"), "utf8");
-  assert.match(schema, /model AutomationDelivery \{[\s\S]*fanId\s+String\?[\s\S]*originKind\s+String[\s\S]*sourceDeviceId\s+String\?[\s\S]*payloadFingerprint\s+String\?[\s\S]*executionKind\s+String\?[\s\S]*reconciliationKind\s+String\?/);
-  assert.doesNotMatch(schema, /model\s+(?:ProgrammaticWrite|MassWriteJob|VaultWriteJob|CustomUploadWriteJob)\s*\{/);
-  assert.match(migration, /ALTER COLUMN "fanId" DROP NOT NULL/);
-  assert.match(migration, /ADD COLUMN IF NOT EXISTS "originKind"/);
-});
+
 
 test("Audit17 neutral authority is mounted and does not use automation.manage as product permission", () => {
   const server = read("server.js");

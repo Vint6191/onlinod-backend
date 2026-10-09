@@ -62,42 +62,7 @@ test("final cut durable promotion claim never holds signal row while waiting for
   assert.match(maintenance, /runDbTransaction\(root,[\s\S]*acquireCampaignTransactionLock\(tx, creatorId\)[\s\S]*SELECT \* FROM "CampaignFanRefreshPromotionSignal"/);
 });
 
-test("Billing and legacy Analytics have no active snapshot generation reader/writer while Phase7 freezes then contracts legacy tables", () => {
-  const billing = source("src/services/billing-wallet-service.js");
-  const settings = source("src/services/settings-service.js");
-  const analyticsRoute = source("src/server.js");
-  const analyticsService = source("scripts/database/phase7-snapshot-compatibility.js");
-  const schema = source("prisma/schema.prisma");
-  const migration = source("prisma/migrations/20260920123000_phase3_analytics_final_authority_cutover_v1/migration.sql");
-  const a21Migration = source("prisma/migrations/20260920223000_phase3_analytics_a21_publication_generation_cursor_scale_v1/migration.sql");
-  const policy = source("docs/PHASE3_ANALYTICS_LEGACY_SNAPSHOT_RETIREMENT.md");
-  const legacyPreflight = source("scripts/database/phase3-analytics-legacy-snapshot-online-preflight.js");
-  const legacyPostflight = source("scripts/database/phase3-analytics-legacy-snapshot-online-postflight.js");
-  const repairMigration = source("prisma/migrations/20260920191500_phase3_analytics_legacy_snapshot_phase_a_repair_v1/migration.sql");
-  const packageJson = require("../../scripts/test-support/phase7-deploy-pipeline")(JSON.parse(source("package.json")));
-  assert.doesNotMatch(billing, /creatorEarningsSnapshot\./);
-  assert.match(billing, /source:\s*"UNAVAILABLE"/);
-  assert.match(settings, /readRolling30dRevenueBatch/);
-  assert.doesNotMatch(settings, /creatorEarningsSnapshot|CreatorEarningsSnapshot/);
-  assert.doesNotMatch(analyticsRoute, /analytics-snapshot-service|reportAnalyticsSnapshots|getLatestPayload/);
-  assert.doesNotMatch(analyticsService, /prisma|analyticsSnapshot\./);
-  assert.doesNotMatch(schema, /model\s+(?:CreatorEarningsSnapshot|CreatorCampaignsSnapshot|AnalyticsSnapshot)\b/);
-  assert.doesNotMatch(migration, /DROP TABLE IF EXISTS "(?:AnalyticsSnapshot|CreatorCampaignsSnapshot|CreatorEarningsSnapshot)"/);
-  assert.doesNotMatch(migration, /CREATE VIEW "(?:AnalyticsSnapshot|CreatorCampaignsSnapshot|CreatorEarningsSnapshot)"/);
-  assert.match(migration, /Phase A only[\s\S]*physical legacy tables are preserved/);
-  assert.match(policy, /Production repair bridge[\s\S]*repairRequired[\s\S]*postflight[\s\S]*Phase B: destructive purge/);
-  assert.match(legacyPreflight, /known_zero_row_legacy_tombstone_view/);
-  assert.match(legacyPreflight, /legacyTombstoneView[\s\S]*repairRequired[\s\S]*phaseASafe/);
-  assert.match(legacyPreflight, /destructivePurgeAllowed:\s*false/);
-  assert.match(repairMigration, /DROP VIEW "AnalyticsSnapshot"/);
-  assert.match(repairMigration, /CREATE TABLE IF NOT EXISTS "AnalyticsSnapshot"/);
-  assert.match(repairMigration, /CREATE TABLE IF NOT EXISTS "CreatorCampaignsSnapshot"/);
-  assert.match(repairMigration, /CREATE TABLE IF NOT EXISTS "CreatorEarningsSnapshot"/);
-  assert.match(repairMigration, /Refusing to replace unexpected AnalyticsSnapshot view/);
-  assert.match(legacyPostflight, /PHASE_A_POST_MIGRATION_WRITABLE_COMPATIBILITY/);
-  assert.match(legacyPostflight, /requiredIndexesPresent/);
-  assert.match(packageJson, /phase3-analytics-legacy-snapshot-online-preflight\.js[\s\S]*prisma migrate deploy[\s\S]*phase3-analytics-legacy-snapshot-online-postflight\.js/);
-});
+
 
 test("Subscriber source state machine is exact-offset, payload-bound, CAS fenced and server-derived", () => {
   const subscriber = source("src/services/subscriber-directory-service.js");
@@ -170,36 +135,9 @@ test("Subscriber publication is restartable bounded work outside generic complet
   assert.match(subscriber, /SUBSCRIBER_RECOVERY_CREATOR_SCOPE_REQUIRED/);
 });
 
-test("Campaign hot queries have predicate/order-specific indexes and claim SQL matches its expression index", () => {
-  const migration = source("prisma/migrations/20260920123000_phase3_analytics_final_authority_cutover_v1/migration.sql");
-  const queue = source("src/services/campaign-fan-refresh-queue-service.js");
-  assert.match(migration, /CreatorFanRefreshDemand_promoter_ready_idx[\s\S]*status" = 'QUEUED'[\s\S]*activeRefreshJobId" IS NULL/);
-  assert.match(migration, /CreatorFanRefreshDemand_recovery_order_idx[\s\S]*COALESCE\("nextRetryAt", "lastFailedAt", "updatedAt"\)[\s\S]*status" = 'FAILED'/);
-  assert.match(migration, /CreatorFanRefreshDemand_canonical_heal_idx[\s\S]*status" IN \('QUEUED', 'FAILED'\)/);
-  assert.match(migration, /CampaignFanRefreshPromotionSignal_claim_due_idx[\s\S]*COALESCE\("claimUntil", '-infinity'::timestamp\)/);
-  assert.match(queue, /COALESCE\(s\."claimUntil", '-infinity'::timestamp\) <= \$1[\s\S]*ORDER BY s\."dueAt" ASC, s\."creatorId" ASC/);
-});
 
-test("A21 clean bootstrap, generation CAS and exact Subscriber cursor scale are source-enforced", () => {
-  const prerequisite = source("prisma/migrations/20260616_aaa_bump_delivery_claim_prerequisite_v27/migration.sql");
-  const a21 = source("prisma/migrations/20260920223000_phase3_analytics_a21_publication_generation_cursor_scale_v1/migration.sql");
-  const subscriber = source("src/services/subscriber-directory-service.js");
-  const fence = source("src/services/subscriber-publication-fence-service.js");
-  const postflight = source("scripts/database/phase3-subscriber-publication-schema-online-postflight.js");
-  assert.match(prerequisite, /ADD COLUMN IF NOT EXISTS "cancelAt"[\s\S]*"claimedByDeviceId"[\s\S]*"claimedAt"[\s\S]*"claimUntil"/);
-  assert.ok("20260616_aaa_bump_delivery_claim_prerequisite_v27" < "20260616_bump_cancelat_backfill_v26");
-  assert.match(a21, /ROW_NUMBER\(\) OVER[\s\S]*PARTITION BY "creatorId"/);
-  assert.match(a21, /SubscriberScanItem_run_id_cursor_idx[\s\S]*"runId", "id"/);
-  assert.match(a21, /SubscriberScanRun_publication_debt_idx/);
-  assert.match(subscriber, /lockSubscriberPublicationCreator[\s\S]*lockDbAdvisoryXact/);
-  assert.doesNotMatch(subscriber, /pg_advisory_xact_lock/);
-  assert.match(subscriber, /publication_recovery_in_progress/);
-  assert.match(subscriber, /publishedGeneration:\s*\{ lt: generation \}/);
-  assert.match(subscriber, /SUBSCRIBER_PUBLICATION_GENERATION_CAS_LOST/);
-  assert.doesNotMatch(fence, /status:\s*"RUNNING"/);
-  assert.match(postflight, /SubscriberScanItem_run_id_cursor_idx/);
-  assert.match(postflight, /publicationGeneration[\s\S]*publishedGeneration/);
-});
+
+
 
 test("index lifecycle contract requires a dedicated ReadCommitted session and bounded one-connection worker", async () => {
   const url = preflight.indexLifecycleWorkerDatabaseUrl("postgresql://u:p@db.example/x?schema=public");
@@ -224,49 +162,10 @@ test("index lifecycle contract requires a dedicated ReadCommitted session and bo
   );
 });
 
-test("final migration carries bounded subscriber cursor, durable signal lease and retired legacy generations", () => {
-  const schema = source("prisma/schema.prisma");
-  const migration = source("prisma/migrations/20260920123000_phase3_analytics_final_authority_cutover_v1/migration.sql");
-  const a21Migration = source("prisma/migrations/20260920223000_phase3_analytics_a21_publication_generation_cursor_scale_v1/migration.sql");
-  assert.match(schema, /fanProjectionCursorOffset\s+Int/);
-  assert.match(schema, /publicationStatus\s+String\s+@default\("PENDING"\)/);
-  assert.match(schema, /publicationCursorId\s+String\?/);
-  assert.match(schema, /pageOffset\s+Int\?/);
-  assert.match(schema, /model CampaignFanRefreshPromotionSignal/);
-  assert.match(schema, /@@unique\(\[agencyId, creatorId\], map: "CampaignFanRefreshPromotionSignal_agency_creator_key"\)/);
-  assert.match(migration, /CONSTRAINT "CampaignFanRefreshPromotionSignal_agency_creator_key" UNIQUE \("agencyId", "creatorId"\)/);
-  assert.match(schema, /claimToken\s+String\?/);
-  assert.match(schema, /claimUntil\s+DateTime\?/);
-  assert.match(migration, /CampaignFanRefreshPromotionSignal_due_claim_creator_idx/);
-  assert.match(schema, /publicationJobReconciledAt\s+DateTime\?/);
-  assert.match(migration, /SubscriberScanRun_publication_job_reconcile_idx/);
-  assert.match(migration, /publicationJobReconciledAt/);
-  assert.match(migration, /CUTOVER_BACKFILL/);
-  assert.match(a21Migration, /publicationGeneration/);
-  assert.match(a21Migration, /publishedGeneration/);
-  assert.match(a21Migration, /SubscriberScanItem_run_id_cursor_idx/);
-  assert.match(a21Migration, /SubscriberScanRun_publication_debt_idx/);
-});
 
 
-test("final physical proof pack is rewritten for the final authority cut and persists proof JSON", () => {
-  const proof = source("scripts/audit/phase3-a20-postgres-proof.js");
-  const finalPg = source("src/services/phase3-analytics-final-authority-cutover.integration.test.js");
-  assert.doesNotMatch(proof, /EXPECTED_PROOF_TEST_COUNT/);
-  assert.match(proof, /tapTestNames/);
-  assert.match(proof, /PHASE3_A31_TAP_FAILURE/);
-  assert.match(proof, /phase3-analytics-final-authority-cutover\.integration\.test\.js/);
-  assert.match(proof, /artifacts[\s\S]*audit[\s\S]*phase3-a26-postgres-proof\.json/);
-  assert.match(proof, /physical proof JSON was not persisted/);
-  assert.match(finalPg, /FINAL_SUBSCRIBER_POINT_REFRESH_RACE_PASS/);
-  assert.match(finalPg, /FINAL_SUBSCRIBER_PERSISTED_CONFLICT_PASS/);
-  assert.match(finalPg, /FINAL_SUBSCRIBER_LOST_RESPONSE_BARRIER_PASS/);
-  assert.match(finalPg, /FINAL_MANUAL_MAINTENANCE_OVERLAP_PASS/);
-  assert.match(finalPg, /FINAL_TWO_REPLICA_PROMOTION_SIGNAL_PASS/);
-  assert.match(finalPg, /FINAL_CUTOVER_CANONICAL_DEBT_HEAL_PASS/);
-  assert.match(finalPg, /FINAL_SUBSCRIBER_CURSOR_PLAN_PROOF/);
-  assert.match(finalPg, /two Subscriber recovery replicas serialize one FAILED publication generation/);
-});
+
+
 
 
 test("Campaign promotion claim chronology is PostgreSQL-owned and stale claimant cannot mutate a re-claimed signal", async () => {

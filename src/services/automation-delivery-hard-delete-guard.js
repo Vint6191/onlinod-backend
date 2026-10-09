@@ -1,7 +1,7 @@
 "use strict";
 
+const cleanup = require("./sfs-cleanup-contract");
 const { hasMassCurrentDebt } = require("./mass-delivery-contract");
-const cleanupContract = require("./phase7-cleanup-contract");
 
 const SFS_MODULE_KEY = "sfs";
 const SFS_FOLLOW_TARGET_ACTION_TYPE = "SFS_FOLLOW_TARGET";
@@ -26,10 +26,10 @@ function sfsCandidateId(row) {
 function candidateNoLongerNeedsFollowProof(candidate, row) {
   if (!candidate) return true;
   if (candidate.completedAt || candidate.state === "COMPLETED") return true;
-  if (candidate.usedForever === true && object(candidate.metadata).legacyMigration !== true) return true;
+  if (candidate.usedForever === true) return true;
 
   const metadata = object(candidate.metadata);
-  if (metadata.legacyMigration === true) return false; // Requires the same scoped attestation as cleanup admission.
+
   if (Number(candidate.generation) !== Number(row?.generation)) return true;
 
   // Current-generation cleanup carries the same proof in both the candidate and
@@ -41,27 +41,13 @@ function candidateNoLongerNeedsFollowProof(candidate, row) {
     && clean(metadata.followEffectDeliveryId) === clean(row?.id);
 }
 
-/**
- * Partition already-bounded hard-delete candidates without scanning the
- * delivery table.  Only the intermediate pre-INT4.3C SFS generation needs its
- * completed FOLLOW receipt while an old cleanup remains active.  Current SFS
- * embeds proof in the cleanup/candidate; legacy cleanup requires an immutable scoped attestation.
- *
- * Unknown/malformed SFS proof rows fail closed.  Current MASS debt is always retained, including legacy NULL remote lifecycle.
- * Other delivery classes retain their own lifecycle guards.
- */
+/** Retention preserves current MASS debt and unresolved SFS cleanup/proofs. */
 async function partitionAutomationDeliveryHardDeleteCandidates({ db, rows = [] } = {}) {
   const all = Array.isArray(rows) ? rows.filter(Boolean) : [];
-  const massProtected = all.filter(hasMassCurrentDebt);
-  const remaining = all.filter((row) => !hasMassCurrentDebt(row));
-  const legacyCleanup = remaining.filter(cleanupContract.isLegacyCleanup);
-  const receipts = legacyCleanup.length && db?.phase7RetirementProof?.findMany
-    ? await db.phase7RetirementProof.findMany({where:{sourceTable:'AutomationDelivery',kind:'SETTLED',deliveryId:{in:legacyCleanup.map(d=>d.id)}},take:500}) : [];
-  const settlement = new Map(receipts.map(p=>[p.deliveryId,p]));
-  const protectedCleanup = legacyCleanup.filter(d=>!cleanupContract.isSettledCleanup(d)||!cleanupContract.matchesSettlementProof(settlement.get(d.id),d));
-  const blockedIds = new Set(protectedCleanup.map(d=>d.id));
-  const input = remaining.filter(d=>!blockedIds.has(d.id));
-  massProtected.push(...protectedCleanup);
+  const protectedDebt = row => hasMassCurrentDebt(row) || (cleanup.isCleanup(row) && !cleanup.isSettledCleanup(row));
+  const massProtected = all.filter(protectedDebt);
+  const remaining = all.filter(row => !protectedDebt(row));
+  const input = remaining;
   const relevant = input.filter(isSfsFollowProof);
   if (!relevant.length) return { deletable: input, protected: massProtected };
 
@@ -89,7 +75,6 @@ async function partitionAutomationDeliveryHardDeleteCandidates({ db, rows = [] }
     : [];
   const byId = new Map((candidates || []).map((candidate) => [candidate.id, candidate]));
 
-  const attested=await require("./phase7-legacy-storage-service").attestedCleanupCandidates(db,candidates.filter(c=>object(c.metadata).legacyMigration===true));
   const deletable = [];
   const protectedRows = [...massProtected];
   for (const row of input) {
@@ -106,7 +91,6 @@ async function partitionAutomationDeliveryHardDeleteCandidates({ db, rows = [] }
     }
     const candidate = byId.get(candidateId);
     let safe = candidateNoLongerNeedsFollowProof(candidate, row);
-    if (!safe && attested.has(candidateId)) safe=true;
     if (safe) deletable.push(row); else protectedRows.push(row);
   }
   return { deletable, protected: protectedRows };

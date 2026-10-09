@@ -126,13 +126,13 @@ test("A33 Admin current Hidden Online and Follow Back routes no longer read raw 
   const admin = source("src/routes/admin-data.js");
   const hiddenStart = admin.indexOf('router.get("/hidden-online"');
   const followStart = admin.indexOf('router.get("/follow-back"');
-  const vaultStart = admin.indexOf('router.get("/vault-sales"');
+  const vaultStart = admin.indexOf('router.get("/money"');
   const currentRoutes = admin.slice(hiddenStart, vaultStart);
   assert.match(currentRoutes, /listHiddenOnline/);
   assert.match(currentRoutes, /listFollowBack/);
   assert.match(currentRoutes, /authority: "canonical_current"/);
   assert.doesNotMatch(currentRoutes, /prisma\.hiddenOnlineUser\.findMany/);
   assert.doesNotMatch(currentRoutes, /prisma\.followBackTask\.findMany/);
-  assert.match(admin, /hiddenOnlineHistoricalCompatibility/);
+  assert.doesNotMatch(admin, /hiddenOnlineHistoricalCompatibility/);
   assert.doesNotMatch(admin.slice(admin.indexOf('router.get("/creator/:id/overview"'), admin.indexOf('router.get("/search"')), /prisma\.hiddenOnlineUser\.count|prisma\.followBackTask\.count/);
 });

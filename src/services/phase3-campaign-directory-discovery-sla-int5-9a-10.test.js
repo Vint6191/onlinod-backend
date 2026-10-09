@@ -30,22 +30,7 @@ function directoryState(overrides = {}) {
   };
 }
 
-test("INT5.9A-10 schema/migration persists independent directory discovery SLA authority", () => {
-  const schema = read("prisma/schema.prisma");
-  const migration = read("prisma/migrations/20260918223000_phase3_campaign_directory_discovery_sla_v1/migration.sql");
-  for (const field of [
-    "campaignDirectoryDiscoveryDueAt",
-    "campaignDirectoryDiscoveryRequestedAt",
-    "campaignDirectoryDiscoveryRequestedRevision",
-    "campaignDirectoryDiscoveryCompletedRevision",
-  ]) {
-    assert.match(schema, new RegExp(`${field}\\s+`));
-    assert.match(migration, new RegExp(`"${field}"`));
-  }
-  assert.match(schema, /CreatorCampaignCollectionState_directory_due_idx/);
-  assert.match(migration, /INTERVAL '72 hours'/);
-  assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM/i);
-});
+
 
 test("INT5.9A-10 frontier due can reuse a fresh directory while pending discovery demand invalidates reuse", () => {
   const now = new Date("2026-09-18T12:00:00.000Z");

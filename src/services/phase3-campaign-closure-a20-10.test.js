@@ -36,16 +36,6 @@ test("A20.10 coverage preflight treats pg_advisory_xact_lock as a command and su
   assert.deepEqual(lock.args, [preflight.PREFLIGHT_ADVISORY_LOCK_CLASS, preflight.PREFLIGHT_ADVISORY_LOCK_KEY]);
 });
 
-test("A20.10 physical preflight owner also uses executeRaw for the void advisory lock", () => {
-  const physical = source("scripts/audit/phase3-a20-preflight-concurrency.js");
-  assert.match(physical, /\$executeRawUnsafe\(\s*`SELECT pg_advisory_xact_lock\(\$1::int, \$2::int\)`/);
-  assert.doesNotMatch(physical, /\$queryRawUnsafe\(\s*`SELECT pg_advisory_xact_lock/);
-});
 
-test("A20.10 PostgreSQL proof failures preserve finally cleanup instead of exiting from inside the proof body", () => {
-  const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
-  assert.doesNotMatch(runner, /function fail[\s\S]{0,220}?process\.exit\(/);
-  assert.match(runner, /throw error/);
-  assert.match(runner, /finally \{[\s\S]*dropSchema\(cli, audit, cleanSchema/);
-  assert.match(runner, /process\.exitCode =/);
-});
+
+

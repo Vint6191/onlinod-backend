@@ -14,7 +14,7 @@ const {
   publishCreatorRetirementControlEvents,
 } = require("./creator-lifecycle-authority-service");
 const { lockTeamControlPlaneTopology } = require("./team-control-plane-authority-service");
-const { assertTeamControlPlaneWriteAdmission } = require("./phase2-release-compatibility-authority-service");
+const { assertTeamControlPlaneWriteAdmission } = require("./database-write-contract-service");
 const { deferCommitHint } = require("./db-commit-kernel");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const has = (c) => Object.hasOwn(permissions, c.action);

@@ -1,6 +1,6 @@
 "use strict";
 
-const { runCreatorAccountWriteTransaction } = require("./phase2-release-compatibility-authority-service");
+const { runCreatorAccountWriteTransaction } = require("./database-write-contract-service");
 
 async function processTelegramAccountRetirementFanoutInContext({ db, item, now = new Date(), batchSize = 50 } = {}) {
   const agencyId = String(item?.agencyId || "").trim();

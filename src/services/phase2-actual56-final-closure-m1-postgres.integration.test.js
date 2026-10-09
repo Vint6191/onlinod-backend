@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const { cleanupAgencyFixture: cleanupAgencyFixtureAuthority } = require("../../scripts/test-support/phase2-postgres-integration-authority");
 
 const enabled = process.env.ONLINOD_POSTGRES_INTEGRATION === "1";
-const release = require("./phase2-release-compatibility-authority-service");
+const release = require("./database-write-contract-service");
 const work = require("./domain-work-authority-service");
 
 function token(prefix) {

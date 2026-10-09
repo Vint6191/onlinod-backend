@@ -28,12 +28,8 @@ async function nextObservationTime(db, { creatorId }) {
   const normalizedCreatorId = clean(creatorId, 180);
   if (!normalizedCreatorId) throw new Error("FAN_OBSERVATION_TOKEN_CREATOR_REQUIRED");
   const rows = await db.$queryRawUnsafe(`
-    WITH mode AS MATERIALIZED (
-      SELECT ((NULLIF("value"->>'floorObservedAt',''))::timestamptz AT TIME ZONE 'UTC')::timestamp(3) AS floor
-      FROM "SystemSetting" WHERE "key"='phase3.fanObservationCreatorClockV1'
-      AND "value"->>'active'='true' AND ("value"->>'epoch')::int>0 FOR SHARE
-    ) INSERT INTO "FanObservationCreatorClock"("creatorId","lastObservedAt","updatedAt")
-      SELECT $1,GREATEST(clock_timestamp(),floor+INTERVAL '1 millisecond'),clock_timestamp() FROM mode WHERE floor IS NOT NULL
+    INSERT INTO "FanObservationCreatorClock"("creatorId","lastObservedAt","updatedAt")
+      VALUES ($1,clock_timestamp(),clock_timestamp())
       ON CONFLICT ("creatorId") DO UPDATE SET "lastObservedAt"=GREATEST(clock_timestamp(),
         "FanObservationCreatorClock"."lastObservedAt"+INTERVAL '1 millisecond',EXCLUDED."lastObservedAt"),"updatedAt"=clock_timestamp()
       RETURNING "lastObservedAt"

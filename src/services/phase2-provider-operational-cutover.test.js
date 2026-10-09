@@ -31,16 +31,7 @@ test("confirmed Telegram projection repair consumes operational debt instead of 
   assert.doesNotMatch(body, /kind:\s*"REFERENCE"[^\n]*state:\s*"CONFIRMED"/);
 });
 
-test("provider debt migration installs current-work storage and exact dirty triggers", () => {
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260909211500_phase2_current_work_coordination/migration.sql"), "utf8");
-  assert.match(migration, /CREATE TABLE IF NOT EXISTS "ProviderOperationalDebt"/);
-  assert.match(migration, /CustomOrder_provider_operational_work_idx/);
-  assert.match(migration, /TelegramDeliveryIntent_provider_operational_dirty/);
-  assert.match(migration, /CustomContentSubmission_provider_operational_dirty/);
-  assert.match(migration, /CustomOrder_provider_operational_state_dirty/);
-  assert.match(migration, /AutomationDelivery_custom_external_projection_debt/);
-  assert.match(migration, /CUSTOM_EXTERNAL_PROJECTION_DEBT/);
-});
+
 
 test("historical Custom external-proof discovery is per-agency finite enumeration, not a recurring history scan", () => {
   const source = read("job-scheduler.js");

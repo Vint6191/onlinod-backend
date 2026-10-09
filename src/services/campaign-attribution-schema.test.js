@@ -10,7 +10,7 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const ledger = read("services/creator-analytics-ledger-service.js");
 const repository = read("services/campaign-read-repository.js");
 const projection = read("services/campaign-read-projection-service.js");
-const temporalSeek = read("../prisma/migrations/20261001170000_campaign_temporal_seek_v3/migration.sql");
+const temporalSeek = read("../prisma/migrations/20261009000000_current_baseline/migration.sql");
 const control = read("services/campaign-scan-control-service.js");
 const routes = read("routes/stats.js");
 const financial = read("services/financial-transactions-service.js");
@@ -48,13 +48,13 @@ test("manual campaign scanner is isolated and has independent routes", () => {
 
 test("payout canonical writes publish durable deltas through database capture", () => {
   assert.doesNotMatch(financial, /rebuildCreatorDailyMetrics/);
-  assert.match(read("../prisma/migrations/20261004030000_analytics_fact_publication_v1/migration.sql"), /analytics_capture_fact_v1/);
+  assert.match(read("../prisma/migrations/20261009000000_current_baseline/migration.sql"), /analytics_capture_fact_v1/);
   assert.doesNotMatch(financial, /from: normalized\[0\]\.occurredAt, to: normalized\.at\(-1\)\.occurredAt/);
 });
 
 test("campaign scanner persists fresh OF fan value as typed current state, not on campaign membership", () => {
   const schema = read("../prisma/schema.prisma");
-  const migration = read("../prisma/migrations/20260808184500_creator_fan_value_current_v1/migration.sql");
+  const migration = read("../prisma/migrations/20261009000000_current_baseline/migration.sql");
   assert.match(schema, /model CreatorFanValueCurrent/);
   assert.match(schema, /platformReportedTotalSpendCents\s+BigInt\?\s+@map\("totalNetCents"\)/);
   assert.match(schema, /messagesSpentCents\s+BigInt\?\s+@map\("messagesNetCents"\)/);

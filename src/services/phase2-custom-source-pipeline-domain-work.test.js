@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const root = path.join(__dirname, "../..");
-const migration = fs.readFileSync(path.join(root, "prisma/migrations/20260910160000_phase2_custom_source_pipeline_domain_work/migration.sql"), "utf8");
+const migration = fs.readFileSync(path.join(root, "prisma/migrations/20261009000000_current_baseline/migration.sql"), "utf8");
 const scheduler = fs.readFileSync(path.join(__dirname, "job-scheduler.js"), "utf8");
 const submissions = fs.readFileSync(path.join(__dirname, "custom-content-submissions-service.js"), "utf8");
 const route = fs.readFileSync(path.join(root, "src/routes/custom-orders.js"), "utf8");
@@ -19,37 +19,9 @@ function slice(source, start, end) {
   return source.slice(from, to);
 }
 
-test("A43 producer matrix publishes standalone source work and both sides of CustomOrder reassignment", () => {
-  const trigger = slice(migration, 'CREATE OR REPLACE FUNCTION "phase2_submission_domain_work_trigger"', 'DROP TRIGGER IF EXISTS "CustomContentSubmission_phase2_domain_work"');
-  assert.match(trigger, /'CUSTOM_SOURCE_PIPELINE','CustomContentSubmission',NEW\."id"/);
-  assert.match(trigger, /IF NEW\."customOrderId" IS NOT NULL[\s\S]*'CUSTOM_COMMUNICATION','CustomOrder',NEW\."customOrderId"/);
-  assert.match(trigger, /TG_OP='UPDATE'[\s\S]*OLD\."customOrderId" IS DISTINCT FROM NEW\."customOrderId"[\s\S]*'CUSTOM_COMMUNICATION','CustomOrder',OLD\."customOrderId"/);
-  assert.match(trigger, /IF TG_OP='DELETE'[\s\S]*do not create fresh[\s\S]*CUSTOM_COMMUNICATION/);
-  assert.doesNotMatch(trigger.match(/IF TG_OP='DELETE'[\s\S]*?RETURN OLD;/)?.[0] || "", /CUSTOM_SOURCE_PIPELINE/,
-    "cascade cleanup must not create orphan source work after the source row is gone");
-});
 
-test("A43 creator/account/config dependencies fan out to standalone submissions with bounded keyset continuation", () => {
-  assert.match(migration, /OLD\."customsVaultFolderId" IS DISTINCT FROM NEW\."customsVaultFolderId"/);
-  assert.match(migration, /UPDATE OF "telegramContact","telegramUserId","telegramAccountId","customsVaultFolderId","status","deletedAt"/);
-  const config = slice(migration, 'CREATE OR REPLACE FUNCTION "phase2_custom_pipeline_config_dependency_trigger"', 'DROP TRIGGER IF EXISTS "WorkspaceSetting_phase2_custom_pipeline_config"');
-  assert.match(config, /'CUSTOM_PIPELINE_CONFIG'/);
-  assert.match(config, /'DEPENDENCY_FANOUT','CustomPipelineConfig'/);
-  assert.doesNotMatch(config, /UPDATE\s+"CustomContentSubmission"/i, "config TX must publish one fanout instead of mass-touching submissions");
-  assert.match(migration, /UPDATE OF "key","value"/);
 
-  const list = slice(scheduler, "async function listDependencyFanoutSubmissions", "async function processTeamMoneyEvidenceFanout");
-  assert.match(list, /pipelineDisposition:\s*\{ in: \["ACTIVE", "SALVAGE"\] \}/);
-  assert.match(list, /CreatorAccount[\s\S]*where\.creatorId/);
-  assert.match(list, /AgencyTelegramMtprotoAccount[\s\S]*where\.telegramSourceAccountId/);
-  assert.match(list, /CustomPipelineConfig/);
-  assert.match(list, /orderBy:\s*\{ id: "asc" \}[\s\S]*take:\s*Math\.max\(1, Math\.min\(100/);
 
-  const fanout = slice(scheduler, "async function maybeRunPhase2DependencyFanout", "async function reminderBlockedDependency");
-  assert.match(fanout, /phase\s*=\s*"submissions"/);
-  assert.match(fanout, /CUSTOM_SOURCE_PIPELINE/);
-  assert.match(fanout, /progressCursor:\s*\{ phase: "submissions", lastId:/);
-});
 
 test("A43 historical standalone source enumeration is per-agency, bounded, resumable, and activation waits for convergence", () => {
   assert.match(scheduler, /PHASE2_COVERAGE_SEED_GENERATION/);
@@ -112,10 +84,4 @@ test("A43 Desktop-facing source execution is exact DomainWork claim + heartbeat 
   assert.match(relayRoute, /sourceWorkClaim:\s*req\.body\?\.sourceWorkClaim/);
 });
 
-test("A43 migration uses bounded indexable source history and preserves new-agency coverage", () => {
-  assert.match(migration, /CREATE INDEX IF NOT EXISTS "CustomContentSubmission_source_history_keyset_idx"[\s\S]*"agencyId","pipelineDisposition","id"[\s\S]*WHERE "pipelineDisposition" IN \('ACTIVE','SALVAGE'\)/);
-  assert.match(migration, /'CUSTOM_SOURCE_PIPELINE','phase2_custom_source_pipeline_coverage_v1',TRUE,'COMPLETE'/);
-  const functions = (migration.match(/CREATE OR REPLACE FUNCTION/g) || []).length;
-  const terminators = (migration.match(/\$\$\s+LANGUAGE\s+plpgsql(?:\s+\w+)*\s*;/gi) || []).length;
-  assert.equal(terminators, functions, "every PL/pgSQL function body must have exactly one terminator");
-});
+

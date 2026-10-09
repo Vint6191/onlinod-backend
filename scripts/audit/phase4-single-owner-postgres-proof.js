@@ -72,7 +72,7 @@ async function main() {
       assert.equal((await preflight(prisma)).ok,true);
       await engine.exec("ROLLBACK");
     });
-    const migration = fs.readFileSync(path.join(__dirname,"../../prisma/migrations/20260924010000_phase4_single_owner_authority/migration.sql"),"utf8");
+    const migration = fs.readFileSync(path.join(__dirname,"../../prisma/migrations/20261009000000_current_baseline/migration.sql"),"utf8");
     await check("unchanged R7 migration refuses bad legacy data and rolls back cleanly", async () => {
       await engine.exec(`UPDATE "AgencyMember" SET "roleKey"='owner',"role"='OWNER' WHERE "id"='m2'`);
       await assert.rejects(() => engine.exec(migration),/PHASE4_SINGLE_OWNER_PREFLIGHT_FAILED/);

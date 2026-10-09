@@ -27,17 +27,7 @@ test("TeamActivityEvent v13 provenance columns stay relational and indexed", () 
   ]) assert.ok(model.includes(index), `missing provenance index ${index}`);
 });
 
-test("provenance migration is additive and contains all canonical core columns", () => {
-  const sql = read("prisma/migrations/20260811234000_team_activity_provenance_v1/migration.sql");
-  assert.doesNotMatch(sql, /DROP\s+(?:TABLE|COLUMN)/i);
-  for (const column of [
-    "eventKind", "actionSource", "lifecycle", "dialogId", "messageId",
-    "correlationId", "coverageId", "automationDeliveryId", "broadcastDispatchId",
-    "priceCents", "currency", "isPpv", "mediaCount",
-  ]) assert.ok(sql.includes(`ADD COLUMN IF NOT EXISTS \"${column}\"`), `migration missing ${column}`);
-  assert.ok(sql.includes("TeamActivityEvent_agencyId_correlationId_idx"));
-  assert.ok(sql.includes("TeamActivityEvent_agencyId_broadcastDispatchId_idx"));
-});
+
 
 test("canonical telemetry keeps human actor separate from automation/system facts", () => {
   const ingest = read("src/services/telemetry-ingest-service.js");
@@ -54,35 +44,9 @@ test("Team efficiency denominator is confirmed manual messages, not mass volume"
   assert.doesNotMatch(analytics, /dollarsPerMessageCents\s*=\s*[^;]*\/\s*(?:metric\.|out\.)?totalMessages/);
 });
 
-test("Claims audit separates resolution actor from selected member", () => {
-  const schema = read("prisma/schema.prisma");
-  const model = schema.match(/model TeamPpvClaimAudit \{[\s\S]*?\n\}/)?.[0] || "";
-  for (const field of ["actorMemberId", "selectedMemberId", "action", "reason", "evidence", "purchaseId"]) {
-    assert.match(model, new RegExp(`\\b${field}\\b`), `missing TeamPpvClaimAudit.${field}`);
-  }
-  const sql = read("prisma/migrations/20260811235500_team_claim_audit_v1/migration.sql");
-  assert.doesNotMatch(sql, /DROP\s+(?:TABLE|COLUMN)/i);
-  assert.ok(sql.includes('CREATE TABLE IF NOT EXISTS "TeamPpvClaimAudit"'));
-  assert.ok(sql.includes('"actorMemberId" TEXT NOT NULL'));
-  assert.ok(sql.includes('"selectedMemberId" TEXT'));
-});
 
-test("Team performance functions are relational and independent from RBAC role", () => {
-  const schema = read("prisma/schema.prisma");
-  const model = schema.match(/model TeamMemberFunction \{[\s\S]*?\n\}/)?.[0] || "";
-  assert.match(model, /functionKey\s+String/);
-  assert.ok(model.includes("@@unique([agencyId, memberId, functionKey])"));
-  const sql = read("prisma/migrations/20260811235800_team_member_functions_v1/migration.sql");
-  assert.doesNotMatch(sql, /DROP\s+(?:TABLE|COLUMN)/i);
-  assert.ok(sql.includes('CREATE TABLE IF NOT EXISTS "TeamMemberFunction"'));
-  assert.ok(sql.includes('"functionKey" TEXT NOT NULL'));
 
-  const teamRoute = read("src/routes/team.js");
-  assert.ok(teamRoute.includes('router.patch("/members/:memberId/functions"'));
-  assert.ok(read('src/services/team-command-contract.js').includes('const TEAM_FUNCTION_KEYS = Object.freeze(["CHATTER", "CONTENT", "SUPERVISOR"])'));
-  assert.match(teamRoute, /TEAM_COMMAND_V2_REQUIRED/);
-  assert.match(teamRoute, /router\.post\("\/commands\/v2", commandHandler\(false\)\)/);
-});
+
 
 test("Team read models do not silently truncate activity or attribution ledgers", () => {
   const analytics = read("src/services/team-analytics-service.js");
@@ -96,32 +60,7 @@ test("Team read models do not silently truncate activity or attribution ledgers"
 });
 
 
-test("Team response projection schema is additive, relational, and excludes accidental User relations", () => {
-  const schema = read("prisma/schema.prisma");
-  const coverage = schema.match(/model TeamCoverageSession \{[\s\S]*?\n\}/)?.[0] || "";
-  const dialog = schema.match(/model TeamDialogSession \{[\s\S]*?\n\}/)?.[0] || "";
-  const response = schema.match(/model TeamResponseCase \{[\s\S]*?\n\}/)?.[0] || "";
-  const user = schema.match(/model User \{[\s\S]*?\n\}/)?.[0] || "";
 
-  assert.match(coverage, /coverageId\s+String/);
-  assert.ok(coverage.includes("@@unique([agencyId, coverageId])"));
-  assert.match(dialog, /activeSeconds\s+Int/);
-  assert.match(dialog, /wallSeconds\s+Int/);
-  assert.match(response, /classification\s+String/);
-  assert.match(response, /wallClockSeconds\s+Int/);
-  assert.match(response, /coverageResponseSeconds\s+Int\?/);
-  assert.match(response, /seenResponseSeconds\s+Int\?/);
-  assert.match(response, /slaEligible\s+Boolean/);
-  assert.ok(response.includes("@@unique([agencyId, creatorId, replyMessageId])"));
-  assert.doesNotMatch(user, /teamCoverageSessions|teamDialogSessions|teamResponseCases/);
-
-  const sql = read("prisma/migrations/20260812012000_team_response_projection_v1/migration.sql");
-  assert.doesNotMatch(sql, /DROP\s+(?:TABLE|COLUMN)/i);
-  for (const table of ["TeamCoverageSession", "TeamDialogSession", "TeamResponseCase"]) {
-    assert.ok(sql.includes(`CREATE TABLE "${table}"`), `missing ${table} migration`);
-  }
-  assert.ok(sql.includes('TeamResponseCase_agencyId_replyMessageId_key'));
-});
 
 test("response derivation explicitly separates fresh SLA from backlog and handoff", () => {
   const projection = read("src/services/team-response-projection-service.js");

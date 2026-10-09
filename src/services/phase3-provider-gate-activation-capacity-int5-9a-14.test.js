@@ -94,65 +94,16 @@ const legacyScope = {
   creatorId: "creator-1", deviceId: "device-1", capability: "read", intervalMs: 700,
 };
 
-test("A14 rolling activation stays legacy-compatible in DRAINING, blocks A14 starts in QUIESCING, then enforces ACTIVE", async () => {
-  const db = activationDb();
-  const draining = await credit.tryAcquireLegacyCompatibleProviderPermit({ db: commitDatabaseFixture(db), ...legacyScope });
-  assert.equal(draining.granted, true);
-  assert.equal(db.state.legacyPermitCount, 1n);
-  await credit.cancelDurableProviderPermit({ db: commitDatabaseFixture(db), ...legacyScope });
-
-  const drain = await credit.beginProviderGateFairnessDrain(db);
-  assert.equal(drain.changed, true);
-  assert.equal(db.state.fairnessActivationState, "QUIESCING");
-  const quiescing = await credit.tryAcquireLegacyCompatibleProviderPermit({ db: commitDatabaseFixture(db), ...legacyScope, permitId: "legacy-permit-2" });
-  assert.equal(quiescing.granted, false);
-  assert.equal(quiescing.reason, "fairness_quiescing");
-
-  let diagnostics = await credit.providerGateFairnessActivationDiagnostics(db);
-  assert.equal(diagnostics.readyToActivate, false, "quiet window must be proven before activation");
-  db.now = new Date(db.now.getTime() + credit.PROVIDER_GATE_LEGACY_QUIET_MS + 1);
-  diagnostics = await credit.providerGateFairnessActivationDiagnostics(db);
-  assert.equal(diagnostics.readyToActivate, true);
-  const activated = await credit.activateProviderGateFairnessAfterDrain(db);
-  assert.equal(activated.activated, true);
-  assert.equal(db.state.fairnessActivationState, "ACTIVE");
-  const active = await credit.tryAcquireLegacyCompatibleProviderPermit({ db: commitDatabaseFixture(db), ...legacyScope, permitId: "legacy-permit-3" });
-  assert.equal(active.granted, false);
-  assert.equal(active.reason, "fairness_active");
+test("provider fairness requires the current active generation", async () => {
+ const db=activationDb();db.state.fairnessActivationState='ACTIVE';
+ assert.equal((await credit.readProviderGateFairnessAuthority({db})).activationState,'ACTIVE');
+ db.state.fairnessActivationState='DRAINING';
+ assert.equal((await credit.readProviderGateFairnessAuthority({db})).activationState,'UNAVAILABLE');
 });
 
-test("A14 migration gates waiter enforcement behind explicit ACTIVE and tracks legacy permit traffic", () => {
-  const schema = fs.readFileSync(path.join(__dirname, "../../prisma/schema.prisma"), "utf8");
-  const migration = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260919023000_phase3_provider_gate_fairness_activation_v2/migration.sql"), "utf8");
-  const historicalA13 = fs.readFileSync(path.join(__dirname, "../../prisma/migrations/20260919010000_phase3_provider_gate_durable_waiter_fairness_v1/migration.sql"), "utf8");
-  for (const field of ["fairnessGeneration", "fairnessActivationState", "fairnessDrainStartedAt", "fairnessActivatedAt", "legacyPermitLastSeenAt", "legacyPermitCount"]) {
-    assert.match(schema, new RegExp(`${field}\\s+`));
-    assert.match(migration, new RegExp(`"${field}"`));
-  }
-  assert.match(migration, /fairnessActivationState[\s\S]*ACTIVE[\s\S]*ONLINOD_PROVIDER_GATE_WAITER_REQUIRED/);
-  assert.match(migration, /legacyPermitLastSeenAt/);
-  assert.match(migration, /legacyPermitCount/);
-  assert.doesNotMatch(migration, /DROP\s+(TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM/i);
 
-  // Historical migrations are immutable. A14 must layer activation in a new
-  // migration so an environment that already applied A13 does not hit Prisma
-  // checksum drift. This hash is the exact A13 artifact shipped in checkpoint A13.
-  assert.equal(crypto.createHash("sha256").update(historicalA13).digest("hex"),
-    "fd56bc1cf7a816aecc9e7a05ea9f2561656b2589206348a40f771ee1c6baaf89");
-  assert.doesNotMatch(historicalA13, /fairnessActivationState|legacyPermitLastSeenAt|legacyPermitCount/);
-  assert.match(historicalA13, /ONLINOD_PROVIDER_GATE_WAITER_REQUIRED/);
-  assert.doesNotMatch(historicalA13, /DROP\s+(TABLE|COLUMN)|TRUNCATE|DELETE\s+FROM/i);
-});
 
-test("A14 operator control plane requires explicit diagnostics/drain/activate and never auto-activates on startup", () => {
-  const script = fs.readFileSync(path.join(__dirname, "../../scripts/phase3-provider-gate-fairness-activation.js"), "utf8");
-  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../../package.json"), "utf8"));
-  assert.equal(pkg.scripts["phase3:provider-gate-fairness"], "node scripts/phase3-provider-gate-fairness-activation.js");
-  assert.match(script, /diagnostics/);
-  assert.match(script, /begin-drain/);
-  assert.match(script, /activateProviderGateFairnessAfterDrain/);
-  assert.doesNotMatch(script, /AUTO_ACTIVATE|activate.*process\.env/i);
-});
+
 
 test("A14 physical capacity math proves 72h is a deadline signal, not a universal 4k-creator promise", () => {
   const starts = capacity.providerPhysicalStartsPerHour(700);

@@ -65,36 +65,6 @@ test("A20.11 preflight commits DDL before beginning serialized data backfill", a
   assert.deepEqual(result, { directUpdated: 3, fallbackUpdated: 2, ddlAltered: true });
 });
 
-test("A20.11 current-generation lookup index is online for populated DBs and migration-backed for fresh DBs", () => {
-  const schema = source("prisma/schema.prisma");
-  const migration = source("prisma/migrations/20260920003000_phase3_campaign_refresh_current_run_lookup_index_v1/migration.sql");
-  const preflightSource = source("scripts/database/phase3-campaign-coverage-generation-online-preflight.js");
-  assert.match(schema, /@@index\(\[creatorId, scanRunId, id\], map: "CreatorCampaignFanRefreshWork_creator_run_id_idx"\)/);
-  assert.match(migration, /CREATE INDEX IF NOT EXISTS "CreatorCampaignFanRefreshWork_creator_run_id_idx"/);
-  assert.match(migration, /IF NOT EXISTS \(SELECT 1 FROM "CreatorCampaignFanRefreshWork" LIMIT 1\)/);
-  assert.match(preflightSource, /CREATE INDEX CONCURRENTLY IF NOT EXISTS/);
-  assert.match(preflightSource, /withIndexLifecycleAuthority\(db,[\s\S]*ensureCurrentRunLookupIndex\(lifecycleDb\)/);
-  assert.equal(preflight.CURRENT_RUN_INDEX_NAME, "CreatorCampaignFanRefreshWork_creator_run_id_idx");
-});
 
-test("A20.11 seeded physical proof models a large current generation and gates index use", () => {
-  const seeded = source("scripts/audit/phase3-a20-seeded-rolling-coverage.js");
-  const runner = source("scripts/audit/phase3-a20-postgres-proof.js");
-  assert.match(seeded, /ONLINOD_A20_SEED_CURRENT_ROWS/);
-  assert.match(seeded, /generate_series\(2, \$6::int\)/);
-  assert.match(seeded, /currentRunIndexUsed/);
-  assert.match(seeded, /CreatorCampaignFanRefreshWork_creator_run_id_idx/);
-  assert.match(runner, /ONLINOD_A20_SEED_CURRENT_ROWS/);
-  assert.match(runner, /currentGenerationRows/);
-  assert.match(runner, /currentRunIndexUsed/);
-  assert.doesNotMatch(runner, /EXPECTED_PROOF_TEST_COUNT/);
-  assert.match(runner, /tapTestNames/);
-  assert.match(runner, /physical proof TAP manifest drifted/);
-  assert.match(runner, /phase3-campaign-closure-a20-11\.integration\.test\.js/);
-  assert.match(runner, /A20_11_PREFLIGHT_RUNTIME_AVAILABILITY_PASS/);
-  const availability = source("scripts/audit/phase3-a20-preflight-runtime-availability.js");
-  assert.match(availability, /ensureAuthorityColumns/);
-  assert.match(availability, /backfillAuthority/);
-  assert.match(availability, /statement_timeout = '1500ms'/);
-  assert.match(availability, /A20_11_PREFLIGHT_RUNTIME_AVAILABILITY_PASS/);
-});
+
+

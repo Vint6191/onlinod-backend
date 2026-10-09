@@ -172,7 +172,7 @@ async function applySqlBudgets(tx, config, timeout) {
     // Canonical timestamp(3) columns, including shared DWI leases, store UTC.
     // Pin every owned transaction to that storage ABI, independently of the
     // pool/session default. Explicit temporal conversions remain at API bounds.
-    "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('onlinod.phase7_executor_generation', 'phase7_legacy_storage_v1', true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)",
+    "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)",
     `${Math.min(config.lockTimeoutMs, timeout)}ms`,
     `${Math.min(config.statementTimeoutMs, timeout)}ms`,
   );

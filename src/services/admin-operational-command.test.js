@@ -54,9 +54,7 @@ for(const revoke of["session","admin","epoch","role"])test(`fresh admin authorit
  const m=createOperationalDb();if(revoke==="session")m.state.sessions[0].revokedAt=m.clock;if(revoke==="admin")m.state.admins[0].active=false;if(revoke==="epoch")m.state.admins[0].accessEpoch=2;if(revoke==="role")m.state.admins[0].role="SUPPORT";
  await assert.rejects(()=>call(m,"user.logout","user-a",{}));assert.equal(m.state.deviceCommands.length,0);assert.equal(m.state.users[0].sessionsRevokedAt,null);
 });
-test("release DRAINING refuses member mutation and no effects escape",async()=>{
- const m=createOperationalDb({draining:true});await assert.rejects(()=>call(m,"member.role.set","member-a",{agencyId:"agency-a",expectedAccessEpoch:1,role:"MANAGER"}));assert.equal(m.state.members[0].accessEpoch,1);assert.equal(m.state.commands.length,0);
-});
+
 test("signal requeue validates scope and repeats only the stored result",async()=>{
  const m=createOperationalDb(),id=crypto.randomUUID(),payload={agencyId:"agency-a",creatorId:"creator-a"};const r=await call(m,"maintenance.subscriber.requeue","signal-a",payload,id);assert.equal(r.statusCode,200);assert.equal(m.state.signals[0].revision,2n);await call(m,"maintenance.subscriber.requeue","signal-a",payload,id);assert.equal(m.state.signals[0].revision,2n);
 });

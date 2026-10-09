@@ -15,24 +15,7 @@ function sliceBetween(source, startNeedle, endNeedle) {
   return source.slice(start, end);
 }
 
-test("INT5.8A-5 exact Campaign frontier fan identities remain bounded after typed-relational cutover", () => {
-  const schema = read("prisma/schema.prisma");
-  const historicalMigration = read("prisma/migrations/20260918031500_phase3_campaign_deep_frontier/migration.sql");
-  const typedMigration = read("prisma/migrations/20260918163000_phase3_campaign_typed_frontier_fans/migration.sql");
-  assert.doesNotMatch(schema, /catchupFrontierFanIds\s+Json\?/);
-  assert.doesNotMatch(schema, /stagedCatchupFrontierFanIds\s+Json\?/);
-  assert.match(schema, /model CreatorCampaignFrontierFan \{/);
-  assert.match(schema, /frontierKind\s+CreatorCampaignFrontierKind/);
-  assert.match(schema, /onlyFansUserId\s+String\s+@db\.VarChar\(180\)/);
-  assert.match(schema, /@@unique\(\[campaignId, frontierKind, onlyFansUserId\]\)/);
-  assert.match(schema, /catchupFrontierRunId\s+String\?/);
-  assert.match(schema, /catchupFrontierStartedAt\s+DateTime\?/);
-  assert.match(historicalMigration, /ADD COLUMN IF NOT EXISTS "catchupFrontierFanIds" JSONB/);
-  assert.match(typedMigration, /jsonb_array_elements_text/);
-  assert.match(typedMigration, /WHERE rn <= 50/);
-  assert.match(typedMigration, /DROP COLUMN IF EXISTS "catchupFrontierFanIds"/);
-  assert.match(typedMigration, /DROP COLUMN IF EXISTS "stagedCatchupFrontierFanIds"/);
-});
+
 
 test("INT5.8A-5 exact deep-boundary machinery remains bounded as pre-v12 compatibility but current planner never republishes it", () => {
   const ledger = read("src/services/creator-analytics-ledger-service.js");
