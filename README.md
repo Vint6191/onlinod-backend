@@ -25,7 +25,7 @@ Backend API + built-in debug Web Console for Onlinod.
 Build command:
 
 ```bash
-npm ci && npm run prisma:migrate
+npm install && npm run prisma:migrate
 ```
 
 Start command:
@@ -119,8 +119,26 @@ runners and environments; Node-only unit tests do not replace those gates.
 `npm run prisma:migrate` installs the current baseline into an empty PostgreSQL database using the public schema.
 It includes the schema, business triggers, functions, queues, indexes and initial
 controls. Repeating the command on the same current installation is safe.
-Old migration receipts or nonempty unbaselined databases are rejected without
-changing data. Use a separate empty database for this pre-release architecture.
+By default, old migration receipts or nonempty unbaselined databases are rejected
+without changing data.
+
+For the existing disposable pre-153 test database, including free Render/Neon
+plans with only a Build Command, use this once:
+
+```bash
+npm install && npm run prisma:migrate -- --reset-legacy-test-database
+```
+
+**This deletes the old public schema and all its test data**, then installs the
+current baseline into the same database. DATABASE_URL and the Start Command stay
+the same. No new database, SQL console, shell access or paid plan is required.
+After a successful deploy, restore the ordinary Build Command above. Repeating
+the reset option against a current installation preserves its data. The option
+only accepts migration history older than the fixed first current baseline;
+it refuses current/failed/changed baseline receipts and later migration history.
+The source checksum is verified before database writes. History inspection and
+schema replacement are in one locked transaction; a failed schema replacement
+rolls back, and an interruption after replacement can resume on the empty database.
 
 The installer gives Prisma an isolated copy of the verified current migration.
 Retired directories left by a source overlay are never applied and cannot block
@@ -136,4 +154,5 @@ checks are read-only and never perform activation, backfill or archive operation
 The reproducible clean-install SQL proof is `npm run test:database`; see
 `TESTING141.md` for its isolated runtime and the complete source verification order.
 `npm run test:database-overlay` additionally verifies mixed migration directories,
-repeat installation, CRLF files, and rejection of an existing old database.
+repeat installation, CRLF files, default rejection of an existing old database,
+explicit test reset and preservation of current data when the option is repeated.

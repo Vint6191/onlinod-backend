@@ -7,6 +7,8 @@ const { PrismaClient } = require("@prisma/client");
 const contract = require("../../src/services/database-contract.json");
 const { assertDatabaseContract } = require("../../src/services/database-contract-service");
 const root = path.resolve(__dirname, "../..");
+const legacyResetTarget = "20261009000000_current_baseline";
+const legacyResetFlag = "--reset-legacy-test-database";
 function fail(code) { throw Object.assign(new Error(code), { code }); }
 
 // A source overlay can leave retired directories beside the current baseline.
@@ -46,6 +48,32 @@ async function inspectInstallation(db) {
   if (!applied.length && tables.some(row => row.name !== "_prisma_migrations")) fail("EMPTY_DATABASE_REQUIRED");
   return { fresh: applied.length === 0 };
 }
+
+// Explicit, pre-release reset of the OLD test schema in the SAME database.
+// Keep this tied to the original baseline: a flag left in a Render build command
+// must never turn into a general reset when a later release changes the contract.
+async function resetLegacyTestDatabase(db) {
+  return db.$transaction(async tx => {
+    await tx.$executeRawUnsafe("SET LOCAL lock_timeout = '15s'");
+    await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(20261009, 153)");
+    try {
+      return { ...await inspectInstallation(tx), legacyReset: false };
+    } catch (error) {
+      if (error.code !== "CURRENT_BASELINE_DATABASE_REQUIRED") throw error;
+    }
+    const rows = await tx.$queryRawUnsafe('SELECT migration_name FROM "public"."_prisma_migrations"');
+    if (contract.migration !== legacyResetTarget || !rows.length || rows.some(row =>
+      !/^\d{8}(?:\d{6})?_[a-zA-Z0-9_]+$/.test(row.migration_name) || row.migration_name >= legacyResetTarget
+    )) fail("LEGACY_TEST_RESET_NOT_APPLICABLE");
+    // The history check and schema replacement share one transaction. Failed
+    // DDL rolls back the old schema; another reset rechecks after taking the lock.
+    console.log("RESETTING_LEGACY_TEST_DATABASE: deleting the old public schema and its test data.");
+    await tx.$executeRawUnsafe('DROP SCHEMA "public" CASCADE');
+    await tx.$executeRawUnsafe('CREATE SCHEMA "public"');
+    return { fresh: true, legacyReset: true };
+  }, { maxWait: 15000, timeout: 120000 });
+}
+
 function deploy(schemaPath) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(root, "node_modules/prisma/build/index.js"), "migrate", "deploy", "--schema", schemaPath], { cwd: root, stdio: "inherit" });
@@ -61,7 +89,9 @@ function deploy(schemaPath) {
     });
   });
 }
-async function main() {
+async function main(args = process.argv.slice(2)) {
+  if (args.some(arg => arg !== legacyResetFlag)) fail("UNKNOWN_INSTALL_ARGUMENT");
+  const resetLegacy = args.includes(legacyResetFlag);
   let databaseUrl;
   try { databaseUrl = new URL(process.env.DATABASE_URL); } catch { fail("DATABASE_URL_REQUIRED"); }
   if (!["postgres:", "postgresql:"].includes(databaseUrl.protocol)) fail("DATABASE_URL_REQUIRED");
@@ -71,7 +101,7 @@ async function main() {
   let db;
   try {
     db = new PrismaClient();
-    const installation = await inspectInstallation(db);
+    const installation = resetLegacy ? await resetLegacyTestDatabase(db) : await inspectInstallation(db);
     await db.$disconnect();
     await deploy(deployment.schemaPath);
     await assertDatabaseContract(db);
@@ -82,11 +112,13 @@ async function main() {
 }
 function reportFailure(error) {
   const messages = {
+    UNKNOWN_INSTALL_ARGUMENT: `The only supported option is ${legacyResetFlag}, which discards the pre-153 TEST database schema and its data.`,
     DATABASE_URL_REQUIRED: "Set DATABASE_URL to a PostgreSQL connection URL.",
     PUBLIC_SCHEMA_REQUIRED: "The current installation requires the public schema.",
     BASELINE_SOURCE_CHECKSUM_MISMATCH: "The current migration does not match its contract. Reapply the complete Backend package.",
     EMPTY_DATABASE_REQUIRED: "This database already contains an earlier schema. Set DATABASE_URL to a NEW EMPTY database; existing data was not changed.",
-    CURRENT_BASELINE_DATABASE_REQUIRED: "This database has earlier migration receipts. Set DATABASE_URL to a NEW EMPTY database; existing data was not changed.",
+    CURRENT_BASELINE_DATABASE_REQUIRED: `Migration history differs from the current baseline; existing data was not changed. To discard a pre-153 TEST schema in this same database, run npm run prisma:migrate -- ${legacyResetFlag}. This deletes its old test data.`,
+    LEGACY_TEST_RESET_NOT_APPLICABLE: "Reset refused: the history is not exclusively pre-153 migrations. A recorded current baseline (including a failed or changed one) is never reset by this option. Existing data was not changed.",
     BASELINE_INSTALLATION_INCOMPLETE: "A previous installation is incomplete. Inspect its Prisma migration receipt before retrying.",
     DUPLICATE_BASELINE_RECEIPT: "The database has duplicate baseline receipts. Installation was stopped.",
     BASELINE_DEPLOY_FAILED: "Prisma could not apply the current baseline. See its error above.",
@@ -96,5 +128,5 @@ function reportFailure(error) {
   if (messages[error.code]) console.error(messages[error.code]);
   if (error.problems?.length) console.error(JSON.stringify({ problems: error.problems }));
 }
-module.exports = { prepareDeployment, inspectInstallation, main, reportFailure };
+module.exports = { prepareDeployment, inspectInstallation, resetLegacyTestDatabase, main, reportFailure };
 if (require.main === module) main().catch(error => { reportFailure(error); process.exitCode = 1; });
