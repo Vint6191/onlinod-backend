@@ -42,7 +42,9 @@
     "test:auth-sql": "node scripts/audit/auth-boundary-sql-proof.cjs",
     "test:all": "node scripts/test-all.cjs",
     "test:database": "node scripts/audit/current-clean-install-proof.cjs",
-    "test:database-overlay": "node scripts/audit/current-install-overlay-proof.cjs"
+    "test:database-overlay": "node scripts/audit/current-install-overlay-proof.cjs",
+    "test:admin-diagnostics": "node scripts/audit/current-admin-diagnostics-proof.cjs",
+    "test:server-startup": "node scripts/audit/current-server-startup-proof.cjs"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

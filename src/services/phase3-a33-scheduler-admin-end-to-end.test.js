@@ -154,7 +154,7 @@ test("A33 Admin current UI maps canonical fields, preserves UNKNOWN money, and i
   assert.doesNotMatch(data, /dataDeleteRecord|dataBulkDelete|dataPurgeDeliveries/);
   assert.match(detail, /const readOnly = !cfg\.model/);
   assert.match(detail, /if \(readOnly\) return/);
-  assert.match(shell, /results\.hiddenOnlineHistoricalCompatibility/);
-  assert.match(shell, /Hidden Online — Historical compatibility/);
-  assert.doesNotMatch(shell, /grp\("Hidden online", results\.hiddenOnline/);
+  assert.match(source("src/routes/admin-data.js"), /results: \{ agencies, creators, users, hiddenOnline: hidden, deliveries: deliveriesByMsg \}/);
+  assert.match(shell, /grp\("Hidden Online", results\.hiddenOnline/);
+  assert.doesNotMatch(shell, /hiddenOnlineHistoricalCompatibility|results\.crmProfiles|Historical CRM/);
 });

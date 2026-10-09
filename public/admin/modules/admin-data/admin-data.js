@@ -112,7 +112,8 @@
 
     body.innerHTML = `
       <div class="adm-anomaly-grid">${cards}</div>
-      <div class="adm-muted" style="margin-top:12px">${r.checkedAt ? `Observed ${esc(fmtDate(r.coverage?.observationFrom))} — ${esc(fmtDate(r.checkedAt))}` : 'Initial diagnostic pass is in progress'} · ${esc(r.coverage?.status || 'UNKNOWN')}<br>Rolling observation; changes during a pass are revisited on the next pass. ${r.coverage?.rebuilding ? `Next pass: ${esc(r.coverage.progressRows)} rows checked.` : ''}</div>`;
+      <div class="adm-muted" style="margin-top:12px">${r.checkedAt ? `Observed ${esc(fmtDate(r.coverage?.observationFrom))} — ${esc(fmtDate(r.checkedAt))}` : 'Initial diagnostic pass is in progress'} · ${esc(r.coverage?.status || 'UNKNOWN')}<br>Rolling observation; changes during a pass are revisited on the next pass. ${r.coverage?.rebuilding ? `Next pass: ${esc(r.coverage.progressRows)} rows checked.` : ''}</div>
+      ${(r.coverage?.excluded || []).map(item => `<p class="adm-muted">${esc(item.reason)}</p>`).join('')}`;
 
     body.insertAdjacentHTML("beforeend", '<p class="adm-muted">Inspect anomalies before acting. Stuck work uses its recovery flow. Terminal archival is available in Browse for one agency and creator.</p>');
   }

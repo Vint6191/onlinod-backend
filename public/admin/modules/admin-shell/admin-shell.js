@@ -170,11 +170,8 @@
       `<div class="adm-search-row" data-go="creator" data-id="${esc(c.id)}"><b>${esc(c.displayName || c.username || c.id)}</b><span>@${esc(c.username || "")} · ${esc(c.status || "")}</span></div>`);
     grp("Users", results.users, (u) =>
       `<div class="adm-search-row" data-go="user" data-id="${esc(u.id)}"><b>${esc(u.email)}</b><span>${esc(u.name || "")}</span></div>`);
-    if(results.crmProfiles===null)groups.push('<div class="adm-muted">Historical CRM: open Data and select an agency or creator.</div>');
-    grp("Fan profiles (CRM)", results.crmProfiles, (p) =>
-      `<div class="adm-search-row" data-go="creator" data-id="${esc(p.creatorId)}"><b>${esc(p.name || p.username || ("fan " + p.fanId))}</b><span>fan ${esc(p.fanId)} · creator ${esc(String(p.creatorId).slice(0,8))}…</span></div>`);
-    grp("Hidden Online — Historical compatibility", results.hiddenOnlineHistoricalCompatibility, (h) =>
-      `<div class="adm-search-row" data-go="creator" data-id="${esc(h.creatorId)}"><b>${esc(h.username || ("fan " + h.fanId))}</b><span>historical/compatibility · ${esc(h.status || "")} · fan ${esc(h.fanId)}</span></div>`);
+    grp("Hidden Online", results.hiddenOnline, (h) =>
+      `<div class="adm-search-row" data-go="creator" data-id="${esc(h.creatorId)}"><b>${esc(h.username || ("fan " + h.fanId))}</b><span>${esc(h.status || "")} · fan ${esc(h.fanId)}</span></div>`);
     grp("Deliveries (by msg/fan)", results.deliveries, (d) =>
       `<div class="adm-search-row" data-go="creator" data-id="${esc(d.creatorId)}"><b>fan ${esc(d.fanId)}</b><span>${esc(d.status || "")} · msg ${esc(d.messageId || "—")}</span></div>`);
     box.innerHTML = groups.length ? groups.join("") : `<div class="adm-search-empty">nothing found</div>`;

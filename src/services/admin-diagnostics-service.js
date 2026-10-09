@@ -3,31 +3,51 @@ const { runRootCommit } = require("./db-commit-kernel");
 // Rebuildable rolling observation, not a transaction-wide historical snapshot.
 // Each durable step reads <=500 rows and <=2 indexed duplicate candidates per row.
 const KEY = "admin.diagnostics.v1", BATCH = 500, STEP_MS = 5000, CYCLE_MS = 60000;
-const LANES = ["AutomationDelivery", "CrmProfile", "CrmProfileRawTag"];
+const GENERATION = "admin_diagnostics_current_v2";
+const LANES = ["AutomationDelivery", "AutomationBumpFanState"];
 const SPECS = [
-  ["delivery_clones", "Deliveries sharing a message ID", "warn"],
-  ["stuck_bumps", "Stuck bumps (>3d, unresolved)", "warn"],
-  ["untagged_profiles", "CRM profiles without tags", "info"],
-  ["raw_tags_review", "Raw tags needing review", "info"],
-  ["deliveries_no_messageid", "In-flight deliveries without messageId", "warn"],
+  ["delivery_clones", "Message sends sharing a provider message ID", "warn"],
+  ["stuck_bumps", "Bumps overdue for cleanup (>3d)", "warn"],
+  ["deliveries_no_messageid", "Completed message sends without a provider ID", "warn"],
+  ["reconcile_required", "Writes awaiting reconciliation", "warn"],
 ];
 const DELIVERY_PAGE_SQL = `WITH page AS MATERIALIZED (
-  SELECT "id","agencyId","creatorId","messageId","status","sentAt","createdAt"
+  SELECT "id","agencyId","creatorId","actionType","messageId","status"
   FROM "AutomationDelivery" WHERE "id">$1 AND "id"<=$2 ORDER BY "id" LIMIT $3
-) SELECT p.*, CASE WHEN p."messageId" IS NULL THEN false ELSE
+) SELECT p.*, CASE WHEN p."actionType"<>'SEND_MESSAGE' OR NULLIF(p."messageId",'') IS NULL THEN false ELSE
   (SELECT count(*)>1 FROM (SELECT 1 FROM "AutomationDelivery" d
-    WHERE d."creatorId"=p."creatorId" AND d."messageId"=p."messageId" LIMIT 2) candidates)
+    WHERE d."creatorId"=p."creatorId" AND d."messageId"=p."messageId"
+      AND d."agencyId"=p."agencyId" AND d."actionType"='SEND_MESSAGE' LIMIT 2) candidates)
   END AS duplicate FROM page p ORDER BY p."id"`;
-const PROFILE_PAGE_SQL = `WITH page AS MATERIALIZED (
-  SELECT "id" FROM "CrmProfile" WHERE "id">$1 AND "id"<=$2 ORDER BY "id" LIMIT $3
-) SELECT p."id", (SELECT t."id" FROM "CrmProfileTag" t WHERE t."profileId"=p."id" LIMIT 1) IS NOT NULL AS tagged FROM page p ORDER BY p."id"`;
+const BUMP_PAGE_SQL = `SELECT "id","pendingMessageId","pendingCancelAt" FROM "AutomationBumpFanState"
+  WHERE "id">$1 AND "id"<=$2 ORDER BY "id" LIMIT $3`;
 function newRun(now) {
   return { startedAt: now.toISOString(), lane: 0, cursor: "", upper: null, scanned: 0,
     counts: Object.fromEntries(SPECS.map(([key]) => [key, 0])), sample: [] };
 }
+function validDate(value) { return typeof value === "string" && Number.isFinite(Date.parse(value)); }
+function validRun(run, completed = false) {
+  return !!run && typeof run === "object" && validDate(run.startedAt)
+    && Number.isSafeInteger(run.lane) && (completed ? run.lane === LANES.length : run.lane >= 0 && run.lane < LANES.length)
+    && typeof run.cursor === "string" && (run.upper === null || typeof run.upper === "string")
+    && Number.isSafeInteger(run.scanned) && run.scanned >= 0
+    && SPECS.every(([key]) => Number.isSafeInteger(run.counts?.[key]) && run.counts[key] >= 0)
+    && Array.isArray(run.sample) && run.sample.length <= 10
+    && run.sample.every(row => row && ["id", "agencyId", "creatorId", "messageId"].every(key => typeof row[key] === "string"))
+    && (!completed || (validDate(run.completedAt) && Date.parse(run.completedAt) >= Date.parse(run.startedAt)));
+}
+function currentState(value) {
+  // The observation is a rebuildable cache, not business data. Never resume a
+  // cursor or publish counts from retired lanes, old status rules or bad state.
+  if (value?.generation !== GENERATION) return {};
+  const completed = validRun(value.completed, true) ? value.completed : null;
+  if (!completed && !value.run) return {};
+  if (value.run && !validRun(value.run)) return { completed };
+  return { completed, run: value.run || null, nextAt: validDate(value.nextAt) ? value.nextAt : null };
+}
 async function diagnosticsStep({ db }) {
   return runRootCommit(db, async ({ tx }) => {
-    // Skewed creator/message or profile/tag statistics can make PostgreSQL
+    // Skewed creator/message statistics can make PostgreSQL
     // choose a whole-table scan for a LIMIT 1/2 probe. These maintenance lanes
     // deliberately use their existing PK/identity indexes even under that skew.
     await tx.$executeRawUnsafe("SET LOCAL enable_seqscan=off");
@@ -36,7 +56,7 @@ async function diagnosticsStep({ db }) {
     const rows = await tx.$queryRawUnsafe(`SELECT "value",clock_timestamp() AT TIME ZONE 'UTC' AS now
       FROM "SystemSetting" WHERE "key"=$1 FOR UPDATE SKIP LOCKED`, KEY);
     if (!rows.length) return { skipped: "busy" };
-    const now = rows[0].now, state = rows[0].value || {};
+    const now = rows[0].now, state = currentState(rows[0].value);
     if (state.nextAt && new Date(state.nextAt)>now) return { skipped: "not_due" };
     const run = state.run || newRun(now), table = LANES[run.lane];
     if (!table) throw Error("ADMIN_DIAGNOSTICS_INVALID_LANE");
@@ -44,11 +64,7 @@ async function diagnosticsStep({ db }) {
       const last = await tx.$queryRawUnsafe(`SELECT "id" FROM "${table}" ORDER BY "id" DESC LIMIT 1`);
       run.upper = last[0]?.id || "";
     }
-    let page;
-    if (run.lane === 0) page = await tx.$queryRawUnsafe(DELIVERY_PAGE_SQL, run.cursor, run.upper, BATCH);
-    else if (run.lane === 1) page = await tx.$queryRawUnsafe(PROFILE_PAGE_SQL, run.cursor, run.upper, BATCH);
-    else page = await tx.$queryRawUnsafe(`SELECT "id","status" FROM "CrmProfileRawTag"
-      WHERE "id">$1 AND "id"<=$2 ORDER BY "id" LIMIT $3`, run.cursor, run.upper, BATCH);
+    const page = await tx.$queryRawUnsafe(run.lane === 0 ? DELIVERY_PAGE_SQL : BUMP_PAGE_SQL, run.cursor, run.upper, BATCH);
     const cutoff = new Date(run.startedAt).getTime()-3*86400000;
     for (const row of page) {
       if (run.lane === 0) {
@@ -56,16 +72,15 @@ async function diagnosticsStep({ db }) {
           run.counts.delivery_clones++;
           if (run.sample.length<10) run.sample.push({ id:row.id, agencyId:row.agencyId, creatorId:row.creatorId, messageId:row.messageId });
         }
-        if (["pending_reply","checking_reply"].includes(row.status) && new Date(row.sentAt || row.createdAt).getTime()<cutoff) run.counts.stuck_bumps++;
-        if (!row.messageId && ["pending_reply","checking_reply","sent"].includes(row.status)) run.counts.deliveries_no_messageid++;
-      } else if (run.lane === 1 && !row.tagged) run.counts.untagged_profiles++;
-      else if (run.lane === 2 && row.status === "needs_review") run.counts.raw_tags_review++;
+        if (!row.messageId && row.actionType === "SEND_MESSAGE" && row.status === "COMPLETED") run.counts.deliveries_no_messageid++;
+        if (row.status === "RECONCILE_REQUIRED") run.counts.reconcile_required++;
+      } else if (row.pendingMessageId && row.pendingCancelAt && new Date(row.pendingCancelAt).getTime()<cutoff) run.counts.stuck_bumps++;
     }
     run.scanned += page.length;
     if (page.length) run.cursor = page[page.length-1].id;
     if (page.length < BATCH || run.cursor === run.upper) { run.lane++; run.cursor=""; run.upper=null; }
     const complete = run.lane === LANES.length;
-    const next = { ...state, run: complete ? null : run, nextAt: new Date(now.getTime()+(complete?CYCLE_MS:STEP_MS)).toISOString(),
+    const next = { ...state, generation: GENERATION, run: complete ? null : run, nextAt: new Date(now.getTime()+(complete?CYCLE_MS:STEP_MS)).toISOString(),
       ...(complete ? { completed: { ...run, completedAt:now.toISOString() } } : {}) };
     await tx.$executeRawUnsafe(`UPDATE "SystemSetting" SET "value"=$2::jsonb,"updatedAt"=clock_timestamp() WHERE "key"=$1`, KEY, JSON.stringify(next));
     return { processed:page.length, complete, lane:table };
@@ -73,12 +88,13 @@ async function diagnosticsStep({ db }) {
 }
 async function readDiagnostics({ db }) {
   const rows=await db.$queryRawUnsafe(`SELECT "value",clock_timestamp() AT TIME ZONE 'UTC' AS now FROM "SystemSetting" WHERE "key"=$1`,KEY);
-  const state=rows[0]?.value || {}, done=state.completed, progress=state.run;
+  const state=currentState(rows[0]?.value), done=state.completed, progress=state.run;
   const age=done ? Math.max(0,rows[0].now.getTime()-Date.parse(done.completedAt)) : null;
   return { ok:true, checkedAt:done?.completedAt || null,
     coverage: { status:!done?"BUILDING":age>300000?"STALE":"AVAILABLE", mode:"ROLLING_OBSERVATION",
       observationFrom:done?.startedAt || null, observationTo:done?.completedAt || null,
-      scannedRows:done?.scanned || 0, rebuilding:!!progress, progressRows:progress?.scanned || 0, ageMs:age },
+      scannedRows:done?.scanned || 0, rebuilding:!!progress, progressRows:progress?.scanned || 0, ageMs:age,
+      sources:LANES, excluded:[{ source:"CRM", reason:"CRM profiles and tags are currently stored on Desktop; server diagnostics do not inspect them." }] },
     anomalies:SPECS.map(([key,title,level])=>({key,title,level:done?(done.counts[key]>0?level:"ok"):"info",
       count:done?done.counts[key]:null, detail:done?`${done.counts[key]} rows observed during the completed pass`:"Initial check is in progress; no complete result yet",
       ...(key==="delivery_clones"?{sample:done?.sample || []}:{})})) };
@@ -93,4 +109,4 @@ function startAdminDiagnostics({ db, log }) {
   const timer=setInterval(tick,STEP_MS);timer.unref?.();void tick();
   return ()=>{stopped=true;clearInterval(timer);return flight || Promise.resolve();};
 }
-module.exports={KEY,BATCH,DELIVERY_PAGE_SQL,PROFILE_PAGE_SQL,diagnosticsStep,readDiagnostics,startAdminDiagnostics};
+module.exports={KEY,GENERATION,BATCH,DELIVERY_PAGE_SQL,BUMP_PAGE_SQL,diagnosticsStep,readDiagnostics,startAdminDiagnostics};

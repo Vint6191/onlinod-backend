@@ -148,39 +148,9 @@ async function main() {
         await db.agency.update({where:{id:'a'},data:{billingSupportHold:false}});
       });
     } finally {await new Promise(resolve=>http.close(resolve));}
-    const diag=require('../../src/services/admin-diagnostics-service');
-    await db.$executeRawUnsafe(`INSERT INTO "AutomationDelivery" ("id","agencyId","creatorId","originKind","moduleKey","actionType","status","messageId","updatedAt")
-      SELECT 'history-'||lpad(n::text,6,'0'),'a','paid','AUTOMATION','bump','SEND_MESSAGE','COMPLETED',CASE WHEN n<=4 THEN 'duplicate' ELSE 'provider-'||n END,now() FROM generate_series(1,20000) n`);
-    await db.$executeRawUnsafe(`INSERT INTO "CrmProfile" ("id","agencyId","creatorId","fanId","updatedAt") VALUES ('p1','a','paid','1',now()),('p2','a','paid','2',now())`);
-    await db.$executeRawUnsafe(`INSERT INTO "CrmProfileTag" ("id","agencyId","profileId","tagKey","label","updatedAt") VALUES ('t','a','p1','tag','tag',now())`);
-    await db.$executeRawUnsafe(`INSERT INTO "CrmProfileRawTag" ("id","agencyId","profileId","rawLabel") VALUES ('raw','a','p1','test')`);
-    const due=()=>db.$executeRawUnsafe(`UPDATE "SystemSetting" SET "value"=jsonb_set("value",'{nextAt}','"2000-01-01T00:00:00Z"') WHERE "key"=$1`,diag.KEY);
-    await check('GET initially reports incomplete coverage rather than a false clean result',async()=>{const r=await diag.readDiagnostics({db});assert.equal(r.coverage.status,'BUILDING');assert.equal(r.anomalies[0].count,null);});
-    await check('diagnostic first step is bounded and throttled across replicas by durable state',async()=>{
-      const result=await diag.diagnosticsStep({db});assert.equal(result.processed,500);assert.equal((await diag.diagnosticsStep({db})).skipped,'not_due');
-      assert.equal((await diag.readDiagnostics({db})).coverage.progressRows,500);
-    });
-    await check('failed cursor persistence rolls back the whole step and restart continues it',async()=>{
-      await due();const before=(await db.systemSetting.findUnique({where:{key:diag.KEY}})).value;
-      const failed={$transaction:(work,options)=>db.$transaction(tx=>work(new Proxy(tx,{get(target,key){if(key==='$executeRawUnsafe')return async(sql,...args)=>{if(sql.startsWith('UPDATE "SystemSetting"'))throw Error('checkpoint fault');return target.$executeRawUnsafe(sql,...args);};return Reflect.get(target,key);}})),options)};
-      await assert.rejects(()=>diag.diagnosticsStep({db:failed}),/checkpoint fault/);
-      assert.deepEqual((await db.systemSetting.findUnique({where:{key:diag.KEY}})).value,before);
-      assert.equal((await diag.diagnosticsStep({db})).processed,500);
-    });
-    await check('all historical pages complete without truncating duplicate, CRM or raw-tag evidence',async()=>{
-      let step;for(let n=0;n<50;n++){await due();step=await diag.diagnosticsStep({db});assert.ok(step.processed<=500);if(step.complete)break;}assert.ok(step.complete);
-      const r=await diag.readDiagnostics({db});assert.equal(r.coverage.status,'AVAILABLE');assert.equal(r.coverage.scannedRows,20003);
-      const counts=Object.fromEntries(r.anomalies.map(a=>[a.key,a.count]));assert.equal(counts.delivery_clones,4);assert.equal(counts.untagged_profiles,1);assert.equal(counts.raw_tags_review,1);
-      let reads=0;await diag.readDiagnostics({db:{$queryRawUnsafe:async(...args)=>{reads++;assert.match(args[0],/FROM "SystemSetting"/);return db.$queryRawUnsafe(...args);}}});assert.equal(reads,1);
-    });
-    await check('completed result remains visible while a new pass is running',async()=>{await due();await diag.diagnosticsStep({db});const r=await diag.readDiagnostics({db});assert.equal(r.coverage.rebuilding,true);assert.equal(r.anomalies[0].count,4);});
-    await check('bounded page uses indexed duplicate probes on a 20000-row history',async()=>{
-      await db.$executeRawUnsafe('ANALYZE "AutomationDelivery"');
-      const plan=await db.$queryRawUnsafe('EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) '+diag.DELIVERY_PAGE_SQL,'','history-020000',500);
-      const nodes=[];function walk(n){if(!n || typeof n!=='object')return;if(n['Node Type'])nodes.push(n);for(const v of Object.values(n))if(Array.isArray(v))v.forEach(walk);else if(v && typeof v==='object')walk(v);}walk(plan);
-      assert.ok(nodes.some(n=>(n['Index Name']||'').includes('creatorId_messageId')));
-      assert.ok(!nodes.some(n=>n['Relation Name']==='AutomationDelivery' && n['Node Type']==='Seq Scan'));
-      const out=process.env.PHASE4_PROOF_OUTPUT;if(out)fs.writeFileSync(path.join(out,'admin-diagnostics-explain.json'),JSON.stringify(plan,null,2));
+    await check('current diagnostics use the maintained current-schema SQL proof', async () => {
+      const result = await require('./current-admin-diagnostics-proof.cjs').main();
+      assert.equal(result.ok, true);
     });
     console.log(JSON.stringify({ ok: true, passed: cases.length, cases, engine: "PGlite with Prisma 5.22", nativeConcurrency: false, productionScale: false }));
   } finally { gate?._test.reset(); await db.$disconnect(); await server.stop(); await engine.close(); }

@@ -156,3 +156,13 @@ The reproducible clean-install SQL proof is `npm run test:database`; see
 `npm run test:database-overlay` additionally verifies mixed migration directories,
 repeat installation, CRLF files, default rejection of an existing old database,
 explicit test reset and preservation of current data when the option is repeated.
+
+`npm run test:admin-diagnostics` checks the full bounded diagnostic pass against
+the current schema, including restart of an obsolete cached cursor, current
+delivery states and pending bump cleanup. CRM profiles/tags currently live on
+Desktop and are explicitly outside server diagnostic coverage. Sending and later
+deleting the same message are different operations, not duplicate sends.
+`npm run test:server-startup` launches the real server on a disposable database,
+observes normal background timers through the first recurring sweep, checks HTTP
+health/readiness, stops cleanly and restarts with the same data. Both proofs use
+ONLINOD_SQL_PROOF_RUNTIME and never connect to the application's DATABASE_URL.
