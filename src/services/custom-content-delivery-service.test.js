@@ -46,6 +46,9 @@ function fixture() {
           if (where?.creatorId?.in && !where.creatorId.in.includes(item.creatorId)) return false;
           if (where?.creatorId && typeof where.creatorId === "string" && item.creatorId !== where.creatorId) return false;
           if (where?.ofMediaIds?.hasSome && !where.ofMediaIds.hasSome.some((id) => item.ofMediaIds.includes(String(id)))) return false;
+          if (where?.OR && !where.OR.some((part) => part.reviewedAt?.gt
+            ? +item.reviewedAt > +part.reviewedAt.gt
+            : +item.reviewedAt === +part.reviewedAt && String(item.id) > String(part.id.gt))) return false;
           return true;
         });
         const specs = Array.isArray(orderBy) ? orderBy : [orderBy];
@@ -174,8 +177,13 @@ test("ready queue reaches an eligible delivery after more than 2000 poisoned APP
   const liveOrder = { ...order, id: "reachable-ready-order", dialogId: "88888" };
   rows.push({ ...row, id: "reachable-ready", customOrderId: liveOrder.id, customOrder: liveOrder, telegramMessageIds: [888888], ofMediaIds: ["888888"], executionPinnedAt: new Date(base + 3000), executionVaultFolderId: "folder-77", ...receipt("folder-77", 1, ["888888"], new Date(base + 3000)), reviewedAt: new Date(base + 3000) });
   assets.push({ creatorId: "creator-1", mediaId: "888888", source: "CUSTOM", customOrderId: "reachable-ready-order", customSubmissionId: "reachable-ready", customFullPriceCents: 6000, mediaType: "video", thumbUrl: null, previewUrl: null, fullUrl: null, folderIds: ["folder-77"], catalogActive: true, sortingStatus: "SORTED" });
-  const result = await listCustomReadyDeliveries({ agencyId: "agency-1", member, db, limit: 1 });
-  assert.deepEqual(result.items.map((item) => item.submissionId), ["reachable-ready"]);
+  const found = []; let cursor = null, requests = 0;
+  do {
+    const result = await listCustomReadyDeliveries({ agencyId: "agency-1", member, db, limit: 1, cursor });
+    found.push(...result.items.map((item) => item.submissionId)); cursor = result.nextCursor;
+    assert(++requests < 10, "bounded continuation must eventually finish through poisoned history");
+  } while (cursor);
+  assert.deepEqual(found, ["reachable-ready"]);
 });
 
 test("READY fails closed when a current-receipt CUSTOM asset loses the pinned folder projection", async () => {

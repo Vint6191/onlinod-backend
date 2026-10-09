@@ -1,5 +1,6 @@
 "use strict";
 
+const { createHash } = require("node:crypto");
 const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
 const { isCompleteSubmission, uniqueMediaIds } = require("./custom-content-library-service");
@@ -8,6 +9,8 @@ const { resolveCustomMediaProvenance, classifyProgrammaticCustomMediaProvenance 
 const { hasCurrentVaultSettlement, customAssetMatchesPipelineProjection, derivePipelineStage } = require("./custom-content-pipeline-authority-service");
 
 const CUSTOM_DELIVERY_OVERDUE_MS = 2 * 60 * 60 * 1000;
+const READY_SCAN_BATCH = 200;
+const READY_SCAN_BUDGET = 600;
 
 function fail(code, message, status = 400) { return Object.assign(new Error(message), { code, status }); }
 function clean(value, max = 500) { return String(value == null ? "" : value).trim().slice(0, max); }
@@ -15,6 +18,37 @@ function scopeWhere(scope) {
   if (scope?.broad) return {};
   const ids = Array.isArray(scope?.creatorIds) ? scope.creatorIds.map(String).filter(Boolean) : [];
   return { creatorId: { in: ids.length ? ids : ["__none__"] } };
+}
+
+function readyCursorScope(agencyId, member, scope) {
+  return createHash("sha256").update(JSON.stringify([String(agencyId), String(member.id),
+    scope?.broad === true ? "all" : [...new Set((scope?.creatorIds || []).map(String))].sort()])).digest("hex").slice(0, 32);
+}
+function readyCursor(row, scopeKey) {
+  return "ready1." + Buffer.from(JSON.stringify({ s: scopeKey, t: new Date(row.reviewedAt).toISOString(), i: String(row.id) })).toString("base64url");
+}
+async function parseReadyCursor(cursor, scopeKey, client, where) {
+  if (cursor == null || cursor === "") return null;
+  if (typeof cursor !== "string" || cursor.length > 1024) throw fail("CUSTOM_DELIVERY_CURSOR_INVALID", "Invalid ready-delivery continuation", 400);
+  if (!cursor.startsWith("ready1.")) {
+    // Rolling deployment: resolve old row-id cursors under the current access
+    // predicate. A disappeared anchor must request a restart, never a false EOF.
+    if (!cursor.trim() || cursor.length > 180) throw fail("CUSTOM_DELIVERY_CURSOR_INVALID", "Invalid legacy ready-delivery continuation", 400);
+    const row = await client.customContentSubmission.findFirst({ where: { ...where, id: cursor }, select: { id: true, reviewedAt: true } });
+    if (!row?.reviewedAt) throw fail("CUSTOM_DELIVERY_CURSOR_STALE", "Ready-delivery continuation must restart", 409);
+    return { id: String(row.id), reviewedAt: new Date(row.reviewedAt) };
+  }
+  let parsed;
+  try {
+    const encoded = cursor.slice(7);
+    if (!/^[A-Za-z0-9_-]+$/.test(encoded)) throw new Error("encoding");
+    parsed = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+    if (!parsed || typeof parsed.i !== "string" || !parsed.i || parsed.i.length > 180
+        || typeof parsed.s !== "string" || typeof parsed.t !== "string"
+        || !Number.isFinite(Date.parse(parsed.t)) || new Date(parsed.t).toISOString() !== parsed.t) throw new Error("shape");
+  } catch { throw fail("CUSTOM_DELIVERY_CURSOR_INVALID", "Invalid ready-delivery continuation", 400); }
+  if (parsed.s !== scopeKey) throw fail("CUSTOM_DELIVERY_CURSOR_STALE", "Ready-delivery access scope changed; restart discovery", 409);
+  return { id: parsed.i, reviewedAt: new Date(parsed.t) };
 }
 
 async function requireDeliveryAccess({ agencyId, member, db }) {
@@ -144,28 +178,29 @@ async function listCustomReadyDeliveries({ agencyId, member, limit = 100, cursor
   const take = Math.max(1, Math.min(100, Math.floor(Number(limit) || 100)));
   const items = [];
   const serverNow = new Date();
-  let scanCursor = clean(cursor, 180) || null;
-  const seenCursors = new Set();
-
-  while (items.length < take) {
-    if (scanCursor && seenCursors.has(scanCursor)) throw fail("CUSTOM_DELIVERY_CURSOR_LOOP", "Ready-delivery cursor did not advance", 500);
-    if (scanCursor) seenCursors.add(scanCursor);
+  const where = {
+    agencyId, pipelineDisposition: "ACTIVE", reviewStatus: "APPROVED", reviewedAt: { not: null },
+    customOrderId: { not: null }, customOrder: { is: { type: "CONTENT", status: "PENDING", fanDeliveredAt: null } },
+    ...scopeWhere(scope),
+  };
+  const scopeKey = readyCursorScope(agencyId, member, scope);
+  let position = await parseReadyCursor(cursor, scopeKey, client, where);
+  let nextCursor = null;
+  let scanned = 0;
+  const response = (next) => ({ ok: true, items, count: items.length, nextCursor: next, serverNow: serverNow.toISOString() });
+  while (items.length < take && scanned < READY_SCAN_BUDGET) {
+    const batchSize = Math.min(READY_SCAN_BATCH, READY_SCAN_BUDGET - scanned);
     const rows = await client.customContentSubmission.findMany({
       where: {
-        agencyId,
-        pipelineDisposition: "ACTIVE",
-        reviewStatus: "APPROVED",
-        reviewedAt: { not: null },
-        customOrderId: { not: null },
-        customOrder: { is: { type: "CONTENT", status: "PENDING", fanDeliveredAt: null } },
-        ...scopeWhere(scope),
+        ...where,
+        ...(position ? { OR: [{ reviewedAt: { gt: position.reviewedAt } },
+          { reviewedAt: position.reviewedAt, id: { gt: position.id } }] } : {}),
       },
       include: DELIVERY_INCLUDE,
       orderBy: [{ reviewedAt: "asc" }, { id: "asc" }],
-      take: 200,
-      ...(scanCursor ? { cursor: { id: scanCursor }, skip: 1 } : {}),
+      take: batchSize,
     });
-    if (!rows.length) return { ok: true, items, count: items.length, nextCursor: null, serverNow: serverNow.toISOString() };
+    if (!rows.length) return response(null);
 
     const candidates = rows.filter((row) => row.customOrder
       && String(row.customOrder.type || "") === "CONTENT"
@@ -176,17 +211,25 @@ async function listCustomReadyDeliveries({ agencyId, member, limit = 100, cursor
     const candidateIds = new Set(candidates.map((row) => String(row.id)));
 
     for (const row of rows) {
-      scanCursor = String(row.id);
+      const nextPosition = { id: String(row.id), reviewedAt: new Date(row.reviewedAt) };
+      if (position && (+nextPosition.reviewedAt < +position.reviewedAt
+          || (+nextPosition.reviewedAt === +position.reviewedAt && nextPosition.id <= position.id))) {
+        throw fail("CUSTOM_DELIVERY_CURSOR_LOOP", "Ready-delivery cursor did not advance", 500);
+      }
+      position = nextPosition;
+      nextCursor = readyCursor(row, scopeKey);
+      scanned += 1;
       if (candidateIds.has(String(row.id)) && isReady(row, assets)) items.push(serializeDelivery(row, assets, serverNow));
       if (items.length >= take) {
-        // Cursor is the last row actually inspected, never the end of the fetched
-        // batch. This keeps later eligible rows reachable across API pages.
-        return { ok: true, items, count: items.length, nextCursor: scanCursor, serverNow: serverNow.toISOString() };
+        // Carry values from the last inspected row, never a live row dependency.
+        return response(nextCursor);
       }
     }
-    if (rows.length < 200) return { ok: true, items, count: items.length, nextCursor: null, serverNow: serverNow.toISOString() };
+    if (rows.length < batchSize) return response(null);
   }
-  return { ok: true, items, count: items.length, nextCursor: scanCursor, serverNow: serverNow.toISOString() };
+  // An empty page with continuation is unfinished inspection, not an empty
+  // queue. Bounded readers must resume it, including through poisoned history.
+  return response(nextCursor);
 }
 
 async function getCustomReadyDelivery({ agencyId, member, customOrderId, db = null } = {}) {
