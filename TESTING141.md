@@ -58,3 +58,13 @@ npm run test:all
 Проверяются десять разделов Automation, шаблон Bump и переключение модели, live presence -> Bump -> история, pause/resume во время preflight, Follow Back, Likes discovery/execution, Refollow, полный SFS discovery/follow/scan/comment/like/unfollow, сохранение cleanup при паузе, потеря подтверждения complete, readback неизвестного send, продолжение очереди после сверки и SIGKILL Backend. Выборка готовых задач проверяется в UTC, Europe/Kyiv и America/New_York. Штатные паузы и сроки не подменяются; общий предел — 600 секунд. Вывод: `evidence/automation-acceptance`, включая JSON, журналы и снимки интерфейса.
 
 OF и нативные Electron-порты контролируются стендом: настоящих отправок нет. Проверка не подтверждает нативный Windows/Electron, настоящий OF или многосессионную конкуренцию PostgreSQL. Команда не нужна на Render; обычная сборка остаётся `npm install && npm run prisma:migrate`.
+
+## Связанный Subscriber Directory / FanData / UI (160)
+
+`npm run test:subscriber-acceptance` использует те же изолированные SQL/browser runtime и переменные окружения, что Automation159. Нужен Node22 и совместимый `better-sqlite3`. Стенд не использует DATABASE_URL приложения и не создаёт начальные строки Subscriber/FanData напрямую.
+
+Настоящие React-компоненты, CreatorService/bootstrap, SubscriberDirectoryService, management journal, BackendReadonlyJobWorker, обработчики subscriber scan/point refresh, SQLite WorkCoordinator и BackendActionWorker обращаются к текущему Backend/Prisma/SQL. Контролируются только физические OF-ответы и native capability/session-reconcile порты.
+
+Сценарии:225 подписчиков / три страницы; остановка и повторное открытие SQLite между страницами; атомарная видимость опубликованного списка; неизвестные деньги и generic isActive; UI Ignore/Block; смена состава при rescan; потеря progress/complete ACK; обновление имени/суммы и поиск/сортировка по текущим данным; изменение допуска Bump во время preflight; Backend SIGKILL; изоляция моделей; явный пустой terminal source. Обычные паузы и lease-сроки не подменяются. Предел600 секунд. Результат — `evidence/subscriber-acceptance` (JSON, журналы, снимки UI).
+
+Это локальная связанная проверка с одним физическим SQL-сеансом PGlite. Настоящие Windows/Electron, OF и многосессионная конкуренция PostgreSQL ею не подтверждаются. Команда только для разработки; Render build остаётся `npm install && npm run prisma:migrate`.

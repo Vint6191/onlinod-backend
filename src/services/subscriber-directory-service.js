@@ -509,15 +509,18 @@ async function projectHiddenOnlineChunk(db, run, itemIds, now) {
       "totalSpentCents" = EXCLUDED."totalSpentCents",
       "status" = CASE WHEN "HiddenOnlineUser"."status" IN ('ignored', 'blocked') THEN "HiddenOnlineUser"."status" ELSE 'active' END,
       "signals" = EXCLUDED."signals",
-      "metadata" = COALESCE("HiddenOnlineUser"."metadata", '{}'::jsonb) || EXCLUDED."metadata",
+      "metadata" = (COALESCE("HiddenOnlineUser"."metadata", '{}'::jsonb) - 'removedByScanRunId') || EXCLUDED."metadata",
       "lastSignalAt" = EXCLUDED."lastSignalAt", "updatedAt" = EXCLUDED."updatedAt"
     `,
     run.id, now, itemIds,
   );
+  // Membership belongs to the published SubscriberScanItem cohort. The status
+  // here belongs to operator overrides (active/ignored/blocked); a scan must
+  // never encode source disappearance as a fourth operator status.
   await db.$executeRawUnsafe(
     `
     UPDATE "HiddenOnlineUser" h
-    SET "status" = 'removed', "updatedAt" = $4,
+    SET "updatedAt" = $4,
         "metadata" = COALESCE(h."metadata", '{}'::jsonb) || jsonb_build_object('removedByScanRunId', $1)
     FROM "SubscriberScanItem" i
     WHERE i."runId" = $1 AND i."id" = ANY($2::text[]) AND i."lastSeenIsNull" = false
@@ -532,7 +535,7 @@ async function markHiddenOnlineDisappeared(db, run, fanIds, now) {
   await db.$executeRawUnsafe(
     `
     UPDATE "HiddenOnlineUser"
-    SET "status" = 'removed', "updatedAt" = $4,
+    SET "updatedAt" = $4,
         "metadata" = COALESCE("metadata", '{}'::jsonb) || jsonb_build_object('removedByScanRunId', $1)
     WHERE "agencyId" = $2 AND "creatorId" = $3 AND "fanId" = ANY($5::text[]) AND "status" = 'active'
     `,
@@ -1666,15 +1669,21 @@ async function listHiddenOnline({
   const skip = integer(offset, 0, 0, 10_000_000);
   const orderSql =
     sort === "name"
-      ? `COALESCE(i."name", i."username", i."fanId") ASC, i."fanId" ASC`
+      ? `COALESCE(f."displayName", i."name", f."username", i."username", i."fanId") ASC, i."fanId" ASC`
       : sort === "recent"
         ? `i."observedAt" DESC, i."fanId" ASC`
-        : `i."totalSpentCents" DESC, i."observedAt" DESC, i."fanId" ASC`;
+        : `(CASE WHEN v."availability" = 'AVAILABLE' THEN v."totalNetCents" ELSE NULL END) DESC NULLS LAST, i."observedAt" DESC, i."fanId" ASC`;
 
   // Join the compact override table in SQL. Avoid loading every ignored/blocked
   // fan into memory or producing a huge NOT IN list for large creator accounts.
+  // Filter/order the canonical fields before LIMIT/OFFSET, matching the current
+  // identity and value returned below. The snapshot owns cohort membership only.
   const baseSql = `
     FROM "SubscriberScanItem" i
+    LEFT JOIN "CreatorFan" f
+      ON f."agencyId" = $2 AND f."creatorId" = $3 AND f."onlyFansUserId" = i."fanId"
+    LEFT JOIN "CreatorFanValueCurrent" v
+      ON v."agencyId" = $2 AND v."creatorId" = $3 AND v."fanId" = f."id"
     LEFT JOIN "HiddenOnlineUser" h
       ON h."agencyId" = $2 AND h."creatorId" = $3 AND h."fanId" = i."fanId"
     WHERE i."runId" = $1
@@ -1682,8 +1691,8 @@ async function listHiddenOnline({
       AND ($4 = 'all' OR (CASE WHEN h."status" IN ('ignored', 'blocked') THEN h."status" ELSE 'active' END) = $4)
       AND (
         $5 = '' OR i."fanId" ILIKE ('%' || $5 || '%')
-        OR COALESCE(i."username", '') ILIKE ('%' || $5 || '%')
-        OR COALESCE(i."name", '') ILIKE ('%' || $5 || '%')
+        OR COALESCE(f."username", i."username", '') ILIKE ('%' || $5 || '%')
+        OR COALESCE(f."displayName", i."name", '') ILIKE ('%' || $5 || '%')
       )`;
 
   const [rows, countRows] = await Promise.all([
