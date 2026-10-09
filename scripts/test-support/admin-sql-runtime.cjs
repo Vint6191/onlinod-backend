@@ -3,7 +3,7 @@
 const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
 const { createRequire } = require("node:module");
 const { PrismaClient } = require("@prisma/client");
-async function createAdminSqlRuntime({ runtimePath } = {}) {
+async function createAdminSqlRuntime({ runtimePath, maxConnections = 1 } = {}) {
   if (!runtimePath) throw Error("An explicit local proof runtime is required");
   const root = path.resolve(__dirname, "../..");
   const load = createRequire(path.resolve(runtimePath, "package.json"));
@@ -19,7 +19,7 @@ async function createAdminSqlRuntime({ runtimePath } = {}) {
       finished_at timestamptz, migration_name varchar(255) NOT NULL, logs text, rolled_back_at timestamptz,
       started_at timestamptz NOT NULL DEFAULT now(), applied_steps_count integer NOT NULL DEFAULT 0)`);
     await engine.query('INSERT INTO "_prisma_migrations"(id,checksum,migration_name,finished_at,applied_steps_count) VALUES($1,$2,$3,now(),1)', [crypto.randomUUID(),contract.checksum,contract.migration]);
-    server = new PGLiteSocketServer({ db: engine, host: "127.0.0.1", port: 0 });
+    server = new PGLiteSocketServer({ db: engine, host: "127.0.0.1", port: 0, maxConnections });
     server.addEventListener("connection", () => { engine.exec("DISCARD ALL").catch(() => {}); });
     await server.start();
     const url = `postgresql://postgres:postgres@${server.getServerConn()}/postgres?connection_limit=1&sslmode=disable`;

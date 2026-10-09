@@ -290,7 +290,7 @@ test("custom order create is creator-scoped and starts pending", async () => {
   assert.deepEqual(result.order.mediaIds, []);
   assert.equal(result.order.createdBy.name, "Chatter");
   assert.equal("agencyId" in result.order, false);
-  assert.equal("creatorId" in result.order, false);
+  assert.equal(result.order.creatorId, "creator-1");
   assert.equal("createdByMemberId" in result.order, false);
   await assert.rejects(() => createCustomOrder({ agencyId: "agency-1", member, input: withCreateIntent({ creatorId: "creator-2", dialogId: "1", scenario: "x" }), db: commitDatabaseFixture(db) }), error => error?.code === "CUSTOM_MANAGEMENT_CREATOR_ACCESS_FORBIDDEN");
 });

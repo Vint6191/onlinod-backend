@@ -192,7 +192,7 @@ function serializeOrder(row, now = new Date()) {
     ? contentDueMs !== null && contentDueMs >= 0 && contentDueMs <= DUE_SOON_MS
     : type === "CALL" ? call.callPhase === "DUE" || (call.callPhase === "UPCOMING" && callDueMs !== null && callDueMs <= DUE_SOON_MS) : false);
   return {
-    id: String(row.id), clientMutationId: row.clientMutationId == null ? null : String(row.clientMutationId), dialogId: String(row.dialogId), scenario: String(row.scenario || ""), internalNote: row.internalNote || null,
+    id: String(row.id), creatorId: String(row.creatorId), clientMutationId: row.clientMutationId == null ? null : String(row.clientMutationId), dialogId: String(row.dialogId), scenario: String(row.scenario || ""), internalNote: row.internalNote || null,
     type,
     contentKind: type === "CONTENT" ? normalizeContentKind(row.contentKind || "BOTH") : null,
     status,
