@@ -79,3 +79,12 @@ OF и нативные Electron-порты контролируются стен
 Отдельная SQL-проверка публикации: `node scripts/audit/current-publication-quantum-proof.cjs` с `ONLINOD_SQL_PROOF_RUNTIME` и `ONLINOD_SQL_PROOF_OUTPUT`. Проверяет 201 день, ограниченный квант публикации, однодневную публикацию за один допуск, Home и чтение опубликованных earnings в UTC, UTC+3 и America/New_York, а также отсутствие сумм в выдаче без money-доступа. Результат — `evidence/publication-quantum.json`.
 
 Контролируются физические OF-ответы и native capability/session-reconcile порты. Реальных внешних записей нет. Используется один SQL-сеанс PGlite; нативные Windows/Electron, OF и многосессионная конкуренция PostgreSQL остаются отдельной целевой приёмкой. Эти команды нужны только разработчику; обычный Render build остаётся `npm install && npm run prisma:migrate`.
+
+
+## Message Library / Vault / Media (162)
+
+`npm run test:media-acceptance` запускает настоящий HQ editor, общий media picker, Scripts sidecar, dialog picker и Vault Dashboard в Chromium. Desktop-службы, журнал команд, SQLite coordinator, readonly worker, HTTP/Prisma и текущая SQL-схема выполняются без подмены. Нужны Node22 и те же `ONLINOD_DESKTOP_ROOT`, `ONLINOD_SQL_PROOF_RUNTIME`, `ONLINOD_BROWSER_RUNTIME`, `ONLINOD_CHROMIUM_PATH`, `ONLINOD_SQL_PROOF_OUTPUT`, что в 161. Результаты и снимки — `evidence/media-acceptance`.
+
+Стенд проверяет создание цепочки из двух сообщений, медиа из Vault, цену/locked text, свежие дескрипторы перед вставкой, нативные orderId и FREE/PAID, многострочный contenteditable, платный текст без медиа, откат ошибки и отмену, папки после первой страницы и служебную All media, metadata search, потерянный ответ сохранения и повторное открытие журнала, корзину/восстановление/удаление, две модели, обычный upload/relay с повтором, полный каталог, идемпотентные агрегаты использования, Vault metadata editor и Backend SIGKILL. Никакие сообщения фанатам не отправляются.
+
+Физические OF/S3 и нативный Vue/Electron являются контролируемыми границами; upload-порт возвращает подготовленный дескриптор, а native composer fixture создаёт orderId. Повтор upload проверяет стабильный preparationId и один relay-send; это не отдельная проверка физического S3. Local usage source — контролируемый агрегированный снимок, без raw chats. Сохраняются отдельные целевые проверки настоящих Windows/Electron, OF/S3 и многосессионного PostgreSQL. Используется один SQL-сеанс PGlite, без production-доступа. Render build остаётся `npm install && npm run prisma:migrate`; добавлять приёмочный стенд в сборку не нужно.
