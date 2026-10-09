@@ -427,8 +427,8 @@ router.get("/message-library/scripts", async (req, res) => {
     const [items, count] = await Promise.all([
       prisma.contentCollection.findMany({
         where,
-        include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }] } },
-        orderBy: [{ updatedAt: "desc" }],
+        include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }, { id: "asc" }] } },
+        orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
         take,
         skip,
       }),
@@ -447,6 +447,32 @@ router.get("/message-library/scripts", async (req, res) => {
     });
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_SCRIPTS_FAILED");
+  }
+});
+
+router.get("/message-library/scripts/:id", async (req, res) => {
+  try {
+    const creatorId = await requireMessageLibraryCreator(req);
+    const scriptId = typeof req.params.id === "string" ? req.params.id.trim() : "";
+    if (!scriptId || scriptId.length > 120) {
+      return res.status(400).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_ID_INVALID", error: "A valid script identity is required" });
+    }
+    const item = await prisma.contentCollection.findFirst({
+      where: {
+        agencyId: req.auth.agencyId, creatorId, kind: MESSAGE_LIBRARY_KIND,
+        deletedAt: null, status: { notIn: ["trash", "deleted", "deleting"] },
+        OR: [{ clientId: scriptId }, { id: scriptId, clientId: null }],
+      },
+      include: { blocks: {
+        where: { deletedAt: null, status: { notIn: ["trash", "deleted"] } },
+        orderBy: [{ order: "asc" }, { id: "asc" }], take: 501,
+      } },
+    });
+    if (!item) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
+    if (item.blocks.length > 500) return res.status(413).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_LIMIT", error: "Script has more than 500 active messages" });
+    return res.json({ ok: true, source: "server", creatorId, item: scriptFromCollection(item) });
+  } catch (err) {
+    return sendError(res, err, "MESSAGE_LIBRARY_SCRIPT_FAILED");
   }
 });
 

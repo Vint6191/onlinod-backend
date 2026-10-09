@@ -93,6 +93,76 @@ function baseDb() {
   };
 }
 
+test("list ordering has a stable tie breaker for scripts and message blocks", async () => {
+  const db = baseDb(); let query;
+  db.contentCollection.findMany = async args => { query = args; return []; };
+  const api = loadRoute(db), res = response();
+  await api.route("GET", "/message-library/scripts")({ auth: auth(), query: { creatorId: "creator-1" } }, res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(query.orderBy, [{ updatedAt: "desc" }, { id: "desc" }]);
+  assert.deepEqual(query.include.blocks.orderBy, [{ order: "asc" }, { createdAt: "asc" }, { id: "asc" }]);
+});
+
+test("exact script read is scoped and returns the active script without a collection scan", async () => {
+  const db = baseDb(); let lookup;
+  db.contentCollection.findMany = async () => { throw new Error("unexpected collection scan"); };
+  db.contentCollection.count = async () => { throw new Error("unexpected count"); };
+  db.contentCollection.findFirst = async args => { lookup = args; return { id: "server-script-1", clientId: "script-1", creatorId: "creator-1", blocks: [{ id: "b", clientId: "message-1", text: "exact text", status: "active" }] }; };
+  const api = loadRoute(db), res = response();
+  await api.route("GET", "/message-library/scripts/:id")({ auth: auth(), params: { id: "script-1" }, query: { creatorId: "creator-1" } }, res);
+  assert.equal(res.statusCode, 200); assert.equal(res.body.item.id, "script-1"); assert.equal(res.body.item.messages[0].text, "exact text");
+  assert.equal(lookup.where.agencyId, "agency-1"); assert.equal(lookup.where.creatorId, "creator-1"); assert.equal(lookup.where.kind, "message_library_script");
+  assert.deepEqual(lookup.where.status, { notIn: ["trash", "deleted", "deleting"] }); assert.equal(lookup.where.deletedAt, null);
+  assert.deepEqual(lookup.where.OR, [{ clientId: "script-1" }, { id: "script-1", clientId: null }]);
+  assert.equal(lookup.include.blocks.take, 501);
+  assert.deepEqual(lookup.include.blocks.where, { deletedAt: null, status: { notIn: ["trash", "deleted"] } });
+});
+
+test("exact script read returns a specific missing result", async () => {
+  const api = loadRoute(baseDb()), res = response();
+  await api.route("GET", "/message-library/scripts/:id")({ auth: auth(), params: { id: "missing" }, query: { creatorId: "creator-1" } }, res);
+  assert.equal(res.statusCode, 404); assert.equal(res.body.code, "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND");
+});
+
+test("exact script read cannot use the endpoint without creator access", async () => {
+  const db = baseDb(); let reads = 0;
+  db.creatorAccount.findFirst = async () => null;
+  db.contentCollection.findFirst = async () => { reads++; return null; };
+  const api = loadRoute(db), res = response();
+  await api.route("GET", "/message-library/scripts/:id")({ auth: auth(), params: { id: "script-1" }, query: { creatorId: "creator-1" } }, res);
+  assert.ok(res.statusCode >= 400); assert.equal(reads, 0);
+});
+
+test("exact script read requires an explicit creator", async () => {
+  const api = loadRoute(baseDb()), res = response();
+  await api.route("GET", "/message-library/scripts/:id")({ auth: auth(), params: { id: "script-1" }, query: {} }, res);
+  assert.equal(res.statusCode, 400); assert.equal(res.body.code, "CREATOR_ID_MISSING");
+});
+
+test("exact script read rejects an oversized identity instead of truncating it", async () => {
+  const db = baseDb(); let reads = 0;
+  db.contentCollection.findFirst = async () => { reads++; return null; };
+  const api = loadRoute(db), res = response();
+  await api.route("GET", "/message-library/scripts/:id")({ auth: auth(), params: { id: "x".repeat(121) }, query: { creatorId: "creator-1" } }, res);
+  assert.equal(res.statusCode, 400); assert.equal(reads, 0);
+});
+
+test("an oversized exact script is reported instead of building a truncated draft", async () => {
+  const db = baseDb();
+  db.contentCollection.findFirst = async () => ({ id: "s1", clientId: "script-1", creatorId: "creator-1", blocks: Array.from({ length: 501 }, (_, i) => ({ id: `b${i}`, text: "text" })) });
+  const api = loadRoute(db), res = response();
+  await api.route("GET", "/message-library/scripts/:id")({ auth: auth(), params: { id: "script-1" }, query: { creatorId: "creator-1" } }, res);
+  assert.equal(res.statusCode, 413); assert.equal(res.body.code, "MESSAGE_LIBRARY_SCRIPT_LIMIT");
+});
+
+test("exact script read accepts all 500 permitted messages", async () => {
+  const db = baseDb();
+  db.contentCollection.findFirst = async () => ({ id: "s1", clientId: "script-1", creatorId: "creator-1", blocks: Array.from({ length: 500 }, (_, i) => ({ id: `b${i}`, order: i, text: `text${i}` })) });
+  const api = loadRoute(db), res = response();
+  await api.route("GET", "/message-library/scripts/:id")({ auth: auth(), params: { id: "script-1" }, query: { creatorId: "creator-1" } }, res);
+  assert.equal(res.statusCode, 200); assert.equal(res.body.item.messages.length, 500); assert.equal(res.body.item.messages[499].text, "text499");
+});
+
 test("script listing returns lockedText and authoritative pagination", async () => {
   const db = baseDb();
   db.contentCollection.findMany = async (args) => {
