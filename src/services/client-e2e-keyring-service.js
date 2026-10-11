@@ -201,17 +201,6 @@ function cryptoIdentityWhere(agencyId, deviceId) {
   return { agencyId_deviceId: { agencyId, deviceId } };
 }
 
-async function requireRegisteredDevice({ db, agencyId, userId, deviceId }) {
-  const id = clean(deviceId, 180);
-  if (!id) throw codedError("CRYPTO_DEVICE_REQUIRED", "Registered deviceId is required", 400);
-  const device = await db.workerDevice.findFirst({
-    where: { id, agencyId, userId },
-    select: { id: true, agencyId: true, userId: true, deviceName: true, platform: true, appVersion: true, lastSeenAt: true },
-  });
-  if (!device) throw codedError("CRYPTO_DEVICE_NOT_REGISTERED", "This device is not registered for the current user and agency", 403);
-  return device;
-}
-
 async function requireCryptoIdentityForUser({ db, agencyId, userId, deviceId, requireActive = false }) {
   const id = clean(deviceId, 180);
   if (!id) throw codedError("CRYPTO_DEVICE_REQUIRED", "Registered deviceId is required", 400);
@@ -430,39 +419,45 @@ async function revokeOwnerRootAccessForMember({ db, agencyId, userId, revokedAt 
 }
 
 async function registerDeviceIdentity({ db, agencyId, userId, deviceId, publicKey }) {
-  const device = await requireRegisteredDevice({ db, agencyId, userId, deviceId });
+  const id = clean(deviceId, 180);
+  if (!id) throw codedError("CRYPTO_DEVICE_REQUIRED", "Registered deviceId is required", 400);
   const canonical = parseX25519PublicKey(publicKey);
-  const existing = await db.deviceCryptoIdentity.findUnique({ where: cryptoIdentityWhere(agencyId, device.id) });
-  if (existing) {
-    if (existing.agencyId !== agencyId) throw codedError("CRYPTO_DEVICE_AGENCY_MISMATCH", "Device crypto identity belongs to a different agency", 403);
-    if (String(existing.userId || "") !== String(userId || "")) throw codedError("CRYPTO_DEVICE_USER_MISMATCH", "Device crypto identity is registered to a different agency member", 403);
-    if (existing.publicKey !== canonical.publicKey || existing.fingerprint !== canonical.fingerprint) {
-      throw codedError("CRYPTO_DEVICE_KEY_IMMUTABLE", "Device crypto public key is immutable; register a new device identity to rotate it", 409, { current: publicIdentity(existing) });
+  return serializableTransaction(db, async (tx) => {
+    await readCurrentCryptoMember({ db: tx, agencyId, userId });
+    const existing = await tx.deviceCryptoIdentity.findUnique({ where: cryptoIdentityWhere(agencyId, id) });
+    if (existing) {
+      if (existing.agencyId !== agencyId) throw codedError("CRYPTO_DEVICE_AGENCY_MISMATCH", "Device crypto identity belongs to a different agency", 403);
+      if (String(existing.userId || "") !== String(userId || "")) throw codedError("CRYPTO_DEVICE_USER_MISMATCH", "Device crypto identity is registered to a different agency member", 403);
+      if (existing.publicKey !== canonical.publicKey || existing.fingerprint !== canonical.fingerprint) {
+        throw codedError("CRYPTO_DEVICE_KEY_IMMUTABLE", "Device crypto public key is immutable; register a new device identity to rotate it", 409, { current: publicIdentity(existing) });
+      }
+      if (existing.status === "REVOKED" || existing.revokedAt) throw codedError("CRYPTO_DEVICE_REVOKED", "This device crypto identity has been revoked", 403);
+    } else {
+      // Wrap history survives identity deletion. A former cryptographic principal
+      // must never acquire a new key under the same logical device id.
+      const [historicalOwnerWrap, historicalCreatorWrap] = await Promise.all([
+        tx.agencyCryptoOwnerKeyWrap.findFirst({ where: { agencyId, deviceId: id }, select: { id: true } }),
+        tx.creatorDeviceKeyWrap.findFirst({ where: { agencyId, deviceId: id }, select: { id: true } }),
+      ]);
+      if (historicalOwnerWrap || historicalCreatorWrap) {
+        throw codedError("CRYPTO_DEVICE_ID_REUSE_FORBIDDEN",
+          "This logical device id has historical encryption-key access and cannot be rebound to a new crypto identity; retire it and sign in with a new device id", 409);
+      }
     }
-    if (existing.status === "REVOKED") throw codedError("CRYPTO_DEVICE_REVOKED", "This device crypto identity has been revoked", 403);
-    return { identity: publicIdentity(existing), idempotent: true };
-  }
+    // The device-bound authenticated request enrolls this PC and its public key
+    // together. It must work before the first background worker heartbeat and
+    // must not publish fabricated liveness or overwrite creator capabilities.
+    const device = await tx.workerDevice.findUnique({ where: { id } });
+    if (device && device.userId !== userId) throw codedError("CRYPTO_DEVICE_USER_MISMATCH", "This logical device belongs to a different user", 403);
+    if (!device) await tx.workerDevice.create({ data: { id, agencyId, userId } });
+    else if (device.agencyId !== agencyId) await tx.workerDevice.update({ where: { id }, data: { agencyId } });
 
-  // A missing identity row does not mean this logical device id is fresh. Wrap
-  // history is durable evidence that an older private key already received AMK
-  // or CDK material. Reusing the same id with a new public key would merge two
-  // different cryptographic principals and could hide historical exposure debt.
-  const [historicalOwnerWrap, historicalCreatorWrap] = await Promise.all([
-    db.agencyCryptoOwnerKeyWrap.findFirst({ where: { agencyId, deviceId: device.id }, select: { id: true } }),
-    db.creatorDeviceKeyWrap.findFirst({ where: { agencyId, deviceId: device.id }, select: { id: true } }),
-  ]);
-  if (historicalOwnerWrap || historicalCreatorWrap) {
-    throw codedError(
-      "CRYPTO_DEVICE_ID_REUSE_FORBIDDEN",
-      "This logical device id has historical encryption-key access and cannot be rebound to a new crypto identity; retire it and sign in with a new device id",
-      409,
-    );
-  }
-
-  const identity = await db.deviceCryptoIdentity.create({
-    data: { deviceId: device.id, agencyId, userId, publicKey: canonical.publicKey, algorithm: DEVICE_KEY_ALGORITHM, fingerprint: canonical.fingerprint, status: "PENDING" },
-  });
-  return { identity: publicIdentity(identity), idempotent: false };
+    if (existing) return { identity: publicIdentity(existing), idempotent: true };
+    const identity = await tx.deviceCryptoIdentity.create({
+      data: { deviceId: id, agencyId, userId, publicKey: canonical.publicKey, algorithm: DEVICE_KEY_ALGORITHM, fingerprint: canonical.fingerprint, status: "PENDING" },
+    });
+    return { identity: publicIdentity(identity), idempotent: false };
+  }, "CRYPTO_DEVICE_REGISTRATION_CONFLICT");
 }
 
 async function initializeAgencyCryptoRoot({ db, agencyId, userId, member, deviceId, recoveryEnvelope, ownerWrap, recoveryProof }) {

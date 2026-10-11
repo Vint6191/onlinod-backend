@@ -21,10 +21,11 @@ test("the same physical device can pin the same X25519 identity independently in
   const identities = new Map();
   const key = publicKey();
   const db = {
+    $transaction: async fn => fn(transactionClient(db)),
+    agencyMember: { findFirst: async ({ where }) => ({ id: 'member', agencyId: where.agencyId, userId: where.userId, role: 'OWNER' }) },
     workerDevice: {
-      findFirst: async ({ where }) => (
-        where.id === device.id && where.agencyId === device.agencyId && where.userId === device.userId ? { ...device } : null
-      ),
+      findUnique: async ({ where }) => where.id === device.id ? { ...device } : null,
+      update: async ({ data }) => Object.assign(device, data),
     },
     agencyCryptoOwnerKeyWrap: { findFirst: async () => null },
     creatorDeviceKeyWrap: { findFirst: async () => null },
@@ -43,8 +44,8 @@ test("the same physical device can pin the same X25519 identity independently in
 
   const first = await registerDeviceIdentity({ db, agencyId: "agency-a", userId: "user-1", deviceId: "pc-1", publicKey: key });
   assert.equal(first.idempotent, false);
-  device.agencyId = "agency-b"; // mirrors the existing heartbeat behavior when active agency changes.
   const second = await registerDeviceIdentity({ db, agencyId: "agency-b", userId: "user-1", deviceId: "pc-1", publicKey: key });
+  assert.equal(device.agencyId, "agency-b");
   assert.equal(second.idempotent, false);
   assert.equal(identities.size, 2);
   assert.equal(identities.get("agency-a:pc-1").fingerprint, identities.get("agency-b:pc-1").fingerprint);
@@ -59,7 +60,9 @@ test("an agency-scoped device identity cannot silently move to another member on
   const identities = new Map();
   const key = publicKey();
   const db = {
-    workerDevice: { findFirst: async ({ where }) => where.id === device.id && where.agencyId === device.agencyId && where.userId === device.userId ? { ...device } : null },
+    $transaction: async fn => fn(transactionClient(db)),
+    agencyMember: { findFirst: async ({ where }) => ({ id: 'member', agencyId: where.agencyId, userId: where.userId, role: 'OWNER' }) },
+    workerDevice: { findUnique: async ({ where }) => where.id === device.id ? { ...device } : null },
     agencyCryptoOwnerKeyWrap: { findFirst: async () => null },
     creatorDeviceKeyWrap: { findFirst: async () => null },
     deviceCryptoIdentity: {
