@@ -183,9 +183,16 @@ async function resolveReminderProviderBinding({ agencyId, order, db }) {
 }
 
 async function resolveInitialReferenceProviderBinding({ agencyId, order, db }) {
-  const obligation = await deriveCustomModelObligation({ agencyId, order, db });
-  if (String(obligation?.state || "") !== "INITIAL_WAITING_RESPONSE" || obligation?.modelOwesResponse !== true || String(obligation?.currentInstruction?.kind || "") !== "TASK") {
-    throw fail("CUSTOM_MODEL_INITIAL_OBLIGATION_NOT_WAITING_RESPONSE", "The initial Custom model obligation is no longer waiting for a response; initial references are obsolete", 409);
+  // CALL references belong to the provider-confirmed TASK too, but a call does
+  // not owe a CONTENT media response. Reuse the existing initial-instruction
+  // authority so planning, refresh, replacement and begin agree on one binding.
+  const obligation = await deriveCustomInitialInstruction({ agencyId, order, db });
+  const type = String(order?.type || "CONTENT").toUpperCase();
+  const eligible = type === "CALL"
+    ? obligation?.state === "INITIAL_CONFIRMED"
+    : type === "CONTENT" && obligation?.state === "INITIAL_WAITING_RESPONSE" && obligation?.modelOwesResponse === true;
+  if (!eligible || String(obligation?.currentInstruction?.kind || "") !== "TASK") {
+    throw fail("CUSTOM_MODEL_INITIAL_OBLIGATION_NOT_WAITING_RESPONSE", "Initial references require a current provider-confirmed content or call TASK", 409);
   }
   const instruction = obligation.currentInstruction;
   return {

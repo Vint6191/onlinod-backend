@@ -2816,3 +2816,38 @@ test("Phase4 Telegram exact receipt settles after hold; duplicate begin cannot i
   const result = await confirmTelegramDeliveryIntent({ ...input, remoteMessageId: 12345, remoteRecipientTelegramUserId: "1001", remoteSentAt: fx.now });
   assert.equal(result.intent.state, "CONFIRMED");
 });
+
+
+function callReferenceInput(fx) {
+  return {agencyId:'agency-1',member:fx.member,orderId:'order-1',kind:'REFERENCE',
+    clientIntentId:'91919191-9191-4191-8191-919191919191',reference:{ordinal:0,name:'call.png',size:4,sha256:'a'.repeat(64)},now:fx.now,db:fx.db};
+}
+test('CALL reference follows the confirmed original TASK through plan, claim, begin, receipt and exact replay', async()=>{
+  const fx=dbFixture();fx.orders[0].type='CALL';seedConfirmedTaskThread(fx,{messageId:9301,telegramUserId:'1001'});
+  const input=callReferenceInput(fx),planned=await planTelegramDeliveryIntent(input);
+  assert.equal(planned.intent.payload.replyToMessageId,'9301');assert.equal(planned.intent.payload.recipientTelegramUserId,'1001');
+  const claimed=await claimTelegramDeliveryIntent({agencyId:'agency-1',member:fx.member,intentId:planned.intent.id,deviceId:'device-1',runtimeClaimToken:'runtime-1',now:fx.now,db:fx.db});assert.equal(claimed.claimed,true);
+  const begun=await beginTelegramDeliveryIntent({agencyId:'agency-1',member:fx.member,intentId:planned.intent.id,deviceId:'device-1',runtimeClaimToken:'runtime-1',claimToken:claimed.claimToken,now:fx.now,db:fx.db});assert.equal(begun.begun,true);
+  await confirmTelegramDeliveryIntent({agencyId:'agency-1',member:fx.member,intentId:planned.intent.id,deviceId:'device-1',claimToken:claimed.claimToken,remoteMessageId:9302,remoteRecipientTelegramUserId:'1001',remoteSentAt:fx.now,now:fx.now,db:fx.db});
+  assert.deepEqual(fx.orders[0].telegramReferenceMessageIds,[9302]);
+  const replay=await planTelegramDeliveryIntent(input);assert.equal(replay.intent.id,planned.intent.id);assert.equal(replay.intent.state,'CONFIRMED');assert.equal(fx.intents.filter(x=>x.kind==='REFERENCE').length,1);
+});
+test('CALL reference needs a confirmed TASK receipt and PHYSICAL cannot acquire reference delivery',async()=>{
+  for(const state of ['missing','COMMITTING','RECONCILE_REQUIRED']){
+    const fx=dbFixture();fx.orders[0].type='CALL';if(state!=='missing'){seedConfirmedTaskThread(fx,{messageId:9401,telegramUserId:'1001'});fx.intents[0].state=state;}
+    await assert.rejects(planTelegramDeliveryIntent(callReferenceInput(fx)),{code:'CUSTOM_MODEL_INITIAL_OBLIGATION_NOT_WAITING_RESPONSE'});
+    assert.equal(fx.intents.filter(x=>x.kind==='REFERENCE').length,0);
+  }
+  const fx=dbFixture();fx.orders[0].type='PHYSICAL';seedConfirmedTaskThread(fx,{messageId:9401,telegramUserId:'1001'});
+  await assert.rejects(planTelegramDeliveryIntent(callReferenceInput(fx)),{code:'CUSTOM_MODEL_INITIAL_OBLIGATION_NOT_WAITING_RESPONSE'});
+});
+test('CALL cancellation or completion after reference claim prevents provider begin',async()=>{
+  for(const status of ['CANCELLED','COMPLETED','MISSED']){
+    const fx=dbFixture();fx.orders[0].type='CALL';seedConfirmedTaskThread(fx,{messageId:9501,telegramUserId:'1001'});
+    const planned=await planTelegramDeliveryIntent(callReferenceInput(fx));
+    const claimed=await claimTelegramDeliveryIntent({agencyId:'agency-1',member:fx.member,intentId:planned.intent.id,deviceId:'device-1',runtimeClaimToken:'runtime-1',now:fx.now,db:fx.db});
+    fx.orders[0].status=status;
+    await assert.rejects(beginTelegramDeliveryIntent({agencyId:'agency-1',member:fx.member,intentId:planned.intent.id,deviceId:'device-1',runtimeClaimToken:'runtime-1',claimToken:claimed.claimToken,now:fx.now,db:fx.db}),e=>['TELEGRAM_DELIVERY_CONTROL_CHANGED','TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED'].includes(e.code));
+    assert.equal(fx.intents.find(x=>x.id===planned.intent.id).commitStartedAt,null);
+  }
+});
