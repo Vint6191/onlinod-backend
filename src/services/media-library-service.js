@@ -375,7 +375,10 @@ function normalizeUsageSource(value) {
   const sourceRevision = clean(input.sourceRevision || input.capturedAt, 100);
   if (!sourceKey || !sourceRevision) return null;
   const merged = new Map();
-  for (const raw of (Array.isArray(input.items) ? input.items : []).slice(0, MAX_USAGE_ITEMS_PER_SOURCE)) {
+  if (Array.isArray(input.items) && input.items.length > MAX_USAGE_ITEMS_PER_SOURCE) {
+    throw Object.assign(new Error("MEDIA_LIBRARY_USAGE_SOURCE_TOO_LARGE"), { code: "MEDIA_LIBRARY_USAGE_SOURCE_TOO_LARGE", status: 413 });
+  }
+  for (const raw of (Array.isArray(input.items) ? input.items : [])) {
     const item = normalizeUsageItem(raw);
     if (!item) continue;
     const current = merged.get(item.mediaId);
@@ -617,11 +620,13 @@ async function replaceUsageSourceTx(tx, { agencyId, creatorId, source }) {
 }
 
 async function replaceUsageSources({ agencyId, creatorId, sources, db = prisma, commitGuard = null }) {
-  const id = await requireCreator(db, agencyId, creatorId);
+  if (Array.isArray(sources) && sources.length > MAX_USAGE_SOURCES) {
+    throw Object.assign(new Error("MEDIA_LIBRARY_USAGE_BATCH_TOO_LARGE"), { code: "MEDIA_LIBRARY_USAGE_BATCH_TOO_LARGE", status: 413 });
+  }
   const normalized = (Array.isArray(sources) ? sources : [])
-    .slice(0, MAX_USAGE_SOURCES)
     .map(normalizeUsageSource)
     .filter(Boolean);
+  const id = await requireCreator(db, agencyId, creatorId);
   const result = {
     ok: true,
     creatorId: id,

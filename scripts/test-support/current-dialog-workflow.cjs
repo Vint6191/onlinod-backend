@@ -364,7 +364,7 @@ exports.runDialog = async function (f) {
       return s.profile.analysisStatus === "done";
     }, "CRM analysis did not finish");
     results.profile = await dialogs.getCrmPanelSnapshot({ creatorId: c, dialogId });
-    results.localUsage = await dialogs.listMediaLibraryUsageSources(c);
+    results.localUsage = await Array.fromAsync(dialogs.iterateMediaLibraryUsageSources(c));
     results.sales = await mediaLibrary.getSalesSummary(c);
     pass(
       "Actual dialog scan/coordinator -> SQLite worker -> durable paged CRM inference and media usage SQL projection"
@@ -820,7 +820,7 @@ export function unmount(){crm?.destroy();translator?.destroy();host?.destroy();r
     const restored = await dialogs.getCrmPanelSnapshot({ creatorId: c, dialogId });
     assert.equal(restored.stats.messagesCount, 65);
     assert.equal(restored.profile.preferredName, "Newer Alex");
-    const usage = await dialogs.listMediaLibraryUsageSources(c);
+    const usage = await Array.fromAsync(dialogs.iterateMediaLibraryUsageSources(c));
     assert.equal(usage[0].items[0].revenueCents, 1250);
     const sqlUsage = await f.withDatabase(async (db) =>
       db.creatorMediaUsageContribution.findMany({ where: { creatorId: c, mediaId: "99001" } })

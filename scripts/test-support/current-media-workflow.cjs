@@ -34,7 +34,7 @@ exports.runMedia = async function(f) {
   library=new m.MessageLibraryService({log,authStore,authService,authorization:authority,commands:libraryCommands});
  };openLibrary();
  const mediaLibrary=new m.MediaLibraryService({log,authStore,authService,authorization:authority,coordinator,managementCommands:commands});
- mediaLibrary.bindUsageSourceProvider({listMediaLibraryUsageSources:async()=>[]});
+ mediaLibrary.bindUsageSourceProvider({iterateMediaLibraryUsageSources:async function*(){}});
  const directory=new m.VaultDirectoryBackendService(authStore,authService,mediaLibrary,undefined,commands);
  let mediaGeneration=1;const transfers=[],relays=[];
  const sourceMedia=Array.from({length:45},(_,i)=>({id:String(90001+i),type:i===1?'video':'photo',duration:i===1?25:0,createdAt:new Date().toISOString(),lists:i<2?[{id:'101',hasMedia:true}]:[],files:{thumb:{url:`https://fixture.invalid/thumb-${i}`},preview:{url:`https://fixture.invalid/preview-${i}`},full:{url:`https://fixture.invalid/current-${i}-v1`}}}));
