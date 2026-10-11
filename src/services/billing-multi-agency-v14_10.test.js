@@ -39,6 +39,7 @@ function makeDb() {
   const db = {
     $transaction: async fn => fn({ ...(db), $transaction: undefined }),
     $queryRawUnsafe: async ()=>[],
+    $executeRawUnsafe: async ()=>0,
     agency: { findUnique: async ({where})=>copy(agencies.get(where.id)||null) },
     agencySubscription: { findFirst: async ({where})=>copy(subs.get(where.agencyId)||null) },
     billingOrder: {
@@ -63,6 +64,8 @@ function makeDb() {
       upsert: async ({where,create,update}) => { const w=where.provider_testMode_providerPaymentId; const k=paymentKey(w.testMode,w.providerPaymentId); let r=attempts.get(k); if(!r){r={id:`attempt-${++attemptSeq}`,createdAt:new Date(),updatedAt:new Date(),...create};attempts.set(k,r);} else {Object.assign(r,update,{updatedAt:new Date()});} return copy(r); },
     },
     billingProviderEvent: {
+      createMany: async ({data}) => { let count=0; for(const item of data) if(!events.has(item.eventKey)){events.set(item.eventKey,{id:`event-${++eventSeq}`,processedAt:null,processingError:null,paymentAttemptId:null,receivedAt:new Date(),...item});count++;} return {count}; },
+      updateMany: async ({where,data}) => {const row=events.get(where.eventKey);if(!row||row.processedAt!==where.processedAt)return {count:0};Object.assign(row,data);return {count:1};},
       create: async ({data}) => { if(events.has(data.eventKey)){const e=new Error('unique');e.code='P2002';throw e;} const r={id:`event-${++eventSeq}`,processedAt:null,processingError:null,paymentAttemptId:null,receivedAt:new Date(),...data};events.set(data.eventKey,r);return copy(r); },
       findUnique: async ({where})=>copy(events.get(where.eventKey)||null),
       update: async ({where,data})=>{ const entry=[...events.entries()].find(([,r])=>r.id===where.id);assert.ok(entry);Object.assign(entry[1],data);return copy(entry[1]); },

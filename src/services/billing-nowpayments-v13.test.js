@@ -52,7 +52,7 @@ function loadService(prismaMock = {}, auditMock = async () => null, dependencyMo
     if (request === "../prisma") return prismaMock;
     if (request === "./audit-service") return { audit: auditMock };
     if (request === "./billing-wallet-service" && dependencyMocks.wallet) return dependencyMocks.wallet;
-    if (request === "./billing-entitlement-service" && dependencyMocks.entitlement) return dependencyMocks.entitlement;
+    if (request === "./billing-entitlement-service" && dependencyMocks.entitlement) return { ...original.call(this, request, parent, isMain), ...dependencyMocks.entitlement };
     return original.call(this, request, parent, isMain);
   };
   try {
@@ -205,6 +205,8 @@ function makeProcessingDb({ failOrderUpdateOnce = false } = {}) {
       },
     },
     billingProviderEvent: {
+      createMany: async ({ data }) => { let count = 0; for (const item of data) if (!eventsByKey.has(item.eventKey)) { eventsByKey.set(item.eventKey, { id: `event-${++eventSeq}`, receivedAt: new Date(), processedAt: null, processingError: null, paymentAttemptId: null, ...item }); count++; } return { count }; },
+      updateMany: async ({ where, data }) => { const row = eventsByKey.get(where.eventKey); if (!row || row.processedAt !== where.processedAt) return { count: 0 }; Object.assign(row, data); return { count: 1 }; },
       create: async ({ data }) => { if (eventsByKey.has(data.eventKey)) { const err = new Error("unique"); err.code = "P2002"; throw err; } const row = { id: `event-${++eventSeq}`, receivedAt: new Date(), processedAt: null, processingError: null, paymentAttemptId: null, ...data }; eventsByKey.set(data.eventKey, row); return { ...row }; },
       findUnique: async ({ where }) => { const row = eventsByKey.get(where.eventKey); return row ? { ...row } : null; },
       update: async ({ where, data }) => { const entry = [...eventsByKey.entries()].find(([, row]) => row.id === where.id); assert.ok(entry, `event ${where.id} exists`); const [key, row] = entry; const next = { ...row, ...data }; eventsByKey.set(key, next); return { ...next }; },
@@ -490,6 +492,36 @@ test("a verified finished sandbox payment activates exactly once when sandbox ac
   const second = await service.applyProviderPayment(payload, { signature: "sig-paid", signatureVerified: true, db });
   assert.equal(second.duplicate, true);
   assert.deepEqual(db._activationWrites(), { subscriptionWrites: 1, agencyWrites: 1 });
+}));
+
+test("delayed waiting after finished preserves terminal order and payment diagnostics", async () => withEnv({
+  NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_SANDBOX_ACTIVATE: "1",
+}, async () => {
+  const db = makeProcessingDb();
+  const service = loadService(db);
+  const payload = { payment_id: "terminal-paid", order_id: "order-1", invoice_id: "invoice-1", payment_status: "finished", price_amount: 20, price_currency: "usd" };
+  await service.applyProviderPayment(payload, { db });
+  const expiry = db._entitlements.get("creator-1").coreValidUntil.getTime();
+  await service.applyProviderPayment({ ...payload, payment_status: "waiting" }, { db });
+  assert.equal(db._getOrder().status, "PAID");
+  assert.equal(db._getOrder().providerStatus, "finished");
+  assert.equal((await db.billingPaymentAttempt.findUnique({ where: { providerPaymentId: "terminal-paid" } })).providerStatus, "finished");
+  assert.equal(db._entitlements.get("creator-1").coreValidUntil.getTime(), expiry);
+}));
+
+test("delayed finished after refunded preserves the terminal payment state", async () => withEnv({
+  NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_SANDBOX_ACTIVATE: "1",
+}, async () => {
+  const db = makeProcessingDb();
+  const service = loadService(db);
+  const payload = { payment_id: "terminal-refund", order_id: "order-1", invoice_id: "invoice-1", payment_status: "finished", price_amount: 20, price_currency: "usd" };
+  await service.applyProviderPayment(payload, { db });
+  await service.applyProviderPayment({ ...payload, payment_status: "refunded" }, { db });
+  await service.applyProviderPayment({ ...payload, updated_at: "delayed" }, { db });
+  assert.equal(db._getOrder().status, "REFUNDED");
+  assert.equal(db._getOrder().providerStatus, "refunded");
+  assert.equal((await db.billingPaymentAttempt.findUnique({ where: { providerPaymentId: "terminal-refund" } })).providerStatus, "refunded");
+  assert.equal(db._entitlements.get("creator-1").coreLastOrderId, null);
 }));
 
 test("sandbox entitlement activation preserves FREE_INTERNAL billing mode so a test payment cannot unlock accidental live charging", async () => withEnv({

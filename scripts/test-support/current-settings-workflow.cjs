@@ -603,9 +603,10 @@ export function context(projection){acceptRendererAuthorizationProjection(projec
         .digest("hex");
     await must("POST", "/api/billing/nowpayments/ipn", ipn, 401, { "x-nowpayments-sig": "invalid" });
     await must("POST", "/api/billing/nowpayments/ipn", ipn, 200, { "x-nowpayments-sig": signature(ipn) });
-    // A second signed provider event describes the same payment. The exact-byte
-    // callback duplicate hits a SQL23505 path that breaks pglite-socket0.2.11's
-    // connection; retain that native-PostgreSQL gap rather than fake the result.
+    // Exact duplicates now use an atomic inbox INSERT ... ON CONFLICT. They
+    // reuse the completed receipt without a second credit or unique violation.
+    const exactDuplicate = await must("POST", "/api/billing/nowpayments/ipn", ipn, 200, { "x-nowpayments-sig": signature(ipn) });
+    assert.equal(exactDuplicate.duplicate, true);
     const repeated = { ...ipn, updated_at: new Date().toISOString() };
     await must("POST", "/api/billing/nowpayments/ipn", repeated, 200, { "x-nowpayments-sig": signature(repeated) });
     await refresh();
@@ -618,11 +619,11 @@ export function context(projection){acceptRendererAuthorizationProjection(projec
       checkoutWindows: m.ports.checkoutCalls.length,
       verifiedCreditCents: 10000,
       repeatedPaymentEvents: true,
-      exactDuplicateCallback: "NOT_VERIFIED_SQL_TRANSPORT_LIMIT",
+      exactDuplicateCallback: true,
       realProvider: false,
     };
     pass(
-      "Lost top-up response recovers one saved invoice; checkout/resume do not credit funds; actual HMAC rejects forged callback and two verified events for the same payment credit once"
+      "Lost top-up response recovers one saved invoice; checkout/resume do not credit funds; actual HMAC rejects forged callback and exact duplicate plus a second verified event credit the same payment once"
     );
 
     // Even an explicit Admin price requires the normal 30-day earnings proof.

@@ -55,7 +55,8 @@
     "test:team-acceptance": "node scripts/audit/current-team-acceptance-proof.cjs",
     "test:settings-acceptance": "node scripts/audit/current-settings-acceptance-proof.cjs",
     "test:admin-acceptance": "node scripts/audit/current-admin-acceptance-proof.cjs",
-    "test:device-recovery-acceptance": "node scripts/audit/current-device-recovery-acceptance-proof.cjs"
+    "test:device-recovery-acceptance": "node scripts/audit/current-device-recovery-acceptance-proof.cjs",
+    "test:billing-events": "node scripts/audit/current-billing-event-acceptance-proof.cjs"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

@@ -1,5 +1,6 @@
 "use strict";
 const { runDbTransaction } = require("./db-transaction-service");
+const { runBillingProviderEvent } = require("./billing-provider-event-service");
 
 
 const crypto = require("node:crypto");
@@ -7,7 +8,7 @@ const prisma = require("../prisma");
 const { audit } = require("./audit-service");
 const { readCommercialPolicy } = require("./billing-commercial-policy-service");
 const { normalizeSelection, periodMonths, priceCreatorSelection } = require("./billing-catalog-service");
-const { activatePaidOrderEntitlements, refundOrderEntitlements } = require("./billing-entitlement-service");
+const { activatePaidOrderEntitlements, refundOrderEntitlements, lockAgencyBillingMutation } = require("./billing-entitlement-service");
 const { creditPaidTopUp, refundTopUp } = require("./billing-wallet-service");
 
 const PROVIDER = "NOWPAYMENTS";
@@ -148,6 +149,13 @@ function monotonicOrderStatus(currentStatus, providerStatus) {
   return next;
 }
 
+function monotonicProviderStatus(currentStatus, incomingStatus) {
+  if (!currentStatus || !incomingStatus) return incomingStatus || currentStatus;
+  const current = orderStatusForProviderStatus(currentStatus);
+  const incoming = orderStatusForProviderStatus(incomingStatus);
+  return monotonicOrderStatus(current, incomingStatus) === incoming ? incomingStatus : currentStatus;
+}
+
 async function updateOrderStatusMonotonically(client, initialOrder, providerStatus, payload) {
   let current = initialOrder;
   for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -162,7 +170,7 @@ async function updateOrderStatusMonotonically(client, initialOrder, providerStat
     // callback read PAID milliseconds earlier.
     const claim = await client.billingOrder.updateMany({
       where: { id: current.id, status: current.status },
-      data: { status: candidateStatus, providerStatus: providerStatus || current.providerStatus, paidAt },
+      data: { status: candidateStatus, providerStatus: monotonicProviderStatus(current.providerStatus, providerStatus), paidAt },
     });
     if (claim.count === 1) {
       const fresh = await client.billingOrder.findUnique({ where: { id: current.id } });
@@ -861,113 +869,77 @@ async function applyProviderPayment(payload, { signature = null, signatureVerifi
   const providerStatus = normalizeStatus(payload.payment_status || payload.status);
   const providerOrderId = clean(payload.order_id, 180);
   const config = providerConfig();
-  let order = providerOrderId ? await client.billingOrder.findUnique({ where: { id: providerOrderId } }) : null;
-  let existingAttempt = null;
-  if (providerPaymentId && order) {
-    existingAttempt = await client.billingPaymentAttempt.findUnique({
-      where: paymentAttemptUniqueWhere(providerPaymentId, order.testMode),
-      include: { order: true },
-    });
-  } else if (providerPaymentId) {
-    existingAttempt = await client.billingPaymentAttempt.findFirst({
-      where: { provider: PROVIDER, providerPaymentId, testMode: config.sandbox },
-      include: { order: true },
-      orderBy: { createdAt: "desc" },
-    });
-    order = existingAttempt?.order || null;
-  }
-  const bindingError =
-    order && (config.sandbox || config.live) && (order.testMode === true) !== config.sandbox
-      ? permanentBindingError("NOWPayments event environment does not match the billing order", "BILLING_PROVIDER_ENVIRONMENT_MISMATCH")
-      : providerOrderId && order && providerOrderId !== String(order.id)
-        ? permanentBindingError("NOWPayments order_id does not match the payment attempt order", "BILLING_PROVIDER_ORDER_MISMATCH")
-        : existingAttempt && order && String(existingAttempt.orderId) !== String(order.id)
-          ? permanentBindingError("NOWPayments payment_id is already bound to another billing order", "BILLING_PROVIDER_PAYMENT_ORDER_MISMATCH")
-          : null;
-
-  const eventKey = sha256(`${PROVIDER}\n${clean(signature, 256).toLowerCase()}\n${stableJson(payload)}`);
-  let event;
-  try {
-    event = await client.billingProviderEvent.create({
-      data: {
-        provider: PROVIDER,
-        eventKey,
-        orderId: order?.id || null,
-        providerStatus: providerStatus || null,
-        signature: clean(signature, 256) || null,
-        signatureVerified,
-        payload,
-      },
-    });
-  } catch (err) {
-    if (err?.code !== "P2002") throw err;
-    event = await client.billingProviderEvent.findUnique({ where: { eventKey } });
-    if (!event) throw err;
-    if (event.processedAt) {
-      const existingOrder = event.orderId ? await client.billingOrder.findUnique({ where: { id: event.orderId } }) : order;
-      return { duplicate: true, order: publicOrder(existingOrder) };
-    }
-  }
-
-  try {
-    if (bindingError) throw bindingError;
-    if (!order) {
-      await client.billingProviderEvent.update({ where: { id: event.id }, data: { processedAt: new Date(), processingError: "ORDER_NOT_FOUND" } });
-      return { duplicate: false, order: null, code: "ORDER_NOT_FOUND" };
-    }
-
-    let candidateStatus = monotonicOrderStatus(order.status, providerStatus);
-    validateProviderPaymentForOrder(order, payload, { requirePrice: candidateStatus === "PAID" });
-
-    let attempt = null;
-    if (providerPaymentId) {
-      attempt = await client.billingPaymentAttempt.upsert({
-        where: paymentAttemptUniqueWhere(providerPaymentId, order.testMode),
-        create: { orderId: order.id, provider: PROVIDER, testMode: order.testMode === true, providerPaymentId, ...paymentAttemptData(payload) },
-        update: paymentAttemptData(payload),
-      });
-      if (event.paymentAttemptId !== attempt.id || event.orderId !== order.id) {
-        await client.billingProviderEvent.update({ where: { id: event.id }, data: { paymentAttemptId: attempt.id, orderId: order.id } });
+  const eventKey = sha256(`${PROVIDER}\n${config.environment}\n${clean(signature, 256).toLowerCase()}\n${stableJson(payload)}`);
+  return runBillingProviderEvent({
+    db: client, provider: PROVIDER, eventKey, paymentId: providerPaymentId,
+    data: { providerStatus: providerStatus || null, signature: clean(signature, 256) || null, signatureVerified, payload },
+    replay: async (tx, event) => ({ duplicate: true, order: publicOrder(event.orderId
+      ? await tx.billingOrder.findUnique({ where: { id: event.orderId } }) : null) }),
+    project: async (tx, event) => {
+      let order = providerOrderId ? await tx.billingOrder.findUnique({ where: { id: providerOrderId } }) : null;
+      const testMode = order ? order.testMode === true : config.sandbox;
+      const existingAttempt = providerPaymentId ? await tx.billingPaymentAttempt.findUnique({
+        where: paymentAttemptUniqueWhere(providerPaymentId, testMode), include: { order: true },
+      }) : null;
+      if (!providerOrderId) order = existingAttempt?.order || null;
+      if (order && (config.sandbox || config.live) && (order.testMode === true) !== config.sandbox) {
+        throw permanentBindingError("NOWPayments event environment does not match the billing order", "BILLING_PROVIDER_ENVIRONMENT_MISMATCH");
       }
-    }
+      if (existingAttempt && providerOrderId && String(existingAttempt.orderId) !== providerOrderId) {
+        throw permanentBindingError("NOWPayments payment_id is already bound to another billing order", "BILLING_PROVIDER_PAYMENT_ORDER_MISMATCH");
+      }
+      if (!order) return { duplicate: false, order: null, code: "ORDER_NOT_FOUND" };
 
-    const advanced = await updateOrderStatusMonotonically(client, order, providerStatus, payload);
-    order = advanced.order;
-    candidateStatus = advanced.candidateStatus;
-
-    let activation = null;
-    const purpose = String(order.purpose || "SUBSCRIPTION");
-    if (candidateStatus === "PAID") {
-      activation = purpose === "WALLET_TOP_UP"
-        ? await creditPaidTopUp({ orderId: order.id, sandboxActivationEnabled: config.sandboxActivationEnabled, db: client })
-        : await activatePaidOrder(order.id, client);
-    }
-    if (candidateStatus === "REFUNDED") {
-      if (purpose === "WALLET_TOP_UP") await refundTopUp({ order, db: client });
-      else await handleRefundedOrder(order, client);
-    }
-
-    await client.billingProviderEvent.update({ where: { id: event.id }, data: { processedAt: new Date(), processingError: null } });
-    if (candidateStatus === "PAID" || candidateStatus === "REFUNDED") {
-      await audit({
-        agencyId: order.agencyId,
-        actorUserId: null,
-        action: candidateStatus === "PAID" ? "billing.payment_finished" : "billing.payment_refunded",
-        targetType: "billing_order",
-        targetId: order.id,
-        metadata: { provider: PROVIDER, providerStatus, source, testMode: order.testMode, activated: activation?.activated === true },
-        db: client,
-      });
-    }
-    return { duplicate: false, order: publicOrder(await client.billingOrder.findUnique({ where: { id: order.id } })), activation };
-  } catch (err) {
-    const permanent = err?.permanent === true || Number(err?.status) >= 400 && Number(err?.status) < 500;
-    await client.billingProviderEvent.update({
-      where: { id: event.id },
-      data: { processedAt: permanent ? new Date() : null, processingError: clean(err?.message || err, 500) },
-    }).catch(() => undefined);
-    throw err;
-  }
+      // All other wallet/subscription mutations start at Agency. Take it before
+      // touching order/attempt rows, then resolve current state, never a stale
+      // pre-lock PAID snapshot. Joined wallet/entitlement helpers keep this root.
+      await lockAgencyBillingMutation(tx, order.agencyId);
+      order = await tx.billingOrder.findUnique({ where: { id: order.id } });
+      if (!order) return { duplicate: false, order: null, code: "ORDER_NOT_FOUND" };
+      const candidate = monotonicOrderStatus(order.status, providerStatus);
+      validateProviderPaymentForOrder(order, payload, { requirePrice: candidate === "PAID" });
+      let attempt = null;
+      if (providerPaymentId) {
+        const attemptData = paymentAttemptData(payload);
+        attemptData.providerStatus = monotonicProviderStatus(existingAttempt?.providerStatus, providerStatus);
+        attempt = await tx.billingPaymentAttempt.upsert({
+          where: paymentAttemptUniqueWhere(providerPaymentId, order.testMode),
+          create: { orderId: order.id, provider: PROVIDER, testMode: order.testMode === true, providerPaymentId, ...attemptData },
+          update: attemptData,
+        });
+        // The unique row is the authority even if another SQL writer did not
+        // use the advisory protocol. A mismatch rolls back its metadata too.
+        if (String(attempt.orderId) !== String(order.id)) {
+          throw permanentBindingError("NOWPayments payment_id is already bound to another billing order", "BILLING_PROVIDER_PAYMENT_ORDER_MISMATCH");
+        }
+      }
+      await tx.billingProviderEvent.update({ where: { id: event.id }, data: { orderId: order.id, paymentAttemptId: attempt?.id || null } });
+      const advanced = await updateOrderStatusMonotonically(tx, order, providerStatus, payload);
+      order = advanced.order;
+      const candidateStatus = advanced.candidateStatus;
+      const purpose = String(order.purpose || "SUBSCRIPTION");
+      let activation = null;
+      if (candidateStatus === "PAID") {
+        activation = purpose === "WALLET_TOP_UP"
+          ? await creditPaidTopUp({ orderId: order.id, sandboxActivationEnabled: config.sandboxActivationEnabled, db: tx })
+          : await activatePaidOrderEntitlements({ orderId: order.id, sandboxActivationEnabled: config.sandboxActivationEnabled, db: tx });
+      }
+      if (candidateStatus === "REFUNDED") {
+        if (purpose === "WALLET_TOP_UP") await refundTopUp({ order, db: tx });
+        else await handleRefundedOrder(order, tx);
+      }
+      if (candidateStatus === "PAID" || candidateStatus === "REFUNDED") {
+        await audit({
+          agencyId: order.agencyId, actorUserId: null,
+          action: candidateStatus === "PAID" ? "billing.payment_finished" : "billing.payment_refunded",
+          targetType: "billing_order", targetId: order.id,
+          metadata: { provider: PROVIDER, providerStatus, source, testMode: order.testMode, activated: activation?.activated === true },
+          db: tx, required: true,
+        });
+      }
+      return { duplicate: false, order: publicOrder(await tx.billingOrder.findUnique({ where: { id: order.id } })), activation };
+    },
+  });
 }
 
 async function handleNowPaymentsIpn({ payload, signature, db = null }) {
