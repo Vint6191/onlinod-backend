@@ -52,7 +52,8 @@
     "test:analytics-acceptance": "node scripts/audit/current-analytics-acceptance-proof.cjs",
     "test:media-acceptance": "node scripts/audit/current-media-acceptance-proof.cjs",
     "test:dialog-acceptance": "node scripts/audit/current-dialog-acceptance-proof.cjs",
-    "test:team-acceptance": "node scripts/audit/current-team-acceptance-proof.cjs"
+    "test:team-acceptance": "node scripts/audit/current-team-acceptance-proof.cjs",
+    "test:settings-acceptance": "node scripts/audit/current-settings-acceptance-proof.cjs"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",
