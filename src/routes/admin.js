@@ -360,7 +360,7 @@ router.get("/system/health", async (_req, res) => {
     env: {
       hasResendKey: !!process.env.RESEND_API_KEY,
       hasSnapshotKey: !!process.env.SNAPSHOT_ENCRYPTION_KEY,
-      hasJwtSecret: !!process.env.JWT_SECRET && process.env.JWT_SECRET !== "change-me-super-long-random-secret",
+      jwtConfigured: !!process.env.JWT_SECRET && process.env.JWT_SECRET !== "change-me-super-long-random-secret",
       publicBaseUrl: process.env.PUBLIC_BASE_URL || null,
       nodeEnv: process.env.NODE_ENV || "development",
     },

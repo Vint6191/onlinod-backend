@@ -184,6 +184,7 @@ router.get("/agency/:id", async (req, res) => {
       modelsTotal: total.modelsTotal,
       page: { limit: page.limit, nextCursor: hasMore ? models.at(-1).creatorId : null },
       tiers: catalogForPolicy(policy).tiers,
+      addons: catalogForPolicy(policy).addons,
       commercialPolicyRevision: policy.revision,
     });
   } catch (err) { return sendErr(res, err); }

@@ -13,6 +13,7 @@
   const R = () => window.OnlinodAdminRouter;
   const S = () => window.OnlinodAdminState;
   const esc = (v) => R().escapeHtml(v);
+  const W = () => window.OnlinodAdminWorkspace;
 
   function fmtDate(v) { if (!v) return "—"; const d = new Date(v); return isNaN(d) ? "—" : d.toISOString().slice(0, 16).replace("T", " "); }
   function fmtMoney(v, row = null) {
@@ -22,18 +23,20 @@
   }
   function trunc(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n) + "…" : s; }
 
-  const local = { tab: "overview", creatorId: null, overview: null, tabData: {}, loading: false };
+  const local = W().local(() => ({ tab: "overview", creatorId: null, overview: null, tabData: {}, loading: false }));
 
   async function render(main) {
+    const current = W().request(main);
     const creatorId = S().sectionParam;
     if (!creatorId) { main.innerHTML = `<div class="adm-error">no creator id</div>`; return; }
     if (local.creatorId !== creatorId) { local.creatorId = creatorId; local.overview = null; local.tabData = {}; local.tab = "overview"; }
 
     main.innerHTML = `<div class="adm-page"><div class="adm-loading">loading model…</div></div>`;
 
-    if (!local.overview) {
+    {
       const r = await A().creatorOverview(creatorId);
-      if (!r || !r.ok) { main.innerHTML = `<div class="adm-page"><div class="adm-error">failed to load creator</div></div>`; return; }
+      if (!current()) return;
+      if (!r || !r.ok) return W().failure(main, r?.error || "Failed to load creator", () => render(main));
       local.overview = r;
     }
     paint(main);
@@ -67,6 +70,7 @@
       <div class="adm-page">
         <div class="adm-detail-head">
           <button class="adm-link" id="admBack">← creators</button>
+          <button class="adm-btn" id="admCreatorRefresh">Refresh</button>
           <h1>${esc(c.displayName || c.username || c.id)}</h1>
           <div class="adm-detail-sub">
             @${esc(c.username || "—")} ·
@@ -87,6 +91,7 @@
       </div>`;
 
     main.querySelector("#admBack").addEventListener("click", () => R().pushSection("creators"));
+    main.querySelector("#admCreatorRefresh").addEventListener("click", () => render(main));
     main.querySelectorAll(".adm-tab").forEach((b) => b.addEventListener("click", () => { local.tab = b.dataset.tab; paint(main); }));
 
     const body = main.querySelector("#admCDBody");
@@ -107,8 +112,10 @@
   }
 
   function renderReplyRate(body) {
+    const current = W().request(body);
     body.innerHTML = `<div class="adm-loading">loading…</div>`;
     A().dataBumpStats({ creatorId: local.creatorId }).then((r) => {
+      if (!current()) return;
       if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">${esc(r?.error||r?.code||"failed")}</div>`; return; }
       const t = r.totals || {};
       const tpl = (r.perTemplate || []).map((p) => `
@@ -131,12 +138,13 @@
   }
 
   // Generic list renderer for a tab. Defines columns + api per kind.
-  function renderList(body, kind, cursor=null) {
+  function renderList(body, kind, offset=null) {
+    const current = W().request(body);
     const creatorId=local.creatorId,tab=local.tab,requestId=local.listRequest=(local.listRequest||0)+1;
     const cfg = listConfig(kind);
     body.innerHTML = `<div class="adm-loading">loading…</div>`;
-    cfg.api(cursor).then((r) => {
-      if(!body.isConnected||creatorId!==local.creatorId||tab!==local.tab||requestId!==local.listRequest)return;
+    cfg.api(offset).then((r) => {
+      if(!current()||creatorId!==local.creatorId||tab!==local.tab||requestId!==local.listRequest)return;
       if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">${esc(r?.error||r?.code||"failed")}</div>`; return; }
       const items = r.items || [];
       const readOnly = !cfg.model;
@@ -150,10 +158,11 @@
       body.innerHTML = `
         <div class="adm-muted" style="margin:6px 0">${items.length} on this page${r.total != null ? " of " + r.total + " total" : ""}${readOnly ? " · canonical current · read-only" : ""}</div>
         <table class="adm-table"><thead><tr>${head}${readOnly ? "" : "<th></th>"}</tr></thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows</td></tr>`}</tbody></table>${r.hasMore?'<button class="adm-btn adm-btn-sm" data-archive-next>next page</button>':""}`;
-      body.querySelector("[data-archive-next]")?.addEventListener("click",()=>renderList(body,kind,r.nextCursor));
+      body.querySelector("[data-archive-next]")?.addEventListener("click",()=>renderList(body,kind,r.nextOffset));
       if (readOnly) return;
       body.querySelectorAll("[data-inspect]").forEach((b) => b.addEventListener("click", async () => {
         const rr = await A().dataInspect(cfg.model, b.dataset.inspect);
+        if (!current()) return;
         if (rr?.ok) showModal(`${cfg.model} · ${b.dataset.inspect}`, `<pre class="adm-json">${esc(JSON.stringify(rr.record, null, 2))}</pre>`);
       }));
 
@@ -164,15 +173,15 @@
     const cid = local.creatorId;
     switch (kind) {
       case "deliveries": return {
-        model: "automationDelivery", api: () => A().dataDeliveries({ creatorId: cid, limit: 300 }),
+        model: "automationDelivery", api: offset => A().dataDeliveries({ creatorId: cid, offset, limit: 200 }),
         cols: [{ k: "fanId", label: "Fan" }, { k: "status", label: "Status" }, { k: "messageId", label: "MsgId" }, { k: "priceCents", label: "Price", fmt: fmtMoney }, { k: "sentAt", label: "Sent", fmt: fmtDate }],
       };
       case "hidden": return {
-        model: null, api: () => A().dataHiddenOnline({ creatorId: cid, limit: 300 }),
+        model: null, api: offset => A().dataHiddenOnline({ creatorId: cid, offset, limit: 200 }),
         cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "status", label: "Status" }, { k: "totalSpentCents", label: "Spent", fmt: fmtMoney }, { k: "observedAt", label: "Observed", fmt: fmtDate }, { k: "statusUpdatedAt", label: "Status updated", fmt: fmtDate }],
       };
       case "followback": return {
-        model: null, api: () => A().dataFollowBack({ creatorId: cid, limit: 300 }),
+        model: null, api: offset => A().dataFollowBack({ creatorId: cid, offset, limit: 200 }),
         cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "latestActionType", label: "Action" }, { k: "latestStatus", label: "Delivery status" }, { k: "state", label: "Candidate state" }, { k: "currentEligibility", label: "Eligibility" }, { k: "updatedAt", label: "Updated", fmt: fmtDate }],
       };
       default: throw new Error("Unknown creator data view");

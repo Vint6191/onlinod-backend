@@ -13,6 +13,7 @@
   const A = () => window.OnlinodAdminApi;
   const R = () => window.OnlinodAdminRouter;
   const esc = (v) => R().escapeHtml(v);
+  const W = () => window.OnlinodAdminWorkspace;
 
   // entity key → { label, api(query), columns:[{k,label,fmt?}], model (for inspection) }
   const ENTITIES = {
@@ -74,9 +75,11 @@
   }
 
   // local view state (kept on the module, simple)
-  const view = { tab: "health", entity: "deliveries", filters: { agencyId: "", creatorId: "" }, rows: [], total: null, nextCursor:null, hasMore:false, statusCounts: null, selected: new Set(), loading: false, requestId: 0 };
+  const view = W().local(() => ({ tab: "health", entity: "deliveries", filters: { agencyId: "", creatorId: "" }, rows: [], total: null, nextOffset:null, hasMore:false, statusCounts: null, selected: new Set(), loading: false, requestId: 0 }));
 
   async function render(main) {
+    view.loading = false;
+    view.requestId++;
     main.innerHTML = `
       <div class="adm-page">
         <div class="adm-page-head">
@@ -96,9 +99,11 @@
 
   // ── HEALTH (anomalies) ──────────────────────────────────────
   async function renderHealth(body) {
+    const current = W().request(body);
     body.innerHTML = `<div class="adm-loading">loading diagnostic results…</div>`;
     const r = await A().dataAnomalies();
-    if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">failed to load anomalies</div>`; return; }
+    if (!current()) return;
+    if (!r || !r.ok) return W().failure(body, r?.error || "Failed to load diagnostics", () => renderHealth(body));
 
     const cards = (r.anomalies || []).map((a) => `
       <div class="adm-anomaly adm-anomaly-${esc(a.level)}">
@@ -138,7 +143,7 @@
 
     body.querySelector("#admEntity").addEventListener("change", (e) => {
       view.entity = e.target.value;
-      view.selected.clear(); view.rows = []; view.nextCursor=null; view.hasMore=false; view.requestId++;
+      view.selected.clear(); view.rows = []; view.nextOffset=null; view.hasMore=false; view.requestId++;
       const bulk = body.querySelector("#admBulkDel");
       if (bulk) { bulk.hidden = view.entity !== "deliveries"; bulk.disabled = true; bulk.textContent = "archive selected"; }
       const table = body.querySelector("#admDataTable");
@@ -150,20 +155,20 @@
 
   async function loadEntity(body, next=false) {
     const sameFilters=view.filters.agencyId===body.querySelector("#admFAgency").value.trim() && view.filters.creatorId===body.querySelector("#admFCreator").value.trim();
-    const cursor=next&&sameFilters?view.nextCursor:null;
+    const offset=next&&sameFilters?view.nextOffset:null;
     view.filters.agencyId = body.querySelector("#admFAgency").value.trim();
     view.filters.creatorId = body.querySelector("#admFCreator").value.trim();
     view.selected.clear(); view.rows = []; updateBulkBtn(body);
-    const requestId = ++view.requestId;
+    const requestId = ++view.requestId, current = W().request(body);
     const table = body.querySelector("#admDataTable");
     table.innerHTML = `<div class="adm-loading">loading…</div>`;
     const ent = ENTITIES[view.entity];
-    const r = await ent.api({ cursor:cursor||undefined, agencyId: view.filters.agencyId || undefined, creatorId: view.filters.creatorId || undefined, limit: 200 });
-    if (requestId !== view.requestId) return;
+    const r = await ent.api({ offset:offset||undefined, agencyId: view.filters.agencyId || undefined, creatorId: view.filters.creatorId || undefined, limit: 200 });
+    if (!current() || requestId !== view.requestId) return;
     if (!r || !r.ok) { table.innerHTML = `<div class="adm-error">${esc(r?.error||r?.code||"load failed")}</div>`; return; }
     view.rows = r.items || [];
     view.total = r.total ?? null;
-    view.nextCursor=r.nextCursor||null;view.hasMore=r.hasMore===true;
+    view.nextOffset=r.nextOffset||null;view.hasMore=r.hasMore===true;
     view.statusCounts = r.statusCounts || null;
     renderTable(body);
   }
@@ -202,6 +207,7 @@
     table.querySelectorAll("[data-inspect]").forEach((b) => b.addEventListener("click", () => inspect(ent.model, b.dataset.inspect)));
     table.querySelector("#admNextPage")?.addEventListener("click",()=>loadEntity(body,true));
     updateBulkBtn(body);
+    W().superOnly(body, "#admBulkDel, [data-content-action]");
     table.querySelectorAll("[data-content-action]").forEach(b => b.addEventListener("click", () => changeContent(body, b.dataset.contentId, b.dataset.contentAction)));
     if (readOnly) return;
 
@@ -222,13 +228,15 @@
     if (!b) return;
     const mutable = view.entity === "deliveries";
     b.hidden = !mutable;
-    b.disabled = view.loading || !mutable || view.selected.size === 0;
+    b.disabled = view.loading || !mutable || view.selected.size === 0 || window.OnlinodAdminState.admin?.role !== "SUPER_ADMIN";
     b.textContent = mutable && view.selected.size ? `archive selected (${view.selected.size})` : "archive selected";
   }
 
   async function inspect(model, id) {
     if (!model) return;
+    const current = W().capture(document.getElementById("admDataBody"));
     const r = await A().dataInspect(model, id);
+    if (!current()) return;
     if (!r || !r.ok) { R().toast("inspect failed", "error"); return; }
     showModal(`${model} · ${id}`, `<pre class="adm-json">${esc(JSON.stringify(r.record, null, 2))}</pre>`);
   }
@@ -241,8 +249,9 @@
     if(!reason?.trim())return;
     if(action==="permanent" && !confirm("Commit permanent deletion? The script cannot be restored; physical cleanup runs in the background."))return;
     view.loading=true;
-    try{const r=await A().dataContentLifecycle(id,{agencyId:row.agencyId,creatorId:row.creatorId,expectedUpdatedAt:row.updatedAt,action,reason:reason.trim()});R().toast(r?.ok?(r.pendingCleanup?"Deletion committed; cleanup pending":"Updated"):(r?.error||"Result unknown; retry the same action"),r?.ok?"ok":"error");if(r?.ok)await loadEntity(body);}
-    finally{view.loading=false;}
+    const current=W().capture(body),unlock=W().lock(body);
+    try{const r=await A().dataContentLifecycle(id,{agencyId:row.agencyId,creatorId:row.creatorId,expectedUpdatedAt:row.updatedAt,action,reason:reason.trim()});if(!current())return;R().toast(r?.ok?(r.pendingCleanup?"Deletion committed; cleanup pending":"Updated"):(r?.error||"Result unknown; retry the same action"),r?.ok?"ok":"error");if(r?.ok)await loadEntity(body);}
+    finally{unlock();if(current())view.loading=false;}
   }
 
   function canSelect(row) {
@@ -250,6 +259,7 @@
   }
   async function archiveSelected(body) {
     if (view.loading || view.entity !== "deliveries" || !view.selected.size) return;
+    if (view.filters.agencyId !== body.querySelector("#admFAgency").value.trim() || view.filters.creatorId !== body.querySelector("#admFCreator").value.trim()) return R().toast("Load the changed filters before selecting records.", "error");
     const reason = body.querySelector("#admArchiveReason").value.trim();
     const cutoff = body.querySelector("#admArchiveCutoff").value;
     const olderThan = cutoff ? new Date(cutoff + "Z") : null;
@@ -258,12 +268,14 @@
     if (!items.length || items.length !== view.selected.size) { R().toast("Reload selection", "error"); return; }
     if (!confirm(`Archive ${items.length} terminal records before ${olderThan.toISOString()}? Monthly counters are preserved.`)) return;
     view.loading = true; updateBulkBtn(body);
+    const current = W().capture(body), unlock = W().lock(body);
     try {
       const r = await A().dataArchiveDeliveries(view.filters.creatorId, { agencyId: view.filters.agencyId, reason, olderThan: olderThan.toISOString(), items });
+      if (!current()) return;
       R().toast(r?.ok ? `archived ${r.archived}` : (r?.error || "Archive result unknown; retry the same selection"), r?.ok ? "ok" : "error");
       if (r?.ok) await loadEntity(body);
     } catch (_) { R().toast("Archive result unknown; retry the same selection", "error"); }
-    finally { view.loading = false; updateBulkBtn(body); }
+    finally { unlock(); if (current()) { view.loading = false; updateBulkBtn(body); } }
   }
 
   function truncate(s, n) { s = String(s); return s.length > n ? s.slice(0, n) + "…" : s; }

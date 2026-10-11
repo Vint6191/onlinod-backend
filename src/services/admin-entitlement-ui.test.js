@@ -1,40 +1,20 @@
 "use strict";
-const test = require("node:test");
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const vm = require("node:vm");
-
-function controls(creator, values) {
-  let sent;
-  const handlers = {};
-  const button = { dataset: { saveCreatorEntitlement: creator.id }, addEventListener: (type, fn) => { handlers[type] = fn; } };
-  const root = {
-    querySelector: selector => Object.hasOwn(values, selector) ? { value: values[selector] } : null,
-    querySelectorAll: selector => selector === "[data-save-creator-entitlement]" ? [button] : [],
-  };
-  const window = { OnlinodRouter: { toast: () => {} }, OnlinodAdminAuth: { request: async (url, options) => { sent = { url, ...options }; return { ok: false, error: "test stops before reload" }; } } };
-  const source = fs.readFileSync(path.join(__dirname, "../../public/pages/admin.js"), "utf8").replace("window.OnlinodAdminPage = { render: guardedStart };", "window.OnlinodAdminPage = { bind, state, localDateTimeValue };");
-  vm.runInNewContext(source, { window, CSS: { escape: value => value }, Date });
-  window.OnlinodAdminPage.state.selectedAgency = { id: "a", creators: [creator] };
-  window.OnlinodAdminPage.bind(root);
-  return { click: () => handlers.click(), sent: () => sent, date: window.OnlinodAdminPage.localDateTimeValue };
-}
-test("AI-only edit from the actual UI retains untouched paid timestamps and source fields", async () => {
-  const creator = { id: "c", billingProfile: { tier: "PRO" }, billingEntitlement: { tier: "PRO", entitlementRevision: 7, coreValidUntil: "2026-10-01T12:34:56Z", aiChatterValidUntil: null } };
-  const values = { '[data-entitlement-reason="c"]': "AI extension", '[data-entitlement-tier="c"]': "PRO", '[data-entitlement-outreach="c"]': "", '[data-entitlement-ai="c"]': "2026-12-01T00:00" };
-  const ui = controls(creator, values); values['[data-entitlement-core="c"]'] = ui.date(creator.billingEntitlement.coreValidUntil);
-  await ui.click();
-  assert.equal(ui.sent().body.expectedRevision, 7);
-  assert.equal(Object.hasOwn(ui.sent().body, "coreValidUntil"), false);
-  assert.equal(Object.hasOwn(ui.sent().body, "tier"), false);
-  assert.ok(ui.sent().body.aiChatterValidUntil);
+const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
+const window={};vm.runInNewContext(fs.readFileSync(require.resolve('../../public/admin/modules/admin-billing/admin-entitlements.js'),'utf8'),{window});
+const {command,value}=window.OnlinodAdminEntitlements;
+test('AI-only edit retains untouched paid timestamps and does not change core tier',()=>{
+ const model={tier:'ELITE',entitlement:{entitlementRevision:7,tier:'PRO',coreValidUntil:'2026-12-01T12:34:56.987Z',aiChatterValidUntil:null,outreachValidUntil:null}};
+ const body=command(model,{tier:'PRO',coreValidUntil:value(model.entitlement.coreValidUntil),aiChatterValidUntil:'2026-12-03T00:00:00',outreachValidUntil:'',reason:'AI extension'});
+ assert.equal(body.expectedRevision,7);assert.equal(Object.hasOwn(body,'coreValidUntil'),false);assert.equal(Object.hasOwn(body,'tier'),false);assert.equal(body.aiChatterValidUntil,'2026-12-03T00:00:00.000Z');
 });
-test("a default tier from pricing does not fabricate a core revoke while granting only an add-on", async () => {
-  const creator = { id: "c", billingProfile: { tier: "ELITE" }, billingEntitlement: null };
-  const ui = controls(creator, { '[data-entitlement-reason="c"]': "AI grant", '[data-entitlement-tier="c"]': "ELITE", '[data-entitlement-core="c"]': "", '[data-entitlement-outreach="c"]': "", '[data-entitlement-ai="c"]': "2026-12-01T00:00" });
-  await ui.click();
-  assert.equal(ui.sent().body.expectedRevision, 0);
-  assert.equal(Object.hasOwn(ui.sent().body, "coreValidUntil"), false);
-  assert.equal(Object.hasOwn(ui.sent().body, "tier"), false);
+test('addon-only grant with no prior entitlement does not fabricate core revoke',()=>{
+ const body=command({tier:'ELITE',entitlement:null},{tier:'ELITE',coreValidUntil:'',aiChatterValidUntil:'2026-12-03T00:00:00',outreachValidUntil:'',reason:'AI grant'});
+ assert.equal(body.expectedRevision,0);assert.equal(Object.hasOwn(body,'coreValidUntil'),false);assert.equal(Object.hasOwn(body,'tier'),false);
+});
+test('tier change preserves the exact core deadline, while explicit clearing revokes only that component',()=>{
+ const model={entitlement:{tier:'PRO',entitlementRevision:1,coreValidUntil:'2026-12-01T12:34:56.987Z'}};
+ const draft={tier:'ELITE',coreValidUntil:value(model.entitlement.coreValidUntil),aiChatterValidUntil:'',outreachValidUntil:'',reason:'Tier correction'};
+ assert.equal(command(model,draft).coreValidUntil,model.entitlement.coreValidUntil);
+ const revoke=command(model,{...draft,tier:'PRO',coreValidUntil:''});assert.equal(revoke.coreValidUntil,null);assert.equal(Object.hasOwn(revoke,'aiChatterValidUntil'),false);
+ assert.throws(()=>command(model,{...draft,reason:''}),/reason/);
 });

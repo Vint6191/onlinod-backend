@@ -23,7 +23,7 @@
 
     const creators       = (a.creators || []).filter((c) => !c.deletedAt);
     const readyCreators  = creators.filter((c) => c.status === "READY");
-    const activeSnaps    = (a.accessSnapshots || []).filter((s) => s.active && !s.revokedAt);
+    const activeSessions = creators.filter(c => c.sessionState?.status === "ACTIVE" && c.sessionState?.portableReady === true);
 
     // MRR estimate from billing profiles in this agency.
     let mrrCents = 0;
@@ -39,8 +39,8 @@
       <section class="adm-metric-grid">
         ${metric("creators",   `${readyCreators.length}/${creators.length}`, "ready / total")}
         ${metric("members",    String((a.members || []).length), "team")}
-        ${metric("snapshots",  String(activeSnaps.length), "active OF access")}
-        ${metric("mrr (est)",  u.formatMoneyFromCents(mrrCents), "core + addons")}
+        ${metric("sessions", String(activeSessions.length), "portable model access")}
+        ${metric("configured monthly", u.formatMoneyFromCents(mrrCents), "current model prices; paid MRR is in Billing")}
       </section>
 
       <section style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:6px;">

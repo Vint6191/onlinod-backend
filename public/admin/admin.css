@@ -258,6 +258,7 @@ body { min-height: 100vh; }
   overflow-y: auto;
   min-width: 0;
 }
+.adm-workspace { grid-area: main; min-width: 0; }
 
 .adm-page-head {
   display: flex;
@@ -969,3 +970,7 @@ body { min-height: 100vh; }
   border-color: rgba(245, 158, 11, 0.5) !important;
   box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.08);
 }
+/* Durable command recovery belongs to the current administrator. */
+#admCommandRecovery:empty { display: none; }
+#admCommandRecovery { grid-column: 1 / -1; padding: 12px 20px; border-bottom: 1px solid var(--adm-line); background: var(--adm-panel); overflow-wrap: anywhere; }
+.adm-command-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 8px; }

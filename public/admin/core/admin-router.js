@@ -83,7 +83,8 @@
     if (!parts[1]) return ["dashboard", null];
 
     const section = parts[1];
-    const param = parts[2] || null;
+    let param = null;
+    try { param = parts[2] ? decodeURIComponent(parts[2]) : null; } catch (_) { /* invalid URL */ }
 
     if (!param) return [section, null];
 
@@ -96,6 +97,7 @@
   function render() {
     const r = root();
     if (!r) return;
+    window.OnlinodAdminWorkspace.leave();
 
     if (location.pathname.startsWith("/admin-login")) {
       if (window.OnlinodAdminApi.getToken()) {
@@ -109,6 +111,13 @@
     if (!window.OnlinodAdminApi.getToken()) {
       history.replaceState({}, "", "/admin-login");
       window.OnlinodAdminLoginPage.render(r);
+      return;
+    }
+
+    if (!window.OnlinodAdminState.admin) {
+      const error = window.OnlinodAdminState.authError;
+      if (error) window.OnlinodAdminWorkspace.failure(r, error, () => window.OnlinodAdminSession.revalidate());
+      else r.innerHTML = '<div class="adm-loading">Checking admin session…</div>';
       return;
     }
 

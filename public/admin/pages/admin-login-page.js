@@ -45,8 +45,10 @@
     const submit   = root.querySelector("#admSubmit");
     const email    = root.querySelector("#admEmail");
     const password = root.querySelector("#admPassword");
+    let busy = false;
 
     async function doLogin() {
+      if (busy) return;
       const e = email.value.trim();
       const p = password.value;
       if (!e || !p) {
@@ -54,8 +56,12 @@
         return;
       }
 
-      submit.disabled = true;
+      busy = true;
+      const current = window.OnlinodAdminWorkspace.capture(submit);
+      window.OnlinodAdminWorkspace.lock(root);
       const result = await A().login({ email: e, password: p });
+      password.value = "";
+      if (!current()) return;
 
       if (!result?.ok) {
         render(root, result?.error || "Admin login failed");

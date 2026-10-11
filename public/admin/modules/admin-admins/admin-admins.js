@@ -13,50 +13,33 @@
 
 (function () {
   "use strict";
+  const W = () => window.OnlinodAdminWorkspace;
 
   const A = () => window.OnlinodAdminApi;
   const R = () => window.OnlinodAdminRouter;
   const U = () => window.OnlinodAdminUtils;
   const State = () => window.OnlinodAdminState;
 
-  const state = {
+  const state = W().local(() => ({
     loading: false,
     error: null,
     list: [],
     lastLoadedAt: 0,
-  };
+  }));
 
-  async function load(force) {
-    if (state.loading) return;
-    if (!force && state.list.length && Date.now() - state.lastLoadedAt < 30_000) return;
-
-    state.loading = true;
-    state.error = null;
-    rerender();
-
-    const result = await A().listAdminUsers();
-    state.loading = false;
-    if (!result?.ok) {
-      state.error = result?.error || "Failed to load admins";
-      state.list = [];
-    } else {
-      state.list = Array.isArray(result.admins) ? result.admins : [];
-      state.lastLoadedAt = Date.now();
-    }
-    rerender();
+  function load(force) {
+    return W().load({ section: "admins", state: state, force,
+      fetch: () => A().listAdminUsers(), apply: result => { state.list = Array.isArray(result.admins) ? result.admins : []; }, render });
   }
 
-  function rerender() {
-    const main = document.getElementById("admMain");
-    if (main) render(main);
-  }
+  function rerender() { W().paint("admins", render); }
 
   function render(main) {
     const r = R();
     const u = U();
     const me = State().admin || {};
 
-    if (!state.list.length && !state.loading && !state.error) load(false);
+    if (W().needsRead(state)) load(false);
 
     main.innerHTML = `
       <div class="adm-page-head">
@@ -103,6 +86,7 @@
     `;
 
     bind(main);
+    W().superOnly(main, "#admAdminsCreate, [data-admin-role], [data-admin-toggle], [data-admin-pwd]");
   }
 
   function renderRow(adm, me) {
@@ -167,10 +151,11 @@
     // Role change
     main.querySelectorAll("[data-admin-role]").forEach((sel) => {
       const original = sel.value;
-      sel.addEventListener("change", async () => {
+      sel.addEventListener("change", () => W().action(sel.closest("tr"), async current => {
         const id = sel.dataset.adminRole;
         const newRole = sel.value;
         const result = await A().patchAdminUser(id, { role: newRole, expectedEpoch: epoch(id), reason: "admin role change" });
+        if (!current()) return;
         if (!result?.ok) {
           R().toast(result?.error || "Role change failed");
           sel.value = original;
@@ -178,19 +163,20 @@
         }
         R().toast(`role → ${newRole.toLowerCase()}`);
         load(true);
-      });
+      }));
     });
 
     // Disable / enable
     main.querySelectorAll("[data-admin-toggle]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
+      btn.addEventListener("click", () => W().action(btn.closest("tr"), async current => {
         const id = btn.dataset.adminToggle;
         const wasActive = btn.dataset.adminActive === "1";
         if (wasActive && !confirm("Disable this admin?\n\nAll their sessions will be revoked.")) return;
         const result = await A().patchAdminUser(id, { active: !wasActive, expectedEpoch: epoch(id), reason: wasActive ? "admin disable" : "admin enable" });
+        if (!current()) return;
         R().toast(result?.ok ? (wasActive ? "admin disabled" : "admin enabled") : (result?.error || "failed"));
         if (result?.ok) load(true);
-      });
+      }));
     });
 
     // Reset password
@@ -228,7 +214,7 @@
           </div>
           <div class="adm-field">
             <label>password</label>
-            <input class="adm-input mono" id="admNewAdminPwd" type="text" placeholder="min 8 chars">
+            <input class="adm-input mono" id="admNewAdminPwd" type="password" autocomplete="new-password" placeholder="8–72 UTF-8 bytes">
           </div>
           <div class="adm-field">
             <label>role</label>
@@ -252,7 +238,7 @@
       el.addEventListener("click", () => { slot.innerHTML = ""; });
     });
 
-    slot.querySelector("#admNewAdminSubmit").addEventListener("click", async () => {
+    slot.querySelector("#admNewAdminSubmit").addEventListener("click", () => W().action(slot.querySelector(".adm-drawer"), async current => {
       const email = slot.querySelector("#admNewAdminEmail").value.trim();
       const name  = slot.querySelector("#admNewAdminName").value.trim();
       const pwd   = slot.querySelector("#admNewAdminPwd").value;
@@ -271,6 +257,7 @@
       }
 
       const result = await A().createAdminUser({ email, name: name || undefined, password: pwd, role, reason: "create admin account" });
+      if (!current()) return;
       if (!result?.ok) {
         errBox.innerHTML = `<div class="adm-error">${R().escapeHtml(result?.error || "create failed")}</div>`;
         return;
@@ -278,7 +265,7 @@
       R().toast("admin created");
       slot.innerHTML = "";
       load(true);
-    });
+    }));
   }
 
   // ── Reset password modal ────────────────────────────────────
@@ -299,7 +286,7 @@
         <div class="adm-drawer-body">
           <div class="adm-field">
             <label>new password</label>
-            <input class="adm-input mono" id="admPwdValue" type="text" placeholder="min 8 chars">
+            <input class="adm-input mono" id="admPwdValue" type="password" autocomplete="new-password" placeholder="8–72 UTF-8 bytes">
           </div>
           <div class="adm-field">
             <label>reason (audit)</label>
@@ -318,7 +305,7 @@
       el.addEventListener("click", () => { slot.innerHTML = ""; });
     });
 
-    slot.querySelector("#admPwdSubmit").addEventListener("click", async () => {
+    slot.querySelector("#admPwdSubmit").addEventListener("click", () => W().action(slot.querySelector(".adm-drawer"), async current => {
       const pwd    = slot.querySelector("#admPwdValue").value;
       const reason = slot.querySelector("#admPwdReason").value.trim();
       const errBox = slot.querySelector("#admPwdError");
@@ -330,6 +317,7 @@
       }
 
       const result = await A().resetAdminPwd(adminId, { password: pwd, expectedEpoch, reason: reason || "admin password reset" });
+      if (!current()) return;
       if (!result?.ok) {
         errBox.innerHTML = `<div class="adm-error">${R().escapeHtml(result?.error || "reset failed")}</div>`;
         return;
@@ -337,7 +325,7 @@
       R().toast("password set — sessions revoked");
       slot.innerHTML = "";
       load(true);
-    });
+    }));
   }
 
   window.OnlinodAdminAdmins = { render };

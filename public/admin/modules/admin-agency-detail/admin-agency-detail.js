@@ -18,6 +18,7 @@
 
 (function () {
   "use strict";
+  const W = () => window.OnlinodAdminWorkspace;
 
   const State = () => window.OnlinodAdminState;
   const StateApi = () => window.OnlinodAdminStateApi;
@@ -39,36 +40,15 @@
     return StateApi().ensureAgencyDetail(id);
   }
 
-  async function load(force) {
+  function load(force) {
     const id = State().sectionParam;
     if (!id) return;
-
-    const slice = StateApi().ensureAgencyDetail(id);
-    if (slice.loading) return;
-    if (!force && slice.data && Date.now() - slice.lastLoadedAt < 30_000) return;
-
-    slice.loading = true;
-    slice.error = null;
-    rerender();
-
-    const result = await A().getAgency(id);
-    slice.loading = false;
-
-    if (!result?.ok) {
-      slice.error = result?.error || "Failed to load agency";
-      slice.data = null;
-    } else {
-      slice.data = result;
-      slice.lastLoadedAt = Date.now();
-    }
-
-    rerender();
+    const slice = StateApi().ensureAgencyDetail(State().sectionParam);
+    return W().load({ section: "agency-detail", state: slice, force,
+      fetch: () => A().getAgency(id), apply: result => { slice.data = result; }, render });
   }
 
-  function rerender() {
-    const main = document.getElementById("admMain");
-    if (main) render(main);
-  }
+  function rerender() { W().paint("agency-detail", render); }
 
   function render(main) {
     const id = State().sectionParam;
@@ -87,7 +67,7 @@
     const u = U();
 
     // Auto-load.
-    if (!slice.data && !slice.loading && !slice.error) {
+    if (W().needsRead(slice)) {
       load(false);
     }
 
@@ -130,6 +110,7 @@
     bindHeader(main, slice);
     bindTabStrip(main, slice);
     bindTabBody(main, slice, tab);
+    W().superOnly(main, '[data-action="soft-delete"], [data-action="hard-delete"], [data-action="restore"], [data-member-role], [data-member-kick], [data-creator-delete], #admSubHold');
   }
 
   function renderBackBar(id) {
@@ -273,7 +254,7 @@
 
   function bindHeader(main, slice) {
     main.querySelectorAll("[data-action]").forEach((btn) => {
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", () => W().action(main, async () => {
         const action = btn.dataset.action;
         const a = slice.data.agency;
 
@@ -282,7 +263,7 @@
         if (action === "soft-delete")  return window.OnlinodAdminAgencyDetailActions.doSoftDelete(a.id);
         if (action === "hard-delete")  return window.OnlinodAdminAgencyDetailActions.doHardDelete(a.id);
         if (action === "restore")      return window.OnlinodAdminAgencyDetailActions.doRestore(a.id);
-      });
+      }));
     });
   }
 

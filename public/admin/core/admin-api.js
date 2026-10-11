@@ -19,6 +19,7 @@
   }
 
   function setToken(token) {
+    if (getToken() === (token || "")) return;
     if (token) localStorage.setItem(TOKEN_KEY, token);
     else localStorage.removeItem(TOKEN_KEY);
     window.dispatchEvent?.(new window.CustomEvent("onlinod:admin-session-changed"));
@@ -87,7 +88,7 @@
       }
     } else {
       const text = await res.text();
-      data = { ok: res.ok, text };
+      data = { ok: false, code: "INVALID_JSON", error: "Server returned an unexpected response. Retry the request." };
     }
 
     if (command && res.ok && (data?.ok !== true || data.commandId !== command.commandId)) data = { ok: false, code: "ADMIN_COMMAND_RESPONSE_UNKNOWN", commandId: command.commandId, error: "Result could not be confirmed. Retry the same change or check its status." };

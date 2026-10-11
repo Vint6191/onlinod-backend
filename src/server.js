@@ -85,6 +85,12 @@ function readAllowedOrigins() {
     .split(",")
     .map((x) => x.trim())
     .filter(Boolean);
+  // The Admin UI is served by this configured backend origin as well.
+  // Do not derive trust from the request's Host/Origin headers.
+  try {
+    const published = new URL(process.env.PUBLIC_BASE_URL);
+    if (["https:", "http:"].includes(published.protocol)) extra.push(published.origin);
+  } catch (_) { /* Unconfigured deployments keep the explicit allowlist. */ }
   return new Set([...DEFAULT_ALLOWED_ORIGINS, ...extra]);
 }
 

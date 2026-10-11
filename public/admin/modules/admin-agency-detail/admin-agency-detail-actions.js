@@ -13,6 +13,7 @@
 (function () {
   "use strict";
 
+  const W = () => window.OnlinodAdminWorkspace;
   const A = () => window.OnlinodAdminApi;
   const R = () => window.OnlinodAdminRouter;
 
@@ -34,6 +35,7 @@
   }
 
   async function doSoftDelete(agencyId) {
+    const current = W().capture(document.getElementById("admMain"));
     const reason = reasonForAction("Reason for deleting this agency? (required)");
     if (!reason) return;
 
@@ -45,6 +47,7 @@
     if (!really) return;
 
     const result = await A().deleteAgency(agencyId, { reason, expectedUpdatedAt: shownAgency()?.updatedAt, hard: false });
+    if (!current()) return;
     if (!result?.ok) {
       R().toast(result?.error || "Delete failed");
       return;
@@ -54,9 +57,11 @@
   }
 
   async function doRestore(agencyId) {
+    const current = W().capture(document.getElementById("admMain"));
     if (!confirm("Restore this agency?\n\nAccess will be recalculated from current billing entitlements.")) return;
     const reason = reasonForAction("Reason for restoring this agency?"); if (!reason) return;
     const result = await A().restoreAgency(agencyId, { reason, expectedUpdatedAt: shownAgency()?.updatedAt });
+    if (!current()) return;
     if (!result?.ok) {
       R().toast(result?.error || "Restore failed");
       return;
@@ -66,9 +71,10 @@
   }
 
   async function doHardDelete(agencyId) {
+    const current = W().capture(document.getElementById("admMain"));
     const confirmText = prompt(
       "HARD DELETE — this is irreversible.\n\n" +
-      "All members, creators, snapshots, billing history will be removed.\n" +
+      "All members, creators, sessions, billing history will be removed.\n" +
       "Type 'DELETE' to confirm:"
     );
     if (confirmText !== "DELETE") {
@@ -82,20 +88,23 @@
     }
 
     const result = await A().deleteAgency(agencyId, { hard: true, reason, expectedUpdatedAt: shownAgency()?.updatedAt });
+    if (!current()) return;
     if (!result?.ok) {
       R().toast(result?.error || "Hard delete failed");
       return;
     }
     R().toast(result?.pending ? "agency hard-delete scheduled — cleanup is running" : "agency hard-deleted");
-    setTimeout(() => R().pushSection("agencies"), 800);
+    R().pushSection("agencies");
   }
 
   // ─── Members ───────────────────────────────────────────────
 
   async function changeMemberRole(memberId, role, onError) {
+    const current = W().capture(document.getElementById("admMain"));
     const reason = reasonForAction("Reason for changing member role?"); if (!reason) { onError?.(); return; }
     const member = shownMember(memberId);
     const result = await A().patchMemberRole(memberId, { role, reason, agencyId: shownAgency()?.id, expectedAccessEpoch: member?.accessEpoch });
+    if (!current()) return;
     if (!result?.ok) {
       R().toast(result?.error || "Role change failed");
       onError?.();
@@ -106,9 +115,11 @@
   }
 
   async function kickMember(memberId) {
+    const current = W().capture(document.getElementById("admMain"));
     const reason = reasonForAction("Reason for removing this member?"); if (!reason) return;
     const member = shownMember(memberId);
     const result = await A().deleteMember(memberId, { reason, agencyId: shownAgency()?.id, expectedAccessEpoch: member?.accessEpoch });
+    if (!current()) return;
     if (!result?.ok) {
       R().toast(result?.error || "Kick failed");
       return;
@@ -120,9 +131,11 @@
   // ─── Creators ──────────────────────────────────────────────
 
   async function deleteCreator(creatorId) {
+    const current = W().capture(document.getElementById("admMain"));
     const reason = reasonForAction("Reason for removing this creator?"); if (!reason) return;
     const creator = shownAgency()?.creators?.find(c => c.id === creatorId);
     const result = await A().deleteCreator(creatorId, { reason, agencyId: shownAgency()?.id, expectedUpdatedAt: creator?.updatedAt, hard: false });
+    if (!current()) return;
     if (!result?.ok) {
       R().toast(result?.error || "Delete failed");
       return;
@@ -134,7 +147,9 @@
   // ─── Subscription ──────────────────────────────────────────
 
   async function saveSubscription(agencyId, body) {
+    const current = W().capture(document.getElementById("admMain"));
     const result = await A().patchSubscription(agencyId, body);
+    if (!current()) return;
     if (!result?.ok) {
       R().toast(result?.error || "Subscription save failed");
       return;

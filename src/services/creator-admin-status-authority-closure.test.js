@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const ADMIN_ROUTE = fs.readFileSync(path.join(__dirname, "../routes/admin.js"), "utf8");
-const ADMIN_PAGE = fs.readFileSync(path.join(__dirname, "../../public/pages/admin.js"), "utf8");
+const ADMIN_PAGE = fs.readFileSync(path.join(__dirname, "../../public/admin/modules/admin-agency-detail/admin-agency-detail-tabs.js"), "utf8");
 
 function statusRouteSource() {
   const start = ADMIN_ROUTE.indexOf('router.patch("/creators/:id/status"');
@@ -36,5 +36,5 @@ test("legacy admin status endpoint cannot forge READY or bypass full DISABLED re
 test("admin UI no longer exposes direct READY or DISABLED status toggles", () => {
   assert.doesNotMatch(ADMIN_PAGE, /data-admin-creator-status/);
   assert.doesNotMatch(ADMIN_PAGE, /manual admin status change/);
-  assert.match(ADMIN_PAGE, /data-admin-delete-creator/);
+  assert.match(ADMIN_PAGE, /data-creator-delete/);
 });

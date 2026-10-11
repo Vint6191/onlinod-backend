@@ -16,6 +16,7 @@
 
 (function () {
   "use strict";
+  const W = () => window.OnlinodAdminWorkspace;
 
   const State = () => window.OnlinodAdminState;
   const A     = () => window.OnlinodAdminApi;
@@ -36,35 +37,13 @@
     return s.agencies;
   }
 
-  async function load(force) {
+  function load(force) {
     const slice = ensureSlice();
-    if (slice.loading) return;
-    if (!force && slice.list.length && Date.now() - slice.lastLoadedAt < 30_000) return;
-
-    slice.loading = true;
-    slice.error = null;
-    rerender();
-
-    const result = await A().listAgencies({
-      includeDeleted: slice.filters.includeDeleted ? "1" : undefined,
-    });
-
-    slice.loading = false;
-    if (!result?.ok) {
-      slice.error = result?.error || "Failed to load agencies";
-      slice.list = [];
-    } else {
-      slice.list = Array.isArray(result.agencies) ? result.agencies : [];
-      slice.lastLoadedAt = Date.now();
-    }
-
-    rerender();
+    return W().load({ section: "agencies", state: slice, force,
+      fetch: () => A().listAgencies({ includeDeleted: slice.filters.includeDeleted ? "1" : undefined }), apply: result => { slice.list = Array.isArray(result.agencies) ? result.agencies : []; }, render });
   }
 
-  function rerender() {
-    const main = document.getElementById("admMain");
-    if (main) render(main);
-  }
+  function rerender() { W().paint("agencies", render); }
 
   function applyClientFilters(list, filters) {
     let out = list;
@@ -91,7 +70,7 @@
     const u = U();
 
     // Auto-load on first render.
-    if (!slice.list.length && !slice.loading && !slice.error) {
+    if (W().needsRead(slice)) {
       load(false);
     }
 
@@ -156,7 +135,7 @@
                     <th>status</th>
                     <th>creators</th>
                     <th>members</th>
-                    <th>snapshots</th>
+                    <th>sessions</th>
                     <th>health</th>
                     <th>created</th>
                     <th></th>
@@ -208,7 +187,7 @@
 
         <td class="adm-cell-num">${r.escapeHtml(String(a.counts?.members || 0))}</td>
 
-        <td class="adm-cell-num">${r.escapeHtml(String(a.counts?.activeSnapshots || 0))}</td>
+        <td class="adm-cell-num">${r.escapeHtml(String(a.counts?.activeCanonicalSessions || 0))}</td>
 
         <td>${u.healthBadge(a.health)}</td>
 

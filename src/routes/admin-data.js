@@ -47,6 +47,11 @@ function clamp(n, lo, hi, dflt) {
 function limitOf(q) { return clamp(q.limit, 1, 500, 100); }
 function offsetOf(q) { return Math.max(0, clamp(q.offset, 0, 10_000_000, 0)); }
 function str(v) { const s = String(v ?? "").trim(); return s || null; }
+function pageOf(query, items, total) {
+  const offset = offsetOf(query), nextOffset = offset + items.length;
+  const hasMore = items.length > 0 && nextOffset < total;
+  return { hasMore, nextOffset: hasMore ? nextOffset : null, offset, limit: limitOf(query) };
+}
 
 async function resolveCreatorScope(creatorId, agencyId = null) {
   const id = str(creatorId);
@@ -88,13 +93,13 @@ router.get("/deliveries", async (req, res) => {
     if (str(req.query.status)) where.status = str(req.query.status);
     if (str(req.query.fanId)) where.fanId = str(req.query.fanId);
     const [items, total, byStatus] = await Promise.all([
-      prisma.automationDelivery.findMany({ where, orderBy: { createdAt: "desc" }, take: limitOf(req.query), skip: offsetOf(req.query) }),
+      prisma.automationDelivery.findMany({ where, orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: limitOf(req.query), skip: offsetOf(req.query) }),
       prisma.automationDelivery.count({ where }),
       prisma.automationDelivery.groupBy({ by: ["status"], where, _count: { _all: true } }),
     ]);
     const statusCounts = {};
     for (const r of byStatus) statusCounts[r.status] = r._count._all;
-    return res.json({ ok: true, total, statusCounts, items });
+    return res.json({ ok: true, total, statusCounts, items, ...pageOf(req.query, items, total) });
   } catch (err) { return sendErr(res, err); }
 });
 
@@ -131,7 +136,7 @@ router.get("/hidden-online", async (req, res) => {
       agencyId: scope.agencyId, creatorId: scope.id, status: str(req.query.status) || "all", search: str(req.query.q) || "",
       limit: limitOf(req.query), offset: offsetOf(req.query), sort: str(req.query.sort) || "recent",
     });
-    return res.json({ ok: true, authority: "canonical_current", total: result.count || 0, items: result.items || [] });
+    return res.json({ ok: true, authority: "canonical_current", total: result.count || 0, items: result.items || [], ...pageOf(req.query, result.items || [], result.count || 0) });
   } catch (err) { return sendErr(res, err); }
 });
 
@@ -144,7 +149,7 @@ router.get("/follow-back", async (req, res) => {
       agencyId: scope.agencyId, creatorId: scope.id, state, search: str(req.query.q) || "",
       limit: limitOf(req.query), offset: offsetOf(req.query),
     });
-    return res.json({ ok: true, authority: "canonical_current", total: result.count || 0, items: result.items || [], metrics: result.metrics || null });
+    return res.json({ ok: true, authority: "canonical_current", total: result.count || 0, items: result.items || [], metrics: result.metrics || null, ...pageOf(req.query, result.items || [], result.count || 0) });
   } catch (err) { return sendErr(res, err); }
 });
 
@@ -154,11 +159,11 @@ router.get("/money", async (req, res) => {
     if (str(req.query.agencyId)) where.agencyId = str(req.query.agencyId);
     if (str(req.query.creatorId)) where.creatorId = str(req.query.creatorId);
     const [items, total, sum] = await Promise.all([
-      prisma.moneyAttribution.findMany({ where, orderBy: { occurredAt: "desc" }, take: limitOf(req.query), skip: offsetOf(req.query) }),
+      prisma.moneyAttribution.findMany({ where, orderBy: [{ occurredAt: "desc" }, { id: "desc" }], take: limitOf(req.query), skip: offsetOf(req.query) }),
       prisma.moneyAttribution.count({ where }),
       prisma.moneyAttribution.aggregate({ where, _sum: { amountCents: true } }),
     ]);
-    return res.json({ ok: true, total, totalCents: sum._sum.amountCents || 0, items });
+    return res.json({ ok: true, total, totalCents: sum._sum.amountCents || 0, items, ...pageOf(req.query, items, total) });
   } catch (err) { return sendErr(res, err); }
 });
 
@@ -169,10 +174,11 @@ router.get("/content", async (req, res) => {
     if (str(req.query.creatorId)) where.creatorId = str(req.query.creatorId);
     if (str(req.query.kind)) where.kind = str(req.query.kind);
     const items = await prisma.contentCollection.findMany({
-      where, orderBy: { updatedAt: "desc" }, take: limitOf(req.query), skip: offsetOf(req.query),
+      where, orderBy: [{ updatedAt: "desc" }, { id: "desc" }], take: limitOf(req.query), skip: offsetOf(req.query),
       include: { _count: { select: { blocks: true } } },
     });
-    return res.json({ ok: true, items });
+    const total = await prisma.contentCollection.count({ where });
+    return res.json({ ok: true, items, total, ...pageOf(req.query, items, total) });
   } catch (err) { return sendErr(res, err); }
 });
 

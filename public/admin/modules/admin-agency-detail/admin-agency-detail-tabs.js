@@ -12,6 +12,7 @@
 
 (function () {
   "use strict";
+  const W = () => window.OnlinodAdminWorkspace;
 
   const R = () => window.OnlinodAdminRouter;
   const U = () => window.OnlinodAdminUtils;
@@ -85,23 +86,23 @@
   function bindMembers(main, slice) {
     main.querySelectorAll("[data-member-role]").forEach((sel) => {
       const original = sel.value;
-      sel.addEventListener("change", async () => {
+      sel.addEventListener("change", () => W().action(main, async () => {
         const memberId = sel.dataset.memberRole;
         const newRole  = sel.value;
         await Actions().changeMemberRole(memberId, newRole, () => {
           // On error (e.g. last owner), revert select.
           sel.value = original;
         });
-      });
+      }));
     });
 
     main.querySelectorAll("[data-member-kick]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
+      btn.addEventListener("click", () => W().action(main, async () => {
         const memberId = btn.dataset.memberKick;
         const email    = btn.dataset.memberEmail || "this member";
         if (!confirm(`Remove ${email} from this agency?\n\nTheir refresh sessions will be revoked. They keep their user account.`)) return;
         await Actions().kickMember(memberId);
-      });
+      }));
     });
   }
 
@@ -121,7 +122,7 @@
     }
 
     const renderRow = (c, muted) => {
-      const snap = (c.accessSnapshots || []).find((s) => s.active && !s.revokedAt);
+      const snap = c.sessionState?.status === "ACTIVE" && c.sessionState?.portableReady === true;
       const tier = c.billingProfile?.tier || "—";
       return `
         <tr ${muted ? `class="muted"` : ""}>
@@ -168,7 +169,7 @@
                 <th>creator</th>
                 <th>status</th>
                 <th>tier</th>
-                <th>snapshot</th>
+                <th>session</th>
                 <th>created</th>
                 <th></th>
               </tr>
@@ -185,12 +186,12 @@
 
   function bindCreators(main, slice) {
     main.querySelectorAll("[data-creator-delete]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
+      btn.addEventListener("click", () => W().action(main, async () => {
         const id   = btn.dataset.creatorDelete;
         const name = btn.dataset.creatorName || "this creator";
-        if (!confirm(`Soft-delete ${name}?\n\nActive snapshots will be revoked. Soft delete is reversible — admin can restore later.`)) return;
+        if (!confirm(`Soft-delete ${name}?\n\nModel access will be retired. Active work can block removal.`)) return;
         await Actions().deleteCreator(id);
-      });
+      }));
     });
   }
 
@@ -255,16 +256,17 @@
     const save = main.querySelector("#admSubSave");
     if (!save) return;
 
-    main.querySelector("#admSubHold")?.addEventListener("click", async () => {
+    main.querySelector("#admSubHold")?.addEventListener("click", () => W().action(main, async current => {
       const agency = slice.data.agency;
       const reason = main.querySelector("#admSubReason").value.trim();
       if (!reason) return R().toast("Reason is required");
       const result = await window.OnlinodAdminApi.setBillingHold(agency.id, { enabled: !agency.billingSupportHold, expectedRevision: agency.billingPolicyRevision, reason });
+      if (!current()) return;
       R().toast(result?.ok ? "Billing hold updated — refresh current values" : result?.error || "Failed");
       if (result?.ok) window.OnlinodAdminAgencyDetailActions.reloadDetail?.();
-    });
+    }));
 
-    save.addEventListener("click", async () => {
+    save.addEventListener("click", () => W().action(main, async () => {
       const plan      = main.querySelector("#admSubPlan").value.trim();
       const trialRaw  = main.querySelector("#admSubTrial").value.trim();
       const reason    = main.querySelector("#admSubReason").value.trim();
@@ -279,7 +281,7 @@
       };
 
       await Actions().saveSubscription(slice.data.agency.id, body);
-    });
+    }));
   }
 
   // ════════════════════════════════════════════════════════════

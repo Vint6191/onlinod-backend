@@ -14,8 +14,9 @@
   const R = () => window.OnlinodAdminRouter;
   const esc = (v) => R().escapeHtml(v);
   const money = (c) => "$" + (Number(c || 0) / 100).toFixed(2);
+  const W = () => window.OnlinodAdminWorkspace;
 
-  const local = { view: "overview", agencyId: null, tiers: null, overviewAfter: null, modelsAfter: null };
+  const local = W().local(() => ({ view: "overview", agencyId: null, tiers: null, overviewAfter: null, modelsAfter: null }));
 
   function pageControls(page, after) {
     return `<div class="adm-bulk-bar"><button class="adm-btn bl-page-first" ${after ? "" : "disabled"}>First page</button><button class="adm-btn bl-page-next" ${page?.nextCursor ? "" : "disabled"}>Next page</button><span>Up to 100 rows per page</span></div>`;
@@ -26,18 +27,23 @@
   }
 
   async function render(main) {
-    if (local.view === "agency" && local.agencyId) return renderAgency(main, local.agencyId);
+    const agencyId = window.OnlinodAdminState.sectionParam;
+    if (agencyId !== local.agencyId) local.modelsAfter = null;
+    local.agencyId = agencyId;
+    if (agencyId) return renderAgency(main, agencyId);
     return renderOverview(main);
   }
 
   // ── OVERVIEW ────────────────────────────────────────────────
   async function renderOverview(main) {
+    const current = W().request(main);
     main.innerHTML = '<div id="blCommercialPolicy"></div><div id="blOverview"></div>';
     window.OnlinodAdminCommercialPolicy?.render(main.querySelector("#blCommercialPolicy"));
     const overview = main.querySelector("#blOverview");
     overview.innerHTML = `<div class="adm-page"><div class="adm-loading">loading billing…</div></div>`;
     const r = await A().billingOverview(local.overviewAfter);
-    if (!r || !r.ok) { overview.innerHTML = `<div class="adm-page"><div class="adm-error">failed to load billing</div></div>`; return; }
+    if (!current()) return;
+    if (!r || !r.ok) return W().failure(overview, r?.error || "Failed to load billing", () => renderOverview(main));
 
     const m = r.mrr || {};
     const kpis = [
@@ -77,15 +83,17 @@
 
     bindPage(overview, r.page, after => { local.overviewAfter = after; return renderOverview(main); });
     overview.querySelectorAll("tr[data-agency]").forEach((tr) => tr.addEventListener("click", () => {
-      local.view = "agency"; local.agencyId = tr.dataset.agency; local.modelsAfter = null; render(main);
+      R().pushDetail("billing", tr.dataset.agency);
     }));
   }
 
   // ── AGENCY DETAIL (per-model editor) ────────────────────────
   async function renderAgency(main, agencyId) {
+    const current = W().request(main);
     main.innerHTML = `<div class="adm-page"><div class="adm-loading">loading agency billing…</div></div>`;
     const r = await A().billingAgency(agencyId, local.modelsAfter);
-    if (!r || !r.ok) { main.innerHTML = `<div class="adm-page"><div class="adm-error">failed</div></div>`; return; }
+    if (!current()) return;
+    if (!r || !r.ok) return W().failure(main, r?.error || "Failed to load agency billing", () => renderAgency(main, agencyId));
     local.tiers = r.tiers || {};
 
     const tierOpts = (sel) => Object.entries(r.tiers).map(([k, v]) =>
@@ -93,7 +101,7 @@
 
     const priceSource = (component, value) => `<select class="bl-${component}-source"><option value="CATALOG" ${value !== "OVERRIDE" ? "selected" : ""}>Global price</option><option value="OVERRIDE" ${value === "OVERRIDE" ? "selected" : ""}>Individual price</option></select>`;
     const rows = (r.models || []).map((m) => `
-      <tr data-creator="${esc(m.creatorId)}" data-pricing-revision="${Number(m.pricingRevision || 0)}" data-configured-line="${Number(m.configuredLineCents || 0)}" class="${m.billingExcluded ? "adm-row-excluded" : ""}">
+      <tr data-creator="${esc(m.creatorId)}" data-auto-tier="${esc(m.tier === "CUSTOM" ? "STARTER" : m.tier || "STARTER")}" data-pricing-revision="${Number(m.pricingRevision || 0)}" data-configured-line="${Number(m.configuredLineCents || 0)}" class="${m.billingExcluded ? "adm-row-excluded" : ""}">
         <td>
           <label><input class="bl-select" type="checkbox" ${m.billingExcluded ? "disabled" : ""}> <b>${esc(m.displayName || m.username || m.creatorId.slice(-8))}</b></label>
           <div class="adm-muted">@${esc(m.username || "—")} · ${esc(m.creatorStatus || "")}</div>
@@ -110,7 +118,7 @@
         </td>
         <td><label><input type="checkbox" class="bl-excl" ${m.billingExcluded ? "checked" : ""}> excl</label></td>
         <td class="adm-money bl-line">${money(m.configuredLineCents)}</td>
-        <td><button class="adm-btn adm-btn-sm bl-save">save</button><button class="adm-btn adm-btn-sm bl-check" hidden>check result</button></td>
+        <td><button class="adm-btn adm-btn-sm bl-save">save</button><button class="adm-btn adm-btn-sm bl-access">access</button><button class="adm-btn adm-btn-sm bl-check" hidden>check result</button></td>
       </tr>`).join("");
 
     const sub = r.subscription;
@@ -157,7 +165,7 @@
       </div>`;
 
     bindPage(main, r.page, after => { local.modelsAfter = after; return renderAgency(main, agencyId); });
-    main.querySelector("#blBack").addEventListener("click", () => { local.view = "overview"; render(main); });
+    main.querySelector("#blBack").addEventListener("click", () => R().pushSection("billing"));
 
     // tier select auto-fills price from catalog (except CUSTOM)
     main.querySelectorAll("tr[data-creator]").forEach((tr) => {
@@ -168,30 +176,36 @@
       function applySources() {
         const automatic = mode.value === "AUTO";
         tierSel.disabled = automatic;
-        if (automatic) coreSource.value = "CATALOG";
+        if (automatic) { coreSource.value = "CATALOG"; tierSel.value = tr.dataset.autoTier; }
         coreSource.disabled = automatic;
         for (const [component, selector] of [["core", ".bl-price"], ["ai", ".bl-ai-price"], ["or", ".bl-or-price"]]) tr.querySelector(selector).disabled = tr.querySelector(`.bl-${component}-source`).value === "CATALOG";
+        if (coreSource.value === "CATALOG" && r.tiers[tierSel.value]?.priceCents != null) priceInp.value = (r.tiers[tierSel.value].priceCents / 100).toFixed(2);
+        for (const [ui, key] of [["ai", "aiChatter"], ["or", "outreach"]]) {
+          if (tr.querySelector(`.bl-${ui}-source`).value === "CATALOG" && r.addons?.[key]) tr.querySelector(`.bl-${ui}-price`).value = (r.addons[key].priceCents / 100).toFixed(2);
+        }
+        recalcLine(tr); recalcTotal(main);
       }
       mode.addEventListener("change", applySources);
       for (const component of ["core", "ai", "or"]) tr.querySelector(`.bl-${component}-source`).addEventListener("change", applySources);
       applySources();
       tierSel.addEventListener("change", () => {
-        const t = tierSel.value;
-        if (t !== "CUSTOM" && r.tiers[t]) priceInp.value = (r.tiers[t].priceCents / 100).toFixed(2);
-        recalcLine(tr); recalcTotal(main);
+        if (tierSel.value === "CUSTOM") coreSource.value = "OVERRIDE";
+        applySources();
       });
       tr.querySelectorAll("input").forEach((inp) => inp.addEventListener("input", () => { recalcLine(tr); recalcTotal(main); }));
-      tr.querySelector(".bl-save").addEventListener("click", () => saveLine(main, tr));
+      tr.querySelector(".bl-save").addEventListener("click", () => W().action(tr, () => saveLine(main, tr)));
+      tr.querySelector(".bl-access").addEventListener("click", () => window.OnlinodAdminEntitlements.open(r.models.find(model => model.creatorId === tr.dataset.creator), () => renderAgency(main, agencyId)));
       tr.querySelector(".bl-check").addEventListener("click", async () => {
         try {
           const result = await A().resolveCommand(`/api/admin/billing/creator/${encodeURIComponent(tr.dataset.creator)}`, "PATCH");
+          if (!current()) return;
           if (!result.pending) { R().toast("Result confirmed; current prices reloaded", "ok"); await renderAgency(main, agencyId); }
           else R().toast("Result is still unknown. Retry the same change.", "error");
         } catch (_) { R().toast("Status could not be retrieved. Retry later.", "error"); }
       });
     });
 
-    const bulkStorageKey = `onlinod_admin_bulk:${agencyId}`;
+    const bulkStorageKey = `onlinod_admin_bulk:${window.OnlinodAdminState.admin.id}:${agencyId}`;
     let bulkCommandId = null;
     try { bulkCommandId = sessionStorage.getItem(bulkStorageKey); } catch (_) {}
     let submitting = false;
@@ -200,6 +214,7 @@
     async function checkBulk() {
       if (!bulkCommandId) { progressEl.textContent = "No submitted command in this tab."; return; }
       const status = await A().commandStatus(bulkCommandId);
+      if (!current()) return;
       if (!status?.ok) { progressEl.textContent = status?.error || "Result unknown; retry the same selection."; return; }
       const p = status.execution?.progress;
       resumePayload = status.execution?.resume || null;
@@ -225,6 +240,7 @@
       const button = main.querySelector("#blBulkApply"); button.disabled = true;
       try {
         const res = await A().billingApplyTier(agencyId, body);
+        if (!current()) return;
         if (res?.commandId) { bulkCommandId = res.commandId; try { sessionStorage.setItem(bulkStorageKey, bulkCommandId); } catch (_) {} }
         R().toast(res?.accepted ? "Selection accepted; check progress for completion." : res?.error || "Submission failed", res?.accepted ? "ok" : "error");
         if (res?.accepted) await checkBulk();
@@ -239,6 +255,7 @@
       submitting = true;
       try {
         const res = await A().billingApplyTier(agencyId, { ...resumePayload, reason });
+        if (!current()) return;
         if (res?.commandId) { bulkCommandId = res.commandId; try { sessionStorage.setItem(bulkStorageKey, bulkCommandId); } catch (_) {} }
         R().toast(res?.accepted ? "Remaining selection accepted." : res?.error || "Resume failed", res?.accepted ? "ok" : "error");
         if (res?.accepted) await checkBulk();
@@ -253,6 +270,7 @@
       submitting = true;
       try {
         const res = await A().billingCancelTier(agencyId, { targetCommandId: bulkCommandId, reason });
+        if (!current()) return;
         R().toast(res?.ok ? "Cancellation confirmed." : res?.error || "Cancellation result unknown; retry.", res?.ok ? "ok" : "error");
         await checkBulk();
       } catch (_) { progressEl.textContent = "Cancellation result unknown; check or retry."; }
@@ -276,8 +294,7 @@
   }
 
   async function saveLine(main, tr) {
-    const btn = tr.querySelector(".bl-save");
-    btn.disabled = true; btn.textContent = "…";
+    const btn = tr.querySelector(".bl-save"), current = W().capture(tr);
     const body = {
       expectedRevision: Number(tr.dataset.pricingRevision),
       tierMode: tr.querySelector(".bl-mode").value,
@@ -289,13 +306,20 @@
     if (body.tierMode === "MANUAL") body.tier = tr.querySelector(".bl-tier").value;
     for (const [component, ui, selector] of [["core", "core", ".bl-price"], ["aiChatter", "ai", ".bl-ai-price"], ["outreach", "or", ".bl-or-price"]]) {
       body[component + "PriceSource"] = tr.querySelector(`.bl-${ui}-source`).value;
-      if (body[component + "PriceSource"] === "OVERRIDE") body[component + "PriceCents"] = Math.round(Number(tr.querySelector(selector).value) * 100);
+      if (body[component + "PriceSource"] === "OVERRIDE") {
+        const raw = tr.querySelector(selector).value.trim();
+        if (!/^\d+(?:\.\d{1,2})?$/.test(raw) || Number(raw) > 10000) return R().toast("Enter prices between $0 and $10,000 with at most two decimal places.", "error");
+        body[component + "PriceCents"] = Math.round(Number(raw) * 100);
+      }
     }
     const res = await A().billingSetCreator(tr.dataset.creator, body);
-    btn.disabled = false; btn.textContent = "save";
+    if (!current()) return;
     tr.querySelector(".bl-check").hidden = !["NETWORK", "INVALID_JSON", "ADMIN_COMMAND_RESPONSE_UNKNOWN", "ADMIN_COMMAND_UNRESOLVED"].includes(res?.code);
     if (res?.ok) {
       tr.dataset.pricingRevision = String(res.billing.pricingRevision);
+      tr.dataset.autoTier = res.billing.tier === "CUSTOM" ? "STARTER" : res.billing.tier;
+      tr.querySelector(".bl-tier").value = res.billing.tier;
+      tr.querySelector(".bl-mode").value = res.billing.tierMode;
       for (const [key, selector] of [["corePriceCents", ".bl-price"], ["aiChatterPriceCents", ".bl-ai-price"], ["outreachPriceCents", ".bl-or-price"]]) tr.querySelector(selector).value = (res.billing[key] / 100).toFixed(2);
       R().toast("saved " + money(res.lineCents), "ok");
       tr.querySelector(".bl-line").textContent = money(res.lineCents);

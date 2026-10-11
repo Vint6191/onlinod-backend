@@ -7,7 +7,7 @@ function browser(overrides={}){
  const api={getToken:()=>token,retentionSettings:async()=>structuredClone(policy),saveRetentionSettings:async body=>{calls.push(["set",body]);return {...policy,revision:5,settings:body.settings};},resetRetentionSettings:async body=>{calls.push(["reset",body]);return {...policy,revision:5};},runRetentionSweep:async body=>{calls.push(["run",body]);return {ok:true,accepted:true,commandId:"run-1",status:"QUEUED"};},commandStatus:async()=>({ok:true,commandId:"run-1",status:"PARTIAL",execution:{progress:{report:{totalDeleted:400,remainingWork:true}}}}),...overrides};
  const escape=value=>String(value).replaceAll("<","&lt;").replaceAll(">","&gt;");
  const window={OnlinodAdminApi:api,OnlinodAdminRouter:{escapeHtml:escape,escapeAttr:escape},addEventListener:(name,fn)=>{listeners[name]=fn;}};
- vm.runInNewContext(source,{window,document:{getElementById:()=>null},confirm:()=>true,console,setInterval,clearInterval});
+ vm.runInNewContext(source,require("../../scripts/test-support/admin-browser-fixture.cjs").workspace({window,document:{getElementById:()=>null},confirm:()=>true,console,setInterval,clearInterval}));
  const ui=window.OnlinodAdminSystem;
  return {ui,calls,api,setToken:value=>{token=value;listeners['onlinod:admin-session-changed']();}};
 }

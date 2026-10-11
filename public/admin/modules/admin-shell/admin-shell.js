@@ -17,6 +17,7 @@
   const R     = () => window.OnlinodAdminRouter;
   const Sess  = () => window.OnlinodAdminSession;
   const A     = () => window.OnlinodAdminApi;
+  const W     = () => window.OnlinodAdminWorkspace;
 
   // section key → { label, icon, page module accessor }
   // Pages that don't exist yet show a "TODO" placeholder.
@@ -42,9 +43,9 @@
         ${renderTopbar(state)}
         ${renderRail(state)}
 
-        <main class="adm-main" id="admMain">
-          <div class="adm-loading">loading…</div>
-        </main>
+        <div class="adm-workspace"><div id="admCommandRecovery" aria-live="polite"></div>
+          <main class="adm-main" id="admMain"><div class="adm-loading">loading…</div></main>
+        </div>
       </div>
     `;
 
@@ -52,7 +53,8 @@
 
     // Render the active page into #admMain. Done in a microtask so
     // the shell appears immediately and pages don't block paint.
-    Promise.resolve().then(() => renderActivePage(root));
+    const current = W().capture(root.querySelector("#admMain"));
+    Promise.resolve().then(() => { if (current()) { renderActivePage(root); void window.OnlinodAdminCommandRecovery.render(); } });
   }
 
   function renderTopbar(state) {
@@ -125,9 +127,14 @@
     // Logout via the user pill
     const userMenu = root.querySelector("#admUserMenu");
     if (userMenu) {
+      let signingOut = false;
       userMenu.addEventListener("click", async () => {
+        if (signingOut) return;
         if (!confirm("Log out of admin?")) return;
+        signingOut = true;
+        const token = A().getToken();
         try { await A().logout(); } catch (_) { /* ignore */ }
+        if (A().getToken() && token !== A().getToken()) return;
         Sess().clearSession();
         history.pushState({}, "", "/admin-login");
         R().render();
@@ -135,25 +142,27 @@
     }
   }
 
-  let searchTimer = null;
   function bindGlobalSearch(root) {
     const input = root.querySelector("#admGlobalSearch");
     const box   = root.querySelector("#admSearchResults");
     if (!input || !box) return;
     const A = () => window.OnlinodAdminApi;
-    const close = () => { box.classList.remove("active"); box.innerHTML = ""; };
+    let generation = 0;
+    const current = W().capture(input);
+    const close = () => { generation++; box.classList.remove("active"); box.innerHTML = ""; };
     input.addEventListener("input", () => {
       const q = input.value.trim();
-      clearTimeout(searchTimer);
+      const own = ++generation;
       if (q.length < 2) { close(); return; }
-      searchTimer = setTimeout(async () => {
+      W().debounce("global-search", async () => {
         const r = await A().dataSearch(q);
+        if (!current() || own !== generation || input.value.trim() !== q) return;
         if (!r || !r.ok) { close(); return; }
         renderSearchResults(box, r.results || {});
       }, 250);
     });
     input.addEventListener("keydown", (e) => { if (e.key === "Escape") { input.value = ""; close(); } });
-    document.addEventListener("click", (e) => { if (!box.contains(e.target) && e.target !== input) close(); });
+    root.addEventListener("click", (e) => { if (!box.contains(e.target) && e.target !== input) close(); });
   }
 
   function renderSearchResults(box, results) {
@@ -183,7 +192,12 @@
         const input = document.querySelector("#admGlobalSearch"); if (input) input.value = "";
         if (go === "agency") R().pushAgencyDetail(id);
         else if (go === "creator") R().pushDetail("creators", id);
-        else if (go === "user") R().pushSection("users");
+        else if (go === "user") {
+          const users = State().users;
+          users.filters.q = results.users.find(user => user.id === id)?.email || id;
+          users.lastLoadedAt = 0; users.list = []; users.error = null;
+          R().pushSection("users");
+        }
       });
     });
   }
@@ -244,6 +258,7 @@
     }
 
     // Unknown section — fall back to dashboard.
+    window.OnlinodAdminStateApi.setSection("dashboard", null);
     window.OnlinodAdminDashboard.render(main);
   }
 

@@ -26,6 +26,7 @@
 
 (function () {
   "use strict";
+  const W = () => window.OnlinodAdminWorkspace;
 
   const A = () => window.OnlinodAdminApi;
   const R = () => window.OnlinodAdminRouter;
@@ -33,7 +34,7 @@
 
   // Local module state — no slice in the global state object since
   // audit is the only place this data lives.
-  const state = {
+  const state = W().local(() => ({
     loading: false,
     error: null,
     events: [],
@@ -47,48 +48,20 @@
       limit: 100,
     },
     lastLoadedAt: 0,
-  };
+  }));
 
-  async function load(force) {
-    if (state.loading) return;
-    if (!force && state.events.length && Date.now() - state.lastLoadedAt < 30_000) return;
-
-    state.loading = true;
-    state.error = null;
-    rerender();
-
-    const f = state.filters;
-    const result = await A().audit({
-      q:          f.q || undefined,
-      agencyId:   f.agencyId || undefined,
-      action:     f.action || undefined,
-      targetType: f.targetType || undefined,
-      before:     f.before || undefined,
-      after:      f.after || undefined,
-      limit:      f.limit || 100,
-    });
-
-    state.loading = false;
-    if (!result?.ok) {
-      state.error = result?.error || "Failed to load audit";
-      state.events = [];
-    } else {
-      state.events = Array.isArray(result.events) ? result.events : [];
-      state.lastLoadedAt = Date.now();
-    }
-    rerender();
+  function load(force) {
+    return W().load({ section: "audit", state: state, force,
+      fetch: () => A().audit(Object.fromEntries(Object.entries(state.filters).filter(([,value]) => value !== ""))), apply: result => { state.events = Array.isArray(result.events) ? result.events : []; }, render });
   }
 
-  function rerender() {
-    const main = document.getElementById("admMain");
-    if (main) render(main);
-  }
+  function rerender() { W().paint("audit", render); }
 
   function render(main) {
     const r = R();
     const u = U();
 
-    if (!state.events.length && !state.loading && !state.error) load(false);
+    if (W().needsRead(state)) load(false);
 
     main.innerHTML = `
       <div class="adm-page-head">
@@ -211,20 +184,20 @@
 
     main.querySelector("#admAuditQ")?.addEventListener("input", (e) => {
       state.filters.q = e.target.value;
-      clearTimeout(qTimer);
-      qTimer = setTimeout(() => load(true), 300);
+      W().invalidate(state);
+      W().debounce("audit.qTimer", () => load(true), 300);
     });
 
     main.querySelector("#admAuditAgency")?.addEventListener("input", (e) => {
       state.filters.agencyId = e.target.value;
-      clearTimeout(aTimer);
-      aTimer = setTimeout(() => load(true), 300);
+      W().invalidate(state);
+      W().debounce("audit.aTimer", () => load(true), 300);
     });
 
     main.querySelector("#admAuditAction")?.addEventListener("input", (e) => {
       state.filters.action = e.target.value;
-      clearTimeout(actTimer);
-      actTimer = setTimeout(() => load(true), 300);
+      W().invalidate(state);
+      W().debounce("audit.actTimer", () => load(true), 300);
     });
 
     main.querySelector("#admAuditTargetType")?.addEventListener("change", (e) => {

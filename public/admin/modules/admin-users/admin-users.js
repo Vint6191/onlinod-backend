@@ -21,6 +21,7 @@
 
 (function () {
   "use strict";
+  const W = () => window.OnlinodAdminWorkspace;
 
   const State = () => window.OnlinodAdminState;
   const A     = () => window.OnlinodAdminApi;
@@ -31,37 +32,13 @@
 
   // ── List load ──────────────────────────────────────────────
 
-  async function load(force) {
+  function load(force) {
     const s = slice();
-    if (s.loading) return;
-    if (!force && s.list.length && Date.now() - s.lastLoadedAt < 30_000) return;
-
-    s.loading = true;
-    s.error = null;
-    rerender();
-
-    const result = await A().listUsers({
-      q:          s.filters.q || undefined,
-      unverified: s.filters.unverified ? "1" : undefined,
-      no_agency:  s.filters.no_agency  ? "1" : undefined,
-      disabled:   s.filters.disabled   ? "1" : undefined,
-    });
-
-    s.loading = false;
-    if (!result?.ok) {
-      s.error = result?.error || "Failed to load users";
-      s.list = [];
-    } else {
-      s.list = Array.isArray(result.users) ? result.users : [];
-      s.lastLoadedAt = Date.now();
-    }
-    rerender();
+    return W().load({ section: "users", state: s, force,
+      fetch: () => A().listUsers({ q:s.filters.q || undefined, unverified:s.filters.unverified ? "1" : undefined, no_agency:s.filters.no_agency ? "1" : undefined, disabled:s.filters.disabled ? "1" : undefined }), apply: result => { s.list = Array.isArray(result.users) ? result.users : []; }, render });
   }
 
-  function rerender() {
-    const main = document.getElementById("admMain");
-    if (main) render(main);
-  }
+  function rerender() { W().paint("users", render); }
 
   // ── Render ─────────────────────────────────────────────────
 
@@ -70,7 +47,7 @@
     const r = R();
     const u = U();
 
-    if (!s.list.length && !s.loading && !s.error) load(false);
+    if (W().needsRead(s)) load(false);
 
     main.innerHTML = `
       <div class="adm-page-head">
@@ -186,11 +163,10 @@
 
     const s = slice();
 
-    let qTimer = null;
     main.querySelector("#admUsersQ")?.addEventListener("input", (e) => {
       s.filters.q = e.target.value;
-      clearTimeout(qTimer);
-      qTimer = setTimeout(() => load(true), 250);
+      W().invalidate(s);
+      W().debounce("users.qTimer", () => load(true), 250);
     });
 
     main.querySelector("#admUsersUnverified")?.addEventListener("change", (e) => {
@@ -226,6 +202,7 @@
   async function openDrawer(userId) {
     const drawer = document.getElementById("admUsersDrawer");
     if (!drawer) return;
+    const current = W().request(drawer);
 
     drawer.innerHTML = `
       <div class="adm-drawer-backdrop" data-drawer-close></div>
@@ -244,6 +221,7 @@
     });
 
     const result = await A().getUser(userId);
+    if (!current()) return;
     const body = drawer.querySelector(".adm-drawer-body");
     if (!body) return;
 
@@ -254,6 +232,7 @@
 
     body.innerHTML = renderDrawerBody(result);
     bindDrawerActions(body, result);
+    W().superOnly(body, "[data-user-action]");
   }
 
   function renderDrawerBody(d) {
@@ -344,7 +323,7 @@
 
   function bindDrawerActions(body, d) {
     body.querySelectorAll("[data-user-action]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
+      btn.addEventListener("click", () => W().action(body, async current => {
         const action = btn.dataset.userAction;
         const userId = d.user.id;
 
@@ -354,6 +333,8 @@
           const ok = confirm(`Disable ${d.user.email}?\n\nAll their refresh sessions will be revoked.`);
           if (!ok) return;
           const result = await A().patchUser(userId, { disabled: true, disabledReason: reason, reason, expectedUpdatedAt: d.user.updatedAt });
+          if (!current()) return;
+          if (result?.ok) W().invalidate(slice());
           R().toast(result?.ok ? "user disabled" : (result?.error || "failed"));
           if (result?.ok) openDrawer(userId);
           else load(true);
@@ -361,6 +342,8 @@
         else if (action === "enable") {
           const reason = prompt("Reason for enabling this user?")?.trim(); if (!reason) return;
           const result = await A().patchUser(userId, { disabled: false, reason, expectedUpdatedAt: d.user.updatedAt });
+          if (!current()) return;
+          if (result?.ok) W().invalidate(slice());
           R().toast(result?.ok ? "user enabled" : (result?.error || "failed"));
           if (result?.ok) openDrawer(userId);
         }
@@ -368,6 +351,8 @@
           if (!confirm(`Force logout ${d.user.email}?\n\nKills all active refresh sessions.`)) return;
           const reason = prompt("Reason for force logout?")?.trim(); if (!reason) return;
           const result = await A().forceLogout(userId, { reason });
+          if (!current()) return;
+          if (result?.ok) W().invalidate(slice());
           R().toast(result?.ok ? `${result.revokedSessions} session(s) revoked` : (result?.error || "failed"));
           if (result?.ok) openDrawer(userId);
         }
@@ -376,10 +361,12 @@
           if (!password) return;
           const reason = prompt("Reason for password reset?")?.trim(); if (!reason) return;
           const result = await A().resetUserPwd(userId, { password, reason, expectedUpdatedAt: d.user.updatedAt });
+          if (!current()) return;
+          if (result?.ok) W().invalidate(slice());
           R().toast(result?.ok ? "password reset — sessions revoked" : (result?.error || "failed"));
           if (result?.ok) openDrawer(userId);
         }
-      });
+      }));
     });
 
     body.querySelectorAll("[data-open-agency]").forEach((btn) => {

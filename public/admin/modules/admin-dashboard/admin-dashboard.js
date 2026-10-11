@@ -14,6 +14,7 @@
 
 (function () {
   "use strict";
+  const W = () => window.OnlinodAdminWorkspace;
 
   const State = () => window.OnlinodAdminState;
   const A     = () => window.OnlinodAdminApi;
@@ -28,33 +29,13 @@
     return s.dashboard;
   }
 
-  async function load(force) {
+  function load(force) {
     const slice = ensureSlice();
-    if (slice.loading) return;
-    if (!force && slice.data && Date.now() - slice.lastLoadedAt < 30_000) return;
-
-    slice.loading = true;
-    slice.error = null;
-    rerender();
-
-    const result = await A().dashboard();
-    slice.loading = false;
-
-    if (!result?.ok) {
-      slice.error = result?.error || "Failed to load dashboard";
-      slice.data = null;
-    } else {
-      slice.data = result;
-      slice.lastLoadedAt = Date.now();
-    }
-
-    rerender();
+    return W().load({ section: "dashboard", state: slice, force,
+      fetch: () => A().dashboard(), apply: result => { slice.data = result; }, render });
   }
 
-  function rerender() {
-    const main = document.getElementById("admMain");
-    if (main) render(main);
-  }
+  function rerender() { W().paint("dashboard", render); }
 
   function render(main) {
     const slice = ensureSlice();
@@ -62,7 +43,7 @@
     const u = U();
 
     // Kick off load if we have nothing.
-    if (!slice.data && !slice.loading && !slice.error) {
+    if (W().needsRead(slice)) {
       load(false);
     }
 
@@ -94,7 +75,7 @@
     const us = d.counts.users;
     const c = d.counts.creators;
     const dv = d.counts.devices;
-    const sn = d.counts.snapshots;
+    const sn = d.counts.canonicalSessions;
 
     const mrrTotalCents =
       Number(d.mrr?.coreCents || 0) +
@@ -132,14 +113,14 @@
         })}
 
         ${renderMetric({
-          label: "active snapshots",
-          value: u.formatNumber(sn.active),
-          hint:  "encrypted in DB",
+          label: "portable sessions",
+          value: u.formatNumber(sn.activePortable),
+          hint:  "active model access",
           mode:  "",
         })}
 
         ${renderMetric({
-          label: "mrr (rough)",
+          label: "MRR (paid access)",
           value: u.formatMoneyFromCents(mrrTotalCents),
           hint:  `core ${u.formatMoneyFromCents(d.mrr?.coreCents || 0)} · addons ${u.formatMoneyFromCents((d.mrr?.aiChatterCents || 0) + (d.mrr?.outreachCents || 0))}`,
           mode:  mrrTotalCents > 0 ? "ok" : "",

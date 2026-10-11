@@ -7,7 +7,7 @@
      status      — DRAFT/READY/NOT_CREATOR/AUTH_FAILED/DISABLED
      tier        — STARTER/GROWTH/PRO/ELITE/CUSTOM
      agencyId    — filter to one agency
-     no_snapshot — only those without active access snapshot
+     no_canonical — only those without active access snapshot
    
    No detail drawer for creators — clicking a creator jumps to
    its agency detail page (the Creators tab there shows it
@@ -16,6 +16,7 @@
 
 (function () {
   "use strict";
+  const W = () => window.OnlinodAdminWorkspace;
 
   const State = () => window.OnlinodAdminState;
   const A     = () => window.OnlinodAdminApi;
@@ -24,45 +25,20 @@
 
   function slice() { return State().creators; }
 
-  async function load(force) {
+  function load(force) {
     const s = slice();
-    if (s.loading) return;
-    if (!force && s.list.length && Date.now() - s.lastLoadedAt < 30_000) return;
-
-    s.loading = true;
-    s.error = null;
-    rerender();
-
-    const result = await A().listCreators({
-      q:            s.filters.q || undefined,
-      status:       s.filters.status || undefined,
-      tier:         s.filters.tier || undefined,
-      agencyId:     s.filters.agencyId || undefined,
-      no_snapshot:  s.filters.no_snapshot ? "1" : undefined,
-    });
-
-    s.loading = false;
-    if (!result?.ok) {
-      s.error = result?.error || "Failed to load creators";
-      s.list = [];
-    } else {
-      s.list = Array.isArray(result.creators) ? result.creators : [];
-      s.lastLoadedAt = Date.now();
-    }
-    rerender();
+    return W().load({ section: "creators", state: s, force,
+      fetch: () => A().listCreators({ q:s.filters.q || undefined, status:s.filters.status || undefined, tier:s.filters.tier || undefined, agencyId:s.filters.agencyId || undefined, no_canonical:s.filters.no_canonical ? "1" : undefined }), apply: result => { s.list = Array.isArray(result.creators) ? result.creators : []; }, render });
   }
 
-  function rerender() {
-    const main = document.getElementById("admMain");
-    if (main) render(main);
-  }
+  function rerender() { W().paint("creators", render); }
 
   function render(main) {
     const s = slice();
     const r = R();
     const u = U();
 
-    if (!s.list.length && !s.loading && !s.error) load(false);
+    if (W().needsRead(s)) load(false);
 
     main.innerHTML = `
       <div class="adm-page-head">
@@ -100,8 +76,8 @@
           </select>
 
           <label class="adm-toolbar-check">
-            <input type="checkbox" id="admCreatorsNoSnap" ${s.filters.no_snapshot ? "checked" : ""}>
-            no snapshot
+            <input type="checkbox" id="admCreatorsNoSnap" ${s.filters.no_canonical ? "checked" : ""}>
+            no portable session
           </label>
 
           <div class="adm-table-toolbar-spacer"></div>
@@ -124,7 +100,7 @@
                     <th>agency</th>
                     <th>status</th>
                     <th>tier</th>
-                    <th>snapshot</th>
+                    <th>session</th>
                     <th>revenue 30d</th>
                     <th>created</th>
                   </tr>
@@ -177,7 +153,7 @@
         </td>
         <td>
           ${
-            c.hasActiveSnapshot
+            c.hasPortableCanonicalSession
               ? `<span class="adm-pill ok no-dot">active</span>`
               : `<span class="adm-pill warn no-dot">none</span>`
           }
@@ -192,12 +168,11 @@
     main.querySelector("#admCreatorsRefresh")?.addEventListener("click", () => load(true));
 
     const s = slice();
-    let qTimer = null;
 
     main.querySelector("#admCreatorsQ")?.addEventListener("input", (e) => {
       s.filters.q = e.target.value;
-      clearTimeout(qTimer);
-      qTimer = setTimeout(() => load(true), 250);
+      W().invalidate(s);
+      W().debounce("creators.qTimer", () => load(true), 250);
     });
 
     main.querySelector("#admCreatorsStatus")?.addEventListener("change", (e) => {
@@ -211,7 +186,7 @@
     });
 
     main.querySelector("#admCreatorsNoSnap")?.addEventListener("change", (e) => {
-      s.filters.no_snapshot = e.target.checked;
+      s.filters.no_canonical = e.target.checked;
       load(true);
     });
 

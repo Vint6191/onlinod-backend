@@ -6,7 +6,7 @@
 (function () {
   "use strict";
 
-  const state = {
+  const initial = () => ({
     admin: null,
     section: "dashboard",
     sectionParam: null,
@@ -30,7 +30,7 @@
     },
     creators: {
       loading: false, error: null, list: [],
-      filters: { q: "", status: "", tier: "", agencyId: "", no_snapshot: false },
+      filters: { q: "", status: "", tier: "", agencyId: "", no_canonical: false },
       lastLoadedAt: 0,
     },
     devices: {
@@ -40,12 +40,8 @@
     },
 
     lastDebug: null,
-  };
-
-  try {
-    const cached = localStorage.getItem("onlinod_admin");
-    if (cached) state.admin = JSON.parse(cached);
-  } catch (_) { /* ignore */ }
+  });
+  const state = initial();
 
   function setAdmin(admin) {
     state.admin = admin || null;
@@ -54,16 +50,17 @@
   }
 
   function clearSession() {
-    state.admin = null;
-    state.dashboard.data = null;
-    state.agencies.list = [];
-    state.agencyDetail = {};
-    state.users.list = [];
-    state.creators.list = [];
-    state.devices.list = [];
-    localStorage.removeItem("onlinod_admin");
-    localStorage.removeItem("onlinod_admin_token");
+    window.OnlinodAdminApi.setToken(null);
+    reset();
   }
+
+  function reset() {
+    for (const key of Object.keys(state)) delete state[key];
+    Object.assign(state, initial());
+    localStorage.removeItem("onlinod_admin");
+  }
+  window.addEventListener("onlinod:admin-session-changed", reset);
+  window.addEventListener("storage", event => { if (event.key === "onlinod_admin_token" || event.key === null) reset(); });
 
   function setSection(section, param) {
     state.section = section || "dashboard";

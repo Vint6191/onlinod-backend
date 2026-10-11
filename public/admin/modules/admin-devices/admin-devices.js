@@ -17,6 +17,7 @@
 
 (function () {
   "use strict";
+  const W = () => window.OnlinodAdminWorkspace;
 
   const State = () => window.OnlinodAdminState;
   const A     = () => window.OnlinodAdminApi;
@@ -28,37 +29,13 @@
 
   function slice() { return State().devices; }
 
-  async function load(force) {
+  function load(force) {
     const s = slice();
-    if (s.loading) return;
-    if (!force && s.list.length && Date.now() - s.lastLoadedAt < 30_000) return;
-
-    s.loading = true;
-    s.error = null;
-    rerender();
-
-    const result = await A().listDevices({
-      q:        s.filters.q || undefined,
-      agencyId: s.filters.agencyId || undefined,
-      online:   s.filters.online  ? "1" : undefined,
-      offline:  s.filters.offline ? "1" : undefined,
-    });
-
-    s.loading = false;
-    if (!result?.ok) {
-      s.error = result?.error || "Failed to load devices";
-      s.list = [];
-    } else {
-      s.list = Array.isArray(result.devices) ? result.devices : [];
-      s.lastLoadedAt = Date.now();
-    }
-    rerender();
+    return W().load({ section: "devices", state: s, force,
+      fetch: () => A().listDevices({ q:s.filters.q || undefined, agencyId:s.filters.agencyId || undefined, online:s.filters.online ? "1" : undefined, offline:s.filters.offline ? "1" : undefined }), apply: result => { s.list = Array.isArray(result.devices) ? result.devices : []; }, render });
   }
 
-  function rerender() {
-    const main = document.getElementById("admMain");
-    if (main) render(main);
-  }
+  function rerender() { W().paint("devices", render); }
 
   function deviceLiveness(device) {
     const last = device.lastSeenAt ? new Date(device.lastSeenAt).getTime() : 0;
@@ -74,7 +51,7 @@
     const r = R();
     const u = U();
 
-    if (!s.list.length && !s.loading && !s.error) load(false);
+    if (W().needsRead(s)) load(false);
 
     const onlineCount = s.list.filter((d) => deviceLiveness(d) === "online").length;
     const staleCount  = s.list.filter((d) => deviceLiveness(d) === "stale").length;
@@ -149,6 +126,7 @@
     `;
 
     bind(main);
+    W().superOnly(main, "[data-device-kick]");
   }
 
   function renderRow(d) {
@@ -190,19 +168,17 @@
     main.querySelector("#admDevicesRefresh")?.addEventListener("click", () => load(true));
 
     const s = slice();
-    let qTimer = null;
-    let aTimer = null;
 
     main.querySelector("#admDevicesQ")?.addEventListener("input", (e) => {
       s.filters.q = e.target.value;
-      clearTimeout(qTimer);
-      qTimer = setTimeout(() => load(true), 250);
+      W().invalidate(s);
+      W().debounce("devices.qTimer", () => load(true), 250);
     });
 
     main.querySelector("#admDevicesAgency")?.addEventListener("input", (e) => {
       s.filters.agencyId = e.target.value;
-      clearTimeout(aTimer);
-      aTimer = setTimeout(() => load(true), 250);
+      W().invalidate(s);
+      W().debounce("devices.aTimer", () => load(true), 250);
     });
 
     main.querySelector("#admDevicesOnline")?.addEventListener("change", (e) => {
@@ -228,7 +204,7 @@
 
     // Kick buttons.
     main.querySelectorAll("[data-device-kick]").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
+      btn.addEventListener("click", (e) => W().action(btn.closest("tr"), async current => {
         e.stopPropagation();
         const id   = btn.dataset.deviceKick;
         const name = btn.dataset.deviceName || "device";
@@ -237,9 +213,10 @@
         const device = s.list.find(row => row.id === id);
         const reason = prompt("Reason for kicking this device?")?.trim(); if (!reason || !device) return;
         const result = await A().kickDevice(id, { reason, agencyId: device.agencyId, userId: device.userId });
+        if (!current()) return;
         R().toast(result?.ok ? "device kicked" : (result?.error || "failed"));
         if (result?.ok) load(true);
-      });
+      }));
     });
   }
 

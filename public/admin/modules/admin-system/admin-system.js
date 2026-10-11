@@ -6,12 +6,13 @@
 
 (function () {
   "use strict";
+  const W = () => window.OnlinodAdminWorkspace;
 
   const A = () => window.OnlinodAdminApi;
   const R = () => window.OnlinodAdminRouter;
   const U = () => window.OnlinodAdminUtils;
 
-  const state = {
+  const state = W().local(() => ({
     loading: false,
     error: null,
     data: null,
@@ -28,29 +29,12 @@
     retentionDirty: false,
     retentionReason: "",
     retentionCommand: null,
-  };
+  }));
 
-  async function load(force) {
+  function load(force) {
     void refreshRetentionCommand();
-    if (state.loading) return;
-    if (!force && state.data && Date.now() - state.lastLoadedAt < 5_000) return;
-
-    state.loading = true;
-    state.error = null;
-    rerender();
-
-    const result = await A().systemHealth();
-    state.loading = false;
-
-    if (!result?.ok && !result?.db) {
-      state.error = result?.error || "Failed to load system health";
-      state.data = null;
-    } else {
-      state.data = result;
-      state.lastLoadedAt = Date.now();
-      state.error = null;
-    }
-    rerender();
+    return W().load({ section: "system", state: state, force,
+      fetch: () => A().systemHealth(), apply: result => { state.data = result; }, render, ttl: 5000 });
   }
 
   let retentionGeneration = 0;
@@ -74,12 +58,13 @@
       if (!currentRetentionRead(generation, token)) return;
       if (result?.ok) state.retentionCommand = result;
       else state.retentionError = result?.error || "Could not read cleanup status";
-    } finally { state.retentionPolling = false; rerender(); }
+    } finally { if (currentRetentionRead(generation, token)) { state.retentionPolling = false; rerender(); } }
   }
   async function loadRetention(force) {
+    if (state.retentionSaving || state.retentionRunning) return;
     if (state.retentionLoading || (!force && state.retentionData)) return;
     if (state.retentionDirty && !force) return;
-    const generation = retentionGeneration, token = A().getToken();
+    const generation = ++retentionGeneration, token = A().getToken();
     state.retentionLoading = true; state.retentionError = null; rerender();
     const result = await A().retentionSettings();
     if (!currentRetentionRead(generation, token)) return;
@@ -99,7 +84,7 @@
     if (reason.length < 3) { state.retentionError = "Enter a reason (at least 3 characters)."; rerender(); return; }
     if (action === "reset" && !confirm("Save current server defaults as the retention policy?")) return;
     if (action === "run" && !confirm("Queue one cleanup pass? Eligible old data will be deleted under the displayed policy.")) return;
-    const generation = retentionGeneration, token = A().getToken();
+    const generation = ++retentionGeneration, token = A().getToken();
     const input = { expectedRevision:state.retentionData.revision, expectedPolicyHash:state.retentionData.policyHash, reason,
       ...(action === "set" ? {settings:{...state.retentionDraft}} : {}) };
     state.retentionSaving = action !== "run"; state.retentionRunning = action === "run";
@@ -120,10 +105,7 @@
   const resetRetention = () => retentionMutation("reset");
   const runRetentionNow = () => retentionMutation("run");
 
-  function rerender() {
-    const main = document.getElementById("admMain");
-    if (main && State_section() === "system") render(main);
-  }
+  function rerender() { W().paint("system", render); }
 
   function State_section() {
     return window.OnlinodAdminState?.section;
@@ -150,7 +132,7 @@
   function render(main) {
     const r = R();
 
-    if (!state.data && !state.loading && !state.error) load(false);
+    if (W().needsRead(state, 5000)) load(false);
     if (!state.retentionData && !state.retentionLoading && !state.retentionError) loadRetention(false);
     startPolling();
 
@@ -182,6 +164,11 @@
     });
 
     bindRetentionEvents(main);
+    W().superOnly(main, "#admRetentionSave, #admRetentionReset, #admRetentionRun, #admRetentionReason, .adm-retention-input");
+    if (!state.retentionData || state.retentionLoading || state.retentionSaving || state.retentionRunning) {
+      main.querySelectorAll("#admRetentionSave, #admRetentionReset, #admRetentionRun, #admRetentionReason, .adm-retention-input").forEach(input => { input.disabled = true; });
+    }
+    if (state.retentionSaving || state.retentionRunning) main.querySelector("#admRetentionReload").disabled = true;
   }
 
   function renderContent(d) {
@@ -224,8 +211,8 @@
 
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px 24px;">
           ${envRow("RESEND_API_KEY",            envPill(env.hasResendKey,   "set"),   "outbound email — without this verification mails come back as devVerificationCode only")}
-          ${envRow("SNAPSHOT_ENCRYPTION_KEY",   envPill(env.hasSnapshotKey, "set"),   "encrypts AccessSnapshot payload (AES-256-GCM). REQUIRED in prod.")}
-          ${envRow("JWT_SECRET",                envPill(env.hasJwtSecret,   "set"),   "signs access tokens. Default 'change-me' is detected as missing.")}
+          ${envRow("SNAPSHOT_ENCRYPTION_KEY",   envPill(env.hasSnapshotKey, "set"),   "Server-managed encrypted credentials (AES-256-GCM).")}
+          ${envRow("JWT_SECRET",                envPill(env.jwtConfigured,   "set"),   "signs access tokens. Default 'change-me' is detected as missing.")}
           ${envRow("PUBLIC_BASE_URL",           env.publicBaseUrl ? `<span class="adm-pill ok no-dot">${r.escapeHtml(env.publicBaseUrl)}</span>` : `<span class="adm-pill warn no-dot">not set</span>`, "used to build email URLs")}
           ${envRow("NODE_ENV",                  `<span class="adm-pill ${env.nodeEnv === "production" ? "ok" : "warn"} no-dot">${r.escapeHtml(env.nodeEnv || "?")}</span>`, "")}
         </div>
@@ -280,7 +267,7 @@
           <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
             <button class="adm-btn ghost" id="admRetentionReload" ${state.retentionLoading ? "disabled" : ""}>reload</button>
             <button class="adm-btn ghost" id="admRetentionReset" ${state.retentionSaving ? "disabled" : ""}>reset defaults</button>
-            <button class="adm-btn ghost" id="admRetentionRun" ${state.retentionRunning || ["QUEUED","RUNNING"].includes(state.retentionCommand?.status) ? "disabled" : ""}>${state.retentionRunning ? "submitting…" : "run cleanup now"}</button>
+            <button class="adm-btn ghost" id="admRetentionRun" ${state.retentionRunning || ["QUEUED","RUNNING"].includes(state.retentionCommand?.status) ? "disabled" : ""}>${state.retentionRunning ? "submitting…" : "queue cleanup pass"}</button>
             <button class="adm-btn" id="admRetentionSave" ${state.retentionSaving || !state.retentionDirty ? "disabled" : ""}>${state.retentionSaving ? "saving…" : "save"}</button>
           </div>
         </div>
@@ -326,7 +313,7 @@
     const r = R(), command = state.retentionCommand;
     const report = command?.execution?.progress?.report;
     const status = command?.status;
-    const text = status === "QUEUED" ? "Cleanup queued. This page checks progress automatically."
+    const text = status === "QUEUED" ? "Cleanup queued for the next scheduled pass, which can take up to an hour. This page checks progress automatically."
       : status === "RUNNING" ? "Cleanup is running."
       : status === "PARTIAL" ? "Pass finished with remaining work. Scheduled cleanup will continue."
       : status === "FAILED" ? "Cleanup pass failed or completed only partly. Review the result before retrying."

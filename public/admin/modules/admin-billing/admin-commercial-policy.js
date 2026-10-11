@@ -55,6 +55,7 @@
         <p id="blPolicyStatus" role="status"></p>
       </form>`;
       const status = root.querySelector("#blPolicyStatus"), form = root.querySelector("#blPolicyForm");
+      window.OnlinodAdminWorkspace?.superOnly(form, 'input, button[type="submit"]');
       let pending = saved, busy = false;
       const lock = value => form.querySelectorAll("input").forEach(input => { input.disabled = value; });
       const remember = value => { pending = value; try { if (value) sessionStorage.setItem(key, JSON.stringify(value)); else sessionStorage.removeItem(key); } catch (_) {} };
