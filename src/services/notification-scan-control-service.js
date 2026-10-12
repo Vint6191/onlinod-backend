@@ -1,7 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { activeCollectorJob, pauseCollectorJob } = require("./analytics-scan-job-authority");
+const { activeCollectorJob, currentCollectorJob, pauseCollectorJob } = require("./analytics-scan-job-authority");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
@@ -90,18 +90,6 @@ function pausedManualJobNeedsFreshRun(job, desiredMode) {
   return schema !== null && schema < 8;
 }
 
-async function recentManualJobs(db, creatorId, statuses = null, take = 40) {
-  const rows = await db.jobInstance.findMany({
-    where: {
-      creatorId,
-      jobKey: JOB_KEY,
-      ...(statuses ? { status: { in: statuses } } : {}),
-    },
-    orderBy: [{ createdAt: "desc" }],
-    take,
-  });
-  return rows.filter(isManualJob);
-}
 
 async function startManualNotificationScan({ db = prisma, creator, requestedByUserId = null, now = new Date(), forceFull = false }) {
   if (!creator?.id || !creator?.agencyId) throw new Error("Creator scope is required");
@@ -308,8 +296,7 @@ async function countOnlineBindings(db, creator, now = null) {
 }
 
 async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL", limit = 100, offset = 0 }) {
-  const manualJobs = await recentManualJobs(db, creator.id, null, 60);
-  const job = await activeCollectorJob(db, creator.id, JOB_KEY) || manualJobs[0] || null;
+  const job = await currentCollectorJob(db, creator.id, JOB_KEY);
   const sync = await loadNotificationSyncState(db, creator.id);
   const syncBelongsToJob = Boolean(job && sync?.sourceJobId === job.id);
   const linkedSync = syncBelongsToJob ? sync : null;

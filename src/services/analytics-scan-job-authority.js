@@ -6,7 +6,8 @@ const ACTIVE_STATUSES = ["SCHEDULED", "PUBLISHING", "CLAIMED", "PAUSED"];
 
 // Trigger provenance does not create a separate collector. START, STOP and the
 // operational reader must select the same job, including an automatic run that
-// a manual START adopted. Completed manual history is a separate presentation.
+// a manual START adopted. Trigger provenance must not hide that run when its
+// lease ends: the operational reader also exposes the latest terminal result.
 async function activeCollectorJob(db, creatorId, jobKey) {
   const rows = await db.jobInstance.findMany({
     where: { creatorId, jobKey, status: { in: ACTIVE_STATUSES } },
@@ -14,6 +15,17 @@ async function activeCollectorJob(db, creatorId, jobKey) {
     take: 1,
   });
   return rows.find(row => ACTIVE_STATUSES.includes(row.status)) || null;
+}
+
+async function currentCollectorJob(db, creatorId, jobKey) {
+  const active = await activeCollectorJob(db, creatorId, jobKey);
+  if (active) return active;
+  const rows = await db.jobInstance.findMany({
+    where: { creatorId, jobKey },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    take: 1,
+  });
+  return rows[0] || null;
 }
 
 async function pauseCollectorJob({ db, creatorId, jobKey, collectorType, now = new Date() }) {
@@ -46,4 +58,4 @@ async function pauseCollectorJob({ db, creatorId, jobKey, collectorType, now = n
   });
 }
 
-module.exports = { activeCollectorJob, pauseCollectorJob };
+module.exports = { activeCollectorJob, currentCollectorJob, pauseCollectorJob };

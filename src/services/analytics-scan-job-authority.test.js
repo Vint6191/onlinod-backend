@@ -59,6 +59,19 @@ function fixture(jobKey, type, status = "CLAIMED") {
   return db;
 }
 for (const [name, key, type, api, suffix] of kinds) {
+  if (name !== "campaign") for (const terminal of ["DONE", "FAILED", "CANCELLED"]) {
+    test(`${name}: adopted automatic ${terminal} run remains visible after its active lease ends`, async () => {
+      const db = fixture(key, type);
+      assert.equal((await api[`startManual${suffix}Scan`]({ db, creator, now })).job.id, "auto-job");
+      db.row.status = terminal;
+      db.row.completedAt = now;
+      db.row.lastError = terminal === "FAILED" ? "provider unavailable" : null;
+      const state = await api[`readManual${suffix}Scan`]({ db, creator });
+      assert.equal(state.jobId, "auto-job");
+      assert.equal(state.manual, false, "Reading a run must not rewrite its trigger provenance");
+      assert.equal(state.status, terminal === "DONE" ? "PARTIAL" : terminal, "Missing completion proof stays partial");
+    });
+  }
   test(`${name}: START adoption, status, STOP and resume use the same automatic collector`, async () => {
     const db = fixture(key, type);
     const start = await api[`startManual${suffix}Scan`]({ db, creator, now });

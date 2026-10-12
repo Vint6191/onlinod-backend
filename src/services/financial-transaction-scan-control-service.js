@@ -1,7 +1,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
-const { activeCollectorJob, pauseCollectorJob } = require("./analytics-scan-job-authority");
+const { activeCollectorJob, currentCollectorJob, pauseCollectorJob } = require("./analytics-scan-job-authority");
 const prisma = require("../prisma");
 const { scheduleJobNow } = require("./job-scheduler");
 const { reschedulePlannedJob } = require("./job-planning-repository");
@@ -46,14 +46,6 @@ function jobStatus(job) {
   if (job.status === "CANCELLED") return "CANCELLED";
   if (job.status === "DONE") return object(job.result).complete === true ? "COMPLETE" : "PARTIAL";
   return String(job.status || "IDLE").toUpperCase();
-}
-async function recentJobs(db, creatorId, statuses = null, take = 40) {
-  const rows = await db.jobInstance.findMany({
-    where: { creatorId, jobKey: JOB_KEY, ...(statuses ? { status: { in: statuses } } : {}) },
-    orderBy: [{ createdAt: "desc" }],
-    take,
-  });
-  return rows.filter(isManualJob);
 }
 async function countOnlineBindings(db, creator, now = null) {
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: now || new Date() });
@@ -139,8 +131,7 @@ function transactionForClient(row) {
 }
 
 async function readManualFinancialTransactionScan({ db = prisma, creator, limit = 100, offset = 0, cursor = null }) {
-  const jobs = await recentJobs(db, creator.id, null, 60);
-  const job = await activeCollectorJob(db, creator.id, JOB_KEY) || jobs[0] || null;
+  const job = await currentCollectorJob(db, creator.id, JOB_KEY);
   const safeLimit = Math.max(1, Math.min(200, integer(limit, 100, 200)));
   if (Number(offset) !== 0) throw Object.assign(new Error("Use the returned Financial page cursor"), { code: "FINANCIAL_CURSOR_REQUIRED", status: 409 });
   const safeOffset = 0;
