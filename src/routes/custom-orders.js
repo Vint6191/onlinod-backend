@@ -178,6 +178,7 @@ router.get("/submissions/:submissionId/assignment-candidates", async (req, res) 
       member: req.auth.membership || req.member,
       submissionId: req.params.submissionId,
       limit: req.query.limit,
+      offset: req.query.offset,
       db: prisma,
     }));
   } catch (err) { return sendError(res, err, "CUSTOM_SUBMISSION_ASSIGNMENT_CANDIDATES_FAILED"); }

@@ -13,6 +13,7 @@ const {
   requireCreator: sharedRequireCreator,
 } = require("./server-store-utils");
 const { classifyProgrammaticCustomMediaProvenance } = require("./custom-content-delivery-service");
+const { normalizeBumpContent } = require("./bump-content");
 
 const TASK_TYPE_ALIASES = Object.freeze({
   winback: "sfs_hunter",
@@ -89,7 +90,7 @@ function parseOffset(value) {
   return sharedParseOffset(value);
 }
 
-function normalizeTaskInput(input = {}, { agencyId, userId, patch = false } = {}) {
+function normalizeTaskInput(input = {}, { agencyId, userId, patch = false, existingType } = {}) {
   const data = {};
   if (!patch || input.type !== undefined) data.type = normalizeTaskType(input.type);
   if (!patch || input.title !== undefined || input.name !== undefined) data.title = clean(input.title || input.name || "Untitled automation", 180) || "Untitled automation";
@@ -97,7 +98,8 @@ function normalizeTaskInput(input = {}, { agencyId, userId, patch = false } = {}
   if (!patch || input.status !== undefined) data.status = normalizeStatus(input.status, data.enabled === false ? "paused" : "active");
   if (!patch || input.creatorId !== undefined || input.accountId !== undefined) data.creatorId = optional(input.creatorId || input.accountId, 100);
   if (!patch || input.clientId !== undefined || input.id !== undefined) data.clientId = optional(input.clientId || input.id, 120);
-  if (!patch || input.config !== undefined) data.config = compactJson(input.config || {}, 16000);
+  if (!patch || input.config !== undefined) data.config = normalizeTaskType(input.type ?? existingType) === "bump_online"
+    ? normalizeBumpContent(input.config || {}) : compactJson(input.config || {}, 16000);
   if (!patch || input.triggers !== undefined) data.triggers = compactJson(input.triggers || {}, 8000);
   if (!patch || input.rules !== undefined) data.rules = compactJson(input.rules || {}, 8000);
   if (!patch || input.schedule !== undefined) data.schedule = compactJson(input.schedule || {}, 8000);
@@ -147,17 +149,9 @@ function normalizeBumpToTask(input = {}, accountId = null) {
   const title = clean(input.title || input.messageText || input.text || "Bump", 180) || "Bump";
   const triggers = input.triggers && typeof input.triggers === "object" ? input.triggers : { fanOnline: true };
   const rules = input.rules && typeof input.rules === "object" ? input.rules : {};
-  const media = Array.isArray(input.media) ? input.media : Array.isArray(input.mediaFiles) ? input.mediaFiles : [];
   const trashedAt = input.trashedAt || input.deletedAt || null;
   const purgeAfter = input.purgeAfter || (trashedAt ? addDaysIso(trashedAt, BUMP_TRASH_RETENTION_DAYS) : null);
-  const config = {
-    schemaVersion: input.schemaVersion || 1,
-    messageText: clean(input.messageText || input.text || "", 12000),
-    price: Number(input.price || 0) || 0,
-    priceCents: clampInt(input.priceCents, Math.round((Number(input.price || 0) || 0) * 100), 0),
-    currency: clean(input.currency || "USD", 12).toUpperCase() || "USD",
-    media,
-  };
+  const config = normalizeBumpContent(input);
   return {
     id: id || undefined,
     clientId: id || undefined,
@@ -316,7 +310,8 @@ function taskToBump(task) {
     enabled: task.enabled === true && task.status !== "deleted" && !task.deletedAt,
     title: task.title || config.messageText?.slice?.(0, 42) || "Bump",
     messageText: clean(config.messageText || config.text || "", 12000),
-    price: Number(config.price || (Number(config.priceCents || 0) / 100) || 0) || 0,
+    price: Number(config.price ?? (Number(config.priceCents || 0) / 100)) || 0,
+    lockedText: config.lockedText === true || config.paidMode === "paid_text",
     currency: clean(config.currency || "USD", 12).toUpperCase() || "USD",
     media: Array.isArray(config.media) ? config.media : [],
     triggers,
@@ -451,7 +446,7 @@ async function patchTask({ agencyId, userId, taskId, patch = {}, creatorId = nul
   if (existing.creatorId && (!cid || String(existing.creatorId) !== cid)) {
     throw automationTaskError("AUTOMATION_TASK_CREATOR_MISMATCH", "Creator-owned task requires its canonical creator boundary", 409);
   }
-  const data = normalizeTaskInput(patch, { agencyId, userId, patch: true });
+  const data = normalizeTaskInput(patch, { agencyId, userId, patch: true, existingType: existing.type });
   delete data.agencyId;
   delete data.createdByUserId;
   if (existing.creatorId) {

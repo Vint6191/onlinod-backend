@@ -821,3 +821,29 @@ test("unassigned assignment freezes its binding before the inner owner reads it"
   db.customContentSubmission.findFirst=async args=>{const result=await original(args);if(args.where?.id===row.id && ++reads===2)return {...result,customOrderId:b.id,bindingRevision:2};return result;};
   await assert.rejects(assignUnassignedCustomContentSubmission({agencyId:'agency-1',member:manager,submissionId:row.id,customOrderId:a.id,db:commitDatabaseFixture(db)}),{code:'CUSTOM_SUBMISSION_ASSIGNMENT_STALE'});
 });
+
+test("assignment candidates expose every eligible target beyond the first page", async () => {
+  const row = submission({ id: "paged-incoming" });
+  const orders = Array.from({ length: 121 }, (_, i) => order(`target-${String(i).padStart(3, "0")}`, { createdAt: new Date(now.getTime() - i * 1000) }));
+  const db = commitDatabaseFixture(fakeDb({ submissions: [row], orders }));
+  const items = [];
+  let offset = 0, pages = 0;
+  do {
+    const result = await listCustomSubmissionAssignmentCandidates({ agencyId: "agency-1", member: manager, submissionId: row.id, limit: 50, offset, db });
+    assert.equal(result.count, 121);
+    assert.equal(result.offset, offset);
+    items.push(...result.items);
+    assert.equal(result.nextOffset, items.length);
+    pages++;
+    if (!result.hasMore) break;
+    assert.ok(result.nextOffset > offset);
+    offset = result.nextOffset;
+  } while (pages < 4);
+  assert.equal(pages, 3);
+  assert.equal(new Set(items.map(item => item.customOrderId)).size, 121);
+  assert.equal(items.at(-1).customOrderId, orders.at(-1).id);
+  const beyond = await listCustomSubmissionAssignmentCandidates({ agencyId: "agency-1", member: manager, submissionId: row.id, offset: 150, db });
+  assert.deepEqual(beyond.items, []);
+  assert.equal(beyond.hasMore, false);
+  assert.equal(beyond.count, 121);
+});

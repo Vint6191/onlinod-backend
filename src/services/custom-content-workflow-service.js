@@ -190,7 +190,7 @@ async function loadCandidateSubmissionHistory({ agencyId, creatorId, orderIds, d
   return byOrder;
 }
 
-async function candidateOrdersForCreator({ agencyId, creatorId, limit, db }) {
+async function candidateOrdersForCreator({ agencyId, creatorId, db }) {
   // This is a suggestion read-model, not mutation authority, but it still must
   // be complete enough to make an exact-valid target reachable from the UI.
   // Presentation LIMIT is applied only after eligibility and ranking.
@@ -242,18 +242,20 @@ async function candidateOrdersForCreator({ agencyId, creatorId, limit, db }) {
     if (orders.length < 200) break;
   }
   result.sort((a, b) => Number(b.awaitingRevision) - Number(a.awaitingRevision) || new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  return result.slice(0, limit);
+  return result;
 }
 
-async function listCustomSubmissionAssignmentCandidates({ agencyId, member, submissionId, limit = 50, db = null } = {}) {
+async function listCustomSubmissionAssignmentCandidates({ agencyId, member, submissionId, limit = 50, offset = 0, db = null } = {}) {
   const client = db || require("../prisma");
   const row = await loadSubmissionForAssignment({ agencyId, member, submissionId, db: client, write: false });
   const take = boundedLimit(limit);
-  const [items, canAssign] = await Promise.all([
-    candidateOrdersForCreator({ agencyId, creatorId: row.creatorId, limit: take, db: client }),
+  const skip = Math.max(0, Math.min(2_147_483_647, Math.floor(Number(offset) || 0)));
+  const [eligible, canAssign] = await Promise.all([
+    candidateOrdersForCreator({ agencyId, creatorId: row.creatorId, db: client }),
     canUsePermission({ member, key: "content.review_customs", db: client }),
   ]);
-  return { ok: true, submissionId: String(row.id), creatorId: String(row.creatorId), items, count: items.length, canAssign, serverNow: new Date().toISOString() };
+  const items = eligible.slice(skip, skip + take);
+  return { ok: true, submissionId: String(row.id), creatorId: String(row.creatorId), items, count: eligible.length, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < eligible.length, canAssign, serverNow: new Date().toISOString() };
 }
 
 async function assignUnassignedCustomContentSubmission({ agencyId, member, submissionId, customOrderId, db = null } = {}) {
