@@ -102,7 +102,11 @@ test("concurrent preparations reserve one command identity before either request
   const b = browser(); b.window.OnlinodAdminState = { admin: { id: "admin-one" } };
   const attempts = await Promise.all(Array.from({ length: 8 }, () => b.commands.prepare(input)));
   assert.equal(new Set(attempts.map(item => item.commandId)).size, 1);
-  assert.equal(attempts.at(-1).attempts, 8);
+  // Promise.all preserves invocation order; WebCrypto digests can complete in
+  // another order. Assert every reservation and the final durable counter.
+  assert.deepEqual(attempts.map(item => item.attempts).sort((a, b) => a - b), [1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.equal(b.storage.size, 1);
+  assert.equal(JSON.parse([...b.storage.values()][0]).attempts, 8);
 });
 
 test("pending results are visible only to their administrator and remain resolvable after sign-in", async () => {

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Восстановление доступа · ONLINOD</title>
+  <link rel="stylesheet" href="/account-recovery/recovery.css">
+  <script src="/account-recovery/recovery.js" defer></script>
+</head>
+<body>
+  <main class="card">
+    <a class="brand" href="/">ONLINOD</a>
+    <p class="eyebrow">Доступ к аккаунту</p>
+    <h1 id="title">Восстановление пароля</h1>
+    <p id="intro">Укажите email, с которым вы зарегистрировались в ONLINOD.</p>
+    <p id="status" role="status" aria-live="polite" hidden></p>
+    <form id="request-form" hidden>
+      <fieldset>
+        <label for="email">Email аккаунта</label>
+        <input id="email" name="email" type="email" autocomplete="email" maxlength="254" required>
+        <button type="submit">Отправить письмо</button>
+      </fieldset>
+    </form>
+    <form id="reset-form" hidden>
+      <fieldset>
+        <label for="password">Новый пароль</label>
+        <input id="password" name="password" type="password" autocomplete="new-password" minlength="8" maxlength="200" required aria-describedby="password-hint">
+        <p class="hint" id="password-hint">От 8 до 200 символов.</p>
+        <label for="confirmation">Повторите пароль</label>
+        <input id="confirmation" name="confirmation" type="password" autocomplete="new-password" minlength="8" maxlength="200" required>
+        <button type="submit">Сохранить новый пароль</button>
+      </fieldset>
+    </form>
+    <a id="request-again" href="/forgot-password" hidden>Запросить новое письмо</a>
+    <p class="footer">После сброса вернитесь в приложение и войдите с новым паролем.</p>
+    <a class="back" href="/">Войти в веб-версию</a>
+    <noscript>Для восстановления пароля включите JavaScript в браузере.</noscript>
+  </main>
+</body>
+</html>

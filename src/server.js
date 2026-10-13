@@ -143,6 +143,7 @@ app.use("/uploads", express.static(path.join(__dirname, "..", "uploads"), {
     res.setHeader("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; style-src 'none'; script-src 'none'; sandbox");
   },
 }));
+app.use(require("./routes/account-recovery-pages"));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
 app.get("/health", async (_req, res) => {

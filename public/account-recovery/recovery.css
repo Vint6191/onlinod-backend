@@ -1,0 +1,25 @@
+:root { color-scheme: dark; font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color: #f1f4f3; background: #101413; }
+* { box-sizing: border-box; }
+body { min-height: 100dvh; margin: 0; padding: 32px 16px; display: grid; place-items: center; background: radial-gradient(ellipse at top, #21372f 0, #101413 65%); }
+.card { width: min(100%, 460px); padding: 36px; border: 1px solid #34443e; border-radius: 20px; background: #19201d; box-shadow: 0 24px 80px #0005; }
+.brand { display: inline-block; color: #eef8f3; font-size: 23px; font-weight: 850; letter-spacing: .08em; text-decoration: none; margin-bottom: 24px; }
+.eyebrow { color: #81d9ad; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; margin: 0 0 8px; }
+h1 { font-size: 29px; line-height: 1.2; margin: 0 0 16px; }
+p { color: #bdcac3; }
+fieldset { border: 0; padding: 0; margin: 24px 0 0; min-width: 0; }
+label { display: block; font-weight: 600; margin-bottom: 8px; }
+input { width: 100%; min-width: 0; padding: 13px 14px; margin-bottom: 18px; border: 1px solid #52665b; border-radius: 9px; background: #111713; color: #fff; font: inherit; }
+button { width: 100%; padding: 14px; border: 0; border-radius: 9px; font: inherit; font-weight: 700; background: #8fdfb5; color: #092b1a; cursor: pointer; }
+button:hover:not(:disabled) { background: #b0edcc; }
+fieldset:disabled { opacity: .65; }
+fieldset:disabled button { cursor: wait; }
+:focus-visible { outline: 2px solid #9cecc2; outline-offset: 3px; }
+.hint { margin: -9px 0 20px; font-size: 13px; }
+#status { padding: 13px 14px; border-radius: 9px; border: 1px solid #416553; background: #213a2d; overflow-wrap: anywhere; }
+#status[data-error="true"] { border-color: #845650; background: #3c2522; color: #ffc7bc; }
+.footer { margin-top: 26px; font-size: 14px; }
+a { color: #a2e7c2; text-underline-offset: 3px; }
+.back { font-size: 14px; }
+#request-again { display: inline-block; margin-top: 20px; }
+[hidden] { display: none !important; }
+@media (max-width: 420px) { .card { padding: 26px 22px; } h1 { font-size: 25px; } }
