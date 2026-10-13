@@ -372,7 +372,10 @@ router.post("/register", async (req, res) => {
     // User, membership and verification outbox commit together. A provider
     // outage after that commit must not turn a created account into HTTP 500.
     let emailResult;
-    try { emailResult = await require("../services/auth-mail-outbox-service").deliverAuthMail({ db: prisma, id: result.verificationMailId }); }
+    try {
+      const mail = require("../services/auth-mail-outbox-service");
+      emailResult = await (web ? mail.deliverAuthMailForRequest : mail.deliverAuthMail)({ db: prisma, id: result.verificationMailId });
+    }
     catch (_) { emailResult = { ok: false, code: "AUTH_MAIL_PENDING" }; }
     const verification = { emailResult };
 
@@ -434,7 +437,7 @@ router.post("/resend-verification", async (req, res) => {
     if (!user) return res.json({ ok: true });
     if (user.emailVerifiedAt) return res.json({ ok: true, alreadyVerified: true });
 
-    const verification = await issueEmailVerification(user);
+    const verification = await issueEmailVerification(user, { web });
     return res.json({
       ok: true,
       emailSent: verification.emailResult?.ok === true && !verification.emailResult?.skipped,
@@ -570,7 +573,7 @@ router.post("/forgot-password", async (req, res) => {
 
     if (!user) return res.json({ ok: true });
 
-    const reset = await issuePasswordReset(user);
+    const reset = await issuePasswordReset(user, { web });
     return res.json({
       ok: true,
       emailSent: reset.emailResult?.ok === true && !reset.emailResult?.skipped,

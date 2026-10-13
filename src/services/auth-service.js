@@ -6,7 +6,7 @@ const { randomToken, randomCode, sha256, addMinutes, addDays } = require("../uti
 const { signAccessToken, refreshTokenDays } = require("../utils/tokens");
 const { resolveRefreshDeviceBinding } = require("../utils/device-binding");
 const { verificationPayload, passwordResetPayload } = require("./email-service");
-const { enqueueAuthMail, deliverAuthMail } = require("./auth-mail-outbox-service");
+const { enqueueAuthMail, deliverAuthMail, deliverAuthMailForRequest } = require("./auth-mail-outbox-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { authorizeAuthorizationHistoryPublisher } = require("./authorization-history-write-contract");
 const {
@@ -107,7 +107,7 @@ async function enqueueInitialEmailVerification(tx, user) {
   return enqueueNewAuthMail(tx, user, "EMAIL_VERIFY", await dbAuthorityNow({ db: tx }));
 }
 
-async function issueAuthMail(user, kind) {
+async function issueAuthMail(user, kind, { web = false } = {}) {
   const id = await withAuthorizationUserLock({ db: prisma, userId: user.id, work: async tx => {
     await tx.$queryRawUnsafe('SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE', user.id);
     const current = await tx.user.findUnique({where:{id:user.id}});
@@ -121,11 +121,11 @@ async function issueAuthMail(user, kind) {
     if(recent) return recent.id;
     return enqueueNewAuthMail(tx, current, kind, now);
   }});
-  const emailResult=id ? await deliverAuthMail({db:prisma,id}) : {ok:true,alreadyVerified:true};
+  const emailResult=id ? await (web ? deliverAuthMailForRequest : deliverAuthMail)({db:prisma,id}) : {ok:true,alreadyVerified:true};
   return { emailResult };
 }
-async function issueEmailVerification(user) { return issueAuthMail(user,"EMAIL_VERIFY"); }
-async function issuePasswordReset(user) { return issueAuthMail(user,"PASSWORD_RESET"); }
+async function issueEmailVerification(user, options) { return issueAuthMail(user,"EMAIL_VERIFY",options); }
+async function issuePasswordReset(user, options) { return issueAuthMail(user,"PASSWORD_RESET",options); }
 
 async function createRefreshSession({
   userId,

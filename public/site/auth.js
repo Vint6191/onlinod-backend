@@ -7,6 +7,7 @@
     loadingSession: ['Loading your account…', 'Загружаем аккаунт…'],
     verifyTitle: ['Confirm your email.', 'Подтверди почту.'], codeLabel: ['6-digit code', 'Код из 6 цифр'], verifyCta: ['Confirm email', 'Подтвердить почту'],
     resend: ['Send another email', 'Отправить письмо ещё раз'], resetTitle: ['Choose a new password.', 'Новый пароль.'],
+    verifiedElsewhere: ['Already confirmed on another device? Sign in here with the same email and password.', 'Уже подтвердил почту на другом устройстве? Войди здесь с той же почтой и паролем.'],
     resetDesc: ['Use 8–200 characters. Previous sessions will be signed out.', 'От 8 до 200 символов. Предыдущие сессии будут завершены.'],
     resetCta: ['Save new password', 'Сохранить новый пароль'], confirmPassword: ['Repeat password', 'Повтори пароль'],
     newReset: ['Request a new link', 'Запросить новую ссылку'], accountTitle: ["You're in.", 'Ты в NOD.'],
@@ -24,14 +25,17 @@
     NO_AGENCY: ['No active agency membership. Contact the owner or support.', 'Нет доступа к действующему агентству. Обратись к владельцу или в поддержку.'],
     TOKEN_INVALID: ['This link is invalid, expired or already used. Request a new one.', 'Ссылка недействительна, истекла или уже использована. Запроси новую.'],
     TOKEN_USED: ['This link has already been used. Try signing in.', 'Ссылка уже использована. Попробуй войти.'],
-    CODE_INVALID: ['The code is invalid or expired. Request another email.', 'Код неверный или истёк. Запроси новое письмо.'],
+    CODE_INVALID: ['The code is invalid, expired or already used. If you confirmed on another device, sign in. Otherwise request another email.', 'Код неверный, истёк или уже использован. Если подтвердил почту на другом устройстве, войди. Иначе запроси новое письмо.'],
     INVITE_EXPIRED: ['The invitation has expired. Ask the owner for a new link.', 'Приглашение истекло. Попроси у владельца новую ссылку.'],
     INVITE_CLAIMED: ['This invitation was already accepted. Try signing in.', 'Приглашение уже принято. Попробуй войти.'],
     INVITE_REVOKED: ['The invitation was revoked by the owner.', 'Владелец отозвал приглашение.'],
     INVITE_NOT_FOUND: ['Invitation not found. Check the link or code.', 'Приглашение не найдено. Проверь ссылку или код.'],
     EMAIL_MISMATCH: ['Use the email named in the invitation.', 'Используй почту, на которую выдано приглашение.'],
     NETWORK_UNAVAILABLE: ['Connection unavailable. Please try again.', 'Нет соединения с сервером. Попробуй ещё раз.'],
-    REQUEST_OUTCOME_UNKNOWN: ['The connection was interrupted. The operation may have completed. After registration or a password change, try signing in first.', 'Соединение прервалось. Операция могла завершиться. После регистрации или смены пароля сначала попробуй войти.'],
+    REQUEST_OUTCOME_UNKNOWN: ['The server reply was lost. The operation may have completed. Check its result before trying again.', 'Ответ сервера потерялся. Операция могла завершиться. Проверь результат перед повторной попыткой.'],
+    LOGIN_OUTCOME_UNKNOWN: ['Sign-in could not be confirmed. Try signing in again. You do not need to register or confirm your email again.', 'Вход не удалось подтвердить. Попробуй войти ещё раз. Повторная регистрация и подтверждение почты не нужны.'],
+    VERIFY_OUTCOME_UNKNOWN: ['The confirmation reply was lost. Your email may already be confirmed. Try signing in, including if you confirmed on another device.', 'Ответ о подтверждении потерялся. Почта уже могла быть подтверждена. Попробуй войти, в том числе если подтвердил её на другом устройстве.'],
+    MAIL_OUTCOME_UNKNOWN: ['The reply was lost. The email may already be on its way. Check your inbox and Spam before requesting another.', 'Ответ потерялся. Письмо уже могло быть отправлено. Проверь почту и «Спам» перед повторным запросом.'],
     LOGOUT_RETRY_REQUIRED: ['Sign out could not be confirmed. Please try again.', 'Выход не подтверждён. Попробуй ещё раз.'],
   };
   const routes = { login: '/login', register: '/register', recovery: '/forgot-password', verify: '/verify-email', reset: '/reset-password', invite: '/invite', account: '/account' };
@@ -49,7 +53,7 @@
   if (view === 'invite') inviteToken = inviteToken || token;
   // Bearer links remain in memory; no token goes to storage or a referrer.
   history.replaceState({}, '', (routes[view] || '/login') + '?lang=' + lang);
-  let sequence = 0, account = null, inviteExisting = false, config = null, resultCopy = null, busy = false;
+  let sequence = 0, account = null, inviteExisting = false, config = null, resultCopy = null, verificationCopy = null, busy = false;
   function errorMessage(error) {
     if (error.status === 429) return pair(['Too many requests. Please wait.', 'Слишком много запросов. Подожди и повтори.']);
     if (error.code === 'TOKEN_EXPIRED' || /^RESET_TOKEN_/.test(error.code || '')) return pair(errors.TOKEN_INVALID);
@@ -64,6 +68,7 @@
     $$('#view-account a[href]').forEach(a => { const url = new URL(a.href); url.searchParams.set('lang', lang); a.href = url.href; });
     $('#invite-existing').textContent = inviteExisting ? pair(['Create an account for this invitation', 'Создать аккаунт по приглашению']) : pair(['I already have an account', 'У меня уже есть аккаунт']);
     if (resultCopy) { $('#result-title').textContent = pair(resultCopy.title); $('#result-description').textContent = pair(resultCopy.description); }
+    if (verificationCopy) $('#verification-note').textContent = pair(verificationCopy);
     if (account) renderAccount();
     document.title = 'NOD — ' + (view === 'account' ? pair(['Account', 'Аккаунт']) : view === 'register' ? pair(['Create account', 'Регистрация']) : pair(['Account access', 'Вход в аккаунт']));
   }
@@ -78,11 +83,24 @@
     history[replace ? 'replaceState' : 'pushState']({}, '', (routes[next] || '/login') + '?lang=' + lang);
     renderLanguage(); $('#view-' + (next === 'account' && !account ? 'loading' : next) + ' h1')?.focus({ preventScroll: true });
   }
-  function result(title, description) { resultCopy = { title, description }; navigate('result'); }
-  function showVerification(email, sent) {
+  function result(title, description, confirmed = true) {
+    resultCopy = { title, description };
+    $('#view-result .result-mark').hidden = !confirmed;
+    navigate('result');
+  }
+  function rememberEmail(email) { $('#login-email').value = email; $('#recovery-email').value = email; }
+  function showVerification(email, sent, { unknown = false, returnTo = 'register' } = {}) {
     token = ''; $('#verify-email').value = email; $('#verify-code').value = '';
+    rememberEmail(email);
     $('#field-verify-email').hidden = false; $('#field-verify-code').hidden = false;
-    $('#verification-note').textContent = sent ? pair(['Open the email link or enter the 6-digit code.', 'Открой ссылку из письма или введи код из 6 цифр.']) : pair(['Your account awaits confirmation. Sending is not confirmed yet. You can request another email below.', 'Аккаунт ожидает подтверждения. Отправка письма пока не подтверждена. Ниже можно запросить его повторно.']);
+    $('#verification-return').hidden = !unknown;
+    $('#verification-return').dataset.route = returnTo;
+    $('#verification-return').dataset.i18n = returnTo === 'invite' ? 'useInvite' : 'backRegister';
+    $('#resend-status').textContent = '';
+    verificationCopy = unknown
+      ? ['The registration reply was lost. If the email arrived, open its link or enter the code here. If it did not arrive, check Spam or request another email below. You can also return to registration.', 'Ответ о регистрации потерялся. Если письмо пришло, открой ссылку или введи код здесь. Если письма нет, проверь «Спам» или запроси его ниже. Также можно вернуться к регистрации.']
+      : sent ? ['Open the email link or enter the 6-digit code.', 'Открой ссылку из письма или введи код из 6 цифр.']
+      : ['Your account awaits confirmation. Email delivery is not confirmed yet. Check your inbox and Spam; you can request another email below.', 'Аккаунт ожидает подтверждения. Отправка письма пока не подтверждена. Проверь почту и «Спам»; ниже можно запросить письмо повторно.'];
     navigate('verify');
   }
   function renderAccount() {
@@ -93,7 +111,23 @@
     const date = account.agency?.trialEndsAt;
     $('#account-trial').textContent = date ? (new Date(date) > new Date() ? pair(['Trial ends: ', 'Пробный период до: ']) : pair(['Trial ended: ', 'Пробный период завершён: '])) + new Date(date).toLocaleString(lang === 'ru' ? 'ru-RU' : 'en-US') : '';
   }
-  async function openAccount() { account = await api.session(); navigate('account'); }
+  async function openAccount() {
+    const ownSequence = sequence, data = await api.session();
+    if (sequence === ownSequence) { account = data; navigate('account'); }
+  }
+  async function signIn(credentials) {
+    try { return await api.request('/api/web/auth/login', { method: 'POST', body: credentials }); }
+    catch (error) {
+      if (error.code !== 'REQUEST_OUTCOME_UNKNOWN') throw error;
+      // Cookies can arrive even if the response body is lost. Only a read of
+      // this browser's session can confirm access; never repeat the login POST.
+      try {
+        const current = await api.request('/api/web/auth/me', { timeout: 15000 });
+        if (current.user?.email?.trim().toLowerCase() === credentials.email.trim().toLowerCase()) return current;
+      } catch (_) {}
+      throw Object.assign(new Error(), { code: 'LOGIN_OUTCOME_UNKNOWN' });
+    }
+  }
   function invitationValue() {
     const value = $('#invite-code').value.trim();
     if (!value) return inviteToken;
@@ -124,17 +158,21 @@
     });
     return valid;
   }
-  function setBusy(value) { busy = value; $$('form .submit-button').forEach(b => { b.disabled = value; }); }
+  function setBusy(value) { busy = value; $$('form .submit-button').forEach(b => { b.disabled = value; }); $('#invite-existing').disabled = value; }
   $$('[data-form]').forEach(form => form.addEventListener('submit', async event => {
     event.preventDefault(); if (busy || !validate(form)) return;
     const ownSequence = sequence, mode = form.dataset.form, status = $('.form-status', form);
+    const submittedEmail = $({ login: '#login-email', register: '#signup-email', verify: '#verify-email', recovery: '#recovery-email', invite: '#invite-email' }[mode] || '#login-email').value;
     setBusy(true); status.textContent = pair(['Please wait…', 'Подожди…']);
     const post = (route, body) => api.request('/api/web/auth/' + route, { method: 'POST', body });
     try {
       if (mode === 'login') {
         const email = $('#login-email').value;
         const credentials = { email, password: $('#login-password').value, rememberDevice: $('#remember-device').checked };
-        try { account = await api.sessionLock(() => post('login', credentials)); }
+        try {
+          const data = await api.sessionLock(() => signIn(credentials));
+          if (sequence === ownSequence) account = data;
+        }
         catch (error) { if (error.code === 'EMAIL_NOT_VERIFIED' && sequence === ownSequence) { showVerification(email, false); return; } throw error; }
         if (sequence === ownSequence) navigate('account');
       } else if (mode === 'register') {
@@ -143,7 +181,7 @@
         if (sequence === ownSequence) showVerification(email, data.emailSent);
       } else if (mode === 'verify') {
         const data = await post('verify-email', token ? { token } : { email: $('#verify-email').value, code: $('#verify-code').value.trim() });
-        if (sequence === ownSequence) { token = ''; $('#login-email').value = data.user.email; result(['Email confirmed.', 'Почта подтверждена.'], ['Sign in with your email and password. The same account works in NOD desktop.', 'Войди с почтой и паролем. Этот же аккаунт используется в приложении NOD.']); }
+        if (sequence === ownSequence) { token = ''; rememberEmail(data.user.email); result(['Email confirmed.', 'Почта подтверждена.'], ['Sign in with your email and password on any device. The same account works in NOD desktop.', 'Войди с почтой и паролем на любом устройстве. Этот же аккаунт используется в приложении NOD.']); }
       } else if (mode === 'recovery') {
         await post('forgot-password', { email: $('#recovery-email').value });
         if (sequence === ownSequence) result(['Request received.', 'Запрос принят.'], ['If this account exists, a reset email will be sent. The link is valid for 30 minutes. Check Spam. Contact support if no email arrives.', 'Если аккаунт существует, на почту будет отправлена ссылка на 30 минут. Проверь «Спам». Если письма нет, обратись в поддержку.']);
@@ -157,7 +195,9 @@
         if (inviteExisting) {
           const credentials = { email, password: $('#invite-password').value };
           await api.sessionLock(async () => {
-            account = await post('login', credentials);
+            const data = await signIn(credentials);
+            if (sequence !== ownSequence) return;
+            account = data;
             await api.request('/api/web/invitations/claim', { method: 'POST', body: { token: value } });
           });
           if (sequence === ownSequence) { inviteToken = ''; result(['Invitation accepted.', 'Приглашение принято.'], ['Your agency membership is ready. Sign in to the desktop app to continue.', 'Доступ к агентству выдан. Войди в приложение, чтобы продолжить работу.']); }
@@ -166,24 +206,50 @@
           if (sequence === ownSequence) { inviteToken = ''; showVerification(email, data.emailSent); }
         }
       }
-    } catch (error) { if (sequence === ownSequence) status.textContent = errorMessage(mode === 'verify' && !token && ['TOKEN_INVALID','TOKEN_USED'].includes(error.code) ? {code:'CODE_INVALID'} : error); }
+    } catch (error) {
+      if (sequence !== ownSequence) return;
+      if (error.code === 'REQUEST_OUTCOME_UNKNOWN') {
+        if (mode === 'register' || (mode === 'invite' && !inviteExisting)) {
+          showVerification(submittedEmail, false, { unknown: true, returnTo: mode });
+          return;
+        }
+        if (mode === 'reset') {
+          token = '';
+          result(['Check your sign-in.', 'Проверь вход.'], ['The reply was lost. Your password may already have changed. Try signing in with the new password. If it does not work, request a new reset link.', 'Ответ потерялся. Пароль уже мог измениться. Попробуй войти с новым паролем. Если не получится, запроси новую ссылку для восстановления.'], false);
+          return;
+        }
+        if (mode === 'verify') { rememberEmail(submittedEmail || $('#login-email').value); error = { code: 'VERIFY_OUTCOME_UNKNOWN' }; }
+        if (mode === 'recovery') error = { code: 'MAIL_OUTCOME_UNKNOWN' };
+      }
+      if (error.code === 'EMAIL_TAKEN') rememberEmail(submittedEmail);
+      status.textContent = errorMessage(mode === 'verify' && !token && ['TOKEN_INVALID','TOKEN_USED'].includes(error.code) ? {code:'CODE_INVALID'} : error);
+    }
     finally { setBusy(false); clearPasswords(); }
   }));
   $('#resend-verification').addEventListener('click', async () => {
     if (busy) return;
     const email = $('#verify-email').value.trim();
     if (!email || !$('#verify-email').checkValidity()) { $('#field-verify-email').hidden = false; $('#verify-email').focus(); $('#resend-status').textContent = pair(['Enter your email first.', 'Сначала укажи почту.']); return; }
+    const ownSequence = sequence;
     setBusy(true); $('#resend-verification').disabled = true;
     try {
       const data = await api.request('/api/web/auth/resend-verification', { method: 'POST', body: { email } });
+      if (sequence !== ownSequence) return;
+      rememberEmail(email);
       $('#resend-status').textContent = data.alreadyVerified ? pair(['Email is confirmed. Sign in.', 'Почта уже подтверждена. Войди в аккаунт.']) : data.emailSent ? pair(['Email sent. Check your inbox and Spam.', 'Письмо отправлено. Проверь почту и «Спам».']) : pair(['Request received; sending is not confirmed yet.', 'Запрос принят; отправка пока не подтверждена.']);
-    } catch (error) { $('#resend-status').textContent = errorMessage(error); }
+    } catch (error) { if (sequence === ownSequence) $('#resend-status').textContent = errorMessage(error.code === 'REQUEST_OUTCOME_UNKNOWN' ? { code: 'MAIL_OUTCOME_UNKNOWN' } : error); }
     finally { setBusy(false); $('#resend-verification').disabled = false; }
   });
   $('#sign-out').addEventListener('click', async () => {
-    if (busy) return; setBusy(true);
-    try { await api.sessionLock(() => api.request('/api/web/auth/logout', { method: 'POST', body: {} })); account = null; navigate('login'); }
-    catch (error) { $('#account-status').textContent = errorMessage(error); } finally { setBusy(false); }
+    if (busy) return;
+    const ownSequence = sequence; setBusy(true);
+    try {
+      await api.sessionLock(() => api.request('/api/web/auth/logout', { method: 'POST', body: {} }));
+      if (sequence === ownSequence) { account = null; navigate('login'); }
+    }
+    // A 401 from /me would only prove the access cookie expired, not that the
+    // refresh session was revoked. Keep logout unconfirmed until its receipt.
+    catch (error) { if (sequence === ownSequence) $('#account-status').textContent = errorMessage(error.code === 'REQUEST_OUTCOME_UNKNOWN' ? { code: 'LOGOUT_RETRY_REQUIRED' } : error); } finally { setBusy(false); }
   });
   $('#invite-existing').addEventListener('click', () => {
     inviteExisting = !inviteExisting; $('#field-invite-name').hidden = inviteExisting; $('#invite-name').required = !inviteExisting;
@@ -203,9 +269,12 @@
   window.addEventListener('popstate', () => navigate(Object.keys(routes).find(k => routes[k] === location.pathname) || 'login', { replace: true }));
   window.addEventListener('pagehide', clearPasswords);
   navigate(view, { replace: true });
-  if (view === 'verify' && token) { $('#field-verify-email').hidden = true; $('#field-verify-code').hidden = true; $('#verification-note').textContent = pair(['Confirm this email address to activate your account.', 'Подтверди почту, чтобы активировать аккаунт.']); }
+  if (view === 'verify' && token) { $('#field-verify-email').hidden = true; $('#field-verify-code').hidden = true; verificationCopy = ['Confirm this email address to activate your account.', 'Подтверди почту, чтобы активировать аккаунт.']; renderLanguage(); }
   if (view === 'reset' && !token) { $('#reset-form .form-status').textContent = pair(errors.TOKEN_INVALID); $('#reset-form .submit-button').disabled = true; }
   if (view === 'invite' && inviteToken) { $('#invite-code').value = inviteToken; previewInvitation(); }
   api.request('/api/site/config').then(data => { config = data; }).catch(() => {});
-  if (view === 'account') openAccount().catch(error => { navigate('login'); $('#login-form .form-status').textContent = error.status === 401 || error.code === 'VALIDATION_ERROR' ? pair(['Please sign in.', 'Войди в аккаунт.']) : errorMessage(error); });
+  if (view === 'account') {
+    const ownSequence = sequence;
+    openAccount().catch(error => { if (sequence !== ownSequence) return; navigate('login'); $('#login-form .form-status').textContent = error.status === 401 || error.code === 'VALIDATION_ERROR' ? pair(['Please sign in.', 'Войди в аккаунт.']) : errorMessage(error); });
+  }
 })();

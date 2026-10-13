@@ -135,4 +135,16 @@ function startAuthMailWorker({ db, intervalMs = 10_000, send }) {
     await flight;
   };
 }
-module.exports = { enqueueAuthMail, deliverAuthMail, startAuthMailWorker };
+async function deliverAuthMailForRequest({ waitMs = 1000, ...delivery }) {
+  // The account/token/outbox are already committed. A slow provider receipt
+  // must not hold the website response open after the user receives the email.
+  // Keep the existing delivery/lease running; the same durable worker recovers
+  // it on restart. There is no second send, token or in-memory-only queue.
+  let timer;
+  const pending = () => ({ ok: false, code: "AUTH_MAIL_PENDING" });
+  const flight = deliverAuthMail(delivery).catch(pending);
+  try {
+    return await Promise.race([flight, new Promise(resolve => { timer = setTimeout(() => resolve(pending()), waitMs); })]);
+  } finally { clearTimeout(timer); }
+}
+module.exports = { enqueueAuthMail, deliverAuthMail, deliverAuthMailForRequest, startAuthMailWorker };
