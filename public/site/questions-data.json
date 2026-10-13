@@ -1,0 +1,631 @@
+{
+  "version": 1,
+  "scope": "PUBLIC_WEBSITE",
+  "categories": [
+    {
+      "id": "start",
+      "en": "Getting started",
+      "ru": "Начало и доступ",
+      "icon": "grid"
+    },
+    {
+      "id": "billing",
+      "en": "Plans & payment",
+      "ru": "Тарифы и оплата",
+      "icon": "chart"
+    },
+    {
+      "id": "install",
+      "en": "Desktop & setup",
+      "ru": "Установка и запуск",
+      "icon": "download"
+    },
+    {
+      "id": "content",
+      "en": "Vault & campaigns",
+      "ru": "Vault и рассылки",
+      "icon": "folder"
+    },
+    {
+      "id": "team",
+      "en": "Team & automation",
+      "ru": "Команда и автоматизация",
+      "icon": "users"
+    },
+    {
+      "id": "tools",
+      "en": "AI, orders & boundaries",
+      "ru": "AI, кастомы и границы",
+      "icon": "shield"
+    }
+  ],
+  "popular": [
+    "per-creator-price",
+    "team-invite",
+    "content-audience",
+    "creator-boundaries",
+    "custom-orders",
+    "installer"
+  ],
+  "items": [
+    {
+      "id": "what-is-nod",
+      "category": "start",
+      "en": {
+        "question": "What is NOD, and who is it for?",
+        "answer": "<p>NOD is a desktop workspace for agencies managing OnlyFans creators. Conversations, fan CRM, Vault, campaigns, automation and team reporting sit alongside the work.</p><p>Use the website to create an account, confirm email and download the app. Day-to-day creator work takes place in NOD desktop.</p>"
+      },
+      "ru": {
+        "question": "Что такое NOD и кому он нужен?",
+        "answer": "<p>NOD — десктоп для агентств, которые работают с моделями на OnlyFans. Переписки, CRM фанатов, Vault, рассылки, автоматизация и командная статистика собраны рядом с повседневной работой.</p><p>На сайте можно создать аккаунт, подтвердить почту и скачать приложение. Повседневная работа с моделями выполняется в NOD Desktop.</p>"
+      },
+      "keywords": "онлинод nod onlyfans only onlyfans agency агентство предназначение",
+      "related": [],
+      "route": {
+        "page": "home",
+        "en": "Explore NOD",
+        "ru": "Посмотреть возможности"
+      },
+      "planned": false
+    },
+    {
+      "id": "owner-start",
+      "category": "start",
+      "en": {
+        "question": "Where does an agency owner start?",
+        "answer": "<p>Create your NOD account and agency, verify your email, then install the desktop app and sign in with the same account.</p><p>Connect the creator’s OnlyFans account in the desktop. Invite your team and assign the creators and permissions they need. Creating the agency does not automatically connect a creator.</p>"
+      },
+      "ru": {
+        "question": "С чего начать владельцу агентства?",
+        "answer": "<p>Создай аккаунт NOD и агентство, подтверди почту, затем установи приложение и войди с теми же данными.</p><p>Подключи аккаунт модели в десктопе. Пригласи сотрудников и назначь им моделей и разрешения. Создание агентства само по себе не подключает OnlyFans модели.</p>"
+      },
+      "keywords": "регистрация register signup owner начать старт",
+      "related": [
+        "team-invite",
+        "connect-vs-access"
+      ],
+      "route": {
+        "page": "auth",
+        "view": "register",
+        "en": "Create an agency",
+        "ru": "Создать агентство"
+      },
+      "planned": false
+    },
+    {
+      "id": "team-invite",
+      "category": "start",
+      "en": {
+        "question": "Does a team member need to create another agency?",
+        "answer": "<p><strong>No. Join the agency through its invitation.</strong> Use your own NOD account, accept the invitation and work with the creators assigned to you.</p><p>A missing creator is a reason to check your assignment with the owner, not to create a duplicate agency. Joining a team does not issue another agency trial.</p>"
+      },
+      "ru": {
+        "question": "Сотруднику нужно создавать ещё одно агентство?",
+        "answer": "<p><strong>Нет. Присоединяйся к агентству по приглашению.</strong> Используй собственный аккаунт NOD, прими приглашение и работай с назначенными тебе моделями.</p><p>Если модели нет в списке, попроси владельца проверить назначение — создавать второе агентство не нужно. Приглашение сотрудника не запускает новый пробный период агентства.</p>"
+      },
+      "keywords": "invite приглашение чатер chatter сотрудник сексер менеджер join team",
+      "related": [
+        "assigned-creators"
+      ],
+      "route": {
+        "page": "auth",
+        "view": "invite",
+        "en": "Join with an invitation",
+        "ru": "Войти по приглашению"
+      },
+      "planned": false
+    },
+    {
+      "id": "connect-vs-access",
+      "category": "start",
+      "en": {
+        "question": "Why can a paid creator still need to reconnect?",
+        "answer": "<p><strong>OnlyFans connection and NOD access are separate states.</strong> A subscription enables NOD tools for that creator; it does not sign in to the creator’s OnlyFans account.</p><p>If the app asks for a connection or reconnection, complete that flow for the correct creator in the desktop. Paying for another period does not repair a lost session.</p>"
+      },
+      "ru": {
+        "question": "Почему оплаченной модели нужно переподключение?",
+        "answer": "<p><strong>Подключение OnlyFans и доступ к NOD — разные состояния.</strong> Подписка открывает инструменты NOD для модели, но не выполняет вход в её аккаунт OnlyFans.</p><p>Если приложение просит подключение или переподключение, пройди этот шаг для нужной модели в десктопе. Повторная оплата не исправляет потерянную сессию.</p>"
+      },
+      "keywords": "reconnect paid not connected подключение оплачено login access",
+      "related": [
+        "after-trial",
+        "assigned-creators"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "email-access",
+      "category": "start",
+      "en": {
+        "question": "Do I need to verify my email? What if I forget my password?",
+        "answer": "<p>Confirm your email before signing in: open the link from the email or enter its six-digit code. The NOD email and password belong to your NOD account, not to a creator’s OnlyFans account.</p><p>Forgot your password? Request a reset from the login page. Links last 30 minutes. After changing the password, sign in again on the website and in the app. If no email arrives, check Spam, request it again or contact support.</p>"
+      },
+      "ru": {
+        "question": "Нужно подтверждать почту? Что делать, если забыл пароль?",
+        "answer": "<p>Перед входом подтверди почту: открой ссылку из письма или введи код из шести цифр. Почта и пароль NOD относятся к твоему аккаунту NOD, а не к аккаунту модели на OnlyFans.</p><p>Если забыл пароль, запроси восстановление на странице входа. Ссылка действует 30 минут. После смены пароля нужно заново войти на сайте и в приложении. Если письма нет, проверь «Спам», запроси повторную отправку или обратись в поддержку.</p>"
+      },
+      "keywords": "email verify verification reset recovery письмо код почта пароль password забыл",
+      "related": [],
+      "route": {
+        "page": "auth",
+        "view": "recovery",
+        "en": "Password recovery",
+        "ru": "Восстановить доступ"
+      },
+      "planned": false
+    },
+    {
+      "id": "per-creator-price",
+      "category": "billing",
+      "en": {
+        "question": "Is the price calculated per agency or per creator?",
+        "answer": "<p><strong>Core access is priced for each creator separately.</strong> The standard revenue tier uses that creator’s verified revenue from the previous 30 completed UTC days, not the agency’s combined revenue.</p><p>The shared agency balance pays for separate creator subscriptions. Optional modules are also selected per creator. Pricing includes a calculator to explore the model.</p>"
+      },
+      "ru": {
+        "question": "Цена считается за агентство или за каждую модель?",
+        "answer": "<p><strong>Базовый доступ рассчитывается отдельно для каждой модели.</strong> Стандартный уровень зависит от её подтверждённого дохода за предыдущие 30 завершённых дней UTC, а не от общего оборота агентства.</p><p>Баланс у агентства общий, подписки моделей — отдельные. Дополнительные модули тоже выбираются для конкретной модели. На странице Pricing есть калькулятор для примера.</p>"
+      },
+      "keywords": "цена стоимость price pricing сколько тариф деньги cost",
+      "related": [
+        "choose-tier",
+        "wallet-vs-subscription"
+      ],
+      "route": {
+        "page": "pricing",
+        "anchor": "calculator",
+        "en": "Calculate your models",
+        "ru": "Посчитать стоимость"
+      },
+      "planned": false
+    },
+    {
+      "id": "choose-tier",
+      "category": "billing",
+      "en": {
+        "question": "Can I choose Starter for a higher-earning creator?",
+        "answer": "<p>No. The standard tier is calculated automatically: Starter, Growth, Pro or Elite. The tier depends on verified revenue; unknown revenue is not treated as zero.</p><p>Pricing shows the current commercial policy. The calculator is an estimate; review the final price in the app before purchasing access for a creator.</p>"
+      },
+      "ru": {
+        "question": "Можно выбрать Starter для модели с большим доходом?",
+        "answer": "<p>Нет. Стандартный уровень — Starter, Growth, Pro или Elite — рассчитывается автоматически по подтверждённому доходу. Неизвестный доход не считается нулевым.</p><p>На странице тарифов показана действующая коммерческая политика. Калькулятор даёт оценку; окончательную стоимость проверь в приложении перед покупкой доступа для модели.</p>"
+      },
+      "keywords": "starter growth pro elite tier план cheaper дешевле",
+      "related": [
+        "per-creator-price"
+      ],
+      "route": {
+        "page": "pricing",
+        "en": "View pricing rules",
+        "ru": "Посмотреть правила цены"
+      },
+      "planned": false
+    },
+    {
+      "id": "trial",
+      "category": "billing",
+      "en": {
+        "question": "How does the trial work?",
+        "answer": "<p>The trial starts when a new agency is created. Adding another creator or accepting an invitation does not start a separate agency trial.</p><p>See Pricing for the current duration. Your agency’s actual end date is shown in your account.</p>"
+      },
+      "ru": {
+        "question": "Как устроен пробный период?",
+        "answer": "<p>Пробный период начинается при создании нового агентства. Добавление ещё одной модели или принятие приглашения не запускает отдельный пробный период.</p><p>Текущая длительность указана на странице тарифов. Дата завершения пробного периода твоего агентства показана в аккаунте.</p>"
+      },
+      "keywords": "trial free period  триал пробный тест бесплатно",
+      "related": [
+        "after-trial",
+        "free-tools"
+      ],
+      "route": {
+        "page": "pricing",
+        "en": "Trial and pricing",
+        "ru": "Пробный доступ и тарифы"
+      },
+      "planned": false
+    },
+    {
+      "id": "after-trial",
+      "category": "billing",
+      "en": {
+        "question": "What happens after the trial ends?",
+        "answer": "<p>Creator operations require an active paid entitlement once the agency trial expires. Access is checked for the particular creator; paying for one does not enable every creator in the agency.</p><p>The owner can still use the billing path to restore access. The planned free modules have separate launch conditions that have not yet been finalised.</p>"
+      },
+      "ru": {
+        "question": "Что происходит после окончания пробного периода?",
+        "answer": "<p>После окончания пробного периода операции с моделью требуют активного оплаченного доступа. Он проверяется для конкретной модели: оплата одной не открывает всех моделей агентства.</p><p>Путь к оплате остаётся доступным владельцу, чтобы восстановить работу. Для планируемых бесплатных модулей условия запуска ещё нужно закрепить отдельно.</p>"
+      },
+      "keywords": "ended expired закончился кончился заблокировано trial access",
+      "related": [
+        "wallet-vs-subscription",
+        "free-tools"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "wallet-vs-subscription",
+      "category": "billing",
+      "en": {
+        "question": "Does a balance top-up activate all creators?",
+        "answer": "<p><strong>No. A top-up and a subscription purchase are different steps.</strong> A confirmed payment credits the agency wallet. Each creator needs an active access period.</p><p>A pending invoice does not confirm wallet credit. Manage the wallet and creator subscriptions in the desktop app.</p>"
+      },
+      "ru": {
+        "question": "Пополнение баланса активирует всех моделей?",
+        "answer": "<p><strong>Нет. Пополнение и покупка подписки — разные шаги.</strong> Подтверждённый платёж зачисляется на баланс агентства. У каждой нужной модели должен быть активный период доступа.</p><p>Ожидающий оплаты счёт ещё не означает зачисленные деньги. Баланс и подписки моделей управляются в приложении.</p>"
+      },
+      "keywords": "wallet balance topup payment invoice деньги баланс пополнение платёж оплатил",
+      "related": [
+        "per-creator-price",
+        "cancel-renewal"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "cancel-renewal",
+      "category": "billing",
+      "en": {
+        "question": "Will turning off renewal end the paid period immediately?",
+        "answer": "<p>No. Turning off auto-renewal does not end the already paid period early. Access remains until the period’s stated end.</p><p>Renewal and the current paid entitlement are separate states. Check the creator’s period end, not only the auto-renewal switch.</p>"
+      },
+      "ru": {
+        "question": "Отключение продления сразу закрывает оплаченный доступ?",
+        "answer": "<p>Нет. Отключение автопродления не обрывает уже оплаченный период. Доступ сохраняется до указанной даты его окончания.</p><p>Будущее продление и текущий оплаченный доступ — разные состояния. Смотри дату окончания периода модели, а не только положение переключателя.</p>"
+      },
+      "keywords": "renew auto cancel отмена продление автопродление",
+      "related": [
+        "after-trial"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "desktop-or-web",
+      "category": "install",
+      "en": {
+        "question": "Can I run the whole workspace in this website?",
+        "answer": "<p>The creator workspace is a desktop app. The website covers the product, access, pricing and setup. The interactive examples here are not connected accounts.</p><p>Install NOD and sign in to work with your agency. Installing the app alone does not connect a creator or activate a subscription.</p>"
+      },
+      "ru": {
+        "question": "Можно работать с моделями прямо на этом сайте?",
+        "answer": "<p>Рабочее пространство для моделей — десктопное приложение. Сайт посвящён продукту, доступу, ценам и началу работы. Интерактивные примеры здесь не подключены к аккаунтам.</p><p>Для работы установи NOD и войди в своё агентство. Одна установка не подключает модель и не активирует подписку.</p>"
+      },
+      "keywords": "browser web веб браузер desktop десктоп сайт",
+      "related": [],
+      "route": {
+        "page": "download",
+        "en": "Open Download",
+        "ru": "Перейти к загрузке"
+      },
+      "planned": false
+    },
+    {
+      "id": "installer",
+      "category": "install",
+      "en": {
+        "question": "Where can I download the installer?",
+        "answer": "<p>Open Download to see published builds for Windows and macOS. A download becomes available when its release link, version and checksum are published.</p><p>If your platform has no published build yet, the page shows that status. Use only the published installer for your system.</p>"
+      },
+      "ru": {
+        "question": "Где скачать установщик?",
+        "answer": "<p>На странице загрузки показаны опубликованные сборки для Windows и macOS. Загрузка становится доступна после публикации ссылки, версии и контрольной суммы выпуска.</p><p>Если сборка для твоей платформы ещё не опубликована, страница сообщит об этом. Используй опубликованный установщик для своей системы.</p>"
+      },
+      "keywords": "download скачать загрузить установщик exe dmg release кнопка не работает installer",
+      "related": [],
+      "route": {
+        "page": "download",
+        "en": "See download status",
+        "ru": "Посмотреть статус загрузки"
+      },
+      "planned": false
+    },
+    {
+      "id": "systems",
+      "category": "install",
+      "en": {
+        "question": "Which systems and hardware are supported?",
+        "answer": "<p>The Download design includes Windows and macOS choices, but that is not confirmation of released builds for both systems.</p><p>Supported OS versions, processor architecture, memory and disk requirements must be published with tested releases. The development package version is not a public release number.</p>"
+      },
+      "ru": {
+        "question": "Какие системы и требования к компьютеру поддерживаются?",
+        "answer": "<p>В макете Download есть выбор Windows и macOS, но это не подтверждение выпущенных сборок для обеих систем.</p><p>Версии ОС, архитектура процессора, требования к памяти и диску должны публиковаться с проверенными сборками. Версия пакета для разработки не является номером публичного релиза.</p>"
+      },
+      "keywords": "windows macos mac linux ram windows 10 windows 11 память требования система компьютер",
+      "related": [
+        "installer"
+      ],
+      "route": {
+        "page": "download",
+        "en": "Build information",
+        "ru": "Информация о сборке"
+      },
+      "planned": false
+    },
+    {
+      "id": "runtime",
+      "category": "install",
+      "en": {
+        "question": "Will desktop workflows run while my computer is off?",
+        "answer": "<p><strong>A desktop workflow needs an available runtime.</strong> A background process and an open application window are not the same thing, but switching off the computer stops local execution.</p><p>Sign-in, connected accounts and server functions also need internet access. Do not interpret “desktop” as fully offline, or a closed window as a guarantee that every job is still running.</p>"
+      },
+      "ru": {
+        "question": "Будут ли десктопные задачи работать на выключенном компьютере?",
+        "answer": "<p><strong>Для десктопных задач нужна доступная среда выполнения.</strong> Фоновый процесс и открытое окно приложения — не одно и то же, но выключенный компьютер не выполняет локальные задачи.</p><p>Вход, подключённые аккаунты и серверные функции также требуют интернета. «Десктоп» не означает полностью автономную работу, а закрытое окно не гарантирует продолжение всех задач.</p>"
+      },
+      "keywords": "offline online фон background выключить закрыть сон sleep интернет офлайн",
+      "related": [
+        "bump-control",
+        "desktop-or-web"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "unsorted",
+      "category": "content",
+      "en": {
+        "question": "Does “Unsorted” mean that a file has never been sent?",
+        "answer": "<p><strong>No. Sorting and usage history answer different questions.</strong> Unsorted helps find media outside the folder structure. Usage history helps see what was sent or purchased.</p><p>A file can already have been used and still need organising. Equally, an incomplete collected history is not proof that a file has never been sent.</p>"
+      },
+      "ru": {
+        "question": "«Неразобранное» — это контент, который никогда не отправляли?",
+        "answer": "<p><strong>Нет. Сортировка и история использования отвечают на разные вопросы.</strong> «Неразобранное» помогает найти медиа вне структуры папок. История использования — увидеть отправки и покупки.</p><p>Материал мог уже использоваться и при этом остаться неразобранным. А неполная собранная история не доказывает, что файл никогда не отправляли.</p>"
+      },
+      "keywords": "unsorted unused not sent vault волт неразобранное несортированный папки",
+      "related": [
+        "vault-sales"
+      ],
+      "route": {
+        "page": "home",
+        "anchor": "features",
+        "en": "Explore Vault",
+        "ru": "Посмотреть Vault"
+      },
+      "planned": false
+    },
+    {
+      "id": "vault-sales",
+      "category": "content",
+      "en": {
+        "question": "What can I see and manage inside Vault?",
+        "answer": "<p>Organise folders, upload and select media for batch actions, and inspect sales-related information beside the content: sale count, attributed revenue, buyers and last sale.</p><p><strong>Attributed revenue is not always a standalone sale price.</strong> Media can be sold in a bundle. Read the metric with its calculation method and available history instead of treating every file as an independent sale.</p>"
+      },
+      "ru": {
+        "question": "Что можно увидеть и сделать прямо в Vault?",
+        "answer": "<p>Организовать папки, загрузить и выбрать медиа для групповых действий, а рядом с контентом посмотреть число продаж, отнесённую выручку, покупателей и последнюю продажу.</p><p><strong>Отнесённая выручка — не всегда цена отдельной продажи файла.</strong> Медиа может продаваться в пакете. Показатель нужно читать с учётом методики и доступной истории, а не считать каждый файл отдельной сделкой.</p>"
+      },
+      "keywords": "vault revenue buyers sold продажи сколько продано статистика контент управление",
+      "related": [
+        "unsorted"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "content-audience",
+      "category": "content",
+      "en": {
+        "question": "Can I send an offer based on content preferences?",
+        "answer": "<p>Build a recipient list from CRM context: content interests, expressed requests, language and location, with exclusions for explicit refusals.</p><p><strong>Two fans with the same spend can want completely different things.</strong> Review the recipient list before sending. The app rechecks the audience before creating the mass-message queue; a matching word alone is not enough to establish interest.</p>"
+      },
+      "ru": {
+        "question": "Можно отправить рассылку по интересам к контенту?",
+        "answer": "<p>Аудитория собирается по контексту CRM: интересам к контенту, выраженным запросам, языку и локации, с исключением явных отказов.</p><p><strong>Два фаната с одинаковыми тратами могут хотеть совершенно разное.</strong> Проверь получателей перед отправкой. Перед созданием очереди приложение повторно проверяет аудиторию; одно совпавшее слово ещё не доказывает интерес.</p>"
+      },
+      "keywords": "campaign mass message preference preferences аудитория рассылка интерес фетиш предпочтения сегмент",
+      "related": [
+        "negative-preferences",
+        "creator-boundaries"
+      ],
+      "route": {
+        "page": "home",
+        "anchor": "features",
+        "en": "Explore content-aware campaigns",
+        "ru": "Посмотреть рассылки по интересам"
+      },
+      "planned": false
+    },
+    {
+      "id": "negative-preferences",
+      "category": "content",
+      "en": {
+        "question": "What if a fan said no, or their preference is unknown?",
+        "answer": "<p>“I don’t like this” is not a positive interest. Use the CRM context and exclusions to distinguish an expressed request, an explicit refusal and missing information.</p><p>Do not treat an unknown preference as consent or a likely match. Review recipients; fewer relevant offers can be a better choice than sending every format to everyone.</p>"
+      },
+      "ru": {
+        "question": "Что делать с отказами и неизвестными предпочтениями?",
+        "answer": "<p>«Мне это не нравится» — не положительный интерес. Контекст CRM и исключения помогают разделять выраженный запрос, явный отказ и отсутствие информации.</p><p>Неизвестное предпочтение не стоит считать согласием или подходящим совпадением. Проверяй получателей: меньше релевантных предложений может быть разумнее, чем любой формат всем подряд.</p>"
+      },
+      "keywords": "refused negative unknown нет не нравится отказ неизвестно",
+      "related": [
+        "content-audience"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "assigned-creators",
+      "category": "team",
+      "en": {
+        "question": "Why can’t an employee see a particular creator?",
+        "answer": "<p>Creator visibility depends on the employee’s assigned accounts and permissions. Ask the owner or an authorised manager to check the assignment and membership state.</p><p>NOD access, creator connection and team permissions are separate checks. Paying for the creator does not automatically assign that creator to every employee.</p>"
+      },
+      "ru": {
+        "question": "Почему сотрудник не видит нужную модель?",
+        "answer": "<p>Видимость моделей зависит от назначенных аккаунтов и разрешений сотрудника. Попроси владельца или уполномоченного менеджера проверить назначение и состояние доступа в команду.</p><p>Подписка NOD, подключение модели и права сотрудника проверяются отдельно. Оплата модели не назначает её автоматически каждому сотруднику.</p>"
+      },
+      "keywords": "permissions role assigned team видимость назначение доступ роли разрешения сотрудник модель нет",
+      "related": [
+        "team-invite",
+        "connect-vs-access"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "team-reporting",
+      "category": "team",
+      "en": {
+        "question": "What does team reporting show beyond revenue?",
+        "answer": "<p>Response-time measures, including median and P90, sit alongside unanswered dialogs. The reporting also covers confirmed posts and stories, manual activity and automation.</p><p>A fast average does not prove that everyone received a reply. Compare shifts with account load and traffic in mind; missing or updating data should not be read as zero work.</p>"
+      },
+      "ru": {
+        "question": "Что видно в статистике команды кроме выручки?",
+        "answer": "<p>Время ответа, включая медиану и P90, показано рядом с неотвеченными диалогами. В отчётах есть подтверждённые посты и истории, ручная активность и автоматизация.</p><p>Хорошее среднее не доказывает, что всем ответили. Сравнивай смены с учётом нагрузки и трафика; отсутствующие или обновляющиеся данные не стоит читать как нулевую работу.</p>"
+      },
+      "keywords": "response time p90 median stories posts статистика ответ скорость время посты истории команда честная",
+      "related": [],
+      "route": {
+        "page": "home",
+        "anchor": "features",
+        "en": "Explore team analytics",
+        "ru": "Посмотреть командную статистику"
+      },
+      "planned": false
+    },
+    {
+      "id": "sfs-hunter",
+      "category": "team",
+      "en": {
+        "question": "What does SFS Hunter automate?",
+        "answer": "<p>It supports a promotion workflow: finding candidates from feed promotions, inspecting profiles, posts and comments, then running configured actions with limits and a history.</p><p>This is a way to reduce repetitive manual checks, not a guarantee of traffic or sales. Counts of follows, likes or comments are not the same as acquired customers.</p>"
+      },
+      "ru": {
+        "question": "Какую работу снимает с команды SFS Hunter?",
+        "answer": "<p>Он поддерживает сценарий продвижения: поиск кандидатов из промо в ленте, проверку профилей, публикаций и комментариев, затем настроенные действия с лимитами и историей.</p><p>Это способ сократить повторяющиеся ручные проверки, а не гарантия трафика или продаж. Число подписок, лайков и комментариев — не то же самое, что привлечённые покупатели.</p>"
+      },
+      "keywords": "sfs hunter hunting сфс хантинг поиск продвижение comment bot outreach",
+      "related": [
+        "bump-control"
+      ],
+      "route": {
+        "page": "pricing",
+        "en": "Optional modules",
+        "ru": "Дополнительные модули"
+      },
+      "planned": false
+    },
+    {
+      "id": "bump-control",
+      "category": "team",
+      "en": {
+        "question": "Can I control the timing and pauses of automated messages?",
+        "answer": "<p>Bump and follow workflows use configured templates, intervals, reply cooldowns and queue/history views. Check the scenario before enabling it; “automatic” does not mean sending without limits.</p><p>Connected accounts, permissions and an available desktop runtime are still required for desktop execution. Local demo switches on this website do not start real workflows.</p>"
+      },
+      "ru": {
+        "question": "Можно управлять интервалами и паузами автоматических сообщений?",
+        "answer": "<p>Для бампов и follow-сценариев есть шаблоны, интервалы, паузы после ответа, очередь и история. Проверь сценарий перед включением: «автоматически» не означает «без ограничений».</p><p>Для десктопного исполнения по-прежнему нужны подключённые аккаунты, права и доступная среда выполнения. Переключатели демо на сайте не запускают реальные задачи.</p>"
+      },
+      "keywords": "automation bumps hidden online follow back refollow бампы автоматизация онлайн пауза шаблон",
+      "related": [
+        "runtime"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "creator-boundaries",
+      "category": "tools",
+      "en": {
+        "question": "The creator does not offer calls. Will NOD flag the request?",
+        "answer": "<p><strong>That is the intended purpose of Creator Boundaries.</strong> The creator’s own services and limits will be visible in the conversation, with a warning when an incoming request may contradict them.</p><p>This is not just a platform banned-word list. The same call request can be outside one creator’s offer and compatible with another’s conditions. The aim is to warn before an unfulfillable promise is made.</p><p>The feature is planned. The profiles and warnings shown on this site are scripted examples, not a released recognition system or an automatic sales block.</p>"
+      },
+      "ru": {
+        "question": "Модель не делает созвоны. NOD предупредит чатера?",
+        "answer": "<p><strong>Именно для этого планируются «Границы модели».</strong> Личные услуги и ограничения модели будут видны прямо в переписке, с предупреждением, когда входящий запрос может им противоречить.</p><p>Это не просто список запрещённых площадкой слов. Один и тот же запрос на созвон может не подходить одной модели и соответствовать условиям другой. Задача — предупредить до невыполнимого обещания.</p><p>Функция планируется. Профили и подсветка на сайте — заданные примеры, а не выпущенная система распознавания или автоматическая блокировка продажи.</p>"
+      },
+      "keywords": "boundaries calls no call model rules personal созвон звонок границы запреты модель не делает ограничения обещание",
+      "related": [],
+      "route": {
+        "page": "home",
+        "anchor": "creator-boundaries",
+        "en": "See the boundaries concept",
+        "ru": "Посмотреть пример границ"
+      },
+      "planned": true
+    },
+    {
+      "id": "translator",
+      "category": "tools",
+      "en": {
+        "question": "Does the translator work immediately after installation?",
+        "answer": "<p>Incoming and outgoing translation uses a configured, available AI model. In the supplied desktop implementation the provider is Ollama; enable the translator and select the intended language and model.</p><p>Installing NOD is not the same as installing and configuring the AI model. If translation is unavailable, check those settings and model availability rather than sending the message unchecked.</p>"
+      },
+      "ru": {
+        "question": "Переводчик работает сразу после установки?",
+        "answer": "<p>Перевод входящих и исходящих сообщений использует настроенную и доступную AI-модель. В переданной реализации десктопа используется Ollama; переводчик нужно включить и выбрать язык и модель.</p><p>Установка NOD не равна установке и настройке AI-модели. Если перевод недоступен, проверь настройки и доступность модели, а не отправляй сообщение без проверки.</p>"
+      },
+      "keywords": "translator translate ollama ai переводчик перевод язык",
+      "related": [
+        "ai-assistance",
+        "free-tools"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "ai-assistance",
+      "category": "tools",
+      "en": {
+        "question": "Are AI suggestions the same as an autonomous chatter?",
+        "answer": "<p>No. CRM summaries and suggested replies assist a person and depend on the configured model and available history. They are not a promise that an AI will run every conversation independently.</p><p>AI Chatter is a separate planned module . Review suggestions before using them; do not treat a generated assumption as a confirmed fan preference or creator commitment.</p>"
+      },
+      "ru": {
+        "question": "AI-подсказки — это автономный чатер?",
+        "answer": "<p>Нет. Резюме CRM и варианты ответов помогают человеку и зависят от настроенной модели и доступной истории. Это не обещание, что AI самостоятельно ведёт все переписки.</p><p>AI Chatter — отдельный планируемый модуль. Проверяй подсказки: предположение AI не является подтверждённым предпочтением фаната или обязательством модели.</p>"
+      },
+      "keywords": "ai chatter бот ии искусственный интеллект подсказки резюме",
+      "related": [
+        "translator",
+        "creator-boundaries"
+      ],
+      "route": null,
+      "planned": false
+    },
+    {
+      "id": "custom-orders",
+      "category": "tools",
+      "en": {
+        "question": "How does NOD help keep custom orders from being forgotten?",
+        "answer": "<p>Record the order with its conversation, creator, brief, references, deadline and payment record. Pass the task through the configured Telegram connection and keep reminders and delivery status in view.</p><p><strong>First, the order must be created.</strong> NOD is not presented as automatically recognising every promise in every chat. The payment record is not payment processing, and a reminder is not proof that the creator completed the work.</p>"
+      },
+      "ru": {
+        "question": "Как NOD помогает не забыть кастом?",
+        "answer": "<p>Оформи заказ с привязкой к диалогу и модели: задание, референсы, срок и учёт оплаты. Передай задачу через настроенное подключение Telegram и держи напоминания и выдачу перед глазами.</p><p><strong>Сначала заказ нужно создать.</strong> NOD не заявляется как автоматическое распознавание любого обещания в чате. Учёт оплаты — не приём платежа, а напоминание — не доказательство выполнения работы моделью.</p>"
+      },
+      "keywords": "custom order telegram напоминание кастом заказ задание референс дедлайн забыл тг телеграм",
+      "related": [],
+      "route": {
+        "page": "home",
+        "anchor": "custom-orders",
+        "en": "See the custom order workflow",
+        "ru": "Посмотреть работу с кастомами"
+      },
+      "planned": false
+    },
+    {
+      "id": "free-tools",
+      "category": "tools",
+      "en": {
+        "question": "Which tools are planned to be free?",
+        "answer": "<p>The launch plan is to make <strong>CRM, the translator and custom orders</strong> free. Exact access conditions, limits and AI-resource requirements still need to be confirmed.</p><p>That does not mean the entire NOD workspace is free after the trial, or that an AI model is included without setup. Current access and billing are managed in the app.</p>"
+      },
+      "ru": {
+        "question": "Какие инструменты планируются бесплатными?",
+        "answer": "<p>В плане запуска — бесплатные <strong>CRM, переводчик и кастомы</strong>. Точные условия доступа, ограничения и требования к AI-ресурсам ещё нужно подтвердить.</p><p>Это не означает, что весь NOD бесплатен после пробного периода или что AI-модель включена без настройки. Текущий доступ и оплата управляются в приложении.</p>"
+      },
+      "keywords": "free бесплатно crm срм кастомы переводчик доплата free plan",
+      "related": [
+        "trial",
+        "translator"
+      ],
+      "route": {
+        "page": "pricing",
+        "en": "Plans and conditions",
+        "ru": "Тарифы и условия"
+      },
+      "planned": true
+    }
+  ]
+}

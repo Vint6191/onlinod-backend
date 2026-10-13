@@ -1,24 +1,22 @@
-# Onlinod Backend v3
+# Onlinod Backend
 
-Backend API + built-in debug Web Console for Onlinod.
+Backend API, NOD public website and the existing platform administration UI.
 
-## What is included
+## Public website
 
-- Web Console served at `/`
-- Email registration
-- Email verification by link or 6-digit code
-- Resend verification email
-- Login only after email verified
-- Access token + refresh token
-- Refresh session
-- Logout
-- Forgot password
-- Reset password
-- Agency workspace
-- Creator/model account CRUD
-- Avatar upload
-- Prisma migration for Neon/Postgres
-- Render-ready setup
+The supplied NOD design is served directly by this Backend. No separate frontend hosting or build command is required.
+
+- `/`: public homepage; `/pricing`, `/download`, `/questions`, `/help`.
+- `/register`: creates a real User, Agency, owner membership and encrypted verification mail in one transaction.
+- `/verify-email`: explicit confirmation by link or six-digit code; opening a GET link does not consume it.
+- `/login`, `/account`: browser sessions and current account/agency information.
+- `/forgot-password`, `/reset-password`: one-time password recovery that revokes previous sessions.
+- `/invite/:token`: registration or existing-account acceptance with the invitation’s actual agency, role and creator scope.
+- `/admin`: existing administration UI.
+
+The website and Desktop share the existing account, membership, session and password authorities. Browser credentials are HttpOnly, SameSite=Lax cookies scoped to `/api/web`; HTTPS makes them Secure. Browser mutation endpoints require the same origin and an explicit website-client header. Native `/api/auth` token responses retain their existing contract.
+
+Pricing comes from the active commercial policy through `/api/site/pricing`. The calculator is an estimate; wallet and creator subscription operations remain in Desktop. Support forms and their widget send email requests with attachments and an explicit provider receipt; replies arrive by email.
 
 ## Render
 
@@ -34,66 +32,46 @@ Start command:
 npm start
 ```
 
-Environment variables:
+Keep the existing `DATABASE_URL`, `JWT_SECRET` and stable encryption key. This website update adds no database migration and requires no database cleanup or replacement.
+
+Set these in Render Environment (values below are examples):
 
 ```env
 NODE_ENV=production
 DATABASE_URL=postgresql://...
-JWT_SECRET=long-random-secret
+JWT_SECRET=your-existing-secret
 PUBLIC_BASE_URL=https://onlinod-backend.onrender.com
 APP_URL=https://onlinod-backend.onrender.com
 ACCESS_TOKEN_TTL=15m
 REFRESH_TOKEN_TTL_DAYS=30
-RESEND_API_KEY=
-SNAPSHOT_ENCRYPTION_KEY=32-byte-base64-server-key
-EMAIL_FROM=Onlinod <onboarding@resend.dev>
+RESEND_API_KEY=your-resend-key
+SNAPSHOT_ENCRYPTION_KEY=your-existing-32-byte-base64-key
+EMAIL_FROM=NOD <mail@your-verified-domain.example>
+SUPPORT_EMAIL=your-support-inbox@example.com
 ```
 
-Verification and reset mail use the durable encrypted `AuthMailOutbox`. Production requires a stable 32-byte base64 `SNAPSHOT_ENCRYPTION_KEY`, plus `RESEND_API_KEY` and a verified `EMAIL_FROM` for delivery. With mail unconfigured, delivery stays pending until token expiry; public responses never disclose verification codes or reset links. Do not rotate the server encryption key while encrypted pending mail still needs delivery.
+`APP_URL` and `PUBLIC_BASE_URL` must be the same public origin serving this site. An HTTPS origin without a path is required; local HTTP loopback is supported for development. Browser registration and resend/reset requests return `AUTH_EMAIL_UNAVAILABLE` when the key, mail API or public origin is unconfigured. A provider rejection after registration leaves the account awaiting confirmation and permits another mail request.
 
-The cumulative 6D+6E candidate and its rollout/acceptance limits are described in `docs/PHASE6_DE_DURABLE_EFFECTS_RESOURCE_ADMISSION.txt`. Apply Backend and Desktop as one coordinated version, using the normal migration deploy pipeline; old unkeyed management routes return 410.
+Verification and reset mail use the encrypted durable `AuthMailOutbox` and the existing Backend retry worker. Do not replace a working `SNAPSHOT_ENCRYPTION_KEY`: pending payloads need the same key. If a new installation has no key, generate one locally with `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"` and save the output only in Render Environment.
 
-## Console
+Use a verified sender domain in Resend for mail to other users. The default `onboarding@resend.dev` sender can only send to the email belonging to the Resend account. See [Resend’s sender-domain instructions](https://resend.com/docs/knowledge-base/403-error-resend-dev-domain). Configuration availability is not proof of inbox delivery; inspect the provider logs and `AuthMailOutbox` delivery status if mail is missing.
 
-Open:
+## Published installers and legal links
 
-```txt
-https://onlinod-backend.onrender.com
+The Download page reads metadata from `/api/site/config`. For each published platform, set:
+
+```env
+NOD_WINDOWS_DOWNLOAD_URL=https://your-release-host.example/NOD-Setup.exe
+NOD_WINDOWS_VERSION=your-published-version
+NOD_WINDOWS_SHA256=64-lowercase-hex-characters
+NOD_WINDOWS_SIZE_BYTES=123456789
+NOD_WINDOWS_MINIMUM_OS=your-tested-system
+NOD_WINDOWS_ARCHITECTURE=your-build-architecture
 ```
 
-Use it to test:
+Use the same suffixes with `NOD_MACOS_` for macOS. URL, version and SHA-256 are mandatory; other fields are optional. Only HTTPS URLs without embedded credentials are accepted. Until a real release is configured, the page shows that the build is unavailable. This source update does not fabricate or host installer binaries.
 
-- register
-- verify email by code
-- login
-- load current user
-- add/list creator accounts
-- forgot/reset password
-
-
-## v5 Creator Analytics WebApp
-
-The web app now uses:
-
-- Login / registration / verify email
-- Home dashboard shell
-- Creator Analytics module adapted from Electron HQ
-- `+ Add Account` modal backed by `POST /api/creators`
-- Creator list backed by `GET /api/creators`
-- Electron-only actions are intentionally shown as toast placeholders
-
-Open:
-
-```txt
-https://onlinod-backend.onrender.com
-```
-
-Flow:
-
-```txt
-Register → Verify Email → Login → Creator Analytics → + Add Account
-```
-
+Optional `NOD_TERMS_URL` and `NOD_PRIVACY_URL` connect the approved published documents. Unconfigured documents show an honest availability notice. Server credentials are never returned by the public configuration API.
 
 ## Current creator session authority
 

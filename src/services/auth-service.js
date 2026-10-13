@@ -96,6 +96,17 @@ async function createAuthToken({ userId, type, ttlMinutes = 30, withCode = false
   return { token, code };
 }
 
+async function enqueueNewAuthMail(tx, current, kind, now) {
+    const token=randomToken(32),code=kind === "EMAIL_VERIFY" ? String(require("node:crypto").randomInt(100000,1000000)) : null;
+    const expiresAt=new Date(now.getTime()+30*60_000);
+    await tx.authToken.updateMany({where:{userId:current.id,type:kind,usedAt:null},data:{usedAt:now}});
+    const row=await tx.authToken.create({data:{userId:current.id,type:kind,tokenHash:sha256(token),codeHash:code?sha256(code):null,expiresAt}});
+    return enqueueAuthMail(tx,{userId:current.id,authTokenId:row.id,kind,expiresAt,payload:kind === "EMAIL_VERIFY" ? verificationPayload({email:current.email,token,code}) : passwordResetPayload({email:current.email,token})});
+}
+async function enqueueInitialEmailVerification(tx, user) {
+  return enqueueNewAuthMail(tx, user, "EMAIL_VERIFY", await dbAuthorityNow({ db: tx }));
+}
+
 async function issueAuthMail(user, kind) {
   const id = await withAuthorizationUserLock({ db: prisma, userId: user.id, work: async tx => {
     await tx.$queryRawUnsafe('SELECT "id" FROM "User" WHERE "id"=$1 FOR UPDATE', user.id);
@@ -108,11 +119,7 @@ async function issueAuthMail(user, kind) {
     // the cooldown. No second token or provider identity is created.
     const [recent] = await tx.$queryRawUnsafe('SELECT m."id" FROM "AuthMailOutbox" m JOIN "AuthToken" t ON t."id"=m."authTokenId" WHERE m."userId"=$1 AND m."kind"=$2 AND m."createdAt">$3 AND t."usedAt" IS NULL AND t."expiresAt">$4 AND m."status" NOT IN (\'FAILED\',\'EXPIRED\') ORDER BY m."createdAt" DESC LIMIT 1',user.id,kind,new Date(now.getTime()-60_000),now);
     if(recent) return recent.id;
-    const token=randomToken(32),code=kind === "EMAIL_VERIFY" ? String(require("node:crypto").randomInt(100000,1000000)) : null;
-    const expiresAt=new Date(now.getTime()+30*60_000);
-    await tx.authToken.updateMany({where:{userId:user.id,type:kind,usedAt:null},data:{usedAt:now}});
-    const row=await tx.authToken.create({data:{userId:user.id,type:kind,tokenHash:sha256(token),codeHash:code?sha256(code):null,expiresAt}});
-    return enqueueAuthMail(tx,{userId:user.id,authTokenId:row.id,kind,expiresAt,payload:kind === "EMAIL_VERIFY" ? verificationPayload({email:current.email,token,code}) : passwordResetPayload({email:current.email,token})});
+    return enqueueNewAuthMail(tx, current, kind, now);
   }});
   const emailResult=id ? await deliverAuthMail({db:prisma,id}) : {ok:true,alreadyVerified:true};
   return { emailResult };
@@ -536,6 +543,7 @@ async function revokeRefreshToken(refreshToken) {
 }
 
 module.exports = {
+  enqueueInitialEmailVerification,
   publicUser,
   refreshRevocationScope,
   getPrimaryMembership,

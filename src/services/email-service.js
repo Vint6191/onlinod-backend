@@ -31,7 +31,7 @@ async function sendMail(payload, { idempotencyKey, fetchImpl = globalThis.fetch 
 
 function verificationPayload({ email, token, code }) {
   const base = getAppUrl();
-  const verifyUrl = `${base}/api/auth/verify-email?token=${encodeURIComponent(token)}`;
+  const verifyUrl = `${base}/verify-email?token=${encodeURIComponent(token)}`;
 
   return {
     from: getFrom(),

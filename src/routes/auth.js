@@ -13,6 +13,7 @@ const {
   publicUser,
   getPrimaryMembership,
   issueEmailVerification,
+  enqueueInitialEmailVerification,
   issuePasswordReset,
   issueLoginTokens,
   verifyEmailByToken,
@@ -29,11 +30,15 @@ const { assertTeamControlPlaneWriteAdmission } = require("../services/database-w
 const { acquireAuthorizationUserLock } = require("../services/authorization-session-authority-service");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 
+const webTransport = require("../services/website-session-transport");
+const { requireAuthMail } = require("../services/website-config-service");
+function createAuthRouter({ web = false } = {}) {
 const router = express.Router();
+if (web) router.use(webTransport.prepareAuthRequest);
 
 const registerSchema = z.object({
   email: z.string().email(),
-  password: z.string().min(8),
+  password: z.string().min(8).max(200),
   name: z.string().min(1).max(80).optional(),
   agencyName: z.string().min(1).max(120).optional(),
   inviteToken: z.string().min(10).optional().nullable(),
@@ -133,6 +138,7 @@ function validationError(res, err) {
 
 router.post("/register", async (req, res) => {
   try {
+    if (web && !requireAuthMail(res)) return;
     const input = registerSchema.parse(req.body);
     const email = input.email.toLowerCase().trim();
     const inviteToken = String(input.inviteToken || "").trim();
@@ -294,6 +300,7 @@ router.post("/register", async (req, res) => {
           user,
           agency: inv.agency,
           member,
+          verificationMailId: await enqueueInitialEmailVerification(tx, user),
           invitationClaimed: true,
           inviteRoleKey: roleKey,
         };
@@ -345,7 +352,7 @@ router.post("/register", async (req, res) => {
         },
       });
 
-      return { user, agency, member, invitationClaimed: false };
+      return { user, agency, member, verificationMailId: await enqueueInitialEmailVerification(tx, user), invitationClaimed: false };
     }, { profile: "TEAM_MANAGEMENT", authority: { kind: "REGISTRATION", agencyId: invitationCheck?.invitation?.agencyId || null }, conflictCode: "REGISTRATION_CONCURRENT_CHANGE" });
 
     if (result.invitationClaimed === true) {
@@ -362,7 +369,12 @@ router.post("/register", async (req, res) => {
         console.error("[auth/register/control-access-epoch] failed:", eventError);
       }
     }
-    const verification = await issueEmailVerification(result.user);
+    // User, membership and verification outbox commit together. A provider
+    // outage after that commit must not turn a created account into HTTP 500.
+    let emailResult;
+    try { emailResult = await require("../services/auth-mail-outbox-service").deliverAuthMail({ db: prisma, id: result.verificationMailId }); }
+    catch (_) { emailResult = { ok: false, code: "AUTH_MAIL_PENDING" }; }
+    const verification = { emailResult };
 
     return res.status(201).json({
       ok: true,
@@ -376,6 +388,9 @@ router.post("/register", async (req, res) => {
     });
   } catch (err) {
     if (err?.issues) return validationError(res, err);
+    if (err?.code === "P2002" && Array.isArray(err.meta?.target) && err.meta.target.includes("email")) {
+      return res.status(409).json({ ok: false, code: "EMAIL_TAKEN", error: "Email is already registered" });
+    }
     if (err?.code === "REGISTRATION_CONCURRENT_CHANGE") return res.status(409).json({ ok: false, code: err.code, error: err.message });
     if (err?.code && String(err.code).startsWith("INVITE_")) {
       return res.status(err.status || 400).json({ ok: false, code: err.code, error: err.message });
@@ -388,47 +403,18 @@ router.post("/register", async (req, res) => {
   }
 });
 
-router.get("/verify-email", async (req, res) => {
-  try {
-    const token = String(req.query.token || "").trim();
-    if (!token) return res.status(400).send("Verification token is missing.");
-
-    const result = await verifyEmailByToken(token);
-    if (!result.ok) return res.status(400).send(`${result.error || "Verification failed"} (${result.code})`);
-
-    return res.send(`
-      <!doctype html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <title>Onlinod email verified</title>
-          <style>
-            body { font-family: Inter, Arial, sans-serif; background:#070b13; color:#fff; display:grid; place-items:center; min-height:100vh; margin:0; }
-            .card { border:1px solid rgba(255,255,255,.12); border-radius:18px; padding:28px; background:#0d1420; max-width:420px; box-shadow:0 30px 80px rgba(0,0,0,.35); }
-            h1 { margin:0 0 10px; color:#f7b84b; }
-            p { color:#cbd5e1; }
-            a { color:#f7b84b; }
-          </style>
-        </head>
-        <body>
-          <div class="card">
-            <h1>Email verified</h1>
-            <p>Your Onlinod account is ready. You can return to the console and log in.</p>
-            <p><a href="/">Open Onlinod Console</a></p>
-          </div>
-        </body>
-      </html>
-    `);
-  } catch (err) {
-    console.error("[auth/verify-email GET] failed:", err);
-    return res.status(500).send("Verification failed.");
-  }
+router.get("/verify-email", (req, res) => {
+  // Mail scanners may follow GET links. The user confirms on the website;
+  // consumption happens only through the existing POST verification authority.
+  const token = typeof req.query.token === "string" ? req.query.token : "";
+  res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" });
+  return res.redirect(303, "/verify-email" + (token.length >= 20 && token.length <= 256 ? "?token=" + encodeURIComponent(token) : ""));
 });
 
 router.post("/verify-email", async (req, res) => {
   try {
-    const input = verifyCodeSchema.parse(req.body);
-    const result = await verifyEmailByCode(input);
+    const input = z.union([z.object({ token: z.string().min(20).max(256) }).strict(), verifyCodeSchema]).parse(req.body);
+    const result = input.token ? await verifyEmailByToken(input.token) : await verifyEmailByCode(input);
     if (!result.ok) return res.status(400).json(result);
     return res.json({ ok: true, user: publicUser(result.user) });
   } catch (err) {
@@ -440,6 +426,7 @@ router.post("/verify-email", async (req, res) => {
 
 router.post("/resend-verification", async (req, res) => {
   try {
+    if (web && !requireAuthMail(res)) return;
     const input = emailOnlySchema.parse(req.body);
     const email = input.email.toLowerCase().trim();
     const user = await prisma.user.findUnique({ where: { email } });
@@ -498,7 +485,7 @@ router.post("/login", require("../middleware/login-admission").loginAdmission({ 
     });
     const effectivePermissions = await resolveEffectivePermissions({ member: membership, db: prisma });
 
-    return res.json({
+    return webTransport.replySession(req, res, {
       ok: true,
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
@@ -513,7 +500,7 @@ router.post("/login", require("../middleware/login-admission").loginAdmission({ 
       accessEpoch: Number(membership.accessEpoch || 1),
       role: membership.role,
       permissions: effectivePermissions,
-    });
+    }, web);
   } catch (err) {
     if (err?.issues) return validationError(res, err);
     const status = Number(err?.status);
@@ -538,7 +525,7 @@ router.post("/refresh", async (req, res) => {
     if (!result.ok) return res.status(401).json(result);
     const effectivePermissions = await resolveEffectivePermissions({ member: result.membership, db: prisma });
 
-    return res.json({
+    return webTransport.replySession(req, res, {
       ok: true,
       accessToken: result.accessToken,
       refreshToken: result.refreshToken,
@@ -553,7 +540,7 @@ router.post("/refresh", async (req, res) => {
       accessEpoch: Number(result.membership.accessEpoch || 1),
       role: result.membership.role,
       permissions: effectivePermissions,
-    });
+    }, web);
   } catch (err) {
     if (err?.issues) return validationError(res, err);
     console.error("[auth/refresh] failed:", err);
@@ -565,15 +552,18 @@ router.post("/logout", async (req, res) => {
   try {
     const input = refreshSchema.safeParse(req.body || {});
     if (input.success) await revokeRefreshToken(input.data.refreshToken);
+    if (web) webTransport.clearSession(req, res);
     return res.json({ ok: true });
   } catch (err) {
     console.error("[auth/logout] failed:", err);
+    if (web) return res.status(503).json({ ok: false, code: "LOGOUT_RETRY_REQUIRED", error: "Sign out could not be confirmed. Please try again." });
     return res.json({ ok: true });
   }
 });
 
 router.post("/forgot-password", async (req, res) => {
   try {
+    if (web && !requireAuthMail(res)) return;
     const input = emailOnlySchema.parse(req.body);
     const email = input.email.toLowerCase().trim();
     const user = await prisma.user.findUnique({ where: { email } });
@@ -595,7 +585,9 @@ router.post("/forgot-password", async (req, res) => {
 router.post("/reset-password", async (req, res) => {
   try {
     const input = resetPasswordSchema.parse(req.body);
-    return res.json(await require("../services/account-password-reset-service").resetAccountPassword({ db: prisma, ...input }));
+    const result = await require("../services/account-password-reset-service").resetAccountPassword({ db: prisma, ...input });
+    if (web) webTransport.clearSession(req, res);
+    return res.json(result);
   } catch (err) {
     if (err?.issues) return validationError(res, err);
     return res.status(Number(err?.status) || 500).json({ ok: false, code: err?.code || "RESET_PASSWORD_FAILED", error: err?.status ? err.message : "Failed to reset password" });
@@ -623,4 +615,7 @@ router.get("/me", authRequired, async (req, res) => {
   }
 });
 
-module.exports = router;
+return router;
+}
+module.exports = createAuthRouter();
+module.exports.createAuthRouter = createAuthRouter;

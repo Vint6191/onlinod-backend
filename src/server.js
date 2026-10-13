@@ -88,7 +88,7 @@ function readAllowedOrigins() {
   // The Admin UI is served by this configured backend origin as well.
   // Do not derive trust from the request's Host/Origin headers.
   try {
-    const published = new URL(process.env.PUBLIC_BASE_URL);
+    const published = new URL(process.env.PUBLIC_BASE_URL || process.env.APP_URL);
     if (["https:", "http:"].includes(published.protocol)) extra.push(published.origin);
   } catch (_) { /* Unconfigured deployments keep the explicit allowlist. */ }
   return new Set([...DEFAULT_ALLOWED_ORIGINS, ...extra]);
@@ -128,7 +128,7 @@ const apiLimiter = rateLimit({
 });
 
 app.use("/api", apiLimiter);
-app.use(["/api/auth/login", "/api/admin-auth/login"], express.json({ limit: "16kb" }));
+app.use(["/api/auth/login", "/api/admin-auth/login", "/api/web/auth/login"], express.json({ limit: "16kb" }));
 
 app.use("/api/management/commands", express.json({ limit: "4400kb" }));
 app.use(express.json({ limit: "2mb" }));
@@ -143,7 +143,7 @@ app.use("/uploads", express.static(path.join(__dirname, "..", "uploads"), {
     res.setHeader("Content-Security-Policy", "default-src 'none'; img-src 'self' data:; style-src 'none'; script-src 'none'; sandbox");
   },
 }));
-app.use(require("./routes/account-recovery-pages"));
+app.use(require("./routes/website"));
 app.use(express.static(path.join(__dirname, "..", "public")));
 
 app.get("/health", async (_req, res) => {
