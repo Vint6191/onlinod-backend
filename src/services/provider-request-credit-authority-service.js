@@ -77,12 +77,15 @@ function assertDurableClient(db) {
   }
 }
 async function ensureStateRow(db) {
+  // Prisma timestamp columns store UTC wall time. These single-statement
+  // writes also run outside the commit kernel's transaction-local UTC scope,
+  // so they must not inherit a pooled connection's session timezone.
   await db.$queryRawUnsafe(`
     INSERT INTO "OfProviderRequestGateState" (
       "id", "revision", "priorityCursor", "backgroundCategoryCursor",
       "fairnessGeneration", "fairnessActivationState",
       "createdAt", "updatedAt"
-    ) VALUES ($1, 0, 0, 0, $2, 'ACTIVE', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    ) VALUES ($1, 0, 0, 0, $2, 'ACTIVE', (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'))
     ON CONFLICT ("id") DO NOTHING
   `, PROVIDER_GATE_STATE_ID, PROVIDER_GATE_FAIRNESS_GENERATION);
 }
@@ -245,11 +248,12 @@ async function registerDurableProviderWaiter({
       "priority", "category", "operation", "source", "enqueuedAt", "leaseUntil", "createdAt", "updatedAt"
     ) VALUES (
       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,
-      clock_timestamp(), clock_timestamp() + ($11::bigint * INTERVAL '1 millisecond'), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+      (clock_timestamp() AT TIME ZONE 'UTC'), (clock_timestamp() AT TIME ZONE 'UTC') + ($11::bigint * INTERVAL '1 millisecond'),
+      (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
     )
     ON CONFLICT ("waiterId") DO UPDATE SET
-      "leaseUntil" = clock_timestamp() + ($11::bigint * INTERVAL '1 millisecond'),
-      "updatedAt" = CURRENT_TIMESTAMP
+      "leaseUntil" = (clock_timestamp() AT TIME ZONE 'UTC') + ($11::bigint * INTERVAL '1 millisecond'),
+      "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
     WHERE "OfProviderRequestGateWaiter"."ownerInstanceId" = EXCLUDED."ownerInstanceId"
       AND "OfProviderRequestGateWaiter"."agencyId" = EXCLUDED."agencyId"
       AND "OfProviderRequestGateWaiter"."creatorId" = EXCLUDED."creatorId"
@@ -286,11 +290,11 @@ async function heartbeatDurableProviderWaiters({ db, ownerInstanceId, waiterIds,
   const rows = await db.$queryRawUnsafe(`
     UPDATE "OfProviderRequestGateWaiter"
     SET
-      "leaseUntil" = clock_timestamp() + ($3::bigint * INTERVAL '1 millisecond'),
-      "updatedAt" = CURRENT_TIMESTAMP
+      "leaseUntil" = (clock_timestamp() AT TIME ZONE 'UTC') + ($3::bigint * INTERVAL '1 millisecond'),
+      "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
     WHERE "ownerInstanceId" = $1
       AND "waiterId" IN (SELECT jsonb_array_elements_text($2::jsonb))
-      AND "leaseUntil" > clock_timestamp()
+      AND "leaseUntil" > (clock_timestamp() AT TIME ZONE 'UTC')
     RETURNING "waiterId"
   `, normalizedOwner, JSON.stringify(ids), ttlMs);
   return { touched: Array.isArray(rows) ? rows.length : (rows ? 1 : 0) };
@@ -450,7 +454,7 @@ async function tryAcquireDurableProviderPermit({
           "activeExpiresAt" = NULL,
           "nextAllowedAt" = GREATEST(COALESCE("nextAllowedAt", $2), $2),
           "revision" = "revision" + 1,
-          "updatedAt" = CURRENT_TIMESTAMP
+          "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
         WHERE "id" = $1
         RETURNING "revision", "nextAllowedAt"
       `, PROVIDER_GATE_STATE_ID, failSafeNext);
@@ -519,7 +523,7 @@ async function tryAcquireDurableProviderPermit({
         "activePriority" = $13,
         "activeCategory" = $14,
         "revision" = "revision" + 1,
-        "updatedAt" = CURRENT_TIMESTAMP
+        "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
       WHERE "id" = $1
       RETURNING "revision"
     `,
@@ -606,7 +610,7 @@ async function acknowledgeDurableProviderStarted({ db, permitId, agencyId, creat
         "usageBackgroundOtherStarts" = CASE WHEN $8::boolean THEN CASE WHEN $7='background_other' THEN 1 ELSE 0 END ELSE "usageBackgroundOtherStarts" + CASE WHEN $7='background_other' THEN 1 ELSE 0 END END,
         "usageUnclassifiedStarts" = CASE WHEN $8::boolean THEN CASE WHEN $6='legacy' OR $7='legacy' THEN 1 ELSE 0 END ELSE "usageUnclassifiedStarts" + CASE WHEN $6='legacy' OR $7='legacy' THEN 1 ELSE 0 END END,
         "revision" = "revision" + 1,
-        "updatedAt" = CURRENT_TIMESTAMP
+        "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
       WHERE "id" = $1
       RETURNING "revision", "usageWindowStartedAt", "usageTotalStarts", "usageUnclassifiedStarts"
     `, PROVIDER_GATE_STATE_ID, authorityNow, clean(creatorId, 200), clean(deviceId, 200), nextAllowedAt, activePriority, activeCategory, resetUsageWindow);
@@ -645,7 +649,7 @@ async function cancelDurableProviderPermit({ db, permitId, agencyId, creatorId, 
         "activeGrantedAt" = NULL,
         "activeExpiresAt" = NULL,
         "revision" = "revision" + 1,
-        "updatedAt" = CURRENT_TIMESTAMP
+        "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
       WHERE "id" = $1
       RETURNING "revision"
     `, PROVIDER_GATE_STATE_ID);

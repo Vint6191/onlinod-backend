@@ -10,6 +10,7 @@ const { audit } = require("../services/audit-service");
 const { waitForDesktopControlEvents } = require("../services/desktop-control-events");
 const { desktopAuthorityProof, readCurrentDesktopMemberAuthority, withStableDesktopCurrentAccess } = require("../services/desktop-current-access-authority-service");
 const { currentCreatorCatalogGeneration } = require("../services/creator-human-management-authority-service");
+const { assertCurrentAuthorizationSession } = require("../services/authorization-session-authority-service");
 
 const router = express.Router();
 router.use(authRequired);
@@ -89,6 +90,7 @@ router.get("/control/events", async (req, res) => {
     // 25 seconds. Re-read current Member/User/Agency authority after the wait
     // before exposing creator-scoped metadata or JOB_AVAILABLE hints.
     const filtered = await filterAuthorizedControlEventsStable(req, result.events);
+    await assertCurrentAuthorizationSession({ db: prisma, ...req.auth });
     res.setHeader("Cache-Control", "no-store, private");
     return res.json({
       ok: true,

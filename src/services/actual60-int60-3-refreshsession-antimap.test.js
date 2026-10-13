@@ -24,6 +24,9 @@ function rel(file) {
 const expectedTouchpoints = [
   "src/middleware/auth.js",
   "src/routes/admin.js",
+  // Bounded exact-lineage revalidation after asynchronous control/heartbeat work.
+  "src/routes/desktop.js",
+  "src/routes/devices.js",
   // Current account/administration command authorities and bounded live state.
   "src/services/account-password-reset-service.js",
   "src/services/account-security-command-service.js",
@@ -45,7 +48,7 @@ const expectedTouchpoints = [
 
 test("INT60.3 RefreshSession anti-map: every production touchpoint is explicitly classified", () => {
   const actual = productionJsFiles(srcRoot)
-    .filter((file) => /refreshsessions?/i.test(fs.readFileSync(file, "utf8")))
+    .filter((file) => /refreshsessions?|assertCurrentAuthorizationSession/i.test(fs.readFileSync(file, "utf8")))
     .map(rel)
     .sort();
   assert.deepEqual(actual, expectedTouchpoints,

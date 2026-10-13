@@ -4,6 +4,7 @@ const prisma = require("../prisma");
 const { authRequired, requireAuthDevice } = require("../middleware/auth");
 const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
+const { assertCurrentAuthorizationSession } = require("../services/authorization-session-authority-service");
 const { withHeartbeatMemberGeneration } = require("../services/device-heartbeat-generation-service");
 const { updateObservationFromHeartbeat, recordRealtimeObservationPing, realtimeFrameSampleAt } = require("../services/team-observation-service");
 const {
@@ -433,6 +434,8 @@ router.post("/heartbeat", async (req, res) => {
       take: 50,
     });
 
+    await assertCurrentAuthorizationSession({ db: prisma, ...req.auth });
+
     if (commands.length) {
       await prisma.deviceCommand.updateMany({
         where: { id: { in: commands.map((item) => item.id) } },
@@ -440,11 +443,15 @@ router.post("/heartbeat", async (req, res) => {
       });
     }
 
-    const forceLogout = commands.some((item) => item.command === "FORCE_LOGOUT");
+    // Revocation is durable RefreshSession state, checked above. A queued device
+    // hint can outlive the login it revoked (including while Desktop is offline).
+    // Consume it, but never turn it into authority over a newer successful login.
+    const forceLogout = false;
+    const currentCommands = commands.filter((item) => item.command !== "FORCE_LOGOUT");
     const revokedCreatorIds = [];
     const revokedPartitions = [];
 
-    for (const command of commands) {
+    for (const command of currentCommands) {
       const payload = command.payload && typeof command.payload === "object" ? command.payload : {};
       if (Array.isArray(payload.creatorIds)) revokedCreatorIds.push(...payload.creatorIds.map(String));
       if (Array.isArray(payload.partitions)) revokedPartitions.push(...payload.partitions.map(String));
@@ -464,7 +471,7 @@ router.post("/heartbeat", async (req, res) => {
       revokedPartitions: Array.from(new Set(revokedPartitions)),
       creatorSessions,
       creatorNetworks,
-      commands,
+      commands: currentCommands,
       observation,
       permissionsVersion: Date.now(),
     });

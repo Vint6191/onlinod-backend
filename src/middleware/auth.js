@@ -92,10 +92,11 @@ async function authRequired(req, res, next, { compactMembership = false } = {}) 
       membership.user = publicAuthUser;
     }
 
-    // Admin force-logout must invalidate already-issued access tokens too.
-    // Revoking refresh sessions is not enough because access tokens remain
-    // valid until their exp. JWT iat is seconds, sessionsRevokedAt is ms.
-    if (membership.user.sessionsRevokedAt) {
+    // Current logins were checked against their exact durable lineage above.
+    // JWT iat has only second precision: comparing it to the old millisecond
+    // cutoff would reject a valid new login made in that same second. Legacy
+    // tokens have no exact lineage, so they still need the timestamp fence.
+    if (!authorizationSessionId && membership.user.sessionsRevokedAt) {
       const tokenIssuedAtMs = Number(decoded.iat || 0) * 1000;
       const revokedAtMs = new Date(membership.user.sessionsRevokedAt).getTime();
 

@@ -1,6 +1,7 @@
 "use strict";
 
 const { lockDbAdvisoryXact, runDbTransaction } = require("./db-transaction-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 function clean(value, max = 240) {
   const text = String(value ?? "").trim();
@@ -35,6 +36,25 @@ async function acquireAuthorizationLineageLock(db, authorizationSessionId) {
   if (!lineage) return false;
   await lockDbAdvisoryXact({ db, key: `authorization-lineage:${lineage}` });
   return true;
+}
+
+// Revalidate the exact login after an asynchronous response has been prepared.
+// A device may already have a newer login: another active session on that same
+// device must never revive the revoked request. Rotation keeps this lineage.
+async function assertCurrentAuthorizationSession({ db, userId, agencyId, deviceId, authorizationSessionId = null }) {
+  const user = clean(userId, 180), agency = clean(agencyId, 180), device = clean(deviceId, 160);
+  const revoked = () => Object.assign(new Error("This session was revoked. Please sign in again."), {
+    code: "SESSION_REVOKED", status: 401,
+  });
+  if (!user || !agency || !device) throw revoked();
+  const now = await dbAuthorityNow({ db });
+  const current = await db.refreshSession.findFirst({
+    where: { userId: user, agencyId: agency, deviceId: device,
+      authorizationSessionId: clean(authorizationSessionId, 220) || null,
+      revokedAt: null, expiresAt: { gt: now } },
+    select: { id: true },
+  });
+  if (!current) throw revoked();
 }
 
 async function lockCurrentLoginAuthority(db, {
@@ -169,6 +189,7 @@ module.exports = {
   acquireAuthorizationUserLock,
   acquireAuthorizationDeviceLock,
   acquireAuthorizationLineageLock,
+  assertCurrentAuthorizationSession,
   lockCurrentLoginAuthority,
   lockCurrentRefreshSession,
   withAuthorizationUserLock,

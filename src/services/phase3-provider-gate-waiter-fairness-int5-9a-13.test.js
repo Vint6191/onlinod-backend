@@ -99,7 +99,7 @@ test("A13 authority prunes expired dead-process waiters before winner selection"
   assert.match(source, /DELETE FROM "OfProviderRequestGateWaiter"[\s\S]*"leaseUntil" <= \$2/);
   assert.match(source, /PROVIDER_GATE_WAITER_LEASE_MS/);
   assert.match(source, /PROVIDER_GATE_WAITER_HEARTBEAT_MS/);
-  assert.match(source, /WHERE "ownerInstanceId" = \$1[\s\S]*"waiterId" IN \(SELECT jsonb_array_elements_text\(\$2::jsonb\)\)[\s\S]*"leaseUntil" > clock_timestamp\(\)/);
+  assert.match(source, /WHERE "ownerInstanceId" = \$1[\s\S]*"waiterId" IN \(SELECT jsonb_array_elements_text\(\$2::jsonb\)\)[\s\S]*"leaseUntil" > \(clock_timestamp\(\) AT TIME ZONE 'UTC'\)/);
 });
 
 test("A13 durable permit acquisition rejects arbitrary permit ids that are not the registered waiter identity", async () => {

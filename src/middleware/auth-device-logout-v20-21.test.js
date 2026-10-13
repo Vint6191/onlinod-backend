@@ -91,3 +91,22 @@ test("legacy JWT can only match a legacy NULL-lineage refresh row during rolling
   const refreshWhere = query.include.user.include.refreshSessions.where;
   assert.equal(refreshWhere.authorizationSessionId, null);
 });
+
+test("a confirmed new login in the same JWT second as force-logout remains authorized", async () => {
+  const row = membership([{ id:"new-refresh", authorizationSessionId:"new-login" }]);
+  row.user.sessionsRevokedAt = new Date(decoded.iat * 1000 + 1);
+  const auth = loadAuthMiddleware({ membership:row, decoded:{...decoded,authorizationSessionId:"new-login"} });
+  const {state,res} = responseRecorder();
+  let accepted = false;
+  await auth.authRequired({headers:{authorization:"Bearer token"}},res,()=>{accepted=true;});
+  assert.equal(accepted,true,JSON.stringify(state));
+});
+
+test("legacy timestamp revocation still rejects a token without an exact login lineage", async () => {
+  const row = membership([{id:"legacy-refresh"}]);
+  row.user.sessionsRevokedAt = new Date(decoded.iat * 1000 + 1);
+  const auth=loadAuthMiddleware({membership:row,decoded});
+  const {state,res}=responseRecorder();
+  await auth.authRequired({headers:{authorization:"Bearer token"}},res,()=>assert.fail("revoked legacy token"));
+  assert.equal(state.status,401);assert.equal(state.body.code,"SESSION_REVOKED");
+});

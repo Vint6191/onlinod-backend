@@ -49,6 +49,13 @@
 
     if (W().needsRead(s)) load(false);
 
+    // List reads and user detail have separate request lifetimes. Preserve the
+    // existing mount (including pending actions) when a debounced search or
+    // refresh repaints this route. Navigation/login still replaces the root and
+    // invalidates its workspace capture; another selected user supersedes the
+    // detail request through W.request(drawer).
+    const drawer = main.querySelector("#admUsersDrawer");
+
     main.innerHTML = `
       <div class="adm-page-head">
         <div>
@@ -116,6 +123,8 @@
       <!-- Detail drawer mount point — populated lazily. -->
       <div id="admUsersDrawer"></div>
     `;
+
+    if (drawer) main.querySelector("#admUsersDrawer").replaceWith(drawer);
 
     bindToolbar(main);
     bindRows(main);

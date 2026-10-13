@@ -357,6 +357,20 @@ async function main() {
       "late user detail cannot replace a newer drawer"
     );
     await page.locator("[data-drawer-close]").last().click();
+    const listWhileDetail = hold((key) => key === "GET /api/admin/users?q=owner");
+    // Type a filter and select an already visible row before the debounce fires.
+    // Both are real UI handlers; the server response is merely held in transit.
+    await page.evaluate(() => {
+      const input = document.getElementById("admUsersQ");
+      input.value = "owner"; input.dispatchEvent(new Event("input", { bubbles: true }));
+      document.querySelector('[data-user-open="owner"]').click();
+    });
+    await listWhileDetail.seen;
+    check((await page.locator(".adm-drawer-body").count()) === 1, "pending search preserves the user detail opened after typing");
+    listWhileDetail.release();
+    await page.waitForFunction(() => !window.OnlinodAdminState.users.loading && window.OnlinodAdminState.users.lastLoadedAt > 0);
+    check((await page.locator(".adm-drawer-body").innerText()).includes("owner@example.test"), "search completion preserves the same selected user and its actions");
+    await page.locator("[data-drawer-close]").last().click();
     const search = hold((key) => key.includes("/data/search?q=owner"));
     await page.locator("#admGlobalSearch").fill("owner");
     await search.seen;
@@ -564,18 +578,44 @@ async function main() {
     await page.locator("#admSubReason").fill("Plan label proof");
     await page.locator("#admSubSave").click();
     await page.getByText("subscription saved", { exact: true }).waitFor();
+    const memberLogin = () => api("POST", "/api/auth/login", {
+      email: "member@example.test", password: "isolated-user-password", deviceId: "proof-device",
+      authorizationScopeIncarnation: crypto.randomUUID(),
+    }, 200, null);
+    const heartbeat = (session, status = 200) => api("POST", "/api/devices/heartbeat", {
+      deviceId: "proof-device", accounts: [],
+    }, status, session.accessToken);
+    const oldMemberLogin = await memberLogin();
+    check((await heartbeat(oldMemberLogin)).forceLogout === false, "current member heartbeat starts without logout");
+    const control = await api("GET", "/api/desktop/control/events?deviceId=proof-device&waitMs=250", undefined, 200, oldMemberLogin.accessToken);
+    // This real long-poll spans kick + relogin. The response must recheck the
+    // original lineage, not a later login on the same logical device.
+    const pendingControl = api("GET", `/api/desktop/control/events?deviceId=proof-device&waitMs=20000&afterSeq=${control.cursor}&streamId=${encodeURIComponent(control.streamId)}`, undefined, 401, oldMemberLogin.accessToken);
+    await wait(150);
     await nav("devices");
     await page.locator('[data-device-kick="proof-device"]').click();
     await page.getByText("device kicked", { exact: true }).waitFor();
+    await heartbeat(oldMemberLogin, 401);
+    let currentMemberLogin = await memberLogin();
+    const resumedHeartbeat = await heartbeat(currentMemberLogin);
+    check(resumedHeartbeat.forceLogout === false && !resumedHeartbeat.commands.some(c => c.command === "FORCE_LOGOUT"), "same-device relogin cannot inherit an old queued logout command");
+    await heartbeat(oldMemberLogin, 401);
+    check((await pendingControl).code === "SESSION_REVOKED", "pending control response rejects its revoked lineage even after a new device login");
     await nav("users");
     await page.locator("#admUsersQ").fill("member");
     await page.locator('[data-user-open="member"]').click();
     await page.locator('[data-user-action="disable"]').click();
     await page.locator('[data-user-action="enable"]').waitFor();
+    await heartbeat(currentMemberLogin, 403);
     await page.locator('[data-user-action="enable"]').click();
     await page.locator('[data-user-action="disable"]').waitFor();
+    currentMemberLogin = await memberLogin();
+    check((await heartbeat(currentMemberLogin)).forceLogout === false, "enabled member can log in without a stale disable command logging them out");
     await page.locator('[data-user-action="force-logout"]').click();
     await page.getByText(/session\(s\) revoked/).waitFor();
+    await heartbeat(currentMemberLogin, 401);
+    currentMemberLogin = await memberLogin();
+    check((await heartbeat(currentMemberLogin)).forceLogout === false, "fresh login after account-wide force logout remains current");
     await page.locator("[data-drawer-close]").last().click();
     pass("Agency member roles, billing hold/policy, device kick and user disable/enable/logout");
     await page.goto(origin + "/admin/agencies/retire-agency");

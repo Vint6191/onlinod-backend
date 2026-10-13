@@ -208,7 +208,7 @@
         e.stopPropagation();
         const id   = btn.dataset.deviceKick;
         const name = btn.dataset.deviceName || "device";
-        if (!confirm(`Kick "${name}"?\n\nElectron will get FORCE_LOGOUT command on next heartbeat.\nRefresh sessions for this user will be revoked immediately.`)) return;
+        if (!confirm(`Kick "${name}"?\n\nThe current sessions on this device will be revoked immediately.\nDesktop will sign out when it checks its access. The user can sign in again.`)) return;
 
         const device = s.list.find(row => row.id === id);
         const reason = prompt("Reason for kicking this device?")?.trim(); if (!reason || !device) return;
