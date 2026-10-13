@@ -13,7 +13,7 @@
   function set(key, value) {
     if (value) memory.set(key, value); else memory.delete(key);
     try { if (value) sessionStorage.setItem(key, JSON.stringify(value)); else sessionStorage.removeItem(key); } catch (_) { /* Session-only memory fallback. */ }
-    if (window.CustomEvent) window.dispatchEvent?.(new window.CustomEvent("onlinod:admin-commands-changed"));
+    if (window.CustomEvent) window.dispatchEvent?.(new window.CustomEvent("nod:admin-commands-changed"));
   }
   function forgetIfCurrent(command) {
     if (command?.key && get(command.key)?.commandId === command.commandId) set(command.key, null);
@@ -28,7 +28,7 @@
     if (!crypto?.subtle || !crypto?.randomUUID) throw new Error("This browser cannot create durable admin commands");
     const resource = path.replace(/^\/api\/admin\/creators\/([^/]+)\/billing$/, "/api/admin/billing/creator/$1");
     // No token, password, hash of password alone, or request body is persisted.
-    const actor = window.OnlinodAdminState?.admin?.id || token;
+    const actor = window.NodAdminState?.admin?.id || token;
     const key = `onlinod_admin_pending_v1:${await digest(`${actor}\n${method}\n${resource}`)}`;
     const fingerprint = await digest(`${token}\n${canonical(body)}`);
     const owner = await digest(actor);
@@ -56,7 +56,7 @@
   }
   async function resolve(path, method, token) {
     const resource = path.replace(/^\/api\/admin\/creators\/([^/]+)\/billing$/, "/api/admin/billing/creator/$1");
-    const actor = window.OnlinodAdminState?.admin?.id || token;
+    const actor = window.NodAdminState?.admin?.id || token;
     let key = `onlinod_admin_pending_v1:${await digest(`${actor}\n${method}\n${resource}`)}`;
     if (!get(key)) key = `onlinod_admin_pending_v1:${await digest(`${token}\n${method}\n${resource}`)}`;
     const pending = get(key);
@@ -67,7 +67,7 @@
     return { ...data, pending: true, commandId: pending.commandId };
   }
   async function pending(token) {
-    const owner = await digest(window.OnlinodAdminState?.admin?.id || token);
+    const owner = await digest(window.NodAdminState?.admin?.id || token);
     const keys = new Set(memory.keys());
     try { for (let i = 0; i < sessionStorage.length; i++) keys.add(sessionStorage.key(i)); } catch (_) {}
     return Array.from(keys).filter(key => key?.startsWith("onlinod_admin_pending_v1:")).map(get)
@@ -80,5 +80,5 @@
     if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, redact(item, name)]));
     return value;
   }
-  window.OnlinodAdminCommands = { prepare, settle, resolve, pending, redact };
+  window.NodAdminCommands = { prepare, settle, resolve, pending, redact };
 })();

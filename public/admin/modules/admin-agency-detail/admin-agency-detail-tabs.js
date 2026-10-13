@@ -12,11 +12,11 @@
 
 (function () {
   "use strict";
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
 
-  const R = () => window.OnlinodAdminRouter;
-  const U = () => window.OnlinodAdminUtils;
-  const Actions = () => window.OnlinodAdminAgencyDetailActions;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
+  const Actions = () => window.NodAdminAgencyDetailActions;
 
   // ════════════════════════════════════════════════════════════
   // Members
@@ -260,10 +260,10 @@
       const agency = slice.data.agency;
       const reason = main.querySelector("#admSubReason").value.trim();
       if (!reason) return R().toast("Reason is required");
-      const result = await window.OnlinodAdminApi.setBillingHold(agency.id, { enabled: !agency.billingSupportHold, expectedRevision: agency.billingPolicyRevision, reason });
+      const result = await window.NodAdminApi.setBillingHold(agency.id, { enabled: !agency.billingSupportHold, expectedRevision: agency.billingPolicyRevision, reason });
       if (!current()) return;
       R().toast(result?.ok ? "Billing hold updated — refresh current values" : result?.error || "Failed");
-      if (result?.ok) window.OnlinodAdminAgencyDetailActions.reloadDetail?.();
+      if (result?.ok) window.NodAdminAgencyDetailActions.reloadDetail?.();
     }));
 
     save.addEventListener("click", () => W().action(main, async () => {
@@ -351,7 +351,7 @@
     });
   }
 
-  window.OnlinodAdminAgencyDetailTabs = {
+  window.NodAdminAgencyDetailTabs = {
     renderMembers,      bindMembers,
     renderCreators,     bindCreators,
     renderSubscription, bindSubscription,

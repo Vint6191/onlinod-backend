@@ -28,7 +28,7 @@ function stateDb(kind, initial = null) {
     upsert: async ({ create, update }) => (state = { ...(state || create), ...(state ? update : {}) }),
     update: async ({ data }) => (state = { ...state, ...data }),
   }, creatorNotificationScanItem: { findMany: async () => [] }, read: () => state,
-  $executeRawUnsafe: async sql => { assert.match(sql, /onlinod\.financial_receipts_v1|pg_advisory_xact_lock|onlinod\.campaign_projection_writer/); return 1; },
+  $executeRawUnsafe: async sql => { assert.match(sql, /nod\.financial_receipts_v1|pg_advisory_xact_lock|nod\.campaign_projection_writer/); return 1; },
   $queryRawUnsafe: async sql => {
     assert.equal(sql, 'SELECT clock_timestamp() AS "authorityNow"');
     return [{ authorityNow: now }];

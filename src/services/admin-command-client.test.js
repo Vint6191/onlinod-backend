@@ -10,7 +10,7 @@ function browser(storage = new Map(), fetch = async () => { throw Error("network
   const window = {};
   const sandbox = { window, crypto: webcrypto, TextEncoder, fetch, sessionStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) } };
   vm.runInNewContext(source, sandbox);
-  return { window, commands: window.OnlinodAdminCommands, storage };
+  return { window, commands: window.NodAdminCommands, storage };
 }
 const input = { path: "/api/admin/billing/creator/creator-a", method: "PATCH", body: { expectedRevision: 1, corePriceCents: 3200, reason: "Edit" }, token: "bearer-sensitive-value" };
 test("network uncertainty and browser reload retain the exact command identity", async () => {
@@ -99,7 +99,7 @@ test("global commercial policy uses a stable command identity and blocks changed
 });
 
 test("concurrent preparations reserve one command identity before either request can send", async () => {
-  const b = browser(); b.window.OnlinodAdminState = { admin: { id: "admin-one" } };
+  const b = browser(); b.window.NodAdminState = { admin: { id: "admin-one" } };
   const attempts = await Promise.all(Array.from({ length: 8 }, () => b.commands.prepare(input)));
   assert.equal(new Set(attempts.map(item => item.commandId)).size, 1);
   // Promise.all preserves invocation order; WebCrypto digests can complete in
@@ -111,12 +111,12 @@ test("concurrent preparations reserve one command identity before either request
 
 test("pending results are visible only to their administrator and remain resolvable after sign-in", async () => {
   const b = browser(new Map(), async url => ({ ok: true, json: async () => ({ ok: true, commandId: url.split('/').pop(), status: "SUCCEEDED" }) }));
-  b.window.OnlinodAdminState = { admin: { id: "admin-one" } };
+  b.window.NodAdminState = { admin: { id: "admin-one" } };
   const first = await b.commands.prepare(input);
   assert.equal((await b.commands.pending(input.token)).length, 1);
-  b.window.OnlinodAdminState.admin.id = "admin-two";
+  b.window.NodAdminState.admin.id = "admin-two";
   assert.equal((await b.commands.pending("other-token")).length, 0);
-  b.window.OnlinodAdminState.admin.id = "admin-one";
+  b.window.NodAdminState.admin.id = "admin-one";
   assert.equal((await b.commands.pending("new-token"))[0].commandId, first.commandId);
   assert.equal((await b.commands.prepare({ ...input, token: "new-token" })).blocked, true);
   assert.equal((await b.commands.resolve(input.path, input.method, "new-token")).pending, false);
@@ -124,7 +124,7 @@ test("pending results are visible only to their administrator and remain resolva
 
 test("an existing session-keyed command is adopted without changing its UUID", async () => {
   const b = browser(); const previous = await b.commands.prepare(input);
-  b.window.OnlinodAdminState = { admin: { id: "admin-one" } };
+  b.window.NodAdminState = { admin: { id: "admin-one" } };
   const next = await b.commands.prepare(input);
   assert.equal(next.commandId, previous.commandId);
   assert.equal((await b.commands.pending(input.token)).length, 1);
@@ -132,7 +132,7 @@ test("an existing session-keyed command is adopted without changing its UUID", a
 });
 
 test("recovery metadata never stores password inputs or bearer credentials", async () => {
-  const b = browser(); b.window.OnlinodAdminState = { admin: { id: "admin-one" } };
+  const b = browser(); b.window.NodAdminState = { admin: { id: "admin-one" } };
   await b.commands.prepare({ ...input, method: "POST", path: "/api/admin/admin-users/id/reset-password", body: { password: "sensitive-test-password", expectedEpoch: 7, reason: "private reason" } });
   assert.doesNotMatch(JSON.stringify([...b.storage]), /sensitive-test-password|bearer-sensitive-value|private reason/);
 });

@@ -1,9 +1,9 @@
 (function () {
   "use strict";
 
-  const A = () => window.OnlinodApi;
-  const S = () => window.OnlinodState;
-  const R = () => window.OnlinodRouter;
+  const A = () => window.NodApi;
+  const S = () => window.NodState;
+  const R = () => window.NodRouter;
 
   function getInviteToken() {
     const match = String(location.pathname || "").match(/^\/invite\/([^/?#]+)/i);
@@ -44,9 +44,9 @@
       <main class="on-auth-shell">
         <div class="on-auth-wrap">
           <div class="on-auth-logo">
-            <div class="on-logo-mark">O</div>
+            <div class="on-logo-mark">N</div>
             <div>
-              <strong>Onlinod</strong>
+              <strong>NOD</strong>
               <span>team invitation</span>
             </div>
           </div>
@@ -146,7 +146,7 @@
           return;
         }
 
-        window.OnlinodSession.setSession(session);
+        window.NodSession.setSession(session);
 
         const claim = await claimInvite(token);
         if (!claim?.ok) {
@@ -154,9 +154,9 @@
           return;
         }
 
-        await window.OnlinodHomePage.bootstrap();
+        await window.NodHomePage.bootstrap();
         history.replaceState(null, "", "/");
-        window.OnlinodRouter.setView("home");
+        window.NodRouter.setView("home");
       };
     }
 
@@ -227,7 +227,7 @@
     return preview;
   }
 
-  window.OnlinodInvitePage = {
+  window.NodInvitePage = {
     render,
     bootstrap,
     getInviteToken,

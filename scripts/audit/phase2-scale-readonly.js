@@ -11,12 +11,12 @@
  *   measured SELECTs and can be expensive on a large production-like dataset.
  *
  * Required:
- *   ONLINOD_PHASE2_SCALE_BENCHMARK=1
- *   ONLINOD_PHASE2_SCALE_AGENCY_ID=<agency id>
+ *   NOD_PHASE2_SCALE_BENCHMARK=1
+ *   NOD_PHASE2_SCALE_AGENCY_ID=<agency id>
  *
  * Optional:
- *   ONLINOD_PHASE2_SCALE_EXPLAIN=1
- *   ONLINOD_PHASE2_SCALE_REQUIRE_LARGE=1
+ *   NOD_PHASE2_SCALE_EXPLAIN=1
+ *   NOD_PHASE2_SCALE_REQUIRE_LARGE=1
  *   ONLINOD_PHASE2_SCALE_MAX_RAW_ROWS_PER_MEMBER=64
  */
 
@@ -308,10 +308,10 @@ async function explainRepresentativeQueries(prisma, agencyId, authority) {
 }
 
 async function main() {
-  if (!envFlag("ONLINOD_PHASE2_SCALE_BENCHMARK")) {
-    throw new Error("ONLINOD_PHASE2_SCALE_BENCHMARK=1_REQUIRED");
+  if (!envFlag("NOD_PHASE2_SCALE_BENCHMARK")) {
+    throw new Error("NOD_PHASE2_SCALE_BENCHMARK=1_REQUIRED");
   }
-  const agencyId = requiredEnv("ONLINOD_PHASE2_SCALE_AGENCY_ID");
+  const agencyId = requiredEnv("NOD_PHASE2_SCALE_AGENCY_ID");
 
   // Set before loading Prisma so its event mode can be enabled by an operator if desired.
   const prisma = require("../../src/prisma");
@@ -319,7 +319,7 @@ async function main() {
 
   try {
     const agency = await prisma.agency.findUnique({ where: { id: agencyId }, select: { id: true } });
-    if (!agency) throw new Error("ONLINOD_PHASE2_SCALE_AGENCY_NOT_FOUND");
+    if (!agency) throw new Error("NOD_PHASE2_SCALE_AGENCY_NOT_FOUND");
 
     const currentAuthority = currentProjectionAuthority();
     const dataset = await countDataset(prisma, agencyId);
@@ -327,12 +327,12 @@ async function main() {
     const withMoney = await measureSnapshot({ prisma, buildTeamAnalyticsSnapshot, agencyId, includeMoney: true });
     const checks = structuralChecks({ dataset, withoutMoney, withMoney });
     const largeChecks = largeDatasetChecks(dataset);
-    const explain = envFlag("ONLINOD_PHASE2_SCALE_EXPLAIN")
+    const explain = envFlag("NOD_PHASE2_SCALE_EXPLAIN")
       ? await explainRepresentativeQueries(prisma, agencyId, currentAuthority)
       : [];
 
     const report = {
-      ok: checks.every((item) => item.ok) && (!envFlag("ONLINOD_PHASE2_SCALE_REQUIRE_LARGE") || largeChecks.every((item) => item.ok)),
+      ok: checks.every((item) => item.ok) && (!envFlag("NOD_PHASE2_SCALE_REQUIRE_LARGE") || largeChecks.every((item) => item.ok)),
       mode: "READ_ONLY_EXISTING_DATA",
       agencyId,
       range: "all",
@@ -342,11 +342,11 @@ async function main() {
       withMoney,
       checks,
       largeDatasetQualification: {
-        required: envFlag("ONLINOD_PHASE2_SCALE_REQUIRE_LARGE"),
+        required: envFlag("NOD_PHASE2_SCALE_REQUIRE_LARGE"),
         qualified: largeChecks.every((item) => item.ok),
         checks: largeChecks,
       },
-      explainEnabled: envFlag("ONLINOD_PHASE2_SCALE_EXPLAIN"),
+      explainEnabled: envFlag("NOD_PHASE2_SCALE_EXPLAIN"),
       explain,
       generatedAt: new Date().toISOString(),
     };

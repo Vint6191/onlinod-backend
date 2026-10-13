@@ -1,4 +1,4 @@
-# Onlinod Backend
+# NOD Backend
 
 Backend API, NOD public website and the existing platform administration UI.
 

@@ -12,7 +12,7 @@ const root = path.resolve(__dirname, "../.."),
 if (!process.env.ONLINOD_DESKTOP_ROOT) throw Error("Set ONLINOD_DESKTOP_ROOT to the current Desktop source root");
 const desktop = path.resolve(process.env.ONLINOD_DESKTOP_ROOT),
   desktopLoad = createRequire(path.join(desktop, "package.json"));
-const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "onlinod-device-proof-"));
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "nod-device-proof-"));
 const output = path.resolve(process.env.ONLINOD_SQL_PROOF_OUTPUT || scratch, "evidence/device-recovery");
 fs.mkdirSync(output, { recursive: true });
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -104,7 +104,7 @@ export const safeStorage={isEncryptionAvailable:()=>true,getSelectedStorageBacke
     bundle: true,
     platform: "node",
     format: "cjs",
-    alias: { electron, "@onlinod/shared": path.join(desktop, "packages/shared/src/index.ts") },
+    alias: { electron, "@nod/shared": path.join(desktop, "packages/shared/src/index.ts") },
     define: {
       "import.meta.url": JSON.stringify(require("node:url").pathToFileURL(path.join(desktop, "package.json")).href),
     },
@@ -369,7 +369,7 @@ async function main() {
           },
         ],
         storage: { bcTokenSha: "controlled-bc" },
-        userAgent: "ONLINOD isolated acceptance",
+        userAgent: "NOD isolated acceptance",
       },
     });
     await a.call("publish", { snapshot: snapshot("initial-session") });

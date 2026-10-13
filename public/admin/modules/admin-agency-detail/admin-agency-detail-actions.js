@@ -3,7 +3,7 @@
    All mutating operations called from agency detail. Each one:
      1. Asks the backend.
      2. Toasts result (success/failure).
-     3. Reloads the slice via OnlinodAdminAgencyDetail.load(true)
+     3. Reloads the slice via NodAdminAgencyDetail.load(true)
         so the UI reflects new data.
    
    We pass error-recovery callbacks where the UI needs to
@@ -13,17 +13,17 @@
 (function () {
   "use strict";
 
-  const W = () => window.OnlinodAdminWorkspace;
-  const A = () => window.OnlinodAdminApi;
-  const R = () => window.OnlinodAdminRouter;
+  const W = () => window.NodAdminWorkspace;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
 
   function reloadDetail() {
-    return window.OnlinodAdminAgencyDetail.load(true);
+    return window.NodAdminAgencyDetail.load(true);
   }
 
   function shownAgency() {
-    const id = window.OnlinodAdminState.sectionParam;
-    return window.OnlinodAdminStateApi.ensureAgencyDetail(id).data?.agency;
+    const id = window.NodAdminState.sectionParam;
+    return window.NodAdminStateApi.ensureAgencyDetail(id).data?.agency;
   }
   function shownMember(id) { return shownAgency()?.members?.find(m => m.id === id); }
   function reasonForAction(label) { const value = prompt(label); return value?.trim() || null; }
@@ -31,7 +31,7 @@
   // ─── Header actions ────────────────────────────────────────
 
   async function doSupport(agencyId) {
-    return window.OnlinodAdminSupport.open(agencyId);
+    return window.NodAdminSupport.open(agencyId);
   }
 
   async function doSoftDelete(agencyId) {
@@ -158,7 +158,7 @@
     await reloadDetail();
   }
 
-  window.OnlinodAdminAgencyDetailActions = {
+  window.NodAdminAgencyDetailActions = {
     reloadDetail,
     doSupport,
     doSoftDelete,

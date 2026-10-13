@@ -10,7 +10,7 @@ test("assertStrongSecret rejects short or low-entropy JWT secrets", () => {
 });
 
 test("assertStrongSecret accepts long high-entropy JWT secrets", () => {
-  assert.doesNotThrow(() => assertStrongSecret("ONLINOD_prod_secret_2026_AaBbCcDdEeFf1234567890"));
+  assert.doesNotThrow(() => assertStrongSecret("NOD_prod_secret_2026_AaBbCcDdEeFf1234567890"));
 });
 
 test("refreshTokenDays falls back to 30 for invalid values", () => {

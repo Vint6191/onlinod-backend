@@ -26,14 +26,14 @@
       actions,
     };
 
-    window.OnlinodCreatorAnalyticsState.ensure(ctx);
+    window.NodCreatorAnalyticsState.ensure(ctx);
 
-    root.innerHTML = window.OnlinodCreatorAnalyticsRenderers.render(ctx);
-    window.OnlinodCreatorAnalyticsEvents.bind(ctx);
+    root.innerHTML = window.NodCreatorAnalyticsRenderers.render(ctx);
+    window.NodCreatorAnalyticsEvents.bind(ctx);
 
     // Re-anchor any open dropdown to its trigger after each render.
     // Cheap: just getBoundingClientRect + inline top/left on the menu.
-    window.OnlinodCreatorAnalyticsEvents.positionDropdowns?.(ctx);
+    window.NodCreatorAnalyticsEvents.positionDropdowns?.(ctx);
 
     // If the set of visible accounts changed since the last render
     // (new account added, existing one removed), make sure the overview
@@ -44,11 +44,11 @@
     const signature = computeAccountsSignature(helpers, state);
     if (state.__creatorAnalyticsAccountsSig !== signature) {
       state.__creatorAnalyticsAccountsSig = signature;
-      window.OnlinodCreatorAnalyticsEvents.ensureNumbers?.(ctx);
+      window.NodCreatorAnalyticsEvents.ensureNumbers?.(ctx);
     }
   }
 
-  window.OnlinodCreatorAnalyticsView = {
+  window.NodCreatorAnalyticsView = {
     render,
   };
 })();

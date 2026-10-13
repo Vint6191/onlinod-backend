@@ -8,7 +8,7 @@
     timers = new Map(),
     stores = new Set(),
     busy = new WeakSet();
-  const token = () => window.OnlinodAdminApi?.getToken() || "";
+  const token = () => window.NodAdminApi?.getToken() || "";
   function capture(root) {
     const ownView = view,
       ownToken = token();
@@ -46,12 +46,12 @@
     leave();
     for (const resetStore of stores) resetStore();
   }
-  window.addEventListener("onlinod:admin-session-changed", reset);
+  window.addEventListener("nod:admin-session-changed", reset);
   window.addEventListener("storage", (event) => {
     if (event.key === "onlinod_admin_token" || event.key === null) reset();
   });
   function active(section) {
-    return Boolean(token()) && [].concat(section).includes(window.OnlinodAdminState.section);
+    return Boolean(token()) && [].concat(section).includes(window.NodAdminState.section);
   }
   function needsRead(state, ttl = 30000) {
     return !state.loading && !state.error && (!state.lastLoadedAt || Date.now() - state.lastLoadedAt >= ttl);
@@ -137,7 +137,7 @@
       });
   }
   function superOnly(root, selector) {
-    if (window.OnlinodAdminState.admin?.role === "SUPER_ADMIN") return;
+    if (window.NodAdminState.admin?.role === "SUPER_ADMIN") return;
     root.querySelectorAll(selector).forEach((node) => {
       node.disabled = true;
       node.title = "Requires SUPER_ADMIN";
@@ -155,7 +155,7 @@
       unlock();
     }
   }
-  window.OnlinodAdminWorkspace = {
+  window.NodAdminWorkspace = {
     capture,
     request,
     invalidate,

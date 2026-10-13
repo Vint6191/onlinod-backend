@@ -34,7 +34,7 @@ function loadSettingsService() {
 test("workspace settings normalize real IANA/time/date preferences", () => {
   const service = loadSettingsService();
   assert.equal(service.isValidTimezone("Europe/Kyiv"), true);
-  assert.equal(service.isValidTimezone("UTC+3-onlinod"), false);
+  assert.equal(service.isValidTimezone("UTC+3-nod"), false);
   assert.deepEqual(service.normalizeWorkspacePreferences({ timezone: "Europe/Kyiv", timeFormat: "12h", dateFormat: "YYYY-MM-DD" }), {
     timezone: "Europe/Kyiv", timeFormat: "12h", dateFormat: "YYYY-MM-DD", vaultUploadRecipient: "",
   });

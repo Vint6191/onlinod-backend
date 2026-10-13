@@ -26,11 +26,11 @@
 
 (function () {
   "use strict";
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
 
-  const A = () => window.OnlinodAdminApi;
-  const R = () => window.OnlinodAdminRouter;
-  const U = () => window.OnlinodAdminUtils;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
 
   // Local module state — no slice in the global state object since
   // audit is the only place this data lives.
@@ -285,5 +285,5 @@
     });
   }
 
-  window.OnlinodAdminAudit = { render };
+  window.NodAdminAudit = { render };
 })();

@@ -1,8 +1,8 @@
 (function () {
   "use strict";
 
-  const S = window.OnlinodCreatorAnalyticsState;
-  const C = window.OnlinodCreatorAnalyticsConstants || {};
+  const S = window.NodCreatorAnalyticsState;
+  const C = window.NodCreatorAnalyticsConstants || {};
 
   function getReadyAccounts(ctx) {
     return ctx.helpers?.getVisibleAccounts?.() || ctx.state.accounts || [];
@@ -135,13 +135,13 @@
 
   function bind(ctx) {
     if (!ctx.root) return;
-    if (ctx.root.__onlinodCreatorAnalyticsBound) {
+    if (ctx.root.__nodCreatorAnalyticsBound) {
       // Already bound to this root. Only re-check pending loads; don't
       // kick off another full overview scan on every rerender.
       return;
     }
 
-    ctx.root.__onlinodCreatorAnalyticsBound = true;
+    ctx.root.__nodCreatorAnalyticsBound = true;
 
     ctx.root.addEventListener("click", async (event) => {
       const target = event.target;
@@ -370,7 +370,7 @@
   }
 
   function rerender(ctx) {
-    window.OnlinodCreatorAnalyticsView.render({
+    window.NodCreatorAnalyticsView.render({
       root: ctx.root,
       state: ctx.state,
       helpers: ctx.helpers,
@@ -423,7 +423,7 @@
     }
   }
 
-  window.OnlinodCreatorAnalyticsEvents = {
+  window.NodCreatorAnalyticsEvents = {
     bind,
     ensureNumbers,
     loadNumbers,

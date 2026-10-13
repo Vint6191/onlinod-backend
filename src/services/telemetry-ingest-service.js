@@ -131,7 +131,7 @@ async function resolveCreator({ agencyId, event, strict = false, allowRetired = 
   const remoteId = cleanString(event.remoteId || event.ofUserId || event.extra?.remoteId || event.extra?.creatorUserId, 160);
   const username = cleanString(event.username || event.extra?.username, 160);
 
-  // Current ONLINOD sends backend creator id in creatorId/accountId. Legacy
+  // Current NOD sends backend creator id in creatorId/accountId. Legacy
   // Electron versions sometimes used local account ids, remote ids or usernames.
   if (explicitCreatorId) candidates.push({ id: explicitCreatorId });
   if (accountId && accountId !== explicitCreatorId) candidates.push({ id: accountId });

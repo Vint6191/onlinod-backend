@@ -243,7 +243,7 @@ exports.runSettings = async function (f) {
     fs.writeFileSync(
       entry,
       `import React from 'react';import{createRoot}from'react-dom/client';import{SettingsWorkspace}from ${JSON.stringify(path.join(renderer, "features/settings/SettingsWorkspace.tsx"))};import{acceptRendererAuthorizationProjection}from ${JSON.stringify(path.join(renderer, "shared/rpc/authorization-scope.ts"))};import ${JSON.stringify(path.join(renderer, "styles.css"))};
-export function mount(projection){window.onlinod={events:{onDesktopAuthorizationEvent:()=>()=>{},onCreatorRuntimeEvent:()=>()=>{}},rpc:{call:async(method,input)=>{const r=await window.actualRpc(method,input);if(r.error)throw Object.assign(Error(r.error.message),{code:r.error.code});return r.result;}}};acceptRendererAuthorizationProjection(projection);createRoot(document.getElementById('root')).render(<React.StrictMode><SettingsWorkspace/></React.StrictMode>);}
+export function mount(projection){window.nod={events:{onDesktopAuthorizationEvent:()=>()=>{},onCreatorRuntimeEvent:()=>()=>{}},rpc:{call:async(method,input)=>{const r=await window.actualRpc(method,input);if(r.error)throw Object.assign(Error(r.error.message),{code:r.error.code});return r.result;}}};acceptRendererAuthorizationProjection(projection);createRoot(document.getElementById('root')).render(<React.StrictMode><SettingsWorkspace/></React.StrictMode>);}
 export function context(projection){acceptRendererAuthorizationProjection(projection);}`
     );
     await load("esbuild").build({
@@ -255,7 +255,7 @@ export function context(projection){acceptRendererAuthorizationProjection(projec
       globalName: "ActualSettings",
       jsx: "automatic",
       nodePaths: [path.join(desktop, "node_modules")],
-      alias: { "@onlinod/shared": path.join(desktop, "packages/shared/src/index.ts") },
+      alias: { "@nod/shared": path.join(desktop, "packages/shared/src/index.ts") },
       loader: { ".css": "css", ".png": "dataurl", ".svg": "dataurl" },
       define: { "process.env.NODE_ENV": '"development"' },
     });

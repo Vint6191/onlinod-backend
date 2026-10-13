@@ -6,11 +6,11 @@
  * READ ONLY. It never seeds, mutates, activates, or repairs coverage.
  *
  * Required:
- *   ONLINOD_PHASE2_COVERAGE_PREFLIGHT=1
+ *   NOD_PHASE2_COVERAGE_PREFLIGHT=1
  *
  * Optional:
- *   ONLINOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_ID=<one agency>
- *   ONLINOD_PHASE2_COVERAGE_PREFLIGHT_SAMPLE_LIMIT=50
+ *   NOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_ID=<one agency>
+ *   NOD_PHASE2_COVERAGE_PREFLIGHT_SAMPLE_LIMIT=50
  */
 
 const {
@@ -157,14 +157,14 @@ async function inspectAgencies(prisma, requestedAgencyId, sampleLimit) {
 }
 
 async function runCoveragePreflight({ prisma = null, env = process.env, stdout = process.stdout } = {}) {
-  if (!envFlag("ONLINOD_PHASE2_COVERAGE_PREFLIGHT", env)) {
-    throw new Error("ONLINOD_PHASE2_COVERAGE_PREFLIGHT=1_REQUIRED");
+  if (!envFlag("NOD_PHASE2_COVERAGE_PREFLIGHT", env)) {
+    throw new Error("NOD_PHASE2_COVERAGE_PREFLIGHT=1_REQUIRED");
   }
 
   const ownsPrisma = !prisma;
   const db = prisma || require("../../src/prisma");
-  const requestedAgencyId = clean(env?.ONLINOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_ID);
-  const sampleLimit = positiveInt(env?.ONLINOD_PHASE2_COVERAGE_PREFLIGHT_SAMPLE_LIMIT, 50);
+  const requestedAgencyId = clean(env?.NOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_ID);
+  const sampleLimit = positiveInt(env?.NOD_PHASE2_COVERAGE_PREFLIGHT_SAMPLE_LIMIT, 50);
 
   try {
     if (requestedAgencyId) {
@@ -172,7 +172,7 @@ async function runCoveragePreflight({ prisma = null, env = process.env, stdout =
         where: { id: requestedAgencyId },
         select: { id: true, deletedAt: true },
       });
-      if (!agency || agency.deletedAt) throw new Error("ONLINOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_NOT_FOUND");
+      if (!agency || agency.deletedAt) throw new Error("NOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_NOT_FOUND");
     }
 
     const currentLane = await readLane(db, COVERAGE_SEED_LANE_KEY);

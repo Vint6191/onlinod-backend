@@ -13,11 +13,11 @@ const root = path.resolve(__dirname, "../.."),
   load = createRequire(path.join(root, "package.json"));
 const runtime = createRequire(path.resolve(process.env.ONLINOD_BROWSER_RUNTIME, "package.json"));
 const output = path.resolve(
-  process.env.ONLINOD_SQL_PROOF_OUTPUT || fs.mkdtempSync(path.join(os.tmpdir(), "onlinod-admin-evidence-")),
+  process.env.ONLINOD_SQL_PROOF_OUTPUT || fs.mkdtempSync(path.join(os.tmpdir(), "nod-admin-evidence-")),
   "evidence/admin-acceptance"
 );
 fs.mkdirSync(output, { recursive: true });
-const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "onlinod-admin-proof-"));
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "nod-admin-proof-"));
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const result = {
   ok: false,
@@ -293,14 +293,14 @@ async function main() {
     });
     const nav = async (section) => {
       await page.locator(`.adm-rail-item[data-section="${section}"]`).click();
-      await page.waitForFunction((section) => window.OnlinodAdminState.section === section, section);
+      await page.waitForFunction((section) => window.NodAdminState.section === section, section);
     };
     const signIn = async (email = "admin@example.test", password = "isolated-admin-password") => {
       await page.locator("#admEmail").fill(email);
       await page.locator("#admPassword").fill(password);
       await page.locator("#admSubmit").click();
       await page.locator("#admDashRefresh").waitFor();
-      await page.waitForFunction(() => window.OnlinodAdminState.dashboard.lastLoadedAt > 0);
+      await page.waitForFunction(() => window.NodAdminState.dashboard.lastLoadedAt > 0);
       check(
         (await page.locator(".adm-metric-grid").count()) === 1,
         "dashboard renders current canonical-session contract"
@@ -368,7 +368,7 @@ async function main() {
     await listWhileDetail.seen;
     check((await page.locator(".adm-drawer-body").count()) === 1, "pending search preserves the user detail opened after typing");
     listWhileDetail.release();
-    await page.waitForFunction(() => !window.OnlinodAdminState.users.loading && window.OnlinodAdminState.users.lastLoadedAt > 0);
+    await page.waitForFunction(() => !window.NodAdminState.users.loading && window.NodAdminState.users.lastLoadedAt > 0);
     check((await page.locator(".adm-drawer-body").innerText()).includes("owner@example.test"), "search completion preserves the same selected user and its actions");
     await page.locator("[data-drawer-close]").last().click();
     const search = hold((key) => key.includes("/data/search?q=owner"));
@@ -421,12 +421,12 @@ async function main() {
       "new login reloads module-local admin roster"
     );
     check(await page.locator("#admAdminsCreate").isDisabled(), "support sees read-only administrator controls");
-    const supportToken = await page.evaluate(() => window.OnlinodAdminApi.getToken());
+    const supportToken = await page.evaluate(() => window.NodAdminApi.getToken());
     failOnce = (key) => key === "GET /api/admin-auth/me";
     await page.reload();
     await wait(250);
     check(
-      await page.evaluate(() => !!window.OnlinodAdminApi.getToken()),
+      await page.evaluate(() => !!window.NodAdminApi.getToken()),
       "temporary authority outage keeps session available for Retry"
     );
     check(

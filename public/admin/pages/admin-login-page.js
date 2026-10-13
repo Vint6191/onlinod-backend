@@ -3,18 +3,18 @@
 (function () {
   "use strict";
 
-  const A = () => window.OnlinodAdminApi;
-  const R = () => window.OnlinodAdminRouter;
-  const Sess = () => window.OnlinodAdminSession;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const Sess = () => window.NodAdminSession;
 
   function render(root, error) {
     root.innerHTML = `
       <main class="adm-login">
         <section class="adm-login-card">
           <div class="adm-login-brand">
-            <div class="adm-login-brand-mark">O</div>
+            <div class="adm-login-brand-mark">N</div>
             <div class="adm-login-brand-text">
-              <strong>Onlinod Admin</strong>
+              <strong>NOD Admin</strong>
               <span>internal access only</span>
             </div>
           </div>
@@ -57,8 +57,8 @@
       }
 
       busy = true;
-      const current = window.OnlinodAdminWorkspace.capture(submit);
-      window.OnlinodAdminWorkspace.lock(root);
+      const current = window.NodAdminWorkspace.capture(submit);
+      window.NodAdminWorkspace.lock(root);
       const result = await A().login({ email: e, password: p });
       password.value = "";
       if (!current()) return;
@@ -82,5 +82,5 @@
     setTimeout(() => email.focus(), 30);
   }
 
-  window.OnlinodAdminLoginPage = { render };
+  window.NodAdminLoginPage = { render };
 })();

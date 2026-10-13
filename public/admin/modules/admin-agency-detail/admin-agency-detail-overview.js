@@ -13,8 +13,8 @@
 (function () {
   "use strict";
 
-  const R = () => window.OnlinodAdminRouter;
-  const U = () => window.OnlinodAdminUtils;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
 
   function render(slice) {
     const r = R();
@@ -186,10 +186,10 @@
       btn.addEventListener("click", (e) => {
         e.preventDefault();
         slice.tab = btn.dataset.agtabJump;
-        window.OnlinodAdminAgencyDetail.rerender();
+        window.NodAdminAgencyDetail.rerender();
       });
     });
   }
 
-  window.OnlinodAdminAgencyDetailOverview = { render, bind };
+  window.NodAdminAgencyDetailOverview = { render, bind };
 })();

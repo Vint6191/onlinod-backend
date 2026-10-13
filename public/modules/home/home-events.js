@@ -4,8 +4,8 @@
   function bind(ctx) {
     if (!ctx.root) return;
 
-    if (ctx.root.__onlinodHomeBound) return;
-    ctx.root.__onlinodHomeBound = true;
+    if (ctx.root.__nodHomeBound) return;
+    ctx.root.__nodHomeBound = true;
 
     ctx.root.addEventListener("click", async (event) => {
       const target = event.target;
@@ -48,7 +48,7 @@
     });
   }
 
-  window.OnlinodHomeEvents = {
+  window.NodHomeEvents = {
     bind,
   };
 })();

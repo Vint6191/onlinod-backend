@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const U = window.OnlinodHomeUtils;
+  const U = window.NodHomeUtils;
 
   // Permission helpers. Pull from ctx.helpers (set up by app-admin.js
   // renderAdminPanel). Fall open when team module isn't loaded so
@@ -31,7 +31,7 @@
             <span class="active"></span>
           </div>
 
-          <span>~/onlinod/home</span>
+          <span>~/nod/home</span>
           <em>·</em>
           <span>live</span>
 
@@ -217,7 +217,7 @@
     `;
   }
 
-  window.OnlinodHomeRenderers = {
+  window.NodHomeRenderers = {
     renderHome,
   };
 })();

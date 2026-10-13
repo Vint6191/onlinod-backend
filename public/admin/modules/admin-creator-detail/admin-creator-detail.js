@@ -9,11 +9,11 @@
 (function () {
   "use strict";
 
-  const A = () => window.OnlinodAdminApi;
-  const R = () => window.OnlinodAdminRouter;
-  const S = () => window.OnlinodAdminState;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const S = () => window.NodAdminState;
   const esc = (v) => R().escapeHtml(v);
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
 
   function fmtDate(v) { if (!v) return "—"; const d = new Date(v); return isNaN(d) ? "—" : d.toISOString().slice(0, 16).replace("T", " "); }
   function fmtMoney(v, row = null) {
@@ -199,5 +199,5 @@
     m.addEventListener("click", (e) => { if (e.target === m) m.remove(); });
   }
 
-  window.OnlinodAdminCreatorDetail = { render };
+  window.NodAdminCreatorDetail = { render };
 })();

@@ -9,7 +9,7 @@ function buildBackendHealthSnapshot({ database = "unknown" } = {}) {
   const memory = process.memoryUsage?.() || {};
   return {
     ok: database !== "error",
-    service: "onlinod-backend",
+    service: "nod-backend",
     time: new Date().toISOString(),
     pid: process.pid,
     node: process.version,

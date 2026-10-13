@@ -107,7 +107,7 @@ function registerTests(){
   assert.equal((await fx.counts()).reduce((n,r)=>n+Number(r.turnCount),0),500);
  });
  test('C1 SQL: process restart continues file-backed committed progress',async(t)=>{
-  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'onlinod-phase6-c1-'));
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'nod-phase6-c1-'));
   t.after(()=>fs.rmSync(directory,{recursive:true,force:true}));
   const run=promisify(execFile);const first=JSON.parse((await run(process.execPath,[__filename,'--restart-worker',directory,'initialize'],{env:process.env,maxBuffer:1024*1024})).stdout);
   const second=JSON.parse((await run(process.execPath,[__filename,'--restart-worker',directory,'continue'],{env:process.env,maxBuffer:1024*1024})).stdout);

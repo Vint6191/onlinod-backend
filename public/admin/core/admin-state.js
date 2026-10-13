@@ -50,7 +50,7 @@
   }
 
   function clearSession() {
-    window.OnlinodAdminApi.setToken(null);
+    window.NodAdminApi.setToken(null);
     reset();
   }
 
@@ -59,7 +59,7 @@
     Object.assign(state, initial());
     localStorage.removeItem("onlinod_admin");
   }
-  window.addEventListener("onlinod:admin-session-changed", reset);
+  window.addEventListener("nod:admin-session-changed", reset);
   window.addEventListener("storage", event => { if (event.key === "onlinod_admin_token" || event.key === null) reset(); });
 
   function setSection(section, param) {
@@ -80,7 +80,7 @@
     return state.agencyDetail[id];
   }
 
-  window.OnlinodAdminState = state;
-  window.OnlinodAdminSession = { setAdmin, clearSession };
-  window.OnlinodAdminStateApi = { setSection, ensureAgencyDetail };
+  window.NodAdminState = state;
+  window.NodAdminSession = { setAdmin, clearSession };
+  window.NodAdminStateApi = { setSection, ensureAgencyDetail };
 })();

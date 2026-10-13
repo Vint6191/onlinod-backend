@@ -1,4 +1,4 @@
-ONLINOD — Phase 5A I4 — Admin background/session commit contract
+NOD — Phase 5A I4 — Admin background/session commit contract
 
 Scope
 Admin login/logout, operator bootstrap, support reads, diagnostics pages,

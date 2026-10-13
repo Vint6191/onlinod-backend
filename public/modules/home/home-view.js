@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  const S = window.OnlinodHomeState;
+  const S = window.NodHomeState;
 
   function render({ root, state, helpers = {}, actions = {} }) {
     if (!root) return;
@@ -15,11 +15,11 @@
 
     S.ensureHomeState(state);
 
-    root.innerHTML = window.OnlinodHomeRenderers.renderHome(ctx);
-    window.OnlinodHomeEvents.bind(ctx);
+    root.innerHTML = window.NodHomeRenderers.renderHome(ctx);
+    window.NodHomeEvents.bind(ctx);
   }
 
-  window.OnlinodHomeView = {
+  window.NodHomeView = {
     render,
   };
 })();

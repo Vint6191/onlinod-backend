@@ -4,7 +4,7 @@ const RETENTION_FIELDS = Object.freeze({
   retentionSweepWindowHours: {
     label: "Retention sweep interval",
     unit: "hours",
-    env: "ONLINOD_RETENTION_SWEEP_WINDOW_HOURS",
+    env: "NOD_RETENTION_SWEEP_WINDOW_HOURS",
     fallback: 24,
     min: 1,
     max: 168,
@@ -13,7 +13,7 @@ const RETENTION_FIELDS = Object.freeze({
   batchSize: {
     label: "Delete batch size",
     unit: "rows",
-    env: "ONLINOD_RETENTION_BATCH_SIZE",
+    env: "NOD_RETENTION_BATCH_SIZE",
     fallback: DEFAULT_BATCH_SIZE,
     min: 100,
     max: 10000,
@@ -23,7 +23,7 @@ const RETENTION_FIELDS = Object.freeze({
   refreshSessionRawHistoryDays: {
     label: "Refresh-session raw token history",
     unit: "days after token expiry",
-    env: "ONLINOD_REFRESH_SESSION_RAW_HISTORY_DAYS",
+    env: "NOD_REFRESH_SESSION_RAW_HISTORY_DAYS",
     fallback: 30,
     min: 7,
     max: 3650,
@@ -33,7 +33,7 @@ const RETENTION_FIELDS = Object.freeze({
   teamIntermediateDays: {
     label: "Team intermediate events",
     unit: "days",
-    env: "ONLINOD_TEAM_ACTIVITY_INTERMEDIATE_DAYS",
+    env: "NOD_TEAM_ACTIVITY_INTERMEDIATE_DAYS",
     fallback: 7,
     min: 1,
     max: 365,
@@ -42,7 +42,7 @@ const RETENTION_FIELDS = Object.freeze({
   teamSessionDays: {
     label: "Team dialog sessions",
     unit: "days",
-    env: "ONLINOD_TEAM_ACTIVITY_SESSION_DAYS",
+    env: "NOD_TEAM_ACTIVITY_SESSION_DAYS",
     fallback: 30,
     min: 1,
     max: 365,
@@ -51,7 +51,7 @@ const RETENTION_FIELDS = Object.freeze({
   teamNoticeDays: {
     label: "Team claim notices",
     unit: "days",
-    env: "ONLINOD_TEAM_ACTIVITY_NOTICE_DAYS",
+    env: "NOD_TEAM_ACTIVITY_NOTICE_DAYS",
     fallback: 90,
     min: 1,
     max: 730,
@@ -60,7 +60,7 @@ const RETENTION_FIELDS = Object.freeze({
   teamAuditDays: {
     label: "Team audit/financial events",
     unit: "days",
-    env: "ONLINOD_TEAM_ACTIVITY_AUDIT_DAYS",
+    env: "NOD_TEAM_ACTIVITY_AUDIT_DAYS",
     fallback: 365,
     min: 30,
     max: 3650,
@@ -69,7 +69,7 @@ const RETENTION_FIELDS = Object.freeze({
   teamCanonicalDetailDays: {
     label: "Team canonical raw detail",
     unit: "days",
-    env: "ONLINOD_TEAM_CANONICAL_DETAIL_DAYS",
+    env: "NOD_TEAM_CANONICAL_DETAIL_DAYS",
     fallback: 180,
     min: 30,
     max: 730,
@@ -78,7 +78,7 @@ const RETENTION_FIELDS = Object.freeze({
   teamMoneyRawDetailDays: {
     label: "Team money raw attribution detail",
     unit: "days",
-    env: "ONLINOD_TEAM_MONEY_RAW_DETAIL_DAYS",
+    env: "NOD_TEAM_MONEY_RAW_DETAIL_DAYS",
     fallback: 180,
     min: 30,
     max: 730,
@@ -88,7 +88,7 @@ const RETENTION_FIELDS = Object.freeze({
   automationDeliveryDetailedDays: {
     label: "Automation detailed delivery history",
     unit: "days",
-    env: "ONLINOD_AUTOMATION_DELIVERY_DETAILED_DAYS",
+    env: "NOD_AUTOMATION_DELIVERY_DETAILED_DAYS",
     fallback: 90,
     min: 7,
     max: 3650,
@@ -97,7 +97,7 @@ const RETENTION_FIELDS = Object.freeze({
   automationAggregateDays: {
     label: "Automation monthly aggregates",
     unit: "days",
-    env: "ONLINOD_AUTOMATION_AGGREGATE_DAYS",
+    env: "NOD_AUTOMATION_AGGREGATE_DAYS",
     fallback: 1095,
     min: 365,
     max: 3650,
@@ -107,7 +107,7 @@ const RETENTION_FIELDS = Object.freeze({
   analyticsIngestBatchDays: {
     label: "Analytics ingest execution history",
     unit: "days",
-    env: "ONLINOD_ANALYTICS_INGEST_BATCH_DAYS",
+    env: "NOD_ANALYTICS_INGEST_BATCH_DAYS",
     fallback: 30,
     min: 7,
     max: 3650,
@@ -116,7 +116,7 @@ const RETENTION_FIELDS = Object.freeze({
   analyticsJobInstanceDays: {
     label: "Analytics completed job history",
     unit: "days",
-    env: "ONLINOD_ANALYTICS_JOB_INSTANCE_DAYS",
+    env: "NOD_ANALYTICS_JOB_INSTANCE_DAYS",
     fallback: 30,
     min: 7,
     max: 3650,
@@ -125,7 +125,7 @@ const RETENTION_FIELDS = Object.freeze({
   analyticsDemandHistoryDays: {
     label: "Analytics collection demand history",
     unit: "days",
-    env: "ONLINOD_ANALYTICS_DEMAND_HISTORY_DAYS",
+    env: "NOD_ANALYTICS_DEMAND_HISTORY_DAYS",
     fallback: 90,
     min: 7,
     max: 3650,
@@ -134,7 +134,7 @@ const RETENTION_FIELDS = Object.freeze({
   analyticsSupersededScanProofDays: {
     label: "Analytics superseded durable proofs",
     unit: "days",
-    env: "ONLINOD_ANALYTICS_SUPERSEDED_SCAN_PROOF_DAYS",
+    env: "NOD_ANALYTICS_SUPERSEDED_SCAN_PROOF_DAYS",
     fallback: 30,
     min: 7,
     max: 3650,
@@ -143,7 +143,7 @@ const RETENTION_FIELDS = Object.freeze({
   analyticsNonEarningsJobDays: {
     label: "Analytics non-earnings job history",
     unit: "days",
-    env: "ONLINOD_ANALYTICS_NON_EARNINGS_JOB_DAYS",
+    env: "NOD_ANALYTICS_NON_EARNINGS_JOB_DAYS",
     fallback: 30,
     min: 7,
     max: 3650,
@@ -152,7 +152,7 @@ const RETENTION_FIELDS = Object.freeze({
   analyticsNonEarningsIngestBatchDays: {
     label: "Analytics non-earnings ingest history",
     unit: "days",
-    env: "ONLINOD_ANALYTICS_NON_EARNINGS_INGEST_DAYS",
+    env: "NOD_ANALYTICS_NON_EARNINGS_INGEST_DAYS",
     fallback: 30,
     min: 7,
     max: 3650,
@@ -161,7 +161,7 @@ const RETENTION_FIELDS = Object.freeze({
   analyticsNotificationScanAuditDays: {
     label: "Notification scan audit history",
     unit: "days",
-    env: "ONLINOD_ANALYTICS_NOTIFICATION_SCAN_AUDIT_DAYS",
+    env: "NOD_ANALYTICS_NOTIFICATION_SCAN_AUDIT_DAYS",
     fallback: 30,
     min: 7,
     max: 3650,
@@ -171,7 +171,7 @@ const RETENTION_FIELDS = Object.freeze({
   automationEventDays: {
     label: "Automation audit events",
     unit: "days",
-    env: "ONLINOD_AUTOMATION_EVENT_DAYS",
+    env: "NOD_AUTOMATION_EVENT_DAYS",
     fallback: 90,
     min: 1,
     max: 3650,
@@ -180,7 +180,7 @@ const RETENTION_FIELDS = Object.freeze({
   automationTaskTrashDays: {
     label: "Trashed automation tasks",
     unit: "days",
-    env: "ONLINOD_AUTOMATION_TASK_TRASH_DAYS",
+    env: "NOD_AUTOMATION_TASK_TRASH_DAYS",
     fallback: 30,
     min: 1,
     max: 3650,
@@ -189,7 +189,7 @@ const RETENTION_FIELDS = Object.freeze({
   auditLogDays: {
     label: "Audit logs",
     unit: "days",
-    env: "ONLINOD_AUDIT_LOG_DAYS",
+    env: "NOD_AUDIT_LOG_DAYS",
     fallback: 365,
     min: 30,
     max: 3650,
@@ -199,7 +199,7 @@ const RETENTION_FIELDS = Object.freeze({
   dialogScanChunkDays: {
     label: "Dialog scan chunk commits",
     unit: "days",
-    env: "ONLINOD_DIALOG_SCAN_CHUNK_DAYS",
+    env: "NOD_DIALOG_SCAN_CHUNK_DAYS",
     fallback: 30,
     min: 1,
     max: 365,
@@ -208,7 +208,7 @@ const RETENTION_FIELDS = Object.freeze({
   dialogScanRunDays: {
     label: "Dialog scan run history",
     unit: "days",
-    env: "ONLINOD_DIALOG_SCAN_RUN_DAYS",
+    env: "NOD_DIALOG_SCAN_RUN_DAYS",
     fallback: 180,
     min: 7,
     max: 3650,
@@ -218,7 +218,7 @@ const RETENTION_FIELDS = Object.freeze({
   trafficSourceMemberNoRevenueDays: {
     label: "Dead source members without revenue",
     unit: "days",
-    env: "ONLINOD_TRAFFIC_SOURCE_MEMBER_NO_REVENUE_DAYS",
+    env: "NOD_TRAFFIC_SOURCE_MEMBER_NO_REVENUE_DAYS",
     fallback: 730,
     min: 30,
     max: 3650,
@@ -227,7 +227,7 @@ const RETENTION_FIELDS = Object.freeze({
   trafficZeroSnapshotDays: {
     label: "Zero orphan fan value snapshots",
     unit: "days",
-    env: "ONLINOD_TRAFFIC_ZERO_SNAPSHOT_DAYS",
+    env: "NOD_TRAFFIC_ZERO_SNAPSHOT_DAYS",
     fallback: 180,
     min: 7,
     max: 3650,
@@ -236,7 +236,7 @@ const RETENTION_FIELDS = Object.freeze({
   trafficPaidOrganicLedgerDays: {
     label: "Paid organic subscription ledger",
     unit: "days",
-    env: "ONLINOD_TRAFFIC_PAID_ORGANIC_LEDGER_DAYS",
+    env: "NOD_TRAFFIC_PAID_ORGANIC_LEDGER_DAYS",
     fallback: 730,
     min: 0,
     max: 3650,
@@ -245,7 +245,7 @@ const RETENTION_FIELDS = Object.freeze({
   trafficFreeOrganicCleanupHours: {
     label: "Free organic noise cleanup delay",
     unit: "hours",
-    env: "ONLINOD_TRAFFIC_FREE_ORGANIC_CLEANUP_HOURS",
+    env: "NOD_TRAFFIC_FREE_ORGANIC_CLEANUP_HOURS",
     fallback: 24,
     min: 1,
     max: 720,
@@ -254,7 +254,9 @@ const RETENTION_FIELDS = Object.freeze({
 });
 
 function envInt(name, fallback) {
-  const n = Number(process.env[name]);
+  // Existing deployments may still use the previous environment variable prefix.
+  const legacyName = name.replace(/^NOD_/, "ONLINOD_");
+  const n = Number(process.env[name] ?? process.env[legacyName]);
   return Number.isFinite(n) && n >= 0 ? Math.round(n) : fallback;
 }
 

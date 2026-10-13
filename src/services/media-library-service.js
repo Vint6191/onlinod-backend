@@ -245,9 +245,9 @@ async function searchMediaLibrary({
     if (searchScope === "description") {
       and.push({ description: { contains: q, mode: "insensitive" } });
     } else if (searchScope === "tags") {
-      and.push(tagClauses.length ? { OR: tagClauses } : { mediaId: "__onlinod_no_tag_match__" });
+      and.push(tagClauses.length ? { OR: tagClauses } : { mediaId: "__nod_no_tag_match__" });
     } else if (searchScope === "folders") {
-      and.push(folderClauses.length ? { OR: folderClauses } : { mediaId: "__onlinod_no_folder_match__" });
+      and.push(folderClauses.length ? { OR: folderClauses } : { mediaId: "__nod_no_folder_match__" });
     } else {
       const clauses = [
         { description: { contains: q, mode: "insensitive" } },

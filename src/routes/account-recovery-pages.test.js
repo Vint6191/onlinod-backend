@@ -21,7 +21,7 @@ test("public recovery routes serve a separate uncached document without reflecti
       const html = await response.text();
       assert.match(html, /id="reset-form"/);
       assert.match(html, /id="request-form"/);
-      assert.doesNotMatch(html, /private-do-not-reflect|OnlinodSession|\/core\/state\.js/);
+      assert.doesNotMatch(html, /private-do-not-reflect|NodSession|\/core\/state\.js/);
     }
     assert.equal((await fetch(base + "/unrelated")).status, 404);
   } finally {

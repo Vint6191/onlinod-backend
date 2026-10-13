@@ -5,9 +5,9 @@ const fs = require("node:fs"),
 exports.workspace = function (sandbox) {
   const w = sandbox.window;
   w.addEventListener ||= () => {};
-  w.OnlinodAdminState ||= { admin: { id: "unit-admin", role: "SUPER_ADMIN" }, section: "unit" };
-  w.OnlinodAdminApi ||= {};
-  w.OnlinodAdminApi.getToken ||= () => "unit-session";
+  w.NodAdminState ||= { admin: { id: "unit-admin", role: "SUPER_ADMIN" }, section: "unit" };
+  w.NodAdminApi ||= {};
+  w.NodAdminApi.getToken ||= () => "unit-session";
   sandbox.document ||= { getElementById: () => null };
   sandbox.document.querySelectorAll ||= () => [];
   Object.assign(sandbox, { setTimeout, clearTimeout, setInterval, clearInterval });

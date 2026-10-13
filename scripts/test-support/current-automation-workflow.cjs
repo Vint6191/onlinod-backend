@@ -122,7 +122,7 @@ import{AutomationWorkspace}from ${JSON.stringify(path.join(renderer, "features/a
 import{acceptRendererAuthorizationProjection}from ${JSON.stringify(path.join(renderer, "shared/rpc/authorization-scope.ts"))};
 import ${JSON.stringify(path.join(renderer, "styles.css"))};
 const client=new QueryClient({defaultOptions:{queries:{retry:false,gcTime:0}}});let root;
-export function mount(input){window.onlinod={events:{onDesktopAuthorizationEvent:()=>()=>{},onCreatorRuntimeEvent:()=>()=>{}},rpc:{call:async(method,payload)=>{const r=await window.actualRpc(method,payload);if(r.error)throw Object.assign(Error(r.error.message),{code:r.error.code});return r.result;}}};
+export function mount(input){window.nod={events:{onDesktopAuthorizationEvent:()=>()=>{},onCreatorRuntimeEvent:()=>()=>{}},rpc:{call:async(method,payload)=>{const r=await window.actualRpc(method,payload);if(r.error)throw Object.assign(Error(r.error.message),{code:r.error.code});return r.result;}}};
 acceptRendererAuthorizationProjection(input.projection);root=createRoot(document.getElementById('root'));root.render(<React.StrictMode><QueryClientProvider client={client}><AutomationWorkspace session={input.session} creators={input.creators} activeCreator={input.creators[0]}/></QueryClientProvider></React.StrictMode>);}
 export async function refresh(){await client.invalidateQueries({queryKey:['automation']});}
 export function unmount(){root.unmount();client.clear();}`);

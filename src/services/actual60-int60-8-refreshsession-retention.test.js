@@ -77,7 +77,7 @@ test("retention source keeps raw tokens for an explicit post-expiry security hor
   const retention = read("src/services/retention-policy-definition.js") + read("src/services/retention-service.js");
   const scheduler = read("src/services/job-scheduler.js");
   assert.match(retention, /refreshSessionRawHistoryDays:[\s\S]*fallback:\s*30[\s\S]*min:\s*7/);
-  assert.match(retention, /ONLINOD_REFRESH_SESSION_RAW_HISTORY_DAYS/);
+  assert.match(retention, /NOD_REFRESH_SESSION_RAW_HISTORY_DAYS/);
   assert.match(retention, /\["authSessions", runRefreshSessionRetentionSweep\]/);
   assert.match(scheduler, /"authSessions"/);
 });

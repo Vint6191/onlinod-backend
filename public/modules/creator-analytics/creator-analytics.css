@@ -1082,7 +1082,7 @@ width: 24px;
 .hq-ca-inline-dropdown-menu {
   position: fixed;
   z-index: 9999;
-  /* top/left are set inline by OnlinodCreatorAnalyticsEvents.positionDropdowns */
+  /* top/left are set inline by NodCreatorAnalyticsEvents.positionDropdowns */
   min-width: 180px;
   max-height: 300px;
   overflow: auto;

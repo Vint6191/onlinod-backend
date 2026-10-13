@@ -1,8 +1,8 @@
 (function () {
   "use strict";
 
-  const U = window.OnlinodCreatorAnalyticsUtils;
-  const S = window.OnlinodCreatorAnalyticsState;
+  const U = window.NodCreatorAnalyticsUtils;
+  const S = window.NodCreatorAnalyticsState;
 
   // Permission helper. Pulls helpers.can from ctx (set up by
   // app-admin.js renderAdminPanel). Falls open when missing.
@@ -142,7 +142,7 @@
 
   function getActiveRangeLabel(ctx) {
     const key = S.getRange ? S.getRange(ctx) : "7d";
-    const item = (window.OnlinodCreatorAnalyticsConstants?.RANGES || []).find(
+    const item = (window.NodCreatorAnalyticsConstants?.RANGES || []).find(
       (x) => x.key === key
     );
     return item?.label || "prev 7d";
@@ -278,8 +278,8 @@
     if (deep.length >= 2) return deep;
 
     // One-time warn so the integrator can inspect the real response shape.
-    if (!window.__onlinodTrendShapeWarned) {
-      window.__onlinodTrendShapeWarned = true;
+    if (!window.__nodTrendShapeWarned) {
+      window.__nodTrendShapeWarned = true;
       try {
         console.warn(
           "[CREATOR_ANALYTICS] Could not extract trend points. Raw shape:",
@@ -383,7 +383,7 @@
 
   function renderRangeDropdown(ctx, { compact = false } = {}) {
     const open = S.isRangeDropdownOpen ? S.isRangeDropdownOpen(ctx) : false;
-    const items = window.OnlinodCreatorAnalyticsConstants?.RANGES || [];
+    const items = window.NodCreatorAnalyticsConstants?.RANGES || [];
 
     if (compact) {
       return `
@@ -484,7 +484,7 @@
           <div>
             <div class="hq-page-title">Creators</div>
             <div class="hq-page-subtitle">
-              ${h(ctx, `${connected} connected · ~/onlinod/creators · analytics live`)}
+              ${h(ctx, `${connected} connected · ~/nod/creators · analytics live`)}
             </div>
           </div>
 
@@ -685,7 +685,7 @@
           </button>
 
           <div class="hq-profile-path">
-            ~/onlinod/creators/<span>${h(ctx, account.username || account.id)}</span>
+            ~/nod/creators/<span>${h(ctx, account.username || account.id)}</span>
           </div>
 
           <div class="hq-profile-spacer"></div>
@@ -1453,7 +1453,7 @@
     return renderCreatorAnalytics(ctx, { ready, problems });
   }
 
-  window.OnlinodCreatorAnalyticsRenderers = {
+  window.NodCreatorAnalyticsRenderers = {
     render,
   };
 })();

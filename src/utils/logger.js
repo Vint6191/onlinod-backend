@@ -13,7 +13,7 @@ function write(level, message, meta = {}) {
   const row = {
     ts: new Date().toISOString(),
     level,
-    service: "onlinod-backend",
+    service: "nod-backend",
     message: String(message || ""),
     ...(meta && typeof meta === "object" ? safeMeta(meta) : { meta }),
   };

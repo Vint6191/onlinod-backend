@@ -389,8 +389,8 @@ import{acceptRendererAuthorizationProjection}from ${JSON.stringify(path.join(ren
 import ${JSON.stringify(path.join(renderer, "styles.css"))};
 let root,crm,translator,host,mutation;let creatorId,dialogId;
 export async function rpc(method,input){const r=await window.actualRpc(method,input);if(r.error)throw Object.assign(Error(r.error.message),{code:r.error.code});return r.result;}
-export async function mount(input){creatorId=input.creatorId;dialogId=input.dialogId;window.onlinod={events:{onDesktopAuthorizationEvent:()=>()=>{}},rpc:{call:rpc}};acceptRendererAuthorizationProjection(input.projection);window.__ONLINOD_TOOL_SIDECAR_CONTEXT__={url:'https://onlyfans.com/my/chats/chat/'+dialogId,creatorId};window.onlinodToolSidecar={copyText:async text=>{window.lastCopied=text;return{ok:true}},setSurfaceState(){}};host=createSidecarRuntimeHost();crm=new DialogCrmSidecarRuntime(host,Object.fromEntries(['getPanel','updateProfile','analyzeProfile','generateReplies'].map(name=>[name,i=>rpc('dialogCrm.'+name,{...i,creatorId})])));await crm.mount(window.__ONLINOD_TOOL_SIDECAR_CONTEXT__);window.crmRuntime=crm;}
-export function switchCreator(id){creatorId=id;window.__ONLINOD_TOOL_SIDECAR_CONTEXT__={url:'https://onlyfans.com/my/chats/chat/'+dialogId,creatorId};crm.refresh(window.__ONLINOD_TOOL_SIDECAR_CONTEXT__);}
+export async function mount(input){creatorId=input.creatorId;dialogId=input.dialogId;window.nod={events:{onDesktopAuthorizationEvent:()=>()=>{}},rpc:{call:rpc}};acceptRendererAuthorizationProjection(input.projection);window.__NOD_TOOL_SIDECAR_CONTEXT__={url:'https://onlyfans.com/my/chats/chat/'+dialogId,creatorId};window.nodToolSidecar={copyText:async text=>{window.lastCopied=text;return{ok:true}},setSurfaceState(){}};host=createSidecarRuntimeHost();crm=new DialogCrmSidecarRuntime(host,Object.fromEntries(['getPanel','updateProfile','analyzeProfile','generateReplies'].map(name=>[name,i=>rpc('dialogCrm.'+name,{...i,creatorId})])));await crm.mount(window.__NOD_TOOL_SIDECAR_CONTEXT__);window.crmRuntime=crm;}
+export function switchCreator(id){creatorId=id;window.__NOD_TOOL_SIDECAR_CONTEXT__={url:'https://onlyfans.com/my/chats/chat/'+dialogId,creatorId};crm.refresh(window.__NOD_TOOL_SIDECAR_CONTEXT__);}
 export async function translate(){const hostApi={...createSidecarRuntimeHost(),onDomMutation:fn=>{mutation=fn;return()=>{mutation=null}}};translator=new TranslatorPageRuntime(hostApi,Object.fromEntries(['getState','updateSettings','translate','clearCache'].map(name=>[name,i=>rpc('translator.'+name,name==='translate'?{...i,creatorId}:i)])));await translator.mount();window.translatorRuntime=translator;}
 export function changed(){mutation?.({addedElements:[],removedElements:[],changedElements:[document.querySelector('[data-message-id]')],mutationCount:1,timestamp:Date.now()});}
 export function applySettings(settings){translator.applyHostSettings({translator:settings});}
@@ -406,7 +406,7 @@ export function unmount(){crm?.destroy();translator?.destroy();host?.destroy();r
       platform: "browser",
       format: "iife",
       globalName: "ActualDialog",
-      alias: { "@onlinod/shared": path.join(desktop, "packages/shared/src/index.ts") },
+      alias: { "@nod/shared": path.join(desktop, "packages/shared/src/index.ts") },
       jsx: "automatic",
       nodePaths: [path.join(desktop, "node_modules")],
       loader: { ".css": "css", ".png": "dataurl", ".svg": "dataurl" },
@@ -658,22 +658,22 @@ export function unmount(){crm?.destroy();translator?.destroy();host?.destroy();r
     results.uiObservations.translatorSelectedInput = await page.evaluate(() => ActualDialog.selectedInput());
     await page.locator(".b-chat__message__text").hover();
     await page.getByRole("button", { name: "Translate this message", exact: true }).click();
-    await page.locator('.onlinod-tx-icon-btn[data-state="translated"]').waitFor();
+    await page.locator('.nod-tx-icon-btn[data-state="translated"]').waitFor();
     results.uiObservations.nativeLinkAfterTranslation = await page.locator(".b-chat__message__text a").count();
     assert.equal(results.uiObservations.translatorSelectedInput, "composer");
     assert.equal(results.uiObservations.nativeLinkAfterTranslation, 1);
-    assert.match(await page.locator(".onlinod-tx-translation").innerText(), /привет из поездки/);
+    assert.match(await page.locator(".nod-tx-translation").innerText(), /привет из поездки/);
     const settings = translator.updateSettings({ incomingTargetLang: "uk" }).settings;
     await page.evaluate((s) => ActualDialog.applySettings(s), settings);
     results.uiObservations.translatedBubbleAfterLanguageChange = await page
       .locator(".b-chat__message__text")
       .innerText();
-    assert.equal(await page.locator(".onlinod-tx-translation").count(), 0);
+    assert.equal(await page.locator(".nod-tx-translation").count(), 0);
     assert.match(results.uiObservations.translatedBubbleAfterLanguageChange, /Hello travel friend/);
     await page.locator(".b-chat__message__text").hover();
     await page.getByRole("button", { name: "Translate this message", exact: true }).click();
-    await page.locator('.onlinod-tx-icon-btn[data-state="translated"]').waitFor();
-    assert.match(await page.locator(".onlinod-tx-translation").innerText(), /привіт із подорожі/);
+    await page.locator('.nod-tx-icon-btn[data-state="translated"]').waitFor();
+    assert.match(await page.locator(".nod-tx-translation").innerText(), /привіт із подорожі/);
     const translations = aiCalls.filter((e) => e.kind === "translation").length;
     await page.getByRole("button", { name: "Translate this message", exact: true }).click();
     await page.getByRole("button", { name: "Translate this message", exact: true }).click();
@@ -708,7 +708,7 @@ export function unmount(){crm?.destroy();translator?.destroy();host?.destroy();r
     releaseTranslation.resolve();
     aiHook = null;
     await until(() => aiActive === 0, "old translation settled");
-    assert.equal(await page.locator(".onlinod-tx-translation").count(), 0);
+    assert.equal(await page.locator(".nod-tx-translation").count(), 0);
     assert.match(await page.locator(".b-chat__message__text").innerText(), /Recycled message/);
     assert.equal(await page.locator(".b-chat__message__text a").count(), 1);
     const inputEntered = deferred(),
@@ -721,7 +721,7 @@ export function unmount(){crm?.destroy();translator?.destroy();host?.destroy();r
     };
     await page.locator("#composer").fill("новый текст поездки");
     await page.evaluate(() => {
-      window.inputTranslation = window.OnlinodOfTranslate.translateInputField();
+      window.inputTranslation = window.NodOfTranslate.translateInputField();
     });
     await inputEntered.promise;
     await page.locator("#composer").fill("уже другой текст");
@@ -730,7 +730,7 @@ export function unmount(){crm?.destroy();translator?.destroy();host?.destroy();r
     assert.equal(await page.evaluate(() => window.inputTranslation), false);
     assert.equal(await page.locator("#composer").inputValue(), "уже другой текст");
     await page.locator("#search").focus();
-    assert.equal(await page.evaluate(() => window.OnlinodOfTranslate.translateInputField()), true);
+    assert.equal(await page.evaluate(() => window.NodOfTranslate.translateInputField()), true);
     assert.equal(await page.locator("#composer").inputValue(), "hello from the trip");
     assert.equal(await page.locator("#search").inputValue(), "search text");
     pass(

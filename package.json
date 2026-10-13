@@ -1,7 +1,7 @@
 {
-  "name": "onlinod-backend",
+  "name": "nod-backend",
   "version": "0.7.1",
-  "description": "Onlinod backend API + internal admin with dedicated admin login",
+  "description": "NOD backend API + internal admin with dedicated admin login",
   "main": "src/server.js",
   "engines": {
     "node": "22.x"

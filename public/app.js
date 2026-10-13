@@ -1,1 +1,1 @@
-(async function(){"use strict";try{if(OnlinodState.accessToken){await OnlinodHomePage.bootstrap();OnlinodState.view='home'}}catch(e){console.warn('[APP] bootstrap failed:',e);OnlinodSession.clearSession()}OnlinodRouter.render();})();
+(async function(){"use strict";try{if(NodState.accessToken){await NodHomePage.bootstrap();NodState.view='home'}}catch(e){console.warn('[APP] bootstrap failed:',e);NodSession.clearSession()}NodRouter.render();})();

@@ -2,8 +2,8 @@
 // Disposable PostgreSQL WASM engine + the application's actual Prisma client.
 // Never uses DATABASE_URL, never connects to an existing database.
 // Install proof-only dependencies OUTSIDE this repo (no production dependency):
-// npm install --prefix /tmp/onlinod-owner-proof --ignore-scripts --no-audit --no-fund @electric-sql/pglite@0.5.8 @electric-sql/pglite-socket@0.2.11
-// PHASE4_PROOF_RUNTIME=/tmp/onlinod-owner-proof node scripts/audit/phase4-single-owner-postgres-proof.js
+// npm install --prefix /tmp/nod-owner-proof --ignore-scripts --no-audit --no-fund @electric-sql/pglite@0.5.8 @electric-sql/pglite-socket@0.2.11
+// PHASE4_PROOF_RUNTIME=/tmp/nod-owner-proof node scripts/audit/phase4-single-owner-postgres-proof.js
 // This proves SQL/driver/commit behavior, NOT native multi-connection concurrency.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");

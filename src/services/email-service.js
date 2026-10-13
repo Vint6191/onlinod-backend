@@ -4,7 +4,12 @@ function getAppUrl() {
 }
 
 function getFrom() {
-  return process.env.EMAIL_FROM || "Onlinod <onboarding@resend.dev>";
+  const from = process.env.EMAIL_FROM || "NOD <onboarding@resend.dev>";
+  const addressAt = from.indexOf("<");
+  // Keep the verified sender address, including existing deployment configuration.
+  return addressAt > 0
+    ? from.slice(0, addressAt).replace(/\bonlinod\b/gi, "NOD") + from.slice(addressAt)
+    : from;
 }
 
 async function sendMail(payload, { idempotencyKey, fetchImpl = globalThis.fetch } = {}) {
@@ -36,16 +41,16 @@ function verificationPayload({ email, token, code }) {
   return {
     from: getFrom(),
     to: email,
-    subject: "Verify your Onlinod email",
+    subject: "Verify your NOD email",
     text:
-      `Welcome to Onlinod.\n\n` +
+      `Welcome to NOD.\n\n` +
       `Verify your email by opening this link:\n${verifyUrl}\n\n` +
       `Or use this code: ${code}\n\n` +
       `This link expires in 30 minutes.`,
     html: `
       <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
-        <h2>Verify your Onlinod email</h2>
-        <p>Welcome to Onlinod.</p>
+        <h2>Verify your NOD email</h2>
+        <p>Welcome to NOD.</p>
         <p><a href="${verifyUrl}" style="display:inline-block;padding:10px 14px;background:#111;color:#fff;text-decoration:none;border-radius:8px">Verify email</a></p>
         <p>Or use this code:</p>
         <div style="font-size:24px;font-weight:700;letter-spacing:4px">${code}</div>
@@ -62,13 +67,13 @@ function passwordResetPayload({ email, token }) {
   return {
     from: getFrom(),
     to: email,
-    subject: "Reset your Onlinod password",
+    subject: "Reset your NOD password",
     text:
-      `Reset your Onlinod password:\n${resetUrl}\n\n` +
+      `Reset your NOD password:\n${resetUrl}\n\n` +
       `This link expires in 30 minutes. If you did not request this, ignore this email.`,
     html: `
       <div style="font-family:Arial,sans-serif;line-height:1.5;color:#111">
-        <h2>Reset your Onlinod password</h2>
+        <h2>Reset your NOD password</h2>
         <p><a href="${resetUrl}" style="display:inline-block;padding:10px 14px;background:#111;color:#fff;text-decoration:none;border-radius:8px">Reset password</a></p>
         <p style="color:#666">This link expires in 30 minutes. If you did not request this, ignore this email.</p>
       </div>
@@ -77,6 +82,7 @@ function passwordResetPayload({ email, token }) {
 }
 
 module.exports = {
+  getFrom,
   sendMail,
   verificationPayload,
   passwordResetPayload,

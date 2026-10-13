@@ -18,7 +18,7 @@ function prepareDeployment(sourceRoot = root) {
   const sql = fs.readFileSync(path.join(sourceRoot, "prisma/migrations", contract.migration, "migration.sql"), "utf8").replace(/\r\n/g, "\n");
   if (crypto.createHash("sha256").update(sql).digest("hex") !== contract.checksum) fail("BASELINE_SOURCE_CHECKSUM_MISMATCH");
   const schema = fs.readFileSync(path.join(sourceRoot, "prisma/schema.prisma"));
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "onlinod-current-install-"));
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nod-current-install-"));
   try {
     const migrationDirectory = path.join(directory, "migrations", contract.migration);
     fs.mkdirSync(migrationDirectory, { recursive: true });

@@ -7,7 +7,7 @@ async function verify(db) {
       AND t.tgname=ANY($1::text[])`,["campaign_refresh_work_writer_v2","campaign_refresh_work_scope_v2"]);
   for (const [name,type] of [["campaign_refresh_work_writer_v2",22],["campaign_refresh_work_scope_v2",23]]) {
     const r=rows.find(x=>x.name===name);
-    if (!r || !["O","A"].includes(r.enabled) || r.fn!=="onlinod_"+name || Number(r.type)!==type
+    if (!r || !["O","A"].includes(r.enabled) || r.fn!=="nod_"+name || Number(r.type)!==type
       || r.table_name!=="CreatorCampaignFanRefreshWork") throw new Error("CAMPAIGN_REFRESH_WORK_FENCE_INVALID:"+name);
   }
   const unique=await db.$queryRawUnsafe(`SELECT i.indisvalid AND i.indisready AND i.indisunique

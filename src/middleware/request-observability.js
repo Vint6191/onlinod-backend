@@ -3,8 +3,8 @@
 const { randomUUID } = require("node:crypto");
 const logger = require("../utils/logger");
 
-const TRACE_HEADER = "x-onlinod-trace-id";
-const STARTUP_TRACE_HEADER = "x-onlinod-startup-trace-id";
+const TRACE_HEADER = "x-nod-trace-id";
+const STARTUP_TRACE_HEADER = "x-nod-startup-trace-id";
 const TRACE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 
 function safeTraceId(value) {
@@ -39,7 +39,7 @@ function createRequestObservabilityMiddleware(options = {}) {
 
     req.traceId = traceId;
     req.startupTraceId = startupTraceId;
-    try { res.setHeader("X-Onlinod-Trace-Id", traceId); } catch {}
+    try { res.setHeader("X-NOD-Trace-Id", traceId); } catch {}
 
     const finish = (terminalEvent) => {
       if (settled) return;

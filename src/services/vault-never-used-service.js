@@ -62,7 +62,7 @@ function oldest(values) {
   return times.length ? new Date(Math.min(...times)).toISOString() : null;
 }
 
-function staleAfterMs(value = process.env.ONLINOD_NEVER_USED_STALE_AFTER_MS) {
+function staleAfterMs(value = (process.env.NOD_NEVER_USED_STALE_AFTER_MS ?? process.env.ONLINOD_NEVER_USED_STALE_AFTER_MS)) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 60_000 ? Math.floor(parsed) : DEFAULT_STALE_AFTER_MS;
 }

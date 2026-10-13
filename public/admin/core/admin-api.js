@@ -5,7 +5,7 @@
    - Reads admin Bearer token from localStorage("onlinod_admin_token").
    - On 401, redirects to /admin-login (unless already there).
    - Always returns parsed JSON (or { ok: false, error } on parse fail).
-   - Stashes the last request/response on window.OnlinodAdminState.lastDebug
+   - Stashes the last request/response on window.NodAdminState.lastDebug
      so we can inspect it in the system page later.
    ──────────────────────────────────────────────────────────── */
 
@@ -22,7 +22,7 @@
     if (getToken() === (token || "")) return;
     if (token) localStorage.setItem(TOKEN_KEY, token);
     else localStorage.removeItem(TOKEN_KEY);
-    window.dispatchEvent?.(new window.CustomEvent("onlinod:admin-session-changed"));
+    window.dispatchEvent?.(new window.CustomEvent("nod:admin-session-changed"));
   }
 
   function buildUrl(path, query) {
@@ -53,10 +53,10 @@
 
     let command;
     try {
-      command = await window.OnlinodAdminCommands.prepare({ path, method: options.method || "GET", body: options.body, token });
+      command = await window.NodAdminCommands.prepare({ path, method: options.method || "GET", body: options.body, token });
       if (command?.blocked) {
         if (sessionChanged()) return changedResult(command);
-        const resolved = await window.OnlinodAdminCommands.resolve(path, options.method || "GET", token);
+        const resolved = await window.NodAdminCommands.resolve(path, options.method || "GET", token);
         if (sessionChanged()) return changedResult(command);
         if (!resolved.pending) return { ok: false, code: "ADMIN_PREVIOUS_COMMAND_COMPLETED", error: "Previous change completed. Reload current values before editing again.", commandId: command.commandId };
         return command.result;
@@ -92,7 +92,7 @@
     }
 
     if (command && res.ok && (data?.ok !== true || data.commandId !== command.commandId)) data = { ok: false, code: "ADMIN_COMMAND_RESPONSE_UNKNOWN", commandId: command.commandId, error: "Result could not be confirmed. Retry the same change or check its status." };
-    window.OnlinodAdminCommands.settle(command, res, data);
+    window.NodAdminCommands.settle(command, res, data);
     // A response belonging to a previous login may settle only its own command.
     // It cannot render old data, overwrite current debug state or log out the
     // administrator who signed in while this request was awaiting the network.
@@ -107,7 +107,7 @@
       setToken(null);
       if (!location.pathname.startsWith("/admin-login")) {
         history.pushState({}, "", "/admin-login");
-        window.OnlinodAdminRouter?.render?.();
+        window.NodAdminRouter?.render?.();
       }
     }
 
@@ -115,8 +115,8 @@
   }
 
   function stashDebug(req, res) {
-    if (!window.OnlinodAdminState) return;
-    window.OnlinodAdminState.lastDebug = window.OnlinodAdminCommands.redact({ request: req, response: res, at: new Date().toISOString() });
+    if (!window.NodAdminState) return;
+    window.NodAdminState.lastDebug = window.NodAdminCommands.redact({ request: req, response: res, at: new Date().toISOString() });
   }
 
   // ─── Convenience wrappers around our admin endpoints ─────────
@@ -128,7 +128,7 @@
     TOKEN_KEY,
     getToken, setToken, request,
     commandStatus: (id) => request(`/api/admin/commands/${encodeURIComponent(id)}`),
-    resolveCommand: (path, method) => window.OnlinodAdminCommands.resolve(path, method, getToken()),
+    resolveCommand: (path, method) => window.NodAdminCommands.resolve(path, method, getToken()),
 
     // auth
     login:  (body)   => request("/api/admin-auth/login",  { method: "POST", body, auth: false }),
@@ -215,5 +215,5 @@
     billingApplyTier:  (id, body) => request(`/api/admin/billing/agency/${encodeURIComponent(id)}/apply-tier`, { method: "POST", body }),
   };
 
-  window.OnlinodAdminApi = api;
+  window.NodAdminApi = api;
 })();

@@ -166,7 +166,7 @@
     setRangeDropdownOpen(ctx, false);
   }
 
-  window.OnlinodCreatorAnalyticsState = {
+  window.NodCreatorAnalyticsState = {
     ensure,
     getRange,
     setRange,

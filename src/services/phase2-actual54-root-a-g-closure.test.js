@@ -131,7 +131,7 @@ test("F54-06 behavioral preflight exits non-zero when seed and manifest exist bu
   try {
     process.exitCode = undefined;
     const report = await runCoveragePreflight({ prisma: db,
-      env: { ONLINOD_PHASE2_COVERAGE_PREFLIGHT: "1", ONLINOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_ID: "agency-1" },
+      env: { NOD_PHASE2_COVERAGE_PREFLIGHT: "1", NOD_PHASE2_COVERAGE_PREFLIGHT_AGENCY_ID: "agency-1" },
       stdout: { write(chunk) { output += String(chunk); } } });
     assert.equal(report.coverage.manifestSeeded, true);
     assert.equal(report.coverage.convergenceComplete, false);

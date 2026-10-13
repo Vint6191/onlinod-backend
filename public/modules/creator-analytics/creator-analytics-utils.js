@@ -28,7 +28,7 @@
     return (ctx.state.accounts || []).filter((x) => x.status !== "ready");
   }
 
-  window.OnlinodCreatorAnalyticsUtils = {
+  window.NodCreatorAnalyticsUtils = {
     fallbackEscape,
     h,
     a,

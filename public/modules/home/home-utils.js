@@ -90,7 +90,7 @@
     return String(n);
   }
 
-  window.OnlinodHomeUtils = {
+  window.NodHomeUtils = {
     h,
     a,
     fallbackEscape,

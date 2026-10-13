@@ -34,7 +34,7 @@ function ownerOnly(req, res, next) {
 }
 
 function safeHtml(title, message) {
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{margin:0;background:#0d0912;color:#f6f2f8;font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;display:grid;place-items:center;min-height:100vh}.card{max-width:560px;margin:24px;padding:32px;border:1px solid rgba(255,255,255,.12);border-radius:16px;background:#15101d;box-shadow:0 24px 70px rgba(0,0,0,.35)}h1{margin:0 0 12px;font-size:28px}p{margin:0;color:#b8afc2}.mark{color:#fbbf24;font-weight:800;letter-spacing:.08em;font-size:12px;margin-bottom:8px}</style></head><body><main class="card"><div class="mark">ONLINOD BILLING</div><h1>${title}</h1><p>${message}</p></main></body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>body{margin:0;background:#0d0912;color:#f6f2f8;font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;display:grid;place-items:center;min-height:100vh}.card{max-width:560px;margin:24px;padding:32px;border:1px solid rgba(255,255,255,.12);border-radius:16px;background:#15101d;box-shadow:0 24px 70px rgba(0,0,0,.35)}h1{margin:0 0 12px;font-size:28px}p{margin:0;color:#b8afc2}.mark{color:#fbbf24;font-weight:800;letter-spacing:.08em;font-size:12px;margin-bottom:8px}</style></head><body><main class="card"><div class="mark">NOD BILLING</div><h1>${title}</h1><p>${message}</p></main></body></html>`;
 }
 
 
@@ -52,10 +52,10 @@ router.post("/nowpayments/ipn", async (req, res) => {
 
 // Hosted checkout redirects only inform the customer. They never activate entitlements.
 router.get("/checkout/success", (_req, res) => {
-  res.type("html").send(safeHtml("Payment received", "NOWPayments is processing the payment. Return to ONLINOD and refresh Plan & Billing; access is granted only after the backend verifies the final payment status."));
+  res.type("html").send(safeHtml("Payment received", "NOWPayments is processing the payment. Return to NOD and refresh Plan & Billing; access is granted only after the backend verifies the final payment status."));
 });
 router.get("/checkout/cancel", (_req, res) => {
-  res.type("html").send(safeHtml("Checkout cancelled", "No subscription change was made. You can return to ONLINOD and create another checkout whenever you are ready."));
+  res.type("html").send(safeHtml("Checkout cancelled", "No subscription change was made. You can return to NOD and create another checkout whenever you are ready."));
 });
 
 router.use(authRequired);
@@ -72,7 +72,7 @@ router.post("/checkout", (_req, res) => {
   return res.status(410).json({ ok: false, code: "BILLING_DIRECT_CHECKOUT_DEPRECATED", error: "Creator checkout was replaced by wallet billing. Top up the workspace balance and start a monthly creator subscription." });
 });
 
-router.post("/wallet/top-up", (_req, res) => res.status(410).json({ ok: false, code: "BILLING_COMMAND_CLIENT_UPGRADE_REQUIRED", error: "Update ONLINOD to recover top-ups safely" }));
+router.post("/wallet/top-up", (_req, res) => res.status(410).json({ ok: false, code: "BILLING_COMMAND_CLIENT_UPGRADE_REQUIRED", error: "Update NOD to recover top-ups safely" }));
 
 router.post("/wallet/top-up/v2", async (req, res) => {
   try {

@@ -5,15 +5,15 @@
      - Browser: pick an entity, filter by agency/creator, view rows
      - Inspect rows as raw JSON; archive explicit terminal deliveries
      - Mutations use typed commands with durable receipts
-   Depends on window.OnlinodAdminApi data* methods.
+   Depends on window.NodAdminApi data* methods.
    ──────────────────────────────────────────────────────────── */
 (function () {
   "use strict";
 
-  const A = () => window.OnlinodAdminApi;
-  const R = () => window.OnlinodAdminRouter;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
   const esc = (v) => R().escapeHtml(v);
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
 
   // entity key → { label, api(query), columns:[{k,label,fmt?}], model (for inspection) }
   const ENTITIES = {
@@ -228,7 +228,7 @@
     if (!b) return;
     const mutable = view.entity === "deliveries";
     b.hidden = !mutable;
-    b.disabled = view.loading || !mutable || view.selected.size === 0 || window.OnlinodAdminState.admin?.role !== "SUPER_ADMIN";
+    b.disabled = view.loading || !mutable || view.selected.size === 0 || window.NodAdminState.admin?.role !== "SUPER_ADMIN";
     b.textContent = mutable && view.selected.size ? `archive selected (${view.selected.size})` : "archive selected";
   }
 
@@ -292,5 +292,5 @@
     return m;
   }
 
-  window.OnlinodAdminData = { render };
+  window.NodAdminData = { render };
 })();

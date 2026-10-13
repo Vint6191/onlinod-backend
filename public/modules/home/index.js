@@ -1,13 +1,13 @@
 (function () {
   "use strict";
 
-  if (!window.OnlinodHomeView) {
-    console.error("[HOME] OnlinodHomeView is missing");
+  if (!window.NodHomeView) {
+    console.error("[HOME] NodHomeView is missing");
     return;
   }
 
-  window.OnlinodHome = {
-    render: window.OnlinodHomeView.render,
+  window.NodHome = {
+    render: window.NodHomeView.render,
   };
 
   console.log("[HOME] renderer module loaded ✓");

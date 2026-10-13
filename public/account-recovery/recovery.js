@@ -39,7 +39,7 @@
   }
   if (resetting) {
     element("title").textContent = "Новый пароль";
-    element("intro").textContent = "Задайте новый пароль для входа в ONLINOD.";
+    element("intro").textContent = "Задайте новый пароль для входа в NOD.";
     if (token.length < 20 || token.length > 256) invalidLink("Ссылка неполная или недействительна. Запросите новое письмо.");
     else resetForm.hidden = false;
   } else {
@@ -77,7 +77,7 @@
       resetForm.reset();
       resetForm.hidden = true;
       element("title").textContent = "Пароль изменён";
-      element("intro").textContent = "Вернитесь в ONLINOD и войдите с новым паролем.";
+      element("intro").textContent = "Вернитесь в NOD и войдите с новым паролем.";
       message("Старые сеансы входа завершены. Ваш аккаунт и данные сохранены.");
     } catch (error) {
       if (["TOKEN_INVALID", "TOKEN_EXPIRED", "TOKEN_USED"].includes(error.code)) {

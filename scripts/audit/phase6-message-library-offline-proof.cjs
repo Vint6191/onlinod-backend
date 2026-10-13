@@ -6,7 +6,7 @@ const { PGlite } = require(process.env.ONLINOD_PGLITE_MODULE || "@electric-sql/p
 const { recordMessageLibraryUsage } = require("../../src/services/message-library-usage-service");
 const { withProductBilling } = require("../../src/services/product-billing-context-service");
 test("D1 actual usage service on file-backed PostgreSQL WASM", async t => {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "onlinod-d1-")); let pg = new PGlite(directory); await pg.waitReady;
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nod-d1-")); let pg = new PGlite(directory); await pg.waitReady;
   t.after(async () => { await pg.close(); fs.rmSync(directory, { recursive: true, force: true }); });
   await pg.exec(fs.readFileSync(path.join(__dirname, "../../test/fixtures/phase6-message-library-I7-baseline.sql"), "utf8"));
   await pg.exec(`INSERT INTO "Agency"(id,name,"trialEndsAt","updatedAt") VALUES ('a','A','2099-01-01',CURRENT_TIMESTAMP),('b','B','2099-01-01',CURRENT_TIMESTAMP);

@@ -8,9 +8,9 @@ const load=createRequire(path.resolve(runtime,'package.json'));
 const {PGlite}=load('@electric-sql/pglite'),{PGLiteSocketServer}=load('@electric-sql/pglite-socket');
 const root=path.resolve(__dirname,'../..'),contract=require('../../src/services/database-contract.json');
 const resetFlag='--reset-legacy-test-database',oldMigration='20260429193000_init_auth_v2';
-const output=process.env.ONLINOD_SQL_PROOF_OUTPUT?path.resolve(process.env.ONLINOD_SQL_PROOF_OUTPUT,'evidence'):fs.mkdtempSync(path.join(os.tmpdir(),'onlinod-overlay-results-'));
+const output=process.env.ONLINOD_SQL_PROOF_OUTPUT?path.resolve(process.env.ONLINOD_SQL_PROOF_OUTPUT,'evidence'):fs.mkdtempSync(path.join(os.tmpdir(),'nod-overlay-results-'));
 fs.mkdirSync(output,{recursive:true});
-const scratch=fs.mkdtempSync(path.join(os.tmpdir(),'onlinod overlay proof ')),fixture=path.join(scratch,'backend');
+const scratch=fs.mkdtempSync(path.join(os.tmpdir(),'nod overlay proof ')),fixture=path.join(scratch,'backend');
 const report={ok:false,nativePostgres:false,productionAccessed:false,engine:'PGlite 0.5.8 + Prisma 5.22 CLI',cases:[]};
 const hash=value=>crypto.createHash('sha256').update(value).digest('hex');
 function sourceSnapshot(){
@@ -26,7 +26,7 @@ function cli(url,label,expectedCode=0,args=[],command=null){return new Promise((
  child.once('error',e=>{clearTimeout(timer);fs.closeSync(fd);reject(e);});
  child.once('exit',(code,signal)=>{
   clearTimeout(timer);fs.closeSync(fd);
-  try{assert.equal(signal,null);assert.equal(code,expectedCode,label);assert.ok(!fs.readdirSync(scratch).some(n=>n.startsWith('onlinod-current-install-')),'temporary deployment left behind');resolve(fs.readFileSync(file,'utf8'));}catch(e){reject(e);}
+  try{assert.equal(signal,null);assert.equal(code,expectedCode,label);assert.ok(!fs.readdirSync(scratch).some(n=>n.startsWith('nod-current-install-')),'temporary deployment left behind');resolve(fs.readFileSync(file,'utf8'));}catch(e){reject(e);}
  });
 });}
 async function database(fn){

@@ -337,7 +337,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
       { key: "30d", label: "30D", enabled: true },
       { key: "90d", label: "3M", enabled: true },
       { key: "180d", label: "6M", enabled: true },
-      { key: "365d", label: "1Y", enabled: oneYearAvailable, reason: oneYearAvailable ? null : "Available after ONLINOD has accumulated a full year of activity coverage" },
+      { key: "365d", label: "1Y", enabled: oneYearAvailable, reason: oneYearAvailable ? null : "Available after NOD has accumulated a full year of activity coverage" },
     ],
     coverage: {
       notificationVerified: notificationCollection.proven === true,

@@ -110,7 +110,7 @@ async function run({ runtimePath, output }) {
 module.exports = { run };
 if (require.main === module) {
   const output = path.resolve(process.env.ONLINOD_SQL_PROOF_OUTPUT ||
-    path.join(fs.mkdtempSync(path.join(os.tmpdir(), "onlinod-provider-timezone-")), "result.json"));
+    path.join(fs.mkdtempSync(path.join(os.tmpdir(), "nod-provider-timezone-")), "result.json"));
   run({ runtimePath: process.env.ONLINOD_SQL_PROOF_RUNTIME, output }).then(result => {
     console.log(JSON.stringify({ ok: result.ok, cases: result.cases, output }));
     process.exitCode = result.ok ? 0 : 1;

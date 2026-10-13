@@ -1,4 +1,4 @@
-/* src/routes/admin-data.js — Onlinod admin "deep data" surface
+/* src/routes/admin-data.js — NOD admin "deep data" surface
    ────────────────────────────────────────────────────────────
    Admin tools to inspect / search data and issue typed archive commands
    across all agencies and creators. Mounted at /api/admin/data and

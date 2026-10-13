@@ -3,10 +3,10 @@
 
   function helpers() {
     return {
-      escapeHtml: window.OnlinodRouter.escapeHtml,
-      escapeAttr: window.OnlinodRouter.escapeAttr,
-      getVisibleAccounts: () => window.OnlinodState.accounts.filter((x) => x.status === "ready"),
-      getProblemAccounts: () => window.OnlinodState.accounts.filter((x) => x.status !== "ready"),
+      escapeHtml: window.NodRouter.escapeHtml,
+      escapeAttr: window.NodRouter.escapeAttr,
+      getVisibleAccounts: () => window.NodState.accounts.filter((x) => x.status === "ready"),
+      getProblemAccounts: () => window.NodState.accounts.filter((x) => x.status !== "ready"),
       accountPublicName: (account) => account.displayName || account.username || "Account",
       accountUsernameLine: (account) => {
         const parts = [];
@@ -16,8 +16,8 @@
       },
       accountStatusLabel: (account) => String(account.status || "draft").replaceAll("_", " ").toUpperCase(),
       accountCardAvatarHtml: (account, className) => {
-        const h = window.OnlinodRouter.escapeHtml;
-        const a = window.OnlinodRouter.escapeAttr;
+        const h = window.NodRouter.escapeHtml;
+        const a = window.NodRouter.escapeAttr;
         const initial = String(account.displayName || account.username || "A").slice(0, 1).toUpperCase();
 
         if (account.avatarUrl || account.avatar) {
@@ -38,26 +38,26 @@
           renderRoute("creatorAnalytics");
           return;
         }
-        window.OnlinodRouter.toast(`${section} is not wired yet`);
+        window.NodRouter.toast(`${section} is not wired yet`);
       },
       openAccountFromAdmin: (accountId) => {
-        window.OnlinodRouter.toast(`Electron only: open account ${accountId}`);
+        window.NodRouter.toast(`Electron only: open account ${accountId}`);
       },
       addAccountFromHQ: () => {
         openAddCreatorModal();
       },
       refreshAccountMe: async (accountId) => {
-        window.OnlinodRouter.toast(`Electron only: refresh users/me ${accountId}`);
+        window.NodRouter.toast(`Electron only: refresh users/me ${accountId}`);
         return { ok: false, code: "ELECTRON_ONLY" };
       },
       createAccessSnapshotForAccount: async (accountId) => {
-        window.OnlinodRouter.toast(`Snapshots next: ${accountId}`);
+        window.NodRouter.toast(`Snapshots next: ${accountId}`);
       },
       revokeLatestAccessSnapshotForAccount: async (accountId) => {
-        window.OnlinodRouter.toast(`Revoke snapshot next: ${accountId}`);
+        window.NodRouter.toast(`Revoke snapshot next: ${accountId}`);
       },
       onTodo: (key) => {
-        window.OnlinodRouter.toast(`TODO: ${key}`);
+        window.NodRouter.toast(`TODO: ${key}`);
       },
     };
   }
@@ -81,20 +81,20 @@
   }
 
   async function bootstrap() {
-    if (!window.OnlinodState.accessToken) return;
+    if (!window.NodState.accessToken) return;
 
-    const me = await window.OnlinodApi.request("/api/auth/me").catch(() => null);
+    const me = await window.NodApi.request("/api/auth/me").catch(() => null);
     if (me?.ok) {
-      window.OnlinodSession.setSession(me);
+      window.NodSession.setSession(me);
     }
 
     await loadCreators();
   }
 
   async function loadCreators() {
-    const creators = await window.OnlinodApi.request("/api/creators").catch(() => null);
+    const creators = await window.NodApi.request("/api/creators").catch(() => null);
     if (creators?.ok) {
-      window.OnlinodState.accounts = (creators.creators || []).map(mapCreatorToAccount);
+      window.NodState.accounts = (creators.creators || []).map(mapCreatorToAccount);
     }
     return creators;
   }
@@ -103,7 +103,7 @@
     try {
       const params = new URLSearchParams(window.location.search || "");
       if (params.get("dev") === "1") return true;
-      if (localStorage.getItem("ONLINOD_DEV_TOOLS") === "1") return true;
+      if (localStorage.getItem("NOD_DEV_TOOLS") === "1") return true;
     } catch (_) {}
 
     return false;
@@ -119,14 +119,14 @@
   }
 
   function shell(inner) {
-    const state = window.OnlinodState;
+    const state = window.NodState;
     const userInitial = String(state.user?.email || "AT").slice(0, 2).toUpperCase();
     const agencyName = state.agency?.name || "workspace";
 
     return `
       <div class="on-app-shell">
         <aside class="on-rail">
-          <div class="on-rail-logo">O</div>
+          <div class="on-rail-logo">N</div>
           <button class="on-rail-btn">HQ</button>
           <div class="on-rail-models">
             ${renderRailCreators()}
@@ -139,18 +139,18 @@
         <main class="on-main">
           <header class="on-topbar">
             <div class="on-wordmark">
-              <span class="on-logo-mark" style="width:24px;height:24px;border-radius:8px;font-size:11px;">O</span>
-              <span>onlinod</span>
+              <span class="on-logo-mark" style="width:24px;height:24px;border-radius:8px;font-size:11px;">N</span>
+              <span>NOD</span>
             </div>
 
             <div class="on-workspace-pill">
               <span class="on-workspace-dot"></span>
-              ${window.OnlinodRouter.escapeHtml(agencyName)}
+              ${window.NodRouter.escapeHtml(agencyName)}
             </div>
 
             <div class="on-search">⌕ jump to… <span style="margin-left:auto">⌘K</span></div>
             <button class="on-btn" id="btnToggleDebug" style="height:32px;margin:0;">debug</button>
-            <div class="on-user-chip">${window.OnlinodRouter.escapeHtml(userInitial)}</div>
+            <div class="on-user-chip">${window.NodRouter.escapeHtml(userInitial)}</div>
           </header>
 
           <nav class="on-nav">
@@ -179,12 +179,12 @@
             <div class="on-modal-head">
               <div>
                 <strong>Add or reconnect creator</strong>
-                <span>Creator enrollment is owned by ONLINOD Desktop.</span>
+                <span>Creator enrollment is owned by NOD Desktop.</span>
               </div>
               <button id="btnCloseAddCreator">×</button>
             </div>
             <div class="on-connect-status active">
-              <strong>Open ONLINOD Desktop</strong>
+              <strong>Open NOD Desktop</strong>
               <span>Use Creator Control in the desktop app to create a draft, verify OnlyFans identity, and publish the encrypted canonical session. The web console never receives session credentials or connection tokens.</span>
             </div>
             <div class="on-btn-row">
@@ -198,8 +198,8 @@
   }
 
   function renderRailCreators() {
-    const h = window.OnlinodRouter.escapeHtml;
-    const accounts = window.OnlinodState.accounts || [];
+    const h = window.NodRouter.escapeHtml;
+    const accounts = window.NodState.accounts || [];
     return accounts.slice(0, 5).map((account) => {
       const initial = h(String(account.displayName || account.username || "A").slice(0, 1).toUpperCase());
       const badge = Number(account.chatMessagesCount || 0);
@@ -228,9 +228,9 @@
 
     if (route === "home") {
       mount.innerHTML = `<div id="homeMount"></div>`;
-      window.OnlinodHome.render({
+      window.NodHome.render({
         root: document.getElementById("homeMount"),
-        state: window.OnlinodState,
+        state: window.NodState,
         helpers: helpers(),
         actions: actions(),
       });
@@ -239,9 +239,9 @@
 
     if (route === "creatorAnalytics") {
       mount.innerHTML = `<div id="creatorAnalyticsMount"></div>`;
-      window.OnlinodCreatorAnalytics.render({
+      window.NodCreatorAnalytics.render({
         root: document.getElementById("creatorAnalyticsMount"),
-        state: window.OnlinodState,
+        state: window.NodState,
         helpers: helpers(),
         actions: actions(),
       });
@@ -252,7 +252,7 @@
       <section class="hq-todo-section">
         <div class="hq-todo-section-main">
           <div>
-            <div class="hq-page-title">${window.OnlinodRouter.escapeHtml(route)}</div>
+            <div class="hq-page-title">${window.NodRouter.escapeHtml(route)}</div>
             <div class="hq-page-subtitle">Reserved for orchestration v1. We'll wire it after Creator Analytics and Electron worker loop.</div>
           </div>
           <span class="hq-todo-badge">NEXT</span>
@@ -277,7 +277,7 @@
 
   function addCreatorFromModal() {
     closeAddCreatorModal();
-    window.OnlinodRouter.toast("Open ONLINOD Desktop → Creator Control to add or reconnect creators");
+    window.NodRouter.toast("Open NOD Desktop → Creator Control to add or reconnect creators");
   }
 
   function bindShell(root) {
@@ -290,16 +290,16 @@
     const logout = root.querySelector("#btnLogoutApp");
     if (logout) {
       logout.addEventListener("click", async () => {
-        if (window.OnlinodState.refreshToken) {
-          await window.OnlinodApi.request("/api/auth/logout", {
+        if (window.NodState.refreshToken) {
+          await window.NodApi.request("/api/auth/logout", {
             method: "POST",
             auth: false,
-            body: { refreshToken: window.OnlinodState.refreshToken },
+            body: { refreshToken: window.NodState.refreshToken },
           }).catch(() => {});
         }
 
-        window.OnlinodSession.clearSession();
-        window.OnlinodRouter.render();
+        window.NodSession.clearSession();
+        window.NodRouter.render();
       });
     }
 
@@ -326,7 +326,7 @@
     if (debug) {
       debug.addEventListener("click", () => {
         document.querySelector(".on-debug-drawer")?.classList.toggle("active");
-        window.OnlinodRouter.renderDebug();
+        window.NodRouter.renderDebug();
       });
     }
 
@@ -341,12 +341,12 @@
     if (copyDebug) {
       copyDebug.addEventListener("click", async () => {
         await navigator.clipboard.writeText(document.querySelector(".on-debug-pre")?.textContent || "{}");
-        window.OnlinodRouter.toast("Copied");
+        window.NodRouter.toast("Copied");
       });
     }
   }
 
-  window.OnlinodHomePage = {
+  window.NodHomePage = {
     render,
     bootstrap,
     loadCreators,

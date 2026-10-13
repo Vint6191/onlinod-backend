@@ -26,7 +26,7 @@ test("Actual53 coverage seed is versioned by one immutable manifest authority", 
 
 test("M53-01 preflight is explicit read-only and compares legacy seed with current manifest", () => {
   assert.equal(pkg.scripts?.["audit:phase2-coverage-preflight"], "node scripts/audit/phase2-coverage-preflight-readonly.js");
-  assert.match(preflight, /ONLINOD_PHASE2_COVERAGE_PREFLIGHT=1_REQUIRED/);
+  assert.match(preflight, /NOD_PHASE2_COVERAGE_PREFLIGHT=1_REQUIRED/);
   assert.match(preflight, /phase2_coverage_seed_v2/);
   assert.match(preflight, /LEGACY_SEED_COMPLETE_REQUIRES_CURRENT_MANIFEST_RESEED/);
   assert.match(preflight, /CURRENT_SEED_MANIFEST_IDENTITY_MISMATCH/);

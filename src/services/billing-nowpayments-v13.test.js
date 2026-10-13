@@ -1129,7 +1129,7 @@ test("V13.3.2 activation/refund re-read order state after the agency lock", () =
   assert.match(entitlementServiceSource, /await lockAgencyBillingMutation\(tx, agencyId\);[\s\S]*?const currentOrder = await tx\.billingOrder\.findUnique[\s\S]*?currentOrder\.status !== "REFUNDED"/);
 });
 
-test("billing HTTP boundary keeps only signed IPN/provider redirects public; ONLINOD does not expose a custom sandbox checkout", () => {
+test("billing HTTP boundary keeps only signed IPN/provider redirects public; NOD does not expose a custom sandbox checkout", () => {
   const ipnPos = routeSource.indexOf('router.post("/nowpayments/ipn"');
   const authPos = routeSource.indexOf("router.use(authRequired)");
   const checkoutPos = routeSource.indexOf('router.post("/checkout"');
@@ -1185,7 +1185,7 @@ test("V13.3.1 creator soft/hard delete recomputes billing aggregate in the canon
   assert.doesNotMatch(deleteRoute, /tx\.creatorAccount\.delete/);
 });
 
-test("V14.9 sandbox resume returns the original NOWPayments sandbox hosted URL and never an ONLINOD checkout page", async () => withEnv({
+test("V14.9 sandbox resume returns the original NOWPayments sandbox hosted URL and never an NOD checkout page", async () => withEnv({
   NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NODE_ENV: "test",
 }, async () => {
   const db = makeProcessingDb();
@@ -1239,7 +1239,7 @@ test("V14.9 sandbox invoice creation rejects production NOWPayments hosted URLs 
   } finally { global.fetch = oldFetch; }
 }));
 
-test("V14.9 invoice amount remains bound to the ONLINOD top-up before any hosted URL is exposed", async () => withEnv({
+test("V14.9 invoice amount remains bound to the NOD top-up before any hosted URL is exposed", async () => withEnv({
   NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NODE_ENV: "test",
 }, async () => {
   let order = null;

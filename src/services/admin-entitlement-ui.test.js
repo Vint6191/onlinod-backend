@@ -1,7 +1,7 @@
 "use strict";
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm');
 const window={};vm.runInNewContext(fs.readFileSync(require.resolve('../../public/admin/modules/admin-billing/admin-entitlements.js'),'utf8'),{window});
-const {command,value}=window.OnlinodAdminEntitlements;
+const {command,value}=window.NodAdminEntitlements;
 test('AI-only edit retains untouched paid timestamps and does not change core tier',()=>{
  const model={tier:'ELITE',entitlement:{entitlementRevision:7,tier:'PRO',coreValidUntil:'2026-12-01T12:34:56.987Z',aiChatterValidUntil:null,outreachValidUntil:null}};
  const body=command(model,{tier:'PRO',coreValidUntil:value(model.entitlement.coreValidUntil),aiChatterValidUntil:'2026-12-03T00:00:00',outreachValidUntil:'',reason:'AI extension'});

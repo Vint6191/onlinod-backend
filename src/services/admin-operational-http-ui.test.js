@@ -27,9 +27,9 @@ test("agency UI forwards shown revisions, typed hard flag and explicit reasons w
  const calls=[],answers=["restore reason","role reason","remove reason","creator reason"];
  const agency={id:"agency-a",updatedAt:"2026-01-01T00:00:00.000Z",members:[{id:"member-a",accessEpoch:7}],creators:[{id:"creator-a",updatedAt:"2026-02-01T00:00:00.000Z"}]};
  const api=new Proxy({}, {get:(_,name)=>name==="getToken"?()=>"unit-session":async(id,body)=>{calls.push({name,id,body});return {ok:true};}});
- const window={OnlinodAdminApi:api,OnlinodAdminRouter:{toast:()=>{}},OnlinodAdminState:{sectionParam:"agency-a"},OnlinodAdminStateApi:{ensureAgencyDetail:()=>({data:{agency}})},OnlinodAdminAgencyDetail:{load:async()=>{}}};
+ const window={NodAdminApi:api,NodAdminRouter:{toast:()=>{}},NodAdminState:{sectionParam:"agency-a"},NodAdminStateApi:{ensureAgencyDetail:()=>({data:{agency}})},NodAdminAgencyDetail:{load:async()=>{}}};
  vm.runInNewContext(fs.readFileSync(require.resolve("../../public/admin/modules/admin-agency-detail/admin-agency-detail-actions.js"),"utf8"),require("../../scripts/test-support/admin-browser-fixture.cjs").workspace({window,prompt:()=>answers.shift(),confirm:()=>true,setTimeout:()=>{}}));
- const ui=window.OnlinodAdminAgencyDetailActions;await ui.doRestore("agency-a");await ui.changeMemberRole("member-a","MANAGER");await ui.kickMember("member-a");await ui.deleteCreator("creator-a");
+ const ui=window.NodAdminAgencyDetailActions;await ui.doRestore("agency-a");await ui.changeMemberRole("member-a","MANAGER");await ui.kickMember("member-a");await ui.deleteCreator("creator-a");
  assert.equal(calls[0].body.expectedUpdatedAt,agency.updatedAt);assert.equal(calls[1].body.expectedAccessEpoch,7);assert.equal(calls[2].body.agencyId,"agency-a");assert.equal(calls[3].body.hard,false);assert.equal(calls[3].body.expectedUpdatedAt,agency.creators[0].updatedAt);assert.ok(calls.every(c=>c.body.reason));
  const count=calls.length;await ui.doRestore("agency-a");assert.equal(calls.length,count);
 });

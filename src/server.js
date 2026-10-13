@@ -153,8 +153,8 @@ app.get("/health", async (_req, res) => {
     return res.json({
       ok: true,
       status: "healthy",
-      service: "onlinod-backend",
-      version: "onlinod_current_v1",
+      service: "nod-backend",
+      version: "nod_current_v1",
       database: "ok",
       time: new Date().toISOString(),
     });
@@ -163,8 +163,8 @@ app.get("/health", async (_req, res) => {
     return res.status(503).json({
       ok: false,
       status: "unhealthy",
-      service: "onlinod-backend",
-      version: "onlinod_current_v1",
+      service: "nod-backend",
+      version: "nod_current_v1",
       database: "error",
       time: new Date().toISOString(),
     });
@@ -177,7 +177,7 @@ app.get("/ready", async (_req, res) => {
     const schema = await readDatabaseContract(prisma);
     return res.status(schema.ready ? 200 : 503).json({
       ok: schema.ready, status: schema.ready ? "ready" : "not_ready",
-      service: "onlinod-backend", version: schema.version, database: "ok", schema,
+      service: "nod-backend", version: schema.version, database: "ok", schema,
       time: new Date().toISOString(),
     });
   } catch (err) {
@@ -185,8 +185,8 @@ app.get("/ready", async (_req, res) => {
     return res.status(503).json({
       ok: false,
       status: "not_ready",
-      service: "onlinod-backend",
-      version: "onlinod_current_v1",
+      service: "nod-backend",
+      version: "nod_current_v1",
       database: "error",
       schema: { ready: false },
       time: new Date().toISOString(),
@@ -195,7 +195,7 @@ app.get("/ready", async (_req, res) => {
 });
 
 app.get("/health/details", async (_req, res) => {
-  if (process.env.ONLINOD_EXPOSE_HEALTH_DETAILS !== "1") {
+  if ((process.env.NOD_EXPOSE_HEALTH_DETAILS ?? process.env.ONLINOD_EXPOSE_HEALTH_DETAILS) !== "1") {
     return res.status(404).json({ ok: false, code: "NOT_FOUND" });
   }
   try {
@@ -217,8 +217,8 @@ app.get("/health/details", async (_req, res) => {
 app.get("/api", (_req, res) => {
   res.json({
     ok: true,
-    service: "onlinod-backend",
-    version: "onlinod_current_v1",
+    service: "nod-backend",
+    version: "nod_current_v1",
   });
 });
 

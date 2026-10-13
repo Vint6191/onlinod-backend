@@ -1,5 +1,5 @@
 {
-  "version": "onlinod_current_v1",
+  "version": "nod_current_v1",
   "migration": "20261009000000_current_baseline",
   "checksum": "f33525574c1a47b19ef8e46bbea46b5065f51df486a57f7cdec00b21dec900e9",
   "columns": [

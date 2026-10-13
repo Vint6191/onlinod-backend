@@ -2,7 +2,7 @@
 const router = require("express").Router();
 const multer = require("multer");
 const { z } = require("zod");
-const { sendMail } = require("../services/email-service");
+const { sendMail, getFrom } = require("../services/email-service");
 const { websiteConfig } = require("../services/website-config-service");
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 3, fields: 9, fieldSize: 10_000 } }).array("files", 3);
 const inputSchema = z.object({ requestId: z.string().uuid(), name: z.string().trim().max(80).optional(),
@@ -25,7 +25,7 @@ router.post("/", (req, res) => {
     if (error) return res.status(400).json({ ok: false, code: "SUPPORT_FILE_LIMIT", error: "Up to three files, 5 MB each" });
     try {
       const input = inputSchema.parse(req.body);
-      const payload = { from: process.env.EMAIL_FROM || "NOD <onboarding@resend.dev>", to: process.env.SUPPORT_EMAIL,
+      const payload = { from: getFrom(), to: process.env.SUPPORT_EMAIL,
         reply_to: input.email, subject: `NOD support · ${input.topic} · ${input.requestId}`,
         text: [`Request: ${input.requestId}`, `From: ${input.name || "—"} <${input.email}>`, `Topic: ${input.topic}`,
           `System: ${input.os || "—"}`, `Version: ${input.version || "—"}`, "", input.message].join("\n"),

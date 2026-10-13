@@ -1,7 +1,7 @@
 (function () {
   "use strict";
-  const API = () => window.OnlinodAdminApi;
-  const esc = value => window.OnlinodAdminRouter.escapeHtml(value);
+  const API = () => window.NodAdminApi;
+  const esc = value => window.NodAdminRouter.escapeHtml(value);
   const path = "/api/admin/billing/commercial-policy";
   const fields = [["trialDays", "Trial duration, days"], ["starterPriceCents", "Starter, USD / month"],
     ["growthPriceCents", "Growth, USD / month"], ["proPriceCents", "Pro, USD / month"],
@@ -9,7 +9,7 @@
     ["outreachPriceCents", "Outreach, USD / month"]];
   let generation = 0, activeRoot = null;
   function invalidate() { generation++; if (activeRoot) activeRoot.innerHTML = ""; activeRoot = null; }
-  window.addEventListener("onlinod:admin-session-changed", invalidate);
+  window.addEventListener("nod:admin-session-changed", invalidate);
   window.addEventListener("storage", event => { if (event.key === "onlinod_admin_token") invalidate(); });
   function parseDraft(root, revision) {
     const settings = {};
@@ -55,7 +55,7 @@
         <p id="blPolicyStatus" role="status"></p>
       </form>`;
       const status = root.querySelector("#blPolicyStatus"), form = root.querySelector("#blPolicyForm");
-      window.OnlinodAdminWorkspace?.superOnly(form, 'input, button[type="submit"]');
+      window.NodAdminWorkspace?.superOnly(form, 'input, button[type="submit"]');
       let pending = saved, busy = false;
       const lock = value => form.querySelectorAll("input").forEach(input => { input.disabled = value; });
       const remember = value => { pending = value; try { if (value) sessionStorage.setItem(key, JSON.stringify(value)); else sessionStorage.removeItem(key); } catch (_) {} };
@@ -88,5 +88,5 @@
       root.querySelector("#blPolicyRetry")?.addEventListener("click", () => render(root));
     }
   }
-  window.OnlinodAdminCommercialPolicy = { render };
+  window.NodAdminCommercialPolicy = { render };
 })();

@@ -54,14 +54,14 @@
   function pushSection(section) {
     const path = section === "dashboard" ? "/admin" : `/admin/${section}`;
     history.pushState({}, "", path);
-    window.OnlinodAdminStateApi.setSection(section, null);
+    window.NodAdminStateApi.setSection(section, null);
     render();
   }
 
   // Open agency detail by id.
   function pushAgencyDetail(agencyId) {
     history.pushState({}, "", `/admin/agencies/${encodeURIComponent(agencyId)}`);
-    window.OnlinodAdminStateApi.setSection("agency-detail", agencyId);
+    window.NodAdminStateApi.setSection("agency-detail", agencyId);
     render();
   }
 
@@ -69,7 +69,7 @@
   function pushDetail(section, id) {
     if (!id) return pushSection(section);
     history.pushState({}, "", `/admin/${section}/${encodeURIComponent(id)}`);
-    window.OnlinodAdminStateApi.setSection(`${section}-detail`, id);
+    window.NodAdminStateApi.setSection(`${section}-detail`, id);
     render();
   }
 
@@ -97,44 +97,44 @@
   function render() {
     const r = root();
     if (!r) return;
-    window.OnlinodAdminWorkspace.leave();
+    window.NodAdminWorkspace.leave();
 
     if (location.pathname.startsWith("/admin-login")) {
-      if (window.OnlinodAdminApi.getToken()) {
+      if (window.NodAdminApi.getToken()) {
         history.replaceState({}, "", "/admin");
         return render();
       }
-      window.OnlinodAdminLoginPage.render(r);
+      window.NodAdminLoginPage.render(r);
       return;
     }
 
-    if (!window.OnlinodAdminApi.getToken()) {
+    if (!window.NodAdminApi.getToken()) {
       history.replaceState({}, "", "/admin-login");
-      window.OnlinodAdminLoginPage.render(r);
+      window.NodAdminLoginPage.render(r);
       return;
     }
 
-    if (!window.OnlinodAdminState.admin) {
-      const error = window.OnlinodAdminState.authError;
-      if (error) window.OnlinodAdminWorkspace.failure(r, error, () => window.OnlinodAdminSession.revalidate());
+    if (!window.NodAdminState.admin) {
+      const error = window.NodAdminState.authError;
+      if (error) window.NodAdminWorkspace.failure(r, error, () => window.NodAdminSession.revalidate());
       else r.innerHTML = '<div class="adm-loading">Checking admin session…</div>';
       return;
     }
 
     const [section, param] = parsePath();
     if (section) {
-      const state = window.OnlinodAdminState;
+      const state = window.NodAdminState;
       if (state.section !== section || state.sectionParam !== param) {
-        window.OnlinodAdminStateApi.setSection(section, param);
+        window.NodAdminStateApi.setSection(section, param);
       }
     }
 
-    window.OnlinodAdminShell.render(r);
+    window.NodAdminShell.render(r);
   }
 
   window.addEventListener("popstate", render);
 
-  window.OnlinodAdminRouter = {
+  window.NodAdminRouter = {
     render,
     escapeHtml, escapeAttr,
     toast,

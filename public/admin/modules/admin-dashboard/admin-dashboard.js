@@ -14,12 +14,12 @@
 
 (function () {
   "use strict";
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
 
-  const State = () => window.OnlinodAdminState;
-  const A     = () => window.OnlinodAdminApi;
-  const R     = () => window.OnlinodAdminRouter;
-  const U     = () => window.OnlinodAdminUtils;
+  const State = () => window.NodAdminState;
+  const A     = () => window.NodAdminApi;
+  const R     = () => window.NodAdminRouter;
+  const U     = () => window.NodAdminUtils;
 
   function ensureSlice() {
     const s = State();
@@ -243,5 +243,5 @@
     });
   }
 
-  window.OnlinodAdminDashboard = { render };
+  window.NodAdminDashboard = { render };
 })();

@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  window.OnlinodCreatorAnalyticsConstants = {
+  window.NodCreatorAnalyticsConstants = {
     DEFAULT_TAB: "issues",
     DEFAULT_RANGE: "7d",
     TABS: {

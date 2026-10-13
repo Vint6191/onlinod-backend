@@ -6,11 +6,11 @@
 
 (function () {
   "use strict";
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
 
-  const A = () => window.OnlinodAdminApi;
-  const R = () => window.OnlinodAdminRouter;
-  const U = () => window.OnlinodAdminUtils;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
 
   const state = W().local(() => ({
     loading: false,
@@ -45,7 +45,7 @@
       retentionResult:null, retentionError:null, retentionCommand:null, retentionPolling:false });
     rerender();
   }
-  window.addEventListener("onlinod:admin-session-changed", clearRetentionSession);
+  window.addEventListener("nod:admin-session-changed", clearRetentionSession);
   window.addEventListener("storage", event => { if (event.key === "onlinod_admin_token") clearRetentionSession(); });
   function currentRetentionRead(generation, token) { return generation === retentionGeneration && token === A().getToken(); }
   async function refreshRetentionCommand() {
@@ -108,7 +108,7 @@
   function rerender() { W().paint("system", render); }
 
   function State_section() {
-    return window.OnlinodAdminState?.section;
+    return window.NodAdminState?.section;
   }
 
   function startPolling() {
@@ -378,5 +378,5 @@
     `;
   }
 
-  window.OnlinodAdminSystem = { render };
+  window.NodAdminSystem = { render };
 })();

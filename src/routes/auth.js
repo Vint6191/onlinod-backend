@@ -314,7 +314,7 @@ router.post("/register", async (req, res) => {
       // policy row lock using DB time; invitations never create another trial.
       const agency = await tx.agency.create({
         data: {
-          name: input.agencyName || "Onlinod Agency",
+          name: input.agencyName || "NOD Agency",
         },
       });
 

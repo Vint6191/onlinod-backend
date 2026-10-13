@@ -6,14 +6,14 @@ const input = { path: "/api/admin/billing/creator/c", method: "PATCH", body: { r
 const defer = () => { let resolve; return { promise: new Promise(r => { resolve = r; }), resolve: value => resolve(value) }; };
 function browser(fetch) {
   const storage = new Map(), tokens = new Map([["onlinod_admin_token", "first-token"]]); let renders = 0;
-  const window = { OnlinodAdminState: { lastDebug: { preserved: true } }, OnlinodAdminRouter: { render: () => { renders++; } }, dispatchEvent() {}, CustomEvent: class {} };
+  const window = { NodAdminState: { lastDebug: { preserved: true } }, NodAdminRouter: { render: () => { renders++; } }, dispatchEvent() {}, CustomEvent: class {} };
   const sandbox = { window, crypto: webcrypto, TextEncoder, URLSearchParams, Date, fetch,
     sessionStorage: { getItem: k => storage.get(k), setItem: (k,v) => storage.set(k,v), removeItem: k => storage.delete(k) },
     localStorage: { getItem: k => tokens.get(k), setItem: (k,v) => tokens.set(k,v), removeItem: k => tokens.delete(k) },
     location: { pathname: "/admin" }, history: { pushState() {} },
   };
   for (const file of ["admin-command-client.js", "admin-api.js"]) vm.runInNewContext(fs.readFileSync(path.join(files, file), "utf8"), sandbox);
-  return { window, commands: window.OnlinodAdminCommands, api: window.OnlinodAdminApi, renders: () => renders };
+  return { window, commands: window.NodAdminCommands, api: window.NodAdminApi, renders: () => renders };
 }
 function response(status, body) { return { status, ok: status < 400, headers: { get: () => "application/json" }, json: async () => body }; }
 
@@ -25,7 +25,7 @@ for (const status of [200, 401, 403]) test(`late ${status} from an old login can
   const result = await request;
   assert.equal(result.code, "ADMIN_SESSION_CHANGED"); assert.equal(result.customerData, undefined);
   assert.equal(b.api.getToken(), "new-token"); assert.equal(b.renders(), 0);
-  assert.equal(b.window.OnlinodAdminState.lastDebug.preserved, true);
+  assert.equal(b.window.NodAdminState.lastDebug.preserved, true);
 });
 
 test("changing session during preparation prevents an old-session send", async () => {

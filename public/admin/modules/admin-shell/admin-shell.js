@@ -13,11 +13,11 @@
 (function () {
   "use strict";
 
-  const State = () => window.OnlinodAdminState;
-  const R     = () => window.OnlinodAdminRouter;
-  const Sess  = () => window.OnlinodAdminSession;
-  const A     = () => window.OnlinodAdminApi;
-  const W     = () => window.OnlinodAdminWorkspace;
+  const State = () => window.NodAdminState;
+  const R     = () => window.NodAdminRouter;
+  const Sess  = () => window.NodAdminSession;
+  const A     = () => window.NodAdminApi;
+  const W     = () => window.NodAdminWorkspace;
 
   // section key → { label, icon, page module accessor }
   // Pages that don't exist yet show a "TODO" placeholder.
@@ -54,7 +54,7 @@
     // Render the active page into #admMain. Done in a microtask so
     // the shell appears immediately and pages don't block paint.
     const current = W().capture(root.querySelector("#admMain"));
-    Promise.resolve().then(() => { if (current()) { renderActivePage(root); void window.OnlinodAdminCommandRecovery.render(); } });
+    Promise.resolve().then(() => { if (current()) { renderActivePage(root); void window.NodAdminCommandRecovery.render(); } });
   }
 
   function renderTopbar(state) {
@@ -65,8 +65,8 @@
     return `
       <header class="adm-topbar">
         <div class="adm-topbar-brand">
-          <div class="adm-topbar-brand-mark">O</div>
-          <span>Onlinod Admin</span>
+          <div class="adm-topbar-brand-mark">N</div>
+          <span>NOD Admin</span>
           <span class="adm-topbar-brand-sub">v0.7.1</span>
         </div>
 
@@ -146,7 +146,7 @@
     const input = root.querySelector("#admGlobalSearch");
     const box   = root.querySelector("#admSearchResults");
     if (!input || !box) return;
-    const A = () => window.OnlinodAdminApi;
+    const A = () => window.NodAdminApi;
     let generation = 0;
     const current = W().capture(input);
     const close = () => { generation++; box.classList.remove("active"); box.innerHTML = ""; };
@@ -166,7 +166,7 @@
   }
 
   function renderSearchResults(box, results) {
-    const R = () => window.OnlinodAdminRouter;
+    const R = () => window.NodAdminRouter;
     const esc = R().escapeHtml;
     const groups = [];
     const grp = (title, rows, mapFn) => {
@@ -209,58 +209,58 @@
     const section = State().section || "dashboard";
 
     if (section === "dashboard") {
-      window.OnlinodAdminDashboard.render(main);
+      window.NodAdminDashboard.render(main);
       return;
     }
     if (section === "agencies") {
-      window.OnlinodAdminAgencies.render(main);
+      window.NodAdminAgencies.render(main);
       return;
     }
     if (section === "agency-detail") {
-      window.OnlinodAdminAgencyDetail.render(main);
+      window.NodAdminAgencyDetail.render(main);
       return;
     }
     if (section === "users") {
-      window.OnlinodAdminUsers.render(main);
+      window.NodAdminUsers.render(main);
       return;
     }
     if (section === "creators") {
-      window.OnlinodAdminCreators.render(main);
+      window.NodAdminCreators.render(main);
       return;
     }
     if (section === "data") {
-      window.OnlinodAdminData.render(main);
+      window.NodAdminData.render(main);
       return;
     }
     if (section === "billing" || section === "billing-detail") {
-      window.OnlinodAdminBilling.render(main);
+      window.NodAdminBilling.render(main);
       return;
     }
     if (section === "creator-detail" || section === "creators-detail") {
-      window.OnlinodAdminCreatorDetail.render(main);
+      window.NodAdminCreatorDetail.render(main);
       return;
     }
     if (section === "devices") {
-      window.OnlinodAdminDevices.render(main);
+      window.NodAdminDevices.render(main);
       return;
     }
     if (section === "audit") {
-      window.OnlinodAdminAudit.render(main);
+      window.NodAdminAudit.render(main);
       return;
     }
     if (section === "admins") {
-      window.OnlinodAdminAdmins.render(main);
+      window.NodAdminAdmins.render(main);
       return;
     }
     if (section === "system") {
-      window.OnlinodAdminSystem.render(main);
+      window.NodAdminSystem.render(main);
       return;
     }
 
     // Unknown section — fall back to dashboard.
-    window.OnlinodAdminStateApi.setSection("dashboard", null);
-    window.OnlinodAdminDashboard.render(main);
+    window.NodAdminStateApi.setSection("dashboard", null);
+    window.NodAdminDashboard.render(main);
   }
 
-  window.OnlinodAdminShell = { render };
+  window.NodAdminShell = { render };
 })();

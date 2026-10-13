@@ -30,6 +30,6 @@ test("A25 fixture lifecycle derives coverage from current Phase2 authority and t
   const creatorDelete = fixture.indexOf("tx.creatorAccount.deleteMany");
   const agencyDelete = fixture.indexOf("tx.agency.deleteMany");
   assert.ok(creatorDelete >= 0 && agencyDelete > creatorDelete, "fixture teardown must delete Creators before Agency");
-  assert.match(fixture, /onlinod\.phase2_destructive_agency_id/);
+  assert.match(fixture, /nod\.phase2_destructive_agency_id/);
   assert.match(fixture, /creatorAccount\.deleteMany/);
 });

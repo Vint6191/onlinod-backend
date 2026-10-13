@@ -7,7 +7,7 @@ const runtimeLoad=createRequire(path.resolve(runtimePath,'package.json'));
 const {PGlite}=runtimeLoad('@electric-sql/pglite');
 const {PGLiteSocketServer}=runtimeLoad('@electric-sql/pglite-socket');
 const root=path.resolve(__dirname,'../..'),load=createRequire(path.join(root,'package.json'));
-const w=process.env.ONLINOD_SQL_PROOF_OUTPUT?path.resolve(process.env.ONLINOD_SQL_PROOF_OUTPUT):fs.mkdtempSync(path.join(require('node:os').tmpdir(),'onlinod-current-proof-'));
+const w=process.env.ONLINOD_SQL_PROOF_OUTPUT?path.resolve(process.env.ONLINOD_SQL_PROOF_OUTPUT):fs.mkdtempSync(path.join(require('node:os').tmpdir(),'nod-current-proof-'));
 fs.mkdirSync(path.join(w,'evidence'),{recursive:true});
 const report={ok:false,nativePostgres:false,engine:'PGlite PostgreSQL 18.3 + real Prisma 5.22',externalProviders:false,cases:[]};
 async function run(name,fn){await fn();report.cases.push({name,ok:true});console.log('PASS',name);}
@@ -23,7 +23,7 @@ function cli(url,label){return new Promise((resolve,reject)=>{
  server.addEventListener('connection',()=>{engine.exec('DISCARD ALL').catch(e=>console.error('session reset:',e.message));});
  await server.start();
  const url=`postgresql://postgres:postgres@${server.getServerConn()}/postgres?connection_limit=1&sslmode=disable`;
- process.env.DATABASE_URL=url;process.env.JWT_SECRET='onlinod-isolated-proof-only-not-a-real-secret';
+ process.env.DATABASE_URL=url;process.env.JWT_SECRET='nod-isolated-proof-only-not-a-real-secret';
  await run('actual installer accepts an empty database',()=>cli(url,'clean-install-first'));
  await run('actual installer repeats without reapplying DDL',()=>cli(url,'clean-install-repeat'));
  db=load('./src/prisma');

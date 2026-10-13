@@ -1,6 +1,6 @@
 /* public/admin/modules/admin-admins/admin-admins.js
    ────────────────────────────────────────────────────────────
-   Manage Onlinod admin users (us — not customer users).
+   Manage NOD admin users (us — not customer users).
    
    Backend enforces SUPER_ADMIN on create/update/reset endpoints,
    so SUPPORT-role admins see the buttons but get a 403 toast if
@@ -13,12 +13,12 @@
 
 (function () {
   "use strict";
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
 
-  const A = () => window.OnlinodAdminApi;
-  const R = () => window.OnlinodAdminRouter;
-  const U = () => window.OnlinodAdminUtils;
-  const State = () => window.OnlinodAdminState;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
+  const State = () => window.NodAdminState;
 
   const state = W().local(() => ({
     loading: false,
@@ -328,5 +328,5 @@
     }));
   }
 
-  window.OnlinodAdminAdmins = { render };
+  window.NodAdminAdmins = { render };
 })();

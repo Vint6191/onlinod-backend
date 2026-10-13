@@ -3855,7 +3855,7 @@ model ModuleSetting {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ONLINOD AUTOMATION SERVER CORE v1
+// NOD AUTOMATION SERVER CORE v1
 // Server-side source of truth for automation tasks/jobs/events. Electron remains
 // the OF worker and local cache fallback. No raw OF payload is stored here.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4115,7 +4115,7 @@ model MediaLibraryScanItem {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ONLINOD SERVER STORES v1
+// NOD SERVER STORES v1
 // Server is the source of truth for content, CRM, lists, campaign drafts,
 // automation state, and vault sales/intel metadata. Electron keeps only
 // session/cookies/runtime cache and executes OF requests.

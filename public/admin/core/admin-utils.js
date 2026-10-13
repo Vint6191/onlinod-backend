@@ -7,7 +7,7 @@
 (function () {
   "use strict";
 
-  const R = () => window.OnlinodAdminRouter;
+  const R = () => window.NodAdminRouter;
 
   function formatMoneyFromCents(cents) {
     const n = Number(cents || 0);
@@ -97,7 +97,7 @@
     `;
   }
 
-  window.OnlinodAdminUtils = {
+  window.NodAdminUtils = {
     formatMoneyFromCents,
     formatNumber,
     formatDate,

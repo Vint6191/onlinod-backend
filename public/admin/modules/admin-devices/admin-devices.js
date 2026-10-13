@@ -17,12 +17,12 @@
 
 (function () {
   "use strict";
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
 
-  const State = () => window.OnlinodAdminState;
-  const A     = () => window.OnlinodAdminApi;
-  const R     = () => window.OnlinodAdminRouter;
-  const U     = () => window.OnlinodAdminUtils;
+  const State = () => window.NodAdminState;
+  const A     = () => window.NodAdminApi;
+  const R     = () => window.NodAdminRouter;
+  const U     = () => window.NodAdminUtils;
 
   const ONLINE_WINDOW_MS = 5 * 60 * 1000;
   const STALE_WINDOW_MS  = 24 * 60 * 60 * 1000;
@@ -220,5 +220,5 @@
     });
   }
 
-  window.OnlinodAdminDevices = { render };
+  window.NodAdminDevices = { render };
 })();

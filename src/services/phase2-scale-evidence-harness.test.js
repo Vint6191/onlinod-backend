@@ -11,8 +11,8 @@ const executable = harness.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
 
 test("Phase2 scale evidence harness is explicit opt-in and targets one Agency", () => {
-  assert.match(harness, /ONLINOD_PHASE2_SCALE_BENCHMARK=1_REQUIRED/);
-  assert.match(harness, /ONLINOD_PHASE2_SCALE_AGENCY_ID/);
+  assert.match(harness, /NOD_PHASE2_SCALE_BENCHMARK=1_REQUIRED/);
+  assert.match(harness, /NOD_PHASE2_SCALE_AGENCY_ID/);
   assert.match(harness, /agency\.findUnique/);
   assert.equal(pkg.scripts?.["audit:phase2-scale"], "node scripts/audit/phase2-scale-readonly.js");
 });
@@ -33,7 +33,7 @@ test("Phase2 scale evidence measures all-range money OFF and ON with bounded car
 });
 
 test("Phase2 EXPLAIN ANALYZE is separately opt-in and mirrors bounded response/dialog detail", () => {
-  assert.match(harness, /ONLINOD_PHASE2_SCALE_EXPLAIN/);
+  assert.match(harness, /NOD_PHASE2_SCALE_EXPLAIN/);
   assert.match(harness, /EXPLAIN \(ANALYZE, BUFFERS, FORMAT JSON\)/);
   assert.match(harness, /responses_retained_detail_grouped_by_member/);
   assert.match(harness, /dialogs_retained_detail_top10_by_member/);
@@ -41,7 +41,7 @@ test("Phase2 EXPLAIN ANALYZE is separately opt-in and mirrors bounded response/d
 });
 
 test("Phase2 large-data qualification is evidence-only and cannot fabricate fixtures", () => {
-  assert.match(harness, /ONLINOD_PHASE2_SCALE_REQUIRE_LARGE/);
+  assert.match(harness, /NOD_PHASE2_SCALE_REQUIRE_LARGE/);
   assert.match(harness, /members>=100/);
   assert.match(harness, /creatorsTouched>=500/);
   assert.match(harness, /moneyFacts>=1000000/);

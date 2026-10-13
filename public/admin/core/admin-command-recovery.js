@@ -1,11 +1,11 @@
 (function () {
   "use strict";
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
   async function render() {
     const root = document.getElementById("admCommandRecovery");
-    if (!root || !window.OnlinodAdminState.admin) return;
+    if (!root || !window.NodAdminState.admin) return;
     const current = W().request(root);
-    const pending = await window.OnlinodAdminCommands.pending(window.OnlinodAdminApi.getToken());
+    const pending = await window.NodAdminCommands.pending(window.NodAdminApi.getToken());
     if (!current()) return;
     root.replaceChildren();
     if (!pending.length) return;
@@ -27,7 +27,7 @@
         button.disabled = true;
         const stillHere = W().capture(root);
         try {
-          const result = await window.OnlinodAdminApi.resolveCommand(item.path, item.method);
+          const result = await window.NodAdminApi.resolveCommand(item.path, item.method);
           if (!stillHere()) return;
           if (result.pending) {
             text.textContent =
@@ -55,9 +55,9 @@
   }
   // Settlement while checking must leave its confirmation visible. New requests
   // repaint the panel; ordinary replies only remove it when the shell reopens.
-  window.addEventListener("onlinod:admin-commands-changed", () => {
+  window.addEventListener("nod:admin-commands-changed", () => {
     const root = document.getElementById("admCommandRecovery");
     if (!root?.querySelector("button:disabled")) void render();
   });
-  window.OnlinodAdminCommandRecovery = { render };
+  window.NodAdminCommandRecovery = { render };
 })();

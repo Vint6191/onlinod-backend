@@ -29,8 +29,8 @@ test("request observability preserves an incoming desktop trace and emits one te
     method: "POST",
     path: "/api/desktop/bootstrap",
     headers: {
-      "x-onlinod-trace-id": "execution-12345678",
-      "x-onlinod-startup-trace-id": "startup-12345678",
+      "x-nod-trace-id": "execution-12345678",
+      "x-nod-startup-trace-id": "startup-12345678",
     },
   };
   const res = new EventEmitter();
@@ -43,7 +43,7 @@ test("request observability preserves an incoming desktop trace and emits one te
   assert.equal(nextCalled, true);
   assert.equal(req.traceId, "execution-12345678");
   assert.equal(req.startupTraceId, "startup-12345678");
-  assert.equal(res.headers["x-onlinod-trace-id"], "execution-12345678");
+  assert.equal(res.headers["x-nod-trace-id"], "execution-12345678");
 
   res.emit("finish");
   res.emit("close");

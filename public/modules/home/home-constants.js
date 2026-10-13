@@ -1,7 +1,7 @@
 (function () {
   "use strict";
 
-  window.OnlinodHomeConstants = {
+  window.NodHomeConstants = {
     MODULE_NAME: "home",
   };
 })();

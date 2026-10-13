@@ -12,9 +12,9 @@ test("served Web UI has zero legacy creator-connect or dev-import enrollment aut
   const home = read("public/pages/home.js");
   assert.doesNotMatch(home, /\/api\/creator-connect/);
   assert.doesNotMatch(home, /\/api\/dev-migration\/import-local/);
-  assert.doesNotMatch(home, /onlinod:\/\/connect|onlinod:\/\/migrate-local/);
-  assert.match(home, /Creator enrollment is owned by ONLINOD Desktop/);
-  assert.match(home, /Open ONLINOD Desktop/);
+  assert.doesNotMatch(home, /nod:\/\/connect|nod:\/\/migrate-local/);
+  assert.match(home, /Creator enrollment is owned by NOD Desktop/);
+  assert.match(home, /Open NOD Desktop/);
 });
 
 test("legacy enrollment generation is physically absent from the production tree", () => {

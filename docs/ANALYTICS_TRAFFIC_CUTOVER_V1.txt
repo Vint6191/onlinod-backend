@@ -1,5 +1,5 @@
 ANALYTICS / TRAFFIC AUTHORITY CONSOLIDATION V1
-Base: Actual102 / ONLINOD_PHASE7_ARCHIVE_DEFAULTS_FIX_V5. 2026-10-01.
+Base: Actual102 / NOD_PHASE7_ARCHIVE_DEFAULTS_FIX_V5. 2026-10-01.
 
 Deployment scope
 Apply matching Backend and Desktop sources. Existing Node requirements remain unchanged.
@@ -59,7 +59,7 @@ Portable SQL proofs: scripts/audit/analytics-traffic/{publication,traffic,deploy
 Generate the matching Prisma client first. Set ONLINOD_SQL_PROOF_RUNTIME to a local
 installation containing @electric-sql/pglite and @electric-sql/pglite-socket. Proofs
 create a disposable loopback database; they do not use an external DATABASE_URL.
-An optional ONLINOD_PROOF_BASE_TAR caches the 270 prior migrations for repeated proofs.
+An optional NOD_PROOF_BASE_TAR caches the 270 prior migrations for repeated proofs.
 The migration proof disables Prisma checkpoint telemetry, uses actual Prisma CLI,
 checks repeat installation, all old checksums and exclusion of the destructive contract.
 Its hooks=false is TEST-ONLY: PGlite cannot prove the existing distinct-session

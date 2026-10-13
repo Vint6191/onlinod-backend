@@ -15,10 +15,10 @@ if (!process.env.ONLINOD_DESKTOP_ROOT || !process.env.ONLINOD_SQL_PROOF_RUNTIME)
   throw Error("Set ONLINOD_DESKTOP_ROOT and ONLINOD_SQL_PROOF_RUNTIME to the local source/runtime directories");
 }
 const outputBase =
-  process.env.ONLINOD_SQL_PROOF_OUTPUT || fs.mkdtempSync(path.join(os.tmpdir(), "onlinod-acceptance-report-"));
+  process.env.ONLINOD_SQL_PROOF_OUTPUT || fs.mkdtempSync(path.join(os.tmpdir(), "nod-acceptance-report-"));
 const output = path.resolve(outputBase, "evidence/product-acceptance");
 fs.mkdirSync(output, { recursive: true });
-const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "onlinod-acceptance-private-"));
+const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "nod-acceptance-private-"));
 // Only synthetic credentials enter this private temporary directory; remove it on every exit.
 process.once("exit", () => fs.rmSync(scratch, { recursive: true, force: true }));
 const desktop = path.resolve(process.env.ONLINOD_DESKTOP_ROOT),
@@ -40,7 +40,7 @@ desktopLoad("esbuild").buildSync({
   bundle: true,
   platform: "node",
   format: "cjs",
-  alias: { "@onlinod/shared": path.join(desktop, "packages/shared/src/index.ts") },
+  alias: { "@nod/shared": path.join(desktop, "packages/shared/src/index.ts") },
 });
 const { e2e, ManagementCommandTransport, TeamCommandTransport, normalizeHomeSummary, campaigns } = require(bundle);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));

@@ -18,13 +18,13 @@
 
 (function () {
   "use strict";
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
 
-  const State = () => window.OnlinodAdminState;
-  const StateApi = () => window.OnlinodAdminStateApi;
-  const A     = () => window.OnlinodAdminApi;
-  const R     = () => window.OnlinodAdminRouter;
-  const U     = () => window.OnlinodAdminUtils;
+  const State = () => window.NodAdminState;
+  const StateApi = () => window.NodAdminStateApi;
+  const A     = () => window.NodAdminApi;
+  const R     = () => window.NodAdminRouter;
+  const U     = () => window.NodAdminUtils;
 
   const TABS = [
     { key: "overview",     label: "Overview" },
@@ -259,10 +259,10 @@
         const a = slice.data.agency;
 
         if (action === "refresh") return load(true);
-        if (action === "support") return window.OnlinodAdminAgencyDetailActions.doSupport(a.id);
-        if (action === "soft-delete")  return window.OnlinodAdminAgencyDetailActions.doSoftDelete(a.id);
-        if (action === "hard-delete")  return window.OnlinodAdminAgencyDetailActions.doHardDelete(a.id);
-        if (action === "restore")      return window.OnlinodAdminAgencyDetailActions.doRestore(a.id);
+        if (action === "support") return window.NodAdminAgencyDetailActions.doSupport(a.id);
+        if (action === "soft-delete")  return window.NodAdminAgencyDetailActions.doSoftDelete(a.id);
+        if (action === "hard-delete")  return window.NodAdminAgencyDetailActions.doHardDelete(a.id);
+        if (action === "restore")      return window.NodAdminAgencyDetailActions.doRestore(a.id);
       }));
     });
   }
@@ -314,21 +314,21 @@
   }
 
   function renderTabBody(slice, tab) {
-    if (tab === "overview")     return window.OnlinodAdminAgencyDetailOverview.render(slice);
-    if (tab === "members")      return window.OnlinodAdminAgencyDetailTabs.renderMembers(slice);
-    if (tab === "creators")     return window.OnlinodAdminAgencyDetailTabs.renderCreators(slice);
-    if (tab === "subscription") return window.OnlinodAdminAgencyDetailTabs.renderSubscription(slice);
-    if (tab === "audit")        return window.OnlinodAdminAgencyDetailTabs.renderAudit(slice);
+    if (tab === "overview")     return window.NodAdminAgencyDetailOverview.render(slice);
+    if (tab === "members")      return window.NodAdminAgencyDetailTabs.renderMembers(slice);
+    if (tab === "creators")     return window.NodAdminAgencyDetailTabs.renderCreators(slice);
+    if (tab === "subscription") return window.NodAdminAgencyDetailTabs.renderSubscription(slice);
+    if (tab === "audit")        return window.NodAdminAgencyDetailTabs.renderAudit(slice);
     return `<div class="adm-empty">unknown tab</div>`;
   }
 
   function bindTabBody(main, slice, tab) {
-    if (tab === "overview")     window.OnlinodAdminAgencyDetailOverview.bind?.(main, slice);
-    if (tab === "members")      window.OnlinodAdminAgencyDetailTabs.bindMembers?.(main, slice);
-    if (tab === "creators")     window.OnlinodAdminAgencyDetailTabs.bindCreators?.(main, slice);
-    if (tab === "subscription") window.OnlinodAdminAgencyDetailTabs.bindSubscription?.(main, slice);
-    if (tab === "audit")        window.OnlinodAdminAgencyDetailTabs.bindAudit?.(main, slice);
+    if (tab === "overview")     window.NodAdminAgencyDetailOverview.bind?.(main, slice);
+    if (tab === "members")      window.NodAdminAgencyDetailTabs.bindMembers?.(main, slice);
+    if (tab === "creators")     window.NodAdminAgencyDetailTabs.bindCreators?.(main, slice);
+    if (tab === "subscription") window.NodAdminAgencyDetailTabs.bindSubscription?.(main, slice);
+    if (tab === "audit")        window.NodAdminAgencyDetailTabs.bindAudit?.(main, slice);
   }
 
-  window.OnlinodAdminAgencyDetail = { render, load, rerender };
+  window.NodAdminAgencyDetail = { render, load, rerender };
 })();

@@ -10,11 +10,11 @@
 (function () {
   "use strict";
 
-  const A = () => window.OnlinodAdminApi;
-  const R = () => window.OnlinodAdminRouter;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
   const esc = (v) => R().escapeHtml(v);
   const money = (c) => "$" + (Number(c || 0) / 100).toFixed(2);
-  const W = () => window.OnlinodAdminWorkspace;
+  const W = () => window.NodAdminWorkspace;
 
   const local = W().local(() => ({ view: "overview", agencyId: null, tiers: null, overviewAfter: null, modelsAfter: null }));
 
@@ -27,7 +27,7 @@
   }
 
   async function render(main) {
-    const agencyId = window.OnlinodAdminState.sectionParam;
+    const agencyId = window.NodAdminState.sectionParam;
     if (agencyId !== local.agencyId) local.modelsAfter = null;
     local.agencyId = agencyId;
     if (agencyId) return renderAgency(main, agencyId);
@@ -38,7 +38,7 @@
   async function renderOverview(main) {
     const current = W().request(main);
     main.innerHTML = '<div id="blCommercialPolicy"></div><div id="blOverview"></div>';
-    window.OnlinodAdminCommercialPolicy?.render(main.querySelector("#blCommercialPolicy"));
+    window.NodAdminCommercialPolicy?.render(main.querySelector("#blCommercialPolicy"));
     const overview = main.querySelector("#blOverview");
     overview.innerHTML = `<div class="adm-page"><div class="adm-loading">loading billing…</div></div>`;
     const r = await A().billingOverview(local.overviewAfter);
@@ -194,7 +194,7 @@
       });
       tr.querySelectorAll("input").forEach((inp) => inp.addEventListener("input", () => { recalcLine(tr); recalcTotal(main); }));
       tr.querySelector(".bl-save").addEventListener("click", () => W().action(tr, () => saveLine(main, tr)));
-      tr.querySelector(".bl-access").addEventListener("click", () => window.OnlinodAdminEntitlements.open(r.models.find(model => model.creatorId === tr.dataset.creator), () => renderAgency(main, agencyId)));
+      tr.querySelector(".bl-access").addEventListener("click", () => window.NodAdminEntitlements.open(r.models.find(model => model.creatorId === tr.dataset.creator), () => renderAgency(main, agencyId)));
       tr.querySelector(".bl-check").addEventListener("click", async () => {
         try {
           const result = await A().resolveCommand(`/api/admin/billing/creator/${encodeURIComponent(tr.dataset.creator)}`, "PATCH");
@@ -205,7 +205,7 @@
       });
     });
 
-    const bulkStorageKey = `onlinod_admin_bulk:${window.OnlinodAdminState.admin.id}:${agencyId}`;
+    const bulkStorageKey = `onlinod_admin_bulk:${window.NodAdminState.admin.id}:${agencyId}`;
     let bulkCommandId = null;
     try { bulkCommandId = sessionStorage.getItem(bulkStorageKey); } catch (_) {}
     let submitting = false;
@@ -332,5 +332,5 @@
     }
   }
 
-  window.OnlinodAdminBilling = { render };
+  window.NodAdminBilling = { render };
 })();

@@ -1,5 +1,5 @@
 const { operationHandler, setBillingPolicyHandler, setBillingHoldHandler, setEntitlementHandler, setPricingHandler, createAdminHandler, patchAdminHandler, resetAdminPasswordHandler } = require("./admin-command-handlers");
-/* src/routes/admin.js — Onlinod admin v2
+/* src/routes/admin.js — NOD admin v2
    ────────────────────────────────────────────────────────────
    Full replacement. Backwards-compatible with v1 endpoints
    (frontends using /agencies, /agencies/:id, /creators/:id/...
@@ -926,7 +926,7 @@ router.get("/live-feed", async (req, res) => {
 
 
 // ════════════════════════════════════════════════════════════
-// ADMIN USERS  (manage admins of Onlinod itself)
+// ADMIN USERS  (manage admins of NOD itself)
 // ════════════════════════════════════════════════════════════
 
 router.get("/admin-users", async (_req, res) => {

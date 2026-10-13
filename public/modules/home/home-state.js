@@ -9,7 +9,7 @@
     return state.home;
   }
 
-  window.OnlinodHomeState = {
+  window.NodHomeState = {
     ensureHomeState,
   };
 })();

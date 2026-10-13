@@ -29,7 +29,7 @@ async function verify(db) {
     FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname=current_schema()
       AND p.proname=ANY($1::text[])`,["onlinod_traffic_canonical_capture_v2","onlinod_traffic_receipt_capture_v2"]);
   if (capture.length!==2 || capture.some(r=>!r.body.includes('"onlinod_traffic_publish_fact_v3"')
-    || r.body.includes('"onlinod_traffic_project_') || r.body.includes('"onlinod_traffic_receipt_project_'))) {
+    || r.body.includes('"nod_traffic_project_') || r.body.includes('"nod_traffic_receipt_project_'))) {
     throw new Error("TRAFFIC_PROJECTION_INLINE_WRITER_PRESENT");
   }
   const views = await db.$queryRawUnsafe(`SELECT pg_get_viewdef(c.oid) AS definition FROM pg_class c

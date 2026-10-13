@@ -290,7 +290,7 @@ async function runRefreshSessionRetentionSweep(options = {}) {
   const db = options.db || prisma;
   const cutoff = daysAgo(cfg.refreshSessionRawHistoryDays, authorityNow);
   const batchSize = Math.max(100, Math.min(10_000, Number(cfg.batchSize) || DEFAULT_BATCH_SIZE));
-  const configuredMaxBatches = Number(process.env.ONLINOD_REFRESH_SESSION_RETENTION_MAX_BATCHES) || REFRESH_SESSION_RETENTION_MAX_BATCHES;
+  const configuredMaxBatches = Number((process.env.NOD_REFRESH_SESSION_RETENTION_MAX_BATCHES ?? process.env.ONLINOD_REFRESH_SESSION_RETENTION_MAX_BATCHES)) || REFRESH_SESSION_RETENTION_MAX_BATCHES;
   // Scale invariant: even at the minimum configurable retention batch size (100),
   // an hourly PARTIAL catch-up cycle must be able to drain at least 10k raw
   // rotations. This prevents an operator override from silently reducing the

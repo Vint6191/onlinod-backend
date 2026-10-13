@@ -96,9 +96,9 @@ import ${JSON.stringify(path.join(renderer,'features/media-picker/media-picker.t
 import ${JSON.stringify(path.join(renderer,'styles.css'))};import ${JSON.stringify(path.join(renderer,'dialog-media-picker/picker.css'))};
 let root;const client=new QueryClient({defaultOptions:{queries:{retry:false}}});
 export async function rpc(method,payload){const r=await window.actualRpc(method,payload);if(r.error)throw Object.assign(Error(r.error.message),{code:r.error.code});return r.result;}
-export function mount(input){window.onlinod={events:{onDesktopAuthorizationEvent:()=>()=>{},onCreatorRuntimeEvent:()=>()=>{}},rpc:{call:rpc}};acceptRendererAuthorizationProjection(input.projection);root=createRoot(document.getElementById('root'));root.render(<React.StrictMode><QueryClientProvider client={client}><MessageLibraryWorkspace session={input.session} creators={input.creators} activeCreator={input.creators[0]}/></QueryClientProvider></React.StrictMode>);}
-export function picker(){window.onlinodDialogMediaPicker={bootstrap:i=>window.actualPicker('bootstrap',i),loadLists:i=>window.actualPicker('loadLists',i),loadMedia:i=>window.actualPicker('loadMedia',i),searchMedia:i=>window.actualPicker('searchMedia',i),attachDraft:i=>window.actualPicker('attachDraft',i),close:async()=>({ok:true}),setPresentationMode:async i=>({ok:true,mode:i.mode}),moveBy(){},onSessionChanged:()=>()=>{}};root=createRoot(document.getElementById('root'));root.render(<DialogMediaPickerApp/>);}
-export async function scripts(context){window.__ONLINOD_TOOL_SIDECAR_CONTEXT__=context;window.onlinodToolSidecar={applyMessageDraft:message=>window.actualApply(message),copyText:async()=>({ok:true}),setSurfaceState(){}};window.onlinodMessageLibrary={listScripts:i=>rpc('messageLibrary.listScripts',{...i,creatorId:context.creatorId}),recordUsage:i=>rpc('messageLibrary.recordUsage',{...i,creatorId:context.creatorId})};const runtime=new MessageLibrarySidecarRuntime();window.scriptsRuntime=runtime;await runtime.refresh(true);runtime.state.open=true;runtime.render();}
+export function mount(input){window.nod={events:{onDesktopAuthorizationEvent:()=>()=>{},onCreatorRuntimeEvent:()=>()=>{}},rpc:{call:rpc}};acceptRendererAuthorizationProjection(input.projection);root=createRoot(document.getElementById('root'));root.render(<React.StrictMode><QueryClientProvider client={client}><MessageLibraryWorkspace session={input.session} creators={input.creators} activeCreator={input.creators[0]}/></QueryClientProvider></React.StrictMode>);}
+export function picker(){window.nodDialogMediaPicker={bootstrap:i=>window.actualPicker('bootstrap',i),loadLists:i=>window.actualPicker('loadLists',i),loadMedia:i=>window.actualPicker('loadMedia',i),searchMedia:i=>window.actualPicker('searchMedia',i),attachDraft:i=>window.actualPicker('attachDraft',i),close:async()=>({ok:true}),setPresentationMode:async i=>({ok:true,mode:i.mode}),moveBy(){},onSessionChanged:()=>()=>{}};root=createRoot(document.getElementById('root'));root.render(<DialogMediaPickerApp/>);}
+export async function scripts(context){window.__NOD_TOOL_SIDECAR_CONTEXT__=context;window.nodToolSidecar={applyMessageDraft:message=>window.actualApply(message),copyText:async()=>({ok:true}),setSurfaceState(){}};window.nodMessageLibrary={listScripts:i=>rpc('messageLibrary.listScripts',{...i,creatorId:context.creatorId}),recordUsage:i=>rpc('messageLibrary.recordUsage',{...i,creatorId:context.creatorId})};const runtime=new MessageLibrarySidecarRuntime();window.scriptsRuntime=runtime;await runtime.refresh(true);runtime.state.open=true;runtime.render();}
 export function vault(input){root?.unmount();root=createRoot(document.getElementById('root'));root.render(<VaultDashboard creators={input.creators} activeCreator={input.creators[0]}/>);}
 export function unmount(){root?.unmount();client.clear();}`);
   await load('esbuild').build({entryPoints:[entry],outfile:script,bundle:true,platform:'browser',format:'iife',globalName:'ActualMedia',jsx:'automatic',nodePaths:[path.join(desktop,'node_modules')],loader:{'.css':'css','.png':'dataurl','.svg':'dataurl'},define:{'process.env.NODE_ENV':'"development"'}});
@@ -146,7 +146,7 @@ export function unmount(){root?.unmount();client.clear();}`);
     setUnlockedMedia(ids){if(window.failFree)throw Error('controlled native failure');this.unlockedMedia=ids.map(id=>this.mediaIndex[id]);}};
    document.querySelector('.b-chat__message-form').__vueParentComponent={proxy:target};window.nativeComposer=target;
    const runtime=new ActualComposer.DialogMediaPageRuntime({openPicker:async()=>({ok:true})});await runtime.mount();window.nativeRuntime=runtime;
-   window.__ONLINOD_TOOL_SIDECAR_PAGE_BRIDGE__=new ActualComposer.ToolSidecarComposerBridge({});
+   window.__NOD_TOOL_SIDECAR_PAGE_BRIDGE__=new ActualComposer.ToolSidecarComposerBridge({});
   });
   const pageContext={webContentsId:101,tabId:'tab-a',creatorId:c,accountId:c,partition:'persist:fixture',url:composerPage.url()};
   const sidecarContents={id:99,mainFrame:{},isDestroyed:()=>false,send(){},close(){}};
@@ -154,7 +154,7 @@ export function unmount(){root?.unmount();client.clear();}`);
   sidecar=new m.ToolSidecarService({log,getMainWindow:()=>null,browser:{getBounds:()=>null,getForegroundOnlyFansPageContext:()=>pageContext,isWebContentsForeground:()=>true},customOrders:custom,vault,authorization:authority,handlers:handlers()});
   const attachSidecar=()=>{sidecar.view={webContents:sidecarContents,setBounds(){}};sidecar.attached=true;};attachSidecar();
   const apply=async(message)=>{
-   attachSidecar();const response=await m.fixture.handlers.get('onlinod:tool-sidecar:page-action')({sender:sidecarContents,senderFrame:sidecarContents.mainFrame},
+   attachSidecar();const response=await m.fixture.handlers.get('nod:tool-sidecar:page-action')({sender:sidecarContents,senderFrame:sidecarContents.mainFrame},
     {id:'library-apply-'+require('node:crypto').randomUUID(),action:'applyMessageDraft',input:{message},scope:sidecar.publicContext(pageContext)});
    if(!response.ok)throw Object.assign(Error(response.error.message),{code:response.error.code});return response.result;
   };
@@ -201,7 +201,7 @@ export function unmount(){root?.unmount();client.clear();}`);
     const ids=[...input.draft.freeMediaIds,...input.draft.paidMediaIds];const resolved=data.resolveComposerMedia(pickerContext,ids);assert.deepEqual(resolved.missingIds,[]);
     const proof=await custom.preflightDialogComposerDraft({creatorId:c,dialogId:pickerContext.dialogId,mediaIds:ids});assert.equal(proof.allow,true);
     const command={requestId:'picker-'+require('node:crypto').randomUUID(),sessionId:pickerContext.sessionId,dialogId:pickerContext.dialogId,freeMediaIds:input.draft.freeMediaIds,paidMediaIds:input.draft.paidMediaIds,priceCents:input.draft.paidPriceCents||0,media:resolved.items.map(item=>({mediaId:item.id,mediaType:item.type,fullUrl:item.fullUrl,previewUrl:item.previewUrl,thumbUrl:item.thumbUrl,createdAt:item.createdAt}))};
-    const result=await composerPage.evaluate(command=>window.__ONLINOD_DIALOG_MEDIA_COMPOSER_APPLY__(command),command);results.pickerApply=result;
+    const result=await composerPage.evaluate(command=>window.__NOD_DIALOG_MEDIA_COMPOSER_APPLY__(command),command);results.pickerApply=result;
     return{...result,attachedCount:ids.length,freeCount:command.freeMediaIds.length,paidCount:command.paidMediaIds.length,priceCents:command.priceCents};
    }
    assert.ok(['loadLists','loadMedia','searchMedia'].includes(method));return data[method](pickerContext,input);

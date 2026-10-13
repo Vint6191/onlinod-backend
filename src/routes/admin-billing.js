@@ -1,5 +1,5 @@
 const { setPricingHandler, bulkPricingHandler, cancelBulkPricingHandler, commercialPolicyHandler } = require("./admin-command-handlers");
-/* src/routes/admin-billing.js — Onlinod billing management
+/* src/routes/admin-billing.js — NOD billing management
    ────────────────────────────────────────────────────────────
    Proper money view: subscription is on the AGENCY, but priced
    PER CONNECTED MODEL via CreatorBillingProfile. This surface gives

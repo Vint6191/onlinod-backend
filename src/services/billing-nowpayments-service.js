@@ -197,7 +197,7 @@ function validateProviderPaymentForOrder(order, payload, { requirePrice = false 
   }
   const invoiceId = clean(payload?.invoice_id, 180);
   if (invoiceId && order.providerInvoiceId && invoiceId !== String(order.providerInvoiceId)) {
-    const err = new Error("NOWPayments invoice does not match the ONLINOD billing order");
+    const err = new Error("NOWPayments invoice does not match the NOD billing order");
     err.code = "BILLING_PROVIDER_INVOICE_MISMATCH";
     err.status = 409;
     err.permanent = true;
@@ -212,7 +212,7 @@ function validateProviderPaymentForOrder(order, payload, { requirePrice = false 
     throw err;
   }
   if (currency && currency !== String(order.currency || "USD").toUpperCase()) {
-    const err = new Error("NOWPayments payment currency does not match the ONLINOD billing order");
+    const err = new Error("NOWPayments payment currency does not match the NOD billing order");
     err.code = "BILLING_PROVIDER_CURRENCY_MISMATCH";
     err.status = 409;
     err.permanent = true;
@@ -230,7 +230,7 @@ function validateProviderPaymentForOrder(order, payload, { requirePrice = false 
     const amount = Number(rawAmount);
     const cents = Number.isFinite(amount) ? Math.round((amount + Number.EPSILON) * 100) : NaN;
     if (!Number.isSafeInteger(cents) || cents !== Number(order.amountCents)) {
-      const err = new Error("NOWPayments payment amount does not match the ONLINOD billing order");
+      const err = new Error("NOWPayments payment amount does not match the NOD billing order");
       err.code = "BILLING_PROVIDER_AMOUNT_MISMATCH";
       err.status = 409;
       err.permanent = true;
@@ -463,7 +463,7 @@ function validateHostedCheckoutUrl(value, cfg = providerConfig()) {
   }
   if (cfg.sandbox && !isSandboxHostedCheckoutHost(host)) {
     const err = permanentBindingError(
-      "NOWPayments sandbox did not return its own hosted checkout. ONLINOD will not open a production NOWPayments invoice for a sandbox order.",
+      "NOWPayments sandbox did not return its own hosted checkout. NOD will not open a production NOWPayments invoice for a sandbox order.",
       "BILLING_SANDBOX_HOSTED_CHECKOUT_UNAVAILABLE",
     );
     err.status = 502;
@@ -489,17 +489,17 @@ function checkoutUrlForOrder(order, cfg = providerConfig()) {
 function validateInvoiceResponseForOrder(order, invoice) {
   const providerOrderId = clean(invoice?.order_id, 180);
   if (providerOrderId && providerOrderId !== String(order.id)) {
-    throw permanentBindingError("NOWPayments invoice order_id does not match the ONLINOD billing order", "BILLING_PROVIDER_ORDER_MISMATCH");
+    throw permanentBindingError("NOWPayments invoice order_id does not match the NOD billing order", "BILLING_PROVIDER_ORDER_MISMATCH");
   }
   const currency = clean(invoice?.price_currency, 40).toUpperCase();
   if (currency && currency !== String(order.currency || "USD").toUpperCase()) {
-    throw permanentBindingError("NOWPayments invoice currency does not match the ONLINOD billing order", "BILLING_PROVIDER_CURRENCY_MISMATCH");
+    throw permanentBindingError("NOWPayments invoice currency does not match the NOD billing order", "BILLING_PROVIDER_CURRENCY_MISMATCH");
   }
   if (invoice?.price_amount !== undefined && invoice?.price_amount !== null && invoice?.price_amount !== "") {
     const amount = Number(invoice.price_amount);
     const cents = Number.isFinite(amount) ? Math.round((amount + Number.EPSILON) * 100) : NaN;
     if (!Number.isSafeInteger(cents) || cents !== Number(order.amountCents)) {
-      throw permanentBindingError("NOWPayments invoice amount does not match the ONLINOD billing order", "BILLING_PROVIDER_AMOUNT_MISMATCH");
+      throw permanentBindingError("NOWPayments invoice amount does not match the NOD billing order", "BILLING_PROVIDER_AMOUNT_MISMATCH");
     }
   }
 }
@@ -639,7 +639,7 @@ async function createCheckout({ agencyId, actorUserId, checkoutKey: rawCheckoutK
     price_amount: priceAmount,
     price_currency: "usd",
     order_id: order.id,
-    order_description: `ONLINOD ${snapshot.billingPeriod} · ${snapshot.billedCreators} creator${snapshot.billedCreators === 1 ? "" : "s"}`,
+    order_description: `NOD ${snapshot.billingPeriod} · ${snapshot.billedCreators} creator${snapshot.billedCreators === 1 ? "" : "s"}`,
     ...invoiceUrls(order.id, cfg),
     is_fee_paid_by_user: cfg.feePaidByUser,
   };
@@ -769,7 +769,7 @@ async function createWalletTopUpCheckout({ agencyId, actorUserId, checkoutKey: r
   const priceAmount = Number((amountCents / 100).toFixed(2));
   const body = {
     price_amount: priceAmount, price_currency: "usd", order_id: order.id,
-    order_description: `ONLINOD balance top-up · $${priceAmount.toFixed(2)}`,
+    order_description: `NOD balance top-up · $${priceAmount.toFixed(2)}`,
     ...invoiceUrls(order.id, cfg), is_fee_paid_by_user: cfg.feePaidByUser,
   };
   try {

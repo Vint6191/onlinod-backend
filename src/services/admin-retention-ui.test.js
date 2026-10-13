@@ -1,15 +1,15 @@
 "use strict";
 const test=require("node:test"),assert=require("node:assert/strict"),fs=require("node:fs"),vm=require("node:vm");
-const source=fs.readFileSync(require.resolve("../../public/admin/modules/admin-system/admin-system.js"),"utf8").replace('window.OnlinodAdminSystem = { render };','window.OnlinodAdminSystem = { render, state, loadRetention, saveRetention, resetRetention, runRetentionNow, refreshRetentionCommand, renderRetentionResult };');
+const source=fs.readFileSync(require.resolve("../../public/admin/modules/admin-system/admin-system.js"),"utf8").replace('window.NodAdminSystem = { render };','window.NodAdminSystem = { render, state, loadRetention, saveRetention, resetRetention, runRetentionNow, refreshRetentionCommand, renderRetentionResult };');
 const policy={ok:true,revision:4,policyHash:"a".repeat(64),settings:{batchSize:100},defaults:{batchSize:2000}};
 function browser(overrides={}){
  let token="session-a";const calls=[],listeners={};
  const api={getToken:()=>token,retentionSettings:async()=>structuredClone(policy),saveRetentionSettings:async body=>{calls.push(["set",body]);return {...policy,revision:5,settings:body.settings};},resetRetentionSettings:async body=>{calls.push(["reset",body]);return {...policy,revision:5};},runRetentionSweep:async body=>{calls.push(["run",body]);return {ok:true,accepted:true,commandId:"run-1",status:"QUEUED"};},commandStatus:async()=>({ok:true,commandId:"run-1",status:"PARTIAL",execution:{progress:{report:{totalDeleted:400,remainingWork:true}}}}),...overrides};
  const escape=value=>String(value).replaceAll("<","&lt;").replaceAll(">","&gt;");
- const window={OnlinodAdminApi:api,OnlinodAdminRouter:{escapeHtml:escape,escapeAttr:escape},addEventListener:(name,fn)=>{listeners[name]=fn;}};
+ const window={NodAdminApi:api,NodAdminRouter:{escapeHtml:escape,escapeAttr:escape},addEventListener:(name,fn)=>{listeners[name]=fn;}};
  vm.runInNewContext(source,require("../../scripts/test-support/admin-browser-fixture.cjs").workspace({window,document:{getElementById:()=>null},confirm:()=>true,console,setInterval,clearInterval}));
- const ui=window.OnlinodAdminSystem;
- return {ui,calls,api,setToken:value=>{token=value;listeners['onlinod:admin-session-changed']();}};
+ const ui=window.NodAdminSystem;
+ return {ui,calls,api,setToken:value=>{token=value;listeners['nod:admin-session-changed']();}};
 }
 test("retention UI sends displayed revision/hash and reason for set/reset/run",async()=>{
  const b=browser();await b.ui.loadRetention(true);b.ui.state.retentionReason="Investigate backlog";

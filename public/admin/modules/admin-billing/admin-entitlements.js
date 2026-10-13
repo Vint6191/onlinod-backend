@@ -25,8 +25,8 @@
     return body;
   }
   function open(model, reload) {
-    const W = window.OnlinodAdminWorkspace,
-      R = window.OnlinodAdminRouter,
+    const W = window.NodAdminWorkspace,
+      R = window.NodAdminRouter,
       esc = R.escapeHtml;
     document.querySelectorAll(".adm-modal-overlay").forEach((node) => node.remove());
     const overlay = document.createElement("div");
@@ -54,7 +54,7 @@
         return;
       }
       void W.action(form, async (current) => {
-        const result = await window.OnlinodAdminApi.patchCreatorEntitlement(model.creatorId, body);
+        const result = await window.NodAdminApi.patchCreatorEntitlement(model.creatorId, body);
         if (!current()) return;
         if (!result?.ok) {
           status.textContent = result?.error || "Result unknown. Check the saved command result.";
@@ -67,5 +67,5 @@
     });
     form.querySelector('[name="reason"]').focus();
   }
-  window.OnlinodAdminEntitlements = { open, command, value };
+  window.NodAdminEntitlements = { open, command, value };
 })();

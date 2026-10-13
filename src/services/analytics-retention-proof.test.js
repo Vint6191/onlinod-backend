@@ -144,7 +144,7 @@ test("non-earnings and failed-job retention has deterministic indexed terminal-a
   assert.doesNotMatch(nonEarningsJobBlock, /baselineVerifiedAt|fullBackfillCompletedAt|CreatorFinancialCollectionState|CreatorCampaignCollectionState|CreatorNotificationSyncState/);
   assert.match(nonEarningsJobBlock, /CreatorNotificationScanItem/);
   assert.match(nonEarningsJobBlock, /scan_item\."sourceJobId" = candidate\."id"/);
-  assert.match(source, /analyticsDemandHistoryDays:[\s\S]*ONLINOD_ANALYTICS_DEMAND_HISTORY_DAYS/);
+  assert.match(source, /analyticsDemandHistoryDays:[\s\S]*NOD_ANALYTICS_DEMAND_HISTORY_DAYS/);
   assert.match(source, /analyticsCollectionDemand\.quarantined_/);
 });
 
