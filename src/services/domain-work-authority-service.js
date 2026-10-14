@@ -85,12 +85,8 @@ function bounded(value, fallback = 25, max = MAX_BATCH) {
   const n = Math.floor(Number(value) || fallback);
   return Math.max(1, Math.min(max, n));
 }
-function creatorLifecycleClaimContended(error) {
-  // Prisma wraps the trigger's NOWAIT SQLSTATE in P2010. Other lock errors,
-  // authority rejections and statement timeouts must keep their normal policy.
-  return String(error?.meta?.code || error?.code || "") === "55P03"
-    && /\bPHASE2_CREATOR_LIFECYCLE_BUSY\b/.test(String(error?.meta?.message || error?.message || ""));
-}
+const { isCreatorLifecycleContention: creatorLifecycleClaimContended } = require("./creator-lifecycle-contention");
+
 function asBigInt(value, fallback = 0n) {
   try { return BigInt(value == null ? fallback : value); } catch (_) { return BigInt(fallback); }
 }

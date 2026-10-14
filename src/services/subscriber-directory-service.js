@@ -3,6 +3,7 @@ const { runDbTransaction } = require("./db-transaction-service");
 
 
 const crypto = require("node:crypto");
+const { writeSubscriberPageSnapshot } = require("./subscriber-page-snapshot-service");
 const prisma = require("../prisma");
 const { projectFollowBackProjectionChunk, staleFollowBackProjectionFans, ensureAutomaticFollowBack } = require("./follow-back-service");
 const { projectFollowAutomationProjectionChunk, staleFollowAutomationProjectionFans, ensureAutomaticFollowAutomation } = require("./follow-automation-service");
@@ -706,6 +707,7 @@ async function advanceSubscriberPublication(db, { runId, jobId, scanEveryDays })
       fanProjectionCursorOffset: Number(run.fanProjectionCursorOffset || 0),
       fanProjectionCount: Number(run.fanProjectionCount || 0),
       publicationTopology: "durable_chunked_generation_v2",
+      traversal: object(run.summary).traversal || null,
     };
 
     // Monotonic generation CAS: only the latest allocated generation may move
@@ -844,7 +846,7 @@ async function applySubscriberScanChunk({
     throw error;
   }
   const hasMore = chunk.hasMore === true;
-  if (!Array.isArray(chunk.items)) throw new Error("SUBSCRIBER_SCAN_ITEMS_REQUIRED");
+  if (!Array.isArray(chunk.items)) throw Object.assign(new Error("SUBSCRIBER_SCAN_ITEMS_REQUIRED"), { code: "SUBSCRIBER_SCAN_ITEMS_REQUIRED" });
   if (chunk.items.length > MAX_PAGE_ITEMS) {
     const error = new Error(`Subscriber page exceeds ${MAX_PAGE_ITEMS} items`);
     error.code = "SUBSCRIBER_SCAN_PAGE_TOO_LARGE";
@@ -860,11 +862,8 @@ async function applySubscriberScanChunk({
       throw error;
     }
   }
-  // Fail closed on any ambiguity between transported provider rows and cursor
-  // advance. Frozen Desktop normally emits one compact item per provider row;
-  // if a provider page ever compacts/deduplicates differently, rejecting that
-  // page is safer than granting the client authority to advance an unproved
-  // cursor and publish an incomplete canonical source.
+  // The transport retains one item per provider row, including identical
+  // duplicates. Cursor distance is proved by those rows, never by unique fans.
   const serverDerivedNextOffset = offset + itemsInput.length;
   const nextOffsetSubmitted = chunk.nextOffset !== null && chunk.nextOffset !== undefined && chunk.nextOffset !== "";
   const submittedNextOffset = nextOffsetSubmitted ? integerOrNull(chunk.nextOffset, 0, 10_000_000) : serverDerivedNextOffset;
@@ -906,20 +905,29 @@ async function applySubscriberScanChunk({
     error.code = "SUBSCRIBER_SCAN_STALLED_CURSOR";
     throw error;
   }
-  const normalizedFanIds = itemsInput.map((item) => clean(object(item).fanId ?? object(item).userId ?? object(item).id, 120));
-  if (normalizedFanIds.some((fanId) => !fanId)) throw new Error("SUBSCRIBER_SCAN_FAN_ID_REQUIRED");
-  if (new Set(normalizedFanIds).size !== normalizedFanIds.length) throw new Error("SUBSCRIBER_SCAN_DUPLICATE_FAN_IN_PAGE");
-  if (normalizedFanIds.length && typeof db.subscriberScanItem?.findMany === "function") {
-    const prior = await db.subscriberScanItem.findMany({
-      where: { runId, fanId: { in: normalizedFanIds } },
-      select: { fanId: true, pageOffset: true },
-      take: normalizedFanIds.length,
-    });
-    if ((prior || []).length) {
-      const error = new Error("Subscriber provider repeated a fan on a different committed page");
-      error.code = "SUBSCRIBER_SCAN_DUPLICATE_FAN_ACROSS_PAGES";
-      throw error;
+  const uniqueInputs = new Map();
+  for (const item of itemsInput) {
+    const fanId = clean(object(item).fanId ?? object(item).userId ?? object(item).id, 120);
+    if (!fanId) throw Object.assign(new Error("SUBSCRIBER_SCAN_FAN_ID_REQUIRED"), { code: "SUBSCRIBER_SCAN_FAN_ID_REQUIRED" });
+    // Identical raw duplicates carry cursor distance but only one observation.
+    // Conflicting facts in a single response have no provable chronology.
+    if (uniqueInputs.has(fanId) && hashJson(uniqueInputs.get(fanId)) !== hashJson(item)) {
+      throw Object.assign(new Error("Subscriber page contains conflicting observations for one fan"), { code: "SUBSCRIBER_SCAN_CONFLICTING_FAN_IN_PAGE" });
     }
+    uniqueInputs.set(fanId, item);
+  }
+  const normalizedFanIds = [...uniqueInputs.keys()];
+  const prior = normalizedFanIds.length && typeof db.subscriberScanItem?.findMany === "function"
+    ? await db.subscriberScanItem.findMany({
+        where: { runId, fanId: { in: normalizedFanIds } },
+        select: { fanId: true, lastSeenIsNull: true }, take: normalizedFanIds.length,
+      }) : [];
+  const priorByFan = new Map(prior.map(item => [item.fanId, item]));
+  const previousTraversal = object(object(run.summary).traversal);
+  const noNewPage = hasMore && normalizedFanIds.length > 0 && prior.length === normalizedFanIds.length;
+  const consecutiveNoNewPages = noNewPage ? Number(previousTraversal.consecutiveNoNewPages || 0) + 1 : 0;
+  if (consecutiveNoNewPages > 5) {
+    throw Object.assign(new Error("Subscriber source keeps returning only previously seen fans; publication stopped"), { code: "SUBSCRIBER_SCAN_NON_ADVANCING_SOURCE" });
   }
 
   // INT5.4C-1C: every non-empty provider page receives chronology only after
@@ -951,7 +959,7 @@ async function applySubscriberScanChunk({
   }
   if (!observedAt) throw new Error("SUBSCRIBER_SCAN_CAUSAL_GENERATION_REQUIRED");
 
-  const items = itemsInput
+  const items = [...uniqueInputs.values()]
     .map((item) => normalizeChunkItem(item, {
       runId,
       agencyId: run.agencyId,
@@ -966,9 +974,11 @@ async function applySubscriberScanChunk({
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: new Date() });
   const hiddenCount = items.filter((item) => item.lastSeenIsNull).length;
   await db.subscriberScanPage.create({
-    data: { runId, offset, nextOffset, itemCount: items.length, hiddenCount, hasMore, contentHash },
+    data: { runId, offset, nextOffset, itemCount: itemsInput.length, hiddenCount, hasMore, contentHash },
   });
-  if (items.length) await db.subscriberScanItem.createMany({ data: items, skipDuplicates: true });
+  const snapshot = await writeSubscriberPageSnapshot(db, {
+    items, priorByFan, runId, agencyId: run.agencyId, creatorId: run.creatorId,
+  });
 
   // The page and its canonical FanData facts commit atomically under the job
   // progress transaction. Provider pages are capped at 100 fans, so projection
@@ -988,7 +998,12 @@ async function applySubscriberScanChunk({
 
   const progressData = {
     status: "RUNNING", startedAt: run.startedAt || authorityNow, nextOffset,
-    scannedCount: { increment: items.length }, pageCount: { increment: 1 }, hiddenCount: { increment: hiddenCount },
+    scannedCount: { increment: snapshot.addedCount }, pageCount: { increment: 1 }, hiddenCount: { increment: snapshot.hiddenDelta },
+    summary: { ...object(run.summary), traversal: {
+      providerRows: nextOffset, uniqueFans: Number(run.scannedCount || 0) + snapshot.addedCount,
+      duplicateRows: Number(previousTraversal.duplicateRows || 0) + itemsInput.length - snapshot.addedCount,
+      overlappingPages: Number(previousTraversal.overlappingPages || 0) + Number(prior.length > 0), consecutiveNoNewPages,
+    } },
     hasMore, lastError: null, fanProjectionStatus: hasMore ? "PROJECTING" : "COMPLETE",
     fanProjectionCursorOffset: nextOffset, fanProjectionCount: { increment: items.length },
     fanProjectionCompletedAt: hasMore ? null : authorityNow, fanProjectionLastError: null,

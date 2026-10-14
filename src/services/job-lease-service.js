@@ -1,4 +1,5 @@
 "use strict";
+const { isCreatorLifecycleContention } = require("./creator-lifecycle-contention");
 const { notificationCommittedPageProof } = require("./notification-page-receipt-service");
 const { notificationRepairParams, needsNotificationRepairRotation, notificationProgressIsStale } = require("./notification-repair-service");
 
@@ -855,6 +856,11 @@ async function acquireJobFanObservationReadLease({ jobId, userId, deviceId, leas
       if (error instanceof ExecutionAccessFenceError) throw new JobLeaseError(error.code, error.message, error.status);
       throw readLeaseError(error);
     }
+  }).catch(error => {
+    // The failed PostgreSQL transaction has already rolled back. No read lease
+    // was granted, so the caller waits without reading OF or failing the job.
+    if (isCreatorLifecycleContention(error)) return { acquired: false, retryAfterMs: 1000, reason: "creator_lifecycle_contended" };
+    throw error;
   });
 }
 
@@ -985,7 +991,7 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     // checkpoint. A lost ACK must return the committed checkpoint before trying
     // to consume that token again. Old clients omit the CAS field; retain their
     // token-validated path during rollout, while current Desktop always sends it.
-    if (job.jobKey === "fan_data_point_refresh" && expectedContinuation !== undefined
+    if (["fan_data_point_refresh", "subscriber_directory_scan"].includes(job.jobKey) && expectedContinuation !== undefined
       && !isDeepStrictEqual(leaseDriverContinuation(job.continuation), leaseDriverContinuation(expectedContinuation))) {
       return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
         progress: job.progress, continuation: job.continuation, sideEffect: { staleProgress: true } };
@@ -1042,7 +1048,29 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       throw new JobLeaseError("CAMPAIGN_SEGMENT_CONTINUATION_INVALID", "Campaign directory segment could not be bound to requested continuation", 409);
     }
     let updated = null;
-    if (financialAuthority.enabled(job) && sideEffect?.financialContinuation) {
+    if (job.jobKey === "subscriber_directory_scan" && chunkResult?.kind === "subscriber_directory_page") {
+      if (sideEffect?.duplicate === true) {
+        // An old immutable page receipt never authorizes a cursor rewind.
+        updated = await tx.jobInstance.update({ where: { id: job.id }, data: {
+          continuation: job.continuation, progress: job.progress,
+        } });
+      } else {
+        const state = { offset: sideEffect.nextOffset, pages: sideEffect.pageCount, scanned: sideEffect.scannedCount };
+        if (![state.offset, state.pages, state.scanned].every(value => Number.isSafeInteger(value) && value >= 0)
+          || typeof sideEffect.hasMore !== "boolean") throw new JobLeaseError("SUBSCRIBER_SCAN_CHECKPOINT_INVALID", "Subscriber page did not produce a durable checkpoint", 422);
+        const serverProgress = {
+          current: state.scanned,
+          percent: sideEffect.hasMore ? Math.min(99, state.pages) : 99,
+          message: sideEffect.hasMore ? `Subscribers: ${state.scanned} unique fans · page ${state.pages}`
+            : `Subscribers: ${state.scanned} unique fans · publishing snapshot`,
+        };
+        const serverContinuation = sideEffect.hasMore
+          ? { driverPhase: "execute", jobContinuation: state }
+          : { driverPhase: "complete", result: { scanRunId: job.params.scanRunId, scanned: state.scanned,
+              pages: state.pages, sourceType: job.params.sourceType || "all", completedAt: now.toISOString() }, progress: serverProgress };
+        updated = await tx.jobInstance.update({ where: { id: job.id }, data: { continuation: serverContinuation, progress: serverProgress } });
+      }
+    } else if (financialAuthority.enabled(job) && sideEffect?.financialContinuation) {
       updated = await tx.jobInstance.update({ where: { id: job.id }, data: { continuation: sideEffect.financialContinuation } });
     } else if (job.jobKey === "fetch_campaigns" && sideEffect?.replay === true) {
       // Receipts prove data was already ingested; they do not authorize an old
@@ -1097,6 +1125,10 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     };
   });
   } catch (error) {
+    if (attemptedJob?.jobKey === "subscriber_directory_scan" && /^SUBSCRIBER_SCAN_/.test(String(error?.code || ""))) {
+      throw new JobLeaseError(error.code, error.message, 422);
+    }
+
     if (!["ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT", "NOTIFICATION_SOURCE_RECEIPT_GAP"].includes(error?.code)
       || attemptedJob?.jobKey !== "catchup_notifications_scan"
       || !["notification_facts_page_all", "notification_facts_page"].includes(chunkResult?.kind)

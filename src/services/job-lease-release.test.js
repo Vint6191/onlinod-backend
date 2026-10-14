@@ -1805,3 +1805,56 @@ test("I3 renewal deadline is computed from time after locks, not request admissi
     leaseToken: item.token, leaseRevision: 3, leaseMs: 30000 });
   assert.equal(result.leaseUntil.toISOString(), "2040-01-01T00:00:35.000Z");
 });
+
+function subscriberLeaseFixture() {
+  const item = notificationConflictFixture(); item.job.jobKey = 'subscriber_directory_scan';
+  item.job.params = { scanRunId: 'subscriber-run', observationReadLeaseVersion: 1 };
+  item.input.chunkResult = { kind: 'subscriber_directory_page', scanRunId: 'subscriber-run' };
+  item.db.jobInstance.update = async ({ data }) => { Object.assign(item.job, data); return { ...item.job }; };
+  return item;
+}
+
+test('Subscriber checkpoint and unique counts come from committed page authority', async () => {
+  const item = subscriberLeaseFixture();
+  item.applyJobChunk = async () => ({ duplicate: false, nextOffset: 9, scannedCount: 5, pageCount: 3, hasMore: true });
+  const { progressJob } = loadService(item);
+  const result = await progressJob({ ...item.input, continuation: { driverPhase: 'complete', result: { scanned: 999 } } });
+  assert.deepEqual(result.continuation, { driverPhase: 'execute', jobContinuation: { offset: 9, scanned: 5, pages: 3 } });
+  assert.equal(result.progress.current, 5);
+});
+
+test('Subscriber lost-ACK CAS rejects stale progress before any token or page write', async () => {
+  const item = subscriberLeaseFixture(), durable = { driverPhase: 'execute', jobContinuation: { offset: 9, scanned: 5, pages: 3 } };
+  item.job.continuation = durable; item.applyJobChunk = () => assert.fail('must not ingest stale progress');
+  const { progressJob } = loadService(item);
+  const result = await progressJob({ ...item.input, expectedContinuation: null });
+  assert.equal(result.sideEffect.staleProgress, true); assert.deepEqual(result.continuation, durable); assert.equal(item.update(), null);
+});
+
+test('Subscriber legacy page replay cannot rewind a newer durable checkpoint', async () => {
+  const item = subscriberLeaseFixture(), durable = { driverPhase: 'execute', jobContinuation: { offset: 9, scanned: 5, pages: 3 } };
+  item.job.continuation = durable; item.applyJobChunk = async () => ({ duplicate: true, nextOffset: 4, hasMore: true });
+  const { progressJob } = loadService(item);
+  const result = await progressJob({ ...item.input, expectedContinuation: undefined });
+  assert.deepEqual(result.continuation, durable);
+});
+
+for (const specific of [true, false]) test(`read lease lifecycle contention becomes waiting only after rollback (specific=${specific})`, async () => {
+  const item = subscriberLeaseFixture(); let rolledBack = false;
+  const error = Object.assign(new Error('lock unavailable'), { code: 'P2010', meta: { code: '55P03', message: specific ? 'PHASE2_CREATOR_LIFECYCLE_BUSY table=FanObservationReadLease' : 'unrelated lock error' } });
+  item.db.jobInstance.findFirst = async () => item.job;
+  item.db.$executeRawUnsafe = async () => 1;
+  item.db.$queryRawUnsafe = async sql => {
+    if (/authorityNow/.test(sql)) return [{ authorityNow: new Date() }];
+    if (/INSERT INTO "FanObservationReadLease"/.test(sql)) throw error;
+    return [];
+  };
+  item.afterRollback = () => { rolledBack = true; };
+  const { acquireJobFanObservationReadLease } = loadService(item);
+  const input = { ...item.input, purpose: 'subscriber_directory_page', requestId: 'read-fixture' };
+  if (specific) {
+    const result = await acquireJobFanObservationReadLease(input);
+    assert.equal(rolledBack, true); assert.equal(result.acquired, false); assert.equal(result.retryAfterMs, 1000);
+    assert.equal(result.token, undefined); assert.equal(item.job.status, 'CLAIMED');
+  } else await assert.rejects(() => acquireJobFanObservationReadLease(input), e => e === error);
+});

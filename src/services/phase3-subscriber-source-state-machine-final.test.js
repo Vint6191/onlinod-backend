@@ -99,9 +99,13 @@ function memoryDb(initialRun, { beforeUpdateMany = null } = {}) {
     subscriberScanItem: {
       async findMany({ where }) {
         const wanted = new Set(where.fanId?.in || []);
-        return items.filter((row) => row.runId === where.runId && wanted.has(row.fanId)).map((row) => ({ fanId: row.fanId, pageOffset: row.pageOffset }));
+        return items.filter((row) => row.runId === where.runId && wanted.has(row.fanId)).map((row) => ({ ...row }));
       },
       async createMany({ data }) { items.push(...data.map((row, index) => ({ id: `item-${items.length + index + 1}`, ...row }))); return { count: data.length }; },
+      async update({ where, data }) {
+        const row = items.find(x => x.runId === where.runId_fanId.runId && x.fanId === where.runId_fanId.fanId);
+        assert.ok(row); Object.assign(row, data); return { ...row };
+      },
     },
   };
   return db;
@@ -155,12 +159,52 @@ test("final Subscriber replay is bound to the exact committed provider payload a
   } finally { loaded.cleanup(); }
 });
 
-test("final Subscriber rejects the same fan appearing on a later provider page", async () => {
-  const loaded = loadSubscriber();
-  const db = memoryDb(makeRun());
+test("overlapping pages advance by raw rows while counting each fan once and updating its latest observation", async () => {
+  const loaded = loadSubscriber(), db = memoryDb(makeRun());
+  const apply = (offset, items, hasMore = true) => loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1",
+    chunkResult: page({ offset, items, nextOffset: offset + items.length, hasMore, token: `token-${offset}` }) });
   try {
-    await loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1", chunkResult: page({ offset: 0, items: [item("fan-1")], nextOffset: 1, hasMore: true }) });
-    await rejectCode(loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1", chunkResult: page({ offset: 1, items: [item("fan-1")], nextOffset: 2, hasMore: false, token: "token-2" }) }), "SUBSCRIBER_SCAN_DUPLICATE_FAN_ACROSS_PAGES");
+    await apply(0, [item("fan-1", { lastSeenIsNull: true }), item("fan-2")]);
+    await apply(2, [item("fan-1", { name: "new", lastSeenIsNull: false }), item("fan-3", { lastSeenIsNull: true })]);
+    const final = await apply(4, [item("fan-3", { lastSeenIsNull: true })], false);
+    assert.equal(final.readyToPublish, true);
+    assert.equal(db.run.nextOffset, 5); assert.equal(db.run.scannedCount, 3); assert.equal(db.run.hiddenCount, 1);
+    assert.equal(db.items.length, 3); assert.equal(db.items.find(x => x.fanId === "fan-1").name, "new");
+    assert.equal(db.run.fanProjectionCount, 5); assert.equal(db.run.fanProjectionStatus, "COMPLETE");
+    assert.equal(db.run.summary.traversal.duplicateRows, 2);
+  } finally { loaded.cleanup(); }
+});
+
+test("identical rows within one page retain provider cursor distance and project one fan", async () => {
+  const loaded = loadSubscriber(), db = memoryDb(makeRun()), one = item("fan-1", { lastSeenIsNull: true });
+  try {
+    await loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1", chunkResult: page({ items: [one, one], nextOffset: 2 }) });
+    assert.equal(db.run.nextOffset, 2); assert.equal(db.run.scannedCount, 1); assert.equal(db.run.hiddenCount, 1);
+    assert.equal(db.pages[0].itemCount, 2); assert.equal(db.items.length, 1); assert.equal(db.run.fanProjectionCount, 1);
+  } finally { loaded.cleanup(); }
+});
+
+test("conflicting same-page observations fail before consuming a token or changing a checkpoint", async () => {
+  const loaded = loadSubscriber(), db = memoryDb(makeRun());
+  try {
+    await rejectCode(loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1",
+      chunkResult: page({ items: [item("fan-1", { name: "one" }), item("fan-1", { name: "two" })], nextOffset: 2 }),
+      consumeObservationToken: () => assert.fail("ambiguous page must not consume token"),
+    }), "SUBSCRIBER_SCAN_CONFLICTING_FAN_IN_PAGE");
+    assert.equal(db.pages.length, 0); assert.equal(db.run.nextOffset, 0);
+  } finally { loaded.cleanup(); }
+});
+
+test("a provider ignoring offsets is bounded and can never publish an incomplete run as successful", async () => {
+  const loaded = loadSubscriber(), db = memoryDb(makeRun());
+  const apply = offset => loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1",
+    chunkResult: page({ offset, items: [item("fan-1")], nextOffset: offset + 1, hasMore: true }) });
+  try {
+    for (let offset = 0; offset < 6; offset++) await apply(offset);
+    await rejectCode(apply(6), "SUBSCRIBER_SCAN_NON_ADVANCING_SOURCE");
+    assert.equal(db.run.scannedCount, 1); assert.equal(db.run.nextOffset, 6);
+    assert.equal(db.run.hasMore, true); assert.equal(db.run.fanProjectionStatus, "PROJECTING");
+    assert.equal(db.pages.length, 6);
   } finally { loaded.cleanup(); }
 });
 

@@ -75,7 +75,8 @@ test("Subscriber source state machine is exact-offset, payload-bound, CAS fenced
   assert.match(chunk, /providerPayloadHash = hashJson\(itemsInput\)/);
   assert.match(chunk, /SUBSCRIBER_SCAN_REPLAY_CONFLICT/);
   assert.match(chunk, /SUBSCRIBER_SCAN_STALLED_CURSOR/);
-  assert.match(chunk, /SUBSCRIBER_SCAN_DUPLICATE_FAN_ACROSS_PAGES/);
+  assert.match(chunk, /SUBSCRIBER_SCAN_NON_ADVANCING_SOURCE/);
+  assert.match(chunk, /writeSubscriberPageSnapshot/);
   assert.match(chunk, /updateMany\([\s\S]*nextOffset: offset[\s\S]*SUBSCRIBER_SCAN_CURSOR_CONFLICT/);
   assert.doesNotMatch(chunk, /\.slice\(0,\s*100\)/);
 });
