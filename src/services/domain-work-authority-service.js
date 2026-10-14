@@ -85,6 +85,12 @@ function bounded(value, fallback = 25, max = MAX_BATCH) {
   const n = Math.floor(Number(value) || fallback);
   return Math.max(1, Math.min(max, n));
 }
+function creatorLifecycleClaimContended(error) {
+  // Prisma wraps the trigger's NOWAIT SQLSTATE in P2010. Other lock errors,
+  // authority rejections and statement timeouts must keep their normal policy.
+  return String(error?.meta?.code || error?.code || "") === "55P03"
+    && /\bPHASE2_CREATOR_LIFECYCLE_BUSY\b/.test(String(error?.meta?.message || error?.message || ""));
+}
 function asBigInt(value, fallback = 0n) {
   try { return BigInt(value == null ? fallback : value); } catch (_) { return BigInt(fallback); }
 }
@@ -644,6 +650,11 @@ async function claimDomainWorkBatchInternal({
          RETURNING d.*`, ...params,
       );
       return { ownerToken, authorityNow, leaseUntil, items: rows || [] };
+    }).catch((error) => {
+      if (typeof db?.$transaction !== "function" || !creatorLifecycleClaimContended(error)) throw error;
+      // This branch has one atomic physical claim: rollback acquired nothing.
+      return { ownerToken, authorityNow: null, leaseUntil: null, items: [], skipped: true,
+        reason: "creator_lifecycle_contended" };
     });
   }
 
@@ -1006,6 +1017,14 @@ async function claimDomainWorkBatchInternal({
           selectedAgency,klass,String(generation),authorityNow,
         );
         return { agencyId: selectedAgency, claimShard: selectedShard, authorityNow, leaseUntil, items: rows || [] };
+      }).catch((error) => {
+        if (!creatorLifecycleClaimContended(error)) throw error;
+        // Only this short transaction rolled back. Keep every earlier committed
+        // tranche visible to the executor, and suppress this shard for this pump
+        // so another creator/Agency can proceed. The next pump retries the shard.
+        // Do not remove the lifecycle trigger or wait while holding DWI locks.
+        return { agencyId: selectedAgency, claimShard: selectedShard, authorityNow: null,
+          leaseUntil: null, items: [], contended: true };
       });
 
       if (!firstAuthorityNow) firstAuthorityNow = tranche.authorityNow || null;

@@ -219,6 +219,30 @@ test("stale notification progress never invokes ingest or writes a checkpoint", 
   assert.equal(item.update(), null);
 });
 
+test("FanData lost-ACK replay returns durable progress before consuming its one-time token", async () => {
+  const item = notificationConflictFixture();
+  item.job.jobKey = 'fan_data_point_refresh'; item.job.params = { fanIds: ['1', '2'], observationTokenVersion: 1 };
+  item.job.continuation = { driverPhase: 'execute', jobContinuation: { index: 2, refreshed: 1, unavailable: 1, errors: 0 } };
+  item.applyJobChunk = async () => { assert.fail('replayed FanData must not consume token or change values'); };
+  const { progressJob } = loadService(item);
+  for (const expectedContinuation of [null, { driverPhase: 'execute', jobContinuation: null },
+    { driverPhase: 'execute', jobContinuation: { index: 1 } }]) {
+    const result = await progressJob({ ...item.input, expectedContinuation, chunkResult: { kind: 'fan_data_point_refresh', observationToken: 'consumed' } });
+    assert.equal(result.sideEffect.staleProgress, true); assert.deepEqual(result.continuation, item.job.continuation);
+  }
+  assert.equal(item.update(), null);
+});
+
+for (const expectedContinuation of [null, { driverPhase: 'execute', jobContinuation: null }, undefined]) {
+  test(`FanData initial checkpoint accepts equivalent empty envelopes and legacy clients (${JSON.stringify(expectedContinuation)})`, async () => {
+    const item = notificationConflictFixture(); item.job.jobKey = 'fan_data_point_refresh'; item.job.params = { fanIds: ['1'] };
+    let applied = 0; item.applyJobChunk = async () => { applied++; return { ok: true }; };
+    const { progressJob } = loadService(item);
+    await progressJob({ ...item.input, expectedContinuation, chunkResult: { kind: 'fan_data_point_refresh', items: [] } });
+    assert.equal(applied, 1); assert.ok(item.update());
+  });
+}
+
 test("an unrelated page failure rolls back without rotating collection authority", async () => {
   const item = notificationConflictFixture(); item.applyJobChunk = async () => { throw new Error("SQL failure"); };
   const { progressJob } = loadService(item);

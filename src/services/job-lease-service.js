@@ -393,6 +393,11 @@ function normalizeLeaseContinuation(value) {
   }
   throw new JobLeaseError("JOB_CONTINUATION_TOO_DEEP", "Job continuation nesting is invalid", 409);
 }
+function leaseDriverContinuation(value) {
+  const normalized = normalizeLeaseContinuation(value);
+  return normalized?.driverPhase === "execute" || normalized?.driverPhase === "complete"
+    ? normalized : { driverPhase: "execute", jobContinuation: normalized };
+}
 async function requireOwnedDevice({ userId, deviceId, db = prisma }) {
   const device = await db.workerDevice.findUnique({ where: { id: deviceId } });
   if (!device || device.userId !== userId) throw new JobLeaseError("NOT_YOUR_DEVICE", "Invalid device", 403);
@@ -972,6 +977,16 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     : normalizeLeaseContinuation(continuation);
 
     if (job.jobKey === "catchup_notifications_scan" && notificationProgressIsStale(job, chunkResult, expectedContinuation)) {
+      return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
+        progress: job.progress, continuation: job.continuation, sideEffect: { staleProgress: true } };
+    }
+
+    // The fan observation token is consumed in the same transaction as this
+    // checkpoint. A lost ACK must return the committed checkpoint before trying
+    // to consume that token again. Old clients omit the CAS field; retain their
+    // token-validated path during rollout, while current Desktop always sends it.
+    if (job.jobKey === "fan_data_point_refresh" && expectedContinuation !== undefined
+      && !isDeepStrictEqual(leaseDriverContinuation(job.continuation), leaseDriverContinuation(expectedContinuation))) {
       return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
         progress: job.progress, continuation: job.continuation, sideEffect: { staleProgress: true } };
     }
