@@ -1,5 +1,6 @@
 "use strict";
 const { notificationCommittedPageProof } = require("./notification-page-receipt-service");
+const { notificationRepairParams, needsNotificationRepairRotation } = require("./notification-repair-service");
 
 const { isDeepStrictEqual } = require("node:util");
 
@@ -656,6 +657,11 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       if (!readyBindings.length) return null;
       const attemptClaimData = { ...claimData, claimedAt: claimNow,
         leaseUntil: new Date(claimNow.getTime() + leaseDuration(leaseMs)), startedAt: candidate.startedAt || claimNow };
+      if (needsNotificationRepairRotation(candidate)) {
+        attemptClaimData.params = notificationRepairParams(candidate, claimNow);
+        attemptClaimData.continuation = null;
+        attemptClaimData.progress = { percent: 0, message: "Notification repair: new collection generation" };
+      }
       if (candidate.jobKey === "financial_transactions_scan") {
         const authority = require("./financial-receipt-authority");
         await authority.enter(db);
@@ -761,13 +767,27 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
 
 async function leaseCommit(input, work, { profile = "JOB_CHUNK", allowExpired = false } = {}) {
   try {
-    return await runRootCommit(prisma, async ({ tx }) => {
+    const outcome = await runRootCommit(prisma, async ({ tx }) => {
       const job = await requireLease({ ...input, db: tx, lock: true, allowExpired });
       if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
       if (job.jobKey === "financial_transactions_scan") await require("./financial-receipt-authority").enter(tx);
       const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+      if (needsNotificationRepairRotation(job)) {
+        const rotated = await tx.jobInstance.updateMany({ where: { id: job.id, status: "CLAIMED", leaseRevision: job.leaseRevision,
+          leaseTokenHash: job.leaseTokenHash, claimedByDeviceId: job.claimedByDeviceId }, data: {
+          status: "SCHEDULED", params: notificationRepairParams(job, now), nextRunAt: now,
+          continuation: null, progress: { percent: 0, message: "Notification repair: new collection generation" },
+          claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null,
+          leaseRevision: { increment: 1 }, workId: null, completedAt: null, lastError: null,
+        } });
+        if (!rotated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification repair lease changed before rotation");
+        return { notificationRepairRotated: true };
+      }
       return work(tx, { job, now });
     }, { profile, authority: { kind: "JOB_LEASE", userId: input.userId }, conflictCode: "JOB_LEASE_CONFLICT" });
+    // Throw only after the rotation commits; throwing inside would roll it back.
+    if (outcome?.notificationRepairRotated) throw new JobLeaseError("JOB_LEASE_STALE", "Notification repair moved to a new collection generation", 409);
+    return outcome;
   } catch (error) {
     if (error?.code === "JOB_LEASE_CONFLICT") throw new JobLeaseError(error.code, error.message, 409);
     throw error;
@@ -1225,6 +1245,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         const status = successful ? "DONE" : terminal ? "FAILED" : "SCHEDULED";
         const failureData = {
           status, attempts, completedAt: terminal ? now : null,
+          ...(!terminal ? { params: notificationRepairParams(job, now, result) } : {}),
           ...(retryAt ? { nextRunAt: retryAt, progress: { percent: 0, message: "notification catch-up scheduled for repair" } } : {}),
           claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, continuation: null, workId: null,
           result: { ...(result || {}), completionSideEffect: { verified: false, sourceTraversalComplete: true } },
@@ -1256,12 +1277,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       const retryAt = successful || manualPartial || terminal ? null
         : new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
       const status = successful || manualPartial ? "DONE" : terminal ? "FAILED" : "SCHEDULED";
-      const repairParams = { ...object(job.params) };
-      const requestedTypes = sideEffect?.summary?.requestedTypes || repairParams.types || [];
-      const partialTypes = requestedTypes.filter(type => sideEffect?.summary?.collectionCoverageByType?.[type] !== "complete");
-      if (partialTypes.length) repairParams.types = partialTypes;
-      delete repairParams.resumeCursors;
-      delete repairParams.notificationRepairPass;
+      const repairParams = status === "SCHEDULED" ? notificationRepairParams(job, now, result) : object(job.params);
       const data = successful ? completionData : {
         status, attempts, params: repairParams, completedAt: status === "SCHEDULED" ? null : now,
         ...(retryAt ? { nextRunAt: retryAt } : {}),

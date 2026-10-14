@@ -891,11 +891,78 @@ test("partial notification completion is rescheduled instead of being marked DON
   assert.equal(updates[0].data.continuation, null);
   assert.equal(updates[0].data.claimedByDeviceId, null);
   assert.equal(updates[0].data.lastError, "notification_scan_partial");
-  assert.deepEqual(updates[0].data.params.types, ["tips"]);
+  assert.deepEqual(updates[0].data.params.types, ["purchases", "tips"]);
+  assert.ok(updates[0].data.params.collectionGeneration);
+  assert.notEqual(updates[0].data.params.collectionGeneration, "run-partial-1");
+  assert.equal(updates[0].data.params.notificationRepairFromRunId, "run-partial-1");
   assert.equal("resumeCursors" in updates[0].data.params, false);
   assert.equal("notificationRepairPass" in updates[0].data.params, false);
   assert.ok(updates[0].data.nextRunAt instanceof Date);
   assert.equal(result.job.status, "SCHEDULED");
+});
+
+test("a claimed pre-fix notification repair rotates durably before accepting another page", async () => {
+  const item = fixture();
+  Object.assign(item.job, { creatorId: "creator-1", jobKey: "catchup_notifications_scan",
+    params: { collectionGeneration: "old-notification-run", collectionRequestedAt: "2026-08-01T00:00:00.000Z", types: ["tips"] },
+    result: { scanRunId: "old-notification-run", coverage: { subscriptions: { status: "complete" }, tips: { status: "partial" } },
+      completionSideEffect: { ok: false, verified: false } },
+    continuation: { driverPhase: "execute", jobContinuation: { page: 1 } },
+  });
+  let chunks = 0;
+  const { progressJob, renewLease } = loadService({ ...item, applyJobChunk: async () => { chunks += 1; } });
+  const input = { jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3 };
+  await assert.rejects(progressJob({ ...input, chunkResult: { kind: "notification_facts_page" } }), error => error.code === "JOB_LEASE_STALE");
+  assert.equal(chunks, 0, "old page cannot reach the ingest service");
+  const { data, where } = item.update();
+  assert.equal(data.status, "SCHEDULED");
+  assert.deepEqual(data.leaseRevision, { increment: 1 });
+  assert.equal(where.leaseTokenHash, item.job.leaseTokenHash);
+  assert.equal(data.leaseTokenHash, null);
+  assert.equal(data.continuation, null);
+  assert.notEqual(data.params.collectionGeneration, "old-notification-run");
+  assert.deepEqual(data.params.types, ["subscriptions", "tips"]);
+  assert.equal(data.attempts, undefined, "upgrade must not consume a failed attempt");
+  await assert.rejects(renewLease({ ...input, leaseMs: 60_000 }), error => error.code === "JOB_NOT_CLAIMED");
+});
+
+test("a stale worker cannot rotate a notification repair owned by another lease", async () => {
+  const item = fixture();
+  Object.assign(item.job, { jobKey: "catchup_notifications_scan", params: { collectionGeneration: "old-run" },
+    result: { scanRunId: "old-run", completionSideEffect: { ok: false } } });
+  const { renewLease } = loadService(item);
+  await assert.rejects(renewLease({ jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: "stale-token", leaseRevision: 3 }),
+    error => error.code === "JOB_LEASE_STALE");
+  assert.equal(item.update(), null);
+});
+
+test("claiming a queued pre-fix repair returns a fresh notification generation and resets only the traversal", async () => {
+  const now = new Date();
+  const candidate = { id: "queued-old-repair", agencyId: "agency-1", creatorId: "creator-1", jobKey: "catchup_notifications_scan",
+    status: "SCHEDULED", leaseRevision: 4, attempts: 2, startedAt: now, progress: { percent: 30 },
+    params: { notificationMode: "catchup", types: ["tips"], collectionGeneration: "old-run", collectionRequestedAt: now.toISOString() },
+    result: { scanRunId: "old-run", coverage: { tips: { status: "partial" } }, completionSideEffect: { ok: false } },
+    continuation: { driverPhase: "execute", jobContinuation: { page: 1 } }, nextRunAt: now,
+  };
+  let data;
+  const db = {
+    workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1", lastSeenAt: now }) },
+    agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all", accessEpoch: 1 }) },
+    creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
+    deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
+    jobInstance: {
+      findMany: async () => [], findFirst: async () => candidate,
+      updateMany: async (input) => { data = input.data; return { count: 1 }; },
+      findUnique: async () => ({ ...candidate, ...data, leaseRevision: 5, creator: { id: "creator-1" } }),
+    },
+  };
+  const { claimJob } = loadService({ db });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", jobKeys: ["catchup_notifications_scan"] });
+  assert.equal(result.reason, "claimed");
+  assert.notEqual(result.job.params.collectionGeneration, "old-run");
+  assert.equal(result.job.params.notificationMode, "catchup");
+  assert.equal(result.job.continuation, null);
+  assert.equal(data.attempts, undefined, "claim keeps the persisted attempt count");
 });
 
 test("manual notification PARTIAL at a proven source boundary stays a visible one-shot DONE", async () => {

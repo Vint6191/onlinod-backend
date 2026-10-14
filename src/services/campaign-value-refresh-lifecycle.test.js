@@ -41,3 +41,17 @@ test('future observation does not satisfy a present demand; invalid run fails be
 test('expiry batch bound rejects oversize work before any database operation',async()=>{
  await assert.rejects(()=>requestExpiredCampaignValues({tx:{$queryRawUnsafe(){throw Error('unexpected database call');}},agencyId:'a',creatorId:'c',fanIds:Array.from({length:101},(_,i)=>String(i)),now:start,freshnessMs:TTL}),/REFRESH_SCOPE_INVALID/);
 });
+
+test('refresh completion retains bounded provider failure diagnostics on the unsatisfied demand',async()=>{
+ const h=harness();
+ await enqueue({...input(h),candidates:[{onlyFansUserId:'404-fan'}]});
+ const job=[...h.jobsByKey.values()][0];
+ const {finalizeCampaignFanRefreshJob}=require('./campaign-fan-refresh-queue-service');
+ const result=await finalizeCampaignFanRefreshJob({db:h.db,job,result:{errors:1,failures:[{fanId:'404-fan',code:'OF_HTTP_ERROR',status:404}]}});
+ assert.equal(result.applied,1);
+ const demand=h.demands.get('creator-1|404-fan');
+ assert.equal(demand.status,'FAILED');
+ assert.match(demand.lastError,/OF_HTTP_ERROR status=404 fan=404-fan/);
+ assert.equal(h.coverage.fanValueSucceeded,0);
+ assert.equal(h.coverage.fanValueFailed,1);
+});

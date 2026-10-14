@@ -1966,7 +1966,14 @@ async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner =
   if (superseded.length) {
     followUpJobId = await scheduleDemandRefreshJob({ db, job, demands: superseded, scheduledAt: now, planner });
   }
-  const errorText = `fan_data_point_refresh completed without satisfying requested freshness${result?.errors ? `; errors=${Number(result.errors)}` : ""}`;
+  const failureDetails = (Array.isArray(result?.failures) ? result.failures : []).slice(0, 3)
+    .map(failure => {
+      const code = clean(failure?.code, 120) || "OF_PROFILE_UNAVAILABLE";
+      const fanId = clean(failure?.fanId, 180);
+      const status = Number(failure?.status);
+      return `${code}${Number.isInteger(status) && status > 0 ? ` status=${status}` : ""}${fanId ? ` fan=${fanId}` : ""}`;
+    });
+  const errorText = clean(`fan_data_point_refresh completed without satisfying requested freshness${result?.errors ? `; errors=${Number(result.errors)}` : ""}${failureDetails.length ? `; ${failureDetails.join("; ")}` : ""}`, 2000);
   let terminal = { applied: 0, topology: "none" };
   if (failed.length && supportsSetBasedCampaignFanRefreshTerminal(db)) {
     terminal = await transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId: job.id, creatorId, now, error: errorText });
@@ -1987,7 +1994,7 @@ async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner =
           lastError: errorText,
         },
       });
-      await transitionWorkForDemand(db, { demand, outcome: WORK_STATUS.FAILED, observedAt: null, error: "refresh job finished without a fresh terminal value", now });
+      await transitionWorkForDemand(db, { demand, outcome: WORK_STATUS.FAILED, observedAt: null, error: errorText, now });
     }
     terminal = { applied: failed.length, topology: "adapter_fallback" };
   }
