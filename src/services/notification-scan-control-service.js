@@ -9,6 +9,7 @@ const { buildNotificationScanParams, loadNotificationSyncState } = require("./no
 const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { capabilityFreshnessWindow } = require("./capability-freshness-authority-service");
+const { notificationContinuationState } = require("./notification-repair-service");
 const {
   buildCollectionCommand, buildCollectionPlanningDedupeParams, collectionCommand, withCollectorStateLock, COLLECTOR_TYPES,
 } = require("./analytics-collector-control-service");
@@ -298,7 +299,9 @@ async function countOnlineBindings(db, creator, now = null) {
 async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL", limit = 100, offset = 0 }) {
   const job = await currentCollectorJob(db, creator.id, JOB_KEY);
   const sync = await loadNotificationSyncState(db, creator.id);
-  const syncBelongsToJob = Boolean(job && sync?.sourceJobId === job.id);
+  const scanRunId = clean(job?.params?.collectionGeneration, 120);
+  const syncBelongsToJob = Boolean(job && sync?.sourceJobId === job.id
+    && (!scanRunId || sync.scanRunId === scanRunId));
   const linkedSync = syncBelongsToJob ? sync : null;
   const normalizedOutcome = String(outcome || "ALL").trim().toUpperCase();
   if (normalizedOutcome !== "ALL" && !OUTCOMES.has(normalizedOutcome)) throw new Error("Invalid notification scan outcome filter");
@@ -312,9 +315,13 @@ async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL
   let currentRunOldestOccurredAt = null;
   let currentRunNewestOccurredAt = null;
   if (job && db?.creatorNotificationScanItem) {
-    const where = {
+    const runWhere = {
       creatorId: creator.id,
       sourceJobId: job.id,
+      ...(scanRunId ? { scanRunId } : {}),
+    };
+    const where = {
+      ...runWhere,
       ...(normalizedOutcome === "ALL" ? {} : { outcome: normalizedOutcome }),
     };
     const [rows, total, outcomeGroups, reasonGroups, bounds] = await Promise.all([
@@ -327,17 +334,17 @@ async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL
       db.creatorNotificationScanItem.count({ where }),
       db.creatorNotificationScanItem.groupBy({
         by: ["outcome"],
-        where: { creatorId: creator.id, sourceJobId: job.id },
+        where: runWhere,
         _count: { _all: true },
       }),
       db.creatorNotificationScanItem.groupBy({
         by: ["outcome", "reasonCode"],
-        where: { creatorId: creator.id, sourceJobId: job.id, reasonCode: { not: null } },
+        where: { ...runWhere, reasonCode: { not: null } },
         _count: { _all: true },
       }),
       typeof db.creatorNotificationScanItem.aggregate === "function"
         ? db.creatorNotificationScanItem.aggregate({
-            where: { creatorId: creator.id, sourceJobId: job.id, occurredAt: { not: null } },
+            where: { ...runWhere, occurredAt: { not: null } },
             _min: { occurredAt: true },
             _max: { occurredAt: true },
           })
@@ -362,7 +369,7 @@ async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL
   const pagesScanned = linkedSync ? integer(linkedSync.pagesScanned) : integer(progress.current);
   // Audit rows and the cursor are committed by the same progress transaction.
   // Their relational counts are the truth for this manual run, so an older
-  // sync snapshot can never leak counters into the selected job.
+  // sync snapshot can never leak counters into the selected job generation.
   const accepted = job && db?.creatorNotificationScanItem ? counts.ACCEPTED : linkedSync ? integer(linkedSync.eventsAccepted) : 0;
   const rejected = job && db?.creatorNotificationScanItem ? counts.REJECTED : linkedSync ? integer(linkedSync.eventsRejected) : 0;
   const ignored = job && db?.creatorNotificationScanItem ? counts.IGNORED : linkedSync ? integer(linkedSync.ignoredEvents) : 0;
@@ -395,7 +402,7 @@ async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL
     accepted,
     rejected,
     ignored,
-    cursor: linkedSync?.nextCursor || clean(object(job?.continuation).fromId, 220),
+    cursor: linkedSync ? linkedSync.nextCursor || null : clean(notificationContinuationState(job?.continuation)?.fromId, 220),
     headNotificationId: linkedSync?.headNotificationId || null,
     tailNotificationId: linkedSync?.tailNotificationId || null,
     oldestOccurredAt: iso(currentRunOldestOccurredAt || linkedSync?.oldestOccurredAt),
@@ -406,7 +413,7 @@ async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL
     lastErrorCode: currentStatus === "FAILED" ? (linkedSync?.lastErrorCode || "NOTIFICATION_SCAN_FAILED") : linkedSync?.lastErrorCode || null,
     lastErrorMessage: currentStatus === "FAILED" ? (linkedSync?.lastErrorMessage || job?.lastError || null) : linkedSync?.lastErrorMessage || null,
     currentMessage: jobMessage(job),
-    sourceBoundaryReached: Boolean(linkedSync && !linkedSync.nextCursor && (
+    sourceBoundaryReached: Boolean(linkedSync && ["COMPLETE", "PARTIAL"].includes(linkedSync.status) && !linkedSync.nextCursor && (
       (params.notificationMode === "full" && linkedSync.fullBackfillCompletedAt)
       || (params.notificationMode === "catchup" && linkedSync.lastCatchupCompletedAt)
     )),

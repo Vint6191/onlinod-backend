@@ -95,6 +95,7 @@ test("manual START uses bounded catch-up when historical notification coverage a
   assert.equal(scheduledInput.params.manualNotificationScan, true);
   assert.equal(scheduledInput.params.manualNotificationScanVersion, 1);
   assert.equal(scheduledInput.params.notificationMode, "catchup");
+  assert.deepEqual(scheduledInput.params.types, ["purchases", "tips", "subscriptions", "likes", "comments"]);
   assert.equal(scheduledInput.params.analyticsRangeKey, "all");
   assert.equal(scheduledInput.params.collectionContractVersion, 1);
   assert.equal(scheduledInput.params.collectionType, "NOTIFICATIONS");
@@ -120,6 +121,7 @@ test("manual START still uses full history for a creator with no historical base
   const db = { jobInstance: { async findMany() { return []; } } };
   await startManualNotificationScan({ db, creator, requestedByUserId: "user-1", now: new Date("2026-08-07T12:00:00.000Z") });
   assert.equal(scheduledInput.params.notificationMode, "full");
+  assert.deepEqual(scheduledInput.params.types, ["purchases", "tips", "subscriptions", "likes", "comments"]);
   assert.equal(buildStateSeen, null);
 });
 
@@ -406,6 +408,46 @@ test("scanner read never equates Job DONE with a proven notification source boun
   const result = await readManualNotificationScan({ db, creator, outcome: "ALL", limit: 100, offset: 0 });
   assert.equal(result.status, "PARTIAL");
   assert.equal(result.sourceBoundaryReached, false);
+});
+
+test("scanner read scopes every audit query to the current generation and hides the same job's retired sync", async () => {
+  const job = manualJob({ status: "CLAIMED", completedAt: null, progress: { current: 12 },
+    params: { notificationMode: "full", ...notificationCommand("current-generation", "full") },
+    continuation: { driverPhase: "execute", jobContinuation: { fromId: "current-cursor" } },
+  });
+  syncState = { sourceJobId: job.id, scanRunId: "retired-generation", status: "FAILED", mode: "full",
+    pagesScanned: 68, eventsAccepted: 769, eventsRejected: 5, ignoredEvents: 17,
+    nextCursor: "retired-cursor", lastErrorCode: "NOTIFICATION_SCAN_FAILED", lastErrorMessage: "lease expired",
+    fullBackfillCompletedAt: new Date("2026-08-01T00:00:00Z"),
+  };
+  const queries = [];
+  const db = {
+    jobInstance: { async findMany() { return [job]; } },
+    creatorNotificationScanItem: {
+      async findMany(input) { queries.push(input.where); return []; },
+      async count(input) { queries.push(input.where); return 0; },
+      async groupBy(input) { queries.push(input.where); return []; },
+      async aggregate(input) { queries.push(input.where); return {}; },
+    },
+    deviceCreatorBinding: { async count() { return 1; } },
+  };
+  const result = await readManualNotificationScan({ db, creator, outcome: "REJECTED" });
+  assert.equal(queries.length, 5);
+  for (const where of queries) {
+    assert.equal(where.creatorId, creator.id); assert.equal(where.sourceJobId, job.id);
+    assert.equal(where.scanRunId, "current-generation");
+  }
+  assert.equal(result.status, "RUNNING"); assert.equal(result.pagesScanned, 12);
+  assert.equal(result.cursor, "current-cursor"); assert.equal(result.processed, 0);
+  assert.equal(result.lastErrorCode, null); assert.equal(result.sourceBoundaryReached, false);
+  assert.equal(result.legacySummary.lastErrorMessage, "lease expired");
+  // Historical baseline timestamps survive in SyncState; they must not make an
+  // in-progress generation look exhausted before its own completion commits.
+  syncState = { ...syncState, scanRunId: "current-generation", status: "SCANNING", nextCursor: null,
+    pagesScanned: 12, lastErrorCode: null, lastErrorMessage: null };
+  const current = await readManualNotificationScan({ db, creator });
+  assert.equal(current.cursor, null); assert.equal(current.sourceBoundaryReached, false);
+  assert.equal(current.legacySummary, null);
 });
 
 test("scanner read reports source boundary only from the linked durable completion proof", async () => {

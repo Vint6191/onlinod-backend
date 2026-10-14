@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
+const { NOTIFICATION_TYPES } = require("./notification-collection-scope");
 
 function tokenHash(value) {
   return crypto.createHash("sha256").update(String(value)).digest("hex");
@@ -151,7 +152,7 @@ function notificationConflictFixture() {
   const item = fixture();
   Object.assign(item.job, { creatorId: "creator-1", jobKey: "catchup_notifications_scan", attempts: 0, continuation: null,
     params: { collectionGeneration: "conflicting-run", collectionRequestedAt: "2026-10-01T00:00:00.000Z",
-      collectionMode: "full", notificationMode: "full", types: ["subscriptions", "tips"] }, result: null });
+      collectionMode: "full", notificationMode: "full", types: [...NOTIFICATION_TYPES] }, result: null });
   item.applyJobChunk = async () => { throw Object.assign(new Error("immutable receipt conflict"), { code: "ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT" }); };
   item.input = { jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3,
     continuation: { driverPhase: "execute", jobContinuation: { scanRunId: "conflicting-run", page: 1 } },
@@ -167,7 +168,7 @@ test("notification conflict without a partial completion marker rotates only aft
   assert.equal(job.status, "SCHEDULED"); assert.equal(job.attempts, 1); assert.equal(job.continuation, null);
   assert.equal(job.leaseRevision, 4); assert.equal(job.leaseTokenHash, null);
   assert.notEqual(job.params.collectionGeneration, "conflicting-run");
-  assert.deepEqual(job.params.types, ["subscriptions", "tips"]);
+  assert.deepEqual(job.params.types, NOTIFICATION_TYPES);
   assert.equal(job.params.notificationRepairReason, "ingest_idempotency_conflict");
 });
 
@@ -977,7 +978,7 @@ test("partial notification completion is rescheduled instead of being marked DON
   assert.equal(updates[0].data.continuation, null);
   assert.equal(updates[0].data.claimedByDeviceId, null);
   assert.equal(updates[0].data.lastError, "notification_scan_partial");
-  assert.deepEqual(updates[0].data.params.types, ["purchases", "tips"]);
+  assert.deepEqual(updates[0].data.params.types, NOTIFICATION_TYPES);
   assert.ok(updates[0].data.params.collectionGeneration);
   assert.notEqual(updates[0].data.params.collectionGeneration, "run-partial-1");
   assert.equal(updates[0].data.params.notificationRepairFromRunId, "run-partial-1");
@@ -1007,7 +1008,7 @@ test("a claimed pre-fix notification repair rotates durably before accepting ano
   assert.equal(data.leaseTokenHash, null);
   assert.equal(data.continuation, null);
   assert.notEqual(data.params.collectionGeneration, "old-notification-run");
-  assert.deepEqual(data.params.types, ["subscriptions", "tips"]);
+  assert.deepEqual(data.params.types, NOTIFICATION_TYPES);
   assert.equal(data.attempts, undefined, "upgrade must not consume a failed attempt");
   await assert.rejects(renewLease({ ...input, leaseMs: 60_000 }), error => error.code === "JOB_NOT_CLAIMED");
 });
@@ -1047,9 +1048,31 @@ test("claiming a queued pre-fix repair returns a fresh notification generation a
   assert.equal(result.reason, "claimed");
   assert.notEqual(result.job.params.collectionGeneration, "old-run");
   assert.equal(result.job.params.notificationMode, "catchup");
+  assert.deepEqual(result.job.params.types, NOTIFICATION_TYPES);
   assert.equal(result.job.continuation, null);
   assert.equal(data.attempts, undefined, "claim keeps the persisted attempt count");
 });
+
+for (const endpoint of ["renewLease", "progressJob", "completeJob"]) {
+  for (const mode of ["full", "catchup"]) test(`a narrow ${mode} run rotates before ${endpoint} without a partial marker`, async () => {
+    const item = notificationConflictFixture();
+    item.job.params = { ...item.job.params, notificationMode: mode, collectionMode: mode, types: ["subscriptions"] };
+    item.applyJobChunk = async () => assert.fail("old page must not be ingested");
+    item.applyJobResult = async () => assert.fail("old narrowed completion must not publish proof");
+    item.completeNotificationSync = async () => assert.fail("old narrowed completion must not advance the frontier");
+    const service = loadService(item);
+    await assert.rejects(service[endpoint]({ ...item.input, result: {
+      schemaVersion: 5, scanRunId: "conflicting-run", notificationMode: mode, sourceExhausted: true,
+      totalAcceptedEvents: 0, coverage: { subscriptions: { status: "complete" } },
+    } }), error => error.code === "JOB_LEASE_STALE");
+    const job = await item.db.jobInstance.findUnique({ where: { id: item.job.id } });
+    assert.equal(job.status, "SCHEDULED"); assert.equal(job.attempts, 0);
+    assert.equal(job.continuation, null); assert.equal(job.leaseTokenHash, null);
+    assert.notEqual(job.params.collectionGeneration, "conflicting-run");
+    assert.deepEqual(job.params.types, NOTIFICATION_TYPES);
+    assert.equal(job.params.notificationMode, mode);
+  });
+}
 
 test("manual notification PARTIAL at a proven source boundary stays a visible one-shot DONE", async () => {
   const token = "manual-notification-boundary-token";

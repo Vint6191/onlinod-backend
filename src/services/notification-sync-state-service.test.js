@@ -27,7 +27,8 @@ function fakeDb(initial = null, scanItems = []) {
     },
     creatorNotificationScanItem: {
       async findMany({ where }) {
-        return scanItems.filter((row) => !where?.sourceJobId || row.sourceJobId === where.sourceJobId);
+        return scanItems.filter((row) => (!where?.sourceJobId || row.sourceJobId === where.sourceJobId)
+          && (!where?.scanRunId || row.scanRunId === where.scanRunId));
       },
     },
     read() { return state ? { ...state } : null; },
@@ -324,9 +325,10 @@ test("verified catch-up atomically promotes the new head and verified known-ID f
     headNotificationId: "verified-head-old",
     knownNotificationIds: ["verified-head-old"],
   }, [
-    { sourceJobId: catchupJob.id, notificationId: "new-head" },
-    { sourceJobId: catchupJob.id, notificationId: "new-neighbor" },
-    { sourceJobId: catchupJob.id, notificationId: "new-neighbor" },
+    { sourceJobId: catchupJob.id, scanRunId: "retired-run", notificationId: "unverified-old-id" },
+    { sourceJobId: catchupJob.id, scanRunId: "scan-run-catchup-promote", notificationId: "new-head" },
+    { sourceJobId: catchupJob.id, scanRunId: "scan-run-catchup-promote", notificationId: "new-neighbor" },
+    { sourceJobId: catchupJob.id, scanRunId: "scan-run-catchup-promote", notificationId: "new-neighbor" },
   ]);
   await completeNotificationSync({
     db, job: catchupJob, deviceId: "device-1", successful: true,

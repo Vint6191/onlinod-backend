@@ -6,6 +6,7 @@ const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 const { collectionCommand, COLLECTOR_TYPES, withCollectorStateLock, commandAuthority, sameGeneration } = require("./analytics-collector-control-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { NOTIFICATION_TYPES } = require("./notification-collection-scope");
 
 const FULL_HISTORY_FROM = new Date("2016-01-01T00:00:00.000Z");
 
@@ -66,7 +67,7 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
     return {
       from: FULL_HISTORY_FROM.toISOString(),
       to: runtimeRangeTo(now).toISOString(),
-      types: ["purchases", "tips", "subscriptions", "likes", "comments"],
+      types: [...NOTIFICATION_TYPES],
       notificationMode: "full",
       pageLimit: 10,
       reason,
@@ -83,7 +84,7 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
   return {
     from: FULL_HISTORY_FROM.toISOString(),
     to: runtimeRangeTo(now).toISOString(),
-    types: ["purchases", "tips", "subscriptions", "likes", "comments"],
+    types: [...NOTIFICATION_TYPES],
     notificationMode: "catchup",
     pageLimit: 10,
     ...(stopAtNotificationId ? { stopAtNotificationId } : {}),
@@ -111,7 +112,7 @@ function boundedNotificationIds(values, limit = 300) {
   return out;
 }
 
-async function verifiedFrontierIds({ db, job, mode, headNotificationId, existingIds }) {
+async function verifiedFrontierIds({ db, job, scanRunId, mode, headNotificationId, existingIds }) {
   const head = clean(headNotificationId, 220);
   // FULL history ends with an ALL reconciliation, but its scan-audit page numbers
   // also contain the earlier typed phases. The exact verified head is therefore
@@ -120,7 +121,7 @@ async function verifiedFrontierIds({ db, job, mode, headNotificationId, existing
     return boundedNotificationIds([head, ...(Array.isArray(existingIds) ? existingIds : [])]);
   }
   const rows = await db.creatorNotificationScanItem.findMany({
-    where: { creatorId: job.creatorId, sourceJobId: job.id },
+    where: { creatorId: job.creatorId, sourceJobId: job.id, scanRunId },
     orderBy: [{ page: "asc" }, { ordinal: "asc" }],
     take: 300,
     select: { notificationId: true },
@@ -235,7 +236,7 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
     const overallComplete = verified && fullHistoryVerified;
     const verifiedKnownIds = verified
       ? await verifiedFrontierIds({
-        db: tx, job, mode, headNotificationId: result?.headNotificationId, existingIds: existing?.knownNotificationIds,
+        db: tx, job, scanRunId: command.generation, mode, headNotificationId: result?.headNotificationId, existingIds: existing?.knownNotificationIds,
       })
       : boundedNotificationIds(existing?.knownNotificationIds);
     const data = {

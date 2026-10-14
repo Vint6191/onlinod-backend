@@ -20,7 +20,7 @@ const ALL_COLLECTOR_VERSION = "notifications-all-v5";
 const LEGACY_SCHEMA_VERSION = 3;
 const LEGACY_COLLECTOR_VERSION = "notifications-catchup-v4";
 const MAX_EVENTS_PER_BATCH = 2_000;
-const NOTIFICATION_TYPES = Object.freeze(["purchases", "tips", "subscriptions", "likes", "comments"]);
+const { NOTIFICATION_TYPES } = require("./notification-collection-scope");
 
 
 function clean(value, max = 220) {

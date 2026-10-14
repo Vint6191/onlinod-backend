@@ -2,6 +2,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { notificationRepairParams, needsNotificationRepairRotation, notificationProgressIsStale } = require("./notification-repair-service");
+const { NOTIFICATION_TYPES, hasFullNotificationScope } = require("./notification-collection-scope");
 
 function partial() {
   return { jobKey: "catchup_notifications_scan", params: {
@@ -17,7 +18,7 @@ test("a repair restores the requested scope under a new generation, even in the 
   const params = notificationRepairParams(job, new Date(job.params.collectionAuthorityRequestedAt));
   assert.notEqual(params.collectionGeneration, job.params.collectionGeneration);
   assert.equal(params.collectionAuthorityRequestedAt, "2026-10-13T23:00:00.001Z");
-  assert.deepEqual(params.types, ["purchases", "tips"]);
+  assert.deepEqual(params.types, NOTIFICATION_TYPES);
   assert.equal(params.from, job.params.from);
   assert.equal(params.notificationRepairFromRunId, "old-run");
   assert.equal(params.collectionType, "NOTIFICATIONS");
@@ -28,13 +29,39 @@ test("a repair restores the requested scope under a new generation, even in the 
   assert.equal(needsNotificationRepairRotation({ ...job, params }), false, "new run must not rotate on every page");
 });
 
-test("only an unfinished repair of the same notification generation is migrated", () => {
+test("a full-scope unfinished repair is migrated only for its own notification generation", () => {
   const job = partial();
+  job.params.types = [...NOTIFICATION_TYPES];
   assert.equal(needsNotificationRepairRotation(job), true);
   assert.equal(Boolean(needsNotificationRepairRotation({ ...job, result: null })), false);
   assert.equal(needsNotificationRepairRotation({ ...job, jobKey: "financial_transactions_scan" }), false);
   assert.equal(needsNotificationRepairRotation({ ...job, result: { ...job.result, scanRunId: "older-run" } }), false);
   assert.equal(needsNotificationRepairRotation({ ...job, result: { ...job.result, completionSideEffect: { ok: true, verified: true } } }), false);
+});
+
+test("narrow active commands rotate without a completion marker and never narrow the repaired traversal", () => {
+  for (const types of [["subscriptions"], ["tips", "purchases"], [], ["unknown"], [...NOTIFICATION_TYPES, "unknown"]]) {
+    for (const notificationMode of ["full", "catchup"]) {
+      const job = partial();
+      job.params = { ...job.params, notificationMode, types };
+      job.result = null;
+      assert.equal(needsNotificationRepairRotation(job), true);
+      const params = notificationRepairParams(job, new Date("2026-10-14T00:00:00Z"), null);
+      assert.deepEqual(params.types, NOTIFICATION_TYPES);
+      assert.equal(params.notificationMode, notificationMode);
+      assert.notEqual(params.collectionGeneration, job.params.collectionGeneration);
+      assert.equal(Boolean(needsNotificationRepairRotation({ ...job, params })), false);
+    }
+  }
+});
+
+test("full scope defaults, ordering and duplicate types do not repeatedly rotate healthy commands", () => {
+  for (const types of [undefined, [...NOTIFICATION_TYPES].reverse(), [...NOTIFICATION_TYPES, "tips"], NOTIFICATION_TYPES.map(type => ` ${type.toUpperCase()} `)]) {
+    const job = { ...partial(), result: null };
+    job.params.types = types;
+    assert.equal(hasFullNotificationScope(job.params), true);
+    assert.equal(Boolean(needsNotificationRepairRotation(job)), false);
+  }
 });
 
 test("bounded catch-up keeps its mode and lower bound while obtaining new page receipt identity", () => {
