@@ -467,9 +467,9 @@ async function notificationFullIsRedundant(job, db = prisma, now = new Date()) {
   if (!db?.creatorNotificationSyncState?.findUnique) return false;
   const state = await db.creatorNotificationSyncState.findUnique({
     where: { creatorId: job.creatorId },
-    select: { fullBackfillVerifiedAt: true },
+    select: { fullBackfillVerifiedAt: true, normalizerVersion: true },
   });
-  return Boolean(trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
+  return Boolean(state?.normalizerVersion === "notification-source-v2" && trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
 }
 async function cancelRedundantNotificationFull(job, now = new Date(), db = prisma) {
   if (!(await notificationFullIsRedundant(job, db, now))) return false;
@@ -1082,7 +1082,7 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     };
   });
   } catch (error) {
-    if (error?.code !== "ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT"
+    if (!["ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT", "NOTIFICATION_SOURCE_RECEIPT_GAP"].includes(error?.code)
       || attemptedJob?.jobKey !== "catchup_notifications_scan"
       || !["notification_facts_page_all", "notification_facts_page"].includes(chunkResult?.kind)
       || chunkResult.scanRunId !== attemptedJob.params?.collectionGeneration) throw error;

@@ -7,8 +7,8 @@ const sql=fs.readFileSync(path.join(root,'prisma/migrations',contract.migration,
 const schema=fs.readFileSync(path.join(root,'prisma/schema.prisma'),'utf8');
 const digest=s=>crypto.createHash('sha256').update(s).digest('hex');
 
-test('one atomic baseline is the complete installation source',()=>{
- assert.deepEqual(fs.readdirSync(path.join(root,'prisma/migrations'),{withFileTypes:true}).filter(e=>e.isDirectory()).map(e=>e.name),[contract.migration]);
+test('immutable baseline and explicit additive migrations are the installation source',()=>{
+ assert.deepEqual(fs.readdirSync(path.join(root,'prisma/migrations'),{withFileTypes:true}).filter(e=>e.isDirectory()).map(e=>e.name),require('./database-migration-chain').migrations.map(item=>item.migration));
  assert.equal(digest(sql),contract.checksum);
  assert.match(sql,/\nBEGIN;/);assert.match(sql,/COMMIT;\s*$/);
  assert.doesNotMatch(sql,/CREATE INDEX CONCURRENTLY|NOT VALID|Phase7Retirement/);

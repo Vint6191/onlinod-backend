@@ -64,7 +64,7 @@ test("ingest is version-fenced, transactional, page-oriented and interval-aware"
   assert.match(service, /const ALL_COLLECTOR_VERSION = "notifications-all-v5"/);
   assert.match(service, /const LEGACY_SCHEMA_VERSION = 3/);
   assert.match(service, /const LEGACY_COLLECTOR_VERSION = "notifications-catchup-v4"/);
-  assert.match(service, /schemaVersion === ALL_SCHEMA_VERSION \? "v5" : "v6"/);
+  assert.match(service, /schemaVersion === SOURCE_SCHEMA_VERSION \? "v7" : "v6"/);
   assert.match(service, /notification-facts:\$\{job\.id\}:\$\{batchKey\}:\$\{protocolSuffix\}/);
   assert.match(service, /runDbTransaction/);
   assert.match(service, /createMany\(\{ data: creates\.map/);

@@ -6,7 +6,7 @@ const { NOTIFICATION_TYPES, hasFullNotificationScope } = require("./notification
 
 function partial() {
   return { jobKey: "catchup_notifications_scan", params: {
-    collectionGeneration: "old-run", collectionRequestedAt: "2026-10-13T23:00:00.000Z",
+    notificationNormalizerVersion: "notification-source-v2", collectionGeneration: "old-run", collectionRequestedAt: "2026-10-13T23:00:00.000Z",
     collectionAuthorityRequestedAt: "2026-10-13T23:00:00.000Z", notificationMode: "full", types: ["tips"],
     from: "2016-01-01T00:00:00.000Z", resumeCursors: { tips: "old-cursor" }, notificationRepairPass: 2,
   }, result: { scanRunId: "old-run", coverage: { purchases: { status: "complete" }, tips: { status: "partial" } },
@@ -94,4 +94,12 @@ test("old Desktop pages cannot rewind any typed phase and complete is terminal",
     { kind: "notification_facts_page_all", scanRunId: "old-run", page: 1 }), false, "legacy traversal restart has a different page sequence");
   assert.equal(notificationProgressIsStale({ ...job, continuation: { driverPhase: "complete", result: {} } }, null), true);
   assert.equal(notificationProgressIsStale({ ...job, jobKey: "financial_transactions_scan" }, null, null), false);
+});
+
+test("a parser upgrade fences old cursors and requires a new full source proof",()=>{
+ const job=partial(); delete job.params.notificationNormalizerVersion; job.params.notificationMode="catchup";job.params.stopAtNotificationId="old-head";
+ assert.equal(needsNotificationRepairRotation(job),true);
+ const params=notificationRepairParams(job,new Date("2026-10-14T00:00:00Z"));
+ assert.equal(params.notificationMode,"full");assert.equal(params.notificationNormalizerVersion,"notification-source-v2");assert.equal(params.stopAtNotificationId,undefined);
+ assert.equal(Boolean(needsNotificationRepairRotation({...job,params,result:null})),false);
 });

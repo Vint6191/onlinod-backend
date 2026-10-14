@@ -118,7 +118,7 @@ for (const mode of ["full", "catchup"]) test(`campaign ${mode} FanData queue set
 test("notification proof keeps traversal age independent of delayed completion", async () => {
   const db = stateDb("creatorNotificationSyncState");
   await completeNotificationSync({ db, job: job("NOTIFICATIONS"), successful: true,
-    result: { notificationMode: "full", scanRunId: "generation", sourceExhausted: true, allSourceExhausted: true } });
+    result: { normalizerVersion:"notification-source-v2", notificationMode: "full", scanRunId: "generation", sourceExhausted: true, allSourceExhausted: true } });
   assert.equal(iso(db.read().fullBackfillObservedAt), old.toISOString());
   assert.equal(iso(collectorPlanningProofAt("NOTIFICATIONS", "catchup", db.read(), now)), old.toISOString());
 });

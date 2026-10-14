@@ -6,6 +6,7 @@ const crypto = require("node:crypto");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const alive = setInterval(() => {}, 1000);
+const onlyLive = process.argv.includes("--live-only");
 const hash = value => crypto.createHash("sha256").update(value).digest("hex");
 const types = ["subscriptions", "purchases", "tips", "comments", "likes"];
 const envelope = state => ({ driverPhase: "execute", jobContinuation: state });
@@ -33,11 +34,19 @@ async function main() {
     const { notificationsCatchupHandler: handler } = await import(pathToFileURL(path.join(desktop,
       "apps/desktop/dist/electron/main/services/backend-jobs/handlers/notifications-catchup-handler.js")));
     const express = require("express"), app = express(), unhandled = [];
-    app.use(express.json());
+    app.use(express.json({limit:"2mb"}));
     // Only authentication is a loopback test port; all access/lease checks are real.
-    app.use((req, res, next) => { req.auth = { userId: "qa-user", agencyId: req.headers["x-fixture-agency"], deviceId: req.body.deviceId }; next(); });
+    app.use(async (req, res, next) => {
+      try {
+        const agencyId = req.headers["x-fixture-agency"];
+        const membership = await db.agencyMember.findFirst({ where: { agencyId, userId: "qa-user" } });
+        req.auth = { userId: "qa-user", agencyId, deviceId: req.body.deviceId, membership };
+        next();
+      } catch (error) { next(error); }
+    });
     app.use("/api/jobs", require("../src/routes/jobs"));
-    app.use((error, req, res, next) => { unhandled.push(error); res.status(500).json({ code: error.code || "SERVER_ERROR" }); });
+    app.use("/api/stats", require("../src/routes/stats"));
+    app.use((error, req, res, next) => { unhandled.push(error); console.error("SQL_PROOF_ROUTE_ERROR", error); res.status(500).json({ code: error.code || "SERVER_ERROR" }); });
     server = await new Promise(resolve => { const value = app.listen(0, "127.0.0.1", () => resolve(value)); });
     const base = `http://127.0.0.1:${server.address().port}/api/jobs`;
 
@@ -46,7 +55,7 @@ async function main() {
       const now = new Date(), token = crypto.randomBytes(32).toString("base64url"), deviceId = `device-${name}`;
       await db.workerDevice.create({ data: { id: deviceId, agencyId: s.agencyId, userId: s.userId, lastSeenAt: now } });
       const params = { from: "2016-01-01T00:00:00.000Z", to: new Date(+now + 300000).toISOString(), types,
-        notificationMode: mode, pageLimit: 10, collectionContractVersion: 1, collectionType: "NOTIFICATIONS",
+        notificationMode: mode, notificationNormalizerVersion: "notification-source-v2", pageLimit: 10, collectionContractVersion: 1, collectionType: "NOTIFICATIONS",
         collectionMode: mode, collectionGeneration: crypto.randomUUID(), collectionRequestedAt: now.toISOString() };
       const job = await db.jobInstance.create({ data: { id: `job-${name}`, agencyId: s.agencyId, creatorId: s.creatorId,
         jobKey: "catchup_notifications_scan", scope: "creator", status: "CLAIMED", params,
@@ -97,7 +106,10 @@ async function main() {
       for (let iteration = 0; iteration < 30; iteration += 1) {
         const phase = mode === "catchup" || state?.fullStage === "all_reconciliation" ? "all" : types[state?.phaseIndex || 0];
         let rows = [], hasMore = false;
-        if (phase === "all") { rows = allPages[allPage++] || []; hasMore = allPage < allPages.length; }
+        if (phase === "all") {
+          const start=state?.fromId?all.findIndex(item=>item.id===state.fromId)+1:0;
+          rows=all.slice(start,start+100);hasMore=start+rows.length<all.length;
+        }
         else if (phase === "subscriptions") { rows = subscriptions[subscriptionPage++]; hasMore = subscriptionPage < subscriptions.length; }
         else rows = typedRows[phase];
         done = await collect(c, state, rows, hasMore);
@@ -133,6 +145,7 @@ async function main() {
       return { pages: done.chunkResult?.page || state?.page, accepted: view.accepted, subscriptionFacts: subscriptions.flat().length, purchaseCents: 500, tipCents: 1299 };
     }
 
+    if (!onlyLive) {
     const c = await setup("replay"), first = await collect(c);
     await post(c, "progress", wire(c, first, envelope(null)));
     const originalReceipts = await receipts(c);
@@ -149,7 +162,8 @@ async function main() {
     await post(c, "progress", wire(c, second, envelope(first.continuation)));
     await post(c, "progress", wire(c, first));
     assert.deepEqual((await row(c)).continuation, envelope(second.continuation), "late page cannot rewind page 2");
-    assert.deepEqual(await receipts(c), originalReceipts);
+    for (const receipt of originalReceipts) assert.deepEqual(await db.analyticsIngestBatch.findUnique({where:{id:receipt.id}}),receipt);
+    assert.equal((await receipts(c)).length, originalReceipts.length + 1, "empty source page has its own receipt");
     assert.equal(await db.creatorSubscriptionEvent.count({ where: { creatorId: c.creatorId } }), 11);
     console.log("PASS changed and exact stale pages: no receipt mutation, no cursor rewind, 11 facts");
 
@@ -198,7 +212,7 @@ async function main() {
       const oldSync = { agencyId: scopeCase.agencyId, creatorId: scopeCase.creatorId, sourceJobId: scopeCase.job.id,
         status: "FAILED", mode, scanRunId: oldRun, pagesScanned: 68, eventsRejected: 1,
         lastErrorCode: "NOTIFICATION_SCAN_FAILED", lastErrorMessage: "lease expired",
-        ...(mode === "catchup" ? { fullBackfillCompletedAt: yesterday, fullBackfillVerifiedAt: yesterday,
+        ...(mode === "catchup" ? { normalizerVersion:"notification-source-v2", fullBackfillCompletedAt: yesterday, fullBackfillVerifiedAt: yesterday,
           fullBackfillObservedAt: yesterday, headNotificationId: "verified-old-head", knownNotificationIds: ["verified-old-head"] } : {}) };
       await db.creatorNotificationSyncState.upsert({ where: { creatorId: scopeCase.creatorId }, create: oldSync, update: oldSync });
       scopeCase.job = await db.jobInstance.update({ where: { id: scopeCase.job.id }, data: {
@@ -228,16 +242,86 @@ async function main() {
     // An error after SQL facts/audit writes rolls back both facts and cursor. No
     // receipt recovery should run for unrelated failures. A later retry commits.
     const fault = await setup("rollback"), faultPage = await collect(fault);
-    const broken = structuredClone(faultPage); broken.chunkResult.auditItems[0].ordinal = -1;
-    await post(fault, "progress", wire(fault, broken), 500);
+    const syncService=require("../src/services/notification-sync-state-service");
+    const originalProgress=syncService.recordNotificationPageProgress;
+    syncService.recordNotificationPageProgress=async args=>{await originalProgress(args);throw new Error("injected failure after facts, audit and frontier");};
+    try { await post(fault, "progress", wire(fault, faultPage), 500); } finally { syncService.recordNotificationPageProgress=originalProgress; }
     assert.equal((await row(fault)).continuation, null); assert.equal((await row(fault)).attempts, 0);
     assert.equal((await receipts(fault)).length, 0);
     assert.equal(await db.creatorSubscriptionEvent.count({ where: { creatorId: fault.creatorId } }), 0);
     await post(fault, "progress", wire(fault, faultPage, null));
     assert.equal(await db.creatorSubscriptionEvent.count({ where: { creatorId: fault.creatorId } }), 11);
-    assert.equal(unhandled.length, 1, "only the intentionally invalid audit row is unhandled");
+    assert.equal(unhandled.length, 1, "only the intentionally injected transaction failure is unhandled");
     console.log("PASS late validation failure: full SQL rollback and successful exact retry");
-    console.log(JSON.stringify({ ok: true, realHttp: true, realSql: true, emittedDesktopHandler: true, productionReclaim: true, moneyNotDuplicated: true }));
+    const domain = await setup("source-semantics", "catchup");
+    const domainRows = [
+      {...eventBase,id:"info-price",type:"price_changed",subType:"price_changed_from_free"},
+      {...eventBase,id:"info-consent",type:"deactivated_media",subType:"deactivated_consent_withdrawal_request"},
+      {...eventBase,id:"deleted-like",type:"favorited",postDeleted:true},
+      {...eventBase,id:"missing-like",type:"favorited"},
+      {...eventBase,id:"tip-profile",type:"tip",text:"I like comments",user:{id:333,name:"Comment King",price:50},replacePairs:{"{AMOUNT}":"12.99"}},
+      {...eventBase,id:"same-minute-1",type:"subscribed",amount:5},
+      {...eventBase,id:"same-minute-2",type:"subscribed",amount:5},
+    ];
+    const domainPage=await collect(domain,null,domainRows,false);
+    await post(domain,"progress",wire(domain,domainPage,null));
+    const observations=await db.creatorNotificationEvent.findMany({where:{creatorId:domain.creatorId}});
+    assert.equal(observations.length,7);
+    assert.equal(observations.filter(r=>r.persistenceStatus==="EVENT_STORED").length,2);
+    assert.equal(observations.filter(r=>r.persistenceStatus==="TARGET_UNAVAILABLE").length,2);
+    assert.equal(observations.find(r=>r.notificationId==="deleted-like").targetState,"DELETED");
+    assert.equal(observations.find(r=>r.notificationId==="missing-like").targetState,"UNAVAILABLE");
+    assert.equal(await db.creatorPostLike.count({where:{creatorId:domain.creatorId}}),0);
+    assert.equal(await db.creatorSubscriptionEvent.count({where:{creatorId:domain.creatorId}}),2);
+    assert.equal((await db.creatorTip.findFirst({where:{creatorId:domain.creatorId}})).amountCents,1299);
+    const audit=await scanner(domain);assert.equal(audit.accepted,7);assert.equal(audit.rejected,0);
+    assert.equal(audit.items.filter(r=>r.persistenceStatus==="FACT_COMMITTED").length,3);
+    const sourceService=require("../src/services/notification-source-ledger-service");
+    const replayed=await sourceService.ingestNotificationSourcePage({db,job:domain.job,deviceId:domain.deviceId,chunk:domainPage.chunkResult});
+    assert.equal(replayed.replayed,true);
+    const mutated=structuredClone(domainPage.chunkResult);mutated.observations[0].sourceEvidence.subType="changed";
+    await assert.rejects(sourceService.ingestNotificationSourcePage({db,job:domain.job,deviceId:domain.deviceId,chunk:mutated}),{code:"ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT"});
+    const proof=await require("../src/services/notification-page-receipt-service").notificationCommittedPageProof(db,domain.job,domainPage.result);
+    assert.equal(proof.verified,true);assert.equal(proof.sourceProof.observed,7);
+    const brokenProof=await require("../src/services/notification-page-receipt-service").notificationCommittedPageProof(db,domain.job,{...domainPage.result,totalObservedRows:8});assert.equal(brokenProof.verified,false);
+    console.log("PASS informational events, unavailable/deleted targets, exact money, strong subscription IDs, DB audit and immutable source replay");
+
+    const repair=await setup("reclassification","catchup");
+    await db.creatorSubscriptionEvent.create({data:{agencyId:repair.agencyId,creatorId:repair.creatorId,eventFingerprint:hash("wrong-category"),externalNotificationId:"wrong-tip",eventType:"SUBSCRIBED_PAID",observedPriceCents:500,currency:"USD",occurredAt:new Date(eventBase.createdAt),source:"NOTIFICATION"}});
+    const repairPage=await collect(repair,null,[{...eventBase,id:"wrong-tip",type:"tip",amount:5}],false);
+    await post(repair,"progress",wire(repair,repairPage,null));
+    assert.equal(await db.creatorSubscriptionEvent.count({where:{creatorId:repair.creatorId}}),0);
+    assert.equal(await db.creatorTip.count({where:{creatorId:repair.creatorId}}),1);
+    assert.equal(await db.creatorNotificationCorrection.count({where:{creatorId:repair.creatorId}}),1);
+    console.log("PASS exact notification reclassification removes the former category with a durable correction journal");
+    const protectedCase=await setup("protected-fact","catchup");
+    await db.creatorSubscriptionEvent.create({data:{agencyId:protectedCase.agencyId,creatorId:protectedCase.creatorId,eventFingerprint:hash("protected-category"),externalNotificationId:"protected-tip",externalTransactionId:"payout-1",eventType:"SUBSCRIBED_PAID",observedPriceCents:500,currency:"USD",occurredAt:new Date(eventBase.createdAt),source:"ONLYFANS_API"}});
+    const protectedPage=await collect(protectedCase,null,[{...eventBase,id:"protected-tip",type:"tip",amount:5}],false);
+    await post(protectedCase,"progress",wire(protectedCase,protectedPage,null));
+    assert.equal(await db.creatorSubscriptionEvent.count({where:{creatorId:protectedCase.creatorId}}),1);
+    assert.equal(await db.creatorTip.count({where:{creatorId:protectedCase.creatorId}}),0);
+    const protectedView=await scanner(protectedCase);assert.equal(protectedView.rejected,1);assert.equal(protectedView.accepted,0);assert.equal(protectedView.items[0].reasonCode,"RECLASSIFICATION_AUTHORITY_CONFLICT");
+    assert.equal((await require("../src/services/notification-page-receipt-service").notificationCommittedPageProof(db,protectedCase.job,protectedPage.result)).verified,false);
+    console.log("PASS independently reconciled money is preserved, visibly rejected and cannot prove COMPLETE");
+    }
+    const live=await setup("live-source","catchup");
+    await db.deviceCreatorBinding.create({data:{agencyId:live.agencyId,creatorId:live.creatorId,deviceId:live.deviceId,status:"ACTIVE",realtimeReady:true,accessEpoch:1,lastSeenAt:new Date()}});
+    const {normalizeNotificationSource}=await import(pathToFileURL(path.join(desktop,"apps/desktop/dist/electron/main/services/notifications/notification-source-normalizer.js")));
+    const rawLive=[{...eventBase,id:"live-tip",type:"tip",replacePairs:{"{AMOUNT}":"12.99"}},{...eventBase,id:"live-info",type:"price_changed",subType:"price_changed_from_free"}];
+    const liveEvents=rawLive.map(raw=>{const {event,...observation}=normalizeNotificationSource(raw,live.creatorId);return {normalizerVersion:"notification-source-v2",eventType:"notification_source_observed",notificationFact:event,notificationObservation:observation};});
+    const liveBody={deviceId:live.deviceId,batchId:"live-source-proof-0001",observedAt:new Date().toISOString(),sourceTimezone:"UTC",events:liveEvents};
+    for(let repeat=0;repeat<2;repeat++){
+      const response=await fetch(`${base.replace("/api/jobs","/api/stats")}/creators/${live.creatorId}/notifications/live`,{method:"POST",headers:{"content-type":"application/json","x-fixture-agency":live.agencyId},body:JSON.stringify({...liveBody,observedAt:new Date().toISOString()})});
+      const result=await response.json();assert.equal(response.status,200,JSON.stringify(result));assert.equal(result.ok,true);
+    }
+    assert.equal(await db.creatorTip.count({where:{creatorId:live.creatorId}}),1);assert.equal(await db.creatorNotificationEvent.count({where:{creatorId:live.creatorId}}),2);
+    const liveHistory=await collect(live,null,rawLive,false);await post(live,"progress",wire(live,liveHistory,null));
+    assert.equal(await db.creatorTip.count({where:{creatorId:live.creatorId}}),1);assert.equal(await db.creatorNotificationEvent.count({where:{creatorId:live.creatorId}}),2);
+    assert.equal((await db.creatorNotificationSyncState.findUnique({where:{creatorId:live.creatorId}})).fullBackfillVerifiedAt,null);
+    console.log("PASS live HTTP with current device/binding, exact replay and subsequent history preserves one canonical fact");
+    await require("../src/services/database-contract-service").assertDatabaseContract(db);
+    console.log("PASS additive schema and approved migration chain satisfy startup contract");
+    console.log(JSON.stringify({ ok: true, realHttp: true, realSql: true, emittedDesktopHandler: true, productionReclaim: !onlyLive, moneyNotDuplicated: true, scope: onlyLive ? "live-only" : "full" }));
   } finally {
     if (server) await new Promise(resolve => server.close(resolve));
     await f.close();

@@ -137,7 +137,7 @@ function verifiedProofTimestampReady(value, now = new Date()) {
 }
 
 function notificationHistoricalBaselineReady(state, now = new Date()) {
-  return verifiedProofTimestampReady(state?.fullBackfillVerifiedAt, now);
+  return state?.normalizerVersion === "notification-source-v2" && verifiedProofTimestampReady(state?.fullBackfillVerifiedAt, now);
 }
 function notificationJobMode(params) {
   // Desktop has always treated anything except an explicit catch-up marker as

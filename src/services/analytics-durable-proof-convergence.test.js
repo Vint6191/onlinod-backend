@@ -31,7 +31,7 @@ for (const c of cases) test(c.name + ": readers and planning use the same proof"
   assert.equal(iso(read.lastVerifiedAt), iso(c.latest));
   for (const type of ["NOTIFICATIONS", "FINANCIAL", "CAMPAIGNS"]) {
     const state = type === "NOTIFICATIONS"
-      ? { fullBackfillVerifiedAt: c.baseline, lastCatchupVerifiedAt: c.head, fullBackfillObservedAt: c.baseline, lastCatchupObservedAt: c.head }
+      ? { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: c.baseline, lastCatchupVerifiedAt: c.head, fullBackfillObservedAt: c.baseline, lastCatchupObservedAt: c.head }
       : { receiptCoverageVersion: 1, baselineVerifiedAt: c.baseline, lastCatchupCompletedAt: c.head, baselineObservedAt: c.baseline, lastCatchupObservedAt: c.head };
     state.activeGeneration = "server-generation";
     const before = JSON.stringify(state);
@@ -44,7 +44,7 @@ for (const c of cases) test(c.name + ": readers and planning use the same proof"
 });
 
 test("unverified notification completion never becomes a planning proof", () => {
-  const state = { fullBackfillVerifiedAt: ago(72), lastCatchupVerifiedAt: ago(48), fullBackfillObservedAt: ago(72), lastCatchupObservedAt: ago(48), lastCatchupCompletedAt: ago(0.1) };
+  const state = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: ago(72), lastCatchupVerifiedAt: ago(48), fullBackfillObservedAt: ago(72), lastCatchupObservedAt: ago(48), lastCatchupCompletedAt: ago(0.1) };
   assert.equal(iso(collectorPlanningProofAt("NOTIFICATIONS", "catchup", state, now)), iso(ago(48)));
 });
 

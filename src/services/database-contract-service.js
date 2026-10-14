@@ -1,5 +1,6 @@
 "use strict";
-const contract = require("./database-contract.json");
+const { currentContract, validMigrationPrefix } = require("./database-migration-chain");
+const contract = currentContract();
 
 function identity(row) { return JSON.stringify(Object.fromEntries(Object.keys(row).sort().map(key => [key, row[key]]))); }
 function compare(expected, actual, key) {
@@ -13,8 +14,7 @@ async function readDatabaseContract(db) {
   const ledger = await db.$queryRawUnsafe('SELECT migration_name,checksum,finished_at,rolled_back_at FROM "_prisma_migrations"');
   const applied = ledger.filter(row => !row.rolled_back_at);
   const problems = [];
-  if (applied.length !== 1 || applied[0].migration_name !== contract.migration
-      || applied[0].checksum !== contract.checksum || !applied[0].finished_at) problems.push("BASELINE_REQUIRED");
+  if (!validMigrationPrefix(applied, true)) problems.push("BASELINE_REQUIRED");
   for (const key of ["tables", "columns", "enums", "views", "functions", "triggers", "constraints", "indexes"]) {
     const rows = await db.$queryRawUnsafe(contract.queries[key]);
     problems.push(...compare(contract[key], rows, key));

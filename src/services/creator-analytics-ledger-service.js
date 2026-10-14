@@ -2573,7 +2573,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     verification: {
       officialEarnings,
       officialMessages,
-      notificationFacts: Boolean(trustedCollectionTimestamp(notificationSync?.fullBackfillVerifiedAt, now)),
+      notificationFacts: Boolean(notificationSync?.normalizerVersion === "notification-source-v2" && trustedCollectionTimestamp(notificationSync?.fullBackfillVerifiedAt, now)),
       earningsDays: verifiedEarningsDays,
       earningsComplete: earningsCollectionState.complete,
       earningsProven: earningsCollectionState.proven,
@@ -2585,6 +2585,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
       messageDays: verifiedMessageDays,
     },
     notificationSync: notificationSync ? {
+      normalizerVersion: notificationSync.normalizerVersion,
       status: notificationSync.status,
       mode: notificationSync.mode,
       pagesScanned: notificationSync.pagesScanned,

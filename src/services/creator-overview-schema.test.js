@@ -32,10 +32,10 @@ test("creator overview is a composed read model, not another raw analytics store
 
 test("one-year audience range stays locked until six-month backfill has accumulated another half year", () => {
   assert.match(service, /185 \* DAY_MS/);
-  assert.match(service, /notificationBaselineAtRaw = ledger\.notificationSync\?\.fullBackfillVerifiedAt \|\| null/);
+  assert.match(service, /notificationBaselineAtRaw = currentNotificationParser \? ledger\.notificationSync\?\.fullBackfillVerifiedAt \|\| null : null/);
   assert.match(service, /notificationBaselineAt = trustedCollectionTimestamp\(notificationBaselineAtRaw, now\)/);
   assert.match(service, /baselineCompletedAt: ledger\.notificationSync\?\.fullBackfillCompletedAt/);
-  assert.match(service, /baselineVerifiedAt: ledger\.notificationSync\?\.fullBackfillVerifiedAt/);
+  assert.match(service, /baselineVerifiedAt: notificationBaselineAtRaw/);
   assert.match(service, /lastCatchupVerifiedAt/);
   assert.match(service, /notificationVerified: notificationCollection\.proven === true/);
   assert.match(service, /oldestOccurredAt/);

@@ -86,6 +86,7 @@ test("collection planning identity excludes trigger provenance and random comman
   assert.deepEqual(buildCollectionPlanningDedupeParams({
     collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: "full", state: null,
   }), {
+    notificationNormalizerVersion: "notification-source-v2",
     planningEpoch: "none:none",
     collectionOrderingAfter: "none",
     collectionContractVersion: 1,

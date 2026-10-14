@@ -92,7 +92,7 @@ test("notification history proof is owned by durable cursor/frontier state, not 
   assert.match(notifications, /CreatorNotificationSyncState owns the durable frontier\/current collection state/);
   assert.match(notifications, /Do not write AnalyticsCoverage\(NOTIFICATION_\*\)/);
   assert.match(notificationSync, /Only the durable verification timestamp is authority/);
-  assert.match(notificationSync, /const historicalBaseline = Boolean\(trustedCollectionTimestamp\(state\?\.fullBackfillVerifiedAt, now\)\)/);
+  assert.match(notificationSync, /const historicalBaseline = Boolean\(state\?\.normalizerVersion === "notification-source-v2" && trustedCollectionTimestamp\(state\?\.fullBackfillVerifiedAt, now\)\)/);
   assert.match(notificationSync, /const stopAtNotificationId = clean\(state\?\.headNotificationId/);
   assert.match(notificationSync, /headNotificationId is the durable \*verified\* frontier/);
   assert.match(notificationSync, /knownNotificationIds: verifiedKnownIds/);

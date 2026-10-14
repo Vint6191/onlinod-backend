@@ -142,6 +142,11 @@ async function applyJobChunk({ db, job, deviceId, userId, chunkResult }) {
     return applyVaultUnsortedChunk({ db, job, deviceId, userId, chunkResult });
   }
   if (job.jobKey === CATCHUP_JOB_KEY && chunkResult?.kind === "notification_facts_page_all") {
+    if (chunkResult.schemaVersion === 6) {
+      assertNotificationCollectionResult({ job, scanRunId: chunkResult.scanRunId, notificationMode: chunkResult.notificationMode });
+      return require("./notification-source-ledger-service").ingestNotificationSourcePage({ db, job, deviceId, userId, chunk: chunkResult });
+    }
+    if (job.params?.notificationNormalizerVersion === "notification-source-v2") throw Object.assign(new Error("Update Desktop for the current notification collector"), { code:"NOTIFICATION_COLLECTOR_UPGRADE_REQUIRED", status:409 });
     assertNotificationCollectionResult({ job, scanRunId: chunkResult.scanRunId, notificationMode: chunkResult.notificationMode });
     const batches = Array.isArray(chunkResult.batches) ? chunkResult.batches : [];
     if (batches.length > 5) throw new Error("Notification ALL page contains too many typed batches");

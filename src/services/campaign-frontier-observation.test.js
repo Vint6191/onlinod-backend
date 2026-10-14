@@ -19,7 +19,7 @@ const control = load('analytics-collector-control-service', { '../prisma': {}, '
 const shared = { '../prisma': {}, './db-time-authority-service': clock, './analytics-collector-control-service': control };
 const scheduled = [];
 const orchestrator = load('creator-analytics-sync-orchestrator', { ...shared,
-  './notification-sync-state-service': { loadNotificationSyncState: async () => ({ fullBackfillVerifiedAt: now, fullBackfillObservedAt: now }) },
+  './notification-sync-state-service': { loadNotificationSyncState: async () => ({ normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now, fullBackfillObservedAt: now }) },
   './financial-transactions-service': { JOB_KEY: 'financial_transactions_scan' },
   './job-scheduler': { scheduleJobNow: async input => { scheduled.push(input); return { created: true }; } },
 });

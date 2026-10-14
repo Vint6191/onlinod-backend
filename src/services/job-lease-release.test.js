@@ -151,7 +151,7 @@ function fixture() {
 function notificationConflictFixture() {
   const item = fixture();
   Object.assign(item.job, { creatorId: "creator-1", jobKey: "catchup_notifications_scan", attempts: 0, continuation: null,
-    params: { collectionGeneration: "conflicting-run", collectionRequestedAt: "2026-10-01T00:00:00.000Z",
+    params: { notificationNormalizerVersion: "notification-source-v2", collectionGeneration: "conflicting-run", collectionRequestedAt: "2026-10-01T00:00:00.000Z",
       collectionMode: "full", notificationMode: "full", types: [...NOTIFICATION_TYPES] }, result: null });
   item.applyJobChunk = async () => { throw Object.assign(new Error("immutable receipt conflict"), { code: "ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT" }); };
   item.input = { jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3,
@@ -1027,7 +1027,7 @@ test("claiming a queued pre-fix repair returns a fresh notification generation a
   const now = new Date();
   const candidate = { id: "queued-old-repair", agencyId: "agency-1", creatorId: "creator-1", jobKey: "catchup_notifications_scan",
     status: "SCHEDULED", leaseRevision: 4, attempts: 2, startedAt: now, progress: { percent: 30 },
-    params: { notificationMode: "catchup", types: ["tips"], collectionGeneration: "old-run", collectionRequestedAt: now.toISOString() },
+    params: { notificationNormalizerVersion: "notification-source-v2", notificationMode: "catchup", types: ["tips"], collectionGeneration: "old-run", collectionRequestedAt: now.toISOString() },
     result: { scanRunId: "old-run", coverage: { tips: { status: "partial" } }, completionSideEffect: { ok: false } },
     continuation: { driverPhase: "execute", jobContinuation: { page: 1 } }, nextRunAt: now,
   };
@@ -1290,7 +1290,7 @@ test("claim fence cancels a legacy no-mode notification FULL once historical bas
     agencyMember: { findFirst: async () => ({ id: "member-1", role: "OWNER", roleKey: "owner", assignedCreators: "all" }) },
     creatorAccount: { findMany: async () => [{ id: "creator-1" }] },
     deviceCreatorBinding: { findMany: async () => [{ creatorId: "creator-1" }] },
-    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), fullBackfillVerifiedAt: new Date("2026-08-08T00:01:00.000Z") }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-08T00:01:00.000Z") }) },
     jobInstance: {
       findFirst: async () => (candidateReads++ === 0 ? candidate : null),
       updateMany: async (args) => {
@@ -1319,7 +1319,7 @@ test("renew fence kills an already claimed legacy no-mode notification FULL afte
   const db = {
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
     agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), fullBackfillVerifiedAt: new Date("2026-08-08T00:01:00.000Z") }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillCompletedAt: new Date("2026-08-08T00:00:00.000Z"), normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-08T00:01:00.000Z") }) },
     jobInstance: {
       findUnique: async () => job,
       updateMany: async (args) => { cancellation = args; return { count: 1 }; },
@@ -1346,7 +1346,7 @@ test("future-poisoned notification baseline cannot cancel a repair FULL lease", 
   const db = {
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
     agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillVerifiedAt: new Date("2099-01-01T00:00:00.000Z") }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2099-01-01T00:00:00.000Z") }) },
     jobInstance: {
       findUnique: async () => job,
       updateMany: async (args) => { update = args; return { count: 1 }; },
@@ -1371,7 +1371,7 @@ test("explicitly forced notification FULL is exempt from the legacy-mode lease f
   const db = {
     workerDevice: { findUnique: async () => ({ id: "device-1", userId: "user-1", agencyId: "agency-1" }) },
     agencyMember: { findFirst: async () => ({ id: "member-1" }) },
-    creatorNotificationSyncState: { findUnique: async () => ({ fullBackfillVerifiedAt: new Date("2026-08-08T00:00:00.000Z") }) },
+    creatorNotificationSyncState: { findUnique: async () => ({ normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-08T00:00:00.000Z") }) },
     jobInstance: {
       findUnique: async () => job,
       updateMany: async (args) => { update = args; return { count: 1 }; },

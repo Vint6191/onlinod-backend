@@ -5,6 +5,7 @@ const fs = require("node:fs"), path = require("node:path"), os = require("node:o
 const { spawn } = require("node:child_process");
 const { PrismaClient } = require("@prisma/client");
 const contract = require("../../src/services/database-contract.json");
+const { migrations, validMigrationPrefix } = require("../../src/services/database-migration-chain");
 const { assertDatabaseContract } = require("../../src/services/database-contract-service");
 const root = path.resolve(__dirname, "../..");
 const legacyResetTarget = "20261009000000_current_baseline";
@@ -12,17 +13,22 @@ const legacyResetFlag = "--reset-legacy-test-database";
 function fail(code) { throw Object.assign(new Error(code), { code }); }
 
 // A source overlay can leave retired directories beside the current baseline.
-// Prisma must never discover that mixed tree. Give it one verified migration
+// Prisma must never discover that mixed tree. Give it the explicit verified migration chain
 // in a private temporary directory; the repository itself is never rewritten.
 function prepareDeployment(sourceRoot = root) {
-  const sql = fs.readFileSync(path.join(sourceRoot, "prisma/migrations", contract.migration, "migration.sql"), "utf8").replace(/\r\n/g, "\n");
-  if (crypto.createHash("sha256").update(sql).digest("hex") !== contract.checksum) fail("BASELINE_SOURCE_CHECKSUM_MISMATCH");
+  const sources = migrations.map(migration => {
+    const sql = fs.readFileSync(path.join(sourceRoot, "prisma/migrations", migration.migration, "migration.sql"), "utf8").replace(/\r\n/g, "\n");
+    if (crypto.createHash("sha256").update(sql).digest("hex") !== migration.checksum) fail("BASELINE_SOURCE_CHECKSUM_MISMATCH");
+    return { ...migration, sql };
+  });
   const schema = fs.readFileSync(path.join(sourceRoot, "prisma/schema.prisma"));
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nod-current-install-"));
   try {
-    const migrationDirectory = path.join(directory, "migrations", contract.migration);
-    fs.mkdirSync(migrationDirectory, { recursive: true });
-    fs.writeFileSync(path.join(migrationDirectory, "migration.sql"), sql);
+    for (const source of sources) {
+      const migrationDirectory = path.join(directory, "migrations", source.migration);
+      fs.mkdirSync(migrationDirectory, { recursive: true });
+      fs.writeFileSync(path.join(migrationDirectory, "migration.sql"), source.sql);
+    }
     fs.writeFileSync(path.join(directory, "migrations/migration_lock.toml"), 'provider = "postgresql"\n');
     const schemaPath = path.join(directory, "schema.prisma");
     fs.writeFileSync(schemaPath, schema);
@@ -41,10 +47,10 @@ async function inspectInstallation(db) {
     return { fresh: true };
   }
   const rows = await db.$queryRawUnsafe('SELECT migration_name,checksum,finished_at,rolled_back_at FROM "_prisma_migrations"');
-  if (rows.some(row => row.migration_name !== contract.migration || row.checksum !== contract.checksum)) fail("CURRENT_BASELINE_DATABASE_REQUIRED");
+  if (rows.some(row => !migrations.some(expected => row.migration_name === expected.migration && row.checksum === expected.checksum))) fail("CURRENT_BASELINE_DATABASE_REQUIRED");
   if (rows.some(row => !row.finished_at && !row.rolled_back_at)) fail("BASELINE_INSTALLATION_INCOMPLETE");
   const applied = rows.filter(row => row.finished_at && !row.rolled_back_at);
-  if (applied.length > 1) fail("DUPLICATE_BASELINE_RECEIPT");
+  if (!validMigrationPrefix(rows)) fail("DUPLICATE_BASELINE_RECEIPT");
   if (!applied.length && tables.some(row => row.name !== "_prisma_migrations")) fail("EMPTY_DATABASE_REQUIRED");
   return { fresh: applied.length === 0 };
 }
@@ -122,7 +128,7 @@ function reportFailure(error) {
     BASELINE_INSTALLATION_INCOMPLETE: "A previous installation is incomplete. Inspect its Prisma migration receipt before retrying.",
     DUPLICATE_BASELINE_RECEIPT: "The database has duplicate baseline receipts. Installation was stopped.",
     BASELINE_DEPLOY_FAILED: "Prisma could not apply the current baseline. See its error above.",
-    DATABASE_CONTRACT_REQUIRED: "The installed database differs from the current contract. Run the installer against a new empty database.",
+    DATABASE_CONTRACT_REQUIRED: "The installed database differs from the current contract. Inspect the reported schema differences; no reset was performed.",
   };
   console.error(error.code || "DATABASE_INSTALL_FAILED");
   if (messages[error.code]) console.error(messages[error.code]);

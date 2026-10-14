@@ -299,13 +299,14 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     db.creatorCampaignCollectionState?.findUnique ? db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
   ]);
 
-  const notificationBaselineAtRaw = ledger.notificationSync?.fullBackfillVerifiedAt || null;
+  const currentNotificationParser = ledger.notificationSync?.normalizerVersion === "notification-source-v2";
+  const notificationBaselineAtRaw = currentNotificationParser ? ledger.notificationSync?.fullBackfillVerifiedAt || null : null;
   const notificationBaselineAt = trustedCollectionTimestamp(notificationBaselineAtRaw, now);
   const notificationCollection = evaluateDurableCollectorState({
     status: ledger.notificationSync?.status,
     baselineCompletedAt: ledger.notificationSync?.fullBackfillCompletedAt,
-    baselineVerifiedAt: ledger.notificationSync?.fullBackfillVerifiedAt,
-    lastVerifiedAt: ledger.notificationSync?.lastCatchupVerifiedAt,
+    baselineVerifiedAt: notificationBaselineAtRaw,
+    lastVerifiedAt: currentNotificationParser ? ledger.notificationSync?.lastCatchupVerifiedAt : null,
     baselineObservedAt: ledger.notificationSync?.fullBackfillObservedAt,
     lastObservedAt: ledger.notificationSync?.lastCatchupObservedAt,
     retryAfterAt: ledger.notificationSync?.retryAfterAt,

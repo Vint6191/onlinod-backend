@@ -62,7 +62,7 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
   // A PARTIAL full scan may have reached the historical boundary while rejecting
   // canonical facts; that state must never unlock bounded catch-up as if the
   // baseline were proven. Only the durable verification timestamp is authority.
-  const historicalBaseline = Boolean(trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
+  const historicalBaseline = Boolean(state?.normalizerVersion === "notification-source-v2" && trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
   if (!historicalBaseline) {
     return {
       from: FULL_HISTORY_FROM.toISOString(),
@@ -88,6 +88,7 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
     notificationMode: "catchup",
     pageLimit: 10,
     ...(stopAtNotificationId ? { stopAtNotificationId } : {}),
+    knownNotificationIds: boundedNotificationIds(state?.knownNotificationIds),
     reason,
     analyticsRangeKey,
   };
@@ -117,11 +118,13 @@ async function verifiedFrontierIds({ db, job, scanRunId, mode, headNotificationI
   // FULL history ends with an ALL reconciliation, but its scan-audit page numbers
   // also contain the earlier typed phases. The exact verified head is therefore
   // the only safe generic frontier we can derive without mixing phase histories.
-  if (mode !== "catchup" || !db?.creatorNotificationScanItem?.findMany) {
+  if (!db?.creatorNotificationScanItem?.findMany) {
     return boundedNotificationIds([head, ...(Array.isArray(existingIds) ? existingIds : [])]);
   }
   const rows = await db.creatorNotificationScanItem.findMany({
-    where: { creatorId: job.creatorId, sourceJobId: job.id, scanRunId },
+    where: { creatorId: job.creatorId, sourceJobId: job.id, scanRunId,
+      ...(job.params?.notificationNormalizerVersion === "notification-source-v2" ? {sourcePhase: mode === "full" ? "all_reconciliation" : "all", outcome:{in:["ACCEPTED","IGNORED"]}, occurredAt:{gte:new Date(job.params.from),lte:new Date(job.params.to)}, OR:[{reasonCode:null},{reasonCode:{not:"OUTSIDE_SCAN_RANGE"}}]} : {}),
+    },
     orderBy: [{ page: "asc" }, { ordinal: "asc" }],
     take: 300,
     select: { notificationId: true },
@@ -227,7 +230,7 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
     const sourceTraversalComplete = sourceExhausted && (mode !== "full" || allSourceExhausted);
     const verified = successful === true && sourceTraversalComplete;
     const trustedPriorFullHistoryVerifiedAt = trustedCollectionTimestamp(existing?.fullBackfillVerifiedAt, now);
-    const priorFullHistoryVerified = Boolean(trustedPriorFullHistoryVerifiedAt);
+    const priorFullHistoryVerified = Boolean(trustedPriorFullHistoryVerifiedAt && existing?.normalizerVersion === "notification-source-v2");
     // A later failed/partial FULL refresh must never erase an already durable
     // historical proof. The latest attempt outcome and the last proven baseline
     // are separate facts: PARTIAL/FAILED may make the collector stale/deferred,
@@ -240,6 +243,7 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
       })
       : boundedNotificationIds(existing?.knownNotificationIds);
     const data = {
+      ...(verified && mode === "full" && result?.normalizerVersion === "notification-source-v2" ? {normalizerVersion:result.normalizerVersion}:{}),
       status: overallComplete ? "COMPLETE" : "PARTIAL",
       mode,
       scanRunId: clean(result?.scanRunId, 120),

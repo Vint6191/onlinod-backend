@@ -71,12 +71,12 @@ function manualContinuationSchema(job) {
   return Number.isInteger(value) && value > 0 ? value : null;
 }
 function historicalBaselineReady(state, now = new Date()) {
-  return Boolean(trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
+  return Boolean(state?.normalizerVersion === "notification-source-v2" && trustedCollectionTimestamp(state?.fullBackfillVerifiedAt, now));
 }
 function hasCurrentNotificationCommand(job, expectedMode) {
   try {
     const command = collectionCommand(job, COLLECTOR_TYPES.NOTIFICATIONS);
-    return command.mode === expectedMode;
+    return command.mode === expectedMode && job.params?.notificationNormalizerVersion === "notification-source-v2";
   } catch {
     return false;
   }
@@ -85,10 +85,9 @@ function pausedManualJobNeedsFreshRun(job, desiredMode) {
   const params = object(job?.params);
   if (params.notificationMode !== desiredMode) return true;
   const schema = manualContinuationSchema(job);
-  // Current desktop continuation contract is v8. v8 adds the page-level
-  // known-boundary proof. Never resume an older cursor under the new stopping
+  // Current desktop continuation contract is v9 with the source ledger. Never resume an older cursor under the new stopping
   // semantics; keep the row for audit and create a clean run in the desired mode.
-  return schema !== null && schema < 8;
+  return schema !== null && schema < 9;
 }
 
 
@@ -188,7 +187,7 @@ async function stopManualNotificationScan({ db = prisma, creatorId, now = new Da
   return pauseCollectorJob({ db, creatorId, jobKey: JOB_KEY, collectorType: COLLECTOR_TYPES.NOTIFICATIONS, now });
 }
 
-function normalizeAuditRow(row, index) {
+function normalizeAuditRow(row, index, verifiedSource=false) {
   const outcome = String(row?.outcome || "").trim().toUpperCase();
   if (!OUTCOMES.has(outcome)) throw new Error(`Notification scan item ${index} has invalid outcome`);
   const factTypeRaw = clean(row?.factType, 40);
@@ -228,21 +227,22 @@ function normalizeAuditRow(row, index) {
     currency: currencyCode,
     outcome,
     reasonCode: clean(row?.reasonCode, 160),
+    ...Object.fromEntries(["eventKind","targetState","persistenceStatus","normalizerVersion","canonicalEventId","sourcePhase"].filter(key=>verifiedSource && row?.[key]!==undefined).map(key=>[key,clean(row[key],160)])),
   };
 }
 
-async function recordNotificationScanItems({ db, job, chunk }) {
+async function recordNotificationScanItems({ db, job, chunk, verifiedSource=false }) {
   if (!db?.creatorNotificationScanItem?.createMany) return { received: 0, stored: 0 };
   if (!job?.creatorId || !job?.agencyId || !job?.id) throw new Error("Notification scan audit requires creator job scope");
-  const scanRunId = clean(chunk?.scanRunId, 80);
-  if (!scanRunId || !/^[A-Za-z0-9._-]{8,80}$/.test(scanRunId)) throw new Error("Notification scan audit requires a valid scanRunId");
+  const scanRunId = clean(chunk?.scanRunId, 120);
+  if (!scanRunId || !/^[A-Za-z0-9._-]{8,120}$/.test(scanRunId)) throw new Error("Notification scan audit requires a valid scanRunId");
   const rawItems = Array.isArray(chunk?.auditItems) ? chunk.auditItems : [];
   if (rawItems.length > MAX_AUDIT_ITEMS_PER_SOURCE_PAGE) {
     throw Object.assign(new Error(`Notification scan page audit exceeds ${MAX_AUDIT_ITEMS_PER_SOURCE_PAGE} rows`), {
       code: "NOTIFICATION_SCAN_AUDIT_PAGE_TOO_LARGE",
     });
   }
-  const rows = rawItems.map(normalizeAuditRow);
+  const rows = rawItems.map((row,index)=>normalizeAuditRow(row,index,verifiedSource));
   if (!rows.length) return { received: 0, stored: 0 };
   const created = await db.creatorNotificationScanItem.createMany({
     data: rows.map((row) => ({
@@ -278,6 +278,8 @@ function itemForClient(row) {
     currency: row.currency,
     outcome: row.outcome,
     reasonCode: row.reasonCode,
+    eventKind: row.eventKind || null, targetState: row.targetState || null,
+    persistenceStatus: row.persistenceStatus || null, normalizerVersion: row.normalizerVersion || null, canonicalEventId: row.canonicalEventId || null,
   };
 }
 
@@ -394,6 +396,7 @@ async function readManualNotificationScan({ db = prisma, creator, outcome = "ALL
     ok: true,
     creatorId: creator.id,
     jobId: job?.id || null,
+    scanRunId,
     status: currentStatus,
     mode: scanMode(job, linkedSync),
     manual: isManualJob(job),

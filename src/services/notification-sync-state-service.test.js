@@ -69,7 +69,7 @@ test("a future-poisoned baseline timestamp cannot unlock notification catch-up",
   const params = buildNotificationScanParams({
     state: {
       fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
-      fullBackfillVerifiedAt: new Date("2026-08-06T22:00:00.000Z"),
+      normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-06T22:00:00.000Z"),
       headNotificationId: "poisoned-head",
     },
     now,
@@ -83,7 +83,7 @@ test("after verified source traversal catch-up is bounded by the durable ID fron
   const params = buildNotificationScanParams({
     state: {
       fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
-      fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
+      normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
       newestOccurredAt: new Date("2026-08-06T20:00:00.000Z"),
       headNotificationId: "notification-head-1",
     },
@@ -98,7 +98,7 @@ test("a realtime socket event cannot move the catch-up event floor across an unv
   const db = fakeDb({
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
     fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
     newestOccurredAt: new Date("2026-08-01T00:00:00.000Z"),
     headNotificationId: "notification-head-verified",
   });
@@ -119,7 +119,7 @@ test("a completed-but-unverified traversal remains FULL repair work instead of b
   const params = buildNotificationScanParams({
     state: {
       fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
-      fullBackfillVerifiedAt: null,
+      normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: null,
       newestOccurredAt: new Date("2026-08-06T20:00:00.000Z"),
       headNotificationId: "notification-head-1",
     },
@@ -186,7 +186,7 @@ test("source exhaustion records completed traversal while verification remains s
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
     scanRunId: "scan-run-0001", pagesScanned: 20, eventsAccepted: 500,
     eventsRejected: 1, ignoredEvents: 10,
-    fullBackfillVerifiedAt: new Date("2026-07-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-07-01T00:00:00.000Z"),
   });
   await completeNotificationSync({
     db, job, deviceId: "device-1", successful: false,
@@ -224,7 +224,7 @@ test("a new forced FULL failure preserves the previous verified frontier and bas
   const db = fakeDb({
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
     status: "COMPLETE", mode: "catchup", scanRunId: "old-catchup-run",
-    fullBackfillCompletedAt: oldVerifiedAt, fullBackfillVerifiedAt: oldVerifiedAt,
+    fullBackfillCompletedAt: oldVerifiedAt, normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: oldVerifiedAt,
     headNotificationId: "verified-head-old",
     knownNotificationIds: ["verified-head-old", "verified-neighbor"],
   });
@@ -249,7 +249,7 @@ test("partial FULL cannot preserve a future-poisoned historical baseline as proo
   const db = fakeDb({
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
     status: "COMPLETE", mode: "full", scanRunId: "old-poisoned-run",
-    fullBackfillCompletedAt: futurePoisonedAt, fullBackfillVerifiedAt: futurePoisonedAt,
+    fullBackfillCompletedAt: futurePoisonedAt, normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: futurePoisonedAt,
     headNotificationId: "old-head", knownNotificationIds: ["old-head"],
   });
   await completeNotificationSync({
@@ -269,7 +269,7 @@ test("a partial later FULL cannot erase an already durable historical baseline",
   const oldVerifiedAt = new Date("2026-08-01T00:00:00.000Z");
   const db = fakeDb({
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
-    scanRunId: "legacy-v6-run", fullBackfillCompletedAt: oldVerifiedAt, fullBackfillVerifiedAt: oldVerifiedAt,
+    scanRunId: "legacy-v6-run", fullBackfillCompletedAt: oldVerifiedAt, normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: oldVerifiedAt,
   });
   await completeNotificationSync({
     db, job: notificationJob("legacy-v6-run", "full"), deviceId: "device-1", successful: true,
@@ -290,7 +290,7 @@ test("catch-up page progress cannot advance the durable verified frontier before
   const db = fakeDb({
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
     status: "COMPLETE", mode: "catchup",
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
     headNotificationId: "verified-head-old",
     knownNotificationIds: ["verified-head-old", "verified-neighbor"],
   });
@@ -321,7 +321,7 @@ test("verified catch-up atomically promotes the new head and verified known-ID f
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
     status: "SCANNING", mode: "catchup", scanRunId: "scan-run-catchup-promote",
     activeGeneration: "scan-run-catchup-promote", activeRequestedAt: new Date("2026-08-06T21:03:00.000Z"),
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
     headNotificationId: "verified-head-old",
     knownNotificationIds: ["verified-head-old"],
   }, [
@@ -351,7 +351,7 @@ test("partial catch-up preserves the previous verified frontier instead of skipp
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
     status: "SCANNING", mode: "catchup", scanRunId: "scan-run-catchup-partial",
     activeGeneration: "scan-run-catchup-partial", activeRequestedAt: new Date("2026-08-06T21:04:00.000Z"),
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
     headNotificationId: "verified-head-old",
     knownNotificationIds: ["verified-head-old", "verified-neighbor"],
   }, [{ sourceJobId: catchupJob.id, notificationId: "new-unverified-head" }]);
@@ -423,7 +423,7 @@ test("same notification generation replay cannot downgrade COMPLETE to SCANNING"
   const db = fakeDb({
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1", status: "COMPLETE", mode: "full",
     scanRunId: "scan-run-complete", activeGeneration: "scan-run-complete", activeRequestedAt: new Date("2026-08-06T21:03:00.000Z"),
-    fullBackfillCompletedAt: new Date("2026-08-06T21:03:10.000Z"), fullBackfillVerifiedAt: new Date("2026-08-06T21:03:10.000Z"),
+    fullBackfillCompletedAt: new Date("2026-08-06T21:03:10.000Z"), normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-06T21:03:10.000Z"),
   });
   await recordNotificationPageProgress({
     db, job: authorityJob, deviceId: "device-1",
@@ -437,7 +437,7 @@ test("live facts cannot falsely verify an incomplete historical backfill", async
   const db = fakeDb({
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1",
     status: "PARTIAL", mode: "full", fullBackfillCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
-    fullBackfillVerifiedAt: null,
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: null,
   });
   await recordNotificationSocketEvent({
     db, agencyId: "agency-1", creatorId: "creator-1", deviceId: "device-1",
@@ -454,7 +454,7 @@ test("notification failure persists the Job retry boundary and retry page clears
   const db = fakeDb({
     id: "sync-1", agencyId: "agency-1", creatorId: "creator-1", status: "SCANNING", mode: "catchup",
     scanRunId: "scan-run-retry", activeGeneration: "scan-run-retry", activeRequestedAt: new Date("2026-08-06T21:04:00.000Z"),
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"),
   });
   const retryAt = new Date("2026-08-06T21:09:00.000Z");
   await recordNotificationSyncFailure({ db, job: authorityJob, error: new Error("provider timeout"), terminal: false, retryAfterAt: retryAt });

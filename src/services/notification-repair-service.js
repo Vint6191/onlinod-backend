@@ -10,7 +10,9 @@ const { NOTIFICATION_TYPES, hasFullNotificationScope } = require("./notification
 // the receipt checksum even when the source page itself has not changed.
 function notificationRepairParams(job, now, result = job?.result) {
   const params = { ...(job?.params || {}) };
-  const mode = params.notificationMode === "catchup" ? "catchup" : "full";
+  const upgrade = params.notificationNormalizerVersion !== "notification-source-v2";
+  const mode = !upgrade && params.notificationMode === "catchup" ? "catchup" : "full";
+  if (upgrade) { delete params.knownNotificationIds; delete params.stopAtNotificationId; params.from="2016-01-01T00:00:00.000Z"; params.to=new Date(now.getTime()+300000).toISOString(); }
   delete params.resumeCursors;
   delete params.notificationRepairPass;
   const command = buildCollectionCommand({ collectorType: COLLECTOR_TYPES.NOTIFICATIONS,
@@ -30,7 +32,7 @@ function needsNotificationRepairRotation(job) {
   // Older repairs persisted only the types seen so far. Rotate before issuing
   // or accepting work, even without a completion marker. Expanding the scope
   // in place would change immutable receipt checksums under the old run ID.
-  if (!hasFullNotificationScope(job.params)) return true;
+  if (!hasFullNotificationScope(job.params) || job.params?.notificationNormalizerVersion !== "notification-source-v2") return true;
   // lastError is cleared at claim, but the previous completion result survives.
   // This also identifies a pre-fix repair already CLAIMED by a live Desktop.
   const result = job.result;
@@ -54,7 +56,7 @@ function notificationProgressIsStale(job, chunk, expectedContinuation) {
   if (current?.driverPhase === "complete") return true;
   // The v8 Desktop deliberately restarts v1-v7 traversal state. Those page
   // counters are not comparable; any conflicting old receipt follows repair.
-  if (Number.isInteger(current?.schemaVersion) && current.schemaVersion < 8) return false;
+  if (Number.isInteger(current?.schemaVersion) && current.schemaVersion < 9) return false;
   // Rolling deployment: older Desktops do not send expectedContinuation, but
   // ALL-page numbers are monotonic across typed phases and ALL reconciliation.
   // Never let an already committed page rewind the cursor or re-read its receipt

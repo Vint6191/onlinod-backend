@@ -32,9 +32,9 @@ const kinds = [
 function fixture(jobKey, type, status = "CLAIMED") {
   const row = { id: "auto-job", creatorId: creator.id, agencyId: creator.agencyId, jobKey, status,
     leaseRevision: 7, claimedByDeviceId: "device-a", lastProgressAt: now,
-    params: { collectionContractVersion: 1, collectionType: type, collectionMode: "full",
+    params: { ...(type === "NOTIFICATIONS" ? {notificationNormalizerVersion:"notification-source-v2"}:{}), collectionContractVersion: 1, collectionType: type, collectionMode: "full",
       collectionGeneration: "run-a", collectionRequestedAt: now.toISOString(), notificationMode: "full" },
-    continuation: { schemaVersion: 8, page: 37 }, progress: { current: 37, message: "page 37" },
+    continuation: { schemaVersion: type === "NOTIFICATIONS" ? 9 : 8, page: 37 }, progress: { current: 37, message: "page 37" },
   };
   const db = { row, sync: null, released: [], updates: [],
     jobInstance: {

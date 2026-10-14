@@ -54,6 +54,7 @@ function collectorPlanningProofAt(collectorType, collectionMode, state, now = ne
   if (collectorType === COLLECTOR_TYPES.CAMPAIGNS) state = require("./campaign-membership-proof-service").membershipProofState(state);
   let baselineVerifiedAt, catchupVerifiedAt;
   if (collectorType === COLLECTOR_TYPES.NOTIFICATIONS) {
+    if (state?.normalizerVersion !== "notification-source-v2") return null;
     baselineVerifiedAt = state?.fullBackfillVerifiedAt;
     catchupVerifiedAt = state?.lastCatchupVerifiedAt;
   } else if (collectorType === COLLECTOR_TYPES.FINANCIAL || collectorType === COLLECTOR_TYPES.CAMPAIGNS) {
@@ -83,6 +84,7 @@ function buildCollectionPlanningDedupeParams({ collectorType, collectionMode = "
   return {
     planningEpoch: `${generation}:${proofAt ? proofAt.toISOString() : "none"}`,
     collectionOrderingAfter: orderingAfter ? orderingAfter.toISOString() : "none",
+    ...(collectorType === COLLECTOR_TYPES.NOTIFICATIONS ? { notificationNormalizerVersion: "notification-source-v2" } : {}),
     collectionContractVersion: COLLECTION_CONTRACT_VERSION,
     collectionType: collectorType,
     collectionMode: requestedMode,
@@ -94,6 +96,7 @@ function buildCollectionCommand({ collectorType, collectionMode = "full", reason
   const requestedAt = date(now);
   if (!requestedAt) throw new Error("ANALYTICS_COLLECTION_CLOCK_INVALID");
   return {
+    ...(collectorType === COLLECTOR_TYPES.NOTIFICATIONS ? { notificationNormalizerVersion: "notification-source-v2" } : {}),
     collectionContractVersion: COLLECTION_CONTRACT_VERSION,
     collectionType: collectorType,
     collectionMode: mode(collectionMode),

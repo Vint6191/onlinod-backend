@@ -556,7 +556,9 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
 
     const grouped = new Map();
     const dates = [];
-    for (const raw of input.events) {
+    const sourceEvents=input.events.filter(event=>event.normalizerVersion === "notification-source-v2" && event.notificationObservation);
+    for(const event of sourceEvents){const row=require("../services/notification-source-ledger-service").normalizeObservation(event.notificationObservation);if(row.occurredAt)dates.push(row.occurredAt);}
+    for (const raw of input.events.filter(event=>!sourceEvents.includes(event))) {
       const normalized = normalizeNotificationFact(raw, ctx.creator.id);
       if (!normalized.sourceType || normalized.rejected) {
         return res.status(422).json({ ok: false, code: "LIVE_NOTIFICATION_EVENT_REJECTED", error: normalized.rejected || "Unsupported live notification event" });
@@ -581,6 +583,17 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
       },
     };
     const results = [];
+    if(sourceEvents.length) {
+      const batches=["purchases","tips","subscriptions","likes","comments"].map(type=>({notificationType:type,
+        batchKey:`run:${input.batchId}:page:${type}:${crypto.createHash("sha256").update(`${input.batchId}|source|${type}`).digest("hex").slice(0,24)}`,
+        events:sourceEvents.filter(event=>event.notificationObservation.category===type&&event.notificationObservation.disposition==="FACT").map(event=>event.notificationFact),
+      }));
+      const sourceJob={...logicalJob,params:{...logicalJob.params,types:["purchases","tips","subscriptions","likes","comments"]}};
+      results.push(await withRealtimeIngestGenerationFence({db:prisma,agencyId:ctx.creator.agencyId,userId,memberId:ctx.member?.id,accessEpoch:memberAccessEpoch,creatorId:ctx.creator.id,
+        work:async({tx})=>require("../services/notification-source-ledger-service").ingestNotificationSourcePage({db:tx,job:sourceJob,deviceId:device.id,commitGuard,live:true,
+          chunk:{schemaVersion:6,normalizerVersion:"notification-source-v2",collectorVersion:"notifications-history-v9-source-ledger",scanRunId:input.batchId,page:1,
+            observations:sourceEvents.map(event=>event.notificationObservation),batches,processedRows:sourceEvents.length}})}));
+    }
     for (const [type, events] of grouped) {
       const typeHash = crypto.createHash("sha256").update(`${input.batchId}|${type}`).digest("hex").slice(0, 24);
       const result = await ingestNotificationFacts({

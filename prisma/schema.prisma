@@ -575,6 +575,8 @@ model CreatorAccount {
   financialReceiptRuns                  FinancialReceiptRun[]
   campaignCollectionState               CreatorCampaignCollectionState?
   notificationScanItems                 CreatorNotificationScanItem[]
+  notificationEvents                    CreatorNotificationEvent[]
+  notificationCorrections               CreatorNotificationCorrection[]
   financialTransactions                 CreatorFinancialTransaction[]
   fanValueCurrent                       CreatorFanValueCurrent[]
   fanRelationshipCurrent                CreatorFanRelationshipCurrent[]
@@ -1990,6 +1992,7 @@ model CreatorFanValueCurrent {
 }
 
 model CreatorNotificationSyncState {
+  normalizerVersion String?
   id                      String                  @id @default(cuid())
   agencyId                String
   creatorId               String                  @unique
@@ -2273,6 +2276,12 @@ model CreatorNotificationScanItem {
   currency              String?
   outcome               CreatorNotificationScanOutcome
   reasonCode            String?
+  eventKind             String?
+  targetState           String?
+  persistenceStatus     String?
+  normalizerVersion     String?
+  canonicalEventId      String?
+  sourcePhase           String?
   createdAt             DateTime                         @default(now())
 
   creator   CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
@@ -6245,4 +6254,62 @@ model LoginAdmissionBucket {
   attempts        Int
 
   @@index([expiresAt, id])
+}
+
+/// Durable source event. sourceEvidence is bounded diagnostics, never a business projection.
+model CreatorNotificationEvent {
+  id                    String @id @default(cuid())
+  agencyId              String
+  creatorId             String
+  identityKey           String
+  notificationId        String?
+  transactionId         String?
+  sourceType            String?
+  sourceSubType         String?
+  category              String?
+  eventType             String?
+  occurredAt            DateTime?
+  fanOnlyFansUserId      String?
+  fanUsernameAtEvent     String?
+  fanDisplayNameAtEvent  String?
+  fanAvatarUrlAtEvent    String?
+  messageId             String?
+  postId                String?
+  commentId             String?
+  targetState           String
+  amountCents           Int?
+  currency              String?
+  disposition           String
+  reasonCode            String?
+  persistenceStatus     String
+  canonicalFactId       String?
+  normalizerVersion     String
+  sourceChecksum        String
+  sourceEvidence        Json
+  sourceJobId           String?
+  scanRunId             String
+  firstObservedAt       DateTime @default(now())
+  lastObservedAt        DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@unique([creatorId, identityKey])
+  @@index([agencyId, creatorId, occurredAt, id])
+  @@index([creatorId, disposition, lastObservedAt])
+}
+
+/// Immutable evidence of a scoped notification reclassification; never used for totals.
+model CreatorNotificationCorrection {
+  id                 String @id @default(cuid())
+  agencyId           String
+  creatorId          String
+  notificationId     String
+  formerModel        String
+  formerFactId       String
+  newEventType       String?
+  reasonCode         String
+  priorEvidence      Json
+  normalizerVersion  String
+  sourceJobId        String?
+  createdAt          DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@index([creatorId, notificationId, createdAt])
 }

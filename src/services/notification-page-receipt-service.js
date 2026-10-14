@@ -10,7 +10,7 @@ function literalPageContains(scanRunId, suffix = "") {
 async function notificationCommittedPageProof(db, job, result) {
   const scanRunId = String(result?.scanRunId || "").trim();
   const expectedRows = Number(result?.totalAcceptedEvents);
-  if (!/^[A-Za-z0-9._-]{8,80}$/.test(scanRunId) || !Number.isSafeInteger(expectedRows) || expectedRows < 0) {
+  if (!/^[A-Za-z0-9._-]{8,120}$/.test(scanRunId) || !Number.isSafeInteger(expectedRows) || expectedRows < 0) {
     return { verified: false, reason: "completion_fact_count_missing" };
   }
   const where = { agencyId: job.agencyId, creatorId: job.creatorId, sourceJobId: job.id,
@@ -35,7 +35,17 @@ async function notificationCommittedPageProof(db, job, result) {
   } else {
     throw Object.assign(new Error("Canonical notification page receipts are required"), { code: "NOTIFICATION_PAGE_RECEIPTS_REQUIRED" });
   }
-  return { verified: receiptsClean && receivedRows === expectedRows,
+  let sourceProof = null;
+  if (result.schemaVersion === 6) {
+    const expectedObserved=Number(result.totalObservedRows),expectedPages=Number(result.totalPages);
+    if (!Number.isSafeInteger(expectedObserved)||expectedObserved<0||!Number.isSafeInteger(expectedPages)||expectedPages<1) return {verified:false,reason:"source_page_proof_missing"};
+    const sourceWhere={...where,idempotencyKey:{contains:`:run:${scanRunId}:source-page:`.replace(/[\\%_]/g,value=>`\\${value}`)}};
+    const totals=await model.aggregate({where:sourceWhere,_sum:{receivedRows:true},_count:{_all:true}});
+    const failed=await model.findFirst({where:{...sourceWhere,OR:[{status:{not:"COMMITTED"}},{rejectedRows:{gt:0}}]},select:{id:true}});
+    sourceProof={expectedObserved,observed:Number(totals._sum.receivedRows||0),expectedPages,pages:totals._count._all};
+    if(failed||sourceProof.observed!==expectedObserved||sourceProof.pages!==expectedPages)return {verified:false,reason:failed?"source_page_partial":"source_page_count_mismatch",sourceProof};
+  }
+  return { ...(sourceProof?{sourceProof}:{}), verified: receiptsClean && receivedRows === expectedRows,
     reason: !receiptsClean ? "backend_page_receipt_partial" : receivedRows !== expectedRows ? "backend_page_receipt_count_mismatch" : "verified",
     expectedRows, receivedRows, batches };
 }

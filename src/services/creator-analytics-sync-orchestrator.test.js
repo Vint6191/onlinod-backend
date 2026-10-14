@@ -110,7 +110,7 @@ test.beforeEach(() => {
 
 test("new full proof suppresses redundant notification and financial catch-ups", async () => {
   const now = new Date("2026-10-01T12:00:00Z"), old = new Date("2026-09-20T12:00:00Z");
-  notificationState = { fullBackfillVerifiedAt: now, fullBackfillObservedAt: now, lastCatchupVerifiedAt: old , lastCatchupObservedAt: old};
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now, fullBackfillObservedAt: now, lastCatchupVerifiedAt: old , lastCatchupObservedAt: old};
   const db = dbFixture({ financialReady: true, campaignReady: true });
   db.creatorFinancialCollectionState.findUnique = async () => ({ status: "COMPLETE", baselineGeneration: "full-proof", baselineVerifiedAt: now, baselineObservedAt: now, lastCatchupCompletedAt: old, lastCatchupObservedAt: old });
   const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
@@ -121,7 +121,7 @@ test("new full proof suppresses redundant notification and financial catch-ups",
 
 test("migration keeps all historical baselines ready and schedules bounded catch-ups for missing source age", async () => {
   const now = new Date("2026-10-01T12:00:00Z");
-  notificationState = { fullBackfillVerifiedAt: now };
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now };
   const db = dbFixture({ financialReady: true, campaignReady: true });
   for (const delegate of ["creatorFinancialCollectionState", "creatorCampaignCollectionState"]) {
     const read = db[delegate].findUnique;
@@ -144,7 +144,7 @@ test("migration keeps all historical baselines ready and schedules bounded catch
 
 for (const completion of ["full", "deferred", "terminal"]) test("recurring planner rechecks " + completion + " after its collector lock", async () => {
   const now = new Date("2026-10-01T12:00:00Z"), old = new Date("2026-09-20T12:00:00Z");
-  notificationState = { fullBackfillVerifiedAt: now , fullBackfillObservedAt: now};
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now , fullBackfillObservedAt: now};
   const db = dbFixture({ financialReady: true, campaignReady: true });
   let reads = 0;
   db.creatorFinancialCollectionState.findUnique = async () => {
@@ -177,7 +177,7 @@ for (const kind of ["notifications", "financial", "campaigns"]) for (const chang
   test(`initial ${kind} revalidates ${change} after acquiring collector authority`, async () => {
     const now = new Date("2026-10-01T12:00:00Z");
     const db = dbFixture({ financialReady: kind === "campaigns" });
-    notificationState = kind === "notifications" ? null : { fullBackfillVerifiedAt: now , fullBackfillObservedAt: now};
+    notificationState = kind === "notifications" ? null : { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now , fullBackfillObservedAt: now};
     let current = null;
     const key = { notifications: "catchup_notifications_scan", financial: "financial_transactions_scan", campaigns: "fetch_campaigns" }[kind];
     const delegate = { notifications: "creatorNotificationSyncState", financial: "creatorFinancialCollectionState", campaigns: "creatorCampaignCollectionState" }[kind];
@@ -185,7 +185,7 @@ for (const kind of ["notifications", "financial", "campaigns"]) for (const chang
     db.jobInstance.findFirst = async ({ where }) => {
       if (where.jobKey === key) {
         current = change === "completion"
-          ? { status: "COMPLETE", baselineGeneration: "new-full", baselineVerifiedAt: now, baselineObservedAt: now, fullBackfillVerifiedAt: now , fullBackfillObservedAt: now}
+          ? { status: "COMPLETE", baselineGeneration: "new-full", baselineVerifiedAt: now, baselineObservedAt: now, normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now , fullBackfillObservedAt: now}
           : { status: "FAILED", retryAfterAt: change === "deferred" ? new Date(+now + 60000) : null };
         if (kind === "notifications") notificationState = current;
       }
@@ -201,7 +201,7 @@ for (const kind of ["notifications", "financial", "campaigns"]) for (const chang
 for (const change of ["fresh", "debt", "deferred", "directory", "generation"]) {
   test(`Campaign recurring plan is reconstructed from locked ${change} state`, async () => {
     const now = new Date("2026-10-01T12:00:00Z");
-    notificationState = { fullBackfillVerifiedAt: now , fullBackfillObservedAt: now};
+    notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now , fullBackfillObservedAt: now};
     const db = dbFixture({ financialReady: true, campaignReady: true, financialCatchupAt: now });
     let current = { status: "COMPLETE", baselineGeneration: "full", baselineVerifiedAt: now, baselineObservedAt: now,
       campaignDirectoryGeneration: "directory-old", campaignDirectoryRevision: 1,
@@ -256,6 +256,7 @@ test("initial analytics sync is strictly Notifications -> Financial -> Campaigns
   assert.ok(scheduled.at(-1).params.collectionGeneration);
   assert.equal(scheduled.at(-1).params.collectionRequestedAt, now.toISOString());
   assert.deepEqual(scheduled.at(-1).dedupeParams, {
+    notificationNormalizerVersion: "notification-source-v2",
     planningEpoch: "none:none",
     collectionOrderingAfter: "none",
     collectionContractVersion: 1,
@@ -267,7 +268,7 @@ test("initial analytics sync is strictly Notifications -> Financial -> Campaigns
   assert.equal(scheduled.at(-1).db, db);
 
   scheduled = [];
-  notificationState = { fullBackfillVerifiedAt: new Date("2026-08-09T10:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-09T10:00:00.000Z")};
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-09T10:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-09T10:00:00.000Z")};
   db = dbFixture({ financialReady: false });
   step = await ensureInitialCreatorAnalyticsSync({ db, creatorId: "creator-1", agencyId: "agency-1", now });
   assert.equal(step.stage, "financial");
@@ -302,7 +303,7 @@ test("initial analytics sync is strictly Notifications -> Financial -> Campaigns
 });
 
 test("initial pipeline advances only after a verified completion from the current stage", async () => {
-  notificationState = { fullBackfillVerifiedAt: new Date("2026-08-09T10:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-09T10:00:00.000Z")};
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-09T10:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-09T10:00:00.000Z")};
   const db = dbFixture({ financialReady: false });
   const job = {
     id: "notification-initial",
@@ -324,7 +325,7 @@ test("initial pipeline advances only after a verified completion from the curren
 test("a completed-but-unverified notification traversal does not advance initial sync or cancel its repair FULL", async () => {
   notificationState = {
     fullBackfillCompletedAt: new Date("2026-08-08T10:00:00.000Z"),
-    fullBackfillVerifiedAt: null, fullBackfillObservedAt: null,
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: null, fullBackfillObservedAt: null,
     headNotificationId: "known-head",
   };
   const active = [{
@@ -346,7 +347,7 @@ test("a completed-but-unverified notification traversal does not advance initial
 test("verified history fences a legacy manual FULL that has no explicit force marker", async () => {
   notificationState = {
     fullBackfillCompletedAt: new Date("2026-08-08T10:00:00.000Z"),
-    fullBackfillVerifiedAt: new Date("2026-08-08T10:01:00.000Z"), fullBackfillObservedAt: new Date("2026-08-08T10:01:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-08T10:01:00.000Z"), fullBackfillObservedAt: new Date("2026-08-08T10:01:00.000Z"),
     headNotificationId: "known-head",
   };
   const active = [{
@@ -362,7 +363,7 @@ test("verified history fences a legacy manual FULL that has no explicit force ma
 });
 
 test("completed history preserves only an explicitly forced FULL rebuild", async () => {
-  notificationState = { fullBackfillVerifiedAt: new Date("2026-08-08T10:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-08T10:00:00.000Z")};
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-08T10:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-08T10:00:00.000Z")};
   const active = [{
     id: "forced-manual-full",
     jobKey: "catchup_notifications_scan",
@@ -384,7 +385,7 @@ test("current Campaign catch-up scheduler publishes no provider-order frontier h
 
 test("recurring analytics uses fixed head catch-ups only after initial history is ready", async () => {
   notificationState = {
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
     lastCatchupCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
     lastCatchupVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), lastCatchupObservedAt: new Date("2026-08-01T00:00:00.000Z"),
     headNotificationId: "notification-head",
@@ -435,7 +436,7 @@ test("recurring analytics uses fixed head catch-ups only after initial history i
 
 test("a freshly completed notification catch-up cannot be immediately scheduled again", async () => {
   notificationState = {
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
     lastCatchupCompletedAt: new Date("2026-08-09T11:58:00.000Z"),
     lastCatchupVerifiedAt: new Date("2026-08-09T11:58:00.000Z"), lastCatchupObservedAt: new Date("2026-08-09T11:58:00.000Z"),
     headNotificationId: "fresh-head",
@@ -461,7 +462,7 @@ test("a freshly completed notification catch-up cannot be immediately scheduled 
 
 test("completed-but-unverified notification catch-up never satisfies recurring freshness", async () => {
   notificationState = {
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
     lastCatchupCompletedAt: new Date("2026-08-09T11:59:30.000Z"),
     lastCatchupVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), lastCatchupObservedAt: new Date("2026-08-01T00:00:00.000Z"),
     headNotificationId: "verified-old-head",
@@ -489,7 +490,7 @@ test("future-poisoned baseline proofs cannot advance the staged initial sync", a
   const now = new Date("2026-08-09T12:00:00.000Z");
   const poisoned = new Date("2026-08-09T13:00:00.000Z");
 
-  notificationState = { fullBackfillVerifiedAt: poisoned, fullBackfillObservedAt: poisoned, headNotificationId: "poisoned-head" };
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: poisoned, fullBackfillObservedAt: poisoned, headNotificationId: "poisoned-head" };
   let db = dbFixture({ financialReady: true, campaignReady: true });
   let step = await ensureInitialCreatorAnalyticsSync({ db, creatorId: "creator-1", agencyId: "agency-1", now });
   assert.equal(step.stage, "notifications");
@@ -497,7 +498,7 @@ test("future-poisoned baseline proofs cannot advance the staged initial sync", a
   assert.equal(scheduled.at(-1).params.collectionMode, "full");
 
   scheduled = [];
-  notificationState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z")};
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z")};
   db = dbFixture({ financialReady: true, campaignReady: true });
   db.creatorFinancialCollectionState.findUnique = async () => ({
     status: "COMPLETE", baselineVerifiedAt: poisoned, baselineObservedAt: poisoned, baselineGeneration: "financial-poisoned",
@@ -521,7 +522,7 @@ test("future-poisoned verified timestamps are DUE in planner exactly like the re
   const poisoned = new Date("2026-08-09T13:00:00.000Z");
   notificationState = {
     status: "COMPLETE",
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
     lastCatchupVerifiedAt: poisoned, lastCatchupObservedAt: poisoned,
     headNotificationId: "verified-head",
   };
@@ -548,7 +549,7 @@ test("future-poisoned verified timestamps are DUE in planner exactly like the re
 test("verified history also fences a legacy notification job with no explicit mode", async () => {
   notificationState = {
     fullBackfillCompletedAt: new Date("2026-08-08T10:00:00.000Z"),
-    fullBackfillVerifiedAt: new Date("2026-08-08T10:01:00.000Z"), fullBackfillObservedAt: new Date("2026-08-08T10:01:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-08T10:01:00.000Z"), fullBackfillObservedAt: new Date("2026-08-08T10:01:00.000Z"),
     headNotificationId: "known-head",
   };
   const active = [{
@@ -565,7 +566,7 @@ test("verified history also fences a legacy notification job with no explicit mo
 });
 
 test("failed catch-up does not erase durable baseline readiness", async () => {
-  notificationState = { fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z")};
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z")};
   const db = dbFixture({
     financialReady: true,
     campaignReady: true,
@@ -584,7 +585,7 @@ test("failed catch-up does not erase durable baseline readiness", async () => {
 
 test("recurring financial and campaign work respect durable retryAfterAt as DEFERRED", async () => {
   notificationState = {
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
     lastCatchupCompletedAt: new Date("2026-08-09T11:59:00.000Z"),
     headNotificationId: "head",
   };
@@ -614,7 +615,7 @@ test("recurring financial and campaign work respect durable retryAfterAt as DEFE
 
 test("terminal collection failure without retryAt is quarantined from automatic recurring scheduling", async () => {
   notificationState = {
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
     lastCatchupCompletedAt: new Date("2026-08-09T11:59:00.000Z"),
     lastCatchupVerifiedAt: new Date("2026-08-09T11:59:00.000Z"), lastCatchupObservedAt: new Date("2026-08-09T11:59:00.000Z"),
   };
@@ -651,7 +652,7 @@ test("notification durable retryAfterAt defers both initial and recurring collec
 
   notificationState = {
     status: "FAILED", retryAfterAt: retryAt,
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
     lastCatchupCompletedAt: new Date("2026-08-01T00:00:00.000Z"), headNotificationId: "head",
   };
   scheduled = [];
@@ -674,7 +675,7 @@ test("terminal notification failure without retryAt is quarantined from automati
 
   notificationState = {
     status: "FAILED", retryAfterAt: null,
-    fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
+    normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), fullBackfillObservedAt: new Date("2026-08-01T00:00:00.000Z"),
     lastCatchupCompletedAt: new Date("2026-08-01T00:00:00.000Z"),
   };
   scheduled = [];
@@ -690,7 +691,7 @@ test("terminal notification failure without retryAt is quarantined from automati
 
 test("collector planning reloads durable state under the collector lock before deriving epoch/order", async () => {
   const now = new Date("2026-08-09T12:00:00.000Z");
-  notificationState = { fullBackfillVerifiedAt: new Date("2026-08-09T10:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-09T10:00:00.000Z")};
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: new Date("2026-08-09T10:00:00.000Z") , fullBackfillObservedAt: new Date("2026-08-09T10:00:00.000Z")};
   const db = dbFixture();
   let reads = 0;
   db.creatorFinancialCollectionState.findUnique = async () => {
@@ -716,7 +717,7 @@ test("collector planning reloads durable state under the collector lock before d
 
 for (const fanStatus of ["QUEUED", "PARTIAL"]) test(`FanData ${fanStatus} cannot block a due Campaign frontier`, async () => {
   const now = new Date("2026-10-04T12:00:00Z");
-  notificationState = { fullBackfillVerifiedAt: now, fullBackfillObservedAt: now };
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now, fullBackfillObservedAt: now };
   const db = dbFixture({ financialReady: true, campaignReady: true, financialCatchupAt: now });
   const original = db.creatorCampaignCollectionState.findUnique;
   db.creatorCampaignCollectionState.findUnique = async () => ({ ...await original(),
@@ -732,7 +733,7 @@ for (const fanStatus of ["QUEUED", "PARTIAL"]) test(`FanData ${fanStatus} cannot
 
 for (const activeStatus of ["SCHEDULED", "CLAIMED", "PAUSED"]) test(`FanData independence retains ${activeStatus} provider exclusion`, async () => {
   const now = new Date("2026-10-04T12:00:00Z");
-  notificationState = { fullBackfillVerifiedAt: now, fullBackfillObservedAt: now };
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now, fullBackfillObservedAt: now };
   const db = dbFixture({ financialReady: true, campaignReady: true, financialCatchupAt: now,
     active: [{id:"existing",jobKey:"fetch_campaigns",status:activeStatus}] });
   const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
@@ -742,7 +743,7 @@ for (const activeStatus of ["SCHEDULED", "CLAIMED", "PAUSED"]) test(`FanData ind
 
 for (const status of ["SCANNING", "FAILED"]) test(`verified streams catch up while Campaign bootstrap is ${status}`, async () => {
   const now = new Date("2026-10-04T12:00:00Z"), old = new Date("2026-09-01T00:00:00Z");
-  notificationState = { fullBackfillVerifiedAt: old, fullBackfillObservedAt: old };
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: old, fullBackfillObservedAt: old };
   const db = dbFixture({ financialReady: true, campaignReady: false,
     active: status === "SCANNING" ? [{id:"bootstrap",jobKey:"fetch_campaigns",status:"CLAIMED"}] : [] });
   db.creatorCampaignCollectionState.findUnique = async () => ({ status, baselineVerifiedAt: null });
@@ -754,7 +755,7 @@ for (const status of ["SCANNING", "FAILED"]) test(`verified streams catch up whi
 
 test("membership baseline advances bootstrap with FanData still pending", async () => {
   const now = new Date("2026-10-04T12:00:00Z");
-  notificationState = { fullBackfillVerifiedAt: now, fullBackfillObservedAt: now };
+  notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now, fullBackfillObservedAt: now };
   const db = dbFixture({ financialReady: true });
   db.creatorCampaignCollectionState.findUnique = async () => ({status:"PARTIAL", membershipBaselineVerifiedAt:now,
     membershipBaselineObservedAt:now, membershipBaselineGeneration:"member-proof", fanValueOutstanding:5});
@@ -773,7 +774,7 @@ test("provider exhaustion without complete membership cannot advance bootstrap",
 
 test("recurring planning acquires Notifications, Financial, Campaigns before any stage write", async () => {
   const now=new Date("2026-10-04T12:00:00Z"), old=new Date("2026-09-01T00:00:00Z"), locks=[];
-  notificationState={fullBackfillVerifiedAt:old,fullBackfillObservedAt:old};
+  notificationState={normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt:old,fullBackfillObservedAt:old};
   const db=dbFixture({financialReady:true,campaignReady:false});
   const check=()=>assert.deepEqual(locks.slice(0,3),["analytics-collector:notifications:creator-1","analytics-collector:financial:creator-1","analytics-collector:campaigns:creator-1"]);
   db.$executeRawUnsafe=async(sql,key)=>{if(sql.includes('pg_advisory_xact_lock'))locks.push(key);return 1;};

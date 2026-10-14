@@ -19,6 +19,8 @@ const ALL_SCHEMA_VERSION = 4;
 const ALL_COLLECTOR_VERSION = "notifications-all-v5";
 const LEGACY_SCHEMA_VERSION = 3;
 const LEGACY_COLLECTOR_VERSION = "notifications-catchup-v4";
+const SOURCE_SCHEMA_VERSION = 6;
+const SOURCE_COLLECTOR_VERSION = "notifications-history-v9-source-ledger";
 const MAX_EVENTS_PER_BATCH = 2_000;
 const { NOTIFICATION_TYPES } = require("./notification-collection-scope");
 
@@ -87,6 +89,7 @@ function identityFingerprint(kind, creatorId, event, occurredAt, amountCents, ca
   }
   if (kind === "subscription") {
     if (transactionId) return sha256(`${kind}|${creatorId}|transaction|${transactionId}|${eventType || "unknown"}`);
+    if (event.normalizerVersion === "notification-source-v2" && notificationId) return sha256(`${kind}|${creatorId}|notification|${notificationId}`);
     // OnlyFans emits the same subscription through new_message, subscribed and
     // later Notifications ALL. Some variants have a notification id and some do
     // not, but they agree on fan, lifecycle type, price and the UTC minute.
@@ -258,7 +261,7 @@ function resultCoverage(result, job) {
   const coverage = object(result?.coverage);
   return Object.fromEntries(requestedTypes(job).map((type) => [type, object(coverage[type]).status === "complete" ? "complete" : "partial"]));
 }
-const COMPLETE_COVERAGE_REASONS = new Set(["source_exhausted", "watermark_reached", "range_boundary_reached"]);
+const COMPLETE_COVERAGE_REASONS = new Set(["source_exhausted", "watermark_reached", "known_boundary_reached", "range_boundary_reached"]);
 const PARTIAL_COVERAGE_REASONS = new Set([
   "event_limit", "not_scanned", "missing_timestamps", "invalid_rows",
   "cursor_stalled", "page_limit", "coverage_unproven",
@@ -701,15 +704,16 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
     });
   }
   const incomingSchemaVersion = result?.schemaVersion;
-  if (!Number.isInteger(incomingSchemaVersion) || ![LEGACY_SCHEMA_VERSION, ALL_SCHEMA_VERSION, SCHEMA_VERSION].includes(incomingSchemaVersion)) {
+  if (!Number.isInteger(incomingSchemaVersion) || ![LEGACY_SCHEMA_VERSION, ALL_SCHEMA_VERSION, SCHEMA_VERSION, SOURCE_SCHEMA_VERSION].includes(incomingSchemaVersion)) {
     throw Object.assign(new Error(`Unsupported notification schema version: ${incomingSchemaVersion ?? "<missing>"}`), {
       code: "NOTIFICATION_SCHEMA_VERSION_UNSUPPORTED",
     });
   }
   const schemaVersion = incomingSchemaVersion;
+  if (result.finalizeCoverage === true && job.params?.notificationNormalizerVersion === "notification-source-v2" && schemaVersion !== SOURCE_SCHEMA_VERSION) throw Object.assign(new Error("Current notification source receipts are required"), {code:"NOTIFICATION_COLLECTOR_UPGRADE_REQUIRED",status:409});
   const scanRunIdRaw = typeof result?.scanRunId === "string" ? result.scanRunId.trim() : "";
   const scanRunId = scanRunIdRaw;
-  if (!scanRunId || scanRunId.length > 80 || !/^[A-Za-z0-9._-]{8,80}$/.test(scanRunId)) {
+  if (!scanRunId || scanRunId.length > 120 || !/^[A-Za-z0-9._-]{8,120}$/.test(scanRunId)) {
     throw Object.assign(new Error("Notification schema v4 requires a valid scanRunId"), {
       code: "NOTIFICATION_SCAN_RUN_ID_REQUIRED",
     });
@@ -752,7 +756,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
   const initiallyRejected = normalized.filter((row) => row.rejected);
   const payloadChecksum = sha256(stableJson(canonicalPayload(normalized, result, job)));
   const rawBatchKey = typeof result?.batchKey === "string" ? result.batchKey.trim() : "";
-  if (!rawBatchKey || rawBatchKey.length > 120 || !/^[A-Za-z0-9._:-]+$/.test(rawBatchKey)) {
+  if (!rawBatchKey || rawBatchKey.length > (schemaVersion === SOURCE_SCHEMA_VERSION ? 240 : 120) || !/^[A-Za-z0-9._:-]+$/.test(rawBatchKey)) {
     throw Object.assign(new Error("Notification batchKey is invalid"), { code: "NOTIFICATION_BATCH_KEY_INVALID" });
   }
   const batchKey = rawBatchKey;
@@ -775,9 +779,9 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       code: "NOTIFICATION_PAGE_BATCH_KEY_MISMATCH",
     });
   }
-  const protocolSuffix = schemaVersion === LEGACY_SCHEMA_VERSION ? "v4" : schemaVersion === ALL_SCHEMA_VERSION ? "v5" : "v6";
+  const protocolSuffix = schemaVersion === LEGACY_SCHEMA_VERSION ? "v4" : schemaVersion === ALL_SCHEMA_VERSION ? "v5" : schemaVersion === SOURCE_SCHEMA_VERSION ? "v7" : "v6";
   const idempotencyKey = `notification-facts:${job.id}:${batchKey}:${protocolSuffix}`;
-  if (idempotencyKey.length > 240) {
+  if (idempotencyKey.length > (schemaVersion === SOURCE_SCHEMA_VERSION ? 512 : 240)) {
     throw Object.assign(new Error("Notification ingest idempotency key exceeds the ledger limit"), {
       code: "NOTIFICATION_IDEMPOTENCY_KEY_TOO_LONG",
     });
@@ -785,7 +789,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
   const collectorVersionRaw = typeof result?.collectorVersion === "string"
     ? result.collectorVersion.trim()
     : "";
-  const expectedCollectorVersion = schemaVersion === LEGACY_SCHEMA_VERSION
+  const expectedCollectorVersion = schemaVersion === SOURCE_SCHEMA_VERSION ? SOURCE_COLLECTOR_VERSION : schemaVersion === LEGACY_SCHEMA_VERSION
     ? LEGACY_COLLECTOR_VERSION
     : schemaVersion === ALL_SCHEMA_VERSION
       ? ALL_COLLECTOR_VERSION
@@ -880,6 +884,22 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
         model: "creatorPostComment", facts: groups.comment, job, deviceId, fanRecordIds, now,
         compareKeys: ["fanRecordId", "externalNotificationId", "onlyFansCommentId", "onlyFansPostId", "commentedAt"],
       });
+      let rowOutcomes;
+      if (schemaVersion === SOURCE_SCHEMA_VERSION) {
+        const persisted = [];
+        for (const [model, group] of [["creatorSale",sale],["creatorTip",tip],["creatorSubscriptionEvent",subscription],["creatorPostLike",like],["creatorPostComment",comment]]) {
+          if (group.canonicalIds?.length) persisted.push(...(await tx[model].findMany({where:{creatorId:job.creatorId,id:{in:group.canonicalIds}},select:{id:true,externalNotificationId:true,...(!["creatorPostLike","creatorPostComment"].includes(model)?{externalTransactionId:true}:{})}})).map(row=>({...row,model})));
+        }
+        const models={sale:"creatorSale",tip:"creatorTip",subscription:"creatorSubscriptionEvent",like:"creatorPostLike",comment:"creatorPostComment"};
+        rowOutcomes=normalized.map(fact=>{
+          const input=fact.rawForChecksum;
+          const row=!fact.rejected && persisted.find(row=>row.model===models[fact.kind]
+            && (input.notificationId ? row.externalNotificationId===String(input.notificationId) : row.externalTransactionId===String(input.transactionId))
+            && !transactionIdentityConflict(row,fact));
+          return {notificationId:input.notificationId||null,transactionId:input.transactionId||null,canonicalFactId:row?.id||null,
+            status:row?"FACT_COMMITTED":"REJECTED",reasonCode:row?null:fact.rejected||"FACT_IDENTITY_CONFLICT"};
+        });
+      }
       await require("./notification-fact-receipt-service").capture({ db: tx, job, groups: [
         { kind: "CreatorSale", ids: sale.canonicalIds }, { kind: "CreatorTip", ids: tip.canonicalIds },
         { kind: "CreatorSubscriptionEvent", ids: subscription.canonicalIds },
@@ -946,13 +966,13 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
             : complete ? null : "One or more notification types have partial coverage",
         },
       });
-      return { replayed: false, batch, counts, complete, coverageByType };
+      return { replayed: false, batch, counts, complete, coverageByType, rowOutcomes };
     };
     const applied = await runDbTransaction(db, applyFacts, { maxWait: 10_000, timeout: 60_000 });
 
     if (applied.replayed) return applied.response;
     // SQL capture publishes every changed fact with this commit; no best-effort rebuild.
-    return { batchId: applied.batch.id, replayed: false, status: applied.batch.status, ...applied.counts, coverageComplete: applied.complete, coverageByType: applied.coverageByType };
+    return { batchId: applied.batch.id, replayed: false, status: applied.batch.status, ...applied.counts, coverageComplete: applied.complete, coverageByType: applied.coverageByType, ...(applied.rowOutcomes ? {rowOutcomes:applied.rowOutcomes}: {}) };
   } catch (error) {
     await db.analyticsIngestBatch.update({
       where: { id: initial.batch.id },

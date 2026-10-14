@@ -9,16 +9,20 @@ async function createAdminSqlRuntime({ runtimePath, maxConnections = 1 } = {}) {
   const load = createRequire(path.resolve(runtimePath, "package.json"));
   const { PGlite } = load("@electric-sql/pglite"), { PGLiteSocketServer } = load("@electric-sql/pglite-socket");
   const contract = require("../../src/services/database-contract.json");
-  const sql = fs.readFileSync(path.join(root, "prisma/migrations", contract.migration, "migration.sql"));
-  if (crypto.createHash("sha256").update(sql).digest("hex") !== contract.checksum) throw Error("BASELINE_SOURCE_CHECKSUM_MISMATCH");
+  const { migrations } = require("../../src/services/database-migration-chain");
+  const sources = migrations.map(item => {
+    const sql = fs.readFileSync(path.join(root, "prisma/migrations", item.migration, "migration.sql"));
+    if (crypto.createHash("sha256").update(sql).digest("hex") !== item.checksum) throw Error("BASELINE_SOURCE_CHECKSUM_MISMATCH");
+    return { ...item, sql };
+  });
   const engine = await PGlite.create();
   let server, db;
   try {
-    await engine.exec(sql.toString("utf8"));
+    for (const source of sources) await engine.exec(source.sql.toString("utf8"));
     await engine.exec(`CREATE TABLE "_prisma_migrations" (id varchar(36) PRIMARY KEY, checksum varchar(64) NOT NULL,
       finished_at timestamptz, migration_name varchar(255) NOT NULL, logs text, rolled_back_at timestamptz,
       started_at timestamptz NOT NULL DEFAULT now(), applied_steps_count integer NOT NULL DEFAULT 0)`);
-    await engine.query('INSERT INTO "_prisma_migrations"(id,checksum,migration_name,finished_at,applied_steps_count) VALUES($1,$2,$3,now(),1)', [crypto.randomUUID(),contract.checksum,contract.migration]);
+    for (const source of sources) await engine.query('INSERT INTO "_prisma_migrations"(id,checksum,migration_name,finished_at,applied_steps_count) VALUES($1,$2,$3,now(),1)', [crypto.randomUUID(),source.checksum,source.migration]);
     server = new PGLiteSocketServer({ db: engine, host: "127.0.0.1", port: 0, maxConnections });
     server.addEventListener("connection", () => { engine.exec("DISCARD ALL").catch(() => {}); });
     await server.start();
@@ -26,7 +30,7 @@ async function createAdminSqlRuntime({ runtimePath, maxConnections = 1 } = {}) {
     const queries = [];
     db = new PrismaClient({ datasources: { db: { url } }, log: [{ emit: "event", level: "query" }] });
     db.$on("query", event => queries.push({ query: event.query, duration: event.duration }));
-    return { root, engine, server, db, url, queries, migrations: [contract.migration],
+    return { root, engine, server, db, url, queries, migrations: migrations.map(item => item.migration),
       async close() { await db.$disconnect(); await server.stop(); await engine.close(); },
     };
   } catch (error) {
