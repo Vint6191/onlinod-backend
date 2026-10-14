@@ -45,6 +45,7 @@ function loadService(fixture) {
   };
   const transaction = fixture.db.$transaction;
   fixture.db.$transaction = (callback, options) => transaction(async () => {
+    const snapshot = new Map(rows);
     const tx = { ...fixture.db }; delete tx.$transaction;
     if (fixture.db.$queryRawUnsafe) tx.$queryRawUnsafe = async (sql, ...args) => {
       if (/FROM "User"/.test(sql)) return fixture.disabledUser ? [] : [{ id: args[0] }];
@@ -59,7 +60,13 @@ function loadService(fixture) {
     };
     if (fixture.db.$executeRawUnsafe) tx.$executeRawUnsafe = (sql, ...args) =>
       sql.startsWith("SELECT set_config('lock_timeout'") ? Promise.resolve(1) : fixture.db.$executeRawUnsafe(sql, ...args);
-    return callback(tx);
+    try { return await callback(tx); }
+    catch (error) {
+      rows.clear();
+      for (const [id, value] of snapshot) rows.set(id, value);
+      await fixture.afterRollback?.(error);
+      throw error;
+    }
   }, options);
   const consequencesModule = require.resolve("./notification-consequence-service");
   require.cache[consequencesModule] = { exports: { publishNotificationConsequences: async ({ db, job }) => {
@@ -139,6 +146,85 @@ function fixture() {
   };
   return { db, job, token, update: () => update };
 }
+
+function notificationConflictFixture() {
+  const item = fixture();
+  Object.assign(item.job, { creatorId: "creator-1", jobKey: "catchup_notifications_scan", attempts: 0, continuation: null,
+    params: { collectionGeneration: "conflicting-run", collectionRequestedAt: "2026-10-01T00:00:00.000Z",
+      collectionMode: "full", notificationMode: "full", types: ["subscriptions", "tips"] }, result: null });
+  item.applyJobChunk = async () => { throw Object.assign(new Error("immutable receipt conflict"), { code: "ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT" }); };
+  item.input = { jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3,
+    continuation: { driverPhase: "execute", jobContinuation: { scanRunId: "conflicting-run", page: 1 } },
+    chunkResult: { kind: "notification_facts_page_all", scanRunId: "conflicting-run", page: 1 }, expectedContinuation: null };
+  return item;
+}
+
+test("notification conflict without a partial completion marker rotates only after page rollback", async () => {
+  const item = notificationConflictFixture();
+  const { progressJob } = loadService(item);
+  await assert.rejects(progressJob(item.input), error => error.code === "JOB_LEASE_STALE");
+  const job = await item.db.jobInstance.findUnique({ where: { id: item.job.id } });
+  assert.equal(job.status, "SCHEDULED"); assert.equal(job.attempts, 1); assert.equal(job.continuation, null);
+  assert.equal(job.leaseRevision, 4); assert.equal(job.leaseTokenHash, null);
+  assert.notEqual(job.params.collectionGeneration, "conflicting-run");
+  assert.deepEqual(job.params.types, ["subscriptions", "tips"]);
+  assert.equal(job.params.notificationRepairReason, "ingest_idempotency_conflict");
+});
+
+test("notification recovery preserves a page committed by another request after rollback", async () => {
+  const item = notificationConflictFixture();
+  const advanced = { driverPhase: "execute", jobContinuation: { scanRunId: "conflicting-run", page: 2 } };
+  item.afterRollback = () => { item.job.continuation = advanced; };
+  const { progressJob } = loadService(item);
+  const result = await progressJob(item.input);
+  assert.equal(result.sideEffect.staleProgress, true); assert.deepEqual(result.continuation, advanced);
+  const job = await item.db.jobInstance.findUnique({ where: { id: item.job.id } });
+  assert.equal(job.params.collectionGeneration, "conflicting-run"); assert.equal(job.attempts, 0);
+});
+
+for (const mutation of ["access", "token", "params"]) test(`notification repair rechecks ${mutation} after rollback`, async () => {
+  const item = notificationConflictFixture(); let revoked = false;
+  item.afterRollback = () => {
+    if (mutation === "access") revoked = true;
+    if (mutation === "token") item.job.leaseTokenHash = tokenHash("replacement");
+    if (mutation === "params") item.job.params = { ...item.job.params, collectionGeneration: "new-command" };
+  };
+  item.assertExecutionAccessFence = async () => { if (revoked) throw Object.assign(new Error("revoked"), { code: "EXECUTION_ACCESS_REVOKED" }); };
+  const { progressJob } = loadService(item);
+  await assert.rejects(progressJob(item.input), error => ["JOB_LEASE_STALE", "EXECUTION_ACCESS_REVOKED"].includes(error.code));
+  const job = await item.db.jobInstance.findUnique({ where: { id: item.job.id } });
+  assert.equal(job.attempts, 0); assert.equal(job.leaseRevision, 3); assert.equal(job.continuation, null);
+});
+
+test("repeated receipt recovery respects the existing job attempt limit", async () => {
+  const item = notificationConflictFixture(); item.job.attempts = 4; let recorded;
+  item.recordJobFailure = async input => { recorded = input; };
+  const { progressJob } = loadService(item);
+  await assert.rejects(progressJob(item.input), error => error.code === "JOB_LEASE_STALE");
+  const job = await item.db.jobInstance.findUnique({ where: { id: item.job.id } });
+  assert.equal(job.status, "FAILED"); assert.equal(job.attempts, 5); assert.equal(recorded.terminal, true);
+  assert.equal(job.params.collectionGeneration, "conflicting-run");
+});
+
+test("stale notification progress never invokes ingest or writes a checkpoint", async () => {
+  const item = notificationConflictFixture();
+  item.job.continuation = { driverPhase: "execute", jobContinuation: { scanRunId: "conflicting-run", page: 2 } };
+  item.applyJobChunk = async () => { assert.fail("stale page must be rejected before ingest"); };
+  const { progressJob } = loadService(item);
+  for (const expectedContinuation of [undefined, null, item.job.continuation]) {
+    const result = await progressJob({ ...item.input, expectedContinuation });
+    assert.equal(result.sideEffect.staleProgress, true); assert.deepEqual(result.continuation, item.job.continuation);
+  }
+  assert.equal(item.update(), null);
+});
+
+test("an unrelated page failure rolls back without rotating collection authority", async () => {
+  const item = notificationConflictFixture(); item.applyJobChunk = async () => { throw new Error("SQL failure"); };
+  const { progressJob } = loadService(item);
+  await assert.rejects(progressJob(item.input), /SQL failure/);
+  const job = await item.db.jobInstance.findUnique({ where: { id: item.job.id } });
+  assert.equal(job.attempts, 0); assert.equal(job.continuation, null); assert.equal(job.leaseRevision, 3);
+});
 
 test("creator context release preserves attempts and records a non-error wait diagnostic", async () => {
   const item = fixture();

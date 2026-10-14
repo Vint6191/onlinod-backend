@@ -129,7 +129,7 @@ test("completion preserves run identity, publishes durable consequences and prov
   assert.match(leaseService, /notification scan completed with rejected facts/);
   assert.match(leaseService, /leaseRevision: \{ increment: 1 \}/);
   assert.match(leaseService, /notification scan scheduled for repair/);
-  assert.match(leaseService, /partialTypes/);
+  assert.match(leaseService, /params: notificationRepairParams\(job, now, result\)/);
   assert.doesNotMatch(leaseService, /const resumeCursors =/);
   assert.doesNotMatch(leaseService, /notificationRepairPass\s*:/);
   assert.match(leaseService, /status: "SCHEDULED"/);

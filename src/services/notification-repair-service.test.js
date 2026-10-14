@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { notificationRepairParams, needsNotificationRepairRotation } = require("./notification-repair-service");
+const { notificationRepairParams, needsNotificationRepairRotation, notificationProgressIsStale } = require("./notification-repair-service");
 
 function partial() {
   return { jobKey: "catchup_notifications_scan", params: {
@@ -45,4 +45,26 @@ test("bounded catch-up keeps its mode and lower bound while obtaining new page r
   assert.equal(params.collectionMode, "catchup");
   assert.equal(params.from, job.params.from);
   assert.notEqual(params.collectionGeneration, "old-run");
+});
+
+test("notification cursor comparison accepts initial null and legacy wrapped states", () => {
+  const job = { ...partial(), result: null, continuation: null };
+  assert.equal(notificationProgressIsStale(job, null, { driverPhase: "execute", jobContinuation: null }), false);
+  const state = { scanRunId: "old-run", page: 2, fromId: "100" };
+  job.continuation = { driverPhase: "execute", jobContinuation: { driverPhase: "execute", jobContinuation: state } };
+  assert.equal(notificationProgressIsStale(job, null, state), false);
+  assert.equal(notificationProgressIsStale(job, null, { ...state, fromId: "101" }), true);
+  assert.equal(notificationProgressIsStale(job, null, null), true);
+});
+
+test("old Desktop pages cannot rewind any typed phase and complete is terminal", () => {
+  const job = { ...partial(), result: null, continuation: { scanRunId: "old-run", page: 12 } };
+  for (const page of [1, 11, 12]) {
+    assert.equal(notificationProgressIsStale(job, { kind: "notification_facts_page_all", scanRunId: "old-run", page }), true);
+  }
+  assert.equal(notificationProgressIsStale(job, { kind: "notification_facts_page_all", scanRunId: "old-run", page: 13 }), false);
+  assert.equal(notificationProgressIsStale({ ...job, continuation: { ...job.continuation, schemaVersion: 7 } },
+    { kind: "notification_facts_page_all", scanRunId: "old-run", page: 1 }), false, "legacy traversal restart has a different page sequence");
+  assert.equal(notificationProgressIsStale({ ...job, continuation: { driverPhase: "complete", result: {} } }, null), true);
+  assert.equal(notificationProgressIsStale({ ...job, jobKey: "financial_transactions_scan" }, null, null), false);
 });

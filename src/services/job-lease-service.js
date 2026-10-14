@@ -1,6 +1,6 @@
 "use strict";
 const { notificationCommittedPageProof } = require("./notification-page-receipt-service");
-const { notificationRepairParams, needsNotificationRepairRotation } = require("./notification-repair-service");
+const { notificationRepairParams, needsNotificationRepairRotation, notificationProgressIsStale } = require("./notification-repair-service");
 
 const { isDeepStrictEqual } = require("node:util");
 
@@ -958,7 +958,11 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
   };
 }
 async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation, chunkResult, expectedContinuation }) {
-  return leaseCommit({ jobId, userId, deviceId, leaseToken, leaseRevision }, async (tx, { job, now }) => {
+  const leaseInput = { jobId, userId, deviceId, leaseToken, leaseRevision };
+  let attemptedJob = null;
+  try {
+  return await leaseCommit(leaseInput, async (tx, { job, now }) => {
+  attemptedJob = job;
   if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
   const tokenHash = hashToken(leaseToken);
   const nextLeaseUntil = new Date(now.getTime() + leaseDuration(leaseMs));
@@ -966,6 +970,11 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   const requestedContinuation = continuation === undefined
     ? job.continuation
     : normalizeLeaseContinuation(continuation);
+
+    if (job.jobKey === "catchup_notifications_scan" && notificationProgressIsStale(job, chunkResult, expectedContinuation)) {
+      return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
+        progress: job.progress, continuation: job.continuation, sideEffect: { staleProgress: true } };
+    }
 
     if (campaignTraversal.enabled(job)) {
       if (!campaignTraversal.expectedMatches(job, expectedContinuation)) {
@@ -1072,6 +1081,51 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       sideEffect,
     };
   });
+  } catch (error) {
+    if (error?.code !== "ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT"
+      || attemptedJob?.jobKey !== "catchup_notifications_scan"
+      || !["notification_facts_page_all", "notification_facts_page"].includes(chunkResult?.kind)
+      || chunkResult.scanRunId !== attemptedJob.params?.collectionGeneration) throw error;
+
+    // The failed page transaction must roll back first: it may have written a
+    // cursor and earlier typed batches. Repair in a fresh transaction, rechecking
+    // ownership, access epoch, token, revision, expiry and the locked job state.
+    // Old immutable receipts and canonical facts are never edited or deleted.
+    const repaired = await leaseCommit(leaseInput, async (tx, { job, now }) => {
+      if (!isDeepStrictEqual(job.params, attemptedJob.params)) {
+        throw new JobLeaseError("JOB_LEASE_STALE", "Notification command changed before receipt recovery");
+      }
+      if (!isDeepStrictEqual(job.continuation, attemptedJob.continuation)) {
+        // Another valid page won after rollback. Its progress outranks repair.
+        return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
+          progress: job.progress, continuation: job.continuation, sideEffect: { staleProgress: true } };
+      }
+      const attempts = Number(job.attempts || 0) + 1;
+      const terminal = attempts >= MAX_ATTEMPTS;
+      const rotated = await tx.jobInstance.updateMany({ where: {
+        id: job.id, status: "CLAIMED", leaseRevision, leaseTokenHash: hashToken(leaseToken),
+        claimedByDeviceId: deviceId, leaseUntil: { gt: now },
+      }, data: {
+        status: terminal ? "FAILED" : "SCHEDULED", attempts,
+        ...(!terminal ? { params: { ...notificationRepairParams(job, now, null),
+          notificationRepairReason: "ingest_idempotency_conflict" }, nextRunAt: now } : {}),
+        continuation: null, progress: { percent: 0, message: terminal
+          ? "Notification receipt recovery exhausted" : "Notification receipt recovery: new collection generation" },
+        claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null,
+        leaseRevision: { increment: 1 }, workId: null, completedAt: terminal ? now : null,
+        lastError: "notification_ingest_idempotency_conflict",
+      } });
+      if (!rotated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Notification lease changed before receipt recovery");
+      if (terminal) await recordJobFailure({ db: tx, job, error: "notification_ingest_idempotency_conflict", terminal: true });
+      return { receiptRecoveryCommitted: true };
+    });
+    // Outside the transaction: a 409 retires this Desktop work item and lets it
+    // claim the new server-owned generation instead of retrying the poisoned key.
+    if (repaired.receiptRecoveryCommitted) {
+      throw new JobLeaseError("JOB_LEASE_STALE", "Notification receipt recovery retired this collection lease");
+    }
+    return repaired;
+  }
 }
 
 async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, result, progress }) {

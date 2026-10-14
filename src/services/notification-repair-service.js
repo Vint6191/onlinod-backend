@@ -1,6 +1,7 @@
 "use strict";
 
 const { buildCollectionCommand, stampCollectionAuthorityParams, COLLECTOR_TYPES } = require("./analytics-collector-control-service");
+const { isDeepStrictEqual } = require("node:util");
 const TYPES = new Set(["purchases", "tips", "subscriptions", "likes", "comments"]);
 
 // A repair is a new provider traversal, not a replay of an immutable page
@@ -35,4 +36,32 @@ function needsNotificationRepairRotation(job) {
     && result.completionSideEffect.ok !== true && result.completionSideEffect.verified !== true;
 }
 
-module.exports = { notificationRepairParams, needsNotificationRepairRotation };
+function notificationContinuationState(value) {
+  // Compare the domain cursor across plain, wrapped and legacy nested leases.
+  for (let depth = 0; depth < 10000 && value?.driverPhase === "execute"; depth += 1) {
+    value = value.jobContinuation;
+  }
+  return value ?? null;
+}
+
+function notificationProgressIsStale(job, chunk, expectedContinuation) {
+  if (job?.jobKey !== "catchup_notifications_scan") return false;
+  const current = notificationContinuationState(job.continuation);
+  if (expectedContinuation !== undefined
+    && !isDeepStrictEqual(current, notificationContinuationState(expectedContinuation))) return true;
+  if (current?.driverPhase === "complete") return true;
+  // The v8 Desktop deliberately restarts v1-v7 traversal state. Those page
+  // counters are not comparable; any conflicting old receipt follows repair.
+  if (Number.isInteger(current?.schemaVersion) && current.schemaVersion < 8) return false;
+  // Rolling deployment: older Desktops do not send expectedContinuation, but
+  // ALL-page numbers are monotonic across typed phases and ALL reconciliation.
+  // Never let an already committed page rewind the cursor or re-read its receipt
+  // with a new provider payload, even when the caller supplies today's cursor.
+  return chunk?.kind === "notification_facts_page_all"
+    && chunk.scanRunId === job.params?.collectionGeneration
+    && current?.scanRunId === chunk.scanRunId
+    && Number.isSafeInteger(chunk.page) && chunk.page > 0
+    && Number.isSafeInteger(current.page) && chunk.page <= current.page;
+}
+
+module.exports = { notificationRepairParams, needsNotificationRepairRotation, notificationProgressIsStale };
