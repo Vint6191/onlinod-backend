@@ -1,9 +1,13 @@
 {
-  "version": "nod_current_v2_notification_source",
+  "version": "nod_current_v3_creator_provider_gate",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
       "checksum": "70d35e5f4b08920fbe752c0aa4ae23d2c69acfd519f0cf9e1c0bed553bdb0e28"
+    },
+    {
+      "migration": "20261015000000_creator_provider_gate",
+      "checksum": "f954403da8a2c3b070b8380c09f60d6f6bfe243791a913921abef654236b699d"
     }
   ],
   "extension": {
@@ -15,9 +19,21 @@
       {
         "name": "CreatorNotificationEvent",
         "persistence": "p"
+      },
+      {
+        "name": "ProviderCapacityCreatorBucket",
+        "persistence": "p"
       }
     ],
     "columns": [
+      {
+        "table": "AnalyticsPlanningBudget",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
       {
         "table": "CreatorNotificationCorrection",
         "name": "id",
@@ -425,13 +441,137 @@
         "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "OfProviderRequestGateState",
+        "name": "scopeCreatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "ProviderCapacityContribution",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "bucket",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "itemCount",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "overdueCount",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "requiredCalls",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyVersion",
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": "NO",
+        "column_default": "'creator_provider_capacity_v2'::character varying"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyId",
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": "NO",
+        "column_default": "'of-creator'::character varying"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyScope",
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": "NO",
+        "column_default": "'CREATOR_PARALLEL'::character varying"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyShardCount",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyShardingAllowed",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "true"
       }
     ],
     "enums": [],
     "views": [],
-    "functions": [],
-    "triggers": [],
+    "functions": [
+      {
+        "name": "onlinod_capacity_publication_fence",
+        "args": "",
+        "hash": "ef305f1b51861689406a4e63475dd96a23dfb42226dbd2ad6b2ac356729058b0"
+      },
+      {
+        "name": "onlinod_enforce_provider_gate_waiter_registration",
+        "args": "",
+        "hash": "672961dd0f1bf92db88837db884821064ba36d32eb54d9e4aa56759f71cf6d70"
+      }
+    ],
+    "triggers": [
+      {
+        "table": "OfProviderRequestGateState",
+        "name": "onlinod_provider_gate_waiter_registration",
+        "type": 23,
+        "definition": "CREATE TRIGGER onlinod_provider_gate_waiter_registration BEFORE INSERT OR UPDATE ON public.\"OfProviderRequestGateState\" FOR EACH ROW EXECUTE FUNCTION onlinod_enforce_provider_gate_waiter_registration()",
+        "args": "",
+        "function": "onlinod_enforce_provider_gate_waiter_registration"
+      }
+    ],
     "constraints": [
+      {
+        "table": "AnalyticsPlanningBudget",
+        "name": "AnalyticsPlanningBudget_creator_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
       {
         "table": "CreatorNotificationCorrection",
         "name": "CreatorNotificationCorrection_agencyId_creatorId_fkey",
@@ -495,9 +635,50 @@
         "deferrable": false,
         "deferred": false,
         "definition": "CHECK ((\"targetState\" = ANY (ARRAY['AVAILABLE'::text, 'UNAVAILABLE'::text, 'DELETED'::text, 'DEACTIVATED'::text, 'NOT_APPLICABLE'::text])))"
+      },
+      {
+        "table": "OfProviderRequestGateState",
+        "name": "OfProviderRequestGateState_scope_creator_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"scopeCreatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "ProviderCapacityCreatorBucket_nonnegative",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"itemCount\" >= 0) AND (\"overdueCount\" >= 0) AND (\"requiredCalls\" >= 0)))"
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "ProviderCapacityCreatorBucket_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", bucket)"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "ProviderCapacityDebtState_topology_v1_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((((\"topologyId\")::text = 'of-creator'::text) AND ((\"topologyScope\")::text = 'CREATOR_PARALLEL'::text) AND (\"topologyShardCount\" >= 0) AND (\"topologyShardingAllowed\" = true) AND ((\"controlMode\")::text = ANY ((ARRAY['NORMAL'::character varying, 'OVERLOAD_PROTECTED'::character varying, 'CONSERVATIVE'::character varying])::text[])) AND (\"campaignDirectoryAdmissionBudgetCalls\" >= 1) AND (\"campaignDirectoryGuaranteedCallsPerSweep\" >= 1)))"
       }
     ],
     "indexes": [
+      {
+        "table": "AnalyticsPlanningBudget",
+        "name": "AnalyticsPlanningBudget_creator_idx",
+        "unique": false,
+        "keys": "6",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
       {
         "table": "CreatorNotificationCorrection",
         "name": "CreatorNotificationCorrection_creatorId_notificationId_createdA",
@@ -549,6 +730,33 @@
         "unique": true,
         "keys": "1",
         "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "OfProviderRequestGateState",
+        "name": "OfProviderRequestGateState_scope_creator_key",
+        "unique": true,
+        "keys": "35",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "OfProviderRequestGateWaiter",
+        "name": "OfProviderRequestGateWaiter_creator_bucket_ticket_idx",
+        "unique": false,
+        "keys": "5 8 9 1",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "ProviderCapacityCreatorBucket_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
         "expressions": null,
         "predicate": null
       }

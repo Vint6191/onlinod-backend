@@ -46,7 +46,7 @@ async function started(service, deviceId, permitId, capability = "read", creator
   });
 }
 
-test("global OF gate prioritizes writes and spaces actual starts by 700ms without per-request DB writes", async () => {
+test("creator OF gate prioritizes writes and spaces actual starts by 700ms without per-request DB writes", async () => {
   const accessCalls = { device: 0, creator: 0, binding: 0 };
   const service = loadService({ db: databaseFixture(accessCalls) });
   service._test.reset();
@@ -74,12 +74,12 @@ test("global OF gate prioritizes writes and spaces actual starts by 700ms withou
   assert.ok(spacing >= 700, `expected >=700ms between acknowledged starts, got ${spacing}`);
   assert.equal(writePermit.intervalMs, 700);
   assert.equal(backgroundPermit.intervalMs, 700);
-  assert.equal(service.getOfRequestGateSnapshot().coordinator, "single_backend_process_global_two_phase_creator_round_robin");
+  assert.equal(service.getOfRequestGateSnapshot().coordinator, "single_backend_process_creator_two_phase");
 });
 
 
 
-test("global OF gate spaces actual starts across different creators", async () => {
+test("creator OF gates grant independently before another creator acknowledges", async () => {
   const accessCalls = { device: 0, creator: 0, binding: 0 };
   const service = loadService({ db: databaseFixture(accessCalls) });
   service._test.reset();
@@ -93,17 +93,22 @@ test("global OF gate spaces actual starts across different creators", async () =
     deviceId: "device-b", creatorId: "creator-b", priority: "background", operation: "campaign.directory", capability: "read", timeoutMs: 5_000,
   });
 
-  const firstStart = await started(service, "device-a", firstPermit.permitId, "read", "creator-a");
   const secondPermit = await secondPromise;
+  assert.equal(service.getOfRequestGateSnapshot().activePermits.length, 2,
+    "B must be granted while A still has an unacknowledged permit");
+  assert.equal(service.getOfRequestGateSnapshot({agencyId:'other-agency',member:{role:'OWNER'}}).activePermits.length,0);
+  assert.deepEqual(Object.keys(service.getOfRequestGateSnapshot({agencyId:'agency-1',member:{role:'WORKER',assignedCreators:{ids:['creator-b']}}}).byCreator),['creator-b']);
+  const firstStart = await started(service, "device-a", firstPermit.permitId, "read", "creator-a");
   const secondStart = await started(service, "device-b", secondPermit.permitId, "read", "creator-b");
   const spacing = new Date(secondStart.startedAt).getTime() - new Date(firstStart.startedAt).getTime();
-  assert.ok(spacing >= 700, `expected process-wide >=700ms between creators, got ${spacing}`);
+  assert.ok(spacing < 700, `different creators must not share spacing, got ${spacing}`);
   const snapshot = service.getOfRequestGateSnapshot();
-  assert.equal(snapshot.activePermit, null);
-  assert.equal(snapshot.lastCreatorId, "creator-b");
+  assert.equal(snapshot.activePermits.length, 0);
+  assert.equal(snapshot.scope, "CREATOR");
+  assert.equal(snapshot.byCreator["creator-b"].lastStartedAt, secondStart.startedAt);
 });
 
-test("background queue is creator-round-robin so one creator backlog cannot monopolize permits", async () => {
+test("one creator backlog cannot block another creator", async () => {
   const accessCalls = { device: 0, creator: 0, binding: 0 };
   const service = loadService({ db: databaseFixture(accessCalls) });
   service._test.reset();
@@ -125,13 +130,13 @@ test("background queue is creator-round-robin so one creator backlog cannot mono
     deviceId: "device-b", creatorId: "creator-b", priority: "background", operation: "b1", capability: "read", timeoutMs: 5_000,
   });
 
-  await service.cancelOfRequestPermit({ userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-a", creatorId: "creator-a", permitId: first.permitId, capability: "read" });
   const second = await Promise.race([
     b1.then((permit) => ({ creator: "b", permit })),
     a2.then((permit) => ({ creator: "a", permit })),
   ]);
   assert.equal(second.creator, "b", "creator B must receive the next background turn before creator A drains its backlog");
   await service.cancelOfRequestPermit({ userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-b", creatorId: "creator-b", permitId: second.permit.permitId, capability: "read" });
+  await service.cancelOfRequestPermit({ userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-a", creatorId: "creator-a", permitId: first.permitId, capability: "read" });
   const permitA2 = await a2;
   await service.cancelOfRequestPermit({ userId: "user-1", agencyId: "agency-1", member: { role: "OWNER", assignedCreators: "all" }, deviceId: "device-a", creatorId: "creator-a", permitId: permitA2.permitId, capability: "read" });
   const permitA3 = await a3;
@@ -205,7 +210,7 @@ test("read capability cache cannot authorize a later write capability", async ()
   assert.equal(accessCalls.binding, 2);
 });
 
-test("security probe is globally paced without requiring pre-existing read readiness", async () => {
+test("security probe shares creator pacing without requiring pre-existing read readiness", async () => {
   const accessCalls = { device: 0, creator: 0, binding: 0 };
   const service = loadService({ db: databaseFixture(accessCalls) });
   service._test.reset();

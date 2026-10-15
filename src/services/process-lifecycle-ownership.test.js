@@ -6,7 +6,7 @@ const turn=()=>new Promise(setImmediate);
 const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve=a;reject=b;});return{promise,resolve,reject};};
 function load(file,ports={},extra={}) {
  const timers=new Set();const timer=(fn,ms)=>{const t={fn,ms,unref(){}};timers.add(t);return t;};
- const context={module:{exports:{}},console,process:{env:{}},Promise,Date,Error,AggregateError,Map,Set,AbortController,AbortSignal,
+ const context={module:{exports:{}},console,process:{env:{}},performance,Promise,Date,Error,AggregateError,Map,Set,AbortController,AbortSignal,
   setImmediate,setTimeout:timer,setInterval:timer,clearTimeout:t=>timers.delete(t),clearInterval:t=>timers.delete(t),
   require(name){if(name in ports)return ports[name];if(name.startsWith('node:'))return require(name);throw Error('Uncontrolled port '+name);},...extra};
  vm.runInNewContext(fs.readFileSync(path.join(root,file),'utf8'),context,{filename:file});return {service:context.module.exports,timers};
@@ -41,6 +41,7 @@ function gate({access=async()=>({status:'READY'}),billing=async()=>({}),durable=
  if(durable){db.$transaction=()=>{};db.$queryRawUnsafe=()=>{};}
  const ports={
   '../prisma':db,'./billing-execution-access-service':{assertProviderBillingAccess:billing},
+  './creator-lifecycle-contention':{isCreatorLifecycleContention:()=>false},
   '../middleware/automation-permissions':{requireCreatorAccess:access},'./db-time-authority-service':{dbAuthorityNow:async()=>new Date()},
   './capability-freshness-authority-service':{capabilityFreshnessWindow:()=>({gte:new Date(0),lte:new Date(Date.now()+60000)})},
   './provider-request-credit-authority-service':{PROVIDER_GATE_PERMIT_TTL_MS:10000,PROVIDER_GATE_WAITER_LEASE_MS:15000,PROVIDER_GATE_WAITER_HEARTBEAT_MS:3000,PROVIDER_GATE_FAIRNESS_GENERATION:'g',

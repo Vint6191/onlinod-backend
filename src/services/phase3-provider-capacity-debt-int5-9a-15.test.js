@@ -7,9 +7,10 @@ const path = require("node:path");
 
 const capacityDebt = require("./provider-capacity-debt-authority-service");
 
-test("A15 durable capacity debt marks 4k Campaign directory + 100k FanData lower-bound as overloaded", () => {
+test("capacity debt does not treat independent 4k models as one overloaded timeline", () => {
   const snapshot = capacityDebt.deriveProviderCapacityDebtSnapshot({
     now: new Date("2026-09-19T00:00:00Z"),
+    creatorCapacity: { creatorCount: 4000, directoryDebtCalls: 0n, fanDebtCalls: 0n, maxDirectoryCalls: 41n, maxFanCalls: 25n, maxRequiredCalls: 66n },
     campaignDirectory: {
       dueCreators: 4_000,
       overdueCreators: 4_000,
@@ -22,16 +23,17 @@ test("A15 durable capacity debt marks 4k Campaign directory + 100k FanData lower
       oldestRequestedAt: new Date("2026-09-18T00:00:00Z"),
     },
   });
-  assert.equal(snapshot.status, "OVERLOADED");
-  assert.match(snapshot.overloadReason, /CAMPAIGN_DIRECTORY_CAPACITY_DEBT/);
-  assert.match(snapshot.overloadReason, /FAN_DATA_CAPACITY_DEBT/);
-  assert.ok(snapshot.campaignDirectoryGuaranteedClearHours > 1500);
-  assert.ok(snapshot.fanDataGuaranteedClearHours > 400);
-  assert.ok(snapshot.providerExclusiveClearHours > 50, "even exclusive physical gate time is a large lower bound");
+  assert.equal(snapshot.status, "PRESSURED");
+  assert.equal(snapshot.campaignDirectoryCapacityDebtCalls, 0n);
+  assert.equal(snapshot.fanDataCapacityDebtCalls, 0n);
+  assert.ok(snapshot.campaignDirectoryGuaranteedClearHours < 1);
+  assert.ok(snapshot.fanDataGuaranteedClearHours < 1);
+  assert.ok(snapshot.providerExclusiveClearHours < 1);
 });
 
 test("A15 capacity projection distinguishes pressured work from impossible target debt", () => {
   const snapshot = capacityDebt.deriveProviderCapacityDebtSnapshot({
+    creatorCapacity: { creatorCount: 1, directoryDebtCalls: 0n, fanDebtCalls: 0n, maxDirectoryCalls: 2n, maxFanCalls: 10n, maxRequiredCalls: 12n },
     campaignDirectory: { dueCreators: 1, overdueCreators: 0, requiredCalls: 2n },
     fanData: { unsatisfiedDemands: 10n, pendingJobs: 1 },
   });
@@ -114,3 +116,9 @@ test("A15 operator diagnostics can read or explicitly refresh the durable capaci
 });
 
 
+
+ test("missing creator distribution stays unknown instead of inventing pooled capacity", () => {
+ const snapshot = capacityDebt.deriveProviderCapacityDebtSnapshot({ campaignDirectory: { dueCreators: 2, requiredCalls: 20000n } });
+ assert.equal(snapshot.status, "UNKNOWN");
+ assert.equal(snapshot.projectionCoverageStatus, "PARTIAL");
+ });

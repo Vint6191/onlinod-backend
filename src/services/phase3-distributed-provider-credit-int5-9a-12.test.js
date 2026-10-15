@@ -20,13 +20,13 @@ function fakeDurableDb(start = new Date("2038-02-03T04:05:06.000Z")) {
     now: new Date(start),
     ticket: 0n,
     waiters: new Map(),
-    state: {
-      id: "of-global",
+    stateTemplate: {
+      id: "of-creator:creator-a",
       activePermitId: null, activeOwnerInstanceId: null, activeAgencyId: null, activeCreatorId: null,
       activeDeviceId: null, activeCapability: null, activeIntervalMs: null, activeGrantedAt: null, activeExpiresAt: null,
       nextAllowedAt: null, revision: 0n, lastStartedAt: null, lastStartedCreatorId: null, lastStartedDeviceId: null,
       priorityCursor: 0, backgroundCategoryCursor: 0,
-      fairnessGeneration: "phase3_provider_gate_fairness_v2_a14",
+      fairnessGeneration: "creator_provider_gate_v1",
       fairnessActivationState: "ACTIVE",
       fairnessDrainStartedAt: new Date(start),
       fairnessActivatedAt: null,
@@ -37,9 +37,13 @@ function fakeDurableDb(start = new Date("2038-02-03T04:05:06.000Z")) {
     $transaction: async (work) => work({ ...(db), $transaction: undefined }),
     $queryRawUnsafe: async (sql, ...args) => {
       const text = String(sql);
-      if (/INSERT INTO "OfProviderRequestGateState"/.test(text)) return [];
-      if (/FROM "OfProviderRequestGateState" s[\s\S]*FOR UPDATE/.test(text)) return [{ ...db.state, authorityNow: new Date(db.now) }];
-      if (/s\."fairnessGeneration"[\s\S]*FROM "OfProviderRequestGateState" s/.test(text)) return [{ ...db.state, authorityNow: new Date(db.now) }];
+      if (/INSERT INTO "OfProviderRequestGateState"/.test(text)) {
+        if (!db.states.has(args[0])) db.states.set(args[0], { ...db.stateTemplate, id: args[0], scopeCreatorId: args[2] });
+        return [];
+      }
+      if (/SELECT "id" FROM "OfProviderRequestGateState"/.test(text)) return [];
+      if (/FROM "OfProviderRequestGateState" s[\s\S]*FOR UPDATE/.test(text)) return db.states.has(args[0]) ? [{ ...db.states.get(args[0]), authorityNow: new Date(db.now) }] : [];
+      if (/s\."fairnessGeneration"[\s\S]*FROM "OfProviderRequestGateState" s/.test(text)) return db.states.has(args[0]) ? [{ ...db.states.get(args[0]), authorityNow: new Date(db.now) }] : [];
       if (/INSERT INTO "OfProviderRequestGateWaiter"/.test(text)) {
         const [waiterId, ownerInstanceId, agencyId, creatorId, deviceId, capability, priority, category, operation, source, ttlMs] = args;
         let row = db.waiters.get(waiterId);
@@ -64,7 +68,7 @@ function fakeDurableDb(start = new Date("2038-02-03T04:05:06.000Z")) {
       }
       if (/CROSS JOIN LATERAL/.test(text)) {
         return JSON.parse(args[0]).flatMap(bucket => [...db.waiters.values()]
-          .filter(row => row.priority === bucket.priority && row.category === bucket.category)
+          .filter(row => row.creatorId === args[2] && row.priority === bucket.priority && row.category === bucket.category)
           .sort((a,b) => a.ticket < b.ticket ? -1 : 1).slice(0,args[1]).map(row => ({...row})));
       }
       if (/DELETE FROM "OfProviderRequestGateWaiter"[\s\S]*"waiterId" = \$1 AND "ownerInstanceId" = \$2/.test(text)) {
@@ -73,35 +77,38 @@ function fakeDurableDb(start = new Date("2038-02-03T04:05:06.000Z")) {
         return [];
       }
       if (/UPDATE "OfProviderRequestGateState"/.test(text)) {
+        const state = db.states.get(args[0]);
         if (/"activePermitId"\s*=\s*\$2/.test(text)) {
-          db.state.activePermitId = args[1]; db.state.activeOwnerInstanceId = args[2]; db.state.activeAgencyId = args[3];
-          db.state.activeCreatorId = args[4]; db.state.activeDeviceId = args[5]; db.state.activeCapability = args[6];
-          db.state.activeIntervalMs = args[7]; db.state.activeGrantedAt = args[8]; db.state.activeExpiresAt = args[9];
-          if (db.state.fairnessActivationState !== "ACTIVE") {
-            db.state.legacyPermitLastSeenAt = new Date(db.now);
-            db.state.legacyPermitCount += 1n;
+          state.activePermitId = args[1]; state.activeOwnerInstanceId = args[2]; state.activeAgencyId = args[3];
+          state.activeCreatorId = args[4]; state.activeDeviceId = args[5]; state.activeCapability = args[6];
+          state.activeIntervalMs = args[7]; state.activeGrantedAt = args[8]; state.activeExpiresAt = args[9];
+          if (state.fairnessActivationState !== "ACTIVE") {
+            state.legacyPermitLastSeenAt = new Date(db.now);
+            state.legacyPermitCount += 1n;
           }
-          db.state.priorityCursor = Number(args[10] ?? db.state.priorityCursor);
-          db.state.backgroundCategoryCursor = Number(args[11] ?? db.state.backgroundCategoryCursor);
+          state.priorityCursor = Number(args[10] ?? state.priorityCursor);
+          state.backgroundCategoryCursor = Number(args[11] ?? state.backgroundCategoryCursor);
         } else {
-          db.state.activePermitId = null; db.state.activeOwnerInstanceId = null; db.state.activeAgencyId = null;
-          db.state.activeCreatorId = null; db.state.activeDeviceId = null; db.state.activeCapability = null;
-          db.state.activeIntervalMs = null; db.state.activeGrantedAt = null; db.state.activeExpiresAt = null;
+          state.activePermitId = null; state.activeOwnerInstanceId = null; state.activeAgencyId = null;
+          state.activeCreatorId = null; state.activeDeviceId = null; state.activeCapability = null;
+          state.activeIntervalMs = null; state.activeGrantedAt = null; state.activeExpiresAt = null;
           if (/"lastStartedAt" = \$2/.test(text)) {
-            db.state.lastStartedAt = args[1]; db.state.lastStartedCreatorId = args[2]; db.state.lastStartedDeviceId = args[3];
+            state.lastStartedAt = args[1]; state.lastStartedCreatorId = args[2]; state.lastStartedDeviceId = args[3];
             const candidate = args[4];
-            if (!db.state.nextAllowedAt || candidate > db.state.nextAllowedAt) db.state.nextAllowedAt = candidate;
+            if (!state.nextAllowedAt || candidate > state.nextAllowedAt) state.nextAllowedAt = candidate;
           } else if (/"nextAllowedAt" = GREATEST/.test(text)) {
             const candidate = args[1];
-            if (!db.state.nextAllowedAt || candidate > db.state.nextAllowedAt) db.state.nextAllowedAt = candidate;
+            if (!state.nextAllowedAt || candidate > state.nextAllowedAt) state.nextAllowedAt = candidate;
           }
         }
-        db.state.revision += 1n;
-        return [{ revision: db.state.revision, nextAllowedAt: db.state.nextAllowedAt }];
+        state.revision += 1n;
+        return [{ revision: state.revision, nextAllowedAt: state.nextAllowedAt }];
       }
       throw new Error(`unexpected sql: ${text}`);
     },
   };
+  db.states = new Map();
+  Object.defineProperty(db, "state", { get: () => db.states.get("of-creator:creator-a") });
   return db;
 }
 
@@ -111,14 +118,14 @@ async function queueWaiter(db, { waiterId, ownerInstanceId, agencyId, creatorId,
 
 const scopeA = { agencyId: "agency-1", creatorId: "creator-a", deviceId: "device-a", capability: "read", intervalMs: 700 };
 
-test("A12 durable singleton serializes permits across backend instances and accepts /started on another replica", async () => {
+test("creator durable gate serializes same-model permits across backend instances and accepts /started on another replica", async () => {
   const db = fakeDurableDb();
   await queueWaiter(db, { waiterId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
   const first = await tryAcquireDurableProviderPermit({ db: commitDatabaseFixture(db), waiterId: "permit-a", permitId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
   assert.equal(first.granted, true);
-  await queueWaiter(db, { waiterId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b" });
+  await queueWaiter(db, { waiterId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-a", deviceId: "device-b" });
   const blocked = await tryAcquireDurableProviderPermit({
-    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
+    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-a", deviceId: "device-b", capability: "read", intervalMs: 700,
   });
   assert.equal(blocked.granted, false);
   assert.equal(blocked.reason, "active_permit");
@@ -129,13 +136,13 @@ test("A12 durable singleton serializes permits across backend instances and acce
   assert.equal(db.state.nextAllowedAt.toISOString(), new Date(db.now.getTime() + 700).toISOString());
 
   const spacing = await tryAcquireDurableProviderPermit({
-    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
+    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-a", deviceId: "device-b", capability: "read", intervalMs: 700,
   });
   assert.equal(spacing.granted, false);
   assert.equal(spacing.reason, "spacing");
   db.now = new Date(started.nextAllowedAt);
   const second = await tryAcquireDurableProviderPermit({
-    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
+    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-a", deviceId: "device-b", capability: "read", intervalMs: 700,
   });
   assert.equal(second.granted, true);
   assert.equal(db.state.activeOwnerInstanceId, "backend-b");
@@ -147,9 +154,9 @@ test("A12 expired unacknowledged permit is unknown outcome and burns another ful
   const first = await tryAcquireDurableProviderPermit({ db: commitDatabaseFixture(db), waiterId: "permit-a", permitId: "permit-a", ownerInstanceId: "backend-a", ...scopeA });
   assert.equal(first.granted, true);
   db.now = new Date(first.expiresAt.getTime() + 1);
-  await queueWaiter(db, { waiterId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b" });
+  await queueWaiter(db, { waiterId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-a", deviceId: "device-b" });
   const expired = await tryAcquireDurableProviderPermit({
-    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-b", deviceId: "device-b", capability: "read", intervalMs: 700,
+    db: commitDatabaseFixture(db), waiterId: "permit-b", permitId: "permit-b", ownerInstanceId: "backend-b", agencyId: "agency-1", creatorId: "creator-a", deviceId: "device-b", capability: "read", intervalMs: 700,
   });
   assert.equal(expired.granted, false);
   assert.equal(expired.reason, "expired_unknown_outcome");
@@ -180,7 +187,7 @@ test("A12 gate service uses PostgreSQL authority when transaction support exists
   assert.match(source, /tryAcquireDurableProviderPermit/);
   assert.match(source, /acknowledgeDurableProviderStarted/);
   assert.match(source, /cancelDurableProviderPermit/);
-  assert.match(source, /postgres_durable_waiter_weighted_fair_global_two_phase/);
+  assert.match(source, /postgres_durable_creator_two_phase/);
   assert.match(source, /if \(!admission\.granted\)[\s\S]*enqueue\(entry\)[\s\S]*durableRetryAtMs/);
 });
 

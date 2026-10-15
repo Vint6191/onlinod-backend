@@ -2,6 +2,7 @@
 
 // One bounded transaction owns backfill, dirty repair, time wakeup and publication.
 // Canonical triggers only touch a per-source dirty key; never this global lock.
+const { creatorCapacitySummarySql, PROJECTED_CREATOR_DEMANDS_SQL, CREATOR_USAGE_SQL } = require("./provider-capacity-creator-summary");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { CLAIMABLE_DESKTOP_JOB_KEYS } = require("./job-catalog");
@@ -10,9 +11,9 @@ const { CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS } = require("./analytics-freshnes
 const { directoryDiscoveryDeadline } = require("./analytics-observation-time");
 const { ID, GENERATION, assertCapacityProjectionCatalog } = require("./provider-capacity-catalog-contract");
 const SOURCE = Object.freeze({
-  directory: { table: "CreatorCampaignCollectionState", columns: '"id","baselineVerifiedAt","campaignDirectoryDiscoveryRequestedRevision","campaignDirectoryDiscoveryCompletedRevision","campaignDirectoryDiscoveryDueAt","campaignDirectoryCampaignCount","campaignDirectoryVerifiedAt","campaignDirectoryRequestedAt"' },
-  fan: { table: "CreatorFanRefreshDemand", columns: '"id","requestedRevision","satisfiedRevision","lastRequestedAt"' },
-  job: { table: "JobInstance", columns: '"id","jobKey","status","scheduledAt"' },
+  directory: { table: "CreatorCampaignCollectionState", columns: '"id","creatorId","baselineVerifiedAt","campaignDirectoryDiscoveryRequestedRevision","campaignDirectoryDiscoveryCompletedRevision","campaignDirectoryDiscoveryDueAt","campaignDirectoryCampaignCount","campaignDirectoryVerifiedAt","campaignDirectoryRequestedAt"' },
+  fan: { table: "CreatorFanRefreshDemand", columns: '"id","creatorId","requestedRevision","satisfiedRevision","lastRequestedAt"' },
+  job: { table: "JobInstance", columns: '"id","creatorId","jobKey","status","scheduledAt"' },
 });
 const OTHER_KEYS = CLAIMABLE_DESKTOP_JOB_KEYS.filter((key) => !["fetch_campaigns", "fan_data_point_refresh"].includes(key));
 const OTHER_BUCKETS = OTHER_KEYS.map((key) => `job:${key}`);
@@ -23,7 +24,7 @@ const failure = (code) => Object.assign(new Error(code), { code });
 
 function contributionFor(kind, row, now) {
   if (!row) return null; // canonical deletion retracts the former contribution
-  const c = { kind, sourceId: row.id, bucket: kind, itemCount: 0n, overdueCount: 0n, requiredCalls: 0n, oldestAt: null, nextDueAt: null };
+  const c = { kind, sourceId: row.id, creatorId: row.creatorId, bucket: kind, itemCount: 0n, overdueCount: 0n, requiredCalls: 0n, oldestAt: null, nextDueAt: null };
   if (kind === "directory") {
     if (!row.baselineVerifiedAt) return null;
     const dueAt = directoryDiscoveryDeadline(row, CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS, now);
@@ -56,6 +57,18 @@ function bucketDeltas(before, after) {
     totals.set(c.bucket, delta);
   }
   return [...totals.values()].filter((c) => c.itemCount || c.overdueCount || c.requiredCalls);
+}
+
+function creatorBucketDeltas(before, after) {
+  const totals = new Map();
+  for (const [rows, sign] of [[before, -1n], [after, 1n]]) for (const c of rows) {
+    if (!c.creatorId) continue; // pre-upgrade contribution is adopted once
+    const key = JSON.stringify([c.creatorId, c.bucket]);
+    const delta = totals.get(key) || { creatorId: c.creatorId, bucket: c.bucket, itemCount: 0n, overdueCount: 0n, requiredCalls: 0n };
+    for (const field of ["itemCount", "overdueCount", "requiredCalls"]) delta[field] += sign * integer(c[field]);
+    totals.set(key, delta);
+  }
+  return [...totals.values()].filter(c => c.itemCount || c.overdueCount || c.requiredCalls);
 }
 
 async function enqueue(db, kind, ids) {
@@ -103,17 +116,31 @@ async function repairDirty(db, now, size) {
         "itemCount"=b."itemCount"+d."itemCount", "overdueCount"=b."overdueCount"+d."overdueCount", "requiredCalls"=b."requiredCalls"+d."requiredCalls"
         FROM jsonb_to_recordset($1::jsonb) AS d(bucket text,"itemCount" bigint,"overdueCount" bigint,"requiredCalls" bigint) WHERE b."bucket"=d.bucket`, json(deltas));
     }
+    const creatorDeltas = creatorBucketDeltas(before, after);
+    if (creatorDeltas.length) {
+      await db.$executeRawUnsafe(`INSERT INTO "ProviderCapacityCreatorBucket" ("creatorId",bucket)
+        SELECT "creatorId",bucket FROM jsonb_to_recordset($1::jsonb) AS d("creatorId" text,bucket text)
+        ON CONFLICT DO NOTHING`, json(creatorDeltas));
+      await db.$executeRawUnsafe(`UPDATE "ProviderCapacityCreatorBucket" b SET
+        "itemCount"=b."itemCount"+d."itemCount", "overdueCount"=b."overdueCount"+d."overdueCount", "requiredCalls"=b."requiredCalls"+d."requiredCalls"
+        FROM jsonb_to_recordset($1::jsonb) AS d("creatorId" text,bucket text,"itemCount" bigint,"overdueCount" bigint,"requiredCalls" bigint)
+        WHERE b."creatorId"=d."creatorId" AND b.bucket=d.bucket`, json(creatorDeltas));
+      await db.$executeRawUnsafe(`DELETE FROM "ProviderCapacityCreatorBucket" b
+        USING jsonb_to_recordset($1::jsonb) AS d("creatorId" text,bucket text)
+        WHERE b."creatorId"=d."creatorId" AND b.bucket=d.bucket AND b."itemCount"=0 AND b."overdueCount"=0 AND b."requiredCalls"=0`, json(creatorDeltas));
+    }
     await db.$executeRawUnsafe(`DELETE FROM "ProviderCapacityContribution" WHERE "kind"=$1 AND "sourceId"=ANY($2::text[])`, kind, ids);
-    if (after.length) await db.$executeRawUnsafe(`INSERT INTO "ProviderCapacityContribution" ("kind","sourceId","bucket","itemCount","overdueCount","requiredCalls","oldestAt","nextDueAt")
-      SELECT kind,"sourceId",bucket,"itemCount","overdueCount","requiredCalls","oldestAt","nextDueAt"
-      FROM jsonb_to_recordset($1::jsonb) AS c(kind text,"sourceId" text,bucket text,"itemCount" bigint,"overdueCount" bigint,"requiredCalls" bigint,"oldestAt" timestamp,"nextDueAt" timestamp)`, json(after));
+    if (after.length) await db.$executeRawUnsafe(`INSERT INTO "ProviderCapacityContribution" ("kind","sourceId","bucket","itemCount","overdueCount","requiredCalls","oldestAt","nextDueAt","creatorId")
+      SELECT kind,"sourceId",bucket,"itemCount","overdueCount","requiredCalls","oldestAt","nextDueAt","creatorId"
+      FROM jsonb_to_recordset($1::jsonb) AS c(kind text,"sourceId" text,bucket text,"itemCount" bigint,"overdueCount" bigint,"requiredCalls" bigint,"oldestAt" timestamp,"nextDueAt" timestamp,"creatorId" text)`, json(after));
     await db.$executeRawUnsafe(`DELETE FROM "ProviderCapacityDirty" WHERE "kind"=$1 AND "sourceId"=ANY($2::text[])`, kind, ids);
   }
   return dirty.length;
 }
 
 async function readProjectedInputs(db, now) {
-  // Fixed catalog cardinality, singleton lookups and indexed LIMIT 1 probes only.
+  // Fixed catalog probes plus compact per-creator buckets; raw fan cardinality
+  // never enters this publication query. No request gate row is locked here.
   const rows = await db.$queryRawUnsafe(`WITH background_other AS (
     SELECT COALESCE(SUM(b."itemCount"),0)::bigint AS "backgroundOtherPendingJobs",
       COUNT(*) FILTER (WHERE b."itemCount">0)::bigint AS "backgroundOtherPendingJobClasses",
@@ -122,7 +149,8 @@ async function readProjectedInputs(db, now) {
     LEFT JOIN "ProviderCapacityBucket" b ON b.bucket=keys.bucket
     LEFT JOIN LATERAL (SELECT "oldestAt" FROM "ProviderCapacityContribution" c
       WHERE c.bucket=keys.bucket AND "oldestAt" IS NOT NULL ORDER BY "oldestAt" LIMIT 1) oldest ON true
-  ) SELECT s."revision", s."directoryComplete",s."fanComplete",s."jobComplete",
+  ), creator_capacity AS (${creatorCapacitySummarySql(PROJECTED_CREATOR_DEMANDS_SQL)}), usage AS (${CREATOR_USAGE_SQL})
+  SELECT creator_capacity.*, s."revision", s."directoryComplete",s."fanComplete",s."jobComplete",
     (s."directoryComplete" AND s."fanComplete" AND s."jobComplete"
       AND NOT EXISTS (SELECT 1 FROM "ProviderCapacityDirty" LIMIT 1)
       AND NOT EXISTS (SELECT 1 FROM "ProviderCapacityContribution" WHERE "nextDueAt" <= $1 LIMIT 1)) AS "projectionComplete",
@@ -139,7 +167,7 @@ async function readProjectedInputs(db, now) {
     LEFT JOIN "ProviderCapacityBucket" f ON f.bucket='fan'
     LEFT JOIN "ProviderCapacityBucket" j ON j.bucket='job:fan_data_point_refresh'
     CROSS JOIN background_other
-    LEFT JOIN "OfProviderRequestGateState" u ON u.id='of-global'
+    CROSS JOIN creator_capacity LEFT JOIN usage u ON true
     WHERE s.id=$3`, now, OTHER_BUCKETS, ID);
   if (!rows[0]) throw failure("CAPACITY_PROJECTION_STATE_MISSING");
   return rows[0];

@@ -9,7 +9,7 @@ function fixture({ register, grant, access } = {}) {
   const db = {
     $transaction() {}, $queryRawUnsafe: async () => [{ authorityNow: new Date() }],
     workerDevice: { findFirst: async () => ({ id: "d", userId: "u", agencyId: "a", lastSeenAt: new Date() }) },
-    creatorAccount: { findFirst: async () => { calls.accesses++; if (access) await access(calls); return { id: "c", agencyId: "a", status: "READY" }; } },
+    creatorAccount: { findFirst: async ({where}) => { calls.accesses++; if (access) await access(calls); return { id: where.id, agencyId: "a", status: "READY" }; } },
     deviceCreatorBinding: { findFirst: async () => ({ id: "binding" }) },
   };
   require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(db);
@@ -20,8 +20,8 @@ function fixture({ register, grant, access } = {}) {
     PROVIDER_GATE_FAIRNESS_GENERATION: "fixture", readProviderGateFairnessAuthority: async () => ({ activationState: "ACTIVE" }),
     registerDurableProviderWaiter: async args => { calls.register.push(args.waiterId); if (register) await register(calls); },
     heartbeatDurableProviderWaiters: async () => ({}), cancelDurableProviderWaiter: async () => ({}),
-    tryAcquireDurableProviderPermit: async () => {
-      calls.grants++; if (grant) await grant(calls);
+    tryAcquireDurableProviderPermit: async args => {
+      calls.grants++; if (grant) await grant(calls,args);
       return { granted: true, intervalMs: 700, grantedAt: new Date(), expiresAt: new Date(Date.now() + 15000) };
     },
     cancelDurableProviderPermit: async () => { calls.cancelled++; return {}; },
@@ -61,4 +61,20 @@ test("post-grant authority failure cancels the grant and is never treated as pre
     await assert.rejects(f.service.acquireOfRequestSlot(input), error => error.meta?.code === "55P03");
     assert.equal(f.calls.grants, 1); assert.equal(f.calls.cancelled, 1); assert.equal(f.calls.register.length, 1);
   } finally { await f.service.stopOfRequestGate(); }
+});
+
+test("a model waiting inside its durable grant cannot head-of-line block another model", {timeout:5000}, async () => {
+  let release, entered;
+  const hold = new Promise(resolve => {release=resolve;});
+  const entering = new Promise(resolve => {entered=resolve;});
+  const f = fixture({grant: async (_calls,args) => {if(args.creatorId==='c'){entered();await hold;}}});
+  const first = f.service.acquireOfRequestSlot(input);
+  try {
+    await entering;
+    const second = await f.service.acquireOfRequestSlot({...input, creatorId:'other', capability:'write', priority:'critical_write', timeoutMs:1000});
+    assert(second.permitId);
+    assert.equal(f.calls.grants,2);
+    release();await first;
+    assert.equal(f.service.getOfRequestGateSnapshot().activePermits.length,2);
+  } finally {release();await first.catch(()=>{});await f.service.stopOfRequestGate();}
 });

@@ -13,7 +13,7 @@ const DEFAULT_PROVIDER_INTERVAL_MS = 700;
 const DEFAULT_CAMPAIGN_DIRECTORY_PAGE_SIZE = 50;
 const DEFAULT_CAMPAIGN_DIRECTORY_TARGET_MS = 72 * 60 * 60 * 1000;
 const DEFAULT_UNIVERSAL_CREATOR_TARGET = 4000;
-const PROVIDER_SCALE_CONTRACT_VERSION = "phase3_provider_scale_contract_v1_a19";
+const PROVIDER_SCALE_CONTRACT_VERSION = "creator_provider_scale_contract_v2";
 
 // Must remain semantically aligned with provider-request-credit-authority-service.
 // Keeping the weights local makes this module pure and avoids importing the DB
@@ -83,10 +83,11 @@ function campaignDirectoryFleetFeasibility({
   const creators = Math.max(0, finiteInt(creatorCount, 0, 0));
   const callsPerCreator = estimatedCampaignDirectoryCalls(campaignCount);
   const requiredCalls = creators * callsPerCreator;
-  const startsPerHour = mode === "background_only"
+  const startsPerCreatorHour = mode === "background_only"
     ? providerCategoryBackgroundOnlyStartsPerHour("campaign_directory", intervalMs)
     : providerCategoryGuaranteedStartsPerHour("campaign_directory", intervalMs);
-  const requiredHours = startsPerHour > 0 ? requiredCalls / startsPerHour : Number.POSITIVE_INFINITY;
+  const startsPerHour = creators * startsPerCreatorHour;
+  const requiredHours = creators === 0 ? 0 : startsPerCreatorHour > 0 ? callsPerCreator / startsPerCreatorHour : Number.POSITIVE_INFINITY;
   const targetHours = Math.max(0, Number(targetMs) || 0) / 3_600_000;
   return {
     creators,
@@ -94,6 +95,9 @@ function campaignDirectoryFleetFeasibility({
     callsPerCreator,
     requiredCalls,
     startsPerHour,
+    startsPerCreatorHour,
+    scope: "CREATOR_PARALLEL",
+    workerAvailabilityRequired: true,
     requiredHours,
     targetHours,
     feasibleWithinTarget: Number.isFinite(requiredHours) && requiredHours <= targetHours,
@@ -114,7 +118,7 @@ function providerScaleContract({
     version: PROVIDER_SCALE_CONTRACT_VERSION,
     universalDirectorySlaGuaranteed: feasibility.feasibleWithinTarget,
     policy: feasibility.feasibleWithinTarget ? "GUARANTEED_WITHIN_CURRENT_TOPOLOGY" : "BEST_EFFORT_OVERDUE_VISIBLE",
-    reason: feasibility.feasibleWithinTarget ? null : "FLEET_GLOBAL_CAPACITY_INSUFFICIENT",
+    reason: feasibility.feasibleWithinTarget ? null : "CREATOR_CAPACITY_INSUFFICIENT",
     noUnauditedSharding: true,
     feasibility,
   };

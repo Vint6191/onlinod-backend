@@ -2,12 +2,18 @@
 
 const { runDbTransaction } = require("./db-transaction-service");
 
-const PROVIDER_GATE_STATE_ID = "of-global";
+// The legacy row is retained only to acknowledge a permit issued before cutover.
+const LEGACY_PROVIDER_GATE_STATE_ID = "of-global";
+function providerGateStateId(creatorId) {
+  const id = clean(creatorId, 200);
+  if (!id) throw Object.assign(new Error("Creator gate scope is required"), { code: "OF_PROVIDER_GATE_SCOPE_REQUIRED" });
+  return `of-creator:${id}`;
+}
 const PROVIDER_GATE_POLL_MS = Math.max(100, Math.min(2_000, Number.parseInt(process.env.OF_PROVIDER_GATE_POLL_MS || "250", 10) || 250));
 const PROVIDER_GATE_PERMIT_TTL_MS = Math.max(5_000, Math.min(60_000, Number.parseInt(process.env.OF_PROVIDER_GATE_PERMIT_TTL_MS || "15000", 10) || 15_000));
 const PROVIDER_GATE_WAITER_LEASE_MS = Math.max(10_000, Math.min(60_000, Number.parseInt(process.env.OF_PROVIDER_GATE_WAITER_LEASE_MS || "20000", 10) || 20_000));
 const PROVIDER_GATE_WAITER_HEARTBEAT_MS = Math.max(2_000, Math.min(Math.floor(PROVIDER_GATE_WAITER_LEASE_MS / 2), Number.parseInt(process.env.OF_PROVIDER_GATE_WAITER_HEARTBEAT_MS || "5000", 10) || 5_000));
-const PROVIDER_GATE_FAIRNESS_GENERATION = "phase3_provider_gate_fairness_v2_a14";
+const PROVIDER_GATE_FAIRNESS_GENERATION = "creator_provider_gate_v1";
 const PROVIDER_GATE_FAIRNESS_STATES = Object.freeze(["ACTIVE"]);
 
 // Preserve the A11 weighted user-facing priority policy, but make the cursor
@@ -76,20 +82,20 @@ function assertDurableClient(db) {
     throw error;
   }
 }
-async function ensureStateRow(db) {
+async function ensureStateRow(db, creatorId) {
   // Prisma timestamp columns store UTC wall time. These single-statement
   // writes also run outside the commit kernel's transaction-local UTC scope,
   // so they must not inherit a pooled connection's session timezone.
   await db.$queryRawUnsafe(`
     INSERT INTO "OfProviderRequestGateState" (
-      "id", "revision", "priorityCursor", "backgroundCategoryCursor",
+      "id", "revision", "priorityCursor", "backgroundCategoryCursor", "scopeCreatorId",
       "fairnessGeneration", "fairnessActivationState",
       "createdAt", "updatedAt"
-    ) VALUES ($1, 0, 0, 0, $2, 'ACTIVE', (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'))
+    ) VALUES ($1, 0, 0, 0, $3, $2, 'ACTIVE', (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'), (CURRENT_TIMESTAMP AT TIME ZONE 'UTC'))
     ON CONFLICT ("id") DO NOTHING
-  `, PROVIDER_GATE_STATE_ID, PROVIDER_GATE_FAIRNESS_GENERATION);
+  `, providerGateStateId(creatorId), PROVIDER_GATE_FAIRNESS_GENERATION, clean(creatorId, 200));
 }
-async function lockedState(db) {
+async function lockedState(db, creatorId, stateId = providerGateStateId(creatorId)) {
   const rows = await db.$queryRawUnsafe(`
     SELECT
       s."id",
@@ -128,10 +134,10 @@ async function lockedState(db) {
     FROM "OfProviderRequestGateState" s
     WHERE s."id" = $1
     FOR UPDATE
-  `, PROVIDER_GATE_STATE_ID);
+  `, stateId);
   const row = Array.isArray(rows) ? rows[0] : rows;
   if (!row) {
-    const error = new Error("Durable provider gate singleton is missing");
+    const error = new Error("Durable creator provider gate is missing");
     error.code = "OF_PROVIDER_GATE_STATE_MISSING";
     error.status = 503;
     throw error;
@@ -169,22 +175,22 @@ function cycleChoice(cycle, cursorValue, available) {
   return null;
 }
 
-async function readProviderGateFairnessAuthority({ db, forUpdate = false } = {}) {
+async function readProviderGateFairnessAuthority({ db, creatorId, forUpdate = false } = {}) {
   assertDurableClient(db);
   if (forUpdate) {
-    await ensureStateRow(db);
-    return fairnessAuthorityFromRow(await lockedState(db));
+    await ensureStateRow(db, creatorId);
+    return fairnessAuthorityFromRow(await lockedState(db, creatorId));
   }
-  await ensureStateRow(db);
+  await ensureStateRow(db, creatorId);
   const rows = await db.$queryRawUnsafe(`
     SELECT
       s."fairnessGeneration", s."fairnessActivationState", clock_timestamp() AS "authorityNow"
     FROM "OfProviderRequestGateState" s
     WHERE s."id"=$1
     LIMIT 1
-  `, PROVIDER_GATE_STATE_ID);
+  `, providerGateStateId(creatorId));
   const row = Array.isArray(rows) ? rows[0] : rows;
-  if (!row) throw Object.assign(new Error("Durable provider gate singleton is missing"), { code: "OF_PROVIDER_GATE_STATE_MISSING", status: 503 });
+  if (!row) throw Object.assign(new Error("Durable creator provider gate is missing"), { code: "OF_PROVIDER_GATE_STATE_MISSING", status: 503 });
   return fairnessAuthorityFromRow(row);
 }
 
@@ -314,15 +320,16 @@ async function cancelDurableProviderWaiter({ db, waiterId, ownerInstanceId } = {
   return { cancelled: Boolean(row) };
 }
 
-async function waiterHeads(tx, authorityNow) {
+async function waiterHeads(tx, authorityNow, creatorId) {
+  providerGateStateId(creatorId);
   // Limit BEFORE filtering expiry: an arbitrary stale prefix cannot make one
-  // admission scan the whole queue under the global gate lock. Eight fixed
-  // buckets x32 ticket rows, backed by the bucket_ticket index.
+  // admission scan the whole queue under this creator gate lock. Eight fixed
+  // buckets x32 ticket rows, backed by the creator_bucket_ticket index.
   // Full tuple bounds cover exactly one bucket, including every bigint ticket.
   // Retain all three order keys: equality + ORDER BY ticket alone lets the
   // planner walk/filter the global PK across entire preceding clustered buckets.
   // Try-lock only those exact tickets. Heartbeats may lock several waiters in
-  // another order, so never wait on their rows while holding the global gate.
+  // another order, so never wait on their rows while holding the creator gate.
   // If any prefix row is locked/disappeared, yield the offer instead of jumping
   // over an unseen FIFO head. Read lease/identity from the locked current row.
   const rows = await tx.$queryRawUnsafe(`
@@ -330,9 +337,9 @@ async function waiterHeads(tx, authorityNow) {
     FROM jsonb_to_recordset($1::jsonb) AS bucket(priority text,category text)
     CROSS JOIN LATERAL (
       SELECT w."ticket" FROM "OfProviderRequestGateWaiter" w
-      WHERE (w."priority",w."category",w."ticket") >= (bucket.priority,bucket.category,'-9223372036854775808'::bigint)
-        AND (w."priority",w."category",w."ticket") <= (bucket.priority,bucket.category,'9223372036854775807'::bigint)
-      ORDER BY w."priority",w."category",w."ticket" LIMIT $2
+      WHERE (w."creatorId",w."priority",w."category",w."ticket") >= ($3,bucket.priority,bucket.category,'-9223372036854775808'::bigint)
+        AND (w."creatorId",w."priority",w."category",w."ticket") <= ($3,bucket.priority,bucket.category,'9223372036854775807'::bigint)
+      ORDER BY w."creatorId",w."priority",w."category",w."ticket" LIMIT $2
     ) prefix
     LEFT JOIN LATERAL (
       SELECT w."waiterId", w."ownerInstanceId", w."agencyId", w."creatorId", w."deviceId",
@@ -341,7 +348,7 @@ async function waiterHeads(tx, authorityNow) {
       FROM "OfProviderRequestGateWaiter" w WHERE w."ticket"=prefix."ticket"
       FOR UPDATE OF w SKIP LOCKED
     ) locked ON true
-  `, JSON.stringify(PROVIDER_GATE_BUCKETS), PROVIDER_GATE_HEAD_PAGE_SIZE);
+  `, JSON.stringify(PROVIDER_GATE_BUCKETS), PROVIDER_GATE_HEAD_PAGE_SIZE, clean(creatorId, 200));
   if (rows.some(row => !row.waiterId)) return [];
   const expired = [], heads = new Map();
   for (const row of rows) {
@@ -415,12 +422,12 @@ async function tryAcquireDurableProviderPermit({
     error.code = "OF_PROVIDER_GATE_WAITER_PERMIT_REQUIRED";
     throw error;
   }
-  const spacingMs = Math.max(1, Math.floor(asNumber(intervalMs, 700)));
+  const spacingMs = Math.max(700, Math.floor(asNumber(intervalMs, 700)));
   const ttlMs = Math.max(5_000, Math.floor(asNumber(permitTtlMs, PROVIDER_GATE_PERMIT_TTL_MS)));
 
   return runDbTransaction(db, async (tx) => {
-    await ensureStateRow(tx);
-    const state = await lockedState(tx);
+    await ensureStateRow(tx, creatorId);
+    const state = await lockedState(tx, creatorId);
     const authorityNow = asDate(state.authorityNow);
     if (!authorityNow) throw new Error("OF_PROVIDER_GATE_DB_TIME_INVALID");
 
@@ -457,7 +464,7 @@ async function tryAcquireDurableProviderPermit({
           "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
         WHERE "id" = $1
         RETURNING "revision", "nextAllowedAt"
-      `, PROVIDER_GATE_STATE_ID, failSafeNext);
+      `, state.id, failSafeNext);
       const updated = Array.isArray(rows) ? rows[0] : rows;
       return {
         granted: false,
@@ -490,7 +497,7 @@ async function tryAcquireDurableProviderPermit({
       };
     }
 
-    const heads = await waiterHeads(tx, authorityNow);
+    const heads = await waiterHeads(tx, authorityNow, creatorId);
     const selected = chooseDurableWaiter(state, heads);
     if (!selected || clean(selected.waiter.waiterId, 200) !== normalized.waiterId) {
       return {
@@ -527,7 +534,7 @@ async function tryAcquireDurableProviderPermit({
       WHERE "id" = $1
       RETURNING "revision"
     `,
-    PROVIDER_GATE_STATE_ID,
+    state.id,
     normalized.permitId,
     normalized.ownerInstanceId,
     normalized.agencyId,
@@ -560,12 +567,21 @@ async function tryAcquireDurableProviderPermit({
   });
 }
 
+async function lockedPermitState(tx, input) {
+  await ensureStateRow(tx, input.creatorId);
+  const state = await lockedState(tx, input.creatorId);
+  if (exactPermitMatch(state, input)) return state;
+  const rows = await tx.$queryRawUnsafe(`SELECT "id" FROM "OfProviderRequestGateState"
+    WHERE "id"=$1 AND "activePermitId"=$2 AND "activeCreatorId"=$3`,
+    LEGACY_PROVIDER_GATE_STATE_ID, clean(input.permitId, 200), clean(input.creatorId, 200));
+  return rows.length ? lockedState(tx, input.creatorId, LEGACY_PROVIDER_GATE_STATE_ID) : state;
+}
+
 async function acknowledgeDurableProviderStarted({ db, permitId, agencyId, creatorId, deviceId, capability } = {}) {
   assertDurableClient(db);
   const input = { permitId, agencyId, creatorId, deviceId, capability };
   return runDbTransaction(db, async (tx) => {
-    await ensureStateRow(tx);
-    const state = await lockedState(tx);
+    const state = await lockedPermitState(tx, input);
     if (!exactPermitMatch(state, input)) {
       const error = new Error("Durable OF provider permit is missing, expired, replaced or belongs to another scope");
       error.code = "OF_GATE_PERMIT_INVALID";
@@ -613,7 +629,7 @@ async function acknowledgeDurableProviderStarted({ db, permitId, agencyId, creat
         "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
       WHERE "id" = $1
       RETURNING "revision", "usageWindowStartedAt", "usageTotalStarts", "usageUnclassifiedStarts"
-    `, PROVIDER_GATE_STATE_ID, authorityNow, clean(creatorId, 200), clean(deviceId, 200), nextAllowedAt, activePriority, activeCategory, resetUsageWindow);
+    `, state.id, authorityNow, clean(creatorId, 200), clean(deviceId, 200), nextAllowedAt, activePriority, activeCategory, resetUsageWindow);
     const updated = Array.isArray(rows) ? rows[0] : rows;
     return {
       startedAt: authorityNow,
@@ -631,8 +647,7 @@ async function cancelDurableProviderPermit({ db, permitId, agencyId, creatorId, 
   assertDurableClient(db);
   const input = { permitId, agencyId, creatorId, deviceId, capability };
   return runDbTransaction(db, async (tx) => {
-    await ensureStateRow(tx);
-    const state = await lockedState(tx);
+    const state = await lockedPermitState(tx, input);
     if (!exactPermitMatch(state, input)) return { cancelled: false, revision: asNumber(state.revision, 0) };
     const rows = await tx.$queryRawUnsafe(`
       UPDATE "OfProviderRequestGateState"
@@ -652,17 +667,17 @@ async function cancelDurableProviderPermit({ db, permitId, agencyId, creatorId, 
         "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'UTC')
       WHERE "id" = $1
       RETURNING "revision"
-    `, PROVIDER_GATE_STATE_ID);
+    `, state.id);
     const updated = Array.isArray(rows) ? rows[0] : rows;
     return { cancelled: true, revision: asNumber(updated?.revision, asNumber(state.revision, 0) + 1) };
   });
 }
 
-async function readDurableProviderGateState({ db } = {}) {
+async function readDurableProviderGateState({ db, creatorId } = {}) {
   assertDurableClient(db);
   return runDbTransaction(db, async (tx) => {
-    await ensureStateRow(tx);
-    const state = await lockedState(tx);
+    await ensureStateRow(tx, creatorId);
+    const state = await lockedState(tx, creatorId);
     return {
       id: state.id,
       activePermitId: clean(state.activePermitId, 200),
@@ -686,7 +701,8 @@ async function readDurableProviderGateState({ db } = {}) {
 }
 
 module.exports = {
-  PROVIDER_GATE_STATE_ID,
+  LEGACY_PROVIDER_GATE_STATE_ID,
+  providerGateStateId,
   PROVIDER_GATE_POLL_MS,
   PROVIDER_GATE_PERMIT_TTL_MS,
   PROVIDER_GATE_WAITER_LEASE_MS,

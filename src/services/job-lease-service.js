@@ -586,7 +586,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   // Do not globally lock a creator at the durable-job layer. Different devices
   // may prepare independent workflows (for example dialog history and the
   // Messages catalog), while writes use their own delivery worker. Physical OF
-  // request starts are globally serialized by the shared request-gate service at 700ms.
+  // All request kinds share the creator's 700ms gate across devices and replicas.
   // A Desktop still sends excludedCreatorIds for lanes it cannot execute locally,
   // preventing parked leases without blocking useful work on another device.
   const eligibleCreatorIds = creatorIds.filter((creatorId) => !explicitlyExcluded.has(creatorId));
@@ -957,7 +957,7 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
       data,
     });
     if (!result.count) throw new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before renewal");
-    // A causal read can legitimately outlive one OF request because the global
+    // A causal read can legitimately outlive one OF request because the creator
     // request gate and safe-read retries are bounded independently. The normal
     // 60s job keepalive extends the durable creator fence while this exact job
     // lease/revision remains alive, preventing TTL expiry from reopening a

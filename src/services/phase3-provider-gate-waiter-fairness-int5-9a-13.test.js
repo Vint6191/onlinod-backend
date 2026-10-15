@@ -131,7 +131,7 @@ test("S2 a contended or disappeared prefix head yields without bypassing FIFO or
     assert.equal(JSON.parse(args[0]).length, 8); assert.equal(args[1], 32);
     return [{ prefixTicket: 1n, waiterId: null }, { prefixTicket: 2n, ticket: 2n, waiterId: "later", priority: "normal", category: "default", leaseUntil: new Date(+now + 60000) }];
   } };
-  assert.deepEqual(await credit._test.waiterHeads(tx, now), []);
+  assert.deepEqual(await credit._test.waiterHeads(tx, now, "creator-a"), []);
 });
 
 test("S2 renewed current lease preserves the earliest exact bigint ticket; cleanup only removes observed expired IDs", async () => {
@@ -147,6 +147,6 @@ test("S2 renewed current lease preserves the earliest exact bigint ticket; clean
     assert.deepEqual(JSON.parse(args[0]), ["expired"]); assert.equal(args[1], now);
     assert.match(sql, /"waiterId" IN[\s\S]*"leaseUntil" <= \$2/); return [];
   } };
-  const heads = await credit._test.waiterHeads(tx, now);
+  const heads = await credit._test.waiterHeads(tx, now, "creator-a");
   assert.equal(calls, 2); assert.equal(heads.length, 1); assert.equal(heads[0].waiterId, "renewed");
 });

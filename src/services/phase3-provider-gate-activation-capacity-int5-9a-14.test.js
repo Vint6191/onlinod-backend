@@ -96,16 +96,16 @@ const legacyScope = {
 
 test("provider fairness requires the current active generation", async () => {
  const db=activationDb();db.state.fairnessActivationState='ACTIVE';
- assert.equal((await credit.readProviderGateFairnessAuthority({db})).activationState,'ACTIVE');
+ assert.equal((await credit.readProviderGateFairnessAuthority({db,creatorId:"creator-1"})).activationState,'ACTIVE');
  db.state.fairnessActivationState='DRAINING';
- assert.equal((await credit.readProviderGateFairnessAuthority({db})).activationState,'UNAVAILABLE');
+ assert.equal((await credit.readProviderGateFairnessAuthority({db,creatorId:"creator-1"})).activationState,'UNAVAILABLE');
 });
 
 
 
 
 
-test("A14 physical capacity math proves 72h is a deadline signal, not a universal 4k-creator promise", () => {
+test("creator capacity math does not serialize independent models; available workers are required", () => {
   const starts = capacity.providerPhysicalStartsPerHour(700);
   assert.ok(starts > 5142 && starts < 5143);
   assert.equal(capacity.providerPriorityShare("background"), 1 / 8);
@@ -115,11 +115,13 @@ test("A14 physical capacity math proves 72h is a deadline signal, not a universa
   const full500 = capacity.campaignDirectoryFleetFeasibility({ creatorCount: 500, campaignCount: 2_000 });
   const full4000 = capacity.campaignDirectoryFleetFeasibility({ creatorCount: 4_000, campaignCount: 2_000 });
   const background500 = capacity.campaignDirectoryFleetFeasibility({ creatorCount: 500, campaignCount: 2_000, mode: "background_only" });
-  assert.equal(full500.feasibleWithinTarget, false);
-  assert.equal(full4000.feasibleWithinTarget, false);
+  assert.equal(full500.feasibleWithinTarget, true);
+  assert.equal(full4000.feasibleWithinTarget, true);
   assert.equal(background500.feasibleWithinTarget, true);
-  assert.ok(full500.requiredHours > 190 && full500.requiredHours < 193);
-  assert.ok(full4000.requiredHours > 1530 && full4000.requiredHours < 1532);
+  assert.ok(full500.requiredHours > 0.38 && full500.requiredHours < 0.39);
+  assert.equal(full4000.requiredHours, full500.requiredHours);
+  assert.equal(full4000.startsPerHour, full500.startsPerHour * 8);
+  assert.equal(full4000.workerAvailabilityRequired, true);
 });
 
 test("A14 directory read status becomes explicitly OVERDUE without pretending source freshness", () => {

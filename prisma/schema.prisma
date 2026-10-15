@@ -461,6 +461,8 @@ model TeamMemberFunction {
 }
 
 model CreatorAccount {
+  providerRequestGate OfProviderRequestGateState?
+  analyticsPlanningBudgets AnalyticsPlanningBudget[]
   massDeliveryState MassCreatorDeliveryState?
   massQueueObservations MassQueueObservation[]
   campaignReadStates CampaignReadState[]
@@ -2738,6 +2740,9 @@ model AnalyticsCollectionLease {
 }
 
 model AnalyticsPlanningBudget {
+  creatorId String?
+  creator CreatorAccount? @relation(fields: [creatorId], references: [id], onDelete: Cascade, map: "AnalyticsPlanningBudget_creator_fkey")
+  @@index([creatorId], map: "AnalyticsPlanningBudget_creator_idx")
   id            String   @id
   windowStart   DateTime
   reservedCalls Int
@@ -3464,10 +3469,11 @@ model JobInstance {
 
 }
 
-// Legacy singleton clock retained only so an old binary can finish a rolling
-// deployment after the additive creator-clock migration lands. Current code
-// never issues FanData observation time from this platform-global row.
+// One clock per creator, shared by every task and device. The retired singleton
+// has no scopeCreatorId and can only acknowledge pre-upgrade permits.
 model OfProviderRequestGateState {
+  scopeCreatorId String? @unique(map: "OfProviderRequestGateState_scope_creator_key")
+  scopeCreator CreatorAccount? @relation(fields: [scopeCreatorId], references: [id], onDelete: Cascade, map: "OfProviderRequestGateState_scope_creator_fkey")
   id                            String    @id
   activePermitId                String?
   activeOwnerInstanceId         String?
@@ -3529,6 +3535,7 @@ model OfProviderRequestGateWaiter {
   @@index([priority, category, ticket], map: "OfProviderRequestGateWaiter_bucket_ticket_idx")
   @@index([ownerInstanceId, leaseUntil], map: "OfProviderRequestGateWaiter_owner_lease_idx")
   @@index([creatorId, ticket], map: "OfProviderRequestGateWaiter_creator_ticket_idx")
+  @@index([creatorId, priority, category, ticket], map: "OfProviderRequestGateWaiter_creator_bucket_ticket_idx")
 }
 
 model ProviderCapacityDebtState {
@@ -3577,11 +3584,11 @@ model ProviderCapacityDebtState {
   backgroundOtherCallCardinalityKnown      Boolean   @default(true)
   futureDebtCoverageStatus                 String    @default("COMPLETE_AT_SAMPLE") @db.VarChar(40)
   futureDebtCoverageReason                 String?   @db.VarChar(500)
-  topologyVersion                          String    @default("phase3_provider_capacity_topology_v1_a16") @db.VarChar(120)
-  topologyId                               String    @default("of-global") @db.VarChar(120)
-  topologyScope                            String    @default("FLEET_GLOBAL") @db.VarChar(40)
-  topologyShardCount                       Int       @default(1)
-  topologyShardingAllowed                  Boolean   @default(false)
+  topologyVersion                          String    @default("creator_provider_capacity_v2") @db.VarChar(120)
+  topologyId                               String    @default("of-creator") @db.VarChar(120)
+  topologyScope                            String    @default("CREATOR_PARALLEL") @db.VarChar(40)
+  topologyShardCount                       Int       @default(0)
+  topologyShardingAllowed                  Boolean   @default(true)
   controlMode                              String    @default("CONSERVATIVE") @db.VarChar(40)
   controlReason                            String?   @db.VarChar(500)
   operatorActionRequired                   Boolean   @default(false)
@@ -5795,6 +5802,7 @@ model ProviderCapacityDirty {
 }
 
 model ProviderCapacityContribution {
+  creatorId String?
   kind          String
   sourceId      String
   bucket        String
@@ -5804,6 +5812,15 @@ model ProviderCapacityContribution {
   oldestAt      DateTime?
   nextDueAt     DateTime?
   @@id([kind, sourceId])
+}
+
+model ProviderCapacityCreatorBucket {
+  creatorId String
+  bucket String
+  itemCount BigInt @default(0)
+  overdueCount BigInt @default(0)
+  requiredCalls BigInt @default(0)
+  @@id([creatorId, bucket])
 }
 
 model ProviderCapacityBucket {

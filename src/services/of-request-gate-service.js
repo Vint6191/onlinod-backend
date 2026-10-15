@@ -11,7 +11,7 @@ function readJobBillingAdmission(entry) {
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
-const { requireCreatorAccess } = require("../middleware/automation-permissions");
+const { requireCreatorAccess, canAccessCreator } = require("../middleware/automation-permissions");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { capabilityFreshnessWindow } = require("./capability-freshness-authority-service");
 const {
@@ -28,27 +28,11 @@ const {
   cancelDurableProviderPermit,
 } = require("./provider-request-credit-authority-service");
 
-// GLOBAL CREATOR REQUEST GATE
-// ---------------------------
-// Jobs may run concurrently on one or many Desktop devices, but every physical
-// OnlyFans request start for one creator must pass through this boundary.
-// The two-step permit/started handshake is deliberate: an acquire-only clock
-// can be violated by network jitter (a later permit may arrive before an older
-// one). The next permit is therefore blocked until the previous Desktop says
-// that transport was actually started, and then for another 700ms.
-//
-// CURRENT DISTRIBUTED AUTHORITY:
-// PostgreSQL always owns the physical two-phase singleton permit. A14 rolls the
-// cross-replica waiter ordering in explicitly: DRAINING is legacy-compatible so
-// an A12 binary can finish a mixed deployment without transient acquire errors;
-// QUIESCING stops new A14 starts while legacy traffic drains; ACTIVE enables the
-// starvation-resistant PostgreSQL waiter/ticket authority. Local memory is only
-// a wake/poll optimization and never owns the physical 700ms chronology.
-// Non-sticky /started or /cancel requests remain safe in every rollout state.
-//
-// A future Redis/dedicated coordinator may replace the durable state adapter,
-// but it must preserve the same single permit authority and fail-safe unknown-
-// outcome expiry semantics. Never add an independent per-device limiter.
+// Every creator owns one distributed start timeline across all tasks/devices.
+// The permit/started handshake retains 700ms spacing even with network jitter;
+// an unacknowledged permit blocks only its creator until fail-safe expiry.
+// Local coordinators wake HTTP waiters independently. PostgreSQL owns grants,
+// weighted priority and FIFO order inside each creator on every replica.
 const DEFAULT_INTERVAL_MS = 700;
 const MAX_WAIT_MS = 60_000;
 const PERMIT_TTL_MS = PROVIDER_GATE_PERMIT_TTL_MS;
@@ -67,7 +51,7 @@ const accessCache = new Map();
 let stopping = false;
 let stopPromise = null;
 let stopController = new AbortController();
-let retryTimer = null;
+let waiterHeartbeatTimer = null;
 let heartbeatFlight = null;
 const pendingEntries = new Set();
 const backgroundFlights = new Set();
@@ -80,16 +64,23 @@ function trackWork(promise) {
 }
 function assertEntryCurrent(entry) {
   if (stopping) throw stoppingError();
-  if (entry.cancelled || entry.signal?.aborted) throw Object.assign(new Error("Global OF gate request was cancelled"), { code: "OF_GATE_CANCELLED" });
+  if (entry.cancelled || entry.signal?.aborted) throw Object.assign(new Error("Creator OF gate request was cancelled"), { code: "OF_GATE_CANCELLED" });
 }
 
-// One local coordinator only wakes local HTTP waiters; PostgreSQL owns global waiter order and every physical permit in production.
-// The previous implementation had one 700ms clock per creator, which allowed
-// many creators to start provider requests simultaneously. That made the
-// advertised "global" gate and all fleet-capacity math false. Keep creator
-// identity only as a fairness dimension inside each priority bucket; never as
-// an independent physical clock.
-const coordinator = {
+const coordinators = new Map();
+function coordinatorFor(agencyId, creatorId) {
+  const key = creatorQueueKey(agencyId, creatorId);
+  let value = coordinators.get(key);
+  if (!value) {
+    value = { ...createCoordinator(), key, agencyId, creatorId };
+    coordinators.set(key, value);
+  }
+  if (value.cleanupTimer) clearTimeout(value.cleanupTimer);
+  value.cleanupTimer = null;
+  return value;
+}
+function createCoordinator() {
+return {
   buckets: new Map(PRIORITIES.map((priority) => [priority, { byCreator: new Map(), order: [], cursor: 0, lastServedKey: null }])),
   priorityCursor: 0,
   running: false,
@@ -101,12 +92,26 @@ const coordinator = {
   lastDeviceId: null,
   lastCreatorId: null,
   durableSelectedWaiterId: null,
-  waiterHeartbeatTimer: null,
+  retryTimer: null,
+  cleanupTimer: null,
   runningEntryId: null,
   runningWaiterRegistered: false,
   fairnessActivationState: "UNAVAILABLE",
   fairnessGeneration: PROVIDER_GATE_FAIRNESS_GENERATION,
 };
+}
+function retireCoordinatorWhenIdle(coordinator) {
+  if (coordinator.running || coordinator.activePermit || queueLength(coordinator) || coordinator.retryTimer) return;
+  if (coordinator.cleanupTimer) clearTimeout(coordinator.cleanupTimer);
+  // In-memory fixtures must also preserve the creator's last spacing deadline.
+  const delay = Math.max(1000, coordinator.nextAllowedAt - Date.now() + 1);
+  coordinator.cleanupTimer = setTimeout(() => {
+    coordinator.cleanupTimer = null;
+    if (!coordinator.running && !coordinator.activePermit && !queueLength(coordinator)
+      && !coordinator.retryTimer && coordinators.get(coordinator.key) === coordinator) coordinators.delete(coordinator.key);
+  }, delay);
+  coordinator.cleanupTimer.unref?.();
+}
 
 function cleanInstanceId(value) {
   const text = String(value ?? "").trim();
@@ -130,9 +135,9 @@ function providerWaiterCategory({ priority, operation, source }) {
   return "background_other";
 }
 function creatorQueueKey(agencyId, creatorId) { return `${agencyId}:${creatorId}`; }
-function bucketFor(priority) { return coordinator.buckets.get(priority); }
+function bucketFor(coordinator, priority) { return coordinator.buckets.get(priority); }
 function enqueue(entry) {
-  const bucket = bucketFor(entry.priority);
+  const bucket = bucketFor(entry.coordinator, entry.priority);
   const key = creatorQueueKey(entry.agencyId, entry.creatorId);
   let queue = bucket.byCreator.get(key);
   if (!queue) {
@@ -147,8 +152,8 @@ function dropEmptyCreator(bucket, index, key) {
   bucket.order.splice(index, 1);
   bucket.cursor = bucket.order.length ? index % bucket.order.length : 0;
 }
-function takeFromPriority(priority) {
-  const bucket = bucketFor(priority);
+function takeFromPriority(coordinator, priority) {
+  const bucket = bucketFor(coordinator, priority);
   let remaining = bucket.order.length;
   if (bucket.lastServedKey && bucket.order.length > 1) {
     const lastIndex = bucket.order.indexOf(bucket.lastServedKey);
@@ -172,14 +177,14 @@ function takeFromPriority(priority) {
   }
   return null;
 }
-function queueLength() {
+function queueLength(coordinator) {
   let total = 0;
   for (const bucket of coordinator.buckets.values()) {
     for (const queue of bucket.byCreator.values()) total += queue.filter((entry) => !entry.cancelled).length;
   }
   return total;
 }
-function takeSpecific(waiterId) {
+function takeSpecific(coordinator, waiterId) {
   const target = clean(waiterId, 200);
   if (!target) return null;
   for (const bucket of coordinator.buckets.values()) {
@@ -195,9 +200,9 @@ function takeSpecific(waiterId) {
   }
   return null;
 }
-function takeNext() {
+function takeNext(coordinator) {
   if (coordinator.durableSelectedWaiterId) {
-    const selected = takeSpecific(coordinator.durableSelectedWaiterId);
+    const selected = takeSpecific(coordinator, coordinator.durableSelectedWaiterId);
     if (selected) {
       coordinator.durableSelectedWaiterId = null;
       return selected;
@@ -206,7 +211,7 @@ function takeNext() {
   for (let step = 0; step < PRIORITY_CYCLE.length; step += 1) {
     const index = (coordinator.priorityCursor + step) % PRIORITY_CYCLE.length;
     const priority = PRIORITY_CYCLE[index];
-    const entry = takeFromPriority(priority);
+    const entry = takeFromPriority(coordinator, priority);
     if (entry) {
       coordinator.priorityCursor = (index + 1) % PRIORITY_CYCLE.length;
       return entry;
@@ -225,24 +230,16 @@ function durableGateAvailable() {
   return typeof prisma?.$transaction === "function" && typeof prisma?.$queryRawUnsafe === "function";
 }
 function liveLocalWaiterIds() {
-  const ids = new Set();
-  if (coordinator.runningEntryId && coordinator.runningWaiterRegistered) ids.add(coordinator.runningEntryId);
-  for (const bucket of coordinator.buckets.values()) {
-    for (const queue of bucket.byCreator.values()) {
-      for (const entry of queue) if (entry.waiterRegistered === true && !entry.cancelled && !entry.settled) ids.add(entry.id);
-    }
-  }
-  return [...ids];
+  return [...pendingEntries].filter(entry => entry.waiterRegistered && !entry.cancelled && !entry.settled).map(entry => entry.id);
 }
 function stopWaiterHeartbeatIfIdle() {
-  if (!coordinator.waiterHeartbeatTimer) return;
-  if (queueLength() > 0 || coordinator.running) return;
-  clearInterval(coordinator.waiterHeartbeatTimer);
-  coordinator.waiterHeartbeatTimer = null;
+  if (!waiterHeartbeatTimer || liveLocalWaiterIds().length) return;
+  clearInterval(waiterHeartbeatTimer);
+  waiterHeartbeatTimer = null;
 }
 function ensureWaiterHeartbeat() {
-  if (stopping || !durableGateAvailable() || coordinator.waiterHeartbeatTimer) return;
-  coordinator.waiterHeartbeatTimer = setInterval(() => {
+  if (stopping || !durableGateAvailable() || waiterHeartbeatTimer) return;
+  waiterHeartbeatTimer = setInterval(() => {
     if (stopping || heartbeatFlight) return;
     const waiterIds = liveLocalWaiterIds();
     if (!waiterIds.length) {
@@ -256,7 +253,7 @@ function ensureWaiterHeartbeat() {
       waiterTtlMs: PROVIDER_GATE_WAITER_LEASE_MS,
     }).catch(() => null)).finally(() => { heartbeatFlight = null; });
   }, PROVIDER_GATE_WAITER_HEARTBEAT_MS);
-  coordinator.waiterHeartbeatTimer.unref?.();
+  waiterHeartbeatTimer.unref?.();
 }
 
 
@@ -336,7 +333,7 @@ function waitUntil(targetMs, signal) {
       if (error) reject(error); else resolve();
     };
     const onAbort = () => {
-      const error = new Error("Global OF gate request was cancelled");
+      const error = new Error("Creator OF gate request was cancelled");
       error.code = "OF_GATE_CANCELLED";
       finish(error);
     };
@@ -345,27 +342,27 @@ function waitUntil(targetMs, signal) {
   });
 }
 
-function clearActivePermit(permit) {
+function clearActivePermit(coordinator, permit) {
   if (permit?.expiryTimer) clearTimeout(permit.expiryTimer);
   if (coordinator.activePermit?.id === permit?.id) coordinator.activePermit = null;
 }
 
-function expirePermit(permit) {
+function expirePermit(coordinator, permit) {
   if (coordinator.activePermit?.id !== permit.id) return;
-  clearActivePermit(permit);
+  clearActivePermit(coordinator, permit);
   // The client may have started transport but lost the acknowledgement. Wait an
-  // extra global interval before granting another permit; this fails safe.
+  // extra creator interval before granting another permit; this fails safe.
   coordinator.nextAllowedAt = Math.max(coordinator.nextAllowedAt, Date.now() + permit.intervalMs);
   coordinator.revision += 1;
-  setImmediate(pump);
+  setImmediate(() => pump(coordinator));
 }
 
-function pump() {
+function pump(coordinator) {
   if (stopping) return;
   const durable = durableGateAvailable();
   if (coordinator.running || (!durable && coordinator.activePermit)) return;
-  const entry = takeNext();
-  if (!entry) return;
+  const entry = takeNext(coordinator);
+  if (!entry) { retireCoordinatorWhenIdle(coordinator); return; }
   coordinator.running = true;
   coordinator.runningEntryId = entry.id;
   let durableRetryAtMs = 0;
@@ -377,11 +374,11 @@ function pump() {
       if (durable) {
         coordinator.durableSelectedWaiterId = null;
         if (entry.cancelled || entry.signal?.aborted) {
-          const error = new Error("Global OF gate request was cancelled");
+          const error = new Error("Creator OF gate request was cancelled");
           error.code = "OF_GATE_CANCELLED";
           throw error;
         }
-        const fairness = await readProviderGateFairnessAuthority({ db: prisma });
+        const fairness = await readProviderGateFairnessAuthority({ db: prisma, creatorId: entry.creatorId });
         assertEntryCurrent(entry);
         coordinator.fairnessActivationState = fairness.activationState;
         coordinator.fairnessGeneration = fairness.generation || PROVIDER_GATE_FAIRNESS_GENERATION;
@@ -440,7 +437,7 @@ function pump() {
             db: prisma, permitId, agencyId: entry.agencyId, creatorId: entry.creatorId,
             deviceId: entry.deviceId, capability: entry.capability,
           }).catch(() => null);
-          const error = new Error("Global OF gate request was cancelled after durable grant");
+          const error = new Error("Creator OF gate request was cancelled after durable grant");
           error.code = "OF_GATE_CANCELLED";
           throw error;
         }
@@ -462,7 +459,8 @@ function pump() {
         // Informational local cleanup only. PostgreSQL remains the permit owner;
         // this timer never advances spacing or grants work.
         permit.expiryTimer = setTimeout(() => {
-          if (coordinator.activePermit?.id === permit.id) clearActivePermit(permit);
+          if (coordinator.activePermit?.id === permit.id) clearActivePermit(coordinator, permit);
+          retireCoordinatorWhenIdle(coordinator);
         }, Math.max(0, permit.expiresAt - Date.now()) + 50);
         permit.expiryTimer.unref?.();
       } else {
@@ -484,7 +482,7 @@ function pump() {
           expiryTimer: null,
           durable: false,
         };
-        permit.expiryTimer = setTimeout(() => expirePermit(permit), PERMIT_TTL_MS);
+        permit.expiryTimer = setTimeout(() => expirePermit(coordinator, permit), PERMIT_TTL_MS);
         permit.expiryTimer.unref?.();
       }
       // Admission can wait behind another replica or a long queue. Re-read
@@ -503,6 +501,9 @@ function pump() {
         }).catch(() => null);
         throw error;
       }
+      // /started may have reached another replica. Replace its stale local hint
+      // and timer only after PostgreSQL has admitted the next permit.
+      if (coordinator.activePermit) clearActivePermit(coordinator, coordinator.activePermit);
       coordinator.activePermit = permit;
       coordinator.lastGrantedAt = permit.grantedAt;
       coordinator.lastDeviceId = entry.deviceId;
@@ -537,10 +538,10 @@ function pump() {
       if (stopping) return;
       if (durableRetryAtMs > 0) {
         const delay = Math.max(0, durableRetryAtMs - Date.now());
-        if (retryTimer) clearTimeout(retryTimer);
-        retryTimer = setTimeout(() => { retryTimer = null; pump(); }, delay);
+        if (coordinator.retryTimer) clearTimeout(coordinator.retryTimer);
+        coordinator.retryTimer = setTimeout(() => { coordinator.retryTimer = null; pump(coordinator); }, delay);
       } else if (durable || !coordinator.activePermit) {
-        setImmediate(pump);
+        setImmediate(() => pump(coordinator));
       }
     }
   })());
@@ -577,9 +578,11 @@ async function acquireOfRequestSlot(input) {
   await readJobBillingAdmission({ ...billingContext, agencyId: access.agencyId, creatorId,
     deviceId: access.deviceId, capability, operation });
   if (stopping) throw stoppingError();
+  const coordinator = coordinatorFor(access.agencyId, creatorId);
   return new Promise((resolve, reject) => {
     const entry = {
       ...billingContext,
+      coordinator,
       id: entryId,
       agencyId: access.agencyId,
       creatorId,
@@ -610,17 +613,18 @@ async function acquireOfRequestSlot(input) {
         trackWork(cancelDurableProviderWaiter({ db: prisma, waiterId: entry.id, ownerInstanceId: BACKEND_INSTANCE_ID }).catch(() => null));
         entry.waiterRegistered = false;
       }
+      setImmediate(() => pump(coordinator));
       reject(error);
     };
     const onAbort = () => {
-      const error = new Error("Global OF gate request was cancelled");
+      const error = new Error("Creator OF gate request was cancelled");
       error.code = "OF_GATE_CANCELLED";
       settleReject(error);
     };
     if (entry.signal?.aborted) return onAbort();
     entry.signal?.addEventListener("abort", onAbort, { once: true });
     timer = setTimeout(() => {
-      const error = new Error(`Timed out waiting for global OF gate after ${timeoutMs}ms`);
+      const error = new Error(`Timed out waiting for creator OF gate after ${timeoutMs}ms`);
       error.code = "OF_GATE_TIMEOUT";
       error.status = 503;
       settleReject(error);
@@ -636,7 +640,7 @@ async function acquireOfRequestSlot(input) {
     entry.reject = settleReject;
     pendingEntries.add(entry);
     enqueue(entry);
-    setImmediate(pump);
+    setImmediate(() => pump(coordinator));
   });
 }
 
@@ -644,17 +648,20 @@ function stopOfRequestGate() {
   if (stopPromise) return stopPromise;
   stopping = true;
   stopController.abort();
-  if (retryTimer) clearTimeout(retryTimer);
-  retryTimer = null;
-  if (coordinator.waiterHeartbeatTimer) clearInterval(coordinator.waiterHeartbeatTimer);
-  coordinator.waiterHeartbeatTimer = null;
+  if (waiterHeartbeatTimer) clearInterval(waiterHeartbeatTimer);
+  waiterHeartbeatTimer = null;
   for (const entry of [...pendingEntries]) entry.reject(stoppingError());
-  for (const bucket of coordinator.buckets.values()) { bucket.byCreator.clear(); bucket.order.length = 0; }
-  // A permit already returned to a Desktop may have crossed physical dispatch.
-  // Retain its PostgreSQL expiry/spacing authority; only discard the local hint.
-  clearActivePermit(coordinator.activePermit);
+  for (const coordinator of coordinators.values()) {
+    if (coordinator.retryTimer) clearTimeout(coordinator.retryTimer);
+    if (coordinator.cleanupTimer) clearTimeout(coordinator.cleanupTimer);
+    coordinator.retryTimer = null;
+    for (const bucket of coordinator.buckets.values()) { bucket.byCreator.clear(); bucket.order.length = 0; }
+    // A delivered permit may already have crossed dispatch. Only remove hints.
+    clearActivePermit(coordinator, coordinator.activePermit);
+  }
   stopPromise = (async () => {
     while (backgroundFlights.size) await Promise.allSettled([...backgroundFlights]);
+    coordinators.clear();
   })();
   return stopPromise;
 }
@@ -678,6 +685,7 @@ async function acknowledgeOfRequestStarted(input) {
     creatorId,
     capability: input.capability,
   });
+  const coordinator = coordinatorFor(access.agencyId, creatorId);
   if (durableGateAvailable()) {
     const started = await acknowledgeDurableProviderStarted({
       db: prisma,
@@ -688,13 +696,13 @@ async function acknowledgeOfRequestStarted(input) {
       capability: input.capability,
     });
     const permit = coordinator.activePermit;
-    if (permit?.id === permitId) clearActivePermit(permit);
+    if (permit?.id === permitId) clearActivePermit(coordinator, permit);
     coordinator.lastStartedAt = started.startedAt.getTime();
     coordinator.nextAllowedAt = started.nextAllowedAt.getTime();
     coordinator.lastDeviceId = access.deviceId;
     coordinator.lastCreatorId = creatorId;
     coordinator.revision = Math.max(coordinator.revision + 1, Number(started.revision || 0));
-    setImmediate(pump);
+    setImmediate(() => pump(coordinator));
     return {
       startedAt: started.startedAt.toISOString(),
       nextAllowedAt: started.nextAllowedAt.toISOString(),
@@ -704,19 +712,19 @@ async function acknowledgeOfRequestStarted(input) {
   }
   const permit = coordinator.activePermit;
   if (!permit || permit.id !== permitId || permit.agencyId !== access.agencyId || permit.creatorId !== creatorId || permit.deviceId !== access.deviceId || permit.capability !== input.capability) {
-    const error = new Error("Global OF request permit is missing, expired or belongs to another device/capability");
+    const error = new Error("Creator OF request permit is missing, expired or belongs to another device/capability");
     error.code = "OF_GATE_PERMIT_INVALID";
     error.status = 409;
     throw error;
   }
   const startedAtMs = Date.now();
-  clearActivePermit(permit);
+  clearActivePermit(coordinator, permit);
   coordinator.lastStartedAt = startedAtMs;
   coordinator.nextAllowedAt = startedAtMs + permit.intervalMs;
   coordinator.lastDeviceId = access.deviceId;
   coordinator.lastCreatorId = creatorId;
   coordinator.revision += 1;
-  setImmediate(pump);
+  setImmediate(() => pump(coordinator));
   return {
     startedAt: new Date(startedAtMs).toISOString(),
     nextAllowedAt: new Date(coordinator.nextAllowedAt).toISOString(),
@@ -739,6 +747,7 @@ async function cancelOfRequestPermit(input) {
     creatorId,
     capability: input.capability,
   });
+  const coordinator = coordinatorFor(access.agencyId, creatorId);
   if (durableGateAvailable()) {
     const result = await cancelDurableProviderPermit({
       db: prisma,
@@ -749,84 +758,48 @@ async function cancelOfRequestPermit(input) {
       capability: input.capability,
     });
     const permit = coordinator.activePermit;
-    if (result.cancelled && permit?.id === permitId) clearActivePermit(permit);
+    if (result.cancelled && permit?.id === permitId) clearActivePermit(coordinator, permit);
     coordinator.revision = Math.max(coordinator.revision + (result.cancelled ? 1 : 0), Number(result.revision || 0));
-    setImmediate(pump);
+    setImmediate(() => pump(coordinator));
     return result;
   }
   const permit = coordinator.activePermit;
   if (!permit || permit.id !== permitId || permit.agencyId !== access.agencyId || permit.creatorId !== creatorId || permit.deviceId !== access.deviceId || permit.capability !== input.capability) return { cancelled: false };
-  clearActivePermit(permit);
+  clearActivePermit(coordinator, permit);
   coordinator.revision += 1;
-  setImmediate(pump);
+  setImmediate(() => pump(coordinator));
   return { cancelled: true, revision: coordinator.revision };
 }
 
-function getOfRequestGateSnapshot() {
-  const byCreator = {};
-  const ensureCreator = (creatorId) => {
-    if (!byCreator[creatorId]) {
-      byCreator[creatorId] = {
-        queued: 0,
-        activePermit: null,
-        byPriority: Object.fromEntries(PRIORITIES.map((priority) => [priority, 0])),
-      };
+function getOfRequestGateSnapshot(scope = null) {
+  const byCreator = {}, activePermits = [];
+  let queued = 0, running = false, revision = 0, latest = null;
+  for (const coordinator of coordinators.values()) {
+    if (scope && (coordinator.agencyId !== scope.agencyId || !canAccessCreator(scope.member, coordinator.creatorId))) continue;
+    const byPriority = Object.fromEntries(PRIORITIES.map(priority => [priority, 0]));
+    for (const priority of PRIORITIES) for (const queue of bucketFor(coordinator, priority).byCreator.values()) {
+      byPriority[priority] += queue.filter(entry => !entry.cancelled).length;
     }
-    return byCreator[creatorId];
-  };
-  for (const priority of PRIORITIES) {
-    const bucket = bucketFor(priority);
-    for (const queue of bucket.byCreator.values()) {
-      for (const entry of queue) {
-        if (entry.cancelled) continue;
-        const row = ensureCreator(entry.creatorId);
-        row.queued += 1;
-        row.byPriority[priority] += 1;
-      }
-    }
+    const permit = coordinator.activePermit;
+    const activePermit = permit ? { permitId: permit.id, creatorId: permit.creatorId, deviceId: permit.deviceId,
+      priority: permit.priority, operation: permit.operation, capability: permit.capability,
+      grantedAt: new Date(permit.grantedAt).toISOString() } : null;
+    if (activePermit) activePermits.push(activePermit);
+    const count = Object.values(byPriority).reduce((sum, value) => sum + value, 0);
+    byCreator[coordinator.creatorId] = { queued: count, activePermit, byPriority,
+      nextAllowedAt: coordinator.nextAllowedAt ? new Date(coordinator.nextAllowedAt).toISOString() : null,
+      lastStartedAt: coordinator.lastStartedAt ? new Date(coordinator.lastStartedAt).toISOString() : null };
+    queued += count; running ||= coordinator.running; revision += coordinator.revision;
+    if (!latest || coordinator.lastStartedAt > latest.lastStartedAt) latest = coordinator;
   }
-  if (coordinator.activePermit) {
-    const row = ensureCreator(coordinator.activePermit.creatorId);
-    row.activePermit = {
-      permitId: coordinator.activePermit.id,
-      deviceId: coordinator.activePermit.deviceId,
-      priority: coordinator.activePermit.priority,
-      operation: coordinator.activePermit.operation,
-      capability: coordinator.activePermit.capability,
-      grantedAt: new Date(coordinator.activePermit.grantedAt).toISOString(),
-    };
-  }
-  return {
-    intervalMs: DEFAULT_INTERVAL_MS,
-    permitTtlMs: PERMIT_TTL_MS,
-    coordinator: durableGateAvailable()
-      ? (coordinator.fairnessActivationState === "ACTIVE" ? "postgres_durable_waiter_weighted_fair_global_two_phase" : "postgres_durable_waiter_unavailable")
-      : "single_backend_process_global_two_phase_creator_round_robin",
-    fairnessGeneration: coordinator.fairnessGeneration,
-    fairnessActivationState: coordinator.fairnessActivationState,
-    distributedAdapterRequiredForMultipleBackendInstances: !durableGateAvailable(),
-    backendInstanceId: BACKEND_INSTANCE_ID,
-    queued: queueLength(),
-    running: coordinator.running,
-    activePermit: coordinator.activePermit ? {
-      permitId: coordinator.activePermit.id,
-      creatorId: coordinator.activePermit.creatorId,
-      deviceId: coordinator.activePermit.deviceId,
-      priority: coordinator.activePermit.priority,
-      operation: coordinator.activePermit.operation,
-      capability: coordinator.activePermit.capability,
-      grantedAt: new Date(coordinator.activePermit.grantedAt).toISOString(),
-    } : null,
-    nextAllowedAt: coordinator.nextAllowedAt ? new Date(coordinator.nextAllowedAt).toISOString() : null,
-    lastGrantedAt: coordinator.lastGrantedAt ? new Date(coordinator.lastGrantedAt).toISOString() : null,
-    lastStartedAt: coordinator.lastStartedAt ? new Date(coordinator.lastStartedAt).toISOString() : null,
-    lastDeviceId: coordinator.lastDeviceId,
-    lastCreatorId: coordinator.lastCreatorId,
-    revision: coordinator.revision,
-    activeCreators: Object.keys(byCreator).length,
-    accessCacheEntries: accessCache.size,
-    byCreator,
-  };
+  return { scope: "CREATOR", intervalMs: DEFAULT_INTERVAL_MS, permitTtlMs: PERMIT_TTL_MS,
+    coordinator: durableGateAvailable() ? "postgres_durable_creator_two_phase" : "single_backend_process_creator_two_phase",
+    fairnessGeneration: PROVIDER_GATE_FAIRNESS_GENERATION,
+    distributedAdapterRequiredForMultipleBackendInstances: !durableGateAvailable(), backendInstanceId: BACKEND_INSTANCE_ID,
+    queued, running, activePermits, activePermit: activePermits.length === 1 ? activePermits[0] : null,
+    nextAllowedAt: null, lastStartedAt: latest?.lastStartedAt ? new Date(latest.lastStartedAt).toISOString() : null,
+    lastCreatorId: latest?.lastCreatorId || null, lastDeviceId: latest?.lastDeviceId || null,
+    revision, activeCreators: Object.keys(byCreator).length, accessCacheEntries: scope ? null : accessCache.size, byCreator };
 }
 
 module.exports = {
@@ -840,33 +813,16 @@ module.exports = {
   _test: {
     providerWaiterCategory,
     reset() {
-      stopping = false;
-      stopPromise = null;
-      stopController = new AbortController();
-      if (retryTimer) clearTimeout(retryTimer);
-      retryTimer = null;
-      heartbeatFlight = null;
-      pendingEntries.clear();
-      backgroundFlights.clear();
-      if (coordinator.activePermit?.expiryTimer) clearTimeout(coordinator.activePermit.expiryTimer);
-      if (coordinator.waiterHeartbeatTimer) clearInterval(coordinator.waiterHeartbeatTimer);
-      coordinator.buckets = new Map(PRIORITIES.map((priority) => [priority, { byCreator: new Map(), order: [], cursor: 0, lastServedKey: null }]));
-      coordinator.priorityCursor = 0;
-      coordinator.running = false;
-      coordinator.activePermit = null;
-      coordinator.nextAllowedAt = 0;
-      coordinator.revision = 0;
-      coordinator.lastGrantedAt = 0;
-      coordinator.lastStartedAt = 0;
-      coordinator.lastDeviceId = null;
-      coordinator.lastCreatorId = null;
-      coordinator.durableSelectedWaiterId = null;
-      coordinator.waiterHeartbeatTimer = null;
-      coordinator.runningEntryId = null;
-      coordinator.runningWaiterRegistered = false;
-      coordinator.fairnessActivationState = "UNAVAILABLE";
-      coordinator.fairnessGeneration = PROVIDER_GATE_FAIRNESS_GENERATION;
-      accessCache.clear();
+      for (const coordinator of coordinators.values()) {
+        if (coordinator.retryTimer) clearTimeout(coordinator.retryTimer);
+        if (coordinator.cleanupTimer) clearTimeout(coordinator.cleanupTimer);
+        if (coordinator.activePermit?.expiryTimer) clearTimeout(coordinator.activePermit.expiryTimer);
+      }
+      if (waiterHeartbeatTimer) clearInterval(waiterHeartbeatTimer);
+      waiterHeartbeatTimer = null;
+      stopping = false; stopPromise = null; stopController = new AbortController();
+      heartbeatFlight = null; pendingEntries.clear(); backgroundFlights.clear();
+      coordinators.clear(); accessCache.clear();
     },
   },
 };

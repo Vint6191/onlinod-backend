@@ -8,15 +8,18 @@ const { guaranteedDirectoryCallsPerSweep } = require("./provider-capacity-topolo
 
 const HOUR_MS = 60 * 60 * 1000;
 
-// One fleet-wide hourly reservation, independent of replica/timer count. This
-// admits periodic directory jobs only; provider starts retain their existing gate.
-async function reserveDirectoryAdmission({ db, state, now, budgetKey = "campaign-directory" }) {
+// Each creator has one hourly reservation across replicas. A large directory
+// must not spend another creator's provider credits.
+async function reserveDirectoryAdmission({ db, state, creatorId, now }) {
+  const scopedCreatorId = String(creatorId || state?.creatorId || "").trim();
+  if (!scopedCreatorId) throw Object.assign(new Error("Directory reservation requires creator scope"), { code: "ANALYTICS_PLANNING_CREATOR_REQUIRED" });
+  const budgetKey = `campaign-directory:${scopedCreatorId}`;
   const at = await dbAuthorityNow({ db, fallbackNow: now });
   const windowStart = new Date(Math.floor(at.getTime() / HOUR_MS) * HOUR_MS);
   const cost = Math.max(1, Math.ceil(Math.max(0, Number(state?.campaignDirectoryCampaignCount) || 0) / 50) + 1);
   const rows = await db.$queryRawUnsafe(`
-    INSERT INTO "AnalyticsPlanningBudget" ("id","windowStart","reservedCalls","reservedJobs","updatedAt")
-    VALUES ($4,$1,$2,1,clock_timestamp())
+    INSERT INTO "AnalyticsPlanningBudget" ("id","windowStart","reservedCalls","reservedJobs","updatedAt","creatorId")
+    VALUES ($4,$1,$2,1,clock_timestamp(),$5)
     ON CONFLICT ("id") DO UPDATE SET
       "windowStart"=EXCLUDED."windowStart",
       "reservedCalls"=CASE WHEN "AnalyticsPlanningBudget"."windowStart" < EXCLUDED."windowStart"
@@ -26,7 +29,7 @@ async function reserveDirectoryAdmission({ db, state, now, budgetKey = "campaign
     WHERE "AnalyticsPlanningBudget"."windowStart" < EXCLUDED."windowStart"
        OR ("AnalyticsPlanningBudget"."windowStart"=EXCLUDED."windowStart"
          AND "AnalyticsPlanningBudget"."reservedCalls" + EXCLUDED."reservedCalls" <= $3 AND "AnalyticsPlanningBudget"."reservedJobs" < 100)
-    RETURNING "reservedCalls"`, windowStart, cost, guaranteedDirectoryCallsPerSweep(), String(budgetKey));
+    RETURNING "reservedCalls"`, windowStart, cost, guaranteedDirectoryCallsPerSweep(), budgetKey, scopedCreatorId);
   // One oversized first request is allowed each hour so cost cannot make a
   // creator impossible to serve. Other admissions wait for the next window.
   return rows.length > 0;
@@ -56,7 +59,7 @@ async function planRecurringCreatorAnalytics({ db, item, ownerToken, now = new D
     const analytics = await ensureRecurringCreatorAnalyticsCatchups({
       db: tx, creatorId, agencyId: item.agencyId, now: ownership.authorityNow, priority: 20,
       campaignDirectoryDiscoveryAdmitted: false,
-      reserveCampaignDirectory: (state) => reserveDirectoryAdmission({ db: tx, state, now: ownership.authorityNow }),
+      reserveCampaignDirectory: (state) => reserveDirectoryAdmission({ db: tx, state, creatorId, now: ownership.authorityNow }),
     });
     // A terminal collector is a recorded domain outcome, not a transaction
     // failure that should erase other streams' valid plans. Scope/claim and

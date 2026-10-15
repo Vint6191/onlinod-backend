@@ -1,30 +1,17 @@
 "use strict";
 
-// Phase 3 INT5.9A-16
-// Provider capacity topology + overload-control contract.
-//
-// Current source authority proves exactly one physical OnlyFans start timeline:
-// OfProviderRequestGateState(id="of-global"). There is no provider-validated
-// independent shard key in the current architecture, so throughput MUST NOT be
-// increased by inventing per-device/per-creator gates. Any future sharding
-// requires a separately audited provider-independence contract.
-//
-// OVERLOAD control does not discard canonical work and does not become a
-// second limiter. It only caps NEW periodic Campaign-directory admission to the
-// directory category's guaranteed weighted credits while debt is overloaded or
-// the durable snapshot is missing/stale. Existing jobs, manual/interactive work,
-// FanData demand and critical writes remain owned by their canonical authorities.
-
+// Capacity belongs to independent creator timelines. Per-creator reservation
+// protects periodic discovery; aggregate fleet debt never throttles other models.
 const {
   DEFAULT_PROVIDER_INTERVAL_MS,
   providerCategoryGuaranteedStartsPerHour,
 } = require("./provider-capacity-sla-service");
 
-const PROVIDER_CAPACITY_TOPOLOGY_VERSION = "phase3_provider_capacity_topology_v1_a16";
-const PROVIDER_CAPACITY_TOPOLOGY_ID = "of-global";
-const PROVIDER_CAPACITY_TOPOLOGY_SCOPE = "FLEET_GLOBAL";
-const PROVIDER_CAPACITY_TOPOLOGY_SHARD_COUNT = 1;
-const PROVIDER_CAPACITY_SHARDING_ALLOWED = false;
+const PROVIDER_CAPACITY_TOPOLOGY_VERSION = "creator_provider_capacity_v2";
+const PROVIDER_CAPACITY_TOPOLOGY_ID = "of-creator";
+const PROVIDER_CAPACITY_TOPOLOGY_SCOPE = "CREATOR_PARALLEL";
+const PROVIDER_CAPACITY_TOPOLOGY_SHARD_COUNT = 0;
+const PROVIDER_CAPACITY_SHARDING_ALLOWED = true;
 const DEFAULT_NORMAL_DIRECTORY_ADMISSION_CALLS = Math.max(
   1,
   Math.min(20_000, Number.parseInt(process.env.CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP || "2400", 10) || 2400),
@@ -49,12 +36,12 @@ function guaranteedDirectoryCallsPerSweep(intervalMs = DEFAULT_PROVIDER_INTERVAL
   // therefore also the conservative admission budget for one hourly sweep.
   return Math.max(1, Math.floor(providerCategoryGuaranteedStartsPerHour("campaign_directory", intervalMs)));
 }
-function providerCapacityTopologyContract() {
+function providerCapacityTopologyContract(creatorCount = 0) {
   return Object.freeze({
     version: PROVIDER_CAPACITY_TOPOLOGY_VERSION,
     topologyId: PROVIDER_CAPACITY_TOPOLOGY_ID,
     scope: PROVIDER_CAPACITY_TOPOLOGY_SCOPE,
-    shardCount: PROVIDER_CAPACITY_TOPOLOGY_SHARD_COUNT,
+    shardCount: finiteInt(creatorCount, 0),
     shardingAllowed: PROVIDER_CAPACITY_SHARDING_ALLOWED,
   });
 }

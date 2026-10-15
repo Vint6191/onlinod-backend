@@ -35,7 +35,7 @@ async function readDatabaseContract(db) {
     EXISTS(SELECT 1 FROM "DomainWorkClaimTopologyState" WHERE "id"='phase3_domain_work_claim_topology_a36_v1'
       AND "generation"="id" AND "activationState"='ACTIVE') AS topology,
     EXISTS(SELECT 1 FROM "OfProviderRequestGateState" WHERE "id"='of-global'
-      AND "fairnessGeneration"='phase3_provider_gate_fairness_v2_a14' AND "fairnessActivationState"='ACTIVE') AS provider,
+      AND "scopeCreatorId" IS NULL AND "fairnessActivationState"='QUIESCING') AS provider,
     EXISTS(SELECT 1 FROM "SystemSetting" WHERE "key"='phase3.campaignCausalObservationV1'
       AND "value"->>'active'='true' AND "value"->>'writerGenerationActive'='true'
       AND "value"->>'claimGenerationActive'='true' AND ("value"->>'writerGeneration')::int>0) AS campaigns,

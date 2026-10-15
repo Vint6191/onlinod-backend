@@ -49,7 +49,7 @@ test("INT5.9A-10 frontier due can reuse a fresh directory while pending discover
   assert.equal(orchestrator.campaignDirectoryReuseBinding(forced, now), null);
 });
 
-test("INT5.9A-10 recurring discovery admission is oldest-due and bounded by estimated provider pages", async () => {
+test("bounded discovery keeps due ordering without pooling independent creators' provider pages", async () => {
   const now = new Date("2026-09-19T00:00:00.000Z");
   const candidates = [
     { creatorId: "creator-a", campaignDirectoryCampaignCount: 2_000, campaignDirectoryDiscoveryDueAt: new Date("2026-09-18T00:00:00Z") },
@@ -62,10 +62,9 @@ test("INT5.9A-10 recurring discovery admission is oldest-due and bounded by esti
     jobInstance: { findMany: async () => [] },
   };
   const result = await scheduler.selectCampaignDirectoryDiscoveryAdmissions({ db, now, creatorIds: candidates.map((r) => r.creatorId), pageBudget: 82, maxJobs: 10 });
-  // 2,000 campaigns reserve 41 calls including the terminal page. Two oldest
-  // creators consume the entire 82-call budget; later due creators cannot jump ahead.
-  assert.deepEqual([...result.admittedCreatorIds], ["creator-a", "creator-b"]);
-  assert.equal(result.estimatedProviderPages, 82);
+  // The former pageBudget argument cannot turn separate models into one clock.
+  assert.deepEqual([...result.admittedCreatorIds], ["creator-a", "creator-b", "creator-c", "creator-d"]);
+  assert.equal(result.estimatedProviderPages, 125);
 });
 
 test("INT5.9A-10 active Campaign work does not waste a directory admission slot", async () => {

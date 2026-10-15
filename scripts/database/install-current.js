@@ -5,7 +5,7 @@ const fs = require("node:fs"), path = require("node:path"), os = require("node:o
 const { spawn } = require("node:child_process");
 const { PrismaClient } = require("@prisma/client");
 const contract = require("../../src/services/database-contract.json");
-const { migrations, validMigrationPrefix } = require("../../src/services/database-migration-chain");
+const { migrations, validMigrationPrefix, currentContract } = require("../../src/services/database-migration-chain");
 const { assertDatabaseContract } = require("../../src/services/database-contract-service");
 const root = path.resolve(__dirname, "../..");
 const legacyResetTarget = "20261009000000_current_baseline";
@@ -111,7 +111,7 @@ async function main(args = process.argv.slice(2)) {
     await db.$disconnect();
     await deploy(deployment.schemaPath);
     await assertDatabaseContract(db);
-    console.log(JSON.stringify({ ok: true, ...installation, version: contract.version }));
+    console.log(JSON.stringify({ ok: true, ...installation, version: currentContract().version }));
   } finally {
     try { if (db) await db.$disconnect(); } finally { deployment.dispose(); }
   }

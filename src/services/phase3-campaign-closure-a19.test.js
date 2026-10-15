@@ -85,13 +85,14 @@ test("A19 manual refresh repair is lost-response idempotent and never falls thro
   assert.equal(deriveManualCampaignStartDebtAction({ failedDebt: 0, queuedDebt: 0 }), "full");
 });
 
-test("A19 scale contract explicitly rejects universal 4000 creators / 72h under one audited fleet-global gate", () => {
+test("creator scale contract exposes parallel provider capacity and explicitly requires workers", () => {
   const contract = providerScaleContract({ creatorCount: 4000, minimumCampaignCount: 1, targetMs: 72 * 60 * 60 * 1000 });
-  assert.equal(contract.universalDirectorySlaGuaranteed, false);
-  assert.equal(contract.policy, "BEST_EFFORT_OVERDUE_VISIBLE");
-  assert.equal(contract.reason, "FLEET_GLOBAL_CAPACITY_INSUFFICIENT");
+  assert.equal(contract.universalDirectorySlaGuaranteed, true);
+  assert.equal(contract.policy, "GUARANTEED_WITHIN_CURRENT_TOPOLOGY");
+  assert.equal(contract.reason, null);
   assert.equal(contract.noUnauditedSharding, true);
-  assert.ok(contract.feasibility.requiredHours > contract.feasibility.targetHours);
+  assert.ok(contract.feasibility.requiredHours < contract.feasibility.targetHours);
+  assert.equal(contract.feasibility.workerAvailabilityRequired,true);
 });
 
 test("A19 failed FanData demand has bounded DB-time backoff and same-revision terminal JobInstance is resettable", () => {

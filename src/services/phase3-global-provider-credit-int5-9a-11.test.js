@@ -58,11 +58,9 @@ test("job claim source skips saturated fan refresh work without blocking other j
   assert.match(source, /fanDataRefreshClaimAvailable\(db, candidate\.creatorId\)/);
 });
 
-test("physical OF gate source has one process-wide permit and creator round-robin, not per-creator clocks", () => {
+test("all request classes enter a coordinator selected by creator", () => {
   const source = fs.readFileSync(path.join(__dirname, "of-request-gate-service.js"), "utf8");
-  assert.match(source, /const coordinator = \{/);
-  assert.match(source, /single_backend_process_global_two_phase_creator_round_robin/);
-  assert.match(source, /lastServedKey/);
-  assert.doesNotMatch(source, /const lanes = new Map\(\)/);
-  assert.doesNotMatch(source, /getLane\(/);
+  assert.match(source, /const coordinators = new Map\(\)/);
+  assert.match(source, /coordinatorFor\(access.agencyId, creatorId\)/);
+  assert.match(source, /single_backend_process_creator_two_phase/);
 });

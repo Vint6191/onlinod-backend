@@ -102,7 +102,7 @@ test("directory admission sends a fixed-size reservation independent of catalog 
     if (/SELECT clock_timestamp/.test(sql)) return [{ authorityNow: now }];
     calls.push({ sql, args }); return [];
   } };
-  assert.equal(await service.reserveDirectoryAdmission({ db, state: { campaignDirectoryCampaignCount: 2000 }, now }), false);
+  assert.equal(await service.reserveDirectoryAdmission({ db, creatorId: "creator-a", state: { campaignDirectoryCampaignCount: 2000 }, now }), false);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].args[0].toISOString(), "2026-09-23T12:00:00.000Z");
   assert.equal(calls[0].args[1], 41);

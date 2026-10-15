@@ -7,6 +7,7 @@
 // scheduler/operator can reason from durable fleet facts instead of from
 // ad-hoc arithmetic in logs.
 
+const { creatorCapacitySummarySql, CREATOR_USAGE_SQL, creatorCapacityFromRow } = require("./provider-capacity-creator-summary");
 const {
   DEFAULT_PROVIDER_INTERVAL_MS,
   DEFAULT_CAMPAIGN_DIRECTORY_PAGE_SIZE,
@@ -26,7 +27,7 @@ const {
 } = require("./provider-capacity-topology-control-service");
 
 const PROVIDER_CAPACITY_STATE_ID = "of-global-capacity-v1";
-const PROVIDER_CAPACITY_SOURCE_VERSION = "phase6_provider_capacity_debt_v1";
+const PROVIDER_CAPACITY_SOURCE_VERSION = "creator_provider_capacity_debt_v2";
 const BACKGROUND_OTHER_PROVIDER_JOB_KEYS = Object.freeze(
   CLAIMABLE_DESKTOP_JOB_KEYS.filter((key) => !["fetch_campaigns", "fan_data_point_refresh"].includes(String(key || "")))
 );
@@ -74,16 +75,21 @@ function deriveProviderCapacityDebtSnapshot({
   fanData = {},
   backgroundOther = {},
   actualUsage = {},
+  creatorCapacity = null,
   projection = { complete: true, revision: 0n },
   intervalMs = DEFAULT_PROVIDER_INTERVAL_MS,
   directoryTargetMs = DEFAULT_CAMPAIGN_DIRECTORY_TARGET_MS,
   fanDataTargetMs = CAMPAIGN_FAN_VALUE_FRESHNESS_MS,
 } = {}) {
   const sampledAt = asDate(now) || new Date();
-  const physicalStartsPerHour = providerPhysicalStartsPerHour(intervalMs);
+  const creatorCount = nonNegativeInt(creatorCapacity?.creatorCount);
+  const perCreatorStartsPerHour = providerPhysicalStartsPerHour(intervalMs);
+  const physicalStartsPerHour = perCreatorStartsPerHour * creatorCount;
   const backgroundGuaranteedStartsPerHour = physicalStartsPerHour * providerPriorityShare("background");
-  const campaignDirectoryGuaranteedStartsPerHour = providerCategoryGuaranteedStartsPerHour("campaign_directory", intervalMs);
-  const fanDataGuaranteedStartsPerHour = providerCategoryGuaranteedStartsPerHour("fan_data", intervalMs);
+  const directoryRate = providerCategoryGuaranteedStartsPerHour("campaign_directory", intervalMs);
+  const campaignDirectoryGuaranteedStartsPerHour = directoryRate * creatorCount;
+  const fanRate = providerCategoryGuaranteedStartsPerHour("fan_data", intervalMs);
+  const fanDataGuaranteedStartsPerHour = fanRate * creatorCount;
 
   const campaignDirectoryDueCreators = nonNegativeInt(campaignDirectory.dueCreators);
   const campaignDirectoryOverdueCreators = nonNegativeInt(campaignDirectory.overdueCreators);
@@ -97,7 +103,8 @@ function deriveProviderCapacityDebtSnapshot({
   // OF calls a domain-specific continuation will consume. Never invent
   // `1 job == 1 call` as an SLA forecast.
   const backgroundOtherCallCardinalityKnown = backgroundOtherPendingJobs === 0;
-  const projectionComplete = projection.complete === true;
+  const distributionKnown = creatorCapacity != null || (campaignDirectoryRequiredCalls === 0n && fanDataUnsatisfiedDemands === 0n);
+  const projectionComplete = projection.complete === true && distributionKnown;
   const futureDebtCoverageStatus = backgroundOtherCallCardinalityKnown && projectionComplete ? "COMPLETE_AT_SAMPLE" : "PARTIAL";
   const futureDebtCoverageReason = !projectionComplete ? "CAPACITY_PROJECTION_REBUILD_OR_LAG" : (backgroundOtherCallCardinalityKnown ? null : "BACKGROUND_OTHER_CALL_CARDINALITY_UNKNOWN");
 
@@ -119,20 +126,17 @@ function deriveProviderCapacityDebtSnapshot({
 
   const campaignDirectoryTargetHours = hours(directoryTargetMs);
   const fanDataTargetHours = hours(fanDataTargetMs);
-  const campaignDirectoryCapacityDebtCalls = debtCalls(
-    campaignDirectoryRequiredCalls,
-    campaignDirectoryGuaranteedStartsPerHour,
-    campaignDirectoryTargetHours,
-  );
-  const fanDataCapacityDebtCalls = debtCalls(
-    fanDataUnsatisfiedDemands,
-    fanDataGuaranteedStartsPerHour,
-    fanDataTargetHours,
-  );
+  // Independent models cannot donate credits to a hot model. Debt adds only
+  // per-creator excess; completion time is the slowest creator, not fleet sum.
+  const campaignDirectoryCapacityDebtCalls = nonNegativeBigInt(creatorCapacity?.directoryDebtCalls);
+  const fanDataCapacityDebtCalls = nonNegativeBigInt(creatorCapacity?.fanDebtCalls);
   const providerLowerBoundRequiredCalls = campaignDirectoryRequiredCalls + fanDataUnsatisfiedDemands;
-  const campaignDirectoryGuaranteedClearHours = safeClearHours(campaignDirectoryRequiredCalls, campaignDirectoryGuaranteedStartsPerHour);
-  const fanDataGuaranteedClearHours = safeClearHours(fanDataUnsatisfiedDemands, fanDataGuaranteedStartsPerHour);
-  const providerExclusiveClearHours = safeClearHours(providerLowerBoundRequiredCalls, physicalStartsPerHour);
+  const campaignDirectoryGuaranteedClearHours = distributionKnown
+    ? safeClearHours(creatorCapacity?.maxDirectoryCalls || 0, directoryRate) : safeClearHours(campaignDirectoryRequiredCalls, directoryRate);
+  const fanDataGuaranteedClearHours = distributionKnown
+    ? safeClearHours(creatorCapacity?.maxFanCalls || 0, fanRate) : safeClearHours(fanDataUnsatisfiedDemands, fanRate);
+  const providerExclusiveClearHours = distributionKnown
+    ? safeClearHours(creatorCapacity?.maxRequiredCalls || 0, perCreatorStartsPerHour) : safeClearHours(providerLowerBoundRequiredCalls, perCreatorStartsPerHour);
 
   const overloadedReasons = [];
   if (campaignDirectoryCapacityDebtCalls > 0n) overloadedReasons.push("CAMPAIGN_DIRECTORY_CAPACITY_DEBT");
@@ -144,7 +148,7 @@ function deriveProviderCapacityDebtSnapshot({
   const status = (!projectionComplete || !actualUsageAccountingComplete || !backgroundOtherCallCardinalityKnown)
     ? "UNKNOWN"
     : (overloadedReasons.length ? "OVERLOADED" : (hasWork ? "PRESSURED" : "HEALTHY"));
-  const topology = providerCapacityTopologyContract();
+  const topology = providerCapacityTopologyContract(creatorCount);
   const control = deriveProviderOverloadControl({
     snapshot: { status, overloadReason: overloadedReasons.length ? overloadedReasons.join(",") : null, sampledAt },
     now: sampledAt,
@@ -272,16 +276,21 @@ async function readCanonicalCapacityInputs({ db, now = new Date() } = {}) {
       FROM "JobInstance"
       WHERE "jobKey" = ANY($3::text[])
         AND "status" IN ('SCHEDULED','CLAIMED','PAUSED')
-    ), usage AS (
-      SELECT
-        "usageWindowStartedAt", "usageTotalStarts", "usageCriticalWriteStarts",
-        "usageInteractiveStarts", "usageRealtimeStarts", "usageNormalStarts",
-        "usageCampaignDirectoryStarts", "usageCampaignFrontierStarts", "usageFanDataStarts",
-        "usageBackgroundOtherStarts", "usageUnclassifiedStarts"
-      FROM "OfProviderRequestGateState" WHERE "id"='of-global' LIMIT 1
-    )
-    SELECT directory.*, fan.*, jobs."pendingJobs", background_other.*, usage.*
-    FROM directory CROSS JOIN fan CROSS JOIN jobs CROSS JOIN background_other LEFT JOIN usage ON TRUE
+    ), creator_demands AS (
+      SELECT "creatorId",SUM("directoryCalls")::bigint AS "directoryCalls",SUM("fanCalls")::bigint AS "fanCalls"
+      FROM (
+        SELECT "creatorId",GREATEST(1,CEIL(GREATEST(0,"campaignDirectoryCampaignCount")::numeric/$2::numeric)::bigint+1) AS "directoryCalls",0::bigint AS "fanCalls"
+        FROM source_directory WHERE "baselineVerifiedAt" IS NOT NULL AND
+          ("campaignDirectoryDiscoveryRequestedRevision">"campaignDirectoryDiscoveryCompletedRevision" OR "observationDueAt" IS NULL OR "observationDueAt"<=$1)
+        UNION ALL
+        SELECT "creatorId",0,COUNT(*)::bigint FROM "CreatorFanRefreshDemand" WHERE "requestedRevision">"satisfiedRevision" GROUP BY "creatorId"
+        UNION ALL
+        SELECT "creatorId",0,0 FROM "JobInstance" WHERE ("jobKey"=ANY($3::text[]) AND "status" IN ('SCHEDULED','CLAIMED','PAUSED'))
+          OR ("jobKey"='fan_data_point_refresh' AND "status" IN ('SCHEDULED','CLAIMED'))
+      ) d GROUP BY "creatorId"
+    ), creator_capacity AS (${creatorCapacitySummarySql('SELECT * FROM creator_demands')}), usage AS (${CREATOR_USAGE_SQL})
+    SELECT directory.*, fan.*, jobs."pendingJobs", background_other.*, usage.*, creator_capacity.*
+    FROM directory CROSS JOIN fan CROSS JOIN jobs CROSS JOIN background_other CROSS JOIN creator_capacity LEFT JOIN usage ON TRUE
   `, authorityNow, DEFAULT_CAMPAIGN_DIRECTORY_PAGE_SIZE, BACKGROUND_OTHER_PROVIDER_JOB_KEYS, CAMPAIGN_DIRECTORY_DISCOVERY_TARGET_MS);
   const row = Array.isArray(rows) ? rows[0] : rows;
   return capacityInputsFromRow(row);
@@ -290,6 +299,7 @@ async function readCanonicalCapacityInputs({ db, now = new Date() } = {}) {
 function capacityInputsFromRow(row) {
   return {
     supported: true,
+    creatorCapacity: creatorCapacityFromRow(row),
     campaignDirectory: {
       dueCreators: row?.dueCreators ?? row?.duecreators ?? 0,
       overdueCreators: row?.overdueCreators ?? row?.overduecreators ?? 0,

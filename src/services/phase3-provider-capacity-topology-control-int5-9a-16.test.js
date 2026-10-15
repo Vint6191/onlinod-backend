@@ -13,15 +13,16 @@ const ROOT = path.join(__dirname, "../..");
 function read(relative) { return fs.readFileSync(path.join(ROOT, relative), "utf8"); }
 function sha(relative) { return crypto.createHash("sha256").update(read(relative)).digest("hex"); }
 
-test("A16 topology is one fleet-global shard and source does not authorize sharding", () => {
-  const contract = topology.providerCapacityTopologyContract();
-  assert.equal(contract.topologyId, "of-global");
-  assert.equal(contract.scope, "FLEET_GLOBAL");
-  assert.equal(contract.shardCount, 1);
-  assert.equal(contract.shardingAllowed, false);
-  const gate = read("src/services/provider-request-credit-authority-service.js");
-  assert.match(gate, /PROVIDER_GATE_STATE_ID\s*=\s*"of-global"/);
-  assert.doesNotMatch(gate, /PROVIDER_GATE_STATE_ID\s*=.*creatorId/);
+test("topology has an independent durable timeline for each creator", () => {
+  const contract = topology.providerCapacityTopologyContract(12);
+  assert.equal(contract.topologyId, "of-creator");
+  assert.equal(contract.scope, "CREATOR_PARALLEL");
+  assert.equal(contract.shardCount, 12);
+  assert.equal(contract.shardingAllowed, true);
+  const credit = require("./provider-request-credit-authority-service");
+  assert.equal(credit.providerGateStateId("creator-a"), "of-creator:creator-a");
+  assert.notEqual(credit.providerGateStateId("creator-a"), credit.providerGateStateId("creator-b"));
+  assert.throws(() => credit.providerGateStateId(null), { code: "OF_PROVIDER_GATE_SCOPE_REQUIRED" });
 });
 
 test("A16 overload protection admits periodic directory work only at guaranteed weighted capacity", () => {
@@ -72,24 +73,26 @@ test("A16 fresh non-overloaded capacity keeps normal directory admission budget"
 test("A16 debt projection persists topology and overload-control facts without becoming canonical work", () => {
   const snapshot = debt.deriveProviderCapacityDebtSnapshot({
     now: new Date("2026-09-19T00:00:00Z"),
+    creatorCapacity: { creatorCount: 4000, directoryDebtCalls: 156286n, fanDebtCalls: 94858n, maxDirectoryCalls: 164000n, maxFanCalls: 100000n, maxRequiredCalls: 264000n },
     campaignDirectory: { dueCreators: 4000, overdueCreators: 4000, requiredCalls: 164000n },
     fanData: { unsatisfiedDemands: 100000n, pendingJobs: 32 },
   });
   assert.equal(snapshot.status, "OVERLOADED");
-  assert.equal(snapshot.topologyId, "of-global");
-  assert.equal(snapshot.topologyScope, "FLEET_GLOBAL");
-  assert.equal(snapshot.topologyShardCount, 1);
-  assert.equal(snapshot.topologyShardingAllowed, false);
+  assert.equal(snapshot.topologyId, "of-creator");
+  assert.equal(snapshot.topologyScope, "CREATOR_PARALLEL");
+  assert.equal(snapshot.topologyShardCount, 4000);
+  assert.equal(snapshot.topologyShardingAllowed, true);
   assert.equal(snapshot.controlMode, "OVERLOAD_PROTECTED");
   assert.equal(snapshot.operatorActionRequired, true);
   assert.equal(snapshot.campaignDirectoryAdmissionBudgetCalls, snapshot.campaignDirectoryGuaranteedCallsPerSweep);
 });
 
-test("periodic directory admission uses one fleet budget under conservative capacity", () => {
+test("periodic directory admission uses a separate budget per creator", () => {
   const service = read("src/services/analytics-recurring-planning-service.js");
   assert.match(service, /guaranteedDirectoryCallsPerSweep/);
   assert.match(service, /AnalyticsPlanningBudget/);
   assert.match(service, /ON CONFLICT/);
+  assert.match(service, /campaign-directory:\$\{scopedCreatorId\}/);
   assert.doesNotMatch(service, /deleteMany|readCanonicalCapacityInputs/);
 });
 

@@ -82,7 +82,7 @@ router.post("/acquire", async (req, res, next) => {
 });
 
 // Called immediately after Desktop initiates the actual OF transport. The next
-// permit cannot be granted until this acknowledgement plus 700ms.
+// permit for this creator cannot be granted until this acknowledgement plus 700ms.
 router.post("/started", async (req, res, next) => {
   try {
     const input = permitSchema.parse(req.body);
@@ -123,6 +123,8 @@ router.post("/cancel", async (req, res, next) => {
   }
 });
 
-router.get("/status", (_req, res) => res.json({ ok: true, ...getOfRequestGateSnapshot() }));
+router.get("/status", (req, res) => res.json({ ok: true, ...getOfRequestGateSnapshot({
+  agencyId: req.auth?.agencyId, member: req.auth?.membership || req.member,
+}) }));
 
 module.exports = router;

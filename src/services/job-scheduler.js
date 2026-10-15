@@ -1781,7 +1781,7 @@ function estimatedCampaignDirectoryPages(state) {
   return Math.max(1, Math.ceil(count / CAMPAIGN_DIRECTORY_PAGE_SIZE) + 1);
 }
 
-async function selectCampaignDirectoryDiscoveryAdmissions({ db = prisma, now = new Date(), creatorIds, pageBudget = CAMPAIGN_DIRECTORY_DISCOVERY_PAGE_BUDGET_PER_SWEEP, maxJobs = CAMPAIGN_DIRECTORY_DISCOVERY_MAX_JOBS_PER_SWEEP } = {}) {
+async function selectCampaignDirectoryDiscoveryAdmissions({ db = prisma, now = new Date(), creatorIds, maxJobs = CAMPAIGN_DIRECTORY_DISCOVERY_MAX_JOBS_PER_SWEEP } = {}) {
   if (!Array.isArray(creatorIds) || creatorIds.length > 100) throw Object.assign(new Error("Discovery requires at most 100 explicit creators"), { code: "ANALYTICS_BOUNDED_SCOPE_REQUIRED" });
   const admittedCreatorIds = new Set();
   if (!creatorIds.length) return { admittedCreatorIds, estimatedProviderPages: 0, considered: 0 };
@@ -1811,7 +1811,9 @@ async function selectCampaignDirectoryDiscoveryAdmissions({ db = prisma, now = n
   for (const row of candidates) {
     if (busy.has(row.creatorId) || (row.retryAfterAt && new Date(row.retryAfterAt) > now) || (row.status === "FAILED" && !row.retryAfterAt)) continue;
     const cost = estimatedCampaignDirectoryPages(row);
-    if (admittedCreatorIds.size >= Math.max(1, Math.min(100, Number(maxJobs) || 100)) || (admittedCreatorIds.size && estimatedProviderPages + cost > Math.max(1, Number(pageBudget) || 1))) break;
+    // Compatibility selection is a bounded work batch, not a fleet provider
+    // budget. Actual recurring reservations belong to each creator's planner.
+    if (admittedCreatorIds.size >= Math.max(1, Math.min(100, Number(maxJobs) || 100))) break;
     admittedCreatorIds.add(row.creatorId);
     estimatedProviderPages += cost;
   }
