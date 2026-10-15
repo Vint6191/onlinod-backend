@@ -40,10 +40,11 @@ const CAMPAIGN_FRONTIER_SCHEDULING_VERSION = 1;
 const CAMPAIGN_DIRECTORY_REUSE_VERSION = 1;
 const CAMPAIGN_FRONTIER_BUDGET_DEFAULT = 50;
 const CAMPAIGN_FRONTIER_BUDGET_MAX = 200;
-const EARNINGS_COLLECTOR_VERSION = "earnings-v6";
-// V6 pins full UTC source-day bounds. Keep queued V4/V5 receipts readable
+const EARNINGS_COLLECTOR_VERSION = "earnings-v7";
+// V7 aggregates distinct intraday chart points. Keep queued V4/V5/V6 receipts readable
 // during a Backend-first rolling update; server amount checks apply to all.
-const EARNINGS_COMPAT_COLLECTOR_VERSIONS = new Set(["earnings-v4", "earnings-v5", EARNINGS_COLLECTOR_VERSION]);
+const EARNINGS_COMPAT_COLLECTOR_VERSIONS = new Set(["earnings-v4", "earnings-v5", "earnings-v6", EARNINGS_COLLECTOR_VERSION]);
+const EARNINGS_UTC_WINDOW_COLLECTOR_VERSIONS = new Set(["earnings-v6", EARNINGS_COLLECTOR_VERSION]);
 const EARNINGS_SCHEMA_VERSION = 4;
 const MESSAGES_COLLECTOR_VERSION = "local-dialog-messages-v2";
 const MESSAGES_SCHEMA_VERSION = 2;
@@ -668,7 +669,7 @@ function validateEarningsCompletion(job, result) {
   if (startDate.getTime() !== requestedRange.dayStart.getTime() || endDate.getTime() !== requestedRange.dayEnd.getTime()) {
     throw new Error("Earnings completion range does not match the claimed job");
   }
-  if (payload.collectorVersion === EARNINGS_COLLECTOR_VERSION &&
+  if (EARNINGS_UTC_WINDOW_COLLECTOR_VERSIONS.has(payload.collectorVersion) &&
     (payload.sourceRange?.startDate !== `${range.startDate} 00:00:00` || payload.sourceRange?.endDate !== `${range.endDate} 23:59:59`)) {
     throw Object.assign(new Error("Earnings source request must cover the complete UTC calendar window"), { code: "EARNINGS_SOURCE_RANGE_MISMATCH", status: 409 });
   }

@@ -253,8 +253,14 @@ function repairParams(job, now) {
 async function settle(db, job, row, sideEffect, now, { forceTerminal = false } = {}) {
   const complete = sideEffect?.ok === true;
   const daily = object(row.payload?.raw);
+  // Keep a bounded description of rejected chart coordinates, not the provider
+  // response. This distinguishes an old collector from ambiguous source data
+  // when a production daily proof cannot be completed.
+  const rejectedTimes = Array.isArray(daily.dailyRejectedSamples) ? daily.dailyRejectedSamples.slice(0, 3).map(sample => ({
+    reason: String(sample?.reason || "unknown").slice(0, 60), date: String(sample?.date || "unknown").slice(0, 80),
+  })) : [];
   const earningsDetail = job.jobKey === "fetch_earnings" && !complete
-    ? `EARNINGS_DAILY_INCOMPLETE: ${Number(daily.dailyObservedCount || 0)} accepted, ${Number(daily.dailyRejected || 0)} rejected; ${JSON.stringify(daily.dailyRejectionReasons || {})}; source=${String(daily.dailySource || "unknown")}; chartCents=${sideEffect?.dailyLedger?.proof?.chartTotalCents ?? "unknown"}; storedCents=${sideEffect?.dailyLedger?.proof?.persistedTotalCents ?? "unknown"}`
+    ? `EARNINGS_DAILY_INCOMPLETE: ${Number(daily.dailyObservedCount || 0)} accepted, ${Number(daily.dailyRejected || 0)} rejected; ${JSON.stringify(daily.dailyRejectionReasons || {})}; source=${String(daily.dailySource || "unknown")}; chartCents=${sideEffect?.dailyLedger?.proof?.chartTotalCents ?? "unknown"}; storedCents=${sideEffect?.dailyLedger?.proof?.persistedTotalCents ?? "unknown"}; collector=${String(row.payload?.collectorVersion || "unknown")}; points=${Number(daily.dailyPointCount || 0)}; uniquePoints=${Number(daily.dailyUniquePointCount || 0)}; rejectedTimes=${JSON.stringify(rejectedTimes)}`
     : null;
   const failureReason = String([sideEffect?.error, earningsDetail].filter(Boolean).join("; ") || `${job.jobKey}_partial`).slice(0, 2000);
   const protocolSuperseded = !complete && ((job.jobKey === "fetch_campaigns" && sideEffect?.completion?.protocolCurrent === false)

@@ -13,6 +13,7 @@ Module._load = function(request, parent, isMain) {
 const {
   ingestEarningsChunk,
   completeEarningsScan,
+  validateEarningsCompletion,
   ingestCampaignChunk,
   ingestCampaignFanValueChunk,
   ingestCampaignFanValuesBatchChunk,
@@ -229,6 +230,25 @@ test("rangeBounds uses inclusive calendar-day windows", () => {
   const previous = rangeBounds("prev_year", now);
   assert.equal(previous.start.toISOString(), "2025-01-01T00:00:00.000Z");
   assert.equal(previous.end.toISOString(), "2025-12-31T23:59:59.999Z");
+});
+
+test("earnings V7 accepts intraday collector output and retains V6 full-window validation during rolling upgrade", () => {
+  const result = { schemaVersion: 4, scanRunId: 'intraday-v7', observedAt: '2026-08-06T12:00:00Z',
+    dailyBatchCount: 1, dailyCount: 7, scannerRejected: 0,
+    range: { startDate: job.params.scanFrom, endDate: job.params.scanTo },
+    sourceRange: { startDate: `${job.params.scanFrom} 00:00:00`, endDate: `${job.params.scanTo} 23:59:59` } };
+  for (const collectorVersion of ['earnings-v6', 'earnings-v7']) {
+    assert.equal(validateEarningsCompletion(job, { ...result, collectorVersion }).expectedDailyCount, 7);
+    assert.throws(() => validateEarningsCompletion(job, { ...result, collectorVersion, sourceRange: undefined }),
+      error => error.code === 'EARNINGS_SOURCE_RANGE_MISMATCH');
+    assert.throws(() => validateEarningsCompletion(job, { ...result, collectorVersion,
+      sourceRange: { ...result.sourceRange, endDate: `${job.params.scanTo} 00:00:00` } }),
+      error => error.code === 'EARNINGS_SOURCE_RANGE_MISMATCH');
+  }
+  for (const collectorVersion of ['earnings-v4', 'earnings-v5']) {
+    assert.equal(validateEarningsCompletion(job, { ...result, collectorVersion, sourceRange: undefined }).expectedDailyCount, 7);
+  }
+  assert.throws(() => validateEarningsCompletion(job, { ...result, collectorVersion: 'earnings-v999' }), /Invalid earnings completion contract/);
 });
 
 test("earnings pages use protocol v4 and remain pending until completion proof", async () => {
