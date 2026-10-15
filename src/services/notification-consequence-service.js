@@ -14,6 +14,21 @@ const TERMINAL = new Set(["DONE", "FAILED", "CANCELLED", "CANCELED", "EXPIRED"])
 function error(code) { return Object.assign(new Error(code), { code }); }
 function owned(result) { if (!result || result.lost) throw error("NOTIFICATION_CONSEQUENCE_CLAIM_LOST"); return result; }
 
+function consequenceFailureDetails(cause, item, failed, elapsedMs) {
+  // Prisma messages can embed invocation arguments and database row contents.
+  // Log bounded identifiers/classification only, never the raw payload or stack.
+  const token = value => String(value || "").replace(/[^a-zA-Z0-9_.:-]/g, "").slice(0, 160) || null;
+  const text = String(cause?.meta?.message || cause?.meta?.error || cause?.message || "");
+  const databaseCode = String(cause?.meta?.code || "") || text.match(/\bcode:\s*"([A-Z0-9]{5})"/)?.[1] || null;
+  const domainCode = text.match(/\b(?:PHASE\d|NOTIFICATION|TRAFFIC|DOMAIN_WORK|DB_COMMIT|SUBSCRIBER|BUMP|FAN_DATA)_[A-Z0-9_]+\b/)?.[0] || null;
+  return { workId: token(item?.id), workClass: token(item?.workClass), jobId: token(item?.objectId),
+    creatorId: token(item?.creatorId), code: token(domainCode || cause?.code || cause?.name || "NOTIFICATION_CONSEQUENCE_FAILED"),
+    errorName: token(cause?.name), databaseCode: token(databaseCode),
+    constraint: token(text.match(/constraint\s+[\\"]*([A-Za-z0-9_]+)/i)?.[1]),
+    state: token(failed?.state), consecutiveFailures: Number(failed?.consecutiveFailures || 0),
+    elapsedMs: Math.max(0, Math.round(elapsedMs)) };
+}
+
 async function publishNotificationConsequences({ db, job }) {
   if (job?.jobKey !== "catchup_notifications_scan") return null;
   const published = await work.publishDomainWork({ db, agencyId: job.agencyId, creatorId: job.creatorId,
@@ -131,7 +146,7 @@ async function processNotificationConsequencePage({ db, item, ownerToken }) {
 async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntimeMs = 5000 } = {}) {
   if (!db) db = require("../prisma");
   const started = performance.now();
-  const report = { ok: true, selected: 0, processed: 0, completed: 0, yielded: 0, waiting: 0, failed: 0, lostOwnership: 0 };
+  const report = { ok: true, selected: 0, processed: 0, completed: 0, yielded: 0, waiting: 0, failed: 0, lostOwnership: 0, reason: null, errorDetails: [] };
   // Claim one quantum at a time: do not hold a large batch's leases while the
   // first item waits. Shared DomainWork claim indexes provide agency fairness.
   let emptyLanes = 0;
@@ -148,6 +163,7 @@ async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntim
     if (!item) { if (++emptyLanes >= 3) break; continue; }
     emptyLanes = 0;
     report.selected += 1;
+    const executionStarted = performance.now();
     try {
       const result = await (item.workClass === "NOTIFICATION_FACT_RECEIPTS"
         ? require("./notification-fact-receipt-service").processPage : processNotificationConsequencePage)({ db, item, ownerToken: claim.ownerToken });
@@ -156,6 +172,9 @@ async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntim
     } catch (cause) {
       const failed = await work.failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error: cause });
       report.ok = false;
+      const detail = consequenceFailureDetails(cause, item, failed, performance.now() - executionStarted);
+      report.reason ||= detail.code;
+      if (report.errorDetails.length < 5) report.errorDetails.push(detail);
       if (failed.lost) report.lostOwnership += 1; else report.failed += 1;
     }
   }

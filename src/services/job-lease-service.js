@@ -1302,6 +1302,41 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     try {
       sideEffect = await applyJobResult({ db: prisma, job, deviceId, userId, result: result || {} });
     } catch (error) {
+      if (error?.code === "SUBSCRIBER_PUBLICATION_DEFERRED_TO_MAINTENANCE") {
+        // Exhausting a bounded publication quantum is successful handoff, not
+        // a failed scan. Release the reserved collector lease atomically with
+        // the recovery signal. Maintenance owns the remaining work; collectors
+        // must not claim this already collected scan again.
+        const pending = { type: "subscriber_directory", runId: clean(job.params?.scanRunId, 120), publicationPending: true };
+        try {
+          return await phaseCommit(async (tx) => {
+            const waitingProgress = { ...object(job.progress), percent: 99,
+              message: "Subscribers collected · publishing snapshot", stage: "PUBLICATION",
+              waitKind: "PUBLICATION", waitReason: "Finishing subscriber snapshot publication" };
+            const updated = await tx.jobInstance.updateMany({
+              where: { id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId,
+                leaseTokenHash: hashToken(leaseToken), leaseRevision: completionLeaseRevision },
+              data: { status: "PUBLISHING",
+                claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null,
+                completedAt: null, lastError: null, lastProgressAt: now, progress: waitingProgress,
+                continuation: { driverPhase: "complete", result: result || {}, progress: waitingProgress },
+                result: { ...(result || {}), completionSideEffect: pending } },
+            });
+            if (!updated.count) throw new JobLeaseError("JOB_LEASE_STALE", "Subscriber publication handoff fence was lost");
+            await require("./subscriber-directory-maintenance-signal-service").signalSubscriberDirectoryMaintenance({
+              db: tx, agencyId: job.agencyId, creatorId: job.creatorId, kind: "RECOVERY", reason: "COMPLETION_HANDOFF",
+            });
+            if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+              await tx.fanObservationReadLease.deleteMany({ where: { jobId: job.id, deviceId, leaseRevision } });
+            }
+            return { job: { id: job.id, status: "PUBLISHING" }, sideEffect: pending, progress: waitingProgress };
+          }, { reserved: true, profile: "JOB_CHUNK" });
+        } catch (handoffError) {
+          // A rejected handoff is still a real failure. Keep the successful
+          // publication pages, but shorten only this exact reserved lease.
+          error = handoffError;
+        }
+      }
       // Keep the reserved job reclaimable. Publication progress itself is
       // durable; shortening the lease avoids pinning a failed request for the
       // full 15-minute reservation window while still fencing this attempt.

@@ -187,7 +187,7 @@ async function scheduleSubscriberScan({
       });
       if (active) {
         const job = active.jobId ? await tx.jobInstance.findUnique({ where: { id: active.jobId } }) : null;
-        if (job && ["SCHEDULED", "CLAIMED"].includes(job.status)) {
+        if (job && ["SCHEDULED", "CLAIMED", "PUBLISHING"].includes(job.status)) {
           return { existingRun: active, existingJob: job };
         }
         await tx.subscriberScanRun.updateMany({
@@ -1672,7 +1672,7 @@ async function getSubscriberDirectoryStatus({ agencyId, creatorId }) {
           updatedAt: job.updatedAt,
         }
       : null,
-    scanning: Boolean(activeRun || job?.status === "SCHEDULED" || job?.status === "CLAIMED"),
+    scanning: Boolean(activeRun || ["SCHEDULED", "CLAIMED", "PUBLISHING"].includes(job?.status)),
     fresh: Boolean(state?.publishedAt && (!state.nextScanAt || state.nextScanAt > new Date())),
   };
 }
