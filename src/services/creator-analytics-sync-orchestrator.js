@@ -90,7 +90,7 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     const baselineReady = Boolean(baseline && (collectorType === COLLECTOR_TYPES.NOTIFICATIONS || (collectorType === COLLECTOR_TYPES.CAMPAIGNS ? membershipProofState(currentCollectorState).baselineGeneration : currentCollectorState?.baselineGeneration)));
     if (initial && baselineReady) return { created: false, reason: "baseline_verified" };
     if (!initial && !baselineReady) return { created: false, reason: "baseline_unverified" };
-    if (catchupFreshnessMs != null && !due(collectorPlanningProofAt(collectorType, "catchup", currentCollectorState, now), catchupFreshnessMs, now)) {
+    if (catchupFreshnessMs != null && !collectorCatchupDue(collectorType, currentCollectorState, catchupFreshnessMs, now)) {
       return { created: false, reason: "fresh" };
     }
     const retry = retryDisposition(currentCollectorState, now);
@@ -364,6 +364,17 @@ function due(lastVerifiedAt, intervalMs, now) {
   return verifiedAt.getTime() < now.getTime() - intervalMs;
 }
 
+function collectorCatchupDue(type, state, freshnessMs, now) {
+  if (type === COLLECTOR_TYPES.FINANCIAL) {
+    // The reader exposes gaps and stale historical audits independently of the
+    // recent head. Planning must use that same authority: a just-verified head
+    // must not postpone the next historical segment for another 24 hours.
+    // Retry/quarantine is checked separately under the collector lock below.
+    return !require("./financial-receipt-authority").evaluateCollection(state, now, freshnessMs).fresh;
+  }
+  return due(collectorPlanningProofAt(type, "catchup", state, now), freshnessMs, now);
+}
+
 async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20, campaignDirectoryDiscoveryAdmitted = true, reserveCampaignDirectory = null, _planningLocksHeld = false } = {}) {
   if (!creatorId || !agencyId) return { ready: false, initial: { ready: false, reason: "missing_scope" }, created: [], skipped: [] };
   // One creator plan owns collector locks in Notifications -> Financial ->
@@ -415,7 +426,7 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
   } else skipped.push(notificationHistoricalBaselineReady(notificationState, now) ? "notifications_catchup:fresh" : "notifications_catchup:baseline_unverified");
 
   const financialReady = Boolean(financialState?.baselineGeneration && collectorPlanningProofAt(COLLECTOR_TYPES.FINANCIAL, "full", financialState, now));
-  if (financialReady && due(collectorPlanningProofAt(COLLECTOR_TYPES.FINANCIAL, "catchup", financialState, now), FINANCIAL_COLLECTION_FRESHNESS_MS, now)) {
+  if (financialReady && collectorCatchupDue(COLLECTOR_TYPES.FINANCIAL, financialState, FINANCIAL_COLLECTION_FRESHNESS_MS, now)) {
     const retry = retryDisposition(financialState, now);
     if (retry.deferred) skipped.push("financial_catchup:deferred");
     else if (retry.terminal) skipped.push("financial_catchup:failed_terminal");

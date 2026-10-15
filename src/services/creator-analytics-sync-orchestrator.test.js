@@ -81,6 +81,7 @@ function dbFixture({
           baselineVerifiedAt: new Date("2026-08-01T00:00:00.000Z"), baselineObservedAt: new Date("2026-08-01T00:00:00.000Z"),
           baselineGeneration: "financial-baseline-generation",
           lastCatchupCompletedAt: financialCatchupAt, lastCatchupObservedAt: financialCatchupAt,
+          recentRangeTo: financialCatchupAt, coverageThrough: financialCatchupAt, historyAuditObservedAt: financialCatchupAt,
           retryAfterAt: financialRetryAfterAt,
         } : null;
       },
@@ -112,11 +113,30 @@ test("new full proof suppresses redundant notification and financial catch-ups",
   const now = new Date("2026-10-01T12:00:00Z"), old = new Date("2026-09-20T12:00:00Z");
   notificationState = { normalizerVersion: "notification-source-v2", fullBackfillVerifiedAt: now, fullBackfillObservedAt: now, lastCatchupVerifiedAt: old , lastCatchupObservedAt: old};
   const db = dbFixture({ financialReady: true, campaignReady: true });
-  db.creatorFinancialCollectionState.findUnique = async () => ({ status: "COMPLETE", baselineGeneration: "full-proof", baselineVerifiedAt: now, baselineObservedAt: now, lastCatchupCompletedAt: old, lastCatchupObservedAt: old });
+  db.creatorFinancialCollectionState.findUnique = async () => ({ status: "COMPLETE", baselineGeneration: "full-proof", baselineVerifiedAt: now, baselineObservedAt: now, lastCatchupCompletedAt: old, lastCatchupObservedAt: old, receiptCoverageVersion: 1, recentRangeTo: now, coverageThrough: now, historyAuditObservedAt: now });
   const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: "creator-1", agencyId: "agency-1", now });
   assert(result.skipped.includes("notifications_catchup:fresh"));
   assert(result.skipped.includes("financial_catchup:fresh"));
   assert(!scheduled.some(j => ["catchup_notifications_scan", "financial_transactions_scan"].includes(j.jobKey)));
+});
+
+test('fresh financial head cannot suppress a remaining historical gap or stale audit', async () => {
+  const now = new Date('2026-08-09T12:00:00Z');
+  notificationState = { normalizerVersion: 'notification-source-v2', fullBackfillVerifiedAt: now, fullBackfillObservedAt: now };
+  for (const debt of [
+    { coverageThrough: new Date('2026-07-01') },
+    { historyAuditObservedAt: new Date('2026-07-01') },
+  ]) {
+    scheduled = [];
+    const db = dbFixture({ financialReady: true, campaignReady: true, financialCatchupAt: now });
+    const read = db.creatorFinancialCollectionState.findUnique;
+    db.creatorFinancialCollectionState.findUnique = async () => ({ ...await read(), ...debt });
+    const result = await ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: 'creator-1', agencyId: 'agency-1', now });
+    assert(result.created.includes('financial_catchup'));
+    const job = scheduled.find(item => item.jobKey === 'financial_transactions_scan');
+    assert.equal(job.params.collectionMode, 'catchup');
+    assert(!result.skipped.includes('financial_catchup:fresh'));
+  }
 });
 
 test("migration keeps all historical baselines ready and schedules bounded catch-ups for missing source age", async () => {
@@ -153,7 +173,8 @@ for (const completion of ["full", "deferred", "terminal"]) test("recurring plann
     // Initial readiness and pre-lock due check see the old state. The third
     // read is in scheduleIfIdle after acquiring collector authority.
     if (reads >= 3) {
-      if (completion === "full") { state.baselineVerifiedAt = now; state.baselineObservedAt = now; }
+      if (completion === "full") { Object.assign(state, { baselineVerifiedAt: now, baselineObservedAt: now,
+        receiptCoverageVersion: 1, recentRangeTo: now, coverageThrough: now, historyAuditObservedAt: now }); }
       else { state.status = "FAILED"; state.retryAfterAt = completion === "deferred" ? new Date(+now + 3600000) : null; }
     }
     return state;

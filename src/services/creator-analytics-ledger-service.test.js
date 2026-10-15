@@ -272,13 +272,30 @@ test("earnings pages use protocol v4 and remain pending until completion proof",
   );
 });
 
+test("earnings rejects a $300 amount discrepancy even when every day, page and client flag says complete", async () => {
+  for (const chartTotal of [30700, undefined, null, '700']) {
+    const harness = batchHarness({ pageBatches: [{ id: 'page-a', status: 'COMMITTED', receivedRows: 7, rejectedRows: 0 }] });
+    harness.tx.creatorEarningsDaily = { count: async () => 7, aggregate: async () => ({ _sum: { totalCents: 700 } }), updateMany: async () => ({ count: 7 }) };
+    const result = await completeEarningsScan({ db: harness.db, job, result: {
+      schemaVersion: 4, collectorVersion: 'earnings-v5', scanRunId: 'mismatch', observedAt: '2026-08-06T12:00:00Z',
+      range: { startDate: '2026-07-31', endDate: '2026-08-06' }, summary: { totalCents: chartTotal },
+      dailyBatchCount: 1, dailyCount: 7, scannerRejected: 0, chartComplete: true, dailyComplete: true,
+    } });
+    assert.equal(result.complete, false);
+    assert.equal(result.proof.persistedTotalCents, 700);
+    assert.equal(result.proof.amountMatched, false);
+    assert.equal(harness.scanProofs[0].status, 'PARTIAL');
+    assert(!harness.coverageUpdates.some(update => update.data.status === 'COMPLETE'));
+  }
+});
+
 test("earnings completion proves every page and promotes only historical coverage", async () => {
   const harness = batchHarness({
     pageBatches: [
       { id: "page-a", status: "COMMITTED", receivedRows: 7, rejectedRows: 0 },
     ],
   });
-  harness.tx.creatorEarningsDaily = { count: async () => 7, updateMany: async () => ({ count: 7 }) };
+  harness.tx.creatorEarningsDaily = { count: async () => 7, aggregate: async () => ({ _sum: { totalCents: 700 } }), updateMany: async () => ({ count: 7 }) };
   const payload = {
     schemaVersion: 4,
     collectorVersion: "earnings-v4",
@@ -286,6 +303,7 @@ test("earnings completion proves every page and promotes only historical coverag
     observedAt: "2026-08-06T12:00:00.000Z",
     range: { startDate: "2026-07-31", endDate: "2026-08-06" },
     dailyBatchCount: 1,
+    summary: { totalCents: 700 },
     dailyCount: 7,
     scannerRejected: 0,
     chartComplete: true,
@@ -312,6 +330,7 @@ test("earnings completion replay monotonically promotes a durable PARTIAL scan p
     observedAt: "2026-08-06T12:00:00.000Z",
     range: { startDate: "2026-07-31", endDate: "2026-08-06" },
     dailyBatchCount: 1,
+    summary: { totalCents: 700 },
     dailyCount: 7,
     scannerRejected: 0,
     chartComplete: true,
@@ -331,7 +350,7 @@ test("earnings completion replay monotonically promotes a durable PARTIAL scan p
     },
     pageBatches: [{ id: "page-a", status: "COMMITTED", receivedRows: 7, rejectedRows: 0 }],
   });
-  harness.tx.creatorEarningsDaily = { count: async () => 7, updateMany: async () => ({ count: 7 }) };
+  harness.tx.creatorEarningsDaily = { count: async () => 7, aggregate: async () => ({ _sum: { totalCents: 700 } }), updateMany: async () => ({ count: 7 }) };
 
   const result = await completeEarningsScan({ db: harness.db, job, deviceId: "device-1", result: payload });
   assert.equal(result.complete, true);
@@ -353,6 +372,7 @@ test("committed earnings proof remains authoritative after operational page-batc
     observedAt: "2026-08-06T12:00:00.000Z",
     range: { startDate: "2026-07-31", endDate: "2026-08-06" },
     dailyBatchCount: 1,
+    summary: { totalCents: 700 },
     dailyCount: 7,
     scannerRejected: 0,
     chartComplete: true,
@@ -372,7 +392,7 @@ test("committed earnings proof remains authoritative after operational page-batc
     },
     pageBatches: [],
   });
-  harness.tx.creatorEarningsDaily = { count: async () => 7, updateMany: async () => ({ count: 7 }) };
+  harness.tx.creatorEarningsDaily = { count: async () => 7, aggregate: async () => ({ _sum: { totalCents: 700 } }), updateMany: async () => ({ count: 7 }) };
 
   const result = await completeEarningsScan({ db: harness.db, job, deviceId: "device-1", result: payload });
   assert.equal(result.complete, true);
@@ -391,6 +411,7 @@ test("committed earnings proof remains authoritative after full ingest-batch com
     observedAt: "2026-08-06T12:00:00.000Z",
     range: { startDate: "2026-07-31", endDate: "2026-08-06" },
     dailyBatchCount: 1,
+    summary: { totalCents: 700 },
     dailyCount: 7,
     scannerRejected: 0,
     chartComplete: true,
@@ -410,7 +431,7 @@ test("committed earnings proof remains authoritative after full ingest-batch com
     },
     pageBatches: [],
   });
-  harness.tx.creatorEarningsDaily = { count: async () => 7, updateMany: async () => ({ count: 7 }) };
+  harness.tx.creatorEarningsDaily = { count: async () => 7, aggregate: async () => ({ _sum: { totalCents: 700 } }), updateMany: async () => ({ count: 7 }) };
 
   const result = await completeEarningsScan({ db: harness.db, job, deviceId: "device-1", result: payload });
   assert.equal(result.complete, true);
@@ -423,7 +444,7 @@ test("committed earnings proof remains authoritative after full ingest-batch com
 
 test("earnings completion stays partial when page proof or daily proof is incomplete", async () => {
   const harness = batchHarness({ pageBatches: [] });
-  harness.tx.creatorEarningsDaily = { count: async () => 0, updateMany: async () => ({ count: 0 }) };
+  harness.tx.creatorEarningsDaily = { count: async () => 0, aggregate: async () => ({ _sum: { totalCents: null } }), updateMany: async () => ({ count: 0 }) };
   const result = await completeEarningsScan({
     db: harness.db,
     job,
@@ -434,6 +455,7 @@ test("earnings completion stays partial when page proof or daily proof is incomp
       observedAt: "2026-08-06T12:00:00.000Z",
       range: { startDate: "2026-07-31", endDate: "2026-08-06" },
       dailyBatchCount: 1,
+    summary: { totalCents: 700 },
       dailyCount: 7,
       scannerRejected: 0,
       chartComplete: true,
@@ -1788,6 +1810,7 @@ test("earnings pages and completion are fenced to the claimed job range", async 
         observedAt: "2026-08-06T12:00:00.000Z",
         range: { startDate: "2026-08-01", endDate: "2026-08-06" },
         dailyBatchCount: 1,
+    summary: { totalCents: 700 },
         dailyCount: 6,
         scannerRejected: 0,
         chartComplete: true,
@@ -1959,6 +1982,7 @@ test("earnings completion refuses to borrow days from another job or scan run", 
   const harness = batchHarness({ pageBatches: [{ id: "page-a", status: "COMMITTED", receivedRows: 7, rejectedRows: 0 }] });
   let countWhere = null;
   harness.tx.creatorEarningsDaily = {
+    aggregate: async () => ({ _sum: { totalCents: 600 } }),
     count: async ({ where }) => { countWhere = where; return where.sourceJobId === job.id && where.sourceScanRunId === "run-overlap" ? 6 : 7; },
     updateMany: async () => ({ count: 7 }),
   };
@@ -1972,6 +1996,7 @@ test("earnings completion refuses to borrow days from another job or scan run", 
       observedAt: "2026-08-06T12:00:00.000Z",
       range: { startDate: "2026-07-31", endDate: "2026-08-06" },
       dailyBatchCount: 1,
+    summary: { totalCents: 700 },
       dailyCount: 7,
       scannerRejected: 0,
       chartComplete: true,

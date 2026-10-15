@@ -40,10 +40,10 @@ const CAMPAIGN_FRONTIER_SCHEDULING_VERSION = 1;
 const CAMPAIGN_DIRECTORY_REUSE_VERSION = 1;
 const CAMPAIGN_FRONTIER_BUDGET_DEFAULT = 50;
 const CAMPAIGN_FRONTIER_BUDGET_MAX = 200;
-const EARNINGS_COLLECTOR_VERSION = "earnings-v5";
-// V5 fixes money-series parsing; the V4 wire schema and completeness proof are
-// unchanged. Accept queued V4 receipts during a Backend-first rolling update.
-const EARNINGS_COMPAT_COLLECTOR_VERSIONS = new Set(["earnings-v4", EARNINGS_COLLECTOR_VERSION]);
+const EARNINGS_COLLECTOR_VERSION = "earnings-v6";
+// V6 pins full UTC source-day bounds. Keep queued V4/V5 receipts readable
+// during a Backend-first rolling update; server amount checks apply to all.
+const EARNINGS_COMPAT_COLLECTOR_VERSIONS = new Set(["earnings-v4", "earnings-v5", EARNINGS_COLLECTOR_VERSION]);
 const EARNINGS_SCHEMA_VERSION = 4;
 const MESSAGES_COLLECTOR_VERSION = "local-dialog-messages-v2";
 const MESSAGES_SCHEMA_VERSION = 2;
@@ -668,6 +668,10 @@ function validateEarningsCompletion(job, result) {
   if (startDate.getTime() !== requestedRange.dayStart.getTime() || endDate.getTime() !== requestedRange.dayEnd.getTime()) {
     throw new Error("Earnings completion range does not match the claimed job");
   }
+  if (payload.collectorVersion === EARNINGS_COLLECTOR_VERSION &&
+    (payload.sourceRange?.startDate !== `${range.startDate} 00:00:00` || payload.sourceRange?.endDate !== `${range.endDate} 23:59:59`)) {
+    throw Object.assign(new Error("Earnings source request must cover the complete UTC calendar window"), { code: "EARNINGS_SOURCE_RANGE_MISMATCH", status: 409 });
+  }
   const key = `earnings:${job.id}:run:${scanRunId}:completion:v4`;
   if (key.length > 240) throw new Error("Earnings completion idempotency key exceeds 240 characters");
   return { payload, scanRunId, expectedDailyBatches, expectedDailyCount, scannerRejected, observedAt, requestedRange, startDate, endDate, key };
@@ -704,6 +708,14 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result, public
     const persistedDailyCount = publication ? publication.persistedDailyCount : await tx.creatorEarningsDaily.count({
       where: { creatorId: job.creatorId, sourceJobId: job.id, sourceScanRunId: scanRunId, sourceTimezone: "UTC", date: { gte: startDate, lte: endDate } },
     });
+    const persistedSum = publication ? publication.persistedTotalCents : (await tx.creatorEarningsDaily.aggregate({
+      where: { creatorId: job.creatorId, sourceJobId: job.id, sourceScanRunId: scanRunId, sourceTimezone: "UTC", date: { gte: startDate, lte: endDate } },
+      _sum: { totalCents: true },
+    }))._sum.totalCents;
+    const persistedTotalCents = persistedSum == null ? null : Number(persistedSum);
+    const chartTotalCents = payload.summary?.totalCents;
+    const amountMatched = Number.isSafeInteger(chartTotalCents) && chartTotalCents >= 0
+      && Number.isSafeInteger(persistedTotalCents) && persistedTotalCents === chartTotalCents;
     const requestedDayCount = Math.floor((requestedRange.dayEnd.getTime() - requestedRange.dayStart.getTime()) / 86_400_000) + 1;
     const proof = {
       expectedDailyBatches,
@@ -716,6 +728,9 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result, public
       chartComplete: payload.chartComplete === true,
       dailyComplete: payload.dailyComplete === true,
       scannerRejected,
+      chartTotalCents: Number.isSafeInteger(chartTotalCents) ? chartTotalCents : null,
+      persistedTotalCents,
+      amountMatched,
     };
     const evaluatedComplete =
       payload.chartComplete === true &&
@@ -725,7 +740,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result, public
       observedDailyBatches === expectedDailyBatches &&
       expectedDailyCount === requestedDayCount &&
       acceptedRows === expectedDailyCount &&
-      persistedDailyCount === expectedDailyCount;
+      persistedDailyCount === expectedDailyCount && amountMatched;
 
     // Durable proof is the business/audit authority after operational ingest rows
     // become eligible for compaction. Replaying the exact immutable completion

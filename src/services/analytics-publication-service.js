@@ -130,7 +130,7 @@ async function earningsUnit(db, job, row, now) {
     date: { gte: input.startDate, lte: input.endDate } };
   const batchWhere = { sourceJobId: job.id, dataType: "EARNINGS",
     idempotencyKey: { startsWith: `earnings:${job.id}:run:${input.scanRunId}:daily:` } };
-  const proof = { batches: 0, acceptedRows: 0, rejectedRows: 0, rejectedBatches: 0, persistedDailyCount: 0, ...row.proof };
+  const proof = { batches: 0, acceptedRows: 0, rejectedRows: 0, rejectedBatches: 0, persistedDailyCount: 0, persistedTotalCents: 0, amountProofVersion: 1, ...row.proof };
   if (row.stage === "EARNINGS_BATCHES") {
     const rows = await db.analyticsIngestBatch.findMany({ where: { ...batchWhere, ...afterId(row.cursor) },
       orderBy: { id: "asc" }, take: PAGE, select: { id: true, receivedRows: true, rejectedRows: true, status: true } });
@@ -144,8 +144,9 @@ async function earningsUnit(db, job, row, now) {
   }
   if (row.stage === "EARNINGS_DAYS") {
     const rows = await db.creatorEarningsDaily.findMany({ where: { ...dailyWhere, ...afterId(row.cursor) },
-      orderBy: { id: "asc" }, take: PAGE, select: { id: true } });
+      orderBy: { id: "asc" }, take: PAGE, select: { id: true, totalCents: true } });
     proof.persistedDailyCount += rows.length;
+    for (const item of rows) proof.persistedTotalCents = sumSafe(proof.persistedTotalCents, Number(item.totalCents));
     return save(db, row, { proof, cursor: rows.length === PAGE ? nextCursor(rows) : {},
       stage: rows.length === PAGE ? row.stage : "EARNINGS_PREPARE" }, now);
   }
@@ -253,7 +254,7 @@ async function settle(db, job, row, sideEffect, now, { forceTerminal = false } =
   const complete = sideEffect?.ok === true;
   const daily = object(row.payload?.raw);
   const earningsDetail = job.jobKey === "fetch_earnings" && !complete
-    ? `EARNINGS_DAILY_INCOMPLETE: ${Number(daily.dailyObservedCount || 0)} accepted, ${Number(daily.dailyRejected || 0)} rejected; ${JSON.stringify(daily.dailyRejectionReasons || {})}; source=${String(daily.dailySource || "unknown")}`
+    ? `EARNINGS_DAILY_INCOMPLETE: ${Number(daily.dailyObservedCount || 0)} accepted, ${Number(daily.dailyRejected || 0)} rejected; ${JSON.stringify(daily.dailyRejectionReasons || {})}; source=${String(daily.dailySource || "unknown")}; chartCents=${sideEffect?.dailyLedger?.proof?.chartTotalCents ?? "unknown"}; storedCents=${sideEffect?.dailyLedger?.proof?.persistedTotalCents ?? "unknown"}`
     : null;
   const failureReason = String([sideEffect?.error, earningsDetail].filter(Boolean).join("; ") || `${job.jobKey}_partial`).slice(0, 2000);
   const protocolSuperseded = !complete && ((job.jobKey === "fetch_campaigns" && sideEffect?.completion?.protocolCurrent === false)
@@ -316,7 +317,9 @@ async function runAnalyticsPublicationUnit({ db, publicationId, claim = null }) 
     if (job.jobKey === "fetch_earnings") {
       const clock = await tx.analyticsPublicationInputClock.findUnique({ where: { jobId } });
       const revision = clock?.revision || 0n;
-      if (revision !== row.inputRevision) {
+      // Adopt already-pending publications after an upgrade by re-reading the
+      // bounded proof. Never finalize an older count-only checkpoint as money.
+      if (revision !== row.inputRevision || (row.stage !== "EARNINGS_BATCHES" && row.proof?.amountProofVersion !== 1)) {
         await save(tx, row, { inputRevision: revision, stage: "EARNINGS_BATCHES", cursor: {}, proof: {} }, now);
         return { publicationPending: true, inputChanged: true, job: { id: job.id, status: "PUBLISHING" } };
       }

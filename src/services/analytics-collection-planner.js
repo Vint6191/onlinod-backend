@@ -371,13 +371,17 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           leaseRevision: true,
         },
       });
-      // Daily rows belong to one current scan. Overlapping runs must not replace
-      // each other's rows while a server-owned publication is still verifying
-      // them. Keep the existing contract immutable; the durable demand replans
-      // any uncovered days after it publishes. This shares the planner lock.
+      // Keep a running scan immutable. Reuse only its intersection; the caller
+      // must plan both uncovered tails before acknowledging the demand. The
+      // demand cursor is not revisited after publication, so deferring an entire
+      // intersecting window here used to lose the non-overlapping days.
       const existing = active.find((job) => sameScanWindow(job, identityParams))
         || active.find((job) => overlappingScanWindow(job, identityParams)) || null;
       if (existing) {
+        const uncoveredWindows = [];
+        const existingFrom = utcDay(existing.params.scanFrom), existingTo = utcDay(existing.params.scanTo);
+        if (scanFrom < existingFrom) uncoveredWindows.push({ scanFrom, scanTo: new Date(existingFrom.getTime() - DAY_MS) });
+        if (scanTo > existingTo) uncoveredWindows.push({ scanFrom: new Date(existingTo.getTime() + DAY_MS), scanTo });
         const demand = await updatePlannedJobDemand({
           db: tx,
           job: existing,
@@ -390,6 +394,7 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
         });
         return {
           job: demand.job || existing,
+          uncoveredWindows,
           created: false,
           publish: demand.updated === true && String((demand.job || existing).status) === "SCHEDULED",
           reason: !sameScanWindow(existing, identityParams) ? "active_window_overlap_deferred"
@@ -458,7 +463,7 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
   });
 
   if (decision.publish && decision.job) publishPlannedJobAvailable(decision.job);
-  return { job: decision.job, created: decision.created, reason: decision.reason };
+  return { job: decision.job, created: decision.created, reason: decision.reason, uncoveredWindows: decision.uncoveredWindows || [] };
 }
 
 async function ensureAnalyticsWindowFreshness({
@@ -493,7 +498,10 @@ async function ensureAnalyticsWindowFreshness({
       select: { coverageDate: true, status: true, lastVerifiedAt: true, retryAfterAt: true, scanProofId: true, scanProof: { select: { status: true, proofVersion: true, requestedAt: true, observationStartedAt: true } } },
     });
   const byDay = new Map(rows.map((row) => [dateKey(row.coverageDate), row]));
-  const evaluatedDays = days.map((day) => ({ day, state: coverageState(byDay.get(dateKey(day)), day, currentNow, force) }));
+  // A user refresh requests a new verification of the selected period, even
+  // when the historical cache is within its ordinary background freshness TTL.
+  const requestedForce = force || String(reason).toUpperCase() === "INTERACTIVE_REFRESH";
+  const evaluatedDays = days.map((day) => ({ day, state: coverageState(byDay.get(dateKey(day)), day, currentNow, requestedForce) }));
   const dueDays = evaluatedDays.filter((item) => item.state.due).map((item) => item.day);
   const deferredDays = evaluatedDays.filter((item) => item.state.deferred).length;
   const staleDays = evaluatedDays.filter((item) => item.state.stale).length;
@@ -502,10 +510,13 @@ async function ensureAnalyticsWindowFreshness({
   }
   const windows = windowsForDueDays(dueDays, currentNow);
   const jobs = [];
+  const seenJobs = new Set();
   let created = 0;
   let reused = 0;
   const effectivePriority = priorityForReason(reason, priority);
-  for (const window of windows) {
+  const remaining = [...windows];
+  while (remaining.length) {
+    const window = remaining.shift();
     const result = await planWindow({
       db,
       creatorId,
@@ -517,11 +528,15 @@ async function ensureAnalyticsWindowFreshness({
       priority: effectivePriority,
       now: currentNow,
     });
-    jobs.push(result.job);
-    if (result.created) created += 1;
-    else reused += 1;
+    remaining.push(...result.uncoveredWindows);
+    if (result.job && !seenJobs.has(result.job.id)) {
+      seenJobs.add(result.job.id);
+      jobs.push(result.job);
+      if (result.created) created += 1;
+      else reused += 1;
+    }
   }
-  return { ok: true, displayRangeKey, startDay: from, endDay: to, dueDays: dueDays.length, deferredDays, staleDays, windows: windows.length, created, reused, jobs, fresh: false };
+  return { ok: true, displayRangeKey, startDay: from, endDay: to, dueDays: dueDays.length, deferredDays, staleDays, windows: jobs.length, created, reused, jobs, fresh: false };
 }
 
 async function ensureAnalyticsFreshness({

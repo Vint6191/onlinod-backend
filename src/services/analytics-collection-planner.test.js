@@ -17,6 +17,52 @@ function isoDay(value) {
   return new Date(value).toISOString().slice(0, 10);
 }
 
+function addEarningsJobs(db, initial = []) {
+  const rows = initial.map(row => structuredClone(row));
+  db.jobInstance = {
+    findMany: async ({ where }) => rows.filter(row => row.creatorId === where.creatorId && row.agencyId === where.agencyId && where.status.in.includes(row.status)),
+    findUnique: async ({ where }) => rows.find(row => where.id ? row.id === where.id : row.idempotencyKey === where.idempotencyKey) || null,
+    createMany: async ({ data }) => {
+      let count = 0;
+      for (const row of data) if (!rows.some(old => old.idempotencyKey === row.idempotencyKey)) {
+        rows.push({ id: `planned-${rows.length}`, ...row }); count++;
+      }
+      return { count };
+    },
+    updateMany: async ({ where, data }) => {
+      const row = rows.find(row => row.id === where.id);
+      if (!row) return { count: 0 };
+      Object.assign(row, data); return { count: 1 };
+    },
+  };
+  return rows;
+}
+
+test('90-day refresh schedules every uncovered day around an immutable active week, even with fresh cached proof', async () => {
+  const now = new Date('2026-10-15T12:00:00Z'), from = new Date('2026-07-18'), to = new Date('2026-10-15');
+  for (const status of ['SCHEDULED', 'CLAIMED', 'PUBLISHING']) {
+    const active = { id: 'active', creatorId: 'c', agencyId: 'a', jobKey: 'fetch_earnings', status, priority: 100, leaseRevision: 3,
+      params: { analyticsContractVersion: 1, sourceTimezone: 'UTC', scanFrom: '2026-07-27', scanTo: '2026-08-02' } };
+    const db = { $executeRawUnsafe: async () => 1 };
+    db.$transaction = async fn => fn({ ...db, $transaction: undefined });
+    const rows = addEarningsJobs(db, [active]);
+    const coverageRows = daysInclusive(from, to).map(coverageDate => ({ coverageDate, status: +coverageDate === +to ? 'PARTIAL' : 'COMPLETE',
+      lastVerifiedAt: now, scanProof: { status: 'COMMITTED', proofVersion: 2, requestedAt: now } }));
+    const input = { db, creatorId: 'c', agencyId: 'a', startDay: from, endDay: to, now, coverageRows };
+    assert.equal((await planner.ensureAnalyticsWindowFreshness({ ...input, reason: 'RECURRING' })).dueDays, 0);
+    const planned = await planner.ensureAnalyticsWindowFreshness({ ...input, reason: 'INTERACTIVE_REFRESH' });
+    assert.equal(planned.dueDays, 90);
+    for (const day of daysInclusive(from, to).map(isoDay)) {
+      const matches = rows.filter(row => row.params.scanFrom <= day && row.params.scanTo >= day);
+      assert.equal(matches.length, 1, `${status}: exactly one job must cover ${day}`);
+    }
+    assert.deepEqual(rows.find(row => row.id === 'active').params, active.params);
+    const again = await planner.ensureAnalyticsWindowFreshness({ ...input, reason: 'INTERACTIVE_REFRESH' });
+    assert.equal(again.created, 0);
+    assert.equal(new Set(again.jobs.map(row => row.id)).size, again.jobs.length);
+  }
+});
+
 for (const [label, from, to] of [['covered', '2026-09-07', '2026-09-13'], ['partially overlapping', '2026-08-30', '2026-09-04']]) {
   test(`${label} earnings demand waits for an active scan instead of invalidating its publication`, async () => {
     for (const status of ['SCHEDULED', 'CLAIMED', 'PUBLISHING']) {
@@ -609,6 +655,7 @@ test("Home demand yields bounded slices and resumes its durable cursor across th
     },
   };
   addDemandAuthority(db);
+  addEarningsJobs(db);
   const store = addDemandStore(db);
   const queued = await planner.enqueueAgencyAnalyticsFreshnessDemand({ db, agencyId: "agency-1", rangeKey: "7d", includePrevious: true, ...DEMAND_ACTOR, now });
   for (const [index, count] of [25, 25, 5].entries()) {
@@ -618,8 +665,8 @@ test("Home demand yields bounded slices and resumes its durable cursor across th
     assert.equal(result.demands, 1);
     assert.equal(result.creators, count);
     assert.equal(result.pages, 1);
-    assert.equal(result.created, 0);
-    assert.equal(result.dueDays, 0);
+    assert.equal(result.created, 4 * count);
+    assert.equal(result.dueDays, 14 * count);
     assert.equal(result.yielded, index < 2 ? 1 : 0);
     const progress = store.get(queued.key);
     assert.equal(progress.cursorCreatorId, creators[Math.min((index + 1) * 25, 55) - 1].id);
@@ -829,6 +876,7 @@ function boundedDemandFixture(count = 10, member = {}) {
     } },
   };
   const store = addDemandStore(db);
+  addEarningsJobs(db);
   addDemandAuthority(db, member);
   return { db, store, now, creators, reads, covered };
 }
@@ -861,7 +909,12 @@ test("Home demand failure after one successful creator preserves progress and re
   const f = boundedDemandFixture(3);
   const freshCoverage = f.db.analyticsCoverage.findMany;
   f.db.analyticsCoverage.findMany = async (args) => (await freshCoverage(args)).filter((row) => row.creatorId === "creator-000");
-  f.db.jobInstance = { findMany: async () => { throw Object.assign(new Error("connection reset during planning"), { code: "P1001" }); } };
+  const readJobs = f.db.jobInstance.findMany;
+  let fail = true;
+  f.db.jobInstance.findMany = async args => {
+    if (fail && args.where.creatorId !== 'creator-000') throw Object.assign(new Error("connection reset during planning"), { code: "P1001" });
+    return readJobs(args);
+  };
   const queued = await planner.enqueueAgencyAnalyticsFreshnessDemand({ db: f.db, agencyId: "agency-1", ...DEMAND_ACTOR, now: f.now, rangeKey: "today", includePrevious: false });
   const result = await planner.runAnalyticsCollectionDemandSweep({ db: f.db, now: f.now });
   assert.equal(result.ok, false);
@@ -869,6 +922,7 @@ test("Home demand failure after one successful creator preserves progress and re
   assert.equal(failed.cursorCreatorId, "creator-000");
   assert.equal(failed.lastErrorCode, "P1001");
   f.db.analyticsCoverage.findMany = freshCoverage;
+  fail = false;
   const retry = await planner.runAnalyticsCollectionDemandSweep({ db: f.db, now: new Date(f.now.getTime() + 31_000) });
   assert.equal(retry.ok, true);
   assert.equal(retry.creators, 2);
