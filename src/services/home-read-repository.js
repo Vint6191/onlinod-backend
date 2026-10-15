@@ -20,11 +20,11 @@ function revenueSql(source = 'visible') {
   return `, periods AS (SELECT 0 AS period,($6::timestamptz AT TIME ZONE 'UTC')::date AS start_day,($7::timestamptz AT TIME ZONE 'UTC')::date AS end_day
     UNION ALL SELECT 1,($8::timestamptz AT TIME ZONE 'UTC')::date,($9::timestamptz AT TIME ZONE 'UTC')::date),
   daily AS MATERIALIZED (
-    SELECT d."creatorId",r.period,d."date",d."totalCents",d."collectedAt",${earningsObservationSql()} AS observed,
+    SELECT d."creatorId",r.period,d."date",d."totalCents",d."hourlyPoints",d."collectedAt",${earningsObservationSql()} AS observed,
       (${earningsObservationSql()}<=($11::timestamptz AT TIME ZONE 'UTC')+interval '5 minutes'
         AND ${earningsObservationSql()}>=($11::timestamptz AT TIME ZONE 'UTC')-(CASE WHEN d."date"=($10::timestamptz AT TIME ZONE 'UTC')::date THEN ${CURRENT_DAY_FRESHNESS_MS}
           WHEN d."date">=($10::timestamptz AT TIME ZONE 'UTC')::date-30 THEN ${RECENT_CLOSED_FRESHNESS_MS} ELSE ${HISTORICAL_FRESHNESS_MS} END)*interval '1 millisecond') AS fresh
-    FROM ${source} c JOIN "CreatorEarningsDaily" d ON d."creatorId"=c."id" AND d."agencyId"=$1 AND d."sourceTimezone"='UTC'
+    FROM ${source} c JOIN "CreatorEarningsPublishedDay" d ON d."creatorId"=c."id" AND d."agencyId"=$1 AND d."sourceTimezone"='UTC'
       JOIN periods r ON d."date" BETWEEN r.start_day AND r.end_day
       ${publishedEarningsJoins()}
     WHERE v."status"='COMPLETE' OR (d."date"=($10::timestamptz AT TIME ZONE 'UTC')::date AND v."status"='PARTIAL')
@@ -77,11 +77,18 @@ async function readHomeTotals(input) {
     , totals AS (SELECT period,COUNT(*) AS total,COUNT(*) FILTER (WHERE usable) AS reporting,
       COUNT(*) FILTER (WHERE usable AND NOT fresh) AS stale,SUM(cents) FILTER (WHERE usable) AS cents
       FROM facts GROUP BY period), points AS (SELECT d."date",SUM(d."totalCents") AS cents FROM daily d
-      JOIN facts f ON f."id"=d."creatorId" AND f.period=d.period AND f.usable WHERE d.period=0 GROUP BY d."date")
+      JOIN facts f ON f."id"=d."creatorId" AND f.period=d.period AND f.usable WHERE d.period=0 GROUP BY d."date"),
+    hourly AS (SELECT h->>'label' AS label,SUM((h->>'valueCents')::bigint) AS cents
+      FROM daily d CROSS JOIN LATERAL jsonb_array_elements(d."hourlyPoints") h WHERE d.period=0 GROUP BY h->>'label'),
+    hourly_ready AS (SELECT ($6::timestamptz=$7::timestamptz AND COUNT(*)>0
+      AND bool_and("hourlyPoints" IS NOT NULL OR "totalCents"=0)
+      AND bool_or("hourlyPoints" IS NOT NULL)) AS ready FROM daily WHERE period=0)
     SELECT COALESCE(c.total,0) AS total,COALESCE(c.reporting,0) AS reporting,COALESCE(c.stale,0) AS stale,
       c.cents,COALESCE(p.total,0) AS previous_total,COALESCE(p.reporting,0) AS previous_reporting,
       COALESCE(p.stale,0) AS previous_stale,p.cents AS previous_cents,(SELECT COUNT(*) FROM pending) AS pending,
-      CASE WHEN c.total=c.reporting THEN (SELECT jsonb_agg(jsonb_build_object('label',to_char("date",'YYYY-MM-DD'),'valueCents',cents) ORDER BY "date") FROM points)
+      CASE WHEN c.total=c.reporting AND (SELECT ready FROM hourly_ready) THEN
+        (SELECT jsonb_agg(jsonb_build_object('label',label,'valueCents',cents) ORDER BY label) FROM hourly)
+      WHEN c.total=c.reporting THEN (SELECT jsonb_agg(jsonb_build_object('label',to_char("date",'YYYY-MM-DD'),'valueCents',cents) ORDER BY "date") FROM points)
       ELSE '[]'::jsonb END AS points FROM (SELECT 1) one LEFT JOIN totals c ON c.period=0 LEFT JOIN totals p ON p.period=1`, ...revenueParams(input));
   const total = number(row.total), reporting = number(row.reporting), stale = number(row.stale);
   const complete = total === reporting, previousComplete = total === number(row.previous_total) && total === number(row.previous_reporting);

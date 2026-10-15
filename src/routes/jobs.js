@@ -68,10 +68,12 @@ function validationError(res, error) {
 
 function leaseError(res, error) {
   if (error instanceof JobLeaseError || error instanceof CampaignTraversalError || error instanceof FinancialReceiptError) {
+    if (error.retryAfterMs) res.set("Retry-After", String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
     return res.status(error.status || 409).json({
       ok: false,
       code: error.code,
       error: error.message,
+      ...(error.retryAfterMs ? { retryAfterMs: error.retryAfterMs, retryable: error.retryable === true } : {}),
     });
   }
   throw error;

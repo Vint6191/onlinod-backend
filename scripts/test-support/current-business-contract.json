@@ -21869,7 +21869,7 @@
       "data_type": "character varying",
       "udt_name": "varchar",
       "is_nullable": "NO",
-      "column_default": "'phase3_provider_capacity_topology_v1_a16'::character varying"
+      "column_default": "'creator_provider_capacity_v2'::character varying"
     },
     {
       "table": "ProviderCapacityDebtState",
@@ -21877,7 +21877,7 @@
       "data_type": "character varying",
       "udt_name": "varchar",
       "is_nullable": "NO",
-      "column_default": "'of-global'::character varying"
+      "column_default": "'of-creator'::character varying"
     },
     {
       "table": "ProviderCapacityDebtState",
@@ -21885,7 +21885,7 @@
       "data_type": "character varying",
       "udt_name": "varchar",
       "is_nullable": "NO",
-      "column_default": "'FLEET_GLOBAL'::character varying"
+      "column_default": "'CREATOR_PARALLEL'::character varying"
     },
     {
       "table": "ProviderCapacityDebtState",
@@ -21893,7 +21893,7 @@
       "data_type": "integer",
       "udt_name": "int4",
       "is_nullable": "NO",
-      "column_default": "1"
+      "column_default": "0"
     },
     {
       "table": "ProviderCapacityDebtState",
@@ -21901,7 +21901,7 @@
       "data_type": "boolean",
       "udt_name": "bool",
       "is_nullable": "NO",
-      "column_default": "false"
+      "column_default": "true"
     },
     {
       "table": "ProviderCapacityDebtState",

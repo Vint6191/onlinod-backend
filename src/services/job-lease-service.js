@@ -677,6 +677,11 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       if (!readyBindings.length) return null;
       const attemptClaimData = { ...claimData, claimedAt: claimNow,
         leaseUntil: new Date(claimNow.getTime() + leaseDuration(leaseMs)), startedAt: candidate.startedAt || claimNow };
+      if (candidate.jobKey === "fetch_earnings" && !candidate.continuation) {
+        // Freshness starts at actual collection, not while a job waits behind
+        // history. Keep authorityRequestedAt unchanged for stale-result fencing.
+        attemptClaimData.params = { ...object(candidate.params), analyticsObservationStartedAt: claimNow.toISOString() };
+      }
       if (needsNotificationRepairRotation(candidate)) {
         attemptClaimData.params = notificationRepairParams(candidate, claimNow);
         attemptClaimData.continuation = null;
@@ -753,7 +758,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   }
   return { job: null, reason: capacityBlockedIds.length ? "campaign-directory-capacity" : (fanRefreshGlobalBlocked || fanRefreshBlockedCreatorIds.length ? "fan-data-refresh-capacity" : "race-lost") };
 }
-async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired = false, db = prisma, lock = false }) {
+async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired = false, db = prisma, lock = false, nowait = false }) {
   const { device } = await requireOwnedDevice({ userId, deviceId, db });
   let job = await db.jobInstance.findUnique({ where: { id: jobId } });
   if (!job) throw new JobLeaseError("JOB_NOT_FOUND", "Job not found", 404);
@@ -769,7 +774,7 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   // Authority/member lock precedes the JobInstance lock. Reading time before
   // either wait would allow an already-expired lease to pass the mutation CAS.
   if (lock && typeof db.$queryRawUnsafe === "function") {
-    const rows = await db.$queryRawUnsafe('SELECT * FROM "JobInstance" WHERE "id"=$1 FOR UPDATE', jobId);
+    const rows = await db.$queryRawUnsafe('SELECT * FROM "JobInstance" WHERE "id"=$1 FOR UPDATE' + (nowait ? ' NOWAIT' : ''), jobId);
     job = rows?.[0];
     if (!job) throw new JobLeaseError("JOB_NOT_FOUND", "Job not found", 404);
   }
@@ -786,10 +791,10 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   return job;
 }
 
-async function leaseCommit(input, work, { profile = "JOB_CHUNK", allowExpired = false } = {}) {
+async function leaseCommit(input, work, { profile = "JOB_CHUNK", allowExpired = false, nowait = false } = {}) {
   try {
     const outcome = await runRootCommit(prisma, async ({ tx }) => {
-      const job = await requireLease({ ...input, db: tx, lock: true, allowExpired });
+      const job = await requireLease({ ...input, db: tx, lock: true, allowExpired, nowait });
       if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
       if (job.jobKey === "financial_transactions_scan") await require("./financial-receipt-authority").enter(tx);
       const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
@@ -810,7 +815,13 @@ async function leaseCommit(input, work, { profile = "JOB_CHUNK", allowExpired = 
     if (outcome?.notificationRepairRotated) throw new JobLeaseError("JOB_LEASE_STALE", "Notification repair moved to a new collection generation", 409);
     return outcome;
   } catch (error) {
-    if (error?.code === "JOB_LEASE_CONFLICT") throw new JobLeaseError(error.code, error.message, 409);
+    // The root has rolled back. Lock contention is temporary unavailability,
+    // not loss of lease ownership and not an ambiguous commit to replay blindly.
+    if (error?.code === "JOB_LEASE_CONFLICT" || (!isCreatorLifecycleContention(error)
+      && (error?.code === "55P03" || (error?.code === "P2010" && error?.meta?.code === "55P03")))) {
+      throw Object.assign(new JobLeaseError("JOB_LEASE_BUSY", "Job update is busy; retry the same lease mutation", 503),
+        { retryable: true, retryAfterMs: 1000 });
+    }
     throw error;
   }
 }
@@ -970,7 +981,7 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
     }
     const updated = await tx.jobInstance.findUnique({ where: { id: job.id } });
     return { superseded: false, updated };
-  });
+  }, { nowait: true });
 
   if (outcome.superseded) throw new JobLeaseError("JOB_SUPERSEDED", "Notification full scan was superseded by existing history", 409);
   const updated = outcome.updated;

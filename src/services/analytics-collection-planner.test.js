@@ -88,6 +88,45 @@ function daysInclusive(start, end) {
   return rows;
 }
 
+test('Home manual refresh reuses today across minutes, leaves fresh history alone and preserves retry delay', async () => {
+  const now = new Date('2026-10-15T12:00:00Z');
+  const window = planner.operationalFreshnessWindow(now);
+  const coverageRows = daysInclusive(window.startDay, window.endDay).map(coverageDate => ({ coverageDate,
+    status: +coverageDate === +window.endDay ? 'PARTIAL' : 'COMPLETE', lastVerifiedAt: now,
+    scanProof: { status: 'COMMITTED', proofVersion: 2, requestedAt: now } }));
+  const db = { $executeRawUnsafe: async () => 1 };
+  db.$transaction = async fn => fn({ ...db, $transaction: undefined });
+  const jobs = addEarningsJobs(db);
+  const input = { db, creatorId: 'c', agencyId: 'a', now, coverageRows, reason: 'HOME_INTERACTIVE_REFRESH' };
+  const first = await planner.ensureOperationalAnalyticsFreshness(input);
+  assert.equal(first.dueDays, 1); assert.equal(jobs.length, 1);
+  const originalId = first.jobs[0].id;
+  for (const minute of [2, 3, 8]) {
+    jobs[0].status = 'DONE';
+    const next = await planner.ensureOperationalAnalyticsFreshness({ ...input, now: new Date(+now + minute * 60_000) });
+    assert.equal(next.jobs[0].id, originalId); assert.equal(jobs.length, 1);
+  }
+  const until = new Date(+now + 30 * 60_000);
+  jobs[0].nextRunAt = until;
+  await planner.ensureOperationalAnalyticsFreshness(input);
+  assert.deepEqual(jobs[0].nextRunAt, until);
+  jobs[0].status = 'FAILED'; coverageRows.at(-1).retryAfterAt = until;
+  const deferred = await planner.ensureOperationalAnalyticsFreshness(input);
+  assert.equal(deferred.jobs.length, 0);
+});
+
+test('publication completing while planner waits prevents reopening a fresh terminal window', async () => {
+  const now = new Date('2026-10-15T12:00:00Z'), day = new Date('2026-10-15');
+  const db = { $executeRawUnsafe: async () => 1,
+    analyticsCoverage: { findMany: async () => [{ coverageDate: day, status: 'PARTIAL', lastVerifiedAt: now,
+      scanProof: { status: 'COMMITTED', proofVersion: 2, requestedAt: now } }] } };
+  db.$transaction = async fn => fn({ ...db, $transaction: undefined });
+  const jobs = addEarningsJobs(db);
+  const result = await planner.ensureAnalyticsWindowFreshness({ db, creatorId: 'c', agencyId: 'a',
+    startDay: day, endDay: day, now, coverageRows: [] });
+  assert.equal(result.jobs.length, 0); assert.equal(jobs.length, 0);
+});
+
 test('one Home collection covers 180 unique days; fresh periods reuse proof and only today is due a minute later', async () => {
   const now = new Date('2026-10-15T12:00:00Z');
   const { startDay, endDay } = planner.operationalFreshnessWindow(now);
@@ -139,9 +178,9 @@ test('Home tabs share one member-fenced demand and automatic heartbeats do not r
   }
   const force = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, mode: 'manual' });
   assert.equal(force.requestRevision, 2, 'manual refresh upgrades an automatic freshness-only request');
-  assert.equal(store.get(first.key).reason, 'INTERACTIVE_REFRESH');
+  assert.equal(store.get(first.key).reason, 'HOME_INTERACTIVE_REFRESH');
   const poll = await planner.enqueueHomeAnalyticsFreshnessDemand(options);
-  assert.equal(poll.requestRevision, 2); assert.equal(store.get(first.key).reason, 'INTERACTIVE_REFRESH');
+  assert.equal(poll.requestRevision, 2); assert.equal(store.get(first.key).reason, 'HOME_INTERACTIVE_REFRESH');
   const again = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, mode: 'manual' });
   assert.equal(again.requestRevision, 2, 'another tab/device must not restart the same forced pass');
   const changedAccess = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, requestedAccessEpoch: 8 });
@@ -946,8 +985,9 @@ function boundedDemandFixture(count = 10, member = {}) {
       return creators.filter((c) => c.agencyId === where.agencyId && (!where.id?.in || where.id.in.includes(c.id)) && (!where.id?.gt || c.id > where.id.gt)).slice(0, take);
     } },
     analyticsCoverage: { findMany: async ({ where }) => {
-      covered.push(...where.creatorId.in);
-      return where.creatorId.in.flatMap((creatorId) => daysInclusive(where.coverageDate.gte, where.coverageDate.lte).map((coverageDate) => ({
+      const ids = typeof where.creatorId === "string" ? [where.creatorId] : where.creatorId.in;
+      if (typeof where.creatorId !== "string") covered.push(...ids);
+      return ids.flatMap((creatorId) => daysInclusive(where.coverageDate.gte, where.coverageDate.lte).map((coverageDate) => ({
         creatorId, coverageDate, status: "COMPLETE", lastVerifiedAt: now,
         scanProofId: "committed", scanProof: { status: "COMMITTED", proofVersion: 2, requestedAt: now },
       })));

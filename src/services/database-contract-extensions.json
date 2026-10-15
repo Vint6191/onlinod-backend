@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v3_creator_provider_gate",
+  "version": "nod_current_v4_earnings_publication",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -8,6 +8,10 @@
     {
       "migration": "20261015000000_creator_provider_gate",
       "checksum": "f954403da8a2c3b070b8380c09f60d6f6bfe243791a913921abef654236b699d"
+    },
+    {
+      "migration": "20261016000000_earnings_published_snapshot",
+      "checksum": "84e5309aa6b12475f594de711032762d0956191710aa06bcc1434ec88acc5862"
     }
   ],
   "extension": {
@@ -22,6 +26,10 @@
       },
       {
         "name": "ProviderCapacityCreatorBucket",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEarningsPublishedDay",
         "persistence": "p"
       }
     ],
@@ -537,6 +545,190 @@
         "udt_name": "bool",
         "is_nullable": "NO",
         "column_default": "true"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "date",
+        "data_type": "date",
+        "udt_name": "date",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceTimezone",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'UTC'::text"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "subscriptionsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "messagesCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "tipsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "postsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "streamsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "referralsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "totalCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "currency",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'USD'::text"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceUpdatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceScanRunId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceScanRequestedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "scanProofId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "collectedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "coverageStatus",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "lastVerifiedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "hourlyPoints",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
       }
     ],
     "enums": [],
@@ -667,6 +859,54 @@
         "deferrable": false,
         "deferred": false,
         "definition": "CHECK ((((\"topologyId\")::text = 'of-creator'::text) AND ((\"topologyScope\")::text = 'CREATOR_PARALLEL'::text) AND (\"topologyShardCount\" >= 0) AND (\"topologyShardingAllowed\" = true) AND ((\"controlMode\")::text = ANY ((ARRAY['NORMAL'::character varying, 'OVERLOAD_PROTECTED'::character varying, 'CONSERVATIVE'::character varying])::text[])) AND (\"campaignDirectoryAdmissionBudgetCalls\" >= 1) AND (\"campaignDirectoryGuaranteedCallsPerSweep\" >= 1)))"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_coverageStatus_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"coverageStatus\" = ANY (ARRAY['COMPLETE'::text, 'PARTIAL'::text])))"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_hourly_size_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"hourlyPoints\" IS NULL) OR ((jsonb_typeof(\"hourlyPoints\") = 'array'::text) AND (jsonb_array_length(\"hourlyPoints\") <= 24))))"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_money_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"totalCents\" >= 0) AND (\"sourceTimezone\" = 'UTC'::text)))"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_scanProofId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"scanProofId\") REFERENCES \"AnalyticsScanProof\"(id) ON UPDATE CASCADE"
       }
     ],
     "indexes": [
@@ -757,6 +997,60 @@
         "unique": true,
         "keys": "1 2",
         "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_agencyId_creatorId_date_idx",
+        "unique": false,
+        "keys": "2 3 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_creatorId_date_idx",
+        "unique": false,
+        "keys": "3 4",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_creatorId_date_sourceTimezone_key",
+        "unique": true,
+        "keys": "3 4 5",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_creatorId_sourceScanRunId_idx",
+        "unique": false,
+        "keys": "3 15",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_scanProofId_idx",
+        "unique": false,
+        "keys": "17",
+        "options": "0",
         "expressions": null,
         "predicate": null
       }

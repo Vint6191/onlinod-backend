@@ -160,6 +160,15 @@ function notificationConflictFixture() {
   return item;
 }
 
+test('exhausted transaction conflicts are temporary busy responses, not false loss of job ownership', async () => {
+  const item=fixture(); let attempts=0;
+  item.db.$transaction=async()=>{attempts++;throw Object.assign(new Error('write conflict'),{code:'P2034'});};
+  const {renewLease}=loadService(item);
+  await assert.rejects(renewLease({jobId:item.job.id,userId:'user-1',deviceId:'device-1',leaseToken:item.token,leaseRevision:3,leaseMs:60000}),
+    error=>error.code==='JOB_LEASE_BUSY'&&error.status===503&&error.retryable===true);
+  assert.equal(attempts,3); assert.equal(item.update(),null);
+});
+
 test("notification conflict without a partial completion marker rotates only after page rollback", async () => {
   const item = notificationConflictFixture();
   const { progressJob } = loadService(item);
@@ -1856,5 +1865,8 @@ for (const specific of [true, false]) test(`read lease lifecycle contention beco
     const result = await acquireJobFanObservationReadLease(input);
     assert.equal(rolledBack, true); assert.equal(result.acquired, false); assert.equal(result.retryAfterMs, 1000);
     assert.equal(result.token, undefined); assert.equal(item.job.status, 'CLAIMED');
-  } else await assert.rejects(() => acquireJobFanObservationReadLease(input), e => e === error);
+  } else {
+    await assert.rejects(() => acquireJobFanObservationReadLease(input), e => e.code === "JOB_LEASE_BUSY" && e.status === 503 && e.retryable && e.retryAfterMs === 1000);
+    assert.equal(rolledBack, true);
+  }
 });

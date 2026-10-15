@@ -558,6 +558,7 @@ model CreatorAccount {
   paidSubscriptions                     CreatorPaidSubscription[]
   postLikes                             CreatorPostLike[]
   postComments                          CreatorPostComment[]
+  earningsPublishedDays                 CreatorEarningsPublishedDay[]
   earningsDaily                         CreatorEarningsDaily[]
   campaigns                             CreatorCampaign[]
   campaignMemberships                   CreatorCampaignFan[]
@@ -654,7 +655,7 @@ model CustomOrder {
 
   agency               Agency                    @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator              CreatorAccount            @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
-  createdByMember      AgencyMember              @relation(fields: [createdByMemberId], references: [id], onDelete: Restrict)
+  createdByMember      AgencyMember              @relation(fields: [createdByMemberId], references: [id], onDelete: NoAction)
   contentSubmissions   CustomContentSubmission[]
   contentLibraryAssets CreatorMediaAsset[]
   deliveryReceipts     CustomDeliveryReceipt[]
@@ -2402,6 +2403,7 @@ model AnalyticsScanProof {
   creator      CreatorAccount         @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   coverageRows AnalyticsCoverage[]
   earningsRows CreatorEarningsDaily[]
+  publishedEarningsRows CreatorEarningsPublishedDay[]
 
   @@unique([creatorId, dataType, scanRunId], map: "AnalyticsScanProof_creator_type_run_key")
   @@index([agencyId, creatorId, dataType, committedAt], map: "AnalyticsScanProof_agency_creator_type_commit_idx")
@@ -3183,6 +3185,43 @@ model CreatorEarningsDaily {
 
 }
 
+// Stable, verified read model. Scanner writes remain in CreatorEarningsDaily.
+model CreatorEarningsPublishedDay {
+  id                    String    @id
+  agencyId              String
+  creatorId             String
+  date                  DateTime  @db.Date
+  sourceTimezone        String    @default("UTC")
+  subscriptionsCents    Int?
+  messagesCents         Int?
+  tipsCents             Int?
+  postsCents            Int?
+  streamsCents          Int?
+  referralsCents        Int?
+  totalCents            Int
+  currency              String    @default("USD")
+  sourceUpdatedAt       DateTime?
+  sourceScanRunId       String?
+  sourceScanRequestedAt DateTime?
+  scanProofId           String
+  collectedAt           DateTime  @default(now())
+  coverageStatus        String
+  lastVerifiedAt        DateTime?
+  hourlyPoints          Json?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  creator      CreatorAccount      @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  scanProof    AnalyticsScanProof @relation(fields: [scanProofId], references: [id], onDelete: NoAction)
+
+  @@unique([creatorId, date, sourceTimezone])
+  @@index([agencyId, creatorId, date])
+  @@index([creatorId, date])
+  @@index([creatorId, sourceScanRunId])
+  @@index([scanProofId])
+
+}
+
 model CreatorCampaign {
   id                             String    @id @default(cuid())
   agencyId                       String
@@ -3815,7 +3854,7 @@ model TeamShift {
   updatedAt         DateTime  @updatedAt
 
   agency   Agency             @relation(fields: [agencyId], references: [id], onDelete: Cascade)
-  member   AgencyMember       @relation(fields: [memberId], references: [id], onDelete: Restrict)
+  member   AgencyMember       @relation(fields: [memberId], references: [id], onDelete: NoAction)
   creators TeamShiftCreator[]
 
   @@index([agencyId, startsAt])
@@ -5754,7 +5793,7 @@ model AdminCommandAudit {
   reason        String
   detail        Json
   createdAt     DateTime @default(now())
-  command       AdminCommand @relation(fields: [commandId], references: [id], onDelete: Restrict)
+  command       AdminCommand @relation(fields: [commandId], references: [id], onDelete: NoAction)
 
   @@unique([commandId, sequence])
   @@index([scopeAgencyId, createdAt, id])

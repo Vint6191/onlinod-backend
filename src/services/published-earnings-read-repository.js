@@ -5,17 +5,16 @@ const { earningsObservationSql } = require("./analytics-observation-time");
 const CREATOR_BATCH = 250;
 const DAY = 86400000;
 
-// These aliases are fixed by source code, never accepted from an API. Facts,
-// coverage and durable proof must describe the SAME day and scan. Operational
+// These aliases are fixed by source code, never accepted from an API. Published
+// facts and durable proof describe the SAME day and scan. Mutable collection
+// coverage must not invalidate the previous published snapshot. Operational
 // jobs and ingest batches are deliberately absent: retention may remove them.
 function publishedEarningsJoins() {
-  return `JOIN "AnalyticsCoverage" v ON v."creatorId"=d."creatorId" AND v."agencyId"=d."agencyId"
-      AND v."dataType"='EARNINGS' AND v."sourceTimezone"='UTC' AND v."coverageDate"=d."date"
-      AND v."scanProofId"=d."scanProofId"
-    JOIN "AnalyticsScanProof" p ON p."id"=d."scanProofId" AND p."creatorId"=d."creatorId" AND p."agencyId"=d."agencyId"
+  return `JOIN "AnalyticsScanProof" p ON p."id"=d."scanProofId" AND p."creatorId"=d."creatorId" AND p."agencyId"=d."agencyId"
       AND p."dataType"='EARNINGS' AND p."sourceTimezone"='UTC' AND p."status"='COMMITTED'
       AND p."proofVersion"=2 AND p."committedAt" IS NOT NULL
-      AND p."scanRunId"=d."sourceScanRunId" AND d."date" BETWEEN p."scanFrom" AND p."scanTo"`;
+      AND p."scanRunId"=d."sourceScanRunId" AND d."date" BETWEEN p."scanFrom" AND p."scanTo"
+    CROSS JOIN LATERAL (SELECT d."coverageStatus" AS status,d."lastVerifiedAt" AS "lastVerifiedAt") v`;
 }
 function windowDays(from, to) {
   const count = (new Date(to)-new Date(from))/DAY + 1;
@@ -35,15 +34,15 @@ async function readPublishedEarningsDays({ db, creatorId, from, to, now }) {
   const today = new Date(now.toISOString().slice(0, 10));
   const rows = await db.$queryRawUnsafe(`/* published_earnings_days_v1 */
     WITH published AS MATERIALIZED (
-      SELECT d.*,${earningsObservationSql()} AS "publishedObservedAt" FROM "CreatorEarningsDaily" d ${publishedEarningsJoins()}
+      SELECT d.*,${earningsObservationSql()} AS "publishedObservedAt" FROM "CreatorEarningsPublishedDay" d ${publishedEarningsJoins()}
       WHERE d."creatorId"=$1 AND d."sourceTimezone"='UTC' AND d."date" BETWEEN ($2::timestamptz AT TIME ZONE 'UTC')::date AND ($3::timestamptz AT TIME ZONE 'UTC')::date
         AND (v."status"='COMPLETE' OR (d."date"=($4::timestamptz AT TIME ZONE 'UTC')::date AND v."status"='PARTIAL'))
     )
-    SELECT d.*,c."coverageDate" AS "stateDate",c."status" AS "coverageStatus",d."publishedObservedAt" AS "coverageVerifiedAt",
+    SELECT d.*,days.date AS "stateDate",COALESCE(d."coverageStatus",c."status"::text,'MISSING') AS "coverageStatus",d."publishedObservedAt" AS "coverageVerifiedAt",
       c."retryAfterAt" AS "coverageRetryAfterAt",c."lastErrorCode" AS "coverageErrorCode"
-    FROM "AnalyticsCoverage" c LEFT JOIN published d ON d."creatorId"=c."creatorId" AND d."date"=c."coverageDate"
-    WHERE c."creatorId"=$1 AND c."dataType"='EARNINGS' AND c."sourceTimezone"='UTC'
-      AND c."coverageDate" BETWEEN ($2::timestamptz AT TIME ZONE 'UTC')::date AND ($3::timestamptz AT TIME ZONE 'UTC')::date ORDER BY c."coverageDate"`, creatorId, from, to, today);
+    FROM generate_series(($2::timestamptz AT TIME ZONE 'UTC'),($3::timestamptz AT TIME ZONE 'UTC'),interval '1 day') days(date)
+    LEFT JOIN "AnalyticsCoverage" c ON c."creatorId"=$1 AND c."dataType"='EARNINGS' AND c."sourceTimezone"='UTC' AND c."coverageDate"=days.date
+    LEFT JOIN published d ON d."date"=days.date ORDER BY days.date`, creatorId, from, to, today);
   // Retry/partial hints survive even when amounts are unavailable. They can
   // never certify money: only the joined published row supplies proof status.
   return rows.map(({ stateDate, coverageStatus, coverageVerifiedAt, coverageRetryAfterAt, coverageErrorCode, publishedObservedAt, ...daily }) => ({
@@ -67,7 +66,7 @@ async function readPublishedEarningsAggregates({ db, creatorIds, from, to, now, 
       SELECT d."creatorId",COUNT(*)::bigint AS days,SUM(d."totalCents")::bigint AS cents,
         MAX(d."collectedAt") AS captured,
         COUNT(*) FILTER (WHERE ${earningsObservationSql()} BETWEEN ($4::timestamptz AT TIME ZONE 'UTC') AND ($5::timestamptz AT TIME ZONE 'UTC'))::bigint AS fresh
-      FROM "CreatorEarningsDaily" d ${publishedEarningsJoins()}
+      FROM "CreatorEarningsPublishedDay" d ${publishedEarningsJoins()}
       WHERE d."creatorId"=ANY($1::text[]) AND d."sourceTimezone"='UTC' AND d."date" BETWEEN ($2::timestamptz AT TIME ZONE 'UTC')::date AND ($3::timestamptz AT TIME ZONE 'UTC')::date
         AND v."status"='COMPLETE'
       GROUP BY d."creatorId"`, ids.slice(offset, offset+CREATOR_BATCH), from, to, freshAfter, freshBefore);

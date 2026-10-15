@@ -40,11 +40,11 @@ const CAMPAIGN_FRONTIER_SCHEDULING_VERSION = 1;
 const CAMPAIGN_DIRECTORY_REUSE_VERSION = 1;
 const CAMPAIGN_FRONTIER_BUDGET_DEFAULT = 50;
 const CAMPAIGN_FRONTIER_BUDGET_MAX = 200;
-const EARNINGS_COLLECTOR_VERSION = "earnings-v7";
+const EARNINGS_COLLECTOR_VERSION = "earnings-v8";
 // V7 aggregates distinct intraday chart points. Keep queued V4/V5/V6 receipts readable
 // during a Backend-first rolling update; server amount checks apply to all.
-const EARNINGS_COMPAT_COLLECTOR_VERSIONS = new Set(["earnings-v4", "earnings-v5", "earnings-v6", EARNINGS_COLLECTOR_VERSION]);
-const EARNINGS_UTC_WINDOW_COLLECTOR_VERSIONS = new Set(["earnings-v6", EARNINGS_COLLECTOR_VERSION]);
+const EARNINGS_COMPAT_COLLECTOR_VERSIONS = new Set(["earnings-v4", "earnings-v5", "earnings-v6", "earnings-v7", EARNINGS_COLLECTOR_VERSION]);
+const EARNINGS_UTC_WINDOW_COLLECTOR_VERSIONS = new Set(["earnings-v6", "earnings-v7", EARNINGS_COLLECTOR_VERSION]);
 const EARNINGS_SCHEMA_VERSION = 4;
 const MESSAGES_COLLECTOR_VERSION = "local-dialog-messages-v2";
 const MESSAGES_SCHEMA_VERSION = 2;
@@ -865,6 +865,11 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result, public
         },
       });
     }
+    }
+    if (complete && publication?.prepareOnly !== true) {
+      await require("./earnings-published-snapshot").publishEarningsSnapshot({
+        db: tx, job, scanProofId: scanProof.id, scanRunId, from: startDate, to: endDate, payload,
+      });
     }
     return { batchId: batch.id, scanProofId: scanProof.id, complete, replay: replay || durableCommittedReplay, proof };
   });

@@ -105,6 +105,7 @@ test("analytics execution retention separates canonical proof from bounded opera
   assert.match(sqlCalls[7].sql, /ORDER BY candidate\."quarantinedAt" ASC, candidate\."key" ASC/);
 
   assert.match(sqlCalls[8].sql, /DELETE FROM "AnalyticsScanProof"/);
+  assert.match(sqlCalls[8].sql, /NOT EXISTS \(SELECT 1 FROM "CreatorEarningsPublishedDay"/);
   assert.match(sqlCalls[8].sql, /NOT EXISTS \([\s\S]*"CreatorEarningsDaily"/);
   assert.match(sqlCalls[8].sql, /NOT EXISTS \([\s\S]*"AnalyticsCoverage"/);
 });

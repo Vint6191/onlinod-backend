@@ -99,8 +99,10 @@ function batchHarness(options = {}) {
   const coverageUpdates = [];
   const scanProofs = [];
   const scanProofUpdates = [];
+  const snapshotWrites = [];
   const existing = options.existingBatch || null;
   const tx = {
+    $executeRawUnsafe: async (sql, ...args) => { if (sql.includes('earnings_verified_snapshot_v1')) snapshotWrites.push({ sql, args }); return 1; },
     ...(options.authorityNow ? { $queryRawUnsafe: async (sql) => { assert.match(String(sql), /clock_timestamp\(\)/); return [{ authorityNow: options.authorityNow }]; } } : {}),
     analyticsIngestBatch: {
       findFirst: async () => options.latestBatch || null,
@@ -186,7 +188,7 @@ function batchHarness(options = {}) {
     },
   };
   return {
-    tx, db: transactional(tx), created, updated, coverage, coverageUpdates, scanProofs, scanProofUpdates,
+    tx, db: transactional(tx), created, updated, coverage, coverageUpdates, scanProofs, scanProofUpdates, snapshotWrites,
     campaignState: () => options.campaignState || null, frontierRows,
   };
 }
@@ -334,6 +336,8 @@ test("earnings completion proves every page and promotes only historical coverag
   assert.equal(harness.updated.at(-1).status, "COMMITTED");
   assert.equal(harness.updated.at(-1).receivedRows, 7);
   assert.equal(harness.updated.at(-1).unchangedRows, 7);
+  assert.equal(harness.snapshotWrites.length, 1);
+  assert.equal(harness.snapshotWrites[0].args[3], result.scanProofId);
   assert.equal(harness.coverageUpdates.length, 2);
   assert.deepEqual(harness.coverageUpdates[0].where.ingestBatchId.in, ["page-a"]);
   assert.equal(harness.coverageUpdates[0].data.scanProofId, result.scanProofId);

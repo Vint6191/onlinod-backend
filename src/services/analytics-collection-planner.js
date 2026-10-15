@@ -225,7 +225,7 @@ function coverageState(row, day, now, force = false) {
     now,
     freshnessMs: earningsFreshnessLimitMs(day, now),
     partialUsable: isCurrentDay,
-    forceDue: force === true,
+    forceDue: force === true && !(row?.retryAfterAt && asDate(row.retryAfterAt) > now),
   });
 }
 
@@ -292,7 +292,7 @@ function windowsForDueDays(dueDays, now) {
 
 function priorityForReason(reason, fallback = 30) {
   const normalized = String(reason || "").toUpperCase();
-  if (normalized === "INTERACTIVE_REFRESH") return Math.max(100, fallback);
+  if (["INTERACTIVE_REFRESH", "HOME_INTERACTIVE_REFRESH"].includes(normalized)) return Math.max(100, fallback);
   if (normalized === "BILLING") return Math.max(80, fallback);
   if (normalized === "INITIAL_SYNC") return Math.max(60, fallback);
   return fallback;
@@ -320,7 +320,12 @@ function overlappingScanWindow(job, identityParams) {
     && params.scanFrom <= identityParams.scanTo && params.scanTo >= identityParams.scanFrom;
 }
 
-async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, scanTo, collectionReason, priority, now }) {
+function forceDay(reason, day, now, force = false) {
+  return force || reason === "INTERACTIVE_REFRESH"
+    || (reason === "HOME_INTERACTIVE_REFRESH" && +utcDay(day) === +utcDay(now));
+}
+
+async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, scanTo, collectionReason, priority, now, force = false }) {
   const identityParams = {
     analyticsContractVersion: ANALYTICS_CONTRACT_VERSION,
     scanFrom: dateKey(scanFrom),
@@ -340,8 +345,10 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
         creatorId,
         agencyId,
         params: identityParams,
-        bucketAt: authorityNow,
-        bucketMs: SCAN_GENERATION_MS,
+        // One logical job per UTC window. Runs have separate lease revisions,
+        // scanRunIds and authorityRequestedAt; a clock bucket is not a task.
+        bucketAt: new Date(0),
+        bucketMs: 0,
       });
       const params = {
         ...identityParams,
@@ -391,7 +398,7 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           // A claimed job's contract is immutable. For a scheduled job, keep the
           // original server-pinned contract too; only priority/nextRunAt may rise.
           params: existing.params || params,
-          nextRunAt: authorityNow,
+          nextRunAt: null,
           publish: false,
         });
         return {
@@ -402,6 +409,21 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           reason: !sameScanWindow(existing, identityParams) ? "active_window_overlap_deferred"
             : demand.updated ? "active_window_merged" : "active_window_reused",
         };
+      }
+
+      // A publication may have completed while this planner waited for its
+      // creator lock. Re-read before reopening a terminal job. Retry deadlines
+      // remain authoritative even for manual refresh.
+      if (typeof tx.analyticsCoverage?.findMany === "function") {
+        const currentRows = await tx.analyticsCoverage.findMany({ where: {
+          creatorId, dataType: "EARNINGS", sourceTimezone: ANALYTICS_SOURCE_TIMEZONE,
+          coverageDate: { gte: scanFrom, lte: scanTo },
+        }, include: { scanProof: true } });
+        const currentByDay = new Map(currentRows.map(row => [dateKey(row.coverageDate), row]));
+        if (!eachDay(scanFrom, scanTo).some(day => coverageState(currentByDay.get(dateKey(day)), day,
+          authorityNow, forceDay(collectionReason, day, authorityNow, force)).due)) {
+          return { job: null, created: false, publish: false, reason: "window_no_longer_due" };
+        }
       }
 
       const planned = await createPlannedJobIfAbsent({
@@ -423,7 +445,7 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           job: planned.job,
           priority,
           params: planned.job.params || params,
-          nextRunAt: authorityNow,
+          nextRunAt: null,
           publish: false,
         });
         return {
@@ -434,9 +456,7 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
         };
       }
       if (!planned.created && planned.job) {
-        // A terminal attempt in the same deterministic bucket must not suppress
-        // a still-due exact window. Reset that same idempotency row under the
-        // creator planning lock instead of creating a parallel logical job.
+        // Reuse the logical window only when due, under the creator lock.
         const retry = await reschedulePlannedJob({
           db: tx,
           job: planned.job,
@@ -448,7 +468,7 @@ async function planWindow({ db, creatorId, agencyId, displayRangeKey, scanFrom, 
           progress: null,
           lastProgressAt: null,
           startedAt: null,
-          protectedStatuses: ["CLAIMED"],
+          protectedStatuses: ["SCHEDULED", "CLAIMED", "PUBLISHING"],
           resetAttempts: true,
           publish: false,
         });
@@ -502,8 +522,9 @@ async function ensureAnalyticsWindowFreshness({
   const byDay = new Map(rows.map((row) => [dateKey(row.coverageDate), row]));
   // A user refresh requests a new verification of the selected period, even
   // when the historical cache is within its ordinary background freshness TTL.
-  const requestedForce = force || String(reason).toUpperCase() === "INTERACTIVE_REFRESH";
-  const evaluatedDays = days.map((day) => ({ day, state: coverageState(byDay.get(dateKey(day)), day, currentNow, requestedForce) }));
+  const normalizedReason = String(reason).toUpperCase();
+  const evaluatedDays = days.map((day) => ({ day, state: coverageState(byDay.get(dateKey(day)), day, currentNow,
+    forceDay(normalizedReason, day, currentNow, force)) }));
   const dueDays = evaluatedDays.filter((item) => item.state.due).map((item) => item.day);
   const deferredDays = evaluatedDays.filter((item) => item.state.deferred).length;
   const staleDays = evaluatedDays.filter((item) => item.state.stale).length;
@@ -530,6 +551,7 @@ async function ensureAnalyticsWindowFreshness({
       // Current revenue must not sit behind the initial historical backfill.
       priority: effectivePriority + (window.scanTo >= today ? 20 : window.scanTo >= new Date(today.getTime() - 30 * DAY_MS) ? 10 : 0),
       now: currentNow,
+      force,
     });
     remaining.push(...result.uncoveredWindows);
     if (result.job && !seenJobs.has(result.job.id)) {
@@ -698,7 +720,7 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
       }
       const coversRequest = asDate(existing.coverageFrom) <= coverageFrom && asDate(existing.coverageTo) >= range.endDay;
       const normalizedReason = String(reason || "INTERACTIVE_REFRESH").toUpperCase();
-      const forceUpgrade = normalizedReason === "INTERACTIVE_REFRESH" && existing.reason !== "INTERACTIVE_REFRESH";
+      const forceUpgrade = ["INTERACTIVE_REFRESH", "HOME_INTERACTIVE_REFRESH"].includes(normalizedReason) && existing.reason !== normalizedReason;
       // Automatic Home heartbeats share a live claim without invalidating its
       // revision/cursor. A new UTC day or an explicit force upgrade needs a
       // new revision. Backoff also survives automatic polls.
@@ -746,10 +768,10 @@ function enqueueHomeAnalyticsFreshnessDemand({ mode = "manual", ...options } = {
     ...options,
     rangeKey: HOME_COLLECTION_RANGE_KEY,
     includePrevious: true,
-    reason: mode === "automatic" ? "HOME_AUTOMATIC" : "INTERACTIVE_REFRESH",
+    reason: mode === "automatic" ? "HOME_AUTOMATIC" : "HOME_INTERACTIVE_REFRESH",
     priority: 100,
     coalescePending: true,
-    minRequestIntervalMs: mode === "automatic" ? HOME_AUTO_REFRESH_INTERVAL_MS : 0,
+    minRequestIntervalMs: mode === "automatic" ? HOME_AUTO_REFRESH_INTERVAL_MS : 5_000,
   });
 }
 

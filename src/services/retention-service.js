@@ -1017,7 +1017,7 @@ async function runAnalyticsExecutionRetentionSweep(options = {}) {
   items.push({ label: `analyticsCollectionDemand.quarantined_${cfg.analyticsDemandHistoryDays}d`, deleted: quarantinedDemandsDeleted, hasMore: quarantinedDemandsDeleted >= batchSize * RETENTION_BATCH_BUDGET });
 
   // AnalyticsScanProof is durable business evidence while a canonical daily or
-  // coverage row still points at it.  Once a newer scan has superseded every
+  // coverage/published row still points at it. Once a newer scan has superseded every
   // such reference, the old receipt becomes technical history and may be
   // compacted.  Never rely on ON DELETE SET NULL here: reachability is the
   // retention authority and referenced proofs are explicitly excluded.
@@ -1029,6 +1029,7 @@ async function runAnalyticsExecutionRetentionSweep(options = {}) {
         SELECT candidate."id"
         FROM "AnalyticsScanProof" candidate
         WHERE candidate."createdAt" < $1
+          AND NOT EXISTS (SELECT 1 FROM "CreatorEarningsPublishedDay" published WHERE published."scanProofId"=candidate."id")
           AND NOT EXISTS (
             SELECT 1
             FROM "CreatorEarningsDaily" d

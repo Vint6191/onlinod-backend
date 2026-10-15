@@ -128,6 +128,10 @@ router.post("/refresh", async (req, res) => {
     const decision = await scheduleFanDataPointRefresh({ agencyId: creator.agencyId, creatorId: creator.id, onlyFansUserIds: ids, reason: clean(req.body?.reason, 120) || "fan_data_api_refresh", priority: Number(req.body?.priority || 95) });
     return res.json({ ok: true, creatorId: creator.id, fanIds: ids, decision });
   } catch (error) {
+    if (error?.code === "FAN_DATA_REFRESH_BACKLOG_FULL") {
+      res.set("Retry-After", "30");
+      return res.status(503).json({ ok: false, code: error.code, error: "Fan refresh queue is full; retry later", retryable: true, retryAfterMs: 30_000 });
+    }
     console.error("[fan-data/refresh] failed:", error);
     return res.status(Number(error?.status) || 500).json({ ok: false, code: error?.code || "FAN_DATA_REFRESH_FAILED", error: error?.message || "Fan data refresh scheduling failed" });
   }
