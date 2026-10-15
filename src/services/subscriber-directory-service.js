@@ -1099,6 +1099,7 @@ async function planSubscriberDerivedAutomation({
       ...(fencedRefreshScheduler ? { scheduleFanRefresh: fencedRefreshScheduler } : {}),
     });
   } catch (error) {
+    if (fencedMaintenance) throw error;
     followBackPlanning = { ok: false, created: false, reason: error?.code || "follow_back_planning_failed", error: clean(error?.message || error, 500) };
   }
   try {
@@ -1107,6 +1108,7 @@ async function planSubscriberDerivedAutomation({
       ...(fencedRefreshScheduler ? { scheduleFanRefresh: fencedRefreshScheduler } : {}),
     });
   } catch (error) {
+    if (fencedMaintenance) throw error;
     followAutomationPlanning = { ok: false, created: false, reason: error?.code || "follow_automation_planning_failed", error: clean(error?.message || error, 500) };
   }
   try {
@@ -1119,6 +1121,7 @@ async function planSubscriberDerivedAutomation({
       ...(fencedRefreshScheduler ? { scheduleFanRefresh: fencedRefreshScheduler } : {}),
     });
   } catch (error) {
+    if (fencedMaintenance) throw error;
     bumpPlanning = {
       ok: false,
       created: false,
@@ -1372,7 +1375,7 @@ async function repairSubscriberDirectoryStateGeneration({ db = prisma, agencyId,
   const maxPublishedGeneration = Number(rows?.[0]?.maxPublishedGeneration || 0);
   if (maxGeneration <= 0) return { repaired: false, reason: "no_runs", maxGeneration: 0, maxPublishedGeneration: 0 };
 
-  const existing = await db.subscriberDirectoryState.findUnique({ where: { creatorId: creator } }).catch(() => null);
+  const existing = await db.subscriberDirectoryState.findUnique({ where: { creatorId: creator } });
   if (!existing) {
     try {
       await db.subscriberDirectoryState.create({
@@ -1479,8 +1482,11 @@ async function recoverSubscriberPublicationDebt({
   let stateRepairs = 0;
   let budgetExhausted = false;
 
+  // The pump's soft time slice controls admission of the next bounded chunk,
+  // not the lifetime of a chunk already admitted. Shrinking a transaction to
+  // a few hundred milliseconds made normal DB latency expire the client.
   const repair = await publicationTransaction(db, agency, creator, (tx) => repairSubscriberDirectoryStateGeneration({ db: tx, agencyId: agency, creatorId: creator }), {
-    maxWaitMs: Math.min(1_000, runtimeBudget), timeoutMs: Math.min(3_000, runtimeBudget), maintenanceSignal,
+    maxWaitMs: 1_000, timeoutMs: 15_000, maintenanceSignal,
   });
   if (repair?.repaired) stateRepairs += 1;
 
@@ -1506,12 +1512,11 @@ async function recoverSubscriberPublicationDebt({
       for (let step = 0; step < stepLimit; step += 1) {
         const remaining = runtimeBudget - (Date.now() - started);
         if (remaining < 300) { budgetExhausted = true; break; }
-        const transactionBudget = Math.max(250, Math.min(5_000, remaining));
         const result = await publicationTransaction(db, agency, creator, (tx) => advanceSubscriberPublication(tx, {
           runId: candidate.id,
           jobId: candidate.jobId || null,
           scanEveryDays,
-        }), { maxWaitMs: Math.min(1_000, transactionBudget), timeoutMs: transactionBudget, maintenanceSignal });
+        }), { maxWaitMs: 1_000, timeoutMs: 15_000, maintenanceSignal });
         advancedSteps += 1;
         if (result?.complete) {
           recoveredRuns += 1;
@@ -1521,6 +1526,7 @@ async function recoverSubscriberPublicationDebt({
       }
     }
     if (!completeResult?.complete) break;
+    if (Date.now() - started >= runtimeBudget) { budgetExhausted = true; break; }
     const freshRun = completeResult.run || await db.subscriberScanRun.findUnique({ where: { id: candidate.id } }).catch(() => candidate);
     let planning = null;
     const publishedRun = freshRun || candidate;
@@ -1528,12 +1534,12 @@ async function recoverSubscriberPublicationDebt({
 
     if (maintenanceSignal) {
       const fencedResult = await publicationTransaction(db, agency, creator, async (tx, claim) => {
-        const txRun = await tx.subscriberScanRun.findUnique({ where: { id: publishedRun.id } }).catch(() => publishedRun);
+        const txRun = await tx.subscriberScanRun.findUnique({ where: { id: publishedRun.id } });
         const txJob = txRun?.jobId
           ? await tx.jobInstance.findUnique({
               where: { id: txRun.jobId },
               select: { id: true, params: true, status: true, leaseUntil: true, leaseRevision: true },
-            }).catch(() => job)
+            })
           : job;
         let txPlanning = null;
         let txPlanningRuns = 0;
@@ -1557,8 +1563,8 @@ async function recoverSubscriberPublicationDebt({
         });
         return { planning: txPlanning, planningRuns: txPlanningRuns, reconciled: txReconciled };
       }, {
-        maxWaitMs: Math.min(2_000, Math.max(500, runtimeBudget - (Date.now() - started))),
-        timeoutMs: Math.min(15_000, Math.max(1_500, runtimeBudget - (Date.now() - started) + 2_000)),
+        maxWaitMs: 2_000,
+        timeoutMs: 15_000,
         maintenanceSignal,
       });
       planning = fencedResult?.planning || null;

@@ -874,7 +874,9 @@ async function ingestTeamEvents({
           results.push({ event, durable });
         }
         return results;
-      }, serializableTxOptions());
+      // Replay the whole bounded DB-only chunk. Authority is rechecked on
+      // every attempt; acknowledgements below only follow a confirmed commit.
+      }, { ...serializableTxOptions(), maxAttempts: 3 });
     } catch (err) {
       if ([
         "TELEMETRY_MEMBER_STALE", "TELEMETRY_ACCESS_EPOCH_STALE",

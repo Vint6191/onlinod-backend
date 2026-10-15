@@ -130,6 +130,27 @@ function manualSent(memberId = "member-1") {
   };
 }
 
+test('PPV money reconciliation replays the full Serializable transaction after rollback without duplicating money', async () => {
+  const f = dbFixture({ sent: manualSent() });
+  const original = f.db.$transaction;
+  let attempts = 0;
+  f.db.$transaction = async (work, options) => {
+    const before = structuredClone(f.getPurchase());
+    attempts++;
+    try {
+      const result = await original(work, options);
+      if (attempts === 1) throw Object.assign(new Error('concurrent purchase writer'), { code: 'P2034' });
+      return result;
+    } catch (error) { f.setPurchase(before); throw error; }
+  };
+  const r = await reconcileCreatorSaleToTeam({ db: f.db, saleId: 'sale-1' });
+  assert.equal(attempts, 2); assert.equal(r.purchase.amountCents, 2500);
+  const replay = await reconcileCreatorSaleToTeam({ db: f.db, saleId: 'sale-1' });
+  assert.equal(replay.purchase.id, r.purchase.id);
+  assert.equal(f.getPurchase().amountCents, 2500);
+  assert.equal(f.getPurchaseCreates(), 2, 'one aborted insertion and one committed insertion; repeated reconciliation updates it');
+});
+
 test("source classification never treats automation/broadcast as human manual", () => {
   assert.equal(classifySentSource({ source: "manual" }), "MANUAL");
   assert.equal(classifySentSource({ source: "manual_chat" }), "MANUAL");

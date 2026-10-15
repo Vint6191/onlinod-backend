@@ -32,10 +32,12 @@ let genericQueries = 0;
 let dailyCalls = 0;
 let analyticsCalls = 0;
 const leaseCalls = [];
+let workProgress = null;
+const recurringPlans = [], yieldedPlans = [];
 
 cacheModule(prismaPath, {});
 cacheModule(require.resolve("./analytics-recurring-planning-service"), {
-  async planRecurringCreatorAnalytics() { analyticsCalls += 1; return { created: 0, skipped: 0 }; },
+  async planRecurringCreatorAnalytics(input) { analyticsCalls += 1; recurringPlans.push(input); return { created: 0, skipped: 0 }; },
 });
 cacheModule(plannerPath, {
   async ensureOperationalAnalyticsFreshness() { throw new Error("not expected"); },
@@ -81,13 +83,13 @@ cacheModule(domainWorkPath, {
     return {
       ownerToken: "planning-owner",
       authorityNow: new Date("2026-09-08T18:05:00.000Z"),
-      items: creators.slice(0, input.limit).map((row, index) => ({ id: `work-${index}`, agencyId: row.agencyId, creatorId: row.id, objectId: row.id })),
+      items: creators.slice(0, input.limit).map((row, index) => ({ id: `work-${index}`, agencyId: row.agencyId, creatorId: row.id, objectId: row.id, progressCursor: workProgress })),
     };
   },
   async heartbeatDomainWorkClaim() { return { renewed: true, authorityNow: new Date("2026-09-08T18:05:00.000Z") }; },
   async ackDomainWorkClaim() { return { acknowledged: true }; },
   async failDomainWorkClaim() { return { failed: true }; },
-  async yieldDomainWorkClaim() { return { yielded: true }; },
+  async yieldDomainWorkClaim(input) { yieldedPlans.push(input); return { yielded: true }; },
 });
 
 delete require.cache[schedulerPath];
@@ -126,4 +128,21 @@ test("Creator Analytics compatibility entry uses the same bounded durable lane",
   assert.equal(result.creatorsScanned, 3);
   assert.equal(analyticsCalls, 3);
   assert.deepEqual(leaseCalls, []);
+});
+
+test('minute earnings planning does not repeat hourly scans; durable cursor preserves their cadence', async () => {
+  workProgress = { lastFullPlanningAt: '2026-09-08T18:04:00.000Z' };
+  recurringPlans.length = yieldedPlans.length = 0;
+  dailyCalls = 0;
+  try {
+    const db = { creatorAccount: { findFirst: async ({ where }) => creators.find(c => c.id === where.id) } };
+    const r = await runRecurringCreatorWork({ db, pageSize: 2 });
+    assert.equal(r.ok, true); assert.equal(r.creatorsScanned, 2);
+    assert.equal(dailyCalls, 0);
+    assert.ok(recurringPlans.every(p => p.includeCatchups === false));
+    for (const p of yieldedPlans) {
+      assert.equal(p.availableAt.toISOString(), '2026-09-08T18:06:00.000Z');
+      assert.equal(p.progressCursor.lastFullPlanningAt, workProgress.lastFullPlanningAt);
+    }
+  } finally { workProgress = null; }
 });

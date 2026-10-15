@@ -5,7 +5,8 @@ const prisma = require("../prisma");
 const { buildHomeSummary, buildHomeCreatorPage } = require("../services/home-summary-service");
 const { readHomeAuthority, MEMBER_CURRENT } = require("../services/home-scope-repository");
 const { canUsePermission } = require("../services/team-access-control");
-const { enqueueAgencyAnalyticsFreshnessDemand } = require("../services/analytics-collection-planner");
+const { enqueueHomeAnalyticsFreshnessDemand } = require("../services/analytics-collection-planner");
+const { normalizeHomeRangeKey } = require("../services/analytics-range-contract");
 
 const router = express.Router();
 
@@ -50,18 +51,18 @@ router.post("/refresh", async (req, res) => {
     if (!allowed) {
       return res.status(403).json({ ok: false, code: "FEATURE_FORBIDDEN", permission: "creator_analytics.refresh", error: "creator_analytics.refresh permission is required" });
     }
-    const demand = await enqueueAgencyAnalyticsFreshnessDemand({
+    // Old clients may still send their selected tab. Validate it, but collect
+    // the shared Home horizon so switching tabs never requires another scan.
+    normalizeHomeRangeKey(req.body?.rangeKey || req.query?.rangeKey || "7d");
+    const demand = await enqueueHomeAnalyticsFreshnessDemand({
       db: prisma,
       agencyId,
       creatorIds: null,
       scopeMode: MEMBER_CURRENT,
-      rangeKey: req.body?.rangeKey || req.query?.rangeKey || "7d",
-      reason: "INTERACTIVE_REFRESH",
-      priority: 100,
+      mode: req.body?.mode ?? "manual",
       requestedByMemberId: member.id,
       requestedAccessEpoch: Number(member.accessEpoch || 1),
       now: new Date(),
-      includePrevious: true,
     });
     return res.json({
       ok: true,
@@ -74,7 +75,7 @@ router.post("/refresh", async (req, res) => {
     });
   } catch (err) {
     console.error("[home/refresh] failed:", err);
-    const status = Number(err?.status) || (err?.code === "ANALYTICS_RANGE_INVALID" ? 400 : 500);
+    const status = Number(err?.status) || (["ANALYTICS_RANGE_INVALID", "HOME_RANGE_UNSUPPORTED"].includes(err?.code) ? 400 : 500);
     return res.status(status).json({ ok: false, code: err?.code || "HOME_REFRESH_FAILED", error: err?.message || "Failed" });
   }
 });

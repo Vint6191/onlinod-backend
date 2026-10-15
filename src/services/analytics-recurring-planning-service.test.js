@@ -84,6 +84,21 @@ test("Analytics successful plan commits before announcing its jobs", async (t) =
   assert.equal(events.length, 1);
 });
 
+test('fast earnings-only cycle preserves lifecycle/claim fences and skips other collectors', async (t) => {
+  const f = fixture();
+  let planned = 0;
+  t.mock.method(require('./analytics-collection-planner'), 'ensureOperationalAnalyticsFreshness', async ({ db }) => {
+    assert.equal(db, f.tx); planned++; return { created: 1 };
+  });
+  t.mock.method(require('./creator-analytics-sync-orchestrator'), 'ensureRecurringCreatorAnalyticsCatchups', async () => {
+    throw new Error('hourly collectors must not run in minute cycle');
+  });
+  const r = await service.planRecurringCreatorAnalytics({ db: f.db, item: f.item, now: f.now, includeCatchups: false });
+  assert.equal(planned, 1); assert.equal(r.created, 1);
+  assert.equal(f.trace.filter(x => x === 'work-lock').length, 2);
+  assert.equal(f.trace.at(-1), 'commit');
+});
+
 test("Analytics unavailable transaction fails closed before any planning", async () => {
   await assert.rejects(() => service.planRecurringCreatorAnalytics({ db: {}, item: {} }), { code: "ANALYTICS_PLANNING_TRANSACTION_REQUIRED" });
 });

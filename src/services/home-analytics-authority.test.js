@@ -49,7 +49,7 @@ test("Home canonical revenue uses distinct date ranges for current/previous peri
       },
       async findMany(args) {
         assert.equal(dateKey(args.where.coverageDate), "2026-09-08");
-        return creators.map((creator) => ({ creatorId: creator.id, status: "PARTIAL", lastVerifiedAt: new Date("2026-09-08T13:55:00.000Z") }));
+        return creators.map((creator) => ({ creatorId: creator.id, status: "PARTIAL", lastVerifiedAt: new Date("2026-09-08T13:59:30.000Z") }));
       },
     },
     jobInstance: { async findMany() { return []; } },
@@ -152,7 +152,7 @@ test("Home refresh HTTP path enqueues one durable demand instead of looping crea
   const fs = require("node:fs");
   const path = require("node:path");
   const source = fs.readFileSync(path.join(__dirname, "..", "routes", "home.js"), "utf8");
-  assert.match(source, /enqueueAgencyAnalyticsFreshnessDemand/);
+  assert.match(source, /enqueueHomeAnalyticsFreshnessDemand/);
   assert.match(source, /requestedByMemberId:\s*member\.id/);
   assert.match(source, /requestedAccessEpoch:\s*Number\(member\.accessEpoch/);
   assert.doesNotMatch(source, /ensureAgencyAnalyticsFreshness/);

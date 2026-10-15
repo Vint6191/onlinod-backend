@@ -88,6 +88,84 @@ function daysInclusive(start, end) {
   return rows;
 }
 
+test('one Home collection covers 180 unique days; fresh periods reuse proof and only today is due a minute later', async () => {
+  const now = new Date('2026-10-15T12:00:00Z');
+  const { startDay, endDay } = planner.operationalFreshnessWindow(now);
+  const db = { $executeRawUnsafe: async () => 1 };
+  db.$transaction = async fn => fn({ ...db, $transaction: undefined });
+  const jobs = addEarningsJobs(db);
+  const input = { db, creatorId: 'c', agencyId: 'a', now, coverageRows: [] };
+  const initial = await planner.ensureOperationalAnalyticsFreshness(input);
+  assert.equal(initial.dueDays, 180);
+  assert.equal(jobs.length, 7);
+  assert.equal(jobs[0].params.scanFrom, isoDay(now));
+  assert.ok(jobs[0].priority > jobs[1].priority);
+  assert.equal(jobs[1].params.scanTo, '2026-10-14');
+  for (const day of daysInclusive(startDay, endDay).map(isoDay)) {
+    assert.equal(jobs.filter(j => j.params.scanFrom <= day && j.params.scanTo >= day).length, 1, day);
+  }
+  assert.ok(jobs.every(j => daysInclusive(j.params.scanFrom, j.params.scanTo).length <= 30));
+  for (const job of jobs) job.status = 'DONE';
+  const coverageRows = daysInclusive(startDay, endDay).map(coverageDate => ({ coverageDate,
+    status: +coverageDate === +endDay ? 'PARTIAL' : 'COMPLETE', lastVerifiedAt: now,
+    scanProof: { status: 'COMMITTED', proofVersion: 2, requestedAt: now } }));
+  const fresh = await planner.ensureOperationalAnalyticsFreshness({ ...input, coverageRows });
+  assert.equal(fresh.dueDays, 0);
+  const live = await planner.ensureOperationalAnalyticsFreshness({ ...input, coverageRows, now: new Date(+now + 61_000) });
+  assert.equal(live.dueDays, 1);
+  assert.equal(live.jobs[0].params.scanFrom, '2026-10-15');
+  assert.equal(live.jobs[0].params.scanTo, '2026-10-15');
+  const rollover = await planner.ensureOperationalAnalyticsFreshness({ ...input, coverageRows, now: new Date('2026-10-16T00:00:01Z') });
+  assert.ok(rollover.jobs.some(j => j.params.scanFrom === '2026-10-16'));
+  assert.ok(rollover.jobs.some(j => j.params.scanFrom <= '2026-10-15' && j.params.scanTo >= '2026-10-15'), 'yesterday PARTIAL must be closed again');
+});
+
+test('Home tabs share one member-fenced demand and automatic heartbeats do not restart its cursor', async () => {
+  const db = {}, store = addDemandStore(db);
+  const now = new Date('2026-10-15T12:00:00Z');
+  const options = { db, agencyId: 'agency-1', scopeMode: 'MEMBER_CURRENT', ...DEMAND_ACTOR, now, mode: 'automatic' };
+  const first = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, rangeKey: 'today' });
+  assert.equal(first.rangeKey, '90d');
+  const initial = store.get(first.key);
+  assert.equal(daysInclusive(initial.coverageFrom, initial.coverageTo).length, 180);
+  await db.analyticsCollectionDemand.update({ where: { key: first.key }, data: {
+    claimToken: 'owner', claimUntil: new Date(+now + 300_000), claimedRevision: 1, cursorCreatorId: 'c500',
+    attempts: 2, nextAttemptAt: new Date(+now + 120_000),
+  } });
+  for (const rangeKey of ['7d', '30d', '90d']) {
+    const r = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, rangeKey, now: new Date(+now + 61_000) });
+    assert.equal(r.key, first.key); assert.equal(r.requestRevision, 1); assert.equal(r.coalesced, true);
+    assert.equal(store.get(first.key).cursorCreatorId, 'c500'); assert.equal(store.get(first.key).attempts, 2);
+  }
+  const force = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, mode: 'manual' });
+  assert.equal(force.requestRevision, 2, 'manual refresh upgrades an automatic freshness-only request');
+  assert.equal(store.get(first.key).reason, 'INTERACTIVE_REFRESH');
+  const poll = await planner.enqueueHomeAnalyticsFreshnessDemand(options);
+  assert.equal(poll.requestRevision, 2); assert.equal(store.get(first.key).reason, 'INTERACTIVE_REFRESH');
+  const again = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, mode: 'manual' });
+  assert.equal(again.requestRevision, 2, 'another tab/device must not restart the same forced pass');
+  const changedAccess = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, requestedAccessEpoch: 8 });
+  assert.notEqual(changedAccess.key, first.key);
+  const midnight = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, now: new Date('2026-10-16T00:00:01Z') });
+  assert.equal(midnight.requestRevision, 3); assert.equal(isoDay(store.get(first.key).coverageTo), '2026-10-16');
+});
+
+test('automatic Home refresh is throttled after completion and never silently resets quarantined work', async () => {
+  const db = {}, store = addDemandStore(db), now = new Date('2026-10-15T12:00:00Z');
+  const options = { db, agencyId: 'agency-1', ...DEMAND_ACTOR, now, mode: 'automatic' };
+  const first = await planner.enqueueHomeAnalyticsFreshnessDemand(options);
+  await db.analyticsCollectionDemand.update({ where: { key: first.key }, data: { completedAt: now, completedRevision: 1 } });
+  const recent = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, now: new Date(+now + 20_000) });
+  assert.equal(recent.queued, false); assert.equal(recent.requestRevision, 1);
+  const next = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, now: new Date(+now + 61_000) });
+  assert.equal(next.queued, true); assert.equal(next.requestRevision, 2);
+  await db.analyticsCollectionDemand.update({ where: { key: first.key }, data: { quarantinedAt: now, attempts: 8 } });
+  await assert.rejects(planner.enqueueHomeAnalyticsFreshnessDemand(options), { code: 'HOME_COLLECTION_RETRY_REQUIRED' });
+  assert.equal(store.get(first.key).attempts, 8);
+  await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, mode: 'manual' });
+  assert.equal(store.get(first.key).quarantinedAt, null);
+});
+
 function addSweepLeaseStore(db) {
   let lease = null;
   db.$transaction = async (work) => work({ ...(db), $transaction: undefined });
@@ -291,11 +369,11 @@ test("Home sweep reports processing failure instead of a healthy success", async
   assert.equal(result.failures, 1);
 });
 
-test("operational freshness window covers today plus the previous 30 fully closed UTC days", () => {
+test("operational freshness covers all Home periods and their comparisons", () => {
   const window = planner.operationalFreshnessWindow(new Date("2026-09-08T14:00:00.000Z"));
-  assert.equal(isoDay(window.startDay), "2026-08-09");
+  assert.equal(isoDay(window.startDay), "2026-03-13");
   assert.equal(isoDay(window.endDay), "2026-09-08");
-  assert.equal(daysInclusive(window.startDay, window.endDay).length, 31);
+  assert.equal(daysInclusive(window.startDay, window.endDay).length, 180);
 });
 
 test("freshness requires a COMMITTED durable scan proof, not merely a proof id", () => {
@@ -315,12 +393,12 @@ test("freshness requires a COMMITTED durable scan proof, not merely a proof id",
 test("old earnings are never FINAL and are periodically reverified for provider corrections", () => {
   const now = new Date("2026-09-08T12:00:00.000Z");
   const oldDay = new Date("2026-05-01T00:00:00.000Z");
-  const proof = { status: "COMMITTED", proofVersion: 2, requestedAt: new Date(now.getTime() - 29 * 86_400_000) };
+  const proof = { status: "COMMITTED", proofVersion: 2, requestedAt: new Date(now.getTime() - 23 * 3_600_000) };
   const freshOld = {
     coverageDate: oldDay, status: "COMPLETE", scanProofId: "proof-old", scanProof: proof,
-    lastVerifiedAt: new Date(now.getTime() - 29 * 86_400_000), retryAfterAt: null,
+    lastVerifiedAt: new Date(now.getTime() - 23 * 3_600_000), retryAfterAt: null,
   };
-  const staleOld = { ...freshOld, lastVerifiedAt: new Date(now.getTime() - 31 * 86_400_000) };
+  const staleOld = { ...freshOld, lastVerifiedAt: new Date(now.getTime() - 25 * 3_600_000) };
   assert.equal(planner.coverageFresh(freshOld, oldDay, now), true);
   assert.equal(planner.coverageFresh(staleOld, oldDay, now), false);
 });
@@ -342,18 +420,18 @@ test("dense missing earnings history uses proven 30-day provider windows while s
   const windows = planner.windowsForDueDays(dense, now);
   assert.equal(windows.length, 3);
   assert.ok(windows.every((window) => ((window.scanTo - window.scanFrom) / 86_400_000) + 1 <= 30));
-  assert.equal(windows[0].scanFrom.toISOString().slice(0, 10), "2026-06-01");
-  assert.equal(windows.at(-1).scanTo.toISOString().slice(0, 10), "2026-08-29");
+  assert.equal(windows.at(-1).scanFrom.toISOString().slice(0, 10), "2026-06-01");
+  assert.equal(windows[0].scanTo.toISOString().slice(0, 10), "2026-08-29");
   assert.equal(planner.DENSE_BACKFILL_MAX_DAYS, 30);
 });
 
-test("old earnings reconciliation policy is explicit: recurring owns only current plus 30 closed days and older history is interactive-demand driven", () => {
+test("all 180 Home days are maintained automatically with bounded provider windows", () => {
   const now = new Date("2026-09-08T14:00:00.000Z");
   const window = planner.operationalFreshnessWindow(now);
-  assert.equal(window.startDay.toISOString().slice(0, 10), "2026-08-09");
+  assert.equal(window.startDay.toISOString().slice(0, 10), "2026-03-13");
   assert.equal(window.endDay.toISOString().slice(0, 10), "2026-09-08");
-  assert.equal(planner.EARNINGS_RECONCILIATION_POLICY.oldHistoryMode, "INTERACTIVE_DEMAND");
-  assert.equal(planner.EARNINGS_RECONCILIATION_POLICY.recurringClosedDays, 30);
+  assert.equal(planner.EARNINGS_RECONCILIATION_POLICY.oldHistoryMode, "RECURRING_HOME_AND_COMPARISON");
+  assert.equal(planner.EARNINGS_RECONCILIATION_POLICY.recurringClosedDays, 179);
   assert.equal(planner.EARNINGS_RECONCILIATION_POLICY.denseBackfillMaxDays, 30);
 });
 

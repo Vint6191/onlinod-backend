@@ -2,12 +2,15 @@
 
 const { DAY_MS, utcDay } = require("./analytics-range-contract");
 
-const CURRENT_DAY_FRESHNESS_MS = 15 * 60 * 1000;
-const RECENT_CLOSED_FRESHNESS_MS = 48 * 60 * 60 * 1000;
+const CURRENT_DAY_FRESHNESS_MS = 60 * 1000;
+const RECENT_CLOSED_FRESHNESS_MS = 6 * 60 * 60 * 1000;
 // Provider history is never declared immutable. Old earnings remain mutable
 // evidence and are periodically reverified so refunds/chargebacks/corrections
 // can converge without inventing an unsupported FINAL state.
-const HISTORICAL_FRESHNESS_MS = 30 * DAY_MS;
+const HISTORICAL_FRESHNESS_MS = DAY_MS;
+// One daily ledger covers all Home tabs and their preceding comparison periods.
+const HOME_COLLECTION_RANGE_KEY = "90d";
+const HOME_AUTO_REFRESH_INTERVAL_MS = 60 * 1000;
 const RECENT_HISTORY_DAYS = 30;
 const COLLECTION_FUTURE_SKEW_TOLERANCE_MS = 5 * 60 * 1000;
 
@@ -78,6 +81,8 @@ function earningsFreshnessLimitMs(day, now = new Date()) {
 }
 
 module.exports = {
+  HOME_COLLECTION_RANGE_KEY,
+  HOME_AUTO_REFRESH_INTERVAL_MS,
   CURRENT_DAY_FRESHNESS_MS,
   RECENT_CLOSED_FRESHNESS_MS,
   HISTORICAL_FRESHNESS_MS,

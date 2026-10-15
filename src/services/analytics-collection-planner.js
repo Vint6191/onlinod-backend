@@ -16,6 +16,8 @@ const {
   RECENT_CLOSED_FRESHNESS_MS,
   HISTORICAL_FRESHNESS_MS,
   earningsFreshnessLimitMs,
+  HOME_COLLECTION_RANGE_KEY,
+  HOME_AUTO_REFRESH_INTERVAL_MS,
 } = require("./analytics-freshness-policy");
 const {
   DAY_MS,
@@ -28,7 +30,7 @@ const {
   dateKey,
 } = require("./analytics-range-contract");
 
-const SCAN_GENERATION_MS = 15 * 60 * 1000;
+const SCAN_GENERATION_MS = CURRENT_DAY_FRESHNESS_MS;
 const RECONCILIATION_BLOCK_DAYS = 7;
 // The previous production generation continuously collected 30d OF earnings
 // windows, which is concrete provider evidence for this bound. Do not raise it
@@ -36,8 +38,8 @@ const RECONCILIATION_BLOCK_DAYS = 7;
 const DENSE_BACKFILL_MAX_DAYS = 30;
 const DENSE_BACKFILL_MIN_DAYS = 14;
 const EARNINGS_RECONCILIATION_POLICY = Object.freeze({
-  recurringClosedDays: 30,
-  oldHistoryMode: "INTERACTIVE_DEMAND",
+  recurringClosedDays: 179,
+  oldHistoryMode: "RECURRING_HOME_AND_COMPARISON",
   sparseBlockDays: RECONCILIATION_BLOCK_DAYS,
   denseBackfillMaxDays: DENSE_BACKFILL_MAX_DAYS,
 });
@@ -270,8 +272,8 @@ function windowsForDueDays(dueDays, now) {
       // current production evidence proves safe (30d), rather than dozens of
       // tiny display-range jobs. Sparse gaps keep the narrower reconciliation
       // block so fresh neighboring history is not needlessly re-read.
-      for (let offset = 0; offset < contiguous.length; offset += DENSE_BACKFILL_MAX_DAYS) {
-        const chunk = contiguous.slice(offset, offset + DENSE_BACKFILL_MAX_DAYS);
+      for (let end = contiguous.length; end > 0; end -= DENSE_BACKFILL_MAX_DAYS) {
+        const chunk = contiguous.slice(Math.max(0, end - DENSE_BACKFILL_MAX_DAYS), end);
         const first = chunk[0];
         const last = chunk.at(-1);
         windows.set(`dense:${dateKey(first)}:${dateKey(last)}`, { scanFrom: first, scanTo: last });
@@ -285,7 +287,7 @@ function windowsForDueDays(dueDays, now) {
       windows.set(key, { scanFrom: blockStart, scanTo: blockEnd });
     }
   }
-  return [...windows.values()].sort((a, b) => a.scanFrom - b.scanFrom);
+  return [...windows.values()].sort((a, b) => b.scanTo - a.scanTo);
 }
 
 function priorityForReason(reason, fallback = 30) {
@@ -525,7 +527,8 @@ async function ensureAnalyticsWindowFreshness({
       scanFrom: window.scanFrom,
       scanTo: window.scanTo,
       collectionReason: String(reason || "RECURRING").toUpperCase(),
-      priority: effectivePriority,
+      // Current revenue must not sit behind the initial historical backfill.
+      priority: effectivePriority + (window.scanTo >= today ? 20 : window.scanTo >= new Date(today.getTime() - 30 * DAY_MS) ? 10 : 0),
       now: currentNow,
     });
     remaining.push(...result.uncoveredWindows);
@@ -579,9 +582,8 @@ async function ensureAnalyticsFreshness({
 
 function operationalFreshnessWindow(now = new Date()) {
   const today = utcDay(now);
-  // One current day + the previous 30 fully closed UTC days. This covers both
-  // the Home 30d current range and Billing's previous-30-closed-day authority
-  // without turning either product display range into a collection identity.
+  // 90 current + 90 preceding days covers all Home tabs and Billing's 30
+  // closed days. Provider windows remain independent of display tabs.
   return {
     startDay: new Date(today.getTime() - EARNINGS_RECONCILIATION_POLICY.recurringClosedDays * DAY_MS),
     endDay: today,
@@ -607,7 +609,7 @@ async function ensureOperationalAnalyticsFreshness({
     agencyId,
     startDay: window.startDay,
     endDay: window.endDay,
-    displayRangeKey: "30d",
+    displayRangeKey: HOME_COLLECTION_RANGE_KEY,
     reason,
     priority,
     now: currentNow,
@@ -646,6 +648,8 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
   requestedByMemberId,
   requestedAccessEpoch,
   now = new Date(),
+  coalescePending = false,
+  minRequestIntervalMs = 0,
 } = {}) {
   if (!agencyId) throw new Error("ANALYTICS_PLANNER_AGENCY_REQUIRED");
   const actorMemberId = String(requestedByMemberId || "").trim();
@@ -692,6 +696,20 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
         });
         return { queued: true, coalesced: false, key, rangeKey: range.rangeKey, requestRevision: row.requestRevision };
       }
+      const coversRequest = asDate(existing.coverageFrom) <= coverageFrom && asDate(existing.coverageTo) >= range.endDay;
+      const normalizedReason = String(reason || "INTERACTIVE_REFRESH").toUpperCase();
+      const forceUpgrade = normalizedReason === "INTERACTIVE_REFRESH" && existing.reason !== "INTERACTIVE_REFRESH";
+      // Automatic Home heartbeats share a live claim without invalidating its
+      // revision/cursor. A new UTC day or an explicit force upgrade needs a
+      // new revision. Backoff also survives automatic polls.
+      if (coalescePending && coversRequest && !forceUpgrade && !existing.quarantinedAt) {
+        const pending = !existing.completedAt && Number(existing.completedRevision || 0) < Number(existing.requestRevision || 0);
+        const recent = asDate(existing.requestedAt) && mutationNow - asDate(existing.requestedAt) < minRequestIntervalMs;
+        if (pending || recent) return { queued: pending, coalesced: true, key, rangeKey: range.rangeKey, requestRevision: existing.requestRevision };
+      }
+      if (normalizedReason === "HOME_AUTOMATIC" && existing.quarantinedAt) {
+        throw Object.assign(new Error("Automatic earnings collection needs a manual retry"), { code: "HOME_COLLECTION_RETRY_REQUIRED", status: 409 });
+      }
       const claimAlive = Boolean(existing.claimToken && asDate(existing.claimUntil) && asDate(existing.claimUntil) > mutationNow);
       const row = await tx.analyticsCollectionDemand.update({
         where: { key },
@@ -719,6 +737,19 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
       });
       return { queued: true, coalesced: true, key, rangeKey: range.rangeKey, requestRevision: row.requestRevision };
     },
+  });
+}
+
+function enqueueHomeAnalyticsFreshnessDemand({ mode = "manual", ...options } = {}) {
+  if (!["manual", "automatic"].includes(mode)) throw Object.assign(new Error("Invalid Home refresh mode"), { code: "HOME_REFRESH_MODE_INVALID", status: 400 });
+  return enqueueAgencyAnalyticsFreshnessDemand({
+    ...options,
+    rangeKey: HOME_COLLECTION_RANGE_KEY,
+    includePrevious: true,
+    reason: mode === "automatic" ? "HOME_AUTOMATIC" : "INTERACTIVE_REFRESH",
+    priority: 100,
+    coalescePending: true,
+    minRequestIntervalMs: mode === "automatic" ? HOME_AUTO_REFRESH_INTERVAL_MS : 0,
   });
 }
 
@@ -1113,6 +1144,7 @@ module.exports = {
   DEMAND_LEASE_MS,
   analyticsDemandKey,
   enqueueAgencyAnalyticsFreshnessDemand,
+  enqueueHomeAnalyticsFreshnessDemand,
   claimNextAnalyticsDemand,
   renewAnalyticsDemandLease,
   settleAnalyticsDemand,

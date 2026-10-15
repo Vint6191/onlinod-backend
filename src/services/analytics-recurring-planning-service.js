@@ -35,7 +35,7 @@ async function reserveDirectoryAdmission({ db, state, creatorId, now }) {
   return rows.length > 0;
 }
 
-async function planRecurringCreatorAnalytics({ db, item, ownerToken, now = new Date() }) {
+async function planRecurringCreatorAnalytics({ db, item, ownerToken, now = new Date(), includeCatchups = true }) {
   if (typeof db?.$transaction !== "function" || typeof db?.$queryRawUnsafe !== "function") {
     throw Object.assign(new Error("Analytics planning requires a root transactional database"), { code: "ANALYTICS_PLANNING_TRANSACTION_REQUIRED" });
   }
@@ -56,11 +56,11 @@ async function planRecurringCreatorAnalytics({ db, item, ownerToken, now = new D
     const { ensureOperationalAnalyticsFreshness } = require("./analytics-collection-planner");
     const { ensureRecurringCreatorAnalyticsCatchups } = require("./creator-analytics-sync-orchestrator");
     const earnings = await ensureOperationalAnalyticsFreshness({ db: tx, creatorId, agencyId: item.agencyId, now: ownership.authorityNow, reason: "RECURRING", priority: 30 });
-    const analytics = await ensureRecurringCreatorAnalyticsCatchups({
+    const analytics = includeCatchups ? await ensureRecurringCreatorAnalyticsCatchups({
       db: tx, creatorId, agencyId: item.agencyId, now: ownership.authorityNow, priority: 20,
       campaignDirectoryDiscoveryAdmitted: false,
       reserveCampaignDirectory: (state) => reserveDirectoryAdmission({ db: tx, state, creatorId, now: ownership.authorityNow }),
-    });
+    }) : { created: [], skipped: [] };
     // A terminal collector is a recorded domain outcome, not a transaction
     // failure that should erase other streams' valid plans. Scope/claim and
     // unexpected database failures still roll back the complete transaction.

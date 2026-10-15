@@ -8,13 +8,14 @@ const ledgerPath = require.resolve("./team-ppv-ledger-service");
 const projectionPath = require.resolve("./team-response-projection-service");
 const servicePath = require.resolve("./telemetry-ingest-service");
 
-function loadService({ failSideEffects = 0, failSideEffectAt = null, failCreatorLookup = false, assignedCreators = undefined } = {}) {
+function loadService({ failSideEffects = 0, failSideEffectAt = null, failCreatorLookup = false, assignedCreators = undefined,
+  commitFailures = 0, commitErrorCode = 'P2034', afterRollback = null } = {}) {
   const created = [];
   const rows = [];
   const sideEffects = [];
   const projections = [];
   const sideEffectState = { failuresRemaining: failSideEffects, failAt: failSideEffectAt, calls: 0 };
-  const authority = { accessEpoch: 1, assignedCreators, afterCommit: null, transactions: 0 };
+  const authority = { accessEpoch: 1, assignedCreators, afterCommit: null, transactions: 0, attempts: 0 };
   const prisma = {
     async $queryRawUnsafe(sql) {
       const text = String(sql || "");
@@ -29,14 +30,17 @@ function loadService({ failSideEffects = 0, failSideEffectAt = null, failCreator
       return [];
     },
     async $transaction(work) {
+      authority.attempts++;
       const snapshot = rows.map((row) => ({ ...row }));
       try {
         const result = await work({ ...(prisma), $transaction: undefined });
+        if (commitFailures-- > 0) throw Object.assign(new Error('synthetic commit failure'), { code: commitErrorCode });
         authority.transactions += 1;
         if (typeof authority.afterCommit === "function") authority.afterCommit(authority.transactions);
         return result;
       } catch (error) {
         rows.splice(0, rows.length, ...snapshot);
+        if (afterRollback) afterRollback(authority);
         throw error;
       }
     },
@@ -146,6 +150,31 @@ async function ingest(service, events, overrides = {}) {
     ...overrides,
   });
 }
+
+test('P2034 rolls back the whole telemetry chunk, retries current authority and acknowledges committed events once', async () => {
+  const f = loadService({ commitFailures: 2 });
+  const result = await ingest(f.service, [canonical(), canonical({ localId: 'local-2', messageId: 'message-2' })]);
+  assert.equal(f.authority.attempts, 3); assert.equal(f.authority.transactions, 1);
+  assert.equal(f.rows.length, 2); assert.equal(result.inserted, 2);
+  assert.deepEqual(result.acknowledgedLocalIds, ['local-1', 'local-2']);
+  const replay = await ingest(f.service, [canonical()]);
+  assert.equal(replay.duplicated, 1); assert.equal(f.rows.length, 2);
+});
+
+test('telemetry retry cannot commit after membership changed during a conflict', async () => {
+  const f = loadService({ commitFailures: 1, afterRollback: authority => { authority.accessEpoch++; } });
+  await assert.rejects(ingest(f.service, [canonical()]), { code: 'TELEMETRY_ACCESS_EPOCH_STALE' });
+  assert.equal(f.authority.transactions, 0); assert.equal(f.rows.length, 0);
+});
+
+test('unknown transaction outcome is not blindly replayed and conflict retries are bounded', async () => {
+  const closed = loadService({ commitFailures: 1, commitErrorCode: 'P2028' });
+  await assert.rejects(ingest(closed.service, [canonical()]), { code: 'P2028' });
+  assert.equal(closed.authority.attempts, 1);
+  const exhausted = loadService({ commitFailures: 5 });
+  await assert.rejects(ingest(exhausted.service, [canonical()]), { code: 'P2034' });
+  assert.equal(exhausted.authority.attempts, 3); assert.equal(exhausted.rows.length, 0);
+});
 
 test("v13 manual confirmed send uses authenticated actor and relational provenance", async () => {
   const { service, rows, sideEffects } = loadService();

@@ -8,18 +8,17 @@
       we schedule lightweight dashboard earnings plus the strict Creator Analytics
       initial sync pipeline so history begins without anyone clicking refresh.
 
-   2. server.js startup — the recurring scheduler runs every
-      `RECURRING_INTERVAL_MS` (default 1 hour) and creates fresh
-      scheduled jobs for any READY creator that doesn't have a
-      scheduled or recently-completed job already.
+   2. server.js startup — the maintenance pump drains durable READY creator
+      work. Earnings freshness is checked each minute; the cursor retains the
+      hourly cadence of other scans. A top-level hourly sweep is a fallback.
 
    Why this design:
    - JobInstance has no unique constraint on (creator, jobKey, params).
      We dedupe in code: if there's already a SCHEDULED or recently-DONE
      (within the cooldown window) job for the same (creator, jobKey,
      rangeKey), we don't create a duplicate.
-   - The recurring scheduler is idempotent — running it twice within
-     the same hour creates zero new jobs.
+   - The recurring scheduler coalesces active provider windows and only
+     schedules missing or due daily earnings proof.
    ────────────────────────────────────────────────────────────
 */
 
@@ -83,6 +82,7 @@ const {
 
 // Recurring sweeper interval. Owner asked for 1 hour.
 const RECURRING_INTERVAL_MS = 60 * 60 * 1000;
+const EARNINGS_PLANNING_INTERVAL_MS = require("./analytics-freshness-policy").HOME_AUTO_REFRESH_INTERVAL_MS;
 
 // How recently a "DONE" job counts as fresh enough to skip rescheduling.
 // Same as RECURRING_INTERVAL_MS — if we just refreshed, don't refresh again.
@@ -97,7 +97,7 @@ const PHASE2_HISTORICAL_ENUMERATION_BATCH_SIZE = 20;
 const PHASE2_CUSTOM_REMINDER_BATCH_SIZE = 50;
 const TEAM_PENDING_PROJECTION_LANE_KEY = "team_pending_projection_v1";
 const TEAM_PENDING_PROJECTION_LANE_GENERATION = "team_pending_projection_v1";
-const ANALYTICS_DEMAND_INTERVAL_MS = 15 * 1000; // durable interactive Home freshness demands
+const ANALYTICS_DEMAND_INTERVAL_MS = 5 * 1000; // durable interactive Home freshness demands
 const TELEGRAM_INBOUND_PROJECTION_INTERVAL_MS = 30 * 1000; // lane cadence; pump checks due state more frequently
 const PHASE2_MAINTENANCE_PUMP_INTERVAL_MS = 5 * 1000;
 const PHASE2_MAINTENANCE_LANES_PER_TICK = 5;
@@ -1964,16 +1964,21 @@ async function runRecurringCreatorWork({
     }
 
     const creatorIssues = [];
+    const baseNow = heartbeat.authorityNow || claim.authorityNow || now;
+    const lastFullPlanningAt = new Date(item.progressCursor?.lastFullPlanningAt || 0);
+    const fullPlanningDue = !Number.isFinite(lastFullPlanningAt.getTime())
+      || lastFullPlanningAt > new Date(baseNow)
+      || new Date(baseNow).getTime() - lastFullPlanningAt.getTime() >= RECURRING_INTERVAL_MS;
     try {
       const { planRecurringCreatorAnalytics } = require("./analytics-recurring-planning-service");
-      const analytics = await planRecurringCreatorAnalytics({ db, item, ownerToken: claim.ownerToken, now });
+      const analytics = await planRecurringCreatorAnalytics({ db, item, ownerToken: claim.ownerToken, now, includeCatchups: fullPlanningDue });
       totalCreated += Number(analytics.created || 0);
       totalSkipped += Number(analytics.skipped || 0);
     } catch (error) {
       creatorIssues.push({ work: "analytics_planning", reason: error?.code || "analytics_planning_failed", error: String(error?.message || error).slice(0, 500) });
     }
     let planning;
-    try {
+    if (fullPlanningDue) try {
       planning = await scheduleInitialJobsForCreator({
         db,
         creatorId: creator.id,
@@ -1995,7 +2000,7 @@ async function runRecurringCreatorWork({
       creatorIssues.push({ work: "creator_planning", reason: error?.code || "creator_planning_exception", error: String(error?.message || error) });
     }
 
-    try {
+    if (fullPlanningDue) try {
       const { ensureDailyVaultIntelligenceCycle } = require("./vault-intelligence-daily-service");
       const daily = await ensureDailyVaultIntelligenceCycle({
         db,
@@ -2026,14 +2031,14 @@ async function runRecurringCreatorWork({
       continue;
     }
 
-    const baseNow = heartbeat.authorityNow || claim.authorityNow || now;
-    const nextRunAt = new Date(new Date(baseNow).getTime() + RECURRING_INTERVAL_MS);
+    const nextRunAt = new Date(new Date(baseNow).getTime() + EARNINGS_PLANNING_INTERVAL_MS);
     const released = await yieldDomainWorkClaim({
       db,
       item,
       ownerToken: claim.ownerToken,
       availableAt: nextRunAt,
-      progressCursor: { lastPlanningCycleAt: new Date(baseNow).toISOString(), nextPlanningCycleAt: nextRunAt.toISOString() },
+      progressCursor: { lastPlanningCycleAt: new Date(baseNow).toISOString(), nextPlanningCycleAt: nextRunAt.toISOString(),
+        lastFullPlanningAt: (fullPlanningDue ? new Date(baseNow) : lastFullPlanningAt).toISOString() },
       fallbackNow: now,
     }).catch(() => ({ yielded: false, lost: true }));
     if (released?.yielded) yielded += 1;

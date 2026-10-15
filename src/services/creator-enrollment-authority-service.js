@@ -80,6 +80,21 @@ async function runSerializable(db, work) {
   });
 }
 
+async function runProfileObservation(db, work) {
+  // A profile observation changes non-key metadata, not session authority. Its
+  // creator row and live actor/billing rows are locked explicitly; the database
+  // unique index arbitrates concurrent username claims. ReadCommitted reads the
+  // current observation after a lock wait instead of retaining an earlier SSI
+  // snapshot shared with unrelated creator/session work.
+  const active = currentCommitContext();
+  if (active && active.tx === db) return joinCommit(active, { isolationLevel: "ReadCommitted" }, ({ tx }) => work(tx));
+  return runRootCommit(db, ({ tx }) => work(tx), {
+    profile: "COMMAND", authority: { kind: "CREATOR_PROFILE_OBSERVATION" },
+    conflictCode: "CREATOR_CONNECTION_CONCURRENT_CHANGE",
+    conflictMessage: "Creator profile authority changed concurrently; refresh and retry",
+  });
+}
+
 function translateConnectionManagementError(error) {
   const code = String(error?.code || "");
   if (code === "MANAGEMENT_PERMISSION_REVOKED") return codedError("CREATOR_MANAGEMENT_FORBIDDEN", "Creator management permission is required", 403, { cause: error });
@@ -107,7 +122,10 @@ async function reassertHumanConnectionMutation(input) {
 
 async function requireLiveCreatorAccess({ tx, agencyId, creatorId, userId, actorMember }) {
   await lockAgencyLifecycle({ tx, agencyId });
-  await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 AND "deletedAt" IS NULL FOR UPDATE', creatorId, agencyId);
+  // Serialize observations and block lifecycle/identity changes, while allowing
+  // FK checks and the KEY SHARE lifecycle fences used by scans, domain work and
+  // provider waiters. FOR UPDATE here unnecessarily rejected those writers.
+  await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 AND "deletedAt" IS NULL FOR NO KEY UPDATE', creatorId, agencyId);
   const member = await tx.agencyMember.findUnique({
     where: { agencyId_userId: { agencyId, userId } },
   });
@@ -367,9 +385,11 @@ async function observeCreatorPlatformProfile({
   if (!deviceId) throw codedError("CREATOR_PROFILE_DEVICE_REQUIRED", "A device-bound platform profile observation is required", 400);
   if (!Number.isInteger(generation) || generation <= 0) throw codedError("CREATOR_PROFILE_GENERATION_INVALID", "A valid creator connection generation is required", 400);
   try {
-    return await runSerializable(db, async (tx) => {
+    return await runProfileObservation(db, async (tx) => {
       const { creator } = await requireLiveCreatorAccess({ tx, agencyId, creatorId, userId, actorMember });
-      await lockDbAdvisoryXact({ db: tx, key: creatorConnectionLockKey(agencyId, creatorId) });
+      // No session payload is read or written here. The creator row already
+      // orders this observation with reconnect/revoke; acquiring the session
+      // advisory lock would couple it to unrelated canonical-session saves.
       if (String(creator.remoteId || "") !== identity) {
         throw codedError("CREATOR_PROFILE_IDENTITY_MISMATCH", "Platform profile observation does not match the connected creator identity", 409);
       }
