@@ -131,6 +131,7 @@ function chunkDbFixture() {
       },
     },
     dialogScanRun: {
+      findUnique: async () => run,
       findFirst: async () => run,
       update: async ({ data }) => {
         if (data.pagesProcessed?.increment) run.pagesProcessed += data.pagesProcessed.increment;
@@ -193,6 +194,48 @@ function chunkDbFixture() {
   };
   return { db, targets, commits, calls, run, state };
 }
+
+test("standalone targeted commit and completion preserve batch-owned history, and require exact local proof", async () => {
+  const prismaModule = require.resolve("../prisma");
+  require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: {} };
+  delete require.cache[require.resolve("./dialog-intelligence-service")];
+  const service = require("./dialog-intelligence-service");
+  const f = chunkDbFixture(); f.run.mode = "targeted";
+  Object.assign(f.state, { activeRunId: "batch-owner", activeJobId: "batch-job", initialScanComplete: false, status: "RUNNING", backwardCursor: "saved-cursor" });
+  const before = structuredClone(f.state);
+  const job = { id: "job-1", agencyId: "agency-1", creatorId: "creator-1", params: {
+    scanRunId: "run-1", dialogId: "dialog-1", mode: "targeted", targetMessageId: "message-target",
+  } };
+  const chunk = { kind: "dialog_message_page", runId: "run-1", dialogId: "dialog-1", mode: "targeted", chunkKey: "target-exact",
+    targetMessageId: "message-target", messageIds: ["message-target"], messageCount: 1, hasMore: false,
+    continuation: { mode: "targeted", resumeState: { mode: "initial", cursor: "must-not-resume" } } };
+  for (const invalid of [
+    { ...chunk, mode: "initial" }, { ...chunk, messageIds: ["wrong"] },
+    { ...chunk, messageIds: [], targetMissing: true, progress: { status: 403 } },
+  ]) await assert.rejects(service.applyDialogIntelligenceChunk({ db: f.db, job, chunkResult: invalid }), /Target/);
+  const applied = await service.applyDialogIntelligenceChunk({ db: f.db, job, chunkResult: chunk });
+  assert.equal(applied.completeAfterCommit, true); assert.equal(applied.jobContinuationOverride, null);
+  assert.deepEqual(f.state, before); assert.equal(f.targets[0].status, "RESOLVED");
+  await service.completeDialogIntelligenceJob({ db: f.db, job, result: applied.completionResult });
+  assert.deepEqual(f.state, before); assert.equal(f.run.status, "COMPLETED");
+  assert.equal(f.calls.messageUpserts, 0, "raw messages never enter the backend ledger");
+});
+
+test("a target queued after the final page requeues the same job with a new lease revision", async () => {
+  const prismaModule = require.resolve("../prisma");
+  require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: {} };
+  delete require.cache[require.resolve("./dialog-intelligence-service")];
+  const { completeDialogIntelligenceJob } = require("./dialog-intelligence-service");
+  const f = chunkDbFixture(); f.run.mode = "targeted";
+  let write;
+  f.db.jobInstance = { update: async ({ data }) => { write = data; return { id: "job-1", ...data }; } };
+  const result = await completeDialogIntelligenceJob({ db: f.db, job: { id: "job-1", agencyId: "agency-1", creatorId: "creator-1", priority: 120,
+    params: { scanRunId: "run-1", dialogId: "dialog-1", mode: "targeted", targetMessageId: "previous" } }, result: {} });
+  assert.equal(result.jobStatus, "SCHEDULED"); assert.equal(f.run.status, "QUEUED");
+  assert.equal(write.continuation.targetMessageId, "message-target"); assert.equal(write.leaseTokenHash, null);
+  assert.deepEqual(write.leaseRevision, { increment: 1 }); assert.equal(write.attempts, 0);
+  assert.equal(f.targets[0].status, "PENDING");
+});
 
 test("durable target survives restart, resolves after commit, and duplicate replay returns saved metadata", async () => {
   const prismaModule = require.resolve("../prisma");

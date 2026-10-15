@@ -288,7 +288,7 @@ async function maybeAdvanceCreatorAnalyticsInitialSync(job, sideEffect) {
   }
 }
 
-function dialogDiscoveryClaimConstraint(enabled) {
+function dialogDiscoveryClaimConstraint(enabled, targetedReconciliation = false) {
   if (enabled !== true) return null;
   return {
     OR: [
@@ -300,14 +300,27 @@ function dialogDiscoveryClaimConstraint(enabled) {
         jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
         params: { path: ["dialogId"], equals: DIALOG_DISCOVERY_DIALOG_ID },
       },
+      // Single-message reconciliation uses a local commit receipt and a Job
+      // lease. It never takes ownership of the batch history plan.
+      ...(targetedReconciliation ? [{
+        jobKey: DIALOG_INTELLIGENCE_JOB_KEY,
+        AND: [
+          { OR: [
+            { params: { path: ["mode"], equals: "targeted" } },
+            { params: { path: ["mode"], equals: "reconcile" } },
+          ] },
+          { params: { path: ["targetMessageId"], not: "" } },
+          { NOT: { params: { path: ["dialogId"], equals: DIALOG_DISCOVERY_DIALOG_ID } } },
+        ],
+      }] : []),
     ],
   };
 }
 
-function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly, excludedJobIds = [], fanRefreshBlockedCreatorIds = [], fanRefreshGlobalBlocked = false, billingConstraint = null }) {
+function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly, targetedReconciliation, excludedJobIds = [], fanRefreshBlockedCreatorIds = [], fanRefreshGlobalBlocked = false, billingConstraint = null }) {
   const constraints = [];
   if (billingConstraint) constraints.push(billingConstraint);
-  const discoveryConstraint = dialogDiscoveryClaimConstraint(dialogDiscoveryOnly);
+  const discoveryConstraint = dialogDiscoveryClaimConstraint(dialogDiscoveryOnly, targetedReconciliation);
   if (discoveryConstraint) constraints.push(discoveryConstraint);
   if (fanRefreshGlobalBlocked) constraints.push({ jobKey: { not: "fan_data_point_refresh" } });
   if (fanRefreshBlockedCreatorIds.length) {
@@ -591,6 +604,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       eligibleCreatorIds,
       now,
       dialogDiscoveryOnly,
+      targetedReconciliation: capabilities?.dialogTargetedReconciliationV1 === true,
       excludedJobIds: capacityBlockedIds,
       fanRefreshBlockedCreatorIds,
       fanRefreshGlobalBlocked,
@@ -682,6 +696,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
             eligibleCreatorIds,
             now: claimNow,
             dialogDiscoveryOnly,
+            targetedReconciliation: capabilities?.dialogTargetedReconciliationV1 === true,
             excludedJobIds: capacityBlockedIds,
             fanRefreshBlockedCreatorIds,
             fanRefreshGlobalBlocked,
@@ -1060,7 +1075,7 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
           || typeof sideEffect.hasMore !== "boolean") throw new JobLeaseError("SUBSCRIBER_SCAN_CHECKPOINT_INVALID", "Subscriber page did not produce a durable checkpoint", 422);
         const serverProgress = {
           current: state.scanned,
-          percent: sideEffect.hasMore ? Math.min(99, state.pages) : 99,
+          percent: sideEffect.hasMore ? 0 : 99,
           message: sideEffect.hasMore ? `Subscribers: ${state.scanned} unique fans · page ${state.pages}`
             : `Subscribers: ${state.scanned} unique fans · publishing snapshot`,
         };
@@ -1075,6 +1090,12 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     } else if (job.jobKey === "fetch_campaigns" && sideEffect?.replay === true) {
       // Receipts prove data was already ingested; they do not authorize an old
       // continuation to replace a newer cursor. Also protects legacy leases.
+      updated = await tx.jobInstance.update({ where: { id: job.id }, data: {
+        continuation: job.continuation, progress: job.progress,
+      } });
+    } else if (job.jobKey === "dialog_intelligence_scan" && sideEffect?.replayedCommit === true) {
+      // A saved receipt acknowledges the old commit, not permission to rewind
+      // a newer target/discovery cursor when its HTTP response is retried.
       updated = await tx.jobInstance.update({ where: { id: job.id }, data: {
         continuation: job.continuation, progress: job.progress,
       } });
@@ -1249,7 +1270,7 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         staleError: () => new JobLeaseError("JOB_LEASE_STALE", "Job lease changed before completion"),
         applySideEffect: (db) => applyJobResult({ db, job, deviceId, userId, result: result || {} }),
       });
-      return { job: { id: job.id, status: "DONE" }, sideEffect };
+      return { job: { id: job.id, status: sideEffect?.jobStatus === "SCHEDULED" ? "SCHEDULED" : "DONE" }, sideEffect };
     }, { reserved: false, profile: "JOB_COMPLETION" });
   }
 

@@ -99,6 +99,7 @@ const claimSchema = z.object({
   // per-dialog jobs that belong to the batch pipeline.
   dialogDiscoveryOnly: z.boolean().optional(),
   capabilities: z.object({
+    dialogTargetedReconciliationV1: z.boolean().optional().default(false),
     legacyStorageRetirementV1: z.boolean().optional().default(false),
     campaignCausalObservationV1: z.boolean().optional().default(false),
     campaignServerFanRefreshV1: z.boolean().optional().default(false),

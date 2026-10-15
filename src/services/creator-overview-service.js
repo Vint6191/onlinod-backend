@@ -61,6 +61,7 @@ const JOB_LABELS = Object.freeze({
 });
 
 function jobLabel(jobKey, params = {}) {
+  if (jobKey === "dialog_intelligence_scan" && ["targeted", "reconcile"].includes(params.mode)) return "Message reconciliation";
   const base = JOB_LABELS[jobKey] || String(jobKey || "Background task").replaceAll("_", " ");
   const syncKind = text(params.analyticsSyncKind, 40);
   const mode = text(params.financialMode || params.campaignMode || params.notificationMode, 40);
@@ -109,7 +110,7 @@ async function readCreatorCurrentTask({ db = prisma, creatorId }) {
     status: statusClass(job.status),
     rawStatus: job.status,
     label: jobLabel(job.jobKey, params),
-    mode: text(params.analyticsSyncKind || params.financialMode || params.campaignMode || params.notificationMode, 80),
+    mode: text(params.analyticsSyncKind || params.financialMode || params.campaignMode || params.notificationMode || params.mode, 80),
     stage: text(params.analyticsSyncStage, 80),
     progress,
     startedAt: iso(job.startedAt || job.claimedAt),

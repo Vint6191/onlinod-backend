@@ -1,6 +1,7 @@
 "use strict";
 
 const { assertProviderBillingAccess } = require("./billing-execution-access-service");
+const { isCreatorLifecycleContention } = require("./creator-lifecycle-contention");
 
 // All provider starts use current billing. Durable readback is a separate,
 // device/member/operation-bound read permission, never a generic unpaid lane.
@@ -368,9 +369,11 @@ function pump() {
   coordinator.running = true;
   coordinator.runningEntryId = entry.id;
   let durableRetryAtMs = 0;
+  let durableGranted = false;
   trackWork((async () => {
     try {
       let permit;
+      let preGrantElapsedMs = 0;
       if (durable) {
         coordinator.durableSelectedWaiterId = null;
         if (entry.cancelled || entry.signal?.aborted) {
@@ -403,6 +406,9 @@ function pump() {
             }
             ensureWaiterHeartbeat();
           }
+          // Measure only time known to precede the successful grant transaction.
+          // Its execution and response transit must still count against the TTL.
+          preGrantElapsedMs = Math.max(0, Math.floor(performance.now() - entry.acquireStartedMono));
           admission = await tryAcquireDurableProviderPermit({
             db: prisma, waiterId: entry.id, permitId, ownerInstanceId: BACKEND_INSTANCE_ID,
             agencyId: entry.agencyId, creatorId: entry.creatorId, deviceId: entry.deviceId,
@@ -426,6 +432,7 @@ function pump() {
           durableRetryAtMs = admission.retryAt instanceof Date ? admission.retryAt.getTime() : Date.now() + 250;
           return;
         }
+        durableGranted = true;
         entry.waiterRegistered = false;
         coordinator.runningWaiterRegistered = false;
         if (entry.cancelled || entry.signal?.aborted) {
@@ -461,6 +468,7 @@ function pump() {
       } else {
         await waitUntil(Math.max(Date.now(), coordinator.nextAllowedAt || 0), AbortSignal.any([stopController.signal, ...(entry.signal ? [entry.signal] : [])]));
         if (entry.cancelled) return;
+        preGrantElapsedMs = Math.max(0, Math.floor(performance.now() - entry.acquireStartedMono));
         permit = {
           id: crypto.randomUUID(),
           agencyId: entry.agencyId,
@@ -508,8 +516,18 @@ function pump() {
         intervalMs: permit.intervalMs,
         capability: entry.capability,
         queueWaitMs: Math.max(0, Date.now() - entry.enqueuedAt),
+        preGrantElapsedMs,
       });
     } catch (error) {
+      // The creator NOWAIT trigger rejected the SQL statement/transaction, so
+      // no permit was committed. Retry outside the rolled-back transaction,
+      // keeping the original waiter identity, timeout and cancellation fences.
+      if (durable && !durableGranted && isCreatorLifecycleContention(error)
+        && !stopping && !entry.cancelled && !entry.signal?.aborted) {
+        enqueue(entry);
+        durableRetryAtMs = Date.now() + 500;
+        return;
+      }
       entry.reject(error);
     } finally {
       coordinator.running = false;
@@ -529,6 +547,7 @@ function pump() {
 }
 
 async function acquireOfRequestSlot(input) {
+  const acquireStartedMono = performance.now();
   if (stopping) throw stoppingError();
   const creatorId = clean(input.creatorId, 200);
   const deviceId = clean(input.deviceId, 200);
@@ -572,6 +591,7 @@ async function acquireOfRequestSlot(input) {
       intervalMs,
       waiterRegistered: false,
       enqueuedAt: Date.now(),
+      acquireStartedMono,
       signal: input.signal || null,
       cancelled: false,
       settled: false,

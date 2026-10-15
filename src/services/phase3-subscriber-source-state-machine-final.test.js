@@ -29,6 +29,9 @@ function loadSubscriber({ projected = null } = {}) {
   ids.push(cacheModule("./job-planning-repository", { createPlannedJob: async () => ({}), publishPlannedJobAvailable() {} }));
   ids.push(cacheModule("./fan-observation-token-service", { consumeFanObservationToken: async () => ({ observedAt: new Date("2044-01-01T00:00:00.000Z") }) }));
   ids.push(cacheModule("./db-time-authority-service", { dbAuthorityNow: async () => new Date("2044-01-01T00:00:01.000Z") }));
+  ids.push(cacheModule("./subscriber-directory-maintenance-signal-service", {
+    SUBSCRIBER_MAINTENANCE_KIND: { RECOVERY: "RECOVERY" }, signalSubscriberDirectoryMaintenance: async () => ({}),
+  }));
   const service = fresh("./subscriber-directory-service");
   return { service, cleanup() { restore(require.resolve("./subscriber-directory-service")); for (const id of ids) restore(id); } };
 }
@@ -216,5 +219,39 @@ test("final Subscriber progress CAS fails closed if durable cursor changes befor
   const loaded = loadSubscriber();
   try {
     await rejectCode(loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1", chunkResult: page({ offset: 0, items: [item("fan-1")], nextOffset: 1 }) }), "SUBSCRIBER_SCAN_CURSOR_CONFLICT");
+  } finally { loaded.cleanup(); }
+});
+
+test("V2 subscriber windows resume a legacy cursor, cross filtered empties and publish only at an explicit terminal", async () => {
+  const loaded = loadSubscriber();
+  const db = memoryDb(makeRun({ nextOffset: 4858, scannedCount: 3602, pageCount: 341, fanProjectionCursorOffset: 4858, fanProjectionCount: 4858 }));
+  const apply = chunkResult => loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1", chunkResult });
+  const window = (offset, items, hasMore) => ({ ...page({ offset, items, hasMore }), pagination: { contract: "of_subscribers_offset_v2", limit: 20 } });
+  try {
+    const first = window(4858, [item("a"), item("b")], true);
+    assert.equal((await apply(first)).nextOffset, 4878);
+    assert.equal((await apply(window(4878, [], true))).nextOffset, 4898);
+    assert.equal(db.run.hasMore, true); assert.equal(db.run.scannedCount, 3604);
+    assert.equal((await apply(first)).duplicate, true);
+    assert.equal(db.run.nextOffset, 4898); assert.equal(db.run.pageCount, 343);
+    assert.equal((await apply(window(4898, [item("b"), item("c")], false))).readyToPublish, true);
+    assert.equal(db.run.nextOffset, 4900); assert.equal(db.run.scannedCount, 3605);
+    assert.equal(db.run.fanProjectionStatus, "COMPLETE"); assert.equal(db.run.fanProjectionCount, 4862);
+    assert.equal(db.run.summary.traversal.filteredPositions, 38);
+    assert.equal(db.run.summary.traversal.providerRows, 4862);
+    assert.equal(db.run.pageLimit, 20);
+  } finally { loaded.cleanup(); }
+});
+
+test("V2 subscriber contract rejects unknown semantics, contradictory cursor and an endless empty source", async () => {
+  const loaded = loadSubscriber();
+  try {
+    const apply = (db, chunkResult) => loaded.service.applySubscriberScanChunk({ db, job: makeJob(), chunkResult });
+    await rejectCode(apply(memoryDb(makeRun()), { ...page(), hasMore: undefined }), "SUBSCRIBER_SCAN_HAS_MORE_INVALID");
+    await rejectCode(apply(memoryDb(makeRun()), { ...page(), pagination: { contract: "future", limit: 20 } }), "SUBSCRIBER_SCAN_PAGINATION_INVALID");
+    await rejectCode(apply(memoryDb(makeRun()), { ...page({ nextOffset: 1 }), pagination: { contract: "of_subscribers_offset_v2", limit: 20 } }), "SUBSCRIBER_SCAN_NEXT_OFFSET_MISMATCH");
+    const db = memoryDb(makeRun({ summary: { traversal: { consecutiveEmptyPages: 50 } } }));
+    await rejectCode(apply(db, { ...page({ items: [] }), pagination: { contract: "of_subscribers_offset_v2", limit: 20 } }), "SUBSCRIBER_SCAN_EMPTY_WINDOW_LIMIT");
+    assert.equal(db.run.hasMore, true); assert.equal(db.pages.length, 0);
   } finally { loaded.cleanup(); }
 });

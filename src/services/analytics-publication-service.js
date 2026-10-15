@@ -18,6 +18,7 @@ const PAGE = 200;
 const MAX_ATTEMPTS = 8;
 const MAX_JOB_ATTEMPTS = 5;
 function fault(code, status = 409) { return Object.assign(new Error(code), { code, status }); }
+function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
 function canonical(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return "[" + value.map(canonical).join(",") + "]";
@@ -250,6 +251,11 @@ function repairParams(job, now) {
 }
 async function settle(db, job, row, sideEffect, now, { forceTerminal = false } = {}) {
   const complete = sideEffect?.ok === true;
+  const daily = object(row.payload?.raw);
+  const earningsDetail = job.jobKey === "fetch_earnings" && !complete
+    ? `EARNINGS_DAILY_INCOMPLETE: ${Number(daily.dailyObservedCount || 0)} accepted, ${Number(daily.dailyRejected || 0)} rejected; ${JSON.stringify(daily.dailyRejectionReasons || {})}; source=${String(daily.dailySource || "unknown")}`
+    : null;
+  const failureReason = String([sideEffect?.error, earningsDetail].filter(Boolean).join("; ") || `${job.jobKey}_partial`).slice(0, 2000);
   const protocolSuperseded = !complete && ((job.jobKey === "fetch_campaigns" && sideEffect?.completion?.protocolCurrent === false)
     || (job.jobKey === "financial_transactions_scan" && sideEffect?.protocolCurrent === false));
   const attempts = Number(job.attempts || 0) + (!complete && !protocolSuperseded ? 1 : 0);
@@ -262,17 +268,17 @@ async function settle(db, job, row, sideEffect, now, { forceTerminal = false } =
   // be scheduled with a fresh scan generation; both changes commit together.
   await db.analyticsPublication.update({ where: { id: row.id }, data: {
     state: complete ? "COMMITTED" : "REJECTED", stage: "TERMINAL", response: result,
-    completedAt: now, lastError: complete ? null : String(sideEffect?.error || `${job.jobKey}_partial`),
+    completedAt: now, lastError: complete ? null : failureReason,
   } });
   if (!complete && !protocolSuperseded) await require("./job-result-service").recordJobFailure({ db, job,
-    error: protocolSuperseded ? `${job.jobKey}_protocol_superseded` : `${job.jobKey}_partial`, terminal, retryAfterAt: retryAt });
+    error: failureReason, terminal, retryAfterAt: retryAt });
   const updated = await db.jobInstance.update({ where: { id: job.id }, data: {
     status, completedAt: retryAt ? null : now, attempts, leaseUntil: null, leaseTokenHash: null, continuation: null,
     claimedAt: null, claimedByDeviceId: null, workId: null,
     ...(retryAt ? { nextRunAt: retryAt, params: repairParams(job, now) } : {}),
     lastProgressAt: now, result: { ...row.payload, completionSideEffect: sideEffect },
     progress: { percent: complete ? 100 : retryAt ? 0 : 99, message: complete ? "completed" : retryAt ? "scheduled for analytics repair" : "analytics publication failed" },
-    lastError: complete ? null : protocolSuperseded ? `${job.jobKey}_protocol_superseded` : String(sideEffect?.error || `${job.jobKey}_partial`),
+    lastError: complete ? null : protocolSuperseded ? `${job.jobKey}_protocol_superseded` : failureReason,
   } });
   if (job.jobKey === "financial_transactions_scan") await require("./financial-receipt-retention-service").publish({ db, job, now });
   if (retryAt) require("./job-planning-repository").publishPlannedJobAvailable(updated);

@@ -40,7 +40,10 @@ const CAMPAIGN_FRONTIER_SCHEDULING_VERSION = 1;
 const CAMPAIGN_DIRECTORY_REUSE_VERSION = 1;
 const CAMPAIGN_FRONTIER_BUDGET_DEFAULT = 50;
 const CAMPAIGN_FRONTIER_BUDGET_MAX = 200;
-const EARNINGS_COLLECTOR_VERSION = "earnings-v4";
+const EARNINGS_COLLECTOR_VERSION = "earnings-v5";
+// V5 fixes money-series parsing; the V4 wire schema and completeness proof are
+// unchanged. Accept queued V4 receipts during a Backend-first rolling update.
+const EARNINGS_COMPAT_COLLECTOR_VERSIONS = new Set(["earnings-v4", EARNINGS_COLLECTOR_VERSION]);
 const EARNINGS_SCHEMA_VERSION = 4;
 const MESSAGES_COLLECTOR_VERSION = "local-dialog-messages-v2";
 const MESSAGES_SCHEMA_VERSION = 2;
@@ -535,7 +538,7 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
   if (
     payload.kind !== "earnings_daily_page" ||
     payload.schemaVersion !== EARNINGS_SCHEMA_VERSION ||
-    payload.collectorVersion !== EARNINGS_COLLECTOR_VERSION ||
+    !EARNINGS_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion) ||
     !scanRunId ||
     !batchKey
   ) {
@@ -575,7 +578,7 @@ async function ingestEarningsChunk({ db = prisma, job, deviceId, chunk }) {
       dataType: "EARNINGS",
       rangeFrom,
       rangeTo,
-      collectorVersion: EARNINGS_COLLECTOR_VERSION,
+      collectorVersion: payload.collectorVersion,
       schemaVersion: EARNINGS_SCHEMA_VERSION,
       payload,
     });
@@ -646,7 +649,7 @@ function validateEarningsCompletion(job, result) {
   const scanRunId = text(payload.scanRunId, 120);
   if (
     payload.schemaVersion !== EARNINGS_SCHEMA_VERSION ||
-    payload.collectorVersion !== EARNINGS_COLLECTOR_VERSION ||
+    !EARNINGS_COMPAT_COLLECTOR_VERSIONS.has(payload.collectorVersion) ||
     !scanRunId
   ) {
     throw new Error("Invalid earnings completion contract");
@@ -682,7 +685,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result, public
       dataType: "EARNINGS",
       rangeFrom: startDate,
       rangeTo: utcDayEnd(endDate),
-      collectorVersion: EARNINGS_COLLECTOR_VERSION,
+      collectorVersion: payload.collectorVersion,
       schemaVersion: EARNINGS_SCHEMA_VERSION,
       payload,
     });
@@ -801,7 +804,7 @@ async function completeEarningsScan({ db = prisma, job, deviceId, result, public
           committedAt: desiredStatus === "COMMITTED" ? serverReceivedAt : null,
           status: desiredStatus,
             proofVersion: 2,
-          collectorVersion: EARNINGS_COLLECTOR_VERSION,
+          collectorVersion: payload.collectorVersion,
           schemaVersion: EARNINGS_SCHEMA_VERSION,
           scanGeneration: requestedRange.contract.scanGeneration,
           collectionReason: requestedRange.contract.collectionReason,

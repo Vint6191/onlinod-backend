@@ -1,9 +1,10 @@
 "use strict";
-const { runDbTransaction } = require("./db-transaction-service");
+const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-service");
+const { randomUUID } = require("node:crypto");
 
 
 const prisma = require("../prisma");
-const { createPlannedJob, updatePlannedJobDemand, publishPlannedJobAvailable } = require("./job-planning-repository");
+const { createPlannedJob, updatePlannedJobDemand, publishPlannedJobAvailable, scheduledResetData } = require("./job-planning-repository");
 
 const DIALOG_INTELLIGENCE_JOB_KEY = "dialog_intelligence_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING", "PAUSED"];
@@ -338,6 +339,7 @@ function targetedContinuation(target, resumeState, knownMessageThreshold) {
     offset: 0,
     page: 0,
     targetMessageId: target.messageId,
+    targetReceiptId: randomUUID(),
     watermark: clean(object(resumeState).watermark, 240),
     watermarkAt: clean(object(resumeState).watermarkAt, 80),
     watermarkReached: object(resumeState).watermarkReached === true,
@@ -346,6 +348,23 @@ function targetedContinuation(target, resumeState, knownMessageThreshold) {
     maxPages: 1,
     resumeState: object(resumeState),
   };
+}
+
+function isTargetedMode(mode) { return mode === "targeted" || mode === "reconcile"; }
+
+async function detachTargetFromHistoryState(db, { agencyId, creatorId, dialogId, runId }) {
+  const state = await db.dialogScanState.findUnique({ where: { creatorId_dialogId: { creatorId, dialogId } } });
+  if (!state || state.activeRunId !== runId) return;
+  // Repair only the pointer written by an older targeted-job build. A batch
+  // that already owns this dialog must retain its plan, progress and watermark.
+  await db.dialogScanState.updateMany({
+    where: { agencyId, creatorId, dialogId, activeRunId: runId },
+    data: {
+      status: state.status === "PAUSED" ? "PAUSED" : state.initialScanComplete && !state.incrementalGapOpen ? "READY" : "PLANNED",
+      scanMode: state.initialScanComplete ? "incremental" : "initial",
+      activeRunId: null, activeJobId: null, lastError: null,
+    },
+  });
 }
 
 async function scheduleDialogScanTx(db, input) {
@@ -357,24 +376,16 @@ async function scheduleDialogScanTx(db, input) {
   const control = await moduleControl(db, agencyId);
   if (!control.enabled) return { ok: true, created: false, reason: "module_disabled" };
 
+  // Serialize creation for this dialog. Progress/completion only take the job
+  // row lock, so they never wait for this scheduling-only advisory lock.
+  await lockDbAdvisoryXact({ db, key: `dialog-schedule:${agencyId}:${creatorId}:${dialogId}` });
   const state = await db.dialogScanState.findUnique({ where: { creatorId_dialogId: { creatorId, dialogId } } });
   const requestedMode = clean(input.mode, 40) || (state?.initialScanComplete ? "incremental" : "initial");
   const mode = requestedMode === "full" ? "initial" : requestedMode;
   const now = new Date();
   const requestedPriority = integer(input.priority, mode === "targeted" ? 160 : 70, 0, 200);
   const targetMessageId = clean(input.targetMessageId, 240);
-  const durableTarget = mode === "targeted" && targetMessageId
-    ? await enqueueReconciliationTarget(db, {
-        agencyId,
-        creatorId,
-        dialogId,
-        messageId: targetMessageId,
-        fanId: input.fanId,
-        source: input.source,
-        priority: requestedPriority,
-      })
-    : null;
-
+  if (isTargetedMode(mode) && !targetMessageId) throw Object.assign(new Error("Targeted reconciliation requires a message id"), { code: "DIALOG_TARGET_REQUIRED" });
   let active = await db.dialogScanRun.findFirst({
     where: { agencyId, creatorId, dialogId, status: { in: ACTIVE_RUN_STATUSES } },
     orderBy: { createdAt: "desc" },
@@ -400,8 +411,36 @@ async function scheduleDialogScanTx(db, input) {
     if (failedRun && checkpointRecoverable) active = failedRun;
   }
 
+  let activeJob = null;
+  if (active?.jobId) {
+    // Same lock order as progress/completion: job, then reconciliation target.
+    // A completion may have won while this scheduler waited for the row.
+    await db.$queryRawUnsafe('SELECT "id" FROM "JobInstance" WHERE "id"=$1 FOR UPDATE', active.jobId);
+    activeJob = await db.jobInstance.findUnique({ where: { id: active.jobId } });
+    active = await db.dialogScanRun.findUnique({ where: { id: active.id } });
+    if (active && ![...ACTIVE_RUN_STATUSES, "FAILED"].includes(active.status)) active = null;
+  }
+  const durableTarget = isTargetedMode(mode) && targetMessageId
+    ? await enqueueReconciliationTarget(db, { agencyId, creatorId, dialogId,
+        messageId: targetMessageId, fanId: input.fanId, source: input.source, priority: requestedPriority })
+    : null;
+
   if (active) {
-    const activeJob = active.jobId ? await db.jobInstance.findUnique({ where: { id: active.jobId } }) : null;
+    if (durableTarget && !isTargetedMode(active.mode) && activeJob?.status === "SCHEDULED") {
+      // This legacy full-history job is no longer claimable. Keep its history
+      // checkpoint in DialogScanState and use the run for the pending target.
+      const continuation = targetedContinuation(durableTarget, {}, integer(input.knownMessageThreshold, 3, 1, 100));
+      const params = { ...object(activeJob.params), mode: "targeted", targetMessageId: durableTarget.messageId };
+      const changed = await db.jobInstance.updateMany({
+        where: { id: activeJob.id, status: "SCHEDULED", leaseRevision: activeJob.leaseRevision },
+        data: { params, continuation, priority: requestedPriority, nextRunAt: now, lastError: null },
+      });
+      if (changed.count !== 1) throw Object.assign(new Error("Dialog target scheduling raced a claim"), { code: "DIALOG_TARGET_SCHEDULE_CONFLICT" });
+      active = await db.dialogScanRun.update({ where: { id: active.id }, data: { mode: "targeted", continuation, status: "QUEUED", lastError: null } });
+      await detachTargetFromHistoryState(db, { agencyId, creatorId, dialogId, runId: active.id });
+      return { ok: true, created: false, reason: "targeted_reconciliation_queued", run: active, job: { ...activeJob, params, continuation } };
+    }
+    if (isTargetedMode(active.mode)) await detachTargetFromHistoryState(db, { agencyId, creatorId, dialogId, runId: active.id });
     if (activeJob && ["SCHEDULED", "CLAIMED"].includes(activeJob.status)) {
       const params = object(activeJob.params);
       const demand = await updatePlannedJobDemand({
@@ -421,7 +460,7 @@ async function scheduleDialogScanTx(db, input) {
         where: { id: active.id },
         data: { status: active.status === "PAUSED" ? "QUEUED" : undefined, pausedAt: active.status === "PAUSED" ? null : undefined, lastError: null },
       });
-      await db.dialogScanState.updateMany({
+      if (!isTargetedMode(active.mode)) await db.dialogScanState.updateMany({
         where: { creatorId, dialogId },
         data: { status: activeJob.status === "CLAIMED" ? "RUNNING" : "QUEUED", activeRunId: active.id, activeJobId: activeJob.id, lastError: null },
       });
@@ -478,7 +517,7 @@ async function scheduleDialogScanTx(db, input) {
       ? discoveryResumeContinuation({ resumeContinuation, fallbackResumeContinuation, checkpoint: discoveryCheckpoint })
       : (Object.keys(resumeContinuation).length ? resumeContinuation : fallbackResumeContinuation);
     const scheduledResumeContinuation = durableTarget
-      ? targetedContinuation(durableTarget, baseResumeContinuation, fallbackResumeContinuation.knownMessageThreshold)
+      ? targetedContinuation(durableTarget, isTargetedMode(active.mode) ? {} : baseResumeContinuation, fallbackResumeContinuation.knownMessageThreshold)
       : baseResumeContinuation;
     const job = await createPlannedJob({
       db,
@@ -514,7 +553,7 @@ async function scheduleDialogScanTx(db, input) {
       where: { id: active.id },
       data: { jobId: job.id, status: "QUEUED", pausedAt: null, completedAt: null, lastError: null },
     });
-    await db.dialogScanState.upsert({
+    if (!isTargetedMode(active.mode)) await db.dialogScanState.upsert({
       where: { creatorId_dialogId: { creatorId, dialogId } },
       create: {
         agencyId,
@@ -584,6 +623,7 @@ async function scheduleDialogScanTx(db, input) {
       watermarkReached: false,
       overlapPages: integer(input.overlapPages, 2, 1, 10),
       targetMessageId: durableTarget?.messageId || targetMessageId,
+      ...(durableTarget ? { targetReceiptId: randomUUID() } : {}),
       knownUnchangedStreak: 0,
       knownMessageThreshold,
       maxPages,
@@ -593,7 +633,7 @@ async function scheduleDialogScanTx(db, input) {
     nextRunAt: now,
   });
   const linkedRun = await db.dialogScanRun.update({ where: { id: run.id }, data: { jobId: job.id } });
-  await db.dialogScanState.upsert({
+  if (!isTargetedMode(mode)) await db.dialogScanState.upsert({
     where: { creatorId_dialogId: { creatorId, dialogId } },
     create: {
       agencyId,
@@ -1107,6 +1147,7 @@ async function autoRecoverDialogHistoryTx(db, input) {
         agencyId,
         creatorId,
         dialogId: { notIn: ["__dialog_discovery__", "__dialog_history_batch__"] },
+        mode: { notIn: ["targeted", "reconcile"] },
         generation,
         status: { in: ACTIVE_RUN_STATUSES },
       },
@@ -1673,6 +1714,17 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
   const currentContinuation = jobContinuationValue(job.continuation);
   const submittedContinuation = { ...object(chunk.continuation) };
   const isTargeted = mode === "targeted" || mode === "reconcile";
+  if (isTargetedMode(run.mode) && !isTargeted) throw Object.assign(new Error("Targeted run cannot publish history coverage"), { code: "DIALOG_TARGET_MODE_MISMATCH" });
+  if (isTargeted) {
+    const expectedTarget = clean(currentContinuation.targetMessageId ?? params.targetMessageId, 240);
+    const expectedReceipt = clean(currentContinuation.targetReceiptId, 80);
+    const unavailable = chunk.targetMissing === true && [404, 410].includes(Number(object(chunk.progress).status));
+    if (!targetMessageId || targetMessageId !== expectedTarget
+      || (expectedReceipt && clean(chunk.targetReceiptId, 80) !== expectedReceipt)
+      || (!messageIds.includes(targetMessageId) && !unavailable)) {
+      throw Object.assign(new Error("Target result requires the exact locally committed message or an explicit 404/410"), { code: "DIALOG_TARGET_COMMIT_PROOF_MISSING" });
+    }
+  }
   const page = integer(chunk.pageStart ?? chunk.page, 0);
   const cursorOut = clean(chunk.cursorOut, 240);
 
@@ -1745,7 +1797,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
   }
 
   let continuationOverride = null;
-  const resumeState = isTargeted ? object(submittedContinuation.resumeState) : submittedContinuation;
+  const resumeState = isTargetedMode(run.mode) ? {} : isTargeted ? object(submittedContinuation.resumeState) : submittedContinuation;
   const nextTarget = await nextReconciliationTarget(db, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
@@ -1847,6 +1899,11 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
       lastError: null,
     },
   });
+
+  if (isTargetedMode(run.mode)) {
+    await detachTargetFromHistoryState(db, { agencyId: job.agencyId, creatorId: job.creatorId, dialogId, runId });
+    return { duplicate: false, replayedCommit: false, chunkId: commit.id, ...responseResult };
+  }
 
   const state = await db.dialogScanState.findUnique({
     where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId } },
@@ -1963,6 +2020,28 @@ async function completeDialogIntelligenceJob({ db = prisma, job, deviceId, resul
   if (!run) throw new Error("Dialog scan run not found");
   const continuation = object(run.continuation);
   const completion = object(result);
+  if (isTargetedMode(run.mode)) {
+    // A notification can arrive between the final page commit and completion.
+    // Hand that durable demand back to the queue under the same job row lock;
+    // never mark a run complete with an unowned pending target.
+    const pending = await nextReconciliationTarget(db, { agencyId: job.agencyId, creatorId: job.creatorId, dialogId });
+    if (pending) {
+      const continuation = targetedContinuation(pending, {}, integer(params.knownMessageThreshold, 3, 1, 100));
+      const queuedJob = await db.jobInstance.update({ where: { id: job.id }, data: scheduledResetData({
+        params: { ...params, mode: "targeted", targetMessageId: pending.messageId },
+        continuation, priority: Math.max(integer(job.priority, 0), pending.priority), nextRunAt: now,
+        progress: { stage: "TARGETED_RECONCILIATION", message: "Queued message reconciliation" },
+      }) });
+      await db.dialogScanRun.update({ where: { id: runId }, data: {
+        status: "QUEUED", mode: "targeted", continuation, completedAt: null, lastError: null,
+      } });
+      await detachTargetFromHistoryState(db, { agencyId: job.agencyId, creatorId: job.creatorId, dialogId, runId });
+      publishPlannedJobAvailable(queuedJob);
+      return { type: "dialog_intelligence", runId, dialogId, jobStatus: "SCHEDULED", next: {
+        created: false, reason: "pending_reconciliation", runId, jobId: job.id,
+      } };
+    }
+  }
   const confirmedMessageId = clean(
     completion.scanNewestMessageId
       ?? continuation.scanNewestMessageId,
@@ -1983,7 +2062,9 @@ async function completeDialogIntelligenceJob({ db = prisma, job, deviceId, resul
       lastError: null,
     },
   });
-  await db.dialogScanState.update({
+  if (isTargetedMode(run.mode)) {
+    await detachTargetFromHistoryState(db, { agencyId: job.agencyId, creatorId: job.creatorId, dialogId, runId });
+  } else await db.dialogScanState.update({
     where: { creatorId_dialogId: { creatorId: job.creatorId, dialogId } },
     data: {
       status: "READY",
@@ -2030,7 +2111,9 @@ async function recordDialogIntelligenceFailure({ job, error, terminal, db = pris
       where: { id: runId },
       data: { status, completedAt: terminal ? new Date() : null, lastError: clean(error, 2000) },
     });
-    await tx.dialogScanState.updateMany({
+    if (isTargetedMode(run?.mode)) {
+      await detachTargetFromHistoryState(tx, { agencyId: job.agencyId, creatorId: job.creatorId, dialogId, runId });
+    } else await tx.dialogScanState.updateMany({
       where: { creatorId: job.creatorId, dialogId },
       data: { status, lastError: clean(error, 2000), activeRunId: terminal ? null : undefined, activeJobId: terminal ? null : undefined },
     });

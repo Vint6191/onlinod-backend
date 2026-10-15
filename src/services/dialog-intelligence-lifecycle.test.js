@@ -18,6 +18,8 @@ function fakeDb(options = {}) {
   const latest = options.latest || active || failed || null;
   return {
     calls,
+    $executeRawUnsafe: async () => 1,
+    $queryRawUnsafe: async () => [],
     creatorAccount: { findFirst: async () => ({ id: "creator-1", agencyId: "agency-1", remoteId: "of-1", status: "READY" }) },
     moduleSetting: { findUnique: async () => ({ enabled: true, status: "active", config: {} }) },
     dialogReconciliationTarget: {
@@ -44,6 +46,7 @@ function fakeDb(options = {}) {
       findMany: async () => options.commits || [],
     },
     dialogScanRun: {
+      findUnique: async ({ where }) => [active, failed, ...calls.runsCreated].find(row => row?.id === where.id) || null,
       findFirst: async ({ where } = {}) => {
         if (where?.status === "FAILED") return failed;
         if (where?.dialogId === "__dialog_discovery__") return latest;
@@ -94,6 +97,26 @@ function fakeDb(options = {}) {
     },
   };
 }
+
+test("target scheduling leaves a batch-owned history plan untouched", async () => {
+  const db = fakeDb({ state: { status: "RUNNING", activeRunId: "batch", backwardCursor: "history-42", initialScanComplete: false } });
+  const result = await scheduleDialogScanTx(db, { agencyId: "agency-1", creatorId: "creator-1", dialogId: "dialog-1", mode: "targeted", targetMessageId: "777" });
+  assert.equal(result.created, true); assert.equal(result.job.params.mode, "targeted");
+  assert.equal(db.calls.statesUpserted.length, 0); assert.equal(db.calls.statesUpdated.length, 0);
+});
+
+test("target scheduling rechecks the run after locking a concurrently completed job", async () => {
+  const active = { id: "run-active", jobId: "job-active", status: "RUNNING", mode: "targeted" };
+  const activeJob = { id: "job-active", status: "CLAIMED", params: { mode: "targeted" } };
+  const db = fakeDb({ active, activeJob });
+  let locked = false;
+  db.$queryRawUnsafe = async () => { locked = true; active.status = "COMPLETED"; activeJob.status = "DONE"; return []; };
+  const enqueue = db.dialogReconciliationTarget.upsert;
+  db.dialogReconciliationTarget.upsert = args => { assert.equal(locked, true); return enqueue(args); };
+  const result = await scheduleDialogScanTx(db, { agencyId: "agency-1", creatorId: "creator-1", dialogId: "dialog-1", mode: "targeted", targetMessageId: "888" });
+  assert.equal(result.created, true); assert.equal(db.calls.jobsCreated.length, 1);
+  assert.equal(result.job.params.targetMessageId, "888");
+});
 
 test("dialog open on a new dialog creates one initial durable run", async () => {
   const db = fakeDb();

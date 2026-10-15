@@ -23,8 +23,8 @@ const {
 const SUBSCRIBER_DIRECTORY_JOB_KEY = "subscriber_directory_scan";
 const ACTIVE_RUN_STATUSES = ["QUEUED", "RUNNING"];
 const DEFAULT_SCAN_EVERY_DAYS = 7;
-const DEFAULT_PAGE_LIMIT = 100;
-const MAX_PAGE_LIMIT = 100;
+const DEFAULT_PAGE_LIMIT = 20;
+const MAX_PAGE_LIMIT = 20;
 const MAX_PAGE_ITEMS = 100;
 const MAX_HIDDEN_LIST_LIMIT = 500;
 const PUBLICATION_BATCH_SIZE = 500;
@@ -845,7 +845,8 @@ async function applySubscriberScanChunk({
     error.code = "SUBSCRIBER_SCAN_OFFSET_INVALID";
     throw error;
   }
-  const hasMore = chunk.hasMore === true;
+  if (typeof chunk.hasMore !== "boolean") throw Object.assign(new Error("Subscriber hasMore must be explicit"), { code: "SUBSCRIBER_SCAN_HAS_MORE_INVALID" });
+  const hasMore = chunk.hasMore;
   if (!Array.isArray(chunk.items)) throw Object.assign(new Error("SUBSCRIBER_SCAN_ITEMS_REQUIRED"), { code: "SUBSCRIBER_SCAN_ITEMS_REQUIRED" });
   if (chunk.items.length > MAX_PAGE_ITEMS) {
     const error = new Error(`Subscriber page exceeds ${MAX_PAGE_ITEMS} items`);
@@ -862,13 +863,18 @@ async function applySubscriberScanChunk({
       throw error;
     }
   }
-  // The transport retains one item per provider row, including identical
-  // duplicates. Cursor distance is proved by those rows, never by unique fans.
-  const serverDerivedNextOffset = offset + itemsInput.length;
+  // V2 follows the OF source window (20), before OF filters unavailable users.
+  // V1 remains readable during rolling deployment and for lost-ACK replays.
+  const pagination = object(chunk.pagination);
+  const sourceWindow = pagination.contract === "of_subscribers_offset_v2";
+  if (Object.keys(pagination).length && (!sourceWindow || pagination.limit !== 20 || itemsInput.length > 20)) {
+    throw Object.assign(new Error("Subscriber pagination contract is invalid"), { code: "SUBSCRIBER_SCAN_PAGINATION_INVALID" });
+  }
+  const serverDerivedNextOffset = offset + (sourceWindow && hasMore ? 20 : itemsInput.length);
   const nextOffsetSubmitted = chunk.nextOffset !== null && chunk.nextOffset !== undefined && chunk.nextOffset !== "";
   const submittedNextOffset = nextOffsetSubmitted ? integerOrNull(chunk.nextOffset, 0, 10_000_000) : serverDerivedNextOffset;
   if (submittedNextOffset === null || submittedNextOffset !== serverDerivedNextOffset) {
-    const error = new Error("Subscriber nextOffset does not match transported provider row count");
+    const error = new Error("Subscriber nextOffset does not match its provider pagination contract");
     error.code = "SUBSCRIBER_SCAN_NEXT_OFFSET_MISMATCH";
     throw error;
   }
@@ -900,7 +906,7 @@ async function applySubscriberScanChunk({
     return { duplicate: true, published: run.status === "PUBLISHED", nextOffset: existingPage.nextOffset, hasMore: existingPage.hasMore };
   }
 
-  if (hasMore && itemsInput.length === 0) {
+  if (hasMore && itemsInput.length === 0 && !sourceWindow) {
     const error = new Error("Subscriber non-terminal page cannot stall the provider cursor");
     error.code = "SUBSCRIBER_SCAN_STALLED_CURSOR";
     throw error;
@@ -926,6 +932,10 @@ async function applySubscriberScanChunk({
   const previousTraversal = object(object(run.summary).traversal);
   const noNewPage = hasMore && normalizedFanIds.length > 0 && prior.length === normalizedFanIds.length;
   const consecutiveNoNewPages = noNewPage ? Number(previousTraversal.consecutiveNoNewPages || 0) + 1 : 0;
+  const consecutiveEmptyPages = hasMore && itemsInput.length === 0 ? Number(previousTraversal.consecutiveEmptyPages || 0) + 1 : 0;
+  if (consecutiveEmptyPages > 50) {
+    throw Object.assign(new Error("Subscriber source returned 50 empty advancing pages; snapshot remains incomplete"), { code: "SUBSCRIBER_SCAN_EMPTY_WINDOW_LIMIT" });
+  }
   if (consecutiveNoNewPages > 5) {
     throw Object.assign(new Error("Subscriber source keeps returning only previously seen fans; publication stopped"), { code: "SUBSCRIBER_SCAN_NON_ADVANCING_SOURCE" });
   }
@@ -998,9 +1008,13 @@ async function applySubscriberScanChunk({
 
   const progressData = {
     status: "RUNNING", startedAt: run.startedAt || authorityNow, nextOffset,
+    ...(sourceWindow ? { pageLimit: 20 } : {}),
     scannedCount: { increment: snapshot.addedCount }, pageCount: { increment: 1 }, hiddenCount: { increment: snapshot.hiddenDelta },
     summary: { ...object(run.summary), traversal: {
-      providerRows: nextOffset, uniqueFans: Number(run.scannedCount || 0) + snapshot.addedCount,
+      providerRows: Number(previousTraversal.providerRows ?? offset) + itemsInput.length,
+      providerOffset: nextOffset, paginationContract: sourceWindow ? pagination.contract : "provider_rows_v1",
+      filteredPositions: Number(previousTraversal.filteredPositions || 0) + nextOffset - offset - itemsInput.length,
+      consecutiveEmptyPages, uniqueFans: Number(run.scannedCount || 0) + snapshot.addedCount,
       duplicateRows: Number(previousTraversal.duplicateRows || 0) + itemsInput.length - snapshot.addedCount,
       overlappingPages: Number(previousTraversal.overlappingPages || 0) + Number(prior.length > 0), consecutiveNoNewPages,
     } },
