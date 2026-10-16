@@ -677,6 +677,8 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       if (!readyBindings.length) return null;
       const attemptClaimData = { ...claimData, claimedAt: claimNow,
         leaseUntil: new Date(claimNow.getTime() + leaseDuration(leaseMs)), startedAt: candidate.startedAt || claimNow };
+      const collectionObservation = require('./analytics-observation-time').stampUnstartedCollectionObservation(candidate, claimNow);
+      if (collectionObservation) attemptClaimData.params = { ...object(attemptClaimData.params || candidate.params), ...collectionObservation };
       if (candidate.jobKey === "fetch_earnings" && !candidate.continuation) {
         // Freshness starts at actual collection, not while a job waits behind
         // history. Keep authorityRequestedAt unchanged for stale-result fencing.
@@ -690,7 +692,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       if (candidate.jobKey === "financial_transactions_scan") {
         const authority = require("./financial-receipt-authority");
         await authority.enter(db);
-        attemptClaimData.params = await authority.claimParams(db, candidate);
+        attemptClaimData.params = await authority.claimParams(db, { ...candidate, params: attemptClaimData.params || candidate.params });
         attemptClaimData.continuation = await authority.restoreContinuation(db, { ...candidate, params: attemptClaimData.params });
       }
       const updated = await db.jobInstance.updateMany({
@@ -774,8 +776,14 @@ async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision
   // Authority/member lock precedes the JobInstance lock. Reading time before
   // either wait would allow an already-expired lease to pass the mutation CAS.
   if (lock && typeof db.$queryRawUnsafe === "function") {
-    const rows = await db.$queryRawUnsafe('SELECT * FROM "JobInstance" WHERE "id"=$1 FOR UPDATE' + (nowait ? ' NOWAIT' : ''), jobId);
+    // A busy keepalive is an expected scheduling outcome. SKIP LOCKED avoids
+    // aborting PostgreSQL (and emitting a Prisma error) just to discover it.
+    const rows = await db.$queryRawUnsafe('SELECT * FROM "JobInstance" WHERE "id"=$1 FOR UPDATE' + (nowait ? ' SKIP LOCKED' : ''), jobId);
     job = rows?.[0];
+    if (!job && nowait && await db.jobInstance.findUnique({ where: { id: jobId }, select: { id: true } })) {
+      throw Object.assign(new JobLeaseError("JOB_LEASE_BUSY", "Job update is busy; retry the same lease mutation", 503),
+        { retryable: true, retryAfterMs: 1000 });
+    }
     if (!job) throw new JobLeaseError("JOB_NOT_FOUND", "Job not found", 404);
   }
   const now = await dbAuthorityNow({ db, fallbackNow: new Date() });

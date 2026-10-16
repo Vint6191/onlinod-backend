@@ -21,7 +21,9 @@ test("populated Campaign coverage crosses JSON with exact bigint revisions and u
   assert.equal(wire.sourceCoverage.campaigns.membershipObservedAt,now.toISOString());
   assert.equal(wire.sourceCoverage.campaigns.fanValueOutstanding,1);
   assert.equal(campaigns.campaignDirectoryFactsRevision,revision);
-  assert.equal(wire.totals.netCents,0);
+  assert.equal(wire.totals.netCents,null);
+  assert.equal(wire.totals.payingFans,null);
+  assert.equal(wire.sourceCoverage.revenue.reason,"FINANCIAL_BASELINE_MISSING");
 });
 test("opaque revision serialization does not relax safe monetary JSON bounds",()=>{
   assert.throws(()=>metricsDto({knownNetCents:"9007199254740993"}),e=>e.code==="CAMPAIGN_AMOUNT_OUT_OF_SAFE_RANGE");

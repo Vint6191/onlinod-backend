@@ -1971,7 +1971,10 @@ async function runRecurringCreatorWork({
       || new Date(baseNow).getTime() - lastFullPlanningAt.getTime() >= RECURRING_INTERVAL_MS;
     try {
       const { planRecurringCreatorAnalytics } = require("./analytics-recurring-planning-service");
-      const analytics = await planRecurringCreatorAnalytics({ db, item, ownerToken: claim.ownerToken, now, includeCatchups: fullPlanningDue });
+      // Each collector owns its freshness/frontier and retry policy. Revisit
+      // unfinished offline gaps every minute instead of parking each segment
+      // behind the unrelated hourly vault/subscriber planning cycle.
+      const analytics = await planRecurringCreatorAnalytics({ db, item, ownerToken: claim.ownerToken, now, includeCatchups: true });
       totalCreated += Number(analytics.created || 0);
       totalSkipped += Number(analytics.skipped || 0);
     } catch (error) {

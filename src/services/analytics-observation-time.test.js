@@ -6,6 +6,7 @@ const prismaPath = require.resolve("../prisma");
 require.cache[prismaPath] = { id: prismaPath, filename: prismaPath, loaded: true, exports: {} };
 const { parseObservationTime, stampObservationStart, observationStartForJob, earningsObservationAt, directoryDiscoveryDeadline } = require("./analytics-observation-time");
 const { selectDurableCollectionProof } = require("./analytics-freshness-policy");
+const { stampUnstartedCollectionObservation } = require("./analytics-observation-time");
 const { evaluateDurableCollectorState } = require("./analytics-state-evaluator");
 const { stampCollectionAuthorityParams, collectorPlanningProofAt,
   completeFinancialCollection, completeCampaignCollection } = require("./analytics-collector-control-service");
@@ -39,6 +40,23 @@ function evaluate(state, at = now) {
     lastVerifiedAt: state.lastCatchupCompletedAt, baselineObservedAt: state.baselineObservedAt,
     lastObservedAt: state.lastCatchupObservedAt, now: at, freshnessMs: hour });
 }
+
+for (const type of ["NOTIFICATIONS", "FINANCIAL"]) test(`${type} first claim after offline binds the read window without changing authority or frontier`, () => {
+  const queued = job(type, "catchup");
+  queued.jobKey = type === "NOTIFICATIONS" ? "catchup_notifications_scan" : "financial_transactions_scan";
+  Object.assign(queued.params, { from: "2016-01-01T00:00:00.000Z", stopAtNotificationId: "verified-head", knownNotificationIds: ["verified-head"],
+    endDate: "2026-09-28 12:00:00", to: "2026-09-28T12:05:00Z" });
+  const before = structuredClone(queued);
+  const params = stampUnstartedCollectionObservation(queued, now);
+  assert.equal(params.analyticsObservationStartedAt, now.toISOString());
+  for (const field of ["collectionGeneration", "collectionAuthorityRequestedAt", "from", "stopAtNotificationId", "knownNotificationIds"]) assert.deepEqual(params[field], before.params[field]);
+  if (type === "NOTIFICATIONS") assert.equal(params.to, "2026-10-01T12:05:00.000Z");
+  else { assert.equal(params.endDate, "2026-10-01 12:00:00"); assert.equal(params.initialMarker, +now/1000); }
+  assert.deepEqual(queued, before);
+  assert.equal(stampUnstartedCollectionObservation({ ...queued, startedAt: old }, now), null);
+  assert.equal(stampUnstartedCollectionObservation({ ...queued, continuation: { driverPhase: "execute" } }, now), null);
+  if (type === "FINANCIAL") assert.equal(stampUnstartedCollectionObservation({ ...queued, params: { ...queued.params, financialWindowGeneration: "generation" } }, now), null);
+});
 
 test("physical observation does not follow logical ordering or client payload time", () => {
   const params = stampCollectionAuthorityParams({ collectionType: "CAMPAIGNS" }, old, now);

@@ -1723,8 +1723,11 @@ test("today earnings are official only when the row and in-progress proof both e
 test("campaign fan reader scopes the campaign to the creator and pages concrete fan identities", async () => {
   const queries=[];
   const db = {
+    creatorFinancialCollectionState:{findUnique:async()=>null},
+    creatorCampaignCollectionState:{findUnique:async()=>null},
     $queryRawUnsafe: async (sql,...args) => {
       queries.push({sql,args});
+      if(sql.includes('FROM "CreatorFanRefreshDemand"'))return [{queued:false,failed:false}];
       if(sql.includes('clock_timestamp'))return [{authorityNow:new Date('2026-08-08')}];
       if(sql.includes('FROM "CampaignProjectionPolicy"'))return [{completedAt:new Date('2026-08-08'),generation:1,activeGeneration:1,empty:false,valueFreshnessMs:require('./analytics-freshness-policy').CAMPAIGN_FAN_VALUE_FRESHNESS_MS,pending:false,expired:false}];
       if(sql.includes('FROM "CreatorCampaignFan" m'))return [{id:'link-1',fanId:'fan-1'},{id:'link-2',fanId:'fan-2'}];
@@ -1746,6 +1749,8 @@ test("campaign fan reader scopes the campaign to the creator and pages concrete 
   assert.equal(result.pagination.hasMore, true);
   assert(result.pagination.nextCursor);
   assert.equal(result.contractVersion,1);
+  assert.equal(result.fans[0].revenue.netCents,null);
+  assert.equal(result.sourceCoverage.revenue.reason,'FINANCIAL_BASELINE_MISSING');
   assert(queries.every(q=>!q.sql.includes('CreatorFinancialTransaction')));
   const selection=queries.find(q=>q.sql.includes('FROM "CreatorCampaignFan" m'));
   assert.deepEqual(selection.args.slice(0,2),['creator-1','campaign-1']);

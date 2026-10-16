@@ -41,7 +41,9 @@ function state(overrides = {}) { return {
   campaignProofCampaignBatches: 1, campaignProofClaimerBatches: 1,
   ...overrides,
 }; }
-const financial = { status: 'COMPLETE', baselineGeneration: 'financial', baselineVerifiedAt: now, baselineObservedAt: now };
+const financial = { status: 'COMPLETE', baselineGeneration: 'financial', baselineVerifiedAt: now, baselineObservedAt: now,
+  receiptCoverageVersion:1,baselineRangeFrom:new Date('2016-01-01Z'),baselineRangeTo:now,coverageThrough:now,
+  recentRangeFrom:new Date(+now-7*86400000),recentRangeTo:now,historyAuditObservedAt:now };
 const read = load('campaign-read-repository');
 async function comparison(legacy) {
   scheduled.length = 0;

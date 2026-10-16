@@ -37,6 +37,22 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
   ].map(x=>({...x,agencyId:s.agencyId,creatorId:s.creatorId}))});
  });
  await check('bounded durable backfill and live queue converge',async()=>({turns:await drain(),pendingSignals:await db.campaignReadChange.count()}));
+ await check('processed money without source proof stays a known subtotal, not a complete zero or total',async()=>{
+  const p=await page();assert.equal(p.projection.ready,true);assert.equal(p.totals.netCents,null);assert.equal(p.totals.knownNetCents,240);
+  assert.equal(p.totals.payingFans,null);assert.equal(p.sourceCoverage.revenue.reason,'FINANCIAL_BASELINE_MISSING');
+  const fans=await read.readCampaignFanPage({db,creatorId:s.creatorId,campaignId:'campaign-2000',rangeKey:'30d'});
+  assert.equal(fans.fans[0].revenue.netCents,null);assert.equal(fans.fans[0].fanValue.platformReportedTotalSpendCents,9000);
+  return{knownNet:240,fullNet:null,fanValueIndependent:true};
+ });
+ // Explicit fixture receipts; this proof exercises the projection/read side.
+ // catchup-recovery-proof.cjs exercises real financial collector receipts.
+ await write(async tx=>{
+  const {seedCoverage}=require('../../test-support/campaign-read-coverage-fixture.cjs');
+  await seedCoverage(tx,s,{kind:'FINANCIAL',now,state:{
+   baselineRangeFrom:new Date('2016-01-01T00:00:00Z'),baselineRangeTo:now,receiptCoverageVersion:1,coverageThrough:now,
+   recentRangeFrom:new Date('2016-01-01T00:00:00Z'),recentRangeTo:now,historyAuditObservedAt:now}});
+  await seedCoverage(tx,s,{kind:'CAMPAIGNS',now});
+ });
  await check('2001 campaigns remain reachable; totals are independent of page size',async()=>{
   const first=await page({limit:1});assert.equal(first.totals.campaigns,2001);assert.equal(first.totals.netCents,240);assert.equal(first.rows.length,1);
   let cursor=null;const seen=new Set();do{const p=await page({limit:100,cursor});assert.equal(p.totals.netCents,240);for(const r of p.rows){assert(!seen.has(r.id));seen.add(r.id)}cursor=p.pagination.nextCursor;}while(cursor);

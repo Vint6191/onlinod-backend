@@ -52,6 +52,7 @@ function loadService(fixture) {
       if (/FROM "User"/.test(sql)) return fixture.disabledUser ? [] : [{ id: args[0] }];
       if (/FROM "CreatorAccount"/.test(sql) && /FOR SHARE/.test(sql)) return [{ id: args[0] }];
       if (/FROM "JobInstance" WHERE "id"=\$1 FOR UPDATE/.test(sql)) {
+        if (fixture.jobLockProbe) return fixture.jobLockProbe(sql, ...args);
         const row = discovered.has(args[0])
           ? { ...discovered.get(args[0]), ...(rows.get(args[0]) || {}) }
           : await fixture.db.jobInstance.findUnique({ where: { id: args[0] } });
@@ -1056,6 +1057,31 @@ test("a stale worker cannot rotate a notification repair owned by another lease"
   assert.equal(item.update(), null);
 });
 
+for (const type of ['NOTIFICATIONS','FINANCIAL']) test(`first ${type} claim after offline updates observation bounds while retaining the original generation`, async () => {
+  const now=new Date(),old=new Date(+now-90*86400000),jobKey=type==='NOTIFICATIONS'?'catchup_notifications_scan':'financial_transactions_scan';
+  const params=require('./analytics-collector-control-service').stampCollectionAuthorityParams({collectionContractVersion:1,collectionType:type,
+    collectionMode:'catchup',collectionGeneration:'queued-generation',collectionRequestedAt:old.toISOString(),notificationMode:'catchup',
+    notificationNormalizerVersion:'notification-source-v2',types:NOTIFICATION_TYPES,from:'2016-01-01T00:00:00.000Z',stopAtNotificationId:'old-verified-head'},old);
+  const candidate={id:'queued-offline',agencyId:'agency-1',creatorId:'creator-1',jobKey,status:'SCHEDULED',leaseRevision:0,attempts:0,
+    startedAt:null,continuation:null,params,nextRunAt:old};
+  let data;
+  const db={
+    workerDevice:{findUnique:async()=>({id:'device-1',userId:'user-1',agencyId:'agency-1',lastSeenAt:now})},
+    agencyMember:{findFirst:async()=>({id:'member-1',role:'OWNER',roleKey:'owner',assignedCreators:'all',accessEpoch:1})},
+    creatorAccount:{findMany:async()=>[{id:'creator-1'}]},deviceCreatorBinding:{findMany:async()=>[{creatorId:'creator-1'}]},
+    creatorFinancialCollectionState:{findUnique:async()=>null},financialReceiptRun:{findUnique:async()=>null},$executeRawUnsafe:async()=>1,
+    jobInstance:{findMany:async()=>[],findFirst:async()=>candidate,updateMany:async input=>{data=input.data;return{count:1}},
+      findUnique:async()=>({...candidate,...data,leaseRevision:1,creator:{id:'creator-1'}})},
+  };
+  const {claimJob}=loadService({db});
+  const result=await claimJob({userId:'user-1',deviceId:'device-1',jobKeys:[jobKey],capabilities:{financialWindowReceiptsV1:true}});
+  assert.equal(result.reason,'claimed');assert.equal(result.job.params.collectionGeneration,params.collectionGeneration);
+  assert.equal(result.job.params.collectionAuthorityRequestedAt,params.collectionAuthorityRequestedAt);
+  assert(Date.parse(result.job.params.analyticsObservationStartedAt)>=+now);
+  if(type==='NOTIFICATIONS') {assert(Date.parse(result.job.params.to)>=+now+5*60000);assert.equal(result.job.params.stopAtNotificationId,'old-verified-head');}
+  else {assert.equal(result.job.params.financialWindowGeneration,params.collectionGeneration);assert(Date.parse(result.job.params.financialWindows[0].to)>=Math.floor(+now/1000)*1000);}
+});
+
 test("claiming a queued pre-fix repair returns a fresh notification generation and resets only the traversal", async () => {
   const now = new Date();
   const candidate = { id: "queued-old-repair", agencyId: "agency-1", creatorId: "creator-1", jobKey: "catchup_notifications_scan",
@@ -1813,6 +1839,33 @@ test("I3 renewal deadline is computed from time after locks, not request admissi
   const result = await service.renewLease({ jobId: item.job.id, userId: "user-1", deviceId: "device-1",
     leaseToken: item.token, leaseRevision: 3, leaseMs: 30000 });
   assert.equal(result.leaseUntil.toISOString(), "2040-01-01T00:00:35.000Z");
+});
+
+test('busy keepalive skips the locked job without a PostgreSQL error or a false lease loss, then renews the same lease', async () => {
+  const item = fixture(), before = structuredClone(item.job);
+  item.db.$executeRawUnsafe = async () => 1;
+  item.db.$queryRawUnsafe = async () => [{ authorityNow: new Date() }];
+  let busy = true, rolledBack = false;
+  item.jobLockProbe = async sql => { assert.match(sql, /FOR UPDATE SKIP LOCKED$/); assert.doesNotMatch(sql, /NOWAIT/); return busy ? [] : [item.job]; };
+  item.afterRollback = () => { rolledBack = true; };
+  const { renewLease } = loadService(item);
+  const input = { jobId: item.job.id, userId: 'user-1', deviceId: 'device-1', leaseToken: item.token, leaseRevision: 3 };
+  await assert.rejects(() => renewLease(input), error => error.code === 'JOB_LEASE_BUSY' && error.status === 503 && error.retryable && error.retryAfterMs === 1000);
+  assert.equal(rolledBack, true); assert.equal(item.update(), null); assert.deepEqual(item.job, before);
+  busy = false;
+  const response = await renewLease(input);
+  assert(response.leaseUntil instanceof Date); assert.equal(item.update().where.leaseRevision, 3);
+});
+
+test('a deleted job is not misreported as temporary lock contention', async () => {
+  const item = fixture(); let reads = 0;
+  item.db.jobInstance.findUnique = async () => ++reads === 1 ? item.job : null;
+  item.db.$executeRawUnsafe = async () => 1;
+  item.db.$queryRawUnsafe = async () => [];
+  item.jobLockProbe = async () => [];
+  const { renewLease } = loadService(item);
+  await assert.rejects(() => renewLease({ jobId: item.job.id, userId: 'user-1', deviceId: 'device-1', leaseToken: item.token, leaseRevision: 3 }), error => error.code === 'JOB_NOT_FOUND' && error.status === 404);
+  assert.equal(item.update(), null);
 });
 
 function subscriberLeaseFixture() {

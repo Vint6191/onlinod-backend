@@ -20,6 +20,26 @@ function stampObservationStart(params, authorityNow) {
   return { ...params, analyticsObservationStartedAt: at.toISOString() };
 }
 
+function stampUnstartedCollectionObservation(job, authorityNow) {
+  // A queue can outlive a laptop's offline period. Bind the first observation
+  // window at claim, preserving the command's logical generation/order. A
+  // takeover must retain its original window and every committed page receipt.
+  if (job?.startedAt != null || job?.continuation != null) return null;
+  const params = job?.params || {};
+  const type = params.collectionType;
+  if (params.collectionContractVersion !== 1
+      || !((job.jobKey === 'catchup_notifications_scan' && type === 'NOTIFICATIONS')
+        || (job.jobKey === 'financial_transactions_scan' && type === 'FINANCIAL'))) return null;
+  if (type === 'FINANCIAL' && params.financialWindowGeneration) return null;
+  const stamped = stampObservationStart(params, authorityNow), at = date(authorityNow);
+  if (type === 'NOTIFICATIONS') stamped.to = new Date(+at + 5 * 60_000).toISOString();
+  else {
+    stamped.initialMarker = Math.floor(+at / 1000);
+    stamped.endDate = new Date(stamped.initialMarker * 1000).toISOString().slice(0, 19).replace('T', ' ');
+  }
+  return stamped;
+}
+
 function observationStartForJob(job) {
   const params = job?.params || {};
   // A malformed explicit boundary is unknown, not permission to use a newer
@@ -66,5 +86,5 @@ function directoryDiscoveryDeadline(state, targetMs, now = null) {
   return scheduled ? new Date(Math.min(+scheduled, +sourceDeadline)) : sourceDeadline;
 }
 
-module.exports = { parseObservationTime: date, stampObservationStart, observationStartForJob, earningsObservationAt,
+module.exports = { parseObservationTime: date, stampObservationStart, stampUnstartedCollectionObservation, observationStartForJob, earningsObservationAt,
   earningsObservationSql, directoryObservationAt, directoryDiscoveryDeadline };
