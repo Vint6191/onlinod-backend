@@ -7,7 +7,8 @@ const MAX_FANS = 100;
 // Called inside the projection root commit, after acquiring Campaign authority.
 // Internal fan ids are re-resolved against current membership and canonical
 // value facts. No payload money/timestamp, run id or historical work is trusted.
-async function requestExpiredCampaignValues({ tx, agencyId, creatorId, fanIds, now, freshnessMs }) {
+async function requestExpiredCampaignValues({ tx, agencyId, creatorId, fanIds, now, freshnessMs, reason = null }) {
+  if (!['MANUAL_REFRESH', 'INITIAL_BASELINE', 'OFFLINE_GAP', 'ENTITY_REPAIR'].includes(reason)) return { requested:0, reason:'event_driven_policy' };
   const ids = [...new Set(fanIds || [])].sort();
   if (!ids.length) return { requested: 0 };
   if (!agencyId || !creatorId || ids.length > MAX_FANS || !Number.isFinite(+now)

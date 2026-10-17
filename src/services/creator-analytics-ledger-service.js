@@ -1922,14 +1922,22 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
   // Directory authority already checked the count under this same creator lock.
   const allCount = directoryAuthority.campaignCount;
   const schedulingCurrent = Number(object(job.params).campaignFrontierSchedulingVersion || 0) >= CAMPAIGN_FRONTIER_SCHEDULING_VERSION;
-  const bounded = command.mode === "catchup" && schedulingCurrent && boundedFrontiers.enabled(job)
+  const recovering = job.params?.syncPolicyVersion === 2 && Boolean(job.params?.recoveryIntentId);
+  const bounded = !recovering && command.mode === "catchup" && schedulingCurrent && boundedFrontiers.enabled(job)
     && directoryCounts.sealedDirectoryCount(current, directoryAuthority) !== null;
   let dueCount = allCount;
   let targetCount = allCount;
   let targetIds = [];
   let selected = null;
 
-  if (command.mode === "full" || !schedulingCurrent) {
+  if (recovering) {
+    // The offset source has no ordered frontier contract. Recover every member
+    // scope once, with indexed fair-page cursors; wall-clock TTL is irrelevant.
+    await tx.creatorCampaign.updateMany({ where: exactGeneration, data: {
+      claimersTargetRunId: scanRunId, ...fairPages.initialCursor(scanRunId),
+    } });
+    targetCount = allCount;
+  } else if (command.mode === "full" || !schedulingCurrent) {
     // Full/rolling-compat traversal already scans every row. Do not materialize
     // the entire directory merely to attach target markers.
     targetCount = allCount;
@@ -2558,7 +2566,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     const isCurrentDay = day.getTime() === currentDay.getTime();
     const state = evaluateCollectionState({
       status: row.status,
-      proofStatus: row.scanProof?.proofVersion === 2 ? row.scanProof.status : null,
+      proofStatus: row.proofKind === "FINANCIAL_LEDGER_V1" ? "COMMITTED" : row.scanProof?.proofVersion === 2 ? row.scanProof.status : null,
       lastVerifiedAt: row.lastVerifiedAt || null,
       retryAfterAt: row.retryAfterAt || null,
       now,
@@ -2568,7 +2576,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     if (state.complete) completeEarningsDays += 1;
     if (state.partial) partialEarningsDays += 1;
     if (state.usable) provenEarningsDays += 1;
-    if (state.fresh) freshEarningsDays += 1;
+    if (row.liveFresh === true || (row.liveFresh !== false && state.fresh)) freshEarningsDays += 1;
     if (state.deferred && state.retryAfterAt && (!earningsRetryAfterAt || state.retryAfterAt > earningsRetryAfterAt)) {
       earningsRetryAfterAt = state.retryAfterAt;
     }

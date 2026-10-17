@@ -82,7 +82,6 @@ const {
 
 // Recurring sweeper interval. Owner asked for 1 hour.
 const RECURRING_INTERVAL_MS = 60 * 60 * 1000;
-const EARNINGS_PLANNING_INTERVAL_MS = require("./analytics-freshness-policy").HOME_AUTO_REFRESH_INTERVAL_MS;
 
 // How recently a "DONE" job counts as fresh enough to skip rescheduling.
 // Same as RECURRING_INTERVAL_MS — if we just refreshed, don't refresh again.
@@ -1971,9 +1970,9 @@ async function runRecurringCreatorWork({
       || new Date(baseNow).getTime() - lastFullPlanningAt.getTime() >= RECURRING_INTERVAL_MS;
     try {
       const { planRecurringCreatorAnalytics } = require("./analytics-recurring-planning-service");
-      // Each collector owns its freshness/frontier and retry policy. Revisit
-      // unfinished offline gaps every minute instead of parking each segment
-      // behind the unrelated hourly vault/subscriber planning cycle.
+      // Capture-loss/reconnect events wake this exact creator immediately.
+      // Collector retries remain owned by their scheduled job. Healthy creators
+      // have no minute analytics polling; hourly generic planning is separate.
       const analytics = await planRecurringCreatorAnalytics({ db, item, ownerToken: claim.ownerToken, now, includeCatchups: true });
       totalCreated += Number(analytics.created || 0);
       totalSkipped += Number(analytics.skipped || 0);
@@ -2034,12 +2033,13 @@ async function runRecurringCreatorWork({
       continue;
     }
 
-    const nextRunAt = new Date(new Date(baseNow).getTime() + EARNINGS_PLANNING_INTERVAL_MS);
+    const nextRunAt = new Date((fullPlanningDue ? new Date(baseNow) : lastFullPlanningAt).getTime() + RECURRING_INTERVAL_MS);
     const released = await yieldDomainWorkClaim({
       db,
       item,
       ownerToken: claim.ownerToken,
       availableAt: nextRunAt,
+      preserveProgressOnNewerRevision: true,
       progressCursor: { lastPlanningCycleAt: new Date(baseNow).toISOString(), nextPlanningCycleAt: nextRunAt.toISOString(),
         lastFullPlanningAt: (fullPlanningDue ? new Date(baseNow) : lastFullPlanningAt).toISOString() },
       fallbackNow: now,
@@ -2266,6 +2266,7 @@ function getRecurringSchedulerHealthSnapshot() {
     maintenance,
     analyticsDemand: { ...analyticsDemandHealth },
     campaignProjection: campaignProjectionExecutor?.snapshot() || null,
+    analyticsHot: analyticsHotExecutor?.snapshot() || null,
     lastDegraded: recurringSchedulerHealth.lastDegraded.map((entry) => ({ ...entry })),
   };
 }
@@ -2310,6 +2311,7 @@ let recurringTimer = null;
 let analyticsDemandTimer = null;
 let phase2MaintenanceTimer = null;
 let campaignProjectionExecutor = null;
+let analyticsHotExecutor = null;
 let schedulerEpoch = 0;
 let schedulerStopPromise = null;
 let analyticsDemandPromise = null;
@@ -2350,6 +2352,10 @@ function startRecurringScheduler({ intervalMs = RECURRING_INTERVAL_MS, runImmedi
   recurringTimer = setInterval(tick, intervalMs);
   campaignProjectionExecutor = require("./campaign-projection-executor").startCampaignProjectionExecutor({
     db: prisma, onError: error => console.error("[scheduler] Campaign projection degraded:", error),
+  });
+
+  analyticsHotExecutor = require("./analytics-hot-executor").start({
+    db: prisma, onError: error => console.error("[scheduler] Analytics hot executor degraded:", error),
   });
 
   const analyticsDemandTick = () => {
@@ -2402,14 +2408,18 @@ function stopRecurringScheduler() {
     clearInterval(phase2MaintenanceTimer);
     phase2MaintenanceTimer = null;
   }
+  let analyticsHotStopped;
+  try { analyticsHotStopped = analyticsHotExecutor?.stop(); }
+  catch (error) { analyticsHotStopped = Promise.reject(error); }
   let campaignStopped;
   try { campaignStopped = campaignProjectionExecutor?.stop(); }
   catch (error) { campaignStopped = Promise.reject(error); }
-  schedulerStopPromise = Promise.allSettled([recurringSweepPromise, phase2MaintenancePromise, analyticsDemandPromise, campaignStopped])
+  schedulerStopPromise = Promise.allSettled([recurringSweepPromise, phase2MaintenancePromise, analyticsDemandPromise, campaignStopped, analyticsHotStopped])
     .then(results => {
       const failures = results.filter(result => result.status === "rejected");
       if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Scheduler drain failed");
       campaignProjectionExecutor = null;
+      analyticsHotExecutor = null;
       console.log("[scheduler] stopped");
       schedulerStopPromise = null;
     });

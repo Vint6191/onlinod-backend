@@ -45,13 +45,16 @@ const financial = { status: 'COMPLETE', baselineGeneration: 'financial', baselin
   receiptCoverageVersion:1,baselineRangeFrom:new Date('2016-01-01Z'),baselineRangeTo:now,coverageThrough:now,
   recentRangeFrom:new Date(+now-7*86400000),recentRangeTo:now,historyAuditObservedAt:now };
 const read = load('campaign-read-repository');
-async function comparison(legacy) {
+async function comparison(legacy, recovery=false) {
   scheduled.length = 0;
   const current = state(legacy ? { baselineObservedAt: null, lastCatchupObservedAt: null, campaignFrontierObservationVersion: 0 } : {});
   const db = { creatorCampaignCollectionState: { findUnique: async () => structuredClone(current) },
     creatorFinancialCollectionState: { findUnique: async () => financial },
     creatorCampaign: { findMany: async () => [] }, jobInstance: { findFirst: async () => null, findMany: async () => [] },
-    $queryRawUnsafe: async (sql) => sql.includes('FROM "CreatorFanRefreshDemand"') ? [{queued:false,failed:false}] : [{ empty: true }], $executeRawUnsafe: async () => 1 };
+    $queryRawUnsafe: async (sql,...args) => {
+      if(sql.includes('FROM "CreatorRecoveryIntent"'))return recovery && args[1]==='campaigns' ? [{id:'recovery',targetAt:now,reason:'OFFLINE_GAP'}] : [];
+      return sql.includes('FROM "CreatorFanRefreshDemand"') ? [{queued:false,failed:false}] : [{ empty: true }];
+    }, $executeRawUnsafe: async () => 1 };
   db.$transaction = async work => { const tx = { ...db }; delete tx.$transaction; return work(tx); };
   const page = await read.readCampaignPage({ db, creatorId: 'creator', now });
   const plan = await orchestrator.ensureRecurringCreatorAnalyticsCatchups({ db, creatorId: 'creator', agencyId: 'agency', now });
@@ -158,16 +161,19 @@ test('FULL legacy terminal pages with distinct receipt keys count each campaign 
   assert.equal(f.rows[1].claimersLastVerifiedRunId,undefined);
 });
 
-test('Campaign reader and planner share the independent directory/frontier deadlines',async()=>{
+test('fresh Campaign reads do not create recovery work',async()=>{
   const r=await comparison(false);
-  assert.equal(r.coverage.fresh,true);assert(r.skipped.includes('campaigns_catchup:fresh'));assert.equal(r.scheduled.length,0);
+  assert.equal(r.coverage.fresh,true);assert(r.skipped.includes('campaigns:live_no_recovery_debt'));assert.equal(r.scheduled.length,0);
 });
-test('Legacy complete state stays usable and requests bounded reuse instead of FULL',async()=>{
+test('legacy Campaign proof stays usable without a TTL-triggered scan',async()=>{
   const r=await comparison(true);
   assert.equal(r.coverage.proven,true);assert.equal(r.coverage.fresh,false);assert.equal(r.coverage.due,true);
-  assert.deepEqual(r.scheduled,['fetch_campaigns']);
-  assert.equal(r.commands[0].collectionMode,'catchup');assert.equal(r.commands[0].campaignDirectoryReuseGeneration,'directory');
-  assert.equal(r.commands[0].campaignFrontierBudget,50);
+  assert.equal(r.scheduled.length,0);
+});
+test('offline debt schedules a causal Campaign traversal despite a recent directory proof',async()=>{
+  const r=await comparison(false,true);assert.deepEqual(r.scheduled,['fetch_campaigns']);
+  assert.equal(r.commands[0].collectionMode,'catchup');assert.equal(r.commands[0].campaignDirectoryDiscoveryVersion,1);
+  assert.equal(r.commands[0].campaignDirectoryReuseGeneration,undefined);
 });
 for(const [label,patch] of [
   ['deadline',{campaignFrontierNextDueAt:now}],['missing deadline',{campaignFrontierNextDueAt:null}],

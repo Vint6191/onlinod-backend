@@ -36,7 +36,9 @@ function planWindows(params, state) {
   const end = date(params.endDate) || date(params.collectionRequestedAt);
   if (!end || end < FLOOR) throw fault("FINANCIAL_WINDOW_END_INVALID");
   const mode = params.collectionMode || params.financialMode;
+  if (params.moneyResolutionVersion === 1) return [window("RESOLUTION", date(params.startDate), end)];
   if (mode !== "catchup") return [window("FULL", date(params.startDate) || FLOOR, end)];
+  if (params.financialFrontierVersion === 2) return [window("FRONTIER", FLOOR, end)];
   const headFrom = new Date(Math.max(+FLOOR, +end - RECENT_DAYS * DAY));
   const result = [window("HEAD", headFrom, end)];
   const frontier = date(state?.coverageThrough) || date(state?.baselineRangeTo) || FLOOR;
@@ -52,10 +54,17 @@ function planWindows(params, state) {
 function windowsFor(job) {
   const windows = job.params?.financialWindows;
   if (!enabled(job) || job.params.financialWindowGeneration !== job.params.collectionGeneration || !Array.isArray(windows) || !windows.length || windows.length > 2) throw fault("FINANCIAL_WINDOWS_REQUIRED");
-  for (const w of windows) if (!["FULL", "HEAD", "GAP", "AUDIT"].includes(w.kind) || !date(w.from) || !date(w.to) || date(w.from) > date(w.to) || String(w.initialMarker) !== String(Math.floor(+date(w.to) / 1000))) throw fault("FINANCIAL_WINDOW_INVALID");
+  for (const w of windows) if (!["FULL", "HEAD", "GAP", "AUDIT", "FRONTIER", "RESOLUTION"].includes(w.kind) || !date(w.from) || !date(w.to) || date(w.from) > date(w.to) || String(w.initialMarker) !== String(Math.floor(+date(w.to) / 1000))) throw fault("FINANCIAL_WINDOW_INVALID");
   const head = windows[0], catchup = (job.params.collectionMode || job.params.financialMode) === "catchup";
   if (head.to !== date(job.params.endDate)?.toISOString() || date(head.from) < FLOOR) throw fault("FINANCIAL_WINDOW_BINDING_INVALID");
-  if (catchup) {
+  if (job.params.moneyResolutionVersion === 1) {
+    if (!catchup || windows.length!==1 || head.kind!=="RESOLUTION" || +date(head.to)-date(head.from)>3600000
+      || !job.params.moneyResolutionObservationId || head.from!==date(job.params.startDate)?.toISOString()) throw fault("FINANCIAL_RESOLUTION_BINDING_INVALID");
+  } else if (catchup && job.params.financialFrontierVersion === 2) {
+    if(windows.length!==1 || head.kind!=="FRONTIER" || +date(head.from)!==+FLOOR
+      || !Array.isArray(job.params.financialFrontierKnownIds) || job.params.financialFrontierKnownIds.length>300
+      || !job.params.financialFrontierBaselineGeneration) throw fault("FINANCIAL_FRONTIER_BINDING_INVALID");
+  } else if (catchup) {
     if (head.kind !== "HEAD" || +date(head.to) - date(head.from) > RECENT_DAYS * DAY) throw fault("FINANCIAL_HEAD_WINDOW_INVALID");
     if (windows[1] && (!["GAP", "AUDIT"].includes(windows[1].kind) || +date(windows[1].to) - date(windows[1].from) > AUDIT_DAYS * DAY || date(windows[1].to) > date(head.from))) throw fault("FINANCIAL_HISTORY_WINDOW_INVALID");
   } else if (windows.length !== 1 || head.kind !== "FULL") throw fault("FINANCIAL_FULL_WINDOW_INVALID");
@@ -66,13 +75,22 @@ async function claimParams(db, job) {
   const state = await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
   const params = { ...job.params, financialReceiptVersion: 1, collectorVersion: COLLECTOR };
   delete params.knownTransactionIds; delete params.catchupMaxPages;
+  if (params.financialFrontierVersion===2 && (params.collectionMode||params.financialMode)==="catchup") {
+    const generation=state?.lastCatchupGeneration || state?.baselineGeneration;
+    if(!generation || !state?.baselineVerifiedAt)throw fault("FINANCIAL_FRONTIER_BASELINE_REQUIRED");
+    const known=await db.$queryRawUnsafe(`SELECT f."externalId" FROM "FinancialObservedFact" f JOIN "FinancialReceiptRun" r ON r.id=f."runId"
+      WHERE r."creatorId"=$1 AND r.generation=$2 AND r.proof->>'complete'='true' AND f."windowIndex"=0
+      ORDER BY (f.value->>'page')::int,(f.value->>'ordinal')::int,f."externalId" LIMIT 300`,job.creatorId,generation);
+    params.financialFrontierKnownIds=known.map(row=>row.externalId);
+    params.financialFrontierBaselineGeneration=generation;
+  }
   params.financialWindows = planWindows(params, state);
   params.financialWindowGeneration = params.collectionGeneration;
   return params;
 }
 function initialCursor(job, windows = windowsFor(job)) {
   return { financialReceiptVersion: 1, collectorVersion: COLLECTOR, scanRunId: job.params.collectionGeneration,
-    windowIndex: 0, phase: "transactions", page: 0, marker: windows[0].initialMarker, chartIndex: 0, processed: 0, scannerRejected: 0 };
+    windowIndex: 0, phase: "transactions", frontierPhase:"SEEK", page: 0, marker: windows[0].initialMarker, chartIndex: 0, processed: 0, scannerRejected: 0 };
 }
 function resultFor(job, cursor) {
   return { schemaVersion: 1, collectorVersion: COLLECTOR, financialReceiptVersion: 1,
@@ -165,6 +183,18 @@ async function commitPage(db, job, chunk, prepared, accepted, backendRejected) {
     markerEnd: chunk.markerEnd || null, sourceHasMore: chunk.sourceHasMore, payloadHash: checksum, received: chunk.rawReceived, rejected } });
   const cursor = { ...row.cursor, page: chunk.pageNumber, marker: chunk.sourceHasMore ? chunk.markerEnd : row.cursor.marker,
     phase: chunk.sourceHasMore ? "transactions" : "charts", chartIndex: 0, processed: row.cursor.processed + chunk.rawReceived, scannerRejected: row.cursor.scannerRejected + rejected };
+  if (row.windows[index].kind === "FRONTIER") {
+    const known=new Set(job.params.financialFrontierKnownIds);
+    const boundary=accepted.length>0 && rejected===0 && accepted.every(f=>known.has(f.externalTransactionId));
+    const overlap=row.cursor.frontierPhase==="OVERLAP";
+    const done=!chunk.sourceHasMore || overlap;
+    cursor.frontierPhase=done?"DONE":boundary?"OVERLAP":"SEEK";
+    cursor.phase=done?"done":"transactions";
+    totals.boundaryPage ||= boundary?chunk.pageNumber:null;
+    if(overlap)totals.overlapPage=chunk.pageNumber;
+    proof.complete=done && totals.rejected===0 && (totals.exhausted || totals.overlapPage===totals.boundaryPage+1);
+    proof.kind="FRONTIER_PLUS_ONE";
+  }
   const receivedAt = await dbAuthorityNow({ db });
   await db.financialReceiptRun.update({ where: { id: row.id }, data: { cursor, proof, updatedAt: receivedAt } });
   return envelope(job, cursor);
@@ -204,6 +234,8 @@ async function completionProof(db, job) {
 }
 function coverageUpdate(job, current, row, observedAt, now) {
   const head = row.windows[0];
+  if(head.kind==="FRONTIER") return {receiptCoverageVersion:1,coverageThrough:date(head.to),recentRangeTo:date(head.to),
+    recentRangeFrom:date(current?.recentRangeFrom)||date(current?.baselineRangeFrom)||FLOOR};
   const common = { receiptCoverageVersion: 1, recentRangeFrom: date(head.from), recentRangeTo: date(head.to) };
   if (head.kind === "FULL") return { ...common, coverageThrough: date(head.to), historyAuditCursor: FLOOR,
     historyAuditCycleStartedAt: null, historyAuditObservedAt: observedAt, historyAuditCompletedAt: now };

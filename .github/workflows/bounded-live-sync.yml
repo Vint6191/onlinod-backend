@@ -1,0 +1,63 @@
+name: Exact live money PostgreSQL release gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  postgres-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: fixture-only
+          POSTGRES_DB: onlinod_test_bounded_sync
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Native PostgreSQL isolation, publication, cache and scale proof
+        run: node scripts/audit/bounded-live-proof.cjs
+        env:
+          ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_bounded_sync
+          ONLINOD_SCALE_ROWS: '50000'
+          ONLINOD_SCALE_REPORT: bounded-live-proof.json
+      - name: Create isolated database for exact-money concurrency proof
+        run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_exact_money'
+        env:
+          PGPASSWORD: fixture-only
+      - name: Native financial resolution, sparse publication and competing revisions
+        run: node scripts/audit/exact-live-money-proof.cjs
+        env:
+          ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_exact_money
+          ONLINOD_SCALE_ROWS: '50000'
+          ONLINOD_EXACT_MONEY_REPORT: exact-live-money-proof.json
+      - name: Create isolated database for adversarial money verification
+        run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_adversarial_money'
+        env:
+          PGPASSWORD: fixture-only
+      - name: Malformed input, category parity, real busy owner and agency fairness
+        run: node scripts/audit/live-money-adversarial-proof.cjs
+        env:
+          ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_adversarial_money
+          ONLINOD_ADVERSARIAL_REPORT: live-money-adversarial-proof.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: bounded-live-postgresql-proof
+          path: |
+            bounded-live-proof.json
+            exact-live-money-proof.json
+            live-money-adversarial-proof.json

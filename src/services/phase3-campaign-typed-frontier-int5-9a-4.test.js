@@ -46,9 +46,9 @@ test("INT5.9A-4 ledger reads at most 100 typed frontier rows and replaces canoni
 test("INT5.9A-4 typed frontier remains server-side and current planner publishes no frontier skip hints", () => {
   const planner = read("src/services/creator-analytics-sync-orchestrator.js");
   assert.doesNotMatch(planner, /async function campaignCatchupState/);
-  const schedulingStart = planner.indexOf('const campaignReady =');
+  const schedulingStart = planner.indexOf('const readiness =');
   const schedulingEnd = planner.indexOf('return { ready: initial.ready, initial, created, skipped };', schedulingStart);
   const slice = planner.slice(schedulingStart, schedulingEnd);
   assert.doesNotMatch(slice, /CreatorCampaignFrontierFan|knownClaimerFrontierHashes|catchupFrontierHash/);
-  assert.match(slice, /campaignOrderIndependentTraversalVersion: 1/);
+  assert.match(slice, /campaignOrderIndependentTraversalVersion:\s*1/);
 });

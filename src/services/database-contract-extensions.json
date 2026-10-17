@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v4_earnings_publication",
+  "version": "nod_current_v7_exact_live_money",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -12,10 +12,70 @@
     {
       "migration": "20261016000000_earnings_published_snapshot",
       "checksum": "84e5309aa6b12475f594de711032762d0956191710aa06bcc1434ec88acc5862"
+    },
+    {
+      "migration": "20261016010000_event_driven_sync",
+      "checksum": "da32043b389de0a1c2b40bffb6f0a2a6e87db3340b07622fc1be97bc1121f935"
+    },
+    {
+      "migration": "20261016020000_bounded_live_publication",
+      "checksum": "b37e39a732dc81612f847c09ae26f556485a251aa965ab4daa22235f220d6a23"
+    },
+    {
+      "migration": "20261016030000_exact_live_money",
+      "checksum": "45c12e3b1108a175373516db21895f8e3408ce8de2551549dd4efe5bd205eddb"
     }
   ],
   "extension": {
     "tables": [
+      {
+        "name": "CreatorDialogRecoveryRequest",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEarningsGeneration",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEarningsGenerationDay",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEarningsGenerationEntry",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEarningsGenerationHour",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEarningsLedgerEntry",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEarningsLedgerHour",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEarningsLedgerProof",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEarningsPublishedDay",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorLiveSync",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorMoneyObservation",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorMoneyResolutionRequest",
+        "persistence": "p"
+      },
       {
         "name": "CreatorNotificationCorrection",
         "persistence": "p"
@@ -25,11 +85,31 @@
         "persistence": "p"
       },
       {
-        "name": "ProviderCapacityCreatorBucket",
+        "name": "CreatorNotificationFrontierPage",
         "persistence": "p"
       },
       {
-        "name": "CreatorEarningsPublishedDay",
+        "name": "CreatorRealtimeReceipt",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorRealtimeSession",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorRecoveryIntent",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorRecoveryWatermark",
+        "persistence": "p"
+      },
+      {
+        "name": "MoneyResolutionAdoption",
+        "persistence": "p"
+      },
+      {
+        "name": "ProviderCapacityCreatorBucket",
         "persistence": "p"
       }
     ],
@@ -41,6 +121,934 @@
         "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "lastCoveredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "sampleAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "nextCheckAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "queued",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "true"
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "reason",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "runId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "baseGeneration",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "state",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'BUILDING'::text"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "phase",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'COPY'::text"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "cursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "fromAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "throughAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "snapshotAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "fullScan",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "legacyPending",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "observedCount",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "invalidCount",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "oldestAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "publishedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "retiredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "mode",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'SNAPSHOT'::text"
+      },
+      {
+        "table": "CreatorEarningsGenerationDay",
+        "name": "generation",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationDay",
+        "name": "date",
+        "data_type": "date",
+        "udt_name": "date",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationDay",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationDay",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationDay",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "generation",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "transactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "status",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationHour",
+        "name": "generation",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationHour",
+        "name": "hour",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationHour",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationHour",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationHour",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "transactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'other'::text"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "status",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "hour",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'other'::text"
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "fromAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "throughAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "generation",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "activeGeneration",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "confirmedThroughAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "date",
+        "data_type": "date",
+        "udt_name": "date",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceTimezone",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'UTC'::text"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "subscriptionsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "messagesCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "tipsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "postsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "streamsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "referralsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "totalCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "currency",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'USD'::text"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceUpdatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceScanRunId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceScanRequestedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "scanProofId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "collectedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "coverageStatus",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "lastVerifiedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "hourlyPoints",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorFinancialCollectionState",
+        "name": "lastResolutionGeneration",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorLiveSync",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorLiveSync",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorLiveSync",
+        "name": "lastCapturedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorLiveSync",
+        "name": "lastDeliveredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorLiveSync",
+        "name": "shortGapFrom",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorLiveSync",
+        "name": "shortGapTo",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorLiveSync",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "transactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "status",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "reason",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "resolvedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "coveredGeneration",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "resolutionBlockedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "resolutionError",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "queued",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "true"
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "targetId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "attempts",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "jobId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "lastError",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorNotificationCorrection",
@@ -395,6 +1403,70 @@
         "column_default": "CURRENT_TIMESTAMP"
       },
       {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "generation",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "page",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "cursorStart",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "cursorEnd",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "digest",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
         "table": "CreatorNotificationScanItem",
         "name": "eventKind",
         "data_type": "text",
@@ -449,6 +1521,318 @@
         "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "CreatorNotificationSyncState",
+        "name": "frontierReceipt",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "table": "CreatorRealtimeReceipt",
+        "name": "sessionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeReceipt",
+        "name": "seq",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeReceipt",
+        "name": "digest",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeReceipt",
+        "name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "deviceId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "memberId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "accessEpoch",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "incarnation",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "capturedSeq",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "ackedSeq",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "lossAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "lossRevision",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "resolvedLossRevision",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "loss",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "retiredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "stream",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "reason",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "gapFrom",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "targetAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "policyVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "status",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'PENDING'::text"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "jobId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "completedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorRecoveryWatermark",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryWatermark",
+        "name": "stream",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryWatermark",
+        "name": "throughAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "MoneyResolutionAdoption",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "MoneyResolutionAdoption",
+        "name": "cursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "MoneyResolutionAdoption",
+        "name": "complete",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
       },
       {
         "table": "OfProviderRequestGateState",
@@ -545,190 +1929,6 @@
         "udt_name": "bool",
         "is_nullable": "NO",
         "column_default": "true"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "agencyId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "date",
-        "data_type": "date",
-        "udt_name": "date",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "sourceTimezone",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'UTC'::text"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "subscriptionsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "messagesCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "tipsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "postsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "streamsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "referralsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "totalCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "currency",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'USD'::text"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "sourceUpdatedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "sourceScanRunId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "sourceScanRequestedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "scanProofId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "collectedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "createdAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "updatedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "coverageStatus",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "lastVerifiedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "hourlyPoints",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
-        "is_nullable": "YES",
-        "column_default": null
       }
     ],
     "enums": [],
@@ -740,12 +1940,114 @@
         "hash": "ef305f1b51861689406a4e63475dd96a23dfb42226dbd2ad6b2ac356729058b0"
       },
       {
+        "name": "onlinod_earnings_generation_delta_v1",
+        "args": "",
+        "hash": "e5e02eacde56c54a34f552f24067b2d6ff4dec95954975f4aeea7673ea9b5af9"
+      },
+      {
+        "name": "onlinod_earnings_writer_fence_v6",
+        "args": "",
+        "hash": "5a12c26073a295801d59990b9ee5b32c5edf5be529d40d05d2674c1885b5166d"
+      },
+      {
+        "name": "onlinod_earnings_writer_fence_v7",
+        "args": "",
+        "hash": "77265a0a834dc6418ad0a236543672d9721468f05fca614f96b4282b2ffd559c"
+      },
+      {
         "name": "onlinod_enforce_provider_gate_waiter_registration",
         "args": "",
         "hash": "672961dd0f1bf92db88837db884821064ba36d32eb54d9e4aa56759f71cf6d70"
+      },
+      {
+        "name": "onlinod_live_earnings_hour_v1",
+        "args": "",
+        "hash": "3d78c12ead7602a9c641d09f5034c6af4369959fb1124ea740ae41e0f8eac8dc"
+      },
+      {
+        "name": "onlinod_money_coverage_monotonic_v7",
+        "args": "",
+        "hash": "aacaf58f1fb97656a5736f2674357f6062cd8cb102c234e16751bb5f09b5b4c4"
+      },
+      {
+        "name": "onlinod_resolution_publication_guard_v7",
+        "args": "",
+        "hash": "5e28f46ecc6a40722a68a70da991785e1e9c3ffb759905c25d2918c83397c8e0"
       }
     ],
     "triggers": [
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "onlinod_earnings_writer_fence_v7",
+        "type": 31,
+        "definition": "CREATE TRIGGER onlinod_earnings_writer_fence_v7 BEFORE INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsGeneration\" FOR EACH ROW EXECUTE FUNCTION onlinod_earnings_writer_fence_v7()",
+        "args": "",
+        "function": "onlinod_earnings_writer_fence_v7"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "onlinod_earnings_generation_delta_v1",
+        "type": 21,
+        "definition": "CREATE TRIGGER onlinod_earnings_generation_delta_v1 AFTER INSERT OR UPDATE ON public.\"CreatorEarningsGenerationEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_earnings_generation_delta_v1()",
+        "args": "",
+        "function": "onlinod_earnings_generation_delta_v1"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "onlinod_earnings_writer_fence_v7",
+        "type": 31,
+        "definition": "CREATE TRIGGER onlinod_earnings_writer_fence_v7 BEFORE INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsGenerationEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_earnings_writer_fence_v7()",
+        "args": "",
+        "function": "onlinod_earnings_writer_fence_v7"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "onlinod_earnings_writer_fence_v6",
+        "type": 31,
+        "definition": "CREATE TRIGGER onlinod_earnings_writer_fence_v6 BEFORE INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsLedgerEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_earnings_writer_fence_v6()",
+        "args": "",
+        "function": "onlinod_earnings_writer_fence_v6"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "onlinod_live_earnings_hour_v1",
+        "type": 29,
+        "definition": "CREATE TRIGGER onlinod_live_earnings_hour_v1 AFTER INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsLedgerEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_live_earnings_hour_v1()",
+        "args": "",
+        "function": "onlinod_live_earnings_hour_v1"
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "onlinod_earnings_writer_fence_v6",
+        "type": 31,
+        "definition": "CREATE TRIGGER onlinod_earnings_writer_fence_v6 BEFORE INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsLedgerProof\" FOR EACH ROW EXECUTE FUNCTION onlinod_earnings_writer_fence_v6()",
+        "args": "",
+        "function": "onlinod_earnings_writer_fence_v6"
+      },
+      {
+        "table": "CreatorFinancialCollectionState",
+        "name": "onlinod_resolution_publication_guard_v7",
+        "type": 23,
+        "definition": "CREATE TRIGGER onlinod_resolution_publication_guard_v7 BEFORE INSERT OR UPDATE ON public.\"CreatorFinancialCollectionState\" FOR EACH ROW EXECUTE FUNCTION onlinod_resolution_publication_guard_v7()",
+        "args": "",
+        "function": "onlinod_resolution_publication_guard_v7"
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "onlinod_earnings_writer_fence_v7",
+        "type": 31,
+        "definition": "CREATE TRIGGER onlinod_earnings_writer_fence_v7 BEFORE INSERT OR DELETE OR UPDATE ON public.\"CreatorMoneyObservation\" FOR EACH ROW EXECUTE FUNCTION onlinod_earnings_writer_fence_v7()",
+        "args": "",
+        "function": "onlinod_earnings_writer_fence_v7"
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "onlinod_money_coverage_monotonic_v7",
+        "type": 19,
+        "definition": "CREATE TRIGGER onlinod_money_coverage_monotonic_v7 BEFORE UPDATE ON public.\"CreatorMoneyObservation\" FOR EACH ROW EXECUTE FUNCTION onlinod_money_coverage_monotonic_v7()",
+        "args": "",
+        "function": "onlinod_money_coverage_monotonic_v7"
+      },
       {
         "table": "OfProviderRequestGateState",
         "name": "onlinod_provider_gate_waiter_registration",
@@ -763,6 +2065,302 @@
         "deferrable": false,
         "deferred": false,
         "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "CreatorDialogRecoveryRequest_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "CreatorDialogRecoveryRequest_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "CreatorEarningsGeneration_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "CreatorEarningsGeneration_mode_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((mode = ANY (ARRAY['SNAPSHOT'::text, 'DELTA'::text])))"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "CreatorEarningsGeneration_phase_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((phase = ANY (ARRAY['COPY'::text, 'APPLY'::text, 'RESOLVE'::text, 'READY'::text])))"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "CreatorEarningsGeneration_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "CreatorEarningsGeneration_state_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((state = ANY (ARRAY['BUILDING'::text, 'READY'::text, 'ACTIVE'::text, 'RETIRED'::text])))"
+      },
+      {
+        "table": "CreatorEarningsGenerationDay",
+        "name": "CreatorEarningsGenerationDay_generation_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (generation) REFERENCES \"CreatorEarningsGeneration\"(id) ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEarningsGenerationDay",
+        "name": "CreatorEarningsGenerationDay_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (generation, date, category)"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "CreatorEarningsGenerationEntry_generation_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (generation) REFERENCES \"CreatorEarningsGeneration\"(id) ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "CreatorEarningsGenerationEntry_netCents_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"netCents\" >= 0))"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "CreatorEarningsGenerationEntry_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (generation, \"transactionId\")"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "CreatorEarningsGenerationEntry_status_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((status = ANY (ARRAY['done'::text, 'loading'::text, 'undo'::text])))"
+      },
+      {
+        "table": "CreatorEarningsGenerationHour",
+        "name": "CreatorEarningsGenerationHour_generation_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (generation) REFERENCES \"CreatorEarningsGeneration\"(id) ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEarningsGenerationHour",
+        "name": "CreatorEarningsGenerationHour_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (generation, hour, category)"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "CreatorEarningsLedgerEntry_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "CreatorEarningsLedgerEntry_netCents_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"netCents\" >= 0))"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "CreatorEarningsLedgerEntry_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", \"transactionId\")"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "CreatorEarningsLedgerEntry_status_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((status = ANY (ARRAY['done'::text, 'loading'::text, 'undo'::text])))"
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "CreatorEarningsLedgerHour_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "CreatorEarningsLedgerHour_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", hour, category)"
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "CreatorEarningsLedgerProof_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "CreatorEarningsLedgerProof_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_coverageStatus_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"coverageStatus\" = ANY (ARRAY['COMPLETE'::text, 'PARTIAL'::text])))"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_hourly_size_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"hourlyPoints\" IS NULL) OR ((jsonb_typeof(\"hourlyPoints\") = 'array'::text) AND (jsonb_array_length(\"hourlyPoints\") <= 24))))"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_money_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"totalCents\" >= 0) AND (\"sourceTimezone\" = 'UTC'::text)))"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_scanProofId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"scanProofId\") REFERENCES \"AnalyticsScanProof\"(id) ON UPDATE CASCADE"
+      },
+      {
+        "table": "CreatorLiveSync",
+        "name": "CreatorLiveSync_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorLiveSync",
+        "name": "CreatorLiveSync_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "CreatorMoneyObservation_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "CreatorMoneyObservation_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "CreatorMoneyObservation_status_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((status = ANY (ARRAY['PENDING'::text, 'APPLIED'::text, 'COVERED'::text])))"
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "CreatorMoneyResolutionRequest_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "CreatorMoneyResolutionRequest_attempts_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((attempts >= 0) AND (attempts <= 6)))"
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "CreatorMoneyResolutionRequest_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\")"
       },
       {
         "table": "CreatorNotificationCorrection",
@@ -829,6 +2427,158 @@
         "definition": "CHECK ((\"targetState\" = ANY (ARRAY['AVAILABLE'::text, 'UNAVAILABLE'::text, 'DELETED'::text, 'DEACTIVATED'::text, 'NOT_APPLICABLE'::text])))"
       },
       {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "CreatorNotificationFrontierPa_creatorId_generation_cursorSt_key",
+        "type": "u",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (\"creatorId\", generation, \"cursorStart\")"
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "CreatorNotificationFrontierPage_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "CreatorNotificationFrontierPage_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", generation, page)"
+      },
+      {
+        "table": "CreatorRealtimeReceipt",
+        "name": "CreatorRealtimeReceipt_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"sessionId\", seq)"
+      },
+      {
+        "table": "CreatorRealtimeReceipt",
+        "name": "CreatorRealtimeReceipt_seq_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((seq > 0))"
+      },
+      {
+        "table": "CreatorRealtimeReceipt",
+        "name": "CreatorRealtimeReceipt_sessionId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"sessionId\") REFERENCES \"CreatorRealtimeSession\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "CreatorRealtimeSession_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "CreatorRealtimeSession_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"capturedSeq\" >= 0) AND (\"ackedSeq\" >= 0)))"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "CreatorRealtimeSession_creatorId_deviceId_incarnation_key",
+        "type": "u",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "UNIQUE (\"creatorId\", \"deviceId\", incarnation)"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "CreatorRealtimeSession_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"targetAt\" >= \"gapFrom\"))"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_reason_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((reason = ANY (ARRAY['OFFLINE_GAP'::text, 'CAPTURE_LOSS'::text])))"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_status_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((status = ANY (ARRAY['PENDING'::text, 'RUNNING'::text, 'COMPLETE'::text])))"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_stream_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((stream = ANY (ARRAY['notifications'::text, 'financial'::text, 'campaigns'::text, 'subscribers'::text])))"
+      },
+      {
+        "table": "CreatorRecoveryWatermark",
+        "name": "CreatorRecoveryWatermark_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorRecoveryWatermark",
+        "name": "CreatorRecoveryWatermark_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", stream)"
+      },
+      {
+        "table": "MoneyResolutionAdoption",
+        "name": "MoneyResolutionAdoption_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
         "table": "OfProviderRequestGateState",
         "name": "OfProviderRequestGateState_scope_creator_fkey",
         "type": "f",
@@ -859,54 +2609,6 @@
         "deferrable": false,
         "deferred": false,
         "definition": "CHECK ((((\"topologyId\")::text = 'of-creator'::text) AND ((\"topologyScope\")::text = 'CREATOR_PARALLEL'::text) AND (\"topologyShardCount\" >= 0) AND (\"topologyShardingAllowed\" = true) AND ((\"controlMode\")::text = ANY ((ARRAY['NORMAL'::character varying, 'OVERLOAD_PROTECTED'::character varying, 'CONSERVATIVE'::character varying])::text[])) AND (\"campaignDirectoryAdmissionBudgetCalls\" >= 1) AND (\"campaignDirectoryGuaranteedCallsPerSweep\" >= 1)))"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_agencyId_creatorId_fkey",
-        "type": "f",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_coverageStatus_check",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK ((\"coverageStatus\" = ANY (ARRAY['COMPLETE'::text, 'PARTIAL'::text])))"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_hourly_size_check",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK (((\"hourlyPoints\" IS NULL) OR ((jsonb_typeof(\"hourlyPoints\") = 'array'::text) AND (jsonb_array_length(\"hourlyPoints\") <= 24))))"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_money_check",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK (((\"totalCents\" >= 0) AND (\"sourceTimezone\" = 'UTC'::text)))"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_pkey",
-        "type": "p",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "PRIMARY KEY (id)"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_scanProofId_fkey",
-        "type": "f",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "FOREIGN KEY (\"scanProofId\") REFERENCES \"AnalyticsScanProof\"(id) ON UPDATE CASCADE"
       }
     ],
     "indexes": [
@@ -915,6 +2617,276 @@
         "name": "AnalyticsPlanningBudget_creator_idx",
         "unique": false,
         "keys": "6",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "CreatorDialogRecoveryRequest_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "CreatorEarningsGeneration_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "EarningsGeneration_abandoned",
+        "unique": false,
+        "keys": "17 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(state = ANY (ARRAY['BUILDING'::text, 'READY'::text]))"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "EarningsGeneration_active",
+        "unique": true,
+        "keys": "3",
+        "options": "0",
+        "expressions": null,
+        "predicate": "(state = 'ACTIVE'::text)"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "EarningsGeneration_building",
+        "unique": true,
+        "keys": "3",
+        "options": "0",
+        "expressions": null,
+        "predicate": "(state = ANY (ARRAY['BUILDING'::text, 'READY'::text]))"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "EarningsGeneration_creator",
+        "unique": false,
+        "keys": "3 6",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "EarningsGeneration_legacy",
+        "unique": false,
+        "keys": "18 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(\"legacyPending\" AND (\"publishedAt\" IS NOT NULL))"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "EarningsGeneration_retired",
+        "unique": false,
+        "keys": "19 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(state = 'RETIRED'::text)"
+      },
+      {
+        "table": "CreatorEarningsGenerationDay",
+        "name": "CreatorEarningsGenerationDay_pkey",
+        "unique": true,
+        "keys": "1 2 3",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "CreatorEarningsGenerationEntry_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "EarningsGenerationEntry_window",
+        "unique": false,
+        "keys": "1 3 2",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsGenerationHour",
+        "name": "CreatorEarningsGenerationHour_pkey",
+        "unique": true,
+        "keys": "1 2 3",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "CreatorEarningsLedgerEntry_pkey",
+        "unique": true,
+        "keys": "2 3",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "EarningsLedger_creator_date",
+        "unique": false,
+        "keys": "2 4",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "CreatorEarningsLedgerHour_pkey",
+        "unique": true,
+        "keys": "2 3 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "CreatorEarningsLedgerProof_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_agencyId_creatorId_date_idx",
+        "unique": false,
+        "keys": "2 3 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_creatorId_date_idx",
+        "unique": false,
+        "keys": "3 4",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_creatorId_date_sourceTimezone_key",
+        "unique": true,
+        "keys": "3 4 5",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_creatorId_sourceScanRunId_idx",
+        "unique": false,
+        "keys": "3 15",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "CreatorEarningsPublishedDay_scanProofId_idx",
+        "unique": false,
+        "keys": "17",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorLiveSync",
+        "name": "CreatorLiveSync_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "CreatorMoneyObservation_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "MoneyObservation_covered",
+        "unique": false,
+        "keys": "10 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(status = 'PENDING'::text)"
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "MoneyObservation_pending",
+        "unique": false,
+        "keys": "3 7 5",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "MoneyObservation_pending_adoption",
+        "unique": false,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": "(status = 'PENDING'::text)"
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "MoneyObservation_resolution_due",
+        "unique": false,
+        "keys": "3 5 1",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "((status = 'PENDING'::text) AND (\"resolutionBlockedAt\" IS NULL))"
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "MoneyObservation_retention",
+        "unique": false,
+        "keys": "6 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(status = ANY (ARRAY['APPLIED'::text, 'COVERED'::text]))"
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "CreatorMoneyResolutionRequest_pkey",
+        "unique": true,
+        "keys": "1",
         "options": "0",
         "expressions": null,
         "predicate": null
@@ -974,6 +2946,159 @@
         "predicate": null
       },
       {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "CreatorNotificationFrontierPa_creatorId_generation_cursorSt_key",
+        "unique": true,
+        "keys": "1 3 5",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "CreatorNotificationFrontierPage_pkey",
+        "unique": true,
+        "keys": "1 3 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "NotificationFrontier_retention",
+        "unique": false,
+        "keys": "8 1 3 4",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorRealtimeReceipt",
+        "name": "CreatorRealtimeReceipt_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorRealtimeReceipt",
+        "name": "RealtimeReceipt_retention",
+        "unique": false,
+        "keys": "4 1 2",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "CreatorRealtimeSession_creatorId_deviceId_incarnation_key",
+        "unique": true,
+        "keys": "3 4 7",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "CreatorRealtimeSession_creator_updated_idx",
+        "unique": false,
+        "keys": "3 15",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "CreatorRealtimeSession_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "RealtimeSession_pending_device",
+        "unique": false,
+        "keys": "3 4 15",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(\"capturedSeq\" > \"ackedSeq\")"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "RealtimeSession_retention",
+        "unique": false,
+        "keys": "15 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(\"retiredAt\" IS NULL)"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_pending_idx",
+        "unique": false,
+        "keys": "3 4 9 7 1",
+        "options": "0 0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "RecoveryIntent_retention",
+        "unique": false,
+        "keys": "11 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(status = 'COMPLETE'::text)"
+      },
+      {
+        "table": "CreatorRecoveryWatermark",
+        "name": "CreatorRecoveryWatermark_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "DomainWorkItem",
+        "name": "DomainWorkItem_hot_expired",
+        "unique": false,
+        "keys": "3 20 1",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "((state = 'CLAIMED'::text) AND \"isOutstanding\")"
+      },
+      {
+        "table": "DomainWorkItem",
+        "name": "DomainWorkItem_hot_ready",
+        "unique": false,
+        "keys": "3 16 1",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "((state = 'READY'::text) AND \"isOutstanding\")"
+      },
+      {
+        "table": "MoneyResolutionAdoption",
+        "name": "MoneyResolutionAdoption_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
         "table": "OfProviderRequestGateState",
         "name": "OfProviderRequestGateState_scope_creator_key",
         "unique": true,
@@ -997,60 +3122,6 @@
         "unique": true,
         "keys": "1 2",
         "options": "0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_agencyId_creatorId_date_idx",
-        "unique": false,
-        "keys": "2 3 4",
-        "options": "0 0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_creatorId_date_idx",
-        "unique": false,
-        "keys": "3 4",
-        "options": "0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_creatorId_date_sourceTimezone_key",
-        "unique": true,
-        "keys": "3 4 5",
-        "options": "0 0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_creatorId_sourceScanRunId_idx",
-        "unique": false,
-        "keys": "3 15",
-        "options": "0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_pkey",
-        "unique": true,
-        "keys": "1",
-        "options": "0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "CreatorEarningsPublishedDay_scanProofId_idx",
-        "unique": false,
-        "keys": "17",
-        "options": "0",
         "expressions": null,
         "predicate": null
       }

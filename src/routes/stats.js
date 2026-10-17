@@ -23,7 +23,7 @@ const { ensureAnalyticsFreshness } = require("../services/analytics-collection-p
 const { normalizeCreatorOverviewRangeKey } = require("../services/analytics-range-contract");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { capabilityFreshnessWindow } = require("../services/capability-freshness-authority-service");
-const { assertRealtimeIngestGenerationCurrent, withRealtimeIngestGenerationFence } = require("../services/realtime-ingest-generation-fence-service");
+const { withRealtimeIngestGenerationFence } = require("../services/realtime-ingest-generation-fence-service");
 const {
   startManualNotificationScan,
   stopManualNotificationScan,
@@ -240,6 +240,8 @@ const liveNotificationSchema = z.object({
   observedAt: z.string().datetime({ offset: true }),
   sourceTimezone: z.literal("UTC").default("UTC"),
   events: z.array(z.record(z.unknown())).min(1).max(100),
+  delivery: z.object({ version: z.literal(1), sessionId: z.string().min(16).max(80),
+    entries: z.array(z.object({ seq: z.number().int().positive().max(Number.MAX_SAFE_INTEGER), capturedAt: z.string().datetime({offset:true}) })).min(1).max(100) }).optional(),
 });
 
 router.get("/creators/:creatorId/overview-v2", requireCampaignReadVersion, async (req, res) => {
@@ -542,17 +544,6 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
     } catch (error) {
       return res.status(Number(error?.status) || 403).json({ ok: false, code: error?.code || "LIVE_NOTIFICATION_REALTIME_UNAVAILABLE", error: error?.message || "Live notification reporter is not ready" });
     }
-    const commitGuard = async (tx) => {
-      await assertRealtimeIngestGenerationCurrent({
-        db: tx,
-        agencyId: ctx.creator.agencyId,
-        userId,
-        memberId: ctx.member?.id,
-        accessEpoch: memberAccessEpoch,
-        creatorId: ctx.creator.id,
-      });
-      await assertLiveBinding(tx);
-    };
 
     const grouped = new Map();
     const dates = [];
@@ -582,58 +573,48 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
         notificationMode: "catchup",
       },
     };
-    const results = [];
-    if(sourceEvents.length) {
-      const batches=["purchases","tips","subscriptions","likes","comments"].map(type=>({notificationType:type,
-        batchKey:`run:${input.batchId}:page:${type}:${crypto.createHash("sha256").update(`${input.batchId}|source|${type}`).digest("hex").slice(0,24)}`,
-        events:sourceEvents.filter(event=>event.notificationObservation.category===type&&event.notificationObservation.disposition==="FACT").map(event=>event.notificationFact),
-      }));
-      const sourceJob={...logicalJob,params:{...logicalJob.params,types:["purchases","tips","subscriptions","likes","comments"]}};
-      results.push(await withRealtimeIngestGenerationFence({db:prisma,agencyId:ctx.creator.agencyId,userId,memberId:ctx.member?.id,accessEpoch:memberAccessEpoch,creatorId:ctx.creator.id,
-        work:async({tx})=>require("../services/notification-source-ledger-service").ingestNotificationSourcePage({db:tx,job:sourceJob,deviceId:device.id,commitGuard,live:true,
-          chunk:{schemaVersion:6,normalizerVersion:"notification-source-v2",collectorVersion:"notifications-history-v9-source-ledger",scanRunId:input.batchId,page:1,
-            observations:sourceEvents.map(event=>event.notificationObservation),batches,processedRows:sourceEvents.length}})}));
-    }
-    for (const [type, events] of grouped) {
-      const typeHash = crypto.createHash("sha256").update(`${input.batchId}|${type}`).digest("hex").slice(0, 24);
-      const result = await ingestNotificationFacts({
-        db: prisma,
-        commitGuard,
-        job: logicalJob,
-        deviceId: device.id,
-        result: {
-          events,
-          notificationType: type,
-          batchKey: `run:${input.batchId}:page:${type}:${typeHash}`,
-          finalizeCoverage: false,
-          sourceTimezone: input.sourceTimezone,
-          scanRunId: input.batchId,
-          collectorVersion: "notifications-all-v5",
-          schemaVersion: 4,
-          coverage: { [type]: { status: "partial" } },
-        },
-      });
-      results.push({ type, ...result });
-    }
-    await withRealtimeIngestGenerationFence({
-      db: prisma,
-      agencyId: ctx.creator.agencyId,
-      userId,
-      memberId: ctx.member?.id,
-      accessEpoch: memberAccessEpoch,
-      creatorId: ctx.creator.id,
+    const committed = await withRealtimeIngestGenerationFence({
+      db: prisma, agencyId: ctx.creator.agencyId, userId, memberId: ctx.member.id,
+      accessEpoch: memberAccessEpoch, creatorId: ctx.creator.id,
       work: async ({ tx }) => {
-        const currentDevice = await assertLiveBinding(tx);
-        return recordNotificationSocketEvent({
-          db: tx,
-          agencyId: ctx.creator.agencyId,
-          creatorId: ctx.creator.id,
-          deviceId: currentDevice.id,
-          occurredAt: dates.length ? new Date(Math.max(...dates.map((date) => date.getTime()))) : observedAt,
-        });
+        await assertLiveBinding(tx);
+        const ingest = async () => {
+          const results = [];
+          if (sourceEvents.length) {
+            const batches = ["purchases","tips","subscriptions","likes","comments"].map(type => ({ notificationType: type,
+              batchKey: `run:${input.batchId}:page:${type}:${crypto.createHash("sha256").update(`${input.batchId}|source|${type}`).digest("hex").slice(0,24)}`,
+              events: sourceEvents.filter(event => event.notificationObservation.category === type && event.notificationObservation.disposition === "FACT").map(event => event.notificationFact),
+            }));
+            const sourceJob = { ...logicalJob, params: { ...logicalJob.params, types: ["purchases","tips","subscriptions","likes","comments"] } };
+            results.push(await require("../services/notification-source-ledger-service").ingestNotificationSourcePage({
+              db: tx, job: sourceJob, deviceId: device.id, live: true,
+              chunk: { schemaVersion:6, normalizerVersion:"notification-source-v2", collectorVersion:"notifications-history-v9-source-ledger",
+                scanRunId:input.batchId, page:1, observations:sourceEvents.map(event=>event.notificationObservation), batches, processedRows:sourceEvents.length },
+            }));
+          }
+          for (const [type, events] of grouped) {
+            const typeHash = crypto.createHash("sha256").update(`${input.batchId}|${type}`).digest("hex").slice(0,24);
+            results.push(await ingestNotificationFacts({ db: tx, job: logicalJob, deviceId: device.id,
+              result: { events, notificationType:type, batchKey:`run:${input.batchId}:page:${type}:${typeHash}`,
+                finalizeCoverage:false, sourceTimezone:input.sourceTimezone, scanRunId:input.batchId,
+                collectorVersion:"notifications-all-v5", schemaVersion:4, coverage:{[type]:{status:"partial"}} },
+            }));
+          }
+          results.push(await require("../services/live-earnings-projection-service").ingestLive({ db:tx,
+            agencyId:ctx.creator.agencyId,creatorId:ctx.creator.id,deviceId:device.id,events:input.events,
+            capturedAt:observedAt,capturedTimes:input.delivery?.entries.map(entry=>entry.capturedAt),now:await dbAuthorityNow({db:tx}) }));
+          await recordNotificationSocketEvent({ db:tx, agencyId:ctx.creator.agencyId, creatorId:ctx.creator.id, deviceId:device.id,
+            occurredAt:dates.length ? new Date(Math.max(...dates.map(date=>date.getTime()))) : observedAt });
+          return results;
+        };
+        if (!input.delivery) return { results: await ingest() };
+        return require("../services/creator-live-sync-service").acceptDelivery({ db:tx, agencyId:ctx.creator.agencyId,
+          creatorId:ctx.creator.id, deviceId:device.id, memberId:ctx.member.id, accessEpoch:memberAccessEpoch,
+          delivery:input.delivery, events:input.events, now:await dbAuthorityNow({db:tx}), ingest });
       },
     });
-    return res.json({ ok: true, creatorId: ctx.creator.id, batchId: input.batchId, results });
+    return res.json({ ok:true, creatorId:ctx.creator.id, batchId:input.batchId, ...committed });
+
   } catch (error) {
     if (error?.issues) return validationError(res, error);
     console.error("[stats/notifications-live] failed:", error);

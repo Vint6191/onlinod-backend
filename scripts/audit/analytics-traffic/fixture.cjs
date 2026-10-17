@@ -1,7 +1,7 @@
 'use strict';
 const path=require('node:path');
-if(!process.env.ONLINOD_SQL_PROOF_RUNTIME)throw Error('ONLINOD_SQL_PROOF_RUNTIME must point to a local PGlite + pglite-socket installation');
-const runtime=path.resolve(process.env.ONLINOD_SQL_PROOF_RUNTIME);
+if(!process.env.ONLINOD_SQL_PROOF_RUNTIME && !process.env.ONLINOD_NATIVE_TEST_DATABASE_URL)throw Error('ONLINOD_SQL_PROOF_RUNTIME must point to a local PGlite + pglite-socket installation');
+const runtime=path.resolve(process.env.ONLINOD_SQL_PROOF_RUNTIME || __dirname);
 async function fixture(){
  const current=await require('../../test-support/admin-sql-runtime.cjs').createAdminSqlRuntime({runtimePath:runtime});
  process.env.DATABASE_URL=current.url;process.env.DIRECT_URL=current.url;

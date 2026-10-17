@@ -82,7 +82,7 @@ async function readiness(db,creatorId,now) {
     valueFreshnessMs:row.valueFreshnessMs,nextChangeAt:!row.empty&&current?row.nextChangeAt?.toISOString()||null:null};
 }
 async function sourceCoverage(db,creatorId,now,key) {
-  const [financial,campaigns,refreshDebt]=await Promise.all([
+  const [storedFinancial,campaigns,refreshDebt,liveCoverage]=await Promise.all([
     // Creator Demand survives current coverage generation changes.
 
     db.creatorFinancialCollectionState.findUnique({where:{creatorId},select:{status:true,baselineVerifiedAt:true,lastCatchupCompletedAt:true,baselineObservedAt:true,lastCatchupObservedAt:true,retryAfterAt:true,
@@ -90,12 +90,15 @@ async function sourceCoverage(db,creatorId,now,key) {
       historyAuditCursor:true,historyAuditObservedAt:true}}),
     db.creatorCampaignCollectionState.findUnique({where:{creatorId},select:CAMPAIGN_COVERAGE_SELECT}),
     readCampaignRefreshDebt({db,creatorId}),
+    require("./earnings-live-read-sql").readLiveEarningsCoverage(db,creatorId,now),
   ]);
+  const financial=storedFinancial ? {...storedFinancial,liveCoverage} : null;
   // Provider coverage evidence is separate from processing all locally known
   // facts. READY never fabricates a completed provider scan.
   const financialState=financialAuthority.evaluateCollection(financial,now,FINANCIAL_COLLECTION_FRESHNESS_MS);
+  const financialFresh=financialState.proven && (liveCoverage ? liveCoverage.fresh : financialState.fresh);
   const campaignState=evaluateCampaignCollectionState(campaigns,now,refreshDebt);
-  return {financial:financial?{...coverageDto(financial),status:stateVocabulary(financialState),proven:financialState.proven,fresh:financialState.fresh,
+  return {financial:financial?{...coverageDto(financial),status:stateVocabulary({...financialState,fresh:financialFresh,stale:financialState.proven&&!financialFresh}),proven:financialState.proven,fresh:financialFresh,
     coverage:financialAuthority.coverageView(financial,now)}:null,
     revenue:campaignRevenueCoverage(financial,campaignState,displayRangeBounds(key,now),now),campaigns:campaigns?{
     ...coverageDto(campaigns),status:stateVocabulary(campaignState),proven:campaignState.proven,fresh:campaignState.fresh,

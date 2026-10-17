@@ -1732,6 +1732,7 @@ test("campaign fan reader scopes the campaign to the creator and pages concrete 
       if(sql.includes('FROM "CampaignProjectionPolicy"'))return [{completedAt:new Date('2026-08-08'),generation:1,activeGeneration:1,empty:false,valueFreshnessMs:require('./analytics-freshness-policy').CAMPAIGN_FAN_VALUE_FRESHNESS_MS,pending:false,expired:false}];
       if(sql.includes('FROM "CreatorCampaignFan" m'))return [{id:'link-1',fanId:'fan-1'},{id:'link-2',fanId:'fan-2'}];
       if(sql.includes('FROM "CampaignReadMetric"'))return [];
+      if(sql.includes('JOIN "CreatorEarningsLedgerProof"'))return []; // No verified monetary baseline in this fixture.
       throw Error('Unexpected Campaign SQL: '+sql);
     },
     creatorCampaign: { findFirst: async ({ where }) => where.creatorId === "creator-1" ? { id: "campaign-1", externalCampaignId: "of-campaign", name: "Link A", isActive: true } : null },

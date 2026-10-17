@@ -30,11 +30,11 @@ test("INT5.9A-5 current planner and claim fence publish no historical claimer sk
   const orchestrator = read("src/services/creator-analytics-sync-orchestrator.js");
   const lease = read("src/services/job-lease-service.js");
   assert.doesNotMatch(orchestrator, /async function campaignCatchupState/);
-  const schedulingStart = orchestrator.indexOf('const campaignReady =');
+  const schedulingStart = orchestrator.indexOf('const readiness =');
   const schedulingEnd = orchestrator.indexOf('return { ready: initial.ready, initial, created, skipped };', schedulingStart);
   const scheduling = orchestrator.slice(schedulingStart, schedulingEnd);
   assert.doesNotMatch(scheduling, /knownClaimerFrontierHashes|knownClaimersByCampaign|knownCampaignFanCounts/);
-  assert.match(scheduling, /campaignOrderIndependentTraversalVersion: 1/);
+  assert.match(scheduling, /campaignOrderIndependentTraversalVersion:\s*1/);
   assert.match(lease, /delete params\.knownCampaignFanCounts/);
   assert.match(lease, /delete params\.knownClaimersByCampaign/);
   assert.match(lease, /delete params\.knownClaimerFrontierHashes/);
@@ -46,7 +46,7 @@ test("INT5.9A-5 rolling wire requires explicit order-independent traversal capab
   assert.match(route, /campaignOrderIndependentTraversalV1: true/);
   assert.match(route, /campaignOrderIndependentTraversalV1: z\.boolean\(\)\.optional\(\)\.default\(false\)/);
   assert.match(lease, /capabilities\?\.campaignOrderIndependentTraversalV1 !== true/);
-  assert.match(lease, /campaignOrderIndependentTraversalVersion: 1/);
+  assert.match(lease, /campaignOrderIndependentTraversalVersion:\s*1/);
   const publication = read("src/services/analytics-publication-service.js");
   assert.match(lease, /acceptAnalyticsPublication/);
   assert.match(publication, /sideEffect\?\.completion\?\.protocolCurrent === false/);

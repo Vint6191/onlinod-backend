@@ -39,7 +39,7 @@ test('future observation does not satisfy a present demand; invalid run fails be
  await assert.rejects(()=>enqueue({...input(harness()),scanStartedAt:null}),/QUEUE_SCOPE_INVALID/);
 });
 test('expiry batch bound rejects oversize work before any database operation',async()=>{
- await assert.rejects(()=>requestExpiredCampaignValues({tx:{$queryRawUnsafe(){throw Error('unexpected database call');}},agencyId:'a',creatorId:'c',fanIds:Array.from({length:101},(_,i)=>String(i)),now:start,freshnessMs:TTL}),/REFRESH_SCOPE_INVALID/);
+ await assert.rejects(()=>requestExpiredCampaignValues({reason:'MANUAL_REFRESH',tx:{$queryRawUnsafe(){throw Error('unexpected database call');}},agencyId:'a',creatorId:'c',fanIds:Array.from({length:101},(_,i)=>String(i)),now:start,freshnessMs:TTL}),/REFRESH_SCOPE_INVALID/);
 });
 
 test('refresh completion retains bounded provider failure diagnostics on the unsatisfied demand',async()=>{
@@ -54,4 +54,9 @@ test('refresh completion retains bounded provider failure diagnostics on the uns
  assert.match(demand.lastError,/OF_HTTP_ERROR status=404 fan=404-fan/);
  assert.equal(h.coverage.fanValueSucceeded,0);
  assert.equal(h.coverage.fanValueFailed,1);
+});
+
+test('reading expired campaign values does not start profile scans',async()=>{
+ const tx=new Proxy({}, {get(){throw Error('TTL reads cannot schedule work');}});
+ assert.equal((await requestExpiredCampaignValues({tx,agencyId:'a',creatorId:'c',fanIds:['fan'],now:start,freshnessMs:TTL})).requested,0);
 });

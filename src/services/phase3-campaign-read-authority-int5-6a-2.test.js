@@ -28,7 +28,7 @@ test("INT5.6A-2 fetch_campaigns is a causal-read job with two exact server-owned
 test("INT5.6A-2 every current campaign scheduler opts new jobs into causal token and read-lease protocol", () => {
   const orchestrator = source("src/services/creator-analytics-sync-orchestrator.js");
   const manual = source("src/services/campaign-scan-control-service.js");
-  const orchestratorPairs = orchestrator.match(/observationTokenVersion:\s*1,\s*\n\s*observationReadLeaseVersion:\s*1,/g) || [];
+  const orchestratorPairs = orchestrator.match(/observationTokenVersion:\s*1,\s*observationReadLeaseVersion:\s*1,/g) || [];
   assert.equal(orchestratorPairs.length, 2, "initial and catchup campaign schedulers must both carry the causal contract");
   assert.match(manual, /fanValueBatchSize:\s*20,[\s\S]*observationTokenVersion:\s*1,[\s\S]*observationReadLeaseVersion:\s*1,/,
     "manual campaign scans must carry the same causal contract");

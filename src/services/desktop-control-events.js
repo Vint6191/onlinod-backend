@@ -11,6 +11,7 @@ const TYPES = new Set([
   "NETWORK_REVISION_CHANGED",
   "KEY_VERSION_CHANGED",
   "JOB_AVAILABLE",
+  "ANALYTICS_CHANGED",
 ]);
 const streamId = randomUUID();
 let sequence = 0;
@@ -89,6 +90,7 @@ function normalizeEvent(input) {
     if (!creatorId) return null;
     return { ...base, creatorId, reason: clean(input?.reason, 160) || null };
   }
+  if (type === "ANALYTICS_CHANGED") return base;
   if (type === "JOB_AVAILABLE") {
     const jobId = clean(input?.jobId, 180);
     if (!jobId) return null;

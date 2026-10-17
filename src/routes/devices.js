@@ -6,24 +6,12 @@ const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { assertCurrentAuthorizationSession } = require("../services/authorization-session-authority-service");
 const { withHeartbeatMemberGeneration } = require("../services/device-heartbeat-generation-service");
-const { updateObservationFromHeartbeat, recordRealtimeObservationPing, realtimeFrameSampleAt } = require("../services/team-observation-service");
-const {
-  OFFLINE_DIALOG_RECOVERY_GAP_MS,
-  hasLongOfflineGap,
-  hasRealtimeCoverageClockSkew,
-  scheduleOfflineDialogRecovery,
-  shouldPreserveRealtimeCoverage,
-} = require("../services/dialog-offline-recovery-service");
+const { realtimeFrameSampleAt } = require("../services/team-observation-service");
+
 
 const router = express.Router();
 router.use(authRequired);
 
-
-function optionalNonNegativeInt(value) {
-  if (value === null || value === undefined || value === "") return null;
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : null;
-}
 
 const heartbeatSchema = z.object({
   deviceId: z.string().min(3).max(160),
@@ -54,168 +42,11 @@ const heartbeatSchema = z.object({
     lastWsFrameAt: z.string().datetime().optional().nullable(),
     lastRuntimeEventAt: z.string().datetime().optional().nullable(),
     backgroundMode: z.boolean().optional().default(false),
-  }).passthrough()).optional().default([]),
+  }).passthrough()).max(10000).optional().default([]),
 });
 
 
-async function syncDeviceCreatorBindings({ agencyId, deviceId, accounts, allowedCreatorIds = null, currentAccessEpoch = null, now = new Date(), db = prisma }) {
-  const list = Array.isArray(accounts) ? accounts : [];
-  let accepted = 0;
-  let rejected = 0;
-  const seenCreatorIds = [];
-  const recoveryCandidates = new Map();
-  const resolvedAccounts = [];
-
-  for (const account of list) {
-    const remoteId = account?.remoteId === undefined || account?.remoteId === null ? null : String(account.remoteId);
-    const username = account?.username ? String(account.username).replace(/^@/, "") : null;
-    const candidateIds = [account?.creatorId, account?.backendCreatorId, account?.accountId]
-      .map((value) => String(value || "").trim())
-      .filter(Boolean);
-
-    const or = [];
-    if (candidateIds.length) or.push({ id: { in: candidateIds } });
-    if (remoteId) or.push({ remoteId });
-    if (username) or.push({ username });
-
-    if (!or.length) {
-      rejected += 1;
-      continue;
-    }
-
-    const creator = await db.creatorAccount.findFirst({
-      where: { agencyId, deletedAt: null, status: "READY", OR: or },
-      select: { id: true },
-    });
-
-    if (!creator || (allowedCreatorIds && !allowedCreatorIds.has(creator.id))) {
-      rejected += 1;
-      continue;
-    }
-
-    const accessEpoch = optionalNonNegativeInt(account?.accessEpoch);
-    const expectedAccessEpoch = optionalNonNegativeInt(currentAccessEpoch);
-    const generationCurrent = expectedAccessEpoch !== null && accessEpoch === expectedAccessEpoch;
-    // A device heartbeat proves process liveness. Creator capability telemetry is
-    // revision-sensitive and must not be published from a stale member access
-    // generation even when the creator remains inside the newly allowed scope.
-    const sessionReadReady = generationCurrent && account?.sessionReadReady === true;
-    const sessionWriteReady = sessionReadReady && account?.sessionWriteReady === true;
-    const realtimeReady = generationCurrent && account?.realtimeHealthy === true;
-    const pageLocalReady = generationCurrent && account?.pageLocalReady === true;
-    const browserMaterialized = generationCurrent && account?.browserMaterialized === true;
-    const browserPresentable = browserMaterialized && account?.browserPresentable === true;
-    const sessionProofEpoch = Number.isInteger(Number(account?.sessionProofEpoch)) ? Number(account.sessionProofEpoch) : null;
-    const canonicalRevision = Number.isInteger(Number(account?.canonicalRevision)) ? Number(account.canonicalRevision) : null;
-    const networkRevision = Number.isInteger(Number(account?.networkRevision)) ? Number(account.networkRevision) : null;
-
-    // DeviceCreatorBinding is device presence plus capability telemetry. It is
-    // never creator-access authority; allowedCreatorIds was resolved from the
-    // current AgencyMember before this function was called. Realtime coverage
-    // is still based only on the durable inbound-frame observation timestamp,
-    // observation timestamp, and only when a healthy listener comes back.
-    const realtimeFrameAt = realtimeReady
-      ? realtimeFrameSampleAt(account, now)
-      : null;
-    if (realtimeFrameAt) {
-      const observation = await db.teamObservationState.findUnique({
-        where: { agencyId_creatorId: { agencyId, creatorId: creator.id } },
-        select: { lastRealtimeEventAt: true },
-      }).catch(() => null);
-      const lastCoveredAt = observation?.lastRealtimeEventAt || null;
-      if (!lastCoveredAt
-        || hasLongOfflineGap(lastCoveredAt, now, OFFLINE_DIALOG_RECOVERY_GAP_MS)
-        || hasRealtimeCoverageClockSkew(lastCoveredAt, now)) {
-        recoveryCandidates.set(creator.id, { creatorId: creator.id, lastCoveredAt });
-      }
-    }
-
-    await db.deviceCreatorBinding.upsert({
-      where: { deviceId_creatorId: { deviceId, creatorId: creator.id } },
-      create: {
-        deviceId,
-        creatorId: creator.id,
-        agencyId,
-        status: "ACTIVE",
-        remoteId,
-        username,
-        accessEpoch,
-        sessionReadReady,
-        sessionWriteReady,
-        realtimeReady,
-        pageLocalReady,
-        browserMaterialized,
-        browserPresentable,
-        sessionProofEpoch,
-        canonicalRevision,
-        networkRevision,
-        lastCapabilityAt: now,
-        lastSeenAt: now,
-      },
-      update: {
-        status: "ACTIVE",
-        remoteId,
-        username,
-        accessEpoch,
-        sessionReadReady,
-        sessionWriteReady,
-        realtimeReady,
-        pageLocalReady,
-        browserMaterialized,
-        browserPresentable,
-        sessionProofEpoch,
-        canonicalRevision,
-        networkRevision,
-        lastCapabilityAt: now,
-        lastSeenAt: now,
-      },
-    });
-
-    seenCreatorIds.push(creator.id);
-    resolvedAccounts.push({
-      creatorId: creator.id,
-      account: {
-        ...account,
-        creatorId: creator.id,
-        backendCreatorId: creator.id,
-        sessionReadReady,
-        sessionWriteReady,
-        realtimeHealthy: Boolean(realtimeFrameAt),
-        pageLocalReady,
-        browserMaterialized,
-        browserPresentable,
-        lastWsFrameAt: realtimeFrameAt?.toISOString() || null,
-      },
-    });
-    accepted += 1;
-  }
-
-  // Mark bindings not seen in this heartbeat as stale instead of deleting.
-  await db.deviceCreatorBinding.updateMany({
-    where: {
-      agencyId,
-      deviceId,
-      ...(seenCreatorIds.length ? { creatorId: { notIn: seenCreatorIds } } : {}),
-    },
-    data: {
-      status: "STALE",
-      sessionReadReady: false,
-      sessionWriteReady: false,
-      realtimeReady: false,
-      pageLocalReady: false,
-      browserMaterialized: false,
-      browserPresentable: false,
-    },
-  });
-
-  return {
-    accepted,
-    rejected,
-    visibleCreatorIds: seenCreatorIds,
-    recoveryCandidates: [...recoveryCandidates.values()],
-    resolvedAccounts,
-  };
-}
+const syncDeviceCreatorBindings = require("../services/device-heartbeat-batch-service").syncBindings;
 
 router.post("/heartbeat", async (req, res) => {
   try {
@@ -278,38 +109,13 @@ router.post("/heartbeat", async (req, res) => {
     const bindings = capabilityCommit.bindings;
     const currentAccessEpoch = capabilityCommit.accessEpoch;
 
-    const dialogRecovery = [];
-    const recoveryDecisions = new Map();
-    for (const candidate of bindings.recoveryCandidates || []) {
-      let result;
-      try {
-        result = await scheduleOfflineDialogRecovery({
-          agencyId,
-          creatorId: candidate.creatorId,
-          lastCoveredAt: candidate.lastCoveredAt,
-          now: heartbeatAt,
-        });
-      } catch (error) {
-        console.warn("[devices/heartbeat] offline dialog recovery scheduling failed:", {
-          creatorId: candidate.creatorId,
-          error: error?.message || String(error),
-        });
-        result = {
-          ok: false,
-          created: false,
-          creatorId: candidate.creatorId,
-          reason: "recovery_schedule_failed",
-          error: error?.message || String(error),
-        };
-      }
-      recoveryDecisions.set(candidate.creatorId, result);
-      dialogRecovery.push(result);
-    }
+    const recoveryCreators = new Set((bindings.recoveryCandidates || []).map(x => x.creatorId));
+    const dialogRecovery = bindings.recoveryCandidates?.length
+      ? [{ ok: true, reason: "recovery_check_queued", creators: bindings.recoveryCandidates.length }] : [];
 
     const realtimeBindings = (bindings.resolvedAccounts || [])
       .filter((entry) => entry?.account?.realtimeHealthy === true
         && Boolean(realtimeFrameSampleAt(entry.account, heartbeatAt)));
-    const realtimeAccounts = realtimeBindings.map((entry) => entry.account);
     let observation = null;
     try {
       observation = await withHeartbeatMemberGeneration({
@@ -317,34 +123,19 @@ router.post("/heartbeat", async (req, res) => {
         userId: req.auth.userId,
         memberId: agencyId === req.auth.agencyId ? (req.auth.membership?.id || null) : null,
         expectedAccessEpoch: currentAccessEpoch,
-        work: async ({ tx }) => {
-          // Notification catch-up and dialog recovery use the same truthful
-          // realtime coverage set. This second generation fence is intentional:
-          // offline-recovery scheduling above may take time, so a revision change
-          // during that middle phase must prevent stale coverage publication.
-          const nextObservation = await updateObservationFromHeartbeat({
-            agencyId,
-            deviceId: boundDeviceId,
-            accounts: realtimeAccounts,
-            now: heartbeatAt,
-            db: tx,
+        work: async ({ tx, member, accessEpoch }) => {
+          // Recheck membership before recording coverage and durable recovery
+          // requests. A revoked capability must not publish a fresh watermark.
+          await require('../services/creator-live-sync-service').recordCaptureSamples({
+            db:tx,agencyId,deviceId:boundDeviceId,memberId:member.id,accessEpoch,bindings:realtimeBindings,now:heartbeatAt,
           });
-          const realtimePings = [];
-          for (const entry of realtimeBindings) {
-            const decision = recoveryDecisions.get(entry.creatorId) || null;
-            realtimePings.push(await recordRealtimeObservationPing({
-              agencyId,
-              deviceId: boundDeviceId,
-              account: entry.account,
-              now: heartbeatAt,
-              advanceRealtimeCoverage: !shouldPreserveRealtimeCoverage(decision),
-              db: tx,
-            }));
-          }
-          nextObservation.realtimeHealthy = realtimePings.filter((item) => item?.ok).length;
-          nextObservation.realtimeCoverageAdvanced = realtimePings.filter((item) => item?.coverageAdvanced).length;
-          nextObservation.realtimeCoverageFenced = realtimePings.filter((item) => item?.ok && !item?.coverageAdvanced).length;
-          return nextObservation;
+          await require('../services/dialog-recovery-queue-service').enqueue({
+            db:tx,agencyId,candidates:bindings.recoveryCandidates || [],bindings:realtimeBindings,now:heartbeatAt,
+          });
+          return require('../services/device-heartbeat-batch-service').recordTeamObservations({
+            db:tx,agencyId,bindings:realtimeBindings,now:heartbeatAt,
+            preserve:creatorId=>recoveryCreators.has(creatorId),
+          });
         },
       });
     } catch (err) {

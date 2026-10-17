@@ -523,9 +523,29 @@ async function ensureAnalyticsWindowFreshness({
   // A user refresh requests a new verification of the selected period, even
   // when the historical cache is within its ordinary background freshness TTL.
   const normalizedReason = String(reason).toUpperCase();
+  if(normalizedReason === "HOME_INTERACTIVE_REFRESH") {
+    // Home and the model's manual financial control share the same planning
+    // authority, including paused jobs and commands already being published.
+    const scheduled=await require("./financial-transaction-scan-control-service").startManualFinancialTransactionScan({
+      db,creator:{id:creatorId,agencyId},now:currentNow,
+    });
+    const created=scheduled.action==="created";
+    return {ok:true,created:Number(created),reused:created?0:1,jobs:scheduled.job?[scheduled.job]:[],windows:1,dueDays:0,deferredDays:0,staleDays:0,fresh:false};
+  }
   const evaluatedDays = days.map((day) => ({ day, state: coverageState(byDay.get(dateKey(day)), day, currentNow,
     forceDay(normalizedReason, day, currentNow, force)) }));
-  const dueDays = evaluatedDays.filter((item) => item.state.due).map((item) => item.day);
+  const automatic = ["RECURRING", "HOME_AUTOMATIC", "INITIAL_BASELINE", "INITIAL_SYNC"].includes(normalizedReason);
+  if(automatic && typeof db.$queryRawUnsafe==="function") {
+    const [ledger]=await db.$queryRawUnsafe('SELECT "fromAt" FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$1 AND "agencyId"=$2',creatorId,agencyId);
+    if(ledger && new Date(ledger.fromAt)<=from) return {ok:true,displayRangeKey,startDay:from,endDay:to,dueDays:0,deferredDays:0,staleDays:0,windows:0,created:0,reused:0,jobs:[],fresh:false,reason:"live_projection_owned"};
+  }
+  const published = automatic && typeof db.creatorEarningsPublishedDay?.findMany === "function"
+    ? await db.creatorEarningsPublishedDay.findMany({where:{agencyId,creatorId,date:{gte:from,lte:to}},select:{date:true}}) : [];
+  const proven = new Set(published.map(row => dateKey(row.date)));
+  for (const row of rows) if (row.scanProof?.status === "COMMITTED" && row.scanProof?.proofVersion === 2) proven.add(dateKey(row.coverageDate));
+  const hasBaseline = proven.size > 0;
+  const dueDays = evaluatedDays.filter(item => item.state.due && (!automatic || (!proven.has(dateKey(item.day))
+    && (item.day < today || byDay.has(dateKey(item.day)) || !hasBaseline)))).map(item => item.day);
   const deferredDays = evaluatedDays.filter((item) => item.state.deferred).length;
   const staleDays = evaluatedDays.filter((item) => item.state.stale).length;
   if (!dueDays.length) {
@@ -547,7 +567,7 @@ async function ensureAnalyticsWindowFreshness({
       displayRangeKey,
       scanFrom: window.scanFrom,
       scanTo: window.scanTo,
-      collectionReason: String(reason || "RECURRING").toUpperCase(),
+      collectionReason: automatic ? "INITIAL_BASELINE" : String(reason || "RECURRING").toUpperCase(),
       // Current revenue must not sit behind the initial historical backfill.
       priority: effectivePriority + (window.scanTo >= today ? 20 : window.scanTo >= new Date(today.getTime() - 30 * DAY_MS) ? 10 : 0),
       now: currentNow,
@@ -764,6 +784,7 @@ async function enqueueAgencyAnalyticsFreshnessDemand({
 
 function enqueueHomeAnalyticsFreshnessDemand({ mode = "manual", ...options } = {}) {
   if (!["manual", "automatic"].includes(mode)) throw Object.assign(new Error("Invalid Home refresh mode"), { code: "HOME_REFRESH_MODE_INVALID", status: 400 });
+  if (mode === "automatic") return Promise.resolve({ queued:false, reason:"live_projection_owned", rangeKey:HOME_COLLECTION_RANGE_KEY });
   return enqueueAgencyAnalyticsFreshnessDemand({
     ...options,
     rangeKey: HOME_COLLECTION_RANGE_KEY,

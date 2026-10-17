@@ -60,8 +60,8 @@ test("live Notification fact reporter gates REALTIME capability against PostgreS
   assert.match(block, /freshnessWindow = capabilityFreshnessWindow\(authorityNow, 10 \* 60 \* 1000\)/);
   assert.match(block, /lastSeenAt: freshnessWindow/);
   assert.match(block, /realtimeReady: true/);
-  assert.match(block, /const commitGuard = async \(tx\)[\s\S]*await assertLiveBinding\(tx\)/);
+  assert.match(block, /withRealtimeIngestGenerationFence\(\{[\s\S]*work: async \(\{ tx \}\)[\s\S]*await assertLiveBinding\(tx\)/);
   assert.doesNotMatch(block.slice(block.indexOf("const assertLiveBinding"), block.indexOf("const grouped =")), /Date\.now\(\)/);
-  assert.match(block, /ingestNotificationFacts\(\{[\s\S]*commitGuard/);
+  assert.match(block, /ingestNotificationFacts\(\{ db: tx/);
   assert.match(block, /withRealtimeIngestGenerationFence\(\{[\s\S]*recordNotificationSocketEvent/);
 });

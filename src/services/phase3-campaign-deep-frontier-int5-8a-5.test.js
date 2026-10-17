@@ -34,11 +34,11 @@ test("INT5.8A-5 exact deep-boundary machinery remains bounded as pre-v12 compati
 
   const planner = read("src/services/creator-analytics-sync-orchestrator.js");
   assert.doesNotMatch(planner, /async function campaignCatchupState/);
-  const schedulingStart = planner.indexOf('const campaignReady =');
+  const schedulingStart = planner.indexOf('const readiness =');
   const schedulingEnd = planner.indexOf('return { ready: initial.ready, initial, created, skipped };', schedulingStart);
   const plannerSlice = planner.slice(schedulingStart, schedulingEnd);
   assert.doesNotMatch(plannerSlice, /catchupFrontierHash|knownClaimerFrontierHashes|catchupFrontierFanIds/);
-  assert.match(plannerSlice, /campaignOrderIndependentTraversalVersion: 1/);
+  assert.match(plannerSlice, /campaignOrderIndependentTraversalVersion:\s*1/);
 });
 
 test("INT5.8A-5 server deep-boundary continuation override remains legacy compatibility while v12 disables that authority", () => {

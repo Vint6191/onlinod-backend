@@ -1074,7 +1074,7 @@ for (const type of ['NOTIFICATIONS','FINANCIAL']) test(`first ${type} claim afte
       findUnique:async()=>({...candidate,...data,leaseRevision:1,creator:{id:'creator-1'}})},
   };
   const {claimJob}=loadService({db});
-  const result=await claimJob({userId:'user-1',deviceId:'device-1',jobKeys:[jobKey],capabilities:{financialWindowReceiptsV1:true}});
+  const result=await claimJob({userId:'user-1',deviceId:'device-1',jobKeys:[jobKey],capabilities:{creatorEventDrivenSyncV2:true,financialWindowReceiptsV1:true}});
   assert.equal(result.reason,'claimed');assert.equal(result.job.params.collectionGeneration,params.collectionGeneration);
   assert.equal(result.job.params.collectionAuthorityRequestedAt,params.collectionAuthorityRequestedAt);
   assert(Date.parse(result.job.params.analyticsObservationStartedAt)>=+now);
@@ -1103,7 +1103,7 @@ test("claiming a queued pre-fix repair returns a fresh notification generation a
     },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", jobKeys: ["catchup_notifications_scan"] });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", jobKeys: ["catchup_notifications_scan"], capabilities:{creatorEventDrivenSyncV2:true} });
   assert.equal(result.reason, "claimed");
   assert.notEqual(result.job.params.collectionGeneration, "old-run");
   assert.equal(result.job.params.notificationMode, "catchup");
@@ -1359,7 +1359,7 @@ test("claim fence cancels a legacy no-mode notification FULL once historical bas
     },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["catchup_notifications_scan"] });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["catchup_notifications_scan"], capabilities:{creatorEventDrivenSyncV2:true} });
   assert.equal(result.job, null);
   assert.equal(result.reason, "no-work");
   assert.equal(cancellation.data.status, "CANCELLED");
@@ -1572,7 +1572,7 @@ test("job claim lease timestamps use PostgreSQL authority instead of replica wal
     },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true } });
   assert.equal(result.reason, "claimed");
   assert.equal(updateData.claimedAt.toISOString(), authorityNow.toISOString());
   assert.equal(updateData.startedAt.toISOString(), authorityNow.toISOString());
@@ -1629,7 +1629,7 @@ test("Campaign claim sets active physical claim generation before SCHEDULED to C
   const { claimJob } = loadService({ db });
   const result = await claimJob({
     userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"],
-    capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true },
+    capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true },
   });
   assert.equal(result.reason, "claimed");
   const markerAt = events.findIndex((event) => event[0] === "marker");
@@ -1685,16 +1685,16 @@ test("job claim creator capability freshness uses the same PostgreSQL authority 
     jobInstance: { findMany: async () => [], findFirst: async () => null },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true, campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true, campaignTraversalAuthorityV1: true, campaignFairPagesV1: true } });
   assert.equal(result.reason, "no-work");
   assert.equal(bindingWhere.lastSeenAt.gte.toISOString(), new Date(authorityNow.getTime() - 2 * 60_000).toISOString());
   assert.equal(bindingWhere.lastSeenAt.lte.toISOString(), new Date(authorityNow.getTime() + 5 * 60_000).toISOString());
 });
 
-for (const missing of ["campaignBoundedTraversalV1", "campaignTraversalAuthorityV1", "campaignFairPagesV1"]) {
+for (const missing of ["creatorEventDrivenSyncV2", "campaignBoundedTraversalV1", "campaignTraversalAuthorityV1", "campaignFairPagesV1"]) {
   test(`Campaign claim without ${missing} never reaches a lease mutation`, async () => {
     const authorityNow = new Date("2039-03-04T05:06:07.800Z");
-    const capabilities = { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true,
+    const capabilities = {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true,
       campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true,
       campaignFrontierSchedulingV1: true, campaignDirectoryReuseV1: true, campaignBoundedTraversalV1: true,
       campaignTraversalAuthorityV1: true, campaignFairPagesV1: true };
@@ -1721,7 +1721,7 @@ test("job claim rejects future-poisoned device heartbeat before creator capabili
     jobInstance: { findMany: async () => [] },
   };
   const { claimJob } = loadService({ db });
-  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true } });
+  const result = await claimJob({ userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"], capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true, campaignResumablePaginationV1: true, campaignFreshnessCoverageV1: true, campaignOrderIndependentTraversalV1: true, campaignSegmentedFairTraversalV1: true } });
   assert.equal(result.reason, "device-stale");
 });
 
@@ -1797,7 +1797,7 @@ test("Campaign claim rejects a worker missing resumable-pagination capability be
   const { claimJob } = loadService({ db });
   const result = await claimJob({
     userId: "user-1", deviceId: "device-1", leaseMs: 60_000, jobKeys: ["fetch_campaigns"],
-    capabilities: { campaignCausalObservationV1: true, campaignServerFanRefreshV1: true },
+    capabilities: {creatorEventDrivenSyncV2:true, campaignCausalObservationV1: true, campaignServerFanRefreshV1: true },
   });
   assert.equal(result.reason, "no-capabilities");
   assert.equal(candidateReads, 0, "an old v9 worker must not even enter Campaign candidate arbitration");

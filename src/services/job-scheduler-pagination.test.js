@@ -130,7 +130,7 @@ test("Creator Analytics compatibility entry uses the same bounded durable lane",
   assert.deepEqual(leaseCalls, []);
 });
 
-test('minute planning checks analytics debt while preserving hourly generic scan cadence', async () => {
+test('event wake checks analytics debt and returns healthy creators to the hourly generic deadline', async () => {
   workProgress = { lastFullPlanningAt: '2026-09-08T18:04:00.000Z' };
   recurringPlans.length = yieldedPlans.length = 0;
   dailyCalls = 0;
@@ -141,7 +141,7 @@ test('minute planning checks analytics debt while preserving hourly generic scan
     assert.equal(dailyCalls, 0);
     assert.ok(recurringPlans.every(p => p.includeCatchups === true), 'offline catch-up remains eligible between hourly generic planning cycles');
     for (const p of yieldedPlans) {
-      assert.equal(p.availableAt.toISOString(), '2026-09-08T18:06:00.000Z');
+      assert.equal(p.availableAt.toISOString(), '2026-09-08T19:04:00.000Z');
       assert.equal(p.progressCursor.lastFullPlanningAt, workProgress.lastFullPlanningAt);
     }
   } finally { workProgress = null; }

@@ -19,15 +19,19 @@ function revenueSql(source = 'visible') {
   const { publishedEarningsJoins } = require('./published-earnings-read-repository');
   return `, periods AS (SELECT 0 AS period,($6::timestamptz AT TIME ZONE 'UTC')::date AS start_day,($7::timestamptz AT TIME ZONE 'UTC')::date AS end_day
     UNION ALL SELECT 1,($8::timestamptz AT TIME ZONE 'UTC')::date,($9::timestamptz AT TIME ZONE 'UTC')::date),
-  daily AS MATERIALIZED (
+  ${require("./earnings-live-read-sql").liveLedgerDailySql(source)}, published_daily AS MATERIALIZED (
     SELECT d."creatorId",r.period,d."date",d."totalCents",d."hourlyPoints",d."collectedAt",${earningsObservationSql()} AS observed,
       (${earningsObservationSql()}<=($11::timestamptz AT TIME ZONE 'UTC')+interval '5 minutes'
         AND ${earningsObservationSql()}>=($11::timestamptz AT TIME ZONE 'UTC')-(CASE WHEN d."date"=($10::timestamptz AT TIME ZONE 'UTC')::date THEN ${CURRENT_DAY_FRESHNESS_MS}
-          WHEN d."date">=($10::timestamptz AT TIME ZONE 'UTC')::date-30 THEN ${RECENT_CLOSED_FRESHNESS_MS} ELSE ${HISTORICAL_FRESHNESS_MS} END)*interval '1 millisecond') AS fresh
+          WHEN d."date">=($10::timestamptz AT TIME ZONE 'UTC')::date-30 THEN ${RECENT_CLOSED_FRESHNESS_MS} ELSE ${HISTORICAL_FRESHNESS_MS} END)*interval '1 millisecond') AS fresh,
+      jsonb_build_object('subscriptions',d."subscriptionsCents",'messages',d."messagesCents",'tips',d."tipsCents",'posts',d."postsCents",'streams',d."streamsCents",'referrals',d."referralsCents") AS "categoryTotals"
     FROM ${source} c JOIN "CreatorEarningsPublishedDay" d ON d."creatorId"=c."id" AND d."agencyId"=$1 AND d."sourceTimezone"='UTC'
       JOIN periods r ON d."date" BETWEEN r.start_day AND r.end_day
       ${publishedEarningsJoins()}
     WHERE v."status"='COMPLETE' OR (d."date"=($10::timestamptz AT TIME ZONE 'UTC')::date AND v."status"='PARTIAL')
+  ), daily AS MATERIALIZED (
+    SELECT * FROM ledger_daily UNION ALL SELECT p.* FROM published_daily p
+    WHERE NOT EXISTS(SELECT 1 FROM ledger_daily l WHERE l."creatorId"=p."creatorId" AND l.period=p.period AND l.date=p.date)
   ), earnings AS (
     SELECT "creatorId",period,COUNT(*) AS days,COUNT(*) FILTER (WHERE fresh) AS fresh_days,
       SUM("totalCents") AS cents,MAX("collectedAt") AS captured,MIN(observed) AS observed FROM daily GROUP BY "creatorId",period
@@ -50,7 +54,7 @@ function pendingSql(source = 'visible') {
       AND d."coverageFrom"<=($6::timestamptz AT TIME ZONE 'UTC')::date AND d."coverageTo">=($7::timestamptz AT TIME ZONE 'UTC')::date
   ), pending AS (
     SELECT c."id" FROM ${source} c WHERE EXISTS (SELECT 1 FROM "JobInstance" j WHERE j."agencyId"=$1
-      AND j."creatorId"=c."id" AND j."jobKey"='fetch_earnings' AND j."status" IN ('SCHEDULED','CLAIMED','PUBLISHING'))
+      AND j."creatorId"=c."id" AND j."jobKey" IN ('fetch_earnings','financial_transactions_scan') AND j."status" IN ('SCHEDULED','CLAIMED','PUBLISHING'))
     OR EXISTS (SELECT 1 FROM live_demands d WHERE (d."creatorIds" IS NULL OR d."creatorIds"='null'::jsonb OR d."creatorIds" ? c."id")
       AND (d.broad OR EXISTS (SELECT 1 FROM "AgencyMemberCreatorAccessCurrent" x
         WHERE x."memberId"=d."requestedByMemberId" AND x."agencyId"=$1
@@ -73,7 +77,7 @@ async function readHomeTotals(input) {
     const [row] = await db.$queryRawUnsafe(`${scopeSql()} SELECT COUNT(*) AS total FROM visible`, ...scopeParams(input));
     return { totalCreators: number(row.total), reportingCreators:0, staleCreators:0, pendingCount:0, totalCents:null, deltaPct:null, points:[] };
   }
-  const [row] = await db.$queryRawUnsafe(`${scopeSql()}${revenueSql()}${pendingSql()}
+  const row = await require("./home-ledger-totals").read(db,revenueParams(input),pendingSql) || (await db.$queryRawUnsafe(`${scopeSql()}${revenueSql()}${pendingSql()}
     , totals AS (SELECT period,COUNT(*) AS total,COUNT(*) FILTER (WHERE usable) AS reporting,
       COUNT(*) FILTER (WHERE usable AND NOT fresh) AS stale,SUM(cents) FILTER (WHERE usable) AS cents
       FROM facts GROUP BY period), points AS (SELECT d."date",SUM(d."totalCents") AS cents FROM daily d
@@ -89,7 +93,7 @@ async function readHomeTotals(input) {
       CASE WHEN c.total=c.reporting AND (SELECT ready FROM hourly_ready) THEN
         (SELECT jsonb_agg(jsonb_build_object('label',label,'valueCents',cents) ORDER BY label) FROM hourly)
       WHEN c.total=c.reporting THEN (SELECT jsonb_agg(jsonb_build_object('label',to_char("date",'YYYY-MM-DD'),'valueCents',cents) ORDER BY "date") FROM points)
-      ELSE '[]'::jsonb END AS points FROM (SELECT 1) one LEFT JOIN totals c ON c.period=0 LEFT JOIN totals p ON p.period=1`, ...revenueParams(input));
+      ELSE '[]'::jsonb END AS points FROM (SELECT 1) one LEFT JOIN totals c ON c.period=0 LEFT JOIN totals p ON p.period=1`, ...revenueParams(input)))[0];
   const total = number(row.total), reporting = number(row.reporting), stale = number(row.stale);
   const complete = total === reporting, previousComplete = total === number(row.previous_total) && total === number(row.previous_reporting);
   const cents = complete ? number(row.cents) : null, prev = previousComplete ? number(row.previous_cents) : null;
@@ -100,7 +104,7 @@ async function readHomeTotals(input) {
 }
 async function readHomeCreatorPage(input) {
   const { db, money } = input, page = pageInput(input);
-  const prefix = `${scopeSql({ cursor:true, cursorParameter:12, broad:typeof input.member.broad === "boolean" ? input.member.broad : null })}, page_candidates AS MATERIALIZED (SELECT "id","displayName","username","avatarUrl","status","remoteId" FROM visible
+  const prefix = `${scopeSql({ cursor:true, cursorParameter:12, broad:typeof input.member.broad === "boolean" ? input.member.broad : null })}, page_candidates AS MATERIALIZED (SELECT "id","agencyId","displayName","username","avatarUrl","status","remoteId" FROM visible
     WHERE "id">$12::text ORDER BY "id" LIMIT $13), page AS MATERIALIZED (SELECT * FROM page_candidates ORDER BY "id" LIMIT $14)`;
   const sql = money ? `${prefix}${revenueSql('page')}${pendingSql('page')}
     SELECT c.*,f.usable,f.fresh,f.cents,f.captured,f.observed,(p."id" IS NOT NULL) AS pending,

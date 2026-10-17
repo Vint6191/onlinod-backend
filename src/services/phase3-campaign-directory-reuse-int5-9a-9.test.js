@@ -160,13 +160,13 @@ test("INT5.9A-9 stale directory revision fails before activating/resetting a new
   assert.equal(harness.segmentReads, 0);
 });
 
-test("INT5.9A-9 durable directory reuse remains the server-owned source for later frontier tranches", () => {
+test("INT5.9A-9 legacy directory reuse stays scoped; offline recovery explicitly reobserves the directory", () => {
   const source = read("src/services/creator-analytics-sync-orchestrator.js");
   assert.match(source, /function campaignDirectoryReuseBinding\(state, now = new Date\(\)\)/);
   assert.match(source, /campaignDirectoryDiscoveryDue\(state, now\)/);
   assert.match(source, /campaignDirectoryReuseGeneration: generation/);
-  assert.match(source, /campaignDirectoryReuseBinding\(campaignState, now\)/);
-  assert.match(source, /\.\.\.\(directoryReuse \|\| \{\}\)/);
+  assert.match(source, /campaignDirectoryReuseBinding\(currentCollectorState, now\)/);
+  assert.match(source, /params\.recoveryIntentId[\s\S]*campaigns_offline_recovery/);
 });
 
 

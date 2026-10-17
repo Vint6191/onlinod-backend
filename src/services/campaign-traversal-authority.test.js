@@ -101,7 +101,7 @@ function progressFixture(job, apply) {
   let writes=0;
   const tx={jobInstance:{updateMany:async({data})=>{writes++;Object.assign(job,structuredClone(data));return{count:1};},
     update:async({data})=>{writes++;Object.assign(job,structuredClone(data));return structuredClone(job);}}};
-  const deps={require,campaignTraversal:authority,leaseCommit:async(_,work)=>work(tx,{job:structuredClone(job),now}),
+  const deps={require,liveSync:require("./creator-live-sync-service"),campaignTraversal:authority,leaseCommit:async(_,work)=>work(tx,{job:structuredClone(job),now}),
     enterCampaignBoundedExecution:async()=>{},hashToken:()=>"hash",leaseDuration:()=>60000,safeProgress:x=>x,
     normalizeLeaseContinuation:x=>x,clean:x=>x,applyJobChunk:apply,publishNotificationConsequences:async()=>{},
     campaignServerBoundaryContinuation:()=>null,campaignDirectorySegmentContinuation:()=>null,JobLeaseError:Error};

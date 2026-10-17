@@ -33,24 +33,36 @@ async function readPublishedEarningsDays({ db, creatorId, from, to, now }) {
   windowDays(from, to);
   const today = new Date(now.toISOString().slice(0, 10));
   const rows = await db.$queryRawUnsafe(`/* published_earnings_days_v1 */
-    WITH published AS MATERIALIZED (
+    WITH live_scope AS (SELECT id,"agencyId" FROM "CreatorAccount" WHERE id=$1),
+    periods AS (SELECT 0 AS period,($2::timestamptz AT TIME ZONE 'UTC')::date AS start_day,($3::timestamptz AT TIME ZONE 'UTC')::date AS end_day),
+    ${require("./earnings-live-read-sql").liveLedgerDailySql("live_scope","$5")},
+    published AS MATERIALIZED (
       SELECT d.*,${earningsObservationSql()} AS "publishedObservedAt" FROM "CreatorEarningsPublishedDay" d ${publishedEarningsJoins()}
       WHERE d."creatorId"=$1 AND d."sourceTimezone"='UTC' AND d."date" BETWEEN ($2::timestamptz AT TIME ZONE 'UTC')::date AND ($3::timestamptz AT TIME ZONE 'UTC')::date
         AND (v."status"='COMPLETE' OR (d."date"=($4::timestamptz AT TIME ZONE 'UTC')::date AND v."status"='PARTIAL'))
     )
-    SELECT d.*,days.date AS "stateDate",COALESCE(d."coverageStatus",c."status"::text,'MISSING') AS "coverageStatus",d."publishedObservedAt" AS "coverageVerifiedAt",
+    SELECT d.*,to_jsonb(l) AS live,days.date AS "stateDate",COALESCE(d."coverageStatus",c."status"::text,'MISSING') AS "coverageStatus",d."publishedObservedAt" AS "coverageVerifiedAt",
       c."retryAfterAt" AS "coverageRetryAfterAt",c."lastErrorCode" AS "coverageErrorCode"
     FROM generate_series(($2::timestamptz AT TIME ZONE 'UTC'),($3::timestamptz AT TIME ZONE 'UTC'),interval '1 day') days(date)
     LEFT JOIN "AnalyticsCoverage" c ON c."creatorId"=$1 AND c."dataType"='EARNINGS' AND c."sourceTimezone"='UTC' AND c."coverageDate"=days.date
-    LEFT JOIN published d ON d."date"=days.date ORDER BY days.date`, creatorId, from, to, today);
+    LEFT JOIN published d ON d."date"=days.date LEFT JOIN ledger_daily l ON l.date=days.date ORDER BY days.date`, creatorId, from, to, today, now);
   // Retry/partial hints survive even when amounts are unavailable. They can
   // never certify money: only the joined published row supplies proof status.
-  return rows.map(({ stateDate, coverageStatus, coverageVerifiedAt, coverageRetryAfterAt, coverageErrorCode, publishedObservedAt, ...daily }) => ({
-    daily: daily.id ? daily : null,
-    coverage: { coverageDate: stateDate, status: coverageStatus, lastVerifiedAt: coverageVerifiedAt,
-      retryAfterAt: coverageRetryAfterAt, lastErrorCode: coverageErrorCode, scanProofId: daily.scanProofId,
-      scanProof: daily.id ? { status: "COMMITTED", proofVersion: 2 } : null },
-  }));
+  return rows.map(({ live,stateDate,coverageStatus,coverageVerifiedAt,coverageRetryAfterAt,coverageErrorCode,publishedObservedAt,...daily }) => {
+    if(live) {
+      const categories={};for(const key of ["subscriptions","messages","tips","posts","streams","referrals"])
+        categories[key+"Cents"]=live.categoryTotals?.other ? null : integer(live.categoryTotals?.[key] || 0);
+      return {daily:{id:`ledger:${creatorId}:${new Date(stateDate).toISOString().slice(0,10)}`,creatorId,date:stateDate,
+        sourceTimezone:"UTC",currency:"USD",...categories,totalCents:integer(live.totalCents),hourlyPoints:live.hourlyPoints,
+        collectedAt:new Date(live.collectedAt)},
+        coverage:{coverageDate:stateDate,status:+new Date(stateDate)===+today?"PARTIAL":"COMPLETE",lastVerifiedAt:new Date(live.observed),
+          retryAfterAt:coverageRetryAfterAt,lastErrorCode:live.fresh?null:"LIVE_DELIVERY_OR_RECONCILIATION_PENDING",
+          proofKind:"FINANCIAL_LEDGER_V1",liveFresh:live.fresh}};
+    }
+    return {daily:daily.id?daily:null,coverage:{coverageDate:stateDate,status:coverageStatus,lastVerifiedAt:coverageVerifiedAt,
+      retryAfterAt:coverageRetryAfterAt,lastErrorCode:coverageErrorCode,scanProofId:daily.scanProofId,
+      scanProof:daily.id?{status:"COMMITTED",proofVersion:2}:null}};
+  });
 }
 
 async function readPublishedEarningsAggregates({ db, creatorIds, from, to, now, freshnessMs }) {

@@ -16,12 +16,7 @@ const receipts = require("./financial-receipt-authority");
 const JOB_KEY = "financial_transactions_scan";
 const COLLECTOR_VERSION = receipts.COLLECTOR;
 const SCHEMA_VERSION = 1;
-const KNOWN_SALE_TYPES = new Map([
-  ["message", "MESSAGE"],
-  ["post", "POST"],
-  ["stream", "STREAM"],
-]);
-const TIP_TYPES = new Set(["tip", "tips"]);
+const { classifyTransactionType: classification } = require("./financial-transaction-category");
 
 const REFUND_TRANSACTION_STATUSES = new Set(["undo"]);
 const PAYOUT_PENDING_TRANSACTION_STATUSES = new Set(["loading"]);
@@ -102,16 +97,6 @@ function signedInteger(value, fallback = 0, max = 2_147_483_647) {
   return parsed;
 }
 function hash(value) { return crypto.createHash("sha256").update(String(value)).digest("hex"); }
-function classification(transactionType) {
-  const type = String(transactionType || "").trim().toLowerCase();
-  if (KNOWN_SALE_TYPES.has(type)) return { factType: "SALE", projectionStatus: "PROJECTED", saleType: KNOWN_SALE_TYPES.get(type), reasonCode: null };
-  if (TIP_TYPES.has(type)) return { factType: "TIP", projectionStatus: "PROJECTED", saleType: null, reasonCode: null };
-  if (/^(subscribe|subscribes|subscription|renew|renewal|resubscribe|resubscription)/.test(type)) {
-    return { factType: "PAID_SUBSCRIPTION", projectionStatus: "STORED_ONLY", saleType: null, reasonCode: "subscription_payment_type_not_proven" };
-  }
-  return { factType: "OTHER", projectionStatus: "STORED_ONLY", saleType: null, reasonCode: "unmapped_transaction_type" };
-}
-
 function normalizeTransaction(row, index, page) {
   const source = object(row);
   const details = object(source.descriptionDetails || source.description_details);
@@ -290,6 +275,9 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
   if (rawRows.length > 100) throw new Error("Financial transaction page exceeds 100 rows");
   const normalized = rawRows.map((row, index) => {
     const normalizedRow = normalizeTransaction(row, index, page);
+    if (!normalizedRow.rejected && (job.params.earningsLedgerVersion===1 || job.params.syncPolicyVersion===2)
+      && (normalizedRow.netCents===null || normalizedRow.currency!=="USD" || !["done","loading","undo"].includes(normalizedRow.transactionStatus)))
+      return {...normalizedRow,rejected:true,reasonCode:"EXACT_FINANCIAL_MONEY_REQUIRED"};
     if (!normalizedRow.rejected && receipts.enabled(job) && !receipts.withinWindow(job, chunk, normalizedRow))
       return { ...normalizedRow, rejected: true, reasonCode: "OUTSIDE_REQUESTED_FINANCIAL_WINDOW" };
     return normalizedRow;
@@ -341,6 +329,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
         reasonCode: row.reasonCode, updatedAt: now,
       };
       const previous = existingById.get(row.externalTransactionId);
+      if (previous?.sourceUpdatedAt && +previous.sourceUpdatedAt > +new Date(job.params.collectionRequestedAt)) continue;
       if (!previous) {
         const data = { ...commonData, sourceJobId: job.id, scanRunId, page: row.page, ordinal: row.ordinal };
         await tx.creatorFinancialTransaction.create({ data: { id: crypto.randomUUID(), createdAt: now, ...data } });
@@ -443,15 +432,24 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   const countMatched = chartReady ? earningsTransactionsCount === Number(chartTotal.transactionsCount || 0) : false;
   const grossMatched = chartReady ? earningsGrossCents === Number(chartTotal.grossCents || 0) : false;
   const netMatched = chartReady ? earningsNetCents === Number(chartTotal.netCents || 0) : false;
-  const complete = receipt.complete && sourceBoundaryReached && scannerRejected === 0 && chartReady && countMatched && grossMatched && netMatched;
+  const frontierVerified = job.params.financialFrontierVersion===2 && receipt.row.proof.kind==="FRONTIER_PLUS_ONE";
+  const complete = receipt.complete && sourceBoundaryReached && scannerRejected === 0 && (frontierVerified || (chartReady && countMatched && grossMatched && netMatched));
   const stateResult = await completeFinancialCollection({
     db, job, deviceId, complete, scanRunId,
-    boundary: sourceBoundaryReached ? "RECEIPT_VERIFIED_WINDOWS" : null,
+    boundary: sourceBoundaryReached ? (frontierVerified ? "RECEIPT_VERIFIED_FRONTIER_PLUS_ONE" : "RECEIPT_VERIFIED_WINDOWS") : null,
     rangeFrom: receipt.row.windows[0].from,
     rangeTo: receipt.row.windows[0].to,
     receiptRun: receipt.row,
   });
   const authoritativeComplete = complete && stateResult?.applied !== false;
+  if (authoritativeComplete) {
+    const ledgerPublished = await require("./live-earnings-projection-service").publishScan(db,job,receipt.row);
+    if (!ledgerPublished && (mode === "full" || frontierVerified || job.params?.moneyResolutionVersion === 1)) {
+      // The collector state, recovery intent and publication share the caller's
+      // root transaction. Incomplete publication must roll back all three.
+      throw new receipts.FinancialReceiptError("EARNINGS_LEDGER_PUBLICATION_INCOMPLETE");
+    }
+  }
   return {
     // Reaching the source boundary is not enough for a successful execution:
     // the JobInstance retry/quarantine lifecycle must see incomplete proof.
@@ -487,6 +485,7 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
     statusSummary: statusTotals.statusSummary,
     storedOnly,
     reconciliation: {
+      proofKind: frontierVerified ? "FRONTIER_PLUS_ONE" : "EXHAUSTED_WINDOW_AND_CHART",
       chartReady,
       countMatched,
       grossMatched,
@@ -501,7 +500,32 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   };
 }
 
+async function ingestExactLiveTransaction({db,agencyId,creatorId,deviceId,money,observedAt,now}) {
+  await lockCreatorFacts(db,agencyId,creatorId);
+  const row=normalizeTransaction({ ...money, externalTransactionId:money.transactionId, transactionStatus:money.status },0,1);
+  if(row.rejected) throw new Error("LIVE_FINANCIAL_NORMALIZATION_FAILED");
+  const job={agencyId,creatorId,sourceJobId:null};
+  const fan=await resolveFan(db,job,row,now);
+  const where={creatorId_externalTransactionId:{creatorId,externalTransactionId:row.externalTransactionId}};
+  const previous=await db.creatorFinancialTransaction.findUnique({where});
+  if(previous?.sourceUpdatedAt && +previous.sourceUpdatedAt>+observedAt)return;
+  const data={agencyId,creatorId,externalTransactionId:row.externalTransactionId,
+    transactionType:row.transactionType,factType:row.factType,projectionStatus:row.projectionStatus,
+    amountCents:row.amountCents,netCents:row.netCents,feeCents:row.feeCents,currency:row.currency,
+    occurredAt:row.occurredAt,transactionStatus:row.transactionStatus,sourceUpdatedAt:observedAt,
+    collectedAt:now,sourceDeviceId:deviceId,reasonCode:row.reasonCode,
+    fanRecordId:fan?.id || previous?.fanRecordId || null,
+    fanOnlyFansUserId:row.fanOnlyFansUserId || previous?.fanOnlyFansUserId || null};
+  if(previous)await db.creatorFinancialTransaction.update({where:{id:previous.id},data});
+  else await db.creatorFinancialTransaction.create({data:{id:crypto.randomUUID(),...data}});
+  if(row.projectionStatus==="PROJECTED") {
+    const fact=await projectKnownFact(db,job,deviceId,row,data.fanRecordId,now);
+    if(fact?.id && ["SALE","TIP"].includes(row.factType))await dispatchTeamMoneyReconciliationForCanonicalFact({db,agencyId,creatorId,sourceType:row.factType==="SALE"?"PPV":"TIP",sourceId:fact.id,now});
+  }
+}
+
 module.exports = {
+  ingestExactLiveTransaction,
   normalizeTransaction,
   JOB_KEY,
   COLLECTOR_VERSION,

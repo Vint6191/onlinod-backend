@@ -154,6 +154,7 @@ async function scheduleSubscriberScan({
   scanEveryDays = DEFAULT_SCAN_EVERY_DAYS,
   priority = 20,
   reason = "subscriber_directory_refresh",
+recoveryIntent = null,
 } = {}) {
   if (!agencyId || !creatorId)
     throw Object.assign(new Error("Creator scope is required"), { code: "CREATOR_SCOPE_REQUIRED" });
@@ -244,6 +245,7 @@ async function scheduleSubscriberScan({
         agencyId,
         idempotencyKey: `${SUBSCRIBER_DIRECTORY_JOB_KEY}:${creatorId}:${run.id}`,
         params: {
+          ...(recoveryIntent ? require("./creator-live-sync-service").recoveryParams(recoveryIntent) : {}),
           scanRunId: run.id,
           mode: run.mode,
           sourceType: run.sourceType,
@@ -258,6 +260,7 @@ async function scheduleSubscriberScan({
         scheduledAt: now,
         nextRunAt: now,
       });
+      if(recoveryIntent) await require("./creator-live-sync-service").bindRecovery(tx,recoveryIntent,job.id);
       const linkedRun = await tx.subscriberScanRun.update({ where: { id: run.id }, data: { jobId: job.id } });
       await tx.subscriberDirectoryState.upsert({
         where: { creatorId },
@@ -321,16 +324,12 @@ async function scheduleSubscriberScan({
 
 async function ensureSubscriberScanDue({ db = prisma, agencyId, creatorId, priority = 10, now = new Date() } = {}) {
   const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId } });
-  if (state?.nextScanAt && state.nextScanAt > now)
-    return { ok: true, created: false, reason: "not_due", nextScanAt: state.nextScanAt };
-  return scheduleSubscriberScan({
-    db,
-    agencyId,
-    creatorId,
-    priority,
-    scanEveryDays: state?.scanEveryDays || DEFAULT_SCAN_EVERY_DAYS,
-    reason: state ? "subscriber_directory_due" : "subscriber_directory_initial",
-  });
+  const sync=require("./creator-live-sync-service");
+  const recoveryIntent=await sync.pendingRecovery(db,creatorId,"subscribers");
+  if(state?.publishedAt && !recoveryIntent) return {ok:true,created:false,reason:"live_no_recovery_debt"};
+  return scheduleSubscriberScan({db,agencyId,creatorId,priority,recoveryIntent,
+    scanEveryDays:state?.scanEveryDays || DEFAULT_SCAN_EVERY_DAYS,
+    reason:recoveryIntent?.reason || "subscriber_directory_initial"});
 }
 
 function normalizeChunkItem(item, {
@@ -1162,6 +1161,8 @@ async function applySubscriberScanCompletion({ job, userId = null, result, db = 
     }
     publishedSummary = publication.summary || run.summary || {};
   }
+
+  await require("./creator-live-sync-service").completeRecovery(db,job,true);
 
   // Planning is best-effort, but it is part of completion convergence. Recovery
   // executes this same helper before it reconciles a stranded JobInstance to DONE,

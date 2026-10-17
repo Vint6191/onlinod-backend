@@ -81,6 +81,7 @@ async function acceptAnalyticsPublication({ db, job, userId, deviceId, leaseToke
   await db.fanObservationReadLease.deleteMany({ where: { jobId: job.id, deviceId, leaseRevision } });
   await publishDomainWork({ db, agencyId: job.agencyId, creatorId: job.creatorId,
     workClass: "ANALYTICS_PUBLICATION", objectType: "ANALYTICS_PUBLICATION", objectId: row.id, partitionKey: job.creatorId });
+  require("./analytics-hot-executor").wakeAfterCommit();
   return response(row);
 }
 
@@ -230,7 +231,10 @@ async function financialUnit(db, job, row, now) {
   // Page commits already maintain distinct transaction totals and chart proof
   // in the immutable run scope. Publication never enumerates mutable sourceJobId.
   const proof = await require("./financial-receipt-authority").completionProof(db, job);
-  return save(db, row, { proof: { receiptRunId: proof.row?.id || null, complete: proof.complete }, cursor: {}, stage: "FINALIZE" }, now);
+  if (!proof.complete) return save(db, row, { proof: { receiptRunId: proof.row?.id || null, complete: false }, cursor: {}, stage: "FINALIZE" }, now);
+  const built = await require("./earnings-generation-service").preparePage(db, job, proof.row);
+  return save(db, row, { proof: { receiptRunId: proof.row.id, complete: true, ledgerGeneration: built.generation || "UNSUPPORTED" },
+    cursor: {}, stage: built.ready || built.unsupported ? "FINALIZE" : "FINANCIAL_ROWS" }, now);
 }
 
 function repairParams(job, now) {
@@ -266,7 +270,7 @@ async function settle(db, job, row, sideEffect, now, { forceTerminal = false } =
   const protocolSuperseded = !complete && ((job.jobKey === "fetch_campaigns" && sideEffect?.completion?.protocolCurrent === false)
     || (job.jobKey === "financial_transactions_scan" && sideEffect?.protocolCurrent === false));
   const attempts = Number(job.attempts || 0) + (!complete && !protocolSuperseded ? 1 : 0);
-  const terminal = forceTerminal || (!protocolSuperseded && attempts >= MAX_JOB_ATTEMPTS);
+  const terminal = forceTerminal || job.params?.moneyResolutionVersion === 1 || (!protocolSuperseded && attempts >= MAX_JOB_ATTEMPTS);
   const retryAt = complete || terminal ? null : new Date(now.getTime() + (protocolSuperseded ? 1000 : 60000 * 2 ** Math.max(0, attempts - 1)));
   const status = complete ? "DONE" : terminal ? "FAILED" : "SCHEDULED";
   const result = { job: { id: job.id, status, ...(retryAt ? { retryAt: retryAt.toISOString() } : {}) }, sideEffect,
@@ -288,6 +292,8 @@ async function settle(db, job, row, sideEffect, now, { forceTerminal = false } =
     lastError: complete ? null : protocolSuperseded ? `${job.jobKey}_protocol_superseded` : failureReason,
   } });
   if (job.jobKey === "financial_transactions_scan") await require("./financial-receipt-retention-service").publish({ db, job, now });
+  if (complete) require("./analytics-change-hint-service").publish(job.agencyId);
+  require("./analytics-hot-executor").wakeAfterCommit();
   if (retryAt) require("./job-planning-repository").publishPlannedJobAvailable(updated);
   return result;
 }
@@ -328,6 +334,14 @@ async function runAnalyticsPublicationUnit({ db, publicationId, claim = null }) 
       if (revision !== row.inputRevision || (row.stage !== "EARNINGS_BATCHES" && row.proof?.amountProofVersion !== 1)) {
         await save(tx, row, { inputRevision: revision, stage: "EARNINGS_BATCHES", cursor: {}, proof: {} }, now);
         return { publicationPending: true, inputChanged: true, job: { id: job.id, status: "PUBLISHING" } };
+      }
+    }
+    // Upgrade already-accepted V19 finalizers through the same bounded build.
+    if (job.jobKey === "financial_transactions_scan" && row.stage === "FINALIZE" && !row.proof?.ledgerGeneration) {
+      const receipt = await require("./financial-receipt-authority").completionProof(tx, job);
+      if (receipt.complete) {
+        await financialUnit(tx, job, row, now);
+        return {publicationPending:true, job:{id:job.id,status:"PUBLISHING"}};
       }
     }
     if (row.stage === "FINALIZE") {

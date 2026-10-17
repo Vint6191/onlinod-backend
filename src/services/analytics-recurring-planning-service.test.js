@@ -38,6 +38,7 @@ function fixture({ expireAtFinal = false } = {}) {
   const tx = { $queryRawUnsafe: async (sql) => {
     if (/FROM "Agency"/.test(sql)) { trace.push("agency"); return [{ id: item.agencyId }]; }
     if (/FROM "CreatorAccount"/.test(sql)) { trace.push("creator"); return [{ id: item.creatorId }]; }
+    if (/FROM "CreatorRecoveryIntent"/.test(sql)) return [];
     if (/FROM "DomainWorkItem"/.test(sql)) {
       fences += 1; trace.push("work-lock");
       return [{ ...item, state: "CLAIMED", requestedRevision: 3n, activeGeneration: "phase2_domain_work_v3_actual55", leaseUntil: new Date(now.getTime() + (expireAtFinal && fences > 1 ? -1 : 60_000)) }];

@@ -4,7 +4,7 @@ const deferred=()=>{let resolve,reject;const promise=new Promise((a,b)=>{resolve
 function schedulerHarness(){
  const source=fs.readFileSync(path.join(__dirname,'job-scheduler.js'),'utf8');
  const timers=new Map(),cleared=[],calls=[];let id=0;
- const recurring=deferred(),maintenance=deferred(),demand=deferred(),campaign=deferred();
+ const recurring=deferred(),maintenance=deferred(),demand=deferred(),campaign=deferred(),hot=deferred();
  const context={console:{log(){},warn(){},error(){}},Promise,Date,prisma:{},
   RECURRING_INTERVAL_MS:3600000,ANALYTICS_DEMAND_INTERVAL_MS:15000,PHASE2_MAINTENANCE_PUMP_INTERVAL_MS:5000,
   recurringSweepPromise:null,phase2MaintenancePromise:null,
@@ -16,17 +16,18 @@ function schedulerHarness(){
   runPhase2MaintenancePump(){calls.push('maintenance');context.phase2MaintenancePromise=maintenance.promise;return maintenance.promise;},
   runAnalyticsCollectionDemandSweep(){calls.push('demand');return demand.promise;},
   require(name){if(name==='./maintenance-lane-registry')return{resolveMaintenanceLanes(){calls.push('validate');}};
+   if(name==='./analytics-hot-executor')return{start(){return{stop(){calls.push('hot-stop');return hot.promise;}};}};
    if(name==='./campaign-projection-executor')return{startCampaignProjectionExecutor(){return{stop(){calls.push('campaign-stop');return campaign.promise;}};}};throw Error(name);},
  };
  vm.runInNewContext(source.slice(source.indexOf('let recurringTimer = null;'),source.indexOf('\n\nmodule.exports = {'))+'\nglobalThis.start=startRecurringScheduler;globalThis.stop=stopRecurringScheduler;',context);
- return{context,timers,cleared,calls,recurring,maintenance,demand,campaign};
+ return{context,timers,cleared,calls,recurring,maintenance,demand,campaign,hot};
 }
 test('scheduler cancels all initial/periodic timers and rejects stale callbacks after restart',async()=>{
  const h=schedulerHarness();h.context.start();assert.equal(h.timers.size,6);const stale=[...h.timers.values()].map(t=>t.fn);
  const stopped=h.context.stop();assert.equal(h.timers.size,0);assert.equal(h.cleared.length,6);
- stale.forEach(fn=>fn());assert.deepEqual(h.calls,['validate','campaign-stop']);
- assert.throws(()=>h.context.start(),/SCHEDULER_STOPPING/);h.campaign.resolve();await stopped;
- h.context.start();stale.forEach(fn=>fn());assert.deepEqual(h.calls,['validate','campaign-stop','validate']);await h.context.stop();
+ stale.forEach(fn=>fn());assert.deepEqual(h.calls,['validate','hot-stop','campaign-stop']);
+ assert.throws(()=>h.context.start(),/SCHEDULER_STOPPING/);h.campaign.resolve();h.hot.resolve();await stopped;
+ h.context.start();stale.forEach(fn=>fn());assert.deepEqual(h.calls,['validate','hot-stop','campaign-stop','validate']);await h.context.stop();
 });
 test('scheduler stop is idempotent and drains recurring, maintenance, demand and campaign before resolving',async()=>{
  const h=schedulerHarness();h.context.start();
@@ -34,7 +35,7 @@ test('scheduler stop is idempotent and drains recurring, maintenance, demand and
  assert.deepEqual(h.calls,['validate','recurring','demand','maintenance']);
  const stopping=h.context.stop();assert.equal(h.context.stop(),stopping);let finished=false;stopping.then(()=>finished=true);
  h.recurring.resolve({ok:true});h.maintenance.resolve({ok:true});h.demand.resolve({ok:true});await Promise.resolve();await Promise.resolve();assert.equal(finished,false);
- h.campaign.resolve();await stopping;assert.equal(finished,true);
+ h.campaign.resolve();await turn();assert.equal(finished,false);h.hot.resolve();await stopping;assert.equal(finished,true);
 });
 test('campaign executor stop waits for running commit and never schedules another round',async()=>{
  const {startCampaignProjectionExecutor}=require('./campaign-projection-executor');const work=deferred(),scheduled=[];
@@ -95,12 +96,12 @@ test('missing external-delivery guard fails startup before maintenance or listen
 test('scheduler cancels its other timers even when campaign stop throws synchronously',async()=>{
  const h=schedulerHarness(),original=h.context.require;
  h.context.require=name=>name==='./campaign-projection-executor'?{startCampaignProjectionExecutor:()=>({stop(){throw Error('campaign still active');}})}:original(name);
- h.context.start();const stopping=h.context.stop();assert.equal(h.timers.size,0);await assert.rejects(stopping,/Scheduler drain failed/);
+ h.context.start();const stopping=h.context.stop();assert.equal(h.timers.size,0);h.hot.resolve();await assert.rejects(stopping,/Scheduler drain failed/);
  assert.equal(h.context.stop(),stopping);assert.throws(()=>h.context.start(),/SCHEDULER_STOPPING/);
 });
 test('scheduler propagates a failed owned sweep after joining all other roots',async()=>{
  const h=schedulerHarness();h.context.start();for(const timer of h.timers.values())if(timer.type==='initial')timer.fn();
  const stopping=h.context.stop();let finished=false;const observed=stopping.then(()=>finished=true,error=>{finished=true;return error;});
  h.maintenance.reject(Error('commit unknown'));h.recurring.resolve({ok:true});h.demand.resolve({ok:true});await turn();assert.equal(finished,false);
- h.campaign.resolve();assert.match((await observed).message,/Scheduler drain failed/);
+ h.campaign.resolve();h.hot.resolve();assert.match((await observed).message,/Scheduler drain failed/);
 });

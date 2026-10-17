@@ -85,6 +85,7 @@ async function startManualFinancialTransactionScan({ db = prisma, creator, reque
     const params = {
       manualFinancialTransactionScan: true,
       manualFinancialTransactionScanVersion: 1,
+      earningsLedgerVersion: 1,
       manualRunToken,
       requestedByUserId: clean(requestedByUserId, 220),
       reason: MANUAL_REASON,

@@ -17,6 +17,7 @@ function campaignRevenueCoverage(financial, campaigns, bounds, now) {
   if (state.proven) {
     add(financial.baselineRangeFrom, financial.coverageThrough || financial.baselineRangeTo);
     if (financial.receiptCoverageVersion === 1) add(financial.recentRangeFrom, financial.recentRangeTo);
+    if (financial.liveCoverage) add(financial.liveCoverage.fromAt,financial.liveCoverage.throughAt);
   }
   intervals.sort((a, b) => +a.from - b.from);
   const merged = [];
@@ -29,7 +30,7 @@ function campaignRevenueCoverage(financial, campaigns, bounds, now) {
   const covered = Boolean(asOf && asOf >= bounds.startAt
     && merged.some(interval => interval.from <= bounds.startAt && interval.to >= asOf));
   const ready = Boolean(state.proven && covered && campaigns.proven);
-  const fresh = ready && state.fresh && campaigns.providerFresh;
+  const fresh = ready && (financial.liveCoverage ? financial.liveCoverage.fresh : state.fresh) && campaigns.providerFresh;
   return {
     authority: "VERIFIED_FINANCIAL_RANGE_AND_MEMBERSHIPS", ready, fresh,
     status: !ready ? "PENDING" : fresh ? "READY" : "STALE",

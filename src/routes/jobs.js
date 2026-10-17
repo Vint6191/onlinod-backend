@@ -22,6 +22,7 @@ const { FinancialReceiptError } = require("../services/financial-receipt-authori
 const router = express.Router();
 
 const JOB_SERVER_CAPABILITIES = Object.freeze({
+  creatorEventDrivenSyncV2: true,
   campaignCausalObservationV1: true,
   campaignServerFanRefreshV1: true,
   campaignResumablePaginationV1: true,
@@ -34,6 +35,7 @@ const JOB_SERVER_CAPABILITIES = Object.freeze({
   campaignTraversalAuthorityV1: true,
   campaignFairPagesV1: true,
   financialWindowReceiptsV1: true,
+  financialMoneyResolutionV1: true,
 });
 
 router.use((req, res, next) => {
@@ -67,7 +69,7 @@ function validationError(res, error) {
 }
 
 function leaseError(res, error) {
-  if (error instanceof JobLeaseError || error instanceof CampaignTraversalError || error instanceof FinancialReceiptError) {
+  if (error instanceof JobLeaseError || error instanceof CampaignTraversalError || error instanceof FinancialReceiptError || (error?.status===409 && String(error?.code || "").startsWith("NOTIFICATION_FRONTIER_"))) {
     if (error.retryAfterMs) res.set("Retry-After", String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
     return res.status(error.status || 409).json({
       ok: false,
@@ -115,6 +117,7 @@ const claimSchema = z.object({
     campaignTraversalAuthorityV1: z.boolean().optional().default(false),
     campaignFairPagesV1: z.boolean().optional().default(false),
     financialWindowReceiptsV1: z.boolean().optional().default(false),
+    financialMoneyResolutionV1: z.boolean().optional().default(false),
   }).passthrough().optional().default({}),
 });
 

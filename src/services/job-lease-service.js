@@ -6,6 +6,7 @@ const { notificationRepairParams, needsNotificationRepairRotation, notificationP
 const { isDeepStrictEqual } = require("node:util");
 
 const crypto = require("node:crypto");
+const { Prisma } = require("@prisma/client");
 const prisma = require("../prisma");
 const { isOwner, normalizeAssignedCreators } = require("./team-access-control");
 const { assertExecutionAccessFence, ExecutionAccessFenceError } = require("./execution-access-fence-service");
@@ -18,6 +19,7 @@ const { trustedCollectionTimestamp } = require("./analytics-freshness-policy");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { runRootCommit } = require("./db-commit-kernel");
 const { publishNotificationConsequences } = require("./notification-consequence-service");
+const liveSync = require("./creator-live-sync-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const {
   FAN_DATA_REFRESH_MAX_ACTIVE_CLAIMS,
@@ -317,9 +319,14 @@ function dialogDiscoveryClaimConstraint(enabled, targetedReconciliation = false)
   };
 }
 
-function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly, targetedReconciliation, excludedJobIds = [], fanRefreshBlockedCreatorIds = [], fanRefreshGlobalBlocked = false, billingConstraint = null }) {
+function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly, targetedReconciliation, excludedJobIds = [], fanRefreshBlockedCreatorIds = [], fanRefreshGlobalBlocked = false, billingConstraint = null, moneyResolutionSupported = true }) {
   const constraints = [];
   if (billingConstraint) constraints.push(billingConstraint);
+  if (!moneyResolutionSupported && allowedJobKeys.includes("financial_transactions_scan")) constraints.push({ OR: [
+    { jobKey: { not: "financial_transactions_scan" } },
+    { params: { path: ["moneyResolutionVersion"], not: 1 } },
+    { params: { path: ["moneyResolutionVersion"], equals: Prisma.DbNull } },
+  ] });
   const discoveryConstraint = dialogDiscoveryClaimConstraint(dialogDiscoveryOnly, targetedReconciliation);
   if (discoveryConstraint) constraints.push(discoveryConstraint);
   if (fanRefreshGlobalBlocked) constraints.push({ jobKey: { not: "fan_data_point_refresh" } });
@@ -576,6 +583,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   ) {
     allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
   }
+  if (capabilities?.creatorEventDrivenSyncV2 !== true) allowedJobKeys = allowedJobKeys.filter(key => !liveSync.JOB_STREAM[key]);
   if (capabilities?.financialWindowReceiptsV1 !== true) allowedJobKeys = allowedJobKeys.filter(key => key !== "financial_transactions_scan");
   if (!allowedJobKeys.length) return { job: null, reason: "no-capabilities" };
   const explicitlyExcluded = new Set(
@@ -609,12 +617,17 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       fanRefreshBlockedCreatorIds,
       fanRefreshGlobalBlocked,
       billingConstraint,
+      moneyResolutionSupported: capabilities?.financialMoneyResolutionV1 === true,
     });
     const candidate = await prisma.jobInstance.findFirst({
       where: candidateWhere,
       orderBy: [{ priority: "desc" }, { nextRunAt: "asc" }],
     });
     if (!candidate) return { job: null, reason: "no-work" };
+    if (!liveSync.admitsJob(candidate)) {
+      await prisma.jobInstance.updateMany({where:{id:candidate.id,status:"SCHEDULED"},data:{status:"CANCELLED",completedAt:now,lastError:"superseded_by_event_driven_policy"}});
+      continue;
+    }
     // Last-chance fence: an old FULL can remain queued while another run has
     // already established the historical baseline. Re-check at claim time so
     // a stale row can never wake up hours later and replay the whole history.
@@ -708,6 +721,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
             fanRefreshBlockedCreatorIds,
             fanRefreshGlobalBlocked,
             billingConstraint,
+            moneyResolutionSupported: capabilities?.financialMoneyResolutionV1 === true,
           }),
         },
         data: attemptClaimData,
@@ -1070,6 +1084,11 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
 
     const sideEffect = await applyJobChunk({ db: tx, job, deviceId, userId, chunkResult });
     if (chunkResult != null) await publishNotificationConsequences({ db: tx, job });
+    if (!liveSync.admitsJob(job)) {
+      const cancelled = await tx.jobInstance.update({where:{id:job.id},data:{status:"CANCELLED",completedAt:now,
+        lastError:"superseded_by_event_driven_policy",leaseUntil:null,leaseTokenHash:null,claimedByDeviceId:null,leaseRevision:{increment:1}}});
+      return {id:job.id,status:cancelled.status,policySuperseded:true,sideEffect};
+    }
     const campaignBoundaryOverride = sideEffect?.serverDeepBoundaryReached === true
       ? campaignServerBoundaryContinuation(requestedContinuation, sideEffect.externalCampaignId, job.continuation)
       : sideEffect?.serverNoProgressDetected === true

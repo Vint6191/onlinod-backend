@@ -322,7 +322,7 @@ async function buildHomeCreatorPage({ agencyId, member, rangeKey = "7d", after =
   const { pageInput, readHomeCreatorPage } = require("./home-read-repository");
   const page = pageInput({ after, limit });
   const ctx = await homeReadContext({ db, agencyId, member, rangeKey });
-  const result = await readHomeCreatorPage({ ...ctx, ...page });
+  const result = await require("./home-read-cache").readHomeCached(ctx,"creators",()=>readHomeCreatorPage({ ...ctx, ...page }),page);
   await require("./home-scope-repository").readHomeAuthority(ctx);
   return { ok: true, contractVersion: 2, agencyId, accessEpoch: ctx.member.accessEpoch,
     rangeKey: ctx.range.rangeKey, refreshedAt: ctx.now.toISOString(), ...result };
@@ -333,7 +333,7 @@ async function buildHomeSummary({ agencyId, member, rangeKey = "7d", db = prisma
   const { readHomeTotals, readHomeJobCounts } = require("./home-read-repository");
   const [agency, revenue, members, jobsByStatus, devices, onlineDevices, latestAudit, subscription] = await Promise.all([
     db.agency.findUnique({ where: { id: agencyId }, select: { id:true, name:true, plan:true, status:true } }),
-    readHomeTotals(ctx),
+    require("./home-read-cache").readHomeCached(ctx,"totals",()=>readHomeTotals(ctx)),
     team || owner ? db.agencyMember.count({ where: { agencyId, deletedAt:null, deactivatedAt:null } }) : 0,
     manage ? readHomeJobCounts(ctx) : {},
     manage ? db.workerDevice.count({ where: { agencyId } }) : null,

@@ -86,6 +86,7 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
     to: runtimeRangeTo(now).toISOString(),
     types: [...NOTIFICATION_TYPES],
     notificationMode: "catchup",
+    notificationFrontierVersion: 2,
     pageLimit: 10,
     ...(stopAtNotificationId ? { stopAtNotificationId } : {}),
     knownNotificationIds: boundedNotificationIds(state?.knownNotificationIds),
@@ -174,7 +175,9 @@ async function recordNotificationPageProgress({ db, job, deviceId, chunk }) {
       return existing;
     }
     const sameRun = existing?.scanRunId === scanRunId;
+    const frontierReceipt = await require("./notification-frontier-authority").commitPage(tx,job,chunk,existing?.frontierReceipt);
     const data = {
+      frontierReceipt,
       status: "SCANNING",
       mode,
       scanRunId,
@@ -228,7 +231,7 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
     // every typed source is exhausted by the desktop continuation and the final
     // unfiltered ALL reconciliation independently reaches hasMore=false.
     const sourceTraversalComplete = sourceExhausted && (mode !== "full" || allSourceExhausted);
-    const verified = successful === true && sourceTraversalComplete;
+    const verified = successful === true && sourceTraversalComplete && require("./notification-frontier-authority").completed(job,existing?.frontierReceipt);
     const trustedPriorFullHistoryVerifiedAt = trustedCollectionTimestamp(existing?.fullBackfillVerifiedAt, now);
     const priorFullHistoryVerified = Boolean(trustedPriorFullHistoryVerifiedAt && existing?.normalizerVersion === "notification-source-v2");
     // A later failed/partial FULL refresh must never erase an already durable
@@ -279,6 +282,7 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
         ...(verified ? { lastCatchupVerifiedAt: now, lastCatchupObservedAt: observationStartForJob(job) } : {}),
       } : {}),
     };
+    await require("./creator-live-sync-service").completeRecovery(tx,job,overallComplete);
     return tx.creatorNotificationSyncState.upsert({
       where: { creatorId: job.creatorId },
       create: { agencyId: job.agencyId, creatorId: job.creatorId, ...data },

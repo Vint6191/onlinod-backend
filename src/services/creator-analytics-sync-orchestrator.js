@@ -30,6 +30,7 @@ const {
 const NOTIFICATION_JOB_KEY = "catchup_notifications_scan";
 const CAMPAIGN_JOB_KEY = "fetch_campaigns";
 const ANALYTICS_SYNC_VERSION = 1;
+const liveSync = require("./creator-live-sync-service");
 const NOTIFICATION_KNOWN_ID_LIMIT = 300;
 
 function object(value) {
@@ -87,10 +88,14 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     if (collectorType === COLLECTOR_TYPES.CAMPAIGNS) currentCollectorState = await recoverPublishedMembershipProof({ db: tx, state: currentCollectorState, now });
     const initial = lifecycleParams(params);
     const baseline = collectorPlanningProofAt(collectorType, "full", currentCollectorState, now);
-    const baselineReady = Boolean(baseline && (collectorType === COLLECTOR_TYPES.NOTIFICATIONS || (collectorType === COLLECTOR_TYPES.CAMPAIGNS ? membershipProofState(currentCollectorState).baselineGeneration : currentCollectorState?.baselineGeneration)));
+    let baselineReady = Boolean(baseline && (collectorType === COLLECTOR_TYPES.NOTIFICATIONS || (collectorType === COLLECTOR_TYPES.CAMPAIGNS ? membershipProofState(currentCollectorState).baselineGeneration : currentCollectorState?.baselineGeneration)));
+    if(initial && collectorType===COLLECTOR_TYPES.FINANCIAL && baselineReady) {
+      const [proof]=await tx.$queryRawUnsafe('SELECT "creatorId" FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$1',creatorId);
+      baselineReady=Boolean(proof);
+    }
     if (initial && baselineReady) return { created: false, reason: "baseline_verified" };
     if (!initial && !baselineReady) return { created: false, reason: "baseline_unverified" };
-    if (catchupFreshnessMs != null && !collectorCatchupDue(collectorType, currentCollectorState, catchupFreshnessMs, now)) {
+    if (!params.recoveryIntentId && catchupFreshnessMs != null && !collectorCatchupDue(collectorType, currentCollectorState, catchupFreshnessMs, now)) {
       return { created: false, reason: "fresh" };
     }
     const retry = retryDisposition(currentCollectorState, now);
@@ -103,6 +108,11 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
       if (!initial) params.knownNotificationIds = recentKnownNotificationIdsFromState(currentCollectorState);
     } else if (collectorType === COLLECTOR_TYPES.FINANCIAL) {
       // Financial windows are bound under the claim fence to current coverage.
+    } else if (collectorType === COLLECTOR_TYPES.CAMPAIGNS && !initial && params.recoveryIntentId) {
+      // Re-observe the unordered directory and member scopes once after a real
+      // gap. Fair page cursors preserve progress across handoffs.
+      params.campaignDirectoryDiscoveryVersion = 1;
+      collectionPlan = "campaigns_offline_recovery";
     } else if (collectorType === COLLECTOR_TYPES.CAMPAIGNS && !initial) {
       const frontierDue = campaignFrontierWorkDue(currentCollectorState, now);
       const directoryDue = campaignDirectoryDiscoveryDue(currentCollectorState, now);
@@ -124,10 +134,11 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     }
     const scheduled = await scheduleNow({
       db: tx, jobKey, creatorId, agencyId, params, priority, now, bucketMs,
-      dedupeParams: buildCollectionPlanningDedupeParams({
+      dedupeParams: { ...buildCollectionPlanningDedupeParams({
         collectorType, collectionMode: params.collectionMode, state: currentCollectorState, now,
-      }),
+      }), ...(params.recoveryIntentId ? { recoveryIntentId: params.recoveryIntentId } : {}) },
     });
+    if (params.recoveryIntentId && scheduled.job?.id) await liveSync.bindRecovery(tx, { id:params.recoveryIntentId }, scheduled.job.id);
     return { ...scheduled, collectionPlan };
   }});
 }
@@ -189,7 +200,9 @@ async function financialInitialCoverageReady(db, creatorId, now = new Date()) {
     where: { creatorId },
     select: { status: true, baselineVerifiedAt: true, baselineGeneration: true },
   });
-  return Boolean(state?.baselineGeneration && verifiedProofTimestampReady(state?.baselineVerifiedAt, now));
+  if(!(state?.baselineGeneration && verifiedProofTimestampReady(state?.baselineVerifiedAt,now)))return false;
+  const [proof]=await db.$queryRawUnsafe('SELECT "creatorId" FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$1',creatorId);
+  return Boolean(proof);
 }
 
 async function campaignInitialCoverageReady(db, creatorId, now = new Date()) {
@@ -276,6 +289,7 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
       analyticsSyncVersion: ANALYTICS_SYNC_VERSION,
       analyticsSyncStage: "financial",
       financialMode: "full",
+      earningsLedgerVersion:1,
       reason: "creator_initial_analytics_sync",
       ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "full", reason: "creator_initial_analytics_sync", now }),
       startDate: "2016-01-01 00:00:00",
@@ -402,107 +416,37 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
 
   const campaignState = await recoverPublishedMembershipProof({ db, state: storedCampaignState, now });
 
-  if (notificationHistoricalBaselineReady(notificationState, now) && due(collectorPlanningProofAt(COLLECTOR_TYPES.NOTIFICATIONS, "catchup", notificationState, now), NOTIFICATION_COLLECTION_FRESHNESS_MS, now)) {
-    const retry = retryDisposition(notificationState, now);
-    if (retry.deferred) skipped.push("notifications_catchup:deferred");
-    else if (retry.terminal) skipped.push("notifications_catchup:failed_terminal");
-    else {
-    const knownNotificationIds = recentKnownNotificationIdsFromState(notificationState);
+  const readiness = {
+    notifications: notificationHistoricalBaselineReady(notificationState, now),
+    financial: Boolean(financialState?.baselineGeneration && collectorPlanningProofAt(COLLECTOR_TYPES.FINANCIAL, "full", financialState, now)),
+    campaigns: Boolean(membershipProofState(campaignState).baselineGeneration && collectorPlanningProofAt(COLLECTOR_TYPES.CAMPAIGNS, "full", campaignState, now)),
+  };
+  const states = { notifications: notificationState, financial: financialState, campaigns: campaignState };
+  for (const stream of liveSync.STREAMS.filter(stream=>stream!=="subscribers")) {
+    if (!readiness[stream]) { skipped.push(`${stream}:baseline_unverified`); continue; }
+    const intent = await liveSync.pendingRecovery(db, creatorId, stream);
+    if (!intent) { skipped.push(`${stream}:live_no_recovery_debt`); continue; }
+    const retry = retryDisposition(states[stream], now);
+    if (retry.deferred || retry.terminal) { skipped.push(`${stream}:${retry.terminal ? "failed_terminal" : "deferred"}`); continue; }
+    const collectorType = stream === "notifications" ? COLLECTOR_TYPES.NOTIFICATIONS : stream === "financial" ? COLLECTOR_TYPES.FINANCIAL : COLLECTOR_TYPES.CAMPAIGNS;
+    const jobKey = stream === "notifications" ? NOTIFICATION_JOB_KEY : stream === "financial" ? FINANCIAL_JOB_KEY : CAMPAIGN_JOB_KEY;
     const params = {
-      ...buildNotificationScanParams({ state: notificationState, now, reason: "creator_analytics_catchup", analyticsRangeKey: "all" }),
-      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectionMode: "catchup", reason: "creator_analytics_catchup", now }),
-      analyticsSyncKind: "catchup",
-      analyticsSyncVersion: ANALYTICS_SYNC_VERSION,
-      analyticsSyncStage: "notifications",
-      knownNotificationIds,
+      ...buildCollectionCommand({ collectorType, collectionMode:"catchup", reason:intent.reason, now }),
+      analyticsSyncKind:"catchup", analyticsSyncVersion:ANALYTICS_SYNC_VERSION, analyticsSyncStage:stream,
+      ...liveSync.recoveryParams(intent),
+      ...(stream === "notifications" ? { ...buildNotificationScanParams({state:notificationState,now,reason:intent.reason}), notificationFrontierVersion:2 } : {}),
+      ...(stream === "financial" ? { financialMode:"catchup", startDate:"2016-01-01 00:00:00", endDate:onlyFansUtcDateTime(now),
+        initialMarker:Math.floor(+now/1000), schemaVersion:FINANCIAL_SCHEMA_VERSION, collectorVersion:FINANCIAL_COLLECTOR_VERSION, financialFrontierVersion:2 } : {}),
+      ...(stream === "campaigns" ? { campaignMode:"catchup", pageSize:50, maxPages:40, claimerPageSize:50, fanValueBatchSize:20,
+        observationTokenVersion:1, observationReadLeaseVersion:1, campaignResumablePaginationVersion:1,
+        campaignFreshnessCoverageVersion:1, campaignOrderIndependentTraversalVersion:1, campaignSegmentedFairTraversalVersion:1,
+        campaignFrontierSchedulingVersion:1, campaignDirectoryReuseVersion:1, campaignFrontierBudget:50,
+        campaignDirectoryDiscoveryVersion:1 } : {}),
     };
-    const scheduled = await scheduleIfIdle({
-      db, creatorId, agencyId, jobKey: NOTIFICATION_JOB_KEY, params, priority, now, bucketMs: NOTIFICATION_COLLECTION_FRESHNESS_MS,
-      collectorType: COLLECTOR_TYPES.NOTIFICATIONS, collectorState: notificationState,
-      catchupFreshnessMs: NOTIFICATION_COLLECTION_FRESHNESS_MS,
-    });
-    if (scheduled.created) created.push("notifications_catchup"); else skipped.push(`notifications_catchup:${scheduled.reason || "skipped"}`);
-    }
-  } else skipped.push(notificationHistoricalBaselineReady(notificationState, now) ? "notifications_catchup:fresh" : "notifications_catchup:baseline_unverified");
-
-  const financialReady = Boolean(financialState?.baselineGeneration && collectorPlanningProofAt(COLLECTOR_TYPES.FINANCIAL, "full", financialState, now));
-  if (financialReady && collectorCatchupDue(COLLECTOR_TYPES.FINANCIAL, financialState, FINANCIAL_COLLECTION_FRESHNESS_MS, now)) {
-    const retry = retryDisposition(financialState, now);
-    if (retry.deferred) skipped.push("financial_catchup:deferred");
-    else if (retry.terminal) skipped.push("financial_catchup:failed_terminal");
-    else {
-    const snapshotMarker = Math.floor(now.getTime() / 1000);
-    const params = {
-      analyticsSyncKind: "catchup",
-      analyticsSyncVersion: ANALYTICS_SYNC_VERSION,
-      analyticsSyncStage: "financial",
-      financialMode: "catchup",
-      reason: "creator_analytics_catchup",
-      ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "catchup", reason: "creator_analytics_catchup", now }),
-      startDate: "2016-01-01 00:00:00",
-      endDate: onlyFansUtcDateTime(new Date(snapshotMarker * 1000)),
-      initialMarker: snapshotMarker,
-      schemaVersion: FINANCIAL_SCHEMA_VERSION,
-      collectorVersion: FINANCIAL_COLLECTOR_VERSION,
-    };
-    const scheduled = await scheduleIfIdle({
-      db, creatorId, agencyId, jobKey: FINANCIAL_JOB_KEY, params, priority, now, bucketMs: FINANCIAL_COLLECTION_FRESHNESS_MS,
-      collectorType: COLLECTOR_TYPES.FINANCIAL, collectorState: financialState,
-      catchupFreshnessMs: FINANCIAL_COLLECTION_FRESHNESS_MS,
-    });
-    if (scheduled.created) created.push("financial_catchup"); else skipped.push(`financial_catchup:${scheduled.reason || "skipped"}`);
-    }
-  } else skipped.push(financialReady ? "financial_catchup:fresh" : "financial_catchup:baseline_unverified");
-
-  const campaignReady = Boolean(membershipProofState(campaignState).baselineGeneration && collectorPlanningProofAt(COLLECTOR_TYPES.CAMPAIGNS, "full", campaignState, now));
-  if (!campaignReady) {
-    skipped.push("campaigns_catchup:baseline_unverified");
-  } else {
-    const frontierDue = campaignFrontierWorkDue(campaignState, now);
-    const directoryDue = campaignDirectoryDiscoveryDue(campaignState, now);
-    const directoryReuse = (frontierDue || !directoryDue) ? campaignDirectoryReuseBinding(campaignState, now) : null;
-    const requiresDirectoryDiscovery = directoryDue || (frontierDue && !directoryReuse);
-    if (!frontierDue && !directoryDue) {
-      skipped.push("campaigns_catchup:fresh");
-    } else if (requiresDirectoryDiscovery && campaignDirectoryDiscoveryAdmitted !== true && typeof reserveCampaignDirectory !== "function") {
-      skipped.push("campaigns_catchup:directory_capacity_deferred");
-    } else {
-      const retry = retryDisposition(campaignState, now);
-      if (retry.deferred) skipped.push("campaigns_catchup:deferred");
-      else if (retry.terminal) skipped.push("campaigns_catchup:failed_terminal");
-      else {
-        const params = {
-          analyticsSyncKind: "catchup",
-          analyticsSyncVersion: ANALYTICS_SYNC_VERSION,
-          analyticsSyncStage: "campaigns",
-          campaignMode: "catchup",
-          reason: "creator_analytics_catchup",
-          ...(directoryReuse || {}),
-          ...(!directoryReuse ? { campaignDirectoryDiscoveryVersion: 1 } : {}),
-          ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectionMode: "catchup", reason: "creator_analytics_catchup", now }),
-          pageSize: 50,
-          maxPages: 40,
-          claimerPageSize: 50,
-          fanValueBatchSize: 20,
-          observationTokenVersion: 1,
-          observationReadLeaseVersion: 1,
-          campaignResumablePaginationVersion: 1,
-          campaignFreshnessCoverageVersion: 1,
-          campaignOrderIndependentTraversalVersion: 1,
-          campaignSegmentedFairTraversalVersion: 1,
-          campaignFrontierSchedulingVersion: 1,
-          campaignDirectoryReuseVersion: 1,
-          campaignFrontierBudget: 50,
-        };
-        const scheduled = await scheduleIfIdle({
-          db, creatorId, agencyId, jobKey: CAMPAIGN_JOB_KEY, params, priority, now, bucketMs: directoryReuse ? CAMPAIGN_COLLECTION_FRESHNESS_MS : CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS,
-          collectorType: COLLECTOR_TYPES.CAMPAIGNS, collectorState: campaignState,
-          reserveDirectory: reserveCampaignDirectory, campaignDirectoryDiscoveryAdmitted,
-        });
-        if (scheduled.created) created.push(scheduled.collectionPlan);
-        else skipped.push(`campaigns_catchup:${scheduled.reason || "skipped"}`);
-      }
-    }
+    const result = await scheduleIfIdle({ db,creatorId,agencyId,jobKey,params,priority,now,bucketMs:1,
+      collectorType,collectorState:states[stream] });
+    if (result.created) created.push(`${stream}_offline_recovery`);
+    else skipped.push(`${stream}:${result.reason || "in_flight"}`);
   }
 
   return { ready: initial.ready, initial, created, skipped };

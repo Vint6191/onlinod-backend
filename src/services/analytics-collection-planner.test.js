@@ -88,31 +88,22 @@ function daysInclusive(start, end) {
   return rows;
 }
 
-test('Home manual refresh reuses today across minutes, leaves fresh history alone and preserves retry delay', async () => {
-  const now = new Date('2026-10-15T12:00:00Z');
-  const window = planner.operationalFreshnessWindow(now);
-  const coverageRows = daysInclusive(window.startDay, window.endDay).map(coverageDate => ({ coverageDate,
-    status: +coverageDate === +window.endDay ? 'PARTIAL' : 'COMPLETE', lastVerifiedAt: now,
-    scanProof: { status: 'COMMITTED', proofVersion: 2, requestedAt: now } }));
-  const db = { $executeRawUnsafe: async () => 1 };
-  db.$transaction = async fn => fn({ ...db, $transaction: undefined });
-  const jobs = addEarningsJobs(db);
-  const input = { db, creatorId: 'c', agencyId: 'a', now, coverageRows, reason: 'HOME_INTERACTIVE_REFRESH' };
-  const first = await planner.ensureOperationalAnalyticsFreshness(input);
-  assert.equal(first.dueDays, 1); assert.equal(jobs.length, 1);
-  const originalId = first.jobs[0].id;
-  for (const minute of [2, 3, 8]) {
-    jobs[0].status = 'DONE';
-    const next = await planner.ensureOperationalAnalyticsFreshness({ ...input, now: new Date(+now + minute * 60_000) });
-    assert.equal(next.jobs[0].id, originalId); assert.equal(jobs.length, 1);
-  }
-  const until = new Date(+now + 30 * 60_000);
-  jobs[0].nextRunAt = until;
-  await planner.ensureOperationalAnalyticsFreshness(input);
-  assert.deepEqual(jobs[0].nextRunAt, until);
-  jobs[0].status = 'FAILED'; coverageRows.at(-1).retryAfterAt = until;
-  const deferred = await planner.ensureOperationalAnalyticsFreshness(input);
-  assert.equal(deferred.jobs.length, 0);
+test('Home manual refresh uses the shared financial authority for every display period', async () => {
+  const control = require('./financial-transaction-scan-control-service');
+  const original = control.startManualFinancialTransactionScan, calls = [];
+  control.startManualFinancialTransactionScan = async input => {
+    calls.push(input); return { action: calls.length === 1 ? 'created' : 'already_running', job: { id: 'financial-job' } };
+  };
+  try {
+    const now = new Date('2026-10-15T12:00:00Z'), db = {};
+    for (const startDay of [new Date('2026-10-15'), new Date('2026-07-18')]) {
+      const result = await planner.ensureAnalyticsWindowFreshness({ db, creatorId: 'c', agencyId: 'a', now,
+        startDay, endDay: new Date('2026-10-15'), coverageRows: [], reason: 'HOME_INTERACTIVE_REFRESH' });
+      assert.equal(result.jobs[0].id, 'financial-job'); assert.equal(result.windows, 1);
+    }
+    assert.equal(calls.length, 2); assert.equal(calls[0].db, db);
+    assert.deepEqual(calls[0].creator, { id: 'c', agencyId: 'a' });
+  } finally { control.startManualFinancialTransactionScan = original; }
 });
 
 test('publication completing while planner waits prevents reopening a fresh terminal window', async () => {
@@ -127,7 +118,7 @@ test('publication completing while planner waits prevents reopening a fresh term
   assert.equal(result.jobs.length, 0); assert.equal(jobs.length, 0);
 });
 
-test('one Home collection covers 180 unique days; fresh periods reuse proof and only today is due a minute later', async () => {
+test('initial Home collection covers 180 days; aging and day rollover never restart provider scans', async () => {
   const now = new Date('2026-10-15T12:00:00Z');
   const { startDay, endDay } = planner.operationalFreshnessWindow(now);
   const db = { $executeRawUnsafe: async () => 1 };
@@ -151,58 +142,39 @@ test('one Home collection covers 180 unique days; fresh periods reuse proof and 
   const fresh = await planner.ensureOperationalAnalyticsFreshness({ ...input, coverageRows });
   assert.equal(fresh.dueDays, 0);
   const live = await planner.ensureOperationalAnalyticsFreshness({ ...input, coverageRows, now: new Date(+now + 61_000) });
-  assert.equal(live.dueDays, 1);
-  assert.equal(live.jobs[0].params.scanFrom, '2026-10-15');
-  assert.equal(live.jobs[0].params.scanTo, '2026-10-15');
+  assert.equal(live.dueDays, 0);
+  assert.equal(live.jobs.length, 0);
   const rollover = await planner.ensureOperationalAnalyticsFreshness({ ...input, coverageRows, now: new Date('2026-10-16T00:00:01Z') });
-  assert.ok(rollover.jobs.some(j => j.params.scanFrom === '2026-10-16'));
-  assert.ok(rollover.jobs.some(j => j.params.scanFrom <= '2026-10-15' && j.params.scanTo >= '2026-10-15'), 'yesterday PARTIAL must be closed again');
+  assert.equal(rollover.jobs.length, 0);
 });
 
-test('Home tabs share one member-fenced demand and automatic heartbeats do not restart its cursor', async () => {
-  const db = {}, store = addDemandStore(db);
-  const now = new Date('2026-10-15T12:00:00Z');
-  const options = { db, agencyId: 'agency-1', scopeMode: 'MEMBER_CURRENT', ...DEMAND_ACTOR, now, mode: 'automatic' };
+test('automatic Home requests never enqueue, reopen or change a demand', async () => {
+  const db = new Proxy({}, { get() { throw Error('automatic Home must not touch the database'); } });
+  for (const rangeKey of ['today', '7d', '30d', '90d']) for (const now of [new Date('2026-10-15T12:00:00Z'), new Date('2026-10-16T00:00:01Z')]) {
+    const result = await planner.enqueueHomeAnalyticsFreshnessDemand({ db, agencyId: 'agency-1', ...DEMAND_ACTOR, now, mode: 'automatic', rangeKey });
+    assert.equal(result.queued, false); assert.equal(result.reason, 'live_projection_owned');
+  }
+});
+
+test('manual Home demands coalesce across tabs and keep the current member access fence', async () => {
+  const db = {}, store = addDemandStore(db), now = new Date('2026-10-15T12:00:00Z');
+  const options = { db, agencyId: 'agency-1', scopeMode: 'MEMBER_CURRENT', ...DEMAND_ACTOR, now, mode: 'manual' };
   const first = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, rangeKey: 'today' });
-  assert.equal(first.rangeKey, '90d');
-  const initial = store.get(first.key);
-  assert.equal(daysInclusive(initial.coverageFrom, initial.coverageTo).length, 180);
+  const initial = store.get(first.key); assert.equal(daysInclusive(initial.coverageFrom, initial.coverageTo).length, 180);
   await db.analyticsCollectionDemand.update({ where: { key: first.key }, data: {
-    claimToken: 'owner', claimUntil: new Date(+now + 300_000), claimedRevision: 1, cursorCreatorId: 'c500',
-    attempts: 2, nextAttemptAt: new Date(+now + 120_000),
+    claimToken: 'owner', claimUntil: new Date(+now + 300_000), claimedRevision: 1, cursorCreatorId: 'c500', attempts: 2,
   } });
   for (const rangeKey of ['7d', '30d', '90d']) {
-    const r = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, rangeKey, now: new Date(+now + 61_000) });
-    assert.equal(r.key, first.key); assert.equal(r.requestRevision, 1); assert.equal(r.coalesced, true);
+    const r = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, rangeKey });
+    assert.equal(r.key, first.key); assert.equal(r.requestRevision, 1);
     assert.equal(store.get(first.key).cursorCreatorId, 'c500'); assert.equal(store.get(first.key).attempts, 2);
   }
-  const force = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, mode: 'manual' });
-  assert.equal(force.requestRevision, 2, 'manual refresh upgrades an automatic freshness-only request');
-  assert.equal(store.get(first.key).reason, 'HOME_INTERACTIVE_REFRESH');
-  const poll = await planner.enqueueHomeAnalyticsFreshnessDemand(options);
-  assert.equal(poll.requestRevision, 2); assert.equal(store.get(first.key).reason, 'HOME_INTERACTIVE_REFRESH');
-  const again = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, mode: 'manual' });
-  assert.equal(again.requestRevision, 2, 'another tab/device must not restart the same forced pass');
-  const changedAccess = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, requestedAccessEpoch: 8 });
-  assert.notEqual(changedAccess.key, first.key);
-  const midnight = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, now: new Date('2026-10-16T00:00:01Z') });
-  assert.equal(midnight.requestRevision, 3); assert.equal(isoDay(store.get(first.key).coverageTo), '2026-10-16');
-});
-
-test('automatic Home refresh is throttled after completion and never silently resets quarantined work', async () => {
-  const db = {}, store = addDemandStore(db), now = new Date('2026-10-15T12:00:00Z');
-  const options = { db, agencyId: 'agency-1', ...DEMAND_ACTOR, now, mode: 'automatic' };
-  const first = await planner.enqueueHomeAnalyticsFreshnessDemand(options);
-  await db.analyticsCollectionDemand.update({ where: { key: first.key }, data: { completedAt: now, completedRevision: 1 } });
-  const recent = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, now: new Date(+now + 20_000) });
-  assert.equal(recent.queued, false); assert.equal(recent.requestRevision, 1);
-  const next = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, now: new Date(+now + 61_000) });
-  assert.equal(next.queued, true); assert.equal(next.requestRevision, 2);
+  const changed = await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, requestedAccessEpoch: 8 });
+  assert.notEqual(changed.key, first.key);
   await db.analyticsCollectionDemand.update({ where: { key: first.key }, data: { quarantinedAt: now, attempts: 8 } });
-  await assert.rejects(planner.enqueueHomeAnalyticsFreshnessDemand(options), { code: 'HOME_COLLECTION_RETRY_REQUIRED' });
+  assert.equal((await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, mode: 'automatic' })).queued, false);
   assert.equal(store.get(first.key).attempts, 8);
-  await planner.enqueueHomeAnalyticsFreshnessDemand({ ...options, mode: 'manual' });
-  assert.equal(store.get(first.key).quarantinedAt, null);
+  await planner.enqueueHomeAnalyticsFreshnessDemand(options); assert.equal(store.get(first.key).quarantinedAt, null);
 });
 
 function addSweepLeaseStore(db) {

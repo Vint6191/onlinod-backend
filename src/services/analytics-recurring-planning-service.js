@@ -61,6 +61,11 @@ async function planRecurringCreatorAnalytics({ db, item, ownerToken, now = new D
       campaignDirectoryDiscoveryAdmitted: false,
       reserveCampaignDirectory: (state) => reserveDirectoryAdmission({ db: tx, state, creatorId, now: ownership.authorityNow }),
     }) : { created: [], skipped: [] };
+    const subscriberIntent=includeCatchups
+      ? await require("./creator-live-sync-service").pendingRecovery(tx,creatorId,"subscribers") : null;
+    const subscribers=subscriberIntent
+      ? await require("./subscriber-directory-service").ensureSubscriberScanDue({db:tx,agencyId:item.agencyId,creatorId,now:ownership.authorityNow,priority:20})
+      : {created:false};
     // A terminal collector is a recorded domain outcome, not a transaction
     // failure that should erase other streams' valid plans. Scope/claim and
     // unexpected database failures still roll back the complete transaction.
@@ -71,7 +76,8 @@ async function planRecurringCreatorAnalytics({ db, item, ownerToken, now = new D
     // or admission budget survive this failed final fence; notifications wait.
     const final = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow: now });
     if (!final.current || final.newerRevision) throw Object.assign(new Error("Analytics planning lease expired before commit"), { code: "ANALYTICS_PLANNING_CLAIM_LOST" });
-    return { created: Number(earnings.created || 0) + Number(analytics.created?.length || 0) + (analytics.initial?.created ? 1 : 0), skipped: Number(analytics.skipped?.length || 0), retired: false, initial: analytics.initial };
+    return { created: Number(earnings.created || 0) + Number(analytics.created?.length || 0) + (analytics.initial?.created ? 1 : 0)
+      + Number(subscribers.created===true), skipped: Number(analytics.skipped?.length || 0), retired: false, initial: analytics.initial };
   }, { maxWait: 5000, timeout: 20_000 }));
 }
 

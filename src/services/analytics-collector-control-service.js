@@ -125,7 +125,8 @@ function stampCollectionAuthorityParams(params, authorityNow, orderingAfter = nu
   const type = clean(source.collectionType, 40);
   const stamped = stampObservationStart({ ...source, collectionAuthorityRequestedAt: orderingAt.toISOString() }, at);
   if (type === COLLECTOR_TYPES.FINANCIAL) {
-    const marker = Math.floor(at.getTime() / 1000);
+    const resolutionEnd = source.moneyResolutionVersion === 1 ? date(source.endDate) : null;
+    const marker = Math.floor((resolutionEnd ? Math.min(+resolutionEnd,+at) : +at) / 1000);
     stamped.financialReceiptVersion = 1;
     stamped.initialMarker = marker;
     stamped.endDate = onlyFansUtcDateTime(new Date(marker * 1000));
@@ -204,6 +205,7 @@ function sameGeneration(current, command) {
 
 function completedForCommand(current, command) {
   if (!sameGeneration(current, command) || String(current?.status || "").toUpperCase() !== "COMPLETE") return false;
+  if (current?.lastResolutionGeneration === command.generation) return true;
   return command.mode === "catchup"
     ? clean(current?.lastCatchupGeneration, 120) === command.generation
     : clean(current?.baselineGeneration, 120) === command.generation;
@@ -253,13 +255,16 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
       await receiptAuthority.enter(tx);
     }
     const common = {
-      ...(success ? receiptAuthority.coverageUpdate(job, current, receiptRun, observedAt, now) : {}),
+      ...(success && job.params?.moneyResolutionVersion === 1 ? { receiptCoverageVersion: 1 } : {}),
+      ...(success && job.params?.moneyResolutionVersion !== 1 ? receiptAuthority.coverageUpdate(job, current, receiptRun, observedAt, now) : {}),
       status: success ? "COMPLETE" : "PARTIAL", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt,
       retryAfterAt: null, lastErrorCode: success ? null : "FINANCIAL_COLLECTION_PARTIAL",
       lastErrorMessage: success ? null : "Financial collection did not prove its requested source boundary",
       sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220),
     };
-    const successData = success && command.mode === "full" ? {
+    const successData = success && job.params?.moneyResolutionVersion === 1 ? {
+      lastResolutionGeneration: command.generation,
+    } : success && command.mode === "full" ? {
       baselineVerifiedAt: now, baselineObservedAt: observedAt, baselineGeneration: command.generation, baselineRangeFrom: date(rangeFrom), baselineRangeTo: date(rangeTo),
     } : success && command.mode === "catchup" ? {
       lastCatchupCompletedAt: now, lastCatchupObservedAt: observedAt, lastCatchupGeneration: command.generation, lastBoundary: clean(boundary, 220),
@@ -267,6 +272,7 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
     const state = await tx.creatorFinancialCollectionState.upsert({
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData }, update: { ...common, ...successData },
     });
+    await require("./creator-live-sync-service").completeRecovery(tx,job,success);
     return { applied: true, stale: false, command, state, scanRunId: clean(scanRunId, 120) };
   }});
 }
@@ -279,7 +285,7 @@ async function recordFinancialCollectionFailure({ db = prisma, job, error, termi
     if (commandAuthority(current, command) === "STALE" || completedForCommand(current, command)) return current;
     const retryAt = terminal ? null : date(retryAfterAt) || new Date((await dbAuthorityNow({ db: tx, fallbackNow: new Date() })).getTime() + 5 * 60 * 1000);
     const data = {
-      status: "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
+      status: job.params?.moneyResolutionVersion === 1 ? "PARTIAL" : "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
       lastErrorCode: "FINANCIAL_COLLECTION_FAILED", lastErrorMessage: clean(error?.message || error, 2000), sourceJobId: clean(job.id, 220),
     };
     return tx.creatorFinancialCollectionState.upsert({
@@ -370,11 +376,14 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
     };
     const membershipData = membershipComplete
       ? require("./campaign-membership-proof-service").membershipProofData(command.mode, command.generation, now, observedAt) : {};
-    const successData = success && command.mode === "full" ? { baselineVerifiedAt: now, baselineObservedAt: observedAt, baselineGeneration: command.generation }
+    const successData = success && job.params?.moneyResolutionVersion === 1 ? {
+      lastResolutionGeneration: command.generation,
+    } : success && command.mode === "full" ? { baselineVerifiedAt: now, baselineObservedAt: observedAt, baselineGeneration: command.generation }
       : success && command.mode === "catchup" ? { lastCatchupCompletedAt: now, lastCatchupObservedAt: observedAt, lastCatchupGeneration: command.generation } : {};
     const state = await tx.creatorCampaignCollectionState.upsert({
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData, ...membershipData }, update: { ...common, ...successData, ...membershipData },
     });
+    await require("./creator-live-sync-service").completeRecovery(tx,job,membershipComplete);
     return { applied: true, stale: false, command, state };
   };
   if (campaignLockHeld) return work(db);
@@ -390,7 +399,7 @@ async function recordCampaignCollectionFailure({ db = prisma, job, error, termin
     const retryAt = terminal ? null : date(retryAfterAt) || new Date((await dbAuthorityNow({ db: tx, fallbackNow: new Date() })).getTime() + 5 * 60 * 1000);
     const coverageAuthority = campaignFanCoverageAuthorityFromJob(job);
     const data = {
-      status: "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
+      status: job.params?.moneyResolutionVersion === 1 ? "PARTIAL" : "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
       fanValueCoverageDelegated: coverageAuthority.delegated, fanValueCoverageOwnerKind: coverageAuthority.ownerKind,
       fanValueCoverageCollectorVersion: coverageAuthority.collectorVersion, fanValueCoverageSourceJobId: coverageAuthority.sourceJobId,
       lastErrorCode: "CAMPAIGN_COLLECTION_FAILED", lastErrorMessage: clean(error?.message || error, 2000), sourceJobId: clean(job.id, 220),

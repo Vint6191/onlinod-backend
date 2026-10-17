@@ -36,11 +36,11 @@ test("INT5.8A-2 page-1 hash is staged and canonical frontier publishes only afte
 test("INT5.8A-2 current planner no longer consumes canonical frontier as ordering-dependent skip authority", () => {
   const orchestrator = read("src/services/creator-analytics-sync-orchestrator.js");
   assert.doesNotMatch(orchestrator, /async function campaignCatchupState/);
-  const schedulingStart = orchestrator.indexOf('const campaignReady =');
+  const schedulingStart = orchestrator.indexOf('const readiness =');
   const schedulingEnd = orchestrator.indexOf('return { ready: initial.ready, initial, created, skipped };', schedulingStart);
   const scheduling = orchestrator.slice(schedulingStart, schedulingEnd);
   assert.doesNotMatch(scheduling, /knownClaimerFrontierHashes|stagedCatchupFrontier/);
-  assert.match(scheduling, /campaignOrderIndependentTraversalVersion: 1/);
+  assert.match(scheduling, /campaignOrderIndependentTraversalVersion:\s*1/);
 });
 
 test("INT5.8A-2 manual Campaign reader converges on server-owned freshness coverage with legacy result/continuation fallback", () => {

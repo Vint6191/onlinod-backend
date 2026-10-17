@@ -461,6 +461,18 @@ model TeamMemberFunction {
 }
 
 model CreatorAccount {
+ dialogRecoveryRequests CreatorDialogRecoveryRequest[]
+  liveSync CreatorLiveSync[]
+  earningsGenerations CreatorEarningsGeneration[]
+  recoveryWatermarks CreatorRecoveryWatermark[]
+  earningsLedgerProof CreatorEarningsLedgerProof[]
+  earningsLedgerEntries CreatorEarningsLedgerEntry[]
+  earningsLedgerHours CreatorEarningsLedgerHour[]
+  moneyObservations CreatorMoneyObservation[]
+  realtimeSessions CreatorRealtimeSession[]
+  recoveryIntents CreatorRecoveryIntent[]
+  notificationFrontierPages CreatorNotificationFrontierPage[]
+
   providerRequestGate OfProviderRequestGateState?
   analyticsPlanningBudgets AnalyticsPlanningBudget[]
   massDeliveryState MassCreatorDeliveryState?
@@ -567,6 +579,7 @@ model CreatorAccount {
   messagesDaily                         CreatorMessagesDaily[]
   dailyMetrics                          CreatorDailyMetrics[]
   analyticsFactPublications              CreatorAnalyticsFactPublication[]
+  moneyResolutionRequests CreatorMoneyResolutionRequest[]
   analyticsPublicationState              CreatorAnalyticsPublicationState?
   analyticsDays                         CreatorAnalyticsDay[]
   analyticsDayMembers                   CreatorAnalyticsDayMember[]
@@ -1995,6 +2008,7 @@ model CreatorFanValueCurrent {
 }
 
 model CreatorNotificationSyncState {
+  frontierReceipt Json @default("{}")
   normalizerVersion String?
   id                      String                  @id @default(cuid())
   agencyId                String
@@ -2038,6 +2052,7 @@ model CreatorNotificationSyncState {
 }
 
 model CreatorFinancialCollectionState {
+ lastResolutionGeneration String?
   id                     String                  @id @default(cuid())
   agencyId               String
   creatorId              String                  @unique
@@ -6368,4 +6383,216 @@ model CreatorNotificationCorrection {
   createdAt          DateTime @default(now())
   creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
   @@index([creatorId, notificationId, createdAt])
+}
+
+model CreatorLiveSync {
+  creatorId String @id
+  agencyId String
+  lastCapturedAt DateTime?
+  lastDeliveredAt DateTime?
+  shortGapFrom DateTime?
+  shortGapTo DateTime?
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+}
+model CreatorRealtimeSession {
+  retiredAt DateTime?
+  id String @id
+  agencyId String
+  creatorId String
+  deviceId String
+  memberId String
+  accessEpoch Int
+  incarnation String
+  capturedSeq BigInt @default(0)
+  ackedSeq BigInt @default(0)
+  capturedAt DateTime?
+  loss Boolean @default(false)
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+  receipts CreatorRealtimeReceipt[]
+  @@unique([creatorId,deviceId,incarnation])
+  @@index([creatorId,updatedAt],map:"CreatorRealtimeSession_creator_updated_idx")
+  lossAt DateTime?
+  lossRevision Int @default(0)
+  resolvedLossRevision Int @default(0)
+}
+model CreatorRealtimeReceipt {
+  sessionId String
+  seq BigInt
+  digest String
+  capturedAt DateTime
+  session CreatorRealtimeSession @relation(fields:[sessionId],references:[id],onDelete:Cascade)
+  @@id([sessionId,seq])
+}
+model CreatorRecoveryIntent {
+  id String @id
+  agencyId String
+  creatorId String
+  stream String
+  reason String
+  gapFrom DateTime
+  targetAt DateTime
+  policyVersion Int
+  status String @default("PENDING")
+  jobId String?
+  completedAt DateTime?
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+  @@index([creatorId,stream,status,targetAt,id],map:"CreatorRecoveryIntent_pending_idx")
+}
+model CreatorNotificationFrontierPage {
+  createdAt DateTime @default(now())
+  creatorId String
+  agencyId String
+  generation String
+  page Int
+  cursorStart String
+  cursorEnd String?
+  digest String
+  creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+  @@id([creatorId,generation,page])
+  @@unique([creatorId,generation,cursorStart])
+}
+
+model CreatorEarningsLedgerProof {
+ confirmedThroughAt DateTime?
+  activeGeneration String?
+ creatorId String @id
+ agencyId String
+ fromAt DateTime
+ throughAt DateTime
+ generation String
+ creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+}
+model CreatorEarningsLedgerEntry {
+ agencyId String
+ creatorId String
+ transactionId String
+ occurredAt DateTime
+ category String @default("other")
+ netCents BigInt
+ status String
+ observedAt DateTime
+ creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+ @@id([creatorId,transactionId])
+ @@index([creatorId,occurredAt],map:"EarningsLedger_creator_date")
+}
+model CreatorEarningsLedgerHour {
+ agencyId String
+ creatorId String
+ hour DateTime
+ category String @default("other")
+ netCents BigInt
+ observedAt DateTime
+ creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+ @@id([creatorId,hour,category])
+}
+model CreatorMoneyObservation {
+ resolutionBlockedAt DateTime?
+ resolutionError String?
+  coveredGeneration String?
+ id String @id
+ agencyId String
+ creatorId String
+ transactionId String?
+ occurredAt DateTime
+ capturedAt DateTime
+ status String
+ reason String?
+ resolvedAt DateTime?
+ creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+ @@index([creatorId,status,occurredAt],map:"MoneyObservation_pending")
+}
+
+model CreatorEarningsGeneration {
+ mode String @default("SNAPSHOT")
+ id String @id
+ agencyId String
+ creatorId String
+ runId String
+ baseGeneration String?
+ state String @default("BUILDING")
+ phase String @default("COPY")
+ cursor String @default("")
+ fromAt DateTime
+ throughAt DateTime
+ snapshotAt DateTime
+ fullScan Boolean
+ legacyPending Boolean @default(false)
+ observedCount BigInt @default(0)
+ invalidCount BigInt @default(0)
+ oldestAt DateTime?
+ createdAt DateTime @default(now())
+ publishedAt DateTime?
+ retiredAt DateTime?
+ creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+ entries CreatorEarningsGenerationEntry[]
+ hours CreatorEarningsGenerationHour[]
+ days CreatorEarningsGenerationDay[]
+ @@index([creatorId,state],map:"EarningsGeneration_creator")
+}
+model CreatorEarningsGenerationEntry {
+ generation String
+ transactionId String
+ occurredAt DateTime
+ category String
+ netCents BigInt
+ status String
+ observedAt DateTime
+ owner CreatorEarningsGeneration @relation(fields:[generation],references:[id],onDelete:Cascade)
+ @@id([generation,transactionId])
+ @@index([generation,occurredAt,transactionId],map:"EarningsGenerationEntry_window")
+}
+model CreatorEarningsGenerationHour {
+ generation String
+ hour DateTime
+ category String
+ netCents BigInt
+ observedAt DateTime
+ owner CreatorEarningsGeneration @relation(fields:[generation],references:[id],onDelete:Cascade)
+ @@id([generation,hour,category])
+}
+model CreatorEarningsGenerationDay {
+ generation String
+ date DateTime @db.Date
+ category String
+ netCents BigInt
+ observedAt DateTime
+ owner CreatorEarningsGeneration @relation(fields:[generation],references:[id],onDelete:Cascade)
+ @@id([generation,date,category])
+}
+model CreatorDialogRecoveryRequest {
+ creatorId String @id
+ agencyId String
+ lastCoveredAt DateTime?
+ sampleAt DateTime
+ nextCheckAt DateTime
+ queued Boolean @default(true)
+ reason String?
+ creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+}
+model CreatorRecoveryWatermark {
+ creatorId String
+ stream String
+ throughAt DateTime
+ creator CreatorAccount @relation(fields:[creatorId],references:[id],onDelete:Cascade)
+ @@id([creatorId,stream])
+}
+
+model CreatorMoneyResolutionRequest {
+ creatorId String @id
+ agencyId String
+ queued Boolean @default(true)
+ targetId String?
+ attempts Int @default(0)
+ jobId String?
+ lastError String?
+ updatedAt DateTime @default(now())
+ creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+}
+model MoneyResolutionAdoption {
+ id String @id
+ cursor String @default("")
+ complete Boolean @default(false)
 }

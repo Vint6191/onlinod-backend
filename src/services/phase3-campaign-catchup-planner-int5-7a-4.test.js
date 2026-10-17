@@ -20,12 +20,12 @@ function functionSlice(source, name, nextName) {
 }
 
 test("INT5.7A-4 current Campaign planner retires ordering-dependent frontier hints instead of shipping them as skip authority", () => {
-  const schedulingStart = orchestrator.indexOf('const campaignReady =');
+  const schedulingStart = orchestrator.indexOf('const readiness =');
   const schedulingEnd = orchestrator.indexOf('return { ready: initial.ready, initial, created, skipped };', schedulingStart);
   assert.ok(schedulingStart >= 0 && schedulingEnd > schedulingStart);
   const scheduling = orchestrator.slice(schedulingStart, schedulingEnd);
   assert.doesNotMatch(scheduling, /campaignCatchupState|knownClaimerFrontierHashes|knownCampaignFanCounts|knownClaimersByCampaign/);
-  assert.match(scheduling, /campaignOrderIndependentTraversalVersion: 1/);
+  assert.match(scheduling, /campaignOrderIndependentTraversalVersion:\s*1/);
   assert.doesNotMatch(orchestrator, /async function campaignCatchupState/);
 });
 

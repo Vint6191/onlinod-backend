@@ -21,6 +21,8 @@ const DOMAIN_WORK_MEMBER_SCOPE_CREATOR_PROBE = 16;
 const DOMAIN_DEPENDENCY_WAKE_OBJECT_TYPE = "DomainDependency";
 
 const WORK_CLASS = Object.freeze({
+  MONEY_RESOLUTION: "MONEY_RESOLUTION",
+  DIALOG_OFFLINE_RECOVERY: "DIALOG_OFFLINE_RECOVERY",
   ANALYTICS_PUBLICATION: "ANALYTICS_PUBLICATION",
   FINANCIAL_RECEIPT_RETENTION: "FINANCIAL_RECEIPT_RETENTION",
   ANALYTICS_FACT_PUBLICATION: "ANALYTICS_FACT_PUBLICATION",
@@ -190,7 +192,7 @@ async function publishDomainWork({ db = null, fallbackNow = null, ...input } = {
          "availableAt"=LEAST("DomainWorkItem"."availableAt",EXCLUDED."availableAt"),
          "nextAttemptAt"=NULL,
          "progressCursor"=CASE
-           WHEN "DomainWorkItem"."state"='CLAIMED' THEN "DomainWorkItem"."progressCursor"
+           WHEN "DomainWorkItem"."state"='CLAIMED' OR "DomainWorkItem"."workClass"='CREATOR_RECURRING_PLANNING' THEN "DomainWorkItem"."progressCursor"
            WHEN "DomainWorkItem"."workClass"='TEAM_DIALOG_PROJECTION'
              AND ("DomainWorkItem"."progressCursor"->'pendingRepair') IS NOT NULL
              THEN "DomainWorkItem"."progressCursor"
@@ -229,7 +231,7 @@ async function publishDomainWork({ db = null, fallbackNow = null, ...input } = {
       state: String(existing.state) === STATE.CLAIMED ? STATE.CLAIMED : STATE.READY, isOutstanding: true,
       availableAt: asDate(existing.availableAt) && asDate(existing.availableAt) < adapterRow.availableAt ? existing.availableAt : adapterRow.availableAt,
       nextAttemptAt: null,
-      progressCursor: String(existing.state) === STATE.CLAIMED
+      progressCursor: String(existing.state) === STATE.CLAIMED || String(existing.workClass) === WORK_CLASS.CREATOR_RECURRING_PLANNING
         ? existing.progressCursor ?? null
         : (String(existing.workClass) === WORK_CLASS.TEAM_DIALOG_PROJECTION && existing.progressCursor?.pendingRepair ? existing.progressCursor : null),
       errorClass: null, lastError: null, terminalCause: null,
@@ -237,6 +239,46 @@ async function publishDomainWork({ db = null, fallbackNow = null, ...input } = {
   });
 }
 
+
+// Bounded producer batch; identities and revisions retain the same authority as
+// publishDomainWork. Distinct creators retain their own claim partitions.
+async function publishDomainWorkBatch({db,items}) {
+  if(!Array.isArray(items)||items.length>500)throw new Error("DOMAIN_WORK_BATCH_INVALID");
+  if(!items.length)return [];
+  const rows=items.map(normalizePublish);
+  if(new Set(rows.map(x=>x.id)).size!==rows.length)throw new Error("DOMAIN_WORK_BATCH_DUPLICATE_IDENTITY");
+  return db.$queryRawUnsafe(`INSERT INTO "DomainWorkItem"(
+    "id","agencyId","workClass","objectType","objectId","parentObjectId","partitionKey","creatorId","accountId",
+    "requestedRevision","completedRevision","activeGeneration","projectionVersion","state","isOutstanding","availableAt",
+    "dependencyKind","dependencyKey","dependencyRevision","createdAt","updatedAt")
+    SELECT x.id,x."agencyId",x."workClass",x."objectType",x."objectId",x."parentObjectId",x."partitionKey",x."creatorId",x."accountId",
+      1,0,x."activeGeneration",x."projectionVersion",'READY',true,COALESCE(x."availableAt",clock_timestamp() AT TIME ZONE 'UTC'),
+      x."dependencyKind",x."dependencyKey",x."dependencyRevision",CURRENT_TIMESTAMP,CURRENT_TIMESTAMP
+    FROM jsonb_to_recordset($1::jsonb) x(id text,"agencyId" text,"workClass" text,"objectType" text,"objectId" text,"parentObjectId" text,
+      "partitionKey" text,"creatorId" text,"accountId" text,"activeGeneration" text,"projectionVersion" text,"availableAt" timestamp,
+      "dependencyKind" text,"dependencyKey" text,"dependencyRevision" bigint) ORDER BY x."agencyId",x.id
+       ON CONFLICT ("agencyId","workClass","objectType","objectId") DO UPDATE SET
+         "requestedRevision"="DomainWorkItem"."requestedRevision"+1,
+         "parentObjectId"=COALESCE(EXCLUDED."parentObjectId","DomainWorkItem"."parentObjectId"),
+         "partitionKey"=EXCLUDED."partitionKey",
+         "creatorId"=COALESCE(EXCLUDED."creatorId","DomainWorkItem"."creatorId"),
+         "accountId"=COALESCE(EXCLUDED."accountId","DomainWorkItem"."accountId"),
+         "dependencyKind"=EXCLUDED."dependencyKind",
+         "dependencyKey"=EXCLUDED."dependencyKey",
+         "dependencyRevision"=GREATEST("DomainWorkItem"."dependencyRevision",EXCLUDED."dependencyRevision"),
+         "state"=CASE WHEN "DomainWorkItem"."state"='CLAIMED' THEN 'CLAIMED' ELSE 'READY' END,
+         "isOutstanding"=TRUE,
+         "availableAt"=LEAST("DomainWorkItem"."availableAt",EXCLUDED."availableAt"),
+         "nextAttemptAt"=NULL,
+         "progressCursor"=CASE
+           WHEN "DomainWorkItem"."state"='CLAIMED' OR "DomainWorkItem"."workClass"='CREATOR_RECURRING_PLANNING' THEN "DomainWorkItem"."progressCursor"
+           WHEN "DomainWorkItem"."workClass"='TEAM_DIALOG_PROJECTION'
+             AND ("DomainWorkItem"."progressCursor"->'pendingRepair') IS NOT NULL
+             THEN "DomainWorkItem"."progressCursor"
+           ELSE NULL END,
+         "errorClass"=NULL,"lastError"=NULL,"terminalCause"=NULL,"updatedAt"=CURRENT_TIMESTAMP
+ RETURNING *`,JSON.stringify(rows,(_,v)=>typeof v==="bigint"?v.toString():v));
+}
 
 async function activeDomainWorkGeneration({ db, workClass, fallback = DOMAIN_WORK_GENERATION } = {}) {
   const klass = clean(workClass, 120);
@@ -1557,7 +1599,7 @@ module.exports = {
   DOMAIN_WORK_MEMBER_SCOPE_SHARD_PROBE, DOMAIN_WORK_MEMBER_SCOPE_CREATOR_PROBE,
   DOMAIN_DEPENDENCY_WAKE_OBJECT_TYPE,
   WORK_CLASS, STATE,
-  workId, publishDomainWork, activeDomainWorkGeneration, domainWorkFamilyState, hasOutstandingDomainWork, claimDomainWorkBatch, lockDomainWorkClaimForCommit, heartbeatDomainWorkClaim, ackDomainWorkClaim,
+  workId, publishDomainWork, publishDomainWorkBatch, activeDomainWorkGeneration, domainWorkFamilyState, hasOutstandingDomainWork, claimDomainWorkBatch, lockDomainWorkClaimForCommit, heartbeatDomainWorkClaim, ackDomainWorkClaim,
   blockDomainWorkClaim, failDomainWorkClaim, saveDomainWorkProgress, yieldDomainWorkClaim, wakeDomainDependencyBatch, bumpDomainDependency, runDomainDependencyWakeSweep, currentDependencyRevision,
   normalizeMemberClaimScope, lockMemberClaimAuthority, reserveMemberScopeCreatorProbe,
 };
