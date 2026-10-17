@@ -390,6 +390,80 @@ async function projectFanIdentityBatch(tx, observations) {
   return new Map(fans.map((fan) => [`${fan.creatorId}\u0000${fan.onlyFansUserId}`, fan]));
 }
 
+/**
+ * Event participants have an immutable OF id, but their embedded profile is a
+ * mutable hint (including expiring image URLs), not a fact at the event's date.
+ * Give those hints the server receipt clock, merge a page once per fan, and
+ * withhold ambiguous fields. Money, activity dates and participant ids remain
+ * exact. The strict profile/relationship/value projectors keep their conflict
+ * checks; no database or monetary error is caught here.
+ */
+async function projectEventFanIdentities(tx, observations, receivedAt) {
+  const observedAt = date(receivedAt);
+  // The notification ingest contract permits a bounded legacy batch of 2,000;
+  // ordinary financial/source pages are much smaller. Preserve that contract.
+  if (!receivedAt || !observedAt || !Array.isArray(observations) || observations.length > 2_000) {
+    throw new Error("Invalid event participant observation batch");
+  }
+  const grouped = new Map();
+  for (const raw of observations) {
+    const externalId = onlyFansUserId(raw?.onlyFansUserId);
+    if (!raw?.agencyId || !raw?.creatorId || !externalId
+      || !["FINANCIAL_TRANSACTION", "LIVE_NOTIFICATION"].includes(raw.source)) {
+      throw new Error("Invalid event participant observation scope or source");
+    }
+    const key = `${raw.creatorId}\u0000${externalId}`;
+    let group = grouped.get(key);
+    if (!group) {
+      group = { agencyId: raw.agencyId, creatorId: raw.creatorId, onlyFansUserId: externalId,
+        source: raw.source, observedAt, fields: new Map(), firstActivity: null, lastActivity: null };
+      grouped.set(key, group);
+    }
+    if (group.agencyId !== raw.agencyId || group.source !== raw.source) throw new Error("Mixed event participant authority scope");
+    const fields = cleanIdentityFields(raw, { rejectSynthetic: true });
+    for (const [field] of IDENTITY_FIELDS) {
+      if (fields[field] === null) continue;
+      if (!group.fields.has(field)) group.fields.set(field, new Set());
+      group.fields.get(field).add(fields[field]);
+    }
+    const activity = raw.activityObservedAt ? date(raw.activityObservedAt) : null;
+    if (activity && (!group.firstActivity || activity < group.firstActivity)) group.firstActivity = activity;
+    if (activity && (!group.lastActivity || activity > group.lastActivity)) group.lastActivity = activity;
+  }
+  const currentByKey = new Map();
+  // Use the same authority lock as every canonical projector. Filtering a tied
+  // hint and writing it are one transaction, including concurrent page commits.
+  for (const creatorId of [...new Set([...grouped.values()].map(row => row.creatorId))].sort()) {
+    const ids = [...grouped.values()].filter(row => row.creatorId === creatorId).map(row => row.onlyFansUserId);
+    await lockFanAuthorityScope(tx, creatorId, ids);
+    const rows = await tx.creatorFan.findMany({ where: { creatorId, onlyFansUserId: { in: ids } } });
+    for (const row of rows) currentByKey.set(`${creatorId}\u0000${row.onlyFansUserId}`, row);
+  }
+  let ambiguousFields = 0;
+  const normalized = [...grouped.entries()].map(([key, group]) => {
+    const input = { agencyId: group.agencyId, creatorId: group.creatorId, onlyFansUserId: group.onlyFansUserId,
+      source: group.source, observedAt, activityObservedAt: group.firstActivity };
+    const current = currentByKey.get(key);
+    for (const [field, , versionField] of IDENTITY_FIELDS) {
+      const values = group.fields.get(field);
+      if (!values?.size) continue;
+      const value = values.values().next().value;
+      if (values.size > 1 || sameGenerationContradiction(current?.[versionField], authorityVersion(observedAt, group.source, value))) {
+        ambiguousFields += 1;
+        continue;
+      }
+      input[field] = value;
+    }
+    return input;
+  });
+  const fans = await projectFanIdentityBatch(tx, normalized);
+  for (const [key, group] of grouped) {
+    const fan = fans.get(key);
+    if (fan && group.lastActivity && +group.lastActivity !== +group.firstActivity) await projectFanActivity(tx, fan.id, group.lastActivity);
+  }
+  return { fans, ambiguousFields };
+}
+
 
 async function projectFanRelationship(tx, observation) {
   const externalId = onlyFansUserId(observation.onlyFansUserId);
@@ -1652,6 +1726,7 @@ module.exports = {
   onlyFansUserId,
   projectFanIdentity,
   projectFanIdentityBatch,
+  projectEventFanIdentities,
   projectFanRelationship,
   projectSubscriberDirectoryRun,
   projectSubscriberDirectoryItems,

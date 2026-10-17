@@ -6,7 +6,7 @@ const crypto = require("node:crypto");
 const prisma = require("../prisma");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
-const { projectFanIdentity } = require("./fan-data-authority-service");
+const { projectEventFanIdentities } = require("./fan-data-authority-service");
 const { lockCreatorFacts, retainKnownFan } = require("./creator-fact-write-authority");
 const {
   COLLECTOR_TYPES, collectionCommand, acceptFinancialGeneration, completeFinancialCollection, recordFinancialCollectionFailure,
@@ -143,19 +143,17 @@ function normalizeTransaction(row, index, page) {
   };
 }
 
-async function resolveFan(tx, job, row, now) {
-  if (!row.fanOnlyFansUserId) return null;
-  return projectFanIdentity(tx, {
+async function resolveFans(tx, job, rows, now) {
+  return projectEventFanIdentities(tx, rows.filter(row => row.fanOnlyFansUserId).map(row => ({
     agencyId: job.agencyId,
     creatorId: job.creatorId,
     onlyFansUserId: row.fanOnlyFansUserId,
     username: row.fanUsername,
     platformDisplayName: row.fanDisplayName,
     avatarUrl: row.fanAvatarUrl,
-    observedAt: row.occurredAt,
     activityObservedAt: row.occurredAt,
     source: "FINANCIAL_TRANSACTION",
-  });
+  })), now);
 }
 
 function businessData(job, deviceId, row, fanRecordId, now) {
@@ -308,9 +306,14 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
       where: { creatorId: job.creatorId, externalTransactionId: { in: ids } },
     }) : [];
     const existingById = new Map(existingRows.map((row) => [row.externalTransactionId, row]));
+    const writable = accepted.filter(row => {
+      const previous = existingById.get(row.externalTransactionId);
+      return !(previous?.sourceUpdatedAt && +previous.sourceUpdatedAt > +new Date(job.params.collectionRequestedAt));
+    });
+    const participants = await resolveFans(tx, job, writable, now);
 
-    for (const row of accepted) {
-      const fan = await resolveFan(tx, job, row, now);
+    for (const row of writable) {
+      const fan = participants.fans.get(`${job.creatorId}\u0000${row.fanOnlyFansUserId}`);
       const fanRecordId = fan?.id || null;
       const commonData = {
         agencyId: job.agencyId, creatorId: job.creatorId, fanRecordId,
@@ -329,7 +332,6 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
         reasonCode: row.reasonCode, updatedAt: now,
       };
       const previous = existingById.get(row.externalTransactionId);
-      if (previous?.sourceUpdatedAt && +previous.sourceUpdatedAt > +new Date(job.params.collectionRequestedAt)) continue;
       if (!previous) {
         const data = { ...commonData, sourceJobId: job.id, scanRunId, page: row.page, ordinal: row.ordinal };
         await tx.creatorFinancialTransaction.create({ data: { id: crypto.randomUUID(), createdAt: now, ...data } });
@@ -364,7 +366,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
       }
     }
     const financialContinuation = receipt ? await receipts.commitPage(tx, job, chunk, receipt, accepted, rejected.length) : null;
-    return { superseded: false, authorityNow: now, financialContinuation };
+    return { superseded: false, authorityNow: now, financialContinuation, identityHintConflicts: participants.ambiguousFields };
   });
 
   if (transactionOutcome?.receiptReplay) return { type: "financial_transactions_page", replay: true, financialContinuation: transactionOutcome.financialContinuation };
@@ -381,6 +383,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
     accepted: accepted.length,
     rejected: rejected.length,
     inserted, updated, unchanged, projected, storedOnly,
+    identityHintConflicts: transactionOutcome.identityHintConflicts,
     rejectedRows: rejected.slice(0, 20).map((row) => ({ ordinal: row.ordinal, reasonCode: row.reasonCode, externalTransactionId: row.externalTransactionId || null, transactionType: row.transactionType || null })),
   };
 }

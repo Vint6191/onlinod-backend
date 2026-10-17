@@ -19,6 +19,7 @@ const {
 } = require("../services/job-lease-service");
 
 const { FinancialReceiptError } = require("../services/financial-receipt-authority");
+const { FanDataObservationBoundaryError } = require("../services/fan-data-authority-service");
 const router = express.Router();
 
 const JOB_SERVER_CAPABILITIES = Object.freeze({
@@ -69,6 +70,11 @@ function validationError(res, error) {
 }
 
 function leaseError(res, error) {
+  // A rejected canonical observation is a typed client/domain failure, never an
+  // opaque retryable 500. Do not expose profile values or authority digests.
+  if (error instanceof FanDataObservationBoundaryError) {
+    return res.status(error.status).json({ ok: false, code: error.code, error: error.message, retryable: false });
+  }
   if (error instanceof JobLeaseError || error instanceof CampaignTraversalError || error instanceof FinancialReceiptError || (error?.status===409 && String(error?.code || "").startsWith("NOTIFICATION_FRONTIER_"))) {
     if (error.retryAfterMs) res.set("Retry-After", String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
     return res.status(error.status || 409).json({

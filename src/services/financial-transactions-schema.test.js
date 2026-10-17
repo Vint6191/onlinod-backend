@@ -44,7 +44,7 @@ test("all-time financial source ledger is relational, typed and user-optional", 
 
 
 test("ingest keeps unavailable-user and unknown-type transactions as durable facts", () => {
-  assert.match(service, /if \(!row\.fanOnlyFansUserId\) return null/);
+  assert.match(service, /rows\.filter\(row => row\.fanOnlyFansUserId\)/);
   assert.deepEqual(require("./financial-transaction-category").classifyTransactionType("unknown_provider_type"), {
     factType: "OTHER", projectionStatus: "STORED_ONLY", saleType: null, reasonCode: "unmapped_transaction_type",
   });

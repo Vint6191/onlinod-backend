@@ -10,7 +10,7 @@ const { parseStrictIsoDateTime } = require("./strict-date-time");
 const { projectSubscriptionFacts } = require("./creator-analytics-projection-service");
 const { lockCreatorFacts, mergeNotificationMoney, transactionIdentityConflict } = require("./creator-fact-write-authority");
 const { dispatchTeamMoneyReconciliationForCanonicalFact } = require("./team-money-reconciliation-service");
-const { projectFanIdentityBatch } = require("./fan-data-authority-service");
+const { projectEventFanIdentities } = require("./fan-data-authority-service");
 
 const SERVICE_VERSION = "notification-facts-v1-history-v8-known-boundary";
 const SCHEMA_VERSION = 5;
@@ -431,13 +431,13 @@ async function resolveFans(tx, { agencyId, creatorId, facts, now }) {
       username: fact.fanUsername,
       platformDisplayName: fact.fanDisplayName,
       avatarUrl: fact.fanAvatarUrl,
-      observedAt: fact.occurredAt,
       activityObservedAt: fact.occurredAt,
       source: "LIVE_NOTIFICATION",
     });
   }
-  const projected = await projectFanIdentityBatch(tx, observations);
-  return new Map([...projected.values()].map((fan) => [fan.onlyFansUserId, fan.id]));
+  const projected = await projectEventFanIdentities(tx, observations, now);
+  return { fanRecordIds: new Map([...projected.fans.values()].map((fan) => [fan.onlyFansUserId, fan.id])),
+    identityHintConflicts: projected.ambiguousFields };
 }
 
 async function existingFacts(tx, model, creatorId, facts) {
@@ -830,7 +830,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       if (lockedBatch?.status === "COMMITTED" || lockedBatch?.status === "PARTIAL") {
         return { replayed: true, response: terminalReplayResponse(lockedBatch, result, job) };
       }
-      const fanRecordIds = await resolveFans(tx, { agencyId: job.agencyId, creatorId: job.creatorId, facts, now });
+      const { fanRecordIds, identityHintConflicts } = await resolveFans(tx, { agencyId: job.agencyId, creatorId: job.creatorId, facts, now });
       const groups = {
         sale: facts.filter((fact) => fact.kind === "sale"),
         tip: facts.filter((fact) => fact.kind === "tip"),
@@ -917,6 +917,7 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
         else for (const type of requested) perTypeInitialRejected[type] += 1;
       }
       const counts = {
+        identityHintConflicts,
         inserted: sale.inserted + tip.inserted + subscription.inserted + like.inserted + comment.inserted,
         updated: sale.updated + tip.updated + subscription.updated + like.updated + comment.updated,
         unchanged: sale.unchanged + tip.unchanged + subscription.unchanged + like.unchanged + comment.unchanged,
