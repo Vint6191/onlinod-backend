@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v7_exact_live_money",
+  "version": "nod_current_v8_team_ledger_retention",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -24,6 +24,10 @@
     {
       "migration": "20261016030000_exact_live_money",
       "checksum": "45c12e3b1108a175373516db21895f8e3408ce8de2551549dd4efe5bd205eddb"
+    },
+    {
+      "migration": "20261017000000_team_ledger_retention",
+      "checksum": "50104ae87756bc2dcd7f3464bf2d36ce3a575557d3294ae8f8607f911291d46c"
     }
   ],
   "extension": {
@@ -1970,6 +1974,16 @@
         "hash": "aacaf58f1fb97656a5736f2674357f6062cd8cb102c234e16751bb5f09b5b4c4"
       },
       {
+        "name": "onlinod_project_team_ppv_fact_v2",
+        "args": "",
+        "hash": "9f764067bb0dc615f3baf6ff39f725dcff41478bb5bd8a09090e702d57229456"
+      },
+      {
+        "name": "onlinod_project_team_tip_fact_v2",
+        "args": "",
+        "hash": "e425b067e37e547b3f765d57423d7a4a49b6dca43de6490ed5032d6e4df2e3f0"
+      },
+      {
         "name": "onlinod_resolution_publication_guard_v7",
         "args": "",
         "hash": "5e28f46ecc6a40722a68a70da991785e1e9c3ffb759905c25d2918c83397c8e0"
@@ -3124,6 +3138,51 @@
         "options": "0 0",
         "expressions": null,
         "predicate": null
+      },
+      {
+        "table": "TeamPpvPurchaseLedger",
+        "name": "TeamPpvPurchaseLedger_retention_compact_v8_idx",
+        "unique": false,
+        "keys": "13 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "((\"compactedAt\" IS NULL) AND (\"historicalFactVersion\" = 'team_money_fact_v2'::text) AND (\"historicalFactProjectedAt\" IS NOT NULL) AND (status = ANY (ARRAY['resolved'::text, 'expired'::text, 'attributed'::text, 'unresolved'::text, 'rejected'::text, 'creator_revenue'::text])))"
+      },
+      {
+        "table": "TeamPpvResolveJob",
+        "name": "TeamPpvResolveJob_retention_expired_v8_idx",
+        "unique": false,
+        "keys": "13 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(status = ANY (ARRAY['resolved'::text, 'expired'::text, 'rejected'::text]))"
+      },
+      {
+        "table": "TeamPpvResolveJob",
+        "name": "TeamPpvResolveJob_retention_old_v8_idx",
+        "unique": false,
+        "keys": "18 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(status = ANY (ARRAY['resolved'::text, 'expired'::text, 'rejected'::text]))"
+      },
+      {
+        "table": "TeamPpvResolveJob",
+        "name": "TeamPpvResolveJob_retention_pending_v8_idx",
+        "unique": false,
+        "keys": "13 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(status = 'pending'::text)"
+      },
+      {
+        "table": "TeamTipLedger",
+        "name": "TeamTipLedger_retention_compact_v8_idx",
+        "unique": false,
+        "keys": "13 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "((\"compactedAt\" IS NULL) AND (\"historicalFactVersion\" = 'team_money_fact_v2'::text) AND (\"historicalFactProjectedAt\" IS NOT NULL))"
       }
     ]
   }

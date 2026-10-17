@@ -92,7 +92,7 @@ test("A34 recurring creator planning is durable, bounded, fair and timer-visible
   assert.equal(lane.module, './job-scheduler'); assert.equal(lane.method, 'runRecurringCreatorWork');
   assert.match(scheduler, /resolveMaintenanceLanes/);
   assert.match(scheduler, /runRecurringSweep\(\)[\s\S]*\.then\(handleRecurringSweepTickResult\)/);
-  assert.match(scheduler, /sweep resolved degraded/);
+  assert.match(scheduler, /sweep completed with errors/);
   assert.match(scheduler, /getRecurringSchedulerHealthSnapshot/);
 });
 
@@ -151,7 +151,7 @@ test("A34 resolved degradation updates scheduler health instead of disappearing 
     assert.equal(health.status, "DEGRADED");
     assert.equal(health.lastReason, "likes_failed");
     assert.ok(health.consecutiveDegraded >= 1);
-    assert.ok(lines.some((line) => line.includes("sweep resolved degraded")));
+    assert.ok(lines.some((line) => line.includes("sweep completed with errors")));
   } finally {
     console.error = original;
   }

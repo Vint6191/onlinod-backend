@@ -167,7 +167,7 @@ test("retention coordinator is durable, fail-closed and uses one DB-authority cu
   assert.match(source, /RETENTION_COORDINATION_SCHEMA_UNAVAILABLE/);
   assert.match(source, /reason: "coordination_failed"/);
   assert.match(source, /db_lease_failed_closed/);
-  assert.match(source, /Promise\.allSettled/);
+  assert.match(source, /settleRetentionLanes\(lanes, laneOptions\)/);
   assert.match(source, /renewRetentionSweepLease/);
   assert.match(source, /const authorityNow = lease\?\.startedAt instanceof Date \? lease\.startedAt : sweepNow\(options\)/);
   assert.match(source, /const laneOptions = \{ \.\.\.options, authorityNow, retentionOwnerToken: lease\?\.acquired \? lease.ownerToken : null \}/);

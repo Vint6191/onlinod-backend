@@ -290,21 +290,11 @@ async function applyLedgerSideEffects(row, db = prisma) {
 }
 
 async function expirePendingJobs({ agencyId = null, now = new Date(), limit = 500, db = prisma } = {}) {
-  const safeLimit = Math.max(1, Math.min(2000, Math.floor(Number(limit) || 500)));
-  const where = {
-    status: "pending",
-    expiresAt: { lt: now instanceof Date ? now : new Date(now) },
-    ...(agencyId ? { agencyId } : {}),
-  };
-  const rows = await db.teamPpvResolveJob.findMany({
-    where, select: { id: true }, orderBy: [{ expiresAt: "asc" }, { id: "asc" }], take: safeLimit,
+  const authorityNow = now instanceof Date ? now : new Date(now);
+  const result = await require("./team-ledger-retention-service").runTeamLedgerRetentionPage({
+    db, kind: "expireJobs", cutoff: authorityNow, now: authorityNow, limit, agencyId,
   });
-  if (!rows.length) return { count: 0, hasMore: false };
-  const result = await db.teamPpvResolveJob.updateMany({
-    where: { id: { in: rows.map((row) => row.id) }, status: "pending" },
-    data: { status: "expired" },
-  });
-  return { count: Number(result?.count || 0), hasMore: rows.length >= safeLimit };
+  return { count: result.expired, hasMore: result.hasMore };
 }
 
 async function createResolverActivityEvent(tx, { agencyId, deviceId, job, memberId, item }) {
@@ -851,53 +841,18 @@ async function resolvePpvConflict({ agencyId, jobId, memberId, actorMemberId = n
 
 async function gcTeamLedgers({ olderThanMs = RAW_LEDGER_RETENTION_MS, now = new Date(), limit = 500, db = prisma } = {}) {
   const authorityNow = now instanceof Date ? now : new Date(now);
-  const expired = await expirePendingJobs({ now: authorityNow, limit, db });
   const before = new Date(authorityNow.getTime() - olderThanMs);
-  const safeLimit = Math.max(1, Math.min(2000, Math.floor(Number(limit) || 500)));
-
-  // R15/R6: Team retention is a finite work unit. Preserve compact authority
-  // roots and only mutate ids selected by a bounded keyset/range query.
-  const [sentRows, purchaseRows, resolveRows] = await Promise.all([
-    db.teamSentMessageLedger.findMany({
-      where: { sentAt: { lt: before }, compactedAt: null },
-      select: { id: true }, orderBy: [{ sentAt: "asc" }, { id: "asc" }], take: safeLimit,
-    }),
-    db.teamPpvPurchaseLedger.findMany({
-      where: {
-        purchasedAt: { lt: before },
-        status: { in: ["resolved", "expired", "attributed", "unresolved", "rejected", "creator_revenue"] },
-        historicalFactVersion: "team_money_fact_v2", historicalFactProjectedAt: { not: null }, compactedAt: null,
-      },
-      select: { id: true }, orderBy: [{ purchasedAt: "asc" }, { id: "asc" }], take: safeLimit,
-    }),
-    db.teamPpvResolveJob.findMany({
-      where: {
-        OR: [{ expiresAt: { lt: authorityNow } }, { createdAt: { lt: before } }],
-        status: { in: ["resolved", "expired", "rejected"] },
-      },
-      select: { id: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }], take: safeLimit,
-    }),
-  ]);
-
-  const [sent, purchases, resolveJobs] = await Promise.all([
-    sentRows.length ? db.teamSentMessageLedger.updateMany({
-      where: { id: { in: sentRows.map((row) => row.id) } },
-      data: { mediaIds: null, compactedAt: authorityNow, rootVersion: "team_sent_root_v2" },
-    }) : Promise.resolve({ count: 0 }),
-    purchaseRows.length ? db.teamPpvPurchaseLedger.updateMany({
-      where: { id: { in: purchaseRows.map((row) => row.id) } },
-      data: { compactedAt: authorityNow, rootVersion: "team_money_root_v2" },
-    }) : Promise.resolve({ count: 0 }),
-    resolveRows.length ? db.teamPpvResolveJob.deleteMany({ where: { id: { in: resolveRows.map((row) => row.id) } } }) : Promise.resolve({ count: 0 }),
-  ]);
-
+  const { runTeamLedgerRetentionPage } = require("./team-ledger-retention-service");
+  const pages = {};
+  for (const kind of ["expireJobs", "sent", "purchases", "expiredJobs", "oldJobs"]) {
+    pages[kind] = await runTeamLedgerRetentionPage({ db, kind, now: authorityNow, limit,
+      cutoff: ["expireJobs", "expiredJobs"].includes(kind) ? authorityNow : before });
+  }
   return {
-    sentMessageLedger: 0,
-    sentMessageLedgerCompacted: sent?.count || 0,
-    ppvPurchaseLedger: 0,
-    ppvPurchaseLedgerCompacted: purchases?.count || 0,
-    ppvResolveJob: resolveJobs?.count || 0,
-    hasMore: Boolean(expired?.hasMore) || sentRows.length >= safeLimit || purchaseRows.length >= safeLimit || resolveRows.length >= safeLimit,
+    sentMessageLedger: 0, sentMessageLedgerCompacted: pages.sent.compacted,
+    ppvPurchaseLedger: 0, ppvPurchaseLedgerCompacted: pages.purchases.compacted,
+    ppvResolveJob: pages.expiredJobs.deleted + pages.oldJobs.deleted,
+    hasMore: Object.values(pages).some(page => page.hasMore),
   };
 }
 

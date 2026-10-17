@@ -20,9 +20,17 @@ test("parallel work contexts cannot borrow another pass's owner token",async()=>
  const makeDb=owner=>({$queryRawUnsafe:async sql=>sql.includes("clock_timestamp")?[{authorityNow:new Date()}]:[{ownerToken:owner,leaseUntil:new Date(Date.now()+60000),completedAt:null}]});
  const result=await Promise.allSettled([withRetentionWork("one",()=>runRetentionMutation(async()=>1,withTransactionClient(makeDb("one")))),withRetentionWork("two",()=>runRetentionMutation(async()=>2,withTransactionClient(makeDb("one"))))]);assert.equal(result[0].status,"fulfilled");assert.equal(result[1].status,"rejected");
 });
-test("tip compaction stops revisiting compacted rows and advances across pages",async()=>{
- const rows=[{id:"a",compactedAt:null},{id:"b",compactedAt:null}];const db={teamTipLedger:{findMany:async input=>{assert.equal(input.where.compactedAt,null);return rows.filter(x=>!x.compactedAt).slice(0,input.take);},updateMany:async input=>{assert.equal(input.where.compactedAt,null);let count=0;for(const row of rows)if(input.where.id.in.includes(row.id)&&!row.compactedAt){row.compactedAt=new Date();count++;}return {count};}}};
- assert.equal((await purgeExpiredTipLedger({db,limit:1})).compacted,1);assert.equal((await purgeExpiredTipLedger({db,limit:1})).compacted,1);const last=await purgeExpiredTipLedger({db,limit:1});assert.equal(last.matched,0);assert.equal(last.hasMore,false);
+test("tip maintenance uses one bounded SQL unit and preserves the agency/time scope",async()=>{
+ const queries=[];const db=withTransactionClient({$queryRawUnsafe:async(sql,...args)=>{
+  queries.push({sql,args});return [{matched:2,picked:2,affected:2}];
+ }});
+ const now=new Date("2026-10-17T12:00:00Z");
+ const result=await purgeExpiredTipLedger({db,agencyId:"agency-a",retentionDays:180,now,limit:20000});
+ assert.equal(result.compacted,2);assert.equal(result.hasMore,false);assert.equal(queries.length,1);
+ assert.equal(queries[0].args[1],500);assert.equal(queries[0].args[3],"agency-a");
+ assert.equal(+queries[0].args[0],+now-180*86400000);
+ assert.match(queries[0].sql,/FOR UPDATE OF l SKIP LOCKED/);
+ assert.doesNotMatch(queries[0].sql,/DELETE FROM "TeamTipLedger"/);
 });
 
 test("lease renewal samples authority time after a contended row lock",async()=>{

@@ -147,6 +147,8 @@ function retentionBreakdown(result, laneNames) {
     const items = Array.isArray(lane.items) ? lane.items : [];
     out[name] = {
       totalDeleted: Number(lane.totalDeleted || 0),
+      totalCompacted: Number(lane.totalCompacted || 0),
+      compactedItems: Object.fromEntries(items.filter(item => item?.compacted).map(item => [item.label, Number(item.compacted)])),
       items: Object.fromEntries(items
         .map((item) => [String(item?.label || "unknown"), Number(item?.deleted || 0)])),
       hasMore: lane?.hasMore === true,
@@ -181,16 +183,16 @@ async function maybeRunRetentionSweep({ now = new Date(), force = false } = {}) 
       .join(", ");
     const breakdown = JSON.stringify(retentionBreakdown(result, laneNames));
     if (result?.ok === false) {
-      console.warn(`[scheduler] retention sweep partial/failed in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}; remainingWork=${result?.remainingWork === true}; ${laneSummary}; errors=${JSON.stringify(result.laneErrors || result.coordinationError || [])}; breakdown=${breakdown}`);
+      console.warn(`[scheduler] retention sweep partial/failed in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}; compacted=${result.totalCompacted || 0}; remainingWork=${result?.remainingWork === true}; ${laneSummary}; errors=${JSON.stringify(result.laneErrors || result.coordinationError || [])}; breakdown=${breakdown}`);
     } else if (result?.skipped) {
       console.log(`[scheduler] retention sweep skipped in ${Date.now() - startedAt}ms — reason=${result.reason || "unknown"}`);
     } else {
-      console.log(`[scheduler] retention sweep done in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}; remainingWork=${result?.remainingWork === true}; ${laneSummary}; breakdown=${breakdown}`);
+      console.log(`[scheduler] retention sweep done in ${Date.now() - startedAt}ms — deleted=${result.totalDeleted || 0}; compacted=${result.totalCompacted || 0}; remainingWork=${result?.remainingWork === true}; ${laneSummary}; breakdown=${breakdown}`);
     }
     return { ...result, windowMs: retentionWindowMs };
   } catch (err) {
     console.warn("[scheduler] retention sweep failed:", err?.message || err);
-    return { ok: false, error: err?.message || String(err), windowMs: retentionWindowMs };
+    return { ok: false, remainingWork: true, error: err?.message || String(err), windowMs: retentionWindowMs };
   }
 }
 
@@ -2190,7 +2192,7 @@ async function runRecurringSweepInternal() {
       .map((node) => ({
         component,
         path: node.path,
-        reason: String(node.value?.reason || node.value?.code || node.value?.error || "resolved_degradation"),
+        reason: String(node.value?.reason || node.value?.code || node.value?.error || "component_failed"),
       }));
     degradedComponents.push(...failures);
   }
@@ -2303,7 +2305,7 @@ function handleAnalyticsDemandTickResult(result, error = null) {
 
 function handleRecurringSweepTickResult(result) {
   if (result?.ok !== false) return result;
-  console.error(`[scheduler] sweep resolved degraded: ${JSON.stringify({ reason: result.reason, degraded: result.degradedComponents || [] })}`);
+  console.error(`[scheduler] sweep completed with errors: ${JSON.stringify({ reason: result.reason, degraded: result.degradedComponents || [] })}`);
   return result;
 }
 

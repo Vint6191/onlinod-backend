@@ -13,8 +13,7 @@ const { withRetentionWork, guardRetentionTransaction, runRetentionControl, runRe
 const { randomUUID } = require("node:crypto");
 const prisma = require("../prisma");
 const runRetentionMutation = (work, db = prisma) => runRetentionMutationWithDb(work, db);
-const { gcTeamLedgers } = require("./team-ppv-ledger-service");
-const { purgeExpiredTipLedger } = require("./team-tip-ledger-service");
+const { runTeamLedgerRetentionPage } = require("./team-ledger-retention-service");
 const { compactAutomationDeliveries } = require("./automation-history-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { lockRetentionCommit } = require("./retention-commit-guard-service");
@@ -624,30 +623,25 @@ async function deleteDeadTrafficSourceMembers() {
 async function runTeamLedgerRetentionSweep(options = {}) {
   const authorityNow = sweepNow(options);
   const cfg = await resolveSweepConfig(options);
-  const [result, tipResult] = await Promise.all([
-    runRetentionMutation(tx => gcTeamLedgers({
-      db: tx,
-      now: authorityNow,
-      olderThanMs: cfg.teamMoneyRawDetailDays * DAY_MS,
-      limit: cfg.batchSize,
-    })),
-    runRetentionMutation(tx => purgeExpiredTipLedger({
-      db: tx,
-      retentionDays: cfg.teamMoneyRawDetailDays,
-      limit: cfg.batchSize,
-      dryRun: false,
-      now: authorityNow,
-    })),
-  ]);
-  const items = [
-    { label: "teamSentMessageLedger", deleted: Number(result?.sentMessageLedger || 0) },
-    { label: "teamSentMessageLedger.compacted", deleted: 0, compacted: Number(result?.sentMessageLedgerCompacted || 0), hasMore: Boolean(result?.hasMore) },
-    { label: "teamPpvPurchaseLedger", deleted: Number(result?.ppvPurchaseLedger || 0) },
-    { label: "teamPpvPurchaseLedger.compacted", deleted: 0, compacted: Number(result?.ppvPurchaseLedgerCompacted || 0) },
-    { label: "teamPpvResolveJob", deleted: Number(result?.ppvResolveJob || 0) },
-    { label: "teamTipLedger", deleted: Number(tipResult?.deleted || 0), compacted: Number(tipResult?.compacted || 0), hasMore: Boolean(tipResult?.hasMore) },
-  ];
-  return summarizeSweep("teamLedgers", items);
+  const before = daysAgo(cfg.teamMoneyRawDetailDays, authorityNow);
+  const items = [];
+  const errors = [];
+  // Each table/page commits separately. A failed page cannot erase an earlier
+  // committed count, and one busy ledger cannot prevent another from advancing.
+  for (const kind of ["expireJobs", "sent", "purchases", "tips", "expiredJobs", "oldJobs"]) {
+    try {
+      items.push(await runTeamLedgerRetentionPage({
+        db: options.db || prisma, kind, now: authorityNow, limit: cfg.batchSize,
+        cutoff: ["expireJobs", "expiredJobs"].includes(kind) ? authorityNow : before,
+      }));
+    } catch (error) {
+      const message = String(error?.message || error);
+      errors.push({ page: kind, error: message });
+      items.push({ label: `teamLedgers.${kind}`, ok: false, deleted: 0, compacted: 0, hasMore: true, error: message });
+    }
+  }
+  return { ...summarizeSweep("teamLedgers", items), ok: errors.length === 0, errors,
+    ...(errors.length ? { reason: "TEAM_LEDGER_RETENTION_PARTIAL", error: errors.map(x => `${x.page}: ${x.error}`).join("; ") } : {}) };
 }
 
 async function runAutomationRetentionSweep(options = {}) {
@@ -1085,7 +1079,7 @@ async function runRetentionSweep(options = {}) {
     } catch (error) {
       // Destructive GC fails closed when its cluster coordinator is unavailable.
       return {
-        ok: false, skipped: true, reason: "coordination_failed", coordinationError: String(error?.message || error),
+        ok: false, skipped: true, reason: "coordination_failed", coordinationError: String(error?.message || error), remainingWork: true,
         elapsedMs: Date.now() - startedAt, totalDeleted: 0, lock: "db_lease_failed_closed",
       };
     }
@@ -1140,34 +1134,15 @@ async function runRetentionSweep(options = {}) {
     const policy = options.policySettings ? { ok: true, settings: options.policySettings } : await getRetentionSettings();
     if (!policy.ok) throw Object.assign(new Error("Retention policy unavailable"), { code: "RETENTION_POLICY_UNAVAILABLE" });
     laneOptions.policySettings = policy.settings;
-    const settled = await withRetentionWork(laneOptions.retentionOwnerToken, () => Promise.allSettled(lanes.map(([, run]) => run(laneOptions))), options.actorGuard || null);
-    const laneErrors = [];
-    const laneResults = {};
-    let totalDeleted = 0;
-    settled.forEach((entry, index) => {
-      const [name] = lanes[index];
-      if (entry.status === "fulfilled") {
-        laneResults[name] = entry.value;
-        totalDeleted += Number(entry.value?.totalDeleted || 0);
-      } else {
-        const message = String(entry.reason?.message || entry.reason || "retention lane failed");
-        laneResults[name] = { label: name, ok: false, totalDeleted: 0, error: message };
-        laneErrors.push({ lane: name, error: message });
-      }
-    });
-    const remainingWork = Object.values(laneResults).some((lane) => lane?.hasMore === true);
+    const settled = await withRetentionWork(laneOptions.retentionOwnerToken, () => settleRetentionLanes(lanes, laneOptions), options.actorGuard || null);
     report = {
-      ok: laneErrors.length === 0,
-      partial: laneErrors.length > 0 && laneErrors.length < lanes.length,
-      remainingWork,
+      ...collectRetentionResults(lanes, settled),
       elapsedMs: Date.now() - startedAt,
-      totalDeleted,
-      ...laneResults,
-      laneErrors,
       lock: useCoordination ? "db_lease" : "disabled",
     };
     if (heartbeatError) {
       report.ok = false;
+      report.remainingWork = true;
       report.coordinationHeartbeatError = String(heartbeatError?.message || heartbeatError);
     }
     return report;
@@ -1182,12 +1157,14 @@ async function runRetentionSweep(options = {}) {
         const finalized = await finalizeRetentionSweepLease({ db: prisma, ownerToken: lease.ownerToken, outcome, error: thrown || (report?.laneErrors?.length ? JSON.stringify(report.laneErrors) : null), onFinalize: options.onFinalize ? (tx, now) => options.onFinalize(tx, now, report, thrown) : null });
         if (finalized !== true && report) {
           report.ok = false;
+          report.remainingWork = true;
           report.coordinationFinalizeError = "RETENTION_COORDINATION_OWNERSHIP_LOST";
         }
       } catch (finalizeError) {
         console.warn("[retention] durable lease finalize failed:", finalizeError?.message || finalizeError);
         if (report) {
           report.ok = false;
+          report.remainingWork = true;
           report.coordinationFinalizeError = String(finalizeError?.message || finalizeError);
         }
       }
@@ -1195,14 +1172,60 @@ async function runRetentionSweep(options = {}) {
   }
 }
 
+function collectRetentionResults(lanes, settled) {
+  const laneErrors = [];
+  const laneResults = {};
+  let totalDeleted = 0;
+  let totalCompacted = 0;
+  settled.forEach((entry, index) => {
+    const [name] = lanes[index];
+    if (entry.status === "fulfilled") {
+      laneResults[name] = entry.value;
+      totalDeleted += Number(entry.value?.totalDeleted || 0);
+      totalCompacted += Number(entry.value?.totalCompacted || 0);
+      if (entry.value?.ok === false) {
+        laneResults[name] = { ...entry.value, hasMore: true };
+        laneErrors.push({ lane: name, error: String(entry.value.error || entry.value.reason || "retention lane incomplete") });
+      }
+    } else {
+      const message = String(entry.reason?.message || entry.reason || "retention lane failed");
+      laneResults[name] = { label: name, ok: false, totalDeleted: 0, totalCompacted: 0, hasMore: true, error: message };
+      laneErrors.push({ lane: name, error: message });
+    }
+  });
+  const remainingWork = Object.values(laneResults).some((lane) => lane?.hasMore === true);
+  return { ok: laneErrors.length === 0,
+    partial: laneErrors.length > 0 && laneErrors.length < lanes.length,
+    reason: laneErrors.length ? "RETENTION_LANE_FAILED" : null,
+    remainingWork, totalDeleted, totalCompacted, ...laneResults, laneErrors };
+}
+
 function summarizeSweep(label, items) {
   const totalDeleted = items.reduce((sum, item) => sum + Number(item?.deleted || 0), 0);
   const hasMore = items.some((item) => item?.hasMore === true);
-  return { label, totalDeleted, hasMore, items };
+  const totalCompacted = items.reduce((sum, item) => sum + Number(item?.compacted || 0), 0);
+  return { label, totalDeleted, totalCompacted, hasMore, items };
+}
+
+async function settleRetentionLanes(lanes, options) {
+  const results = new Array(lanes.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= lanes.length) return;
+      try { results[index] = { status: "fulfilled", value: await lanes[index][1](options) }; }
+      catch (reason) { results[index] = { status: "rejected", reason }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(2, lanes.length) }, worker));
+  return results;
 }
 
 module.exports = {
   RETENTION_SETTING_KEY,
+  settleRetentionLanes,
+  collectRetentionResults,
   deleteByIdsInBatches,
   RETENTION_BATCH_BUDGET,
   runRetentionSweep,

@@ -15,7 +15,7 @@ function loadTeamPpvServiceWithDb(db) {
     if (request === "./historical-attribution-target-authority-service") return { resolveHistoricalAttributionTarget: async () => ({}) };
     if (request === "../utils/prisma-transaction") return { serializableTxOptions: () => ({}) };
     if (request === "./team-money-reconciliation-service") return { reconcileMoneyForSentMessageEvidence: async () => ({}) };
-    if (request === "./db-transaction-service") return require(request);
+    if (request === "./db-transaction-service" || request === "./team-ledger-retention-service") return require(request);
     throw new Error(`unexpected require ${request}`);
   };
   vm.runInNewContext(source, { module, exports: module.exports, require: requireStub, console, Date, Set, Map, Math, Number, String, Array, Object, JSON, Promise, Buffer, Error }, { filename: "team-ppv-ledger-service.js" });
@@ -81,46 +81,21 @@ test("bounded v1 baseline enumeration installs dedup identity without incrementi
 
 
 
-test("stable Team money roots are compacted, not deleted by retention", () => {
-  const ppv = fs.readFileSync(path.join(__dirname, "team-ppv-ledger-service.js"), "utf8");
-  const tip = fs.readFileSync(path.join(__dirname, "team-tip-ledger-service.js"), "utf8");
-  assert.match(ppv, /teamPpvPurchaseLedger\.updateMany/);
-  assert.doesNotMatch(ppv, /teamPpvPurchaseLedger\.deleteMany\(\{[\s\S]{0,500}historicalFactVersion/);
-  assert.match(tip, /teamTipLedger\.updateMany/);
-  assert.match(tip, /compactedAt/);
-});
-
-
-test("R15/R6 Team ledger retention preserves compact roots and yields after one bounded unit", async () => {
-  const calls = { sentUpdated: [], purchasesUpdated: [], jobsExpired: [], jobsDeleted: [] };
-  const db = {
-    teamSentMessageLedger: {
-      async findMany({ take }) { return [{ id: "s1" }, { id: "s2" }, { id: "s3" }].slice(0, take); },
-      async updateMany({ where, data }) { calls.sentUpdated.push({ where, data }); return { count: where.id.in.length }; },
-    },
-    teamPpvPurchaseLedger: {
-      async findMany({ take }) { return [{ id: "p1" }, { id: "p2" }, { id: "p3" }].slice(0, take); },
-      async updateMany({ where, data }) { calls.purchasesUpdated.push({ where, data }); return { count: where.id.in.length }; },
-    },
-    teamPpvResolveJob: {
-      async findMany({ where, take }) {
-        if (where.status === "pending") return [{ id: "pending-1" }, { id: "pending-2" }, { id: "pending-3" }].slice(0, take);
-        return [{ id: "done-1" }, { id: "done-2" }, { id: "done-3" }].slice(0, take);
-      },
-      async updateMany({ where, data }) { calls.jobsExpired.push({ where, data }); return { count: where.id.in.length }; },
-      async deleteMany({ where }) { calls.jobsDeleted.push(where); return { count: where.id.in.length }; },
-    },
-  };
-  const { gcTeamLedgers } = loadTeamPpvServiceWithDb(db);
-  const result = await gcTeamLedgers({ db, now: new Date("2026-09-10T00:00:00Z"), olderThanMs: 1, limit: 2 });
-  assert.equal(result.sentMessageLedger, 0, "sent proof roots are compacted, never TTL-deleted");
-  assert.equal(result.sentMessageLedgerCompacted, 2);
-  assert.equal(result.ppvPurchaseLedgerCompacted, 2);
-  assert.equal(result.ppvResolveJob, 2);
-  assert.equal(result.hasMore, true, "full bounded pages must yield with continuation work visible");
-  assert.deepEqual(calls.sentUpdated[0].where.id.in, ["s1", "s2"]);
-  assert.equal(calls.sentUpdated[0].data.mediaIds, null);
-  assert.equal(calls.sentUpdated[0].data.rootVersion, "team_sent_root_v2");
+// Full trigger, preservation, repeat and rollback behavior is exercised by
+// scripts/audit/team-ledger-retention-proof.cjs against the current SQL schema.
+test("Team ledger entrypoint preserves roots and reports each bounded unit",async()=>{
+ const {withTransactionClient}=require("../../scripts/test-support/transaction-client-fixture");
+ const queries=[];
+ const db=withTransactionClient({$queryRawUnsafe:async(sql,...args)=>{
+  queries.push({sql,args});return [{matched:2,picked:2,affected:2}];
+ }});
+ const {gcTeamLedgers}=loadTeamPpvServiceWithDb(db);
+ const result=await gcTeamLedgers({db,now:new Date("2026-10-17T12:00:00Z"),olderThanMs:180*86400000,limit:2});
+ assert.equal(queries.length,5);assert(queries.every(q=>q.args[1]===2));
+ assert.equal(result.sentMessageLedger,0);assert.equal(result.ppvPurchaseLedger,0);
+ assert.equal(result.sentMessageLedgerCompacted,2);assert.equal(result.ppvPurchaseLedgerCompacted,2);
+ assert.equal(result.ppvResolveJob,4);assert.equal(result.hasMore,true);
+ for(const q of queries){assert.match(q.sql,/SKIP LOCKED/);assert.doesNotMatch(q.sql,/DELETE FROM "Team(?:Tip|PpvPurchase|SentMessage)Ledger"/);}
 });
 
 test("retention compacts response/dialog/coverage only behind explicit consumer watermark authority", () => {

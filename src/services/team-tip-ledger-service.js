@@ -1458,38 +1458,10 @@ async function purgeExpiredTipLedger({ agencyId = null, retentionDays = TIP_LEDG
   if (!Number.isFinite(authorityNow.getTime())) throw new Error("TEAM_TIP_RETENTION_AUTHORITY_TIME_INVALID");
   const cutoff = new Date(authorityNow.getTime() - safeRetentionDays * 24 * 60 * 60 * 1000);
 
-  const where = {
-    receivedAt: { lt: cutoff },
-    compactedAt: null,
-    historicalFactVersion: "team_money_fact_v2",
-    historicalFactProjectedAt: { not: null },
-    ...(cleanAgency ? { agencyId: cleanAgency } : {}),
-  };
-
-  const rows = await db.teamTipLedger.findMany({
-    where,
-    select: { id: true },
-    orderBy: { receivedAt: "asc" },
-    take: safeLimit,
+  const page = await require("./team-ledger-retention-service").runTeamLedgerRetentionPage({
+    db, kind: "tips", cutoff, now: authorityNow, limit: safeLimit, agencyId: cleanAgency, dryRun,
   });
-
-  if (dryRun || rows.length === 0) {
-    return { ok: true, deleted: dryRun ? 0 : rows.length, matched: rows.length, hasMore: rows.length >= safeLimit, retentionDays: safeRetentionDays, cutoff, dryRun: Boolean(dryRun) };
-  }
-
-  const result = await db.teamTipLedger.updateMany({
-    where: { ...where, id: { in: rows.map((row) => row.id) } },
-    // Keep the stable attribution/manual-decision root. Only discard rebuildable
-    // candidate/result detail after the retention horizon; history remains durable.
-    data: {
-      candidates: null,
-      weakCandidates: null,
-      result: null,
-      compactedAt: authorityNow,
-      rootVersion: "team_money_root_v2",
-    },
-  });
-  return { ok: true, deleted: 0, compacted: result.count, matched: rows.length, hasMore: rows.length >= safeLimit, retentionDays: safeRetentionDays, cutoff, dryRun: false };
+  return { ...page, retentionDays: safeRetentionDays, cutoff };
 }
 
 module.exports = {

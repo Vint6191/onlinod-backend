@@ -28,17 +28,18 @@ test("retention is fail-closed on projection proof and owns Team raw horizons ce
   const ppv = read("src/services/team-ppv-ledger-service.js");
   const tip = read("src/services/team-tip-ledger-service.js");
   const claims = read("src/routes/team-claims.js");
+  const pages = read("src/services/team-ledger-retention-service.js");
 
   assert.match(retention, /teamCanonicalDetailDays/);
   assert.match(retention, /teamMoneyRawDetailDays/);
   assert.match(retention, /historicalProjectionVersion:\s*"team_activity_contribution_v2"/);
   assert.doesNotMatch(retention, /historicalProjectionVersion:\s*"team_activity_daily_v1"/);
-  assert.match(retention, /purgeExpiredTipLedger/);
+  assert.match(retention, /runTeamLedgerRetentionPage/);
   assert.match(retention, /now:\s*authorityNow/);
-  assert.match(ppv, /historicalFactVersion:\s*"team_money_fact_v2"/);
-  assert.match(ppv, /teamPpvPurchaseLedger\.updateMany/);
-  assert.match(tip, /historicalFactVersion:\s*"team_money_fact_v2"/);
-  assert.match(tip, /teamTipLedger\.updateMany/);
+  assert.match(ppv, /runTeamLedgerRetentionPage/);
+  assert.match(tip, /runTeamLedgerRetentionPage/);
+  assert.equal((pages.match(/l\."historicalFactVersion"='team_money_fact_v2' AND l\."historicalFactProjectedAt" IS NOT NULL/g) || []).length, 2);
+  assert.match(pages, /FOR UPDATE OF l SKIP LOCKED/);
   assert.match(claims, /getRetentionSettings\(\)/);
   assert.match(claims, /dbAuthorityNow\(\{ db: prisma \}\)/);
   assert.match(claims, /now:\s*retentionAuthorityNow/);
