@@ -18,7 +18,7 @@ exports.runAnalytics = async function runAnalytics(f) {
     accessRuntime: { currentAuthorityProof: () => ({ accessEpoch: 1, creatorCatalogGeneration: 1 }), allowedCreatorIdsSnapshot: () => creatorIds } });
   const publishAuthority = () => authority.publish({ accessEpoch: 1, creatorCatalogGeneration: 1, role: "OWNER", roleKey: "owner", effectivePermissions: permissions,
     allowedCreatorIds: creatorIds, observedAt: Date.now(), observedAtMono: performance.now(),
-    billing: { version: 1, validForMs: 90000, creators: creatorIds.map(creatorId => ({ creatorId, allowed: true, validForMs: 90000, reason: "TRIAL" })) } });
+    billing: { version: 1, validForMs: 90000, creators: creatorIds.map(creatorId => ({ creatorId, allowed: true, validForMs: 90000, reason: "TRIAL" })) } }, "billing authority refresh", { renewUnchanged: true });
   publishAuthority();
   let loseCostReply = false, heldTraffic = null;
   const serviceApi = { ...api, deviceId, request: async (url, options) => {
@@ -134,7 +134,29 @@ exports.runAnalytics = async function runAnalytics(f) {
   };
   const overview = () => analytics.getOverview({ creatorId: c, rangeKey: "7d", force: true });
   const traffic = (extra = {}) => analytics.getTraffic({ creatorId: c, rangeKey: "30d", force: true, ...extra });
+  const observeTrafficProgress = phase => {
+    const traceSource = fs.readFileSync(path.join(output, "traffic-projection-trace.jsonl"), "utf8");
+    const trace = traceSource.slice(0, traceSource.lastIndexOf("\n")).split("\n")
+      .filter(Boolean).map(line => JSON.parse(line));
+    const last = trace.filter(row => row.phase === "END").at(-1);
+    (results.trafficProgress ||= {})[phase] = last && { tick: last.tick, outstanding: last.after.length,
+      noProgressForMs: last.noProgressForMs, unchangedTicks: last.unchangedTicks };
+    assert(!last || !last.after.length || last.noProgressForMs < 180000 || last.unchangedTicks < 3,
+      "Traffic claims repeated for three minutes without committed cursor/revision/outstanding progress");
+  };
   let renewal, server, browser, page;
+  let screenshotsAvailable = true;
+  const captureScreenshot = async options => {
+    if (!page || !screenshotsAvailable) return;
+    try {
+      await page.bringToFront();
+      await page.screenshot({ ...options, animations: "disabled", timeout: 45000 });
+    } catch (error) {
+      screenshotsAvailable = false;
+      (results.screenshotErrors ||= []).push({ file: path.basename(options.path), message: error.message });
+      console.warn("ANALYTICS_OPTIONAL_SCREENSHOT_FAILURE", error.message);
+    }
+  };
   try {
     renewal = setInterval(publishAuthority, 30000);
     const creators = (await creatorService.list()).creators;
@@ -157,7 +179,8 @@ export async function refresh(){await client.invalidateQueries();}`);
       res.end(file ? fs.readFileSync(file) : '<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/app.css"></head><body><div id="root"></div><script src="/app.js"></script></body></html>');
     });
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-    const chromium = runtime("@sparticuz/chromium");
+    const chromiumModule = runtime("@sparticuz/chromium");
+    const chromium = chromiumModule.default || chromiumModule;
     browser = await runtime("playwright").chromium.launch({ executablePath: process.env.ONLINOD_CHROMIUM_PATH || await chromium.executablePath(), args: chromium.args, headless: true });
     page = await browser.newPage({ viewport: { width: 1536, height: 1050 } });
     page.on("pageerror", error => errors.push(error.message));
@@ -187,21 +210,29 @@ export async function refresh(){await client.invalidateQueries();}`);
       await table.getByText(name, { exact: true }).waitFor();
     };
     results.emptyHome = await home.getSummary({ rangeKey: "7d" }); assert.equal(results.emptyHome.revenue.totalCents, null);
-    await page.screenshot({ path: path.join(output, "home-empty.png"), fullPage: true });
+    await captureScreenshot({ path: path.join(output, "home-empty.png"), fullPage: true, animations: "disabled", timeout: 45000 });
     pass("Empty current Home and actual creator bootstrap preserve unknown earnings");
     await app("Analytics");
     await until(async () => await page.locator('.co-finance-summary .co-metric-card').first().locator('strong').textContent() === '—', 'Unknown overview became zero');
-    await page.screenshot({ path: path.join(output, "overview-empty.png"), fullPage: true });
+    await captureScreenshot({ path: path.join(output, "overview-empty.png"), fullPage: true, animations: "disabled", timeout: 45000 });
     await app("Home");
     await home.refresh({ rangeKey: "7d" }); coordinator.start(); worker.start();
     await until(async () => { results.home = await home.getSummary({ rangeKey: "7d" }); return results.home.revenue.coverage.reportingCreators === 2; }, "Home collection did not publish both creators", 300000);
-    assert.equal(results.home.revenue.totalCents, 3600); results.homeCreators = await home.getCreators({ rangeKey: "7d" });
+    assert.equal(results.home.revenue.totalCents, 3600);
+    // Summary and creator-page reads have independent ten-second caches. Wait
+    // for the actual page to observe publication instead of requiring two
+    // independently requested snapshots to become current at the same instant.
+    await until(async () => {
+      results.homeCreators = await home.getCreators({ rangeKey: "7d" });
+      return results.homeCreators.creators.find(row => row.id === c)?.revenueCents === 3600
+        && results.homeCreators.creators.find(row => row.id !== c)?.revenueCents === 0;
+    }, "Home creator page did not observe both exact published amounts", 30000);
     assert.equal(results.homeCreators.creators.find(row => row.id === c).revenueCents, 3600);
     assert.equal(results.homeCreators.creators.find(row => row.id !== c).revenueCents, 0);
     await page.evaluate(() => window.ActualAnalytics.refresh()); await page.locator(".hq-metric.primary .hq-metric-value").getByText("$36", { exact: true }).waitFor({ timeout: 60000 });
     results.homeAxisLabels = await page.locator('.hq-sparkline-axis span').allTextContents();
     assert.equal(results.homeAxisLabels.length, 7); assert(results.homeAxisLabels.every(label => /^\d{2} [A-Z][a-z]{2}$/.test(label)));
-    await page.screenshot({ path: path.join(output, "home-populated.png"), fullPage: true });
+    await captureScreenshot({ path: path.join(output, "home-populated.png"), fullPage: true, animations: "disabled", timeout: 45000 });
     pass("Actual earnings handler -> durable daily coverage -> Home totals and separate creator rows");
 
     await app("Analytics"); await view("DATA SOURCES"); await scanner("FINANCIAL TRANSACTIONS"); await page.getByRole("button", { name: "START MONEY SCAN", exact: true }).click(); worker.wakeAvailableJob();
@@ -209,7 +240,7 @@ export async function refresh(){await client.invalidateQueries();}`);
     assert.equal(results.financial.items.length, 4); results.firstOverview = await overview();
     await until(async () => { results.firstOverview = await overview(); return results.firstOverview.finance.netCents === 3600; }, "Financial publication missing from overview");
     assert.equal(results.firstOverview.finance.refundGrossCents, 2000);
-    await page.screenshot({ path: path.join(output, "financial-collected.png"), fullPage: true });
+    await captureScreenshot({ path: path.join(output, "financial-collected.png"), fullPage: true, animations: "disabled", timeout: 45000 });
     pass("Actual financial worker collects two payout pages and six chart checks; refunds stay separate from net earnings");
 
     await scanner("NOTIFICATIONS"); await page.getByRole("button", { name: "START SCAN", exact: true }).click(); worker.wakeAvailableJob();
@@ -221,7 +252,14 @@ export async function refresh(){await client.invalidateQueries();}`);
     await scanner("CAMPAIGNS"); lostProgress = true;
     await page.getByRole("button", { name: "START SCAN", exact: true }).click(); worker.wakeAvailableJob();
     await until(async () => { results.campaignScan = await analytics.getCampaignScan({ creatorId: c }); return results.campaignScan.collectorStatus === "COMPLETE"; }, "Campaign traversal did not finish", 180000);
-    await until(async () => { results.traffic = await traffic(); return results.traffic.projection.ready && results.traffic.totals.sourceMembers === 52; }, "Traffic projection did not finish", 240000);
+    // This cold 51-source fixture requires the finite backfill stages plus fan
+    // pages across maintenance rotations. Keep a generous absolute deadline,
+    // and independently reject repeated claims without committed progress.
+    await until(async () => {
+      results.traffic = await traffic();
+      observeTrafficProgress("initial");
+      return results.traffic.projection.ready && results.traffic.totals.sourceMembers === 52;
+    }, "Traffic projection did not finish", 600000);
     await until(async () => { results.campaigns = await analytics.getCampaignPage({ creatorId: c, rangeKey: "7d", limit: 100 }); return results.campaigns.projection.ready; }, "Campaign read projection did not finish");
     assert.equal(results.campaigns.totals.memberships, 52); assert.equal(results.campaigns.totals.uniqueFans, 51);
     assert.equal(results.campaigns.totals.netCents, 3600);
@@ -235,7 +273,7 @@ export async function refresh(){await client.invalidateQueries();}`);
     await page.locator('.co-finance-summary .co-metric-card').first().getByText('$36.00', { exact: true }).waitFor();
     await page.locator('.coa-main').filter({ hasText: 'Source 02' }).click();
     await page.locator('.coa-drop').getByText('@fan_21001', { exact: true }).waitFor();
-    await page.screenshot({ path: path.join(output, "campaign-overview.png"), fullPage: true });
+    await captureScreenshot({ path: path.join(output, "campaign-overview.png"), fullPage: true, animations: "disabled", timeout: 45000 });
     pass("Actual Overview and Campaign accordion show published earnings, attributed paying fans and separate unknown lifetime value");
 
     await view("TRAFFIC"); await until(async () => await page.getByRole('button', { name: 'Next sources', exact: true }).isEnabled(), 'Traffic first page did not load');
@@ -247,7 +285,7 @@ export async function refresh(){await client.invalidateQueries();}`);
     await page.getByRole("button", { name: "Next fans", exact: true }).click();
     await page.getByText("fan_21051", { exact: false }).last().waitFor(); await page.getByText("Not available yet", { exact: true }).waitFor();
     await page.getByRole("button", { name: "Previous fans", exact: true }).click();
-    await page.screenshot({ path: path.join(output, "traffic-members.png"), fullPage: true });
+    await captureScreenshot({ path: path.join(output, "traffic-members.png"), fullPage: true, animations: "disabled", timeout: 45000 });
     pass("Actual Traffic UI source/member pagination, shared-fan totals and explicit unknown spend");
 
     await page.getByRole("button", { name: "Edit cost for Source 01", exact: true }).click();
@@ -257,7 +295,7 @@ export async function refresh(){await client.invalidateQueries();}`);
     assert.equal(results.cost.costRevision, 1);
     await page.getByRole('form', { name: 'Cost for Source 01', exact: true }).waitFor({ state: 'hidden' });
     await page.getByRole('table', { name: 'Traffic sources' }).locator('tr').filter({ hasText: 'Source 01' }).getByText('$25.50', { exact: true }).waitFor();
-    await page.screenshot({ path: path.join(output, "traffic-cost.png"), fullPage: true });
+    await captureScreenshot({ path: path.join(output, "traffic-cost.png"), fullPage: true, animations: "disabled", timeout: 45000 });
     pass("Actual cost editor -> durable command -> revision checked server commit -> refreshed Traffic UI");
 
     await page.getByRole("button", { name: "Edit cost for Source 01", exact: true }).click();
@@ -299,12 +337,15 @@ export async function refresh(){await client.invalidateQueries();}`);
     assert.equal(results.correctedOverview.finance.refundGrossCents, 0);
     results.correctedScan = await analytics.getFinancialTransactionScan({ creatorId: c }); assert.equal(results.correctedScan.items.length, 4);
     await page.locator('.co-finance-summary .co-metric-card').first().getByText('$52.00', { exact: true }).waitFor({ timeout: 45000 });
-    await page.screenshot({ path: path.join(output, 'overview-corrected.png'), fullPage: true });
+    await captureScreenshot({ path: path.join(output, 'overview-corrected.png'), fullPage: true, animations: "disabled", timeout: 45000 });
     pass("Provider correction of an existing refund updates the actual Overview automatically: four transactions, net $52, no duplicated fact");
     await view("TRAFFIC");
     campaignGeneration = 2; campaigns[0].name = "Source 01 refreshed";
     await page.getByRole("button", { name: "Update sources", exact: true }).click(); worker.wakeAvailableJob();
-    await until(async () => { results.rescan = await traffic(); return results.rescan.projection.ready && results.rescan.sources.some(row => row.name === "Source 01 refreshed"); }, "Traffic refresh did not publish", 180000);
+    await until(async () => {
+      results.rescan = await traffic(); observeTrafficProgress("rescan");
+      return results.rescan.projection.ready && results.rescan.sources.some(row => row.name === "Source 01 refreshed");
+    }, "Traffic refresh did not publish", 600000);
     assert.equal(results.rescan.sources.find(row => row.name === "Source 01 refreshed").costCents, 2675);
     assert.equal(results.rescan.sources.find(row => row.name === "Source 01 refreshed").currency, "EUR");
     assert.equal(results.rescan.totals.sourceMembers, 52); assert.equal(results.rescan.totals.fanValueCents, 17000);
@@ -315,11 +356,12 @@ export async function refresh(){await client.invalidateQueries();}`);
     await page.getByRole("button", { name: "Reload saved data", exact: true }).click();
     await showTrafficSource('Source 01 refreshed');
     await page.getByRole('table', { name: 'Traffic sources' }).locator('tr').filter({ hasText: 'Source 01 refreshed' }).getByText('€26.75', { exact: true }).waitFor();
-    await page.screenshot({ path: path.join(output, "traffic-recovered.png"), fullPage: true });
+    await captureScreenshot({ path: path.join(output, "traffic-recovered.png"), fullPage: true, animations: "disabled", timeout: 45000 });
     assert.deepEqual(errors, []);
     pass("Repeat provider collection preserves manual cost and exact totals; SQLite reopen and Backend SIGKILL retain the populated UI");
     results.browserVersion = await browser.version();
   } catch (error) {
+    console.error("ANALYTICS_WORKFLOW_FAILURE", error?.stack || error);
     await worker.stop();
     results.failureState = await f.withDatabase(async db => ({
       coverage: await db.analyticsCoverage.findMany({ where: { agencyId, dataType: 'EARNINGS' } }),
@@ -333,7 +375,7 @@ export async function refresh(){await client.invalidateQueries();}`);
     clearInterval(renewal); await worker.stop(); await coordinator.destroy(); analytics.destroy();
     results.renderer = { calls, errors, requests }; results.provider = { calls: providerCalls, campaignDirectoryReads: [...providerReads], externalWrites: 0 };
     fs.writeFileSync(path.join(output, "worker-log.json"), JSON.stringify(logs, null, 2));
-    await page?.screenshot({ path: path.join(output, "last-screen.png"), fullPage: true }).catch(() => {});
+    await captureScreenshot({ path: path.join(output, "last-screen.png"), fullPage: true });
     await browser?.close(); if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
     globalThis.fetch = nativeFetch;
   }

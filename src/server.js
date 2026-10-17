@@ -4,7 +4,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
+const { createApiTrafficLimiter } = require("./middleware/api-traffic-limiter");
 const path = require("node:path");
 
 const authRoutes = require("./routes/auth");
@@ -120,14 +120,7 @@ app.use(
   })
 );
 
-const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: Number(process.env.API_RATE_LIMIT_PER_MIN || 1000),
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-app.use("/api", apiLimiter);
+app.use("/api", createApiTrafficLimiter());
 app.use(["/api/auth/login", "/api/admin-auth/login", "/api/web/auth/login"], express.json({ limit: "16kb" }));
 
 app.use("/api/management/commands", express.json({ limit: "4400kb" }));
@@ -247,6 +240,7 @@ app.use("/api/automation", authRequired, productBilling, automationControlRoutes
 // Narrow post-commit capability settlement must remain usable after logout or
 // member retirement; it cannot mint new external work.
 app.use("/api/programmatic-of-write-settlement", programmaticOfWriteSettlementRoutes);
+app.use("/api/telegram-delivery-settlement", require("./routes/telegram-delivery-settlement"));
 app.use("/api/programmatic-of-writes", authRequired, programmaticOfWriteRoutes);
 app.use("/api/server/content", authRequired, productBilling, contentStoreRoutes);
 app.use("/api/server/crm", authRequired, legacyCrmRoutes);

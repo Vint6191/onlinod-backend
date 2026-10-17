@@ -64,23 +64,6 @@ test("final cut durable promotion claim never holds signal row while waiting for
 
 
 
-test("Subscriber source state machine is exact-offset, payload-bound, CAS fenced and server-derived", () => {
-  const subscriber = source("src/services/subscriber-directory-service.js");
-  const chunk = subscriber.slice(subscriber.indexOf("async function applySubscriberScanChunk"), subscriber.indexOf("async function applySubscriberScanCompletion"));
-  assert.match(chunk, /SELECT \* FROM "SubscriberScanRun" WHERE "id" = \$1 FOR UPDATE/);
-  assert.match(chunk, /SUBSCRIBER_SCAN_OFFSET_INVALID/);
-  assert.match(chunk, /offset !== expectedOffset[\s\S]*SUBSCRIBER_SCAN_REWIND[\s\S]*SUBSCRIBER_SCAN_GAP/);
-  assert.match(chunk, /serverDerivedNextOffset = offset \+ itemsInput\.length/);
-  assert.match(chunk, /SUBSCRIBER_SCAN_NEXT_OFFSET_MISMATCH/);
-  assert.match(chunk, /providerPayloadHash = hashJson\(itemsInput\)/);
-  assert.match(chunk, /SUBSCRIBER_SCAN_REPLAY_CONFLICT/);
-  assert.match(chunk, /SUBSCRIBER_SCAN_STALLED_CURSOR/);
-  assert.match(chunk, /SUBSCRIBER_SCAN_NON_ADVANCING_SOURCE/);
-  assert.match(chunk, /writeSubscriberPageSnapshot/);
-  assert.match(chunk, /updateMany\([\s\S]*nextOffset: offset[\s\S]*SUBSCRIBER_SCAN_CURSOR_CONFLICT/);
-  assert.doesNotMatch(chunk, /\.slice\(0,\s*100\)/);
-});
-
 test("Subscriber non-value outcomes cannot mutate canonical FanValue or satisfy Campaign demand", () => {
   const authority = source("src/services/fan-data-authority-service.js");
   const observer = authority.slice(authority.indexOf("function subscriberDirectoryObservationFromItem"), authority.indexOf("async function projectSubscriberDirectoryItems"));

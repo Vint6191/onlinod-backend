@@ -12,7 +12,7 @@ exports.runMedia = async function(f) {
  const authService={ensureSession:async()=>({authenticated:true,session:authStore.readSession()})};
  const permissions=Object.fromEntries(['content.manage_vault','content.manage_message_library','messageLibrary.manage','content.delete_posts','money.view_earnings'].map(k=>[k,true]));
  const authority=new m.DesktopCurrentAuthorizationAuthorityService({log,authStore,accessRuntime:{currentAuthorityProof:()=>({accessEpoch:1,creatorCatalogGeneration:1}),allowedCreatorIdsSnapshot:()=>creatorIds}});
- const publish=()=>authority.publish({accessEpoch:1,creatorCatalogGeneration:1,role:'OWNER',roleKey:'owner',effectivePermissions:permissions,allowedCreatorIds:creatorIds,observedAt:Date.now(),observedAtMono:performance.now(),billing:{version:1,validForMs:90000,creators:creatorIds.map(creatorId=>({creatorId,allowed:true,validForMs:90000,reason:'TRIAL'}))}});publish();
+ const publish=()=>authority.publish({accessEpoch:1,creatorCatalogGeneration:1,role:'OWNER',roleKey:'owner',effectivePermissions:permissions,allowedCreatorIds:creatorIds,observedAt:Date.now(),observedAtMono:performance.now(),billing:{version:1,validForMs:90000,creators:creatorIds.map(creatorId=>({creatorId,allowed:true,validForMs:90000,reason:'TRIAL'}))}},'billing authority refresh',{renewUnchanged:true});publish();
  const coordinator=new m.WorkCoordinatorService({log,databasePath:path.join(scratch,'media-work.sqlite')});
  const capabilities={canRun:()=>({allowed:true}),onChanged:()=>()=>{},get:creatorId=>({api:{readReady:true,writeReady:true},browser:{pageLocalReady:true,materialized:true,presentable:true},identity:{state:'VERIFIED',platformUserId:creatorId===c?'100001':'100002',sessionProofEpoch:1},access:{accessEpoch:1},session:{partition:'persist:acceptance:'+creatorId,sessionEpoch:1,canonicalRevision:1,networkRevision:0,runtimeGeneration:1},realtime:{ready:true,lastInboundFrameAt:new Date().toISOString()}})};
  coordinator.setCapabilityResolver((...args)=>capabilities.canRun(...args));
@@ -122,7 +122,7 @@ export function unmount(){root?.unmount();client.clear();}`);
   await page.getByLabel('Locked text',{exact:true}).check();
   await page.getByRole('button',{name:'Add from Vault',exact:true}).click();
   await until(async()=>await page.locator('[data-mpk-pick]').count()>0,'Universal picker did not load');
-  await page.screenshot({path:path.join(output,'01-library-picker.png')});
+  await page.screenshot({animations:'disabled',timeout:45000,path:path.join(output,'01-library-picker.png')});
   // Continue the same actual interface below.
   await page.locator('[data-mpk-pick]').first().click();
   await page.locator('[data-mpk-pick]').nth(1).click();
@@ -133,7 +133,7 @@ export function unmount(){root?.unmount();client.clear();}`);
   await page.getByText('Saved script',{exact:true}).waitFor();
   const stored=(await library.listScripts({creatorId:c,includeTrash:true})).items[0];
   assert.equal(stored.messages.length,2);assert.equal(stored.messages[0].media.length,2);assert.equal(stored.messages[0].price,12.5);
-  results.script=stored;await page.screenshot({path:path.join(output,'02-library-saved.png')});
+  results.script=stored;await page.screenshot({animations:'disabled',timeout:45000,path:path.join(output,'02-library-saved.png')});
   pass('Actual HQ editor and universal Vault picker save a two-block priced script through Desktop journal and SQL');
   // Real page adapter on a controlled native Vue composer contract. No live OF.
   composerPage=await browserContext.newPage();console.log('READY controlled composer page');
@@ -170,7 +170,7 @@ export function unmount(){root?.unmount();client.clear();}`);
   assert.deepEqual(paid.uploads,{keep:'active-upload'});assert.deepEqual(paid.removed,['keep-removal']);assert.deepEqual(paid.releases,['keep-release']);
   await until(()=>calls.some(row=>row.method==='messageLibrary.recordUsage'),'Confirmed draft usage did not reach Desktop');
   await until(async()=>requests.some(row=>row.path.endsWith('/message-library/usage/v2')&&[200,201].includes(row.status)),'Usage did not reach SQL');
-  results.paidComposer=paid;await sidecarPage.screenshot({path:path.join(output,'03-scripts-composer.png')});
+  results.paidComposer=paid;await sidecarPage.screenshot({animations:'disabled',timeout:45000,path:path.join(output,'03-scripts-composer.png')});
   pass('Real Scripts sidecar -> main provenance and current Vault resolution -> shared native composer, exact paid state and usage');
   const bad=await apply({...stored.messages[0],currency:'EUR'});assert.equal(bad.complete,false);assert.deepEqual(await composerSnapshot(),paid);
   await composerPage.evaluate(()=>{window.failFree=true;});
@@ -218,7 +218,7 @@ export function unmount(){root?.unmount();client.clear();}`);
   await pickerPage.locator('[data-media-id="90001"]').getByRole('button',{name:'Select media',exact:true}).click();
   await pickerPage.locator('[data-media-id="90002"]').getByRole('button',{name:'Select media',exact:true}).click();
   await pickerPage.getByLabel('Paid message price',{exact:true}).fill('7.25');
-  await pickerPage.screenshot({path:path.join(output,'04-dialog-picker.png')});
+  await pickerPage.screenshot({animations:'disabled',timeout:45000,path:path.join(output,'04-dialog-picker.png')});
   await pickerPage.getByRole('button',{name:'ADD TO MESSAGE',exact:true}).click();
   await until(()=>Boolean(results.pickerApply),'Picker did not apply');assert.equal(results.pickerApply.ok,true,JSON.stringify(results.pickerApply));
   const mixed=await composerSnapshot();assert.equal(mixed.text,'Free follow-up');assert.equal(mixed.price,7.25);assert.equal(mixed.media.length,2);assert.deepEqual(mixed.free,['native-90001']);results.mixedComposer=mixed;
@@ -275,7 +275,7 @@ export function unmount(){root?.unmount();client.clear();}`);
   await page.getByRole('button',{name:/Collection 102/}).waitFor();
   await page.locator('.hq-vault-perf-row').filter({hasText:'asset sales'}).getByText('$7.25',{exact:true}).waitFor();
   results.vaultUiRevenue='$7.25';
-  await page.screenshot({path:path.join(output,'05-vault-dashboard.png')});
+  await page.screenshot({animations:'disabled',timeout:45000,path:path.join(output,'05-vault-dashboard.png')});
   await page.getByRole('button',{name:/Edit info for/}).first().click();
   await page.locator('.hq-vault-editor-description').fill('Sunrise portrait updated in Vault');
   await page.getByRole('button',{name:'Save info',exact:true}).click();
@@ -292,9 +292,9 @@ export function unmount(){root?.unmount();client.clear();}`);
   results.renderer={errors,calls,requests};results.provider={calls:providerCalls,externalWrites:0};
   assert.deepEqual(errors,[]);
  } finally {
-  clearInterval(renewal);if(page)await page.screenshot({path:path.join(output,'last-screen.png')}).catch(()=>{});
+  clearInterval(renewal);if(page)await page.screenshot({animations:'disabled',timeout:45000,path:path.join(output,'last-screen.png')}).catch(()=>{});
   results.renderer={errors,calls,requests};results.provider={calls:providerCalls,externalWrites:0};
-  if(sidecarPage){results.sidecarStatus=await sidecarPage.locator('.on-ml-status').textContent().catch(()=>null);await sidecarPage.screenshot({path:path.join(output,'last-sidecar.png')}).catch(()=>{});}
+  if(sidecarPage){results.sidecarStatus=await sidecarPage.locator('.on-ml-status').textContent().catch(()=>null);await sidecarPage.screenshot({animations:'disabled',timeout:45000,path:path.join(output,'last-sidecar.png')}).catch(()=>{});}
   if(composerPage)results.lastComposer=await composerPage.evaluate(()=>JSON.stringify(window.nativeComposer)).catch(()=>null);
   sidecar?.destroy();await browser?.close();if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}
   await worker.stop();await campaigns.prepareShutdown();await mediaLibrary.destroy();await vault.destroy();custom.destroy();await coordinator.destroy();

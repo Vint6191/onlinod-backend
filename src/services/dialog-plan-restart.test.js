@@ -92,6 +92,13 @@ function createDb({ enabled = true } = {}) {
   let jobSeq = 0;
 
   const db = {
+    _locks: [],
+    $executeRawUnsafe: async (sql, ...args) => {
+      assert.equal(sql, "SELECT pg_advisory_xact_lock(hashtext($1))");
+      assert.deepEqual(args, ["dialog-schedule:agency-1:creator-1:__dialog_discovery__"]);
+      db._locks.push(args[0]);
+      return 1;
+    },
     _runs: runs,
     _jobs: jobs,
     _states: states,
@@ -215,6 +222,7 @@ test("full rescan after cancellation creates a clean replacement in the same tx 
   });
 
   assert.equal(result.created, true);
+  assert.deepEqual(db._locks, ["dialog-schedule:agency-1:creator-1:__dialog_discovery__"]);
   assert.equal(result.supersededHistoryRuns, 1);
   assert.equal(result.generation, 1);
   assert.equal(db._runs.find((row) => row.id === "old-discovery").status, "CANCELLED");

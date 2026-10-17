@@ -200,7 +200,8 @@ async function main() {
       password: "isolated-admin-password",
     });
     token = admin.token;
-    const chromium = runtime("@sparticuz/chromium");
+    const chromiumModule = runtime("@sparticuz/chromium");
+    const chromium = chromiumModule.default || chromiumModule;
     browser = await runtime("playwright").chromium.launch({
       executablePath: process.env.ONLINOD_CHROMIUM_PATH || (await chromium.executablePath()),
       args: chromium.args,
@@ -716,14 +717,17 @@ async function main() {
     await f.db.$disconnect();
     check(result.rendererErrors.length === 0, "no browser runtime errors");
     result.ok = true;
+  } catch (error) {
+    result.error = { message: error.message, stack: error.stack };
+    throw error;
   } finally {
     closing = true;
     fs.writeFileSync(
       path.join(output, baseline ? "baseline.json" : "result.json"),
       JSON.stringify(result, null, 2) + "\n"
     );
-    if (page) await page.unrouteAll({ behavior: "ignoreErrors" });
-    if (browser) await browser.close();
+    if (page) await page.unrouteAll({ behavior: "ignoreErrors" }).catch(() => {});
+    if (browser) await browser.close().catch(() => {});
     if (child) {
       child.kill("SIGKILL");
       await exit;

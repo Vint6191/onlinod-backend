@@ -305,17 +305,25 @@ async function seedCampaignProjection({db}) {
 async function runCampaignProjectionSweep({db,limit=4,concurrency=1,seed=true,maxRuntimeMs=Infinity}) {
   const started=Date.now();
   const seeding=seed?await seedCampaignProjection({db}):{visited:0,seeded:0},results=[];
-  for (let turn=0;turn<CLASSES.length && Date.now()-started<maxRuntimeMs;turn++) {
+  for (let turn=0;turn<CLASSES.length;turn++) {
+    // Durable class admission rotates across sweeps. Preparation may consume
+    // the slice, but must never suppress its first bounded admitted class.
+    if(turn>0 && Date.now()-started>=maxRuntimeMs)break;
     const workClass=await admitProjectionWorkClass(db);
     if(!workClass)break;
     const batch=await claimDomainWorkBatch({db,workClass,limit:Math.max(1,Math.min(8,limit)),perAgencyQuantum:2,perPartitionQuantum:1});
     const items=[...(batch.items||[])];
-    await Promise.all(Array.from({length:Math.min(items.length,Math.max(1,Math.min(4,concurrency)))},async()=>{
+    const workers=await Promise.allSettled(Array.from({length:Math.min(items.length,Math.max(1,Math.min(4,concurrency)))},async()=>{
       while(items.length){const item=items.shift();
         try{results.push(await runCampaignProjectionUnit({db,item,ownerToken:batch.ownerToken}));}
         catch(error){await failDomainWorkClaim({db,item,ownerToken:batch.ownerToken,error});results.push({error:String(error.code||error.message)});}
       }
     }));
+    // A sibling may still own a bounded transaction if failure disposition
+    // itself fails. Drain it before the executor can start another sweep.
+    const rejected=workers.filter(worker=>worker.status==="rejected");
+    for(const worker of rejected)results.push({error:String(worker.reason?.code||worker.reason?.message||worker.reason)});
+    if(rejected.length)break;
   }
   return {ok:results.every(x=>!x.error),seed:seeding,processed:results.length,results};
 }

@@ -32,14 +32,17 @@ test("INT5 F55-03 mixed same-time reply clusters fail closed even for a strictly
   assert.match(response, /for \(const peer of sameTimeReplyPeers\)/);
 });
 
-test("F55-04 only Team pending repair opts into preserving progress across newer revisions", () => {
+test("F55-04 only Team pending repair and creator planning retain progress across newer revisions", () => {
   const scheduler = read("job-scheduler.js");
   const domain = read("domain-work-authority-service.js");
   assert.match(domain, /preserveProgressOnNewerRevision = false/);
   assert.match(domain, /preserveProgressOnNewerRevision === true/);
   const matches = scheduler.match(/preserveProgressOnNewerRevision/g) || [];
-  assert.equal(matches.length, 1);
+  assert.equal(matches.length, 2);
   assert.match(scheduler, /Boolean\(nextProgressCursor\?\.pendingRepair\)/);
+  // A wake during an active planning turn retains the hourly cadence marker;
+  // it must not turn every reconnect into another complete planning pass.
+  assert.match(scheduler, /preserveProgressOnNewerRevision: true,\s*progressCursor: \{ lastPlanningCycleAt:[\s\S]*?lastFullPlanningAt:/);
 });
 
 

@@ -102,7 +102,7 @@ async function loadCreatorCoverage({ db, agencyId, range, authorityNow, allowedC
              COUNT(*) FILTER (WHERE prev_member IS NOT NULL AND prev_member<>"memberId" AND seg_start<prev_end)::bigint AS overlaps
         FROM seq GROUP BY "creatorId"
     )
-    SELECT r."creatorId",u.covered_seconds,r.session_seconds,r.sessions_count,r.members_count,r.active_now,r.stale_open_sessions,
+    SELECT r."creatorId",u.covered_seconds,r.session_seconds,r.sessions_count,r.members_count,r.active_now,r.open_sessions,r.stale_open_sessions,
            COALESCE(t.handoffs,0)::bigint AS handoffs,COALESCE(t.overlaps,0)::bigint AS overlaps
       FROM raw_totals r JOIN union_totals u USING("creatorId") LEFT JOIN transitions t USING("creatorId")`;
   return query(db, sql, params({ agencyId, range, authorityNow, allowedCreatorIds }));
@@ -138,8 +138,11 @@ async function loadHandoffDetails({ db, agencyId, range, authorityNow, allowedCr
   return query(db, sql, params({ agencyId, range, authorityNow, allowedCreatorIds }));
 }
 
-async function loadShiftMetrics({ db, agencyId, shiftIds, authorityNow, currentResponseGeneration = false }) {
+async function loadShiftMetrics({ db, agencyId, shiftIds, authorityNow, allowedCreatorIds, currentResponseGeneration = false }) {
   if (!shiftIds.length) return [];
+  // Each aggregate is bounded by the selected detail batch. Evaluate it once:
+  // an inlined aggregate can be rescanned for every shift when cold statistics
+  // underestimate the batch, turning 1000 response lookups into a million.
   const sql = `WITH selected AS (
       SELECT s."id",s."memberId",s."startsAt",s."endsAt",m."assignedCreators" AS member_scope
         FROM "TeamShift" s
@@ -154,15 +157,16 @@ async function loadShiftMetrics({ db, agencyId, shiftIds, authorityNow, currentR
         JOIN "CreatorAccount" ca ON ca."id"=sc."creatorRefId" AND ca."agencyId"=$1 AND ca."deletedAt" IS NULL
         JOIN "TeamCoverageSession" c ON c."agencyId"=$1 AND c."creatorId"=sc."creatorRefId" AND sc."creatorRefId" IS NOT NULL AND c."memberId"=s."memberId"
        WHERE "phase2_scope_allows_creator"(s.member_scope,sc."creatorRefId")
+         AND ($5::text[] IS NULL OR sc."creatorRefId"=ANY($5::text[]))
          AND c."startedAt"<s."endsAt" AND CASE WHEN c."endedAt" IS NOT NULL THEN c."endedAt" ELSE LEAST($3::timestamp,c."startedAt"+INTERVAL '12 hours') END>s."startsAt"
     ), valid AS (SELECT * FROM cbase WHERE seg_end>seg_start), ordered AS (
       SELECT v.*,MAX(seg_end) OVER(PARTITION BY shift_id ORDER BY seg_start,seg_end,session_id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_max_end FROM valid v
     ), marked AS (SELECT o.*,CASE WHEN prev_max_end IS NULL OR seg_start>prev_max_end THEN 1 ELSE 0 END AS new_group FROM ordered o),
     grouped AS (SELECT m.*,SUM(new_group) OVER(PARTITION BY shift_id ORDER BY seg_start,seg_end,session_id ROWS UNBOUNDED PRECEDING) AS grp FROM marked m),
     unions AS (SELECT shift_id,grp,MIN(seg_start) AS s,MAX(seg_end) AS e FROM grouped GROUP BY shift_id,grp),
-    cov_union AS (SELECT shift_id,SUM(EXTRACT(EPOCH FROM(e-s)))::bigint AS actual_seconds FROM unions GROUP BY shift_id),
-    cov_raw AS (SELECT shift_id,COUNT(DISTINCT session_id)::bigint AS sessions_count,MIN(seg_start) AS first_actual,MAX(seg_end) AS last_actual FROM valid GROUP BY shift_id),
-    resp AS (
+    cov_union AS MATERIALIZED (SELECT shift_id,SUM(EXTRACT(EPOCH FROM(e-s)))::bigint AS actual_seconds FROM unions GROUP BY shift_id),
+    cov_raw AS MATERIALIZED (SELECT shift_id,COUNT(DISTINCT session_id)::bigint AS sessions_count,MIN(seg_start) AS first_actual,MAX(seg_end) AS last_actual FROM valid GROUP BY shift_id),
+    resp AS MATERIALIZED (
       SELECT s."id" AS shift_id,
              COUNT(*) FILTER(WHERE r."slaEligible"=TRUE AND COALESCE(r."projectionState",'FULL')='FULL')::bigint AS response_samples,
              percentile_cont(0.5) WITHIN GROUP(ORDER BY r."wallClockSeconds") FILTER(WHERE r."slaEligible"=TRUE AND COALESCE(r."projectionState",'FULL')='FULL') AS median_response,
@@ -172,6 +176,7 @@ async function loadShiftMetrics({ db, agencyId, shiftIds, authorityNow, currentR
         JOIN "CreatorAccount" ca ON ca."id"=sc."creatorRefId" AND ca."agencyId"=$1 AND ca."deletedAt" IS NULL
         JOIN "TeamResponseCaseCurrent" r ON r."agencyId"=$1 AND r."creatorId"=sc."creatorRefId" AND sc."creatorRefId" IS NOT NULL AND r."memberId"=s."memberId" AND r."replyAt">=s."startsAt" AND r."replyAt"<=s."endsAt"
          AND "phase2_scope_allows_creator"(s.member_scope,sc."creatorRefId")
+         AND ($5::text[] IS NULL OR sc."creatorRefId"=ANY($5::text[]))
          AND ($4::boolean=FALSE OR (r."derivationVersion"='team_response_v2' AND r."projectionState" IN ('FULL','INCOMPLETE_HISTORY')))
        GROUP BY s."id"
     )
@@ -179,16 +184,18 @@ async function loadShiftMetrics({ db, agencyId, shiftIds, authorityNow, currentR
            c.first_actual,c.last_actual,COALESCE(r.response_samples,0)::bigint AS response_samples,r.median_response,
            COALESCE(r.sla15_passes,0)::bigint AS sla15_passes,COALESCE(r.incomplete_responses,0)::bigint AS incomplete_responses
       FROM selected s LEFT JOIN cov_union u ON u.shift_id=s."id" LEFT JOIN cov_raw c ON c.shift_id=s."id" LEFT JOIN resp r ON r.shift_id=s."id"`;
-  return query(db, sql, [String(agencyId), shiftIds.map(String), new Date(authorityNow), currentResponseGeneration === true]);
+  return query(db, sql, [String(agencyId), shiftIds.map(String), new Date(authorityNow), currentResponseGeneration === true, normalizedScope(allowedCreatorIds)]);
 }
 
 async function loadPlanSummary({ db, agencyId, range, authorityNow, allowedCreatorIds }) {
   const scope = normalizedScope(allowedCreatorIds);
+  // Fold each shift's base row and coverage contribution once. Joining the two
+  // full retained-range sets can become quadratic when statistics are cold.
   const sql = `WITH selected AS (
       SELECT s."id",s."memberId",s."status",s."startsAt",s."endsAt",m."assignedCreators" AS member_scope FROM "TeamShift" s
        JOIN "AgencyMember" m ON m."id"=s."memberId" AND m."agencyId"=s."agencyId" AND m."deletedAt" IS NULL AND m."deactivatedAt" IS NULL
        JOIN "User" u ON u."id"=m."userId" AND u."disabledAt" IS NULL
-       WHERE s."agencyId"=$1 AND s."startsAt"<=$3::timestamp AND ($2::timestamp IS NULL OR s."endsAt">=$2::timestamp)
+       WHERE s."agencyId"=$1 AND s."startsAt"<=$3::timestamp AND s."endsAt">=COALESCE($2::timestamp,'-infinity'::timestamp)
          AND EXISTS(
            SELECT 1 FROM "TeamShiftCreator" sc0
             JOIN "CreatorAccount" ca0 ON ca0."id"=sc0."creatorRefId" AND ca0."agencyId"=s."agencyId" AND ca0."deletedAt" IS NULL
@@ -204,33 +211,42 @@ async function loadPlanSummary({ db, agencyId, range, authorityNow, allowedCreat
         JOIN "TeamCoverageSession" c ON c."agencyId"=$1 AND c."creatorId"=sc."creatorRefId" AND sc."creatorRefId" IS NOT NULL
         JOIN "TeamShift" sx ON sx."id"=s."id" AND c."memberId"=sx."memberId"
        WHERE "phase2_scope_allows_creator"(s.member_scope,sc."creatorRefId")
+         AND ($5::text[] IS NULL OR sc."creatorRefId"=ANY($5::text[]))
          AND c."startedAt"<s."endsAt" AND CASE WHEN c."endedAt" IS NOT NULL THEN c."endedAt" ELSE LEAST($4::timestamp,c."startedAt"+INTERVAL '12 hours') END>s."startsAt"
     ), valid AS(SELECT * FROM cbase WHERE seg_end>seg_start), ordered AS(
       SELECT v.*,MAX(seg_end) OVER(PARTITION BY shift_id ORDER BY seg_start,seg_end ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_max_end FROM valid v
     ), marked AS(SELECT o.*,CASE WHEN prev_max_end IS NULL OR seg_start>prev_max_end THEN 1 ELSE 0 END AS new_group FROM ordered o),
     grouped AS(SELECT m.*,SUM(new_group) OVER(PARTITION BY shift_id ORDER BY seg_start,seg_end ROWS UNBOUNDED PRECEDING) AS grp FROM marked m),
     unions AS(SELECT shift_id,grp,MIN(seg_start) AS s,MAX(seg_end) AS e FROM grouped GROUP BY shift_id,grp),
-    cov AS(SELECT shift_id,SUM(EXTRACT(EPOCH FROM(e-s))) AS actual_seconds FROM unions GROUP BY shift_id),
+    cov AS MATERIALIZED(SELECT shift_id,SUM(EXTRACT(EPOCH FROM(e-s))) AS actual_seconds FROM unions GROUP BY shift_id),
     per_shift AS(
-      SELECT s.*,EXTRACT(EPOCH FROM(s."endsAt"-s."startsAt")) AS planned_seconds,COALESCE(c.actual_seconds,0) AS actual_seconds FROM selected s LEFT JOIN cov c ON c.shift_id=s."id"
+      SELECT "id",MAX("status") AS "status",MAX("startsAt") AS "startsAt",MAX("endsAt") AS "endsAt",
+             SUM(planned_seconds) AS planned_seconds,SUM(actual_seconds) AS actual_seconds
+        FROM (
+          SELECT s."id",s."status",s."startsAt",s."endsAt",EXTRACT(EPOCH FROM(s."endsAt"-s."startsAt")) AS planned_seconds,0::numeric AS actual_seconds FROM selected s
+          UNION ALL
+          SELECT c.shift_id,NULL::text,NULL::timestamp,NULL::timestamp,0::numeric,c.actual_seconds FROM cov c
+        ) contributions
+       GROUP BY "id"
     ) SELECT
       COUNT(*) FILTER(WHERE "status"<>'CANCELLED')::bigint AS planned_shifts,
       COUNT(*) FILTER(WHERE "status"<>'CANCELLED' AND $4::timestamp>="startsAt" AND $4::timestamp<"endsAt")::bigint AS live_planned_shifts,
       COUNT(*) FILTER(WHERE "status"<>'CANCELLED' AND "endsAt"<=$4::timestamp)::bigint AS completed_shifts,
       COUNT(*) FILTER(WHERE "status"<>'CANCELLED' AND "endsAt"<=$4::timestamp AND actual_seconds<=0)::bigint AS missed_shifts,
-      COALESCE(SUM(planned_seconds) FILTER(WHERE "status"<>'CANCELLED'),0)::bigint AS planned_seconds,
-      COALESCE(SUM(LEAST(planned_seconds,actual_seconds)) FILTER(WHERE "status"<>'CANCELLED'),0)::bigint AS actual_against_plan_seconds
+      COALESCE(SUM(planned_seconds) FILTER(WHERE "status"<>'CANCELLED' AND "startsAt"<=$4::timestamp),0)::bigint AS planned_seconds,
+      COALESCE(SUM(LEAST(planned_seconds,actual_seconds)) FILTER(WHERE "status"<>'CANCELLED' AND "startsAt"<=$4::timestamp),0)::bigint AS actual_against_plan_seconds
       FROM per_shift`;
   const rows = await query(db, sql, [String(agencyId), range?.startAt ? new Date(range.startAt) : null, new Date(range.endAt), new Date(authorityNow), scope]);
   return rows?.[0] || {};
 }
 
-async function loadVisibleShifts({ db, agencyId, queryRange, allowedCreatorIds, includeCreatorWhere }) {
+async function loadVisibleShifts({ db, agencyId, queryRange, authorityNow, allowedCreatorIds, includeCreatorWhere }) {
   const scope = normalizedScope(allowedCreatorIds);
   const startAt = queryRange.startAt ? new Date(queryRange.startAt) : null;
   const endAt = new Date(queryRange.endAt);
   const ids = await query(db, `
-    SELECT s."id" AS visible_shift_id
+    WITH eligible AS NOT MATERIALIZED (
+    SELECT s."id" AS visible_shift_id,s."startsAt",s."endsAt"
       FROM "TeamShift" s
       JOIN "AgencyMember" m
         ON m."id"=s."memberId" AND m."agencyId"=s."agencyId"
@@ -238,7 +254,7 @@ async function loadVisibleShifts({ db, agencyId, queryRange, allowedCreatorIds, 
       JOIN "User" u ON u."id"=m."userId" AND u."disabledAt" IS NULL
      WHERE s."agencyId"=$1
        AND s."startsAt"<=$3::timestamp
-       AND ($2::timestamp IS NULL OR s."endsAt">=$2::timestamp)
+       AND s."endsAt">=COALESCE($2::timestamp,'-infinity'::timestamp)
        AND EXISTS (
          SELECT 1
            FROM "TeamShiftCreator" sc
@@ -249,8 +265,16 @@ async function loadVisibleShifts({ db, agencyId, queryRange, allowedCreatorIds, 
             AND "phase2_scope_allows_creator"(m."assignedCreators",sc."creatorRefId")
             AND ($4::text[] IS NULL OR sc."creatorRefId"=ANY($4::text[]))
        )
-     ORDER BY s."startsAt",s."id"
-     LIMIT ${SHIFT_DETAIL_LIMIT + 1}`, [String(agencyId), startAt, endAt, scope]);
+    ), shortlist AS (
+      (SELECT * FROM eligible WHERE "endsAt">$5::timestamp ORDER BY "startsAt",visible_shift_id LIMIT ${SHIFT_DETAIL_LIMIT + 1})
+      UNION ALL
+      (SELECT * FROM eligible WHERE "endsAt"<=$5::timestamp ORDER BY "startsAt" DESC,visible_shift_id LIMIT ${SHIFT_DETAIL_LIMIT + 1})
+    )
+    SELECT visible_shift_id FROM shortlist
+     ORDER BY CASE WHEN "endsAt">$5::timestamp THEN 0 ELSE 1 END,
+       CASE WHEN "endsAt">$5::timestamp THEN "startsAt" END ASC,
+       "startsAt" DESC,visible_shift_id
+     LIMIT ${SHIFT_DETAIL_LIMIT + 1}`, [String(agencyId), startAt, endAt, scope, new Date(authorityNow)]);
   const orderedIds = (ids || []).map((row) => String(row.visible_shift_id || row.visibleShiftId || row.id || "")).filter(Boolean);
   const selectedIds = orderedIds.slice(0, SHIFT_DETAIL_LIMIT);
   if (!selectedIds.length) return { rows: [], complete: orderedIds.length <= SHIFT_DETAIL_LIMIT, limit: SHIFT_DETAIL_LIMIT };
@@ -285,16 +309,16 @@ function fulfillment({ status, startsAt, endsAt, actualSeconds, nowMs }) {
   return planned > 0 && actualSeconds/planned >= .8 ? "COVERED" : "PARTIAL";
 }
 
-async function buildScheduleScaleRead({ db, agencyId, queryRange, authorityNow, allowedCreatorIds, context, includeCreatorWhere, currentResponseGeneration = false }) {
-  const visible = await loadVisibleShifts({ db, agencyId, queryRange, allowedCreatorIds, includeCreatorWhere });
+async function buildScheduleScaleRead({ db, agencyId, queryRange, planningRange = queryRange, authorityNow, allowedCreatorIds, context, includeCreatorWhere, currentResponseGeneration = false }) {
+  const visible = await loadVisibleShifts({ db, agencyId, queryRange: planningRange, authorityNow, allowedCreatorIds, includeCreatorWhere });
   const shiftIds = visible.rows.map((r) => String(r.id));
   const [shiftMetricRows, creatorRows, memberRows, recentRows, handoffRows, plan] = await Promise.all([
-    loadShiftMetrics({ db, agencyId, shiftIds, authorityNow, currentResponseGeneration }),
+    loadShiftMetrics({ db, agencyId, shiftIds, authorityNow, allowedCreatorIds, currentResponseGeneration }),
     loadCreatorCoverage({ db, agencyId, range: queryRange, authorityNow, allowedCreatorIds }),
     loadMemberCoverage({ db, agencyId, range: queryRange, authorityNow, allowedCreatorIds }),
     loadRecentSessions({ db, agencyId, range: queryRange, authorityNow, allowedCreatorIds }),
     loadHandoffDetails({ db, agencyId, range: queryRange, authorityNow, allowedCreatorIds }),
-    loadPlanSummary({ db, agencyId, range: queryRange, authorityNow, allowedCreatorIds }),
+    loadPlanSummary({ db, agencyId, range: planningRange, authorityNow, allowedCreatorIds }),
   ]);
   const metrics = new Map((shiftMetricRows || []).map((row) => [String(row.shift_id), row]));
   const nowMs = new Date(authorityNow).getTime();

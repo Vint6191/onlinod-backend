@@ -1,5 +1,6 @@
 "use strict";
 const assert = require("node:assert/strict"), crypto = require("node:crypto"), fs = require("node:fs"), path = require("node:path");
+const { pathToFileURL } = require("node:url");
 const { fixture, scope } = require("./analytics-traffic/fixture.cjs");
 const keepAlive = setInterval(() => {}, 1000);
 const deadline = setTimeout(() => { console.error("PUBLICATION_PROOF_TIMEOUT"); process.exit(2); }, 90000);
@@ -7,6 +8,8 @@ async function main() {
   const f = await fixture(), { db, root } = f;
   const result = { ok: false, nativePostgres: false, cases: [] };
   try {
+    const desktop = path.resolve(process.env.ONLINOD_DESKTOP_ROOT || path.join(root, "../desktop"));
+    const { earningsHandler } = await import(pathToFileURL(path.join(desktop, "apps/desktop/dist/electron/main/services/backend-jobs/handlers/earnings-handler.js")));
     const s = await scope(db);
     require.cache[require.resolve(path.join(root, "src/prisma"))] = { exports: db };
     const kernel = require(path.join(root, "src/services/db-commit-kernel"));
@@ -16,7 +19,7 @@ async function main() {
     async function accept(id, from, days) {
       const at = new Date(), run = "run-" + id, token = "lease-" + id;
       const to = new Date(Date.parse(from) + (days - 1) * 86400000).toISOString().slice(0, 10);
-      await kernel.runRootCommit(db, ({ tx }) => tx.jobInstance.create({ data: {
+      const job = await kernel.runRootCommit(db, ({ tx }) => tx.jobInstance.create({ data: {
         id, agencyId: s.agencyId, creatorId: s.creatorId, jobKey: "fetch_earnings", scope: "creator", status: "CLAIMED",
         claimedByDeviceId: "qa-device", leaseTokenHash: crypto.createHash("sha256").update(token).digest("hex"), leaseRevision: 1,
         leaseMemberId: "member-" + s.agencyId, leaseAccessEpoch: 1, leaseUntil: new Date(+at + 600000),
@@ -24,19 +27,33 @@ async function main() {
           analyticsObservationStartedAt: at.toISOString(), scanGeneration: run, collectionReason: "LOCAL_ACCEPTANCE" },
       } }));
       const identity = { jobId: id, userId: s.userId, deviceId: "qa-device", leaseToken: token, leaseRevision: 1 };
-      for (let offset = 0; offset < days; offset += 50) {
-        await lease.progressJob({ ...identity, chunkResult: { kind: "earnings_daily_page", schemaVersion: 4, collectorVersion: "earnings-v4",
-          scanRunId: run, observedAt: at.toISOString(), batchKey: `run:${run}:daily:${offset}`, scannerRejected: 0,
-          rows: Array.from({ length: Math.min(50, days - offset) }, (_, i) => ({ date: new Date(Date.parse(from) + (offset + i) * 86400000).toISOString().slice(0, 10), sourceTimezone: "UTC", totalCents: 100, currency: "USD" })),
-        } });
-      }
-      return lease.completeJob({ ...identity, result: { schemaVersion: 4, collectorVersion: "earnings-v4", scanRunId: run, observedAt: at.toISOString(),
-        range: { startDate: from, endDate: to }, dailyBatchCount: Math.ceil(days / 50), dailyCount: days, scannerRejected: 0, chartComplete: true, dailyComplete: true } });
+      const reports = [];
+      // Only the provider is synthetic. Current Desktop code produces the
+      // actual amount proof, page identity and completion protocol.
+      const collected = await earningsHandler.runChunk({ creatorId: s.creatorId, job, signal: new AbortController().signal,
+        ofApi: { request: async () => ({ ok: true, status: 200, data: { total: { total: days,
+          chartAmount: Array.from({ length: days }, (_, i) => ({ date: new Date(Date.parse(from) + i * 86400000).toISOString().slice(0, 10), count: 1 })),
+        } } }) }, reportAsync: report => reports.push(report), flushAsyncReports: async () => {},
+      });
+      assert.equal(collected.result.dailyComplete, true);
+      assert.equal(collected.result.dailyCount, days);
+      for (const report of reports) await lease.progressJob({ ...identity, ...report });
+      return lease.completeJob({ ...identity, result: collected.result });
     }
     const first = await accept("quantum-history", "2025-01-01", 201);
-    const one = await publisher.runAnalyticsPublicationSweep({ db, maxUnitsPerClaim: 1 });
+    let slowPreparation = true;
+    db.$use(async (params, next) => {
+      const value = await next(params);
+      if (slowPreparation && params.model === "AnalyticsPublication" && params.action === "findUnique") {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      return value;
+    });
+    const one = await publisher.runAnalyticsPublicationSweep({ db, maxUnitsPerClaim: 1, maxRuntimeMs: 1 });
+    slowPreparation = false;
     assert.equal(one.results[0].units, 1);
     assert.equal((await db.analyticsPublication.findUnique({ where: { id: first.publicationId } })).state, "PENDING");
+    result.cases.push({ name: "An admitted publication advances one real fenced SQL unit even when preparation exceeds its soft slice", units: 1 });
     let units = 1;
     for (let attempt = 0; attempt < 12; attempt++) {
       const state = await db.analyticsPublication.findUnique({ where: { id: first.publicationId } });
@@ -46,7 +63,8 @@ async function main() {
       assert.equal(sweep.ok, true, JSON.stringify(sweep));
       for (const row of sweep.results) { assert(row.units <= 8); units += row.units; }
     }
-    assert.equal((await db.analyticsPublication.findUnique({ where: { id: first.publicationId } })).state, "COMMITTED");
+    const firstPublication = await db.analyticsPublication.findUnique({ where: { id: first.publicationId } });
+    assert.equal(firstPublication.state, "COMMITTED", JSON.stringify({ lastError: firstPublication.lastError, stage: firstPublication.stage, proof: firstPublication.proof }));
     assert(units >= 8);
     result.cases.push({ name: "201 days publish in bounded, fenced units and resume after a one-unit quantum", units });
     const today = new Date().toISOString().slice(0, 10), current = await accept("quantum-today", today, 1);

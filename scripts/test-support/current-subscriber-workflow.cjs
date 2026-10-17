@@ -21,8 +21,13 @@ exports.runSubscriberDirectory = async function runSubscriberDirectory(f) {
   const publishAuthority = () => authority.publish({ accessEpoch: 1, creatorCatalogGeneration: 1, role: "OWNER", roleKey: "owner",
     effectivePermissions: { "automation.manage": true, "automation.view_logs": true, "content.manage_vault": true },
     allowedCreatorIds: creatorIds, observedAt: Date.now(), observedAtMono: performance.now(),
-    billing: { version: 1, validForMs: 90000, creators: creatorIds.map(creatorId => ({ creatorId, allowed: true, validForMs: 90000, reason: "TRIAL" })) } });
+    billing: { version: 1, validForMs: 90000, creators: creatorIds.map(creatorId => ({ creatorId, allowed: true, validForMs: 90000, reason: "TRIAL" })) } }, "billing authority refresh", { renewUnchanged: true });
   publishAuthority();
+  // Match production proactive renewal: unchanged scope/content/billing keeps
+  // permits current. A default publish is an invalidation, not a heartbeat.
+  const initialAuthorityRevision = authority.getSnapshot().localAuthorizationRevision;
+  publishAuthority();
+  assert.equal(authority.getSnapshot().localAuthorizationRevision, initialAuthorityRevision);
   const commands = new m.ManagementCommandTransport(api, authStore, path.join(scratch, "subscriber-commands.json"), authority, () => {});
   const service = new m.SubscriberDirectoryService(authStore, authService, authority, commands);
   const automation = new m.AutomationService(authStore, authService, authority, commands);
@@ -198,7 +203,7 @@ export async function refresh(){await client.invalidateQueries({queryKey:['autom
     makeWorkers(); coordinator.start(); worker.start();
     await until(async () => (await status()).state?.status === "READY" && (await status()).job?.status === "DONE", "Reopened worker did not publish directory", 65000);
     results.initial = await status();
-    assert.equal(results.initial.state.totalCount, 225); assert.equal(results.initial.run.pageCount, 3);
+    assert.equal(results.initial.state.totalCount, 225); assert.equal(results.initial.run.pageCount, 12);
     assert.equal(provider.pageReads.get("1:0"), 1, "Reopen resumes from durable next page");
     assert.equal((await hidden()).count, 5);
     const facts = await current(["20001", "20003", "20005"]); results.initialFacts = facts;
@@ -209,7 +214,7 @@ export async function refresh(){await client.invalidateQueries({queryKey:['autom
     assert.equal(unknownValue.totalSpentCents, null, "Unfetched spend is not zero");
     await refresh(); await page.getByText("Alice", { exact: true }).waitFor();
     await page.screenshot({ path: path.join(output, "published-directory.png"), fullPage: true });
-    pass("225 fans / three actual provider pages; SQLite reopen resumes, publication exposes five hidden fans and current FanData");
+    pass("225 fans / twelve actual provider windows; SQLite reopen resumes, publication exposes five hidden fans and current FanData");
 
     const row = name => page.getByRole("row").filter({ has: page.getByText(name, { exact: true }) });
     await row("Alice").getByRole("button", { name: "Ignore", exact: true }).click();

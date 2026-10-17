@@ -146,7 +146,7 @@ exports.runDialog = async function (f) {
         validForMs: 90000,
         creators: creatorIds.map((creatorId) => ({ creatorId, allowed: true, validForMs: 90000, reason: "TRIAL" })),
       },
-    });
+    }, "billing authority refresh", { renewUnchanged: true });
   publish();
   const coordinator = new m.WorkCoordinatorService({ log, databasePath: path.join(scratch, "dialog-work.sqlite") });
   coordinator.setCapabilityResolver(() => ({ allowed: true }));

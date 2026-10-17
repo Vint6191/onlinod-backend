@@ -228,7 +228,13 @@ async function processAdoption({ db, item, ownerToken }) {
 async function runSweep({ db = require("../prisma"), limit = 8, maxRuntimeMs = 5000 } = {}) {
   const started = performance.now();
   const report = { ok: true, enumeration: await enumerateAdoption({ db }), processed: 0, failed: 0, completed: 0 };
-  for (let i = 0; i < Math.min(16, limit) && performance.now() - started < maxRuntimeMs; i++) {
+  const unitLimit = Math.max(2, Math.min(16, Math.floor(Number(limit) || 8)));
+  for (let i = 0; i < unitLimit; i++) {
+    // The lane owns two independent durable work classes. Admit one bounded
+    // unit for each before applying the soft budget: slow discovery must not
+    // prevent all publication, and a busy live stream must not starve adoption
+    // (whose completion is the read model's initialized/readiness proof).
+    if (i >= 2 && performance.now() - started >= maxRuntimeMs) break;
     const workClass = i % 2 ? ADOPTION_CLASS : WORK_CLASS;
     const claim = await work.claimDomainWorkBatch({ db, workClass, limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
     const item = claim.items?.[0]; if (!item) continue;

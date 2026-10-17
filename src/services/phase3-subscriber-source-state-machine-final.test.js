@@ -255,3 +255,38 @@ test("V2 subscriber contract rejects unknown semantics, contradictory cursor and
     assert.equal(db.run.hasMore, true); assert.equal(db.pages.length, 0);
   } finally { loaded.cleanup(); }
 });
+
+
+test("V2 filtered windows bind observation tokens to distinct fans while replay and empty windows consume no chronology", async () => {
+  const loaded = loadSubscriber();
+  const db = memoryDb(makeRun());
+  const tokens = [];
+  const consumeObservationToken = async input => {
+    assert.equal(input.job.id, "job-1");
+    assert.equal(input.deviceId, "device-1");
+    assert.equal(input.leaseRevision, 7);
+    assert.equal(input.purpose, "subscriber_directory_page");
+    assert.equal(tokens.some(token => token.token === input.token), false, "a lost-ACK replay must precede one-time token consumption");
+    tokens.push(input);
+    return { observedAt: new Date("2044-01-01T00:00:00.000Z") };
+  };
+  const apply = chunkResult => loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1", chunkResult, consumeObservationToken });
+  try {
+    const first = { ...page({ items: [item("fan-1"), item("fan-1")] }), pagination: { contract: "of_subscribers_offset_v2", limit: 20 } };
+    assert.equal((await apply(first)).nextOffset, 20);
+    assert.deepEqual(tokens[0].subjects, ["fan-1"]);
+    assert.equal(db.run.scannedCount, 1);
+    assert.equal(db.run.fanProjectionCount, 1);
+    assert.equal((await apply(first)).duplicate, true);
+    const empty = { ...page({ offset: 20, items: [] }), pagination: { contract: "of_subscribers_offset_v2", limit: 20 } };
+    delete empty.observationToken;
+    assert.equal((await apply(empty)).nextOffset, 40);
+    assert.equal(db.run.hasMore, true);
+    assert.equal(db.run.fanProjectionCursorOffset, 40);
+    assert.equal(tokens.length, 1);
+    assert.equal(db.run.summary.traversal.filteredPositions, 38);
+    assert.equal((await apply({ ...empty, offset: 40, hasMore: false })).readyToPublish, true);
+    assert.equal(db.run.fanProjectionStatus, "COMPLETE");
+    assert.equal(tokens.length, 1);
+  } finally { loaded.cleanup(); }
+});

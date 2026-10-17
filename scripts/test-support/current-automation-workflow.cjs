@@ -19,7 +19,7 @@ exports.runAutomation = async function runAutomation(f) {
   const publish = () => authority.publish({ accessEpoch: 1, creatorCatalogGeneration: 1, role: "OWNER", roleKey: "owner",
     effectivePermissions: { "automation.manage": true, "automation.view_logs": true, "content.manage_vault": true },
     allowedCreatorIds: creatorIds, observedAt: Date.now(), observedAtMono: performance.now(),
-    billing: { version: 1, validForMs: 90000, creators: creatorIds.map(creatorId => ({ creatorId, allowed: true, validForMs: 90000, reason: "TRIAL" })) } });
+    billing: { version: 1, validForMs: 90000, creators: creatorIds.map(creatorId => ({ creatorId, allowed: true, validForMs: 90000, reason: "TRIAL" })) } }, "billing authority refresh", { renewUnchanged: true });
   publish();
   const commands = new m.ManagementCommandTransport(api, authStore, path.join(scratch, "automation-commands.json"), authority, () => {});
   const service = new m.AutomationService(authStore, authService, authority, commands);

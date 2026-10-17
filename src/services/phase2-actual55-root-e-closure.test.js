@@ -236,7 +236,17 @@ test("F55-06 Creator non-FK anti-map classifies every non-cascade creatorId carr
     "TeamMemberActivityDaily", "TeamMoneyAttributionFact", "TeamMoneyDailyRollup",
     "TeamMoneyLifetimeRollup", "TeamMoneyRollupContribution",
   ];
-  const classified = Array.from(new Set([...directSetNull, ...operationalCleanup, ...retainedHistory])).sort();
+  // Source DELETE triggers retain dirty identities until the capacity owner
+  // retracts both global and creator deltas. Direct cleanup would lose the
+  // subtraction and corrupt these rebuildable aggregate counters.
+  const deferredProjectionRetraction = ["ProviderCapacityContribution", "ProviderCapacityCreatorBucket"];
+  const capacity = source("provider-capacity-projection-service.js");
+  assert.match(capacity, /if \(!row\) return null/);
+  assert.match(capacity, /bucketDeltas\(before, after\)/);
+  assert.match(capacity, /creatorBucketDeltas\(before, after\)/);
+  assert.match(capacity, /DELETE FROM "ProviderCapacityCreatorBucket"/);
+  assert.match(capacity, /DELETE FROM "ProviderCapacityContribution"/);
+  const classified = Array.from(new Set([...directSetNull, ...operationalCleanup, ...retainedHistory, ...deferredProjectionRetraction])).sort();
   assert.deepEqual(nonCascadeCreatorCarriers, classified);
 
   const destructive = source("phase2-destructive-delete-authority-service.js");

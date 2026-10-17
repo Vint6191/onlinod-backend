@@ -76,6 +76,7 @@ test("Closure4 advisory lock callers use executeRaw and the current reviewed aut
     "services/creator-analytics-ledger-service.js",
     "services/creator-fact-write-authority.js",
     "services/db-transaction-service.js",
+    "services/earnings-generation-service.js",
     "services/message-library-command-service.js",
     "services/message-library-lifecycle-service.js",
     "services/message-library-usage-service.js",

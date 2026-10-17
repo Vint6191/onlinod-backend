@@ -27,6 +27,7 @@ const {
   heartbeatDomainWorkClaim,
 } = require("./domain-work-authority-service");
 const { assertCustomManagementCreatorAccess, lockCurrentAgencyMember } = require("./custom-management-access-authority-service");
+const { confirmationAuthority } = require("./custom-telegram-thread-authority-service");
 const { scanAllById } = require("./telegram-exact-authority-scan-service");
 const {
   nextReminderForOrder,
@@ -1091,8 +1092,9 @@ function verifyStoredClaim(row, { deviceId, claimToken }) {
     throw fail("TELEGRAM_DELIVERY_CLAIM_STALE", "Telegram delivery claim is no longer valid", 409);
   }
 }
-function verifyCommitClaim(row, { deviceId, claimToken }) {
-  if (!row || !["COMMITTING", "RECONCILE_REQUIRED"].includes(String(row.state)) || !row.claimTokenHash || tokenHash(claimToken) !== String(row.claimTokenHash) || String(row.deviceId || "") !== clean(deviceId, 180)) {
+function verifyCommitClaim(row, { deviceId, claimToken }, { allowConfirmed = false } = {}) {
+  const states = allowConfirmed ? ["COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"] : ["COMMITTING", "RECONCILE_REQUIRED"];
+  if (!row || !states.includes(String(row.state)) || !row.claimTokenHash || tokenHash(claimToken) !== String(row.claimTokenHash) || String(row.deviceId || "") !== clean(deviceId, 180)) {
     throw fail("TELEGRAM_DELIVERY_COMMIT_LEASE_STALE", "Telegram delivery commit lease is no longer valid", 409);
   }
 }
@@ -1408,7 +1410,7 @@ async function projectConfirmedIntent({ row, now, db }) {
 
 async function reconcileInboundAfterConfirmedReceipt({ row, member, now, db }) {
   if (!row?.remoteRecipientTelegramUserId && !row?.remoteMessageId) return { ok: true, skipped: true };
-  const providerReceipt = String(row.confirmationAuthority || "PROVIDER_RECEIPT") === "PROVIDER_RECEIPT";
+  const providerReceipt = confirmationAuthority(row) === "PROVIDER_RECEIPT";
   try {
     return await reconcilePendingInboundForConfirmedDelivery({
       agencyId: row.agencyId,
@@ -1436,7 +1438,7 @@ async function assertProviderReceiptIdentityAvailable({ agencyId, accountId, rem
   if (existing) throw fail("TELEGRAM_DELIVERY_REMOTE_MESSAGE_CONFLICT", "This Telegram account/message receipt is already owned by another delivery intent", 409);
 }
 
-async function confirmTelegramDeliveryIntent({ agencyId, member, intentId, deviceId, claimToken, remoteMessageId, remoteRecipientTelegramUserId = null, remoteSentAt, now = new Date(), db = null } = {}) {
+async function confirmTelegramDeliveryIntent({ agencyId, member, intentId, deviceId, claimToken, remoteMessageId, remoteRecipientTelegramUserId = null, remoteSentAt, now = new Date(), db = null, exactReceipt = false } = {}) {
   const client = db || require("../prisma"); const id = clean(intentId, 180); const row = await client.telegramDeliveryIntent.findFirst({ where: { id, agencyId } });
   if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
   const messageId = positiveInt(remoteMessageId, "remoteMessageId"); const recipientTelegramUserId = clean(remoteRecipientTelegramUserId, 40);
@@ -1446,12 +1448,28 @@ async function confirmTelegramDeliveryIntent({ agencyId, member, intentId, devic
   if (row.state === "CONFIRMED") {
     if (Number(row.remoteMessageId) !== messageId) throw fail("TELEGRAM_DELIVERY_CONFIRM_CONFLICT", "Telegram delivery was already confirmed with a different remote message id", 409);
     if (recipientTelegramUserId && row.remoteRecipientTelegramUserId && String(row.remoteRecipientTelegramUserId) !== recipientTelegramUserId) throw fail("TELEGRAM_DELIVERY_CONFIRM_CONFLICT", "Telegram delivery was already confirmed for a different recipient identity", 409);
+    if (exactReceipt && confirmationAuthority(row) === "PROVIDER_RECEIPT"
+        && new Date(row.remoteSentAt).getTime() !== sentAt.getTime()) {
+      throw fail("TELEGRAM_DELIVERY_CONFIRM_CONFLICT", "Telegram delivery was already confirmed with a different provider timestamp", 409);
+    }
     // A late actual provider receipt is stronger than an earlier manual reconciliation of the
     // same exact message. It may upgrade provenance, but never change canonical remote identity.
     let confirmedRow = row;
-    if (String(row.confirmationAuthority || "") !== "PROVIDER_RECEIPT") {
+    if (confirmationAuthority(row) !== "PROVIDER_RECEIPT") {
+      // Matching public message fields only prove an exact replay, not that this
+      // caller observed the provider response. A manual decision may become
+      // provider evidence only through the original committed device/claim.
+      // Claim expiry and current runtime ownership do not revoke that narrow
+      // receipt capability: a late response still belongs to its original send.
+      verifyCommitClaim(row, { deviceId, claimToken }, { allowConfirmed: true });
       await assertProviderReceiptIdentityAvailable({ agencyId, accountId: row.accountId, remoteMessageId: messageId, excludeIntentId: row.id, db: client });
-      await client.telegramDeliveryIntent.updateMany({ where: { id: row.id, agencyId, state: "CONFIRMED", remoteMessageId: messageId }, data: { confirmationAuthority: "PROVIDER_RECEIPT" } });
+      const promoted = await client.telegramDeliveryIntent.updateMany({
+        where: { id: row.id, agencyId, state: "CONFIRMED", remoteMessageId: messageId,
+          claimRevision: row.claimRevision, claimTokenHash: row.claimTokenHash, deviceId: row.deviceId },
+        data: { confirmationAuthority: "PROVIDER_RECEIPT", remoteSentAt: sentAt,
+          ...(recipientTelegramUserId ? { remoteRecipientTelegramUserId: recipientTelegramUserId } : {}) },
+      });
+      if (Number(promoted?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_CONFIRM_RACE", "Telegram delivery changed before provider proof promotion", 409);
       confirmedRow = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } }) || row;
     }
     // Repair-safe idempotency: historical/partially-settled rows are projected from the same canonical receipt.
@@ -1494,6 +1512,40 @@ async function confirmTelegramDeliveryIntent({ agencyId, member, intentId, devic
   await reconcileInboundAfterConfirmedReceipt({ row: confirmed, member, now, db: client });
   await audit({ agencyId, actorUserId: member?.userId || row.userId || null, action: "custom_order.telegram_delivery_confirm", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, kind: row.kind, remoteMessageId: messageId }, db: client });
   return { ok: true, idempotent: false, intent: publicIntent(confirmed) };
+}
+
+// The original random commit claim is a receipt-only capability after begin.
+// It never admits new work, changes immutable scope, or restores a retryable
+// state. Retirement/logout cannot revoke a provider fact already observed by
+// that physical sender. Validate even terminal replays before any projection.
+async function settleTelegramDeliveryWithClaim({ intentId, deviceId, claimToken, creatorId, accountId, kind, outcome,
+  remoteMessageId = null, remoteRecipientTelegramUserId = null, remoteSentAt = null, reason = null, db = null } = {}) {
+  const client = db || require("../prisma");
+  const row = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180) } });
+  if (!row || !row.commitStartedAt) throw fail("TELEGRAM_DELIVERY_SETTLEMENT_CAPABILITY_INVALID", "Telegram settlement capability is invalid", 403);
+  try { verifyCommitClaim(row, { deviceId, claimToken }, { allowConfirmed: true }); }
+  catch { throw fail("TELEGRAM_DELIVERY_SETTLEMENT_CAPABILITY_INVALID", "Telegram settlement capability is invalid", 403); }
+  if (String(row.creatorId) !== clean(creatorId, 180) || String(row.accountId) !== clean(accountId, 180) || String(row.kind) !== clean(kind, 40)) {
+    throw fail("TELEGRAM_DELIVERY_SETTLEMENT_SCOPE_MISMATCH", "Telegram receipt scope differs from the committed intent", 409);
+  }
+  const mode = clean(outcome, 40);
+  if (!["CONFIRMED", "UNKNOWN"].includes(mode)) throw fail("TELEGRAM_DELIVERY_SETTLEMENT_OUTCOME_INVALID", "Receipt settlement cannot authorize another send", 400);
+  let result;
+  if (mode === "CONFIRMED") {
+    // The committed payload pins the recipient independently of mutable creator
+    // bindings and of any later login. No capability may redirect that receipt.
+    const recipient = clean(remoteRecipientTelegramUserId, 40);
+    const committedRecipient = clean(row.payload?.recipientTelegramUserId, 40);
+    if (!/^\d{1,20}$/.test(recipient) || !committedRecipient || recipient !== committedRecipient) {
+      throw fail("TELEGRAM_DELIVERY_SETTLEMENT_RECIPIENT_MISMATCH", "Telegram receipt recipient differs from the committed intent", 409);
+    }
+    if (!remoteSentAt) throw fail("TELEGRAM_DELIVERY_SETTLEMENT_TIMESTAMP_REQUIRED", "The exact provider timestamp is required", 400);
+    result = await confirmTelegramDeliveryIntent({ agencyId: row.agencyId, member: null, intentId: row.id,
+      deviceId, claimToken, remoteMessageId, remoteRecipientTelegramUserId: recipient, remoteSentAt, db: client, exactReceipt: true });
+  } else {
+    result = await markTelegramDeliveryUnknown({ agencyId: row.agencyId, member: null, intentId: row.id, deviceId, claimToken, reason, db: client });
+  }
+  return { ok: true, idempotent: !!result.idempotent, intentId: row.id, state: result.intent.state };
 }
 
 async function repairConfirmedTelegramDeliveryProjectionItem({ agencyId, intentId, now = new Date(), db = null } = {}) {
@@ -2513,6 +2565,7 @@ module.exports = {
   claimTelegramDeliveryIntent,
   beginTelegramDeliveryIntent,
   confirmTelegramDeliveryIntent,
+  settleTelegramDeliveryWithClaim,
   repairConfirmedTelegramDeliveryProjections,
   repairConfirmedTelegramDeliveryProjectionItem,
   repairCurrentCustomModelCommunicationForOrder,

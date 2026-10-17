@@ -51,6 +51,20 @@ async function runSubscriberDirectoryMaintenance({
   let reserved = 0;
   let drained = false;
 
+  function recordError(error, signal = null) {
+    totals.errors += 1;
+    if (totals.errorDetails.length < 5) {
+      totals.errorDetails.push({
+        signalId: signal?.id || null,
+        agencyId: signal?.agencyId || null,
+        creatorId: signal?.creatorId || null,
+        kind: signal?.kind || null,
+        code: error?.code || null,
+        message: String(error?.message || error || "subscriber_maintenance_error").slice(0, 500),
+      });
+    }
+  }
+
   async function processRecovery(signal, remainingMs) {
     let result;
     try {
@@ -149,17 +163,7 @@ async function runSubscriberDirectoryMaintenance({
       }
       totals.processedSignals += 1;
     } catch (error) {
-      totals.errors += 1;
-      if (totals.errorDetails.length < 5) {
-        totals.errorDetails.push({
-          signalId: signal?.id || null,
-          agencyId: signal?.agencyId || null,
-          creatorId: signal?.creatorId || null,
-          kind: signal?.kind || null,
-          code: error?.code || null,
-          message: String(error?.message || error || "subscriber_maintenance_error").slice(0, 500),
-        });
-      }
+      recordError(error, signal);
       await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, error, retryMs: 60_000 }).catch(() => null);
     }
   }
@@ -176,7 +180,16 @@ async function runSubscriberDirectoryMaintenance({
       if (!signal && reserved >= limit) return;
       if (!signal) {
         reserved += 1;
-        signal = await claimSubscriberDirectoryMaintenanceSignal({ db, now, statementTimeoutMs: Math.min(2_000, remainingMs) });
+        try {
+          signal = await claimSubscriberDirectoryMaintenanceSignal({ db, now, statementTimeoutMs: Math.min(2_000, remainingMs) });
+        } catch (error) {
+          // Admission failure stops new claims, but does not end the lane while
+          // a sibling still owns durable publication work. The scheduler and
+          // graceful shutdown must continue to await those owners.
+          drained = true;
+          recordError(error);
+          return;
+        }
       }
       if (!signal) { drained = true; return; }
       await processSignal(signal);
@@ -195,10 +208,13 @@ async function runSubscriberDirectoryMaintenance({
     drained = true;
   } else {
     const additionalWorkers = Math.max(0, workerCount - 1);
-    await Promise.all([
+    const workers = await Promise.allSettled([
       worker(firstSignal),
       ...Array.from({ length: additionalWorkers }, () => worker()),
     ]);
+    for (const workerResult of workers) {
+      if (workerResult.status === "rejected") recordError(workerResult.reason);
+    }
   }
   const budgetExhausted = !drained && monotonicNow() - started >= budgetMs;
   const poisonedSignals = await countPoisonedSubscriberMaintenanceSignals({ db });

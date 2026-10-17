@@ -2,6 +2,79 @@
 
 const crypto = require("node:crypto");
 const { deriveCustomModelObligation } = require("./custom-model-obligation-authority-service");
+const CURRENT_THREAD_PAGE_SIZE = 100;
+
+// Discovery starts with the indexed CURRENT order set, never with a sender's
+// lifetime provider history. EXISTS uses the exact order/account/sender index;
+// pagination bounds each read without losing ambiguous active candidates.
+const CURRENT_THREAD_ORDER_PAGE_SQL = `/* custom_telegram_current_order_page */
+  SELECT o."id", o."creatorId", o."type", o."status"
+  FROM "CustomOrder" o
+  WHERE o."agencyId"=$1 AND o."status"='PENDING' AND o."id">$4
+    AND EXISTS (
+      SELECT 1 FROM "TelegramDeliveryIntent" i
+      WHERE i."agencyId"=o."agencyId" AND i."customOrderId"=o."id"
+        AND i."accountId"=$2 AND i."remoteRecipientTelegramUserId"=$3
+        AND i."state"='CONFIRMED' AND i."kind" IN ('TASK','REVISION_REQUEST')
+    )
+  ORDER BY o."id" LIMIT $5`;
+
+async function currentOrderPage({ agencyId, accountId, sender, afterId, db }) {
+  if (typeof db.$queryRawUnsafe === "function") {
+    return db.$queryRawUnsafe(CURRENT_THREAD_ORDER_PAGE_SQL, agencyId, accountId, sender, afterId, CURRENT_THREAD_PAGE_SIZE);
+  }
+  // Delegate-only adapters use the same current-state boundary. Production
+  // Prisma uses the indexed EXISTS above, which avoids unrelated active orders.
+  return db.customOrder.findMany({
+    where: { agencyId, status: "PENDING", id: { gt: afterId } },
+    select: { id: true, creatorId: true, type: true, status: true },
+    orderBy: { id: "asc" }, take: CURRENT_THREAD_PAGE_SIZE,
+  });
+}
+
+function isCurrentProviderInstruction(row, { agencyId, accountId, sender, order, cutoffMs }) {
+  if (!row || String(row.agencyId) !== agencyId || String(row.customOrderId) !== String(order.id)
+      || String(row.creatorId) !== String(order.creatorId) || String(row.accountId) !== accountId
+      || String(row.remoteRecipientTelegramUserId) !== sender || String(row.state) !== "CONFIRMED"
+      || !["TASK", "REVISION_REQUEST"].includes(String(row.kind)) || confirmationAuthority(row) !== "PROVIDER_RECEIPT") return false;
+  if (cutoffMs == null) return true;
+  const anchorMs = new Date(row.remoteSentAt || row.confirmedAt || NaN).getTime();
+  return Number.isFinite(anchorMs) && anchorMs <= cutoffMs;
+}
+
+async function confirmedTaskForCurrentOrder({ agencyId, accountId, sender, order, cutoffMs, db }) {
+  if (typeof db.$queryRawUnsafe === "function") {
+    const rows = await db.$queryRawUnsafe(`/* custom_telegram_current_task */
+      SELECT i."id", i."agencyId", i."accountId", i."creatorId", i."customOrderId", i."kind", i."state",
+        i."remoteMessageId", i."remoteRecipientTelegramUserId", i."remoteSentAt", i."confirmationAuthority", i."outcomeReason", i."confirmedAt"
+      FROM "TelegramDeliveryIntent" i
+      WHERE i."agencyId"=$1 AND i."customOrderId"=$2 AND i."accountId"=$3
+        AND i."remoteRecipientTelegramUserId"=$4 AND i."state"='CONFIRMED' AND i."kind"='TASK'
+        AND COALESCE(NULLIF(upper(btrim(i."confirmationAuthority")),''),
+          CASE WHEN upper(btrim(COALESCE(i."outcomeReason",''))) LIKE 'MANUAL_CONFIRMED:%' THEN 'MANUAL_RECONCILIATION' ELSE 'PROVIDER_RECEIPT' END)='PROVIDER_RECEIPT'
+        AND ($5::timestamp IS NULL OR COALESCE(i."remoteSentAt",i."confirmedAt") <= $5::timestamp)
+      ORDER BY i."confirmedAt" DESC, i."id" DESC LIMIT 1`,
+    agencyId, String(order.id), accountId, sender, cutoffMs == null ? null : new Date(cutoffMs));
+    return rows[0] || null;
+  }
+  // Legacy adapters may contain more than one historical TASK for an order.
+  // Keep exact temporal/provenance eligibility, without an arbitrary recent-N
+  // correctness cutoff or an unbounded materialized result.
+  let cursor = null;
+  for (;;) {
+    const rows = await db.telegramDeliveryIntent.findMany({
+      where: { agencyId, customOrderId: String(order.id), accountId, remoteRecipientTelegramUserId: sender, kind: "TASK", state: "CONFIRMED" },
+      orderBy: [{ confirmedAt: "desc" }, { id: "desc" }], take: CURRENT_THREAD_PAGE_SIZE,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    });
+    const matching = rows.find(row => isCurrentProviderInstruction(row, { agencyId, accountId, sender, order, cutoffMs }));
+    if (matching) return matching;
+    if (rows.length < CURRENT_THREAD_PAGE_SIZE) return null;
+    const next = clean(rows[rows.length - 1]?.id);
+    if (!next || next === cursor) throw Object.assign(new Error("Current Telegram TASK pagination did not advance"), { code: "TELEGRAM_THREAD_SCAN_STALLED", status: 503 });
+    cursor = next;
+  }
+}
 
 function clean(value, max = 180) {
   const text = String(value == null ? "" : value).trim();
@@ -96,75 +169,37 @@ async function resolveTelegramCustomThread({ agencyId, accountId, senderTelegram
   if (!db.telegramDeliveryIntent?.findMany || !db.customOrder?.findMany) {
     return { type: "NO_ACTIVE_THREAD", proven: false, conflict: false, thread: null, threads: [], creatorIds: [], customOrderIds: [] };
   }
-  const instructionRows = await db.telegramDeliveryIntent.findMany({
-    where: {
-      agencyId,
-      accountId: normalizedAccountId,
-      kind: { in: ["TASK", "REVISION_REQUEST"] },
-      state: "CONFIRMED",
-      remoteRecipientTelegramUserId: sender,
-    },
-    select: {
-      id: true, agencyId: true, accountId: true, creatorId: true, customOrderId: true, kind: true,
-      remoteMessageId: true, remoteRecipientTelegramUserId: true, remoteSentAt: true, confirmationAuthority: true,
-      outcomeReason: true, confirmedAt: true,
-    },
-    orderBy: [{ confirmedAt: "desc" }, { id: "desc" }],
-  });
   const cutoff = eventSentAt == null ? null : new Date(eventSentAt);
   const cutoffMs = cutoff && Number.isFinite(cutoff.getTime()) ? cutoff.getTime() : null;
-  const providerInstructions = (instructionRows || []).filter((row) => {
-    if (confirmationAuthority(row) !== "PROVIDER_RECEIPT") return false;
-    if (cutoffMs == null) return true;
-    const anchorAt = row.remoteSentAt || row.confirmedAt || null;
-    const anchorMs = anchorAt ? new Date(anchorAt).getTime() : NaN;
-    // A future instruction may never retroactively claim a provider observation that was already
-    // sent. Missing historical timestamps are insufficient temporal proof and therefore fail closed.
-    return Number.isFinite(anchorMs) && anchorMs <= cutoffMs;
-  });
-  const orderIds = Array.from(new Set(providerInstructions.map((row) => clean(row.customOrderId, 180)).filter(Boolean)));
-  if (!orderIds.length) {
-    return { type: "NO_ACTIVE_THREAD", proven: false, conflict: false, thread: null, threads: [], creatorIds: [], customOrderIds: [] };
-  }
-  const orders = await db.customOrder.findMany({
-    where: { agencyId, id: { in: orderIds }, status: "PENDING" },
-    select: { id: true, creatorId: true, type: true, status: true },
-  });
-  const orderById = new Map((orders || []).map((row) => [String(row.id), row]));
-  const intentById = new Map(providerInstructions.map((row) => [String(row.id), row]));
-  const taskByOrder = new Map();
-  for (const intent of providerInstructions) {
-    if (String(intent.kind || "") !== "TASK") continue;
-    const orderId = String(intent.customOrderId || "");
-    if (orderId && !taskByOrder.has(orderId)) taskByOrder.set(orderId, intent);
-  }
   const threadByOrder = new Map();
-  for (const order of orders || []) {
-    const orderId = String(order.id);
-    const obligation = await deriveCustomModelObligation({ agencyId, order, db });
-    let intent = null;
-    if (obligation?.modelOwesResponse && obligation.currentInstruction) {
-      const current = obligation.currentInstruction;
-      if (["TASK", "REVISION_REQUEST"].includes(String(current.kind || ""))
-          && String(current.accountId || "") === normalizedAccountId
-          && String(current.recipientTelegramUserId || "") === sender) {
-        const currentIntent = intentById.get(String(current.intentId || ""));
-        if (currentIntent && confirmationAuthority(currentIntent) === "PROVIDER_RECEIPT") {
-          if (cutoffMs == null) intent = currentIntent;
-          else {
-            const anchorMs = current.remoteSentAt ? new Date(current.remoteSentAt).getTime() : NaN;
-            if (Number.isFinite(anchorMs) && anchorMs <= cutoffMs) intent = currentIntent;
-          }
+  let afterId = "";
+  for (;;) {
+    const orders = await currentOrderPage({ agencyId, accountId: normalizedAccountId, sender, afterId, db });
+    for (const order of orders || []) {
+      const orderId = String(order.id);
+      const obligation = await deriveCustomModelObligation({ agencyId, order, db });
+      let intent = null;
+      if (obligation?.modelOwesResponse && obligation.currentInstruction) {
+        const current = obligation.currentInstruction;
+        if (["TASK", "REVISION_REQUEST"].includes(String(current.kind || ""))
+            && String(current.accountId || "") === normalizedAccountId
+            && String(current.recipientTelegramUserId || "") === sender) {
+          const currentIntent = await db.telegramDeliveryIntent.findFirst({ where: { id: String(current.intentId || ""), agencyId, customOrderId: orderId } });
+          if (isCurrentProviderInstruction(currentIntent, { agencyId, accountId: normalizedAccountId, sender, order, cutoffMs })) intent = currentIntent;
         }
       }
+      // A confirmed TASK remains exact business-context proof even while a later revision is
+      // pending/unknown or an observed media predates the revision receipt. It may identify the
+      // CustomOrder, but it does NOT grant revision-response causality: the submission authority
+      // still requires the current confirmed revision instruction and will surface REVIEW_REQUIRED.
+      if (!intent) intent = await confirmedTaskForCurrentOrder({ agencyId, accountId: normalizedAccountId, sender, order, cutoffMs, db });
+      if (!intent || String(order.creatorId) !== String(intent.creatorId)) continue;
+      if (!threadByOrder.has(orderId)) threadByOrder.set(orderId, publicThread(intent, order, "ACTIVE_THREAD"));
     }
-    // A confirmed TASK remains exact business-context proof even while a later revision is
-    // pending/unknown or an observed media predates the revision receipt. It may identify the
-    // CustomOrder, but it does NOT grant revision-response causality: the submission authority
-    // still requires the current confirmed revision instruction and will surface REVIEW_REQUIRED.
-    if (!intent) intent = taskByOrder.get(orderId) || null;
-    if (!intent || String(order.creatorId) !== String(intent.creatorId)) continue;
-    if (!threadByOrder.has(orderId)) threadByOrder.set(orderId, publicThread(intent, order, "ACTIVE_THREAD"));
+    if (orders.length < CURRENT_THREAD_PAGE_SIZE) break;
+    const next = clean(orders[orders.length - 1]?.id);
+    if (!next || next <= afterId) throw Object.assign(new Error("Current Telegram order pagination did not advance"), { code: "TELEGRAM_THREAD_SCAN_STALLED", status: 503 });
+    afterId = next;
   }
   const threads = [...threadByOrder.values()];
   const creatorIds = Array.from(new Set(threads.map((row) => row.creatorId)));
@@ -191,6 +226,8 @@ function targetAllowedByThreadContext(context, target) {
 }
 
 module.exports = {
+  CURRENT_THREAD_PAGE_SIZE,
+  CURRENT_THREAD_ORDER_PAGE_SQL,
   providerMessageEventId,
   resolveTelegramCustomThread,
   targetAllowedByThreadContext,

@@ -86,6 +86,27 @@ test("Schedule read model combines planned shifts with actual coverage without i
   assert.equal(staleCreator.sessions[0].durationSeconds, 12 * 60 * 60, "stale open coverage is capped at the same 12h bound as response projection");
 });
 
+test("Schedule includes upcoming shifts without extending actual coverage or penalizing future work", async () => {
+  const db = dbForRead();
+  const past = (await db.teamShift.findMany())[0];
+  const future = { ...past, id: "future-shift", startsAt: new Date("2026-08-14T09:00:00Z"), endsAt: new Date("2026-08-14T17:00:00Z") };
+  const distant = { ...future, id: "distant-shift", startsAt: new Date("2026-09-14T09:00:00Z"), endsAt: new Date("2026-09-14T17:00:00Z") };
+  let coverageEnd;
+  const readCoverage = db.teamCoverageSession.findMany;
+  db.teamCoverageSession.findMany = async (args) => { coverageEnd = args.where.startedAt.lte; return readCoverage(args); };
+  db.teamShift.findMany = async ({ where }) => [past, future, distant].filter(row => row.startsAt <= where.startsAt.lte && (!where.endsAt?.gte || row.endsAt >= where.endsAt.gte));
+  const now = new Date("2026-08-13T12:00:00Z");
+  const payload = await schedule.buildTeamSchedule({ agencyId: "agency-1", rangeKey: "7d", now, db: commitDatabaseFixture(db) });
+  assert.deepEqual(payload.shifts.map(row => row.id), ["shift-1", "future-shift"]);
+  assert.equal(payload.shifts[1].fulfillment, "UPCOMING");
+  assert.equal(payload.summary.plannedShifts, 2);
+  assert.equal(payload.summary.plannedSeconds, 8 * 3600, "future work is not missed coverage");
+  assert.equal(payload.summary.planCoveragePct, 75);
+  assert.equal(payload.range.endAt, now.toISOString(), "historical reporting still ends at the database clock");
+  assert.equal(payload.planningRange.endAt, "2026-08-20T12:00:00.000Z");
+  assert.equal(coverageEnd.toISOString(), now.toISOString());
+});
+
 
 test("current planned Schedule drops a historical shift when its member no longer has access to the live Creator", async () => {
   const payload = await schedule.buildTeamSchedule({

@@ -2,7 +2,7 @@
 const test = require("node:test"), assert = require("node:assert/strict");
 const fs = require("node:fs"), path = require("node:path");
 const root = path.resolve(__dirname, "..");
-const contract = require("./database-contract.json");
+const contract = require("./database-migration-chain").currentContract();
 const business = require("../../scripts/test-support/current-business-contract.json");
 function sources(directory) {
   return fs.readdirSync(directory, { withFileTypes: true }).flatMap(entry => {

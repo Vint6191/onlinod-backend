@@ -13,6 +13,7 @@ const PROVIDER_GATE_POLL_MS = Math.max(100, Math.min(2_000, Number.parseInt(proc
 const PROVIDER_GATE_PERMIT_TTL_MS = Math.max(5_000, Math.min(60_000, Number.parseInt(process.env.OF_PROVIDER_GATE_PERMIT_TTL_MS || "15000", 10) || 15_000));
 const PROVIDER_GATE_WAITER_LEASE_MS = Math.max(10_000, Math.min(60_000, Number.parseInt(process.env.OF_PROVIDER_GATE_WAITER_LEASE_MS || "20000", 10) || 20_000));
 const PROVIDER_GATE_WAITER_HEARTBEAT_MS = Math.max(2_000, Math.min(Math.floor(PROVIDER_GATE_WAITER_LEASE_MS / 2), Number.parseInt(process.env.OF_PROVIDER_GATE_WAITER_HEARTBEAT_MS || "5000", 10) || 5_000));
+const { PROVIDER_GATE_MAX_PENDING, PROVIDER_GATE_HEARTBEAT_BATCH_SIZE } = require("./provider-gate-resource-limits");
 const PROVIDER_GATE_FAIRNESS_GENERATION = "creator_provider_gate_v1";
 const PROVIDER_GATE_FAIRNESS_STATES = Object.freeze(["ACTIVE"]);
 
@@ -290,10 +291,18 @@ async function registerDurableProviderWaiter({
 async function heartbeatDurableProviderWaiters({ db, ownerInstanceId, waiterIds, waiterTtlMs = PROVIDER_GATE_WAITER_LEASE_MS } = {}) {
   assertDurableClient(db);
   const normalizedOwner = clean(ownerInstanceId, 200);
-  const ids = [...new Set((Array.isArray(waiterIds) ? waiterIds : []).map((value) => clean(value, 200)).filter(Boolean))].slice(0, 5000);
+  const ids = [...new Set((Array.isArray(waiterIds) ? waiterIds : []).map((value) => clean(value, 200)).filter(Boolean))];
   if (!normalizedOwner || !ids.length) return { touched: 0 };
+  if (ids.length > PROVIDER_GATE_MAX_PENDING) throw Object.assign(new Error("Provider waiter heartbeat exceeds bounded admission"), { code: "OF_PROVIDER_GATE_HEARTBEAT_CAPACITY" });
   const ttlMs = Math.max(5_000, Math.min(60_000, Math.floor(asNumber(waiterTtlMs, PROVIDER_GATE_WAITER_LEASE_MS))));
-  const rows = await db.$queryRawUnsafe(`
+  // At most four bounded transactions, independently attempted. A failed/slow
+  // prefix must not prevent the tail from renewing on every heartbeat forever.
+  // Expired rows are never resurrected, and another replica's rows are untouched.
+  const batches = [];
+  for (let offset = 0; offset < ids.length; offset += PROVIDER_GATE_HEARTBEAT_BATCH_SIZE) {
+    const batch = ids.slice(offset, offset + PROVIDER_GATE_HEARTBEAT_BATCH_SIZE);
+    batches.push(runDbTransaction(db, async (tx) => {
+      const rows = await tx.$queryRawUnsafe(`
     UPDATE "OfProviderRequestGateWaiter"
     SET
       "leaseUntil" = (clock_timestamp() AT TIME ZONE 'UTC') + ($3::bigint * INTERVAL '1 millisecond'),
@@ -302,8 +311,19 @@ async function heartbeatDurableProviderWaiters({ db, ownerInstanceId, waiterIds,
       AND "waiterId" IN (SELECT jsonb_array_elements_text($2::jsonb))
       AND "leaseUntil" > (clock_timestamp() AT TIME ZONE 'UTC')
     RETURNING "waiterId"
-  `, normalizedOwner, JSON.stringify(ids), ttlMs);
-  return { touched: Array.isArray(rows) ? rows.length : (rows ? 1 : 0) };
+  `, normalizedOwner, JSON.stringify(batch), ttlMs);
+      return Array.isArray(rows) ? rows.length : (rows ? 1 : 0);
+    }, { maxWait: 1000, timeout: 2000, lockTimeoutMs: 250, statementTimeoutMs: 1500 }));
+  }
+  const results = await Promise.allSettled(batches);
+  const failed = results.filter(result => result.status === "rejected");
+  if (failed.length) {
+    const error = Object.assign(new Error("Some provider waiter heartbeat batches could not renew"), {
+      code: "OF_PROVIDER_GATE_HEARTBEAT_PARTIAL", failedBatches: failed.length, cause: failed[0].reason,
+    });
+    throw error;
+  }
+  return { touched: results.reduce((total, result) => total + result.value, 0) };
 }
 
 async function cancelDurableProviderWaiter({ db, waiterId, ownerInstanceId } = {}) {
@@ -707,6 +727,8 @@ module.exports = {
   PROVIDER_GATE_PERMIT_TTL_MS,
   PROVIDER_GATE_WAITER_LEASE_MS,
   PROVIDER_GATE_WAITER_HEARTBEAT_MS,
+  PROVIDER_GATE_MAX_PENDING,
+  PROVIDER_GATE_HEARTBEAT_BATCH_SIZE,
   PROVIDER_GATE_FAIRNESS_GENERATION,
   PROVIDER_GATE_FAIRNESS_STATES,
   PROVIDER_GATE_PRIORITY_CYCLE,

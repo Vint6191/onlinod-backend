@@ -24,6 +24,7 @@ const {
   claimTelegramDeliveryIntent,
   beginTelegramDeliveryIntent,
   confirmTelegramDeliveryIntent,
+  settleTelegramDeliveryWithClaim,
   repairConfirmedTelegramDeliveryProjections,
   repairCurrentCustomModelCommunicationForOrder,
   repairCustomModelCommunicationConvergence,
@@ -2849,5 +2850,93 @@ test('CALL cancellation or completion after reference claim prevents provider be
     fx.orders[0].status=status;
     await assert.rejects(beginTelegramDeliveryIntent({agencyId:'agency-1',member:fx.member,intentId:planned.intent.id,deviceId:'device-1',runtimeClaimToken:'runtime-1',claimToken:claimed.claimToken,now:fx.now,db:fx.db}),e=>['TELEGRAM_DELIVERY_CONTROL_CHANGED','TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED'].includes(e.code));
     assert.equal(fx.intents.find(x=>x.id===planned.intent.id).commitStartedAt,null);
+  }
+});
+
+test('provider proof promotion requires the original committed device and claim even after manual confirmation', async () => {
+  const fx = dbFixture(), flow = await taskToCommitting(fx);
+  const exact = { agencyId: 'agency-1', member: fx.member, intentId: flow.planned.intent.id,
+    deviceId: 'device-1', claimToken: flow.claimed.claimToken,
+    remoteMessageId: 9801, remoteRecipientTelegramUserId: '1001', remoteSentAt: fx.now, now: fx.now, db: fx.db };
+  for (const wrong of [{ deviceId: 'device-2' }, { claimToken: 'wrong-claim' }]) {
+    await assert.rejects(confirmTelegramDeliveryIntent({ ...exact, ...wrong }), { code: 'TELEGRAM_DELIVERY_COMMIT_LEASE_STALE' });
+  }
+  assert.equal(fx.intents[0].state, 'COMMITTING');
+  await markTelegramDeliveryUnknown({ ...exact, reason: 'provider acknowledgement was delayed' });
+  await reconcileTelegramDeliveryIntent({ ...exact, resolution: 'CONFIRMED', reason: 'manager inspected provider history' });
+  assert.equal(fx.intents[0].confirmationAuthority, 'MANUAL_RECONCILIATION');
+  const manuallyConfirmed = clone(fx.intents[0]);
+  for (const wrong of [{ deviceId: 'device-2' }, { claimToken: 'wrong-claim' }, { deviceId: 'device-2', claimToken: 'wrong-claim' }]) {
+    await assert.rejects(confirmTelegramDeliveryIntent({ ...exact, ...wrong }), { code: 'TELEGRAM_DELIVERY_COMMIT_LEASE_STALE' });
+    assert.deepEqual(fx.intents[0], manuallyConfirmed, 'public receipt fields cannot mutate manual provenance');
+  }
+  // Runtime ownership / membership revocation cannot change who owns an already
+  // committed provider response. The exact original capability may settle late.
+  fx.accounts[0].runtimeClaimedByDeviceId = 'device-2';
+  const promoted = await confirmTelegramDeliveryIntent({ ...exact, member: null });
+  assert.equal(promoted.idempotent, true);
+  assert.equal(promoted.intent.confirmationAuthority, 'PROVIDER_RECEIPT');
+  assert.equal(fx.intents[0].remoteMessageId, 9801);
+  assert.equal(fx.intents[0].remoteRecipientTelegramUserId, '1001');
+  assert.equal((await confirmTelegramDeliveryIntent(exact)).idempotent, true);
+  await assert.rejects(confirmTelegramDeliveryIntent({ ...exact, remoteMessageId: 9802 }), { code: 'TELEGRAM_DELIVERY_CONFIRM_CONFLICT' });
+});
+
+test('legacy manual provenance inferred from outcomeReason is not upgraded by an unowned replay', async () => {
+  const fx = dbFixture();
+  seedConfirmedTaskThread(fx, { messageId: 9803, telegramUserId: '1001' });
+  fx.intents[0].confirmationAuthority = null;
+  fx.intents[0].outcomeReason = 'MANUAL_CONFIRMED:historical operator decision';
+  fx.intents[0].claimTokenHash = null;
+  await assert.rejects(confirmTelegramDeliveryIntent({ agencyId: 'agency-1', member: fx.member, intentId: fx.intents[0].id,
+    deviceId: 'device-1', claimToken: 'not-a-provider-capability', remoteMessageId: 9803,
+    remoteRecipientTelegramUserId: '1001', remoteSentAt: fx.now, now: fx.now, db: fx.db }),
+  { code: 'TELEGRAM_DELIVERY_COMMIT_LEASE_STALE' });
+  assert.equal(fx.intents[0].confirmationAuthority, null);
+});
+
+test('post-logout Telegram capability settles only its exact committed scope and returns no private payload', async () => {
+  const fx = dbFixture(), flow = await taskToCommitting(fx);
+  const receipt = { intentId: flow.planned.intent.id, deviceId: 'device-1', claimToken: flow.claimed.claimToken,
+    creatorId: 'creator-1', accountId: 'tg-1', kind: 'TASK', outcome: 'CONFIRMED',
+    remoteMessageId: '9901', remoteRecipientTelegramUserId: '1001', remoteSentAt: fx.now.toISOString(), db: fx.db };
+  const original = clone(fx.intents[0]);
+  for (const wrong of [{ deviceId: 'device-2' }, { claimToken: 'not-the-original-capability' }]) {
+    await assert.rejects(settleTelegramDeliveryWithClaim({ ...receipt, ...wrong }), { code: 'TELEGRAM_DELIVERY_SETTLEMENT_CAPABILITY_INVALID' });
+    assert.deepEqual(fx.intents[0], original);
+  }
+  for (const wrong of [{ creatorId: 'other-creator' }, { accountId: 'other-account' }, { kind: 'REFERENCE' }]) {
+    await assert.rejects(settleTelegramDeliveryWithClaim({ ...receipt, ...wrong }), { code: 'TELEGRAM_DELIVERY_SETTLEMENT_SCOPE_MISMATCH' });
+  }
+  await assert.rejects(settleTelegramDeliveryWithClaim({ ...receipt, remoteRecipientTelegramUserId: '9999' }), { code: 'TELEGRAM_DELIVERY_SETTLEMENT_RECIPIENT_MISMATCH' });
+  await assert.rejects(settleTelegramDeliveryWithClaim({ ...receipt, outcome: 'PROVEN_NOT_SENT' }), { code: 'TELEGRAM_DELIVERY_SETTLEMENT_OUTCOME_INVALID' });
+  assert.deepEqual(await settleTelegramDeliveryWithClaim(receipt), { ok: true, idempotent: false, intentId: receipt.intentId, state: 'CONFIRMED' });
+  assert.deepEqual(await settleTelegramDeliveryWithClaim(receipt), { ok: true, idempotent: true, intentId: receipt.intentId, state: 'CONFIRMED' });
+  await assert.rejects(settleTelegramDeliveryWithClaim({ ...receipt, claimToken: 'not-the-original-capability' }), { code: 'TELEGRAM_DELIVERY_SETTLEMENT_CAPABILITY_INVALID' });
+  await assert.rejects(settleTelegramDeliveryWithClaim({ ...receipt, remoteMessageId: '9902' }), { code: 'TELEGRAM_DELIVERY_CONFIRM_CONFLICT' });
+  await assert.rejects(settleTelegramDeliveryWithClaim({ ...receipt, remoteSentAt: new Date(fx.now.getTime() + 1).toISOString() }), { code: 'TELEGRAM_DELIVERY_CONFIRM_CONFLICT' });
+  assert.equal(fx.intents[0].remoteMessageId, 9901);
+});
+
+test('post-logout UNKNOWN cannot enable resend and an exact late provider receipt still converges', async () => {
+  const fx = dbFixture(), flow = await taskToCommitting(fx);
+  const receipt = { intentId: flow.planned.intent.id, deviceId: 'device-1', claimToken: flow.claimed.claimToken,
+    creatorId: 'creator-1', accountId: 'tg-1', kind: 'TASK', outcome: 'UNKNOWN', reason: 'transport lost response', db: fx.db };
+  assert.equal((await settleTelegramDeliveryWithClaim(receipt)).state, 'RECONCILE_REQUIRED');
+  assert.equal((await settleTelegramDeliveryWithClaim(receipt)).idempotent, true);
+  const confirmed = await settleTelegramDeliveryWithClaim({ ...receipt, outcome: 'CONFIRMED',
+    remoteMessageId: '9903', remoteRecipientTelegramUserId: '1001', remoteSentAt: fx.now.toISOString() });
+  assert.equal(confirmed.state, 'CONFIRMED');
+  assert.equal((await settleTelegramDeliveryWithClaim(receipt)).state, 'CONFIRMED', 'an older UNKNOWN cannot downgrade provider proof');
+});
+
+test('receipt capability cannot create a commit from a claimed or retryable Telegram row', async () => {
+  const fx = dbFixture(), flow = await taskToCommitting(fx);
+  const receipt = { intentId: flow.planned.intent.id, deviceId: 'device-1', claimToken: flow.claimed.claimToken,
+    creatorId: 'creator-1', accountId: 'tg-1', kind: 'TASK', outcome: 'UNKNOWN', db: fx.db };
+  for (const state of ['PLANNED', 'CLAIMED', 'CANCELLED', 'FAILED_PRECOMMIT']) {
+    fx.intents[0].state = state;
+    await assert.rejects(settleTelegramDeliveryWithClaim(receipt), { code: 'TELEGRAM_DELIVERY_SETTLEMENT_CAPABILITY_INVALID' });
+    assert.equal(fx.intents[0].state, state);
   }
 });

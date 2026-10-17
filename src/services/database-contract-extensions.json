@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v9_subscriber_publication_liveness",
+  "version": "nod_current_v11_team_schedule_end_window",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -32,6 +32,14 @@
     {
       "migration": "20261017010000_subscriber_publication_liveness",
       "checksum": "beafca1d187cd2bc43d81467448b0573738702412c707a487d447f94b6bc4b5e"
+    },
+    {
+      "migration": "20261018000000_custom_telegram_current_threads",
+      "checksum": "cdad5a3823fb2309e166dbff74d3df635bdae994e3035c5d352ac8e92ef6cf34"
+    },
+    {
+      "migration": "20261018010000_team_schedule_end_window",
+      "checksum": "21c38296ebb870cbc0a32ceec466db0414e07ecb1955a7fc17336e936e37a946"
     }
   ],
   "extension": {
@@ -3196,6 +3204,33 @@
         "options": "0 0 0",
         "expressions": null,
         "predicate": "((attempts >= 100) AND ((\"lastError\" IS NULL) OR ((\"lastError\")::text = ANY ((ARRAY['subscriber_recovery_budget_exhausted'::character varying, 'maintenance_budget_exhausted'::character varying, 'publication_debt'::character varying])::text[]))))"
+      },
+      {
+        "table": "CustomOrder",
+        "name": "CustomOrder_current_thread_order_idx",
+        "unique": false,
+        "keys": "2 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(status = 'PENDING'::\"CustomOrderStatus\")"
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "TelegramDeliveryIntent_current_thread_lookup_idx",
+        "unique": false,
+        "keys": "2 4 6 23 7 29 1",
+        "options": "0 0 0 0 0 3 3",
+        "expressions": null,
+        "predicate": "((state = 'CONFIRMED'::text) AND (kind = ANY (ARRAY['TASK'::text, 'REVISION_REQUEST'::text])))"
+      },
+      {
+        "table": "TeamShift",
+        "name": "TeamShift_agencyId_endsAt_idx",
+        "unique": false,
+        "keys": "2 5",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
       }
     ]
   }

@@ -38,6 +38,9 @@ async function filterAuthorizedControlEvents(req, events, member) {
   return (Array.isArray(events) ? events : []).filter((event) => {
     const type = String(event?.type || "");
     if (type === "ACCESS_EPOCH_CHANGED" || type === "CREATOR_REVOKED") return true;
+    // The agency-scoped bus strips all payload from this invalidation hint.
+    // It grants no read access: Home re-reads through its current permissions.
+    if (type === "ANALYTICS_CHANGED") return true;
     if (type === "JOB_AVAILABLE" && !event?.creatorId) return true;
     if (creatorProtectedTypes.has(type) || type === "JOB_AVAILABLE") return allowedIds.has(String(event?.creatorId || ""));
     return false;

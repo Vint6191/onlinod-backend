@@ -390,6 +390,15 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
   );
   const retainedRange = clampRangeToAvailableFrom(range, detailAvailableFrom);
   const queryRange = retainedRange || { ...range, startAt: new Date(0), endAt: new Date(0) };
+  // Schedule planning must include future work. Keep observations and coverage
+  // on the historical range; expanding that shared range would fabricate future
+  // coverage and distort performance. Explicit previous-year views stay historical.
+  const upcomingDays = range.key === "24h" ? 1 : /^\d+d$/.test(range.key) ? Number(range.key.slice(0, -1)) : 30;
+  const planningRange = range.key === "prev_year" ? queryRange : {
+    ...range,
+    startAt: retainedRange?.startAt || authorityNow,
+    endAt: new Date(authorityNow.getTime() + upcomingDays * 86400000),
+  };
   const scheduleCoverage = { ...coverageState(range, detailAvailableFrom), source: "bounded_team_schedule_detail_v1" };
   const nowMs = authorityNow.getTime();
   const scopedCreatorIds = Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, Infinity) : null;
@@ -405,11 +414,12 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
 
   if (supportsScheduleScaleRead(db)) {
     const context = await loadScheduleContext({ agencyId, allowedCreatorIds, canManageSchedule, db });
-    const scaled = await buildScheduleScaleRead({ db, agencyId, queryRange, authorityNow, allowedCreatorIds, context, includeCreatorWhere, currentResponseGeneration });
+    const scaled = await buildScheduleScaleRead({ db, agencyId, queryRange, planningRange, authorityNow, allowedCreatorIds, context, includeCreatorWhere, currentResponseGeneration });
     return {
       ok: true,
       asOf: authorityNow.toISOString(),
       range: rangeForClient(range),
+      planningRange: rangeForClient(planningRange),
       retainedRange: retainedRange ? rangeForClient(retainedRange) : null,
       historicalCoverage: scheduleCoverage,
       creatorScope: Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, Infinity) : "all",
@@ -439,7 +449,7 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
       },
     }),
     findAllById(db.teamShift, {
-      where: { agencyId, ...plannedShiftWhere(queryRange, allowedCreatorIds) },
+      where: { agencyId, ...plannedShiftWhere(planningRange, allowedCreatorIds) },
       include: {
         member: { select: { id: true, displayName: true, roleKey: true, assignedCreators: true, user: { select: { name: true, email: true } } } },
         creators: includeCreatorWhere,
@@ -605,14 +615,16 @@ async function buildTeamSchedule({ agencyId, rangeKey = "7d", allowedCreatorIds 
 
   const nonCancelled = plannedShifts.filter((row) => row.status !== "CANCELLED");
   const completed = nonCancelled.filter((row) => new Date(row.endsAt).getTime() <= nowMs);
-  const totalPlannedSeconds = nonCancelled.reduce((sum, row) => sum + row.plannedSeconds, 0);
-  const totalActualAgainstPlanSeconds = nonCancelled.reduce((sum, row) => sum + Math.min(row.plannedSeconds, row.actualPresenceSeconds), 0);
+  const startedShifts = nonCancelled.filter((row) => new Date(row.startsAt).getTime() <= nowMs);
+  const totalPlannedSeconds = startedShifts.reduce((sum, row) => sum + row.plannedSeconds, 0);
+  const totalActualAgainstPlanSeconds = startedShifts.reduce((sum, row) => sum + Math.min(row.plannedSeconds, row.actualPresenceSeconds), 0);
   const missedShifts = completed.filter((row) => row.fulfillment === "MISSED").length;
 
   return {
     ok: true,
     asOf: authorityNow.toISOString(),
     range: rangeForClient(range),
+    planningRange: rangeForClient(planningRange),
     retainedRange: retainedRange ? rangeForClient(retainedRange) : null,
     historicalCoverage: scheduleCoverage,
     creatorScope: Array.isArray(allowedCreatorIds) ? uniqueIds(allowedCreatorIds, Infinity) : "all",

@@ -3873,6 +3873,7 @@ model TeamShift {
   creators TeamShiftCreator[]
 
   @@index([agencyId, startsAt])
+  @@index([agencyId, endsAt])
   @@index([agencyId, status, startsAt])
   @@index([memberId, startsAt])
 }

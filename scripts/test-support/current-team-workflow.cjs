@@ -22,7 +22,7 @@ exports.runTeam = async function runTeam(f) {
     accessRuntime:{currentAuthorityProof:()=>({accessEpoch:1,creatorCatalogGeneration:catalog}),allowedCreatorIdsSnapshot:()=>creatorIds}});
   const publishAuthority = () => authority.publish({accessEpoch:1,creatorCatalogGeneration:catalog,role:'OWNER',roleKey:'owner',effectivePermissions:permissions,
     allowedCreatorIds:creatorIds,observedAt:Date.now(),observedAtMono:performance.now(),
-    billing:{version:1,validForMs:90000,creators:creatorIds.map(creatorId=>({creatorId,allowed:true,validForMs:90000,reason:'TRIAL'}))}});
+    billing:{version:1,validForMs:90000,creators:creatorIds.map(creatorId=>({creatorId,allowed:true,validForMs:90000,reason:'TRIAL'}))}},'billing authority refresh',{renewUnchanged:true});
   publishAuthority();
   let loseAction=null, held=null, failRead=null;
   const serviceApi = {...api, request:async(url,options)=>{
@@ -68,7 +68,8 @@ export function notify(domain){window.dispatchEvent(new Event(domain==='team'?'n
     await load('esbuild').build({entryPoints:[entry],outfile:script,bundle:true,platform:'browser',format:'iife',globalName:'ActualTeam',jsx:'automatic',nodePaths:[path.join(desktop,'node_modules')],alias:{'@nod/shared':path.join(desktop,'packages/shared/src/index.ts')},loader:{'.css':'css','.png':'dataurl','.svg':'dataurl'},define:{'process.env.NODE_ENV':'"development"'}});
     server=http.createServer((req,res)=>{const file=req.url==='/app.js'?script:req.url==='/app.css'?script.replace(/js$/,'css'):null;res.setHeader('Content-Type',file?file.endsWith('.js')?'application/javascript':'text/css':'text/html');res.end(file?fs.readFileSync(file):'<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/app.css"></head><body><div id="root"></div><script src="/app.js"></script></body></html>');});
     await new Promise(r=>server.listen(0,'127.0.0.1',r));
-    const chromium=runtime('@sparticuz/chromium');
+    const chromiumModule=runtime('@sparticuz/chromium');
+    const chromium=chromiumModule.default||chromiumModule;
     browser=await runtime('playwright').chromium.launch({executablePath:process.env.ONLINOD_CHROMIUM_PATH||await chromium.executablePath(),args:chromium.args,headless:true});
     page=await browser.newPage({viewport:{width:1536,height:1050}});page.setDefaultTimeout(15000);
     page.on('pageerror',e=>errors.push(e.message));page.on('dialog',d=>d.accept());
@@ -121,6 +122,8 @@ export function notify(domain){window.dispatchEvent(new Event(domain==='team'?'n
     if(baseline)await editor.getByPlaceholder('Shift note…').fill('New note while saving');
     gate.release();await editor.waitFor({state:'hidden'});
     const savedSchedule=await schedule.getWorkspace({rangeKey:'7d'});assert.equal(savedSchedule.shifts.length,1);results.shift=savedSchedule.shifts[0];
+    assert.equal(results.shift.fulfillment,'UPCOMING');assert.equal(savedSchedule.summary.plannedSeconds,0,'A future shift must not reduce actual plan coverage');
+    assert.ok(new Date(savedSchedule.planningRange.endAt)>new Date(results.shift.startsAt));
     if(baseline){findings.push('SHIFT_ACK_CLOSED_FORM_WITH_UNSUBMITTED_EDIT');results.baselineFindings=findings;return;}
     pass('Schedule create commits one revision and prevents unsaved input loss during delayed acknowledgement');
 
@@ -135,12 +138,48 @@ export function notify(domain){window.dispatchEvent(new Event(domain==='team'?'n
     await until(()=>calls.filter(r=>r.method==='teamSchedule.getWorkspace').length>readCount,'Post-mutation reload missing');
     await until(async()=>await page.locator('.ts-shift-row.cancelled').count()===1,'Late cancellation replaced current schedule');
     assert.equal(calls.filter(r=>r.method==='teamSchedule.getWorkspace').at(-1).input.rangeKey,'30d');
-    assert.equal((await schedule.getWorkspace({rangeKey:'30d'})).shifts.find(r=>r.id===results.shift.id).revision,2);
+    const current30d=await schedule.getWorkspace({rangeKey:'30d'});
+    assert.equal(current30d.shifts.find(r=>r.id===results.shift.id).revision,2);
     await period('7D');await until(async()=>await page.locator('.ts-shift-row').count()===1,'Seven day schedule did not settle');
     failRead='teamSchedule.getWorkspace';await period('30D');await page.getByText('Schedule is unavailable',{exact:true}).waitFor();
     assert.equal(await page.locator('.ts-shift-row').count(),0,'Failed new period must not present old-period rows');
-    await page.getByRole('button',{name:'TRY AGAIN',exact:true}).click();await until(async()=>await page.locator('.ts-shift-row').count()===1,'Schedule retry failed');
+    await page.getByRole('button',{name:'TRY AGAIN',exact:true}).click();await until(async()=>await page.locator('.ts-shift-row').count()===current30d.shifts.length,'Schedule retry must restore the current retained range');
     pass('Shift cancel during period change reloads the current 30-day period; failed reads never relabel older-period rows');
+
+    await f.withDatabase(async(db,backendLoad)=>{
+      const {buildTeamSchedule}=backendLoad('./src/services/team-schedule-service');
+      const now=new Date(),startsAt=new Date(+now-2*3600000),endsAt=new Date(+now-3600000);
+      const previousCoverage=await db.teamProjectionCoverage.findUnique({where:{agencyId}});
+      const detailFrom=new Date(+now-3*86400000);
+      await db.teamProjectionCoverage.update({where:{agencyId},data:{responseCoverageFrom:detailFrom,dialogCoverageFrom:detailFrom}});
+      const ownerId=authStore.readSession().activeMemberId;
+      const ids=Array.from({length:1001},(_,i)=>'schedule-history-proof-'+i);
+      const scopedId='schedule-scope-proof',upcomingId='schedule-upcoming-proof';
+      const coverageId='schedule-hidden-coverage-proof';
+      try {
+        await db.teamShift.createMany({data:ids.map(id=>({id,agencyId,memberId,startsAt,endsAt,timezone:'UTC'}))});
+        await db.teamShiftCreator.createMany({data:ids.map(shiftId=>({shiftId,creatorId:c,creatorRefId:c}))});
+        await db.teamShift.create({data:{id:upcomingId,agencyId,memberId,startsAt:new Date(+now+3600000),endsAt:new Date(+now+2*3600000),creators:{create:{creatorId:c,creatorRefId:c}}}});
+        const bounded=await buildTeamSchedule({db,agencyId,rangeKey:'7d',allowedCreatorIds:[c]});
+        assert.equal(bounded.shifts.length,1000);assert.equal(bounded.detailCoverage.complete,false);
+        assert.ok(bounded.shifts.some(row=>row.id===upcomingId),'Past detail limit must not hide upcoming work');
+        assert.equal(bounded.summary.plannedShifts,1002,'Summary remains exact beyond the detail limit');
+        await db.teamShift.deleteMany({where:{agencyId,id:{in:ids}}});
+        await db.teamShift.create({data:{id:scopedId,agencyId,memberId:ownerId,startsAt,endsAt,creators:{create:creatorIds.map(creatorId=>({creatorId,creatorRefId:creatorId}))}}});
+        await db.teamCoverageSession.create({data:{agencyId,creatorId:creatorIds[1],memberId:ownerId,coverageId,startedAt:startsAt,endedAt:endsAt,durationSeconds:3600}});
+        const scoped=await buildTeamSchedule({db,agencyId,rangeKey:'7d',allowedCreatorIds:[c]});
+        const all=await buildTeamSchedule({db,agencyId,rangeKey:'7d',allowedCreatorIds:null});
+        assert.equal(scoped.shifts.find(row=>row.id===scopedId).actualPresenceSeconds,0,'Hidden creator coverage must not leak into a visible shift');
+        assert.equal(scoped.summary.actualAgainstPlanSeconds,0);
+        assert.equal(all.shifts.find(row=>row.id===scopedId).actualPresenceSeconds,3600);
+        assert.equal(all.summary.actualAgainstPlanSeconds,3600);
+      } finally {
+        await db.teamCoverageSession.deleteMany({where:{agencyId,coverageId}});
+        await db.teamShift.deleteMany({where:{agencyId,id:{in:[...ids,scopedId,upcomingId]}}});
+        await db.teamProjectionCoverage.update({where:{agencyId},data:{responseCoverageFrom:previousCoverage.responseCoverageFrom,dialogCoverageFrom:previousCoverage.dialogCoverageFrom}});
+      }
+    });
+    pass('SQL Schedule keeps upcoming work visible beyond 1000 historical shifts and excludes hidden creator coverage from detail and summary');
 
     await view('Team');await tab('ROLES');await page.locator('.taa-role-rail-head button').click();
     await page.getByPlaceholder('Senior Chatter').fill('Acceptance role');await page.locator('.taa-small-modal select').selectOption('chatter');
@@ -190,7 +229,7 @@ export function notify(domain){window.dispatchEvent(new Event(domain==='team'?'n
     // Canonical tips originate in a current financial job, not direct claim rows.
     await must('POST','/api/devices/heartbeat',{deviceId,accounts:[{creatorId:c,remoteId:'100001',status:'READY',accessEpoch:1,sessionReadReady:true,sessionWriteReady:true,sessionProofEpoch:1,canonicalRevision:1,networkRevision:0,runtimeReady:true}]});
     const operation=await managementCommands.executeOperation('financial',c,'start',{});managementCommands.acknowledge(operation.commandId);
-    const claim=await must('POST','/api/jobs/claim',{deviceId,leaseMs:180000,jobKeys:['financial_transactions_scan'],capabilities:{legacyStorageRetirementV1:true,financialWindowReceiptsV1:true}});
+    const claim=await must('POST','/api/jobs/claim',{deviceId,leaseMs:180000,jobKeys:['financial_transactions_scan'],capabilities:{creatorEventDrivenSyncV2:true,legacyStorageRetirementV1:true,financialWindowReceiptsV1:true,financialMoneyResolutionV1:true}});
     assert.ok(claim.job,JSON.stringify(claim));const job=claim.job;let continuation=job.continuation||{driverPhase:'execute',jobContinuation:null};
     const rawTransactions=[{id:'team-tip-one',descriptionDetails:{type:'tip'},amount:25,net:20,fee:5,currency:'USD',status:'done',createdAt:new Date(Date.parse(job.params.endDate)-1000).toISOString(),user:{id:'21001',username:'tip_fan'}}];
     const providerCalls=[];
@@ -226,7 +265,7 @@ export function notify(domain){window.dispatchEvent(new Event(domain==='team'?'n
 
     const notificationStop=await managementCommands.executeOperation('notification',c,'stop',{});managementCommands.acknowledge(notificationStop.commandId);
     const notificationOp=await managementCommands.executeOperation('notification',c,'start',{});managementCommands.acknowledge(notificationOp.commandId);
-    const notificationClaim=await must('POST','/api/jobs/claim',{deviceId,leaseMs:180000,jobKeys:['catchup_notifications_scan'],capabilities:{legacyStorageRetirementV1:true}});
+    const notificationClaim=await must('POST','/api/jobs/claim',{deviceId,leaseMs:180000,jobKeys:['catchup_notifications_scan'],capabilities:{creatorEventDrivenSyncV2:true,legacyStorageRetirementV1:true}});
     assert.ok(notificationClaim.job,JSON.stringify(notificationClaim));const njob=notificationClaim.job;let nc=njob.continuation||{driverPhase:'execute',jobContinuation:null};
     const purchase={id:'notification-team-purchase',type:'purchased_message',messageId:'99002',amount:30,currency:'USD',createdAt:new Date(Date.parse(njob.params.to)-1000).toISOString(),user:{id:'21002',username:'ppv_fan'}};
     analytics.handleNetworkAction({...action,fanId:'21002',dialogId:'21002',messageId:'99002',requestId:'team-acceptance-ppv',priceCents:3000,mediaCount:1,mediaIds:['55001'],occurredAt:new Date(Date.parse(purchase.createdAt)-1000).toISOString()});await analytics.flush();
@@ -235,7 +274,7 @@ export function notify(domain){window.dispatchEvent(new Event(domain==='team'?'n
     for(let step=0;step<12;step++){
       const chunk=await m.notificationsCatchupHandler.runChunk({job:njob,creatorId:c,continuation:nc.jobContinuation,signal:new AbortController().signal,ofApi:notificationProvider});
       const next=chunk.outcome==='done'?{driverPhase:'complete',result:chunk.result,progress:chunk.progress}:{driverPhase:'execute',jobContinuation:chunk.continuation};
-      const response=await must('POST',`/api/jobs/${njob.id}/progress`,{deviceId,leaseToken:njob.leaseToken,leaseRevision:njob.leaseRevision,continuation:next,chunkResult:chunk.chunkResult,progress:chunk.progress});nc=response.lease.continuation;
+      const response=await must('POST',`/api/jobs/${njob.id}/progress`,{deviceId,leaseToken:njob.leaseToken,leaseRevision:njob.leaseRevision,expectedContinuation:nc,continuation:next,chunkResult:chunk.chunkResult,progress:chunk.progress});nc=response.lease.continuation;
       if(nc.driverPhase==='complete'){await must('POST',`/api/jobs/${njob.id}/complete`,{deviceId,leaseToken:njob.leaseToken,leaseRevision:njob.leaseRevision,result:nc.result,progress:nc.progress});break;}
     }
     assert.equal(nc.driverPhase,'complete');

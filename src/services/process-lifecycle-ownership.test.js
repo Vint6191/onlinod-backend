@@ -42,6 +42,7 @@ function gate({access=async()=>({status:'READY'}),billing=async()=>({}),durable=
  const ports={
   '../prisma':db,'./billing-execution-access-service':{assertProviderBillingAccess:billing},
   './creator-lifecycle-contention':{isCreatorLifecycleContention:()=>false},
+  './provider-gate-resource-limits':require('./provider-gate-resource-limits'),
   '../middleware/automation-permissions':{requireCreatorAccess:access},'./db-time-authority-service':{dbAuthorityNow:async()=>new Date()},
   './capability-freshness-authority-service':{capabilityFreshnessWindow:()=>({gte:new Date(0),lte:new Date(Date.now()+60000)})},
   './provider-request-credit-authority-service':{PROVIDER_GATE_PERMIT_TTL_MS:10000,PROVIDER_GATE_WAITER_LEASE_MS:15000,PROVIDER_GATE_WAITER_HEARTBEAT_MS:3000,PROVIDER_GATE_FAIRNESS_GENERATION:'g',

@@ -53,6 +53,7 @@ const ROUTE_MANIFEST = Object.freeze([
   route("/api/fan-data", ROUTE_CLASS.CREATOR, "routes/fan-data.js", "canonical creator scope; /observations additionally requires device-bound trusted producer ingress"),
   route("/api/automation", ROUTE_CLASS.CREATOR_DEVICE, "routes/automation-control.js", "creator scope + canonical automation permissions + execution device"),
   route("/api/programmatic-of-write-settlement", ROUTE_CLASS.PUBLIC, "routes/programmatic-of-write-settlement.js", "settlement-only random capability for an already-authorized MASS or exact Custom manual commit; cannot mint new external work"),
+  route("/api/telegram-delivery-settlement", ROUTE_CLASS.PUBLIC, "routes/telegram-delivery-settlement.js", "original Telegram commit claim/device capability; exact scope-bound CONFIRMED/UNKNOWN receipt only; cannot plan, begin, fetch material or enable resend"),
   route("/api/programmatic-of-writes", ROUTE_CLASS.CREATOR_DEVICE, "routes/programmatic-of-writes.js", "shared non-idempotent external-write commit authority; product-specific creator/permission adapters + signed device"),
   route("/api/server/content", ROUTE_CLASS.CREATOR_DEVICE, "routes/content-store.js", "current Message Library authority; generic collections are 410 tombstones", { retiredSubroutes: ["/collections", "/collections/:id", "/collections/:id/blocks", "/collections/:id/usage"] }),
   route("/api/server/crm", ROUTE_CLASS.LEGACY_GONE, "server.js:createLegacyGoneRouter", "410 tombstone; historical/admin archive only", { replacement: "Desktop local CRM authority" }),

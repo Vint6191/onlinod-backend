@@ -120,10 +120,13 @@ test("INT2.5 routes fence each durable realtime commit without replacing busines
   const stats = fs.readFileSync(path.join(__dirname, "../routes/stats.js"), "utf8");
   const statsStart = stats.indexOf('router.post("/creators/:creatorId/notifications/live"');
   const statsBlock = stats.slice(statsStart);
-  assert.match(statsBlock, /const commitGuard = async \(tx\)/);
-  assert.match(statsBlock, /assertRealtimeIngestGenerationCurrent\(\{[\s\S]*db: tx/);
-  assert.match(statsBlock, /ingestNotificationFacts\(\{[\s\S]*db: prisma,[\s\S]*commitGuard/);
-  assert.match(statsBlock, /withRealtimeIngestGenerationFence\(\{[\s\S]*recordNotificationSocketEvent\(\{[\s\S]*db: tx/);
+  assert.match(statsBlock, /withRealtimeIngestGenerationFence\(\{[\s\S]*db: prisma[\s\S]*accessEpoch: memberAccessEpoch/);
+  assert.match(statsBlock, /work: async \(\{ tx \}\) => \{\s*await assertLiveBinding\(tx\)/);
+  assert.match(statsBlock, /ingestNotificationFacts\(\{\s*db:\s*tx/);
+  assert.match(statsBlock, /ingestNotificationSourcePage\(\{\s*db:\s*tx/);
+  assert.match(statsBlock, /ingestLive\(\{\s*db:\s*tx/);
+  assert.match(statsBlock, /acceptDelivery\(\{\s*db:\s*tx/);
+  assert.match(statsBlock, /withRealtimeIngestGenerationFence\(\{[\s\S]*recordNotificationSocketEvent\(\{\s*db:\s*tx/);
 
   const notifications = fs.readFileSync(path.join(__dirname, "notification-facts-service.js"), "utf8");
   const ingestStart = notifications.indexOf("async function ingestNotificationFacts");

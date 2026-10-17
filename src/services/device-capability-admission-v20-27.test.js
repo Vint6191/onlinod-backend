@@ -21,20 +21,34 @@ test("heartbeat keeps liveness distinct from capability while committing agency-
   assert.ok(upsertAt > generationAt, "agency-scoped device liveness mutation must occur inside current membership generation");
   assert.ok(scopeAt > upsertAt && syncAt > scopeAt, "creator capability telemetry follows current member scope in the same transaction");
   assert.match(block.slice(generationAt, syncAt + 400), /currentAccessEpoch: accessEpoch[\s\S]*db: tx/);
-  assert.match(source, /const generationCurrent = expectedAccessEpoch !== null && accessEpoch === expectedAccessEpoch/);
-  assert.match(source, /const realtimeReady = generationCurrent && account\?\.realtimeHealthy === true/);
-  assert.match(source, /allowedCreatorIds && !allowedCreatorIds\.has\(creator\.id\)/);
-  assert.doesNotMatch(source, /status\s*&&\s*status\s*!==\s*["']READY["']/);
+  assert.match(source, /syncBindings/);
 });
 
-test("DeviceCreatorBinding is presence + typed capability telemetry, not universal READY", () => {
-  const source = read("routes/devices.js");
+test("DeviceCreatorBinding is presence + typed capability telemetry, not universal READY", async () => {
+  const source = read("services/device-heartbeat-batch-service.js");
   const schema = fs.readFileSync(path.resolve(root, "../prisma/schema.prisma"), "utf8");
   for (const field of ["sessionReadReady", "sessionWriteReady", "realtimeReady", "pageLocalReady", "browserMaterialized", "browserPresentable", "sessionProofEpoch", "canonicalRevision", "networkRevision", "lastCapabilityAt"]) {
     assert.match(source, new RegExp(field));
     assert.match(schema, new RegExp(`\\b${field}\\b`));
   }
-  assert.match(source, /status: "STALE",[\s\S]{0,240}sessionReadReady: false,[\s\S]{0,160}sessionWriteReady: false/);
+  const writes=[];
+  const result=await require("./device-heartbeat-batch-service").syncBindings({agencyId:"a",deviceId:"d",now:new Date(),currentAccessEpoch:2,
+    allowedCreatorIds:new Set(["allowed"]),accounts:[
+      {creatorId:"allowed",accessEpoch:2,sessionReadReady:true,sessionWriteReady:false},
+      {creatorId:"denied",accessEpoch:2,sessionReadReady:true,sessionWriteReady:true},
+      {creatorId:"allowed",accessEpoch:2,sessionReadReady:true,sessionWriteReady:true},
+    ],db:{
+      $queryRawUnsafe:async()=>[{i:0,id:"allowed"},{i:1,id:"denied"},{i:2,id:"allowed"}],
+      $executeRawUnsafe:async(sql,...args)=>{writes.push({sql,args});return 1;},
+    }});
+  assert.equal(result.accepted,1);assert.equal(result.rejected,2);
+  const [binding]=JSON.parse(writes.find(x=>x.sql.includes('INSERT INTO "DeviceCreatorBinding"')).args[2]);
+  assert.equal(binding.creatorId,"allowed");assert.equal(binding.sessionReadReady,true);
+  assert.equal(binding.sessionWriteReady,false);assert.equal(binding.realtimeReady,false);
+  const stale=writes.find(x=>x.sql.includes("SET status='STALE'"));
+  assert.deepEqual(stale.args[2],["allowed"]);
+  for(const field of ["sessionReadReady","sessionWriteReady","realtimeReady","pageLocalReady","browserMaterialized","browserPresentable"])
+    assert.ok(stale.sql.includes(`"${field}"=false`));
 });
 
 test("readonly leases require SESSION_READ while automation actions require SESSION_WRITE", () => {

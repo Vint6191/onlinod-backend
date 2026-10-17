@@ -35,6 +35,13 @@ const {
 // weighted priority and FIFO order inside each creator on every replica.
 const DEFAULT_INTERVAL_MS = 700;
 const MAX_WAIT_MS = 60_000;
+// Backpressure is local resource admission. PostgreSQL remains the authority
+// for the 700ms creator timeline and FIFO/priority across all replicas.
+const {
+  PROVIDER_GATE_MAX_PENDING: MAX_PENDING_REQUESTS,
+  PROVIDER_GATE_MAX_PENDING_PER_DEVICE: MAX_PENDING_PER_DEVICE,
+  PROVIDER_GATE_MAX_PENDING_PER_CREATOR: MAX_PENDING_PER_CREATOR,
+} = require("./provider-gate-resource-limits");
 const PERMIT_TTL_MS = PROVIDER_GATE_PERMIT_TTL_MS;
 const BACKEND_INSTANCE_ID = cleanInstanceId(process.env.RENDER_INSTANCE_ID || process.env.HOSTNAME) || `backend-${crypto.randomUUID()}`;
 const ACCESS_CACHE_TTL_MS = 60_000;
@@ -54,6 +61,32 @@ let stopController = new AbortController();
 let waiterHeartbeatTimer = null;
 let heartbeatFlight = null;
 const pendingEntries = new Set();
+const pendingByDevice = new Map();
+const pendingByCreator = new Map();
+function pendingDeviceKey(entry) { return JSON.stringify([entry.agencyId, entry.userId, entry.deviceId]); }
+function changePendingCount(map, key, delta) {
+  const count = (map.get(key) || 0) + delta;
+  if (count > 0) map.set(key, count); else map.delete(key);
+}
+function assertQueueCapacity(entry) {
+  if (pendingEntries.size >= MAX_PENDING_REQUESTS
+    || (pendingByDevice.get(pendingDeviceKey(entry)) || 0) >= MAX_PENDING_PER_DEVICE
+    || (pendingByCreator.get(creatorQueueKey(entry.agencyId, entry.creatorId)) || 0) >= MAX_PENDING_PER_CREATOR) {
+    throw Object.assign(new Error("Provider request queue is full; retry after current requests progress"), {
+      code: "OF_GATE_QUEUE_CAPACITY", status: 503, retryable: true, retryAfterMs: 1000,
+    });
+  }
+}
+function addPendingEntry(entry) {
+  pendingEntries.add(entry);
+  changePendingCount(pendingByDevice, pendingDeviceKey(entry), 1);
+  changePendingCount(pendingByCreator, creatorQueueKey(entry.agencyId, entry.creatorId), 1);
+}
+function removePendingEntry(entry) {
+  if (!pendingEntries.delete(entry)) return;
+  changePendingCount(pendingByDevice, pendingDeviceKey(entry), -1);
+  changePendingCount(pendingByCreator, creatorQueueKey(entry.agencyId, entry.creatorId), -1);
+}
 const backgroundFlights = new Set();
 function stoppingError() { return Object.assign(new Error("BACKEND_STOPPING"), { code: "BACKEND_STOPPING", status: 503 }); }
 function trackWork(promise) {
@@ -578,6 +611,7 @@ async function acquireOfRequestSlot(input) {
   await readJobBillingAdmission({ ...billingContext, agencyId: access.agencyId, creatorId,
     deviceId: access.deviceId, capability, operation });
   if (stopping) throw stoppingError();
+  assertQueueCapacity({ agencyId: access.agencyId, userId, creatorId, deviceId: access.deviceId });
   const coordinator = coordinatorFor(access.agencyId, creatorId);
   return new Promise((resolve, reject) => {
     const entry = {
@@ -605,7 +639,8 @@ async function acquireOfRequestSlot(input) {
     const settleReject = (error) => {
       if (entry.settled) return;
       entry.settled = true;
-      pendingEntries.delete(entry);
+      removePendingEntry(entry);
+      takeSpecific(coordinator, entry.id);
       entry.cancelled = true;
       clearTimeout(timer);
       entry.signal?.removeEventListener("abort", onAbort);
@@ -621,6 +656,7 @@ async function acquireOfRequestSlot(input) {
       error.code = "OF_GATE_CANCELLED";
       settleReject(error);
     };
+    addPendingEntry(entry);
     if (entry.signal?.aborted) return onAbort();
     entry.signal?.addEventListener("abort", onAbort, { once: true });
     timer = setTimeout(() => {
@@ -632,13 +668,12 @@ async function acquireOfRequestSlot(input) {
     entry.resolve = (value) => {
       if (entry.settled) return;
       entry.settled = true;
-      pendingEntries.delete(entry);
+      removePendingEntry(entry);
       clearTimeout(timer);
       entry.signal?.removeEventListener("abort", onAbort);
       resolve(value);
     };
     entry.reject = settleReject;
-    pendingEntries.add(entry);
     enqueue(entry);
     setImmediate(() => pump(coordinator));
   });
@@ -821,7 +856,7 @@ module.exports = {
       if (waiterHeartbeatTimer) clearInterval(waiterHeartbeatTimer);
       waiterHeartbeatTimer = null;
       stopping = false; stopPromise = null; stopController = new AbortController();
-      heartbeatFlight = null; pendingEntries.clear(); backgroundFlights.clear();
+      heartbeatFlight = null; pendingEntries.clear(); pendingByDevice.clear(); pendingByCreator.clear(); backgroundFlights.clear();
       coordinators.clear(); accessCache.clear();
     },
   },

@@ -496,13 +496,52 @@ async function main() {
       const tampered = structuredClone(body);
       tampered.events[0].moneyObservation.netCents = 600;
       assert.equal((await request(tampered)).body.code, "LIVE_DELIVERY_PAYLOAD_CONFLICT");
+      const faultEvent=structuredClone(event);
+      Object.assign(faultEvent.moneyObservation,{transactionId:"http-rollback",fanOnlyFansUserId:"987654",fanUsername:"current_fan",
+        revisionAt:new Date(+wall-30000).toISOString()});
+      const nextBody=(events,seq)=>({...body,batchId:"http-authority-"+seq,events,
+        delivery:{...body.delivery,entries:events.map((_,index)=>({seq:seq+index,capturedAt:wall.toISOString()}))}});
+      // Inject a crash after the real money/fan/fact writes, while still inside
+      // the actual HTTP root commit. No monetary implementation is replaced.
+      const realIngest=money.ingestLive;
+      money.ingestLive=async input=>{await realIngest(input);throw Object.assign(Error("INJECTED_AFTER_LIVE_MONEY"),{code:"INJECTED_AFTER_LIVE_MONEY"});};
+      try {assert.equal((await request(nextBody([faultEvent],2))).status,500);}
+      finally {money.ingestLive=realIngest;}
+      for(const [model,where] of [
+        ["creatorFinancialTransaction",{creatorId:s.creatorId,externalTransactionId:"http-rollback"}],
+        ["creatorTip",{creatorId:s.creatorId,externalTransactionId:"http-rollback"}],
+        ["creatorFan",{creatorId:s.creatorId,onlyFansUserId:"987654"}],
+        ["creatorEarningsLedgerEntry",{creatorId:s.creatorId,transactionId:"http-rollback"}],
+      ])assert.equal(await db[model].count({where}),0,model+" escaped failed root commit");
+      let httpSession=await db.creatorRealtimeSession.findFirst({where:{creatorId:s.creatorId,incarnation:body.delivery.sessionId}});
+      assert.equal(httpSession.ackedSeq,1n);
+      assert.equal(await db.creatorRealtimeReceipt.count({where:{sessionId:httpSession.id,seq:2n}}),0);
+      const retried=await request(nextBody([faultEvent],2));assert.equal(retried.status,200,JSON.stringify(retried.body));assert.equal(retried.body.deliveryAck.throughSeq,2);
+      const knownFan=await db.creatorFan.findUnique({where:{creatorId_onlyFansUserId:{creatorId:s.creatorId,onlyFansUserId:"987654"}}});assert(knownFan);
+      const financialWhere={creatorId_externalTransactionId:{creatorId:s.creatorId,externalTransactionId:"http-rollback"}};
+      const knownTransaction=await db.creatorFinancialTransaction.findUnique({where:financialWhere});
+      assert.equal(knownTransaction.fanRecordId,knownFan.id);assert.equal(knownTransaction.fanUsernameAtEvent,"current_fan");
+      assert.equal((await db.creatorTip.findUnique({where:financialWhere})).fanRecordId,knownFan.id);
+      const correction=structuredClone(faultEvent);Object.assign(correction.moneyObservation,{status:"undo",revisionAt:new Date(+wall-10000).toISOString()});
+      delete correction.moneyObservation.fanOnlyFansUserId;delete correction.moneyObservation.fanUsername;
+      assert.equal((await request(nextBody([correction],3))).status,200);
+      let corrected=await db.creatorFinancialTransaction.findUnique({where:financialWhere});
+      assert.equal(corrected.transactionStatus,"undo");assert.equal(corrected.fanRecordId,knownFan.id);assert.equal(corrected.fanUsernameAtEvent,"current_fan");
+      const stale=structuredClone(faultEvent);stale.moneyObservation.fanOnlyFansUserId="999999";
+      assert.equal((await request(nextBody([stale],4))).status,200);
+      assert.equal((await db.creatorFinancialTransaction.findUnique({where:financialWhere})).transactionStatus,"undo");
+      assert.equal(await db.creatorFan.count({where:{creatorId:s.creatorId,onlyFansUserId:"999999"}}),0);
+      const unknown=structuredClone(correction);Object.assign(unknown.moneyObservation,{transactionId:"http-unknown-fan",status:"done"});
+      assert.equal((await request(nextBody([unknown],5))).status,200);
+      assert.equal((await db.creatorFinancialTransaction.findUnique({where:{creatorId_externalTransactionId:{creatorId:s.creatorId,externalTransactionId:"http-unknown-fan"}}})).fanRecordId,null);
+      pass("HTTP live money uses canonical fan authority; crash rolls money/fan/facts/receipt/ACK back together; retry, unknown fan and identity-preserving refund converge");
       await tx((t) =>
         t.deviceCreatorBinding.updateMany({ where: { creatorId: s.creatorId }, data: { realtimeReady: false } })
       );
       const rejected = await request({
         ...body,
         batchId: "http-proof-second",
-        delivery: { ...body.delivery, entries: [{ seq: 2, capturedAt: wall.toISOString() }] },
+        delivery: { ...body.delivery, entries: [{ seq: 6, capturedAt: wall.toISOString() }] },
       });
       assert.equal(rejected.status, 409);
       const [receipt] = await db.$queryRawUnsafe(
@@ -510,7 +549,7 @@ async function main() {
         s.creatorId,
         body.delivery.sessionId
       );
-      assert.equal(receipt.ackedSeq, 1n);
+      assert.equal(receipt.ackedSeq, 5n);
       pass(
         "Desktop normalization -> HTTP access fence -> canonical fact and money -> ACK; replay safe and withdrawn binding cannot advance ACK"
       );

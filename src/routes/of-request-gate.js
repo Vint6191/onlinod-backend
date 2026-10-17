@@ -47,7 +47,11 @@ function validationError(res, error) {
 }
 function serviceError(res, next, error) {
   if (error instanceof z.ZodError) return validationError(res, error);
-  if (error?.status) return res.status(error.status).json({ ok: false, code: error.code || "OF_GATE_FAILED", error: error.message });
+  if (error?.status) {
+    if (error.retryAfterMs) res.setHeader("Retry-After", String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
+    return res.status(error.status).json({ ok: false, code: error.code || "OF_GATE_FAILED", error: error.message,
+      ...(error.retryable ? { retryable: true, retryAfterMs: error.retryAfterMs || 1000 } : {}) });
+  }
   return next(error);
 }
 

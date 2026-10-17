@@ -127,7 +127,7 @@ router.post("/heartbeat", async (req, res) => {
           // Recheck membership before recording coverage and durable recovery
           // requests. A revoked capability must not publish a fresh watermark.
           await require('../services/creator-live-sync-service').recordCaptureSamples({
-            db:tx,agencyId,deviceId:boundDeviceId,memberId:member.id,accessEpoch,bindings:realtimeBindings,now:heartbeatAt,
+            db:tx,agencyId,deviceId:boundDeviceId,memberId:member.id,accessEpoch,bindings:bindings.resolvedAccounts || [],now:heartbeatAt,
           });
           await require('../services/dialog-recovery-queue-service').enqueue({
             db:tx,agencyId,candidates:bindings.recoveryCandidates || [],bindings:realtimeBindings,now:heartbeatAt,

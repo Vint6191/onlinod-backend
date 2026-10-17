@@ -150,8 +150,11 @@ async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntim
   // Claim one quantum at a time: do not hold a large batch's leases while the
   // first item waits. Shared DomainWork claim indexes provide agency fairness.
   let emptyLanes = 0;
-  for (let index = 0; index < Math.max(1, Math.min(16, Number(limit) || 8)); index += 1) {
-    if (performance.now() - started >= maxRuntimeMs) break;
+  for (let index = 0; index < Math.max(3, Math.min(16, Number(limit) || 8)); index += 1) {
+    // Each class receives one bounded opportunity even when an earlier class
+    // consumes the soft slice. Otherwise live receipts can starve both retained
+    // consequence queues indefinitely on every restarted sweep.
+    if (index >= 3 && performance.now() - started >= maxRuntimeMs) break;
     const claim = await work.claimDomainWorkBatch({ db, workClass: ["NOTIFICATION_FACT_RECEIPTS", WORK_CLASS, LEGACY_WORK_CLASS][index % 3], limit: 1,
       perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
     if (claim?.skipped) {

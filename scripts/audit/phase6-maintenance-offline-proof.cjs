@@ -13,13 +13,11 @@ const { PGlite } = require(process.env.ONLINOD_PGLITE_MODULE || '@electric-sql/p
 const admission = require('../../src/services/phase2-maintenance-admission-service');
 const lanes = admission.MAINTENANCE_LANE_NAMES;
 const ROOT = path.resolve(__dirname,'../..');
-const migration = fs.readFileSync(path.join(ROOT,'prisma/migrations/20261009000000_current_baseline/migration.sql'),'utf8')
-  + ['20261009000000_current_baseline','20261009000000_current_baseline'].map(name => {
-    const sql=fs.readFileSync(path.join(ROOT,'prisma/migrations',name,'migration.sql'),'utf8');
-    return '\nBEGIN;\n'+sql.slice(sql.indexOf('INSERT INTO "MaintenanceAdmissionClassState"'));
-  }).join('\n')
-  + fs.readFileSync(path.join(ROOT,'prisma/migrations/20261009000000_current_baseline/migration.sql'),'utf8')
-  + fs.readFileSync(path.join(ROOT,'prisma/migrations/20261009000000_current_baseline/migration.sql'),'utf8');
+const migration = require('../../src/services/database-migration-chain').migrations.map(entry => {
+  const sql = fs.readFileSync(path.join(ROOT,'prisma/migrations',entry.migration,'migration.sql'),'utf8').replace(/\r\n/g,'\n');
+  assert.equal(require('node:crypto').createHash('sha256').update(sql).digest('hex'), entry.checksum);
+  return sql;
+}).join('\n');
 const scheduler = fs.readFileSync(path.join(ROOT,'src/services/job-scheduler.js'),'utf8');
 function adapter(pg,{rollback=false}={}) {
  let transactionOpen=false;const trace=[];
@@ -37,7 +35,7 @@ function adapter(pg,{rollback=false}={}) {
 async function fixture(t) {
  const pg=new PGlite();await pg.waitReady;t.after(()=>pg.close());await pg.exec(migration);
  const fx=adapter(pg);
- return {pg,...fx,adapter:fx,select:(extra={})=>admission.selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes,...extra}),counts:async()=>(await pg.query('SELECT "laneName","turnCount" FROM "MaintenanceAdmissionClassState" WHERE generation=\'phase6_maintenance_registry_v5\' ORDER BY "ordinal"')).rows};
+ return {pg,...fx,adapter:fx,select:(extra={})=>admission.selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes,...extra}),counts:async()=>(await pg.query('SELECT "laneName","turnCount" FROM "MaintenanceAdmissionClassState" WHERE generation=$1 ORDER BY "ordinal"',[admission.MAINTENANCE_ADMISSION_GENERATION])).rows};
 }
 function pumpHarness(db,invoke) {
  require.cache[path.join(ROOT,'src/prisma.js')]={exports:db};
@@ -49,10 +47,20 @@ function pumpHarness(db,invoke) {
  return args=>{
    const restore=[];
    try {
-     for(const lane of registry.MAINTENANCE_LANES){
-       const module=load(lane.module),original=module[lane.method];
-       restore.push(()=>{module[lane.method]=original;});
-       module[lane.method]=()=>invoke(lane.name);
+     const groups = new Map();
+     for (const lane of registry.MAINTENANCE_LANES) {
+       const key = lane.module + ':' + lane.method;
+       if (!groups.has(key)) groups.set(key, []);
+       groups.get(key).push(lane);
+     }
+     for (const group of groups.values()) {
+       const {module: request, method} = group[0], module = load(request), original = module[method];
+       restore.push(() => { module[method] = original; });
+       module[method] = options => {
+         const lane = group.find(candidate => Object.entries(candidate.options).every(([key,value]) => options[key] === value));
+         assert(lane, 'Every retained callback variant must have its own dispatch identity');
+         return invoke(lane.name);
+       };
      }
      return pump(args); // The actual resolver binds every callback before its first await.
    } finally {restore.reverse().forEach(run=>run());}
@@ -72,16 +80,16 @@ function registerTests(){
  test('C1 SQL + actual pump: a failed class stays degraded across other batches until its own retry succeeds',async(t)=>{
   const fx=await fixture(t);let failed=false;
   const pump=pumpHarness(fx.db,async name=>{
-   if(name==='notificationHistoryRepair'&&!failed){failed=true;throw Object.assign(Error('controlled repair failure'),{code:'NOTIFICATION_HISTORY_CURSOR_INVALID'});}
+   if(name==='notificationConsequences'&&!failed){failed=true;throw Object.assign(Error('controlled repair failure'),{code:'CONTROLLED_NOTIFICATION_FAILURE'});}
    return{ok:true};
   });
   const scheduler=require('../../src/services/job-scheduler');
   for(let i=0;i<Math.ceil(lanes.length/5);i++){
    const result=await pump({db:fx.db});scheduler._test.handleMaintenanceTickResult(result);
    assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.status,'DEGRADED');
-   assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.lastReason,'notificationHistoryRepair:NOTIFICATION_HISTORY_CURSOR_INVALID');
+   assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.lastReason,'notificationConsequences:CONTROLLED_NOTIFICATION_FAILURE');
   }
-  const retry=await pump({db:fx.db});assert.equal(retry.notificationHistoryRepair.ok,true);
+  const retry=await pump({db:fx.db});assert.equal(retry.notificationConsequences.ok,true);
   scheduler._test.handleMaintenanceTickResult(retry);
   assert.equal(scheduler.getRecurringSchedulerHealthSnapshot().maintenance.status,'HEALTHY');
  });
@@ -95,7 +103,7 @@ function registerTests(){
   const counts=(await fx.counts()).map(r=>Number(r.turnCount));
   assert.equal(seen.size,lanes.length);assert.equal(counts.reduce((a,b)=>a+b,0),500);assert.ok(Math.max(...counts)-Math.min(...counts)<=1);
   const diagnostics=await admission.readMaintenanceAdmissionProgress({db:{$queryRawUnsafe:async(sql,...params)=>(await fx.pg.query(sql,params)).rows}});
-  assert.equal(diagnostics.minimumTurns,String(Math.floor(500/lanes.length)));assert.equal(diagnostics.maximumTurns,String(Math.ceil(500/lanes.length)));assert.equal(diagnostics.spread,'1');assert.equal(diagnostics.readOnly,true);
+  assert.equal(diagnostics.minimumTurns,String(Math.floor(500/lanes.length)));assert.equal(diagnostics.maximumTurns,String(Math.ceil(500/lanes.length)));assert.equal(diagnostics.spread,500%lanes.length?'1':'0');assert.equal(diagnostics.readOnly,true);
 
  });
  test('C1 SQL: 100 fresh client wrappers share progress (serialized WASM backend)',async(t)=>{

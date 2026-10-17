@@ -190,17 +190,22 @@ async function runTrafficProjectionSweep({ db, limit = 4, maxRuntimeMs = 5000 })
       let group=facts&&groups.find(rows=>rows.length<FACT_PAGE && rows[0].agencyId===item.agencyId && rows[0].creatorId===item.creatorId);
       if(!group){group=[];groups.push(group);}group.push(item);
     }
+    let completedUnits = 0;
     for (const items of groups) {
-      if (performance.now() - started >= classBudget) {
+      if (completedUnits > 0 && performance.now() - started >= classBudget) {
         for (const item of items) await yieldDomainWorkClaim({ db, item, ownerToken: batch.ownerToken });
         continue;
       }
       if(items.length>1) {
-        try {results.push(...await runTrafficProjectionItems({db,items,ownerToken:batch.ownerToken}));continue;}
+        try {results.push(...await runTrafficProjectionItems({db,items,ownerToken:batch.ownerToken}));completedUnits++;continue;}
         catch (_) { /* The whole batch rolled back. Isolate a bad/stolen item below. */ }
       }
+      let isolated = 0;
       for (const item of items) {
-        if (performance.now() - started >= classBudget) {
+        // A rolled-back batch is not a completed unit. Even if it consumed the
+        // slice, isolate one item so a poison row gets an explicit failure and
+        // healthy work cannot become an endless sequence of successful yields.
+        if (isolated > 0 && performance.now() - started >= classBudget) {
           await yieldDomainWorkClaim({ db, item, ownerToken: batch.ownerToken });
           continue;
         }
@@ -209,6 +214,8 @@ async function runTrafficProjectionSweep({ db, limit = 4, maxRuntimeMs = 5000 })
           await failDomainWorkClaim({ db, item, ownerToken: batch.ownerToken, error });
           results.push({ error: String(error.code || error.message) });
         }
+        isolated++;
+        completedUnits++;
       }
     }
   }

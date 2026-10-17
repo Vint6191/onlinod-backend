@@ -22,10 +22,10 @@ function mountedFamilies() {
   return out;
 }
 
-test("Audit16 route manifest exactly classifies all 54 production route families including 6D commands", () => {
+test("Audit16 route manifest exactly classifies all 55 production route families including commit-only Telegram settlement", () => {
   const mounted = mountedFamilies();
-  assert.equal(mounted.length, 54, `expected 54 route families, got ${mounted.length}`);
-  assert.equal(ROUTE_MANIFEST.length, 54, "manifest must classify exactly 54 route families");
+  assert.equal(mounted.length, 55, `expected 55 route families, got ${mounted.length}`);
+  assert.equal(ROUTE_MANIFEST.length, 55, "manifest must classify exactly 55 route families");
   assert.deepEqual(new Set(ROUTE_MANIFEST.map((x) => x.path)), new Set(mounted));
   const valid = new Set(Object.values(ROUTE_CLASS));
   for (const entry of ROUTE_MANIFEST) {
@@ -113,8 +113,9 @@ test("Audit16 Stats, Traffic and Fan Data use canonical creator scope and canoni
   assert.match(liveRoute, /const memberAccessEpoch = ctx\.member\?\.accessEpoch/);
   assert.match(liveRoute, /Number\.isInteger\(memberAccessEpoch\)/);
   assert.match(liveRoute, /accessEpoch:\s*memberAccessEpoch/);
-  assert.match(liveRoute, /commitGuard/);
-  assert.match(liveRoute, /assertRealtimeIngestGenerationCurrent/);
+  assert.match(liveRoute, /withRealtimeIngestGenerationFence\(\{[\s\S]*accessEpoch:\s*memberAccessEpoch/);
+  assert.match(liveRoute, /work: async \(\{ tx \}\) => \{\s*await assertLiveBinding\(tx\)/);
+  assert.match(liveRoute, /ingestNotificationFacts\(\{\s*db:\s*tx/);
   assert.match(liveRoute, /res\.status\(Number\(error\?\.status\) \|\| 500\)/);
   assert.doesNotMatch(liveRoute, /requireRefreshPermission/);
   assert.match(stats, /router\.post\("\/creators\/:creatorId\/messages-daily", legacyStatsGone\)/);

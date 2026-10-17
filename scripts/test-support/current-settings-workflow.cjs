@@ -84,7 +84,7 @@ exports.runSettings = async function (f) {
         validForMs: 90000,
         creators: creatorIds.map((creatorId) => ({ creatorId, allowed: true, validForMs: 90000, reason: "TRIAL" })),
       },
-    });
+    }, "billing authority refresh", { renewUnchanged: true });
   publish();
   let renewal = setInterval(publish, 30000);
   const api = {
@@ -236,6 +236,21 @@ exports.runSettings = async function (f) {
     return { entered, release };
   };
   let server, browser, page;
+  // Headless Chromium can stall its image compositor after fonts are ready.
+  // Capture is diagnostic evidence; functional assertions below remain required.
+  results.visualCaptures = [];
+  const capture = async (name) => {
+    try {
+      await page.screenshot({ path: path.join(output, `${name}.png`), fullPage: true, animations: "disabled", timeout: 10000 });
+      results.visualCaptures.push({ name, ok: true });
+    } catch (error) {
+      results.visualCaptures.push({ name, ok: false, error: error.message });
+      const text = await page.locator("body").innerText({ timeout: 3000 }).catch(() => "DOM text unavailable");
+      fs.writeFileSync(path.join(output, `${name}.txt`), text);
+      const limitation = "Some diagnostic screenshots could not be captured by headless Chromium; DOM text is retained and visual verification is incomplete";
+      if (!results.limitations.includes(limitation)) results.limitations.push(limitation);
+    }
+  };
   try {
     const renderer = path.join(desktop, "apps/desktop/renderer/src"),
       entry = path.join(scratch, "settings-renderer.tsx"),
@@ -272,7 +287,8 @@ export function context(projection){acceptRendererAuthorizationProjection(projec
       );
     });
     await new Promise((r) => server.listen(0, "127.0.0.1", r));
-    const chromium = runtime("@sparticuz/chromium");
+    const chromiumModule = runtime("@sparticuz/chromium");
+    const chromium = chromiumModule.default || chromiumModule;
     browser = await runtime("playwright").chromium.launch({
       executablePath: process.env.ONLINOD_CHROMIUM_PATH || (await chromium.executablePath()),
       args: chromium.args,
@@ -743,7 +759,7 @@ export function context(projection){acceptRendererAuthorizationProjection(projec
     pass(
       "Server-authorized explicit test price starts one monthly period; cancel/resume renewal preserves paid access and does not debit twice"
     );
-    await page.screenshot({ path: path.join(output, "billing.png"), fullPage: true });
+    await capture("billing");
 
     const second = await must("POST", "/api/auth/login", {
       email: "owner@example.test",
@@ -806,7 +822,7 @@ export function context(projection){acceptRendererAuthorizationProjection(projec
 
     failRead = "settings.getEncryptionState";
     failuresLeft = 2;
-    await page.getByRole("button", { name: "Encryption recovery", exact: true }).click();
+    await tab("Encryption");
     await page.getByRole("button", { name: "Retry encryption state", exact: true }).click();
     await page.getByText("ROOT V1", { exact: true }).waitFor();
     const enc = await settings.getEncryptionState();
@@ -826,7 +842,7 @@ export function context(projection){acceptRendererAuthorizationProjection(projec
     );
 
     await tab("My Account");
-    await page.screenshot({ path: path.join(output, "account.png"), fullPage: true });
+    await capture("account");
     const old = hold("settings.getState");
     await refresh();
     await old.entered;
@@ -855,7 +871,7 @@ export function context(projection){acceptRendererAuthorizationProjection(projec
         .locator("body")
         .innerText()
         .catch(() => null);
-      await page.screenshot({ path: path.join(output, "failure.png"), fullPage: true }).catch(() => {});
+      await capture("failure");
     }
     throw e;
   } finally {

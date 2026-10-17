@@ -74,14 +74,36 @@ async function readPublishedEarningsAggregates({ db, creatorIds, from, to, now, 
     // One PostgreSQL statement is one snapshot, including inside a caller's
     // READ COMMITTED billing transaction. Never combine independent counts and
     // sums across commits. SQL returns <=250 aggregates, not every daily row.
+    // Ledger ownership has the same precedence as the day/Home readers. A
+    // partial boundary day is unavailable, never permission to substitute an
+    // older competing published amount. Freshness keeps the caller's age policy
+    // while preserving recovery, unresolved-money and capture-gap fences.
     const batch = await db.$queryRawUnsafe(`/* published_earnings_aggregate_v1 */
-      SELECT d."creatorId",COUNT(*)::bigint AS days,SUM(d."totalCents")::bigint AS cents,
-        MAX(d."collectedAt") AS captured,
-        COUNT(*) FILTER (WHERE ${earningsObservationSql()} BETWEEN ($4::timestamptz AT TIME ZONE 'UTC') AND ($5::timestamptz AT TIME ZONE 'UTC'))::bigint AS fresh
-      FROM "CreatorEarningsPublishedDay" d ${publishedEarningsJoins()}
-      WHERE d."creatorId"=ANY($1::text[]) AND d."sourceTimezone"='UTC' AND d."date" BETWEEN ($2::timestamptz AT TIME ZONE 'UTC')::date AND ($3::timestamptz AT TIME ZONE 'UTC')::date
-        AND v."status"='COMPLETE'
-      GROUP BY d."creatorId"`, ids.slice(offset, offset+CREATOR_BATCH), from, to, freshAfter, freshBefore);
+      WITH live_scope AS (SELECT id,"agencyId" FROM "CreatorAccount" WHERE id=ANY($1::text[]) AND "deletedAt" IS NULL),
+      periods AS (SELECT 0 AS period,($2::timestamptz AT TIME ZONE 'UTC')::date AS start_day,($3::timestamptz AT TIME ZONE 'UTC')::date AS end_day),
+      ${require("./earnings-live-read-sql").liveLedgerDailySql("live_scope","$6")},
+      authoritative_days AS MATERIALIZED (
+        SELECT l."creatorId",l.date,l."totalCents",l."collectedAt",
+          (NOT a.recovering AND NOT a.unresolved AND a."shortGapFrom" IS NULL
+            AND l.observed BETWEEN ($4::timestamptz AT TIME ZONE 'UTC') AND ($5::timestamptz AT TIME ZONE 'UTC')) AS fresh
+        FROM ledger_daily l JOIN ledger_authority a ON a.id=l."creatorId"
+        WHERE l.date::timestamp>=a."fromAt"
+          AND l.date::timestamp+interval '1 day'<=${require("./earnings-live-read-sql").coverageThroughSql()}
+      ), usable_days AS (
+        SELECT * FROM authoritative_days
+        UNION ALL
+        SELECT d."creatorId",d.date,d."totalCents",d."collectedAt",
+          (${earningsObservationSql()} BETWEEN ($4::timestamptz AT TIME ZONE 'UTC') AND ($5::timestamptz AT TIME ZONE 'UTC')
+            AND NOT EXISTS(SELECT 1 FROM ledger_authority a WHERE a.id=d."creatorId"
+              AND (a.recovering OR a.unresolved OR a."shortGapFrom" IS NOT NULL))) AS fresh
+        FROM "CreatorEarningsPublishedDay" d ${publishedEarningsJoins()}
+        WHERE d."creatorId"=ANY($1::text[]) AND d."sourceTimezone"='UTC' AND d."date" BETWEEN ($2::timestamptz AT TIME ZONE 'UTC')::date AND ($3::timestamptz AT TIME ZONE 'UTC')::date
+          AND v."status"='COMPLETE'
+          AND NOT EXISTS(SELECT 1 FROM ledger_daily l WHERE l."creatorId"=d."creatorId" AND l.date=d.date)
+      )
+      SELECT "creatorId",COUNT(*)::bigint AS days,SUM("totalCents")::bigint AS cents,
+        MAX("collectedAt") AS captured,COUNT(*) FILTER (WHERE fresh)::bigint AS fresh
+      FROM usable_days GROUP BY "creatorId"`, ids.slice(offset, offset+CREATOR_BATCH), from, to, freshAfter, freshBefore, now);
     rows.push(...batch.map(row => ({ ...row, days: integer(row.days), cents: integer(row.cents), fresh: integer(row.fresh) })));
   }
   return new Map(rows.map(row => [row.creatorId, row]));

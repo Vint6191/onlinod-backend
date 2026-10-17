@@ -81,7 +81,7 @@ exports.runCustoms = async function runCustoms(f) {
         validForMs: 90000,
         creators: creatorIds.map((creatorId) => ({ creatorId, allowed: true, validForMs: 90000, reason: "TRIAL" })),
       },
-    });
+    }, "billing authority refresh", { renewUnchanged: true });
   publish();
   const faults = [],
     faultEvents = [],
@@ -89,6 +89,9 @@ exports.runCustoms = async function runCustoms(f) {
   globalThis.fetch = async (input, options) => {
     const url = new URL(String(input));
     assert.equal(url.origin, api.apiBase, "Fixture may only contact its isolated Backend");
+    if (url.pathname.startsWith('/api/telegram-delivery-settlement/')) {
+      assert.equal(new Headers(options?.headers).get('authorization'), null, 'Telegram provider receipt must not borrow a current login');
+    }
     const fault = faults.find((x) => x.remaining > 0 && x.match(url.pathname));
     if (fault && fault.phase === "before") {
       fault.remaining--;
@@ -555,7 +558,7 @@ exports.runCustoms = async function runCustoms(f) {
 
     const confirmLoss = fault(
       "telegram-confirm-response-loss",
-      (p) => p.includes("/telegram-deliveries/") && p.endsWith("/confirm"),
+      (p) => p.startsWith("/api/telegram-delivery-settlement/"),
       "after",
       100
     );
@@ -563,12 +566,40 @@ exports.runCustoms = async function runCustoms(f) {
       confirmLost = await makeOrder("Lost Telegram confirm response");
     assert.equal(sends.length, beforeConfirm + 1);
     assert.equal(custom.telegramDeliveries.settlements(100).length, 1);
+    const savedReceipt = custom.telegramDeliveries.settlements(100)[0];
+    const settlementBody = { authorityVersion: 'TELEGRAM_COMMIT_RECEIPT_V1', deviceId: savedReceipt.deviceId,
+      claimToken: savedReceipt.claimToken, creatorId: savedReceipt.creatorId, accountId: savedReceipt.accountId,
+      kind: savedReceipt.kind, outcome: savedReceipt.outcome, remoteMessageId: savedReceipt.remoteMessageId,
+      remoteRecipientTelegramUserId: savedReceipt.remoteRecipientTelegramUserId, remoteSentAt: savedReceipt.remoteSentAt };
+    const rawSettlement = async (change = {}) => {
+      const response = await nativeFetch(savedReceipt.apiBase + '/api/telegram-delivery-settlement/' + savedReceipt.intentId, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...settlementBody, ...change }),
+      });
+      return { status: response.status, data: await response.json() };
+    };
+    assert.equal((await rawSettlement({ claimToken: 'wrong-secret-claim-with-no-ownership' })).status, 403);
+    assert.equal((await rawSettlement({ deviceId: 'other-device' })).status, 403);
+    assert.equal((await rawSettlement({ accountId: 'other-account' })).status, 409);
+    assert.equal((await rawSettlement({ remoteMessageId: String(Number(savedReceipt.remoteMessageId) + 10) })).status, 409);
+    assert.equal((await rawSettlement({ remoteSentAt: '2000-01-01T00:00:00.000Z' })).status, 409);
+    assert.equal((await rawSettlement({ outcome: 'PROVEN_NOT_SENT' })).status, 400);
     await restart();
     confirmLoss.remaining = 0;
-    await custom.sendTelegram({ creatorId: c, orderId: confirmLost.order.id });
+    const savedApiRequest = customApi.request, savedApiBase = customApi.apiBase;
+    try {
+      customApi.apiBase = 'https://later-login.example.test';
+      customApi.request = async () => { throw Object.assign(Error('logged out'), { code: 'SESSION_CLOSED' }); };
+      await custom.flushTelegramSettlementOutbox();
+      assert.equal(custom.telegramDeliveries.settlements(100).length, 0);
+    } finally { customApi.request = savedApiRequest; customApi.apiBase = savedApiBase; }
+    const acknowledged = await rawSettlement();
+    assert.equal(acknowledged.status, 200);
+    assert.deepEqual(Object.keys(acknowledged.data).sort(), ['idempotent', 'intentId', 'ok', 'state']);
     assert.equal(sends.length, beforeConfirm + 1);
     assert.equal(custom.telegramDeliveries.settlements(100).length, 0);
-    pass("Confirmed Telegram receipt survives SQLite reopen and settles without a duplicate task");
+    await custom.sendTelegram({ creatorId: c, orderId: confirmLost.order.id });
+    assert.equal(sends.length, beforeConfirm + 1);
+    pass("Confirmed Telegram receipt survives SQLite reopen, logout and backend-host switch; exact capability replay settles with no duplicate task or private payload");
 
     unknownTelegram = true;
     const beforeUnknown = sends.length,

@@ -5,7 +5,7 @@ const runtimePath=process.env.ONLINOD_SQL_PROOF_RUNTIME;
 if(!runtimePath)throw Error('Set ONLINOD_SQL_PROOF_RUNTIME to a separate local SQL proof runtime');
 const runtimeLoad=createRequire(path.resolve(runtimePath,'package.json'));
 const {PGlite}=runtimeLoad('@electric-sql/pglite');
-const {PGLiteSocketServer}=runtimeLoad('@electric-sql/pglite-socket');
+const {createPgliteSocketServer}=require('../test-support/pglite-socket-runtime.cjs');
 const root=path.resolve(__dirname,'../..'),load=createRequire(path.join(root,'package.json'));
 const w=process.env.ONLINOD_SQL_PROOF_OUTPUT?path.resolve(process.env.ONLINOD_SQL_PROOF_OUTPUT):fs.mkdtempSync(path.join(require('node:os').tmpdir(),'nod-current-proof-'));
 fs.mkdirSync(path.join(w,'evidence'),{recursive:true});
@@ -13,15 +13,14 @@ const report={ok:false,nativePostgres:false,engine:'PGlite PostgreSQL 18.3 + rea
 async function run(name,fn){await fn();report.cases.push({name,ok:true});console.log('PASS',name);}
 function cli(url,label){return new Promise((resolve,reject)=>{
  const log=fs.openSync(path.join(w,'evidence',label+'.log'),'w');
- const child=spawn(process.execPath,['scripts/database/install-current.js'],{cwd:root,env:{...process.env,DATABASE_URL:url},stdio:['ignore',log,log]});
+ // Invoke the same installer entry point and retain unexpected protocol errors
+ // in this isolated fixture's log instead of losing them behind a generic code.
+ const child=spawn(process.execPath,['-e',`const installer=require('./scripts/database/install-current.js');installer.main([]).catch(error=>{installer.reportFailure(error);console.error(error.stack||error);process.exitCode=1;});`],{cwd:root,env:{...process.env,DATABASE_URL:url},stdio:['ignore',log,log]});
  const timer=setTimeout(()=>child.kill('SIGTERM'),90000);
  child.once('error',reject);child.once('exit',code=>{clearTimeout(timer);fs.closeSync(log);code===0?resolve():reject(Error(label+': exit '+code));});
 });}
 (async()=>{let engine,server,db;const keep=setInterval(()=>{},1000);try{
- engine=await PGlite.create();server=new PGLiteSocketServer({db:engine,host:'127.0.0.1',port:0});
- // PGlite shares one PostgreSQL session; reset it between sequential clients.
- server.addEventListener('connection',()=>{engine.exec('DISCARD ALL').catch(e=>console.error('session reset:',e.message));});
- await server.start();
+ engine=await PGlite.create();server=await createPgliteSocketServer({engine,load:runtimeLoad,debug:process.env.ONLINOD_SQL_DEBUG==='1'});
  const url=`postgresql://postgres:postgres@${server.getServerConn()}/postgres?connection_limit=1&sslmode=disable`;
  process.env.DATABASE_URL=url;process.env.JWT_SECRET='nod-isolated-proof-only-not-a-real-secret';
  await run('actual installer accepts an empty database',()=>cli(url,'clean-install-first'));
@@ -88,6 +87,7 @@ function cli(url,label){return new Promise((resolve,reject)=>{
  });
  await run('last operational owner cannot be disabled',async()=>{
   await db.$disconnect();
+  await server.waitForIdle();
   await engine.exec("BEGIN; SELECT set_config('onlinod.phase2_team_control_plane_generation','phase2_team_control_plane_v2_durable_access',true)");
   await engine.query('UPDATE "AgencyMember" SET "deactivatedAt"=now() WHERE id=$1',[fixture.member.id]);
   await assert.rejects(engine.exec('COMMIT'),/OWNER/);

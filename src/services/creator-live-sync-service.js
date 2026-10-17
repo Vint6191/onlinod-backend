@@ -107,8 +107,12 @@ async function recordCaptureSample(input) {
 async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,bindings,now}) {
   const input=[...new Map(bindings.map(x=>[x.creatorId,x])).values()].sort((a,b)=>a.creatorId.localeCompare(b.creatorId)),output=[];
   for(let offset=0;offset<input.length;offset+=500) {
-    const samples=[];
-    for(const entry of input.slice(offset,offset+500)) {
+    const batch=input.slice(offset,offset+500),samples=[];
+    // API readiness admits recovery work; it is not evidence of live capture.
+    // Lock the union before taking any session locks, including on a heartbeat
+    // where some creators have an API session but no healthy websocket yet.
+    const readyIds=batch.filter(entry=>entry.account?.sessionReadReady===true).map(entry=>entry.creatorId);
+    for(const entry of batch) {
       const o=entry.account?.observation,at=date(entry.account?.lastWsFrameAt),through=date(o?.capturedThroughAt);
       if(o?.version===1 && o.moneyRevisionVersion!==1){output.push({recorded:false,reason:"money_revision_protocol_required"});continue;}
       if(o?.version!==1 || !entry.account.realtimeHealthy || !at || !through || +at>+now+30000 || +now-at>SAMPLE_MAX_AGE_MS || +through>+at)continue;
@@ -116,17 +120,22 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
       samples.push({creatorId:entry.creatorId,id:key(entry.creatorId,deviceId,o.sessionId),incarnation:o.sessionId,through,seq:o.capturedThroughSeq,
         lossRevision:validSequence(o.lossRevision)?o.lossRevision:o.loss===true?1:0,from:date(o.captureFromAt)});
     }
-    if(!samples.length)continue;
-    const ids=samples.map(x=>x.creatorId);
+    const ids=[...new Set([...samples.map(x=>x.creatorId),...readyIds])].sort();
+    if(!ids.length)continue;
     await db.$executeRawUnsafe(`INSERT INTO "CreatorLiveSync"("creatorId","agencyId")
       SELECT x,$1 FROM unnest($2::text[]) x ORDER BY x ON CONFLICT("creatorId") DO NOTHING`,agencyId,ids);
     // Lock state before inserting sessions, including first contact after sleep.
     await db.$queryRawUnsafe(`SELECT "creatorId" FROM "CreatorLiveSync" WHERE "agencyId"=$1 AND "creatorId"=ANY($2::text[])
       ORDER BY "creatorId" FOR UPDATE`,agencyId,ids);
-    await db.$executeRawUnsafe(`INSERT INTO "CreatorRealtimeSession"(id,"agencyId","creatorId","deviceId","memberId","accessEpoch",incarnation)
+    if(samples.length)await db.$executeRawUnsafe(`INSERT INTO "CreatorRealtimeSession"(id,"agencyId","creatorId","deviceId","memberId","accessEpoch",incarnation)
       SELECT x.id,$1,x."creatorId",$2,$3,$4,x.incarnation FROM jsonb_to_recordset($5::jsonb) x(id text,"creatorId" text,incarnation text)
       ORDER BY x."creatorId" ON CONFLICT(id) DO NOTHING`,agencyId,deviceId,memberId,accessEpoch,JSON.stringify(samples));
-    const states=await db.$queryRawUnsafe(`SELECT l.*,row_to_json(s) AS session,p."throughAt" AS baseline,
+    const states=samples.length?await db.$queryRawUnsafe(`SELECT l.*,row_to_json(s) AS session,p."throughAt" AS baseline,
+      (SELECT min(w."throughAt") FROM "CreatorRecoveryWatermark" w WHERE w."creatorId"=l."creatorId" AND w.stream=ANY($6::text[])
+        HAVING count(*)=cardinality($6::text[])) AS "recoveryCoveredThrough",
+      (SELECT jsonb_object_agg(q.stream,q."targetAt") FROM (
+        SELECT i.stream,max(i."targetAt") AS "targetAt" FROM "CreatorRecoveryIntent" i
+        WHERE i."creatorId"=l."creatorId" AND i.status<>'COMPLETE' GROUP BY i.stream) q) AS "recoveryQueuedThrough",
       CASE WHEN s."capturedAt" IS NULL THEN EXISTS(SELECT 1 FROM "CreatorRealtimeSession" old
         WHERE old."creatorId"=l."creatorId" AND old."deviceId"=$4 AND old.id<>s.id AND old."capturedSeq">old."ackedSeq"
         AND old."updatedAt">$5::timestamp-interval '30 days') ELSE false END AS abandoned,
@@ -139,7 +148,7 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
         ) history GROUP BY stream) completed) ELSE NULL END AS recovered
       FROM "CreatorLiveSync" l JOIN "CreatorRealtimeSession" s ON s.id=ANY($3::text[]) AND s."creatorId"=l."creatorId"
       LEFT JOIN "CreatorEarningsLedgerProof" p ON p."creatorId"=l."creatorId"
-      WHERE l."agencyId"=$1 AND l."creatorId"=ANY($2::text[]) ORDER BY l."creatorId"`,agencyId,ids,samples.map(x=>x.id),deviceId,now);
+      WHERE l."agencyId"=$1 AND l."creatorId"=ANY($2::text[]) ORDER BY l."creatorId"`,agencyId,ids,samples.map(x=>x.id),deviceId,now,STREAMS):[];
     const byId=new Map(states.map(x=>[x.creatorId,x])),writes=[],intents=[],wake=[];
     for(const x of samples) {
       const l=byId.get(x.creatorId),s=l?.session;
@@ -153,13 +162,33 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
         if(s.lossAt && date(s.lossAt)<=l.recovered)resolved=Number(s.lossRevision);
         if(shortFrom && (shortTo||shortFrom)<=l.recovered){shortFrom=null;shortTo=null;}
       }
-      const previous=date(l.lastCapturedAt)||date(l.baseline),continuous=previous&&x.from&&x.from<=x.through&&+x.from<=+previous+SAMPLE_MAX_AGE_MS;
+      const captured=date(l.lastCapturedAt)||date(l.baseline),recoveredThrough=date(l.recoveryCoveredThrough);
+      // Provider recovery is interval coverage, not live freshness. It can
+      // suppress a repeated old gap when the websocket finally returns, but
+      // must never advance lastCapturedAt or lastDeliveredAt by itself.
+      const previous=captured&&recoveredThrough?new Date(Math.max(+captured,+recoveredThrough)):captured||recoveredThrough,
+        continuous=previous&&x.from&&x.from<=x.through&&+x.from<=+previous+SAMPLE_MAX_AGE_MS;
       const gap=previous&&!continuous?+x.through-previous:0,longGap=previous&&gap>=OFFLINE_GAP_MS;
       const captureLoss=x.lossRevision>Number(s.lossRevision)||l.abandoned,delivered=Number(s.ackedSeq)>=x.seq;
       if(longGap||captureLoss) {
-        const from=previous||x.through,reason=captureLoss?"CAPTURE_LOSS":"OFFLINE_GAP",recoveryKey=key(x.creatorId,from.toISOString(),x.through.toISOString(),reason);
-        for(const stream of STREAMS)intents.push({id:key(recoveryKey,stream),creatorId:x.creatorId,stream,reason,from,through:x.through});
-        wake.push(x.creatorId);
+        const reason=captureLoss?"CAPTURE_LOSS":"OFFLINE_GAP";
+        for(const stream of STREAMS) {
+          const queued=date(l.recoveryQueuedThrough?.[stream]);
+          const from=!captureLoss&&queued&&queued>(previous||x.through)?queued:previous||x.through;
+          if(!captureLoss&&queued&&+x.through-from<OFFLINE_GAP_MS) {
+            // An API-only heartbeat may have already queued this interval.
+            // Preserve that immutable target. A later, uncovered short tail
+            // remains explicit debt until proof covers it; it is not capture.
+            if(+x.through-from>SAMPLE_MAX_AGE_MS) {
+              shortFrom=!shortFrom||from<shortFrom?from:shortFrom;
+              shortTo=!shortTo||x.through>shortTo?x.through:shortTo;
+            }
+            continue;
+          }
+          const recoveryKey=key(x.creatorId,from.toISOString(),x.through.toISOString(),reason);
+          intents.push({id:key(recoveryKey,stream),creatorId:x.creatorId,stream,reason,from,through:x.through});
+          wake.push(x.creatorId);
+        }
       }
       if(previous&&gap>SAMPLE_MAX_AGE_MS&&!longGap){shortFrom=!shortFrom||previous<shortFrom?previous:shortFrom;shortTo=!shortTo||x.through>shortTo?x.through:shortTo;}
       const changed=!s.capturedAt||s.retiredAt||Number(s.capturedSeq)!==x.seq||x.lossRevision!==Number(s.lossRevision)
@@ -179,11 +208,44 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
         FROM jsonb_to_recordset($1::jsonb) x("creatorId" text,through timestamp,delivered boolean,"shortFrom" timestamp,"shortTo" timestamp)
         WHERE l."creatorId"=x."creatorId"`,json,now);
     }
+    if(readyIds.length) {
+      // Evaluate after capture writes: another receiver or a continuous local
+      // journal may already cover the apparent disconnect. Only a real,
+      // uncovered interval creates debt. A running traversal has a frozen
+      // target; repeated heartbeats must not move it or multiply its jobs.
+      // Completed watermarks survive intent retention and service restarts.
+      // A proved short interruption also needs eventual repair: fresh later
+      // capture cannot erase it. After one hour of age repair its fixed end,
+      // rather than turning continuous healthy capture into recurring scans.
+      const gaps=await db.$queryRawUnsafe(`/* api_ready_recovery_debt_v1 */
+        SELECT l."creatorId",s.stream,g."gapFrom",
+          CASE WHEN c."coveredAt"<=($4::timestamptz AT TIME ZONE 'UTC')-($5::bigint*interval '1 millisecond')
+            THEN ($4::timestamptz AT TIME ZONE 'UTC') ELSE l."shortGapTo" END AS "targetAt"
+        FROM "CreatorLiveSync" l CROSS JOIN unnest($3::text[]) s(stream)
+        LEFT JOIN "CreatorEarningsLedgerProof" p ON p."creatorId"=l."creatorId" AND p."agencyId"=l."agencyId"
+        LEFT JOIN "CreatorRecoveryWatermark" w ON w."creatorId"=l."creatorId" AND w.stream=s.stream
+        CROSS JOIN LATERAL (SELECT GREATEST(COALESCE(l."lastCapturedAt",p."throughAt"),w."throughAt") AS "coveredAt") c
+        CROSS JOIN LATERAL (SELECT LEAST(c."coveredAt",CASE WHEN l."shortGapTo">COALESCE(
+          GREATEST(w."throughAt",CASE WHEN s.stream='financial' THEN p."throughAt" END),'-infinity'::timestamp)
+          THEN GREATEST(l."shortGapFrom",w."throughAt",CASE WHEN s.stream='financial' THEN p."throughAt" END)
+          END) AS "gapFrom") g
+        WHERE l."agencyId"=$1 AND l."creatorId"=ANY($2::text[])
+          AND g."gapFrom"<=($4::timestamptz AT TIME ZONE 'UTC')-($5::bigint*interval '1 millisecond')
+          AND NOT EXISTS(SELECT 1 FROM "CreatorRecoveryIntent" i WHERE i."creatorId"=l."creatorId"
+            AND i.stream=s.stream AND i.status<>'COMPLETE')
+        ORDER BY l."creatorId",s.stream`,agencyId,readyIds,STREAMS,now,OFFLINE_GAP_MS);
+      for(const gap of gaps) {
+        const from=date(gap.gapFrom),through=date(gap.targetAt),reason="OFFLINE_GAP";
+        intents.push({id:key(key(gap.creatorId,from.toISOString(),through.toISOString(),reason),gap.stream),
+          creatorId:gap.creatorId,stream:gap.stream,reason,from,through});
+        wake.push(gap.creatorId);
+      }
+    }
     if(intents.length) {
       await db.$executeRawUnsafe(`INSERT INTO "CreatorRecoveryIntent"(id,"agencyId","creatorId",stream,reason,"gapFrom","targetAt","policyVersion")
         SELECT x.id,$1,x."creatorId",x.stream,x.reason,x."from",x.through,$3 FROM jsonb_to_recordset($2::jsonb)
         x(id text,"creatorId" text,stream text,reason text,"from" timestamp,through timestamp) ORDER BY x."creatorId",x.stream ON CONFLICT(id) DO NOTHING`,agencyId,JSON.stringify(intents),POLICY_VERSION);
-      await require("./domain-work-authority-service").publishDomainWorkBatch({db,items:wake.map(creatorId=>({agencyId,creatorId,
+      await require("./domain-work-authority-service").publishDomainWorkBatch({db,items:[...new Set(wake)].map(creatorId=>({agencyId,creatorId,
         workClass:"CREATOR_RECURRING_PLANNING",objectType:"CreatorAccount",objectId:creatorId,partitionKey:creatorId}))});
     }
     if(writes.length) await require("./earnings-coverage-service").advanceDelivered(db,writes.map(x=>x.creatorId));

@@ -508,17 +508,21 @@ async function ingestExactLiveTransaction({db,agencyId,creatorId,deviceId,money,
   const row=normalizeTransaction({ ...money, externalTransactionId:money.transactionId, transactionStatus:money.status },0,1);
   if(row.rejected) throw new Error("LIVE_FINANCIAL_NORMALIZATION_FAILED");
   const job={agencyId,creatorId,sourceJobId:null};
-  const fan=await resolveFan(db,job,row,now);
   const where={creatorId_externalTransactionId:{creatorId,externalTransactionId:row.externalTransactionId}};
   const previous=await db.creatorFinancialTransaction.findUnique({where});
   if(previous?.sourceUpdatedAt && +previous.sourceUpdatedAt>+observedAt)return;
-  const data={agencyId,creatorId,externalTransactionId:row.externalTransactionId,
+  // Live and scan ingestion share the canonical fan authority. Resolve only
+  // after the revision fence, so a delayed correction cannot refresh identity
+  // observations that belong to an already superseded financial event.
+  const participants=await resolveFans(db,job,[row],now);
+  const fan=participants.fans.get(`${creatorId}\u0000${row.fanOnlyFansUserId}`);
+  const data=retainKnownFan(previous,{agencyId,creatorId,externalTransactionId:row.externalTransactionId,
     transactionType:row.transactionType,factType:row.factType,projectionStatus:row.projectionStatus,
     amountCents:row.amountCents,netCents:row.netCents,feeCents:row.feeCents,currency:row.currency,
     occurredAt:row.occurredAt,transactionStatus:row.transactionStatus,sourceUpdatedAt:observedAt,
     collectedAt:now,sourceDeviceId:deviceId,reasonCode:row.reasonCode,
-    fanRecordId:fan?.id || previous?.fanRecordId || null,
-    fanOnlyFansUserId:row.fanOnlyFansUserId || previous?.fanOnlyFansUserId || null};
+    fanRecordId:fan?.id || null,fanOnlyFansUserId:row.fanOnlyFansUserId || null,
+    fanUsernameAtEvent:row.fanUsername,fanDisplayNameAtEvent:row.fanDisplayName,fanAvatarUrlAtEvent:row.fanAvatarUrl});
   if(previous)await db.creatorFinancialTransaction.update({where:{id:previous.id},data});
   else await db.creatorFinancialTransaction.create({data:{id:crypto.randomUUID(),...data}});
   if(row.projectionStatus==="PROJECTED") {

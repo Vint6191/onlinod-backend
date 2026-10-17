@@ -140,9 +140,8 @@ async function main() {
   ({ e2e, ManagementCommandTransport } = desktopModules);
   const f = await load("./scripts/test-support/admin-sql-runtime.cjs").createAdminSqlRuntime({
     runtimePath: process.env.ONLINOD_SQL_PROOF_RUNTIME,
-    // A killed TCP client can remain in pglite-socket 0.2.11's handler set.
-    // Leave bounded reconnect capacity; only one Backend is alive at a time
-    // and PGlite still has one physical SQL session.
+    // Only one Backend is alive at a time; the SQL fixture explicitly waits
+    // for retired sockets before transferring its single PostgreSQL session.
     maxConnections: 4,
   });
   let child,
@@ -192,6 +191,7 @@ globalThis.fetch=async()=>{throw Error('ACCEPTANCE_EXTERNAL_IO_FORBIDDEN');};
       ONLINOD_ACCEPTANCE_MAILBOX: mailbox,
     });
     async function boot() {
+      await f.waitForIdle();
       const from = log.length;
       let ended = false;
       child = spawn(process.execPath, ["--require", preload, "src/server.js"], {
@@ -433,6 +433,7 @@ globalThis.fetch=async()=>{throw Error('ACCEPTANCE_EXTERNAL_IO_FORBIDDEN');};
       actorProof, mailbox, password,
       withDatabase: async (work) => {
         await stop();
+        await f.waitForIdle();
         try {
           return await work(f.db, load, f.queries);
         } finally {

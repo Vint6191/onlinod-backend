@@ -1683,13 +1683,11 @@ test("two manager reassignments from the same submission revision cannot both wi
 });
 
 test("manual historical import cannot cross a current active Telegram thread that belongs to another creator", async () => {
-  const db = withTransactionalRollback(fakeDb());
-  db.telegramDeliveryIntent.findMany = async ({ where }) => {
-    const kinds = Array.isArray(where.kind?.in) ? where.kind.in : [where.kind];
-    if (!kinds.includes("TASK") || where.accountId !== "tg-1" || String(where.remoteRecipientTelegramUserId) !== "987654321012345678") return [];
-    return [{ id: "task-thread-b", agencyId: "agency-1", accountId: "tg-1", creatorId: "creator-2", customOrderId: "custom-2", kind: "TASK", state: "CONFIRMED", remoteMessageId: 901, remoteRecipientTelegramUserId: "987654321012345678", confirmationAuthority: "PROVIDER_RECEIPT", remoteSentAt: new Date("2026-09-05T10:00:00.000Z"), confirmedAt: new Date("2026-09-05T10:00:01.000Z") }];
-  };
-  db.customOrder.findMany = async ({ where }) => db._orders.filter((row) => row.agencyId === where.agencyId && where.id?.in?.includes(row.id) && String(row.status || "PENDING") === String(where.status || row.status || "PENDING")).map(clone);
+  // Seed actual authority facts, rather than hard-coding the retired lifetime
+  // scan's `id.in` query shape into this cross-creator isolation fixture.
+  const db = withTransactionalRollback(fakeDb({ deliveryIntents: [
+    { id: "task-thread-b", agencyId: "agency-1", accountId: "tg-1", creatorId: "creator-2", customOrderId: "custom-2", kind: "TASK", state: "CONFIRMED", remoteMessageId: 901, remoteRecipientTelegramUserId: "987654321012345678", confirmationAuthority: "PROVIDER_RECEIPT", remoteSentAt: new Date("2026-09-05T10:00:00.000Z"), confirmedAt: new Date("2026-09-05T10:00:01.000Z") },
+  ] }));
   await assert.rejects(
     () => createCustomContentSubmission({
       agencyId: "agency-1", member, db: commitDatabaseFixture(db),

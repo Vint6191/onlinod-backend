@@ -151,6 +151,8 @@ async function main() {
     const mailbox = path.join(scratch, "mail.jsonl");
     fs.writeFileSync(mailbox, "");
     const preload = path.join(scratch, "controlled-io.cjs");
+    const trafficTrace = path.join(output, "traffic-projection-trace.jsonl");
+    fs.writeFileSync(trafficTrace, "");
     fs.writeFileSync(
       preload,
       `const fs=require('node:fs'),crypto=require('node:crypto');
@@ -158,6 +160,7 @@ require(${JSON.stringify(path.join(root, "src/services/email-service.js"))}).sen
 fs.appendFileSync(process.env.ONLINOD_ACCEPTANCE_MAILBOX,JSON.stringify({payload,idempotencyKey:options.idempotencyKey})+'\\n');
 return {ok:true,outcome:'confirmed',providerId:'local-'+crypto.createHash('sha256').update(options.idempotencyKey).digest('hex').slice(0,32)};};
 globalThis.fetch=async()=>{throw Error('ACCEPTANCE_EXTERNAL_IO_FORBIDDEN');};
+require(${JSON.stringify(path.join(root, "scripts/test-support/traffic-projection-trace.cjs"))}).attachTrafficProjectionTrace(${JSON.stringify(trafficTrace)});
 `
     );
     const env = { ...process.env };
@@ -441,10 +444,12 @@ globalThis.fetch=async()=>{throw Error('ACCEPTANCE_EXTERNAL_IO_FORBIDDEN');};
 }
 // PGlite socket callbacks alone do not retain the event loop during initialization.
 const keep = setInterval(() => {}, 1000);
+// Initial and replacement Campaign generations each have a bounded ten-minute
+// projection deadline with a separate no-progress watchdog in the workflow.
 const deadline = setTimeout(() => {
   console.error("PRODUCT_ACCEPTANCE_DEADLINE");
   process.exit(2);
-}, 900000);
+}, 1500000);
 main()
   .catch((e) => {
     console.error(e);
