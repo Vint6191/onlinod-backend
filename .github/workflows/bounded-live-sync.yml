@@ -71,6 +71,15 @@ jobs:
         env:
           ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_event_participants
           ONLINOD_EVENT_PARTICIPANT_REPORT: event-participant-ingest-proof.json
+      - name: Create isolated database for subscriber publication recovery
+        run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_subscriber_publication'
+        env:
+          PGPASSWORD: fixture-only
+      - name: Subscriber publication liveness, continuation, lease and upgrade proof
+        run: node scripts/audit/subscriber-publication-liveness-proof.cjs
+        env:
+          ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_subscriber_publication
+          ONLINOD_SUBSCRIBER_LIVENESS_REPORT: subscriber-publication-liveness-proof.json
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -81,3 +90,4 @@ jobs:
             live-money-adversarial-proof.json
             team-ledger-retention-proof.json
             event-participant-ingest-proof.json
+            subscriber-publication-liveness-proof.json

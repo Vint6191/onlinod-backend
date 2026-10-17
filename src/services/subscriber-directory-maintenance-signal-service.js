@@ -8,6 +8,9 @@ const { dbAuthorityNow } = require("./db-time-authority-service");
 const SUBSCRIBER_MAINTENANCE_KIND = Object.freeze({ RECOVERY: "RECOVERY", RETENTION: "RETENTION" });
 const SUBSCRIBER_MAINTENANCE_CLAIM_MS = 2 * 60 * 1000;
 const SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS = 100;
+// Pre-v25 workers charged successful continuation against the error budget.
+// Only these exact historical yield reasons are eligible for automatic repair.
+const LEGACY_YIELD_ERRORS = ["subscriber_recovery_budget_exhausted", "maintenance_budget_exhausted", "publication_debt"];
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -74,8 +77,8 @@ async function claimSubscriberDirectoryMaintenanceSignal({ db, now = new Date(),
     const authorityNow = await dbAuthorityNow({ db: tx, fallbackNow });
     const claimUntil = new Date(authorityNow.getTime() + SUBSCRIBER_MAINTENANCE_CLAIM_MS);
     const rows = await tx.$queryRawUnsafe(`
-      WITH candidate AS (
-        SELECT s."id"
+      WITH normal_candidate AS (
+        SELECT s."id",s."dueAt",s."creatorId",s."kind"
         FROM "SubscriberDirectoryMaintenanceSignal" s
         WHERE s."dueAt" <= $1
           AND s."attempts" < ${SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS}
@@ -83,9 +86,26 @@ async function claimSubscriberDirectoryMaintenanceSignal({ db, now = new Date(),
         ORDER BY s."dueAt" ASC, s."creatorId" ASC, s."kind" ASC
         FOR UPDATE OF s SKIP LOCKED
         LIMIT 1
+      ), legacy_candidate AS (
+        SELECT s."id",s."dueAt",s."creatorId",s."kind"
+        FROM "SubscriberDirectoryMaintenanceSignal" s
+        WHERE s."dueAt" <= $1
+          AND s."attempts" >= ${SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS}
+          AND (s."lastError" IS NULL OR s."lastError" IN
+            ('subscriber_recovery_budget_exhausted','maintenance_budget_exhausted','publication_debt'))
+          AND COALESCE(s."claimUntil", '-infinity'::timestamp) <= $1
+        ORDER BY s."dueAt" ASC, s."creatorId" ASC, s."kind" ASC
+        FOR UPDATE OF s SKIP LOCKED
+        LIMIT 1
+      ), eligible AS (
+        SELECT * FROM normal_candidate UNION ALL SELECT * FROM legacy_candidate
+      ), candidate AS (
+        SELECT "id" FROM eligible ORDER BY "dueAt", "creatorId", "kind" LIMIT 1
       )
       UPDATE "SubscriberDirectoryMaintenanceSignal" s
-      SET "claimToken"=$2, "claimUntil"=$3, "updatedAt"=NOW()
+      SET "claimToken"=$2, "claimUntil"=$3, "updatedAt"=NOW(),
+          "attempts"=CASE WHEN s."attempts" >= ${SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS} THEN 0 ELSE s."attempts" END,
+          "lastError"=CASE WHEN s."attempts" >= ${SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS} THEN NULL ELSE s."lastError" END
       FROM candidate c
       WHERE s."id"=c."id"
       RETURNING s."id",s."agencyId",s."creatorId",s."kind",s."dueAt",s."reason",s."revision",s."attempts",s."claimToken",s."claimUntil"
@@ -146,7 +166,7 @@ async function withSubscriberMaintenanceClaimFence({ db, signal, work, maxWaitMs
 async function countPoisonedSubscriberMaintenanceSignals({ db } = {}) {
   if (typeof db?.subscriberDirectoryMaintenanceSignal?.count !== "function") return 0;
   return Number(await db.subscriberDirectoryMaintenanceSignal.count({
-    where: { attempts: { gte: SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS } },
+    where: { attempts: { gte: SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS }, lastError: { not: null, notIn: LEGACY_YIELD_ERRORS } },
   }) || 0);
 }
 
@@ -154,7 +174,7 @@ async function listPoisonedSubscriberMaintenanceSignals({ db, limit = 100 } = {}
   if (typeof db?.subscriberDirectoryMaintenanceSignal?.findMany !== "function") return [];
   const take = Math.max(1, Math.min(500, Number(limit) || 100));
   return db.subscriberDirectoryMaintenanceSignal.findMany({
-    where: { attempts: { gte: SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS } },
+    where: { attempts: { gte: SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS }, lastError: { not: null, notIn: LEGACY_YIELD_ERRORS } },
     orderBy: [{ attempts: "desc" }, { dueAt: "asc" }, { creatorId: "asc" }],
     take,
   });
@@ -210,8 +230,9 @@ async function releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now = n
   const count = await db.$executeRawUnsafe(`
     UPDATE "SubscriberDirectoryMaintenanceSignal"
     SET "dueAt"=$3, "claimToken"=NULL, "claimUntil"=NULL,
-        "attempts"="attempts"+1, "lastError"=$4, "updatedAt"=NOW()
+        "attempts"=CASE WHEN $4::text IS NULL THEN 0 ELSE "attempts"+1 END, "lastError"=$4, "updatedAt"=NOW()
     WHERE "id"=$1 AND "claimToken"=$2 AND "revision"=$5
+      AND "claimUntil" > clock_timestamp()
   `, signal.id, signal.claimToken, retryDueAt, clean(error?.message || error, 1000), Number(signal.revision || 0));
   return Number(count || 0) > 0;
 }

@@ -66,7 +66,7 @@ function buildFixture({ failTransactionAttempt = null } = {}) {
   };
   const previousRun = { id: "run-prev", agencyId: "agency-1", creatorId: "creator-1", status: "PUBLISHED", publicationGeneration: 1, publicationStatus: "COMPLETE" };
   const state = { creatorId: "creator-1", agencyId: "agency-1", currentRunId: "run-prev", status: "READY", scanEveryDays: 7, publicationGeneration: 2, publishedGeneration: 1 };
-  const job = { id: "job-1", status: "SCHEDULED", leaseUntil: null, leaseRevision: 0, params: { scanRunId: "run-current", scanEveryDays: 7 } };
+  const job = { id: "job-1", agencyId: "agency-1", creatorId: "creator-1", jobKey: "subscriber_directory_scan", status: "SCHEDULED", leaseUntil: null, leaseRevision: 0, params: { scanRunId: "run-current", scanEveryDays: 7 } };
   let txAttempts = 0;
   const projectedChunkSizes = [];
   const staleChunkSizes = [];

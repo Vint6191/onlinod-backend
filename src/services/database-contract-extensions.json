@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v8_team_ledger_retention",
+  "version": "nod_current_v9_subscriber_publication_liveness",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -28,6 +28,10 @@
     {
       "migration": "20261017000000_team_ledger_retention",
       "checksum": "50104ae87756bc2dcd7f3464bf2d36ce3a575557d3294ae8f8607f911291d46c"
+    },
+    {
+      "migration": "20261017010000_subscriber_publication_liveness",
+      "checksum": "beafca1d187cd2bc43d81467448b0573738702412c707a487d447f94b6bc4b5e"
     }
   ],
   "extension": {
@@ -3183,6 +3187,15 @@
         "options": "0 0",
         "expressions": null,
         "predicate": "((\"compactedAt\" IS NULL) AND (\"historicalFactVersion\" = 'team_money_fact_v2'::text) AND (\"historicalFactProjectedAt\" IS NOT NULL))"
+      },
+      {
+        "table": "SubscriberDirectoryMaintenanceSignal",
+        "name": "SubscriberDirectoryMaintenanceSignal_legacy_yield_idx",
+        "unique": false,
+        "keys": "5 3 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "((attempts >= 100) AND ((\"lastError\" IS NULL) OR ((\"lastError\")::text = ANY ((ARRAY['subscriber_recovery_budget_exhausted'::character varying, 'maintenance_budget_exhausted'::character varying, 'publication_debt'::character varying])::text[]))))"
       }
     ]
   }

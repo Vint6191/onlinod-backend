@@ -1,4 +1,5 @@
 "use strict";
+const { performance } = require("node:perf_hooks");
 
 const {
   recoverSubscriberPublicationDebt,
@@ -25,6 +26,7 @@ async function runSubscriberDirectoryMaintenance({
   retentionKeep = 2,
   retentionBatch = 50,
   scheduleFanRefresh = null,
+  monotonicNow = () => performance.now(),
 } = {}) {
   if (typeof db?.$transaction !== "function" || typeof db?.$queryRawUnsafe !== "function") {
     return { ok: true, processedSignals: 0, reason: "adapter_unsupported" };
@@ -32,12 +34,13 @@ async function runSubscriberDirectoryMaintenance({
   const limit = Math.max(1, Math.min(100, Number(maxSignals) || 16));
   const workerCount = Math.max(1, Math.min(8, Number(concurrency) || 4, limit));
   const budgetMs = Math.max(750, Math.min(30_000, Number(maxRuntimeMs) || 5_000));
-  const started = Date.now();
+  const started = monotonicNow();
   const totals = {
     processedSignals: 0,
     recoverySignals: 0,
     retentionSignals: 0,
     recoveredRuns: 0,
+    advancedSteps: 0,
     reconciledJobs: 0,
     deletedRuns: 0,
     stateRepairs: 0,
@@ -61,6 +64,7 @@ async function runSubscriberDirectoryMaintenance({
         maxRuntimeMs: Math.max(500, Math.min(remainingMs, 4_000)),
         maintenanceSignal: signal,
         scheduleFanRefresh,
+        monotonicNow,
       });
     } catch (error) {
       if (error?.code === "SUBSCRIBER_MAINTENANCE_CLAIM_STALE") {
@@ -70,11 +74,13 @@ async function runSubscriberDirectoryMaintenance({
       throw error;
     }
     totals.recoveredRuns += Number(result?.recoveredRuns || 0);
+    totals.advancedSteps += Number(result?.advancedSteps || 0);
     totals.reconciledJobs += Number(result?.reconciledJobs || 0);
     totals.stateRepairs += Number(result?.stateRepairs || 0);
     const debtRemains = await hasSubscriberPublicationDebt({ db, agencyId: signal.agencyId, creatorId: signal.creatorId });
-    if (debtRemains || result?.budgetExhausted) {
-      await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, retryMs: 2_000, error: result?.budgetExhausted ? "subscriber_recovery_budget_exhausted" : null });
+    if (debtRemains) {
+      // More bounded work is a continuation, not a failed attempt.
+      await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, retryMs: 2_000 });
       return;
     }
     await signalSubscriberDirectoryMaintenance({
@@ -116,7 +122,7 @@ async function runSubscriberDirectoryMaintenance({
         reason: "RETENTION_BLOCKED_BY_PUBLICATION_DEBT",
       });
       await releaseSubscriberDirectoryMaintenanceSignal({
-        db, signal, now, retryMs: 30_000, error: "publication_debt",
+        db, signal, now, retryMs: 30_000,
       });
       return;
     }
@@ -128,11 +134,9 @@ async function runSubscriberDirectoryMaintenance({
   }
 
   async function processSignal(signal) {
-    const remainingMs = budgetMs - (Date.now() - started);
-    if (remainingMs < 500) {
-      await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, retryMs: 1_000, error: "maintenance_budget_exhausted" });
-      return;
-    }
+    const remainingMs = budgetMs - (monotonicNow() - started);
+    // Claim admission already reserved one bounded unit. Network/lock latency
+    // may use the soft slice, but must not turn every owned unit into a no-op.
     try {
       if (signal.kind === SUBSCRIBER_MAINTENANCE_KIND.RECOVERY) {
         totals.recoverySignals += 1;
@@ -163,11 +167,12 @@ async function runSubscriberDirectoryMaintenance({
   async function worker(initialSignal = null) {
     let nextSignal = initialSignal;
     for (;;) {
-      if (drained || Date.now() - started >= budgetMs) return;
-      const remainingMs = budgetMs - (Date.now() - started);
-      if (remainingMs < 400) return;
+      const remainingMs = budgetMs - (monotonicNow() - started);
       let signal = nextSignal;
       nextSignal = null;
+      // A sibling finding an empty queue only stops NEW claims. Never abandon
+      // an owned signal until it is processed, released or fenced as stale.
+      if (!signal && (drained || remainingMs < 400)) return;
       if (!signal && reserved >= limit) return;
       if (!signal) {
         reserved += 1;
@@ -184,7 +189,7 @@ async function runSubscriberDirectoryMaintenance({
   const firstSignal = await claimSubscriberDirectoryMaintenanceSignal({
     db,
     now,
-    statementTimeoutMs: Math.min(2_000, Math.max(400, budgetMs - (Date.now() - started))),
+    statementTimeoutMs: Math.min(2_000, Math.max(400, budgetMs - (monotonicNow() - started))),
   });
   if (!firstSignal) {
     drained = true;
@@ -195,7 +200,7 @@ async function runSubscriberDirectoryMaintenance({
       ...Array.from({ length: additionalWorkers }, () => worker()),
     ]);
   }
-  const budgetExhausted = !drained && Date.now() - started >= budgetMs;
+  const budgetExhausted = !drained && monotonicNow() - started >= budgetMs;
   const poisonedSignals = await countPoisonedSubscriberMaintenanceSignals({ db });
   const poisonedSample = poisonedSignals > 0
     ? await listPoisonedSubscriberMaintenanceSignals({ db, limit: 5 })

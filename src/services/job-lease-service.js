@@ -1411,6 +1411,8 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         data: { publicationJobReconciledAt: now, publicationLastError: null },
       });
       if (!reconciledRun.count) throw new JobLeaseError("SUBSCRIBER_PUBLICATION_RECONCILE_MISSING", "Published Subscriber run was not available for atomic job reconciliation");
+      // Coverage and terminal job state share the same lease-fenced commit.
+      await require("./creator-live-sync-service").completeRecovery(tx, job, true);
       return updated;
     }, { reserved: true, profile: "JOB_CHUNK" });
     if (!completed.count) throw new JobLeaseError("JOB_LEASE_STALE", "Subscriber completion fence was lost");

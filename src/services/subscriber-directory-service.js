@@ -1,4 +1,5 @@
 "use strict";
+const { performance } = require("node:perf_hooks");
 const { runDbTransaction } = require("./db-transaction-service");
 
 
@@ -1162,8 +1163,6 @@ async function applySubscriberScanCompletion({ job, userId = null, result, db = 
     publishedSummary = publication.summary || run.summary || {};
   }
 
-  await require("./creator-live-sync-service").completeRecovery(db,job,true);
-
   // Planning is best-effort, but it is part of completion convergence. Recovery
   // executes this same helper before it reconciles a stranded JobInstance to DONE,
   // so a crash after FINALIZE cannot silently lose subscriber-derived automation.
@@ -1295,13 +1294,22 @@ async function reconcileRecoveredSubscriberPublicationJob(db, { run, summary = n
     }
     const currentJob = await tx.jobInstance.findUnique({
       where: { id: jobId },
-      select: { id: true, status: true, leaseUntil: true, leaseRevision: true },
-    }).catch(() => null);
+      select: { id: true, agencyId: true, creatorId: true, jobKey: true, params: true, status: true, leaseUntil: true, leaseRevision: true },
+    });
     if (!currentJob) {
       const marked = await markSubscriberPublicationJobReconciled(tx, runId, now);
       return { reconciled: marked, reason: "job_missing" };
     }
+    if (currentJob.agencyId !== run.agencyId || currentJob.creatorId !== run.creatorId ||
+        currentJob.jobKey !== SUBSCRIBER_DIRECTORY_JOB_KEY || currentJob.params?.scanRunId !== runId) {
+      throw Object.assign(new Error("Subscriber publication job does not own this run"), { code: "SUBSCRIBER_PUBLICATION_JOB_SCOPE_MISMATCH" });
+    }
+    if (currentJob.status === "CANCELLED") {
+      await markSubscriberPublicationJobReconciled(tx, runId, now);
+      return { reconciled: true, reason: "cancelled" };
+    }
     if (currentJob.status === "DONE") {
+      if (run.status === "PUBLISHED") await require("./creator-live-sync-service").completeRecovery(tx, currentJob, true);
       await markSubscriberPublicationJobReconciled(tx, runId, now);
       return { reconciled: true, reason: "already_done" };
     }
@@ -1333,8 +1341,9 @@ async function reconcileRecoveredSubscriberPublicationJob(db, { run, summary = n
     });
     if (!Number(updated?.count || 0)) return { reconciled: false, reason: "job_raced" };
     if (typeof tx?.fanObservationReadLease?.deleteMany === "function") {
-      await tx.fanObservationReadLease.deleteMany({ where: { jobId } }).catch(() => null);
+      await tx.fanObservationReadLease.deleteMany({ where: { jobId } });
     }
+    if (run.status === "PUBLISHED") await require("./creator-live-sync-service").completeRecovery(tx, currentJob, true);
     await markSubscriberPublicationJobReconciled(tx, runId, now);
     return { reconciled: true, reason: "done" };
   };
@@ -1343,7 +1352,7 @@ async function reconcileRecoveredSubscriberPublicationJob(db, { run, summary = n
 
 function subscriberRecoveryJobNeedsPlanning(job, now) {
   if (!job) return true;
-  if (job.status === "DONE") return false;
+  if (["DONE", "CANCELLED"].includes(job.status)) return false;
   return !subscriberPublicationJobLeaseAuthority(job, now).active;
 }
 
@@ -1460,6 +1469,7 @@ async function recoverSubscriberPublicationDebt({
   beforePlanning = null,
   maintenanceSignal = null,
   scheduleFanRefresh = null,
+  monotonicNow = () => performance.now(),
 } = {}) {
   const agency = clean(agencyId, 180);
   const creator = clean(creatorId, 180);
@@ -1475,13 +1485,17 @@ async function recoverSubscriberPublicationDebt({
   const runLimit = Math.max(1, Math.min(10, Number(maxRuns) || 4));
   const stepLimit = Math.max(1, Math.min(20, Number(maxStepsPerRun) || 4));
   const runtimeBudget = Math.max(500, Math.min(30_000, Number(maxRuntimeMs) || 5_000));
-  const started = Date.now();
+  const started = monotonicNow();
   let advancedSteps = 0;
   let recoveredRuns = 0;
   let reconciledJobs = 0;
   let planningRuns = 0;
   let stateRepairs = 0;
   let budgetExhausted = false;
+  // A unit includes its discovery/preparation AND either one publication page
+  // or final planning/reconciliation. Preparation alone is not progress. Admit
+  // the first unit even on a slow connection; the soft clock gates later units.
+  let completedUnits = 0;
 
   // The pump's soft time slice controls admission of the next bounded chunk,
   // not the lifetime of a chunk already admitted. Shrinking a transaction to
@@ -1492,18 +1506,18 @@ async function recoverSubscriberPublicationDebt({
   if (repair?.repaired) stateRepairs += 1;
 
   for (let runIndex = 0; runIndex < runLimit; runIndex += 1) {
-    const elapsed = Date.now() - started;
-    if (elapsed >= runtimeBudget) { budgetExhausted = true; break; }
+    const elapsed = monotonicNow() - started;
+    if (completedUnits > 0 && elapsed >= runtimeBudget) { budgetExhausted = true; break; }
     const candidate = await findSubscriberPublicationDebtForCreator(db, { agencyId: agency, creatorId: creator });
     if (!candidate) break;
     const job = candidate.jobId && typeof db?.jobInstance?.findUnique === "function"
       ? await db.jobInstance.findUnique({
           where: { id: candidate.jobId },
           select: { id: true, params: true, status: true, leaseUntil: true, leaseRevision: true },
-        }).catch(() => null)
+        })
       : null;
     const state = typeof db?.subscriberDirectoryState?.findUnique === "function"
-      ? await db.subscriberDirectoryState.findUnique({ where: { creatorId: creator }, select: { scanEveryDays: true } }).catch(() => null)
+      ? await db.subscriberDirectoryState.findUnique({ where: { creatorId: creator }, select: { scanEveryDays: true } })
       : null;
     const scanEveryDays = integer(job?.params?.scanEveryDays ?? state?.scanEveryDays, DEFAULT_SCAN_EVERY_DAYS, 1, 30);
     let completeResult = null;
@@ -1511,14 +1525,27 @@ async function recoverSubscriberPublicationDebt({
       completeResult = { complete: true, run: candidate, summary: candidate.summary || {} };
     } else {
       for (let step = 0; step < stepLimit; step += 1) {
-        const remaining = runtimeBudget - (Date.now() - started);
-        if (remaining < 300) { budgetExhausted = true; break; }
-        const result = await publicationTransaction(db, agency, creator, (tx) => advanceSubscriberPublication(tx, {
-          runId: candidate.id,
-          jobId: candidate.jobId || null,
-          scanEveryDays,
-        }), { maxWaitMs: 1_000, timeoutMs: 15_000, maintenanceSignal });
+        const remaining = runtimeBudget - (monotonicNow() - started);
+        if (completedUnits > 0 && remaining < 300) { budgetExhausted = true; break; }
+        const result = await publicationTransaction(db, agency, creator, async (tx) => {
+          const advanced = await advanceSubscriberPublication(tx, {
+            runId: candidate.id, jobId: candidate.jobId || null, scanEveryDays,
+          });
+          if (candidate.jobId) {
+            const phase = advanced.phase || advanced.run?.publicationStatus;
+            await tx.jobInstance.updateMany({
+              where: { id: candidate.jobId, agencyId: agency, creatorId: creator,
+                jobKey: SUBSCRIBER_DIRECTORY_JOB_KEY, status: "PUBLISHING" },
+              data: { lastProgressAt: await dbAuthorityNow({ db: tx }),
+                progress: { percent: 99, stage: "PUBLICATION", waitKind: "PUBLICATION",
+                  message: `Subscribers collected · publishing snapshot (${String(phase).toLowerCase()})`,
+                  publicationPhase: phase, publicationBatchRows: Number(advanced.processed || 0) } },
+            });
+          }
+          return advanced;
+        }, { maxWaitMs: 1_000, timeoutMs: 15_000, maintenanceSignal });
         advancedSteps += 1;
+        completedUnits += 1;
         if (result?.complete) {
           recoveredRuns += 1;
           completeResult = result;
@@ -1527,8 +1554,8 @@ async function recoverSubscriberPublicationDebt({
       }
     }
     if (!completeResult?.complete) break;
-    if (Date.now() - started >= runtimeBudget) { budgetExhausted = true; break; }
-    const freshRun = completeResult.run || await db.subscriberScanRun.findUnique({ where: { id: candidate.id } }).catch(() => candidate);
+    if (completedUnits > 0 && monotonicNow() - started >= runtimeBudget) { budgetExhausted = true; break; }
+    const freshRun = completeResult.run || await db.subscriberScanRun.findUnique({ where: { id: candidate.id } });
     let planning = null;
     const publishedRun = freshRun || candidate;
     let reconciled = null;
@@ -1595,6 +1622,7 @@ async function recoverSubscriberPublicationDebt({
         now: authorityNow,
       });
     }
+    completedUnits += 1;
     if (reconciled.reconciled) reconciledJobs += 1;
     if (!reconciled.reconciled && reconciled.reason === "active_claim") break;
   }
