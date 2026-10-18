@@ -8,7 +8,7 @@ const RECENT_DAYS = 7, AUDIT_DAYS = 30, HISTORY_FRESH_MS = 7 * DAY;
 const COLLECTOR = "payout-transactions-v3-window-receipts";
 const FULL_CHARTS = ["total", "subscribes", "tips", "messages", "post", "stream"];
 class FinancialReceiptError extends Error {
-  constructor(code) { super(code); this.code = code; this.status = 409; }
+  constructor(code) { super(code); this.code = code; this.status = 409; this.retryable = false; }
 }
 function fault(code) { return new FinancialReceiptError(code); }
 function enabled(job) { return job?.jobKey === "financial_transactions_scan" && job.params?.financialReceiptVersion === 1; }

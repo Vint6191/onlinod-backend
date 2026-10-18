@@ -81,7 +81,9 @@ function leaseError(res, error) {
       ok: false,
       code: error.code,
       error: error.message,
-      ...(error.retryAfterMs ? { retryAfterMs: error.retryAfterMs, retryable: error.retryable === true } : {}),
+      ...(error.retryAfterMs ? { retryAfterMs: error.retryAfterMs } : {}),
+      // Domain retry policy is independent of whether a retry delay was supplied.
+      ...(typeof error.retryable === "boolean" || error.retryAfterMs ? { retryable: error.retryable === true } : {}),
     });
   }
   throw error;

@@ -6,6 +6,7 @@ class NotificationFrontierError extends Error {
     super(code);
     this.code = code;
     this.status = 409;
+    this.retryable = false;
   }
 }
 const fail = (code) => {
