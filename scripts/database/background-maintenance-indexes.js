@@ -1,6 +1,7 @@
 "use strict";
 const { state } = require("./analytics-traffic-indexes");
 const definitions = Object.freeze([
+  { name: "MaintenanceAdmissionClassState_sequence_idx", table: "MaintenanceAdmissionClassState", expression: '"generation","admissionSequence","ordinal"', unique: false },
   { name: "FanObservationToken_expiry_id_idx", table: "FanObservationToken", expression: '"createdAt","id"', unique: false },
   { name: "OfProviderRequestGateWaiter_expiry_id_idx", table: "OfProviderRequestGateWaiter", expression: '"leaseUntil","waiterId"', unique: false },
   { name: "OfProviderRequestGateWaiter_bucket_ticket_idx", table: "OfProviderRequestGateWaiter", expression: '"priority","category","ticket"', unique: false },

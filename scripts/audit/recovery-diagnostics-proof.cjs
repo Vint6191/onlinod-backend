@@ -21,10 +21,23 @@ const keep = setInterval(() => {}, 1000);
 
     const now = new Date();
     await f.db.jobInstance.create({ data: { id: "diag-financial", ...tenant, userId: undefined,
-      jobKey: "financial_transactions_scan", scope: "creator", status: "SCHEDULED",
+      jobKey: "financial_transactions_scan", scope: "creator", status: "FAILED",
       params: { moneyResolutionVersion: 1, startDate: "2026-10-17T10:00:00Z", endDate: "2026-10-17T11:00:00Z",
         cookie: "canary-secret", rawObservation: "canary-fan" },
       lastError: "private canary-provider-payload", nextRunAt: now,
+      result: { raw: "canary-result", completionSideEffect: {
+        type: "financial_transactions", ok: false, protocolCurrent: true,
+        sourceBoundaryReached: true, scannerRejected: 0, staleGeneration: false,
+        reconciliation: { proofKind: "EXHAUSTED_WINDOW_AND_CHART", chartReady: true,
+          countMatched: false, grossMatched: false, netMatched: false,
+          chartCount: 2, chartGrossCents: 2500, chartNetCents: 2000 },
+        windows: [{ kind: "RESOLUTION", from: "2026-10-17T10:00:00Z", to: "2026-10-17T11:00:00Z",
+          pages: 1, received: 1, rejected: 0, exhausted: true, matched: false,
+          count: 1, grossCents: 1000, netCents: 800, statusGroups: {},
+          charts: { total: { transactionsCount: 2, grossCents: 2500, netCents: 2000 } },
+          payload: "canary-provider-response" }],
+        raw: "canary-side-effect", fanUserId: "canary-fan-user",
+      } },
     } });
     await f.db.creatorMoneyResolutionRequest.create({ data: { creatorId: tenant.creatorId, agencyId: tenant.agencyId,
       jobId: "diag-financial", attempts: 1, lastError: "canary-stored-message", updatedAt: now } });
@@ -36,9 +49,17 @@ const keep = setInterval(() => {}, 1000);
     assert.equal(rows.at(-1)[0], "creator recovery snapshot", JSON.stringify(rows.at(-1)));
     assert.equal(payload.moneyResolution.jobId, "diag-financial");
     assert.equal(payload.referencedJobs[0].windowMs, 3600000);
+    assert.equal(payload.referencedJobs[0].status, "FAILED");
+    const verification = payload.referencedJobs[0].financialVerification;
+    assert.equal(verification.outcome, "REJECTED");
+    assert.equal(verification.countMatched, false);
+    assert.equal(verification.windows[0].observed.count, 1);
+    assert.equal(verification.windows[0].expected.count, 2);
+    assert.equal(verification.windows[0].observed.netCents, 800);
+    assert.equal(verification.windows[0].expected.netCents, 2000);
     assert.equal(payload.recoveryIntents[0].id, "diag-intent");
     assert.doesNotMatch(JSON.stringify(payload), /canary/);
-    console.log("PASS resolution command and recovery intent are visible without raw job data");
+    console.log("PASS existing failed resolution exposes stored verification mismatch without new scans or raw job data");
     await observed.stop();
 
     const denied = createRecoveryRuntimeObserver({ emit });
