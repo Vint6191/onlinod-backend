@@ -59,3 +59,22 @@ test("event streams are timed but excluded from generic slow-request warnings", 
   assert.equal(expectedLongRequest("/api/creator-sessions/events"), true);
   assert.equal(expectedLongRequest("/api/creators"), false);
 });
+
+test("fast failed background polls are visible without logging request secrets", () => {
+  for (const path of ["/api/jobs/claim", "/api/devices/heartbeat", "/api/creator-sessions/events"]) {
+    const rows = [];
+    const middleware = createRequestObservabilityMiddleware({ slowRequestMs: 10_000,
+      log: { debug: (message, meta) => rows.push({ level: "debug", message, meta }),
+        warn: (message, meta) => rows.push({ level: "warn", message, meta }) } });
+    const req = { method: "POST", originalUrl: path + "?token=private-query",
+      headers: { authorization: "Bearer private-header", "x-nod-trace-id": "job-poll-12345678" },
+      body: { credential: "private-body" } };
+    const res = new EventEmitter(); res.statusCode = 503; res.setHeader = () => {};
+    middleware(req, res, () => {}); res.emit("finish"); res.emit("close");
+    assert.equal(rows.length, 1); assert.equal(rows[0].level, "warn");
+    assert.equal(rows[0].message, "failed http request");
+    assert.equal(rows[0].meta.path, path); assert.equal(rows[0].meta.status, 503);
+    assert.equal(rows[0].meta.traceId, "job-poll-12345678");
+    assert.doesNotMatch(JSON.stringify(rows), /private-|credential|authorization|token=/);
+  }
+});

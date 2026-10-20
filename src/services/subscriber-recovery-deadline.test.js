@@ -41,3 +41,47 @@ test('generation repair does not treat a database failure as absent state', asyn
   await assert.rejects(service.repairSubscriberDirectoryStateGeneration({ db, agencyId: 'a', creatorId: 'c' }), { code: 'P2028' });
   assert.equal(creates, 0);
 });
+
+test('fractional remaining pump time is admitted by the strict commit kernel', async () => {
+  const options = [];
+  const tx = {
+    $executeRawUnsafe: async () => 1,
+    $queryRawUnsafe: async sql => sql.includes('AS "authorityNow"') ? [{ authorityNow: new Date() }] : [],
+  };
+  const db = { $transaction: async (work, opt) => { options.push(opt); return work(tx); } };
+  const { claimSubscriberDirectoryMaintenanceSignal } = require('./subscriber-directory-maintenance-signal-service');
+  const result = await claimSubscriberDirectoryMaintenanceSignal({ db, statementTimeoutMs: 743.912345 });
+  assert.equal(result, null);
+  assert.equal(options.length, 1, 'the fractional soft clock must reach SQL admission instead of failing option validation');
+  assert.ok(Number.isInteger(options[0].maxWait) && Number.isInteger(options[0].timeout));
+  assert.ok(options[0].maxWait <= 744 && options[0].maxWait >= 250);
+});
+
+for (const failedRead of ['existing publication job', 'directory state', 'newest generation']) {
+  test(`subscriber scheduling preserves the original database failure when reading ${failedRead}`, async () => {
+    const fault = Object.assign(new Error('Timed out fetching a new connection from the connection pool.'), { code: 'P2024' });
+    let runReads = 0, creates = 0;
+    const tx = {
+      $executeRawUnsafe: async () => 1,
+      $queryRawUnsafe: async sql => sql.includes('INSERT INTO "SubscriberDirectoryMaintenanceSignal"')
+        ? [{ id: 'repair-signal' }] : [{ authorityNow: new Date() }],
+      subscriberScanRun: {
+        findFirst: async () => {
+          runReads++;
+          if (runReads === 1 && failedRead === 'existing publication job') return { id: 'debt', jobId: 'job' };
+          if (runReads === 3 && failedRead === 'newest generation') throw fault;
+          return null;
+        },
+        create: async () => { creates++; throw Error('scheduling must stop before creating a replacement'); },
+      },
+      subscriberDirectoryState: { findUnique: async () => {
+        if (failedRead === 'directory state') throw fault;
+        return null;
+      } },
+      jobInstance: { findUnique: async () => { throw fault; } },
+    };
+    const db = { $queryRawUnsafe: tx.$queryRawUnsafe, $transaction: async work => work(tx) };
+    await assert.rejects(service.scheduleSubscriberScan({ db, agencyId: 'agency', creatorId: 'creator' }), error => error === fault);
+    assert.equal(creates, 0, 'a failed authority read is not permission to replace the current scan');
+  });
+}

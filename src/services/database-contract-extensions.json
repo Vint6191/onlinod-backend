@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v11_team_schedule_end_window",
+  "version": "nod_current_v15_subscriber_analytics_recovery",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -40,6 +40,22 @@
     {
       "migration": "20261018010000_team_schedule_end_window",
       "checksum": "21c38296ebb870cbc0a32ceec466db0414e07ecb1955a7fc17336e936e37a946"
+    },
+    {
+      "migration": "20261018020000_analytics_publication_readiness_indexes",
+      "checksum": "d64d614407753801b5d36bb49519e3594f4c5e439d2b2c176d0bd79682b3fb2c"
+    },
+    {
+      "migration": "20261018030000_analytics_recovery_retry",
+      "checksum": "0c6ada7409d9349b672e3d50f928f1771695f6e2e63d14beda4fe24a9f4185af"
+    },
+    {
+      "migration": "20261018040000_domain_work_transient_recovery",
+      "checksum": "b691572d49518fa719a9f25252ccabd007a040d8113c667783e80fcd991125ee"
+    },
+    {
+      "migration": "20261018050000_subscriber_stranded_wake",
+      "checksum": "341b5d37b6b22ced282e02a71a55689c31a9b6d14dd5dafc325546cf50e56ab1"
     }
   ],
   "extension": {
@@ -3231,6 +3247,42 @@
         "options": "0 0",
         "expressions": null,
         "predicate": null
+      },
+      {
+        "table": "AnalyticsCollectionDemand",
+        "name": "AnalyticsCollectionDemand_quarantine_pending_idx",
+        "unique": false,
+        "keys": "2",
+        "options": "0",
+        "expressions": null,
+        "predicate": "((\"completedAt\" IS NULL) AND (\"quarantinedAt\" IS NOT NULL))"
+      },
+      {
+        "table": "CreatorAnalyticsFactPublication",
+        "name": "AnalyticsFactPublication_dirty_current_day_idx",
+        "unique": false,
+        "keys": "2 3 0",
+        "options": "0 0 0",
+        "expressions": "\"left\"(COALESCE((\"currentValue\" ->> 'purchasedAt'::text), (\"currentValue\" ->> 'tippedAt'::text), (\"currentValue\" ->> 'occurredAt'::text), (\"currentValue\" ->> 'paidAt'::text), (\"currentValue\" ->> 'likedAt'::text), (\"currentValue\" ->> 'commentedAt'::text), (\"currentValue\" ->> 'date'::text)), 10)",
+        "predicate": "dirty"
+      },
+      {
+        "table": "CreatorAnalyticsFactPublication",
+        "name": "AnalyticsFactPublication_dirty_published_day_idx",
+        "unique": false,
+        "keys": "2 3 0",
+        "options": "0 0 0",
+        "expressions": "\"left\"(COALESCE((\"publishedValue\" ->> 'purchasedAt'::text), (\"publishedValue\" ->> 'tippedAt'::text), (\"publishedValue\" ->> 'occurredAt'::text), (\"publishedValue\" ->> 'paidAt'::text), (\"publishedValue\" ->> 'likedAt'::text), (\"publishedValue\" ->> 'commentedAt'::text), (\"publishedValue\" ->> 'date'::text)), 10)",
+        "predicate": "dirty"
+      },
+      {
+        "table": "DomainWorkItem",
+        "name": "DomainWorkItem_reconcile_class_current_idx",
+        "unique": false,
+        "keys": "3 12 1",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(\"isOutstanding\" AND (state = 'RECONCILE_REQUIRED'::text))"
       }
     ]
   }

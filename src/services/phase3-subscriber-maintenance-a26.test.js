@@ -31,7 +31,7 @@ test("A26 Subscriber maintenance uses a durable creator-scoped oldest-due SKIP L
   assert.match(maintenance, /claimSubscriberDirectoryMaintenanceSignal/);
   assert.match(maintenance, /maintenanceSignal:\s*signal/);
   assert.match(signals, /withSubscriberMaintenanceClaimFence/);
-  assert.match(signals, /"claimUntil" > clock_timestamp\(\)/);
+  assert.match(signals, /"claimUntil" > \(clock_timestamp\(\) AT TIME ZONE 'UTC'\)/);
   assert.match(signals, /FOR UPDATE/);
   assert.match(maintenance, /if \(!signal && reserved >= limit\) return/);
   const lane = require('./maintenance-lane-registry').MAINTENANCE_LANES.find(lane => lane.name === 'subscriberDirectoryMaintenance');

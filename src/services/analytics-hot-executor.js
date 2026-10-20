@@ -8,8 +8,8 @@ function wakeAfterCommit() {
 }
 async function due(db) {
   const rows=await db.$queryRawUnsafe(`SELECT c.name FROM (VALUES ('ANALYTICS_PUBLICATION'),('MONEY_RESOLUTION')) c(name)
-    WHERE EXISTS(SELECT 1 FROM "DomainWorkItem" w WHERE w."workClass"=c.name AND w."isOutstanding" AND w.state='READY' AND w."availableAt"<=clock_timestamp())
-    OR EXISTS(SELECT 1 FROM "DomainWorkItem" w WHERE w."workClass"=c.name AND w."isOutstanding" AND w.state='CLAIMED' AND w."leaseUntil"<=clock_timestamp())
+    WHERE EXISTS(SELECT 1 FROM "DomainWorkItem" w WHERE w."workClass"=c.name AND w."isOutstanding" AND w.state='READY' AND w."availableAt"<=(clock_timestamp() AT TIME ZONE 'UTC'))
+    OR EXISTS(SELECT 1 FROM "DomainWorkItem" w WHERE w."workClass"=c.name AND w."isOutstanding" AND w.state='CLAIMED' AND w."leaseUntil"<=(clock_timestamp() AT TIME ZONE 'UTC'))
     OR (c.name='MONEY_RESOLUTION' AND EXISTS(SELECT 1 FROM "MoneyResolutionAdoption" WHERE id='v7' AND NOT complete))`);
   return new Set(rows.map(x=>x.name));
 }

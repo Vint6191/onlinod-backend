@@ -945,6 +945,48 @@ test("persistent analytics demand contract corruption quarantines immediately", 
   assert.equal(await planner.claimNextAnalyticsDemand({ db, now: new Date("2026-09-09T14:00:00.000Z"), ownerToken: "replica-b" }), null);
 });
 
+test("a long database outage preserves analytics demand and its cursor beyond eight failures", async () => {
+  const db = {};
+  const store = addDemandStore(db);
+  let now = new Date("2026-10-18T00:00:00Z");
+  await planner.enqueueAgencyAnalyticsFreshnessDemand({ db, agencyId: "agency-1", rangeKey: "7d", ...DEMAND_ACTOR, now });
+  for (let attempt = 1; attempt <= 12; attempt++) {
+    const claimed = await planner.claimNextAnalyticsDemand({ db, now, ownerToken: "replica-" + attempt });
+    assert.ok(claimed, "database recovery must leave a runnable demand");
+    claimed.cursorCreatorId = "creator-025";
+    const error = Object.assign(Error("database unavailable"), { code: attempt % 2 ? "P1001" : "P2010", meta: { code: "40001" } });
+    const outcome = await planner.settleAnalyticsDemand({ db, demand: claimed, completedAt: now, error });
+    assert.equal(outcome.retry, true);
+    assert.equal(outcome.quarantined, false);
+    assert.equal(outcome.attempts, attempt);
+    assert.equal(outcome.errorClass, "TRANSIENT");
+    assert.ok(outcome.nextAttemptAt - now <= 60 * 60_000);
+    assert.ok(outcome.nextAttemptAt > now);
+    assert.equal(store.get(claimed.key).cursorCreatorId, "creator-025");
+    assert.equal(store.get(claimed.key).claimedRevision, 1);
+    now = outcome.nextAttemptAt;
+  }
+  const recovered = await planner.claimNextAnalyticsDemand({ db, now, ownerToken: "recovered" });
+  const done = await planner.settleAnalyticsDemand({ db, demand: recovered, completedAt: now });
+  assert.equal(done.completed, true);
+  assert.equal(store.get(recovered.key).attempts, 0);
+});
+
+test("unknown repeated analytics failures still exhaust the repair budget", async () => {
+  const db = {};
+  const store = addDemandStore(db);
+  let now = new Date("2026-10-18T00:00:00Z");
+  const created = await planner.enqueueAgencyAnalyticsFreshnessDemand({ db, agencyId: "agency-1", rangeKey: "7d", ...DEMAND_ACTOR, now });
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    const claimed = await planner.claimNextAnalyticsDemand({ db, now, ownerToken: "unknown-" + attempt });
+    const outcome = await planner.settleAnalyticsDemand({ db, demand: claimed, completedAt: now, error: Error("unexpected parser failure") });
+    assert.equal(outcome.quarantined, attempt === 8);
+    now = outcome.nextAttemptAt || now;
+  }
+  assert.equal(store.get(created.key).lastErrorClass, "INTERNAL");
+  assert.ok(store.get(created.key).quarantinedAt);
+});
+
 function boundedDemandFixture(count = 10, member = {}) {
   const now = new Date("2026-09-08T14:00:00Z");
   const creators = Array.from({ length: count }, (_, index) => ({ id: `creator-${String(index).padStart(3, "0")}`, agencyId: "agency-1" }));

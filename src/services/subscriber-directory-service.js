@@ -18,6 +18,7 @@ const { lockAutomationWriteCommitFence, runWithAutomationWriteCommitFence } = re
 const {
   SUBSCRIBER_MAINTENANCE_KIND,
   signalSubscriberDirectoryMaintenance,
+  ensureSubscriberDirectoryMaintenance,
   lockSubscriberMaintenanceClaimRow,
 } = require("./subscriber-directory-maintenance-signal-service");
 
@@ -177,8 +178,12 @@ recoveryIntent = null,
         orderBy: [{ publicationGeneration: "asc" }, { updatedAt: "asc" }, { id: "asc" }],
       });
       if (publicationDebt) {
+        await ensureSubscriberDirectoryMaintenance({
+          db: tx, agencyId, creatorId, kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY,
+          reason: "EXISTING_PUBLICATION_DEBT",
+        });
         const debtJob = publicationDebt.jobId
-          ? await tx.jobInstance.findUnique({ where: { id: publicationDebt.jobId } }).catch(() => null)
+          ? await tx.jobInstance.findUnique({ where: { id: publicationDebt.jobId } })
           : null;
         return { existingPublication: publicationDebt, existingJob: debtJob };
       }
@@ -208,12 +213,12 @@ recoveryIntent = null,
       const state = await tx.subscriberDirectoryState.findUnique({
         where: { creatorId },
         select: { publicationGeneration: true, publishedGeneration: true },
-      }).catch(() => null);
+      });
       const newestRun = await tx.subscriberScanRun.findFirst({
         where: { creatorId },
         orderBy: [{ publicationGeneration: "desc" }, { createdAt: "desc" }],
         select: { publicationGeneration: true },
-      }).catch(() => null);
+      });
       const generation = Math.max(
         Number(state?.publicationGeneration || 0),
         Number(newestRun?.publicationGeneration || 0),
@@ -327,7 +332,21 @@ async function ensureSubscriberScanDue({ db = prisma, agencyId, creatorId, prior
   const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId } });
   const sync=require("./creator-live-sync-service");
   const recoveryIntent=await sync.pendingRecovery(db,creatorId,"subscribers");
-  if(state?.publishedAt && !recoveryIntent) return {ok:true,created:false,reason:"live_no_recovery_debt"};
+  if (state?.publishedAt && !recoveryIntent) {
+    // A prior published snapshot does not prove that a later generation has
+    // finished publication. Reconnect/recurring planning must also repair a
+    // stranded publisher without scheduling a duplicate provider scan.
+    const recovering = await runDbTransaction(db, async tx => {
+      await lockSubscriberPublicationCreator(tx, agencyId, creatorId);
+      if (!await hasSubscriberPublicationDebt({ db: tx, agencyId, creatorId })) return false;
+      await ensureSubscriberDirectoryMaintenance({
+        db: tx, agencyId, creatorId, kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY,
+        reason: "EXISTING_PUBLICATION_DEBT",
+      });
+      return true;
+    });
+    return { ok: true, created: false, reason: recovering ? "publication_recovery_in_progress" : "live_no_recovery_debt" };
+  }
   return scheduleSubscriberScan({db,agencyId,creatorId,priority,recoveryIntent,
     scanEveryDays:state?.scanEveryDays || DEFAULT_SCAN_EVERY_DAYS,
     reason:recoveryIntent?.reason || "subscriber_directory_initial"});

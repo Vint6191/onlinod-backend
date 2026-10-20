@@ -5,6 +5,13 @@
 // budget. Unknown errors are bounded too; they must never become an infinite loop.
 const MAX_CONSECUTIVE_FAILURES = 8;
 const MAX_RETRY_DELAY_MS = 15 * 60_000;
+const { isTransientDatabaseError } = require("./db-retry-policy");
+// These executors resume pure SQL planning/publication from durable state.
+// They do not send provider writes. Unknown errors and all unreviewed classes
+// retain the finite poison budget.
+const DATABASE_RECOVERY_WORK_CLASSES = Object.freeze([
+  "CREATOR_RECURRING_PLANNING", "ANALYTICS_PUBLICATION", "ANALYTICS_FACT_PUBLICATION", "ANALYTICS_FACT_ADOPTION",
+]);
 const CONTRACT_CODES = new Set([
   "P2000", "P2003", "P2004", "P2005", "P2006", "P2007", "P2009", "P2011", "P2012",
   "P2013", "P2014", "P2018", "P2021", "P2022", "P2023", "P2025",
@@ -20,19 +27,20 @@ const CONTRACT_CODES = new Set([
   "CUSTOM_SUBMISSION_EXECUTION_PROFILE_LEGACY_RECIPIENT_CONFLICT",
 ]);
 
-function domainWorkFailureOutcome({ error, consecutiveFailures }) {
+function domainWorkFailureOutcome({ error, consecutiveFailures, workClass = null }) {
   const code = String(error?.code || "DOMAIN_WORK_FAILED").slice(0, 120);
   const sqlCode = String(error?.meta?.code || error?.cause?.code || "");
   const contract = error?.retryable === false || CONTRACT_CODES.has(code) || CONTRACT_CODES.has(sqlCode)
     || ["TypeError", "ReferenceError", "SyntaxError", "PrismaClientValidationError", "ZodError"].includes(error?.name);
-  const exhausted = consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+  const transientDatabase = DATABASE_RECOVERY_WORK_CLASSES.includes(workClass) && isTransientDatabaseError(error);
+  const exhausted = !transientDatabase && consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
   return {
     code,
     state: contract || exhausted ? "RECONCILE_REQUIRED" : "READY",
-    errorClass: contract ? "CONTRACT" : exhausted ? "RETRY_EXHAUSTED" : "TRANSIENT",
+    errorClass: contract ? "CONTRACT" : exhausted ? "RETRY_EXHAUSTED" : transientDatabase ? "TRANSIENT_DATABASE" : "TRANSIENT",
     terminalCause: contract ? code : exhausted ? `RETRY_EXHAUSTED:${code}` : null,
     delayMs: Math.min(MAX_RETRY_DELAY_MS, 1000 * 2 ** Math.min(10, consecutiveFailures)),
   };
 }
 
-module.exports = { domainWorkFailureOutcome, MAX_CONSECUTIVE_FAILURES, MAX_RETRY_DELAY_MS };
+module.exports = { domainWorkFailureOutcome, MAX_CONSECUTIVE_FAILURES, MAX_RETRY_DELAY_MS, DATABASE_RECOVERY_WORK_CLASSES };

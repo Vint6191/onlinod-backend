@@ -14,6 +14,7 @@ function maintenanceDegradedDetails(result) {
       failed: boundedCount(lane.failed), skipped: lane.skipped === true,
       errors: boundedCount(lane.errors), contended: boundedCount(lane.contended),
       poisonedSignals: boundedCount(lane.poisonedSignals),
+      blockedWorkClasses: Array.isArray(lane.blockedWorkClasses) ? lane.blockedWorkClasses.slice(0, 4) : [],
       errorDetails: Array.isArray(lane.errorDetails) ? lane.errorDetails.slice(0, 5) : [],
       poisonedSample: Array.isArray(lane.poisonedSample) ? lane.poisonedSample.slice(0, 5) : [],
       error: lane.error ? String(lane.error).slice(0, 500) : null,

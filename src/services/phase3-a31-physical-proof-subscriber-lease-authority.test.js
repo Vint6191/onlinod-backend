@@ -24,7 +24,7 @@ test("A31 Subscriber durable mutation lock order fences repair/publication befor
   assert.match(subscriber, /advanceSubscriberPublication[\s\S]*maintenanceSignal/);
   assert.doesNotMatch(maintenance, /withSubscriberMaintenanceClaimFence/,
     "maintenance worker must not lock the signal row before creator publication authority");
-  assert.match(signals, /"claimUntil" > clock_timestamp\(\)[\s\S]*FOR UPDATE/);
+  assert.match(signals, /"claimUntil" > \(clock_timestamp\(\) AT TIME ZONE 'UTC'\)[\s\S]*FOR UPDATE/);
 });
 
 test("A31 recovered automation planning remains durable debt and Bumps cannot escape the fenced transaction", () => {

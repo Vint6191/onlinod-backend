@@ -121,6 +121,10 @@ const SCHEDULER_OUTCOME = Object.freeze({
   WAITING: "WAITING",
   DEGRADED: "DEGRADED",
 });
+// Keep exception identity inside this process without changing the serialized
+// planning result returned to routes/health. Text-only degraded results cannot
+// authorize an unbounded retry of the recurring SQL planner.
+const SCHEDULER_FAILURE_CAUSE = Symbol("schedulerFailureCause");
 const WAITING_REASON_PATTERN = /(?:waiting|not_ready|pending|deferred|already_in_flight|recently_done|idempotency_race|daily_limit|cooldown|lease_contended|legacy_executor_drain)/i;
 let recurringSchedulerHealth = {
   status: "STARTING",
@@ -269,17 +273,19 @@ function normalizeSchedulerDecision(decision, { requireOk = true, reason = null,
   };
 }
 
-function recordDerivedSchedulerOutcome({ created, skipped, degraded, outcomes = null, work, decision, createdLabel = work, createdWhen = null, reason = null, requireOk = true }) {
+function recordDerivedSchedulerOutcome({ created, skipped, degraded, outcomes = null, work, decision, createdLabel = work, createdWhen = null, reason = null, requireOk = true, failureCause = null }) {
   const normalized = normalizeSchedulerDecision(decision, { requireOk, reason, createdWhen });
   if (normalized.created) created.push(createdLabel);
   else skipped.push(`${work}:${normalized.reason}`);
   if (normalized.outcome === SCHEDULER_OUTCOME.DEGRADED) {
-    degraded.push({
+    const failure = {
       work,
       reason: normalized.reason,
       created: normalized.created,
       failures: normalized.failures,
-    });
+    };
+    if (failureCause) Object.defineProperty(failure, SCHEDULER_FAILURE_CAUSE, { value: failureCause });
+    degraded.push(failure);
   }
   if (Array.isArray(outcomes)) outcomes.push({ work, ...normalized });
   return normalized;
@@ -287,9 +293,11 @@ function recordDerivedSchedulerOutcome({ created, skipped, degraded, outcomes = 
 
 async function executeSchedulerConsumer({ work, execute, created, skipped, degraded, outcomes, createdLabel = work, createdWhen = null, reason = null, requireOk = true }) {
   let decision;
+  let failureCause = null;
   try {
     decision = await execute();
   } catch (error) {
+    failureCause = error;
     decision = {
       ok: false,
       created: false,
@@ -304,7 +312,7 @@ async function executeSchedulerConsumer({ work, execute, created, skipped, degra
       createdLabel: typeof createdLabel === "function" ? createdLabel(decision) : createdLabel,
       createdWhen: typeof createdWhen === "function" ? createdWhen(decision) : createdWhen,
       reason: typeof reason === "function" ? reason(decision) : reason,
-      requireOk,
+      requireOk, failureCause,
     }),
   };
 }
@@ -418,6 +426,7 @@ async function scheduleInitialJobsForCreator({
     const reason = err?.code || "creator_analytics_exception";
     skipped.push(`creator_analytics:${reason}`);
     const failure = { work: "creator_analytics", reason, created: false, failures: [{ path: "exception", reason, error: String(err?.message || err) }] };
+    Object.defineProperty(failure, SCHEDULER_FAILURE_CAUSE, { value: err });
     degraded.push(failure);
     outcomes.push({ ...failure, outcome: SCHEDULER_OUTCOME.DEGRADED, ok: false });
     // Fail closed for automatic read work. If bootstrap state cannot be proven,
@@ -1965,6 +1974,7 @@ async function runRecurringCreatorWork({
     }
 
     const creatorIssues = [];
+    const creatorFailures = [];
     const baseNow = heartbeat.authorityNow || claim.authorityNow || now;
     const lastFullPlanningAt = new Date(item.progressCursor?.lastFullPlanningAt || 0);
     const fullPlanningDue = !Number.isFinite(lastFullPlanningAt.getTime())
@@ -1979,6 +1989,7 @@ async function runRecurringCreatorWork({
       totalCreated += Number(analytics.created || 0);
       totalSkipped += Number(analytics.skipped || 0);
     } catch (error) {
+      creatorFailures.push(error);
       creatorIssues.push({ work: "analytics_planning", reason: error?.code || "analytics_planning_failed", error: String(error?.message || error).slice(0, 500) });
     }
     let planning;
@@ -1996,11 +2007,14 @@ async function runRecurringCreatorWork({
       totalCreated += Number(planning?.created?.length || 0);
       totalSkipped += Number(planning?.skipped?.length || 0);
       if (!planning || planning.ok === false || !Array.isArray(planning.degraded)) {
-        creatorIssues.push(...(Array.isArray(planning?.degraded) && planning.degraded.length
+        const issues = Array.isArray(planning?.degraded) && planning.degraded.length
           ? planning.degraded
-          : [{ work: "creator_planning", reason: planning?.reason || "malformed_creator_planning_result" }]));
+          : [{ work: "creator_planning", reason: planning?.reason || "malformed_creator_planning_result" }];
+        creatorIssues.push(...issues);
+        for (const issue of issues) if (issue[SCHEDULER_FAILURE_CAUSE]) creatorFailures.push(issue[SCHEDULER_FAILURE_CAUSE]);
       }
     } catch (error) {
+      creatorFailures.push(error);
       creatorIssues.push({ work: "creator_planning", reason: error?.code || "creator_planning_exception", error: String(error?.message || error) });
     }
 
@@ -2017,6 +2031,7 @@ async function runRecurringCreatorWork({
       else dailyCyclesSkipped += 1;
       if (!dailyOutcome.ok) creatorIssues.push({ work: "daily_vault_intelligence", reason: dailyOutcome.reason, failures: dailyOutcome.failures });
     } catch (error) {
+      creatorFailures.push(error);
       dailyCyclesSkipped += 1;
       creatorIssues.push({ work: "daily_vault_intelligence", reason: error?.code || "daily_vault_exception", error: String(error?.message || error) });
     }
@@ -2026,7 +2041,13 @@ async function runRecurringCreatorWork({
     if (creatorIssues.length) {
       totalDegraded += creatorIssues.length;
       degradedCreators.push({ creatorId: creator.id, issues: creatorIssues });
-      const error = Object.assign(new Error(creatorIssues.map((issue) => `${issue.work}:${issue.reason}`).join("; ").slice(0, 1900)), {
+      const message = creatorIssues.map((issue) => `${issue.work}:${issue.reason}`).join("; ").slice(0, 1900);
+      // Keep typed causes for known SQL outages. Flattening them into the
+      // generic DEGRADED code used to exhaust this durable planner forever.
+      // A malformed/contract result has no matching error and stays bounded.
+      const failure = creatorFailures.length === creatorIssues.length
+        ? new AggregateError(creatorFailures, message) : new Error(message);
+      const error = Object.assign(failure, {
         code: "CREATOR_RECURRING_PLANNING_DEGRADED",
       });
       const failed = await failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error, fallbackNow: now }).catch(() => ({ failed: false, lost: true }));
@@ -2097,7 +2118,9 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
     // admitted lane executes one already-bounded work unit, then yields to the next lane.
     for (const [name, run] of selected) {
       try {
-        const laneResult = await run();
+        const laneResult = await require("./maintenance-blocked-work-service").withBlockedWorkHealth({
+          db, lane: name, result: await run(),
+        });
         result[name] = laneResult;
         if (laneResult?.ok === false) result.ok = false;
       } catch (error) {

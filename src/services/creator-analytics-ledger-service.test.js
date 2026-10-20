@@ -1571,7 +1571,7 @@ test("ledger overview preserves nullable earnings categories and counts only com
     $queryRaw: async () => [{ campaignId: "campaign-1", totalRevenueCents: 1000n, salesRevenueCents: 700n, tipsRevenueCents: 300n, subscriptionRevenueCents: 0n, transactionsCount: 2n }],
   };
   db.$queryRawUnsafe = async (sql) => {
-    if (sql.includes('CreatorAnalyticsPublicationState')) return [{ initialized: true, pending: false, days: [{ date: '2026-08-06', values: { likes: 4, comments: 2 } }] }];
+    if (sql.includes('CreatorAnalyticsPublicationState')) return [{ initialized: true, pending: { all: false, activity: false, financial: false }, days: [{ date: '2026-08-06', values: { likes: 4, comments: 2 } }] }];
     if (sql.includes('clock_timestamp')) return [{ authorityNow: new Date("2026-08-06T12:00:00Z") }];
     if (sql.includes('published_earnings_days_v1')) {
       const rows = await db.creatorEarningsDaily.findMany();
@@ -1641,7 +1641,7 @@ test("current overview ledger mode does not read dormant server message authorit
     $queryRaw: async () => [],
   };
   db.$queryRawUnsafe = async (sql) => {
-    if (sql.includes('CreatorAnalyticsPublicationState')) return [{ initialized: true, pending: false, days: [{ date: '2026-08-06', values: { likes: 4, comments: 2 } }] }];
+    if (sql.includes('CreatorAnalyticsPublicationState')) return [{ initialized: true, pending: { all: false, activity: false, financial: false }, days: [{ date: '2026-08-06', values: { likes: 4, comments: 2 } }] }];
     if (sql.includes('clock_timestamp')) return [{ authorityNow: new Date("2026-08-06T12:00:00Z") }];
     if (sql.includes('published_earnings_days_v1')) {
       const rows = await db.creatorEarningsDaily.findMany();
@@ -1703,7 +1703,7 @@ test("today earnings are official only when the row and in-progress proof both e
     $queryRaw: async () => [],
   };
   db.$queryRawUnsafe = async (sql) => {
-    if (sql.includes('CreatorAnalyticsPublicationState')) return [{ initialized: true, pending: false, days: [{ date: '2026-08-06', values: { likes: 4, comments: 2 } }] }];
+    if (sql.includes('CreatorAnalyticsPublicationState')) return [{ initialized: true, pending: { all: false, activity: false, financial: false }, days: [{ date: '2026-08-06', values: { likes: 4, comments: 2 } }] }];
     if (sql.includes('clock_timestamp')) return [{ authorityNow: new Date("2026-08-06T12:00:00Z") }];
     if (sql.includes('published_earnings_days_v1')) {
       const rows = await db.creatorEarningsDaily.findMany();

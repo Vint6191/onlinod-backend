@@ -346,6 +346,10 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
       financialWindows: financialCoverage,
       factPublicationReady: ledger.factPublication?.ready === true,
       factPublicationState: ledger.factPublication?.state || "REBUILDING",
+      factPublication: {
+        activity: ledger.factPublication?.scopes?.activity || { ready: false, state: "REBUILDING" },
+        financial: ledger.factPublication?.scopes?.financial || { ready: false, state: "REBUILDING" },
+      },
       earningsVerified: ledger.verification.officialEarnings,
       earningsComplete: ledger.verification.earningsComplete === true,
       earningsProven: ledger.verification.earningsProven === true,

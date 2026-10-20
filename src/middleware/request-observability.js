@@ -54,7 +54,11 @@ function createRequestObservabilityMiddleware(options = {}) {
         durationMs: Math.round(durationMs * 10) / 10,
         terminalEvent,
       };
-      if (durationMs >= slowRequestMs && !expectedLongRequest(path)) {
+      // Fast failures of background polls must be visible at the default level.
+      // Metadata deliberately excludes bodies, credentials and query strings.
+      if (meta.status >= 500) {
+        log.warn("failed http request", meta);
+      } else if (durationMs >= slowRequestMs && !expectedLongRequest(path)) {
         log.warn("slow http request", meta);
       } else {
         log.debug("http request", meta);

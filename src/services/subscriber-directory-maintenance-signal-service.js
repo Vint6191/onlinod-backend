@@ -4,6 +4,7 @@ const { runDbTransaction } = require("./db-transaction-service");
 
 const crypto = require("node:crypto");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { isTransientDatabaseError, classifyStoredDatabaseFailure, describeDatabaseFailure } = require("./db-retry-policy");
 
 const SUBSCRIBER_MAINTENANCE_KIND = Object.freeze({ RECOVERY: "RECOVERY", RETENTION: "RETENTION" });
 const SUBSCRIBER_MAINTENANCE_CLAIM_MS = 2 * 60 * 1000;
@@ -11,6 +12,9 @@ const SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS = 100;
 // Pre-v25 workers charged successful continuation against the error budget.
 // Only these exact historical yield reasons are eligible for automatic repair.
 const LEGACY_YIELD_ERRORS = ["subscriber_recovery_budget_exhausted", "maintenance_budget_exhausted", "publication_debt"];
+// Due/lease columns are timestamp-without-time-zone containing UTC. Several
+// signal operations run outside a commit-kernel transaction, so SQL must not
+// interpret these values using a pool connection's local TimeZone.
 
 function clean(value, max = 500) {
   const text = String(value ?? "").trim();
@@ -48,7 +52,7 @@ async function signalSubscriberDirectoryMaintenance({
     INSERT INTO "SubscriberDirectoryMaintenanceSignal" (
       "id","agencyId","creatorId","kind","dueAt","reason","revision","attempts","createdAt","updatedAt"
     ) VALUES (
-      $1,$2,$3,$4,$5,$6,1,0,NOW(),NOW()
+      $1,$2,$3,$4,$5,$6,1,0,(NOW() AT TIME ZONE 'UTC'),(NOW() AT TIME ZONE 'UTC')
     )
     ON CONFLICT ("creatorId","kind") DO UPDATE SET
       "agencyId"=EXCLUDED."agencyId",
@@ -59,18 +63,63 @@ async function signalSubscriberDirectoryMaintenance({
       "claimToken"=NULL,
       "claimUntil"=NULL,
       "lastError"=NULL,
-      "updatedAt"=NOW()
+      "updatedAt"=(NOW() AT TIME ZONE 'UTC')
     RETURNING "id","agencyId","creatorId","kind","dueAt","revision","claimToken","claimUntil"
   `, `submaint_${crypto.randomUUID?.() || crypto.randomBytes(16).toString("hex")}`, agency, creator, signalKind, effectiveDueAt, clean(reason, 64) || "PUBLICATION_DEBT");
   const signal = Array.isArray(rows) ? rows[0] || null : null;
   return { signaled: Boolean(signal), signal };
 }
 
+// Re-observing an unfinished publication is not a new publication revision.
+// Repair a missing wake without stealing a healthy worker's claim, resetting
+// its backoff or silently clearing a genuine quarantined error.
+async function ensureSubscriberDirectoryMaintenance({ db, agencyId, creatorId, kind, reason = "PUBLICATION_DEBT" } = {}) {
+  const agency = clean(agencyId, 180);
+  const creator = clean(creatorId, 180);
+  const signalKind = normalizeKind(kind);
+  if (!agency || !creator || typeof db?.$queryRawUnsafe !== "function") return { signaled: false, reason: "adapter_unsupported" };
+  const rows = await db.$queryRawUnsafe(`
+    INSERT INTO "SubscriberDirectoryMaintenanceSignal" (
+      "id","agencyId","creatorId","kind","dueAt","reason","revision","attempts","createdAt","updatedAt"
+    ) VALUES ($1,$2,$3,$4,(clock_timestamp() AT TIME ZONE 'UTC'),$5,1,0,(clock_timestamp() AT TIME ZONE 'UTC'),(clock_timestamp() AT TIME ZONE 'UTC'))
+    ON CONFLICT ("creatorId","kind") DO NOTHING
+    RETURNING "id","agencyId","creatorId","kind","dueAt","revision","claimToken","claimUntil"
+  `, `submaint_${crypto.randomUUID()}`, agency, creator, signalKind, clean(reason, 64) || "PUBLICATION_DEBT");
+  if (rows.length) return { signaled: true, repaired: false, signal: rows[0] };
+  // Older workers charged temporary database outages against their poison
+  // budget and persisted only message text. Repair only an exact recognized
+  // database diagnostic, scoped to this creator/kind. Revision + lease checks
+  // prevent this planning wake from stealing a live owner or newer work.
+  const prior = await db.$queryRawUnsafe(`
+    SELECT "id","revision","attempts","lastError"
+    FROM "SubscriberDirectoryMaintenanceSignal"
+    WHERE "agencyId"=$1 AND "creatorId"=$2 AND "kind"=$3
+      AND "attempts">=$4
+      AND COALESCE("claimUntil",'-infinity'::timestamp)<=(clock_timestamp() AT TIME ZONE 'UTC')
+    LIMIT 1
+  `, agency, creator, signalKind, SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS);
+  const old = prior[0];
+  if (!old || !classifyStoredDatabaseFailure({ message: old.lastError })) return { signaled: false, repaired: false, signal: null };
+  const repaired = await db.$queryRawUnsafe(`
+    UPDATE "SubscriberDirectoryMaintenanceSignal"
+    SET "attempts"=0,"lastError"=NULL,"claimToken"=NULL,"claimUntil"=NULL,
+      "dueAt"=LEAST("dueAt",(clock_timestamp() AT TIME ZONE 'UTC')),"reason"='TRANSIENT_DATABASE_RECOVERY',
+      "revision"="revision"+1,"updatedAt"=(clock_timestamp() AT TIME ZONE 'UTC')
+    WHERE "id"=$1 AND "agencyId"=$2 AND "creatorId"=$3 AND "kind"=$4
+      AND "revision"=$5 AND "attempts"=$6 AND "lastError" IS NOT DISTINCT FROM $7::text
+      AND COALESCE("claimUntil",'-infinity'::timestamp)<=(clock_timestamp() AT TIME ZONE 'UTC')
+    RETURNING "id","agencyId","creatorId","kind","dueAt","revision","claimToken","claimUntil"
+  `, old.id, agency, creator, signalKind, Number(old.revision), Number(old.attempts), old.lastError);
+  return { signaled: repaired.length > 0, repaired: repaired.length > 0, signal: repaired[0] || null };
+}
+
 async function claimSubscriberDirectoryMaintenanceSignal({ db, now = new Date(), statementTimeoutMs = 2_000 } = {}) {
   if (typeof db?.$transaction !== "function") return null;
   const fallbackNow = asDate(now);
   const claimToken = `subclaim_${crypto.randomUUID?.() || crypto.randomBytes(16).toString("hex")}`;
-  const timeoutMs = Math.max(250, Math.min(5_000, Number(statementTimeoutMs) || 2_000));
+  // The pump measures its remaining slice with performance.now(), whose result
+  // is fractional. Commit-kernel budgets (and Prisma options) are integer ms.
+  const timeoutMs = Math.max(250, Math.min(5_000, Math.floor(Number(statementTimeoutMs) || 2_000)));
   return runDbTransaction(db, async (tx) => {
     if (typeof tx?.$queryRawUnsafe !== "function") return null;
     await tx.$executeRawUnsafe(`SET LOCAL statement_timeout = '${Math.floor(timeoutMs)}ms'`);
@@ -103,7 +152,7 @@ async function claimSubscriberDirectoryMaintenanceSignal({ db, now = new Date(),
         SELECT "id" FROM eligible ORDER BY "dueAt", "creatorId", "kind" LIMIT 1
       )
       UPDATE "SubscriberDirectoryMaintenanceSignal" s
-      SET "claimToken"=$2, "claimUntil"=$3, "updatedAt"=NOW(),
+      SET "claimToken"=$2, "claimUntil"=$3, "updatedAt"=(NOW() AT TIME ZONE 'UTC'),
           "attempts"=CASE WHEN s."attempts" >= ${SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS} THEN 0 ELSE s."attempts" END,
           "lastError"=CASE WHEN s."attempts" >= ${SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS} THEN NULL ELSE s."lastError" END
       FROM candidate c
@@ -124,7 +173,7 @@ async function lockSubscriberMaintenanceClaimRow({ db, signal } = {}) {
     WHERE "id"=$1
       AND "claimToken"=$2
       AND "revision"=$3
-      AND "claimUntil" > clock_timestamp()
+      AND "claimUntil" > (clock_timestamp() AT TIME ZONE 'UTC')
     FOR UPDATE
   `, signal.id, signal.claimToken, Number(signal.revision || 0));
   return Array.isArray(rows) ? rows[0] || null : null;
@@ -138,7 +187,7 @@ async function subscriberMaintenanceClaimCurrent({ db, signal } = {}) {
     WHERE "id"=$1
       AND "claimToken"=$2
       AND "revision"=$3
-      AND "claimUntil" > clock_timestamp()
+      AND "claimUntil" > (clock_timestamp() AT TIME ZONE 'UTC')
     LIMIT 1
   `, signal.id, signal.claimToken, Number(signal.revision || 0));
   return Array.isArray(rows) && rows.length === 1;
@@ -186,13 +235,13 @@ async function requeuePoisonedSubscriberMaintenanceSignal({ db, signalId, reason
   const rows = await db.$queryRawUnsafe(`
     UPDATE "SubscriberDirectoryMaintenanceSignal"
     SET "attempts"=0,
-        "dueAt"=clock_timestamp(),
+        "dueAt"=(clock_timestamp() AT TIME ZONE 'UTC'),
         "claimToken"=NULL,
         "claimUntil"=NULL,
         "lastError"=NULL,
         "reason"=$2,
         "revision"="revision"+1,
-        "updatedAt"=clock_timestamp()
+        "updatedAt"=(clock_timestamp() AT TIME ZONE 'UTC')
     WHERE "id"=$1 AND "attempts" >= ${SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS}
     RETURNING "id","agencyId","creatorId","kind","dueAt","revision"
   `, id, clean(reason, 64) || "OPERATOR_REQUEUE");
@@ -207,7 +256,7 @@ async function ackSubscriberDirectoryMaintenanceSignal({ db, signal } = {}) {
       WHERE "id"=$1
         AND "claimToken"=$2
         AND "revision"=$3
-        AND "claimUntil" > clock_timestamp()
+        AND "claimUntil" > (clock_timestamp() AT TIME ZONE 'UTC')
     `, signal.id, signal.claimToken, Number(signal.revision || 0));
     return Number(count || 0) > 0;
   }
@@ -230,10 +279,12 @@ async function releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now = n
   const count = await db.$executeRawUnsafe(`
     UPDATE "SubscriberDirectoryMaintenanceSignal"
     SET "dueAt"=$3, "claimToken"=NULL, "claimUntil"=NULL,
-        "attempts"=CASE WHEN $4::text IS NULL THEN 0 ELSE "attempts"+1 END, "lastError"=$4, "updatedAt"=NOW()
+        "attempts"=CASE WHEN $4::text IS NULL THEN 0 WHEN $6::boolean THEN "attempts" ELSE "attempts"+1 END,
+        "lastError"=$4, "updatedAt"=(NOW() AT TIME ZONE 'UTC')
     WHERE "id"=$1 AND "claimToken"=$2 AND "revision"=$5
-      AND "claimUntil" > clock_timestamp()
-  `, signal.id, signal.claimToken, retryDueAt, clean(error?.message || error, 1000), Number(signal.revision || 0));
+      AND "claimUntil" > (clock_timestamp() AT TIME ZONE 'UTC')
+  `, signal.id, signal.claimToken, retryDueAt, error == null ? null : clean(describeDatabaseFailure(error, 1000), 1000),
+    Number(signal.revision || 0), isTransientDatabaseError(error));
   return Number(count || 0) > 0;
 }
 
@@ -242,6 +293,7 @@ module.exports = {
   SUBSCRIBER_MAINTENANCE_CLAIM_MS,
   SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS,
   signalSubscriberDirectoryMaintenance,
+  ensureSubscriberDirectoryMaintenance,
   claimSubscriberDirectoryMaintenanceSignal,
   subscriberMaintenanceClaimCurrent,
   lockSubscriberMaintenanceClaimRow,

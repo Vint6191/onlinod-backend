@@ -10,12 +10,12 @@ const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const { collectionCommand, COLLECTOR_TYPES } = require("./analytics-collector-control-service");
 const { stampObservationStart, observationStartForJob } = require("./analytics-observation-time");
 const directoryCounts = require("./campaign-directory-count-authority");
+const { isTransientDatabaseError, describeDatabaseFailure } = require("./db-retry-policy");
 const { publishDomainWork, claimDomainWorkBatch, lockDomainWorkClaimForCommit,
   ackDomainWorkClaim, yieldDomainWorkClaim, failDomainWorkClaim } = require("./domain-work-authority-service");
 
 const KEYS = new Set(["fetch_earnings", "fetch_campaigns", "financial_transactions_scan"]);
 const PAGE = 200;
-const MAX_ATTEMPTS = 8;
 const MAX_JOB_ATTEMPTS = 5;
 function fault(code, status = 409) { return Object.assign(new Error(code), { code, status }); }
 function object(value) { return value && typeof value === "object" && !Array.isArray(value) ? value : {}; }
@@ -417,12 +417,16 @@ async function runAnalyticsPublicationSweep({ db, limit = 8, maxRuntimeMs = 5000
         if (!row || row.state !== "PENDING" || jobs[0]?.status !== "PUBLISHING") return;
         if (!(await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken: batch.ownerToken })).current) return;
         await lockDomain(tx, jobs[0]);
-        const attempt = row.attempts + 1, at = await dbAuthorityNow({ db: tx });
-        const message = String(error?.code || error?.message || error).slice(0, 2000);
-        if (attempt >= MAX_ATTEMPTS || require("./domain-work-failure-policy").domainWorkFailureOutcome({ error, consecutiveFailures: attempt }).state === "RECONCILE_REQUIRED") {
+        const attempt = Math.min(2_147_483_647, Number(row.attempts || 0) + 1), at = await dbAuthorityNow({ db: tx });
+        const message = isTransientDatabaseError(error) ? describeDatabaseFailure(error)
+          : String(error?.code || error?.message || error).slice(0, 2000);
+        // No provider write is performed here: each retry re-reads the durable
+        // publication stage under the existing ownership and generation fences.
+        // Database availability must not reject already accepted source facts.
+        if (!isTransientDatabaseError(error) && require("./domain-work-failure-policy").domainWorkFailureOutcome({ error, consecutiveFailures: attempt }).state === "RECONCILE_REQUIRED") {
           await settle(tx, jobs[0], row, { ok: false, type: "analytics_publication", error: message }, at, { forceTerminal: true });
         } else await tx.analyticsPublication.update({ where: { id: publicationId }, data: {
-          attempts: attempt, lastError: message, availableAt: new Date(at.getTime() + Math.min(300000, 1000 * 2 ** attempt)),
+          attempts: attempt, lastError: message, availableAt: new Date(at.getTime() + Math.min(300000, 1000 * 2 ** Math.min(10, attempt))),
         } });
       }, { profile: "JOB_CHUNK", authority: { kind: "ANALYTICS_PUBLICATION_FAILURE" } });
       const failed = await db.analyticsPublication.findUnique({ where: { id: publicationId } });

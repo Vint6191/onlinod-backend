@@ -248,12 +248,37 @@ async function runSweep({ db = require("../prisma"), limit = 8, maxRuntimeMs = 5
   return report;
 }
 
+const PUBLICATION_SCOPES = Object.freeze({
+  financial: ["CreatorFinancialTransaction"],
+  activity: ["CreatorSubscriptionEvent", "CreatorPostLike", "CreatorPostComment"],
+  all: TABLES,
+});
+// Values are staged from canonical UTC SQL facts. Match contribution()'s date
+// precedence, including the previous value: a correction can move OUT of the
+// requested range and still requires subtraction from that range's day totals.
+function factDayExpression(column) {
+  if (!["currentValue", "publishedValue"].includes(column)) throw fault("ANALYTICS_FACT_COLUMN_INVALID");
+  return `left(COALESCE(${["purchasedAt", "tippedAt", "occurredAt", "paidAt", "likedAt", "commentedAt", "date"]
+    .map(key => `f."${column}"->>'${key}'`).join(",")}),10)`;
+}
+function publicationEvidence(initialized, pending) {
+  return { ready: initialized && !pending, state: !initialized ? "REBUILDING" : pending ? "UPDATING" : "READY" };
+}
+
 async function readPublishedDays({ db, creatorId, from, to }) {
   const [row] = await db.$queryRawUnsafe(`SELECT COALESCE(s.initialized,FALSE) AS initialized,
-    EXISTS(SELECT 1 FROM "CreatorAnalyticsFactPublication" f WHERE f."creatorId"=c.id AND f.dirty LIMIT 1) AS pending,
+    (SELECT jsonb_object_agg(scope.name,
+      EXISTS(SELECT 1 FROM "CreatorAnalyticsFactPublication" f
+        WHERE f."creatorId"=c.id AND f.dirty AND f.kind=ANY(scope.kinds)
+          AND ${factDayExpression("currentValue")}>=$2::text AND ${factDayExpression("currentValue")}<=$3::text)
+      OR EXISTS(SELECT 1 FROM "CreatorAnalyticsFactPublication" f
+        WHERE f."creatorId"=c.id AND f.dirty AND f.kind=ANY(scope.kinds)
+          AND ${factDayExpression("publishedValue")}>=$2::text AND ${factDayExpression("publishedValue")}<=$3::text))
+      FROM jsonb_to_recordset($4::jsonb) scope(name text,kinds text[])) AS pending,
     COALESCE((SELECT jsonb_agg(jsonb_build_object('date',d.date,'values',d.values,'updatedAt',d."updatedAt") ORDER BY d.date)
       FROM "CreatorAnalyticsDay" d WHERE d."creatorId"=c.id AND d.date>=$2::date AND d.date<=$3::date),'[]') AS days
-    FROM "CreatorAccount" c LEFT JOIN "CreatorAnalyticsPublicationState" s ON s."creatorId"=c.id WHERE c.id=$1`, creatorId, from, to);
+    FROM "CreatorAccount" c LEFT JOIN "CreatorAnalyticsPublicationState" s ON s."creatorId"=c.id WHERE c.id=$1`, creatorId, new Date(from).toISOString().slice(0, 10), new Date(to).toISOString().slice(0, 10),
+    JSON.stringify(Object.entries(PUBLICATION_SCOPES).map(([name, kinds]) => ({ name, kinds }))));
   if (!row) throw fault("ANALYTICS_CREATOR_MISSING");
   const totals = {}, days = row.days || [];
   for (const day of days) for (const [key, amount] of Object.entries(day.values)) add(totals, key, amount);
@@ -263,9 +288,11 @@ async function readPublishedDays({ db, creatorId, from, to }) {
     if (parts[0] === "subscription" && parts[2] === "count") subscriptions.push({ eventType: parts[1], _count: { _all: totals[key] }, _sum: { observedPriceCents: totals[`subscription:${parts[1]}:amount`] || 0 } });
     if (parts[0] === "financial" && parts[3] === "count") financialGroups.push({ transactionType: parts[1], transactionStatus: parts[2], _count: { _all: totals[key] }, _sum: { amountCents: totals[`financial:${parts[1]}:${parts[2]}:amount`] || 0, netCents: totals[`financial:${parts[1]}:${parts[2]}:net`] || 0 } });
   }
-  return { ready: row.initialized && !row.pending, state: !row.initialized ? "REBUILDING" : row.pending ? "UPDATING" : "READY",
+  const scopes = Object.fromEntries(Object.keys(PUBLICATION_SCOPES)
+    .map(name => [name, publicationEvidence(row.initialized === true, row.pending?.[name] !== false)]));
+  return { ...scopes.all, scopes,
     days: days.map(row => ({ date: new Date(row.date), ...row.values })), totals, subscriptions, financialGroups };
 }
 
 module.exports = { WORK_CLASS, ADOPTION_CLASS, ADOPTION_KEY, TABLES, MODELS, PAGE, contribution, deltas,
-  applyDeltas, processPage, enumerateAdoption, processAdoption, runSweep, readPublishedDays };
+  applyDeltas, processPage, enumerateAdoption, processAdoption, runSweep, readPublishedDays, factDayExpression, PUBLICATION_SCOPES };

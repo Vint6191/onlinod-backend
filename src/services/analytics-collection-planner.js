@@ -11,6 +11,7 @@ const { allowedCreatorScope } = require("../middleware/automation-permissions");
 const { canUsePermission } = require("./team-access-control");
 const { evaluateCollectionState } = require("./analytics-state-evaluator");
 const { earningsObservationAt } = require("./analytics-observation-time");
+const { classifyDatabaseFailure } = require("./db-retry-policy");
 const {
   CURRENT_DAY_FRESHNESS_MS,
   RECENT_CLOSED_FRESHNESS_MS,
@@ -862,18 +863,14 @@ const DEMAND_CONTRACT_ERROR_CODES = new Set([
   "ANALYTICS_DEMAND_ACCESS_FENCE_MISSING",
   "ANALYTICS_DEMAND_RANGE_INVALID",
 ]);
-const DEMAND_TRANSIENT_ERROR_CODES = new Set([
-  "P1001", "P1002", "P1008", "P1017", "P2024", "P2034",
-  "ETIMEDOUT", "ECONNRESET", "ECONNREFUSED", "EAI_AGAIN",
-]);
-
 function analyticsDemandError(error) {
   const source = error && typeof error === "object" ? error : {};
-  const rawCode = String(source.code || "ANALYTICS_DEMAND_FAILED").trim().toUpperCase().replace(/[^A-Z0-9_]+/g, "_");
+  const databaseFailure = classifyDatabaseFailure(error);
+  const rawCode = String(databaseFailure?.code || source.code || "ANALYTICS_DEMAND_FAILED").trim().toUpperCase().replace(/[^A-Z0-9_]+/g, "_");
   const code = (rawCode || "ANALYTICS_DEMAND_FAILED").slice(0, 120);
   const errorClass = DEMAND_CONTRACT_ERROR_CODES.has(code)
     ? "CONTRACT"
-    : DEMAND_TRANSIENT_ERROR_CODES.has(code) ? "TRANSIENT" : "INTERNAL";
+    : databaseFailure ? "TRANSIENT" : "INTERNAL";
   return {
     code,
     errorClass,
@@ -917,8 +914,12 @@ async function settleAnalyticsDemand({ db = prisma, demand, completedAt = new Da
       }
       if (error) {
         const failure = analyticsDemandError(error);
-        const attempts = Number(current.attempts || 0) + 1;
-        const quarantined = failure.terminal === true || attempts >= DEMAND_MAX_ATTEMPTS;
+        const attempts = Math.min(2_147_483_647, Number(current.attempts || 0) + 1);
+        // Planning is a durable SQL operation. A database outage may last
+        // longer than eight attempts; retain its cursor and bounded backoff.
+        // Contract errors and unknown repeated failures still require repair.
+        const quarantined = failure.terminal === true ||
+          (failure.errorClass !== "TRANSIENT" && attempts >= DEMAND_MAX_ATTEMPTS);
         const nextAttemptAt = quarantined ? null : new Date(finishedAt.getTime() + demandRetryDelayMs(attempts));
         await tx.analyticsCollectionDemand.update({
           where: { key: demand.key },
@@ -1159,7 +1160,17 @@ async function runAnalyticsCollectionDemandSweep({ db = prisma, now = new Date()
         errors.push({ key: demand.key, reason: analyticsDemandError(error).code, settled });
       }
     }
-    return { ok: totals.failures === 0, skipped: false, ...totals, ...(totals.failures ? { reason: "analytics_demand_processing_failed", errors } : {}) };
+    // An empty claim is not evidence that quarantined work recovered. This
+    // positive partial-index probe stays bounded independently of history.
+    const quarantinedRemaining = typeof db?.$queryRawUnsafe === "function"
+      ? Boolean((await db.$queryRawUnsafe(`SELECT EXISTS (
+          SELECT 1 FROM "AnalyticsCollectionDemand"
+          WHERE "completedAt" IS NULL AND "quarantinedAt" IS NOT NULL
+        ) AS present`))[0]?.present)
+      : false;
+    return { ok: totals.failures === 0 && !quarantinedRemaining, skipped: false, ...totals, quarantinedRemaining,
+      ...(totals.failures ? { reason: "analytics_demand_processing_failed", errors }
+        : quarantinedRemaining ? { reason: "analytics_demand_quarantined" } : {}) };
   })();
   try {
     return await demandSweepPromise;

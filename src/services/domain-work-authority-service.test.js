@@ -520,6 +520,33 @@ test("Phase3 closure: actual cursor progress resets failures; a heartbeat or emp
   assert.equal(result.consecutiveFailures, 1, "use locked persisted progress, not the stale claimed copy");
 });
 
+test("SQL publication/planning resumes after more than eight temporary database failures with its cursor intact", async () => {
+  for (const workClass of ["CREATOR_RECURRING_PLANNING", "ANALYTICS_PUBLICATION", "ANALYTICS_FACT_PUBLICATION", "ANALYTICS_FACT_ADOPTION"]) {
+    const fx = makeDb();
+    let at = new Date("2026-10-18T00:00:00Z");
+    const row = await authority.publishDomainWork({ db: fx.db, ...base, workClass, objectType: "CreatorAccount", availableAt: at });
+    const cursor = { lastFullPlanningAt: at.toISOString(), lastFactId: "already-committed-page" };
+    fx.rows.get(row.id).progressCursor = cursor;
+    for (let failures = 1; failures <= 12; failures++) {
+      const claim = await authority.claimDomainWorkBatch({ db: fx.db, workClass, ownerToken: `process-${failures}`, fallbackNow: at });
+      assert.equal(claim.items.length, 1, workClass);
+      const result = await authority.failDomainWorkClaim({ db: fx.db, item: claim.items[0], fallbackNow: at,
+        error: Object.assign(new Error("Timed out fetching a new connection from the connection pool."), { code: "P2024" }) });
+      assert.equal(result.state, "READY");
+      assert.equal(result.consecutiveFailures, failures);
+      assert.equal(result.reconcileRequired, false);
+      assert(result.retryAt > at && result.retryAt - at <= 900000);
+      assert.deepEqual(fx.rows.get(row.id).progressCursor, cursor);
+      assert.match(fx.rows.get(row.id).lastError, /^\[TRANSIENT_DB:P2024\]/);
+      at = result.retryAt;
+    }
+    const restarted = await authority.claimDomainWorkBatch({ db: fx.db, workClass, ownerToken: "restored-database", fallbackNow: at });
+    assert.equal(restarted.items.length, 1);
+    assert.deepEqual(restarted.items[0].progressCursor, cursor);
+    assert((await authority.ackDomainWorkClaim({ db: fx.db, item: restarted.items[0], fallbackNow: at })).acknowledged);
+  }
+});
+
 test("Phase3 closure: contract errors require repair, while new canonical revision supersedes old poison", async () => {
   for (const error of [new TypeError("broken projection"), Object.assign(new Error("bad FK"), { code: "P2010", meta: { code: "23503" } }),
     Object.assign(new Error("bad work identity"), { code: "TEAM_DIALOG_WORK_IDENTITY_INVALID" })]) {

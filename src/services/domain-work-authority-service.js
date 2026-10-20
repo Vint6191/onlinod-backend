@@ -3,6 +3,7 @@
 const { createHash, randomUUID } = require("node:crypto");
 const { isDeepStrictEqual } = require("node:util");
 const { domainWorkFailureOutcome } = require("./domain-work-failure-policy");
+const { describeDatabaseFailure } = require("./db-retry-policy");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const {
@@ -1322,7 +1323,7 @@ async function failDomainWorkClaim({ db = null, item, ownerToken = null, error =
     const stored = ownership.item;
     const consecutiveFailures = (asBigInt(stored.failureRevision) === asBigInt(item.claimedRevision)
       ? Math.max(0, Number(stored.consecutiveFailures || 0)) : 0) + 1;
-    const outcome = domainWorkFailureOutcome({ error, consecutiveFailures });
+    const outcome = domainWorkFailureOutcome({ error, consecutiveFailures, workClass: stored.workClass });
     // Respect a domain's later retry deadline, but never hot-loop a past one.
     const due = outcome.state === STATE.READY
       ? new Date(Math.max(authorityNow.getTime() + outcome.delayMs, asDate(retryAt)?.getTime() || 0)) : null;
@@ -1334,7 +1335,8 @@ async function failDomainWorkClaim({ db = null, item, ownerToken = null, error =
         ...(due ? { availableAt: due } : {}), nextAttemptAt: due,
         failureRevision: asBigInt(item.claimedRevision), consecutiveFailures, lastFailureAt: authorityNow,
         errorClass: outcome.errorClass, terminalCause: outcome.terminalCause,
-        lastError: clean(`${outcome.code}: ${error?.message || error || "DOMAIN_WORK_FAILED"}`, 2000),
+        lastError: clean(outcome.errorClass === "TRANSIENT_DATABASE" ? describeDatabaseFailure(error)
+          : `${outcome.code}: ${error?.message || error || "DOMAIN_WORK_FAILED"}`, 2000),
       },
     });
     if (Number(failed?.count || 0) === 1) return {

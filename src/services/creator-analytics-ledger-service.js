@@ -2600,7 +2600,7 @@ async function readCreatorLedgerOverview({ db = prisma, creatorId, rangeKey, now
     ok: true,
     creatorId,
     range: { key: range.key, startAt: range.start.toISOString(), endAt: range.end.toISOString() },
-    factPublication: { ready: publishedFacts.ready, state: publishedFacts.state },
+    factPublication: { ready: publishedFacts.ready, state: publishedFacts.state, scopes: publishedFacts.scopes },
     financialGroups: publishedFacts.financialGroups,
     verification: {
       officialEarnings,
