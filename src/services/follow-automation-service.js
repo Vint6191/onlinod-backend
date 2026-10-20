@@ -1,4 +1,5 @@
 "use strict";
+const { inheritSchedulerFailureCauses } = require("./scheduler-failure-cause");
 
 const prisma = require("../prisma");
 const { readSubscriberConsumerPage } = require("./fan-consumer-cursor-service");
@@ -386,12 +387,12 @@ async function ensureAutomaticFollowAutomation({ agencyId, creatorId, source = "
   if (!directory?.currentRunId) return { ok: true, created: false, reason: "snapshot_not_ready" };
   const planned = await planFollowAutomation({ agencyId, creatorId, userId: null, source, priority: 55, db, scheduleFanRefresh });
   const refreshDebt = Number(planned?.fanRefresh?.requested || 0) > 0 && planned?.fanRefresh?.durable !== true;
-  return {
+  return inheritSchedulerFailureCauses({
     ok: !refreshDebt,
     created: planned.summary.created > 0,
     reason: refreshDebt ? "fan_refresh_debt_not_durable" : (planned.summary.created ? "planned" : "nothing_due"),
     planned,
-  };
+  }, refreshDebt ? [planned.fanRefresh] : []);
 }
 
 async function validateFollowAutomationDelivery({ delivery, control, now = new Date(), db = prisma }) {

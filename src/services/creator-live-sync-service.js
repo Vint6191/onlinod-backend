@@ -352,7 +352,7 @@ async function acceptDelivery({
 
 async function pendingRecovery(db, creatorId, stream) {
   const rows = await db.$queryRawUnsafe(
-    `SELECT * FROM "CreatorRecoveryIntent" WHERE "creatorId"=$1 AND stream=$2 AND status<>'COMPLETE' ORDER BY "targetAt",id LIMIT 1`,
+    `SELECT * FROM "CreatorRecoveryIntent" WHERE "creatorId"=$1 AND stream=$2 AND status IN ('PENDING','RUNNING') ORDER BY "targetAt",id LIMIT 1`,
     creatorId,
     stream
   );
@@ -375,7 +375,7 @@ async function bindRecovery(db, intent, jobId) {
     jobId
   );
 }
-async function completeRecovery(db, job, successful) {
+async function completeRecovery(db, job, successful, { deferPlanningWake = false } = {}) {
   const id = job.params?.recoveryIntentId;
   if (!successful) return;
   const stream = JOB_STREAM[job.jobKey];
@@ -392,7 +392,7 @@ async function completeRecovery(db, job, successful) {
         new Date(job.params.collectionRequestedAt)
       );
       await compactRecoveryAuthority(db, job.creatorId);
-      await wakeRemainingRecovery(db, job);
+      await wakeRemainingRecovery(db, job, { deferPlanningWake });
     }
     return;
   }
@@ -416,14 +416,20 @@ async function completeRecovery(db, job, successful) {
     rows[0].targetAt
   );
   await compactRecoveryAuthority(db, job.creatorId);
-  await wakeRemainingRecovery(db, job);
+  await wakeRemainingRecovery(db, job, { deferPlanningWake });
 }
 
-async function wakeRemainingRecovery(db, job) {
+async function wakeRemainingRecovery(db, job, { deferPlanningWake = false } = {}) {
   // A newer gap may have arrived while the old collector was still running.
   // Its completion wakes the creator directly instead of relying on a sweep.
   const pending=await db.$queryRawUnsafe(`SELECT 1 FROM "CreatorRecoveryIntent"
     WHERE "creatorId"=$1 AND status='PENDING' LIMIT 1`,job.creatorId);
+  if (pending.length && deferPlanningWake) {
+    await require("./subscriber-directory-maintenance-signal-service").signalSubscriberDirectoryMaintenance({
+      db, agencyId: job.agencyId, creatorId: job.creatorId, kind: "DERIVED_PLANNING", reason: "REMAINING_RECOVERY_DEBT",
+    });
+    return;
+  }
   if(pending.length) await require("./domain-work-authority-service").publishDomainWork({
     db,agencyId:job.agencyId,creatorId:job.creatorId,workClass:"CREATOR_RECURRING_PLANNING",
     objectType:"CreatorAccount",objectId:job.creatorId,partitionKey:job.creatorId,

@@ -136,5 +136,21 @@ for (const expireAtFinal of [false,true]) test(`terminal bootstrap preserves eli
   }));
   const call=()=>service.planRecurringCreatorAnalytics({db:f.db,item:f.item,now:f.now});
   if(expireAtFinal){await assert.rejects(call,{code:"ANALYTICS_PLANNING_CLAIM_LOST"});assert.equal(events.length,0);}
-  else {const r=await call();assert.equal(r.created,2);assert.equal(r.initial.reason,"failed_terminal");assert.equal(events.length,1);assert.equal(f.rolledBack,false);}
+  else {const r=await call();assert.equal(r.created,2);assert.equal(r.initial.reason,"failed_terminal");
+    assert.deepEqual(r.blocked,[{stream:"campaigns",reason:"failed_terminal",code:"COLLECTOR_REPAIR_REQUIRED"}]);
+    assert.equal(events.length,1);assert.equal(f.rolledBack,false);}
+});
+
+test("committed recurring decisions retain exact skip reasons and terminal collector cause", async (t) => {
+  const f = fixture();
+  const blocked = [{ stream: "financial", reason: "failed_terminal", code: "INVALID_STATEMENT_PROOF" }];
+  t.mock.method(require("./analytics-collection-planner"), "ensureOperationalAnalyticsFreshness", async () => ({ created: false, reason: "fresh" }));
+  t.mock.method(require("./creator-analytics-sync-orchestrator"), "ensureRecurringCreatorAnalyticsCatchups", async () => ({
+    initial: { ready: true }, created: ["notifications"], skipped: ["financial:failed_terminal", "campaigns:already_in_flight"], blocked,
+  }));
+  const result = await service.planRecurringCreatorAnalytics({ db: f.db, item: f.item, now: f.now });
+  assert.equal(result.created, 1);
+  assert.deepEqual(result.blocked, blocked);
+  assert.deepEqual(result.skipReasons, ["financial:failed_terminal", "campaigns:already_in_flight", "earnings:fresh"]);
+  assert.equal(f.trace.at(-1), "commit");
 });

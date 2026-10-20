@@ -53,6 +53,14 @@ test('scheduler diagnostic counts array errors as errors, never NaN/null', () =>
   const details = s._test.maintenanceDegradedDetails(result).notificationConsequences;
   assert.equal(details.errors, 2); assert.match(JSON.stringify(details), /"errors":2/);
 });
+test('maintenance diagnostic names blocked collectors and bounded planning reasons', () => {
+  const details = scheduler()._test.maintenanceDegradedDetails({ creatorRecurringPlanning: {
+    ok: false, reason: 'derived_planning_degraded', blockedCollectors: ['financial', 'unexpected'],
+    planningReasons: { 'financial:failed_terminal': 2, 'contains customer text': 1 },
+  } }).creatorRecurringPlanning;
+  assert.deepEqual(details.blockedCollectors, ['financial']);
+  assert.deepEqual(details.planningReasons, { 'financial:failed_terminal': 2 });
+});
 test('actual pump preserves a thrown error code and still attempts later admitted lanes', async () => {
   const calls = [], s = scheduler({ callbacks: {
     notificationConsequences: async () => { calls.push('repair'); throw Object.assign(new Error('fixture failure detail'), { code: 'NOTIFICATION_HISTORY_CURSOR_INVALID' }); },

@@ -15,6 +15,10 @@ function maintenanceDegradedDetails(result) {
       errors: boundedCount(lane.errors), contended: boundedCount(lane.contended),
       poisonedSignals: boundedCount(lane.poisonedSignals),
       blockedWorkClasses: Array.isArray(lane.blockedWorkClasses) ? lane.blockedWorkClasses.slice(0, 4) : [],
+      blockedCollectors: Array.isArray(lane.blockedCollectors)
+        ? lane.blockedCollectors.filter(stream => ["financial", "notifications", "campaigns", "subscribers"].includes(stream)).slice(0, 4) : [],
+      planningReasons: Object.fromEntries(Object.entries(lane.planningReasons || {}).slice(0, 33)
+        .filter(([reason]) => /^[A-Za-z0-9_.:-]{1,160}$/.test(reason)).map(([reason, count]) => [reason, boundedCount(count)])),
       errorDetails: Array.isArray(lane.errorDetails) ? lane.errorDetails.slice(0, 5) : [],
       poisonedSample: Array.isArray(lane.poisonedSample) ? lane.poisonedSample.slice(0, 5) : [],
       error: lane.error ? String(lane.error).slice(0, 500) : null,

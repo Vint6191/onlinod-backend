@@ -60,3 +60,21 @@ test("one broken or untyped planner substep still exhausts the bounded poison bu
     assert.notEqual(settlement.policy.errorClass, "TRANSIENT_DATABASE");
   }
 });
+
+test("terminal collector is visible without quarantining independent shared planning work", async () => {
+  failures = { analytics: { created: 1, skipped: 2,
+    skipReasons: ["campaigns:failed_terminal", "notifications:already_in_flight"],
+    blocked: [{ stream: "campaigns", reason: "failed_terminal", code: "BAD_SCAN_PROOF" }],
+  } };
+  settlement = null;
+  const run = await scheduler.runRecurringCreatorWork({ db });
+  assert.equal(run.ok, false);
+  assert.deepEqual(run.blockedCollectors, ["campaigns"]);
+  assert.equal(run.totalCreated, 1);
+  assert.equal(run.planningReasons["campaigns:failed_terminal"], 1);
+  assert.equal(run.planningReasons["notifications:already_in_flight"], 1);
+  assert.equal(run.degradedCreators[0].issues[0].code, "BAD_SCAN_PROOF");
+  assert.equal(run.yielded, 1);
+  assert.equal(run.retried, 0);
+  assert.equal(settlement, null, "recorded domain failure must not consume shared planning retry budget");
+});

@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { attachSchedulerFailureCause, inheritSchedulerFailureCauses } = require("./scheduler-failure-cause");
 const { readFanConsumerPage } = require("./fan-consumer-cursor-service");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
@@ -257,7 +258,7 @@ async function applySfsDiscoveryCompletion({ job, result, db = prisma }) {
   const control = await getAutomationControlSnapshot({ agencyId: job.agencyId, creatorId: job.creatorId, db });
   const settings = normalizeSfsSettings(control.modules.sfs.settings);
   const planned = settings.automatic
-    ? await planSfsTargets({ agencyId: job.agencyId, creatorId: job.creatorId, source: "discovery_complete", priority: 70, db }).catch((error) => ({ ok: false, reason: error?.code || error?.message }))
+    ? await planSfsTargets({ agencyId: job.agencyId, creatorId: job.creatorId, source: "discovery_complete", priority: 70, db }).catch((error) => attachSchedulerFailureCause({ ok: false, reason: error?.code || error?.message }, error))
     : { ok: true, created: 0, reason: "automatic_disabled" };
   return { type: "sfs_discovery", discovered: int(payload.discovered), resolved: int(payload.resolved), planned };
 }
@@ -870,12 +871,13 @@ async function setSfsCandidateState({ agencyId, creatorId, candidateId, action, 
 
 function resolveAutomaticSfsResult({ discovery, planning }) {
   const created = Boolean(discovery?.created || planning?.created);
+  const failures = [discovery, planning].filter(decision => !decision || typeof decision.ok !== "boolean" || decision.ok === false);
   if (planning?.fanRefresh?.requested > 0 && planning.fanRefresh.durable !== true) {
-    return { ok: false, created, reason: "fan_refresh_debt_not_durable", discovery, planning };
+    return inheritSchedulerFailureCauses({ ok: false, created, reason: "fan_refresh_debt_not_durable", discovery, planning }, [...failures, planning.fanRefresh]);
   }
   const failed = [discovery, planning].find((decision) => decision?.ok === false);
   if (failed) {
-    return { ok: false, created, reason: failed.reason || "sfs_substep_failed", discovery, planning };
+    return inheritSchedulerFailureCauses({ ok: false, created, reason: failed.reason || "sfs_substep_failed", discovery, planning }, failures);
   }
   return { ok: true, created, discovery, planning };
 }
@@ -884,8 +886,8 @@ async function ensureAutomaticSfs({ agencyId, creatorId, source = "scheduler", d
   const control = await getAutomationControlSnapshot({ agencyId, creatorId, db });
   const settings = normalizeSfsSettings(control.modules.sfs.settings);
   if (!control.effective.sfsEnabled || !settings.automatic) return { ok: true, created: false, reason: "automatic_disabled" };
-  const discovery = await scheduleSfsDiscovery({ agencyId, creatorId, source, db }).catch((error) => ({ ok: false, reason: error?.code || error?.message }));
-  const planning = await planSfsTargets({ agencyId, creatorId, source, limit: settings.dailyLimit, db }).catch((error) => ({ ok: false, reason: error?.code || error?.message }));
+  const discovery = await scheduleSfsDiscovery({ agencyId, creatorId, source, db }).catch((error) => attachSchedulerFailureCause({ ok: false, reason: error?.code || error?.message }, error));
+  const planning = await planSfsTargets({ agencyId, creatorId, source, limit: settings.dailyLimit, db }).catch((error) => attachSchedulerFailureCause({ ok: false, reason: error?.code || error?.message }, error));
   return resolveAutomaticSfsResult({ discovery, planning });
 }
 

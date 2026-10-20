@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const prisma = require("../prisma");
+const { attachSchedulerFailureCause, inheritSchedulerFailureCauses } = require("./scheduler-failure-cause");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
 const { ensurePlannedJob, afterPlanningCommit } = require("./job-planning-repository");
@@ -285,7 +286,7 @@ async function applyLikesDiscoveryCompletion({ job, result, db = prisma }) {
         planning = await planLikes({ agencyId: job.agencyId, creatorId: job.creatorId, source: "discovery_complete", manual: false, db: tx });
       }
     } catch (error) {
-      planning = { ok: false, reason: error?.code || "planning_failed", error: error?.message || String(error) };
+      planning = attachSchedulerFailureCause({ ok: false, reason: error?.code || "planning_failed", error: error?.message || String(error) }, error);
     }
     return { type: "likes_discovery", applied: true, result: object(result), planning };
   });
@@ -520,12 +521,13 @@ async function planLikes(input) {
 
 function resolveAutomaticLikesResult({ discovery, planning }) {
   const created = Boolean(discovery?.created || planning?.created);
+  const failures = [discovery, planning].filter(decision => !decision || typeof decision.ok !== "boolean" || decision.ok === false);
   if (planning?.fanRefresh?.requested > 0 && planning.fanRefresh.durable !== true) {
-    return { ok: false, created, reason: "fan_refresh_debt_not_durable", discovery, planning };
+    return inheritSchedulerFailureCauses({ ok: false, created, reason: "fan_refresh_debt_not_durable", discovery, planning }, [...failures, planning.fanRefresh]);
   }
   const failed = [discovery, planning].find((decision) => decision?.ok === false);
   if (failed) {
-    return { ok: false, created, reason: failed.reason || failed.code || "likes_substep_failed", discovery, planning };
+    return inheritSchedulerFailureCauses({ ok: false, created, reason: failed.reason || failed.code || "likes_substep_failed", discovery, planning }, failures);
   }
   if (!discovery || !planning || typeof discovery.ok !== "boolean" || typeof planning.ok !== "boolean") {
     return { ok: false, created, reason: "likes_substep_malformed", discovery, planning };
@@ -536,16 +538,16 @@ function resolveAutomaticLikesResult({ discovery, planning }) {
 async function ensureAutomaticLikes({ agencyId, creatorId, source = "automatic", db = prisma }) {
   let control;
   try { control = await getAutomationControlSnapshot({ agencyId, creatorId, db }); }
-  catch (error) { return { ok: false, created: false, reason: error?.code || "control_unavailable" }; }
+  catch (error) { return attachSchedulerFailureCause({ ok: false, created: false, reason: error?.code || "control_unavailable" }, error); }
   if (!control.effective.likesEnabled) return { ok: true, created: false, reason: "module_disabled" };
   const settings = normalizeLikesSettings(control.modules.likes.settings);
   if (!settings.automatic) return { ok: true, created: false, reason: "automatic_disabled" };
   const discovery = await scheduleLikesDiscovery({
     agencyId, creatorId, source, force: false, maxFans: settings.discoveryBatchSize * 2, priority: 25, db,
-  }).catch((error) => ({ ok: false, created: false, reason: error?.code || error?.message || "likes_discovery_failed" }));
+  }).catch((error) => attachSchedulerFailureCause({ ok: false, created: false, reason: error?.code || error?.message || "likes_discovery_failed" }, error));
   const planning = await planLikes({
     agencyId, creatorId, source, manual: false, priority: 40, db,
-  }).catch((error) => ({ ok: false, created: false, reason: error?.code || error?.message || "likes_planning_failed" }));
+  }).catch((error) => attachSchedulerFailureCause({ ok: false, created: false, reason: error?.code || error?.message || "likes_planning_failed" }, error));
   return resolveAutomaticLikesResult({ discovery, planning });
 }
 

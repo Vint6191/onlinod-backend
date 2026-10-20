@@ -34,10 +34,15 @@ let analyticsCalls = 0;
 const leaseCalls = [];
 let workProgress = null;
 const recurringPlans = [], yieldedPlans = [];
+const derivedCalls = [];
+let claimClockAdvance = null;
+let derivedFailure = null;
+let analyticsResult = { created: 0, skipped: 0 };
+let admissionError = null;
 
 cacheModule(prismaPath, {});
 cacheModule(require.resolve("./analytics-recurring-planning-service"), {
-  async planRecurringCreatorAnalytics(input) { analyticsCalls += 1; recurringPlans.push(input); return { created: 0, skipped: 0 }; },
+  async planRecurringCreatorAnalytics(input) { analyticsCalls += 1; recurringPlans.push(input); return analyticsResult; },
 });
 cacheModule(plannerPath, {
   async ensureOperationalAnalyticsFreshness() { throw new Error("not expected"); },
@@ -76,12 +81,25 @@ cacheModule(dailyPath, {
     return { ok: true, created: 0 };
   },
 });
+for (const [file, name] of [
+  ["follow-back-service", "ensureAutomaticFollowBack"], ["bump-service", "ensureAutomaticBumps"],
+  ["likes-service", "ensureAutomaticLikes"], ["follow-automation-service", "ensureAutomaticFollowAutomation"],
+  ["sfs-service", "ensureAutomaticSfs"],
+]) cacheModule(require.resolve(`./${file}`), {
+  [name]: async ({ creatorId }) => {
+    derivedCalls.push({ name, creatorId });
+    if (derivedFailure && name === "ensureAutomaticFollowBack") throw derivedFailure;
+    return { ok: true, created: false, reason: "already_planned" };
+  },
+});
 cacheModule(domainWorkPath, {
   WORK_CLASS: { CREATOR_RECURRING_PLANNING: "CREATOR_RECURRING_PLANNING" },
   async claimDomainWorkBatch(input) {
     assert.equal(input.workClass, "CREATOR_RECURRING_PLANNING");
+    claimClockAdvance?.();
     return {
       ownerToken: "planning-owner",
+      ...(admissionError ? { admissionError } : {}),
       authorityNow: new Date("2026-09-08T18:05:00.000Z"),
       items: creators.slice(0, input.limit).map((row, index) => ({ id: `work-${index}`, agencyId: row.agencyId, creatorId: row.id, objectId: row.id, progressCursor: workProgress })),
     };
@@ -90,6 +108,66 @@ cacheModule(domainWorkPath, {
   async ackDomainWorkClaim() { return { acknowledged: true }; },
   async failDomainWorkClaim() { return { failed: true }; },
   async yieldDomainWorkClaim(input) { yieldedPlans.push(input); return { yielded: true }; },
+});
+
+for (const hourlyDue of [false, true]) test(`published Subscriber generation plans derived work despite Analytics bootstrap waiting: hourlyDue=${hourlyDue}`, async () => {
+  workProgress = { lastFullPlanningAt: hourlyDue ? "2026-09-08T16:00:00.000Z" : "2026-09-08T18:04:00.000Z", lastSubscriberDerivedGeneration: 1, retainedField: "keep" };
+  derivedCalls.length = yieldedPlans.length = 0;
+  dailyCalls = 0;
+  try {
+    const db = {
+      creatorAccount: { findFirst: async ({ where }) => creators.find(c => c.id === where.id) },
+      subscriberDirectoryState: { findUnique: async ({ where }) => ({ agencyId: creators.find(c => c.id === where.creatorId).agencyId,
+        currentRunId: "published-run", publishedAt: new Date("2026-09-08T18:05:00Z"), publishedGeneration: 2 }) },
+    };
+    const r = await runRecurringCreatorWork({ db, pageSize: 1 });
+    assert.equal(r.ok, true);
+    assert.equal(derivedCalls.length, 5);
+    assert.equal(dailyCalls, hourlyDue ? 1 : 0);
+    assert.equal(yieldedPlans[0].progressCursor.lastSubscriberDerivedGeneration, 2);
+    assert.equal(yieldedPlans[0].progressCursor.retainedField, "keep");
+    assert.equal(yieldedPlans[0].preserveProgressOnNewerRevision, true);
+    assert.equal(yieldedPlans[0].availableAt.toISOString(), hourlyDue ? "2026-09-08T19:05:00.000Z" : "2026-09-08T19:04:00.000Z");
+
+    workProgress = yieldedPlans[0].progressCursor;
+    derivedCalls.length = 0;
+    const replay = await runRecurringCreatorWork({ db, pageSize: 1 });
+    assert.equal(replay.ok, true);
+    assert.equal(derivedCalls.length, 0, "same committed generation does not bypass hourly cadence twice");
+  } finally { workProgress = null; }
+});
+
+test("a failed derived planner cannot consume the Subscriber generation", async () => {
+  workProgress = { lastFullPlanningAt: "2026-09-08T18:04:00.000Z", lastSubscriberDerivedGeneration: 1 };
+  derivedFailure = Object.assign(new Error("controlled outage"), { code: "P2024" });
+  yieldedPlans.length = derivedCalls.length = 0;
+  const db = { creatorAccount: { findFirst: async () => creators[0] }, subscriberDirectoryState: { findUnique: async () => ({
+    agencyId: creators[0].agencyId, currentRunId: "published", publishedAt: new Date(), publishedGeneration: 2,
+  }) } };
+  try {
+    const failed = await runRecurringCreatorWork({ db, pageSize: 1 });
+    assert.equal(failed.ok, false);
+    assert.equal(failed.retried, 1);
+    assert.equal(yieldedPlans.length, 0);
+    derivedFailure = null;
+    const recovered = await runRecurringCreatorWork({ db, pageSize: 1 });
+    assert.equal(recovered.ok, true);
+    assert.equal(yieldedPlans[0].progressCursor.lastSubscriberDerivedGeneration, 2);
+  } finally { workProgress = null; derivedFailure = null; }
+});
+
+test("admission exhausting a soft slice still attempts one owned creator and releases the rest", async (t) => {
+  let clock = 0;
+  t.mock.method(Date, "now", () => clock);
+  claimClockAdvance = () => { clock += 2000; };
+  yieldedPlans.length = 0;
+  try {
+    const db = { creatorAccount: { findFirst: async ({ where }) => creators.find(c => c.id === where.id) } };
+    const r = await runRecurringCreatorWork({ db, pageSize: 3, maxRuntimeMs: 1000 });
+    assert.equal(r.creatorsScanned, 1);
+    assert.equal(r.yieldedForBudget, 2);
+    assert.equal(yieldedPlans.length, 3);
+  } finally { claimClockAdvance = null; }
 });
 
 delete require.cache[schedulerPath];
@@ -145,4 +223,38 @@ test('event wake checks analytics debt and returns healthy creators to the hourl
       assert.equal(p.progressCursor.lastFullPlanningAt, workProgress.lastFullPlanningAt);
     }
   } finally { workProgress = null; }
+});
+
+test('known collector retry is scheduled at its backoff deadline without repeating hourly automation', async () => {
+  workProgress = { lastFullPlanningAt: '2026-09-08T18:04:00.000Z' };
+  analyticsResult = { created: 0, skipped: 1, nextRetryAt: new Date('2026-09-08T18:07:00.000Z'), pendingRecoveryCount: 2 };
+  yieldedPlans.length = derivedCalls.length = 0;
+  dailyCalls = 0;
+  try {
+    const db = { creatorAccount: { findFirst: async () => creators[0] } };
+    const r = await runRecurringCreatorWork({ db, pageSize: 1 });
+    assert.equal(r.ok, true);
+    assert.equal(yieldedPlans[0].availableAt.toISOString(), '2026-09-08T18:07:00.000Z');
+    assert.equal(yieldedPlans[0].progressCursor.lastFullPlanningAt, workProgress.lastFullPlanningAt);
+    assert.equal(derivedCalls.length, 0);
+    assert.equal(dailyCalls, 0);
+    analyticsResult = { created: 0, skipped: 1, pendingRecoveryCount: 2 };
+    yieldedPlans.length = 0;
+    await runRecurringCreatorWork({ db, pageSize: 1 });
+    assert.equal(yieldedPlans[0].availableAt.toISOString(), '2026-09-08T19:04:00.000Z', 'in-flight debt alone must not cause minute polling');
+  } finally { workProgress = null; analyticsResult = { created: 0, skipped: 0 }; }
+});
+
+test('partial admission reports its database failure while executing every returned owner', async () => {
+  admissionError = { code: 'P2024' };
+  yieldedPlans.length = 0;
+  try {
+    const db = { creatorAccount: { findFirst: async ({ where }) => creators.find(c => c.id === where.id) } };
+    const r = await runRecurringCreatorWork({ db, pageSize: 2 });
+    assert.equal(r.ok, false);
+    assert.equal(r.creatorsScanned, 2);
+    assert.equal(r.yielded, 2);
+    assert.equal(r.retried, 0);
+    assert.equal(r.planningReasons['admission:P2024'], 1);
+  } finally { admissionError = null; }
 });

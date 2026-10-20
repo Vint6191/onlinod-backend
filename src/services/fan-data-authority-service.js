@@ -1,4 +1,5 @@
 "use strict";
+const { attachSchedulerFailureCause, inheritSchedulerFailureCauses } = require("./scheduler-failure-cause");
 
 const { exactFanId, boundedFanIds } = require("./fan-data-input");
 const { runDbTransaction } = require("./db-transaction-service");
@@ -1583,7 +1584,7 @@ async function scheduleDurableFanDataRefreshDebt({
 } = {}) {
   let ids;
   try { ids = boundedFanIds(fanIds, "FAN_DATA_POINT_REFRESH_TOO_LARGE").sort(); }
-  catch (error) { return { fanIds: [], requested: Array.isArray(fanIds) ? fanIds.length : 0, durable: false, decision: null, error: error.code }; }
+  catch (error) { return attachSchedulerFailureCause({ fanIds: [], requested: Array.isArray(fanIds) ? fanIds.length : 0, durable: false, decision: null, error: error.code }, error); }
   if (!ids.length) return { fanIds: [], requested: 0, durable: true, decision: null };
   if (!Array.isArray(refreshFields) || refreshFields.length > 32) return { fanIds: ids, requested: ids.length, durable: false, decision: null, error: "FAN_DATA_FIELDS_TOO_LARGE" };
   const fields = [...new Set((refreshFields || []).map((value) => text(value, 120)).filter(Boolean))].sort();
@@ -1602,21 +1603,21 @@ async function scheduleDurableFanDataRefreshDebt({
       },
     });
     const durable = fanDataPointRefreshDecisionDurable(decision);
-    return {
+    return inheritSchedulerFailureCauses({
       fanIds: ids,
       requested: ids.length,
       durable,
       decision,
       ...(durable ? {} : { error: `fan_refresh_not_durable:${String(decision?.reason || "unknown")}` }),
-    };
+    }, durable ? [] : [decision]);
   } catch (error) {
-    return {
+    return attachSchedulerFailureCause({
       fanIds: ids,
       requested: ids.length,
       durable: false,
       decision: null,
       error: text(error?.code || error?.message || "fan_refresh_schedule_failed", 240),
-    };
+    }, error);
   }
 }
 

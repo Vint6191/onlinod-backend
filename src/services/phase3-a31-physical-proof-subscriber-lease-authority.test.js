@@ -27,16 +27,17 @@ test("A31 Subscriber durable mutation lock order fences repair/publication befor
   assert.match(signals, /"claimUntil" > \(clock_timestamp\(\) AT TIME ZONE 'UTC'\)[\s\S]*FOR UPDATE/);
 });
 
-test("A31 recovered automation planning remains durable debt and Bumps cannot escape the fenced transaction", () => {
+test("A31 source completion owns a durable derived wake without executing delivery planners", () => {
   const subscriber = source("src/services/subscriber-directory-service.js");
-  const bumps = source("src/services/bump-service.js");
-  assert.match(subscriber, /subscriberDerivedPlanningConverged/);
-  assert.match(subscriber, /reason: "planning_failed", durableRetryRequired: true/);
-  assert.match(subscriber, /fencedMaintenance[\s\S]*scheduleFanRefresh: fencedRefreshScheduler/);
-  assert.match(bumps, /scheduleFanRefresh = \(args\) => scheduleFanDataPointRefresh\(\{ \.\.\.args, db \}\)/);
-  assert.match(bumps, /planBumps\([\s\S]*scheduleFanRefresh/);
-  assert.match(subscriber, /DERIVED_AUTOMATION_PLANNING_FAILED/);
-  assert.match(subscriber, /publicationJobReconciledAt:\s*null/);
+  const maintenance = source("src/services/subscriber-directory-maintenance-service.js");
+  assert.match(subscriber, /summary\.derivedPlanningWake = await publishSubscriberDerivedPlanningWake/);
+  assert.match(subscriber, /kind: SUBSCRIBER_MAINTENANCE_KIND\.DERIVED_PLANNING/);
+  assert.doesNotMatch(subscriber, /ensureAutomaticFollowBack|ensureAutomaticFollowAutomation|ensureAutomaticBumps/);
+  const promotion = maintenance.slice(maintenance.indexOf("async function dispatchSubscriberDerivedPlanning"), maintenance.indexOf("async function runSubscriberDirectoryMaintenance"));
+  assert.ok(promotion.indexOf("publishDomainWork") < promotion.indexOf("lockSubscriberMaintenanceClaimRow"));
+  assert.match(promotion, /ackSubscriberDirectoryMaintenanceSignal/);
+  assert.match(promotion, /SUBSCRIBER_MAINTENANCE_CLAIM_STALE/);
+  assert.doesNotMatch(promotion, /lockSubscriberPublicationCreator|lockAutomationWriteCommitFence/);
 });
 
 test("A31 generation repair and completion work are bounded instead of O(all history) / 100000 phase loops", () => {
@@ -87,3 +88,12 @@ test("A31 maintenance failures/poison debt are visible and recoverable without R
 
 
 
+
+
+test("collector completion paths use the outbox while holding source commit locks", () => {
+  for (const file of ["subscriber-directory-service.js", "job-lease-service.js", "analytics-collector-control-service.js", "notification-sync-state-service.js"]) {
+    const calls = [...source("src/services/" + file).matchAll(/\.completeRecovery\(([^;]+)\);/g)];
+    assert.ok(calls.length, file);
+    for (const call of calls) assert.match(call[1], /deferPlanningWake\s*:\s*true/, file + " must not lock DWI under a collector/publication commit");
+  }
+});

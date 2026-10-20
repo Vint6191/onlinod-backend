@@ -8,12 +8,13 @@ const path = require("node:path");
 const ROOT = path.resolve(__dirname, "../..");
 const source = (relative) => fs.readFileSync(path.join(ROOT, relative), "utf8");
 
-test("A32 Subscriber fenced derived planning persists real FanData refresh jobs inside the caller transaction", () => {
+test("A32 Subscriber derived work uses the durable outbox and existing FanData scheduling authority", () => {
   const subscriber = source("src/services/subscriber-directory-service.js");
   const fanData = source("src/services/fan-data-authority-service.js");
   const scheduler = source("src/services/job-scheduler.js");
   assert.doesNotMatch(subscriber, /subscriber_maintenance_fenced_deferred/);
-  assert.match(subscriber, /refreshScheduler = typeof scheduleFanRefresh[\s\S]*fencedRefreshScheduler[\s\S]*refreshScheduler\(\{[\s\S]*db,[\s\S]*causalBarrierKey/);
+  assert.match(subscriber, /ensureSubscriberDerivedPlanningWake/);
+  assert.match(subscriber, /SUBSCRIBER_MAINTENANCE_KIND\.DERIVED_PLANNING/);
   assert.match(fanData, /scheduleFanDataPointRefresh\(\{ db = null/);
   assert.match(fanData, /ensureSingleJob\(\{[\s\S]*\.\.\.\(db \? \{ db \} : \{\}\)[\s\S]*jobKey: FAN_DATA_POINT_REFRESH_JOB_KEY/);
   assert.match(scheduler, /ensureSingleJob\(\{ db = prisma/);
@@ -60,15 +61,13 @@ test("A32 fixture leak authority is schema-derived across tenant roots/FK descen
 });
 
 
-test("A32 transient scheduler proof seam reaches real recovery without changing production defaults", () => {
-  const subscriber = source("src/services/subscriber-directory-service.js");
-  const maintenance = source("src/services/subscriber-directory-maintenance-service.js");
-  assert.match(subscriber, /planSubscriberDerivedAutomation\(\{[\s\S]*scheduleFanRefresh = null/);
-  assert.match(subscriber, /refreshScheduler = typeof scheduleFanRefresh === "function" \? scheduleFanRefresh : scheduleFanDataPointRefresh/);
-  assert.match(subscriber, /recoverSubscriberPublicationDebt\(\{[\s\S]*scheduleFanRefresh = null/);
-  assert.match(subscriber, /fencedMaintenance: true,[\s\S]*scheduleFanRefresh,/);
-  assert.match(maintenance, /runSubscriberDirectoryMaintenance\(\{[\s\S]*scheduleFanRefresh = null/);
-  assert.match(maintenance, /maintenanceSignal: signal,[\s\S]*scheduleFanRefresh,/);
+test("A32 real SQL proof exercises restart, enabled automation and stale outbox rollback", () => {
+  const proof = source("scripts/audit/current-subscriber-recovery-liveness-proof.cjs");
+  assert.match(proof, /createScaleSqlRuntime/);
+  assert.match(proof, /runRecurringCreatorWork/);
+  assert.match(proof, /SUBSCRIBER_MAINTENANCE_CLAIM_STALE/);
+  assert.match(proof, /lastSubscriberDerivedGeneration/);
+  assert.match(proof, /deliveries > 0/);
 });
 
 test("A32 physical expectations follow canonical work status and prove index path eligibility without requiring a specific cost-planner winner", () => {
@@ -88,7 +87,7 @@ test("A32 INT2 Subscriber recovery uses one NULL/expired/future lease authority 
   assert.match(subscriber, /casWhere: status === "CLAIMED"[\s\S]*leaseUntil: null[\s\S]*leaseUntil: \{ lte: now \}/);
   assert.match(subscriber, /const leaseAuthority = subscriberPublicationJobLeaseAuthority\(currentJob, now\)/);
   assert.match(subscriber, /\.\.\.leaseAuthority\.casWhere/);
-  assert.match(subscriber, /return !subscriberPublicationJobLeaseAuthority\(job, now\)\.active/);
+  assert.match(subscriber, /if \(leaseAuthority\.active\)/);
 });
 
 test("A32 INT2 FanData refresh identity owns consumer and required field set instead of first-consumer-wins coalescing", () => {

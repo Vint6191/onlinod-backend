@@ -48,6 +48,7 @@ test('one offline intent schedules one version-bound job per stream and repeats 
 for(const stream of ['notifications','financial','campaigns'])for(const failure of ['deferred','terminal'])test(`${stream} ${failure} debt stays quarantined`,async()=>{
  intents[stream]=debt(stream);const state={notifications:notes,financial:financialState,campaigns:campaignState}[stream];state.status='FAILED';state.retryAfterAt=failure==='deferred'?new Date(+now+60000):null;
  const result=await api.ensureRecurringCreatorAnalyticsCatchups(input(db()));assert.equal(planned.length,0);assert(result.skipped.includes(stream+':'+(failure==='deferred'?'deferred':'failed_terminal')));
+ assert.deepEqual(result.blocked,failure==='terminal'?[{stream,reason:'failed_terminal',code:'COLLECTOR_REPAIR_REQUIRED'}]:[]);
 });
 test('initial history remains notifications, financial ledger, campaigns in order',async()=>{
  const d=db();notes=null;financialState=null;campaignState=null;ledger=false;

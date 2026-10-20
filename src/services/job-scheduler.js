@@ -124,7 +124,7 @@ const SCHEDULER_OUTCOME = Object.freeze({
 // Keep exception identity inside this process without changing the serialized
 // planning result returned to routes/health. Text-only degraded results cannot
 // authorize an unbounded retry of the recurring SQL planner.
-const SCHEDULER_FAILURE_CAUSE = Symbol("schedulerFailureCause");
+const { SCHEDULER_FAILURE_CAUSE, readSchedulerFailureCause } = require("./scheduler-failure-cause");
 const WAITING_REASON_PATTERN = /(?:waiting|not_ready|pending|deferred|already_in_flight|recently_done|idempotency_race|daily_limit|cooldown|lease_contended|legacy_executor_drain)/i;
 let recurringSchedulerHealth = {
   status: "STARTING",
@@ -296,6 +296,7 @@ async function executeSchedulerConsumer({ work, execute, created, skipped, degra
   let failureCause = null;
   try {
     decision = await execute();
+    failureCause = readSchedulerFailureCause(decision);
   } catch (error) {
     failureCause = error;
     decision = {
@@ -332,6 +333,51 @@ function schedulerPlanningResult(created, skipped, degraded, outcomes = []) {
   };
 }
 
+const SUBSCRIBER_DERIVED_PLANNERS = ["follow_back_plan", "bumps_plan", "likes_plan", "follow_automation_plan", "sfs_plan"];
+
+async function scheduleDerivedAutomationForCreator({ db, agencyId, creatorId, subscriberSnapshot = null }) {
+  const created = [], skipped = [], degraded = [], outcomes = [];
+  const generation = Number(subscriberSnapshot?.publishedGeneration || 0);
+  const runId = subscriberSnapshot?.currentRunId;
+  const refresh = runId && generation > 0 ? {
+    scheduleFanRefresh: input => require("./fan-data-authority-service").scheduleFanDataPointRefresh({
+      ...input, db, agencyId, creatorId,
+      params: { ...(input?.params || {}),
+        causalBarrierKey: input?.params?.causalBarrierKey || `subscriber-derived:${runId}:${generation}`,
+        subscriberRunId: runId, subscriberPublicationGeneration: generation },
+    }),
+  } : {};
+  // Follow Back candidate planning is backend orchestration over the already
+  // published Subscriber Directory projection. It never starts another OF scan.
+  await executeSchedulerConsumer({
+    work: "follow_back_plan", created, skipped, degraded, outcomes,
+    execute: () => ensureAutomaticFollowBack({ agencyId, creatorId, source: "recurring_scheduler", db, ...refresh }),
+  });
+
+  await executeSchedulerConsumer({
+    work: "bumps_plan", created, skipped, degraded, outcomes,
+    createdLabel: (decision) => `bumps_plan:${Number(decision?.planned || 0)}`,
+    execute: () => ensureAutomaticBumps({ agencyId, creatorId, source: "recurring_scheduler", db, ...refresh }),
+  });
+
+  await executeSchedulerConsumer({
+    work: "likes_plan", created, skipped, degraded, outcomes,
+    execute: () => ensureAutomaticLikes({ agencyId, creatorId, source: "recurring_scheduler", db }),
+  });
+
+  await executeSchedulerConsumer({
+    work: "follow_automation_plan", created, skipped, degraded, outcomes,
+    execute: () => ensureAutomaticFollowAutomation({ agencyId, creatorId, source: "recurring_scheduler", db, ...refresh }),
+  });
+
+  await executeSchedulerConsumer({
+    work: "sfs_plan", created, skipped, degraded, outcomes,
+    execute: () => ensureAutomaticSfs({ agencyId, creatorId, source: "recurring_scheduler", db }),
+  });
+
+  return schedulerPlanningResult(created, skipped, degraded, outcomes);
+}
+
 async function scheduleInitialJobsForCreator({
   db = prisma,
   creatorId,
@@ -341,6 +387,7 @@ async function scheduleInitialJobsForCreator({
   includeAnalyticsCatchups = false,
   includeEarningsFreshness = true,
   includeCreatorAnalytics = true,
+  subscriberSnapshot = null,
 }) {
   if (!creatorId || !agencyId) {
     return schedulerPlanningResult([], [], [{ work: "creator_scope", reason: "missing_scope", created: false, failures: [{ path: "input", reason: "missing_scope" }] }], []);
@@ -449,33 +496,11 @@ async function scheduleInitialJobsForCreator({
     }),
   });
 
-  // Follow Back candidate planning is backend orchestration over the already
-  // published Subscriber Directory projection. It never starts another OF scan.
-  await executeSchedulerConsumer({
-    work: "follow_back_plan", created, skipped, degraded, outcomes,
-    execute: () => ensureAutomaticFollowBack({ agencyId, creatorId, source: "recurring_scheduler", db }),
-  });
-
-  await executeSchedulerConsumer({
-    work: "bumps_plan", created, skipped, degraded, outcomes,
-    createdLabel: (decision) => `bumps_plan:${Number(decision?.planned || 0)}`,
-    execute: () => ensureAutomaticBumps({ agencyId, creatorId, source: "recurring_scheduler", db }),
-  });
-
-  await executeSchedulerConsumer({
-    work: "likes_plan", created, skipped, degraded, outcomes,
-    execute: () => ensureAutomaticLikes({ agencyId, creatorId, source: "recurring_scheduler", db }),
-  });
-
-  await executeSchedulerConsumer({
-    work: "follow_automation_plan", created, skipped, degraded, outcomes,
-    execute: () => ensureAutomaticFollowAutomation({ agencyId, creatorId, source: "recurring_scheduler", db }),
-  });
-
-  await executeSchedulerConsumer({
-    work: "sfs_plan", created, skipped, degraded, outcomes,
-    execute: () => ensureAutomaticSfs({ agencyId, creatorId, source: "recurring_scheduler", db }),
-  });
+  const derived = await scheduleDerivedAutomationForCreator({ db, agencyId, creatorId, subscriberSnapshot });
+  created.push(...derived.created);
+  skipped.push(...derived.skipped);
+  degraded.push(...derived.degraded);
+  outcomes.push(...derived.outcomes);
 
   return schedulerPlanningResult(created, skipped, degraded, outcomes);
 }
@@ -1906,9 +1931,24 @@ async function runRecurringCreatorWork({
   let creatorsScanned = 0;
   let totalCreated = 0;
   let totalSkipped = 0;
-  let totalDegraded = 0;
+  let totalDegraded = claim.admissionError ? 1 : 0;
   const degradedCreators = [];
   const processedCreatorIds = [];
+  const planningReasons = Object.create(null);
+  const blockedCollectors = new Set();
+  function recordPlanningReasons(reasons) {
+    for (const reason of Array.isArray(reasons) ? reasons.slice(0, 16) : []) {
+      const text = String(reason || "");
+      const safe = /^[A-Za-z0-9_.:-]{1,160}$/.test(text) ? text : "unclassified";
+      const key = Object.hasOwn(planningReasons, safe) || Object.keys(planningReasons).length < 32 ? safe : "other";
+      planningReasons[key] = (planningReasons[key] || 0) + 1;
+    }
+  }
+  if (claim.admissionError) {
+    const code = String(claim.admissionError.code || "DATABASE_TEMPORARILY_UNAVAILABLE").slice(0, 120);
+    recordPlanningReasons([`admission:${code}`]);
+    degradedCreators.push({ creatorId: null, issues: [{ work: "recurring_planning_admission", reason: "partial_admission", code }] });
+  }
   let dailyCyclesStarted = 0;
   let dailyCyclesSkipped = 0;
   let retired = 0;
@@ -1918,7 +1958,9 @@ async function runRecurringCreatorWork({
   let lostOwnership = 0;
 
   for (let index = 0; index < items.length; index += 1) {
-    if (Date.now() - startedAt >= runtimeBudget) {
+    // Admission can consume the soft slice. Attempt the first owned unit so
+    // latency alone cannot make every claimed batch yield without progress.
+    if (index > 0 && Date.now() - startedAt >= runtimeBudget) {
       const remaining = items.slice(index);
       const releases = await Promise.all(remaining.map((item) => yieldDomainWorkClaim({
         db,
@@ -1975,11 +2017,33 @@ async function runRecurringCreatorWork({
 
     const creatorIssues = [];
     const creatorFailures = [];
+    const recordedBlockers = [];
     const baseNow = heartbeat.authorityNow || claim.authorityNow || now;
     const lastFullPlanningAt = new Date(item.progressCursor?.lastFullPlanningAt || 0);
     const fullPlanningDue = !Number.isFinite(lastFullPlanningAt.getTime())
       || lastFullPlanningAt > new Date(baseNow)
       || new Date(baseNow).getTime() - lastFullPlanningAt.getTime() >= RECURRING_INTERVAL_MS;
+    const lastSubscriberDerivedGeneration = Math.max(0, Number(item.progressCursor?.lastSubscriberDerivedGeneration) || 0);
+    let subscriberGeneration = lastSubscriberDerivedGeneration;
+    let subscriberSnapshot = null;
+    try {
+      // Publication only seeds durable planning work. Its newly committed
+      // generation must bypass the hourly gate without coupling snapshot
+      // completion to creation of every derived automation delivery.
+      if (typeof db.subscriberDirectoryState?.findUnique === "function") {
+        const snapshot = await db.subscriberDirectoryState.findUnique({ where: { creatorId: creator.id },
+          select: { agencyId: true, currentRunId: true, publishedAt: true, publishedGeneration: true } });
+        if (snapshot?.agencyId === creator.agencyId && snapshot.currentRunId && snapshot.publishedAt) {
+          subscriberSnapshot = snapshot;
+          subscriberGeneration = Math.max(subscriberGeneration, Number(snapshot.publishedGeneration) || 0);
+        }
+      }
+    } catch (error) {
+      creatorFailures.push(error);
+      creatorIssues.push({ work: "subscriber_derived_generation", reason: error?.code || "subscriber_state_read_failed" });
+    }
+    const subscriberPlanningDue = subscriberGeneration > lastSubscriberDerivedGeneration;
+    let collectorRetryAt = null;
     try {
       const { planRecurringCreatorAnalytics } = require("./analytics-recurring-planning-service");
       // Capture-loss/reconnect events wake this exact creator immediately.
@@ -1988,13 +2052,23 @@ async function runRecurringCreatorWork({
       const analytics = await planRecurringCreatorAnalytics({ db, item, ownerToken: claim.ownerToken, now, includeCatchups: true });
       totalCreated += Number(analytics.created || 0);
       totalSkipped += Number(analytics.skipped || 0);
+      recordPlanningReasons(analytics.skipReasons);
+      if (analytics.nextRetryAt) {
+        const retry = new Date(analytics.nextRetryAt);
+        if (Number.isFinite(retry.getTime())) collectorRetryAt = new Date(Math.max(new Date(baseNow).getTime() + 1000, retry.getTime()));
+      }
+      for (const blocked of Array.isArray(analytics.blocked) ? analytics.blocked.slice(0, 4) : []) {
+        if (!["financial", "notifications", "campaigns", "subscribers"].includes(blocked.stream)) continue;
+        blockedCollectors.add(blocked.stream);
+        recordedBlockers.push({ work: `collector_${blocked.stream}`, reason: "failed_terminal", code: String(blocked.code || "COLLECTOR_REPAIR_REQUIRED").slice(0, 120) });
+      }
     } catch (error) {
       creatorFailures.push(error);
       creatorIssues.push({ work: "analytics_planning", reason: error?.code || "analytics_planning_failed", error: String(error?.message || error).slice(0, 500) });
     }
     let planning;
-    if (fullPlanningDue) try {
-      planning = await scheduleInitialJobsForCreator({
+    if (fullPlanningDue || subscriberPlanningDue) try {
+      planning = fullPlanningDue ? await scheduleInitialJobsForCreator({
         db,
         creatorId: creator.id,
         agencyId: creator.agencyId,
@@ -2003,9 +2077,22 @@ async function runRecurringCreatorWork({
         includeAnalyticsCatchups: false,
         includeEarningsFreshness: false,
         includeCreatorAnalytics: false,
-      });
+        subscriberSnapshot,
+      }) : null;
+      // A published snapshot already contains canonical input. Planning its
+      // derived work does not need Analytics bootstrap or another provider scan.
+      if (subscriberPlanningDue && !planning?.outcomes?.some(outcome => SUBSCRIBER_DERIVED_PLANNERS.includes(outcome.work))) {
+        const derived = await scheduleDerivedAutomationForCreator({ db, agencyId: creator.agencyId, creatorId: creator.id, subscriberSnapshot });
+        planning = schedulerPlanningResult(
+          [...(planning?.created || []), ...derived.created],
+          [...(planning?.skipped || []), ...derived.skipped],
+          [...(planning?.degraded || []), ...derived.degraded],
+          [...(planning?.outcomes || []), ...derived.outcomes],
+        );
+      }
       totalCreated += Number(planning?.created?.length || 0);
       totalSkipped += Number(planning?.skipped?.length || 0);
+      recordPlanningReasons(planning?.skipped);
       if (!planning || planning.ok === false || !Array.isArray(planning.degraded)) {
         const issues = Array.isArray(planning?.degraded) && planning.degraded.length
           ? planning.degraded
@@ -2038,6 +2125,13 @@ async function runRecurringCreatorWork({
 
     creatorsScanned += 1;
     processedCreatorIds.push(creator.id);
+    if (recordedBlockers.length) {
+      // An independently recorded collector failure must remain visible while
+      // other streams and automation continue. Do not quarantine their shared
+      // planning work item merely to report a domain-level blocker.
+      totalDegraded += recordedBlockers.length;
+      degradedCreators.push({ creatorId: creator.id, issues: recordedBlockers });
+    }
     if (creatorIssues.length) {
       totalDegraded += creatorIssues.length;
       degradedCreators.push({ creatorId: creator.id, issues: creatorIssues });
@@ -2056,15 +2150,22 @@ async function runRecurringCreatorWork({
       continue;
     }
 
-    const nextRunAt = new Date((fullPlanningDue ? new Date(baseNow) : lastFullPlanningAt).getTime() + RECURRING_INTERVAL_MS);
+    const derivedAttemptCompleted = planning?.ok === true
+      && SUBSCRIBER_DERIVED_PLANNERS.every(work => planning.outcomes?.some(outcome => outcome.work === work && outcome.ok));
+    const derivedGeneration = derivedAttemptCompleted ? subscriberGeneration : lastSubscriberDerivedGeneration;
+    const hourlyRunAt = new Date((fullPlanningDue ? new Date(baseNow) : lastFullPlanningAt).getTime() + RECURRING_INTERVAL_MS);
+    const nextRunAt = new Date(Math.min(hourlyRunAt.getTime(),
+      collectorRetryAt ? collectorRetryAt.getTime() : Infinity,
+      subscriberPlanningDue && !derivedAttemptCompleted ? new Date(baseNow).getTime() + 60_000 : Infinity));
     const released = await yieldDomainWorkClaim({
       db,
       item,
       ownerToken: claim.ownerToken,
       availableAt: nextRunAt,
       preserveProgressOnNewerRevision: true,
-      progressCursor: { lastPlanningCycleAt: new Date(baseNow).toISOString(), nextPlanningCycleAt: nextRunAt.toISOString(),
-        lastFullPlanningAt: (fullPlanningDue ? new Date(baseNow) : lastFullPlanningAt).toISOString() },
+      progressCursor: { ...(item.progressCursor || {}), lastPlanningCycleAt: new Date(baseNow).toISOString(), nextPlanningCycleAt: nextRunAt.toISOString(),
+        lastFullPlanningAt: (fullPlanningDue ? new Date(baseNow) : lastFullPlanningAt).toISOString(),
+        lastSubscriberDerivedGeneration: derivedGeneration },
       fallbackNow: now,
     }).catch(() => ({ yielded: false, lost: true }));
     if (released?.yielded) yielded += 1;
@@ -2081,6 +2182,8 @@ async function runRecurringCreatorWork({
     totalCreated,
     totalSkipped,
     totalDegraded,
+    planningReasons,
+    blockedCollectors: [...blockedCollectors],
     degradedCreators,
     processedCreatorIds,
     dailyCyclesStarted,
@@ -2164,6 +2267,8 @@ async function runRecurringSweepInternal() {
     totalSkipped,
     totalDegraded,
     degradedCreators,
+    planningReasons = {},
+    blockedCollectors = [],
     dailyCyclesStarted,
     dailyCyclesSkipped,
   } = recurringCreatorWork;
@@ -2204,7 +2309,7 @@ async function runRecurringSweepInternal() {
 
   const elapsed = Date.now() - startedAt;
   console.log(
-    `[scheduler] sweep done in ${elapsed}ms — creators=${creatorsScanned}, pages=${creatorPages}, jobs created=${totalCreated}, skipped=${totalSkipped}, degraded=${totalDegraded}, daily started=${dailyCyclesStarted}, daily skipped=${dailyCyclesSkipped}`
+    `[scheduler] sweep done in ${elapsed}ms — creators=${creatorsScanned}, pages=${creatorPages}, jobs created=${totalCreated}, skipped=${totalSkipped}, degraded=${totalDegraded}, daily started=${dailyCyclesStarted}, daily skipped=${dailyCyclesSkipped}; skip reasons=${JSON.stringify(planningReasons)}; blocked collectors=${JSON.stringify(blockedCollectors)}`
   );
 
   const components = { recurringCreatorWork, capacityProjection, retention, billingRenewals, billingExpiry };

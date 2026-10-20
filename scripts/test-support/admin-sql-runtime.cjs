@@ -3,14 +3,13 @@
 const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
 const { createRequire } = require("node:module");
 const { PrismaClient } = require("@prisma/client");
-async function createAdminSqlRuntime({ runtimePath, maxConnections = 1 } = {}) {
+async function createAdminSqlRuntime({ runtimePath, maxConnections = 1, beforeMigration = null } = {}) {
   if (!runtimePath) throw Error("An explicit local proof runtime is required");
   const root = path.resolve(__dirname, "../..");
   const load = createRequire(path.resolve(runtimePath, "package.json"));
   const { PGlite } = load("@electric-sql/pglite");
   const { createPgliteSocketServer } = require("./pglite-socket-runtime.cjs");
-  const contract = require("../../src/services/database-contract.json");
-  const { migrations } = require("../../src/services/database-migration-chain");
+  const migrations = require("./proof-migration-chain.cjs").selectProofMigrations(beforeMigration);
   const sources = migrations.map(item => {
     const sql = fs.readFileSync(path.join(root, "prisma/migrations", item.migration, "migration.sql"));
     if (crypto.createHash("sha256").update(sql).digest("hex") !== item.checksum) throw Error("BASELINE_SOURCE_CHECKSUM_MISMATCH");

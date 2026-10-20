@@ -50,6 +50,11 @@ async function selectPhase2MaintenanceLanes({ db, laneNames, lanesPerTick = MAX_
   // canonical work/leases remain with each lane and the class is admitted again.
   // Require its own root: joining a caller transaction could retain these class
   // locks during business execution and report offers before their commit.
+  // This bounded unit includes configuration, the <=65-row catalog check and
+  // one <=5-row claim. Its root budget must cover all transport round trips:
+  // three seconds could expire before the second query on a healthy but slow
+  // connection and prevent every maintenance lane from running. Short SQL
+  // lock/statement limits stay separate from the transaction's headroom.
   return runRootCommit(db, async ({ tx }) => {
     const catalog = await tx.$queryRawUnsafe(`SELECT "laneName","ordinal"
       FROM "MaintenanceAdmissionClassState" WHERE "generation"=$1
@@ -85,7 +90,7 @@ async function selectPhase2MaintenanceLanes({ db, laneNames, lanesPerTick = MAX_
       skipped: rows.length === 0,
       reason: rows.length === 0 ? "maintenance_admission_contended" : null,
     };
-  }, { maxWait: 1500, timeout: 3000, deadlineMs: 5000, lockTimeoutMs: 1000, statementTimeoutMs: 2000, maxAttempts: 2 });
+  }, { maxWait: 1500, timeout: 15000, deadlineMs: 20000, lockTimeoutMs: 1000, statementTimeoutMs: 2000, maxAttempts: 2 });
 }
 
 module.exports = { selectPhase2MaintenanceLanes, readMaintenanceAdmissionProgress, validateMaintenanceLaneNames, MAINTENANCE_ADMISSION_GENERATION, MAINTENANCE_LANE_NAMES, MAX_MAINTENANCE_LANES_PER_TICK };

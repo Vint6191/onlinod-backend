@@ -1,9 +1,10 @@
 "use strict";
 const fs=require("node:fs"),os=require("node:os"),path=require("node:path"),crypto=require("node:crypto");
 const {execFileSync}=require("node:child_process"),{PrismaClient}=require("@prisma/client");
-async function createScaleSqlRuntime() {
+async function createScaleSqlRuntime({ beforeMigration = null } = {}) {
+ const migrations=require("./proof-migration-chain.cjs").selectProofMigrations(beforeMigration);
  const explicit=process.env.ONLINOD_NATIVE_TEST_DATABASE_URL;
- if(!explicit) return {...await require("./admin-sql-runtime.cjs").createAdminSqlRuntime({runtimePath:process.env.ONLINOD_SQL_PROOF_RUNTIME}),native:false};
+ if(!explicit) return {...await require("./admin-sql-runtime.cjs").createAdminSqlRuntime({runtimePath:process.env.ONLINOD_SQL_PROOF_RUNTIME,beforeMigration}),native:false};
  const url=new URL(explicit),name=decodeURIComponent(url.pathname.slice(1));
  // This helper installs a schema. It deliberately cannot target an application's
  // DATABASE_URL, an arbitrary remote host, or an existing populated database.
@@ -16,7 +17,6 @@ async function createScaleSqlRuntime() {
  const env={...process.env,PGHOST:url.hostname,PGPORT:url.port||"5432",PGUSER:decodeURIComponent(url.username),PGPASSWORD:decodeURIComponent(url.password),PGDATABASE:name,PGSSLMODE:"disable"};
  const run=file=>execFileSync("psql",["--no-psqlrc","--set","ON_ERROR_STOP=1","--file",file],{env,stdio:["ignore","pipe","pipe"]});
  try {
-  const migrations=require(root+"/src/services/database-migration-chain").migrations;
   for(const item of migrations) {
    const file=path.join(root,"prisma/migrations",item.migration,"migration.sql");
    if(crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex")!==item.checksum)throw Error("BASELINE_SOURCE_CHECKSUM_MISMATCH");
@@ -28,7 +28,7 @@ async function createScaleSqlRuntime() {
    started_at timestamptz NOT NULL DEFAULT now(),applied_steps_count integer NOT NULL DEFAULT 0);`);
   run(file);
   for(const item of migrations)await db.$executeRawUnsafe('INSERT INTO "_prisma_migrations"(id,checksum,migration_name,finished_at,applied_steps_count) VALUES($1,$2,$3,now(),1)',crypto.randomUUID(),item.checksum,item.migration);
-  return {db,queries,native:true,close:()=>db.$disconnect()};
+  return {db,url:explicit,queries,native:true,migrations:migrations.map(item=>item.migration),close:()=>db.$disconnect()};
  }catch(error){await db.$disconnect();throw error;}finally{fs.rmSync(dir,{recursive:true,force:true});}
 }
 module.exports={createScaleSqlRuntime};

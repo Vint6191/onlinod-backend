@@ -272,7 +272,7 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
     const state = await tx.creatorFinancialCollectionState.upsert({
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData }, update: { ...common, ...successData },
     });
-    await require("./creator-live-sync-service").completeRecovery(tx,job,success);
+    await require("./creator-live-sync-service").completeRecovery(tx,job,success,{deferPlanningWake:true});
     return { applied: true, stale: false, command, state, scanRunId: clean(scanRunId, 120) };
   }});
 }
@@ -283,14 +283,18 @@ async function recordFinancialCollectionFailure({ db = prisma, job, error, termi
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: job.creatorId, work: async (tx) => {
     const current = await tx.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
     if (commandAuthority(current, command) === "STALE" || completedForCommand(current, command)) return current;
-    const retryAt = terminal ? null : date(retryAfterAt) || new Date((await dbAuthorityNow({ db: tx, fallbackNow: new Date() })).getTime() + 5 * 60 * 1000);
+    const retryNow = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+    const interruption = terminal ? await require("./collector-retry-policy").collectionFailureRetry({ db: tx, job, error, terminal, now: retryNow }) : null;
+    const retryAt = terminal ? interruption?.retryAt || null : date(retryAfterAt) || new Date(+retryNow + 5 * 60 * 1000);
     const data = {
       status: job.params?.moneyResolutionVersion === 1 ? "PARTIAL" : "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
       lastErrorCode: "FINANCIAL_COLLECTION_FAILED", lastErrorMessage: clean(error?.message || error, 2000), sourceJobId: clean(job.id, 220),
     };
-    return tx.creatorFinancialCollectionState.upsert({
+    const state = await tx.creatorFinancialCollectionState.upsert({
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...data }, update: data,
     });
+    await require("./collector-retry-policy").signalCollectorRetry({ db: tx, job, interruption, now: retryNow });
+    return state;
   }});
 }
 
@@ -383,7 +387,7 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
     const state = await tx.creatorCampaignCollectionState.upsert({
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData, ...membershipData }, update: { ...common, ...successData, ...membershipData },
     });
-    await require("./creator-live-sync-service").completeRecovery(tx,job,membershipComplete);
+    await require("./creator-live-sync-service").completeRecovery(tx,job,membershipComplete,{deferPlanningWake:true});
     return { applied: true, stale: false, command, state };
   };
   if (campaignLockHeld) return work(db);
@@ -396,7 +400,9 @@ async function recordCampaignCollectionFailure({ db = prisma, job, error, termin
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.CAMPAIGNS, creatorId: job.creatorId, work: async (tx) => {
     const current = await tx.creatorCampaignCollectionState.findUnique({ where: { creatorId: job.creatorId } });
     if (commandAuthority(current, command) === "STALE" || completedForCommand(current, command)) return current;
-    const retryAt = terminal ? null : date(retryAfterAt) || new Date((await dbAuthorityNow({ db: tx, fallbackNow: new Date() })).getTime() + 5 * 60 * 1000);
+    const retryNow = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+    const interruption = terminal ? await require("./collector-retry-policy").collectionFailureRetry({ db: tx, job, error, terminal, now: retryNow }) : null;
+    const retryAt = terminal ? interruption?.retryAt || null : date(retryAfterAt) || new Date(+retryNow + 5 * 60 * 1000);
     const coverageAuthority = campaignFanCoverageAuthorityFromJob(job);
     const data = {
       status: job.params?.moneyResolutionVersion === 1 ? "PARTIAL" : "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
@@ -404,9 +410,11 @@ async function recordCampaignCollectionFailure({ db = prisma, job, error, termin
       fanValueCoverageCollectorVersion: coverageAuthority.collectorVersion, fanValueCoverageSourceJobId: coverageAuthority.sourceJobId,
       lastErrorCode: "CAMPAIGN_COLLECTION_FAILED", lastErrorMessage: clean(error?.message || error, 2000), sourceJobId: clean(job.id, 220),
     };
-    return tx.creatorCampaignCollectionState.upsert({
+    const state = await tx.creatorCampaignCollectionState.upsert({
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...data }, update: data,
     });
+    await require("./collector-retry-policy").signalCollectorRetry({ db: tx, job, interruption, now: retryNow });
+    return state;
   }});
 }
 

@@ -9,10 +9,11 @@ const { createScaleSqlRuntime } = require("../test-support/scale-sql-runtime.cjs
 const { scope } = require("./analytics-traffic/fixture.cjs");
 
 (async () => {
-  const runtime = await createScaleSqlRuntime(), checks = [];
+  const before = process.env.ONLINOD_EXPECT_SUBSCRIBER_STALL === "1";
+  const upgradeMigration = "20261017010000_subscriber_publication_liveness";
+  const runtime = await createScaleSqlRuntime({ beforeMigration: before ? null : upgradeMigration }), checks = [];
   const pass = name => { checks.push(name); console.log("PASS", name); };
   const realNow = Date.now;
-  const before = process.env.ONLINOD_EXPECT_SUBSCRIBER_STALL === "1";
   const keepAlive = setInterval(() => {}, 1000);
   let offset = 0, slowPreparation = false, slowClaim = false;
   const monotonicNow = () => realNow() + offset;
@@ -45,7 +46,7 @@ const { scope } = require("./analytics-traffic/fixture.cjs");
     });
     const wake = creatorId => signals.signalSubscriberDirectoryMaintenance({ db, agencyId: s.agencyId, creatorId,
       kind: "RECOVERY", dueAt: new Date(0), reason: "LIVENESS_PROOF" });
-    const due = creatorId => db.subscriberDirectoryMaintenanceSignal.updateMany({ where: { creatorId }, data: { dueAt: new Date(0) } });
+    const due = creatorId => db.subscriberDirectoryMaintenanceSignal.updateMany({ where: { creatorId, kind: "RECOVERY" }, data: { dueAt: new Date(0) } });
     for (const creatorId of creators) {
       const runId = `run-${creatorId}`, jobId = `job-${creatorId}`, recoveryIntentId = `intent-${creatorId}`;
       await db.jobInstance.create({ data: { id: jobId, agencyId: s.agencyId, creatorId, jobKey: "subscriber_directory_scan", scope: "creator",
@@ -63,11 +64,17 @@ const { scope } = require("./analytics-traffic/fixture.cjs");
       await wake(creatorId);
     }
     if (!before) {
-      // Exercise the actual deployment path over populated V8 state, then repeat
-      // it. The new release must not reset receipts, cursors or collected rows.
-      await db.$executeRawUnsafe('DROP INDEX "SubscriberDirectoryMaintenanceSignal_legacy_yield_idx"');
-      await db.$executeRawUnsafe('DELETE FROM "_prisma_migrations" WHERE migration_name=$1', "20261017010000_subscriber_publication_liveness");
+      // Exercise the actual deployment path over a real populated V8 prefix.
+      // Its DDL and receipts were installed together; no receipt is removed
+      // from an already-newer schema to pretend that an upgrade is necessary.
+      const { migrations, validMigrationPrefix } = require("../../src/services/database-migration-chain");
+      const prefix = migrations.slice(0, migrations.findIndex(item => item.migration === upgradeMigration));
+      const oldReceipts = await db.$queryRawUnsafe('SELECT migration_name,checksum,finished_at,rolled_back_at FROM "_prisma_migrations" ORDER BY migration_name');
+      assert.equal(validMigrationPrefix(oldReceipts), true);
+      assert.deepEqual(oldReceipts.map(row => row.migration_name), prefix.map(item => item.migration));
+      assert.equal((await db.$queryRawUnsafe("SELECT to_regclass('public.\"SubscriberDirectoryMaintenanceSignal_legacy_yield_idx\"')::text AS name"))[0].name, null);
       await db.$disconnect();
+      if (runtime.waitForIdle) await runtime.waitForIdle();
       const install = () => new Promise((resolve, reject) => {
         const child = spawn(process.execPath, ["scripts/database/install-current.js"], {
           cwd: path.resolve(__dirname, "../.."), stdio: ["ignore", "pipe", "pipe"],
@@ -80,10 +87,12 @@ const { scope } = require("./analytics-traffic/fixture.cjs");
         child.once("exit", code => { clearTimeout(timer); code === 0 ? resolve() : reject(Error(output)); });
       });
       await install(); await install();
+      const currentReceipts = await db.$queryRawUnsafe('SELECT migration_name,checksum,finished_at,rolled_back_at FROM "_prisma_migrations"');
+      assert.equal(validMigrationPrefix(currentReceipts, true), true);
       assert.equal(await db.subscriberScanItem.count(), 2002);
       assert.equal(await db.jobInstance.count({ where: { status: "PUBLISHING" } }), 2);
       assert.equal((await require("../../src/services/database-contract-service").readDatabaseContract(db)).ready, true);
-      pass("actual V8-to-V9 installer and repeated install preserve both collected snapshots and pass schema readiness");
+      pass("actual V8-to-current installer and repeated install preserve both collected snapshots and pass schema readiness");
     }
     if (runtime.native && !before) {
       let enter, release;
@@ -143,10 +152,22 @@ const { scope } = require("./analytics-traffic/fixture.cjs");
         assert.equal((await recover(creatorId)).reason, "none_due");
       }
       pass("both 1001-row snapshots, job DONE and offline recovery converge; current-task clears and replay is idle");
+      assert.equal(await db.subscriberDirectoryMaintenanceSignal.count({ where: {
+        agencyId: s.agencyId, creatorId: { in: creators }, kind: "DERIVED_PLANNING",
+      } }), 2);
+      const derived = await runSubscriberDirectoryMaintenance({ db, maxSignals: 8, concurrency: 1, maxRuntimeMs: 30000 });
+      assert.equal(derived.ok, true);
+      assert.equal(await db.subscriberDirectoryMaintenanceSignal.count({ where: {
+        agencyId: s.agencyId, creatorId: { in: creators }, kind: "DERIVED_PLANNING",
+      } }), 0);
+      assert.equal(await db.domainWorkItem.count({ where: {
+        agencyId: s.agencyId, creatorId: { in: creators }, workClass: "CREATOR_RECURRING_PLANNING", isOutstanding: true,
+      } }), 2);
+      pass("completed snapshots durably hand off derived planning for both creators before recovery quarantine tests");
       // Known pre-v25 yields are repairable. Real domain failures stay quarantined.
       for (let i = 0; i < creators.length; i++) {
         await wake(creators[i]);
-        await db.subscriberDirectoryMaintenanceSignal.updateMany({ where: { creatorId: creators[i] },
+        await db.subscriberDirectoryMaintenanceSignal.updateMany({ where: { creatorId: creators[i], kind: "RECOVERY" },
           data: { attempts: 100, lastError: i ? "GENUINE_DATA_CONTRADICTION" : "subscriber_recovery_budget_exhausted" } });
       }
       signal = await signals.claimSubscriberDirectoryMaintenanceSignal({ db });
@@ -157,7 +178,7 @@ const { scope } = require("./analytics-traffic/fixture.cjs");
       pass("legacy false poison resumes automatically; genuine poison stays quarantined");
       for (const legacyError of [null, "maintenance_budget_exhausted", "publication_debt"]) {
         await wake(creators[0]);
-        await db.subscriberDirectoryMaintenanceSignal.updateMany({ where: { creatorId: creators[0] },
+        await db.subscriberDirectoryMaintenanceSignal.updateMany({ where: { creatorId: creators[0], kind: "RECOVERY" },
           data: { attempts: 150, lastError: legacyError } });
         signal = await signals.claimSubscriberDirectoryMaintenanceSignal({ db });
         assert.equal(signal.creatorId, creators[0]); assert.equal(signal.attempts, 0);

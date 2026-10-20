@@ -23,15 +23,19 @@ test('a small maintenance slice never shrinks an admitted recovery transaction t
   const db = { ...tx, $transaction: async (work, opt) => { options.push(opt); return work(tx); } };
   const r = await service.recoverSubscriberPublicationDebt({ db, agencyId: 'a', creatorId: 'c', maxRuntimeMs: 500 });
   assert.equal(r.ok, true); assert.equal(options.length, 1);
-  assert.ok(options[0].timeout >= 14_900 && options[0].timeout <= 15_000);
+  assert.ok(options[0].timeout >= 44_900 && options[0].timeout <= 45_000);
   assert.equal(options[0].maxWait, 1_000);
 });
 
-test('closed maintenance transaction fails immediately; no subsequent planners run or report success', async () => {
-  followingCalls = 0;
-  await assert.rejects(service._test.planSubscriberDerivedAutomation({ run: { id: 'r', agencyId: 'a', creatorId: 'c' },
-    db: {}, fencedMaintenance: true }), { code: 'P2028' });
-  assert.equal(followingCalls, 0);
+test('a failed durable wake cannot mark a published run as handed off', async () => {
+  let markers = 0;
+  const db = { $queryRawUnsafe: async sql => { if (sql.includes('INSERT INTO')) throw closed; return [{ authorityNow: new Date() }]; },
+    subscriberDirectoryState: { findUnique: async () => ({ currentRunId: 'r', publishedGeneration: 1 }) },
+    subscriberScanRun: { update: async () => { markers++; } } };
+  await assert.rejects(service._test.ensureSubscriberDerivedPlanningWake(db, {
+    id: 'r', agencyId: 'a', creatorId: 'c', status: 'PUBLISHED', publicationStatus: 'COMPLETE', publicationGeneration: 1,
+  }), { code: 'P2028' });
+  assert.equal(markers, 0);
 });
 
 test('generation repair does not treat a database failure as absent state', async () => {
@@ -54,7 +58,8 @@ test('fractional remaining pump time is admitted by the strict commit kernel', a
   assert.equal(result, null);
   assert.equal(options.length, 1, 'the fractional soft clock must reach SQL admission instead of failing option validation');
   assert.ok(Number.isInteger(options[0].maxWait) && Number.isInteger(options[0].timeout));
-  assert.ok(options[0].maxWait <= 744 && options[0].maxWait >= 250);
+  assert.equal(options[0].maxWait, 5000);
+  assert.ok(options[0].timeout >= 14900 && options[0].timeout <= 15000);
 });
 
 for (const failedRead of ['existing publication job', 'directory state', 'newest generation']) {
@@ -85,3 +90,18 @@ for (const failedRead of ['existing publication job', 'directory state', 'newest
     assert.equal(creates, 0, 'a failed authority read is not permission to replace the current scan');
   });
 }
+
+
+test('absolute recollection retry preserves the database deadline despite application clock skew', async () => {
+  const at = new Date('2026-10-20T12:00:00Z'), retryAt = new Date(+at + 120000);
+  let stored;
+  const db = { $queryRawUnsafe: async () => [{ authorityNow: at }],
+    $executeRawUnsafe: async (_sql, ...args) => { stored = args[2]; return 1; } };
+  const { releaseSubscriberDirectoryMaintenanceSignal } = require('./subscriber-directory-maintenance-signal-service');
+  const originalNow = Date.now;
+  try {
+    Date.now = () => +at + 3600000;
+    await releaseSubscriberDirectoryMaintenanceSignal({ db, signal: { id: 'signal', claimToken: 'owner', revision: 1 }, retryAt });
+  } finally { Date.now = originalNow; }
+  assert.equal(+stored, +retryAt);
+});

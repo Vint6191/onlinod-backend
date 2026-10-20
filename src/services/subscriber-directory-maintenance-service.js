@@ -1,5 +1,7 @@
 "use strict";
 const { performance } = require("node:perf_hooks");
+const { runDbTransaction } = require("./db-transaction-service");
+const { publishDomainWork } = require("./domain-work-authority-service");
 
 const {
   recoverSubscriberPublicationDebt,
@@ -11,10 +13,35 @@ const {
   signalSubscriberDirectoryMaintenance,
   claimSubscriberDirectoryMaintenanceSignal,
   ackSubscriberDirectoryMaintenanceSignal,
+  lockSubscriberMaintenanceClaimRow,
   releaseSubscriberDirectoryMaintenanceSignal,
   countPoisonedSubscriberMaintenanceSignals,
   listPoisonedSubscriberMaintenanceSignals,
 } = require("./subscriber-directory-maintenance-signal-service");
+
+// Outbox consumer deliberately owns no Subscriber/automation advisory locks.
+// The shared order with recurring planning is DWI -> signal. If a publication
+// replaces the revision while this transaction waits, both DWI and ack roll
+// back; the newer signal remains available for its own owner.
+async function dispatchSubscriberDerivedPlanning({ db, signal }) {
+  return runDbTransaction(db, async tx => {
+    const work = await publishDomainWork({
+      db: tx, agencyId: signal.agencyId, creatorId: signal.creatorId,
+      workClass: "CREATOR_RECURRING_PLANNING", objectType: "CreatorAccount",
+      objectId: signal.creatorId, partitionKey: signal.creatorId,
+    });
+    if (!work?.id) throw Object.assign(new Error("Subscriber derived planning work was not persisted"), {
+      code: "SUBSCRIBER_DERIVED_WAKE_MISSING",
+    });
+    const current = await lockSubscriberMaintenanceClaimRow({ db: tx, signal });
+    if (!current || !await ackSubscriberDirectoryMaintenanceSignal({ db: tx, signal })) {
+      throw Object.assign(new Error("Subscriber derived planning outbox owner is stale"), {
+        code: "SUBSCRIBER_MAINTENANCE_CLAIM_STALE",
+      });
+    }
+    return { dispatched: true, workId: work.id };
+  }, { maxWait: 5_000, timeout: 20_000, lockTimeoutMs: 5_000, statementTimeoutMs: 10_000 });
+}
 
 async function runSubscriberDirectoryMaintenance({
   db,
@@ -25,7 +52,6 @@ async function runSubscriberDirectoryMaintenance({
   recoveryStepsPerRun = 4,
   retentionKeep = 2,
   retentionBatch = 50,
-  scheduleFanRefresh = null,
   monotonicNow = () => performance.now(),
 } = {}) {
   if (typeof db?.$transaction !== "function" || typeof db?.$queryRawUnsafe !== "function") {
@@ -39,6 +65,7 @@ async function runSubscriberDirectoryMaintenance({
     processedSignals: 0,
     recoverySignals: 0,
     retentionSignals: 0,
+    derivedPlanningSignals: 0,
     recoveredRuns: 0,
     advancedSteps: 0,
     reconciledJobs: 0,
@@ -77,7 +104,6 @@ async function runSubscriberDirectoryMaintenance({
         maxStepsPerRun: recoveryStepsPerRun,
         maxRuntimeMs: Math.max(500, Math.min(remainingMs, 4_000)),
         maintenanceSignal: signal,
-        scheduleFanRefresh,
         monotonicNow,
       });
     } catch (error) {
@@ -94,7 +120,7 @@ async function runSubscriberDirectoryMaintenance({
     const debtRemains = await hasSubscriberPublicationDebt({ db, agencyId: signal.agencyId, creatorId: signal.creatorId });
     if (debtRemains) {
       // More bounded work is a continuation, not a failed attempt.
-      await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, retryMs: 2_000 });
+      await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, retryMs: 2_000, retryAt: result?.retryAt || null });
       return;
     }
     await signalSubscriberDirectoryMaintenance({
@@ -155,6 +181,9 @@ async function runSubscriberDirectoryMaintenance({
       if (signal.kind === SUBSCRIBER_MAINTENANCE_KIND.RECOVERY) {
         totals.recoverySignals += 1;
         await processRecovery(signal, remainingMs);
+      } else if (signal.kind === SUBSCRIBER_MAINTENANCE_KIND.DERIVED_PLANNING) {
+        totals.derivedPlanningSignals += 1;
+        await dispatchSubscriberDerivedPlanning({ db, signal });
       } else if (signal.kind === SUBSCRIBER_MAINTENANCE_KIND.RETENTION) {
         totals.retentionSignals += 1;
         await processRetention(signal);
@@ -236,4 +265,4 @@ async function runSubscriberDirectoryMaintenance({
   };
 }
 
-module.exports = { runSubscriberDirectoryMaintenance };
+module.exports = { runSubscriberDirectoryMaintenance, _test: { dispatchSubscriberDerivedPlanning } };

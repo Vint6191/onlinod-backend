@@ -113,7 +113,7 @@ test("Subscriber publication is restartable bounded work outside generic complet
   assert.match(subscriber, /reconcileRecoveredSubscriberPublicationJob[\s\S]*status:\s*"DONE"/);
   assert.match(subscriber, /publicationJobReconciledAt/);
   assert.match(subscriber, /status:\s*\{ in:\s*\["PUBLISHED", "SUPERSEDED"\] \}[\s\S]*publicationStatus:\s*"COMPLETE"[\s\S]*publicationJobReconciledAt:\s*null/);
-  assert.match(subscriber, /planSubscriberDerivedAutomation[\s\S]*subscriber_snapshot_recovered/);
+  assert.match(subscriber, /ensureSubscriberDerivedPlanningWake[\s\S]*derivedPlanningDeferred: true/);
   assert.match(scheduler, /resolveMaintenanceLanes/);
   assert.equal(require("./maintenance-lane-registry").MAINTENANCE_LANES.find(lane=>lane.name==="subscriberDirectoryMaintenance").method,"runSubscriberDirectoryMaintenance");
   assert.match(subscriber, /SUBSCRIBER_RECOVERY_CREATOR_SCOPE_REQUIRED/);

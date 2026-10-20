@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v15_subscriber_analytics_recovery",
+  "version": "nod_current_v16_recovery_liveness",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -56,6 +56,10 @@
     {
       "migration": "20261018050000_subscriber_stranded_wake",
       "checksum": "341b5d37b6b22ced282e02a71a55689c31a9b6d14dd5dafc325546cf50e56ab1"
+    },
+    {
+      "migration": "20261020000000_recovery_liveness",
+      "checksum": "9ae6d050c671e6dc71e825c1391476d9fe0e5a9a1f6f26ac1b4fe613ea39583c"
     }
   ],
   "extension": {
@@ -2015,6 +2019,11 @@
         "name": "onlinod_resolution_publication_guard_v7",
         "args": "",
         "hash": "5e28f46ecc6a40722a68a70da991785e1e9c3ffb759905c25d2918c83397c8e0"
+      },
+      {
+        "name": "onlinod_sync_creator_task_activity",
+        "args": "",
+        "hash": "6e15a795e85e5e717f52b0bf909802286b08ece5f5605346681683b3065d2d57"
       }
     ],
     "triggers": [
@@ -2651,6 +2660,14 @@
         "deferrable": false,
         "deferred": false,
         "definition": "CHECK ((((\"topologyId\")::text = 'of-creator'::text) AND ((\"topologyScope\")::text = 'CREATOR_PARALLEL'::text) AND (\"topologyShardCount\" >= 0) AND (\"topologyShardingAllowed\" = true) AND ((\"controlMode\")::text = ANY ((ARRAY['NORMAL'::character varying, 'OVERLOAD_PROTECTED'::character varying, 'CONSERVATIVE'::character varying])::text[])) AND (\"campaignDirectoryAdmissionBudgetCalls\" >= 1) AND (\"campaignDirectoryGuaranteedCallsPerSweep\" >= 1)))"
+      },
+      {
+        "table": "SubscriberDirectoryMaintenanceSignal",
+        "name": "SubscriberDirectoryMaintenanceSignal_kind_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((kind)::text = ANY (ARRAY['RECOVERY'::text, 'RETENTION'::text, 'DERIVED_PLANNING'::text])))"
       }
     ],
     "indexes": [
@@ -3283,6 +3300,24 @@
         "options": "0 0 0",
         "expressions": null,
         "predicate": "(\"isOutstanding\" AND (state = 'RECONCILE_REQUIRED'::text))"
+      },
+      {
+        "table": "SubscriberScanRun",
+        "name": "SubscriberScanRun_recollection_creator_idx",
+        "unique": false,
+        "keys": "2 3 24 1",
+        "options": "0 0 3 0",
+        "expressions": null,
+        "predicate": "(\"publicationStatus\" = 'RECOLLECTING'::text)"
+      },
+      {
+        "table": "SubscriberDirectoryMaintenanceSignal",
+        "name": "SubscriberDirectoryMaintenanceSignal_structural_retry_idx",
+        "unique": false,
+        "keys": "5 3 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(((kind)::text = 'RECOVERY'::text) AND (attempts >= 100) AND ((\"lastError\")::text ~ '^Subscriber publication generation [0-9]+ is stale behind allocated generation [0-9]+$'::text))"
       }
     ]
   }

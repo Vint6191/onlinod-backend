@@ -94,7 +94,7 @@ function progressSnapshot(progress) {
 async function readCreatorCurrentTask({ db = prisma, creatorId }) {
   const claimed = await db.jobInstance.findFirst({
     where: { creatorId, status: { in: ["CLAIMED", "PUBLISHING"] } },
-    orderBy: [{ lastProgressAt: "desc" }, { priority: "desc" }, { claimedAt: "desc" }],
+    orderBy: [{ lastProgressAt: { sort: "desc", nulls: "last" } }, { priority: "desc" }, { claimedAt: { sort: "desc", nulls: "last" } }],
   });
   const job = claimed || await db.jobInstance.findFirst({
     where: { creatorId, status: { in: ["PAUSED", "SCHEDULED"] } },
@@ -127,7 +127,7 @@ async function readCreatorTaskActivityDays({ db = prisma, creatorId, now = new D
   if (typeof db?.$queryRawUnsafe === "function") {
     try {
       const rows = await db.$queryRawUnsafe(`
-        SELECT to_char(("updatedAt" AT TIME ZONE 'UTC')::date, 'YYYY-MM-DD') AS day
+        SELECT to_char("updatedAt"::date, 'YYYY-MM-DD') AS day
         FROM "CreatorTaskActivity"
         WHERE "creatorId" = $1 AND "updatedAt" >= $2
         GROUP BY 1
@@ -167,7 +167,9 @@ async function readCreatorTaskActivity({ db = prisma, creatorId, now = new Date(
   const rows = await db.creatorTaskActivity.findMany({ where, orderBy: [{ updatedAt: "desc" }, { id: "desc" }], take });
   return rows.map((row) => {
     const params = { analyticsSyncKind: row.mode, analyticsSyncStage: row.stage };
-    const at = row.completedAt || row.updatedAt || row.startedAt || row.createdAt;
+    // The list is selected and ordered by its last status update. Use the same
+    // timestamp for its displayed day; completion remains available separately.
+    const at = row.updatedAt || row.completedAt || row.startedAt || row.createdAt;
     return {
       id: row.id,
       jobId: row.jobId,

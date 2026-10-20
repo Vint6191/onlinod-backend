@@ -98,8 +98,9 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     if (!params.recoveryIntentId && catchupFreshnessMs != null && !collectorCatchupDue(collectorType, currentCollectorState, catchupFreshnessMs, now)) {
       return { created: false, reason: "fresh" };
     }
-    const retry = retryDisposition(currentCollectorState, now);
-    if (retry.deferred || retry.terminal) return { created: false, reason: retry.deferred ? "deferred" : "failed_terminal", retryAfterAt: retry.retryAfterAt };
+    const retry = await collectorRetryDisposition({ db: tx, collectorType, state: currentCollectorState, agencyId, creatorId, now });
+    currentCollectorState = retry.state;
+    if (retry.deferred || retry.terminal) return { created: false, reason: retry.deferred ? retry.reason || "deferred" : "failed_terminal", retryAfterAt: retry.retryAfterAt };
 
     params = { ...params, ...buildCollectionCommand({ collectorType, collectionMode: initial ? "full" : "catchup", reason: params.reason, now }) };
     let collectionPlan = null;
@@ -261,8 +262,8 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
     // must not advance the staged initial-sync authority.
     await cancelRedundantInitialNotificationJobs(db, creatorId, now);
   } else {
-    const notificationRetry = retryDisposition(notificationState, now);
-    if (notificationRetry.deferred) return { ready: false, stage: "notifications", created: false, reason: "deferred", retryAfterAt: notificationRetry.retryAfterAt, jobId: null };
+    const notificationRetry = await collectorRetryDisposition({ db, collectorType: COLLECTOR_TYPES.NOTIFICATIONS, state: notificationState, agencyId, creatorId, now });
+    if (notificationRetry.deferred) return { ready: false, stage: "notifications", created: false, reason: notificationRetry.reason || "deferred", retryAfterAt: notificationRetry.retryAfterAt, jobId: null };
     if (notificationRetry.terminal) return { ready: false, stage: "notifications", created: false, reason: "failed_terminal", retryAfterAt: null, jobId: null };
     const params = {
       ...buildNotificationScanParams({ state: notificationState, now, reason: "creator_initial_analytics_sync", analyticsRangeKey: "all" }),
@@ -280,8 +281,8 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
 
   if (!(await financialInitialCoverageReady(db, creatorId, now))) {
     const financialState = await db.creatorFinancialCollectionState.findUnique({ where: { creatorId } });
-    const retry = retryDisposition(financialState, now);
-    if (retry.deferred) return { ready: false, stage: "financial", created: false, reason: "deferred", retryAfterAt: retry.retryAfterAt, jobId: null };
+    const retry = await collectorRetryDisposition({ db, collectorType: COLLECTOR_TYPES.FINANCIAL, state: financialState, agencyId, creatorId, now });
+    if (retry.deferred) return { ready: false, stage: "financial", created: false, reason: retry.reason || "deferred", retryAfterAt: retry.retryAfterAt, jobId: null };
     if (retry.terminal) return { ready: false, stage: "financial", created: false, reason: "failed_terminal", retryAfterAt: null, jobId: null };
     const snapshotMarker = Math.floor(now.getTime() / 1000);
     const params = {
@@ -307,8 +308,8 @@ async function ensureInitialCreatorAnalyticsSync({ db = prisma, creatorId, agenc
 
   if (!(await campaignInitialCoverageReady(db, creatorId, now))) {
     const campaignState = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId } });
-    const retry = retryDisposition(campaignState, now);
-    if (retry.deferred) return { ready: false, stage: "campaigns", created: false, reason: "deferred", retryAfterAt: retry.retryAfterAt, jobId: null };
+    const retry = await collectorRetryDisposition({ db, collectorType: COLLECTOR_TYPES.CAMPAIGNS, state: campaignState, agencyId, creatorId, now });
+    if (retry.deferred) return { ready: false, stage: "campaigns", created: false, reason: retry.reason || "deferred", retryAfterAt: retry.retryAfterAt, jobId: null };
     if (retry.terminal) return { ready: false, stage: "campaigns", created: false, reason: "failed_terminal", retryAfterAt: null, jobId: null };
     const params = {
       analyticsSyncKind: "initial",
@@ -367,6 +368,14 @@ function retryDisposition(state, now = new Date()) {
   return { deferred: false, terminal: false, retryAfterAt: retryAt };
 }
 
+async function collectorRetryDisposition({ db, collectorType, state, agencyId, creatorId, now }) {
+  const recovered = await require("./collector-retry-policy").recoverTerminalCollector({ db, type: collectorType, state, agencyId, creatorId, now });
+  if (recovered.active) return { state: recovered.state, deferred: true, terminal: false, retryAfterAt: null, reason: "already_in_flight" };
+  return recovered.waitingForSession
+    ? { state: recovered.state, deferred: true, terminal: false, retryAfterAt: null, reason: "waiting_for_api_session" }
+    : { ...retryDisposition(recovered.state, now), state: recovered.state };
+}
+
 function due(lastVerifiedAt, intervalMs, now) {
   if (!lastVerifiedAt) return true;
   const verifiedAt = new Date(lastVerifiedAt);
@@ -390,7 +399,7 @@ function collectorCatchupDue(type, state, freshnessMs, now) {
 }
 
 async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId, agencyId, now = new Date(), priority = 20, campaignDirectoryDiscoveryAdmitted = true, reserveCampaignDirectory = null, _planningLocksHeld = false } = {}) {
-  if (!creatorId || !agencyId) return { ready: false, initial: { ready: false, reason: "missing_scope" }, created: [], skipped: [] };
+  if (!creatorId || !agencyId) return { ready: false, initial: { ready: false, reason: "missing_scope" }, created: [], skipped: [], blocked: [], pendingRecoveryCount: 0, nextRetryAt: null };
   // One creator plan owns collector locks in Notifications -> Financial ->
   // Campaigns order before bootstrap can take its stage lock. Otherwise an
   // unfinished Campaign bootstrap followed by a Notification catch-up reverses
@@ -404,9 +413,10 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
   const initial = await ensureInitialCreatorAnalyticsSync({ db, creatorId, agencyId, now, priority: Math.max(priority, 80) });
   // Bootstrap order remains staged. Each already-proven stream can refresh
   // while a later bootstrap stage is pending or terminally failed.
-  if (initial.reason === "missing_scope") return { ready: false, initial, created: [], skipped: [] };
+  if (initial.reason === "missing_scope") return { ready: false, initial, created: [], skipped: [], blocked: [], pendingRecoveryCount: 0, nextRetryAt: null };
   const created = [];
   const skipped = [];
+  const blocked = [];
 
   const [notificationState, financialState, storedCampaignState] = await Promise.all([
     loadNotificationSyncState(db, creatorId),
@@ -422,13 +432,24 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     campaigns: Boolean(membershipProofState(campaignState).baselineGeneration && collectorPlanningProofAt(COLLECTOR_TYPES.CAMPAIGNS, "full", campaignState, now)),
   };
   const states = { notifications: notificationState, financial: financialState, campaigns: campaignState };
+  // One indexed pending/running lookup per stream, never a count over history.
+  // A live job can fail after this planning transaction yields. The durable
+  // debt keeps a bounded wake until completion, including the subscriber stream.
+  const intents = Object.fromEntries(await Promise.all(liveSync.STREAMS.map(async stream =>
+    [stream, await liveSync.pendingRecovery(db, creatorId, stream)])));
+  const pendingRecoveryCount = Object.values(intents).filter(Boolean).length;
+  let nextRetryAt = null;
   for (const stream of liveSync.STREAMS.filter(stream=>stream!=="subscribers")) {
-    if (!readiness[stream]) { skipped.push(`${stream}:baseline_unverified`); continue; }
-    const intent = await liveSync.pendingRecovery(db, creatorId, stream);
-    if (!intent) { skipped.push(`${stream}:live_no_recovery_debt`); continue; }
-    const retry = retryDisposition(states[stream], now);
-    if (retry.deferred || retry.terminal) { skipped.push(`${stream}:${retry.terminal ? "failed_terminal" : "deferred"}`); continue; }
     const collectorType = stream === "notifications" ? COLLECTOR_TYPES.NOTIFICATIONS : stream === "financial" ? COLLECTOR_TYPES.FINANCIAL : COLLECTOR_TYPES.CAMPAIGNS;
+    const retry = await collectorRetryDisposition({ db, collectorType, state: states[stream], agencyId, creatorId, now });
+    states[stream] = retry.state;
+    const candidateRetryAt = retry.reason === "waiting_for_api_session" ? new Date(+now + 60_000) : retry.retryAfterAt;
+    if (candidateRetryAt && +candidateRetryAt > +now && (!nextRetryAt || +candidateRetryAt < +nextRetryAt)) nextRetryAt = candidateRetryAt;
+    if (retry.terminal) blocked.push({ stream, reason: "failed_terminal", code: states[stream]?.lastErrorCode || "COLLECTOR_REPAIR_REQUIRED" });
+    if (retry.deferred || retry.terminal) { skipped.push(`${stream}:${retry.terminal ? "failed_terminal" : retry.reason || "deferred"}`); continue; }
+    if (!readiness[stream]) { skipped.push(`${stream}:baseline_unverified`); continue; }
+    const intent = intents[stream];
+    if (!intent) { skipped.push(`${stream}:live_no_recovery_debt`); continue; }
     const jobKey = stream === "notifications" ? NOTIFICATION_JOB_KEY : stream === "financial" ? FINANCIAL_JOB_KEY : CAMPAIGN_JOB_KEY;
     const params = {
       ...buildCollectionCommand({ collectorType, collectionMode:"catchup", reason:intent.reason, now }),
@@ -449,7 +470,7 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     else skipped.push(`${stream}:${result.reason || "in_flight"}`);
   }
 
-  return { ready: initial.ready, initial, created, skipped };
+  return { ready: initial.ready, initial, created, skipped, blocked, pendingRecoveryCount, nextRetryAt };
 }
 
 async function advanceCreatorAnalyticsInitialSyncAfterCompletion({ db = prisma, job, sideEffect = null, now = new Date() } = {}) {

@@ -42,7 +42,7 @@ test("F55-04 only Team pending repair and creator planning retain progress acros
   assert.match(scheduler, /Boolean\(nextProgressCursor\?\.pendingRepair\)/);
   // A wake during an active planning turn retains the hourly cadence marker;
   // it must not turn every reconnect into another complete planning pass.
-  assert.match(scheduler, /preserveProgressOnNewerRevision: true,\s*progressCursor: \{ lastPlanningCycleAt:[\s\S]*?lastFullPlanningAt:/);
+  assert.match(scheduler, /preserveProgressOnNewerRevision: true,\s*progressCursor: \{ \.\.\.\(item\.progressCursor \|\| \{\}\), lastPlanningCycleAt:[\s\S]*?lastFullPlanningAt:[\s\S]*?lastSubscriberDerivedGeneration:/);
 });
 
 

@@ -1224,7 +1224,7 @@ test("A32 PostgreSQL: fenced 500-fan refresh intent is transaction-atomic, bound
   }
 });
 
-test("A32 PostgreSQL: full fenced derived planning lane converges 500 refresh candidates across Follow Back, Follow Automation and Bumps", { skip: !enabled, timeout: 180_000 }, async () => {
+test("A32 PostgreSQL: source completion hands 500 refresh candidates to durable derived planning", { skip: !enabled, timeout: 180_000 }, async () => {
   const { PrismaClient } = require("@prisma/client");
   const db = new PrismaClient();
   const scope = await createAgencyCreator(db, "a32-full-derived-planning");
@@ -1244,16 +1244,25 @@ test("A32 PostgreSQL: full fenced derived planning lane converges 500 refresh ca
     });
     const elapsedMs = Date.now() - started;
     assert.equal(recovered.reconciledJobs, 1, JSON.stringify(recovered));
-    assert.equal(recovered.planningRuns, 1, JSON.stringify(recovered));
+    assert.equal(recovered.planningRuns, 0, JSON.stringify(recovered));
     assert.ok(elapsedMs < 15_000, `full fenced derived planning held authority for ${elapsedMs}ms`);
 
     const run = await db.subscriberScanRun.findUnique({ where: { id: fixture.runId } });
     const subscriberJob = await db.jobInstance.findUnique({ where: { id: fixture.jobId } });
     assert.ok(run?.publicationJobReconciledAt instanceof Date);
     assert.equal(subscriberJob?.status, "DONE");
-    assert.equal(subscriberJob?.result?.followBackPlanning?.ok, true, JSON.stringify(subscriberJob?.result?.followBackPlanning));
-    assert.equal(subscriberJob?.result?.followAutomationPlanning?.ok, true, JSON.stringify(subscriberJob?.result?.followAutomationPlanning));
-    assert.equal(subscriberJob?.result?.bumpPlanning?.ok, true, JSON.stringify(subscriberJob?.result?.bumpPlanning));
+    assert.equal(subscriberJob?.result?.derivedPlanningDeferred, true);
+    assert.equal(await db.jobInstance.count({ where: { creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" } }), 0);
+    await ackSubscriberDirectoryMaintenanceSignal({ db, signal: claim });
+    await signalSubscriberDirectoryMaintenance({ db, ...scope, kind: "DERIVED_PLANNING", dueAt: new Date(0) });
+    const derivedClaim = await claimSubscriberDirectoryMaintenanceSignal({ db });
+    assert.equal(derivedClaim.kind, "DERIVED_PLANNING");
+    await require("./subscriber-directory-maintenance-service")._test.dispatchSubscriberDerivedPlanning({ db, signal: derivedClaim });
+    const derivedWork = await db.domainWorkItem.findFirst({ where: { agencyId: scope.agencyId,
+      workClass: "CREATOR_RECURRING_PLANNING", objectType: "CreatorAccount", objectId: scope.creatorId } });
+    await db.domainWorkItem.update({ where: { id: derivedWork.id }, data: { availableAt: new Date(0),
+      progressCursor: { lastFullPlanningAt: new Date().toISOString(), lastSubscriberDerivedGeneration: 0 } } });
+    await require("./job-scheduler").runRecurringCreatorWork({ db, pageSize: 1, maxRuntimeMs: 1000 });
 
     const refreshJobs = await db.jobInstance.findMany({
       where: { agencyId: scope.agencyId, creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" },
@@ -1278,63 +1287,37 @@ test("A32 PostgreSQL: full fenced derived planning lane converges 500 refresh ca
   }
 });
 
-test("A32 PostgreSQL: transient derived refresh scheduler failure preserves publication debt and retry converges without duplicate intents", { skip: !enabled, timeout: 180_000 }, async () => {
+test("A32 PostgreSQL: stale derived outbox claim rolls back DWI while source completion remains durable", { skip: !enabled, timeout: 180_000 }, async () => {
   const { PrismaClient } = require("@prisma/client");
   const db = new PrismaClient();
   const scope = await createAgencyCreator(db, "a32-derived-planning-retry");
   try {
     const fixture = await seedA32DerivedPlanningDebt(db, scope, { fanCount: 50, generation: 89 });
-    await signalSubscriberDirectoryMaintenance({
-      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
-      kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: new Date(0), reason: "A32_TRANSIENT_PLANNING_FAILURE",
-    });
-    const firstClaim = await claimSubscriberDirectoryMaintenanceSignal({ db, now: await databaseNow(db) });
-    assert.ok(firstClaim?.claimToken);
-    let injectedCalls = 0;
-    const first = await recoverSubscriberPublicationDebt({
-      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
-      maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 10_000, maintenanceSignal: firstClaim,
-      scheduleFanRefresh: async () => {
-        injectedCalls += 1;
-        const error = new Error("A32 transient FanData scheduler failure");
-        error.code = "A32_TRANSIENT_REFRESH_SCHEDULER";
-        throw error;
-      },
-    });
-    assert.ok(injectedCalls >= 3, `all derived consumers must encounter the transient scheduler failure: ${injectedCalls}`);
-    assert.equal(first.reconciledJobs, 0, JSON.stringify(first));
-    const failedRun = await db.subscriberScanRun.findUnique({ where: { id: fixture.runId } });
-    const failedJob = await db.jobInstance.findUnique({ where: { id: fixture.jobId } });
-    assert.equal(failedRun?.publicationJobReconciledAt, null);
-    assert.equal(failedJob?.status, "FAILED");
-    assert.equal(await db.jobInstance.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" } }), 0);
-    await releaseSubscriberDirectoryMaintenanceSignal({
-      db, signal: firstClaim, now: await databaseNow(db), retryMs: 1_000,
-      error: Object.assign(new Error("transient derived planning failure"), { code: "A32_TRANSIENT_REFRESH_SCHEDULER" }),
-    });
-    const released = await db.subscriberDirectoryMaintenanceSignal.findUnique({ where: { id: firstClaim.id } });
-    assert.equal(released?.attempts, 1);
-    assert.equal(released?.claimToken, null);
-
-    await signalSubscriberDirectoryMaintenance({
-      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
-      kind: SUBSCRIBER_MAINTENANCE_KIND.RECOVERY, dueAt: new Date(0), reason: "A32_TRANSIENT_RETRY_NOW",
-    });
-    const secondClaim = await claimSubscriberDirectoryMaintenanceSignal({ db, now: await databaseNow(db) });
-    assert.ok(secondClaim?.claimToken);
-    assert.ok(Number(secondClaim.revision) > Number(firstClaim.revision));
-    const second = await recoverSubscriberPublicationDebt({
-      db, agencyId: scope.agencyId, creatorId: scope.creatorId,
-      maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 15_000, maintenanceSignal: secondClaim,
-    });
-    assert.equal(second.reconciledJobs, 1, JSON.stringify(second));
-    const convergedRun = await db.subscriberScanRun.findUnique({ where: { id: fixture.runId } });
-    const convergedJob = await db.jobInstance.findUnique({ where: { id: fixture.jobId } });
-    assert.ok(convergedRun?.publicationJobReconciledAt instanceof Date);
-    assert.equal(convergedJob?.status, "DONE");
+    const first = await recoverSubscriberPublicationDebt({ db, ...scope });
+    assert.equal(first.reconciledJobs, 1);
+    assert.equal((await db.jobInstance.findUnique({ where: { id: fixture.jobId } })).status, "DONE");
+    await signalSubscriberDirectoryMaintenance({ db, ...scope, kind: "DERIVED_PLANNING", dueAt: new Date(0) });
+    const stale = await claimSubscriberDirectoryMaintenanceSignal({ db });
+    assert.equal(stale.kind, "DERIVED_PLANNING");
+    await signalSubscriberDirectoryMaintenance({ db, ...scope, kind: "DERIVED_PLANNING", dueAt: new Date(0) });
+    const before = await db.domainWorkItem.findFirst({ where: { agencyId: scope.agencyId,
+      workClass: "CREATOR_RECURRING_PLANNING", objectType: "CreatorAccount", objectId: scope.creatorId } });
+    const { dispatchSubscriberDerivedPlanning } = require("./subscriber-directory-maintenance-service")._test;
+    await assert.rejects(dispatchSubscriberDerivedPlanning({ db, signal: stale }), { code: "SUBSCRIBER_MAINTENANCE_CLAIM_STALE" });
+    const after = await db.domainWorkItem.findFirst({ where: { agencyId: scope.agencyId,
+      workClass: "CREATOR_RECURRING_PLANNING", objectType: "CreatorAccount", objectId: scope.creatorId } });
+    assert.equal(after?.requestedRevision, before?.requestedRevision);
+    assert.equal((await db.jobInstance.findUnique({ where: { id: fixture.jobId } })).status, "DONE");
+    const next = await claimSubscriberDirectoryMaintenanceSignal({ db });
+    assert.ok(Number(next.revision) > Number(stale.revision));
+    await dispatchSubscriberDerivedPlanning({ db, signal: next });
+    const work = await db.domainWorkItem.findFirst({ where: { agencyId: scope.agencyId,
+      workClass: "CREATOR_RECURRING_PLANNING", objectType: "CreatorAccount", objectId: scope.creatorId } });
+    await db.domainWorkItem.update({ where: { id: work.id }, data: { availableAt: new Date(0),
+      progressCursor: { lastFullPlanningAt: new Date().toISOString(), lastSubscriberDerivedGeneration: 0 } } });
+    await require("./job-scheduler").runRecurringCreatorWork({ db, pageSize: 1, maxRuntimeMs: 1000 });
     assert.equal(await db.jobInstance.count({ where: { agencyId: scope.agencyId, creatorId: scope.creatorId, jobKey: "fan_data_point_refresh" } }), 3);
-    await ackSubscriberDirectoryMaintenanceSignal({ db, signal: secondClaim });
-    console.log(`A32_DERIVED_PLANNING_RETRY_PROOF ${JSON.stringify({ firstReconciled: first.reconciledJobs, secondReconciled: second.reconciledJobs, injectedCalls })}`);
+    assert.equal(await db.subscriberDirectoryMaintenanceSignal.count({ where: { creatorId: scope.creatorId, kind: "DERIVED_PLANNING" } }), 0);
   } finally {
     await db.automationTask.deleteMany({ where: { agencyId: scope.agencyId } }).catch(() => null);
     await cleanupAgency(db, scope.agencyId);

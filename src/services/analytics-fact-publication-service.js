@@ -228,6 +228,7 @@ async function processAdoption({ db, item, ownerToken }) {
 async function runSweep({ db = require("../prisma"), limit = 8, maxRuntimeMs = 5000 } = {}) {
   const started = performance.now();
   const report = { ok: true, enumeration: await enumerateAdoption({ db }), processed: 0, failed: 0, completed: 0 };
+  const blocked = new Set();
   const unitLimit = Math.max(2, Math.min(16, Math.floor(Number(limit) || 8)));
   for (let i = 0; i < unitLimit; i++) {
     // The lane owns two independent durable work classes. Admit one bounded
@@ -236,7 +237,16 @@ async function runSweep({ db = require("../prisma"), limit = 8, maxRuntimeMs = 5
     // (whose completion is the read model's initialized/readiness proof).
     if (i >= 2 && performance.now() - started >= maxRuntimeMs) break;
     const workClass = i % 2 ? ADOPTION_CLASS : WORK_CLASS;
+    if (blocked.has(workClass)) continue;
     const claim = await work.claimDomainWorkBatch({ db, workClass, limit: 1, perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
+    // An unavailable executor/topology is not an empty, healthy queue. Keep
+    // ordinary contention retryable, but expose structural admission failures.
+    if (claim.skipped && !["creator_lifecycle_contended", "none_due"].includes(claim.reason)) {
+      blocked.add(workClass);
+      report.ok = false;
+      report.reason ||= claim.reason || "DOMAIN_WORK_CLAIM_BLOCKED";
+      report.blockedWorkClasses = [...blocked];
+    }
     const item = claim.items?.[0]; if (!item) continue;
     try {
       const result = await (workClass === ADOPTION_CLASS ? processAdoption : processPage)({ db, item, ownerToken: claim.ownerToken });

@@ -6,13 +6,14 @@ const fs = require("node:fs"), path = require("node:path");
 const { spawn } = require("node:child_process");
 const { createScaleSqlRuntime } = require("../test-support/scale-sql-runtime.cjs");
 const { scope } = require("./analytics-traffic/fixture.cjs");
+const { migrations, validMigrationPrefix } = require("../../src/services/database-migration-chain");
 const { TRANSIENT_DATABASE_CODES, classifyStoredDatabaseFailure } = require("../../src/services/db-retry-policy");
 const root = path.resolve(__dirname, "../.."), migrationName = "20261018050000_subscriber_stranded_wake";
 const keep = setInterval(() => {}, 1000);
 const deadline = setTimeout(() => { console.error("SUBSCRIBER_MIGRATION_PROOF_DEADLINE"); process.exit(2); }, 240000);
 
 (async () => {
-  const runtime = await createScaleSqlRuntime(), checks = [];
+  const runtime = await createScaleSqlRuntime({ beforeMigration: migrationName }), checks = [];
   const pass = name => { checks.push(name); console.log("PASS", name); };
   try {
     const { db } = runtime, s = await scope(db);
@@ -96,7 +97,13 @@ const deadline = setTimeout(() => { console.error("SUBSCRIBER_MIGRATION_PROOF_DE
     pass("migration debt selection uses existing partial indexes with 15000 completed historical scans");
 
     const runsBefore = await db.subscriberScanRun.findMany({ where: { id: { startsWith: "subscriber-migration-" } }, orderBy: { id: "asc" } });
-    await db.$executeRawUnsafe('DELETE FROM "_prisma_migrations" WHERE migration_name=$1', migrationName);
+    const targetIndex = migrations.findIndex(item => item.migration === migrationName);
+    assert(targetIndex > 0, "target migration must follow the baseline");
+    const prefix = await db.$queryRawUnsafe('SELECT migration_name,checksum,finished_at,rolled_back_at FROM "_prisma_migrations" ORDER BY migration_name');
+    assert.equal(validMigrationPrefix(prefix), true, "fixture must have an authentic completed migration prefix");
+    assert.equal(validMigrationPrefix(prefix, true), false, "target and later migrations must not be preinstalled");
+    assert.deepEqual(prefix.map(row => ({ migration: row.migration_name, checksum: row.checksum })), migrations.slice(0, targetIndex));
+    pass("actual pre-upgrade DDL and receipts stop immediately before the target migration");
     await db.$executeRawUnsafe("SET TIME ZONE 'Pacific/Auckland'");
     await db.$disconnect(); if (runtime.waitForIdle) await runtime.waitForIdle();
     const install = () => new Promise((resolve, reject) => {

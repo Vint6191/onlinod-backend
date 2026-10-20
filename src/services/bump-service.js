@@ -1,4 +1,5 @@
 "use strict";
+const { attachSchedulerFailureCause, inheritSchedulerFailureCauses } = require("./scheduler-failure-cause");
 
 const prisma = require("../prisma");
 const { readSubscriberConsumerPage } = require("./fan-consumer-cursor-service");
@@ -1094,6 +1095,10 @@ async function planConfiguredBumpSources({
     return { ok: true, created: false, reason: "no_sources_enabled", planned: 0, sources: [], readyDevices: await sessionWriteWorkerCount({ agencyId, creatorId, db }), skipCounts: { no_sources_enabled: 1 } };
   }
 
+  // Read this diagnostic before collecting independent source outcomes. A
+  // final SQL throw must not replace an already-recorded contract failure and
+  // make the whole attempt look like a purely transient database outage.
+  const readyDevices = await sessionWriteWorkerCount({ agencyId, creatorId, db });
   const sources = [];
   let planned = 0;
   for (const candidateSource of requested) {
@@ -1104,28 +1109,27 @@ async function planConfiguredBumpSources({
         manual, db, scheduleFanRefresh,
       });
       const refreshDebt = Number(result?.fanRefresh?.requested || 0) > 0 && result?.fanRefresh?.durable !== true;
-      sources.push({
+      sources.push(inheritSchedulerFailureCauses({
         source: candidateSource,
         ok: !refreshDebt,
         planned: result.planned || 0,
         skipped: result.skipped || [],
         ...(result?.fanRefresh ? { fanRefresh: result.fanRefresh } : {}),
         ...(refreshDebt ? { code: "fan_refresh_debt_not_durable", error: result?.fanRefresh?.error || "fan refresh intent was not durably scheduled" } : {}),
-      });
+      }, refreshDebt ? [result.fanRefresh] : []));
       planned += Number(result.planned || 0);
     } catch (error) {
-      sources.push({ source: candidateSource, ok: false, code: error?.code || "planning_failed", error: String(error?.message || error).slice(0, 500), skipped: [] });
+      sources.push(attachSchedulerFailureCause({ source: candidateSource, ok: false, code: error?.code || "planning_failed", error: String(error?.message || error).slice(0, 500), skipped: [] }, error));
     }
   }
   const skipCounts = summarizePlanningSkips(sources);
-  const readyDevices = await sessionWriteWorkerCount({ agencyId, creatorId, db });
   const firstFailure = Object.keys(skipCounts)[0] || null;
   const ok = sources.every((row) => row?.ok !== false);
-  return {
+  return inheritSchedulerFailureCauses({
     ok, created: planned > 0,
     reason: ok ? (planned > 0 ? source : (firstFailure || "no_eligible_candidates")) : (firstFailure || "planning_failed"),
     planned, sources, requestedSources: requested, readyDevices, skipCounts,
-  };
+  }, sources.filter(row => row?.ok === false));
 }
 
 async function ensureAutomaticBumps({

@@ -1550,6 +1550,19 @@ async function runCampaignFanRefreshPromotionMaintenance({
   let reservedSlots = 0;
   let drained = false;
 
+  function recordError(error, signal = null) {
+    totals.errors += 1;
+    if (totals.errorDetails.length < 5) {
+      totals.errorDetails.push({
+        signalId: signal?.id || null,
+        agencyId: signal?.agencyId || null,
+        creatorId: signal?.creatorId || null,
+        code: error?.code || null,
+        message: String(error?.message || error || "campaign_promotion_maintenance_error").slice(0, 500),
+      });
+    }
+  }
+
   async function processSignal(signal) {
     try {
       const claimed = await runDbTransaction(root, async (tx) => {
@@ -1626,16 +1639,7 @@ async function runCampaignFanRefreshPromotionMaintenance({
       totals.promotedJobs += Number(claimed.promoted?.promotedJobs || 0);
       totals.promotedFans += Number(claimed.promoted?.promotedFans || 0);
     } catch (error) {
-      totals.errors += 1;
-      if (totals.errorDetails.length < 5) {
-        totals.errorDetails.push({
-          signalId: signal?.id || null,
-          agencyId: signal?.agencyId || null,
-          creatorId: signal?.creatorId || null,
-          code: error?.code || null,
-          message: String(error?.message || error || "campaign_promotion_maintenance_error").slice(0, 500),
-        });
-      }
+      recordError(error, signal);
       await releaseCampaignFanRefreshPromotionClaim({ db: root, signal, now: fallbackNow, error }).catch(() => {});
     }
   }
@@ -1643,15 +1647,23 @@ async function runCampaignFanRefreshPromotionMaintenance({
   async function worker(initialSignal = null) {
     let nextSignal = initialSignal;
     for (;;) {
-      if (drained || Date.now() - startedMonotonic >= runtimeBudgetMs) return;
       let signal = nextSignal;
       nextSignal = null;
+      // The soft slice gates new claims only. A slow claim or an empty sibling
+      // cannot abandon a signal already owned for the next two minutes.
+      if (!signal && (drained || Date.now() - startedMonotonic >= runtimeBudgetMs)) return;
       if (!signal && reservedSlots >= max) return;
       if (!signal) {
         reservedSlots += 1;
         // Claim is one short SKIP LOCKED transaction and derives lease chronology
         // from PostgreSQL. Never preclaim a batch that can expire in a JS queue.
-        signal = await claimCampaignFanRefreshPromotionSignal({ db: root, now: fallbackNow });
+        try {
+          signal = await claimCampaignFanRefreshPromotionSignal({ db: root, now: fallbackNow });
+        } catch (error) {
+          drained = true;
+          recordError(error);
+          return;
+        }
       }
       if (!signal) { drained = true; return; }
       await processSignal(signal);
@@ -1664,10 +1676,13 @@ async function runCampaignFanRefreshPromotionMaintenance({
   if (!firstSignal) {
     drained = true;
   } else {
-    await Promise.all([
+    const workers = await Promise.allSettled([
       worker(firstSignal),
       ...Array.from({ length: Math.max(0, workerCount - 1) }, () => worker()),
     ]);
+    for (const workerResult of workers) {
+      if (workerResult.status === "rejected") recordError(workerResult.reason);
+    }
   }
   const budgetExhausted = !drained && reservedSlots < max && Date.now() - startedMonotonic >= runtimeBudgetMs;
   return {

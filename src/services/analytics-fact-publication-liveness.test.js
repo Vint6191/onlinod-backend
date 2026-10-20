@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test"), assert = require("node:assert/strict");
 const { performance } = require("node:perf_hooks");
-function fixture(t, { slowEnumeration = false } = {}) {
+function fixture(t, { slowEnumeration = false, skippedClaim = null } = {}) {
   let clock = 0, initialized = false;
   t.mock.method(performance, "now", () => clock);
   const claims = [], acknowledgements = [], saved = new Map();
@@ -25,6 +25,7 @@ function fixture(t, { slowEnumeration = false } = {}) {
     "./domain-work-authority-service": {
       claimDomainWorkBatch: async ({ workClass }) => {
         claims.push(workClass); clock += 1000;
+        if (skippedClaim) return { ownerToken: "owner", items: [], ...skippedClaim };
         return { ownerToken: "owner", items: [{ id: workClass, workClass, agencyId: "agency", creatorId: "creator", objectId: "creator", progressCursor: { table: 7 } }] };
       },
       lockDomainWorkClaimForCommit: async ({ item }) => ({ current: true, item }),
@@ -49,4 +50,25 @@ for (const slowEnumeration of [true, false]) test(`fact publication admits each 
   assert.deepEqual(f.acknowledgements, f.claims);
   assert.equal(f.initialized(), true, "constant live-fact work must not starve the adoption readiness proof");
   assert.equal(result.completed, 2);
+});
+
+for (const reason of ["domain_work_claim_topology_building", "unsupported_domain_work_generation", "unknown_admission_failure"])
+test(`fact publication exposes blocked admission: ${reason}`, async t => {
+  const f = fixture(t, { skippedClaim: { skipped: true, reason } });
+  const result = await f.service.runSweep({ db: f.db, limit: 8, maxRuntimeMs: 10000 });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, reason);
+  assert.deepEqual(result.blockedWorkClasses, [f.service.WORK_CLASS, f.service.ADOPTION_CLASS]);
+  assert.deepEqual(f.claims, result.blockedWorkClasses, "blocked classes are not immediately re-probed in the same slice");
+  assert.equal(result.processed, 0);
+  assert.equal(f.initialized(), false);
+});
+
+for (const reason of ["creator_lifecycle_contended", "none_due", null])
+test(`ordinary empty or contended publication claims remain healthy: ${reason}`, async t => {
+  const f = fixture(t, { skippedClaim: reason ? { skipped: true, reason } : {} });
+  const result = await f.service.runSweep({ db: f.db, limit: 2, maxRuntimeMs: 10000 });
+  assert.equal(result.ok, true);
+  assert.equal(result.reason, undefined);
+  assert.equal(result.processed, 0);
 });

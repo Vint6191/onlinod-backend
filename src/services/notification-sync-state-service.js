@@ -282,7 +282,7 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
         ...(verified ? { lastCatchupVerifiedAt: now, lastCatchupObservedAt: observationStartForJob(job) } : {}),
       } : {}),
     };
-    await require("./creator-live-sync-service").completeRecovery(tx,job,overallComplete);
+    await require("./creator-live-sync-service").completeRecovery(tx,job,overallComplete,{deferPlanningWake:true});
     return tx.creatorNotificationSyncState.upsert({
       where: { creatorId: job.creatorId },
       create: { agencyId: job.agencyId, creatorId: job.creatorId, ...data },
@@ -300,7 +300,9 @@ async function recordNotificationSyncFailure({ db, job, deviceId = null, error, 
     const authority = commandAuthority(existing, command);
     if (authority === "STALE" || (sameGeneration(existing, command) && String(existing?.status || "").toUpperCase() === "COMPLETE")) return existing;
     const params = object(job.params);
-    const retryAt = terminal ? null : (strictDate(retryAfterAt) || new Date((await dbAuthorityNow({ db: tx, fallbackNow: new Date() })).getTime() + 5 * 60 * 1000));
+    const retryNow = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+    const interruption = terminal ? await require("./collector-retry-policy").collectionFailureRetry({ db: tx, job, error, terminal, now: retryNow }) : null;
+    const retryAt = terminal ? interruption?.retryAt || null : strictDate(retryAfterAt) || new Date(+retryNow + 5 * 60 * 1000);
     const data = {
       status: "FAILED",
       mode: params.notificationMode === "catchup" ? "catchup" : "full",
@@ -313,11 +315,13 @@ async function recordNotificationSyncFailure({ db, job, deviceId = null, error, 
       sourceDeviceId: clean(deviceId, 220),
       sourceJobId: clean(job.id, 220),
     };
-    return tx.creatorNotificationSyncState.upsert({
+    const state = await tx.creatorNotificationSyncState.upsert({
       where: { creatorId: job.creatorId },
       create: { agencyId: job.agencyId, creatorId: job.creatorId, ...data },
       update: data,
     });
+    await require("./collector-retry-policy").signalCollectorRetry({ db: tx, job, interruption, now: retryNow });
+    return state;
   }});
 }
 

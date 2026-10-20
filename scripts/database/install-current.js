@@ -50,7 +50,10 @@ async function inspectInstallation(db) {
   if (rows.some(row => !migrations.some(expected => row.migration_name === expected.migration && row.checksum === expected.checksum))) fail("CURRENT_BASELINE_DATABASE_REQUIRED");
   if (rows.some(row => !row.finished_at && !row.rolled_back_at)) fail("BASELINE_INSTALLATION_INCOMPLETE");
   const applied = rows.filter(row => row.finished_at && !row.rolled_back_at);
-  if (!validMigrationPrefix(rows)) fail("DUPLICATE_BASELINE_RECEIPT");
+  if (!validMigrationPrefix(rows)) {
+    const activeNames = rows.filter(row => !row.rolled_back_at).map(row => row.migration_name);
+    fail(new Set(activeNames).size !== activeNames.length ? "DUPLICATE_BASELINE_RECEIPT" : "NONCONTIGUOUS_BASELINE_RECEIPTS");
+  }
   if (!applied.length && tables.some(row => row.name !== "_prisma_migrations")) fail("EMPTY_DATABASE_REQUIRED");
   return { fresh: applied.length === 0 };
 }
@@ -127,6 +130,7 @@ function reportFailure(error) {
     LEGACY_TEST_RESET_NOT_APPLICABLE: "Reset refused: the history is not exclusively pre-153 migrations. A recorded current baseline (including a failed or changed one) is never reset by this option. Existing data was not changed.",
     BASELINE_INSTALLATION_INCOMPLETE: "A previous installation is incomplete. Inspect its Prisma migration receipt before retrying.",
     DUPLICATE_BASELINE_RECEIPT: "The database has duplicate baseline receipts. Installation was stopped.",
+    NONCONTIGUOUS_BASELINE_RECEIPTS: "Migration history has a missing earlier receipt while later migrations are recorded. Installation was stopped; existing data was not changed.",
     BASELINE_DEPLOY_FAILED: "Prisma could not apply the current baseline. See its error above.",
     DATABASE_CONTRACT_REQUIRED: "The installed database differs from the current contract. Inspect the reported schema differences; no reset was performed.",
   };

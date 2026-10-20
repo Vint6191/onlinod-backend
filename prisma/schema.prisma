@@ -4684,7 +4684,7 @@ model SubscriberScanRun {
   fanProjectionCount          Int       @default(0)
   fanProjectionCompletedAt    DateTime?
   fanProjectionLastError      String?   @db.VarChar(1000)
-  publicationStatus           String    @default("PENDING") // PENDING | CURRENT | PREVIOUS | FINALIZE | COMPLETE
+  publicationStatus           String    @default("PENDING") // PENDING | CURRENT | PREVIOUS | FINALIZE | RECOLLECTING | COMPLETE
   publicationGeneration       Int       @default(0)
   publicationCursorId         String?   @db.VarChar(180)
   publicationPreviousRunId    String?
@@ -4825,7 +4825,7 @@ model SubscriberDirectoryMaintenanceSignal {
   id         String    @id @default(cuid())
   agencyId   String
   creatorId  String
-  kind       String    @db.VarChar(32) // RECOVERY | RETENTION
+  kind       String    @db.VarChar(32) // RECOVERY | RETENTION | DERIVED_PLANNING
   dueAt      DateTime  @default(now())
   reason     String    @default("PUBLICATION_DEBT") @db.VarChar(64)
   revision   Int       @default(1)

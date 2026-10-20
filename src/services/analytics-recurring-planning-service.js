@@ -76,8 +76,23 @@ async function planRecurringCreatorAnalytics({ db, item, ownerToken, now = new D
     // or admission budget survive this failed final fence; notifications wait.
     const final = await lockDomainWorkClaimForCommit({ db: tx, item, ownerToken, fallbackNow: now });
     if (!final.current || final.newerRevision) throw Object.assign(new Error("Analytics planning lease expired before commit"), { code: "ANALYTICS_PLANNING_CLAIM_LOST" });
+    const blocked = Array.isArray(analytics.blocked) ? analytics.blocked.slice(0, 4) : [];
+    if (analytics.initial?.reason === "failed_terminal" && !blocked.some(entry => entry.stream === analytics.initial.stage)) {
+      blocked.push({ stream: analytics.initial.stage, reason: "failed_terminal", code: "COLLECTOR_REPAIR_REQUIRED" });
+    }
     return { created: Number(earnings.created || 0) + Number(analytics.created?.length || 0) + (analytics.initial?.created ? 1 : 0)
-      + Number(subscribers.created===true), skipped: Number(analytics.skipped?.length || 0), retired: false, initial: analytics.initial };
+      + Number(subscribers.created===true), skipped: Number(analytics.skipped?.length || 0), retired: false, initial: analytics.initial,
+      // Retain domain outcomes after commit. A terminal collector is not a
+      // failed SQL transaction, but it must not disappear behind a skip count.
+      blocked,
+      pendingRecoveryCount: Math.max(0, Math.min(4, Number(analytics.pendingRecoveryCount) || 0)),
+      nextRetryAt: analytics.nextRetryAt || null,
+      skipReasons: [
+        ...(Array.isArray(analytics.skipped) ? analytics.skipped : []),
+        ...(!earnings.created && earnings.reason ? [`earnings:${earnings.reason}`] : []),
+        ...(!subscribers.created && subscribers.reason ? [`subscribers:${subscribers.reason}`] : []),
+      ].slice(0, 12),
+    };
   }, { maxWait: 5000, timeout: 20_000 }));
 }
 

@@ -12,7 +12,103 @@ const keepAlive = setInterval(() => {}, 1000);
 const deadline = setTimeout(() => { console.error('EARNINGS_LIVE_PROOF_DEADLINE'); process.exit(2); }, 300_000);
 const checks = [], pass = name => { checks.push(name); console.log('PASS', name); };
 
+async function seedPredecessorEarnings(db, { creatorScope, otherId, now }) {
+  const verifiedDay = new Date(key(+now - dayMs));
+  await db.$transaction(async tx => {
+    for (const creatorId of [creatorScope.creatorId, otherId]) {
+      const jobId = `upgrade-job-${creatorId}`, runId = `upgrade-run-${creatorId}`, proofId = `upgrade-proof-${creatorId}`;
+      await tx.jobInstance.create({ data: { id: jobId, agencyId: creatorScope.agencyId, creatorId,
+        jobKey: 'fetch_earnings', scope: 'creator', status: 'PUBLISHING', leaseRevision: 1 } });
+      await tx.analyticsPublication.create({ data: { id: `upgrade-publication-${creatorId}`, jobId,
+        agencyId: creatorScope.agencyId, creatorId, userId: creatorScope.userId, deviceId: 'upgrade-device',
+        leaseRevision: 1, leaseTokenHash: 'upgrade-token', payloadHash: 'upgrade-payload', payload: {},
+        state: 'PENDING', stage: 'FINALIZE' } });
+      // The real predecessor proof guard requires this scoped publisher. No
+      // trigger is disabled and no receipt/schema is removed to seed fixtures.
+      await tx.analyticsScanProof.create({ data: { id: proofId, agencyId: creatorScope.agencyId, creatorId,
+        dataType: 'EARNINGS', scanRunId: runId, sourceTimezone: 'UTC', scanFrom: verifiedDay, scanTo: verifiedDay,
+        requestedAt: now, observationStartedAt: now, serverReceivedAt: now, committedAt: now, status: 'COMMITTED',
+        collectorVersion: 'earnings-v7', schemaVersion: 2, scanGeneration: runId, collectionReason: 'UPGRADE_PROOF',
+        sourceJobId: jobId, rowCount: 1, payloadChecksum: `upgrade-${creatorId}`, proofVersion: 2 } });
+      await tx.creatorEarningsDaily.create({ data: { id: `upgrade-day-${creatorId}`, agencyId: creatorScope.agencyId,
+        creatorId, date: verifiedDay, sourceTimezone: 'UTC', totalCents: creatorId === otherId ? 0 : 2400,
+        sourceScanRunId: runId, sourceScanRequestedAt: now, scanProofId: proofId, sourceJobId: jobId } });
+      await tx.analyticsCoverage.create({ data: { id: `upgrade-coverage-${creatorId}`, agencyId: creatorScope.agencyId,
+        creatorId, dataType: 'EARNINGS', coverageDate: verifiedDay, sourceTimezone: 'UTC', status: 'COMPLETE',
+        coveredFromAt: verifiedDay, coveredToAt: new Date(+verifiedDay + dayMs - 1), scanProofId: proofId, lastVerifiedAt: now } });
+      await tx.analyticsPublication.update({ where: { id: `upgrade-publication-${creatorId}` }, data: { state: 'COMMITTED', stage: 'TERMINAL', completedAt: now } });
+      await tx.jobInstance.update({ where: { id: jobId }, data: { status: 'DONE', completedAt: now } });
+    }
+    await tx.creatorEarningsDaily.create({ data: { id: 'upgrade-unverified-day', agencyId: creatorScope.agencyId,
+      creatorId: creatorScope.creatorId, date: new Date(key(now)), sourceTimezone: 'UTC', totalCents: 999999,
+      sourceScanRunId: 'upgrade-rejected-run', sourceScanRequestedAt: now } });
+    await tx.analyticsCoverage.create({ data: { id: 'upgrade-unverified-coverage', agencyId: creatorScope.agencyId,
+      creatorId: creatorScope.creatorId, dataType: 'EARNINGS', coverageDate: new Date(key(now)), sourceTimezone: 'UTC',
+      status: 'FAILED', lastVerifiedAt: now, lastErrorCode: 'EARNINGS_DAILY_INCOMPLETE', lastErrorMessage: 'No committed proof for this candidate' } });
+  });
+}
+
+async function provePublishedSnapshotUpgrade({ creatorScope, otherId, now }) {
+  const targetMigration = '20261016000000_earnings_published_snapshot';
+  const predecessor = await createAdminSqlRuntime({ runtimePath: process.env.ONLINOD_SQL_PROOF_RUNTIME,
+    maxConnections: 4, beforeMigration: targetMigration });
+  try {
+    const db = predecessor.db;
+    assert.equal(predecessor.migrations.length, 3, 'the actual v3 schema has exactly its three predecessor receipts');
+    assert.equal(predecessor.migrations.includes(targetMigration), false);
+    assert.equal((await db.$queryRawUnsafe(`SELECT to_regclass('public."CreatorEarningsPublishedDay"')::text AS name`))[0].name, null);
+    const { inspectInstallation } = require(path.join(root, 'scripts/database/install-current'));
+    assert.deepEqual(await inspectInstallation(db), { fresh: false });
+    const readRows = (client, table) => client.$queryRawUnsafe(`SELECT to_jsonb(t) AS row FROM "${table}" t WHERE t."agencyId"=$1 ORDER BY t.id`, creatorScope.agencyId)
+      .then(rows => rows.map(row => row.row));
+    const sourceTables = ['WorkerDevice', 'JobInstance', 'AnalyticsPublication', 'AnalyticsScanProof',
+      'AnalyticsIngestBatch', 'CreatorEarningsDaily', 'AnalyticsCoverage'];
+    await scope(db, creatorScope);
+    await db.$transaction(async tx => {
+      await tx.$queryRawUnsafe("SELECT set_config('onlinod.phase2_creator_writer_generation','phase2_creator_writer_v2_actual56_postcut',true)");
+      await tx.creatorAccount.create({ data: { id: otherId, agencyId: creatorScope.agencyId, displayName: 'Zero', status: 'READY', remoteId: otherId } });
+    });
+    await seedPredecessorEarnings(db, { creatorScope, otherId, now });
+    const source = Object.fromEntries(await Promise.all(sourceTables.map(async table => [table, await readRows(db, table)])));
+    assert.ok(source.CreatorEarningsDaily.length > 1 && source.AnalyticsScanProof.some(row => row.status === 'COMMITTED'));
+    const predecessorReceipts = await db.$queryRawUnsafe('SELECT migration_name,checksum,finished_at FROM "_prisma_migrations" ORDER BY migration_name');
+    assert.equal(predecessorReceipts.length, 3);
+    await db.$disconnect();
+    await predecessor.waitForIdle();
+    console.log('UPGRADE genuine v3 schema, receipts and source data prepared; starting the production installer');
+    await new Promise((resolve, reject) => {
+      const child = require('node:child_process').spawn(process.execPath, ['scripts/database/install-current.js'], {
+        cwd: root, env: { ...process.env, DATABASE_URL: predecessor.url, DIRECT_URL: predecessor.url }, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let output = ''; child.stdout.on('data', b => { output += b; }); child.stderr.on('data', b => { output += b; });
+      const timer = setTimeout(() => child.kill('SIGTERM'), 60_000);
+      child.once('error', error => { clearTimeout(timer); reject(error); });
+      child.once('exit', code => { clearTimeout(timer); code === 0 ? resolve() : reject(Error(`Upgrade installer failed: ${output}`)); });
+    });
+    assert.equal(await db.creatorEarningsPublishedDay.count(), source.CreatorEarningsDaily.length - 1);
+    assert.equal(await db.creatorEarningsPublishedDay.count({ where: { creatorId: creatorScope.creatorId, date: new Date(key(now)) } }), 0);
+    assert.equal(await db.creatorEarningsPublishedDay.count({ where: { creatorId: otherId, totalCents: 0 } }),
+      source.CreatorEarningsDaily.filter(row => row.creatorId === otherId && row.totalCents === 0 && row.scanProofId).length);
+    const verifiedMoney = source.CreatorEarningsDaily.filter(row => row.creatorId === creatorScope.creatorId && row.scanProofId)
+      .reduce((sum, row) => sum + row.totalCents, 0);
+    assert.equal((await db.creatorEarningsPublishedDay.aggregate({ where: { creatorId: creatorScope.creatorId }, _sum: { totalCents: true } }))._sum.totalCents, verifiedMoney);
+    for (const table of ['AnalyticsScanProof', 'AnalyticsIngestBatch', 'CreatorEarningsDaily', 'AnalyticsCoverage']) {
+      assert.deepEqual(await readRows(db, table), source[table], `${table} preserved by the real upgrade`);
+    }
+    const upgradedReceipts = await db.$queryRawUnsafe('SELECT migration_name,checksum,finished_at FROM "_prisma_migrations" ORDER BY migration_name');
+    assert.deepEqual(upgradedReceipts.slice(0, predecessorReceipts.length), predecessorReceipts, 'installer preserves the complete predecessor receipt prefix');
+    assert.equal((await require(path.join(root, 'src/services/database-contract-service')).readDatabaseContract(db)).ready, true);
+  } finally { await predecessor.close(); }
+}
+
 async function main() {
+  if (process.argv.includes('--upgrade-only')) {
+    await provePublishedSnapshotUpgrade({ creatorScope: { agencyId: 'upgrade-agency', creatorId: 'upgrade-creator', userId: 'upgrade-user' },
+      otherId: 'upgrade-zero', now: new Date() });
+    pass('genuine v3-to-current installer preserves source evidence and receipts, publishes verified money/zero and excludes unverified money');
+    console.log(JSON.stringify({ ok: true, checks, mode: 'upgrade-only', runtime: 'isolated predecessor PGlite + Prisma', liveProvider: false }));
+    return;
+  }
   const { earningsHandler } = await import(pathToFileURL(path.join(desktop, 'apps/desktop/dist/electron/main/services/backend-jobs/handlers/earnings-handler.js')));
   const f = await createAdminSqlRuntime({ runtimePath: process.env.ONLINOD_SQL_PROOF_RUNTIME, maxConnections: 4 });
   try {
@@ -224,27 +320,10 @@ async function main() {
     const constraints=await lifecycle.loadForeignKeyConstraints(db);
     const cleanupPlan=lifecycle.cascadeDeletePlanFromConstraints(constraints.filter(x=>x.deleteAction==='CASCADE'),'CreatorAccount',constraints);
     assert.ok(cleanupPlan.findIndex(x=>x.tableName==='CreatorEarningsPublishedDay')<cleanupPlan.findIndex(x=>x.tableName==='AnalyticsScanProof'));
-    // Simulate upgrade from 162: remove only the new isolated table, keep the
-    // old schema's facts/proofs (including the failed current-day candidate).
-    const candidateCount=await db.creatorEarningsDaily.count();
-    await db.$disconnect();
-    await f.engine.exec('DROP TABLE "CreatorEarningsPublishedDay"');
-    await f.engine.query('DELETE FROM "_prisma_migrations" WHERE migration_name=$1',['20261016000000_earnings_published_snapshot']);
-    console.log('UPGRADE existing v3 data prepared; starting the production installer');
-    await new Promise((resolve,reject)=>{
-      const child=require('node:child_process').spawn(process.execPath,['scripts/database/install-current.js'],{
-        cwd:root,env:{...process.env,DATABASE_URL:f.url,DIRECT_URL:f.url},stdio:['ignore','pipe','pipe'],
-      });
-      let output=''; child.stdout.on('data',b=>{output+=b;}); child.stderr.on('data',b=>{output+=b;});
-      const timer=setTimeout(()=>child.kill('SIGTERM'),60_000);
-      child.once('error',error=>{clearTimeout(timer);reject(error);});
-      child.once('exit',code=>{clearTimeout(timer);code===0?resolve():reject(Error(`Upgrade installer failed: ${output}`));});
-    });
-    assert.equal(await db.creatorEarningsPublishedDay.count(),candidateCount-1);
-    assert.equal(await db.creatorEarningsDaily.count(),candidateCount);
-    assert.equal(await db.creatorEarningsPublishedDay.count({where:{creatorId:s.creatorId,date:new Date(key(now))}}),0);
-    assert.equal((await require(path.join(root,'src/services/database-contract-service')).readDatabaseContract(db)).ready,true);
-    pass('actual v3-to-v4 installer seeds verified rows only, preserves source data, rejects unverified money and passes the full schema contract');
+    // A migration proof must start from matching predecessor DDL and receipts.
+    // Keep the full-current execution fixture intact and use an isolated v3 DB.
+    await provePublishedSnapshotUpgrade({ creatorScope: s, otherId, now });
+    pass('isolated v3-to-current installer seeds verified fixture rows only, preserves source evidence and predecessor receipts, excludes unverified money and passes the full schema contract');
     assert.ok(admitted.has('analyticsPublication'));
     console.log(JSON.stringify({ ok: true, checks, plannedJobs: jobs.length, pumpTicks, admittedLanes: [...admitted], syntheticProvider: true, publicationDueTimesModified: false, runtime: 'isolated PGlite + Prisma', liveProvider: false }));
   } finally { await f.close(); }

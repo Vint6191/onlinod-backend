@@ -1,9 +1,10 @@
 "use strict";
 
 const { createHash, randomUUID } = require("node:crypto");
+const { performance } = require("node:perf_hooks");
 const { isDeepStrictEqual } = require("node:util");
 const { domainWorkFailureOutcome } = require("./domain-work-failure-policy");
-const { describeDatabaseFailure } = require("./db-retry-policy");
+const { describeDatabaseFailure, classifyDatabaseFailure } = require("./db-retry-policy");
 const { runDbTransaction } = require("./db-transaction-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const {
@@ -20,6 +21,19 @@ const DOMAIN_WORK_CLAIM_TOPOLOGY_ID = "phase3_domain_work_claim_topology_a36_v1"
 const DOMAIN_WORK_MEMBER_SCOPE_SHARD_PROBE = 32;
 const DOMAIN_WORK_MEMBER_SCOPE_CREATOR_PROBE = 16;
 const DOMAIN_DEPENDENCY_WAKE_OBJECT_TYPE = "DomainDependency";
+// These roots only reserve a bounded locator, fence one claim, or settle one
+// work item. Budget the complete sequence of SQL round trips, separately from
+// the existing five-second SQL lock/statement limits. A five-second root could
+// repeatedly expire before the mutation even when every query succeeds.
+const DOMAIN_WORK_COMMIT_OPTIONS = Object.freeze({
+  maxWait: 5000, timeout: 15000, deadlineMs: 20000, lockTimeoutMs: 5000, statementTimeoutMs: 5000,
+});
+// Physical broad claims additionally reconcile their bounded partition/shard
+// locators in the same commit. Business execution is outside these roots.
+const DOMAIN_WORK_CLAIM_COMMIT_OPTIONS = Object.freeze({
+  ...DOMAIN_WORK_COMMIT_OPTIONS, timeout: 20000, deadlineMs: 25000,
+});
+const DOMAIN_WORK_CLAIM_ADMISSION_BUDGET_MS = 15000;
 
 const WORK_CLASS = Object.freeze({
   MONEY_RESOLUTION: "MONEY_RESOLUTION",
@@ -506,14 +520,16 @@ async function reserveMemberScopeCreatorProbe({
       authorityNow,
       creatorIds: Array.from(new Set((rows || []).map((row) => clean(row?.creatorId, 180)).filter(Boolean))),
     };
-  });
+  }, DOMAIN_WORK_COMMIT_OPTIONS);
 }
 
 async function claimDomainWorkBatchInternal({
   db = null, workClass, agencyId = null, objectType = null, objectIds = null, creatorIds = null, memberScope = null, ownerToken = randomUUID(), limit = 25,
   perAgencyQuantum = 10, perPartitionQuantum = 2, leaseMs = DEFAULT_LEASE_MS, generation = DOMAIN_WORK_GENERATION, fallbackNow = new Date(),
+  monotonicNow = () => performance.now(),
 } = {}) {
   if (!db) db = require("../prisma");
+  const admissionStarted = monotonicNow();
   const klass = clean(workClass, 120);
   if (!klass) throw Object.assign(new Error("workClass is required"), { code: "DOMAIN_WORK_CLASS_REQUIRED" });
   const take = bounded(limit);
@@ -689,7 +705,7 @@ async function claimDomainWorkBatchInternal({
          RETURNING d.*`, ...params,
       );
       return { ownerToken, authorityNow, leaseUntil, items: rows || [] };
-    }).catch((error) => {
+    }, DOMAIN_WORK_COMMIT_OPTIONS).catch((error) => {
       if (typeof db?.$transaction !== "function" || !creatorLifecycleClaimContended(error)) throw error;
       // This branch has one atomic physical claim: rollback acquired nothing.
       return { ownerToken, authorityNow: null, leaseUntil: null, items: [], skipped: true,
@@ -711,8 +727,15 @@ async function claimDomainWorkBatchInternal({
     const maxTranches = Math.max(1, Math.min(384, take + DOMAIN_WORK_CLAIM_SHARD_COUNT));
     let firstAuthorityNow = null;
     let lastLeaseUntil = null;
+    let admissionError = null;
 
+    try {
     for (let attempt = 0; attempt < maxTranches && claimed.length < take; attempt += 1) {
+      // One tranche owns its agency/shard discovery AND physical claim. Finish
+      // that first bounded unit even when discovery consumed the soft slice,
+      // then return its owners instead of preclaiming until their leases expire.
+      // The existing hard tranche cap also bounds contended/corrupt locators.
+      if (attempt > 0 && monotonicNow() - admissionStarted >= DOMAIN_WORK_CLAIM_ADMISSION_BUDGET_MS) break;
       const remaining = take - claimed.length;
       const exhaustedAgencies = effectiveAgencyId
         ? (Number(claimedByAgency.get(effectiveAgencyId) || 0) >= quantum ? [effectiveAgencyId] : [])
@@ -805,7 +828,7 @@ async function claimDomainWorkBatchInternal({
             reservedAgency = clean(rows?.[0]?.agencyId, 180);
           }
           return { agencyId: reservedAgency, authorityNow };
-        });
+        }, DOMAIN_WORK_COMMIT_OPTIONS);
         
         if (agencyReservation.contended) continue;
         selectedAgency = clean(agencyReservation.agencyId, 180);
@@ -902,7 +925,7 @@ async function claimDomainWorkBatchInternal({
           return { claimShard: null, authorityNow };
         }
         return { claimShard: selectedShard, authorityNow };
-      });
+      }, DOMAIN_WORK_COMMIT_OPTIONS);
 
       
       if (shardReservation.contended) continue;
@@ -1056,7 +1079,7 @@ async function claimDomainWorkBatchInternal({
           selectedAgency,klass,String(generation),authorityNow,
         );
         return { agencyId: selectedAgency, claimShard: selectedShard, authorityNow, leaseUntil, items: rows || [] };
-      }).catch((error) => {
+      }, DOMAIN_WORK_CLAIM_COMMIT_OPTIONS).catch((error) => {
         if (!creatorLifecycleClaimContended(error)) throw error;
         // Only this short transaction rolled back. Keep every earlier committed
         // tranche visible to the executor, and suppress this shard for this pump
@@ -1088,12 +1111,20 @@ async function claimDomainWorkBatchInternal({
         suppressedShards.push({ agencyId: tranche.agencyId, claimShard: tranche.claimShard });
       }
     }
+    } catch (error) {
+      const transient = classifyDatabaseFailure(error);
+      if (!claimed.length || !transient) throw error;
+      // Earlier tranches have committed independently. A later SQL outage must
+      // not hide their owners from the executor until lease expiry. Stop new
+      // admission, return those handles, and retain a bounded failure signal.
+      admissionError = { code: transient.code };
+    }
     return {
       ownerToken,
       authorityNow: firstAuthorityNow,
       leaseUntil: lastLeaseUntil,
       items: claimed.slice(0, take),
-      
+      ...(admissionError ? { admissionError } : {}),
     };
   }
 
@@ -1201,7 +1232,7 @@ async function lockDomainWorkClaimForCommit({ db = null, item, ownerToken = null
       newerRevision: asBigInt(current.requestedRevision) > asBigInt(item.claimedRevision),
       item: { ...current, claimFence: asBigInt(current.claimFence), claimedRevision: asBigInt(current.claimedRevision), ownerToken: expectedOwner },
     };
-  });
+  }, DOMAIN_WORK_COMMIT_OPTIONS);
 }
 
 async function heartbeatDomainWorkClaim({ db = null, item, ownerToken = null, leaseMs = DEFAULT_LEASE_MS, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION } = {}) {
@@ -1215,7 +1246,7 @@ async function heartbeatDomainWorkClaim({ db = null, item, ownerToken = null, le
     const changed = await tx.domainWorkItem?.updateMany?.({ where: claimWhere(item, ownerToken, authorityNow, generation), data: { leaseUntil } });
     if (Number(changed?.count || 0) !== 1) return { renewed: false, lost: true, authorityNow };
     return { renewed: true, lost: false, authorityNow, leaseUntil };
-  });
+  }, DOMAIN_WORK_COMMIT_OPTIONS);
 }
 
 async function ackDomainWorkClaim({ db = null, item, ownerToken = null, terminalCause = null, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION } = {}) {
@@ -1255,7 +1286,7 @@ async function ackDomainWorkClaim({ db = null, item, ownerToken = null, terminal
       data: { completedRevision: asBigInt(item.claimedRevision), state: hasNewer ? STATE.READY : STATE.DONE, isOutstanding: hasNewer, availableAt: hasNewer ? authorityNow : current.availableAt, ownerToken: null, leaseUntil: authorityNow, nextAttemptAt: null, errorClass: null, lastError: null, consecutiveFailures: 0, failureRevision: 0n, lastFailureAt: null, terminalCause: hasNewer ? null : clean(terminalCause, 120), progressCursor: hasNewer ? null : current.progressCursor ?? null },
     });
     return Number(changed?.count || 0) === 1 ? { acknowledged: true, lost: false, state: hasNewer ? STATE.READY : STATE.DONE } : { acknowledged: false, lost: true };
-  });
+  }, DOMAIN_WORK_COMMIT_OPTIONS);
 }
 
 async function blockDomainWorkClaim({ db = null, item, ownerToken = null, dependencyKind, dependencyKey, dependencyRevision = 0n, reason = "DEPENDENCY_BLOCKED", fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION } = {}) {
@@ -1307,7 +1338,7 @@ async function blockDomainWorkClaim({ db = null, item, ownerToken = null, depend
       },
     });
     return Number(reopened?.count || 0) === 1 ? { blocked: false, ready: true, lost: false, newerRevision: true } : { blocked: false, lost: true };
-  });
+  }, DOMAIN_WORK_COMMIT_OPTIONS);
 }
 
 async function failDomainWorkClaim({ db = null, item, ownerToken = null, error = null, dependency = null, retryAt = null, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION } = {}) {
@@ -1357,7 +1388,7 @@ async function failDomainWorkClaim({ db = null, item, ownerToken = null, error =
     return Number(reopened?.count || 0) === 1
       ? { failed: false, superseded: true, ready: true, lost: false, retryAt: null }
       : { failed: false, lost: true };
-  });
+  }, DOMAIN_WORK_COMMIT_OPTIONS);
 }
 
 async function saveDomainWorkProgress({ db = null, item, ownerToken = null, progressCursor, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION } = {}) {
@@ -1375,7 +1406,7 @@ async function saveDomainWorkProgress({ db = null, item, ownerToken = null, prog
       ...(madeProgress ? { consecutiveFailures: 0, failureRevision: 0n, lastFailureAt: null, errorClass: null, lastError: null, terminalCause: null } : {}),
     } });
     return Number(changed?.count || 0) === 1 ? { saved: true, lost: false } : { saved: false, lost: true };
-  });
+  }, DOMAIN_WORK_COMMIT_OPTIONS);
 }
 
 async function yieldDomainWorkClaim({ db = null, item, ownerToken = null, progressCursor = undefined, availableAt = null, fallbackNow = new Date(), generation = DOMAIN_WORK_GENERATION, preserveProgressOnNewerRevision = false } = {}) {
@@ -1415,7 +1446,7 @@ async function yieldDomainWorkClaim({ db = null, item, ownerToken = null, progre
     return Number(reopened?.count || 0) === 1
       ? { yielded: true, lost: false, newerRevision: true, availableAt: authorityNow }
       : { yielded: false, lost: true };
-  });
+  }, DOMAIN_WORK_COMMIT_OPTIONS);
 }
 
 async function wakeDomainDependencyBatch({ db = null, item, limit = 100, fallbackNow = new Date() } = {}) {

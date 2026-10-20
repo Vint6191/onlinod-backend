@@ -6,7 +6,7 @@ const crypto = require("node:crypto");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { isTransientDatabaseError, classifyStoredDatabaseFailure, describeDatabaseFailure } = require("./db-retry-policy");
 
-const SUBSCRIBER_MAINTENANCE_KIND = Object.freeze({ RECOVERY: "RECOVERY", RETENTION: "RETENTION" });
+const SUBSCRIBER_MAINTENANCE_KIND = Object.freeze({ RECOVERY: "RECOVERY", RETENTION: "RETENTION", DERIVED_PLANNING: "DERIVED_PLANNING" });
 const SUBSCRIBER_MAINTENANCE_CLAIM_MS = 2 * 60 * 1000;
 const SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS = 100;
 // Pre-v25 workers charged successful continuation against the error budget.
@@ -146,8 +146,30 @@ async function claimSubscriberDirectoryMaintenanceSignal({ db, now = new Date(),
         ORDER BY s."dueAt" ASC, s."creatorId" ASC, s."kind" ASC
         FOR UPDATE OF s SKIP LOCKED
         LIMIT 1
+      ), structural_candidate AS (
+        -- One known pre-repair quarantine. The diagnostic alone is insufficient:
+        -- a live scoped publisher and its current generation authority must
+        -- independently prove this exact stranded generation. Never adopt an
+        -- unknown poison or steal an unexpired maintenance owner.
+        SELECT s."id",s."dueAt",s."creatorId",s."kind"
+        FROM "SubscriberDirectoryMaintenanceSignal" s
+        JOIN "JobInstance" j ON j."agencyId"=s."agencyId" AND j."creatorId"=s."creatorId"
+          AND j."jobKey"='subscriber_directory_scan' AND j."status"='PUBLISHING'
+        JOIN "SubscriberScanRun" r ON r."id"=j."params"->>'scanRunId' AND r."jobId"=j."id"
+          AND r."agencyId"=s."agencyId" AND r."creatorId"=s."creatorId"
+        JOIN "SubscriberDirectoryState" d ON d."creatorId"=s."creatorId" AND d."agencyId"=s."agencyId"
+        WHERE s."kind"='RECOVERY' AND s."attempts">=${SUBSCRIBER_MAINTENANCE_MAX_ATTEMPTS}
+          AND s."dueAt" <= $1 AND COALESCE(s."claimUntil",'-infinity'::timestamp) <= $1
+          AND s."lastError" ~ '^Subscriber publication generation [0-9]+ is stale behind allocated generation [0-9]+$'
+          AND r."publicationGeneration">0 AND r."publicationGeneration"<d."publicationGeneration"
+          AND r."hasMore"=false AND r."fanProjectionStatus"='COMPLETE'
+          AND r."publicationStatus" IN ('PENDING','CURRENT','PREVIOUS','FINALIZE')
+        ORDER BY s."dueAt",s."creatorId",s."kind"
+        FOR UPDATE OF s SKIP LOCKED
+        LIMIT 1
       ), eligible AS (
         SELECT * FROM normal_candidate UNION ALL SELECT * FROM legacy_candidate
+        UNION ALL SELECT * FROM structural_candidate
       ), candidate AS (
         SELECT "id" FROM eligible ORDER BY "dueAt", "creatorId", "kind" LIMIT 1
       )
@@ -161,7 +183,11 @@ async function claimSubscriberDirectoryMaintenanceSignal({ db, now = new Date(),
     `, authorityNow, claimToken, claimUntil);
     const signal = Array.isArray(rows) ? rows[0] || null : null;
     return signal ? { ...signal, claimedAt: authorityNow } : null;
-  }, { maxWait: timeoutMs, timeout: timeoutMs + 1_000 });
+  // Claim admission has several SQL round trips (kernel setup, statement cap,
+  // database clock, then SKIP LOCKED). The pump's soft slice is not a client
+  // transaction lifetime; at normal remote latency a 3s transaction could
+  // expire before returning any owner and prevent every publication callback.
+  }, { maxWait: 5_000, timeout: 15_000, lockTimeoutMs: timeoutMs, statementTimeoutMs: timeoutMs });
 }
 
 async function lockSubscriberMaintenanceClaimRow({ db, signal } = {}) {
@@ -272,10 +298,12 @@ async function ackSubscriberDirectoryMaintenanceSignal({ db, signal } = {}) {
   return Number(deleted?.count || 0) > 0;
 }
 
-async function releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now = new Date(), error = null, retryMs = 60_000 } = {}) {
+async function releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now = new Date(), error = null, retryMs = 60_000, retryAt = null } = {}) {
   if (!signal?.id || !signal?.claimToken || typeof db?.$executeRawUnsafe !== "function") return false;
   const authorityNow = await dbAuthorityNow({ db, fallbackNow: asDate(now) });
-  const retryDueAt = new Date(authorityNow.getTime() + Math.max(1_000, Math.min(15 * 60_000, Number(retryMs) || 60_000)));
+  const target = retryAt == null ? null : new Date(retryAt);
+  const delay = target && Number.isFinite(target.getTime()) ? target.getTime() - authorityNow.getTime() : Number(retryMs) || 60_000;
+  const retryDueAt = new Date(authorityNow.getTime() + Math.max(1_000, Math.min(15 * 60_000, delay)));
   const count = await db.$executeRawUnsafe(`
     UPDATE "SubscriberDirectoryMaintenanceSignal"
     SET "dueAt"=$3, "claimToken"=NULL, "claimUntil"=NULL,

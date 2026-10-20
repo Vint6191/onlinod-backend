@@ -22,9 +22,11 @@ async function getSubscriberPublicationFence({ db = null, agencyId, creatorId })
     where: {
       agencyId: scopedAgencyId,
       creatorId: scopedCreatorId,
-      hasMore: false,
-      fanProjectionStatus: "COMPLETE",
-      publicationStatus: { in: [...SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES] },
+      OR: [
+        { publicationStatus: "RECOLLECTING" },
+        { hasMore: false, fanProjectionStatus: "COMPLETE",
+          publicationStatus: { in: [...SUBSCRIBER_PUBLICATION_IN_PROGRESS_STATUSES] } },
+      ],
     },
     orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
     select: { id: true, publicationStatus: true, updatedAt: true },

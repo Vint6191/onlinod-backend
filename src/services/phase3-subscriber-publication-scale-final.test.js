@@ -72,6 +72,7 @@ function buildFixture({ failTransactionAttempt = null } = {}) {
   const staleChunkSizes = [];
   const lockCalls = [];
   let failAt = failTransactionAttempt;
+  let derivedWakes = 0;
 
   const model = {
     subscriberScanRun: {
@@ -159,6 +160,7 @@ function buildFixture({ failTransactionAttempt = null } = {}) {
       ...model,
       $queryRawUnsafe: async (sql, id) => {
         const text = String(sql);
+        if (text.includes('INSERT INTO "SubscriberDirectoryMaintenanceSignal"')) { derivedWakes++; return [{ id: 'derived-wake' }]; }
         if (text.includes('MAX(r."publicationGeneration")')) {
           return [{ maxGeneration: run.publicationGeneration, maxPublishedGeneration: state.publishedGeneration }];
         }
@@ -184,6 +186,7 @@ function buildFixture({ failTransactionAttempt = null } = {}) {
   return {
     db, run, state, previousRun, job, current, previous, projectedChunkSizes, staleChunkSizes, lockCalls,
     get txAttempts() { return txAttempts; },
+    get derivedWakes() { return derivedWakes; },
     clearFailure() { failAt = null; },
   };
 }
@@ -294,7 +297,7 @@ test("durable Subscriber publication recovery lane resumes a crashed run and rec
 });
 
 
-test("PUBLISHED Subscriber snapshot survives crash-before-job-DONE and recovery converges planning + job ledger exactly once", async () => {
+test("PUBLISHED Subscriber snapshot survives crash-before-job-DONE and recovery persists derived wake + job ledger exactly once", async () => {
   const restores = [];
   let followBackPlans = 0;
   let followAutomationPlans = 0;
@@ -329,20 +332,22 @@ test("PUBLISHED Subscriber snapshot survives crash-before-job-DONE and recovery 
 
     const first = await service.recoverSubscriberPublicationDebt({ db: fx.db, agencyId: fx.run.agencyId, creatorId: fx.run.creatorId, maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 30_000 });
     assert.equal(first.reconciledJobs, 1);
-    assert.equal(first.planningRuns, 1);
+    assert.equal(first.planningRuns, 0);
+    assert.equal(fx.derivedWakes, 1);
+    assert.equal(fx.run.summary.derivedPlanningWake.publicationGeneration, 2);
     assert.equal(fx.job.status, "DONE");
     assert.equal(fx.job.result?.recoveredPublication, true);
     assert.ok(fx.run.publicationJobReconciledAt instanceof Date);
-    assert.equal(followBackPlans, 1);
-    assert.equal(followAutomationPlans, 1);
-    assert.equal(bumpPlans, 1);
+    assert.equal(followBackPlans, 0);
+    assert.equal(followAutomationPlans, 0);
+    assert.equal(bumpPlans, 0);
 
     const second = await service.recoverSubscriberPublicationDebt({ db: fx.db, agencyId: fx.run.agencyId, creatorId: fx.run.creatorId, maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 30_000 });
     assert.equal(second.reason, "none_due", "durable reconciliation marker must remove the published run from recovery debt");
     assert.equal(second.reconciledJobs, 0);
-    assert.equal(followBackPlans, 1, "planning must not replay after marker commit");
-    assert.equal(followAutomationPlans, 1);
-    assert.equal(bumpPlans, 1);
+    assert.equal(followBackPlans, 0, "planning must not replay after marker commit");
+    assert.equal(followAutomationPlans, 0);
+    assert.equal(bumpPlans, 0);
   } finally {
     delete require.cache[servicePath];
     for (const restore of restores.reverse()) restore();
@@ -444,6 +449,7 @@ test("A21 reverse FINALIZE ordering cannot let an older Subscriber generation re
     ]);
     const state = { creatorId: "creator-1", currentRunId: null, publicationGeneration: 2, publishedGeneration: 0 };
     const db = {
+      $queryRawUnsafe: async (sql, id) => String(sql).includes('INSERT INTO "SubscriberDirectoryMaintenanceSignal"') ? [{ id: 'derived-wake' }] : (String(sql).includes('FROM "SubscriberScanRun"') ? [clone(runs.get(id))] : []),
       subscriberScanRun: {
         findUnique: async ({ where }) => clone(runs.get(where.id) || null),
         update: async ({ where, data }) => { const row = runs.get(where.id); applyData(row, data); return clone(row); },
