@@ -11,6 +11,12 @@ class FinancialReceiptError extends Error {
   constructor(code) { super(code); this.code = code; this.status = 409; this.retryable = false; }
 }
 function fault(code) { return new FinancialReceiptError(code); }
+const INVALID_CLAIM_CODES = new Set([
+  "FINANCIAL_WINDOW_END_INVALID", "FINANCIAL_WINDOWS_REQUIRED", "FINANCIAL_WINDOW_INVALID",
+  "FINANCIAL_WINDOW_BINDING_INVALID", "FINANCIAL_RESOLUTION_BINDING_INVALID", "FINANCIAL_FRONTIER_BINDING_INVALID",
+  "FINANCIAL_HEAD_WINDOW_INVALID", "FINANCIAL_HISTORY_WINDOW_INVALID", "FINANCIAL_FULL_WINDOW_INVALID",
+]);
+function invalidClaim(error) { return error instanceof FinancialReceiptError && INVALID_CLAIM_CODES.has(error.code); }
 function enabled(job) { return job?.jobKey === "financial_transactions_scan" && job.params?.financialReceiptVersion === 1; }
 function date(value) {
   if (!value) return null;
@@ -36,7 +42,14 @@ function planWindows(params, state) {
   const end = date(params.endDate) || date(params.collectionRequestedAt);
   if (!end || end < FLOOR) throw fault("FINANCIAL_WINDOW_END_INVALID");
   const mode = params.collectionMode || params.financialMode;
-  if (params.moneyResolutionVersion === 1) return [window("RESOLUTION", date(params.startDate), end)];
+  if (params.moneyResolutionVersion === 1) {
+    const from = date(params.startDate);
+    if (!from || from < FLOOR || from > end || +end - from > 3600000 || mode !== "catchup"
+        || typeof params.moneyResolutionObservationId !== "string" || !params.moneyResolutionObservationId.trim()) {
+      throw fault("FINANCIAL_RESOLUTION_BINDING_INVALID");
+    }
+    return [window("RESOLUTION", from, end)];
+  }
   if (mode !== "catchup") return [window("FULL", date(params.startDate) || FLOOR, end)];
   if (params.financialFrontierVersion === 2) return [window("FRONTIER", FLOOR, end)];
   const headFrom = new Date(Math.max(+FLOOR, +end - RECENT_DAYS * DAY));
@@ -54,7 +67,7 @@ function planWindows(params, state) {
 function windowsFor(job) {
   const windows = job.params?.financialWindows;
   if (!enabled(job) || job.params.financialWindowGeneration !== job.params.collectionGeneration || !Array.isArray(windows) || !windows.length || windows.length > 2) throw fault("FINANCIAL_WINDOWS_REQUIRED");
-  for (const w of windows) if (!["FULL", "HEAD", "GAP", "AUDIT", "FRONTIER", "RESOLUTION"].includes(w.kind) || !date(w.from) || !date(w.to) || date(w.from) > date(w.to) || String(w.initialMarker) !== String(Math.floor(+date(w.to) / 1000))) throw fault("FINANCIAL_WINDOW_INVALID");
+  for (const w of windows) if (!w || !["FULL", "HEAD", "GAP", "AUDIT", "FRONTIER", "RESOLUTION"].includes(w.kind) || !date(w.from) || !date(w.to) || date(w.from) > date(w.to) || String(w.initialMarker) !== String(Math.floor(+date(w.to) / 1000))) throw fault("FINANCIAL_WINDOW_INVALID");
   const head = windows[0], catchup = (job.params.collectionMode || job.params.financialMode) === "catchup";
   if (head.to !== date(job.params.endDate)?.toISOString() || date(head.from) < FLOOR) throw fault("FINANCIAL_WINDOW_BINDING_INVALID");
   if (job.params.moneyResolutionVersion === 1) {
@@ -86,6 +99,7 @@ async function claimParams(db, job) {
   }
   params.financialWindows = planWindows(params, state);
   params.financialWindowGeneration = params.collectionGeneration;
+  windowsFor({ ...job, params });
   return params;
 }
 function initialCursor(job, windows = windowsFor(job)) {
@@ -269,6 +283,6 @@ function evaluateCollection(state, now, freshnessMs) {
   const deferred = Boolean(base.retryAfterAt && base.retryAfterAt > now);
   return Object.freeze({ ...base, fresh: false, stale: base.proven, deferred, due: !deferred && !base.failed });
 }
-module.exports = { FinancialReceiptError, COLLECTOR, FULL_CHARTS, RECENT_DAYS, AUDIT_DAYS, HISTORY_FRESH_MS, enabled, enter, date, hash, runId,
+module.exports = { FinancialReceiptError, invalidClaim, COLLECTOR, FULL_CHARTS, RECENT_DAYS, AUDIT_DAYS, HISTORY_FRESH_MS, enabled, enter, date, hash, runId,
   planWindows, windowsFor, claimParams, initialCursor, envelope, resultFor, expectedMatches, restoreContinuation,
   beforePage, withinWindow, commitPage, commitChart, completionProof, coverageUpdate, coverageView, evaluateCollection };

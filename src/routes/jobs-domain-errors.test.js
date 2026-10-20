@@ -74,9 +74,12 @@ function notificationConflict({ replay = false } = {}) {
 test("job progress HTTP preserves domain retry policy, lease ownership and unexpected failures", async t => {
   const failures = [];
   const unhandled = [];
+  const diagnosticRows = [], log = require("../utils/logger"), previousWarn = log.warn;
+  log.warn = (message, fields) => diagnosticRows.push({ message, fields });
+  t.after(() => { log.warn = previousWarn; });
   const app = express();
   app.use(express.json());
-  app.use((req, _res, next) => { req.auth = { userId: "user" }; next(); });
+  app.use((req, _res, next) => { req.auth = { userId: "user" }; req.traceId = "test-trace-169"; next(); });
   app.use("/jobs", router);
   app.use((error, _req, res, _next) => {
     unhandled.push(error);
@@ -107,6 +110,11 @@ test("job progress HTTP preserves domain retry policy, lease ownership and unexp
       ok: false, code: "FINANCIAL_RECEIPT_PAYLOAD_CONFLICT", error: "FINANCIAL_RECEIPT_PAYLOAD_CONFLICT", retryable: false,
     });
     assert.equal(wire.retryAfter, null);
+    const observed = diagnosticRows.find(row => row.fields.error.code === "FINANCIAL_RECEIPT_PAYLOAD_CONFLICT");
+    assert.equal(observed.message, "readonly request rejected");
+    assert.equal(observed.fields.traceId, "test-trace-169");
+    assert.equal(observed.fields.jobId, "job");
+    assert.doesNotMatch(JSON.stringify(diagnosticRows), /fixture-token-long-enough|payloadHash/);
   });
 
   for (const [replay, code] of [[false, "NOTIFICATION_FRONTIER_CURSOR_MISMATCH"], [true, "NOTIFICATION_FRONTIER_PAYLOAD_CONFLICT"]]) {

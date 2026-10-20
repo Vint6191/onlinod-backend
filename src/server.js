@@ -322,6 +322,7 @@ async function startServer({ own, checkpoint }) {
   logger.info("maintenance runtime ready", maintenance);
   own("provider-gate", require("./services/of-request-gate-service").stopOfRequestGate);
   own("desktop-control", require("./services/desktop-control-events").stopDesktopControlEvents);
+  own("recovery-observations", require("./services/recovery-runtime-observer").stopRecoveryRuntimeObserver);
   // Register this owner before start, so a partial scheduler startup rolls back.
   own("scheduler", stopRecurringScheduler);
   startRecurringScheduler();

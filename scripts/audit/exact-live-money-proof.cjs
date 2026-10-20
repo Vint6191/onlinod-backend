@@ -53,13 +53,19 @@ function pass(name){results.push(name);console.log("PASS",name);}
   const planned=await resolver.processRequest(await claim());assert(planned.created);
   let job=await db.jobInstance.findUnique({where:{id:planned.jobId}});assert.equal(job.params.moneyResolutionVersion,1);
   const blocked=await resolver.processRequest(await claim());assert.equal(blocked.reason,"FINANCIAL_SCHEDULED");assert.equal(await db.jobInstance.count({where:{creatorId:s.creatorId,jobKey:"financial_transactions_scan",status:"SCHEDULED"}}),1);
-  job.params=await receipts.claimParams(db,job);assert.equal(job.params.financialWindows[0].kind,"RESOLUTION");
-  assert(Date.parse(job.params.financialWindows[0].to)-Date.parse(job.params.financialWindows[0].from)<=3600000);
+  const plannedEnd=receipts.date(job.params.endDate).toISOString();
   await db.workerDevice.create({data:{id:"resolution-device",agencyId:s.agencyId,userId:s.userId,lastSeenAt:new Date()}});
+  await db.deviceCreatorBinding.create({data:{deviceId:"resolution-device",agencyId:s.agencyId,creatorId:s.creatorId,sessionReadReady:true,lastSeenAt:new Date()}});
   await db.agency.update({where:{id:s.agencyId},data:{trialEndsAt:new Date(Date.now()+86400000)}});
-  const token="resolution-token";
-  await tx(async t=>{await receipts.enter(t);job=await t.jobInstance.update({where:{id:job.id},data:{params:job.params,status:"CLAIMED",claimedByDeviceId:"resolution-device",leaseUntil:new Date(Date.now()+600000),leaseRevision:1,leaseTokenHash:crypto.createHash("sha256").update(token).digest("hex"),leaseMemberId:member.id,leaseAccessEpoch:member.accessEpoch}});});
-  pass("resolution schedules one bounded window and respects an already active financial job");
+  const lease=require(root+"/src/services/job-lease-service");
+  const leased=await lease.claimJob({userId:s.userId,deviceId:"resolution-device",jobKeys:["financial_transactions_scan"],
+    capabilities:{creatorEventDrivenSyncV2:true,financialWindowReceiptsV1:true,financialMoneyResolutionV1:true}});
+  assert.equal(leased.job.id,job.id);
+  const token=leased.job.leaseToken;
+  job=await db.jobInstance.findUnique({where:{id:job.id}});
+  assert.equal(job.params.financialWindows[0].kind,"RESOLUTION");assert.equal(job.params.financialWindows[0].to,plannedEnd);
+  assert(Date.parse(job.params.financialWindows[0].to)-Date.parse(job.params.financialWindows[0].from)<=3600000);
+  pass("resolution schedules and actually claims one bounded window, preserving its target interval and respecting active work");
   const w=job.params.financialWindows[0],fin=require(root+"/src/services/financial-transactions-service");
   const existing=await db.$queryRawUnsafe(`SELECT * FROM "CreatorEarningsGenerationEntry" WHERE generation='baseline' AND "occurredAt" BETWEEN $1 AND $2`,new Date(w.from),new Date(w.to));
   const transactions=[...existing.map(e=>({externalTransactionId:e.transactionId,occurredAt:e.occurredAt.toISOString(),netCents:Number(e.netCents),transactionStatus:e.status})),{externalTransactionId:"resolved-tip",occurredAt:event.notificationObservation.occurredAt,netCents:800,transactionStatus:"done"}].map(e=>({...e,fanOnlyFansUserId:"42",transactionType:"tip",amountCents:1000,feeCents:1000-e.netCents,currency:"USD"}));
@@ -67,8 +73,8 @@ function pass(name){results.push(name);console.log("PASS",name);}
   await tx(t=>fin.ingestFinancialChartChunk({db:t,job,deviceId:null,chunk:{collectorVersion:receipts.COLLECTOR,scanRunId:job.params.collectionGeneration,windowIndex:0,category:"total",rangeFrom:w.from,rangeTo:w.to,grossCents:1000*transactions.length,netCents:transactions.reduce((n,e)=>n+e.netCents,0),transactionsCount:transactions.length}}));
   const receipt=await receipts.completionProof(db,job);assert(receipt.complete);
   const prep=await prepare({job,run:receipt.row});assert.equal(prep.copy,0);
-  const lease=require(root+"/src/services/job-lease-service"),publisher=require(root+"/src/services/analytics-publication-service");
-  const completion={jobId:job.id,userId:s.userId,deviceId:"resolution-device",leaseToken:token,leaseRevision:1,result:{scanRunId:job.params.collectionGeneration}};
+  const publisher=require(root+"/src/services/analytics-publication-service");
+  const completion={jobId:job.id,userId:s.userId,deviceId:"resolution-device",leaseToken:token,leaseRevision:leased.job.leaseRevision,result:{scanRunId:job.params.collectionGeneration}};
   const accepted=await lease.completeJob(completion);assert(accepted.publicationId);
   let completed;
   for(let i=0;i<5;i++){

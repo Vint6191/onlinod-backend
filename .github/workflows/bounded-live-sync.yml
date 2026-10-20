@@ -53,6 +53,15 @@ jobs:
         env:
           ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_adversarial_money
           ONLINOD_ADVERSARIAL_REPORT: live-money-adversarial-proof.json
+      - name: Create isolated database for financial worker claim liveness
+        run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_financial_claim'
+        env:
+          PGPASSWORD: fixture-only
+      - name: Historical resolution claim, receipt restart, invalid candidate isolation and rollback
+        run: node scripts/audit/financial-claim-liveness-proof.cjs
+        env:
+          ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_financial_claim
+          ONLINOD_FINANCIAL_CLAIM_REPORT: financial-claim-liveness-proof.json
       - name: Create isolated database for retention contention proof
         run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_retention'
         env:
@@ -88,6 +97,7 @@ jobs:
             bounded-live-proof.json
             exact-live-money-proof.json
             live-money-adversarial-proof.json
+            financial-claim-liveness-proof.json
             team-ledger-retention-proof.json
             event-participant-ingest-proof.json
             subscriber-publication-liveness-proof.json

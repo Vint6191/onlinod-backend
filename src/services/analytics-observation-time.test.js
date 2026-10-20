@@ -58,6 +58,28 @@ for (const type of ["NOTIFICATIONS", "FINANCIAL"]) test(`${type} first claim aft
   if (type === "FINANCIAL") assert.equal(stampUnstartedCollectionObservation({ ...queued, params: { ...queued.params, financialWindowGeneration: "generation" } }, now), null);
 });
 
+test("historical money resolution first claim stamps read time but preserves its exact bounded interval", async () => {
+  const receipts = require("./financial-receipt-authority");
+  const queued = job("FINANCIAL", "catchup");
+  queued.jobKey = "financial_transactions_scan";
+  Object.assign(queued.params, { moneyResolutionVersion: 1, moneyResolutionObservationId: "pending-event",
+    startDate: new Date(+old - hour).toISOString(), endDate: "2026-09-28 12:00:00", initialMarker: +old / 1000 });
+  const before = structuredClone(queued);
+  const params = stampUnstartedCollectionObservation(queued, now);
+  for (const field of ["startDate", "endDate", "initialMarker", "collectionGeneration", "collectionAuthorityRequestedAt"])
+    assert.deepEqual(params[field], before.params[field]);
+  assert.equal(params.analyticsObservationStartedAt, now.toISOString());
+  const claimed = { ...queued, params: await receipts.claimParams({ creatorFinancialCollectionState: { findUnique: async () => null } }, { ...queued, params }) };
+  const [window] = receipts.windowsFor(claimed);
+  assert.equal(window.kind, "RESOLUTION");
+  assert.equal(+new Date(window.to) - new Date(window.from), hour);
+  assert.equal(window.to, old.toISOString());
+  assert.equal(stampUnstartedCollectionObservation({ ...claimed, startedAt: now }, new Date(+now + hour)), null);
+  assert.equal(stampUnstartedCollectionObservation({ ...claimed, continuation: receipts.initialCursor(claimed) }, new Date(+now + hour)), null);
+  assert.equal(stampUnstartedCollectionObservation(claimed, new Date(+now + hour)), null);
+  assert.deepEqual(queued, before);
+});
+
 test("physical observation does not follow logical ordering or client payload time", () => {
   const params = stampCollectionAuthorityParams({ collectionType: "CAMPAIGNS" }, old, now);
   assert.equal(params.collectionAuthorityRequestedAt, new Date(+now + 1).toISOString());

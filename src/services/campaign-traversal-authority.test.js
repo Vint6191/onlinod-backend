@@ -56,8 +56,8 @@ test("missing expected continuation fails closed; initial empty envelope is cano
 test("the jobs route reports traversal conflicts as 409 without masking unrelated errors",()=>{
   const source=fs.readFileSync(path.join(__dirname,"../routes/jobs.js"),"utf8");
   const body=source.slice(source.indexOf("function leaseError("),source.indexOf("const deviceSchema"));
-  const respond=new Function("JobLeaseError","CampaignTraversalError","FinancialReceiptError","FanDataObservationBoundaryError","return ("+body+")")(
-    class JobLeaseError extends Error {},authority.CampaignTraversalError,require("./financial-receipt-authority").FinancialReceiptError,require("./fan-data-authority-service").FanDataObservationBoundaryError);
+  const respond=new Function("JobLeaseError","CampaignTraversalError","FinancialReceiptError","FanDataObservationBoundaryError","observeLeaseRejection","return ("+body+")")(
+    class JobLeaseError extends Error {},authority.CampaignTraversalError,require("./financial-receipt-authority").FinancialReceiptError,require("./fan-data-authority-service").FanDataObservationBoundaryError,()=>{});
   const response={statusCode:null,body:null,status(code){this.statusCode=code;return this;},json(body){this.body=body;return this;}};
   let conflict;try{authority.expectedMatches(fixture().job,undefined);}catch(error){conflict=error;}
   respond(response,conflict);

@@ -1619,6 +1619,7 @@ async function recoverSubscriberPublicationDebt({
   let derivedPlanningWakes = 0;
   let stateRepairs = 0;
   let budgetExhausted = false;
+  let lastStep = null;
   // A unit includes its discovery/preparation AND either one publication page
   // or final source reconciliation. Preparation alone is not progress. Admit
   // the first unit even on a slow connection; the soft clock gates later units.
@@ -1640,7 +1641,8 @@ async function recoverSubscriberPublicationDebt({
   };
   if (repair?.replacement?.replaced) return {
     ok: true, recoveredRuns: 0, advancedSteps: 0, reconciledJobs: 0, planningRuns: 0,
-    recollectedRuns: 1, replacementJobId: repair.replacement.job.id, stateRepairs,
+    recollectedRuns: 1, replacementJobId: repair.replacement.job.id,
+    replacementRunId: repair.replacement.run?.id || null, recoveryCause: repair.replacement.cause || null, stateRepairs,
     reason: "publication_recollection_scheduled",
   };
 
@@ -1689,6 +1691,14 @@ async function recoverSubscriberPublicationDebt({
         }, { maxWaitMs: 1_000, timeoutMs: 45_000, maintenanceSignal });
         advancedSteps += 1;
         completedUnits += 1;
+        lastStep = {
+          runId: candidate.id, jobId: candidate.jobId || null,
+          phase: result?.phase || result?.run?.publicationStatus || null,
+          generation: Number(result?.run?.publicationGeneration || candidate.publicationGeneration || 0),
+          cursorId: result?.run?.publicationCursorId || null,
+          processedRows: Number(result?.processed || 0),
+          completedAt: result?.run?.publicationCompletedAt || null,
+        };
         if (result?.complete) {
           recoveredRuns += 1;
           completeResult = result;
@@ -1709,6 +1719,12 @@ async function recoverSubscriberPublicationDebt({
           maxWaitMs: 2_000, timeoutMs: 45_000, maintenanceSignal,
         })
       : await publicationTransaction(db, agency, creator, reconcile);
+    lastStep = {
+      runId: publishedRun.id, jobId: publishedRun.jobId || null,
+      phase: publishedRun.publicationStatus || null,
+      generation: Number(publishedRun.publicationGeneration || 0),
+      reconciliation: reconciled.reason || null,
+    };
     if (reconciled.derivedPlanningWake) derivedPlanningWakes += 1;
     completedUnits += 1;
     if (reconciled.reconciled) reconciledJobs += 1;
@@ -1725,6 +1741,7 @@ async function recoverSubscriberPublicationDebt({
     derivedPlanningWakes,
     stateRepairs,
     budgetExhausted,
+    lastStep,
     reason: reconciledJobs ? "reconciled" : (recoveredRuns ? "recovered" : (advancedSteps ? "advanced" : (budgetExhausted ? "budget_exhausted" : "none_due"))),
   };
 }
@@ -1996,6 +2013,8 @@ module.exports = {
   recoverSubscriberPublicationDebt,
   repairSubscriberDirectoryStateGeneration,
   hasSubscriberPublicationDebt,
+  subscriberPublicationDebtWhere,
+  subscriberRecollectionCause,
   cleanupSubscriberScanHistory,
   getSubscriberDirectoryStatus,
   listHiddenOnline,

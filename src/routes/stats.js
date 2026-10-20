@@ -256,6 +256,10 @@ router.get("/creators/:creatorId/overview-v2", requireCampaignReadVersion, async
       return res.status(400).json({ ok: false, code: "INVALID_OVERVIEW_RANGE", error: `Invalid overview range: ${String(req.query.range || "")}` });
     }
     const overview = await readStatsSnapshot(req, ctx, ({ db }) => readCreatorOverview({ db, creatorId: ctx.creator.id, rangeKey }));
+    require("../services/recovery-runtime-observer").observeRecoveryRuntime({
+      db: prisma, agencyId: ctx.creator.agencyId, creatorId: ctx.creator.id,
+      traceId: req.traceId, startupTraceId: req.startupTraceId, trigger: "overview-v2",
+    });
     return res.json(overview);
   } catch (error) {
     console.error("[stats/overview-v2] failed:", error);
@@ -269,6 +273,10 @@ router.get("/creators/:creatorId/current-task", async (req, res) => {
     if (!ctx) return;
     if (!requireEarningsPermission(res, ctx.member)) return;
     const task = await readStatsSnapshot(req, ctx, ({ db }) => readCreatorCurrentTask({ db, creatorId: ctx.creator.id }));
+    require("../services/recovery-runtime-observer").observeRecoveryRuntime({
+      db: prisma, agencyId: ctx.creator.agencyId, creatorId: ctx.creator.id, jobId: task?.id,
+      traceId: req.traceId, startupTraceId: req.startupTraceId, trigger: "current-task",
+    });
     return res.json({ ok: true, creatorId: ctx.creator.id, task });
   } catch (error) {
     console.error("[stats/current-task] failed:", error);

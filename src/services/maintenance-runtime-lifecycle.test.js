@@ -58,6 +58,7 @@ function serverHarness({brokenStop=false,badExternal=false}={}){
    if(name==='./services/maintenance-runtime-contract')return{verifyMaintenanceRuntime(){calls.push('verify');return ready.promise;}};
    if(name==='./services/of-request-gate-service')return{stopOfRequestGate(){}};
    if(name==='./services/desktop-control-events')return{stopDesktopControlEvents(){}};
+   if(name==='./services/recovery-runtime-observer')return{stopRecoveryRuntimeObserver(){}};
    if(name==='node:http')return{createServer(){const server=new EventEmitter();server.listening=false;server.listen=(_port,callback)=>{server.listening=true;calls.push('listen');callback();};server.close=callback=>{calls.push('close');close=()=>{server.listening=false;callback();};};return server;}};
    const method=name.includes('dialog-module')?'startDialogControlWorker':name.includes('auth-mail')?'startAuthMailWorker':'startAdminDiagnostics';
    return{[method](){return()=>{calls.push(method+'-stop');if(brokenStop&&method==='startAdminDiagnostics')throw Error('controlled stop failure');};}};

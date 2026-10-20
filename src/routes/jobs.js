@@ -20,6 +20,7 @@ const {
 
 const { FinancialReceiptError } = require("../services/financial-receipt-authority");
 const { FanDataObservationBoundaryError } = require("../services/fan-data-authority-service");
+const { emitRuntimeDiagnostic, diagnosticError } = require("../services/runtime-diagnostic-log");
 const router = express.Router();
 
 const JOB_SERVER_CAPABILITIES = Object.freeze({
@@ -69,13 +70,27 @@ function validationError(res, error) {
   });
 }
 
+function observeLeaseRejection(res, error) {
+  const req = res.req;
+  const operation = req?.route?.path || "job-operation";
+  const deviceId = req?.auth?.deviceId || req?.body?.deviceId || null;
+  const jobId = req?.params?.id || null;
+  emitRuntimeDiagnostic("readonly request rejected", `${operation}:${jobId || deviceId}:${error.code}`, {
+    operation, jobId, deviceId, agencyId: req?.auth?.agencyId || null,
+    traceId: req?.traceId || null, startupTraceId: req?.startupTraceId || null,
+    status: error.status || 409, error: diagnosticError(error), retryable: error.retryable === true,
+  });
+}
+
 function leaseError(res, error) {
   // A rejected canonical observation is a typed client/domain failure, never an
   // opaque retryable 500. Do not expose profile values or authority digests.
   if (error instanceof FanDataObservationBoundaryError) {
+    observeLeaseRejection(res, error);
     return res.status(error.status).json({ ok: false, code: error.code, error: error.message, retryable: false });
   }
   if (error instanceof JobLeaseError || error instanceof CampaignTraversalError || error instanceof FinancialReceiptError || (error?.status===409 && String(error?.code || "").startsWith("NOTIFICATION_FRONTIER_"))) {
+    observeLeaseRejection(res, error);
     if (error.retryAfterMs) res.set("Retry-After", String(Math.max(1, Math.ceil(error.retryAfterMs / 1000))));
     return res.status(error.status || 409).json({
       ok: false,
@@ -88,6 +103,7 @@ function leaseError(res, error) {
   }
   throw error;
 }
+
 
 const deviceSchema = z.string().min(1).max(200);
 const tokenSchema = z.string().min(20).max(500);
@@ -210,6 +226,13 @@ router.post("/claim", async (req, res, next) => {
       dialogDiscoveryOnly: input.dialogDiscoveryOnly === true,
       capabilities: input.capabilities,
     });
+    emitRuntimeDiagnostic("readonly claim result", `${input.deviceId}:${claimed.reason || "unknown"}`, {
+      deviceId: input.deviceId, traceId: req.traceId, startupTraceId: req.startupTraceId,
+      reason: claimed.reason || null, jobId: claimed.job?.id || null, jobKey: claimed.job?.jobKey || null,
+      creatorId: claimed.job?.creatorId || null, agencyId: claimed.job?.agencyId || req.auth?.agencyId || null,
+      leaseUntil: claimed.job?.leaseUntil || null, requestedJobKeys: input.jobKeys.length,
+      excludedCreators: input.excludedCreatorIds?.length || 0,
+    }, { level: "info" });
     return res.json({ ok: true, ...claimed, serverCapabilities: { ...JOB_SERVER_CAPABILITIES, legacyStorageRetirementV1: true } });
   } catch (error) {
     if (error instanceof z.ZodError) return validationError(res, error);

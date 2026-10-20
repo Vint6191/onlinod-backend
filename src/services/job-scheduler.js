@@ -28,6 +28,7 @@ const prisma = require("../prisma");
 const { runRetentionSweep, getRetentionSettings } = require("./retention-service");
 const { selectPhase2MaintenanceLanes } = require("./phase2-maintenance-admission-service");
 const { createMaintenanceHealth, maintenanceDegradedDetails } = require("./maintenance-health-service");
+const maintenanceProgress = require("./maintenance-progress-diagnostics").createMaintenanceProgressDiagnostics();
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { ensureSubscriberScanDue } = require("./subscriber-directory-service");
 const { ensureAutomaticFollowBack } = require("./follow-back-service");
@@ -2207,7 +2208,11 @@ async function runRecurringCreatorWork({
  * between hourly top-level sweeps; leases make restart/takeover safe.
  */
 async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) {
+  // The timer still observes a hung/admission-blocked pump while its previous
+  // promise is pending. No extra database work or separate timer is needed.
+  maintenanceProgress.observe();
   if (phase2MaintenancePromise) return { ok: true, skipped: true, reason: "local_overlap" };
+  maintenanceProgress.begin();
   phase2MaintenancePromise = (async () => {
     // Phase6: durable per-class dispatch progress; domain claims/leases remain
     // inside each lane. A process restart cannot reset the fleet to a clock phase.
@@ -2216,10 +2221,12 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
       db, laneNames: [...lanes.keys()], lanesPerTick: PHASE2_MAINTENANCE_LANES_PER_TICK,
     });
     const selected = admission.selected.map(name => [name, lanes.get(name)]);
+    maintenanceProgress.admitted(admission.selected);
     const result = { ok: true, admission };
     // Sequential admission deliberately avoids a fixed Promise.all connection burst. Every
     // admitted lane executes one already-bounded work unit, then yields to the next lane.
     for (const [name, run] of selected) {
+      maintenanceProgress.startLane(name);
       try {
         const laneResult = await require("./maintenance-blocked-work-service").withBlockedWorkHealth({
           db, lane: name, result: await run(),
@@ -2230,10 +2237,12 @@ async function runPhase2MaintenancePump({ db = prisma, now = new Date() } = {}) 
         result.ok = false;
         result[name] = { ok: false, reason: String(error?.code || "maintenance_lane_crashed").slice(0, 240), error: String(error?.message || error).slice(0, 500) };
       }
+      maintenanceProgress.finishLane(name, result[name]);
     }
     return result;
   })();
-  try { return await phase2MaintenancePromise; }
+  try { const result = await phase2MaintenancePromise; maintenanceProgress.finish(); return result; }
+  catch (error) { maintenanceProgress.finish(error); throw error; }
   finally { phase2MaintenancePromise = null; }
 }
 
@@ -2394,6 +2403,7 @@ function getRecurringSchedulerHealthSnapshot() {
     ...(analyticsDemandHealth.status === "DEGRADED" ? { status: "DEGRADED", lastReason: analyticsDemandHealth.lastReason } : {}),
     ...(maintenance.status === "DEGRADED" ? { status: "DEGRADED", lastReason: maintenance.lastReason } : {}),
     maintenance,
+    maintenanceProgress: maintenanceProgress.snapshot(),
     analyticsDemand: { ...analyticsDemandHealth },
     campaignProjection: campaignProjectionExecutor?.snapshot() || null,
     analyticsHot: analyticsHotExecutor?.snapshot() || null,

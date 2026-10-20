@@ -2,6 +2,8 @@
 const { performance } = require("node:perf_hooks");
 const { runDbTransaction } = require("./db-transaction-service");
 const { publishDomainWork } = require("./domain-work-authority-service");
+const { emitRuntimeDiagnostic } = require("./runtime-diagnostic-log");
+const { safeSubscriberDiagnosticError } = require("./subscriber-recovery-diagnostics");
 
 const {
   recoverSubscriberPublicationDebt,
@@ -80,14 +82,22 @@ async function runSubscriberDirectoryMaintenance({
 
   function recordError(error, signal = null) {
     totals.errors += 1;
+    const diagnostic = safeSubscriberDiagnosticError(error);
+    emitRuntimeDiagnostic("subscriber recovery error", `${signal?.creatorId || "admission"}:${signal?.kind || "claim"}`, {
+      agencyId: signal?.agencyId || null, creatorId: signal?.creatorId || null,
+      signalId: signal?.id || null, kind: signal?.kind || null,
+      revision: Number(signal?.revision || 0), attempts: Number(signal?.attempts || 0),
+      claimUntil: signal?.claimUntil || null, error: diagnostic,
+    });
     if (totals.errorDetails.length < 5) {
       totals.errorDetails.push({
         signalId: signal?.id || null,
         agencyId: signal?.agencyId || null,
         creatorId: signal?.creatorId || null,
         kind: signal?.kind || null,
-        code: error?.code || null,
-        message: String(error?.message || error || "subscriber_maintenance_error").slice(0, 500),
+        code: diagnostic?.code || null,
+        message: diagnostic?.category || "RECORDED_FAILURE",
+        fingerprint: diagnostic?.fingerprint || null,
       });
     }
   }
@@ -109,7 +119,7 @@ async function runSubscriberDirectoryMaintenance({
     } catch (error) {
       if (error?.code === "SUBSCRIBER_MAINTENANCE_CLAIM_STALE") {
         totals.contended += 1;
-        return;
+        return { reason: "claim_stale" };
       }
       throw error;
     }
@@ -120,8 +130,8 @@ async function runSubscriberDirectoryMaintenance({
     const debtRemains = await hasSubscriberPublicationDebt({ db, agencyId: signal.agencyId, creatorId: signal.creatorId });
     if (debtRemains) {
       // More bounded work is a continuation, not a failed attempt.
-      await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, retryMs: 2_000, retryAt: result?.retryAt || null });
-      return;
+      const released = await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, retryMs: 2_000, retryAt: result?.retryAt || null });
+      return { ...result, debtRemains, signalReleased: Boolean(released) };
     }
     await signalSubscriberDirectoryMaintenance({
       db,
@@ -130,7 +140,8 @@ async function runSubscriberDirectoryMaintenance({
       kind: SUBSCRIBER_MAINTENANCE_KIND.RETENTION,
       reason: "RECOVERY_CONVERGED",
     });
-    await ackSubscriberDirectoryMaintenanceSignal({ db, signal });
+    const acknowledged = await ackSubscriberDirectoryMaintenanceSignal({ db, signal });
+    return { ...result, debtRemains, signalAcknowledged: Boolean(acknowledged) };
   }
 
   async function processRetention(signal) {
@@ -175,25 +186,48 @@ async function runSubscriberDirectoryMaintenance({
 
   async function processSignal(signal) {
     const remainingMs = budgetMs - (monotonicNow() - started);
+    const unitStarted = monotonicNow();
+    const diagnosticScope = {
+      signalId: signal.id, agencyId: signal.agencyId, creatorId: signal.creatorId,
+      kind: signal.kind, revision: Number(signal.revision || 0), attempts: Number(signal.attempts || 0),
+      claimUntil: signal.claimUntil || null,
+    };
+    if (signal.kind !== SUBSCRIBER_MAINTENANCE_KIND.RETENTION) {
+      emitRuntimeDiagnostic("subscriber recovery started", `${signal.creatorId}:${signal.kind}`, diagnosticScope, { level: "info" });
+    }
     // Claim admission already reserved one bounded unit. Network/lock latency
     // may use the soft slice, but must not turn every owned unit into a no-op.
     try {
+      let observed = null;
       if (signal.kind === SUBSCRIBER_MAINTENANCE_KIND.RECOVERY) {
         totals.recoverySignals += 1;
-        await processRecovery(signal, remainingMs);
+        observed = await processRecovery(signal, remainingMs);
       } else if (signal.kind === SUBSCRIBER_MAINTENANCE_KIND.DERIVED_PLANNING) {
         totals.derivedPlanningSignals += 1;
-        await dispatchSubscriberDerivedPlanning({ db, signal });
+        observed = await dispatchSubscriberDerivedPlanning({ db, signal });
       } else if (signal.kind === SUBSCRIBER_MAINTENANCE_KIND.RETENTION) {
         totals.retentionSignals += 1;
         await processRetention(signal);
       } else {
         throw Object.assign(new Error(`Unknown Subscriber maintenance signal kind ${signal.kind}`), { code: "SUBSCRIBER_MAINTENANCE_KIND_INVALID" });
       }
+      if (observed) emitRuntimeDiagnostic("subscriber recovery step", `${signal.creatorId}:${signal.kind}:${observed.lastStep?.phase || observed.reason || "dispatched"}`, {
+        ...diagnosticScope, durationMs: Math.round(monotonicNow() - unitStarted),
+        reason: observed.reason || (observed.dispatched ? "derived_planning_dispatched" : "processed"),
+        advancedSteps: Number(observed.advancedSteps || 0), recoveredRuns: Number(observed.recoveredRuns || 0),
+        reconciledJobs: Number(observed.reconciledJobs || 0), stateRepairs: Number(observed.stateRepairs || 0),
+        debtRemains: observed.debtRemains ?? null, signalReleased: observed.signalReleased ?? null,
+        signalAcknowledged: observed.signalAcknowledged ?? null, retryAt: observed.retryAt || null,
+        replacementJobId: observed.replacementJobId || null, replacementRunId: observed.replacementRunId || null,
+        recoveryCause: observed.recoveryCause || null, workId: observed.workId || null,
+        lastStep: observed.lastStep || null,
+      }, { level: "info" });
       totals.processedSignals += 1;
     } catch (error) {
       recordError(error, signal);
-      await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, error, retryMs: 60_000 }).catch(() => null);
+      await releaseSubscriberDirectoryMaintenanceSignal({ db, signal, now, error, retryMs: 60_000 }).catch(releaseError => {
+        recordError(releaseError, signal);
+      });
     }
   }
 
@@ -256,7 +290,7 @@ async function runSubscriberDirectoryMaintenance({
     poisonedSignals,
     poisonedSample: poisonedSample.map((row) => ({
       id: row.id, agencyId: row.agencyId, creatorId: row.creatorId, kind: row.kind,
-      attempts: row.attempts, dueAt: row.dueAt, lastError: row.lastError,
+      attempts: row.attempts, dueAt: row.dueAt, lastError: safeSubscriberDiagnosticError(row.lastError),
     })),
     claimedSlots: reserved,
     concurrency: workerCount,

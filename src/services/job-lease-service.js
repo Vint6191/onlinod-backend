@@ -606,6 +606,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   const capacityBlockedIds = [];
   const fanRefreshBlockedCreatorIds = [];
   let fanRefreshGlobalBlocked = false;
+  let rejectedFinancialClaims = 0;
   for (let race = 0; race < 20; race += 1) {
     const candidateWhere = claimCandidateWhere({
       allowedJobKeys,
@@ -623,7 +624,8 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       where: candidateWhere,
       orderBy: [{ priority: "desc" }, { nextRunAt: "asc" }],
     });
-    if (!candidate) return { job: null, reason: "no-work" };
+    if (!candidate) return { job: null, reason: rejectedFinancialClaims ? "invalid-financial-command" : "no-work",
+      ...(rejectedFinancialClaims ? { rejectedFinancialClaims } : {}) };
     if (!liveSync.admitsJob(candidate)) {
       await prisma.jobInstance.updateMany({where:{id:candidate.id,status:"SCHEDULED"},data:{status:"CANCELLED",completedAt:now,lastError:"superseded_by_event_driven_policy"}});
       continue;
@@ -705,8 +707,27 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       if (candidate.jobKey === "financial_transactions_scan") {
         const authority = require("./financial-receipt-authority");
         await authority.enter(db);
-        attemptClaimData.params = await authority.claimParams(db, { ...candidate, params: attemptClaimData.params || candidate.params });
-        attemptClaimData.continuation = await authority.restoreContinuation(db, { ...candidate, params: attemptClaimData.params });
+        try {
+          attemptClaimData.params = await authority.claimParams(db, { ...candidate, params: attemptClaimData.params || candidate.params });
+          attemptClaimData.continuation = await authority.restoreContinuation(db, { ...candidate, params: attemptClaimData.params });
+        } catch (error) {
+          // Only deterministic command/window validation is isolated. A database
+          // or ownership error must still abort the transaction. The exact job
+          // is locked and authorized above; no receipt, window or money fact is
+          // rewritten to make invalid work appear successful.
+          if (!authority.invalidClaim(error)) throw error;
+          const rejected = await db.jobInstance.updateMany({
+            where: { id: candidate.id, agencyId: candidate.agencyId, creatorId: candidate.creatorId,
+              status: "SCHEDULED", leaseRevision: candidate.leaseRevision },
+            data: { status: "FAILED", completedAt: claimNow, lastError: error.code,
+              result: { ...object(candidate.result), failure: { code: error.code, phase: "CLAIM_ADMISSION", retryable: false } },
+              claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null,
+              leaseRevision: { increment: 1 } },
+          });
+          if (!rejected.count) return null;
+          await recordJobFailure({ db, job: candidate, error: error.code, terminal: true });
+          return { __invalidFinancialClaim: true, code: error.code };
+        }
       }
       const updated = await db.jobInstance.updateMany({
         where: {
@@ -751,6 +772,17 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       }
       throw error;
     }
+    if (claimed?.__invalidFinancialClaim === true) {
+      require("./runtime-diagnostic-log").emitRuntimeDiagnostic("readonly claim candidate rejected", candidate.id + ":" + claimed.code, {
+        agencyId: candidate.agencyId, creatorId: candidate.creatorId, jobId: candidate.id, jobKey: candidate.jobKey,
+        errorCode: claimed.code, action: "failed_invalid_candidate", moneyResolution: candidate.params?.moneyResolutionVersion === 1,
+        sourceFromAt: require("./financial-receipt-authority").date(candidate.params?.startDate)?.toISOString() || null,
+        sourceToAt: require("./financial-receipt-authority").date(candidate.params?.endDate)?.toISOString() || null,
+        startedAt: candidate.startedAt?.toISOString() || null,
+      });
+      rejectedFinancialClaims++;
+      continue;
+    }
     if (claimed?.__campaignDirectoryCapacityBlocked === true) {
       capacityBlockedIds.push(candidate.id);
       continue;
@@ -772,7 +804,8 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       reason: "claimed",
     };
   }
-  return { job: null, reason: capacityBlockedIds.length ? "campaign-directory-capacity" : (fanRefreshGlobalBlocked || fanRefreshBlockedCreatorIds.length ? "fan-data-refresh-capacity" : "race-lost") };
+  return { job: null, reason: rejectedFinancialClaims ? "invalid-financial-command" : (capacityBlockedIds.length ? "campaign-directory-capacity" : (fanRefreshGlobalBlocked || fanRefreshBlockedCreatorIds.length ? "fan-data-refresh-capacity" : "race-lost")),
+    ...(rejectedFinancialClaims ? { rejectedFinancialClaims } : {}) };
 }
 async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired = false, db = prisma, lock = false, nowait = false }) {
   const { device } = await requireOwnedDevice({ userId, deviceId, db });

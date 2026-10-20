@@ -111,7 +111,9 @@ async function runSweep({db,limit=2,maxRuntimeMs=2000}={}) {
   const report={ok:true,processed:0,created:0,failed:0,adopted:await adoptPage(db)},start=performance.now();
   const claim=await work.claimDomainWorkBatch({db,workClass:WORK_CLASS,limit:Math.min(8,limit),perAgencyQuantum:2,perPartitionQuantum:1});
   for(const item of claim.items||[]) {
-    if(performance.now()-start>=maxRuntimeMs) {await work.yieldDomainWorkClaim({db,item,ownerToken:claim.ownerToken});continue;}
+    // Admission can consume the soft slice on a slow database. Execute the
+    // first owned unit so every sweep cannot claim then yield the same debt.
+    if(report.processed+report.failed>0 && performance.now()-start>=maxRuntimeMs) {await work.yieldDomainWorkClaim({db,item,ownerToken:claim.ownerToken});continue;}
     try {const result=await processRequest({db,item,ownerToken:claim.ownerToken});report.processed++;report.created+=result.created?1:0;}
     catch(error){report.ok=false;report.failed++;await work.failDomainWorkClaim({db,item,ownerToken:claim.ownerToken,error});}
   }

@@ -33,6 +33,11 @@ function stampUnstartedCollectionObservation(job, authorityNow) {
   if (type === 'FINANCIAL' && params.financialWindowGeneration) return null;
   const stamped = stampObservationStart(params, authorityNow), at = date(authorityNow);
   if (type === 'NOTIFICATIONS') stamped.to = new Date(+at + 5 * 60_000).toISOString();
+  // Resolution is a specific historical event window, not a rolling catch-up.
+  // Advancing its end to claim time widens a valid hour into days and makes the
+  // highest-priority scheduled job poison every subsequent worker claim. Keep
+  // the command's immutable source interval; only the physical read starts now.
+  else if (params.moneyResolutionVersion === 1) return stamped;
   else {
     stamped.initialMarker = Math.floor(+at / 1000);
     stamped.endDate = new Date(stamped.initialMarker * 1000).toISOString().slice(0, 19).replace('T', ' ');
