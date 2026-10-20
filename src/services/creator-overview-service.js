@@ -62,6 +62,7 @@ const JOB_LABELS = Object.freeze({
 
 function jobLabel(jobKey, params = {}) {
   if (jobKey === "dialog_intelligence_scan" && ["targeted", "reconcile"].includes(params.mode)) return "Message reconciliation";
+  if (jobKey === "financial_transactions_scan" && params.moneyResolutionVersion === 1) return "Transaction verification";
   const base = JOB_LABELS[jobKey] || String(jobKey || "Background task").replaceAll("_", " ");
   const syncKind = text(params.analyticsSyncKind, 40);
   const mode = text(params.financialMode || params.campaignMode || params.notificationMode, 40);

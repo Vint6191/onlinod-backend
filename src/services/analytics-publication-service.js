@@ -101,6 +101,11 @@ async function lockDomain(db, job) {
 
 async function currentGeneration(db, job) {
   if (job.jobKey === "fetch_earnings") return true;
+  if (require("./money-resolution-authority").targeted(job)) {
+    // A main catch-up can advance independently. An obsolete targeted request
+    // is a rejected authority, not a successfully superseded money publication.
+    return require("./money-resolution-authority").assertMoneyResolutionAuthority(db, job);
+  }
   const type = job.jobKey === "fetch_campaigns" ? COLLECTOR_TYPES.CAMPAIGNS : COLLECTOR_TYPES.FINANCIAL;
   const command = collectionCommand(job, type);
   const state = await (type === COLLECTOR_TYPES.CAMPAIGNS ? db.creatorCampaignCollectionState : db.creatorFinancialCollectionState)
@@ -266,7 +271,9 @@ async function settle(db, job, row, sideEffect, now, { forceTerminal = false } =
   const earningsDetail = job.jobKey === "fetch_earnings" && !complete
     ? `EARNINGS_DAILY_INCOMPLETE: ${Number(daily.dailyObservedCount || 0)} accepted, ${Number(daily.dailyRejected || 0)} rejected; ${JSON.stringify(daily.dailyRejectionReasons || {})}; source=${String(daily.dailySource || "unknown")}; chartCents=${sideEffect?.dailyLedger?.proof?.chartTotalCents ?? "unknown"}; storedCents=${sideEffect?.dailyLedger?.proof?.persistedTotalCents ?? "unknown"}; collector=${String(row.payload?.collectorVersion || "unknown")}; points=${Number(daily.dailyPointCount || 0)}; uniquePoints=${Number(daily.dailyUniquePointCount || 0)}; rejectedTimes=${JSON.stringify(rejectedTimes)}`
     : null;
-  const failureReason = String([sideEffect?.error, earningsDetail].filter(Boolean).join("; ") || `${job.jobKey}_partial`).slice(0, 2000);
+  const financialVerification = job.jobKey === "financial_transactions_scan"
+    ? require("./financial-verification-diagnostics").financialVerificationDiagnostics(sideEffect) : null;
+  const failureReason = String([sideEffect?.error, earningsDetail, financialVerification?.reasons?.[0]].filter(Boolean).join("; ") || `${job.jobKey}_partial`).slice(0, 2000);
   const protocolSuperseded = !complete && ((job.jobKey === "fetch_campaigns" && sideEffect?.completion?.protocolCurrent === false)
     || (job.jobKey === "financial_transactions_scan" && sideEffect?.protocolCurrent === false));
   const attempts = Number(job.attempts || 0) + (!complete && !protocolSuperseded ? 1 : 0);
@@ -302,7 +309,7 @@ async function runAnalyticsPublicationUnit({ db, publicationId, claim = null }) 
   const candidate = await db.analyticsPublication.findUnique({ where: { id: publicationId } });
   const jobId = candidate?.jobId;
   if (!candidate || candidate.state !== "PENDING") return candidate ? response(candidate) : { skipped: true };
-  return runRootCommit(db, async ({ tx }) => {
+  const result = await runRootCommit(db, async ({ tx }) => {
     const perform = async () => {
     const lifecycle = await lockAgencyLifecycleBarrier({ db: tx, agencyId: candidate.agencyId });
     const creators = await tx.$queryRawUnsafe('SELECT "id" FROM "CreatorAccount" WHERE "id"=$1 AND "agencyId"=$2 AND "deletedAt" IS NULL FOR SHARE', candidate.creatorId, candidate.agencyId);
@@ -360,6 +367,12 @@ async function runAnalyticsPublicationUnit({ db, publicationId, claim = null }) 
     }
     return result;
   }, { profile: "JOB_CHUNK", authority: { kind: "ANALYTICS_PUBLICATION", agencyId: candidate.agencyId, creatorId: candidate.creatorId } });
+  const verification = require("./financial-verification-diagnostics").financialVerificationDiagnostics(result?.sideEffect);
+  if (verification) require("./runtime-diagnostic-log").emitRuntimeDiagnostic("financial verification result", publicationId, {
+    agencyId: candidate.agencyId, creatorId: candidate.creatorId, jobId, publicationId,
+    status: result.job?.status || null, verification,
+  }, { level: verification.outcome === "VERIFIED" ? "info" : "warn" });
+  return result;
 }
 
 async function runAnalyticsPublicationSweep({ db, limit = 8, maxRuntimeMs = 5000, maxUnitsPerClaim = 8 } = {}) {

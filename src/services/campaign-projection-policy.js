@@ -23,12 +23,21 @@ async function changeCampaignProjectionPolicy({db,expectedGeneration,valueFreshn
 
 async function admitProjectionWorkClass(db) {
   return runRootCommit(db,async({tx})=>{
+    // The class counter is telemetry, not a scheduling priority. A zero-count
+    // new/repaired class gets one early turn, then joins the sequence frontier.
+    // Read only this generation's fixed five-class catalog; lock its selected
+    // row, never a singleton shared with other maintenance generations.
     const [row]=await tx.$queryRawUnsafe(`WITH next AS MATERIALIZED (
       SELECT "generation","laneName" FROM "MaintenanceAdmissionClassState"
-      WHERE "generation"='campaign_projection_execution_v2' ORDER BY "turnCount","ordinal"
+      WHERE "generation"='campaign_projection_execution_v2' ORDER BY "admissionSequence","ordinal"
       LIMIT 1 FOR UPDATE SKIP LOCKED
-    ) UPDATE "MaintenanceAdmissionClassState" s SET "turnCount"=s."turnCount"+1,"lastAdmittedAt"=clock_timestamp()
-      FROM next n WHERE s."generation"=n."generation" AND s."laneName"=n."laneName" RETURNING s."laneName"`);
+    ), frontier AS MATERIALIZED (
+      SELECT COALESCE(MAX("admissionSequence"),0) AS sequence
+      FROM "MaintenanceAdmissionClassState" WHERE "generation"='campaign_projection_execution_v2'
+    ) UPDATE "MaintenanceAdmissionClassState" s SET "turnCount"=s."turnCount"+1,
+      "admissionSequence"=GREATEST(s."admissionSequence",f.sequence)+1,"lastAdmittedAt"=clock_timestamp()
+      FROM next n CROSS JOIN frontier f
+      WHERE s."generation"=n."generation" AND s."laneName"=n."laneName" RETURNING s."laneName"`);
     return row?.laneName||null;
   },{profile:"JOB_CHUNK"});
 }

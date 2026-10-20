@@ -54,6 +54,7 @@ function pass(name){results.push(name);console.log("PASS",name);}
   let job=await db.jobInstance.findUnique({where:{id:planned.jobId}});assert.equal(job.params.moneyResolutionVersion,1);
   const blocked=await resolver.processRequest(await claim());assert.equal(blocked.reason,"FINANCIAL_SCHEDULED");assert.equal(await db.jobInstance.count({where:{creatorId:s.creatorId,jobKey:"financial_transactions_scan",status:"SCHEDULED"}}),1);
   const plannedEnd=receipts.date(job.params.endDate).toISOString();
+  const mainCollectorBefore=await db.creatorFinancialCollectionState.findUnique({where:{creatorId:s.creatorId}});
   await db.workerDevice.create({data:{id:"resolution-device",agencyId:s.agencyId,userId:s.userId,lastSeenAt:new Date()}});
   await db.deviceCreatorBinding.create({data:{deviceId:"resolution-device",agencyId:s.agencyId,creatorId:s.creatorId,sessionReadReady:true,lastSeenAt:new Date()}});
   await db.agency.update({where:{id:s.agencyId},data:{trialEndsAt:new Date(Date.now()+86400000)}});
@@ -70,6 +71,7 @@ function pass(name){results.push(name);console.log("PASS",name);}
   const existing=await db.$queryRawUnsafe(`SELECT * FROM "CreatorEarningsGenerationEntry" WHERE generation='baseline' AND "occurredAt" BETWEEN $1 AND $2`,new Date(w.from),new Date(w.to));
   const transactions=[...existing.map(e=>({externalTransactionId:e.transactionId,occurredAt:e.occurredAt.toISOString(),netCents:Number(e.netCents),transactionStatus:e.status})),{externalTransactionId:"resolved-tip",occurredAt:event.notificationObservation.occurredAt,netCents:800,transactionStatus:"done"}].map(e=>({...e,fanOnlyFansUserId:"42",transactionType:"tip",amountCents:1000,feeCents:1000-e.netCents,currency:"USD"}));
   await tx(t=>fin.ingestFinancialTransactionsChunk({db:t,job,deviceId:null,chunk:{collectorVersion:receipts.COLLECTOR,scanRunId:job.params.collectionGeneration,windowIndex:0,pageNumber:1,markerStart:w.initialMarker,markerEnd:null,rawReceived:transactions.length,scannerRejected:0,duplicateRows:0,sourceHasMore:false,transactions}}));
+  assert.deepEqual(await db.creatorFinancialCollectionState.findUnique({where:{creatorId:s.creatorId}}),mainCollectorBefore,'targeted resolution must preserve the main collector while ingesting its bounded window');
   await tx(t=>fin.ingestFinancialChartChunk({db:t,job,deviceId:null,chunk:{collectorVersion:receipts.COLLECTOR,scanRunId:job.params.collectionGeneration,windowIndex:0,category:"total",rangeFrom:w.from,rangeTo:w.to,grossCents:1000*transactions.length,netCents:transactions.reduce((n,e)=>n+e.netCents,0),transactionsCount:transactions.length}}));
   const receipt=await receipts.completionProof(db,job);assert(receipt.complete);
   const prep=await prepare({job,run:receipt.row});assert.equal(prep.copy,0);
@@ -84,7 +86,7 @@ function pass(name){results.push(name);console.log("PASS",name);}
   }
   assert.equal(completed.job.status,"DONE");
   const state=await db.creatorFinancialCollectionState.findUnique({where:{creatorId:s.creatorId}}),proof=await db.creatorEarningsLedgerProof.findUnique({where:{creatorId:s.creatorId}});
-  assert.equal(state.baselineGeneration,"baseline");assert.equal(state.lastCatchupGeneration,null);assert.equal(state.lastResolutionGeneration,job.params.collectionGeneration);
+  assert.deepEqual(state,mainCollectorBefore,'targeted publication must not change main status, coverage, freshness, active generation or retry');
   assert.equal(+proof.fromAt,+from);assert.equal(+proof.throughAt,+end);assert.equal(proof.activeGeneration,"baseline");
   await tx(async t=>{await receipts.enter(t);await t.jobInstance.update({where:{id:job.id},data:{status:"DONE"}});});
   assert((await resolver.processRequest(await claim())).idle);

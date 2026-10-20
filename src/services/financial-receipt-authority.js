@@ -172,7 +172,7 @@ function withinWindow(job, chunk, row) {
   const w = windowsFor(job)[chunk.windowIndex];
   return w && row.occurredAt >= date(w.from) && row.occurredAt <= date(w.to);
 }
-async function commitPage(db, job, chunk, prepared, accepted, backendRejected) {
+async function commitPage(db, job, chunk, prepared, accepted, backendRejected, rejectedRows = []) {
   const { row, checksum } = prepared, index = chunk.windowIndex, proof = row.proof, totals = proof.windows[index];
   const previous = accepted.length ? await db.financialObservedFact.findMany({ where: { runId: row.id, windowIndex: index, externalId: { in: accepted.map(x => x.externalTransactionId) } } }) : [];
   const byId = new Map(previous.map(x => [x.externalId, x.value]));
@@ -192,6 +192,16 @@ async function commitPage(db, job, chunk, prepared, accepted, backendRejected) {
     SELECT $1,$2,r."externalId",r."occurredAt",r.value FROM jsonb_to_recordset($3::jsonb) r("externalId" text,"occurredAt" timestamp,value jsonb)
     ON CONFLICT("runId","windowIndex","externalId") DO UPDATE SET "occurredAt"=EXCLUDED."occurredAt",value=EXCLUDED.value`, row.id, index, JSON.stringify(records));
   const rejected = chunk.scannerRejected + backendRejected;
+  // Only server normalization codes and counts are kept. A later publication
+  // diagnostic must explain rejection without storing the rejected payload.
+  if (rejected > 0) {
+    totals.rejectionReasons ||= {};
+    if (chunk.scannerRejected) totals.rejectionReasons.SCANNER_REJECTED = (totals.rejectionReasons.SCANNER_REJECTED || 0) + chunk.scannerRejected;
+    for (const rejectedRow of rejectedRows) {
+      const reason = rejectedRow.reasonCode;
+      totals.rejectionReasons[reason] = (totals.rejectionReasons[reason] || 0) + 1;
+    }
+  }
   totals.pages++; totals.received += chunk.rawReceived; totals.rejected += rejected; totals.exhausted = !chunk.sourceHasMore;
   await db.financialPageReceipt.create({ data: { runId: row.id, windowIndex: index, page: chunk.pageNumber, markerStart: chunk.markerStart,
     markerEnd: chunk.markerEnd || null, sourceHasMore: chunk.sourceHasMore, payloadHash: checksum, received: chunk.rawReceived, rejected } });

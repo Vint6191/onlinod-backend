@@ -215,6 +215,10 @@ async function acceptFinancialGeneration({ db = prisma, job, deviceId = null } =
   const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: job.creatorId, work: async (tx) => {
     const existing = await tx.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
+    if (require("./money-resolution-authority").targeted(job)) {
+      await require("./money-resolution-authority").assertMoneyResolutionAuthority(tx, job);
+      return { accepted: true, stale: false, targeted: true, command, state: existing };
+    }
     const authority = commandAuthority(existing, command);
     if (authority === "STALE") return { accepted: false, stale: true, command, state: existing };
     if (authority === "CURRENT" && ["COMPLETE", "PARTIAL"].includes(String(existing?.status || "").toUpperCase())) {
@@ -240,6 +244,14 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
   const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: job.creatorId, work: async (tx) => {
     const current = await tx.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
+    if (require("./money-resolution-authority").targeted(job)) {
+      await require("./money-resolution-authority").assertMoneyResolutionAuthority(tx, job);
+      if (complete === true && (!receiptRun || receiptRun.proof.complete !== true)) throw new Error("FINANCIAL_RECEIPT_COVERAGE_REQUIRED");
+      if (complete === true) await require("./money-resolution-authority").wakePendingRecovery(tx, job);
+      // Job/receipt/publication and its pending observation own the result.
+      // A verified or failed hour cannot replace the main catch-up's authority.
+      return { applied: true, stale: false, targeted: true, command, state: current, scanRunId: clean(scanRunId, 120) };
+    }
     if (commandAuthority(current, command) === "STALE") return { applied: false, stale: true, command, state: current };
     if (complete === true && completedForCommand(current, command)) {
       return { applied: true, stale: false, replay: true, command, state: current, scanRunId: clean(scanRunId, 120) };
@@ -255,16 +267,13 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
       await receiptAuthority.enter(tx);
     }
     const common = {
-      ...(success && job.params?.moneyResolutionVersion === 1 ? { receiptCoverageVersion: 1 } : {}),
-      ...(success && job.params?.moneyResolutionVersion !== 1 ? receiptAuthority.coverageUpdate(job, current, receiptRun, observedAt, now) : {}),
+      ...(success ? receiptAuthority.coverageUpdate(job, current, receiptRun, observedAt, now) : {}),
       status: success ? "COMPLETE" : "PARTIAL", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt,
       retryAfterAt: null, lastErrorCode: success ? null : "FINANCIAL_COLLECTION_PARTIAL",
       lastErrorMessage: success ? null : "Financial collection did not prove its requested source boundary",
       sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220),
     };
-    const successData = success && job.params?.moneyResolutionVersion === 1 ? {
-      lastResolutionGeneration: command.generation,
-    } : success && command.mode === "full" ? {
+    const successData = success && command.mode === "full" ? {
       baselineVerifiedAt: now, baselineObservedAt: observedAt, baselineGeneration: command.generation, baselineRangeFrom: date(rangeFrom), baselineRangeTo: date(rangeTo),
     } : success && command.mode === "catchup" ? {
       lastCatchupCompletedAt: now, lastCatchupObservedAt: observedAt, lastCatchupGeneration: command.generation, lastBoundary: clean(boundary, 220),
@@ -282,12 +291,20 @@ async function recordFinancialCollectionFailure({ db = prisma, job, error, termi
   try { command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL); } catch { return null; }
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: job.creatorId, work: async (tx) => {
     const current = await tx.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
+    if (require("./money-resolution-authority").targeted(job)) {
+      const now = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
+      await tx.creatorMoneyResolutionRequest.updateMany({ where: { agencyId: job.agencyId, creatorId: job.creatorId,
+        jobId: job.id, targetId: job.params.moneyResolutionObservationId },
+      data: { lastError: clean(error?.message || error, 2000), updatedAt: now } });
+      if (terminal) await require("./money-resolution-authority").wakePendingRecovery(tx, job);
+      return current;
+    }
     if (commandAuthority(current, command) === "STALE" || completedForCommand(current, command)) return current;
     const retryNow = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
     const interruption = terminal ? await require("./collector-retry-policy").collectionFailureRetry({ db: tx, job, error, terminal, now: retryNow }) : null;
     const retryAt = terminal ? interruption?.retryAt || null : date(retryAfterAt) || new Date(+retryNow + 5 * 60 * 1000);
     const data = {
-      status: job.params?.moneyResolutionVersion === 1 ? "PARTIAL" : "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
+      status: "FAILED", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: retryAt,
       lastErrorCode: "FINANCIAL_COLLECTION_FAILED", lastErrorMessage: clean(error?.message || error, 2000), sourceJobId: clean(job.id, 220),
     };
     const state = await tx.creatorFinancialCollectionState.upsert({

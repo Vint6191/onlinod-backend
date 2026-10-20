@@ -273,7 +273,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
   if (rawRows.length > 100) throw new Error("Financial transaction page exceeds 100 rows");
   const normalized = rawRows.map((row, index) => {
     const normalizedRow = normalizeTransaction(row, index, page);
-    if (!normalizedRow.rejected && (job.params.earningsLedgerVersion===1 || job.params.syncPolicyVersion===2)
+    if (!normalizedRow.rejected && (job.params.earningsLedgerVersion===1 || job.params.syncPolicyVersion===2 || job.params.moneyResolutionVersion===1)
       && (normalizedRow.netCents===null || normalizedRow.currency!=="USD" || !["done","loading","undo"].includes(normalizedRow.transactionStatus)))
       return {...normalizedRow,rejected:true,reasonCode:"EXACT_FINANCIAL_MONEY_REQUIRED"};
     if (!normalizedRow.rejected && receipts.enabled(job) && !receipts.withinWindow(job, chunk, normalizedRow))
@@ -365,7 +365,7 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
         storedOnly += 1;
       }
     }
-    const financialContinuation = receipt ? await receipts.commitPage(tx, job, chunk, receipt, accepted, rejected.length) : null;
+    const financialContinuation = receipt ? await receipts.commitPage(tx, job, chunk, receipt, accepted, rejected.length, rejected) : null;
     return { superseded: false, authorityNow: now, financialContinuation, identityHintConflicts: participants.ambiguousFields };
   });
 

@@ -1,6 +1,7 @@
 "use strict";
 const { runDbTransaction } = require("./db-transaction-service");
 const { emitRuntimeDiagnostic, diagnosticError } = require("./runtime-diagnostic-log");
+const { financialVerificationDiagnostics } = require("./financial-verification-diagnostics");
 
 const code = value => /^[A-Za-z0-9_.:-]{1,120}$/.test(String(value || "")) ? String(value) : null;
 const error = value => value ? diagnosticError(Object.assign(new Error(String(value)), { code: value })) : null;
@@ -48,15 +49,21 @@ async function inspectRecoveryRuntime(db, { agencyId, creatorId, jobId = null })
   const ids = [...new Set([jobId, financial?.sourceJobId, notifications?.sourceJobId, resolution?.jobId, ...intents.map(row => row.jobId)].filter(Boolean))].slice(0, 20);
   const rows = ids.length ? await db.jobInstance.findMany({ where: { ...scope, id: { in: ids } }, select: {
     id: true, jobKey: true, status: true, priority: true, nextRunAt: true, startedAt: true,
-    lastProgressAt: true, leaseUntil: true, claimedByDeviceId: true, attempts: true, lastError: true, params: true,
+    lastProgressAt: true, leaseUntil: true, claimedByDeviceId: true, attempts: true, lastError: true, params: true, result: true,
   } }) : [];
   const jobs = rows.map(row => {
     const p = row.params && typeof row.params === "object" ? row.params : {};
-    const { params: _params, lastError, ...fields } = row;
+    // The failed execution already stores the verification result. Read that
+    // exact referenced job; no new provider scan or historical job search is
+    // needed. Only the financial allowlist can leave this diagnostic reader.
+    const { params: _params, result: storedResult, lastError, ...fields } = row;
     const startDate = iso(p.startDate), endDate = iso(p.endDate);
     return { ...fields, error: error(lastError), collectionGeneration: code(p.collectionGeneration),
       collectionMode: code(p.collectionMode), moneyResolutionVersion: p.moneyResolutionVersion === 1 ? 1 : null,
       startDate, endDate, windowMs: startDate && endDate ? Date.parse(endDate) - Date.parse(startDate) : null,
+      ...(row.jobKey === "financial_transactions_scan" ? {
+        financialVerification: financialVerificationDiagnostics(storedResult?.completionSideEffect),
+      } : {}),
     };
   });
   for (const state of [financial, notifications]) if (state) state.lastErrorCode = code(state.lastErrorCode);

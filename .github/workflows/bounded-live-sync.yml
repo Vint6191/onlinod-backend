@@ -62,6 +62,15 @@ jobs:
         env:
           ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_financial_claim
           ONLINOD_FINANCIAL_CLAIM_REPORT: financial-claim-liveness-proof.json
+      - name: Create isolated database for financial resolution authority
+        run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_financial_resolution'
+        env:
+          PGPASSWORD: fixture-only
+      - name: Targeted verification preserves main catch-up state and wakes pending recovery
+        run: node scripts/audit/financial-resolution-isolation-proof.cjs
+        env:
+          ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_financial_resolution
+          ONLINOD_FINANCIAL_RESOLUTION_REPORT: financial-resolution-isolation-proof.json
       - name: Create isolated database for retention contention proof
         run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_retention'
         env:
@@ -89,6 +98,22 @@ jobs:
         env:
           ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_subscriber_publication
           ONLINOD_SUBSCRIBER_LIVENESS_REPORT: subscriber-publication-liveness-proof.json
+      - name: Create isolated database for maintenance catalog upgrade
+        run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_maintenance_upgrade'
+        env:
+          PGPASSWORD: fixture-only
+      - name: Evolved catalog fairness, installer, restart and concurrent admission
+        run: node scripts/audit/maintenance-admission-upgrade-proof.cjs | tee maintenance-admission-upgrade-proof.log
+        env:
+          ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_maintenance_upgrade
+      - name: Create isolated database for subscriber scheduler upgrade
+        run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_subscriber_scheduler_upgrade'
+        env:
+          PGPASSWORD: fixture-only
+      - name: Actual scheduler closes two stranded publications after upgrade and restart
+        run: node scripts/audit/maintenance-upgrade-subscriber-proof.cjs | tee maintenance-upgrade-subscriber-proof.log
+        env:
+          ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_subscriber_scheduler_upgrade
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -98,6 +123,9 @@ jobs:
             exact-live-money-proof.json
             live-money-adversarial-proof.json
             financial-claim-liveness-proof.json
+            financial-resolution-isolation-proof.json
             team-ledger-retention-proof.json
             event-participant-ingest-proof.json
             subscriber-publication-liveness-proof.json
+            maintenance-admission-upgrade-proof.log
+            maintenance-upgrade-subscriber-proof.log

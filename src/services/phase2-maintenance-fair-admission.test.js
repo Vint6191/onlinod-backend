@@ -12,7 +12,7 @@ function fixture({catalog = lanes.map((laneName,ordinal)=>({laneName,ordinal})),
   async $queryRawUnsafe(sql,...params){
    calls.push({sql,params});
    if(/SELECT "laneName","ordinal"/.test(sql))return catalog;
-   if(/WITH candidates/.test(sql)){advanced=true;return selected ?? lanes.slice(0,params[1]).map((laneName,ordinal)=>({laneName,ordinal,turnCount:1n,lastAdmittedAt:new Date(0)}));}
+   if(/WITH candidates/.test(sql)){advanced=true;return selected ?? lanes.slice(0,params[1]).map((laneName,ordinal)=>({laneName,ordinal,turnCount:1n,admissionSequence:1n,lastAdmittedAt:new Date(0)}));}
    throw Error('unexpected query');
   },
  };
@@ -38,7 +38,7 @@ test("C1 database catalog drift fails closed without advancing or a time fallbac
  const fx=fixture({catalog:lanes.slice(1).map((laneName,ordinal)=>({laneName,ordinal}))});
  await assert.rejects(selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes}),{code:'MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH'});assert.equal(fx.advanced,false);assert.equal(fx.committed,false);
 });
-test("C1 ordinals are versioned and cannot silently reorder equal-turn classes",async()=>{
+test("C1 ordinals are versioned and cannot silently reorder equal-sequence classes",async()=>{
  const fx=fixture({catalog:lanes.map((laneName,ordinal)=>({laneName,ordinal:ordinal+1}))});
  await assert.rejects(selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes}),{code:'MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH'});
 });
@@ -47,8 +47,8 @@ test("C1 skipped locked catalog returns bounded contention rather than a duplica
  assert.equal(r.ok,true);assert.equal(r.skipped,true);assert.equal(r.reason,'maintenance_admission_contended');assert.equal(r.contended,5);assert.deepEqual(r.selected,[]);
 });
 test("C1 partial admission uses only available rows; result remains JSON serializable",async()=>{
- const fx=fixture({selected:[{laneName:lanes[0],turnCount:9007199254740993n,lastAdmittedAt:new Date(0)}]});
- const r=await selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes});assert.equal(r.contended,4);assert.equal(r.turns[0].turn,'9007199254740993');assert.doesNotThrow(()=>JSON.stringify(r));
+ const fx=fixture({selected:[{laneName:lanes[0],turnCount:9007199254740993n,admissionSequence:9007199254740995n,lastAdmittedAt:new Date(0)}]});
+ const r=await selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes});assert.equal(r.contended,4);assert.equal(r.turns[0].turn,'9007199254740993');assert.equal(r.turns[0].admissionSequence,'9007199254740995');assert.doesNotThrow(()=>JSON.stringify(r));
 });
 test("C1 invalid driver result cannot leak an unknown or repeated work class",async()=>{
  const fx=fixture({selected:[{laneName:lanes[0]},{laneName:lanes[0]}]});
@@ -68,9 +68,10 @@ test("C1 read-only diagnostics count opportunities without advancing progress",a
  const {readMaintenanceAdmissionProgress}=require('./phase2-maintenance-admission-service');let calls=0;
  const db={$queryRawUnsafe:async(sql,...params)=>{
   calls++;assert.match(sql,/^SELECT/);assert.equal(params[1],65);
-  return lanes.map((laneName,ordinal)=>({laneName,ordinal,turnCount:ordinal?9007199254740993n:9007199254740994n,lastAdmittedAt:null}));
+  return lanes.map((laneName,ordinal)=>({laneName,ordinal,turnCount:ordinal?9007199254740993n:9007199254740994n,admissionSequence:BigInt(ordinal),lastAdmittedAt:null}));
  }};
  const result=await readMaintenanceAdmissionProgress({db});assert.equal(calls,1);assert.equal(result.readOnly,true);assert.equal(result.spread,'1');assert.equal(result.minimumTurns,'9007199254740993');assert.equal(result.lanes.length,lanes.length);assert.doesNotThrow(()=>JSON.stringify(result));
+ assert.equal(result.policy,'bounded_fair_sequence');assert.equal(result.minimumSequence,'0');assert.equal(result.maximumSequence,String(lanes.length-1));
 });
 
 test("C1 admission cannot join business transaction and retain class locks across execution",async()=>{

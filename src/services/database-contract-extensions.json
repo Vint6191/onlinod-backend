@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v16_recovery_liveness",
+  "version": "nod_current_v17_maintenance_admission_sequence",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -60,6 +60,10 @@
     {
       "migration": "20261020000000_recovery_liveness",
       "checksum": "9ae6d050c671e6dc71e825c1391476d9fe0e5a9a1f6f26ac1b4fe613ea39583c"
+    },
+    {
+      "migration": "20261020010000_maintenance_admission_sequence",
+      "checksum": "f836868ad639aae524b458d22f10fc30aea31062ba539f2ce445692e33be5ba7"
     }
   ],
   "extension": {
@@ -1965,6 +1969,14 @@
         "udt_name": "bool",
         "is_nullable": "NO",
         "column_default": "true"
+      },
+      {
+        "table": "MaintenanceAdmissionClassState",
+        "name": "admissionSequence",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
       }
     ],
     "enums": [],
@@ -2668,6 +2680,14 @@
         "deferrable": false,
         "deferred": false,
         "definition": "CHECK (((kind)::text = ANY (ARRAY['RECOVERY'::text, 'RETENTION'::text, 'DERIVED_PLANNING'::text])))"
+      },
+      {
+        "table": "MaintenanceAdmissionClassState",
+        "name": "MaintenanceAdmissionClassState_sequence_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"admissionSequence\" >= 0))"
       }
     ],
     "indexes": [
@@ -3318,6 +3338,15 @@
         "options": "0 0 0",
         "expressions": null,
         "predicate": "(((kind)::text = 'RECOVERY'::text) AND (attempts >= 100) AND ((\"lastError\")::text ~ '^Subscriber publication generation [0-9]+ is stale behind allocated generation [0-9]+$'::text))"
+      },
+      {
+        "table": "MaintenanceAdmissionClassState",
+        "name": "MaintenanceAdmissionClassState_sequence_idx",
+        "unique": false,
+        "keys": "1 6 3",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
       }
     ]
   }

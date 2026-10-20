@@ -160,8 +160,8 @@ function registerTests(){
  });
  test('C1 SQL: bounded progress selection has an indexed path; schema catalog matches code',async(t)=>{
   const fx=await fixture(t);await fx.pg.exec('SET enable_seqscan=off');
-  const plan=await fx.pg.query(`EXPLAIN (FORMAT JSON) SELECT "laneName" FROM "MaintenanceAdmissionClassState" WHERE generation=$1 ORDER BY "turnCount",ordinal LIMIT 5 FOR UPDATE SKIP LOCKED`,[admission.MAINTENANCE_ADMISSION_GENERATION]);
-  assert.match(JSON.stringify(plan.rows),/MaintenanceAdmissionClassState_turn_idx/);
+  const plan=await fx.pg.query(`EXPLAIN (FORMAT JSON) SELECT "laneName" FROM "MaintenanceAdmissionClassState" WHERE generation=$1 ORDER BY "admissionSequence",ordinal LIMIT 5 FOR UPDATE SKIP LOCKED`,[admission.MAINTENANCE_ADMISSION_GENERATION]);
+  assert.match(JSON.stringify(plan.rows),/MaintenanceAdmissionClassState_sequence_idx/);
   assert.deepEqual((await fx.counts()).map(r=>r.laneName),lanes);
   assert.ok(!fx.adapter.trace.some(sql=>/DomainWorkItem|JobInstance|MaintenanceLaneState/.test(sql)));
  });

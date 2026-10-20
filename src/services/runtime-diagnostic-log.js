@@ -2,7 +2,7 @@
 
 const { createHash } = require("node:crypto");
 const logger = require("../utils/logger");
-const DIAGNOSTIC_VERSION = "recovery-169-v1";
+const DIAGNOSTIC_VERSION = "recovery-170-v1";
 const PRIVATE_KEY = /token|secret|password|authorization|cookie|payload|^(?:params|continuation|headers|body|raw|stack)$/i;
 
 // Callers must construct allowlisted metadata, never pass request/job objects.

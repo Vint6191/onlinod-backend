@@ -123,7 +123,7 @@ async function main() {
     });
     await check("online postflight verifies the new partial predicate and refuses a wrong index", async () => {
       const indexes = load("scripts/database/background-maintenance-indexes");
-      assert.equal((await indexes.ensureIndexes(db, { create: true })).contracts, 4);
+      assert.equal((await indexes.ensureIndexes(db, { create: true })).contracts, indexes.definitions.length);
       await db.$executeRawUnsafe('DROP INDEX "DomainWorkItem_notification_identity_recovery_idx"');
       await db.$executeRawUnsafe('CREATE INDEX "DomainWorkItem_notification_identity_recovery_idx" ON "DomainWorkItem"("id")');
       await assert.rejects(indexes.ensureIndexes(db), /MAINTENANCE_INDEX_INVALID/);

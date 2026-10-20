@@ -22,20 +22,26 @@ function validateStoredCatalog(catalog) {
 
 async function readMaintenanceAdmissionProgress({ db } = {}) {
   if (typeof db?.$queryRawUnsafe !== "function") throw failure("MAINTENANCE_ADMISSION_READ_CLIENT_REQUIRED");
-  const rows = await db.$queryRawUnsafe(`SELECT "laneName","ordinal","turnCount","lastAdmittedAt"
+  const rows = await db.$queryRawUnsafe(`SELECT "laneName","ordinal","turnCount","admissionSequence","lastAdmittedAt"
     FROM "MaintenanceAdmissionClassState" WHERE "generation"=$1
     ORDER BY "ordinal" LIMIT $2`, MAINTENANCE_ADMISSION_GENERATION, MAX_CATALOG_ROWS + 1);
   validateStoredCatalog(rows);
   const turns = rows.map((row) => BigInt(row.turnCount));
   const minimum = turns.reduce((a, b) => a < b ? a : b);
   const maximum = turns.reduce((a, b) => a > b ? a : b);
+  const sequences = rows.map((row) => BigInt(row.admissionSequence));
   return {
     generation: MAINTENANCE_ADMISSION_GENERATION,
     readOnly: true,
     meaning: "dispatch_opportunities_not_completed_work",
     totalLanes: rows.length,
     minimumTurns: String(minimum), maximumTurns: String(maximum), spread: String(maximum - minimum),
-    lanes: rows.map((row) => ({ name: row.laneName, turn: String(row.turnCount), lastAdmittedAt: row.lastAdmittedAt })),
+    policy: "bounded_fair_sequence",
+    sequenceMeaning: "dispatch_order_not_lifetime_count_or_wall_clock",
+    minimumSequence: String(sequences.reduce((a, b) => a < b ? a : b)),
+    maximumSequence: String(sequences.reduce((a, b) => a > b ? a : b)),
+    lanes: rows.map((row) => ({ name: row.laneName, turn: String(row.turnCount),
+      admissionSequence: String(row.admissionSequence), lastAdmittedAt: row.lastAdmittedAt })),
   };
 }
 
@@ -60,32 +66,48 @@ async function selectPhase2MaintenanceLanes({ db, laneNames, lanesPerTick = MAX_
       FROM "MaintenanceAdmissionClassState" WHERE "generation"=$1
       ORDER BY "ordinal" LIMIT $2`, MAINTENANCE_ADMISSION_GENERATION, MAX_CATALOG_ROWS + 1);
     validateStoredCatalog(catalog);
-    // Per-class row locks only. No singleton cursor/clock lock and no lock held
-    // while executing a lane. Slow/failed callbacks consume their turn instead
-    // of resetting the fleet to a wall-clock phase after every restart.
+    // Lifetime counts cannot order an evolving catalog: a newly installed lane
+    // at zero would monopolize dispatch until it caught up with years of old
+    // offers. Give every selected row a ticket after the observed frontier.
+    // New lanes get one early opportunity, then join the back of the queue.
+    // Sequence is independent of clock changes; turnCount stays an actual count.
+    // Distinct positions preserve order within a mixed batch at the round edge.
+    // Independent concurrent batches may share tickets; ordinal breaks those
+    // ties, and a stale frontier can never move a selected row backwards.
+    // Per-class row locks only, never a singleton lock or a business-work lease.
     const rows = await tx.$queryRawUnsafe(`WITH candidates AS MATERIALIZED (
-      SELECT "generation","laneName","ordinal","turnCount"
+      SELECT "generation","laneName","ordinal","admissionSequence"
       FROM "MaintenanceAdmissionClassState"
       WHERE "generation"=$1
-      ORDER BY "turnCount","ordinal"
+      ORDER BY "admissionSequence","ordinal"
       LIMIT $2 FOR UPDATE SKIP LOCKED
+    ), frontier AS MATERIALIZED (
+      SELECT COALESCE(MAX("admissionSequence"),0) AS sequence
+      FROM "MaintenanceAdmissionClassState" WHERE "generation"=$1
+    ), ranked AS (
+      SELECT c.*,ROW_NUMBER() OVER (ORDER BY c."admissionSequence",c."ordinal") AS position
+      FROM candidates c
     ), advanced AS (
       UPDATE "MaintenanceAdmissionClassState" state SET
-        "turnCount"=state."turnCount"+1, "lastAdmittedAt"=clock_timestamp()
-      FROM candidates c
+        "turnCount"=state."turnCount"+1,
+        "admissionSequence"=GREATEST(state."admissionSequence",f.sequence)+c.position,
+        "lastAdmittedAt"=clock_timestamp()
+      FROM ranked c CROSS JOIN frontier f
       WHERE state."generation"=c."generation" AND state."laneName"=c."laneName"
-      RETURNING state."laneName",state."turnCount",state."lastAdmittedAt",c."ordinal",c."turnCount" AS "previousTurn"
-    ) SELECT * FROM advanced ORDER BY "previousTurn","ordinal"`, MAINTENANCE_ADMISSION_GENERATION, quantum);
+      RETURNING state."laneName",state."turnCount",state."admissionSequence",state."lastAdmittedAt",
+        c."ordinal",c."admissionSequence" AS "previousSequence"
+    ) SELECT * FROM advanced ORDER BY "previousSequence","ordinal"`, MAINTENANCE_ADMISSION_GENERATION, quantum);
     if (rows.length > quantum || new Set(rows.map((row) => row.laneName)).size !== rows.length ||
       rows.some((row) => !MAINTENANCE_LANE_NAMES.includes(row.laneName))) throw failure("MAINTENANCE_ADMISSION_RESULT_INVALID");
     return {
       ok: true,
       generation: MAINTENANCE_ADMISSION_GENERATION,
-      policy: "least_admitted_class",
+      policy: "bounded_fair_sequence",
       lanesPerTick: quantum,
       totalLanes: MAINTENANCE_LANE_NAMES.length,
       selected: rows.map((row) => row.laneName),
-      turns: rows.map((row) => ({ name: row.laneName, turn: String(row.turnCount), admittedAt: row.lastAdmittedAt })),
+      turns: rows.map((row) => ({ name: row.laneName, turn: String(row.turnCount),
+        admissionSequence: String(row.admissionSequence), admittedAt: row.lastAdmittedAt })),
       contended: quantum - rows.length,
       skipped: rows.length === 0,
       reason: rows.length === 0 ? "maintenance_admission_contended" : null,

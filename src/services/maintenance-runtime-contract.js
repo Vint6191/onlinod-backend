@@ -5,6 +5,7 @@ async function verifyMaintenanceRuntime({ db } = {}) {
   const handlers = resolveMaintenanceLanes({ db });
   const progress = await readMaintenanceAdmissionProgress({ db });
   const indexes = await require("../../scripts/database/background-maintenance-indexes").ensureIndexes(db);
-  return { ready: true, generation: MAINTENANCE_ADMISSION_GENERATION, handlers: handlers.size, catalog: progress.totalLanes, indexes: indexes.contracts };
+  return { ready: true, generation: MAINTENANCE_ADMISSION_GENERATION, handlers: handlers.size, catalog: progress.totalLanes,
+    admissionPolicy: progress.policy, indexes: indexes.contracts };
 }
 module.exports = { verifyMaintenanceRuntime };

@@ -40,7 +40,7 @@ async function main() {
     assert.equal(visited.size, admission.MAINTENANCE_LANE_NAMES.length);
     const progress = await admission.readMaintenanceAdmissionProgress({ db });
     assert.equal(progress.minimumTurns, "1"); assert.equal(progress.spread, "1");
-    console.log("PASS persisted least-turn fairness visits all maintenance lanes", JSON.stringify({ lanes: visited.size, spread: progress.spread }));
+    console.log("PASS persisted sequence fairness visits all maintenance lanes", JSON.stringify({ lanes: visited.size, spread: progress.spread }));
 
     await db.$executeRawUnsafe('DELETE FROM "MaintenanceAdmissionClassState" WHERE "generation"=$1 AND "laneName"=$2', admission.MAINTENANCE_ADMISSION_GENERATION, admission.MAINTENANCE_LANE_NAMES[0]);
     const invalidBefore = await counts();
