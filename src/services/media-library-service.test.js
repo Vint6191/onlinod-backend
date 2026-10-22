@@ -8,6 +8,17 @@ const fs = require("node:fs");
 const path = require("node:path");
 const prismaModule = require.resolve("../prisma");
 require.cache[prismaModule] = { id: prismaModule, filename: prismaModule, loaded: true, exports: {} };
+const publications = [];
+const publishModule = require.resolve("./media-entity-change-service");
+require.cache[publishModule] = { exports: { publishMediaResult: async input => { publications.push(input); } } };
+const factModule = require.resolve("./media-usage-fact-service");
+const factProtocol = require(factModule);
+// SQL fact/baseline behavior is exercised against the real schema in
+// scripts/audit/media-usage-facts-proof.cjs. These tests isolate orchestration.
+require.cache[factModule] = { exports: { ...factProtocol, mergeUsageFactSourceTx: async (tx, { source }) => {
+  tx.accepted.push(source.sourceKey);
+  return { accepted: true, stale: false, acceptedItems: 0, missingMediaIds: [] };
+} } };
 delete require.cache[require.resolve("./media-library-service")];
 const {
   getMediaMetadata,
@@ -245,234 +256,12 @@ test("metadata editing updates an inactive placeholder without reactivating cata
   assert.equal(assets.get("inactive-media").description, "kept while inactive");
 });
 
-function usageDb({ rawSql = false } = {}) {
-  const assets = new Map([
-    ["m1", {
-      id: "asset-m1",
-      agencyId: AGENCY_ID,
-      creatorId: CREATOR_ID,
-      mediaId: "m1",
-      catalogActive: true,
-      sentCount: 0,
-      soldCount: 0,
-      notOpenedCount: 0,
-      freeCount: 0,
-      revenueCents: 0,
-      averagePriceCents: 0,
-      uniqueBuyers: 0,
-      lastSoldAt: null,
-    }],
-  ]);
-  const contributions = [];
-  const sourceStates = new Map();
-  const transactionCalls = [];
-  const usageLocks = [];
-  const bulkUsageUpdates = [];
-
-  const matchesMedia = (where, mediaId) => {
-    if (where.mediaId?.in && !where.mediaId.in.includes(mediaId)) return false;
-    if (typeof where.mediaId === "string" && where.mediaId !== mediaId) return false;
-    return true;
-  };
-  const db = {
-    creatorAccount: {
-      async findFirst() { return { id: CREATOR_ID }; },
-    },
-    creatorMediaAsset: {
-      async findMany({ where }) {
-        return [...assets.values()].filter((asset) => (
-          asset.agencyId === where.agencyId
-          && asset.creatorId === where.creatorId
-          && matchesMedia(where, asset.mediaId)
-          && (where.catalogActive === undefined || asset.catalogActive === where.catalogActive)
-        ));
-      },
-      async createMany({ data }) {
-        let count = 0;
-        for (const row of data) {
-          if (assets.has(row.mediaId)) continue;
-          assets.set(row.mediaId, {
-            id: row.id,
-            ...row,
-            sentCount: 0,
-            soldCount: 0,
-            notOpenedCount: 0,
-            freeCount: 0,
-            revenueCents: 0,
-            averagePriceCents: 0,
-            uniqueBuyers: 0,
-            lastSoldAt: null,
-          });
-          count += 1;
-        }
-        return { count };
-      },
-      async updateMany({ where, data }) {
-        let count = 0;
-        for (const asset of assets.values()) {
-          if (asset.agencyId !== where.agencyId || asset.creatorId !== where.creatorId || !matchesMedia(where, asset.mediaId)) continue;
-          Object.assign(asset, data);
-          count += 1;
-        }
-        return { count };
-      },
-    },
-    creatorMediaUsageSourceState: {
-      async findUnique({ where }) {
-        return sourceStates.get(where.creatorId_sourceKey.sourceKey) || null;
-      },
-      async upsert({ where, create, update }) {
-        const key = where.creatorId_sourceKey.sourceKey;
-        const next = sourceStates.has(key) ? { ...sourceStates.get(key), ...update } : { ...create };
-        sourceStates.set(key, next);
-        return next;
-      },
-    },
-    creatorMediaUsageContribution: {
-      async findMany({ where }) {
-        return contributions.filter((row) => row.agencyId === where.agencyId && row.creatorId === where.creatorId && row.sourceKey === where.sourceKey);
-      },
-      async deleteMany({ where }) {
-        let count = 0;
-        for (let index = contributions.length - 1; index >= 0; index -= 1) {
-          const row = contributions[index];
-          if (row.agencyId === where.agencyId && row.creatorId === where.creatorId && row.sourceKey === where.sourceKey) {
-            contributions.splice(index, 1);
-            count += 1;
-          }
-        }
-        return { count };
-      },
-      async createMany({ data }) {
-        contributions.push(...data.map((row) => ({ ...row })));
-        return { count: data.length };
-      },
-      async groupBy({ where }) {
-        const ids = new Set(where.mediaId.in);
-        const grouped = new Map();
-        for (const row of contributions) {
-          if (row.agencyId !== where.agencyId || row.creatorId !== where.creatorId || !ids.has(row.mediaId)) continue;
-          const group = grouped.get(row.mediaId) || {
-            mediaId: row.mediaId,
-            _sum: { sentCount: 0, soldCount: 0, notOpenedCount: 0, freeCount: 0, revenueCents: 0, uniqueBuyers: 0 },
-            _max: { lastSoldAt: null, capturedAt: null },
-          };
-          for (const field of Object.keys(group._sum)) group._sum[field] += row[field] || 0;
-          if (row.lastSoldAt && (!group._max.lastSoldAt || row.lastSoldAt > group._max.lastSoldAt)) group._max.lastSoldAt = row.lastSoldAt;
-          if (row.capturedAt && (!group._max.capturedAt || row.capturedAt > group._max.capturedAt)) group._max.capturedAt = row.capturedAt;
-          grouped.set(row.mediaId, group);
-        }
-        return [...grouped.values()];
-      },
-    },
-    async $transaction(callback, options) {
-      transactionCalls.push(options || null);
-      return callback({ ...(db), $transaction: undefined });
-    },
-  };
-  db.$queryRawUnsafe = async () => { throw new Error("void deserialization: advisory lock must not use queryRaw"); };
-  db.$executeRawUnsafe = async (query, ...args) => {
-    if (/pg_advisory_xact_lock/.test(String(query))) {
-      usageLocks.push([query, ...args]);
-      return 1;
-    }
-    const [agencyId, creatorId, payload] = args;
-    const projections = JSON.parse(payload);
-    bulkUsageUpdates.push({ query, agencyId, creatorId, projections });
-    for (const projection of projections) {
-      const asset = assets.get(projection.mediaId);
-      if (asset && asset.agencyId === agencyId && asset.creatorId === creatorId) Object.assign(asset, projection);
-    }
-    return projections.length;
-  };
-  return { db: commitDatabaseFixture(db), assets, contributions, transactionCalls, usageLocks, bulkUsageUpdates };
-}
-
-test("usage sources replace atomically, reject stale revisions, and retain missing ids only as inactive placeholders", async () => {
-  const { db, assets, contributions } = usageDb();
-  const first = await replaceUsageSources({
-    agencyId: AGENCY_ID,
-    creatorId: CREATOR_ID,
-    db: commitDatabaseFixture(db),
-    sources: [{
-      sourceKey: "opaque-dialog",
-      sourceRevision: "2026-07-19T10:00:00.000Z",
-      capturedAt: "2026-07-19T10:00:00.000Z",
-      items: [
-        { mediaId: "m1", sentCount: 2, soldCount: 1, notOpenedCount: 0, freeCount: 0, revenueCents: 500, uniqueBuyers: 1 },
-        { mediaId: "missing", sentCount: 1, soldCount: 0, notOpenedCount: 0, freeCount: 1, revenueCents: 0, uniqueBuyers: 0 },
-      ],
-    }],
-  });
-  assert.deepEqual(first.missingMediaIds, ["missing"]);
-  assert.equal(assets.get("missing").catalogActive, false);
-  assert.equal(assets.get("m1").sentCount, 2);
-  assert.equal(assets.get("m1").revenueCents, 500);
-
-  const replaced = await replaceUsageSources({
-    agencyId: AGENCY_ID,
-    creatorId: CREATOR_ID,
-    db: commitDatabaseFixture(db),
-    sources: [{
-      sourceKey: "opaque-dialog",
-      sourceRevision: "2026-07-19T11:00:00.000Z",
-      capturedAt: "2026-07-19T11:00:00.000Z",
-      items: [{ mediaId: "m1", sentCount: 5, soldCount: 0, notOpenedCount: 0, freeCount: 5, revenueCents: 0, uniqueBuyers: 0 }],
-    }],
-  });
-  assert.equal(replaced.acceptedSources, 1);
-  assert.equal(assets.get("m1").sentCount, 5);
-  assert.equal(assets.get("missing").sentCount, 0);
-  assert.equal(contributions.some((row) => row.mediaId === "missing"), false);
-
-  const stale = await replaceUsageSources({
-    agencyId: AGENCY_ID,
-    creatorId: CREATOR_ID,
-    db: commitDatabaseFixture(db),
-    sources: [{
-      sourceKey: "opaque-dialog",
-      sourceRevision: "2026-07-19T10:30:00.000Z",
-      capturedAt: "2026-07-19T10:30:00.000Z",
-      items: [{ mediaId: "m1", sentCount: 99, soldCount: 99, notOpenedCount: 0, freeCount: 0, revenueCents: 9999, uniqueBuyers: 1 }],
-    }],
-  });
-  assert.equal(stale.staleSources, 1);
-  assert.equal(assets.get("m1").sentCount, 5);
+test("aggregate-only producers fail closed before the database is touched", async () => {
+  const db = new Proxy({}, { get() { throw Error("MUST_NOT_ACCESS_DATABASE"); } });
+  await assert.rejects(() => replaceUsageSources({ agencyId: AGENCY_ID, creatorId: CREATOR_ID, db,
+    sources: [{ sourceKey: "opaque-dialog", sourceRevision: "2099-01-01", items: [] }] }),
+  { code: "MEDIA_USAGE_FACT_PROTOCOL_REQUIRED" });
 });
-
-test("usage batches commit one bounded source transaction and bulk projection at a time", async () => {
-  const { db, assets, transactionCalls, usageLocks, bulkUsageUpdates } = usageDb({ rawSql: true });
-  const result = await replaceUsageSources({
-    agencyId: AGENCY_ID,
-    creatorId: CREATOR_ID,
-    db: commitDatabaseFixture(db),
-    sources: [
-      {
-        sourceKey: "opaque-dialog-a",
-        sourceRevision: "2026-07-19T12:00:00.000Z",
-        capturedAt: "2026-07-19T12:00:00.000Z",
-        items: [{ mediaId: "m1", sentCount: 2, soldCount: 1, notOpenedCount: 0, freeCount: 0, revenueCents: 500, uniqueBuyers: 1 }],
-      },
-      {
-        sourceKey: "opaque-dialog-b",
-        sourceRevision: "2026-07-19T12:01:00.000Z",
-        capturedAt: "2026-07-19T12:01:00.000Z",
-        items: [{ mediaId: "m1", sentCount: 3, soldCount: 0, notOpenedCount: 0, freeCount: 3, revenueCents: 0, uniqueBuyers: 0 }],
-      },
-    ],
-  });
-
-  assert.equal(result.acceptedSources, 2);
-  assert.equal(transactionCalls.length, 2);
-  assert.equal(transactionCalls.every((options) => options.isolationLevel === "ReadCommitted" && options.maxWait <= 10_000 && options.maxWait > 0 && options.timeout <= 30_000 && options.timeout > 29_000), true);
-  assert.equal(usageLocks.length, 2);
-  assert.equal(usageLocks.every((call) => /pg_advisory_xact_lock/.test(call[0]) && !/::text/.test(call[0])), true);
-  assert.equal(bulkUsageUpdates.length, 2);
-  assert.match(bulkUsageUpdates[0].query, /jsonb_to_recordset/);
-  assert.equal(assets.get("m1").sentCount, 5);
-  assert.equal(assets.get("m1").revenueCents, 500);
-});
-
 
 test("folder membership mutation rejects removing live CUSTOM media from its pinned pipeline folder before local projection drifts", async () => {
   const assets = [{ id: "asset-custom", mediaId: "9001", source: "CUSTOM", customSubmissionId: "sub-live", folderIds: ["vault-pinned", "other"] }];
@@ -513,6 +302,7 @@ test("validated COMPLETED relay proof protects live CUSTOM media before asset/su
   };
   let deleted = 0;
   const tx = {
+    $executeRawUnsafe: async () => 1,
     creatorMediaAsset: {
       async findMany({ where = {} } = {}) {
         return assets.filter((row) => !where.source || String(row.source) === String(where.source)).map((row) => ({ ...row }));
@@ -547,81 +337,39 @@ test("validated COMPLETED relay proof protects live CUSTOM media before asset/su
   assert.deepEqual(assets[0].folderIds, ["vault-pinned", "other"]);
 });
 
-test("INT2.8 usage commit guard runs inside each source transaction before media mutation", async () => {
-  const { db, assets, transactionCalls, usageLocks } = usageDb({ rawSql: true });
-  const events = [];
-  const result = await replaceUsageSources({
-    agencyId: AGENCY_ID,
-    creatorId: CREATOR_ID,
-    db: commitDatabaseFixture(db),
-    commitGuard: async (tx) => {
-      assert.notEqual(tx, db);
-      assert.equal(tx.$transaction, undefined);
-      assert.equal(require("./db-commit-kernel").currentCommitContext().tx, tx);
-      assert.equal(usageLocks.length, events.filter((event) => event === "guard").length);
-      events.push("guard");
-    },
-    sources: [
-      {
-        sourceKey: "guard-a",
-        sourceRevision: "2026-09-14T20:00:00.000Z",
-        capturedAt: "2026-09-14T20:00:00.000Z",
-        items: [{ mediaId: "m1", sentCount: 1, soldCount: 0, notOpenedCount: 0, freeCount: 1, revenueCents: 0, uniqueBuyers: 0 }],
-      },
-      {
-        sourceKey: "guard-b",
-        sourceRevision: "2026-09-14T20:01:00.000Z",
-        capturedAt: "2026-09-14T20:01:00.000Z",
-        items: [{ mediaId: "m1", sentCount: 2, soldCount: 0, notOpenedCount: 0, freeCount: 2, revenueCents: 0, uniqueBuyers: 0 }],
-      },
-    ],
-  });
-
-  assert.equal(result.acceptedSources, 2);
-  assert.deepEqual(events, ["guard", "guard"]);
-  assert.equal(transactionCalls.length, 2);
-  assert.equal(usageLocks.length, 2);
-  assert.equal(assets.get("m1").sentCount, 3);
-});
-
-test("INT2.8 authorization generation change between source commits fails closed without undoing an already valid source", async () => {
-  const { db, assets, contributions, usageLocks } = usageDb({ rawSql: true });
+function emptyFactSource(sourceKey) {
+  const sourceRevision = "revision";
+  return { protocolVersion: 2, sourceKey, sourceRevision, capturedAt: "2026-10-21T10:00:00Z",
+    coverage: { version: 1, complete: true, localRevision: sourceRevision, messageCount: 0, oldestMessageAt: null, newestMessageAt: null },
+    facts: [], factPage: { runId: require("node:crypto").createHash("sha256").update(JSON.stringify([sourceKey, sourceRevision])).digest("hex"),
+      pageNumber: 1, previousHash: null, pageHash: require("./realtime-receipt-hash").hashCanonicalJson([]), done: true, totalFacts: 0 } };
+}
+function orchestrationDb() {
+  const accepted = [], locks = [], transactions = [];
+  const db = { accepted,
+    creatorAccount: { findFirst: async () => ({ id: CREATOR_ID }) },
+    $executeRawUnsafe: async query => { if (/pg_advisory_xact_lock/.test(query)) locks.push(query); return 1; },
+    $transaction: async (work, options) => { transactions.push(options); return work({ ...db, $transaction: undefined }); },
+  };
+  return { db: commitDatabaseFixture(db), accepted, locks, transactions };
+}
+test("INT2.8 fact sources recheck current authorization in each bounded owner transaction before the media lock", async () => {
+  const { db, accepted, locks, transactions } = orchestrationDb();
   let guards = 0;
-  await assert.rejects(
-    () => replaceUsageSources({
-      agencyId: AGENCY_ID,
-      creatorId: CREATOR_ID,
-      db: commitDatabaseFixture(db),
-      commitGuard: async () => {
-        guards += 1;
-        if (guards === 2) {
-          const error = new Error("stale authorization generation");
-          error.code = "EXECUTION_ACCESS_EPOCH_STALE";
-          error.status = 409;
-          throw error;
-        }
-      },
-      sources: [
-        {
-          sourceKey: "generation-a",
-          sourceRevision: "2026-09-14T21:00:00.000Z",
-          capturedAt: "2026-09-14T21:00:00.000Z",
-          items: [{ mediaId: "m1", sentCount: 4, soldCount: 0, notOpenedCount: 0, freeCount: 4, revenueCents: 0, uniqueBuyers: 0 }],
-        },
-        {
-          sourceKey: "generation-b",
-          sourceRevision: "2026-09-14T21:01:00.000Z",
-          capturedAt: "2026-09-14T21:01:00.000Z",
-          items: [{ mediaId: "m1", sentCount: 8, soldCount: 0, notOpenedCount: 0, freeCount: 8, revenueCents: 0, uniqueBuyers: 0 }],
-        },
-      ],
-    }),
-    (error) => error?.code === "EXECUTION_ACCESS_EPOCH_STALE" && error?.status === 409,
-  );
-
-  assert.equal(guards, 2);
-  assert.equal(usageLocks.length, 1, "stale generation must fail before the second media advisory lock");
-  assert.equal(assets.get("m1").sentCount, 4);
-  assert.equal(contributions.some((row) => row.sourceKey === "generation-a"), true);
-  assert.equal(contributions.some((row) => row.sourceKey === "generation-b"), false);
+  const result = await replaceUsageSources({ agencyId: AGENCY_ID, creatorId: CREATOR_ID, db,
+    sources: [emptyFactSource("source-a"), emptyFactSource("source-b")],
+    commitGuard: async tx => { assert.equal(require("./db-commit-kernel").currentCommitContext().tx, tx); assert.equal(locks.length, guards++); },
+  });
+  assert.equal(result.acceptedSources, 2); assert.deepEqual(accepted, ["source-a", "source-b"]);
+  assert.equal(transactions.length, 2); assert.equal(locks.length, 2);
+  assert(transactions.every(options => options.timeout <= 30000 && options.maxWait <= 10000));
+});
+test("INT2.8 revocation between fact pages fails before a second source mutation and preserves the first authorized commit", async () => {
+  const { db, accepted, locks } = orchestrationDb();
+  let guards = 0;
+  await assert.rejects(() => replaceUsageSources({ agencyId: AGENCY_ID, creatorId: CREATOR_ID, db,
+    sources: [emptyFactSource("source-a"), emptyFactSource("source-b")],
+    commitGuard: async () => { if (++guards === 2) throw Object.assign(Error("revoked"), { code: "EXECUTION_ACCESS_EPOCH_STALE" }); },
+  }), { code: "EXECUTION_ACCESS_EPOCH_STALE" });
+  assert.deepEqual(accepted, ["source-a"]); assert.equal(locks.length, 1);
 });

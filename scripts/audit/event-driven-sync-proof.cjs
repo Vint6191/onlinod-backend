@@ -151,7 +151,7 @@ async function main() {
       };
       await tx(async (t) => {
         await sync.bindRecovery(t, i, job.id);
-        await sync.completeRecovery(t, job, true);
+        await sync.completeRecovery(t, job, true, { coveredThrough: returned });
       });
     }
     await sample("a", a, new Date(+returned + 60000), 2, 1);

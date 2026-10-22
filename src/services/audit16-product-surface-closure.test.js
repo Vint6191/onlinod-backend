@@ -115,7 +115,8 @@ test("Audit16 Stats, Traffic and Fan Data use canonical creator scope and canoni
   assert.match(liveRoute, /accessEpoch:\s*memberAccessEpoch/);
   assert.match(liveRoute, /withRealtimeIngestGenerationFence\(\{[\s\S]*accessEpoch:\s*memberAccessEpoch/);
   assert.match(liveRoute, /work: async \(\{ tx \}\) => \{\s*await assertLiveBinding\(tx\)/);
-  assert.match(liveRoute, /ingestNotificationFacts\(\{\s*db:\s*tx/);
+  assert.match(liveRoute, /processLiveNotificationBatch\(\{\s*db:\s*tx/);
+  assert.match(read("services/data-change-processor-service.js"), /ingestNotificationFacts\(\{\s*db:\s*tx/);
   assert.match(liveRoute, /res\.status\(Number\(error\?\.status\) \|\| 500\)/);
   assert.doesNotMatch(liveRoute, /requireRefreshPermission/);
   assert.match(stats, /router\.post\("\/creators\/:creatorId\/messages-daily", legacyStatsGone\)/);

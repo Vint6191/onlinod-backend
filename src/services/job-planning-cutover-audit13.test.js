@@ -60,6 +60,9 @@ test("only execution/recovery authorities may directly return JobInstance to SCH
   const allowed = new Set([
     "services/job-lease-service.js",
     "services/dialog-intelligence-service.js",
+    // Repairs a prematurely publishing Subscriber job at its durable page
+    // cursor; it cannot allocate a replacement collection generation.
+    "services/subscriber-directory-service.js",
   ]);
   const offenders = [];
   for (const file of productionJsFiles(ROOT)) {

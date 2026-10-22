@@ -49,11 +49,11 @@ async function writeLive(db, scope, row) {
   for (const target of targets) await upsert(db,target.id,[row]);
 }
 function supported(run) {
-  return run?.proof?.complete && (run.windows?.length === 1 && ["FULL","RESOLUTION"].includes(run.windows[0].kind) || run.proof.kind === "FRONTIER_PLUS_ONE");
+  return run?.proof?.complete && (run.windows?.length === 1 && ["FULL","RESOLUTION"].includes(run.windows[0].kind) || ["FRONTIER_PLUS_ONE", "FRONTIER_PLUS_TWO_AND_CHART"].includes(run.proof.kind));
 }
 async function preparePage(db, job, run) {
   if (!supported(run)) return { ready: false, unsupported: true };
-  const from = new Date(run.windows[0].from), through = new Date(run.windows[0].to), snapshot = new Date(job.params.collectionRequestedAt);
+  const from = new Date(run.proof.windows[0].oldestAt || run.windows[0].comparisonFrom || run.windows[0].from), through = new Date(run.windows[0].to), snapshot = require("./analytics-observation-time").observationStartForJob(job);
   if (![from,through,snapshot].every(x=>Number.isFinite(+x))) throw fail("EARNINGS_PUBLICATION_TIME_INVALID");
   await lock(db,job.creatorId);
   let [g] = await db.$queryRawUnsafe('SELECT * FROM "CreatorEarningsGeneration" WHERE id=$1', run.id);
@@ -81,7 +81,10 @@ async function preparePage(db, job, run) {
     rows = g.baseGeneration
       ? await db.$queryRawUnsafe(`SELECT * FROM "CreatorEarningsGenerationEntry" WHERE generation=$1 AND "transactionId">$2 ORDER BY "transactionId" LIMIT $3`,g.baseGeneration,g.cursor,PAGE)
       : await db.$queryRawUnsafe(`SELECT * FROM "CreatorEarningsLedgerEntry" WHERE "creatorId"=$1 AND "transactionId">$2 ORDER BY "transactionId" LIMIT $3`,job.creatorId,g.cursor,PAGE);
-    await upsert(db,g.id,rows.filter(x=>!g.fullScan || +x.occurredAt<+from || +x.occurredAt>+through || +x.observedAt>+snapshot));
+    // End-of-source proves what this provider returned, not that identities
+    // absent from this later response ceased to exist. Corrections replace an
+    // identity explicitly; omission never deletes confirmed historical money.
+    await upsert(db,g.id,rows);
     await advance(db,g,rows,rows.at(-1)?.transactionId,"APPLY");
   } else if (g.phase === "APPLY") {
     rows = await db.$queryRawUnsafe(`SELECT "externalId","occurredAt",value FROM "FinancialObservedFact"
@@ -143,7 +146,7 @@ async function publish(db,job,run) {
   const resolution = run.windows[0].kind === "RESOLUTION";
   if (g.mode === "DELTA" && previous?.activeGeneration !== g.baseGeneration) throw fail("EARNINGS_DELTA_BASE_SUPERSEDED");
   // A frontier reaches an existing baseline; it never proves its nominal
-  // 2016 lower request bound. A point resolution proves no global range at all.
+  // unbounded lower request. A point resolution proves no global range at all.
   let from = previous?.fromAt || g.fromAt, through = previous?.throughAt || g.throughAt;
   if (!resolution) {
     if (g.fullScan) {

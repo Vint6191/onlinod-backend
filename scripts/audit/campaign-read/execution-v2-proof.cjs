@@ -7,7 +7,7 @@ const checks=[],alive=setInterval(()=>{},1000),deadline=setTimeout(()=>{console.
 async function check(name,fn){const result=await fn();checks.push({name,result});console.log('PASS',name,JSON.stringify(result||{}));}
 (async()=>{const f=await fixture();try{
  const {db,root}=f;await db.$executeRawUnsafe(`SET TIME ZONE '${zone}'`);
- const s=await scope(db),now=new Date(),ago=d=>new Date(+now-d*86400000);
+ const s=await scope(db,undefined,{bareSessionForTimezoneProof:true}),now=new Date(),ago=d=>new Date(+now-d*86400000);
  require.cache[require.resolve(path.join(root,'src/prisma'))]={exports:db};
  const kernel=require(path.join(root,'src/services/db-commit-kernel')),work=require(path.join(root,'src/services/domain-work-authority-service')),
   projection=require(path.join(root,'src/services/campaign-read-projection-service')),read=require(path.join(root,'src/services/campaign-read-repository')),
@@ -26,7 +26,7 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
   return {projectionStates:0,backfillUnits:0,ready:true};
  });
  await check('trigger publication and dependency wake preserve UTC outside application transactions',async()=>{
-  // scope() deliberately uses a plain transaction in the requested timezone.
+  // This scope explicitly uses a plain transaction in the requested timezone.
   // This exercises the DB publisher used by old replicas and creator triggers.
   const initial=await db.domainWorkItem.findFirst({where:{creatorId:s.creatorId,workClass:'TRAFFIC_BACKFILL'}});
   assert(initial);assert(+initial.availableAt<=Date.now());assert(Date.now()-initial.availableAt<60000);

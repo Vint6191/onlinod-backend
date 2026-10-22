@@ -7,6 +7,12 @@ const assert = require("node:assert/strict");
 
 const prismaId = require.resolve("../prisma");
 require.cache[prismaId] = { id: prismaId, filename: prismaId, loaded: true, exports: {} };
+// The reverse-feed owner has its own SQL rollback/idempotency proof. This unit
+// fixture models notification storage only; verify its transaction handoff.
+require.cache[require.resolve("./creator-entity-change-service")] = { exports: {
+  async publishCanonicalSales({db, saleIds}) { assert.ok(db); assert.ok(saleIds.length); return {staged:true}; },
+  async publishCanonicalFactInvalidations({db, ids}) { assert.ok(db); assert.ok(ids.length); return {staged:true}; },
+} };
 delete require.cache[require.resolve("./notification-facts-service")];
 const {
   normalizeEvent,

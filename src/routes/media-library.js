@@ -45,24 +45,12 @@ const metadataSchema = z.object({
   storylineOrder: z.number().int().min(-100000).max(100000).nullable().optional(),
   storylineRole: z.enum(["main", "additional"]).nullable().optional(),
 });
-const usageItemSchema = z.object({
-  mediaId: z.string().min(1).max(240),
-  sentCount: z.number().int().min(0).max(10_000_000),
-  soldCount: z.number().int().min(0).max(10_000_000),
-  notOpenedCount: z.number().int().min(0).max(10_000_000),
-  freeCount: z.number().int().min(0).max(10_000_000),
-  revenueCents: z.number().int().min(0).max(2_000_000_000),
-  uniqueBuyers: z.number().int().min(0).max(10_000_000),
-  lastSoldAt: z.string().max(100).nullable().optional(),
-});
+// The v2 service validates bounded stable facts and their hash/count manifest.
+// Keep these objects intact: stripping proof fields before validation is unsafe
+// during rolling deployments, and would invalidate the canonical page hash.
 const usageSourcesSchema = z.object({
   accessEpoch: z.number().int().min(0),
-  sources: z.array(z.object({
-    sourceKey: z.string().min(1).max(240),
-    sourceRevision: z.string().min(1).max(100),
-    capturedAt: z.string().max(100).optional(),
-    items: z.array(usageItemSchema).max(2000),
-  })).min(1).max(25),
+  sources: z.array(z.object({ protocolVersion: z.literal(2) }).passthrough()).min(1).max(25),
 });
 const folderMutationSchema = z.object({
   mediaIds: z.array(z.string().min(1).max(240)).min(1).max(5000),
@@ -93,6 +81,8 @@ function sendError(res, error, fallbackCode) {
     ok: false,
     code,
     error: String(error?.message || error || "Media Library request failed"),
+    ...(error?.sourceKey ? { sourceKey: error.sourceKey } : {}),
+    ...(error?.reason ? { reason: error.reason } : {}),
   });
 }
 
@@ -191,6 +181,7 @@ async function putCurrentAuthorizedUsageSources(req, res) {
 // New Desktop builds use a versioned path so they fail closed against an old
 // backend replica instead of having accessEpoch stripped by the legacy Zod
 // object and committing without generation proof during a rolling deploy.
+router.put("/:creatorId/usage-sources/complete-v2/current-authorized", putCurrentAuthorizedUsageSources);
 router.put("/:creatorId/usage-sources/current-authorized", putCurrentAuthorizedUsageSources);
 // The legacy path remains mounted only with the same mandatory proof. Old
 // Desktop builds therefore fail closed after the backend rollout.

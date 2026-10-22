@@ -71,5 +71,6 @@ test("A20 mixed observation batch reconciles only fans that actually projected v
   assert.match(authority, /const valueFanIds = rows\.filter\(\(row\) => row\.value\)\.map\(\(row\) => row\.onlyFansUserId\)/);
   const calls = authority.match(/fanIds: valueFanIds/g) || [];
   assert.equal(calls.length, 2, "both SQL production and adapter fallback paths must scope healing to value observations");
-  assert.doesNotMatch(authority, /fanIds: touchedFanIds/);
+  assert.doesNotMatch(authority, /reconcileCampaignFanRefreshDemandsFromCanonicalObservations\(\{[^}]*fanIds: touchedFanIds/);
+  assert.match(authority, /publishCanonicalFanChanges\(\{[^}]*fanIds: touchedFanIds/, "identity and relationship changes still invalidate the canonical fan read");
 });

@@ -1,3 +1,4 @@
+require("../../scripts/test-support/canonical-change-publication-fixture").installCanonicalChangePublicationFixture();
 "use strict";
 const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 
@@ -296,7 +297,8 @@ test("INT5.1C FanData server generations use durable DB-owned clocks rather than
   assert.match(refresh, /const receivedAt = await dbAuthorityNow\(\{ db, fallbackNow: new Date\(\) \}\)/);
   assert.match(refresh, /observationTokenRequired = Number\(job\?\.params\?\.observationTokenVersion/);
   assert.match(refresh, /consumeFanObservationToken/);
-  assert.match(refresh, /causalObservedAt = date\(consumedToken\.observedAt\)/);
+  assert.match(refresh, /const observedAt = date\(consumedToken\.observedAt\)/);
+  assert.match(refresh, /causalObservedAtByFan\.set\(fanId, observedAt\)/);
   assert.match(refresh, /causalObservedAt = date\(job\.createdAt\)/);
   assert.doesNotMatch(refresh, /causalObservedAt = date\(job\.startedAt\)/);
   assert.doesNotMatch(refresh, /causalObservedAt = date\(job\.claimedAt\)/);

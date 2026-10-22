@@ -1,6 +1,7 @@
 "use strict";
 // This queue is created by incomplete money events. Its timer reads durable work
 // only: it never invents a source scan for a healthy, idle creator.
+const { performance } = require("node:perf_hooks");
 const work = require("./domain-work-authority-service");
 const { runRootCommit } = require("./db-commit-kernel");
 const { dbAuthorityNow } = require("./db-time-authority-service");
@@ -76,7 +77,7 @@ async function processRequest({db,item,ownerToken}) {
     if(active)return wait(`FINANCIAL_${active.status}`,active.status==="PAUSED"?300000:30000);
     const [proof]=await tx.$queryRawUnsafe(`SELECT "activeGeneration" FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$1`,item.creatorId);
     if(!proof?.activeGeneration)return wait("BASELINE_REQUIRED",300000);
-    const prior=request.jobId?await tx.jobInstance.findUnique({where:{id:request.jobId},select:{status:true,lastError:true}}):null;
+    const prior=request.jobId?await tx.jobInstance.findUnique({where:{id:request.jobId},select:{status:true,lastError:true,params:true}}):null;
     const attempts=request.targetId===target.id?request.attempts:0;
     if(attempts>=MAX_ATTEMPTS || (request.targetId===target.id && prior?.status==="CANCELLED")) {
       await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v7',true)");
@@ -89,8 +90,13 @@ async function processRequest({db,item,ownerToken}) {
       const exact=await require("./earnings-generation-service").activeEntry(tx,item.creatorId,target.transactionId);
       if(exact)occurred=exact.occurredAt;
     }
-    const from=new Date(Math.floor(+occurred/3600000)*3600000),to=new Date(Math.min(+from+3600000,Math.floor(+now/1000)*1000));
-    if(+from>+to || +from<+new Date("2016-01-01T00:00:00Z"))return wait("SOURCE_TIME_INVALID",300000);
+    const previousBounds = request.targetId === target.id && prior?.params?.moneyResolutionObservationId === target.id ? prior.params : null;
+    const from = previousBounds ? require("./financial-receipt-authority").date(previousBounds.startDate) : new Date(Math.floor(+occurred/3600000)*3600000);
+    const to = previousBounds ? require("./financial-receipt-authority").date(previousBounds.endDate) : new Date(Math.min(+from+3600000,Math.floor(+now/1000)*1000));
+    if (!from || !to || +from > +to) {
+      await tx.$executeRawUnsafe(`UPDATE "CreatorMoneyObservation" SET "resolutionBlockedAt"=$2,"resolutionError"='SOURCE_TIME_INVALID' WHERE id=$1`,target.id,now);
+      return wait("SOURCE_TIME_INVALID",1000);
+    }
     const state=await tx.creatorFinancialCollectionState.findUnique({where:{creatorId:item.creatorId}});
     const params=control.stampCollectionAuthorityParams({
       ...control.buildCollectionCommand({collectorType:"FINANCIAL",collectionMode:"catchup",reason:"LIVE_MONEY_RESOLUTION",now}),

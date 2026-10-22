@@ -122,11 +122,13 @@ test("INT2.5 routes fence each durable realtime commit without replacing busines
   const statsBlock = stats.slice(statsStart);
   assert.match(statsBlock, /withRealtimeIngestGenerationFence\(\{[\s\S]*db: prisma[\s\S]*accessEpoch: memberAccessEpoch/);
   assert.match(statsBlock, /work: async \(\{ tx \}\) => \{\s*await assertLiveBinding\(tx\)/);
-  assert.match(statsBlock, /ingestNotificationFacts\(\{\s*db:\s*tx/);
-  assert.match(statsBlock, /ingestNotificationSourcePage\(\{\s*db:\s*tx/);
-  assert.match(statsBlock, /ingestLive\(\{\s*db:\s*tx/);
-  assert.match(statsBlock, /acceptDelivery\(\{\s*db:\s*tx/);
-  assert.match(statsBlock, /withRealtimeIngestGenerationFence\(\{[\s\S]*recordNotificationSocketEvent\(\{\s*db:\s*tx/);
+  const processor = fs.readFileSync(path.join(__dirname, "data-change-processor-service.js"), "utf8");
+  assert.match(statsBlock, /processLiveNotificationBatch\(\{[\s\S]*db:tx/);
+  assert.match(processor, /ingestNotificationFacts\(\{\s*db:\s*tx/);
+  assert.match(processor, /ingestNotificationSourcePage\(\{\s*db:\s*tx/);
+  assert.match(processor, /ingestLive\(\{\s*db:\s*tx/);
+  assert.match(processor, /acceptDelivery\(\{\s*db:\s*tx/);
+  assert.match(processor, /recordNotificationSocketEvent\(\{\s*db:\s*tx/);
 
   const notifications = fs.readFileSync(path.join(__dirname, "notification-facts-service.js"), "utf8");
   const ingestStart = notifications.indexOf("async function ingestNotificationFacts");

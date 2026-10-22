@@ -42,15 +42,60 @@ test("contract errors, generic retryable flags, stale error metadata and write m
   assert.equal(classifyCollectorReadFailure({ job: { ...job, params: { moneyResolutionVersion: 1 } }, error: "lease expired" }), null);
 });
 
-test("new failures use the current exact failed job and bound generation backoff to fifteen minutes", async () => {
+test("terminal failure keeps its budget exhausted even when the transport error was retryable", async () => {
   const now = new Date("2026-10-20T12:00:00Z");
   const current = { ...job, status: "FAILED", lastError: message, result: { failure: failure("SESSION_FETCH_FAILED", 0) } };
   const classify = source => collectionFailureRetry({ db: { jobInstance: { findUnique: async () => source } }, job, error: message, terminal: true, now });
   const result = await classify(current);
-  assert.equal(+result.retryAt - +now, MAX_RETRY_MS);
+  assert.equal(result.retryAt, null);
+  assert.equal(result.terminal, true);
   for (const source of [{ ...current, creatorId: "other" }, { ...current, agencyId: "other" },
     { ...current, status: "CLAIMED" }, { ...current, lastError: "previous attempt" },
     { ...current, id: "other" }, { ...current, jobKey: "send_message" }]) assert.equal(await classify(source), null);
   const auth = await classify({ ...current, result: { failure: failure("OF_REQUEST_FAILED", 401, { retryable: false }) } });
   assert.equal(auth.waitingForSession, true); assert.equal(auth.retryAt, null);
+});
+
+
+test("a new process or ready binding cannot resurrect a stopped collector", async () => {
+  const state = { status: "FAILED", sourceJobId: "source", activeGeneration: "episode", retryAfterAt: null };
+  const { recoverTerminalCollector } = require("./collector-retry-policy");
+  for (let restart = 0; restart < 5; restart++) {
+    const result = await recoverTerminalCollector({ db: new Proxy({}, { get() { throw new Error("must not mutate stopped episode"); } }), state,
+      type: "FINANCIAL", agencyId: "a", creatorId: "c", now: new Date() });
+    assert.equal(result.state, state); assert.equal(result.recovered, false);
+  }
+});
+test("same-job nonterminal retry uses the committed deadline", async () => {
+  const now = new Date("2026-10-20T12:00:00Z"), nextRunAt = new Date(+now+60000);
+  const current = { ...job, status: "SCHEDULED", nextRunAt, lastError: message, result: { failure: failure("SESSION_FETCH_FAILED", 0) } };
+  const result = await collectionFailureRetry({db:{jobInstance:{findUnique:async()=>current}},job,error:message,terminal:false,now});
+  assert.equal(+result.retryAt,+nextRunAt); assert.equal(result.terminal,false);
+});
+
+test("legacy retry deadlines cannot replenish an exhausted or missing source episode", async () => {
+  const { recoverTerminalCollector } = require("./collector-retry-policy");
+  const source = { ...job, params: { collectionGeneration: "episode" }, status: "FAILED" };
+  for (const retryAfterAt of [new Date("2020-01-01"), new Date("2099-01-01"), "invalid"])
+    for (const stored of [source, null, { ...source, status: "COMPLETED" }, { ...source, status: "CANCELLED" },
+      { ...source, status: "SCHEDULED", agencyId: "other" }, { ...source, status: "SCHEDULED", creatorId: "other" },
+      { ...source, status: "SCHEDULED", jobKey: "fetch_campaigns" },
+      { ...source, status: "SCHEDULED", params: { collectionGeneration: "different" } }]) {
+      const state = { status: "FAILED", sourceJobId: job.id, activeGeneration: "episode", retryAfterAt };
+      const result = await recoverTerminalCollector({ db: { jobInstance: { findUnique: async () => stored } },
+        state, type: "FINANCIAL", agencyId: job.agencyId, creatorId: job.creatorId });
+      assert.equal(result.terminal, true); assert.equal(result.active, undefined); assert.equal(result.state, state);
+    }
+});
+
+test("only the exact active source job preserves a bounded retry episode", async () => {
+  const { recoverTerminalCollector } = require("./collector-retry-policy");
+  for (const status of ["SCHEDULED", "CLAIMED", "PUBLISHING", "PAUSED"])
+    for (const retryAfterAt of [new Date("2020-01-01"), new Date("2099-01-01")]) {
+      const state = { status: "FAILED", sourceJobId: job.id, activeGeneration: "episode", retryAfterAt };
+      const result = await recoverTerminalCollector({ db: { jobInstance: { findUnique: async () => ({ ...job, status,
+        params: { collectionGeneration: "episode" } }) } }, state, type: "FINANCIAL", agencyId: job.agencyId, creatorId: job.creatorId });
+      assert.equal(result.active, true); assert.equal(result.terminal, undefined); assert.equal(result.recovered, false);
+      assert.equal(result.state, state);
+    }
 });

@@ -1,6 +1,6 @@
 "use strict";
 const { hashCanonicalJson } = require("./realtime-receipt-hash");
-const enabled = (job) => job.params?.notificationMode === "catchup" && job.params?.notificationFrontierVersion === 2;
+const enabled = (job) => job.params?.notificationMode === "catchup" && [2, 3].includes(job.params?.notificationFrontierVersion);
 class NotificationFrontierError extends Error {
   constructor(code) {
     super(code);
@@ -12,13 +12,31 @@ class NotificationFrontierError extends Error {
 const fail = (code) => {
   throw new NotificationFrontierError(code);
 };
-async function commitPage(db, job, chunk, previous) {
+// Only persistence can decide whether a page changed the source. IDs alone do
+// not reveal corrected facts, and a row inserted by this walk is never baseline
+// evidence. A fixed episode bound survives machine handoff and delayed starts.
+function assessPage(job, rows, previousByIdentity, outcomes = new Map()) {
+  const knownBefore = new Date(job.params?.recoveryTargetAt || job.params?.notificationKnownBeforeAt || job.params?.collectionRequestedAt);
+  const gapFrom = job.params?.recoveryGapFrom ? new Date(job.params.recoveryGapFrom) : null;
+  const unchanged = rows.length > 0 && Number.isFinite(+knownBefore) && rows.every(row => {
+    const prior = previousByIdentity.get(row.identityKey);
+    const outcome = outcomes.get(row.identityKey);
+    return prior && Number.isFinite(+new Date(prior.firstObservedAt)) && +new Date(prior.firstObservedAt) < +knownBefore
+      && prior.sourceChecksum === row.sourceChecksum
+      && prior.persistenceStatus !== "REJECTED" && row.disposition !== "REJECTED"
+      && (!outcome || outcome.status === prior.persistenceStatus && (outcome.canonicalFactId || null) === (prior.canonicalFactId || null));
+  });
+  const pastGap = !gapFrom || Number.isFinite(+gapFrom) && rows.length > 0
+    && rows.every(row => row.occurredAt && +new Date(row.occurredAt) <= +gapFrom);
+  return { unchanged, pastGap };
+}
+async function commitPage(db, job, chunk, previous, assessment = null) {
   if (!enabled(job)) return previous || {};
   const generation = job.params.collectionGeneration;
   const p =
     previous?.generation === generation
       ? previous
-      : { generation, page: 0, cursor: null, phase: "SEEK", boundaryPage: null };
+      : { generation, page: 0, cursor: null, phase: "SEEK", boundaryPage: null, unchangedPages: 0 };
   const digest = hashCanonicalJson(chunk);
   const [receipt] = await db.$queryRawUnsafe(
     'SELECT digest FROM "CreatorNotificationFrontierPage" WHERE "creatorId"=$1 AND generation=$2 AND page=$3',
@@ -40,8 +58,10 @@ async function commitPage(db, job, chunk, previous) {
   if (typeof chunk.sourceHasMore !== "boolean" || !Array.isArray(chunk.observations))
     fail("NOTIFICATION_FRONTIER_PAGE_INVALID");
   const ids = chunk.observations.map((row) => row.notificationId).filter(Boolean);
-  const known = new Set([...(job.params.knownNotificationIds || []), job.params.stopAtNotificationId].filter(Boolean));
-  const boundary = ids.length > 0 && ids.length === chunk.observations.length && ids.every((id) => known.has(id));
+  // A truncated wire prefix is not a whole provider page. It can persist data
+  // and advance the cursor, but cannot count toward the three-page proof.
+  const boundary = assessment?.unchanged === true && assessment?.pastGap === true
+    && chunk.providerPageComplete === true && ids.length > 0 && ids.length === chunk.observations.length;
   const cursor = chunk.cursorEnd || null;
   if (chunk.sourceHasMore && (!ids.length || !cursor || cursor === p.cursor || ids.at(-1) !== cursor))
     fail("NOTIFICATION_FRONTIER_CURSOR_STALLED");
@@ -54,20 +74,20 @@ async function commitPage(db, job, chunk, previous) {
     );
     if (cycle) fail("NOTIFICATION_FRONTIER_CURSOR_CYCLE");
   }
-  const done = !chunk.sourceHasMore || p.phase === "OVERLAP";
+  const unchangedPages = boundary ? Number(p.unchangedPages || 0) + 1 : 0;
+  const done = !chunk.sourceHasMore || unchangedPages >= 3;
   const next = {
     generation,
+    frontierVersion: 3,
     page: chunk.page,
     cursor: done ? null : cursor,
     phase: done ? "DONE" : boundary ? "OVERLAP" : "SEEK",
-    boundaryPage: p.boundaryPage || (boundary ? chunk.page : null),
-    overlapPage: p.phase === "OVERLAP" ? chunk.page : null,
+    unchangedPages,
+    boundaryPage: boundary ? (p.unchangedPages ? p.boundaryPage : chunk.page) : null,
+    overlapPage: done && unchangedPages >= 3 ? chunk.page : null,
     exhausted: !chunk.sourceHasMore,
   };
-  if (
-    chunk.sourceExhausted !== done ||
-    (done && chunk.stopReason !== (!chunk.sourceHasMore ? "source_exhausted" : "known_boundary_reached"))
-  )
+  if (chunk.sourceExhausted && !done || !chunk.sourceHasMore && chunk.stopReason !== "source_exhausted")
     fail("NOTIFICATION_FRONTIER_COMPLETION_INVALID");
   await db.$executeRawUnsafe(
     'INSERT INTO "CreatorNotificationFrontierPage"("creatorId","agencyId",generation,page,"cursorStart","cursorEnd",digest) VALUES($1,$2,$3,$4,$5,$6,$7)',
@@ -86,7 +106,27 @@ function completed(job, receipt) {
     !enabled(job) ||
     (receipt?.generation === job.params.collectionGeneration &&
       receipt.phase === "DONE" &&
-      (receipt.exhausted === true || receipt.overlapPage === receipt.boundaryPage + 1))
+      (receipt.exhausted === true || receipt.frontierVersion === 3 && receipt.unchangedPages >= 3
+        && receipt.overlapPage === receipt.boundaryPage + 2))
   );
 }
-module.exports = { NotificationFrontierError, enabled, commitPage, completed };
+
+function attachContinuation(job, requestedContinuation, sideEffect) {
+  if (!enabled(job) || !sideEffect?.notificationFrontier) return null;
+  if (sideEffect.replayed) return job.continuation;
+  const receipt = sideEffect.notificationFrontier;
+  const envelope = requestedContinuation || {};
+  if (envelope.driverPhase === "complete") {
+    if (receipt.phase !== "DONE") fail("NOTIFICATION_FRONTIER_COMPLETION_INVALID");
+    return envelope;
+  }
+  const domain = envelope.driverPhase === "execute" ? envelope.jobContinuation : envelope;
+  if (!domain || domain.scanRunId !== receipt.generation || domain.page !== receipt.page)
+    fail("NOTIFICATION_FRONTIER_CONTINUATION_INVALID");
+  const next = { ...domain, fromId: receipt.cursor || undefined, sourceExhausted: receipt.phase === "DONE",
+    unchangedPages: receipt.unchangedPages, boundaryPage: receipt.boundaryPage || undefined,
+    overlapPending: receipt.phase === "OVERLAP",
+    stopReason: receipt.phase === "DONE" ? (receipt.exhausted ? "source_exhausted" : "known_boundary_reached") : undefined };
+  return envelope.driverPhase === "execute" ? { ...envelope, jobContinuation: next } : next;
+}
+module.exports = { NotificationFrontierError, enabled, assessPage, commitPage, completed, attachContinuation };

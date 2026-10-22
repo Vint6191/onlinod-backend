@@ -263,6 +263,8 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result, publ
   if (job.jobKey === SFS_TARGET_SCAN_JOB_KEY) return applySfsTargetScanCompletion({ db, job, deviceId, userId, result: result || {} });
   if (job.jobKey === FAN_DATA_POINT_REFRESH_JOB_KEY) {
     const demandCoverage = await finalizeCampaignFanRefreshJob({ db, job, result: result || {} });
+    if (demandCoverage?.failedFanIds?.length) await require("./campaign-fan-change-publication").publishCanonicalFanChanges({
+      db, agencyId: job.agencyId, creatorId: job.creatorId, fanIds: demandCoverage.failedFanIds });
     return { ok: true, type: "fan_data_point_refresh", ...(asObject(result)), demandCoverage };
   }
   if (job.jobKey === SUBSCRIBER_DIRECTORY_JOB_KEY) {
@@ -271,7 +273,8 @@ async function applyJobResult({ db = prisma, job, deviceId, userId, result, publ
   throw new Error(`No backend result applier registered for ${job.jobKey}`);
 }
 
-async function recordJobFailure({ db = prisma, job, error, terminal = true, retryAfterAt = null }) {
+async function recordJobFailureOwned({ db = prisma, job, error, terminal = true, retryAfterAt = null }) {
+
   if (job.jobKey === FINANCIAL_TRANSACTIONS_JOB_KEY) return recordFinancialCollectionFailure({ db, job, error, terminal, retryAfterAt });
   if (job.jobKey === CAMPAIGNS_JOB_KEY) return recordCampaignCollectionFailure({ db, job, error, terminal, retryAfterAt });
   if (job.jobKey === DIALOG_INTELLIGENCE_JOB_KEY) {
@@ -284,6 +287,28 @@ async function recordJobFailure({ db = prisma, job, error, terminal = true, retr
   if ([SFS_DISCOVERY_JOB_KEY, SFS_TARGET_SCAN_JOB_KEY].includes(job.jobKey)) return recordSfsJobFailure({ db, job, error, terminal });
   if (job.jobKey === FAN_DATA_POINT_REFRESH_JOB_KEY) return recordCampaignFanRefreshJobFailure({ db, job, error, terminal });
   return null;
+}
+
+async function recordJobFailure(input) {
+  const { db = prisma, job, error, terminal = true } = input;
+  const outcome = await recordJobFailureOwned(input);
+  if (job.jobKey === FAN_DATA_POINT_REFRESH_JOB_KEY && terminal && outcome?.failedFanIds?.length) {
+    await require("./campaign-fan-change-publication").publishCanonicalFanChanges({
+      db, agencyId: job.agencyId, creatorId: job.creatorId, fanIds: outcome.failedFanIds });
+  }
+  if (require("./creator-live-sync-service").JOB_STREAM[job.jobKey]) {
+    if (terminal && job.params?.recoveryIntentId && outcome?.publicationRecoveryPending !== true) {
+      const current = await db.jobInstance.findUnique({ where: { id: job.id }, select: { attempts: true } });
+      await require("./creator-live-sync-service").stopRecovery(db, job, error,
+        { attempts: Math.max(Number(current?.attempts || 0), Number(job.attempts || 0)) });
+    }
+    // A stopped source must release independent initial stages promptly. This
+    // wakes planning; it grants no new retry budget to the stopped episode.
+    await require("./subscriber-directory-maintenance-signal-service").signalSubscriberDirectoryMaintenance({
+      db, agencyId: job.agencyId, creatorId: job.creatorId, kind: "DERIVED_PLANNING", reason: "SOURCE_JOB_SETTLED",
+    });
+  }
+  return outcome;
 }
 
 module.exports = { EARNINGS_JOB_KEY, CAMPAIGNS_JOB_KEY, applyJobChunk, applyJobResult, recordJobFailure };

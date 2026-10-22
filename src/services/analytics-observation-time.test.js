@@ -50,8 +50,8 @@ for (const type of ["NOTIFICATIONS", "FINANCIAL"]) test(`${type} first claim aft
   const params = stampUnstartedCollectionObservation(queued, now);
   assert.equal(params.analyticsObservationStartedAt, now.toISOString());
   for (const field of ["collectionGeneration", "collectionAuthorityRequestedAt", "from", "stopAtNotificationId", "knownNotificationIds"]) assert.deepEqual(params[field], before.params[field]);
-  if (type === "NOTIFICATIONS") assert.equal(params.to, "2026-10-01T12:05:00.000Z");
-  else { assert.equal(params.endDate, "2026-10-01 12:00:00"); assert.equal(params.initialMarker, +now/1000); }
+  if (type === "NOTIFICATIONS") assert.equal(params.to, "2026-09-28T12:05:00.000Z");
+  else { assert.equal(params.endDate, before.params.endDate); assert.equal(params.initialMarker, +new Date("2026-09-28T12:00:00Z")/1000); }
   assert.deepEqual(queued, before);
   assert.equal(stampUnstartedCollectionObservation({ ...queued, startedAt: old }, now), null);
   assert.equal(stampUnstartedCollectionObservation({ ...queued, continuation: { driverPhase: "execute" } }, now), null);
@@ -78,6 +78,15 @@ test("historical money resolution first claim stamps read time but preserves its
   assert.equal(stampUnstartedCollectionObservation({ ...claimed, continuation: receipts.initialCursor(claimed) }, new Date(+now + hour)), null);
   assert.equal(stampUnstartedCollectionObservation(claimed, new Date(+now + hour)), null);
   assert.deepEqual(queued, before);
+});
+
+test("only an unstarted financial recovery command can repair a fractional target to its fixed provider second", () => {
+  const queued=job("FINANCIAL","catchup"); queued.jobKey="financial_transactions_scan";
+  queued.params.recoveryTargetAt="2026-09-28T12:00:00.123Z";
+  assert.equal(stampUnstartedCollectionObservation(queued,now).endDate,"2026-09-28 12:00:01");
+  assert.equal(queued.params.endDate,"2026-09-28 12:00:00");
+  assert.equal(stampUnstartedCollectionObservation({...queued,startedAt:old},now),null);
+  assert.equal(stampUnstartedCollectionObservation({...queued,params:{...queued.params,financialWindowGeneration:"generation"}},now),null);
 });
 
 test("physical observation does not follow logical ordering or client payload time", () => {

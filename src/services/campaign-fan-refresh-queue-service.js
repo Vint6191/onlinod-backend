@@ -46,6 +46,7 @@ function uniqueCandidates(values) {
       onlyFansUserId: fanId,
       embeddedValueAvailable: candidate?.embeddedValueAvailable === true || existing.embeddedValueAvailable === true,
       valueObservedAt: asDate(candidate?.valueObservedAt) || existing.valueObservedAt || null,
+      valueAvailability: clean(candidate?.valueAvailability, 32) || existing.valueAvailability || null,
     });
   }
   return [...byId.values()].sort((a, b) => a.onlyFansUserId.localeCompare(b.onlyFansUserId));
@@ -256,8 +257,8 @@ async function ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, covera
   return state;
 }
 
-async function incrementCoverage(db, { creatorId, scanRunId, expected = 0, alreadyFresh = 0, queued = 0, outstanding = 0, failed = 0, now, state }) {
-  if (!(expected || alreadyFresh || queued || outstanding)) return;
+async function incrementCoverage(db, { creatorId, scanRunId, expected = 0, alreadyFresh = 0, queued = 0, outstanding = 0, failed = 0, unavailable = 0, now, state }) {
+  if (!(expected || alreadyFresh || queued || outstanding || unavailable)) return;
   // All callers hold creator Campaign authority. Classify the accumulated run,
   // not just this page: fresh-only arrivals cannot erase older queued/failed
   // debt. Keep proof publication with its existing completion authority.
@@ -271,7 +272,8 @@ async function incrementCoverage(db, { creatorId, scanRunId, expected = 0, alrea
       fanValueQueued: { increment: queued },
       fanValueOutstanding: { increment: outstanding },
       fanValueFailed: { increment: failed },
-      fanValueFreshnessStatus: totalOutstanding > 0 ? "QUEUED" : totalFailed > 0 ? "PARTIAL" : "COMPLETE",
+      fanValueUnavailable: { increment: unavailable },
+      fanValueFreshnessStatus: totalOutstanding > 0 ? "QUEUED" : (totalFailed > 0 || Number(state?.fanValueUnavailable || 0) + unavailable > 0) ? "PARTIAL" : "COMPLETE",
       fanValueCoverageUpdatedAt: now,
     },
   });
@@ -283,7 +285,7 @@ async function reconcileCampaignFanValueCoverage({ db, creatorId, scanRunId, now
   const coverage = coverageFromState(state, scanRunId);
   if (!coverage.matches) return state;
   const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
-  const freshnessStatus = coverage.outstanding > 0 ? "QUEUED" : coverage.failed > 0 ? "PARTIAL" : "COMPLETE";
+  const freshnessStatus = coverage.outstanding > 0 ? "QUEUED" : (coverage.failed > 0 || coverage.unavailable > 0) ? "PARTIAL" : "COMPLETE";
   const membershipComplete = String(state?.membershipCoverageStatus || "") === "COMPLETE";
   const frontierComplete = String(state?.campaignFrontierFreshnessStatus || "") === "COMPLETE";
   const overallComplete = membershipComplete && frontierComplete && freshnessStatus === "COMPLETE";
@@ -296,7 +298,7 @@ async function reconcileCampaignFanValueCoverage({ db, creatorId, scanRunId, now
       lastErrorCode: overallComplete ? null : (coverage.outstanding > 0 ? "CAMPAIGN_FAN_VALUE_REFRESH_PENDING" : "CAMPAIGN_FAN_VALUE_REFRESH_PARTIAL"),
       lastErrorMessage: overallComplete ? null : (coverage.outstanding > 0
         ? `Campaign membership is complete; ${coverage.outstanding} FanData refreshes are still outstanding`
-        : `Campaign membership is complete; ${coverage.failed} FanData refreshes failed`),
+        : `Campaign membership is complete; ${coverage.failed} FanData refreshes failed; ${coverage.unavailable} unavailable`),
     } : {}),
   };
   if (overallComplete) {
@@ -498,6 +500,8 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
         AND d."onlyFansUserId" = ANY($2::text[])
         AND d."status" IN ('QUEUED', 'FAILED')
         AND d."satisfiedRevision" < d."requestedRevision"
+        AND v."availability" IN ('AVAILABLE', 'UNAVAILABLE')
+        AND (v."availability" = 'UNAVAILABLE' OR v."totalNetCents" IS NOT NULL)
         AND v."fetchedAt" >= d."requestedFreshnessCutoffAt"
         AND v."fetchedAt" <= $4
       ORDER BY d."id"
@@ -569,7 +573,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
           "fanValueCoverageUpdatedAt" = $3,
           "fanValueFreshnessStatus" = CASE
             WHEN GREATEST(0, s."fanValueOutstanding" - d."queuedDone") > 0 THEN 'QUEUED'::"AnalyticsCoverageStatus"
-            WHEN GREATEST(0, s."fanValueFailed" - d."failedDone") > 0 THEN 'PARTIAL'::"AnalyticsCoverageStatus"
+            WHEN GREATEST(0, s."fanValueFailed" - d."failedDone") > 0 OR s."fanValueUnavailable" + d."unavailableDone" > 0 THEN 'PARTIAL'::"AnalyticsCoverageStatus"
             ELSE 'COMPLETE'::"AnalyticsCoverageStatus"
           END,
           "status" = CASE
@@ -577,6 +581,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
              AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
              AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
              AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+             AND s."fanValueUnavailable" + d."unavailableDone" = 0
               THEN 'COMPLETE'::"AnalyticsCoverageStatus"
             WHEN s."membershipCoverageStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
               THEN 'PARTIAL'::"AnalyticsCoverageStatus"
@@ -586,15 +591,15 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
           "lastErrorCode" = CASE
             WHEN s."membershipCoverageStatus" <> 'COMPLETE'::"AnalyticsCoverageStatus" THEN s."lastErrorCode"
             WHEN GREATEST(0, s."fanValueOutstanding" - d."queuedDone") > 0 THEN 'CAMPAIGN_FAN_VALUE_REFRESH_PENDING'
-            WHEN GREATEST(0, s."fanValueFailed" - d."failedDone") > 0 THEN 'CAMPAIGN_FAN_VALUE_REFRESH_PARTIAL'
+            WHEN GREATEST(0, s."fanValueFailed" - d."failedDone") > 0 OR s."fanValueUnavailable" + d."unavailableDone" > 0 THEN 'CAMPAIGN_FAN_VALUE_REFRESH_PARTIAL'
             ELSE NULL
           END,
           "lastErrorMessage" = CASE
             WHEN s."membershipCoverageStatus" <> 'COMPLETE'::"AnalyticsCoverageStatus" THEN s."lastErrorMessage"
             WHEN GREATEST(0, s."fanValueOutstanding" - d."queuedDone") > 0
               THEN 'Campaign membership is complete; ' || GREATEST(0, s."fanValueOutstanding" - d."queuedDone")::text || ' FanData refreshes are still outstanding'
-            WHEN GREATEST(0, s."fanValueFailed" - d."failedDone") > 0
-              THEN 'Campaign membership is complete; ' || GREATEST(0, s."fanValueFailed" - d."failedDone")::text || ' FanData refreshes failed'
+            WHEN GREATEST(0, s."fanValueFailed" - d."failedDone") > 0 OR s."fanValueUnavailable" + d."unavailableDone" > 0
+              THEN 'Campaign membership is complete; ' || GREATEST(0, s."fanValueFailed" - d."failedDone")::text || ' FanData refreshes failed; ' || (s."fanValueUnavailable" + d."unavailableDone")::text || ' unavailable'
             ELSE NULL
           END,
           "lastCompleteScanRunId" = CASE
@@ -602,6 +607,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
              AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
              AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
              AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+             AND s."fanValueUnavailable" + d."unavailableDone" = 0
               THEN d."scanRunId"
             ELSE s."lastCompleteScanRunId"
           END,
@@ -611,6 +617,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
              AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
              AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
              AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+             AND s."fanValueUnavailable" + d."unavailableDone" = 0
               THEN $3 ELSE s."baselineVerifiedAt" END,
           "baselineObservedAt" = CASE
             WHEN s."mode" = 'full'
@@ -618,6 +625,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
              AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
              AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
              AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+             AND s."fanValueUnavailable" + d."unavailableDone" = 0
               THEN s."membershipObservedAt" ELSE s."baselineObservedAt" END,
           "baselineGeneration" = CASE
             WHEN s."mode" = 'full'
@@ -625,6 +633,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
              AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
              AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
              AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+             AND s."fanValueUnavailable" + d."unavailableDone" = 0
               THEN s."activeGeneration" ELSE s."baselineGeneration" END,
           "lastCatchupCompletedAt" = CASE
             WHEN s."mode" = 'catchup'
@@ -632,6 +641,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
              AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
              AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
              AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+             AND s."fanValueUnavailable" + d."unavailableDone" = 0
               THEN $3 ELSE s."lastCatchupCompletedAt" END,
           "lastCatchupObservedAt" = CASE
             WHEN s."mode" = 'catchup'
@@ -639,6 +649,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
              AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
              AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
              AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+             AND s."fanValueUnavailable" + d."unavailableDone" = 0
               THEN s."membershipObservedAt" ELSE s."lastCatchupObservedAt" END,
           "lastCatchupGeneration" = CASE
             WHEN s."mode" = 'catchup'
@@ -646,6 +657,7 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservationsSetBas
              AND s."campaignFrontierFreshnessStatus" = 'COMPLETE'::"AnalyticsCoverageStatus"
              AND GREATEST(0, s."fanValueOutstanding" - d."queuedDone") = 0
              AND GREATEST(0, s."fanValueFailed" - d."failedDone") = 0
+             AND s."fanValueUnavailable" + d."unavailableDone" = 0
               THEN s."activeGeneration" ELSE s."lastCatchupGeneration" END,
           "updatedAt" = $3
       FROM delta d
@@ -721,6 +733,8 @@ async function reconcileCampaignFanRefreshDemandsFromCanonicalObservations({ db,
     const value = currentByFan.get(String(demand.onlyFansUserId));
     const observedAt = asDate(value?.valueObservedAt);
     if (!observedAt || !campaignFanRefreshIsFresh(observedAt, demand.requestedFreshnessCutoffAt, effectiveNow)) continue;
+    if (!["AVAILABLE", "UNAVAILABLE"].includes(String(value?.availability || "").toUpperCase())) continue;
+    if (String(value?.availability || "").toUpperCase() === "AVAILABLE" && value?.platformReportedTotalSpendCents == null && value?.totalNetCents == null) continue;
     const outcome = String(value?.availability || "").toUpperCase() === "AVAILABLE" ? WORK_STATUS.SUCCEEDED : WORK_STATUS.UNAVAILABLE;
     await db.creatorFanRefreshDemand.update({
       where: { id: demand.id },
@@ -1162,6 +1176,7 @@ async function scheduleDemandRefreshJob({ db, job, demands, scheduledAt, planner
       requestReason: "campaign_cross_run_refresh_demand_v2",
       observationTokenVersion: 1,
       observationReadLeaseVersion: 1,
+      fanDataPipelineVersion: 1,
       campaignRefreshQueueVersion: CAMPAIGN_FAN_REFRESH_QUEUE_VERSION,
       campaignRefreshDemandFanIds: rows.map((row) => row.fanId),
     },
@@ -1260,15 +1275,15 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
 
   // Even embedded values may come from an aged read lease. Only committed
   // canonical observation time proves freshness at this page's admission.
-  const fresh = newCandidates.filter((row) => campaignFanRefreshIsFresh(row.valueObservedAt, cutoff, scheduledAt));
+  const fresh = newCandidates.filter((row) => row.valueAvailability !== "MALFORMED" && campaignFanRefreshIsFresh(row.valueObservedAt, cutoff, scheduledAt));
   const stale = newCandidates.filter((row) => !fresh.includes(row));
   let freshCreated = 0;
   if (fresh.length) {
     const created = await db.creatorCampaignFanRefreshWork.createMany({
       data: fresh.map((row) => ({
         agencyId, creatorId, scanRunId: runId, scanStartedAt: runStartedAt, onlyFansUserId: row.onlyFansUserId,
-        campaignJobId, freshnessCutoffAt: cutoff, requestedRevision: 0, status: WORK_STATUS.ALREADY_FRESH,
-        outcome: WORK_STATUS.ALREADY_FRESH, observedAt: row.valueObservedAt || scheduledAt, completedAt: scheduledAt, scheduledAt,
+        campaignJobId, freshnessCutoffAt: cutoff, requestedRevision: 0, status: row.valueAvailability === "UNAVAILABLE" ? WORK_STATUS.UNAVAILABLE : WORK_STATUS.ALREADY_FRESH,
+        outcome: row.valueAvailability === "UNAVAILABLE" ? WORK_STATUS.UNAVAILABLE : WORK_STATUS.ALREADY_FRESH, observedAt: row.valueObservedAt || scheduledAt, completedAt: scheduledAt, scheduledAt,
       })),
       skipDuplicates: true,
     });
@@ -1383,7 +1398,8 @@ async function enqueueUniqueCampaignFanRefreshes({ db, job, scanRunId, scanStart
   await incrementCoverage(db, {
     creatorId, scanRunId: runId, cutoff,
     expected: freshCreated + staleCreated,
-    alreadyFresh: freshCreated,
+    alreadyFresh: freshCreated - fresh.filter(row => row.valueAvailability === "UNAVAILABLE").length,
+    unavailable: fresh.filter(row => row.valueAvailability === "UNAVAILABLE").length,
     queued: staleCreated,
     outstanding: staleCreated - failedCreated,
     failed: failedCreated,
@@ -1703,7 +1719,7 @@ function supportsSetBasedCampaignFanRefreshTerminal(db) {
     && Boolean(db?.creatorCampaignCollectionState);
 }
 
-async function transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId, creatorId, now, error } = {}) {
+async function transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId, creatorId, now, error, fanIds = null, exhausted = false, profileAttempts = 0 } = {}) {
   const jobId = clean(refreshJobId, 180);
   if (!jobId) return { applied: 0, workTransitioned: 0, coverageRunsUpdated: 0, topology: "set_based_v1" };
   const effectiveNow = asDate(now) || await dbAuthorityNow({ db, fallbackNow: new Date() });
@@ -1714,6 +1730,7 @@ async function transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId, 
       FROM "CreatorFanRefreshDemand" d
       WHERE d."activeRefreshJobId" = $1
         AND d."creatorId" = $4
+        AND ($5::text[] IS NULL OR d."onlyFansUserId" = ANY($5::text[]))
         AND NOT (
           COALESCE(d."activeRefreshRevision", 0) > 0
           AND d."requestedRevision" > d."activeRefreshRevision"
@@ -1753,17 +1770,17 @@ async function transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId, 
           "activeRefreshJobId" = NULL,
           "activeRefreshRevision" = NULL,
           "lastFailedAt" = $2,
-          "retryAttempts" = d."retryAttempts" + 1,
+          "retryAttempts" = GREATEST(d."retryAttempts" + 1, $7::int),
           "nextRetryAt" = CASE
-            WHEN d."retryAttempts" + 1 >= ${CAMPAIGN_FAN_REFRESH_MAX_RETRIES} THEN NULL
+            WHEN $6::boolean OR d."retryAttempts" + 1 >= ${CAMPAIGN_FAN_REFRESH_MAX_RETRIES} THEN NULL
             ELSE $2 + make_interval(mins => LEAST(30, (1 << LEAST(4, GREATEST(0, d."retryAttempts")))))
           END,
           "quarantinedAt" = CASE
-            WHEN d."retryAttempts" + 1 >= ${CAMPAIGN_FAN_REFRESH_MAX_RETRIES} THEN $2
+            WHEN $6::boolean OR d."retryAttempts" + 1 >= ${CAMPAIGN_FAN_REFRESH_MAX_RETRIES} THEN $2
             ELSE NULL
           END,
           "lastOutcome" = CASE
-            WHEN d."retryAttempts" + 1 >= ${CAMPAIGN_FAN_REFRESH_MAX_RETRIES} THEN 'QUARANTINED'
+            WHEN $6::boolean OR d."retryAttempts" + 1 >= ${CAMPAIGN_FAN_REFRESH_MAX_RETRIES} THEN 'QUARANTINED'
             ELSE 'RETRY_BACKOFF'
           END,
           "lastError" = $3,
@@ -1771,7 +1788,7 @@ async function transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId, 
       FROM candidate c
       WHERE d."id" = c."id"
         AND (SELECT "count" FROM unsafe) = 0
-      RETURNING d."id", d."creatorId"
+      RETURNING d."id", d."creatorId", d."onlyFansUserId", d."quarantinedAt"
     ), work_update AS (
       UPDATE "CreatorCampaignFanRefreshWork" w
       SET "status" = 'FAILED',
@@ -1828,19 +1845,48 @@ async function transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId, 
     SELECT
       (SELECT "count" FROM unsafe) AS "coverageTransitionLost",
       (SELECT COUNT(*)::int FROM demand_update) AS "applied",
+      ARRAY(SELECT "onlyFansUserId" FROM demand_update ORDER BY "onlyFansUserId") AS "failedFanIds",
+      ARRAY(SELECT "onlyFansUserId" FROM demand_update WHERE "quarantinedAt" IS NOT NULL ORDER BY "onlyFansUserId") AS "quarantinedFanIds",
       (SELECT COUNT(*)::int FROM work_update) AS "workTransitioned",
       (SELECT COUNT(*)::int FROM coverage_update) AS "coverageRunsUpdated"
-  `, jobId, effectiveNow, errorText, creatorId);
+  `, jobId, effectiveNow, errorText, creatorId, fanIds, exhausted, profileAttempts);
   const result = Array.isArray(rows) && rows[0] ? rows[0] : {};
   if (Math.max(0, Number(result.coverageTransitionLost || 0)) > 0) {
     throw new Error("CAMPAIGN_FAN_REFRESH_TERMINAL_COVERAGE_TRANSITION_LOST");
   }
   return {
     applied: Math.max(0, Number(result.applied || 0)),
+    failedFanIds: Array.isArray(result.failedFanIds) ? result.failedFanIds : [],
+    quarantinedFanIds: Array.isArray(result.quarantinedFanIds) ? result.quarantinedFanIds : [],
     workTransitioned: Math.max(0, Number(result.workTransitioned || 0)),
     coverageRunsUpdated: Math.max(0, Number(result.coverageRunsUpdated || 0)),
     topology: "set_based_v1",
   };
+}
+
+// Called by the same fenced progress transaction as the successful prefix and
+// checkpoint. Only the exhausted profile is terminal; later fans remain queued.
+async function recordCampaignFanRefreshProfileFailures({ db, job, failures = [], now = new Date() } = {}) {
+  if (!failures.length || !db?.creatorFanRefreshDemand?.findMany) return { applied: 0 };
+  await acquireCampaignTransactionLock(db, job.creatorId);
+  const fanIds = [...new Set(failures.map(row => clean(row?.fanId, 180)).filter(Boolean))];
+  const profileAttempts = Math.max(...failures.map(row => Number(row.attempts) || 1));
+  const error = clean(failures.map(row => `${row.code} status=${Number(row.status) || 0} fan=${row.fanId} attempts=${row.attempts}`).join("; "), 1000);
+  if (supportsSetBasedCampaignFanRefreshTerminal(db)) return transitionCampaignFanRefreshTerminalSetBased({
+    db, refreshJobId: job.id, creatorId: job.creatorId, now, error, fanIds, exhausted: true, profileAttempts,
+  });
+  const demands = await db.creatorFanRefreshDemand.findMany({ where: {
+    creatorId: job.creatorId, activeRefreshJobId: job.id, onlyFansUserId: { in: fanIds },
+  } });
+  for (const demand of demands) {
+    await db.creatorFanRefreshDemand.update({ where: { id: demand.id }, data: {
+      status: DEMAND_STATUS.FAILED, activeRefreshJobId: null, activeRefreshRevision: null,
+      retryAttempts: Math.max(Number(demand.retryAttempts || 0) + 1, profileAttempts), nextRetryAt: null,
+      quarantinedAt: now, lastFailedAt: now, lastOutcome: "QUARANTINED", lastError: error,
+    } });
+    await transitionWorkForDemand(db, { demand, outcome: WORK_STATUS.FAILED, observedAt: null, error, now });
+  }
+  return { applied: demands.length, failedFanIds: demands.map(row => row.onlyFansUserId), quarantinedFanIds: demands.map(row => row.onlyFansUserId) };
 }
 
 async function recordCampaignFanRefreshChunk({ db, job, chunkResult, applied: projectionReceipt = null, _campaignLockHeld = false } = {}) {
@@ -1909,6 +1955,8 @@ async function recordCampaignFanRefreshChunk({ db, job, chunkResult, applied: pr
     const value = currentByFan.get(String(demand.onlyFansUserId));
     const observedAt = asDate(value?.valueObservedAt);
     if (!observedAt || !campaignFanRefreshIsFresh(observedAt, demand.requestedFreshnessCutoffAt, now)) continue;
+    if (!["AVAILABLE", "UNAVAILABLE"].includes(String(value?.availability || "").toUpperCase())) continue;
+    if (String(value?.availability || "").toUpperCase() === "AVAILABLE" && value?.platformReportedTotalSpendCents == null && value?.totalNetCents == null) continue;
     const outcome = String(value?.availability || "").toUpperCase() === "AVAILABLE" ? WORK_STATUS.SUCCEEDED : WORK_STATUS.UNAVAILABLE;
     await db.creatorFanRefreshDemand.update({
       where: { id: demand.id },
@@ -1949,6 +1997,16 @@ async function signalCampaignDebtAfterTerminal({ db, job, creatorId, now, termin
   });
 }
 
+async function signalCampaignFanRefreshSettled(db, job) {
+  // FanData work is delegated and has no analyticsSyncKind=initial marker.
+  // Its final canonical demand transition must wake the initial-stage planner
+  // in this commit, including the all-success path with no active demands left.
+  return require("./subscriber-directory-maintenance-signal-service").signalSubscriberDirectoryMaintenance({
+    db, agencyId: job.agencyId, creatorId: job.creatorId,
+    kind: "DERIVED_PLANNING", reason: "CAMPAIGN_FAN_REFRESH_SETTLED",
+  });
+}
+
 async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner = null, _campaignLockHeld = false } = {}) {
   if (!db?.creatorFanRefreshDemand?.findMany || String(job?.jobKey || "") !== "fan_data_point_refresh") return null;
   const creatorId = clean(job?.creatorId, 180);
@@ -1964,7 +2022,10 @@ async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner =
   await lockDemandRowsByRefreshJob(db, job.id, creatorId);
   const demands = await db.creatorFanRefreshDemand.findMany({ where: { creatorId, activeRefreshJobId: job.id }, take: CAMPAIGN_FAN_REFRESH_OBSERVATION_MAX + 1 });
   if (demands.length > CAMPAIGN_FAN_REFRESH_OBSERVATION_MAX) throw new Error("CAMPAIGN_FAN_REFRESH_JOB_BINDINGS_OVERFLOW");
-  if (!demands.length) return { applied: 0, rescheduled: 0 };
+  if (!demands.length) {
+    await signalCampaignFanRefreshSettled(db, job);
+    return { applied: 0, rescheduled: 0 };
+  }
   const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
   const superseded = [];
   const failed = [];
@@ -1993,8 +2054,10 @@ async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner =
   if (failed.length && supportsSetBasedCampaignFanRefreshTerminal(db)) {
     terminal = await transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId: job.id, creatorId, now, error: errorText });
   } else {
+    const quarantinedFanIds = [];
     for (const demand of failed) {
       const { retryAttempts, quarantined, nextRetryAt, quarantinedAt, lastOutcome } = campaignFanRefreshFailurePlan(demand, now);
+      if (quarantined) quarantinedFanIds.push(demand.onlyFansUserId);
       await db.creatorFanRefreshDemand.update({
         where: { id: demand.id },
         data: {
@@ -2011,14 +2074,18 @@ async function finalizeCampaignFanRefreshJob({ db, job, result = null, planner =
       });
       await transitionWorkForDemand(db, { demand, outcome: WORK_STATUS.FAILED, observedAt: null, error: errorText, now });
     }
-    terminal = { applied: failed.length, topology: "adapter_fallback" };
+    terminal = { applied: failed.length, topology: "adapter_fallback", failedFanIds: failed.map(row => row.onlyFansUserId),
+      quarantinedFanIds };
   }
   const deferred = followUpJobId ? 0 : superseded.length;
   const promotionSignal = await signalCampaignDebtAfterTerminal({
     db, job, creatorId, now, terminalApplied: terminal.applied, deferred, reason: "TERMINAL_FINALIZE_DEBT",
   });
+  await signalCampaignFanRefreshSettled(db, job);
   return {
     applied: terminal.applied,
+    failedFanIds: terminal.failedFanIds || [],
+    quarantinedFanIds: terminal.quarantinedFanIds || [],
     rescheduled: followUpJobId ? superseded.length : 0,
     deferred,
     followUpJobId,
@@ -2044,7 +2111,10 @@ async function recordCampaignFanRefreshJobFailure({ db, job, error, terminal = t
   await lockDemandRowsByRefreshJob(db, job.id, creatorId);
   const demands = await db.creatorFanRefreshDemand.findMany({ where: { creatorId, activeRefreshJobId: job.id }, take: CAMPAIGN_FAN_REFRESH_OBSERVATION_MAX + 1 });
   if (demands.length > CAMPAIGN_FAN_REFRESH_OBSERVATION_MAX) throw new Error("CAMPAIGN_FAN_REFRESH_JOB_BINDINGS_OVERFLOW");
-  if (!demands.length) return { applied: 0, rescheduled: 0 };
+  if (!demands.length) {
+    await signalCampaignFanRefreshSettled(db, job);
+    return { applied: 0, rescheduled: 0 };
+  }
   const now = await dbAuthorityNow({ db, fallbackNow: new Date() });
   const superseded = [];
   const failed = [];
@@ -2061,8 +2131,10 @@ async function recordCampaignFanRefreshJobFailure({ db, job, error, terminal = t
   if (failed.length && supportsSetBasedCampaignFanRefreshTerminal(db)) {
     failedTransition = await transitionCampaignFanRefreshTerminalSetBased({ db, refreshJobId: job.id, creatorId, now, error: errorText });
   } else {
+    const quarantinedFanIds = [];
     for (const demand of failed) {
       const { retryAttempts, quarantined, nextRetryAt, quarantinedAt, lastOutcome } = campaignFanRefreshFailurePlan(demand, now);
+      if (quarantined) quarantinedFanIds.push(demand.onlyFansUserId);
       await db.creatorFanRefreshDemand.update({ where: { id: demand.id }, data: {
         status: DEMAND_STATUS.FAILED, activeRefreshJobId: null, activeRefreshRevision: null,
         lastFailedAt: now, retryAttempts, nextRetryAt, quarantinedAt,
@@ -2071,14 +2143,18 @@ async function recordCampaignFanRefreshJobFailure({ db, job, error, terminal = t
       } });
       await transitionWorkForDemand(db, { demand, outcome: WORK_STATUS.FAILED, observedAt: null, error: errorText, now });
     }
-    failedTransition = { applied: failed.length, topology: "adapter_fallback" };
+    failedTransition = { applied: failed.length, topology: "adapter_fallback", failedFanIds: failed.map(row => row.onlyFansUserId),
+      quarantinedFanIds };
   }
   const deferred = followUpJobId ? 0 : superseded.length;
   const promotionSignal = await signalCampaignDebtAfterTerminal({
     db, job, creatorId, now, terminalApplied: failedTransition.applied, deferred, reason: "TERMINAL_FAILURE_DEBT",
   });
+  await signalCampaignFanRefreshSettled(db, job);
   return {
     applied: failedTransition.applied,
+    failedFanIds: failedTransition.failedFanIds || [],
+    quarantinedFanIds: failedTransition.quarantinedFanIds || [],
     rescheduled: followUpJobId ? superseded.length : 0,
     deferred,
     followUpJobId,
@@ -2109,6 +2185,7 @@ module.exports = {
   repairFailedCampaignFanRefreshDemands,
   reconcileCampaignFanRefreshDemandsFromCanonicalObservations,
   recordCampaignFanRefreshChunk,
+  recordCampaignFanRefreshProfileFailures,
   finalizeCampaignFanRefreshJob,
   recordCampaignFanRefreshJobFailure,
   reconcileCampaignFanValueCoverage,

@@ -501,6 +501,7 @@ async function ingestNotificationSourcePage({
         lastErrorCode: rejectedRows ? "NOTIFICATION_ROWS_REJECTED" : null
       }
     });
+    let notificationState = null;
     if (!live) {
       await require("./notification-scan-control-service").recordNotificationScanItems({
         db: tx,
@@ -511,10 +512,11 @@ async function ingestNotificationSourcePage({
           auditItems
         }
       });
-      await require("./notification-sync-state-service").recordNotificationPageProgress({
+      notificationState = await require("./notification-sync-state-service").recordNotificationPageProgress({
         db: tx,
         job,
         deviceId,
+        frontierAssessment: require("./notification-frontier-authority").assessPage(job, rows, previousByIdentity, outcomes),
         chunk: {
           ...chunk,
           rejectedRows,
@@ -529,7 +531,8 @@ async function ingestNotificationSourcePage({
       status: receipt.status,
       observed: rows.length,
       rejected: rejectedRows,
-      batches: ledgers
+      batches: ledgers,
+      ...(notificationState?.frontierReceipt ? { notificationFrontier: notificationState.frontierReceipt } : {})
     };
   }, {
     maxWait: 10000,

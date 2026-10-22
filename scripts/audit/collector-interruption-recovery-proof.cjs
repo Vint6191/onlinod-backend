@@ -2,7 +2,7 @@
 // Disposable, fully migrated PostgreSQL/PGlite and real Prisma/services. These
 // fixtures recreate persisted pre-fix poison; no live database/provider access.
 const assert = require("node:assert/strict");
-const fs = require("node:fs"), path = require("node:path");
+const path = require("node:path");
 const { createAdminSqlRuntime } = require("../test-support/admin-sql-runtime.cjs");
 const { scope } = require("./analytics-traffic/fixture.cjs");
 const root = path.resolve(__dirname, "../..");
@@ -13,14 +13,13 @@ const checks = [], pass = name => { checks.push(name); console.log("PASS", name)
 (async () => {
   const f = await createAdminSqlRuntime({ runtimePath: process.env.ONLINOD_SQL_PROOF_RUNTIME });
   try {
-    let db = f.db;
+    const db = f.db;
     const now = new Date(), old = new Date(+now - 3 * 86400000);
     require.cache[require.resolve(root + "/src/prisma")] = { exports: db };
     const { runRootCommit } = require(root + "/src/services/db-commit-kernel");
     const commit = work => runRootCommit(db, ({ tx }) => work(tx));
-    let authority = require(root + "/src/services/domain-work-authority-service");
-    let sync = require(root + "/src/services/creator-live-sync-service");
-    let scheduler = require(root + "/src/services/job-scheduler");
+    const sync = require(root + "/src/services/creator-live-sync-service");
+    const scheduler = require(root + "/src/services/job-scheduler");
     const heartbeat = require(root + "/src/services/device-heartbeat-batch-service");
     const s = await scope(db, { agencyId: "recovery-agency", creatorId: "recovery-creator", userId: "recovery-owner" });
     const narrow = { agencyId: s.agencyId, creatorId: s.creatorId };
@@ -71,13 +70,14 @@ const checks = [], pass = name => { checks.push(name); console.log("PASS", name)
     const models = { catchup_notifications_scan: "creatorNotificationSyncState", financial_transactions_scan: "creatorFinancialCollectionState", fetch_campaigns: "creatorCampaignCollectionState" };
     const plan = () => orchestrator.ensureRecurringCreatorAnalyticsCatchups({ db, ...narrow });
     const queued = () => db.jobInstance.findMany({ where: { ...narrow, jobKey: { in: Object.keys(models) }, status: "SCHEDULED" } });
-    async function fail(job, error = "lease expired", failure = null) {
+    async function fail(job, error = "lease expired", failure = null, { terminal = true, attempts = 5 } = {}) {
       await commit(async tx => {
-        await tx.jobInstance.update({ where: { id: job.id }, data: { status: "FAILED", attempts: 5, lastError: error,
-          result: failure ? { failure } : {}, completedAt: new Date() } });
+        const retryAfterAt = terminal ? null : new Date(Date.now() + 5 * 60_000);
+        await tx.jobInstance.update({ where: { id: job.id }, data: { status: terminal ? "FAILED" : "SCHEDULED", attempts, lastError: error,
+          result: failure ? { failure } : {}, completedAt: terminal ? new Date() : null, ...(retryAfterAt ? { nextRunAt: retryAfterAt } : {}) } });
         // The production lease transaction calls the writer with the pre-update
         // job object. The failure classifier must reread this exact attempt.
-        await results.recordJobFailure({ db: tx, job, error, terminal: true });
+        await results.recordJobFailure({ db: tx, job, error, terminal, retryAfterAt });
       });
     }
     assert.equal((await plan()).created.length, 3);
@@ -95,7 +95,7 @@ const checks = [], pass = name => { checks.push(name); console.log("PASS", name)
     }), /INJECTED_ROLLBACK_AFTER_RETRY_SIGNAL/);
     assert.equal(await db.subscriberDirectoryMaintenanceSignal.count({ where: { ...narrow, kind: "DERIVED_PLANNING" } }), 0);
     assert.equal((await db.jobInstance.findUnique({ where: { id: originalJobs[0].id } })).status, "SCHEDULED");
-    for (const job of originalJobs) await fail(job);
+    for (const job of originalJobs) await fail(job, "lease expired", null, { terminal: false, attempts: 4 });
     for (const job of originalJobs) {
       const state = await db[models[job.jobKey]].findUnique({ where: { creatorId: s.creatorId } });
       assert.equal(state.status, "FAILED"); assert(+state.retryAfterAt > Date.now());
@@ -104,16 +104,18 @@ const checks = [], pass = name => { checks.push(name); console.log("PASS", name)
     for (let tick = 0; tick < 3; tick++) {
       const result = await plan();
       assert.equal(result.created.length, 0); assert.deepEqual(result.blocked, []);
-      assert(result.skipped.every(value => value.endsWith(":deferred")));
-      assert.equal(result.pendingRecoveryCount, 4); assert(result.nextRetryAt > new Date());
+      assert(result.skipped.every(value => value.endsWith(":already_in_flight")));
+      assert.equal(result.pendingRecoveryCount, 4);
+      const current = await queued();
+      assert.deepEqual(current.map(row => row.id).sort(), originalJobs.map(row => row.id).sort());
+      assert(current.every(row => row.attempts === 4));
     }
-    pass("five exhausted leases retain three recovery debts with bounded backoff, without new-job churn");
+    pass("nonterminal retries retain the same source job and four used attempts without new-generation churn");
     const retrySignal = await db.subscriberDirectoryMaintenanceSignal.findFirst({ where: { ...narrow, kind: "DERIVED_PLANNING" } });
-    assert.equal(retrySignal.reason, "COLLECTOR_RETRY"); assert(+retrySignal.dueAt > Date.now());
+    assert.equal(retrySignal.reason, "SOURCE_JOB_SETTLED"); assert(+retrySignal.dueAt <= Date.now());
     assert.equal(+(await plannerRow()).availableAt, +yielded.availableAt);
-    // Advance the disposable due-time fixture rather than waiting fifteen
-    // minutes. Dispatch uses the actual claim token/revision and DWI authority.
-    await db.subscriberDirectoryMaintenanceSignal.update({ where: { id: retrySignal.id }, data: { dueAt: new Date(0) } });
+    // Dispatch uses the actual claim token/revision and DWI authority. Waking
+    // planning must not replenish the source job's remaining attempt budget.
     const signalService = require(root + "/src/services/subscriber-directory-maintenance-signal-service");
     const claim = await signalService.claimSubscriberDirectoryMaintenanceSignal({ db });
     assert.equal(claim.kind, "DERIVED_PLANNING");
@@ -121,7 +123,24 @@ const checks = [], pass = name => { checks.push(name); console.log("PASS", name)
     assert(+(await plannerRow()).availableAt < +yielded.availableAt);
     assert(+(await plannerRow()).availableAt <= Date.now() + 1000);
     assert.equal(await db.subscriberDirectoryMaintenanceSignal.count({ where: { id: retrySignal.id } }), 0);
-    pass("failure after hourly planner yield commits a durable due-time outbox wake; transaction rollback leaves neither failure nor signal");
+    pass("failure after hourly planner yield commits a durable outbox wake; transaction rollback leaves neither failure nor signal");
+
+    for (const job of originalJobs) await fail(job);
+    for (const job of originalJobs) {
+      const state = await db[models[job.jobKey]].findUnique({ where: { creatorId: s.creatorId } });
+      assert.equal(state.status, "FAILED"); assert.equal(state.retryAfterAt, null);
+      const intent = await db.creatorRecoveryIntent.findUnique({ where: { id: job.params.recoveryIntentId } });
+      assert.equal(intent.status, "STOPPED"); assert.equal(intent.failedAttempts, 5); assert.equal(intent.jobId, job.id);
+    }
+    for (let tick = 0; tick < 3; tick++) {
+      const result = await plan();
+      assert.equal(result.created.length, 0); assert.equal(result.blocked.length, 3);
+      assert(result.blocked.every(row => row.reason === "failed_terminal"));
+      assert.equal(result.pendingRecoveryCount, 1); // the independent subscriber debt remains pending
+      assert.equal(result.nextRetryAt, null);
+    }
+    assert.equal((await queued()).length, 0);
+    pass("five exhausted attempts stop their exact recovery episodes and leave independent subscriber debt observable");
 
     // Persist the exact old168 state: the current generation failed three days
     // ago and retryAfterAt is NULL. This is a data fixture, not an UPDATE-all
@@ -135,23 +154,36 @@ const checks = [], pass = name => { checks.push(name); console.log("PASS", name)
     await db.$disconnect(); await db.$connect();
     delete require.cache[require.resolve(root + "/src/services/creator-analytics-sync-orchestrator")];
     orchestrator = require(root + "/src/services/creator-analytics-sync-orchestrator");
-    const recovered = await plan();
-    assert.equal(recovered.created.length, 3); assert.deepEqual(recovered.blocked, []);
-    const nextJobs = await queued();
-    for (const job of nextJobs) {
-      const previous = originalJobs.find(oldJob => oldJob.jobKey === job.jobKey);
-      assert.notEqual(job.id, previous.id); assert.notEqual(job.params.collectionGeneration, previous.params.collectionGeneration);
-      assert.equal((await db.jobInstance.findUnique({ where: { id: previous.id } })).status, "FAILED");
-      const intent = await db.creatorRecoveryIntent.findUnique({ where: { id: job.params.recoveryIntentId } });
-      assert.equal(intent.status, "RUNNING"); assert.equal(intent.jobId, job.id);
+    for (let tick = 0; tick < 3; tick++) {
+      const restarted = await plan();
+      assert.equal(restarted.created.length, 0); assert.equal(restarted.blocked.length, 3);
     }
-    for (let tick = 0; tick < 3; tick++) assert.equal((await plan()).created.length, 0);
-    assert.equal((await queued()).length, 3); assert.equal(await db.creatorRecoveryIntent.count({ where: narrow }), 4);
-    pass("restart recovers old terminal interruptions into exactly one fresh generation per stream and rebinds existing intents");
+    assert.equal((await queued()).length, 0); assert.equal(await db.creatorRecoveryIntent.count({ where: narrow }), 4);
+    for (const original of originalJobs) {
+      const job = await db.jobInstance.findUnique({ where: { id: original.id } });
+      assert.equal(job.status, "FAILED"); assert.equal(job.attempts, 5);
+      assert.equal(job.params.collectionGeneration, original.params.collectionGeneration);
+      const intent = await db.creatorRecoveryIntent.findUnique({ where: { id: original.params.recoveryIntentId } });
+      assert.equal(intent.status, "STOPPED"); assert.equal(intent.jobId, original.id);
+    }
+    pass("restart preserves old terminal jobs, attempt budgets and stopped intents instead of resurrecting their generations");
 
-    const campaign = nextJobs.find(job => job.jobKey === "fetch_campaigns");
-    const financial = nextJobs.find(job => job.jobKey === "financial_transactions_scan");
-    const notification = nextJobs.find(job => job.jobKey === "catchup_notifications_scan");
+    const creator = { id: s.creatorId, agencyId: s.agencyId };
+    const financialStart = await require(root + "/src/services/financial-transaction-scan-control-service").startManualFinancialTransactionScan({
+      db, creator, requestedByUserId: s.userId });
+    const notificationStart = await require(root + "/src/services/notification-scan-control-service").startManualNotificationScan({
+      db, creator, requestedByUserId: s.userId });
+    const financial = financialStart.job, notification = notificationStart.job;
+    const campaign = originalJobs.find(job => job.jobKey === "fetch_campaigns");
+    for (const job of [financial, notification]) {
+      const previous = originalJobs.find(oldJob => oldJob.jobKey === job.jobKey);
+      assert.equal(job.status, "SCHEDULED"); assert.equal(job.attempts, 0);
+      assert.notEqual(job.id, previous.id); assert.notEqual(job.params.collectionGeneration, previous.params.collectionGeneration);
+      assert.equal((await db.jobInstance.findUnique({ where: { id: previous.id } })).attempts, 5);
+    }
+    assert.equal((await queued()).length, 2);
+    assert.equal((await db.jobInstance.findUnique({ where: { id: campaign.id } })).status, "FAILED");
+    pass("explicit source commands create independent new episodes while the failed campaign remains stopped");
     const transportError = "SESSION_FETCH_TIMEOUT: Request timed out [GET /api2/v2/users/me/notifications; status=0]";
     await fail(notification, transportError, { code: "SESSION_FETCH_TIMEOUT", method: "GET", status: 0, retryable: true, message: transportError });
     const authError = "OF_REQUEST_FAILED: Unauthorized [GET /api2/v2/earnings; status=401]";
@@ -160,23 +192,19 @@ const checks = [], pass = name => { checks.push(name); console.log("PASS", name)
     await db.workerDevice.update({ where: { id: "recovery-device" }, data: { lastSeenAt: old } });
     await db.deviceCreatorBinding.updateMany({ where: narrow, data: { sessionReadReady: false, lastSeenAt: old, lastCapabilityAt: old } });
     const waiting = await plan();
-    assert.deepEqual(waiting.blocked, [{ stream: "campaigns", reason: "failed_terminal", code: "CAMPAIGN_COLLECTION_FAILED" }]);
-    assert(waiting.skipped.includes("financial:waiting_for_api_session")); assert.equal((await queued()).length, 0);
+    assert.equal(waiting.blocked.length, 3); assert(waiting.blocked.every(row => row.reason === "failed_terminal"));
+    assert.equal((await queued()).length, 0);
     for (let tick = 0; tick < 3; tick++) assert.equal((await plan()).created.length, 0);
     await receive(null); // stale access epoch cannot turn failed auth into READY
     assert.equal((await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: s.creatorId } })).retryAfterAt, null);
     await db.workerDevice.update({ where: { id: "recovery-device" }, data: { lastSeenAt: new Date() } });
     await receive();
-    assert.equal((await plan()).created.length, 0); // fresh auth still respects backoff
-    assert((await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: s.creatorId } })).retryAfterAt);
-    await commit(async tx => {
-      for (const model of ["creatorNotificationSyncState", "creatorFinancialCollectionState"])
-        await tx[model].update({ where: { creatorId: s.creatorId }, data: { retryAfterAt: new Date(Date.now() - 1000) } });
-    });
-    const independent = await plan();
-    assert.equal(independent.created.length, 2); assert.equal(independent.blocked.length, 1);
-    assert(independent.created.includes("financial_offline_recovery")); assert(independent.created.includes("notifications_offline_recovery"));
-    pass("GET transport recovers, 401 requires authorized fresh session plus backoff, and contract failure cannot block other streams");
+    const afterHeartbeat = await plan();
+    assert.equal(afterHeartbeat.created.length, 0); assert.equal(afterHeartbeat.blocked.length, 3);
+    assert.equal((await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: s.creatorId } })).retryAfterAt, null);
+    assert.equal((await queued()).length, 0);
+    assert.equal(await db.creatorRecoveryIntent.count({ where: narrow }), 4);
+    pass("transport, auth and contract exhaustion stay terminal after stale or freshly authorized heartbeats");
 
     // Negative fences use real SQL rows. No stale generation or other scope can
     // acquire permission to retry merely by retaining the phrase lease expired.
@@ -197,11 +225,13 @@ const checks = [], pass = name => { checks.push(name); console.log("PASS", name)
       db, creator: { id: s.creatorId, agencyId: s.agencyId }, requestedByUserId: s.userId, intent: "source" });
     assert.notEqual(manual.job.params.collectionGeneration, campaign.params.collectionGeneration);
     assert.equal(manual.job.status, "SCHEDULED"); assert.equal(manual.job.params.collectionMode, "full");
-    const beforeAccept = await plan(); assert.deepEqual(beforeAccept.blocked, []);
     await control.acceptCampaignGeneration({ db, job: manual.job });
-    await results.recordJobFailure({ db, job: campaign, error: "lease expired", terminal: true });
+    await commit(tx => results.recordJobFailure({ db: tx, job: campaign, error: "lease expired", terminal: true }));
     assert.equal((await currentCampaign()).activeGeneration, manual.job.params.collectionGeneration);
     assert.equal((await currentCampaign()).status, "SCANNING");
+    const independent = await plan();
+    assert.equal(independent.created.length, 0);
+    assert.deepEqual(independent.blocked.map(row => row.stream).sort(), ["financial", "notifications"]);
     pass("source job, generation and agency fences reject stale repair; explicit source START creates a fresh command immune to old failure");
     console.log(JSON.stringify({ ok: true, checks: checks.length, names: checks }, null, 2));
   } finally { await f.close(); }

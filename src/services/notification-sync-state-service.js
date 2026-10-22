@@ -34,10 +34,6 @@ function latestDate(...values) {
   const dates = values.map(strictDate).filter(Boolean);
   return dates.length ? new Date(Math.max(...dates.map((date) => date.getTime()))) : null;
 }
-function runtimeRangeTo(now = new Date()) {
-  return new Date(now.getTime() + 5 * 60 * 1000);
-}
-
 function assertNotificationCollectionResult({ job, scanRunId, notificationMode = null } = {}) {
   const command = collectionCommand(job, COLLECTOR_TYPES.NOTIFICATIONS);
   const incomingRunId = clean(scanRunId, 120);
@@ -66,7 +62,7 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
   if (!historicalBaseline) {
     return {
       from: FULL_HISTORY_FROM.toISOString(),
-      to: runtimeRangeTo(now).toISOString(),
+      to: new Date(now).toISOString(),
       types: [...NOTIFICATION_TYPES],
       notificationMode: "full",
       pageLimit: 10,
@@ -83,10 +79,11 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
   const stopAtNotificationId = clean(state?.headNotificationId, 220);
   return {
     from: FULL_HISTORY_FROM.toISOString(),
-    to: runtimeRangeTo(now).toISOString(),
+    to: new Date(now).toISOString(),
     types: [...NOTIFICATION_TYPES],
     notificationMode: "catchup",
-    notificationFrontierVersion: 2,
+    notificationFrontierVersion: 3,
+    notificationKnownBeforeAt: new Date(now).toISOString(),
     pageLimit: 10,
     ...(stopAtNotificationId ? { stopAtNotificationId } : {}),
     knownNotificationIds: boundedNotificationIds(state?.knownNotificationIds),
@@ -149,7 +146,7 @@ function pageOccurredBounds(chunk) {
   };
 }
 
-async function recordNotificationPageProgress({ db, job, deviceId, chunk }) {
+async function recordNotificationPageProgress({ db, job, deviceId, chunk, frontierAssessment = null }) {
   const mode = chunk?.notificationMode === "catchup" ? "catchup" : "full";
   const command = assertNotificationCollectionResult({ job, scanRunId: chunk?.scanRunId, notificationMode: mode });
   if (!db?.creatorNotificationSyncState?.upsert) return null;
@@ -175,7 +172,7 @@ async function recordNotificationPageProgress({ db, job, deviceId, chunk }) {
       return existing;
     }
     const sameRun = existing?.scanRunId === scanRunId;
-    const frontierReceipt = await require("./notification-frontier-authority").commitPage(tx,job,chunk,existing?.frontierReceipt);
+    const frontierReceipt = await require("./notification-frontier-authority").commitPage(tx,job,chunk,existing?.frontierReceipt,frontierAssessment);
     const data = {
       frontierReceipt,
       status: "SCANNING",
@@ -183,7 +180,7 @@ async function recordNotificationPageProgress({ db, job, deviceId, chunk }) {
       scanRunId,
       activeGeneration: command.generation,
       activeRequestedAt: command.requestedAt,
-      nextCursor: sourceExhausted ? null : cursorEnd,
+      nextCursor: sourceExhausted || frontierReceipt?.phase === "DONE" ? null : cursorEnd,
       // headNotificationId is the durable *verified* frontier. Working scan head
       // lives in the Desktop continuation/result until completion is proven.
       headNotificationId: existing?.headNotificationId || null,

@@ -50,7 +50,7 @@ const deadline = setTimeout(() => { console.error("FINANCIAL_CLAIM_PROOF_DEADLIN
       return { db, item: batch.items[0], ownerToken: batch.ownerToken };
     }
     const input = { userId: s.userId, deviceId: "claim-device", jobKeys: ["financial_transactions_scan", "catchup_notifications_scan"],
-      capabilities: { creatorEventDrivenSyncV2: true, financialWindowReceiptsV1: true, financialMoneyResolutionV1: true } };
+      capabilities: { creatorEventDrivenSyncV2: true, financialWindowReceiptsV1: true, financialTraversalV2: true, financialMoneyResolutionV1: true } };
     const planned = await resolver.processRequest(await resolutionClaim());
     assert(planned.created);
     const queued = await db.jobInstance.findUnique({ where: { id: planned.jobId } });

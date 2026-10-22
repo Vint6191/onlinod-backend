@@ -26,3 +26,26 @@ test('invalid money resolution commands fail as typed admission errors without w
   assert.equal(authority.invalidClaim(new authority.FinancialReceiptError('FINANCIAL_RECEIPT_PAYLOAD_CONFLICT')),false);
 });
 test('fresh head cannot label stale history fresh; read evaluation preserves immutable state and retry quarantine',()=>{const state={status:'COMPLETE',receiptCoverageVersion:1,baselineVerifiedAt:now,baselineObservedAt:now,lastCatchupCompletedAt:now,lastCatchupObservedAt:now,recentRangeTo:now,coverageThrough:now,historyAuditObservedAt:new Date(+now-8*86400000)};const read=authority.evaluateCollection(state,now,3600000);assert.equal(read.fresh,false);assert.equal(read.stale,true);assert.equal(read.due,true);assert(Object.isFrozen(read));const deferred=authority.evaluateCollection({...state,retryAfterAt:new Date(+now+60000)},now,3600000);assert.equal(deferred.due,false);assert.equal(deferred.deferred,true);const failed=authority.evaluateCollection({...state,status:'FAILED'},now,3600000);assert.equal(failed.due,false);const fresh=authority.evaluateCollection({...state,historyAuditObservedAt:now},now,3600000);assert.equal(fresh.fresh,true);});
+
+test('legacy date-filtered full receipt cannot certify all available history; retained receipt remains inspectable', async () => {
+  const j = job(); j.params.collectionMode = 'full'; j.params.financialWindows = authority.planWindows(j.params, null);
+  const row = { id: authority.runId(j), jobId:j.id, agencyId:j.agencyId, creatorId:j.creatorId, generation:j.params.collectionGeneration,
+    windows:j.params.financialWindows, cursor:{phase:'done'}, proof:{complete:true,windows:[{exhausted:true}]} };
+  const result = await authority.completionProof({financialReceiptRun:{findUnique:async()=>row}},j);
+  assert.equal(result.complete,false); assert.equal(result.filteredHistory,true); assert.equal(authority.historyRead(row),false); assert.equal(result.row,row);
+});
+test('full traversal has no lower filter; comparison scope is derived separately from source receipts', () => {
+  const p = {...params, collectionMode:'full',financialTraversalVersion:2,startDate:'2016-01-01'};
+  const windows = authority.planWindows(p,null); assert.equal(windows[0].from,null);
+  const j = {...job(),params:{...p,financialWindows:windows}}; assert.deepEqual(authority.windowsFor(j),windows);
+  assert.equal(authority.initialCursor(j).comparisonFrom,null);
+  const row={windows,proof:{windows:[{oldestAt:'2015-02-03T04:00:00.000Z',comparisonFrom:'2015-02-03T00:00:00.000Z',exhausted:true}]}};
+  assert.equal(authority.historyRead(row),true); assert.equal(authority.comparisonRange(row).from,'2015-02-03T00:00:00.000Z');
+});
+
+test('financial gap comparison uses the same second-precision lower coordinate as the provider chart', () => {
+  const gap='2026-10-04T11:00:00.987Z';
+  const windows=authority.planWindows({...params,financialTraversalVersion:2,financialFrontierVersion:2,recoveryGapFrom:gap},null);
+  assert.equal(windows[0].from,null); assert.equal(windows[0].comparisonFrom,'2026-10-04T11:00:00.000Z');
+  assert.equal(windows[0].to,now.toISOString());
+});

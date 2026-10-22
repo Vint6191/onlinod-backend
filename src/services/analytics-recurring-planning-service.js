@@ -61,9 +61,7 @@ async function planRecurringCreatorAnalytics({ db, item, ownerToken, now = new D
       campaignDirectoryDiscoveryAdmitted: false,
       reserveCampaignDirectory: (state) => reserveDirectoryAdmission({ db: tx, state, creatorId, now: ownership.authorityNow }),
     }) : { created: [], skipped: [] };
-    const subscriberIntent=includeCatchups
-      ? await require("./creator-live-sync-service").pendingRecovery(tx,creatorId,"subscribers") : null;
-    const subscribers=subscriberIntent
+    const subscribers=includeCatchups
       ? await require("./subscriber-directory-service").ensureSubscriberScanDue({db:tx,agencyId:item.agencyId,creatorId,now:ownership.authorityNow,priority:20})
       : {created:false};
     // A terminal collector is a recorded domain outcome, not a transaction

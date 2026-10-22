@@ -5,10 +5,46 @@ const assert = require("node:assert/strict");
 const { setTimeout: delay } = require("node:timers/promises");
 const {
   runRootCommit, joinCommit, currentCommitContext, classifyCommitConflict,
-  commitAuthorityNow, deferCommitHint, discardCommitHints,
+  commitAuthorityNow, deferCommitHint, discardCommitHints, prepareCommit,
 } = require("./db-commit-kernel");
 
 const retryOptions = { retryBaseMs: 1 };
+
+test("durable preparation follows domain work, joins its transaction and precedes commit hints", async () => {
+  const events = [], db = rootDb();
+  await runRootCommit(db, async context => {
+    prepareCommit(context, "z-feed", ({ tx }) => {
+      assert.equal(tx, context.tx); events.push("feed");
+      assert.throws(() => prepareCommit(context, "recursive", () => {}), { code: "DB_COMMIT_PREPARATION_INVALID" });
+    });
+    prepareCommit(context, "a-first", () => events.push("first"));
+    deferCommitHint(context, "hint", () => events.push("hint"));
+    await joinCommit(context, {}, () => { events.push("joined-owner"); });
+    events.push("owner-end");
+  });
+  assert.deepEqual(events, ["joined-owner", "owner-end", "first", "feed", "hint"]);
+  assert.equal(db.calls[0].committed, true);
+});
+
+test("a failed durable preparation rejects the root and emits no committed hint", async () => {
+  const hints = [], db = rootDb();
+  await assert.rejects(() => runRootCommit(db, context => {
+    deferCommitHint(context, "hint", () => hints.push("leaked"));
+    prepareCommit(context, "feed", () => { throw Error("DURABLE_PUBLICATION_FAILED"); });
+  }), /DURABLE_PUBLICATION_FAILED/);
+  assert.equal(db.calls[0].committed, false);
+  assert.deepEqual(hints, []);
+});
+
+test("rejection savepoint discards durable preparations and their buffered state", async () => {
+  const events = [];
+  await runRootCommit(rootDb(), context => {
+    prepareCommit(context, "feed", () => events.push("leaked"), () => events.push("discarded"));
+    discardCommitHints(context);
+    prepareCommit(context, "feed", () => events.push("receipt"));
+  });
+  assert.deepEqual(events, ["discarded", "receipt"]);
+});
 
 test("a rejected domain savepoint can discard hints while its receipt commits", async () => {
   const published = [];

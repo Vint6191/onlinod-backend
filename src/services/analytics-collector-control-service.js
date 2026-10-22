@@ -25,9 +25,7 @@ function clean(value, max = 220) {
   return text ? text.slice(0, max) : null;
 }
 function date(value) {
-  if (!value) return null;
-  const parsed = value instanceof Date ? new Date(value.getTime()) : new Date(value);
-  return Number.isFinite(parsed.getTime()) ? parsed : null;
+  return parseObservationTime(value);
 }
 function mode(value) {
   return String(value || "").trim().toLowerCase() === "catchup" ? "catchup" : "full";
@@ -125,15 +123,25 @@ function stampCollectionAuthorityParams(params, authorityNow, orderingAfter = nu
   const type = clean(source.collectionType, 40);
   const stamped = stampObservationStart({ ...source, collectionAuthorityRequestedAt: orderingAt.toISOString() }, at);
   if (type === COLLECTOR_TYPES.FINANCIAL) {
-    const resolutionEnd = source.moneyResolutionVersion === 1 ? date(source.endDate) : null;
-    const marker = Math.floor((resolutionEnd ? Math.min(+resolutionEnd,+at) : +at) / 1000);
+    // Server planning fixes the pass upper bound. Reclaiming/rescheduling the
+    // same gap cannot extend it to a later machine/replica clock.
+    const requestedEnd = date(source.endDate);
+    const recoveryTarget = source.moneyResolutionVersion !== 1 && source.collectionMode === "catchup"
+      ? date(source.recoveryTargetAt) : null;
+    // The provider only accepts whole seconds. Round an exact persisted target
+    // up once, and let scheduleJobNow defer claim until that bound has passed.
+    // A future/forged target cannot authorize an arbitrary future source read.
+    const marker = recoveryTarget && recoveryTarget <= at
+      ? Math.ceil(+recoveryTarget / 1000)
+      : source.financialTraversalVersion === 2 && source.collectionMode === "full"
+        ? Math.min(Math.ceil(+(requestedEnd || at) / 1000), Math.ceil(+at / 1000))
+        : Math.floor((requestedEnd ? Math.min(+requestedEnd, +at) : +at) / 1000);
     stamped.financialReceiptVersion = 1;
     stamped.initialMarker = marker;
     stamped.endDate = onlyFansUtcDateTime(new Date(marker * 1000));
   } else if (type === COLLECTOR_TYPES.NOTIFICATIONS) {
-    // Notification transport accepts a small forward tolerance, but the anchor
-    // is PostgreSQL time rather than whichever backend replica planned first.
-    stamped.to = new Date(at.getTime() + 5 * 60 * 1000).toISOString();
+    const target = date(source.recoveryTargetAt || source.to);
+    stamped.to = new Date(target ? Math.min(+target, +at) : +at).toISOString();
   }
   return stamped;
 }
@@ -240,7 +248,7 @@ async function acceptFinancialGeneration({ db = prisma, job, deviceId = null } =
   }});
 }
 
-async function completeFinancialCollection({ db = prisma, job, deviceId = null, complete, scanRunId, boundary = null, rangeFrom = null, rangeTo = null, receiptRun = null } = {}) {
+async function completeFinancialCollection({ db = prisma, job, deviceId = null, complete, scanRunId, boundary = null, rangeFrom = null, rangeTo = null, receiptRun = null, historyRead = false, verification = null } = {}) {
   const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: job.creatorId, work: async (tx) => {
     const current = await tx.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
@@ -269,8 +277,8 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
     const common = {
       ...(success ? receiptAuthority.coverageUpdate(job, current, receiptRun, observedAt, now) : {}),
       status: success ? "COMPLETE" : "PARTIAL", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt,
-      retryAfterAt: null, lastErrorCode: success ? null : "FINANCIAL_COLLECTION_PARTIAL",
-      lastErrorMessage: success ? null : "Financial collection did not prove its requested source boundary",
+      retryAfterAt: null, lastErrorCode: success ? null : historyRead ? "FINANCIAL_HISTORY_READ_UNVERIFIED" : "FINANCIAL_COLLECTION_PARTIAL",
+      lastErrorMessage: success ? null : historyRead ? `Available financial history was read; comparable verification ${verification || "not completed"}` : "Financial collection did not prove its requested traversal and comparison",
       sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220),
     };
     const successData = success && command.mode === "full" ? {
@@ -281,7 +289,7 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
     const state = await tx.creatorFinancialCollectionState.upsert({
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData }, update: { ...common, ...successData },
     });
-    await require("./creator-live-sync-service").completeRecovery(tx,job,success,{deferPlanningWake:true});
+    await require("./creator-live-sync-service").completeRecovery(tx,job,success,{deferPlanningWake:true,coveredThrough:end});
     return { applied: true, stale: false, command, state, scanRunId: clean(scanRunId, 120) };
   }});
 }
@@ -404,7 +412,7 @@ async function completeCampaignCollection({ db = prisma, job, deviceId = null, c
     const state = await tx.creatorCampaignCollectionState.upsert({
       where: { creatorId: job.creatorId }, create: { agencyId: job.agencyId, creatorId: job.creatorId, ...common, ...successData, ...membershipData }, update: { ...common, ...successData, ...membershipData },
     });
-    await require("./creator-live-sync-service").completeRecovery(tx,job,membershipComplete,{deferPlanningWake:true});
+    await require("./creator-live-sync-service").completeRecovery(tx,job,membershipComplete,{deferPlanningWake:true,coveredThrough:observedAt});
     return { applied: true, stale: false, command, state };
   };
   if (campaignLockHeld) return work(db);

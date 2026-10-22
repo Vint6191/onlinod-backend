@@ -62,6 +62,8 @@ test("live Notification fact reporter gates REALTIME capability against PostgreS
   assert.match(block, /realtimeReady: true/);
   assert.match(block, /withRealtimeIngestGenerationFence\(\{[\s\S]*work: async \(\{ tx \}\)[\s\S]*await assertLiveBinding\(tx\)/);
   assert.doesNotMatch(block.slice(block.indexOf("const assertLiveBinding"), block.indexOf("const grouped =")), /Date\.now\(\)/);
-  assert.match(block, /ingestNotificationFacts\(\{ db: tx/);
-  assert.match(block, /withRealtimeIngestGenerationFence\(\{[\s\S]*recordNotificationSocketEvent/);
+  const processor = read("services/data-change-processor-service.js");
+  assert.match(block, /processLiveNotificationBatch\(\{[\s\S]*db:tx/);
+  assert.match(processor, /ingestNotificationFacts\(\{ db: tx/);
+  assert.match(processor, /recordNotificationSocketEvent\(\{ db:tx/);
 });

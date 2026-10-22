@@ -17,7 +17,7 @@ const CAMPAIGN_COVERAGE_SELECT = Object.freeze(Object.fromEntries([
   "campaignDirectoryFactsRevision", "campaignDirectoryCountRevision",
   "campaignFrontierNextEligibleAt", "campaignFrontierScheduleVersion", "campaignFrontierPlanRunId", "campaignFrontierObservationVersion", "campaignFrontierFreshnessStatus", "campaignFrontierNextDueAt",
   "campaignFrontierTargetCount", "campaignFrontierCompletedCount", "campaignFrontierDeferredCount",
-  "fanValueCoverageScanRunId", "fanValueExpected", "fanValueFreshnessStatus", "fanValueOutstanding", "fanValueFailed",
+  "fanValueCoverageScanRunId", "fanValueExpected", "fanValueFreshnessStatus", "fanValueOutstanding", "fanValueFailed", "fanValueUnavailable",
 ].map(key => [key, true])));
 
 function coverageDto(row) {
@@ -56,7 +56,7 @@ function frontierAdmissionDue(state, now = new Date()) {
 }
 function fanRefreshPending(state) {
   return Boolean(state?.activeGeneration && state.fanValueCoverageScanRunId === state.activeGeneration
-    && Number(state.fanValueExpected || 0) > 0 && state.fanValueFreshnessStatus !== "COMPLETE");
+    && Number(state.fanValueOutstanding || 0) > 0);
 }
 function frontierDueWhere(exactGeneration, now) {
   return { ...exactGeneration, OR: [
@@ -70,9 +70,12 @@ function evaluateCampaignCollectionState(state, now = new Date(), refreshDebt = 
     lastVerifiedAt: proof.lastCatchupCompletedAt, baselineObservedAt: proof.baselineObservedAt,
     lastObservedAt: proof.lastCatchupObservedAt, retryAfterAt: state?.retryAfterAt, now });
   const discoveryDue = directoryDue(state, now), membershipDue = frontierDue(state, now);
-  const delegatedPending = fanRefreshPending(state) || refreshDebt?.queued === true || refreshDebt?.failed === true;
+  const delegatedPending = fanRefreshPending(state) || refreshDebt?.queued === true;
+  const delegatedIncomplete = delegatedPending || refreshDebt?.failed === true
+    || Boolean(state?.activeGeneration && state.fanValueCoverageScanRunId === state.activeGeneration
+      && Number(state.fanValueExpected || 0) > 0 && state.fanValueFreshnessStatus !== "COMPLETE");
   const providerFresh = base.proven && !discoveryDue && !membershipDue;
-  const fresh = providerFresh && !delegatedPending;
+  const fresh = providerFresh && !delegatedIncomplete;
   const scheduledLater = membershipDue && !discoveryDue && !frontierAdmissionDue(state, now);
   const deferred = !fresh && (Boolean(base.retryAfterAt && +base.retryAfterAt > +now) || scheduledLater);
   return Object.freeze({ ...base, fresh, stale: base.usable && !fresh, deferred,
@@ -80,7 +83,7 @@ function evaluateCampaignCollectionState(state, now = new Date(), refreshDebt = 
     due: !providerFresh && !deferred && !base.failed, providerFresh,
     refreshDebt: refreshDebt || null,
     freshnessAuthority: "DIRECTORY_AND_FRONTIERS",
-    directoryDue: discoveryDue, frontierDue: membershipDue, fanRefreshPending: delegatedPending,
+    directoryDue: discoveryDue, frontierDue: membershipDue, fanRefreshPending: delegatedPending, fanRefreshIncomplete: delegatedIncomplete,
     directoryObservedAt: directoryObservationAt(state, now),
     directoryNextDueAt: directoryDiscoveryDeadline(state, CAMPAIGN_DIRECTORY_DISCOVERY_SLA_MS, now),
     frontierNextEligibleAt: parseObservationTime(state?.campaignFrontierNextEligibleAt),

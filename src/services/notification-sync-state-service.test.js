@@ -56,7 +56,7 @@ test("initial notification scan is one ALL traversal from the beginning of suppo
   const now = new Date("2026-08-06T21:00:00.000Z");
   const params = buildNotificationScanParams({ state: null, now, reason: "manual", analyticsRangeKey: "30d" });
   assert.equal(params.from, FULL_HISTORY_FROM.toISOString());
-  assert.equal(params.to, "2026-08-06T21:05:00.000Z");
+  assert.equal(params.to, "2026-08-06T21:00:00.000Z");
   assert.equal(params.notificationMode, "full");
   assert.deepEqual(params.types, ["purchases", "tips", "subscriptions", "likes", "comments"]);
   assert.equal(params.pageLimit, 10);

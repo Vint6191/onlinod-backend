@@ -87,7 +87,7 @@ test("completion reconciles OF earnings after undo refunds while keeping loading
   assert.match(service, /earningsTransactionsCount = Math\.max\(0, count - statusTotals\.refundTransactionsCount\)/);
   assert.match(service, /earningsGrossCents = grossCents - statusTotals\.refundGrossCents/);
   assert.match(service, /earningsNetCents = netCents - statusTotals\.refundNetCents/);
-  assert.match(service, /countMatched = chartReady \? earningsTransactionsCount/);
+  assert.match(service, /countMatched = chartReady \? comparison\.transactionsCount/);
   assert.match(service, /sourceBoundaryReached/);
   assert.match(service, /scannerRejected === 0/);
   assert.match(service, /chartTotal\.sourceJobId === job\.id/);

@@ -29,6 +29,11 @@ function terminalDb(demandCount, rawResult, calls) {
     async $queryRawUnsafe(sql, ...args) {
       count("raw");
       if (/SELECT clock_timestamp\(\)/.test(sql)) return [{ authorityNow: new Date("2040-03-01T00:00:00.000Z") }];
+      if (/INSERT INTO "SubscriberDirectoryMaintenanceSignal"/.test(sql)) {
+        assert.equal(args[3], "DERIVED_PLANNING");
+        assert.equal(args[5], "CAMPAIGN_FAN_REFRESH_SETTLED");
+        return [{ id: "derived-wake", creatorId: args[2], kind: args[3] }];
+      }
       if (/FROM "CreatorFanRefreshDemand" WHERE "activeRefreshJobId"/.test(sql) && /FOR UPDATE/.test(sql)) return demands.map((row) => ({ id: row.id }));
       if (/INSERT INTO "CampaignFanRefreshPromotionSignal"/.test(sql) && /ON CONFLICT \("creatorId"\)/.test(sql)) {
         assert.match(sql, /LEAST\("CampaignFanRefreshPromotionSignal"\."dueAt", EXCLUDED\."dueAt"\)/);
@@ -39,14 +44,16 @@ function terminalDb(demandCount, rawResult, calls) {
         assert.match(sql, /ORDER BY d\."id" ASC[\s\S]*FOR UPDATE OF d/);
         assert.match(sql, /CROSS JOIN LATERAL[\s\S]*LIMIT 1 FOR UPDATE OF w/);
         assert.equal(args[3], "creator-1");
-        assert.match(sql, /"retryAttempts" = d\."retryAttempts" \+ 1/);
+        assert.match(sql, /"retryAttempts" = GREATEST\(d\."retryAttempts" \+ 1, \$7::int\)/);
         assert.match(sql, /'QUARANTINED'/);
         assert.match(sql, /CAMPAIGN_FAN_VALUE_REFRESH_PENDING/);
         assert.match(sql, /CAMPAIGN_FAN_VALUE_REFRESH_PARTIAL/);
         assert.equal(args[0], "refresh-job-1");
         assert.ok(args[1] instanceof Date);
         assert.equal(typeof args[2], "string");
-        return [rawResult];
+        const selected = demands.filter(row => args[4] == null || args[4].includes(row.onlyFansUserId)).slice(0, rawResult.applied);
+        return [{ ...rawResult, failedFanIds: selected.map(row => row.onlyFansUserId),
+          quarantinedFanIds: args[5] ? selected.map(row => row.onlyFansUserId) : [] }];
       }
       throw new Error(`unexpected raw SQL in A20.5 terminal topology harness: ${sql.slice(0, 140)}`);
     },
@@ -76,13 +83,15 @@ for (const demandCount of [1, 20, 50]) {
       result: {},
     });
     assert.equal(result.applied, demandCount);
+    assert.deepEqual(result.failedFanIds, Array.from({ length: demandCount }, (_, i) => `fan-${i + 1}`));
+    assert.deepEqual(result.quarantinedFanIds, []);
     assert.equal(result.workTransitioned, demandCount);
     assert.equal(result.topology, "set_based_v1");
-    assert.equal(calls.raw, 4, "row lock + DB clock + terminal CTE + durable signal merge must remain constant");
+    assert.equal(calls.raw, 6, "row lock, clocks, terminal CTE, debt and derived wakes remain constant");
     assert.equal(calls["demand.findMany"], 1);
     assert.equal(calls["demand.update"] || 0, 0);
     assert.equal(calls["work.updateMany"] || 0, 0);
-    assert.equal(calls.total, 6, "campaign authority + terminal + durable-signal topology must not grow with demand count");
+    assert.equal(calls.total, 8, "campaign authority + terminal + durable-signal topology must not grow with demand count");
   });
 }
 
@@ -102,10 +111,11 @@ for (const demandCount of [1, 20, 50]) {
       terminal: true,
     });
     assert.equal(result.applied, demandCount);
+    assert.equal(result.failedFanIds.length, demandCount);
     assert.equal(result.workTransitioned, demandCount);
     assert.equal(result.topology, "set_based_v1");
-    assert.equal(calls.raw, 4);
-    assert.equal(calls.total, 6);
+    assert.equal(calls.raw, 6);
+    assert.equal(calls.total, 8);
   });
 }
 
@@ -124,7 +134,7 @@ test("A20.5 partial 25/50 completion terminalizes only the remaining active dema
   });
   assert.equal(result.applied, 25);
   assert.equal(result.topology, "set_based_v1");
-  assert.equal(calls.total, 6);
+  assert.equal(calls.total, 8);
 });
 
 test("A20.5 terminal transition fails closed when current coverage cannot absorb the planned decrement", async () => {
@@ -149,7 +159,7 @@ test("A20.5 source keeps terminal demand/work locks deterministic and retry/quar
   const source = fs.readFileSync(path.join(__dirname, "campaign-fan-refresh-queue-service.js"), "utf8");
   assert.match(source, /transitionCampaignFanRefreshTerminalSetBased[\s\S]*ORDER BY d\."id" ASC[\s\S]*FOR UPDATE OF d/);
   assert.match(source, /work_before AS \([\s\S]*ORDER BY w\."id" ASC[\s\S]*FOR UPDATE OF w/);
-  assert.match(source, /"retryAttempts" = d\."retryAttempts" \+ 1/);
+  assert.match(source, /"retryAttempts" = GREATEST\(d\."retryAttempts" \+ 1, \$7::int\)/);
   assert.match(source, /CAMPAIGN_FAN_REFRESH_MAX_RETRIES/);
   assert.match(source, /CAMPAIGN_FAN_REFRESH_TERMINAL_COVERAGE_TRANSITION_LOST/);
   assert.match(source, /supportsSetBasedCampaignFanRefreshTerminal\(db\)/);

@@ -35,23 +35,44 @@ function canonical(value) {
 function hash(value) { return createHash("sha256").update(canonical(value)).digest("hex"); }
 function runId(job) { return hash([job.id, job.params.collectionGeneration]); }
 async function enter(db) { await db.$executeRawUnsafe("SELECT set_config('onlinod.financial_receipts_v1','1',true)"); }
-function window(kind, from, to) {
-  return { kind, from: from.toISOString(), to: to.toISOString(), initialMarker: String(Math.floor(+to / 1000)) };
+function window(kind, from, to, comparisonFrom = null) {
+  return { kind, from: from ? from.toISOString() : null, to: to.toISOString(), initialMarker: String(Math.floor(+to / 1000)),
+    ...(comparisonFrom ? { comparisonFrom: comparisonFrom.toISOString() } : {}) };
+}
+function currentTraversal(job) { return job?.params?.financialTraversalVersion === 2; }
+function historyRead(row) { return Boolean(row?.windows?.[0]?.kind === "FULL" && row?.windows?.[0]?.from === null && row?.proof?.windows?.[0]?.exhausted === true); }
+function comparisonRange(row, index = 0) {
+  const w = row.windows[index], totals = row.proof.windows[index];
+  return { from: totals.comparisonFrom || w.comparisonFrom || w.from, to: w.to };
+}
+function comparableTotals(totals) { return totals.comparisonTotals || totals; }
+function earningsTotals(totals) {
+  const undo = totals.statusGroups?.undo;
+  return { transactionsCount: totals.count - (undo?._count?._all || 0),
+    grossCents: totals.grossCents - (undo?._sum?.amountCents || 0), netCents: totals.netCents - (undo?._sum?.netCents || 0) };
 }
 function planWindows(params, state) {
   const end = date(params.endDate) || date(params.collectionRequestedAt);
-  if (!end || end < FLOOR) throw fault("FINANCIAL_WINDOW_END_INVALID");
+  if (!end) throw fault("FINANCIAL_WINDOW_END_INVALID");
   const mode = params.collectionMode || params.financialMode;
   if (params.moneyResolutionVersion === 1) {
     const from = date(params.startDate);
-    if (!from || from < FLOOR || from > end || +end - from > 3600000 || mode !== "catchup"
+    if (!from || from > end || +end - from > 3600000 || mode !== "catchup"
         || typeof params.moneyResolutionObservationId !== "string" || !params.moneyResolutionObservationId.trim()) {
       throw fault("FINANCIAL_RESOLUTION_BINDING_INVALID");
     }
     return [window("RESOLUTION", from, end)];
   }
-  if (mode !== "catchup") return [window("FULL", date(params.startDate) || FLOOR, end)];
-  if (params.financialFrontierVersion === 2) return [window("FRONTIER", FLOOR, end)];
+  if (mode !== "catchup") return [window("FULL", params.financialTraversalVersion === 2 ? null : date(params.startDate) || FLOOR, end)];
+  if (params.financialFrontierVersion === 2) {
+    const from = params.financialTraversalVersion === 2 ? null : FLOOR;
+    const gap = date(params.financialFrontierGapFrom) || date(params.recoveryGapFrom) || date(state?.coverageThrough) || date(state?.baselineRangeTo);
+    // Earnings chart coordinates have second precision. Compare exactly that
+    // same interval, including the fraction before the recorded gap boundary.
+    const comparison = gap ? new Date(Math.floor(+gap / 1000) * 1000) : null;
+    if (params.financialTraversalVersion === 2 && (!gap || gap > end)) throw fault("FINANCIAL_FRONTIER_BINDING_INVALID");
+    return [window("FRONTIER", from, end, params.financialTraversalVersion === 2 ? comparison : null)];
+  }
   const headFrom = new Date(Math.max(+FLOOR, +end - RECENT_DAYS * DAY));
   const result = [window("HEAD", headFrom, end)];
   const frontier = date(state?.coverageThrough) || date(state?.baselineRangeTo) || FLOOR;
@@ -67,36 +88,52 @@ function planWindows(params, state) {
 function windowsFor(job) {
   const windows = job.params?.financialWindows;
   if (!enabled(job) || job.params.financialWindowGeneration !== job.params.collectionGeneration || !Array.isArray(windows) || !windows.length || windows.length > 2) throw fault("FINANCIAL_WINDOWS_REQUIRED");
-  for (const w of windows) if (!w || !["FULL", "HEAD", "GAP", "AUDIT", "FRONTIER", "RESOLUTION"].includes(w.kind) || !date(w.from) || !date(w.to) || date(w.from) > date(w.to) || String(w.initialMarker) !== String(Math.floor(+date(w.to) / 1000))) throw fault("FINANCIAL_WINDOW_INVALID");
+  for (const w of windows) {
+    const unbounded = currentTraversal(job) && ["FULL", "FRONTIER"].includes(w?.kind) && w.from === null;
+    if (!w || !["FULL", "HEAD", "GAP", "AUDIT", "FRONTIER", "RESOLUTION"].includes(w.kind) || (!unbounded && !date(w.from)) || !date(w.to) || (w.from && date(w.from) > date(w.to)) || String(w.initialMarker) !== String(Math.floor(+date(w.to) / 1000))) throw fault("FINANCIAL_WINDOW_INVALID");
+  }
   const head = windows[0], catchup = (job.params.collectionMode || job.params.financialMode) === "catchup";
-  if (head.to !== date(job.params.endDate)?.toISOString() || date(head.from) < FLOOR) throw fault("FINANCIAL_WINDOW_BINDING_INVALID");
+  if (head.to !== date(job.params.endDate)?.toISOString()) throw fault("FINANCIAL_WINDOW_BINDING_INVALID");
   if (job.params.moneyResolutionVersion === 1) {
     if (!catchup || windows.length!==1 || head.kind!=="RESOLUTION" || +date(head.to)-date(head.from)>3600000
       || !job.params.moneyResolutionObservationId || head.from!==date(job.params.startDate)?.toISOString()) throw fault("FINANCIAL_RESOLUTION_BINDING_INVALID");
   } else if (catchup && job.params.financialFrontierVersion === 2) {
-    if(windows.length!==1 || head.kind!=="FRONTIER" || +date(head.from)!==+FLOOR
-      || !Array.isArray(job.params.financialFrontierKnownIds) || job.params.financialFrontierKnownIds.length>300
-      || !job.params.financialFrontierBaselineGeneration) throw fault("FINANCIAL_FRONTIER_BINDING_INVALID");
+    if(windows.length!==1 || head.kind!=="FRONTIER" || !job.params.financialFrontierBaselineGeneration) throw fault("FINANCIAL_FRONTIER_BINDING_INVALID");
+    if (currentTraversal(job)) {
+      if (head.from !== null || !date(head.comparisonFrom) || date(head.comparisonFrom) > date(head.to)
+        || !date(job.params.financialFrontierKnownBefore)) throw fault("FINANCIAL_FRONTIER_BINDING_INVALID");
+    } else if (+date(head.from)!==+FLOOR || !Array.isArray(job.params.financialFrontierKnownIds) || job.params.financialFrontierKnownIds.length>300) throw fault("FINANCIAL_FRONTIER_BINDING_INVALID");
   } else if (catchup) {
     if (head.kind !== "HEAD" || +date(head.to) - date(head.from) > RECENT_DAYS * DAY) throw fault("FINANCIAL_HEAD_WINDOW_INVALID");
     if (windows[1] && (!["GAP", "AUDIT"].includes(windows[1].kind) || +date(windows[1].to) - date(windows[1].from) > AUDIT_DAYS * DAY || date(windows[1].to) > date(head.from))) throw fault("FINANCIAL_HISTORY_WINDOW_INVALID");
-  } else if (windows.length !== 1 || head.kind !== "FULL") throw fault("FINANCIAL_FULL_WINDOW_INVALID");
+  } else if (windows.length !== 1 || head.kind !== "FULL" || (currentTraversal(job) && head.from !== null)) throw fault("FINANCIAL_FULL_WINDOW_INVALID");
   return windows;
 }
 async function claimParams(db, job) {
-  if (enabled(job) && job.params.financialWindowGeneration === job.params.collectionGeneration) { windowsFor(job); return job.params; }
+  if (enabled(job) && job.params.financialWindowGeneration === job.params.collectionGeneration) {
+    windowsFor(job);
+    const legacyTraversal = !currentTraversal(job) && job.params.financialWindows[0].kind !== "RESOLUTION";
+    const existing = legacyTraversal && typeof db.financialReceiptRun?.findUnique === "function"
+      ? await db.financialReceiptRun.findUnique({ where: { id: runId(job) } }) : legacyTraversal;
+    // Upgrade a command only before its first immutable receipt exists. An old
+    // already-filtered traversal must remain visible as filtered evidence.
+    if (!legacyTraversal || existing) return job.params;
+  }
   const state = await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
-  const params = { ...job.params, financialReceiptVersion: 1, collectorVersion: COLLECTOR };
+  const params = { ...job.params, financialReceiptVersion: 1, financialTraversalVersion: 2, collectorVersion: COLLECTOR };
   delete params.knownTransactionIds; delete params.catchupMaxPages;
+  if ((params.collectionMode || params.financialMode) === "catchup" && params.moneyResolutionVersion !== 1) params.financialFrontierVersion = 2;
   if (params.financialFrontierVersion===2 && (params.collectionMode||params.financialMode)==="catchup") {
     const generation=state?.lastCatchupGeneration || state?.baselineGeneration;
     if(!generation || !state?.baselineVerifiedAt)throw fault("FINANCIAL_FRONTIER_BASELINE_REQUIRED");
-    const known=await db.$queryRawUnsafe(`SELECT f."externalId" FROM "FinancialObservedFact" f JOIN "FinancialReceiptRun" r ON r.id=f."runId"
-      WHERE r."creatorId"=$1 AND r.generation=$2 AND r.proof->>'complete'='true' AND f."windowIndex"=0
-      ORDER BY (f.value->>'page')::int,(f.value->>'ordinal')::int,f."externalId" LIMIT 300`,job.creatorId,generation);
-    params.financialFrontierKnownIds=known.map(row=>row.externalId);
+    // Known-before-start is checked against creator facts per bounded page.
+    // A 300-ID sample cannot represent a large pre-existing financial history.
+    params.financialFrontierKnownBefore = (require("./analytics-observation-time").observationStartForJob(job) || date(params.collectionRequestedAt)).toISOString();
+    params.financialFrontierGapFrom = (date(params.recoveryGapFrom) || date(state.coverageThrough) || date(state.baselineRangeTo))?.toISOString();
+    delete params.financialFrontierKnownIds;
     params.financialFrontierBaselineGeneration=generation;
   }
+  if ((params.collectionMode || params.financialMode) !== "catchup" || params.financialFrontierVersion === 2) delete params.startDate;
   params.financialWindows = planWindows(params, state);
   params.financialWindowGeneration = params.collectionGeneration;
   windowsFor({ ...job, params });
@@ -104,11 +141,13 @@ async function claimParams(db, job) {
 }
 function initialCursor(job, windows = windowsFor(job)) {
   return { financialReceiptVersion: 1, collectorVersion: COLLECTOR, scanRunId: job.params.collectionGeneration,
-    windowIndex: 0, phase: "transactions", frontierPhase:"SEEK", page: 0, marker: windows[0].initialMarker, chartIndex: 0, processed: 0, scannerRejected: 0 };
+    windowIndex: 0, phase: "transactions", frontierPhase:"SEEK", overlapPages: 0, page: 0, marker: windows[0].initialMarker, chartIndex: 0, processed: 0, scannerRejected: 0,
+    ...(currentTraversal(job) ? { financialTraversalVersion: 2, comparisonFrom: windows[0].comparisonFrom || windows[0].from } : {}) };
 }
 function resultFor(job, cursor) {
   return { schemaVersion: 1, collectorVersion: COLLECTOR, financialReceiptVersion: 1,
-    scanRunId: job.params.collectionGeneration, sourceBoundaryReached: cursor.phase === "done",
+    scanRunId: job.params.collectionGeneration, sourceBoundaryReached: cursor.sourceBoundaryReached ?? cursor.phase === "done",
+    historyRead: cursor.historyRead === true, traversalComplete: cursor.traversalComplete ?? cursor.phase === "done",
     scannerRejected: cursor.scannerRejected, processed: cursor.processed };
 }
 function envelope(job, cursor) {
@@ -146,7 +185,7 @@ async function lockedRun(db, job) {
   const id = runId(job), windows = windowsFor(job);
   await db.financialReceiptRun.upsert({ where: { id }, create: { id, jobId: job.id, agencyId: job.agencyId, creatorId: job.creatorId,
     generation: job.params.collectionGeneration, windows, cursor: initialCursor(job, windows),
-    proof: { complete: false, windows: windows.map(() => ({ ...emptyTotals(), pages: 0, received: 0, rejected: 0, exhausted: false, charts: {} })) } }, update: {} });
+    proof: { complete: false, ...(currentTraversal(job) ? { version: 2, historyRead: false, traversalComplete: false, verification: "PENDING" } : {}), windows: windows.map(() => ({ ...emptyTotals(), pages: 0, received: 0, rejected: 0, exhausted: false, charts: {} })) } }, update: {} });
   await db.$queryRawUnsafe('SELECT id FROM "FinancialReceiptRun" WHERE id=$1 FOR UPDATE', id);
   const row = await db.financialReceiptRun.findUnique({ where: { id } });
   if (row.agencyId !== job.agencyId || row.creatorId !== job.creatorId || !isDeepStrictEqual(row.windows, windows)) throw fault("FINANCIAL_RECEIPT_SCOPE_MISMATCH");
@@ -166,16 +205,29 @@ async function beforePage(db, job, chunk) {
   if (!Array.isArray(chunk.transactions) || chunk.rawReceived !== chunk.transactions.length + chunk.scannerRejected + chunk.duplicateRows || typeof chunk.sourceHasMore !== "boolean") throw fault("FINANCIAL_RECEIPT_PAGE_INVALID");
   if (chunk.sourceHasMore && (typeof chunk.markerEnd !== "string" || !chunk.markerEnd || chunk.markerEnd.length > 220 || chunk.markerEnd === chunk.markerStart || chunk.rawReceived === 0)) throw fault("FINANCIAL_RECEIPT_CURSOR_STALLED");
   if (chunk.sourceHasMore && await db.financialPageReceipt.findFirst({ where: { runId: row.id, windowIndex, markerStart: chunk.markerEnd }, select: { page: true } })) throw fault("FINANCIAL_RECEIPT_CURSOR_CYCLE");
-  return { row, checksum, replay: false };
+  let knownBefore = null;
+  if (currentTraversal(job) && row.windows[windowIndex].kind === "FRONTIER") {
+    const facts = chunk.transactions.length ? await db.creatorFinancialTransaction.findMany({ where: {
+      creatorId: job.creatorId, externalTransactionId: { in: chunk.transactions.map(value => value.externalTransactionId) },
+      createdAt: { lt: date(job.params.financialFrontierKnownBefore) },
+    }, select: { externalTransactionId: true } }) : [];
+    knownBefore = new Set(facts.map(value => value.externalTransactionId));
+  }
+  return { row, checksum, replay: false, knownBefore };
 }
 function withinWindow(job, chunk, row) {
   const w = windowsFor(job)[chunk.windowIndex];
-  return w && row.occurredAt >= date(w.from) && row.occurredAt <= date(w.to);
+  return w && (!w.from || row.occurredAt >= date(w.from)) && row.occurredAt <= date(w.to);
 }
 async function commitPage(db, job, chunk, prepared, accepted, backendRejected, rejectedRows = []) {
   const { row, checksum } = prepared, index = chunk.windowIndex, proof = row.proof, totals = proof.windows[index];
   const previous = accepted.length ? await db.financialObservedFact.findMany({ where: { runId: row.id, windowIndex: index, externalId: { in: accepted.map(x => x.externalTransactionId) } } }) : [];
   const byId = new Map(previous.map(x => [x.externalId, x.value]));
+  if (chunk.sourceHasMore && accepted.length > 0 && accepted.every(fact => {
+    const prior = byId.get(fact.externalTransactionId);
+    return prior && prior.occurredAt === fact.occurredAt.toISOString() && prior.amountCents === fact.amountCents
+      && prior.netCents === fact.netCents && prior.transactionStatus === fact.transactionStatus && prior.transactionType === fact.transactionType;
+  })) throw fault("FINANCIAL_RECEIPT_PAGE_REPEATED");
   const records = [];
   for (const fact of accepted) {
     const value = { externalTransactionId: fact.externalTransactionId, occurredAt: fact.occurredAt.toISOString(),
@@ -185,6 +237,15 @@ async function commitPage(db, job, chunk, prepared, accepted, backendRejected, r
       page: fact.page, ordinal: fact.ordinal };
     if (byId.has(fact.externalTransactionId)) addFact(totals, byId.get(fact.externalTransactionId), -1);
     addFact(totals, value, 1);
+    if (!totals.oldestAt || value.occurredAt < totals.oldestAt) totals.oldestAt = value.occurredAt;
+    if (!totals.newestAt || value.occurredAt > totals.newestAt) totals.newestAt = value.occurredAt;
+    if (currentTraversal(job) && row.windows[index].comparisonFrom) {
+      totals.comparisonTotals ||= emptyTotals();
+      const from = row.windows[index].comparisonFrom;
+      const previousValue = byId.get(fact.externalTransactionId);
+      if (previousValue && previousValue.occurredAt >= from) addFact(totals.comparisonTotals, previousValue, -1);
+      if (value.occurredAt >= from) addFact(totals.comparisonTotals, value, 1);
+    }
     byId.set(fact.externalTransactionId, value);
     records.push({ externalId: fact.externalTransactionId, occurredAt: fact.occurredAt.toISOString(), value });
   }
@@ -208,16 +269,43 @@ async function commitPage(db, job, chunk, prepared, accepted, backendRejected, r
   const cursor = { ...row.cursor, page: chunk.pageNumber, marker: chunk.sourceHasMore ? chunk.markerEnd : row.cursor.marker,
     phase: chunk.sourceHasMore ? "transactions" : "charts", chartIndex: 0, processed: row.cursor.processed + chunk.rawReceived, scannerRejected: row.cursor.scannerRejected + rejected };
   if (row.windows[index].kind === "FRONTIER") {
-    const known=new Set(job.params.financialFrontierKnownIds);
-    const boundary=accepted.length>0 && rejected===0 && accepted.every(f=>known.has(f.externalTransactionId));
-    const overlap=row.cursor.frontierPhase==="OVERLAP";
-    const done=!chunk.sourceHasMore || overlap;
-    cursor.frontierPhase=done?"DONE":boundary?"OVERLAP":"SEEK";
-    cursor.phase=done?"done":"transactions";
-    totals.boundaryPage ||= boundary?chunk.pageNumber:null;
-    if(overlap)totals.overlapPage=chunk.pageNumber;
-    proof.complete=done && totals.rejected===0 && (totals.exhausted || totals.overlapPage===totals.boundaryPage+1);
-    proof.kind="FRONTIER_PLUS_ONE";
+    const known = prepared.knownBefore || new Set(job.params.financialFrontierKnownIds || []);
+    const passedGap = !currentTraversal(job) || (accepted.length > 0 && accepted.every(f => +f.occurredAt <= +date(row.windows[index].comparisonFrom)));
+    const boundary = passedGap && accepted.length > 0 && rejected === 0 && accepted.every(f => known.has(f.externalTransactionId));
+    const overlap = row.cursor.frontierPhase === "OVERLAP";
+    const overlapPages = overlap ? (row.cursor.overlapPages || 0) + 1 : 0;
+    const requiredOverlap = currentTraversal(job) ? 2 : 1;
+    const done = !chunk.sourceHasMore || (overlap && overlapPages >= requiredOverlap);
+    cursor.overlapPages = overlapPages;
+    cursor.frontierPhase = done ? "DONE" : overlap || boundary ? "OVERLAP" : "SEEK";
+    cursor.phase = done ? (currentTraversal(job) ? "charts" : "done") : "transactions";
+    totals.boundaryPage ||= boundary ? chunk.pageNumber : null;
+    if (overlap) totals.overlapPage = chunk.pageNumber;
+    totals.overlapPages = overlapPages;
+    totals.traversalComplete = done;
+    proof.kind = currentTraversal(job) ? "FRONTIER_PLUS_TWO_AND_CHART" : "FRONTIER_PLUS_ONE";
+    if (!currentTraversal(job)) proof.complete = done && totals.rejected === 0 && (totals.exhausted || totals.overlapPage === totals.boundaryPage + 1);
+  }
+  if (currentTraversal(job)) {
+    const w = row.windows[index];
+    const traversalComplete = totals.exhausted || totals.traversalComplete === true;
+    if (traversalComplete) {
+      totals.comparisonFrom = w.comparisonFrom || w.from || (totals.oldestAt ? new Date(Date.parse(totals.oldestAt)).toISOString().slice(0, 10) + "T00:00:00.000Z" : null);
+      totals.comparisonTo = w.to;
+      cursor.comparisonFrom = totals.comparisonFrom;
+      cursor.traversalComplete = true;
+      cursor.sourceBoundaryReached = totals.exhausted;
+      cursor.historyRead = w.kind === "FULL" && totals.exhausted;
+      proof.historyRead = cursor.historyRead;
+      proof.traversalComplete = true;
+      // An empty unbounded list does not establish a date range suitable for
+      // chart verification. Preserve the explicit end-of-source observation.
+      if (!totals.comparisonFrom) {
+        totals.comparable = false;
+        proof.verification = "UNAVAILABLE";
+        cursor.phase = "done";
+      } else totals.comparable = true;
+    }
   }
   const receivedAt = await dbAuthorityNow({ db });
   await db.financialReceiptRun.update({ where: { id: row.id }, data: { cursor, proof, updatedAt: receivedAt } });
@@ -225,10 +313,10 @@ async function commitPage(db, job, chunk, prepared, accepted, backendRejected, r
 }
 async function commitChart(db, job, chunk) {
   const row = await lockedRun(db, job), index = integer(chunk.windowIndex, row.windows.length - 1), state = row.cursor, w = row.windows[index];
-  const categories = w.kind === "FULL" ? FULL_CHARTS : ["total"];
+  const categories = w.kind === "FULL" ? FULL_CHARTS : ["total"], range = comparisonRange(row, index);
   const previous = row.proof.windows[index].charts[chunk.category];
   const summary = { grossCents: chunk.grossCents, netCents: chunk.netCents, transactionsCount: chunk.transactionsCount };
-  if (chunk.collectorVersion !== COLLECTOR || chunk.scanRunId !== row.generation || date(chunk.rangeFrom)?.toISOString() !== w.from || date(chunk.rangeTo)?.toISOString() !== w.to) throw fault("FINANCIAL_CHART_SCOPE_MISMATCH");
+  if (chunk.collectorVersion !== COLLECTOR || chunk.scanRunId !== row.generation || date(chunk.rangeFrom)?.toISOString() !== range.from || date(chunk.rangeTo)?.toISOString() !== range.to) throw fault("FINANCIAL_CHART_SCOPE_MISMATCH");
   if (!Number.isSafeInteger(summary.grossCents) || !Number.isSafeInteger(summary.netCents)) throw fault("FINANCIAL_CHART_AMOUNT_INVALID");
   integer(summary.transactionsCount);
   if (previous) {
@@ -239,12 +327,15 @@ async function commitChart(db, job, chunk) {
   const proof = row.proof, totals = proof.windows[index]; totals.charts[chunk.category] = summary;
   const cursor = { ...state, chartIndex: state.chartIndex + 1 };
   if (cursor.chartIndex === categories.length) {
-    const chart = totals.charts.total, undo = totals.statusGroups.undo;
-    totals.matched = totals.count - (undo?._count._all || 0) === chart.transactionsCount
-      && totals.grossCents - (undo?._sum.amountCents || 0) === chart.grossCents && totals.netCents - (undo?._sum.netCents || 0) === chart.netCents;
+    const chart = totals.charts.total, observed = earningsTotals(comparableTotals(totals));
+    totals.matched = observed.transactionsCount === chart.transactionsCount && observed.grossCents === chart.grossCents && observed.netCents === chart.netCents;
     cursor.windowIndex++;
     if (cursor.windowIndex < row.windows.length) Object.assign(cursor, { phase: "transactions", marker: row.windows[cursor.windowIndex].initialMarker, page: 0, chartIndex: 0 });
-    else { cursor.phase = "done"; proof.complete = proof.windows.every(p => p.exhausted && p.matched && p.rejected === 0); }
+    else {
+      cursor.phase = "done";
+      proof.complete = proof.windows.every(p => (p.exhausted || (currentTraversal(job) && p.traversalComplete)) && p.matched && p.rejected === 0);
+      if (currentTraversal(job)) proof.verification = proof.complete ? "VERIFIED" : "MISMATCH";
+    }
   }
   const receivedAt = await dbAuthorityNow({ db });
   await db.financialReceiptRun.update({ where: { id: row.id }, data: { cursor, proof, updatedAt: receivedAt } });
@@ -254,14 +345,17 @@ async function completionProof(db, job) {
   if (!enabled(job)) return { complete: false, protocolCurrent: false };
   const row = await db.financialReceiptRun.findUnique({ where: { id: runId(job) } });
   if (!row || row.generation !== job.params.collectionGeneration || row.jobId !== job.id || row.agencyId !== job.agencyId || row.creatorId !== job.creatorId) return { complete: false, protocolCurrent: true };
-  return { complete: row.cursor.phase === "done" && row.proof.complete === true, protocolCurrent: true, row };
+  const filteredHistory = row.windows[0]?.kind === "FULL" && row.windows[0].from !== null;
+  const legacyTraversal = !currentTraversal(job) && row.windows[0]?.kind !== "RESOLUTION";
+  const unavailableReason = filteredHistory ? "FINANCIAL_LEGACY_FILTERED_HISTORY" : legacyTraversal ? "FINANCIAL_LEGACY_FRONTIER_INCOMPLETE" : null;
+  return { complete: !unavailableReason && row.cursor.phase === "done" && row.proof.complete === true, protocolCurrent: true, filteredHistory, unavailableReason, row };
 }
 function coverageUpdate(job, current, row, observedAt, now) {
   const head = row.windows[0];
   if(head.kind==="FRONTIER") return {receiptCoverageVersion:1,coverageThrough:date(head.to),recentRangeTo:date(head.to),
     recentRangeFrom:date(current?.recentRangeFrom)||date(current?.baselineRangeFrom)||FLOOR};
-  const common = { receiptCoverageVersion: 1, recentRangeFrom: date(head.from), recentRangeTo: date(head.to) };
-  if (head.kind === "FULL") return { ...common, coverageThrough: date(head.to), historyAuditCursor: FLOOR,
+  const common = { receiptCoverageVersion: 1, recentRangeFrom: date(row.proof?.windows?.[0]?.oldestAt) || date(head.from), recentRangeTo: date(head.to) };
+  if (head.kind === "FULL") return { ...common, coverageThrough: date(head.to), historyAuditCursor: date(row.proof?.windows?.[0]?.oldestAt) || date(head.from),
     historyAuditCycleStartedAt: null, historyAuditObservedAt: observedAt, historyAuditCompletedAt: now };
   const frontier = date(current?.coverageThrough) || date(current?.baselineRangeTo) || FLOOR;
   const extra = row.windows[1];
@@ -294,5 +388,5 @@ function evaluateCollection(state, now, freshnessMs) {
   return Object.freeze({ ...base, fresh: false, stale: base.proven, deferred, due: !deferred && !base.failed });
 }
 module.exports = { FinancialReceiptError, invalidClaim, COLLECTOR, FULL_CHARTS, RECENT_DAYS, AUDIT_DAYS, HISTORY_FRESH_MS, enabled, enter, date, hash, runId,
-  planWindows, windowsFor, claimParams, initialCursor, envelope, resultFor, expectedMatches, restoreContinuation,
+  planWindows, windowsFor, claimParams, initialCursor, envelope, resultFor, expectedMatches, restoreContinuation, currentTraversal, historyRead, comparisonRange, comparableTotals, earningsTotals,
   beforePage, withinWindow, commitPage, commitChart, completionProof, coverageUpdate, coverageView, evaluateCollection };

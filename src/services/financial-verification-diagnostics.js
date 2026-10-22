@@ -17,22 +17,28 @@ function financialVerificationDiagnostics(value) {
   const reconciliation = object(source.reconciliation);
   const reasons = new Set();
   const reject = (condition, reason) => { if (!source.ok && condition) reasons.add(reason); };
+  reject(source.error === "FINANCIAL_LEGACY_FILTERED_HISTORY", "FINANCIAL_LEGACY_FILTERED_HISTORY");
+  reject(source.error === "FINANCIAL_LEGACY_FRONTIER_INCOMPLETE", "FINANCIAL_LEGACY_FRONTIER_INCOMPLETE");
   reject(source.protocolCurrent === false, "FINANCIAL_RECEIPT_PROTOCOL_REQUIRED");
-  reject(source.sourceBoundaryReached === false, "FINANCIAL_SOURCE_BOUNDARY_NOT_REACHED");
+  reject(source.sourceBoundaryReached === false && source.traversalComplete !== true, "FINANCIAL_SOURCE_BOUNDARY_NOT_REACHED");
+  reject(source.verification === "UNAVAILABLE", "FINANCIAL_COMPARISON_SCOPE_UNAVAILABLE");
   reject(number(source.scannerRejected) > 0, "FINANCIAL_SOURCE_ROWS_REJECTED");
   reject(source.staleGeneration === true, "FINANCIAL_GENERATION_SUPERSEDED");
   const windows = (Array.isArray(source.windows) ? source.windows : []).slice(0, 2).map((value, index) => {
-    const row = object(value), chart = object(object(row.charts).total), undo = object(object(row.statusGroups).undo);
-    const gross = number(row.grossCents), net = number(row.netCents), count = number(row.count);
-    const countUndo = number(object(undo._count)._all) ?? 0;
-    const grossUndo = number(object(undo._sum).amountCents) ?? 0, netUndo = number(object(undo._sum).netCents) ?? 0;
+    const row = object(value), chart = object(object(row.charts).total);
+    const comparison = row.comparisonTotals ? object(row.comparisonTotals) : row;
+    const comparisonUndo = object(object(comparison.statusGroups).undo);
+    const gross = number(comparison.grossCents), net = number(comparison.netCents), count = number(comparison.count);
+    const countUndo = number(object(comparisonUndo._count)._all) ?? 0;
+    const grossUndo = number(object(comparisonUndo._sum).amountCents) ?? 0, netUndo = number(object(comparisonUndo._sum).netCents) ?? 0;
     const observed = { count: count === null ? null : count - countUndo,
       grossCents: gross === null ? null : gross - grossUndo, netCents: net === null ? null : net - netUndo };
     const expected = { count: number(chart.transactionsCount), grossCents: number(chart.grossCents), netCents: number(chart.netCents) };
-    const chartRequired = row.kind !== "FRONTIER";
+    const chartRequired = row.kind !== "FRONTIER" || reconciliation.proofKind === "FRONTIER_PLUS_TWO_AND_CHART";
     const chartPresent = Object.keys(chart).length > 0;
     reject(number(row.rejected) > 0, "FINANCIAL_SOURCE_ROWS_REJECTED");
-    reject(chartRequired && row.exhausted === false, "FINANCIAL_SOURCE_BOUNDARY_NOT_REACHED");
+    reject(chartRequired && row.exhausted === false && row.traversalComplete !== true, "FINANCIAL_SOURCE_BOUNDARY_NOT_REACHED");
+    reject(row.comparable === false, "FINANCIAL_COMPARISON_SCOPE_UNAVAILABLE");
     reject(chartRequired && !chartPresent, "FINANCIAL_CHART_RECEIPT_MISSING");
     for (const [key, reason] of [["count", "FINANCIAL_CHART_COUNT_MISMATCH"], ["grossCents", "FINANCIAL_CHART_GROSS_MISMATCH"], ["netCents", "FINANCIAL_CHART_NET_MISMATCH"]])
       reject(chartRequired && chartPresent && observed[key] !== null && expected[key] !== null && observed[key] !== expected[key], reason);
@@ -40,8 +46,9 @@ function financialVerificationDiagnostics(value) {
       pages: number(row.pages), received: number(row.received), rejected: number(row.rejected), exhausted: bool(row.exhausted),
       rejectionReasons: Object.fromEntries(REJECTION_REASONS.filter(key => number(object(row.rejectionReasons)[key]) > 0)
         .map(key => [key, number(row.rejectionReasons[key])])),
-      matched: bool(row.matched), chartPresent, observed, expected,
-      boundaryPage: number(row.boundaryPage), overlapPage: number(row.overlapPage) };
+      matched: bool(row.matched), chartPresent, comparable: bool(row.comparable),
+      comparisonFromAt: iso(row.comparisonFrom || row.from), comparisonToAt: iso(row.comparisonTo || row.to), observed, expected,
+      boundaryPage: number(row.boundaryPage), overlapPage: number(row.overlapPage), overlapPages: number(row.overlapPages) };
   });
   if (reconciliation.proofKind !== "FRONTIER_PLUS_ONE") {
     reject(reconciliation.chartReady === false, "FINANCIAL_CHART_RECEIPT_MISSING");
@@ -52,8 +59,10 @@ function financialVerificationDiagnostics(value) {
   reject(!reasons.size, "FINANCIAL_RECEIPT_INCOMPLETE");
   return { version: 1, outcome: source.ok ? "VERIFIED" : "REJECTED", reasons: [...reasons],
     protocolCurrent: bool(source.protocolCurrent), sourceBoundaryReached: bool(source.sourceBoundaryReached),
+    historyRead: bool(source.historyRead), traversalComplete: bool(source.traversalComplete),
+    verification: ["PENDING", "UNAVAILABLE", "MISMATCH", "VERIFIED"].includes(source.verification) ? source.verification : null, published: bool(source.published),
     scannerRejected: number(source.scannerRejected), staleGeneration: bool(source.staleGeneration),
-    proofKind: ["FRONTIER_PLUS_ONE", "EXHAUSTED_WINDOW_AND_CHART"].includes(reconciliation.proofKind) ? reconciliation.proofKind : null,
+    proofKind: ["FRONTIER_PLUS_ONE", "FRONTIER_PLUS_TWO_AND_CHART", "EXHAUSTED_WINDOW_AND_CHART"].includes(reconciliation.proofKind) ? reconciliation.proofKind : null,
     chartReady: bool(reconciliation.chartReady), countMatched: bool(reconciliation.countMatched),
     grossMatched: bool(reconciliation.grossMatched), netMatched: bool(reconciliation.netMatched), windows };
 }

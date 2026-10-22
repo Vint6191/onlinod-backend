@@ -38,6 +38,7 @@ const JOB_SERVER_CAPABILITIES = Object.freeze({
   campaignFairPagesV1: true,
   financialWindowReceiptsV1: true,
   financialMoneyResolutionV1: true,
+  financialTraversalV2: true,
 });
 
 router.use((req, res, next) => {
@@ -142,6 +143,7 @@ const claimSchema = z.object({
     campaignFairPagesV1: z.boolean().optional().default(false),
     financialWindowReceiptsV1: z.boolean().optional().default(false),
     financialMoneyResolutionV1: z.boolean().optional().default(false),
+    financialTraversalV2: z.boolean().optional().default(false),
   }).passthrough().optional().default({}),
 });
 
@@ -173,6 +175,7 @@ const observationReadLeaseAcquireSchema = z.object({
   leaseRevision: leaseRevisionSchema,
   purpose: z.string().min(1).max(120),
   requestId: z.string().min(16).max(200),
+  fanDataBatch: z.object({ startIndex: z.number().int().min(0).max(500), fanIds: z.array(z.string().min(1).max(180)).min(1).max(20) }).optional(),
   campaignPage: z.object({ externalCampaignId: z.string().min(1).max(220),
     pageNumber: z.number().int().min(1).max(2147483647), sourceOffset: z.number().int().min(0).max(2147483647) }).optional(),
 });
@@ -210,6 +213,7 @@ const failSchema = z.object({
   workId: workIdSchema,
   error: z.string().min(1).max(2000),
   result: z.unknown().optional(),
+  expectedContinuation: z.unknown().optional(),
   retryable: z.boolean().optional(),
 });
 
@@ -274,6 +278,7 @@ router.post("/:id/observation-read-lease/acquire", async (req, res, next) => {
       purpose: input.purpose,
       requestId: input.requestId,
       campaignPage: input.campaignPage,
+      fanDataBatch: input.fanDataBatch,
     });
     return res.json({ ok: true, ...lease });
   } catch (error) {
@@ -391,6 +396,7 @@ router.post("/:id/fail", async (req, res, next) => {
       error: input.error,
       result: input.result,
       retryable: input.retryable,
+      expectedContinuation: input.expectedContinuation,
     });
     return res.json({ ok: true, job: failed });
   } catch (error) {

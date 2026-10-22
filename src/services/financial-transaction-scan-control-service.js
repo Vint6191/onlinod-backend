@@ -90,7 +90,6 @@ async function startManualFinancialTransactionScan({ db = prisma, creator, reque
       requestedByUserId: clean(requestedByUserId, 220),
       reason: MANUAL_REASON,
       ...buildCollectionCommand({ collectorType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "full", reason: MANUAL_REASON, now: authorityNow }),
-      startDate: "2016-01-01 00:00:00",
       endDate: onlyFansUtcDateTime(new Date(snapshotMarker * 1000)),
       initialMarker: snapshotMarker,
       schemaVersion: SCHEMA_VERSION,
@@ -166,26 +165,28 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     typeSummary = Object.values(proof.typeGroups || {}).sort((a,b) => b.count-a.count || a.transactionType.localeCompare(b.transactionType));
     const categories = { total: "TOTAL", subscribes: "SUBSCRIPTIONS", tips: "TIPS", messages: "MESSAGES", post: "POSTS", stream: "STREAMS" };
     charts = Object.entries(proof.charts).map(([key, value]) => ({ ...value, category: categories[key],
-      rangeFrom: run.windows[0].from, rangeTo: run.windows[0].to, collectedAt: null }));
+      rangeFrom: require("./financial-receipt-authority").comparisonRange(run).from, rangeTo: run.windows[0].to, collectedAt: null }));
   }
   const onlineWorkers = await countOnlineBindings(db, creator);
   const continuationEnvelope = object(job?.continuation);
   const continuation = run?.cursor || (continuationEnvelope.driverPhase === "execute" ? object(continuationEnvelope.jobContinuation) : continuationEnvelope);
   const totalChart = charts.find((row) => row.category === "TOTAL") || null;
-  const sourceBoundaryReached = run?.cursor.phase === "done";
+  const sourceBoundaryReached = Boolean(run && run.proof.windows.every(window => window.exhausted));
+  const authority = require("./financial-receipt-authority");
+  const comparison = proof ? authority.earningsTotals(authority.comparableTotals(proof)) : null;
   const scannerRejected = run ? run.proof.windows.reduce((sum, window) => sum + window.rejected, 0) : 0;
   const computedReconciliation = {
     chartReady: Boolean(totalChart),
-    countMatched: Boolean(totalChart) && summary.earningsTransactionsCount === Number(totalChart.transactionsCount || 0),
-    grossMatched: Boolean(totalChart) && summary.earningsGrossCents === Number(totalChart.grossCents || 0),
-    netMatched: Boolean(totalChart) && summary.earningsNetCents === Number(totalChart.netCents || 0),
+    countMatched: Boolean(totalChart) && comparison?.transactionsCount === Number(totalChart.transactionsCount || 0),
+    grossMatched: Boolean(totalChart) && comparison?.grossCents === Number(totalChart.grossCents || 0),
+    netMatched: Boolean(totalChart) && comparison?.netCents === Number(totalChart.netCents || 0),
     chartCount: totalChart ? Number(totalChart.transactionsCount || 0) : null,
     chartGrossCents: totalChart ? Number(totalChart.grossCents || 0) : null,
     chartNetCents: totalChart ? Number(totalChart.netCents || 0) : null,
   };
   let status = jobStatus(job);
   if (job?.status === "DONE") {
-    const verified = run?.proof.complete === true && sourceBoundaryReached && scannerRejected === 0 && computedReconciliation.chartReady
+    const verified = run?.proof.complete === true && run?.cursor.phase === "done" && scannerRejected === 0 && computedReconciliation.chartReady
       && computedReconciliation.countMatched && computedReconciliation.grossMatched && computedReconciliation.netMatched;
     status = verified ? "COMPLETE" : "PARTIAL";
   }
@@ -202,6 +203,10 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     pagesScanned: run ? run.proof.windows.reduce((sum, window) => sum + window.pages, 0) : integer(progress.current, 0, 1_000_000),
     marker: clean(continuation.marker, 220),
     sourceBoundaryReached,
+    historyRead: authority.historyRead(run),
+    traversalComplete: run?.proof.traversalComplete === true || run?.cursor.phase === "done",
+    verification: object(object(job?.result).completionSideEffect).verification || run?.proof.verification || (run?.proof.complete ? "VERIFIED" : "PENDING"),
+    published: job?.status === "DONE" && run?.proof.complete === true,
     scannerRejected,
     oldestOccurredAt: iso(bounds?._min?.occurredAt),
     newestOccurredAt: iso(bounds?._max?.occurredAt),

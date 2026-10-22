@@ -25,7 +25,9 @@ module.exports = async function wakeProof({ db, scope: s, now, pass }) {
       { id: "wake-old", agencyId: s.agencyId, creatorId: s.creatorId, stream: "financial", reason: "OFFLINE_GAP", gapFrom: new Date(+now - 7200000), targetAt: now, policyVersion: 2, status: "RUNNING", jobId: "wake-job" },
       { id: "wake-new", agencyId: s.agencyId, creatorId: s.creatorId, stream: "financial", reason: "OFFLINE_GAP", gapFrom: now, targetAt: new Date(+now + 1), policyVersion: 2, status: "PENDING" },
     ] });
-    await sync.completeRecovery(t, { id: "wake-job", ...s, jobKey: "financial_transactions_scan", params: { recoveryIntentId: "wake-old" } }, true);
+    await sync.completeRecovery(t, { id: "wake-job", ...s, jobKey: "financial_transactions_scan",
+      params: { recoveryIntentId: "wake-old", recoveryTargetAt: now.toISOString(), endDate: now.toISOString() } }, true,
+      { coveredThrough: now });
   });
   c = await claim(); assert.equal(c.items.length, 1); assert.deepEqual(c.items[0].progressCursor, progressCursor);
   assert.equal((await db.creatorRecoveryIntent.findUnique({ where: { id: "wake-new" } })).status, "PENDING");

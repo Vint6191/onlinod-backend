@@ -1,3 +1,4 @@
+require("../../scripts/test-support/canonical-change-publication-fixture").installCanonicalChangePublicationFixture();
 'use strict';
 // Execute production functions. Database/clock adapters are explicit doubles;
 // this is not a PostgreSQL integration test.
@@ -52,7 +53,7 @@ async function comparison(legacy, recovery=false) {
     creatorFinancialCollectionState: { findUnique: async () => financial },
     creatorCampaign: { findMany: async () => [] }, jobInstance: { findFirst: async () => null, findMany: async () => [] },
     $queryRawUnsafe: async (sql,...args) => {
-      if(sql.includes('FROM "CreatorRecoveryIntent"'))return recovery && args[1]==='campaigns' ? [{id:'recovery',targetAt:now,reason:'OFFLINE_GAP'}] : [];
+      if(sql.includes('FROM "CreatorRecoveryIntent"'))return recovery && args[1]==='campaigns' ? [{id:'recovery',gapFrom:observed,targetAt:now,reason:'OFFLINE_GAP'}] : [];
       return sql.includes('FROM "CreatorFanRefreshDemand"') ? [{queued:false,failed:false}] : [{ empty: true }];
     }, $executeRawUnsafe: async () => 1 };
   db.$transaction = async work => { const tx = { ...db }; delete tx.$transaction; return work(tx); };
@@ -192,6 +193,12 @@ test('Delegated debt suppresses duplicate provider work and never reads as fresh
   const row=state({fanValueExpected:2,fanValueOutstanding:1,fanValueFreshnessStatus:'QUEUED'});
   const e=freshness.evaluateCampaignCollectionState(row,now);
   assert.equal(e.fresh,false);assert.equal(e.due,false);assert.equal(e.fanRefreshPending,true);
+});
+test('Terminal unavailable coverage is incomplete without pretending that refresh work remains pending',()=>{
+  const row=state({fanValueExpected:2,fanValueOutstanding:0,fanValueUnavailable:1,fanValueFreshnessStatus:'PARTIAL'});
+  const e=freshness.evaluateCampaignCollectionState(row,now,{queued:false,failed:false});
+  assert.equal(e.providerFresh,true);assert.equal(e.fresh,false);assert.equal(e.due,false);
+  assert.equal(e.fanRefreshPending,false);assert.equal(e.fanRefreshIncomplete,true);
 });
 for(const count of [0,1])test('Server-planned zero-target reuse survives restart/replay without renewing observation, count='+count,async()=>{
   const f=fixture({versions:count?[1]:[]});

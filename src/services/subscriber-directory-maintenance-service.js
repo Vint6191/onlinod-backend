@@ -127,6 +127,10 @@ async function runSubscriberDirectoryMaintenance({
     totals.advancedSteps += Number(result?.advancedSteps || 0);
     totals.reconciledJobs += Number(result?.reconciledJobs || 0);
     totals.stateRepairs += Number(result?.stateRepairs || 0);
+    if (result?.stopped) {
+      const acknowledged = await ackSubscriberDirectoryMaintenanceSignal({ db, signal });
+      return { ...result, debtRemains: true, signalAcknowledged: Boolean(acknowledged) };
+    }
     const debtRemains = await hasSubscriberPublicationDebt({ db, agencyId: signal.agencyId, creatorId: signal.creatorId });
     if (debtRemains) {
       // More bounded work is a continuation, not a failed attempt.

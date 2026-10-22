@@ -59,9 +59,12 @@ function pass(name){results.push(name);console.log("PASS",name);}
   await db.deviceCreatorBinding.create({data:{deviceId:"resolution-device",agencyId:s.agencyId,creatorId:s.creatorId,sessionReadReady:true,lastSeenAt:new Date()}});
   await db.agency.update({where:{id:s.agencyId},data:{trialEndsAt:new Date(Date.now()+86400000)}});
   const lease=require(root+"/src/services/job-lease-service");
-  const leased=await lease.claimJob({userId:s.userId,deviceId:"resolution-device",jobKeys:["financial_transactions_scan"],
+  const oldDesktop=await lease.claimJob({userId:s.userId,deviceId:"resolution-device",jobKeys:["financial_transactions_scan"],
     capabilities:{creatorEventDrivenSyncV2:true,financialWindowReceiptsV1:true,financialMoneyResolutionV1:true}});
-  assert.equal(leased.job.id,job.id);
+  assert.equal(oldDesktop.job,null,"legacy traversal capability cannot claim financial source work");
+  const leased=await lease.claimJob({userId:s.userId,deviceId:"resolution-device",jobKeys:["financial_transactions_scan"],
+    capabilities:{creatorEventDrivenSyncV2:true,financialWindowReceiptsV1:true,financialMoneyResolutionV1:true,financialTraversalV2:true}});
+  assert.equal(leased.job?.id,job.id,JSON.stringify(leased));
   const token=leased.job.leaseToken;
   job=await db.jobInstance.findUnique({where:{id:job.id}});
   assert.equal(job.params.financialWindows[0].kind,"RESOLUTION");assert.equal(job.params.financialWindows[0].to,plannedEnd);

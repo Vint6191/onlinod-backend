@@ -199,7 +199,7 @@ test("A19 later canonical fresh observation heals previously FAILED Campaign deb
       update: async ({ data }) => { demandUpdates.push(data); Object.assign(demand, data); return demand; },
     },
     creatorFan: {
-      findMany: async () => [{ onlyFansUserId: "f1", valueCurrent: { valueObservedAt: observedAt, availability: "AVAILABLE" } }],
+      findMany: async () => [{ onlyFansUserId: "f1", valueCurrent: { valueObservedAt: observedAt, availability: "AVAILABLE", platformReportedTotalSpendCents: 1234n } }],
     },
     creatorCampaignFanRefreshWork: {
       findMany: async () => [{ id: "w1", creatorId: "c1", scanRunId: "run1", status: "FAILED", freshnessCutoffAt: cutoff }],

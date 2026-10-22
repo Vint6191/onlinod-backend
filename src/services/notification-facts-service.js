@@ -853,6 +853,9 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       if (groups.sale.length) {
         const persistedSales = await existingFacts(tx, "creatorSale", job.creatorId, groups.sale);
         for (const row of persistedSales) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "PPV", sourceId: row.id, now });
+        if (sale.inserted || sale.updated) await require("./creator-entity-change-service").publishCanonicalSales({
+          db:tx,agencyId:job.agencyId,creatorId:job.creatorId,saleIds:persistedSales.map(row=>row.id),
+        });
       }
       if (groups.tip.length) {
         const persistedTips = await existingFacts(tx, "creatorTip", job.creatorId, groups.tip);
@@ -884,6 +887,11 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
         model: "creatorPostComment", facts: groups.comment, job, deviceId, fanRecordIds, now,
         compareKeys: ["fanRecordId", "externalNotificationId", "onlyFansCommentId", "onlyFansPostId", "commentedAt"],
       });
+      for (const [model, group] of [["creatorTip", tip], ["creatorSubscriptionEvent", subscription], ["creatorPostLike", like], ["creatorPostComment", comment]]) {
+        if ((group.inserted || group.updated) && group.canonicalIds.length) await require("./creator-entity-change-service").publishCanonicalFactInvalidations({
+          db: tx, agencyId: job.agencyId, creatorId: job.creatorId, model, ids: group.canonicalIds,
+        });
+      }
       let rowOutcomes;
       if (schemaVersion === SOURCE_SCHEMA_VERSION) {
         const persisted = [];

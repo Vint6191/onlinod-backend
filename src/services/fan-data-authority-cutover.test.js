@@ -1,3 +1,4 @@
+require("../../scripts/test-support/canonical-change-publication-fixture").installCanonicalChangePublicationFixture();
 const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 "use strict";
 
@@ -384,7 +385,9 @@ test("campaign current value read model preserves unknown instead of coercing it
   const {fanValueDto}=require('./campaign-read-repository');
   const now=new Date('2026-08-08');
   const value=fanValueDto({availability:'AVAILABLE',valueObservedAt:now,platformReportedTotalSpendCents:null,source:'USER_PROFILE'},now);
-  assert.equal(value.available,true);assert.equal(value.platformReportedTotalSpendCents,null);assert.equal(value.messagesSpentCents,null);
+  assert.equal(value.available,false);assert.equal(value.platformReportedTotalSpendCents,null);assert.equal(value.messagesSpentCents,null);
+  const zero=fanValueDto({availability:'AVAILABLE',valueObservedAt:now,platformReportedTotalSpendCents:0n,source:'USER_PROFILE'},now);
+  assert.equal(zero.available,true);assert.equal(zero.platformReportedTotalSpendCents,0);
   const ledger=read('src/services/creator-analytics-ledger-service.js');
   assert.match(ledger, /avatarUrl:\s*text\(item\.avatarUrl, 1200\)/);
   assert.match(ledger, /headerUrl:\s*text\(item\.headerUrl, 1200\)/);

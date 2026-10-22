@@ -7,14 +7,19 @@ async function fixture(){
  process.env.DATABASE_URL=current.url;process.env.DIRECT_URL=current.url;
  return {...current,pg:current.engine,socket:current.server};
 }
-async function scope(db,{agencyId='qa-agency',creatorId='qa-creator',userId='qa-user'}={}){
- await db.$transaction(async tx=>{
+async function scope(db,{agencyId='qa-agency',creatorId='qa-creator',userId='qa-user'}={}, {bareSessionForTimezoneProof=false}={}){
+ const write=async tx=>{
   await tx.$queryRawUnsafe(`SELECT set_config('onlinod.phase2_team_control_plane_generation','phase2_team_control_plane_v2_durable_access',true),set_config('onlinod.phase2_creator_writer_generation','phase2_creator_writer_v2_actual56_postcut',true)`);
   await tx.user.upsert({where:{id:userId},create:{id:userId,email:userId+'@example.test',passwordHash:'fixture'},update:{}});
   await tx.agency.upsert({where:{id:agencyId},create:{id:agencyId,name:'Fixture'},update:{}});
   await tx.agencyMember.create({data:{id:'member-'+agencyId,agencyId,userId,role:'OWNER',roleKey:'owner',assignedCreators:'all',permissions:{}}});
   await tx.creatorAccount.create({data:{id:creatorId,agencyId,displayName:'Fixture',remoteId:creatorId,status:'READY'}});
- });
+ };
+ // Ordinary fixtures enter the same UTC owner boundary as account creation.
+ // Only the explicit adversarial trigger proof bypasses it to test SQL's own
+ // temporal conversions under a caller-controlled non-UTC session.
+ if(bareSessionForTimezoneProof)await db.$transaction(write);
+ else await require('../../../src/services/db-commit-kernel').runRootCommit(db,({tx})=>write(tx));
  return{agencyId,creatorId,userId};
 }
 module.exports={fixture,scope};

@@ -731,6 +731,10 @@ async function applyVaultUnsortedChunk({ db, job, userId, chunkResult }) {
     knownStreak,
     expectedCount: integer(continuation.expectedCount ?? chunk.expectedMediaCount),
   });
+  if (mode === "incremental" && items.length) await require("./media-entity-change-service").publishMediaResult({
+    db,agencyId:job.agencyId,creatorId:job.creatorId,kind:"VAULT_CATALOG_PAGE",entityId:`vault-catalog:${job.creatorId}`,
+    state:{jobId:job.id,pages,items},
+  });
   const complete = !hasMore || stopForKnown || stopForMaxPages || items.length === 0;
   if (complete) {
     return {
@@ -882,6 +886,13 @@ async function applyVaultUnsortedCompletion({ db = prisma, job, userId, result }
       lastError: null,
     },
     countOverride: nextCounts,
+  });
+  // Staging pages cannot announce a new catalog. Completion announces only
+  // the canonical publication and persisted read snapshot, in that same root.
+  await require("./media-entity-change-service").publishMediaResult({
+    db,agencyId:job.agencyId,creatorId:job.creatorId,kind:"VAULT_CATALOG_PUBLISHED",entityId:`vault-catalog:${job.creatorId}`,
+    state:{jobId:job.id,mode,pages:integer(payload.pages),scanned:integer(payload.scanned),expectedMediaCount,
+      exactPublication,warning,...nextCounts},
   });
   return {
     type: "vault_unsorted",

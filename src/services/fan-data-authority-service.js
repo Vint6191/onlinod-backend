@@ -1363,7 +1363,7 @@ async function applyGenericFanObservationBulkSql(tx, rows, scope) {
 
 async function commitFanFacts(db, {
   agencyId, creatorId, sourceDeviceId = null, sourceJobId = null, sourceDeliveryId = null, scanRunId = null, items = [],
-  allowedSources = null, observedAtPolicy = null, receivedAt = new Date(), causalObservedAt = null, campaignLockHeld = false,
+  allowedSources = null, observedAtPolicy = null, receivedAt = new Date(), causalObservedAt = null, causalObservedAtByFan = null, campaignLockHeld = false,
 } = {}) {
   const scopedAgencyId = text(agencyId, 180);
   const scopedCreatorId = text(creatorId, 180);
@@ -1392,7 +1392,8 @@ async function commitFanFacts(db, {
     );
   }
   const rows = inputItems
-    .map((raw) => normalizeBatchObservation(raw, envelope))
+    .map((raw) => normalizeBatchObservation(raw, causalObservedAtByFan instanceof Map
+      ? { ...envelope, causalObservedAt: date(causalObservedAtByFan.get(onlyFansUserId(raw?.onlyFansUserId))) } : envelope))
     .filter(Boolean);
   const apply = async (tx) => {
     const identityProjected = rows.reduce((count, row) => count + (row.identity ? 1 : 0), 0);
@@ -1428,6 +1429,8 @@ async function commitFanFacts(db, {
           db: tx, creatorId: scopedCreatorId, fanIds: valueFanIds, now: envelope.receivedAt, _campaignLockHeld: campaignAuthorityHeld,
         });
       }
+      await require("./campaign-fan-change-publication").publishCanonicalFanChanges({ db: tx,
+        agencyId: scopedAgencyId, creatorId: scopedCreatorId, fanIds: touchedFanIds });
       return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };
     }
 
@@ -1454,7 +1457,9 @@ async function commitFanFacts(db, {
         db: tx, creatorId: scopedCreatorId, fanIds: valueFanIds, now: envelope.receivedAt, _campaignLockHeld: campaignAuthorityHeld,
       });
     }
-    return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };
+    await require("./campaign-fan-change-publication").publishCanonicalFanChanges({ db: tx,
+        agencyId: scopedAgencyId, creatorId: scopedCreatorId, fanIds: touchedFanIds });
+      return { ok: true, projected: rows.length, identityProjected, relationshipProjected, valueProjected, touchedFanIds };
   };
   return runDbTransaction(db, apply);
 }
@@ -1514,38 +1519,40 @@ async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult })
   // scheduled earlier.
   const receivedAt = await dbAuthorityNow({ db, fallbackNow: new Date() });
   let causalObservedAt = null;
+  let causalObservedAtByFan = null;
   const observationTokenRequired = Number(job?.params?.observationTokenVersion || 0) >= 1;
+  if (Number(chunkResult?.pipelineVersion || 0) === 1) {
+    await require("./fan-data-batch-authority").validateFanDataBatchReuse({ db, job, chunkResult, now: receivedAt });
+  }
   if (items.length && observationTokenRequired) {
     try {
-      const consumedToken = await consumeFanObservationToken({
-        db,
-        job,
-        deviceId,
-        leaseRevision: job.leaseRevision,
-        token: chunkResult?.observationToken,
-        purpose: "fan_data_point_refresh",
-        subjects: returnedFanIds,
-      });
-      causalObservedAt = date(consumedToken.observedAt);
+      const tokens = Number(chunkResult?.pipelineVersion || 0) === 1
+        ? (Array.isArray(chunkResult.observationTokens) ? chunkResult.observationTokens : [])
+        : [{ token: chunkResult?.observationToken, subjects: returnedFanIds }];
+      const tokenSubjects = tokens.flatMap(group => Array.isArray(group?.subjects) ? group.subjects : []);
+      if (!tokens.length || tokens.length > FAN_DATA_POINT_REFRESH_CHUNK_MAX
+        || tokenSubjects.length !== returnedFanIds.length || new Set(tokenSubjects).size !== tokenSubjects.length
+        || returnedFanIds.some(id => !tokenSubjects.includes(id))) throw new Error("Fan data token groups must exactly cover returned observations");
+      causalObservedAtByFan = new Map();
+      for (const group of tokens) {
+        const consumedToken = await consumeFanObservationToken({ db, job, deviceId, leaseRevision: job.leaseRevision,
+          token: group.token, purpose: "fan_data_point_refresh", subjects: group.subjects });
+        const observedAt = date(consumedToken.observedAt);
+        if (!observedAt) throw new Error("Fan data token observation time is invalid");
+        for (const fanId of group.subjects) causalObservedAtByFan.set(fanId, observedAt);
+        causalObservedAt = observedAt;
+      }
     } catch (error) {
-      throw new FanDataObservationBoundaryError(
-        "FAN_DATA_POINT_REFRESH_OBSERVATION_TOKEN_INVALID",
-        error?.message || "Fan data point refresh observation token is invalid",
-        409,
-      );
+      throw new FanDataObservationBoundaryError("FAN_DATA_POINT_REFRESH_OBSERVATION_TOKEN_INVALID",
+        error?.message || "Fan data point refresh observation token is invalid", 409);
     }
   } else if (items.length) {
-    // Rollout compatibility for jobs created before INT5.4C-1A deployment. New
-    // schedules always carry observationTokenVersion=1 and cannot use this path.
     causalObservedAt = date(job.createdAt);
   } else {
     causalObservedAt = receivedAt;
   }
-  if (!causalObservedAt) throw new FanDataObservationBoundaryError(
-    "FAN_DATA_POINT_REFRESH_OBSERVATION_TIME_REQUIRED",
-    "Fan data point refresh is missing server-owned observation chronology",
-    409,
-  );
+  if (!causalObservedAt) throw new FanDataObservationBoundaryError("FAN_DATA_POINT_REFRESH_OBSERVATION_TIME_REQUIRED",
+    "Fan data point refresh is missing server-owned observation chronology", 409);
   const result = await projectFanObservationBatch(db, {
     agencyId: job.agencyId,
     creatorId: job.creatorId,
@@ -1557,7 +1564,14 @@ async function applyFanDataPointRefreshChunk({ db, job, deviceId, chunkResult })
     observedAtPolicy: "SERVER_GENERATION",
     receivedAt,
     causalObservedAt,
+    causalObservedAtByFan,
   });
+  if (Number(chunkResult?.pipelineVersion || 0) === 1 && chunkResult.terminalFailures?.length) {
+    const failureReceipt = await require("./campaign-fan-refresh-queue-service").recordCampaignFanRefreshProfileFailures({ db, job,
+      failures: chunkResult.terminalFailures, now: receivedAt });
+    if (failureReceipt.failedFanIds?.length) await require("./campaign-fan-change-publication").publishCanonicalFanChanges({ db,
+      agencyId: job.agencyId, creatorId: job.creatorId, fanIds: failureReceipt.failedFanIds });
+  }
   // Current FanData changes publish bounded Traffic projection work in the DB.
   return { type: "fan_data_point_refresh", ...result };
 }
@@ -1657,7 +1671,7 @@ async function scheduleFanDataPointRefresh({ db = null, agencyId, creatorId, onl
     jobKey: FAN_DATA_POINT_REFRESH_JOB_KEY,
     creatorId,
     agencyId,
-    params: { ...stableParams, fanIds: ids, rangeKey, requestReason: text(reason, 120) || "fan_data_point_refresh", observationTokenVersion: 1, observationReadLeaseVersion: 1 },
+    params: { ...stableParams, fanIds: ids, rangeKey, requestReason: text(reason, 120) || "fan_data_point_refresh", observationTokenVersion: 1, observationReadLeaseVersion: 1, fanDataPipelineVersion: 1 },
     priority,
     now,
     freshnessWindowMs: 2 * 60 * 1000,

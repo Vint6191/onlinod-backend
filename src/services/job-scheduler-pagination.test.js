@@ -35,12 +35,19 @@ const leaseCalls = [];
 let workProgress = null;
 const recurringPlans = [], yieldedPlans = [];
 const derivedCalls = [];
+const subscriberCalls = [];
 let claimClockAdvance = null;
 let derivedFailure = null;
 let analyticsResult = { created: 0, skipped: 0 };
 let admissionError = null;
 
 cacheModule(prismaPath, {});
+cacheModule(require.resolve("./subscriber-directory-service"), {
+  async ensureSubscriberScanDue(input) {
+    subscriberCalls.push(input);
+    return { ok: true, created: false, reason: "fresh" };
+  },
+});
 cacheModule(require.resolve("./analytics-recurring-planning-service"), {
   async planRecurringCreatorAnalytics(input) { analyticsCalls += 1; recurringPlans.push(input); return analyticsResult; },
 });
@@ -113,6 +120,7 @@ cacheModule(domainWorkPath, {
 for (const hourlyDue of [false, true]) test(`published Subscriber generation plans derived work despite Analytics bootstrap waiting: hourlyDue=${hourlyDue}`, async () => {
   workProgress = { lastFullPlanningAt: hourlyDue ? "2026-09-08T16:00:00.000Z" : "2026-09-08T18:04:00.000Z", lastSubscriberDerivedGeneration: 1, retainedField: "keep" };
   derivedCalls.length = yieldedPlans.length = 0;
+  subscriberCalls.length = 0;
   dailyCalls = 0;
   try {
     const db = {
@@ -123,6 +131,7 @@ for (const hourlyDue of [false, true]) test(`published Subscriber generation pla
     const r = await runRecurringCreatorWork({ db, pageSize: 1 });
     assert.equal(r.ok, true);
     assert.equal(derivedCalls.length, 5);
+    assert.equal(subscriberCalls.length, hourlyDue ? 1 : 0, "bootstrap waiting does not hide independently due Subscriber planning");
     assert.equal(dailyCalls, hourlyDue ? 1 : 0);
     assert.equal(yieldedPlans[0].progressCursor.lastSubscriberDerivedGeneration, 2);
     assert.equal(yieldedPlans[0].progressCursor.retainedField, "keep");

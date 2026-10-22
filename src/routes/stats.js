@@ -7,7 +7,6 @@
 "use strict";
 
 const express = require("express");
-const crypto = require("node:crypto");
 const { z } = require("zod");
 const prisma = require("../prisma");
 const { requireAuthDevice } = require("../middleware/auth");
@@ -15,9 +14,7 @@ const { resolveEffectivePermissions } = require("../services/team-access-control
 const { requireCreatorAccess, allowedCreatorScope } = require("../middleware/automation-permissions");
 const { readCampaignFans } = require("../services/creator-analytics-ledger-service");
 const { readCreatorOverview, readCreatorCurrentTask, readCreatorTaskActivity, readCreatorTaskActivityDays } = require("../services/creator-overview-service");
-const { recordNotificationSocketEvent } = require("../services/notification-sync-state-service");
 const { ensureRecurringCreatorAnalyticsCatchups } = require("../services/creator-analytics-sync-orchestrator");
-const { ingestNotificationFacts, normalizeEvent: normalizeNotificationFact } = require("../services/notification-facts-service");
 const { scheduleSubscriberScan } = require("../services/subscriber-directory-service");
 const { ensureAnalyticsFreshness } = require("../services/analytics-collection-planner");
 const { normalizeCreatorOverviewRangeKey } = require("../services/analytics-range-contract");
@@ -496,6 +493,28 @@ router.post("/creators/:creatorId/campaign-scan/stop", async (req, res) => {
   }
 });
 
+function entityChangeError(res, error) {
+  return res.status(Number(error?.status) || 500).json({ ok:false, code:error?.code || "ENTITY_CHANGE_READ_FAILED",
+    ...(error?.code === "RECONCILE_REQUIRED" ? { protocolVersion:1,retainedFrom:error.retainedFrom,headRevision:error.headRevision } : {}) });
+}
+async function entityChangeRead(req, res, current) {
+  try {
+    const ctx = await loadCreatorWithAccess(req, res, String(req.params.creatorId || ""));
+    if (!ctx) return;
+    const service = require("../services/creator-entity-change-service");
+    const value = await require("../services/creator-entity-viewer-service").readWithEntityViewer({
+      db:prisma,agencyId:ctx.creator.agencyId,creatorId:ctx.creator.id,userId:actorUserId(req),member:ctx.member,
+    }, ({ db }) => (current ? service.readCurrentEntities : service.readEntityChanges)({
+      db,agencyId:ctx.creator.agencyId,creatorId:ctx.creator.id,
+      afterRevision:req.query.afterRevision,limit:req.query.limit,snapshotBarrier:req.query.snapshotBarrier,
+      afterType:req.query.afterType,afterId:req.query.afterId,
+    }));
+    return res.json({ ok:true,...value });
+  } catch (error) { return entityChangeError(res,error); }
+}
+router.get("/creators/:creatorId/entity-changes/current", (req,res) => entityChangeRead(req,res,true));
+router.get("/creators/:creatorId/entity-changes", (req,res) => entityChangeRead(req,res,false));
+
 router.post("/creators/:creatorId/notifications/live", async (req, res) => {
   try {
     const input = liveNotificationSchema.parse(req.body || {});
@@ -553,72 +572,14 @@ router.post("/creators/:creatorId/notifications/live", async (req, res) => {
       return res.status(Number(error?.status) || 403).json({ ok: false, code: error?.code || "LIVE_NOTIFICATION_REALTIME_UNAVAILABLE", error: error?.message || "Live notification reporter is not ready" });
     }
 
-    const grouped = new Map();
-    const dates = [];
-    const sourceEvents=input.events.filter(event=>event.normalizerVersion === "notification-source-v2" && event.notificationObservation);
-    for(const event of sourceEvents){const row=require("../services/notification-source-ledger-service").normalizeObservation(event.notificationObservation);if(row.occurredAt)dates.push(row.occurredAt);}
-    for (const raw of input.events.filter(event=>!sourceEvents.includes(event))) {
-      const normalized = normalizeNotificationFact(raw, ctx.creator.id);
-      if (!normalized.sourceType || normalized.rejected) {
-        return res.status(422).json({ ok: false, code: "LIVE_NOTIFICATION_EVENT_REJECTED", error: normalized.rejected || "Unsupported live notification event" });
-      }
-      if (!grouped.has(normalized.sourceType)) grouped.set(normalized.sourceType, []);
-      grouped.get(normalized.sourceType).push(raw);
-      if (normalized.occurredAt) dates.push(normalized.occurredAt);
-    }
-    const observedAt = new Date(input.observedAt);
-    const rangeFrom = dates.length ? new Date(Math.min(...dates.map((date) => date.getTime())) - 5 * 60 * 1000) : new Date(observedAt.getTime() - 5 * 60 * 1000);
-    const rangeTo = dates.length ? new Date(Math.max(...dates.map((date) => date.getTime())) + 5 * 60 * 1000) : new Date(observedAt.getTime() + 5 * 60 * 1000);
-    const logicalJob = {
-      id: `live_${input.batchId}`,
-      agencyId: ctx.creator.agencyId,
-      creatorId: ctx.creator.id,
-      sourceJobId: null,
-      params: {
-        from: rangeFrom.toISOString(),
-        to: rangeTo.toISOString(),
-        types: [...grouped.keys()],
-        notificationMode: "catchup",
-      },
-    };
     const committed = await withRealtimeIngestGenerationFence({
       db: prisma, agencyId: ctx.creator.agencyId, userId, memberId: ctx.member.id,
       accessEpoch: memberAccessEpoch, creatorId: ctx.creator.id,
       work: async ({ tx }) => {
         await assertLiveBinding(tx);
-        const ingest = async () => {
-          const results = [];
-          if (sourceEvents.length) {
-            const batches = ["purchases","tips","subscriptions","likes","comments"].map(type => ({ notificationType: type,
-              batchKey: `run:${input.batchId}:page:${type}:${crypto.createHash("sha256").update(`${input.batchId}|source|${type}`).digest("hex").slice(0,24)}`,
-              events: sourceEvents.filter(event => event.notificationObservation.category === type && event.notificationObservation.disposition === "FACT").map(event => event.notificationFact),
-            }));
-            const sourceJob = { ...logicalJob, params: { ...logicalJob.params, types: ["purchases","tips","subscriptions","likes","comments"] } };
-            results.push(await require("../services/notification-source-ledger-service").ingestNotificationSourcePage({
-              db: tx, job: sourceJob, deviceId: device.id, live: true,
-              chunk: { schemaVersion:6, normalizerVersion:"notification-source-v2", collectorVersion:"notifications-history-v9-source-ledger",
-                scanRunId:input.batchId, page:1, observations:sourceEvents.map(event=>event.notificationObservation), batches, processedRows:sourceEvents.length },
-            }));
-          }
-          for (const [type, events] of grouped) {
-            const typeHash = crypto.createHash("sha256").update(`${input.batchId}|${type}`).digest("hex").slice(0,24);
-            results.push(await ingestNotificationFacts({ db: tx, job: logicalJob, deviceId: device.id,
-              result: { events, notificationType:type, batchKey:`run:${input.batchId}:page:${type}:${typeHash}`,
-                finalizeCoverage:false, sourceTimezone:input.sourceTimezone, scanRunId:input.batchId,
-                collectorVersion:"notifications-all-v5", schemaVersion:4, coverage:{[type]:{status:"partial"}} },
-            }));
-          }
-          results.push(await require("../services/live-earnings-projection-service").ingestLive({ db:tx,
-            agencyId:ctx.creator.agencyId,creatorId:ctx.creator.id,deviceId:device.id,events:input.events,
-            capturedAt:observedAt,capturedTimes:input.delivery?.entries.map(entry=>entry.capturedAt),now:await dbAuthorityNow({db:tx}) }));
-          await recordNotificationSocketEvent({ db:tx, agencyId:ctx.creator.agencyId, creatorId:ctx.creator.id, deviceId:device.id,
-            occurredAt:dates.length ? new Date(Math.max(...dates.map(date=>date.getTime()))) : observedAt });
-          return results;
-        };
-        if (!input.delivery) return { results: await ingest() };
-        return require("../services/creator-live-sync-service").acceptDelivery({ db:tx, agencyId:ctx.creator.agencyId,
-          creatorId:ctx.creator.id, deviceId:device.id, memberId:ctx.member.id, accessEpoch:memberAccessEpoch,
-          delivery:input.delivery, events:input.events, now:await dbAuthorityNow({db:tx}), ingest });
+        return require("../services/data-change-processor-service").processLiveNotificationBatch({
+          db:tx,creator:ctx.creator,member:ctx.member,device,input,
+        });
       },
     });
     return res.json({ ok:true, creatorId:ctx.creator.id, batchId:input.batchId, ...committed });

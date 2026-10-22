@@ -59,7 +59,7 @@ async function main() {
     ) SELECT * FROM advanced ORDER BY ordinal`, generation);
     const oldSeen = new Set();
     for (let i = 0; i < 100; i++) (await oldSelect()).forEach(row => oldSeen.add(row.laneName));
-    assert.deepEqual([...oldSeen].sort(), lanes.slice(28).sort());
+    assert.deepEqual([...oldSeen].sort(), (await readCounts()).filter(row => row.ordinal >= 28).map(row => row.laneName).sort());
     assert((await readCounts()).filter(row => row.ordinal < 28).every(row => row.turnCount === 3582n));
     pass("former admission reproduces the incident: 100 ticks offer only the ten new lanes", {
       oldLanesStarved: 28, oldCount: 3582, theoreticalCatchupTicks: 7164,
@@ -68,11 +68,12 @@ async function main() {
     const before = await readCounts();
     const receipts = await db.$queryRawUnsafe('SELECT id,checksum,migration_name,finished_at FROM "_prisma_migrations" ORDER BY migration_name');
     await installCurrent(); await installCurrent();
-    assert.deepEqual(await readCounts(), before, "upgrade and rerun preserve lifetime counts and timestamps");
+    assert.deepEqual((await readCounts()).filter(row => before.some(old => old.laneName === row.laneName)), before, "upgrade and rerun preserve lifetime counts and timestamps");
+    assert.equal((await readCounts()).length, lanes.length, "later migrations append their own lanes without rewriting existing ones");
     assert((await readAll()).every(row => row.admissionSequence === 0n));
     const afterReceipts = await db.$queryRawUnsafe('SELECT id,checksum,migration_name,finished_at FROM "_prisma_migrations" ORDER BY migration_name');
     assert.deepEqual(afterReceipts.slice(0, receipts.length), receipts);
-    assert.equal(afterReceipts.length, receipts.length + 1);
+    assert.equal(afterReceipts.length, require("../../src/services/database-migration-chain").migrations.length);
     assert.equal((await require("../../src/services/database-contract-service").readDatabaseContract(db)).ready, true);
     pass("actual additive installer initializes scheduling sequence without rewriting counters or prior receipts");
 
@@ -82,7 +83,7 @@ async function main() {
     const seen = new Set([...first.selected, ...second.selected]);
     for (let i = 2; i < Math.ceil(lanes.length / 5); i++) (await select()).selected.forEach(name => seen.add(name));
     assert.equal(seen.size, lanes.length);
-    for (const [i, row] of (await readCounts()).entries()) assert(row.turnCount > before[i].turnCount);
+    for (const [i, row] of (await readCounts()).entries()) assert(row.turnCount > (before.find(old => old.laneName === row.laneName)?.turnCount || 0n));
     pass("fresh worker processes share persisted order and all existing lanes run within eight batches", { lanes: seen.size });
 
     // Arbitrary skew in both lifetime counts and timestamps is harmless. The

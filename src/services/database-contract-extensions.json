@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v17_maintenance_admission_sequence",
+  "version": "nod_current_v18_collection_lifecycle_and_entity_changes",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -64,6 +64,10 @@
     {
       "migration": "20261020010000_maintenance_admission_sequence",
       "checksum": "f836868ad639aae524b458d22f10fc30aea31062ba539f2ce445692e33be5ba7"
+    },
+    {
+      "migration": "20261022010000_collection_lifecycle_and_entity_changes",
+      "checksum": "d7c8442e9d38938c897ecb01ef90646dbf8f593ee089e0079c108f69f0d5b001"
     }
   ],
   "extension": {
@@ -105,7 +109,23 @@
         "persistence": "p"
       },
       {
+        "name": "CreatorEntityChange",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEntityChangeHead",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEntityCurrent",
+        "persistence": "p"
+      },
+      {
         "name": "CreatorLiveSync",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorMediaUsageFact",
         "persistence": "p"
       },
       {
@@ -867,6 +887,214 @@
         "column_default": null
       },
       {
+        "table": "CreatorEntityChange",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "revision",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "entityType",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "entityId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "sourceIdentity",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "sourceVersion",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "payload",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "tombstone",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "lastRevision",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "retainedFrom",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "1"
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "nextRetentionAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "entityType",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "entityId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "revision",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "sourceIdentity",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "sourceVersion",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "payload",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "tombstone",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
         "table": "CreatorFinancialCollectionState",
         "name": "lastResolutionGeneration",
         "data_type": "text",
@@ -929,6 +1157,126 @@
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorMediaUsageContribution",
+        "name": "factBaseline",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "sourceKey",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "sourceMessageId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "mediaId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "payload",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "purchased",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "sourceRevision",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "lastSeenRunId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageSourceState",
+        "name": "coverage",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageSourceState",
+        "name": "factProtocol",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
       },
       {
         "table": "CreatorMoneyObservation",
@@ -1731,6 +2079,14 @@
         "column_default": null
       },
       {
+        "table": "CreatorRealtimeSession",
+        "name": "captureFromAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
         "table": "CreatorRecoveryIntent",
         "name": "id",
         "data_type": "text",
@@ -1827,6 +2183,38 @@
         "column_default": "CURRENT_TIMESTAMP"
       },
       {
+        "table": "CreatorRecoveryIntent",
+        "name": "failedAttempts",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "stoppedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "lastError",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "lastProgressAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
         "table": "CreatorRecoveryWatermark",
         "name": "creatorId",
         "data_type": "text",
@@ -1849,6 +2237,14 @@
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": null
+      },
+      {
+        "table": "MaintenanceAdmissionClassState",
+        "name": "admissionSequence",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
       },
       {
         "table": "MoneyResolutionAdoption",
@@ -1971,10 +2367,66 @@
         "column_default": "true"
       },
       {
-        "table": "MaintenanceAdmissionClassState",
-        "name": "admissionSequence",
-        "data_type": "bigint",
-        "udt_name": "int8",
+        "table": "_prisma_migrations",
+        "name": "id",
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "_prisma_migrations",
+        "name": "checksum",
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "_prisma_migrations",
+        "name": "finished_at",
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "_prisma_migrations",
+        "name": "migration_name",
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "_prisma_migrations",
+        "name": "logs",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "_prisma_migrations",
+        "name": "rolled_back_at",
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "_prisma_migrations",
+        "name": "started_at",
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": "NO",
+        "column_default": "now()"
+      },
+      {
+        "table": "_prisma_migrations",
+        "name": "applied_steps_count",
+        "data_type": "integer",
+        "udt_name": "int4",
         "is_nullable": "NO",
         "column_default": "0"
       }
@@ -2362,6 +2814,78 @@
         "definition": "FOREIGN KEY (\"scanProofId\") REFERENCES \"AnalyticsScanProof\"(id) ON UPDATE CASCADE"
       },
       {
+        "table": "CreatorEntityChange",
+        "name": "CreatorEntityChange_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "CreatorEntityChange_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", revision)"
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "CreatorEntityChange_revision_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((revision > 0))"
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "CreatorEntityChangeHead_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "CreatorEntityChangeHead_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "CreatorEntityChangeHead_revisions_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"lastRevision\" >= 0) AND (\"retainedFrom\" >= 1) AND (\"retainedFrom\" <= (\"lastRevision\" + 1))))"
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "CreatorEntityCurrent_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "CreatorEntityCurrent_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", \"entityType\", \"entityId\")"
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "CreatorEntityCurrent_revision_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((revision > 0))"
+      },
+      {
         "table": "CreatorLiveSync",
         "name": "CreatorLiveSync_agencyId_creatorId_fkey",
         "type": "f",
@@ -2376,6 +2900,30 @@
         "deferrable": false,
         "deferred": false,
         "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "CreatorMediaUsageFact_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "CreatorMediaUsageFact_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "table": "CreatorMediaUsageSourceState",
+        "name": "CreatorMediaUsageSourceState_fact_protocol_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"factProtocol\" = ANY (ARRAY[0, 2])))"
       },
       {
         "table": "CreatorMoneyObservation",
@@ -2579,6 +3127,14 @@
       },
       {
         "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_attempts_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"failedAttempts\" >= 0))"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
         "name": "CreatorRecoveryIntent_check",
         "type": "c",
         "deferrable": false,
@@ -2607,7 +3163,7 @@
         "type": "c",
         "deferrable": false,
         "deferred": false,
-        "definition": "CHECK ((status = ANY (ARRAY['PENDING'::text, 'RUNNING'::text, 'COMPLETE'::text])))"
+        "definition": "CHECK ((status = ANY (ARRAY['PENDING'::text, 'RUNNING'::text, 'COMPLETE'::text, 'STOPPED'::text])))"
       },
       {
         "table": "CreatorRecoveryIntent",
@@ -2632,6 +3188,14 @@
         "deferrable": false,
         "deferred": false,
         "definition": "PRIMARY KEY (\"creatorId\", stream)"
+      },
+      {
+        "table": "MaintenanceAdmissionClassState",
+        "name": "MaintenanceAdmissionClassState_sequence_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"admissionSequence\" >= 0))"
       },
       {
         "table": "MoneyResolutionAdoption",
@@ -2682,15 +3246,24 @@
         "definition": "CHECK (((kind)::text = ANY (ARRAY['RECOVERY'::text, 'RETENTION'::text, 'DERIVED_PLANNING'::text])))"
       },
       {
-        "table": "MaintenanceAdmissionClassState",
-        "name": "MaintenanceAdmissionClassState_sequence_check",
-        "type": "c",
+        "table": "_prisma_migrations",
+        "name": "_prisma_migrations_pkey",
+        "type": "p",
         "deferrable": false,
         "deferred": false,
-        "definition": "CHECK ((\"admissionSequence\" >= 0))"
+        "definition": "PRIMARY KEY (id)"
       }
     ],
     "indexes": [
+      {
+        "table": "AnalyticsCollectionDemand",
+        "name": "AnalyticsCollectionDemand_quarantine_pending_idx",
+        "unique": false,
+        "keys": "2",
+        "options": "0",
+        "expressions": null,
+        "predicate": "((\"completedAt\" IS NULL) AND (\"quarantinedAt\" IS NOT NULL))"
+      },
       {
         "table": "AnalyticsPlanningBudget",
         "name": "AnalyticsPlanningBudget_creator_idx",
@@ -2699,6 +3272,24 @@
         "options": "0",
         "expressions": null,
         "predicate": null
+      },
+      {
+        "table": "CreatorAnalyticsFactPublication",
+        "name": "AnalyticsFactPublication_dirty_current_day_idx",
+        "unique": false,
+        "keys": "2 3 0",
+        "options": "0 0 0",
+        "expressions": "\"left\"(COALESCE((\"currentValue\" ->> 'purchasedAt'::text), (\"currentValue\" ->> 'tippedAt'::text), (\"currentValue\" ->> 'occurredAt'::text), (\"currentValue\" ->> 'paidAt'::text), (\"currentValue\" ->> 'likedAt'::text), (\"currentValue\" ->> 'commentedAt'::text), (\"currentValue\" ->> 'date'::text)), 10)",
+        "predicate": "dirty"
+      },
+      {
+        "table": "CreatorAnalyticsFactPublication",
+        "name": "AnalyticsFactPublication_dirty_published_day_idx",
+        "unique": false,
+        "keys": "2 3 0",
+        "options": "0 0 0",
+        "expressions": "\"left\"(COALESCE((\"publishedValue\" ->> 'purchasedAt'::text), (\"publishedValue\" ->> 'tippedAt'::text), (\"publishedValue\" ->> 'occurredAt'::text), (\"publishedValue\" ->> 'paidAt'::text), (\"publishedValue\" ->> 'likedAt'::text), (\"publishedValue\" ->> 'commentedAt'::text), (\"publishedValue\" ->> 'date'::text)), 10)",
+        "predicate": "dirty"
       },
       {
         "table": "CreatorDialogRecoveryRequest",
@@ -2899,11 +3490,146 @@
         "predicate": null
       },
       {
+        "table": "CreatorEntityChange",
+        "name": "CreatorEntityChange_agencyId_creatorId_revision_idx",
+        "unique": false,
+        "keys": "3 1 2",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "CreatorEntityChange_createdAt_creatorId_revision_idx",
+        "unique": false,
+        "keys": "10 1 2",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "CreatorEntityChange_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "CreatorEntityChangeHead_agencyId_creatorId_key",
+        "unique": true,
+        "keys": "2 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "CreatorEntityChangeHead_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "CreatorEntityChangeHead_retention_due_idx",
+        "unique": false,
+        "keys": "5 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "CreatorEntityChangeHead_updatedAt_creatorId_idx",
+        "unique": false,
+        "keys": "6 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "CreatorEntityCurrent_agencyId_creatorId_entityType_entityId_idx",
+        "unique": false,
+        "keys": "4 1 2 3",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "CreatorEntityCurrent_pkey",
+        "unique": true,
+        "keys": "1 2 3",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
         "table": "CreatorLiveSync",
         "name": "CreatorLiveSync_pkey",
         "unique": true,
         "keys": "1",
         "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaUsageContribution",
+        "name": "CreatorMediaUsageContribution_legacy_pending_idx",
+        "unique": false,
+        "keys": "3 6",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "((\"factBaseline\" IS NULL) OR ((\"factBaseline\" ->> 'legacyPending'::text) = 'true'::text))"
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "CreatorMediaUsageFact_identity_key",
+        "unique": true,
+        "keys": "3 4 5 6",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "CreatorMediaUsageFact_media_idx",
+        "unique": false,
+        "keys": "3 6",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "CreatorMediaUsageFact_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "CreatorMediaUsageFact_run_idx",
+        "unique": false,
+        "keys": "3 4 10",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "CreatorMediaUsageFact_source_idx",
+        "unique": false,
+        "keys": "3 4",
+        "options": "0 0",
         "expressions": null,
         "predicate": null
       },
@@ -3151,6 +3877,15 @@
         "predicate": null
       },
       {
+        "table": "CustomOrder",
+        "name": "CustomOrder_current_thread_order_idx",
+        "unique": false,
+        "keys": "2 1",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "(status = 'PENDING'::\"CustomOrderStatus\")"
+      },
+      {
         "table": "DomainWorkItem",
         "name": "DomainWorkItem_hot_expired",
         "unique": false,
@@ -3167,6 +3902,42 @@
         "options": "0 0 0",
         "expressions": null,
         "predicate": "((state = 'READY'::text) AND \"isOutstanding\")"
+      },
+      {
+        "table": "DomainWorkItem",
+        "name": "DomainWorkItem_reconcile_class_current_idx",
+        "unique": false,
+        "keys": "3 12 1",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(\"isOutstanding\" AND (state = 'RECONCILE_REQUIRED'::text))"
+      },
+      {
+        "table": "JobInstance",
+        "name": "JobInstance_creator_due_fair_idx",
+        "unique": false,
+        "keys": "4 8 11 9 1",
+        "options": "0 0 0 3 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "JobInstance",
+        "name": "JobInstance_due_fair_idx",
+        "unique": false,
+        "keys": "8 11 9 1",
+        "options": "0 0 3 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "MaintenanceAdmissionClassState",
+        "name": "MaintenanceAdmissionClassState_sequence_idx",
+        "unique": false,
+        "keys": "1 6 3",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
       },
       {
         "table": "MoneyResolutionAdoption",
@@ -3205,6 +3976,33 @@
         "predicate": null
       },
       {
+        "table": "SubscriberDirectoryMaintenanceSignal",
+        "name": "SubscriberDirectoryMaintenanceSignal_legacy_yield_idx",
+        "unique": false,
+        "keys": "5 3 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "((attempts >= 100) AND ((\"lastError\" IS NULL) OR ((\"lastError\")::text = ANY ((ARRAY['subscriber_recovery_budget_exhausted'::character varying, 'maintenance_budget_exhausted'::character varying, 'publication_debt'::character varying])::text[]))))"
+      },
+      {
+        "table": "SubscriberDirectoryMaintenanceSignal",
+        "name": "SubscriberDirectoryMaintenanceSignal_structural_retry_idx",
+        "unique": false,
+        "keys": "5 3 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(((kind)::text = 'RECOVERY'::text) AND (attempts >= 100) AND ((\"lastError\")::text ~ '^Subscriber publication generation [0-9]+ is stale behind allocated generation [0-9]+$'::text))"
+      },
+      {
+        "table": "SubscriberScanRun",
+        "name": "SubscriberScanRun_recollection_creator_idx",
+        "unique": false,
+        "keys": "2 3 24 1",
+        "options": "0 0 3 0",
+        "expressions": null,
+        "predicate": "(\"publicationStatus\" = 'RECOLLECTING'::text)"
+      },
+      {
         "table": "TeamPpvPurchaseLedger",
         "name": "TeamPpvPurchaseLedger_retention_compact_v8_idx",
         "unique": false,
@@ -3241,6 +4039,15 @@
         "predicate": "(status = 'pending'::text)"
       },
       {
+        "table": "TeamShift",
+        "name": "TeamShift_agencyId_endsAt_idx",
+        "unique": false,
+        "keys": "2 5",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
         "table": "TeamTipLedger",
         "name": "TeamTipLedger_retention_compact_v8_idx",
         "unique": false,
@@ -3248,24 +4055,6 @@
         "options": "0 0",
         "expressions": null,
         "predicate": "((\"compactedAt\" IS NULL) AND (\"historicalFactVersion\" = 'team_money_fact_v2'::text) AND (\"historicalFactProjectedAt\" IS NOT NULL))"
-      },
-      {
-        "table": "SubscriberDirectoryMaintenanceSignal",
-        "name": "SubscriberDirectoryMaintenanceSignal_legacy_yield_idx",
-        "unique": false,
-        "keys": "5 3 4",
-        "options": "0 0 0",
-        "expressions": null,
-        "predicate": "((attempts >= 100) AND ((\"lastError\" IS NULL) OR ((\"lastError\")::text = ANY ((ARRAY['subscriber_recovery_budget_exhausted'::character varying, 'maintenance_budget_exhausted'::character varying, 'publication_debt'::character varying])::text[]))))"
-      },
-      {
-        "table": "CustomOrder",
-        "name": "CustomOrder_current_thread_order_idx",
-        "unique": false,
-        "keys": "2 1",
-        "options": "0 0",
-        "expressions": null,
-        "predicate": "(status = 'PENDING'::\"CustomOrderStatus\")"
       },
       {
         "table": "TelegramDeliveryIntent",
@@ -3277,74 +4066,11 @@
         "predicate": "((state = 'CONFIRMED'::text) AND (kind = ANY (ARRAY['TASK'::text, 'REVISION_REQUEST'::text])))"
       },
       {
-        "table": "TeamShift",
-        "name": "TeamShift_agencyId_endsAt_idx",
-        "unique": false,
-        "keys": "2 5",
-        "options": "0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "AnalyticsCollectionDemand",
-        "name": "AnalyticsCollectionDemand_quarantine_pending_idx",
-        "unique": false,
-        "keys": "2",
+        "table": "_prisma_migrations",
+        "name": "_prisma_migrations_pkey",
+        "unique": true,
+        "keys": "1",
         "options": "0",
-        "expressions": null,
-        "predicate": "((\"completedAt\" IS NULL) AND (\"quarantinedAt\" IS NOT NULL))"
-      },
-      {
-        "table": "CreatorAnalyticsFactPublication",
-        "name": "AnalyticsFactPublication_dirty_current_day_idx",
-        "unique": false,
-        "keys": "2 3 0",
-        "options": "0 0 0",
-        "expressions": "\"left\"(COALESCE((\"currentValue\" ->> 'purchasedAt'::text), (\"currentValue\" ->> 'tippedAt'::text), (\"currentValue\" ->> 'occurredAt'::text), (\"currentValue\" ->> 'paidAt'::text), (\"currentValue\" ->> 'likedAt'::text), (\"currentValue\" ->> 'commentedAt'::text), (\"currentValue\" ->> 'date'::text)), 10)",
-        "predicate": "dirty"
-      },
-      {
-        "table": "CreatorAnalyticsFactPublication",
-        "name": "AnalyticsFactPublication_dirty_published_day_idx",
-        "unique": false,
-        "keys": "2 3 0",
-        "options": "0 0 0",
-        "expressions": "\"left\"(COALESCE((\"publishedValue\" ->> 'purchasedAt'::text), (\"publishedValue\" ->> 'tippedAt'::text), (\"publishedValue\" ->> 'occurredAt'::text), (\"publishedValue\" ->> 'paidAt'::text), (\"publishedValue\" ->> 'likedAt'::text), (\"publishedValue\" ->> 'commentedAt'::text), (\"publishedValue\" ->> 'date'::text)), 10)",
-        "predicate": "dirty"
-      },
-      {
-        "table": "DomainWorkItem",
-        "name": "DomainWorkItem_reconcile_class_current_idx",
-        "unique": false,
-        "keys": "3 12 1",
-        "options": "0 0 0",
-        "expressions": null,
-        "predicate": "(\"isOutstanding\" AND (state = 'RECONCILE_REQUIRED'::text))"
-      },
-      {
-        "table": "SubscriberScanRun",
-        "name": "SubscriberScanRun_recollection_creator_idx",
-        "unique": false,
-        "keys": "2 3 24 1",
-        "options": "0 0 3 0",
-        "expressions": null,
-        "predicate": "(\"publicationStatus\" = 'RECOLLECTING'::text)"
-      },
-      {
-        "table": "SubscriberDirectoryMaintenanceSignal",
-        "name": "SubscriberDirectoryMaintenanceSignal_structural_retry_idx",
-        "unique": false,
-        "keys": "5 3 4",
-        "options": "0 0 0",
-        "expressions": null,
-        "predicate": "(((kind)::text = 'RECOVERY'::text) AND (attempts >= 100) AND ((\"lastError\")::text ~ '^Subscriber publication generation [0-9]+ is stale behind allocated generation [0-9]+$'::text))"
-      },
-      {
-        "table": "MaintenanceAdmissionClassState",
-        "name": "MaintenanceAdmissionClassState_sequence_idx",
-        "unique": false,
-        "keys": "1 6 3",
-        "options": "0 0 0",
         "expressions": null,
         "predicate": null
       }

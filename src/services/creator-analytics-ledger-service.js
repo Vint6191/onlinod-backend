@@ -1129,6 +1129,9 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       await recordCampaignCompletionProofBatch(tx, {
         job, scanRunId, collectorVersion: payload.collectorVersion, kind, rejectedRows: rejected, state: generation.state,
       });
+      await require("./campaign-fan-change-publication").publishCanonicalCampaignChanges({ db: tx,
+        agencyId: job.agencyId, creatorId: job.creatorId,
+        externalCampaignIds: rawRows.map(raw => normalizeCampaign(raw)?.externalCampaignId).filter(Boolean) });
       return { replay: false, batchId: batch.id, inserted, updated, unchanged, rejected, superseded: false };
     }
 
@@ -1253,14 +1256,14 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     if (projectedFanIds.length && typeof tx.creatorFan?.findMany === "function") {
       projectedFans = await tx.creatorFan.findMany({
         where: { creatorId: job.creatorId, onlyFansUserId: { in: projectedFanIds } },
-        select: { id: true, onlyFansUserId: true, valueCurrent: { select: { valueObservedAt: true } } },
+        select: { id: true, onlyFansUserId: true, valueCurrent: { select: { valueObservedAt: true, availability: true, platformReportedTotalSpendCents: true } } },
         take: projectedFanIds.length,
       });
     } else if (projectedFanIds.length && typeof tx.creatorFan?.findUnique === "function") {
       projectedFans = (await Promise.all(projectedFanIds.map(async (onlyFansUserId) => {
         const fan = await tx.creatorFan.findUnique({
           where: { creatorId_onlyFansUserId: { creatorId: job.creatorId, onlyFansUserId } },
-          select: { id: true, onlyFansUserId: true, valueCurrent: { select: { valueObservedAt: true } } },
+          select: { id: true, onlyFansUserId: true, valueCurrent: { select: { valueObservedAt: true, availability: true, platformReportedTotalSpendCents: true } } },
         });
         return fan ? { ...fan, onlyFansUserId: fan.onlyFansUserId || onlyFansUserId } : null;
       }))).filter(Boolean);
@@ -1304,7 +1307,12 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
       const refreshCandidates = [...uniqueClaimers.values()].map((claimer) => ({
         onlyFansUserId: claimer.onlyFansUserId,
         embeddedValueAvailable: claimer.embeddedValue?.available === true,
-        valueObservedAt: fanByOnlyFansUserId.get(String(claimer.onlyFansUserId))?.valueCurrent?.valueObservedAt || null,
+        valueObservedAt: (() => {
+          const value = fanByOnlyFansUserId.get(String(claimer.onlyFansUserId))?.valueCurrent;
+          return value?.availability === "UNAVAILABLE" || (value?.availability === "AVAILABLE" && value?.platformReportedTotalSpendCents != null)
+            ? value.valueObservedAt : null;
+        })(),
+        valueAvailability: fanByOnlyFansUserId.get(String(claimer.onlyFansUserId))?.valueCurrent?.availability || null,
       }));
       fanRefreshQueue = await enqueueUniqueCampaignFanRefreshes({
         db: tx, job, scanRunId, scanStartedAt, candidates: refreshCandidates, now: serverReceivedAt,
@@ -1488,6 +1496,8 @@ async function ingestCampaignChunk({ db = prisma, job, deviceId, chunk }) {
     await recordCampaignCompletionProofBatch(tx, {
       job, scanRunId, collectorVersion: payload.collectorVersion, kind, rejectedRows: rejected, state: generation.state,
     });
+    await require("./campaign-fan-change-publication").publishCanonicalCampaignChanges({ db: tx,
+      agencyId: job.agencyId, creatorId: job.creatorId, campaignIds: [saved.id] });
     return {
       replay: false, batchId: batch.id, inserted, updated, unchanged, rejected, campaignComplete,
       knownBoundaryReached, serverDeepBoundaryReached, serverNoProgressDetected, externalCampaignId, fanRefreshQueue, superseded: false,

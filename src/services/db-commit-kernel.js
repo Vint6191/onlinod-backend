@@ -137,10 +137,30 @@ function deferCommitHint(context, key, notify) {
   state.hints.set(key, notify);
 }
 
+// Durable publications run after the owner has finished all domain writes and
+// locks, but still inside its transaction. Hooks cannot register more hooks:
+// this is a bounded final phase, not a second work scheduler. The change feed
+// uses it to acquire creator heads last, in one deterministic order.
+function prepareCommit(context, key, prepare, discard = null) {
+  const state = stateFor(context);
+  if (state.preparing || typeof key !== "string" || !key || key.length > 200 || typeof prepare !== "function") {
+    throw failure("DB_COMMIT_PREPARATION_INVALID", "A preparation must be registered during domain work");
+  }
+  if (!state.preparations.has(key) && state.preparations.size >= 16) {
+    throw failure("DB_COMMIT_PREPARATION_CAPACITY", "The transaction preparation budget is exhausted");
+  }
+  state.preparations.set(key, { prepare, discard });
+}
+
 // A command may commit its rejection receipt after rolling its domain savepoint
 // back. That root must explicitly discard advisory effects of the rejected work.
 function discardCommitHints(context) {
-  stateFor(context).hints.clear();
+  const state = stateFor(context);
+  state.hints.clear();
+  // A rejected domain savepoint must not publish a change for rolled-back
+  // facts while the root commits only its rejection receipt.
+  for (const item of state.preparations.values()) if (typeof item.discard === "function") item.discard();
+  state.preparations.clear();
 }
 
 function hintFailure(error) {
@@ -204,7 +224,7 @@ async function runRootCommit(db, work, options = {}) {
         }
         const tx = rawTx;
         const context = Object.freeze({ rootId, attempt, tx, profile: config.profile, isolationLevel: config.isolationLevel, authority });
-        state = { phase: "ACTIVE", deadlineAt: Math.min(deadlineAt, performance.now() + timeout), hints: new Map(), config };
+        state = { phase: "ACTIVE", deadlineAt: Math.min(deadlineAt, performance.now() + timeout), hints: new Map(), preparations: new Map(), preparing: false, config };
         contexts.set(context, state);
         transactionContexts.set(tx, context);
         return scope.run(context, async () => {
@@ -212,12 +232,18 @@ async function runRootCommit(db, work, options = {}) {
           stateFor(context);
           const value = await work(context);
           stateFor(context);
+          state.preparing = true;
+          for (const [, item] of [...state.preparations].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) {
+            await item.prepare(context);
+            stateFor(context);
+          }
+          state.preparations.clear();
           state.phase = "COMMITTING";
           return value;
         });
       }, { isolationLevel: config.isolationLevel, maxWait, timeout });
     } catch (error) {
-      if (state) { state.phase = "ROLLED_BACK"; state.hints.clear(); }
+      if (state) { state.phase = "ROLLED_BACK"; state.hints.clear(); state.preparations.clear(); }
       lastError = error;
       if (!classifyCommitConflict(error)) throw error;
       if (attempt >= config.maxAttempts) break;
@@ -245,5 +271,5 @@ async function runRootCommit(db, work, options = {}) {
 
 module.exports = {
   COMMIT_PROFILES, runRootCommit, joinCommit, currentCommitContext,
-  isCommitTransaction, classifyCommitConflict, commitAuthorityNow, deferCommitHint, discardCommitHints,
+  isCommitTransaction, classifyCommitConflict, commitAuthorityNow, deferCommitHint, discardCommitHints, prepareCommit,
 };

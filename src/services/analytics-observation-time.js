@@ -32,14 +32,25 @@ function stampUnstartedCollectionObservation(job, authorityNow) {
         || (job.jobKey === 'financial_transactions_scan' && type === 'FINANCIAL'))) return null;
   if (type === 'FINANCIAL' && params.financialWindowGeneration) return null;
   const stamped = stampObservationStart(params, authorityNow), at = date(authorityNow);
-  if (type === 'NOTIFICATIONS') stamped.to = new Date(+at + 5 * 60_000).toISOString();
+  if (type === 'NOTIFICATIONS') {
+    const target = date(params.recoveryTargetAt || params.to);
+    stamped.to = new Date(target ? Math.min(+target, +at) : +at).toISOString();
+  }
   // Resolution is a specific historical event window, not a rolling catch-up.
   // Advancing its end to claim time widens a valid hour into days and makes the
   // highest-priority scheduled job poison every subsequent worker claim. Keep
   // the command's immutable source interval; only the physical read starts now.
   else if (params.moneyResolutionVersion === 1) return stamped;
   else {
-    stamped.initialMarker = Math.floor(+at / 1000);
+    // The recovery episode/initial pass already owns its fixed upper bound.
+    // Claim changes the physical observation start, never the intended period.
+    let through = date(params.endDate) || at;
+    const target = params.collectionMode === 'catchup' ? date(params.recoveryTargetAt) : null;
+    const representedTarget = target ? new Date(Math.ceil(+target / 1000) * 1000) : null;
+    // Only unstarted commands without receipt bindings may acquire the provider
+    // precision fix. Existing receipt windows and their proof stay immutable.
+    if (representedTarget && representedTarget <= at) through = representedTarget;
+    stamped.initialMarker = Math.floor(+through / 1000);
     stamped.endDate = new Date(stamped.initialMarker * 1000).toISOString().slice(0, 19).replace('T', ' ');
   }
   return stamped;

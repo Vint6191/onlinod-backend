@@ -120,8 +120,10 @@ async function readCampaignPage({db,creatorId,rangeKey:key="all",cursor=null,lim
   const byId=combineMetrics(metrics,"campaignId");
   coverage.fanValues = {
     authority:"CANONICAL_VALUE_TTL",scope:"CURRENT_CAMPAIGN_MEMBERS",freshnessMs:projection.valueFreshnessMs,
-    status:!projection.ready?"PENDING":n(byId.get(""),"ofValueStaleFans")>0?"STALE":"FRESH",
-    fresh:projection.ready&&n(byId.get(""),"ofValueStaleFans")===0,
+    status:!projection.ready?"PENDING":n(byId.get(""),"ofValueStaleFans")>0?"STALE":n(byId.get(""),"ofValueUnknownFans")>0?"PARTIAL":"FRESH",
+    fresh:projection.ready&&n(byId.get(""),"ofValueStaleFans")===0&&n(byId.get(""),"ofValueUnknownFans")===0,
+    knownFans:projection.ready?n(byId.get(""),"ofValueKnownFans"):null,
+    unknownFans:projection.ready?n(byId.get(""),"ofValueUnknownFans"):null,
     freshFans:projection.ready?n(byId.get(""),"ofValueFreshFans"):null,
     staleFans:projection.ready?n(byId.get(""),"ofValueStaleFans"):null,
   };
@@ -134,7 +136,7 @@ async function readCampaignPage({db,creatorId,rangeKey:key="all",cursor=null,lim
 function fanValueDto(value,now,freshnessMs=CAMPAIGN_FAN_VALUE_FRESHNESS_MS) {
   if(!value)return null;
   const observed=trustedCollectionTimestamp(value.valueObservedAt,now);
-  const available=Boolean(observed&&+observed+freshnessMs>+now&&value.availability==="AVAILABLE");
+  const available=Boolean(observed&&+observed+freshnessMs>+now&&value.availability==="AVAILABLE"&&value.platformReportedTotalSpendCents!=null);
   const money=field=>available?safeInteger(value[field]):null;
   return {available,availability:value.availability,
     platformReportedTotalSpendCents:money("platformReportedTotalSpendCents"),messagesSpentCents:money("messagesSpentCents"),
@@ -168,14 +170,21 @@ async function readCampaignFanPage({db,creatorId,campaignId,rangeKey:key="all",f
   const pageIds=ids.slice(0,take);
   const rows=pageIds.length?await db.creatorCampaignFan.findMany({where:{creatorId,campaignId,id:{in:pageIds.map(x=>x.id)}},include:{fan:{include:{valueCurrent:true}}}}):[];
   const metrics=pageIds.length?await db.$queryRawUnsafe('SELECT "fanId","metrics" FROM "CampaignReadMetric" WHERE "creatorId"=$1 AND "campaignId"=$2 AND "rangeKey" IN ($3,\'current\') AND "fanId"=ANY($4::text[])',creatorId,campaignId,key,pageIds.map(x=>x.fanId)):[];
+  const demands=rows.length&&db.creatorFanRefreshDemand?.findMany?await db.creatorFanRefreshDemand.findMany({
+    where:{creatorId,onlyFansUserId:{in:rows.map(row=>row.fan.onlyFansUserId)}},take:take,
+    select:{onlyFansUserId:true,status:true,lastError:true,retryAttempts:true,nextRetryAt:true,activeRefreshJob:{select:{status:true}}}}):[];
+  const demandByFan=new Map(demands.map(row=>[row.onlyFansUserId,row]));
   const byId=new Map(rows.map(r=>[r.id,r])),byFan=combineMetrics(metrics,"fanId");
   return {ok:true,contractVersion:VERSION,creatorId,campaign,rangeKey:key,filter,projection,sourceCoverage:coverage,
     fans:pageIds.flatMap(({id})=>{
       const row=byId.get(id);if(!row)return [];
-      const fan=row.fan;
+      const fan=row.fan,demand=demandByFan.get(fan.onlyFansUserId),value=fanValueDto(fan.valueCurrent,now,projection.valueFreshnessMs);
+      const fanDataStatus=demand?.status==="QUEUED"?(demand.activeRefreshJob?.status==="CLAIMED"?"RUNNING":"PENDING")
+        :demand?.status==="FAILED"?"FAILED":value?.availability==="UNAVAILABLE"&&value.expiresAt&&+new Date(value.expiresAt)>+now?"UNAVAILABLE":value?.available?"AVAILABLE":"STALE";
       return [{id:row.id,externalClaimerId:row.externalClaimerId,attributedAt:row.attributedAt?.toISOString()||null,collectedAt:row.collectedAt.toISOString(),
         fan:{id:fan.id,onlyFansUserId:fan.onlyFansUserId,username:fan.username,displayName:fan.displayName,firstSeenAt:fan.firstSeenAt.toISOString(),lastSeenAt:fan.lastSeenAt.toISOString()},
-        fanValue:fanValueDto(fan.valueCurrent,now,projection.valueFreshnessMs),revenue:metricsDto(byFan.get(row.fanRecordId),projection.ready,coverage.revenue.ready && row.attributedAt!=null)}];
+        fanDataStatus,fanDataError:fanDataStatus==="FAILED"?demand.lastError:null,fanDataRetryAttempts:demand?.retryAttempts||0,
+        fanValue:value,revenue:metricsDto(byFan.get(row.fanRecordId),projection.ready,coverage.revenue.ready && row.attributedAt!=null)}];
     }),pagination:{limit:take,returned:pageIds.length,hasMore:ids.length>take,nextCursor:ids.length>take?encodeCursor(scope,pageIds.at(-1).fanId):null,order:"IMMUTABLE_FAN_ID",semantics:"LIVE_PAGES"}};
 }
 module.exports={VERSION,safeInteger,metricsDto,rangeKey,decodeCursor,encodeCursor,readiness,fanValueDto,readCampaignPage,readCampaignFanPage};

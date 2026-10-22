@@ -36,15 +36,27 @@ async function inspectRecoveryRuntime(db, { agencyId, creatorId, jobId = null })
   const resolution = await db.creatorMoneyResolutionRequest.findFirst({ where: scope, select: {
     queued: true, targetId: true, attempts: true, jobId: true, lastError: true, updatedAt: true,
   } });
-  // Per-stream prefix of the current-debt index; never scan completed history.
+  // Per-stream/status prefix of the debt index; include finite stops so an
+  // exhausted recovery stays explainable without scanning completed history.
   const intents = await db.$queryRawUnsafe(`SELECT i.* FROM
     (VALUES ('financial'),('notifications'),('campaigns'),('subscribers')) AS stream(name)
     CROSS JOIN (VALUES ('PENDING'),('RUNNING')) AS status(name)
     CROSS JOIN LATERAL (
-      SELECT i.id,i.stream,i.status,i."gapFrom",i."targetAt",i."jobId",i."updatedAt"
+      SELECT i.id,i.stream,i.status,i.reason,i."gapFrom",i."targetAt",i."jobId",i."updatedAt",
+        i."failedAttempts",i."stoppedAt",i."lastProgressAt",i."lastError"
       FROM "CreatorRecoveryIntent" i
       WHERE i."agencyId"=$1 AND i."creatorId"=$2 AND i.stream=stream.name AND i.status=status.name
       ORDER BY i."targetAt",i.id LIMIT 2
+    ) i
+    UNION ALL
+    SELECT i.* FROM
+    (VALUES ('financial'),('notifications'),('campaigns'),('subscribers')) AS stream(name)
+    CROSS JOIN LATERAL (
+      SELECT i.id,i.stream,i.status,i.reason,i."gapFrom",i."targetAt",i."jobId",i."updatedAt",
+        i."failedAttempts",i."stoppedAt",i."lastProgressAt",i."lastError"
+      FROM "CreatorRecoveryIntent" i
+      WHERE i."agencyId"=$1 AND i."creatorId"=$2 AND i.stream=stream.name AND i.status='STOPPED'
+      ORDER BY i."targetAt" DESC,i.id DESC LIMIT 2
     ) i`, agencyId, creatorId);
   const ids = [...new Set([jobId, financial?.sourceJobId, notifications?.sourceJobId, resolution?.jobId, ...intents.map(row => row.jobId)].filter(Boolean))].slice(0, 20);
   const rows = ids.length ? await db.jobInstance.findMany({ where: { ...scope, id: { in: ids } }, select: {
@@ -68,8 +80,9 @@ async function inspectRecoveryRuntime(db, { agencyId, creatorId, jobId = null })
   });
   for (const state of [financial, notifications]) if (state) state.lastErrorCode = code(state.lastErrorCode);
   if (resolution) { resolution.error = error(resolution.lastError); delete resolution.lastError; }
+  const recoveryIntents = intents.map(({ lastError, reason, ...row }) => ({ ...row, reason: code(reason), error: error(lastError) }));
   return { scope, observedAt: now.toISOString(), clockAuthority: "DATABASE", subscriber, collectors: { financial, notifications }, moneyResolution: resolution,
-    recoveryIntents: intents, referencedJobs: jobs, sampling: "BOUNDED_CURRENT_DEBT_AND_REFERENCED_JOBS" };
+    recoveryIntents, referencedJobs: jobs, sampling: "BOUNDED_CURRENT_DEBT_AND_REFERENCED_JOBS" };
 }
 
 function createRecoveryRuntimeObserver({ inspect = inspectRecoveryRuntime, emit = emitRuntimeDiagnostic, now = Date.now,

@@ -1,3 +1,4 @@
+require("../../scripts/test-support/canonical-change-publication-fixture").installCanonicalChangePublicationFixture();
 const { commitDatabaseFixture } = require("../../scripts/test-support/commit-database-fixture");
 "use strict";
 

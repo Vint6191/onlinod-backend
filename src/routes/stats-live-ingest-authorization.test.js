@@ -71,6 +71,16 @@ function fixture({ commitEpoch = 7, commitBinding = true, source = false } = {})
     } },
     "../services/realtime-ingest-generation-fence-service": { withRealtimeIngestGenerationFence },
   };
+  // Exercise the extracted processor with the same transaction-aware owner
+  // doubles; the route must pass its fenced tx rather than opening a new root.
+  const processorFile = path.resolve(__dirname, "../services/data-change-processor-service.js");
+  const processorModule = { exports: {} };
+  const processorRequire = createRequire(processorFile);
+  vm.runInNewContext(fs.readFileSync(processorFile, "utf8"), {
+    module: processorModule, exports: processorModule.exports,
+    require(id) { return overrides[id.replace(/^\.\//, "../services/")] || processorRequire(id); },
+  }, { filename: processorFile });
+  overrides["../services/data-change-processor-service"] = processorModule.exports;
   const filename = path.resolve(__dirname, "stats.js");
   const localRequire = createRequire(filename);
   const module = { exports: {} };

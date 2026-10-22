@@ -1,10 +1,9 @@
 "use strict";
 
-// Only these reviewed provider READ collectors have a fresh-generation recovery
-// path. This policy never replays an external write, resumes a corrupt cursor,
-// or treats a client's generic retryable=true as evidence of a transient error.
+// Provider read failures may retry inside their existing bounded job episode.
+// Exhaustion is durable; heartbeat, a new worker or a fresh session cannot
+// replenish its budget by creating another collection generation.
 const JOB_TYPES = Object.freeze({ catchup_notifications_scan: "NOTIFICATIONS", financial_transactions_scan: "FINANCIAL", fetch_campaigns: "CAMPAIGNS", subscriber_directory_scan: "SUBSCRIBERS" });
-const MODELS = Object.freeze({ NOTIFICATIONS: "creatorNotificationSyncState", FINANCIAL: "creatorFinancialCollectionState", CAMPAIGNS: "creatorCampaignCollectionState" });
 const MAX_RETRY_MS = 15 * 60_000;
 const object = value => value && typeof value === "object" && !Array.isArray(value) ? value : {};
 const date = value => { const at = value ? new Date(value) : null; return at && Number.isFinite(+at) ? at : null; };
@@ -39,7 +38,7 @@ function sameSourceJob(job, expected) {
 
 // Called inside the existing failure transaction, after JobInstance has stored
 // its result. Do not consult a prior attempt's failure payload on a stale copy.
-async function collectionFailureRetry({ db, job, error, terminal, now }) {
+async function collectionFailureRetry({ db, job, error, terminal }) {
   if (!JOB_TYPES[job?.jobKey]) return null;
   let current = null;
   if (db?.jobInstance?.findUnique) current = await db.jobInstance.findUnique({ where: { id: job.id } });
@@ -47,11 +46,11 @@ async function collectionFailureRetry({ db, job, error, terminal, now }) {
   const actual = sameSourceJob(current, job) && ["FAILED", "SCHEDULED"].includes(current.status) && current.lastError === text ? current : null;
   const classified = classifyCollectorReadFailure({ job, error, failure: actual?.result?.failure });
   if (!classified) return null;
-  return { ...classified, retryAt: terminal && !classified.waitingForSession ? new Date(+now + retryDelay(actual || job)) : null };
+  return { ...classified, terminal: terminal === true, retryAt: terminal ? null : date(actual?.nextRunAt) };
 }
 
 async function signalCollectorRetry({ db, job, interruption, now }) {
-  if (!interruption) return;
+  if (!interruption || interruption.terminal) return;
   // A failure can commit after the planner has yielded for an hour. Record the
   // next wake in the same transaction, without taking its DWI lock underneath
   // a collector lock. The shared outbox consumer only wakes creator planning.
@@ -61,50 +60,24 @@ async function signalCollectorRetry({ db, job, interruption, now }) {
   });
 }
 
-// Runtime adoption of old terminal interruptions is bounded to the exact
-// creator+collector state/source job. It joins the same lock used by START,
-// planning, accept and completion. It does not scan terminal job history.
-async function recoverTerminalCollector({ db, type, state, agencyId, creatorId, now }) {
-  if (state?.status !== "FAILED" || state.retryAfterAt || !state.sourceJobId || !state.activeGeneration)
-    return { state, waitingForSession: false };
-  const model = MODELS[type];
-  if (!model || !db?.[model]?.updateMany || !db?.jobInstance?.findUnique) return { state, waitingForSession: false };
-  const { withCollectorStateLock, collectionCommand } = require("./analytics-collector-control-service");
-  return withCollectorStateLock({ db, type, creatorId, work: async tx => {
-    const current = await tx[model].findUnique({ where: { creatorId } });
-    if (!current || current.agencyId !== agencyId || current.creatorId !== creatorId || current.status !== "FAILED"
-      || current.retryAfterAt || current.sourceJobId !== state.sourceJobId || current.activeGeneration !== state.activeGeneration)
-      return { state: current || state, waitingForSession: false };
-    const job = await tx.jobInstance.findUnique({ where: { id: current.sourceJobId } });
-    if (!job || job.agencyId !== agencyId || job.creatorId !== creatorId || JOB_TYPES[job.jobKey] !== type || job.status !== "FAILED")
-      return { state: current, waitingForSession: false };
-    let command;
-    try { command = collectionCommand(job, type); } catch { return { state: current, waitingForSession: false }; }
-    if (command.generation !== current.activeGeneration || +command.requestedAt !== +date(current.activeRequestedAt))
-      return { state: current, waitingForSession: false };
-    // An existing queued/paused/publishing traversal remains its owner's work.
-    // In particular a manual PAUSE must not be bypassed by automatic repair.
-    const active = await tx.jobInstance.findFirst({ where: { agencyId, creatorId, jobKey: job.jobKey,
-      status: { in: ["SCHEDULED", "CLAIMED", "PUBLISHING", "PAUSED"] } }, select: { id: true } });
-    if (active) return { state: current, waitingForSession: false, active: true };
-    const classified = classifyCollectorReadFailure({ job, error: job.lastError, failure: job.result?.failure });
-    if (!classified) return { state: current, waitingForSession: false };
-    if (classified.waitingForSession) {
-      const failedAt = date(job.completedAt) || date(job.updatedAt);
-      const fresh = { gte: new Date(+now - 2 * 60_000), lte: new Date(+now + 30_000) };
-      const binding = failedAt && await tx.deviceCreatorBinding?.findFirst?.({ where: { agencyId, creatorId, status: "ACTIVE",
-        sessionReadReady: true, lastSeenAt: fresh, lastCapabilityAt: { gt: failedAt, lte: new Date(+now + 30_000) },
-        device: { agencyId, lastSeenAt: fresh } }, select: { id: true } });
-      if (!binding) return { state: current, waitingForSession: true };
-    }
-    const failedAt = date(job.completedAt) || date(job.updatedAt) || now;
-    const retryAt = new Date(Math.min(+failedAt, +now) + retryDelay(job));
-    const changed = await tx[model].updateMany({ where: { creatorId, agencyId, status: "FAILED", retryAfterAt: null,
-      sourceJobId: job.id, activeGeneration: command.generation, activeRequestedAt: current.activeRequestedAt },
-      data: { retryAfterAt: retryAt } });
-    return { state: changed.count ? { ...current, retryAfterAt: retryAt } : await tx[model].findUnique({ where: { creatorId } }),
-      waitingForSession: false, recovered: changed.count === 1, code: classified.code };
-  } });
+// A terminal source is an observable stopped episode. Automatic planning reads
+// that result but must never turn FAILED into a fresh-generation retry. Explicit
+// retry/new collection causes are admitted by their owning command authority.
+async function recoverTerminalCollector({ db, type, state, agencyId, creatorId }) {
+  const result = { state, waitingForSession: false, recovered: false };
+  if (String(state?.status || "").toUpperCase() !== "FAILED") return result;
+  // Older releases left retryAfterAt on exhausted collectors. Its deadline is
+  // a scheduling hint, never authority to create another generation. Only an
+  // exact still-active source job can retain the existing episode's budget.
+  if (state.retryAfterAt && state.sourceJobId && db?.jobInstance?.findUnique) {
+    const source = await db.jobInstance.findUnique({ where: { id: state.sourceJobId },
+      select: { id: true, agencyId: true, creatorId: true, jobKey: true, status: true, params: true } });
+    if (source?.id === state.sourceJobId && source.agencyId === agencyId && source.creatorId === creatorId
+      && JOB_TYPES[source.jobKey] === type && typeof state.activeGeneration === "string" && state.activeGeneration
+      && source.params?.collectionGeneration === state.activeGeneration
+      && ["SCHEDULED", "CLAIMED", "PUBLISHING", "PAUSED"].includes(source.status)) return { ...result, active: true };
+  }
+  return { ...result, terminal: true };
 }
 
 module.exports = { JOB_TYPES, MAX_RETRY_MS, retryDelay, classifyCollectorReadFailure, collectionFailureRetry, signalCollectorRetry, recoverTerminalCollector };

@@ -471,6 +471,10 @@ model CreatorAccount {
   moneyObservations CreatorMoneyObservation[]
   realtimeSessions CreatorRealtimeSession[]
   recoveryIntents CreatorRecoveryIntent[]
+  entityChangeHead CreatorEntityChangeHead?
+  entityChanges CreatorEntityChange[]
+  entityCurrent CreatorEntityCurrent[]
+  mediaUsageFacts CreatorMediaUsageFact[]
   notificationFrontierPages CreatorNotificationFrontierPage[]
 
   providerRequestGate OfProviderRequestGateState?
@@ -3510,6 +3514,8 @@ model JobInstance {
   creatorEarningsTotals          CreatorEarningsTotal[]
 
   @@index([status, nextRunAt])
+  @@index([status, nextRunAt, priority(sort: Desc), id], map: "JobInstance_due_fair_idx")
+  @@index([creatorId, status, nextRunAt, priority(sort: Desc), id], map: "JobInstance_creator_due_fair_idx")
   @@index([creatorId])
   @@index([agencyId])
   @@index([jobKey])
@@ -4116,6 +4122,7 @@ model CreatorMediaAsset {
 }
 
 model CreatorMediaUsageContribution {
+  factBaseline Json?
   id             String    @id @default(cuid())
   agencyId       String
   creatorId      String
@@ -4145,6 +4152,8 @@ model CreatorMediaUsageContribution {
 }
 
 model CreatorMediaUsageSourceState {
+  factProtocol Int @default(0)
+  coverage Json?
   id             String   @id @default(cuid())
   agencyId       String
   creatorId      String
@@ -4159,6 +4168,26 @@ model CreatorMediaUsageSourceState {
 
   @@unique([creatorId, sourceKey])
   @@index([agencyId, creatorId, updatedAt])
+}
+
+model CreatorMediaUsageFact {
+  id String @id @default(cuid())
+  agencyId String
+  creatorId String
+  sourceKey String
+  sourceMessageId String
+  mediaId String
+  payload Json
+  purchased Boolean @default(false)
+  sourceRevision String
+  lastSeenRunId String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@unique([creatorId, sourceKey, sourceMessageId, mediaId], map: "CreatorMediaUsageFact_identity_key")
+  @@index([creatorId, sourceKey], map: "CreatorMediaUsageFact_source_idx")
+  @@index([creatorId, mediaId], map: "CreatorMediaUsageFact_media_idx")
+  @@index([creatorId, sourceKey, lastSeenRunId], map: "CreatorMediaUsageFact_run_idx")
 }
 
 model MediaLibraryScanItem {
@@ -6399,6 +6428,7 @@ model CreatorLiveSync {
   creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
 }
 model CreatorRealtimeSession {
+  captureFromAt DateTime?
   retiredAt DateTime?
   id String @id
   agencyId String
@@ -6429,6 +6459,10 @@ model CreatorRealtimeReceipt {
   @@id([sessionId,seq])
 }
 model CreatorRecoveryIntent {
+  failedAttempts Int @default(0)
+  stoppedAt DateTime?
+  lastError String?
+  lastProgressAt DateTime?
   id String @id
   agencyId String
   creatorId String
@@ -6444,6 +6478,52 @@ model CreatorRecoveryIntent {
   creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
   @@index([creatorId,stream,status,targetAt,id],map:"CreatorRecoveryIntent_pending_idx")
 }
+model CreatorEntityChangeHead {
+  creatorId String @id
+  agencyId String
+  lastRevision BigInt @default(0)
+  retainedFrom BigInt @default(1)
+  nextRetentionAt DateTime?
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@unique([agencyId, creatorId])
+  @@index([nextRetentionAt, creatorId], map:"CreatorEntityChangeHead_retention_due_idx")
+  @@index([updatedAt, creatorId])
+}
+
+model CreatorEntityChange {
+  creatorId String
+  revision BigInt
+  agencyId String
+  entityType String
+  entityId String
+  sourceIdentity String
+  sourceVersion String
+  payload Json
+  tombstone Boolean @default(false)
+  createdAt DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@id([creatorId, revision])
+  @@index([createdAt, creatorId, revision])
+  @@index([agencyId, creatorId, revision])
+}
+
+model CreatorEntityCurrent {
+  creatorId String
+  entityType String
+  entityId String
+  agencyId String
+  revision BigInt
+  sourceIdentity String
+  sourceVersion String
+  payload Json
+  tombstone Boolean @default(false)
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId, creatorId], references: [agencyId, id], onDelete: Cascade)
+  @@id([creatorId, entityType, entityId])
+  @@index([agencyId, creatorId, entityType, entityId])
+}
+
 model CreatorNotificationFrontierPage {
   createdAt DateTime @default(now())
   creatorId String

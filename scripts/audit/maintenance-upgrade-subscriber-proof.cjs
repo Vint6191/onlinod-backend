@@ -1,6 +1,6 @@
 "use strict";
 // Isolated authentic-schema upgrade + real scheduler/publisher integration.
-// Provider observations are fixture inputs; all 38 maintenance callbacks, SQL
+// Provider observations are fixture inputs; all current maintenance callbacks, SQL
 // ownership, publication phases and process restarts execute production code.
 process.env.TZ = "UTC";
 const assert = require("node:assert/strict");
@@ -60,6 +60,20 @@ const workerSource = `
   try {
     const { db } = fixture;
     require.cache[require.resolve(root + "/src/prisma")] = { exports: db };
+    // This setup deliberately runs against the pre-admission schema. The new
+    // reverse feed did not exist in that version: model that one old boundary
+    // explicitly while constructing historical stranded subscriber state.
+    // Every post-upgrade pump runs unmodified production modules in a fresh
+    // child process, including the real transactional reverse publication.
+    const entityChanges = require(root + "/src/services/creator-entity-change-service");
+    const publishEntityChanges = entityChanges.publishEntityChanges;
+    let constructingOldSchemaFixture = true;
+    entityChanges.publishEntityChanges = async input => {
+      if (!constructingOldSchemaFixture) return publishEntityChanges(input);
+      assert.equal(require(root + "/src/services/db-commit-kernel").currentCommitContext()?.tx, input.db);
+      assert.ok(input.changes.length <= 5000);
+      return { staged: false, count: 0, historicalFixtureWithoutReverseFeed: true };
+    };
     const sub = require(root + "/src/services/subscriber-directory-service");
     const { runRootCommit } = require(root + "/src/services/db-commit-kernel");
     const { MAINTENANCE_LANE_NAMES } = require(root + "/src/services/maintenance-lane-registry");
@@ -145,9 +159,11 @@ const workerSource = `
 
     async function releaseConnection() { await db.$disconnect(); if (fixture.waitForIdle) await fixture.waitForIdle(); }
     async function install() { await releaseConnection(); return childProcess(["scripts/database/install-current.js"], fixture.url); }
+    constructingOldSchemaFixture = false;
     await install();
     const upgraded = await db.$queryRawUnsafe('SELECT "laneName","ordinal","turnCount","lastAdmittedAt","admissionSequence" FROM "MaintenanceAdmissionClassState" WHERE generation=$1 ORDER BY ordinal', generation);
-    assert.deepEqual(upgraded.map(({ admissionSequence, ...row }) => row), before);
+    assert.deepEqual(upgraded.filter(row => before.some(oldRow => oldRow.laneName === row.laneName)).map(({ admissionSequence, ...row }) => row), before);
+    assert.equal(upgraded.length, MAINTENANCE_LANE_NAMES.length);
     assert.ok(upgraded.every(row => row.admissionSequence === 0n));
     assert.deepEqual(await db.subscriberScanRun.findMany({ where: { id: { in: targets.map(row => row.runId) } }, orderBy: { id: "asc" } }), runsBefore);
     assert.equal((await require("../../src/services/database-contract-service").readDatabaseContract(db)).ready, true);
@@ -159,7 +175,7 @@ const workerSource = `
       const line = output.split(/\r?\n/).find(value => value.startsWith("MAINTENANCE_PROOF_RESULT="));
       assert.ok(line, output);
       const result = JSON.parse(line.slice("MAINTENANCE_PROOF_RESULT=".length));
-      assert.equal(result.ready.ready, true); assert.equal(result.ready.handlers, 38);
+      assert.equal(result.ready.ready, true); assert.equal(result.ready.handlers, MAINTENANCE_LANE_NAMES.length);
       for (const tick of result.ticks) {
         assert.equal(tick.policy, "bounded_fair_sequence"); assert.equal(tick.selected.length, 5);
         assert.deepEqual(tick.failures, [], JSON.stringify(tick)); assert.equal(tick.ok, true, JSON.stringify(tick));
@@ -230,7 +246,7 @@ const workerSource = `
     const after = await db.$queryRawUnsafe('SELECT "laneName","turnCount","admissionSequence" FROM "MaintenanceAdmissionClassState" WHERE generation=$1 ORDER BY ordinal', generation);
     for (const row of after) {
       const offers = ticks.filter(tick => tick.selected.includes(row.laneName)).length;
-      assert.equal(row.turnCount, before.find(prior => prior.laneName === row.laneName).turnCount + BigInt(offers));
+      assert.equal(row.turnCount, (before.find(prior => prior.laneName === row.laneName)?.turnCount || 0n) + BigInt(offers));
       assert.ok(row.admissionSequence > 0n);
     }
     pass("repeated install and a third process preserve closure, checkpoints and exact lifetime dispatch counts");

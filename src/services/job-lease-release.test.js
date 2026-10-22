@@ -396,7 +396,7 @@ test("claim allows another device workflow for the same creator and honors only 
     excludedCreatorIds: ["creator-1"],
   });
   assert.equal(result.job.creatorId, "creator-2");
-  assert.deepEqual(candidateWhere.creatorId.in, ["creator-2"]);
+  assert.deepEqual((candidateWhere.creatorId ? candidateWhere : candidateWhere.AND[0]).creatorId.in, ["creator-2"]);
   assert.equal(legacyLiveLeaseQueryCalled, false, "server must not globally lock a creator because another device owns a different workflow");
 });
 
@@ -701,9 +701,9 @@ test("discovery-only claim fences the shared dialog job key to the discovery sen
     ],
   };
   const billingConstraint = { OR: [{ creatorId: { in: ["creator-1"] } }] };
-  assert.deepEqual(selectedWhere.AND, [billingConstraint, expectedConstraint]);
+  assert.deepEqual((selectedWhere.status ? selectedWhere : selectedWhere.AND[0]).AND, [billingConstraint, expectedConstraint]);
   assert.deepEqual(fencedWhere.AND, [billingConstraint, expectedConstraint]);
-  assert.deepEqual(selectedWhere.jobKey.in, ["fetch_earnings", "dialog_intelligence_scan"]);
+  assert.deepEqual((selectedWhere.status ? selectedWhere : selectedWhere.AND[0]).jobKey.in, ["fetch_earnings", "dialog_intelligence_scan"]);
   assert.deepEqual(fencedWhere.jobKey.in, ["fetch_earnings", "dialog_intelligence_scan"]);
 });
 
@@ -1057,7 +1057,7 @@ test("a stale worker cannot rotate a notification repair owned by another lease"
   assert.equal(item.update(), null);
 });
 
-for (const type of ['NOTIFICATIONS','FINANCIAL']) test(`first ${type} claim after offline updates observation bounds while retaining the original generation`, async () => {
+for (const type of ['NOTIFICATIONS','FINANCIAL']) test(`first ${type} claim after offline retains its generation and respects the stream's observation bound`, async () => {
   const now=new Date(),old=new Date(+now-90*86400000),jobKey=type==='NOTIFICATIONS'?'catchup_notifications_scan':'financial_transactions_scan';
   const params=require('./analytics-collector-control-service').stampCollectionAuthorityParams({collectionContractVersion:1,collectionType:type,
     collectionMode:'catchup',collectionGeneration:'queued-generation',collectionRequestedAt:old.toISOString(),notificationMode:'catchup',
@@ -1069,17 +1069,17 @@ for (const type of ['NOTIFICATIONS','FINANCIAL']) test(`first ${type} claim afte
     workerDevice:{findUnique:async()=>({id:'device-1',userId:'user-1',agencyId:'agency-1',lastSeenAt:now})},
     agencyMember:{findFirst:async()=>({id:'member-1',role:'OWNER',roleKey:'owner',assignedCreators:'all',accessEpoch:1})},
     creatorAccount:{findMany:async()=>[{id:'creator-1'}]},deviceCreatorBinding:{findMany:async()=>[{creatorId:'creator-1'}]},
-    creatorFinancialCollectionState:{findUnique:async()=>null},financialReceiptRun:{findUnique:async()=>null},$executeRawUnsafe:async()=>1,
+    creatorFinancialCollectionState:{findUnique:async()=>({baselineGeneration:"baseline",baselineVerifiedAt:old,coverageThrough:new Date(+old-86400000)})},financialReceiptRun:{findUnique:async()=>null},$executeRawUnsafe:async()=>1,
     jobInstance:{findMany:async()=>[],findFirst:async()=>candidate,updateMany:async input=>{data=input.data;return{count:1}},
       findUnique:async()=>({...candidate,...data,leaseRevision:1,creator:{id:'creator-1'}})},
   };
   const {claimJob}=loadService({db});
-  const result=await claimJob({userId:'user-1',deviceId:'device-1',jobKeys:[jobKey],capabilities:{creatorEventDrivenSyncV2:true,financialWindowReceiptsV1:true}});
+  const result=await claimJob({userId:'user-1',deviceId:'device-1',jobKeys:[jobKey],capabilities:{creatorEventDrivenSyncV2:true,financialWindowReceiptsV1:true,financialTraversalV2:true}});
   assert.equal(result.reason,'claimed');assert.equal(result.job.params.collectionGeneration,params.collectionGeneration);
   assert.equal(result.job.params.collectionAuthorityRequestedAt,params.collectionAuthorityRequestedAt);
   assert(Date.parse(result.job.params.analyticsObservationStartedAt)>=+now);
-  if(type==='NOTIFICATIONS') {assert(Date.parse(result.job.params.to)>=+now+5*60000);assert.equal(result.job.params.stopAtNotificationId,'old-verified-head');}
-  else {assert.equal(result.job.params.financialWindowGeneration,params.collectionGeneration);assert(Date.parse(result.job.params.financialWindows[0].to)>=Math.floor(+now/1000)*1000);}
+  if(type==='NOTIFICATIONS') {assert.equal(result.job.params.to,params.to);assert.equal(result.job.params.stopAtNotificationId,'old-verified-head');}
+  else {assert.equal(result.job.params.financialWindowGeneration,params.collectionGeneration);assert.equal(+new Date(result.job.params.financialWindows[0].to), +require('./financial-receipt-authority').date(params.endDate));}
 });
 
 test("claiming a queued pre-fix repair returns a fresh notification generation and resets only the traversal", async () => {
@@ -1884,6 +1884,71 @@ test('Subscriber checkpoint and unique counts come from committed page authority
   assert.deepEqual(result.continuation, { driverPhase: 'execute', jobContinuation: { offset: 9, scanned: 5, pages: 3 } });
   assert.equal(result.progress.current, 5);
 });
+
+function collectorRetryFixture(source, variant = 'advance') {
+  const item = notificationConflictFixture();
+  item.job.attempts = 4;
+  item.job.continuation = null;
+  item.db.jobInstance.update = async ({ data }) => { Object.assign(item.job, data); return { ...item.job }; };
+  item.db.$executeRawUnsafe = async () => 1;
+  let effect;
+  if (source === 'financial') {
+    item.job.jobKey = 'financial_transactions_scan';
+    item.job.params = { financialReceiptVersion: 1, collectionMode: 'full', collectionGeneration: 'retry-source' };
+    item.input.chunkResult = { kind: variant === 'chart' ? 'financial_chart_total' : 'financial_transactions_page' };
+    effect = { type: item.input.chunkResult.kind, financialContinuation: { driverPhase: 'execute', jobContinuation: { page: 1, marker: 'older' } } };
+    if (variant === 'replay') effect.replay = true;
+    if (variant === 'superseded') effect.superseded = true;
+    if (variant === 'unchanged') effect.financialContinuation = { driverPhase: 'execute', jobContinuation: null };
+    item.input.continuation = effect.financialContinuation;
+  } else if (source === 'campaigns') {
+    item.job.jobKey = 'fetch_campaigns';
+    item.job.params = { campaignTraversalAuthorityVersion: 1, collectionMode: 'full', collectionGeneration: 'retry-source', collectionRequestedAt: '2026-10-01T00:00:00Z' };
+    const current = { collectorVersion: 'campaigns-v13', scanRunId: 'retry-source', scanStartedAt: '2026-10-01T00:00:00.000Z', phase: 'campaigns',
+      campaignMode: 'full', offset: 0, page: 0, campaigns: [], segmentCursor: null, segmentRequestCursor: null, segmentHasMore: false,
+      campaignIndex: 0, claimerOffset: 0, claimerPage: 0, claimerRejected: 0, directorySourceExhausted: false, campaignPagesComplete: false,
+      truncated: false, totalCampaignCount: 0, campaignBatchCount: 0, claimerBatchCount: 0, campaignScannerRejected: 0, claimerScannerRejected: 0 };
+    item.input.chunkResult = variant === 'segment' ? { kind: 'campaign_directory_segment' }
+      : { kind: 'campaigns_page', sourceRowCount: 1, sourceHasMore: true, pageNumber: 1, sourceOffset: 0, scannerRejected: 0, campaigns: [{ externalCampaignId: '1' }] };
+    item.input.continuation = { driverPhase: 'execute', jobContinuation: variant === 'segment' ? current : { ...current, offset: 1, page: 1, campaignBatchCount: 1 } };
+    effect = { batchId: 'campaign-receipt', replay: variant === 'replay', superseded: variant === 'superseded', serverNoProgressDetected: variant === 'stalled' };
+  } else if (source === 'notifications') {
+    item.job.params = { ...item.job.params, notificationMode: 'full', collectionMode: 'full' };
+    item.input.chunkResult = { kind: 'notification_facts_page_all', schemaVersion: 6, scanRunId: item.job.params.collectionGeneration,
+      page: 1, sourceHasMore: true, cursorStart: null, cursorEnd: 'notification-1', observations: [{ notificationId: 'notification-1' }] };
+    item.input.continuation = { driverPhase: 'execute', jobContinuation: { scanRunId: item.job.params.collectionGeneration, page: 1, fromId: 'notification-1' } };
+    effect = { type: 'notification_source_page', batchId: 'notification-receipt', status: 'COMMITTED', replayed: variant === 'replay' };
+    if (variant === 'stalled') item.input.chunkResult.cursorStart = item.input.chunkResult.cursorEnd;
+  } else {
+    item.job.jobKey = 'subscriber_directory_scan';
+    item.job.params = { scanRunId: 'retry-source' };
+    item.input.chunkResult = { kind: 'subscriber_directory_page', scanRunId: 'retry-source', offset: 0 };
+    effect = { duplicate: variant === 'replay', nextOffset: variant === 'stalled' ? 0 : 20, scannedCount: 0, pageCount: 1, hasMore: true };
+  }
+  item.applyJobChunk = async () => effect;
+  return item;
+}
+
+for (const source of ['financial', 'campaigns', 'notifications', 'subscribers']) {
+  test(`${source} new committed source page resets only its current segment retry budget`, async () => {
+    const item = collectorRetryFixture(source), { progressJob } = loadService(item);
+    await progressJob(item.input);
+    assert.equal((await item.db.jobInstance.findUnique({ where: { id: item.job.id } })).attempts, 0);
+  });
+  test(`${source} immutable page replay preserves an exhausted segment's retry count`, async () => {
+    const item = collectorRetryFixture(source, 'replay'), { progressJob } = loadService(item);
+    await progressJob(item.input);
+    assert.equal((await item.db.jobInstance.findUnique({ where: { id: item.job.id } })).attempts, 4);
+  });
+}
+for (const [source, variant] of [['financial','chart'], ['financial','superseded'], ['financial','unchanged'], ['campaigns','segment'],
+  ['campaigns','superseded'], ['campaigns','stalled'], ['notifications','stalled'], ['subscribers','stalled']]) {
+  test(`${source} ${variant} cannot replenish provider-page retry budget`, async () => {
+    const item = collectorRetryFixture(source, variant), { progressJob } = loadService(item);
+    await progressJob(item.input);
+    assert.equal((await item.db.jobInstance.findUnique({ where: { id: item.job.id } })).attempts, 4);
+  });
+}
 
 test('Subscriber lost-ACK CAS rejects stale progress before any token or page write', async () => {
   const item = subscriberLeaseFixture(), durable = { driverPhase: 'execute', jobContinuation: { offset: 9, scanned: 5, pages: 3 } };

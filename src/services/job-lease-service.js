@@ -419,6 +419,47 @@ function leaseDriverContinuation(value) {
   return normalized?.driverPhase === "execute" || normalized?.driverPhase === "complete"
     ? normalized : { driverPhase: "execute", jobContinuation: normalized };
 }
+function committedCollectorSourceAdvance(job, chunk, effect) {
+  if (!chunk || !effect || effect.replay === true || effect.replayed === true || effect.duplicate === true
+    || effect.superseded === true || effect.staleProgress === true || effect.serverNoProgressDetected === true) return false;
+  if (job.jobKey === "financial_transactions_scan") {
+    // This continuation is returned only after the receipt owner validates and
+    // commits a new provider page/marker. Chart receipts are a separate phase.
+    return require("./financial-receipt-authority").enabled(job)
+      && chunk.kind === "financial_transactions_page" && effect.type === "financial_transactions_page"
+      && Boolean(effect.financialContinuation)
+      && !isDeepStrictEqual(leaseDriverContinuation(job.continuation), leaseDriverContinuation(effect.financialContinuation));
+  }
+  if (job.jobKey === "fetch_campaigns") {
+    return campaignTraversal.enabled(job) && ["campaigns_page", "campaign_claimers_page"].includes(chunk.kind)
+      && effect.replay === false && Boolean(effect.batchId) && typeof chunk.sourceHasMore === "boolean"
+      && (chunk.sourceHasMore === false || Number.isSafeInteger(chunk.sourceRowCount) && chunk.sourceRowCount > 0);
+  }
+  if (job.jobKey === "subscriber_directory_scan") {
+    return chunk.kind === "subscriber_directory_page" && effect.duplicate === false
+      && Number.isSafeInteger(effect.pageCount) && effect.pageCount > 0 && Number.isSafeInteger(effect.nextOffset)
+      && (effect.hasMore === false || effect.hasMore === true && Number.isSafeInteger(chunk.offset) && effect.nextOffset > chunk.offset);
+  }
+  if (job.jobKey === "catchup_notifications_scan") {
+    if (chunk.kind !== "notification_facts_page_all" || chunk.schemaVersion !== 6
+      || effect.type !== "notification_source_page" || effect.replayed !== false || !effect.batchId
+      || !["COMMITTED", "PARTIAL"].includes(effect.status)) return false;
+    const prior = object(leaseDriverContinuation(job.continuation).jobContinuation);
+    if (!Number.isSafeInteger(chunk.page) || chunk.page <= Number(prior.page || 0)) return false;
+    if (require("./notification-frontier-authority").enabled(job)) {
+      return effect.notificationFrontier?.generation === job.params.collectionGeneration
+        && effect.notificationFrontier.page === chunk.page;
+    }
+    // Initial typed/ALL traversal also commits immutable source receipts. An
+    // unchanged cursor, progress-only message or a new receipt label alone is
+    // not evidence that the provider segment advanced.
+    return chunk.sourceHasMore === false || chunk.sourceHasMore === true
+      && typeof chunk.cursorEnd === "string" && chunk.cursorEnd !== chunk.cursorStart
+      && Array.isArray(chunk.observations) && chunk.observations.length > 0
+      && chunk.observations.at(-1)?.notificationId === chunk.cursorEnd;
+  }
+  return false;
+}
 async function requireOwnedDevice({ userId, deviceId, db = prisma }) {
   const device = await db.workerDevice.findUnique({ where: { id: deviceId } });
   if (!device || device.userId !== userId) throw new JobLeaseError("NOT_YOUR_DEVICE", "Invalid device", 403);
@@ -584,7 +625,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     allowedJobKeys = allowedJobKeys.filter((jobKey) => jobKey !== "fetch_campaigns");
   }
   if (capabilities?.creatorEventDrivenSyncV2 !== true) allowedJobKeys = allowedJobKeys.filter(key => !liveSync.JOB_STREAM[key]);
-  if (capabilities?.financialWindowReceiptsV1 !== true) allowedJobKeys = allowedJobKeys.filter(key => key !== "financial_transactions_scan");
+  if (capabilities?.financialWindowReceiptsV1 !== true || capabilities?.financialTraversalV2 !== true) allowedJobKeys = allowedJobKeys.filter(key => key !== "financial_transactions_scan");
   if (!allowedJobKeys.length) return { job: null, reason: "no-capabilities" };
   const explicitlyExcluded = new Set(
     (Array.isArray(excludedCreatorIds) ? excludedCreatorIds : [])
@@ -620,10 +661,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       billingConstraint,
       moneyResolutionSupported: capabilities?.financialMoneyResolutionV1 === true,
     });
-    const candidate = await prisma.jobInstance.findFirst({
-      where: candidateWhere,
-      orderBy: [{ priority: "desc" }, { nextRunAt: "asc" }],
-    });
+    const candidate = await require("./job-claim-fairness-service").selectClaimCandidate({ db: prisma, where: candidateWhere, now });
     if (!candidate) return { job: null, reason: rejectedFinancialClaims ? "invalid-financial-command" : "no-work",
       ...(rejectedFinancialClaims ? { rejectedFinancialClaims } : {}) };
     if (!liveSync.admitsJob(candidate)) {
@@ -898,7 +936,7 @@ function readLeaseError(error) {
   return error;
 }
 
-async function acquireJobFanObservationReadLease({ jobId, userId, deviceId, leaseToken, leaseRevision, purpose, requestId, campaignPage }) {
+async function acquireJobFanObservationReadLease({ jobId, userId, deviceId, leaseToken, leaseRevision, purpose, requestId, campaignPage, fanDataBatch }) {
   return leaseCommit({ jobId, userId, deviceId, leaseToken, leaseRevision }, async (tx, { job, now }) => {
   if (Number(job?.params?.observationReadLeaseVersion || 0) < 1) {
     throw new JobLeaseError("FAN_OBSERVATION_READ_LEASE_NOT_REQUIRED", "Job does not use the cross-device observation read lease", 409);
@@ -924,6 +962,8 @@ async function acquireJobFanObservationReadLease({ jobId, userId, deviceId, leas
         await enterCampaignBoundedExecution({ db: tx });
         await acquireCampaignTransactionLock(tx, job.creatorId);
       }
+      const recheckedBatch = fanDataBatch == null ? null
+        : await require("./fan-data-batch-authority").recheckFanDataBatchDemand({ db: tx, job, batch: fanDataBatch, now });
       const acquired = await acquireCreatorObservationReadLease({
         db: tx, jobId: job.id, agencyId: job.agencyId, creatorId: job.creatorId, deviceId, leaseRevision,
         purpose: normalizedPurpose, requestId,
@@ -932,7 +972,7 @@ async function acquireJobFanObservationReadLease({ jobId, userId, deviceId, leas
         await campaignTraversal.beginRead({ db: tx, job, campaignPage, acquiredAt: acquired.acquiredAt });
       }
       await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, db: tx, lock: true });
-      return acquired;
+      return recheckedBatch ? { ...acquired, fanDataBatch: recheckedBatch } : acquired;
     } catch (error) {
       if (error instanceof ExecutionAccessFenceError) throw new JobLeaseError(error.code, error.message, error.status);
       throw readLeaseError(error);
@@ -1072,7 +1112,7 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     // checkpoint. A lost ACK must return the committed checkpoint before trying
     // to consume that token again. Old clients omit the CAS field; retain their
     // token-validated path during rollout, while current Desktop always sends it.
-    if (["fan_data_point_refresh", "subscriber_directory_scan"].includes(job.jobKey) && expectedContinuation !== undefined
+    if (["fan_data_point_refresh", "subscriber_directory_scan", "catchup_notifications_scan"].includes(job.jobKey) && expectedContinuation !== undefined
       && !isDeepStrictEqual(leaseDriverContinuation(job.continuation), leaseDriverContinuation(expectedContinuation))) {
       return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
         progress: job.progress, continuation: job.continuation, sideEffect: { staleProgress: true } };
@@ -1096,6 +1136,7 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
     }
     if (financialAuthority.enabled(job) && !["financial_transactions_page", "financial_chart_total"].includes(chunkResult?.kind))
       throw new JobLeaseError("FINANCIAL_PAGE_RECEIPT_REQUIRED", "Financial progress requires a source receipt", 409);
+    if (job.jobKey === "fan_data_point_refresh") require("./fan-data-batch-authority").assertFanDataBatchProgress({ job, chunkResult, continuation: requestedContinuation });
     const updatedFence = await tx.jobInstance.updateMany({
       where: {
         id: job.id,
@@ -1156,6 +1197,13 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
               pages: state.pages, sourceType: job.params.sourceType || "all", completedAt: now.toISOString() }, progress: serverProgress };
         updated = await tx.jobInstance.update({ where: { id: job.id }, data: { continuation: serverContinuation, progress: serverProgress } });
       }
+    } else if (job.jobKey === "catchup_notifications_scan") {
+      const serverContinuation = sideEffect?.replayed === true ? job.continuation
+        : require("./notification-frontier-authority").attachContinuation(job, requestedContinuation, sideEffect) ?? requestedContinuation;
+      updated = await tx.jobInstance.update({ where: { id: job.id }, data: {
+        continuation: serverContinuation,
+        ...(sideEffect?.replayed === true ? { progress: job.progress } : {}),
+      } });
     } else if (financialAuthority.enabled(job) && sideEffect?.financialContinuation) {
       updated = await tx.jobInstance.update({ where: { id: job.id }, data: { continuation: sideEffect.financialContinuation } });
     } else if (job.jobKey === "fetch_campaigns" && sideEffect?.replay === true) {
@@ -1191,6 +1239,14 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
           },
         },
       });
+    }
+
+    // Retries belong to the current stalled provider segment, not the lifetime
+    // of a long scan. Reset only beside its newly committed source checkpoint.
+    // A lost ACK/replay, chart read, segment load, keepalive or cooperative yield
+    // must preserve the budget across restarts and machine handoffs.
+    if (Number(job.attempts) > 0 && committedCollectorSourceAdvance(job, chunkResult, sideEffect)) {
+      updated = await tx.jobInstance.update({ where: { id: job.id }, data: { attempts: 0 } });
     }
 
     // update() already returns the row. Avoid a final findUnique round-trip on
@@ -1571,8 +1627,11 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   await maybeAdvanceCreatorAnalyticsInitialSync(job, completed);
   return { job: { id: job.id, status: "DONE" }, sideEffect: completed };
 }
-async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, error, result, retryable = true }) {
+async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, error, result, retryable = true, expectedContinuation }) {
   const outcome = await leaseCommit({ jobId, userId, deviceId, leaseToken, leaseRevision }, async (tx, { job, now }) => {
+  if (expectedContinuation !== undefined && !isDeepStrictEqual(leaseDriverContinuation(job.continuation), leaseDriverContinuation(expectedContinuation))) {
+    return { staleFailure: true, id: job.id, status: job.status, continuation: job.continuation };
+  }
   const errorText = clean(error, 2000) || "unknown error";
   const attempts = job.attempts + 1;
   const terminal = retryable === false || attempts >= MAX_ATTEMPTS;
@@ -1597,6 +1656,7 @@ async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, wor
     const failureSideEffect = await recordJobFailure({ db: tx, job, error: errorText, terminal, retryAfterAt: terminal ? null : data.nextRunAt });
     return { job, terminal, data, errorText, failureSideEffect };
   }, { allowExpired: true, profile: "JOB_COMPLETION" });
+  if (outcome.staleFailure === true) return outcome;
   const { job, terminal, data, errorText, failureSideEffect } = outcome;
 
   // The bounded final subscriber page may be fully committed even when the

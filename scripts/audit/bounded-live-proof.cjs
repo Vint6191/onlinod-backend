@@ -62,10 +62,13 @@ function pass(name){checks.push(name);console.log("PASS",name);}
   await assert.rejects(()=>tx(async t=>{assert(await gen.publish(t,job,run));throw Error("FINALIZE_CRASH");}),/FINALIZE_CRASH/);
   assert.equal((await home.readHomeTotals(input)).totalCents,1000);
   const switchStart=performance.now();await tx(t=>gen.publish(t,job,run));const finalizeMs=Math.round(performance.now()-switchStart);
-  const total=await home.readHomeTotals(input);assert.equal(total.totalCents,(count-1)*100+700);assert.equal(total.points.reduce((n,x)=>n+x.valueCents,0),total.totalCents);
-  assert.equal((await gen.activeEntry(db,s.creatorId,"tx-000001")).status,"undo");assert.equal(await gen.activeEntry(db,s.creatorId,"old-only"),null);
+  // A later provider response omitting an identity is not a refund. Contract
+  // 171 retains the previously confirmed 300 alongside the newer live payment;
+  // the explicit newer undo still replaces its own observed transaction.
+  const total=await home.readHomeTotals(input);assert.equal(total.totalCents,(count-1)*100+700+300);assert.equal(total.points.reduce((n,x)=>n+x.valueCents,0),total.totalCents);
+  assert.equal((await gen.activeEntry(db,s.creatorId,"tx-000001")).status,"undo");assert.equal(Number((await gen.activeEntry(db,s.creatorId,"old-only")).netCents),300);
   assert.equal((await require(root+"/src/services/earnings-live-read-sql").readLiveEarningsCoverage(db,s.creatorId,now)).fresh,true);
-  pass("chunk crash and pointer-swap crash roll back; previous Home remains stable; newer refund/new payment survive full replacement; totals equal hourly curve");
+  pass("chunk crash and pointer-swap crash roll back; previous Home remains stable; omitted confirmed fact and newer refund/payment survive full replacement; totals equal hourly curve");
   const finStart=performance.now();await tx(t=>gen.publish(t,job,run));
   metrics.publication={rows:count,finalizeMs,pages:steps,maximumVisited,maxPageMs:Math.round(Math.max(...durations)),medianPageMs:Math.round(durations.sort((a,b)=>a-b)[Math.floor(durations.length/2)]),replayFinalizeMs:Math.round(performance.now()-finStart)};
   // Completion visibility is atomic even when cleanup has not caught up.

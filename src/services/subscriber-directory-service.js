@@ -196,6 +196,7 @@ async function createSubscriberScanUnderLock(tx, {
       sourceType: run.sourceType,
       pageLimit: normalizedLimit,
       scanEveryDays: normalizedEveryDays,
+      collectionRequestedAt: now.toISOString(),
       reason: clean(reason, 160) || "subscriber_directory_refresh",
       publicationGeneration: generation,
       observationTokenVersion: 1,
@@ -244,7 +245,7 @@ async function scheduleSubscriberScan({
   scanEveryDays = DEFAULT_SCAN_EVERY_DAYS,
   priority = 20,
   reason = "subscriber_directory_refresh",
-recoveryIntent = null,
+  recoveryIntent = null,
 } = {}) {
   if (!agencyId || !creatorId)
     throw Object.assign(new Error("Creator scope is required"), { code: "CREATOR_SCOPE_REQUIRED" });
@@ -263,6 +264,7 @@ recoveryIntent = null,
       await lockSubscriberPublicationCreator(tx, agencyId, creatorId);
       const repaired = await repairInvalidSubscriberPublisher(tx, { agencyId, creatorId, now, manual: manual === true || force === true });
       if (repaired.replaced) return { ...repaired, recoveryReplacement: true };
+      if (repaired.stopped || repaired.resumed) return repaired;
 
       const publicationDebt = await tx.subscriberScanRun.findFirst({
         where: subscriberPublicationDebtWhere({ agencyId, creatorId }),
@@ -301,6 +303,23 @@ recoveryIntent = null,
         });
       }
 
+      if (!manual && !force) {
+        const latest = await tx.subscriberScanRun.findFirst({ where: { agencyId, creatorId },
+          orderBy: [{ publicationGeneration: "desc" }, { createdAt: "desc" }] });
+        if (latest?.status === "FAILED") {
+          const failedJob = latest.jobId ? await tx.jobInstance.findUnique({ where: { id: latest.jobId } }) : null;
+          // Retry the existing job/checkpoint within its finite lease budget.
+          // A new heartbeat is not permission to reset that budget or history.
+          const baseline = recoveryIntent ? await tx.subscriberDirectoryState.findUnique({ where: { creatorId } }) : null;
+          const independentCause = baseline?.publishedAt && failedJob && recoveryIntent && await require("./creator-live-sync-service").independentRecoveryAfterStop(tx,
+            { creatorId, stream: "subscribers", intentId: recoveryIntent.id, sourceJobId: failedJob.id });
+          if ((!failedJob || ["FAILED","CANCELLED"].includes(failedJob.status)) && !independentCause) {
+            if (failedJob) await require("./creator-live-sync-service").stopRecovery(tx,failedJob,failedJob.lastError || "SUBSCRIBER_SCAN_STOPPED");
+            return { blockedRun: latest, existingJob: failedJob, reason: "failed_terminal" };
+          }
+        }
+      }
+
       return createSubscriberScanUnderLock(tx, {
         agencyId, creatorId, userId, manual, force, mode, sourceType,
         normalizedLimit, normalizedEveryDays, priority, reason, recoveryIntent, now,
@@ -327,6 +346,8 @@ recoveryIntent = null,
     };
   }
 
+  if (result.blockedRun) return { ok: true, created: false, reason: result.reason || "failed_terminal",
+    run: runSummary(result.blockedRun), job: result.existingJob || null };
   if (result.existingPublication) {
     return {
       ok: true,
@@ -375,27 +396,15 @@ async function continueSubscriberRecollection(tx, { agencyId, creatorId, now, ma
   if (job && ["SCHEDULED", "CLAIMED", "PUBLISHING", "PAUSED"].includes(job.status)) {
     return { replaced: false, waiting: true, retryAt: new Date(+now + 30_000) };
   }
-  if (!manual && job?.status !== "FAILED") {
-    throw Object.assign(new Error("Subscriber recollection replacement is missing or cancelled; manual restart is required"), {
-      code: "SUBSCRIBER_RECOLLECTION_BLOCKED",
-    });
+  const sync = require("./creator-live-sync-service");
+  const recoveryIntent = await sync.pendingRecovery(tx, creatorId, "subscribers");
+  const independentCause = state?.publishedAt && job && recoveryIntent && await sync.independentRecoveryAfterStop(tx,
+    { creatorId, stream: "subscribers", intentId: recoveryIntent.id, sourceJobId: job.id });
+  if (!manual && !independentCause) {
+    if (job) await require("./creator-live-sync-service").stopRecovery(tx,job,job.lastError || "SUBSCRIBER_RECOLLECTION_STOPPED");
+    return { replaced: false, stopped: true, blockedRun: replacement || debt, existingJob: job, reason: "failed_terminal" };
   }
-  const { classifyCollectorReadFailure, retryDelay } = require("./collector-retry-policy");
-  const interrupted = classifyCollectorReadFailure({ job, error: job?.lastError, failure: job?.result?.failure });
-  if (!interrupted && !manual) throw Object.assign(new Error(`Subscriber recollection needs manual restart: ${clean(job?.lastError, 500) || "unclassified collection failure"}`), {
-    code: "SUBSCRIBER_RECOLLECTION_BLOCKED",
-  });
-  const failedAt = dateOrNull(job?.completedAt) || dateOrNull(job?.updatedAt) || now;
-  if (interrupted?.waitingForSession && !manual) {
-    const fresh = { gte: new Date(+now - 2 * 60_000), lte: new Date(+now + 30_000) };
-    const binding = await tx.deviceCreatorBinding?.findFirst?.({ where: { agencyId, creatorId, status: "ACTIVE",
-      sessionReadReady: true, lastSeenAt: fresh, lastCapabilityAt: { gt: failedAt, lte: new Date(+now + 30_000) },
-      device: { agencyId, lastSeenAt: fresh } }, select: { id: true } });
-    if (!binding) return { replaced: false, waiting: true, retryAt: new Date(+now + 60_000), reason: "provider_auth_required" };
-  }
-  const retryAt = new Date(Math.min(+failedAt, +now) + retryDelay(job));
-  if (!manual && retryAt > now) return { replaced: false, waiting: true, retryAt, reason: "recollection_retry_backoff" };
-  const cause = interrupted?.code || "MANUAL_RECOLLECTION_RESTART";
+  const cause = manual ? "MANUAL_RECOLLECTION_RESTART" : "INDEPENDENT_RECOVERY_EPISODE";
   if (job) {
     const fenced = await tx.jobInstance.updateMany({ where: { id: job.id, agencyId, creatorId,
       status: job.status, leaseRevision: Number(job.leaseRevision || 0) }, data: {
@@ -409,7 +418,6 @@ async function continueSubscriberRecollection(tx, { agencyId, creatorId, now, ma
   await tx.subscriberScanRun.update({ where: { id: replacement.id }, data: {
     status: "FAILED", publicationStatus: "RECOLLECTING", publicationLastError: job?.lastError || "MANUAL_RECOLLECTION_RESTART",
   } });
-  const recoveryIntent = await require("./creator-live-sync-service").pendingRecovery(tx, creatorId, "subscribers");
   const next = await createSubscriberScanUnderLock(tx, { agencyId, creatorId, now, recoveryIntent,
     reason: "subscriber_recollection_retry", normalizedEveryDays: integer(state?.scanEveryDays, DEFAULT_SCAN_EVERY_DAYS, 1, 30) });
   await tx.subscriberScanRun.update({ where: { id: replacement.id }, data: {
@@ -436,6 +444,35 @@ async function repairInvalidSubscriberPublisher(tx, { agencyId, creatorId, now, 
   const state = await tx.subscriberDirectoryState.findUnique({ where: { creatorId } });
   const cause = subscriberRecollectionCause(run, state);
   if (!cause) return { replaced: false };
+  if (cause === "SUBSCRIBER_PUBLICATION_SOURCE_PROOF_MISSING" && run?.hasMore === true
+    && ["QUEUED","RUNNING"].includes(run.status) && run.publicationStatus === "PENDING") {
+    // A publisher handed off before the final page is a resumable traversal,
+    // not evidence to throw away hundreds of persisted pages and recollect.
+    const previousRepair = object(object(run.summary).publicationSourceResume);
+    const repairs = Number(previousRepair.offset) === Number(run.nextOffset)
+      ? Number(previousRepair.attempts || 0) + 1 : 1;
+    if (repairs > 3 && !manual) {
+      await tx.jobInstance.updateMany({ where: { id: job.id, status: "PUBLISHING", leaseRevision: Number(job.leaseRevision || 0) },
+        data: { status: "FAILED", completedAt: now, lastError: "SUBSCRIBER_PUBLICATION_NO_PROGRESS" } });
+      await tx.subscriberScanRun.update({ where: { id: run.id }, data: { status: "FAILED", completedAt: now,
+        lastError: "SUBSCRIBER_PUBLICATION_NO_PROGRESS", publicationLastError: "SUBSCRIBER_PUBLICATION_NO_PROGRESS" } });
+      await tx.subscriberDirectoryState.updateMany({ where: { creatorId, lastJobId: job.id },
+        data: { status: "FAILED", lastError: "SUBSCRIBER_PUBLICATION_NO_PROGRESS" } });
+      await require("./creator-live-sync-service").stopRecovery(tx,job,"SUBSCRIBER_PUBLICATION_NO_PROGRESS",{attempts:repairs,now});
+      return { replaced: false, stopped: true, blockedRun: run, existingJob: job, reason: "failed_terminal" };
+    }
+    const updated = await tx.jobInstance.updateMany({ where: { id: job.id, status: "PUBLISHING", leaseRevision: Number(job.leaseRevision || 0) },
+      data: { status: "SCHEDULED", completedAt: null, nextRunAt: now, lastError: null, claimedAt: null, claimedByDeviceId: null,
+        leaseUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, workId: null,
+        continuation: { driverPhase: "execute", jobContinuation: { offset: Number(run.nextOffset || 0),
+          pages: Number(run.pageCount || 0), scanned: Number(run.scannedCount || 0) } } } });
+    if (!updated.count) return { replaced: false, waiting: true };
+    await tx.subscriberScanRun.update({ where: { id: run.id }, data: { lastError: null, publicationLastError: null,
+      summary: { ...object(run.summary), publicationSourceResume: { offset: Number(run.nextOffset || 0), attempts: repairs } } } });
+    const resumed = await tx.jobInstance.findUnique({ where: { id: job.id } });
+    publishPlannedJobAvailable(resumed);
+    return { replaced: false, resumed: true, existingRun: run, existingJob: resumed };
+  }
   // A newer valid owner must finish first. Never replace a live collector, or
   // recollect an old generation while the replacement is already publishing.
   const other = await tx.subscriberScanRun.findFirst({ where: {
@@ -488,9 +525,25 @@ async function repairInvalidSubscriberPublisher(tx, { agencyId, creatorId, now, 
 }
 
 async function ensureSubscriberScanDue({ db = prisma, agencyId, creatorId, priority = 10, now = new Date() } = {}) {
-  const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId } });
-  const sync=require("./creator-live-sync-service");
-  const recoveryIntent=await sync.pendingRecovery(db,creatorId,"subscribers");
+  // This preflight can adopt a terminal job or settle already-published debt.
+  // Keep those writes in the UTC owner boundary even for a root-client caller;
+  // provider scheduling below retains its separate owner transaction.
+  const { state, recoveryIntent } = await runDbTransaction(db, async tx => {
+    const state = await tx.subscriberDirectoryState.findUnique({ where: { creatorId } });
+    const sync=require("./creator-live-sync-service");
+    let recoveryIntent=await sync.pendingRecovery(tx,creatorId,"subscribers");
+    if (recoveryIntent && state?.currentRunId && state.publishedAt) {
+      const published = await tx.subscriberScanRun.findUnique({ where: { id: state.currentRunId } });
+      if (published?.status === "PUBLISHED" && published.publicationStatus === "COMPLETE" && published.hasMore === false
+        && published.fanProjectionStatus === "COMPLETE" && published.createdAt
+        && +new Date(recoveryIntent.targetAt) <= +new Date(published.createdAt)) {
+        await sync.completeRecovery(tx,{id:published.jobId,agencyId,creatorId,jobKey:SUBSCRIBER_DIRECTORY_JOB_KEY,
+          params:{collectionMode:"full",collectionRequestedAt:new Date(published.createdAt).toISOString()}},true,{deferPlanningWake:true});
+        recoveryIntent=await sync.pendingRecovery(tx,creatorId,"subscribers");
+      }
+    }
+    return { state, recoveryIntent };
+  });
   if (state?.publishedAt && !recoveryIntent) {
     // A prior published snapshot does not prove that a later generation has
     // finished publication. Reconnect/recurring planning must also repair a
@@ -1448,7 +1501,7 @@ async function reconcileRecoveredSubscriberPublicationJob(db, { run, summary = n
       return { reconciled: true, reason: "cancelled" };
     }
     if (currentJob.status === "DONE") {
-      if (run.status === "PUBLISHED") await require("./creator-live-sync-service").completeRecovery(tx, currentJob, true, { deferPlanningWake: true });
+      if (run.status === "PUBLISHED") await require("./creator-live-sync-service").completeRecovery(tx, currentJob, true, { deferPlanningWake: true, coveredThrough: currentRun?.createdAt });
       await markSubscriberPublicationJobReconciled(tx, runId, now);
       return { reconciled: true, reason: "already_done" };
     }
@@ -1482,7 +1535,7 @@ async function reconcileRecoveredSubscriberPublicationJob(db, { run, summary = n
     if (typeof tx?.fanObservationReadLease?.deleteMany === "function") {
       await tx.fanObservationReadLease.deleteMany({ where: { jobId } });
     }
-    if (run.status === "PUBLISHED") await require("./creator-live-sync-service").completeRecovery(tx, currentJob, true, { deferPlanningWake: true });
+    if (run.status === "PUBLISHED") await require("./creator-live-sync-service").completeRecovery(tx, currentJob, true, { deferPlanningWake: true, coveredThrough: currentRun?.createdAt });
     await markSubscriberPublicationJobReconciled(tx, runId, now);
     return { reconciled: true, reason: "done", derivedPlanningWake: derivedWake.queued };
   };
@@ -1634,6 +1687,14 @@ async function recoverSubscriberPublicationDebt({
     return { ...generation, replacement };
   }, { maxWaitMs: 1_000, timeoutMs: 45_000, maintenanceSignal });
   if (repair?.repaired) stateRepairs += 1;
+  if (repair?.replacement?.stopped) return {
+    ok: true, stopped: true, recoveredRuns: 0, advancedSteps: 0, reconciledJobs: 0, planningRuns: 0, stateRepairs,
+    reason: "failed_terminal", sourceJobId: repair.replacement.existingJob?.id || null,
+  };
+  if (repair?.replacement?.resumed) return {
+    ok: true, recoveredRuns: 0, advancedSteps: 0, reconciledJobs: 0, planningRuns: 0, stateRepairs,
+    reason: "publication_source_resumed", retryAt: new Date(+authorityNow + 30_000),
+  };
   if (repair?.replacement?.waiting) return {
     ok: true, recoveredRuns: 0, advancedSteps: 0, reconciledJobs: 0, planningRuns: 0,
     stateRepairs, retryAt: repair.replacement.retryAt || new Date(+authorityNow + 30_000),

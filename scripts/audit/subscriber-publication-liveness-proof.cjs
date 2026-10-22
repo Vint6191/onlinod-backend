@@ -41,18 +41,35 @@ const { scope } = require("./analytics-traffic/fixture.cjs");
       if (slowClaim && params.action === "queryRaw" && JSON.stringify(params.args).includes('RETURNING s.')) offset += 2000;
       return value;
     });
-    const recover = (creatorId, options = {}) => subscribers.recoverSubscriberPublicationDebt({
-      db, agencyId: s.agencyId, creatorId, maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 500, monotonicNow, ...options,
-    });
+    const recover = async (creatorId, options = {}) => {
+      try { return await subscribers.recoverSubscriberPublicationDebt({
+        db, agencyId: s.agencyId, creatorId, maxRuns: 1, maxStepsPerRun: 1, maxRuntimeMs: 500, monotonicNow, ...options,
+      }); } catch (error) {
+        if (error.code === "LIVE_RECOVERY_COMPLETION_SCOPE_MISMATCH") {
+          const evidence = await db.$queryRawUnsafe(`SELECT i.id,i."jobId",i.status,i."policyVersion",i."targetAt",
+            r.id AS "runId",r."createdAt" AS "runCreatedAt",r.status AS "runStatus",r."publicationStatus",
+            j.params,j."creatorId",j."agencyId" FROM "CreatorRecoveryIntent" i
+            JOIN "JobInstance" j ON j.id=i."jobId" JOIN "SubscriberScanRun" r ON r."jobId"=j.id WHERE i."creatorId"=$1`,creatorId);
+          error.message += " " + JSON.stringify(evidence);
+        }
+        throw error;
+      }
+    };
     const wake = creatorId => signals.signalSubscriberDirectoryMaintenance({ db, agencyId: s.agencyId, creatorId,
       kind: "RECOVERY", dueAt: new Date(0), reason: "LIVENESS_PROOF" });
     const due = creatorId => db.subscriberDirectoryMaintenanceSignal.updateMany({ where: { creatorId, kind: "RECOVERY" }, data: { dueAt: new Date(0) } });
+    const legacyBindings = [];
     for (const creatorId of creators) {
       const runId = `run-${creatorId}`, jobId = `job-${creatorId}`, recoveryIntentId = `intent-${creatorId}`;
       await db.jobInstance.create({ data: { id: jobId, agencyId: s.agencyId, creatorId, jobKey: "subscriber_directory_scan", scope: "creator",
         status: "PUBLISHING", params: { scanRunId: runId, scanEveryDays: 7, recoveryIntentId }, lastProgressAt: new Date(0) } });
-      await db.creatorRecoveryIntent.create({ data: { id: recoveryIntentId, agencyId: s.agencyId, creatorId, jobId,
-        stream: "subscribers", policyVersion: 2, reason: "OFFLINE_GAP", status: "RUNNING", gapFrom: new Date(0), targetAt: new Date() } });
+      // Seed only columns that existed in this real V8 prefix; the current
+      // generated Prisma model also selects fields added by later migrations.
+      await db.$executeRawUnsafe(`INSERT INTO "CreatorRecoveryIntent"
+        (id,"agencyId","creatorId","jobId",stream,"policyVersion",reason,status,"gapFrom","targetAt","updatedAt")
+        VALUES ($1,$2,$3,$4,'subscribers',2,'OFFLINE_GAP','RUNNING',$5::timestamp,$6::timestamp,clock_timestamp())`,
+      recoveryIntentId, s.agencyId, creatorId, jobId, new Date(0).toISOString(), new Date().toISOString());
+      legacyBindings.push((await db.$queryRawUnsafe(`SELECT id,"jobId","policyVersion","targetAt" FROM "CreatorRecoveryIntent" WHERE id=$1`,recoveryIntentId))[0]);
       await db.subscriberDirectoryState.create({ data: { agencyId: s.agencyId, creatorId, publicationGeneration: 1 } });
       await db.subscriberScanRun.create({ data: { id: runId, agencyId: s.agencyId, creatorId, jobId, status: "RUNNING",
         hasMore: false, nextOffset: 1020, scannedCount: 1001, fanProjectionCursorOffset: 1020, fanProjectionCount: 1001,
@@ -91,6 +108,8 @@ const { scope } = require("./analytics-traffic/fixture.cjs");
       assert.equal(validMigrationPrefix(currentReceipts, true), true);
       assert.equal(await db.subscriberScanItem.count(), 2002);
       assert.equal(await db.jobInstance.count({ where: { status: "PUBLISHING" } }), 2);
+      assert.deepEqual(await db.$queryRawUnsafe(`SELECT id,"jobId","policyVersion","targetAt" FROM "CreatorRecoveryIntent" ORDER BY id`),
+        [...legacyBindings].sort((a,b)=>a.id.localeCompare(b.id)),"the real upgrade must preserve each legacy episode and its fixed source target");
       assert.equal((await require("../../src/services/database-contract-service").readDatabaseContract(db)).ready, true);
       pass("actual V8-to-current installer and repeated install preserve both collected snapshots and pass schema readiness");
     }
@@ -216,6 +235,20 @@ const { scope } = require("./analytics-traffic/fixture.cjs");
       await db.jobInstance.update({ where: { id: jobId }, data: { params: { scanRunId: runId, recoveryIntentId: `intent-${creatorId}` } } });
       await recover(creatorId);
       pass("failed coverage finalization rolls back job DONE and reconciliation marker together, then retries successfully");
+      const legacyIntent = legacyBindings.find(row => row.id === `intent-${creatorId}`);
+      const frozenRun = await db.subscriberScanRun.findUnique({ where: { id: runId } });
+      await db.jobInstance.update({ where: { id: jobId }, data: { status: "PUBLISHING" } });
+      await db.subscriberScanRun.update({ where: { id: runId }, data: { publicationJobReconciledAt: null } });
+      await db.creatorRecoveryIntent.update({ where: { id: legacyIntent.id }, data: { status: "RUNNING", targetAt: new Date(+frozenRun.createdAt + 1) } });
+      await assert.rejects(recover(creatorId), e => e.code === "LIVE_RECOVERY_COMPLETION_SCOPE_MISMATCH");
+      assert.equal((await db.jobInstance.findUnique({ where: { id: jobId } })).status, "PUBLISHING");
+      assert.equal((await db.subscriberScanRun.findUnique({ where: { id: runId } })).publicationJobReconciledAt, null);
+      assert.equal((await db.creatorRecoveryIntent.findUnique({ where: { id: legacyIntent.id } })).status, "RUNNING");
+      await db.creatorRecoveryIntent.update({ where: { id: legacyIntent.id }, data: { targetAt: legacyIntent.targetAt } });
+      await recover(creatorId);
+      assert.equal(await db.jobInstance.count({ where: { creatorId: { in: creators } } }), 2);
+      assert.equal(await db.subscriberScanRun.count({ where: { creatorId: { in: creators } } }), 2);
+      pass("legacy job without a target parameter cannot cover one future millisecond; UTC completion preserves the original jobs and runs");
       await db.jobInstance.update({ where: { id: jobId }, data: { status: "CLAIMED", leaseUntil: new Date(realNow() + 60000) } });
       await db.subscriberScanRun.update({ where: { id: runId }, data: { publicationJobReconciledAt: null } });
       assert.equal((await recover(creatorId)).reconciledJobs, 0);

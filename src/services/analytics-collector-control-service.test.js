@@ -95,6 +95,23 @@ test("collection planning identity excludes trigger provenance and random comman
   });
 });
 
+test("financial recovery freezes the minimal whole-second end without authorizing future targets", () => {
+  const at = new Date("2026-10-22T12:00:00.321Z"), target = "2026-10-22T12:00:00.123Z";
+  const params = { collectionType: COLLECTOR_TYPES.FINANCIAL, collectionMode: "catchup", recoveryTargetAt: target,
+    endDate: "2026-10-22T12:00:00.000Z", financialTraversalVersion: 2 };
+  const frozen = stampCollectionAuthorityParams(params, at);
+  assert.equal(frozen.endDate, "2026-10-22 12:00:01");
+  assert.equal(frozen.recoveryTargetAt, target); assert.equal(frozen.initialMarker, 1792670401);
+  const later = stampCollectionAuthorityParams(frozen, new Date("2026-10-25T12:00:00Z"));
+  assert.equal(later.endDate, frozen.endDate);
+  const future = stampCollectionAuthorityParams({ ...params, recoveryTargetAt: "2099-01-01T00:00:00Z", endDate: "2099-01-01T00:00:00Z" }, at);
+  assert.equal(future.endDate, "2026-10-22 12:00:00");
+  const full = stampCollectionAuthorityParams({ ...params, collectionMode: "full", recoveryTargetAt: undefined, endDate: "2026-10-22 12:00:01" }, at);
+  assert.equal(full.endDate, "2026-10-22 12:00:01");
+  const bounded = stampCollectionAuthorityParams({ ...params, collectionMode: "full", endDate: "2099-01-01T00:00:00Z" }, at);
+  assert.equal(bounded.endDate, "2026-10-22 12:00:01");
+});
+
 test("financial collection state serializes exact server generations and rejects same-time competing commands", async () => {
   const db = stateDb("financial");
   const at = "2026-09-08T20:00:00.123Z";
@@ -206,7 +223,7 @@ test("DB collection authority stamps provider time boundaries, not replica wall-
     collectionType: COLLECTOR_TYPES.NOTIFICATIONS,
     to: "2099-01-01T00:00:00.000Z",
   }, authorityAt);
-  assert.equal(notification.to, new Date(authorityAt.getTime() + 5 * 60 * 1000).toISOString());
+  assert.equal(notification.to, authorityAt.toISOString());
 });
 
 
@@ -225,5 +242,5 @@ test("collection ordering advances monotonically past the durable command while 
     collectionType: COLLECTOR_TYPES.NOTIFICATIONS,
   }, physicalDbNow, new Date("2026-09-09T03:10:12.500Z"));
   assert.equal(notification.collectionAuthorityRequestedAt, "2026-09-09T03:10:12.501Z");
-  assert.equal(notification.to, "2026-09-09T03:15:11.999Z", "provider boundary must stay anchored to physical PostgreSQL time");
+  assert.equal(notification.to, "2026-09-09T03:10:11.999Z", "provider boundary must stay anchored to physical PostgreSQL time");
 });

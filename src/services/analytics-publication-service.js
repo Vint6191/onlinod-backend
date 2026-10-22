@@ -277,7 +277,11 @@ async function settle(db, job, row, sideEffect, now, { forceTerminal = false } =
   const protocolSuperseded = !complete && ((job.jobKey === "fetch_campaigns" && sideEffect?.completion?.protocolCurrent === false)
     || (job.jobKey === "financial_transactions_scan" && sideEffect?.protocolCurrent === false));
   const attempts = Number(job.attempts || 0) + (!complete && !protocolSuperseded ? 1 : 0);
-  const terminal = forceTerminal || job.params?.moneyResolutionVersion === 1 || (!protocolSuperseded && attempts >= MAX_JOB_ATTEMPTS);
+  // The provider traversal is already durably finished. Re-running all pages
+  // cannot repair a rejected comparison contract; preserve the mismatch and
+  // require a separate repair basis instead of creating a new full generation.
+  const financialTraversalFinished = job.jobKey === "financial_transactions_scan" && sideEffect?.traversalComplete === true;
+  const terminal = forceTerminal || financialTraversalFinished || job.params?.moneyResolutionVersion === 1 || (!protocolSuperseded && attempts >= MAX_JOB_ATTEMPTS);
   const retryAt = complete || terminal ? null : new Date(now.getTime() + (protocolSuperseded ? 1000 : 60000 * 2 ** Math.max(0, attempts - 1)));
   const status = complete ? "DONE" : terminal ? "FAILED" : "SCHEDULED";
   const result = { job: { id: job.id, status, ...(retryAt ? { retryAt: retryAt.toISOString() } : {}) }, sideEffect,
@@ -288,7 +292,7 @@ async function settle(db, job, row, sideEffect, now, { forceTerminal = false } =
     state: complete ? "COMMITTED" : "REJECTED", stage: "TERMINAL", response: result,
     completedAt: now, lastError: complete ? null : failureReason,
   } });
-  if (!complete && !protocolSuperseded) await require("./job-result-service").recordJobFailure({ db, job,
+  if (!complete && !protocolSuperseded) await require("./job-result-service").recordJobFailure({ db, job: { ...job, attempts },
     error: failureReason, terminal, retryAfterAt: retryAt });
   const updated = await db.jobInstance.update({ where: { id: job.id }, data: {
     status, completedAt: retryAt ? null : now, attempts, leaseUntil: null, leaseTokenHash: null, continuation: null,

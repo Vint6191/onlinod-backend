@@ -83,7 +83,7 @@ const checks=[],pass=name=>{checks.push(name);console.log("PASS",name);};
 
     for(const i of await debts(rollback))await commit(async t=>{
       const job={...narrow(rollback),id:"done-"+i.stream,jobKey:Object.keys(sync.JOB_STREAM).find(k=>sync.JOB_STREAM[k]===i.stream),params:sync.recoveryParams(i)};
-      await sync.bindRecovery(t,i,job.id);await sync.completeRecovery(t,job,true);
+      await sync.bindRecovery(t,i,job.id);await sync.completeRecovery(t,job,true,{coveredThrough:now});
     });
     await db.creatorRecoveryIntent.deleteMany({where:{creatorId:rollback.creatorId,status:"COMPLETE"}});
     await receive(rollback,new Date(+now+60000),{...apiAccount(rollback),realtimeHealthy:true,lastWsFrameAt:new Date(+now+60000).toISOString(),
@@ -118,7 +118,7 @@ const checks=[],pass=name=>{checks.push(name);console.log("PASS",name);};
     assert.equal(+(await db.creatorLiveSync.findUnique({where:{creatorId:short.creatorId}})).shortGapTo,+shortEnd);
     for(const [index,i] of shortDebts.entries()) {
       await commit(async t=>{const job={...narrow(short),id:"short-done-"+i.stream,jobKey:Object.keys(sync.JOB_STREAM).find(k=>sync.JOB_STREAM[k]===i.stream),params:sync.recoveryParams(i)};
-        await sync.bindRecovery(t,i,job.id);await sync.completeRecovery(t,job,true);});
+        await sync.bindRecovery(t,i,job.id);await sync.completeRecovery(t,job,true,{coveredThrough:shortEnd});});
       const at=new Date(+now+(index+1)*60000);await receive(short,at,liveAt(at));
       const l=await db.creatorLiveSync.findUnique({where:{creatorId:short.creatorId}});
       assert.equal(l.shortGapFrom===null,index===shortDebts.length-1,"capture/delivery cannot erase unresolved gap before every stream has proof");
@@ -135,7 +135,7 @@ const checks=[],pass=name=>{checks.push(name);console.log("PASS",name);};
     assert.equal(+tailState.shortGapFrom,+now);assert.equal(+tailState.shortGapTo,+tailEnd);
     for(const i of initialApiDebts)await commit(async t=>{
       const job={...narrow(apiThenWs),id:"api-ws-done-"+i.stream,jobKey:Object.keys(sync.JOB_STREAM).find(k=>sync.JOB_STREAM[k]===i.stream),params:sync.recoveryParams(i)};
-      await sync.bindRecovery(t,i,job.id);await sync.completeRecovery(t,job,true);
+      await sync.bindRecovery(t,i,job.id);await sync.completeRecovery(t,job,true,{coveredThrough:now});
     });
     const tailCheck=new Date(+now+61*60000);await receive(apiThenWs,tailCheck,tailLive(tailCheck));
     const tailDebts=(await debts(apiThenWs)).filter(i=>i.status!=="COMPLETE");

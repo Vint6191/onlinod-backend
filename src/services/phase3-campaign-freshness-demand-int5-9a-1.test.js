@@ -168,6 +168,9 @@ test("INT5.9A-1 one fresh observation settles the shared demand and current cove
   const refreshJob = [...h.jobs.values()][0];
   h.setValue({ valueObservedAt: new Date("2026-09-18T11:30:00Z"), availability: "AVAILABLE" });
   await recordCampaignFanRefreshChunk({ db: h.db, job: { id: refreshJob.id, jobKey: "fan_data_point_refresh", creatorId: "creator-1" }, chunkResult: { items: [{ onlyFansUserId: "fan-1" }] } });
+  assert.equal([...h.demands.values()][0].status, "QUEUED", "a fresh timestamp without a known amount does not satisfy financial demand");
+  h.setValue({ valueObservedAt: new Date("2026-09-18T11:30:00Z"), availability: "AVAILABLE", platformReportedTotalSpendCents: 0n });
+  await recordCampaignFanRefreshChunk({ db: h.db, job: { id: refreshJob.id, jobKey: "fan_data_point_refresh", creatorId: "creator-1" }, chunkResult: { items: [{ onlyFansUserId: "fan-1" }] } });
   const demand = [...h.demands.values()][0];
   assert.equal(demand.status, "COMPLETE");
   assert.equal(demand.satisfiedRevision, demand.requestedRevision);

@@ -12,6 +12,12 @@ const repo = require("./job-planning-repository");
 const service = require("./analytics-recurring-planning-service");
 Module._load = originalLoad;
 
+test.beforeEach((t) => {
+  // Subscriber admission is independent of Analytics bootstrap readiness and
+  // participates in the same transaction. Its SQL behavior has separate proofs.
+  t.mock.method(require("./subscriber-directory-service"), "ensureSubscriberScanDue", async () => ({ created: false }));
+});
+
 test("Analytics job publication waits for commit and discards rolled-back jobs", async () => {
   events.length = 0;
   await assert.rejects(() => repo.afterPlanningCommit(async () => {

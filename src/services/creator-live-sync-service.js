@@ -15,7 +15,7 @@ const JOB_STREAM = Object.freeze({
 });
 const key = (...parts) => hashCanonicalJson(parts);
 const date = (value) => {
-  const normalized=typeof value==="string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)?value+"Z":value;
+  const normalized=typeof value==="string" && /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(value)?value.replace(" ","T")+"Z":value;
   const d = normalized ? new Date(normalized) : null;
   return d && Number.isFinite(+d) ? d : null;
 };
@@ -136,6 +136,10 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
       (SELECT jsonb_object_agg(q.stream,q."targetAt") FROM (
         SELECT i.stream,max(i."targetAt") AS "targetAt" FROM "CreatorRecoveryIntent" i
         WHERE i."creatorId"=l."creatorId" AND i.status<>'COMPLETE' GROUP BY i.stream) q) AS "recoveryQueuedThrough",
+      (SELECT max(other."capturedAt") FROM "CreatorRealtimeSession" other
+        WHERE other."creatorId"=l."creatorId" AND other.id<>s.id AND other."retiredAt" IS NULL AND other.loss=false
+          AND other."captureFromAt"<=COALESCE(s."capturedAt",l."lastCapturedAt")
+          AND other."capturedAt">=COALESCE(s."capturedAt",l."lastCapturedAt")) AS "otherCoveredThrough",
       CASE WHEN s."capturedAt" IS NULL THEN EXISTS(SELECT 1 FROM "CreatorRealtimeSession" old
         WHERE old."creatorId"=l."creatorId" AND old."deviceId"=$4 AND old.id<>s.id AND old."capturedSeq">old."ackedSeq"
         AND old."updatedAt">$5::timestamp-interval '30 days') ELSE false END AS abandoned,
@@ -169,13 +173,21 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
       const previous=captured&&recoveredThrough?new Date(Math.max(+captured,+recoveredThrough)):captured||recoveredThrough,
         continuous=previous&&x.from&&x.from<=x.through&&+x.from<=+previous+SAMPLE_MAX_AGE_MS;
       const gap=previous&&!continuous?+x.through-previous:0,longGap=previous&&gap>=OFFLINE_GAP_MS;
-      const captureLoss=x.lossRevision>Number(s.lossRevision)||l.abandoned,delivered=Number(s.ackedSeq)>=x.seq;
+      const otherThrough=date(l.otherCoveredThrough);
+      const coveredByOther=otherThrough && +otherThrough>=+x.through-SAMPLE_MAX_AGE_MS;
+      if (coveredByOther) resolved = Math.max(resolved,x.lossRevision);
+      const captureLoss=(x.lossRevision>Number(s.lossRevision)||l.abandoned)&&!coveredByOther,delivered=Number(s.ackedSeq)>=x.seq;
       if(longGap||captureLoss) {
         const reason=captureLoss?"CAPTURE_LOSS":"OFFLINE_GAP";
         for(const stream of STREAMS) {
           const queued=date(l.recoveryQueuedThrough?.[stream]);
-          const from=!captureLoss&&queued&&queued>(previous||x.through)?queued:previous||x.through;
-          if(!captureLoss&&queued&&+x.through-from<OFFLINE_GAP_MS) {
+          const from=queued&&queued>(previous||x.through)?queued:previous||x.through;
+          // Reconnecting at the end of the same outage cannot manufacture a
+          // second episode behind an immutable running or stopped target. A
+          // later outage is independent only after acquisition actually resumed
+          // beyond that target, not merely because wall-clock time advanced.
+          if (queued && (!previous || previous <= queued)) continue;
+          if(queued && (queued>=x.through || +x.through-from<OFFLINE_GAP_MS)) {
             // An API-only heartbeat may have already queued this interval.
             // Preserve that immutable target. A later, uncovered short tail
             // remains explicit debt until proof covers it; it is not capture.
@@ -200,8 +212,9 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
     if(writes.length) {
       const json=JSON.stringify(writes);
       await db.$executeRawUnsafe(`UPDATE "CreatorRealtimeSession" s SET "capturedSeq"=x.seq,"capturedAt"=x.through,loss=x.loss,
+        "captureFromAt"=CASE WHEN x."from"<=x.through THEN x."from" ELSE NULL END,
         "lossAt"=x."lossAt","lossRevision"=x."lossRevision","resolvedLossRevision"=x.resolved,"updatedAt"=$2,"retiredAt"=NULL
-        FROM jsonb_to_recordset($1::jsonb) x(id text,seq bigint,through timestamp,loss boolean,"lossAt" timestamp,"lossRevision" int,resolved int) WHERE s.id=x.id`,json,now);
+        FROM jsonb_to_recordset($1::jsonb) x(id text,seq bigint,through timestamp,"from" timestamp,loss boolean,"lossAt" timestamp,"lossRevision" int,resolved int) WHERE s.id=x.id`,json,now);
       await db.$executeRawUnsafe(`UPDATE "CreatorLiveSync" l SET "lastCapturedAt"=GREATEST(l."lastCapturedAt",x.through),
         "lastDeliveredAt"=CASE WHEN x.delivered THEN GREATEST(l."lastDeliveredAt",x.through) ELSE l."lastDeliveredAt" END,
         "shortGapFrom"=x."shortFrom","shortGapTo"=x."shortTo","updatedAt"=$2
@@ -214,25 +227,20 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
       // uncovered interval creates debt. A running traversal has a frozen
       // target; repeated heartbeats must not move it or multiply its jobs.
       // Completed watermarks survive intent retention and service restarts.
-      // A proved short interruption also needs eventual repair: fresh later
-      // capture cannot erase it. After one hour of age repair its fixed end,
-      // rather than turning continuous healthy capture into recurring scans.
+      // Eligibility measures outage duration, not the age of an earlier short
+      // interruption. Healthy acquisition must not manufacture hourly debt.
       const gaps=await db.$queryRawUnsafe(`/* api_ready_recovery_debt_v1 */
-        SELECT l."creatorId",s.stream,g."gapFrom",
-          CASE WHEN c."coveredAt"<=($4::timestamptz AT TIME ZONE 'UTC')-($5::bigint*interval '1 millisecond')
-            THEN ($4::timestamptz AT TIME ZONE 'UTC') ELSE l."shortGapTo" END AS "targetAt"
+        SELECT l."creatorId",s.stream,c."coveredAt" AS "gapFrom",
+          ($4::timestamptz AT TIME ZONE 'UTC') AS "targetAt"
         FROM "CreatorLiveSync" l CROSS JOIN unnest($3::text[]) s(stream)
         LEFT JOIN "CreatorEarningsLedgerProof" p ON p."creatorId"=l."creatorId" AND p."agencyId"=l."agencyId"
         LEFT JOIN "CreatorRecoveryWatermark" w ON w."creatorId"=l."creatorId" AND w.stream=s.stream
-        CROSS JOIN LATERAL (SELECT GREATEST(COALESCE(l."lastCapturedAt",p."throughAt"),w."throughAt") AS "coveredAt") c
-        CROSS JOIN LATERAL (SELECT LEAST(c."coveredAt",CASE WHEN l."shortGapTo">COALESCE(
-          GREATEST(w."throughAt",CASE WHEN s.stream='financial' THEN p."throughAt" END),'-infinity'::timestamp)
-          THEN GREATEST(l."shortGapFrom",w."throughAt",CASE WHEN s.stream='financial' THEN p."throughAt" END)
-          END) AS "gapFrom") g
+        CROSS JOIN LATERAL (SELECT GREATEST(l."lastCapturedAt",w."throughAt",
+          CASE WHEN s.stream='financial' THEN p."throughAt" END) AS "coveredAt") c
         WHERE l."agencyId"=$1 AND l."creatorId"=ANY($2::text[])
-          AND g."gapFrom"<=($4::timestamptz AT TIME ZONE 'UTC')-($5::bigint*interval '1 millisecond')
+          AND c."coveredAt"<=($4::timestamptz AT TIME ZONE 'UTC')-($5::bigint*interval '1 millisecond')
           AND NOT EXISTS(SELECT 1 FROM "CreatorRecoveryIntent" i WHERE i."creatorId"=l."creatorId"
-            AND i.stream=s.stream AND i.status<>'COMPLETE')
+            AND i.stream=s.stream AND i.status<>'COMPLETE' AND i."targetAt">=c."coveredAt")
         ORDER BY l."creatorId",s.stream`,agencyId,readyIds,STREAMS,now,OFFLINE_GAP_MS);
       for(const gap of gaps) {
         const from=date(gap.gapFrom),through=date(gap.targetAt),reason="OFFLINE_GAP";
@@ -351,6 +359,17 @@ async function acceptDelivery({
 }
 
 async function pendingRecovery(db, creatorId, stream) {
+  // The owning job is also the retry/checkpoint authority. A terminal job may
+  // have been written by an older server without closing its intent; adopt that
+  // outcome once, never allocate a fresh generation on the next heartbeat.
+  await db.$executeRawUnsafe(`UPDATE "CreatorRecoveryIntent" i SET status='STOPPED',
+    "stoppedAt"=COALESCE(i."stoppedAt",j."completedAt",clock_timestamp()),
+    "lastError"=COALESCE(j."lastError",'RECOVERY_JOB_TERMINAL'),
+    "failedAttempts"=GREATEST(i."failedAttempts",j.attempts),"updatedAt"=clock_timestamp()
+    FROM "JobInstance" j WHERE i."creatorId"=$1 AND i.stream=$2 AND i.status IN ('PENDING','RUNNING')
+      AND j.id=i."jobId" AND j.status IN ('FAILED','CANCELLED')
+      AND NOT (j."jobKey"='subscriber_directory_scan' AND EXISTS(SELECT 1 FROM "SubscriberScanRun" run
+        WHERE run."jobId"=j.id AND run."hasMore"=false AND run."fanProjectionStatus"='COMPLETE'))`,creatorId,stream);
   const rows = await db.$queryRawUnsafe(
     `SELECT * FROM "CreatorRecoveryIntent" WHERE "creatorId"=$1 AND stream=$2 AND status IN ('PENDING','RUNNING') ORDER BY "targetAt",id LIMIT 1`,
     creatorId,
@@ -362,59 +381,97 @@ function recoveryParams(intent) {
   return {
     syncPolicyVersion: POLICY_VERSION,
     recoveryIntentId: intent.id,
+    recoveryGapFrom: new Date(intent.gapFrom).toISOString(),
     recoveryTargetAt: new Date(intent.targetAt).toISOString(),
     collectionReason: intent.reason,
     reason: intent.reason,
   };
 }
+async function independentRecoveryAfterStop(db, { creatorId, stream, intentId, sourceJobId }) {
+  if (!intentId || !sourceJobId) return false;
+  const rows = await db.$queryRawUnsafe(`SELECT next.id FROM "CreatorRecoveryIntent" next
+    JOIN "CreatorRecoveryIntent" stopped ON stopped."creatorId"=next."creatorId" AND stopped.stream=next.stream
+    JOIN "CreatorLiveSync" live ON live."creatorId"=next."creatorId"
+    WHERE next.id=$1 AND next."creatorId"=$2 AND next.stream=$3 AND next.status='PENDING' AND next."jobId" IS NULL
+      AND stopped."jobId"=$4 AND stopped.status='STOPPED' AND next."gapFrom">stopped."targetAt"
+      AND live."lastCapturedAt">=next."gapFrom" LIMIT 1`,intentId,creatorId,stream,sourceJobId);
+  return rows.length > 0;
+}
 async function bindRecovery(db, intent, jobId) {
   if (!jobId) return;
-  await db.$executeRawUnsafe(
-    `UPDATE "CreatorRecoveryIntent" SET "jobId"=$2,status='RUNNING',"updatedAt"=clock_timestamp() WHERE id=$1 AND status<>'COMPLETE'`,
+  const bound = await db.$queryRawUnsafe(
+    `UPDATE "CreatorRecoveryIntent" SET "jobId"=$2,status='RUNNING',"updatedAt"=clock_timestamp()
+      WHERE id=$1 AND ((status='PENDING' AND "jobId" IS NULL) OR (status='RUNNING' AND "jobId"=$2)) RETURNING id`,
     intent.id,
     jobId
   );
+  if (!bound.length) throw error("LIVE_RECOVERY_EPISODE_ALREADY_OWNED");
 }
-async function completeRecovery(db, job, successful, { deferPlanningWake = false } = {}) {
+async function stopRecovery(db, job, failure, { attempts = job.attempts, now = new Date() } = {}) {
+  if (!job.params?.recoveryIntentId) return;
+  await db.$executeRawUnsafe(`UPDATE "CreatorRecoveryIntent" SET status='STOPPED',"stoppedAt"=COALESCE("stoppedAt",$4),
+    "lastError"=$5,"failedAttempts"=GREATEST("failedAttempts",$6),"updatedAt"=$4
+    WHERE id=$1 AND "creatorId"=$2 AND "jobId"=$3 AND status IN ('PENDING','RUNNING')`,
+    job.params.recoveryIntentId,job.creatorId,job.id,now,String(failure?.code || failure?.message || failure || "RECOVERY_STOPPED").slice(0,2000),
+    Math.max(0,Number(attempts)||0));
+}
+async function completeRecovery(db, job, successful, { deferPlanningWake = false, coveredThrough } = {}) {
   const id = job.params?.recoveryIntentId;
   if (!successful) return;
   const stream = JOB_STREAM[job.jobKey];
-  if (!id) {
-    if (
-      job.jobKey === "financial_transactions_scan" &&
-      job.params?.collectionMode === "full" &&
-      job.params?.earningsLedgerVersion === 1
-    ) {
-      await db.$executeRawUnsafe(
-        `UPDATE "CreatorRecoveryIntent" SET status='COMPLETE',"completedAt"=clock_timestamp(),"updatedAt"=clock_timestamp()
-        WHERE "creatorId"=$1 AND stream='financial' AND status<>'COMPLETE' AND "targetAt"<=$2`,
-        job.creatorId,
-        new Date(job.params.collectionRequestedAt)
-      );
-      await compactRecoveryAuthority(db, job.creatorId);
-      await wakeRemainingRecovery(db, job, { deferPlanningWake });
-    }
-    return;
-  }
-  const rows = await db.$queryRawUnsafe(
+  if (!stream) return;
+  const listStream = ["subscribers","campaigns"].includes(stream);
+  // The requested recovery target is an obligation, never evidence that the
+  // source reached it. Ordered sources need their actual upper bound; a full
+  // unordered-list pass covers its persisted start snapshot. Explicit invalid
+  // evidence must not silently fall back to another timestamp.
+  const sourceThrough = coveredThrough !== undefined ? coveredThrough
+    : listStream ? job.params?.collectionRequestedAt ?? job.createdAt ?? job.scheduledAt
+      : stream === "financial" ? job.params?.endDate : job.params?.to;
+  let through = date(sourceThrough);
+  const listSnapshot = listStream ? through : null;
+  let from = ["subscribers","campaigns"].includes(stream) || job.params?.collectionMode === "full"
+    || job.params?.notificationMode === "full" ? null : date(job.params?.recoveryGapFrom);
+  if (id) {
+    if (!through) throw error("LIVE_RECOVERY_COVERAGE_REQUIRED");
+    const target = date(job.params?.recoveryTargetAt);
+    if (through && target && through < target) throw error("LIVE_RECOVERY_COVERAGE_INCOMPLETE");
+    const rows = await db.$queryRawUnsafe(
     `UPDATE "CreatorRecoveryIntent" SET status='COMPLETE',"completedAt"=clock_timestamp(),"updatedAt"=clock_timestamp()
-    WHERE id=$1 AND "agencyId"=$2 AND "creatorId"=$3 AND stream=$4 AND "jobId"=$5 AND "policyVersion"=$6 RETURNING "targetAt"`,
+    WHERE id=$1 AND "agencyId"=$2 AND "creatorId"=$3 AND stream=$4 AND "jobId"=$5 AND "policyVersion"=$6
+      AND status IN ('RUNNING','STOPPED','COMPLETE') AND "targetAt"<=$7::timestamp RETURNING "targetAt","gapFrom"`,
     id,
     job.agencyId,
     job.creatorId,
     stream,
     job.id,
-    POLICY_VERSION
+    POLICY_VERSION,
+    // Source boundaries are UTC instants stored in TIMESTAMP columns. Prisma
+    // sends Date parameters as timestamptz; casting those through a non-UTC
+    // database session would shift the immutable coverage boundary.
+    through.toISOString()
   );
-  if (!rows.length) throw error("LIVE_RECOVERY_COMPLETION_SCOPE_MISMATCH");
-  // Coalesce only unstarted debt covered by this exact published traversal.
+    if (!rows.length) throw error("LIVE_RECOVERY_COMPLETION_SCOPE_MISMATCH");
+    through = date(rows[0].targetAt);
+    // Unordered lists require a complete pass. Its immutable start snapshot
+    // also covers older queued gaps, even when bound to the oldest episode.
+    if (listSnapshot && listSnapshot > through) through = listSnapshot;
+    if (!["subscribers","campaigns"].includes(stream) && job.params?.collectionMode !== "full") from = date(rows[0].gapFrom);
+  }
+  if (!through) return;
+  // A full traversal already covers debt queued while it was waiting to run.
+  // Settle every covered episode, including an unlinked initial/manual scan;
+  // later targets remain explicit unfinished work and are never moved forward.
   await db.$executeRawUnsafe(
     `UPDATE "CreatorRecoveryIntent" SET status='COMPLETE',"completedAt"=clock_timestamp(),"updatedAt"=clock_timestamp()
-    WHERE "creatorId"=$1 AND stream=$2 AND status='PENDING' AND "targetAt"<=$3`,
+    WHERE "creatorId"=$1 AND stream=$2 AND status<>'COMPLETE' AND "targetAt"<=$3::timestamp
+      AND ($4::timestamp IS NULL OR "gapFrom">=$4::timestamp)`,
     job.creatorId,
     stream,
-    rows[0].targetAt
+    through.toISOString(), from?.toISOString() || null
   );
+  await db.$executeRawUnsafe(`INSERT INTO "CreatorRecoveryWatermark"("creatorId",stream,"throughAt") VALUES($1,$2,$3::timestamp)
+    ON CONFLICT("creatorId",stream) DO UPDATE SET "throughAt"=GREATEST("CreatorRecoveryWatermark"."throughAt",EXCLUDED."throughAt")`,job.creatorId,stream,through.toISOString());
   await compactRecoveryAuthority(db, job.creatorId);
   await wakeRemainingRecovery(db, job, { deferPlanningWake });
 }
@@ -456,6 +513,8 @@ module.exports = {
   acceptDelivery,
   pendingRecovery,
   recoveryParams,
+  independentRecoveryAfterStop,
   bindRecovery,
+  stopRecovery,
   completeRecovery,
 };

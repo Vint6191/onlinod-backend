@@ -12,6 +12,9 @@ require.cache[schedulerModule] = {
   loaded: true,
   exports: { scheduleJobNow: async () => { throw new Error("not used in this test"); } },
 };
+const publications = [];
+const publishModule = require.resolve("./media-entity-change-service");
+require.cache[publishModule] = { exports: { publishMediaResult: async input => { publications.push(input); } } };
 delete require.cache[require.resolve("./vault-unsorted-service")];
 const {
   applyVaultUnsortedChunk,

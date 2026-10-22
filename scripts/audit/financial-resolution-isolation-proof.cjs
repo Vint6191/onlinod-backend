@@ -29,7 +29,7 @@ const deadline = setTimeout(() => { console.error("FINANCIAL_RESOLUTION_PROOF_DE
       for (const other of batch.items.filter(row => row.id !== item.id)) await work.yieldDomainWorkClaim({ db, item: other, ownerToken: batch.ownerToken, availableAt: new Date(+now + 3600000) });
       return { db, item, ownerToken: batch.ownerToken };
     }
-    async function scenario(name, { mismatch = false, missingNet = false, runningDebt = false } = {}) {
+    async function scenario(name, { mismatch = false, missingNet = false, runningDebt = false, emptySource = false } = {}) {
       const s = await scope(db, { agencyId: name + "-agency", creatorId: name + "-creator", userId: name + "-user" });
       const deviceId = name + "-device", transactionId = name + "-money", observationId = name + "-observation";
       await db.agency.update({ where: { id: s.agencyId }, data: { trialEndsAt: new Date(+now + 86400000) } });
@@ -47,7 +47,7 @@ const deadline = setTimeout(() => { console.error("FINANCIAL_RESOLUTION_PROOF_DE
       });
       const planned = await resolver.processRequest(await claimRequest(s.creatorId)); assert(planned.created);
       const claimed = await lease.claimJob({ userId: s.userId, deviceId, jobKeys: ["financial_transactions_scan"],
-        capabilities: { creatorEventDrivenSyncV2: true, financialWindowReceiptsV1: true, financialMoneyResolutionV1: true } });
+        capabilities: { creatorEventDrivenSyncV2: true, financialWindowReceiptsV1: true, financialMoneyResolutionV1: true, financialTraversalV2: true } });
       assert.equal(claimed.job.id, planned.jobId);
       const job = await db.jobInstance.findUnique({ where: { id: planned.jobId } }), window = job.params.financialWindows[0];
       assert.equal(window.kind, "RESOLUTION"); assert.equal(Date.parse(window.to) - Date.parse(window.from), 3600000);
@@ -70,21 +70,21 @@ const deadline = setTimeout(() => { console.error("FINANCIAL_RESOLUTION_PROOF_DE
       const request = await db.creatorMoneyResolutionRequest.findUnique({ where: { creatorId: s.creatorId } });
       const providerRow = { id: transactionId, amount: 10, ...(missingNet ? {} : { net: 8 }), fee: 2, status: "done",
         createdAt: eventAt.toISOString(), descriptionDetails: { type: "tip" }, user: { id: "42" } };
-      const chart = { total: { gross: mismatch ? 20 : 10, total: mismatch ? 16 : 8, count: mismatch ? 2 : 1 } };
+      const chart = { total: { gross: emptySource ? 57 : mismatch ? 20 : 10, total: emptySource ? 45.6 : mismatch ? 16 : 8, count: emptySource ? 3 : mismatch ? 2 : 1 } };
       const providerCalls = [];
       let checkpoint = claimed.job.continuation ?? null;
       const credentials = { jobId: job.id, userId: s.userId, deviceId, leaseToken: claimed.job.leaseToken, leaseRevision: claimed.job.leaseRevision };
       for (let page = 0; page < 2; page++) {
         const step = desktop ? await desktop.handler.runChunk({ job, creatorId: s.creatorId,
           continuation: checkpoint?.jobContinuation ?? null, signal: new AbortController().signal,
-          ofApi: { request: async request => { providerCalls.push(request); return { ok: true, data: page ? chart : { list: [providerRow], hasMore: false } }; } } }) : {
+          ofApi: { request: async request => { providerCalls.push(request); return { ok: true, data: page ? chart : { list: emptySource ? [] : [providerRow], hasMore: false } }; } } }) : {
           outcome: page ? "done" : "continue", progress: { percent: page ? 100 : 0 }, chunkResult: page ? {
             kind: "financial_chart_total", collectorVersion: receipts.COLLECTOR, scanRunId: job.params.collectionGeneration, windowIndex: 0,
             category: "total", rangeFrom: window.from, rangeTo: window.to, grossCents: chart.total.gross * 100,
             netCents: chart.total.total * 100, transactionsCount: chart.total.count,
           } : { kind: "financial_transactions_page", collectorVersion: receipts.COLLECTOR, scanRunId: job.params.collectionGeneration,
-            windowIndex: 0, pageNumber: 1, markerStart: window.initialMarker, markerEnd: null, rawReceived: 1, scannerRejected: 0,
-            duplicateRows: 0, sourceHasMore: false, transactions: [{ externalTransactionId: transactionId, transactionType: "tip", amountCents: 1000,
+            windowIndex: 0, pageNumber: 1, markerStart: window.initialMarker, markerEnd: null, rawReceived: emptySource ? 0 : 1, scannerRejected: 0,
+            duplicateRows: 0, sourceHasMore: false, transactions: emptySource ? [] : [{ externalTransactionId: transactionId, transactionType: "tip", amountCents: 1000,
               netCents: missingNet ? null : 800, feeCents: 200, currency: "USD", transactionStatus: "done", occurredAt: eventAt.toISOString(), fanOnlyFansUserId: "42" }] } };
         if (page === 0) {
           await db.creatorMoneyResolutionRequest.update({ where: { creatorId: s.creatorId }, data: { jobId: normal.id } });
@@ -117,6 +117,7 @@ const deadline = setTimeout(() => { console.error("FINANCIAL_RESOLUTION_PROOF_DE
       assert.equal(proof.activeGeneration, name + "-base"); assert.equal(+proof.fromAt, +fromAt); assert.equal(+proof.throughAt, +baselineAt);
       const observation = await db.creatorMoneyObservation.findUnique({ where: { id: observationId } });
       const detail = diagnostics((await db.jobInstance.findUnique({ where: { id: job.id } })).result.completionSideEffect);
+      if (emptySource) { assert.deepEqual(detail.windows[0].observed, { count: 0, grossCents: 0, netCents: 0 }); assert.deepEqual(detail.windows[0].expected, { count: 3, grossCents: 5700, netCents: 4560 }); }
       if (mismatch || missingNet) {
         assert.equal(observation.status, "PENDING"); assert.equal(observation.coveredGeneration, null);
         assert.equal(await db.creatorEarningsGenerationEntry.count({ where: { generation: name + "-base", transactionId } }), 0);
@@ -152,6 +153,7 @@ const deadline = setTimeout(() => { console.error("FINANCIAL_RESOLUTION_PROOF_DE
     await scenario("verified");
     await scenario("chart-mismatch", { mismatch: true });
     await scenario("missing-net", { missingNet: true, runningDebt: true });
+    await scenario("observed-zero-vs-three", { mismatch: true, emptySource: true });
     pass(desktop ? "unchanged Desktop financial handler -> real fenced progress -> receipt/chart -> completion/publication bridge" : "backend progress/completion/publication path; Desktop bridge optional and not executed");
     const report = { ok: true, engine: runtime.native ? "native PostgreSQL" : "PGlite + Prisma; native concurrency not executed", desktopBridge: Boolean(desktop), checks };
     if (process.env.ONLINOD_FINANCIAL_RESOLUTION_REPORT) fs.writeFileSync(process.env.ONLINOD_FINANCIAL_RESOLUTION_REPORT, JSON.stringify(report, null, 2));

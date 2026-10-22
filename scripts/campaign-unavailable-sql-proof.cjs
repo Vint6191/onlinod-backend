@@ -138,9 +138,9 @@ async function main() {
     } while (step.outcome !== 'done');
     await jobPost('complete', { result: step.result, progress: step.progress });
     assert.equal((await db.jobInstance.findUnique({ where: { id: job.id } })).status, 'DONE');
-    assert.equal(chunks, 3); assert.equal(calls, 14); assert.equal(step.result.unavailable, 12); assert.equal(step.result.errors, 0);
+    assert.equal(chunks, 2); assert.equal(calls, 14); assert.equal(step.result.unavailable, 12); assert.equal(step.result.errors, 0);
     const state = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: s.creatorId } });
-    assert.equal(state.status, 'COMPLETE'); assert.equal(state.fanValueFreshnessStatus, 'COMPLETE');
+    assert.equal(state.status, 'PARTIAL'); assert.equal(state.fanValueFreshnessStatus, 'PARTIAL');
     assert.equal(state.fanValueSucceeded, 2); assert.equal(state.fanValueUnavailable, 12);
     assert.equal(state.fanValueOutstanding, 0); assert.equal(state.fanValueFailed, 0);
     const demands = await db.creatorFanRefreshDemand.findMany({ where: { creatorId: s.creatorId } });
@@ -170,12 +170,13 @@ async function main() {
     const view = await viewResponse.json(); assert.equal(viewResponse.status, 200, JSON.stringify(view));
     assert.equal(view.fanValuesOutstanding, 0); assert.equal(view.fanValuesFailed, 0);
     assert.equal(view.refreshRecoveryAvailable, false);
-    assert.equal(view.campaignPage.sourceCoverage.fanValues.status, 'FRESH');
+    assert.equal(view.campaignPage.sourceCoverage.fanValues.status, 'PARTIAL');
+    assert.equal(view.campaignPage.sourceCoverage.fanValues.unknownFans, 12);
     assert.equal(view.campaignPage.totals.ofValueKnownFans, 2);
     assert.equal(view.campaignPage.totals.ofValueUnknownFans, 12);
     assert.equal(view.campaignPage.totals.platformReportedFanSpendCents, null);
     assert.equal(unhandled.length, 0);
-    console.log('PASS campaign quarantine -> explicit repair -> real read lease/token -> emitted Desktop -> HTTP progress replay -> SQL coverage COMPLETE');
+    console.log('PASS campaign quarantine -> explicit repair -> real read lease/token -> emitted Desktop -> HTTP progress replay -> SQL coverage PARTIAL');
     console.log(JSON.stringify({ chunks, providerCalls: calls, succeeded: state.fanValueSucceeded, unavailable: state.fanValueUnavailable,
       outstanding: state.fanValueOutstanding, failed: state.fanValueFailed, preservedPriorCents: '9876', missingArrivalDates: 14,
       campaignViewFanStatus: view.campaignPage.sourceCoverage.fanValues.status, recoveryAvailable: view.refreshRecoveryAvailable }));

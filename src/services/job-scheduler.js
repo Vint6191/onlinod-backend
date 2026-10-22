@@ -420,11 +420,9 @@ async function scheduleInitialJobsForCreator({
     });
   }
 
-  // Creator Analytics bootstrap owns the creator background-read lane until its
-  // strict Notifications -> Financial -> Campaigns history sequence is proven.
-  // The recurring scheduler can delegate the actual Analytics planning to its
-  // distributed sweep, but it still gates unrelated creator-wide scans on the
-  // proven bootstrap state so the old lane-ownership invariant is preserved.
+  // Initial collectors retain independent progress and outcomes. Their claim
+  // priorities choose the first turn; a slow or stopped source must not hide
+  // subscriber work behind a global readiness barrier.
   try {
     const {
       ensureInitialCreatorAnalyticsSync,
@@ -457,18 +455,17 @@ async function scheduleInitialJobsForCreator({
         };
         outcomes.push(normalized);
         if (failedTerminal) degraded.push({ work: normalized.work, reason: normalized.reason, created: normalized.created, failures: normalized.failures });
-        return schedulerPlanningResult(created, skipped, degraded, outcomes);
+        if (initial.reason === "missing_scope") return schedulerPlanningResult(created, skipped, degraded, outcomes);
       }
-      outcomes.push({ work: "creator_analytics_initial", outcome: initial.created ? SCHEDULER_OUTCOME.CREATED : SCHEDULER_OUTCOME.NOOP, ok: true, created: Boolean(initial.created), reason: initial.reason || "initial_sync_complete", failures: [] });
+      if (initial.ready) outcomes.push({ work: "creator_analytics_initial", outcome: initial.created ? SCHEDULER_OUTCOME.CREATED : SCHEDULER_OUTCOME.NOOP, ok: true, created: Boolean(initial.created), reason: initial.reason || "initial_sync_complete", failures: [] });
 
     } else {
       const ready = await creatorAnalyticsInitialSyncReady({ db, creatorId, now });
       if (!ready) {
         skipped.push("creator_analytics_initial:waiting:distributed_sweep");
         outcomes.push({ work: "creator_analytics_initial", outcome: SCHEDULER_OUTCOME.WAITING, ok: true, created: false, reason: "distributed_sweep", failures: [] });
-        return schedulerPlanningResult(created, skipped, degraded, outcomes);
       }
-      outcomes.push({ work: "creator_analytics_initial", outcome: SCHEDULER_OUTCOME.NOOP, ok: true, created: false, reason: "initial_sync_complete", failures: [] });
+      if (ready) outcomes.push({ work: "creator_analytics_initial", outcome: SCHEDULER_OUTCOME.NOOP, ok: true, created: false, reason: "initial_sync_complete", failures: [] });
     }
   } catch (err) {
     const reason = err?.code || "creator_analytics_exception";
@@ -484,7 +481,7 @@ async function scheduleInitialJobsForCreator({
 
   // Traffic is derived from the canonical Campaigns collector.
 
-  // Subscriber Directory — one shared weekly source for Hidden Online,
+  // Subscriber Directory — one shared initial/recovery source for Hidden Online,
   // Follow Back candidates and future subscriber-driven modules.
   await executeSchedulerConsumer({
     work: "subscriber_directory_scan",
@@ -648,6 +645,12 @@ async function scheduleJobNow({
   const plannedParams = analyticsCommand
     ? stampCollectionAuthorityParams(params, authorityNow, dedupeParams?.collectionOrderingAfter)
     : params;
+  const financialBoundary = jobKey === "financial_transactions_scan" && plannedParams.financialTraversalVersion === 2
+    ? require("./financial-receipt-authority").date(plannedParams.endDate) : null;
+  // Provider timestamps have second resolution. A frozen millisecond recovery
+  // target is rounded up once; wait for that bound before beginning the read.
+  const plannedNextRunAt = financialBoundary && +financialBoundary > +authorityNow
+    ? financialBoundary : authorityNow;
 
   const planned = await ensurePlannedJob({
     db,
@@ -659,7 +662,7 @@ async function scheduleJobNow({
     params: plannedParams,
     priority,
     scheduledAt: authorityNow,
-    nextRunAt: authorityNow,
+    nextRunAt: plannedNextRunAt,
     shouldResetExisting: (existing) => {
       if (!hasStableDedupe) return !["CLAIMED", "PUBLISHING"].includes(existing.status);
       // Same planning epoch + active row means another replica already owns the

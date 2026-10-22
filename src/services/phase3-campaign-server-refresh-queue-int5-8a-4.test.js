@@ -185,7 +185,7 @@ test("INT5.8A-4 source retains server-refresh compatibility while current Campai
   assert.match(ledger, /"campaigns-v8", "campaigns-v9", "campaigns-v10", "campaigns-v11", "campaigns-v12", CAMPAIGN_COLLECTOR_VERSION/);
   assert.match(ledger, /enqueueUniqueCampaignFanRefreshes/);
   assert.match(ledger, /CAMPAIGN_SERVER_REFRESH_COLLECTOR_VERSIONS\.has\(payload\.collectorVersion\)/);
-  assert.match(ledger, /valueCurrent: \{ select: \{ valueObservedAt: true \} \}/);
+  assert.match(ledger, /valueCurrent: \{ select: \{ valueObservedAt: true, availability: true, platformReportedTotalSpendCents: true \} \}/);
   assert.match(schema, /model CreatorCampaignFanRefreshWork/);
   assert.match(schema, /@@unique\(\[creatorId, scanRunId, onlyFansUserId\]/);
   assert.match(route, /campaignServerFanRefreshV1/);
