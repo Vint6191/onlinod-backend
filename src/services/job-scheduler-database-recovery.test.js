@@ -10,6 +10,11 @@ function result(kind, fallback = healthy) {
   return failures[kind] || fallback;
 }
 const db = { creatorAccount: { findFirst: async () => ({ id: "creator", agencyId: "agency", status: "READY" }) } };
+// These scheduling fixtures model stages that have already released independent work.
+cache("./initial-collection-readiness-service", {
+  loadInitialCollectionAdmission: async ({ creatorIds }) => new Map(creatorIds.map(id => [id, { financialReleased: true, campaignsReleased: true }])),
+  initialCollectionAdmission: () => ({ admitted: true }),
+});
 cache("../prisma", db);
 cache("./analytics-recurring-planning-service", { planRecurringCreatorAnalytics: async () => result("analytics", { created: 0, skipped: 0 }) });
 cache("./creator-analytics-sync-orchestrator", { creatorAnalyticsInitialSyncReady: async () => result("bootstrap", true) });

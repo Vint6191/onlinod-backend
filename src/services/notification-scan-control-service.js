@@ -195,7 +195,7 @@ function normalizeAuditRow(row, index, verifiedSource=false) {
   if (factType && !["PURCHASE", "TIP", "SUBSCRIPTION", "LIKE", "COMMENT"].includes(factType)) {
     throw new Error(`Notification scan item ${index} has invalid factType`);
   }
-  const page = integer(row?.page, 0, 1_000_000);
+  const page = integer(row?.page, 0, 2_147_483_647);
   const ordinal = integer(row?.ordinal, -1, 99);
   if (page < 1 || ordinal < 0) throw new Error(`Notification scan item ${index} has invalid page/ordinal`);
   const occurredAt = row?.occurredAt ? new Date(row.occurredAt) : null;

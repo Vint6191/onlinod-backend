@@ -114,6 +114,7 @@ async function pendingIdentityMaps({ agencyId, rows, db = prisma }) {
         lastActivityAt: fan.valueCurrent.lastActivityAt || null,
         availability: clean(fan.valueCurrent.availability, 40),
         observedAt: fan.valueCurrent.valueObservedAt || null,
+        fieldAuthority: require("./fan-value-field-authority").valueFieldAuthority(fan.valueCurrent),
         source: clean(fan.valueCurrent.source, 80),
       } : null,
     });

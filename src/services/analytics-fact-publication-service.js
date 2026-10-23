@@ -8,7 +8,7 @@ const { pauseDeletedAgencyProjection } = require("./analytics-projection-lifecyc
 
 const WORK_CLASS = "ANALYTICS_FACT_PUBLICATION";
 const ADOPTION_CLASS = "ANALYTICS_FACT_ADOPTION";
-const ADOPTION_KEY = "analytics_publication_adoption_v1";
+const ADOPTION_KEY = "analytics_publication_adoption_v2";
 const PAGE = 100;
 const TABLES = ["CreatorSale", "CreatorTip", "CreatorSubscriptionEvent", "CreatorPaidSubscription",
   "CreatorPostLike", "CreatorPostComment", "CreatorFinancialTransaction", "CreatorMessagesDaily"];
@@ -38,7 +38,7 @@ function financialType(value) {
 // Fixed-size dimension vocabulary; unknown provider types cannot grow a day
 // JSON object with arbitrarily many keys. Monetary sums retain their sign.
 function contribution(kind, row) {
-  if (!row || (kind === "CreatorMessagesDaily" && row.sourceTimezone !== "UTC")) return null;
+  if (!row || (["CreatorSale", "CreatorTip", "CreatorFinancialTransaction"].includes(kind) && ["unverified", "superseded"].includes(row.transactionStatus)) || (kind === "CreatorMessagesDaily" && row.sourceTimezone !== "UTC")) return null;
   const time = row.purchasedAt || row.tippedAt || row.occurredAt || row.paidAt || row.likedAt || row.commentedAt || row.date;
   const utc = typeof time === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?$/.test(time) ? time + "Z" : time;
   const date = new Date(utc);
@@ -46,12 +46,14 @@ function contribution(kind, row) {
   const values = {}, members = [];
   const set = (key, value = 1) => add(values, key, value);
   if (kind === "CreatorSale") {
-    set("salesCount"); set("salesCents", row.amountCents); set("totalObservedRevenueCents", row.amountCents);
+    set("salesCount"); if (row.amountCents == null) { set("salesGrossUnknown"); set("observedRevenueUnknown"); }
+    else { set("salesCents", row.amountCents); set("totalObservedRevenueCents", row.amountCents); }
     if (row.saleType === "MESSAGE") set("messageSales");
     if (row.saleType === "POST") set("postSales");
     if (row.fanId) members.push(["uniqueBuyers", row.fanId]);
   } else if (kind === "CreatorTip") {
-    set("tipsCount"); set("tipsCents", row.amountCents); set("totalObservedRevenueCents", row.amountCents);
+    set("tipsCount"); if (row.amountCents == null) { set("tipsGrossUnknown"); set("observedRevenueUnknown"); }
+    else { set("tipsCents", row.amountCents); set("totalObservedRevenueCents", row.amountCents); }
   } else if (kind === "CreatorPaidSubscription") {
     set("paidSubscriptions"); set("paidSubscriptionsCents", row.amountCents); set("totalObservedRevenueCents", row.amountCents);
   } else if (kind === "CreatorPostLike" || kind === "CreatorPostComment") {
@@ -70,7 +72,8 @@ function contribution(kind, row) {
   } else if (kind === "CreatorFinancialTransaction") {
     const status = ["undo", "loading"].includes(String(row.transactionStatus).trim().toLowerCase()) ? String(row.transactionStatus).trim().toLowerCase() : "settled";
     const prefix = `financial:${financialType(row.transactionType)}:${status}:`;
-    set(prefix + "count"); set(prefix + "amount", row.amountCents); set(prefix + "net", row.netCents);
+    set(prefix + "count"); if (row.amountCents == null) set(prefix + "grossUnknown"); else set(prefix + "amount", row.amountCents);
+    if (row.netCents == null) set(prefix + "netUnknown"); else set(prefix + "net", row.netCents);
   } else if (kind === "CreatorMessagesDaily") {
     for (const key of ["incomingMessages", "outgoingMessages", "uniqueDialogs"]) set(key, row[key]);
   } else throw fault("ANALYTICS_FACT_KIND_INVALID");
@@ -180,7 +183,8 @@ async function enumerateAdoption({ db }) {
     for (const row of [...rows].sort((a, b) => a.agencyId.localeCompare(b.agencyId) || a.id.localeCompare(b.id))) {
       await lockAgencyLifecycleBarrier({ db: tx, agencyId: row.agencyId });
       const identity = { agencyId: row.agencyId, creatorId: row.id, workClass: ADOPTION_CLASS, objectType: "CreatorAccount", objectId: row.id, partitionKey: row.id };
-      if (!await tx.domainWorkItem.findUnique({ where: { id: work.workId(identity) }, select: { id: true } })) await work.publishDomainWork({ db: tx, ...identity });
+      const prior = await tx.domainWorkItem.findUnique({ where: { id: work.workId(identity) }, select: { progressCursor: true } });
+      if (prior?.progressCursor?.financialRepairVersion !== 172) await work.publishDomainWork({ db: tx, ...identity });
     }
     const complete = rows.length < 10 || rows.at(-1)?.id === cursor.upperId;
     await tx.maintenanceLaneState.update({ where: { key: ADOPTION_KEY }, data: { cursor: { ...cursor, afterId: rows.at(-1)?.id || cursor.afterId }, completedAt: complete ? new Date() : null, lastOutcome: complete ? "ENUMERATED" : "ENUMERATING" } });
@@ -199,7 +203,27 @@ async function processAdoption({ db, item, ownerToken }) {
       owned(await work.ackDomainWorkClaim({ db: tx, item, ownerToken, terminalCause: "CREATOR_RETIRED" }));
       return { completed: true, processed: 0 };
     }
-    const cursor = item.progressCursor || {}, table = cursor.table || 0;
+    const cursor = item.progressCursor || {};
+    if (cursor.financialRepairVersion !== 172) {
+      // Financial delivery takes earnings -> facts -> Work. Busy ownership
+      // yields without waiting while holding the inverse Work lock order.
+      if (!await require("./earnings-generation-service").tryLock(tx, item.creatorId)) {
+        owned(await work.yieldDomainWorkClaim({ db: tx, item, ownerToken, availableAt: new Date(Date.now() + 1000) }));
+        return { waiting: true, processed: 0 };
+      }
+      const repair = await require("./financial-legacy-repair-service").repairPage({ db: tx, agencyId: item.agencyId,
+        creatorId: item.creatorId, afterId: cursor.financialRepairAfterId || "", now: await require("./db-time-authority-service").dbAuthorityNow({ db: tx }) });
+      owned(await work.lockDomainWorkClaimForCommit({ db: tx, item, ownerToken }));
+      if (repair.waiting) {
+        owned(await work.yieldDomainWorkClaim({ db: tx, item, ownerToken, availableAt: new Date(Date.now() + 1000) }));
+        return repair;
+      }
+      const next = repair.complete ? { financialRepairVersion: 172, table: 0, afterId: "" }
+        : { financialRepairAfterId: repair.afterId };
+      owned(await work.yieldDomainWorkClaim({ db: tx, item, ownerToken, progressCursor: next }));
+      return { yielded: true, ...repair, completed: false };
+    }
+    const table = cursor.table || 0;
     if (!Number.isInteger(table) || table < 0 || table >= TABLES.length) throw fault("ANALYTICS_ADOPTION_CURSOR_INVALID");
     // Lock source before staging, as live writers do. Adoption never overwrites
     // a newer staged value; historical and live publications cannot double-add.
@@ -214,7 +238,7 @@ async function processAdoption({ db, item, ownerToken }) {
       return { completed: true, processed: 0 };
     }
     if (claim.newerRevision) throw fault("ANALYTICS_ADOPTION_REPUBLISHED");
-    const next = rows.length === PAGE ? { table, afterId: rows.at(-1).id } : { table: table + 1, afterId: "" };
+    const next = rows.length === PAGE ? { ...cursor, table, afterId: rows.at(-1).id } : { ...cursor, table: table + 1, afterId: "" };
     if (next.table < TABLES.length) {
       owned(await work.yieldDomainWorkClaim({ db: tx, item, ownerToken, progressCursor: next }));
       return { yielded: true, processed: rows.length };

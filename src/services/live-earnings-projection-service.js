@@ -24,7 +24,6 @@ function exactMoney(event) {
     typeof raw.transactionId !== "string" ||
     !/^[A-Za-z0-9_-]{1,180}$/.test(raw.transactionId) ||
     !occurredAt ||
-    !safe(raw.amountCents) ||
     !safe(raw.netCents) ||
     raw.currency !== "USD" ||
     !status(raw.status) ||
@@ -33,7 +32,7 @@ function exactMoney(event) {
     raw.transactionType.length > 80
   )
     return null;
-  return { ...raw, transactionType: normalizeTransactionType(raw.transactionType), occurredAt, revisionAt };
+  return { ...raw, amountCents: safe(raw.amountCents) ? raw.amountCents : null, transactionType: normalizeTransactionType(raw.transactionType), occurredAt, revisionAt };
 }
 
 async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedAt, capturedTimes = null, now }) {
@@ -72,6 +71,7 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
       const changed =
         previous &&
         (Number(previous.netCents) !== money.netCents ||
+          (previous.grossCents == null ? null : Number(previous.grossCents)) !== money.amountCents ||
           previous.status !== money.status ||
           +previous.occurredAt !== +money.occurredAt ||
           previous.category !== categoryFor(money.transactionType));
@@ -79,7 +79,7 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
       else if (changed && +observedAt === +previous.observedAt) reason = "TRANSACTION_REVISION_CONFLICT";
       else if (!previous || +observedAt >= +previous.observedAt) {
         await generation.writeLive(db, {agencyId, creatorId}, {
-          transactionId: money.transactionId, occurredAt: money.occurredAt, netCents: money.netCents,
+          transactionId: money.transactionId, occurredAt: money.occurredAt, netCents: money.netCents, grossCents: money.amountCents,
           status: money.status, observedAt, category: categoryFor(money.transactionType),
         });
         await require("./financial-transactions-service").ingestExactLiveTransaction({

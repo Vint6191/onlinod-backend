@@ -1,0 +1,57 @@
+name: Recovery closure and upgrade PostgreSQL gate
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  recovery-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: actual-upgrade
+            proof: scripts/audit/recovery172-upgrade-proof.cjs
+          - name: financial-authority
+            proof: scripts/audit/financial-display-authority172-proof.cjs
+          - name: fan-components
+            proof: scripts/audit/fan-data-component-closure-proof.cjs
+          - name: media-corrections
+            proof: scripts/audit/media-financial-corrections-proof.cjs
+          - name: event-identity-batch
+            proof: scripts/audit/event-fan-identity-batch-scale-proof.cjs
+          - name: initial-stage-claim
+            proof: scripts/audit/initial-stage-claim172-proof.cjs
+          - name: initial-campaign-readiness
+            proof: scripts/audit/initial-campaign-readiness172-proof.cjs
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: fixture-only
+          POSTGRES_DB: onlinod_test_recovery172
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Actual source, migration and publication proof
+        run: node "${{ matrix.proof }}" 2>&1 | tee recovery-proof.log
+        env:
+          ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_recovery172
+          ONLINOD_SCALE_ROWS: '50000'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: recovery172-${{ matrix.name }}
+          path: recovery-proof.log

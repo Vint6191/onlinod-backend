@@ -39,9 +39,12 @@ test("Creator Analytics canonical transactions publish exact Team money work ins
   assert.match(notifications, /dispatchTeamMoneyReconciliationForCanonicalFact\(\{ db: tx,[\s\S]*sourceType: "PPV"/);
   assert.match(notifications, /dispatchTeamMoneyReconciliationForCanonicalFact\(\{ db: tx,[\s\S]*sourceType: "TIP"/);
   assert.doesNotMatch(notifications, /reconcileCreatorSalesToTeam|reconcileCreatorTipsToTeam/);
-  assert.match(financial, /const projectedFact = await projectKnownFact\(tx/);
-  assert.match(financial, /dispatchTeamMoneyReconciliationForCanonicalFact\(\{ db: tx,[\s\S]*sourceType: "PPV"/);
-  assert.match(financial, /dispatchTeamMoneyReconciliationForCanonicalFact\(\{ db: tx,[\s\S]*sourceType: "TIP"/);
+  const verifiedPublication = financial.slice(financial.indexOf("async function publishVerifiedFinancialFactsPage"));
+  assert.match(verifiedPublication, /financial-canonical-publication-repository/);
+  const repository = fs.readFileSync(path.join(__dirname, "financial-canonical-publication-repository.js"), "utf8");
+  assert.match(repository, /upsert\(db,table,records/);
+  assert.match(repository, /CreatorSale/); assert.match(repository, /CreatorTip/);
+  assert.match(reconciliation, /triggerOwned: true/);
   assert.doesNotMatch(financial, /reconcileCreatorSaleToTeam\(\{ db: tx|reconcileCreatorTipToTeam\(\{ db: tx/);
 });
 
@@ -70,9 +73,16 @@ test("Team tips bind to CreatorTip and recent chatter timing is evidence-only", 
 });
 
 test("payout undo is excluded from Team PPV money without erasing ownership evidence", () => {
-  assert.match(reconciliation, /REFUND_STATUSES = new Set\(\["undo"\]\)/);
-  assert.match(analytics, /financialStatus:\s*null/);
-  assert.match(analytics, /financialStatus:\s*\{ not: "undo" \}/);
+  const { financiallyActive, activeFinancialWhere, teamFinancialStatus } = require("./team-money-financial-state-service");
+  for (const financialStatus of ["undo", "refund", "refunded", "chargeback", "unverified", "gross_unknown"]) {
+    assert.equal(financiallyActive({ financialStatus }), false, financialStatus);
+    assert.ok(activeFinancialWhere().OR[1].financialStatus.notIn.includes(financialStatus));
+  }
+  assert.equal(financiallyActive({ financialStatus: null }), true, "a notification with known gross remains valid evidence");
+  assert.equal(teamFinancialStatus({ transactionStatus: "done", amountCents: null, netCents: 800 }), "gross_unknown");
+  assert.equal(teamFinancialStatus({ transactionStatus: "done", amountCents: 0 }), "done", "an explicit zero is known");
+  assert.equal(teamFinancialStatus({ transactionStatus: "unverified", amountCents: 1000 }), "unverified");
+  assert.match(analytics, /activeFinancialWhere\(\)/);
   assert.match(analytics, /ppvFinanciallyActive/);
 });
 

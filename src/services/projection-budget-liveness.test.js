@@ -93,7 +93,7 @@ test("Campaign executor drains its owned sibling when recording another item's f
 for (const failBatch of [false, true]) test(`Traffic ${failBatch ? "failed batch is isolated" : "slow claim runs a bounded unit"} before yielding the class`, async t => {
   let clock = 0;
   t.mock.method(performance, "now", () => clock);
-  const acknowledged = [], failed = [], yielded = [], claimed = [];
+  const acknowledged = [], failed = [], yielded = [], claimed = [], publications = [];
   const db = {
     $queryRawUnsafe: async sql => sql.includes('FROM "TrafficProjectionSeed"') ? [{ complete: true }] : sql.includes('FROM "CreatorAccount"') ? [{ id: "creator" }] : [],
     $executeRawUnsafe: async sql => { if (failBatch && sql.includes('onlinod_traffic_project_source_v2')) { clock += 2000; throw Object.assign(Error("bad canonical row"), { code: "23514" }); } return 0; },
@@ -103,6 +103,7 @@ for (const failBatch of [false, true]) test(`Traffic ${failBatch ? "failed batch
     "./agency-lifecycle-barrier-service": { lockAgencyLifecycleBarrier: async () => ({ row: { id: "agency" } }) },
     "./analytics-projection-lifecycle-service": projectionLifecycle,
     "./traffic-projection-authority": { authorizeTrafficExecutor: async () => {}, enterTrafficProjection: async () => {} },
+    "./creator-entity-change-service": { publishEntityChanges: async input => { publications.push(input); return { staged: true }; } },
     "./domain-work-authority-service": {
       claimDomainWorkBatch: async ({ workClass }) => {
         claimed.push(workClass); if (!failBatch) clock += 2000;
@@ -121,6 +122,7 @@ for (const failBatch of [false, true]) test(`Traffic ${failBatch ? "failed batch
     assert.equal(result.ok, false); assert.deepEqual(failed, [["work-0", "23514"]]);
     assert.deepEqual(yielded, ["work-1"], "the remaining reservation is released; one failed page cannot become an eternal healthy yield");
   } else { assert.equal(result.ok, true); assert.deepEqual(acknowledged, ["work-0"]); }
+  assert.equal(publications.length, failBatch ? 0 : 1, "only a completed fenced unit publishes its committed projection");
   assert.equal(result.processed, 1);
 });
 

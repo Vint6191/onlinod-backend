@@ -28,6 +28,26 @@ test('unknown NET cannot be normalized to zero; a known zero stays zero',()=>{
  assert.equal(metricsDto(financialMetrics({...base,netCents:80}),false).netCents,null);
  assert.deepEqual(financialMetrics({...base,transactionStatus:'undo',netCents:80}),{});
 });
+test('quarantined old financial evidence is not confirmed or pending money',()=>{
+ const evidence=financialMetrics({amountCents:1500,netCents:null,transactionType:'tip',transactionStatus:'unverified',reasonCode:'LEGACY_FINANCIAL_UNVERIFIED'});
+ assert.deepEqual(evidence,{unverifiedTransactions:'1'});
+ const dto=metricsDto(evidence);
+ for(const field of ['grossCents','netCents','settledGrossCents','settledNetCents','pendingGrossCents','pendingNetCents','tipsRevenueCents','payingFans'])assert.equal(dto[field],null,field);
+ assert.equal(dto.unverifiedTransactions,1);assert.equal(dto.transactionsCount,0);assert.equal(dto.pendingTransactionsCount,0);
+});
+test('superseded canonical projection retracts the old contribution without creating uncertainty',()=>{
+ const old={amountCents:1000,netCents:800,transactionType:'tip',transactionStatus:'done'};
+ const after=financialMetrics({...old,transactionStatus:'superseded',amountCents:null,netCents:null});
+ assert.deepEqual(after,{});
+ const diff=deltas([{campaignId:'c',fanId:'f',rangeKey:'all',metrics:financialMetrics(old)}],[]);
+ assert.equal(diff[0].metrics.knownNetCents,'-800');assert.equal(metricsDto(after).unverifiedTransactions,0);
+});
+test('verified NET without known gross preserves the NET and masks only gross',()=>{
+ const evidence=financialMetrics({amountCents:null,netCents:800,transactionType:'tip',transactionStatus:'done'});
+ const dto=metricsDto(evidence);assert.equal(dto.netCents,800);assert.equal(dto.tipsRevenueCents,800);
+ assert.equal(dto.grossCents,null);assert.equal(dto.settledGrossCents,null);assert.equal(dto.unknownGrossTransactions,1);
+ assert.doesNotThrow(()=>deltas([],[{campaignId:'c',rangeKey:'all',fanId:'f',metrics:evidence}]));
+});
 test('receipt replay is empty; moving an amount preserves exact cents across identities',()=>{
  const a=[{campaignId:'one',fanId:'fan',rangeKey:'30d',metrics:{knownNetCents:'9007199254740999',transactionsCount:'1'}}];
  assert.deepEqual(deltas(a,a),[]);

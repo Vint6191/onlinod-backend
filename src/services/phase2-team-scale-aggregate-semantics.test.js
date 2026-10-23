@@ -22,7 +22,7 @@ function member() {
   };
 }
 
-function makePrisma({ queryLog }) {
+function makePrisma({ queryLog, moneyEvidence = { hasUnverifiedFinancialFacts: false, hasUnknownGross: false } }) {
   const aggregate = async () => ({});
   return {
     agencyMember: {
@@ -57,6 +57,7 @@ function makePrisma({ queryLog }) {
     async $queryRawUnsafe(sql) {
       queryLog.push(sql);
       if (/clock_timestamp\(\)/.test(sql)) return [{ authorityNow: new Date("2026-09-09T20:00:00.000Z") }];
+      if (/AS "hasUnverifiedFinancialFacts"/.test(sql)) return [moneyEvidence];
       if (/WITH fan_keys AS/.test(sql)) {
         return [{ memberId: "member-a", uniqueFans: 20n, creatorCoverage: 3n }];
       }
@@ -162,6 +163,18 @@ test("audience coverage uses SQL UNION semantics and money-off never references 
   assert.match(audienceSql, /electron_team_v13/);
   assert.doesNotMatch(audienceSql, /TeamMoneyAttributionFact/);
   assert.equal(queryLog.some((sql) => /TeamMoneyAttributionFact/.test(sql)), false, "money OFF must not query money facts anywhere in snapshot");
+});
+
+test("unknown or unverified Team money marks known revenue as partial without destroying its subtotal", async () => {
+  for (const field of ["hasUnverifiedFinancialFacts", "hasUnknownGross"]) {
+    const queryLog = [];
+    const analytics = loadAnalytics(makePrisma({ queryLog, moneyEvidence: { [field]: true } }));
+    const result = await analytics.buildTeamMembers({ agencyId: "agency-1", rangeKey: "30d", includeMoney: true });
+    assert.equal(result.projection.historical.families.money.status, "PARTIAL");
+    assert.equal(result.projection.historical.families.money[field], true);
+    assert.equal(result.members[0].metrics.revenueAttributedCents, 5000);
+    assert.equal(queryLog.filter(sql => /AS "hasUnverifiedFinancialFacts"/.test(sql)).length, 1);
+  }
 });
 
 

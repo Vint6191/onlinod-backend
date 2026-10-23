@@ -93,6 +93,7 @@ function progressSnapshot(progress) {
 }
 
 async function readCreatorCurrentTask({ db = prisma, creatorId }) {
+  const initialCollection = await require("./initial-collection-readiness-service").readInitialCollectionReadiness({ db, creatorId, now: await dbAuthorityNow({ db }) });
   const claimed = await db.jobInstance.findFirst({
     where: { creatorId, status: { in: ["CLAIMED", "PUBLISHING"] } },
     orderBy: [{ lastProgressAt: { sort: "desc", nulls: "last" } }, { priority: "desc" }, { claimedAt: { sort: "desc", nulls: "last" } }],
@@ -101,10 +102,19 @@ async function readCreatorCurrentTask({ db = prisma, creatorId }) {
     where: { creatorId, status: { in: ["PAUSED", "SCHEDULED"] } },
     orderBy: [{ priority: "desc" }, { nextRunAt: "asc" }, { createdAt: "asc" }],
   });
-  if (!job) return { active: false, status: "IDLE", label: "Background runtime ready", progress: { percent: 100, message: null, current: null, total: null } };
+  if (!job) {
+    const problem = initialCollection.sources.find(source => ["STOPPED", "PARTIAL", "VERIFICATION_FAILED"].includes(source.state));
+    return { active: false, status: problem ? "PARTIAL" : initialCollection.ready ? "IDLE" : "WAITING",
+      label: initialCollection.ready ? "Initial data collection complete" : "Initial data collection incomplete",
+      error: problem?.reason || null, initialCollection,
+      progress: { percent: initialCollection.completed / initialCollection.total * 100,
+        message: problem?.reason || (initialCollection.ready ? "Required sources have saved results" : "Waiting for required source results"),
+        current: initialCollection.completed, total: initialCollection.total } };
+  }
   const params = object(job.params);
   const progress = progressSnapshot(job.progress);
   return {
+    initialCollection,
     active: ["CLAIMED", "PUBLISHING", "PAUSED"].includes(job.status),
     id: job.id,
     jobKey: job.jobKey,
@@ -295,9 +305,9 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
   const end = new Date(ledger.range.endAt);
   const eventBetween = { gte: start, lte: end };
 
-  const [creator, financialGroups, campaignPage, financialCollectionState, campaignCollectionState] = await Promise.all([
+  const [creator, publishedFinancial, campaignPage, financialCollectionState, campaignCollectionState] = await Promise.all([
     db.creatorAccount.findUnique({ where: { id: creatorId }, select: { id: true, createdAt: true, updatedAt: true } }),
-    Promise.resolve(ledger.financialGroups),
+    require("./published-financial-read-repository").readPublishedFinancialSummary({ db, creatorId, from: start, to: end }),
     require("./campaign-read-repository").readCampaignPage({ db, creatorId, rangeKey: range, now }),
     db.creatorFinancialCollectionState?.findUnique ? db.creatorFinancialCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
     db.creatorCampaignCollectionState?.findUnique ? db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
@@ -331,7 +341,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
   activity.likes = int(ledger.totals.likesCount);
   activity.comments = int(ledger.totals.commentsCount);
 
-  const finance = financeSummary(financialGroups);
+  const finance = publishedFinancial.finance;
 
   return {
     ok: true,
@@ -351,7 +361,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
       factPublicationState: ledger.factPublication?.state || "REBUILDING",
       factPublication: {
         activity: ledger.factPublication?.scopes?.activity || { ready: false, state: "REBUILDING" },
-        financial: ledger.factPublication?.scopes?.financial || { ready: false, state: "REBUILDING" },
+        financial: { ready: publishedFinancial.ready, state: publishedFinancial.state },
       },
       earningsVerified: ledger.verification.officialEarnings,
       earningsComplete: ledger.verification.earningsComplete === true,

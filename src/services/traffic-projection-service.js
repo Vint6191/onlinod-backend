@@ -15,8 +15,21 @@ async function ensureTrafficProjection({ db, agencyId, creatorId }) {
   await db.$executeRawUnsafe('SELECT "onlinod_traffic_ensure_backfill_v2"($1,$2)', agencyId, creatorId);
 }
 
-// Only this finite enumerator scans creator identities, once per installation.
-// New scopes are enrolled by CreatorAccount insertion and live fact capture.
+// Upgrade existing members by bounded primary-key pages without resetting
+// verified projections or creating provider work.
+async function seedTrafficComponents({ db }) {
+  return runRootCommit(db, async ({ tx }) => {
+    await authorizeTrafficExecutor(tx);
+    const [seed] = await tx.$queryRawUnsafe('SELECT * FROM "TrafficProjectionSeed" WHERE "id"=\'fan-components-v1\' FOR UPDATE SKIP LOCKED');
+    if (!seed || seed.complete) return { seeded: 0 };
+    const rows = await tx.$queryRawUnsafe('SELECT "id","agencyId","creatorId","fanId" FROM "TrafficSourceMember" WHERE "id">$1 ORDER BY "id" LIMIT $2', seed.cursor, PAGE);
+    const fans = new Map(rows.map(row => [JSON.stringify([row.creatorId,row.fanId]),row]));
+    for (const row of fans.values()) await tx.$executeRawUnsafe('SELECT "onlinod_traffic_dirty_fan_v2"($1,$2,$3)',row.agencyId,row.creatorId,row.fanId);
+    await tx.$executeRawUnsafe('UPDATE "TrafficProjectionSeed" SET "cursor"=$1,"complete"=$2 WHERE "id"=\'fan-components-v1\'',rows.at(-1)?.id||seed.cursor,rows.length<PAGE);
+    return { seeded:fans.size, visited:rows.length };
+  }, { profile:"JOB_CHUNK",authority:{kind:"TRAFFIC_COMPONENT_SEED"} });
+}
+
 async function seedTrafficProjection({ db }) {
   return runRootCommit(db, async ({ tx }) => {
     await authorizeTrafficExecutor(tx);
@@ -82,7 +95,7 @@ async function backfillUnit(tx, item) {
   await tx.$executeRawUnsafe(`UPDATE "TrafficProjectionBackfillData" SET "stage"=$2,"cursor"=$3,
     "completedAt"=CASE WHEN $2='DONE' THEN CURRENT_TIMESTAMP ELSE NULL END,"updatedAt"=CURRENT_TIMESTAMP WHERE "creatorId"=$1`,
   state.creatorId, stage, more ? rows.at(-1).id : "");
-  return { done: stage === "DONE", stage, processed: rows.length };
+  return { done: stage === "DONE", stage, processed: rows.length, publicationCursor: more ? rows.at(-1).id : stage };
 }
 
 async function fanUnit(tx, item, cursor) {
@@ -158,6 +171,13 @@ async function runTrafficProjectionItems({ db, items, ownerToken }) {
         : await yieldDomainWorkClaim({ db: tx, item, ownerToken,
           progressCursor: { ...(result.cursor || {}), revision: String(item.claimedRevision) } });
       if (settled.lost) throw fault("TRAFFIC_PROJECTION_CLAIM_LOST");
+      if (active && (result.done || result.processed > 0)) {
+        const dataVersion = require("./realtime-receipt-hash").hashCanonicalJson({ owner:item.id,
+          revision:String(item.claimedRevision), cursor, result });
+        await require("./creator-entity-change-service").publishEntityChanges({ db:tx,agencyId:item.agencyId,creatorId:item.creatorId,
+          changes:[{entityType:"TRAFFIC",entityId:item.creatorId,sourceIdentity:`TrafficProjection:${item.id}`,sourceVersion:dataVersion,
+            payload:{dataVersion,reason:"TRAFFIC_PROJECTION_PUBLISHED"}}] });
+      }
       results.push(result);
     }
     return results;
@@ -170,6 +190,7 @@ async function runTrafficProjectionUnit({db,item,ownerToken}) {
 
 async function runTrafficProjectionSweep({ db, limit = 4, maxRuntimeMs = 5000 }) {
   const seed = await seedTrafficProjection({ db });
+  seed.components = await seedTrafficComponents({ db });
   const results = [];
   const classBudget = Math.max(1, Math.min(5000, Number(maxRuntimeMs) || 5000)) / 3;
   // Separate queues prevent a large rebuild from starving current observations.

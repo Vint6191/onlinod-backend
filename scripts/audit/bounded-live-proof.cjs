@@ -12,6 +12,15 @@ function pass(name){checks.push(name);console.log("PASS",name);}
  try {
   const {db}=f,s=await scope(db),member=await db.agencyMember.findUnique({where:{id:"member-"+s.agencyId}});
   const tx=fn=>runRootCommit(db,({tx})=>fn(tx)),now=new Date(),today=new Date(now.toISOString().slice(0,10)),from=new Date(+today-179*86400000);
+  // PGlite has no background autoanalyze. Refresh fixture statistics outside
+  // commits, without changing their 15s budget; these timings are not native
+  // PostgreSQL capacity measurements. Report this maintenance separately.
+  if(!f.native)metrics.fixtureMaintenance={kind:"ANALYZE",everyAppliedRows:1000,calls:0,elapsedMs:0};
+  const maintainFixture=async()=>{
+    if(f.native)return;
+    const began=performance.now();await db.$executeRawUnsafe("ANALYZE");
+    metrics.fixtureMaintenance.calls++;metrics.fixtureMaintenance.elapsedMs+=Math.round(performance.now()-began);
+  };
   require.cache[require.resolve(root+"/src/prisma")]={exports:db};
   const home=require(root+"/src/services/home-read-repository");
   const input={db,...s,member,money:true,manage:true,range:{startDay:today,endDay:today},previous:{startDay:new Date(+today-86400000),endDay:new Date(+today-86400000)},now};
@@ -35,16 +44,20 @@ function pass(name){checks.push(name);console.log("PASS",name);}
   });
   assert.equal((await home.readHomeTotals(input)).totalCents,400);
   const count=Number(process.env.ONLINOD_SCALE_ROWS||10000);
-  const run={id:"bounded-run",...s,jobId:"fixture-job",generation:"bounded-generation",windows:[{kind:"FULL",from:from.toISOString(),to:now.toISOString()}],cursor:{phase:"done"},proof:{complete:true,windows:[{count}]}},job={...s,params:{collectionRequestedAt:now.toISOString()}};
+  const run={id:"bounded-run",...s,jobId:"fixture-job",generation:"bounded-generation",windows:[{kind:"FULL",from:from.toISOString(),to:now.toISOString()}],cursor:{phase:"done"},proof:{complete:true,windows:[{count}]}},job={...s,params:{
+    ...require(root+"/src/services/analytics-collector-control-service").buildCollectionCommand({collectorType:"FINANCIAL",now}),
+    collectionGeneration:"bounded-generation"}};
   await tx(async t=>{
     await require(root+"/src/services/financial-receipt-authority").enter(t);
     await t.financialReceiptRun.create({data:{id:run.id,agencyId:s.agencyId,creatorId:s.creatorId,jobId:run.jobId,generation:run.generation,windows:run.windows,cursor:run.cursor,proof:run.proof}});
     await t.$executeRawUnsafe(`INSERT INTO "FinancialObservedFact"("runId","windowIndex","externalId","occurredAt",value)
-      SELECT $1,0,'tx-'||lpad(i::text,6,'0'),$2,jsonb_build_object('netCents',100,'currency','USD','transactionStatus','done','factType','TIP')
+      SELECT $1,0,'tx-'||lpad(i::text,6,'0'),$2,jsonb_build_object('externalTransactionId','tx-'||lpad(i::text,6,'0'),
+        'transactionType','tip','occurredAt',$2::timestamp,'amountCents',125,'netCents',100,'currency','USD','transactionStatus','done','factType','TIP')
       FROM generate_series(1,$3::int) i`,run.id,today,count);
     await gen.lock(t,s.creatorId);
     await t.creatorMoneyObservation.create({data:{id:"pending-observation",agencyId:s.agencyId,creatorId:s.creatorId,occurredAt:today,capturedAt:old,status:"PENDING"}});
   });
+  await maintainFixture();
   let result=await tx(t=>gen.preparePage(t,job,run));assert(!result.ready);
   await assert.rejects(()=>tx(t=>t.$executeRawUnsafe(`UPDATE "CreatorEarningsLedgerEntry" SET "netCents"=999 WHERE "creatorId"=$1`,s.creatorId)),/EARNINGS_WRITER_UPGRADE_REQUIRED/);
   await assert.rejects(()=>tx(t=>t.creatorEarningsLedgerProof.update({where:{creatorId:s.creatorId},data:{generation:"old-writer"}})),/EARNINGS_WRITER_UPGRADE_REQUIRED/);
@@ -53,10 +66,14 @@ function pass(name){checks.push(name);console.log("PASS",name);}
   assert.equal((await db.creatorEarningsGeneration.findUnique({where:{id:run.id}})).observedCount,0n);
   assert.equal((await home.readHomeTotals(input)).totalCents,400);
   await tx(async t=>{await gen.lock(t,s.creatorId);await gen.writeLive(t,s,row("tx-000001",100,"undo",new Date(+now+1)));await gen.writeLive(t,s,row("live-only",700,"done",new Date(+now+1)));});
-  const durations=[];let maximumVisited=0,steps=0;
+  const durations=[],publicationStarted=performance.now();let maximumVisited=0,steps=0,appliedRows=0,rowsSinceAnalyze=0;
   while(!result.ready && steps++<1000) {
     const began=performance.now();result=await tx(t=>gen.preparePage(t,job,run));durations.push(performance.now()-began);maximumVisited=Math.max(maximumVisited,result.visited||0);
     assert.equal((await home.readHomeTotals(input)).totalCents,1000);
+    if(result.phase==="APPLY"){appliedRows+=result.visited||0;rowsSinceAnalyze+=result.visited||0;}
+    if(!f.native&&rowsSinceAnalyze>=1000){await maintainFixture();rowsSinceAnalyze%=1000;}
+    if(steps%10===0||result.ready)console.log("PROGRESS publication",JSON.stringify({pages:steps,appliedRows,totalRows:count,
+      elapsedMs:Math.round(performance.now()-publicationStarted),lastPageMs:Math.round(durations.at(-1)),fixtureMaintenance:metrics.fixtureMaintenance||null}));
   }
   assert(result.ready);assert(maximumVisited<=gen.PAGE);
   await assert.rejects(()=>tx(async t=>{assert(await gen.publish(t,job,run));throw Error("FINALIZE_CRASH");}),/FINALIZE_CRASH/);

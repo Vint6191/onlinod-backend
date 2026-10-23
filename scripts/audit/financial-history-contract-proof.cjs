@@ -79,7 +79,7 @@ const pass = text => { checks.push(text); console.log("PASS", text); };
     const limited=await start(); await step(limited,{list:[recent],hasMore:false}); await charts(limited,{gross:10,net:8,count:1}); await finish(limited);
     assert.equal(Number((await gen.activeEntry(db,s.creatorId,"before-2016")).netCents),400);
     pass("later provider history omits an old identity without deleting its previously confirmed published money");
-    const bad=await start({recoveryIntentId:"mismatch-recovery"}); await step(bad,{list:[recent],hasMore:false}); await charts(bad,{gross:20,net:16,count:2});
+    const bad=await start({recoveryIntentId:"mismatch-recovery"}); await step(bad,{list:[{...recent,amount:5,net:4,fee:1}],hasMore:false}); await charts(bad,{gross:10,net:8,count:1});
     const failed=await finish(bad,"FAILED"); assert.equal(failed.attempts,1); assert.equal(failed.result.completionSideEffect.historyRead,true);
     assert.equal(failed.result.completionSideEffect.verification,"MISMATCH"); assert.equal(failed.result.completionSideEffect.published,false);
     assert.equal(failed.params.collectionGeneration,bad.job.params.collectionGeneration);
@@ -87,6 +87,11 @@ const pass = text => { checks.push(text); console.log("PASS", text); };
     assert.equal(stopped.status,"STOPPED"); assert.equal(stopped.failedAttempts,1); assert(stopped.stoppedAt);
     assert(await db.subscriberDirectoryMaintenanceSignal.findFirst({where:{creatorId:s.creatorId,kind:"DERIVED_PLANNING"}}));
     assert.equal(Number((await gen.activeEntry(db,s.creatorId,"before-2016")).netCents),400);
+    assert.equal((await db.creatorFinancialTransaction.findUnique({where:{creatorId_externalTransactionId:{creatorId:s.creatorId,externalTransactionId:recent.id}}})).netCents,800);
+    assert.equal((await db.creatorTip.findUnique({where:{creatorId_externalTransactionId:{creatorId:s.creatorId,externalTransactionId:recent.id}}})).netCents,800);
+    const display=await require(root+"/src/services/published-financial-read-repository").readPublishedFinancialSummary({db,creatorId:s.creatorId,from:new Date(+now-86400000),to:now});
+    assert.equal(display.ready,true); assert.equal(display.finance.netCents,800);
+    assert.equal((await db.financialObservedFact.findUnique({where:{runId_windowIndex_externalId:{runId:receipts.runId(bad.job),windowIndex:0,externalId:recent.id}}})).value.netCents,400);
     pass("completed history with mismatched count/gross/net is terminal and retained, never repaired by automatic full-generation restart");
     const gap=await start({mode:"catchup",gapFrom:new Date(+now-1800000+789),recoveryIntentId:"verified-fractional-gap",recoveryTargetAt:new Date(+now-123)});
     assert.equal(gap.job.params.financialWindows[0].comparisonFrom,new Date(+now-1800000).toISOString());
@@ -129,15 +134,25 @@ const pass = text => { checks.push(text); console.log("PASS", text); };
       await tx.creatorSale.update({where:{id:sale.id},data:{messageId:"message-77"}});
     });
     const linkedSale=await start(); const linkedPage=await step(linkedSale,{list:[message],hasMore:false});
-    assert.equal(linkedPage.sideEffect.unchanged,1); assert.equal(linkedPage.sideEffect.updated,0);
+    assert.equal(linkedPage.sideEffect.inserted,0); assert.equal(linkedPage.sideEffect.updated,0);
+    assert.equal(await db.creatorEntityCurrent.findUnique({where:{creatorId_entityType_entityId:{creatorId:s.creatorId,entityType:"MESSAGE_PURCHASE",entityId:"42:message-77"}}}),null);
+    await charts(linkedSale,{gross:10,net:8,count:1,category:"chat_messages"}); await finish(linkedSale);
     const purchase=await db.creatorEntityCurrent.findUnique({where:{creatorId_entityType_entityId:{creatorId:s.creatorId,entityType:"MESSAGE_PURCHASE",entityId:"42:message-77"}}});
     assert.deepEqual(purchase.payload,{dialogId:"42",messageId:"message-77",opened:true,purchasedAt:message.createdAt,operationId:message.id});
     const linkedRevision=purchase.revision;
-    await charts(linkedSale,{gross:10,net:8,count:1,category:"chat_messages"}); await finish(linkedSale);
     const repeatedSale=await start(); await step(repeatedSale,{list:[message],hasMore:false});
     assert.equal((await db.creatorEntityCurrent.findUnique({where:{creatorId_entityType_entityId:{creatorId:s.creatorId,entityType:"MESSAGE_PURCHASE",entityId:"42:message-77"}}})).revision,linkedRevision);
     await charts(repeatedSale,{gross:10,net:8,count:1,category:"chat_messages"}); await finish(repeatedSale);
-    pass("unchanged payout re-observation publishes a late exact canonical message link, while a later identical observation emits no duplicate purchase correction");
+    assert.equal((await db.creatorEntityCurrent.findUnique({where:{creatorId_entityType_entityId:{creatorId:s.creatorId,entityType:"MESSAGE_PURCHASE",entityId:"42:message-77"}}})).revision,linkedRevision);
+    pass("verified unchanged payout re-observation publishes a late exact canonical message link, while a later identical observation emits no duplicate purchase correction");
+    const optionalGross=await start(); await step(optionalGross,{list:[{...money("net-without-gross",new Date(+now-1000)),amount:[],net:7}],hasMore:false});
+    await charts(optionalGross,{gross:undefined,net:7,count:1}); const optionalGrossDone=await finish(optionalGross);
+    assert.equal(optionalGrossDone.result.completionSideEffect.reconciliation.grossMatched,null);
+    assert.equal(Number((await gen.activeEntry(db,s.creatorId,"net-without-gross")).netCents),700);
+    assert.equal((await gen.activeEntry(db,s.creatorId,"net-without-gross")).grossCents,null);
+    const grossDisplay=await require(root+"/src/services/published-financial-read-repository").readPublishedFinancialSummary({db,creatorId:s.creatorId,from:new Date(+now-86400000),to:now});
+    assert.equal(grossDisplay.ready,true); assert.equal(grossDisplay.finance.grossCents,null); assert(grossDisplay.finance.netCents>=700);
+    pass("valid NET plus missing/malformed optional gross publishes confirmed NET with unknown gross; no assumed fee rate or false zero");
     const finance=require(root+"/src/services/financial-transactions-service");
     const liveTip={transactionId:"live-tip-feed",transactionType:"tip",occurredAt:new Date(+now-1000),amountCents:1000,netCents:800,
       feeCents:200,currency:"USD",status:"done",fanOnlyFansUserId:"42"};
@@ -153,6 +168,38 @@ const pass = text => { checks.push(text); console.log("PASS", text); };
     assert.notEqual((await tipRead()).payload.dataVersion,beforeTip.payload.dataVersion);
     assert.equal((await db.creatorEntityCurrent.findUnique({where:{creatorId_entityType_entityId:{creatorId:s.creatorId,entityType:"MESSAGE_PURCHASE",entityId:"42:message-77"}}})).revision,linkedRevision);
     pass("exact live tip corrections publish canonical read invalidations atomically; identical observations create no feed revision or unrelated message correction");
+    const newer=await start();await step(newer,{list:[{...recent,amount:20,net:16,fee:4}],hasMore:false});await charts(newer,{gross:20,net:16,count:1});
+    const queued=await lease.completeJob({...newer.credentials,result:newer.checkpoint.result});assert(queued.publicationId);
+    const readFact=()=>db.creatorFinancialTransaction.findUnique({where:{creatorId_externalTransactionId:{creatorId:s.creatorId,externalTransactionId:recent.id}}});
+    for(let i=0;i<8;i++){
+      await db.analyticsPublication.update({where:{id:queued.publicationId},data:{availableAt:new Date(0)}});
+      await publication.runAnalyticsPublicationUnit({db,publicationId:queued.publicationId});
+      if((await readFact()).netCents===1600)break;
+    }
+    assert.equal((await readFact()).netCents,1600);assert.equal(Number((await gen.activeEntry(db,s.creatorId,recent.id)).netCents),800);
+    const repair=await runRootCommit(db,async({tx})=>{
+      await gen.lock(tx,s.creatorId);
+      return require(root+"/src/services/financial-legacy-repair-service").repairPage({db:tx,...s,now:new Date()});
+    });
+    assert.equal(repair.waiting,true);assert.equal(repair.reason,"FINANCIAL_PUBLICATION_IN_PROGRESS");assert.equal((await readFact()).netCents,1600);
+    let committed=false;
+    for(let i=0;i<8;i++){
+      await db.analyticsPublication.update({where:{id:queued.publicationId},data:{availableAt:new Date(0)}});
+      const result=await publication.runAnalyticsPublicationUnit({db,publicationId:queued.publicationId});
+      if(!result.publicationPending){assert.equal(result.job.status,"DONE");committed=true;break;}
+    }
+    assert(committed);assert.equal(Number((await gen.activeEntry(db,s.creatorId,recent.id)).netCents),1600);assert.equal((await readFact()).netCents,1600);
+    pass("adoption between verified APPLY and final snapshot activation waits for the publication owner and cannot downgrade its canonical money to the preceding baseline");
+    await runRootCommit(db,async({tx})=>{
+      await gen.lock(tx,s.creatorId);await gen.writeLive(tx,s,{transactionId:"newer-ledger-only",occurredAt:new Date(+now-1000),
+        category:"tips",netCents:1600,grossCents:2000,status:"done",observedAt:new Date(Date.now()+10000)});
+    });
+    const olderSource=await start();await step(olderSource,{list:[money("newer-ledger-only",new Date(+now-1000))],hasMore:false});
+    await charts(olderSource,{gross:10,net:8,count:1});await finish(olderSource);
+    assert.equal(Number((await gen.activeEntry(db,s.creatorId,"newer-ledger-only")).netCents),1600);
+    assert.equal(await db.creatorFinancialTransaction.findUnique({where:{creatorId_externalTransactionId:{creatorId:s.creatorId,externalTransactionId:"newer-ledger-only"}}}),null);
+    assert.equal(await db.creatorTip.findUnique({where:{creatorId_externalTransactionId:{creatorId:s.creatorId,externalTransactionId:"newer-ledger-only"}}}),null);
+    pass("a stale history row rejected by a newer ledger revision cannot become a second canonical money authority when its business projection was absent");
     console.log(JSON.stringify({ok:true,engine:runtime.native?"native PostgreSQL":"PGlite + Prisma; no native concurrency/provider verification",checks},null,2));
   } finally {desktop?.close();await runtime.close();}
 })().catch(error=>{console.error(error);process.exitCode=1;}).finally(()=>{clearInterval(keepAlive);clearTimeout(deadline);});

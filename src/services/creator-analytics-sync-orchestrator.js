@@ -389,7 +389,13 @@ function retryDisposition(state, now = new Date()) {
 }
 
 async function collectorRetryDisposition({ db, collectorType, state, agencyId, creatorId, now, recoveryIntentId = null }) {
-  const recovered = await require("./collector-retry-policy").recoverTerminalCollector({ db, type: collectorType, state, agencyId, creatorId, now });
+  // A completed-but-partial notification traversal is a finite outcome. A
+  // missing retry date must not become permission to start again from HEAD.
+  const partialNotification = collectorType === COLLECTOR_TYPES.NOTIFICATIONS
+    && state?.status === "PARTIAL" && !state.retryAfterAt;
+  const recovered = await require("./collector-retry-policy").recoverTerminalCollector({ db, type: collectorType,
+    state: partialNotification ? { ...state, status: "FAILED" } : state, agencyId, creatorId, now });
+  if (partialNotification) recovered.state = state;
   if (recovered.active) return { state: recovered.state, deferred: true, terminal: false, retryAfterAt: null, reason: "already_in_flight" };
   if (recovered.terminal && await liveSync.independentRecoveryAfterStop(db, { creatorId, stream: collectorType.toLowerCase(),
     intentId: recoveryIntentId, sourceJobId: recovered.state?.sourceJobId })) {

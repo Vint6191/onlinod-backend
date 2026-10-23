@@ -53,11 +53,11 @@ function creatorAllowed(creatorId, allowedCreatorIds) {
 }
 
 function activeFinancialWhere() {
-  return { OR: [{ financialStatus: null }, { financialStatus: { not: "undo" } }] };
+  return require("./team-money-financial-state-service").activeFinancialWhere();
 }
 
 function financiallyActive(row) {
-  return String(row?.financialStatus || "").trim().toLowerCase() !== "undo";
+  return require("./team-money-financial-state-service").financiallyActive(row);
 }
 
 async function findTipLedgerForUpdate(tx, { agencyId, eventHash }) {

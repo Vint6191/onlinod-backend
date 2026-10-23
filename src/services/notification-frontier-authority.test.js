@@ -66,3 +66,24 @@ test("cursor cycles and premature client completion cannot produce successful re
   await assert.rejects(frontier.commitPage(db,job,{...chunk(2),sourceExhausted:true,stopReason:"known_boundary_reached"},state,{unchanged:true,pastGap:true}),{code:"NOTIFICATION_FRONTIER_COMPLETION_INVALID"});
   assert.equal(frontier.enabled({...job,params:{...job.params,notificationMode:"full"}}),false);
 });
+
+test("FULL persists cursor cycle authority but permits independent typed sources to reuse IDs",async()=>{
+  const full={...job,params:{...job.params,notificationMode:"full",notificationFrontierVersion:4}};
+  const db=store(); let state=null,page=0;
+  for(const sourcePhase of frontier.FULL_PHASES) {
+    const final=sourcePhase==="all_reconciliation";
+    const value={page:++page,sourcePhase,cursorStart:null,cursorEnd:"same-id",observations:[{notificationId:"same-id"}],
+      sourceHasMore:false,phaseSourceExhausted:true,sourceExhausted:final,allSourceExhausted:final,
+      providerPageComplete:true,stopReason:final?"source_exhausted":null};
+    state=await frontier.commitPage(db,full,value,JSON.parse(JSON.stringify(state)));
+    assert.equal(frontier.completed(full,state),final);
+  }
+  assert.equal(db.pages.length,6); assert.equal(state.exhausted,true);
+  const cyclic=store(); const make=(page,start,end)=>({page,sourcePhase:"subscriptions",cursorStart:start,cursorEnd:end,
+    observations:[{notificationId:end}],sourceHasMore:true,phaseSourceExhausted:false,sourceExhausted:false,allSourceExhausted:false});
+  state=await frontier.commitPage(cyclic,full,make(1,null,"A"),null);
+  state=await frontier.commitPage(cyclic,full,make(2,"A","B"),JSON.parse(JSON.stringify(state)));
+  await assert.rejects(frontier.commitPage(cyclic,full,make(3,"B","A"),JSON.parse(JSON.stringify(state))),{code:"NOTIFICATION_FRONTIER_CURSOR_CYCLE"});
+  assert.equal(cyclic.pages.length,2);
+  await assert.rejects(frontier.commitPage(cyclic,full,{...make(3,"B","C"),sourcePhase:"tips"},state),{code:"NOTIFICATION_FRONTIER_PHASE_MISMATCH"});
+});

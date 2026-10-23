@@ -52,6 +52,8 @@ function analyticsBase(mediaId) {
     notOpenedCount: 0,
     freeCount: 0,
     revenueCents: 0,
+    revenueUnknownCount: 0,
+    revenueComplete: false,
     averagePriceCents: 0,
     uniqueBuyers: 0,
     rank: null,
@@ -66,7 +68,7 @@ function analyticsBase(mediaId) {
   };
 }
 
-function assetAnalytics(asset, authoritative, rank = null) {
+function assetAnalytics(asset, authoritative, rank = null, moneyReady = true) {
   const mediaId = clean(asset.mediaId);
   const sentCount = integer(asset.sentCount);
   const active = asset.catalogActive === true;
@@ -82,6 +84,8 @@ function assetAnalytics(asset, authoritative, rank = null) {
     notOpenedCount: integer(asset.notOpenedCount),
     freeCount: integer(asset.freeCount),
     revenueCents: integer(asset.revenueCents),
+    revenueUnknownCount: integer(asset.revenueUnknownCount),
+    revenueComplete: moneyReady && integer(asset.revenueUnknownCount) === 0,
     averagePriceCents: integer(asset.averagePriceCents),
     uniqueBuyers: integer(asset.uniqueBuyers),
     rank,
@@ -96,8 +100,8 @@ function assetAnalytics(asset, authoritative, rank = null) {
   };
 }
 
-function topAsset(asset, authoritative, rank) {
-  const analytics = assetAnalytics(asset, authoritative, rank);
+function topAsset(asset, authoritative, rank, moneyReady) {
+  const analytics = assetAnalytics(asset, authoritative, rank, moneyReady);
   return {
     ...analytics,
     assetId: analytics.mediaId,
@@ -116,13 +120,13 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
   const ids = cleanMediaIds(mediaIds, MAX_MEDIA_IDS);
   const activeWhere = { agencyId, creatorId: cleanCreatorId, catalogActive: true };
 
-  const [[catalogCount, usedCount, totals, soldAssets, topRows, assetRows, latestAsset], pipelineResult] = await Promise.all([
+  const [[catalogCount, usedCount, totals, soldAssets, topRows, assetRows, latestAsset, moneyReady], pipelineResult] = await Promise.all([
     readMediaSnapshot(client, tx => Promise.all([
       tx.creatorMediaAsset.count({ where: activeWhere }),
       tx.creatorMediaAsset.count({ where: { ...activeWhere, sentCount: { gt: 0 } } }),
       tx.creatorMediaAsset.aggregate({
         where: activeWhere,
-        _sum: { soldCount: true, revenueCents: true },
+        _sum: { soldCount: true, revenueCents: true, revenueUnknownCount: true },
         _max: { lastSoldAt: true },
       }),
       tx.creatorMediaAsset.count({ where: { ...activeWhere, soldCount: { gt: 0 } } }),
@@ -140,6 +144,7 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
         orderBy: { updatedAt: "desc" },
         select: { updatedAt: true, usageUpdatedAt: true },
       }),
+      require("./media-financial-projection-service").financialProjectionReady(tx, cleanCreatorId),
     ])),
     includePipeline
       ? getNeverUsedPipelineState({ agencyId, creatorId: cleanCreatorId, db: client })
@@ -152,7 +157,7 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
   const assetById = new Map(assetRows.map((asset) => [String(asset.mediaId), asset]));
   const analytics = ids.map((mediaId) => {
     const asset = assetById.get(mediaId);
-    if (asset) return assetAnalytics(asset, authoritative, rankById.get(mediaId) || null);
+    if (asset) return assetAnalytics(asset, authoritative, rankById.get(mediaId) || null, moneyReady);
     return {
       ...analyticsBase(mediaId),
       usageState: authoritative ? "NOT_APPLICABLE" : "UNKNOWN",
@@ -160,7 +165,7 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
       authoritative,
     };
   });
-  const topAssets = topRows.map((asset, index) => topAsset(asset, authoritative, index + 1));
+  const topAssets = topRows.map((asset, index) => topAsset(asset, authoritative, index + 1, moneyReady));
   const freshnessCandidates = [latestAsset?.updatedAt, latestAsset?.usageUpdatedAt, pipeline?.updatedAt, totals?._max?.lastSoldAt]
     .map((value) => value ? new Date(value).getTime() : Number.NaN)
     .filter(Number.isFinite);
@@ -174,6 +179,8 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
       soldAssets,
       totalSales: exactMediaCount(totals?._sum?.soldCount),
       revenueCents: exactMediaCount(totals?._sum?.revenueCents),
+      revenueUnknownCount: exactMediaCount(totals?._sum?.revenueUnknownCount),
+      revenueComplete: moneyReady && exactMediaCount(totals?._sum?.revenueUnknownCount) === 0,
       lastSaleAt: iso(totals?._max?.lastSoldAt),
     },
     analytics,

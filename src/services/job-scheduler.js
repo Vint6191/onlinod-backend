@@ -31,6 +31,7 @@ const { createMaintenanceHealth, maintenanceDegradedDetails } = require("./maint
 const maintenanceProgress = require("./maintenance-progress-diagnostics").createMaintenanceProgressDiagnostics();
 const { buildJobIdempotencyKey } = require("./job-idempotency");
 const { ensureSubscriberScanDue } = require("./subscriber-directory-service");
+const { loadInitialCollectionAdmission, initialCollectionAdmission } = require("./initial-collection-readiness-service");
 const { ensureAutomaticFollowBack } = require("./follow-back-service");
 const { ensureAutomaticBumps } = require("./bump-service");
 const { ensureAutomaticLikes } = require("./likes-service");
@@ -489,9 +490,12 @@ async function scheduleInitialJobsForCreator({
     skipped,
     degraded,
     outcomes,
-    execute: () => ensureSubscriberScanDue({
-      db, agencyId, creatorId, priority: Math.max(5, priority - 30), now,
-    }),
+    execute: async () => {
+      const states = await loadInitialCollectionAdmission({ db, creatorIds: [creatorId], now });
+      const admission = initialCollectionAdmission({ jobKey: "subscriber_directory_scan" }, states.get(creatorId));
+      if (!admission.admitted) return { ok: true, created: false, reason: admission.reason };
+      return ensureSubscriberScanDue({ db, agencyId, creatorId, priority: Math.max(5, priority - 30), now });
+    },
   });
 
   const derived = await scheduleDerivedAutomationForCreator({ db, agencyId, creatorId, subscriberSnapshot });

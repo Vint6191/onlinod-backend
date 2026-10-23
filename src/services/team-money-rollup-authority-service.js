@@ -67,7 +67,7 @@ function desiredContribution(fact) {
   const sourceType = clean(fact?.sourceType,20)?.toUpperCase() || null;
   const day = utcDay(fact?.occurredAt);
   const active = String(fact?.classificationState || "") === "CANONICAL"
-    && fact?.attributionActive === true && Boolean(memberId) && Boolean(sourceType) && Boolean(day);
+    && require("./team-money-financial-state-service").financiallyActive(fact) && fact?.attributionActive === true && Boolean(memberId) && Boolean(sourceType) && Boolean(day);
   const row = {
     agencyId, sourceFactId, active,
     memberId: active ? memberId : null,
@@ -82,7 +82,6 @@ function desiredContribution(fact) {
     active: row.active, memberId: row.memberId, creatorId: row.creatorId, sourceType: row.sourceType,
     currency: row.currency, day: row.day?.toISOString?.() || null, amountCents: row.amountCents.toString(),
     businessStatus: clean(fact?.businessStatus,80), financialStatus: clean(fact?.financialStatus,80),
-    sourceUpdatedAt: fact?.sourceUpdatedAt instanceof Date ? fact.sourceUpdatedAt.toISOString() : String(fact?.sourceUpdatedAt || ""),
     classificationState: clean(fact?.classificationState,40),
   })).digest("hex");
   return row;
@@ -159,6 +158,7 @@ async function applyTeamMoneyFactToRollups({ db = prisma, agencyId, factId } = {
         projectionVersion: TEAM_MONEY_ROLLUP_VERSION,
       },
     });
+    await require("./team-money-financial-state-service").publishTeamMoneyResult(tx, { ...contribution, creatorId: fact.creatorId }, "MONEY_ROLLUP_PROJECTED");
     return { ok: true, changed: true, contribution };
   });
 }

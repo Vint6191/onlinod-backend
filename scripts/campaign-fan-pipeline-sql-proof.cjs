@@ -7,9 +7,10 @@ const { pathToFileURL } = require('node:url');
 const alive = setInterval(() => {}, 1000);
 const deadline = setTimeout(() => { console.error('SQL_PROOF_DEADLINE'); process.exit(2); }, 300000);
 async function main() {
-  const { fixture, scope } = require('./audit/analytics-traffic/fixture.cjs');
+  const { scope } = require('./audit/analytics-traffic/fixture.cjs');
+  const { createScaleSqlRuntime } = require('./test-support/scale-sql-runtime.cjs');
   console.log('START current-schema fixture');
-  const f = await fixture(); let server;
+  const f = await createScaleSqlRuntime(); let server;
   console.log('PASS current-schema fixture');
   try {
     const { db } = f, s = await scope(db), now = new Date(), run = 'campaign-run';
@@ -139,7 +140,9 @@ async function main() {
         signal: new AbortController().signal, commitFanDataBatch: committer,
         ofApi: { async request({ endpoint }) {
           const id = endpoint.path.split('/').at(-1); reads.push(id); if (savePending) overlap = true;
-          if (id === '1002') return { ok: false, status: 503, code: 'OF_HTTP_ERROR' };
+          if (id === '1002') return reads.filter(value=>value===id).length===1
+            ? {ok:true,status:200,data:{id,username:'partial-retained',subscribedOnData:{totalSumm:'malformed',tipsSumm:7}}}
+            : { ok: false, status: 503, code: 'OF_HTTP_ERROR' };
           if (id === '1003') return { ok: false, status: 404, code: 'OF_HTTP_ERROR' };
           return { ok: true, status: 200, data: { id, subscribedOnData: { totalSumm: id === '1001' ? 0 : 1 } } };
         } },
@@ -153,6 +156,11 @@ async function main() {
         const sql = await db.jobInstance.findUnique({ where: { id: job.id } });
         assert.equal(sql.continuation.jobContinuation.index, 2);
         assert.equal(sql.continuation.jobContinuation.retry.attempts, restart + 1);
+        if(restart===0){
+          const partial=await db.creatorFanValueCurrent.findUnique({where:{creatorId_fanRecordId:{creatorId:s.creatorId,fanRecordId:'fan-1002'}}});
+          assert.equal(partial.availability,'MALFORMED');assert.equal(partial.tipsSpentCents,700n);
+          assert.equal(partial.platformReportedTotalSpendCents,9876n,'partial facts never replace the last known aggregate');
+        }
         await jobPost('release', { workId: `work-${job.id}`, reason: 'fixture process restart', runAfterMs: 1000 });
         await write(tx => tx.jobInstance.update({ where: { id: job.id }, data: { nextRunAt: new Date(0) } }));
       } else {
@@ -176,7 +184,9 @@ async function main() {
     assert.equal(failed.status, 'FAILED'); assert.equal(failed.retryAttempts, 5); assert.ok(failed.quarantinedAt); assert.equal(failed.nextRetryAt, null);
     assert.match(failed.lastError, /503.*1002.*5/);
     const prior = await db.creatorFanValueCurrent.findUnique({ where: { creatorId_fanRecordId: { creatorId: s.creatorId, fanRecordId: 'fan-1002' } } });
-    assert.equal(prior.platformReportedTotalSpendCents, 9876n); assert.equal(prior.valueObservedAt.getTime(), new Date(+now - 86400000).getTime());
+    assert.equal(prior.platformReportedTotalSpendCents, 9876n);assert.equal(prior.availability,'MALFORMED');
+    assert.equal(prior.tipsSpentCents,700n,'first authorized partial observation survives four later transport failures');
+    assert.equal((await db.creatorFan.findUnique({where:{id:'fan-1002'}})).username,'partial-retained');
     const terminal = savedReceipts.find(row => row.chunkResult.terminalFailures.length);
     assert.deepEqual(terminal.chunkResult.terminalFailures.map(row => row.fanId), ['1002']);
     assert.equal(await db.creatorFanRefreshDemand.count({ where: { creatorId: s.creatorId, status: 'QUEUED' } }), 0);
@@ -235,6 +245,12 @@ async function main() {
       quantumLeaseRevision: 1, quantumStartedAt: requestedAt, quantumRequests: 0 };
     let segmentCheckpoint = { driverPhase: 'execute', jobContinuation: segmentState };
     await write(async tx => {
+      // This section tests finite Campaign retries after a prior source has
+      // failed. It carries no fake financial proof: the normal admission policy
+      // must let independent Campaign work proceed after that finite failure.
+      await tx.creatorFinancialCollectionState.upsert({where:{creatorId:s.creatorId},
+        create:{agencyId:s.agencyId,creatorId:s.creatorId,status:'FAILED',lastErrorCode:'PROVIDER_UNAVAILABLE'},
+        update:{status:'FAILED',lastErrorCode:'PROVIDER_UNAVAILABLE'}});
       await require('../src/services/campaign-causal-activation-service').enterCampaignBoundedExecution({ db: tx });
       return tx.jobInstance.create({ data: { id: 'segment-retry-job', agencyId: s.agencyId, creatorId: s.creatorId,
       jobKey: 'fetch_campaigns', scope: 'creator', status: 'SCHEDULED', nextRunAt: new Date(0), continuation: segmentCheckpoint,

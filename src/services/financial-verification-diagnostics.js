@@ -7,7 +7,7 @@ const iso = value => typeof value === "string" && /^\d{4}-\d\d-\d\dT/.test(value
   ? new Date(value).toISOString() : null;
 const KINDS = new Set(["FULL", "HEAD", "GAP", "AUDIT", "FRONTIER", "RESOLUTION"]);
 const REJECTION_REASONS = ["SCANNER_REJECTED", "transaction_id_missing", "transaction_type_missing", "occurred_at_invalid",
-  "amount_invalid", "currency_invalid", "EXACT_FINANCIAL_MONEY_REQUIRED", "OUTSIDE_REQUESTED_FINANCIAL_WINDOW"];
+  "amount_invalid", "net_invalid", "currency_invalid", "EXACT_FINANCIAL_MONEY_REQUIRED", "OUTSIDE_REQUESTED_FINANCIAL_WINDOW"];
 
 // Reads the existing bounded completion proof, including pre-diagnostic failed
 // jobs. Never forwards profile values, descriptions, payloads or transaction IDs.
@@ -32,7 +32,7 @@ function financialVerificationDiagnostics(value) {
     const countUndo = number(object(comparisonUndo._count)._all) ?? 0;
     const grossUndo = number(object(comparisonUndo._sum).amountCents) ?? 0, netUndo = number(object(comparisonUndo._sum).netCents) ?? 0;
     const observed = { count: count === null ? null : count - countUndo,
-      grossCents: gross === null ? null : gross - grossUndo, netCents: net === null ? null : net - netUndo };
+      grossCents: gross === null || (comparison.grossKnown ?? count) - (comparisonUndo.grossKnown ?? countUndo) !== count - countUndo ? null : gross - grossUndo, netCents: net === null ? null : net - netUndo };
     const expected = { count: number(chart.transactionsCount), grossCents: number(chart.grossCents), netCents: number(chart.netCents) };
     const chartRequired = row.kind !== "FRONTIER" || reconciliation.proofKind === "FRONTIER_PLUS_TWO_AND_CHART";
     const chartPresent = Object.keys(chart).length > 0;

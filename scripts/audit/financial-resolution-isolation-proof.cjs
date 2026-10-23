@@ -123,7 +123,7 @@ const deadline = setTimeout(() => { console.error("FINANCIAL_RESOLUTION_PROOF_DE
         assert.equal(await db.creatorEarningsGenerationEntry.count({ where: { generation: name + "-base", transactionId } }), 0);
         assert.equal(detail.outcome, "REJECTED");
         if (mismatch) assert.deepEqual(detail.reasons, ["FINANCIAL_CHART_COUNT_MISMATCH", "FINANCIAL_CHART_GROSS_MISMATCH", "FINANCIAL_CHART_NET_MISMATCH"]);
-        if (missingNet) { assert(detail.reasons.includes("FINANCIAL_SOURCE_ROWS_REJECTED")); assert.equal(detail.windows[0].rejectionReasons.EXACT_FINANCIAL_MONEY_REQUIRED, 1); }
+        if (missingNet) { assert(detail.reasons.includes("FINANCIAL_SOURCE_ROWS_REJECTED")); assert.equal(detail.windows[0].rejectionReasons.net_invalid, 1); }
       } else {
         assert(observation.coveredGeneration); assert((await db.creatorEarningsGeneration.findUnique({ where: { id: observation.coveredGeneration } })).publishedAt);
         assert.equal(detail.outcome, "VERIFIED");

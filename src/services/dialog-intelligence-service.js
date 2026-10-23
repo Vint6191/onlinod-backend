@@ -391,16 +391,20 @@ async function scheduleDialogScanTx(db, input) {
     orderBy: { createdAt: "desc" },
   });
 
-  // Manual/automatic non-destructive starts may recover a terminal job from its
+  // Explicit non-destructive starts may recover a terminal job from its
   // last committed continuation. This is intentionally narrow: explicit full
   // rescans still create a clean generation, while transient/retryable failures
   // (including an OF empty page that still advertises hasMore=true) continue
   // from the durable offset instead of throwing away thousands of list pages.
-  if (!active && input.forceChildFull !== true) {
-    const failedRun = await db.dialogScanRun.findFirst({
-      where: { agencyId, creatorId, dialogId, status: "FAILED" },
-      orderBy: { createdAt: "desc" },
+  if (!active && input.forceChildFull !== true && !isTargetedMode(mode)) {
+    const latestRun = await db.dialogScanRun.findFirst({
+      where: { agencyId, creatorId, dialogId, mode: { notIn: ["targeted", "reconcile"] } },
+      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
     });
+    // A successful replacement has superseded an older failed episode. Only
+    // the current history attempt can stop recovery; targeted reconciliation
+    // has its own queue and cannot retire or resurrect that history budget.
+    const failedRun = latestRun?.status === "FAILED" ? latestRun : null;
     const failedJob = failedRun?.jobId
       ? await db.jobInstance.findUnique({ where: { id: failedRun.jobId } })
       : null;
@@ -408,7 +412,15 @@ async function scheduleDialogScanTx(db, input) {
     const failureCode = clean(failure.code, 160);
     const checkpointRecoverable = failure.retryable === true
       || RECOVERABLE_DISCOVERY_FAILURE_CODES.has(failureCode);
-    if (failedRun && checkpointRecoverable) active = failedRun;
+    const independentEpisode = failedRun && clean(input.source, 80) === "offline_gap_recovery"
+      ? await require("./dialog-recovery-episode-authority").independentEpisode(db, {
+        agencyId, creatorId, failedRun, now: dateOrNull(input.dialogRecoveryEpisode?.targetAt) || now,
+      }) : null;
+    if (independentEpisode) input = { ...input, dialogRecoveryEpisode: independentEpisode };
+    if (failedRun && !isTargetedMode(mode) && input.allowTerminalRetry !== true && !independentEpisode) {
+      return { ok: true, created: false, reason: "recovery_stopped", run: failedRun, job: failedJob };
+    }
+    if (failedRun && checkpointRecoverable && !independentEpisode) active = failedRun;
   }
 
   let activeJob = null;
@@ -419,6 +431,9 @@ async function scheduleDialogScanTx(db, input) {
     activeJob = await db.jobInstance.findUnique({ where: { id: active.jobId } });
     active = await db.dialogScanRun.findUnique({ where: { id: active.id } });
     if (active && ![...ACTIVE_RUN_STATUSES, "FAILED"].includes(active.status)) active = null;
+    if (active && activeJob?.status === "FAILED" && !isTargetedMode(mode) && input.allowTerminalRetry !== true) {
+      return { ok: true, created: false, reason: "recovery_stopped", run: active, job: activeJob };
+    }
   }
   const durableTarget = isTargetedMode(mode) && targetMessageId
     ? await enqueueReconciliationTarget(db, { agencyId, creatorId, dialogId,
@@ -533,6 +548,7 @@ async function scheduleDialogScanTx(db, input) {
         dialogId,
         fanId: clean(input.fanId, 160) || active.fanId || null,
         mode: active.mode,
+        ...(active.mode === "discovery" ? { discoveryTraversalVersion: 1 } : {}),
         source: clean(input.source, 80) || "startup_resume",
         pageLimit: integer(input.pageLimit, 50, 1, 100),
         discoveryBatchSize: active.mode === "discovery" ? integer(input.discoveryBatchSize ?? object(activeJob?.params).discoveryBatchSize, 100, 25, 100) : undefined,
@@ -604,6 +620,8 @@ async function scheduleDialogScanTx(db, input) {
     idempotencyKey: `${DIALOG_INTELLIGENCE_JOB_KEY}:${creatorId}:${dialogId}:${run.id}`,
     params: {
       scanRunId: run.id, dialogId, fanId: clean(input.fanId, 160), mode,
+      ...(mode === "discovery" ? { discoveryTraversalVersion: 1 } : {}),
+      ...(input.dialogRecoveryEpisode ? { dialogRecoveryEpisode: input.dialogRecoveryEpisode } : {}),
       source: clean(input.source, 80) || "manual", pageLimit: integer(input.pageLimit, 50, 1, 100),
       discoveryBatchSize: mode === "discovery" ? integer(input.discoveryBatchSize, 100, 25, 100) : undefined,
       discoveryBatchMaxApiPages: mode === "discovery" ? integer(input.discoveryBatchMaxApiPages, 50, 1, 100) : undefined,
@@ -748,6 +766,22 @@ async function restartCreatorDialogPlanTx(db, input) {
   }
 
   const forceChildFull = input.forceChildFull === true;
+  if (clean(input.source, 80) === "offline_gap_recovery" && input.allowTerminalRetry !== true) {
+    // The automatic gap checker is not an explicit retry command. Check before
+    // superseding child state or allocating a new generation, under the same
+    // scheduling lock used to create the discovery job.
+    await lockDbAdvisoryXact({ db, key: `dialog-schedule:${agencyId}:${creatorId}:__dialog_discovery__` });
+    const latest = await db.dialogScanRun.findFirst({
+      where: { agencyId, creatorId, dialogId: "__dialog_discovery__" }, orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    });
+    if (latest?.status === "FAILED") {
+      const next = await require("./dialog-recovery-episode-authority").independentEpisode(db, {
+        agencyId, creatorId, failedRun: latest, now: dateOrNull(input.dialogRecoveryEpisode?.targetAt) || new Date(),
+      });
+      if (!next) return { ok: true, created: false, reason: "recovery_stopped", run: latest, supersededHistoryRuns: 0 };
+      input = { ...input, dialogRecoveryEpisode: next };
+    }
+  }
   const activeDiscovery = await db.dialogScanRun.findFirst({
     where: {
       agencyId,
@@ -1027,27 +1061,11 @@ async function autoRecoverDialogDiscoveryTx(db, input) {
     return { ok: true, recovered: false, reason: "no_failed_discovery" };
   }
 
-  const failedJob = await db.jobInstance.findUnique({ where: { id: latestRun.jobId } });
-  const failure = object(object(failedJob?.result).failure);
-  const code = clean(failure.code, 160);
-  if (!RECOVERABLE_DISCOVERY_FAILURE_CODES.has(code)) {
-    return { ok: true, recovered: false, reason: "failure_not_auto_recoverable" };
-  }
+  // Reading Vault or reconnecting a worker is not authority to replenish an
+  // exhausted episode. Only an explicit retry command may resume its saved
+  // checkpoint with a new execution budget.
+  return { ok: true, recovered: false, reason: "recovery_stopped", runId: latestRun.id, jobId: latestRun.jobId };
 
-  const params = object(failedJob?.params);
-  const resumed = await scheduleDialogScanTx(db, {
-    agencyId,
-    creatorId,
-    dialogId: "__dialog_discovery__",
-    mode: "discovery",
-    childMode: clean(params.childMode, 40) || "initial",
-    source: clean(input.source, 80) || "automatic_dialog_discovery_recovery",
-    priority: integer(input.priority, 90, 0, 200),
-    pageLimit: integer(params.pageLimit, 50, 1, 100),
-    maxPages: integer(params.maxPages, 5000, 1, 10000),
-    generation: integer(params.generation, latestRun.generation || 0, 0, 2_000_000_000),
-  });
-  return { ok: true, recovered: true, reason: resumed.reason || "resumed", runId: resumed.run?.id || latestRun.id, jobId: resumed.job?.id || null };
 }
 
 async function autoRecoverDialogDiscovery(input) {
@@ -1418,9 +1436,10 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   const discoveryDialogId = clean(params.dialogId, 180) || "__dialog_discovery__";
   if (!job.agencyId || !job.creatorId || !runId || !chunkKey) throw new Error("Dialog discovery chunk scope is incomplete");
   const existing = await db.dialogScanChunkCommit.findUnique({ where: { runId_chunkKey: { runId, chunkKey } } });
-  if (existing) return { duplicate: true, chunkId: existing.id, ...object(existing.result) };
+  if (existing) return { ...object(existing.result), duplicate: true, replayedCommit: true, chunkId: existing.id };
   const run = await db.dialogScanRun.findFirst({ where: { id: runId, creatorId: job.creatorId, agencyId: job.agencyId } });
   if (!run) throw new Error("Dialog discovery run not found");
+  const sourcePageAdvance = await require("./dialog-discovery-page-authority").commitDiscoveryPages(db, job, run, chunk);
   const childMode = clean(chunk.childMode ?? params.childMode, 40) || "incremental";
   const forceChildFull = chunk.forceChildFull === true || params.forceChildFull === true;
   const generation = integer(params.generation ?? run.generation, run.generation || 0);
@@ -1616,7 +1635,16 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   const page = pageEnd;
   const hasMore = chunk.hasMore === true;
   const cursorOut = clean(chunk.cursorOut, 240);
-  const result = { discovered, planned, unchanged, unavailableUnchanged, scheduled: 0, hasMore, page, pageStart, pageEnd, pagesInBatch, cursorOut, childMode, forceChildFull, generation };
+  const result = { discovered, planned, unchanged, unavailableUnchanged, scheduled: 0, hasMore, page, pageStart, pageEnd, pagesInBatch, cursorOut, childMode, forceChildFull, generation,
+    ...(sourcePageAdvance ? { sourcePageAdvance } : {}),
+    // Persist terminal discovery in the same commit as its source page. If the
+    // final asynchronous HTTP acknowledgement is lost, renew can complete this
+    // exact run without rereading the exhausted provider tail.
+    ...(sourcePageAdvance && !hasMore ? { completeAfterCommit: true, completionResult: {
+      runId, mode: "discovery", childMode, pages: sourcePageAdvance.toPage,
+      dialogsFound: Number(run.purchaseSignals || 0) + discovered, hasMore: false,
+    } } : {}),
+  };
   const commit = await db.dialogScanChunkCommit.create({
     data: {
       agencyId: job.agencyId, creatorId: job.creatorId, runId, jobId: job.id, dialogId: discoveryDialogId,
@@ -1825,7 +1853,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
     localOnly: true,
     hasMore,
     page,
-    pageEnd: integer(chunk.pageEnd, page + pagesInBatch, page + 1, 100_000),
+    pageEnd: integer(chunk.pageEnd, page + pagesInBatch, page + 1, 2_147_483_647),
     cursorOut,
     messageIds,
     changedMessageIds,
@@ -2018,6 +2046,15 @@ async function completeDialogIntelligenceJob({ db = prisma, job, deviceId, resul
   const now = new Date();
   const run = await db.dialogScanRun.findUnique({ where: { id: runId } });
   if (!run) throw new Error("Dialog scan run not found");
+  if (run.mode === "discovery" && params.discoveryTraversalVersion === 1) {
+    const terminalPage = await db.dialogScanChunkCommit.findFirst({ where: {
+      agencyId: job.agencyId, creatorId: job.creatorId, runId, mode: "discovery_source_page",
+      page: run.pagesProcessed, hasMore: false,
+    }, select: { id: true } });
+    if (!terminalPage) throw Object.assign(new Error("Dialog discovery source has not been exhausted"), {
+      code: "DIALOG_DISCOVERY_SOURCE_NOT_EXHAUSTED", status: 409, retryable: false,
+    });
+  }
   const continuation = object(run.continuation);
   const completion = object(result);
   if (isTargetedMode(run.mode)) {

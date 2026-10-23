@@ -266,7 +266,7 @@ const PARTIAL_COVERAGE_REASONS = new Set([
   "event_limit", "not_scanned", "missing_timestamps", "invalid_rows",
   "cursor_stalled", "page_limit", "coverage_unproven",
 ]);
-function nonNegativeCoverageInteger(value, field, max = 1_000_000) {
+function nonNegativeCoverageInteger(value, field, max = 2_147_483_647) {
   if (!Number.isInteger(value) || value < 0 || value > max) {
     throw Object.assign(new Error(`Notification coverage ${field} is invalid`), {
       code: "NOTIFICATION_COVERAGE_METADATA_INVALID",
@@ -291,7 +291,7 @@ function validateFinalScannerCoverage(result, job, rangeFrom, rangeTo) {
         code: "NOTIFICATION_COVERAGE_METADATA_INVALID",
       });
     }
-    nonNegativeCoverageInteger(row.pages, `${type}.pages`, 1_000_000);
+    nonNegativeCoverageInteger(row.pages, `${type}.pages`, 2_147_483_647);
     nonNegativeCoverageInteger(row.events, `${type}.events`);
     const rejected = nonNegativeCoverageInteger(row.rejected, `${type}.rejected`);
     if (status === "complete" && rejected !== 0) {
@@ -312,7 +312,8 @@ function validateFinalScannerCoverage(result, job, rangeFrom, rangeTo) {
     }
     // Observed pages may include one boundary row outside the requested range,
     // but an entirely disjoint evidence interval cannot prove this job.
-    if (oldest && newest && (newest < rangeFrom || oldest > rangeTo)) {
+    const full = job.params?.notificationMode === "full" || job.params?.collectionMode === "full";
+    if (oldest && newest && ((!full && newest < rangeFrom) || oldest > rangeTo)) {
       throw Object.assign(new Error(`Notification coverage evidence is outside the requested range for ${type}`), { code: "NOTIFICATION_COVERAGE_METADATA_INVALID" });
     }
   }
@@ -748,7 +749,8 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
   }
   for (const row of normalized) {
     if (row.rejected || !row.occurredAt) continue;
-    if (row.occurredAt < rangeFrom || row.occurredAt > rangeTo) {
+    const full = params.notificationMode === "full" || params.collectionMode === "full";
+    if ((!full && row.occurredAt < rangeFrom) || row.occurredAt > rangeTo) {
       row.rejected = "EVENT_OUTSIDE_REQUESTED_RANGE";
     }
   }

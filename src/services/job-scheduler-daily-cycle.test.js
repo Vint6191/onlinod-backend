@@ -46,6 +46,11 @@ cacheModule(retentionPath, {
   async runRetentionSweep() { return { totalDeleted: 0 }; },
   async getRetentionSettings() { return { settings: { retentionSweepWindowHours: 24 } }; },
 });
+// These scheduling fixtures model stages that have already released independent work.
+cacheModule(require.resolve("./initial-collection-readiness-service"), {
+  loadInitialCollectionAdmission: async ({ creatorIds }) => new Map(creatorIds.map(id => [id, { financialReleased: true, campaignsReleased: true }])),
+  initialCollectionAdmission: () => ({ admitted: true }),
+});
 cacheModule(subscriberPath, { async ensureSubscriberScanDue() { return { created: false }; } });
 cacheModule(followBackPath, { async ensureAutomaticFollowBack() { return { created: false, reason: "disabled" }; } });
 cacheModule(bumpPath, { async ensureAutomaticBumps() { return { created: false, reason: "disabled" }; } });

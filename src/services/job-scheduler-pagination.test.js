@@ -41,6 +41,11 @@ let derivedFailure = null;
 let analyticsResult = { created: 0, skipped: 0 };
 let admissionError = null;
 
+// These scheduling fixtures model stages that have already released independent work.
+cacheModule(require.resolve("./initial-collection-readiness-service"), {
+  loadInitialCollectionAdmission: async ({ creatorIds }) => new Map(creatorIds.map(id => [id, { financialReleased: true, campaignsReleased: true }])),
+  initialCollectionAdmission: () => ({ admitted: true }),
+});
 cacheModule(prismaPath, {});
 cacheModule(require.resolve("./subscriber-directory-service"), {
   async ensureSubscriberScanDue(input) {

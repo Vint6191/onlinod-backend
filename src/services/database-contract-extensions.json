@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v18_collection_lifecycle_and_entity_changes",
+  "version": "nod_current_v22_recovery172",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -68,6 +68,22 @@
     {
       "migration": "20261022010000_collection_lifecycle_and_entity_changes",
       "checksum": "d7c8442e9d38938c897ecb01ef90646dbf8f593ee089e0079c108f69f0d5b001"
+    },
+    {
+      "migration": "20261023000100_financial_display_authority",
+      "checksum": "01476f6f0edd93af3fd9b86eb1fabd15a5e790c2356618be815782f553c232b3"
+    },
+    {
+      "migration": "20261023010000_media_financial_corrections",
+      "checksum": "604e1fb8f5c577e287b3ebfc63173d70f7381d340ec2335ae1b860cfb41a2fe3"
+    },
+    {
+      "migration": "20261023020000_fan_value_components",
+      "checksum": "b3d25e43aa2b3edafa7aa9a00d444b9a886e4a2bbe6c3c127ca0cdb488f0c9e3"
+    },
+    {
+      "migration": "20261023030000_recovery172_runtime_admission",
+      "checksum": "b9dafa7ca8b16a5386385648adbf6cee5864aa1f972e081ed91ca7d7e8bf46be"
     }
   ],
   "extension": {
@@ -122,6 +138,18 @@
       },
       {
         "name": "CreatorLiveSync",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorMediaFinancialAdoptionState",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorMediaMessageFinancialState",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorMediaSaleLink",
         "persistence": "p"
       },
       {
@@ -439,6 +467,14 @@
         "column_default": null
       },
       {
+        "table": "CreatorEarningsGenerationDay",
+        "name": "financialMetrics",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
         "table": "CreatorEarningsGenerationEntry",
         "name": "generation",
         "data_type": "text",
@@ -492,6 +528,14 @@
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "grossCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -599,6 +643,14 @@
         "column_default": null
       },
       {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "grossCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
         "table": "CreatorEarningsLedgerHour",
         "name": "agencyId",
         "data_type": "text",
@@ -645,6 +697,14 @@
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "financialMetrics",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
       },
       {
         "table": "CreatorEarningsLedgerProof",
@@ -1103,6 +1163,14 @@
         "column_default": null
       },
       {
+        "table": "CreatorFinancialTransaction",
+        "name": "amountCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
         "table": "CreatorLiveSync",
         "name": "creatorId",
         "data_type": "text",
@@ -1159,12 +1227,300 @@
         "column_default": "CURRENT_TIMESTAMP"
       },
       {
+        "table": "CreatorMediaAsset",
+        "name": "revenueUnknownCount",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "phase",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'SALES'::text"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "upperSaleId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "saleCursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "factSource",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "factMessage",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "factMedia",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "completedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "sourceKey",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "messageId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "dialogId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "proofActive",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "purchasedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "operationId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "version",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "dirty",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "true"
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "cursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "saleId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "sourceKey",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "dialogId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "messageId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "netCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "proofActive",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "purchasedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "operationId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "version",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
         "table": "CreatorMediaUsageContribution",
         "name": "factBaseline",
         "data_type": "jsonb",
         "udt_name": "jsonb",
         "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageContribution",
+        "name": "revenueUnknownCount",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
       },
       {
         "table": "CreatorMediaUsageFact",
@@ -1260,6 +1616,14 @@
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "observedPayload",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -2239,6 +2603,22 @@
         "column_default": null
       },
       {
+        "table": "CreatorSale",
+        "name": "amountCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorTip",
+        "name": "amountCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
         "table": "MaintenanceAdmissionClassState",
         "name": "admissionSequence",
         "data_type": "bigint",
@@ -2442,7 +2822,12 @@
       {
         "name": "onlinod_earnings_generation_delta_v1",
         "args": "",
-        "hash": "e5e02eacde56c54a34f552f24067b2d6ff4dec95954975f4aeea7673ea9b5af9"
+        "hash": "bd0b3987c5b80dd959b456e77a12b2e8e59d123d20f39828012fc93c0b3ad377"
+      },
+      {
+        "name": "onlinod_earnings_metrics_delta_v1",
+        "args": "metrics jsonb, status text, net bigint, gross bigint, direction bigint",
+        "hash": "e05164fd783ea934632f8ed70a01aa2f8019e6da3760a58d4ce083c96c4969d1"
       },
       {
         "name": "onlinod_earnings_writer_fence_v6",
@@ -2460,9 +2845,14 @@
         "hash": "672961dd0f1bf92db88837db884821064ba36d32eb54d9e4aa56759f71cf6d70"
       },
       {
+        "name": "onlinod_guard_team_financial_authority_v1",
+        "args": "",
+        "hash": "7b98b12e9a287d9783ffb2d1b763a73e0958ae02955e240ef6d14891655530f4"
+      },
+      {
         "name": "onlinod_live_earnings_hour_v1",
         "args": "",
-        "hash": "3d78c12ead7602a9c641d09f5034c6af4369959fb1124ea740ae41e0f8eac8dc"
+        "hash": "1b54a4fb528428d3e921d87990fd8015444ff26f1e5a434b8899eb0c0b5070bc"
       },
       {
         "name": "onlinod_money_coverage_monotonic_v7",
@@ -2488,6 +2878,11 @@
         "name": "onlinod_sync_creator_task_activity",
         "args": "",
         "hash": "6e15a795e85e5e717f52b0bf909802286b08ece5f5605346681683b3065d2d57"
+      },
+      {
+        "name": "onlinod_traffic_member_metrics_v2",
+        "args": "member_id text",
+        "hash": "85dbdfde605ff69021ba66b982863774b8c72de803df15352c4fbf005b2dbe3b"
       }
     ],
     "triggers": [
@@ -2570,6 +2965,14 @@
         "definition": "CREATE TRIGGER onlinod_provider_gate_waiter_registration BEFORE INSERT OR UPDATE ON public.\"OfProviderRequestGateState\" FOR EACH ROW EXECUTE FUNCTION onlinod_enforce_provider_gate_waiter_registration()",
         "args": "",
         "function": "onlinod_enforce_provider_gate_waiter_registration"
+      },
+      {
+        "table": "TeamMoneyAttributionFact",
+        "name": "TeamMoneyAttributionFact_current_financial_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamMoneyAttributionFact_current_financial_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamMoneyAttributionFact\" FOR EACH ROW EXECUTE FUNCTION onlinod_guard_team_financial_authority_v1()",
+        "args": "",
+        "function": "onlinod_guard_team_financial_authority_v1"
       }
     ],
     "constraints": [
@@ -2900,6 +3303,54 @@
         "deferrable": false,
         "deferred": false,
         "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "CreatorMediaFinancialAdoptionState_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "CreatorMediaFinancialAdoptionState_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "CreatorMediaMessageFinancialState_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "CreatorMediaMessageFinancialState_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", \"sourceKey\", \"messageId\")"
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "CreatorMediaSaleLink_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "CreatorMediaSaleLink_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"saleId\")"
       },
       {
         "table": "CreatorMediaUsageFact",
@@ -3580,6 +4031,60 @@
         "predicate": null
       },
       {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "CreatorMediaFinancialAdoptionState_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "CreatorMediaMessageFinancialState_dirty_idx",
+        "unique": false,
+        "keys": "2 11 3 4",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "CreatorMediaMessageFinancialState_pkey",
+        "unique": true,
+        "keys": "2 3 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "CreatorMediaSaleLink_message_idx",
+        "unique": false,
+        "keys": "3 4 6",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "CreatorMediaSaleLink_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorMediaUsageContribution",
+        "name": "CreatorMediaUsageContribution_last_sale_idx",
+        "unique": false,
+        "keys": "3 5 14",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
         "table": "CreatorMediaUsageContribution",
         "name": "CreatorMediaUsageContribution_legacy_pending_idx",
         "unique": false,
@@ -3596,6 +4101,15 @@
         "options": "0 0 0 0",
         "expressions": null,
         "predicate": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "CreatorMediaUsageFact_last_sale_idx",
+        "unique": false,
+        "keys": "3 4 6 0",
+        "options": "0 0 0 3",
+        "expressions": "(payload ->> 'lastSoldAt'::text)",
+        "predicate": "purchased"
       },
       {
         "table": "CreatorMediaUsageFact",
@@ -3632,6 +4146,15 @@
         "options": "0 0",
         "expressions": null,
         "predicate": null
+      },
+      {
+        "table": "CreatorMediaUsageSourceState",
+        "name": "CreatorMediaUsageSourceState_legacy_pending_idx",
+        "unique": false,
+        "keys": "3",
+        "options": "0",
+        "expressions": null,
+        "predicate": "(\"factProtocol\" = 0)"
       },
       {
         "table": "CreatorMoneyObservation",
@@ -3842,6 +4365,15 @@
       },
       {
         "table": "CreatorRecoveryIntent",
+        "name": "CreatorRecoveryIntent_dialog_episode_idx",
+        "unique": false,
+        "keys": "3 7 1",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
         "name": "CreatorRecoveryIntent_pending_idx",
         "unique": false,
         "keys": "3 4 9 7 1",
@@ -3872,6 +4404,15 @@
         "name": "CreatorRecoveryWatermark_pkey",
         "unique": true,
         "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorSale",
+        "name": "CreatorSale_media_adoption_idx",
+        "unique": false,
+        "keys": "3 1",
         "options": "0 0",
         "expressions": null,
         "predicate": null
@@ -4001,6 +4542,24 @@
         "options": "0 0 3 0",
         "expressions": null,
         "predicate": "(\"publicationStatus\" = 'RECOLLECTING'::text)"
+      },
+      {
+        "table": "TeamMoneyAttributionFact",
+        "name": "TeamMoneyAttributionFact_uncertain_creator_idx",
+        "unique": false,
+        "keys": "2 6 13",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(\"financialStatus\" = ANY (ARRAY['unverified'::text, 'gross_unknown'::text]))"
+      },
+      {
+        "table": "TeamMoneyAttributionFact",
+        "name": "TeamMoneyAttributionFact_uncertain_range_idx",
+        "unique": false,
+        "keys": "2 13 6",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(\"financialStatus\" = ANY (ARRAY['unverified'::text, 'gross_unknown'::text]))"
       },
       {
         "table": "TeamPpvPurchaseLedger",

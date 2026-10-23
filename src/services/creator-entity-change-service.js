@@ -8,7 +8,7 @@ const { currentCommitContext, prepareCommit, runRootCommit } = require("./db-com
 const { hashCanonicalJson } = require("./realtime-receipt-hash");
 const { performance } = require("node:perf_hooks");
 const TYPES = Object.freeze(["MESSAGE_PURCHASE", "HOME", "CRM", "CAMPAIGN", "FAN", "MEDIA", "TEAM", "AUDIENCE", "TRAFFIC"]);
-const MAX_PAGE = 200, MAX_STAGED = 10000, MAX_CONTRIBUTORS = 40000, MAX_PAYLOAD_BYTES = 8192, RETENTION_DAYS = 30;
+const MAX_PAGE = 200, MAX_STAGED = 12000, MAX_CONTRIBUTORS = 40000, MAX_PAYLOAD_BYTES = 8192, RETENTION_DAYS = 30;
 const stages = new WeakMap();
 const fail = (code, status = 409) => Object.assign(new Error(code), { code, status });
 const compare = (left, right) => left < right ? -1 : left > right ? 1 : 0;
@@ -30,7 +30,12 @@ function normalize(change) {
     tombstone: change.tombstone === true, payload: JSON.parse(JSON.stringify(change.payload ?? {})) };
   if (!row.payload || typeof row.payload !== "object" || Array.isArray(row.payload)
       || Buffer.byteLength(JSON.stringify(row.payload)) > MAX_PAYLOAD_BYTES) throw fail("ENTITY_CHANGE_PAYLOAD_INVALID", 400);
-  if (row.entityType === "MESSAGE_PURCHASE" && !row.tombstone) {
+  if (row.entityType === "MESSAGE_PURCHASE" && row.tombstone) {
+    const p = row.payload;
+    boundedString(p.dialogId, 240); boundedString(p.messageId, 240);
+    if (row.entityId !== `${p.dialogId}:${p.messageId}` || p.reason !== "CANONICAL_ASSOCIATION_WITHDRAWN"
+      || Object.keys(p).some(key => !["dialogId", "messageId", "reason"].includes(key))) throw fail("ENTITY_CHANGE_PURCHASE_INVALID", 400);
+  } else if (row.entityType === "MESSAGE_PURCHASE" && !row.tombstone) {
     const p = row.payload;
     boundedString(p.dialogId, 240); boundedString(p.messageId, 240);
     if (typeof p.opened !== "boolean" || row.entityId !== `${p.dialogId}:${p.messageId}`) throw fail("ENTITY_CHANGE_PURCHASE_INVALID", 400);
@@ -153,25 +158,14 @@ async function canonicalFactRows(db, { agencyId, creatorId, ids, model }) {
     include: { fan: { select: { onlyFansUserId: true } } }, take: unique.length }) : [];
 }
 async function publishCanonicalSales({ db, agencyId, creatorId, saleIds }) {
+  await require("./creator-fact-write-authority").lockCreatorFacts(db, agencyId, creatorId);
   const rows = await canonicalFactRows(db, { agencyId, creatorId, ids: saleIds, model: "creatorSale" });
   if (!rows.length) return { staged: true, count: 0 };
   const changes = factInvalidations({ rows, model: "CreatorSale", creatorId, scopedTypes: ["CRM", "MEDIA", "FAN"] });
-  for (const row of rows) {
-    const dialogId = row.fanOnlyFansUserIdAtEvent || row.fan?.onlyFansUserId;
-    const dataVersion = hashCanonicalJson({ id: row.id, dialogId, messageId: row.messageId, saleType: row.saleType, purchasedAt: row.purchasedAt,
-      status: row.transactionStatus, amountCents: row.amountCents, netCents: row.netCents, currency: row.currency });
-    // Payout rows with no exact message identity are not purchase evidence for
-    // a particular local message. A later canonical link enters this same path.
-    // Refunds change financial/media reads; they do not prove message closure.
-    if (dialogId && row.messageId && row.saleType === "MESSAGE"
-        && ["", "done", "completed", "complete", "success", "paid"].includes(String(row.transactionStatus || "").toLowerCase())) {
-      changes.push({ entityType: "MESSAGE_PURCHASE", entityId: `${dialogId}:${row.messageId}`,
-        sourceIdentity: `CreatorSale:${row.id}`, sourceVersion: dataVersion, payload: { dialogId, messageId: row.messageId, opened: true,
-          purchasedAt: new Date(row.purchasedAt).toISOString(), operationId: row.externalTransactionId || row.externalNotificationId || row.id } });
-    }
-  }
+  changes.push(...await require("./media-financial-projection-service").publishCanonicalMediaSales({ db, agencyId, creatorId, rows }));
   return publishEntityChanges({ db, agencyId, creatorId, changes });
 }
+
 async function publishCanonicalFactInvalidations({ db, agencyId, creatorId, model, ids }) {
   if (!["creatorTip", "creatorSubscriptionEvent", "creatorPostLike", "creatorPostComment"].includes(model)) throw fail("ENTITY_CHANGE_TYPE_INVALID");
   const rows = await canonicalFactRows(db, { agencyId, creatorId, model, ids });

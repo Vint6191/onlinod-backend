@@ -1,6 +1,7 @@
 "use strict";
 const { readCampaignRefreshDebt } = require("./campaign-refresh-debt-service");
 const { readWithAnalyticsViewer } = require("./analytics-viewer-read-service");
+const { valueFieldState } = require("./fan-value-field-authority");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { CAMPAIGN_COVERAGE_SELECT, evaluateCampaignCollectionState, coverageDto } = require("./campaign-freshness-service");
 const DAY = 86400000, UNKNOWN = "unattributed_paid_subscriptions";
@@ -58,7 +59,7 @@ async function freshness(db, creator, now) {
 async function readSnapshot(db, input, reader) {
   return readWithAnalyticsViewer({ ...input, db, permission: "traffic.view" }, async ({ db: tx, creator }) => {
     const now = await dbAuthorityNow({ db: tx });
-    const result = await reader(tx, creator, rangeWindow(input.rangeKey, now));
+    const result = await reader(tx, creator, rangeWindow(input.rangeKey, now), now);
     return { ok: true, contractVersion: 2, creatorId: creator.id, asOf: now.toISOString(), ...result,
       projection: await freshness(tx, creator, now) };
   });
@@ -102,7 +103,7 @@ async function getTrafficOverview(input) {
 
 async function getTrafficSourceMembers(input) {
   const { take, offset, after } = page(input), unknown = input.sourceId === UNKNOWN;
-  return readSnapshot(input.db, input, async (db, creator, range) => {
+  return readSnapshot(input.db, input, async (db, creator, range, now) => {
     const source = unknown ? { id: UNKNOWN, sourceType: "paid_unknown", name: "Paid subscriptions · unknown source" }
       : await db.trafficSource.findFirst({ where: { id: input.sourceId, agencyId: creator.agencyId, creatorId: creator.id } });
     if (!source) throw fault("TRAFFIC_SOURCE_NOT_FOUND", 404);
@@ -120,21 +121,28 @@ async function getTrafficSourceMembers(input) {
     const paid = await revenue(db, creator, "receiptFan:" + key, fanIds, range);
     const value = (await lifetime(db, creator, "source", [key])).get(key) || {};
     const members = visible.map(row => {
-      const fan = identities.get(row.fanId), val = valueMap.get(fan?.id), available = val?.availability === "AVAILABLE";
+      const fan = identities.get(row.fanId), val = valueMap.get(fan?.id), fieldState = valueFieldState(val, now), available = fieldState.available;
+      const money = field => fieldState.fields[field].fresh && val?.[field] != null ? num(val[field]) : null;
       const username = fan?.username || row.metadata?.fanUsername || null, name = fan?.displayName || row.metadata?.fanName || null;
       return { fanId: row.fanId, fanUsername: username, fanName: name, avatarUrl: fan?.avatarUrl || row.metadata?.fanAvatar || null,
         displayName: username ? `@${username}` : name || row.fanId, valueAvailability: val?.availability || "NOT_FETCHED",
-        totalSummCents: available ? num(val.platformReportedTotalSpendCents) : null,
-        messagesSummCents: available ? num(val.messagesSpentCents) : null, tipsSummCents: available ? num(val.tipsSpentCents) : null,
-        subscribesSummCents: available ? num(val.subscriptionsSpentCents) : null, postsSummCents: available ? num(val.postsSpentCents) : null,
-        streamsSummCents: available ? num(val.streamsSpentCents) : null, fetchedAt: val?.valueObservedAt || null,
-        lastValueFetchedAt: val?.valueObservedAt || null, pendingValue: !available || num(row.projectionMetrics?.valuePendingMembers) > 0,
+        totalSummCents: available ? money("platformReportedTotalSpendCents") : null,
+        messagesSummCents: money("messagesSpentCents"), tipsSummCents: money("tipsSpentCents"),
+        subscribesSummCents: money("subscriptionsSpentCents"), postsSummCents: money("postsSpentCents"),
+        streamsSummCents: money("streamsSpentCents"), fetchedAt: fieldState.fields.platformReportedTotalSpendCents.observedAt,
+        fieldAuthority: fieldState.authority, fieldFreshness: fieldState.fields,
+        lastValueFetchedAt: fieldState.fields.platformReportedTotalSpendCents.observedAt, pendingValue: !available || num(row.projectionMetrics?.valuePendingMembers) > 0,
         firstSeenAt: row.firstSeenAt || null, lastSeenAt: row.lastSeenAt || null, claimedAt: row.claimedAt || null, convertedAt: row.convertedAt || null,
         ledgerSubscriptions: num(paid.get(row.fanId)?.paidSubscriptions), ledgerRevenueCents: num(paid.get(row.fanId)?.revenueCents) };
     });
+    const componentTotals = Object.fromEntries([['messages','Messages'],['tips','Tips'],['subscribes','Subscribes'],['posts','Posts'],['streams','Streams']].flatMap(([name,metric]) => {
+      const known = num(value[`value${metric}Cents`]);
+      const members = num(value.sourceMembers);
+      const proved = members === 0 || (num(value.valueComponentsMembers) === members && num(value[`value${metric}UnknownMembers`]) === 0);
+      return [[`${name}SummCents`,proved ? known : null],[`known${metric}SummCents`,known],[`${name}UnknownMembers`,num(value[`value${metric}UnknownMembers`])]];
+    }));
     return { source, range, totals: { members: num(unknown ? value.paidFans : value.sourceMembers), fetched: num(value.valueSnapshotMembers), pending: num(value.valuePendingMembers),
-      buyers: num(unknown ? value.paidFans : value.valuePayingFans), fanValueCents: num(value.fanValueCents), messagesSummCents: num(value.valueMessagesCents),
-      tipsSummCents: num(value.valueTipsCents), subscribesSummCents: num(value.valueSubscribesCents), postsSummCents: num(value.valuePostsCents), streamsSummCents: num(value.valueStreamsCents) },
+      buyers: num(unknown ? value.paidFans : value.valuePayingFans), fanValueCents: num(value.fanValueCents), ...componentTotals },
     members, pagination: { limit: take, offset, returned: members.length, hasMore: rows.length > take, nextCursor: rows.length > take ? visible.at(-1).fanId : null } };
   });
 }

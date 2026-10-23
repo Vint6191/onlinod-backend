@@ -4,6 +4,10 @@
 // pointer swap. No provider/network work, whole-run scan, or historical delete
 // is permitted in the final commit.
 const PAGE = 500;
+// Canonical publication invokes business projections and their durable work
+// triggers. Keep that fan-out bounded to one provider page per transaction;
+// copying verified ledger entries and resolving hints retain the larger budget.
+const APPLY_PAGE = 100;
 const { earningsCategory } = require("./financial-transaction-category");
 const fail = (code) => Object.assign(new Error(code), { code });
 async function lock(db, creatorId) {
@@ -14,22 +18,22 @@ async function tryLock(db, creatorId) {
   return row?.owned === true;
 }
 async function upsert(db, generation, rows) {
-  if (!rows.length) return;
-  await db.$executeRawUnsafe(`INSERT INTO "CreatorEarningsGenerationEntry"
-    (generation,"transactionId","occurredAt",category,"netCents",status,"observedAt")
-    SELECT $1,x."transactionId",x."occurredAt",x.category,x."netCents",x.status,x."observedAt"
-    FROM jsonb_to_recordset($2::jsonb) x("transactionId" text,"occurredAt" timestamp,category text,"netCents" bigint,status text,"observedAt" timestamp)
+  if (!rows.length) return [];
+  return db.$queryRawUnsafe(`INSERT INTO "CreatorEarningsGenerationEntry"
+    (generation,"transactionId","occurredAt",category,"netCents","grossCents",status,"observedAt")
+    SELECT $1,x."transactionId",x."occurredAt",x.category,x."netCents",x."grossCents",x.status,x."observedAt"
+    FROM jsonb_to_recordset($2::jsonb) x("transactionId" text,"occurredAt" timestamp,category text,"netCents" bigint,"grossCents" bigint,status text,"observedAt" timestamp)
     ORDER BY x."transactionId"
     ON CONFLICT(generation,"transactionId") DO UPDATE SET "occurredAt"=EXCLUDED."occurredAt",category=EXCLUDED.category,
-      "netCents"=EXCLUDED."netCents",status=EXCLUDED.status,"observedAt"=EXCLUDED."observedAt"
-    WHERE "CreatorEarningsGenerationEntry"."observedAt"<=EXCLUDED."observedAt"`, generation,
+      "netCents"=EXCLUDED."netCents","grossCents"=EXCLUDED."grossCents",status=EXCLUDED.status,"observedAt"=EXCLUDED."observedAt"
+    WHERE "CreatorEarningsGenerationEntry"."observedAt"<=EXCLUDED."observedAt" RETURNING "transactionId"`, generation,
     JSON.stringify(rows, (_, v) => typeof v === "bigint" ? v.toString() : v));
 }
 async function activeEntry(db, creatorId, transactionId) {
-  const [row] = await db.$queryRawUnsafe(`SELECT e."transactionId",e."occurredAt",e.category,e."netCents",e.status,e."observedAt",e.generation FROM "CreatorEarningsLedgerProof" p
+  const [row] = await db.$queryRawUnsafe(`SELECT e."transactionId",e."occurredAt",e.category,e."netCents",e."grossCents",e.status,e."observedAt",e.generation FROM "CreatorEarningsLedgerProof" p
     JOIN "CreatorEarningsGenerationEntry" e ON e.generation=p."activeGeneration"
     WHERE p."creatorId"=$1 AND e."transactionId"=$2
-    UNION ALL SELECT e.* FROM (SELECT "transactionId","occurredAt",category,"netCents",status,"observedAt",NULL::text AS generation
+    UNION ALL SELECT e.* FROM (SELECT "transactionId","occurredAt",category,"netCents","grossCents",status,"observedAt",NULL::text AS generation
       FROM "CreatorEarningsLedgerEntry" WHERE "creatorId"=$1 AND "transactionId"=$2) e
     WHERE NOT EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$1 AND "activeGeneration" IS NOT NULL)`, creatorId, transactionId);
   return row || null;
@@ -40,11 +44,11 @@ async function writeLive(db, scope, row) {
     WHERE "creatorId"=$1 AND mode='SNAPSHOT' AND state IN ('ACTIVE','BUILDING','READY') ORDER BY id`, scope.creatorId);
   if (!targets.some(x => x.state === "ACTIVE")) {
     await db.$executeRawUnsafe(`INSERT INTO "CreatorEarningsLedgerEntry"
-      ("agencyId","creatorId","transactionId","occurredAt",category,"netCents",status,"observedAt")
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT("creatorId","transactionId") DO UPDATE SET
+      ("agencyId","creatorId","transactionId","occurredAt",category,"netCents",status,"observedAt","grossCents")
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT("creatorId","transactionId") DO UPDATE SET
       "occurredAt"=EXCLUDED."occurredAt",category=EXCLUDED.category,"netCents"=EXCLUDED."netCents",
-      status=EXCLUDED.status,"observedAt"=EXCLUDED."observedAt"`, scope.agencyId,scope.creatorId,row.transactionId,
-      row.occurredAt,row.category,row.netCents,row.status,row.observedAt);
+      "grossCents"=EXCLUDED."grossCents",status=EXCLUDED.status,"observedAt"=EXCLUDED."observedAt"`, scope.agencyId,scope.creatorId,row.transactionId,
+      row.occurredAt,row.category,row.netCents,row.status,row.observedAt,row.grossCents ?? null);
   }
   for (const target of targets) await upsert(db,target.id,[row]);
 }
@@ -88,24 +92,25 @@ async function preparePage(db, job, run) {
     await advance(db,g,rows,rows.at(-1)?.transactionId,"APPLY");
   } else if (g.phase === "APPLY") {
     rows = await db.$queryRawUnsafe(`SELECT "externalId","occurredAt",value FROM "FinancialObservedFact"
-      WHERE "runId"=$1 AND "windowIndex"=0 AND "externalId">$2 ORDER BY "externalId" LIMIT $3`,run.id,g.cursor,PAGE);
+      WHERE "runId"=$1 AND "windowIndex"=0 AND "externalId">$2 ORDER BY "externalId" LIMIT $3`,run.id,g.cursor,APPLY_PAGE);
     let invalid = 0, oldest = g.oldestAt;
     const values = [];
     for (const f of rows) {
       const v=f.value, net=Number(v.netCents);
       if (v.netCents == null || !Number.isSafeInteger(net) || net<0 || v.currency!=="USD" || !["done","loading","undo"].includes(v.transactionStatus)) { invalid++; continue; }
       if (!oldest || +f.occurredAt<+oldest) oldest=f.occurredAt;
-      values.push({transactionId:f.externalId,occurredAt:f.occurredAt,netCents:net,status:v.transactionStatus,observedAt:snapshot,
+      values.push({transactionId:f.externalId,occurredAt:f.occurredAt,netCents:net,grossCents:v.amountCents ?? null,status:v.transactionStatus,observedAt:snapshot,
         category:earningsCategory(v)});
     }
     // The complete immutable receipt is checked before preparation. Each delta
     // is already an exact financial fact; only the range proof waits for finalization.
-    await upsert(db,g.mode === "DELTA" ? g.baseGeneration : g.id,values);
+    const accepted = new Set((await upsert(db,g.mode === "DELTA" ? g.baseGeneration : g.id,values)).map(row=>row.transactionId));
+    await require("./financial-transactions-service").publishVerifiedFinancialFactsPage({ db, job, facts: rows.filter(row=>accepted.has(row.externalId)), now: new Date() });
     await db.$executeRawUnsafe(`UPDATE "CreatorEarningsGeneration" SET "observedCount"="observedCount"+$2,
       "invalidCount"="invalidCount"+$3,"oldestAt"=$4 WHERE id=$1`,g.id,rows.length,invalid,oldest);
-    if (rows.length<PAGE && (Number(g.observedCount)+rows.length !== run.proof.windows[0].count || Number(g.invalidCount)+invalid))
+    if (rows.length<APPLY_PAGE && (Number(g.observedCount)+rows.length !== run.proof.windows[0].count || Number(g.invalidCount)+invalid))
       throw fail("EARNINGS_GENERATION_PROOF_MISMATCH");
-    await advance(db,g,rows,rows.at(-1)?.externalId,"RESOLVE");
+    await advance(db,g,rows,rows.at(-1)?.externalId,"RESOLVE",APPLY_PAGE);
   } else if (g.phase === "RESOLVE") {
     if (run.windows[0].kind === "RESOLUTION" && !g.cursor) {
       // A bounded resolution cannot silently retain a transaction absent from
@@ -130,8 +135,8 @@ async function preparePage(db, job, run) {
   } else throw fail("EARNINGS_GENERATION_STAGE_INVALID");
   return { ready:g.phase==="RESOLVE" && rows.length<PAGE, generation:g.id, visited:rows.length, phase:g.phase };
 }
-async function advance(db,g,rows,cursor,next) {
-  await db.$executeRawUnsafe('UPDATE "CreatorEarningsGeneration" SET phase=$2,cursor=$3 WHERE id=$1',g.id,rows.length===PAGE?g.phase:next,rows.length===PAGE?cursor:"");
+async function advance(db,g,rows,cursor,next,pageSize=PAGE) {
+  await db.$executeRawUnsafe('UPDATE "CreatorEarningsGeneration" SET phase=$2,cursor=$3 WHERE id=$1',g.id,rows.length===pageSize?g.phase:next,rows.length===pageSize?cursor:"");
 }
 async function publish(db,job,run) {
   if (!supported(run)) return false;
@@ -171,4 +176,4 @@ async function publish(db,job,run) {
       resolution?previous.generation:run.generation,g.mode === "DELTA" ? g.baseGeneration : g.id);
   return true;
 }
-module.exports = {PAGE,lock,tryLock,upsert,activeEntry,writeLive,preparePage,publish};
+module.exports = {PAGE,APPLY_PAGE,lock,tryLock,upsert,activeEntry,writeLive,preparePage,publish};

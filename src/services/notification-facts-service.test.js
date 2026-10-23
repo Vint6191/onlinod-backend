@@ -897,8 +897,9 @@ test("production transaction acquires the advisory lock before canonical fan/fac
   });
   assert.equal(result.status, "COMMITTED");
   assert.match(sqlCalls[0], /pg_advisory_xact_lock/);
-  assert.equal(db.store.fans.length, 1);
-  assert.equal(db.store.fans[0].onlyFansUserId, "lock-fan");
+  // The production event projector writes fans in bulk SQL. This adapter only
+  // observes execution order; actual SQL projection has its own SQL proof.
+  assert(sqlCalls.findIndex(sql => /INSERT INTO "CreatorFan"/.test(sql)) > 0);
 });
 
 test("a batch committed after ensureBatch is re-read under the transaction lock and never overwrites counters", async () => {

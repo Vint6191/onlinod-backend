@@ -26,7 +26,7 @@ function fixture(t, { slowEnumeration = false, skippedClaim = null } = {}) {
       claimDomainWorkBatch: async ({ workClass }) => {
         claims.push(workClass); clock += 1000;
         if (skippedClaim) return { ownerToken: "owner", items: [], ...skippedClaim };
-        return { ownerToken: "owner", items: [{ id: workClass, workClass, agencyId: "agency", creatorId: "creator", objectId: "creator", progressCursor: { table: 7 } }] };
+        return { ownerToken: "owner", items: [{ id: workClass, workClass, agencyId: "agency", creatorId: "creator", objectId: "creator", progressCursor: { table: 7, financialRepairVersion: 172 } }] };
       },
       lockDomainWorkClaimForCommit: async ({ item }) => ({ current: true, item }),
       ackDomainWorkClaim: async ({ item }) => { acknowledgements.push(item.workClass); return { lost: false }; },

@@ -4,7 +4,8 @@ const crypto = require("node:crypto");
 const { hashCanonicalJson } = require("./realtime-receipt-hash");
 const { publishMediaResult } = require("./media-entity-change-service");
 const MAX_FACTS = 2000, MAX_LEGACY_MEDIA = 2000, MAX_RUNS = 8;
-const COUNTS = ["sentCount", "soldCount", "notOpenedCount", "freeCount", "revenueCents"];
+const financialMedia = require("./media-financial-projection-service");
+const COUNTS = financialMedia.COUNTS;
 
 function fail(code, sourceKey, reason, status = 409) {
   throw Object.assign(new Error(code), { code, sourceKey, reason, status });
@@ -57,7 +58,13 @@ function normalizeUsageFactSource(input) {
     const next = [fact.messageId, fact.mediaId];
     if (prior && compareKey(prior, next) >= 0) fail("MEDIA_USAGE_FACT_INVALID", sourceKey, "fact keyset order");
     prior = next;
-    return { messageId: fact.messageId, mediaId: fact.mediaId, ...counters(fact) };
+    if ((fact.allocationCount !== undefined || fact.allocationIndex !== undefined)
+      && (!Number.isSafeInteger(fact.allocationCount) || fact.allocationCount < 1 || fact.allocationCount > 100000
+        || !Number.isSafeInteger(fact.allocationIndex) || fact.allocationIndex < 0 || fact.allocationIndex >= fact.allocationCount)) fail("MEDIA_USAGE_FACT_INVALID", sourceKey, "allocation ordinal");
+    if (fact.purchaseEvidence !== undefined && !["PROVIDER","CANONICAL","NONE"].includes(fact.purchaseEvidence)) fail("MEDIA_USAGE_FACT_INVALID", sourceKey, "purchase evidence");
+    return { messageId: fact.messageId, mediaId: fact.mediaId, ...counters(fact),
+      ...(fact.allocationCount === undefined ? {} : { allocationCount: fact.allocationCount, allocationIndex: fact.allocationIndex }),
+      ...(fact.purchaseEvidence === undefined ? {} : { purchaseEvidence: fact.purchaseEvidence }) };
   });
   return { protocolVersion: 2, sourceKey, sourceRevision: input.sourceRevision, capturedAt: new Date(input.capturedAt),
     coverage: { version: 1, complete: coverage.complete, localRevision: coverage.localRevision, messageCount: coverage.messageCount,
@@ -99,7 +106,7 @@ function advanceRun(state, source) {
     runs: [...runs.filter(run => run.runId !== page.runId), receipt].slice(-MAX_RUNS) } };
 }
 
-async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source, recomputeUsage }) {
+async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source }) {
   const scope = { agencyId, creatorId, sourceKey: source.sourceKey };
   const state = await tx.creatorMediaUsageSourceState.findUnique({ where: { creatorId_sourceKey: { creatorId, sourceKey: source.sourceKey } } });
   const run = advanceRun(state, source);
@@ -126,16 +133,31 @@ async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source, recompu
     legacyRows = pending;
   }
   const existing = source.facts.length ? await tx.$queryRawUnsafe(`
-    SELECT f."sourceMessageId", f."mediaId", f.payload, f.purchased FROM "CreatorMediaUsageFact" f
+    SELECT f."sourceMessageId", f."mediaId", f.payload, f."observedPayload", f.purchased FROM "CreatorMediaUsageFact" f
     JOIN jsonb_to_recordset($4::jsonb) AS page("messageId" text, "mediaId" text)
       ON f."sourceMessageId"=page."messageId" AND f."mediaId"=page."mediaId"
     WHERE f."agencyId"=$1 AND f."creatorId"=$2 AND f."sourceKey"=$3`, agencyId, creatorId, source.sourceKey, JSON.stringify(source.facts)) : [];
   const previous = new Map(existing.map(row => [key({ messageId: row.sourceMessageId, mediaId: row.mediaId }), row]));
+  const financialStates = await financialMedia.statesForFacts(tx, scope, source.facts.map(fact => ({ ...fact, sourceKey: source.sourceKey })));
   const changed = [], baselines = new Map(), pendingLegacy = new Set();
-  for (const fact of source.facts) {
-    const old = previous.get(key(fact));
-    if (old && (hashCanonicalJson(old.payload) === hashCanonicalJson(fact) || (old.purchased && !fact.soldCount))) continue;
-    if (old && (old.purchased || !fact.soldCount)) fail("MEDIA_USAGE_FACT_CONFLICT", source.sourceKey, `accounting evidence changed for ${fact.messageId}:${fact.mediaId}`);
+  for (const incoming of source.facts) {
+    const old = previous.get(key(incoming)), oldObserved = old?.observedPayload || old?.payload;
+    const state = financialStates.get(JSON.stringify([source.sourceKey,incoming.messageId]));
+    let observed = incoming;
+    if (oldObserved && oldObserved.soldCount && !incoming.soldCount
+      && !(state && !state.proofActive && oldObserved.purchaseEvidence !== "PROVIDER")) observed = oldObserved;
+    else if (oldObserved && !state && (oldObserved.soldCount || !incoming.soldCount)
+      && COUNTS.filter(field => !["revenueCents", "revenueUnknownCount"].includes(field)).some(field => Number(oldObserved[field] || 0) !== Number(incoming[field] || 0))) {
+      fail("MEDIA_USAGE_FACT_CONFLICT", source.sourceKey, `accounting evidence changed for ${incoming.messageId}:${incoming.mediaId}`);
+    }
+    // A late old desktop omits ordinals; it cannot erase already-proven exact
+    // attachment allocation metadata for the same immutable message/media fact.
+    if (observed.allocationCount === undefined && oldObserved?.allocationCount !== undefined) observed = {
+      ...observed, allocationCount: oldObserved.allocationCount, allocationIndex: oldObserved.allocationIndex,
+    };
+    const fact = financialMedia.effectiveFact(observed, state);
+    if (old && hashCanonicalJson(old.payload) === hashCanonicalJson(fact)
+      && hashCanonicalJson(oldObserved) === hashCanonicalJson(observed)) continue;
     const row = contributionById.get(fact.mediaId);
     if (legacy && row && (!row.factBaseline || row.factBaseline.legacyPending === true)) pendingLegacy.add(fact.mediaId);
     const baseline = baselines.get(fact.mediaId) || counters(row?.factBaseline || (!legacy ? row : null) || zero());
@@ -145,18 +167,19 @@ async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source, recompu
     }
     baseline.uniqueBuyers = baseline.soldCount > 0 ? 1 : 0;
     if (fact.lastSoldAt && (!baseline.lastSoldAt || fact.lastSoldAt > baseline.lastSoldAt)) baseline.lastSoldAt = fact.lastSoldAt;
-    baselines.set(fact.mediaId, baseline); changed.push(fact);
+    if (!baseline.soldCount) baseline.lastSoldAt = null;
+    baselines.set(fact.mediaId, baseline); changed.push({ fact, observed });
   }
   const active = mediaIds.length ? await tx.creatorMediaAsset.findMany({ where: { agencyId, creatorId, catalogActive: true, mediaId: { in: mediaIds } }, select: { mediaId: true }, take: mediaIds.length }) : [];
   const activeIds = new Set(active.map(row => row.mediaId));
   if (changed.length) {
     await tx.$executeRawUnsafe(`INSERT INTO "CreatorMediaUsageFact"
-      (id,"agencyId","creatorId","sourceKey","sourceMessageId","mediaId",payload,purchased,"sourceRevision","lastSeenRunId","createdAt","updatedAt")
-      SELECT page.id,$1,$2,$3,page."messageId",page."mediaId",page.payload,page.purchased,$5,$6,clock_timestamp(),clock_timestamp()
-      FROM jsonb_to_recordset($4::jsonb) AS page(id text,"messageId" text,"mediaId" text,payload jsonb,purchased boolean)
-      ON CONFLICT ("creatorId","sourceKey","sourceMessageId","mediaId") DO UPDATE SET payload=EXCLUDED.payload,purchased=EXCLUDED.purchased,
+      (id,"agencyId","creatorId","sourceKey","sourceMessageId","mediaId",payload,"observedPayload",purchased,"sourceRevision","lastSeenRunId","createdAt","updatedAt")
+      SELECT page.id,$1,$2,$3,page."messageId",page."mediaId",page.payload,page.observed,page.purchased,$5,$6,clock_timestamp(),clock_timestamp()
+      FROM jsonb_to_recordset($4::jsonb) AS page(id text,"messageId" text,"mediaId" text,payload jsonb,observed jsonb,purchased boolean)
+      ON CONFLICT ("creatorId","sourceKey","sourceMessageId","mediaId") DO UPDATE SET payload=EXCLUDED.payload,"observedPayload"=EXCLUDED."observedPayload",purchased=EXCLUDED.purchased,
         "sourceRevision"=EXCLUDED."sourceRevision","lastSeenRunId"=EXCLUDED."lastSeenRunId","updatedAt"=EXCLUDED."updatedAt"`,
-    agencyId, creatorId, source.sourceKey, JSON.stringify(changed.map(fact => ({ id: crypto.randomUUID(), messageId: fact.messageId, mediaId: fact.mediaId, payload: fact, purchased: Boolean(fact.soldCount) }))), source.sourceRevision, source.factPage.runId);
+    agencyId, creatorId, source.sourceKey, JSON.stringify(changed.map(({ fact, observed }) => ({ id: crypto.randomUUID(), messageId: fact.messageId, mediaId: fact.mediaId, payload: fact, observed, purchased: Boolean(fact.soldCount) }))), source.sourceRevision, source.factPage.runId);
   }
   if (activate) for (const row of legacyRows) {
     pendingLegacy.add(row.mediaId);
@@ -166,10 +189,18 @@ async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source, recompu
   // evidence whose message identities were never stored by the aggregate API.
   // Keep that exact old projection until facts account for it. This is a
   // conservative migration hold, never a max(old,new) accounting projection.
-  const unexplainedLegacy = activate && legacyRows.some(row => ["sentCount", "soldCount", "revenueCents"]
+  const unexplainedLegacy = activate && legacyRows.some(row => ["sentCount", "soldCount"]
     .some(field => baselines.get(row.mediaId)[field] < Number(row[field] || 0)));
   if (unexplainedLegacy) activate = false;
   const affected = [...baselines.keys()];
+  if (affected.length) {
+    const lastRows = await tx.$queryRawUnsafe(`SELECT k."mediaId",(SELECT f.payload->>'lastSoldAt'
+      FROM "CreatorMediaUsageFact" f WHERE f."creatorId"=$2 AND f."sourceKey"=$3 AND f."mediaId"=k."mediaId" AND f.purchased
+      ORDER BY (f.payload->>'lastSoldAt') DESC LIMIT 1) at FROM unnest($4::text[]) k("mediaId") WHERE $1::text IS NOT NULL`, agencyId,creatorId,source.sourceKey,affected);
+    for (const row of lastRows) baselines.get(row.mediaId).lastSoldAt = row.at || null;
+  }
+
+  let projectionRows = [];
   if (affected.length) {
     await tx.creatorMediaAsset.createMany({ data: affected.map(mediaId => ({ id: crypto.randomUUID(), agencyId, creatorId, mediaId,
       catalogActive: false, sortingStatus: "UNSORTED", firstSeenAt: source.capturedAt, lastSeenAt: source.capturedAt })), skipDuplicates: true });
@@ -179,14 +210,15 @@ async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source, recompu
       factBaseline: { ...baselines.get(mediaId), legacyPending: !activate && pendingLegacy.has(mediaId) },
       ...(!activate && pendingLegacy.has(mediaId) ? counters(contributionById.get(mediaId)) : baselines.get(mediaId)) }));
     await tx.$executeRawUnsafe(`INSERT INTO "CreatorMediaUsageContribution"
-      (id,"agencyId","creatorId","sourceKey","sourceRevision","assetId","mediaId","factBaseline","sentCount","soldCount","notOpenedCount","freeCount","revenueCents","uniqueBuyers","lastSoldAt","capturedAt","createdAt","updatedAt")
-      SELECT p.id,$1,$2,$3,$5,p."assetId",p."mediaId",p."factBaseline",p."sentCount",p."soldCount",p."notOpenedCount",p."freeCount",p."revenueCents",p."uniqueBuyers",p."lastSoldAt",$6,clock_timestamp(),clock_timestamp()
-      FROM jsonb_to_recordset($4::jsonb) AS p(id text,"assetId" text,"mediaId" text,"factBaseline" jsonb,"sentCount" int,"soldCount" int,"notOpenedCount" int,"freeCount" int,"revenueCents" int,"uniqueBuyers" int,"lastSoldAt" timestamptz)
+      (id,"agencyId","creatorId","sourceKey","sourceRevision","assetId","mediaId","factBaseline","sentCount","soldCount","notOpenedCount","freeCount","revenueCents","revenueUnknownCount","uniqueBuyers","lastSoldAt","capturedAt","createdAt","updatedAt")
+      SELECT p.id,$1,$2,$3,$5,p."assetId",p."mediaId",p."factBaseline",p."sentCount",p."soldCount",p."notOpenedCount",p."freeCount",p."revenueCents",p."revenueUnknownCount",p."uniqueBuyers",p."lastSoldAt",$6,clock_timestamp(),clock_timestamp()
+      FROM jsonb_to_recordset($4::jsonb) AS p(id text,"assetId" text,"mediaId" text,"factBaseline" jsonb,"sentCount" int,"soldCount" int,"notOpenedCount" int,"freeCount" int,"revenueCents" int,"revenueUnknownCount" int,"uniqueBuyers" int,"lastSoldAt" timestamptz)
       ON CONFLICT ("creatorId","sourceKey","mediaId") DO UPDATE SET "assetId"=EXCLUDED."assetId","sourceRevision"=EXCLUDED."sourceRevision",
         "factBaseline"=EXCLUDED."factBaseline","sentCount"=EXCLUDED."sentCount","soldCount"=EXCLUDED."soldCount","notOpenedCount"=EXCLUDED."notOpenedCount",
-        "freeCount"=EXCLUDED."freeCount","revenueCents"=EXCLUDED."revenueCents","uniqueBuyers"=EXCLUDED."uniqueBuyers","lastSoldAt"=EXCLUDED."lastSoldAt",
+        "freeCount"=EXCLUDED."freeCount","revenueCents"=EXCLUDED."revenueCents","revenueUnknownCount"=EXCLUDED."revenueUnknownCount","uniqueBuyers"=EXCLUDED."uniqueBuyers","lastSoldAt"=EXCLUDED."lastSoldAt",
         "capturedAt"=GREATEST("CreatorMediaUsageContribution"."capturedAt",EXCLUDED."capturedAt"),"updatedAt"=EXCLUDED."updatedAt"`,
     agencyId, creatorId, source.sourceKey, JSON.stringify(rows), source.sourceRevision, source.capturedAt);
+    projectionRows = rows.map(row => ({ mediaId: row.mediaId, before: contributionById.get(row.mediaId), after: row }));
   }
   if (source.coverage.complete && source.factPage.done) run.coverage.fullCoverage = source.coverage;
   run.coverage.awaitingCompleteReason = legacy && !activate
@@ -196,7 +228,7 @@ async function mergeUsageFactSourceTx(tx, { agencyId, creatorId, source, recompu
     update: { sourceRevision: source.sourceRevision, capturedAt: new Date(Math.max(source.capturedAt.getTime(), new Date(state?.capturedAt || 0).getTime())), coverage: run.coverage, factProtocol: legacy && !activate ? 0 : 2 } });
   const projected = affected.filter(mediaId => activate || !pendingLegacy.has(mediaId));
   if (projected.length) {
-    await recomputeUsage(tx, agencyId, creatorId, projected);
+    await financialMedia.applyContributionDeltas(tx, { agencyId, creatorId }, projectionRows.filter(row => projected.includes(row.mediaId)));
     await publishMediaResult({ db: tx, agencyId, creatorId, kind: "USAGE_FACTS", entityId: `usage:${source.sourceKey}`,
       state: { runId: source.factPage.runId, pageHash: source.factPage.pageHash, baseline: [...baselines] } });
   }

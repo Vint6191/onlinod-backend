@@ -85,7 +85,7 @@ async function processRequest({ db, item, ownerToken, schedule = null }) {
     }
     // No provider polling timer. Unresolved coverage is checked again only on a
     // later healthy heartbeat; paused/missing baselines get a longer DB backoff.
-    const delay = ["baseline_missing", "history_paused", "history_cancelled", "module_disabled"].includes(decision.reason) ? 300000 : 60000;
+    const delay = ["baseline_missing", "history_paused", "history_cancelled", "module_disabled", "recovery_stopped"].includes(decision.reason) ? 300000 : 60000;
     await tx.$executeRawUnsafe(`UPDATE "CreatorDialogRecoveryRequest" SET queued=false,"nextCheckAt"=$3,reason=$4
       WHERE "agencyId"=$1 AND "creatorId"=$2`, item.agencyId, item.creatorId, new Date(+now + delay), decision.reason || null);
     assertOwned(await work.ackDomainWorkClaim({ db: tx, item, ownerToken }));

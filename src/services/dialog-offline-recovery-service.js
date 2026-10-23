@@ -147,7 +147,7 @@ async function scheduleOfflineDialogRecovery({
     db.dialogScanRun.findFirst({
       where: { agencyId: agency, creatorId: creator, dialogId: "__dialog_discovery__" },
       orderBy: { createdAt: "desc" },
-      select: { id: true, status: true, continuation: true, createdAt: true, updatedAt: true },
+      select: { id: true, status: true, source: true, jobId: true, lastError: true, continuation: true, createdAt: true, updatedAt: true },
     }),
     db.dialogScanRun.findFirst({
       where: {
@@ -218,6 +218,14 @@ async function scheduleOfflineDialogRecovery({
       status: activeDiscovery.status,
     };
   }
+  let newEpisode = null;
+  if (latestDiscovery?.status === "FAILED") {
+    newEpisode = await require("./dialog-recovery-episode-authority").independentEpisode(db, {
+      agencyId: agency, creatorId: creator, failedRun: latestDiscovery, now: current,
+    });
+    if (!newEpisode) return { ok: true, created: false, reason: "recovery_stopped", gapMs,
+      runId: latestDiscovery.id, jobId: latestDiscovery.jobId, error: latestDiscovery.lastError || "DIALOG_RECOVERY_EXHAUSTED" };
+  }
 
   // Do not schedule the same historical gap again after a discovery and every
   // history row from that generation have already settled. The heartbeat may
@@ -266,6 +274,9 @@ async function scheduleOfflineDialogRecovery({
   if (ACTIVE_RUN_STATUSES.includes(clean(latestBeforeSchedule?.status, 40)?.toUpperCase())) {
     return { ok: true, created: false, reason: "already_in_flight", gapMs, runId: latestBeforeSchedule.id, status: latestBeforeSchedule.status };
   }
+  if (latestBeforeSchedule?.status === "FAILED" && !newEpisode) {
+    return { ok: true, created: false, reason: "recovery_stopped", gapMs, runId: latestBeforeSchedule.id };
+  }
 
   const result = await schedule({
     agencyId: agency,
@@ -273,10 +284,12 @@ async function scheduleOfflineDialogRecovery({
     childMode: "incremental",
     forceChildFull: false,
     source: OFFLINE_DIALOG_RECOVERY_SOURCE,
+    dialogRecoveryEpisode: newEpisode || require("./dialog-recovery-episode-authority").episode({
+      agencyId: agency, creatorId: creator, gapFrom: effectiveLastCoveredAt, targetAt: current,
+    }),
     generation: null,
     pageLimit: 50,
     overlapPages: 2,
-    maxPages: 10_000,
     priority: 80,
     knownMessageThreshold: 1,
     userId: null,

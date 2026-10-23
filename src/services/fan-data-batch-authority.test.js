@@ -81,3 +81,40 @@ test("another consumer's canonical fields satisfy a queued request only after it
   job.params.refreshFields = ["identity"];
   assert.deepEqual((await recheckFanDataBatchDemand({ db, job, batch, now })).readFanIds, ["1"]);
 });
+
+test('terminal malformed profile saves valid partial facts but remains one failed fan', () => {
+  const f = fixture(), prior = { ...initial(), retry: {index:0,fanId:'1',attempts:4,code:'OF_PROFILE_VALUE_MALFORMED'} };
+  f.job.continuation=envelope(prior);
+  f.chunkResult={kind:'fan_data_point_refresh',pipelineVersion:1,startIndex:0,endIndex:1,fanIds:['1'],
+    items:[{onlyFansUserId:'1',value:{availability:'MALFORMED',tipsSpentCents:500}}],reusedFanIds:[],reusedUnavailableFanIds:[],
+    terminalFailures:[{fanId:'1',attempts:5,code:'OF_PROFILE_VALUE_MALFORMED'}]};
+  f.continuation=envelope({...prior,index:1,retry:null,errors:1});
+  assert.doesNotThrow(()=>assertFanDataBatchProgress(f));
+  for (const change of [g=>{g.chunkResult.terminalFailures=[];},g=>{g.chunkResult.terminalFailures[0].code='OTHER';},g=>{g.continuation.jobContinuation.refreshed=1;},
+    g=>{g.chunkResult.terminalFailures.push({...g.chunkResult.terminalFailures[0]});g.continuation.jobContinuation.errors=2;}]) {
+    const bad=structuredClone(f);change(bad);assert.throws(()=>assertFanDataBatchProgress(bad),/FAN_DATA_BATCH_/);
+  }
+});
+
+test('component demand reuses its own clock without requiring an available total', async () => {
+  const now=new Date('2026-10-23T12:00:00Z'),cutoff=new Date(+now-10000);
+  const fan={onlyFansUserId:'1',valueCurrent:{availability:'UNAVAILABLE',valueObservedAt:now,messagesSpentCents:1200,
+    messagesSpentCentsAuthorityVersion:now.toISOString()+'|700|USER_PROFILE|digest'}};
+  const job={jobKey:'fan_data_point_refresh',creatorId:'creator',createdAt:cutoff,params:{fanIds:['1'],refreshFields:['messagesSpentCents']},continuation:envelope(initial())};
+  const db={creatorFan:{findMany:async()=>[fan]}},batch={startIndex:0,fanIds:['1']};
+  assert.deepEqual((await recheckFanDataBatchDemand({db,job,batch,now})).reusedFanIds,['1']);
+  job.params.refreshFields=['tipsSpentCents'];
+  assert.deepEqual((await recheckFanDataBatchDemand({db,job,batch,now})).readFanIds,['1']);
+});
+
+test('partial malformed observation at the retry boundary never advances or certifies its fan',()=>{
+ const f=fixture();f.chunkResult={kind:'fan_data_point_refresh',pipelineVersion:1,startIndex:0,endIndex:0,fanIds:[],
+   items:[{onlyFansUserId:'1',value:{availability:'MALFORMED',tipsSpentCents:700}}],reusedFanIds:[],reusedUnavailableFanIds:[],terminalFailures:[]};
+ f.continuation=envelope({...initial(),retry:{index:0,fanId:'1',attempts:1,code:'OF_PROFILE_VALUE_MALFORMED'}});
+ assert.doesNotThrow(()=>assertFanDataBatchProgress(f));
+ for(const change of [g=>{g.continuation.jobContinuation.refreshed=1;},g=>{g.chunkResult.items[0].onlyFansUserId='2';},
+   g=>{g.continuation.jobContinuation.retry.code='HTTP_ERROR';},g=>{g.chunkResult.items.push(structuredClone(g.chunkResult.items[0]));},
+   g=>{g.job.params.fanDataProfileMaxAttempts=1;}]) {
+   const bad=structuredClone(f);change(bad);assert.throws(()=>assertFanDataBatchProgress(bad),/FAN_DATA_BATCH_/);
+ }
+});

@@ -237,7 +237,7 @@ async function financialUnit(db, job, row, now) {
   // in the immutable run scope. Publication never enumerates mutable sourceJobId.
   const proof = await require("./financial-receipt-authority").completionProof(db, job);
   if (!proof.complete) return save(db, row, { proof: { receiptRunId: proof.row?.id || null, complete: false }, cursor: {}, stage: "FINALIZE" }, now);
-  const built = await require("./earnings-generation-service").preparePage(db, job, proof.row);
+  const built = await require("./earnings-generation-service").preparePage(db, { ...job, financialSourceDeviceId: row.deviceId }, proof.row);
   return save(db, row, { proof: { receiptRunId: proof.row.id, complete: true, ledgerGeneration: built.generation || "UNSUPPORTED" },
     cursor: {}, stage: built.ready || built.unsupported ? "FINALIZE" : "FINANCIAL_ROWS" }, now);
 }

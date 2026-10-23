@@ -10,6 +10,7 @@ const { getRetentionSettings } = require("./retention-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { coverageState, buildProjectionDetailAuthority } = require("./team-historical-range-authority-service");
 const { phase2CoverageStatus, FAMILY: PHASE2_COVERAGE_FAMILY, GENERATION: PHASE2_COVERAGE_GENERATION } = require("./phase2-work-coverage-authority-service");
+const { activeFinancialWhere, financiallyActive } = require("./team-money-financial-state-service");
 
 const TEAM_TELEMETRY_VERSION = "team_v13_provenance";
 const SUPPORTED_TEAM_TELEMETRY_VERSIONS = new Set([
@@ -151,17 +152,15 @@ function creatorScopeWhere(allowedCreatorIds) {
 }
 
 function activePpvFinancialWhere() {
-  // Notification-only purchases do not have a payout status yet and remain
-  // valid revenue. A later payout `undo` is authoritative reversal evidence.
-  return { OR: [{ financialStatus: null }, { financialStatus: { not: "undo" } }] };
+  return activeFinancialWhere();
 }
 
 function ppvFinanciallyActive(row) {
-  return String(row?.financialStatus || "").trim().toLowerCase() !== "undo";
+  return financiallyActive(row);
 }
 
 function activeTipFinancialWhere() {
-  return { OR: [{ financialStatus: null }, { financialStatus: { not: "undo" } }] };
+  return activeFinancialWhere();
 }
 
 async function findAllById(model, args = {}, pageSize = 5000) {
@@ -666,6 +665,18 @@ async function teamScaleQuery(section, sql, params) {
   }
 }
 
+async function loadMoneyEvidenceStatus({ agencyId, range, allowedCreatorIds = null }) {
+  const where = sqlScopedWhere({ alias: "m", agencyId, allowedCreatorIds, range, field: "occurredAt",
+    extra: [`m."financialStatus" IN ('unverified','gross_unknown')`] });
+  if (where.empty) return { hasUnverifiedFinancialFacts: false, hasUnknownGross: false };
+  // Presence, not a history count: both probes use partial agency/range or
+  // creator/range indexes and stop at their first matching unresolved fact.
+  const [row] = await teamScaleQuery("money_evidence", `SELECT
+    EXISTS(SELECT 1 FROM "TeamMoneyAttributionFact" m WHERE ${where.sql} AND m."financialStatus"='unverified') AS "hasUnverifiedFinancialFacts",
+    EXISTS(SELECT 1 FROM "TeamMoneyAttributionFact" m WHERE ${where.sql} AND m."financialStatus"='gross_unknown') AS "hasUnknownGross"`, where.params);
+  return { hasUnverifiedFinancialFacts: row?.hasUnverifiedFinancialFacts === true, hasUnknownGross: row?.hasUnknownGross === true };
+}
+
 function rowNumber(row, key, fallback = 0) {
   return num(row?.[key], fallback);
 }
@@ -1117,7 +1128,7 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
   const responseRange = projectionDetail.responseRange;
   const dialogRange = projectionDetail.dialogRange;
 
-  const [activityRows, legacyRows, responseRows, dialogRows, pendingRows, moneyRows, audienceRows] = await Promise.all([
+  const [activityRows, legacyRows, responseRows, dialogRows, pendingRows, moneyRows, audienceRows, moneyEvidence] = await Promise.all([
     loadActivitySummarySql({ agencyId, range: activityRange, allowedCreatorIds, exactRaw: exactRawActivity }),
     rawRange ? loadLegacyBoundedSummarySql({ agencyId, range: rawRange, allowedCreatorIds }) : Promise.resolve([]),
     responseRange ? loadResponseSummarySql({ agencyId, range: responseRange, allowedCreatorIds, currentGenerationOnly: currentResponseGeneration }) : Promise.resolve([]),
@@ -1125,6 +1136,7 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
     loadPendingSummarySql({ agencyId, allowedCreatorIds, authorityNow, currentGenerationOnly: currentDialogGeneration }),
     includeMoney ? loadMoneySummarySql({ agencyId, range, allowedCreatorIds, rollupReady: moneyReadSummaryStatus.ready === true }) : Promise.resolve([]),
     loadAudienceCoverageSummarySql({ agencyId, range, rawRange, allowedCreatorIds, includeMoney, exactRawActivity }),
+    includeMoney ? loadMoneyEvidenceStatus({ agencyId, range, allowedCreatorIds }) : Promise.resolve({}),
   ]);
 
   const metricsByMember = new Map();
@@ -1301,7 +1313,9 @@ async function buildComputedScale({ agencyId, rangeKey = "7d", includeMoney = tr
   const classificationUnresolved = Math.max(0, Number(moneyRootCoverageStatus?.row?.unresolvedCount || 0));
   const moneyCoverage = includeMoney ? {
     ...baseMoneyCoverage,
-    status: moneyRootCoverageStatus?.currentReady ? (classificationUnresolved > 0 ? "PARTIAL" : baseMoneyCoverage.status) : "PARTIAL",
+    status: moneyRootCoverageStatus?.currentReady && classificationUnresolved === 0
+      && !moneyEvidence.hasUnverifiedFinancialFacts && !moneyEvidence.hasUnknownGross ? baseMoneyCoverage.status : "PARTIAL",
+    ...moneyEvidence,
     rootClassification: moneyRootCoverageStatus?.semanticState || moneyRootCoverageStatus?.state || "MISSING",
     unresolvedRootGenerations: classificationUnresolved,
     readSummaryGeneration: moneyReadSummaryStatus?.coverage?.state || "MISSING",

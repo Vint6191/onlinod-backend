@@ -8,7 +8,9 @@ const { collectionCommand, COLLECTOR_TYPES, withCollectorStateLock, commandAutho
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { NOTIFICATION_TYPES } = require("./notification-collection-scope");
 
-const FULL_HISTORY_FROM = new Date("2016-01-01T00:00:00.000Z");
+// Receipt envelopes require a date. FULL has no lower fact boundary; this
+// metadata default must never discard an older valid provider observation.
+const FULL_HISTORY_FROM = new Date(0);
 
 function clean(value, max = 220) {
   if (value === null || value === undefined) return null;
@@ -21,7 +23,7 @@ function object(value) {
 function strictDate(value) {
   return parseStrictIsoDateTime(value);
 }
-function nonNegativeInt(value, max = 100_000_000) {
+function nonNegativeInt(value, max = 2_147_483_647) {
   const number = Number(value);
   if (!Number.isInteger(number) || number < 0 || number > max) return 0;
   return number;
@@ -65,6 +67,7 @@ function buildNotificationScanParams({ state = null, now = new Date(), reason = 
       to: new Date(now).toISOString(),
       types: [...NOTIFICATION_TYPES],
       notificationMode: "full",
+      notificationFrontierVersion: 4,
       pageLimit: 10,
       reason,
       analyticsRangeKey,
@@ -121,7 +124,7 @@ async function verifiedFrontierIds({ db, job, scanRunId, mode, headNotificationI
   }
   const rows = await db.creatorNotificationScanItem.findMany({
     where: { creatorId: job.creatorId, sourceJobId: job.id, scanRunId,
-      ...(job.params?.notificationNormalizerVersion === "notification-source-v2" ? {sourcePhase: mode === "full" ? "all_reconciliation" : "all", outcome:{in:["ACCEPTED","IGNORED"]}, occurredAt:{gte:new Date(job.params.from),lte:new Date(job.params.to)}, OR:[{reasonCode:null},{reasonCode:{not:"OUTSIDE_SCAN_RANGE"}}]} : {}),
+      ...(job.params?.notificationNormalizerVersion === "notification-source-v2" ? {sourcePhase: mode === "full" ? "all_reconciliation" : "all", outcome:{in:["ACCEPTED","IGNORED"]}, occurredAt:{...(mode === "full" ? {} : {gte:new Date(job.params.from)}),lte:new Date(job.params.to)}, OR:[{reasonCode:null},{reasonCode:{not:"OUTSIDE_SCAN_RANGE"}}]} : {}),
     },
     orderBy: [{ page: "asc" }, { ordinal: "asc" }],
     take: 300,
@@ -155,7 +158,7 @@ async function recordNotificationPageProgress({ db, job, deviceId, chunk, fronti
   const cursorEnd = clean(chunk?.cursorEnd, 220);
   const tailNotificationId = clean(chunk?.tailNotificationId, 220);
   const sourceExhausted = chunk?.sourceExhausted === true;
-  const page = nonNegativeInt(chunk?.page, 1_000_000);
+  const page = nonNegativeInt(chunk?.page, 2_147_483_647);
   const totalAcceptedRows = nonNegativeInt(chunk?.totalAcceptedRows ?? chunk?.acceptedRows);
   const totalRejectedRows = nonNegativeInt(chunk?.totalRejectedRows ?? chunk?.rejectedRows);
   const totalIgnoredRows = nonNegativeInt(chunk?.totalIgnoredRows ?? chunk?.ignoredRows);
@@ -255,7 +258,7 @@ async function completeNotificationSync({ db, job, deviceId, result, successful 
         : existing?.headNotificationId || null,
       tailNotificationId: clean(result?.tailNotificationId, 220) || existing?.tailNotificationId || null,
       knownNotificationIds: verifiedKnownIds,
-      pagesScanned: Math.max(nonNegativeInt(existing?.pagesScanned), nonNegativeInt(object(result?.coverage).purchases?.pages, 1_000_000)),
+      pagesScanned: Math.max(nonNegativeInt(existing?.pagesScanned, 2_147_483_647), nonNegativeInt(object(result?.coverage).purchases?.pages, 2_147_483_647)),
       lastErrorCode: overallComplete ? null
         : verified && mode === "catchup" && !fullHistoryVerified ? "NOTIFICATION_FULL_BACKFILL_PARTIAL"
           : sourceTraversalComplete ? "NOTIFICATION_FACTS_PARTIAL" : "NOTIFICATION_SCAN_PARTIAL",

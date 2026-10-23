@@ -49,7 +49,8 @@ function comparableTotals(totals) { return totals.comparisonTotals || totals; }
 function earningsTotals(totals) {
   const undo = totals.statusGroups?.undo;
   return { transactionsCount: totals.count - (undo?._count?._all || 0),
-    grossCents: totals.grossCents - (undo?._sum?.amountCents || 0), netCents: totals.netCents - (undo?._sum?.netCents || 0) };
+    grossCents: (totals.grossKnown ?? totals.count) - (undo?.grossKnown ?? undo?._count?._all ?? 0) === totals.count - (undo?._count?._all || 0)
+      ? totals.grossCents - (undo?._sum?.amountCents || 0) : null, netCents: totals.netCents - (undo?._sum?.netCents || 0) };
 }
 function planWindows(params, state) {
   const end = date(params.endDate) || date(params.collectionRequestedAt);
@@ -159,16 +160,20 @@ async function restoreContinuation(db, job) {
   const row = await db.financialReceiptRun.findUnique({ where: { id: runId(job) } });
   return envelope(job, row?.cursor || initialCursor(job));
 }
-function emptyTotals() { return { count: 0, storedOnly: 0, grossCents: 0, netCents: 0, feeCents: 0, statusGroups: {}, typeGroups: {} }; }
+function emptyTotals() { return { count: 0, storedOnly: 0, grossKnown: 0, grossCents: 0, netCents: 0, feeCents: 0, statusGroups: {}, typeGroups: {} }; }
 function sum(a, b) { const n = (a || 0) + (b || 0); if (!Number.isSafeInteger(n)) throw fault("FINANCIAL_RECEIPT_AMOUNT_OVERFLOW"); return n; }
 function addFact(totals, value, sign) {
+  totals.grossKnown ??= totals.count;
   totals.count += sign;
+  if (value.amountCents !== null && value.amountCents !== undefined) totals.grossKnown += sign;
   if (value.projectionStatus === "STORED_ONLY") totals.storedOnly += sign;
   for (const [key, field] of [["grossCents", "amountCents"], ["netCents", "netCents"], ["feeCents", "feeCents"]]) totals[key] = sum(totals[key], sign * (value[field] || 0));
   const status = String(value.transactionStatus || "").trim().toLowerCase();
   const key = ["done", "loading", "undo", ""].includes(status) ? status : "other";
   const group = totals.statusGroups[key] || { transactionStatus: key, _count: { _all: 0 }, _sum: { amountCents: 0, netCents: 0, feeCents: 0 } };
+  group.grossKnown ??= group._count._all;
   group._count._all += sign;
+  if (value.amountCents !== null && value.amountCents !== undefined) group.grossKnown += sign;
   for (const field of ["amountCents", "netCents", "feeCents"]) group._sum[field] = sum(group._sum[field], sign * (value[field] || 0));
   totals.statusGroups[key] = group;
   const type = ["message", "post", "stream"].includes(value.transactionType) ? value.transactionType
@@ -176,8 +181,10 @@ function addFact(totals, value, sign) {
   const identity = JSON.stringify([type, value.factType, value.projectionStatus, value.reasonCode]);
   totals.typeGroups ||= {};
   const typed = totals.typeGroups[identity] || { transactionType: type, factType: value.factType,
-    projectionStatus: value.projectionStatus, reasonCode: value.reasonCode, count: 0, grossCents: 0, netCents: 0 };
-  typed.count += sign; typed.grossCents = sum(typed.grossCents, sign * value.amountCents); typed.netCents = sum(typed.netCents, sign * (value.netCents || 0));
+    projectionStatus: value.projectionStatus, reasonCode: value.reasonCode, count: 0, grossKnown: 0, grossCents: 0, netCents: 0 };
+  typed.grossKnown ??= typed.count;
+  if (value.amountCents != null) typed.grossKnown += sign;
+  typed.count += sign; typed.grossCents = sum(typed.grossCents, sign * (value.amountCents || 0)); typed.netCents = sum(typed.netCents, sign * (value.netCents || 0));
   if (typed.count) totals.typeGroups[identity] = typed; else delete totals.typeGroups[identity];
 }
 async function lockedRun(db, job) {
@@ -233,6 +240,8 @@ async function commitPage(db, job, chunk, prepared, accepted, backendRejected, r
     const value = { externalTransactionId: fact.externalTransactionId, occurredAt: fact.occurredAt.toISOString(),
       transactionType: fact.transactionType, factType: fact.factType, projectionStatus: fact.projectionStatus,
       fanOnlyFansUserId: fact.fanOnlyFansUserId, currency: fact.currency, reasonCode: fact.reasonCode,
+      fanUsername: fact.fanUsername, fanDisplayName: fact.fanDisplayName, fanAvatarUrl: fact.fanAvatarUrl,
+      taxCents: fact.taxCents, vatCents: fact.vatCents, mediaTaxCents: fact.mediaTaxCents,
       amountCents: fact.amountCents, netCents: fact.netCents, feeCents: fact.feeCents, transactionStatus: fact.transactionStatus,
       page: fact.page, ordinal: fact.ordinal };
     if (byId.has(fact.externalTransactionId)) addFact(totals, byId.get(fact.externalTransactionId), -1);
@@ -317,7 +326,7 @@ async function commitChart(db, job, chunk) {
   const previous = row.proof.windows[index].charts[chunk.category];
   const summary = { grossCents: chunk.grossCents, netCents: chunk.netCents, transactionsCount: chunk.transactionsCount };
   if (chunk.collectorVersion !== COLLECTOR || chunk.scanRunId !== row.generation || date(chunk.rangeFrom)?.toISOString() !== range.from || date(chunk.rangeTo)?.toISOString() !== range.to) throw fault("FINANCIAL_CHART_SCOPE_MISMATCH");
-  if (!Number.isSafeInteger(summary.grossCents) || !Number.isSafeInteger(summary.netCents)) throw fault("FINANCIAL_CHART_AMOUNT_INVALID");
+  if ((summary.grossCents !== null && !Number.isSafeInteger(summary.grossCents)) || !Number.isSafeInteger(summary.netCents)) throw fault("FINANCIAL_CHART_AMOUNT_INVALID");
   integer(summary.transactionsCount);
   if (previous) {
     if (!isDeepStrictEqual(previous, summary)) throw fault("FINANCIAL_CHART_RECEIPT_CONFLICT");
@@ -328,7 +337,7 @@ async function commitChart(db, job, chunk) {
   const cursor = { ...state, chartIndex: state.chartIndex + 1 };
   if (cursor.chartIndex === categories.length) {
     const chart = totals.charts.total, observed = earningsTotals(comparableTotals(totals));
-    totals.matched = observed.transactionsCount === chart.transactionsCount && observed.grossCents === chart.grossCents && observed.netCents === chart.netCents;
+    totals.matched = observed.transactionsCount === chart.transactionsCount && (observed.grossCents === null || chart.grossCents === null || observed.grossCents === chart.grossCents) && observed.netCents === chart.netCents;
     cursor.windowIndex++;
     if (cursor.windowIndex < row.windows.length) Object.assign(cursor, { phase: "transactions", marker: row.windows[cursor.windowIndex].initialMarker, page: 0, chartIndex: 0 });
     else {

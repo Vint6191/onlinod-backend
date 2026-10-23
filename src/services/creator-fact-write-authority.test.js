@@ -13,21 +13,29 @@ test('both fact writers use the exact creator-scoped lock identity of the existi
 });
 for(const model of ['creatorSale','creatorTip'])test(`${model}: late notification enriches ownership without rewriting payout money or losing notification consequence ownership`,()=>{
  const paidAt=new Date('2025-02-03');
- const existing={source:'ONLYFANS_API',externalTransactionId:'tx',externalNotificationId:null,fanRecordId:'fan',amountCents:2300,currency:'EUR',saleType:'MESSAGE',purchasedAt:paidAt,tippedAt:paidAt,sourceJobId:'financial-job',sourceDeviceId:'financial-device',collectedAt:paidAt,sourceUpdatedAt:null,messageId:null,postId:null};
- const incoming={source:'NOTIFICATION',externalTransactionId:null,externalNotificationId:'notification',fanRecordId:null,amountCents:1000,currency:'USD',purchasedAt:new Date('2026-01-01'),tippedAt:new Date('2026-01-01'),sourceJobId:'notification-job',messageId:'message'};
+ const existing={source:'ONLYFANS_API',externalTransactionId:'tx',externalNotificationId:null,fanRecordId:'fan',amountCents:2300,netCents:1700,transactionStatus:'undo',feeCents:600,currency:'EUR',saleType:'MESSAGE',purchasedAt:paidAt,tippedAt:paidAt,sourceJobId:'financial-job',sourceDeviceId:'financial-device',collectedAt:paidAt,sourceUpdatedAt:null,messageId:null,postId:null};
+ const incoming={source:'NOTIFICATION',externalTransactionId:null,externalNotificationId:'notification',fanRecordId:null,amountCents:1000,netCents:0,transactionStatus:'done',feeCents:0,currency:'USD',purchasedAt:new Date('2026-01-01'),tippedAt:new Date('2026-01-01'),sourceJobId:'notification-job',messageId:'message'};
  const merged=mergeNotificationMoney(model,existing,incoming);
- for(const key of ['source','externalTransactionId','amountCents','currency','fanRecordId'])assert.deepEqual(merged[key],existing[key]);
+ for(const key of ['source','externalTransactionId','amountCents','netCents','transactionStatus','feeCents','currency','fanRecordId'])assert.deepEqual(merged[key],existing[key]);
  assert.equal(merged.sourceJobId,'notification-job');
  assert.equal(merged.messageId,'message');assert.equal(merged.externalNotificationId,'notification');
  const replay=mergeNotificationMoney(model,merged,{...incoming,messageId:null});assert.equal(replay.messageId,'message');
  assert(transactionIdentityConflict(existing,{externalTransactionId:'other-tx'}));assert(!transactionIdentityConflict(existing,{externalTransactionId:null}));
 });
 test('financial source distinguishes unknown money from exact zero and never coerces a missing amount to zero',()=>{
- const base={externalTransactionId:'tx',transactionType:'message',occurredAt:'2026-01-01',amountCents:100,currency:'USD'};
+ const base={externalTransactionId:'tx',transactionType:'message',occurredAt:'2026-01-01',amountCents:100,netCents:80,currency:'USD'};
  const row=normalizeTransaction({...base,feeCents:null,netCents:0,taxCents:null},0,1);
  assert.equal(row.rejected,false);assert.equal(row.feeCents,null);assert.equal(row.netCents,0);assert.equal(row.taxCents,null);
- for(const amountCents of [null,undefined,false,'100','',NaN])assert.equal(normalizeTransaction({...base,amountCents},0,1).reasonCode,'amount_invalid');
- assert.equal(normalizeTransaction({...base,amountCents:-100},0,1).amountCents,-100);
+ for(const amountCents of [null,undefined,false,'100','',NaN]){
+  const normalized=normalizeTransaction({...base,amountCents},0,1);
+  assert.equal(normalized.rejected,false);assert.equal(normalized.amountCents,null);assert.equal(normalized.netCents,80);
+ }
+ for(const netCents of [null,undefined,false,'80','',NaN])assert.equal(normalizeTransaction({...base,netCents},0,1).reasonCode,'net_invalid');
+ for(const net of [[],{},true,'   ','0x10','1e2'])assert.equal(normalizeTransaction({...base,netCents:undefined,net},0,1).reasonCode,'net_invalid');
+ const negativeGross=normalizeTransaction({...base,amountCents:-100},0,1);
+ assert.equal(negativeGross.amountCents,null);assert.equal(negativeGross.netCents,80);assert.equal(negativeGross.projectionStatus,'PROJECTED');
+ assert.equal(normalizeTransaction({...base,amountCents:0},0,1).projectionStatus,'PROJECTED');
+ assert.equal(normalizeTransaction({...base,amountCents:0,netCents:0},0,1).projectionStatus,'STORED_ONLY');
  assert.equal(normalizeTransaction({...base,amountCents:undefined,amount:1.25},0,1).amountCents,125);
 });
 test('a user-less payout does not erase an already proven fan, while a different proven fan keeps its own metadata',()=>{

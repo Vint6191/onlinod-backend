@@ -12,6 +12,12 @@ function tokenHash(value) {
 function loadService(fixture) {
   require("../../scripts/test-support/billing-execution-fixture").installTrialBillingRows(fixture.db);
   fixture.db.analyticsIngestBatch ||= { findMany: async () => [] };
+  // These lease-focused fixtures have already completed independent initial
+  // stages. The SQL collector proof exercises actual gated initial claims.
+  for (const model of ["creatorFinancialCollectionState", "creatorCampaignCollectionState", "creatorEarningsLedgerProof"]) {
+    fixture.db[model] ||= {};
+    fixture.db[model].findMany ||= async ({ where }) => where.creatorId.in.map(creatorId => ({ creatorId, status: "FAILED" }));
+  }
   fixture.db.jobInstance = fixture.db.jobInstance || {};
   if (typeof fixture.db.jobInstance.findMany !== "function") fixture.db.jobInstance.findMany = async () => [];
   if (typeof fixture.db.$transaction !== "function") fixture.db.$transaction = async (work) => work(fixture.db);
@@ -153,7 +159,7 @@ function notificationConflictFixture() {
   const item = fixture();
   Object.assign(item.job, { creatorId: "creator-1", jobKey: "catchup_notifications_scan", attempts: 0, continuation: null,
     params: { notificationNormalizerVersion: "notification-source-v2", collectionGeneration: "conflicting-run", collectionRequestedAt: "2026-10-01T00:00:00.000Z",
-      collectionMode: "full", notificationMode: "full", types: [...NOTIFICATION_TYPES] }, result: null });
+      collectionMode: "full", notificationMode: "full", notificationFrontierVersion: 4, types: [...NOTIFICATION_TYPES] }, result: null });
   item.applyJobChunk = async () => { throw Object.assign(new Error("immutable receipt conflict"), { code: "ANALYTICS_INGEST_IDEMPOTENCY_CONFLICT" }); };
   item.input = { jobId: item.job.id, userId: "user-1", deviceId: "device-1", leaseToken: item.token, leaseRevision: 3,
     continuation: { driverPhase: "execute", jobContinuation: { scanRunId: "conflicting-run", page: 1 } },
@@ -937,16 +943,16 @@ test("bounded notification catch-up cannot become PROVEN when backend page recei
     progress: { percent: 100 },
   });
 
-  assert.equal(result.job.status, "SCHEDULED");
+  assert.equal(result.job.status, "FAILED");
   assert.equal(result.sideEffect.verified, false);
   assert.equal(result.sideEffect.pageProof.reason, "backend_page_receipt_partial");
   assert.deepEqual(syncCalls, [false]);
   assert.equal(failures.length, 1);
-  assert.equal(failures[0].terminal, false);
-  assert.equal(updates[0].data.status, "SCHEDULED");
+  assert.equal(failures[0].terminal, true);
+  assert.equal(updates[0].data.status, "FAILED");
 });
 
-test("partial notification completion is rescheduled instead of being marked DONE", async () => {
+test("partial notification completion stops without restarting a new FULL generation", async () => {
   const token = "notification-partial-token";
   const now = new Date();
   const job = {
@@ -1007,19 +1013,17 @@ test("partial notification completion is rescheduled instead of being marked DON
 
   assert.equal(updates.length, 1);
   assert.equal(updates[0].where.leaseRevision, 3);
-  assert.equal(updates[0].data.status, "SCHEDULED");
+  assert.equal(updates[0].data.status, "FAILED");
   assert.equal(updates[0].data.attempts, 1);
   assert.equal(updates[0].data.continuation, null);
   assert.equal(updates[0].data.claimedByDeviceId, null);
   assert.equal(updates[0].data.lastError, "notification_scan_partial");
-  assert.deepEqual(updates[0].data.params.types, NOTIFICATION_TYPES);
-  assert.ok(updates[0].data.params.collectionGeneration);
-  assert.notEqual(updates[0].data.params.collectionGeneration, "run-partial-1");
-  assert.equal(updates[0].data.params.notificationRepairFromRunId, "run-partial-1");
+  assert.deepEqual(updates[0].data.params, job.params);
+  assert.equal(updates[0].data.params.collectionGeneration, undefined);
   assert.equal("resumeCursors" in updates[0].data.params, false);
   assert.equal("notificationRepairPass" in updates[0].data.params, false);
-  assert.ok(updates[0].data.nextRunAt instanceof Date);
-  assert.equal(result.job.status, "SCHEDULED");
+  assert.equal(updates[0].data.nextRunAt, undefined);
+  assert.equal(result.job.status, "FAILED");
 });
 
 test("a claimed pre-fix notification repair rotates durably before accepting another page", async () => {
@@ -1191,7 +1195,7 @@ test("manual notification PARTIAL at a proven source boundary stays a visible on
   assert.equal(failures.length, 0, "manual rejected facts at the source boundary must not start hidden repair");
 });
 
-test("manual notification completion retries when the source boundary was not reached", async () => {
+test("manual notification completion stops when the source boundary was not reached", async () => {
   const token = "manual-notification-incomplete-token";
   const now = new Date();
   const job = {
@@ -1242,13 +1246,13 @@ test("manual notification completion retries when the source boundary was not re
     progress: { percent: 80 },
   });
 
-  assert.equal(result.job.status, "SCHEDULED");
+  assert.equal(result.job.status, "FAILED");
   assert.equal(updates.length, 1);
-  assert.equal(updates[0].data.status, "SCHEDULED");
+  assert.equal(updates[0].data.status, "FAILED");
   assert.equal(updates[0].data.attempts, 1);
-  assert.ok(updates[0].data.nextRunAt instanceof Date);
+  assert.equal(updates[0].data.nextRunAt, undefined);
   assert.equal(failures.length, 1);
-  assert.equal(failures[0].terminal, false);
+  assert.equal(failures[0].terminal, true);
 });
 
 test("fifth non-resumable partial notification attempt becomes FAILED instead of looping forever", async () => {
@@ -1918,6 +1922,7 @@ function collectorRetryFixture(source, variant = 'advance') {
       page: 1, sourceHasMore: true, cursorStart: null, cursorEnd: 'notification-1', observations: [{ notificationId: 'notification-1' }] };
     item.input.continuation = { driverPhase: 'execute', jobContinuation: { scanRunId: item.job.params.collectionGeneration, page: 1, fromId: 'notification-1' } };
     effect = { type: 'notification_source_page', batchId: 'notification-receipt', status: 'COMMITTED', replayed: variant === 'replay' };
+    if (variant !== 'stalled') effect.notificationFrontier = { generation: item.job.params.collectionGeneration, page: 1, cursor: 'notification-1', phase: 'SEEK' };
     if (variant === 'stalled') item.input.chunkResult.cursorStart = item.input.chunkResult.cursorEnd;
   } else {
     item.job.jobKey = 'subscriber_directory_scan';

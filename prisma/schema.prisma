@@ -475,6 +475,9 @@ model CreatorAccount {
   entityChanges CreatorEntityChange[]
   entityCurrent CreatorEntityCurrent[]
   mediaUsageFacts CreatorMediaUsageFact[]
+  mediaSaleLinks CreatorMediaSaleLink[]
+  mediaFinancialStates CreatorMediaMessageFinancialState[]
+  mediaFinancialAdoption CreatorMediaFinancialAdoptionState[]
   notificationFrontierPages CreatorNotificationFrontierPage[]
 
   providerRequestGate OfProviderRequestGateState?
@@ -2817,7 +2820,7 @@ model CreatorFinancialTransaction {
   transactionType       String
   factType              CreatorFinancialTransactionFactType         @default(OTHER)
   projectionStatus      CreatorFinancialTransactionProjectionStatus @default(STORED_ONLY)
-  amountCents           Int
+  amountCents           Int?
   feeCents              Int?
   netCents              Int?
   taxCents              Int?
@@ -2899,7 +2902,7 @@ model CreatorSale {
   saleType                 CreatorSaleType   @default(MESSAGE)
   messageId                String?
   postId                   String?
-  amountCents              Int
+  amountCents              Int?
   feeCents                 Int?
   netCents                 Int?
   taxCents                 Int?
@@ -2928,6 +2931,7 @@ model CreatorSale {
   @@index([agencyId, creatorId, purchasedAt])
   @@index([creatorId, fanRecordId, purchasedAt])
   @@index([creatorId, messageId])
+  @@index([creatorId, id], map: "CreatorSale_media_adoption_idx")
   @@index([creatorId, postId])
   @@index([sourceJobId])
   @@index([agencyId, creatorId, sourceJobId, id], map: "CreatorSale_consequence_job_cursor_idx")
@@ -2947,7 +2951,7 @@ model CreatorTip {
   externalNotificationId   String?
   externalTransactionId    String?
   messageId                String?
-  amountCents              Int
+  amountCents              Int?
   feeCents                 Int?
   netCents                 Int?
   taxCents                 Int?
@@ -4095,6 +4099,7 @@ model CreatorMediaAsset {
   notOpenedCount    Int       @default(0)
   freeCount         Int       @default(0)
   revenueCents      Int       @default(0)
+  revenueUnknownCount Int @default(0)
   averagePriceCents Int       @default(0)
   uniqueBuyers      Int       @default(0)
   lastSoldAt        DateTime?
@@ -4135,6 +4140,7 @@ model CreatorMediaUsageContribution {
   notOpenedCount Int       @default(0)
   freeCount      Int       @default(0)
   revenueCents   Int       @default(0)
+  revenueUnknownCount Int @default(0)
   uniqueBuyers   Int       @default(0)
   lastSoldAt     DateTime?
   capturedAt     DateTime  @default(now())
@@ -4148,6 +4154,7 @@ model CreatorMediaUsageContribution {
   @@unique([creatorId, sourceKey, mediaId])
   @@index([creatorId, sourceKey])
   @@index([creatorId, mediaId])
+  @@index([creatorId, mediaId, lastSoldAt], map: "CreatorMediaUsageContribution_last_sale_idx")
   @@index([assetId])
 }
 
@@ -4178,6 +4185,7 @@ model CreatorMediaUsageFact {
   sourceMessageId String
   mediaId String
   payload Json
+  observedPayload Json?
   purchased Boolean @default(false)
   sourceRevision String
   lastSeenRunId String?
@@ -4188,6 +4196,55 @@ model CreatorMediaUsageFact {
   @@index([creatorId, sourceKey], map: "CreatorMediaUsageFact_source_idx")
   @@index([creatorId, mediaId], map: "CreatorMediaUsageFact_media_idx")
   @@index([creatorId, sourceKey, lastSeenRunId], map: "CreatorMediaUsageFact_run_idx")
+}
+
+model CreatorMediaSaleLink {
+  saleId String @id
+  agencyId String
+  creatorId String
+  sourceKey String?
+  dialogId String?
+  messageId String?
+  netCents Int?
+  proofActive Boolean @default(false)
+  purchasedAt DateTime?
+  operationId String?
+  version String
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId,creatorId], references: [agencyId,id], onDelete: Cascade)
+  @@index([creatorId,sourceKey,messageId], map: "CreatorMediaSaleLink_message_idx")
+}
+
+model CreatorMediaMessageFinancialState {
+  agencyId String
+  creatorId String
+  sourceKey String
+  messageId String
+  dialogId String
+  netCents BigInt?
+  proofActive Boolean @default(false)
+  purchasedAt DateTime?
+  operationId String?
+  version String
+  dirty Boolean @default(true)
+  cursor String @default("")
+  updatedAt DateTime @default(now())
+  creator CreatorAccount @relation(fields: [agencyId,creatorId], references: [agencyId,id], onDelete: Cascade)
+  @@id([creatorId,sourceKey,messageId])
+  @@index([creatorId,dirty,sourceKey,messageId], map: "CreatorMediaMessageFinancialState_dirty_idx")
+}
+
+model CreatorMediaFinancialAdoptionState {
+  creatorId String @id
+  agencyId String
+  phase String @default("SALES")
+  upperSaleId String @default("")
+  saleCursor String @default("")
+  factSource String @default("")
+  factMessage String @default("")
+  factMedia String @default("")
+  completedAt DateTime?
+  creator CreatorAccount @relation(fields: [agencyId,creatorId], references: [agencyId,id], onDelete: Cascade)
 }
 
 model MediaLibraryScanItem {
@@ -6477,6 +6534,7 @@ model CreatorRecoveryIntent {
   updatedAt DateTime @default(now())
   creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
   @@index([creatorId,stream,status,targetAt,id],map:"CreatorRecoveryIntent_pending_idx")
+  @@index([creatorId,targetAt,id],map:"CreatorRecoveryIntent_dialog_episode_idx")
 }
 model CreatorEntityChangeHead {
   creatorId String @id
@@ -6554,6 +6612,7 @@ model CreatorEarningsLedgerEntry {
  transactionId String
  occurredAt DateTime
  category String @default("other")
+ grossCents BigInt?
  netCents BigInt
  status String
  observedAt DateTime
@@ -6566,6 +6625,7 @@ model CreatorEarningsLedgerHour {
  creatorId String
  hour DateTime
  category String @default("other")
+ financialMetrics Json @default("{}")
  netCents BigInt
  observedAt DateTime
  creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
@@ -6620,6 +6680,7 @@ model CreatorEarningsGenerationEntry {
  transactionId String
  occurredAt DateTime
  category String
+ grossCents BigInt?
  netCents BigInt
  status String
  observedAt DateTime
@@ -6640,6 +6701,7 @@ model CreatorEarningsGenerationDay {
  generation String
  date DateTime @db.Date
  category String
+ financialMetrics Json @default("{}")
  netCents BigInt
  observedAt DateTime
  owner CreatorEarningsGeneration @relation(fields:[generation],references:[id],onDelete:Cascade)

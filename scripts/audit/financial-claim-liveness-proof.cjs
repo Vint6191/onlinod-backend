@@ -94,6 +94,14 @@ const deadline = setTimeout(() => { console.error("FINANCIAL_CLAIM_PROOF_DEADLIN
       await t.creatorAccount.create({ data: { id: "healthy-creator", agencyId: s.agencyId, displayName: "Healthy", status: "READY" } });
       await t.deviceCreatorBinding.create({ data: { agencyId: s.agencyId, creatorId: "healthy-creator",
         deviceId: "claim-device", sessionReadReady: true, lastSeenAt: new Date() } });
+      // This proof isolates invalid financial-command admission after initial
+      // collection has reached finite outcomes. A brand-new notification lane
+      // correctly waits for its independent initial sources otherwise.
+      for (const creatorId of ["healthy-creator", s.creatorId]) {
+        for (const model of ["creatorFinancialCollectionState", "creatorCampaignCollectionState"])
+          await t[model].upsert({ where: { creatorId },
+            create: { agencyId: s.agencyId, creatorId, status: "FAILED" }, update: { status: "FAILED" } });
+      }
     });
     const healthy = await db.jobInstance.create({ data: { agencyId: s.agencyId, creatorId: "healthy-creator", jobKey: "catchup_notifications_scan",
       scope: "creator", priority: 1, nextRunAt: new Date(0), params: { notificationMode: "catchup", notificationNormalizerVersion: "notification-source-v2" } } });

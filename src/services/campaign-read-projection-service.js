@@ -48,13 +48,20 @@ function valueMetrics(value, now, freshnessMs = CAMPAIGN_FAN_VALUE_FRESHNESS_MS)
   };
 }
 function financialMetrics(row) {
-  if (!row || String(row.transactionStatus || "").toLowerCase() === "undo") return {};
+  if (!row || ["undo", "superseded"].includes(String(row.transactionStatus || "").toLowerCase())) return {};
+  // A quarantined pre-authority row is unresolved evidence, not a pending
+  // payment. Keeping a separate count reverses its former receipt amounts and
+  // prevents an apparently verified zero while provider recovery is pending.
+  if (String(row.transactionStatus || "").toLowerCase() === "unverified" || row.reasonCode === "LEGACY_FINANCIAL_UNVERIFIED") {
+    return { unverifiedTransactions: "1" };
+  }
   const net = row.netCents, settled = String(row.transactionStatus || "").toLowerCase() === "done";
   const type = String(row.transactionType || "").toLowerCase();
   const category = type.startsWith("subscription") ? "subscription" : ["message","chat_message","chat_messages"].includes(type) ? "sales" : ["tip","tips"].includes(type) ? "tips" : null;
-  const out = { grossCents: row.amountCents, knownNetCents: net ?? 0, unknownNetTransactions: net == null ? 1 : 0, transactionsCount: 1 };
+  const out = { grossCents: row.amountCents ?? 0, unknownGrossTransactions: row.amountCents == null ? 1 : 0,
+    knownNetCents: net ?? 0, unknownNetTransactions: net == null ? 1 : 0, transactionsCount: 1 };
   const prefix = settled ? "settled" : "pending";
-  Object.assign(out, { [prefix+"GrossCents"]: row.amountCents, [prefix+"KnownNetCents"]: net ?? 0,
+  Object.assign(out, { [prefix+"GrossCents"]: row.amountCents ?? 0, [prefix+"UnknownGrossTransactions"]: row.amountCents == null ? 1 : 0, [prefix+"KnownNetCents"]: net ?? 0,
     [prefix+"UnknownNetTransactions"]: net == null ? 1 : 0, [prefix+"TransactionsCount"]: 1 });
   if (category) Object.assign(out, { [category+"KnownNetCents"]: net ?? 0, [category+"UnknownNetTransactions"]: net == null ? 1 : 0 });
   return textMetrics(out);
@@ -73,6 +80,7 @@ async function replaceReceipt(tx, item, kind, sourceId, contributions, nextDueAt
   const [before] = await tx.$queryRawUnsafe('SELECT "contributions","nextDueAt" FROM "CampaignReadReceipt" WHERE "creatorId"=$1 AND "kind"=$2 AND "sourceId"=$3', item.creatorId,kind,sourceId);
   const delta = deltas(before?.contributions || [],contributions);
   if (before && !delta.length && +(before.nextDueAt || 0) === +(nextDueAt || 0)) return;
+  (item.changedReceipts ||= []).push({ kind, sourceId, contributions, nextDueAt });
   if (delta.length) await tx.$executeRawUnsafe(`SELECT "onlinod_campaign_read_add_v1"($1,$2,x."campaignId",x."rangeKey",x."fanId",x.metrics)
     FROM jsonb_to_recordset($3::jsonb) x("campaignId" text,"rangeKey" text,"fanId" text,metrics jsonb)`,item.agencyId,item.creatorId,JSON.stringify(delta));
   if (!contributions.length && !nextDueAt) {
@@ -275,6 +283,13 @@ async function runCampaignProjectionUnit({db,item,ownerToken}) {
     const settlement=result.done?await ackDomainWorkClaim({db:tx,item,ownerToken})
       :await yieldDomainWorkClaim({db:tx,item,ownerToken,availableAt:result.availableAt||null,progressCursor:{...result.cursor,revision:String(item.claimedRevision)}});
     if (settlement.lost) throw fault("CAMPAIGN_PROJECTION_CLAIM_LOST");
+    if (!result.retired && !result.paused && (item.changedReceipts?.length || result.done || result.processed > 0)) {
+      const dataVersion=require("./realtime-receipt-hash").hashCanonicalJson({ owner:item.id,
+        revision:String(item.claimedRevision),cursor:item.progressCursor,result,receipts:item.changedReceipts||[] });
+      await require("./creator-entity-change-service").publishEntityChanges({db:tx,agencyId:item.agencyId,creatorId:item.creatorId,
+        changes:[{entityType:"CAMPAIGN",entityId:item.creatorId,sourceIdentity:`CampaignProjection:${item.id}`,sourceVersion:dataVersion,
+          payload:{dataVersion,reason:"CAMPAIGN_PROJECTION_PUBLISHED"}}]});
+    }
     return result;
   },{profile:"JOB_CHUNK",authority:{kind:"CAMPAIGN_READ_PROJECTION",agencyId:item.agencyId,creatorId:item.creatorId}});
 }

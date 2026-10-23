@@ -329,7 +329,7 @@ test("Closure2 Bump reply annotates COMMITTING delete without SKIPPED divergence
   const at = new Date();
   const state = { id: "state-1", pendingMessageId: "msg-1", pendingDeliveryId: "send-1", counters: {} };
   const cancel = { id: "delete-1", agencyId: "agency-1", creatorId: "creator-1", moduleKey: "bumps", actionType: "DELETE_MESSAGE", targetId: "msg-1", status: "COMMITTING", leaseRevision: 3, result: {}, payload: {} };
-  const send = { id: "send-1", payload: { afterReplyCooldownMs: 10_000, template: { id: "tpl-1" } }, result: {} };
+  const send = { id: "send-1", agencyId: "agency-1", creatorId: "creator-1", fanId: "fan-1", messageId: "msg-1", sentAt: new Date(at.getTime() - 1000), payload: { afterReplyCooldownMs: 10_000, template: { id: "tpl-1" } }, result: {} };
   const db = {
     automationBumpFanState: {
       findUnique: async () => state,

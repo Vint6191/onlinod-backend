@@ -68,7 +68,10 @@ const { scope } = require("./analytics-traffic/fixture.cjs");
     let ppvFact = await db.teamMoneyAttributionFact.findFirst({ where: { sourceRowId: "original-ppv-1" } });
     assert.equal(tipFact.amountCents, 1100); assert.equal(tipFact.classificationState, "CANONICAL"); assert.equal(tipFact.attributionActive, true);
     assert.equal(ppvFact.amountCents, 2700); assert.equal(ppvFact.memberId, "member-" + s.agencyId);
-    await tx(t => t.teamTipLedger.update({ where: { id: "original-tip-1" }, data: { financialStatus: "undo" } }));
+    await tx(async t => {
+      await t.creatorTip.update({ where: { id: "canonical-tip" }, data: { transactionStatus: "undo" } });
+      await t.teamTipLedger.update({ where: { id: "original-tip-1" }, data: { financialStatus: "undo" } });
+    });
     tipFact = await db.teamMoneyAttributionFact.findFirst({ where: { sourceRowId: "original-tip-1" } });
     assert.equal(tipFact.attributionActive, false); assert.equal(tipFact.financialStatus, "undo");
     assert.notDeepEqual(await summaryWork(), originalWork);

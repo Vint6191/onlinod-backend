@@ -147,7 +147,7 @@ async function createSubscriberScanUnderLock(tx, {
   agencyId, creatorId, userId = null, manual = false, force = false,
   mode = "full", sourceType = "all", normalizedLimit = DEFAULT_PAGE_LIMIT,
   normalizedEveryDays = DEFAULT_SCAN_EVERY_DAYS, priority = 20,
-  reason = "subscriber_directory_refresh", recoveryIntent = null, now,
+  reason = "subscriber_directory_refresh", recoveryIntent = null, now, recollectionAttempts = 0,
 }) {
   const state = await tx.subscriberDirectoryState.findUnique({
     where: { creatorId },
@@ -201,6 +201,7 @@ async function createSubscriberScanUnderLock(tx, {
       publicationGeneration: generation,
       observationTokenVersion: 1,
       observationReadLeaseVersion: 1,
+      subscriberRecollectionAttempts: Math.max(0, Math.floor(Number(recollectionAttempts) || 0)),
     },
     priority: integer(priority, 20, 0, 200),
     scheduledAt: now,
@@ -444,6 +445,7 @@ async function repairInvalidSubscriberPublisher(tx, { agencyId, creatorId, now, 
   const state = await tx.subscriberDirectoryState.findUnique({ where: { creatorId } });
   const cause = subscriberRecollectionCause(run, state);
   if (!cause) return { replaced: false };
+  const recollectionAttempts = manual ? 0 : Number(job.params?.subscriberRecollectionAttempts || 0);
   if (cause === "SUBSCRIBER_PUBLICATION_SOURCE_PROOF_MISSING" && run?.hasMore === true
     && ["QUEUED","RUNNING"].includes(run.status) && run.publicationStatus === "PENDING") {
     // A publisher handed off before the final page is a resumable traversal,
@@ -472,6 +474,24 @@ async function repairInvalidSubscriberPublisher(tx, { agencyId, creatorId, now, 
     const resumed = await tx.jobInstance.findUnique({ where: { id: job.id } });
     publishPlannedJobAvailable(resumed);
     return { replaced: false, resumed: true, existingRun: run, existingJob: resumed };
+  }
+  if (recollectionAttempts >= 3) {
+    const failure = `SUBSCRIBER_RECOLLECTION_EXHAUSTED: ${cause}`;
+    if (!run) run = await tx.subscriberScanRun.create({ data: {
+      id: runId || `subrecollection_${crypto.randomUUID()}`, agencyId, creatorId, jobId: runId ? job.id : null,
+      status: "FAILED", publicationStatus: "RECOLLECTING", publicationGeneration: Number(state?.publicationGeneration || 0),
+      lastError: failure, publicationLastError: failure, completedAt: now,
+    } });
+    await tx.jobInstance.updateMany({ where: { id: job.id, status: "PUBLISHING", leaseRevision: Number(job.leaseRevision || 0) },
+      data: { status: "FAILED", completedAt: now, lastError: failure, claimedAt: null, claimedByDeviceId: null,
+        leaseUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, workId: null, lastProgressAt: now,
+        progress: { stage: "STOPPED", message: "Subscriber snapshot repair stopped; explicit retry required", recoveryCause: cause } } });
+    if (run) await tx.subscriberScanRun.update({ where: { id: run.id }, data: {
+      status: "FAILED", publicationStatus: "RECOLLECTING", completedAt: now, lastError: failure, publicationLastError: failure,
+    } });
+    await tx.subscriberDirectoryState.updateMany({ where: { creatorId, lastJobId: job.id }, data: { status: "FAILED", lastError: failure } });
+    await require("./creator-live-sync-service").stopRecovery(tx, job, failure, { attempts: recollectionAttempts, now });
+    return { replaced: false, stopped: true, blockedRun: run, existingJob: job, reason: "failed_terminal" };
   }
   // A newer valid owner must finish first. Never replace a live collector, or
   // recollect an old generation while the replacement is already publishing.
@@ -512,6 +532,7 @@ async function repairInvalidSubscriberPublisher(tx, { agencyId, creatorId, now, 
   const recoveryIntent = await require("./creator-live-sync-service").pendingRecovery(tx, creatorId, "subscribers");
   const replacement = await createSubscriberScanUnderLock(tx, {
     agencyId, creatorId, now, reason: "subscriber_publication_recollection", recoveryIntent,
+    recollectionAttempts: recollectionAttempts + 1,
     normalizedEveryDays: integer(state?.scanEveryDays, DEFAULT_SCAN_EVERY_DAYS, 1, 30),
   });
   if (run) await tx.subscriberScanRun.update({ where: { id: run.id }, data: {

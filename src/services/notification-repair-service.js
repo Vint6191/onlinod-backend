@@ -12,13 +12,14 @@ function notificationRepairParams(job, now, result = job?.result) {
   const params = { ...(job?.params || {}) };
   const upgrade = params.notificationNormalizerVersion !== "notification-source-v2";
   const mode = !upgrade && params.notificationMode === "catchup" ? "catchup" : "full";
-  if (upgrade) { delete params.knownNotificationIds; delete params.stopAtNotificationId; params.from="2016-01-01T00:00:00.000Z"; params.to=new Date(now.getTime()+300000).toISOString(); }
+  if (upgrade) { delete params.knownNotificationIds; delete params.stopAtNotificationId; params.from=new Date(0).toISOString(); params.to=new Date(now.getTime()+300000).toISOString(); }
   delete params.resumeCursors;
   delete params.notificationRepairPass;
   const command = buildCollectionCommand({ collectorType: COLLECTOR_TYPES.NOTIFICATIONS,
     collectionMode: mode, reason: params.collectionReason || params.reason || "notification_repair", now });
   return stampCollectionAuthorityParams({ ...params, ...command,
     notificationMode: mode,
+    notificationFrontierVersion: mode === "full" ? 4 : 3,
     types: [...NOTIFICATION_TYPES],
     notificationRepairVersion: 1,
     notificationRepairFromRunId: params.collectionGeneration || result?.scanRunId || null,
@@ -33,6 +34,7 @@ function needsNotificationRepairRotation(job) {
   // or accepting work, even without a completion marker. Expanding the scope
   // in place would change immutable receipt checksums under the old run ID.
   if (!hasFullNotificationScope(job.params) || job.params?.notificationNormalizerVersion !== "notification-source-v2") return true;
+  if (job.params?.notificationMode !== "catchup" && job.params?.notificationFrontierVersion !== 4) return true;
   // lastError is cleared at claim, but the previous completion result survives.
   // This also identifies a pre-fix repair already CLAIMED by a live Desktop.
   const result = job.result;

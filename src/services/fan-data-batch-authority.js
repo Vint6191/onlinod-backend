@@ -23,7 +23,8 @@ function compatibleFieldsSatisfied(fan, fields, cutoff, now, isFresh) {
     if (field === "relationship") return RELATIONSHIP_FIELDS.every(key => freshVersion(relationship?.[`${key}AuthorityVersion`]));
     if (IDENTITY_FIELDS[field]) return freshVersion(fan?.[IDENTITY_FIELDS[field]]);
     if (RELATIONSHIP_FIELDS.includes(field)) return freshVersion(relationship?.[`${field}AuthorityVersion`]);
-    if (VALUE_FIELDS.includes(field)) return knownValue() && (value.availability === "UNAVAILABLE" || freshVersion(value[`${field}AuthorityVersion`]));
+    if (VALUE_FIELDS.includes(field)) return freshVersion(value?.[`${field}AuthorityVersion`])
+      || (field === "platformReportedTotalSpendCents" && knownValue());
     return false;
   });
 }
@@ -97,8 +98,19 @@ function assertFanDataBatchProgress({ job, chunkResult, continuation }) {
   const reused = Array.isArray(chunkResult.reusedFanIds) ? chunkResult.reusedFanIds : [];
   const failed = Array.isArray(chunkResult.terminalFailures) ? chunkResult.terminalFailures : [];
   const returned = items.map(row => String(row?.onlyFansUserId || ""));
-  const completed = [...returned, ...reused, ...failed.map(row => String(row?.fanId || ""))];
-  if (new Set(completed).size !== completed.length || completed.length !== checked.fanIds.length
+  const failedIds = failed.map(row => String(row?.fanId || ""));
+  const partial = items.filter(row => row?.value?.availability === "MALFORMED");
+  // One failed profile at the retry boundary may contribute independently
+  // valid fields without claiming completion or discarding the prior prefix.
+  const pendingPartialIds = partial.filter(row => next.retry?.index === checked.endIndex
+    && next.retry.fanId === String(row.onlyFansUserId) && next.retry.code === "OF_PROFILE_VALUE_MALFORMED"
+    && checked.requested[checked.endIndex] === String(row.onlyFansUserId)
+    && !checked.fanIds.includes(String(row.onlyFansUserId))).map(row => String(row.onlyFansUserId));
+  if (partial.some(row => !failed.some(failure => String(failure.fanId) === String(row.onlyFansUserId)
+      && failure.code === "OF_PROFILE_VALUE_MALFORMED") && !pendingPartialIds.includes(String(row.onlyFansUserId)))
+    || failedIds.some(id => returned.includes(id) && !partial.some(row => String(row.onlyFansUserId) === id))) fail("FAN_DATA_BATCH_PARTIAL_INVALID");
+  const completed = [...returned.filter(id => !pendingPartialIds.includes(id)), ...reused, ...failedIds.filter(id => !returned.includes(id))];
+  if (items.length > MAX_BATCH || new Set(returned).size !== returned.length || new Set(failedIds).size !== failedIds.length || new Set(completed).size !== completed.length || completed.length !== checked.fanIds.length
     || checked.fanIds.some(id => !completed.includes(id))) fail("FAN_DATA_BATCH_PREFIX_REQUIRED");
   const configuredAttempts = Number(job.params?.fanDataProfileMaxAttempts);
   const maxAttempts = Number.isSafeInteger(configuredAttempts) && configuredAttempts >= 0 ? Math.max(1, Math.min(5, configuredAttempts)) : 5;
@@ -106,7 +118,7 @@ function assertFanDataBatchProgress({ job, chunkResult, continuation }) {
     || row.attempts !== (before.retry?.fanId === row.fanId ? index(before.retry.attempts) : 0) + 1
     || !String(row.code || ""))) fail("FAN_DATA_BATCH_FAILURE_INVALID");
   const unavailable = items.filter(row => row?.value?.availability === "UNAVAILABLE").length;
-  if (next.refreshed !== index(before.refreshed) + items.length - unavailable
+  if (next.refreshed !== index(before.refreshed) + items.length - unavailable - partial.length
     || next.unavailable !== index(before.unavailable) + unavailable
     || next.reused !== index(before.reused) + reused.length
     || next.errors !== index(before.errors) + failed.length
@@ -116,7 +128,7 @@ function assertFanDataBatchProgress({ job, chunkResult, continuation }) {
   if (next.retry) {
     const old = before.retry?.index === next.retry.index ? index(before.retry.attempts) : 0;
     if (next.retry.index !== next.index || next.retry.fanId !== checked.requested[next.index]
-      || next.retry.attempts !== old + 1 || next.retry.attempts > 5) fail("FAN_DATA_BATCH_RETRY_INVALID");
+      || next.retry.attempts !== old + 1 || next.retry.attempts >= maxAttempts) fail("FAN_DATA_BATCH_RETRY_INVALID");
   }
 }
 

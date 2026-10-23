@@ -4,8 +4,10 @@ const prisma = require("../prisma");
 const { runDbTransaction } = require("./db-transaction-service");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 
+const { teamFinancialStatus, publishTeamMoneyResult, financiallyActive } = require("./team-money-financial-state-service");
+
 const RESOLVE_JOB_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
-const REFUND_STATUSES = new Set(["undo"]);
+const REFUND_STATUSES = new Set(["undo", "refunded", "refund", "chargeback", "reversed", "reversal"]);
 const MANUAL_SOURCE_MARKERS = ["manual"];
 const NON_HUMAN_SOURCE_MARKERS = ["automation", "auto_", "broadcast", "mass", "campaign", "queue", "system", "scheduler", "welcome", "bump"];
 const MANAGER_SOURCE_PREFIX = "manual_claim_";
@@ -388,7 +390,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
     loadFinancialTransaction(db, sale),
     findExactSentMessage(db, sale),
   ]);
-  const financialStatus = clean(sale.transactionStatus || financialTransaction?.transactionStatus, 80);
+  const financialStatus = teamFinancialStatus(sale, financialTransaction?.transactionStatus);
   const sentClass = classifySentSource(sent);
   const member = sentClass === "MANUAL" ? await ensureActiveMember(db, sale, sent) : null;
 
@@ -444,6 +446,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
         attributionBasis: existing.attributionBasis || "MANUAL_OVERRIDE_PRESERVED",
       },
     });
+    await publishTeamMoneyResult(db, existing, "PPV_RECONCILED");
     return { ok: true, purchase: existing, preservedManualResolution: true, financialRefunded: isRefundStatus(financialStatus) };
   }
 
@@ -501,7 +504,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
     purchase = await db.teamPpvPurchaseLedger.create({ data });
   }
 
-  if (sale.messageId && !isRefundStatus(financialStatus)) {
+  if (sale.messageId && financiallyActive({ financialStatus })) {
     await upsertResolveJob(db, { purchase, sale, proposed, sent });
   } else if (sale.messageId && isRefundStatus(financialStatus) && db?.teamPpvResolveJob?.updateMany) {
     await db.teamPpvResolveJob.updateMany({
@@ -510,6 +513,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
     });
   }
 
+  await publishTeamMoneyResult(db, purchase, "PPV_RECONCILED");
   return {
     ok: true,
     purchase,
@@ -644,7 +648,7 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
   const sentClass = classifySentSource(sent);
   const member = sentClass === "MANUAL" ? await ensureActiveMember(db, tip, sent) : null;
   const recent = await findRecentTipCandidates(db, tip, fanExternalId);
-  const financialStatus = clean(tip.transactionStatus, 80);
+  const financialStatus = teamFinancialStatus(tip);
 
   let proposed = { status: "unresolved", memberId: null, userId: null, basis: "NO_EXACT_MESSAGE_PROVENANCE" };
   if (tip.messageId && sentClass === "NON_HUMAN") {
@@ -690,6 +694,7 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
       where: { id: existing.id },
       data: { ...sourceData, attributionBasis: existing.attributionBasis || "MANUAL_OVERRIDE_PRESERVED" },
     });
+    await publishTeamMoneyResult(db, existing, "TIP_RECONCILED");
     return { ok: true, attribution: existing, preservedManualResolution: true, financialRefunded: isRefundStatus(financialStatus) };
   }
 
@@ -747,6 +752,7 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
     ? await db.teamTipLedger.update({ where: { id: existing.id }, data })
     : await db.teamTipLedger.create({ data });
 
+  await publishTeamMoneyResult(db, attribution, "TIP_RECONCILED");
   return {
     ok: true, attribution, proposedStatus: proposed.status, attributionBasis: proposed.basis,
     financialRefunded: isRefundStatus(financialStatus),

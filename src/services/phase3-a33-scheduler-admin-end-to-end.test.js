@@ -29,6 +29,9 @@ function installSchedulerDecisionHarness() {
   cacheModule(require.resolve("./analytics-recurring-planning-service"), { planRecurringCreatorAnalytics: async () => ({ created: 0, skipped: 0 }) });
   const degraded = (created = true) => ({ ok: false, created, reason: "fan_refresh_debt_not_durable" });
   const prisma = {
+    creatorFinancialCollectionState: { findMany: async () => [{ creatorId: "creator-a33", status: "COMPLETE", baselineGeneration: "initial-proof", baselineVerifiedAt: new Date("2026-01-01T00:00:00Z") }] },
+    creatorCampaignCollectionState: { findMany: async () => [{ creatorId: "creator-a33", status: "COMPLETE", membershipBaselineGeneration: "initial-membership", membershipBaselineVerifiedAt: new Date("2026-01-01T00:00:00Z") }] },
+    creatorEarningsLedgerProof: { findMany: async () => [{ creatorId: "creator-a33" }] },
     creatorAccount: {
       async findFirst() {
         return { id: "creator-a33", agencyId: "agency-a33", remoteId: "of-a33", username: "a33", displayName: "A33" };

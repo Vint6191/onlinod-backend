@@ -49,6 +49,9 @@ function fakeDb(options = {}) {
       findUnique: async ({ where }) => [active, failed, ...calls.runsCreated].find(row => row?.id === where.id) || null,
       findFirst: async ({ where } = {}) => {
         if (where?.status === "FAILED") return failed;
+        if (where?.status?.in) return [active, latest].find(row => row && where.status.in.includes(row.status)
+          && !where?.dialogId?.notIn?.includes(row.dialogId)) || null;
+        if (where?.mode?.notIn) return latest;
         if (where?.dialogId === "__dialog_discovery__") return latest;
         if (where?.dialogId?.not === "__dialog_discovery__") return active;
         return active;
@@ -173,7 +176,7 @@ test("partially scanned paused dialog resumes the same run and continuation", as
   assert.equal(db.calls.runsCreated.length, 0);
 });
 
-test("recoverable failed discovery resumes the same checkpoint instead of rebuilding the dialog list", async () => {
+test("explicit retry resumes failed discovery from the same durable checkpoint", async () => {
   const failed = {
     id: "run-failed", jobId: "job-failed", status: "FAILED", mode: "discovery",
     dialogId: "__dialog_discovery__", pagesProcessed: 1151, generation: 7,
@@ -192,7 +195,7 @@ test("recoverable failed discovery resumes the same checkpoint instead of rebuil
   const db = fakeDb({ failed, failedJob, state: { generation: 7 } });
   const result = await scheduleDialogScanTx(db, {
     agencyId: "agency-1", creatorId: "creator-1", dialogId: "__dialog_discovery__",
-    mode: "discovery", childMode: "initial", source: "never_used_pipeline", priority: 90,
+    mode: "discovery", childMode: "initial", source: "never_used_pipeline", priority: 90, allowTerminalRetry: true,
   });
   assert.equal(result.resumed, true);
   assert.equal(result.run.id, "run-failed");
@@ -204,7 +207,7 @@ test("recoverable failed discovery resumes the same checkpoint instead of rebuil
 
 
 
-test("status polling automatically revives the contradictory empty discovery tail", async () => {
+test("status polling preserves terminal contradictory discovery failure", async () => {
   const failed = {
     id: "run-failed", jobId: "job-failed", status: "FAILED", mode: "discovery",
     dialogId: "__dialog_discovery__", pagesProcessed: 1151, generation: 7,
@@ -224,13 +227,11 @@ test("status polling automatically revives the contradictory empty discovery tai
   const result = await autoRecoverDialogDiscoveryTx(db, {
     agencyId: "agency-1", creatorId: "creator-1", source: "status_poll", priority: 90,
   });
-  assert.equal(result.recovered, true);
-  assert.equal(db.calls.jobsCreated.length, 1);
-  assert.deepEqual(db.calls.jobsCreated[0].continuation, failed.continuation);
-  assert.equal(db.calls.jobsCreated[0].params.scanRunId, "run-failed");
-  assert.equal(db.calls.runsUpdated.at(-1).data.status, "QUEUED");
+  assert.equal(result.recovered, false);
+  assert.equal(result.reason, "recovery_stopped");
+  assert.equal(db.calls.jobsCreated.length, 0);
+  assert.equal(db.calls.runsUpdated.length, 0);
 });
-
 
 
 test("active discovery whose continuation restarted at zero is fenced and restored from committed chunks", async () => {
@@ -290,7 +291,7 @@ test("purchase target is queued inside an active initial run without damaging co
   assert.equal(db.calls.runsCreated.length, 0);
 });
 
-test("legacy cursor-stalled discovery is automatically resumed from its durable checkpoint", async () => {
+test("status polling preserves terminal cursor-stalled discovery failure", async () => {
   const failed = {
     id: "run-cursor-stalled", jobId: "job-cursor-stalled", status: "FAILED", mode: "discovery",
     dialogId: "__dialog_discovery__", pagesProcessed: 1220, generation: 9,
@@ -310,11 +311,10 @@ test("legacy cursor-stalled discovery is automatically resumed from its durable 
   const result = await autoRecoverDialogDiscoveryTx(db, {
     agencyId: "agency-1", creatorId: "creator-1", source: "status_poll", priority: 90,
   });
-  assert.equal(result.recovered, true);
-  assert.equal(db.calls.jobsCreated.length, 1);
-  assert.deepEqual(db.calls.jobsCreated[0].continuation, failed.continuation);
-  assert.equal(db.calls.jobsCreated[0].params.scanRunId, "run-cursor-stalled");
-  assert.equal(db.calls.runsUpdated.at(-1).data.status, "QUEUED");
+  assert.equal(result.recovered, false);
+  assert.equal(result.reason, "recovery_stopped");
+  assert.equal(db.calls.jobsCreated.length, 0);
+  assert.equal(db.calls.runsUpdated.length, 0);
 });
 
 

@@ -720,7 +720,7 @@ async function finalizeBumpDelete({ delivery, result, outcomeCode, db = prisma }
   return { replied: replied && changed > 0, canceled: canceled && changed > 0, changed };
 }
 
-async function markBumpReply({ agencyId, creatorId, fanId, messageId = null, repliedAt = new Date(), source = "ws", db = prisma }) {
+async function markBumpReply({ agencyId, creatorId, fanId, messageId = null, repliedAt = null, source = "ws", db = prisma }) {
   return runWithAutomationWriteCommitFence({
     db,
     agencyId, creatorId,
@@ -737,7 +737,20 @@ async function markBumpReply({ agencyId, creatorId, fanId, messageId = null, rep
       const payload = object(cancel?.payload || send?.payload);
       const timing = object(send?.payload?.timing);
       const cooldownMs = int(payload.afterReplyCooldownMs ?? timing.afterReplyCooldownMs, 24 * 60 * 60_000, 0, 90 * 24 * 60 * 60_000);
-      const at = date(repliedAt) || new Date();
+      const sentValue = state.lastBumpSentAt || send?.sentAt || object(send?.result).sentAt || payload.sentAt || state.lastSentAt;
+      // date(null) is the Unix epoch elsewhere in this service; absence is not
+      // episode evidence and must be rejected before that compatibility helper.
+      const at = repliedAt === null || repliedAt === undefined || repliedAt === '' ? null : date(repliedAt);
+      const sentAt = sentValue === null || sentValue === undefined || sentValue === '' ? null : date(sentValue);
+      if (!at || !sentAt) return { ok: true, matched: false, code: "reply_episode_time_unproven" };
+      if (at.getTime() < sentAt.getTime()) return { ok: true, matched: false, code: "reply_predates_bump" };
+      const replyMessageId = clean(messageId, 160);
+      if (!replyMessageId || replyMessageId === pendingMessageId) return { ok: true, matched: false, code: "reply_message_unproven" };
+      if (/^\d+$/.test(replyMessageId) && /^\d+$/.test(pendingMessageId) && BigInt(replyMessageId) <= BigInt(pendingMessageId)) {
+        return { ok: true, matched: false, code: "reply_predates_bump" };
+      }
+      if (send && (send.id !== state.pendingDeliveryId || send.agencyId !== agencyId || send.creatorId !== creatorId || send.fanId !== fanId
+        || (send.messageId && send.messageId !== pendingMessageId))) return { ok: true, matched: false, code: "reply_episode_scope_mismatch" };
       const stateChanged = await tx.automationBumpFanState.updateMany({
         where: { id: state.id, pendingMessageId },
         data: {
@@ -935,6 +948,7 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
   for (const event of rows) {
     const type = clean(event?.type, 80);
     if (type === "presence_online") {
+      if (reconcileOnly) { summary.ignored += 1; continue; }
       for (const fanId of event.fanIds || event.onlineIds || []) {
         const normalized = clean(fanId, 160);
         if (normalized) onlineIds.add(normalized);
@@ -993,7 +1007,8 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
         creatorId,
         fanId,
         messageId: event.messageId,
-        repliedAt: event.createdAt || event.changedAt || new Date(),
+        // A delayed edit or receipt time cannot prove a reply to this send.
+        repliedAt: event.createdAt || null,
         source: clean(event.source, 80) || "ws",
         db: commitDb,
       }));

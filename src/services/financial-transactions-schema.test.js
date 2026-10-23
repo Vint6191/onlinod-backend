@@ -66,8 +66,9 @@ test("ingest keeps unavailable-user and unknown-type transactions as durable fac
 
 test("financial catch-up re-observes statuses without stealing full-scan provenance", () => {
   assert.match(service, /financialMode\(job\) === "catchup"/);
-  assert.match(service, /Catch-up re-observes the head/);
-  assert.match(service, /\? commonData\s*:\s*\{ \.\.\.commonData, sourceJobId: job\.id, scanRunId/);
+  const publication = read("src/services/financial-canonical-publication-repository.js");
+  assert.match(publication, /!previous\|\|!catchup\?\{sourceJobId:job\.id,scanRunId/);
+  assert.match(service, /publishVerifiedFinancialFactsPage/);
   assert.match(service, /receipts\.completionProof/);
   assert.match(service, /receipt\.complete/);
 });
@@ -85,7 +86,7 @@ test("completion reconciles OF earnings after undo refunds while keeping loading
   assert.match(service, /REFUND_TRANSACTION_STATUSES = new Set\(\["undo"\]\)/);
   assert.match(service, /PAYOUT_PENDING_TRANSACTION_STATUSES = new Set\(\["loading"\]\)/);
   assert.match(service, /earningsTransactionsCount = Math\.max\(0, count - statusTotals\.refundTransactionsCount\)/);
-  assert.match(service, /earningsGrossCents = grossCents - statusTotals\.refundGrossCents/);
+  assert.match(service, /earningsGrossCents = receipts\.earningsTotals\(proof\)\.grossCents/);
   assert.match(service, /earningsNetCents = netCents - statusTotals\.refundNetCents/);
   assert.match(service, /countMatched = chartReady \? comparison\.transactionsCount/);
   assert.match(service, /sourceBoundaryReached/);

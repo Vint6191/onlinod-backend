@@ -1,4 +1,5 @@
 "use strict";
+const { valueFieldState } = require("./fan-value-field-authority");
 const { readCampaignRefreshDebt } = require("./campaign-refresh-debt-service");
 
 const { dbAuthorityNow } = require("./db-time-authority-service");
@@ -19,17 +20,17 @@ function safeInteger(value) {
 }
 const n=(m,k)=>safeInteger(m?.[k]??0);
 function metricsDto(m={},ready=true,revenueReady=ready) {
-  const moneyReady=ready && revenueReady && n(m,"unknownAttributionFans")===0;
+  const moneyReady=ready && revenueReady && n(m,"unknownAttributionFans")===0 && n(m,"unverifiedTransactions")===0;
   const amount=(known,unknown)=>moneyReady && n(m,unknown)===0?n(m,known):null;
   return {
     campaigns:n(m,"campaigns"),activeCampaigns:n(m,"activeCampaigns"),memberships:n(m,"memberships"),
     fans:n(m,"memberships"),fansCount:n(m,"memberships"),uniqueFans:n(m,"uniqueFans"),newFans:n(m,"newFans"),
     payingFans:moneyReady?n(m,"payingFans"):null,unknownAttributionFans:n(m,"unknownAttributionFans"),
-    grossCents:moneyReady?n(m,"grossCents"):null,knownNetCents:ready?n(m,"knownNetCents"):null,
-    unknownNetTransactions:n(m,"unknownNetTransactions"),netCents:amount("knownNetCents","unknownNetTransactions"),
+    grossCents:amount("grossCents","unknownGrossTransactions"),unknownGrossTransactions:n(m,"unknownGrossTransactions"),knownNetCents:ready?n(m,"knownNetCents"):null,
+    unknownNetTransactions:n(m,"unknownNetTransactions"),unverifiedTransactions:n(m,"unverifiedTransactions"),netCents:amount("knownNetCents","unknownNetTransactions"),
     transactionsCount:n(m,"transactionsCount"),transactions:n(m,"transactionsCount"),
-    settledGrossCents:moneyReady?n(m,"settledGrossCents"):null,settledNetCents:amount("settledKnownNetCents","settledUnknownNetTransactions"),
-    settledTransactionsCount:n(m,"settledTransactionsCount"),pendingGrossCents:moneyReady?n(m,"pendingGrossCents"):null,
+    settledGrossCents:amount("settledGrossCents","settledUnknownGrossTransactions"),settledNetCents:amount("settledKnownNetCents","settledUnknownNetTransactions"),
+    settledTransactionsCount:n(m,"settledTransactionsCount"),pendingGrossCents:amount("pendingGrossCents","pendingUnknownGrossTransactions"),
     pendingNetCents:amount("pendingKnownNetCents","pendingUnknownNetTransactions"),pendingTransactionsCount:n(m,"pendingTransactionsCount"),
     salesRevenueCents:amount("salesKnownNetCents","salesUnknownNetTransactions"),tipsRevenueCents:amount("tipsKnownNetCents","tipsUnknownNetTransactions"),
     subscriptionRevenueCents:amount("subscriptionKnownNetCents","subscriptionUnknownNetTransactions"),
@@ -136,13 +137,13 @@ async function readCampaignPage({db,creatorId,rangeKey:key="all",cursor=null,lim
 function fanValueDto(value,now,freshnessMs=CAMPAIGN_FAN_VALUE_FRESHNESS_MS) {
   if(!value)return null;
   const observed=trustedCollectionTimestamp(value.valueObservedAt,now);
-  const available=Boolean(observed&&+observed+freshnessMs>+now&&value.availability==="AVAILABLE"&&value.platformReportedTotalSpendCents!=null);
-  const money=field=>available?safeInteger(value[field]):null;
+  const state=valueFieldState(value,now,freshnessMs),available=state.available;
+  const money=field=>(field==="platformReportedTotalSpendCents"?available:state.fields[field].fresh)?safeInteger(value[field]):null;
   return {available,availability:value.availability,
     platformReportedTotalSpendCents:money("platformReportedTotalSpendCents"),messagesSpentCents:money("messagesSpentCents"),
     subscriptionsSpentCents:money("subscriptionsSpentCents"),tipsSpentCents:money("tipsSpentCents"),postsSpentCents:money("postsSpentCents"),streamsSpentCents:money("streamsSpentCents"),
     observedAt:value.valueObservedAt.toISOString(),expiresAt:observed?new Date(+observed+freshnessMs).toISOString():null,
-    lastActivityAt:value.lastActivityAt?.toISOString()||null,source:value.source};
+    lastActivityAt:value.lastActivityAt?.toISOString()||null,source:value.source,fieldAuthority:state.authority,fieldFreshness:state.fields};
 }
 async function readCampaignFanPage({db,creatorId,campaignId,rangeKey:key="all",filter="ALL",cursor=null,limit=50,offset=0,now=null}) {
   if(Number(offset)!==0)throw fault("CAMPAIGN_CURSOR_REQUIRED");

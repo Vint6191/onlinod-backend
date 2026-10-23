@@ -360,109 +360,6 @@ async function listStorylines({ agencyId, creatorId, db = prisma }) {
   return { ok: true, creatorId: id, storylines, count: storylines.length };
 }
 
-async function recomputeUsage(db, agencyId, creatorId, mediaIds) {
-  const ids = cleanMediaIds(mediaIds, MAX_USAGE_SOURCES * MAX_USAGE_ITEMS_PER_SOURCE);
-  if (!ids.length) return;
-  const now = new Date();
-  await db.creatorMediaAsset.updateMany({
-    where: { agencyId, creatorId, mediaId: { in: ids } },
-    data: {
-      sentCount: 0,
-      soldCount: 0,
-      notOpenedCount: 0,
-      freeCount: 0,
-      revenueCents: 0,
-      averagePriceCents: 0,
-      uniqueBuyers: 0,
-      lastSoldAt: null,
-      usageUpdatedAt: now,
-    },
-  });
-
-  const groups = await db.creatorMediaUsageContribution.groupBy({
-    by: ["mediaId"],
-    where: { agencyId, creatorId, mediaId: { in: ids } },
-    _sum: {
-      sentCount: true,
-      soldCount: true,
-      notOpenedCount: true,
-      freeCount: true,
-      revenueCents: true,
-      uniqueBuyers: true,
-    },
-    _max: { lastSoldAt: true, capturedAt: true },
-  });
-  const projections = groups.map((group) => {
-    const soldCount = integer(group._sum?.soldCount);
-    const revenueCents = integer(group._sum?.revenueCents);
-    return {
-      mediaId: clean(group.mediaId, 240),
-      sentCount: integer(group._sum?.sentCount, 0, 0, 2_000_000_000),
-      soldCount: integer(soldCount, 0, 0, 2_000_000_000),
-      notOpenedCount: integer(group._sum?.notOpenedCount, 0, 0, 2_000_000_000),
-      freeCount: integer(group._sum?.freeCount, 0, 0, 2_000_000_000),
-      revenueCents: integer(revenueCents, 0, 0, 2_000_000_000),
-      averagePriceCents: soldCount > 0 ? integer(Math.round(revenueCents / soldCount), 0, 0, 2_000_000_000) : 0,
-      uniqueBuyers: integer(group._sum?.uniqueBuyers, 0, 0, 2_000_000_000),
-      lastSoldAt: iso(group._max?.lastSoldAt),
-      usageUpdatedAt: iso(group._max?.capturedAt || now),
-    };
-  }).filter((group) => group.mediaId);
-
-  if (projections.length && typeof db.$executeRawUnsafe === "function") {
-    // Prisma's per-row update loop is prohibitively expensive against hosted
-    // Postgres. The values were already normalized above; jsonb_to_recordset
-    // applies every aggregate in one parameterized UPDATE.
-    await db.$executeRawUnsafe(`
-      UPDATE "CreatorMediaAsset" AS asset
-      SET
-        "sentCount" = projection."sentCount",
-        "soldCount" = projection."soldCount",
-        "notOpenedCount" = projection."notOpenedCount",
-        "freeCount" = projection."freeCount",
-        "revenueCents" = projection."revenueCents",
-        "averagePriceCents" = projection."averagePriceCents",
-        "uniqueBuyers" = projection."uniqueBuyers",
-        "lastSoldAt" = projection."lastSoldAt",
-        "usageUpdatedAt" = projection."usageUpdatedAt",
-        "updatedAt" = NOW()
-      FROM jsonb_to_recordset($3::jsonb) AS projection(
-        "mediaId" text,
-        "sentCount" integer,
-        "soldCount" integer,
-        "notOpenedCount" integer,
-        "freeCount" integer,
-        "revenueCents" integer,
-        "averagePriceCents" integer,
-        "uniqueBuyers" integer,
-        "lastSoldAt" timestamptz,
-        "usageUpdatedAt" timestamptz
-      )
-      WHERE asset."agencyId" = $1
-        AND asset."creatorId" = $2
-        AND asset."mediaId" = projection."mediaId"
-    `, agencyId, creatorId, JSON.stringify(projections));
-    return;
-  }
-
-  // Test doubles and non-Postgres adapters keep the portable fallback.
-  for (const projection of projections) {
-    await db.creatorMediaAsset.updateMany({
-      where: { agencyId, creatorId, mediaId: projection.mediaId },
-      data: {
-        sentCount: projection.sentCount,
-        soldCount: projection.soldCount,
-        notOpenedCount: projection.notOpenedCount,
-        freeCount: projection.freeCount,
-        revenueCents: projection.revenueCents,
-        averagePriceCents: projection.averagePriceCents,
-        uniqueBuyers: projection.uniqueBuyers,
-        lastSoldAt: date(projection.lastSoldAt),
-        usageUpdatedAt: date(projection.usageUpdatedAt, now),
-      },
-    });
-  }
-}
 
 async function lockMediaLibraryUsageTx(db, agencyId, creatorId) {
   await lockDbAdvisoryXact({ db, key: `media_library_usage:${agencyId}:${creatorId}` });
@@ -470,7 +367,7 @@ async function lockMediaLibraryUsageTx(db, agencyId, creatorId) {
 
 async function replaceUsageSourceTx(tx, { agencyId, creatorId, source }) {
   await lockMediaLibraryUsageTx(tx, agencyId, creatorId);
-  return mergeUsageFactSourceTx(tx, { agencyId, creatorId, source, recomputeUsage });
+  return mergeUsageFactSourceTx(tx, { agencyId, creatorId, source });
 }
 
 async function replaceUsageSources({ agencyId, creatorId, sources, db = prisma, commitGuard = null }) {
@@ -633,6 +530,7 @@ async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {
     SELECT COUNT(*) FILTER (WHERE a."soldCount" > 0) AS "soldAssets",
       COALESCE(SUM(a."soldCount"), 0) AS "totalSales",
       COALESCE(SUM(a."revenueCents"), 0) AS "revenueCents",
+      COALESCE(SUM(a."revenueUnknownCount"), 0) AS "revenueUnknownCount",
       COALESCE(SUM(a."notOpenedCount"), 0) AS "notOpened",
       COALESCE(SUM(a."freeCount"), 0) AS "free",
       MAX(a."lastSoldAt") AS "lastSaleAt",
@@ -652,6 +550,8 @@ async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {
       soldAssets: exactMediaCount(totals.soldAssets),
       totalSales: exactMediaCount(totals.totalSales),
       revenueCents: exactMediaCount(totals.revenueCents),
+      revenueUnknownCount: exactMediaCount(totals.revenueUnknownCount),
+      revenueComplete: await require("./media-financial-projection-service").financialProjectionReady(db, id) && exactMediaCount(totals.revenueUnknownCount) === 0,
       opened: exactMediaCount(totals.totalSales),
       notOpened: exactMediaCount(totals.notOpened),
       free: exactMediaCount(totals.free),
@@ -663,26 +563,8 @@ async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {
   };
 }
 
-async function rebuildMediaUsage({ agencyId, creatorId, db = prisma }) {
-  const id = await requireCreator(db, agencyId, creatorId);
-  const assets = await db.creatorMediaAsset.findMany({
-    where: { agencyId, creatorId: id, catalogActive: true },
-    select: { mediaId: true },
-    take: 100000,
-  });
-  const mediaIds = assets.map((asset) => String(asset.mediaId));
-  await runDbTransaction(db, async (tx) => {
-    await lockMediaLibraryUsageTx(tx, agencyId, id);
-    for (let offset = 0; offset < mediaIds.length; offset += MAX_MEDIA_IDS) {
-      await recomputeUsage(tx, agencyId, id, mediaIds.slice(offset, offset + MAX_MEDIA_IDS));
-    }
-    if (mediaIds.length) await publishMediaResult({ db: tx, agencyId, creatorId: id, kind: "USAGE_REBUILT",
-      state: { commit: currentCommitContext().rootId, mediaIds } });
-  });
-  return { ok: true, creatorId: id, rebuilt: mediaIds.length };
-}
 
-function assetToSalesAsset(asset) {
+function assetToSalesAsset(asset, ready = true) {
   return {
     id: String(asset.id),
     creatorId: String(asset.creatorId),
@@ -696,6 +578,8 @@ function assetToSalesAsset(asset) {
     },
     soldCount: integer(asset.soldCount),
     totalRevenueCents: integer(asset.revenueCents),
+    revenueUnknownCount: integer(asset.revenueUnknownCount),
+    revenueComplete: ready && integer(asset.revenueUnknownCount) === 0,
     uniqueBuyers: integer(asset.uniqueBuyers),
     averagePriceCents: integer(asset.averagePriceCents),
     openedCount: integer(asset.soldCount),
@@ -720,7 +604,8 @@ async function listMediaSalesAssets({ agencyId, creatorId, offset = 0, limit = 1
   const { rows: assets, count } = await readMediaPage(db, {
     where, orderBy: [{ revenueCents: "desc" }, { soldCount: "desc" }, { lastSoldAt: "desc" }, { mediaId: "asc" }], offset: skip, limit: take,
   });
-  const items = assets.map(assetToSalesAsset);
+  const ready = await require("./media-financial-projection-service").financialProjectionReady(db, id);
+  const items = assets.map(asset => assetToSalesAsset(asset, ready));
   return { ok: true, items, count, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < count };
 }
 
@@ -739,6 +624,4 @@ module.exports = {
   deleteMediaAssets,
   getMediaSalesSummary,
   listMediaSalesAssets,
-  rebuildMediaUsage,
-  recomputeUsage,
 };

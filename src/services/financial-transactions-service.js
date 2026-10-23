@@ -33,18 +33,18 @@ function summarizeStatusGroups(groups = []) {
   for (const group of groups || []) {
     const status = normalizedStatus(group.transactionStatus);
     const count = Number(group?._count?._all || 0);
-    const grossCents = Number(group?._sum?.amountCents || 0);
+    const grossCents = (group.grossKnown ?? count) === count ? Number(group?._sum?.amountCents || 0) : null;
     const netCents = Number(group?._sum?.netCents || 0);
     const feeCents = Number(group?._sum?.feeCents || 0);
     statusSummary.push({ status: status || null, count, grossCents, netCents, feeCents });
     if (status === "done") {
-      settledTransactionsCount += count; settledGrossCents += grossCents; settledNetCents += netCents; settledFeeCents += feeCents;
+      settledTransactionsCount += count; settledGrossCents = settledGrossCents === null || grossCents === null ? null : settledGrossCents + grossCents; settledNetCents += netCents; settledFeeCents += feeCents;
     }
     if (PAYOUT_PENDING_TRANSACTION_STATUSES.has(status)) {
-      pendingTransactionsCount += count; pendingGrossCents += grossCents; pendingNetCents += netCents; pendingFeeCents += feeCents;
+      pendingTransactionsCount += count; pendingGrossCents = pendingGrossCents === null || grossCents === null ? null : pendingGrossCents + grossCents; pendingNetCents += netCents; pendingFeeCents += feeCents;
     }
     if (REFUND_TRANSACTION_STATUSES.has(status)) {
-      refundTransactionsCount += count; refundGrossCents += grossCents; refundNetCents += netCents; refundFeeCents += feeCents;
+      refundTransactionsCount += count; refundGrossCents = refundGrossCents === null || grossCents === null ? null : refundGrossCents + grossCents; refundNetCents += netCents; refundFeeCents += feeCents;
     }
   }
   return {
@@ -76,7 +76,8 @@ function strictDate(value) {
   return Number.isFinite(date.getTime()) ? date : null;
 }
 function moneyCents(value) {
-  if (value === null || value === undefined || value === "" || typeof value === "boolean") return null;
+  if (typeof value !== "number" && typeof value !== "string") return null;
+  if (typeof value === "string" && !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(value.trim())) return null;
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return null;
   const cents = Math.round(parsed * 100);
@@ -105,15 +106,17 @@ function normalizeTransaction(row, index, page) {
   const externalTransactionId = clean(source.externalTransactionId ?? source.id ?? source.transactionId ?? source.transaction_id, 220);
   const transactionType = clean(source.transactionType ?? details.type ?? source.type, 120);
   const occurredAt = strictDate(source.occurredAt ?? source.createdAt ?? source.created_at ?? source.date);
-  const amountCents = sourceCents(source.amountCents, source.amount);
+  const gross = sourceCents(source.amountCents, source.amount);
+  const amountCents = gross !== null && gross >= 0 ? gross : null;
+  const netCents = sourceCents(source.netCents, source.net);
   const currency = (clean(source.currency, 10) || "USD").toUpperCase();
   if (!externalTransactionId) return { rejected: true, reasonCode: "transaction_id_missing", page, ordinal: index };
   if (!transactionType) return { rejected: true, reasonCode: "transaction_type_missing", page, ordinal: index, externalTransactionId };
   if (!occurredAt) return { rejected: true, reasonCode: "occurred_at_invalid", page, ordinal: index, externalTransactionId, transactionType };
-  if (amountCents === null) return { rejected: true, reasonCode: "amount_invalid", page, ordinal: index, externalTransactionId, transactionType, occurredAt: occurredAt.toISOString() };
+  if (netCents === null || netCents < 0) return { rejected: true, reasonCode: "net_invalid", page, ordinal: index, externalTransactionId, transactionType, occurredAt: occurredAt.toISOString() };
   if (!/^[A-Z]{3}$/.test(currency)) return { rejected: true, reasonCode: "currency_invalid", page, ordinal: index, externalTransactionId, transactionType, occurredAt: occurredAt.toISOString(), amountCents };
   const mapped = classification(transactionType);
-  if (mapped.projectionStatus === "PROJECTED" && amountCents <= 0) {
+  if (mapped.projectionStatus === "PROJECTED" && Math.max(amountCents ?? 0, netCents) <= 0) {
     mapped.projectionStatus = "STORED_ONLY";
     mapped.reasonCode = "nonpositive_transaction_not_projected";
   }
@@ -127,14 +130,14 @@ function normalizeTransaction(row, index, page) {
     factType: mapped.factType,
     projectionStatus: mapped.projectionStatus,
     saleType: mapped.saleType,
-    reasonCode: mapped.reasonCode,
+    reasonCode: amountCents === null ? "GROSS_UNAVAILABLE" : mapped.reasonCode,
     fanOnlyFansUserId,
     fanUsername: clean(source.fanUsername ?? user.username, 180),
     fanDisplayName: clean(source.fanDisplayName ?? user.name ?? user.displayName, 255),
     fanAvatarUrl: clean(source.fanAvatarUrl ?? user.avatar ?? user.avatarUrl ?? user.avatarThumbs?.c144 ?? user.avatarThumbs?.c50, 1200),
     amountCents,
     feeCents: sourceCents(source.feeCents, source.fee),
-    netCents: sourceCents(source.netCents, source.net),
+    netCents,
     taxCents: sourceCents(source.taxCents, source.taxAmount ?? source.tax_amount),
     vatCents: sourceCents(source.vatCents, source.vatAmount ?? source.vat_amount),
     mediaTaxCents: sourceCents(source.mediaTaxCents, source.mediaTaxAmount ?? source.media_tax_amount),
@@ -176,7 +179,7 @@ function businessData(job, deviceId, row, fanRecordId, now) {
     transactionStatus: row.transactionStatus,
     currency: row.currency,
     source: "ONLYFANS_API",
-    sourceUpdatedAt: null,
+    sourceUpdatedAt: row.sourceUpdatedAt || observationStartForJob(job),
     collectedAt: now,
     sourceDeviceId: deviceId || null,
     sourceJobId: job.id,
@@ -185,7 +188,7 @@ function businessData(job, deviceId, row, fanRecordId, now) {
 }
 
 async function uniqueLegacyProjectionCandidate(tx, job, row, fanRecordId) {
-  if (!fanRecordId || row.amountCents <= 0) return null;
+  if (!fanRecordId || row.amountCents == null || row.amountCents <= 0) return null;
   const gte = new Date(row.occurredAt.getTime() - 5_000);
   const lte = new Date(row.occurredAt.getTime() + 5_000);
   if (row.factType === "SALE") {
@@ -229,8 +232,10 @@ async function projectKnownFact(tx, job, deviceId, row, fanRecordId, now) {
     const existing = await tx.creatorSale.findUnique({
       where: { creatorId_externalTransactionId: { creatorId: job.creatorId, externalTransactionId: row.externalTransactionId } },
     });
+    if (existing?.sourceUpdatedAt && +existing.sourceUpdatedAt > +common.sourceUpdatedAt) return null;
     if (existing) return tx.creatorSale.update({ where: { id: existing.id }, data: retainKnownFan(existing, update) });
     const legacy = await uniqueLegacyProjectionCandidate(tx, job, row, fanRecordId);
+    if (legacy?.sourceUpdatedAt && +legacy.sourceUpdatedAt > +common.sourceUpdatedAt) return null;
     if (legacy) return tx.creatorSale.update({ where: { id: legacy.id }, data: update });
     return tx.creatorSale.create({
       data: { id: crypto.randomUUID(), createdAt: now, eventFingerprint: hash(`payout-transaction|${job.creatorId}|${row.externalTransactionId}`), externalNotificationId: null, messageId: null, postId: null, ...update },
@@ -241,8 +246,10 @@ async function projectKnownFact(tx, job, deviceId, row, fanRecordId, now) {
     const existing = await tx.creatorTip.findUnique({
       where: { creatorId_externalTransactionId: { creatorId: job.creatorId, externalTransactionId: row.externalTransactionId } },
     });
+    if (existing?.sourceUpdatedAt && +existing.sourceUpdatedAt > +common.sourceUpdatedAt) return null;
     if (existing) return tx.creatorTip.update({ where: { id: existing.id }, data: retainKnownFan(existing, update) });
     const legacy = await uniqueLegacyProjectionCandidate(tx, job, row, fanRecordId);
+    if (legacy?.sourceUpdatedAt && +legacy.sourceUpdatedAt > +common.sourceUpdatedAt) return null;
     if (legacy) return tx.creatorTip.update({ where: { id: legacy.id }, data: update });
     return tx.creatorTip.create({
       data: { id: crypto.randomUUID(), createdAt: now, eventFingerprint: hash(`payout-transaction|${job.creatorId}|${row.externalTransactionId}`), externalNotificationId: null, messageId: null, ...update },
@@ -301,80 +308,13 @@ async function ingestFinancialTransactionsChunk({ db = prisma, job, deviceId, ch
     const now = await dbAuthorityNow({ db: tx, fallbackNow: processReceivedAt });
     const receipt = receipts.enabled(job) ? await receipts.beforePage(tx, job, chunk) : null;
     if (receipt?.replay) return { receiptReplay: true, financialContinuation: receipt.financialContinuation };
-    await lockCreatorFacts(tx, job.agencyId, job.creatorId);
-    const ids = accepted.map((row) => row.externalTransactionId);
-    const existingRows = ids.length ? await tx.creatorFinancialTransaction.findMany({
-      where: { creatorId: job.creatorId, externalTransactionId: { in: ids } },
-    }) : [];
-    const existingById = new Map(existingRows.map((row) => [row.externalTransactionId, row]));
-    const writable = accepted.filter(row => {
-      const previous = existingById.get(row.externalTransactionId);
-      return !(previous?.sourceUpdatedAt && +previous.sourceUpdatedAt > +observationStartForJob(job));
-    });
-    const participants = await resolveFans(tx, job, writable, now);
-    const projectedSaleIds = [], projectedTipIds = [];
-
-    for (const row of writable) {
-      const fan = participants.fans.get(`${job.creatorId}\u0000${row.fanOnlyFansUserId}`);
-      const fanRecordId = fan?.id || null;
-      const commonData = {
-        agencyId: job.agencyId, creatorId: job.creatorId, fanRecordId,
-        fanOnlyFansUserId: row.fanOnlyFansUserId || null,
-        fanUsernameAtEvent: row.fanUsername || null,
-        fanDisplayNameAtEvent: row.fanDisplayName || null,
-        fanAvatarUrlAtEvent: row.fanAvatarUrl || null,
-        externalTransactionId: row.externalTransactionId,
-        transactionType: row.transactionType,
-        factType: row.factType,
-        projectionStatus: row.projectionStatus,
-        amountCents: row.amountCents, feeCents: row.feeCents, netCents: row.netCents,
-        taxCents: row.taxCents, vatCents: row.vatCents, mediaTaxCents: row.mediaTaxCents,
-        currency: row.currency, occurredAt: row.occurredAt, transactionStatus: row.transactionStatus,
-        sourceUpdatedAt: observationStartForJob(job), collectedAt: now, sourceDeviceId: deviceId || null,
-        reasonCode: row.reasonCode, updatedAt: now,
-      };
-      const previous = existingById.get(row.externalTransactionId);
-      if (!previous) {
-        const data = { ...commonData, sourceJobId: job.id, scanRunId, page: row.page, ordinal: row.ordinal };
-        await tx.creatorFinancialTransaction.create({ data: { id: crypto.randomUUID(), createdAt: now, ...data } });
-        inserted += 1;
-      } else {
-        // Catch-up re-observes the head so status changes such as done -> undo
-        // are applied, but an overlap page must not steal provenance from the
-        // original full scan. Full rebuilds intentionally rebind provenance.
-        const data = financialMode(job) === "catchup"
-          ? commonData
-          : { ...commonData, sourceJobId: job.id, scanRunId, page: row.page, ordinal: row.ordinal };
-        const previousComparable = comparable(previous);
-        const canonicalData = retainKnownFan(previous, data);
-        const nextComparable = comparable({ ...canonicalData, occurredAt: row.occurredAt });
-        await tx.creatorFinancialTransaction.update({ where: { id: previous.id }, data: canonicalData });
-        if (previousComparable === nextComparable) unchanged += 1; else updated += 1;
-      }
-      if (row.projectionStatus === "PROJECTED") {
-        const projectedFact = await projectKnownFact(tx, job, deviceId, row, fanRecordId, now);
-        if (row.factType === "SALE" && projectedFact?.id) {
-          // Canonical fan/message links may have changed while the payout row
-          // is byte-identical. The feed owner deduplicates canonical content.
-          projectedSaleIds.push(projectedFact.id);
-          // Exact Team PPV ownership is derived from CreatorSale.messageId.
-          // The payout row only enriches that canonical sale with financial
-          // status/identity; no chatter-recency heuristic is introduced here.
-          await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "PPV", sourceId: projectedFact.id, now });
-        }
-        if (row.factType === "TIP" && projectedFact?.id) {
-          projectedTipIds.push(projectedFact.id);
-          await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "TIP", sourceId: projectedFact.id, now });
-        }
-        projected += 1;
-      } else {
-        storedOnly += 1;
-      }
-    }
+    // Immutable receipts retain source observations, including a failed pass.
+    // Canonical financial identities and business projections advance together
+    // only from a verified publication page or an exact live observation.
+    if (!receipt) throw new receipts.FinancialReceiptError("FINANCIAL_RECEIPT_PROTOCOL_REQUIRED");
+    storedOnly += accepted.length;
     const financialContinuation = receipt ? await receipts.commitPage(tx, job, chunk, receipt, accepted, rejected.length, rejected) : null;
-    if (projectedSaleIds.length) await require("./creator-entity-change-service").publishCanonicalSales({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, saleIds: projectedSaleIds });
-    if (projectedTipIds.length) await require("./creator-entity-change-service").publishCanonicalFactInvalidations({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, model: "creatorTip", ids: projectedTipIds });
-    return { superseded: false, authorityNow: now, financialContinuation, identityHintConflicts: participants.ambiguousFields };
+    return { superseded: false, authorityNow: now, financialContinuation, identityHintConflicts: 0 };
   });
 
   if (transactionOutcome?.receiptReplay) return { type: "financial_transactions_page", replay: true, financialContinuation: transactionOutcome.financialContinuation };
@@ -426,12 +366,12 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   const aggregate = { _sum: { amountCents: proof.grossCents, netCents: proof.netCents, feeCents: proof.feeCents } };
   const count = proof.count, statusGroups = Object.values(proof.statusGroups), storedOnly = proof.storedOnly;
   const chartTotal = proof.charts.total ? { ...proof.charts.total, sourceJobId: job.id, scanRunId } : null;
-  const grossCents = Number(aggregate?._sum?.amountCents || 0);
+  const grossCents = (proof.grossKnown ?? proof.count) === proof.count ? Number(aggregate?._sum?.amountCents || 0) : null;
   const netCents = Number(aggregate?._sum?.netCents || 0);
   const feeCents = Number(aggregate?._sum?.feeCents || 0);
   const statusTotals = summarizeStatusGroups(statusGroups);
   const earningsTransactionsCount = Math.max(0, count - statusTotals.refundTransactionsCount);
-  const earningsGrossCents = grossCents - statusTotals.refundGrossCents;
+  const earningsGrossCents = receipts.earningsTotals(proof).grossCents;
   const earningsNetCents = netCents - statusTotals.refundNetCents;
   const earningsFeeCents = feeCents - statusTotals.refundFeeCents;
   const sourceBoundaryReached = receipt.row.proof.windows.every(window => window.exhausted === true);
@@ -444,11 +384,12 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
   // a refunded/reversed transaction and is excluded from chart earnings.
   const comparison = receipts.earningsTotals(receipts.comparableTotals(proof));
   const countMatched = chartReady ? comparison.transactionsCount === Number(chartTotal.transactionsCount || 0) : false;
-  const grossMatched = chartReady ? comparison.grossCents === Number(chartTotal.grossCents || 0) : false;
+  const grossComparable = chartReady && comparison.grossCents !== null && chartTotal.grossCents !== null;
+  const grossMatched = grossComparable ? comparison.grossCents === chartTotal.grossCents : null;
   const netMatched = chartReady ? comparison.netCents === Number(chartTotal.netCents || 0) : false;
   const frontierVerified = job.params.financialFrontierVersion === 2 && ["FRONTIER_PLUS_ONE", "FRONTIER_PLUS_TWO_AND_CHART"].includes(receipt.row.proof.kind);
   const legacyFrontier = frontierVerified && !receipts.currentTraversal(job);
-  const complete = receipt.complete && traversalComplete && scannerRejected === 0 && (legacyFrontier || (chartReady && countMatched && grossMatched && netMatched));
+  const complete = receipt.complete && traversalComplete && scannerRejected === 0 && (legacyFrontier || (chartReady && countMatched && grossMatched !== false && netMatched));
   const stateResult = await completeFinancialCollection({
     db, job, deviceId, complete, scanRunId,
     boundary: complete ? (frontierVerified ? receipt.row.proof.kind : "RECEIPT_VERIFIED_AVAILABLE_HISTORY") : null,
@@ -513,10 +454,10 @@ async function completeFinancialTransactionsScan({ db = prisma, job, deviceId, r
       observed: comparison,
       chartReady,
       countMatched,
-      grossMatched,
+      grossComparable, grossMatched,
       netMatched,
       chartCount: chartReady ? Number(chartTotal.transactionsCount || 0) : null,
-      chartGrossCents: chartReady ? Number(chartTotal.grossCents || 0) : null,
+      chartGrossCents: chartReady ? chartTotal.grossCents : null,
       chartNetCents: chartReady ? Number(chartTotal.netCents || 0) : null,
     },
     deviceId: deviceId || null,
@@ -540,22 +481,50 @@ async function ingestExactLiveTransaction({db,agencyId,creatorId,deviceId,money,
   const fan=participants.fans.get(`${creatorId}\u0000${row.fanOnlyFansUserId}`);
   const data=retainKnownFan(previous,{agencyId,creatorId,externalTransactionId:row.externalTransactionId,
     transactionType:row.transactionType,factType:row.factType,projectionStatus:row.projectionStatus,
-    amountCents:row.amountCents,netCents:row.netCents,feeCents:row.feeCents,currency:row.currency,
+    amountCents:row.amountCents,netCents:row.netCents,feeCents:row.feeCents,taxCents:row.taxCents,
+    vatCents:row.vatCents,mediaTaxCents:row.mediaTaxCents,currency:row.currency,
     occurredAt:row.occurredAt,transactionStatus:row.transactionStatus,sourceUpdatedAt:observedAt,
     collectedAt:now,sourceDeviceId:deviceId,reasonCode:row.reasonCode,
     fanRecordId:fan?.id || null,fanOnlyFansUserId:row.fanOnlyFansUserId || null,
     fanUsernameAtEvent:row.fanUsername,fanDisplayNameAtEvent:row.fanDisplayName,fanAvatarUrlAtEvent:row.fanAvatarUrl});
   if(previous)await db.creatorFinancialTransaction.update({where:{id:previous.id},data});
   else await db.creatorFinancialTransaction.create({data:{id:crypto.randomUUID(),...data}});
+  const changed=await require("./financial-canonical-publication-repository").supersede({db,job,rows:[row],observedAt,now});
   if(row.projectionStatus==="PROJECTED") {
-    const fact=await projectKnownFact(db,job,deviceId,row,data.fanRecordId,now);
+    const fact=await projectKnownFact(db,job,deviceId,{...row,sourceUpdatedAt:observedAt},data.fanRecordId,now);
     if(fact?.id && ["SALE","TIP"].includes(row.factType))await dispatchTeamMoneyReconciliationForCanonicalFact({db,agencyId,creatorId,sourceType:row.factType==="SALE"?"PPV":"TIP",sourceId:fact.id,now});
-    if(fact?.id && row.factType==="SALE")await require("./creator-entity-change-service").publishCanonicalSales({db,agencyId,creatorId,saleIds:[fact.id]});
-    if(fact?.id && row.factType==="TIP")await require("./creator-entity-change-service").publishCanonicalFactInvalidations({db,agencyId,creatorId,model:"creatorTip",ids:[fact.id]});
+    if(fact?.id && ["SALE","TIP"].includes(row.factType))changed[row.factType].push(fact.id);
   }
+  if(changed.SALE.length)await require("./creator-entity-change-service").publishCanonicalSales({db,agencyId,creatorId,saleIds:changed.SALE});
+  if(changed.TIP.length)await require("./creator-entity-change-service").publishCanonicalFactInvalidations({db,agencyId,creatorId,model:"creatorTip",ids:changed.TIP});
+}
+
+// Called by the existing, bounded publication owner after the immutable run's
+// verification succeeds. Each committed page is idempotent and newer live
+// source revisions retain authority when an older history page is published.
+async function publishVerifiedFinancialFactsPage({ db, job, facts, now }) {
+  if (!facts.length) return;
+  await lockCreatorFacts(db, job.agencyId, job.creatorId);
+  const observedAt = observationStartForJob(job);
+  const rows = facts.map((fact, index) => normalizeTransaction(fact.value, index, 1));
+  if (rows.some(row => row.rejected)) throw new Error("FINANCIAL_PUBLICATION_FACT_INVALID");
+  const existing = await db.creatorFinancialTransaction.findMany({ where: { creatorId: job.creatorId,
+    externalTransactionId: { in: rows.map(row => row.externalTransactionId) } } });
+  const byId = new Map(existing.map(row => [row.externalTransactionId, row]));
+  const writable = rows.filter(row => !byId.get(row.externalTransactionId)?.sourceUpdatedAt
+    || +byId.get(row.externalTransactionId).sourceUpdatedAt <= +observedAt);
+  const participants = await resolveFans(db, job, writable, now);
+  const deviceId = job.financialSourceDeviceId || job.claimedByDeviceId || null;
+  const ids = await require("./financial-canonical-publication-repository").publish({ db, job, rows: writable, existing: byId,
+    participants, deviceId, observedAt, now, scanRunId: collectionCommand(job, COLLECTOR_TYPES.FINANCIAL).generation,
+    catchup: financialMode(job) === "catchup" });
+  const saleIds = ids.SALE, tipIds = ids.TIP;
+  if (saleIds.length) await require("./creator-entity-change-service").publishCanonicalSales({ db, agencyId: job.agencyId, creatorId: job.creatorId, saleIds });
+  if (tipIds.length) await require("./creator-entity-change-service").publishCanonicalFactInvalidations({ db, agencyId: job.agencyId, creatorId: job.creatorId, model: "creatorTip", ids: tipIds });
 }
 
 module.exports = {
+  publishVerifiedFinancialFactsPage,
   ingestExactLiveTransaction,
   normalizeTransaction,
   JOB_KEY,

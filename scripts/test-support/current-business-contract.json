@@ -11924,7 +11924,7 @@
       "name": "amountCents",
       "data_type": "integer",
       "udt_name": "int4",
-      "is_nullable": "NO",
+      "is_nullable": "YES",
       "column_default": null
     },
     {
@@ -13988,7 +13988,7 @@
       "name": "amountCents",
       "data_type": "integer",
       "udt_name": "int4",
-      "is_nullable": "NO",
+      "is_nullable": "YES",
       "column_default": null
     },
     {
@@ -14972,7 +14972,7 @@
       "name": "amountCents",
       "data_type": "integer",
       "udt_name": "int4",
-      "is_nullable": "NO",
+      "is_nullable": "YES",
       "column_default": null
     },
     {

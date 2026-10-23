@@ -23,51 +23,82 @@ const { scope } = require("./analytics-traffic/fixture.cjs");
     await assert.rejects(tx(t => projectFanIdentity(t, { ...fanInput, avatarUrl: "https://images.test/avatar?token=new" })),
       error => error.code === "FAN_DATA_SAME_GENERATION_CONFLICT");
     pass("reproduced legacy event-date/avatar contradiction against persisted SQL authority");
+    const lease = require("../../src/services/job-lease-service"), publication = require("../../src/services/analytics-publication-service");
+    const deviceId = "event-participant-device";
+    await db.agency.update({ where: { id: s.agencyId }, data: { trialEndsAt: new Date(+now + 86400000) } });
+    await db.workerDevice.create({ data: { id: deviceId, agencyId: s.agencyId, userId: s.userId, lastSeenAt: new Date() } });
+    await db.deviceCreatorBinding.create({ data: { deviceId, agencyId: s.agencyId, creatorId: s.creatorId, sessionReadReady: true, lastSeenAt: new Date() } });
     const command = buildCollectionCommand({ collectorType: COLLECTOR_TYPES.FINANCIAL, now });
-    const initialMarker = String(Math.floor(+now / 1000));
-    const params = { ...command, financialReceiptVersion: 1, financialMode: "full", earningsLedgerVersion: 1,
-      collectorVersion: receipts.COLLECTOR, endDate: now.toISOString(), financialWindowGeneration: command.collectionGeneration,
-      financialWindows: [{ kind: "FULL", from: "2016-01-01T00:00:00.000Z", to: now.toISOString(), initialMarker }] };
-    const job = await db.jobInstance.create({ data: { id: "financial-avatar-regression", agencyId: s.agencyId,
-      creatorId: s.creatorId, jobKey: "financial_transactions_scan", scope: "creator", status: "RUNNING", params } });
+    const created = await db.jobInstance.create({ data: { id: "financial-avatar-regression", agencyId: s.agencyId,
+      creatorId: s.creatorId, jobKey: "financial_transactions_scan", scope: "creator", status: "SCHEDULED",
+      params: { ...command, financialMode: "full", earningsLedgerVersion: 1, endDate: now.toISOString() } } });
+    const claimed = await lease.claimJob({ userId: s.userId, deviceId, jobKeys: ["financial_transactions_scan"],
+      capabilities: { creatorEventDrivenSyncV2: true, financialWindowReceiptsV1: true, financialMoneyResolutionV1: true, financialTraversalV2: true } });
+    assert.equal(claimed.job?.id, created.id, JSON.stringify(claimed));
+    const job = await db.jobInstance.findUnique({ where: { id: created.id } });
+    assert.equal(job.params.financialTraversalVersion, 2); assert.equal(job.params.financialWindows[0].from, null);
+    const credentials = { jobId: job.id, userId: s.userId, deviceId, leaseToken: claimed.job.leaseToken, leaseRevision: claimed.job.leaseRevision };
+    let checkpoint = claimed.job.continuation ?? null;
+    const progress = async chunkResult => {
+      const result = await lease.progressJob({ ...credentials, expectedContinuation: checkpoint,
+        continuation: checkpoint, chunkResult });
+      assert(!result.sideEffect?.staleProgress); checkpoint = result.continuation; return result.sideEffect;
+    };
     const row = (id, gross, fan = "159980430", avatar = null) => ({ externalTransactionId: id, transactionType: "tip",
       fanOnlyFansUserId: fan, fanUsername: "known-fan", fanAvatarUrl: avatar,
       occurredAt: old.toISOString(), amountCents: gross, netCents: gross * 0.8, feeCents: gross * 0.2,
       currency: "USD", transactionStatus: "done" });
-    const page = { scanRunId: command.collectionGeneration, collectorVersion: receipts.COLLECTOR,
-      windowIndex: 0, pageNumber: 1, markerStart: initialMarker, markerEnd: "older-marker", sourceHasMore: true,
+    const page = { kind: "financial_transactions_page", scanRunId: command.collectionGeneration, collectorVersion: receipts.COLLECTOR,
+      windowIndex: 0, pageNumber: 1, markerStart: job.params.financialWindows[0].initialMarker, markerEnd: "older-marker", sourceHasMore: true,
       rawReceived: 3, scannerRejected: 0, duplicateRows: 0,
       transactions: [row("one", 1000, "159980430", "avatar-A"), row("two", 2000, "159980430", "avatar-B"), row("deleted-fan", 500, null)] };
-    const ingest = chunk => tx(t => financial.ingestFinancialTransactionsChunk({ db: t, job, deviceId: null, chunk }));
-    const first = await ingest(page);
-    assert.equal(first.accepted, 3); assert.equal(first.inserted, 3); assert.equal(first.rejected, 0);
-    assert.equal(first.identityHintConflicts, 1);
-    const stored = await db.creatorFinancialTransaction.findMany({ where: { creatorId: s.creatorId } });
-    assert.equal(stored.reduce((n, r) => n + r.netCents, 0), 2800);
-    assert.equal(stored.find(r => r.externalTransactionId === "deleted-fan").fanRecordId, null);
-    assert.equal(await db.creatorTip.count({ where: { creatorId: s.creatorId } }), 3);
+    const first = await progress(page);
+    assert.equal(first.accepted, 3); assert.equal(first.storedOnly, 3); assert.equal(first.inserted, 0); assert.equal(first.rejected, 0);
+    assert.equal(await db.financialObservedFact.count({ where: { runId: receipts.runId(job) } }), 3);
+    assert.equal(await db.creatorFinancialTransaction.count({ where: { creatorId: s.creatorId } }), 0);
+    assert.equal(await db.creatorTip.count({ where: { creatorId: s.creatorId } }), 0);
     let fan = await db.creatorFan.findUnique({ where: { creatorId_onlyFansUserId: { creatorId: s.creatorId, onlyFansUserId: "159980430" } } });
-    assert.equal(fan.avatarUrl, "https://images.test/avatar?token=old");
-    assert.equal(fan.username, "known-fan");
-    assert.equal(+fan.firstSeenAt, +old); assert.equal(+fan.lastActivityObservedAt, +old);
-    assert(+fan.identityObservedAt >= +now);
-    pass("whole financial page commits exact NET and tip projections despite ambiguous avatars and unavailable fan");
-    assert.equal((await ingest(page)).replay, true);
-    assert.equal(await db.creatorFinancialTransaction.count({ where: { creatorId: s.creatorId } }), 3);
-    await assert.rejects(ingest({ ...page, transactions: [{ ...page.transactions[0], amountCents: 999 }, ...page.transactions.slice(1)] }),
+    assert.equal(fan.avatarUrl, "https://images.test/avatar?token=old"); assert.equal(fan.username, null);
+    pass("source page persists immutable financial evidence without publishing money or profile hints before verification");
+    const replay = chunk => tx(t => financial.ingestFinancialTransactionsChunk({ db: t, job, deviceId, chunk }));
+    assert.equal((await replay(page)).replay, true);
+    await assert.rejects(replay({ ...page, transactions: [{ ...page.transactions[0], amountCents: 999 }, ...page.transactions.slice(1)] }),
       error => error.code === "FINANCIAL_RECEIPT_PAYLOAD_CONFLICT");
     pass("receipt replay is idempotent; changed committed monetary page remains rejected");
-    const second = await ingest({ ...page, pageNumber: 2, markerStart: "older-marker", markerEnd: null, sourceHasMore: false,
+    const second = await progress({ ...page, pageNumber: 2, markerStart: "older-marker", markerEnd: null, sourceHasMore: false,
       rawReceived: 1, transactions: [row("three", 100, "159980430", "avatar-current")] });
-    assert.equal(second.inserted, 1);
-    fan = await db.creatorFan.findUnique({ where: { id: fan.id } });
-    assert.equal(fan.avatarUrl, "avatar-current");
+    assert.equal(second.storedOnly, 1); assert.equal(second.inserted, 0);
     const run = await db.financialReceiptRun.findFirst({ where: { creatorId: s.creatorId } });
     assert.equal(run.proof.windows[0].netCents, 2880); assert.equal(run.cursor.page, 2);
-    pass("next page advances durable receipt cursor and mutable profile while event dates remain unchanged");
+    const range = receipts.comparisonRange(run);
+    for (const category of receipts.FULL_CHARTS) {
+      const money = ["total", "tips"].includes(category);
+      await progress({ kind: "financial_chart_total", collectorVersion: receipts.COLLECTOR, scanRunId: command.collectionGeneration,
+        windowIndex: 0, category, rangeFrom: range.from, rangeTo: range.to, grossCents: money ? 3600 : 0,
+        netCents: money ? 2880 : 0, transactionsCount: money ? 4 : 0 });
+    }
+    assert.equal((await receipts.completionProof(db, job)).complete, true);
+    assert.equal(checkpoint.driverPhase, "complete");
+    const queued = await lease.completeJob({ ...credentials, result: checkpoint.result }); assert(queued.publicationId);
+    let published;
+    for (let i = 0; i < 12; i++) {
+      await db.analyticsPublication.update({ where: { id: queued.publicationId }, data: { availableAt: new Date(0) } });
+      published = await publication.runAnalyticsPublicationUnit({ db, publicationId: queued.publicationId });
+      if (!published.publicationPending) break;
+    }
+    assert.equal(published.job.status, "DONE", JSON.stringify(published));
+    const stored = await db.creatorFinancialTransaction.findMany({ where: { creatorId: s.creatorId } });
+    assert.equal(stored.length, 4); assert.equal(stored.reduce((n, r) => n + r.netCents, 0), 2880);
+    assert.equal(stored.find(r => r.externalTransactionId === "deleted-fan").fanRecordId, null);
+    assert.equal(await db.creatorTip.count({ where: { creatorId: s.creatorId } }), 4);
+    fan = await db.creatorFan.findUnique({ where: { id: fan.id } });
+    assert.equal(fan.avatarUrl, "https://images.test/avatar?token=old", "three conflicting historical hints cannot replace the saved canonical avatar");
+    assert.equal(fan.username, "known-fan"); assert.equal(+fan.firstSeenAt, +old); assert.equal(+fan.lastActivityObservedAt, +old);
+    assert(+fan.identityObservedAt >= +now);
+    pass("real lease, six chart receipts and bounded publication commit all exact NET and tips while withholding ambiguous historical avatars");
     const hint = { ...s, onlyFansUserId: "159980430", source: "LIVE_NOTIFICATION", activityObservedAt: old,
       username: "notification-user", avatarUrl: "notification-avatar" };
-    const hintAt = new Date(+now + 1000);
+    const hintAt = new Date(Date.now() + 1000);
     await tx(t => projectEventFanIdentities(t, [hint], hintAt));
     const conflict = await tx(t => projectEventFanIdentities(t, [{ ...hint, avatarUrl: "different", platformDisplayName: "available name" }], hintAt));
     assert.equal(conflict.ambiguousFields, 1);

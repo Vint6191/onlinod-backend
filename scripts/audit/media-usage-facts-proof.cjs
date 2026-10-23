@@ -33,15 +33,18 @@ function source(sourceKey, revision, facts, { complete = true, pageNumber = 1, p
     assert.equal((await asset("m2")).sentCount, 1); assert.equal((await asset("m1")).soldCount, 1);
     const purchasedHead = (await changes()).headRevision;
     await submit([source("dialog", "2099-stale-full", [fact("001", "m1"), fact("002", "m2")])]);
-    assert.equal((await asset("m1")).soldCount, 1); assert.equal((await asset("m1")).revenueCents, 500);
+    assert.equal((await asset("m1")).soldCount, 1); assert.equal((await asset("m1")).revenueCents, 0); assert.equal((await asset("m1")).revenueUnknownCount, 1);
     assert.equal((await changes()).headRevision, purchasedHead);
     await submit([source("dialog", "older-clock-new-fact", [fact("003", "m1", true)], { complete: false })]);
     assert.equal((await asset("m1")).sentCount, 2); assert.equal((await asset("m1")).soldCount, 2);
-    assert.equal((await asset("m1")).uniqueBuyers, 1); assert.equal((await asset("m1")).revenueCents, 1000);
+    assert.equal((await asset("m1")).uniqueBuyers, 1); assert.equal((await asset("m1")).revenueCents, 0); assert.equal((await asset("m1")).revenueUnknownCount, 2);
     pass("partial newer PC retains missing facts; stale full PC cannot undo purchase; exact per-fact delta avoids max-count approximation");
 
+    await submit([source("dialog", "repriced-observation", [{ ...fact("001", "m1", true), revenueCents: 700 }, fact("004", "price-new-media")])]);
+    assert.equal((await asset("m1")).revenueCents, 0); assert.equal((await asset("m1")).revenueUnknownCount, 2);
+    assert.equal((await asset("price-new-media")).sentCount, 1);
     const beforeConflict = (await changes()).headRevision;
-    const conflict = source("dialog", "conflict", [{ ...fact("001", "m1", true), revenueCents: 700 }, fact("004", "m3")]);
+    const conflict = source("dialog", "conflict", [{ ...fact("002", "m2"), notOpenedCount: 0, freeCount: 1 }, fact("004", "m3")]);
     await assert.rejects(() => submit([conflict]), { code: "MEDIA_USAGE_FACT_CONFLICT" });
     assert.equal(await asset("m3"), null); assert.equal((await changes()).headRevision, beforeConflict);
     await assert.rejects(() => commit(async tx => {
@@ -49,7 +52,7 @@ function source(sourceKey, revision, facts, { complete = true, pageNumber = 1, p
       throw Error("OWNER_ROLLBACK");
     }), /OWNER_ROLLBACK/);
     assert.equal(await asset("m4"), null); assert.equal((await changes()).headRevision, beforeConflict);
-    pass("conflicting accounting evidence and owner failure roll back fact, aggregate, receipt and reverse publication together");
+    pass("changed local price does not invent NET or block other facts; structural conflicts and owner failure roll back atomically");
 
     const legacy = await db.creatorMediaAsset.create({ data: { ...own, mediaId: "legacy-media", sentCount: 2, soldCount: 1, revenueCents: 500 } });
     await db.creatorMediaUsageSourceState.create({ data: { ...own, sourceKey: "legacy-dialog", sourceRevision: capturedAt } });

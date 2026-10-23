@@ -2,6 +2,7 @@
 const { attachSchedulerFailureCause, inheritSchedulerFailureCauses } = require("./scheduler-failure-cause");
 
 const { exactFanId, boundedFanIds } = require("./fan-data-input");
+const { valueFieldAuthority } = require("./fan-value-field-authority");
 const { runDbTransaction } = require("./db-transaction-service");
 
 
@@ -361,6 +362,31 @@ async function projectFanIdentityBatch(tx, observations) {
   }
   if (!normalized.length) return new Map();
 
+  // Event pages carry hundreds of distinct participants. Reuse the canonical
+  // bulk projector so fan/field count cannot create thousands of network round
+  // trips inside the financial or notification owner's transaction.
+  if (typeof tx.$executeRawUnsafe === "function") {
+    const byCreator = new Map();
+    for (const row of normalized) {
+      const group = byCreator.get(row.creatorId) || { agencyId: row.agencyId, rows: [] };
+      if (group.agencyId !== row.agencyId) throw new Error("Mixed fan identity authority scope");
+      group.rows.push(row); byCreator.set(row.creatorId, group);
+    }
+    const fans = new Map();
+    for (const creatorId of [...byCreator.keys()].sort()) {
+      const group = byCreator.get(creatorId);
+      for (let offset = 0; offset < group.rows.length; offset += FAN_DATA_OBSERVATION_BATCH_MAX) {
+        const page = group.rows.slice(offset, offset + FAN_DATA_OBSERVATION_BATCH_MAX);
+        await applyGenericFanObservationBulkSql(tx, page.map(row => ({ onlyFansUserId: row.onlyFansUserId, identity: row })),
+          { agencyId: group.agencyId, creatorId });
+      }
+      const ids = [...new Set(group.rows.map(row => row.onlyFansUserId))];
+      const current = await tx.creatorFan.findMany({ where: { agencyId: group.agencyId, creatorId, onlyFansUserId: { in: ids } } });
+      for (const fan of current) fans.set(`${fan.creatorId}\u0000${fan.onlyFansUserId}`, fan);
+    }
+    return fans;
+  }
+
   // Create identity-neutral fan records in one batch; identity clocks are advanced
   // only by projectFanIdentity after real fields survive normalization.
   const firstByFan = new Map();
@@ -457,6 +483,18 @@ async function projectEventFanIdentities(tx, observations, receivedAt) {
     }
     return input;
   });
+  // Activity endpoints are observations of the same fan, not more identity
+  // hints. Include both in the bounded bulk set so no per-fan follow-up writes
+  // remain when a page spans multiple historical events for each participant.
+  if (typeof tx.$executeRawUnsafe === "function") {
+    for (const group of grouped.values()) {
+      if (group.lastActivity && +group.lastActivity !== +group.firstActivity) normalized.push({
+        agencyId: group.agencyId, creatorId: group.creatorId, onlyFansUserId: group.onlyFansUserId,
+        source: group.source, observedAt, activityObservedAt: group.lastActivity,
+      });
+    }
+    return { fans: await projectFanIdentityBatch(tx, normalized), ambiguousFields };
+  }
   const fans = await projectFanIdentityBatch(tx, normalized);
   for (const [key, group] of grouped) {
     const fan = fans.get(key);
@@ -528,6 +566,7 @@ async function projectFanRelationship(tx, observation) {
 function nullableBigInt(value) {
   if (value === null || value === undefined || value === "") return null;
   if (typeof value === "bigint") return value >= 0n ? value : null;
+  if (!["number", "string"].includes(typeof value) || (typeof value === "string" && !value.trim())) return null;
   const number = Number(value);
   return Number.isSafeInteger(number) && number >= 0 ? BigInt(number) : null;
 }
@@ -555,9 +594,9 @@ function normalizedFanValueFacts(observation) {
   const lastActivityPresent = Object.prototype.hasOwnProperty.call(observation, "lastActivityAt");
   const lastActivityAt = observation.lastActivityAt === null ? null : date(observation.lastActivityAt);
   const observedFields = { availability };
-  if (availability === VALUE_AVAILABILITY.AVAILABLE) {
-    for (const [field, value] of Object.entries(numeric)) if (value !== null) observedFields[field] = value;
-  }
+  // Availability describes the total; each supported component remains an
+  // independent observation even when the total is unavailable or malformed.
+  for (const [field, value] of Object.entries(numeric)) if (value !== null) observedFields[field] = value;
   if (lastActivityPresent && (observation.lastActivityAt === null || lastActivityAt)) observedFields.lastActivityAt = lastActivityAt;
   return { availability, numeric, lastActivityPresent, lastActivityAt, observedFields };
 }
@@ -596,7 +635,7 @@ async function projectFanValue(tx, observation) {
     sourceDeliveryId: text(observation.sourceDeliveryId, 180),
     scanRunId: text(observation.scanRunId, 180),
   };
-  if (availability === VALUE_AVAILABILITY.AVAILABLE) {
+  {
     for (const [field, versionField] of VALUE_FIELDS) {
       const value = numeric[field];
       if (value === null) continue;
@@ -612,7 +651,7 @@ async function projectFanValue(tx, observation) {
   let existing = await tx.creatorFanValueCurrent.findUnique({ where });
   if (existing) {
     assertStoredVersionCompatible("value", externalId, "availability", existing.availabilityAuthorityVersion, availabilityVersion);
-    if (availability === VALUE_AVAILABILITY.AVAILABLE) {
+    {
       for (const [field, versionField] of VALUE_FIELDS) {
         const value = numeric[field];
         if (value === null) continue;
@@ -641,7 +680,7 @@ async function projectFanValue(tx, observation) {
     data: { availability, availabilityAuthorityVersion: availabilityVersion },
   });
 
-  if (availability === VALUE_AVAILABILITY.AVAILABLE) {
+  {
     for (const [field, versionField] of VALUE_FIELDS) {
       const value = numeric[field];
       if (value === null) continue;
@@ -837,7 +876,7 @@ async function assertNoPersistedBulkAuthorityConflicts(tx, { creatorId, fanRows,
     }
   }
 
-  const currentRelationships = typeof tx?.creatorFanRelationshipCurrent?.findMany === "function"
+  const currentRelationships = relationshipRows.length && typeof tx?.creatorFanRelationshipCurrent?.findMany === "function"
     ? await tx.creatorFanRelationshipCurrent.findMany({ where: { creatorId, onlyFansUserId: { in: fanIds } } })
     : [];
   const relationshipByExternalId = new Map((currentRelationships || []).map((row) => [String(row.onlyFansUserId), row]));
@@ -850,7 +889,7 @@ async function assertNoPersistedBulkAuthorityConflicts(tx, { creatorId, fanRows,
   }
 
   const fanRecordIds = [...new Set((currentFans || []).map((row) => row.id).filter(Boolean))];
-  const currentValues = fanRecordIds.length && typeof tx?.creatorFanValueCurrent?.findMany === "function"
+  const currentValues = valueRows.length && fanRecordIds.length && typeof tx?.creatorFanValueCurrent?.findMany === "function"
     ? await tx.creatorFanValueCurrent.findMany({ where: { creatorId, fanRecordId: { in: fanRecordIds } } })
     : [];
   const fanExternalIdByRecordId = new Map((currentFans || []).map((row) => [String(row.id), String(row.onlyFansUserId)]));
@@ -1055,7 +1094,7 @@ function buildGenericFanObservationBulkRows(rows, { agencyId, creatorId, sourceD
         aggregate.availability = maxVersionEntry(aggregate.availability, {
           version: availabilityVersion, value: normalized.availability,
         }, { kind: "value", fanId, field: "availability" });
-        if (normalized.availability === VALUE_AVAILABILITY.AVAILABLE) {
+        {
           for (const [field, versionField] of VALUE_FIELDS) {
             const fieldValue = normalized.numeric[field];
             if (fieldValue === null) continue;
@@ -1698,6 +1737,7 @@ async function readFanCurrent(db, { agencyId, creatorId, onlyFansUserIds }) {
       observedAt: fan.identityObservedAt || null,
       source: fan.identitySource || null,
       completeness: fan.identityCompleteness || null,
+      fieldAuthority: Object.fromEntries(IDENTITY_FIELDS.map(([field, , versionField]) => [field, parseAuthorityVersion(fan[versionField])])),
     },
     relationship: fan.relationshipCurrent ? {
       fanSubscribesToCreator: fan.relationshipCurrent.fanSubscribesToCreator,
@@ -1727,6 +1767,7 @@ async function readFanCurrent(db, { agencyId, creatorId, onlyFansUserIds }) {
       availability: fan.valueCurrent.availability,
       observedAt: fan.valueCurrent.valueObservedAt,
       source: fan.valueCurrent.source,
+      fieldAuthority: valueFieldAuthority(fan.valueCurrent),
     } : null,
   }));
 }

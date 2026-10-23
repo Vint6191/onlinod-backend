@@ -24,7 +24,7 @@ function mergeNotificationMoney(model, existing, incoming) {
   // sourceJobId/collectedAt remain the current ingest association used by the
   // existing consequence dispatcher. Payout provenance is held by the separate
   // CreatorFinancialTransaction ledger; do not steal the notification receipt.
-  for (const field of ["amountCents", "currency", "source", "sourceUpdatedAt",
+  for (const field of ["amountCents", "netCents", "feeCents", "taxCents", "vatCents", "mediaTaxCents", "transactionStatus", "currency", "source", "sourceUpdatedAt",
     ...(model === "creatorSale" ? ["saleType", "purchasedAt"] : ["tippedAt"])]) merged[field] = existing[field];
   if (existing.fanRecordId) {
     for (const field of ["fanRecordId", "fanOnlyFansUserIdAtEvent", "fanUsernameAtEvent", "fanDisplayNameAtEvent", "fanAvatarUrlAtEvent"]) {

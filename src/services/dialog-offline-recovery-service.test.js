@@ -143,7 +143,7 @@ test("a creator-wide gap over one hour schedules one head-aware incremental reco
   assert.equal(calls[0].forceChildFull, false);
   assert.equal(calls[0].source, "offline_gap_recovery");
   assert.equal(calls[0].knownMessageThreshold, 1);
-  assert.equal(calls[0].maxPages, 10_000);
+  assert.equal(calls[0].maxPages, undefined, "history has a per-quantum budget, not a lifetime truncation cap");
 });
 
 test("paused or already active history is not duplicated by heartbeat recovery", async () => {

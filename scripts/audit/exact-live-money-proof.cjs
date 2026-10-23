@@ -19,9 +19,9 @@ function pass(name){results.push(name);console.log("PASS",name);}
   const input={db,...s,member,money:true,manage:true,range:{startDay:today,endDay:today},previous:{startDay:yesterday,endDay:yesterday},now};
   async function seedRun(id,through,kind="FULL",values=[{id:"old",at:yesterday,net:100}],sc=s,lower=from) {
     const run={id,agencyId:sc.agencyId,creatorId:sc.creatorId,jobId:"fixture-"+id,generation:id,windows:[{kind,from:lower.toISOString(),to:through.toISOString()}],cursor:{phase:"done"},proof:{complete:true,...(kind==="FRONTIER"?{kind:"FRONTIER_PLUS_ONE"}:{}),windows:[{count:values.length}]}};
-    const job={...sc,params:{collectionRequestedAt:through.toISOString()}};
+    const job={...sc,params:{...require(root+"/src/services/analytics-collector-control-service").buildCollectionCommand({collectorType:"FINANCIAL",collectionMode:kind==="FULL"?"full":"catchup",now:through}),collectionGeneration:id}};
     await tx(async t=>{await receipts.enter(t);await t.financialReceiptRun.create({data:run});
-      for(const v of values)await t.$executeRawUnsafe(`INSERT INTO "FinancialObservedFact"("runId","windowIndex","externalId","occurredAt",value) VALUES($1,0,$2,$3,$4::jsonb)`,id,v.id,v.at,JSON.stringify({netCents:v.net,currency:"USD",transactionStatus:v.status||"done",factType:"TIP"}));});
+      for(const v of values)await t.$executeRawUnsafe(`INSERT INTO "FinancialObservedFact"("runId","windowIndex","externalId","occurredAt",value) VALUES($1,0,$2,$3,$4::jsonb)`,id,v.id,v.at,JSON.stringify({externalTransactionId:v.id,transactionType:"tip",occurredAt:v.at,amountCents:1000,netCents:v.net,currency:"USD",transactionStatus:v.status||"done",factType:"TIP"}));});
     return{run,job};
   }
   async function prepare(r){let page,units=0,copy=0;do{page=await tx(t=>gen.preparePage(t,r.job,r.run));units++;copy+=page.phase==="COPY"?page.visited:0;assert(units<1000);}while(!page.ready);return{units,copy};}

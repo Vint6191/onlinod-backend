@@ -1,6 +1,8 @@
 "use strict";
 const { hashCanonicalJson } = require("./realtime-receipt-hash");
-const enabled = (job) => job.params?.notificationMode === "catchup" && [2, 3].includes(job.params?.notificationFrontierVersion);
+const FULL_PHASES = Object.freeze(["subscriptions", "purchases", "tips", "comments", "likes", "all_reconciliation"]);
+const fullEnabled = (job) => job.params?.notificationMode === "full" && job.params?.notificationFrontierVersion === 4;
+const enabled = (job) => fullEnabled(job) || job.params?.notificationMode === "catchup" && [2, 3].includes(job.params?.notificationFrontierVersion);
 class NotificationFrontierError extends Error {
   constructor(code) {
     super(code);
@@ -33,6 +35,7 @@ function assessPage(job, rows, previousByIdentity, outcomes = new Map()) {
 async function commitPage(db, job, chunk, previous, assessment = null) {
   if (!enabled(job)) return previous || {};
   const generation = job.params.collectionGeneration;
+  const full = fullEnabled(job);
   const p =
     previous?.generation === generation
       ? previous
@@ -52,9 +55,14 @@ async function commitPage(db, job, chunk, previous, assessment = null) {
     p.phase === "DONE" ||
     chunk.page !== p.page + 1 ||
     (chunk.cursorStart || null) !== p.cursor ||
-    chunk.sourcePhase !== "all"
+    (!full && chunk.sourcePhase !== "all")
   )
     fail("NOTIFICATION_FRONTIER_CURSOR_MISMATCH");
+  if (full) {
+    const phase = p.page === 0 ? FULL_PHASES[0]
+      : p.phaseExhausted ? FULL_PHASES[FULL_PHASES.indexOf(p.sourcePhase) + 1] : p.sourcePhase;
+    if (!phase || chunk.sourcePhase !== phase) fail("NOTIFICATION_FRONTIER_PHASE_MISMATCH");
+  }
   if (typeof chunk.sourceHasMore !== "boolean" || !Array.isArray(chunk.observations))
     fail("NOTIFICATION_FRONTIER_PAGE_INVALID");
   const ids = chunk.observations.map((row) => row.notificationId).filter(Boolean);
@@ -70,24 +78,27 @@ async function commitPage(db, job, chunk, previous, assessment = null) {
       'SELECT page FROM "CreatorNotificationFrontierPage" WHERE "creatorId"=$1 AND generation=$2 AND "cursorStart"=$3',
       job.creatorId,
       generation,
-      cursor
+      full ? `${chunk.sourcePhase}:${cursor}` : cursor
     );
     if (cycle) fail("NOTIFICATION_FRONTIER_CURSOR_CYCLE");
   }
   const unchangedPages = boundary ? Number(p.unchangedPages || 0) + 1 : 0;
-  const done = !chunk.sourceHasMore || unchangedPages >= 3;
+  const done = full ? chunk.sourcePhase === "all_reconciliation" && !chunk.sourceHasMore
+    : !chunk.sourceHasMore || unchangedPages >= 3;
   const next = {
     generation,
-    frontierVersion: 3,
+    frontierVersion: full ? 4 : 3,
     page: chunk.page,
-    cursor: done ? null : cursor,
+    cursor: done || !chunk.sourceHasMore ? null : cursor,
     phase: done ? "DONE" : boundary ? "OVERLAP" : "SEEK",
     unchangedPages,
     boundaryPage: boundary ? (p.unchangedPages ? p.boundaryPage : chunk.page) : null,
     overlapPage: done && unchangedPages >= 3 ? chunk.page : null,
-    exhausted: !chunk.sourceHasMore,
+    exhausted: full ? done : !chunk.sourceHasMore,
+    ...(full ? { sourcePhase: chunk.sourcePhase, phaseExhausted: !chunk.sourceHasMore } : {}),
   };
-  if (chunk.sourceExhausted && !done || !chunk.sourceHasMore && chunk.stopReason !== "source_exhausted")
+  if (chunk.sourceExhausted && !done || (!full || done) && !chunk.sourceHasMore && chunk.stopReason !== "source_exhausted"
+    || full && (chunk.phaseSourceExhausted !== !chunk.sourceHasMore || chunk.allSourceExhausted === true && !done))
     fail("NOTIFICATION_FRONTIER_COMPLETION_INVALID");
   await db.$executeRawUnsafe(
     'INSERT INTO "CreatorNotificationFrontierPage"("creatorId","agencyId",generation,page,"cursorStart","cursorEnd",digest) VALUES($1,$2,$3,$4,$5,$6,$7)',
@@ -95,7 +106,7 @@ async function commitPage(db, job, chunk, previous, assessment = null) {
     job.agencyId,
     generation,
     chunk.page,
-    p.cursor || "",
+    full ? `${chunk.sourcePhase}:${p.cursor || ""}` : p.cursor || "",
     cursor,
     digest
   );
@@ -123,10 +134,16 @@ function attachContinuation(job, requestedContinuation, sideEffect) {
   const domain = envelope.driverPhase === "execute" ? envelope.jobContinuation : envelope;
   if (!domain || domain.scanRunId !== receipt.generation || domain.page !== receipt.page)
     fail("NOTIFICATION_FRONTIER_CONTINUATION_INVALID");
+  if (fullEnabled(job)) {
+    const next = { ...domain, fromId: receipt.cursor || undefined,
+      sourceExhausted: receipt.phase === "DONE", allSourceExhausted: receipt.phase === "DONE",
+      stopReason: receipt.phase === "DONE" ? "source_exhausted" : undefined };
+    return envelope.driverPhase === "execute" ? { ...envelope, jobContinuation: next } : next;
+  }
   const next = { ...domain, fromId: receipt.cursor || undefined, sourceExhausted: receipt.phase === "DONE",
     unchangedPages: receipt.unchangedPages, boundaryPage: receipt.boundaryPage || undefined,
     overlapPending: receipt.phase === "OVERLAP",
     stopReason: receipt.phase === "DONE" ? (receipt.exhausted ? "source_exhausted" : "known_boundary_reached") : undefined };
   return envelope.driverPhase === "execute" ? { ...envelope, jobContinuation: next } : next;
 }
-module.exports = { NotificationFrontierError, enabled, assessPage, commitPage, completed, attachContinuation };
+module.exports = { NotificationFrontierError, FULL_PHASES, enabled, fullEnabled, assessPage, commitPage, completed, attachContinuation };

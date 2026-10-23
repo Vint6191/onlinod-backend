@@ -728,7 +728,8 @@ async function runDialogIntelligenceRetentionSweep(options = {}) {
     batchSize: cfg.batchSize,
     label: `dialogScanChunkCommit.old_${cfg.dialogScanChunkDays}d`,
     orderBy: { committedAt: "asc" },
-    where: { committedAt: { lt: daysAgo(cfg.dialogScanChunkDays, authorityNow) } },
+    where: { committedAt: { lt: daysAgo(cfg.dialogScanChunkDays, authorityNow) },
+      run: { status: { in: ["COMPLETED", "FAILED", "CANCELLED", "CANCELED"] } } },
   }));
   out.push(await deleteByIdsInBatches({
     modelName: "dialogScanRun",

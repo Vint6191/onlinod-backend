@@ -126,10 +126,10 @@ test("completion preserves run identity, publishes durable consequences and prov
   assert.match(observation, /result\?\.sourceExhausted === true/);
   assert.match(leaseService, /job\.jobKey === "catchup_notifications_scan"/);
   assert.match(leaseService, /job\.params\?\.manualNotificationScan === true/);
-  assert.match(leaseService, /notification scan completed with rejected facts/);
+  assert.match(leaseService, /Notification history partial/);
   assert.match(leaseService, /leaseRevision: \{ increment: 1 \}/);
-  assert.match(leaseService, /notification scan scheduled for repair/);
-  assert.match(leaseService, /params: notificationRepairParams\(job, now, result\)/);
+  assert.match(leaseService, /explicit retry required/);
+  assert.match(leaseService, /const terminal = !successful/);
   assert.doesNotMatch(leaseService, /const resumeCursors =/);
   assert.doesNotMatch(leaseService, /notificationRepairPass\s*:/);
   assert.match(leaseService, /status: "SCHEDULED"/);

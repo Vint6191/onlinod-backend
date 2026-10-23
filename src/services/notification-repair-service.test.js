@@ -6,7 +6,7 @@ const { NOTIFICATION_TYPES, hasFullNotificationScope } = require("./notification
 
 function partial() {
   return { jobKey: "catchup_notifications_scan", params: {
-    notificationNormalizerVersion: "notification-source-v2", collectionGeneration: "old-run", collectionRequestedAt: "2026-10-13T23:00:00.000Z",
+    notificationNormalizerVersion: "notification-source-v2", notificationFrontierVersion: 4, collectionGeneration: "old-run", collectionRequestedAt: "2026-10-13T23:00:00.000Z",
     collectionAuthorityRequestedAt: "2026-10-13T23:00:00.000Z", notificationMode: "full", types: ["tips"],
     from: "2016-01-01T00:00:00.000Z", resumeCursors: { tips: "old-cursor" }, notificationRepairPass: 2,
   }, result: { scanRunId: "old-run", coverage: { purchases: { status: "complete" }, tips: { status: "partial" } },
@@ -102,4 +102,13 @@ test("a parser upgrade fences old cursors and requires a new full source proof",
  const params=notificationRepairParams(job,new Date("2026-10-14T00:00:00Z"));
  assert.equal(params.notificationMode,"full");assert.equal(params.notificationNormalizerVersion,"notification-source-v2");assert.equal(params.stopAtNotificationId,undefined);
  assert.equal(Boolean(needsNotificationRepairRotation({...job,params,result:null})),false);
+});
+
+test("FULL without durable phase frontier rotates once before accepting more source pages", () => {
+  const job = partial(); job.result = null; job.params.types = NOTIFICATION_TYPES;
+  delete job.params.notificationFrontierVersion;
+  assert.equal(needsNotificationRepairRotation(job), true);
+  const params = notificationRepairParams(job, new Date("2026-10-14T00:00:00Z"));
+  assert.equal(params.notificationFrontierVersion, 4);
+  assert.equal(Boolean(needsNotificationRepairRotation({ ...job, params })), false);
 });

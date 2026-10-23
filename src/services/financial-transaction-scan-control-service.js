@@ -155,14 +155,14 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
     rows = receipt.items.map(transactionForClient); total = proof.count; bounds = receipt.bounds;
     const statusTotals = summarizeStatusGroups(Object.values(proof.statusGroups));
     statusSummary = statusTotals.statusSummary;
-    summary = { transactionsCount: total, grossCents: proof.grossCents, netCents: proof.netCents, feeCents: proof.feeCents,
+    summary = { transactionsCount: total, grossCents: (proof.grossKnown ?? total) === total ? proof.grossCents : null, netCents: proof.netCents, feeCents: proof.feeCents,
       projected: total - proof.storedOnly, storedOnly: proof.storedOnly,
       earningsTransactionsCount: Math.max(0, total - statusTotals.refundTransactionsCount),
-      earningsGrossCents: proof.grossCents - statusTotals.refundGrossCents,
+      earningsGrossCents: require("./financial-receipt-authority").earningsTotals(proof).grossCents,
       earningsNetCents: proof.netCents - statusTotals.refundNetCents,
       ...Object.fromEntries(Object.entries(statusTotals).filter(([key]) => key !== "statusSummary")),
     };
-    typeSummary = Object.values(proof.typeGroups || {}).sort((a,b) => b.count-a.count || a.transactionType.localeCompare(b.transactionType));
+    typeSummary = Object.values(proof.typeGroups || {}).map(row => ({ ...row, grossCents: (row.grossKnown ?? row.count) === row.count ? row.grossCents : null })).sort((a,b) => b.count-a.count || a.transactionType.localeCompare(b.transactionType));
     const categories = { total: "TOTAL", subscribes: "SUBSCRIPTIONS", tips: "TIPS", messages: "MESSAGES", post: "POSTS", stream: "STREAMS" };
     charts = Object.entries(proof.charts).map(([key, value]) => ({ ...value, category: categories[key],
       rangeFrom: require("./financial-receipt-authority").comparisonRange(run).from, rangeTo: run.windows[0].to, collectedAt: null }));
@@ -178,16 +178,16 @@ async function readManualFinancialTransactionScan({ db = prisma, creator, limit 
   const computedReconciliation = {
     chartReady: Boolean(totalChart),
     countMatched: Boolean(totalChart) && comparison?.transactionsCount === Number(totalChart.transactionsCount || 0),
-    grossMatched: Boolean(totalChart) && comparison?.grossCents === Number(totalChart.grossCents || 0),
+    grossMatched: !totalChart || comparison?.grossCents == null || totalChart.grossCents == null ? null : comparison.grossCents === totalChart.grossCents,
     netMatched: Boolean(totalChart) && comparison?.netCents === Number(totalChart.netCents || 0),
     chartCount: totalChart ? Number(totalChart.transactionsCount || 0) : null,
-    chartGrossCents: totalChart ? Number(totalChart.grossCents || 0) : null,
+    chartGrossCents: totalChart ? totalChart.grossCents : null,
     chartNetCents: totalChart ? Number(totalChart.netCents || 0) : null,
   };
   let status = jobStatus(job);
   if (job?.status === "DONE") {
     const verified = run?.proof.complete === true && run?.cursor.phase === "done" && scannerRejected === 0 && computedReconciliation.chartReady
-      && computedReconciliation.countMatched && computedReconciliation.grossMatched && computedReconciliation.netMatched;
+      && computedReconciliation.countMatched && computedReconciliation.grossMatched !== false && computedReconciliation.netMatched;
     status = verified ? "COMPLETE" : "PARTIAL";
   }
   return {

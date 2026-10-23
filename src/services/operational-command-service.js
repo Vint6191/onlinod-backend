@@ -181,6 +181,7 @@ async function apply(db, agencyId, creatorId, userId, member, p) {
         creatorId,
         userId,
         ...input,
+        allowTerminalRetry: true,
       });
       if (value.job) require("./job-planning-repository").publishPlannedJobAvailable(value.job);
     } else value = await require("./dialog-scan-control-service").cancelDialogRun({ ...common, ...input });
@@ -221,6 +222,7 @@ async function apply(db, agencyId, creatorId, userId, member, p) {
         creatorId,
         userId,
         ...input,
+        allowTerminalRetry: true,
         childMode,
         forceChildFull: input.mode === "full",
         source: input.source || "manual_creator_scan",

@@ -4,6 +4,12 @@ const { commitDatabaseFixture } = require("../../scripts/test-support/commit-dat
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+// This unit fixture models row-lock ownership, not PostgreSQL feed persistence.
+// Real owner+feed atomicity is exercised by media-financial-corrections-proof.
+const stagedTeamChanges = [];
+test.mock.method(require("./creator-entity-change-service"), "publishEntityChanges", async input => {
+  stagedTeamChanges.push(...input.changes); return {staged:true};
+});
 const { phase2AnalyticsFixture, attachManagementAuthority, phase2ManagerActor } = require("./phase2-test-authority-fixtures");
 const fs = require("node:fs");
 const path = require("node:path");

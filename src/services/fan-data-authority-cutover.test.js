@@ -438,3 +438,25 @@ test("follow projections expose explicit relationship vocabulary while legacy DB
   assert.match(followAutomation, /creatorFollowsFan/);
   assert.match(followAutomation, /fanSubscribesToCreator/);
 });
+
+test('partial spend survives unavailable or malformed totals with independent field clocks', async () => {
+  const tx = authorityTx({ fan: baseFan() });
+  await projectValue(tx, '2026-10-20T00:00:00Z', null, 'UNAVAILABLE', { messagesSpentCents: 1200, tipsSpentCents: 300 });
+  assert.equal(tx.value.platformReportedTotalSpendCents, undefined);
+  assert.equal(tx.value.messagesSpentCents, 1200n);
+  assert.equal(tx.value.tipsSpentCents, 300n);
+  const clock = tx.value.messagesSpentCentsAuthorityVersion;
+  await projectValue(tx, '2026-10-22T00:00:00Z', 2000, 'AVAILABLE', { messagesSpentCents: [], tipsSpentCents: '   ' });
+  assert.equal(tx.value.messagesSpentCents, 1200n);
+  assert.equal(tx.value.messagesSpentCentsAuthorityVersion, clock);
+  assert.equal(tx.value.tipsSpentCents, 300n);
+  const dto = require('./campaign-read-repository').fanValueDto(tx.value, new Date('2026-10-22T00:10:00Z'), 3600000);
+  assert.equal(dto.platformReportedTotalSpendCents, 2000);
+  assert.equal(dto.messagesSpentCents, null);
+  assert.equal(dto.fieldFreshness.messagesSpentCents.fresh, false);
+  assert.equal(dto.fieldAuthority.messagesSpentCents.observedAt, '2026-10-20T00:00:00.000Z');
+  await projectValue(tx, '2026-10-22T00:20:00Z', null, 'MALFORMED', { tipsSpentCents: 500 });
+  assert.equal(tx.value.platformReportedTotalSpendCents, 2000n);
+  assert.equal(tx.value.tipsSpentCents, 500n);
+  assert.equal(tx.value.availability, 'MALFORMED');
+});

@@ -20,6 +20,7 @@ const { dbAuthorityNow } = require("./db-time-authority-service");
 const { runRootCommit } = require("./db-commit-kernel");
 const { publishNotificationConsequences } = require("./notification-consequence-service");
 const liveSync = require("./creator-live-sync-service");
+const { loadInitialCollectionAdmission, initialCollectionAdmission, initialCollectionClaimWhere } = require("./initial-collection-readiness-service");
 const { lockDbAdvisoryXact } = require("./db-transaction-service");
 const {
   FAN_DATA_REFRESH_MAX_ACTIVE_CLAIMS,
@@ -57,6 +58,7 @@ const FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY = Object.freeze({
   fetch_campaigns: Object.freeze(["campaign_claimers_page", "campaign_fan_values"]),
 });
 const FAN_OBSERVATION_READ_LEASE_JOB_KEYS = new Set(Object.keys(FAN_OBSERVATION_READ_PURPOSE_BY_JOB_KEY));
+const INITIAL_ORDERED_JOB_KEYS = new Set(["fetch_campaigns", "catchup_notifications_scan", "subscriber_directory_scan"]);
 
 class JobLeaseError extends Error {
   constructor(code, message, status = 409) {
@@ -321,6 +323,7 @@ function dialogDiscoveryClaimConstraint(enabled, targetedReconciliation = false)
 
 function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly, targetedReconciliation, excludedJobIds = [], fanRefreshBlockedCreatorIds = [], fanRefreshGlobalBlocked = false, billingConstraint = null, moneyResolutionSupported = true }) {
   const constraints = [];
+  if (allowedJobKeys.some(key => INITIAL_ORDERED_JOB_KEYS.has(key))) constraints.push(initialCollectionClaimWhere(now));
   if (billingConstraint) constraints.push(billingConstraint);
   if (!moneyResolutionSupported && allowedJobKeys.includes("financial_transactions_scan")) constraints.push({ OR: [
     { jobKey: { not: "financial_transactions_scan" } },
@@ -439,6 +442,13 @@ function committedCollectorSourceAdvance(job, chunk, effect) {
     return chunk.kind === "subscriber_directory_page" && effect.duplicate === false
       && Number.isSafeInteger(effect.pageCount) && effect.pageCount > 0 && Number.isSafeInteger(effect.nextOffset)
       && (effect.hasMore === false || effect.hasMore === true && Number.isSafeInteger(chunk.offset) && effect.nextOffset > chunk.offset);
+  }
+  if (job.jobKey === "dialog_intelligence_scan") {
+    const advance = effect.sourcePageAdvance;
+    return job.params?.discoveryTraversalVersion === 1 && chunk.kind === "dialog_discovery_page"
+      && effect.duplicate === false && Boolean(effect.chunkId) && advance?.pages > 0
+      && Number.isSafeInteger(advance.fromPage) && Number.isSafeInteger(advance.toPage)
+      && advance.toPage > advance.fromPage && advance.toPage === chunk.pageEnd;
   }
   if (job.jobKey === "catchup_notifications_scan") {
     if (chunk.kind !== "notification_facts_page_all" || chunk.schemaVersion !== 6
@@ -648,6 +658,18 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   const fanRefreshBlockedCreatorIds = [];
   let fanRefreshGlobalBlocked = false;
   let rejectedFinancialClaims = 0;
+  let initialStageBlocked = false;
+  // Load a bounded pending page once. Rejected initial stages must not turn a
+  // claim poll into one collection-state query per historical job or creator.
+  let initialAdmission = new Map();
+  if (allowedJobKeys.some(key => INITIAL_ORDERED_JOB_KEYS.has(key))) {
+    const pending = await prisma.jobInstance.findMany({ where: {
+      agencyId: device.agencyId, creatorId: { in: eligibleCreatorIds }, status: "SCHEDULED", nextRunAt: { lte: now },
+      jobKey: { in: allowedJobKeys.filter(key => INITIAL_ORDERED_JOB_KEYS.has(key)) },
+    }, select: { creatorId: true, jobKey: true, params: true }, orderBy: [{ nextRunAt: "asc" }, { id: "asc" }], take: 200 });
+    initialAdmission = await loadInitialCollectionAdmission({ db: prisma, creatorIds: pending.map(row => row.creatorId), now });
+    initialStageBlocked = pending.some(job => !initialCollectionAdmission(job, initialAdmission.get(job.creatorId)).admitted);
+  }
   for (let race = 0; race < 20; race += 1) {
     const candidateWhere = claimCandidateWhere({
       allowedJobKeys,
@@ -662,8 +684,19 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       moneyResolutionSupported: capabilities?.financialMoneyResolutionV1 === true,
     });
     const candidate = await require("./job-claim-fairness-service").selectClaimCandidate({ db: prisma, where: candidateWhere, now });
-    if (!candidate) return { job: null, reason: rejectedFinancialClaims ? "invalid-financial-command" : "no-work",
+    if (!candidate) return { job: null, reason: rejectedFinancialClaims ? "invalid-financial-command" : initialStageBlocked ? "initial-stage-wait" : "no-work",
       ...(rejectedFinancialClaims ? { rejectedFinancialClaims } : {}) };
+    if (INITIAL_ORDERED_JOB_KEYS.has(candidate.jobKey)) {
+      if (!initialAdmission.has(candidate.creatorId)) {
+        const extra = await loadInitialCollectionAdmission({ db: prisma, creatorIds: [candidate.creatorId], now });
+        initialAdmission.set(candidate.creatorId, extra.get(candidate.creatorId));
+      }
+      if (!initialCollectionAdmission(candidate, initialAdmission.get(candidate.creatorId)).admitted) {
+        initialStageBlocked = true;
+        capacityBlockedIds.push(candidate.id);
+        continue;
+      }
+    }
     if (!liveSync.admitsJob(candidate)) {
       await prisma.jobInstance.updateMany({where:{id:candidate.id,status:"SCHEDULED"},data:{status:"CANCELLED",completedAt:now,lastError:"superseded_by_event_driven_policy"}});
       continue;
@@ -720,6 +753,12 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       // Recheck paid access and telemetry and construct a full lease only now.
       const billing = await assertJobBillingAccess({ db, job: candidate, recoveryCapable: capabilities?.billingRecoveryLeaseV1 === true });
       const claimNow = billing.now;
+      if (INITIAL_ORDERED_JOB_KEYS.has(candidate.jobKey)) {
+        const fresh = await loadInitialCollectionAdmission({ db, creatorIds: [candidate.creatorId], now: claimNow });
+        initialAdmission.set(candidate.creatorId, fresh.get(candidate.creatorId));
+        const admission = initialCollectionAdmission(candidate, fresh.get(candidate.creatorId));
+        if (!admission.admitted) return { __initialStageBlocked: true, reason: admission.reason };
+      }
       const currentDevice = await db.workerDevice.findUnique({ where: { id: deviceId } });
       if (!currentDevice || currentDevice.userId !== userId || currentDevice.agencyId !== device.agencyId
           || !isCapabilityTimestampFresh(currentDevice.lastSeenAt, claimNow, 5 * 60 * 1000)) return null;
@@ -741,6 +780,9 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
         attemptClaimData.params = notificationRepairParams(candidate, claimNow);
         attemptClaimData.continuation = null;
         attemptClaimData.progress = { percent: 0, message: "Notification repair: new collection generation" };
+      }
+      if (candidate.jobKey === DIALOG_INTELLIGENCE_JOB_KEY && candidate.params?.dialogId === DIALOG_DISCOVERY_DIALOG_ID) {
+        attemptClaimData.params = { ...object(attemptClaimData.params || candidate.params), discoveryTraversalVersion: 1 };
       }
       if (candidate.jobKey === "financial_transactions_scan") {
         const authority = require("./financial-receipt-authority");
@@ -825,6 +867,11 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       capacityBlockedIds.push(candidate.id);
       continue;
     }
+    if (claimed?.__initialStageBlocked === true) {
+      initialStageBlocked = true;
+      capacityBlockedIds.push(candidate.id);
+      continue;
+    }
     if (claimed?.__fanDataRefreshCapacityBlocked === true) {
       if (claimed.globalFull) fanRefreshGlobalBlocked = true;
       else if (!fanRefreshBlockedCreatorIds.includes(String(candidate.creatorId))) fanRefreshBlockedCreatorIds.push(String(candidate.creatorId));
@@ -842,7 +889,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       reason: "claimed",
     };
   }
-  return { job: null, reason: rejectedFinancialClaims ? "invalid-financial-command" : (capacityBlockedIds.length ? "campaign-directory-capacity" : (fanRefreshGlobalBlocked || fanRefreshBlockedCreatorIds.length ? "fan-data-refresh-capacity" : "race-lost")),
+  return { job: null, reason: rejectedFinancialClaims ? "invalid-financial-command" : initialStageBlocked ? "initial-stage-wait" : (capacityBlockedIds.length ? "campaign-directory-capacity" : (fanRefreshGlobalBlocked || fanRefreshBlockedCreatorIds.length ? "fan-data-refresh-capacity" : "race-lost")),
     ...(rejectedFinancialClaims ? { rejectedFinancialClaims } : {}) };
 }
 async function requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, allowExpired = false, db = prisma, lock = false, nowait = false }) {
@@ -1295,15 +1342,17 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
         return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
           progress: job.progress, continuation: job.continuation, sideEffect: { staleProgress: true } };
       }
-      const attempts = Number(job.attempts || 0) + 1;
+      const repairAttempts = Number(job.params?.notificationReceiptRepairAttempts || 0) + 1;
+      const attempts = Math.max(Number(job.attempts || 0) + 1, repairAttempts);
       const terminal = attempts >= MAX_ATTEMPTS;
       const rotated = await tx.jobInstance.updateMany({ where: {
         id: job.id, status: "CLAIMED", leaseRevision, leaseTokenHash: hashToken(leaseToken),
         claimedByDeviceId: deviceId, leaseUntil: { gt: now },
       }, data: {
         status: terminal ? "FAILED" : "SCHEDULED", attempts,
-        ...(!terminal ? { params: { ...notificationRepairParams(job, now, null),
-          notificationRepairReason: "ingest_idempotency_conflict" }, nextRunAt: now } : {}),
+        params: { ...(terminal ? object(job.params) : notificationRepairParams(job, now, null)),
+          notificationReceiptRepairAttempts: repairAttempts, notificationRepairReason: "ingest_idempotency_conflict" },
+        ...(!terminal ? { nextRunAt: now } : {}),
         continuation: null, progress: { percent: 0, message: terminal
           ? "Notification receipt recovery exhausted" : "Notification receipt recovery: new collection generation" },
         claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null,
@@ -1525,14 +1574,15 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
           : { verified: false, reason: "scanner_report_partial" };
         const successful = pageProof.verified === true;
         const attempts = Number(job.attempts || 0) + (successful ? 0 : 1);
-        const terminal = !successful && attempts >= MAX_ATTEMPTS;
-        const retryAt = successful || terminal ? null
-          : new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
-        const status = successful ? "DONE" : terminal ? "FAILED" : "SCHEDULED";
+        // Provider traversal has already ended. Re-reading every page cannot
+        // repair an invalid captured fact or a missing receipt. Preserve this
+        // finite partial result; a separate explicit repair is a new command.
+        const terminal = !successful;
+        const retryAt = null;
+        const status = successful ? "DONE" : "FAILED";
         const failureData = {
-          status, attempts, completedAt: terminal ? now : null,
-          ...(!terminal ? { params: notificationRepairParams(job, now, result) } : {}),
-          ...(retryAt ? { nextRunAt: retryAt, progress: { percent: 0, message: "notification catch-up scheduled for repair" } } : {}),
+          status, attempts, completedAt: now,
+          progress: { percent: 100, message: "Notification catch-up partial: saved facts retained; explicit retry required" },
           claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, continuation: null, workId: null,
           result: { ...(result || {}), completionSideEffect: { verified: false, sourceTraversalComplete: true } },
           lastError: "notification_scan_partial",
@@ -1559,18 +1609,17 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       const manualPartial = !successful && job.params?.manualNotificationScan === true
         && sideEffect?.sourceTraversalComplete === true;
       const attempts = Number(job.attempts || 0) + (successful || manualPartial ? 0 : 1);
-      const terminal = !successful && !manualPartial && attempts >= MAX_ATTEMPTS;
-      const retryAt = successful || manualPartial || terminal ? null
-        : new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1)));
-      const status = successful || manualPartial ? "DONE" : terminal ? "FAILED" : "SCHEDULED";
-      const repairParams = status === "SCHEDULED" ? notificationRepairParams(job, now, result) : object(job.params);
+      const terminal = !successful && !manualPartial;
+      const retryAt = null;
+      const status = successful || manualPartial ? "DONE" : "FAILED";
+      const repairParams = object(job.params);
       const data = successful ? completionData : {
-        status, attempts, params: repairParams, completedAt: status === "SCHEDULED" ? null : now,
-        ...(retryAt ? { nextRunAt: retryAt } : {}),
+        status, attempts, params: repairParams, completedAt: now,
         claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null,
         continuation: null, workId: null,
-        progress: manualPartial ? { percent: 100, message: "notification scan completed with rejected facts" }
-          : { percent: 0, message: "notification scan scheduled for repair" },
+        progress: sideEffect?.sourceTraversalComplete
+          ? { percent: 100, message: "Notification history partial: rejected facts retained; explicit retry required" }
+          : { ...object(job.progress), message: "Notification history incomplete: completion proof rejected; explicit retry required" },
         lastError: "notification_scan_partial",
       };
       data.result = { ...(result || {}), completionSideEffect: sideEffect };

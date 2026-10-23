@@ -46,6 +46,10 @@ function fakeDb() {
   ];
   return commitDatabaseFixture({
     async $queryRawUnsafe(sql, ...params) {
+      if (sql.includes('FROM "CreatorMediaMessageFinancialState"')) {
+        assert.deepEqual(params,["creator-1","media_financial_adoption_v1"]);
+        return [{ready:true}];
+      }
       if (sql.includes('FROM "DialogScanState"')) {
         const [agency,creator,selection,generation,startedAt] = params;
         assert.equal(agency,"agency-1"); assert.equal(creator,"creator-1");
