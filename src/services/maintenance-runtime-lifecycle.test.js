@@ -50,7 +50,7 @@ function serverHarness({brokenStop=false,badExternal=false}={}){
  const db={$disconnect:async()=>{calls.push('disconnect');}};
  const log={info(){},warn(){},error(...args){calls.push(['error',...args]);}};
  const lifecycle=require('./backend-process-lifecycle').createBackendProcessLifecycle({db,log,processPort,schedule:()=>({}),cancel(){}});
- const context={Promise,console:{error(...args){calls.push(['error',...args]);},warn(){}},process:processPort,logger:log,prisma:db,app:{},lifecycle,assertDatabaseContract:async()=>({ready:true}),
+ const context={Promise,console:{error(...args){calls.push(['error',...args]);},warn(){}},process:processPort,logger:log,runtimeRelease:'isolated-lifecycle-test',prisma:db,app:{},lifecycle,assertDatabaseContract:async()=>({ready:true}),
   startRecurringScheduler(){calls.push('scheduler-start');},stopRecurringScheduler(){calls.push('scheduler-stop');return drain.promise;},
   require(name){
    if(name==='./services/database-contract-service')return{assertDatabaseContract:async()=>({ready:true})};

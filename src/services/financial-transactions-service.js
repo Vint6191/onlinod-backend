@@ -71,9 +71,7 @@ function clean(value, max = 220) {
   return text ? text.slice(0, max) : null;
 }
 function strictDate(value) {
-  if (!value) return null;
-  const date = value instanceof Date ? value : new Date(value);
-  return Number.isFinite(date.getTime()) ? date : null;
+  return receipts.date(value);
 }
 function moneyCents(value) {
   if (typeof value !== "number" && typeof value !== "string") return null;

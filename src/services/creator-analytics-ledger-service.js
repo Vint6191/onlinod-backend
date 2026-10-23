@@ -1937,20 +1937,32 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
     && directoryCounts.sealedDirectoryCount(current, directoryAuthority) !== null;
   let dueCount = allCount;
   let targetCount = allCount;
+  let completedCount = 0;
   let targetIds = [];
   let selected = null;
 
   if (recovering) {
     // The offset source has no ordered frontier contract. Recover every member
     // scope once, with indexed fair-page cursors; wall-clock TTL is irrelevant.
-    await tx.creatorCampaign.updateMany({ where: exactGeneration, data: {
+    // 172 could erase the plan when resuming a transient failure while keeping
+    // its committed cursors. Initialize only a new run; a cursor from this run
+    // (including a completed one) is durable evidence, never restartable work.
+    await tx.creatorCampaign.updateMany({ where: { ...exactGeneration,
+      OR: [{ claimersCursorRunId: null }, { claimersCursorRunId: { not: scanRunId } }],
+    }, data: {
       claimersTargetRunId: scanRunId, ...fairPages.initialCursor(scanRunId),
     } });
     targetCount = allCount;
+    completedCount = await tx.creatorCampaign.count({ where: { ...exactGeneration,
+      claimersCursorRunId: scanRunId, claimersCursorPending: false, claimersLastVerifiedRunId: scanRunId,
+    } });
   } else if (command.mode === "full" || !schedulingCurrent) {
     // Full/rolling-compat traversal already scans every row. Do not materialize
     // the entire directory merely to attach target markers.
     targetCount = allCount;
+    if (fairPages.enabled(job)) completedCount = await tx.creatorCampaign.count({ where: { ...exactGeneration,
+      claimersCursorRunId: scanRunId, claimersCursorPending: false, claimersLastVerifiedRunId: scanRunId,
+    } });
   } else if (bounded) {
     selected = await (fairPages.enabled(job) ? fairPages : boundedFrontiers).selectTargets(tx, exactGeneration, now, campaignFrontierBudget(job));
     targetIds = selected.targets.map(row => row.id);
@@ -1993,6 +2005,16 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
     select: { claimersNextDueAt: true },
   });
   const fanCutoff = new Date(command.requestedAt.getTime() - CAMPAIGN_FAN_VALUE_FRESHNESS_MS);
+  if (fairPages.enabled(job) && current?.campaignProofScanRunId === scanRunId
+      && Number(current.campaignProofClaimerBatches || 0) > 0) {
+    // A missing plan despite committed member pages identifies an interrupted
+    // old resume. Its counters were erased together with the plan, while the
+    // typed per-fan receipts survived. Restore them once, before sealing the
+    // plan, so a queued/failed fan cannot disappear from completeness.
+    await require("./campaign-fan-refresh-queue-service").restoreCampaignFanCoverageRun(tx, {
+      agencyId: job.agencyId, creatorId: job.creatorId, scanRunId, cutoff: fanCutoff, now,
+    });
+  }
   const previousProof = campaignCompletionProofFromState(current, scanRunId, CAMPAIGN_COLLECTOR_VERSION);
   return tx.creatorCampaignCollectionState.update({
     where: { creatorId: job.creatorId },
@@ -2009,10 +2031,10 @@ async function ensureCampaignFrontierPlan(tx, { job, command, scanRunId, now, di
         campaignProofCampaignBatches: 0, campaignProofClaimerBatches: 0,
         campaignProofRejectedBatches: 0, campaignProofRejectedRows: 0,
       } : {}),
-      campaignFrontierFreshnessStatus: targetCount ? "QUEUED" : (deferred > 0 ? "PARTIAL" : "COMPLETE"),
+      campaignFrontierFreshnessStatus: completedCount < targetCount ? (completedCount ? "SCANNING" : "QUEUED") : (deferred > 0 ? "PARTIAL" : "COMPLETE"),
       campaignFrontierDueCount: dueCount,
       campaignFrontierTargetCount: targetCount,
-      campaignFrontierCompletedCount: 0,
+      campaignFrontierCompletedCount: completedCount,
       campaignFrontierDeferredCount: deferred,
       campaignFrontierOldestDueAt: oldestDue?.claimersNextDueAt || (dueCount > 0 ? command.requestedAt : null),
       campaignFrontierNextDueAt: nextDue?.claimersNextDueAt || null,

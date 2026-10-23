@@ -20,7 +20,7 @@ function invalidClaim(error) { return error instanceof FinancialReceiptError && 
 function enabled(job) { return job?.jobKey === "financial_transactions_scan" && job.params?.financialReceiptVersion === 1; }
 function date(value) {
   if (!value) return null;
-  const raw = typeof value === "string" && /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(value) ? value.replace(" ", "T") + "Z" : value;
+  const raw = typeof value === "string" && /^\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:\.\d{1,9})?$/.test(value) ? value.replace(" ", "T") + "Z" : value;
   const result = new Date(raw); return Number.isFinite(+result) ? result : null;
 }
 function integer(value, max = 1000000000) {

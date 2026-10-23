@@ -93,6 +93,14 @@ const pass = text => { checks.push(text); console.log("PASS", text); };
     assert.equal(display.ready,true); assert.equal(display.finance.netCents,800);
     assert.equal((await db.financialObservedFact.findUnique({where:{runId_windowIndex_externalId:{runId:receipts.runId(bad.job),windowIndex:0,externalId:recent.id}}})).value.netCents,400);
     pass("completed history with mismatched count/gross/net is terminal and retained, never repaired by automatic full-generation restart");
+    assert.equal(failed.result.completionSideEffect.windows[0].expectedMinusObserved, undefined);
+    const recoverySnapshot = await require(root + "/src/services/recovery-runtime-observer").inspectRecoveryRuntime(db, s);
+    const storedFailure = recoverySnapshot.referencedJobs.find(row => row.id === bad.job.id);
+    assert(storedFailure);
+    assert.deepEqual(storedFailure.financialVerification.windows[0].expectedMinusObserved, { count: 0, grossCents: 500, netCents: 400 });
+    assert.deepEqual(storedFailure.financialVerification.windows[0].allObserved, { count: 1, grossCents: 500, netCents: 400 });
+    assert.equal((await db.jobInstance.findUnique({ where: { id: bad.job.id } })).status, "FAILED");
+    pass("existing failed completion JSON yields new bounded diagnostics through the actual Stats recovery reader without a provider request or restarting the job");
     const gap=await start({mode:"catchup",gapFrom:new Date(+now-1800000+789),recoveryIntentId:"verified-fractional-gap",recoveryTargetAt:new Date(+now-123)});
     assert.equal(gap.job.params.financialWindows[0].comparisonFrom,new Date(+now-1800000).toISOString());
     await step(gap,{list:[money("fractional-chart-start",new Date(+now-1800000+100),4)],hasMore:true,nextMarker:"gap-boundary"});
@@ -111,6 +119,31 @@ const pass = text => { checks.push(text); console.log("PASS", text); };
     assert.equal(Number((await gen.activeEntry(db,s.creatorId,"fractional-chart-start")).netCents),320);
     assert.equal((await db.creatorRecoveryIntent.findUnique({where:{id:"verified-fractional-gap"}})).status,"COMPLETE");
     pass("catchup crosses frozen gap then immutable known page plus TWO further pages, preserves new overlap facts, verifies only comparable gap window");
+    const exactGapAt = new Date(+now - 1800000), knownAtGap = money("known-at-comparison-second", exactGapAt, 5);
+    const seedAtGap = await start();
+    await step(seedAtGap, { list: [knownAtGap], hasMore: false });
+    await charts(seedAtGap, { gross: 5, net: 4, count: 1 }); await finish(seedAtGap);
+    const boundaryRun = await start({ mode: "catchup", gapFrom: exactGapAt });
+    const timezone = process.env.TZ;
+    try {
+      process.env.TZ = "Europe/Kyiv";
+      // Both server-owned bounds are inclusive. A known lower-bound fact must
+      // remain in the observed sum; knowing it before the run only stops the
+      // traversal after the required overlap, it never removes its money.
+      const upper = { ...money("upper-second-utc", now, 17.99), createdAt: now.toISOString().slice(0, 19).replace("T", " ") };
+      await step(boundaryRun, { list: [upper], hasMore: true, nextMarker: "exact-gap-lower" });
+      await step(boundaryRun, { list: [{ ...knownAtGap, createdAt: exactGapAt.toISOString().slice(0, 19) }], hasMore: true, nextMarker: "exact-gap-overlap-one" });
+      assert.equal(boundaryRun.checkpoint.jobContinuation.frontierPhase, "OVERLAP");
+      await step(boundaryRun, { list: [recent], hasMore: true, nextMarker: "exact-gap-overlap-two" });
+      await step(boundaryRun, { list: [historic], hasMore: true, nextMarker: "exact-gap-unused" });
+      await charts(boundaryRun, { gross: 22.99, net: 18.39, count: 2 });
+      const done = await finish(boundaryRun);
+      assert.deepEqual(done.result.completionSideEffect.reconciliation.observed, { transactionsCount: 2, grossCents: 2299, netCents: 1839 });
+      assert.equal(done.result.completionSideEffect.windows[0].comparisonTotals.count, 2);
+      assert.equal(done.result.completionSideEffect.published, true);
+      assert.equal(Number((await gen.activeEntry(db, s.creatorId, "upper-second-utc")).netCents), 1439);
+    } finally { if (timezone === undefined) delete process.env.TZ; else process.env.TZ = timezone; }
+    pass("non-UTC Desktop preserves offsetless UTC source dates; known facts at the exact lower second and current facts at the exact upper second both enter chart verification");
     const empty=await start(); await step(empty,{list:[],hasMore:false}); const emptyResult=await finish(empty,"FAILED");
     assert.equal(emptyResult.result.completionSideEffect.historyRead,true); assert.equal(emptyResult.result.completionSideEffect.verification,"UNAVAILABLE");
     assert.equal(Number((await gen.activeEntry(db,s.creatorId,"before-2016")).netCents),400);

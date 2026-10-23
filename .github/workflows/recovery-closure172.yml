@@ -28,6 +28,8 @@ jobs:
             proof: scripts/audit/initial-stage-claim172-proof.cjs
           - name: initial-campaign-readiness
             proof: scripts/audit/initial-campaign-readiness172-proof.cjs
+          - name: campaign-resume
+            proof: scripts/audit/campaign-resume173-proof.cjs
     services:
       postgres:
         image: postgres:16

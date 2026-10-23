@@ -206,6 +206,33 @@ function coverageFromState(state, scanRunId) {
   };
 }
 
+async function restoreCampaignFanCoverageRun(db, { agencyId, creatorId, scanRunId, cutoff, now }) {
+  // One-time recovery of a 172 plan reset, under the creator Campaign lock.
+  // The typed work rows are the retained per-fan receipts. Read only this exact
+  // run through its creator/run index; never derive coverage from provider data
+  // or from work belonging to historical runs.
+  const [counts] = await db.$queryRawUnsafe(`SELECT COUNT(*)::int AS expected,
+    COUNT(*) FILTER (WHERE status='ALREADY_FRESH')::int AS fresh,
+    COUNT(*) FILTER (WHERE "requestedRevision">0)::int AS queued,
+    COUNT(*) FILTER (WHERE status='QUEUED')::int AS outstanding,
+    COUNT(*) FILTER (WHERE status='SUCCEEDED')::int AS succeeded,
+    COUNT(*) FILTER (WHERE status='UNAVAILABLE')::int AS unavailable,
+    COUNT(*) FILTER (WHERE status='FAILED')::int AS failed
+    FROM "CreatorCampaignFanRefreshWork"
+    WHERE "agencyId"=$1 AND "creatorId"=$2 AND "scanRunId"=$3`, agencyId, creatorId, scanRunId);
+  const expected = Number(counts.expected), outstanding = Number(counts.outstanding),
+    failed = Number(counts.failed), unavailable = Number(counts.unavailable);
+  if (expected !== Number(counts.fresh) + outstanding + Number(counts.succeeded) + unavailable + failed)
+    throw new Error("CAMPAIGN_FAN_COVERAGE_RESTORE_STATUS_INVALID");
+  return db.creatorCampaignCollectionState.update({ where: { creatorId }, data: {
+    fanValueCoverageScanRunId: scanRunId, fanValueFreshnessCutoffAt: cutoff,
+    fanValueExpected: expected, fanValueAlreadyFresh: Number(counts.fresh), fanValueQueued: Number(counts.queued),
+    fanValueOutstanding: outstanding, fanValueSucceeded: Number(counts.succeeded), fanValueUnavailable: unavailable,
+    fanValueFailed: failed, fanValueCoverageUpdatedAt: now,
+    fanValueFreshnessStatus: outstanding ? "QUEUED" : failed || unavailable ? "PARTIAL" : "COMPLETE",
+  } });
+}
+
 async function ensureCoverageRun(db, { creatorId, scanRunId, cutoff, now, coverageAuthority = null }) {
   const state = await db.creatorCampaignCollectionState?.findUnique?.({ where: { creatorId } });
   if (!state) return null;
@@ -2174,6 +2201,7 @@ module.exports = {
   DEMAND_STATUS,
   campaignFanRefreshIsFresh,
   campaignFanValueCoverageFromState: coverageFromState,
+  restoreCampaignFanCoverageRun,
   enqueueUniqueCampaignFanRefreshes,
   promoteQueuedCampaignFanRefreshDemands,
   runCampaignFanRefreshPromotionMaintenance,

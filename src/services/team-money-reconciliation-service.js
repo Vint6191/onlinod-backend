@@ -525,7 +525,10 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
 
 async function reconcileCreatorSaleToTeam({ db = prisma, saleId }) {
   // The source and attribution locks are re-read inside each DB-only attempt.
-  return runDbTransaction(db, (tx) => reconcileCreatorSaleToTeamInTransaction({ db: tx, saleId }), { ...serializableTxOptions(), maxAttempts: 3 });
+  return runDbTransaction(db, (tx) => reconcileCreatorSaleToTeamInTransaction({ db: tx, saleId }), {
+    ...serializableTxOptions(), maxAttempts: 3,
+    operation: "team-money.reconcile-sale", authority: { kind: "TEAM_MONEY_RECONCILIATION", saleId },
+  });
 }
 
 async function reconcileCreatorSalesToTeam({ db = prisma, saleIds = [] }) {
@@ -760,7 +763,10 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
 }
 
 async function reconcileCreatorTipToTeam({ db = prisma, tipId }) {
-  return runDbTransaction(db, (tx) => reconcileCreatorTipToTeamInTransaction({ db: tx, tipId }), { ...serializableTxOptions(), maxAttempts: 3 });
+  return runDbTransaction(db, (tx) => reconcileCreatorTipToTeamInTransaction({ db: tx, tipId }), {
+    ...serializableTxOptions(), maxAttempts: 3,
+    operation: "team-money.reconcile-tip", authority: { kind: "TEAM_MONEY_RECONCILIATION", tipId },
+  });
 }
 
 async function reconcileCreatorTipsToTeam({ db = prisma, tipIds = [] }) {

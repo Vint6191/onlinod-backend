@@ -51,6 +51,7 @@ const { authRequired, homeAuthRequired } = require("./middleware/auth");
 const { createRequestObservabilityMiddleware } = require("./middleware/request-observability");
 const prisma = require("./prisma");
 const logger = require("./utils/logger");
+const runtimeRelease = "recovery-173-v1";
 const { buildBackendHealthSnapshot } = require("./utils/health-snapshot");
 const { readDatabaseContract, assertDatabaseContract } = require("./services/database-contract-service");
 const { startRecurringScheduler, stopRecurringScheduler, getRecurringSchedulerHealthSnapshot } = require("./services/job-scheduler");
@@ -170,7 +171,7 @@ app.get("/ready", async (_req, res) => {
     const schema = await readDatabaseContract(prisma);
     return res.status(schema.ready ? 200 : 503).json({
       ok: schema.ready, status: schema.ready ? "ready" : "not_ready",
-      service: "nod-backend", version: schema.version, database: "ok", schema,
+      service: "nod-backend", runtimeRelease, version: schema.version, database: "ok", schema,
       time: new Date().toISOString(),
     });
   } catch (err) {
@@ -179,6 +180,7 @@ app.get("/ready", async (_req, res) => {
       ok: false,
       status: "not_ready",
       service: "nod-backend",
+      runtimeRelease,
       version: "nod_current_v1",
       database: "error",
       schema: { ready: false },
@@ -342,6 +344,6 @@ async function startServer({ own, checkpoint }) {
   httpServer.on("error", error => { void lifecycle.stop("http-error", error); });
   await listening;
   checkpoint();
-  logger.info("backend listening", { port });
+  logger.info("backend listening", { port, runtimeRelease });
 }
 void lifecycle.start(startServer);

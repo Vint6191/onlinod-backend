@@ -49,3 +49,15 @@ test('financial gap comparison uses the same second-precision lower coordinate a
   assert.equal(windows[0].from,null); assert.equal(windows[0].comparisonFrom,'2026-10-04T11:00:00.000Z');
   assert.equal(windows[0].to,now.toISOString());
 });
+
+test('financial receipt timestamp coordinates do not depend on backend local timezone', () => {
+  const previous = process.env.TZ;
+  try {
+    for (const timezone of ['UTC', 'Europe/Kyiv', 'America/Los_Angeles']) {
+      process.env.TZ = timezone;
+      for (const value of ['2026-10-20 20:57:34.123', '2026-10-20T20:57:34.123', '2026-10-20T23:57:34.123+03:00']) {
+        assert.equal(authority.date(value).toISOString(), '2026-10-20T20:57:34.123Z', `${timezone}: ${value}`);
+      }
+    }
+  } finally { if (previous === undefined) delete process.env.TZ; else process.env.TZ = previous; }
+});

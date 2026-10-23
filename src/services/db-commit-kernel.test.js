@@ -9,6 +9,110 @@ const {
 } = require("./db-commit-kernel");
 
 const retryOptions = { retryBaseMs: 1 };
+const logger = require("../utils/logger");
+
+function captureConflictDiagnostics(t) {
+  const rows = [];
+  for (const level of ["info", "warn"]) t.mock.method(logger, level, (message, meta) => rows.push({ level, message, ...meta }));
+  return rows;
+}
+
+function transactionalCounter({ failures = 0 } = {}) {
+  const state = { committedValue: 0, attempts: 0 };
+  return { state, async $transaction(work) {
+    state.attempts += 1;
+    let pendingValue = state.committedValue;
+    const result = await work({ increment() { pendingValue += 1; } });
+    if (state.attempts <= failures) throw conflict();
+    state.committedValue = pendingValue;
+    return result;
+  } };
+}
+
+test("conflicted commits log one attributed recovery and publish only the committed attempt", async (t) => {
+  const rows = captureConflictDiagnostics(t), db = transactionalCounter({ failures: 2 }), hints = [];
+  const result = await runRootCommit(db, ctx => {
+    ctx.tx.increment();
+    deferCommitHint(ctx, "published", () => hints.push(ctx.attempt));
+    return { completed: true };
+  }, {
+    ...retryOptions, operation: "team-money.reconcile-sale",
+    authority: { kind: "TEAM_MONEY_RECONCILIATION", agencyId: "agency-1", creatorId: "creator-1", saleId: "sale-1", secret: "MUST_NOT_APPEAR", query: "SELECT private_value" },
+  });
+  assert.deepEqual(result, { completed: true });
+  assert.equal(db.state.committedValue, 1);
+  assert.deepEqual(hints, [3]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].level, "info");
+  assert.equal(rows[0].outcome, "COMMITTED_AFTER_RETRY");
+  assert.equal(rows[0].attempts, 3);
+  assert.equal(rows[0].conflicts, 2);
+  assert.equal(rows[0].sqlState, "40001");
+  assert.equal(rows[0].operation, "team-money.reconcile-sale");
+  assert.equal(rows[0].agencyId, "agency-1");
+  assert.equal(rows[0].creatorId, "creator-1");
+  assert.equal(rows[0].saleId, "sale-1");
+  assert.match(rows[0].rootId, /^[0-9a-f-]{36}$/);
+  assert.doesNotMatch(JSON.stringify(rows), /MUST_NOT_APPEAR|SELECT|controlled DB conflict/);
+});
+
+test("exhausted conflict logs one terminal outcome and commits neither writes nor hints", async (t) => {
+  const rows = captureConflictDiagnostics(t), db = transactionalCounter({ failures: 3 }), hints = [];
+  await assert.rejects(runRootCommit(db, ctx => {
+    ctx.tx.increment(); deferCommitHint(ctx, "published", () => hints.push(ctx.attempt));
+  }, { ...retryOptions, conflictCode: "TEAM_CONFLICT" }), error => error.code === "TEAM_CONFLICT" && error.cause.meta.code === "40001");
+  assert.equal(db.state.attempts, 3);
+  assert.equal(db.state.committedValue, 0);
+  assert.deepEqual(hints, []);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].level, "warn");
+  assert.equal(rows[0].outcome, "RETRY_EXHAUSTED");
+  assert.equal(rows[0].attempts, 3);
+  assert.equal(rows[0].conflicts, 3);
+});
+
+test("business rejection after retry stays rejected and cannot be reported as recovered", async (t) => {
+  const rows = captureConflictDiagnostics(t), rejected = Object.assign(Error("private rejection payload"), { code: "STALE_INPUT", status: 409 });
+  await assert.rejects(runRootCommit(rootDb(), ctx => {
+    if (ctx.attempt === 1) throw conflict();
+    throw rejected;
+  }, retryOptions), error => error === rejected);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].outcome, "FAILED_AFTER_RETRY");
+  assert.equal(rows[0].attempts, 2);
+  assert.equal(rows[0].terminalCode, "STALE_INPUT");
+  assert.doesNotMatch(JSON.stringify(rows), /private rejection payload/);
+});
+
+test("diagnostic sinks cannot replay successful commits or replace exhausted failures", async (t) => {
+  for (const level of ["info", "warn"]) t.mock.method(logger, level, () => { throw conflict(); });
+  const db = transactionalCounter({ failures: 1 });
+  assert.equal(await runRootCommit(db, ctx => { ctx.tx.increment(); return "committed"; }, retryOptions), "committed");
+  assert.equal(db.state.committedValue, 1);
+  assert.equal(db.state.attempts, 2);
+  const exhausted = conflict();
+  await assert.rejects(runRootCommit(rootDb(), () => { throw exhausted; }, retryOptions), error => error === exhausted);
+});
+
+test("healthy transactions do not produce conflict diagnostics", async (t) => {
+  const rows = captureConflictDiagnostics(t);
+  assert.equal(await runRootCommit(rootDb(), () => "healthy"), "healthy");
+  assert.deepEqual(rows, []);
+});
+
+test("conflict diagnostics reject unbounded and non-identifier metadata", async (t) => {
+  const rows = captureConflictDiagnostics(t);
+  await runRootCommit(rootDb(), ctx => { if (ctx.attempt === 1) throw conflict(); }, {
+    ...retryOptions, operation: "SELECT * FROM private_table",
+    authority: { kind: "TEST", creatorId: "https://private.example/?token=secret", agencyId: "a".repeat(1000), jobId: { token: "secret" } },
+  });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].operation, "TEST");
+  assert.equal(rows[0].creatorId, undefined);
+  assert.equal(rows[0].agencyId, undefined);
+  assert.equal(rows[0].jobId, undefined);
+  assert.doesNotMatch(JSON.stringify(rows), /SELECT|private|secret|https/);
+});
 
 test("durable preparation follows domain work, joins its transaction and precedes commit hints", async () => {
   const events = [], db = rootDb();

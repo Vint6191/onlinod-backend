@@ -38,3 +38,24 @@ test("frontier proof does not require a chart; unsupported records remain unavai
   assert.deepEqual(result.reasons, ["FINANCIAL_RECEIPT_INCOMPLETE"]);
   for (const input of [null, {}, { type: "campaigns", ok: false }, { type: "financial_transactions", ok: "true" }]) assert.equal(describe(input), null);
 });
+
+test("stored frontier evidence separates excluded older rows and refunds from a one-row chart delta", () => {
+  const comparisonTotals = { count: 2, grossKnown: 2, grossCents: 2299, netCents: 1839,
+    statusGroups: { undo: { _count: { _all: 1 }, grossKnown: 1, _sum: { amountCents: 500, netCents: 400 } } } };
+  const result = describe({ type: "financial_transactions", ok: false, reconciliation: { proofKind: "FRONTIER_PLUS_TWO_AND_CHART" }, windows: [{ ...window, kind: "FRONTIER",
+    count: 40, grossKnown: 40, grossCents: 25299, netCents: 20239, comparisonTotals,
+    oldestAt: "2026-10-01T00:00:00Z", newestAt: "2026-10-23T20:00:00Z",
+    charts: { total: { transactionsCount: 2, grossCents: 2299, netCents: 1839 } } }] });
+  const evidence = result.windows[0];
+  assert.deepEqual(evidence.expectedMinusObserved, { count: 1, grossCents: 500, netCents: 400 });
+  assert.deepEqual(evidence.comparedRefunds, { count: 1, grossCents: 500, netCents: 400 });
+  assert.deepEqual(evidence.excludedBeforeComparison, { count: 38, grossCents: 23000, netCents: 18400 });
+  assert.equal(evidence.oldestObservedAt, "2026-10-01T00:00:00.000Z");
+  assert.equal(evidence.newestObservedAt, "2026-10-23T20:00:00.000Z");
+  assert(result.reasons.includes("FINANCIAL_CHART_NET_MISMATCH"));
+  assert.equal(result.outcome, "REJECTED");
+  // Existing failed-job snapshots nest verification several levels deep. The
+  // diagnostic emitter must still retain the useful scalar evidence.
+  const logged = require('./runtime-diagnostic-log').safeDiagnosticValue({ snapshot: { referencedJobs: [{ financialVerification: result }] } });
+  assert.deepEqual(logged.snapshot.referencedJobs[0].financialVerification.windows[0].expectedMinusObserved, evidence.expectedMinusObserved);
+});

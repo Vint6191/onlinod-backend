@@ -9,6 +9,20 @@ const KINDS = new Set(["FULL", "HEAD", "GAP", "AUDIT", "FRONTIER", "RESOLUTION"]
 const REJECTION_REASONS = ["SCANNER_REJECTED", "transaction_id_missing", "transaction_type_missing", "occurred_at_invalid",
   "amount_invalid", "net_invalid", "currency_invalid", "EXACT_FINANCIAL_MONEY_REQUIRED", "OUTSIDE_REQUESTED_FINANCIAL_WINDOW"];
 
+function rawTotals(value) {
+  const row = object(value), count = number(row.count);
+  return { count, grossCents: count === null || (row.grossKnown ?? count) !== count ? null : number(row.grossCents), netCents: number(row.netCents) };
+}
+function refundTotals(value) {
+  const undo = object(object(object(value).statusGroups).undo), count = number(object(undo._count)._all) ?? 0;
+  return { count, grossCents: (undo.grossKnown ?? count) !== count ? null : number(object(undo._sum).amountCents) ?? 0,
+    netCents: number(object(undo._sum).netCents) ?? 0 };
+}
+function subtract(a, b) {
+  return Object.fromEntries(["count", "grossCents", "netCents"].map(key => [key,
+    a[key] === null || b[key] === null ? null : number(a[key] - b[key])]));
+}
+
 // Reads the existing bounded completion proof, including pre-diagnostic failed
 // jobs. Never forwards profile values, descriptions, payloads or transaction IDs.
 function financialVerificationDiagnostics(value) {
@@ -34,6 +48,10 @@ function financialVerificationDiagnostics(value) {
     const observed = { count: count === null ? null : count - countUndo,
       grossCents: gross === null || (comparison.grossKnown ?? count) - (comparisonUndo.grossKnown ?? countUndo) !== count - countUndo ? null : gross - grossUndo, netCents: net === null ? null : net - netUndo };
     const expected = { count: number(chart.transactionsCount), grossCents: number(chart.grossCents), netCents: number(chart.netCents) };
+    // These fixed-size aggregates also work for already-failed receipts. They
+    // distinguish excluded overlap/history from refunds without logging rows,
+    // transaction IDs or asking the provider for the same history again.
+    const allObserved = rawTotals(row), comparedObserved = rawTotals(comparison);
     const chartRequired = row.kind !== "FRONTIER" || reconciliation.proofKind === "FRONTIER_PLUS_TWO_AND_CHART";
     const chartPresent = Object.keys(chart).length > 0;
     reject(number(row.rejected) > 0, "FINANCIAL_SOURCE_ROWS_REJECTED");
@@ -48,6 +66,9 @@ function financialVerificationDiagnostics(value) {
         .map(key => [key, number(row.rejectionReasons[key])])),
       matched: bool(row.matched), chartPresent, comparable: bool(row.comparable),
       comparisonFromAt: iso(row.comparisonFrom || row.from), comparisonToAt: iso(row.comparisonTo || row.to), observed, expected,
+      timeAuthority: "UTC", oldestObservedAt: iso(row.oldestAt), newestObservedAt: iso(row.newestAt),
+      allObserved, comparedIncludingRefunds: comparedObserved, excludedBeforeComparison: subtract(allObserved, comparedObserved),
+      comparedRefunds: refundTotals(comparison), expectedMinusObserved: subtract(expected, observed),
       boundaryPage: number(row.boundaryPage), overlapPage: number(row.overlapPage), overlapPages: number(row.overlapPages) };
   });
   if (reconciliation.proofKind !== "FRONTIER_PLUS_ONE") {

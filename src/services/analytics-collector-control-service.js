@@ -335,6 +335,17 @@ async function acceptCampaignGeneration({ db = prisma, job, deviceId = null, cam
     if (authority === "CURRENT" && String(existing?.status || "").toUpperCase() === "FAILED" && !existing?.retryAfterAt) {
       return { accepted: false, stale: true, terminal: true, command, state: existing };
     }
+    if (authority === "CURRENT") {
+      // A retry resumes the same immutable traversal. Resetting its plan and
+      // coverage would leave the already-committed per-campaign page cursors
+      // ahead of that plan and make the next segment try to rewind them.
+      const state = await tx.creatorCampaignCollectionState.update({
+        where: { creatorId: job.creatorId },
+        data: { status: "SCANNING", retryAfterAt: null, lastErrorCode: null, lastErrorMessage: null,
+          sourceDeviceId: clean(deviceId, 220), sourceJobId: clean(job.id, 220) },
+      });
+      return { accepted: true, stale: false, resumed: true, command, state };
+    }
     const coverageAuthority = campaignFanCoverageAuthorityFromJob(job);
     const data = {
       status: "SCANNING", mode: command.mode, activeGeneration: command.generation, activeRequestedAt: command.requestedAt, retryAfterAt: null,

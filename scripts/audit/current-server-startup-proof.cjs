@@ -38,7 +38,10 @@ async function main() {
         if (ended || Date.now() > deadline) throw Error("Server did not reach listening state: " + log);
         await pause(100);
       }
-      await get("/health"); await get("/ready");
+      await get("/health");
+      const readiness = await get("/ready");
+      assert.equal(readiness.runtimeRelease, "recovery-173-v1");
+      assert.equal(readiness.version, "nod_current_v22_recovery172");
       await pause(observeMs); assert.equal(ended, false);
       const health = await get("/health/details"); await get("/ready");
       child.kill("SIGTERM");
@@ -47,7 +50,7 @@ async function main() {
       assert.deepEqual(stopped, { code: 0, signal: null }, log);
       assert.match(log, /maintenance runtime ready/); assert.match(log, /shutdown requested/);
       assert.doesNotMatch(log, /prisma:error|"level":"(?:warn|error)"|step failed|sweep crashed|projection degraded|maintenance degraded|42P01|does not exist/i);
-      return { observedMs: observeMs, health, exit: stopped };
+      return { observedMs: observeMs, runtimeRelease: readiness.runtimeRelease, health, exit: stopped };
     } finally {
       if (!ended) { child.kill("SIGKILL"); await exit.catch(() => {}); }
       fs.writeFileSync(path.join(output, "server-" + label + ".log"), log);

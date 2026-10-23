@@ -136,7 +136,9 @@ function manualSent(memberId = "member-1") {
   };
 }
 
-test('PPV money reconciliation replays the full Serializable transaction after rollback without duplicating money', async () => {
+test('PPV money reconciliation replays the full Serializable transaction after rollback without duplicating money', async (t) => {
+  const diagnostics = [];
+  t.mock.method(require('../utils/logger'), 'info', (message, meta) => diagnostics.push({ message, ...meta }));
   const f = dbFixture({ sent: manualSent() });
   const original = f.db.$transaction;
   let attempts = 0;
@@ -155,6 +157,11 @@ test('PPV money reconciliation replays the full Serializable transaction after r
   assert.equal(replay.purchase.id, r.purchase.id);
   assert.equal(f.getPurchase().amountCents, 2500);
   assert.equal(f.getPurchaseCreates(), 2, 'one aborted insertion and one committed insertion; repeated reconciliation updates it');
+  assert.equal(diagnostics.length, 1, 'one terminal recovery record; healthy replay adds no noise');
+  assert.equal(diagnostics[0].outcome, 'COMMITTED_AFTER_RETRY');
+  assert.equal(diagnostics[0].operation, 'team-money.reconcile-sale');
+  assert.equal(diagnostics[0].saleId, 'sale-1');
+  assert.equal(diagnostics[0].attempts, 2);
 });
 
 test("source classification never treats automation/broadcast as human manual", () => {

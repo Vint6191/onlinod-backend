@@ -5,6 +5,7 @@ const { randomUUID } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
 const { setTimeout: delay } = require("node:timers/promises");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const logger = require("../utils/logger");
 
 // One owner begins, retries and commits. Domain services still own permission
 // checks and lock ordering. All application interactive roots use this kernel;
@@ -60,6 +61,38 @@ function classifyCommitConflict(error) {
     current = current.cause;
   }
   return null;
+}
+
+function diagnosticIdentifier(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/.test(value) ? value : null;
+}
+
+// Prisma logs the failed statement before the owner retries. Emit one terminal
+// result for a conflicted root so that a recovered 40001 can be distinguished
+// from abandoned work. Never include SQL, arbitrary authority fields or error
+// messages, and never let diagnostics change a committed/rolled-back outcome.
+function reportConflictOutcome({ rootId, config, authority, startedAt, attempts, conflicts, lastConflict, outcome, terminalError = null }) {
+  if (!conflicts) return;
+  try {
+    const meta = {
+      diagnosticVersion: "db-commit-173-v1", rootId, outcome,
+      operation: diagnosticIdentifier(config.operation) || diagnosticIdentifier(authority.kind),
+      profile: config.profile, isolationLevel: config.isolationLevel,
+      authorityKind: diagnosticIdentifier(authority.kind),
+      attempts, conflicts, maxAttempts: config.maxAttempts,
+      durationMs: Math.round(performance.now() - startedAt),
+      conflictKind: lastConflict?.kind ?? null,
+      conflictCode: lastConflict?.code ?? null,
+      sqlState: lastConflict?.sqlState ?? null,
+      terminalCode: diagnosticIdentifier(terminalError?.code),
+    };
+    for (const key of ["agencyId", "creatorId", "userId", "deviceId", "jobId", "saleId", "tipId"]) {
+      const value = diagnosticIdentifier(authority[key]);
+      if (value) meta[key] = value;
+    }
+    if (outcome === "COMMITTED_AFTER_RETRY") logger.info("database transaction recovered after conflict", meta);
+    else logger.warn("database transaction conflict unresolved", meta);
+  } catch { /* A log sink must never trigger command replay or hide rejection. */ }
 }
 
 function optionsFor(options) {
@@ -208,7 +241,9 @@ async function runRootCommit(db, work, options = {}) {
   const authority = Object.freeze({ kind: "DOMAIN", ...(options.authority || {}) });
   if (typeof authority.kind !== "string" || !authority.kind) throw failure("DB_COMMIT_AUTHORITY_INVALID", "An authority intent is required");
   const rootId = randomUUID();
-  const deadlineAt = performance.now() + config.deadlineMs;
+  const startedAt = performance.now();
+  const deadlineAt = startedAt + config.deadlineMs;
+  let attempts = 0, conflicts = 0, lastConflict = null;
   let lastError;
   for (let attempt = 1; attempt <= config.maxAttempts; attempt += 1) {
     const remaining = Math.floor(deadlineAt - performance.now());
@@ -217,6 +252,7 @@ async function runRootCommit(db, work, options = {}) {
     const timeout = Math.min(config.timeout, remaining - maxWait);
     let state;
     let result;
+    attempts = attempt;
     try {
       result = await db.$transaction(async (rawTx) => {
         if (!rawTx || rawTx === db || typeof rawTx.$transaction === "function") {
@@ -245,7 +281,13 @@ async function runRootCommit(db, work, options = {}) {
     } catch (error) {
       if (state) { state.phase = "ROLLED_BACK"; state.hints.clear(); state.preparations.clear(); }
       lastError = error;
-      if (!classifyCommitConflict(error)) throw error;
+      const conflict = classifyCommitConflict(error);
+      if (!conflict) {
+        reportConflictOutcome({ rootId, config, authority, startedAt, attempts, conflicts, lastConflict, outcome: "FAILED_AFTER_RETRY", terminalError: error });
+        throw error;
+      }
+      conflicts += 1;
+      lastConflict = conflict;
       if (attempt >= config.maxAttempts) break;
       const pause = Math.min(1000, config.retryBaseMs * (2 ** (attempt - 1))) + Math.floor(Math.random() * config.retryBaseMs);
       if (performance.now() + pause + 2 >= deadlineAt) break;
@@ -258,8 +300,10 @@ async function runRootCommit(db, work, options = {}) {
       state.phase = "COMMITTED";
       flushHints(state);
     }
+    reportConflictOutcome({ rootId, config, authority, startedAt, attempts, conflicts, lastConflict, outcome: "COMMITTED_AFTER_RETRY" });
     return result;
   }
+  reportConflictOutcome({ rootId, config, authority, startedAt, attempts, conflicts, lastConflict, outcome: "RETRY_EXHAUSTED", terminalError: lastError });
   if (lastError && config.conflictCode) {
     const error = failure(config.conflictCode, config.conflictMessage || "State changed concurrently; refresh and retry", lastError);
     error.status = 409;

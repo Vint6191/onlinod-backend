@@ -42,6 +42,7 @@ function stateDb(kind) {
   const locks = [];
   const delegate = {
     findUnique: async () => state,
+    update: async ({ data }) => { state = { ...state, ...data }; return state; },
     upsert: async ({ create, update }) => {
       state = state ? { ...state, ...update } : { id: `${kind}-state`, ...create };
       return state;
@@ -171,6 +172,24 @@ test("a later campaign server command supersedes the old generation and stale co
   assert.equal(completionReplay.replay, true);
   assert.equal(db._state().baselineVerifiedAt, verifiedAt);
   assert.ok(db._locks.every(([, key]) => key === "analytics-collector:campaigns:creator-1"));
+});
+
+test("same-generation Campaign retry preserves issued work, proofs and FanData coverage", async () => {
+  const db = stateDb("campaign");
+  const currentJob = job(COLLECTOR_TYPES.CAMPAIGNS, "campaign-retry", "2026-09-08T20:00:00.000Z");
+  await acceptCampaignGeneration({ db, job: currentJob });
+  const retained = { campaignFrontierPlanRunId: "campaign-retry", campaignFrontierSelection: { ids: ["a", "b"] },
+    campaignFrontierTargetCount: 2, campaignFrontierCompletedCount: 1, campaignFrontierFreshnessStatus: "SCANNING",
+    campaignProofScanRunId: "campaign-retry", campaignProofClaimerBatches: 20,
+    fanValueExpected: 10, fanValueOutstanding: 4, fanValueFailed: 1, fanValueFreshnessStatus: "PARTIAL" };
+  Object.assign(db._state(), retained);
+  await recordCampaignCollectionFailure({ db, job: currentJob, terminal: false,
+    error: new Error("provider timeout"), retryAfterAt: new Date("2026-09-08T20:04:00Z") });
+  const result = await acceptCampaignGeneration({ db, job: currentJob, deviceId: "reclaimed-device" });
+  assert.equal(result.resumed, true); assert.equal(result.state.status, "SCANNING");
+  assert.equal(result.state.retryAfterAt, null); assert.equal(result.state.lastErrorCode, null);
+  assert.equal(result.state.sourceDeviceId, "reclaimed-device");
+  for (const [key, value] of Object.entries(retained)) assert.deepEqual(result.state[key], value, key);
 });
 
 test("collector failure state preserves the Job retry boundary and terminal failure has no automatic retryAt", async () => {
