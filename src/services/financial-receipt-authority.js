@@ -52,6 +52,16 @@ function earningsTotals(totals) {
     grossCents: (totals.grossKnown ?? totals.count) - (undo?.grossKnown ?? undo?._count?._all ?? 0) === totals.count - (undo?._count?._all || 0)
       ? totals.grossCents - (undo?._sum?.amountCents || 0) : null, netCents: totals.netCents - (undo?._sum?.netCents || 0) };
 }
+function provenFrontier(state) { return date(state?.coverageThrough) || date(state?.baselineRangeTo); }
+function frontierGap(params, state) {
+  const bounds = [date(params.financialFrontierGapFrom), date(params.recoveryGapFrom), provenFrontier(state)].filter(Boolean);
+  return bounds.length ? new Date(Math.min(...bounds.map(Number))) : null;
+}
+function frontierContinuous(state, row) {
+  const through = provenFrontier(state), from = date(row.windows[0].comparisonFrom);
+  const comparedFrom = date(row.proof?.windows?.[0]?.comparisonFrom) || from;
+  return Boolean(through && from && comparedFrom && from <= through && comparedFrom <= through);
+}
 function planWindows(params, state) {
   const end = date(params.endDate) || date(params.collectionRequestedAt);
   if (!end) throw fault("FINANCIAL_WINDOW_END_INVALID");
@@ -67,7 +77,12 @@ function planWindows(params, state) {
   if (mode !== "catchup") return [window("FULL", params.financialTraversalVersion === 2 ? null : date(params.startDate) || FLOOR, end)];
   if (params.financialFrontierVersion === 2) {
     const from = params.financialTraversalVersion === 2 ? null : FLOOR;
-    const gap = date(params.financialFrontierGapFrom) || date(params.recoveryGapFrom) || date(state?.coverageThrough) || date(state?.baselineRangeTo);
+    const requestedGap = date(params.financialFrontierGapFrom) || date(params.recoveryGapFrom);
+    if (params.financialTraversalVersion === 2 && requestedGap > end)
+      throw fault("FINANCIAL_FRONTIER_BINDING_INVALID");
+    // A later offline episode does not prove an earlier failed catchup. The
+    // new comparison must bridge all the way back to continuous coverage.
+    const gap = frontierGap(params, state);
     // Earnings chart coordinates have second precision. Compare exactly that
     // same interval, including the fraction before the recorded gap boundary.
     const comparison = gap ? new Date(Math.floor(+gap / 1000) * 1000) : null;
@@ -111,16 +126,30 @@ function windowsFor(job) {
   return windows;
 }
 async function claimParams(db, job) {
+  let state;
   if (enabled(job) && job.params.financialWindowGeneration === job.params.collectionGeneration) {
     windowsFor(job);
     const legacyTraversal = !currentTraversal(job) && job.params.financialWindows[0].kind !== "RESOLUTION";
-    const existing = legacyTraversal && typeof db.financialReceiptRun?.findUnique === "function"
-      ? await db.financialReceiptRun.findUnique({ where: { id: runId(job) } }) : legacyTraversal;
+    const frontier = currentTraversal(job) && job.params.financialWindows[0].kind === "FRONTIER";
+    if (!legacyTraversal && !frontier) return job.params;
+    const existing = typeof db.financialReceiptRun?.findUnique === "function"
+      ? await db.financialReceiptRun.findUnique({ where: { id: runId(job) }, select: { id: true } }) : true;
     // Upgrade a command only before its first immutable receipt exists. An old
-    // already-filtered traversal must remain visible as filtered evidence.
-    if (!legacyTraversal || existing) return job.params;
+    // already-filtered or narrower traversal remains inspectable evidence.
+    if (existing) return job.params;
+    state = await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
+    if (frontier) {
+      const windows = planWindows(job.params, state);
+      if (date(windows[0].comparisonFrom) >= date(job.params.financialWindows[0].comparisonFrom)) return job.params;
+      // The claim owner already locks this job. With no receipt there is no
+      // collected evidence or checksum to change; keep its original identity,
+      // target and known-before timestamp, widening only the comparison.
+      const params = { ...job.params, financialFrontierGapFrom: frontierGap(job.params, state).toISOString(), financialWindows: windows };
+      windowsFor({ ...job, params });
+      return params;
+    }
   }
-  const state = await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
+  state ??= await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
   const params = { ...job.params, financialReceiptVersion: 1, financialTraversalVersion: 2, collectorVersion: COLLECTOR };
   delete params.knownTransactionIds; delete params.catchupMaxPages;
   if ((params.collectionMode || params.financialMode) === "catchup" && params.moneyResolutionVersion !== 1) params.financialFrontierVersion = 2;
@@ -130,7 +159,7 @@ async function claimParams(db, job) {
     // Known-before-start is checked against creator facts per bounded page.
     // A 300-ID sample cannot represent a large pre-existing financial history.
     params.financialFrontierKnownBefore = (require("./analytics-observation-time").observationStartForJob(job) || date(params.collectionRequestedAt)).toISOString();
-    params.financialFrontierGapFrom = (date(params.recoveryGapFrom) || date(state.coverageThrough) || date(state.baselineRangeTo))?.toISOString();
+    params.financialFrontierGapFrom = frontierGap(params, state)?.toISOString();
     delete params.financialFrontierKnownIds;
     params.financialFrontierBaselineGeneration=generation;
   }
@@ -356,13 +385,20 @@ async function completionProof(db, job) {
   if (!row || row.generation !== job.params.collectionGeneration || row.jobId !== job.id || row.agencyId !== job.agencyId || row.creatorId !== job.creatorId) return { complete: false, protocolCurrent: true };
   const filteredHistory = row.windows[0]?.kind === "FULL" && row.windows[0].from !== null;
   const legacyTraversal = !currentTraversal(job) && row.windows[0]?.kind !== "RESOLUTION";
-  const unavailableReason = filteredHistory ? "FINANCIAL_LEGACY_FILTERED_HISTORY" : legacyTraversal ? "FINANCIAL_LEGACY_FRONTIER_INCOMPLETE" : null;
+  let unavailableReason = filteredHistory ? "FINANCIAL_LEGACY_FILTERED_HISTORY" : legacyTraversal ? "FINANCIAL_LEGACY_FRONTIER_INCOMPLETE" : null;
+  if (!unavailableReason && row.windows[0]?.kind === "FRONTIER") {
+    const state = await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId }, select: { coverageThrough: true, baselineRangeTo: true } });
+    if (!frontierContinuous(state, row)) unavailableReason = "FINANCIAL_FRONTIER_COVERAGE_GAP";
+  }
   return { complete: !unavailableReason && row.cursor.phase === "done" && row.proof.complete === true, protocolCurrent: true, filteredHistory, unavailableReason, row };
 }
 function coverageUpdate(job, current, row, observedAt, now) {
   const head = row.windows[0];
-  if(head.kind==="FRONTIER") return {receiptCoverageVersion:1,coverageThrough:date(head.to),recentRangeTo:date(head.to),
-    recentRangeFrom:date(current?.recentRangeFrom)||date(current?.baselineRangeFrom)||FLOOR};
+  if (head.kind === "FRONTIER") {
+    if (!frontierContinuous(current, row)) throw fault("FINANCIAL_FRONTIER_COVERAGE_GAP");
+    return { receiptCoverageVersion: 1, coverageThrough: date(head.to), recentRangeTo: date(head.to),
+      recentRangeFrom: date(current?.recentRangeFrom) || date(current?.baselineRangeFrom) || FLOOR };
+  }
   const common = { receiptCoverageVersion: 1, recentRangeFrom: date(row.proof?.windows?.[0]?.oldestAt) || date(head.from), recentRangeTo: date(head.to) };
   if (head.kind === "FULL") return { ...common, coverageThrough: date(head.to), historyAuditCursor: date(row.proof?.windows?.[0]?.oldestAt) || date(head.from),
     historyAuditCycleStartedAt: null, historyAuditObservedAt: observedAt, historyAuditCompletedAt: now };

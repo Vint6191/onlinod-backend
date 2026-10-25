@@ -15,6 +15,7 @@ const pass = text => { checks.push(text); console.log("PASS", text); };
     require.cache[require.resolve(root + "/src/prisma")] = { exports: db };
     desktop = await require("../test-support/desktop-financial-handler.cjs").loadDesktopFinancialHandler(process.env.ONLINOD_DESKTOP_SOURCE || path.resolve(root, "../desktop168"));
     const control = require(root + "/src/services/analytics-collector-control-service"), receipts = require(root + "/src/services/financial-receipt-authority");
+    const { runRootCommit } = require(root + "/src/services/db-commit-kernel");
     const lease = require(root + "/src/services/job-lease-service"), publication = require(root + "/src/services/analytics-publication-service");
     const gen = require(root + "/src/services/earnings-generation-service"), now = new Date(Math.floor(Date.now()/1000)*1000);
     const s = await scope(db, { agencyId: "history-agency", creatorId: "history-creator", userId: "history-user" }), deviceId = "history-device";
@@ -22,11 +23,33 @@ const pass = text => { checks.push(text); console.log("PASS", text); };
     await db.workerDevice.create({ data: { id: deviceId, agencyId: s.agencyId, userId: s.userId, lastSeenAt: new Date() } });
     await db.deviceCreatorBinding.create({ data: { deviceId, agencyId: s.agencyId, creatorId: s.creatorId, sessionReadReady: true, lastSeenAt: new Date() } });
     const capabilities = { creatorEventDrivenSyncV2:true, financialWindowReceiptsV1:true, financialMoneyResolutionV1:true, financialTraversalV2:true };
-    async function start({ mode = "full", gapFrom = null, recoveryIntentId = null, recoveryTargetAt = now } = {}) {
+    async function start({ mode = "full", gapFrom = null, recoveryIntentId = null, endAt = now, recoveryTargetAt = endAt,
+      priorComparisonFrom = null, priorReceipt = false } = {}) {
+      let priorParams = {};
+      if (priorComparisonFrom) {
+        const current = await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: s.creatorId } });
+        priorParams = { financialReceiptVersion: 1, financialTraversalVersion: 2,
+          financialFrontierKnownBefore: new Date().toISOString(), financialFrontierGapFrom: priorComparisonFrom.toISOString(),
+          financialFrontierBaselineGeneration: current.lastCatchupGeneration || current.baselineGeneration,
+          financialWindows: [{ kind: "FRONTIER", from: null, to: endAt.toISOString(), initialMarker: String(+endAt / 1000),
+            comparisonFrom: new Date(Math.floor(+priorComparisonFrom / 1000) * 1000).toISOString() }] };
+      }
+      const command = control.buildCollectionCommand({collectorType:"FINANCIAL",collectionMode:mode,reason:"MANUAL_PROOF",now:new Date()});
       const created = await db.jobInstance.create({ data: { agencyId:s.agencyId, creatorId:s.creatorId, scope:"creator", jobKey:"financial_transactions_scan", status:"SCHEDULED",
-        params: { ...control.buildCollectionCommand({collectorType:"FINANCIAL",collectionMode:mode,reason:"MANUAL_PROOF",now:new Date()}),
-          endDate:now.toISOString(), earningsLedgerVersion:1, ...(recoveryIntentId ? { recoveryIntentId, recoveryTargetAt: recoveryTargetAt.toISOString() } : {}),
-          ...(mode === "catchup" ? {financialMode:mode,financialFrontierVersion:2,recoveryGapFrom:gapFrom.toISOString()} : {startDate:"2016-01-01 00:00:00"}) } } });
+        params: { ...command, endDate:endAt.toISOString(), earningsLedgerVersion:1,
+          ...(recoveryIntentId ? { recoveryIntentId, recoveryTargetAt: recoveryTargetAt.toISOString() } : {}),
+          ...(mode === "catchup" ? {financialMode:mode,financialFrontierVersion:2,recoveryGapFrom:gapFrom.toISOString()} : {startDate:"2016-01-01 00:00:00"}),
+          ...priorParams, ...(priorComparisonFrom ? { financialWindowGeneration: command.collectionGeneration } : {}) } } });
+      // Emulate a pre-upgrade durable binding. Its first receipt is the point
+      // after which even a wider correct scope must not replace its identity.
+      if (priorReceipt) await runRootCommit(db, async ({ tx }) => {
+        await receipts.enter(tx);
+        await tx.financialReceiptRun.create({ data: { id: receipts.runId(created), jobId: created.id, agencyId: s.agencyId, creatorId: s.creatorId,
+          generation: created.params.collectionGeneration, windows: created.params.financialWindows, cursor: receipts.initialCursor(created),
+          proof: { complete: false, version: 2, historyRead: false, traversalComplete: false, verification: "PENDING",
+            windows: [{ count: 0, storedOnly: 0, grossKnown: 0, grossCents: 0, netCents: 0, feeCents: 0,
+              statusGroups: {}, typeGroups: {}, pages: 0, received: 0, rejected: 0, exhausted: false, charts: {} }] } } });
+      });
       if (recoveryIntentId) await db.creatorRecoveryIntent.create({ data: { id: recoveryIntentId, agencyId: s.agencyId, creatorId: s.creatorId,
         stream: "financial", reason: "OFFLINE_GAP", gapFrom: gapFrom || new Date(+now-3600000), targetAt: recoveryTargetAt, status: "RUNNING", jobId: created.id, policyVersion: 2 } });
       const claimed = await lease.claimJob({ userId:s.userId, deviceId, jobKeys:["financial_transactions_scan"], capabilities });
@@ -59,6 +82,53 @@ const pass = text => { checks.push(text); console.log("PASS", text); };
       return db.jobInstance.findUnique({where:{id:run.job.id}});
     }
     const money=(id,at,amount=10)=>({id,amount,net:amount*.8,fee:amount*.2,status:"done",createdAt:at.toISOString(),descriptionDetails:{type:"tip"},user:{id:"42"}});
+    // Exact recovery-window coordinates from the 25 Oct log. Provider rows are
+    // explicit synthetic evidence, not a claim about the real missing $3 row.
+    const lastProven = new Date("2026-10-20T19:09:42.000Z"), laterGap = new Date("2026-10-23T20:55:30.628Z"), laterTarget = new Date("2026-10-25T14:49:22.000Z");
+    const known = money("continuity-baseline", new Date("2026-10-20T18:00:00Z"), 5);
+    const missingThree = money("continuity-missing-three", new Date("2026-10-21T10:00:00Z"), 3);
+    const previouslySeen = [money("continuity-first", new Date("2026-10-22T17:57:52Z"), 10), money("continuity-second", new Date("2026-10-21T18:00:00Z"), 13)];
+    const latest = money("continuity-later-episode", new Date("2026-10-23T22:00:00Z"), 7);
+    const oldBaseline = await start({ endAt: lastProven });
+    await step(oldBaseline, { list: [known], hasMore: false }); await charts(oldBaseline, { gross: 5, net: 4, count: 1 }); await finish(oldBaseline);
+    const stateNow = () => db.creatorFinancialCollectionState.findUnique({ where: { creatorId: s.creatorId } });
+    assert.equal((await stateNow()).coverageThrough.toISOString(), lastProven.toISOString());
+    const missingRun = await start({ mode: "catchup", gapFrom: new Date("2026-10-20T20:57:39Z"), endAt: new Date("2026-10-23T20:49:45Z"), recoveryIntentId: "continuity-old-failed" });
+    await step(missingRun, { list: [...previouslySeen, known], hasMore: false }); await charts(missingRun, { gross: 26, net: 20.8, count: 3 });
+    const missingDone = await finish(missingRun, "FAILED"), oldFailure = structuredClone(missingDone.result);
+    assert.equal(missingDone.result.completionSideEffect.verification, "MISMATCH");
+    assert.deepEqual(missingDone.result.completionSideEffect.reconciliation.observed, { transactionsCount: 2, grossCents: 2300, netCents: 1840 });
+    assert.equal((await stateNow()).coverageThrough.toISOString(), lastProven.toISOString());
+    assert.equal(await gen.activeEntry(db, s.creatorId, missingThree.id), null);
+    pass("the logged $3 gross/$2.40 net mismatch remains terminal and does not advance the last continuous financial proof");
+    const narrow = await start({ mode: "catchup", gapFrom: laterGap, endAt: laterTarget, recoveryIntentId: "continuity-narrow",
+      priorComparisonFrom: laterGap, priorReceipt: true });
+    assert.equal(narrow.job.params.financialWindows[0].comparisonFrom, "2026-10-23T20:55:30.000Z");
+    await step(narrow, { list: [latest, known], hasMore: false }); await charts(narrow, { gross: 7, net: 5.6, count: 1 });
+    const narrowReceipt = await db.financialReceiptRun.findUnique({ where: { id: receipts.runId(narrow.job) } });
+    assert.equal(narrowReceipt.proof.complete, true); // matching money inside the narrower window alone
+    const narrowDone = await finish(narrow, "FAILED");
+    assert.equal(narrowDone.attempts, 1); assert.equal(narrowDone.result.completionSideEffect.error, "FINANCIAL_FRONTIER_COVERAGE_GAP");
+    assert.equal(narrowDone.result.completionSideEffect.published, false);
+    assert.deepEqual(await db.financialReceiptRun.findUnique({ where: { id: narrowReceipt.id } }), narrowReceipt);
+    assert.equal((await stateNow()).coverageThrough.toISOString(), lastProven.toISOString());
+    assert.equal(await gen.activeEntry(db, s.creatorId, latest.id), null);
+    assert.equal((await db.creatorRecoveryIntent.findUnique({ where: { id: "continuity-narrow" } })).status, "STOPPED");
+    const narrowDiagnostics = require(root + "/src/services/financial-verification-diagnostics").financialVerificationDiagnostics(narrowDone.result.completionSideEffect);
+    assert(narrowDiagnostics.reasons.includes("FINANCIAL_FRONTIER_COVERAGE_GAP"));
+    pass("a matching but disconnected immutable receipt terminates without publication, retry, coverage advance or evidence rewrite");
+    const wider = await start({ mode: "catchup", gapFrom: laterGap, endAt: laterTarget, recoveryIntentId: "continuity-repaired", priorComparisonFrom: laterGap });
+    assert.equal(wider.job.params.financialWindows[0].comparisonFrom, lastProven.toISOString());
+    assert.equal(wider.checkpoint.jobContinuation.comparisonFrom, lastProven.toISOString());
+    await step(wider, { list: [latest, ...previouslySeen, missingThree, known], hasMore: false }); await charts(wider, { gross: 33, net: 26.4, count: 4 });
+    const widerDone = await finish(wider);
+    assert.equal(widerDone.params.collectionGeneration, wider.job.params.collectionGeneration);
+    assert.equal((await stateNow()).coverageThrough.toISOString(), laterTarget.toISOString());
+    assert.equal((await db.creatorRecoveryIntent.findUnique({ where: { id: "continuity-repaired" } })).status, "COMPLETE");
+    assert.equal(Number((await gen.activeEntry(db, s.creatorId, missingThree.id)).netCents), 240);
+    assert.equal(Number((await gen.activeEntry(db, s.creatorId, latest.id)).netCents), 560);
+    assert.deepEqual((await db.jobInstance.findUnique({ where: { id: missingRun.job.id } })).result, oldFailure);
+    pass("an existing pending command without a receipt rebinds at claim and verifies 20–25 Oct as one interval, preserving the older failed evidence");
     const recent=money("recent",new Date(+now-3600000)), historic=money("before-2016",new Date("2015-02-03T04:00:00Z"),5);
     const full=await start();
     for(const bad of [{hasMore:false},{list:{},hasMore:false},{list:[],hasMore:0},{list:[]}]) {
@@ -159,7 +229,6 @@ const pass = text => { checks.push(text); console.log("PASS", text); };
     await charts(firstSale,{gross:10,net:8,count:1,category:"chat_messages"}); await finish(firstSale);
     const sale=await db.creatorSale.findUnique({where:{creatorId_externalTransactionId:{creatorId:s.creatorId,externalTransactionId:message.id}}});
     assert.equal(sale.messageId,null);
-    const {runRootCommit}=require(root+"/src/services/db-commit-kernel");
     // Persist a late exact link as an older owner could have done before the
     // reverse feed existed. The repeated payout itself does not change.
     await runRootCommit(db,async({tx})=>{

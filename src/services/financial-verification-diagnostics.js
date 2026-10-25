@@ -33,6 +33,7 @@ function financialVerificationDiagnostics(value) {
   const reject = (condition, reason) => { if (!source.ok && condition) reasons.add(reason); };
   reject(source.error === "FINANCIAL_LEGACY_FILTERED_HISTORY", "FINANCIAL_LEGACY_FILTERED_HISTORY");
   reject(source.error === "FINANCIAL_LEGACY_FRONTIER_INCOMPLETE", "FINANCIAL_LEGACY_FRONTIER_INCOMPLETE");
+  reject(source.error === "FINANCIAL_FRONTIER_COVERAGE_GAP", "FINANCIAL_FRONTIER_COVERAGE_GAP");
   reject(source.protocolCurrent === false, "FINANCIAL_RECEIPT_PROTOCOL_REQUIRED");
   reject(source.sourceBoundaryReached === false && source.traversalComplete !== true, "FINANCIAL_SOURCE_BOUNDARY_NOT_REACHED");
   reject(source.verification === "UNAVAILABLE", "FINANCIAL_COMPARISON_SCOPE_UNAVAILABLE");
