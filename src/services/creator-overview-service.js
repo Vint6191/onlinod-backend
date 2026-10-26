@@ -305,12 +305,13 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
   const end = new Date(ledger.range.endAt);
   const eventBetween = { gte: start, lte: end };
 
-  const [creator, publishedFinancial, campaignPage, financialCollectionState, campaignCollectionState] = await Promise.all([
+  const [creator, publishedFinancial, campaignPage, financialCollectionState, campaignCollectionState, audience] = await Promise.all([
     db.creatorAccount.findUnique({ where: { id: creatorId }, select: { id: true, createdAt: true, updatedAt: true } }),
     require("./published-financial-read-repository").readPublishedFinancialSummary({ db, creatorId, from: start, to: end }),
     require("./campaign-read-repository").readCampaignPage({ db, creatorId, rangeKey: range, now }),
     db.creatorFinancialCollectionState?.findUnique ? db.creatorFinancialCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
     db.creatorCampaignCollectionState?.findUnique ? db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
+    require("./published-subscriber-summary").readCreatorAudience({ db, creatorId, now }),
   ]);
 
   const currentNotificationParser = ledger.notificationSync?.normalizerVersion === "notification-source-v2";
@@ -342,6 +343,9 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
   activity.comments = int(ledger.totals.commentsCount);
 
   const finance = publishedFinancial.finance;
+  const { comparison, financialRange } = await require("./creator-overview-comparison").readCreatorFinancialReadState({
+    db, creatorId, range, now, current: publishedFinancial,
+  });
 
   return {
     ok: true,
@@ -355,6 +359,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
       { key: "365d", label: "1Y", enabled: oneYearAvailable, reason: oneYearAvailable ? null : "Available after NOD has accumulated a full year of activity coverage" },
     ],
     coverage: {
+      financialRange,
       notificationVerified: notificationCollection.proven === true,
       financialWindows: financialCoverage,
       factPublicationReady: ledger.factPublication?.ready === true,
@@ -383,6 +388,8 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     },
     activity,
     finance,
+    comparison,
+    audience,
     campaigns: campaignPage,
     daily: {
       metrics: (ledger.daily?.metrics || []).map((row) => ({

@@ -318,9 +318,9 @@ async function homeReadContext({ db, agencyId, member, rangeKey }) {
   return { db, agencyId, member: current, billing, now, range: displayRangeBounds(key, now),
     previous: previousDisplayRange(key, now), money, team, audit, manage, refresh, owner: isOwner(current) };
 }
-async function buildHomeCreatorPage({ agencyId, member, rangeKey = "7d", after = null, limit = 50, db = prisma }) {
+async function buildHomeCreatorPage({ agencyId, member, rangeKey = "7d", after = null, limit = 50, search = "", trend = "all", includeRevenuePoints = false, db = prisma }) {
   const { pageInput, readHomeCreatorPage } = require("./home-read-repository");
-  const page = pageInput({ after, limit });
+  const page = pageInput({ after, limit, search, trend, includeRevenuePoints });
   const ctx = await homeReadContext({ db, agencyId, member, rangeKey });
   const result = await require("./home-read-cache").readHomeCached(ctx,"creators",()=>readHomeCreatorPage({ ...ctx, ...page }),page);
   await require("./home-scope-repository").readHomeAuthority(ctx);
@@ -331,9 +331,10 @@ async function buildHomeSummary({ agencyId, member, rangeKey = "7d", db = prisma
   const ctx = await homeReadContext({ db, agencyId, member, rangeKey });
   const { now, range, money, team, audit, manage, refresh, owner } = ctx;
   const { readHomeTotals, readHomeJobCounts } = require("./home-read-repository");
-  const [agency, revenue, members, jobsByStatus, devices, onlineDevices, latestAudit, subscription] = await Promise.all([
+  const [agency, revenue, audience, members, jobsByStatus, devices, onlineDevices, latestAudit, subscription] = await Promise.all([
     db.agency.findUnique({ where: { id: agencyId }, select: { id:true, name:true, plan:true, status:true } }),
     require("./home-read-cache").readHomeCached(ctx,"totals",()=>readHomeTotals(ctx)),
+    require("./home-read-cache").readHomeCached(ctx,"audience",()=>require("./published-subscriber-summary").readHomeAudience(ctx)),
     team || owner ? db.agencyMember.count({ where: { agencyId, deletedAt:null, deactivatedAt:null } }) : 0,
     manage ? readHomeJobCounts(ctx) : {},
     manage ? db.workerDevice.count({ where: { agencyId } }) : null,
@@ -350,9 +351,10 @@ async function buildHomeSummary({ agencyId, member, rangeKey = "7d", db = prisma
     agency: {id:agencyId,name:agency?.name ?? null,plan:owner ? agency?.plan ?? null:null,status:agency?.status ?? null,billingAvailable:owner},
     range:{key:range.rangeKey,label:range.rangeKey==="today"?"Today":range.rangeKey,from:range.startDay.toISOString(),to:range.endAt.toISOString(),previousKey:range.rangeKey},
     refreshedAt:now.toISOString(),
+    audience,
     creatorScope:{broad:ctx.member.broad,mode:"current_membership",accessEpoch:ctx.member.accessEpoch,totalCreators:revenue.totalCreators,creatorIds:[]},
     revenue:{...availability(money,money?null:"FORBIDDEN"),refreshAllowed:money&&refresh,totalCents:revenue.totalCents,grossCents:null,
-      deltaPct:revenue.deltaPct,currency:"USD",salesCount:null,uniqueFans:null,creatorCount:revenue.reportingCreators,points:revenue.points,
+      deltaPct:revenue.deltaPct,medianCreatorRevenueCents:revenue.medianCreatorRevenueCents,currency:"USD",salesCount:null,uniqueFans:null,creatorCount:revenue.reportingCreators,points:revenue.points,
       coverage:{totalCreators:revenue.totalCreators,reportingCreators:revenue.reportingCreators,pendingCount:revenue.pendingCount,staleCreators:revenue.staleCreators},
       pending:{count:revenue.pendingCount,creatorIds:[],jobs:[],etaSeconds:null},stalenessMs:CURRENT_DAY_FRESHNESS_MS,source:money?"creator_earnings_daily":"forbidden"},
     seats:owner?{...availability(true),used:members,limit:seatsLimit,remaining:seatsLimit===null?null:Math.max(0,Number(seatsLimit)-members),source:seatsLimit===null?"members_only":"subscription"}

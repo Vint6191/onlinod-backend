@@ -32,3 +32,15 @@ test("committed invalidation prevents a late old read from repopulating cache an
  release(10);assert.equal(await old,10);assert.equal(await readHomeCached(ctx,"totals",async()=>99),20);
  assert.equal(await readHomeCached(other,"totals",async()=>99),7);
 });
+
+
+test('creator directory cache separates global search/trend and optional chart payloads',async()=>{
+ const context=scope();let calls=0;const read=async()=>++calls;
+ const page={after:'',limit:20,search:'',trend:'all',includeRevenuePoints:false};
+ assert.equal(await readHomeCached(context,'creators',read,page),1);
+ assert.equal(await readHomeCached(context,'creators',read,{...page,search:'Anna'}),2);
+ assert.equal(await readHomeCached(context,'creators',read,{...page,trend:'increasing'}),3);
+ assert.equal(await readHomeCached(context,'creators',read,{...page,trend:'declining'}),4);
+ assert.equal(await readHomeCached(context,'creators',read,{...page,includeRevenuePoints:true}),5);
+ assert.equal(await readHomeCached(context,'creators',read,page),1);
+});

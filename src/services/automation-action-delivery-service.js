@@ -1543,24 +1543,37 @@ async function releaseActionDelivery(input) {
   return { ok: true, delivery: updated };
 }
 
-async function listActionDeliveries({ agencyId, creatorId, creatorIds = null, moduleKey, actionType, status, deviceId, fan, offset = 0, limit = 100 }) {
+async function listActionDeliveries({ agencyId, creatorId, creatorIds = null, moduleKey, actionType, status, view, deviceId, fan, offset = 0, limit = 100 }) {
   const take = Math.max(1, Math.min(500, Number(limit) || 100));
   const skip = Math.max(0, Number(offset) || 0);
   const search = clean(fan, 160);
+  const viewStatuses = view === "queue"
+    ? ["QUEUED", "CLAIMED", "RUNNING", "COMMITTING", "RECONCILE_REQUIRED", "RETRY_SCHEDULED", "PAUSED"]
+    : view === "history" ? ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"] : null;
+  if (view && !viewStatuses) throw new ActionDeliveryError("DELIVERY_VIEW_INVALID", "Choose queue or history", 400);
+  const selectedStatuses = status ? (Array.isArray(status) ? status : [status]) : null;
+  if (viewStatuses && selectedStatuses?.some(value => !viewStatuses.includes(value))) {
+    throw new ActionDeliveryError("DELIVERY_STATUS_VIEW_MISMATCH", "This status does not belong to the selected view", 400);
+  }
+  const statusFilter = selectedStatuses
+    ? (Array.isArray(status) ? { in: selectedStatuses } : status)
+    : viewStatuses ? { in: viewStatuses } : null;
   const where = {
     agencyId,
     originKind: "AUTOMATION",
     ...(creatorId ? { creatorId } : Array.isArray(creatorIds) ? { creatorId: { in: creatorIds } } : {}),
     ...(moduleKey ? { moduleKey } : {}),
     ...(actionType ? { actionType } : {}),
-    ...(status ? { status: Array.isArray(status) ? { in: status } : status } : {}),
+    ...(statusFilter ? { status: statusFilter } : {}),
     ...(deviceId ? { claimedByDeviceId: deviceId } : {}),
     ...(search ? { OR: [{ fanId: { contains: search, mode: "insensitive" } }, { targetId: { contains: search, mode: "insensitive" } }] } : {}),
   };
   const [items, count] = await Promise.all([
     prisma.automationDelivery.findMany({
       where,
-      orderBy: [{ priority: "desc" }, { notBefore: "asc" }, { createdAt: "desc" }],
+      orderBy: view === "history"
+        ? [{ finishedAt: { sort: "desc", nulls: "last" } }, { updatedAt: "desc" }, { id: "desc" }]
+        : [{ priority: "desc" }, { notBefore: "asc" }, { createdAt: "desc" }, { id: "desc" }],
       skip,
       take,
       select: {

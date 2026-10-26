@@ -2,8 +2,10 @@
 const { scopeSql, scopeParams } = require('./home-scope-repository');
 const { CURRENT_DAY_FRESHNESS_MS, RECENT_CLOSED_FRESHNESS_MS, HISTORICAL_FRESHNESS_MS } = require('./analytics-freshness-policy');
 const { earningsObservationSql } = require('./analytics-observation-time');
+const { percentChange, revenueComparison } = require('./analytics-comparison');
+const { subscriberHeadColumns, subscriberHeadJoins, audienceFromRow } = require('./published-subscriber-summary');
 const MAX_PAGE_SIZE = 100;
-function pageInput({ after = null, limit = 50 } = {}) {
+function pageInput({ after = null, limit = 50, search = '', trend = 'all', includeRevenuePoints = false } = {}) {
   if (after != null && (typeof after !== 'string' || after.length > 180 || /[\x00-\x1f]/.test(after))) {
     throw Object.assign(new Error('HOME_CURSOR_INVALID'), { code: 'HOME_CURSOR_INVALID', status: 400 });
   }
@@ -11,7 +13,11 @@ function pageInput({ after = null, limit = 50 } = {}) {
   if (!Number.isInteger(size) || size < 1 || size > MAX_PAGE_SIZE) {
     throw Object.assign(new Error('HOME_PAGE_SIZE_INVALID'), { code: 'HOME_PAGE_SIZE_INVALID', status: 400 });
   }
-  return { after: after || '', limit: size };
+  if (typeof search !== 'string' || search.length > 100 || /[\x00-\x1f]/.test(search)
+      || !['all','increasing','declining'].includes(trend) || typeof includeRevenuePoints !== 'boolean') {
+    throw Object.assign(new Error('HOME_CREATOR_FILTER_INVALID'), { code:'HOME_CREATOR_FILTER_INVALID', status:400 });
+  }
+  return { after: after || '', limit: size, search:search.trim(), trend, includeRevenuePoints };
 }
 // Each period is at most 90 days. SQL reduces all visible canonical rows to one
 // aggregate and at most 90 chart points; no creator-sized arrays cross the wire.
@@ -75,7 +81,7 @@ async function readHomeTotals(input) {
   const { db, money, manage } = input;
   if (!money) {
     const [row] = await db.$queryRawUnsafe(`${scopeSql()} SELECT COUNT(*) AS total FROM visible`, ...scopeParams(input));
-    return { totalCreators: number(row.total), reportingCreators:0, staleCreators:0, pendingCount:0, totalCents:null, deltaPct:null, points:[] };
+    return { totalCreators: number(row.total), reportingCreators:0, staleCreators:0, pendingCount:0, totalCents:null, deltaPct:null, medianCreatorRevenueCents:null, points:[] };
   }
   const row = await require("./home-ledger-totals").read(db,revenueParams(input),pendingSql) || (await db.$queryRawUnsafe(`${scopeSql()}${revenueSql()}${pendingSql()}
     , totals AS (SELECT period,COUNT(*) AS total,COUNT(*) FILTER (WHERE usable) AS reporting,
@@ -88,7 +94,8 @@ async function readHomeTotals(input) {
       AND bool_and("hourlyPoints" IS NOT NULL OR "totalCents"=0)
       AND bool_or("hourlyPoints" IS NOT NULL)) AS ready FROM daily WHERE period=0)
     SELECT COALESCE(c.total,0) AS total,COALESCE(c.reporting,0) AS reporting,COALESCE(c.stale,0) AS stale,
-      c.cents,COALESCE(p.total,0) AS previous_total,COALESCE(p.reporting,0) AS previous_reporting,
+      c.cents,(SELECT round((percentile_cont(0.5) WITHIN GROUP (ORDER BY cents))::numeric)::bigint
+        FROM facts WHERE period=0 AND usable) AS median_cents,COALESCE(p.total,0) AS previous_total,COALESCE(p.reporting,0) AS previous_reporting,
       COALESCE(p.stale,0) AS previous_stale,p.cents AS previous_cents,(SELECT COUNT(*) FROM pending) AS pending,
       CASE WHEN c.total=c.reporting AND (SELECT ready FROM hourly_ready) THEN
         (SELECT jsonb_agg(jsonb_build_object('label',label,'valueCents',cents) ORDER BY label) FROM hourly)
@@ -97,25 +104,39 @@ async function readHomeTotals(input) {
   const total = number(row.total), reporting = number(row.reporting), stale = number(row.stale);
   const complete = total === reporting, previousComplete = total === number(row.previous_total) && total === number(row.previous_reporting);
   const cents = complete ? number(row.cents) : null, prev = previousComplete ? number(row.previous_cents) : null;
-  const deltaPct = complete && previousComplete && !stale && !number(row.previous_stale) && prev
-    ? Math.round(((cents-prev)/prev)*1000)/10 : null;
+  const deltaPct = complete && previousComplete && !stale && !number(row.previous_stale)
+    ? percentChange(cents,prev) : null;
   return { totalCreators:total, reportingCreators:reporting, staleCreators:stale, pendingCount:number(row.pending),
-    totalCents:cents, deltaPct, points: (row.points || []).map(p=>({label:p.label,valueCents:number(p.valueCents)})) };
+    totalCents:cents, deltaPct, medianCreatorRevenueCents:complete && total>0 && !stale && row.median_cents!=null ? number(row.median_cents) : null, points: (row.points || []).map(p=>({label:p.label,valueCents:number(p.valueCents)})) };
 }
 async function readHomeCreatorPage(input) {
   const { db, money } = input, page = pageInput(input);
-  const prefix = `${scopeSql({ cursor:true, cursorParameter:12, broad:typeof input.member.broad === "boolean" ? input.member.broad : null })}, page_candidates AS MATERIALIZED (SELECT "id","agencyId","displayName","username","avatarUrl","status","remoteId" FROM visible
-    WHERE "id">$12::text ORDER BY "id" LIMIT $13), page AS MATERIALIZED (SELECT * FROM page_candidates ORDER BY "id" LIMIT $14)`;
-  const sql = money ? `${prefix}${revenueSql('page')}${pendingSql('page')}
-    SELECT c.*,f.usable,f.fresh,f.cents,f.captured,f.observed,(p."id" IS NOT NULL) AS pending,
-      (SELECT COUNT(*)>$14 FROM page_candidates) AS more FROM page c
-    JOIN facts f ON f."id"=c."id" AND f.period=0 LEFT JOIN pending p ON p."id"=c."id" ORDER BY c."id"`
-    : `${prefix} SELECT c.*,false AS usable,false AS fresh,false AS pending,(SELECT COUNT(*)>$14 FROM page_candidates) AS more FROM page c ORDER BY c."id"`;
-  // Parameters are typed even on the no-money branch (PostgreSQL extended protocol).
-  const query = money ? sql : sql.replace('SELECT c.*,false', `SELECT ($6::timestamptz AT TIME ZONE 'UTC')::date AS unused6,($7::timestamptz AT TIME ZONE 'UTC')::date AS unused7,($8::timestamptz AT TIME ZONE 'UTC')::date AS unused8,($9::timestamptz AT TIME ZONE 'UTC')::date AS unused9,($10::timestamptz AT TIME ZONE 'UTC')::date AS unused10,($11::timestamptz AT TIME ZONE 'UTC') AS unused11,c.*,false`);
-  const rows = await db.$queryRawUnsafe(query,...revenueParams(input),page.after,page.limit+1,page.limit);
+  if (!money && page.trend !== 'all') return { creators:[], nextCursor:null, limit:page.limit, order:'id_asc' };
+  const { readHomeTrendRows, literalSearch, searchSql } = require('./home-creator-trend-read');
+  let rows;
+  if (page.trend !== 'all') {
+    rows = await readHomeTrendRows(input,page,{revenueSql,pendingSql,revenueParams});
+  } else {
+    const prefix = `${scopeSql({ cursor:true, cursorParameter:12, broad:typeof input.member.broad === "boolean" ? input.member.broad : null })}, page_candidates AS MATERIALIZED (SELECT "id","agencyId","displayName","username","avatarUrl","status","remoteId" FROM visible
+      WHERE "id">$12::text AND ${searchSql()} ORDER BY "id" LIMIT $13), page AS MATERIALIZED (SELECT * FROM page_candidates ORDER BY "id" LIMIT $14)`;
+    const sql = money ? `${prefix}${revenueSql('page')}${pendingSql('page')}
+      SELECT c.*,f.usable,f.fresh,f.cents,f.captured,f.observed,(p."id" IS NOT NULL) AS pending,${subscriberHeadColumns()},
+        prior.usable AS previous_usable,prior.fresh AS previous_fresh,prior.cents AS previous_cents,
+        CASE WHEN $17::boolean AND f.usable THEN (SELECT jsonb_agg(jsonb_build_object('label',to_char(d.date,'YYYY-MM-DD'),'valueCents',d."totalCents") ORDER BY d.date)
+          FROM daily d WHERE d."creatorId"=c.id AND d.period=0) ELSE '[]'::jsonb END AS points,
+        $16::text AS filter_trend,(SELECT COUNT(*)>$14 FROM page_candidates) AS more FROM page c
+      JOIN facts f ON f."id"=c."id" AND f.period=0 LEFT JOIN facts prior ON prior.id=c.id AND prior.period=1
+      LEFT JOIN pending p ON p."id"=c."id" ${subscriberHeadJoins()} ORDER BY c."id"`
+      : `${prefix} SELECT c.*,false AS usable,false AS fresh,false AS pending,$16::text AS filter_trend,$17::boolean AS include_points,(SELECT COUNT(*)>$14 FROM page_candidates) AS more FROM page c ORDER BY c."id"`;
+    // Parameters are typed even on the no-money branch (PostgreSQL extended protocol).
+    const query = money ? sql : sql.replace('SELECT c.*,false', `SELECT ($6::timestamptz AT TIME ZONE 'UTC')::date AS unused6,($7::timestamptz AT TIME ZONE 'UTC')::date AS unused7,($8::timestamptz AT TIME ZONE 'UTC')::date AS unused8,($9::timestamptz AT TIME ZONE 'UTC')::date AS unused9,($10::timestamptz AT TIME ZONE 'UTC')::date AS unused10,($11::timestamptz AT TIME ZONE 'UTC') AS unused11,c.*,false`);
+    rows = await db.$queryRawUnsafe(query,...revenueParams(input),page.after,page.limit+1,page.limit,literalSearch(page.search),page.trend,page.includeRevenuePoints);
+  }
   const creators = rows.map(c=>({id:c.id,name:c.displayName,displayName:c.displayName,username:c.username,avatarUrl:c.avatarUrl,status:c.status,remoteId:c.remoteId,
     revenueCents:c.usable?number(c.cents):null,salesCount:null,uniqueFans:null,capturedAt:c.usable?c.captured:null,
+    subscriberCount:audienceFromRow(c).subscriberCount,subscribersUpdatedAt:audienceFromRow(c).publishedAt,subscribersStale:audienceFromRow(c).stale,
+    ...revenueComparison(number(c.cents),number(c.previous_cents),c.usable===true&&c.fresh===true&&c.previous_usable===true&&c.previous_fresh===true),
+    revenuePoints:page.includeRevenuePoints && c.usable ? (c.points||[]).map(point=>({label:point.label,valueCents:number(point.valueCents)})) : [],
     hasRevenue:c.usable===true,pending:c.pending===true,stale:c.usable===true&&!c.fresh,
     staleSeconds:c.usable&&!c.fresh&&c.observed?Math.max(0,Math.floor((input.now-new Date(c.observed))/1000)):null}));
   return { creators, nextCursor:rows[0]?.more?rows.at(-1).id:null, limit:page.limit, order:'id_asc' };

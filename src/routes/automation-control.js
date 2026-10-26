@@ -635,6 +635,7 @@ router.post("/likes/:creatorId/candidates/:candidateId/action", seniorRequired, 
 });
 
 const deliveryQuerySchema = z.object({
+  view: z.enum(["queue", "history"]).optional(),
   creatorId: z.string().max(160).optional(),
   moduleKey: z.string().max(80).optional(),
   actionType: z.string().max(80).optional(),
@@ -712,6 +713,7 @@ router.get("/deliveries", async (req, res) => {
       moduleKey: query.moduleKey || null,
       actionType: query.actionType || null,
       status: query.status || null,
+      view: query.view,
       deviceId: query.deviceId || null,
       fan: query.fan || null,
       offset: query.offset || 0,

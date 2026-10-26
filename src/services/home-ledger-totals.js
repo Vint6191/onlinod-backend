@@ -15,12 +15,15 @@ async function read(db,params,pendingSql) {
        a."fromAt"::date<=r.start_day AND ${coverageThroughSql()}::date>=r.end_day AS usable,
        ${freshSql("$11")} AS fresh FROM visible c CROSS JOIN periods r LEFT JOIN ledger_authority a ON a.id=c.id
    ), values_by_day AS MATERIALIZED (
-     SELECT f.period,e.date,e."netCents" AS cents FROM facts f JOIN "CreatorEarningsGenerationDay" e
+     SELECT f.id,f.period,e.date,e."netCents" AS cents FROM facts f JOIN "CreatorEarningsGenerationDay" e
        ON e.generation=f."activeGeneration" AND e.date BETWEEN f.start_day AND f.end_day
        WHERE f.usable AND (SELECT ready FROM eligibility)
-     UNION ALL SELECT f.period,e.hour::date,e."netCents" FROM facts f JOIN "CreatorEarningsLedgerHour" e
+     UNION ALL SELECT f.id,f.period,e.hour::date,e."netCents" FROM facts f JOIN "CreatorEarningsLedgerHour" e
        ON e."creatorId"=f.id AND e.hour>=f.start_day AND e.hour<f.end_day+1
        WHERE f."activeGeneration" IS NULL AND f.usable AND (SELECT ready FROM eligibility)
+   ), creator_values AS (SELECT id,period,SUM(cents) AS cents FROM values_by_day GROUP BY id,period),
+   median AS (SELECT round((percentile_cont(0.5) WITHIN GROUP (ORDER BY COALESCE(v.cents,0)))::numeric)::bigint AS cents
+     FROM facts f LEFT JOIN creator_values v ON v.id=f.id AND v.period=f.period WHERE f.period=0 AND f.usable
    ), stats AS (SELECT period,count(*) AS total,count(*) FILTER(WHERE usable) AS reporting,
        count(*) FILTER(WHERE usable AND NOT fresh) AS stale FROM facts GROUP BY period),
    sums AS (SELECT period,SUM(cents) AS cents FROM values_by_day GROUP BY period),
@@ -33,7 +36,7 @@ async function read(db,params,pendingSql) {
    ), chart_hours AS (SELECT hour,SUM(cents) AS cents FROM hour_values GROUP BY hour)
    ${pendingSql()}
    SELECT (SELECT ready FROM eligibility) AS "fastReady",COALESCE(c.total,0) AS total,COALESCE(c.reporting,0) AS reporting,
-     COALESCE(c.stale,0) AS stale,COALESCE(s.cents,0) AS cents,
+     COALESCE(c.stale,0) AS stale,COALESCE(s.cents,0) AS cents,(SELECT cents FROM median) AS median_cents,
      COALESCE(p.total,0) AS previous_total,COALESCE(p.reporting,0) AS previous_reporting,COALESCE(p.stale,0) AS previous_stale,
      COALESCE(ps.cents,0) AS previous_cents,(SELECT count(*) FROM pending) AS pending,
      CASE WHEN COALESCE(c.total,0)=0 OR c.total<>c.reporting THEN '[]'::jsonb WHEN $6::timestamptz=$7::timestamptz THEN (

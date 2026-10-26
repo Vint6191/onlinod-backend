@@ -33,7 +33,9 @@ router.get("/creators", async (req, res) => {
     const agencyId = String(req.auth?.agencyId || "");
     if (req.query.agencyId && String(req.query.agencyId) !== agencyId) return res.status(403).json({ok:false,code:"AGENCY_FORBIDDEN"});
     return res.json(await buildHomeCreatorPage({ agencyId, member:currentMember(req), rangeKey:req.query.range||"7d",
-      after:req.query.after ?? null, limit:req.query.limit === undefined ? 50 : Number(req.query.limit) }));
+      after:req.query.after ?? null, limit:req.query.limit === undefined ? 50 : Number(req.query.limit),
+      search:req.query.search ?? '', trend:req.query.trend ?? 'all',
+      includeRevenuePoints:req.query.includeRevenuePoints === undefined ? false : req.query.includeRevenuePoints === 'true' ? true : req.query.includeRevenuePoints === 'false' ? false : req.query.includeRevenuePoints }));
   } catch (error) {
     return res.status(Number(error?.status)||500).json({ok:false,code:error?.code||"HOME_CREATORS_FAILED",error:error?.message||"Failed"});
   }
