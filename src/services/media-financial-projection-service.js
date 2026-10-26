@@ -295,15 +295,19 @@ async function processPage({ db, item, ownerToken }) {
   }, { profile: "JOB_CHUNK", timeout: 15000, authority: { kind: WORK_CLASS, agencyId: item.agencyId, creatorId: item.creatorId } });
 }
 
-async function financialProjectionReady(db, creatorId) {
-  const [row] = await db.$queryRawUnsafe(`SELECT NOT (
-    EXISTS(SELECT 1 FROM "CreatorMediaMessageFinancialState" WHERE "creatorId"=$1 AND dirty)
-    OR EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1 AND "completedAt" IS NULL)
+async function financialProjectionState(db, creatorId) {
+  const [row] = await db.$queryRawUnsafe(`SELECT
+    EXISTS(SELECT 1 FROM "CreatorMediaMessageFinancialState" WHERE "creatorId"=$1 AND dirty) AS pending,
+    NOT (EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1 AND "completedAt" IS NULL)
     OR EXISTS(SELECT 1 FROM "CreatorMediaUsageSourceState" WHERE "creatorId"=$1 AND "factProtocol"=0)
     OR EXISTS(SELECT 1 FROM "MaintenanceLaneState" m WHERE m.key=$2 AND m."completedAt" IS NULL
       AND $1<=m.cursor->>'upperId' AND NOT EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1))
-    ) AS ready`, creatorId, ADOPTION_KEY);
-  return row?.ready === true;
+    ) AS available`, creatorId, ADOPTION_KEY);
+  const available = row?.available === true;
+  return { available, ready: available && row?.pending === false, pending: row?.pending === true };
+}
+async function financialProjectionReady(db, creatorId) {
+  return (await financialProjectionState(db, creatorId)).ready;
 }
 
 async function runSweep({ db = require("../prisma"), limit = 4, maxRuntimeMs = 4000 } = {}) {
@@ -319,4 +323,4 @@ async function runSweep({ db = require("../prisma"), limit = 4, maxRuntimeMs = 4
 }
 
 module.exports = { WORK_CLASS, ADOPTION_KEY, PAGE, COUNTS, sourceKey, lock, counts, verifiedLegacyRows, publishCanonicalMediaSales,
-  effectiveFact, statesForFacts, publishMessageStates, financialProjectionReady, applyContributionDeltas, projectFactPage, enumerateAdoption, processPage, runSweep };
+  effectiveFact, statesForFacts, publishMessageStates, financialProjectionState, financialProjectionReady, applyContributionDeltas, projectFactPage, enumerateAdoption, processPage, runSweep };

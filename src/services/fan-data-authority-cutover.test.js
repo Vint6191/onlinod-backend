@@ -452,7 +452,7 @@ test('partial spend survives unavailable or malformed totals with independent fi
   assert.equal(tx.value.tipsSpentCents, 300n);
   const dto = require('./campaign-read-repository').fanValueDto(tx.value, new Date('2026-10-22T00:10:00Z'), 3600000);
   assert.equal(dto.platformReportedTotalSpendCents, 2000);
-  assert.equal(dto.messagesSpentCents, null);
+  assert.equal(dto.messagesSpentCents, 1200);
   assert.equal(dto.fieldFreshness.messagesSpentCents.fresh, false);
   assert.equal(dto.fieldAuthority.messagesSpentCents.observedAt, '2026-10-20T00:00:00.000Z');
   await projectValue(tx, '2026-10-22T00:20:00Z', null, 'MALFORMED', { tipsSpentCents: 500 });

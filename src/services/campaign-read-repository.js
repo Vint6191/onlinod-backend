@@ -71,6 +71,11 @@ async function readiness(db,creatorId,now) {
     EXISTS(SELECT 1 FROM "DomainWorkItem" w WHERE w."creatorId"=$1 AND w."isOutstanding" AND w."workClass"=ANY($2::text[])
       AND w."workClass"<>'CAMPAIGN_CLOCK') AS pending,
     EXISTS(SELECT 1 FROM "CampaignReadReceipt" r WHERE r."creatorId"=$1 AND r."nextDueAt"<="phase3_utc_timestamp"($3::timestamptz)) AS expired,
+    (EXISTS(SELECT 1 FROM "CampaignReadReceipt" r WHERE r."creatorId"=$1 AND r.kind='FINANCIAL'
+      AND r."nextDueAt"<="phase3_utc_timestamp"($3::timestamptz))
+    OR EXISTS(SELECT 1 FROM "CampaignReadReceipt" r WHERE r."creatorId"=$1 AND r.kind='MEMBER' AND r."windowVersion"=0)
+    OR EXISTS(SELECT 1 FROM "CampaignReadReceipt" r WHERE r."creatorId"=$1 AND r.kind='MEMBER'
+      AND r."windowDueAt"<="phase3_utc_timestamp"($3::timestamptz))) AS "periodExpired",
     (SELECT r."nextDueAt" FROM "CampaignReadReceipt" r WHERE r."creatorId"=$1 AND r."nextDueAt" IS NOT NULL ORDER BY r."nextDueAt","kind","sourceId" LIMIT 1) AS "nextChangeAt"
     FROM "CampaignProjectionPolicy" p LEFT JOIN "CampaignReadStateData" s ON s."creatorId"=$1
     LEFT JOIN "CampaignReadMetric" m ON m."creatorId"=$1 AND m."campaignId"='' AND m."rangeKey"='current' AND m."fanId"=''
@@ -78,7 +83,10 @@ async function readiness(db,creatorId,now) {
   if(!row)throw fault("CAMPAIGN_PROJECTION_POLICY_MISSING",503);
   const current=row.generation===row.activeGeneration;
   const ready=Boolean(row.empty || (current&&row.completedAt&&!row.pending&&!row.expired));
-  return {ready,empty:row.empty,generation:row.activeGeneration,state:ready?"READY":!current||!row.completedAt?"REBUILDING":"PENDING",asOf:now.toISOString(),
+  // Incremental work does not erase already committed figures. A generation
+  // rebuild or an overdue rolling-window change still cannot certify this range.
+  const available=Boolean(row.empty || (current&&row.completedAt&&!row.periodExpired));
+  return {ready,available,pending:!ready,empty:row.empty,generation:row.activeGeneration,state:ready?"READY":!current||!row.completedAt?"REBUILDING":"PENDING",asOf:now.toISOString(),
     fanValueStatus:!ready?"PENDING":!row.empty&&BigInt(row.staleFans||0)>0n?"STALE":"FRESH",
     valueFreshnessMs:row.valueFreshnessMs,nextChangeAt:!row.empty&&current?row.nextChangeAt?.toISOString()||null:null};
 }
@@ -121,28 +129,28 @@ async function readCampaignPage({db,creatorId,rangeKey:key="all",cursor=null,lim
   const byId=combineMetrics(metrics,"campaignId");
   coverage.fanValues = {
     authority:"CANONICAL_VALUE_TTL",scope:"CURRENT_CAMPAIGN_MEMBERS",freshnessMs:projection.valueFreshnessMs,
-    status:!projection.ready?"PENDING":n(byId.get(""),"ofValueStaleFans")>0?"STALE":n(byId.get(""),"ofValueUnknownFans")>0?"PARTIAL":"FRESH",
+    status:!projection.available?"PENDING":!projection.ready||n(byId.get(""),"ofValueStaleFans")>0?"STALE":n(byId.get(""),"ofValueUnknownFans")>0?"PARTIAL":"FRESH",
     fresh:projection.ready&&n(byId.get(""),"ofValueStaleFans")===0&&n(byId.get(""),"ofValueUnknownFans")===0,
-    knownFans:projection.ready?n(byId.get(""),"ofValueKnownFans"):null,
-    unknownFans:projection.ready?n(byId.get(""),"ofValueUnknownFans"):null,
-    freshFans:projection.ready?n(byId.get(""),"ofValueFreshFans"):null,
-    staleFans:projection.ready?n(byId.get(""),"ofValueStaleFans"):null,
+    knownFans:projection.available?n(byId.get(""),"ofValueKnownFans"):null,
+    unknownFans:projection.available?n(byId.get(""),"ofValueUnknownFans"):null,
+    freshFans:projection.available?n(byId.get(""),"ofValueFreshFans"):null,
+    staleFans:projection.available?n(byId.get(""),"ofValueStaleFans"):null,
   };
   const bounds=displayRangeBounds(key,now);
   return {ok:true,contractVersion:VERSION,creatorId,range:{key,startAt:bounds.startAt.toISOString(),endAt:bounds.endAt.toISOString()},
-    projection,sourceCoverage:coverage,totals:projection.ready?metricsDto(byId.get(""),true,coverage.revenue.ready):null,
-    rows:page.map(row=>({...row,...metricsDto(byId.get(row.id),projection.ready,coverage.revenue.ready)})),
+    projection,sourceCoverage:coverage,totals:projection.available?metricsDto(byId.get(""),true,coverage.revenue.ready):null,
+    rows:page.map(row=>({...row,...metricsDto(byId.get(row.id),projection.available,coverage.revenue.ready)})),
     pagination:{limit:take,returned:page.length,hasMore:rows.length>take,nextCursor:rows.length>take?encodeCursor(scope,page.at(-1).id):null,order:"IMMUTABLE_ID",semantics:"LIVE_PAGES"}};
 }
 function fanValueDto(value,now,freshnessMs=CAMPAIGN_FAN_VALUE_FRESHNESS_MS) {
   if(!value)return null;
   const observed=trustedCollectionTimestamp(value.valueObservedAt,now);
-  const state=valueFieldState(value,now,freshnessMs),available=state.available;
-  const money=field=>(field==="platformReportedTotalSpendCents"?available:state.fields[field].fresh)?safeInteger(value[field]):null;
-  return {available,availability:value.availability,
+  const state=valueFieldState(value,now,freshnessMs),available=state.known;
+  const money=field=>(field==="platformReportedTotalSpendCents"?available:state.fields[field].known)?safeInteger(value[field]):null;
+  return {available,fresh:state.available,availability:value.availability,
     platformReportedTotalSpendCents:money("platformReportedTotalSpendCents"),messagesSpentCents:money("messagesSpentCents"),
     subscriptionsSpentCents:money("subscriptionsSpentCents"),tipsSpentCents:money("tipsSpentCents"),postsSpentCents:money("postsSpentCents"),streamsSpentCents:money("streamsSpentCents"),
-    observedAt:value.valueObservedAt.toISOString(),expiresAt:observed?new Date(+observed+freshnessMs).toISOString():null,
+    observedAt:state.fields.platformReportedTotalSpendCents.observedAt,expiresAt:observed?new Date(+observed+freshnessMs).toISOString():null,
     lastActivityAt:value.lastActivityAt?.toISOString()||null,source:value.source,fieldAuthority:state.authority,fieldFreshness:state.fields};
 }
 async function readCampaignFanPage({db,creatorId,campaignId,rangeKey:key="all",filter="ALL",cursor=null,limit=50,offset=0,now=null}) {
@@ -157,7 +165,7 @@ async function readCampaignFanPage({db,creatorId,campaignId,rangeKey:key="all",f
   // Materialize the bounded payer page BEFORE looking up memberships. A plain
   // ordered JOIN can become a merge join that walks every non-paying member
   // between sparse payers even when the payer side uses its partial index.
-  const ids=filter==="PAYING"&&!projection.ready?[]:await db.$queryRawUnsafe(filter==="PAYING"?`
+  const ids=filter==="PAYING"&&!projection.available?[]:await db.$queryRawUnsafe(filter==="PAYING"?`
     WITH payers AS MATERIALIZED (
       SELECT p."fanId" FROM "CampaignReadMetric" p
       WHERE p."creatorId"=$1 AND p."campaignId"=$2 AND p."rangeKey"=$3 AND p."paying"=true AND p."fanId">$4
@@ -181,11 +189,11 @@ async function readCampaignFanPage({db,creatorId,campaignId,rangeKey:key="all",f
       const row=byId.get(id);if(!row)return [];
       const fan=row.fan,demand=demandByFan.get(fan.onlyFansUserId),value=fanValueDto(fan.valueCurrent,now,projection.valueFreshnessMs);
       const fanDataStatus=demand?.status==="QUEUED"?(demand.activeRefreshJob?.status==="CLAIMED"?"RUNNING":"PENDING")
-        :demand?.status==="FAILED"?"FAILED":value?.availability==="UNAVAILABLE"&&value.expiresAt&&+new Date(value.expiresAt)>+now?"UNAVAILABLE":value?.available?"AVAILABLE":"STALE";
+        :demand?.status==="FAILED"?"FAILED":value?.availability==="UNAVAILABLE"&&value.expiresAt&&+new Date(value.expiresAt)>+now?"UNAVAILABLE":value?.fresh?"AVAILABLE":"STALE";
       return [{id:row.id,externalClaimerId:row.externalClaimerId,attributedAt:row.attributedAt?.toISOString()||null,collectedAt:row.collectedAt.toISOString(),
         fan:{id:fan.id,onlyFansUserId:fan.onlyFansUserId,username:fan.username,displayName:fan.displayName,firstSeenAt:fan.firstSeenAt.toISOString(),lastSeenAt:fan.lastSeenAt.toISOString()},
         fanDataStatus,fanDataError:fanDataStatus==="FAILED"?demand.lastError:null,fanDataRetryAttempts:demand?.retryAttempts||0,
-        fanValue:value,revenue:metricsDto(byFan.get(row.fanRecordId),projection.ready,coverage.revenue.ready && row.attributedAt!=null)}];
+        fanValue:value,revenue:metricsDto(byFan.get(row.fanRecordId),projection.available,coverage.revenue.ready && row.attributedAt!=null)}];
     }),pagination:{limit:take,returned:pageIds.length,hasMore:ids.length>take,nextCursor:ids.length>take?encodeCursor(scope,pageIds.at(-1).fanId):null,order:"IMMUTABLE_FAN_ID",semantics:"LIVE_PAGES"}};
 }
 module.exports={VERSION,safeInteger,metricsDto,rangeKey,decodeCursor,encodeCursor,readiness,fanValueDto,readCampaignPage,readCampaignFanPage};

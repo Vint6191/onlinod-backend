@@ -30,6 +30,8 @@ jobs:
             proof: scripts/audit/initial-campaign-readiness172-proof.cjs
           - name: campaign-resume
             proof: scripts/audit/campaign-resume173-proof.cjs
+          - name: saved-read-availability177
+            proof: scripts/audit/saved-read177-proof.cjs
     services:
       postgres:
         image: postgres:16

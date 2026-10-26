@@ -6182,6 +6182,8 @@ model CampaignReadReceipt {
   sourceId String
   contributions Json @default("[]")
   nextDueAt DateTime?
+  windowDueAt DateTime?
+  windowVersion Int @default(0)
   updatedAt DateTime @default(now())
   creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
   @@id([creatorId,kind,sourceId])

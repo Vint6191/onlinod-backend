@@ -51,7 +51,9 @@ async function freshness(db, creator, now) {
   const coverage = await db.creatorCampaignCollectionState.findUnique({ where: { creatorId: creator.id }, select: {
     ...CAMPAIGN_COVERAGE_SELECT, membershipCoverageCompletedAt: true,
   } });
-  return { providerCoverage: coverage ? coverageDto(coverage) : null, ready: Boolean(state?.completedAt) && !pending, rebuilding: !state?.completedAt,
+  return { providerCoverage: coverage ? coverageDto(coverage) : null,
+    available: Boolean(state?.completedAt), ready: Boolean(state?.completedAt) && !pending, rebuilding: !state?.completedAt,
+    updatedAt: state?.updatedAt?.toISOString() || null,
     providerFreshness: evaluateCampaignCollectionState(coverage, now, await readCampaignRefreshDebt({ db, creatorId: creator.id })),
     pending: Boolean(pending), failure: pending?.state === "RECONCILE_REQUIRED" ? pending.lastError : null,
     providerAuthority: "CAMPAIGNS", valueAuthority: "FAN_DATA_CURRENT", projectionVersion: 3 };
@@ -121,12 +123,13 @@ async function getTrafficSourceMembers(input) {
     const paid = await revenue(db, creator, "receiptFan:" + key, fanIds, range);
     const value = (await lifetime(db, creator, "source", [key])).get(key) || {};
     const members = visible.map(row => {
-      const fan = identities.get(row.fanId), val = valueMap.get(fan?.id), fieldState = valueFieldState(val, now), available = fieldState.available;
-      const money = field => fieldState.fields[field].fresh && val?.[field] != null ? num(val[field]) : null;
+      const fan = identities.get(row.fanId), val = valueMap.get(fan?.id), fieldState = valueFieldState(val, now), available = fieldState.known;
+      const money = field => fieldState.fields[field].known && val?.[field] != null ? num(val[field]) : null;
       const username = fan?.username || row.metadata?.fanUsername || null, name = fan?.displayName || row.metadata?.fanName || null;
       return { fanId: row.fanId, fanUsername: username, fanName: name, avatarUrl: fan?.avatarUrl || row.metadata?.fanAvatar || null,
         displayName: username ? `@${username}` : name || row.fanId, valueAvailability: val?.availability || "NOT_FETCHED",
         totalSummCents: available ? money("platformReportedTotalSpendCents") : null,
+        valueKnown: available, valueFresh: fieldState.available,
         messagesSummCents: money("messagesSpentCents"), tipsSummCents: money("tipsSpentCents"),
         subscribesSummCents: money("subscriptionsSpentCents"), postsSummCents: money("postsSpentCents"),
         streamsSummCents: money("streamsSpentCents"), fetchedAt: fieldState.fields.platformReportedTotalSpendCents.observedAt,

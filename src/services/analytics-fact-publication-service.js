@@ -324,6 +324,11 @@ async function readPublishedDays({ db, creatorId, from, to }) {
   }
   const scopes = Object.fromEntries(Object.keys(PUBLICATION_SCOPES)
     .map(name => [name, publicationEvidence(row.initialized === true, row.pending?.[name] !== false)]));
+  // Expose saved activity while another chunk is publishing, without upgrading
+  // the completeness proof. First adoption with no published activity remains
+  // unavailable; only a drained publication may certify an empty/zero range.
+  const activitySaved = Object.keys(totals).some(key => key.startsWith("subscription:") || ["likes", "comments", "newSubscribers", "renewals", "expiredSubscribers", "autoRenewDisabled"].includes(key));
+  scopes.activity.available = scopes.activity.ready || row.initialized === true && activitySaved;
   return { ...scopes.all, scopes,
     days: days.map(row => ({ date: new Date(row.date), ...row.values })), totals, subscriptions, financialGroups };
 }

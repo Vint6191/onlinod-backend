@@ -23,12 +23,16 @@ function valueFieldState(value, now, freshnessMs = CAMPAIGN_FAN_VALUE_FRESHNESS_
     // timestamps cannot be inferred from a later, unrelated profile field.
     const observed = trustedCollectionTimestamp(authority[field]?.observedAt
       ?? (field === "platformReportedTotalSpendCents" ? value?.valueObservedAt : null), now);
-    const known = value?.[field] != null;
+    const known = value?.[field] != null && Boolean(observed);
     const fresh = Boolean(known && observed && +observed + freshnessMs > +now);
     return [field, { known, fresh, observedAt: observed?.toISOString() || null,
       expiresAt: observed ? new Date(+observed + freshnessMs).toISOString() : null }];
   }));
-  return { authority, fields, available: value?.availability === "AVAILABLE" && fields.platformReportedTotalSpendCents.fresh };
+  // Expiry limits claims of freshness, not the lifetime of a saved observation.
+  // Keep `available` strict for collectors/decisions; display readers use `known`.
+  return { authority, fields,
+    known: value?.availability === "AVAILABLE" && fields.platformReportedTotalSpendCents.known,
+    available: value?.availability === "AVAILABLE" && fields.platformReportedTotalSpendCents.fresh };
 }
 
 module.exports = { VALUE_FIELDS, fieldAuthority, valueFieldAuthority, valueFieldState };

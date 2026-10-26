@@ -68,7 +68,7 @@ function analyticsBase(mediaId) {
   };
 }
 
-function assetAnalytics(asset, authoritative, rank = null, moneyReady = true) {
+function assetAnalytics(asset, authoritative, rank = null, moneyState = {ready:true,available:true,pending:false}) {
   const mediaId = clean(asset.mediaId);
   const sentCount = integer(asset.sentCount);
   const active = asset.catalogActive === true;
@@ -85,7 +85,9 @@ function assetAnalytics(asset, authoritative, rank = null, moneyReady = true) {
     freeCount: integer(asset.freeCount),
     revenueCents: integer(asset.revenueCents),
     revenueUnknownCount: integer(asset.revenueUnknownCount),
-    revenueComplete: moneyReady && integer(asset.revenueUnknownCount) === 0,
+    revenueAvailable: moneyState.available && integer(asset.revenueUnknownCount) === 0,
+    revenuePending: moneyState.pending,
+    revenueComplete: moneyState.ready && integer(asset.revenueUnknownCount) === 0,
     averagePriceCents: integer(asset.averagePriceCents),
     uniqueBuyers: integer(asset.uniqueBuyers),
     rank,
@@ -100,8 +102,8 @@ function assetAnalytics(asset, authoritative, rank = null, moneyReady = true) {
   };
 }
 
-function topAsset(asset, authoritative, rank, moneyReady) {
-  const analytics = assetAnalytics(asset, authoritative, rank, moneyReady);
+function topAsset(asset, authoritative, rank, moneyState) {
+  const analytics = assetAnalytics(asset, authoritative, rank, moneyState);
   return {
     ...analytics,
     assetId: analytics.mediaId,
@@ -120,7 +122,7 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
   const ids = cleanMediaIds(mediaIds, MAX_MEDIA_IDS);
   const activeWhere = { agencyId, creatorId: cleanCreatorId, catalogActive: true };
 
-  const [[catalogCount, usedCount, totals, soldAssets, topRows, assetRows, latestAsset, moneyReady], pipelineResult] = await Promise.all([
+  const [[catalogCount, usedCount, totals, soldAssets, topRows, assetRows, latestAsset, moneyState], pipelineResult] = await Promise.all([
     readMediaSnapshot(client, tx => Promise.all([
       tx.creatorMediaAsset.count({ where: activeWhere }),
       tx.creatorMediaAsset.count({ where: { ...activeWhere, sentCount: { gt: 0 } } }),
@@ -144,7 +146,7 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
         orderBy: { updatedAt: "desc" },
         select: { updatedAt: true, usageUpdatedAt: true },
       }),
-      require("./media-financial-projection-service").financialProjectionReady(tx, cleanCreatorId),
+      require("./media-financial-projection-service").financialProjectionState(tx, cleanCreatorId),
     ])),
     includePipeline
       ? getNeverUsedPipelineState({ agencyId, creatorId: cleanCreatorId, db: client })
@@ -157,7 +159,7 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
   const assetById = new Map(assetRows.map((asset) => [String(asset.mediaId), asset]));
   const analytics = ids.map((mediaId) => {
     const asset = assetById.get(mediaId);
-    if (asset) return assetAnalytics(asset, authoritative, rankById.get(mediaId) || null, moneyReady);
+    if (asset) return assetAnalytics(asset, authoritative, rankById.get(mediaId) || null, moneyState);
     return {
       ...analyticsBase(mediaId),
       usageState: authoritative ? "NOT_APPLICABLE" : "UNKNOWN",
@@ -165,7 +167,7 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
       authoritative,
     };
   });
-  const topAssets = topRows.map((asset, index) => topAsset(asset, authoritative, index + 1, moneyReady));
+  const topAssets = topRows.map((asset, index) => topAsset(asset, authoritative, index + 1, moneyState));
   const freshnessCandidates = [latestAsset?.updatedAt, latestAsset?.usageUpdatedAt, pipeline?.updatedAt, totals?._max?.lastSoldAt]
     .map((value) => value ? new Date(value).getTime() : Number.NaN)
     .filter(Number.isFinite);
@@ -180,7 +182,9 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
       totalSales: exactMediaCount(totals?._sum?.soldCount),
       revenueCents: exactMediaCount(totals?._sum?.revenueCents),
       revenueUnknownCount: exactMediaCount(totals?._sum?.revenueUnknownCount),
-      revenueComplete: moneyReady && exactMediaCount(totals?._sum?.revenueUnknownCount) === 0,
+      revenueAvailable: moneyState.available && exactMediaCount(totals?._sum?.revenueUnknownCount) === 0,
+      revenuePending: moneyState.pending,
+      revenueComplete: moneyState.ready && exactMediaCount(totals?._sum?.revenueUnknownCount) === 0,
       lastSaleAt: iso(totals?._max?.lastSoldAt),
     },
     analytics,

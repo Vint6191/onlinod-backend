@@ -11,10 +11,12 @@ const { utcDay, DAY_MS } = require("./analytics-range-contract");
 const { enterCampaignProjection, admitProjectionWorkClass } = require("./campaign-projection-policy");
 const { acquireCampaignTransactionLock } = require("./campaign-transaction-lock-service");
 const { requestExpiredCampaignValues } = require("./campaign-value-refresh-service");
+const { fieldAuthority } = require("./fan-value-field-authority");
 const PAGE = 100;
 const RANGES = Object.freeze(["7d", "30d", "90d", "180d", "365d", "all"]);
 const CLASSES = Object.freeze(["CAMPAIGN_FACT", "CAMPAIGN_VALUE", "CAMPAIGN_ATTRIBUTION", "CAMPAIGN_CLOCK", "CAMPAIGN_BACKFILL"]);
 const SOURCES = Object.freeze({ DIRECTORY: "CreatorCampaign", MEMBER: "CreatorCampaignFan", FINANCIAL: "CreatorFinancialTransaction" });
+const SAVED_VALUE_REPAIR = "campaign_saved_value_177";
 const fault = code => Object.assign(new Error(code), { code, status: 409 });
 const textMetrics = obj => Object.fromEntries(Object.entries(obj).map(([k,v]) => [k, String(v)]));
 
@@ -31,11 +33,13 @@ function windowMembership(at, now) {
   return { ranges, due: future.length ? new Date(Math.min(...future)) : null };
 }
 function valueMetrics(value, now, freshnessMs = CAMPAIGN_FAN_VALUE_FRESHNESS_MS) {
-  const observed = value?.fetchedAt ? new Date(value.fetchedAt) : null;
-  const trusted = observed && +observed <= +now + COLLECTION_FUTURE_SKEW_TOLERANCE_MS;
+  const at = fieldAuthority(value?.platformReportedTotalSpendCentsAuthorityVersion)?.observedAt ?? value?.fetchedAt;
+  const parsed = at ? new Date(at) : null;
+  const observed = parsed && Number.isFinite(+parsed) ? parsed : null;
+  const trusted = observed && Number.isFinite(+observed) && +observed <= +now + COLLECTION_FUTURE_SKEW_TOLERANCE_MS;
   const expires = observed ? new Date(+observed + freshnessMs) : null;
   const fresh = Boolean(trusted && +expires > +now);
-  const available = fresh && value.availability === "AVAILABLE";
+  const available = trusted && value.availability === "AVAILABLE";
   const known = available && value.totalNetCents != null;
   return {
     fresh,
@@ -76,18 +80,18 @@ function deltas(previous, next) {
   }
   return [...map.entries()].sort(([a],[b]) => a.localeCompare(b)).map(([,v]) => v).filter(r => Object.values(r.metrics).some(v => v !== "0"));
 }
-async function replaceReceipt(tx, item, kind, sourceId, contributions, nextDueAt) {
-  const [before] = await tx.$queryRawUnsafe('SELECT "contributions","nextDueAt" FROM "CampaignReadReceipt" WHERE "creatorId"=$1 AND "kind"=$2 AND "sourceId"=$3', item.creatorId,kind,sourceId);
+async function replaceReceipt(tx, item, kind, sourceId, contributions, nextDueAt, windowDueAt) {
+  const [before] = await tx.$queryRawUnsafe('SELECT "contributions","nextDueAt","windowDueAt","windowVersion" FROM "CampaignReadReceipt" WHERE "creatorId"=$1 AND "kind"=$2 AND "sourceId"=$3', item.creatorId,kind,sourceId);
   const delta = deltas(before?.contributions || [],contributions);
-  if (before && !delta.length && +(before.nextDueAt || 0) === +(nextDueAt || 0)) return;
+  if (before && before.windowVersion===1 && !delta.length && +(before.nextDueAt || 0) === +(nextDueAt || 0) && +(before.windowDueAt || 0) === +(windowDueAt || 0)) return;
   (item.changedReceipts ||= []).push({ kind, sourceId, contributions, nextDueAt });
   if (delta.length) await tx.$executeRawUnsafe(`SELECT "onlinod_campaign_read_add_v1"($1,$2,x."campaignId",x."rangeKey",x."fanId",x.metrics)
     FROM jsonb_to_recordset($3::jsonb) x("campaignId" text,"rangeKey" text,"fanId" text,metrics jsonb)`,item.agencyId,item.creatorId,JSON.stringify(delta));
   if (!contributions.length && !nextDueAt) {
     await tx.$executeRawUnsafe('DELETE FROM "CampaignReadReceipt" WHERE "creatorId"=$1 AND "kind"=$2 AND "sourceId"=$3',item.creatorId,kind,sourceId);
-  } else await tx.$executeRawUnsafe(`INSERT INTO "CampaignReadReceipt"("agencyId","creatorId","kind","sourceId","contributions","nextDueAt") VALUES($1,$2,$3,$4,$5::jsonb,"phase3_utc_timestamp"($6::timestamptz))
-    ON CONFLICT("creatorId","kind","sourceId") DO UPDATE SET "contributions"=EXCLUDED."contributions","nextDueAt"=EXCLUDED."nextDueAt","updatedAt"=CURRENT_TIMESTAMP`,
-  item.agencyId,item.creatorId,kind,sourceId,JSON.stringify(contributions),nextDueAt);
+  } else await tx.$executeRawUnsafe(`INSERT INTO "CampaignReadReceipt"("agencyId","creatorId","kind","sourceId","contributions","nextDueAt","windowDueAt","windowVersion") VALUES($1,$2,$3,$4,$5::jsonb,"phase3_utc_timestamp"($6::timestamptz),"phase3_utc_timestamp"($7::timestamptz),1)
+    ON CONFLICT("creatorId","kind","sourceId") DO UPDATE SET "contributions"=EXCLUDED."contributions","nextDueAt"=EXCLUDED."nextDueAt","windowDueAt"=EXCLUDED."windowDueAt","windowVersion"=1,"updatedAt"=CURRENT_TIMESTAMP`,
+  item.agencyId,item.creatorId,kind,sourceId,JSON.stringify(contributions),nextDueAt,windowDueAt);
 }
 async function projectSource(tx, item, kind, id, now) {
   const policy = item.policy || await enterCampaignProjection(tx);
@@ -99,18 +103,18 @@ async function projectSource(tx, item, kind, id, now) {
     if (!SOURCES[kind]) throw fault("CAMPAIGN_READ_SOURCE_INVALID");
     [row] = await tx.$queryRawUnsafe(`SELECT * FROM "${SOURCES[kind]}" WHERE "creatorId"=$1 AND "agencyId"=$2 AND "id"=$3`,item.creatorId,item.agencyId,id);
   }
-  const entries = [], due = [];
+  const entries = [], due = [];let windowDueAt=null;
   const add = (campaignId,rangeKey,fanId,metrics) => entries.push({campaignId,rangeKey,fanId,metrics:textMetrics(metrics)});
   const schedule = date => { if (date && +date > +now) due.push(+date); };
   if (row && kind === "DIRECTORY") {
     for (const p of ["",row.id]) add(p,"current","",{campaigns:1,activeCampaigns:row.isActive?1:0});
   }
   if (row && (kind === "MEMBER" || kind === "VALUE")) {
-    const [value] = await tx.$queryRawUnsafe('SELECT "availability","totalNetCents","fetchedAt" FROM "CreatorFanValueCurrent" WHERE "creatorId"=$1 AND "agencyId"=$2 AND "fanId"=$3',item.creatorId,item.agencyId,row.fanId);
+    const [value] = await tx.$queryRawUnsafe('SELECT "availability","totalNetCents","fetchedAt","platformReportedTotalSpendCentsAuthorityVersion" FROM "CreatorFanValueCurrent" WHERE "creatorId"=$1 AND "agencyId"=$2 AND "fanId"=$3',item.creatorId,item.agencyId,row.fanId);
     const current = valueMetrics(value,now,policy.valueFreshnessMs); schedule(current.due);
     if (kind === "VALUE" && !current.fresh) (item.valueRefreshFans ||= new Set()).add(row.fanId);
     const membership = windowMembership(row.attributedAt,now);
-    if (kind === "MEMBER") schedule(membership.due);
+    if (kind === "MEMBER") { schedule(membership.due);windowDueAt=membership.due; }
     // Current directory/value/membership facts exist once, independent of the
     // financial window. Only payer references and arrivals need window state.
     if (kind === "MEMBER") {
@@ -129,7 +133,7 @@ async function projectSource(tx, item, kind, id, now) {
     // Unattributed facts are found by the membership interval repair later.
     if (!attribution?.campaignId || !Object.keys(money).length) due.length=0;
   }
-  await replaceReceipt(tx,item,kind,id,entries,due.length?new Date(Math.min(...due)):null);
+  await replaceReceipt(tx,item,kind,id,entries,due.length?new Date(Math.min(...due)):null,windowDueAt);
 }
 async function nextClock(tx, creatorId) {
   const [row] = await tx.$queryRawUnsafe('SELECT "nextDueAt" FROM "CampaignReadReceipt" WHERE "creatorId"=$1 AND "nextDueAt" IS NOT NULL ORDER BY "nextDueAt","kind","sourceId" LIMIT 1',creatorId);
@@ -296,13 +300,14 @@ async function runCampaignProjectionUnit({db,item,ownerToken}) {
 async function seedCampaignProjection({db}) {
   return runRootCommit(db,async({tx}) => {
     const policy=await enterCampaignProjection(tx);
+    const repair=await seedSavedValueRepair(tx);
     const [seed]=await tx.$queryRawUnsafe('SELECT "id","cursor","complete","valueFreshnessMs","generation" FROM "CampaignReadSeed" WHERE "id"=\'v1\' FOR UPDATE SKIP LOCKED');
-    if(!seed)return {seeded:0,visited:0};
+    if(!seed)return {seeded:0,visited:0,repair};
     if(seed.generation!==policy.generation){
       await tx.$executeRawUnsafe('UPDATE "CampaignReadSeed" SET "generation"=$1,"valueFreshnessMs"=$2,"cursor"=\'\',"complete"=false WHERE "id"=\'v1\'',policy.generation,policy.valueFreshnessMs);
       seed.cursor="";seed.complete=false;
     }
-    if(seed.complete)return {seeded:0,visited:0};
+    if(seed.complete)return {seeded:0,visited:0,repair};
     const rows=await tx.$queryRawUnsafe(`WITH batch AS MATERIALIZED (
       SELECT "id","agencyId" FROM "CreatorAccount" WHERE "id">$1 AND "deletedAt" IS NULL ORDER BY "id" LIMIT $2
     ) SELECT b.*,EXISTS(SELECT 1 FROM "CreatorCampaign" c WHERE c."creatorId"=b."id") AS relevant,
@@ -314,8 +319,35 @@ async function seedCampaignProjection({db}) {
       seeded++;
     }
     await tx.$executeRawUnsafe('UPDATE "CampaignReadSeed" SET "cursor"=$1,"complete"=$2 WHERE "id"=\'v1\'',rows.at(-1)?.id||seed.cursor,rows.length<PAGE);
-    return {seeded,visited:rows.length};
+    return {seeded,visited:rows.length,repair};
   },{profile:"JOB_CHUNK",authority:{kind:"CAMPAIGN_READ_SEED"}});
+}
+// One finite, restart-safe pass repairs receipts produced by the old TTL rule.
+// Keyset pages enqueue ordinary projection work; no provider reads and no
+// financial-history reset. Inserts/updates after this fence use the live outbox.
+async function seedSavedValueRepair(tx) {
+  await tx.$executeRawUnsafe(`INSERT INTO "MaintenanceLaneState"(key,generation,cursor,"updatedAt")
+    VALUES($1,$1,jsonb_build_object('afterId','','upperId',COALESCE((SELECT id FROM "CreatorCampaignFan" ORDER BY id DESC LIMIT 1),'')),CURRENT_TIMESTAMP)
+    ON CONFLICT(key) DO NOTHING`,SAVED_VALUE_REPAIR);
+  const [state]=await tx.$queryRawUnsafe('SELECT cursor,"completedAt" FROM "MaintenanceLaneState" WHERE key=$1 FOR UPDATE SKIP LOCKED',SAVED_VALUE_REPAIR);
+  if(!state||state.completedAt)return {visited:0,completed:Boolean(state?.completedAt)};
+  const {afterId,upperId}=state.cursor;
+  if(typeof afterId!=="string"||typeof upperId!=="string")throw fault("CAMPAIGN_VALUE_REPAIR_CURSOR_INVALID");
+  const rows=await tx.$queryRawUnsafe(`WITH batch AS MATERIALIZED (
+    SELECT id,"agencyId","creatorId","fanId" FROM "CreatorCampaignFan" WHERE id>$1 AND id<=$2 ORDER BY id LIMIT $3
+  ) SELECT b.*,EXISTS(SELECT 1 FROM "CreatorCampaignFan" m WHERE m."creatorId"=b."creatorId" AND m."fanId"=b."fanId")
+    AND EXISTS(SELECT 1 FROM "CreatorAccount" c WHERE c.id=b."creatorId" AND c."deletedAt" IS NULL) AS relevant
+    FROM batch b ORDER BY b.id`,afterId,upperId,25);
+  const fans=new Map(rows.map(row=>[JSON.stringify([row.creatorId,row.fanId]),row]));
+  for(const row of fans.values())if(row.relevant){
+    await lockAgencyLifecycleBarrier({db:tx,agencyId:row.agencyId});
+    await publishDomainWork({db:tx,agencyId:row.agencyId,creatorId:row.creatorId,partitionKey:row.creatorId,
+      workClass:"CAMPAIGN_VALUE",objectType:"CreatorFanValueCurrent",objectId:row.fanId});
+  }
+  const completed=rows.length<25||rows.at(-1)?.id===upperId;
+  await tx.maintenanceLaneState.update({where:{key:SAVED_VALUE_REPAIR},data:{
+    cursor:{afterId:rows.at(-1)?.id||afterId,upperId},completedAt:completed?await dbAuthorityNow({db:tx}):null}});
+  return {visited:rows.length,completed};
 }
 async function runCampaignProjectionSweep({db,limit=4,concurrency=1,seed=true,maxRuntimeMs=Infinity}) {
   const started=Date.now();
@@ -342,4 +374,4 @@ async function runCampaignProjectionSweep({db,limit=4,concurrency=1,seed=true,ma
   }
   return {ok:results.every(x=>!x.error),seed:seeding,processed:results.length,results};
 }
-module.exports={PAGE,RANGES,CLASSES,windowMembership,valueMetrics,financialMetrics,deltas,projectSource,clockUnit,runCampaignProjectionUnit,seedCampaignProjection,runCampaignProjectionSweep};
+module.exports={PAGE,RANGES,CLASSES,SAVED_VALUE_REPAIR,windowMembership,valueMetrics,financialMetrics,deltas,projectSource,clockUnit,runCampaignProjectionUnit,seedCampaignProjection,runCampaignProjectionSweep};

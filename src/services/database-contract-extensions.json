@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v22_recovery172",
+  "version": "nod_current_v23_saved_read177",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -84,6 +84,10 @@
     {
       "migration": "20261023030000_recovery172_runtime_admission",
       "checksum": "b9dafa7ca8b16a5386385648adbf6cee5864aa1f972e081ed91ca7d7e8bf46be"
+    },
+    {
+      "migration": "20261026000000_saved_read177",
+      "checksum": "3cea350f1a1be99516d5a8a7d9822c7afdc781815d18e2d768b5a1d058bf4335"
     }
   ],
   "extension": {
@@ -211,12 +215,20 @@
         "column_default": null
       },
       {
-        "table": "CreatorDialogRecoveryRequest",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
+        "table": "CampaignReadReceipt",
+        "name": "windowDueAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "CampaignReadReceipt",
+        "name": "windowVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
       },
       {
         "table": "CreatorDialogRecoveryRequest",
@@ -228,18 +240,18 @@
       },
       {
         "table": "CreatorDialogRecoveryRequest",
-        "name": "lastCoveredAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorDialogRecoveryRequest",
-        "name": "sampleAt",
+        "name": "lastCoveredAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
-        "is_nullable": "NO",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -267,32 +279,16 @@
         "column_default": null
       },
       {
-        "table": "CreatorEarningsGeneration",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "sampleAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorEarningsGeneration",
         "name": "agencyId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "runId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -308,19 +304,19 @@
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "state",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
         "is_nullable": "NO",
-        "column_default": "'BUILDING'::text"
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "phase",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "'COPY'::text"
+        "column_default": null
       },
       {
         "table": "CreatorEarningsGeneration",
@@ -340,27 +336,27 @@
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "throughAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "snapshotAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGeneration",
         "name": "fullScan",
         "data_type": "boolean",
         "udt_name": "bool",
         "is_nullable": "NO",
         "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "invalidCount",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
       },
       {
         "table": "CreatorEarningsGeneration",
@@ -372,15 +368,15 @@
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "observedCount",
-        "data_type": "bigint",
-        "udt_name": "int8",
+        "name": "mode",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "0"
+        "column_default": "'SNAPSHOT'::text"
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "invalidCount",
+        "name": "observedCount",
         "data_type": "bigint",
         "udt_name": "int8",
         "is_nullable": "NO",
@@ -396,11 +392,11 @@
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "createdAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
+        "name": "phase",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
+        "column_default": "'COPY'::text"
       },
       {
         "table": "CreatorEarningsGeneration",
@@ -420,15 +416,39 @@
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "mode",
+        "name": "runId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "'SNAPSHOT'::text"
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "snapshotAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "state",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'BUILDING'::text"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "throughAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
       },
       {
         "table": "CreatorEarningsGenerationDay",
-        "name": "generation",
+        "name": "category",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -444,7 +464,15 @@
       },
       {
         "table": "CreatorEarningsGenerationDay",
-        "name": "category",
+        "name": "financialMetrics",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "table": "CreatorEarningsGenerationDay",
+        "name": "generation",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -467,16 +495,56 @@
         "column_default": null
       },
       {
-        "table": "CreatorEarningsGenerationDay",
-        "name": "financialMetrics",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "'{}'::jsonb"
+        "column_default": null
       },
       {
         "table": "CreatorEarningsGenerationEntry",
         "name": "generation",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "grossCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "status",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -491,51 +559,11 @@
         "column_default": null
       },
       {
-        "table": "CreatorEarningsGenerationEntry",
-        "name": "occurredAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationEntry",
+        "table": "CreatorEarningsGenerationHour",
         "name": "category",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationEntry",
-        "name": "netCents",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationEntry",
-        "name": "status",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationEntry",
-        "name": "observedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationEntry",
-        "name": "grossCents",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -556,14 +584,6 @@
       },
       {
         "table": "CreatorEarningsGenerationHour",
-        "name": "category",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationHour",
         "name": "netCents",
         "data_type": "bigint",
         "udt_name": "int8",
@@ -588,7 +608,55 @@
       },
       {
         "table": "CreatorEarningsLedgerEntry",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'other'::text"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
         "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "grossCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "status",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -603,54 +671,6 @@
         "column_default": null
       },
       {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "occurredAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "category",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'other'::text"
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "netCents",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "status",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "observedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "grossCents",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
         "table": "CreatorEarningsLedgerHour",
         "name": "agencyId",
         "data_type": "text",
@@ -660,22 +680,6 @@
       },
       {
         "table": "CreatorEarningsLedgerHour",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerHour",
-        "name": "hour",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerHour",
         "name": "category",
         "data_type": "text",
         "udt_name": "text",
@@ -684,17 +688,9 @@
       },
       {
         "table": "CreatorEarningsLedgerHour",
-        "name": "netCents",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerHour",
-        "name": "observedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -707,8 +703,40 @@
         "column_default": "'{}'::jsonb"
       },
       {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "hour",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
         "table": "CreatorEarningsLedgerProof",
-        "name": "creatorId",
+        "name": "activeGeneration",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -716,7 +744,15 @@
       },
       {
         "table": "CreatorEarningsLedgerProof",
-        "name": "agencyId",
+        "name": "confirmedThroughAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -732,14 +768,6 @@
       },
       {
         "table": "CreatorEarningsLedgerProof",
-        "name": "throughAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerProof",
         "name": "generation",
         "data_type": "text",
         "udt_name": "text",
@@ -748,151 +776,15 @@
       },
       {
         "table": "CreatorEarningsLedgerProof",
-        "name": "activeGeneration",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerProof",
-        "name": "confirmedThroughAt",
+        "name": "throughAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorEarningsPublishedDay",
         "name": "agencyId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "date",
-        "data_type": "date",
-        "udt_name": "date",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "sourceTimezone",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'UTC'::text"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "subscriptionsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "messagesCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "tipsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "postsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "streamsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "referralsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "totalCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "currency",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'USD'::text"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "sourceUpdatedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "sourceScanRunId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "sourceScanRequestedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "scanProofId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -908,6 +800,14 @@
       },
       {
         "table": "CreatorEarningsPublishedDay",
+        "name": "coverageStatus",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
         "name": "createdAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
@@ -916,15 +816,39 @@
       },
       {
         "table": "CreatorEarningsPublishedDay",
-        "name": "updatedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorEarningsPublishedDay",
-        "name": "coverageStatus",
+        "name": "currency",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'USD'::text"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "date",
+        "data_type": "date",
+        "udt_name": "date",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "hourlyPoints",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "id",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -940,11 +864,123 @@
       },
       {
         "table": "CreatorEarningsPublishedDay",
-        "name": "hourlyPoints",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
+        "name": "messagesCents",
+        "data_type": "integer",
+        "udt_name": "int4",
         "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "postsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "referralsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "scanProofId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceScanRequestedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceScanRunId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceTimezone",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'UTC'::text"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceUpdatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "streamsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "subscriptionsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "tipsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "totalCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorEntityChange",
@@ -956,15 +992,7 @@
       },
       {
         "table": "CreatorEntityChange",
-        "name": "revision",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEntityChange",
-        "name": "agencyId",
+        "name": "entityId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -980,9 +1008,17 @@
       },
       {
         "table": "CreatorEntityChange",
-        "name": "entityId",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "payload",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "revision",
+        "data_type": "bigint",
+        "udt_name": "int8",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -1004,14 +1040,6 @@
       },
       {
         "table": "CreatorEntityChange",
-        "name": "payload",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEntityChange",
         "name": "tombstone",
         "data_type": "boolean",
         "udt_name": "bool",
@@ -1019,16 +1047,8 @@
         "column_default": "false"
       },
       {
-        "table": "CreatorEntityChange",
-        "name": "createdAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
         "table": "CreatorEntityChangeHead",
-        "name": "creatorId",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1036,7 +1056,7 @@
       },
       {
         "table": "CreatorEntityChangeHead",
-        "name": "agencyId",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1052,19 +1072,19 @@
       },
       {
         "table": "CreatorEntityChangeHead",
-        "name": "retainedFrom",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": "1"
-      },
-      {
-        "table": "CreatorEntityChangeHead",
         "name": "nextRetentionAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "retainedFrom",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "1"
       },
       {
         "table": "CreatorEntityChangeHead",
@@ -1076,7 +1096,7 @@
       },
       {
         "table": "CreatorEntityCurrent",
-        "name": "creatorId",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1084,7 +1104,7 @@
       },
       {
         "table": "CreatorEntityCurrent",
-        "name": "entityType",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1100,9 +1120,17 @@
       },
       {
         "table": "CreatorEntityCurrent",
-        "name": "agencyId",
+        "name": "entityType",
         "data_type": "text",
         "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "payload",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -1127,14 +1155,6 @@
         "name": "sourceVersion",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEntityCurrent",
-        "name": "payload",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -1172,7 +1192,7 @@
       },
       {
         "table": "CreatorLiveSync",
-        "name": "creatorId",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1180,7 +1200,7 @@
       },
       {
         "table": "CreatorLiveSync",
-        "name": "agencyId",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1236,14 +1256,6 @@
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaFinancialAdoptionState",
         "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
@@ -1252,31 +1264,23 @@
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "phase",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'SALES'::text"
+        "name": "completedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "upperSaleId",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "''::text"
+        "column_default": null
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "saleCursor",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "''::text"
-      },
-      {
-        "table": "CreatorMediaFinancialAdoptionState",
-        "name": "factSource",
+        "name": "factMedia",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1292,7 +1296,7 @@
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "factMedia",
+        "name": "factSource",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1300,11 +1304,27 @@
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "completedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
+        "name": "phase",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'SALES'::text"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "saleCursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "upperSaleId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
       },
       {
         "table": "CreatorMediaMessageFinancialState",
@@ -1324,19 +1344,11 @@
       },
       {
         "table": "CreatorMediaMessageFinancialState",
-        "name": "sourceKey",
+        "name": "cursor",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaMessageFinancialState",
-        "name": "messageId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
+        "column_default": "''::text"
       },
       {
         "table": "CreatorMediaMessageFinancialState",
@@ -1348,9 +1360,33 @@
       },
       {
         "table": "CreatorMediaMessageFinancialState",
+        "name": "dirty",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "true"
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "messageId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
         "name": "netCents",
         "data_type": "bigint",
         "udt_name": "int8",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "operationId",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
       },
@@ -1372,35 +1408,11 @@
       },
       {
         "table": "CreatorMediaMessageFinancialState",
-        "name": "operationId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaMessageFinancialState",
-        "name": "version",
+        "name": "sourceKey",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
-      },
-      {
-        "table": "CreatorMediaMessageFinancialState",
-        "name": "dirty",
-        "data_type": "boolean",
-        "udt_name": "bool",
-        "is_nullable": "NO",
-        "column_default": "true"
-      },
-      {
-        "table": "CreatorMediaMessageFinancialState",
-        "name": "cursor",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "''::text"
       },
       {
         "table": "CreatorMediaMessageFinancialState",
@@ -1411,8 +1423,8 @@
         "column_default": "CURRENT_TIMESTAMP"
       },
       {
-        "table": "CreatorMediaSaleLink",
-        "name": "saleId",
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "version",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1432,14 +1444,6 @@
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaSaleLink",
-        "name": "sourceKey",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -1468,6 +1472,14 @@
       },
       {
         "table": "CreatorMediaSaleLink",
+        "name": "operationId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
         "name": "proofActive",
         "data_type": "boolean",
         "udt_name": "bool",
@@ -1484,18 +1496,18 @@
       },
       {
         "table": "CreatorMediaSaleLink",
-        "name": "operationId",
+        "name": "saleId",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "YES",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorMediaSaleLink",
-        "name": "version",
+        "name": "sourceKey",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "NO",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -1505,6 +1517,14 @@
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "version",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
       },
       {
         "table": "CreatorMediaUsageContribution",
@@ -1524,7 +1544,7 @@
       },
       {
         "table": "CreatorMediaUsageFact",
-        "name": "id",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1532,11 +1552,11 @@
       },
       {
         "table": "CreatorMediaUsageFact",
-        "name": "agencyId",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
         "is_nullable": "NO",
-        "column_default": null
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorMediaUsageFact",
@@ -1548,7 +1568,7 @@
       },
       {
         "table": "CreatorMediaUsageFact",
-        "name": "sourceKey",
+        "name": "id",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1556,10 +1576,10 @@
       },
       {
         "table": "CreatorMediaUsageFact",
-        "name": "sourceMessageId",
+        "name": "lastSeenRunId",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "NO",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -1568,6 +1588,14 @@
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "observedPayload",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -1588,6 +1616,22 @@
       },
       {
         "table": "CreatorMediaUsageFact",
+        "name": "sourceKey",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "sourceMessageId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
         "name": "sourceRevision",
         "data_type": "text",
         "udt_name": "text",
@@ -1596,34 +1640,10 @@
       },
       {
         "table": "CreatorMediaUsageFact",
-        "name": "lastSeenRunId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaUsageFact",
-        "name": "createdAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorMediaUsageFact",
         "name": "updatedAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaUsageFact",
-        "name": "observedPayload",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
-        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -1644,41 +1664,9 @@
       },
       {
         "table": "CreatorMoneyObservation",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyObservation",
         "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyObservation",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyObservation",
-        "name": "transactionId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyObservation",
-        "name": "occurredAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -1692,7 +1680,15 @@
       },
       {
         "table": "CreatorMoneyObservation",
-        "name": "status",
+        "name": "coveredGeneration",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1700,23 +1696,23 @@
       },
       {
         "table": "CreatorMoneyObservation",
-        "name": "reason",
+        "name": "id",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "YES",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorMoneyObservation",
-        "name": "resolvedAt",
+        "name": "occurredAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
-        "is_nullable": "YES",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorMoneyObservation",
-        "name": "coveredGeneration",
+        "name": "reason",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -1739,6 +1735,46 @@
         "column_default": null
       },
       {
+        "table": "CreatorMoneyObservation",
+        "name": "resolvedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "status",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "transactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "attempts",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
         "table": "CreatorMoneyResolutionRequest",
         "name": "creatorId",
         "data_type": "text",
@@ -1748,10 +1784,18 @@
       },
       {
         "table": "CreatorMoneyResolutionRequest",
-        "name": "agencyId",
+        "name": "jobId",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "NO",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "lastError",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -1772,43 +1816,11 @@
       },
       {
         "table": "CreatorMoneyResolutionRequest",
-        "name": "attempts",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": "0"
-      },
-      {
-        "table": "CreatorMoneyResolutionRequest",
-        "name": "jobId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyResolutionRequest",
-        "name": "lastError",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyResolutionRequest",
         "name": "updatedAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorNotificationCorrection",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
       },
       {
         "table": "CreatorNotificationCorrection",
@@ -1820,23 +1832,15 @@
       },
       {
         "table": "CreatorNotificationCorrection",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorNotificationCorrection",
         "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationCorrection",
-        "name": "notificationId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationCorrection",
-        "name": "formerModel",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1852,6 +1856,22 @@
       },
       {
         "table": "CreatorNotificationCorrection",
+        "name": "formerModel",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationCorrection",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationCorrection",
         "name": "newEventType",
         "data_type": "text",
         "udt_name": "text",
@@ -1860,7 +1880,15 @@
       },
       {
         "table": "CreatorNotificationCorrection",
-        "name": "reasonCode",
+        "name": "normalizerVersion",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationCorrection",
+        "name": "notificationId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1876,7 +1904,7 @@
       },
       {
         "table": "CreatorNotificationCorrection",
-        "name": "normalizerVersion",
+        "name": "reasonCode",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1891,22 +1919,6 @@
         "column_default": null
       },
       {
-        "table": "CreatorNotificationCorrection",
-        "name": "createdAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
         "table": "CreatorNotificationEvent",
         "name": "agencyId",
         "data_type": "text",
@@ -1916,47 +1928,15 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "identityKey",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "notificationId",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "amountCents",
+        "data_type": "integer",
+        "udt_name": "int4",
         "is_nullable": "YES",
         "column_default": null
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "transactionId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "sourceType",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "sourceSubType",
+        "name": "canonicalFactId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -1972,6 +1952,38 @@
       },
       {
         "table": "CreatorNotificationEvent",
+        "name": "commentId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "currency",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "disposition",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
         "name": "eventType",
         "data_type": "text",
         "udt_name": "text",
@@ -1980,9 +1992,17 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "occurredAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
+        "name": "fanAvatarUrlAtEvent",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "fanDisplayNameAtEvent",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
       },
@@ -2004,19 +2024,35 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "fanDisplayNameAtEvent",
+        "name": "firstObservedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "id",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "YES",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "fanAvatarUrlAtEvent",
+        "name": "identityKey",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "YES",
+        "is_nullable": "NO",
         "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "lastObservedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorNotificationEvent",
@@ -2028,23 +2064,7 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "postId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "commentId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "targetState",
+        "name": "normalizerVersion",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2052,15 +2072,7 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "amountCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "currency",
+        "name": "notificationId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -2068,17 +2080,9 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "disposition",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "reasonCode",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
         "is_nullable": "YES",
         "column_default": null
       },
@@ -2092,7 +2096,7 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "canonicalFactId",
+        "name": "postId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -2100,7 +2104,15 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "normalizerVersion",
+        "name": "reasonCode",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "scanRunId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2132,7 +2144,23 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "scanRunId",
+        "name": "sourceSubType",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "sourceType",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "targetState",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2140,15 +2168,23 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "firstObservedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
+        "name": "transactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
       },
       {
-        "table": "CreatorNotificationEvent",
-        "name": "lastObservedAt",
+        "table": "CreatorNotificationFrontierPage",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "createdAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "NO",
@@ -2164,7 +2200,23 @@
       },
       {
         "table": "CreatorNotificationFrontierPage",
-        "name": "agencyId",
+        "name": "cursorEnd",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "cursorStart",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "digest",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2187,36 +2239,12 @@
         "column_default": null
       },
       {
-        "table": "CreatorNotificationFrontierPage",
-        "name": "cursorStart",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationFrontierPage",
-        "name": "cursorEnd",
+        "table": "CreatorNotificationScanItem",
+        "name": "canonicalEventId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
-      },
-      {
-        "table": "CreatorNotificationFrontierPage",
-        "name": "digest",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationFrontierPage",
-        "name": "createdAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorNotificationScanItem",
@@ -2228,7 +2256,7 @@
       },
       {
         "table": "CreatorNotificationScanItem",
-        "name": "targetState",
+        "name": "normalizerVersion",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -2244,22 +2272,6 @@
       },
       {
         "table": "CreatorNotificationScanItem",
-        "name": "normalizerVersion",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationScanItem",
-        "name": "canonicalEventId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationScanItem",
         "name": "sourcePhase",
         "data_type": "text",
         "udt_name": "text",
@@ -2267,8 +2279,8 @@
         "column_default": null
       },
       {
-        "table": "CreatorNotificationSyncState",
-        "name": "normalizerVersion",
+        "table": "CreatorNotificationScanItem",
+        "name": "targetState",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -2283,8 +2295,24 @@
         "column_default": "'{}'::jsonb"
       },
       {
+        "table": "CreatorNotificationSyncState",
+        "name": "normalizerVersion",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
         "table": "CreatorRealtimeReceipt",
-        "name": "sessionId",
+        "name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeReceipt",
+        "name": "digest",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2300,27 +2328,27 @@
       },
       {
         "table": "CreatorRealtimeReceipt",
-        "name": "digest",
+        "name": "sessionId",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRealtimeReceipt",
-        "name": "capturedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorRealtimeSession",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "accessEpoch",
+        "data_type": "integer",
+        "udt_name": "int4",
         "is_nullable": "NO",
         "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "ackedSeq",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
       },
       {
         "table": "CreatorRealtimeSession",
@@ -2329,6 +2357,30 @@
         "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "captureFromAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "capturedSeq",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
       },
       {
         "table": "CreatorRealtimeSession",
@@ -2348,17 +2400,9 @@
       },
       {
         "table": "CreatorRealtimeSession",
-        "name": "memberId",
+        "name": "id",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRealtimeSession",
-        "name": "accessEpoch",
-        "data_type": "integer",
-        "udt_name": "int4",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -2372,19 +2416,11 @@
       },
       {
         "table": "CreatorRealtimeSession",
-        "name": "capturedSeq",
-        "data_type": "bigint",
-        "udt_name": "int8",
+        "name": "loss",
+        "data_type": "boolean",
+        "udt_name": "bool",
         "is_nullable": "NO",
-        "column_default": "0"
-      },
-      {
-        "table": "CreatorRealtimeSession",
-        "name": "ackedSeq",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": "0"
+        "column_default": "false"
       },
       {
         "table": "CreatorRealtimeSession",
@@ -2404,35 +2440,19 @@
       },
       {
         "table": "CreatorRealtimeSession",
+        "name": "memberId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
         "name": "resolvedLossRevision",
         "data_type": "integer",
         "udt_name": "int4",
         "is_nullable": "NO",
         "column_default": "0"
-      },
-      {
-        "table": "CreatorRealtimeSession",
-        "name": "capturedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRealtimeSession",
-        "name": "loss",
-        "data_type": "boolean",
-        "udt_name": "bool",
-        "is_nullable": "NO",
-        "column_default": "false"
-      },
-      {
-        "table": "CreatorRealtimeSession",
-        "name": "updatedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorRealtimeSession",
@@ -2444,19 +2464,11 @@
       },
       {
         "table": "CreatorRealtimeSession",
-        "name": "captureFromAt",
+        "name": "updatedAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": null
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorRecoveryIntent",
@@ -2464,70 +2476,6 @@
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "stream",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "reason",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "gapFrom",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "targetAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "policyVersion",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "status",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'PENDING'::text"
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "jobId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -2540,11 +2488,11 @@
       },
       {
         "table": "CreatorRecoveryIntent",
-        "name": "updatedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
+        "column_default": null
       },
       {
         "table": "CreatorRecoveryIntent",
@@ -2556,9 +2504,25 @@
       },
       {
         "table": "CreatorRecoveryIntent",
-        "name": "stoppedAt",
+        "name": "gapFrom",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "jobId",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
       },
@@ -2577,6 +2541,62 @@
         "udt_name": "timestamp",
         "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "policyVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "reason",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "status",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'PENDING'::text"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "stoppedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "stream",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "targetAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorRecoveryWatermark",
@@ -2628,11 +2648,11 @@
       },
       {
         "table": "MoneyResolutionAdoption",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "complete",
+        "data_type": "boolean",
+        "udt_name": "bool",
         "is_nullable": "NO",
-        "column_default": null
+        "column_default": "false"
       },
       {
         "table": "MoneyResolutionAdoption",
@@ -2644,11 +2664,11 @@
       },
       {
         "table": "MoneyResolutionAdoption",
-        "name": "complete",
-        "data_type": "boolean",
-        "udt_name": "bool",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "false"
+        "column_default": null
       },
       {
         "table": "OfProviderRequestGateState",
@@ -2668,7 +2688,7 @@
       },
       {
         "table": "ProviderCapacityCreatorBucket",
-        "name": "creatorId",
+        "name": "bucket",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2676,7 +2696,7 @@
       },
       {
         "table": "ProviderCapacityCreatorBucket",
-        "name": "bucket",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2705,14 +2725,6 @@
         "udt_name": "int8",
         "is_nullable": "NO",
         "column_default": "0"
-      },
-      {
-        "table": "ProviderCapacityDebtState",
-        "name": "topologyVersion",
-        "data_type": "character varying",
-        "udt_name": "varchar",
-        "is_nullable": "NO",
-        "column_default": "'creator_provider_capacity_v2'::character varying"
       },
       {
         "table": "ProviderCapacityDebtState",
@@ -2747,12 +2759,20 @@
         "column_default": "true"
       },
       {
-        "table": "_prisma_migrations",
-        "name": "id",
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyVersion",
         "data_type": "character varying",
         "udt_name": "varchar",
         "is_nullable": "NO",
-        "column_default": null
+        "column_default": "'creator_provider_capacity_v2'::character varying"
+      },
+      {
+        "table": "_prisma_migrations",
+        "name": "applied_steps_count",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
       },
       {
         "table": "_prisma_migrations",
@@ -2772,7 +2792,7 @@
       },
       {
         "table": "_prisma_migrations",
-        "name": "migration_name",
+        "name": "id",
         "data_type": "character varying",
         "udt_name": "varchar",
         "is_nullable": "NO",
@@ -2784,6 +2804,14 @@
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "_prisma_migrations",
+        "name": "migration_name",
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
@@ -2801,14 +2829,6 @@
         "udt_name": "timestamptz",
         "is_nullable": "NO",
         "column_default": "now()"
-      },
-      {
-        "table": "_prisma_migrations",
-        "name": "applied_steps_count",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": "0"
       }
     ],
     "enums": [],
@@ -3723,6 +3743,33 @@
         "options": "0",
         "expressions": null,
         "predicate": null
+      },
+      {
+        "table": "CampaignReadReceipt",
+        "name": "CampaignReadReceipt_kind_due177_idx",
+        "unique": false,
+        "keys": "1 3 6",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(\"nextDueAt\" IS NOT NULL)"
+      },
+      {
+        "table": "CampaignReadReceipt",
+        "name": "CampaignReadReceipt_window_due177_idx",
+        "unique": false,
+        "keys": "1 8",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": "((kind = 'MEMBER'::text) AND (\"windowDueAt\" IS NOT NULL))"
+      },
+      {
+        "table": "CampaignReadReceipt",
+        "name": "CampaignReadReceipt_window_repair177_idx",
+        "unique": false,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": "((kind = 'MEMBER'::text) AND (\"windowVersion\" = 0))"
       },
       {
         "table": "CreatorAnalyticsFactPublication",

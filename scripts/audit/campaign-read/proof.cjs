@@ -90,7 +90,7 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
  });
  await check('unknown NET, known zero, correction and undo preserve money evidence',async()=>{
   await write(tx=>tx.creatorFinancialTransaction.create({data:{id:'money-unknown',agencyId:s.agencyId,creatorId:s.creatorId,fanRecordId:'fan-d',externalTransactionId:'unknown',transactionType:'tip',amountCents:100,netCents:null,transactionStatus:'done',occurredAt:ago(0.1)}}));
-  assert.equal((await page()).totals,null);await drain();let p=await page();assert.equal(p.totals.netCents,null);assert.equal(p.totals.knownNetCents,240);assert.equal(p.totals.unknownNetTransactions,1);
+  assert.equal((await page()).projection.ready,false);assert.equal((await page()).totals.netCents,240);await drain();let p=await page();assert.equal(p.totals.netCents,null);assert.equal(p.totals.knownNetCents,240);assert.equal(p.totals.unknownNetTransactions,1);
   await write(tx=>tx.creatorFinancialTransaction.update({where:{id:'money-unknown'},data:{netCents:0}}));await drain();p=await page();assert.equal(p.totals.netCents,240);assert.equal(p.totals.unknownNetTransactions,0);assert.equal(p.totals.payingFans,2);
   await write(tx=>tx.creatorFinancialTransaction.update({where:{id:'money-unknown'},data:{transactionStatus:'undo'}}));await drain();p=await page();assert.equal(p.totals.payingFans,1);assert.equal(p.totals.transactionsCount,2);
   return{unknownPreserved:true,knownZeroPreserved:true,undoRetractsPayer:true};
@@ -133,7 +133,7 @@ async function check(name,fn){const result=await fn();checks.push({name,result})
   const observed=new Date(Date.now()-ttl+3000);
   await write(tx=>tx.creatorFanValueCurrent.update({where:{id:'value-a'},data:{valueObservedAt:observed}}));await drain();assert.equal((await page()).totals.ofValueKnownFans,1);
   const delay=Math.max(0,+observed+ttl-Date.now()+30);await new Promise(resolve=>setTimeout(resolve,delay));
-  assert.equal((await page()).totals,null);await drain();const p=await page();assert.equal(p.totals.ofValueKnownFans,0);assert.equal(p.totals.knownPlatformReportedFanSpendCents,0);
+  assert.equal((await page()).projection.ready,false);assert.equal((await page()).totals.knownPlatformReportedFanSpendCents,9000);await drain();const p=await page();assert.equal(p.totals.ofValueKnownFans,1);assert.equal(p.totals.ofValueStaleFans,4);assert.equal(p.totals.knownPlatformReportedFanSpendCents,9000);
   return{expiredWithoutCanonicalUpdate:true,projectionRefreshed:true};
  });
  await check('tenant and cursor scopes remain fenced; revoked viewer cannot read saved aggregates',async()=>{

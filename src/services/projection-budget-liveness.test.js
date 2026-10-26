@@ -45,7 +45,7 @@ test("Analytics publication executes one fenced unit after slow claim instead of
 test("Campaign seeding latency does not suppress the next durably admitted work class", async t => {
   let clock = 0, claims = 0, admissions = 0;
   t.mock.method(Date, "now", () => clock);
-  const db = { $queryRawUnsafe: async () => { clock += 2000; return [{ complete: true }]; } };
+  const db = { $executeRawUnsafe: async () => 0, $queryRawUnsafe: async () => { clock += 2000; return [{ complete: true, completedAt: new Date(1) }]; } };
   const service = load(t, "./campaign-read-projection-service", {
     "./db-commit-kernel": kernel,
     "./campaign-projection-policy": { enterCampaignProjection: async () => ({}), admitProjectionWorkClass: async () => { admissions++; return "CAMPAIGN_FACT"; } },

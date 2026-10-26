@@ -16,7 +16,8 @@ test('future payment is scheduled for its actual event time, never counted befor
 });
 test('FanData TTL, unavailable state, future clock ceiling, unknown and known zero stay distinct',()=>{
  const now=new Date('2026-10-01T12:00:00Z'),v={availability:'AVAILABLE',fetchedAt:new Date(+now-TTL+1),totalNetCents:0n};
- assert.equal(valueMetrics(v,now).metrics.ofValueKnownFans,'1');assert.equal(valueMetrics(v,new Date(+now+1)).metrics.ofValueKnownFans,'0');
+ assert.equal(valueMetrics(v,now).metrics.ofValueKnownFans,'1');assert.equal(valueMetrics(v,new Date(+now+1)).metrics.ofValueKnownFans,'1');
+ assert.equal(valueMetrics(v,new Date(+now+1)).metrics.ofValueStaleFans,'1');
  assert.equal(valueMetrics({...v,totalNetCents:null},now).metrics.ofValueUnknownFans,'1');
  assert.equal(valueMetrics({...v,availability:'UNAVAILABLE'},now).metrics.ofValueKnownFans,'0');
  assert.equal(valueMetrics({...v,fetchedAt:new Date(+now+300001)},now).metrics.ofValueKnownFans,'0');

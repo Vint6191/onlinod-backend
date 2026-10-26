@@ -543,6 +543,7 @@ async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {
     FROM "CreatorMediaAsset" a
     WHERE a."agencyId" = $1 AND a."creatorId" = $2 AND a."catalogActive" = true
   `, agencyId, id);
+  const moneyState = await require("./media-financial-projection-service").financialProjectionState(db, id);
   return {
     ok: true,
     summary: {
@@ -551,7 +552,9 @@ async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {
       totalSales: exactMediaCount(totals.totalSales),
       revenueCents: exactMediaCount(totals.revenueCents),
       revenueUnknownCount: exactMediaCount(totals.revenueUnknownCount),
-      revenueComplete: await require("./media-financial-projection-service").financialProjectionReady(db, id) && exactMediaCount(totals.revenueUnknownCount) === 0,
+      revenueAvailable: moneyState.available && exactMediaCount(totals.revenueUnknownCount) === 0,
+      revenuePending: moneyState.pending,
+      revenueComplete: moneyState.ready && exactMediaCount(totals.revenueUnknownCount) === 0,
       opened: exactMediaCount(totals.totalSales),
       notOpened: exactMediaCount(totals.notOpened),
       free: exactMediaCount(totals.free),
@@ -564,7 +567,7 @@ async function getMediaSalesSummary({ agencyId, creatorId, db = prisma }) {
 }
 
 
-function assetToSalesAsset(asset, ready = true) {
+function assetToSalesAsset(asset, moneyState = {ready:true,available:true,pending:false}) {
   return {
     id: String(asset.id),
     creatorId: String(asset.creatorId),
@@ -579,7 +582,9 @@ function assetToSalesAsset(asset, ready = true) {
     soldCount: integer(asset.soldCount),
     totalRevenueCents: integer(asset.revenueCents),
     revenueUnknownCount: integer(asset.revenueUnknownCount),
-    revenueComplete: ready && integer(asset.revenueUnknownCount) === 0,
+    revenueAvailable: moneyState.available && integer(asset.revenueUnknownCount) === 0,
+    revenuePending: moneyState.pending,
+    revenueComplete: moneyState.ready && integer(asset.revenueUnknownCount) === 0,
     uniqueBuyers: integer(asset.uniqueBuyers),
     averagePriceCents: integer(asset.averagePriceCents),
     openedCount: integer(asset.soldCount),
@@ -604,8 +609,8 @@ async function listMediaSalesAssets({ agencyId, creatorId, offset = 0, limit = 1
   const { rows: assets, count } = await readMediaPage(db, {
     where, orderBy: [{ revenueCents: "desc" }, { soldCount: "desc" }, { lastSoldAt: "desc" }, { mediaId: "asc" }], offset: skip, limit: take,
   });
-  const ready = await require("./media-financial-projection-service").financialProjectionReady(db, id);
-  const items = assets.map(asset => assetToSalesAsset(asset, ready));
+  const moneyState = await require("./media-financial-projection-service").financialProjectionState(db, id);
+  const items = assets.map(asset => assetToSalesAsset(asset, moneyState));
   return { ok: true, items, count, offset: skip, nextOffset: skip + items.length, hasMore: skip + items.length < count };
 }
 
