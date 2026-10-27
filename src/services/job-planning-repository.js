@@ -1,7 +1,7 @@
 "use strict";
 
 const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-service");
-const { fanDataRefreshScheduleAvailable, FAN_DATA_REFRESH_SCHEDULE_LOCK_KEY } = require("./provider-capacity-authority-service");
+const { fanDataRefreshScheduleAvailable, FAN_DATA_REFRESH_SCHEDULE_LOCK_KEY, FAN_DATA_REFRESH_MAX_PENDING_JOBS, FAN_DATA_REFRESH_MAX_PENDING_JOBS_PER_CREATOR } = require("./provider-capacity-authority-service");
 const { boundedFanIds } = require("./fan-data-input");
 
 const prisma = require("../prisma");
@@ -339,7 +339,11 @@ async function withFanRefreshAdmission(input, work, reuseDemand = false) {
     const alreadyPending = current && ["SCHEDULED", "CLAIMED", "PUBLISHING"].includes(current.status);
     if (!replayCreate && !alreadyPending) {
       const capacity = await fanDataRefreshScheduleAvailable(tx, creatorId);
-      if (!capacity.available) throw Object.assign(new Error("FAN_DATA_REFRESH_BACKLOG_FULL"), { code: "FAN_DATA_REFRESH_BACKLOG_FULL", status: 503, retryable: true, retryAfterMs: 30_000 });
+      if (!capacity.available) throw Object.assign(new Error("FAN_DATA_REFRESH_BACKLOG_FULL"), {
+        code: "FAN_DATA_REFRESH_BACKLOG_FULL", status: 503, retryable: true, retryAfterMs: 30_000,
+        capacity: { pendingGlobal: capacity.pendingGlobal, pendingCreator: capacity.pendingCreator,
+          maxPendingGlobal: FAN_DATA_REFRESH_MAX_PENDING_JOBS, maxPendingCreator: FAN_DATA_REFRESH_MAX_PENDING_JOBS_PER_CREATOR },
+      });
     }
     return work({ ...input, ...(identity && !input.job ? { job: identity } : {}), db: tx, params: { ...params, fanIds: ids } });
   });

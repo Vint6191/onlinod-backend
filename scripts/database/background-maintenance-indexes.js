@@ -6,6 +6,7 @@ const definitions = Object.freeze([
   { name: "OfProviderRequestGateWaiter_expiry_id_idx", table: "OfProviderRequestGateWaiter", expression: '"leaseUntil","waiterId"', unique: false },
   { name: "OfProviderRequestGateWaiter_bucket_ticket_idx", table: "OfProviderRequestGateWaiter", expression: '"priority","category","ticket"', unique: false },
   require("../../src/services/notification-identity-recovery-contract.json"),
+  require("../../src/services/notification-refresh-recovery-contract.json"),
 ].map(Object.freeze));
 async function ensureIndexes(db, { create = false } = {}) {
   for (const spec of definitions) {

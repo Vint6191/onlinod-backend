@@ -143,7 +143,7 @@ test("slow receipt work cannot starve either retained notification consequence c
       failDomainWorkClaim: async () => { throw Error("UNEXPECTED_PAGE_FAILURE"); },
     },
   });
-  const result = await service.runNotificationConsequenceSweep({ db: { jobInstance: { findUnique: async () => null } }, maxRuntimeMs: 500 });
+  const result = await service.runNotificationConsequenceSweep({ db: { $queryRawUnsafe: async () => [], jobInstance: { findUnique: async () => null } }, maxRuntimeMs: 500 });
   assert.equal(result.ok, true); assert.deepEqual(classes, ["NOTIFICATION_FACT_RECEIPTS", "V2", "LEGACY"]);
   assert.deepEqual(acknowledgements, ["V2", "LEGACY"]); assert.equal(result.completed, 3);
 });

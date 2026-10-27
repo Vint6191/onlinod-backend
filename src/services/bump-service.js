@@ -6,7 +6,7 @@ const { readSubscriberConsumerPage } = require("./fan-consumer-cursor-service");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { withDbAdvisoryXactLock } = require("./db-transaction-service");
 const { runWithAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
-const { projectFanObservationBatch, scheduleFanDataPointRefresh, scheduleDurableFanDataRefreshDebt, FAN_DATA_OBSERVATION_BATCH_MAX } = require("./fan-data-authority-service");
+const { projectFanObservationBatch, scheduleFanDataPointRefresh, scheduleDurableFanDataRefreshDebt, fanDataPointRefreshDecisionDurable, FAN_DATA_OBSERVATION_BATCH_MAX } = require("./fan-data-authority-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { onlineObservationFresh } = require("./bump-write-window-service");
 const { assertSubscriberPublicationIdle, validateSubscriberPublicationIdle } = require("./subscriber-publication-fence-service");
@@ -1065,7 +1065,7 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
         });
       });
       summary.subscriptionReconcile = { fanIds: observed.fanIds, decision: refreshDecision };
-      if (Number(refreshDecision?.requested || 0) > 0 && refreshDecision?.durable !== true) {
+      if (!fanDataPointRefreshDecisionDurable(refreshDecision)) {
         throw Object.assign(new Error("Subscription reconciliation was not durably scheduled"), { code: "FAN_REFRESH_INTENT_NOT_DURABLE" });
       }
 
@@ -1086,7 +1086,7 @@ async function processRuntimeEvents({ agencyId, creatorId, events = [], userId =
       });
       summary.planned += Number(plannedCount || 0);
     } catch (error) {
-      summary.errors.push({ type: "subscription_created", code: error?.code || "event_failed", error: String(error?.message || error).slice(0, 500) });
+      summary.errors.push(attachSchedulerFailureCause({ type: "subscription_created", code: error?.code || "event_failed", error: String(error?.message || error).slice(0, 500) }, error));
     }
   }
 

@@ -40,6 +40,7 @@ function loadBump(captures) {
         dbAuthorityNow: async () => new Date("2026-09-16T18:30:00.000Z"),
       };
       if (request === "./fan-data-authority-service") return {
+        fanDataPointRefreshDecisionDurable: require("./fan-data-authority-service").fanDataPointRefreshDecisionDurable,
         projectFanObservationBatch: async (_db, args) => {
           captures.authority.push(args);
           return { ok: true, projected: args.items.length };

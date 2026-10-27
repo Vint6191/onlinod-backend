@@ -37,6 +37,7 @@ test("SOURCE FINAL anti-map: every DomainWorkItem storage mutator is classified"
     "src/services/domain-work-authority-service.js",
     "src/services/domain-work-repair-service.js",
     "src/services/notification-identity-recovery-service.js",
+    "src/services/notification-refresh-recovery-service.js",
     "src/services/phase2-destructive-delete-authority-service.js",
   ], "A new DomainWorkItem writer must join C1 conservation + M1 executor review");
 });

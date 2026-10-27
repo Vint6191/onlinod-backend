@@ -2,7 +2,7 @@
 const { emitRuntimeDiagnostic, diagnosticError } = require("./runtime-diagnostic-log");
 const { MAINTENANCE_LANE_NAMES } = require("./maintenance-lane-registry");
 const OBSERVED = ["subscriberDirectoryMaintenance", "creatorRecurringPlanning", "notificationConsequences", "analyticsFactPublication"];
-const COUNTERS = ["processedSignals", "recoverySignals", "recoveredRuns", "advancedSteps", "reconciledJobs", "stateRepairs", "errors", "contended", "poisonedSignals", "processed", "claimed", "created", "failed", "scannedCreators", "createdJobs", "skippedJobs"];
+const COUNTERS = ["processedSignals", "recoverySignals", "recoveredRuns", "advancedSteps", "reconciledJobs", "stateRepairs", "errors", "contended", "poisonedSignals", "processed", "claimed", "created", "failed", "waiting", "backpressured", "recovered", "scannedCreators", "createdJobs", "skippedJobs"];
 function createMaintenanceProgressDiagnostics({ now = Date.now, emit = emitRuntimeDiagnostic } = {}) {
   const lanes = new Map(MAINTENANCE_LANE_NAMES.map(name => [name, { turns: 0, lastStartedAt: null, lastCompletedAt: null, result: null }]));
   let cycle = 0, stage = "NOT_STARTED", currentLane = null, startedAt = null, laneStartedAt = null;

@@ -20,3 +20,10 @@ test("admission failure and never-dispatched subscriber lane are distinguishable
   assert.equal(state.stage, "ADMISSION_FAILED"); assert.equal(state.lastError.code, "P2028");
   assert.equal(state.lanes.subscriberDirectoryMaintenance.turns, 0); assert.doesNotMatch(JSON.stringify(state), /private SQL/);
 });
+test("notification capacity wait and recovered quarantine remain visible in the periodic log", () => {
+  const d = createMaintenanceProgressDiagnostics();
+  d.finishLane("notificationConsequences", { ok: true, reason: "FAN_DATA_REFRESH_BACKLOG_FULL", waiting: 1, backpressured: 1, recovered: 2, failed: 0 });
+  const result = d.snapshot().lanes.notificationConsequences.result;
+  assert.equal(result.reason, "FAN_DATA_REFRESH_BACKLOG_FULL");
+  assert.equal(result.waiting, 1); assert.equal(result.backpressured, 1); assert.equal(result.recovered, 2); assert.equal(result.failed, 0);
+});

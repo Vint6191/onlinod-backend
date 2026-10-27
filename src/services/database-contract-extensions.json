@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v24_fan_ltv178",
+  "version": "nod_current_v25_notification_backpressure183",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -92,6 +92,10 @@
     {
       "migration": "20261026010000_fan_ltv178",
       "checksum": "3553339de7a62755f276458f594b62a7d8dbb203f2003dc65cf9fc114ad96c72"
+    },
+    {
+      "migration": "20261027000000_notification_refresh_backpressure",
+      "checksum": "991769eac572454c6f5fb4b03e771682e387b09df0a3e6aabd76d1c83fc4ad40"
     }
   ],
   "extension": {
@@ -5201,6 +5205,15 @@
         "options": "0",
         "expressions": null,
         "predicate": null
+      },
+      {
+        "table": "DomainWorkItem",
+        "name": "DomainWorkItem_notification_refresh_recovery_idx",
+        "unique": false,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": "((state = 'RECONCILE_REQUIRED'::text) AND (\"terminalCause\" = 'RETRY_EXHAUSTED:NOTIFICATION_BUMP_PROJECTION_FAILED:FAN_DATA_REFRESH_BACKLOG_FULL'::text) AND (\"workClass\" = ANY (ARRAY['NOTIFICATION_CONSEQUENCES'::text, 'NOTIFICATION_CONSEQUENCES_V2'::text, 'NOTIFICATION_FACT_RECEIPTS'::text])) AND ((\"lastRepair\" ->> 'kind'::text) IS DISTINCT FROM 'notification_refresh_capacity_recovery_v1'::text))"
       }
     ]
   }

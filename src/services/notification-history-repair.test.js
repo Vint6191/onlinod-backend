@@ -47,7 +47,8 @@ test("historical subscription repair schedules current reconciliation without al
   Module._load = function(name, parent, main) {
     if (parent?.filename === servicePath && name === "./fan-data-authority-service") return {
       FAN_DATA_OBSERVATION_BATCH_MAX: 500,
-      scheduleFanDataPointRefresh: async input => { requested = input; return { requested: 1, durable: true }; },
+      scheduleFanDataPointRefresh: async input => { requested = input; return { created: true, jobId: "fixture-refresh" }; },
+      fanDataPointRefreshDecisionDurable: require("./fan-data-authority-service").fanDataPointRefreshDecisionDurable,
     };
     if (parent?.filename === servicePath && name === "./automation-control-service") return {
       requireCreator: async () => assert.fail("history must not enter workflow observation"),

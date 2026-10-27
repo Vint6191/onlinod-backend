@@ -6,24 +6,33 @@ const { runRootCommit } = require("./db-commit-kernel");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { pauseDeletedAgencyProjection } = require("./analytics-projection-lifecycle-service");
+const { readSchedulerFailureCause } = require("./scheduler-failure-cause");
+const { emitRuntimeDiagnostic } = require("./runtime-diagnostic-log");
+const { recoverNotificationRefreshWork } = require("./notification-refresh-recovery-service");
 const LEGACY_WORK_CLASS = work.WORK_CLASS.NOTIFICATION_CONSEQUENCES;
 const WORK_CLASS = work.WORK_CLASS.NOTIFICATION_CONSEQUENCES_V2;
 const PAGE_SIZE = 50;
 const TABLES = ["creatorSale", "creatorTip", "creatorSubscriptionEvent"];
 const TERMINAL = new Set(["DONE", "FAILED", "CANCELLED", "CANCELED", "EXPIRED"]);
-function error(code) { return Object.assign(new Error(code), { code }); }
+function error(code, cause) { return Object.assign(new Error(code, cause ? { cause } : undefined), { code }); }
 function owned(result) { if (!result || result.lost) throw error("NOTIFICATION_CONSEQUENCE_CLAIM_LOST"); return result; }
 
 function consequenceFailureDetails(cause, item, failed, elapsedMs) {
   // Prisma messages can embed invocation arguments and database row contents.
   // Log bounded identifiers/classification only, never the raw payload or stack.
   const token = value => String(value || "").replace(/[^a-zA-Z0-9_.:-]/g, "").slice(0, 160) || null;
-  const text = String(cause?.meta?.message || cause?.meta?.error || cause?.message || "");
-  const databaseCode = String(cause?.meta?.code || "") || text.match(/\bcode:\s*"([A-Z0-9]{5})"/)?.[1] || null;
+  let original = cause;
+  const seen = new Set();
+  for (let depth = 0; original?.cause && depth < 8 && !seen.has(original.cause); depth++) {
+    seen.add(original); original = original.cause;
+  }
+  const text = String(original?.meta?.message || original?.meta?.error || original?.message || "");
+  const databaseCode = String(original?.meta?.code || "") || text.match(/\bcode:\s*"([A-Z0-9]{5})"/)?.[1] || null;
   const domainCode = text.match(/\b(?:PHASE\d|NOTIFICATION|TRAFFIC|DOMAIN_WORK|DB_COMMIT|SUBSCRIBER|BUMP|FAN_DATA)_[A-Z0-9_]+\b/)?.[0] || null;
   return { workId: token(item?.id), workClass: token(item?.workClass), jobId: token(item?.objectId),
-    creatorId: token(item?.creatorId), code: token(domainCode || cause?.code || cause?.name || "NOTIFICATION_CONSEQUENCE_FAILED"),
-    errorName: token(cause?.name), databaseCode: token(databaseCode),
+    creatorId: token(item?.creatorId), code: token(String(cause?.code || "").startsWith("NOTIFICATION_BUMP_PROJECTION_FAILED:")
+      ? cause.code : domainCode || cause?.code || cause?.name || "NOTIFICATION_CONSEQUENCE_FAILED"),
+    causeCode: token(original?.code || original?.name), errorName: token(original?.name), databaseCode: token(databaseCode),
     constraint: token(text.match(/constraint\s+[\\"]*([A-Za-z0-9_]+)/i)?.[1]),
     state: token(failed?.state), consecutiveFailures: Number(failed?.consecutiveFailures || 0),
     elapsedMs: Math.max(0, Math.round(elapsedMs)) };
@@ -71,7 +80,8 @@ async function projectFacts({ db, job, table, rows, historical = false, historyP
     const result = await require("./bump-service").processRuntimeEvents({
       db, agencyId: job.agencyId, creatorId: job.creatorId, events: subscriptions, reconcileOnly: historical,
     });
-    if (result?.errors?.length) throw error(`NOTIFICATION_BUMP_PROJECTION_FAILED:${result.errors[0].code}`);
+    if (result?.errors?.length) throw error(`NOTIFICATION_BUMP_PROJECTION_FAILED:${result.errors[0].code}`,
+      readSchedulerFailureCause(result.errors[0]));
   }
   return { retentionExcluded };
 }
@@ -146,7 +156,10 @@ async function processNotificationConsequencePage({ db, item, ownerToken }) {
 async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntimeMs = 5000 } = {}) {
   if (!db) db = require("../prisma");
   const started = performance.now();
-  const report = { ok: true, selected: 0, processed: 0, completed: 0, yielded: 0, waiting: 0, failed: 0, lostOwnership: 0, reason: null, errorDetails: [] };
+  const recovery = await recoverNotificationRefreshWork({ db });
+  const report = { ok: true, selected: 0, processed: 0, completed: 0, yielded: 0, waiting: 0,
+    backpressured: 0, recovered: recovery.resumed, failed: 0, lostOwnership: 0, reason: null, errorDetails: [] };
+  if (recovery.selected) emitRuntimeDiagnostic("notification refresh backlog recovery", "recovery", recovery, { level: "info" });
   // Claim one quantum at a time: do not hold a large batch's leases while the
   // first item waits. Shared DomainWork claim indexes provide agency fairness.
   let emptyLanes = 0;
@@ -159,8 +172,11 @@ async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntim
       perAgencyQuantum: 1, perPartitionQuantum: 1, leaseMs: 120000 });
     if (claim?.skipped) {
       report.skipped = true;
-      report.reason = claim.reason;
-      report.ok = claim.reason === "domain_work_dependency_wake_bridge_transition";
+      const transition = claim.reason === "domain_work_dependency_wake_bridge_transition";
+      if (!transition) {
+        report.ok = false;
+        if (!report.errorDetails.length) report.reason = claim.reason;
+      } else report.reason ||= claim.reason;
     }
     const item = claim?.items?.[0];
     if (!item) { if (++emptyLanes >= 3) break; continue; }
@@ -173,10 +189,34 @@ async function runNotificationConsequenceSweep({ db = null, limit = 8, maxRuntim
       report.processed += result.processed;
       for (const key of ["completed", "yielded", "waiting"]) if (result[key]) report[key] += 1;
     } catch (cause) {
+      // The entire projection page has rolled back. Release only this current
+      // lease, keeping its receipt/cursor and failure budget. A full enrichment
+      // queue is bounded backpressure, not a poisoned notification fact.
+      if (cause?.code === "NOTIFICATION_BUMP_PROJECTION_FAILED:FAN_DATA_REFRESH_BACKLOG_FULL"
+        && cause.cause?.code === "FAN_DATA_REFRESH_BACKLOG_FULL" && cause.cause.retryable === true) {
+        const yielded = await runRootCommit(db, async ({ tx }) => {
+          const now = await dbAuthorityNow({ db: tx });
+          return work.yieldDomainWorkClaim({ db: tx, item, ownerToken: claim.ownerToken,
+            availableAt: new Date(+now + 30_000) });
+        }, { profile: "JOB_CHUNK", authority: { kind: "NOTIFICATION_REFRESH_WAIT", agencyId: item.agencyId, creatorId: item.creatorId } });
+        if (yielded.lost) report.lostOwnership++;
+        else {
+          report.waiting++; report.backpressured++;
+          report.reason ||= "FAN_DATA_REFRESH_BACKLOG_FULL";
+          const capacity = Object.fromEntries(["pendingGlobal", "pendingCreator", "maxPendingGlobal", "maxPendingCreator"]
+            .filter(key => Number.isFinite(cause.cause.capacity?.[key])).map(key => [key, cause.cause.capacity[key]]));
+          emitRuntimeDiagnostic("notification projection waiting for fan refresh capacity", item.id, {
+            workId: item.id, workClass: item.workClass, creatorId: item.creatorId,
+            reason: "FAN_DATA_REFRESH_BACKLOG_FULL", retryAt: yielded.availableAt,
+            newerRevision: yielded.newerRevision, capacity,
+          }, { level: "info" });
+        }
+        continue;
+      }
       const failed = await work.failDomainWorkClaim({ db, item, ownerToken: claim.ownerToken, error: cause });
       report.ok = false;
       const detail = consequenceFailureDetails(cause, item, failed, performance.now() - executionStarted);
-      report.reason ||= detail.code;
+      if (!report.errorDetails.length) report.reason = detail.code;
       if (report.errorDetails.length < 5) report.errorDetails.push(detail);
       if (failed.lost) report.lostOwnership += 1; else report.failed += 1;
     }
