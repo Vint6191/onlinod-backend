@@ -6,6 +6,7 @@ const cors = require("cors");
 const helmet = require("helmet");
 const { createApiTrafficLimiter } = require("./middleware/api-traffic-limiter");
 const path = require("node:path");
+const { URL } = require("node:url");
 
 const authRoutes = require("./routes/auth");
 const creatorRoutes = require("./routes/creators");
@@ -51,7 +52,7 @@ const { authRequired, homeAuthRequired } = require("./middleware/auth");
 const { createRequestObservabilityMiddleware } = require("./middleware/request-observability");
 const prisma = require("./prisma");
 const logger = require("./utils/logger");
-const runtimeRelease = "recovery-175-v1";
+const runtimeRelease = "storage-startup-181-v1";
 const { buildBackendHealthSnapshot } = require("./utils/health-snapshot");
 const { readDatabaseContract, assertDatabaseContract } = require("./services/database-contract-service");
 const { startRecurringScheduler, stopRecurringScheduler, getRecurringSchedulerHealthSnapshot } = require("./services/job-scheduler");
@@ -94,7 +95,7 @@ function readAllowedOrigins() {
   try {
     const published = new URL(process.env.PUBLIC_BASE_URL || process.env.APP_URL);
     if (["https:", "http:"].includes(published.protocol)) extra.push(published.origin);
-  } catch (_) { /* Unconfigured deployments keep the explicit allowlist. */ }
+  } catch { /* Unconfigured deployments keep the explicit allowlist. */ }
   return new Set([...DEFAULT_ALLOWED_ORIGINS, ...extra]);
 }
 
@@ -338,6 +339,9 @@ async function startServer({ own, checkpoint }) {
   if (process.env.DIALOGS_DATABASE_URL || process.env.CRM_DATABASE_URL) {
     const stores = require('./services/conversation-storage/runtime').runtime();
     require('./services/conversation-storage/lifecycle').startConversationStores({ stores, own, log: logger });
+  } else {
+    logger.warn("conversation storage not configured", { code: "CONVERSATION_DATABASES_NOT_CONFIGURED",
+      required: ["DIALOGS_DATABASE_URL", "CRM_DATABASE_URL"], runtimeRelease });
   }
   const httpServer = require("node:http").createServer(app);
   const listening = new Promise((resolve, reject) => {

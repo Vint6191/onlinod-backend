@@ -42,6 +42,18 @@ test("C1 ordinals are versioned and cannot silently reorder equal-sequence class
  const fx=fixture({catalog:lanes.map((laneName,ordinal)=>({laneName,ordinal:ordinal+1}))});
  await assert.rejects(selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes}),{code:'MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH'});
 });
+test("catalog mismatch identifies the running process and both versions without advancing work", async () => {
+ const catalog = lanes.slice(1).map((laneName, ordinal) => ({ laneName, ordinal }));
+ const fx = fixture({ catalog });
+ await assert.rejects(selectPhase2MaintenanceLanes({ db: fx.db, laneNames: lanes }), error => {
+  assert.equal(error.code, 'MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH');
+  assert.deepEqual(error.expectedLanes, lanes);
+  assert.deepEqual(error.storedLanes, catalog.map(row => ({ name: row.laneName, ordinal: row.ordinal })));
+  assert.equal(error.processId, process.pid);
+  return true;
+ });
+ assert.equal(fx.advanced, false);
+});
 test("C1 skipped locked catalog returns bounded contention rather than a duplicate fallback",async()=>{
  const fx=fixture({selected:[]});const r=await selectPhase2MaintenanceLanes({db:fx.db,laneNames:lanes});
  assert.equal(r.ok,true);assert.equal(r.skipped,true);assert.equal(r.reason,'maintenance_admission_contended');assert.equal(r.contended,5);assert.deepEqual(r.selected,[]);

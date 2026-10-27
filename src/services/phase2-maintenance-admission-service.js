@@ -16,7 +16,11 @@ function validateMaintenanceLaneNames(laneNames) {
 function validateStoredCatalog(catalog) {
   if (catalog.length !== MAINTENANCE_LANE_NAMES.length || catalog.some((row, i) =>
     row.laneName !== MAINTENANCE_LANE_NAMES[i] || Number(row.ordinal) !== i)) {
-    throw failure("MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH");
+    const error = failure("MAINTENANCE_ADMISSION_SCHEMA_CATALOG_MISMATCH");
+    error.expectedLanes = [...MAINTENANCE_LANE_NAMES];
+    error.storedLanes = catalog.map(row => ({ name: row.laneName, ordinal: Number(row.ordinal) }));
+    error.processId = process.pid;
+    throw error;
   }
 }
 
