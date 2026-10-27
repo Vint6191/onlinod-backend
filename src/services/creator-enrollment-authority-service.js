@@ -464,6 +464,9 @@ async function observeCreatorPlatformProfile({
     });
   } catch (error) {
     if (creatorUniqueViolation(error)) throw codedError("CREATOR_ALREADY_EXISTS", "This OnlyFans username is already active in the agency", 409, { cause: error });
+    const sqlState = error?.code === "P2010" ? error.meta?.code : error?.code;
+    if (sqlState === "55P03") throw codedError("CREATOR_PROFILE_BUSY", "Creator profile is busy; retry the observation", 503,
+      { cause: error, retryable: true, retryAfterMs: 1000 });
     throw error;
   }
 }

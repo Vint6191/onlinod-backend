@@ -159,6 +159,17 @@ test("retry exhaustion is a controlled conflict, never a successful profile upda
   assert.equal(f.creators.get("a").avatarRevision, 0);
 });
 
+test("profile lock timeout is a retryable busy response after rollback, not a generic server failure", async () => {
+  const cause = Object.assign(new Error("private query"), { code: "P2010", meta: { code: "55P03" } });
+  const f = fixture({ failure: () => { throw cause; } });
+  await assert.rejects(observeCreatorPlatformProfile(input(f)), error => {
+    assert.equal(error.code, "CREATOR_PROFILE_BUSY"); assert.equal(error.status, 503);
+    assert.equal(error.retryable, true); assert.equal(error.retryAfterMs, 1000); assert.equal(error.cause, cause);
+    assert.doesNotMatch(error.message, /private query/); return true;
+  });
+  assert.equal(f.options.length, 1); assert.equal(f.creators.get("a").avatarRevision, 0);
+});
+
 test("a username unique violation is a business conflict and is never replayed", async () => {
   const f = fixture({ failure: () => { throw Object.assign(new Error("unique"), { code: "P2002" }); } });
   await assert.rejects(observeCreatorPlatformProfile(input(f)), { code: "CREATOR_ALREADY_EXISTS", status: 409 });

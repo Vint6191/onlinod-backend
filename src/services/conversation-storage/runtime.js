@@ -8,6 +8,7 @@ const { CrmRepository } = require("./crm-repository");
 const { CrmAnalysisService } = require("./crm-analysis-service");
 const { HistoryRelay } = require("./history-relay");
 const { readFanCurrent } = require("../fan-data-authority-service");
+const { readCapacity, assertCapacity } = require("./capacity");
 let singleton;
 const READS = new Set([
   "getIdentity",
@@ -53,13 +54,19 @@ class ConversationRuntime {
     this.core = core;
     this.dialogs = new DialogRepository(db.dialogs);
     this.models = new DialogReadModels(this.dialogs);
-    this.crm = new CrmRepository(db.crm, this.dialogs);
+    this.crm = new CrmRepository(db.crm, this.dialogs, {
+      read: (ctx, onlyFansUserIds) => readFanCurrent(core, { agencyId: ctx.agencyId, creatorId: ctx.creatorId, onlyFansUserIds }),
+      revision: async ctx => (await c.one(core,
+        'SELECT "lastRevision" FROM "CreatorEntityChangeHead" WHERE "agencyId"=$1 AND "creatorId"=$2',
+        ctx.agencyId, ctx.creatorId))?.lastRevision || 0n,
+    });
     this.crm.models = this.models;
     this.relay = new HistoryRelay(this.dialogs, this.crm);
     this.analysis = new CrmAnalysisService(this.crm, this.dialogs, this.relay);
     this.changes = new DialogChanges(this.dialogs, core);
     this.health = new Map();
     this.capacities = new Map();
+    this.capacityReads = new Map();
     this.pumpBusy = false;
   }
   async check(domain) {
@@ -69,24 +76,22 @@ class ConversationRuntime {
     this.health.set(domain, now);
   }
   async capacity(domain) {
-    const now = Date.now(),
-      previous = this.capacities.get(domain);
-    if (previous && now - previous.at < 10000) {
-      c.check(previous.ok, "CONVERSATION_DATABASE_CAPACITY", 507);
-      return;
-    }
+    const max = Number(process.env.CONVERSATION_BRANCH_MAX_BYTES || 850000000);
+    c.check(Number.isSafeInteger(max) && max > 0, "CONVERSATION_CAPACITY_CONFIG_INVALID", 503);
+    const previous = this.capacities.get(domain);
+    if (previous && previous.maxBytes === max && Date.now() - previous.at < 10000) return assertCapacity(previous);
     // All databases in this branch share disk. This is a physical size guard,
     // distinct from the per-model accounted quota. Other Neon branches/projects
     // must be budgeted by the operator; PostgreSQL cannot see them here.
-    const row = await c.one(
-      this.db[domain],
-      "SELECT sum(pg_database_size(oid))::bigint bytes FROM pg_database WHERE NOT datistemplate AND has_database_privilege(oid,'CONNECT')"
-    );
-    const max = Number(process.env.CONVERSATION_BRANCH_MAX_BYTES || 850000000);
-    c.check(Number.isSafeInteger(max) && max > 0, "CONVERSATION_CAPACITY_CONFIG_INVALID", 503);
-    const ok = Number(row.bytes) < max;
-    this.capacities.set(domain, { at: now, ok });
-    c.check(ok, "CONVERSATION_DATABASE_CAPACITY", 507);
+    let pending = this.capacityReads.get(domain);
+    if (!pending) {
+      pending = readCapacity(this.db[domain], domain, max).then(snapshot => {
+        this.capacities.set(domain, snapshot); return snapshot;
+      });
+      this.capacityReads.set(domain, pending);
+      void pending.finally(() => { if (this.capacityReads.get(domain) === pending) this.capacityReads.delete(domain); }).catch(() => undefined);
+    }
+    return assertCapacity(await pending);
   }
   async financial(ctx, fanId) {
     if (ctx.canViewMoney !== true) return { available: false, source: "financial-ledger", reason: "FORBIDDEN" };
@@ -304,7 +309,7 @@ class ConversationRuntime {
       // Unleased AI/profile/automation writes are deliberately not a public port.
     }
     if (target === "campaignProfiles") {
-      if (method === "readRevision") return Number((await this.crm.scope(ctx)).revision);
+      if (method === "readRevision") return this.crm.readRevision(ctx);
       if (method === "readPage") return this.crm.readPage(ctx, a);
       if (method === "listProfiles") {
         const page = await this.crm.readPage(ctx, a);

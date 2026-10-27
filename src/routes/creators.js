@@ -61,7 +61,7 @@ function looksLikeAllowedImage(filePath, mimeType) {
 }
 
 function safeUnlink(filePath) {
-  try { if (filePath) fs.unlinkSync(filePath); } catch (_) {}
+  try { if (filePath) fs.unlinkSync(filePath); } catch { /* Temporary upload cleanup is best effort. */ }
 }
 
 const upload = multer({
@@ -168,6 +168,9 @@ function creatorErrorResponse(res, error, fallbackCode, fallbackMessage) {
   }
   if (error?.status && error?.code) {
     const payload = { ok: false, code: error.code, error: error.message || fallbackMessage };
+    if (error.code === "CREATOR_PROFILE_BUSY") {
+      payload.retryable = true; payload.retryAfterMs = 1000; res.set("Retry-After", "1");
+    }
     if (error.creatorId) payload.creatorId = error.creatorId;
     if (error.currentConnectionState) payload.currentConnectionState = error.currentConnectionState;
     if (error.currentConnectionGeneration != null) payload.currentConnectionGeneration = error.currentConnectionGeneration;

@@ -15,6 +15,14 @@ const FORBIDDEN = new Set([
   "revision",
   "fieldVersions",
 ]);
+function currentIdentity(profile, identity) {
+  if (!identity) return profile;
+  const p = { ...profile, platformUsername: identity.username || "",
+    platformDisplayName: identity.platformDisplayName || "" };
+  p.fanName = p.preferredName || p.inferredPersonalName || p.legacyUnclassifiedName || p.platformDisplayName || "";
+  p.fanUsername = p.platformUsername;
+  return p;
+}
 function profileValue(row, notes = []) {
   const p = {
     ...globalThis.structuredClone(defaults.profile),
@@ -91,9 +99,31 @@ function cleanPatch(raw) {
   return patch;
 }
 class CrmRepository {
-  constructor(db, dialogs) {
+  constructor(db, dialogs, canonical = null) {
     this.db = db;
     this.dialogs = dialogs;
+    this.canonical = canonical;
+  }
+  async identities(ctx, fanIds) {
+    if (!this.canonical || !fanIds.length) return new Map();
+    const ids = [...new Set(fanIds.map(c.platformId))];
+    c.check(ids.length <= 100, "CRM_IDENTITY_PAGE_TOO_LARGE", 400);
+    const rows = await this.canonical.read(ctx, ids);
+    return new Map(rows.filter(row => ids.includes(String(row.onlyFansUserId)))
+      .map(row => [String(row.onlyFansUserId), row.platformIdentity]));
+  }
+  async identityRevision(ctx) {
+    return this.canonical ? BigInt(await this.canonical.revision(ctx)) : 0n;
+  }
+  combinedRevision(crmRevision, identityRevision) {
+    const revision = BigInt(crmRevision || 0) + identityRevision;
+    c.check(revision >= 0n && revision <= BigInt(Number.MAX_SAFE_INTEGER), "CAMPAIGN_REVISION_OVERFLOW", 503);
+    return Number(revision);
+  }
+  async readRevision(ctx) {
+    const identity = await this.identityRevision(ctx);
+    const scope = await c.one(this.db, "SELECT revision FROM crm_scope WHERE scope_id=$1 AND agency_id=$2", ctx.scopeId, ctx.agencyId);
+    return this.combinedRevision(scope?.revision, identity);
   }
   async scope(ctx, db = this.db) {
     await c.exec(
@@ -216,12 +246,14 @@ class CrmRepository {
   }
   async getProfile(ctx, fanId) {
     const row = await this.readProfile(ctx, fanId);
-    return profileValue(row, row.notes);
+    const identities = await this.identities(ctx, [fanId]);
+    return currentIdentity(profileValue(row, row.notes), identities.get(fanId));
   }
   async getPanelSnapshot(ctx, input) {
     const fanId = c.platformId(input.dialogId),
       row = await this.readProfile(ctx, fanId),
-      profile = profileValue(row, row.notes);
+      identities = await this.identities(ctx, [fanId]),
+      profile = currentIdentity(profileValue(row, row.notes), identities.get(fanId));
     let history = {
         available: false,
         error: "DIALOG_HISTORY_UNAVAILABLE",
@@ -442,10 +474,12 @@ class CrmRepository {
     });
   }
   async readPage(ctx, input) {
-    return c.transaction(this.db, async (tx) => {
+    const identityRevision = await this.identityRevision(ctx);
+    const page = await c.transaction(this.db, async (tx) => {
       await this.scope(ctx, tx);
       const scope = await c.one(tx, "SELECT * FROM crm_scope WHERE scope_id=$1 FOR SHARE", ctx.scopeId);
-      if (input.revision !== undefined) c.check(input.revision === Number(scope.revision), "CAMPAIGN_SOURCE_CHANGED");
+      const revision = this.combinedRevision(scope.revision, identityRevision);
+      if (input.revision !== undefined) c.check(input.revision === revision, "CAMPAIGN_SOURCE_CHANGED");
       const fields = [
         "platformDisplayName",
         "platformUsername",
@@ -486,12 +520,19 @@ class CrmRepository {
           profile: profileValue(row),
           updatedAt: c.iso(row.updated_at),
         })),
-        revision: Number(scope.revision),
+        revision,
         nextDialogId: more ? records.at(-1).fan_id : null,
       };
       c.bounded(result, 2097152);
       return result;
     });
+    // Cross-database canonical reads occur after releasing the CRM transaction.
+    // The monotone source head fences identities as well as manual CRM edits.
+    const identities = await this.identities(ctx, page.rows.map(row => row.fanId));
+    c.check(await this.identityRevision(ctx) === identityRevision, "CAMPAIGN_SOURCE_CHANGED");
+    for (const row of page.rows) row.profile = currentIdentity(row.profile, identities.get(row.fanId));
+    c.bounded(page, 2097152);
+    return page;
   }
   async receiveHistory(ctx, event) {
     return c.transaction(this.db, async (tx) => {
@@ -527,4 +568,4 @@ class CrmRepository {
     });
   }
 }
-module.exports = { CrmRepository, profileValue, cleanPatch };
+module.exports = { CrmRepository, profileValue, cleanPatch, currentIdentity };

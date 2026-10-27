@@ -72,10 +72,14 @@ router.post("/creators/:creatorId/call", async (req, res) => {
         creatorId: req.params.creatorId,
         code,
         sqlState: error.meta?.code || null,
+        ...(code === "CONVERSATION_DATABASE_CAPACITY" && error.capacity ? { capacity: error.capacity } : {}),
         durationMs: Date.now() - started,
       })
     );
-    res.status(status >= 400 && status <= 599 ? status : 503).json({ ok: false, code, error: code });
+    const retryAfterMs = code === "CONVERSATION_DATABASE_CAPACITY" ? 300000 : null;
+    if (retryAfterMs) res.set("Retry-After", String(retryAfterMs / 1000));
+    res.status(status >= 400 && status <= 599 ? status : 503).json({ ok: false, code, error: code,
+      ...(retryAfterMs ? { retryAfterMs } : {}) });
   } finally {
     if (admittedBytes) {
       active--;

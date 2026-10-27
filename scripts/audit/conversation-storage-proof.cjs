@@ -597,6 +597,29 @@ async function main() {
         ),
       { code: "HISTORY_INPUT_CONFLICT" }
     );
+    const beforeIdentity = await c.rows(crm.db, "SELECT fan_id,profile,revision FROM crm_profile WHERE scope_id=$1 ORDER BY fan_id", ctx.scopeId);
+    let identityHead = 20n;
+    crm.canonical = {
+      revision: async () => identityHead,
+      read: async (scope, ids) => {
+        assert.equal(scope.agencyId, ctx.agencyId);
+        return ids.map(id => ({ onlyFansUserId: id, platformIdentity: { username: `canonical${id}`, platformDisplayName: `Current ${id}` } }));
+      },
+    };
+    const currentPanel = await crm.getPanelSnapshot(ctx, { dialogId: "5678" });
+    assert.equal(currentPanel.profile.platformUsername, "canonical5678");
+    assert.equal((await crm.getProfile(ctx, "99999999")).platformUsername, "canonical99999999");
+    const currentPage = await crm.readPage(ctx, {});
+    assert.ok(currentPage.rows.every(row => row.profile.platformUsername === `canonical${row.fanId}`));
+    assert.equal(currentPage.revision, await crm.readRevision(ctx));
+    identityHead++;
+    await assert.rejects(crm.readPage(ctx, { revision: currentPage.revision }), { code: "CAMPAIGN_SOURCE_CHANGED" });
+    assert.deepEqual(await c.rows(crm.db, "SELECT fan_id,profile,revision FROM crm_profile WHERE scope_id=$1 ORDER BY fan_id", ctx.scopeId), beforeIdentity);
+    const { readCapacity, assertCapacity } = require("../../src/services/conversation-storage/capacity");
+    const measured = await readCapacity(db, "dialogs", 850000000);
+    assert.ok(measured.usedBytes > 0); assert.ok(measured.databases.length);
+    assert.throws(() => assertCapacity({ ...measured, maxBytes: 1 }), e => e.code === "CONVERSATION_DATABASE_CAPACITY" && e.capacity.usedBytes === measured.usedBytes);
+    console.log("184 canonical CRM identity/read-only composition, campaign source fence and physical capacity SQL PASS");
     console.log(
       "conversation-storage: independent schemas; identity/isolation; page/expired receipt replay; collector terminal/restore fences; history rewrite fences; CRM outage recovery; manual conflicts/notes; AI checkpoint, lease takeover and atomic completion; purchase withdrawal; media/daily projections; quota rollback PASS"
     );
