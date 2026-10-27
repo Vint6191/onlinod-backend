@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v25_notification_backpressure183",
+  "version": "nod_current_v26_entity_change_window187",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -96,6 +96,10 @@
     {
       "migration": "20261027000000_notification_refresh_backpressure",
       "checksum": "991769eac572454c6f5fb4b03e771682e387b09df0a3e6aabd76d1c83fc4ad40"
+    },
+    {
+      "migration": "20261027010000_entity_change_window187",
+      "checksum": "b519c8698885343c2361e6f53a3c2d63fa5b1375d1c165508dd6a7988dee87d2"
     }
   ],
   "extension": {

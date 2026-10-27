@@ -8,7 +8,10 @@ const { currentCommitContext, prepareCommit, runRootCommit } = require("./db-com
 const { hashCanonicalJson } = require("./realtime-receipt-hash");
 const { performance } = require("node:perf_hooks");
 const TYPES = Object.freeze(["MESSAGE_PURCHASE", "HOME", "CRM", "CAMPAIGN", "FAN", "MEDIA", "TEAM", "AUDIENCE", "TRAFFIC"]);
-const MAX_PAGE = 200, MAX_STAGED = 12000, MAX_CONTRIBUTORS = 40000, MAX_PAYLOAD_BYTES = 8192, RETENTION_DAYS = 30;
+const MAX_PAGE = 200, MAX_STAGED = 12000, MAX_CONTRIBUTORS = 40000, MAX_PAYLOAD_BYTES = 8192;
+// This is a delivery window, not an audit ledger. Current snapshots are the
+// durable recovery source for devices which miss the window.
+const RETENTION_DAYS = 1, MAX_RETAINED_CHANGES = 20000;
 const stages = new WeakMap();
 const fail = (code, status = 409) => Object.assign(new Error(code), { code, status });
 const compare = (left, right) => left < right ? -1 : left > right ? 1 : 0;
@@ -177,7 +180,7 @@ async function publishCanonicalFactInvalidations({ db, agencyId, creatorId, mode
 async function persistCreator(db, { agencyId, creatorId, changes }) {
   await db.$executeRawUnsafe(`INSERT INTO "CreatorEntityChangeHead"("creatorId","agencyId") VALUES($1,$2)
     ON CONFLICT("creatorId") DO NOTHING`, creatorId, agencyId);
-  const [head] = await db.$queryRawUnsafe(`SELECT "lastRevision" FROM "CreatorEntityChangeHead"
+  const [head] = await db.$queryRawUnsafe(`SELECT "lastRevision","retainedFrom" FROM "CreatorEntityChangeHead"
     WHERE "creatorId"=$1 AND "agencyId"=$2 FOR UPDATE`, creatorId, agencyId);
   if (!head) throw fail("ENTITY_CHANGE_SCOPE_MISMATCH");
   const inputs = [...changes.values()].map(combineInvalidation).sort((a, b) => compare(a.entityType,b.entityType) || compare(a.entityId,b.entityId));
@@ -211,9 +214,20 @@ async function persistCreator(db, { agencyId, creatorId, changes }) {
     FROM jsonb_to_recordset($3::jsonb) x(revision bigint,"entityType" text,"entityId" text,"sourceIdentity" text,"sourceVersion" text,payload jsonb,tombstone boolean)
     ON CONFLICT("creatorId","entityType","entityId") DO UPDATE SET revision=EXCLUDED.revision,"sourceIdentity"=EXCLUDED."sourceIdentity",
       "sourceVersion"=EXCLUDED."sourceVersion",payload=EXCLUDED.payload,tombstone=EXCLUDED.tombstone,"updatedAt"=clock_timestamp()`, creatorId, agencyId, json);
-  await db.$executeRawUnsafe(`UPDATE "CreatorEntityChangeHead" SET "lastRevision"=$3,"updatedAt"=clock_timestamp(),
-      "nextRetentionAt"=COALESCE("nextRetentionAt",clock_timestamp()+interval '30 days')
-    WHERE "creatorId"=$1 AND "agencyId"=$2`, creatorId, agencyId, last);
+  const floor = BigInt(head.retainedFrom), desiredFloor = last - BigInt(MAX_RETAINED_CHANGES) + 1n;
+  // Each append pays for at most the same number of old rows. A fresh window
+  // cannot grow past the cap, even with no maintenance worker. A legacy backlog
+  // cannot grow either; its remainder is drained by bounded maintenance pages.
+  // Never turn a one-row fact commit into a scan/delete of the old million rows.
+  const paidFloor = floor + BigInt(writes.length);
+  const nextFloor = desiredFloor > floor ? (desiredFloor < paidFloor ? desiredFloor : paidFloor) : floor;
+  if (nextFloor > floor) await db.$executeRawUnsafe(`DELETE FROM "CreatorEntityChange"
+    WHERE "creatorId"=$1 AND "agencyId"=$2 AND revision >= $3 AND revision < $4`, creatorId, agencyId, floor, nextFloor);
+  await db.$executeRawUnsafe(`UPDATE "CreatorEntityChangeHead" SET "lastRevision"=$3,"retainedFrom"=$4,"updatedAt"=clock_timestamp(),
+      "nextRetentionAt"=CASE WHEN $3::bigint-$4::bigint+1>$5::int THEN clock_timestamp()
+        ELSE LEAST(COALESCE("nextRetentionAt",clock_timestamp()+($6::int*interval '1 day')),
+          clock_timestamp()+($6::int*interval '1 day')) END
+    WHERE "creatorId"=$1 AND "agencyId"=$2`, creatorId, agencyId, last, nextFloor, MAX_RETAINED_CHANGES, RETENTION_DAYS);
 }
 
 const wire = row => ({ revision: String(row.revision), entityType: row.entityType, entityId: row.entityId,
@@ -237,6 +251,13 @@ async function readEntityChanges({ db, agencyId, creatorId, afterRevision = "0",
   const rows = await db.$queryRawUnsafe(`SELECT revision,"entityType","entityId","sourceIdentity","sourceVersion",payload,tombstone
     FROM "CreatorEntityChange" WHERE "creatorId"=$1 AND "agencyId"=$2 AND revision>$3 AND revision<=$4 ORDER BY revision LIMIT $5`,
   creatorId, agencyId, after, head.lastRevision, size + 1);
+  // A one-time physical journal reclamation can cross an older MVCC snapshot.
+  // Never advance across a missing revision, or report that reader as caught up.
+  if (rows.some((row, index) => BigInt(row.revision) !== after + BigInt(index) + 1n)
+      || (rows.length <= size && BigInt(rows.at(-1)?.revision ?? after) < head.lastRevision)) {
+    throw Object.assign(fail("RECONCILE_REQUIRED"), { retainedFrom: head.retainedFrom.toString(),
+      headRevision: head.lastRevision.toString(), protocolVersion: 1 });
+  }
   const changes = rows.slice(0, size).map(wire);
   return { protocolVersion: 1, creatorId, changes, nextRevision: changes.at(-1)?.revision || after.toString(),
     headRevision: head.lastRevision.toString(), retainedFrom: head.retainedFrom.toString(), hasMore: rows.length > size };
@@ -259,7 +280,7 @@ async function readCurrentEntities({ db, agencyId, creatorId, snapshotBarrier, a
 
 // Compact only a contiguous prefix. Current entity snapshots survive retention,
 // so an offline device never pins history and can reconcile in bounded pages.
-async function retainPage(db, { limit = 500 } = {}) {
+async function retainPageResult(db, { limit = 500 } = {}) {
   if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw fail("ENTITY_CHANGE_RETENTION_INVALID", 400);
   // Only due heads enter the indexed queue. A creator with a large backlog
   // returns to the end of that queue after every bounded page, and a held head
@@ -267,28 +288,37 @@ async function retainPage(db, { limit = 500 } = {}) {
   const heads = await db.$queryRawUnsafe(`SELECT * FROM "CreatorEntityChangeHead"
     WHERE "nextRetentionAt"<=statement_timestamp() ORDER BY "nextRetentionAt","creatorId"
     LIMIT 1 FOR UPDATE SKIP LOCKED`);
-  if (!heads.length) return 0;
+  if (!heads.length) return { selected: false, deleted: 0 };
   const head = heads[0];
-  const candidates = await db.$queryRawUnsafe(`SELECT revision,("createdAt"<clock_timestamp()-($2::int*interval '1 day')) AS expired
-    FROM "CreatorEntityChange" WHERE "creatorId"=$1 ORDER BY revision LIMIT $3`, head.creatorId, RETENTION_DAYS, limit);
+  const countThrough = BigInt(head.lastRevision) - BigInt(MAX_RETAINED_CHANGES);
+  const candidates = await db.$queryRawUnsafe(`SELECT revision,
+      (revision <= $4::bigint OR "createdAt"<=clock_timestamp()-($2::int*interval '1 day')) AS expired
+    FROM "CreatorEntityChange" WHERE "creatorId"=$1 ORDER BY revision LIMIT $3`, head.creatorId, RETENTION_DAYS, limit, countThrough);
   const prefix = [];
   for (const row of candidates) { if (!row.expired) break; prefix.push(row.revision); }
   const through = prefix.length ? BigInt(prefix.at(-1)) : BigInt(head.retainedFrom) - 1n;
   if (prefix.length) await db.$executeRawUnsafe(`DELETE FROM "CreatorEntityChange" WHERE "creatorId"=$1 AND revision<=$2`, head.creatorId, through);
   await db.$executeRawUnsafe(`UPDATE "CreatorEntityChangeHead" SET "retainedFrom"=$2,"updatedAt"=clock_timestamp(),
-    "nextRetentionAt"=(SELECT GREATEST(clock_timestamp(),c."createdAt"+($3::int*interval '1 day'))
+    "nextRetentionAt"=(SELECT CASE WHEN c.revision <= $4::bigint THEN clock_timestamp()
+        ELSE GREATEST(clock_timestamp(),c."createdAt"+($3::int*interval '1 day')) END
       FROM "CreatorEntityChange" c WHERE c."creatorId"=$1 ORDER BY c.revision LIMIT 1)
-    WHERE "creatorId"=$1`, head.creatorId, through + 1n, RETENTION_DAYS);
-  return prefix.length;
+    WHERE "creatorId"=$1`, head.creatorId, through + 1n, RETENTION_DAYS, countThrough);
+  return { selected: true, deleted: prefix.length };
+}
+async function retainPage(db, options) {
+  return (await retainPageResult(db, options)).deleted;
 }
 async function runRetentionSweep({ db = require("../prisma"), maxPages = 8, maxRuntimeMs = 4000 } = {}) {
-  const report = { ok: true, processed: 0 }, started = performance.now();
+  const report = { ok: true, processed: 0, pages: 0 }, started = performance.now();
   for (let i = 0; i < Math.min(32, Math.max(1, maxPages)); i++) {
-    const count = await runRootCommit(db, ({ tx }) => retainPage(tx), { profile: "RETENTION_MUTATION", timeout: 5000, deadlineMs: 7000 });
-    report.processed += count;
-    if (!count || performance.now() - started >= maxRuntimeMs) break;
+    const page = await runRootCommit(db, ({ tx }) => retainPageResult(tx), { profile: "RETENTION_MUTATION", timeout: 5000, deadlineMs: 7000 });
+    report.processed += page.deleted;
+    report.pages += Number(page.selected);
+    // A due head can have nothing left to delete after a publisher trimmed it.
+    // Reschedule that head and continue; it is not proof the queue is empty.
+    if (!page.selected || performance.now() - started >= maxRuntimeMs) break;
   }
   return report;
 }
 
-module.exports = { TYPES, MAX_PAGE, publishEntityChanges, publishCanonicalSales, publishCanonicalFactInvalidations, readEntityChanges, readCurrentEntities, retainPage, runRetentionSweep };
+module.exports = { TYPES, MAX_PAGE, RETENTION_DAYS, MAX_RETAINED_CHANGES, publishEntityChanges, publishCanonicalSales, publishCanonicalFactInvalidations, readEntityChanges, readCurrentEntities, retainPage, runRetentionSweep };

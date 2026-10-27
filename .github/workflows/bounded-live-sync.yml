@@ -122,6 +122,14 @@ jobs:
         run: node scripts/audit/creator-entity-change-proof.cjs | tee creator-entity-change-proof.log
         env:
           ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_entity_change
+      - name: Create isolated database for bounded entity change windows
+        run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_entity_window187'
+        env:
+          PGPASSWORD: fixture-only
+      - name: Journal count and age bounds, rollback, physical reclamation and offline recovery
+        run: node scripts/audit/entity-change-window187-proof.cjs | tee entity-change-window187-proof.log
+        env:
+          ONLINOD_NATIVE_TEST_DATABASE_URL: postgresql://postgres:fixture-only@127.0.0.1:5432/onlinod_test_entity_window187
       - name: Create isolated database for job_claim_fairness
         run: psql --host 127.0.0.1 --username postgres --dbname postgres --command 'CREATE DATABASE onlinod_test_job_claim_fairness'
         env:
@@ -170,6 +178,7 @@ jobs:
             maintenance-admission-upgrade-proof.log
             maintenance-upgrade-subscriber-proof.log
             creator-entity-change-proof.log
+            entity-change-window187-proof.log
             job-claim-fairness-proof.log
             media-usage-facts-proof.log
             source-bound-timezone171-proof.log
