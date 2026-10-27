@@ -64,3 +64,23 @@ test('diagnostic counts and samples remain finite and bounded', () => {
   assert.equal(details.failed, 0); assert.equal(details.errors, 2); assert.equal(details.contended, 0); assert.equal(details.poisonedSignals, 0);
   assert.equal(details.errorDetails.length, 5); assert.equal(details.poisonedSample.length, 5);
 });
+
+test('recurring planner diagnostics retain the actual issues, retry and lease loss without copying private errors', () => {
+  const details = maintenanceDegradedDetails({ creatorRecurringPlanning: {
+    ok: false, reason: 'derived_planning_degraded', totalDegraded: 8, retried: 2, lostOwnership: 1,
+    degradedCreators: Array(10).fill({ creatorId: 'creator-1', issues: Array(10).fill({
+      work: 'analytics_planning', reason: 'P2034', code: 'TRANSACTION_CONFLICT',
+      error: 'postgresql://secret:password@database/customer', failures: ['failure'],
+    }) }),
+  } }).creatorRecurringPlanning;
+  assert.equal(details.totalDegraded, 8); assert.equal(details.retried, 2); assert.equal(details.lostOwnership, 1);
+  assert.equal(details.degradedCreators.length, 4); assert.equal(details.degradedCreators[0].issues.length, 4);
+  assert.deepEqual(details.degradedCreators[0].issues[0], {
+    work: 'analytics_planning', reason: 'P2034', code: 'TRANSACTION_CONFLICT', failures: 1,
+  });
+  assert.doesNotMatch(JSON.stringify(details), /secret|password|database/);
+  const invalid = maintenanceDegradedDetails({ lane: { ok: false, totalDegraded: Infinity,
+    degradedCreators: [{ creatorId: null, issues: [null, { reason: 'customer message' }] }],
+  } }).lane;
+  assert.equal(invalid.totalDegraded, 0); assert.equal(invalid.degradedCreators[0].issues[1].reason, null);
+});

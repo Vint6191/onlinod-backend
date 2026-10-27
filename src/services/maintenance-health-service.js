@@ -7,6 +7,7 @@ function boundedCount(value) {
 }
 function maintenanceDegradedDetails(result) {
   const degraded = {};
+  const identifier = value => typeof value === "string" && /^[A-Za-z0-9_.:-]{1,160}$/.test(value) ? value : null;
   for (const [name, lane] of Object.entries(result || {})) {
     if (!lane || typeof lane !== "object" || lane.ok !== false) continue;
     degraded[name] = {
@@ -19,6 +20,17 @@ function maintenanceDegradedDetails(result) {
         ? lane.blockedCollectors.filter(stream => ["financial", "notifications", "campaigns", "subscribers"].includes(stream)).slice(0, 4) : [],
       planningReasons: Object.fromEntries(Object.entries(lane.planningReasons || {}).slice(0, 33)
         .filter(([reason]) => /^[A-Za-z0-9_.:-]{1,160}$/.test(reason)).map(([reason, count]) => [reason, boundedCount(count)])),
+      // Recurring planning reports its failures here, not in lane.errors.
+      // Preserve actionable codes without copying exception text, SQL or data.
+      totalDegraded: boundedCount(lane.totalDegraded), retried: boundedCount(lane.retried),
+      lostOwnership: boundedCount(lane.lostOwnership),
+      degradedCreators: Array.isArray(lane.degradedCreators) ? lane.degradedCreators.slice(0, 4).map(creator => ({
+        creatorId: identifier(creator?.creatorId),
+        issues: Array.isArray(creator?.issues) ? creator.issues.slice(0, 4).map(issue => ({
+          work: identifier(issue?.work), reason: identifier(issue?.reason), code: identifier(issue?.code),
+          failures: boundedCount(issue?.failures),
+        })) : [],
+      })) : [],
       errorDetails: Array.isArray(lane.errorDetails) ? lane.errorDetails.slice(0, 5) : [],
       poisonedSample: Array.isArray(lane.poisonedSample) ? lane.poisonedSample.slice(0, 5) : [],
       error: lane.error ? String(lane.error).slice(0, 500) : null,
