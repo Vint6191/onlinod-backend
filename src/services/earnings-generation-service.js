@@ -20,20 +20,21 @@ async function tryLock(db, creatorId) {
 async function upsert(db, generation, rows) {
   if (!rows.length) return [];
   return db.$queryRawUnsafe(`INSERT INTO "CreatorEarningsGenerationEntry"
-    (generation,"transactionId","occurredAt",category,"netCents","grossCents",status,"observedAt")
-    SELECT $1,x."transactionId",x."occurredAt",x.category,x."netCents",x."grossCents",x.status,x."observedAt"
-    FROM jsonb_to_recordset($2::jsonb) x("transactionId" text,"occurredAt" timestamp,category text,"netCents" bigint,"grossCents" bigint,status text,"observedAt" timestamp)
+    (generation,"transactionId","occurredAt",category,"netCents","grossCents",status,"observedAt","fanOnlyFansUserId")
+    SELECT $1,x."transactionId",x."occurredAt",x.category,x."netCents",x."grossCents",x.status,x."observedAt",x."fanOnlyFansUserId"
+    FROM jsonb_to_recordset($2::jsonb) x("transactionId" text,"occurredAt" timestamp,category text,"netCents" bigint,"grossCents" bigint,status text,"observedAt" timestamp,"fanOnlyFansUserId" text)
     ORDER BY x."transactionId"
     ON CONFLICT(generation,"transactionId") DO UPDATE SET "occurredAt"=EXCLUDED."occurredAt",category=EXCLUDED.category,
-      "netCents"=EXCLUDED."netCents","grossCents"=EXCLUDED."grossCents",status=EXCLUDED.status,"observedAt"=EXCLUDED."observedAt"
+      "netCents"=EXCLUDED."netCents","grossCents"=EXCLUDED."grossCents",status=EXCLUDED.status,"observedAt"=EXCLUDED."observedAt",
+      "fanOnlyFansUserId"=COALESCE(EXCLUDED."fanOnlyFansUserId","CreatorEarningsGenerationEntry"."fanOnlyFansUserId")
     WHERE "CreatorEarningsGenerationEntry"."observedAt"<=EXCLUDED."observedAt" RETURNING "transactionId"`, generation,
     JSON.stringify(rows, (_, v) => typeof v === "bigint" ? v.toString() : v));
 }
 async function activeEntry(db, creatorId, transactionId) {
-  const [row] = await db.$queryRawUnsafe(`SELECT e."transactionId",e."occurredAt",e.category,e."netCents",e."grossCents",e.status,e."observedAt",e.generation FROM "CreatorEarningsLedgerProof" p
+  const [row] = await db.$queryRawUnsafe(`SELECT e."transactionId",e."occurredAt",e.category,e."netCents",e."grossCents",e.status,e."observedAt",e."fanOnlyFansUserId",e.generation FROM "CreatorEarningsLedgerProof" p
     JOIN "CreatorEarningsGenerationEntry" e ON e.generation=p."activeGeneration"
     WHERE p."creatorId"=$1 AND e."transactionId"=$2
-    UNION ALL SELECT e.* FROM (SELECT "transactionId","occurredAt",category,"netCents","grossCents",status,"observedAt",NULL::text AS generation
+    UNION ALL SELECT e.* FROM (SELECT "transactionId","occurredAt",category,"netCents","grossCents",status,"observedAt","fanOnlyFansUserId",NULL::text AS generation
       FROM "CreatorEarningsLedgerEntry" WHERE "creatorId"=$1 AND "transactionId"=$2) e
     WHERE NOT EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$1 AND "activeGeneration" IS NOT NULL)`, creatorId, transactionId);
   return row || null;
@@ -44,11 +45,12 @@ async function writeLive(db, scope, row) {
     WHERE "creatorId"=$1 AND mode='SNAPSHOT' AND state IN ('ACTIVE','BUILDING','READY') ORDER BY id`, scope.creatorId);
   if (!targets.some(x => x.state === "ACTIVE")) {
     await db.$executeRawUnsafe(`INSERT INTO "CreatorEarningsLedgerEntry"
-      ("agencyId","creatorId","transactionId","occurredAt",category,"netCents",status,"observedAt","grossCents")
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT("creatorId","transactionId") DO UPDATE SET
+      ("agencyId","creatorId","transactionId","occurredAt",category,"netCents",status,"observedAt","grossCents","fanOnlyFansUserId")
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT("creatorId","transactionId") DO UPDATE SET
       "occurredAt"=EXCLUDED."occurredAt",category=EXCLUDED.category,"netCents"=EXCLUDED."netCents",
-      "grossCents"=EXCLUDED."grossCents",status=EXCLUDED.status,"observedAt"=EXCLUDED."observedAt"`, scope.agencyId,scope.creatorId,row.transactionId,
-      row.occurredAt,row.category,row.netCents,row.status,row.observedAt,row.grossCents ?? null);
+      "grossCents"=EXCLUDED."grossCents",status=EXCLUDED.status,"observedAt"=EXCLUDED."observedAt",
+      "fanOnlyFansUserId"=COALESCE(EXCLUDED."fanOnlyFansUserId","CreatorEarningsLedgerEntry"."fanOnlyFansUserId")`, scope.agencyId,scope.creatorId,row.transactionId,
+      row.occurredAt,row.category,row.netCents,row.status,row.observedAt,row.grossCents ?? null,row.fanOnlyFansUserId ?? null);
   }
   for (const target of targets) await upsert(db,target.id,[row]);
 }
@@ -100,7 +102,7 @@ async function preparePage(db, job, run) {
       if (v.netCents == null || !Number.isSafeInteger(net) || net<0 || v.currency!=="USD" || !["done","loading","undo"].includes(v.transactionStatus)) { invalid++; continue; }
       if (!oldest || +f.occurredAt<+oldest) oldest=f.occurredAt;
       values.push({transactionId:f.externalId,occurredAt:f.occurredAt,netCents:net,grossCents:v.amountCents ?? null,status:v.transactionStatus,observedAt:snapshot,
-        category:earningsCategory(v)});
+        category:earningsCategory(v),fanOnlyFansUserId:require("./fan-ltv-model").fanId(v.fanOnlyFansUserId)});
     }
     // The complete immutable receipt is checked before preparation. Each delta
     // is already an exact financial fact; only the range proof waits for finalization.

@@ -11,7 +11,7 @@
     "dev": "node src/server.js",
     "start": "node src/server.js",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "node scripts/database/install-current.js",
+    "prisma:migrate": "node scripts/database/install-all.js",
     "prisma:dev": "prisma migrate dev",
     "prisma:push": "node scripts/database/reject-schema-push.js",
     "postinstall": "prisma generate",
@@ -56,7 +56,10 @@
     "test:settings-acceptance": "node scripts/audit/current-settings-acceptance-proof.cjs",
     "test:admin-acceptance": "node scripts/audit/current-admin-acceptance-proof.cjs",
     "test:device-recovery-acceptance": "node scripts/audit/current-device-recovery-acceptance-proof.cjs",
-    "test:billing-events": "node scripts/audit/current-billing-event-acceptance-proof.cjs"
+    "test:billing-events": "node scripts/audit/current-billing-event-acceptance-proof.cjs",
+    "conversation:migrate": "node scripts/database/install-conversation-stores.js",
+    "audit:conversation": "node scripts/audit/conversation-storage-proof.cjs",
+    "conversation:reconcile": "node scripts/database/reconcile-conversations.js"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",

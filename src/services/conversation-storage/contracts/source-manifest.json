@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "sourceHashes": {
+    "apps/desktop/electron/main/services/dialog-messages/analysis-result-validator.ts": "f53be257658bcc7c239784f738c2999970fe2407e9f9e7aabe0024d590e9596c",
+    "apps/desktop/electron/main/services/dialog-messages/analysis-storage-contract.ts": "8934a3ef18a37d4be592947d45f8ace3a6062130e533bebff0dab7c3d9948446",
+    "apps/desktop/electron/main/services/dialog-messages/crm-analysis.ts": "9af5c04561ae39a9ac46f2f98adc018efadbd76b613526f5dbd3827070e7fb57",
+    "apps/desktop/electron/main/services/dialog-messages/crm-fetish-taxonomy.ts": "49baa49605975c2cb62ffff6d2f8b8dcb56e7ecda31a5e80262de2ed6193575c",
+    "apps/desktop/electron/main/services/dialog-messages/crm-profile-codec.ts": "417b72045f99a98225378d66a0176c1b9ee3a7995a49ce9a13b5fda282e0e6a4",
+    "apps/desktop/electron/main/services/dialog-messages/dialog-db-budget.ts": "ae23b991278c504fc2b5c0af69b4849cfe90415c176b64438626d36287c81eb4",
+    "apps/desktop/electron/main/services/dialog-messages/dialog-messages-codec.ts": "a4d5725f0b9a769eb66ff19f1dd6ccfa9c56ea17cb0f8c944d7bbc06a5a8c5f5",
+    "apps/desktop/electron/main/services/host-resource-budget/bounded-payload.ts": "e05aeaac087576c6b9303528253da0cab0c9ea24a0814d2cf44dc920321138c2"
+  }
+}

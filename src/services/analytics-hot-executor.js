@@ -7,14 +7,16 @@ function wakeAfterCommit() {
   if(context)deferCommitHint(context,"analytics-hot-wake",notify);else notify();
 }
 async function due(db) {
-  const rows=await db.$queryRawUnsafe(`SELECT c.name FROM (VALUES ('ANALYTICS_PUBLICATION'),('MONEY_RESOLUTION')) c(name)
+  const rows=await db.$queryRawUnsafe(`SELECT c.name FROM (VALUES ('ANALYTICS_PUBLICATION'),('MONEY_RESOLUTION'),('FAN_LTV_PROJECTION')) c(name)
     WHERE EXISTS(SELECT 1 FROM "DomainWorkItem" w WHERE w."workClass"=c.name AND w."isOutstanding" AND w.state='READY' AND w."availableAt"<=(clock_timestamp() AT TIME ZONE 'UTC'))
     OR EXISTS(SELECT 1 FROM "DomainWorkItem" w WHERE w."workClass"=c.name AND w."isOutstanding" AND w.state='CLAIMED' AND w."leaseUntil"<=(clock_timestamp() AT TIME ZONE 'UTC'))
-    OR (c.name='MONEY_RESOLUTION' AND EXISTS(SELECT 1 FROM "MoneyResolutionAdoption" WHERE id='v7' AND NOT complete))`);
+    OR (c.name='MONEY_RESOLUTION' AND EXISTS(SELECT 1 FROM "MoneyResolutionAdoption" WHERE id='v7' AND NOT complete))
+    OR (c.name='FAN_LTV_PROJECTION' AND NOT EXISTS(SELECT 1 FROM "MaintenanceLaneState" WHERE key='fan_ltv178_adoption' AND "completedAt" IS NOT NULL))`);
   return new Set(rows.map(x=>x.name));
 }
 function start({db,probe=due,publication=input=>require("./analytics-publication-service").runAnalyticsPublicationSweep(input),
-  resolution=input=>require("./money-resolution-service").runSweep(input),schedule=setTimeout,cancel=clearTimeout,now=Date.now,onError=()=>{},idleMs=2000,maxIdleMs=10000}={}) {
+  resolution=input=>require("./money-resolution-service").runSweep(input),fanLtv=input=>require("./fan-ltv-projection-service").runSweep(input),
+  schedule=setTimeout,cancel=clearTimeout,now=Date.now,onError=()=>{},idleMs=2000,maxIdleMs=10000}={}) {
   let stopped=false,timer=null,running=null,woken=false,idle=idleMs;
   const health={running:false,rounds:0,units:0,errors:0,lastCompletedAt:null,lastDurationMs:0};
   function arm(delay){if(stopped)return;if(timer!==null)cancel(timer);timer=schedule(dispatch,delay);timer?.unref?.();}
@@ -24,10 +26,12 @@ function start({db,probe=due,publication=input=>require("./analytics-publication
       const pending=await probe(db);
       // One bounded owner per lane locally. Other replicas share the durable
       // tenant/partition fairness and claim fences; no model-wide timer scans.
-      for(const [name,run] of [["ANALYTICS_PUBLICATION",publication],["MONEY_RESOLUTION",resolution]])if(pending.has(name)&&!stopped) {
-        const result=await run({db,limit:2,maxRuntimeMs:2000,maxUnitsPerClaim:8});
-        health.rounds++;health.units+=result.processed||0;busy ||= Boolean(result.processed||result.adopted);
-        if(result.ok===false){failed=true;health.errors++;onError(result);}
+      for(const [name,run] of [["ANALYTICS_PUBLICATION",publication],["MONEY_RESOLUTION",resolution],["FAN_LTV_PROJECTION",fanLtv]])if(pending.has(name)&&!stopped) {
+        try {
+          const result=await run({db,limit:2,maxRuntimeMs:2000,maxUnitsPerClaim:8});
+          health.rounds++;health.units+=result.processed||0;busy ||= Boolean(result.processed||result.adopted||result.seed?.visited);
+          if(result.ok===false){failed=true;health.errors++;onError(result);}
+        }catch(error){failed=true;health.errors++;onError(error);}
       }
     }catch(error){failed=true;health.errors++;onError(error);}
     finally{health.running=false;health.lastCompletedAt=now();health.lastDurationMs=now()-started;

@@ -22,10 +22,10 @@ function mountedFamilies() {
   return out;
 }
 
-test("Audit16 route manifest exactly classifies all 55 production route families including commit-only Telegram settlement", () => {
+test("Audit16 route manifest exactly classifies all 56 production route families including dedicated conversation storage", () => {
   const mounted = mountedFamilies();
-  assert.equal(mounted.length, 55, `expected 55 route families, got ${mounted.length}`);
-  assert.equal(ROUTE_MANIFEST.length, 55, "manifest must classify exactly 55 route families");
+  assert.equal(mounted.length, 56, `expected 56 route families, got ${mounted.length}`);
+  assert.equal(ROUTE_MANIFEST.length, 56, "manifest must classify exactly 56 route families");
   assert.deepEqual(new Set(ROUTE_MANIFEST.map((x) => x.path)), new Set(mounted));
   const valid = new Set(Object.values(ROUTE_CLASS));
   for (const entry of ROUTE_MANIFEST) {
@@ -248,8 +248,8 @@ test("Audit16 current Dialog Intelligence cannot write retired server raw-messag
     /vaultPurchaseLedger\.(?:create|upsert|update)/,
     /vaultPurchaseMedia\.(?:create|upsert|update)/,
   ]) assert.doesNotMatch(source, retiredWriter);
-  assert.match(source, /Purchase facts, prices and Vault projections are local-only/);
-  assert.match(source, /ingestWsMessages[\s\S]*localOnly:\s*true[\s\S]*ignored:\s*true/);
+  assert.match(source, /Raw message facts belong to the dedicated Dialogs database/);
+  assert.match(source, /ingestWsMessages[\s\S]*localOnly:\s*!process\.env\.DIALOGS_DATABASE_URL[\s\S]*ignored:\s*true/);
 });
 
 test("Audit16 direct Dialog Intelligence machine ingress requires a signed auth device", () => {

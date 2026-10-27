@@ -39,6 +39,7 @@ const MAINTENANCE_LANES = Object.freeze([
   ["dialogOfflineRecovery", "./dialog-recovery-queue-service", "runSweep"],
   ["creatorEntityChangeRetention", "./creator-entity-change-service", "runRetentionSweep"],
   ["mediaFinancialProjection", "./media-financial-projection-service", "runSweep", { limit: 16, concurrency: 4, maxRuntimeMs: 5000 }],
+  ["fanLtvProjection", "./fan-ltv-projection-service", "runSweep", { limit: 4, maxRuntimeMs: 4000 }],
 ].map(([name, module, method, options = {}], ordinal) => Object.freeze({ name, module, method, ordinal, options: Object.freeze(options) })));
 const MAINTENANCE_LANE_NAMES = Object.freeze(MAINTENANCE_LANES.map(lane => lane.name));
 if (new Set(MAINTENANCE_LANE_NAMES).size !== MAINTENANCE_LANES.length || MAINTENANCE_LANES.length > 64) {

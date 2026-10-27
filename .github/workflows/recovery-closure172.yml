@@ -30,6 +30,10 @@ jobs:
             proof: scripts/audit/initial-campaign-readiness172-proof.cjs
           - name: campaign-resume
             proof: scripts/audit/campaign-resume173-proof.cjs
+          - name: fan-ltv178
+            proof: scripts/audit/fan-ltv178-proof.cjs
+          - name: fan-ltv-upgrade178
+            proof: scripts/audit/fan-ltv178-upgrade-proof.cjs
           - name: saved-read-availability177
             proof: scripts/audit/saved-read177-proof.cjs
     services:

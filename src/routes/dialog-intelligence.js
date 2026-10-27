@@ -480,18 +480,13 @@ router.get("/creators/:creatorId/dialogs/:dialogId/state", async (req, res) => {
 });
 
 router.get("/creators/:creatorId/dialogs/:dialogId/messages", async (req, res) => {
-  // Compatibility surface only. Full chat history is canonical in the
-  // Desktop's dialog-messages.sqlite and is intentionally not served from
-  // PostgreSQL anymore.
-  return res.json({
-    ok: true,
-    localOnly: true,
-    items: [],
-    count: 0,
-    offset: 0,
-    nextOffset: 0,
-    hasMore: false,
-  });
+  try {
+    const ctx=await require('../services/conversation-storage/access').conversationContext(req,req.params.creatorId);
+    const store=require('../services/conversation-storage/runtime').runtime();await store.check('dialogs');
+    const query=z.object({limit:z.coerce.number().int().min(1).max(200).default(100),offset:z.coerce.number().int().min(0).max(10000).default(0)}).parse(req.query);
+    const input={dialogId:req.params.dialogId,...query};const [items,count,status]=await Promise.all([store.dialogs.getMessages(ctx,input),store.dialogs.count(ctx,input),store.dialogs.getStatus(ctx)]);
+    const nextOffset=query.offset+items.length;return res.json({ok:true,localOnly:false,storage:'server',items,count:count.messages,offset:query.offset,nextOffset,hasMore:nextOffset<count.messages,coverage:{complete:false,collectionFromAt:status.collectionFromAt}});
+  }catch(error){return serviceError(res,error,'DIALOG_HISTORY_READ_FAILED');}
 });
 
 router.get("/creators/:creatorId/runs", async (req, res) => {

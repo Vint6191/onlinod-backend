@@ -305,13 +305,14 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
   const end = new Date(ledger.range.endAt);
   const eventBetween = { gte: start, lte: end };
 
-  const [creator, publishedFinancial, campaignPage, financialCollectionState, campaignCollectionState, audience] = await Promise.all([
+  const [creator, publishedFinancial, campaignPage, financialCollectionState, campaignCollectionState, audience, fanLtv] = await Promise.all([
     db.creatorAccount.findUnique({ where: { id: creatorId }, select: { id: true, createdAt: true, updatedAt: true } }),
     require("./published-financial-read-repository").readPublishedFinancialSummary({ db, creatorId, from: start, to: end }),
     require("./campaign-read-repository").readCampaignPage({ db, creatorId, rangeKey: range, now }),
     db.creatorFinancialCollectionState?.findUnique ? db.creatorFinancialCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
     db.creatorCampaignCollectionState?.findUnique ? db.creatorCampaignCollectionState.findUnique({ where: { creatorId } }) : Promise.resolve(null),
     require("./published-subscriber-summary").readCreatorAudience({ db, creatorId, now }),
+    require("./fan-ltv-read-repository").readFanLtv({ db, creatorId, rangeKey: range, now }),
   ]);
 
   const currentNotificationParser = ledger.notificationSync?.normalizerVersion === "notification-source-v2";
@@ -388,6 +389,7 @@ async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", n
     },
     activity,
     finance,
+    fanLtv,
     comparison,
     audience,
     campaigns: campaignPage,

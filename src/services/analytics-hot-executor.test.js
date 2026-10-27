@@ -29,3 +29,13 @@ test("both hot lanes get a bounded turn and errors back off without losing futur
  await h.next();assert.equal(errors.length,1);assert.equal([...h.timers.values()][0].delay,2000);
  fail=false;h.executor.wake();await h.next();assert.deepEqual(calls.slice(-2),[["publication",2,8],["resolution",2]]);assert.equal([...h.timers.values()][0].delay,25);await h.executor.stop();
 });
+test("Fan LTV adoption and backlog share the bounded hot executor and a failing sibling cannot starve them",async()=>{
+ const calls=[],errors=[];
+ const h=harness({probe:async()=>new Set(["ANALYTICS_PUBLICATION","MONEY_RESOLUTION","FAN_LTV_PROJECTION"]),
+  publication:async()=>{calls.push('publication');throw Error('unrelated transient');},
+  resolution:async()=>{calls.push('resolution');return{ok:true,processed:0};},
+  fanLtv:async input=>{calls.push('ltv');assert.equal(input.limit,2);assert.equal(input.maxRuntimeMs,2000);return{ok:true,processed:1,seed:{visited:25}};},
+  onError:error=>errors.push(error)});
+ await h.next();assert.deepEqual(calls,['publication','resolution','ltv']);assert.equal(errors.length,1);
+ assert.equal(h.executor.snapshot().units,1);assert.equal(h.timers.size,1);await h.executor.stop();
+});

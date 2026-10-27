@@ -74,13 +74,15 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
           (previous.grossCents == null ? null : Number(previous.grossCents)) !== money.amountCents ||
           previous.status !== money.status ||
           +previous.occurredAt !== +money.occurredAt ||
-          previous.category !== categoryFor(money.transactionType));
+          previous.category !== categoryFor(money.transactionType)
+          || (previous.fanOnlyFansUserId && require("./fan-ltv-model").fanId(money.fanOnlyFansUserId) && previous.fanOnlyFansUserId !== money.fanOnlyFansUserId));
       if (changed && !money.revisionAt) reason = "TRANSACTION_REVISION_REQUIRED";
       else if (changed && +observedAt === +previous.observedAt) reason = "TRANSACTION_REVISION_CONFLICT";
       else if (!previous || +observedAt >= +previous.observedAt) {
         await generation.writeLive(db, {agencyId, creatorId}, {
           transactionId: money.transactionId, occurredAt: money.occurredAt, netCents: money.netCents, grossCents: money.amountCents,
           status: money.status, observedAt, category: categoryFor(money.transactionType),
+          fanOnlyFansUserId: require("./fan-ltv-model").fanId(money.fanOnlyFansUserId),
         });
         await require("./financial-transactions-service").ingestExactLiveTransaction({
           db,

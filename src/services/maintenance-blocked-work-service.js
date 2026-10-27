@@ -5,6 +5,7 @@ const { DOMAIN_WORK_GENERATION } = require("./domain-work-authority-service");
 // These lanes consume the durable read/planning/publication queues. A successful
 // empty claim does not prove that their outstanding quarantined work recovered.
 const LANE_CLASSES = Object.freeze({
+  fanLtvProjection: ["FAN_LTV_PROJECTION"],
   creatorRecurringPlanning: ["CREATOR_RECURRING_PLANNING"],
   analyticsPublication: ["ANALYTICS_PUBLICATION"],
   analyticsFactPublication: ["ANALYTICS_FACT_PUBLICATION", "ANALYTICS_FACT_ADOPTION"],

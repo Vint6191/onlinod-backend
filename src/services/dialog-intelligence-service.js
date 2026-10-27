@@ -1449,7 +1449,7 @@ async function applyDialogDiscoveryChunk({ db, job, deviceId, chunkResult }) {
   // real PostgreSQL uses one findMany + createMany + at most two updateMany calls.
   //
   // FUTURE SERVER MIGRATION FOUNDATION: this function deliberately accepts a
-  // transport-neutral discovery plan. Raw conversations remain local-only today;
+  // transport-neutral discovery plan. Raw conversations are collected through the dedicated Dialogs API;
   // a future server scanner/storage tier can be attached behind this boundary.
   const uniqueDialogs = new Map();
   for (const raw of list(chunk.dialogs).slice(0, 500)) {
@@ -1850,7 +1850,7 @@ async function applyDialogIntelligenceChunk({ db, job, deviceId, chunkResult }) 
     updated,
     unchanged,
     projected: 0,
-    localOnly: true,
+    localOnly: !process.env.DIALOGS_DATABASE_URL,
     hasMore,
     page,
     pageEnd: integer(chunk.pageEnd, page + pagesInBatch, page + 1, 2_147_483_647),
@@ -2007,9 +2007,9 @@ function normalizedSignal(raw, job) {
 async function applyPurchaseSignalsChunk({ db, job, chunkResult, userId = null }) {
   const chunk = object(chunkResult);
   const agencyId = clean(job.agencyId, 160);
-  if (!agencyId) return { accepted: 0, projected: 0, scheduled: 0, disabled: false, localOnly: true };
+  if (!agencyId) return { accepted: 0, projected: 0, scheduled: 0, disabled: false, localOnly: !process.env.DIALOGS_DATABASE_URL };
   const control = await moduleControl(db, agencyId);
-  if (!control.enabled) return { accepted: 0, projected: 0, scheduled: 0, disabled: true, localOnly: true };
+  if (!control.enabled) return { accepted: 0, projected: 0, scheduled: 0, disabled: true, localOnly: !process.env.DIALOGS_DATABASE_URL };
   const raws = chunk.kind === "dialog_purchase_signals" ? list(chunk.signals) : [];
   let accepted = 0;
   let scheduled = 0;
@@ -2017,7 +2017,7 @@ async function applyPurchaseSignalsChunk({ db, job, chunkResult, userId = null }
     const signal = normalizedSignal(raw, job);
     if (!signal) continue;
     accepted += 1;
-    // Purchase facts, prices and Vault projections are local-only. PostgreSQL
+    // Raw message facts belong to the dedicated Dialogs database. This product DB
     // retains only the durable reconciliation target/job needed to resolve a
     // notification's source message on another worker after a restart.
     if (signal.dialogId && signal.sourceMessageId) {
@@ -2035,7 +2035,7 @@ async function applyPurchaseSignalsChunk({ db, job, chunkResult, userId = null }
       if (result.created || result.reason === "targeted_reconciliation_queued") scheduled += 1;
     }
   }
-  return { accepted, projected: 0, scheduled, localOnly: true };
+  return { accepted, projected: 0, scheduled, localOnly: !process.env.DIALOGS_DATABASE_URL };
 }
 
 async function completeDialogIntelligenceJob({ db = prisma, job, deviceId, result }) {
@@ -2171,7 +2171,7 @@ async function ingestWsMessages({ agencyId, creatorId, dialogId, fanId = null, m
   // rolling backend deploy cannot continue growing DialogMessageLedger.
   return {
     ok: true,
-    localOnly: true,
+    localOnly: !process.env.DIALOGS_DATABASE_URL,
     ignored: true,
     agencyId: clean(agencyId, 160),
     creatorId: clean(creatorId, 160),

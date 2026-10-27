@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v23_saved_read177",
+  "version": "nod_current_v24_fan_ltv178",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -88,6 +88,10 @@
     {
       "migration": "20261026000000_saved_read177",
       "checksum": "3cea350f1a1be99516d5a8a7d9822c7afdc781815d18e2d768b5a1d058bf4335"
+    },
+    {
+      "migration": "20261026010000_fan_ltv178",
+      "checksum": "3553339de7a62755f276458f594b62a7d8dbb203f2003dc65cf9fc114ad96c72"
     }
   ],
   "extension": {
@@ -202,6 +206,30 @@
       },
       {
         "name": "ProviderCapacityCreatorBucket",
+        "persistence": "p"
+      },
+      {
+        "name": "FanLtvBalance",
+        "persistence": "p"
+      },
+      {
+        "name": "FanLtvChange",
+        "persistence": "p"
+      },
+      {
+        "name": "FanLtvDistribution",
+        "persistence": "p"
+      },
+      {
+        "name": "FanLtvMetric",
+        "persistence": "p"
+      },
+      {
+        "name": "FanLtvReceipt",
+        "persistence": "p"
+      },
+      {
+        "name": "FanLtvState",
         "persistence": "p"
       }
     ],
@@ -2829,6 +2857,238 @@
         "udt_name": "timestamptz",
         "is_nullable": "NO",
         "column_default": "now()"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "fanOnlyFansUserId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "fanOnlyFansUserId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "rangeKey",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "fanId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "payments",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvChange",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvChange",
+        "name": "transactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvDistribution",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvDistribution",
+        "name": "prefix",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvDistribution",
+        "name": "count",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvMetric",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvMetric",
+        "name": "rangeKey",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvMetric",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvMetric",
+        "name": "values",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "transactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "value",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "nextDueAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvState",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvState",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvState",
+        "name": "sourceKey",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "stage",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'RESET'::text"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "cursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "upperId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "resetStage",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "snapshot",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvState",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
       }
     ],
     "enums": [],
@@ -2903,6 +3163,21 @@
         "name": "onlinod_traffic_member_metrics_v2",
         "args": "member_id text",
         "hash": "85dbdfde605ff69021ba66b982863774b8c72de803df15352c4fbf005b2dbe3b"
+      },
+      {
+        "name": "onlinod_fan_ltv_source178",
+        "args": "",
+        "hash": "c0902f1107244bd7841bdd011faa8c7a1de9f69c7dfeb834ec2429e407dee2f0"
+      },
+      {
+        "name": "onlinod_fan_ltv_wake178",
+        "args": "a text, c text, t text",
+        "hash": "8d8a10cb81994bba701c7f76da6a8ae8d25bf2b203bef2e9206132e803f1d593"
+      },
+      {
+        "name": "onlinod_fan_ltv_writer178",
+        "args": "",
+        "hash": "a8996803881264d23ecb4fd64849209978d79155c21d6fa876351405a4506ac9"
       }
     ],
     "triggers": [
@@ -2993,6 +3268,62 @@
         "definition": "CREATE TRIGGER \"TeamMoneyAttributionFact_current_financial_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamMoneyAttributionFact\" FOR EACH ROW EXECUTE FUNCTION onlinod_guard_team_financial_authority_v1()",
         "args": "",
         "function": "onlinod_guard_team_financial_authority_v1"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "FanLtv_generation178",
+        "type": 29,
+        "definition": "CREATE TRIGGER \"FanLtv_generation178\" AFTER INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsGenerationEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_source178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_source178"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "FanLtv_ledger178",
+        "type": 29,
+        "definition": "CREATE TRIGGER \"FanLtv_ledger178\" AFTER INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsLedgerEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_source178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_source178"
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "FanLtv_publication178",
+        "type": 21,
+        "definition": "CREATE TRIGGER \"FanLtv_publication178\" AFTER INSERT OR UPDATE ON public.\"CreatorEarningsLedgerProof\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_source178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_source178"
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "FanLtvBalance_writer178",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"FanLtvBalance_writer178\" BEFORE INSERT OR UPDATE ON public.\"FanLtvBalance\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_writer178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_writer178"
+      },
+      {
+        "table": "FanLtvDistribution",
+        "name": "FanLtvDistribution_writer178",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"FanLtvDistribution_writer178\" BEFORE INSERT OR UPDATE ON public.\"FanLtvDistribution\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_writer178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_writer178"
+      },
+      {
+        "table": "FanLtvMetric",
+        "name": "FanLtvMetric_writer178",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"FanLtvMetric_writer178\" BEFORE INSERT OR UPDATE ON public.\"FanLtvMetric\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_writer178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_writer178"
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "FanLtvReceipt_writer178",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"FanLtvReceipt_writer178\" BEFORE INSERT OR UPDATE ON public.\"FanLtvReceipt\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_writer178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_writer178"
       }
     ],
     "constraints": [
@@ -3723,6 +4054,134 @@
         "deferrable": false,
         "deferred": false,
         "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "FanLtvBalance_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"FanLtvState\"(\"creatorId\") ON DELETE CASCADE"
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "FanLtvBalance_netCents_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"netCents\" >= 0) AND (\"netCents\" <= '9007199254740991'::bigint)))"
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "FanLtvBalance_payments_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((payments >= 0) AND (payments <= '9007199254740991'::bigint)))"
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "FanLtvBalance_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", \"rangeKey\", \"fanId\")"
+      },
+      {
+        "table": "FanLtvChange",
+        "name": "FanLtvChange_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"FanLtvState\"(\"creatorId\") ON DELETE CASCADE"
+      },
+      {
+        "table": "FanLtvChange",
+        "name": "FanLtvChange_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", \"transactionId\")"
+      },
+      {
+        "table": "FanLtvDistribution",
+        "name": "FanLtvDistribution_count_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((count >= 0) AND (count <= '9007199254740991'::bigint)))"
+      },
+      {
+        "table": "FanLtvDistribution",
+        "name": "FanLtvDistribution_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"FanLtvState\"(\"creatorId\") ON DELETE CASCADE"
+      },
+      {
+        "table": "FanLtvDistribution",
+        "name": "FanLtvDistribution_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", prefix)"
+      },
+      {
+        "table": "FanLtvDistribution",
+        "name": "FanLtvDistribution_prefix_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((length(prefix) = ANY (ARRAY[2, 4, 6, 8, 10, 12, 14])))"
+      },
+      {
+        "table": "FanLtvMetric",
+        "name": "FanLtvMetric_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"FanLtvState\"(\"creatorId\") ON DELETE CASCADE"
+      },
+      {
+        "table": "FanLtvMetric",
+        "name": "FanLtvMetric_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", \"rangeKey\", category)"
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "FanLtvReceipt_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"FanLtvState\"(\"creatorId\") ON DELETE CASCADE"
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "FanLtvReceipt_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", \"transactionId\")"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "FanLtvState_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON DELETE CASCADE"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "FanLtvState_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\")"
       }
     ],
     "indexes": [
@@ -4674,6 +5133,69 @@
       {
         "table": "_prisma_migrations",
         "name": "_prisma_migrations_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "FanLtvBalance_pkey",
+        "unique": true,
+        "keys": "1 2 3",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvChange",
+        "name": "FanLtvChange_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvDistribution",
+        "name": "FanLtvDistribution_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvMetric",
+        "name": "FanLtvMetric_pkey",
+        "unique": true,
+        "keys": "1 2 3",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "FanLtvReceipt_due178_idx",
+        "unique": false,
+        "keys": "1 4 2",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(\"nextDueAt\" IS NOT NULL)"
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "FanLtvReceipt_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvState",
+        "name": "FanLtvState_pkey",
         "unique": true,
         "keys": "1",
         "options": "0",

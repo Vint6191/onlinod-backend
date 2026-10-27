@@ -461,6 +461,8 @@ model TeamMemberFunction {
 }
 
 model CreatorAccount {
+  fanLtvStates FanLtvState[]
+
  dialogRecoveryRequests CreatorDialogRecoveryRequest[]
   liveSync CreatorLiveSync[]
   earningsGenerations CreatorEarningsGeneration[]
@@ -6609,6 +6611,8 @@ model CreatorEarningsLedgerProof {
  creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
 }
 model CreatorEarningsLedgerEntry {
+ fanOnlyFansUserId String?
+
  agencyId String
  creatorId String
  transactionId String
@@ -6678,6 +6682,8 @@ model CreatorEarningsGeneration {
  @@index([creatorId,state],map:"EarningsGeneration_creator")
 }
 model CreatorEarningsGenerationEntry {
+ fanOnlyFansUserId String?
+
  generation String
  transactionId String
  occurredAt DateTime
@@ -6742,4 +6748,60 @@ model MoneyResolutionAdoption {
  id String @id
  cursor String @default("")
  complete Boolean @default(false)
+}
+
+model FanLtvState {
+ creatorId String @id
+ agencyId String
+ sourceKey String @default("")
+ stage String @default("RESET")
+ cursor String @default("")
+ upperId String @default("")
+ resetStage Int @default(0)
+ snapshot Json?
+ updatedAt DateTime @default(now())
+ creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
+ changes FanLtvChange[]
+ receipts FanLtvReceipt[]
+ balances FanLtvBalance[]
+ metrics FanLtvMetric[]
+ distribution FanLtvDistribution[]
+}
+model FanLtvChange {
+ creatorId String
+ transactionId String
+ owner FanLtvState @relation(fields:[creatorId],references:[creatorId],onDelete:Cascade)
+ @@id([creatorId,transactionId])
+}
+model FanLtvReceipt {
+ creatorId String
+ transactionId String
+ value Json
+ nextDueAt DateTime?
+ owner FanLtvState @relation(fields:[creatorId],references:[creatorId],onDelete:Cascade)
+ @@id([creatorId,transactionId])
+}
+model FanLtvBalance {
+ creatorId String
+ rangeKey String
+ fanId String
+ netCents BigInt
+ payments BigInt
+ owner FanLtvState @relation(fields:[creatorId],references:[creatorId],onDelete:Cascade)
+ @@id([creatorId,rangeKey,fanId])
+}
+model FanLtvMetric {
+ creatorId String
+ rangeKey String
+ category String
+ values Json @default("{}")
+ owner FanLtvState @relation(fields:[creatorId],references:[creatorId],onDelete:Cascade)
+ @@id([creatorId,rangeKey,category])
+}
+model FanLtvDistribution {
+ creatorId String
+ prefix String
+ count BigInt
+ owner FanLtvState @relation(fields:[creatorId],references:[creatorId],onDelete:Cascade)
+ @@id([creatorId,prefix])
 }

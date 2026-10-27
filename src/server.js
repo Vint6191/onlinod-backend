@@ -56,10 +56,13 @@ const { buildBackendHealthSnapshot } = require("./utils/health-snapshot");
 const { readDatabaseContract, assertDatabaseContract } = require("./services/database-contract-service");
 const { startRecurringScheduler, stopRecurringScheduler, getRecurringSchedulerHealthSnapshot } = require("./services/job-scheduler");
 const { createBackendProcessLifecycle } = require("./services/backend-process-lifecycle");
-const lifecycle = createBackendProcessLifecycle({ db: prisma, log: logger });
+const lifecycle = createBackendProcessLifecycle({
+  db: require('./services/conversation-storage/databases').databaseShutdownPort(prisma),
+  log: logger,
+});
 
 const legacyAnalyticsRoutes = createLegacyGoneRouter("analytics_snapshots", "/api/home + /api/stats");
-const legacyCrmRoutes = createLegacyGoneRouter("server_crm", "Desktop local CRM authority");
+const legacyCrmRoutes = createLegacyGoneRouter("server_crm", "Use /api/conversation-storage for the dedicated CRM database");
 const legacyFanListsRoutes = createLegacyGoneRouter("server_fan_lists", "current MASS local audience pipeline");
 const legacySegmentsRoutes = createLegacyGoneRouter("server_segments", "current MASS local audience pipeline");
 const legacyCampaignsRoutes = createLegacyGoneRouter("server_campaigns", "current MASS CreatorApiRuntime queue");
@@ -250,6 +253,7 @@ app.use("/api/server/fan-lists", authRequired, legacyFanListsRoutes);
 app.use("/api/server/segments", authRequired, legacySegmentsRoutes);
 app.use("/api/server/campaigns", authRequired, legacyCampaignsRoutes);
 app.use("/api/server/automation", authRequired, productBilling, automationStoreRoutes);
+app.use("/api/conversation-storage", authRequired, productBilling, require("./routes/conversation-storage"));
 app.use("/api/dialog-intelligence", authRequired, productBilling, dialogIntelligenceRoutes);
 app.use("/api/custom-orders", authRequired, productBilling, customOrdersRoutes);
 app.use("/api/server/vault-sales", authRequired, legacyVaultSalesRoutes);
@@ -331,6 +335,10 @@ async function startServer({ own, checkpoint }) {
   own("dialog-control", require("./services/dialog-module-control-service").startDialogControlWorker({ db: prisma }));
   own("auth-mail", require("./services/auth-mail-outbox-service").startAuthMailWorker({ db: prisma }));
   own("admin-diagnostics", require("./services/admin-diagnostics-service").startAdminDiagnostics({ db: prisma, log: logger }));
+  if (process.env.DIALOGS_DATABASE_URL || process.env.CRM_DATABASE_URL) {
+    const stores = require('./services/conversation-storage/runtime').runtime();
+    require('./services/conversation-storage/lifecycle').startConversationStores({ stores, own, log: logger });
+  }
   const httpServer = require("node:http").createServer(app);
   const listening = new Promise((resolve, reject) => {
     httpServer.once("error", reject);

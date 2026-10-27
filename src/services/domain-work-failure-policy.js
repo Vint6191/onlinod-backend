@@ -10,6 +10,7 @@ const { isTransientDatabaseError } = require("./db-retry-policy");
 // They do not send provider writes. Unknown errors and all unreviewed classes
 // retain the finite poison budget.
 const DATABASE_RECOVERY_WORK_CLASSES = Object.freeze([
+  "FAN_LTV_PROJECTION",
   "CREATOR_RECURRING_PLANNING", "ANALYTICS_PUBLICATION", "ANALYTICS_FACT_PUBLICATION", "ANALYTICS_FACT_ADOPTION",
 ]);
 const CONTRACT_CODES = new Set([
