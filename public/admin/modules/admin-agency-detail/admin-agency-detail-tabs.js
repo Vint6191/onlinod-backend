@@ -241,6 +241,12 @@
           </div>
         </div>
 
+        <div class="adm-field">
+          <label>Development access</label>
+          ${sub?.billingMode === "FREE_INTERNAL"
+            ? '<div class="adm-muted">Internal development access is enabled. Trial expiry no longer blocks this agency. Live wallet debits are disabled; support holds still apply.</div>'
+            : '<div class="adm-muted">For your development or beta-test agency: internal access without a trial deadline. Applies only to this agency.</div><button class="adm-btn" id="admSubDevelopment">Enable internal development access</button>'}
+        </div>
         <div class="adm-field"><label>billing mode</label><select class="adm-select" id="admSubMode">${["MANUAL","STRIPE","CRYPTO","FREE_INTERNAL"].map(mode => `<option value="${mode}" ${(sub?.billingMode || "MANUAL") === mode ? "selected" : ""}>${mode}</option>`).join("")}</select></div>
         <div class="adm-field"><label>billing period</label><select class="adm-select" id="admSubBillingPeriod">${["MONTHLY","THREE_MONTHS","SIX_MONTHS"].map(period => `<option value="${period}" ${(sub?.billingPeriod || "MONTHLY") === period ? "selected" : ""}>${period}</option>`).join("")}</select></div>
         <div class="adm-field"><span>Billing hold preserves purchased access and payment history.</span><button class="adm-btn" id="admSubHold">${a.billingSupportHold ? "Release billing hold" : "Hold billing status"}</button></div>
@@ -255,6 +261,18 @@
   function bindSubscription(main, slice) {
     const save = main.querySelector("#admSubSave");
     if (!save) return;
+
+    main.querySelector("#admSubDevelopment")?.addEventListener("click", () => W().action(main, async current => {
+      const agency = slice.data.agency;
+      const result = await window.NodAdminApi.patchSubscription(agency.id, {
+        expectedRevision: agency.billingPolicyRevision,
+        billingMode: "FREE_INTERNAL",
+        reason: "Internal development and beta testing",
+      });
+      if (!current()) return;
+      R().toast(result?.ok ? "Internal development access enabled" : result?.error || "Failed");
+      if (result?.ok) window.NodAdminAgencyDetailActions.reloadDetail?.();
+    }));
 
     main.querySelector("#admSubHold")?.addEventListener("click", () => W().action(main, async current => {
       const agency = slice.data.agency;
