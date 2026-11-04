@@ -17,9 +17,9 @@
   const W = () => window.NodAdminWorkspace;
 
   const State = () => window.NodAdminState;
-  const A     = () => window.NodAdminApi;
-  const R     = () => window.NodAdminRouter;
-  const U     = () => window.NodAdminUtils;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
 
   function ensureSlice() {
     const s = State();
@@ -31,11 +31,21 @@
 
   function load(force) {
     const slice = ensureSlice();
-    return W().load({ section: "dashboard", state: slice, force,
-      fetch: () => A().dashboard(), apply: result => { slice.data = result; }, render });
+    return W().load({
+      section: "dashboard",
+      state: slice,
+      force,
+      fetch: () => A().dashboard(),
+      apply: (result) => {
+        slice.data = result;
+      },
+      render,
+    });
   }
 
-  function rerender() { W().paint("dashboard", render); }
+  function rerender() {
+    W().paint("dashboard", render);
+  }
 
   function render(main) {
     const slice = ensureSlice();
@@ -50,11 +60,11 @@
     main.innerHTML = `
       <div class="adm-page-head">
         <div>
-          <div class="adm-page-title">Dashboard</div>
-          <div class="adm-page-subtitle">~/admin/dashboard · live snapshot</div>
+          <div class="adm-page-title">Обзор</div>
+          <div class="adm-page-subtitle">Актуальное состояние агентств, моделей и платформы</div>
         </div>
         <div style="display:flex;gap:8px;">
-          <button class="adm-btn ghost" id="admDashRefresh">↻ refresh</button>
+          <button class="adm-btn ghost" id="admDashRefresh">Обновить</button>
         </div>
       </div>
 
@@ -78,60 +88,58 @@
     const sn = d.counts.canonicalSessions;
 
     const mrrTotalCents =
-      Number(d.mrr?.coreCents || 0) +
-      Number(d.mrr?.aiChatterCents || 0) +
-      Number(d.mrr?.outreachCents || 0);
+      Number(d.mrr?.coreCents || 0) + Number(d.mrr?.aiChatterCents || 0) + Number(d.mrr?.outreachCents || 0);
 
     return `
-      <section class="adm-metric-grid">
+      <section class="adm-metric-grid adm-dashboard-metrics">
         ${renderMetric({
-          label: "agencies",
+          label: "Агентства",
           value: u.formatNumber(a.total),
-          hint:  `${a.active} active · ${a.trial} trial · ${a.locked} locked`,
-          mode:  a.locked > 0 ? "warn" : "",
+          hint: `${a.active} active · ${a.trial} trial · ${a.locked} locked`,
+          mode: a.locked > 0 ? "warn" : "",
         })}
 
         ${renderMetric({
-          label: "users",
+          label: "Пользователи",
           value: u.formatNumber(us.total),
-          hint:  us.unverified > 0 ? `${us.unverified} unverified` : "all verified",
-          mode:  us.unverified > 0 ? "warn" : "ok",
+          hint: us.unverified > 0 ? `${us.unverified} unverified` : "all verified",
+          mode: us.unverified > 0 ? "warn" : "ok",
         })}
 
         ${renderMetric({
-          label: "creators",
+          label: "Модели",
           value: u.formatNumber(c.total),
-          hint:  `${c.ready} ready · ${c.problem} problem`,
-          mode:  c.problem > 0 ? "warn" : "",
+          hint: `${c.ready} ready · ${c.problem} problem`,
+          mode: c.problem > 0 ? "warn" : "",
         })}
 
         ${renderMetric({
-          label: "devices",
+          label: "Устройства",
           value: u.formatNumber(dv.total),
-          hint:  `${dv.online} online`,
-          mode:  dv.online > 0 ? "ok" : "",
+          hint: `${dv.online} online`,
+          mode: dv.online > 0 ? "ok" : "",
         })}
 
         ${renderMetric({
-          label: "portable sessions",
+          label: "Сохранённые сессии",
           value: u.formatNumber(sn.activePortable),
-          hint:  "active model access",
-          mode:  "",
+          hint: "Сессии OnlyFans; доступ NOD учитывается отдельно",
+          mode: "",
         })}
 
         ${renderMetric({
-          label: "MRR (paid access)",
+          label: "Активные периоды, $/мес",
           value: u.formatMoneyFromCents(mrrTotalCents),
-          hint:  `core ${u.formatMoneyFromCents(d.mrr?.coreCents || 0)} · addons ${u.formatMoneyFromCents((d.mrr?.aiChatterCents || 0) + (d.mrr?.outreachCents || 0))}`,
-          mode:  mrrTotalCents > 0 ? "ok" : "",
+          hint: `core ${u.formatMoneyFromCents(d.mrr?.coreCents || 0)} · addons ${u.formatMoneyFromCents((d.mrr?.aiChatterCents || 0) + (d.mrr?.outreachCents || 0))}`,
+          mode: mrrTotalCents > 0 ? "ok" : "",
         })}
       </section>
 
-      <section style="display:grid;grid-template-columns:1.4fr 1fr;gap:12px;margin-top:6px;">
+      <section class="adm-dashboard-columns">
         <div class="adm-card">
           <div class="adm-card-head">
-            <div class="adm-card-title">Recent admin actions</div>
-            <button class="adm-card-action" data-section="audit">view audit →</button>
+            <div class="adm-card-title">Последние действия</div>
+            <button class="adm-card-action" data-section="audit">Весь журнал →</button>
           </div>
 
           ${
@@ -145,8 +153,8 @@
 
         <div class="adm-card">
           <div class="adm-card-head">
-            <div class="adm-card-title">Recent signups</div>
-            <button class="adm-card-action" data-section="users">all users →</button>
+            <div class="adm-card-title">Новые пользователи</div>
+            <button class="adm-card-action" data-section="users">Все пользователи →</button>
           </div>
 
           ${
@@ -206,7 +214,10 @@
   function renderSignupRow(u_) {
     const r = R();
     const u = U();
-    const initial = String(u_.email || "?").trim().slice(0, 1).toUpperCase();
+    const initial = String(u_.email || "?")
+      .trim()
+      .slice(0, 1)
+      .toUpperCase();
 
     return `
       <div style="

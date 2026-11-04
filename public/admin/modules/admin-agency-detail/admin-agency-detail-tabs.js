@@ -50,7 +50,9 @@
               </tr>
             </thead>
             <tbody>
-              ${members.map((m) => `
+              ${members
+                .map(
+                  (m) => `
                 <tr>
                   <td>
                     <div class="adm-cell-name">
@@ -65,8 +67,8 @@
                   <td>
                     <select ${m.role === "OWNER" || m.roleKey === "owner" ? "disabled" : ""} class="adm-select" data-member-role="${r.escapeAttr(m.id)}" style="width:140px;">
                       ${m.role === "OWNER" || m.roleKey === "owner" ? '<option value="OWNER" selected>OWNER · transfer in Desktop</option>' : ""}
-                      <option value="ADMIN"    ${m.role === "ADMIN"    ? "selected" : ""}>ADMIN</option>
-                      <option value="MANAGER"  ${m.role === "MANAGER"  ? "selected" : ""}>MANAGER</option>
+                      <option value="ADMIN"    ${m.role === "ADMIN" ? "selected" : ""}>ADMIN</option>
+                      <option value="MANAGER"  ${m.role === "MANAGER" ? "selected" : ""}>MANAGER</option>
                       <option value="OPERATOR" ${m.role === "OPERATOR" ? "selected" : ""}>OPERATOR</option>
                     </select>
                   </td>
@@ -75,7 +77,9 @@
                     <button ${m.role === "OWNER" || m.roleKey === "owner" ? "disabled" : ""} class="adm-btn danger" data-member-kick="${r.escapeAttr(m.id)}" data-member-email="${r.escapeAttr(m.user?.email || "")}">kick</button>
                   </td>
                 </tr>
-              `).join("")}
+              `
+                )
+                .join("")}
             </tbody>
           </table>
         </div>
@@ -86,23 +90,32 @@
   function bindMembers(main, slice) {
     main.querySelectorAll("[data-member-role]").forEach((sel) => {
       const original = sel.value;
-      sel.addEventListener("change", () => W().action(main, async () => {
-        const memberId = sel.dataset.memberRole;
-        const newRole  = sel.value;
-        await Actions().changeMemberRole(memberId, newRole, () => {
-          // On error (e.g. last owner), revert select.
-          sel.value = original;
-        });
-      }));
+      sel.addEventListener("change", () =>
+        W().action(main, async () => {
+          const memberId = sel.dataset.memberRole;
+          const newRole = sel.value;
+          await Actions().changeMemberRole(memberId, newRole, () => {
+            // On error (e.g. last owner), revert select.
+            sel.value = original;
+          });
+        })
+      );
     });
 
     main.querySelectorAll("[data-member-kick]").forEach((btn) => {
-      btn.addEventListener("click", () => W().action(main, async () => {
-        const memberId = btn.dataset.memberKick;
-        const email    = btn.dataset.memberEmail || "this member";
-        if (!confirm(`Remove ${email} from this agency?\n\nTheir refresh sessions will be revoked. They keep their user account.`)) return;
-        await Actions().kickMember(memberId);
-      }));
+      btn.addEventListener("click", () =>
+        W().action(main, async () => {
+          const memberId = btn.dataset.memberKick;
+          const email = btn.dataset.memberEmail || "this member";
+          if (
+            !confirm(
+              `Remove ${email} from this agency?\n\nTheir refresh sessions will be revoked. They keep their user account.`
+            )
+          )
+            return;
+          await Actions().kickMember(memberId);
+        })
+      );
     });
   }
 
@@ -115,7 +128,7 @@
     const u = U();
     const a = slice.data.agency;
     const creators = (a.creators || []).filter((c) => !c.deletedAt);
-    const deleted  = (a.creators || []).filter((c) => c.deletedAt);
+    const deleted = (a.creators || []).filter((c) => c.deletedAt);
 
     if (!creators.length && !deleted.length) {
       return `<div class="adm-card"><div class="adm-empty">No creators yet.</div></div>`;
@@ -186,12 +199,14 @@
 
   function bindCreators(main, slice) {
     main.querySelectorAll("[data-creator-delete]").forEach((btn) => {
-      btn.addEventListener("click", () => W().action(main, async () => {
-        const id   = btn.dataset.creatorDelete;
-        const name = btn.dataset.creatorName || "this creator";
-        if (!confirm(`Soft-delete ${name}?\n\nModel access will be retired. Active work can block removal.`)) return;
-        await Actions().deleteCreator(id);
-      }));
+      btn.addEventListener("click", () =>
+        W().action(main, async () => {
+          const id = btn.dataset.creatorDelete;
+          const name = btn.dataset.creatorName || "this creator";
+          if (!confirm(`Soft-delete ${name}?\n\nModel access will be retired. Active work can block removal.`)) return;
+          await Actions().deleteCreator(id);
+        })
+      );
     });
   }
 
@@ -206,18 +221,19 @@
     const sub = (a.subscriptions || [])[0] || null;
 
     return `
+      <div class="adm-notice">Trial, внутренний доступ и блокировка применяются ко всему агентству. Уровни Starter / Growth / Pro / Elite / Custom и платные сроки редактируются отдельно у каждой модели.</div>
       <div class="adm-card">
         <div class="adm-card-head">
-          <div class="adm-card-title">Subscription</div>
+          <div class="adm-card-title">Политика доступа агентства</div>
         </div>
 
         <div style="display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:14px;">
           <div class="adm-field">
-            <label>plan</label>
+            <label>Метка плана агентства</label>
             <input class="adm-input" id="admSubPlan"   value="${r.escapeAttr(a.plan || "dev")}">
           </div>
           <div class="adm-field">
-            <label>billing status (derived from access and hold)</label>
+            <label>Сводный статус (по доступам моделей и блокировке)</label>
             <input class="adm-input" value="${r.escapeAttr(a.status || "TRIAL")}" readonly>
           </div>
 
@@ -226,32 +242,34 @@
             <div class="adm-muted">Managed in Billing: global catalog and explicit model overrides.</div>
           </div>
           <div class="adm-field">
-            <label>trial ends at (ISO)</label>
+            <label>Пробный период агентства до (UTC)</label>
             <input class="adm-input mono" id="admSubTrial" placeholder="2026-06-01T00:00:00Z" value="${r.escapeAttr(a.trialEndsAt ? new Date(a.trialEndsAt).toISOString() : "")}">
           </div>
 
           <div class="adm-field" style="grid-column:1 / -1;">
-            <label>current period end (ISO)</label>
+            <label>Самая поздняя дата Core среди моделей (UTC, справочно)</label>
             <input class="adm-input mono" id="admSubPeriod" readonly placeholder="2026-12-31T23:59:59Z" value="${r.escapeAttr(a.currentPeriodEnd ? new Date(a.currentPeriodEnd).toISOString() : "")}">
           </div>
 
           <div class="adm-field" style="grid-column:1 / -1;">
-            <label>reason for change (audit)</label>
+            <label>Причина изменения для журнала</label>
             <input class="adm-input" id="admSubReason" placeholder="e.g. promo extended for 1 month">
           </div>
         </div>
 
         <div class="adm-field">
-          <label>Development access</label>
-          ${sub?.billingMode === "FREE_INTERNAL"
-            ? '<div class="adm-muted">Internal development access is enabled. Trial expiry no longer blocks this agency. Live wallet debits are disabled; support holds still apply.</div>'
-            : '<div class="adm-muted">For your development or beta-test agency: internal access without a trial deadline. Applies only to this agency.</div><button class="adm-btn" id="admSubDevelopment">Enable internal development access</button>'}
+          <label>Внутренний доступ для разработки</label>
+          ${
+            sub?.billingMode === "FREE_INTERNAL"
+              ? '<div class="adm-muted">Internal development access is enabled. Trial expiry no longer blocks this agency. Live wallet debits are disabled; support holds still apply.</div>'
+              : '<div class="adm-muted">For your development or beta-test agency: internal access without a trial deadline. Applies only to this agency.</div><button class="adm-btn" id="admSubDevelopment">Enable internal development access</button>'
+          }
         </div>
-        <div class="adm-field"><label>billing mode</label><select class="adm-select" id="admSubMode">${["MANUAL","STRIPE","CRYPTO","FREE_INTERNAL"].map(mode => `<option value="${mode}" ${(sub?.billingMode || "MANUAL") === mode ? "selected" : ""}>${mode}</option>`).join("")}</select></div>
-        <div class="adm-field"><label>billing period</label><select class="adm-select" id="admSubBillingPeriod">${["MONTHLY","THREE_MONTHS","SIX_MONTHS"].map(period => `<option value="${period}" ${(sub?.billingPeriod || "MONTHLY") === period ? "selected" : ""}>${period}</option>`).join("")}</select></div>
+        <div class="adm-field"><label>Режим агентства</label><select class="adm-select" id="admSubMode">${["MANUAL", "STRIPE", "CRYPTO", "FREE_INTERNAL"].map((mode) => `<option value="${mode}" ${(sub?.billingMode || "MANUAL") === mode ? "selected" : ""}>${mode}</option>`).join("")}</select></div>
+        <div class="adm-field"><label>Настройка периода агентства (служебная)</label><select class="adm-select" id="admSubBillingPeriod">${["MONTHLY", "THREE_MONTHS", "SIX_MONTHS"].map((period) => `<option value="${period}" ${(sub?.billingPeriod || "MONTHLY") === period ? "selected" : ""}>${period}</option>`).join("")}</select></div>
         <div class="adm-field"><span>Billing hold preserves purchased access and payment history.</span><button class="adm-btn" id="admSubHold">${a.billingSupportHold ? "Release billing hold" : "Hold billing status"}</button></div>
         <div style="display:flex;gap:8px;margin-top:6px;">
-          <button class="adm-btn primary" id="admSubSave">Save subscription</button>
+          <button class="adm-btn primary" id="admSubSave">Сохранить политику</button>
           ${sub ? `<span style="font-family:var(--adm-mono);font-size:11px;color:var(--adm-muted);align-self:center;">last updated ${r.escapeHtml(u.timeAgo(sub.updatedAt))}</span>` : ""}
         </div>
       </div>
@@ -262,44 +280,54 @@
     const save = main.querySelector("#admSubSave");
     if (!save) return;
 
-    main.querySelector("#admSubDevelopment")?.addEventListener("click", () => W().action(main, async current => {
-      const agency = slice.data.agency;
-      const result = await window.NodAdminApi.patchSubscription(agency.id, {
-        expectedRevision: agency.billingPolicyRevision,
-        billingMode: "FREE_INTERNAL",
-        reason: "Internal development and beta testing",
-      });
-      if (!current()) return;
-      R().toast(result?.ok ? "Internal development access enabled" : result?.error || "Failed");
-      if (result?.ok) window.NodAdminAgencyDetailActions.reloadDetail?.();
-    }));
+    main.querySelector("#admSubDevelopment")?.addEventListener("click", () =>
+      W().action(main, async (current) => {
+        const agency = slice.data.agency;
+        const result = await window.NodAdminApi.patchSubscription(agency.id, {
+          expectedRevision: agency.billingPolicyRevision,
+          billingMode: "FREE_INTERNAL",
+          reason: "Internal development and beta testing",
+        });
+        if (!current()) return;
+        R().toast(result?.ok ? "Internal development access enabled" : result?.error || "Failed");
+        if (result?.ok) window.NodAdminAgencyDetailActions.reloadDetail?.();
+      })
+    );
 
-    main.querySelector("#admSubHold")?.addEventListener("click", () => W().action(main, async current => {
-      const agency = slice.data.agency;
-      const reason = main.querySelector("#admSubReason").value.trim();
-      if (!reason) return R().toast("Reason is required");
-      const result = await window.NodAdminApi.setBillingHold(agency.id, { enabled: !agency.billingSupportHold, expectedRevision: agency.billingPolicyRevision, reason });
-      if (!current()) return;
-      R().toast(result?.ok ? "Billing hold updated — refresh current values" : result?.error || "Failed");
-      if (result?.ok) window.NodAdminAgencyDetailActions.reloadDetail?.();
-    }));
+    main.querySelector("#admSubHold")?.addEventListener("click", () =>
+      W().action(main, async (current) => {
+        const agency = slice.data.agency;
+        const reason = main.querySelector("#admSubReason").value.trim();
+        if (!reason) return R().toast("Reason is required");
+        const result = await window.NodAdminApi.setBillingHold(agency.id, {
+          enabled: !agency.billingSupportHold,
+          expectedRevision: agency.billingPolicyRevision,
+          reason,
+        });
+        if (!current()) return;
+        R().toast(result?.ok ? "Billing hold updated — refresh current values" : result?.error || "Failed");
+        if (result?.ok) window.NodAdminAgencyDetailActions.reloadDetail?.();
+      })
+    );
 
-    save.addEventListener("click", () => W().action(main, async () => {
-      const plan      = main.querySelector("#admSubPlan").value.trim();
-      const trialRaw  = main.querySelector("#admSubTrial").value.trim();
-      const reason    = main.querySelector("#admSubReason").value.trim();
+    save.addEventListener("click", () =>
+      W().action(main, async () => {
+        const plan = main.querySelector("#admSubPlan").value.trim();
+        const trialRaw = main.querySelector("#admSubTrial").value.trim();
+        const reason = main.querySelector("#admSubReason").value.trim();
 
-      const body = {
-        plan: plan || undefined,
-        expectedRevision: slice.data.agency.billingPolicyRevision,
-        billingMode: main.querySelector("#admSubMode").value,
-        billingPeriod: main.querySelector("#admSubBillingPeriod").value,
-        trialEndsAt: trialRaw || null,
-        reason: reason || undefined,
-      };
+        const body = {
+          plan: plan || undefined,
+          expectedRevision: slice.data.agency.billingPolicyRevision,
+          billingMode: main.querySelector("#admSubMode").value,
+          billingPeriod: main.querySelector("#admSubBillingPeriod").value,
+          trialEndsAt: trialRaw || null,
+          reason: reason || undefined,
+        };
 
-      await Actions().saveSubscription(slice.data.agency.id, body);
-    }));
+        await Actions().saveSubscription(slice.data.agency.id, body);
+      })
+    );
   }
 
   // ════════════════════════════════════════════════════════════
@@ -333,7 +361,9 @@
               </tr>
             </thead>
             <tbody>
-              ${logs.map((l) => `
+              ${logs
+                .map(
+                  (l) => `
                 <tr>
                   <td class="adm-cell-mono">${r.escapeHtml(u.formatDateTime(l.createdAt))}</td>
                   <td><span class="adm-pill muted no-dot">${r.escapeHtml(l.action)}</span></td>
@@ -345,7 +375,9 @@
                     <button class="adm-btn ghost" data-audit-show="${r.escapeAttr(l.id)}">view diff</button>
                   </td>
                 </tr>
-              `).join("")}
+              `
+                )
+                .join("")}
             </tbody>
           </table>
         </div>
@@ -361,7 +393,7 @@
         if (!log) return;
 
         const before = JSON.stringify(log.before || null, null, 2);
-        const after  = JSON.stringify(log.after  || null, null, 2);
+        const after = JSON.stringify(log.after || null, null, 2);
         // Simple modal-less view: show in alert. We can build a real
         // diff viewer in заход 5 (audit page).
         alert(`BEFORE:\n${before}\n\nAFTER:\n${after}`);
@@ -370,9 +402,13 @@
   }
 
   window.NodAdminAgencyDetailTabs = {
-    renderMembers,      bindMembers,
-    renderCreators,     bindCreators,
-    renderSubscription, bindSubscription,
-    renderAudit,        bindAudit,
+    renderMembers,
+    bindMembers,
+    renderCreators,
+    bindCreators,
+    renderSubscription,
+    bindSubscription,
+    renderAudit,
+    bindAudit,
   };
 })();

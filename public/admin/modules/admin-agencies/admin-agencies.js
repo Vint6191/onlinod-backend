@@ -19,9 +19,9 @@
   const W = () => window.NodAdminWorkspace;
 
   const State = () => window.NodAdminState;
-  const A     = () => window.NodAdminApi;
-  const R     = () => window.NodAdminRouter;
-  const U     = () => window.NodAdminUtils;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
 
   function ensureSlice() {
     const s = State();
@@ -39,21 +39,38 @@
 
   function load(force) {
     const slice = ensureSlice();
-    return W().load({ section: "agencies", state: slice, force,
-      fetch: () => A().listAgencies({ includeDeleted: slice.filters.includeDeleted ? "1" : undefined }), apply: result => { slice.list = Array.isArray(result.agencies) ? result.agencies : []; }, render });
+    return W().load({
+      section: "agencies",
+      state: slice,
+      force,
+      fetch: () => A().listAgencies({ includeDeleted: slice.filters.includeDeleted ? "1" : undefined }),
+      apply: (result) => {
+        slice.list = Array.isArray(result.agencies) ? result.agencies : [];
+      },
+      render,
+    });
   }
 
-  function rerender() { W().paint("agencies", render); }
+  function rerender() {
+    W().paint("agencies", render);
+  }
 
   function applyClientFilters(list, filters) {
     let out = list;
 
     if (filters.q) {
       const needle = filters.q.toLowerCase();
-      out = out.filter((a) =>
-        String(a.name || "").toLowerCase().includes(needle) ||
-        String(a.id || "").toLowerCase().includes(needle) ||
-        String(a.owner?.email || "").toLowerCase().includes(needle)
+      out = out.filter(
+        (a) =>
+          String(a.name || "")
+            .toLowerCase()
+            .includes(needle) ||
+          String(a.id || "")
+            .toLowerCase()
+            .includes(needle) ||
+          String(a.owner?.email || "")
+            .toLowerCase()
+            .includes(needle)
       );
     }
 
@@ -79,11 +96,11 @@
     main.innerHTML = `
       <div class="adm-page-head">
         <div>
-          <div class="adm-page-title">Agencies</div>
-          <div class="adm-page-subtitle">~/admin/agencies · ${r.escapeHtml(String(filtered.length))}/${r.escapeHtml(String(slice.list.length))}</div>
+          <div class="adm-page-title">Агентства</div>
+          <div class="adm-page-subtitle">${r.escapeHtml(String(filtered.length))}/${r.escapeHtml(String(slice.list.length))}</div>
         </div>
         <div style="display:flex;gap:8px;">
-          <button class="adm-btn ghost" id="admAgRefresh">↻ refresh</button>
+          <button class="adm-btn ghost" id="admAgRefresh">Обновить</button>
         </div>
       </div>
 
@@ -117,7 +134,7 @@
           <div class="adm-table-toolbar-spacer"></div>
 
           <span style="color:var(--adm-muted);font-family:var(--adm-mono);font-size:11px;">
-            ${slice.loading ? "loading…" : (slice.lastLoadedAt ? `loaded ${u.timeAgo(slice.lastLoadedAt)}` : "")}
+            ${slice.loading ? "loading…" : slice.lastLoadedAt ? `loaded ${u.timeAgo(slice.lastLoadedAt)}` : ""}
           </span>
         </div>
 
@@ -125,8 +142,8 @@
           slice.loading && !slice.list.length
             ? `<div class="adm-loading">loading agencies…</div>`
             : !filtered.length
-            ? `<div class="adm-empty">${slice.list.length ? "No matches for current filters." : "No agencies yet."}</div>`
-            : `
+              ? `<div class="adm-empty">${slice.list.length ? "No matches for current filters." : "No agencies yet."}</div>`
+              : `
               <table class="adm-table">
                 <thead>
                   <tr>

@@ -19,19 +19,38 @@
   const W = () => window.NodAdminWorkspace;
 
   const State = () => window.NodAdminState;
-  const A     = () => window.NodAdminApi;
-  const R     = () => window.NodAdminRouter;
-  const U     = () => window.NodAdminUtils;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
 
-  function slice() { return State().creators; }
+  function slice() {
+    return State().creators;
+  }
 
   function load(force) {
     const s = slice();
-    return W().load({ section: "creators", state: s, force,
-      fetch: () => A().listCreators({ q:s.filters.q || undefined, status:s.filters.status || undefined, tier:s.filters.tier || undefined, agencyId:s.filters.agencyId || undefined, no_canonical:s.filters.no_canonical ? "1" : undefined }), apply: result => { s.list = Array.isArray(result.creators) ? result.creators : []; }, render });
+    return W().load({
+      section: "creators",
+      state: s,
+      force,
+      fetch: () =>
+        A().listCreators({
+          q: s.filters.q || undefined,
+          status: s.filters.status || undefined,
+          tier: s.filters.tier || undefined,
+          agencyId: s.filters.agencyId || undefined,
+          no_canonical: s.filters.no_canonical ? "1" : undefined,
+        }),
+      apply: (result) => {
+        s.list = Array.isArray(result.creators) ? result.creators : [];
+      },
+      render,
+    });
   }
 
-  function rerender() { W().paint("creators", render); }
+  function rerender() {
+    W().paint("creators", render);
+  }
 
   function render(main) {
     const s = slice();
@@ -43,10 +62,10 @@
     main.innerHTML = `
       <div class="adm-page-head">
         <div>
-          <div class="adm-page-title">Creators</div>
-          <div class="adm-page-subtitle">~/admin/creators · ${r.escapeHtml(String(s.list.length))} loaded</div>
+          <div class="adm-page-title">Модели</div>
+          <div class="adm-page-subtitle">${r.escapeHtml(String(s.list.length))} loaded</div>
         </div>
-        <button class="adm-btn ghost" id="admCreatorsRefresh">↻ refresh</button>
+        <button class="adm-btn ghost" id="admCreatorsRefresh">Обновить</button>
       </div>
 
       ${s.error ? `<div class="adm-error">${r.escapeHtml(s.error)}</div>` : ""}
@@ -83,7 +102,7 @@
           <div class="adm-table-toolbar-spacer"></div>
 
           <span style="color:var(--adm-muted);font-family:var(--adm-mono);font-size:11px;">
-            ${s.loading ? "loading…" : (s.lastLoadedAt ? `loaded ${u.timeAgo(s.lastLoadedAt)}` : "")}
+            ${s.loading ? "loading…" : s.lastLoadedAt ? `loaded ${u.timeAgo(s.lastLoadedAt)}` : ""}
           </span>
         </div>
 
@@ -91,8 +110,8 @@
           s.loading && !s.list.length
             ? `<div class="adm-loading">loading creators…</div>`
             : !s.list.length
-            ? `<div class="adm-empty">No creators match these filters.</div>`
-            : `
+              ? `<div class="adm-empty">No creators match these filters.</div>`
+              : `
               <table class="adm-table">
                 <thead>
                   <tr>

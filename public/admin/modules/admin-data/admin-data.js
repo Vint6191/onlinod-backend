@@ -17,9 +17,20 @@
 
   // entity key → { label, api(query), columns:[{k,label,fmt?}], model (for inspection) }
   const ENTITIES = {
-    "content": { label: "Message Library", model: "contentCollection", api: q => A().dataContent({...q,kind:"message_library_script",includeTrash:"true"}), cols: [{k:"title",label:"Title"},{k:"status",label:"Status"},{k:"creatorId",label:"Creator"},{k:"updatedAt",label:"Updated",fmt:fmtDate}] },
-    "deliveries": {
-      label: "Automation Deliveries", model: "automationDelivery",
+    content: {
+      label: "Message Library",
+      model: "contentCollection",
+      api: (q) => A().dataContent({ ...q, kind: "message_library_script", includeTrash: "true" }),
+      cols: [
+        { k: "title", label: "Title" },
+        { k: "status", label: "Status" },
+        { k: "creatorId", label: "Creator" },
+        { k: "updatedAt", label: "Updated", fmt: fmtDate },
+      ],
+    },
+    deliveries: {
+      label: "Automation Deliveries",
+      model: "automationDelivery",
       api: (q) => A().dataDeliveries(q),
       cols: [
         { k: "fanId", label: "Fan" },
@@ -30,7 +41,8 @@
       ],
     },
     "hidden-online": {
-      label: "Hidden Online — Current", model: null,
+      label: "Hidden Online — Current",
+      model: null,
       api: (q) => A().dataHiddenOnline(q),
       cols: [
         { k: "fanId", label: "Fan" },
@@ -42,7 +54,8 @@
       ],
     },
     "follow-back": {
-      label: "Follow Back — Current", model: null,
+      label: "Follow Back — Current",
+      model: null,
       api: (q) => A().dataFollowBack(q),
       cols: [
         { k: "fanId", label: "Fan" },
@@ -54,8 +67,9 @@
         { k: "updatedAt", label: "Updated", fmt: fmtDate },
       ],
     },
-    "money": {
-      label: "Money Attribution", model: "moneyAttribution",
+    money: {
+      label: "Money Attribution",
+      model: "moneyAttribution",
       api: (q) => A().dataMoney(q),
       cols: [
         { k: "eventType", label: "Type" },
@@ -67,7 +81,11 @@
     },
   };
 
-  function fmtDate(v) { if (!v) return "—"; const d = new Date(v); return isNaN(d) ? "—" : d.toISOString().slice(0, 16).replace("T", " "); }
+  function fmtDate(v) {
+    if (!v) return "—";
+    const d = new Date(v);
+    return isNaN(d) ? "—" : d.toISOString().slice(0, 16).replace("T", " ");
+  }
   function fmtMoney(v, row = null) {
     if (v == null || (row?.valueAvailability && row.valueAvailability !== "AVAILABLE")) return "—";
     const n = Number(v);
@@ -75,7 +93,19 @@
   }
 
   // local view state (kept on the module, simple)
-  const view = W().local(() => ({ tab: "health", entity: "deliveries", filters: { agencyId: "", creatorId: "" }, rows: [], total: null, nextOffset:null, hasMore:false, statusCounts: null, selected: new Set(), loading: false, requestId: 0 }));
+  const view = W().local(() => ({
+    tab: "health",
+    entity: "deliveries",
+    filters: { agencyId: "", creatorId: "" },
+    rows: [],
+    total: null,
+    nextOffset: null,
+    hasMore: false,
+    statusCounts: null,
+    selected: new Set(),
+    loading: false,
+    requestId: 0,
+  }));
 
   async function render(main) {
     view.loading = false;
@@ -83,7 +113,7 @@
     main.innerHTML = `
       <div class="adm-page">
         <div class="adm-page-head">
-          <h1>Data Explorer</h1>
+          <h1>Данные платформы</h1>
           <div class="adm-page-sub">inspect data; archive selected terminal deliveries with a reason</div>
         </div>
         <div class="adm-tabs">
@@ -92,7 +122,12 @@
         </div>
         <div id="admDataBody"></div>
       </div>`;
-    main.querySelectorAll(".adm-tab").forEach((b) => b.addEventListener("click", () => { view.tab = b.dataset.tab; render(main); }));
+    main.querySelectorAll(".adm-tab").forEach((b) =>
+      b.addEventListener("click", () => {
+        view.tab = b.dataset.tab;
+        render(main);
+      })
+    );
     if (view.tab === "health") renderHealth(main.querySelector("#admDataBody"));
     else renderBrowse(main.querySelector("#admDataBody"));
   }
@@ -105,7 +140,9 @@
     if (!current()) return;
     if (!r || !r.ok) return W().failure(body, r?.error || "Failed to load diagnostics", () => renderHealth(body));
 
-    const cards = (r.anomalies || []).map((a) => `
+    const cards = (r.anomalies || [])
+      .map(
+        (a) => `
       <div class="adm-anomaly adm-anomaly-${esc(a.level)}">
         <div class="adm-anomaly-top">
           <span class="adm-anomaly-dot"></span>
@@ -113,19 +150,26 @@
           <span class="adm-anomaly-count">${esc(a.count != null ? a.count : "")}</span>
         </div>
         <div class="adm-anomaly-detail">${esc(a.detail)}</div>
-      </div>`).join("");
+      </div>`
+      )
+      .join("");
 
     body.innerHTML = `
       <div class="adm-anomaly-grid">${cards}</div>
-      <div class="adm-muted" style="margin-top:12px">${r.checkedAt ? `Observed ${esc(fmtDate(r.coverage?.observationFrom))} — ${esc(fmtDate(r.checkedAt))}` : 'Initial diagnostic pass is in progress'} · ${esc(r.coverage?.status || 'UNKNOWN')}<br>Rolling observation; changes during a pass are revisited on the next pass. ${r.coverage?.rebuilding ? `Next pass: ${esc(r.coverage.progressRows)} rows checked.` : ''}</div>
-      ${(r.coverage?.excluded || []).map(item => `<p class="adm-muted">${esc(item.reason)}</p>`).join('')}`;
+      <div class="adm-muted" style="margin-top:12px">${r.checkedAt ? `Observed ${esc(fmtDate(r.coverage?.observationFrom))} — ${esc(fmtDate(r.checkedAt))}` : "Initial diagnostic pass is in progress"} · ${esc(r.coverage?.status || "UNKNOWN")}<br>Rolling observation; changes during a pass are revisited on the next pass. ${r.coverage?.rebuilding ? `Next pass: ${esc(r.coverage.progressRows)} rows checked.` : ""}</div>
+      ${(r.coverage?.excluded || []).map((item) => `<p class="adm-muted">${esc(item.reason)}</p>`).join("")}`;
 
-    body.insertAdjacentHTML("beforeend", '<p class="adm-muted">Inspect anomalies before acting. Stuck work uses its recovery flow. Terminal archival is available in Browse for one agency and creator.</p>');
+    body.insertAdjacentHTML(
+      "beforeend",
+      '<p class="adm-muted">Inspect anomalies before acting. Stuck work uses its recovery flow. Terminal archival is available in Browse for one agency and creator.</p>'
+    );
   }
 
   // ── BROWSE (entity tables) ──────────────────────────────────
   async function renderBrowse(body) {
-    const opts = Object.entries(ENTITIES).map(([k, v]) => `<option value="${k}" ${k === view.entity ? "selected" : ""}>${esc(v.label)}</option>`).join("");
+    const opts = Object.entries(ENTITIES)
+      .map(([k, v]) => `<option value="${k}" ${k === view.entity ? "selected" : ""}>${esc(v.label)}</option>`)
+      .join("");
     const readOnlyCurrent = view.entity !== "deliveries";
     body.innerHTML = `
       <div class="adm-data-controls">
@@ -143,32 +187,55 @@
 
     body.querySelector("#admEntity").addEventListener("change", (e) => {
       view.entity = e.target.value;
-      view.selected.clear(); view.rows = []; view.nextOffset=null; view.hasMore=false; view.requestId++;
+      view.selected.clear();
+      view.rows = [];
+      view.nextOffset = null;
+      view.hasMore = false;
+      view.requestId++;
       const bulk = body.querySelector("#admBulkDel");
-      if (bulk) { bulk.hidden = view.entity !== "deliveries"; bulk.disabled = true; bulk.textContent = "archive selected"; }
+      if (bulk) {
+        bulk.hidden = view.entity !== "deliveries";
+        bulk.disabled = true;
+        bulk.textContent = "archive selected";
+      }
       const table = body.querySelector("#admDataTable");
-      if (table) table.innerHTML = `<div class="adm-muted">press load to view ${esc(ENTITIES[view.entity]?.label || "entity")}</div>`;
+      if (table)
+        table.innerHTML = `<div class="adm-muted">press load to view ${esc(ENTITIES[view.entity]?.label || "entity")}</div>`;
     });
     body.querySelector("#admLoad").addEventListener("click", () => loadEntity(body));
     body.querySelector("#admBulkDel").addEventListener("click", () => archiveSelected(body));
   }
 
-  async function loadEntity(body, next=false) {
-    const sameFilters=view.filters.agencyId===body.querySelector("#admFAgency").value.trim() && view.filters.creatorId===body.querySelector("#admFCreator").value.trim();
-    const offset=next&&sameFilters?view.nextOffset:null;
+  async function loadEntity(body, next = false) {
+    const sameFilters =
+      view.filters.agencyId === body.querySelector("#admFAgency").value.trim() &&
+      view.filters.creatorId === body.querySelector("#admFCreator").value.trim();
+    const offset = next && sameFilters ? view.nextOffset : null;
     view.filters.agencyId = body.querySelector("#admFAgency").value.trim();
     view.filters.creatorId = body.querySelector("#admFCreator").value.trim();
-    view.selected.clear(); view.rows = []; updateBulkBtn(body);
-    const requestId = ++view.requestId, current = W().request(body);
+    view.selected.clear();
+    view.rows = [];
+    updateBulkBtn(body);
+    const requestId = ++view.requestId,
+      current = W().request(body);
     const table = body.querySelector("#admDataTable");
     table.innerHTML = `<div class="adm-loading">loading…</div>`;
     const ent = ENTITIES[view.entity];
-    const r = await ent.api({ offset:offset||undefined, agencyId: view.filters.agencyId || undefined, creatorId: view.filters.creatorId || undefined, limit: 200 });
+    const r = await ent.api({
+      offset: offset || undefined,
+      agencyId: view.filters.agencyId || undefined,
+      creatorId: view.filters.creatorId || undefined,
+      limit: 200,
+    });
     if (!current() || requestId !== view.requestId) return;
-    if (!r || !r.ok) { table.innerHTML = `<div class="adm-error">${esc(r?.error||r?.code||"load failed")}</div>`; return; }
+    if (!r || !r.ok) {
+      table.innerHTML = `<div class="adm-error">${esc(r?.error || r?.code || "load failed")}</div>`;
+      return;
+    }
     view.rows = r.items || [];
     view.total = r.total ?? null;
-    view.nextOffset=r.nextOffset||null;view.hasMore=r.hasMore===true;
+    view.nextOffset = r.nextOffset || null;
+    view.hasMore = r.hasMore === true;
     view.statusCounts = r.statusCounts || null;
     renderTable(body);
   }
@@ -177,18 +244,24 @@
     const ent = ENTITIES[view.entity];
     const table = body.querySelector("#admDataTable");
     const statusBar = view.statusCounts
-      ? `<div class="adm-status-bar">${Object.entries(view.statusCounts).map(([s, n]) => `<span>${esc(s)}: <b>${esc(n)}</b></span>`).join("")}</div>` : "";
+      ? `<div class="adm-status-bar">${Object.entries(view.statusCounts)
+          .map(([s, n]) => `<span>${esc(s)}: <b>${esc(n)}</b></span>`)
+          .join("")}</div>`
+      : "";
 
     const readOnly = view.entity !== "deliveries";
     const head = `<tr>${readOnly ? "" : '<th class="adm-col-check"><input type="checkbox" id="admChkAll"></th>'}${ent.cols.map((c) => `<th>${esc(c.label)}</th>`).join("")}${ent.model ? "<th></th>" : ""}</tr>`;
-    const rows = view.rows.map((row) => {
-      const cells = ent.cols.map((c) => {
-        const raw = row[c.k];
-        const val = c.fmt ? c.fmt(raw, row) : (raw == null ? "—" : String(raw));
-        return `<td title="${esc(typeof raw === "object" ? JSON.stringify(raw) : raw)}">${esc(truncate(val, 40))}</td>`;
-      }).join("");
-      if (!ent.model) return `<tr>${cells}</tr>`;
-      return `<tr data-id="${esc(row.id)}">
+    const rows = view.rows
+      .map((row) => {
+        const cells = ent.cols
+          .map((c) => {
+            const raw = row[c.k];
+            const val = c.fmt ? c.fmt(raw, row) : raw == null ? "—" : String(raw);
+            return `<td title="${esc(typeof raw === "object" ? JSON.stringify(raw) : raw)}">${esc(truncate(val, 40))}</td>`;
+          })
+          .join("");
+        if (!ent.model) return `<tr>${cells}</tr>`;
+        return `<tr data-id="${esc(row.id)}">
         ${readOnly ? "" : `<td class="adm-col-check"><input type="checkbox" class="admRowChk" data-id="${esc(row.id)}" ${canSelect(row) ? "" : "disabled"}></td>`}
         ${cells}
         <td class="adm-row-actions">
@@ -196,39 +269,59 @@
           ${view.entity === "content" && row.status !== "deleting" ? `<button class="adm-link" data-content-id="${esc(row.id)}" data-content-action="${row.deletedAt || row.status === "trash" ? "restore" : "trash"}">${row.deletedAt || row.status === "trash" ? "restore" : "trash"}</button>${row.deletedAt || row.status === "trash" ? `<button class="adm-link" data-content-id="${esc(row.id)}" data-content-action="permanent">delete forever</button>` : ""}` : ""}
         </td>
       </tr>`;
-    }).join("");
+      })
+      .join("");
 
     table.innerHTML = `
       ${statusBar}
-      <div class="adm-muted" style="margin:6px 0">${view.rows.length} on this page${view.total==null?"":` of ${view.total} total`}${readOnly ? " · read-only" : ""}</div>
+      <div class="adm-muted" style="margin:6px 0">${view.rows.length} on this page${view.total == null ? "" : ` of ${view.total} total`}${readOnly ? " · read-only" : ""}</div>
       <table class="adm-table"><thead>${head}</thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows on this page</td></tr>`}</tbody></table>
-      ${view.hasMore?'<button class="adm-btn adm-btn-sm" id="admNextPage">next page</button>':""}`;
+      ${view.hasMore ? '<button class="adm-btn adm-btn-sm" id="admNextPage">next page</button>' : ""}`;
 
-    table.querySelectorAll("[data-inspect]").forEach((b) => b.addEventListener("click", () => inspect(ent.model, b.dataset.inspect)));
-    table.querySelector("#admNextPage")?.addEventListener("click",()=>loadEntity(body,true));
+    table
+      .querySelectorAll("[data-inspect]")
+      .forEach((b) => b.addEventListener("click", () => inspect(ent.model, b.dataset.inspect)));
+    table.querySelector("#admNextPage")?.addEventListener("click", () => loadEntity(body, true));
     updateBulkBtn(body);
     W().superOnly(body, "#admBulkDel, [data-content-action]");
-    table.querySelectorAll("[data-content-action]").forEach(b => b.addEventListener("click", () => changeContent(body, b.dataset.contentId, b.dataset.contentAction)));
+    table
+      .querySelectorAll("[data-content-action]")
+      .forEach((b) =>
+        b.addEventListener("click", () => changeContent(body, b.dataset.contentId, b.dataset.contentAction))
+      );
     if (readOnly) return;
 
     // select-all
     table.querySelector("#admChkAll")?.addEventListener("change", (e) => {
       view.selected.clear();
-      table.querySelectorAll(".admRowChk").forEach((c) => { if (!c.disabled) { c.checked = e.target.checked && view.selected.size < 100; toggleSel(c.dataset.id, c.checked); } });
+      table.querySelectorAll(".admRowChk").forEach((c) => {
+        if (!c.disabled) {
+          c.checked = e.target.checked && view.selected.size < 100;
+          toggleSel(c.dataset.id, c.checked);
+        }
+      });
       updateBulkBtn(body);
     });
-    table.querySelectorAll(".admRowChk").forEach((c) => c.addEventListener("change", () => { toggleSel(c.dataset.id, c.checked); c.checked = view.selected.has(c.dataset.id); updateBulkBtn(body); }));
-
-
+    table.querySelectorAll(".admRowChk").forEach((c) =>
+      c.addEventListener("change", () => {
+        toggleSel(c.dataset.id, c.checked);
+        c.checked = view.selected.has(c.dataset.id);
+        updateBulkBtn(body);
+      })
+    );
   }
 
-  function toggleSel(id, on) { if (!on) view.selected.delete(id); else if (view.selected.size < 100) view.selected.add(id); }
+  function toggleSel(id, on) {
+    if (!on) view.selected.delete(id);
+    else if (view.selected.size < 100) view.selected.add(id);
+  }
   function updateBulkBtn(body) {
     const b = body.querySelector("#admBulkDel");
     if (!b) return;
     const mutable = view.entity === "deliveries";
     b.hidden = !mutable;
-    b.disabled = view.loading || !mutable || view.selected.size === 0 || window.NodAdminState.admin?.role !== "SUPER_ADMIN";
+    b.disabled =
+      view.loading || !mutable || view.selected.size === 0 || window.NodAdminState.admin?.role !== "SUPER_ADMIN";
     b.textContent = mutable && view.selected.size ? `archive selected (${view.selected.size})` : "archive selected";
   }
 
@@ -237,48 +330,127 @@
     const current = W().capture(document.getElementById("admDataBody"));
     const r = await A().dataInspect(model, id);
     if (!current()) return;
-    if (!r || !r.ok) { R().toast("inspect failed", "error"); return; }
+    if (!r || !r.ok) {
+      R().toast("inspect failed", "error");
+      return;
+    }
     showModal(`${model} · ${id}`, `<pre class="adm-json">${esc(JSON.stringify(r.record, null, 2))}</pre>`);
   }
 
   async function changeContent(body, id, action) {
-    if(view.loading)return;
-    const row=view.rows.find(row=>row.id===id);
-    if(!row?.creatorId || !row.agencyId || !row.updatedAt)return;
-    const reason=prompt(`Reason to ${action} this Message Library script:`);
-    if(!reason?.trim())return;
-    if(action==="permanent" && !confirm("Commit permanent deletion? The script cannot be restored; physical cleanup runs in the background."))return;
-    view.loading=true;
-    const current=W().capture(body),unlock=W().lock(body);
-    try{const r=await A().dataContentLifecycle(id,{agencyId:row.agencyId,creatorId:row.creatorId,expectedUpdatedAt:row.updatedAt,action,reason:reason.trim()});if(!current())return;R().toast(r?.ok?(r.pendingCleanup?"Deletion committed; cleanup pending":"Updated"):(r?.error||"Result unknown; retry the same action"),r?.ok?"ok":"error");if(r?.ok)await loadEntity(body);}
-    finally{unlock();if(current())view.loading=false;}
+    if (view.loading) return;
+    const row = view.rows.find((row) => row.id === id);
+    if (!row?.creatorId || !row.agencyId || !row.updatedAt) return;
+    const reason = prompt(`Reason to ${action} this Message Library script:`);
+    if (!reason?.trim()) return;
+    if (
+      action === "permanent" &&
+      !confirm("Commit permanent deletion? The script cannot be restored; physical cleanup runs in the background.")
+    )
+      return;
+    view.loading = true;
+    const current = W().capture(body),
+      unlock = W().lock(body);
+    try {
+      const r = await A().dataContentLifecycle(id, {
+        agencyId: row.agencyId,
+        creatorId: row.creatorId,
+        expectedUpdatedAt: row.updatedAt,
+        action,
+        reason: reason.trim(),
+      });
+      if (!current()) return;
+      R().toast(
+        r?.ok
+          ? r.pendingCleanup
+            ? "Deletion committed; cleanup pending"
+            : "Updated"
+          : r?.error || "Result unknown; retry the same action",
+        r?.ok ? "ok" : "error"
+      );
+      if (r?.ok) await loadEntity(body);
+    } finally {
+      unlock();
+      if (current()) view.loading = false;
+    }
   }
 
   function canSelect(row) {
-    return row.originKind === "AUTOMATION" && ["COMPLETED","FAILED","SKIPPED","CANCELED"].includes(row.status) && row.finishedAt && row.updatedAt && row.agencyId === view.filters.agencyId && row.creatorId === view.filters.creatorId;
+    return (
+      row.originKind === "AUTOMATION" &&
+      ["COMPLETED", "FAILED", "SKIPPED", "CANCELED"].includes(row.status) &&
+      row.finishedAt &&
+      row.updatedAt &&
+      row.agencyId === view.filters.agencyId &&
+      row.creatorId === view.filters.creatorId
+    );
   }
   async function archiveSelected(body) {
     if (view.loading || view.entity !== "deliveries" || !view.selected.size) return;
-    if (view.filters.agencyId !== body.querySelector("#admFAgency").value.trim() || view.filters.creatorId !== body.querySelector("#admFCreator").value.trim()) return R().toast("Load the changed filters before selecting records.", "error");
+    if (
+      view.filters.agencyId !== body.querySelector("#admFAgency").value.trim() ||
+      view.filters.creatorId !== body.querySelector("#admFCreator").value.trim()
+    )
+      return R().toast("Load the changed filters before selecting records.", "error");
     const reason = body.querySelector("#admArchiveReason").value.trim();
     const cutoff = body.querySelector("#admArchiveCutoff").value;
     const olderThan = cutoff ? new Date(cutoff + "Z") : null;
-    if (!view.filters.agencyId || !view.filters.creatorId || !reason || !olderThan || !Number.isFinite(olderThan.getTime())) { R().toast("Load one agency and creator; supply cutoff (UTC) and reason", "error"); return; }
-    const items = view.rows.filter(row => view.selected.has(row.id) && canSelect(row)).map(row => ({ id: row.id, expectedUpdatedAt: row.updatedAt })).sort((a,b) => a.id.localeCompare(b.id));
-    if (!items.length || items.length !== view.selected.size) { R().toast("Reload selection", "error"); return; }
-    if (!confirm(`Archive ${items.length} terminal records before ${olderThan.toISOString()}? Monthly counters are preserved.`)) return;
-    view.loading = true; updateBulkBtn(body);
-    const current = W().capture(body), unlock = W().lock(body);
+    if (
+      !view.filters.agencyId ||
+      !view.filters.creatorId ||
+      !reason ||
+      !olderThan ||
+      !Number.isFinite(olderThan.getTime())
+    ) {
+      R().toast("Load one agency and creator; supply cutoff (UTC) and reason", "error");
+      return;
+    }
+    const items = view.rows
+      .filter((row) => view.selected.has(row.id) && canSelect(row))
+      .map((row) => ({ id: row.id, expectedUpdatedAt: row.updatedAt }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+    if (!items.length || items.length !== view.selected.size) {
+      R().toast("Reload selection", "error");
+      return;
+    }
+    if (
+      !confirm(
+        `Archive ${items.length} terminal records before ${olderThan.toISOString()}? Monthly counters are preserved.`
+      )
+    )
+      return;
+    view.loading = true;
+    updateBulkBtn(body);
+    const current = W().capture(body),
+      unlock = W().lock(body);
     try {
-      const r = await A().dataArchiveDeliveries(view.filters.creatorId, { agencyId: view.filters.agencyId, reason, olderThan: olderThan.toISOString(), items });
+      const r = await A().dataArchiveDeliveries(view.filters.creatorId, {
+        agencyId: view.filters.agencyId,
+        reason,
+        olderThan: olderThan.toISOString(),
+        items,
+      });
       if (!current()) return;
-      R().toast(r?.ok ? `archived ${r.archived}` : (r?.error || "Archive result unknown; retry the same selection"), r?.ok ? "ok" : "error");
+      R().toast(
+        r?.ok ? `archived ${r.archived}` : r?.error || "Archive result unknown; retry the same selection",
+        r?.ok ? "ok" : "error"
+      );
       if (r?.ok) await loadEntity(body);
-    } catch (_) { R().toast("Archive result unknown; retry the same selection", "error"); }
-    finally { unlock(); if (current()) { view.loading = false; updateBulkBtn(body); } }
+    } catch (_) {
+      R().toast("Archive result unknown; retry the same selection", "error");
+    } finally {
+      unlock();
+      if (current()) {
+        view.loading = false;
+        updateBulkBtn(body);
+      }
+    }
   }
 
-  function truncate(s, n) { s = String(s); return s.length > n ? s.slice(0, n) + "…" : s; }
+  function truncate(s, n) {
+    s = String(s);
+    return s.length > n ? s.slice(0, n) + "…" : s;
+  }
 
   function showModal(title, html) {
     let m = document.querySelector(".adm-modal-overlay");
@@ -288,7 +460,9 @@
     m.innerHTML = `<div class="adm-modal"><div class="adm-modal-head"><b>${esc(title)}</b><button class="adm-modal-close">✕</button></div><div class="adm-modal-body">${html}</div></div>`;
     document.body.appendChild(m);
     m.querySelector(".adm-modal-close").addEventListener("click", () => m.remove());
-    m.addEventListener("click", (e) => { if (e.target === m) m.remove(); });
+    m.addEventListener("click", (e) => {
+      if (e.target === m) m.remove();
+    });
     return m;
   }
 

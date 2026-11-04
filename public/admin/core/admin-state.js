@@ -13,10 +13,15 @@
 
     // ── slices ────────────────────────────────────────────
     dashboard: {
-      loading: false, error: null, data: null, lastLoadedAt: 0,
+      loading: false,
+      error: null,
+      data: null,
+      lastLoadedAt: 0,
     },
     agencies: {
-      loading: false, error: null, list: [],
+      loading: false,
+      error: null,
+      list: [],
       filters: { q: "", includeDeleted: false, statusFilter: "all" },
       lastLoadedAt: 0,
     },
@@ -24,17 +29,23 @@
 
     // Cross-agency listings — one slice per section.
     users: {
-      loading: false, error: null, list: [],
+      loading: false,
+      error: null,
+      list: [],
       filters: { q: "", unverified: false, no_agency: false, disabled: false },
       lastLoadedAt: 0,
     },
     creators: {
-      loading: false, error: null, list: [],
+      loading: false,
+      error: null,
+      list: [],
       filters: { q: "", status: "", tier: "", agencyId: "", no_canonical: false },
       lastLoadedAt: 0,
     },
     devices: {
-      loading: false, error: null, list: [],
+      loading: false,
+      error: null,
+      list: [],
       filters: { q: "", agencyId: "", online: false, offline: false },
       lastLoadedAt: 0,
     },
@@ -60,7 +71,9 @@
     localStorage.removeItem("onlinod_admin");
   }
   window.addEventListener("nod:admin-session-changed", reset);
-  window.addEventListener("storage", event => { if (event.key === "onlinod_admin_token" || event.key === null) reset(); });
+  window.addEventListener("storage", (event) => {
+    if (event.key === "onlinod_admin_token" || event.key === null) reset();
+  });
 
   function setSection(section, param) {
     state.section = section || "dashboard";
@@ -71,8 +84,10 @@
     if (!id) return null;
     if (!state.agencyDetail[id]) {
       state.agencyDetail[id] = {
-        loading: false, error: null, data: null,
-        tab: "overview",
+        loading: false,
+        error: null,
+        data: null,
+        tab: "creators",
         lastLoadedAt: 0,
         ui: { editingMember: null, editingSubscription: false },
       };

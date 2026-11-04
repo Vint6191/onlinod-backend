@@ -22,16 +22,17 @@
 
   const State = () => window.NodAdminState;
   const StateApi = () => window.NodAdminStateApi;
-  const A     = () => window.NodAdminApi;
-  const R     = () => window.NodAdminRouter;
-  const U     = () => window.NodAdminUtils;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
 
   const TABS = [
-    { key: "overview",     label: "Overview" },
-    { key: "members",      label: "Members" },
-    { key: "creators",     label: "Creators" },
-    { key: "subscription", label: "Subscription" },
-    { key: "audit",        label: "Audit" },
+    { key: "creators", label: "Модели" },
+    { key: "model-subscriptions", label: "Подписки моделей" },
+    { key: "members", label: "Команда" },
+    { key: "overview", label: "Об агентстве" },
+    { key: "subscription", label: "Политика доступа" },
+    { key: "audit", label: "История" },
   ];
 
   function currentSlice() {
@@ -44,11 +45,21 @@
     const id = State().sectionParam;
     if (!id) return;
     const slice = StateApi().ensureAgencyDetail(State().sectionParam);
-    return W().load({ section: "agency-detail", state: slice, force,
-      fetch: () => A().getAgency(id), apply: result => { slice.data = result; }, render });
+    return W().load({
+      section: "agency-detail",
+      state: slice,
+      force,
+      fetch: () => A().getAgency(id),
+      apply: (result) => {
+        slice.data = result;
+      },
+      render,
+    });
   }
 
-  function rerender() { W().paint("agency-detail", render); }
+  function rerender() {
+    W().paint("agency-detail", render);
+  }
 
   function render(main) {
     const id = State().sectionParam;
@@ -57,8 +68,7 @@
         <div class="adm-error">No agency id in URL.</div>
         <button class="adm-btn" data-back-to-agencies>← back to agencies</button>
       `;
-      main.querySelector("[data-back-to-agencies]")
-          ?.addEventListener("click", () => R().pushSection("agencies"));
+      main.querySelector("[data-back-to-agencies]")?.addEventListener("click", () => R().pushSection("agencies"));
       return;
     }
 
@@ -94,7 +104,7 @@
     if (!slice.data) return;
 
     const a = slice.data.agency;
-    const tab = slice.tab || "overview";
+    const tab = slice.tab || "creators";
 
     main.innerHTML = `
       ${renderBackBar(id)}
@@ -110,24 +120,26 @@
     bindHeader(main, slice);
     bindTabStrip(main, slice);
     bindTabBody(main, slice, tab);
-    W().superOnly(main, '[data-action="soft-delete"], [data-action="hard-delete"], [data-action="restore"], [data-member-role], [data-member-kick], [data-creator-delete], #admSubHold');
+    W().superOnly(
+      main,
+      '[data-action="soft-delete"], [data-action="hard-delete"], [data-action="restore"], [data-member-role], [data-member-kick], [data-creator-delete], #admSubHold'
+    );
   }
 
   function renderBackBar(id) {
     const r = R();
     return `
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
-        <button class="adm-btn ghost" data-back-to-agencies>← Agencies</button>
+        <button class="adm-btn ghost" data-back-to-agencies>← Агентства</button>
         <div style="
           font-family:var(--adm-mono);font-size:11px;color:var(--adm-muted);
-        ">~/admin/agencies/${r.escapeHtml(id)}</div>
+        ">Карточка агентства</div>
       </div>
     `;
   }
 
   function bindBackBar(main) {
-    main.querySelector("[data-back-to-agencies]")
-        ?.addEventListener("click", () => R().pushSection("agencies"));
+    main.querySelector("[data-back-to-agencies]")?.addEventListener("click", () => R().pushSection("agencies"));
   }
 
   function renderHeader(slice) {
@@ -141,21 +153,22 @@
     const pipelineDebt = Math.max(0, Number(pipeline.total || 0));
     const owner = (a.members || []).find((m) => m.role === "OWNER");
 
-    const pipelineBreakdown = pipelineDebt > 0
-      ? [
-          ["pending orders", pipeline.pendingOrders],
-          ["submissions", pipeline.activeSubmissions],
-          ["OF writes", pipeline.activeWrites],
-          ["Telegram deliveries", pipeline.activeTelegramDeliveries],
-          ["cancel follow-up debt", pipeline.cancelledTelegramFollowupDebt],
-          ["confirmed projection debt", pipeline.confirmedTelegramProjectionDebt],
-          ["provider observations", pipeline.unresolvedInboundEvents],
-        ]
-          .map(([label, value]) => [label, Math.max(0, Number(value || 0))])
-          .filter(([, value]) => value > 0)
-          .map(([label, value]) => `${label}: ${value}`)
-          .join(" · ")
-      : "";
+    const pipelineBreakdown =
+      pipelineDebt > 0
+        ? [
+            ["pending orders", pipeline.pendingOrders],
+            ["submissions", pipeline.activeSubmissions],
+            ["OF writes", pipeline.activeWrites],
+            ["Telegram deliveries", pipeline.activeTelegramDeliveries],
+            ["cancel follow-up debt", pipeline.cancelledTelegramFollowupDebt],
+            ["confirmed projection debt", pipeline.confirmedTelegramProjectionDebt],
+            ["provider observations", pipeline.unresolvedInboundEvents],
+          ]
+            .map(([label, value]) => [label, Math.max(0, Number(value || 0))])
+            .filter(([, value]) => value > 0)
+            .map(([label, value]) => `${label}: ${value}`)
+            .join(" · ")
+        : "";
 
     return `
       <div class="adm-page-head">
@@ -170,8 +183,8 @@
             </div>
             <div class="adm-page-subtitle">
               ${r.escapeHtml(a.id)}
-              · created ${r.escapeHtml(u.formatDate(a.createdAt))}
-              ${owner ? `· owner ${r.escapeHtml(owner.user?.email || "—")}` : ""}
+              · создано ${r.escapeHtml(u.formatDate(a.createdAt))}
+              ${owner ? `· владелец ${r.escapeHtml(owner.user?.email || "—")}` : ""}
               ${h ? ` · health ${r.escapeHtml(String(h.score))}/100` : ""}
             </div>
           </div>
@@ -180,14 +193,14 @@
         <div style="display:flex;gap:8px;flex-wrap:wrap;">
           ${
             isDeleted
-              ? `<button class="adm-btn primary" data-action="restore">↺ restore</button>`
-              : `<button class="adm-btn" data-action="support">Support diagnostics</button>`
+              ? `<button class="adm-btn primary" data-action="restore">Восстановить</button>`
+              : `<button class="adm-btn" data-action="support">Диагностика</button>`
           }
 
           ${
             !isDeleted
-              ? `<button class="adm-btn danger" data-action="soft-delete">delete agency…</button>`
-              : `<button class="adm-btn danger" data-action="hard-delete">hard delete…</button>`
+              ? `<button class="adm-btn danger" data-action="soft-delete">Удалить агентство…</button>`
+              : `<button class="adm-btn danger" data-action="hard-delete">Удалить навсегда…</button>`
           }
 
           <button class="adm-btn ghost" data-action="refresh">↻</button>
@@ -232,7 +245,10 @@
           <div class="adm-card-title">Health · ${r.escapeHtml(String(issues.length))} issue${issues.length === 1 ? "" : "s"}</div>
         </div>
         <div style="display:flex;flex-direction:column;gap:8px;">
-          ${issues.slice(0, 8).map((i) => `
+          ${issues
+            .slice(0, 8)
+            .map(
+              (i) => `
             <div style="
               display:flex;align-items:center;gap:10px;
               padding:8px 10px;border-radius:6px;
@@ -246,7 +262,9 @@
                 ${r.escapeHtml(i.targetType)}
               </span>
             </div>
-          `).join("")}
+          `
+            )
+            .join("")}
         </div>
       </div>
     `;
@@ -254,38 +272,39 @@
 
   function bindHeader(main, slice) {
     main.querySelectorAll("[data-action]").forEach((btn) => {
-      btn.addEventListener("click", () => W().action(main, async () => {
-        const action = btn.dataset.action;
-        const a = slice.data.agency;
+      btn.addEventListener("click", () =>
+        W().action(main, async () => {
+          const action = btn.dataset.action;
+          const a = slice.data.agency;
 
-        if (action === "refresh") return load(true);
-        if (action === "support") return window.NodAdminAgencyDetailActions.doSupport(a.id);
-        if (action === "soft-delete")  return window.NodAdminAgencyDetailActions.doSoftDelete(a.id);
-        if (action === "hard-delete")  return window.NodAdminAgencyDetailActions.doHardDelete(a.id);
-        if (action === "restore")      return window.NodAdminAgencyDetailActions.doRestore(a.id);
-      }));
+          if (action === "refresh") return load(true);
+          if (action === "support") return window.NodAdminAgencyDetailActions.doSupport(a.id);
+          if (action === "soft-delete") return window.NodAdminAgencyDetailActions.doSoftDelete(a.id);
+          if (action === "hard-delete") return window.NodAdminAgencyDetailActions.doHardDelete(a.id);
+          if (action === "restore") return window.NodAdminAgencyDetailActions.doRestore(a.id);
+        })
+      );
     });
   }
 
   function renderTabStrip(slice) {
     const r = R();
-    const tab = slice.tab || "overview";
+    const tab = slice.tab || "creators";
     const a = slice.data.agency;
 
     const counts = {
-      members:      (a.members || []).length,
-      creators:     (a.creators || []).filter((c) => !c.deletedAt).length,
-      subscription: (a.subscriptions || []).length,
-      audit:        (a.adminActionLogs || []).length,
+      members: (a.members || []).length,
+      creators: (a.creators || []).filter((c) => !c.deletedAt).length,
+      audit: (a.adminActionLogs || []).length,
     };
 
     const items = TABS.map((t) => {
       const c = counts[t.key];
       return `
         <button
-          class="adm-rail-item ${t.key === tab ? "active" : ""}"
+          class="adm-tab ${t.key === tab ? "active" : ""}"
           data-agtab="${r.escapeAttr(t.key)}"
-          style="display:inline-flex;width:auto;"
+          aria-pressed="${t.key === tab}"
         >
           <span>${r.escapeHtml(t.label)}</span>
           ${c !== undefined ? `<span class="adm-rail-item-badge">${r.escapeHtml(String(c))}</span>` : ""}
@@ -293,15 +312,7 @@
       `;
     }).join("");
 
-    return `
-      <div style="
-        display:flex;gap:6px;flex-wrap:wrap;
-        padding:6px;border-radius:10px;background:var(--adm-panel-2);
-        border:1px solid var(--adm-line);margin-bottom:14px;
-      ">
-        ${items}
-      </div>
-    `;
+    return `<div class="adm-tabs" aria-label="Разделы агентства">${items}</div>`;
   }
 
   function bindTabStrip(main, slice) {
@@ -314,20 +325,26 @@
   }
 
   function renderTabBody(slice, tab) {
-    if (tab === "overview")     return window.NodAdminAgencyDetailOverview.render(slice);
-    if (tab === "members")      return window.NodAdminAgencyDetailTabs.renderMembers(slice);
-    if (tab === "creators")     return window.NodAdminAgencyDetailTabs.renderCreators(slice);
+    if (tab === "overview") return window.NodAdminAgencyDetailOverview.render(slice);
+    if (tab === "members") return window.NodAdminAgencyDetailTabs.renderMembers(slice);
+    if (tab === "model-subscriptions") return '<div id="admAgencyModels"></div>';
+    if (tab === "creators")
+      return `<div id="admAgencyModels"></div><details class="adm-card"><summary>Архив и удаление моделей</summary>${window.NodAdminAgencyDetailTabs.renderCreators(slice)}</details>`;
     if (tab === "subscription") return window.NodAdminAgencyDetailTabs.renderSubscription(slice);
-    if (tab === "audit")        return window.NodAdminAgencyDetailTabs.renderAudit(slice);
+    if (tab === "audit") return window.NodAdminAgencyDetailTabs.renderAudit(slice);
     return `<div class="adm-empty">unknown tab</div>`;
   }
 
   function bindTabBody(main, slice, tab) {
-    if (tab === "overview")     window.NodAdminAgencyDetailOverview.bind?.(main, slice);
-    if (tab === "members")      window.NodAdminAgencyDetailTabs.bindMembers?.(main, slice);
-    if (tab === "creators")     window.NodAdminAgencyDetailTabs.bindCreators?.(main, slice);
+    if (tab === "overview") window.NodAdminAgencyDetailOverview.bind?.(main, slice);
+    if (tab === "members") window.NodAdminAgencyDetailTabs.bindMembers?.(main, slice);
+    if (tab === "creators") window.NodAdminAgencyDetailTabs.bindCreators?.(main, slice);
+    if (tab === "creators" || tab === "model-subscriptions")
+      void window.NodAdminBilling.mountAgency(main.querySelector("#admAgencyModels"), slice.data.agency.id, {
+        models: tab === "creators",
+      });
     if (tab === "subscription") window.NodAdminAgencyDetailTabs.bindSubscription?.(main, slice);
-    if (tab === "audit")        window.NodAdminAgencyDetailTabs.bindAudit?.(main, slice);
+    if (tab === "audit") window.NodAdminAgencyDetailTabs.bindAudit?.(main, slice);
   }
 
   window.NodAdminAgencyDetail = { render, load, rerender };

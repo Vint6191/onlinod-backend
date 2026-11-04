@@ -15,24 +15,25 @@
             <div class="adm-login-brand-mark">N</div>
             <div class="adm-login-brand-text">
               <strong>NOD Admin</strong>
-              <span>internal access only</span>
+              <span>Nudes · Operation · Dollars</span>
             </div>
           </div>
 
+          <h1>С возвращением</h1><p>Агентства, модели и подписки — в одном рабочем пространстве.</p>
           ${error ? `<div class="adm-error">${R().escapeHtml(error)}</div>` : ""}
 
           <div class="adm-field">
-            <label>Admin email</label>
+            <label for="admEmail">Email администратора</label>
             <input class="adm-input" id="admEmail" autocomplete="username" type="email">
           </div>
 
           <div class="adm-field">
-            <label>Password</label>
+            <label for="admPassword">Пароль</label>
             <input class="adm-input" id="admPassword" autocomplete="current-password" type="password">
           </div>
 
           <button class="adm-btn primary" id="admSubmit" style="width:100%;justify-content:center;height:36px;">
-            Sign in
+            Войти
           </button>
         </section>
       </main>
@@ -42,8 +43,8 @@
   }
 
   function bind(root) {
-    const submit   = root.querySelector("#admSubmit");
-    const email    = root.querySelector("#admEmail");
+    const submit = root.querySelector("#admSubmit");
+    const email = root.querySelector("#admEmail");
     const password = root.querySelector("#admPassword");
     let busy = false;
 
@@ -76,8 +77,12 @@
     }
 
     submit.addEventListener("click", doLogin);
-    password.addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
-    email.addEventListener("keydown",    (e) => { if (e.key === "Enter") password.focus(); });
+    password.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") doLogin();
+    });
+    email.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") password.focus();
+    });
 
     setTimeout(() => email.focus(), 30);
   }

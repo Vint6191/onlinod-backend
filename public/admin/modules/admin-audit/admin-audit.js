@@ -51,11 +51,21 @@
   }));
 
   function load(force) {
-    return W().load({ section: "audit", state: state, force,
-      fetch: () => A().audit(Object.fromEntries(Object.entries(state.filters).filter(([,value]) => value !== ""))), apply: result => { state.events = Array.isArray(result.events) ? result.events : []; }, render });
+    return W().load({
+      section: "audit",
+      state: state,
+      force,
+      fetch: () => A().audit(Object.fromEntries(Object.entries(state.filters).filter(([, value]) => value !== ""))),
+      apply: (result) => {
+        state.events = Array.isArray(result.events) ? result.events : [];
+      },
+      render,
+    });
   }
 
-  function rerender() { W().paint("audit", render); }
+  function rerender() {
+    W().paint("audit", render);
+  }
 
   function render(main) {
     const r = R();
@@ -66,10 +76,10 @@
     main.innerHTML = `
       <div class="adm-page-head">
         <div>
-          <div class="adm-page-title">Audit</div>
-          <div class="adm-page-subtitle">~/admin/audit · ${r.escapeHtml(String(state.events.length))} events</div>
+          <div class="adm-page-title">Журнал действий</div>
+          <div class="adm-page-subtitle">${r.escapeHtml(String(state.events.length))} events</div>
         </div>
-        <button class="adm-btn ghost" id="admAuditRefresh">↻ refresh</button>
+        <button class="adm-btn ghost" id="admAuditRefresh">Обновить</button>
       </div>
 
       ${state.error ? `<div class="adm-error">${r.escapeHtml(state.error)}</div>` : ""}
@@ -104,7 +114,7 @@
           <div class="adm-table-toolbar-spacer"></div>
 
           <span style="color:var(--adm-muted);font-family:var(--adm-mono);font-size:11px;">
-            ${state.loading ? "loading…" : (state.lastLoadedAt ? `loaded ${u.timeAgo(state.lastLoadedAt)}` : "")}
+            ${state.loading ? "loading…" : state.lastLoadedAt ? `loaded ${u.timeAgo(state.lastLoadedAt)}` : ""}
           </span>
         </div>
 
@@ -112,8 +122,8 @@
           state.loading && !state.events.length
             ? `<div class="adm-loading">loading audit…</div>`
             : !state.events.length
-            ? `<div class="adm-empty">No events match these filters.</div>`
-            : `
+              ? `<div class="adm-empty">No events match these filters.</div>`
+              : `
               <table class="adm-table">
                 <thead>
                   <tr>
@@ -151,8 +161,8 @@
     const actor = e.actorAdminId
       ? `<span class="adm-pill warn no-dot" title="admin">admin</span> ${r.escapeHtml(String(e.actorAdminId).slice(-8))}`
       : e.actorUserId
-      ? `<span class="adm-pill info no-dot" title="user">user</span> ${r.escapeHtml(String(e.actorUserId).slice(-8))}`
-      : `<span style="color:var(--adm-muted);">system</span>`;
+        ? `<span class="adm-pill info no-dot" title="user">user</span> ${r.escapeHtml(String(e.actorUserId).slice(-8))}`
+        : `<span style="color:var(--adm-muted);">system</span>`;
 
     const target = e.targetType
       ? `<span class="adm-pill muted no-dot">${r.escapeHtml(e.targetType)}</span> ${r.escapeHtml(String(e.targetId || "").slice(-10))}`
@@ -180,7 +190,9 @@
   function bind(main) {
     main.querySelector("#admAuditRefresh")?.addEventListener("click", () => load(true));
 
-    let qTimer = null, aTimer = null, actTimer = null;
+    let qTimer = null,
+      aTimer = null,
+      actTimer = null;
 
     main.querySelector("#admAuditQ")?.addEventListener("input", (e) => {
       state.filters.q = e.target.value;
@@ -281,7 +293,9 @@
     `;
 
     slot.querySelectorAll("[data-modal-close]").forEach((el) => {
-      el.addEventListener("click", () => { slot.innerHTML = ""; });
+      el.addEventListener("click", () => {
+        slot.innerHTML = "";
+      });
     });
   }
 

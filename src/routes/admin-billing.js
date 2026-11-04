@@ -1,10 +1,14 @@
-const { setPricingHandler, bulkPricingHandler, cancelBulkPricingHandler, commercialPolicyHandler } = require("./admin-command-handlers");
+const {
+  setPricingHandler,
+  bulkPricingHandler,
+  cancelBulkPricingHandler,
+  commercialPolicyHandler,
+} = require("./admin-command-handlers");
 /* src/routes/admin-billing.js — NOD billing management
    ────────────────────────────────────────────────────────────
-   Proper money view: subscription is on the AGENCY, but priced
-   PER CONNECTED MODEL via CreatorBillingProfile. This surface gives
-   the real MRR (filtered by agency status), a per-agency breakdown
-   with each model's price, and bulk/per-model billing operations.
+   Paid access belongs to each creator. Agencies provide ownership, trial and
+   internal-access policy. Read models show each independent component and
+   configured pricing; aggregate amounts do not grant agency-wide access.
 
    Mounted at /api/admin/billing (adminRequired).
 
@@ -15,17 +19,21 @@ const { setPricingHandler, bulkPricingHandler, cancelBulkPricingHandler, commerc
      GET  /tiers               — tier catalog + addon prices
    ──────────────────────────────────────────────────────────── */
 
-"use strict";
+("use strict");
 
-const express = require("express");
 const prisma = require("../prisma");
 const { adminRequired } = require("../middleware/admin");
 const { adminHttpAuditMiddleware } = require("../middleware/admin-audit");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
-const { effectiveBillingState, liveEntitlementEnd, activeCore, scopedEntitlement } = require("../services/billing-state-service");
+const { effectiveBillingState, activeCore, scopedEntitlement } = require("../services/billing-state-service");
 const { publicEntitlement } = require("../services/billing-entitlement-service");
+const { accessFromRow } = require("../services/billing-execution-access-service");
 
-const { billingPage, readAgencyBillingTotals, readGlobalBillingTotals } = require("../services/admin-billing-read-service");
+const {
+  billingPage,
+  readAgencyBillingTotals,
+  readGlobalBillingTotals,
+} = require("../services/admin-billing-read-service");
 
 const router = require("./admin-router").createAdminRouter();
 router.use(adminRequired);
@@ -58,8 +66,10 @@ function activePaidLineCents(entitlement, now = new Date()) {
   if (!entitlement) return 0;
   let cents = 0;
   if (activeCore(entitlement, now)) cents += Number(entitlement.corePriceCents || 0);
-  if (entitlement.aiChatterValidUntil && new Date(entitlement.aiChatterValidUntil) > now) cents += Number(entitlement.aiChatterPriceCents || 0);
-  if (entitlement.outreachValidUntil && new Date(entitlement.outreachValidUntil) > now) cents += Number(entitlement.outreachPriceCents || 0);
+  if (entitlement.aiChatterValidUntil && new Date(entitlement.aiChatterValidUntil) > now)
+    cents += Number(entitlement.aiChatterPriceCents || 0);
+  if (entitlement.outreachValidUntil && new Date(entitlement.outreachValidUntil) > now)
+    cents += Number(entitlement.outreachPriceCents || 0);
   return cents;
 }
 
@@ -68,7 +78,12 @@ router.patch("/commercial-policy", commercialPolicyHandler);
 router.get("/tiers", async (_req, res) => {
   const policy = await readCommercialPolicy({ db: prisma });
   const { tiers, addons } = catalogForPolicy(policy);
-  return res.json({ ok: true, tiers, addons: { aiChatterPriceCents: addons.aiChatter.priceCents, outreachPriceCents: addons.outreach.priceCents }, commercialPolicyRevision: policy.revision });
+  return res.json({
+    ok: true,
+    tiers,
+    addons: { aiChatterPriceCents: addons.aiChatter.priceCents, outreachPriceCents: addons.outreach.priceCents },
+    commercialPolicyRevision: policy.revision,
+  });
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -82,11 +97,12 @@ router.get("/overview", async (req, res) => {
     const agencies = await prisma.agency.findMany({
       where: { deletedAt: null, ...(page.after ? { id: { gt: page.after } } : {}) },
       include: { subscriptions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 } },
-      orderBy: { id: "asc" }, take: page.limit + 1,
+      orderBy: { id: "asc" },
+      take: page.limit + 1,
     });
     const hasMore = agencies.length > page.limit;
     if (hasMore) agencies.pop();
-    const totals = await readAgencyBillingTotals({ db: prisma, agencyIds: agencies.map(a => a.id), policy, now });
+    const totals = await readAgencyBillingTotals({ db: prisma, agencyIds: agencies.map((a) => a.id), policy, now });
 
     const rows = [];
 
@@ -96,7 +112,8 @@ router.get("/overview", async (req, res) => {
       const activeUntil = total.activeUntil;
       const { status } = effectiveBillingState({ agency: a, subscription: sub, activeUntil, now });
       const billable = BILLABLE_STATUSES.has(status) && sub?.billingMode !== "FREE_INTERNAL";
-      const agencyCents = total.monthlyCents, modelsCounted = total.modelsBilled;
+      const agencyCents = total.monthlyCents,
+        modelsCounted = total.modelsBilled;
       const addons = { aiChatter: total.ai, outreach: total.outreach };
 
       rows.push({
@@ -122,7 +139,9 @@ router.get("/overview", async (req, res) => {
       agencies: rows,
       page: { limit: page.limit, nextCursor: hasMore ? agencies.at(-1).id : null },
     });
-  } catch (err) { return sendErr(res, err); }
+  } catch (err) {
+    return sendErr(res, err);
+  }
 });
 
 // ════════════════════════════════════════════════════════════════
@@ -135,7 +154,16 @@ router.get("/agency/:id", async (req, res) => {
       where: { id: req.params.id },
       include: {
         subscriptions: { orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: 1 },
-        creators: { where: { deletedAt: null, ...(page.after ? { id: { gt: page.after } } : {}) }, include: { billingProfile: true, billingEntitlement: true }, orderBy: { id: "asc" }, take: page.limit + 1 },
+        creators: {
+          where: { deletedAt: null, ...(page.after ? { id: { gt: page.after } } : {}) },
+          include: {
+            billingProfile: true,
+            billingEntitlement: true,
+            sessionState: { select: { status: true, agencyId: true } },
+          },
+          orderBy: { id: "asc" },
+          take: page.limit + 1,
+        },
       },
     });
     if (!agency || agency.deletedAt) return res.status(404).json({ ok: false, code: "AGENCY_NOT_FOUND" });
@@ -154,6 +182,10 @@ router.get("/agency/:id", async (req, res) => {
       const ent = scopedEntitlement(c, agency.id);
       return {
         creatorId: c.id,
+        agencyId: agency.id,
+        agencyName: agency.name,
+        remoteId: c.remoteId,
+        sessionStatus: c.sessionState?.agencyId === agency.id ? c.sessionState.status : null,
         displayName: c.displayName,
         username: c.username,
         creatorStatus: c.status,
@@ -168,6 +200,15 @@ router.get("/agency/:id", async (req, res) => {
         configuredLineCents: configuredLineCents(bp, policy),
         activeLineCents: activePaidLineCents(ent, now),
         entitlement: publicEntitlement(ent, now),
+        access: accessFromRow({
+          deletedAt: agency.deletedAt,
+          billingSupportHold: agency.billingSupportHold,
+          trialEndsAt: agency.trialEndsAt,
+          billingMode,
+          coreValidFrom: ent?.coreValidFrom,
+          coreValidUntil: ent?.coreValidUntil,
+          authorityNow: now,
+        }),
       };
     });
 
@@ -175,8 +216,20 @@ router.get("/agency/:id", async (req, res) => {
 
     return res.json({
       ok: true,
-      agency: { id: agency.id, name: agency.name, plan: agency.plan, status, currentPeriodEnd: activeUntil, trialEndsAt: agency.trialEndsAt },
-      subscription: sub ? { ...sub, status, currentPeriodEnd: activeUntil, trialEndsAt: agency.trialEndsAt, graceUntil: null } : null,
+      agency: {
+        id: agency.id,
+        name: agency.name,
+        plan: agency.plan,
+        status,
+        currentPeriodEnd: activeUntil,
+        trialEndsAt: agency.trialEndsAt,
+        billingMode,
+        billingSupportHold: agency.billingSupportHold,
+        billingSupportHoldReason: agency.billingSupportHoldReason,
+      },
+      subscription: sub
+        ? { ...sub, status, currentPeriodEnd: activeUntil, trialEndsAt: agency.trialEndsAt, graceUntil: null }
+        : null,
       billable: BILLABLE_STATUSES.has(status) && billingMode !== "FREE_INTERNAL",
       models,
       monthlyCents,
@@ -187,7 +240,9 @@ router.get("/agency/:id", async (req, res) => {
       addons: catalogForPolicy(policy).addons,
       commercialPolicyRevision: policy.revision,
     });
-  } catch (err) { return sendErr(res, err); }
+  } catch (err) {
+    return sendErr(res, err);
+  }
 });
 
 // ════════════════════════════════════════════════════════════════

@@ -1,336 +1,310 @@
-/* public/admin/modules/admin-billing/admin-billing.js
-   ────────────────────────────────────────────────────────────
-   Billing management. Subscription lives on the agency, priced
-   per connected model. Two views:
-     overview        — real MRR (status-filtered) + agency rollup
-     agency detail   — every model with editable tier/price/addons,
-                       live line totals, bounded selected-model bulk commands
-   Routed via section "billing" (overview) and a local detail state.
-   ──────────────────────────────────────────────────────────── */
+/* Model subscriptions: agency-scoped reads, separate pricing and access commands. */
 (function () {
   "use strict";
-
-  const A = () => window.NodAdminApi;
-  const R = () => window.NodAdminRouter;
+  const A = () => window.NodAdminApi,
+    R = () => window.NodAdminRouter,
+    W = () => window.NodAdminWorkspace;
   const esc = (v) => R().escapeHtml(v);
   const money = (c) => "$" + (Number(c || 0) / 100).toFixed(2);
-  const W = () => window.NodAdminWorkspace;
-
-  const local = W().local(() => ({ view: "overview", agencyId: null, tiers: null, overviewAfter: null, modelsAfter: null }));
-
+  const date = (value) => (value ? esc(String(value).slice(0, 10)) : "—");
+  const local = W().local(() => ({ agencyId: null, overviewAfter: null, modelsAfter: null }));
   function pageControls(page, after) {
-    return `<div class="adm-bulk-bar"><button class="adm-btn bl-page-first" ${after ? "" : "disabled"}>First page</button><button class="adm-btn bl-page-next" ${page?.nextCursor ? "" : "disabled"}>Next page</button><span>Up to 100 rows per page</span></div>`;
+    return `<div class="adm-pagination"><span>До ${Number(page?.limit || 100)} записей на странице</span><button class="adm-btn bl-page-first" ${after ? "" : "disabled"}>В начало</button><button class="adm-btn bl-page-next" ${page?.nextCursor ? "" : "disabled"}>Далее →</button></div>`;
   }
   function bindPage(root, page, go) {
     root.querySelector(".bl-page-first")?.addEventListener("click", () => go(null));
     root.querySelector(".bl-page-next")?.addEventListener("click", () => go(page.nextCursor));
   }
-
   async function render(main) {
     const agencyId = window.NodAdminState.sectionParam;
     if (agencyId !== local.agencyId) local.modelsAfter = null;
     local.agencyId = agencyId;
-    if (agencyId) return renderAgency(main, agencyId);
-    return renderOverview(main);
+    return agencyId ? renderAgency(main, agencyId) : renderOverview(main);
   }
-
-  // ── OVERVIEW ────────────────────────────────────────────────
+  function catalogMarkup(catalog) {
+    if (!catalog?.ok) return '<div class="adm-muted">Каталог недоступен. Обновите страницу.</div>';
+    return `<div class="adm-tier-grid">${Object.entries(catalog.tiers || {})
+      .map(
+        ([key, tier]) =>
+          `<article class="adm-tier-card"><span class="adm-tier" data-tier="${esc(key)}">${esc(tier.label)}</span><strong>${key === "CUSTOM" ? "Индивидуально" : money(tier.priceCents)}<small>${key === "CUSTOM" ? "" : " / месяц"}</small></strong><span>${esc(tier.revenueLabel || "Индивидуальные условия")}</span></article>`
+      )
+      .join(
+        ""
+      )}</div><p class="adm-muted">Дополнения: AI Chatter ${money(catalog.addons?.aiChatterPriceCents)} / мес · SFS + Comment Bot ${money(catalog.addons?.outreachPriceCents)} / мес. У каждого дополнения отдельный срок доступа.</p>`;
+  }
   async function renderOverview(main) {
     const current = W().request(main);
-    main.innerHTML = '<div id="blCommercialPolicy"></div><div id="blOverview"></div>';
-    window.NodAdminCommercialPolicy?.render(main.querySelector("#blCommercialPolicy"));
-    const overview = main.querySelector("#blOverview");
-    overview.innerHTML = `<div class="adm-page"><div class="adm-loading">loading billing…</div></div>`;
-    const r = await A().billingOverview(local.overviewAfter);
+    main.innerHTML = '<div class="adm-loading">Загружаем подписки…</div>';
+    const [result, tiers] = await Promise.allSettled([A().billingOverview(local.overviewAfter), A().billingTiers()]);
     if (!current()) return;
-    if (!r || !r.ok) return W().failure(overview, r?.error || "Failed to load billing", () => renderOverview(main));
-
+    const r = result.value,
+      catalog = tiers.value;
+    if (!r?.ok) return W().failure(main, r?.error || "Не удалось загрузить подписки", () => renderOverview(main));
     const m = r.mrr || {};
-    const kpis = [
-      { label: "MRR (billed)", val: money(m.billedCents), strong: true },
-      { label: "Billed models", val: m.billedModels },
-      { label: "Billable agencies", val: `${m.billableAgencies} / ${m.totalAgencies}` },
-      { label: "Trial potential", val: money(m.trialPotentialCents) },
-    ].map((k) => `<div class="adm-kpi ${k.strong ? "adm-kpi-strong" : ""}"><div class="adm-kpi-label">${esc(k.label)}</div><div class="adm-kpi-val">${esc(k.val)}</div></div>`).join("");
-
-    const rows = (r.agencies || []).map((a) => `
-      <tr data-agency="${esc(a.agencyId)}" class="adm-clickable">
-        <td><b>${esc(a.name)}</b><div class="adm-muted">${esc(a.plan || "")}</div></td>
-        <td><span class="adm-badge adm-badge-${a.billable ? "ok" : (a.status === "TRIAL" ? "info" : "muted")}">${esc(a.status)}</span></td>
-        <td>${esc(a.modelsBilled)} / ${esc(a.modelsTotal)}</td>
-        <td class="adm-money">${money(a.monthlyCents)}</td>
-        <td class="adm-muted">${a.addons.aiChatter ? "AI " + money(a.addons.aiChatter) : ""} ${a.addons.outreach ? "OR " + money(a.addons.outreach) : ""}</td>
-        <td class="adm-muted">${a.currentPeriodEnd ? esc(String(a.currentPeriodEnd).slice(0, 10)) : (a.trialEndsAt ? "trial→" + esc(String(a.trialEndsAt).slice(0, 10)) : "—")}</td>
-      </tr>`).join("");
-
-    overview.innerHTML = `
-      <div class="adm-page">
-        <div class="adm-page-head">
-          <h1>Billing</h1>
-          <div class="adm-page-sub">subscription is per agency, priced per connected model</div>
-        </div>
-        <div class="adm-kpi-row">${kpis}</div>
-        <div class="adm-card">
-          <div class="adm-card-title">Agencies — monthly billing (click to manage)</div>
-          <table class="adm-table">
-            <thead><tr><th>Agency</th><th>Status</th><th>Models billed</th><th>Monthly</th><th>Addons</th><th>Period end</th></tr></thead>
-            <tbody>${rows || `<tr><td colspan="6" class="adm-muted">no agencies</td></tr>`}</tbody>
-          </table>
-        </div>
-        ${pageControls(r.page, local.overviewAfter)}
-        <div class="adm-muted">MRR counts active paid entitlements. Trial potential uses current configured prices.</div>
-      </div>`;
-
-    bindPage(overview, r.page, after => { local.overviewAfter = after; return renderOverview(main); });
-    overview.querySelectorAll("tr[data-agency]").forEach((tr) => tr.addEventListener("click", () => {
-      R().pushDetail("billing", tr.dataset.agency);
-    }));
+    const rows = (r.agencies || [])
+      .map(
+        (a) =>
+          `<tr><td><button class="adm-link" data-agency="${esc(a.agencyId)}">${esc(a.name)}</button><div class="adm-muted">${esc(a.agencyId)}</div></td><td><span class="adm-pill ${a.billable ? "ok" : "muted"}">${esc(a.status)}</span></td><td>${esc(a.modelsBilled)} / ${esc(a.modelsTotal)}</td><td class="adm-money">${money(a.monthlyCents)}</td><td class="adm-muted">AI ${money(a.addons?.aiChatter)}<br>SFS ${money(a.addons?.outreach)}</td><td><button class="adm-btn adm-btn-sm" data-agency="${esc(a.agencyId)}">Подписки моделей →</button></td></tr>`
+      )
+      .join("");
+    main.innerHTML = `<div class="adm-page-head"><div><p class="adm-eyebrow">Платформа / Биллинг</p><h1>Подписки моделей</h1><p class="adm-page-subtitle">Свой уровень, цена и период доступа у каждой модели внутри агентства.</p></div></div>
+      <div class="adm-kpi-row">${[
+        ["Активные периоды, $/мес", money(m.billedCents)],
+        ["Модели с платным доступом", m.billedModels || 0],
+        ["Агентства с платными моделями", `${m.billableAgencies || 0} / ${m.totalAgencies || 0}`],
+        ["Настроенная стоимость trial", money(m.trialPotentialCents)],
+      ]
+        .map(
+          ([label, value]) =>
+            `<div class="adm-kpi"><div class="adm-kpi-label">${label}</div><div class="adm-kpi-val">${esc(value)}</div></div>`
+        )
+        .join("")}</div>
+      <details class="adm-card"><summary>Уровни подписки и общий каталог цен</summary>${catalogMarkup(catalog)}<div id="blCommercialPolicy"></div></details>
+      <div class="adm-card"><div class="adm-card-head"><div class="adm-card-title">Агентства и их модели</div><span class="adm-muted">Итоги по действующим периодам</span></div><div class="adm-table-wrap"><table class="adm-table"><thead><tr><th>Агентство</th><th>Сводный статус</th><th>Активные / всего</th><th>Стоимость в месяц</th><th>Дополнения</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="6" class="adm-empty">Агентств пока нет</td></tr>'}</tbody></table></div>${pageControls(r.page, local.overviewAfter)}</div><p class="adm-muted">Сумма рассчитана по действующим периодам доступа, а не по поступлениям денег. Общего оплаченного срока на всё агентство нет.</p>`;
+    const policy = main.querySelector("#blCommercialPolicy"),
+      details = policy.closest("details");
+    let loaded = false;
+    details.addEventListener("toggle", () => {
+      if (details.open && !loaded) {
+        loaded = true;
+        window.NodAdminCommercialPolicy.render(policy);
+      }
+    });
+    main
+      .querySelectorAll("[data-agency]")
+      .forEach((el) => el.addEventListener("click", () => R().pushDetail("billing", el.dataset.agency)));
+    bindPage(main, r.page, (after) => {
+      local.overviewAfter = after;
+      return renderOverview(main);
+    });
   }
-
-  // ── AGENCY DETAIL (per-model editor) ────────────────────────
-  async function renderAgency(main, agencyId) {
+  function accessMarkup(m) {
+    const ent = m.entitlement || {},
+      access = m.access;
+    const label =
+      {
+        FREE_INTERNAL: "Внутренний доступ",
+        TRIAL: "Пробный доступ",
+        PAID: "Действует",
+        BILLING_ACCESS_HELD: "Блокировка агентства",
+        CREATOR_SUBSCRIPTION_REQUIRED: "Нет доступа",
+      }[access?.reason] || "Статус не получен";
+    return `<span class="adm-pill ${access?.allowed ? "ok" : access?.reason === "BILLING_ACCESS_HELD" ? "crit" : "warn"}">${label}</span><div class="adm-cell-sub">${ent.coreValidUntil ? `Core до ${date(ent.coreValidUntil)}` : "Core не выдан"}</div>${access?.reason === "TRIAL" ? `<div class="adm-cell-sub">Trial до ${date(access.validUntil)}</div>` : ""}`;
+  }
+  function addonsMarkup(m) {
+    const ent = m.entitlement || {};
+    return [
+      ["aiChatter", "AI"],
+      ["outreach", "SFS"],
+    ]
+      .map(
+        ([key, label]) =>
+          `<div class="adm-addon-status"><span class="adm-pill ${ent[key + "Active"] ? "ok" : "muted"}">${label}</span><span class="adm-muted">${ent[key + "ValidUntil"] ? date(ent[key + "ValidUntil"]) : "не выдан"}</span></div>`
+      )
+      .join("");
+  }
+  async function renderAgency(main, agencyId, options = {}) {
     const current = W().request(main);
-    main.innerHTML = `<div class="adm-page"><div class="adm-loading">loading agency billing…</div></div>`;
+    main.innerHTML = '<div class="adm-loading">Загружаем модели агентства…</div>';
     const r = await A().billingAgency(agencyId, local.modelsAfter);
     if (!current()) return;
-    if (!r || !r.ok) return W().failure(main, r?.error || "Failed to load agency billing", () => renderAgency(main, agencyId));
-    local.tiers = r.tiers || {};
-
-    const tierOpts = (sel) => Object.entries(r.tiers).map(([k, v]) =>
-      `<option value="${k}" ${k === sel ? "selected" : ""}>${esc(v.label)} (${k === "CUSTOM" ? "explicit price" : money(v.priceCents)})</option>`).join("");
-
-    const priceSource = (component, value) => `<select class="bl-${component}-source"><option value="CATALOG" ${value !== "OVERRIDE" ? "selected" : ""}>Global price</option><option value="OVERRIDE" ${value === "OVERRIDE" ? "selected" : ""}>Individual price</option></select>`;
-    const rows = (r.models || []).map((m) => `
-      <tr data-creator="${esc(m.creatorId)}" data-auto-tier="${esc(m.tier === "CUSTOM" ? "STARTER" : m.tier || "STARTER")}" data-pricing-revision="${Number(m.pricingRevision || 0)}" data-configured-line="${Number(m.configuredLineCents || 0)}" class="${m.billingExcluded ? "adm-row-excluded" : ""}">
-        <td>
-          <label><input class="bl-select" type="checkbox" ${m.billingExcluded ? "disabled" : ""}> <b>${esc(m.displayName || m.username || m.creatorId.slice(-8))}</b></label>
-          <div class="adm-muted">@${esc(m.username || "—")} · ${esc(m.creatorStatus || "")}</div>
-        </td>
-        <td><select class="bl-mode"><option value="AUTO" ${m.tierMode !== "MANUAL" ? "selected" : ""}>Automatic tier</option><option value="MANUAL" ${m.tierMode === "MANUAL" ? "selected" : ""}>Fixed tier</option></select><select class="bl-tier">${tierOpts(m.tier || "STARTER")}</select></td>
-        <td>${priceSource("core", m.corePriceSource)}<input class="bl-price" type="number" min="0" step="0.01" value="${(Number(m.corePriceCents || 0) / 100).toFixed(2)}" style="width:80px"> </td>
-        <td class="adm-addon-cell">
-          <label><input type="checkbox" class="bl-ai" ${m.aiChatterEnabled ? "checked" : ""}> AI</label>
-          ${priceSource("ai", m.aiChatterPriceSource)}<input class="bl-ai-price" type="number" min="0" step="0.01" value="${(Number(m.aiChatterPriceCents || 0) / 100).toFixed(2)}" style="width:64px">
-        </td>
-        <td class="adm-addon-cell">
-          <label><input type="checkbox" class="bl-or" ${m.outreachEnabled ? "checked" : ""}> OR</label>
-          ${priceSource("or", m.outreachPriceSource)}<input class="bl-or-price" type="number" min="0" step="0.01" value="${(Number(m.outreachPriceCents || 0) / 100).toFixed(2)}" style="width:64px">
-        </td>
-        <td><label><input type="checkbox" class="bl-excl" ${m.billingExcluded ? "checked" : ""}> excl</label></td>
-        <td class="adm-money bl-line">${money(m.configuredLineCents)}</td>
-        <td><button class="adm-btn adm-btn-sm bl-save">save</button><button class="adm-btn adm-btn-sm bl-access">access</button><button class="adm-btn adm-btn-sm bl-check" hidden>check result</button></td>
-      </tr>`).join("");
-
-    const sub = r.subscription;
-    main.innerHTML = `
-      <div class="adm-page">
-        <div class="adm-detail-head">
-          <button class="adm-link" id="blBack">← billing</button>
-          <h1>${esc(r.agency.name)}</h1>
-          <div class="adm-detail-sub">
-            status <b>${esc(r.agency.status)}</b> ·
-            <span class="adm-badge adm-badge-${r.billable ? "ok" : "muted"}">${r.billable ? "billable" : "not billed"}</span> ·
-            plan ${esc(r.agency.plan || "—")} ·
-            <span class="adm-muted">id ${esc(r.agency.id)}</span>
-          </div>
-        </div>
-
-        <div class="adm-kpi-row">
-          <div class="adm-kpi adm-kpi-strong"><div class="adm-kpi-label">Configured monthly · all models</div><div class="adm-kpi-val" id="blTotal" data-configured-total="${Number(r.configuredMonthlyCents || 0)}">${money(r.configuredMonthlyCents)}</div></div>
-          <div class="adm-kpi"><div class="adm-kpi-label">Models</div><div class="adm-kpi-val">${r.modelsTotal}</div></div>
-          <div class="adm-kpi"><div class="adm-kpi-label">Period end</div><div class="adm-kpi-val" style="font-size:14px">${r.agency.currentPeriodEnd ? esc(String(r.agency.currentPeriodEnd).slice(0, 10)) : "—"}</div></div>
-        </div>
-
-        <div class="adm-bulk-bar">
-          <span>Set tier for selected models (maximum 100):</span>
-          <select id="blBulkTier">${Object.entries(r.tiers).map(([k, v]) => `<option value="${k}">${esc(v.label)} (${k === "CUSTOM" ? "explicit price" : money(v.priceCents)})</option>`).join("")}</select>
-          <input id="blBulkCustomPrice" type="number" min="0" max="10000" step="0.01" placeholder="CUSTOM price $">
-          <input id="blBulkReason" maxlength="500" placeholder="Reason for change">
-          <button class="adm-btn adm-btn-sm" id="blBulkApply">queue selected</button>
-          <button class="adm-btn adm-btn-sm" id="blBulkCheck">check progress</button>
-          <button class="adm-btn adm-btn-sm" id="blBulkCancel">cancel remaining</button>
-          <button class="adm-btn adm-btn-sm" id="blBulkResume" disabled>resume remaining</button>
-          <span id="blBulkProgress" role="status"></span>
-          <details><summary>Results by model</summary><pre id="blBulkOutcomes"></pre></details>
-        </div>
-
-        <div class="adm-card">
-          <div class="adm-card-title">Per-model billing — edit & save each line</div>
-          <table class="adm-table adm-billing-table">
-            <thead><tr><th>Model</th><th>Tier</th><th>Base $</th><th>AI chatter</th><th>Outreach</th><th>Excl</th><th>Line</th><th></th></tr></thead>
-            <tbody>${rows || `<tr><td colspan="8" class="adm-muted">no models connected</td></tr>`}</tbody>
-          </table>
-          ${pageControls(r.page, local.modelsAfter)}
-        </div>
-      </div>`;
-
-    bindPage(main, r.page, after => { local.modelsAfter = after; return renderAgency(main, agencyId); });
-    main.querySelector("#blBack").addEventListener("click", () => R().pushSection("billing"));
-
-    // tier select auto-fills price from catalog (except CUSTOM)
-    main.querySelectorAll("tr[data-creator]").forEach((tr) => {
-      const tierSel = tr.querySelector(".bl-tier");
-      const priceInp = tr.querySelector(".bl-price");
-      const mode = tr.querySelector(".bl-mode");
-      const coreSource = tr.querySelector(".bl-core-source");
-      function applySources() {
-        const automatic = mode.value === "AUTO";
-        tierSel.disabled = automatic;
-        if (automatic) { coreSource.value = "CATALOG"; tierSel.value = tr.dataset.autoTier; }
-        coreSource.disabled = automatic;
-        for (const [component, selector] of [["core", ".bl-price"], ["ai", ".bl-ai-price"], ["or", ".bl-or-price"]]) tr.querySelector(selector).disabled = tr.querySelector(`.bl-${component}-source`).value === "CATALOG";
-        if (coreSource.value === "CATALOG" && r.tiers[tierSel.value]?.priceCents != null) priceInp.value = (r.tiers[tierSel.value].priceCents / 100).toFixed(2);
-        for (const [ui, key] of [["ai", "aiChatter"], ["or", "outreach"]]) {
-          if (tr.querySelector(`.bl-${ui}-source`).value === "CATALOG" && r.addons?.[key]) tr.querySelector(`.bl-${ui}-price`).value = (r.addons[key].priceCents / 100).toFixed(2);
-        }
-        recalcLine(tr); recalcTotal(main);
-      }
-      mode.addEventListener("change", applySources);
-      for (const component of ["core", "ai", "or"]) tr.querySelector(`.bl-${component}-source`).addEventListener("change", applySources);
-      applySources();
-      tierSel.addEventListener("change", () => {
-        if (tierSel.value === "CUSTOM") coreSource.value = "OVERRIDE";
-        applySources();
-      });
-      tr.querySelectorAll("input").forEach((inp) => inp.addEventListener("input", () => { recalcLine(tr); recalcTotal(main); }));
-      tr.querySelector(".bl-save").addEventListener("click", () => W().action(tr, () => saveLine(main, tr)));
-      tr.querySelector(".bl-access").addEventListener("click", () => window.NodAdminEntitlements.open(r.models.find(model => model.creatorId === tr.dataset.creator), () => renderAgency(main, agencyId)));
-      tr.querySelector(".bl-check").addEventListener("click", async () => {
-        try {
-          const result = await A().resolveCommand(`/api/admin/billing/creator/${encodeURIComponent(tr.dataset.creator)}`, "PATCH");
-          if (!current()) return;
-          if (!result.pending) { R().toast("Result confirmed; current prices reloaded", "ok"); await renderAgency(main, agencyId); }
-          else R().toast("Result is still unknown. Retry the same change.", "error");
-        } catch (_) { R().toast("Status could not be retrieved. Retry later.", "error"); }
-      });
+    if (!r?.ok)
+      return W().failure(main, r?.error || "Не удалось загрузить модели", () => renderAgency(main, agencyId, options));
+    const tierOpts = Object.entries(r.tiers || {})
+      .map(
+        ([key, t]) =>
+          `<option value="${esc(key)}">${esc(t.label)} · ${key === "CUSTOM" ? "своя цена" : money(t.priceCents)}</option>`
+      )
+      .join("");
+    const rows = (r.models || [])
+      .map((m) => {
+        const tier = m.entitlement?.tier || m.tier || "STARTER";
+        const session =
+          { ACTIVE: "Сессия сохранена", REVOKED: "Вход отозван", REINITIALIZING: "Переподключение" }[m.sessionStatus] ||
+          "Нет сессии";
+        return `<tr data-creator="${esc(m.creatorId)}" data-pricing-revision="${Number(m.pricingRevision || 0)}" class="${m.billingExcluded ? "adm-row-excluded" : ""}"><td><div class="adm-model-name"><input class="bl-select" type="checkbox" aria-label="Выбрать ${esc(m.displayName || m.creatorId)}" ${m.billingExcluded ? "disabled" : ""}><div><button class="adm-link bl-model">${esc(m.displayName || m.username || m.creatorId)}</button><div class="adm-cell-sub">@${esc(m.username || "—")} · ${esc(m.creatorStatus || "")}</div></div></div></td>
+        <td><span class="adm-tier" data-tier="${esc(tier)}">${esc(r.tiers?.[tier]?.label || tier)}</span><div class="adm-cell-sub">${m.tierMode === "MANUAL" ? "Ручной выбор" : "По доходу"}${m.tier && tier !== m.tier ? ` · далее ${esc(m.tier)}` : ""}</div></td>
+        <td>${accessMarkup(m)}</td><td>${addonsMarkup(m)}</td><td><span class="adm-pill ${m.sessionStatus === "ACTIVE" ? "info" : "muted"}">${session}</span></td><td class="adm-money">${money(m.configuredLineCents)}<div class="adm-cell-sub">${m.billingExcluded ? "исключена" : "настроено / мес"}</div></td>
+        <td><div class="adm-row-actions"><button class="adm-btn adm-btn-sm bl-pricing">Тариф</button><button class="adm-btn adm-btn-sm bl-access">Доступ</button></div></td></tr>`;
+      })
+      .join("");
+    const banner = r.agency.billingSupportHold
+      ? `<strong>Агентство заблокировано.</strong> Сроки моделей сохранены. ${esc(r.agency.billingSupportHoldReason || "")}`
+      : r.agency.billingMode === "FREE_INTERNAL"
+        ? "<strong>Внутренний доступ агентства.</strong> Это отдельное исключение для разработки; оно не означает оплату подписок моделей."
+        : r.agency.trialEndsAt
+          ? `Пробный период агентства до ${date(r.agency.trialEndsAt)}. Платные периоды моделей независимы.`
+          : "Подписка, дополнения и срок доступа принадлежат конкретной модели. Состояние входа в OnlyFans отображается отдельно.";
+    main.innerHTML = `<div class="adm-page">
+      ${options.embedded ? "" : `<div class="adm-detail-head"><button class="adm-link" id="blBack">← Подписки моделей</button><h1>${esc(r.agency.name)}</h1><p class="adm-detail-sub">Подписки моделей агентства</p></div>`}
+      <div class="adm-notice">${banner}</div>
+      <div class="adm-kpi-row adm-model-metrics"><div class="adm-kpi"><div class="adm-kpi-label">Моделей в агентстве</div><div class="adm-kpi-val">${Number(r.modelsTotal ?? r.models.length)}</div></div><div class="adm-kpi"><div class="adm-kpi-label">Настроенная стоимость / мес</div><div class="adm-kpi-val">${money(r.configuredMonthlyCents)}</div></div><div class="adm-kpi"><div class="adm-kpi-label">Действующие периоды / мес</div><div class="adm-kpi-val">${money(r.monthlyCents)}</div></div></div>
+      <div class="adm-card"><div class="adm-card-head"><div class="adm-card-title">${options.models ? "Модели агентства" : "Подписки и доступ"}</div><span class="adm-muted">Сроки указаны в UTC</span></div><div class="adm-table-wrap"><table class="adm-table adm-billing-table"><thead><tr><th>Модель</th><th>Уровень</th><th>Доступ NOD / Core</th><th>Дополнения до</th><th>OnlyFans</th><th>Стоимость</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="7" class="adm-empty">В агентстве пока нет моделей</td></tr>'}</tbody></table></div>${pageControls(r.page, local.modelsAfter)}</div>
+      <details class="adm-card"><summary>Массовое изменение тарифа выбранных моделей</summary><p class="adm-muted">Только отмеченные модели на этой странице, максимум 100. Оплаченные периоды не изменятся. Исключённые модели недоступны для массовой смены.</p>
+        <div class="adm-bulk-bar"><label>Уровень <select id="blBulkTier">${tierOpts}</select></label><label>Цена Custom, USD <input id="blBulkCustomPrice" type="number" min="0" max="10000" step="0.01" placeholder="Индивидуальная цена"></label><input id="blBulkReason" maxlength="500" aria-label="Причина массового изменения" placeholder="Причина изменения"><button class="adm-btn primary" id="blBulkApply">Применить к выбранным</button><button class="adm-btn" id="blBulkCheck">Проверить выполнение</button><button class="adm-btn" id="blBulkCancel">Отменить оставшиеся</button><button class="adm-btn" id="blBulkResume" disabled>Продолжить оставшиеся</button><span id="blBulkProgress" role="status"></span><details><summary>Результат по каждой модели</summary><pre id="blBulkOutcomes"></pre></details></div></details></div>`;
+    bindPage(main, r.page, (after) => {
+      local.modelsAfter = after;
+      return renderAgency(main, agencyId, options);
     });
-
+    main.querySelector("#blBack")?.addEventListener("click", () => R().pushSection("billing"));
+    main.querySelectorAll("tr[data-creator]").forEach((tr) => {
+      const model = {
+        ...r.models.find((m) => m.creatorId === tr.dataset.creator),
+        agencyId,
+        agencyName: r.agency.name,
+      };
+      const reload = () => {
+        if (current()) return renderAgency(main, agencyId, options);
+      };
+      tr.querySelector(".bl-model")?.addEventListener("click", () => R().pushDetail("creators", model.creatorId));
+      tr.querySelector(".bl-pricing")?.addEventListener("click", () => window.NodAdminPricing.open(model, r, reload));
+      tr.querySelector(".bl-access")?.addEventListener("click", () => window.NodAdminEntitlements.open(model, reload));
+    });
     const bulkStorageKey = `onlinod_admin_bulk:${window.NodAdminState.admin.id}:${agencyId}`;
     let bulkCommandId = null;
-    try { bulkCommandId = sessionStorage.getItem(bulkStorageKey); } catch (_) {}
+    try {
+      bulkCommandId = sessionStorage.getItem(bulkStorageKey);
+    } catch (_) {}
     let submitting = false;
     let resumePayload = null;
     const progressEl = main.querySelector("#blBulkProgress");
     async function checkBulk() {
-      if (!bulkCommandId) { progressEl.textContent = "No submitted command in this tab."; return; }
+      if (!bulkCommandId) {
+        progressEl.textContent = "No submitted command in this tab.";
+        return;
+      }
       const status = await A().commandStatus(bulkCommandId);
       if (!current()) return;
-      if (!status?.ok) { progressEl.textContent = status?.error || "Result unknown; retry the same selection."; return; }
+      if (!status?.ok) {
+        progressEl.textContent = status?.error || "Result unknown; retry the same selection.";
+        return;
+      }
       const p = status.execution?.progress;
       resumePayload = status.execution?.resume || null;
       main.querySelector("#blBulkResume").disabled = !resumePayload;
-      main.querySelector("#blBulkOutcomes").textContent = (p?.outcomes || []).map(item => `${item.creatorId}: ${item.status}${item.code ? " / " + item.code : ""}`).join("\n");
+      main.querySelector("#blBulkOutcomes").textContent = (p?.outcomes || [])
+        .map((item) => `${item.creatorId}: ${item.status}${item.code ? " / " + item.code : ""}`)
+        .join("\n");
       progressEl.textContent = `${status.status}${status.execution?.workState === "RECONCILE_REQUIRED" ? " / RECONCILE_REQUIRED" : ""}: ${p?.nextIndex || 0}/${p?.total || 0}, changed ${p?.succeeded || 0}, rejected ${p?.rejected || 0}, skipped ${p?.skipped || 0}. ${p?.stoppedCode || ""}`;
     }
-    main.querySelector("#blBulkCheck").addEventListener("click", () => checkBulk().catch(() => { progressEl.textContent = "Status unavailable; check again."; }));
+    main.querySelector("#blBulkCheck").addEventListener("click", () =>
+      checkBulk().catch(() => {
+        progressEl.textContent = "Status unavailable; check again.";
+      })
+    );
     main.querySelector("#blBulkApply").addEventListener("click", async () => {
       if (submitting) return;
-      const items = Array.from(main.querySelectorAll("tr[data-creator]")).filter(tr => tr.querySelector(".bl-select").checked).map(tr => ({ creatorId: tr.dataset.creator, expectedRevision: Number(tr.dataset.pricingRevision) }));
+      const items = Array.from(main.querySelectorAll("tr[data-creator]"))
+        .filter((tr) => tr.querySelector(".bl-select").checked)
+        .map((tr) => ({ creatorId: tr.dataset.creator, expectedRevision: Number(tr.dataset.pricingRevision) }));
       const tier = main.querySelector("#blBulkTier").value;
       const reason = main.querySelector("#blBulkReason").value.trim();
-      if (!items.length || items.length > 100 || !reason) { R().toast("Select 1–100 models and enter a reason.", "error"); return; }
+      if (!items.length || items.length > 100 || !reason) {
+        R().toast("Select 1–100 models and enter a reason.", "error");
+        return;
+      }
       const body = { items, tier, reason };
       if (tier === "CUSTOM") {
         const raw = main.querySelector("#blBulkCustomPrice").value;
-        if (!raw.trim() || !Number.isFinite(Number(raw)) || Number(raw) < 0 || Number(raw) > 10000) { R().toast("Enter a valid CUSTOM price.", "error"); return; }
+        if (!raw.trim() || !Number.isFinite(Number(raw)) || Number(raw) < 0 || Number(raw) > 10000) {
+          R().toast("Enter a valid CUSTOM price.", "error");
+          return;
+        }
         body.corePriceCents = Math.round(Number(raw) * 100);
       }
-      if (!confirm(`Queue tier "${tier}" for these ${items.length} selected models? Changed prices will be rejected individually.`)) return;
+      if (
+        !confirm(
+          `Queue tier "${tier}" for these ${items.length} selected models? Changed prices will be rejected individually.`
+        )
+      )
+        return;
       submitting = true;
-      const button = main.querySelector("#blBulkApply"); button.disabled = true;
+      const button = main.querySelector("#blBulkApply");
+      button.disabled = true;
       try {
         const res = await A().billingApplyTier(agencyId, body);
         if (!current()) return;
-        if (res?.commandId) { bulkCommandId = res.commandId; try { sessionStorage.setItem(bulkStorageKey, bulkCommandId); } catch (_) {} }
-        R().toast(res?.accepted ? "Selection accepted; check progress for completion." : res?.error || "Submission failed", res?.accepted ? "ok" : "error");
+        if (res?.commandId) {
+          bulkCommandId = res.commandId;
+          try {
+            sessionStorage.setItem(bulkStorageKey, bulkCommandId);
+          } catch (_) {}
+        }
+        R().toast(
+          res?.accepted ? "Selection accepted; check progress for completion." : res?.error || "Submission failed",
+          res?.accepted ? "ok" : "error"
+        );
         if (res?.accepted) await checkBulk();
-      } catch (_) { progressEl.textContent = "Result unknown; retry the same selection."; }
-      finally { submitting = false; button.disabled = false; }
+      } catch (_) {
+        progressEl.textContent = "Result unknown; retry the same selection.";
+      } finally {
+        submitting = false;
+        button.disabled = false;
+      }
     });
     main.querySelector("#blBulkResume").addEventListener("click", async () => {
       if (!resumePayload || submitting) return;
       const reason = main.querySelector("#blBulkReason").value.trim();
-      if (!reason) { R().toast("Enter a reason for resuming.", "error"); return; }
-      if (!confirm(`Resume ${resumePayload.items.length} remaining models with the original prices and versions?`)) return;
+      if (!reason) {
+        R().toast("Enter a reason for resuming.", "error");
+        return;
+      }
+      if (!confirm(`Resume ${resumePayload.items.length} remaining models with the original prices and versions?`))
+        return;
       submitting = true;
       try {
         const res = await A().billingApplyTier(agencyId, { ...resumePayload, reason });
         if (!current()) return;
-        if (res?.commandId) { bulkCommandId = res.commandId; try { sessionStorage.setItem(bulkStorageKey, bulkCommandId); } catch (_) {} }
-        R().toast(res?.accepted ? "Remaining selection accepted." : res?.error || "Resume failed", res?.accepted ? "ok" : "error");
+        if (res?.commandId) {
+          bulkCommandId = res.commandId;
+          try {
+            sessionStorage.setItem(bulkStorageKey, bulkCommandId);
+          } catch (_) {}
+        }
+        R().toast(
+          res?.accepted ? "Remaining selection accepted." : res?.error || "Resume failed",
+          res?.accepted ? "ok" : "error"
+        );
         if (res?.accepted) await checkBulk();
-      } catch (_) { progressEl.textContent = "Result unknown; check progress or retry the same resume."; }
-      finally { submitting = false; }
+      } catch (_) {
+        progressEl.textContent = "Result unknown; check progress or retry the same resume.";
+      } finally {
+        submitting = false;
+      }
     });
     main.querySelector("#blBulkCancel").addEventListener("click", async () => {
       if (!bulkCommandId || submitting) return;
       const reason = main.querySelector("#blBulkReason").value.trim();
-      if (!reason) { R().toast("Enter a cancellation reason.", "error"); return; }
+      if (!reason) {
+        R().toast("Enter a cancellation reason.", "error");
+        return;
+      }
       if (!confirm("Cancel remaining changes? Completed changes stay in place.")) return;
       submitting = true;
       try {
         const res = await A().billingCancelTier(agencyId, { targetCommandId: bulkCommandId, reason });
         if (!current()) return;
-        R().toast(res?.ok ? "Cancellation confirmed." : res?.error || "Cancellation result unknown; retry.", res?.ok ? "ok" : "error");
+        R().toast(
+          res?.ok ? "Cancellation confirmed." : res?.error || "Cancellation result unknown; retry.",
+          res?.ok ? "ok" : "error"
+        );
         await checkBulk();
-      } catch (_) { progressEl.textContent = "Cancellation result unknown; check or retry."; }
-      finally { submitting = false; }
-    });
-    if (bulkCommandId) checkBulk().catch(() => { progressEl.textContent = "Status unavailable; check again."; });
-  }
-
-  function lineFromRow(tr) {
-    if (tr.querySelector(".bl-excl").checked) return 0;
-    let c = Math.round(Number(tr.querySelector(".bl-price").value || 0) * 100);
-    if (tr.querySelector(".bl-ai").checked) c += Math.round(Number(tr.querySelector(".bl-ai-price").value || 0) * 100);
-    if (tr.querySelector(".bl-or").checked) c += Math.round(Number(tr.querySelector(".bl-or-price").value || 0) * 100);
-    return c;
-  }
-  function recalcLine(tr) { tr.querySelector(".bl-line").textContent = money(lineFromRow(tr)); }
-  function recalcTotal(main) {
-    let t = 0;
-    main.querySelectorAll("tr[data-creator]").forEach((tr) => { t += lineFromRow(tr) - Number(tr.dataset.configuredLine || 0); });
-    const el = main.querySelector("#blTotal"); if (el) el.textContent = money(Number(el.dataset.configuredTotal || 0) + t);
-  }
-
-  async function saveLine(main, tr) {
-    const btn = tr.querySelector(".bl-save"), current = W().capture(tr);
-    const body = {
-      expectedRevision: Number(tr.dataset.pricingRevision),
-      tierMode: tr.querySelector(".bl-mode").value,
-      aiChatterEnabled: tr.querySelector(".bl-ai").checked,
-      outreachEnabled: tr.querySelector(".bl-or").checked,
-      billingExcluded: tr.querySelector(".bl-excl").checked,
-      reason: "admin billing edit",
-    };
-    if (body.tierMode === "MANUAL") body.tier = tr.querySelector(".bl-tier").value;
-    for (const [component, ui, selector] of [["core", "core", ".bl-price"], ["aiChatter", "ai", ".bl-ai-price"], ["outreach", "or", ".bl-or-price"]]) {
-      body[component + "PriceSource"] = tr.querySelector(`.bl-${ui}-source`).value;
-      if (body[component + "PriceSource"] === "OVERRIDE") {
-        const raw = tr.querySelector(selector).value.trim();
-        if (!/^\d+(?:\.\d{1,2})?$/.test(raw) || Number(raw) > 10000) return R().toast("Enter prices between $0 and $10,000 with at most two decimal places.", "error");
-        body[component + "PriceCents"] = Math.round(Number(raw) * 100);
+      } catch (_) {
+        progressEl.textContent = "Cancellation result unknown; check or retry.";
+      } finally {
+        submitting = false;
       }
-    }
-    const res = await A().billingSetCreator(tr.dataset.creator, body);
-    if (!current()) return;
-    tr.querySelector(".bl-check").hidden = !["NETWORK", "INVALID_JSON", "ADMIN_COMMAND_RESPONSE_UNKNOWN", "ADMIN_COMMAND_UNRESOLVED"].includes(res?.code);
-    if (res?.ok) {
-      tr.dataset.pricingRevision = String(res.billing.pricingRevision);
-      tr.dataset.autoTier = res.billing.tier === "CUSTOM" ? "STARTER" : res.billing.tier;
-      tr.querySelector(".bl-tier").value = res.billing.tier;
-      tr.querySelector(".bl-mode").value = res.billing.tierMode;
-      for (const [key, selector] of [["corePriceCents", ".bl-price"], ["aiChatterPriceCents", ".bl-ai-price"], ["outreachPriceCents", ".bl-or-price"]]) tr.querySelector(selector).value = (res.billing[key] / 100).toFixed(2);
-      R().toast("saved " + money(res.lineCents), "ok");
-      tr.querySelector(".bl-line").textContent = money(res.lineCents);
-      tr.classList.toggle("adm-row-excluded", body.billingExcluded);
-      tr.querySelector(".bl-select").disabled = body.billingExcluded;
-      if (body.billingExcluded) tr.querySelector(".bl-select").checked = false;
-      recalcTotal(main);
-    } else {
-      R().toast(res?.error || "save failed", "error");
-    }
+    });
+    if (bulkCommandId)
+      checkBulk().catch(() => {
+        progressEl.textContent = "Status unavailable; check again.";
+      });
   }
 
   window.NodAdminBilling = { render };
+  window.NodAdminBilling.mountAgency = (main, agencyId, options = {}) => {
+    local.modelsAfter = null;
+    local.agencyId = agencyId;
+    return renderAgency(main, agencyId, { ...options, embedded: true });
+  };
 })();

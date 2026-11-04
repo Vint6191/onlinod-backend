@@ -20,29 +20,47 @@
   const W = () => window.NodAdminWorkspace;
 
   const State = () => window.NodAdminState;
-  const A     = () => window.NodAdminApi;
-  const R     = () => window.NodAdminRouter;
-  const U     = () => window.NodAdminUtils;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
 
   const ONLINE_WINDOW_MS = 5 * 60 * 1000;
-  const STALE_WINDOW_MS  = 24 * 60 * 60 * 1000;
+  const STALE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
-  function slice() { return State().devices; }
+  function slice() {
+    return State().devices;
+  }
 
   function load(force) {
     const s = slice();
-    return W().load({ section: "devices", state: s, force,
-      fetch: () => A().listDevices({ q:s.filters.q || undefined, agencyId:s.filters.agencyId || undefined, online:s.filters.online ? "1" : undefined, offline:s.filters.offline ? "1" : undefined }), apply: result => { s.list = Array.isArray(result.devices) ? result.devices : []; }, render });
+    return W().load({
+      section: "devices",
+      state: s,
+      force,
+      fetch: () =>
+        A().listDevices({
+          q: s.filters.q || undefined,
+          agencyId: s.filters.agencyId || undefined,
+          online: s.filters.online ? "1" : undefined,
+          offline: s.filters.offline ? "1" : undefined,
+        }),
+      apply: (result) => {
+        s.list = Array.isArray(result.devices) ? result.devices : [];
+      },
+      render,
+    });
   }
 
-  function rerender() { W().paint("devices", render); }
+  function rerender() {
+    W().paint("devices", render);
+  }
 
   function deviceLiveness(device) {
     const last = device.lastSeenAt ? new Date(device.lastSeenAt).getTime() : 0;
     if (!last) return "never";
     const age = Date.now() - last;
     if (age <= ONLINE_WINDOW_MS) return "online";
-    if (age <= STALE_WINDOW_MS)  return "idle";
+    if (age <= STALE_WINDOW_MS) return "idle";
     return "stale";
   }
 
@@ -54,19 +72,19 @@
     if (W().needsRead(s)) load(false);
 
     const onlineCount = s.list.filter((d) => deviceLiveness(d) === "online").length;
-    const staleCount  = s.list.filter((d) => deviceLiveness(d) === "stale").length;
+    const staleCount = s.list.filter((d) => deviceLiveness(d) === "stale").length;
 
     main.innerHTML = `
       <div class="adm-page-head">
         <div>
-          <div class="adm-page-title">Devices</div>
+          <div class="adm-page-title">Устройства</div>
           <div class="adm-page-subtitle">
-            ~/admin/devices · ${r.escapeHtml(String(s.list.length))} total
+            ${r.escapeHtml(String(s.list.length))} total
             · ${r.escapeHtml(String(onlineCount))} online
             ${staleCount ? ` · ${r.escapeHtml(String(staleCount))} stale` : ""}
           </div>
         </div>
-        <button class="adm-btn ghost" id="admDevicesRefresh">↻ refresh</button>
+        <button class="adm-btn ghost" id="admDevicesRefresh">Обновить</button>
       </div>
 
       ${s.error ? `<div class="adm-error">${r.escapeHtml(s.error)}</div>` : ""}
@@ -94,7 +112,7 @@
           <div class="adm-table-toolbar-spacer"></div>
 
           <span style="color:var(--adm-muted);font-family:var(--adm-mono);font-size:11px;">
-            ${s.loading ? "loading…" : (s.lastLoadedAt ? `loaded ${u.timeAgo(s.lastLoadedAt)}` : "")}
+            ${s.loading ? "loading…" : s.lastLoadedAt ? `loaded ${u.timeAgo(s.lastLoadedAt)}` : ""}
           </span>
         </div>
 
@@ -102,8 +120,8 @@
           s.loading && !s.list.length
             ? `<div class="adm-loading">loading devices…</div>`
             : !s.list.length
-            ? `<div class="adm-empty">No devices match these filters.</div>`
-            : `
+              ? `<div class="adm-empty">No devices match these filters.</div>`
+              : `
               <table class="adm-table">
                 <thead>
                   <tr>
@@ -136,9 +154,9 @@
 
     const livenessPill = {
       online: `<span class="adm-pill ok">online</span>`,
-      idle:   `<span class="adm-pill warn">idle</span>`,
-      stale:  `<span class="adm-pill crit">stale</span>`,
-      never:  `<span class="adm-pill muted no-dot">never seen</span>`,
+      idle: `<span class="adm-pill warn">idle</span>`,
+      stale: `<span class="adm-pill crit">stale</span>`,
+      never: `<span class="adm-pill muted no-dot">never seen</span>`,
     }[live];
 
     return `
@@ -204,19 +222,27 @@
 
     // Kick buttons.
     main.querySelectorAll("[data-device-kick]").forEach((btn) => {
-      btn.addEventListener("click", (e) => W().action(btn.closest("tr"), async current => {
-        e.stopPropagation();
-        const id   = btn.dataset.deviceKick;
-        const name = btn.dataset.deviceName || "device";
-        if (!confirm(`Kick "${name}"?\n\nThe current sessions on this device will be revoked immediately.\nDesktop will sign out when it checks its access. The user can sign in again.`)) return;
+      btn.addEventListener("click", (e) =>
+        W().action(btn.closest("tr"), async (current) => {
+          e.stopPropagation();
+          const id = btn.dataset.deviceKick;
+          const name = btn.dataset.deviceName || "device";
+          if (
+            !confirm(
+              `Kick "${name}"?\n\nThe current sessions on this device will be revoked immediately.\nDesktop will sign out when it checks its access. The user can sign in again.`
+            )
+          )
+            return;
 
-        const device = s.list.find(row => row.id === id);
-        const reason = prompt("Reason for kicking this device?")?.trim(); if (!reason || !device) return;
-        const result = await A().kickDevice(id, { reason, agencyId: device.agencyId, userId: device.userId });
-        if (!current()) return;
-        R().toast(result?.ok ? "device kicked" : (result?.error || "failed"));
-        if (result?.ok) load(true);
-      }));
+          const device = s.list.find((row) => row.id === id);
+          const reason = prompt("Reason for kicking this device?")?.trim();
+          if (!reason || !device) return;
+          const result = await A().kickDevice(id, { reason, agencyId: device.agencyId, userId: device.userId });
+          if (!current()) return;
+          R().toast(result?.ok ? "device kicked" : result?.error || "failed");
+          if (result?.ok) load(true);
+        })
+      );
     });
   }
 

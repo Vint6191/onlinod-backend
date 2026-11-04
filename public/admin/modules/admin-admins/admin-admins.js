@@ -28,11 +28,21 @@
   }));
 
   function load(force) {
-    return W().load({ section: "admins", state: state, force,
-      fetch: () => A().listAdminUsers(), apply: result => { state.list = Array.isArray(result.admins) ? result.admins : []; }, render });
+    return W().load({
+      section: "admins",
+      state: state,
+      force,
+      fetch: () => A().listAdminUsers(),
+      apply: (result) => {
+        state.list = Array.isArray(result.admins) ? result.admins : [];
+      },
+      render,
+    });
   }
 
-  function rerender() { W().paint("admins", render); }
+  function rerender() {
+    W().paint("admins", render);
+  }
 
   function render(main) {
     const r = R();
@@ -44,8 +54,8 @@
     main.innerHTML = `
       <div class="adm-page-head">
         <div>
-          <div class="adm-page-title">Admins</div>
-          <div class="adm-page-subtitle">~/admin/admins · ${r.escapeHtml(String(state.list.length))} total</div>
+          <div class="adm-page-title">Администраторы</div>
+          <div class="adm-page-subtitle">${r.escapeHtml(String(state.list.length))} total</div>
         </div>
         <div style="display:flex;gap:8px;">
           <button class="adm-btn primary" id="admAdminsCreate">+ create admin</button>
@@ -60,8 +70,8 @@
           state.loading && !state.list.length
             ? `<div class="adm-loading">loading admins…</div>`
             : !state.list.length
-            ? `<div class="adm-empty">No admin users yet.</div>`
-            : `
+              ? `<div class="adm-empty">No admin users yet.</div>`
+              : `
               <table class="adm-table">
                 <thead>
                   <tr>
@@ -112,7 +122,7 @@
         <td>
           <select class="adm-select" data-admin-role="${r.escapeAttr(adm.id)}" style="width:160px;" ${isMe ? "disabled" : ""}>
             <option value="SUPER_ADMIN" ${adm.role === "SUPER_ADMIN" ? "selected" : ""}>SUPER_ADMIN</option>
-            <option value="SUPPORT"     ${adm.role === "SUPPORT"     ? "selected" : ""}>SUPPORT</option>
+            <option value="SUPPORT"     ${adm.role === "SUPPORT" ? "selected" : ""}>SUPPORT</option>
           </select>
         </td>
         <td>
@@ -142,7 +152,9 @@
     `;
   }
 
-  function epoch(id) { return state.list.find(item => item.id === id)?.accessEpoch; }
+  function epoch(id) {
+    return state.list.find((item) => item.id === id)?.accessEpoch;
+  }
 
   function bind(main) {
     main.querySelector("#admAdminsRefresh")?.addEventListener("click", () => load(true));
@@ -151,32 +163,44 @@
     // Role change
     main.querySelectorAll("[data-admin-role]").forEach((sel) => {
       const original = sel.value;
-      sel.addEventListener("change", () => W().action(sel.closest("tr"), async current => {
-        const id = sel.dataset.adminRole;
-        const newRole = sel.value;
-        const result = await A().patchAdminUser(id, { role: newRole, expectedEpoch: epoch(id), reason: "admin role change" });
-        if (!current()) return;
-        if (!result?.ok) {
-          R().toast(result?.error || "Role change failed");
-          sel.value = original;
-          return;
-        }
-        R().toast(`role → ${newRole.toLowerCase()}`);
-        load(true);
-      }));
+      sel.addEventListener("change", () =>
+        W().action(sel.closest("tr"), async (current) => {
+          const id = sel.dataset.adminRole;
+          const newRole = sel.value;
+          const result = await A().patchAdminUser(id, {
+            role: newRole,
+            expectedEpoch: epoch(id),
+            reason: "admin role change",
+          });
+          if (!current()) return;
+          if (!result?.ok) {
+            R().toast(result?.error || "Role change failed");
+            sel.value = original;
+            return;
+          }
+          R().toast(`role → ${newRole.toLowerCase()}`);
+          load(true);
+        })
+      );
     });
 
     // Disable / enable
     main.querySelectorAll("[data-admin-toggle]").forEach((btn) => {
-      btn.addEventListener("click", () => W().action(btn.closest("tr"), async current => {
-        const id = btn.dataset.adminToggle;
-        const wasActive = btn.dataset.adminActive === "1";
-        if (wasActive && !confirm("Disable this admin?\n\nAll their sessions will be revoked.")) return;
-        const result = await A().patchAdminUser(id, { active: !wasActive, expectedEpoch: epoch(id), reason: wasActive ? "admin disable" : "admin enable" });
-        if (!current()) return;
-        R().toast(result?.ok ? (wasActive ? "admin disabled" : "admin enabled") : (result?.error || "failed"));
-        if (result?.ok) load(true);
-      }));
+      btn.addEventListener("click", () =>
+        W().action(btn.closest("tr"), async (current) => {
+          const id = btn.dataset.adminToggle;
+          const wasActive = btn.dataset.adminActive === "1";
+          if (wasActive && !confirm("Disable this admin?\n\nAll their sessions will be revoked.")) return;
+          const result = await A().patchAdminUser(id, {
+            active: !wasActive,
+            expectedEpoch: epoch(id),
+            reason: wasActive ? "admin disable" : "admin enable",
+          });
+          if (!current()) return;
+          R().toast(result?.ok ? (wasActive ? "admin disabled" : "admin enabled") : result?.error || "failed");
+          if (result?.ok) load(true);
+        })
+      );
     });
 
     // Reset password
@@ -235,37 +259,47 @@
     `;
 
     slot.querySelectorAll("[data-modal-close]").forEach((el) => {
-      el.addEventListener("click", () => { slot.innerHTML = ""; });
+      el.addEventListener("click", () => {
+        slot.innerHTML = "";
+      });
     });
 
-    slot.querySelector("#admNewAdminSubmit").addEventListener("click", () => W().action(slot.querySelector(".adm-drawer"), async current => {
-      const email = slot.querySelector("#admNewAdminEmail").value.trim();
-      const name  = slot.querySelector("#admNewAdminName").value.trim();
-      const pwd   = slot.querySelector("#admNewAdminPwd").value;
-      const role  = slot.querySelector("#admNewAdminRole").value;
-      const errBox = slot.querySelector("#admNewAdminError");
+    slot.querySelector("#admNewAdminSubmit").addEventListener("click", () =>
+      W().action(slot.querySelector(".adm-drawer"), async (current) => {
+        const email = slot.querySelector("#admNewAdminEmail").value.trim();
+        const name = slot.querySelector("#admNewAdminName").value.trim();
+        const pwd = slot.querySelector("#admNewAdminPwd").value;
+        const role = slot.querySelector("#admNewAdminRole").value;
+        const errBox = slot.querySelector("#admNewAdminError");
 
-      errBox.innerHTML = "";
+        errBox.innerHTML = "";
 
-      if (!email || !pwd) {
-        errBox.innerHTML = `<div class="adm-error">email and password are required</div>`;
-        return;
-      }
-      if (pwd.length < 8) {
-        errBox.innerHTML = `<div class="adm-error">password must be ≥8 chars</div>`;
-        return;
-      }
+        if (!email || !pwd) {
+          errBox.innerHTML = `<div class="adm-error">email and password are required</div>`;
+          return;
+        }
+        if (pwd.length < 8) {
+          errBox.innerHTML = `<div class="adm-error">password must be ≥8 chars</div>`;
+          return;
+        }
 
-      const result = await A().createAdminUser({ email, name: name || undefined, password: pwd, role, reason: "create admin account" });
-      if (!current()) return;
-      if (!result?.ok) {
-        errBox.innerHTML = `<div class="adm-error">${R().escapeHtml(result?.error || "create failed")}</div>`;
-        return;
-      }
-      R().toast("admin created");
-      slot.innerHTML = "";
-      load(true);
-    }));
+        const result = await A().createAdminUser({
+          email,
+          name: name || undefined,
+          password: pwd,
+          role,
+          reason: "create admin account",
+        });
+        if (!current()) return;
+        if (!result?.ok) {
+          errBox.innerHTML = `<div class="adm-error">${R().escapeHtml(result?.error || "create failed")}</div>`;
+          return;
+        }
+        R().toast("admin created");
+        slot.innerHTML = "";
+        load(true);
+      })
+    );
   }
 
   // ── Reset password modal ────────────────────────────────────
@@ -302,30 +336,38 @@
     `;
 
     slot.querySelectorAll("[data-modal-close]").forEach((el) => {
-      el.addEventListener("click", () => { slot.innerHTML = ""; });
+      el.addEventListener("click", () => {
+        slot.innerHTML = "";
+      });
     });
 
-    slot.querySelector("#admPwdSubmit").addEventListener("click", () => W().action(slot.querySelector(".adm-drawer"), async current => {
-      const pwd    = slot.querySelector("#admPwdValue").value;
-      const reason = slot.querySelector("#admPwdReason").value.trim();
-      const errBox = slot.querySelector("#admPwdError");
-      errBox.innerHTML = "";
+    slot.querySelector("#admPwdSubmit").addEventListener("click", () =>
+      W().action(slot.querySelector(".adm-drawer"), async (current) => {
+        const pwd = slot.querySelector("#admPwdValue").value;
+        const reason = slot.querySelector("#admPwdReason").value.trim();
+        const errBox = slot.querySelector("#admPwdError");
+        errBox.innerHTML = "";
 
-      if (!pwd || pwd.length < 8) {
-        errBox.innerHTML = `<div class="adm-error">password must be ≥8 chars</div>`;
-        return;
-      }
+        if (!pwd || pwd.length < 8) {
+          errBox.innerHTML = `<div class="adm-error">password must be ≥8 chars</div>`;
+          return;
+        }
 
-      const result = await A().resetAdminPwd(adminId, { password: pwd, expectedEpoch, reason: reason || "admin password reset" });
-      if (!current()) return;
-      if (!result?.ok) {
-        errBox.innerHTML = `<div class="adm-error">${R().escapeHtml(result?.error || "reset failed")}</div>`;
-        return;
-      }
-      R().toast("password set — sessions revoked");
-      slot.innerHTML = "";
-      load(true);
-    }));
+        const result = await A().resetAdminPwd(adminId, {
+          password: pwd,
+          expectedEpoch,
+          reason: reason || "admin password reset",
+        });
+        if (!current()) return;
+        if (!result?.ok) {
+          errBox.innerHTML = `<div class="adm-error">${R().escapeHtml(result?.error || "reset failed")}</div>`;
+          return;
+        }
+        R().toast("password set — sessions revoked");
+        slot.innerHTML = "";
+        load(true);
+      })
+    );
   }
 
   window.NodAdminAdmins = { render };

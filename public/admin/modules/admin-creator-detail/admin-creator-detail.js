@@ -15,21 +15,36 @@
   const esc = (v) => R().escapeHtml(v);
   const W = () => window.NodAdminWorkspace;
 
-  function fmtDate(v) { if (!v) return "—"; const d = new Date(v); return isNaN(d) ? "—" : d.toISOString().slice(0, 16).replace("T", " "); }
+  function fmtDate(v) {
+    if (!v) return "—";
+    const d = new Date(v);
+    return isNaN(d) ? "—" : d.toISOString().slice(0, 16).replace("T", " ");
+  }
   function fmtMoney(v, row = null) {
     if (v == null || (row?.valueAvailability && row.valueAvailability !== "AVAILABLE")) return "—";
     const n = Number(v);
     return Number.isFinite(n) ? "$" + (n / 100).toFixed(2) : "—";
   }
-  function trunc(s, n) { s = String(s == null ? "" : s); return s.length > n ? s.slice(0, n) + "…" : s; }
+  function trunc(s, n) {
+    s = String(s == null ? "" : s);
+    return s.length > n ? s.slice(0, n) + "…" : s;
+  }
 
   const local = W().local(() => ({ tab: "overview", creatorId: null, overview: null, tabData: {}, loading: false }));
 
   async function render(main) {
     const current = W().request(main);
     const creatorId = S().sectionParam;
-    if (!creatorId) { main.innerHTML = `<div class="adm-error">no creator id</div>`; return; }
-    if (local.creatorId !== creatorId) { local.creatorId = creatorId; local.overview = null; local.tabData = {}; local.tab = "overview"; }
+    if (!creatorId) {
+      main.innerHTML = `<div class="adm-error">no creator id</div>`;
+      return;
+    }
+    if (local.creatorId !== creatorId) {
+      local.creatorId = creatorId;
+      local.overview = null;
+      local.tabData = {};
+      local.tab = "overview";
+    }
 
     main.innerHTML = `<div class="adm-page"><div class="adm-loading">loading model…</div></div>`;
 
@@ -54,23 +69,34 @@
       { label: "Hidden online", val: counts.hiddenOnline },
       { label: "Follow back", val: counts.followBack },
       { label: "Money", val: fmtMoney(counts.moneyCents) },
-    ].map((k) => `<div class="adm-kpi"><div class="adm-kpi-label">${esc(k.label)}</div><div class="adm-kpi-val">${esc(k.val ?? "—")}</div></div>`).join("");
+    ]
+      .map(
+        (k) =>
+          `<div class="adm-kpi"><div class="adm-kpi-label">${esc(k.label)}</div><div class="adm-kpi-val">${esc(k.val ?? "—")}</div></div>`
+      )
+      .join("");
 
     const dStatus = counts.deliveriesByStatus || {};
     const statusChips = Object.keys(dStatus).length
-      ? `<div class="adm-chips">${Object.entries(dStatus).map(([s, n]) => `<span class="adm-chip">${esc(s)}: ${esc(n)}</span>`).join("")}</div>` : "";
+      ? `<div class="adm-chips">${Object.entries(dStatus)
+          .map(([s, n]) => `<span class="adm-chip">${esc(s)}: ${esc(n)}</span>`)
+          .join("")}</div>`
+      : "";
 
     const TABS = [
       ["overview", "Overview"],
-      ["deliveries", "Deliveries"], ["replyrate", "Reply Rate"],
-      ["hidden", "Hidden Online"], ["followback", "Follow Back"],
+      ["deliveries", "Deliveries"],
+      ["replyrate", "Reply Rate"],
+      ["hidden", "Hidden Online"],
+      ["followback", "Follow Back"],
     ];
 
     main.innerHTML = `
       <div class="adm-page">
         <div class="adm-detail-head">
           <button class="adm-link" id="admBack">← creators</button>
-          <button class="adm-btn" id="admCreatorRefresh">Refresh</button>
+          <button class="adm-btn" id="admCreatorRefresh">Обновить</button>
+          ${c.agency?.id ? `<button class="adm-btn" id="admCreatorBilling">Подписки агентства</button>` : ""}
           <h1>${esc(c.displayName || c.username || c.id)}</h1>
           <div class="adm-detail-sub">
             @${esc(c.username || "—")} ·
@@ -91,8 +117,14 @@
       </div>`;
 
     main.querySelector("#admBack").addEventListener("click", () => R().pushSection("creators"));
+    main.querySelector("#admCreatorBilling")?.addEventListener("click", () => R().pushDetail("billing", c.agency.id));
     main.querySelector("#admCreatorRefresh").addEventListener("click", () => render(main));
-    main.querySelectorAll(".adm-tab").forEach((b) => b.addEventListener("click", () => { local.tab = b.dataset.tab; paint(main); }));
+    main.querySelectorAll(".adm-tab").forEach((b) =>
+      b.addEventListener("click", () => {
+        local.tab = b.dataset.tab;
+        paint(main);
+      })
+    );
 
     const body = main.querySelector("#admCDBody");
     if (local.tab === "overview") renderOverview(body);
@@ -103,7 +135,8 @@
   }
 
   function renderOverview(body) {
-    const o = local.overview, c = o.creator || {};
+    const o = local.overview,
+      c = o.creator || {};
     body.innerHTML = `
       <div class="adm-card">
         <div class="adm-card-title">Raw creator record</div>
@@ -114,14 +147,23 @@
   function renderReplyRate(body) {
     const current = W().request(body);
     body.innerHTML = `<div class="adm-loading">loading…</div>`;
-    A().dataBumpStats({ creatorId: local.creatorId }).then((r) => {
-      if (!current()) return;
-      if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">${esc(r?.error||r?.code||"failed")}</div>`; return; }
-      const t = r.totals || {};
-      const tpl = (r.perTemplate || []).map((p) => `
+    A()
+      .dataBumpStats({ creatorId: local.creatorId })
+      .then((r) => {
+        if (!current()) return;
+        if (!r || !r.ok) {
+          body.innerHTML = `<div class="adm-error">${esc(r?.error || r?.code || "failed")}</div>`;
+          return;
+        }
+        const t = r.totals || {};
+        const tpl = (r.perTemplate || [])
+          .map(
+            (p) => `
         <tr><td>${esc(trunc(p.templateId || "(none)", 24))}</td><td>${esc(p.sent)}</td><td>${esc(p.replied)}</td>
-        <td><b>${esc(p.replyRate)}%</b></td><td>${esc(p.canceled)}</td><td>${esc(p.expired)}</td><td>${esc(p.failed)}</td></tr>`).join("");
-      body.innerHTML = `
+        <td><b>${esc(p.replyRate)}%</b></td><td>${esc(p.canceled)}</td><td>${esc(p.expired)}</td><td>${esc(p.failed)}</td></tr>`
+          )
+          .join("");
+        body.innerHTML = `
         <div class="adm-kpi-row">
           <div class="adm-kpi"><div class="adm-kpi-label">sent</div><div class="adm-kpi-val">${esc(t.sent || 0)}</div></div>
           <div class="adm-kpi"><div class="adm-kpi-label">replied</div><div class="adm-kpi-val">${esc(t.replied || 0)}</div></div>
@@ -134,57 +176,102 @@
           <table class="adm-table"><thead><tr><th>Template</th><th>Sent</th><th>Replied</th><th>Reply%</th><th>Canceled</th><th>Expired</th><th>Failed</th></tr></thead>
           <tbody>${tpl || `<tr><td colspan="7" class="adm-muted">no data yet</td></tr>`}</tbody></table>
         </div>`;
-    });
+      });
   }
 
   // Generic list renderer for a tab. Defines columns + api per kind.
-  function renderList(body, kind, offset=null) {
+  function renderList(body, kind, offset = null) {
     const current = W().request(body);
-    const creatorId=local.creatorId,tab=local.tab,requestId=local.listRequest=(local.listRequest||0)+1;
+    const creatorId = local.creatorId,
+      tab = local.tab,
+      requestId = (local.listRequest = (local.listRequest || 0) + 1);
     const cfg = listConfig(kind);
     body.innerHTML = `<div class="adm-loading">loading…</div>`;
     cfg.api(offset).then((r) => {
-      if(!current()||creatorId!==local.creatorId||tab!==local.tab||requestId!==local.listRequest)return;
-      if (!r || !r.ok) { body.innerHTML = `<div class="adm-error">${esc(r?.error||r?.code||"failed")}</div>`; return; }
+      if (!current() || creatorId !== local.creatorId || tab !== local.tab || requestId !== local.listRequest) return;
+      if (!r || !r.ok) {
+        body.innerHTML = `<div class="adm-error">${esc(r?.error || r?.code || "failed")}</div>`;
+        return;
+      }
       const items = r.items || [];
       const readOnly = !cfg.model;
       const head = cfg.cols.map((c) => `<th>${esc(c.label)}</th>`).join("");
-      const rows = items.map((row) => {
-        const tds = cfg.cols.map((c) => `<td title="${esc(typeof row[c.k] === "object" ? JSON.stringify(row[c.k]) : row[c.k])}">${esc(trunc(c.fmt ? c.fmt(row[c.k], row) : (row[c.k] == null ? "—" : row[c.k]), 40))}</td>`).join("");
-        return readOnly
-          ? `<tr>${tds}</tr>`
-          : `<tr>${tds}<td class="adm-row-actions"><button class="adm-link" data-inspect="${esc(row.id)}">inspect</button></td></tr>`;
-      }).join("");
+      const rows = items
+        .map((row) => {
+          const tds = cfg.cols
+            .map(
+              (c) =>
+                `<td title="${esc(typeof row[c.k] === "object" ? JSON.stringify(row[c.k]) : row[c.k])}">${esc(trunc(c.fmt ? c.fmt(row[c.k], row) : row[c.k] == null ? "—" : row[c.k], 40))}</td>`
+            )
+            .join("");
+          return readOnly
+            ? `<tr>${tds}</tr>`
+            : `<tr>${tds}<td class="adm-row-actions"><button class="adm-link" data-inspect="${esc(row.id)}">inspect</button></td></tr>`;
+        })
+        .join("");
       body.innerHTML = `
         <div class="adm-muted" style="margin:6px 0">${items.length} on this page${r.total != null ? " of " + r.total + " total" : ""}${readOnly ? " · canonical current · read-only" : ""}</div>
-        <table class="adm-table"><thead><tr>${head}${readOnly ? "" : "<th></th>"}</tr></thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows</td></tr>`}</tbody></table>${r.hasMore?'<button class="adm-btn adm-btn-sm" data-archive-next>next page</button>':""}`;
-      body.querySelector("[data-archive-next]")?.addEventListener("click",()=>renderList(body,kind,r.nextOffset));
+        <table class="adm-table"><thead><tr>${head}${readOnly ? "" : "<th></th>"}</tr></thead><tbody>${rows || `<tr><td colspan="99" class="adm-muted">no rows</td></tr>`}</tbody></table>${r.hasMore ? '<button class="adm-btn adm-btn-sm" data-archive-next>next page</button>' : ""}`;
+      body.querySelector("[data-archive-next]")?.addEventListener("click", () => renderList(body, kind, r.nextOffset));
       if (readOnly) return;
-      body.querySelectorAll("[data-inspect]").forEach((b) => b.addEventListener("click", async () => {
-        const rr = await A().dataInspect(cfg.model, b.dataset.inspect);
-        if (!current()) return;
-        if (rr?.ok) showModal(`${cfg.model} · ${b.dataset.inspect}`, `<pre class="adm-json">${esc(JSON.stringify(rr.record, null, 2))}</pre>`);
-      }));
-
+      body.querySelectorAll("[data-inspect]").forEach((b) =>
+        b.addEventListener("click", async () => {
+          const rr = await A().dataInspect(cfg.model, b.dataset.inspect);
+          if (!current()) return;
+          if (rr?.ok)
+            showModal(
+              `${cfg.model} · ${b.dataset.inspect}`,
+              `<pre class="adm-json">${esc(JSON.stringify(rr.record, null, 2))}</pre>`
+            );
+        })
+      );
     });
   }
 
   function listConfig(kind) {
     const cid = local.creatorId;
     switch (kind) {
-      case "deliveries": return {
-        model: "automationDelivery", api: offset => A().dataDeliveries({ creatorId: cid, offset, limit: 200 }),
-        cols: [{ k: "fanId", label: "Fan" }, { k: "status", label: "Status" }, { k: "messageId", label: "MsgId" }, { k: "priceCents", label: "Price", fmt: fmtMoney }, { k: "sentAt", label: "Sent", fmt: fmtDate }],
-      };
-      case "hidden": return {
-        model: null, api: offset => A().dataHiddenOnline({ creatorId: cid, offset, limit: 200 }),
-        cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "status", label: "Status" }, { k: "totalSpentCents", label: "Spent", fmt: fmtMoney }, { k: "observedAt", label: "Observed", fmt: fmtDate }, { k: "statusUpdatedAt", label: "Status updated", fmt: fmtDate }],
-      };
-      case "followback": return {
-        model: null, api: offset => A().dataFollowBack({ creatorId: cid, offset, limit: 200 }),
-        cols: [{ k: "fanId", label: "Fan" }, { k: "username", label: "Username" }, { k: "latestActionType", label: "Action" }, { k: "latestStatus", label: "Delivery status" }, { k: "state", label: "Candidate state" }, { k: "currentEligibility", label: "Eligibility" }, { k: "updatedAt", label: "Updated", fmt: fmtDate }],
-      };
-      default: throw new Error("Unknown creator data view");
+      case "deliveries":
+        return {
+          model: "automationDelivery",
+          api: (offset) => A().dataDeliveries({ creatorId: cid, offset, limit: 200 }),
+          cols: [
+            { k: "fanId", label: "Fan" },
+            { k: "status", label: "Status" },
+            { k: "messageId", label: "MsgId" },
+            { k: "priceCents", label: "Price", fmt: fmtMoney },
+            { k: "sentAt", label: "Sent", fmt: fmtDate },
+          ],
+        };
+      case "hidden":
+        return {
+          model: null,
+          api: (offset) => A().dataHiddenOnline({ creatorId: cid, offset, limit: 200 }),
+          cols: [
+            { k: "fanId", label: "Fan" },
+            { k: "username", label: "Username" },
+            { k: "status", label: "Status" },
+            { k: "totalSpentCents", label: "Spent", fmt: fmtMoney },
+            { k: "observedAt", label: "Observed", fmt: fmtDate },
+            { k: "statusUpdatedAt", label: "Status updated", fmt: fmtDate },
+          ],
+        };
+      case "followback":
+        return {
+          model: null,
+          api: (offset) => A().dataFollowBack({ creatorId: cid, offset, limit: 200 }),
+          cols: [
+            { k: "fanId", label: "Fan" },
+            { k: "username", label: "Username" },
+            { k: "latestActionType", label: "Action" },
+            { k: "latestStatus", label: "Delivery status" },
+            { k: "state", label: "Candidate state" },
+            { k: "currentEligibility", label: "Eligibility" },
+            { k: "updatedAt", label: "Updated", fmt: fmtDate },
+          ],
+        };
+      default:
+        throw new Error("Unknown creator data view");
     }
   }
 
@@ -196,7 +283,9 @@
     m.innerHTML = `<div class="adm-modal"><div class="adm-modal-head"><b>${esc(title)}</b><button class="adm-modal-close">✕</button></div><div class="adm-modal-body">${html}</div></div>`;
     document.body.appendChild(m);
     m.querySelector(".adm-modal-close").addEventListener("click", () => m.remove());
-    m.addEventListener("click", (e) => { if (e.target === m) m.remove(); });
+    m.addEventListener("click", (e) => {
+      if (e.target === m) m.remove();
+    });
   }
 
   window.NodAdminCreatorDetail = { render };

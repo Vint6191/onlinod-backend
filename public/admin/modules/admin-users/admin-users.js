@@ -24,21 +24,39 @@
   const W = () => window.NodAdminWorkspace;
 
   const State = () => window.NodAdminState;
-  const A     = () => window.NodAdminApi;
-  const R     = () => window.NodAdminRouter;
-  const U     = () => window.NodAdminUtils;
+  const A = () => window.NodAdminApi;
+  const R = () => window.NodAdminRouter;
+  const U = () => window.NodAdminUtils;
 
-  function slice() { return State().users; }
+  function slice() {
+    return State().users;
+  }
 
   // ── List load ──────────────────────────────────────────────
 
   function load(force) {
     const s = slice();
-    return W().load({ section: "users", state: s, force,
-      fetch: () => A().listUsers({ q:s.filters.q || undefined, unverified:s.filters.unverified ? "1" : undefined, no_agency:s.filters.no_agency ? "1" : undefined, disabled:s.filters.disabled ? "1" : undefined }), apply: result => { s.list = Array.isArray(result.users) ? result.users : []; }, render });
+    return W().load({
+      section: "users",
+      state: s,
+      force,
+      fetch: () =>
+        A().listUsers({
+          q: s.filters.q || undefined,
+          unverified: s.filters.unverified ? "1" : undefined,
+          no_agency: s.filters.no_agency ? "1" : undefined,
+          disabled: s.filters.disabled ? "1" : undefined,
+        }),
+      apply: (result) => {
+        s.list = Array.isArray(result.users) ? result.users : [];
+      },
+      render,
+    });
   }
 
-  function rerender() { W().paint("users", render); }
+  function rerender() {
+    W().paint("users", render);
+  }
 
   // ── Render ─────────────────────────────────────────────────
 
@@ -59,10 +77,10 @@
     main.innerHTML = `
       <div class="adm-page-head">
         <div>
-          <div class="adm-page-title">Users</div>
-          <div class="adm-page-subtitle">~/admin/users · ${r.escapeHtml(String(s.list.length))} loaded</div>
+          <div class="adm-page-title">Пользователи</div>
+          <div class="adm-page-subtitle">${r.escapeHtml(String(s.list.length))} loaded</div>
         </div>
-        <button class="adm-btn ghost" id="admUsersRefresh">↻ refresh</button>
+        <button class="adm-btn ghost" id="admUsersRefresh">Обновить</button>
       </div>
 
       ${s.error ? `<div class="adm-error">${r.escapeHtml(s.error)}</div>` : ""}
@@ -90,7 +108,7 @@
           <div class="adm-table-toolbar-spacer"></div>
 
           <span style="color:var(--adm-muted);font-family:var(--adm-mono);font-size:11px;">
-            ${s.loading ? "loading…" : (s.lastLoadedAt ? `loaded ${u.timeAgo(s.lastLoadedAt)}` : "")}
+            ${s.loading ? "loading…" : s.lastLoadedAt ? `loaded ${u.timeAgo(s.lastLoadedAt)}` : ""}
           </span>
         </div>
 
@@ -98,8 +116,8 @@
           s.loading && !s.list.length
             ? `<div class="adm-loading">loading users…</div>`
             : !s.list.length
-            ? `<div class="adm-empty">No users match these filters.</div>`
-            : `
+              ? `<div class="adm-empty">No users match these filters.</div>`
+              : `
               <table class="adm-table">
                 <thead>
                   <tr>
@@ -226,7 +244,9 @@
       </aside>
     `;
     drawer.querySelectorAll("[data-drawer-close]").forEach((el) => {
-      el.addEventListener("click", () => { drawer.innerHTML = ""; });
+      el.addEventListener("click", () => {
+        drawer.innerHTML = "";
+      });
     });
 
     const result = await A().getUser(userId);
@@ -293,7 +313,9 @@
       ${
         memberships.length
           ? `<div style="display:flex;flex-direction:column;margin-bottom:16px;">
-              ${memberships.map((m) => `
+              ${memberships
+                .map(
+                  (m) => `
                 <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--adm-line);">
                   <div style="flex:1;min-width:0;">
                     <div style="font-size:12.5px;">${r.escapeHtml(m.agency.name)} ${m.agency.deletedAt ? `<span class="adm-pill crit no-dot" style="margin-left:6px;">deleted</span>` : ""}</div>
@@ -304,7 +326,9 @@
                   <span class="adm-pill ${m.role === "OWNER" ? "warn" : "muted"} no-dot">${r.escapeHtml(String(m.role).toLowerCase())}</span>
                   <button class="adm-btn ghost" data-open-agency="${r.escapeAttr(m.agency.id)}">→</button>
                 </div>
-              `).join("")}
+              `
+                )
+                .join("")}
             </div>`
           : `<div class="adm-empty" style="padding:14px;">No memberships.</div>`
       }
@@ -313,7 +337,10 @@
       ${
         sessions.length
           ? `<div style="display:flex;flex-direction:column;font-family:var(--adm-mono);font-size:11px;">
-              ${sessions.slice(0, 10).map((s) => `
+              ${sessions
+                .slice(0, 10)
+                .map(
+                  (s) => `
                 <div style="padding:6px 0;border-top:1px solid var(--adm-line);
                             display:flex;justify-content:space-between;gap:10px;">
                   <span style="color:${s.revokedAt ? "var(--adm-muted)" : "var(--adm-text)"};">
@@ -323,7 +350,9 @@
                     ${r.escapeHtml(s.userAgent || "—")}
                   </span>
                 </div>
-              `).join("")}
+              `
+                )
+                .join("")}
             </div>`
           : `<div class="adm-empty" style="padding:14px;">No sessions.</div>`
       }
@@ -332,50 +361,63 @@
 
   function bindDrawerActions(body, d) {
     body.querySelectorAll("[data-user-action]").forEach((btn) => {
-      btn.addEventListener("click", () => W().action(body, async current => {
-        const action = btn.dataset.userAction;
-        const userId = d.user.id;
+      btn.addEventListener("click", () =>
+        W().action(body, async (current) => {
+          const action = btn.dataset.userAction;
+          const userId = d.user.id;
 
-        if (action === "disable") {
-          const reason = prompt("Reason for disabling? (required)")?.trim();
-          if (!reason) return;
-          const ok = confirm(`Disable ${d.user.email}?\n\nAll their refresh sessions will be revoked.`);
-          if (!ok) return;
-          const result = await A().patchUser(userId, { disabled: true, disabledReason: reason, reason, expectedUpdatedAt: d.user.updatedAt });
-          if (!current()) return;
-          if (result?.ok) W().invalidate(slice());
-          R().toast(result?.ok ? "user disabled" : (result?.error || "failed"));
-          if (result?.ok) openDrawer(userId);
-          else load(true);
-        }
-        else if (action === "enable") {
-          const reason = prompt("Reason for enabling this user?")?.trim(); if (!reason) return;
-          const result = await A().patchUser(userId, { disabled: false, reason, expectedUpdatedAt: d.user.updatedAt });
-          if (!current()) return;
-          if (result?.ok) W().invalidate(slice());
-          R().toast(result?.ok ? "user enabled" : (result?.error || "failed"));
-          if (result?.ok) openDrawer(userId);
-        }
-        else if (action === "force-logout") {
-          if (!confirm(`Force logout ${d.user.email}?\n\nKills all active refresh sessions.`)) return;
-          const reason = prompt("Reason for force logout?")?.trim(); if (!reason) return;
-          const result = await A().forceLogout(userId, { reason });
-          if (!current()) return;
-          if (result?.ok) W().invalidate(slice());
-          R().toast(result?.ok ? `${result.revokedSessions} session(s) revoked` : (result?.error || "failed"));
-          if (result?.ok) openDrawer(userId);
-        }
-        else if (action === "reset-password") {
-          const password = prompt("Enter the new password (8–72 UTF-8 bytes). Keep it until the command is confirmed; the server will not return it.");
-          if (!password) return;
-          const reason = prompt("Reason for password reset?")?.trim(); if (!reason) return;
-          const result = await A().resetUserPwd(userId, { password, reason, expectedUpdatedAt: d.user.updatedAt });
-          if (!current()) return;
-          if (result?.ok) W().invalidate(slice());
-          R().toast(result?.ok ? "password reset — sessions revoked" : (result?.error || "failed"));
-          if (result?.ok) openDrawer(userId);
-        }
-      }));
+          if (action === "disable") {
+            const reason = prompt("Reason for disabling? (required)")?.trim();
+            if (!reason) return;
+            const ok = confirm(`Disable ${d.user.email}?\n\nAll their refresh sessions will be revoked.`);
+            if (!ok) return;
+            const result = await A().patchUser(userId, {
+              disabled: true,
+              disabledReason: reason,
+              reason,
+              expectedUpdatedAt: d.user.updatedAt,
+            });
+            if (!current()) return;
+            if (result?.ok) W().invalidate(slice());
+            R().toast(result?.ok ? "user disabled" : result?.error || "failed");
+            if (result?.ok) openDrawer(userId);
+            else load(true);
+          } else if (action === "enable") {
+            const reason = prompt("Reason for enabling this user?")?.trim();
+            if (!reason) return;
+            const result = await A().patchUser(userId, {
+              disabled: false,
+              reason,
+              expectedUpdatedAt: d.user.updatedAt,
+            });
+            if (!current()) return;
+            if (result?.ok) W().invalidate(slice());
+            R().toast(result?.ok ? "user enabled" : result?.error || "failed");
+            if (result?.ok) openDrawer(userId);
+          } else if (action === "force-logout") {
+            if (!confirm(`Force logout ${d.user.email}?\n\nKills all active refresh sessions.`)) return;
+            const reason = prompt("Reason for force logout?")?.trim();
+            if (!reason) return;
+            const result = await A().forceLogout(userId, { reason });
+            if (!current()) return;
+            if (result?.ok) W().invalidate(slice());
+            R().toast(result?.ok ? `${result.revokedSessions} session(s) revoked` : result?.error || "failed");
+            if (result?.ok) openDrawer(userId);
+          } else if (action === "reset-password") {
+            const password = prompt(
+              "Enter the new password (8–72 UTF-8 bytes). Keep it until the command is confirmed; the server will not return it."
+            );
+            if (!password) return;
+            const reason = prompt("Reason for password reset?")?.trim();
+            if (!reason) return;
+            const result = await A().resetUserPwd(userId, { password, reason, expectedUpdatedAt: d.user.updatedAt });
+            if (!current()) return;
+            if (result?.ok) W().invalidate(slice());
+            R().toast(result?.ok ? "password reset — sessions revoked" : result?.error || "failed");
+            if (result?.ok) openDrawer(userId);
+          }
+        })
+      );
     });
 
     body.querySelectorAll("[data-open-agency]").forEach((btn) => {

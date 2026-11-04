@@ -33,39 +33,71 @@
 
   function load(force) {
     void refreshRetentionCommand();
-    return W().load({ section: "system", state: state, force,
-      fetch: () => A().systemHealth(), apply: result => { state.data = result; }, render, ttl: 5000 });
+    return W().load({
+      section: "system",
+      state: state,
+      force,
+      fetch: () => A().systemHealth(),
+      apply: (result) => {
+        state.data = result;
+      },
+      render,
+      ttl: 5000,
+    });
   }
 
   let retentionGeneration = 0;
   function clearRetentionSession() {
     retentionGeneration += 1;
-    Object.assign(state, { retentionLoading:false, retentionSaving:false, retentionRunning:false,
-      retentionData:null, retentionDraft:null, retentionDirty:false, retentionReason:"",
-      retentionResult:null, retentionError:null, retentionCommand:null, retentionPolling:false });
+    Object.assign(state, {
+      retentionLoading: false,
+      retentionSaving: false,
+      retentionRunning: false,
+      retentionData: null,
+      retentionDraft: null,
+      retentionDirty: false,
+      retentionReason: "",
+      retentionResult: null,
+      retentionError: null,
+      retentionCommand: null,
+      retentionPolling: false,
+    });
     rerender();
   }
   window.addEventListener("nod:admin-session-changed", clearRetentionSession);
-  window.addEventListener("storage", event => { if (event.key === "onlinod_admin_token") clearRetentionSession(); });
-  function currentRetentionRead(generation, token) { return generation === retentionGeneration && token === A().getToken(); }
+  window.addEventListener("storage", (event) => {
+    if (event.key === "onlinod_admin_token") clearRetentionSession();
+  });
+  function currentRetentionRead(generation, token) {
+    return generation === retentionGeneration && token === A().getToken();
+  }
   async function refreshRetentionCommand() {
     const command = state.retentionCommand;
     if (!command || !["QUEUED", "RUNNING"].includes(command.status) || state.retentionPolling) return;
-    const generation = retentionGeneration, token = A().getToken();
+    const generation = retentionGeneration,
+      token = A().getToken();
     state.retentionPolling = true;
     try {
       const result = await A().commandStatus(command.commandId);
       if (!currentRetentionRead(generation, token)) return;
       if (result?.ok) state.retentionCommand = result;
       else state.retentionError = result?.error || "Could not read cleanup status";
-    } finally { if (currentRetentionRead(generation, token)) { state.retentionPolling = false; rerender(); } }
+    } finally {
+      if (currentRetentionRead(generation, token)) {
+        state.retentionPolling = false;
+        rerender();
+      }
+    }
   }
   async function loadRetention(force) {
     if (state.retentionSaving || state.retentionRunning) return;
     if (state.retentionLoading || (!force && state.retentionData)) return;
     if (state.retentionDirty && !force) return;
-    const generation = ++retentionGeneration, token = A().getToken();
-    state.retentionLoading = true; state.retentionError = null; rerender();
+    const generation = ++retentionGeneration,
+      token = A().getToken();
+    state.retentionLoading = true;
+    state.retentionError = null;
+    rerender();
     const result = await A().retentionSettings();
     if (!currentRetentionRead(generation, token)) return;
     state.retentionLoading = false;
@@ -81,23 +113,48 @@
   async function retentionMutation(action) {
     if (state.retentionSaving || state.retentionRunning || !state.retentionData) return;
     const reason = state.retentionReason.trim();
-    if (reason.length < 3) { state.retentionError = "Enter a reason (at least 3 characters)."; rerender(); return; }
+    if (reason.length < 3) {
+      state.retentionError = "Enter a reason (at least 3 characters).";
+      rerender();
+      return;
+    }
     if (action === "reset" && !confirm("Save current server defaults as the retention policy?")) return;
-    if (action === "run" && !confirm("Queue one cleanup pass? Eligible old data will be deleted under the displayed policy.")) return;
-    const generation = ++retentionGeneration, token = A().getToken();
-    const input = { expectedRevision:state.retentionData.revision, expectedPolicyHash:state.retentionData.policyHash, reason,
-      ...(action === "set" ? {settings:{...state.retentionDraft}} : {}) };
-    state.retentionSaving = action !== "run"; state.retentionRunning = action === "run";
-    state.retentionError = null; state.retentionResult = null; rerender();
-    const result = action === "set" ? await A().saveRetentionSettings(input)
-      : action === "reset" ? await A().resetRetentionSettings(input) : await A().runRetentionSweep(input);
+    if (
+      action === "run" &&
+      !confirm("Queue one cleanup pass? Eligible old data will be deleted under the displayed policy.")
+    )
+      return;
+    const generation = ++retentionGeneration,
+      token = A().getToken();
+    const input = {
+      expectedRevision: state.retentionData.revision,
+      expectedPolicyHash: state.retentionData.policyHash,
+      reason,
+      ...(action === "set" ? { settings: { ...state.retentionDraft } } : {}),
+    };
+    state.retentionSaving = action !== "run";
+    state.retentionRunning = action === "run";
+    state.retentionError = null;
+    state.retentionResult = null;
+    rerender();
+    const result =
+      action === "set"
+        ? await A().saveRetentionSettings(input)
+        : action === "reset"
+          ? await A().resetRetentionSettings(input)
+          : await A().runRetentionSweep(input);
     if (!currentRetentionRead(generation, token)) return;
-    state.retentionSaving = false; state.retentionRunning = false;
+    state.retentionSaving = false;
+    state.retentionRunning = false;
     if (!result?.ok) state.retentionError = result?.error || "Command failed; reload or retry the same change.";
-    else if (action === "run") state.retentionCommand = { commandId:result.commandId, status:result.status };
+    else if (action === "run") state.retentionCommand = { commandId: result.commandId, status: result.status };
     else {
-      state.retentionData = result; state.retentionDraft = {...result.settings}; state.retentionDirty = false;
-      state.retentionResult = { message:action === "reset" ? "Defaults saved as a new policy revision." : "Retention policy saved." };
+      state.retentionData = result;
+      state.retentionDraft = { ...result.settings };
+      state.retentionDirty = false;
+      state.retentionResult = {
+        message: action === "reset" ? "Defaults saved as a new policy revision." : "Retention policy saved.",
+      };
     }
     rerender();
   }
@@ -105,7 +162,9 @@
   const resetRetention = () => retentionMutation("reset");
   const runRetentionNow = () => retentionMutation("run");
 
-  function rerender() { W().paint("system", render); }
+  function rerender() {
+    W().paint("system", render);
+  }
 
   function State_section() {
     return window.NodAdminState?.section;
@@ -139,10 +198,10 @@
     main.innerHTML = `
       <div class="adm-page-head">
         <div>
-          <div class="adm-page-title">System</div>
-          <div class="adm-page-subtitle">~/admin/system · health auto-refresh 15s · retention policy editable</div>
+          <div class="adm-page-title">Система</div>
+          <div class="adm-page-subtitle">health auto-refresh 15s · retention policy editable</div>
         </div>
-        <button class="adm-btn ghost" id="admSysRefresh">↻ refresh</button>
+        <button class="adm-btn ghost" id="admSysRefresh">Обновить</button>
       </div>
 
       ${state.error ? `<div class="adm-error">${r.escapeHtml(state.error)}</div>` : ""}
@@ -151,8 +210,8 @@
         state.loading && !state.data
           ? `<div class="adm-loading">loading system status…</div>`
           : state.data
-          ? renderContent(state.data)
-          : ""
+            ? renderContent(state.data)
+            : ""
       }
 
       ${renderRetentionCard()}
@@ -164,9 +223,18 @@
     });
 
     bindRetentionEvents(main);
-    W().superOnly(main, "#admRetentionSave, #admRetentionReset, #admRetentionRun, #admRetentionReason, .adm-retention-input");
+    W().superOnly(
+      main,
+      "#admRetentionSave, #admRetentionReset, #admRetentionRun, #admRetentionReason, .adm-retention-input"
+    );
     if (!state.retentionData || state.retentionLoading || state.retentionSaving || state.retentionRunning) {
-      main.querySelectorAll("#admRetentionSave, #admRetentionReset, #admRetentionRun, #admRetentionReason, .adm-retention-input").forEach(input => { input.disabled = true; });
+      main
+        .querySelectorAll(
+          "#admRetentionSave, #admRetentionReset, #admRetentionRun, #admRetentionReason, .adm-retention-input"
+        )
+        .forEach((input) => {
+          input.disabled = true;
+        });
     }
     if (state.retentionSaving || state.retentionRunning) main.querySelector("#admRetentionReload").disabled = true;
   }
@@ -182,9 +250,10 @@
       ? `<span class="adm-pill ok no-dot">connected</span>`
       : `<span class="adm-pill crit no-dot">down</span>`;
 
-    const envPill = (ok, label) => ok
-      ? `<span class="adm-pill ok no-dot">${r.escapeHtml(label)}</span>`
-      : `<span class="adm-pill crit no-dot">missing</span>`;
+    const envPill = (ok, label) =>
+      ok
+        ? `<span class="adm-pill ok no-dot">${r.escapeHtml(label)}</span>`
+        : `<span class="adm-pill crit no-dot">missing</span>`;
 
     const formatUptime = (seconds) => {
       const s = Number(seconds || 0);
@@ -198,10 +267,10 @@
 
     return `
       <section class="adm-metric-grid">
-        ${metricCard("database",  db.ok ? `${db.latencyMs} ms` : "down", dbPill)}
-        ${metricCard("uptime",    formatUptime(srv.uptime),               `<span class="adm-pill info no-dot">node ${r.escapeHtml(srv.node || "?")}</span>`)}
-        ${metricCard("memory",    `${srv.memoryMb} MB`,                   `<span class="adm-pill muted no-dot">rss</span>`)}
-        ${metricCard("version",   srv.version || "?",                     `<span class="adm-pill ${env.nodeEnv === "production" ? "ok" : "warn"} no-dot">${r.escapeHtml(env.nodeEnv || "?")}</span>`)}
+        ${metricCard("database", db.ok ? `${db.latencyMs} ms` : "down", dbPill)}
+        ${metricCard("uptime", formatUptime(srv.uptime), `<span class="adm-pill info no-dot">node ${r.escapeHtml(srv.node || "?")}</span>`)}
+        ${metricCard("memory", `${srv.memoryMb} MB`, `<span class="adm-pill muted no-dot">rss</span>`)}
+        ${metricCard("version", srv.version || "?", `<span class="adm-pill ${env.nodeEnv === "production" ? "ok" : "warn"} no-dot">${r.escapeHtml(env.nodeEnv || "?")}</span>`)}
       </section>
 
       <div class="adm-card" style="margin-top:6px;">
@@ -209,12 +278,12 @@
           <div class="adm-card-title">Environment</div>
         </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px 24px;">
-          ${envRow("RESEND_API_KEY",            envPill(env.hasResendKey,   "set"),   "outbound email — without this verification mails come back as devVerificationCode only")}
-          ${envRow("SNAPSHOT_ENCRYPTION_KEY",   envPill(env.hasSnapshotKey, "set"),   "Server-managed encrypted credentials (AES-256-GCM).")}
-          ${envRow("JWT_SECRET",                envPill(env.jwtConfigured,   "set"),   "signs access tokens. Default 'change-me' is detected as missing.")}
-          ${envRow("PUBLIC_BASE_URL",           env.publicBaseUrl ? `<span class="adm-pill ok no-dot">${r.escapeHtml(env.publicBaseUrl)}</span>` : `<span class="adm-pill warn no-dot">not set</span>`, "used to build email URLs")}
-          ${envRow("NODE_ENV",                  `<span class="adm-pill ${env.nodeEnv === "production" ? "ok" : "warn"} no-dot">${r.escapeHtml(env.nodeEnv || "?")}</span>`, "")}
+        <div class="adm-form-grid">
+          ${envRow("RESEND_API_KEY", envPill(env.hasResendKey, "set"), "outbound email — without this verification mails come back as devVerificationCode only")}
+          ${envRow("SNAPSHOT_ENCRYPTION_KEY", envPill(env.hasSnapshotKey, "set"), "Server-managed encrypted credentials (AES-256-GCM).")}
+          ${envRow("JWT_SECRET", envPill(env.jwtConfigured, "set"), "signs access tokens. Default 'change-me' is detected as missing.")}
+          ${envRow("PUBLIC_BASE_URL", env.publicBaseUrl ? `<span class="adm-pill ok no-dot">${r.escapeHtml(env.publicBaseUrl)}</span>` : `<span class="adm-pill warn no-dot">not set</span>`, "used to build email URLs")}
+          ${envRow("NODE_ENV", `<span class="adm-pill ${env.nodeEnv === "production" ? "ok" : "warn"} no-dot">${r.escapeHtml(env.nodeEnv || "?")}</span>`, "")}
         </div>
       </div>
 
@@ -247,12 +316,51 @@
 
     const groups = [
       ["Core", ["retentionSweepWindowHours", "batchSize"]],
-      ["Team activity", ["teamIntermediateDays", "teamSessionDays", "teamNoticeDays", "teamAuditDays", "teamCanonicalDetailDays", "teamMoneyRawDetailDays"]],
-      ["Automation", ["automationDeliveryDetailedDays", "automationAggregateDays", "automationJobDoneDays", "automationEventDays", "automationTaskTrashDays"]],
-      ["Analytics", ["analyticsIngestBatchDays", "analyticsJobInstanceDays", "analyticsDemandHistoryDays", "analyticsSupersededScanProofDays", "analyticsNonEarningsJobDays", "analyticsNonEarningsIngestBatchDays", "analyticsNotificationScanAuditDays"]],
+      [
+        "Team activity",
+        [
+          "teamIntermediateDays",
+          "teamSessionDays",
+          "teamNoticeDays",
+          "teamAuditDays",
+          "teamCanonicalDetailDays",
+          "teamMoneyRawDetailDays",
+        ],
+      ],
+      [
+        "Automation",
+        [
+          "automationDeliveryDetailedDays",
+          "automationAggregateDays",
+          "automationJobDoneDays",
+          "automationEventDays",
+          "automationTaskTrashDays",
+        ],
+      ],
+      [
+        "Analytics",
+        [
+          "analyticsIngestBatchDays",
+          "analyticsJobInstanceDays",
+          "analyticsDemandHistoryDays",
+          "analyticsSupersededScanProofDays",
+          "analyticsNonEarningsJobDays",
+          "analyticsNonEarningsIngestBatchDays",
+          "analyticsNotificationScanAuditDays",
+        ],
+      ],
       ["Sessions and audit", ["refreshSessionRawHistoryDays", "auditLogDays"]],
       ["Dialog intelligence", ["dialogScanChunkDays", "dialogScanRunDays"]],
-      ["Traffic", ["trafficSourceMemberNoRevenueDays", "trafficZeroSnapshotDays", "trafficDailyAggregateDays", "trafficPaidOrganicLedgerDays", "trafficFreeOrganicCleanupHours"]],
+      [
+        "Traffic",
+        [
+          "trafficSourceMemberNoRevenueDays",
+          "trafficZeroSnapshotDays",
+          "trafficDailyAggregateDays",
+          "trafficPaidOrganicLedgerDays",
+          "trafficFreeOrganicCleanupHours",
+        ],
+      ],
     ];
 
     return `
@@ -267,7 +375,7 @@
           <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;">
             <button class="adm-btn ghost" id="admRetentionReload" ${state.retentionLoading ? "disabled" : ""}>reload</button>
             <button class="adm-btn ghost" id="admRetentionReset" ${state.retentionSaving ? "disabled" : ""}>reset defaults</button>
-            <button class="adm-btn ghost" id="admRetentionRun" ${state.retentionRunning || ["QUEUED","RUNNING"].includes(state.retentionCommand?.status) ? "disabled" : ""}>${state.retentionRunning ? "submitting…" : "queue cleanup pass"}</button>
+            <button class="adm-btn ghost" id="admRetentionRun" ${state.retentionRunning || ["QUEUED", "RUNNING"].includes(state.retentionCommand?.status) ? "disabled" : ""}>${state.retentionRunning ? "submitting…" : "queue cleanup pass"}</button>
             <button class="adm-btn" id="admRetentionSave" ${state.retentionSaving || !state.retentionDirty ? "disabled" : ""}>${state.retentionSaving ? "saving…" : "save"}</button>
           </div>
         </div>
@@ -277,14 +385,18 @@
         ${state.retentionLoading && !state.retentionData ? `<div class="adm-loading">loading retention policy…</div>` : ""}
 
         <label>Reason for change or cleanup<input class="adm-input" id="admRetentionReason" maxlength="500" value="${r.escapeAttr(state.retentionReason)}"></label>
-        ${groups.map(([title, keys]) => `
+        ${groups
+          .map(
+            ([title, keys]) => `
           <div style="margin-top:12px;">
             <div style="font-weight:700;margin-bottom:8px;color:var(--adm-text);">${r.escapeHtml(title)}</div>
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:10px;">
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(min(250px,100%),1fr));gap:10px;">
               ${keys.map((key) => retentionField(key, schema[key] || {}, draft[key])).join("")}
             </div>
           </div>
-        `).join("")}
+        `
+          )
+          .join("")}
 
         <div style="margin-top:12px;color:var(--adm-muted);font-size:12px;line-height:1.5;">
           0 is allowed only for paid organic ledger retention and means keep forever. Writes require SUPER_ADMIN.
@@ -310,24 +422,39 @@
   }
 
   function renderRetentionResult() {
-    const r = R(), command = state.retentionCommand;
+    const r = R(),
+      command = state.retentionCommand;
     const report = command?.execution?.progress?.report;
     const status = command?.status;
-    const text = status === "QUEUED" ? "Cleanup queued for the next scheduled pass, which can take up to an hour. This page checks progress automatically."
-      : status === "RUNNING" ? "Cleanup is running."
-      : status === "PARTIAL" ? "Pass finished with remaining work. Scheduled cleanup will continue."
-      : status === "FAILED" ? "Cleanup pass failed or completed only partly. Review the result before retrying."
-      : status === "CANCELLED" ? "Cleanup cancelled: administrator access or policy changed before execution."
-      : status === "SUCCEEDED" ? "Cleanup pass completed." : "";
+    const text =
+      status === "QUEUED"
+        ? "Cleanup queued for the next scheduled pass, which can take up to an hour. This page checks progress automatically."
+        : status === "RUNNING"
+          ? "Cleanup is running."
+          : status === "PARTIAL"
+            ? "Pass finished with remaining work. Scheduled cleanup will continue."
+            : status === "FAILED"
+              ? "Cleanup pass failed or completed only partly. Review the result before retrying."
+              : status === "CANCELLED"
+                ? "Cleanup cancelled: administrator access or policy changed before execution."
+                : status === "SUCCEEDED"
+                  ? "Cleanup pass completed."
+                  : "";
     return `${state.retentionResult?.message ? `<div class="adm-success">${r.escapeHtml(state.retentionResult.message)}</div>` : ""}
-      ${text ? `<div class="${["FAILED","CANCELLED"].includes(status) ? "adm-error" : "adm-muted"}" style="margin:10px 0;">${r.escapeHtml(text)}
+      ${
+        text
+          ? `<div class="${["FAILED", "CANCELLED"].includes(status) ? "adm-error" : "adm-muted"}" style="margin:10px 0;">${r.escapeHtml(text)}
       ${report ? `<div>Rows deleted in this attempt: ${Number(report.totalDeleted || 0)}. Remaining work: ${report.remainingWork ? "yes" : "no"}.</div>` : ""}
       ${command?.execution?.progress?.code ? `<div>${r.escapeHtml(command.execution.progress.code)}</div>` : ""}
-      ${report?.laneErrors?.length ? `<div>${r.escapeHtml(report.laneErrors.map(item=>`${item.lane}: ${item.error}`).join("; "))}</div>` : ""}</div>` : ""}`;
+      ${report?.laneErrors?.length ? `<div>${r.escapeHtml(report.laneErrors.map((item) => `${item.lane}: ${item.error}`).join("; "))}</div>` : ""}</div>`
+          : ""
+      }`;
   }
 
   function bindRetentionEvents(main) {
-    main.querySelector("#admRetentionReason")?.addEventListener("input", event => { state.retentionReason = event.target.value; });
+    main.querySelector("#admRetentionReason")?.addEventListener("input", (event) => {
+      state.retentionReason = event.target.value;
+    });
     main.querySelector("#admRetentionReload")?.addEventListener("click", () => loadRetention(true));
     main.querySelector("#admRetentionSave")?.addEventListener("click", saveRetention);
     main.querySelector("#admRetentionReset")?.addEventListener("click", resetRetention);

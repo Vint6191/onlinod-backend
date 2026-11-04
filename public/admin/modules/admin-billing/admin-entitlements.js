@@ -3,7 +3,7 @@
   const components = [
     ["coreValidUntil", "Core"],
     ["aiChatterValidUntil", "AI Chatter"],
-    ["outreachValidUntil", "SFS / Outreach"],
+    ["outreachValidUntil", "SFS + Comment Bot"],
   ];
   const value = (date) => (date ? new Date(date).toISOString().slice(0, 19) : "");
   function command(model, draft) {
@@ -11,6 +11,7 @@
       reason = draft.reason.trim();
     if (!reason) throw Error("Enter a reason for the access change.");
     const body = { expectedRevision: ent.entitlementRevision || 0, reason };
+    if (model.agencyId) body.expectedAgencyId = model.agencyId;
     for (const [key] of components) {
       if (draft[key] === value(ent[key])) continue;
       const date = draft[key] ? new Date(draft[key] + "Z") : null;
@@ -25,47 +26,30 @@
     return body;
   }
   function open(model, reload) {
-    const W = window.NodAdminWorkspace,
-      R = window.NodAdminRouter,
-      esc = R.escapeHtml;
-    document.querySelectorAll(".adm-modal-overlay").forEach((node) => node.remove());
-    const overlay = document.createElement("div");
-    overlay.className = "adm-modal-overlay";
-    const ent = model.entitlement || {};
-    overlay.innerHTML = `<form class="adm-modal" role="dialog" aria-modal="true" aria-label="Model access">
-      <div class="adm-modal-head"><b>Access · ${esc(model.displayName || model.creatorId)}</b><button type="button" class="adm-btn" data-close>Close</button></div>
-      <div class="adm-modal-body"><p>Dates are UTC. Clearing a date revokes that component. Untouched components keep their exact paid dates.</p>
-      <label>Access tier<select class="adm-select" name="tier">${["STARTER", "GROWTH", "PRO", "ELITE", "CUSTOM"].map((tier) => `<option ${tier === (ent.tier || model.tier || "STARTER") ? "selected" : ""}>${tier}</option>`).join("")}</select></label>
-      ${components.map(([key, label]) => `<label class="adm-field">${label} access until (UTC)<input class="adm-input" type="datetime-local" step="1" name="${key}" value="${esc(value(ent[key]))}"></label>`).join("")}
-      <label class="adm-field">Reason<input class="adm-input" name="reason" required maxlength="500"></label>
-      <button class="adm-btn primary" type="submit">Save access</button><p role="status"></p></div></form>`;
-    document.body.append(overlay);
-    const form = overlay.querySelector("form"),
-      status = form.querySelector('[role="status"]');
-    form.querySelector("[data-close]").addEventListener("click", () => overlay.remove());
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      const draft = Object.fromEntries(new FormData(form));
-      let body;
-      try {
-        body = command(model, draft);
-      } catch (error) {
-        status.textContent = error.message;
-        return;
-      }
-      void W.action(form, async (current) => {
-        const result = await window.NodAdminApi.patchCreatorEntitlement(model.creatorId, body);
-        if (!current()) return;
-        if (!result?.ok) {
-          status.textContent = result?.error || "Result unknown. Check the saved command result.";
-          return;
-        }
-        overlay.remove();
-        R.toast("Access updated", "ok");
-        await reload();
-      });
+    const UI = window.NodAdminUI,
+      esc = window.NodAdminRouter.escapeHtml,
+      ent = model.entitlement || {};
+    const { sheet, close } = UI.drawer({
+      title: "Доступ к NOD",
+      subtitle: UI.subject(model),
+      body: `
+      <form><fieldset data-draft><div class="adm-notice"><strong>Ручное изменение доступа</strong><br>Каждый компонент имеет собственный срок. Пустая дата отзывает только этот компонент. Неизменённые даты сохраняются точно.</div>
+      ${model.access?.reason === "FREE_INTERNAL" || model.access?.reason === "TRIAL" ? `<p class="adm-muted">Сейчас действует политика агентства: ${esc(model.access.reason)}. Отзыв Core не отменяет эту политику.</p>` : ""}
+      <label class="adm-field">Уровень текущего доступа<select name="tier">${["STARTER", "GROWTH", "PRO", "ELITE", "CUSTOM"].map((tier) => `<option ${tier === (ent.tier || model.tier || "STARTER") ? "selected" : ""}>${tier}</option>`).join("")}</select></label>
+      ${components.map(([key, label]) => `<label class="adm-field">${label} — доступ до (UTC)<input type="datetime-local" step="1" name="${key}" value="${esc(value(ent[key]))}"></label>`).join("")}
+      <p class="adm-muted">Ручное изменение Core отключает его автопродление. Оно не создаёт оплату. Настройки цен и следующие покупки редактируются в «Тариф и дополнения».</p>
+      <label class="adm-field">Причина изменения<textarea name="reason" rows="2" required maxlength="500"></textarea></label></fieldset>
+      <div class="adm-sticky-actions"><button class="adm-btn primary" type="submit">Сохранить доступ</button><button class="adm-btn" type="button" data-check>Проверить / обновить</button></div><p role="status" aria-live="polite"></p></form>`,
     });
-    form.querySelector('[name="reason"]').focus();
+    const form = sheet.querySelector("form");
+    UI.commandForm({
+      form,
+      close,
+      reload,
+      build: () => command(model, Object.fromEntries(new FormData(form))),
+      path: `/api/admin/creators/${encodeURIComponent(model.creatorId)}/entitlement`,
+      send: (body) => window.NodAdminApi.patchCreatorEntitlement(model.creatorId, body),
+    });
   }
   window.NodAdminEntitlements = { open, command, value };
 })();
