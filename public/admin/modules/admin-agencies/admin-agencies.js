@@ -195,7 +195,7 @@
 
         <td class="adm-cell-mono">${r.escapeHtml(ownerEmail)}</td>
 
-        <td>${u.statusPill(a.status)}${isDeleted ? `<span class="adm-pill crit no-dot" style="margin-left:6px;">deleted</span>` : ""}</td>
+        <td>${u.statusPill(a.status)}${a.subscription?.billingMode === "FREE_INTERNAL" ? ' <span class="adm-pill info no-dot">Разработка</span>' : ""}${isDeleted ? `<span class="adm-pill crit no-dot" style="margin-left:6px;">deleted</span>` : ""}</td>
 
         <td class="adm-cell-num">
           ${r.escapeHtml(String(a.counts?.readyCreators || 0))}

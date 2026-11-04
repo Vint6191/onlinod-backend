@@ -109,6 +109,7 @@
     main.innerHTML = `
       ${renderBackBar(id)}
       ${renderHeader(slice)}
+      ${window.NodAdminDevelopmentAccess.render(slice.data.agency)}
       ${renderTabStrip(slice)}
 
       <div id="admAgDetailTabBody">
@@ -118,6 +119,7 @@
 
     bindBackBar(main);
     bindHeader(main, slice);
+    window.NodAdminDevelopmentAccess.bind(main, slice.data.agency, () => load(true));
     bindTabStrip(main, slice);
     bindTabBody(main, slice, tab);
     W().superOnly(

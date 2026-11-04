@@ -22,13 +22,13 @@
   function icon(name) {
     return `<svg class="adm-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.dashboard}</svg>`;
   }
-  function drawer({ title, subtitle = "", body }) {
+  function drawer({ title, subtitle = "", body, eyebrow = "Управление моделью" }) {
     document.querySelectorAll(".adm-modal-overlay").forEach((node) => node.remove());
     const previous = document.activeElement,
       esc = window.NodAdminRouter.escapeHtml;
     const overlay = document.createElement("div");
     overlay.className = "adm-modal-overlay adm-side-overlay";
-    overlay.innerHTML = `<section class="adm-side-sheet" role="dialog" aria-modal="true" aria-labelledby="admSheetTitle" tabindex="-1"><header class="adm-modal-head"><div><p class="adm-eyebrow">Управление моделью</p><h2 id="admSheetTitle">${esc(title)}</h2></div><button type="button" class="adm-btn ghost adm-icon-btn" data-sheet-close aria-label="Закрыть">${icon("close")}</button></header><div class="adm-sheet-context">${subtitle}</div><div class="adm-sheet-body">${body}</div></section>`;
+    overlay.innerHTML = `<section class="adm-side-sheet" role="dialog" aria-modal="true" aria-labelledby="admSheetTitle" tabindex="-1"><header class="adm-modal-head"><div><p class="adm-eyebrow">${esc(eyebrow)}</p><h2 id="admSheetTitle">${esc(title)}</h2></div><button type="button" class="adm-btn ghost adm-icon-btn" data-sheet-close aria-label="Закрыть">${icon("close")}</button></header><div class="adm-sheet-context">${subtitle}</div><div class="adm-sheet-body">${body}</div></section>`;
     document.body.append(overlay);
     const sheet = overlay.querySelector(".adm-side-sheet");
     const close = () => {

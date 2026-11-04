@@ -224,6 +224,7 @@ router.get("/agency/:id", async (req, res) => {
         currentPeriodEnd: activeUntil,
         trialEndsAt: agency.trialEndsAt,
         billingMode,
+        billingPolicyRevision: agency.billingPolicyRevision,
         billingSupportHold: agency.billingSupportHold,
         billingSupportHoldReason: agency.billingSupportHoldReason,
       },

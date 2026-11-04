@@ -127,6 +127,15 @@ function response(url, method, body, headers) {
       recentSignups: [],
     };
   if (p === "/api/admin/agencies") return { ok: true, agencies };
+  if (/^\/api\/admin\/agencies\/[^/]+\/subscription$/.test(p) && method === 'PATCH') {
+    const agency = agencies.find(a => a.id === p.split('/').at(-2)), commandId = headers['idempotency-key'];
+    if (receipts.has(commandId)) return receipts.get(commandId).result;
+    assert.equal(agency.billingPolicyRevision,body.expectedRevision);
+    assert.deepEqual(Object.keys(body).sort(),['billingMode','expectedRevision','reason']);
+    agency.billingPolicyRevision++;agency.billingMode=body.billingMode;agency.subscriptions[0].billingMode=body.billingMode;
+    const result = {ok:true,commandId,policy:{agencyId:agency.id,billingMode:body.billingMode,revision:agency.billingPolicyRevision}};
+    report.mutations.push({path:p,body,commandId});receipts.set(commandId,{ok:true,status:'SUCCEEDED',result});return result;
+  }
   if (p.startsWith("/api/admin/agencies/"))
     return { ok: true, agency: agencies.find((a) => a.id === p.split("/").at(-1)), health: { score: 100, issues: [] } };
   if (p === "/api/admin/billing/tiers")
@@ -311,6 +320,20 @@ const server = http.createServer(async (req, res) => {
     };
     await go("agencies/agency-a");
     await page.waitForSelector('tr[data-creator="c1"]');
+    const originalEntitlements = structuredClone(models.map(m => m.entitlement));
+    assert.equal(await page.locator('[data-development-toggle]:visible').count(),1);
+    await page.getByRole('button',{name:'Включить режим разработки',exact:true}).click();
+    await page.getByRole('button',{name:'Включить для агентства',exact:true}).click();
+    await page.getByRole('button',{name:'Выключить режим разработки',exact:true}).waitFor();
+    assert.equal(agencies[0].billingMode,'FREE_INTERNAL');assert.equal(agencies[1].billingMode,'MANUAL');
+    await go('billing/agency-a');await page.getByRole('button',{name:'Выключить режим разработки',exact:true}).click();
+    assert.equal(await page.locator('[name=returnMode]').inputValue(),'');
+    await page.selectOption('[name=returnMode]','MANUAL');await page.fill('[name=reason]','End internal beta');
+    await page.getByRole('button',{name:'Выключить для агентства',exact:true}).click();
+    await page.getByRole('button',{name:'Включить режим разработки',exact:true}).waitFor();
+    assert.equal(agencies[0].billingMode,'MANUAL');assert.deepEqual(models.map(m=>m.entitlement),originalEntitlements);
+    report.cases.push('Development toggle visible from default agency and billing; explicit enable/disable stays scoped and preserves all model periods');
+    await go('agencies/agency-a');await page.waitForSelector('tr[data-creator="c1"]');
     assert.equal(await page.locator("tr[data-creator]").count(), 5);
     assert.equal(await page.locator('[data-agtab="creators"]').getAttribute("aria-pressed"), "true");
     assert.equal(await page.locator("[data-tier]").count(), 5);

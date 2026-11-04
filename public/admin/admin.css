@@ -1560,3 +1560,7 @@ details.adm-card[open] > summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+.adm-development { display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:0 0 18px;padding:14px 16px;border:1px solid var(--adm-line-strong);border-radius:10px;background:var(--adm-panel); }
+.adm-development-title { display:flex;align-items:center;gap:9px; }
+.adm-development p {margin:4px 0 0;color:var(--adm-muted);font-size:11px;}

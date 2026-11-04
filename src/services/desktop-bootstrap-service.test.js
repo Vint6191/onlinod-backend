@@ -200,3 +200,16 @@ test("accessEpoch bumps atomically at member and agency scope", async () => {
   assert.deepEqual(calls[1][1].where, { agencyId: "agency-1", deletedAt: null, deactivatedAt: null });
   assert.deepEqual(calls[1][1].data, { accessEpoch: { increment: 1 } });
 });
+
+test('Desktop receives the reason for this model at database time; admission codes and deadlines remain unchanged',async()=>{
+ const at=new Date('2026-11-04T00:00:00Z'),before=new Date(+at-1000),after=new Date(+at+5000);
+ const facts={expired:{coreValidFrom:before,coreValidUntil:at},never:{},trial:{coreValidUntil:before,trialEndsAt:at},future:{coreValidFrom:after,coreValidUntil:new Date(+after+5000)},internal:{billingMode:'FREE_INTERNAL',coreValidUntil:before},held:{billingMode:'FREE_INTERNAL',billingSupportHold:true,trialEndsAt:before},paid:{coreValidUntil:after,trialEndsAt:before},liveTrial:{coreValidUntil:before,trialEndsAt:after},invalid:{coreValidFrom:'bad',coreValidUntil:before}};
+ const f=fixture(Object.keys(facts).map(id=>creator(id)));let reads=0;
+ f.db.$queryRawUnsafe=async(sql,agency,ids)=>{assert.match(sql,/FROM "Agency" a CROSS JOIN clock/);assert.equal(agency,'agency-1');reads++;return ids.map(creatorId=>({creatorId,billingMode:'MANUAL',authorityNow:at,...facts[creatorId]}));};
+ const {authorization:{billing}}=await buildDesktopBootstrap({db:commitDatabaseFixture(f.db),agencyId:'agency-1',userId:'user-1',deviceId:'device-a',member:{id:'member-1',role:'OWNER',roleKey:'owner',accessEpoch:12}});
+ assert.equal(reads,1);const rows=Object.fromEntries(billing.creators.map(c=>[c.creatorId,c]));
+ for(const [id,detail] of [['expired','CORE_EXPIRED'],['trial','TRIAL_EXPIRED'],['future','PERIOD_NOT_STARTED'],['never',undefined],['invalid',undefined]]){
+   assert.equal(rows[id].denialDetail,detail);assert.equal(rows[id].reason,'CREATOR_SUBSCRIPTION_REQUIRED');assert.equal(rows[id].allowed,false);assert.equal(rows[id].validForMs,0);
+ }
+ for(const [id,reason] of [['internal','FREE_INTERNAL'],['held','BILLING_ACCESS_HELD'],['paid','PAID'],['liveTrial','TRIAL']]){assert.equal(rows[id].reason,reason);assert.equal(rows[id].denialDetail,undefined);assert.equal(rows[id].allowed,id!=='held');}
+});

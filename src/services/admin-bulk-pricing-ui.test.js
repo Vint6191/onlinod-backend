@@ -11,7 +11,9 @@ async function ui({count=2,tier="PRO",price="",selected=[0],storedId=null,status
  const currentStatus=status || {ok:true,status:"QUEUED",execution:{progress:{total:selected.length,nextIndex:0,succeeded:0,rejected:0,skipped:0,outcomes:[]},workState:"READY"}};
  const window={NodAdminRouter:{escapeHtml:v=>String(v??""),toast:(...x)=>toasts.push(x)},NodAdminApi:{billingAgency:async()=>({ok:true,agency:{id:"a",name:"A",status:"ACTIVE"},models,tiers:{PRO:{label:"Pro",priceCents:5000},CUSTOM:{label:"Custom",priceCents:null}}}),billingApplyTier:async(id,body)=>{calls.push({id,body});return {ok:true,accepted:true,commandId:"accepted-id"};},commandStatus:async()=>currentStatus}};
  const source=fs.readFileSync(path.join(__dirname,"../../public/admin/modules/admin-billing/admin-billing.js"),"utf8").replace("window.NodAdminBilling = { render };","window.NodAdminBilling = { renderAgency };");
- vm.runInNewContext(source,require("../../scripts/test-support/admin-browser-fixture.cjs").workspace({window,confirm:()=>true,sessionStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)}}));
+ const sandbox=require("../../scripts/test-support/admin-browser-fixture.cjs").workspace({window,confirm:()=>true,sessionStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)}});
+ vm.runInNewContext(fs.readFileSync(require.resolve('../../public/admin/modules/admin-billing/admin-development-access.js'),'utf8'),sandbox);
+ vm.runInNewContext(source,sandbox);
  await window.NodAdminBilling.renderAgency(main,"a");
  return {calls,toasts,elements,storage,click:id=>elements[id].handlers.click(),main};
 }

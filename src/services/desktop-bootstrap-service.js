@@ -171,6 +171,7 @@ async function buildDesktopBootstrap({ db, agencyId, userId, member, deviceId })
   const billing = { version: 1, validForMs: 90_000, creators: creators.map(c => {
     const state = billingAccess.get(c.id);
     return { creatorId: c.id, allowed: state?.allowed === true, reason: state?.reason || "BILLING_CREATOR_NOT_FOUND",
+      ...(state?.allowed === false && state.denialDetail ? { denialDetail: state.denialDetail } : {}),
       validForMs: state?.allowed ? Math.max(0, Math.min(90_000, state.validUntil ? state.validUntil.getTime() - state.now.getTime() : 90_000)) : 0 };
   }) };
   return {

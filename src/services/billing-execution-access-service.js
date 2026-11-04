@@ -26,6 +26,20 @@ const ACCESS_SQL = `WITH clock AS MATERIALIZED (SELECT clock_timestamp() AT TIME
  LEFT JOIN "CreatorBillingEntitlement" e ON e."creatorId"=c."id" AND e."agencyId"=a."id"
  WHERE a."id"=$1 AND c."id"=ANY($2::text[])`;
 
+// Optional explanation for the Desktop. Admission always uses `allowed` and the
+// canonical reason. Only dates already read for this creator at DB time count.
+function deniedPeriodDetail(row, now) {
+  const finiteDate = value => value instanceof Date && Number.isFinite(+value);
+  const end = finiteDate(row.coreValidUntil) ? +row.coreValidUntil : null;
+  const start = finiteDate(row.coreValidFrom) ? +row.coreValidFrom : null;
+  const trial = finiteDate(row.trialEndsAt) ? +row.trialEndsAt : null;
+  if (end !== null && start !== null && start > +now && end > start) return "PERIOD_NOT_STARTED";
+  // A trial can outlast a previous model period. Name the access that ended last.
+  if (end !== null && end <= +now && (row.coreValidFrom == null || (start !== null && start <= end)) && (trial === null || end >= trial)) return "CORE_EXPIRED";
+  if (trial !== null && trial <= +now) return "TRIAL_EXPIRED";
+  return null;
+}
+
 function accessFromRow(row) {
   const now = row?.authorityNow;
   if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
@@ -36,7 +50,8 @@ function accessFromRow(row) {
   const trial = row.trialEndsAt instanceof Date && row.trialEndsAt > now ? row.trialEndsAt : null;
   const paid = activeCore(row, now) ? row.coreValidUntil : null;
   const validUntil = trial && paid ? new Date(Math.max(trial.getTime(), paid.getTime())) : trial || paid;
-  return { allowed: !!validUntil, recoverable: true, reason: validUntil ? (paid ? "PAID" : "TRIAL") : "CREATOR_SUBSCRIPTION_REQUIRED", now, validUntil };
+  const denialDetail = validUntil ? null : deniedPeriodDetail(row, now);
+  return { allowed: !!validUntil, recoverable: true, reason: validUntil ? (paid ? "PAID" : "TRIAL") : "CREATOR_SUBSCRIPTION_REQUIRED", now, validUntil, ...(denialDetail ? { denialDetail } : {}) };
 }
 
 async function readBillingExecutionAccess({ db, agencyId, creatorIds }) {
