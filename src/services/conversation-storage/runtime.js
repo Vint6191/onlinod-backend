@@ -65,6 +65,7 @@ class ConversationRuntime {
     this.analysis = new CrmAnalysisService(this.crm, this.dialogs, this.relay);
     this.changes = new DialogChanges(this.dialogs, core);
     this.health = new Map();
+    this.healthReads = new Map();
     this.capacities = new Map();
     this.capacityReads = new Map();
     this.pumpBusy = false;
@@ -72,8 +73,13 @@ class ConversationRuntime {
   async check(domain) {
     const now = Date.now();
     if (now - (this.health.get(domain) || 0) < 30000) return;
-    await ready(this.db[domain], domain);
-    this.health.set(domain, now);
+    let pending = this.healthReads.get(domain);
+    if (!pending) {
+      pending = ready(this.db[domain], domain).then(() => { this.health.set(domain, Date.now()); });
+      this.healthReads.set(domain, pending);
+      void pending.finally(() => { if (this.healthReads.get(domain) === pending) this.healthReads.delete(domain); }).catch(() => undefined);
+    }
+    return pending;
   }
   async capacity(domain) {
     const max = Number(process.env.CONVERSATION_BRANCH_MAX_BYTES || 850000000);

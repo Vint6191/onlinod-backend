@@ -1,16 +1,21 @@
 "use strict";
 const { URL } = require("node:url");
-const { check, one } = require("./common");
+const { check, fail } = require("./common");
+const { verify } = require("./schema-contract");
 let clients;
 function address(raw) {
-  const u = new URL(raw);
-  check(
-    !u.searchParams.get("schema") || u.searchParams.get("schema") === "public",
-    "CONVERSATION_PUBLIC_SCHEMA_REQUIRED",
-    503
-  );
-  check(["postgres:", "postgresql:"].includes(u.protocol), "CONVERSATION_DATABASE_URL_INVALID", 503);
-  return `${u.hostname.replace("-pooler.", ".")}:${u.port || "5432"}${u.pathname}`;
+  let u, database;
+  try { u = new URL(raw); database = u.pathname.slice(1); }
+  catch { throw fail("CONVERSATION_DATABASE_URL_INVALID", 503); }
+  check(["postgres:", "postgresql:"].includes(u.protocol) && u.hostname && database,
+    "CONVERSATION_DATABASE_URL_INVALID", 503);
+  check(!u.searchParams.getAll("schema").some((schema) => schema && schema !== "public"),
+    "CONVERSATION_PUBLIC_SCHEMA_REQUIRED", 503);
+  // Prisma 5.22 uses the database pathname verbatim: /store and /%73tore
+  // can select different databases. Fold DNS case, but do not decode or rewrite
+  // the database component or the URL passed to Prisma.
+  return JSON.stringify({ host: u.hostname.toLowerCase().replace("-pooler.", "."),
+    port: u.port || "5432", database, schema: "public" });
 }
 function configuration(env = process.env) {
   const dialogs = env.DIALOGS_DATABASE_URL,
@@ -38,8 +43,9 @@ function getDatabases() {
   return clients;
 }
 async function ready(db, domain) {
-  const row = await one(db, "SELECT version FROM conversation_schema_version WHERE domain=$1", domain);
-  check(row?.version === 1, "CONVERSATION_DATABASE_MIGRATION_REQUIRED", 503);
+  // ConversationRuntime.check owns the bounded 30-second readiness cache and
+  // coalesces concurrent checks. This verifier always inspects the real store.
+  return verify(db, domain);
 }
 function databaseShutdownPort(core, currentStores = () => clients) {
   return {

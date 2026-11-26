@@ -1,0 +1,3248 @@
+{
+  "version": 1,
+  "domains": {
+    "dialogs": {
+      "sourceChecksum": "fa1798433de5c00df291863304b0de0bfc7358fc5b49bceec8f59ac9e78eb9e5",
+      "catalog": {
+        "rules": [],
+        "tables": [
+          {
+            "kind": "r",
+            "name": "conversation_schema_version",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "dialog_archive_day",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "dialog_archive_debt",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "dialog_archive_message",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "dialog_archive_outbox",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "dialog_archive_page",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "dialog_archive_receipt",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "dialog_archive_scope",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "dialog_archive_thread",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          }
+        ],
+        "columns": [
+          {
+            "name": "checksum",
+            "type": "text",
+            "table": "conversation_schema_version",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "domain",
+            "type": "text",
+            "table": "conversation_schema_version",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "version",
+            "type": "integer",
+            "table": "conversation_schema_version",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "day",
+            "type": "date",
+            "table": "dialog_archive_day",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "dialog_id",
+            "type": "text",
+            "table": "dialog_archive_day",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "incoming",
+            "type": "bigint",
+            "table": "dialog_archive_day",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "media",
+            "type": "bigint",
+            "table": "dialog_archive_day",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "offered_cents",
+            "type": "bigint",
+            "table": "dialog_archive_day",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "outgoing",
+            "type": "bigint",
+            "table": "dialog_archive_day",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "ppv_opened",
+            "type": "bigint",
+            "table": "dialog_archive_day",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "ppv_sent",
+            "type": "bigint",
+            "table": "dialog_archive_day",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "purchased_cents",
+            "type": "bigint",
+            "table": "dialog_archive_day",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "dialog_archive_day",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "attempts",
+            "type": "integer",
+            "table": "dialog_archive_debt",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "completed",
+            "type": "bigint",
+            "table": "dialog_archive_debt",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "desired",
+            "type": "bigint",
+            "table": "dialog_archive_debt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "dialog_id",
+            "type": "text",
+            "table": "dialog_archive_debt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "lease_device",
+            "type": "text",
+            "table": "dialog_archive_debt",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "next_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_debt",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "owner",
+            "type": "text",
+            "table": "dialog_archive_debt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "reason",
+            "type": "text",
+            "table": "dialog_archive_debt",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "receipt_id",
+            "type": "text",
+            "table": "dialog_archive_debt",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "dialog_archive_debt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "status",
+            "type": "text",
+            "table": "dialog_archive_debt",
+            "default": "'WAITING'::text",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "canonical_opened",
+            "type": "boolean",
+            "table": "dialog_archive_message",
+            "default": "false",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "canonical_revision",
+            "type": "bigint",
+            "table": "dialog_archive_message",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "changed_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "content_hash",
+            "type": "text",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "data",
+            "type": "jsonb",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "dialog_id",
+            "type": "text",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "first_seen_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_message",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "message_id",
+            "type": "text",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "platform_author_id",
+            "type": "text",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "platform_creator_id",
+            "type": "text",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "platform_fan_id",
+            "type": "text",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "price_cents",
+            "type": "bigint",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "provider_observed_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "provider_opened",
+            "type": "boolean",
+            "table": "dialog_archive_message",
+            "default": "false",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "revision",
+            "type": "bigint",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "sender",
+            "type": "text",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "storage_bytes",
+            "type": "integer",
+            "table": "dialog_archive_message",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "acknowledged_revision",
+            "type": "bigint",
+            "table": "dialog_archive_outbox",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "attempts",
+            "type": "integer",
+            "table": "dialog_archive_outbox",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "dialog_id",
+            "type": "text",
+            "table": "dialog_archive_outbox",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "retry_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_outbox",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "revision",
+            "type": "bigint",
+            "table": "dialog_archive_outbox",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "rewrite_revision",
+            "type": "bigint",
+            "table": "dialog_archive_outbox",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "dialog_archive_outbox",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_page",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "cursor",
+            "type": "text",
+            "table": "dialog_archive_page",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "dialog_id",
+            "type": "text",
+            "table": "dialog_archive_page",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "episode",
+            "type": "text",
+            "table": "dialog_archive_page",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "known_page",
+            "type": "integer",
+            "table": "dialog_archive_page",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "next_cursor",
+            "type": "text",
+            "table": "dialog_archive_page",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "request_hash",
+            "type": "text",
+            "table": "dialog_archive_page",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "result",
+            "type": "jsonb",
+            "table": "dialog_archive_page",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "dialog_archive_page",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "command_id",
+            "type": "text",
+            "table": "dialog_archive_receipt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "expires_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_receipt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "request_hash",
+            "type": "text",
+            "table": "dialog_archive_receipt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "result",
+            "type": "jsonb",
+            "table": "dialog_archive_receipt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "dialog_archive_receipt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "agency_id",
+            "type": "text",
+            "table": "dialog_archive_scope",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "collection_from",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_scope",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_scope",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "epoch",
+            "type": "text",
+            "table": "dialog_archive_scope",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "inventory_complete",
+            "type": "boolean",
+            "table": "dialog_archive_scope",
+            "default": "false",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "platform",
+            "type": "text",
+            "table": "dialog_archive_scope",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "platform_creator_id",
+            "type": "text",
+            "table": "dialog_archive_scope",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "quota_bytes",
+            "type": "bigint",
+            "table": "dialog_archive_scope",
+            "default": "200000000",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "relay_lease_until",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_scope",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "relay_next_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_scope",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "relay_pending",
+            "type": "boolean",
+            "table": "dialog_archive_scope",
+            "default": "false",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "relay_token",
+            "type": "text",
+            "table": "dialog_archive_scope",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "revision",
+            "type": "bigint",
+            "table": "dialog_archive_scope",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "dialog_archive_scope",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "status",
+            "type": "text",
+            "table": "dialog_archive_scope",
+            "default": "'ACTIVE'::text",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "used_bytes",
+            "type": "bigint",
+            "table": "dialog_archive_scope",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "collector_device",
+            "type": "text",
+            "table": "dialog_archive_thread",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "collector_token",
+            "type": "text",
+            "table": "dialog_archive_thread",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "collector_until",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_thread",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "dialog_id",
+            "type": "text",
+            "table": "dialog_archive_thread",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "platform_fan_id",
+            "type": "text",
+            "table": "dialog_archive_thread",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "revision",
+            "type": "bigint",
+            "table": "dialog_archive_thread",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "rewrite_revision",
+            "type": "bigint",
+            "table": "dialog_archive_thread",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "dialog_archive_thread",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "state",
+            "type": "jsonb",
+            "table": "dialog_archive_thread",
+            "default": "'{}'::jsonb",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "stats",
+            "type": "jsonb",
+            "table": "dialog_archive_thread",
+            "default": "'{}'::jsonb",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "updated_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_thread",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "upper_at",
+            "type": "timestamp with time zone",
+            "table": "dialog_archive_thread",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "upper_id",
+            "type": "text",
+            "table": "dialog_archive_thread",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          }
+        ],
+        "indexes": [
+          {
+            "keys": [
+              "domain"
+            ],
+            "name": "conversation_schema_version_pkey",
+            "ready": true,
+            "table": "conversation_schema_version",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0",
+            "keyCount": 1,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "day",
+              "dialog_id"
+            ],
+            "name": "dialog_archive_day_pkey",
+            "ready": true,
+            "table": "dialog_archive_day",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "next_at",
+              "dialog_id",
+              "owner"
+            ],
+            "name": "dialog_archive_debt_due",
+            "ready": true,
+            "table": "dialog_archive_debt",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0 0",
+            "keyCount": 4,
+            "predicate": "((desired > completed) AND (status <> 'STOPPED'::text))",
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "dialog_id",
+              "owner"
+            ],
+            "name": "dialog_archive_debt_pkey",
+            "ready": true,
+            "table": "dialog_archive_debt",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "dialog_id",
+              "created_at",
+              "length(message_id)",
+              "message_id"
+            ],
+            "name": "dialog_archive_creator_reply",
+            "ready": true,
+            "table": "dialog_archive_message",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 3 3 3",
+            "keyCount": 5,
+            "predicate": "(sender = 'creator'::text)",
+            "expressions": "length(message_id)"
+          },
+          {
+            "keys": [
+              "((data -> 'mediaIds'::text))"
+            ],
+            "name": "dialog_archive_media_asset",
+            "ready": true,
+            "table": "dialog_archive_message",
+            "valid": true,
+            "method": "gin",
+            "unique": false,
+            "options": "0",
+            "keyCount": 1,
+            "predicate": "(sender = 'creator'::text)",
+            "expressions": "(data -> 'mediaIds'::text)"
+          },
+          {
+            "keys": [
+              "scope_id",
+              "dialog_id",
+              "message_id"
+            ],
+            "name": "dialog_archive_media_page",
+            "ready": true,
+            "table": "dialog_archive_message",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": "((sender = 'creator'::text) AND ((data -> 'mediaIds'::text) <> '[]'::jsonb))",
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "created_at",
+              "message_id",
+              "dialog_id"
+            ],
+            "name": "dialog_archive_message_creator_time",
+            "ready": true,
+            "table": "dialog_archive_message",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0 0",
+            "keyCount": 4,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "first_seen_at",
+              "dialog_id",
+              "message_id"
+            ],
+            "name": "dialog_archive_message_first_seen",
+            "ready": true,
+            "table": "dialog_archive_message",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0 0",
+            "keyCount": 4,
+            "predicate": "(sender = 'user'::text)",
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "dialog_id",
+              "created_at",
+              "length(message_id)",
+              "message_id"
+            ],
+            "name": "dialog_archive_message_page",
+            "ready": true,
+            "table": "dialog_archive_message",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0 0 0",
+            "keyCount": 5,
+            "predicate": null,
+            "expressions": "length(message_id)"
+          },
+          {
+            "keys": [
+              "scope_id",
+              "dialog_id",
+              "message_id"
+            ],
+            "name": "dialog_archive_message_pkey",
+            "ready": true,
+            "table": "dialog_archive_message",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "retry_at",
+              "scope_id",
+              "dialog_id"
+            ],
+            "name": "dialog_archive_outbox_due",
+            "ready": true,
+            "table": "dialog_archive_outbox",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": "(revision > acknowledged_revision)",
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "dialog_id"
+            ],
+            "name": "dialog_archive_outbox_pkey",
+            "ready": true,
+            "table": "dialog_archive_outbox",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "retry_at",
+              "dialog_id"
+            ],
+            "name": "dialog_archive_outbox_scope_due",
+            "ready": true,
+            "table": "dialog_archive_outbox",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": "(revision > acknowledged_revision)",
+            "expressions": null
+          },
+          {
+            "keys": [
+              "created_at",
+              "scope_id",
+              "dialog_id"
+            ],
+            "name": "dialog_archive_page_expiry",
+            "ready": true,
+            "table": "dialog_archive_page",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "dialog_id",
+              "episode",
+              "cursor"
+            ],
+            "name": "dialog_archive_page_pkey",
+            "ready": true,
+            "table": "dialog_archive_page",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0 0 0",
+            "keyCount": 4,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "created_at",
+              "dialog_id"
+            ],
+            "name": "dialog_archive_page_scope_expiry",
+            "ready": true,
+            "table": "dialog_archive_page",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "expires_at",
+              "scope_id",
+              "command_id"
+            ],
+            "name": "dialog_archive_receipt_expiry",
+            "ready": true,
+            "table": "dialog_archive_receipt",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "command_id"
+            ],
+            "name": "dialog_archive_receipt_pkey",
+            "ready": true,
+            "table": "dialog_archive_receipt",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "expires_at",
+              "command_id"
+            ],
+            "name": "dialog_archive_receipt_scope_expiry",
+            "ready": true,
+            "table": "dialog_archive_receipt",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "agency_id",
+              "platform",
+              "platform_creator_id"
+            ],
+            "name": "dialog_archive_scope_agency_id_platform_platform_creator_id_key",
+            "ready": true,
+            "table": "dialog_archive_scope",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id"
+            ],
+            "name": "dialog_archive_scope_pkey",
+            "ready": true,
+            "table": "dialog_archive_scope",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0",
+            "keyCount": 1,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "relay_next_at",
+              "scope_id"
+            ],
+            "name": "dialog_archive_scope_relay",
+            "ready": true,
+            "table": "dialog_archive_scope",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": "relay_pending",
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "updated_at",
+              "dialog_id"
+            ],
+            "name": "dialog_archive_thread_due",
+            "ready": true,
+            "table": "dialog_archive_thread",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "dialog_id"
+            ],
+            "name": "dialog_archive_thread_pkey",
+            "ready": true,
+            "table": "dialog_archive_thread",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          }
+        ],
+        "triggers": [],
+        "constraints": [
+          {
+            "name": "conversation_schema_version_pkey",
+            "type": "p",
+            "table": "conversation_schema_version",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (domain)",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_day_pkey",
+            "type": "p",
+            "table": "dialog_archive_day",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, day, dialog_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_day_scope_id_fkey",
+            "type": "f",
+            "table": "dialog_archive_day",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "dialog_archive_scope",
+              "schema": "public",
+              "columns": [
+                "scope_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id"
+              ]
+            }
+          },
+          {
+            "name": "dialog_archive_debt_pkey",
+            "type": "p",
+            "table": "dialog_archive_debt",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, dialog_id, owner)",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_debt_scope_id_dialog_id_fkey",
+            "type": "f",
+            "table": "dialog_archive_debt",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "dialog_archive_thread",
+              "schema": "public",
+              "columns": [
+                "scope_id",
+                "dialog_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id",
+                "dialog_id"
+              ]
+            }
+          },
+          {
+            "name": "dialog_archive_message_pkey",
+            "type": "p",
+            "table": "dialog_archive_message",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, dialog_id, message_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_message_price_cents_check",
+            "type": "c",
+            "table": "dialog_archive_message",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "CHECK ((price_cents >= 0))",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_message_scope_id_dialog_id_fkey",
+            "type": "f",
+            "table": "dialog_archive_message",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "dialog_archive_thread",
+              "schema": "public",
+              "columns": [
+                "scope_id",
+                "dialog_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id",
+                "dialog_id"
+              ]
+            }
+          },
+          {
+            "name": "dialog_archive_message_sender_check",
+            "type": "c",
+            "table": "dialog_archive_message",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "CHECK ((sender = ANY (ARRAY['creator'::text, 'user'::text])))",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_message_storage_bytes_check",
+            "type": "c",
+            "table": "dialog_archive_message",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "CHECK ((storage_bytes >= 0))",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_outbox_pkey",
+            "type": "p",
+            "table": "dialog_archive_outbox",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, dialog_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_outbox_scope_id_dialog_id_fkey",
+            "type": "f",
+            "table": "dialog_archive_outbox",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "dialog_archive_thread",
+              "schema": "public",
+              "columns": [
+                "scope_id",
+                "dialog_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id",
+                "dialog_id"
+              ]
+            }
+          },
+          {
+            "name": "dialog_archive_page_pkey",
+            "type": "p",
+            "table": "dialog_archive_page",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, dialog_id, episode, cursor)",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_page_scope_id_dialog_id_fkey",
+            "type": "f",
+            "table": "dialog_archive_page",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "dialog_archive_thread",
+              "schema": "public",
+              "columns": [
+                "scope_id",
+                "dialog_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id",
+                "dialog_id"
+              ]
+            }
+          },
+          {
+            "name": "dialog_archive_receipt_pkey",
+            "type": "p",
+            "table": "dialog_archive_receipt",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, command_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_receipt_scope_id_fkey",
+            "type": "f",
+            "table": "dialog_archive_receipt",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "dialog_archive_scope",
+              "schema": "public",
+              "columns": [
+                "scope_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id"
+              ]
+            }
+          },
+          {
+            "name": "dialog_archive_scope_agency_id_platform_platform_creator_id_key",
+            "type": "u",
+            "table": "dialog_archive_scope",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "UNIQUE (agency_id, platform, platform_creator_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_scope_pkey",
+            "type": "p",
+            "table": "dialog_archive_scope",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_scope_platform_check",
+            "type": "c",
+            "table": "dialog_archive_scope",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "CHECK ((platform = 'onlyfans'::text))",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_scope_quota_bytes_check",
+            "type": "c",
+            "table": "dialog_archive_scope",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "CHECK ((quota_bytes > 0))",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_scope_used_bytes_check",
+            "type": "c",
+            "table": "dialog_archive_scope",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "CHECK ((used_bytes >= 0))",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_thread_pkey",
+            "type": "p",
+            "table": "dialog_archive_thread",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, dialog_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "dialog_archive_thread_scope_id_fkey",
+            "type": "f",
+            "table": "dialog_archive_thread",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "dialog_archive_scope",
+              "schema": "public",
+              "columns": [
+                "scope_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id"
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "crm": {
+      "sourceChecksum": "83c529446643bf6c008f8416154810ed362a62c32e9fb2f4296521127eaefbd1",
+      "catalog": {
+        "rules": [],
+        "tables": [
+          {
+            "kind": "r",
+            "name": "conversation_schema_version",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "crm_analysis_chunk",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "crm_analysis_run",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "crm_analysis_work",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "crm_audit",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "crm_command_receipt",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "crm_note",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "crm_profile",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "crm_reply_run",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          },
+          {
+            "kind": "r",
+            "name": "crm_scope",
+            "persistence": "p",
+            "rowSecurity": false,
+            "forceRowSecurity": false
+          }
+        ],
+        "columns": [
+          {
+            "name": "checksum",
+            "type": "text",
+            "table": "conversation_schema_version",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "domain",
+            "type": "text",
+            "table": "conversation_schema_version",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "version",
+            "type": "integer",
+            "table": "conversation_schema_version",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "page_hash",
+            "type": "text",
+            "table": "crm_analysis_chunk",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "page_number",
+            "type": "integer",
+            "table": "crm_analysis_chunk",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "run_id",
+            "type": "text",
+            "table": "crm_analysis_chunk",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "summary",
+            "type": "jsonb",
+            "table": "crm_analysis_chunk",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "base_messages",
+            "type": "bigint",
+            "table": "crm_analysis_run",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "completed_messages",
+            "type": "bigint",
+            "table": "crm_analysis_run",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "completed_pages",
+            "type": "integer",
+            "table": "crm_analysis_run",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "config",
+            "type": "jsonb",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "context",
+            "type": "jsonb",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp with time zone",
+            "table": "crm_analysis_run",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "cursor",
+            "type": "jsonb",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "fan_id",
+            "type": "text",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "final",
+            "type": "jsonb",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "generation",
+            "type": "bigint",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "input",
+            "type": "jsonb",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "input_done",
+            "type": "boolean",
+            "table": "crm_analysis_run",
+            "default": "false",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "lease_actor",
+            "type": "text",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "lease_device",
+            "type": "text",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "lease_token",
+            "type": "text",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "lease_until",
+            "type": "timestamp with time zone",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "pending",
+            "type": "jsonb",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "persona_revision",
+            "type": "bigint",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "reduction_through",
+            "type": "integer",
+            "table": "crm_analysis_run",
+            "default": "'-1'::integer",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "result",
+            "type": "jsonb",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "run_id",
+            "type": "text",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "state",
+            "type": "text",
+            "table": "crm_analysis_run",
+            "default": "'RUNNING'::text",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "summary",
+            "type": "jsonb",
+            "table": "crm_analysis_run",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "updated_at",
+            "type": "timestamp with time zone",
+            "table": "crm_analysis_run",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "active_run_id",
+            "type": "text",
+            "table": "crm_analysis_work",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "allow_prefix",
+            "type": "boolean",
+            "table": "crm_analysis_work",
+            "default": "true",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "config",
+            "type": "jsonb",
+            "table": "crm_analysis_work",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "failures",
+            "type": "integer",
+            "table": "crm_analysis_work",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "fan_id",
+            "type": "text",
+            "table": "crm_analysis_work",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "generation",
+            "type": "bigint",
+            "table": "crm_analysis_work",
+            "default": "1",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "lane",
+            "type": "integer",
+            "table": "crm_analysis_work",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "last_error",
+            "type": "text",
+            "table": "crm_analysis_work",
+            "default": "''::text",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "next_run_at",
+            "type": "timestamp with time zone",
+            "table": "crm_analysis_work",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "crm_analysis_work",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "state",
+            "type": "text",
+            "table": "crm_analysis_work",
+            "default": "'READY'::text",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "actor_id",
+            "type": "text",
+            "table": "crm_audit",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp with time zone",
+            "table": "crm_audit",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "fan_id",
+            "type": "text",
+            "table": "crm_audit",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "fields",
+            "type": "jsonb",
+            "table": "crm_audit",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "id",
+            "type": "text",
+            "table": "crm_audit",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "kind",
+            "type": "text",
+            "table": "crm_audit",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "revision",
+            "type": "bigint",
+            "table": "crm_audit",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "crm_audit",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "command_id",
+            "type": "text",
+            "table": "crm_command_receipt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "expires_at",
+            "type": "timestamp with time zone",
+            "table": "crm_command_receipt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "request_hash",
+            "type": "text",
+            "table": "crm_command_receipt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "result",
+            "type": "jsonb",
+            "table": "crm_command_receipt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "crm_command_receipt",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "author_id",
+            "type": "text",
+            "table": "crm_note",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "created_at",
+            "type": "timestamp with time zone",
+            "table": "crm_note",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "deleted",
+            "type": "boolean",
+            "table": "crm_note",
+            "default": "false",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "fan_id",
+            "type": "text",
+            "table": "crm_note",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "note_id",
+            "type": "text",
+            "table": "crm_note",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "revision",
+            "type": "bigint",
+            "table": "crm_note",
+            "default": "1",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "crm_note",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "text",
+            "type": "text",
+            "table": "crm_note",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "updated_at",
+            "type": "timestamp with time zone",
+            "table": "crm_note",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "accepted_input",
+            "type": "jsonb",
+            "table": "crm_profile",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "analysis_basis",
+            "type": "jsonb",
+            "table": "crm_profile",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "fan_id",
+            "type": "text",
+            "table": "crm_profile",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "field_versions",
+            "type": "jsonb",
+            "table": "crm_profile",
+            "default": "'{}'::jsonb",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "history_epoch",
+            "type": "text",
+            "table": "crm_profile",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "history_revision",
+            "type": "bigint",
+            "table": "crm_profile",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "manual_fields",
+            "type": "jsonb",
+            "table": "crm_profile",
+            "default": "'[]'::jsonb",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "profile",
+            "type": "jsonb",
+            "table": "crm_profile",
+            "default": "'{}'::jsonb",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "reply_token",
+            "type": "text",
+            "table": "crm_profile",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "revision",
+            "type": "bigint",
+            "table": "crm_profile",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "rewrite_revision",
+            "type": "bigint",
+            "table": "crm_profile",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "crm_profile",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "updated_at",
+            "type": "timestamp with time zone",
+            "table": "crm_profile",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "actor_id",
+            "type": "text",
+            "table": "crm_reply_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "device_id",
+            "type": "text",
+            "table": "crm_reply_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "expires_at",
+            "type": "timestamp with time zone",
+            "table": "crm_reply_run",
+            "default": "(now() + '00:30:00'::interval)",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "fan_id",
+            "type": "text",
+            "table": "crm_reply_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "input",
+            "type": "jsonb",
+            "table": "crm_reply_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "persona_revision",
+            "type": "bigint",
+            "table": "crm_reply_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "profile_revision",
+            "type": "bigint",
+            "table": "crm_reply_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "result_hash",
+            "type": "text",
+            "table": "crm_reply_run",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "crm_reply_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "token",
+            "type": "text",
+            "table": "crm_reply_run",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "agency_id",
+            "type": "text",
+            "table": "crm_scope",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "discovery_after",
+            "type": "text",
+            "table": "crm_scope",
+            "default": "''::text",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "persona",
+            "type": "jsonb",
+            "table": "crm_scope",
+            "default": null,
+            "notNull": false,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "persona_revision",
+            "type": "bigint",
+            "table": "crm_scope",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "platform_creator_id",
+            "type": "text",
+            "table": "crm_scope",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "revision",
+            "type": "bigint",
+            "table": "crm_scope",
+            "default": "0",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "scope_id",
+            "type": "text",
+            "table": "crm_scope",
+            "default": null,
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          },
+          {
+            "name": "updated_at",
+            "type": "timestamp with time zone",
+            "table": "crm_scope",
+            "default": "now()",
+            "notNull": true,
+            "identity": "",
+            "generated": ""
+          }
+        ],
+        "indexes": [
+          {
+            "keys": [
+              "domain"
+            ],
+            "name": "conversation_schema_version_pkey",
+            "ready": true,
+            "table": "conversation_schema_version",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0",
+            "keyCount": 1,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "run_id",
+              "page_number"
+            ],
+            "name": "crm_analysis_chunk_pkey",
+            "ready": true,
+            "table": "crm_analysis_chunk",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "updated_at",
+              "run_id"
+            ],
+            "name": "crm_analysis_run_gc",
+            "ready": true,
+            "table": "crm_analysis_run",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": "(state <> 'RUNNING'::text)",
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "fan_id",
+              "created_at"
+            ],
+            "name": "crm_analysis_run_history",
+            "ready": true,
+            "table": "crm_analysis_run",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "state",
+              "lease_until"
+            ],
+            "name": "crm_analysis_run_lease",
+            "ready": true,
+            "table": "crm_analysis_run",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "run_id"
+            ],
+            "name": "crm_analysis_run_pkey",
+            "ready": true,
+            "table": "crm_analysis_run",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0",
+            "keyCount": 1,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "state",
+              "lane",
+              "next_run_at",
+              "fan_id"
+            ],
+            "name": "crm_analysis_work_due",
+            "ready": true,
+            "table": "crm_analysis_work",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0 0 0",
+            "keyCount": 5,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "fan_id"
+            ],
+            "name": "crm_analysis_work_pkey",
+            "ready": true,
+            "table": "crm_analysis_work",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "created_at",
+              "id"
+            ],
+            "name": "crm_audit_expiry",
+            "ready": true,
+            "table": "crm_audit",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "id"
+            ],
+            "name": "crm_audit_pkey",
+            "ready": true,
+            "table": "crm_audit",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0",
+            "keyCount": 1,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "created_at",
+              "id"
+            ],
+            "name": "crm_audit_scope_expiry",
+            "ready": true,
+            "table": "crm_audit",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "expires_at",
+              "scope_id",
+              "command_id"
+            ],
+            "name": "crm_command_receipt_expiry",
+            "ready": true,
+            "table": "crm_command_receipt",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "command_id"
+            ],
+            "name": "crm_command_receipt_pkey",
+            "ready": true,
+            "table": "crm_command_receipt",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "expires_at",
+              "command_id"
+            ],
+            "name": "crm_command_receipt_scope_expiry",
+            "ready": true,
+            "table": "crm_command_receipt",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "fan_id",
+              "note_id"
+            ],
+            "name": "crm_note_pkey",
+            "ready": true,
+            "table": "crm_note",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0 0",
+            "keyCount": 3,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "fan_id"
+            ],
+            "name": "crm_profile_analysis_pending",
+            "ready": true,
+            "table": "crm_profile",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": "((history_revision > 0) AND ((accepted_input IS NULL) OR ((accepted_input ->> 'epoch'::text) IS DISTINCT FROM history_epoch) OR (((accepted_input ->> 'revision'::text))::bigint < history_revision)))",
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id",
+              "fan_id"
+            ],
+            "name": "crm_profile_pkey",
+            "ready": true,
+            "table": "crm_profile",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "expires_at",
+              "token"
+            ],
+            "name": "crm_reply_expiry",
+            "ready": true,
+            "table": "crm_reply_run",
+            "valid": true,
+            "method": "btree",
+            "unique": false,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "token"
+            ],
+            "name": "crm_reply_run_pkey",
+            "ready": true,
+            "table": "crm_reply_run",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0",
+            "keyCount": 1,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "agency_id",
+              "platform_creator_id"
+            ],
+            "name": "crm_scope_agency_id_platform_creator_id_key",
+            "ready": true,
+            "table": "crm_scope",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0 0",
+            "keyCount": 2,
+            "predicate": null,
+            "expressions": null
+          },
+          {
+            "keys": [
+              "scope_id"
+            ],
+            "name": "crm_scope_pkey",
+            "ready": true,
+            "table": "crm_scope",
+            "valid": true,
+            "method": "btree",
+            "unique": true,
+            "options": "0",
+            "keyCount": 1,
+            "predicate": null,
+            "expressions": null
+          }
+        ],
+        "triggers": [],
+        "constraints": [
+          {
+            "name": "conversation_schema_version_pkey",
+            "type": "p",
+            "table": "conversation_schema_version",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (domain)",
+            "foreignKey": null
+          },
+          {
+            "name": "crm_analysis_chunk_pkey",
+            "type": "p",
+            "table": "crm_analysis_chunk",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (run_id, page_number)",
+            "foreignKey": null
+          },
+          {
+            "name": "crm_analysis_chunk_run_id_fkey",
+            "type": "f",
+            "table": "crm_analysis_chunk",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "crm_analysis_run",
+              "schema": "public",
+              "columns": [
+                "run_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "run_id"
+              ]
+            }
+          },
+          {
+            "name": "crm_analysis_run_pkey",
+            "type": "p",
+            "table": "crm_analysis_run",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (run_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "crm_analysis_run_scope_id_fan_id_fkey",
+            "type": "f",
+            "table": "crm_analysis_run",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "crm_profile",
+              "schema": "public",
+              "columns": [
+                "scope_id",
+                "fan_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id",
+                "fan_id"
+              ]
+            }
+          },
+          {
+            "name": "crm_analysis_work_pkey",
+            "type": "p",
+            "table": "crm_analysis_work",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, fan_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "crm_analysis_work_scope_id_fan_id_fkey",
+            "type": "f",
+            "table": "crm_analysis_work",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "crm_profile",
+              "schema": "public",
+              "columns": [
+                "scope_id",
+                "fan_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id",
+                "fan_id"
+              ]
+            }
+          },
+          {
+            "name": "crm_audit_pkey",
+            "type": "p",
+            "table": "crm_audit",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (id)",
+            "foreignKey": null
+          },
+          {
+            "name": "crm_audit_scope_id_fkey",
+            "type": "f",
+            "table": "crm_audit",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "crm_scope",
+              "schema": "public",
+              "columns": [
+                "scope_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id"
+              ]
+            }
+          },
+          {
+            "name": "crm_command_receipt_pkey",
+            "type": "p",
+            "table": "crm_command_receipt",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, command_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "crm_command_receipt_scope_id_fkey",
+            "type": "f",
+            "table": "crm_command_receipt",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "crm_scope",
+              "schema": "public",
+              "columns": [
+                "scope_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id"
+              ]
+            }
+          },
+          {
+            "name": "crm_note_pkey",
+            "type": "p",
+            "table": "crm_note",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, fan_id, note_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "crm_note_scope_id_fan_id_fkey",
+            "type": "f",
+            "table": "crm_note",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "crm_profile",
+              "schema": "public",
+              "columns": [
+                "scope_id",
+                "fan_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id",
+                "fan_id"
+              ]
+            }
+          },
+          {
+            "name": "crm_profile_pkey",
+            "type": "p",
+            "table": "crm_profile",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id, fan_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "crm_profile_scope_id_fkey",
+            "type": "f",
+            "table": "crm_profile",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "crm_scope",
+              "schema": "public",
+              "columns": [
+                "scope_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id"
+              ]
+            }
+          },
+          {
+            "name": "crm_reply_run_pkey",
+            "type": "p",
+            "table": "crm_reply_run",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (token)",
+            "foreignKey": null
+          },
+          {
+            "name": "crm_reply_run_scope_id_fan_id_fkey",
+            "type": "f",
+            "table": "crm_reply_run",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": null,
+            "foreignKey": {
+              "match": "s",
+              "table": "crm_profile",
+              "schema": "public",
+              "columns": [
+                "scope_id",
+                "fan_id"
+              ],
+              "onDelete": "c",
+              "onUpdate": "a",
+              "references": [
+                "scope_id",
+                "fan_id"
+              ]
+            }
+          },
+          {
+            "name": "crm_scope_agency_id_platform_creator_id_key",
+            "type": "u",
+            "table": "crm_scope",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "UNIQUE (agency_id, platform_creator_id)",
+            "foreignKey": null
+          },
+          {
+            "name": "crm_scope_pkey",
+            "type": "p",
+            "table": "crm_scope",
+            "deferred": false,
+            "validated": true,
+            "deferrable": false,
+            "definition": "PRIMARY KEY (scope_id)",
+            "foreignKey": null
+          }
+        ]
+      }
+    }
+  }
+}

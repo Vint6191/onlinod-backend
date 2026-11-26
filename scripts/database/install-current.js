@@ -7,6 +7,7 @@ const { PrismaClient } = require("@prisma/client");
 const contract = require("../../src/services/database-contract.json");
 const { migrations, validMigrationPrefix, currentContract } = require("../../src/services/database-migration-chain");
 const { assertDatabaseContract } = require("../../src/services/database-contract-service");
+const { annotateFailure, reportFailure, deploymentFailure, preservePrimaryFailure } = require("./install-diagnostics");
 const root = path.resolve(__dirname, "../..");
 const legacyResetTarget = "20261009000000_current_baseline";
 const legacyResetFlag = "--reset-legacy-test-database";
@@ -17,9 +18,13 @@ function fail(code) { throw Object.assign(new Error(code), { code }); }
 // in a private temporary directory; the repository itself is never rewritten.
 function prepareDeployment(sourceRoot = root) {
   const sources = migrations.map(migration => {
-    const sql = fs.readFileSync(path.join(sourceRoot, "prisma/migrations", migration.migration, "migration.sql"), "utf8").replace(/\r\n/g, "\n");
-    if (crypto.createHash("sha256").update(sql).digest("hex") !== migration.checksum) fail("BASELINE_SOURCE_CHECKSUM_MISMATCH");
-    return { ...migration, sql };
+    try {
+      const sql = fs.readFileSync(path.join(sourceRoot, "prisma/migrations", migration.migration, "migration.sql"), "utf8").replace(/\r\n/g, "\n");
+      if (crypto.createHash("sha256").update(sql).digest("hex") !== migration.checksum) fail("BASELINE_SOURCE_CHECKSUM_MISMATCH");
+      return { ...migration, sql };
+    } catch (error) {
+      throw annotateFailure(error, { phase: "SOURCE_PREPARATION", domain: "core", migration: migration.migration });
+    }
   });
   const schema = fs.readFileSync(path.join(sourceRoot, "prisma/schema.prisma"));
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nod-current-install-"));
@@ -34,8 +39,10 @@ function prepareDeployment(sourceRoot = root) {
     fs.writeFileSync(schemaPath, schema);
     return { schemaPath, dispose: () => fs.rmSync(directory, { recursive: true, force: true }) };
   } catch (error) {
-    fs.rmSync(directory, { recursive: true, force: true });
-    throw error;
+    let failure = error;
+    try { fs.rmSync(directory, { recursive: true, force: true }); }
+    catch (cleanup) { failure = preservePrimaryFailure(failure, cleanup, { phase: "SOURCE_CLEANUP", domain: "core" }); }
+    throw failure;
   }
 }
 
@@ -83,60 +90,101 @@ async function resetLegacyTestDatabase(db) {
   }, { maxWait: 15000, timeout: 120000 });
 }
 
-function deploy(schemaPath) {
+function deploy(schemaPath, installationUrl) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [path.join(root, "node_modules/prisma/build/index.js"), "migrate", "deploy", "--schema", schemaPath], { cwd: root, stdio: "inherit" });
+    const cli = path.join(root, "node_modules/prisma/build/index.js");
+    // A missing CLI is a source/dependency failure, not a database error. Node's
+    // raw module-not-found stack must not become the deployment diagnostic.
+    fs.accessSync(cli, fs.constants.R_OK);
+    const child = spawn(process.execPath, [cli, "migrate", "deploy", "--schema", schemaPath], {
+      cwd: root, env: { ...process.env, DATABASE_URL: installationUrl, CHECKPOINT_DISABLE: "1" }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "", settled = false;
+    const capture = chunk => { output = (output + chunk).slice(-256 * 1024); };
+    child.stdout.setEncoding("utf8"); child.stderr.setEncoding("utf8");
+    child.stdout.on("data", capture); child.stderr.on("data", capture);
     const forward = signal => () => child.kill(signal);
     const interrupt = forward("SIGINT"), terminate = forward("SIGTERM");
     process.on("SIGINT", interrupt); process.on("SIGTERM", terminate);
     const cleanup = () => { process.off("SIGINT", interrupt); process.off("SIGTERM", terminate); };
-    child.once("error", error => { cleanup(); reject(error); });
-    child.once("exit", (code, signal) => {
+    child.once("error", error => { settled = true; cleanup(); reject(error); });
+    // close waits for both output pipes. No raw Prisma/SQL output is logged:
+    // migration errors can contain row values and connection identifiers.
+    child.once("close", (code, signal) => {
       cleanup();
+      if (settled) return;
+      settled = true;
       if (code === 0 && !signal) resolve();
-      else reject(Object.assign(new Error("BASELINE_DEPLOY_FAILED"), { code: "BASELINE_DEPLOY_FAILED", exitCode: code, signal }));
+      else reject(deploymentFailure(output, code, signal, migrations.map(item => item.migration)));
     });
   });
 }
-async function main(args = process.argv.slice(2)) {
-  if (args.some(arg => arg !== legacyResetFlag)) fail("UNKNOWN_INSTALL_ARGUMENT");
-  const resetLegacy = args.includes(legacyResetFlag);
-  let databaseUrl;
-  try { databaseUrl = new URL(process.env.DATABASE_URL); } catch { fail("DATABASE_URL_REQUIRED"); }
-  if (!["postgres:", "postgresql:"].includes(databaseUrl.protocol)) fail("DATABASE_URL_REQUIRED");
-  const configuredSchema = databaseUrl.searchParams.get("schema");
-  if (configuredSchema && configuredSchema !== "public") fail("PUBLIC_SCHEMA_REQUIRED");
-  const deployment = prepareDeployment();
-  let db;
+function connectionIdentity(raw, setting) {
+  const invalid = setting === "DIRECT_URL" ? "DIRECT_DATABASE_URL_INVALID" : "DATABASE_URL_REQUIRED";
   try {
-    db = new PrismaClient();
-    const installation = resetLegacy ? await resetLegacyTestDatabase(db) : await inspectInstallation(db);
-    await db.$disconnect();
-    await deploy(deployment.schemaPath);
-    await assertDatabaseContract(db);
-    console.log(JSON.stringify({ ok: true, ...installation, version: currentContract().version }));
-  } finally {
-    try { if (db) await db.$disconnect(); } finally { deployment.dispose(); }
+    let url;
+    try { url = new URL(raw); } catch { fail(invalid); }
+    if (!["postgres:", "postgresql:"].includes(url.protocol) || !url.hostname || !url.pathname || url.pathname === "/") fail(invalid);
+    if (url.searchParams.getAll("schema").some(schema => schema && schema !== "public")) fail("PUBLIC_SCHEMA_REQUIRED");
+    // This release pins Prisma 5.22: it treats the URL database pathname as a
+    // literal name. Decoding %xx here could authorize a different physical DB.
+    return { host: url.hostname.toLowerCase().replace("-pooler.", "."), port: url.port || "5432", database: url.pathname.slice(1), schema: "public" };
+  } catch (error) {
+    throw annotateFailure(error, { phase: "CONFIGURATION", domain: "core", connectionSetting: setting });
   }
 }
-function reportFailure(error) {
-  const messages = {
-    UNKNOWN_INSTALL_ARGUMENT: `The only supported option is ${legacyResetFlag}, which discards the pre-153 TEST database schema and its data.`,
-    DATABASE_URL_REQUIRED: "Set DATABASE_URL to a PostgreSQL connection URL.",
-    PUBLIC_SCHEMA_REQUIRED: "The current installation requires the public schema.",
-    BASELINE_SOURCE_CHECKSUM_MISMATCH: "The current migration does not match its contract. Reapply the complete Backend package.",
-    EMPTY_DATABASE_REQUIRED: "This database already contains an earlier schema. Set DATABASE_URL to a NEW EMPTY database; existing data was not changed.",
-    CURRENT_BASELINE_DATABASE_REQUIRED: `Migration history differs from the current baseline; existing data was not changed. To discard a pre-153 TEST schema in this same database, run npm run prisma:migrate -- ${legacyResetFlag}. This deletes its old test data.`,
-    LEGACY_TEST_RESET_NOT_APPLICABLE: "Reset refused: the history is not exclusively pre-153 migrations. A recorded current baseline (including a failed or changed one) is never reset by this option. Existing data was not changed.",
-    BASELINE_INSTALLATION_INCOMPLETE: "A previous installation is incomplete. Inspect its Prisma migration receipt before retrying.",
-    DUPLICATE_BASELINE_RECEIPT: "The database has duplicate baseline receipts. Installation was stopped.",
-    NONCONTIGUOUS_BASELINE_RECEIPTS: "Migration history has a missing earlier receipt while later migrations are recorded. Installation was stopped; existing data was not changed.",
-    BASELINE_DEPLOY_FAILED: "Prisma could not apply the current baseline. See its error above.",
-    DATABASE_CONTRACT_REQUIRED: "The installed database differs from the current contract. Inspect the reported schema differences; no reset was performed.",
-  };
-  console.error(error.code || "DATABASE_INSTALL_FAILED");
-  if (messages[error.code]) console.error(messages[error.code]);
-  if (error.problems?.length) console.error(JSON.stringify({ problems: error.problems }));
+function validateConfiguration(args = process.argv.slice(2), env = process.env) {
+  if (args.some(arg => arg !== legacyResetFlag)) fail("UNKNOWN_INSTALL_ARGUMENT");
+  const runtime = connectionIdentity(env.DATABASE_URL, "DATABASE_URL");
+  if (env.DIRECT_URL) {
+    const direct = connectionIdentity(env.DIRECT_URL, "DIRECT_URL");
+    if (JSON.stringify(runtime) !== JSON.stringify(direct)) throw annotateFailure(Object.assign(new Error("DIRECT_DATABASE_IDENTITY_MISMATCH"), {
+      code: "DIRECT_DATABASE_IDENTITY_MISMATCH",
+    }), { phase: "CONFIGURATION", domain: "core", connectionSetting: "DIRECT_URL" });
+    return { installationUrl: env.DIRECT_URL, connectionSetting: "DIRECT_URL" };
+  }
+  return { installationUrl: env.DATABASE_URL, connectionSetting: "DATABASE_URL" };
 }
-module.exports = { prepareDeployment, inspectInstallation, resetLegacyTestDatabase, main, reportFailure };
+async function main(args = process.argv.slice(2)) {
+  let phase = "CONFIGURATION", deployment, db, primary, result, connection;
+  try {
+    connection = validateConfiguration(args);
+    const resetLegacy = args.includes(legacyResetFlag);
+    phase = "SOURCE_PREPARATION";
+    deployment = prepareDeployment();
+    phase = "CORE_CONNECT";
+    // DIRECT_URL is optional and installer-only. Do not mutate the runtime
+    // DATABASE_URL or alter Prisma schema datasource configuration.
+    db = new PrismaClient({ datasources: { db: { url: connection.installationUrl } } });
+    // Prisma 5 lazy raw-query initialization can omit errorCode. Explicit
+    // connection preserves the engine's stable P1000/P1001/P1003 diagnosis.
+    await db.$connect();
+    phase = resetLegacy ? "CORE_LEGACY_RESET" : "CORE_INSPECT";
+    const installation = resetLegacy ? await resetLegacyTestDatabase(db) : await inspectInstallation(db);
+    phase = "DATABASE_DISCONNECT";
+    await db.$disconnect();
+    phase = "CORE_DEPLOY";
+    console.log(JSON.stringify({ phase, domain: "core", status: "STARTED", connectionSetting: connection.connectionSetting }));
+    await deploy(deployment.schemaPath, connection.installationUrl);
+    phase = "CORE_VERIFY";
+    await db.$connect();
+    await assertDatabaseContract(db);
+    result = { ok: true, domain: "core", ...installation, version: currentContract().version };
+  } catch (error) {
+    primary = annotateFailure(error, { phase, domain: "core", connectionSetting: connection?.connectionSetting });
+  } finally {
+    if (db) {
+      try { await db.$disconnect(); }
+      catch (error) { primary = preservePrimaryFailure(primary, error, { phase: "DATABASE_DISCONNECT", domain: "core" }); }
+    }
+    if (deployment) {
+      try { deployment.dispose(); }
+      catch (error) { primary = preservePrimaryFailure(primary, error, { phase: "SOURCE_CLEANUP", domain: "core" }); }
+    }
+  }
+  if (primary) throw primary;
+  console.log(JSON.stringify(result));
+  return result;
+}
+module.exports = { prepareDeployment, inspectInstallation, resetLegacyTestDatabase, validateConfiguration, main, reportFailure };
 if (require.main === module) main().catch(error => { reportFailure(error); process.exitCode = 1; });
