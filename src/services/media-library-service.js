@@ -594,7 +594,7 @@ function assetToSalesAsset(asset, moneyState = {ready:true,available:true,pendin
   };
 }
 
-async function listMediaSalesAssets({ agencyId, creatorId, offset = 0, limit = 100, mediaType = null, db = prisma }) {
+async function listMediaSalesAssets({ agencyId, creatorId, offset = 0, limit = 100, mediaType = null, moneyAllowed = true, db = prisma }) {
   const id = await requireCreator(db, agencyId, creatorId);
   const skip = mediaOffset(offset);
   const take = integer(limit, 100, 1, 500);
@@ -607,7 +607,7 @@ async function listMediaSalesAssets({ agencyId, creatorId, offset = 0, limit = 1
     ...(normalizedType ? { mediaType: normalizedType } : {}),
   };
   const { rows: assets, count } = await readMediaPage(db, {
-    where, orderBy: [{ revenueCents: "desc" }, { soldCount: "desc" }, { lastSoldAt: "desc" }, { mediaId: "asc" }], offset: skip, limit: take,
+    where, orderBy: [...(moneyAllowed ? [{ revenueCents: "desc" }] : []), { soldCount: "desc" }, { lastSoldAt: "desc" }, { mediaId: "asc" }], offset: skip, limit: take,
   });
   const moneyState = await require("./media-financial-projection-service").financialProjectionState(db, id);
   const items = assets.map(asset => assetToSalesAsset(asset, moneyState));

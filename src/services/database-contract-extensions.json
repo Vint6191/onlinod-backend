@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v26_entity_change_window187",
+  "version": "nod_current_v31_custom_instruction_continuation",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -100,6 +100,26 @@
     {
       "migration": "20261027010000_entity_change_window187",
       "checksum": "b519c8698885343c2361e6f53a3c2d63fa5b1375d1c165508dd6a7988dee87d2"
+    },
+    {
+      "migration": "20261126000000_architecture_proofs_and_edits",
+      "checksum": "cafd190c5310da89f0597ebce8f6df83488bee3ced5f7e1fb8ef512638886910"
+    },
+    {
+      "migration": "20261126010000_architecture_revision_and_recovery",
+      "checksum": "e157d55ab1df457e6240338395125d602bd3e66c8fb4326598d84086f25ca931"
+    },
+    {
+      "migration": "20261126020000_financial_repair_intent_reasons",
+      "checksum": "d27dde26b2a8cba110179cd7e82f08b73d1d5e7b5a9c74545fcb341eec6e77a9"
+    },
+    {
+      "migration": "20261126030000_custom_instruction_manifest",
+      "checksum": "074b663d84e2eb1c0e3b2a909e1df03718e63ca0b006a1656863a7696f8e1e03"
+    },
+    {
+      "migration": "20261126040000_custom_instruction_continuation",
+      "checksum": "4ac1f22e149937456cad9509c2653f01dd4ae1d8f5426beb2376d1466386b880"
     }
   ],
   "extension": {
@@ -3097,6 +3117,62 @@
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "proofPolicyVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "AgencyMember",
+        "name": "editRevision",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "1"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "unackedSinceAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "unackedThroughAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "instructionManifest",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "instructionParentId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "instructionPartIndex",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
       }
     ],
     "enums": [],
@@ -3186,6 +3262,11 @@
         "name": "onlinod_fan_ltv_writer178",
         "args": "",
         "hash": "a8996803881264d23ecb4fd64849209978d79155c21d6fa876351405a4506ac9"
+      },
+      {
+        "name": "nod_member_edit_revision",
+        "args": "",
+        "hash": "de96fb6375daa1bff3f52a5628fc02d6fee5acffba4190c391bd8f69468b2fb5"
       }
     ],
     "triggers": [
@@ -3332,6 +3413,14 @@
         "definition": "CREATE TRIGGER \"FanLtvReceipt_writer178\" BEFORE INSERT OR UPDATE ON public.\"FanLtvReceipt\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_writer178()",
         "args": "",
         "function": "onlinod_fan_ltv_writer178"
+      },
+      {
+        "table": "AgencyMember",
+        "name": "AgencyMember_edit_revision",
+        "type": 19,
+        "definition": "CREATE TRIGGER \"AgencyMember_edit_revision\" BEFORE UPDATE ON public.\"AgencyMember\" FOR EACH ROW EXECUTE FUNCTION nod_member_edit_revision()",
+        "args": "",
+        "function": "nod_member_edit_revision"
       }
     ],
     "constraints": [
@@ -3965,7 +4054,7 @@
         "type": "c",
         "deferrable": false,
         "deferred": false,
-        "definition": "CHECK ((reason = ANY (ARRAY['OFFLINE_GAP'::text, 'CAPTURE_LOSS'::text])))"
+        "definition": "CHECK (((reason = ANY (ARRAY['OFFLINE_GAP'::text, 'CAPTURE_LOSS'::text])) OR ((stream = 'financial'::text) AND (reason = ANY (ARRAY['FINANCIAL_PROOF_ADOPTION'::text, 'FINANCIAL_PROOF_ADOPTION_FULL'::text, 'FINANCIAL_DELIVERY_GAP'::text])))))"
       },
       {
         "table": "CreatorRecoveryIntent",
@@ -4190,6 +4279,54 @@
         "deferrable": false,
         "deferred": false,
         "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "CreatorEarningsLedgerProof_proofPolicyVersion_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"proofPolicyVersion\" >= 0))"
+      },
+      {
+        "table": "AgencyMember",
+        "name": "AgencyMember_editRevision_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"editRevision\" >= 1))"
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "TelegramDeliveryIntent_instruction_part_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((((kind <> 'INSTRUCTION_PART'::text) AND (\"instructionParentId\" IS NULL) AND (\"instructionPartIndex\" IS NULL)) OR ((kind = 'INSTRUCTION_PART'::text) AND (\"instructionParentId\" IS NOT NULL) AND (\"instructionParentId\" <> id) AND (\"instructionPartIndex\" IS NOT NULL) AND (\"instructionPartIndex\" >= 1) AND (\"instructionManifest\" IS NULL))))"
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "TelegramDeliveryIntent_kind_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((kind = ANY (ARRAY['TASK'::text, 'REFERENCE'::text, 'MANUAL_REMINDER'::text, 'AUTO_REMINDER'::text, 'CANCELLATION'::text, 'REVISION_REQUEST'::text, 'INSTRUCTION_PART'::text, 'INSTRUCTION_CONTINUATION'::text])))"
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "TelegramDeliveryIntent_instruction_manifest_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"instructionManifest\" IS NULL) OR ((kind = ANY (ARRAY['TASK'::text, 'REVISION_REQUEST'::text, 'INSTRUCTION_CONTINUATION'::text])) AND (jsonb_typeof(\"instructionManifest\") = 'object'::text))))"
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "TelegramDeliveryIntent_continuation_manifest_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((kind <> 'INSTRUCTION_CONTINUATION'::text) OR (\"instructionManifest\" IS NOT NULL)))"
       }
     ],
     "indexes": [
@@ -5130,15 +5267,6 @@
         "predicate": "((\"compactedAt\" IS NULL) AND (\"historicalFactVersion\" = 'team_money_fact_v2'::text) AND (\"historicalFactProjectedAt\" IS NOT NULL))"
       },
       {
-        "table": "TelegramDeliveryIntent",
-        "name": "TelegramDeliveryIntent_current_thread_lookup_idx",
-        "unique": false,
-        "keys": "2 4 6 23 7 29 1",
-        "options": "0 0 0 0 0 3 3",
-        "expressions": null,
-        "predicate": "((state = 'CONFIRMED'::text) AND (kind = ANY (ARRAY['TASK'::text, 'REVISION_REQUEST'::text])))"
-      },
-      {
         "table": "_prisma_migrations",
         "name": "_prisma_migrations_pkey",
         "unique": true,
@@ -5218,6 +5346,51 @@
         "options": "0",
         "expressions": null,
         "predicate": "((state = 'RECONCILE_REQUIRED'::text) AND (\"terminalCause\" = 'RETRY_EXHAUSTED:NOTIFICATION_BUMP_PROJECTION_FAILED:FAN_DATA_REFRESH_BACKLOG_FULL'::text) AND (\"workClass\" = ANY (ARRAY['NOTIFICATION_CONSEQUENCES'::text, 'NOTIFICATION_CONSEQUENCES_V2'::text, 'NOTIFICATION_FACT_RECEIPTS'::text])) AND ((\"lastRepair\" ->> 'kind'::text) IS DISTINCT FROM 'notification_refresh_capacity_recovery_v1'::text))"
+      },
+      {
+        "table": "TeamPpvResolveJob",
+        "name": "TeamPpvResolveJob_agency_status_created_id_idx",
+        "unique": false,
+        "keys": "2 11 18 1",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "TeamPpvResolveJob",
+        "name": "TeamPpvResolveJob_creator_status_created_id_idx",
+        "unique": false,
+        "keys": "2 4 11 18 1",
+        "options": "0 0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "TelegramDeliveryIntent_instruction_part_key",
+        "unique": true,
+        "keys": "37 38",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "TelegramDeliveryIntent_instruction_parent_idx",
+        "unique": false,
+        "keys": "2 37",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "TelegramDeliveryIntent_current_thread_lookup_idx",
+        "unique": false,
+        "keys": "2 4 6 23 7 29 1",
+        "options": "0 0 0 0 0 3 3",
+        "expressions": null,
+        "predicate": "((state = 'CONFIRMED'::text) AND (kind = ANY (ARRAY['TASK'::text, 'REVISION_REQUEST'::text, 'INSTRUCTION_CONTINUATION'::text])))"
       }
     ]
   }

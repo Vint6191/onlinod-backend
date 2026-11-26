@@ -31,6 +31,7 @@
     pending.clear();
     for (const timer of timers.values()) clearTimeout(timer);
     timers.clear();
+    window.NodAdminUI?.closeAll({ restoreFocus: false });
     document.querySelectorAll(".adm-modal-overlay, .adm-toast").forEach((node) => node.remove());
   }
   function local(factory) {

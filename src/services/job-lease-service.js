@@ -422,6 +422,15 @@ function leaseDriverContinuation(value) {
   return normalized?.driverPhase === "execute" || normalized?.driverPhase === "complete"
     ? normalized : { driverPhase: "execute", jobContinuation: normalized };
 }
+
+function acceptedCompletionResult(job, supplied) {
+  const accepted = leaseDriverContinuation(job.continuation);
+  if (accepted.driverPhase !== "complete") return supplied;
+  if (supplied !== undefined && !isDeepStrictEqual(supplied, accepted.result)) {
+    throw new JobLeaseError("JOB_COMPLETION_RESULT_CONFLICT", "Completion result differs from the server-accepted descriptor", 409);
+  }
+  return accepted.result;
+}
 function committedCollectorSourceAdvance(job, chunk, effect) {
   if (!chunk || !effect || effect.replay === true || effect.replayed === true || effect.duplicate === true
     || effect.superseded === true || effect.staleProgress === true || effect.serverNoProgressDetected === true) return false;
@@ -586,20 +595,24 @@ async function sweepExpiredLeases(now = null, { agencyId = null, limit = 100 } =
           || !locked.leaseUntil || new Date(locked.leaseUntil) > currentNow) return false;
       const job = locked;
       if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
-      const attempts = Number(job.attempts || 0) + 1;
-      const terminal = attempts >= MAX_ATTEMPTS;
+      const completionAccepted = leaseDriverContinuation(job.continuation).driverPhase === "complete";
+      // Accepted work no longer consumes provider execution attempts. Its next
+      // lease only publishes the durable descriptor; it must survive even the
+      // last provider attempt losing its completion acknowledgement.
+      const attempts = completionAccepted ? Math.min(Number(job.attempts || 0), MAX_ATTEMPTS - 1) : Number(job.attempts || 0) + 1;
+      const terminal = !completionAccepted && attempts >= MAX_ATTEMPTS;
       const retryAt = terminal ? null : new Date(currentNow.getTime() + RETRY_BACKOFF_MS);
       const updated = await tx.jobInstance.updateMany({
         where: { id: job.id, status: "CLAIMED", leaseRevision: job.leaseRevision, leaseUntil: { lte: currentNow } },
         data: { status: terminal ? "FAILED" : "SCHEDULED", attempts,
-          ...(terminal ? { completedAt: currentNow } : { nextRunAt: retryAt }), lastError: "lease expired",
+          ...(terminal ? { completedAt: currentNow } : { nextRunAt: retryAt }), lastError: completionAccepted ? "completion_pending:lease_expired" : "lease expired",
           claimedAt: null, claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null },
       });
       if (!updated.count) return false;
       if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
         await tx.fanObservationReadLease.deleteMany({ where: { jobId: job.id, leaseRevision: job.leaseRevision } });
       }
-      await recordJobFailure({ db: tx, job, error: "lease expired", terminal, retryAfterAt: retryAt });
+      if (!completionAccepted) await recordJobFailure({ db: tx, job, error: "lease expired", terminal, retryAfterAt: retryAt });
       return true;
     }, { profile: "JOB_COMPLETION", authority: { kind: "JOB_LEASE_EXPIRY", agencyId: candidate.agencyId, creatorId: candidate.creatorId } });
     if (applied) changed += 1;
@@ -1083,11 +1096,12 @@ async function issueFanObservationToken({ jobId, userId, deviceId, leaseToken, l
 async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, leaseMs, workId, progress, continuation }) {
   const outcome = await leaseCommit({ jobId, userId, deviceId, leaseToken, leaseRevision }, async (tx, { job, now }) => {
   if (job.jobKey === "fetch_campaigns") await enterCampaignBoundedExecution({ db: tx });
-  if (campaignTraversal.enabled(job) && continuation !== undefined
+  const completionAccepted = leaseDriverContinuation(job.continuation).driverPhase === "complete";
+  if (!completionAccepted && campaignTraversal.enabled(job) && continuation !== undefined
     && !campaignTraversal.expectedMatches(job, continuation)) {
     throw new JobLeaseError("CAMPAIGN_PROGRESS_ENDPOINT_REQUIRED", "Campaign continuation advances only through progress", 409);
   }
-  if (require("./financial-receipt-authority").enabled(job) && continuation !== undefined
+  if (!completionAccepted && require("./financial-receipt-authority").enabled(job) && continuation !== undefined
     && !require("./financial-receipt-authority").expectedMatches(job, continuation)) throw new JobLeaseError("FINANCIAL_PROGRESS_ENDPOINT_REQUIRED", "Financial cursor advances only with a receipt", 409);
   const tokenHash = hashToken(leaseToken);
   const data = {
@@ -1095,8 +1109,10 @@ async function renewLease({ jobId, userId, deviceId, leaseToken, leaseRevision, 
   };
   if (workId !== undefined) data.workId = clean(workId, 200) || job.workId;
   const normalizedProgress = safeProgress(progress);
-  if (normalizedProgress) data.progress = normalizedProgress;
-  if (continuation !== undefined) data.continuation = normalizeLeaseContinuation(continuation);
+  if (normalizedProgress && !completionAccepted) data.progress = normalizedProgress;
+  // Once accepted, the completion descriptor belongs to the server. A legacy
+  // keepalive cannot rewind it after its progress response was lost.
+  if (continuation !== undefined && !completionAccepted) data.continuation = normalizeLeaseContinuation(continuation);
   if (normalizedProgress || continuation !== undefined) data.lastProgressAt = now;
 
     // Also fence a FULL that became redundant *after* it was claimed. The
@@ -1149,6 +1165,11 @@ async function progressJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   const requestedContinuation = continuation === undefined
     ? job.continuation
     : normalizeLeaseContinuation(continuation);
+
+    if (leaseDriverContinuation(job.continuation).driverPhase === "complete") {
+      return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
+        progress: job.progress, continuation: job.continuation, sideEffect: { staleProgress: true, completionAccepted: true } };
+    }
 
     if (job.jobKey === "catchup_notifications_scan" && notificationProgressIsStale(job, chunkResult, expectedContinuation)) {
       return { id: job.id, status: job.status, leaseUntil: job.leaseUntil, leaseRevision: job.leaseRevision,
@@ -1393,13 +1414,15 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
       const receipt = await tx.analyticsPublication.findUnique({ where: { jobId_leaseRevision: { jobId, leaseRevision } } });
       if (receipt) return publication.assertReplay(receipt, { userId, deviceId, leaseToken, leaseRevision, result });
       const current = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, db: tx });
+      const acceptedResult = acceptedCompletionResult(current, result);
       const acceptedAt = await dbAuthorityNow({ db: tx });
       return publication.acceptAnalyticsPublication({ db: tx, job: current, userId, deviceId,
-        leaseToken, leaseRevision, result, now: acceptedAt });
+        leaseToken, leaseRevision, result: acceptedResult, now: acceptedAt });
     }, { profile: "JOB_CHUNK", authority: { kind: "ANALYTICS_PUBLICATION_ACCEPT", userId, agencyId: observedJob.agencyId, creatorId: observedJob.creatorId } });
   }
   let now = await dbAuthorityNow({ db: prisma, fallbackNow: new Date() });
   let job = await requireLease({ jobId, userId, deviceId, leaseToken, leaseRevision, now });
+  result = acceptedCompletionResult(job, result);
   let fenceWhere = {
     id: job.id,
     status: "CLAIMED",
@@ -1428,9 +1451,10 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
   }, async (tx, current) => {
     job = current.job;
     now = current.now;
+    result = acceptedCompletionResult(job, result);
     fenceWhere = { id: job.id, status: "CLAIMED", claimedByDeviceId: deviceId,
       leaseTokenHash: hashToken(leaseToken), leaseRevision, leaseUntil: { gt: now } };
-    completionData = { ...completionData, completedAt: now, lastProgressAt: now };
+    completionData = { ...completionData, completedAt: now, lastProgressAt: now, result: result || null };
     return work(tx);
   }, { profile });
 
@@ -1678,6 +1702,12 @@ async function completeJob({ jobId, userId, deviceId, leaseToken, leaseRevision,
 }
 async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, workId, error, result, retryable = true, expectedContinuation }) {
   const outcome = await leaseCommit({ jobId, userId, deviceId, leaseToken, leaseRevision }, async (tx, { job, now }) => {
+  if (leaseDriverContinuation(job.continuation).driverPhase === "complete") {
+    // Provider work is already durably accepted. A late provider/network error
+    // may not discard that result or spend its collection retry budget.
+    return { staleFailure: true, completionRequired: true, id: job.id, status: job.status,
+      continuation: job.continuation, progress: job.progress };
+  }
   if (expectedContinuation !== undefined && !isDeepStrictEqual(leaseDriverContinuation(job.continuation), leaseDriverContinuation(expectedContinuation))) {
     return { staleFailure: true, id: job.id, status: job.status, continuation: job.continuation };
   }

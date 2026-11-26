@@ -2,6 +2,7 @@
 
 const crypto = require("node:crypto");
 const { deriveCustomModelObligation } = require("./custom-model-obligation-authority-service");
+const { instructionDeliveryState, assertInstructionPart } = require("./custom-instruction-manifest");
 const CURRENT_THREAD_PAGE_SIZE = 100;
 
 // Discovery starts with the indexed CURRENT order set, never with a sender's
@@ -15,7 +16,7 @@ const CURRENT_THREAD_ORDER_PAGE_SQL = `/* custom_telegram_current_order_page */
       SELECT 1 FROM "TelegramDeliveryIntent" i
       WHERE i."agencyId"=o."agencyId" AND i."customOrderId"=o."id"
         AND i."accountId"=$2 AND i."remoteRecipientTelegramUserId"=$3
-        AND i."state"='CONFIRMED' AND i."kind" IN ('TASK','REVISION_REQUEST')
+        AND i."state"='CONFIRMED' AND i."kind" IN ('TASK','REVISION_REQUEST','INSTRUCTION_CONTINUATION')
     )
   ORDER BY o."id" LIMIT $5`;
 
@@ -36,9 +37,11 @@ function isCurrentProviderInstruction(row, { agencyId, accountId, sender, order,
   if (!row || String(row.agencyId) !== agencyId || String(row.customOrderId) !== String(order.id)
       || String(row.creatorId) !== String(order.creatorId) || String(row.accountId) !== accountId
       || String(row.remoteRecipientTelegramUserId) !== sender || String(row.state) !== "CONFIRMED"
-      || !["TASK", "REVISION_REQUEST"].includes(String(row.kind)) || confirmationAuthority(row) !== "PROVIDER_RECEIPT") return false;
+      || !["TASK", "REVISION_REQUEST", "INSTRUCTION_CONTINUATION"].includes(String(row.kind)) || confirmationAuthority(row) !== "PROVIDER_RECEIPT"
+      || instructionDeliveryState(row) !== "CONFIRMED"
+      || (row.instructionManifest && row.instructionManifest.confirmationAuthority !== "PROVIDER_RECEIPT")) return false;
   if (cutoffMs == null) return true;
-  const anchorMs = new Date(row.remoteSentAt || row.confirmedAt || NaN).getTime();
+  const anchorMs = new Date(row.instructionManifest?.completedAt || row.remoteSentAt || row.confirmedAt || NaN).getTime();
   return Number.isFinite(anchorMs) && anchorMs <= cutoffMs;
 }
 
@@ -46,7 +49,7 @@ async function confirmedTaskForCurrentOrder({ agencyId, accountId, sender, order
   if (typeof db.$queryRawUnsafe === "function") {
     const rows = await db.$queryRawUnsafe(`/* custom_telegram_current_task */
       SELECT i."id", i."agencyId", i."accountId", i."creatorId", i."customOrderId", i."kind", i."state",
-        i."remoteMessageId", i."remoteRecipientTelegramUserId", i."remoteSentAt", i."confirmationAuthority", i."outcomeReason", i."confirmedAt"
+        i."remoteMessageId", i."remoteRecipientTelegramUserId", i."remoteSentAt", i."confirmationAuthority", i."outcomeReason", i."confirmedAt", i."instructionManifest"
       FROM "TelegramDeliveryIntent" i
       WHERE i."agencyId"=$1 AND i."customOrderId"=$2 AND i."accountId"=$3
         AND i."remoteRecipientTelegramUserId"=$4 AND i."state"='CONFIRMED' AND i."kind"='TASK'
@@ -55,7 +58,7 @@ async function confirmedTaskForCurrentOrder({ agencyId, accountId, sender, order
         AND ($5::timestamp IS NULL OR COALESCE(i."remoteSentAt",i."confirmedAt") <= $5::timestamp)
       ORDER BY i."confirmedAt" DESC, i."id" DESC LIMIT 1`,
     agencyId, String(order.id), accountId, sender, cutoffMs == null ? null : new Date(cutoffMs));
-    return rows[0] || null;
+    return rows.find(row => isCurrentProviderInstruction(row, { agencyId, accountId, sender, order, cutoffMs })) || null;
   }
   // Legacy adapters may contain more than one historical TASK for an order.
   // Keep exact temporal/provenance eligibility, without an arbitrary recent-N
@@ -95,10 +98,23 @@ function confirmationAuthority(row) {
   const reason = clean(row?.outcomeReason, 500).toUpperCase();
   return reason.startsWith("MANUAL_CONFIRMED:") ? "MANUAL_RECONCILIATION" : "PROVIDER_RECEIPT";
 }
-function publicThread(intent, order, type) {
+function sourceSnapshotInvalid(source, continuation) {
+  return source.accountId !== continuation.accountId || source.customOrderId !== continuation.customOrderId
+    || source.creatorId !== continuation.creatorId || source.state !== "CONFIRMED"
+    || source.kind !== continuation.payload?.sourceKind
+    || String(source.remoteMessageId) !== String(continuation.payload?.sourceRemoteMessageId)
+    || source.remoteRecipientTelegramUserId !== continuation.payload?.recipientTelegramUserId;
+}
+function publicThread(intent, order, type, parent = null) {
+  const instruction = parent || intent;
+  const sourceId = instruction.kind === "INSTRUCTION_CONTINUATION" ? instruction.payload?.sourceIntentId : null;
   return {
     resolutionType: type,
-    anchorIntentId: String(intent.id),
+    anchorIntentId: String(sourceId || intent.instructionParentId || intent.id),
+    instructionVersionIntentId: String(instruction.id),
+    instructionContinuationId: sourceId ? String(instruction.id) : null,
+    physicalPartIntentId: intent.instructionParentId ? String(intent.id) : null,
+    instructionContentHash: intent.payload?.instructionContentHash || intent.instructionManifest?.contentHash || null,
     agencyId: String(intent.agencyId),
     accountId: String(intent.accountId),
     telegramUserId: clean(intent.remoteRecipientTelegramUserId, 40) || null,
@@ -117,6 +133,7 @@ async function matchingConfirmedMessageRows({ agencyId, accountId, remoteMessage
       where,
       select: {
         id: true, agencyId: true, accountId: true, creatorId: true, customOrderId: true,
+        kind: true, state: true, customSubmissionId: true, payload: true, instructionParentId: true, instructionPartIndex: true, instructionManifest: true,
         remoteMessageId: true, remoteRecipientTelegramUserId: true, confirmationAuthority: true,
         outcomeReason: true, confirmedAt: true,
       },
@@ -157,7 +174,18 @@ async function resolveTelegramCustomThread({ agencyId, accountId, senderTelegram
     const order = db.customOrder?.findFirst
       ? await db.customOrder.findFirst({ where: { id: String(intent.customOrderId), agencyId }, select: { id: true, creatorId: true, type: true, status: true } })
       : null;
-    const thread = publicThread(intent, order, "DIRECT_REPLY");
+    let parent = null;
+    if (intent.instructionParentId) {
+      parent = await db.telegramDeliveryIntent.findFirst({ where: { id: intent.instructionParentId, agencyId } });
+      if (!parent) throw Object.assign(new Error("Instruction part parent is missing"), { code: "CUSTOM_INSTRUCTION_PARENT_MISSING", status: 409 });
+      assertInstructionPart(intent, parent);
+    }
+    const instruction = parent || intent;
+    if (instruction.kind === "INSTRUCTION_CONTINUATION") {
+      const source = await db.telegramDeliveryIntent.findFirst({ where: { agencyId, id: instruction.payload?.sourceIntentId } });
+      if (!source || sourceSnapshotInvalid(source, instruction)) throw Object.assign(new Error("Continuation source identity is invalid"), { code: "CUSTOM_CONTINUATION_SOURCE_CHANGED", status: 409 });
+    }
+    const thread = publicThread(intent, order, "DIRECT_REPLY", parent);
     return { type: "DIRECT_REPLY", proven: true, conflict: false, thread, threads: [thread], creatorIds: [thread.creatorId], customOrderIds: [thread.customOrderId] };
   }
 
@@ -181,7 +209,7 @@ async function resolveTelegramCustomThread({ agencyId, accountId, senderTelegram
       let intent = null;
       if (obligation?.modelOwesResponse && obligation.currentInstruction) {
         const current = obligation.currentInstruction;
-        if (["TASK", "REVISION_REQUEST"].includes(String(current.kind || ""))
+        if (["TASK", "REVISION_REQUEST", "INSTRUCTION_CONTINUATION"].includes(String(current.kind || ""))
             && String(current.accountId || "") === normalizedAccountId
             && String(current.recipientTelegramUserId || "") === sender) {
           const currentIntent = await db.telegramDeliveryIntent.findFirst({ where: { id: String(current.intentId || ""), agencyId, customOrderId: orderId } });

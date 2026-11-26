@@ -77,8 +77,8 @@ async function executeDomain(context, agencyId, userId, actorMember, actorDevice
     actorMemberId: actorMember.id, actorDeviceId, actorProof: command.actorProof };
   switch (command.action) {
     case "member.update": return { ok: true, member: await team.updateMemberSettings({ ...args, memberId: id, patch: p }) };
-    case "member.status": return { ok: true, ...await team.setMemberStatus({ ...args, memberId: id, status: p.status }) };
-    case "member.remove": return { ok: true, ...await team.removeMember({ ...args, memberId: id }), historicalAttributionPreserved: true };
+    case "member.status": return { ok: true, ...await team.setMemberStatus({ ...args, memberId: id, status: p.status, expectedRevision: p.expectedRevision }) };
+    case "member.remove": return { ok: true, ...await team.removeMember({ ...args, memberId: id, expectedRevision: p.expectedRevision }), historicalAttributionPreserved: true };
     case "invitation.create": return { ok: true, ...await team.createInvitation({ ...args, input: p, invitationToken: invitationToken(agencyId, userId, command) }) };
     case "invitation.reissue": return { ok: true, ...await team.reissueInvitation({ ...args, invitationId: id, expiresInDays: p.expiresInDays, invitationToken: invitationToken(agencyId, userId, command) }) };
     case "invitation.revoke": return { ok: true, ...await team.revokeInvitation({ ...args, invitationId: id }) };

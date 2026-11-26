@@ -276,16 +276,7 @@
   }
 
   function showModal(title, html) {
-    let m = document.querySelector(".adm-modal-overlay");
-    if (m) m.remove();
-    m = document.createElement("div");
-    m.className = "adm-modal-overlay";
-    m.innerHTML = `<div class="adm-modal"><div class="adm-modal-head"><b>${esc(title)}</b><button class="adm-modal-close">✕</button></div><div class="adm-modal-body">${html}</div></div>`;
-    document.body.appendChild(m);
-    m.querySelector(".adm-modal-close").addEventListener("click", () => m.remove());
-    m.addEventListener("click", (e) => {
-      if (e.target === m) m.remove();
-    });
+    return window.NodAdminUI.dialog({ title, body: html }).overlay;
   }
 
   window.NodAdminCreatorDetail = { render };

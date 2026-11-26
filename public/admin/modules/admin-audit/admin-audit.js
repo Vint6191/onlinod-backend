@@ -255,14 +255,7 @@
 
     const meta = evt.metadata || {};
 
-    slot.innerHTML = `
-      <div class="adm-drawer-backdrop" data-modal-close></div>
-      <aside class="adm-drawer" style="width:min(720px,96vw);">
-        <div class="adm-drawer-head">
-          <div class="adm-drawer-title">Event diff</div>
-          <button class="adm-btn ghost" data-modal-close>×</button>
-        </div>
-        <div class="adm-drawer-body">
+    window.NodAdminUI.dialog({ mount: slot, title: "Event diff", width: "min(720px,96vw)", body: `
           <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px 16px;
                       font-family:var(--adm-mono);font-size:11.5px;margin-bottom:14px;">
             <div><span style="color:var(--adm-muted);">time</span><br>${r.escapeHtml(u.formatDateTime(evt.createdAt))}</div>
@@ -288,15 +281,7 @@
             border-radius:6px;padding:10px;font-family:var(--adm-mono);
             font-size:11px;overflow:auto;max-height:240px;color:var(--adm-text-soft);
           ">${r.escapeHtml(JSON.stringify(meta.after ?? null, null, 2))}</pre>
-        </div>
-      </aside>
-    `;
-
-    slot.querySelectorAll("[data-modal-close]").forEach((el) => {
-      el.addEventListener("click", () => {
-        slot.innerHTML = "";
-      });
-    });
+    ` });
   }
 
   window.NodAdminAudit = { render };

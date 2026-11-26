@@ -22,22 +22,43 @@
   function icon(name) {
     return `<svg class="adm-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.dashboard}</svg>`;
   }
-  function drawer({ title, subtitle = "", body, eyebrow = "Управление моделью" }) {
+  const dialogs = new Set();
+  let dialogSequence = 0;
+  function closeAll({ restoreFocus = false } = {}) {
+    for (const dialog of Array.from(dialogs)) dialog.close({ restoreFocus });
     document.querySelectorAll(".adm-modal-overlay").forEach((node) => node.remove());
-    const previous = document.activeElement,
-      esc = window.NodAdminRouter.escapeHtml;
+  }
+  function drawer({ title, subtitle = "", body, eyebrow = "Управление моделью", mount = document.body, variant = "side", width = "" }) {
+    let previous = document.activeElement;
+    for (const dialog of dialogs) if (dialog.overlay.contains(previous)) previous = dialog.previous;
+    closeAll();
+    const esc = window.NodAdminRouter.escapeHtml;
+    const titleId = `admDialogTitle${++dialogSequence}`;
     const overlay = document.createElement("div");
-    overlay.className = "adm-modal-overlay adm-side-overlay";
-    overlay.innerHTML = `<section class="adm-side-sheet" role="dialog" aria-modal="true" aria-labelledby="admSheetTitle" tabindex="-1"><header class="adm-modal-head"><div><p class="adm-eyebrow">${esc(eyebrow)}</p><h2 id="admSheetTitle">${esc(title)}</h2></div><button type="button" class="adm-btn ghost adm-icon-btn" data-sheet-close aria-label="Закрыть">${icon("close")}</button></header><div class="adm-sheet-context">${subtitle}</div><div class="adm-sheet-body">${body}</div></section>`;
-    document.body.append(overlay);
-    const sheet = overlay.querySelector(".adm-side-sheet");
-    const close = () => {
+    overlay.className = variant === "side" ? "adm-modal-overlay adm-side-overlay" : "adm-modal-overlay";
+    overlay.innerHTML = variant === "side"
+      ? `<section class="adm-side-sheet" role="dialog" aria-modal="true" aria-labelledby="${titleId}" tabindex="-1"><header class="adm-modal-head"><div><p class="adm-eyebrow">${esc(eyebrow)}</p><h2 id="${titleId}">${esc(title)}</h2></div><button type="button" class="adm-btn ghost adm-icon-btn" data-sheet-close aria-label="Закрыть">${icon("close")}</button></header><div class="adm-sheet-context">${subtitle}</div><div class="adm-sheet-body">${body}</div></section>`
+      : `<section class="adm-drawer" role="dialog" aria-modal="true" aria-labelledby="${titleId}" tabindex="-1"><header class="adm-drawer-head"><h2 class="adm-drawer-title" id="${titleId}">${esc(title)}</h2><button type="button" class="adm-btn ghost" data-modal-close data-drawer-close aria-label="Закрыть">×</button></header><div class="adm-drawer-body">${body}</div></section>`;
+    if (mount === document.body) mount.append(overlay);
+    else mount.replaceChildren(overlay);
+    const sheet = overlay.querySelector('[role="dialog"]');
+    if (width) sheet.style.width = width;
+    let closed = false;
+    const close = ({ restoreFocus = true } = {}) => {
+      if (closed) return;
+      closed = true;
+      dialogs.delete(handle);
       overlay.remove();
-      if (previous?.isConnected) previous.focus();
+      if (restoreFocus && previous?.isConnected) previous.focus({ preventScroll: true });
     };
-    overlay.querySelector("[data-sheet-close]").addEventListener("click", close);
+    const handle = { overlay, sheet, close, previous };
+    dialogs.add(handle);
     overlay.addEventListener("click", (event) => {
-      if (event.target === overlay) close();
+      const target = event.target;
+      if (target === overlay || target.closest?.("[data-sheet-close], [data-modal-close], [data-drawer-close]")) {
+        event.preventDefault();
+        close();
+      }
     });
     overlay.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
@@ -62,8 +83,9 @@
       }
     });
     sheet.focus();
-    return { overlay, sheet, close };
+    return { overlay, sheet, close, body: sheet.querySelector(".adm-drawer-body, .adm-sheet-body") };
   }
+  function dialog(options) { return drawer({ ...options, variant: "modal" }); }
   function subject(model) {
     const esc = window.NodAdminRouter.escapeHtml;
     return `<strong>${esc(model.displayName || model.username || model.creatorId)}</strong><span>${esc(model.agencyName || "Агентство")} · @${esc(model.username || "—")}</span><small>Модель ${esc(model.creatorId)}${model.remoteId ? ` · OnlyFans ${esc(model.remoteId)}` : ""}</small>`;
@@ -151,5 +173,5 @@
       }
     });
   }
-  window.NodAdminUI = { icon, drawer, subject, commandForm };
+  window.NodAdminUI = { icon, drawer, dialog, closeAll, subject, commandForm };
 })();

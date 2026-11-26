@@ -12,12 +12,13 @@ const creatorAccessSchema = z.union([
   z.object({ mode: z.enum(["all", "scoped"]), creatorIds: z.array(z.string().trim().min(1).max(180)).max(10000).default([]) }),
 ]);
 const memberSettingsSchema = z.object({
+  expectedRevision: z.number().int().positive().optional(),
   displayName: z.string().trim().min(1).max(120).nullable().optional(),
   roleKey: z.string().trim().min(1).max(100).optional(),
   functions: z.array(functionSchema).max(TEAM_FUNCTION_KEYS.length).optional(),
   assignedCreators: creatorAccessSchema.optional(),
 }).strict();
-const memberStatusSchema = z.object({ status: z.enum(["active", "deactivated"]) }).strict();
+const memberStatusSchema = z.object({ expectedRevision: z.number().int().positive().optional(), status: z.enum(["active", "deactivated"]) }).strict();
 const invitationSchema = z.object({
   email: z.string().trim().email().max(254).nullable().optional(),
   displayName: z.string().trim().min(1).max(120).nullable().optional(),
@@ -57,7 +58,7 @@ const shift = z.object({
 const ACTIONS = Object.freeze({
   "member.update": memberSettingsSchema,
   "member.status": memberStatusSchema,
-  "member.remove": empty,
+  "member.remove": z.object({ expectedRevision: z.number().int().positive().optional() }).strict(),
   "invitation.create": invitationSchema,
   "invitation.reissue": reissueSchema,
   "invitation.revoke": empty,
@@ -68,7 +69,7 @@ const ACTIONS = Object.freeze({
   "role.reset": empty,
   "role.delete": empty,
   "shift.create": shift,
-  "shift.update": shift.partial().extend({ expectedRevision: z.number().int().positive() }),
+  "shift.update": shift.partial().extend({ expectedRevision: z.number().int().positive(), timeEditVersion: z.literal(1).optional() }),
   "shift.cancel": z.object({ expectedRevision: z.number().int().positive(), reason: z.string().trim().max(500).nullable().optional() }).strict(),
 });
 const envelope = z.object({

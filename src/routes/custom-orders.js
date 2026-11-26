@@ -4,6 +4,7 @@ const express = require("express");
 const prisma = require("../prisma");
 const {
   createCustomOrder,
+  resolveOrAbortCustomCreate,
   getCustomOrder,
   getCustomOrderByClientMutationId,
   listCustomOrders,
@@ -42,6 +43,7 @@ const { prepareCustomManualDeliveryCommit } = require("../services/custom-manual
 
 const {
   planTelegramDeliveryIntent,
+  getTelegramInstruction,
   listTelegramDeliveryWork,
   claimTelegramDeliveryIntent,
   beginTelegramDeliveryIntent,
@@ -114,6 +116,21 @@ router.post("/", async (req, res) => {
     const result = await createCustomOrder({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, input: req.body || {}, db: prisma });
     return res.status(result.idempotent ? 200 : 201).json(result);
   } catch (err) { return sendError(res, err, "CUSTOM_ORDER_CREATE_FAILED"); }
+});
+
+router.post("/resolve-create", async (req, res) => {
+  try {
+    return res.json(await resolveOrAbortCustomCreate({ agencyId: req.auth.agencyId,
+      member: req.auth.membership || req.member, input: req.body || {}, db: prisma }));
+  } catch (err) { return sendError(res, err, "CUSTOM_ORDER_CREATE_RESOLUTION_FAILED"); }
+});
+
+router.get("/:orderId/instruction-continuation-preview", async (req, res) => {
+  try {
+    return res.json(await require("../services/custom-instruction-continuation-service").previewInstructionContinuation({
+      agencyId: req.auth.agencyId, member: req.auth.membership || req.member, orderId: req.params.orderId,
+      sourceIntentId: req.query.sourceIntentId || null, db: prisma }));
+  } catch (err) { return sendError(res, err, "CUSTOM_CONTINUATION_PREVIEW_FAILED"); }
 });
 
 router.get("/submissions", async (req, res) => {
@@ -570,6 +587,7 @@ router.post("/telegram-inbound", async (req, res) => {
     requireProductDevice(req, req.body?.deviceId);
     return res.json(await ingestTelegramInboundEvent({
       agencyId: req.auth.agencyId, member: req.auth.membership || req.member, accountId: req.body?.accountId, deviceId: req.body?.deviceId, claimToken: req.body?.claimToken,
+      handoffVersion: req.body?.handoffVersion,
       senderTelegramUserId: req.body?.senderTelegramUserId, messageId: req.body?.messageId, replyToMessageId: req.body?.replyToMessageId, groupedId: req.body?.groupedId,
       hasMedia: req.body?.hasMedia === true, text: req.body?.text, sentAt: req.body?.sentAt, db: prisma,
     }));
@@ -613,16 +631,16 @@ router.get("/telegram-deliveries/reminder-planning-blocked", async (req, res) =>
 });
 
 router.post("/telegram-deliveries/work", async (req, res) => {
-  try { requireProductDevice(req, req.body?.deviceId); return res.json(await listTelegramDeliveryWork({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, limit: req.body?.limit, db: prisma })); }
+  try { requireProductDevice(req, req.body?.deviceId); return res.json(await listTelegramDeliveryWork({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, limit: req.body?.limit, instructionManifestVersion: req.body?.instructionManifestVersion, db: prisma })); }
   catch (err) { return sendError(res, err, "TELEGRAM_DELIVERY_WORK_FAILED"); }
 });
 
 router.post("/telegram-deliveries/:intentId/claim", async (req, res) => {
-  try { requireProductDevice(req, req.body?.deviceId); return res.json(await claimTelegramDeliveryIntent({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, intentId: req.params.intentId, deviceId: req.body?.deviceId, runtimeClaimToken: req.body?.runtimeClaimToken, db: prisma })); }
+  try { requireProductDevice(req, req.body?.deviceId); return res.json(await claimTelegramDeliveryIntent({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, intentId: req.params.intentId, deviceId: req.body?.deviceId, runtimeClaimToken: req.body?.runtimeClaimToken, instructionManifestVersion: req.body?.instructionManifestVersion, db: prisma })); }
   catch (err) { return sendError(res, err, "TELEGRAM_DELIVERY_CLAIM_FAILED"); }
 });
 router.post("/telegram-deliveries/:intentId/begin", async (req, res) => {
-  try { requireProductDevice(req, req.body?.deviceId); return res.json(await beginTelegramDeliveryIntent({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, intentId: req.params.intentId, deviceId: req.body?.deviceId, runtimeClaimToken: req.body?.runtimeClaimToken, claimToken: req.body?.claimToken, db: prisma })); }
+  try { requireProductDevice(req, req.body?.deviceId); return res.json(await beginTelegramDeliveryIntent({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, intentId: req.params.intentId, deviceId: req.body?.deviceId, runtimeClaimToken: req.body?.runtimeClaimToken, claimToken: req.body?.claimToken, instructionManifestVersion: req.body?.instructionManifestVersion, db: prisma })); }
   catch (err) { return sendError(res, err, "TELEGRAM_DELIVERY_BEGIN_FAILED"); }
 });
 router.post("/telegram-deliveries/:intentId/confirm", async (req, res) => {
@@ -663,8 +681,13 @@ router.get("/:orderId/telegram-context", async (req, res) => {
 });
 
 router.post("/:orderId/telegram-deliveries/plan", async (req, res) => {
-  try { return res.json(await planTelegramDeliveryIntent({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, orderId: req.params.orderId, kind: req.body?.kind, clientIntentId: req.body?.clientIntentId, reference: req.body?.reference, db: prisma })); }
+  try { return res.json(await planTelegramDeliveryIntent({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, orderId: req.params.orderId, kind: req.body?.kind, clientIntentId: req.body?.clientIntentId, reference: req.body?.reference, instructionManifestVersion: req.body?.instructionManifestVersion, db: prisma })); }
   catch (err) { return sendError(res, err, "TELEGRAM_DELIVERY_PLAN_FAILED"); }
+});
+
+router.get("/telegram-deliveries/:intentId/instruction", async (req, res) => {
+  try { return res.json(await getTelegramInstruction({ agencyId: req.auth.agencyId, member: req.auth.membership || req.member, intentId: req.params.intentId, db: prisma })); }
+  catch (err) { return sendError(res, err, "CUSTOM_INSTRUCTION_READ_FAILED"); }
 });
 
 

@@ -707,11 +707,11 @@ async function reconcilePendingInboundForRecipient({ agencyId, accountId, sender
   return reconcilePendingInboundForConfirmedDelivery({ agencyId, accountId, senderTelegramUserId, actorUserId, now, limit, cursor, db });
 }
 
-async function ingestTelegramInboundEvent({ agencyId, member, accountId, deviceId, claimToken, senderTelegramUserId, messageId, replyToMessageId = null, groupedId = null, hasMedia = false, text = null, sentAt: sentAtInput = null, now = new Date(), db = null } = {}) {
+async function ingestTelegramInboundEvent({ agencyId, member, accountId, deviceId, claimToken, handoffVersion = 0, senderTelegramUserId, messageId, replyToMessageId = null, groupedId = null, hasMedia = false, text = null, sentAt: sentAtInput = null, now = new Date(), db = null } = {}) {
   const client = db || require("../prisma"); const normalizedAccountId = clean(accountId, 180); const sender = clean(senderTelegramUserId, 40);
   if (!normalizedAccountId || !/^\d{1,20}$/.test(sender)) throw fail("TELEGRAM_INBOUND_SCOPE_INVALID", "Telegram account and sender identity are required");
   const inboundMessageId = positiveInt(messageId, "messageId"); const replyId = positiveInt(replyToMessageId, "replyToMessageId", true); const observedAt = sentAt(sentAtInput, now);
-  await assertTelegramInboundRuntimeLease({ agencyId, member, accountId: normalizedAccountId, deviceId, claimToken, now, db: client });
+  await assertTelegramInboundRuntimeLease({ agencyId, member, accountId: normalizedAccountId, deviceId, claimToken, handoffVersion, now, db: client });
 
   // Correlation can seed the row, but the acceptance boundary is the durable provider event itself.
   // Any business projection after create/find is backend-owned and can never make Desktop retain the observation.

@@ -3,6 +3,7 @@ const { runDbTransaction, lockDbAdvisoryXact } = require("./db-transaction-servi
 
 
 const crypto = require("node:crypto");
+const { readInstructionManifest, instructionDeliveryState } = require("./custom-instruction-manifest");
 const { audit } = require("./audit-service");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
 const {
@@ -35,6 +36,13 @@ function clientMutationId(value) {
   const text = String(value == null ? "" : value).trim().toLowerCase();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text)) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_ID_REQUIRED", "clientMutationId must be a stable UUID");
   return text;
+}
+function createAbortReceiptId(agencyId, mutationId) { return `custom-create:${agencyId}:${mutationId}`; }
+function assertCreateAbortScope(receipt, { agencyId, creatorId, dialogId }) {
+  if (receipt && (receipt.agencyId !== agencyId || receipt.action !== "custom.create" || receipt.targetId !== creatorId
+    || receipt.reference?.dialogId !== dialogId || receipt.status !== "ABANDONED")) {
+    throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "Create intent is bound to another scope", 409);
+  }
 }
 function stableCreateFingerprint(data) {
   const value = {
@@ -173,6 +181,25 @@ const ORDER_INCLUDE = Object.freeze({
   createdByMember: { select: { id: true, displayName: true, roleKey: true, user: { select: { name: true, email: true } } } },
 });
 
+async function attachInstructionSummaries({ rows, agencyId, member, db }) {
+  if (!rows.length || !db.telegramDeliveryIntent?.findMany) return rows;
+  const instructions = await db.telegramDeliveryIntent.findMany({ where: { agencyId, customOrderId: { in: rows.map(row => row.id) }, kind: { in: ["TASK", "REVISION_REQUEST", "INSTRUCTION_CONTINUATION"] } },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }], distinct: ["customOrderId"] });
+  const canContinue = member && await require("./team-access-control").canUsePermission({ member, key: "content.review_customs", db });
+  for (const row of rows) {
+    const instruction = instructions.find(item => item.customOrderId === row.id);
+    if (!instruction) continue;
+    const manifest = readInstructionManifest(instruction);
+    const legacyIncomplete = require("./custom-instruction-continuation-service").sourceLooksIncomplete(instruction, row);
+    row.telegramInstruction = { intentId: instruction.id, state: instructionDeliveryState(instruction),
+      kind: instruction.kind, sourceIntentId: instruction.payload?.sourceIntentId || null,
+      parts: manifest?.parts.length || 1, confirmedParts: manifest?.confirmedParts ?? (instruction.state === "CONFIRMED" ? 1 : 0),
+      contentHash: manifest?.contentHash || null, locked: Boolean(instruction.commitStartedAt || instruction.state === "CONFIRMED"),
+      legacyTextMayBeIncomplete: legacyIncomplete, continuationEligible: Boolean(legacyIncomplete && row.status === "PENDING" && canContinue) };
+  }
+  return rows;
+}
+
 function serializeOrder(row, now = new Date()) {
   if (!row) return null;
   const dueAt = row.dueAt ? new Date(row.dueAt) : null;
@@ -221,6 +248,7 @@ function serializeOrder(row, now = new Date()) {
     priceCents: Math.max(0, Number(row.priceCents || 0)), price: Math.max(0, Number(row.priceCents || 0)) / 100,
     ...paymentSnapshot(row.priceCents, row.paidAmountCents),
     telegramTaskMessageId: row.telegramTaskMessageId == null ? null : String(row.telegramTaskMessageId),
+    ...(row.telegramInstruction ? { telegramInstruction: row.telegramInstruction } : {}),
     telegramReferenceMessageIds: Array.isArray(row.telegramReferenceMessageIds) ? row.telegramReferenceMessageIds.map(String) : [],
     telegramLastModelMessageId: row.telegramLastModelMessageId == null ? null : String(row.telegramLastModelMessageId),
     telegramLastModelMessageAt: row.telegramLastModelMessageAt ? new Date(row.telegramLastModelMessageAt).toISOString() : null,
@@ -273,6 +301,7 @@ async function listCustomOrders({ agencyId, member, creatorId = null, dialogId =
   }
   const overdueCount = Number(contentOverdueCount || 0) + Number(oldCallOverdueCount || 0) + recentCallOverdueCount;
   const dueSoonCount = Number(contentDueSoonCount || 0) + Number(upcomingCallCount || 0) + callDueNowCount;
+  await attachInstructionSummaries({ rows: items, agencyId, member, db: client });
   return { ok: true, items: items.map((row) => serializeOrder(row, now)), count, nextOffset: skip + items.length, hasMore: skip + items.length < count, counts: { pending: pendingCount, completed: completedCount, missed: missedCount, cancelled: cancelledCount, overdue: overdueCount, dueSoon: dueSoonCount }, serverNow: now.toISOString() };
 }
 
@@ -320,6 +349,9 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
       }
       return { row: existing, idempotent: true };
     }
+    const aborted = await tx.managementCommandReceipt.findUnique({ where: { id: createAbortReceiptId(agencyId, data.clientMutationId) } });
+    assertCreateAbortScope(aborted, { agencyId, creatorId: data.creatorId, dialogId: data.dialogId });
+    if (aborted) throw fail("CUSTOM_ORDER_CREATE_ABORTED", "This create intent was resolved without an order and cannot run later", 409);
     let row = await tx.customOrder.create({ data: { agencyId, creatorId: data.creatorId, dialogId: data.dialogId, createdByMemberId: member.id, clientMutationId: data.clientMutationId, clientMutationFingerprint: fingerprint, scenario: data.scenario, internalNote: data.internalNote, type: data.type, contentKind: data.contentKind, status: "PENDING", dueAt: data.dueAt, scheduledAt: data.scheduledAt, durationMinutes: data.durationMinutes, physicalStatus: data.physicalStatus, physicalStatusChangedAt: data.type === "PHYSICAL" ? now : null, mediaIds: data.mediaIds, priceCents: data.priceCents, paidAmountCents: data.paidAmountCents, reminderConfig: data.reminderConfig, nextReminderAt: null }, include: ORDER_INCLUDE });
     await reprojectCustomReminderSchedule({ agencyId, orderId: row.id, now, db: tx });
     row = await tx.customOrder.findFirst({ where: { id: row.id, agencyId }, include: ORDER_INCLUDE }) || row;
@@ -333,6 +365,40 @@ async function createCustomOrder({ agencyId, member, input, now = new Date(), db
     await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.create", targetType: "CustomOrder", targetId: row.id, metadata: { creatorId: row.creatorId, dialogId: row.dialogId, type: row.type, status: row.status, dueAt: row.dueAt, scheduledAt: row.scheduledAt, priceCents: row.priceCents, paidAmountCents: payment.paidAmountCents, remainingAmountCents: payment.remainingAmountCents, paymentStatus: payment.paymentStatus, clientMutationId: data.clientMutationId }, db: client });
   }
   return { ok: true, idempotent: outcome.idempotent, order: serializeOrder(row, now) };
+}
+
+async function resolveOrAbortCustomCreate({ agencyId, member, input = {}, now = new Date(), db = null } = {}) {
+  if (!agencyId || !member?.id) throw fail("CUSTOM_ORDER_ACTOR_REQUIRED", "Agency membership is required", 403);
+  const client = db || require("../prisma");
+  const mutationId = clientMutationId(input.clientMutationId);
+  const creatorId = required(input.creatorId, "creatorId", 100), dialogId = required(input.dialogId, "dialogId", 100);
+  return runDbTransaction(client, async (tx) => {
+    await lockAgencyPipelineLifecycle({ db: tx, agencyId });
+    // The same lock as create serializes an absent-order decision with any
+    // delayed original POST. An empty GET is never an abandonment proof.
+    await lockDbAdvisoryXact({ db: tx, key: `custom-create:${agencyId}:${mutationId}` });
+    await assertCustomManagementCreatorAccess({ agencyId, actorMember: member, creatorId, permissionKey: null, db: tx });
+    await lockCreatorPipelineLifecycle({ db: tx, agencyId, creatorId });
+    const row = await tx.customOrder.findFirst({ where: { agencyId, clientMutationId: mutationId }, include: ORDER_INCLUDE });
+    if (row) {
+      if (row.creatorId !== creatorId || row.dialogId !== dialogId) throw fail("CUSTOM_ORDER_CLIENT_MUTATION_CONFLICT", "Create intent is bound to another scope", 409);
+      return { ok: true, clientMutationId: mutationId, state: "COMMITTED", order: serializeOrder(row, now) };
+    }
+    const id = createAbortReceiptId(agencyId, mutationId);
+    const receipt = await tx.managementCommandReceipt.findUnique({ where: { id } });
+    assertCreateAbortScope(receipt, { agencyId, creatorId, dialogId });
+    if (!receipt) {
+      // This namespace is never exposed as a generic management command and
+      // follows its existing no-TTL receipt retention until agency purge.
+      await tx.managementCommandReceipt.create({ data: { id, agencyId, userId: member.userId,
+        action: "custom.create", targetId: creatorId,
+        fingerprint: crypto.createHash("sha256").update(JSON.stringify([agencyId, creatorId, dialogId, mutationId])).digest("hex"),
+        status: "ABANDONED", reference: { creatorId, dialogId, clientMutationId: mutationId, policyVersion: 1 } } });
+      await audit({ agencyId, actorUserId: member.userId, action: "custom_order.create_abandoned", targetType: "CustomCreateIntent", targetId: mutationId,
+        metadata: { creatorId, dialogId, policyVersion: 1 }, db: tx });
+    }
+    return { ok: true, clientMutationId: mutationId, state: "ABORTED", order: null };
+  });
 }
 
 async function getCustomOrderByClientMutationId({ agencyId, member, clientMutationId: mutationId, now = new Date(), db = null } = {}) {
@@ -358,6 +424,7 @@ async function loadOwnedOrder({ agencyId, member, orderId, db = null }) {
 
 async function getCustomOrder({ agencyId, member, orderId, now = new Date(), db = null } = {}) {
   const row = await loadOwnedOrder({ agencyId, member, orderId, db });
+  await attachInstructionSummaries({ rows: [row], agencyId, member, db: db || require("../prisma") });
   return { ok: true, order: serializeOrder(row, now) };
 }
 
@@ -492,7 +559,7 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
       where: {
         agencyId,
         customOrderId: current.id,
-        kind: { in: ["TASK", "REVISION_REQUEST"] },
+        kind: { in: ["TASK", "REVISION_REQUEST", "INSTRUCTION_CONTINUATION"] },
         state: { in: ["COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"] },
       },
       select: { id: true, kind: true },
@@ -597,6 +664,6 @@ async function updateCustomOrder({ agencyId, member, orderId, input, now = new D
 
 module.exports = {
   CUSTOM_ORDER_STATUSES, CUSTOM_ORDER_TYPES, CUSTOM_ORDER_CONTENT_KINDS, CUSTOM_ORDER_PHYSICAL_STATUSES, CUSTOM_ORDER_PAYMENT_STATUSES,
-  buildUpdateData, callPhaseSnapshot, createCustomOrder, getCustomOrder, getCustomOrderByClientMutationId, listCustomOrders, loadOwnedOrder, mediaIdsArray, mediaIdsString, paymentSnapshot,
+  buildUpdateData, callPhaseSnapshot, createCustomOrder, resolveOrAbortCustomCreate, getCustomOrder, getCustomOrderByClientMutationId, listCustomOrders, loadOwnedOrder, mediaIdsArray, mediaIdsString, paymentSnapshot,
   normalizeCreateInput, normalizePaidAmountCents, normalizeStatus, normalizeType, serializeOrder, updateCustomOrder,
 };

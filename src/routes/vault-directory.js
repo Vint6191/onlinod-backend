@@ -144,12 +144,13 @@ router.post("/:creatorId/never-used/items", async (req, res) => {
 
 router.post("/:creatorId/intelligence", async (req, res) => {
   try {
-    const result = await getVaultDirectoryIntelligence({
-      agencyId: req.auth.agencyId,
-      creatorId: req.params.creatorId,
+    const result = await require("../services/media-money-viewer-service").readMediaWithViewer({
+      userId: req.auth.userId, creatorId: req.params.creatorId, member: req.auth.membership || req.member || null,
+    }, ({ db, creator, moneyAllowed }) => getVaultDirectoryIntelligence({
+      db, moneyAllowed, agencyId: creator.agencyId, creatorId: creator.id,
       mediaIds: req.body?.mediaIds || [],
       includePipeline: req.body?.includePipeline !== false,
-    });
+    }));
     return res.json(result);
   } catch (error) {
     return sendError(res, error, "VAULT_DIRECTORY_INTELLIGENCE_FAILED");

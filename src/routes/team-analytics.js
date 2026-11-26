@@ -13,6 +13,7 @@ const {
 } = require("../services/team-analytics-service");
 const {
   listPpvConflicts,
+  listPpvConflictPage,
   resolvePpvConflict,
 } = require("../services/team-ppv-ledger-service");
 const {
@@ -140,16 +141,15 @@ function ppvClaimForViewer(row, canViewAudit) {
 router.get("/ppv/conflicts", async (req, res) => {
   try {
     const viewer = await requirePpvClaimsManager(req, res); if (!viewer) return;
-    const includeClosed = String(req.query.includeClosed || req.query.include_closed || "") === "1" || String(req.query.includeClosed || "").toLowerCase() === "true";
-    const conflicts = (await listPpvConflicts({
-      agencyId: viewer.agencyId,
-      limit: req.query.limit || 100,
-      includeClosed,
-      allowedCreatorIds: viewer.allowedCreatorIds,
-    })).map((row) => ppvClaimForViewer(row, viewer.canViewAudit));
-    return res.json({ ok: true, conflicts });
+    if (String(req.query.contractVersion || "") !== "2") return res.status(426).json({ ok: false, code: "CLAIMS_READER_UPDATE_REQUIRED", error: "Update NOD to read the complete Claims queue." });
+    const page = await listPpvConflictPage({
+      agencyId: viewer.agencyId, allowedCreatorIds: viewer.allowedCreatorIds,
+      actorScope: [viewer.member.id, viewer.member.accessEpoch], limit: req.query.limit || 100,
+      state: req.query.state || "needs_review", query: req.query.query || "", creatorId: req.query.creatorId || null, cursor: req.query.cursor || null,
+    });
+    return res.json({ ...page, conflicts: page.conflicts.map(row => ppvClaimForViewer(row, viewer.canViewAudit)) });
   } catch (err) {
-    return res.status(500).json({ ok: false, code: "PPV_CONFLICTS_FAILED", error: err?.message || "Failed" });
+    return res.status(Number(err.status) || 500).json({ ok: false, code: err.code || "PPV_CONFLICTS_FAILED", error: err?.message || "Failed" });
   }
 });
 

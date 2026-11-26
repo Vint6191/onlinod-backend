@@ -1,4 +1,5 @@
 "use strict";
+const { instructionDeliveryState } = require("./custom-instruction-manifest");
 const { runDbTransaction } = require("./db-transaction-service");
 
 
@@ -586,9 +587,10 @@ async function resolveRetiredCreatorPendingCustomOrder({ agencyId, member, custo
 
     const telegramRows = tx.telegramDeliveryIntent?.findMany ? await tx.telegramDeliveryIntent.findMany({
       where: { agencyId, creatorId: current.creatorId, customOrderId: current.id },
-      select: { id: true, kind: true, state: true, commitStartedAt: true, remoteMessageId: true, remoteSentAt: true, confirmedAt: true },
+      select: { id: true, kind: true, state: true, instructionManifest: true, commitStartedAt: true, remoteMessageId: true, remoteSentAt: true, confirmedAt: true },
     }) : [];
     const unknownTelegram = (telegramRows || []).filter((row) => ["COMMITTING", "RECONCILE_REQUIRED"].includes(String(row.state)));
+    if (unknownTelegram.some(row => ["INSTRUCTION_PART", "INSTRUCTION_CONTINUATION"].includes(row.kind))) throw fail("CUSTOM_RETIRED_ORDER_INSTRUCTION_PART_OUTCOME_UNRESOLVED", "Resolve the physical instruction part before closing this historical Custom", 409);
     const unknownTask = unknownTelegram.find((row) => String(row.kind) === "TASK");
     if (unknownTask) {
       throw fail(
@@ -624,7 +626,7 @@ async function resolveRetiredCreatorPendingCustomOrder({ agencyId, member, custo
     const confirmedTask = (telegramRows || []).find((row) => String(row.kind) === "TASK" && String(row.state) === "CONFIRMED");
     let confirmedTaskMessageId = null;
     let confirmedTaskEffectAt = null;
-    if (confirmedTask) {
+    if (confirmedTask && instructionDeliveryState(confirmedTask) === "CONFIRMED") {
       confirmedTaskMessageId = Number(confirmedTask.remoteMessageId);
       if (!Number.isSafeInteger(confirmedTaskMessageId) || confirmedTaskMessageId <= 0) {
         throw fail("CUSTOM_RETIRED_ORDER_TASK_RECEIPT_INVALID", "Confirmed historical Telegram TASK is missing a valid provider message id", 409);
@@ -632,7 +634,7 @@ async function resolveRetiredCreatorPendingCustomOrder({ agencyId, member, custo
       if (current.telegramTaskMessageId != null && Number(current.telegramTaskMessageId) !== confirmedTaskMessageId) {
         throw fail("CUSTOM_RETIRED_ORDER_TASK_PROJECTION_CONFLICT", "Custom order is linked to a different Telegram TASK provider message", 409);
       }
-      const effectCandidate = confirmedTask.remoteSentAt || confirmedTask.confirmedAt || now;
+      const effectCandidate = confirmedTask.instructionManifest?.completedAt || confirmedTask.remoteSentAt || confirmedTask.confirmedAt || now;
       const parsedEffect = new Date(effectCandidate);
       confirmedTaskEffectAt = Number.isFinite(parsedEffect.getTime()) ? parsedEffect : now;
     }

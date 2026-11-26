@@ -61,6 +61,8 @@ function pendingSql(source = 'visible') {
   ), pending AS (
     SELECT c."id" FROM ${source} c WHERE EXISTS (SELECT 1 FROM "JobInstance" j WHERE j."agencyId"=$1
       AND j."creatorId"=c."id" AND j."jobKey" IN ('fetch_earnings','financial_transactions_scan') AND j."status" IN ('SCHEDULED','CLAIMED','PUBLISHING'))
+    OR EXISTS (SELECT 1 FROM "CreatorRecoveryIntent" i WHERE i."agencyId"=$1 AND i."creatorId"=c."id"
+      AND i.stream='financial' AND i.status IN ('PENDING','RUNNING'))
     OR EXISTS (SELECT 1 FROM live_demands d WHERE (d."creatorIds" IS NULL OR d."creatorIds"='null'::jsonb OR d."creatorIds" ? c."id")
       AND (d.broad OR EXISTS (SELECT 1 FROM "AgencyMemberCreatorAccessCurrent" x
         WHERE x."memberId"=d."requestedByMemberId" AND x."agencyId"=$1

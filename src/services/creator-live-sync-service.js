@@ -138,17 +138,18 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
         WHERE i."creatorId"=l."creatorId" AND i.status<>'COMPLETE' GROUP BY i.stream) q) AS "recoveryQueuedThrough",
       (SELECT max(other."capturedAt") FROM "CreatorRealtimeSession" other
         WHERE other."creatorId"=l."creatorId" AND other.id<>s.id AND other."retiredAt" IS NULL AND other.loss=false
+          AND other."ackedSeq">=other."capturedSeq"
           AND other."captureFromAt"<=COALESCE(s."capturedAt",l."lastCapturedAt")
           AND other."capturedAt">=COALESCE(s."capturedAt",l."lastCapturedAt")) AS "otherCoveredThrough",
       CASE WHEN s."capturedAt" IS NULL THEN EXISTS(SELECT 1 FROM "CreatorRealtimeSession" old
         WHERE old."creatorId"=l."creatorId" AND old."deviceId"=$4 AND old.id<>s.id AND old."capturedSeq">old."ackedSeq"
         AND old."updatedAt">$5::timestamp-interval '30 days') ELSE false END AS abandoned,
       CASE WHEN s.loss OR l."shortGapFrom" IS NOT NULL THEN EXISTS(SELECT 1 FROM "CreatorRecoveryIntent" i
-        WHERE i."creatorId"=l."creatorId" AND i.status<>'COMPLETE') ELSE false END AS pending,
+        WHERE i."creatorId"=l."creatorId" AND i.stream='financial' AND i.status<>'COMPLETE') ELSE false END AS pending,
       CASE WHEN s.loss OR l."shortGapFrom" IS NOT NULL THEN (SELECT min(at) FROM (
         SELECT stream,max(at) AS at FROM (
-          SELECT stream,"throughAt" AS at FROM "CreatorRecoveryWatermark" WHERE "creatorId"=l."creatorId"
-          UNION ALL SELECT stream,"targetAt" FROM "CreatorRecoveryIntent" WHERE "creatorId"=l."creatorId" AND status='COMPLETE'
+          SELECT stream,"throughAt" AS at FROM "CreatorRecoveryWatermark" WHERE "creatorId"=l."creatorId" AND stream='financial'
+          UNION ALL SELECT stream,"targetAt" FROM "CreatorRecoveryIntent" WHERE "creatorId"=l."creatorId" AND stream='financial' AND status='COMPLETE'
         ) history GROUP BY stream) completed) ELSE NULL END AS recovered
       FROM "CreatorLiveSync" l JOIN "CreatorRealtimeSession" s ON s.id=ANY($3::text[]) AND s."creatorId"=l."creatorId"
       LEFT JOIN "CreatorEarningsLedgerProof" p ON p."creatorId"=l."creatorId"
@@ -171,15 +172,18 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
       // suppress a repeated old gap when the websocket finally returns, but
       // must never advance lastCapturedAt or lastDeliveredAt by itself.
       const previous=captured&&recoveredThrough?new Date(Math.max(+captured,+recoveredThrough)):captured||recoveredThrough,
-        continuous=previous&&x.from&&x.from<=x.through&&+x.from<=+previous+SAMPLE_MAX_AGE_MS;
+        continuous=previous&&x.from&&x.from<=x.through&&x.from<=previous;
       const gap=previous&&!continuous?+x.through-previous:0,longGap=previous&&gap>=OFFLINE_GAP_MS;
       const otherThrough=date(l.otherCoveredThrough);
-      const coveredByOther=otherThrough && +otherThrough>=+x.through-SAMPLE_MAX_AGE_MS;
+      // A recent healthy sample is only liveness. Resolving another receiver's
+      // loss requires independent delivery through the entire lost interval.
+      const coveredByOther=otherThrough && +otherThrough>=+x.through;
       if (coveredByOther) resolved = Math.max(resolved,x.lossRevision);
       const captureLoss=(x.lossRevision>Number(s.lossRevision)||l.abandoned)&&!coveredByOther,delivered=Number(s.ackedSeq)>=x.seq;
-      if(longGap||captureLoss) {
+      const financialGap=Boolean(previous&&gap>0&&!coveredByOther);
+      if(longGap||captureLoss||financialGap) {
         const reason=captureLoss?"CAPTURE_LOSS":"OFFLINE_GAP";
-        for(const stream of STREAMS) {
+        for(const stream of longGap||captureLoss ? STREAMS : ["financial"]) {
           const queued=date(l.recoveryQueuedThrough?.[stream]);
           const from=queued&&queued>(previous||x.through)?queued:previous||x.through;
           // Reconnecting at the end of the same outage cannot manufacture a
@@ -187,7 +191,7 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
           // later outage is independent only after acquisition actually resumed
           // beyond that target, not merely because wall-clock time advanced.
           if (queued && (!previous || previous <= queued)) continue;
-          if(queued && (queued>=x.through || +x.through-from<OFFLINE_GAP_MS)) {
+          if(queued && (queued>=x.through || (stream!=="financial" && +x.through-from<OFFLINE_GAP_MS))) {
             // An API-only heartbeat may have already queued this interval.
             // Preserve that immutable target. A later, uncovered short tail
             // remains explicit debt until proof covers it; it is not capture.
@@ -202,19 +206,22 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
           wake.push(x.creatorId);
         }
       }
-      if(previous&&gap>SAMPLE_MAX_AGE_MS&&!longGap){shortFrom=!shortFrom||previous<shortFrom?previous:shortFrom;shortTo=!shortTo||x.through>shortTo?x.through:shortTo;}
+      if(financialGap&&!longGap){shortFrom=!shortFrom||previous<shortFrom?previous:shortFrom;shortTo=!shortTo||x.through>shortTo?x.through:shortTo;}
       const changed=!s.capturedAt||s.retiredAt||Number(s.capturedSeq)!==x.seq||x.lossRevision!==Number(s.lossRevision)
-        ||resolved!==Number(s.resolvedLossRevision)||String(shortFrom)!==String(date(l.shortGapFrom))||longGap||captureLoss||+now-date(s.updatedAt)>=60000;
+        ||resolved!==Number(s.resolvedLossRevision)||String(shortFrom)!==String(date(l.shortGapFrom))||longGap||captureLoss||financialGap||+now-date(s.updatedAt)>=60000;
       if(changed)writes.push({...x,resolved,shortFrom,shortTo,delivered,loss:x.lossRevision>resolved,
+        unackedSinceAt:delivered?null:date(s.unackedSinceAt)||(Number(s.capturedSeq)>Number(s.ackedSeq)?date(s.updatedAt):now),
+        unackedThroughAt:delivered?null:x.seq>Number(s.capturedSeq)?x.through:date(s.unackedThroughAt)||date(s.capturedAt)||x.through,
         lossAt:x.lossRevision>Number(s.lossRevision)?x.through:date(s.lossAt)});
-      output.push({recorded:true,coalesced:!changed,recoveryRequired:Boolean(longGap||captureLoss),delivered});
+      output.push({recorded:true,coalesced:!changed,recoveryRequired:Boolean(longGap||captureLoss||financialGap),delivered});
     }
     if(writes.length) {
       const json=JSON.stringify(writes);
       await db.$executeRawUnsafe(`UPDATE "CreatorRealtimeSession" s SET "capturedSeq"=x.seq,"capturedAt"=x.through,loss=x.loss,
         "captureFromAt"=CASE WHEN x."from"<=x.through THEN x."from" ELSE NULL END,
+        "unackedSinceAt"=x."unackedSinceAt","unackedThroughAt"=x."unackedThroughAt",
         "lossAt"=x."lossAt","lossRevision"=x."lossRevision","resolvedLossRevision"=x.resolved,"updatedAt"=$2,"retiredAt"=NULL
-        FROM jsonb_to_recordset($1::jsonb) x(id text,seq bigint,through timestamp,"from" timestamp,loss boolean,"lossAt" timestamp,"lossRevision" int,resolved int) WHERE s.id=x.id`,json,now);
+        FROM jsonb_to_recordset($1::jsonb) x(id text,seq bigint,through timestamp,"from" timestamp,loss boolean,"lossAt" timestamp,"lossRevision" int,resolved int,"unackedSinceAt" timestamp,"unackedThroughAt" timestamp) WHERE s.id=x.id`,json,now);
       await db.$executeRawUnsafe(`UPDATE "CreatorLiveSync" l SET "lastCapturedAt"=GREATEST(l."lastCapturedAt",x.through),
         "lastDeliveredAt"=CASE WHEN x.delivered THEN GREATEST(l."lastDeliveredAt",x.through) ELSE l."lastDeliveredAt" END,
         "shortGapFrom"=x."shortFrom","shortGapTo"=x."shortTo","updatedAt"=$2
@@ -256,6 +263,9 @@ async function recordCaptureSamples({db,agencyId,deviceId,memberId,accessEpoch,b
       await require("./domain-work-authority-service").publishDomainWorkBatch({db,items:[...new Set(wake)].map(creatorId=>({agencyId,creatorId,
         workClass:"CREATOR_RECURRING_PLANNING",objectType:"CreatorAccount",objectId:creatorId,partitionKey:creatorId}))});
     }
+    // Adopt legacy false confirmations and recover stranded receiver debt even
+    // when capture is healthy. This is bounded to the heartbeat's creator set.
+    await require("./financial-proof-repair-service").ensureFinancialDebt({db,agencyId,creatorIds:ids,now});
     if(writes.length) await require("./earnings-coverage-service").advanceDelivered(db,writes.map(x=>x.creatorId));
   }
   return output;
@@ -341,7 +351,9 @@ async function acceptDelivery({
     new Date(+now - 30 * 86400000)
   );
   await db.$executeRawUnsafe(
-    'UPDATE "CreatorRealtimeSession" SET "ackedSeq"=$2,"updatedAt"=$3 WHERE id=$1',
+    `UPDATE "CreatorRealtimeSession" SET "ackedSeq"=$2,"updatedAt"=$3,
+      "unackedSinceAt"=CASE WHEN $2>="capturedSeq" THEN NULL ELSE "unackedSinceAt" END,
+      "unackedThroughAt"=CASE WHEN $2>="capturedSeq" THEN NULL ELSE "unackedThroughAt" END WHERE id=$1`,
     s.id,
     ack,
     now
@@ -439,7 +451,8 @@ async function completeRecovery(db, job, successful, { deferPlanningWake = false
     const rows = await db.$queryRawUnsafe(
     `UPDATE "CreatorRecoveryIntent" SET status='COMPLETE',"completedAt"=clock_timestamp(),"updatedAt"=clock_timestamp()
     WHERE id=$1 AND "agencyId"=$2 AND "creatorId"=$3 AND stream=$4 AND "jobId"=$5 AND "policyVersion"=$6
-      AND status IN ('RUNNING','STOPPED','COMPLETE') AND "targetAt"<=$7::timestamp RETURNING "targetAt","gapFrom"`,
+      AND status IN ('RUNNING','STOPPED','COMPLETE') AND "targetAt"<=$7::timestamp
+      AND (reason<>'FINANCIAL_PROOF_ADOPTION_FULL' OR $8::boolean) RETURNING "targetAt","gapFrom"`,
     id,
     job.agencyId,
     job.creatorId,
@@ -449,7 +462,7 @@ async function completeRecovery(db, job, successful, { deferPlanningWake = false
     // Source boundaries are UTC instants stored in TIMESTAMP columns. Prisma
     // sends Date parameters as timestamptz; casting those through a non-UTC
     // database session would shift the immutable coverage boundary.
-    through.toISOString()
+    through.toISOString(), job.params?.collectionMode === "full"
   );
     if (!rows.length) throw error("LIVE_RECOVERY_COMPLETION_SCOPE_MISMATCH");
     through = date(rows[0].targetAt);
@@ -465,10 +478,11 @@ async function completeRecovery(db, job, successful, { deferPlanningWake = false
   await db.$executeRawUnsafe(
     `UPDATE "CreatorRecoveryIntent" SET status='COMPLETE',"completedAt"=clock_timestamp(),"updatedAt"=clock_timestamp()
     WHERE "creatorId"=$1 AND stream=$2 AND status<>'COMPLETE' AND "targetAt"<=$3::timestamp
-      AND ($4::timestamp IS NULL OR "gapFrom">=$4::timestamp)`,
+      AND ($4::timestamp IS NULL OR "gapFrom">=$4::timestamp)
+      AND (reason<>'FINANCIAL_PROOF_ADOPTION_FULL' OR $5::boolean)`,
     job.creatorId,
     stream,
-    through.toISOString(), from?.toISOString() || null
+    through.toISOString(), from?.toISOString() || null, job.params?.collectionMode === "full"
   );
   await db.$executeRawUnsafe(`INSERT INTO "CreatorRecoveryWatermark"("creatorId",stream,"throughAt") VALUES($1,$2,$3::timestamp)
     ON CONFLICT("creatorId",stream) DO UPDATE SET "throughAt"=GREATEST("CreatorRecoveryWatermark"."throughAt",EXCLUDED."throughAt")`,job.creatorId,stream,through.toISOString());

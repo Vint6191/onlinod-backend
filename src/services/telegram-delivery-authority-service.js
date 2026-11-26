@@ -2,6 +2,8 @@
 const { classifyCommitConflict } = require("./db-commit-kernel");
 
 const crypto = require("node:crypto");
+const { buildInstructionManifest, readInstructionManifest, instructionDeliveryState, instructionPayload,
+  assertInstructionPart, assertInstructionCapability, effectiveInstruction } = require("./custom-instruction-manifest");
 const { lockBillingWriteAdmission, assertBillingWriteAdmission, selectBillableTelegramWorkIds } = require("./billing-write-admission-service");
 const { audit } = require("./audit-service");
 const { allowedCreatorScope, requireCreatorAccess } = require("../middleware/automation-permissions");
@@ -39,7 +41,7 @@ const {
   taskText,
 } = require("./custom-order-reminders");
 
-const DELIVERY_KINDS = Object.freeze(["TASK", "REFERENCE", "MANUAL_REMINDER", "AUTO_REMINDER", "CANCELLATION", "REVISION_REQUEST"]);
+const DELIVERY_KINDS = Object.freeze(["TASK", "REFERENCE", "MANUAL_REMINDER", "AUTO_REMINDER", "CANCELLATION", "REVISION_REQUEST", "INSTRUCTION_PART", "INSTRUCTION_CONTINUATION"]);
 const DELIVERY_STATES = Object.freeze(["PLANNED", "CLAIMED", "COMMITTING", "CONFIRMED", "RECONCILE_REQUIRED", "CANCELLED", "FAILED_PRECOMMIT"]);
 const KIND_SET = new Set(DELIVERY_KINDS);
 const REMINDER_KINDS = new Set(["MANUAL_REMINDER", "AUTO_REMINDER"]);
@@ -117,6 +119,9 @@ function publicIntent(row) {
     id: String(row.id), creatorId: String(row.creatorId), customOrderId: String(row.customOrderId), customSubmissionId: row.customSubmissionId == null ? null : String(row.customSubmissionId), accountId: String(row.accountId),
     kind: String(row.kind), logicalKey: String(row.logicalKey), clientIntentId: row.clientIntentId || null,
     referenceOrdinal: row.referenceOrdinal == null ? null : Number(row.referenceOrdinal), payloadFingerprint: String(row.payloadFingerprint), payload,
+    instructionManifest: row.instructionManifest || null, instructionParentId: row.instructionParentId || null,
+    instructionPartIndex: row.instructionPartIndex == null ? null : Number(row.instructionPartIndex),
+    instructionState: row.instructionManifest ? instructionDeliveryState(row) : null,
     state: String(row.state), claimRevision: Number(row.claimRevision || 0), claimUntil: row.claimUntil ? new Date(row.claimUntil).toISOString() : null,
     commitStartedAt: row.commitStartedAt ? new Date(row.commitStartedAt).toISOString() : null,
     remoteMessageId: row.remoteMessageId == null ? null : String(row.remoteMessageId), remoteRecipientTelegramUserId: row.remoteRecipientTelegramUserId || null, remoteSentAt: row.remoteSentAt ? new Date(row.remoteSentAt).toISOString() : null,
@@ -150,11 +155,12 @@ async function resolveAccountForOrder({ agencyId, order, db }) {
 }
 
 async function loadConfirmedTaskThread({ agencyId, orderId, db }) {
-  const task = await db.telegramDeliveryIntent.findFirst({
+  const source = await db.telegramDeliveryIntent.findFirst({
     where: { agencyId, customOrderId: clean(orderId, 180), kind: "TASK", state: "CONFIRMED" },
     orderBy: [{ confirmedAt: "desc" }, { createdAt: "desc" }],
   });
-  if (!task || task.remoteMessageId == null) throw fail("TELEGRAM_DELIVERY_TASK_THREAD_REQUIRED", "A confirmed Telegram TASK receipt is required before follow-up delivery", 409);
+  const task = await effectiveInstruction(source, db, agencyId);
+  if (!task || !confirmedInstruction(task)) throw fail("TELEGRAM_DELIVERY_TASK_THREAD_REQUIRED", "A complete confirmed Telegram TASK instruction is required before follow-up delivery", 409);
   const recipientTelegramUserId = clean(task.remoteRecipientTelegramUserId, 40);
   if (!/^\d{1,20}$/.test(recipientTelegramUserId)) throw fail("TELEGRAM_DELIVERY_TASK_RECIPIENT_UNPROVEN", "The confirmed Telegram TASK does not contain a proven recipient identity", 409);
   return {
@@ -192,7 +198,8 @@ async function resolveInitialReferenceProviderBinding({ agencyId, order, db }) {
   const eligible = type === "CALL"
     ? obligation?.state === "INITIAL_CONFIRMED"
     : type === "CONTENT" && obligation?.state === "INITIAL_WAITING_RESPONSE" && obligation?.modelOwesResponse === true;
-  if (!eligible || String(obligation?.currentInstruction?.kind || "") !== "TASK") {
+  if (!eligible || !["TASK", "INSTRUCTION_CONTINUATION"].includes(String(obligation?.currentInstruction?.kind || ""))
+      || obligation?.currentInstruction?.kind === "INSTRUCTION_CONTINUATION" && obligation.currentInstruction.sourceKind !== "TASK") {
     throw fail("CUSTOM_MODEL_INITIAL_OBLIGATION_NOT_WAITING_RESPONSE", "Initial references require a current provider-confirmed content or call TASK", 409);
   }
   const instruction = obligation.currentInstruction;
@@ -222,14 +229,16 @@ async function resolveIntentProviderBinding({ agencyId, order, kind, customSubmi
   return loadConfirmedTaskThread({ agencyId, orderId: order.id, db });
 }
 
-async function createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId = null, referenceOrdinal = null, customSubmissionId = null, payload, now, db, reactivateCancelledTask = false, actorMember = null, _transactional = false }) {
+async function createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId = null, referenceOrdinal = null, customSubmissionId = null, payload, now, db, reactivateCancelledTask = false, actorMember = null, _transactional = false,
+  _instructionPrepared = false, instructionManifest = null, reservedId = null }) {
   // New Telegram work and Telegram-account retirement contend on the same account row.
   // Running the canonical-intent reservation in one transaction lets the no-op ACTIVE
   // update below act as a row mutex: either planning wins and retirement sees the new
   // blocker, or retirement wins and planning cannot create a new intent afterwards.
   if (!_transactional && typeof db?.$transaction === "function") {
     return runDbTransaction(db, 
-      (tx) => createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId, referenceOrdinal, customSubmissionId, payload, now, db: tx, reactivateCancelledTask, actorMember, _transactional: true }),
+      (tx) => createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId, referenceOrdinal, customSubmissionId, payload, now, db: tx, reactivateCancelledTask, actorMember, _transactional: true,
+        _instructionPrepared, instructionManifest, reservedId }),
       { isolationLevel: "Serializable" },
     );
   }
@@ -243,6 +252,29 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
     });
   }
   const key = logicalKey({ agencyId, orderId: order.id, kind, identity });
+  if (!_instructionPrepared && ["TASK", "REVISION_REQUEST", "INSTRUCTION_CONTINUATION"].includes(String(kind))) {
+    const existingInstruction = await db.telegramDeliveryIntent.findUnique({ where: { logicalKey: key } })
+      || (kind === "REVISION_REQUEST" && customSubmissionId ? await db.telegramDeliveryIntent.findFirst({ where: { agencyId, kind, customSubmissionId: String(customSubmissionId) } }) : null);
+    // A pre-upgrade provider receipt is immutable history. A longer modern formatter must
+    // never reinterpret its old truncated message as authorization to send a new tail.
+    if (existingInstruction && (existingInstruction.commitStartedAt || existingInstruction.state === "CONFIRMED") && !existingInstruction.instructionManifest) {
+      const oldText = String(existingInstruction.payload?.text || "");
+      const sameLegacyDecision = kind === "TASK" ? oldText.length === 4096 && oldText === String(payload?.text).slice(0, 4096)
+        : existingInstruction.payload?.reviewDecisionFingerprint === payload?.reviewDecisionFingerprint;
+      if (sameLegacyDecision && payloadFingerprint({ ...payload, text: oldText }) === existingInstruction.payloadFingerprint) {
+        return { row: existingInstruction, created: false, refreshed: false };
+      }
+    }
+    if (kind === "INSTRUCTION_CONTINUATION" || String(payload?.text || "").length > 4096 || existingInstruction?.instructionManifest) {
+      const parentId = existingInstruction?.id || crypto.randomUUID();
+      const manifest = buildInstructionManifest(parentId, String(payload.text));
+      const reserved = await createOrReadIntent({ agencyId, order, accountId, kind, identity, clientIntentId, referenceOrdinal, customSubmissionId,
+        payload: instructionPayload(payload, manifest, 0), now, db, reactivateCancelledTask, actorMember: null, _transactional: true,
+        _instructionPrepared: true, instructionManifest: manifest, reservedId: parentId });
+      await synchronizeInstructionChildren({ parent: reserved.row, sourcePayload: payload, now, db });
+      return reserved;
+    }
+  }
   const fingerprint = payloadFingerprint(payload);
   const findCanonicalExisting = async () => {
     const byKey = await db.telegramDeliveryIntent.findUnique({ where: { logicalKey: key } });
@@ -284,7 +316,7 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
     // target, reminder text, or current order projection changes after plan/claim but before begin().
     // A refresh always invalidates the old claim. After COMMITTING the row is immutable.
     // For REFERENCES the local file proof + ordinal are the business identity and may NEVER change.
-    const precommitRefreshable = String(existing.kind) === String(kind)
+    const precommitRefreshable = kind !== "INSTRUCTION_CONTINUATION" && String(existing.kind) === String(kind)
       && String(existing.creatorId) === String(order.creatorId)
       && ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"].includes(String(existing.state))
       && existing.commitStartedAt == null;
@@ -298,6 +330,7 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
         where: { id: existing.id, agencyId, state: String(existing.state), claimRevision: Number(existing.claimRevision || 0), commitStartedAt: null },
         data: {
           accountId: String(accountId), customSubmissionId: customSubmissionId ? String(customSubmissionId) : existing.customSubmissionId, payloadFingerprint: fingerprint, payload, state: "PLANNED",
+          ...(instructionManifest ? { instructionManifest } : {}),
           deviceId: null, userId: null, memberId: null, accessEpoch: null,
           claimTokenHash: null, claimUntil: null, claimRevision: nextRevision,
           outcomeReason: `PRECOMMIT_${String(kind)}_REFRESH`, providerBindingRepairAttempts: 0, providerBindingRetryAt: null,
@@ -387,6 +420,7 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
       },
       data: {
         accountId: String(accountId), payloadFingerprint: fingerprint, payload, state: "PLANNED",
+        ...(instructionManifest ? { instructionManifest } : {}),
         deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, commitStartedAt: null,
         claimRevision: nextRevision,
         outcomeReason: reactivateCancellation
@@ -405,6 +439,7 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
 
   try {
     const row = await db.telegramDeliveryIntent.create({ data: {
+      ...(reservedId ? { id: reservedId } : {}), ...(instructionManifest ? { instructionManifest } : {}),
       agencyId, creatorId: order.creatorId, customOrderId: order.id, customSubmissionId: customSubmissionId ? String(customSubmissionId) : null, accountId, kind, logicalKey: key,
       clientIntentId, referenceOrdinal, payloadFingerprint: fingerprint, payload, state: "PLANNED", createdAt: now,
     } });
@@ -417,6 +452,101 @@ async function createOrReadIntent({ agencyId, order, accountId, kind, identity, 
     if (!raced) throw fail("TELEGRAM_DELIVERY_INTENT_RACE", "Telegram delivery identity collided but the canonical row could not be recovered", 409);
     return useExisting(raced);
   }
+}
+
+async function synchronizeInstructionChildren({ parent, sourcePayload, now, db }) {
+  const manifest = readInstructionManifest(parent);
+  if (!manifest) return;
+  const existing = await db.telegramDeliveryIntent.findMany({ where: { agencyId: parent.agencyId, instructionParentId: parent.id } });
+  const byIndex = new Map(existing.map(row => [Number(row.instructionPartIndex), row]));
+  for (const part of manifest.parts.slice(1)) {
+    const previous = byIndex.get(part.index);
+    if (parent.commitStartedAt || parent.state === "CONFIRMED") {
+      if (!previous) throw fail("CUSTOM_INSTRUCTION_PART_MISSING", "Committed instruction has a missing physical part; manual repair is required", 409);
+      assertInstructionPart(previous, parent);
+      continue;
+    }
+    const payload = instructionPayload(sourcePayload, manifest, part.index);
+    const data = { accountId: parent.accountId, customSubmissionId: parent.customSubmissionId || null,
+      payload, payloadFingerprint: payloadFingerprint(payload), state: "PLANNED", deviceId: null, userId: null,
+      memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, outcomeReason: null };
+    if (!previous) {
+      await db.telegramDeliveryIntent.create({ data: { ...data, id: part.id, agencyId: parent.agencyId,
+        creatorId: parent.creatorId, customOrderId: parent.customOrderId, kind: "INSTRUCTION_PART",
+        logicalKey: `${parent.logicalKey}:part:${part.index}`, instructionParentId: parent.id, instructionPartIndex: part.index, createdAt: now } });
+    } else if (previous.payloadFingerprint !== data.payloadFingerprint || previous.state === "CANCELLED") {
+      const changed = await db.telegramDeliveryIntent.updateMany({ where: { id: previous.id, agencyId: parent.agencyId,
+        state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT", "CANCELLED"] }, commitStartedAt: null, claimRevision: previous.claimRevision },
+        data: { ...data, claimRevision: Number(previous.claimRevision || 0) + 1 } });
+      if (Number(changed.count) !== 1) throw fail("CUSTOM_INSTRUCTION_PART_IMMUTABLE", "A committed instruction part cannot be replaced", 409);
+    }
+  }
+  const obsolete = existing.filter(row => Number(row.instructionPartIndex) >= manifest.parts.length);
+  if (obsolete.length) await db.telegramDeliveryIntent.updateMany({ where: { agencyId: parent.agencyId, id: { in: obsolete.map(row => row.id) },
+    commitStartedAt: null, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] } }, data: { state: "CANCELLED",
+    claimTokenHash: null, claimUntil: null, outcomeReason: "INSTRUCTION_PRECOMMIT_VERSION_REPLACED" } });
+}
+
+async function instructionParent(row, db) {
+  if (!row?.instructionParentId) return row?.instructionManifest ? row : null;
+  const parent = await db.telegramDeliveryIntent.findFirst({ where: { id: row.instructionParentId, agencyId: row.agencyId } });
+  if (!parent) throw fail("CUSTOM_INSTRUCTION_PARENT_MISSING", "Instruction parent is unavailable", 409);
+  assertInstructionPart(row, parent);
+  return parent;
+}
+
+async function instructionPredecessor(row, db) {
+  if (!row?.instructionParentId) return null;
+  const parent = await instructionParent(row, db);
+  const { manifest, index } = assertInstructionPart(row, parent);
+  const required = manifest.parts.slice(0, index);
+  const rows = await db.telegramDeliveryIntent.findMany({ where: { agencyId: row.agencyId, id: { in: required.map(part => part.id) } } });
+  for (const part of required) {
+    const prior = rows.find(candidate => candidate.id === part.id);
+    if (!prior || prior.state !== "CONFIRMED") return prior || { id: part.id, state: "MISSING" };
+    assertInstructionPart(prior, parent);
+  }
+  return null;
+}
+
+async function refreshInstructionAggregate({ row, now = new Date(), db }) {
+  if (!row?.instructionParentId && !row?.instructionManifest) return row;
+  return runDbTransaction(db, async tx => {
+    const parentId = row.instructionParentId || row.id;
+    if (typeof tx.$queryRawUnsafe === "function") await tx.$queryRawUnsafe(`SELECT "id" FROM "TelegramDeliveryIntent" WHERE "id"=$1 AND "agencyId"=$2 FOR UPDATE`, String(parentId), String(row.agencyId));
+    const parent = await tx.telegramDeliveryIntent.findFirst({ where: { id: parentId, agencyId: row.agencyId } });
+    if (!parent) throw fail("CUSTOM_INSTRUCTION_PARENT_MISSING", "Instruction parent is unavailable", 409);
+    const manifest = readInstructionManifest(parent);
+    if (!manifest) return parent;
+    const parts = await tx.telegramDeliveryIntent.findMany({ where: { agencyId: row.agencyId, id: { in: manifest.parts.map(part => part.id) } } });
+    if (parts.length !== manifest.parts.length) throw fail("CUSTOM_INSTRUCTION_PART_MISSING", "Instruction manifest has a missing physical part", 409);
+    for (const part of parts) assertInstructionPart(part, parent);
+    const confirmed = parts.filter(part => part.state === "CONFIRMED");
+    const complete = confirmed.length === parts.length && confirmed.every(part => /^\d{1,20}$/.test(String(part.remoteMessageId))
+      && part.remoteRecipientTelegramUserId === parent.remoteRecipientTelegramUserId && Number.isFinite(new Date(part.remoteSentAt || part.confirmedAt).getTime()));
+    const state = complete ? "COMPLETE" : parts.some(part => part.state === "RECONCILE_REQUIRED") ? "UNKNOWN"
+      : parts.some(part => part.state === "CANCELLED") ? "CANCELLED" : parts.some(part => ["COMMITTING", "CLAIMED"].includes(part.state)) ? "SENDING" : "PENDING";
+    const aggregate = { ...manifest, state, confirmedParts: confirmed.length,
+      completedAt: complete ? new Date(Math.max(...confirmed.map(part => new Date(part.remoteSentAt || part.confirmedAt).getTime()))).toISOString() : null,
+      confirmationAuthority: complete && confirmed.every(part => confirmationAuthority(part) === "PROVIDER_RECEIPT") ? "PROVIDER_RECEIPT" : null };
+    if (stableJson(aggregate) !== stableJson(manifest)) await tx.telegramDeliveryIntent.updateMany({ where: { id: parent.id, agencyId: parent.agencyId,
+      instructionManifest: { equals: manifest } }, data: { instructionManifest: aggregate } });
+    return { ...parent, instructionManifest: aggregate };
+  });
+}
+
+async function getTelegramInstruction({ agencyId, member, intentId, db = null } = {}) {
+  const client = db || require("../prisma");
+  const row = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180), agencyId } });
+  if (!row) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Instruction not found", 404);
+  await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db: client });
+  const parent = await instructionParent(row, client) || row;
+  const manifest = readInstructionManifest(parent);
+  if (!manifest) return { ok: true, intent: publicIntent(parent), parts: [publicIntent(parent)], complete: parent.state === "CONFIRMED" };
+  const refreshed = await refreshInstructionAggregate({ row: parent, db: client });
+  const parts = await client.telegramDeliveryIntent.findMany({ where: { agencyId, id: { in: manifest.parts.map(part => part.id) } } });
+  return { ok: true, intent: publicIntent(refreshed), parts: manifest.parts.map(part => publicIntent(parts.find(row => row.id === part.id))),
+    complete: instructionDeliveryState(refreshed) === "CONFIRMED" };
 }
 
 async function findUnresolvedReminder({ agencyId, orderId, excludeIntentId = null, db }) {
@@ -456,11 +586,11 @@ async function assertInitialTaskDispatchCurrent({ agencyId, order, intentId = nu
   return obligation;
 }
 
-async function planTelegramDeliveryIntent({ agencyId, member, orderId, kind, clientIntentId = null, reference = null, now = new Date(), db = null } = {}) {
+async function planTelegramDeliveryIntent({ agencyId, member, orderId, kind, clientIntentId = null, reference = null, instructionManifestVersion = null, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("TELEGRAM_DELIVERY_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const normalizedKind = clean(kind, 40).toUpperCase();
-  if (!KIND_SET.has(normalizedKind) || normalizedKind === "AUTO_REMINDER" || normalizedKind === "REVISION_REQUEST") throw fail("TELEGRAM_DELIVERY_KIND_INVALID", "Unsupported user-planned Telegram delivery kind");
+  if (!KIND_SET.has(normalizedKind) || ["AUTO_REMINDER", "REVISION_REQUEST", "INSTRUCTION_PART", "INSTRUCTION_CONTINUATION"].includes(normalizedKind)) throw fail("TELEGRAM_DELIVERY_KIND_INVALID", "Unsupported user-planned Telegram delivery kind");
   const order = await loadOrder({ agencyId, orderId, db: client });
   await requireCreatorAccess({ agencyId, member, creatorId: order.creatorId, db: client });
   const status = String(order.status || "PENDING").toUpperCase();
@@ -513,6 +643,7 @@ async function planTelegramDeliveryIntent({ agencyId, member, orderId, kind, cli
     actorMember: member,
   });
   if (reserved.created) await audit({ agencyId, actorUserId: member.userId || null, action: "custom_order.telegram_delivery_plan", targetType: "TelegramDeliveryIntent", targetId: reserved.row.id, metadata: { orderId: order.id, creatorId: order.creatorId, kind: normalizedKind }, db: client });
+  if (instructionDeliveryState(reserved.row) !== "CONFIRMED") assertInstructionCapability(reserved.row, instructionManifestVersion);
   return { ok: true, skipped: false, created: reserved.created, intent: publicIntent(reserved.row) };
 }
 
@@ -692,7 +823,7 @@ function revisionDecisionFingerprint({ submissionId, customOrderId, reviewCommen
 
 function revisionRequestText({ revisionNumber = null, reviewComment } = {}) {
   const version = Number.isInteger(Number(revisionNumber)) && Number(revisionNumber) > 0 ? `\nВерсия: ${Number(revisionNumber)}` : "";
-  return `♻️ Нужна доработка кастома${version}\n\nЧто исправить:\n«${clean(reviewComment, 3500)}»\n\nПришли исправленную версию ответом сюда.`.slice(0, 4096);
+  return `♻️ Нужна доработка кастома${version}\n\nЧто исправить:\n«${String(reviewComment || "").trim()}»\n\nПришли исправленную версию ответом сюда.`;
 }
 
 async function loadRevisionRequestDecision({ agencyId, customSubmissionId, customOrderId, db }) {
@@ -728,6 +859,7 @@ async function planRevisionRequestIntentForReviewedSubmission({ agencyId, member
     reviewDecisionFingerprint: decision.fingerprint,
     reviewComment: String(decision.submission.reviewComment),
     reviewedAt: new Date(decision.submission.reviewedAt).toISOString(),
+    ...(Number.isSafeInteger(Number(revisionNumber)) && Number(revisionNumber) > 0 ? { revisionNumber: Number(revisionNumber) } : {}),
   };
   const reserved = await createOrReadIntent({
     agencyId, order, accountId: binding.accountId, kind: "REVISION_REQUEST", identity: `submission:${decision.submission.id}`,
@@ -761,6 +893,55 @@ async function refreshPrecommitIntentFromCurrentState({ row, agencyId, now = new
       where: { id: row.id, agencyId, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: Number(row.claimRevision || 0), commitStartedAt: null },
       data: { state: "CANCELLED", deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null, outcomeReason: "PRECOMMIT_BUSINESS_STATE_CHANGED" },
     });
+    if (row.instructionManifest || row.instructionParentId) await refreshInstructionAggregate({ row, now, db });
+    return db.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+  }
+
+  if (kind === "INSTRUCTION_CONTINUATION") {
+    try { await require("./custom-instruction-continuation-service").assertContinuationCurrent({ row, order, db }); }
+    catch (error) {
+      if (!["CUSTOM_CONTINUATION_NOT_REQUIRED", "CUSTOM_CONTINUATION_SOURCE_CHANGED"].includes(error?.code)) throw error;
+      await db.telegramDeliveryIntent.updateMany({ where: { agencyId, OR: [{ id: row.id }, { instructionParentId: row.id }],
+        state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, commitStartedAt: null },
+        data: { state: "CANCELLED", claimTokenHash: null, claimUntil: null, claimRevision: { increment: 1 }, outcomeReason: error.code } });
+      await refreshInstructionAggregate({ row, now, db });
+      return db.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+    }
+    return row; // Reviewed text and historical provider binding are immutable.
+  }
+
+  if (kind === "INSTRUCTION_PART") {
+    const parent = await instructionParent(row, db);
+    let obsolete = parent.state === "CANCELLED" || parent.instructionManifest?.state === "CANCELLED";
+    if (!obsolete) {
+      try {
+        if (parent.kind === "TASK") {
+          const obligation = await assertInitialTaskDispatchCurrent({ agencyId, order, intentId: parent.id, allowAnyInitialState: true, db });
+          obsolete = obligation.instructionIntentId != null && String(obligation.instructionIntentId) !== String(parent.id);
+        } else if (parent.kind === "INSTRUCTION_CONTINUATION") {
+          await require("./custom-instruction-continuation-service").assertContinuationCurrent({ row: parent, order, db });
+        } else await loadRevisionRequestDecision({ agencyId, customSubmissionId: parent.customSubmissionId, customOrderId: order.id, db });
+      } catch (error) {
+        if (["CUSTOM_MODEL_INITIAL_INSTRUCTION_NOT_REQUIRED", "TELEGRAM_DELIVERY_CONTROL_CHANGED", "TELEGRAM_REVISION_SUBMISSION_NOT_FOUND", "CUSTOM_CONTINUATION_NOT_REQUIRED", "CUSTOM_CONTINUATION_SOURCE_CHANGED"].includes(error?.code)) obsolete = true;
+        else throw error;
+      }
+    }
+    if (obsolete) {
+      await db.telegramDeliveryIntent.updateMany({ where: { id: row.id, agencyId, commitStartedAt: null,
+        state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: row.claimRevision },
+        data: { state: "CANCELLED", claimTokenHash: null, claimUntil: null, claimRevision: Number(row.claimRevision || 0) + 1, outcomeReason: "INSTRUCTION_OBLIGATION_CHANGED" } });
+      await refreshInstructionAggregate({ row: parent, now, db });
+      return db.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+    }
+    if (parent.state !== "CONFIRMED" || parent.remoteMessageId == null) return row;
+    const payload = { ...row.payload, recipientTelegramUserId: parent.remoteRecipientTelegramUserId,
+      replyToDeliveryId: parent.id, replyToMessageId: String(parent.remoteMessageId) };
+    const fingerprint = payloadFingerprint(payload);
+    if (fingerprint === row.payloadFingerprint) return row;
+    await db.telegramDeliveryIntent.updateMany({ where: { id: row.id, agencyId, commitStartedAt: null,
+      state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, claimRevision: row.claimRevision },
+      data: { payload, payloadFingerprint: fingerprint, state: "PLANNED", claimRevision: Number(row.claimRevision || 0) + 1,
+        deviceId: null, userId: null, memberId: null, accessEpoch: null, claimTokenHash: null, claimUntil: null } });
     return db.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
   }
 
@@ -976,7 +1157,7 @@ async function repairPrecommitProviderBlockedIntents({ agencyId, member = null, 
   return report;
 }
 
-async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = new Date(), db = null } = {}) {
+async function listTelegramDeliveryWork({ agencyId, member, limit = 25, instructionManifestVersion = null, now = new Date(), db = null } = {}) {
   if (!agencyId || !member?.id) throw fail("TELEGRAM_DELIVERY_ACTOR_REQUIRED", "Agency membership is required", 403);
   const client = db || require("../prisma");
   const scope = await allowedCreatorScope({ agencyId, member, db: client });
@@ -984,19 +1165,20 @@ async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = ne
   const staleCommitBefore = new Date(now.getTime() - CLAIM_MS);
   const staleCommits = await client.telegramDeliveryIntent.findMany({
     where: { agencyId, ...scopeWhere(scope), state: "COMMITTING", commitStartedAt: { lte: staleCommitBefore } },
-    select: { id: true }, orderBy: [{ commitStartedAt: "asc" }, { id: "asc" }], take: 100,
+    orderBy: [{ commitStartedAt: "asc" }, { id: "asc" }], take: 100,
   });
   if (staleCommits.length) await client.telegramDeliveryIntent.updateMany({
     where: { agencyId, id: { in: staleCommits.map(row => row.id) }, state: "COMMITTING", commitStartedAt: { lte: staleCommitBefore } },
     data: { state: "RECONCILE_REQUIRED", outcomeReason: "COMMIT_PROCESS_LOST" },
   });
+  for (const stale of staleCommits) if (stale.instructionParentId || stale.instructionManifest) await refreshInstructionAggregate({ row: stale, now, db: client });
 
   // R9/R6: work discovery is a locator, not an archaeological filter. Read at most the
   // caller's executable budget and revalidate every returned target at claim/begin time.
   // Stale precommit rows are repaired/cancelled here only inside that same finite budget;
   // we never keep paging through the tenant just to fill `limit`.
   const scanBudget = Math.min(200, Math.max(25, take * 4));
-  const billableIds = await selectBillableTelegramWorkIds({ db: client, agencyId, scope, take: scanBudget });
+  const billableIds = await selectBillableTelegramWorkIds({ db: client, agencyId, scope, take: scanBudget, instructionManifestVersion });
   const rows = await client.telegramDeliveryIntent.findMany({
     where: {
       agencyId, ...scopeWhere(scope), id: { in: billableIds }, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] },
@@ -1021,6 +1203,8 @@ async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = ne
       current = await refreshPrecommitIntentFromCurrentState({ row: snapshot, agencyId, now, db: client });
     }
     if (!current || String(current.state) === "CANCELLED") continue;
+    if (await instructionPredecessor(current, client)) continue;
+    assertInstructionCapability(current, instructionManifestVersion);
     items.push(publicIntent(current));
     if (items.length >= take) break;
   }
@@ -1034,7 +1218,7 @@ async function listTelegramDeliveryWork({ agencyId, member, limit = 25, now = ne
   };
 }
 
-async function claimTelegramDeliveryIntent({ agencyId, member, intentId, deviceId, runtimeClaimToken, now = new Date(), db = null } = {}) {
+async function claimTelegramDeliveryIntent({ agencyId, member, intentId, deviceId, runtimeClaimToken, instructionManifestVersion = null, now = new Date(), db = null } = {}) {
   const client = db || require("../prisma");
   return runDbTransaction(client, async tx => {
   const client = tx;
@@ -1055,6 +1239,9 @@ async function claimTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
   const fence = actor(member);
   await assertExecutionAccessFence({ db: client, agencyId, creatorId: row.creatorId, ...fence, lock: true });
   if (row.state === "CONFIRMED" || row.state === "RECONCILE_REQUIRED" || row.state === "COMMITTING" || row.state === "CANCELLED") return { ok: true, claimed: false, intent: publicIntent(row), claimToken: null };
+  assertInstructionCapability(row, instructionManifestVersion);
+  const instructionBlockedBy = await instructionPredecessor(row, client);
+  if (instructionBlockedBy) return { ok: true, claimed: false, busy: true, blockedByIntentId: String(instructionBlockedBy.id), intent: publicIntent(row), claimToken: null };
   if (String(row.kind) === "REFERENCE" && Number.isInteger(Number(row.referenceOrdinal)) && Number(row.referenceOrdinal) > 0) {
     // Preserve reference ordering across crashes: a later file may be planned durably, but it cannot
     // receive a physical commit permit while an earlier reference is unresolved/not confirmed.
@@ -1102,6 +1289,44 @@ function verifyCommitClaim(row, { deviceId, claimToken }, { allowConfirmed = fal
 async function currentBeginGuard({ row, member, agencyId, runtimeClaimToken, deviceId, now, db }) {
   await requireCreatorAccess({ agencyId, member, creatorId: row.creatorId, db });
   const order = await loadOrder({ agencyId, orderId: row.customOrderId, db });
+  if (row.kind === "INSTRUCTION_CONTINUATION") {
+    const binding = await require("./custom-instruction-continuation-service").assertContinuationCurrent({ row, order, db });
+    if (row.payload?.replyToMessageId !== binding.replyToMessageId || row.payload?.recipientTelegramUserId !== binding.recipientTelegramUserId)
+      throw fail("CUSTOM_CONTINUATION_SOURCE_CHANGED", "Reviewed continuation provider binding changed", 409);
+    const runtime = await assertTelegramSendRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId, claimToken: runtimeClaimToken, now, db });
+    await assertExecutionAccessFence({ db, agencyId, creatorId: row.creatorId, userId: row.userId, memberId: row.memberId, accessEpoch: row.accessEpoch, lock: true });
+    return { order, runtime };
+  }
+  if (row.kind === "INSTRUCTION_PART") {
+    const parent = await instructionParent(row, db);
+    if (String(order.status) !== "PENDING") throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "Custom order is no longer pending", 409);
+    if (parent.kind === "TASK") {
+      try { await assertInitialTaskDispatchCurrent({ agencyId, order, intentId: parent.id, db }); }
+      catch (error) {
+        if (error.code === "CUSTOM_MODEL_INITIAL_INSTRUCTION_NOT_REQUIRED") throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "This instruction no longer owns the model obligation", 409);
+        throw error;
+      }
+    } else if (parent.kind === "REVISION_REQUEST") {
+      const decision = await loadRevisionRequestDecision({ agencyId, customSubmissionId: parent.customSubmissionId, customOrderId: order.id, db });
+      if (parent.payload?.reviewDecisionFingerprint !== decision.fingerprint) throw fail("TELEGRAM_DELIVERY_CONTROL_CHANGED", "Revision instruction is no longer current", 409);
+    } else if (parent.kind === "INSTRUCTION_CONTINUATION") {
+      await require("./custom-instruction-continuation-service").assertContinuationCurrent({ row: parent, order, db });
+    } else throw fail("CUSTOM_INSTRUCTION_PARENT_INVALID", "Unsupported instruction parent", 409);
+    const predecessor = await instructionPredecessor(row, db);
+    if (predecessor) throw fail("CUSTOM_INSTRUCTION_PREDECESSOR_UNCONFIRMED", "The earlier physical part must be confirmed before continuation", 409);
+    const binding = parent.kind === "INSTRUCTION_CONTINUATION"
+      ? await require("./custom-instruction-continuation-service").assertContinuationCurrent({ row: parent, order, db })
+      : await resolveIntentProviderBinding({ agencyId, order, kind: parent.kind, customSubmissionId: parent.customSubmissionId, db });
+    if (String(binding.accountId) !== String(parent.accountId)
+        || row.payload?.recipientTelegramUserId !== parent.remoteRecipientTelegramUserId
+        || String(row.payload?.replyToMessageId) !== String(parent.remoteMessageId)
+        || (parent.kind === "TASK" && String(order.creator?.telegramUserId || "") !== String(parent.remoteRecipientTelegramUserId))) {
+      throw fail("CUSTOM_INSTRUCTION_PROVIDER_CHANGED", "Committed instruction provider binding changed; continuation requires review", 409);
+    }
+    const runtime = await assertTelegramSendRuntimeLease({ agencyId, member, accountId: row.accountId, deviceId, claimToken: runtimeClaimToken, now, db });
+    await assertExecutionAccessFence({ db, agencyId, creatorId: row.creatorId, userId: row.userId, memberId: row.memberId, accessEpoch: row.accessEpoch, lock: true });
+    return { order, runtime };
+  }
   if (String(row.kind) === "TASK") {
     try {
       await assertInitialTaskDispatchCurrent({ agencyId, order, intentId: row.id, db });
@@ -1150,7 +1375,10 @@ async function currentBeginGuard({ row, member, agencyId, runtimeClaimToken, dev
     if (unresolvedReminder) throw fail("CUSTOM_ORDER_REMINDER_OUTCOME_UNRESOLVED", "A previous reminder outcome is unresolved and fences this reminder commit", 409);
   }
   if (kind === "TASK") {
-    const currentTaskPayload = taskPayload(order);
+    const fullPayload = taskPayload(order);
+    const manifest = readInstructionManifest(row);
+    if (manifest && fullPayload.text !== manifest.fullText) throw fail("TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED", "The accepted instruction text changed before commit", 409);
+    const currentTaskPayload = manifest ? instructionPayload(fullPayload, manifest, 0) : fullPayload;
     if (!/^\d{1,20}$/.test(clean(currentTaskPayload.recipientTelegramUserId, 40))) {
       throw fail("TELEGRAM_DELIVERY_TASK_RECIPIENT_UNPROVEN", "Resolve the current Telegram contact before committing the TASK delivery", 409);
     }
@@ -1182,11 +1410,12 @@ async function currentBeginGuard({ row, member, agencyId, runtimeClaimToken, dev
   return { order, runtime };
 }
 
-async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceId, runtimeClaimToken, claimToken, now = new Date(), db = null } = {}) {
+async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceId, runtimeClaimToken, claimToken, instructionManifestVersion = null, now = new Date(), db = null } = {}) {
   const client = db || require("../prisma");
   const initial = await client.telegramDeliveryIntent.findFirst({ where: { id: clean(intentId, 180), agencyId } });
   if (!initial) throw fail("TELEGRAM_DELIVERY_INTENT_NOT_FOUND", "Telegram delivery intent not found", 404);
   if (["CONFIRMED", "RECONCILE_REQUIRED", "COMMITTING"].includes(String(initial.state))) return { ok: true, begun: false, intent: publicIntent(initial) };
+  assertInstructionCapability(initial, instructionManifestVersion);
   verifyStoredClaim(initial, { deviceId, claimToken });
 
   const beginPermit = async (tx) => {
@@ -1201,7 +1430,7 @@ async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
 
     const { order, runtime } = await currentBeginGuard({ row, member, agencyId, runtimeClaimToken, deviceId, now, db: tx });
     const kind = String(row.kind);
-    if (kind === "TASK" || kind === "REVISION_REQUEST" || REMINDER_KINDS.has(kind)) {
+    if (kind === "TASK" || kind === "REVISION_REQUEST" || kind === "INSTRUCTION_PART" || kind === "INSTRUCTION_CONTINUATION" || REMINDER_KINDS.has(kind)) {
       const previousUpdatedAt = order?.updatedAt ? new Date(order.updatedAt) : null;
       if (!previousUpdatedAt || !Number.isFinite(previousUpdatedAt.getTime())) {
         throw fail("TELEGRAM_DELIVERY_PRECOMMIT_REFRESH_REQUIRED", "Custom order revision is unavailable before Telegram external commit", 409);
@@ -1233,6 +1462,7 @@ async function beginTelegramDeliveryIntent({ agencyId, member, intentId, deviceI
     });
     if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_BEGIN_RACE", "Telegram delivery changed before commit permit", 409);
     const fresh = await tx.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+    if (fresh.instructionParentId || fresh.instructionManifest) await refreshInstructionAggregate({ row: fresh, now, db: tx });
     return { ok: true, begun: true, intent: publicIntent(fresh) };
   };
 
@@ -1309,7 +1539,12 @@ async function clearConfirmedProjectionBlocked({ row, db }) {
 
 async function projectConfirmedIntentObserved({ row, now, db }) {
   try {
-    await projectConfirmedIntent({ row, now, db });
+    const parent = await refreshInstructionAggregate({ row, now, db });
+    // CONFIRMED on part zero is a physical receipt, not completion of the accepted instruction.
+    // Only the complete ordered manifest starts reminders or publishes deliveredAt.
+    if (!parent?.instructionManifest || instructionDeliveryState(parent) === "CONFIRMED") {
+      await projectConfirmedIntent({ row: parent || row, now, db });
+    }
     await clearConfirmedProjectionBlocked({ row, db });
   } catch (error) {
     await markConfirmedProjectionBlocked({ row, error, now, db }).catch(() => undefined);
@@ -1319,7 +1554,8 @@ async function projectConfirmedIntentObserved({ row, now, db }) {
 
 async function projectConfirmedIntent({ row, now, db }) {
   const kind = String(row.kind); const remoteMessageId = Number(row.remoteMessageId);
-  const effectAtCandidate = row.remoteSentAt ? new Date(row.remoteSentAt) : (row.confirmedAt ? new Date(row.confirmedAt) : now);
+  const effectAtCandidate = row.instructionManifest?.completedAt ? new Date(row.instructionManifest.completedAt)
+    : row.remoteSentAt ? new Date(row.remoteSentAt) : (row.confirmedAt ? new Date(row.confirmedAt) : now);
   const effectAt = Number.isFinite(effectAtCandidate.getTime()) ? effectAtCandidate : now;
   const order = await db.customOrder.findFirst({ where: { id: row.customOrderId, agencyId: row.agencyId } });
   if (!order) return;
@@ -1335,16 +1571,19 @@ async function projectConfirmedIntent({ row, now, db }) {
 
     // First project only the provider fact. Do not carry status/reminder fields from the
     // snapshot read above: cancellation can commit between that read and this write.
-    const linked = await db.customOrder.updateMany({
+    await db.customOrder.updateMany({
       where: { id: order.id, agencyId: row.agencyId, telegramTaskMessageId: null },
       data: { telegramTaskMessageId: remoteMessageId },
     });
-    if (Number(linked?.count || 0) === 1) {
-      await db.customOrder.updateMany({
-        where: { id: order.id, agencyId: row.agencyId, deliveredAt: null },
-        data: { deliveredAt: effectAt },
-      });
-    }
+    // A crash may commit the provider identity before the timestamp projection.
+    // Replaying that exact receipt must fill the missing fact independently of
+    // whether this invocation established the link. A concurrent different link
+    // can never receive this instruction's completion timestamp.
+    await db.customOrder.updateMany({
+      where: { id: order.id, agencyId: row.agencyId, creatorId: row.creatorId,
+        telegramTaskMessageId: remoteMessageId, deliveredAt: null },
+      data: { deliveredAt: effectAt },
+    });
 
     let settledOrder = await db.customOrder.findFirst({ where: { id: order.id, agencyId: row.agencyId } });
     if (!settledOrder) return;
@@ -1367,7 +1606,7 @@ async function projectConfirmedIntent({ row, now, db }) {
         reason: "TASK_SETTLED_AFTER_CANCELLATION", now: effectAt, db,
       });
     }
-  } else if (kind === "REVISION_REQUEST") {
+  } else if (kind === "REVISION_REQUEST" || kind === "INSTRUCTION_CONTINUATION") {
     // The model's next obligation starts only at the provider-confirmed revision instruction.
     // Reprojecting here anchors the new reminder cycle to this exact receipt; REQUEST_REVISION
     // itself intentionally leaves nextReminderAt null while delivery is pending/unknown.
@@ -1444,6 +1683,8 @@ async function confirmTelegramDeliveryIntent({ agencyId, member, intentId, devic
   const messageId = positiveInt(remoteMessageId, "remoteMessageId"); const recipientTelegramUserId = clean(remoteRecipientTelegramUserId, 40);
   if (recipientTelegramUserId && !/^\d{1,20}$/.test(recipientTelegramUserId)) throw fail("TELEGRAM_DELIVERY_RECIPIENT_ID_INVALID", "remoteRecipientTelegramUserId must be a numeric Telegram user id");
   if (String(row.kind) === "TASK" && !/^\d{1,20}$/.test(recipientTelegramUserId)) throw fail("TELEGRAM_DELIVERY_TASK_RECIPIENT_REQUIRED", "TASK confirmation requires the proven Telegram recipient user id", 409);
+  if ((row.instructionParentId || row.instructionManifest) && (!/^\d{1,20}$/.test(recipientTelegramUserId)
+      || recipientTelegramUserId !== String(row.payload?.recipientTelegramUserId))) throw fail("CUSTOM_INSTRUCTION_RECEIPT_RECIPIENT_MISMATCH", "Instruction receipt must identify the committed recipient", 409);
   const sentAt = iso(remoteSentAt, "remoteSentAt", now) || now;
   if (row.state === "CONFIRMED") {
     if (Number(row.remoteMessageId) !== messageId) throw fail("TELEGRAM_DELIVERY_CONFIRM_CONFLICT", "Telegram delivery was already confirmed with a different remote message id", 409);
@@ -1637,7 +1878,7 @@ async function repairConfirmedTelegramDeliveryProjections({ agencyId, now = new 
   };
 }
 
-const MODEL_COMMUNICATION_PRECOMMIT_KINDS = ["TASK", "REFERENCE", "REVISION_REQUEST", "AUTO_REMINDER", "MANUAL_REMINDER"];
+const MODEL_COMMUNICATION_PRECOMMIT_KINDS = ["TASK", "REFERENCE", "REVISION_REQUEST", "INSTRUCTION_PART", "INSTRUCTION_CONTINUATION", "AUTO_REMINDER", "MANUAL_REMINDER"];
 
 async function ensureRevisionRequestIntentForOrder({ agencyId, orderId, now = new Date(), db } = {}) {
   if (!db?.customOrder?.findFirst || !db?.customContentSubmission?.findFirst || !db?.telegramDeliveryIntent?.findFirst) {
@@ -1908,6 +2149,7 @@ async function markTelegramDeliveryProvenNotSent({ agencyId, member, intentId, d
   if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_PROVEN_NOT_SENT_RACE", "Telegram delivery changed while recording proven no-effect", 409);
   const fresh = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
   await audit({ agencyId, actorUserId: member?.userId || row.userId || null, action: "custom_order.telegram_delivery_proven_not_sent", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, kind: row.kind, reason: justification, orphanCustomOrder: orphan }, db: client });
+  if (fresh.instructionParentId || fresh.instructionManifest) await refreshInstructionAggregate({ row: fresh, db: client });
   if (!orphan) {
     const cancelledOrder = await client.customOrder.findFirst({ where: { id: row.customOrderId, agencyId, status: "CANCELLED" } });
     if (cancelledOrder && !cancelledOrder.telegramCancellationWaivedAt) {
@@ -1982,6 +2224,12 @@ async function assertTelegramDeliveryMaterialAccess({ agencyId, member, intentId
   }
   verifyCommitClaim(row, { deviceId, claimToken: deliveryClaimToken });
   if (String(row.state) !== "COMMITTING") throw fail("TELEGRAM_DELIVERY_MATERIAL_STATE_INVALID", "Telegram delivery material is available only after the commit permit", 409);
+  if (row.instructionParentId || row.instructionManifest) {
+    const parent = await instructionParent(row, client);
+    assertInstructionPart(row, parent);
+    const predecessor = await instructionPredecessor(row, client);
+    if (predecessor) throw fail("CUSTOM_INSTRUCTION_PREDECESSOR_UNCONFIRMED", "Earlier instruction part is not confirmed", 409);
+  }
   const recipientTelegramUserId = clean(row.payload?.recipientTelegramUserId, 40);
   const replyToMessageId = clean(row.payload?.replyToMessageId, 40);
   const isTask = String(row.kind) === "TASK";
@@ -2001,6 +2249,7 @@ async function markTelegramDeliveryUnknown({ agencyId, member, intentId, deviceI
   const changed = await client.telegramDeliveryIntent.updateMany({ where: { id: row.id, agencyId, state: "COMMITTING", claimRevision: row.claimRevision, claimTokenHash: row.claimTokenHash }, data: { state: "RECONCILE_REQUIRED", outcomeReason: clean(reason, 500) || "OUTCOME_UNKNOWN" } });
   if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_UNKNOWN_RACE", "Telegram delivery changed while recording unknown outcome", 409);
   const fresh = await client.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
+  if (fresh.instructionParentId || fresh.instructionManifest) await refreshInstructionAggregate({ row: fresh, now, db: client });
   await audit({ agencyId, actorUserId: member?.userId || row.userId || null, action: "custom_order.telegram_delivery_unknown", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, kind: row.kind, reason: fresh.outcomeReason }, db: client });
   return { ok: true, idempotent: false, intent: publicIntent(fresh) };
 }
@@ -2419,6 +2668,7 @@ async function reconcileTelegramDeliveryIntent({ agencyId, member, intentId, res
         const recipientTelegramUserId = clean(remoteRecipientTelegramUserId, 40);
         if (recipientTelegramUserId && !/^\d{1,20}$/.test(recipientTelegramUserId)) throw fail("TELEGRAM_DELIVERY_RECIPIENT_ID_INVALID", "remoteRecipientTelegramUserId must be a numeric Telegram user id");
         if (String(row.kind) === "TASK" && !/^\d{1,20}$/.test(recipientTelegramUserId)) throw fail("TELEGRAM_DELIVERY_TASK_RECIPIENT_REQUIRED", "TASK reconciliation requires the Telegram recipient user id used for the manual decision", 409);
+        if ((row.instructionParentId || row.instructionManifest) && recipientTelegramUserId !== String(row.payload?.recipientTelegramUserId)) throw fail("CUSTOM_INSTRUCTION_RECEIPT_RECIPIENT_MISMATCH", "Instruction reconciliation must identify the committed recipient", 409);
         const sentAt = iso(remoteSentAt, "remoteSentAt", now) || now;
         await assertProviderReceiptIdentityAvailable({ agencyId, accountId: row.accountId, remoteMessageId: messageId, excludeIntentId: row.id, db: tx });
         let changed;
@@ -2433,7 +2683,7 @@ async function reconcileTelegramDeliveryIntent({ agencyId, member, intentId, res
         }
         if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_RECONCILE_RACE", "Telegram delivery changed during reconciliation", 409);
         const settled = await tx.telegramDeliveryIntent.findFirst({ where: { id: row.id, agencyId } });
-        await projectConfirmedIntent({ row: settled, now, db: tx });
+        await projectConfirmedIntentObserved({ row: settled, now, db: tx });
         await audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_delivery_manual_reconcile_confirm", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, kind: row.kind, remoteMessageId: messageId, reason: justification, authority: "MANUAL_RECONCILIATION" }, db: tx, required: true });
         return settled;
       }
@@ -2455,6 +2705,7 @@ async function reconcileTelegramDeliveryIntent({ agencyId, member, intentId, res
             },
       });
       if (Number(changed?.count || 0) !== 1) throw fail("TELEGRAM_DELIVERY_RECONCILE_RACE", "Telegram delivery changed during reconciliation", 409);
+      if (row.instructionParentId || row.instructionManifest) await refreshInstructionAggregate({ row, now, db: tx });
       await audit({ agencyId, actorUserId: member?.userId || null, action: "custom_order.telegram_delivery_manual_reconcile_not_sent", targetType: "TelegramDeliveryIntent", targetId: row.id, metadata: { orderId: row.customOrderId, creatorId: row.creatorId, kind: row.kind, reason: justification, orphanCustomOrder: orphan }, db: tx, required: true });
       if (!orphan) {
         const cancelledOrder = await tx.customOrder.findFirst({ where: { id: row.customOrderId, agencyId, status: "CANCELLED" } });
@@ -2548,7 +2799,17 @@ async function planCancellationIntentForCommittedOrder({ agencyId, member, order
   });
 }
 
+async function createReviewedContinuationIntent({ agencyId, order, source, payload, now, db }) {
+  const result = await createOrReadIntent({ agencyId, order, accountId: source.accountId, kind: "INSTRUCTION_CONTINUATION",
+    identity: source.id, customSubmissionId: source.customSubmissionId || null, payload, now, db });
+  return result.row;
+}
+
 module.exports = {
+  createReviewedContinuationIntent,
+  loadRevisionRequestDecision,
+  revisionRequestText,
+  getTelegramInstruction,
   CLAIM_MS,
   DELIVERY_KINDS,
   DELIVERY_STATES,

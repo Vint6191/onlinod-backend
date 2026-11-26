@@ -33,13 +33,14 @@ async function loadMember({ db, userId, agencyId, memberId, lock = false }) {
   });
 }
 
-async function assertExecutionAccessFence(input) {
+// A current signed membership can settle work already owned by that principal
+// without regaining permission to start new work for a revoked creator.
+async function assertExecutionMemberFence(input) {
   const memberId = String(input.memberId || "").trim();
-  const creatorId = String(input.creatorId || "").trim();
   const agencyId = String(input.agencyId || "").trim();
   const userId = String(input.userId || "").trim();
   const accessEpoch = int(input.accessEpoch, -1);
-  if (!memberId || !creatorId || !agencyId || !userId || accessEpoch < 0) {
+  if (!memberId || !agencyId || !userId || accessEpoch < 0) {
     throw new ExecutionAccessFenceError("EXECUTION_ACCESS_FENCE_MISSING", "Execution lease has no access fence", 409);
   }
   const db = input.db || require("../prisma");
@@ -50,6 +51,15 @@ async function assertExecutionAccessFence(input) {
   if (int(member.accessEpoch, 1) !== accessEpoch) {
     throw new ExecutionAccessFenceError("EXECUTION_ACCESS_EPOCH_STALE", "Execution lease access epoch is stale", 409);
   }
+  return { member, accessEpoch };
+}
+
+async function assertExecutionAccessFence(input) {
+  const creatorId = String(input.creatorId || "").trim();
+  const agencyId = String(input.agencyId || "").trim();
+  if (!creatorId) throw new ExecutionAccessFenceError("EXECUTION_ACCESS_FENCE_MISSING", "Execution lease has no access fence", 409);
+  const db = input.db || require("../prisma");
+  const { member, accessEpoch } = await assertExecutionMemberFence(input);
   if (!canAccessCreator(member, creatorId)) {
     throw new ExecutionAccessFenceError("EXECUTION_CREATOR_ACCESS_REVOKED", "Creator access was revoked after lease claim", 403);
   }
@@ -64,4 +74,4 @@ async function assertExecutionAccessFence(input) {
   return { member, creator, accessEpoch };
 }
 
-module.exports = { ExecutionAccessFenceError, assertExecutionAccessFence };
+module.exports = { ExecutionAccessFenceError, assertExecutionMemberFence, assertExecutionAccessFence };

@@ -27,6 +27,7 @@ const {
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { isOnlineBumpSend, commitOnlineBumpWrite } = require("./bump-write-window-service");
 const { CREATOR_WRITE_LANE_STATUSES } = require("./automation-delivery-statuses");
+const { deliveryRequiresReconciliation, unresolvedDeliveryWhere, deliveryOutcomeSnapshotWhere } = require("./automation-outcome-contract");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
 const {
   FAILURE_CATEGORIES, SAFE_RETRY_CATEGORIES, normalizeFailureCategory, classifyAutomationFailure, automationActionWriteSemantics,
@@ -138,15 +139,12 @@ function validationActionError(delivery, validation, fallbackCode, fallbackMessa
   return error;
 }
 
-function deliveryRequiresReconciliation(delivery) {
-  const result = object(delivery?.result);
-  return delivery?.status === "RECONCILE_REQUIRED"
-    || delivery?.failureCategory === FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE
-    || String(result.outcomeState || "").toUpperCase() === "RECONCILE_REQUIRED";
-}
 function reconciliationStartedAt(delivery, now = new Date()) {
   const result = object(delivery?.result);
-  const value = delivery?.writeCommitAt || result.reconciliationStartedAt || delivery?.updatedAt || now;
+  // Legacy control-corrupted rows get one bounded opportunity to read the
+  // provider after adoption. Their original commit time stays intact.
+  const value = result.controlRecoveryVersion === 1 && result.controlRecoveredAt
+    ? result.controlRecoveredAt : delivery?.writeCommitAt || result.reconciliationStartedAt || delivery?.updatedAt || now;
   const parsed = value instanceof Date ? value : new Date(value);
   return Number.isFinite(parsed.getTime()) ? parsed : now;
 }
@@ -279,6 +277,39 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
     ...(agencyId ? { agencyId } : {}),
     ...(creatorIds ? { creatorId: { in: creatorIds.length ? creatorIds : ["__none__"] } } : {}),
   };
+  // Repair old pause/cancel transitions without issuing another external write.
+  // The original identity and proof remain; claiming this row grants only the
+  // existing reconciliation path. CAS makes the bounded repair restart-safe.
+  const strandedControls = await client.automationDelivery.findMany({
+    where: { ...scopeWhere, status: { in: ["PAUSED", "CANCELED", "FAILED"] }, ...unresolvedDeliveryWhere() },
+    orderBy: { id: "asc" }, take: 100,
+  });
+  let changed = 0;
+  for (const row of strandedControls) {
+    if (!deliveryRequiresReconciliation(row)) continue;
+    const repaired = await runDbTransaction(client, async (tx) => {
+      await lockCleanupMutation(tx, row);
+      const applied = await tx.automationDelivery.updateMany({
+        where: { id: row.id, status: row.status, leaseRevision: row.leaseRevision, ...unresolvedDeliveryWhere() },
+        data: { status: "RECONCILE_REQUIRED", failureCategory: FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE,
+          failureCode: "control_outcome_recovery", finishedAt: null, notBefore: now,
+          claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null,
+          leaseRevision: { increment: 1 }, lastCheckedAt: now,
+          result: { ...object(row.result), outcomeState: "RECONCILE_REQUIRED", controlRecoveryVersion: 1,
+            controlRecoveryFrom: row.status, controlRecoveredAt: now.toISOString(),
+            stopAfterReconciliation: row.status === "CANCELED" || object(row.result).stopAfterReconciliation === true,
+            reconciliationStartedAt: reconciliationStartedAt(row, now).toISOString() } },
+      });
+      if (!applied.count) return false;
+      if (typeof tx.fanObservationReadLease?.deleteMany === "function") {
+        await tx.fanObservationReadLease.deleteMany({ where: { deliveryId: row.id, leaseRevision: row.leaseRevision } });
+      }
+      const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
+      await updateModuleCandidateProgress(current, "RECONCILE_REQUIRED", "control_outcome_recovery", tx);
+      return true;
+    });
+    if (repaired) changed += 1;
+  }
   const rows = await client.automationDelivery.findMany({
     where: { ...scopeWhere, status: { in: LEASED_STATUSES }, claimUntil: { lt: now } },
     select: {
@@ -287,7 +318,6 @@ async function sweepExpiredAutomationLeases(input = new Date()) {
       attempts: true, maxAttempts: true, result: true, leaseRevision: true, generation: true, notBefore: true,
     }, orderBy: [{ claimUntil: "asc" }, { id: "asc" }], take: 100,
   });
-  let changed = 0;
   const terminalizeUnresolved = async (row, where) => {
     const failureCode = "outcome_unresolved_do_not_retry";
     const result = { ...object(row.result), outcomeState: "UNRESOLVED_DO_NOT_RETRY", unresolvedClosedAt: now.toISOString(), unresolvedCloseReason: "MAINTENANCE_RECONCILIATION_WINDOW_EXPIRED" };
@@ -827,10 +857,7 @@ async function claimActionDelivery({ userId, deviceId, leaseMs, actionTypes = ["
               agencyId: candidate.agencyId,
               creatorId: candidate.creatorId,
               id: { not: candidate.id },
-              OR: [
-                { status: "RECONCILE_REQUIRED" },
-                { failureCategory: FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE },
-              ],
+              ...unresolvedDeliveryWhere(),
             },
             select: { id: true },
           });
@@ -1463,7 +1490,8 @@ async function failActionDelivery(input) {
   const safetyRecovery = mustPreserveRefollowSaga(delivery, failureCode) || isSfsCleanupDelivery(delivery);
   const reconcile = failureCategory === FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE;
   const categoryRetryable = SAFE_RETRY_CATEGORIES.includes(failureCategory) || reconcile;
-  const retryable = categoryRetryable && (reconcile || safetyRecovery || delivery.attempts < delivery.maxAttempts);
+  const retryable = categoryRetryable && (reconcile || (object(delivery.result).stopAfterReconciliation !== true
+    && (safetyRecovery || delivery.attempts < delivery.maxAttempts)));
   const nextStatus = reconcile ? "RECONCILE_REQUIRED" : (retryable ? "RETRY_SCHEDULED" : "FAILED");
   const nextNotBefore = (retryable || reconcile) ? new Date(now.getTime() + retryDelayMs(delivery.attempts, failureCode, input.retryAfterMs)) : delivery.notBefore;
   const result = {
@@ -1601,7 +1629,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId, db = pri
   if (delivery.failureCode && ["permission_denied", "invalid_payload", "fan_not_found", "blocked", "creator_revoked", "custom_media_programmatic_forbidden"].includes(delivery.failureCode)) {
     throw new ActionDeliveryError("DELIVERY_UNSAFE_RETRY", `Failure ${delivery.failureCode} requires a new action generation`);
   }
-  if (delivery.failureCategory === FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE ||
+  if (deliveryRequiresReconciliation(delivery) ||
       (delivery.status === "FAILED" && automationActionWriteSemantics(delivery.actionType) === "NON_IDEMPOTENT_WRITE" && !SAFE_RETRY_CATEGORIES.includes(delivery.failureCategory))) {
     throw new ActionDeliveryError("DELIVERY_RECONCILIATION_REQUIRED", "Unknown provider outcome must be reconciled before retry");
   }
@@ -1689,7 +1717,7 @@ async function retryActionDelivery({ agencyId, actorUserId, deliveryId, db = pri
     await lockCleanupMutation(tx,delivery);
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
-      where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
+      where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision, ...deliveryOutcomeSnapshotWhere(delivery) },
       data: {
         status: "QUEUED",
         attempts: 0,
@@ -1724,10 +1752,10 @@ async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason 
   const delivery = await db.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   await requireLiveAutomationManagementActor({ db, agencyId, actorUserId, creatorId: delivery.creatorId });
-  if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
-  if (["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status)) {
+  if (delivery.status === "COMMITTING" || deliveryRequiresReconciliation(delivery)) {
     throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before cancellation");
   }
+  if (TERMINAL_STATUSES.includes(delivery.status)) return { ok: true, duplicate: true, delivery };
   if (isSfsCleanupDelivery(delivery)) {
     throw new ActionDeliveryError("UNSAFE_SFS_CLEANUP_CANCEL", "An SFS safety unfollow cannot be canceled");
   }
@@ -1742,7 +1770,7 @@ async function cancelActionDelivery({ agencyId, actorUserId, deliveryId, reason 
     await lockCleanupMutation(tx,delivery);
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
-      where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision },
+      where: { id: delivery.id, originKind: "AUTOMATION", status: delivery.status, leaseRevision: delivery.leaseRevision, ...deliveryOutcomeSnapshotWhere(delivery) },
       data: {
         status: "CANCELED",
         failureCode: "canceled",
@@ -1784,13 +1812,13 @@ async function releaseClaimByAdmin({ agencyId, actorUserId, deliveryId, db = pri
   const delivery = await db.automationDelivery.findFirst({ where: { id: deliveryId, agencyId, originKind: "AUTOMATION" } });
   if (!delivery) throw new ActionDeliveryError("DELIVERY_NOT_FOUND", "Delivery not found", 404);
   await requireLiveAutomationManagementActor({ db, agencyId, actorUserId, creatorId: delivery.creatorId });
-  if (["COMMITTING", "RECONCILE_REQUIRED"].includes(delivery.status)) throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before administrative release");
+  if (delivery.status === "COMMITTING" || deliveryRequiresReconciliation(delivery)) throw new ActionDeliveryError("DELIVERY_COMMIT_IN_FLIGHT", "Committed write must settle or reconcile before administrative release");
   if (!["CLAIMED", "RUNNING"].includes(delivery.status)) return { ok: true, duplicate: true, delivery };
   const updated = await runDbTransaction(db, async (tx) => {
     await lockCleanupMutation(tx,delivery);
     await requireLiveAutomationManagementActor({ db: tx, agencyId, actorUserId, creatorId: delivery.creatorId });
     const changed = await tx.automationDelivery.updateMany({
-      where: { id: delivery.id, originKind: "AUTOMATION", status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision },
+      where: { id: delivery.id, originKind: "AUTOMATION", status: { in: ["CLAIMED", "RUNNING"] }, leaseRevision: delivery.leaseRevision, ...deliveryOutcomeSnapshotWhere(delivery) },
       data: { status: "QUEUED", notBefore: new Date(Date.now() + 15_000), claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, attempts: { decrement: 1 }, lastError: "Claim released by administrator" },
     });
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_CHANGED", "Delivery changed before administrative release");

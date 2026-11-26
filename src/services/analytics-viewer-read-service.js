@@ -17,7 +17,9 @@ async function resolveAnalyticsViewer({ db, userId, creatorId, member: expected 
   if (!member) throw denied("ANALYTICS_ACCESS_CHANGED");
   await requireCreatorAccess({ db, agencyId: creator.agencyId, member, creatorId });
   const effective = { ...member, permissions: await resolveEffectivePermissions({ db, member }) };
-  if (!await canUsePermission({ db, member: effective, key: permission })) throw denied("FEATURE_FORBIDDEN");
+  // Explicit null is used only by mixed content readers which project optional
+  // fields from the effective permissions. Missing permissions still fail.
+  if (permission !== null && !await canUsePermission({ db, member: effective, key: permission })) throw denied("FEATURE_FORBIDDEN");
   return { creator, member: effective };
 }
 
@@ -33,7 +35,11 @@ async function readWithAnalyticsViewer(input, read) {
   // Re-check on the root AFTER the read snapshot ends. Re-reading inside a
   // REPEATABLE READ snapshot cannot observe a concurrently disabled user,
   // retired scope or changed epoch and would falsely certify the old payload.
-  await resolveAnalyticsViewer({ ...input, member: result.member });
+  const current = await resolveAnalyticsViewer({ ...input, member: result.member });
+  for (const permission of input.projectionPermissions || []) {
+    if ((current.member.permissions?.[permission] === true) !== (result.member.permissions?.[permission] === true))
+      throw denied("ANALYTICS_ACCESS_CHANGED");
+  }
   return result.value;
 }
 

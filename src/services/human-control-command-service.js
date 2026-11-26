@@ -222,6 +222,11 @@ async function apply(tx, agencyId, userId, member, c, context, deviceId) {
     });
     return { ...value, humanReference: { readAt: now.toISOString() } };
   }
+  if (c.action === "custom.continueInstruction") {
+    value = await require("./custom-instruction-continuation-service").createInstructionContinuation({
+      agencyId, member, creatorId: c.targetId, input: p, now: await dbAuthorityNow({ db: tx }), db: tx });
+    return { ...value, humanReference: { intentId: value.intentId } };
+  }
   if (c.action === "custom.destination") {
     value = await destination.setCustomVaultDestination({
       agencyId,
@@ -281,6 +286,8 @@ async function apply(tx, agencyId, userId, member, c, context, deviceId) {
   throw fail("HUMAN_COMMAND_UNKNOWN", "Unsupported control action", 400);
 }
 async function current(tx, agencyId, member, c, ref) {
+  if (c.action === "custom.continueInstruction") return require("./custom-instruction-continuation-service").readInstructionContinuationResult({
+    agencyId, creatorId: c.targetId, intentId: ref.humanReference.intentId, db: tx });
   if (c.action === "operation.control") {
     await require("./operational-command-service").authorizeExtra(tx, member, c.payload);
     return ref.humanReference.outcome;

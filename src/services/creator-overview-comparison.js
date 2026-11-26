@@ -45,8 +45,19 @@ function financialRangeCoverage({ current, coverage, range, now }) {
   // promise that observations arriving after it have already been collected.
   const ready = Boolean(current?.ready && current.generation && from && through
     && from <= requested.startAt && through >= requested.endDay);
+  const reason = !current?.ready || !coverage ? "NO_BASELINE"
+    : coverage.proofPolicyVersion === 0 ? "POLICY_ADOPTION_REQUIRED"
+    : coverage.recoveryStopped ? "RECOVERY_STOPPED"
+    : coverage.recovering ? "RECOVERY_PENDING"
+    : coverage.unresolved ? "UNRESOLVED_MONEY"
+    : coverage.undelivered ? "DELIVERY_PENDING"
+    : !ready ? "RANGE_NOT_COVERED"
+    : coverage.fresh !== true ? "STALE_SNAPSHOT" : "READY";
   return { ready, fresh: ready && coverage?.fresh === true,
-    fromAt: from?.toISOString() || null, throughAt: through?.toISOString() || null };
+    fromAt: from?.toISOString() || null, throughAt: through?.toISOString() || null,
+    contractVersion: 1, proofPolicyVersion: coverage?.proofPolicyVersion || 0,
+    sourceObservedAt: coverage?.sourceObservedAt ? new Date(coverage.sourceObservedAt).toISOString() : null,
+    verifiedThroughAt: through?.toISOString() || null, snapshotRevision: coverage?.snapshotRevision || null, reason };
 }
 
 async function readCreatorFinancialReadState({ db, creatorId, range, now, current }) {

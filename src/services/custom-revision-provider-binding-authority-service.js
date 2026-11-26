@@ -1,6 +1,7 @@
 "use strict";
 
 const { isActiveTelegramAccount } = require("./telegram-account-reference-authority-service");
+const { instructionDeliveryState, effectiveInstruction } = require("./custom-instruction-manifest");
 
 function clean(value, max = 500) {
   const text = String(value == null ? "" : value).trim();
@@ -18,7 +19,7 @@ function positiveMessageId(value) {
   return /^\d{1,20}$/.test(text) && BigInt(text) > 0n ? text : null;
 }
 function confirmedTaskBinding(task) {
-  if (!task || String(task.state || "") !== "CONFIRMED") return null;
+  if (!task || instructionDeliveryState(task) !== "CONFIRMED") return null;
   const accountId = clean(task.accountId, 180);
   const replyToMessageId = positiveMessageId(task.remoteMessageId);
   const recipientTelegramUserId = positiveMessageId(task.remoteRecipientTelegramUserId);
@@ -75,10 +76,11 @@ async function inspectRevisionProviderBindings({ agencyId, orderId, submission, 
     error.status = 500;
     throw error;
   }
-  const task = await db.telegramDeliveryIntent.findFirst({
+  const sourceTask = await db.telegramDeliveryIntent.findFirst({
     where: { agencyId: String(agencyId), customOrderId: String(orderId), kind: "TASK", state: "CONFIRMED" },
     orderBy: [{ confirmedAt: "desc" }, { createdAt: "desc" }, { id: "desc" }],
   });
+  const task = await effectiveInstruction(sourceTask, db, agencyId);
   const candidates = [confirmedTaskBinding(task), pinnedSubmissionSourceBinding(submission)].filter(Boolean);
   const inspected = [];
   for (const binding of candidates) {

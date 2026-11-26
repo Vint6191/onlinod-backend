@@ -537,8 +537,26 @@ async function ensureAnalyticsWindowFreshness({
     forceDay(normalizedReason, day, currentNow, force)) }));
   const automatic = ["RECURRING", "HOME_AUTOMATIC", "INITIAL_BASELINE", "INITIAL_SYNC"].includes(normalizedReason);
   if(automatic && typeof db.$queryRawUnsafe==="function") {
-    const [ledger]=await db.$queryRawUnsafe('SELECT "fromAt" FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$1 AND "agencyId"=$2',creatorId,agencyId);
-    if(ledger && new Date(ledger.fromAt)<=from) return {ok:true,displayRangeKey,startDay:from,endDay:to,dueDays:0,deferredDays:0,staleDays:0,windows:0,created:0,reused:0,jobs:[],fresh:false,reason:"live_projection_owned"};
+    const ledger = await require('./earnings-live-read-sql').readLiveEarningsCoverage(db, creatorId, currentNow);
+    if (ledger && new Date(ledger.fromAt) <= from) {
+      // The ledger owns this range, including responsibility for repairing its
+      // missing end. Ownership alone cannot suppress both collection paths.
+      const requiredThroughAt = to < today ? new Date(+to + DAY_MS - 1) : new Date(+currentNow - 3 * 60_000);
+      let recoveryPending = ledger.recovering;
+      if (ledger.proofPolicyVersion !== require('./earnings-coverage-service').FINANCIAL_PROOF_POLICY_VERSION
+        || new Date(ledger.throughAt) < requiredThroughAt || ledger.shortGapFrom) {
+        const { withCollectorStateLock, COLLECTOR_TYPES } = require('./analytics-collector-control-service');
+        const repair = await withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId, work: async tx => {
+          await tx.$executeRawUnsafe('INSERT INTO "CreatorLiveSync"("creatorId","agencyId") VALUES($1,$2) ON CONFLICT("creatorId") DO NOTHING', creatorId, agencyId);
+          await tx.$queryRawUnsafe('SELECT "creatorId" FROM "CreatorLiveSync" WHERE "creatorId"=$1 FOR UPDATE', creatorId);
+          return require('./financial-proof-repair-service').ensureFinancialDebt({ db: tx, agencyId,
+            creatorIds: [creatorId], now: currentNow, targetAt: currentNow, requiredThroughAt });
+        } });
+        recoveryPending ||= repair.queued > 0;
+      }
+      return {ok:true,displayRangeKey,startDay:from,endDay:to,dueDays:0,deferredDays:0,staleDays:0,windows:0,created:0,reused:0,jobs:[],
+        fresh:ledger.fresh === true && !recoveryPending,reason:recoveryPending ? 'financial_recovery_pending' : 'live_projection_owned'};
+    }
   }
   const published = automatic && typeof db.creatorEarningsPublishedDay?.findMany === "function"
     ? await db.creatorEarningsPublishedDay.findMany({where:{agencyId,creatorId,date:{gte:from,lte:to}},select:{date:true}}) : [];

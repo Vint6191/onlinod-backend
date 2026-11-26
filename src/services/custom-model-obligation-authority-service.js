@@ -1,6 +1,7 @@
 "use strict";
 
 const { deriveCustomRevisionDispatch } = require("./custom-revision-dispatch-authority-service");
+const { instructionDeliveryState, effectiveInstruction } = require("./custom-instruction-manifest");
 
 function clean(value, max = 500) {
   const text = String(value == null ? "" : value).trim();
@@ -14,16 +15,18 @@ function isoOrNull(value) {
 }
 
 function confirmedInstruction(intent) {
-  if (!intent || String(intent.state || "") !== "CONFIRMED") return null;
+  if (!intent || instructionDeliveryState(intent) !== "CONFIRMED") return null;
   const messageId = clean(intent.remoteMessageId, 40);
   const recipient = clean(intent.remoteRecipientTelegramUserId, 40);
   // remoteSentAt is the strongest provider timestamp. Historical confirmed rows may predate
   // that projection; confirmedAt is a conservative fallback (never earlier than settlement).
-  const sentAt = isoOrNull(intent.remoteSentAt || intent.confirmedAt);
+  const sentAt = isoOrNull(intent.instructionManifest?.completedAt || intent.remoteSentAt || intent.confirmedAt);
   if (!/^\d{1,20}$/.test(messageId) || !/^\d{1,20}$/.test(recipient) || !sentAt) return null;
   return {
     intentId: String(intent.id),
     kind: String(intent.kind),
+    sourceKind: intent.kind === "INSTRUCTION_CONTINUATION" ? intent.payload?.sourceKind || null : null,
+    sourceIntentId: intent.kind === "INSTRUCTION_CONTINUATION" ? intent.payload?.sourceIntentId || null : null,
     accountId: String(intent.accountId),
     remoteMessageId: messageId,
     recipientTelegramUserId: recipient,
@@ -53,7 +56,7 @@ function stateResult({ state, order, submission = null, intent = null, instructi
     currentInstruction: instruction,
     instructionIntentId: instruction?.intentId || (intent?.id ? String(intent.id) : null),
     instructionKind: instruction?.kind || (intent?.kind ? String(intent.kind) : null),
-    deliveryState: intent?.state ? String(intent.state) : null,
+    deliveryState: intent?.state ? instructionDeliveryState(intent) : null,
     latestSubmission: publicSubmission(submission),
     reason,
   };
@@ -70,7 +73,7 @@ async function latestSubmissionForOrder({ agencyId, order, db }) {
 
 async function latestIntent({ agencyId, orderId, kind, customSubmissionId = null, db }) {
   if (!db?.telegramDeliveryIntent?.findFirst) return null;
-  return db.telegramDeliveryIntent.findFirst({
+  const source = await db.telegramDeliveryIntent.findFirst({
     where: {
       agencyId,
       customOrderId: String(orderId),
@@ -79,6 +82,7 @@ async function latestIntent({ agencyId, orderId, kind, customSubmissionId = null
     },
     orderBy: [{ createdAt: "desc" }, { id: "desc" }],
   });
+  return effectiveInstruction(source, db, agencyId);
 }
 
 async function deriveCustomInitialInstruction({ agencyId, orderId = null, order = null, db } = {}) {
@@ -121,11 +125,11 @@ async function deriveCustomInitialInstruction({ agencyId, orderId = null, order 
       reason: "TASK_PROVIDER_CONFIRMED",
     };
   }
-  if (String(task?.state || "") === "RECONCILE_REQUIRED" || String(task?.state || "") === "COMMITTING") {
-    return { applies: true, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type, state: "INITIAL_DELIVERY_UNKNOWN", initialInstructionRequired: false, currentInstruction: null, instructionIntentId: String(task.id), instructionKind: "TASK", deliveryState: String(task.state), reason: "TASK_OUTCOME_UNKNOWN" };
+  if (["RECONCILE_REQUIRED", "COMMITTING"].includes(instructionDeliveryState(task))) {
+    return { applies: true, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type, state: "INITIAL_DELIVERY_UNKNOWN", initialInstructionRequired: false, currentInstruction: null, instructionIntentId: String(task.id), instructionKind: "TASK", deliveryState: instructionDeliveryState(task), reason: "TASK_OUTCOME_UNKNOWN" };
   }
   if (task) {
-    return { applies: true, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type, state: "INITIAL_DISPATCH_PENDING", initialInstructionRequired: ["PLANNED","CLAIMED","FAILED_PRECOMMIT","CANCELLED"].includes(String(task.state || "")), currentInstruction: null, instructionIntentId: String(task.id), instructionKind: "TASK", deliveryState: String(task.state || "PLANNED"), reason: `TASK_${String(task.state || "PLANNED")}` };
+    return { applies: true, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type, state: "INITIAL_DISPATCH_PENDING", initialInstructionRequired: ["PLANNED","CLAIMED","FAILED_PRECOMMIT","CANCELLED"].includes(instructionDeliveryState(task)), currentInstruction: null, instructionIntentId: String(task.id), instructionKind: "TASK", deliveryState: instructionDeliveryState(task), reason: `TASK_${instructionDeliveryState(task)}` };
   }
   return { applies: true, missing: false, orderId: String(row.id), creatorId: String(row.creatorId), type, state: "NO_INSTRUCTION", initialInstructionRequired: true, modelOwesResponse: false, currentInstruction: null, reason: "TASK_INTENT_MISSING" };
 }
@@ -178,7 +182,7 @@ async function deriveCustomModelObligation({ agencyId, orderId = null, order = n
   if (instruction) {
     return stateResult({ state: "INITIAL_WAITING_RESPONSE", order: row, intent: task, instruction, obligation: true, reason: "TASK_PROVIDER_CONFIRMED" });
   }
-  if (String(task?.state || "") === "RECONCILE_REQUIRED") {
+  if (["RECONCILE_REQUIRED", "COMMITTING"].includes(instructionDeliveryState(task))) {
     return stateResult({ state: "INITIAL_DELIVERY_UNKNOWN", order: row, intent: task, reason: "TASK_OUTCOME_UNKNOWN" });
   }
   if (task) return stateResult({ state: "INITIAL_DISPATCH_PENDING", order: row, intent: task, reason: `TASK_${String(task.state || "PLANNED")}` });

@@ -1,4 +1,5 @@
 "use strict";
+const { instructionDeliveryState, effectiveInstruction } = require("./custom-instruction-manifest");
 
 const { audit } = require("./audit-service");
 const { fenceCustomModelObligationTransition } = require("./custom-model-obligation-authority-service");
@@ -40,7 +41,7 @@ async function relevantModelInstruction({ agencyId, creatorId, customOrderId, ex
   }
 
   const kind = latest ? "REVISION_REQUEST" : "TASK";
-  const intent = await db.telegramDeliveryIntent.findFirst({
+  const source = await db.telegramDeliveryIntent.findFirst({
     where: {
       agencyId,
       customOrderId,
@@ -49,12 +50,13 @@ async function relevantModelInstruction({ agencyId, creatorId, customOrderId, ex
     },
     select: {
       id: true, agencyId: true, creatorId: true, customOrderId: true, customSubmissionId: true,
-      kind: true, state: true, claimRevision: true, commitStartedAt: true, remoteMessageId: true,
+      kind: true, state: true, instructionManifest: true, claimRevision: true, commitStartedAt: true, remoteMessageId: true,
       remoteRecipientTelegramUserId: true, remoteSentAt: true, confirmedAt: true, outcomeReason: true,
       createdAt: true, updatedAt: true,
     },
     orderBy: [{ createdAt: "desc" }, { id: "desc" }],
   });
+  const intent = await effectiveInstruction(source, db, agencyId);
   if (intent && String(intent.creatorId || creatorId) !== String(creatorId)) {
     throw fail("CUSTOM_MODEL_INSTRUCTION_TARGET_CONFLICT", "The current model instruction belongs to a different creator", 409);
   }
@@ -63,7 +65,7 @@ async function relevantModelInstruction({ agencyId, creatorId, customOrderId, ex
 
 function decisionForInstruction(intent) {
   if (!intent) return { decision: "NO_INSTRUCTION", allow: true, supersede: false };
-  const state = String(intent.state || "");
+  const state = instructionDeliveryState(intent);
   if (PRECOMMIT_STATES.has(state) && intent.commitStartedAt == null) {
     return { decision: "SUPERSEDE_PRECOMMIT", allow: true, supersede: true };
   }
@@ -81,7 +83,7 @@ async function reloadInstruction({ agencyId, instructionId, db }) {
     where: { id: String(instructionId), agencyId },
     select: {
       id: true, agencyId: true, creatorId: true, customOrderId: true, customSubmissionId: true,
-      kind: true, state: true, claimRevision: true, commitStartedAt: true, remoteMessageId: true,
+      kind: true, state: true, instructionManifest: true, claimRevision: true, commitStartedAt: true, remoteMessageId: true,
       remoteRecipientTelegramUserId: true, remoteSentAt: true, confirmedAt: true, outcomeReason: true,
       createdAt: true, updatedAt: true,
     },
@@ -161,25 +163,29 @@ async function adjudicateHumanModelResponseOverride({
       intent = await reloadInstruction({ agencyId: scopedAgencyId, instructionId: intent.id, db });
       outcome = decisionForInstruction(intent);
       if (!outcome.allow || outcome.supersede) {
-        if (String(intent?.state) === "COMMITTING") {
+        if (instructionDeliveryState(intent) === "COMMITTING") {
           throw fail("CUSTOM_MODEL_INSTRUCTION_COMMITTING", "The model instruction has crossed the provider commit boundary; settle it before accepting a manual response", 409);
         }
-        if (String(intent?.state) === "RECONCILE_REQUIRED") {
+        if (instructionDeliveryState(intent) === "RECONCILE_REQUIRED") {
           throw fail("CUSTOM_MODEL_INSTRUCTION_OUTCOME_UNKNOWN", "The model instruction provider outcome is unknown; reconcile it before accepting a manual response", 409);
         }
         throw fail("CUSTOM_MODEL_INSTRUCTION_OVERRIDE_RACE", "The model instruction changed while the human response override was being adjudicated", 409);
       }
     } else {
+      if (intent.instructionManifest) await db.telegramDeliveryIntent.updateMany({
+        where: { agencyId: scopedAgencyId, instructionParentId: intent.id, state: { in: ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT"] }, commitStartedAt: null },
+        data: { state: "CANCELLED", claimTokenHash: null, claimUntil: null, claimRevision: { increment: 1 }, outcomeReason: "HUMAN_RESPONSE_SUPERSEDED_INSTRUCTION" },
+      });
       intent = await reloadInstruction({ agencyId: scopedAgencyId, instructionId: intent.id, db }) || { ...intent, state: "CANCELLED" };
       outcome = { decision: "SUPERSEDED_PRECOMMIT", allow: true, supersede: false };
     }
   }
 
   if (!outcome.allow) {
-    if (String(intent?.state) === "COMMITTING") {
+    if (instructionDeliveryState(intent) === "COMMITTING") {
       throw fail("CUSTOM_MODEL_INSTRUCTION_COMMITTING", "The model instruction has crossed the provider commit boundary; settle it before accepting a manual response", 409);
     }
-    if (String(intent?.state) === "RECONCILE_REQUIRED") {
+    if (instructionDeliveryState(intent) === "RECONCILE_REQUIRED") {
       throw fail("CUSTOM_MODEL_INSTRUCTION_OUTCOME_UNKNOWN", "The model instruction provider outcome is unknown; reconcile it before accepting a manual response", 409);
     }
     throw fail("CUSTOM_MODEL_INSTRUCTION_UNRESOLVED", "The current model instruction is not proven safe for a human response override", 409);

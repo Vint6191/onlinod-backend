@@ -217,10 +217,9 @@ router.post("/:creatorId/assets/delete", vaultManagementRequired, async (req, re
 
 router.get("/:creatorId/sales/summary", async (req, res) => {
   try {
-    return res.json(await getMediaSalesSummary({
-      agencyId: req.auth.agencyId,
-      creatorId: req.params.creatorId,
-    }));
+    return res.json(await require("../services/media-money-viewer-service").readMediaWithViewer({
+      userId: req.auth.userId, creatorId: req.params.creatorId, member: req.auth.membership || req.member || null,
+    }, ({ db, creator }) => getMediaSalesSummary({ db, agencyId: creator.agencyId, creatorId: creator.id })));
   } catch (error) {
     return sendError(res, error, "MEDIA_LIBRARY_SALES_SUMMARY_FAILED");
   }
@@ -229,11 +228,9 @@ router.get("/:creatorId/sales/summary", async (req, res) => {
 router.post("/:creatorId/sales/assets", async (req, res) => {
   try {
     const input = salesListSchema.parse(req.body || {});
-    return res.json(await listMediaSalesAssets({
-      agencyId: req.auth.agencyId,
-      creatorId: req.params.creatorId,
-      ...input,
-    }));
+    return res.json(await require("../services/media-money-viewer-service").readMediaWithViewer({
+      userId: req.auth.userId, creatorId: req.params.creatorId, member: req.auth.membership || req.member || null,
+    }, ({ db, creator, moneyAllowed }) => listMediaSalesAssets({ db, agencyId: creator.agencyId, creatorId: creator.id, moneyAllowed, ...input })));
   } catch (error) {
     return sendError(res, error, "MEDIA_LIBRARY_SALES_ASSETS_FAILED");
   }

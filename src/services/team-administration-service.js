@@ -297,6 +297,7 @@ function memberToClient(member) {
     roleKey: memberRoleKey(member),
     legacyRole: member.role,
     accessEpoch: normalizedEpoch(member.accessEpoch),
+    editRevision: Number(member.editRevision || 1),
     functions: cleanFunctions((member.teamFunctions || []).map((row) => row.functionKey)),
     creatorAccess: isOwner(member) ? { mode: "all", creatorIds: [] } : normalizeAssignedCreators(member.assignedCreators),
     assignedCreators: member.assignedCreators ?? "all",
@@ -647,6 +648,18 @@ function publishRoleMemberAccessEpochs({ agencyId, roleKey, members, sourceDevic
   }
 }
 
+function assertMemberEditRevision(target, expectedRevision) {
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
+    throw Object.assign(new Error("Update NOD and reopen this member before editing"), { code: "TEAM_WRITER_UPDATE_REQUIRED", status: 426 });
+  if (Number(target.editRevision || 1) !== expectedRevision)
+    throw Object.assign(new Error("Member changed since this form was opened. Reload and review your changes."),
+      { code: "MEMBER_EDIT_CONFLICT", status: 409, details: { expectedRevision, currentRevision: Number(target.editRevision || 1) } });
+}
+function creatorScopesEqual(a, b) {
+  const left = normalizeAssignedCreators(a), right = normalizeAssignedCreators(b);
+  return left.mode === right.mode && (left.mode === "all" || JSON.stringify([...left.creatorIds].sort()) === JSON.stringify([...right.creatorIds].sort()));
+}
+
 async function updateMemberSettings({ agencyId, memberId, patch, actorMember, actorUserId: actorId, actorDeviceId = null, actorProof = null, db = prisma }) {
   const target = await db.agencyMember.findFirst({
     where: { id: memberId, agencyId, deletedAt: null },
@@ -693,6 +706,7 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
 
   const nextFunctions = patch.functions === undefined ? null : cleanFunctions(patch.functions);
   const before = memberToClient(target);
+  let authorityChanged = false;
 
   const updated = await serializableTeamTransaction(db, async (tx) => {
     // Every writer of AgencyMember current-authority state joins one narrow
@@ -703,6 +717,7 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
 
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found in this agency"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
+    assertMemberEditRevision(liveTarget, patch.expectedRevision);
 
     const liveNextRoleKey = patch.roleKey === undefined ? memberRoleKey(liveTarget) : nextRoleKey;
     if (patch.roleKey !== undefined) {
@@ -764,19 +779,24 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
       });
     }
 
+    const priorFunctions = nextFunctions === null ? [] : await tx.teamMemberFunction.findMany({ where: { agencyId, memberId: target.id }, select: { functionKey: true } });
+    const functionsChanged = nextFunctions !== null && JSON.stringify([...nextFunctions].sort()) !== JSON.stringify(priorFunctions.map(x => x.functionKey).sort());
+    authorityChanged = liveNextRoleKey !== memberRoleKey(liveTarget) || Boolean(committedCreatorScope && !creatorScopesEqual(committedCreatorScope.value, liveTarget.assignedCreators));
+    const nameChanged = patch.displayName !== undefined && (patch.displayName || null) !== (liveTarget.displayName || null);
     const row = await tx.agencyMember.update({
       where: { id: liveTarget.id },
       data: {
         ...(patch.displayName !== undefined ? { displayName: patch.displayName || null } : {}),
         ...(patch.roleKey !== undefined ? { roleKey: liveNextRoleKey, role: roleKeyToLegacy(liveNextRoleKey) } : {}),
         ...(committedCreatorScope ? { assignedCreators: committedCreatorScope.value } : {}),
-        ...((patch.roleKey !== undefined || committedCreatorScope) ? { accessEpoch: { increment: 1 } } : {}),
+        ...(authorityChanged ? { accessEpoch: { increment: 1 } } : {}),
+        ...((authorityChanged || nameChanged || functionsChanged) ? { editRevision: { increment: 1 } } : {}),
       },
     });
     if (liveOwnerDemoted) {
       await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: new Date() });
     }
-    if (nextFunctions !== null) {
+    if (functionsChanged) {
       await tx.teamMemberFunction.deleteMany({ where: { agencyId, memberId: target.id } });
       if (nextFunctions.length) {
         await tx.teamMemberFunction.createMany({
@@ -795,7 +815,7 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
   });
 
   const after = memberToClient(updated);
-  if (patch.roleKey !== undefined || creatorScope) {
+  if (authorityChanged) {
     // One durable Member.accessEpoch change is the correctness fact. Control
     // delivery is only a wakeup; do not amplify a broad revoke into one event
     // per Creator. Desktop recomputes the authoritative catalog from generations.
@@ -817,7 +837,7 @@ async function updateMemberSettings({ agencyId, memberId, patch, actorMember, ac
   return after;
 }
 
-async function setMemberStatus({ agencyId, memberId, status, actorMember, actorUserId: actorId, actorDeviceId = null, actorProof = null, db = prisma }) {
+async function setMemberStatus({ agencyId, memberId, status, expectedRevision, actorMember, actorUserId: actorId, actorDeviceId = null, actorProof = null, db = prisma }) {
   const target = await db.agencyMember.findFirst({ where: { id: memberId, agencyId, deletedAt: null } });
   if (!target) {
     const error = new Error("Member not found");
@@ -839,6 +859,7 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
     await lockTeamControlPlaneTopology({ tx, agencyId });
     const liveTarget = await tx.agencyMember.findFirst({ where: { id: target.id, agencyId, deletedAt: null } });
     if (!liveTarget) { const error = new Error("Member not found"); error.code = "MEMBER_NOT_FOUND"; error.status = 404; throw error; }
+    assertMemberEditRevision(liveTarget, expectedRevision);
 
     if (status !== "deactivated") {
       // Reactivation makes this membership live for role-derived authorization.
@@ -859,8 +880,9 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
         tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof,
       });
     }
+    if (Boolean(liveTarget.deactivatedAt) === (status === "deactivated")) { deactivatedAt = liveTarget.deactivatedAt; return liveTarget; }
     deactivatedAt = status === "deactivated" ? await dbAuthorityNow({ db: tx, fallbackNow: new Date() }) : null;
-    const updatedMember = await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deactivatedAt, accessEpoch: { increment: 1 } } });
+    const updatedMember = await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deactivatedAt, accessEpoch: { increment: 1 }, editRevision: { increment: 1 } } });
     if (status === "deactivated") {
       await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deactivatedAt });
       await tx.refreshSession.updateMany({
@@ -870,7 +892,7 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
     }
     return updatedMember || { ...liveTarget, deactivatedAt, accessEpoch: normalizedEpoch(liveTarget.accessEpoch) + 1 };
   });
-  publishMemberAccessEpoch({ agencyId, member: statusMutation || { ...target, accessEpoch: normalizedEpoch(target.accessEpoch) + 1 }, sourceDeviceId: actorDeviceId });
+  if (statusMutation.accessEpoch !== target.accessEpoch) publishMemberAccessEpoch({ agencyId, member: statusMutation || { ...target, accessEpoch: normalizedEpoch(target.accessEpoch) + 1 }, sourceDeviceId: actorDeviceId });
   await audit({
     agencyId,
     actorUserId: actorId,
@@ -883,7 +905,7 @@ async function setMemberStatus({ agencyId, memberId, status, actorMember, actorU
   return { id: target.id, status, deactivatedAt };
 }
 
-async function removeMember({ agencyId, memberId, actorMember = null, actorUserId: actorId = null, actorDeviceId = null, actorProof = null, platformAdmin = false, expectedAccessEpoch = null, publishEvents = true, db = prisma }) {
+async function removeMember({ agencyId, memberId, expectedRevision, actorMember = null, actorUserId: actorId = null, actorDeviceId = null, actorProof = null, platformAdmin = false, expectedAccessEpoch = null, publishEvents = true, db = prisma }) {
   const target = await db.agencyMember.findFirst({ where: { id: memberId, agencyId, deletedAt: null } });
   if (!target) {
     const error = new Error("Member not found");
@@ -921,6 +943,8 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
       if (liveTarget.id === liveActor.id) { const error = new Error("You cannot remove your own membership"); error.code = "CANNOT_REMOVE_SELF"; error.status = 409; throw error; }
     }
 
+    if (!platformAdmin) assertMemberEditRevision(liveTarget, expectedRevision);
+
     if (expectedAccessEpoch !== null && liveTarget.accessEpoch !== expectedAccessEpoch) throw Object.assign(new Error("Member access changed; reload"), {code:"MEMBER_REVISION_CONFLICT",status:409});
 
     // The Team control-plane fence now serializes every owner/member lifecycle
@@ -931,7 +955,7 @@ async function removeMember({ agencyId, memberId, actorMember = null, actorUserI
       await requireOwnerPossessionForCryptoDestructiveTeamMutation({ tx, agencyId, actorUserId: actorId, liveActor, actorDeviceId, actorProof });
     }
     deletedAt = await dbAuthorityNow({ db: tx, fallbackNow: new Date() });
-    const updatedMember = await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deletedAt, deactivatedAt: deletedAt, accessEpoch: { increment: 1 } } });
+    const updatedMember = await tx.agencyMember.update({ where: { id: liveTarget.id }, data: { deletedAt, deactivatedAt: deletedAt, accessEpoch: { increment: 1 }, editRevision: { increment: 1 } } });
     await revokeOwnerRootAccessForMember({ db: tx, agencyId, userId: liveTarget.userId, revokedAt: deletedAt });
     await tx.refreshSession.updateMany({ where: { userId: liveTarget.userId, agencyId, revokedAt: null, expiresAt: { gt: deletedAt } }, data: { revokedAt: deletedAt } });
     return updatedMember || { ...liveTarget, deletedAt, deactivatedAt: deletedAt, accessEpoch: normalizedEpoch(liveTarget.accessEpoch) + 1 };

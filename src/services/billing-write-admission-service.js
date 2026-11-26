@@ -40,7 +40,7 @@ function billingActionClaimWhere(access) {
 // an unpaid prefix. One indexed candidate per paid creator bounds discovery
 // independently of queued history and prevents one creator monopolizing a page.
 // This is discovery only; commit rechecks the shared authority.
-async function selectBillableTelegramWorkIds({ db, agencyId, scope, take }) {
+async function selectBillableTelegramWorkIds({ db, agencyId, scope, take, instructionManifestVersion = null }) {
   const rows = await db.$queryRawUnsafe(`WITH clock AS MATERIALIZED (
       SELECT clock_timestamp() AT TIME ZONE 'UTC' AS at
     ), agency AS MATERIALIZED (
@@ -64,10 +64,19 @@ async function selectBillableTelegramWorkIds({ db, agencyId, scope, take }) {
         AND (t."state"<>'CLAIMED' OR t."claimUntil" IS NULL OR t."claimUntil"<=clock.at)
         AND NOT (t."state"='PLANNED' AND t."commitStartedAt" IS NULL
           AND starts_with(COALESCE(t."outcomeReason",''),'PRECOMMIT_PROVIDER_UNAVAILABLE:'))
+        AND ($5::boolean OR (t."instructionParentId" IS NULL AND t."instructionManifest" IS NULL))
+        AND (t."instructionParentId" IS NULL OR (
+          EXISTS (SELECT 1 FROM "TelegramDeliveryIntent" p WHERE p."id"=t."instructionParentId"
+            AND p."agencyId"=t."agencyId" AND p."state"='CONFIRMED')
+          AND NOT EXISTS (SELECT 1 FROM "TelegramDeliveryIntent" before_part
+            WHERE before_part."instructionParentId"=t."instructionParentId"
+              AND before_part."agencyId"=t."agencyId" AND before_part."instructionPartIndex"<t."instructionPartIndex"
+              AND before_part."state"<>'CONFIRMED')
+        ))
       ORDER BY t."createdAt",t."id" LIMIT 1
     ) t
     ORDER BY t."createdAt",t."id" LIMIT $4`, agencyId, scope?.broad === true,
-    (scope?.creatorIds || []).map(String), Math.max(1, Math.min(200, take)));
+    (scope?.creatorIds || []).map(String), Math.max(1, Math.min(200, take)), Number(instructionManifestVersion) === 1);
   return rows.map(row => row.id);
 }
 

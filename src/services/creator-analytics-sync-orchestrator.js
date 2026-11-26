@@ -103,7 +103,12 @@ async function scheduleIfIdle({ db, creatorId, agencyId, jobKey, params, priorit
     currentCollectorState = retry.state;
     if (retry.deferred || retry.terminal) return { created: false, reason: retry.deferred ? retry.reason || "deferred" : "failed_terminal", retryAfterAt: retry.retryAfterAt };
 
-    params = { ...params, ...buildCollectionCommand({ collectorType, collectionMode: initial ? "full" : "catchup", reason: params.reason, now }) };
+    const recovery = collectorType === COLLECTOR_TYPES.FINANCIAL && params.recoveryIntentId
+      ? await tx.creatorRecoveryIntent.findFirst({ where: { id: params.recoveryIntentId, creatorId, agencyId,
+        stream: "financial", status: { not: "COMPLETE" } } }) : null;
+    const fullFinancialRepair = recovery?.reason === "FINANCIAL_PROOF_ADOPTION_FULL";
+    params = { ...params, ...buildCollectionCommand({ collectorType, collectionMode: initial || fullFinancialRepair ? "full" : "catchup", reason: params.reason, now }) };
+    if (fullFinancialRepair) { params.financialMode = "full"; delete params.financialFrontierVersion; }
     let collectionPlan = null;
     if (collectorType === COLLECTOR_TYPES.NOTIFICATIONS) {
       params = { ...params, ...buildNotificationScanParams({ state: initial ? null : currentCollectorState, now, reason: params.reason, analyticsRangeKey: "all" }) };
@@ -482,16 +487,20 @@ async function ensureRecurringCreatorAnalyticsCatchups({ db = prisma, creatorId,
     if (!readiness[stream]) { skipped.push(`${stream}:baseline_unverified`); continue; }
     const intent = intents[stream];
     if (!intent) { skipped.push(`${stream}:live_no_recovery_debt`); continue; }
+    const fullFinancialRepair = stream === "financial" && intent.reason === "FINANCIAL_PROOF_ADOPTION_FULL";
     const jobKey = stream === "notifications" ? NOTIFICATION_JOB_KEY : stream === "financial" ? FINANCIAL_JOB_KEY : CAMPAIGN_JOB_KEY;
     const params = {
-      ...buildCollectionCommand({ collectorType, collectionMode:"catchup", reason:intent.reason, now }),
+      ...buildCollectionCommand({ collectorType, collectionMode:fullFinancialRepair?"full":"catchup", reason:intent.reason, now }),
       analyticsSyncKind:"catchup", analyticsSyncVersion:ANALYTICS_SYNC_VERSION, analyticsSyncStage:stream,
       ...liveSync.recoveryParams(intent),
       ...(stream === "notifications" ? { ...buildNotificationScanParams({state:notificationState,now,reason:intent.reason}),
         to:new Date(intent.targetAt).toISOString(), notificationFrontierVersion:3 } : {}),
-      ...(stream === "financial" ? { financialMode:"catchup", endDate:onlyFansUtcDateTime(intent.targetAt),
+      ...(stream === "financial" ? { financialMode:fullFinancialRepair?"full":"catchup",
+        // The source accepts second precision. Round UP so a fractional frozen
+        // recovery target is actually included in the requested proof window.
+        endDate:onlyFansUtcDateTime(new Date(Math.ceil(+new Date(intent.targetAt)/1000)*1000)),
         initialMarker:Math.ceil(+new Date(intent.targetAt)/1000), schemaVersion:FINANCIAL_SCHEMA_VERSION, collectorVersion:FINANCIAL_COLLECTOR_VERSION,
-        financialFrontierVersion:2, financialTraversalVersion:2 } : {}),
+        ...(!fullFinancialRepair?{financialFrontierVersion:2}:{}), financialTraversalVersion:2 } : {}),
       ...(stream === "campaigns" ? { campaignMode:"catchup", pageSize:50, maxPages:40, claimerPageSize:50, fanValueBatchSize:20,
         observationTokenVersion:1, observationReadLeaseVersion:1, campaignResumablePaginationVersion:1,
         campaignFreshnessCoverageVersion:1, campaignOrderIndependentTraversalVersion:1, campaignSegmentedFairTraversalVersion:1,

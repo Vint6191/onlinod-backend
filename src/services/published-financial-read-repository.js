@@ -46,6 +46,8 @@ async function readPublishedFinancialSummary({ db, creatorId, from, to }) {
   start.setUTCHours(0, 0, 0, 0); end.setUTCHours(0, 0, 0, 0);
   if (!Number.isFinite(+start) || !Number.isFinite(+end) || end < start || end - start > 366 * 86400000)
     throw new Error("FINANCIAL_DISPLAY_RANGE_INVALID");
+  // Bind UTC calendar text: a Prisma Date is timestamptz, whose ::date cast
+  // otherwise selects a different day under a non-UTC SQL session timezone.
   const [row] = await db.$queryRawUnsafe(`WITH authority AS MATERIALIZED (
       SELECT p.* FROM "CreatorAccount" c JOIN "CreatorEarningsLedgerProof" p ON p."creatorId"=c.id AND p."agencyId"=c."agencyId"
       WHERE c.id=$1 AND c."deletedAt" IS NULL
@@ -56,10 +58,10 @@ async function readPublishedFinancialSummary({ db, creatorId, from, to }) {
       UNION ALL
       SELECT d.category,d."netCents",d."financialMetrics" FROM authority p
         JOIN "CreatorEarningsLedgerHour" d ON d."creatorId"=p."creatorId" AND d."agencyId"=p."agencyId"
-        WHERE p."activeGeneration" IS NULL AND d.hour >= $2 AND d.hour < $3::timestamp+interval '1 day'
+        WHERE p."activeGeneration" IS NULL AND d.hour >= $2::timestamp AND d.hour < $3::timestamp+interval '1 day'
     ) SELECT p."fromAt",p."throughAt",p.generation,p."activeGeneration",
       COALESCE((SELECT jsonb_agg(jsonb_build_object('category',category,'netCents',"netCents",'metrics',metrics)) FROM metric_rows),'[]') AS rows
-      FROM authority p`, creatorId, start, end);
+      FROM authority p`, creatorId, start.toISOString().slice(0, 10), end.toISOString().slice(0, 10));
   return { ready: Boolean(row), state: row ? "READY" : "REBUILDING", generation: row?.activeGeneration || row?.generation || null,
     fromAt: row?.fromAt?.toISOString() || null, throughAt: row?.throughAt?.toISOString() || null,
     finance: row ? summarize(row.rows) : { grossCents: null, netCents: null, transactions: null, refundGrossCents: null,

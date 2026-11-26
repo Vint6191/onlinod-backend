@@ -157,7 +157,20 @@ async function deriveCustomCancellationInstruction({ agencyId, orderId = null, o
   if (!row) return { state: "ORDER_MISSING", anchor: null, revisionIntentId: null, revisionState: null };
 
   const submission = await latestSubmissionForCancellation({ agencyId: scopedAgencyId, order: row, db });
+  const unknownPart = db.telegramDeliveryIntent?.findFirst ? await db.telegramDeliveryIntent.findFirst({
+    where: { agencyId: scopedAgencyId, customOrderId: row.id, kind: { in: ["TASK", "REVISION_REQUEST", "INSTRUCTION_PART", "INSTRUCTION_CONTINUATION"] }, state: { in: ["COMMITTING", "RECONCILE_REQUIRED"] } },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+  }) : null;
+  if (unknownPart) return { state: "REVISION_OUTCOME_UNRESOLVED", anchor: null, instruction: unknownPart,
+    revisionIntentId: unknownPart.instructionParentId || unknownPart.id, revisionState: unknownPart.state, submissionId: submission?.id || null };
+  const continuation = await db.telegramDeliveryIntent.findFirst({ where: { agencyId: scopedAgencyId, customOrderId: row.id,
+    kind: "INSTRUCTION_CONTINUATION", state: "CONFIRMED" }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] });
   const revision = await latestProviderSignificantRevision({ agencyId: scopedAgencyId, orderId: row.id, db });
+  if (continuation?.kind === "INSTRUCTION_CONTINUATION" && (!revision || continuation.payload?.sourceIntentId === revision.id)) {
+    const instruction = confirmedCancellationInstruction(continuation);
+    if (instruction) return { state: "CONFIRMED_CONTINUATION", anchor: publicAnchor(instruction), instruction: continuation,
+      revisionIntentId: continuation.id, revisionState: "CONFIRMED", submissionId: submission?.id || null };
+  }
   const task = await latestConfirmedTask({ agencyId: scopedAgencyId, orderId: row.id, db });
   return classifyCancellationInstructionFacts({ submission, revision, task });
 }
@@ -167,7 +180,7 @@ function requireCancellationProviderAnchor(result) {
   if (String(result?.state || "") === "REVISION_OUTCOME_UNRESOLVED") {
     throw fail(
       "CUSTOM_CANCELLATION_INSTRUCTION_OUTCOME_UNRESOLVED",
-      "The current revision instruction crossed the Telegram commit boundary; settle its provider outcome before cancellation follow-up is sent",
+      "The current instruction crossed the Telegram commit boundary; settle its provider outcome before cancellation follow-up is sent",
       409,
       { instructionIntentId: result.revisionIntentId || null, instructionState: result.revisionState || null },
     );

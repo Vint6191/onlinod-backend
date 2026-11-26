@@ -89,6 +89,10 @@ const payloads = {
     .strict(),
   "media.delete": z.object({ mediaIds: z.array(id).min(1).max(5000) }).strict(),
   "custom.update": z.object({ orderId: id, expectedUpdatedAt: stamp, patch: orderPatch }).strict(),
+  "custom.continueInstruction": z.object({ orderId: id, sourceIntentId: id,
+    expectedSourceSnapshotHash: z.string().regex(/^[a-f0-9]{64}$/), expectedOrderUpdatedAt: stamp,
+    reviewedText: z.string().min(1).max(20000), reviewedTextHash: z.string().regex(/^[a-f0-9]{64}$/),
+    instructionManifestVersion: z.literal(1) }).strict(),
   "custom.destination": z
     .object({ folderId: id.nullable(), expectedFolderId: id.nullable(), expectedRevision: z.number().int().min(0) })
     .strict(),
@@ -112,6 +116,7 @@ const permissions = {
   "media.folder": "content.manage_vault",
   "media.delete": "content.manage_vault",
   "custom.update": null,
+  "custom.continueInstruction": "content.review_customs",
   "custom.destination": "content.manage_vault",
   "creator.retire": "creators.manage",
 };

@@ -297,7 +297,22 @@ function collectorStatePayload(state) {
   };
 }
 
-async function readCreatorOverview({ db = prisma, creatorId, rangeKey = "30d", now = new Date() }) {
+async function readCreatorOverview(input) {
+  const db = input.db || prisma;
+  const kernel = require("./db-commit-kernel");
+  const context = kernel.currentCommitContext();
+  if (context) {
+    if (db !== context.tx) throw Object.assign(new Error("FINANCIAL_READ_SCOPE_MISMATCH"), { code: "FINANCIAL_READ_SCOPE_MISMATCH" });
+    return kernel.joinCommit(context, { isolationLevel: "RepeatableRead" }, () => readCreatorOverviewSnapshot({ ...input, db }));
+  }
+  // The HTTP viewer already supplies RR and performs its post-read access
+  // recheck. Direct internal consumers must obey the same snapshot invariant.
+  return kernel.runRootCommit(db, ({ tx }) => readCreatorOverviewSnapshot({ ...input, db: tx }), {
+    profile: "COMMAND", isolationLevel: "RepeatableRead", authority: { kind: "FINANCIAL_OVERVIEW_READ", creatorId: input.creatorId },
+  });
+}
+
+async function readCreatorOverviewSnapshot({ db, creatorId, rangeKey = "30d", now = new Date() }) {
   now = await dbAuthorityNow({ db, fallbackNow: now });
   const range = normalizeCreatorOverviewRangeKey(rangeKey);
   const ledger = await readCreatorLedgerOverview({ db, creatorId, rangeKey: range, now, includeMessages: false, includeCoveragePage: false, authorityResolved: true });

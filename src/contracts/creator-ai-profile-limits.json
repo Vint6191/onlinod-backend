@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "stringLengthUnit": "utf16-code-units",
+  "maxStringLength": 4000,
+  "maxPayloadUtf8Bytes": 32768,
+  "sections": [
+    "personal",
+    "chatting",
+    "physicalContent"
+  ]
+}

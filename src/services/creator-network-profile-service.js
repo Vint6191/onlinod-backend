@@ -692,7 +692,6 @@ module.exports = {
   proxyPublic,
   PROXY_TYPES,
   NETWORK_MODES,
-  proxyPublic,
   profilePublic,
   createProxyEndpoint,
   createProxyForCreator,

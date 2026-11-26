@@ -9,6 +9,7 @@ const PAGE = 500;
 // copying verified ledger entries and resolving hints retain the larger budget.
 const APPLY_PAGE = 100;
 const { earningsCategory } = require("./financial-transaction-category");
+const { FINANCIAL_PROOF_POLICY_VERSION } = require("./earnings-coverage-service");
 const fail = (code) => Object.assign(new Error(code), { code });
 async function lock(db, creatorId) {
   await db.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v7',true), pg_advisory_xact_lock(hashtextextended($1,0))", `live-earnings:${creatorId}`);
@@ -59,7 +60,9 @@ function supported(run) {
 }
 async function preparePage(db, job, run) {
   if (!supported(run)) return { ready: false, unsupported: true };
-  const from = new Date(run.proof.windows[0].oldestAt || run.windows[0].comparisonFrom || run.windows[0].from), through = new Date(run.windows[0].to), snapshot = require("./analytics-observation-time").observationStartForJob(job);
+  // Chart comparison proves the requested empty hours too. The oldest payment
+  // bounds observed facts; it must not shorten the accepted verification window.
+  const from = verifiedWindowFrom(run), through = new Date(run.windows[0].to), snapshot = require("./analytics-observation-time").observationStartForJob(job);
   if (![from,through,snapshot].every(x=>Number.isFinite(+x))) throw fail("EARNINGS_PUBLICATION_TIME_INVALID");
   await lock(db,job.creatorId);
   let [g] = await db.$queryRawUnsafe('SELECT * FROM "CreatorEarningsGeneration" WHERE id=$1', run.id);
@@ -76,6 +79,10 @@ async function preparePage(db, job, run) {
   }
   if (g.agencyId !== job.agencyId || g.creatorId !== job.creatorId || +g.snapshotAt !== +snapshot) throw fail("EARNINGS_GENERATION_SCOPE_MISMATCH");
   if (g.publishedAt) return { ready:true, generation:g.id };
+  if (+g.fromAt !== +from) {
+    await db.$executeRawUnsafe('UPDATE "CreatorEarningsGeneration" SET "fromAt"=$2 WHERE id=$1 AND "publishedAt" IS NULL',g.id,from);
+    g.fromAt = from;
+  }
   if (g.state === "RETIRED") throw fail("EARNINGS_GENERATION_RETIRED");
   if (g.mode === "DELTA") {
     const [base] = await db.$queryRawUnsafe('SELECT "activeGeneration" FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$1',job.creatorId);
@@ -140,6 +147,10 @@ async function preparePage(db, job, run) {
 async function advance(db,g,rows,cursor,next,pageSize=PAGE) {
   await db.$executeRawUnsafe('UPDATE "CreatorEarningsGeneration" SET phase=$2,cursor=$3 WHERE id=$1',g.id,rows.length===pageSize?g.phase:next,rows.length===pageSize?cursor:"");
 }
+function verifiedWindowFrom(run) {
+  const proof = run.proof.windows[0], window = run.windows[0];
+  return new Date(proof.comparisonFrom || window.comparisonFrom || window.from || proof.oldestAt);
+}
 async function publish(db,job,run) {
   if (!supported(run)) return false;
   await lock(db,job.creatorId);
@@ -157,9 +168,11 @@ async function publish(db,job,run) {
   let from = previous?.fromAt || g.fromAt, through = previous?.throughAt || g.throughAt;
   if (!resolution) {
     if (g.fullScan) {
-      if (previous && (+g.fromAt > +previous.throughAt || +g.throughAt < +previous.fromAt))
+      const verifiedFrom = verifiedWindowFrom(run);
+      if (!Number.isFinite(+verifiedFrom)) throw fail("EARNINGS_PUBLICATION_TIME_INVALID");
+      if (previous && (+verifiedFrom > +previous.throughAt || +g.throughAt < +previous.fromAt))
         throw fail("EARNINGS_DISJOINT_COVERAGE");
-      from = new Date(Math.min(+from,+g.fromAt));
+      from = new Date(Math.min(+from,+verifiedFrom));
     }
     through = new Date(Math.max(+through,+g.throughAt));
   }
@@ -170,12 +183,14 @@ async function publish(db,job,run) {
   } else {
     await db.$executeRawUnsafe(`UPDATE "CreatorEarningsGeneration" SET state='RETIRED',"publishedAt"=clock_timestamp(),"retiredAt"=clock_timestamp() WHERE id=$1`,g.id);
   }
-  await db.$executeRawUnsafe(`INSERT INTO "CreatorEarningsLedgerProof"("creatorId","agencyId","fromAt","throughAt",generation,"activeGeneration","confirmedThroughAt")
-    VALUES($1,$2,$3,$4,$5,$6,$4) ON CONFLICT("creatorId") DO UPDATE SET
+  await db.$executeRawUnsafe(`INSERT INTO "CreatorEarningsLedgerProof"("creatorId","agencyId","fromAt","throughAt",generation,"activeGeneration","confirmedThroughAt","proofPolicyVersion")
+    VALUES($1,$2,$3,$4,$5,$6,$4,$7) ON CONFLICT("creatorId") DO UPDATE SET
       "fromAt"=EXCLUDED."fromAt","throughAt"=EXCLUDED."throughAt",
-      "confirmedThroughAt"=GREATEST("CreatorEarningsLedgerProof"."confirmedThroughAt",EXCLUDED."throughAt"),
+      "confirmedThroughAt"=GREATEST(CASE WHEN "CreatorEarningsLedgerProof"."proofPolicyVersion"=$7
+        THEN "CreatorEarningsLedgerProof"."confirmedThroughAt" END,EXCLUDED."throughAt"),
+      "proofPolicyVersion"=CASE WHEN $8 THEN "CreatorEarningsLedgerProof"."proofPolicyVersion" ELSE $7 END,
       generation=EXCLUDED.generation,"activeGeneration"=EXCLUDED."activeGeneration"`,job.creatorId,job.agencyId,from,through,
-      resolution?previous.generation:run.generation,g.mode === "DELTA" ? g.baseGeneration : g.id);
+      resolution?previous.generation:run.generation,g.mode === "DELTA" ? g.baseGeneration : g.id,FINANCIAL_PROOF_POLICY_VERSION,resolution);
   return true;
 }
 module.exports = {PAGE,APPLY_PAGE,lock,tryLock,upsert,activeEntry,writeLive,preparePage,publish};

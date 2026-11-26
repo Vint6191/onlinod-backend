@@ -115,7 +115,7 @@ function topAsset(asset, authoritative, rank, moneyState) {
   };
 }
 
-async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [], includePipeline = true, db = null }) {
+async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [], includePipeline = true, moneyAllowed = true, db = null }) {
   const client = db || require("../prisma");
   const cleanCreatorId = clean(creatorId, 100);
   await requireCreator(client, agencyId, cleanCreatorId);
@@ -134,7 +134,7 @@ async function getVaultDirectoryIntelligence({ agencyId, creatorId, mediaIds = [
       tx.creatorMediaAsset.count({ where: { ...activeWhere, soldCount: { gt: 0 } } }),
       tx.creatorMediaAsset.findMany({
         where: { ...activeWhere, soldCount: { gt: 0 } },
-        orderBy: [{ revenueCents: "desc" }, { soldCount: "desc" }, { lastSoldAt: "desc" }, { mediaId: "asc" }],
+        orderBy: [...(moneyAllowed ? [{ revenueCents: "desc" }] : []), { soldCount: "desc" }, { lastSoldAt: "desc" }, { mediaId: "asc" }],
         take: TOP_ASSET_LIMIT,
       }),
       ids.length ? tx.creatorMediaAsset.findMany({

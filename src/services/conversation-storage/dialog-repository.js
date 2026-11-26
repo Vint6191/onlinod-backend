@@ -84,6 +84,8 @@ function normalize(ctx, dialogId, raw) {
   c.check(Array.isArray(raw.mediaIds) && raw.mediaIds.length <= 100, "DIALOG_MEDIA_INVALID", 400);
   const cents = Math.round(Number(raw.price) * 100);
   c.check(Number.isSafeInteger(cents) && cents >= 0, "DIALOG_PRICE_INVALID", 400);
+  const explicitOpened = raw.opened === 0 || raw.opened === 1 || typeof raw.opened === "boolean";
+  c.check(!raw.providerPurchaseObservedAt || explicitOpened, "DIALOG_PURCHASE_OBSERVATION_VALUE_REQUIRED", 400);
   const m = {
     messageId,
     platformCreatorId: ctx.platformCreatorId,
@@ -93,7 +95,8 @@ function normalize(ctx, dialogId, raw) {
     text: raw.text,
     mediaIds: [...new Set(raw.mediaIds.map(c.platformId))],
     price: cents / 100,
-    opened: raw.opened === 1 ? 1 : 0,
+    opened: raw.opened === 1 || raw.opened === true ? 1 : 0,
+    ...(raw.providerPurchaseObservedAt ? { providerPurchaseObservedAt: c.iso(raw.providerPurchaseObservedAt) } : {}),
     createdAt: c.iso(raw.createdAt),
     changedAt: raw.changedAt ? c.iso(raw.changedAt) : null,
     source: raw.source === "delta_scan" ? "delta_scan" : "full_scan",
@@ -102,8 +105,10 @@ function normalize(ctx, dialogId, raw) {
   return m;
 }
 function publicRecord(ctx, dialogId, row) {
+  // A read contains effective state, never a fresh provider observation.
+  const { providerPurchaseObservedAt: _observation, ...data } = row.data;
   return {
-    ...row.data,
+    ...data,
     id: `${ctx.creatorId}:${dialogId}:${row.message_id}`,
     creatorId: ctx.creatorId,
     dialogId,
@@ -431,16 +436,25 @@ class DialogRepository {
             old &&
             Date.parse(candidate.changedAt || candidate.createdAt) <
               Date.parse(old.data.changedAt || old.data.createdAt);
-          const next = stale ? { ...old.data } : { ...candidate };
+          const { providerPurchaseObservedAt: observationAt, ...observedMessage } = candidate;
+          const next = stale ? { ...old.data } : { ...observedMessage };
+          delete next.providerPurchaseObservedAt;
           if (old)
             c.check(
               next.createdAt === c.iso(old.created_at) && next.sender === old.sender,
               "DIALOG_IMMUTABLE_IDENTITY_CONFLICT"
             );
-          let providerOpened = Boolean(old?.provider_opened || candidate.opened === 1),
+          let providerOpened = Boolean(old?.provider_opened),
             canonicalOpened = Boolean(old?.canonical_opened);
           let canonicalRevision = String(old?.canonical_revision || 0),
             providerObservedAt = old?.provider_observed_at ? c.iso(old.provider_observed_at) : null;
+          // Missing opened is not a new negative. Untimed legacy positives can
+          // seed an unverified record, but cannot override a versioned result.
+          if (!providerObservedAt && !observationAt && candidate.opened === 1) providerOpened = true;
+          if (observationAt && (!providerObservedAt || observationAt > providerObservedAt)) {
+            providerOpened = candidate.opened === 1;
+            providerObservedAt = observationAt;
+          }
           const proof = input.purchaseProof;
           if (proof && proof.messageId === candidate.messageId) {
             if (proof.kind === "canonical" && BigInt(proof.revision) > BigInt(canonicalRevision)) {

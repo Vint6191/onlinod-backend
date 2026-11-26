@@ -927,6 +927,10 @@ async function issueTelegramMtprotoLocalMaterial({ agencyId, member, accountId, 
     session: normalizedPurpose === "authorize" ? "" : secret.session,
     ...(normalizedPurpose === "customs-source-read" ? { sourceTelegramUserId: String(customsSource?.telegramSourceUserId || "") } : {}),
     ...(normalizedPurpose === "customs-delivery-write" || normalizedPurpose === "customs-delivery-read" ? { deliveryTelegramUserId: String(customsDelivery?.recipientTelegramUserId || "") } : {}),
+    ...(normalizedPurpose === "customs-delivery-write" ? {
+      deliveryText: typeof customsDelivery?.row?.payload?.text === "string" ? customsDelivery.row.payload.text : null,
+      deliveryReplyToMessageId: customsDelivery?.replyToMessageId == null ? null : String(customsDelivery.replyToMessageId),
+    } : {}),
   };
 }
 

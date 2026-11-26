@@ -1,6 +1,7 @@
 "use strict";
 const c = require("./common");
 const defaults = require("./crm-profile-default.json");
+const personaLimits = require("../../contracts/creator-ai-profile-limits.json");
 const MANUAL = new Set(defaults.manualFields);
 const FORBIDDEN = new Set([
   "analysis",
@@ -97,6 +98,11 @@ function cleanPatch(raw) {
         400
       );
   return patch;
+}
+function validateMergedProfile(profile) {
+  if (profile.budgetMin != null && profile.budgetMax != null)
+    c.check(profile.budgetMin <= profile.budgetMax, "CRM_BUDGET_INVALID", 400);
+  return profile;
 }
 class CrmRepository {
   constructor(db, dialogs, canonical = null) {
@@ -320,6 +326,7 @@ class CrmRepository {
           revision = Number(before.revision) + 1;
         const versions = { ...before.field_versions };
         for (const key of Object.keys(patch)) versions[key] = revision;
+        validateMergedProfile(next);
         c.bounded(next, 65536);
         c.check(
           Array.isArray(input.appendNotes || []) && (input.appendNotes || []).length <= 10,
@@ -388,6 +395,7 @@ class CrmRepository {
     }
     delete values.fanUsername;
     const next = { ...before.profile, ...values };
+    validateMergedProfile(next);
     c.bounded(next, 65536);
     const revision = Number(before.revision) + 1;
     await c.exec(
@@ -411,7 +419,7 @@ class CrmRepository {
   async personaSave(ctx, input, id) {
     const data = c.object(input.profile);
     c.check(data.creatorId === ctx.creatorId, "CRM_PERSONA_SCOPE_MISMATCH", 403);
-    c.bounded(data, 32768);
+    c.check(Buffer.byteLength(JSON.stringify(data)) <= personaLimits.maxPayloadUtf8Bytes, "CRM_PERSONA_TOO_LARGE", 413);
     for (const key of Object.keys(data))
       c.check(
         ["version", "creatorId", "personal", "chatting", "physicalContent", "createdAt", "updatedAt"].includes(key),
@@ -422,7 +430,7 @@ class CrmRepository {
       c.check(data[key] && typeof data[key] === "object" && !Array.isArray(data[key]), "CRM_PERSONA_INVALID", 400);
       for (const value of Object.values(data[key]))
         c.check(
-          (typeof value === "string" && value.length <= 4000) || typeof value === "boolean",
+          (typeof value === "string" && value.length <= personaLimits.maxStringLength) || typeof value === "boolean",
           "CRM_PERSONA_INVALID",
           400
         );

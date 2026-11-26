@@ -258,8 +258,10 @@ class CrmAnalysisService {
         : null;
       if (previous?.state === "RUNNING" && new Date(previous.lease_until).getTime() > Date.now()) return { run: null };
       const token = c.randomUUID();
+      const persona = await this.crm.scope(ctx, tx);
       let run;
-      if (canResume && previous?.run_id === prior.run_id && Number(previous.generation) === Number(work.generation))
+      if (canResume && previous?.run_id === prior.run_id && Number(previous.generation) === Number(work.generation)
+        && Number(previous.persona_revision) === Number(persona.persona_revision) && c.hash(previous.config) === c.hash(work.config))
         run = await c.one(
           tx,
           `UPDATE crm_analysis_run SET lease_token=$2,lease_device=$3,lease_actor=$4,lease_until=now()+interval '2 minutes',updated_at=now() WHERE run_id=$1 RETURNING *`,
@@ -271,7 +273,6 @@ class CrmAnalysisService {
       else {
         if (previous)
           await c.exec(tx, "UPDATE crm_analysis_run SET state='SUPERSEDED' WHERE run_id=$1", previous.run_id);
-        const persona = await this.crm.scope(ctx, tx);
         const p = await this.crm.ensure(ctx, fanId, tx);
         const basis = p.analysis_basis;
         const reuse =
@@ -542,11 +543,13 @@ class CrmAnalysisService {
         !superseded && head.history_epoch === row.input.epoch && Number(head.history_revision) > row.input.revision;
       await c.exec(
         tx,
-        "UPDATE crm_analysis_work SET state=$3,generation=generation+$4,active_run_id=NULL,next_run_at=now(),last_error='',failures=0 WHERE scope_id=$1 AND fan_id=$2",
+        "UPDATE crm_analysis_work SET state=$3,generation=generation+$4,active_run_id=NULL,next_run_at=now(),last_error='',failures=0 WHERE scope_id=$1 AND fan_id=$2 AND generation=$5 AND active_run_id=$6",
         ctx.scopeId,
         row.fan_id,
         superseded || appended ? "READY" : "DONE",
-        appended ? 1 : 0
+        appended ? 1 : 0,
+        work.generation,
+        row.run_id
       );
       await this.publish(ctx, row.fan_id, tx);
       return receipt;
@@ -565,25 +568,31 @@ class CrmAnalysisService {
           ctx.scopeId,
           r.fan_id
         );
-        const failures = work.failures + 1;
-        const state = cancel || failures >= 4 ? "ERROR" : "READY";
+        const superseded = Number(work.generation) !== Number(r.generation);
+        const failures = superseded ? work.failures : work.failures + 1;
+        const state = superseded ? "READY" : cancel || failures >= 4 ? "ERROR" : "READY";
+        const resume = !superseded && !cancel && failures < 4;
         await c.exec(
           tx,
-          "UPDATE crm_analysis_run SET state='CANCELLED',lease_until=now(),updated_at=now() WHERE run_id=$1",
-          r.run_id
+          "UPDATE crm_analysis_run SET state=$2,lease_until=now(),updated_at=now() WHERE run_id=$1",
+          r.run_id,
+          superseded ? "SUPERSEDED" : resume ? "RUNNING" : "CANCELLED"
         );
         await c.exec(
           tx,
-          "UPDATE crm_analysis_work SET state=$3,active_run_id=NULL,failures=$4,last_error=$5,next_run_at=now()+($6::integer*interval '1 millisecond') WHERE scope_id=$1 AND fan_id=$2",
+          "UPDATE crm_analysis_work SET state=$3,active_run_id=$7,failures=$4,last_error=$5,next_run_at=now()+($6::integer*interval '1 millisecond') WHERE scope_id=$1 AND fan_id=$2 AND generation=$8 AND active_run_id=$9",
           ctx.scopeId,
           r.fan_id,
           state,
           failures,
-          String(error || "").slice(0, 512),
-          Math.min(300000, Math.max(1000, delay || 30000))
+          superseded ? work.last_error : String(error || "").slice(0, 512),
+          superseded ? 0 : Math.min(300000, Math.max(1000, delay || 30000)),
+          resume ? r.run_id : null,
+          work.generation,
+          r.run_id
         );
         await this.publish(ctx, r.fan_id, tx);
-        return { status: cancel ? "cancelled" : "deferred", runId: r.run_id };
+        return { status: superseded ? "superseded" : cancel ? "cancelled" : "deferred", runId: r.run_id };
       }
     );
   }

@@ -1,4 +1,5 @@
 "use strict";
+const { instructionDeliveryState } = require("./custom-instruction-manifest");
 
 const { createHash } = require("node:crypto");
 const { runDbTransaction } = require("./db-transaction-service");
@@ -79,6 +80,7 @@ function hasProjectedReference(order, remoteMessageId) {
 function intentProjectionDebt({ intent, order }) {
   if (!intent || String(intent.state || "") !== "CONFIRMED") return false;
   if (intent.projectionBlockedAt) return true;
+  if (intent.instructionManifest && instructionDeliveryState(intent) !== "CONFIRMED") return false;
   const kind = String(intent.kind || "");
   if (kind === "TASK") {
     return intent.remoteMessageId != null && (Number(order?.telegramTaskMessageId) !== Number(intent.remoteMessageId) || !order?.deliveredAt);
@@ -100,7 +102,7 @@ async function loadOrderFacts({ agencyId, orderId, db }) {
     where: { agencyId, customOrderId: String(order.id) },
     select: {
       id: true, agencyId: true, creatorId: true, customOrderId: true, customSubmissionId: true, accountId: true,
-      kind: true, state: true, commitStartedAt: true, remoteMessageId: true, remoteRecipientTelegramUserId: true,
+      kind: true, state: true, instructionManifest: true, commitStartedAt: true, remoteMessageId: true, remoteRecipientTelegramUserId: true,
       remoteSentAt: true, confirmedAt: true, projectionBlockedAt: true, providerBindingRetryAt: true, outcomeReason: true,
       createdAt: true, updatedAt: true,
     },
@@ -146,7 +148,7 @@ async function buildOrderDebtCandidates({ agencyId, order, intents, submissions,
     const task = latest((intents || []).filter((row) => String(row.kind) === "TASK" && String(row.state) === "CONFIRMED"), "confirmedAt");
     if (task?.accountId) accountIds.add(String(task.accountId));
     if (orderType === "CONTENT") {
-      for (const revision of (intents || []).filter((row) => String(row.kind) === "REVISION_REQUEST" && ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT", "COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"].includes(String(row.state)))) {
+      for (const revision of (intents || []).filter((row) => ["REVISION_REQUEST", "INSTRUCTION_CONTINUATION"].includes(String(row.kind)) && ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT", "COMMITTING", "RECONCILE_REQUIRED", "CONFIRMED"].includes(String(row.state)))) {
         if (revision.accountId) accountIds.add(String(revision.accountId));
       }
       for (const submission of submissions || []) {

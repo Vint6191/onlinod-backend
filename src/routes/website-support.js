@@ -1,10 +1,10 @@
 "use strict";
 const router = require("express").Router();
-const multer = require("multer");
+const { createSupportMultipart } = require("../middleware/support-multipart");
 const { z } = require("zod");
 const { sendMail, getFrom } = require("../services/email-service");
 const { websiteConfig } = require("../services/website-config-service");
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, files: 3, fields: 9, fieldSize: 10_000 } }).array("files", 3);
+const upload = createSupportMultipart();
 const inputSchema = z.object({ requestId: z.string().uuid(), name: z.string().trim().max(80).optional(),
   email: z.string().trim().email().max(254), topic: z.enum(["installation", "access", "billing", "bug", "idea", "other"]),
   message: z.string().trim().min(10).max(8000), os: z.string().trim().max(80).optional(), version: z.string().trim().max(40).optional() }).strict();
@@ -22,7 +22,8 @@ router.post("/", (req, res) => {
   res.set("Cache-Control", "no-store");
   if (!websiteConfig().support.available) return res.status(503).json({ ok: false, code: "SUPPORT_UNAVAILABLE", error: "Support delivery is not configured" });
   upload(req, res, async error => {
-    if (error) return res.status(400).json({ ok: false, code: "SUPPORT_FILE_LIMIT", error: "Up to three files, 5 MB each" });
+    if (req.aborted || res.writableEnded) return;
+    if (error) return res.status(error.status || 400).json({ ok: false, code: error.code || "SUPPORT_INPUT_INVALID", error: "Check the form and attachments. Up to three files, 5 MB each." });
     try {
       const input = inputSchema.parse(req.body);
       const payload = { from: getFrom(), to: process.env.SUPPORT_EMAIL,

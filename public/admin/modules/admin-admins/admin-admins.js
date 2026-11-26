@@ -220,14 +220,7 @@
     const slot = document.getElementById("admAdminsModal");
     if (!slot) return;
 
-    slot.innerHTML = `
-      <div class="adm-drawer-backdrop" data-modal-close></div>
-      <aside class="adm-drawer">
-        <div class="adm-drawer-head">
-          <div class="adm-drawer-title">Create admin</div>
-          <button class="adm-btn ghost" data-modal-close>×</button>
-        </div>
-        <div class="adm-drawer-body">
+    const modal = window.NodAdminUI.dialog({ mount: slot, title: "Create admin", body: `
           <div class="adm-field">
             <label>email</label>
             <input class="adm-input" id="admNewAdminEmail" autocomplete="off" type="email">
@@ -254,15 +247,7 @@
           </div>
 
           <div id="admNewAdminError" style="margin-top:12px;"></div>
-        </div>
-      </aside>
-    `;
-
-    slot.querySelectorAll("[data-modal-close]").forEach((el) => {
-      el.addEventListener("click", () => {
-        slot.innerHTML = "";
-      });
-    });
+    ` });
 
     slot.querySelector("#admNewAdminSubmit").addEventListener("click", () =>
       W().action(slot.querySelector(".adm-drawer"), async (current) => {
@@ -296,7 +281,7 @@
           return;
         }
         R().toast("admin created");
-        slot.innerHTML = "";
+        modal.close();
         load(true);
       })
     );
@@ -310,14 +295,7 @@
     const slot = document.getElementById("admAdminsModal");
     if (!slot) return;
 
-    slot.innerHTML = `
-      <div class="adm-drawer-backdrop" data-modal-close></div>
-      <aside class="adm-drawer">
-        <div class="adm-drawer-head">
-          <div class="adm-drawer-title">Reset password — ${r.escapeHtml(email)}</div>
-          <button class="adm-btn ghost" data-modal-close>×</button>
-        </div>
-        <div class="adm-drawer-body">
+    const modal = window.NodAdminUI.dialog({ mount: slot, title: `Reset password — ${email}`, body: `
           <div class="adm-field">
             <label>new password</label>
             <input class="adm-input mono" id="admPwdValue" type="password" autocomplete="new-password" placeholder="8–72 UTF-8 bytes">
@@ -331,15 +309,7 @@
             <button class="adm-btn ghost" data-modal-close>Cancel</button>
           </div>
           <div id="admPwdError" style="margin-top:12px;"></div>
-        </div>
-      </aside>
-    `;
-
-    slot.querySelectorAll("[data-modal-close]").forEach((el) => {
-      el.addEventListener("click", () => {
-        slot.innerHTML = "";
-      });
-    });
+    ` });
 
     slot.querySelector("#admPwdSubmit").addEventListener("click", () =>
       W().action(slot.querySelector(".adm-drawer"), async (current) => {
@@ -364,7 +334,7 @@
           return;
         }
         R().toast("password set — sessions revoked");
-        slot.innerHTML = "";
+        modal.close();
         load(true);
       })
     );

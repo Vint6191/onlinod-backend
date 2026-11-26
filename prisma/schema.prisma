@@ -400,6 +400,7 @@ model AgencyMember {
   role             UserRole  @default(OWNER)
   permissions      Json?
   accessEpoch      Int       @default(1)
+  editRevision     Int       @default(1)
   roleKey          String?
   displayName      String?
   initials         String?
@@ -861,6 +862,9 @@ model TelegramDeliveryIntent {
   logicalKey                    String    @unique
   clientIntentId                String?
   referenceOrdinal              Int?
+  instructionManifest           Json?
+  instructionParentId           String?
+  instructionPartIndex          Int?
   payloadFingerprint            String
   payload                       Json      @default("{}")
   state                         String    @default("PLANNED")
@@ -888,6 +892,8 @@ model TelegramDeliveryIntent {
   updatedAt                     DateTime  @updatedAt
 
   @@unique([customOrderId, kind, referenceOrdinal], map: "TelegramDeliveryIntent_reference_ordinal_key")
+  @@unique([instructionParentId, instructionPartIndex], map: "TelegramDeliveryIntent_instruction_part_key")
+  @@index([agencyId, instructionParentId], map: "TelegramDeliveryIntent_instruction_parent_idx")
   @@unique([agencyId, accountId, remoteMessageId], map: "TelegramDeliveryIntent_provider_message_key")
   @@index([agencyId, state, createdAt])
   @@index([agencyId, creatorId, state])
@@ -5842,6 +5848,8 @@ model TeamPpvResolveJob {
   @@unique([agencyId, purchaseId, messageId])
   @@index([agencyId, status, createdAt])
   @@index([agencyId, messageId])
+  @@index([agencyId, status, createdAt, id], map: "TeamPpvResolveJob_agency_status_created_id_idx")
+  @@index([agencyId, creatorId, status, createdAt, id], map: "TeamPpvResolveJob_creator_status_created_id_idx")
 }
 
 model SystemSetting {
@@ -6490,6 +6498,8 @@ model CreatorLiveSync {
 }
 model CreatorRealtimeSession {
   captureFromAt DateTime?
+  unackedSinceAt DateTime?
+  unackedThroughAt DateTime?
   retiredAt DateTime?
   id String @id
   agencyId String
@@ -6601,6 +6611,7 @@ model CreatorNotificationFrontierPage {
 }
 
 model CreatorEarningsLedgerProof {
+ proofPolicyVersion Int @default(0)
  confirmedThroughAt DateTime?
   activeGeneration String?
  creatorId String @id

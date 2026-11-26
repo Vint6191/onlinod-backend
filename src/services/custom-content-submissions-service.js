@@ -1,4 +1,5 @@
 "use strict";
+const { instructionDeliveryState } = require("./custom-instruction-manifest");
 const { classifyCommitConflict } = require("./db-commit-kernel");
 const { runDbTransaction } = require("./db-transaction-service");
 
@@ -273,7 +274,18 @@ async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOr
     select: { id: true, reviewStatus: true },
     orderBy: [{ receivedAt: "desc" }, { createdAt: "desc" }, { id: "desc" }],
   });
-  if (!latest) return;
+  if (!latest) {
+    if (humanOverridePrecheck) return;
+    const initial = db.telegramDeliveryIntent?.findFirst ? await db.telegramDeliveryIntent.findFirst({
+      where: { agencyId, creatorId, customOrderId, kind: "TASK" }, orderBy: [{ createdAt: "desc" }, { id: "desc" }] }) : null;
+    const current = await require("./custom-instruction-manifest").effectiveInstruction(initial, db, agencyId);
+    if (current?.kind !== "INSTRUCTION_CONTINUATION") return;
+    if (instructionDeliveryState(current) !== "CONFIRMED") throw fail("CUSTOM_SUBMISSION_INITIAL_CONTINUATION_UNCONFIRMED", "The reviewed full instruction is not completely delivered yet; correlate this response manually", 409);
+    const observed = new Date(revisionSentAt || NaN), completed = new Date(current.instructionManifest?.completedAt || NaN);
+    if (!Number.isFinite(observed.getTime()) || !Number.isFinite(completed.getTime()) || observed < completed)
+      throw fail("CUSTOM_SUBMISSION_INITIAL_CONTINUATION_CAUSALITY_UNPROVEN", "Incoming media predates the completed reviewed instruction", 409);
+    return;
+  }
   if (String(latest.reviewStatus || REVIEW_WAITING) !== REVIEW_REVISION) {
     throw fail("CUSTOM_SUBMISSION_ORDER_BUSY", "This custom order already has an active content submission awaiting manager review", 409);
   }
@@ -281,17 +293,20 @@ async function validateSubmissionLifecycleTarget({ agencyId, creatorId, customOr
   // causality, but they MUST call adjudicateHumanModelResponseOverride() inside the final write
   // transaction before binding the response. This flag is precheck-only and has no commit authority.
   if (humanOverridePrecheck) return;
-  const revisionIntent = db.telegramDeliveryIntent?.findFirst ? await db.telegramDeliveryIntent.findFirst({
+  const revisionSource = db.telegramDeliveryIntent?.findFirst ? await db.telegramDeliveryIntent.findFirst({
     where: { agencyId, customOrderId, customSubmissionId: latest.id, kind: "REVISION_REQUEST", state: "CONFIRMED" },
-    select: { id: true, remoteSentAt: true, confirmedAt: true },
+    select: { id: true, agencyId: true, creatorId: true, customOrderId: true, kind: true, state: true, instructionManifest: true, remoteSentAt: true, confirmedAt: true },
     orderBy: [{ confirmedAt: "desc" }, { createdAt: "desc" }],
   }) : null;
-  if (!revisionIntent) {
+  const revisionIntent = await require("./custom-instruction-manifest").effectiveInstruction(revisionSource, db, agencyId);
+  if (!revisionIntent || instructionDeliveryState(revisionIntent) !== "CONFIRMED") {
     throw fail("CUSTOM_SUBMISSION_REVISION_DISPATCH_UNCONFIRMED", "The manager revision instruction is not provider-confirmed yet; incoming media requires review/correlation instead of automatic next-version assignment", 409);
   }
-  if (revisionSourceIntentId && String(revisionSourceIntentId) === String(revisionIntent.id)) return;
   const sent = revisionSentAt ? new Date(revisionSentAt) : null;
-  const remoteSent = revisionIntent.remoteSentAt ? new Date(revisionIntent.remoteSentAt) : null;
+  const completeAt = revisionIntent.instructionManifest?.completedAt || revisionIntent.remoteSentAt;
+  const remoteSent = completeAt ? new Date(completeAt) : null;
+  if (revisionSourceIntentId && [revisionIntent.id, revisionIntent.payload?.sourceIntentId].filter(Boolean).map(String).includes(String(revisionSourceIntentId))
+      && (!revisionIntent.instructionManifest || (sent && remoteSent && sent >= remoteSent))) return;
   if (sent && remoteSent && Number.isFinite(sent.getTime()) && Number.isFinite(remoteSent.getTime()) && sent.getTime() >= remoteSent.getTime()) return;
   throw fail("CUSTOM_SUBMISSION_REVISION_CAUSALITY_UNPROVEN", "Incoming media is not causally after the confirmed revision instruction; manager review is required", 409);
 }
@@ -2092,6 +2107,7 @@ async function commitCustomContentSubmissionMedia({ agencyId, member, submission
 }
 
 module.exports = {
+  validateSubmissionLifecycleTarget,
   MAX_TELEGRAM_MESSAGES,
   assignCustomContentSubmission,
   assertCustomSubmissionTelegramSourceAccess,

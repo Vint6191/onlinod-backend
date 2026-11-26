@@ -1,6 +1,7 @@
 "use strict";
 
 const { resolveRevisionProviderBinding } = require("./custom-revision-provider-binding-authority-service");
+const { instructionDeliveryState, effectiveInstruction } = require("./custom-instruction-manifest");
 
 function clean(value, max = 500) {
   const text = String(value == null ? "" : value).trim();
@@ -20,9 +21,9 @@ function projection({ status, intent = null, blockedCode = null, binding = null 
   return {
     status: String(status),
     intentId: intent?.id == null ? null : String(intent.id),
-    state: intent?.state == null ? null : String(intent.state),
+    state: intent?.state == null ? null : instructionDeliveryState(intent),
     providerMessageId: intent?.remoteMessageId == null ? null : String(intent.remoteMessageId),
-    remoteSentAt: isoOrNull(intent?.remoteSentAt),
+    remoteSentAt: isoOrNull(intent?.instructionManifest?.completedAt || intent?.remoteSentAt),
     blockedCode: blockedCode || null,
     providerAnchorKind: binding?.anchorKind || null,
     providerAccountId: binding?.accountId || null,
@@ -47,10 +48,11 @@ async function deriveCustomRevisionDispatch({ agencyId, orderId, submission, int
     error.status = 500;
     throw error;
   }
-  const row = intent === undefined
+  const source = intent === undefined
     ? await latestRevisionIntent({ agencyId, orderId, submissionId: submission.id, db })
     : intent;
-  const state = String(row?.state || "");
+  const row = await effectiveInstruction(source, db, agencyId);
+  const state = instructionDeliveryState(row);
 
   if (state === "CONFIRMED") return projection({ status: "WAITING_MODEL", intent: row });
   if (state === "RECONCILE_REQUIRED") return projection({ status: "DELIVERY_UNKNOWN", intent: row });

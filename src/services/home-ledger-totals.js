@@ -1,6 +1,6 @@
 "use strict";
 const {scopeSql}=require("./home-scope-repository");
-const {ledgerAuthoritySql,coverageThroughSql,freshSql}=require("./earnings-live-read-sql");
+const {ledgerAuthoritySql,coverageFirstDaySql,coverageLastDaySql,freshSql}=require("./earnings-live-read-sql");
 // Coverage is an interval predicate per creator, never C creators × D zero
 // rows. Only actual daily buckets participate in aggregation; fill chart zeros
 // once for the agency after SUM. The fallback still serves pre-ledger installs.
@@ -9,10 +9,12 @@ async function read(db,params,pendingSql) {
    SELECT 0 AS period,($6::timestamptz AT TIME ZONE 'UTC')::date AS start_day,($7::timestamptz AT TIME ZONE 'UTC')::date AS end_day
    UNION ALL SELECT 1,($8::timestamptz AT TIME ZONE 'UTC')::date,($9::timestamptz AT TIME ZONE 'UTC')::date),
    ${ledgerAuthoritySql("visible")}, eligibility AS MATERIALIZED (
-     SELECT (SELECT count(*) FROM ledger_authority)=(SELECT count(*) FROM visible) AS ready
+     SELECT (SELECT count(*) FROM ledger_authority)=(SELECT count(*) FROM visible)
+       AND NOT EXISTS(SELECT 1 FROM ledger_authority a CROSS JOIN periods r
+         WHERE ${coverageFirstDaySql()}>r.start_day OR ${coverageLastDaySql("$11")}<r.end_day) AS ready
    ), facts AS MATERIALIZED (
      SELECT c.id,r.period,r.start_day,r.end_day,a."activeGeneration",
-       a."fromAt"::date<=r.start_day AND ${coverageThroughSql()}::date>=r.end_day AS usable,
+       ${coverageFirstDaySql()}<=r.start_day AND ${coverageLastDaySql("$11")}>=r.end_day AS usable,
        ${freshSql("$11")} AS fresh FROM visible c CROSS JOIN periods r LEFT JOIN ledger_authority a ON a.id=c.id
    ), values_by_day AS MATERIALIZED (
      SELECT f.id,f.period,e.date,e."netCents" AS cents FROM facts f JOIN "CreatorEarningsGenerationDay" e

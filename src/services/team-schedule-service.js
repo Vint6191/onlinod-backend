@@ -762,6 +762,7 @@ async function createTeamShift({ agencyId, actorUserId, actorMemberId, actorMemb
 }
 
 async function updateTeamShift({ agencyId, shiftId, actorUserId, actorMemberId, actorMember = null, actorAllowedCreatorIds = null, expectedRevision, input, db = prisma }) {
+  if (input?.timeEditVersion !== 1) throw error("TEAM_SCHEDULE_WRITER_UPDATE_REQUIRED", "Update NOD and reopen the schedule before editing", 426);
   const id = clean(shiftId, 180);
   const expected = requiredRevision(expectedRevision);
   const admittedActor = actorFence(actorMember, actorMemberId, actorUserId);
@@ -874,5 +875,4 @@ module.exports = {
   clipCoverageSession,
   validateShiftWindow,
   validTimezone,
-  matchShiftActual,
 };

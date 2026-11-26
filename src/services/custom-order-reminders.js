@@ -381,7 +381,7 @@ function taskText(order) {
   }
   lines.push("");
   lines.push(String(order?.scenario || "").trim());
-  return lines.filter((line, index, all) => !(line === "" && all[index - 1] === "")).join("\n").slice(0, 4096);
+  return lines.filter((line, index, all) => !(line === "" && all[index - 1] === "")).join("\n");
 }
 
 async function readWorkspaceReminderPolicy({ agencyId, db }) {

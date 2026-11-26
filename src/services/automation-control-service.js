@@ -3,6 +3,7 @@
 const prisma = require("../prisma");
 const { lockAutomationWriteCommitFence } = require("./automation-write-commit-fence-service");
 const { runDbTransaction } = require("./db-transaction-service");
+const { deliveryRequiresReconciliation, deliveryOutcomeSnapshotWhere } = require("./automation-outcome-contract");
 
 const FOLLOW_BACK_MODULE_KEY = "follow_back";
 const BUMPS_MODULE_KEY = "bumps";
@@ -373,9 +374,10 @@ async function pauseDeliveriesForControl({ agencyId, creatorId = null, moduleKey
   });
   let changed = 0;
   for (const row of rows) {
+    if (deliveryRequiresReconciliation(row)) continue;
     const applied = await runDbTransaction(db, async (tx) => {
       const updated = await tx.automationDelivery.updateMany({
-        where: { id: row.id, originKind: "AUTOMATION", status: row.status, leaseRevision: row.leaseRevision },
+        where: { id: row.id, originKind: "AUTOMATION", status: row.status, leaseRevision: row.leaseRevision, ...deliveryOutcomeSnapshotWhere(row) },
         data: {
           status: "PAUSED", failureCode, lastError: reason, claimedByDeviceId: null, claimedAt: null,
           claimUntil: null, leaseTokenHash: null, leaseRevision: { increment: 1 }, lastCheckedAt: now,
@@ -413,6 +415,9 @@ async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKe
   });
   let resumed = 0;
   for (const row of rows) {
+    // Legacy paused unknown outcomes belong to the reconciliation repair, not
+    // to the new-write queue. Re-enabling a module cannot prove their effect.
+    if (deliveryRequiresReconciliation(row)) continue;
     const key = `${row.creatorId}:${row.moduleKey}`;
     if (!enabled.has(key)) {
       try { const snapshot = await getAutomationControlSnapshot({ agencyId, creatorId: row.creatorId, db }); enabled.set(key, effectiveModuleEnabled(snapshot, row.moduleKey)); }
@@ -420,7 +425,7 @@ async function resumeDeliveriesForControl({ agencyId, creatorId = null, moduleKe
     }
     if (!enabled.get(key)) continue;
     const applied = await runDbTransaction(db, async (tx) => {
-      const updated = await tx.automationDelivery.updateMany({ where: { id: row.id, originKind: "AUTOMATION", status: "PAUSED", leaseRevision: row.leaseRevision }, data: { status: "QUEUED", failureCode: null, lastError: null, lastCheckedAt: new Date() } });
+      const updated = await tx.automationDelivery.updateMany({ where: { id: row.id, originKind: "AUTOMATION", status: "PAUSED", leaseRevision: row.leaseRevision, ...deliveryOutcomeSnapshotWhere(row) }, data: { status: "QUEUED", failureCode: null, lastError: null, lastCheckedAt: new Date() } });
       if (!updated.count) return false;
       const current = await tx.automationDelivery.findUnique({ where: { id: row.id } });
       await projectControlDeliveryState(tx, current, "QUEUED", null);

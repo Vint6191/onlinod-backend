@@ -1068,7 +1068,8 @@ details.adm-card[open] > summary {
   gap: 14px;
   border-bottom: 1px solid var(--adm-line);
 }
-.adm-modal-head h2 {
+.adm-modal-head h2,
+.adm-drawer-head h2 {
   font-size: 20px;
   margin: 0;
 }

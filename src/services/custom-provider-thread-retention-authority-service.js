@@ -26,7 +26,16 @@ function futureRevisionCandidates({ task, submission }) {
 function classifyProviderThreadRetention({ order, submission, intents, accountById, retiringAccountId }) {
   const target=clean(retiringAccountId);
   if (!order || String(order.type||"CONTENT").toUpperCase()!=="CONTENT" || String(order.status||"").toUpperCase()!=="PENDING") return null;
+  const continuation = newest((intents || []).filter(row => row.kind === "INSTRUCTION_CONTINUATION"
+    && ["PLANNED", "CLAIMED", "FAILED_PRECOMMIT", "COMMITTING", "RECONCILE_REQUIRED"].includes(row.state)
+    || row.kind === "INSTRUCTION_CONTINUATION" && row.state === "CONFIRMED" && row.instructionManifest?.state !== "COMPLETE"));
+  if (continuation && String(continuation.accountId) === target) return { reason: "REVIEWED_CONTINUATION_PENDING", orderId: String(order.id),
+    creatorId: String(order.creatorId), accountId: target, anchorKind: "INSTRUCTION_CONTINUATION", intentId: continuation.id };
   const task=latestConfirmedTask(intents);
+  if (task?.instructionManifest && task.instructionManifest.state !== "COMPLETE" && String(task.accountId) === target
+      && (!submission || String(submission.reviewStatus || "WAITING_REVIEW") !== "APPROVED")) {
+    return { reason: "PARTIAL_INSTRUCTION_PENDING", orderId: String(order.id), creatorId: String(order.creatorId), accountId: target, anchorKind: "TASK", intentId: task.id };
+  }
   if (!submission) {
     const taskBinding=confirmedTaskBinding(task);
     return taskBinding && String(taskBinding.accountId)===target
@@ -123,8 +132,8 @@ async function findCustomProviderThreadRetentionBlockerForOrder({ agencyId, acco
     orderBy:[{receivedAt:"asc"},{createdAt:"asc"},{id:"asc"}],
   }) : [];
   const intents=db.telegramDeliveryIntent?.findMany ? await db.telegramDeliveryIntent.findMany({
-    where:{agencyId,customOrderId:scopedOrderId,kind:{in:["TASK","REVISION_REQUEST"]}},
-    select:{id:true,creatorId:true,customOrderId:true,customSubmissionId:true,kind:true,state:true,accountId:true,remoteMessageId:true,remoteRecipientTelegramUserId:true,remoteSentAt:true,confirmedAt:true,createdAt:true},
+    where:{agencyId,customOrderId:scopedOrderId,kind:{in:["TASK","REVISION_REQUEST","INSTRUCTION_CONTINUATION"]}},
+    select:{id:true,creatorId:true,customOrderId:true,customSubmissionId:true,kind:true,state:true,instructionManifest:true,accountId:true,remoteMessageId:true,remoteRecipientTelegramUserId:true,remoteSentAt:true,confirmedAt:true,createdAt:true},
     orderBy:[{createdAt:"asc"},{id:"asc"}],
   }) : [];
   const accountIds=new Set([target]);
@@ -170,8 +179,8 @@ async function findCustomProviderThreadRetentionBlockers({ agencyId, accountId, 
   });
   const intents=[];
   if(db.telegramDeliveryIntent?.findMany) await scanAllById({
-    delegate:db.telegramDeliveryIntent, where:{agencyId,customOrderId:{in:orderIds},kind:{in:["TASK","REVISION_REQUEST"]}},
-    select:{id:true,creatorId:true,customOrderId:true,customSubmissionId:true,kind:true,state:true,accountId:true,remoteMessageId:true,remoteRecipientTelegramUserId:true,remoteSentAt:true,confirmedAt:true,createdAt:true},
+    delegate:db.telegramDeliveryIntent, where:{agencyId,customOrderId:{in:orderIds},kind:{in:["TASK","REVISION_REQUEST","INSTRUCTION_CONTINUATION"]}},
+    select:{id:true,creatorId:true,customOrderId:true,customSubmissionId:true,kind:true,state:true,instructionManifest:true,accountId:true,remoteMessageId:true,remoteRecipientTelegramUserId:true,remoteSentAt:true,confirmedAt:true,createdAt:true},
     onPage:async(rows)=>{intents.push(...(rows||[]));return false;},
   });
   const accountIds=new Set([target]);

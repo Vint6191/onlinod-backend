@@ -231,23 +231,7 @@
     if (!drawer) return;
     const current = W().request(drawer);
 
-    drawer.innerHTML = `
-      <div class="adm-drawer-backdrop" data-drawer-close></div>
-      <aside class="adm-drawer">
-        <div class="adm-drawer-head">
-          <div class="adm-drawer-title">User detail</div>
-          <button class="adm-btn ghost" data-drawer-close>×</button>
-        </div>
-        <div class="adm-drawer-body">
-          <div class="adm-loading">loading…</div>
-        </div>
-      </aside>
-    `;
-    drawer.querySelectorAll("[data-drawer-close]").forEach((el) => {
-      el.addEventListener("click", () => {
-        drawer.innerHTML = "";
-      });
-    });
+    window.NodAdminUI.dialog({ mount: drawer, title: "User detail", body: '<div class="adm-loading">loading…</div>' });
 
     const result = await A().getUser(userId);
     if (!current()) return;
@@ -423,7 +407,7 @@
     body.querySelectorAll("[data-open-agency]").forEach((btn) => {
       btn.addEventListener("click", () => {
         const drawer = document.getElementById("admUsersDrawer");
-        if (drawer) drawer.innerHTML = "";
+        if (drawer) window.NodAdminUI.closeAll({ restoreFocus: false });
         R().pushAgencyDetail(btn.dataset.openAgency);
       });
     });

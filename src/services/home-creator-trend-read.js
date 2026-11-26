@@ -1,7 +1,7 @@
 "use strict";
 
 const { scopeSql } = require("./home-scope-repository");
-const { ledgerAuthoritySql, coverageThroughSql, freshSql } = require("./earnings-live-read-sql");
+const { ledgerAuthoritySql, coverageThroughSql, coverageFirstDaySql, coverageLastDaySql, freshSql } = require("./earnings-live-read-sql");
 const { subscriberHeadColumns, subscriberHeadJoins } = require("./published-subscriber-summary");
 
 function literalSearch(value) {
@@ -66,11 +66,13 @@ async function readHomeTrendRows(input, page, { revenueSql, pendingSql, revenueP
     SELECT 0 AS period,($6::timestamptz AT TIME ZONE 'UTC')::date AS start_day,($7::timestamptz AT TIME ZONE 'UTC')::date AS end_day
     UNION ALL SELECT 1,($8::timestamptz AT TIME ZONE 'UTC')::date,($9::timestamptz AT TIME ZONE 'UTC')::date
   ), ${ledgerAuthoritySql("searched")}, eligibility AS MATERIALIZED (
-    SELECT (SELECT count(*) FROM ledger_authority)=(SELECT count(*) FROM searched) AS ready
+    SELECT (SELECT count(*) FROM ledger_authority)=(SELECT count(*) FROM searched)
+      AND NOT EXISTS(SELECT 1 FROM ledger_authority a CROSS JOIN periods r
+        WHERE ${coverageFirstDaySql()}>r.start_day OR ${coverageLastDaySql("$11")}<r.end_day) AS ready
   ), authority_facts AS MATERIALIZED (
     SELECT a.id,r.period,r.start_day,r.end_day,a."activeGeneration",a."throughAt" AS captured,
-      GREATEST(a."throughAt",a."lastDeliveredAt") AS observed,
-      a."fromAt"::date<=r.start_day AND ${coverageThroughSql()}::date>=r.end_day AS usable,
+      ${coverageThroughSql()} AS observed,
+      ${coverageFirstDaySql()}<=r.start_day AND ${coverageLastDaySql("$11")}>=r.end_day AS usable,
       ${freshSql("$11")} AS fresh FROM ledger_authority a CROSS JOIN periods r
   ), day_values AS MATERIALIZED (
     SELECT f.id,f.period,e.date,e."netCents" AS cents FROM authority_facts f JOIN "CreatorEarningsGenerationDay" e

@@ -452,11 +452,11 @@ async function createPpvClaimNoticeEvents(tx, { agencyId, deviceId, actorMemberI
   return created;
 }
 
-async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false, allowedCreatorIds = null }) {
+async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false, allowedCreatorIds = null, db = prisma, selectedRows = null }) {
   const statuses = includeClosed
     ? ["conflict", "resolved", "rejected"]
     : ["conflict"];
-  const rows = await prisma.teamPpvResolveJob.findMany({
+  const rows = selectedRows || await db.teamPpvResolveJob.findMany({
     where: { agencyId, ...creatorScopeWhere(allowedCreatorIds), status: { in: statuses } },
     orderBy: { updatedAt: "desc" },
     take: Math.max(1, Math.min(250, Number(limit) || 100)),
@@ -464,12 +464,12 @@ async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false, 
 
   const purchaseIds = Array.from(new Set(rows.map((r) => r.purchaseId).filter(Boolean)));
   const purchases = purchaseIds.length
-    ? await prisma.teamPpvPurchaseLedger.findMany({ where: { agencyId, purchaseId: { in: purchaseIds } } , take: 10000})
+    ? await db.teamPpvPurchaseLedger.findMany({ where: { agencyId, purchaseId: { in: purchaseIds } } , take: 10000})
     : [];
   const purchaseById = new Map(purchases.map((p) => [p.purchaseId, p]));
   const jobIds = rows.map((row) => row.id).filter(Boolean);
   const auditRows = jobIds.length
-    ? await prisma.teamPpvClaimAudit.findMany({
+    ? await db.teamPpvClaimAudit.findMany({
         where: { agencyId, jobId: { in: jobIds } },
         orderBy: { createdAt: "asc" },
         take: 10000,
@@ -504,7 +504,7 @@ async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false, 
   });
   const memberIds = Array.from(new Set(rawCandidates.map((c) => c.memberId).filter(Boolean)));
   const members = memberIds.length
-    ? await prisma.agencyMember.findMany({
+    ? await db.agencyMember.findMany({
         where: { agencyId, id: { in: memberIds }, deletedAt: null },
         include: { user: { select: { id: true, email: true, name: true } } },
         take: 10000})
@@ -562,6 +562,77 @@ async function listPpvConflicts({ agencyId, limit = 100, includeClosed = false, 
       updatedAt: r.updatedAt?.getTime?.() || null,
     };
   });
+}
+
+const PPV_PAGE_STATES = new Set(["all", "needs_review", "attributed", "creator_revenue", "closed"]);
+function ppvReadError(code, message) { return Object.assign(new Error(message), { code, status: 409 }); }
+async function listPpvConflictPage({ agencyId, allowedCreatorIds = null, actorScope = null, state = "needs_review", query = "", creatorId = null, cursor = null, limit = 100, db = prisma }) {
+  const take = Math.max(1, Math.min(250, Math.floor(Number(limit) || 100)));
+  if (!PPV_PAGE_STATES.has(state)) throw Object.assign(new Error("Unknown PPV state filter"), { code: "PPV_FILTER_INVALID", status: 400 });
+  const search = String(query || "").trim().toLowerCase();
+  if (search.length > 200) throw Object.assign(new Error("Search is too long"), { code: "PPV_FILTER_INVALID", status: 400 });
+  const scope = normalizedCreatorScope(allowedCreatorIds)?.sort() ?? null;
+  const selectedCreator = creatorId ? String(creatorId).trim() : null;
+  const identity = require("node:crypto").createHash("sha256").update(JSON.stringify([2, agencyId, scope, actorScope, state, search, selectedCreator])).digest("hex");
+  let page = null;
+  if (cursor) {
+    try {
+      if (typeof cursor !== "string" || cursor.length > 2048) throw Error();
+      page = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
+      if (page.v !== 2 || page.identity !== identity || typeof page.id !== "string" || page.id.length > 180
+        || !Number.isFinite(Date.parse(page.createdAt)) || !Number.isFinite(Date.parse(page.asOf))
+        || Date.parse(page.asOf) < Date.now() - 86400000 || Date.parse(page.asOf) > Date.now() + 60000) throw Error();
+    } catch { throw ppvReadError("PPV_CURSOR_EXPIRED", "The Claims view changed. Refresh from its first page."); }
+  }
+  const asOf = page?.asOf || new Date().toISOString();
+  const read = async tx => {
+    // Prisma timestamps are UTC timestamp-without-zone. Bind ISO text to avoid
+    // Date parameters being cast through the database session timezone.
+    const values = [agencyId, JSON.stringify(scope), selectedCreator, asOf];
+    const base = `j."agencyId"=$1 AND ($2::jsonb='null'::jsonb OR $2::jsonb ? j."creatorId")
+      AND ($3::text IS NULL OR j."creatorId"=$3) AND j."createdAt"<=$4::timestamp
+      AND j.status IN ('conflict','resolved','rejected')`;
+    const normalized = `CASE WHEN j.status='conflict' THEN 'conflict' WHEN p.status='attributed' THEN 'attributed'
+      WHEN p.status='creator_revenue' THEN 'creator_revenue' WHEN p.status='unresolved' THEN 'unresolved'
+      WHEN j.status='rejected' OR p.status='rejected' THEN 'rejected' ELSE 'attributed' END`;
+    const joined = `FROM "TeamPpvResolveJob" j LEFT JOIN "TeamPpvPurchaseLedger" p ON p."agencyId"=j."agencyId" AND p."purchaseId"=j."purchaseId"`;
+    const reviews = `(${normalized}) IN ('conflict','unresolved')`;
+    const countsRows = await tx.$queryRawUnsafe(`SELECT count(*)::int AS total,
+      count(*) FILTER (WHERE j.status='conflict')::int AS open,
+      count(*) FILTER (WHERE ${reviews})::int AS "needsReview",
+      count(*) FILTER (WHERE (${normalized})='attributed')::int AS attributed,
+      count(*) FILTER (WHERE (${normalized})='creator_revenue')::int AS "creatorRevenue",
+      count(*) FILTER (WHERE NOT ${reviews})::int AS closed ${joined} WHERE ${base}`, ...values);
+    const filters = [base];
+    if (state === "needs_review") filters.push(reviews);
+    if (state === "attributed") filters.push(`(${normalized})='attributed'`);
+    if (state === "creator_revenue") filters.push(`(${normalized})='creator_revenue'`);
+    if (state === "closed") filters.push(`NOT ${reviews}`);
+    if (search) {
+      // Literal substring search; parameters never become SQL identifiers/text.
+      values.push('%' + search.replace(/[\\%_]/g, c => '\\' + c) + '%');
+      const q = '$' + values.length;
+      filters.push(`(concat_ws(' ',j.id,j."purchaseId",j."messageId",j."creatorId",j."creatorRef",j."accountId",j.currency,(j."amountCents"::numeric/100)::text,(${normalized})) ILIKE ${q}
+        OR EXISTS (SELECT 1 FROM "CreatorAccount" c WHERE c.id=j."creatorId" AND concat_ws(' ',c."displayName",c.username) ILIKE ${q})
+        OR EXISTS (SELECT 1 FROM "AgencyMember" m LEFT JOIN "User" u ON u.id=m."userId" WHERE m."agencyId"=j."agencyId"
+          AND (m.id=j."resolvedByMemberId" OR j.result->>'memberId'=m.id OR j.result->>'existingMemberId'=m.id OR j.result->>'incomingMemberId'=m.id
+            OR EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(j.result->'candidates')='array' THEN j.result->'candidates' ELSE '[]'::jsonb END) candidate WHERE candidate->>'memberId'=m.id))
+          AND concat_ws(' ',m."displayName",u.name,u.email) ILIKE ${q}))`);
+    }
+    const where = filters.join(' AND ');
+    const [matching] = await tx.$queryRawUnsafe(`SELECT count(*)::int AS count ${joined} WHERE ${where}`, ...values);
+    const pageValues = [...values];
+    let after = '';
+    if (page) { pageValues.push(page.createdAt, page.id); after = ` AND (j."createdAt",j.id)<($${pageValues.length - 1}::timestamp,$${pageValues.length}::text)`; }
+    pageValues.push(take + 1);
+    const selected = await tx.$queryRawUnsafe(`SELECT j.* ${joined} WHERE ${where}${after} ORDER BY j."createdAt" DESC,j.id DESC LIMIT $${pageValues.length}`, ...pageValues);
+    const hasMore = selected.length > take, rows = selected.slice(0, take), last = rows[rows.length - 1];
+    const nextCursor = hasMore && last ? Buffer.from(JSON.stringify({ v: 2, identity, asOf, createdAt: last.createdAt.toISOString(), id: last.id })).toString('base64url') : null;
+    const conflicts = await listPpvConflicts({ agencyId, allowedCreatorIds, db: tx, selectedRows: rows });
+    return { ok: true, contractVersion: 2, conflicts, hasMore, nextCursor, asOf, queryIdentity: identity,
+      counts: { ...countsRows[0], matching: matching.count }, returned: conflicts.length };
+  };
+  return typeof db.$transaction === 'function' ? db.$transaction(read, { isolationLevel: 'RepeatableRead', timeout: 15000 }) : read(db);
 }
 
 async function createPpvClaimAudit(tx, { agencyId, actorMemberId, job, action, selectedMemberId, reason, candidates, purchaseBefore }) {
@@ -860,6 +931,7 @@ module.exports = {
   applyLedgerSideEffects,
   upsertSentMessageFromEvent,
   listPpvConflicts,
+  listPpvConflictPage,
   resolvePpvConflict,
   expirePendingJobs,
   gcTeamLedgers,
