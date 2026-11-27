@@ -19,7 +19,10 @@ async function runBillingProviderEvent({ db, provider, eventKey, paymentId, data
       await lockEvent(tx);
       const event = await tx.billingProviderEvent.findUnique({ where: { eventKey } });
       if (!event) throw Object.assign(new Error("Billing provider inbox receipt is missing"), { code: "BILLING_PROVIDER_RECEIPT_MISSING" });
-      if (event.processedAt) return replay(tx, event);
+      // An invoice-only callback can arrive before its creation response has
+      // attached providerInvoiceId. Revisit old and new unresolved receipts
+      // when the provider retries; they are not successful duplicate payments.
+      if (event.processedAt && event.processingError !== "ORDER_NOT_FOUND") return replay(tx, event);
       // This identity is global, before any Agency/order lock. Even callbacks
       // naming different orders must re-read the payment binding after waiting.
       // Sandbox/live rows remain separate in SQL; sharing this narrow lock also
@@ -27,7 +30,8 @@ async function runBillingProviderEvent({ db, provider, eventKey, paymentId, data
       if (paymentId) await lockDbAdvisoryXact({ db: tx, key: `${provider}:billing-payment:${paymentId}` });
       const result = await project(tx, event);
       await tx.billingProviderEvent.update({ where: { id: event.id }, data: {
-        processedAt: new Date(), processingError: result.code === "ORDER_NOT_FOUND" ? result.code : null,
+        processedAt: result.code === "ORDER_NOT_FOUND" ? null : new Date(),
+        processingError: result.code === "ORDER_NOT_FOUND" ? result.code : null,
       } });
       return result;
     }, COMMIT_OPTIONS);

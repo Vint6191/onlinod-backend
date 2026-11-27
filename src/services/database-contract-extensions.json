@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v35_payment_and_runtime_repairs",
+  "version": "nod_current_v36_financial_correction_projection",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -160,6 +160,10 @@
     {
       "migration": "20261128030000_payment_settlements",
       "checksum": "a7986e8e411539651bf9ac28e52c5a685f37e9947aafe5b10a494d35c8020d38"
+    },
+    {
+      "migration": "20261128040000_financial_correction_projection",
+      "checksum": "76cd1b58738cc66d6d3e325c35c09c16e4f51a80d52b1e61e6d3be9a4f1c9662"
     }
   ],
   "extension": {
@@ -3762,7 +3766,7 @@
       {
         "name": "onlinod_guard_team_financial_authority_v1",
         "args": "",
-        "hash": "7b98b12e9a287d9783ffb2d1b763a73e0958ae02955e240ef6d14891655530f4"
+        "hash": "2e12a2ebc76176c567157119dfb9ec307b3459ea9a4012563724fe4cb533f0d3"
       },
       {
         "name": "onlinod_guard_team_purchase_identity_v3",
@@ -3978,6 +3982,30 @@
         "definition": "CREATE TRIGGER onlinod_money_coverage_monotonic_v7 BEFORE UPDATE ON public.\"CreatorMoneyObservation\" FOR EACH ROW EXECUTE FUNCTION onlinod_money_coverage_monotonic_v7()",
         "args": "",
         "function": "onlinod_money_coverage_monotonic_v7"
+      },
+      {
+        "table": "CreatorSale",
+        "name": "CreatorSale_phase2_team_money_work",
+        "type": 21,
+        "definition": "CREATE TRIGGER \"CreatorSale_phase2_team_money_work\" AFTER INSERT OR UPDATE OF \"fanId\", \"externalNotificationId\", \"eventFingerprint\", \"saleType\", \"messageId\", \"amountCents\", currency, \"purchasedAt\", \"transactionStatus\", \"externalTransactionId\", \"sourceUpdatedAt\", \"financialCorrelation\" ON public.\"CreatorSale\" FOR EACH ROW EXECUTE FUNCTION phase2_team_money_reconciliation_trigger()",
+        "args": "",
+        "function": "phase2_team_money_reconciliation_trigger"
+      },
+      {
+        "table": "CreatorSale",
+        "name": "CreatorSale_refresh_team_fact_v1",
+        "type": 21,
+        "definition": "CREATE TRIGGER \"CreatorSale_refresh_team_fact_v1\" AFTER INSERT OR UPDATE OF \"saleType\", \"amountCents\", currency, \"purchasedAt\", \"transactionStatus\", \"sourceUpdatedAt\" ON public.\"CreatorSale\" FOR EACH ROW EXECUTE FUNCTION onlinod_refresh_team_fact_from_creator_sale_v1()",
+        "args": "",
+        "function": "onlinod_refresh_team_fact_from_creator_sale_v1"
+      },
+      {
+        "table": "CreatorTip",
+        "name": "CreatorTip_phase2_team_money_work",
+        "type": 21,
+        "definition": "CREATE TRIGGER \"CreatorTip_phase2_team_money_work\" AFTER INSERT OR UPDATE OF \"fanId\", \"externalNotificationId\", \"eventFingerprint\", \"messageId\", \"amountCents\", currency, \"tippedAt\", \"transactionStatus\", \"externalTransactionId\", \"sourceUpdatedAt\", \"financialCorrelation\" ON public.\"CreatorTip\" FOR EACH ROW EXECUTE FUNCTION phase2_team_money_reconciliation_trigger()",
+        "args": "",
+        "function": "phase2_team_money_reconciliation_trigger"
       },
       {
         "table": "FanLtvBalance",

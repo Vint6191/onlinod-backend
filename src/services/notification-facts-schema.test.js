@@ -29,10 +29,19 @@ function modelBody(name) {
   return match[1];
 }
 
-test("notification facts are typed relational tables without JSON business storage", () => {
+test("notification money remains typed and relational with separate bounded correlation evidence", () => {
   for (const name of ["CreatorSale", "CreatorTip", "CreatorSubscriptionEvent"]) {
     const body = modelBody(name);
-    assert.doesNotMatch(body, /\bJson\??\b/);
+    const evidence = /^\s*financialCorrelation\s+Json\?\s*$/m;
+    if (name !== "CreatorSubscriptionEvent") {
+      assert.match(body, evidence);
+      assert.match(body, /amountCents\s+Int\?/);
+      assert.match(body, /currency\s+String/);
+      const correlationDdl = read("prisma/migrations/20261128011000_financial_correlation_provenance/migration.sql");
+      assert.match(correlationDdl, new RegExp(name + '_correlation208_check'));
+      assert.match(correlationDdl, /->>'version'='1'/);
+    }
+    assert.doesNotMatch(body.replace(evidence, ""), /\bJson\??\b/);
     assert.match(body, /eventFingerprint\s+String/);
     assert.match(body, /fanRecordId\s+String\?\s+@map\("fanId"\)/);
     assert.match(body, /CreatorAccount\s+@relation\(fields: \[agencyId, creatorId\], references: \[agencyId, id\], onDelete: Cascade\)/);

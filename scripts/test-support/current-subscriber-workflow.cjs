@@ -83,6 +83,7 @@ exports.runSubscriberDirectory = async function runSubscriberDirectory(f) {
       throw Error("UNEXPECTED_PROVIDER_REQUEST " + JSON.stringify({ source: input.source, endpoint: input.endpoint }));
     },
   };
+  const messageSettlements = new m.AutomationMessageSettlementOutbox(log, path.join(scratch, "subscriber-message-receipts.sqlite"));
   let coordinator, worker, actionWorker;
   const makeWorkers = () => {
     coordinator = new m.WorkCoordinatorService({ log, databasePath: path.join(scratch, "subscriber-work.sqlite") });
@@ -93,7 +94,7 @@ exports.runSubscriberDirectory = async function runSubscriberDirectory(f) {
       sessionReconcile: { reconcileDurableAccessCatalog: async () => {}, observeCanonicalManifests: () => {}, observeNetworkManifests: () => {},
         hardRevokeCreator: () => { throw Error("UNEXPECTED_HARD_REVOKE"); }, hardRevokeAll: () => { throw Error("UNEXPECTED_LOGOUT"); } }, events: { emit: () => {} } });
     actionWorker = new m.BackendActionWorker({ log, authStore, authService, capabilities, authorization: authority,
-      creatorRuntime, coordinator, ofApi, customOrders: { assertProgrammaticMediaAllowed: async () => { throw Error("MEDIA_NOT_IN_THIS_WORKFLOW"); } } });
+      creatorRuntime, coordinator, ofApi, messageSettlements, customOrders: { assertProgrammaticMediaAllowed: async () => { throw Error("MEDIA_NOT_IN_THIS_WORKFLOW"); } } });
   };
   makeWorkers();
   const handlers = { ...m.createSubscriberDirectoryHandlers(service), ...m.createAutomationHandlers(automation, () => actionWorker),
@@ -303,7 +304,7 @@ export async function refresh(){await client.invalidateQueries({queryKey:['autom
     results.browserVersion = await browser.version();
   } finally {
     clearInterval(renewal);
-    await actionWorker.stop(); await worker.stop(); await coordinator.destroy();
+    await actionWorker.stop(); await worker.stop(); await messageSettlements.destroy(); await coordinator.destroy();
     results.finalStatus = await status().catch(error => ({ error: error.message }));
     results.renderer = { calls, errors, requests };
     results.provider = { calls: provider.calls, pageReads: [...provider.pageReads], physicalWrites: provider.messages.length };

@@ -77,8 +77,9 @@ exports.runAutomation = async function runAutomation(f) {
       throw Error("UNEXPECTED_PROVIDER_REQUEST " + JSON.stringify({ source, endpoint }));
     },
   };
+  const messageSettlements = new m.AutomationMessageSettlementOutbox(log, path.join(scratch, "automation-message-receipts.sqlite"));
   const worker = new m.BackendActionWorker({ log, authStore, authService, capabilities, authorization: authority,
-    creatorRuntime, coordinator, ofApi, customOrders: { assertProgrammaticMediaAllowed: async () => {} } });
+    creatorRuntime, coordinator, ofApi, messageSettlements, customOrders: { assertProgrammaticMediaAllowed: async () => {} } });
   const handlers = { ...m.createAutomationHandlers(service, () => worker),
     "managementCommands.listPending": () => commands.listPending(),
     "managementCommands.acknowledge": input => commands.acknowledge(input.commandId),
@@ -95,7 +96,7 @@ exports.runAutomation = async function runAutomation(f) {
     assert.equal(url.origin, api.apiBase, "Only isolated Backend HTTP is permitted");
     const response = await nativeFetch(input, options);
     requests.push({ method: options?.method || "GET", path: url.pathname, status: response.status });
-    if (loseCompletionAck && /\/api\/automation\/worker\/[^/]+\/complete$/.test(url.pathname) && response.ok) {
+    if (loseCompletionAck && /\/api\/automation-action-settlement\/[^/]+\/complete$/.test(url.pathname) && response.ok) {
       loseCompletionAck = false; await response.clone().text();
       results.lostCompletionAck = true;
       throw Error("Controlled lost completion acknowledgement after SQL commit");
@@ -348,6 +349,8 @@ export function unmount(){root.unmount();client.clear();}`);
     commands.acknowledge(withLostAck.commandId);
     const ackRow = await terminal("SEND_MESSAGE", "16007");
     await until(() => coordinator.list({ statuses: ["queued", "running"], limit: 100 }).items.length === 0, "Local retry did not accept committed SQL receipt", 30000);
+    await until(() => messageSettlements.db.prepare("SELECT count(*) n FROM automation_message_receipts").get().n === 0,
+      "Exact settlement retry did not acknowledge the committed receipt", 30000);
     assert.equal(results.lostCompletionAck, true);
     assert.equal(provider.messages.filter(row => row.toUser.id === "16007").length, 1);
     assert.equal((await deliveries()).find(row => row.id === ackRow.id).status, "COMPLETED");
@@ -389,7 +392,7 @@ export function unmount(){root.unmount();client.clear();}`);
     clearInterval(renewal);
     for (const release of blockedReleases) release();
     if (page) { await page.screenshot({ path: path.join(output, "last-screen.png"), fullPage: true }).catch(() => {}); }
-    await worker.stop(); await coordinator.destroy();
+    await worker.stop(); await messageSettlements.destroy(); await coordinator.destroy();
     results.finalDeliveries = await service.listDeliveries({ creatorId: c, limit: 100 }).catch(error => ({ error: error.message }));
     globalThis.fetch = nativeFetch;
     await browser?.close();

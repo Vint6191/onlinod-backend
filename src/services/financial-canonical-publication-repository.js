@@ -98,8 +98,12 @@ async function publish({db,job,rows,existing,participants,deviceId,observedAt,no
     const model=kind==="SALE"?"creatorSale":"creatorTip",table=kind==="SALE"?"CreatorSale":"CreatorTip",time=kind==="SALE"?"purchasedAt":"tippedAt";
     const candidates=rows.filter(row=>row.factType===kind&&row.projectionStatus==="PROJECTED").map(row=>({...row,fanRecordId:financialById.get(row.externalTransactionId).fanRecordId}));
     if(!candidates.length)continue;
-    ids[kind].push(...await correlation.invalidateNeighborhoods({db,job,rows:candidates,kind,now}));
-    const prior=await db[model].findMany({where:{creatorId:job.creatorId,externalTransactionId:{in:candidates.map(row=>row.externalTransactionId)}}});
+    let prior=await db[model].findMany({where:{creatorId:job.creatorId,externalTransactionId:{in:candidates.map(row=>row.externalTransactionId)}}});
+    const anchors=[...candidates,...prior.map(row=>({...row,occurredAt:row[time]}))];
+    const changed=[];
+    for(let offset=0;offset<anchors.length;offset+=500)changed.push(...await correlation.invalidateNeighborhoods({db,job,rows:anchors.slice(offset,offset+500),kind,now}));
+    ids[kind].push(...changed);
+    if(prior.some(row=>changed.includes(row.id)))prior=await db[model].findMany({where:{creatorId:job.creatorId,externalTransactionId:{in:candidates.map(row=>row.externalTransactionId)}}});
     const byTransaction=new Map(prior.map(row=>[row.externalTransactionId,row]));
     const legacy=await legacyCandidates(db,job,candidates.filter(row=>!byTransaction.has(row.externalTransactionId)),kind),records=[];
     if(legacy.ambiguousIds?.length){
@@ -121,9 +125,11 @@ async function publish({db,job,rows,existing,participants,deviceId,observedAt,no
         vatCents:row.vatCents,mediaTaxCents:row.mediaTaxCents,transactionStatus:row.transactionStatus,currency:row.currency,
         source:"ONLYFANS_API",sourceUpdatedAt:revision,collectedAt:restoringVerifiedLedger?row.collectedAt:now,sourceDeviceId:restoringVerifiedLedger?row.sourceDeviceId:deviceId,
         sourceJobId:restoringVerifiedLedger?row.sourceJobId:job.id??financialById.get(row.externalTransactionId)?.sourceJobId??previous?.sourceJobId??null,updatedAt:now,
-        [time]:row.occurredAt,...(kind==="SALE"?{saleType:row.saleType||"OTHER"}:{})}));
+        [time]:row.occurredAt,...(kind==="SALE"?{saleType:row.saleType||"OTHER",
+          messageId:row.saleType==="MESSAGE"?previous?.messageId||null:null,
+          postId:row.saleType==="POST"?previous?.postId||null:null}:{})}));
     }
-    await upsert(db,table,records,[...COMMON,time,...(kind==="SALE"?["saleType"]:[])],["eventFingerprint"]);
+    await upsert(db,table,records,[...COMMON,time,...(kind==="SALE"?["saleType","messageId","postId"]:[])],["eventFingerprint"]);
     ids[kind].push(...records.map(row=>row.id));
   }
   return ids;

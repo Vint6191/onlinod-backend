@@ -1,7 +1,9 @@
 "use strict";
 const { randomUUID } = require("node:crypto");
+const { discoveryAuthState, requestPaymentDiscovery } = require("./billing-discovery-auth-service");
 
 const PAGE_SIZE = 100;
+const DISCOVERY_VERSION = 2;
 function bindingError(code, message) { return Object.assign(new Error(message), { code, status: 409, permanent: true }); }
 function paymentId(value) {
   const id = String(value ?? "").trim();
@@ -29,6 +31,8 @@ async function reconcilePayments({ db, order, cfg, providerPaymentId, request, a
   const remaining = () => Math.max(250, deadline - Date.now());
   let checked = 0, discovered = 0, reason = null;
   const errors = [];
+  const auth = discoveryAuthState(cfg);
+  let discoveryAvailable = auth.configured;
   const consume = async (payload, expectedId, knownBinding = false) => {
     await apply(boundPayment(payload, order, expectedId, knownBinding), { signature: null, signatureVerified: false, source: "RECONCILIATION", db });
     checked += 1;
@@ -44,57 +48,79 @@ async function reconcilePayments({ db, order, cfg, providerPaymentId, request, a
     orderId: order.id, ...(old.attemptCursor ? { id: { gt: old.attemptCursor } } : {}),
   }, orderBy: { id: "asc" }, take: 5 });
   let advancedAttempts = 0;
+  // Keep a bounded slot for discovery even if known payments time out. Without
+  // this, a slow known-payment cycle can consume every refresh indefinitely.
+  const attemptDeadline = auth.configured ? Math.min(deadline - 5000, Date.now() + 10_000) : deadline - 1000;
   for (const attempt of attempts.slice(0, 4)) {
-    if (Date.now() >= deadline - 1000) { reason = "PAYMENT_RECONCILIATION_CONTINUES"; break; }
+    if (Date.now() >= attemptDeadline) { reason = "PAYMENT_RECONCILIATION_CONTINUES"; break; }
     if (attempt.providerPaymentId !== providerPaymentId) {
-      try { await consume(await request(`/payment/${encodeURIComponent(attempt.providerPaymentId)}`, { timeoutMs: remaining() }), attempt.providerPaymentId, true); }
-      catch (error) { errors.push(String(error.code || "PAYMENT_RECONCILIATION_FAILED")); }
+      try { await consume(await request(`/payment/${encodeURIComponent(attempt.providerPaymentId)}`, {
+        timeoutMs: Math.max(250, Math.min(remaining(), attemptDeadline - Date.now())),
+      }), attempt.providerPaymentId, true); }
+      catch (error) { errors.push({ stage: "attempt", code: String(error.code || "PAYMENT_RECONCILIATION_FAILED") }); }
     }
     progress.attemptCursor = attempt.id; advancedAttempts += 1;
   }
   if (advancedAttempts === attempts.length) progress.attemptCursor = null;
-  if (!cfg.reconciliationToken) {
-    reason = reason || "PAYMENT_DISCOVERY_AUTH_REQUIRED";
+  if (!auth.configured) {
+    reason = auth.reason;
   } else if (Date.now() < deadline - 1000) {
     // Official GET /payment list requires the merchant JWT in addition to the
     // API key. The public invoice endpoint does not expose payment discovery.
-    // Source: https://nowpayments.io/blog/how-to-use-your-nowpayments-payment-api-to-the-full-extent
-    if (!progress.cycle || progress.complete) {
+    // Invoice filtering keeps timeless invoices independent of the merchant's
+    // total payment history. A cursor belongs to one filter/version: carrying
+    // an old merchant-wide page into this query would silently skip payments.
+    // https://nowpayments.zendesk.com/hc/en-us/articles/21345824322717-API-and-endpoint-description
+    const scope = order.providerInvoiceId ? `invoice:${order.providerInvoiceId}` : `order:${order.id}`;
+    if (progress.version !== DISCOVERY_VERSION || progress.scope !== scope || !progress.cycle || progress.complete) {
       const upper = new Date(); upper.setUTCDate(upper.getUTCDate() + 1);
+      progress.version = DISCOVERY_VERSION; progress.scope = scope;
       progress.cycle = randomUUID(); progress.page = 0; progress.rowOffset = 0; progress.complete = false;
       progress.dateFrom = new Date(order.createdAt).toISOString().slice(0, 10);
       progress.dateTo = upper.toISOString().slice(0, 10);
     }
     const query = new URLSearchParams({ limit: String(PAGE_SIZE), page: String(progress.page || 0), sortBy: "created_at", orderBy: "asc", dateFrom: progress.dateFrom, dateTo: progress.dateTo });
-    const page = await request(`/payment/?${query}`, { headers: { Authorization: `Bearer ${cfg.reconciliationToken}` }, timeoutMs: remaining() });
-    const rows = Array.isArray(page?.data) ? page.data : null;
-    if (!rows || rows.length > PAGE_SIZE) throw Object.assign(new Error("Invalid payment discovery response"), { code: "NOWPAYMENTS_DISCOVERY_RESPONSE_INVALID", status: 502 });
-    let consumedRows = Math.min(rows.length, Number(progress.rowOffset) || 0), matchedThisPage = 0;
-    for (let i = consumedRows; i < rows.length; i += 1) {
-      if (Date.now() >= deadline - 1000 || matchedThisPage >= 10) break;
-      const row = rows[i];
-      const belongs = String(row?.order_id || "") === order.id || (!!order.providerInvoiceId && String(row?.invoice_id || "") === order.providerInvoiceId);
-      if (belongs) {
-        // Invalid bindings stop at their exact row; they are never silently
-        // skipped while advancing the durable cursor.
-        await consume(row); discovered += 1; matchedThisPage += 1;
+    if (order.providerInvoiceId) query.set("invoiceid", order.providerInvoiceId);
+    try {
+      const page = await requestPaymentDiscovery({ cfg, request, pathname: `/payment/?${query}`, remaining });
+      const rows = Array.isArray(page?.data) ? page.data : null;
+      if (!rows || rows.length > PAGE_SIZE) throw Object.assign(new Error("Invalid payment discovery response"), { code: "NOWPAYMENTS_DISCOVERY_RESPONSE_INVALID", status: 502 });
+      let consumedRows = Math.min(rows.length, Number(progress.rowOffset) || 0), matchedThisPage = 0;
+      for (let i = consumedRows; i < rows.length; i += 1) {
+        if (Date.now() >= deadline - 1000 || matchedThisPage >= 10) break;
+        const row = rows[i];
+        const belongs = String(row?.order_id || "") === order.id || (!!order.providerInvoiceId && String(row?.invoice_id || "") === order.providerInvoiceId);
+        if (belongs) {
+          // Keep the exact row when a binding or projection fails. Successful
+          // preceding rows and known-payment cursors still survive the outage.
+          await consume(row); discovered += 1; matchedThisPage += 1;
+        }
+        consumedRows = i + 1;
+        progress.rowOffset = consumedRows;
       }
-      consumedRows = i + 1;
+      const returnedLimit = Number(page.limit);
+      const effectiveLimit = Number.isInteger(returnedLimit) && returnedLimit > 0 && returnedLimit <= PAGE_SIZE ? returnedLimit : PAGE_SIZE;
+      const pageComplete = consumedRows === rows.length;
+      progress.rowOffset = pageComplete ? 0 : consumedRows;
+      progress.page = Number(progress.page || 0) + (pageComplete ? 1 : 0);
+      progress.complete = pageComplete && rows.length < effectiveLimit;
+      reason = progress.complete && !progress.attemptCursor ? null : "PAYMENT_RECONCILIATION_CONTINUES";
+    } catch (error) {
+      const code = String(error?.code || "PAYMENT_DISCOVERY_FAILED");
+      errors.push({ stage: "discovery", code });
+      if (code.startsWith("PAYMENT_DISCOVERY_AUTH_")) {
+        discoveryAvailable = false;
+        reason = code;
+      } else reason = "PAYMENT_RECONCILIATION_RETRY_REQUIRED";
     }
-    const returnedLimit = Number(page.limit);
-    const effectiveLimit = Number.isInteger(returnedLimit) && returnedLimit > 0 && returnedLimit <= PAGE_SIZE ? returnedLimit : PAGE_SIZE;
-    const pageComplete = consumedRows === rows.length;
-    progress.rowOffset = pageComplete ? 0 : consumedRows;
-    progress.page = Number(progress.page || 0) + (pageComplete ? 1 : 0);
-    progress.complete = pageComplete && rows.length < effectiveLimit;
-    reason = progress.complete && !progress.attemptCursor ? null : "PAYMENT_RECONCILIATION_CONTINUES";
   } else reason = "PAYMENT_RECONCILIATION_CONTINUES";
   progress.checkedAt = new Date().toISOString();
   progress.retryRequired = errors.length > 0;
-  if (errors.length) reason = "PAYMENT_RECONCILIATION_RETRY_REQUIRED";
+  progress.lastErrorCode = errors.at(-1)?.code || null;
+  if (errors.length && !reason?.startsWith("PAYMENT_DISCOVERY_AUTH_")) reason = "PAYMENT_RECONCILIATION_RETRY_REQUIRED";
   await saveProgress(db, order.id, previous, progress);
   return { reconciled: checked > 0, checked, discovered, reason: reason || (checked ? null : "PAYMENT_NOT_FOUND"),
-    more: !progress.complete && !!cfg.reconciliationToken || !!progress.attemptCursor || errors.length > 0,
+    more: !progress.complete && discoveryAvailable || !!progress.attemptCursor || errors.some(error => error.stage === "attempt"),
     paymentIdRecoveryAvailable: true };
 }
 module.exports = { reconcilePayments, boundPayment, paymentId };

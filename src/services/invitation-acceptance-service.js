@@ -156,6 +156,10 @@ async function acceptInvitationForUser({ token, userId, verifiedUser = null, exp
         initials: String(currentInvite.displayName || currentUser.name || currentUser.email || "??").trim().slice(0, 2).toUpperCase(),
         commission: currentInvite.commission ?? { kind: "none" },
         assignedCreators: creatorScope.value,
+        // A new invitation grants its current role and scope. Restoring the
+        // historical member ID must not resurrect individual permission grants
+        // from that member's previous role or previous period of employment.
+        permissions: {},
       });
       const member = membership.member;
       const restored = membership.restored;

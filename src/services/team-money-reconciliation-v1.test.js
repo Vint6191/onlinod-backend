@@ -99,6 +99,8 @@ function dbFixture({ sent = null, existing = null, financialStatus = "done", mem
       },
     },
     teamPpvResolveJob: {
+      async findUnique() { return resolveJob ? { ...resolveJob } : null; },
+      async update({ data }) { resolveJob = { ...resolveJob, ...data }; return { ...resolveJob }; },
       async upsert({ create, update }) {
         resolveJob = resolveJob ? { ...resolveJob, ...update } : { id: "job-1", ...create };
         return { ...resolveJob };
@@ -117,6 +119,7 @@ function dbFixture({ sent = null, existing = null, financialStatus = "done", mem
     getPurchaseCreates: () => purchaseCreates,
     setSent: (value) => { sentCurrent = value; },
     setPurchase: (value) => { purchase = value ? { ...value } : null; },
+    setSale: (value) => Object.assign(sale, value),
   };
 }
 
@@ -274,6 +277,41 @@ test("payout undo keeps attribution evidence but financially disables the purcha
   assert.equal(fx.getPurchase().attributedMemberId, "member-1");
   // No pending resolver job is created for reversed money.
   assert.equal(fx.getResolveJob(), null);
+});
+
+test("a verified non-message correction retires PPV and preserves its manual owner for a later exact restoration", async () => {
+  const fx = dbFixture({ sent: manualSent() });
+  await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  const root = { ...fx.getPurchase(), resolvedSource: "manual_claim_resolution", attributedMemberId: "manager-selected-member" };
+  fx.setPurchase(root);
+  for (const saleType of ["POST", "STREAM"]) {
+    fx.setSale({ saleType, messageId: null });
+    const retired = await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+    assert.equal(retired.financiallyInactive, true);
+    assert.equal(fx.getPurchase().id, root.id);
+    assert.equal(fx.getPurchase().financialStatus, "superseded");
+    assert.equal(fx.getPurchase().attributedMemberId, "manager-selected-member");
+    assert.equal(fx.getPurchase().resolvedSource, "manual_claim_resolution");
+    fx.setSale({ saleType: "MESSAGE", messageId: "message-1", transactionStatus: "done" });
+    await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+    assert.equal(fx.getPurchase().financialStatus, "done");
+    assert.equal(fx.getPurchase().attributedMemberId, "manager-selected-member");
+  }
+  assert.equal(fx.getPurchaseCreates(), 1);
+});
+
+test("quarantined or reversed PPV closes automatic review without discarding earlier manual audit", async () => {
+  const fx = dbFixture({ sent: manualSent() });
+  await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  fx.setPurchase({ ...fx.getPurchase(), attributedMemberId: "previous-owner" });
+  await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  assert.equal(fx.getResolveJob().status, "conflict");
+  fx.getResolveJob().result.manualResolutions = [{ reason: "original manager evidence" }];
+  fx.setSale({ transactionStatus: "unverified" });
+  await reconcileCreatorSaleToTeam({ db: fx.db, saleId: "sale-1" });
+  assert.equal(fx.getResolveJob().status, "expired");
+  assert.equal(fx.getResolveJob().result.financialClosureReason, "FINANCIAL_UNVERIFIED");
+  assert.equal(fx.getResolveJob().result.manualResolutions[0].reason, "original manager evidence");
 });
 
 

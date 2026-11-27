@@ -26,6 +26,7 @@ const {
 } = require("./fan-observation-read-lease-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { isOnlineBumpSend, commitOnlineBumpWrite } = require("./bump-write-window-service");
+const { isMessageDelivery, preserveMessageSettlement, mintActionMessageSettlement } = require("./automation-message-settlement-service");
 const { CREATOR_WRITE_LANE_STATUSES } = require("./automation-delivery-statuses");
 const { deliveryRequiresReconciliation, unresolvedDeliveryWhere, deliveryOutcomeSnapshotWhere } = require("./automation-outcome-contract");
 const { claimPacingRetryAt } = require("./automation-pacing-service");
@@ -1217,7 +1218,11 @@ async function prepareWriteActionDelivery(input) {
     // lease after acquiring it so a queued control/revoke transition cannot
     // race a stale pre-lock delivery snapshot into COMMITTING.
     delivery = await requireLease({ ...input, db: tx, lockAccess: true });
+    if (input.messageSettlementVersion === 1 && !isMessageDelivery(delivery)) {
+      throw new ActionDeliveryError("ACTION_MESSAGE_SETTLEMENT_SCOPE_INVALID", "Message receipt protocol requires a Bump send", 400);
+    }
     if (delivery.status === "COMMITTING" && delivery.writeCommitAt) {
+      if (input.messageSettlementVersion === 1) throw new ActionDeliveryError("DELIVERY_ALREADY_COMMITTING", "Message send already crossed the write commit boundary");
       return { ok: true, duplicate: true, id: delivery.id, status: delivery.status, leaseRevision: delivery.leaseRevision, writeCommitRevision: delivery.writeCommitRevision, writeCommitAt: delivery.writeCommitAt };
     }
     if (deliveryRequiresReconciliation(delivery)) throw new ActionDeliveryError("DELIVERY_RECONCILIATION_REQUIRED", "Delivery must prove the previous external write outcome before another write permit");
@@ -1290,7 +1295,8 @@ async function prepareWriteActionDelivery(input) {
         return { bumpDenied: { ok: false, terminal: true, status: "SKIPPED", code: "stale_candidate" }, delivery };
       }
       return { ok: true, duplicate: false, id: committing.id, status: committing.status,
-        leaseRevision: committing.leaseRevision, writeCommitRevision: committing.writeCommitRevision, writeCommitAt: committing.writeCommitAt };
+        leaseRevision: committing.leaseRevision, writeCommitRevision: committing.writeCommitRevision, writeCommitAt: committing.writeCommitAt,
+        ...(input.messageSettlementVersion === 1 ? await mintActionMessageSettlement({ db: tx, delivery: committing, deviceId: input.deviceId }) : {}) };
     }
     const changed = await tx.automationDelivery.updateMany({
       where: { id: delivery.id, status: "RUNNING", claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision, claimUntil: { gt: now } },
@@ -1301,7 +1307,8 @@ async function prepareWriteActionDelivery(input) {
     });
     if (!changed.count) throw new ActionDeliveryError("DELIVERY_COMMIT_PERMIT_STALE", "Delivery changed before write commit permit");
     const committing = await tx.automationDelivery.findUnique({ where: { id: delivery.id } });
-    return { ok: true, duplicate: false, id: committing.id, status: committing.status, leaseRevision: committing.leaseRevision, writeCommitRevision: committing.writeCommitRevision, writeCommitAt: committing.writeCommitAt };
+    return { ok: true, duplicate: false, id: committing.id, status: committing.status, leaseRevision: committing.leaseRevision, writeCommitRevision: committing.writeCommitRevision, writeCommitAt: committing.writeCommitAt,
+      ...(input.messageSettlementVersion === 1 ? await mintActionMessageSettlement({ db: tx, delivery: committing, deviceId: input.deviceId }) : {}) };
     }, { timeout: 30_000 });
     // Denial is returned through COMMIT so the terminal/retry transition and fan
     // reservation cleanup survive; the HTTP error is emitted only afterwards.
@@ -1387,7 +1394,7 @@ async function completeActionDelivery(input) {
   const now = new Date();
   const clientResult = object(input.result);
   const effectTime = buildAutomationEffectTimeEvidence(delivery, clientResult, now);
-  const result = sanitizeAutomationSettlementResult(clientResult, effectTime);
+  const result = preserveMessageSettlement(delivery, sanitizeAutomationSettlementResult(clientResult, effectTime));
   const outcomeCode = clean(input.outcomeCode, 120) || clean(result.code, 120) || null;
   // Preserve the accepted SFS outcome in the durable receipt used by cleanup
   // handoff and retirement, including clients that send outcomeCode separately.
@@ -1402,7 +1409,11 @@ async function completeActionDelivery(input) {
     const changed = await tx.automationDelivery.updateMany({
       where: {
         id: delivery.id,
-        status: { in: LEASED_STATUSES },
+        // Preparing a send preserves the lease revision. Bind the outcome to
+        // the observed write generation too, so a pre-commit result cannot
+        // erase a capability minted while this request waited for its locks.
+        status: delivery.status,
+        writeCommitRevision: delivery.writeCommitRevision,
         claimedByDeviceId: input.deviceId,
         leaseTokenHash: hashToken(input.leaseToken),
         leaseRevision: input.leaseRevision,
@@ -1489,19 +1500,19 @@ async function failActionDelivery(input) {
     && (safetyRecovery || delivery.attempts < delivery.maxAttempts)));
   const nextStatus = reconcile ? "RECONCILE_REQUIRED" : (retryable ? "RETRY_SCHEDULED" : "FAILED");
   const nextNotBefore = (retryable || reconcile) ? new Date(now.getTime() + retryDelayMs(delivery.attempts, failureCode, input.retryAfterMs)) : delivery.notBefore;
-  const result = {
+  const result = preserveMessageSettlement(delivery, {
     ...object(delivery.result), ...inputResult,
     reportedEndpointSemantics: inputResult.endpointSemantics || null, reportedIdempotent: inputResult.idempotent === true, reportedProvenNoEffect: inputResult.provenNoEffect === true,
     endpointSemantics, writeReachedWire: reachedWire, provenNoEffect, failureCode, failureCategory, reportedFailureCategory,
     outcomeState: reconcile ? "RECONCILE_REQUIRED" : (provenNoEffect ? "PROVEN_NO_EFFECT" : "TERMINAL"),
     ...(reconcile ? { reconciliationStartedAt: object(delivery.result).reconciliationStartedAt || delivery.writeCommitAt?.toISOString?.() || now.toISOString() } : {}),
     failedAt: now.toISOString(), retryable,
-  };
+  });
   const updated = await runDbTransaction(prisma, async (tx) => {
     await lockCleanupMutation(tx,delivery);
     await lockDeliveryExecutionAccess({ db: tx, delivery, userId: input.userId });
     const changed = await tx.automationDelivery.updateMany({
-      where: { id: delivery.id, status: { in: LEASED_STATUSES }, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision },
+      where: { id: delivery.id, status: delivery.status, writeCommitRevision: delivery.writeCommitRevision, claimedByDeviceId: input.deviceId, leaseTokenHash: hashToken(input.leaseToken), leaseRevision: input.leaseRevision },
       data: {
         status: nextStatus, failureCode, failureCategory, reportedFailureCategory, lastError, result, notBefore: nextNotBefore,
         finishedAt: retryable || reconcile ? null : now, claimedByDeviceId: null, claimedAt: null, claimUntil: null, leaseTokenHash: null,

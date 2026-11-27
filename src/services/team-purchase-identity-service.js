@@ -35,6 +35,8 @@ async function legacyAmbiguous(db,sale,root) {
 }
 async function adoptPage(db) {
   return require("./db-commit-kernel").runRootCommit(db,async({tx})=>{
+    const repair=await require("./financial-correlation-adoption-service").adoptPageInTransaction(tx);
+    if(repair)return repair;
     const [state]=await tx.$queryRawUnsafe('SELECT * FROM "MaintenanceLaneState" WHERE key=$1 AND "completedAt" IS NULL FOR UPDATE SKIP LOCKED',KEY);
     if(!state)return {complete:true,selected:0};
     if(state.cursor.phase==="ROOTS") {

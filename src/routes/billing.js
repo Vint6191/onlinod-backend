@@ -46,6 +46,9 @@ router.post("/nowpayments/ipn", async (req, res) => {
   try {
     const signature = String(req.get("x-nowpayments-sig") || "");
     const result = await handleNowPaymentsIpn({ payload: req.body || {}, signature });
+    if (result.code === "ORDER_NOT_FOUND") return res.status(503).json({
+      ok: false, code: "BILLING_ORDER_BINDING_PENDING", error: "The invoice is not available yet; retry this notification",
+    });
     return res.json({ ok: true, duplicate: result.duplicate === true });
   } catch (err) {
     if (Number(err?.status) >= 500) console.error("[billing/ipn] failed:", err);

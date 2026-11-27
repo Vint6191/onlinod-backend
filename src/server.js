@@ -247,6 +247,7 @@ app.use("/api/automation", authRequired, productBilling, automationControlRoutes
 // Narrow post-commit capability settlement must remain usable after logout or
 // member retirement; it cannot mint new external work.
 app.use("/api/programmatic-of-write-settlement", programmaticOfWriteSettlementRoutes);
+app.use("/api/automation-action-settlement", require("./routes/automation-action-settlement"));
 app.use("/api/telegram-delivery-settlement", require("./routes/telegram-delivery-settlement"));
 app.use("/api/programmatic-of-writes", authRequired, programmaticOfWriteRoutes);
 app.use("/api/server/content", authRequired, productBilling, contentStoreRoutes);

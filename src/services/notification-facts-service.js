@@ -511,6 +511,11 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
     if (!["creatorSubscriptionEvent", "creatorPostLike", "creatorPostComment"].includes(model) && row.externalTransactionId) tokens.push(`t:${row.externalTransactionId}`);
     for (const token of tokens) byToken.set(token, row);
   }
+  const reverse = ["creatorSale", "creatorTip"].includes(model)
+    ? await require("./financial-correlation-service").notificationCandidates({ db: tx, job,
+      facts: facts.filter(fact => !factIdentityTokens(fact).some(token => byToken.has(token))),
+      fanRecordIds, kind: model === "creatorSale" ? "SALE" : "TIP" })
+    : new Map();
   const seenInput = new Map();
   const creates = [];
   const updates = [];
@@ -533,7 +538,7 @@ async function persistFactGroup(tx, { model, facts, job, deviceId, fanRecordIds,
       if (row) existingMatches.set(row.id, row);
     }
     if (existingMatches.size > 1) { rejected += 1; continue; }
-    const row = existingMatches.size === 1 ? [...existingMatches.values()][0] : null;
+    const row = existingMatches.size === 1 ? [...existingMatches.values()][0] : reverse.get(fact.fingerprint) || null;
     if (transactionIdentityConflict(row, fact) || (model === "creatorSubscriptionEvent" && row && subscriptionIdentityConflict(row, fact))) {
       rejected += 1;
       continue;

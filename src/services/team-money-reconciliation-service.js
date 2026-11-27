@@ -5,6 +5,7 @@ const { runDbTransaction } = require("./db-transaction-service");
 const { serializableTxOptions } = require("../utils/prisma-transaction");
 
 const { teamFinancialStatus, publishTeamMoneyResult, financiallyActive } = require("./team-money-financial-state-service");
+const correlation = require("./financial-correlation-service");
 
 const RESOLVE_JOB_RETENTION_MS = 180 * 24 * 60 * 60 * 1000;
 const REFUND_STATUSES = new Set(["undo", "refunded", "refund", "chargeback", "reversed", "reversal"]);
@@ -224,7 +225,7 @@ async function ensureActiveMember(db, sale, sent) {
 }
 
 async function upsertResolveJob(db, { purchase, sale, proposed, sent, previousResult = null }) {
-  const messageId = clean(sale.messageId, 160);
+  const messageId = clean(correlation.reviewMessageId(sale), 160);
   if (!messageId || !db?.teamPpvResolveJob?.upsert) return null;
   const key = {
     agencyId_purchaseId_messageId: {
@@ -262,21 +263,24 @@ async function upsertResolveJob(db, { purchase, sale, proposed, sent, previousRe
   }
 
   if (proposed.status === "conflict") {
-    const candidates = mergeCandidates(candidateFromPurchase(purchase), candidateFromSent(sent));
+    const candidates = mergeCandidates(candidateFromPurchase(purchase), candidateFromSent(sent),
+      await correlation.reviewCandidates(db, sale, "SALE"));
     return db.teamPpvResolveJob.upsert({
       where: key,
       create: {
         ...base,
         status: "conflict",
         attempts: 0,
-        result: { ...previousResult, conflict: true, claimType: "ppv_attribution_conflict", source: "creator_sale_reconciliation", reason: proposed.basis, candidates },
+        result: { ...previousResult, conflict: true, claimType: "ppv_attribution_conflict", source: "creator_sale_reconciliation", reason: proposed.basis, candidates,
+          financialCorrelation: sale.financialCorrelation || null, exactMessageId: sale.messageId || null },
       },
       update: {
         amountCents: base.amountCents,
         currency: base.currency,
         purchasedAt: base.purchasedAt,
         status: "conflict",
-        result: { ...previousResult, conflict: true, claimType: "ppv_attribution_conflict", source: "creator_sale_reconciliation", reason: proposed.basis, candidates },
+        result: { ...previousResult, conflict: true, claimType: "ppv_attribution_conflict", source: "creator_sale_reconciliation", reason: proposed.basis, candidates,
+          financialCorrelation: sale.financialCorrelation || null, exactMessageId: sale.messageId || null },
       },
     });
   }
@@ -346,6 +350,30 @@ async function lockTipLedgerRow(db, row) {
   return rows?.[0] || null;
 }
 
+async function closeInactivePpvResolver(db, job, reason) {
+  if (!job || !["pending", "conflict"].includes(job.status)) return;
+  await db.teamPpvResolveJob.update({ where: { id: job.id }, data: { status: "expired", resolvedAt: new Date(),
+    result: { ...(job.result || {}), source: "creator_sale_reconciliation", financialClosureReason: reason } } });
+}
+
+async function retireNonMessagePurchase(db, sale) {
+  const financial = await loadFinancialTransaction(db, sale);
+  let existing = await findExistingPurchase(db, { sale, purchaseId: purchaseIdentity(sale),
+    financialTransactionId: financial?.id || null });
+  if (!existing) return { ok: true, skipped: true, reason: "NOT_MESSAGE_SALE" };
+  // Keep the same ResolveJob -> Purchase lock order as manager decisions.
+  const jobs = typeof db.$queryRawUnsafe === "function"
+    ? await db.$queryRawUnsafe('SELECT * FROM "TeamPpvResolveJob" WHERE "agencyId"=$1 AND "purchaseId"=$2 ORDER BY id FOR UPDATE',sale.agencyId,existing.purchaseId)
+    : [await lockPpvResolveJobByIdentity(db, { agencyId: sale.agencyId, purchaseId: existing.purchaseId, messageId: existing.messageId })].filter(Boolean);
+  existing = await lockPpvPurchaseRow(db, existing);
+  const purchase = existing.financialStatus === "superseded" ? existing : await db.teamPpvPurchaseLedger.update({
+    where: { id: existing.id }, data: { financialStatus: "superseded" },
+  });
+  for (const job of jobs) await closeInactivePpvResolver(db, job, "SOURCE_NOT_MESSAGE");
+  await publishTeamMoneyResult(db, purchase, "PPV_RECONCILED");
+  return { ok: true, purchase, financiallyInactive: true, reason: "NOT_MESSAGE_SALE" };
+}
+
 async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
   if (!saleId) return { ok: false, code: "SALE_ID_REQUIRED" };
   // Memory test clients used by Creator Analytics intentionally do not model
@@ -357,7 +385,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
   const sale = await loadSale(db, saleId);
   if (!sale) return { ok: false, code: "SALE_NOT_FOUND" };
   if (String(sale.saleType || "").toUpperCase() !== "MESSAGE") {
-    return { ok: true, skipped: true, reason: "NOT_MESSAGE_SALE" };
+    return retireNonMessagePurchase(db, sale);
   }
 
   const purchaseId = purchaseIdentity(sale);
@@ -388,7 +416,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
   let existing = await findExistingPurchase(db, {
     sale, purchaseId, fanExternalId, financialTransactionId: financialTransaction?.id || null,
   });
-  const lockedResolveJob = await lockPpvResolveJobByIdentity(db, {agencyId:sale.agencyId,purchaseId:existing?.purchaseId||purchaseId,messageId:clean(sale.messageId,160)});
+  const lockedResolveJob = await lockPpvResolveJobByIdentity(db, {agencyId:sale.agencyId,purchaseId:existing?.purchaseId||purchaseId,messageId:clean(correlation.reviewMessageId(sale),160)});
   if (existing) existing = await lockPpvPurchaseRow(db, existing);
   const correlationReview = require("./financial-correlation-service").requiresReview(sale, existing);
   if (correlationReview) proposed = { ...proposed, status: "conflict", basis: "FINANCIAL_IDENTITY_AMBIGUOUS" };
@@ -426,7 +454,9 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
       },
     });
     await require("./team-purchase-identity-service").bind(db,sale,existing);
-    if (correlationReview && sale.messageId && financiallyActive({financialStatus})) {
+    if (!financiallyActive({financialStatus})) {
+      await closeInactivePpvResolver(db, lockedResolveJob, "FINANCIAL_" + String(financialStatus).toUpperCase());
+    } else if (correlationReview && correlation.reviewMessageId(sale)) {
       await upsertResolveJob(db, { purchase: existing, sale, proposed, sent, previousResult: lockedResolveJob?.result });
     } else if (!correlationReview && lockedResolveJob?.status === "conflict"
       && lockedResolveJob.result?.reason === "FINANCIAL_IDENTITY_AMBIGUOUS" && existing.status === "attributed") {
@@ -492,13 +522,10 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
   }
 
   await require("./team-purchase-identity-service").bind(db,sale,purchase);
-  if (sale.messageId && financiallyActive({ financialStatus })) {
-    await upsertResolveJob(db, { purchase, sale, proposed, sent });
-  } else if (sale.messageId && isRefundStatus(financialStatus) && db?.teamPpvResolveJob?.updateMany) {
-    await db.teamPpvResolveJob.updateMany({
-      where: { agencyId: sale.agencyId, purchaseId: purchase.purchaseId, messageId: sale.messageId, status: { in: ["pending", "conflict"] } },
-      data: { status: "expired", resolvedAt: new Date(), result: { source: "creator_sale_reconciliation", reason: "FINANCIAL_UNDO" } },
-    });
+  if (correlation.reviewMessageId(sale) && financiallyActive({ financialStatus })) {
+    await upsertResolveJob(db, { purchase, sale, proposed, sent, previousResult: lockedResolveJob?.result });
+  } else if (!financiallyActive({financialStatus})) {
+    await closeInactivePpvResolver(db, lockedResolveJob, "FINANCIAL_" + String(financialStatus).toUpperCase());
   }
 
   await publishTeamMoneyResult(db, purchase, "PPV_RECONCILED");
@@ -708,15 +735,17 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
     proposed = { ...proposed, status: "conflict", basis: "EXACT_MESSAGE_OWNERSHIP_CONFLICT" };
   }
 
+  const candidates = mergeCandidates(recent.primary, await correlation.reviewCandidates(db, tip, "TIP"));
   const result = {
     claimType: "tip_attribution",
     attributionMode: "exact_message_first",
     attributionWindowMinutes: 10,
     softReviewWindowMinutes: 15,
-    candidates: recent.primary,
+    candidates,
     weakCandidates: recent.weak,
     autoReason: proposed.basis,
     exactMessageId: clean(tip.messageId, 160),
+    financialCorrelation: tip.financialCorrelation || null,
   };
   const history = Array.isArray(existing?.history) ? [...existing.history] : [];
   history.push({
@@ -752,7 +781,7 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
 
   const data = {
     ...sourceData, ...attributionData, attributionBasis: proposed.basis, compactedAt: null,
-    candidates: recent.primary, weakCandidates: recent.weak, result, history,
+    candidates, weakCandidates: recent.weak, result, history,
   };
   const attribution = existing
     ? await db.teamTipLedger.update({ where: { id: existing.id }, data })

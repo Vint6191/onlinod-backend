@@ -11,6 +11,7 @@ const { normalizeSelection, periodMonths, priceCreatorSelection } = require("./b
 const { activatePaidOrderEntitlements, refundOrderEntitlements, lockAgencyBillingMutation } = require("./billing-entitlement-service");
 const { creditPaidTopUp, refundTopUp } = require("./billing-wallet-service");
 const { valuePayment, cents: exactCents } = require("./billing-payment-value-service");
+const { discoveryAuthState } = require("./billing-discovery-auth-service");
 
 const PROVIDER = "NOWPAYMENTS";
 const PROCESSING_STATUSES = new Set(["waiting", "confirming", "confirmed", "sending"]);
@@ -95,6 +96,9 @@ function providerConfig() {
     sandboxActivationEnabled: sandbox && boolEnv("NOWPAYMENTS_SANDBOX_ACTIVATE", process.env.NODE_ENV !== "production"),
     timeoutMs,
     reconciliationToken: clean(process.env.NOWPAYMENTS_RECONCILIATION_TOKEN, 10000).replace(/^Bearer\s+/i, ""),
+    reconciliationEmail: clean(process.env.NOWPAYMENTS_RECONCILIATION_EMAIL, 320),
+    // Merchant passwords are case/space sensitive. Do not normalize secrets.
+    reconciliationPassword: String(process.env.NOWPAYMENTS_RECONCILIATION_PASSWORD || ""),
   };
 }
 
@@ -114,7 +118,7 @@ function publicProviderConfig() {
     testMode: cfg.sandbox,
     feePaidByUser: cfg.feePaidByUser,
     sandboxActivationEnabled: cfg.sandboxActivationEnabled,
-    paymentDiscoveryConfigured: Boolean(cfg.reconciliationToken),
+    paymentDiscoveryConfigured: discoveryAuthState(cfg).configured,
     liveAutoPricingEnabled: boolEnv("BILLING_LIVE_AUTO_PRICING_ENABLED", false),
     missingConfiguration: missing,
   };

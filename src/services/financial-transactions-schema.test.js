@@ -58,7 +58,7 @@ test("ingest keeps unavailable-user and unknown-type transactions as durable fac
   assert.match(publication, /financialCorrelation:correlation\.neighborhoodEvidence/);
   assert.doesNotMatch(publication, /messageId:\s*null/, "payout updates must not erase notification message evidence");
   const sourceWrite = publication.indexOf('await upsert(db,"CreatorFinancialTransaction"');
-  const projection = publication.indexOf("const prior=", sourceWrite);
+  const projection = publication.indexOf("await db[model].findMany", sourceWrite);
   assert.ok(sourceWrite >= 0 && projection > sourceWrite, "source transaction must be durable before business projection");
 });
 

@@ -829,7 +829,7 @@ router.post("/worker/:id/validate", async (req, res) => {
   catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_VALIDATE_FAILED"); }
 });
 router.post("/worker/:id/prepare-write", async (req, res) => {
-  try { const input = workerLeaseSchema.parse(req.body || {}); return res.json(await prepareWriteActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input })); }
+  try { const input = workerLeaseSchema.extend({ messageSettlementVersion: z.literal(1).optional() }).parse(req.body || {}); return res.json(await prepareWriteActionDelivery({ deliveryId: req.params.id, userId: req.auth.userId, ...input })); }
   catch (error) { if (error instanceof z.ZodError) return validationError(res, error); return serviceError(res, error, "ACTION_DELIVERY_PREPARE_WRITE_FAILED"); }
 });
 router.post("/worker/:id/complete", async (req, res) => {
