@@ -1,6 +1,8 @@
 "use strict";
 
 const { scopeSql, scopeParams } = require("./home-scope-repository");
+const { runDbTransaction } = require("./db-transaction-service");
+const { dbAuthorityNow } = require("./db-time-authority-service");
 
 // Count metadata is committed with the published head. Do not COUNT subscriber
 // rows or expose the partially built next generation while it is scanning.
@@ -37,6 +39,23 @@ async function readCreatorAudience({ db, creatorId, now }) {
     ${subscriberHeadJoins()} WHERE c.id=$1 AND c."deletedAt" IS NULL`,creatorId,now);
   return audienceFromRow(row);
 }
+// All audience surfaces use the same publication barrier. A state row exists
+// before the first source pass, so its default zero counts are not evidence of
+// an empty audience. Keep its control metadata and the head proof in one MVCC
+// snapshot; callers can join this read with rows/status in that same snapshot.
+async function readPublishedSubscriberDirectory({ db, agencyId, creatorId }) {
+  return runDbTransaction(db, async tx => {
+    const now = await dbAuthorityNow({ db: tx });
+    const [state, rows] = await Promise.all([
+      tx.subscriberDirectoryState.findFirst({ where: { agencyId, creatorId } }),
+      tx.$queryRawUnsafe(`SELECT sr.id AS published_run_id, ${subscriberHeadColumns("$3")}
+        FROM "CreatorAccount" c ${subscriberHeadJoins()}
+        WHERE c.id=$1 AND c."agencyId"=$2 AND c."deletedAt" IS NULL`, creatorId, agencyId, now),
+    ]);
+    const published = Boolean(rows[0]?.published_run_id);
+    return { state: state || null, published, fresh: published && rows[0].subscribers_stale === false };
+  }, { isolationLevel: "RepeatableRead" });
+}
 async function readHomeAudience(input) {
   if (!input.money) return {available:false,totalSubscribers:null,coverage:{totalCreators:0,reportingCreators:0,staleCreators:0},oldestPublishedAt:null};
   const [row]=await input.db.$queryRawUnsafe(`${scopeSql()} SELECT COUNT(*) AS total,
@@ -49,4 +68,4 @@ async function readHomeAudience(input) {
     oldestPublishedAt:complete?iso(row?.oldest):null};
 }
 
-module.exports={subscriberHeadJoins,subscriberHeadColumns,readCreatorAudience,readHomeAudience,audienceFromRow};
+module.exports={subscriberHeadJoins,subscriberHeadColumns,readCreatorAudience,readHomeAudience,audienceFromRow,readPublishedSubscriberDirectory};

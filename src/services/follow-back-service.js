@@ -2,6 +2,7 @@
 const { inheritSchedulerFailureCauses } = require("./scheduler-failure-cause");
 
 const prisma = require("../prisma");
+const { readPublishedSubscriberDirectory } = require("./published-subscriber-summary");
 const { readSubscriberConsumerPage } = require("./fan-consumer-cursor-service");
 const { assertAutomationDeliveryAdoption } = require("./automation-delivery-adoption-guard");
 const { nextAutomationWriteSlot } = require("./automation-pacing-service");
@@ -678,7 +679,7 @@ async function getAutomationOverview({ agencyId, creatorId }) {
     }),
     listActionDeliveries({ agencyId, creatorId, status: "FAILED", offset: 0, limit: 5 }),
     listActionDeliveries({ agencyId, creatorId, status: "COMPLETED", offset: 0, limit: 5 }),
-    prisma.subscriberDirectoryState.findFirst({ where: { agencyId, creatorId } }),
+    readPublishedSubscriberDirectory({ db: prisma, agencyId, creatorId }),
   ]);
   const statusCounts = Object.fromEntries(queueByStatus.map((row) => [row.status, row._count._all]));
   return {
@@ -692,7 +693,7 @@ async function getAutomationOverview({ agencyId, creatorId }) {
       running: (statusCounts.RUNNING || 0) + (statusCounts.COMMITTING || 0) + (statusCounts.RECONCILE_REQUIRED || 0),
       failed: statusCounts.FAILED || 0,
     },
-    subscriberDirectory: directory,
+    subscriberDirectory: directory.state ? { ...directory.state, published: directory.published } : null,
     followBack: followBack.metrics,
     recentErrors: recentErrorsPage.items,
     recentSuccess: recentSuccessPage.items,

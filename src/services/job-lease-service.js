@@ -45,6 +45,7 @@ const DEFAULT_LEASE_MS = 5 * 60 * 1000;
 const MIN_LEASE_MS = 30 * 1000;
 const MAX_LEASE_MS = 15 * 60 * 1000;
 const RETRY_BACKOFF_MS = 60 * 1000;
+const SUBSCRIBER_RATE_LIMIT_MAX_RETRY_MS = 15 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
 const CAMPAIGN_DIRECTORY_DISCOVERY_MAX_ACTIVE_CLAIMS = Math.max(1, Math.min(100, Number.parseInt(process.env.CAMPAIGN_DIRECTORY_DISCOVERY_MAX_ACTIVE_CLAIMS || "8", 10) || 8));
 const CAMPAIGN_DIRECTORY_DISCOVERY_CLAIM_LOCK_KEY = "campaign-directory-discovery-claim-admission-v1";
@@ -74,6 +75,18 @@ function clean(value, max = 500) {
 }
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function failedJobRetryDelay(job, result, attempts) {
+  const backoff = RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1));
+  const failure = object(object(result).failure);
+  // Subscriber source failures already carry the provider Retry-After through
+  // the worker's durable failure receipt. Preserve that wait at the job owner;
+  // using only exponential backoff can immediately repeat a rate-limited read.
+  // A malformed hint cannot change scheduling, and a valid hint cannot reset
+  // the finite attempt budget or postpone work without a bounded deadline.
+  if (job.jobKey !== "subscriber_directory_scan" || failure.status !== 429
+    || !Number.isSafeInteger(failure.retryAfterMs) || failure.retryAfterMs <= 0) return backoff;
+  return Math.max(backoff, Math.min(SUBSCRIBER_RATE_LIMIT_MAX_RETRY_MS, failure.retryAfterMs));
 }
 function campaignDirectoryDiscoveryJob(params) {
   const value = object(params);
@@ -1726,7 +1739,7 @@ async function failJob({ jobId, userId, deviceId, leaseToken, leaseRevision, wor
     claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: clean(workId, 200) || job.workId,
   } : {
     status: "SCHEDULED", attempts, lastError: errorText, result: result || null,
-    nextRunAt: new Date(now.getTime() + RETRY_BACKOFF_MS * (2 ** Math.max(0, attempts - 1))), claimedAt: null,
+    nextRunAt: new Date(now.getTime() + failedJobRetryDelay(job, result, attempts)), claimedAt: null,
     claimedByDeviceId: null, leaseUntil: null, leaseTokenHash: null, workId: null,
   };
     const updated = await tx.jobInstance.updateMany({

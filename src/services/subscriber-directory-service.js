@@ -1,6 +1,7 @@
 "use strict";
 const { performance } = require("node:perf_hooks");
 const { runDbTransaction } = require("./db-transaction-service");
+const { readPublishedSubscriberDirectory } = require("./published-subscriber-summary");
 
 
 const crypto = require("node:crypto");
@@ -9,6 +10,7 @@ const prisma = require("../prisma");
 const { projectFollowBackProjectionChunk, staleFollowBackProjectionFans } = require("./follow-back-service");
 const { projectFollowAutomationProjectionChunk, staleFollowAutomationProjectionFans } = require("./follow-automation-service");
 const { projectSubscriberDirectoryItems, readFanCurrent } = require("./fan-data-authority-service");
+const { exactFanId } = require("./fan-data-input");
 const { createPlannedJob, publishPlannedJobAvailable } = require("./job-planning-repository");
 const { consumeFanObservationToken } = require("./fan-observation-token-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
@@ -593,8 +595,18 @@ function normalizeChunkItem(item, {
   observationTimeBasis = "SERVER_SCAN_GENERATION_LEGACY",
 }) {
   const raw = object(item);
-  const fanId = clean(raw.fanId ?? raw.userId ?? raw.id, 120);
+  const fanId = exactFanId(raw.fanId ?? raw.userId ?? raw.id);
   if (!fanId) return null;
+  // Missing/malformed provider fields carry no observation. Explicit null keeps
+  // its existing FanData semantics (relationship clear, no identity overwrite)
+  // and must stay distinct from a value that failed parsing. String(object) must never become
+  // a newer canonical name, avatar or subscription type.
+  const textField = (value, max) => typeof value === "string" ? clean(value, max) : null;
+  const validDateField = value => (typeof value === "string" || value instanceof Date) && dateOrNull(value) !== null;
+  const dateField = value => validDateField(value) ? dateOrNull(value) : null;
+  const validCentsField = value => typeof value === "number" && integerOrNull(value, 0, 2_000_000_000) !== null;
+  const fieldObserved = (field, valid) => Object.prototype.hasOwnProperty.call(raw, field)
+    && (raw[field] === null || valid(raw[field]));
   const lastSeenIsNull = raw.lastSeenIsNull === true;
   const relationshipInputToCanonical = {
     canReceiveChatMessage: "canReceiveChatMessage",
@@ -610,12 +622,19 @@ function normalizeChunkItem(item, {
     subscribePriceCents: "subscribePriceCents",
     lastSeenAt: "lastSeenAt",
   };
+  const relationshipFieldValid = {
+    subscriptionType: value => typeof value === "string",
+    fanSubscriptionExpiresAt: validDateField,
+    creatorFollowExpiresAt: validDateField,
+    lastSeenAt: validDateField,
+    subscribePriceCents: validCentsField,
+  };
   const observedRelationshipFields = Object.entries(relationshipInputToCanonical)
-    .filter(([inputField]) => Object.prototype.hasOwnProperty.call(raw, inputField))
+    .filter(([inputField]) => fieldObserved(inputField, relationshipFieldValid[inputField] || (value => typeof value === "boolean")))
     .map(([, canonicalField]) => canonicalField);
   const observedIdentityFields = [
     ["username", "username"], ["name", "platformDisplayName"], ["avatarUrl", "avatarUrl"], ["headerUrl", "headerUrl"],
-  ].filter(([inputField]) => Object.prototype.hasOwnProperty.call(raw, inputField)).map(([, canonicalField]) => canonicalField);
+  ].filter(([inputField]) => fieldObserved(inputField, value => typeof value === "string")).map(([, canonicalField]) => canonicalField);
   const observedValueFields = [
     "totalSpentCents", "messagesSpentCents", "tipsSpentCents", "subscriptionsSpentCents", "postsSpentCents", "streamsSpentCents",
   ].filter((field) => Object.prototype.hasOwnProperty.call(raw, field));
@@ -630,10 +649,10 @@ function normalizeChunkItem(item, {
     agencyId,
     creatorId,
     fanId,
-    dialogId: clean(raw.dialogId ?? raw.withUserId ?? fanId, 120),
-    username: clean(raw.username, 160),
-    name: clean(raw.name ?? raw.displayName, 240),
-    avatarUrl: clean(raw.avatarUrl ?? raw.avatar, 1000),
+    dialogId: exactFanId(raw.dialogId ?? raw.withUserId ?? fanId),
+    username: textField(raw.username, 160),
+    name: textField(raw.name ?? raw.displayName, 240),
+    avatarUrl: textField(raw.avatarUrl ?? raw.avatar, 1000),
     totalSpentCents: integerOrNull(raw.totalSpentCents, 0, 2_000_000_000),
     messagesSpentCents: integerOrNull(raw.messagesSpentCents, 0, 2_000_000_000),
     tipsSpentCents: integerOrNull(raw.tipsSpentCents, 0, 2_000_000_000),
@@ -641,22 +660,22 @@ function normalizeChunkItem(item, {
     postsSpentCents: integerOrNull(raw.postsSpentCents, 0, 2_000_000_000),
     streamsSpentCents: integerOrNull(raw.streamsSpentCents, 0, 2_000_000_000),
     valueAvailability: valueAvailability(raw),
-    lastSeenAt: dateOrNull(raw.lastSeenAt),
+    lastSeenAt: dateField(raw.lastSeenAt),
     lastSeenIsNull,
     canReceiveChatMessage: boolOrNull(raw.canReceiveChatMessage),
     isActive: boolOrNull(raw.isActive),
     subscribedOn: boolOrNull(raw.subscribedOn),
     subscribedBy: boolOrNull(raw.subscribedBy),
-    subscriptionType: clean(raw.subscriptionType ?? raw.type, 80),
+    subscriptionType: textField(raw.subscriptionType ?? raw.type, 80),
     fanSubscribesToCreator: boolOrNull(raw.fanSubscribesToCreator),
     fanSubscriptionActive: boolOrNull(raw.fanSubscriptionActive),
-    fanSubscriptionExpiresAt: dateOrNull(raw.fanSubscriptionExpiresAt),
+    fanSubscriptionExpiresAt: dateField(raw.fanSubscriptionExpiresAt),
     creatorFollowsFan: boolOrNull(raw.creatorFollowsFan),
-    creatorFollowExpiresAt: dateOrNull(raw.creatorFollowExpiresAt),
+    creatorFollowExpiresAt: dateField(raw.creatorFollowExpiresAt),
     blocked: boolOrNull(raw.blocked),
     restricted: boolOrNull(raw.restricted),
     performer: boolOrNull(raw.performer),
-    subscribePriceCents: integerOrNull(raw.subscribePriceCents, 0, 2_000_000_000),
+    subscribePriceCents: validCentsField(raw.subscribePriceCents) ? raw.subscribePriceCents : null,
     metadata,
     observedAt,
   };
@@ -1179,8 +1198,12 @@ async function applySubscriberScanChunk({
   }
   const uniqueInputs = new Map();
   for (const item of itemsInput) {
-    const fanId = clean(object(item).fanId ?? object(item).userId ?? object(item).id, 120);
+    const raw = object(item);
+    const fanId = exactFanId(raw.fanId ?? raw.userId ?? raw.id);
     if (!fanId) throw Object.assign(new Error("SUBSCRIBER_SCAN_FAN_ID_REQUIRED"), { code: "SUBSCRIBER_SCAN_FAN_ID_REQUIRED" });
+    if (!exactFanId(raw.dialogId ?? raw.withUserId ?? fanId)) {
+      throw Object.assign(new Error("SUBSCRIBER_SCAN_DIALOG_ID_INVALID"), { code: "SUBSCRIBER_SCAN_DIALOG_ID_INVALID" });
+    }
     // Identical raw duplicates carry cursor distance but only one observation.
     // Conflicting facts in a single response have no provable chronology.
     if (uniqueInputs.has(fanId) && hashJson(uniqueInputs.get(fanId)) !== hashJson(item)) {
@@ -1457,6 +1480,10 @@ async function recordSubscriberScanFailure({ job, error, terminal = true, db = p
     await db.subscriberDirectoryState.updateMany({
       where: { creatorId: run.creatorId, OR: [{ lastJobId: null }, { lastJobId: job.id }] },
       data: { status: terminal ? "FAILED" : "SCANNING", lastJobId: job.id, lastError: errorText },
+    });
+    if (terminal) await signalSubscriberDirectoryMaintenance({
+      db, agencyId: run.agencyId, creatorId: run.creatorId,
+      kind: SUBSCRIBER_MAINTENANCE_KIND.RETENTION, dueAt: now, reason: "SOURCE_SCAN_STOPPED",
     });
   }
   return run;
@@ -1833,7 +1860,7 @@ async function cleanupSubscriberScanHistory({ db = prisma, agencyId = null, crea
   if (!creator) return { deletedRuns: 0, reason: "creator_missing" };
   let agency = clean(agencyId, 180);
   if (!agency) {
-    const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId: creator }, select: { agencyId: true } }).catch(() => null);
+    const state = await db.subscriberDirectoryState.findUnique({ where: { creatorId: creator }, select: { agencyId: true } });
     agency = clean(state?.agencyId, 180);
   }
   const batch = Math.max(1, Math.min(200, Number(maxRuns) || 50));
@@ -1842,65 +1869,88 @@ async function cleanupSubscriberScanHistory({ db = prisma, agencyId = null, crea
   const work = async (tx) => {
     const debt = await tx.subscriberScanRun.findFirst({ where: subscriberPublicationDebtWhere({ agencyId: agency || undefined, creatorId: creator }), select: { id: true } });
     if (debt) return { deletedRuns: 0, blockedByPublicationDebt: true, reason: "publication_debt" };
-    const state = await tx.subscriberDirectoryState.findUnique({ where: { creatorId: creator }, select: { currentRunId: true, previousRunId: true } }).catch(() => null);
+    const state = await tx.subscriberDirectoryState.findUnique({ where: { creatorId: creator }, select: { currentRunId: true, previousRunId: true, lastJobId: true } });
     const keepIds = new Set([state?.currentRunId, state?.previousRunId].filter(Boolean));
-    const old = await tx.subscriberScanRun.findMany({
-      where: {
-        creatorId: creator,
-        status: { in: ["SUPERSEDED", "FAILED"] },
-        publicationStatus: "COMPLETE",
-        ...(keepIds.size ? { id: { notIn: [...keepIds] } } : {}),
-      },
-      orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-      skip: retain,
-      take: batch,
-      select: { id: true },
-    });
-    if (old.length) await tx.subscriberScanRun.deleteMany({ where: { id: { in: old.map((item) => item.id) }, publicationStatus: "COMPLETE" } });
-    return { deletedRuns: old.length, hasMore: old.length === batch, blockedByPublicationDebt: false, reason: old.length ? "deleted" : "none_due" };
+    // A stopped source scan never reaches publication COMPLETE. Its bounded
+    // page receipts can age out after replacement just like superseded output.
+    // Preserve the latest control job (including its finite failure budget),
+    // current/previous published snapshots, and any still executable job. The
+    // indexed job probe is inside selection so protected rows cannot starve an
+    // older batch or make retention repeatedly select the same live work.
+    const old = await tx.$queryRawUnsafe(`
+      SELECT r."id" FROM "SubscriberScanRun" r
+      WHERE r."creatorId"=$1 AND ($2::text IS NULL OR r."agencyId"=$2)
+        AND r."status" IN ('SUPERSEDED','FAILED')
+        AND (r."publicationStatus"='COMPLETE'
+          OR (r."status"='FAILED' AND r."publicationStatus"='PENDING'
+            AND (r."hasMore" IS DISTINCT FROM false OR r."fanProjectionStatus" <> 'COMPLETE')))
+        AND NOT (r."id"=ANY($3::text[]))
+        AND ($4::text IS NULL OR r."jobId" IS DISTINCT FROM $4)
+        AND NOT EXISTS (SELECT 1 FROM "JobInstance" j WHERE j."id"=r."jobId"
+          AND (j."status" NOT IN ('DONE','FAILED','CANCELLED')
+            OR j."agencyId" IS DISTINCT FROM r."agencyId" OR j."creatorId" IS DISTINCT FROM r."creatorId"
+            OR j."jobKey" <> 'subscriber_directory_scan' OR j."params"->>'scanRunId' IS DISTINCT FROM r."id"))
+      ORDER BY r."createdAt" DESC,r."id" DESC OFFSET $5 LIMIT $6
+    `, creator, agency, [...keepIds], state?.lastJobId || null, retain, batch);
+    const eligiblePublication = { OR: [
+      { publicationStatus: "COMPLETE" },
+      { status: "FAILED", publicationStatus: "PENDING", OR: [
+        { hasMore: null }, { hasMore: true }, { fanProjectionStatus: { not: "COMPLETE" } },
+      ] },
+    ] };
+    const deleted = old.length ? await tx.subscriberScanRun.deleteMany({ where: {
+      creatorId: creator, ...(agency ? { agencyId: agency } : {}),
+      id: { in: old.map((item) => item.id) }, status: { in: ["SUPERSEDED", "FAILED"] }, ...eligiblePublication,
+    } }) : { count: 0 };
+    return { deletedRuns: deleted.count, hasMore: old.length === batch, blockedByPublicationDebt: false, reason: deleted.count ? "deleted" : "none_due" };
   };
   if (agency) return publicationTransaction(db, agency, creator, work, { maxWaitMs: 2_000, timeoutMs: 5_000, maintenanceSignal });
   return work(db);
 }
 
-async function getSubscriberDirectoryStatus({ agencyId, creatorId }) {
-  const [state, activeRun, latestRun, job] = await Promise.all([
-    prisma.subscriberDirectoryState.findFirst({ where: { agencyId, creatorId } }),
-    prisma.subscriberScanRun.findFirst({
-      where: { agencyId, creatorId, status: { in: ACTIVE_RUN_STATUSES } },
-      orderBy: { createdAt: "desc" },
-    }),
-    prisma.subscriberScanRun.findFirst({ where: { agencyId, creatorId }, orderBy: { createdAt: "desc" } }),
-    prisma.jobInstance.findFirst({
-      where: { agencyId, creatorId, jobKey: SUBSCRIBER_DIRECTORY_JOB_KEY },
-      orderBy: { createdAt: "desc" },
-    }),
-  ]);
-  const run = activeRun || latestRun;
-  return {
-    ok: true,
-    creatorId,
-    state: state || null,
-    run: runSummary(run),
-    job: job
-      ? {
-          id: job.id,
-          status: job.status,
-          progress: job.progress || null,
-          attempts: job.attempts,
-          nextRunAt: job.nextRunAt,
-          claimedAt: job.claimedAt,
-          leaseUntil: job.leaseUntil,
-          lastError: job.lastError,
-          updatedAt: job.updatedAt,
-        }
-      : null,
-    scanning: Boolean(activeRun || ["SCHEDULED", "CLAIMED", "PUBLISHING"].includes(job?.status)),
-    fresh: Boolean(state?.publishedAt && (!state.nextScanAt || state.nextScanAt > new Date())),
-  };
+async function getSubscriberDirectoryStatus({ agencyId, creatorId, db = prisma }) {
+  return runDbTransaction(db, async tx => {
+    const [directory, activeRun, latestRun, job] = await Promise.all([
+      readPublishedSubscriberDirectory({ db: tx, agencyId, creatorId }),
+      tx.subscriberScanRun.findFirst({
+        where: { agencyId, creatorId, status: { in: ACTIVE_RUN_STATUSES } },
+        orderBy: { createdAt: "desc" },
+      }),
+      tx.subscriberScanRun.findFirst({ where: { agencyId, creatorId }, orderBy: { createdAt: "desc" } }),
+      tx.jobInstance.findFirst({
+        where: { agencyId, creatorId, jobKey: SUBSCRIBER_DIRECTORY_JOB_KEY },
+        orderBy: { createdAt: "desc" },
+      }),
+    ]);
+    const { state, published, fresh } = directory;
+    const run = activeRun || latestRun;
+    return {
+      ok: true,
+      creatorId,
+      state: state || null,
+      run: runSummary(run),
+      job: job
+        ? {
+            id: job.id,
+            status: job.status,
+            progress: job.progress || null,
+            attempts: job.attempts,
+            nextRunAt: job.nextRunAt,
+            claimedAt: job.claimedAt,
+            leaseUntil: job.leaseUntil,
+            lastError: job.lastError,
+            updatedAt: job.updatedAt,
+          }
+        : null,
+      scanning: Boolean(activeRun || ["SCHEDULED", "CLAIMED", "PUBLISHING"].includes(job?.status)),
+      published,
+      fresh,
+    };
+  }, { isolationLevel: "RepeatableRead" });
 }
 
 async function listHiddenOnline({
+  db = prisma,
   agencyId,
   creatorId,
   status = "active",
@@ -1909,119 +1959,122 @@ async function listHiddenOnline({
   limit = 100,
   sort = "spent_desc",
 }) {
-  const state = await prisma.subscriberDirectoryState.findFirst({ where: { agencyId, creatorId } });
-  if (!state?.currentRunId)
-    return { ok: true, creatorId, items: [], count: 0, offset: 0, nextOffset: 0, hasMore: false, state: state || null };
+  return runDbTransaction(db, async tx => {
+    const { state, published } = await readPublishedSubscriberDirectory({ db: tx, agencyId, creatorId });
+    if (!published)
+      return { ok: true, creatorId, items: [], count: 0, offset: 0, nextOffset: 0, hasMore: false, state, published: false };
 
-  const normalizedStatus = ["active", "ignored", "blocked", "all"].includes(String(status || "active").toLowerCase())
-    ? String(status || "active").toLowerCase()
-    : "active";
-  const query = clean(search, 160) || "";
-  const take = integer(limit, 100, 1, MAX_HIDDEN_LIST_LIMIT);
-  const skip = integer(offset, 0, 0, 10_000_000);
-  const orderSql =
-    sort === "name"
-      ? `COALESCE(f."displayName", i."name", f."username", i."username", i."fanId") ASC, i."fanId" ASC`
-      : sort === "recent"
-        ? `i."observedAt" DESC, i."fanId" ASC`
-        : `(CASE WHEN v."availability" = 'AVAILABLE' THEN v."totalNetCents" ELSE NULL END) DESC NULLS LAST, i."observedAt" DESC, i."fanId" ASC`;
+    const normalizedStatus = ["active", "ignored", "blocked", "all"].includes(String(status || "active").toLowerCase())
+      ? String(status || "active").toLowerCase()
+      : "active";
+    const query = (clean(search, 160) || "").replace(/[\\%_]/g, "\\$&");
+    const take = integer(limit, 100, 1, MAX_HIDDEN_LIST_LIMIT);
+    const skip = integer(offset, 0, 0, 10_000_000);
+    const orderSql =
+      sort === "name"
+        ? `COALESCE(f."displayName", i."name", f."username", i."username", i."fanId") ASC, i."fanId" ASC`
+        : sort === "recent"
+          ? `i."observedAt" DESC, i."fanId" ASC`
+          : `(CASE WHEN v."availability" = 'AVAILABLE' THEN v."totalNetCents" ELSE NULL END) DESC NULLS LAST, i."observedAt" DESC, i."fanId" ASC`;
 
-  // Join the compact override table in SQL. Avoid loading every ignored/blocked
-  // fan into memory or producing a huge NOT IN list for large creator accounts.
-  // Filter/order the canonical fields before LIMIT/OFFSET, matching the current
-  // identity and value returned below. The snapshot owns cohort membership only.
-  const baseSql = `
-    FROM "SubscriberScanItem" i
-    LEFT JOIN "CreatorFan" f
-      ON f."agencyId" = $2 AND f."creatorId" = $3 AND f."onlyFansUserId" = i."fanId"
-    LEFT JOIN "CreatorFanValueCurrent" v
-      ON v."agencyId" = $2 AND v."creatorId" = $3 AND v."fanId" = f."id"
-    LEFT JOIN "HiddenOnlineUser" h
-      ON h."agencyId" = $2 AND h."creatorId" = $3 AND h."fanId" = i."fanId"
-    WHERE i."runId" = $1
-      AND i."lastSeenIsNull" = true
-      AND ($4 = 'all' OR (CASE WHEN h."status" IN ('ignored', 'blocked') THEN h."status" ELSE 'active' END) = $4)
-      AND (
-        $5 = '' OR i."fanId" ILIKE ('%' || $5 || '%')
-        OR COALESCE(f."username", i."username", '') ILIKE ('%' || $5 || '%')
-        OR COALESCE(f."displayName", i."name", '') ILIKE ('%' || $5 || '%')
-      )`;
+    // Join the compact override table in SQL. Avoid loading every ignored/blocked
+    // fan into memory or producing a huge NOT IN list for large creator accounts.
+    // Filter/order the canonical fields before LIMIT/OFFSET, matching the current
+    // identity and value returned below. The snapshot owns cohort membership only.
+    const baseSql = `
+      FROM "SubscriberScanItem" i
+      LEFT JOIN "CreatorFan" f
+        ON f."agencyId" = $2 AND f."creatorId" = $3 AND f."onlyFansUserId" = i."fanId"
+      LEFT JOIN "CreatorFanValueCurrent" v
+        ON v."agencyId" = $2 AND v."creatorId" = $3 AND v."fanId" = f."id"
+      LEFT JOIN "HiddenOnlineUser" h
+        ON h."agencyId" = $2 AND h."creatorId" = $3 AND h."fanId" = i."fanId"
+      WHERE i."runId" = $1
+        AND i."lastSeenIsNull" = true
+        AND ($4 = 'all' OR (CASE WHEN h."status" IN ('ignored', 'blocked') THEN h."status" ELSE 'active' END) = $4)
+        AND (
+          $5 = '' OR i."fanId" ILIKE ('%' || $5 || '%')
+          OR COALESCE(f."username", i."username", '') ILIKE ('%' || $5 || '%')
+          OR COALESCE(f."displayName", i."name", '') ILIKE ('%' || $5 || '%')
+        )`;
 
-  const [rows, countRows] = await Promise.all([
-    prisma.$queryRawUnsafe(
-      `
-      SELECT
-        i."fanId", i."dialogId", i."username", i."name", i."avatarUrl",
-        i."totalSpentCents", i."lastSeenAt", i."lastSeenIsNull",
-        i."canReceiveChatMessage", i."isActive", i."subscribedOn", i."subscribedBy",
-        i."subscriptionType", i."observedAt",
-        (CASE WHEN h."status" IN ('ignored', 'blocked') THEN h."status" ELSE 'active' END) AS "status",
-        (COALESCE(i."metadata", '{}'::jsonb) || COALESCE(h."metadata", '{}'::jsonb)) AS "metadata",
-        h."updatedAt" AS "statusUpdatedAt"
-      ${baseSql}
-      ORDER BY ${orderSql}
-      LIMIT $6 OFFSET $7
-    `,
-      state.currentRunId,
-      agencyId,
-      creatorId,
-      normalizedStatus,
-      query,
-      take,
-      skip
-    ),
-    prisma.$queryRawUnsafe(
-      `SELECT COUNT(*)::bigint AS count ${baseSql}`,
-      state.currentRunId,
-      agencyId,
-      creatorId,
-      normalizedStatus,
-      query
-    ),
-  ]);
+    const [rows, countRows] = await Promise.all([
+      tx.$queryRawUnsafe(
+        `
+        SELECT
+          i."fanId", i."dialogId", i."username", i."name", i."avatarUrl",
+          i."totalSpentCents", i."lastSeenAt", i."lastSeenIsNull",
+          i."canReceiveChatMessage", i."isActive", i."subscribedOn", i."subscribedBy",
+          i."subscriptionType", i."observedAt",
+          (CASE WHEN h."status" IN ('ignored', 'blocked') THEN h."status" ELSE 'active' END) AS "status",
+          (COALESCE(i."metadata", '{}'::jsonb) || COALESCE(h."metadata", '{}'::jsonb)) AS "metadata",
+          h."updatedAt" AS "statusUpdatedAt"
+        ${baseSql}
+        ORDER BY ${orderSql}
+        LIMIT $6 OFFSET $7
+      `,
+        state.currentRunId,
+        agencyId,
+        creatorId,
+        normalizedStatus,
+        query,
+        take,
+        skip
+      ),
+      tx.$queryRawUnsafe(
+        `SELECT COUNT(*)::bigint AS count ${baseSql}`,
+        state.currentRunId,
+        agencyId,
+        creatorId,
+        normalizedStatus,
+        query
+      ),
+    ]);
 
-  const count = asNumber(countRows?.[0]?.count);
-  const rawItems = Array.isArray(rows) ? rows : [];
-  const currentRows = await readFanCurrent(prisma, {
-    agencyId, creatorId, onlyFansUserIds: rawItems.map((item) => item.fanId).filter(Boolean),
-  });
-  const currentByFan = new Map(currentRows.map((row) => [String(row.onlyFansUserId), row]));
-  const items = rawItems.map((item) => {
-    const current = currentByFan.get(String(item.fanId || '')) || null;
+    const count = asNumber(countRows?.[0]?.count);
+    const rawItems = Array.isArray(rows) ? rows : [];
+    const currentRows = await readFanCurrent(tx, {
+      agencyId, creatorId, onlyFansUserIds: rawItems.map((item) => item.fanId).filter(Boolean),
+    });
+    const currentByFan = new Map(currentRows.map((row) => [String(row.onlyFansUserId), row]));
+    const items = rawItems.map((item) => {
+      const current = currentByFan.get(String(item.fanId || '')) || null;
+      return {
+        ...item,
+        platformIdentity: current?.platformIdentity || null,
+        relationship: current?.relationship || null,
+        value: current?.value || null,
+        username: current?.platformIdentity?.username ?? item.username ?? null,
+        name: current?.platformIdentity?.platformDisplayName ?? item.name ?? null,
+        avatarUrl: current?.platformIdentity?.avatarUrl ?? item.avatarUrl ?? null,
+        totalSpentCents: current?.value?.availability === 'AVAILABLE'
+          ? current.value.platformReportedTotalSpendCents
+          : null,
+        platformReportedTotalSpendCents: current?.value?.platformReportedTotalSpendCents ?? null,
+        valueAvailability: current?.value?.availability ?? 'NOT_FETCHED',
+        // Legacy flat aliases are response-time derivations of canonical current.
+        // lastSeenIsNull remains immutable snapshot/cohort evidence.
+        canReceiveChatMessage: current?.relationship?.canReceiveChatMessage ?? null,
+        isActive: current?.relationship?.fanSubscriptionActive ?? null,
+        subscribedOn: current?.relationship?.fanSubscribesToCreator ?? null,
+        subscribedBy: current?.relationship?.creatorFollowsFan ?? null,
+        subscriptionType: current?.relationship?.fanSubscriptionType ?? null,
+        lastSeenAt: current?.relationship?.lastSeenAt ?? null,
+        metadata: object(item.metadata),
+      };
+    });
     return {
-      ...item,
-      platformIdentity: current?.platformIdentity || null,
-      relationship: current?.relationship || null,
-      value: current?.value || null,
-      username: current?.platformIdentity?.username ?? item.username ?? null,
-      name: current?.platformIdentity?.platformDisplayName ?? item.name ?? null,
-      avatarUrl: current?.platformIdentity?.avatarUrl ?? item.avatarUrl ?? null,
-      totalSpentCents: current?.value?.availability === 'AVAILABLE'
-        ? current.value.platformReportedTotalSpendCents
-        : null,
-      platformReportedTotalSpendCents: current?.value?.platformReportedTotalSpendCents ?? null,
-      valueAvailability: current?.value?.availability ?? 'NOT_FETCHED',
-      // Legacy flat aliases are response-time derivations of canonical current.
-      // lastSeenIsNull remains immutable snapshot/cohort evidence.
-      canReceiveChatMessage: current?.relationship?.canReceiveChatMessage ?? null,
-      isActive: current?.relationship?.fanSubscriptionActive ?? null,
-      subscribedOn: current?.relationship?.fanSubscribesToCreator ?? null,
-      subscribedBy: current?.relationship?.creatorFollowsFan ?? null,
-      subscriptionType: current?.relationship?.fanSubscriptionType ?? null,
-      lastSeenAt: current?.relationship?.lastSeenAt ?? null,
-      metadata: object(item.metadata),
+      ok: true,
+      creatorId,
+      items,
+      count,
+      offset: skip,
+      nextOffset: skip + items.length,
+      hasMore: skip + items.length < count,
+      state,
+      published,
     };
-  });
-  return {
-    ok: true,
-    creatorId,
-    items,
-    count,
-    offset: skip,
-    nextOffset: skip + items.length,
-    hasMore: skip + items.length < count,
-    state,
-  };
+  }, { isolationLevel: "RepeatableRead" });
 }
 
 async function setHiddenOnlineStatus({ agencyId, creatorId, fanId, status, db = prisma }) {

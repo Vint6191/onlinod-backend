@@ -2,7 +2,6 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs"), path = require("node:path"), http = require("node:http");
 const { createRequire } = require("node:module");
-const { pathToFileURL } = require("node:url");
 
 // No Subscriber/FanData/candidate rows are seeded. Current services and workers
 // consume controlled physical OF responses through the normal HTTP/SQL path.
@@ -39,7 +38,8 @@ exports.runSubscriberDirectory = async function runSubscriberDirectory(f) {
     realtime: { ready: true, lastInboundFrameAt: new Date().toISOString() },
   }) };
   const creatorRuntime = { getVerifiedIdentity: creatorId => ({ platformUserId: creatorId === c ? "100001" : "100002" }),
-    getState: () => ({ attached: true, websocket: { connected: true }, lastEventAt: new Date().toISOString() }), on: () => () => {} };
+    getState: () => ({ attached: true, websocket: { connected: true }, lastEventAt: new Date().toISOString() }), on: () => () => {},
+    registerChangeAdapter: () => () => {} };
   const provider = { calls: [], profiles: new Map(), pageReads: new Map(), generation: 1, gate: null, messages: [], pageChangedAfterAck: false };
   const observedAt = new Date().toISOString();
   const names = ["Alice", "Bobby", "Cara", "Dora", "Evan"];
@@ -62,6 +62,7 @@ exports.runSubscriberDirectory = async function runSubscriberDirectory(f) {
         })]);
       }
       if (input.source === "backend.readonly.subscriber_directory") {
+        if (input.creatorId !== c) return success({ list: [], hasMore: false, total: 0 });
         const query = new URL(input.endpoint.path, "https://provider.fixture").searchParams;
         const offset = Number(query.get("offset") || 0), limit = Number(query.get("limit") || 100);
         const key = provider.generation + ":" + offset;
@@ -80,6 +81,12 @@ exports.runSubscriberDirectory = async function runSubscriberDirectory(f) {
       // sources explicitly empty without replacing their real job handlers.
       if (input.source.startsWith("backend.readonly.notifications_history.")) return success({ list: [], hasMore: false });
       if (input.source === "backend.readonly.fetch_earnings.chart") return success({ total: { total_amount: 0, total_count: 0 }, chart: [] });
+      if (input.source === "backend.readonly.financial_transactions.payouts") return success({ list: [], hasMore: false });
+      if (input.source.startsWith("backend.readonly.financial_transactions.chart.")) {
+        const category = input.source.split(".").at(-1);
+        return success({ [category === "messages" ? "chat_messages" : category]: { gross: 0, total: 0, count: 0 } });
+      }
+      if (input.source === "backend.readonly.fetch_campaigns.list") return success({ list: [], hasMore: false, total: 0 });
       throw Error("UNEXPECTED_PROVIDER_REQUEST " + JSON.stringify({ source: input.source, endpoint: input.endpoint }));
     },
   };
@@ -160,15 +167,16 @@ const client=new QueryClient({defaultOptions:{queries:{retry:false,gcTime:0}}});
 export function mount(input){window.nod={events:{onDesktopAuthorizationEvent:()=>()=>{},onCreatorRuntimeEvent:()=>()=>{}},rpc:{call:async(method,payload)=>{const r=await window.actualRpc(method,payload);if(r.error)throw Object.assign(Error(r.error.message),{code:r.error.code});return r.result;}}};acceptRendererAuthorizationProjection(input.projection);root=createRoot(document.getElementById('root'));root.render(<React.StrictMode><QueryClientProvider client={client}><AutomationWorkspace session={input.session} creators={input.creators} activeCreator={input.creators.find(creator=>creator.id===input.projection.activeCreatorId)}/></QueryClientProvider></React.StrictMode>);}
 export async function refresh(){await client.invalidateQueries({queryKey:['automation']});}`);
     await load("esbuild").build({ entryPoints: [fixture], outfile: script, bundle: true, platform: "browser", format: "iife", globalName: "ActualAutomation",
-      jsx: "automatic", nodePaths: [path.join(desktop, "node_modules")], loader: { ".css": "css", ".png": "dataurl", ".svg": "dataurl" }, define: { "process.env.NODE_ENV": '"development"' } });
+      jsx: "automatic", nodePaths: [path.join(desktop, "node_modules")], loader: { ".css": "css", ".png": "dataurl", ".svg": "dataurl", ".ttf": "dataurl", ".woff2": "dataurl" }, define: { "process.env.NODE_ENV": '"development"' } });
     server = http.createServer((req, res) => {
       const file = req.url === "/app.js" ? script : req.url === "/app.css" ? script.replace(/js$/, "css") : null;
       res.setHeader("Content-Type", file ? file.endsWith(".js") ? "application/javascript" : "text/css" : "text/html");
       res.end(file ? fs.readFileSync(file) : '<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/app.css"></head><body><div id="root"></div><script src="/app.js"></script></body></html>');
     });
     await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
-    const { default: chromium } = await import(pathToFileURL(runtime.resolve("@sparticuz/chromium")).href);
-    browser = await runtime("playwright").chromium.launch({ executablePath: process.env.ONLINOD_CHROMIUM_PATH || await chromium.executablePath(), args: chromium.args, headless: true });
+    browser = await runtime("playwright").chromium.launch({
+      ...(process.env.ONLINOD_CHROMIUM_PATH ? { executablePath: process.env.ONLINOD_CHROMIUM_PATH } : {}),
+      args: ["--no-sandbox", "--disable-dev-shm-usage"], headless: true });
     page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
     page.on("pageerror", error => errors.push(error.message));
     const origin = `http://127.0.0.1:${server.address().port}`;
@@ -182,9 +190,15 @@ export async function refresh(){await client.invalidateQueries({queryKey:['autom
     await page.evaluate(input => window.ActualAutomation.mount(input), { creators, session: { ...authStore.readSession(), permissions: { "automation.manage": true } },
       projection: { ok: true, authenticated: true, current: true, quarantineState: "CURRENT", localAuthorizationRevision: 1,
         session: { ...authStore.readSession(), accessToken: undefined, refreshToken: undefined }, creators, activeCreatorId: c } });
-    const go = name => page.getByRole("navigation", { name: "Automation sections" }).getByRole("button", { name, exact: true }).click();
-    const refresh = async () => { await page.getByRole("button", { name: "Refresh", exact: true }).click(); await page.evaluate(() => window.ActualAutomation.refresh()); };
-    const click = async name => { await page.getByRole("button", { name, exact: true }).first().click(); await until(async () => !(await page.getByRole("button", { name: "Refresh", exact: true }).isDisabled()), "UI command did not settle"); };
+    const go = name => page.getByRole("navigation", { name: "Разделы автоматизации" }).getByRole("button", { name, exact: true }).click();
+    const refresh = async () => { await page.getByRole("button", { name: "Обновить автоматизацию", exact: true }).click(); await page.evaluate(() => window.ActualAutomation.refresh()); };
+    const click = async name => { await page.getByRole("button", { name, exact: true }).first().click(); await until(async () => !(await page.getByRole("button", { name: "Обновить автоматизацию", exact: true }).isDisabled()), "UI command did not settle"); };
+    const scheduleScan = async () => {
+      const receipt = await service.scheduleScan({ creatorId: c, manual: true, force: true });
+      assert.ok(receipt.commandId, "Scan scheduling must return its committed command receipt");
+      commands.acknowledge(receipt.commandId);
+      return receipt;
+    };
     await go("Hidden Online");
     assert.equal((await hidden()).count, 0);
     const bumpSettings = { automatic: false, hiddenOnlineEnabled: true, onlineEnabled: false,
@@ -193,7 +207,7 @@ export async function refresh(){await client.invalidateQueries({queryKey:['autom
     pass("Empty actual React directory and real creator bootstrap; all subscriber facts begin absent");
 
     const held = hold(input => input.source === "backend.readonly.subscriber_directory" && Number(new URL(input.endpoint.path, "https://provider.fixture").searchParams.get("offset")) === 100);
-    await click("Full rescan");
+    await scheduleScan();
     coordinator.start(); worker.start();
     await Promise.race([held.entered, wait(40000).then(() => { throw Error("Subscriber worker did not reach page two: " + JSON.stringify(logs.slice(-8))); })]);
     const partial = await status(); results.partial = partial;
@@ -217,19 +231,20 @@ export async function refresh(){await client.invalidateQueries({queryKey:['autom
     await page.screenshot({ path: path.join(output, "published-directory.png"), fullPage: true });
     pass("225 fans / twelve actual provider windows; SQLite reopen resumes, publication exposes five hidden fans and current FanData");
 
-    const row = name => page.getByRole("row").filter({ has: page.getByText(name, { exact: true }) });
-    await row("Alice").getByRole("button", { name: "Ignore", exact: true }).click();
+    const openFan = name => page.getByRole("button", { name: "Открыть карточку " + name, exact: true }).click();
+    await openFan("Alice"); await page.getByRole("button", { name: "Игнорировать", exact: true }).click();
     await until(async () => (await hidden({ status: "ignored" })).count === 1, "Ignore did not commit");
-    await row("Bobby").getByRole("button", { name: "Block", exact: true }).click();
+    await openFan("Bobby"); page.once("dialog", dialog => dialog.accept());
+    await page.getByRole("button", { name: "Исключить", exact: true }).click();
     await until(async () => (await hidden({ status: "blocked" })).count === 1, "Block did not commit");
-    await page.getByLabel("Hidden fan status").selectOption("all");
+    await page.getByRole("group", { name: "Статус аудитории" }).getByRole("button", { name: "Все", exact: true }).click();
     pass("Actual UI ignore/block controls commit through the management journal and separate status filters");
 
     rows = rows.filter(row => row.id !== "20003").map(row => row.id === "20004" ? { ...row, lastSeen: observedAt } : row);
     const newcomer = { ...makeFan(225), name: "New hidden fan", lastSeen: null }; rows.push(newcomer); provider.profiles.set(newcomer.id, newcomer);
     provider.generation = 2; loseProgressAck = true; loseCompleteAck = true;
     const previousRun = results.initial.state.currentRunId;
-    await click("Full rescan"); worker.wakeAvailableJob();
+    await scheduleScan(); worker.wakeAvailableJob();
     await until(async () => { const value = await status(); return value.state?.currentRunId !== previousRun && value.state?.status === "READY" && value.job?.status === "DONE"; }, "Lost progress acknowledgement prevented the next snapshot", 55000);
     results.rescan = await status();
     assert.equal(provider.pageReads.get("2:0"), 1, "Committed subscriber page must not be read from the provider again after losing its ACK");
@@ -251,18 +266,20 @@ export async function refresh(){await client.invalidateQueries({queryKey:['autom
     assert.equal((await hidden({ sort: "spent_desc", limit: 1 })).items[0].fanId, "20001", "Canonical ordering precedes pagination");
     assert.equal((await hidden({ sort: "spent_desc", limit: 1, offset: 1 })).items[0].fanId, ordered.items[1].fanId);
     assert.equal((await hidden({ search: "Alice" })).count, 0, "Retired display names must not produce hidden matches");
-    await refresh(); await page.getByLabel("Search hidden fans").fill("Zoe current"); await page.getByText("Zoe current", { exact: true }).waitFor();
+    await refresh(); await page.getByLabel("Поиск фанов").fill("Zoe current"); await page.getByText("Zoe current", { exact: true }).waitFor();
     await page.screenshot({ path: path.join(output, "current-profile-search.png"), fullPage: true });
     pass("Actual point-refresh worker updates identity/spend; server search, ordering and React use the same canonical current data");
 
-    await row("Zoe current").getByRole("button", { name: "Restore", exact: true }).click();
+    await openFan("Zoe current"); await page.getByRole("button", { name: "Вернуть в аудиторию", exact: true }).click();
     await until(async () => (await hidden({ status: "active", search: "zoe_current" })).count === 1, "Restore did not commit");
-    await go("Bumps"); await click("New bump");
-    await page.getByLabel("Internal title", { exact: true }).fill("Directory acceptance");
-    await page.getByLabel("Message", { exact: true }).fill("Current directory message");
-    await page.getByLabel("Hidden online", { exact: true }).check();
-    await page.getByLabel("Minimum delay, seconds", { exact: true }).fill("0"); await page.getByLabel("Maximum delay, seconds", { exact: true }).fill("0");
-    await click("Save template"); await page.getByRole("heading", { name: "Directory acceptance", exact: true }).waitFor();
+    await go("Bumps"); await click("Новый бамп");
+    await page.getByLabel("Название для команды", { exact: true }).fill("Directory acceptance");
+    await page.getByLabel("Текст сообщения", { exact: true }).fill("Current directory message");
+    const hiddenToggle = page.getByRole("switch", { name: "Скрытый онлайн", exact: true });
+    if (await hiddenToggle.getAttribute("aria-checked") !== "true") await hiddenToggle.click();
+    await page.getByText("Время и повторы", { exact: true }).click();
+    await page.getByLabel("Задержка от, секунды", { exact: true }).fill("0"); await page.getByLabel("Задержка до, секунды", { exact: true }).fill("0");
+    await click("Сохранить бамп"); await page.getByRole("button", { name: "Directory acceptance", exact: true }).waitFor();
     await setControl("bumps", bumpSettings);
     const heldSend = hold(input => input.source.startsWith("automation.bump.send-preflight:"));
     // Use the newly discovered fan: the earlier identity test legitimately
@@ -288,13 +305,18 @@ export async function refresh(){await client.invalidateQueries({queryKey:['autom
     await go("Hidden Online"); await refresh();
     assert.equal((await status()).state.currentRunId, results.rescan.state.currentRunId);
     assert.equal((await hidden({ search: "zoe_current" })).count, 1);
-    await page.getByLabel("Automation model").selectOption(creatorIds[1]);
+    const chooseModel = async id => {
+      await page.getByRole("button", { name: "Выбрать модель", exact: true }).click();
+      const creator = creators.find(item => item.id === id);
+      await page.getByRole("option").filter({ has: page.getByText(creator.displayName || creator.username, { exact: true }) }).click();
+    };
+    await chooseModel(creatorIds[1]);
     assert.equal((await service.listHiddenOnline({ creatorId: creatorIds[1], status: "all" })).count, 0);
-    await page.getByLabel("Automation model").selectOption(c);
+    await chooseModel(c);
     pass("Backend SIGKILL preserves published directory, overrides/current profile; second model remains isolated");
 
     rows = []; provider.generation = 3; provider.pageChangedAfterAck = false;
-    await click("Full rescan"); worker.wakeAvailableJob();
+    await scheduleScan(); worker.wakeAvailableJob();
     await until(async () => { const value = await status(); return value.state?.status === "READY" && value.state?.totalCount === 0 && value.job?.status === "DONE"; }, "Explicit empty terminal source did not publish");
     results.empty = await status(); assert.equal(results.empty.state.disappearedCount, 225); assert.equal((await hidden()).count, 0);
     assert.equal((await current(["20001"]))[0]?.platformIdentity?.username, "zoe_current", "Source disappearance must not erase known current facts");

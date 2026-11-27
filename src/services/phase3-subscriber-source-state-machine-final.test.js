@@ -290,3 +290,43 @@ test("V2 filtered windows bind observation tokens to distinct fans while replay 
     assert.equal(tokens.length, 1);
   } finally { loaded.cleanup(); }
 });
+
+test("subscriber fan and dialog identities reject lossy coercion before token consumption or receipts", async () => {
+  const loaded = loadSubscriber();
+  try {
+    const invalidIds = [{ id: "fan" }, true, ["fan"], 1.5, -1, Number.MAX_SAFE_INTEGER + 1, "x".repeat(181), "bad\nidentity"];
+    for (const fanId of invalidIds) {
+      const db = memoryDb(makeRun());
+      let consumed = false;
+      await rejectCode(loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1",
+        chunkResult: page({ items: [item("valid"), item(fanId)], hasMore: false }),
+        consumeObservationToken: async () => { consumed = true; return { observedAt: new Date() }; },
+      }), "SUBSCRIBER_SCAN_FAN_ID_REQUIRED");
+      assert.equal(consumed, false);
+      assert.equal(db.pages.length, 0); assert.equal(db.items.length, 0); assert.equal(db.run.nextOffset, 0);
+    }
+    const db = memoryDb(makeRun());
+    await rejectCode(loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1",
+      chunkResult: page({ items: [item("valid", { dialogId: { id: "dialog" } })], hasMore: false }),
+    }), "SUBSCRIBER_SCAN_DIALOG_ID_INVALID");
+    assert.equal(db.pages.length, 0); assert.equal(db.items.length, 0);
+  } finally { loaded.cleanup(); }
+});
+
+test("subscriber intake keeps distinct canonical 180-character identities and exact token subjects", async () => {
+  const loaded = loadSubscriber();
+  try {
+    const db = memoryDb(makeRun());
+    const prefix = "f".repeat(179), ids = [prefix + "a", prefix + "b"];
+    let subjects;
+    const result = await loaded.service.applySubscriberScanChunk({ db, job: makeJob(), deviceId: "device-1",
+      chunkResult: page({ items: ids.map(id => item(id)), hasMore: false }),
+      consumeObservationToken: async input => { subjects = input.subjects; return { observedAt: new Date("2044-01-01T00:00:00.000Z") }; },
+    });
+    assert.deepEqual(subjects, ids);
+    assert.deepEqual(db.items.map(value => value.fanId), ids);
+    assert.deepEqual(db.items.map(value => value.dialogId), ids);
+    assert.equal(result.scannedCount, 2); assert.equal(result.hasMore, false);
+    assert.equal(db.run.fanProjectionStatus, "COMPLETE");
+  } finally { loaded.cleanup(); }
+});
