@@ -40,7 +40,7 @@ function stampUnstartedCollectionObservation(job, authorityNow) {
   // Advancing its end to claim time widens a valid hour into days and makes the
   // highest-priority scheduled job poison every subsequent worker claim. Keep
   // the command's immutable source interval; only the physical read starts now.
-  else if (params.moneyResolutionVersion === 1) return stamped;
+  else if (params.moneyResolutionVersion === 1 || params.billingRecoveryVersion === 1) return stamped;
   else {
     // The recovery episode/initial pass already owns its fixed upper bound.
     // Claim changes the physical observation start, never the intended period.

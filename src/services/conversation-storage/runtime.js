@@ -13,11 +13,13 @@ const { collectConversationGarbage } = require("./garbage-collection");
 const { financialPublicationPendingSql } = require("../earnings-coverage-service");
 let singleton;
 const READS = new Set([
+  "lookupReceipt",
   "getIdentity",
   "getState",
   "getStatus",
   "hasDialog",
   "getMessages",
+  "getMessagePage",
   "inspectScanFrontier",
   "findExistingMessageIds",
   "listResumableStates",
@@ -59,7 +61,7 @@ class ConversationRuntime {
     this.crm = new CrmRepository(db.crm, this.dialogs, {
       read: (ctx, onlyFansUserIds) => readFanCurrent(core, { agencyId: ctx.agencyId, creatorId: ctx.creatorId, onlyFansUserIds }),
       revision: async ctx => (await c.one(core,
-        'SELECT "lastRevision" FROM "CreatorEntityChangeHead" WHERE "agencyId"=$1 AND "creatorId"=$2',
+        'SELECT revision AS "lastRevision" FROM "CreatorFanIdentityHead" WHERE "agencyId"=$1 AND "creatorId"=$2',
         ctx.agencyId, ctx.creatorId))?.lastRevision || 0n,
     }, () => this.capacity("crm"));
     this.crm.models = this.models;
@@ -107,18 +109,23 @@ class ConversationRuntime {
     if (ctx.canViewMoney !== true) return { available: false, source: "financial-ledger", reason: "FORBIDDEN" };
     const row = await c.one(
       this.core,
-      `SELECT s.stage,s.snapshot,b."netCents",b.payments,p.generation,p."activeGeneration",p."creatorId",p."throughAt",
+      `SELECT s.stage,s.snapshot,s."publishedRevision",b."netCents",b.payments,p.generation,p."activeGeneration",p."creatorId",p."throughAt",
       ${financialPublicationPendingSql('s."creatorId"')} AS publishing,
       EXISTS(SELECT 1 FROM "FanLtvChange" x WHERE x."creatorId"=s."creatorId") dirty,
       EXISTS(SELECT 1 FROM "FanLtvReceipt" x WHERE x."creatorId"=s."creatorId" AND x."nextDueAt"<=now()) due
-      FROM "FanLtvState" s LEFT JOIN "FanLtvBalance" b ON b."creatorId"=s."creatorId" AND b."rangeKey"='all' AND b."fanId"=$3
+      FROM "FanLtvState" s LEFT JOIN LATERAL (
+        SELECT v."netCents",v.payments FROM "FanLtvPublishedBalance" v
+        WHERE v."creatorId"=s."creatorId" AND v."fanId"=$3 AND v.revision<=s."publishedRevision"
+        ORDER BY v.revision DESC LIMIT 1
+      ) b ON true
       LEFT JOIN "CreatorEarningsLedgerProof" p ON p."creatorId"=s."creatorId" AND p."agencyId"=s."agencyId"
       WHERE s."agencyId"=$1 AND s."creatorId"=$2`,
       ctx.agencyId,
       ctx.creatorId,
       fanId
     );
-    const available = Boolean(
+    const available = Boolean(row?.snapshot?.version === 1 && Number(row.publishedRevision) > 0);
+    const current = Boolean(
       row &&
         !row.publishing &&
         row.stage === "LIVE" &&
@@ -131,13 +138,14 @@ class ConversationRuntime {
     );
     return {
       available,
+      pending: available && !current,
       source: "financial-ledger",
       netCents: available ? Number(row.netCents || 0) : null,
       payments: available ? Number(row.payments || 0) : null,
       historyComplete:
         available && row.snapshot?.historyComplete === true && row.snapshot?.ranges?.all?.attributionComplete === true,
       asOf: row?.snapshot?.asOf || null,
-      reason: available ? null : "PROJECTION_UPDATING",
+      reason: current ? null : "PROJECTION_UPDATING",
     };
   }
   async automationState(ctx, input) {
@@ -200,6 +208,7 @@ class ConversationRuntime {
   async call(ctx, target, method, args, command) {
     c.check(Array.isArray(args) && args.length <= 6, "CONVERSATION_ARGUMENTS_INVALID", 400);
     const a = args[0] || {};
+    if (target === "receipts" && method === "lookupReceipt") return require("./receipt-lookup").lookupReceipt(this, ctx, a);
     if (target === "scope" && method === "getIdentity") return { platformCreatorId: ctx.platformCreatorId };
     const domain = ["crmProfiles", "campaignProfiles", "persona", "analysis"].includes(target) ? "crm" : "dialogs";
     await this.check(domain);
@@ -216,6 +225,7 @@ class ConversationRuntime {
           "getState",
           "getStatus",
           "getMessages",
+          "getMessagePage",
           "inspectScanFrontier",
           "findExistingMessageIds",
           "listResumableStates",

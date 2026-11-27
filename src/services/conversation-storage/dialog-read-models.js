@@ -42,7 +42,10 @@ class DialogReadModels {
       this.db,
       `SELECT s.epoch,s.collection_from,s.quota_bytes,s.used_bytes,s.status,t.state,t.stats,t.revision,t.rewrite_revision,t.upper_at,t.upper_id,
       coalesce((SELECT jsonb_agg(m.data ORDER BY m.created_at DESC,length(m.message_id) DESC,m.message_id DESC) FROM
-        (SELECT data,created_at,message_id FROM dialog_archive_message WHERE scope_id=s.scope_id AND dialog_id=$2 ORDER BY created_at DESC,length(message_id) DESC,message_id DESC LIMIT $3) m),'[]'::jsonb) recent
+        (SELECT (data - 'text') || jsonb_build_object('text',left(data->>'text',1024)) ||
+          CASE WHEN char_length(data->>'text')>1024 THEN jsonb_build_object('textView',jsonb_build_object(
+            'policy','crm-panel-preview-v1','truncated',true,'originalTextCodePoints',char_length(data->>'text'))) ELSE '{}'::jsonb END AS data,
+          created_at,message_id FROM dialog_archive_message WHERE scope_id=s.scope_id AND dialog_id=$2 ORDER BY created_at DESC,length(message_id) DESC,message_id DESC LIMIT $3) m),'[]'::jsonb) recent
       FROM dialog_archive_scope s LEFT JOIN dialog_archive_thread t ON t.scope_id=s.scope_id AND t.dialog_id=$2 WHERE s.scope_id=$1`,
       ctx.scopeId,
       input.dialogId,

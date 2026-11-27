@@ -101,6 +101,7 @@ async function lockDomain(db, job) {
 
 async function currentGeneration(db, job) {
   if (job.jobKey === "fetch_earnings") return true;
+  if(require("./billing-financial-recovery-service").targeted(job))return require("./billing-financial-recovery-service").assertCommand(job);
   if (require("./money-resolution-authority").targeted(job)) {
     // A main catch-up can advance independently. An obsolete targeted request
     // is a rejected authority, not a successfully superseded money publication.

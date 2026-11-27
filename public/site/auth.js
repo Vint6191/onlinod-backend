@@ -22,7 +22,9 @@
     EMAIL_NOT_VERIFIED: ['Confirm your email first, then reopen this invitation.', 'Сначала подтверди почту, затем снова открой приглашение.'],
     AUTH_EMAIL_UNAVAILABLE: ['Email delivery is temporarily unavailable. Contact support.', 'Отправка писем сейчас недоступна. Обратись в поддержку.'],
     USER_DISABLED: ['Account access has been disabled. Contact support.', 'Доступ к аккаунту отключён. Обратись в поддержку.'],
-    NO_AGENCY: ['No active agency membership. Contact the owner or support.', 'Нет доступа к действующему агентству. Обратись к владельцу или в поддержку.'],
+    NO_AGENCY: ['Accept an agency invitation to continue.', 'Прими приглашение агентства, чтобы продолжить.'],
+    AGENCY_SELECTION_REQUIRED: ['Choose an agency, then sign in.', 'Выбери агентство и войди.'],
+    AGENCY_MEMBERSHIP_UNAVAILABLE: ['Agency access changed. Sign in again.', 'Доступ к агентству изменился. Войди снова.'],
     TOKEN_INVALID: ['This link is invalid, expired or already used. Request a new one.', 'Ссылка недействительна, истекла или уже использована. Запроси новую.'],
     TOKEN_USED: ['This link has already been used. Try signing in.', 'Ссылка уже использована. Попробуй войти.'],
     CODE_INVALID: ['The code is invalid, expired or already used. If you confirmed on another device, sign in. Otherwise request another email.', 'Код неверный, истёк или уже использован. Если подтвердил почту на другом устройстве, войди. Иначе запроси новое письмо.'],
@@ -115,15 +117,33 @@
     const ownSequence = sequence, data = await api.session();
     if (sequence === ownSequence) { account = data; navigate('account'); }
   }
+  function showWorkspaces(workspaces) {
+    const field = $('#field-login-agency'), select = $('#login-agency');
+    select.replaceChildren();
+    const prompt = document.createElement('option'); prompt.value = ''; prompt.textContent = pair(['Choose an agency…', 'Выбери агентство…']); select.append(prompt);
+    for (const workspace of workspaces) { const option = document.createElement('option'); option.value = workspace.agencyId; option.textContent = workspace.name + ' · ' + workspace.role; select.append(option); }
+    field.hidden = false;
+    select.focus();
+  }
+  $('#login-email').addEventListener('input', () => { $('#field-login-agency').hidden = true; $('#login-agency').replaceChildren(); });
   async function signIn(credentials) {
+    if (!credentials.agencyId) {
+      const principal = await api.request('/api/web/auth/resolve-principal', { method: 'POST', body: credentials });
+      if (principal.selectionRequired) {
+        showWorkspaces(principal.workspaces);
+        throw Object.assign(new Error(), { code: 'AGENCY_SELECTION_REQUIRED' });
+      }
+      if (principal.selectedAgencyId) credentials.agencyId = principal.selectedAgencyId;
+    }
     try { return await api.request('/api/web/auth/login', { method: 'POST', body: credentials }); }
     catch (error) {
       if (error.code !== 'REQUEST_OUTCOME_UNKNOWN') throw error;
+      if (credentials.inviteToken) throw Object.assign(new Error(), { code: 'LOGIN_OUTCOME_UNKNOWN' });
       // Cookies can arrive even if the response body is lost. Only a read of
       // this browser's session can confirm access; never repeat the login POST.
       try {
         const current = await api.request('/api/web/auth/me', { timeout: 15000 });
-        if (current.user?.email?.trim().toLowerCase() === credentials.email.trim().toLowerCase()) return current;
+        if (current.user?.email?.trim().toLowerCase() === credentials.email.trim().toLowerCase() && (!credentials.agencyId || (current.activeAgencyId || current.agency?.id) === credentials.agencyId)) return current;
       } catch (_) {}
       throw Object.assign(new Error(), { code: 'LOGIN_OUTCOME_UNKNOWN' });
     }
@@ -169,7 +189,7 @@
     try {
       if (mode === 'login') {
         const email = $('#login-email').value;
-        const credentials = { email, password: $('#login-password').value, rememberDevice: $('#remember-device').checked };
+        const credentials = { email, password: $('#login-password').value, rememberDevice: $('#remember-device').checked, agencyId: $('#login-agency').value || undefined };
         try {
           const data = await api.sessionLock(() => signIn(credentials));
           if (sequence === ownSequence) account = data;
@@ -194,12 +214,11 @@
         const value = invitationValue(); if (!value) throw Object.assign(new Error(), { code: 'INVITE_NOT_FOUND' });
         const email = $('#invite-email').value;
         if (inviteExisting) {
-          const credentials = { email, password: $('#invite-password').value };
+          const credentials = { email, password: $('#invite-password').value, inviteToken: value };
           await api.sessionLock(async () => {
             const data = await signIn(credentials);
             if (sequence !== ownSequence) return;
             account = data;
-            await api.request('/api/web/invitations/claim', { method: 'POST', body: { token: value } });
           });
           if (sequence === ownSequence) { inviteToken = ''; result(['Invitation accepted.', 'Приглашение принято.'], ['Your agency membership is ready. Sign in to the desktop app to continue.', 'Доступ к агентству выдан. Войди в приложение, чтобы продолжить работу.']); }
         } else {

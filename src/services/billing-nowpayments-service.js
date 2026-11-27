@@ -10,6 +10,7 @@ const { readCommercialPolicy } = require("./billing-commercial-policy-service");
 const { normalizeSelection, periodMonths, priceCreatorSelection } = require("./billing-catalog-service");
 const { activatePaidOrderEntitlements, refundOrderEntitlements, lockAgencyBillingMutation } = require("./billing-entitlement-service");
 const { creditPaidTopUp, refundTopUp } = require("./billing-wallet-service");
+const { valuePayment, cents: exactCents } = require("./billing-payment-value-service");
 
 const PROVIDER = "NOWPAYMENTS";
 const PROCESSING_STATUSES = new Set(["waiting", "confirming", "confirmed", "sending"]);
@@ -93,6 +94,7 @@ function providerConfig() {
     feePaidByUser: boolEnv("NOWPAYMENTS_FEE_PAID_BY_USER", false),
     sandboxActivationEnabled: sandbox && boolEnv("NOWPAYMENTS_SANDBOX_ACTIVATE", process.env.NODE_ENV !== "production"),
     timeoutMs,
+    reconciliationToken: clean(process.env.NOWPAYMENTS_RECONCILIATION_TOKEN, 10000).replace(/^Bearer\s+/i, ""),
   };
 }
 
@@ -112,6 +114,7 @@ function publicProviderConfig() {
     testMode: cfg.sandbox,
     feePaidByUser: cfg.feePaidByUser,
     sandboxActivationEnabled: cfg.sandboxActivationEnabled,
+    paymentDiscoveryConfigured: Boolean(cfg.reconciliationToken),
     liveAutoPricingEnabled: boolEnv("BILLING_LIVE_AUTO_PRICING_ENABLED", false),
     missingConfiguration: missing,
   };
@@ -227,9 +230,8 @@ function validateProviderPaymentForOrder(order, payload, { requirePrice = false 
     throw err;
   }
   if (rawAmount !== null && rawAmount !== undefined && rawAmount !== "") {
-    const amount = Number(rawAmount);
-    const cents = Number.isFinite(amount) ? Math.round((amount + Number.EPSILON) * 100) : NaN;
-    if (!Number.isSafeInteger(cents) || cents !== Number(order.amountCents)) {
+    const amount = exactCents(rawAmount);
+    if (amount === null || amount <= 0n || (order.purpose !== "WALLET_TOP_UP" && amount !== BigInt(order.amountCents))) {
       const err = new Error("NOWPayments payment amount does not match the NOD billing order");
       err.code = "BILLING_PROVIDER_AMOUNT_MISMATCH";
       err.status = 409;
@@ -249,7 +251,7 @@ async function nowPaymentsRequest(pathname, options = {}) {
     throw err;
   }
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), cfg.timeoutMs);
+  const timer = setTimeout(() => controller.abort(), Math.max(250, Math.min(cfg.timeoutMs, Number(options.timeoutMs) || cfg.timeoutMs)));
   try {
     const response = await fetch(`${cfg.apiBase}${pathname}`, {
       method: options.method || "GET",
@@ -263,6 +265,7 @@ async function nowPaymentsRequest(pathname, options = {}) {
       signal: controller.signal,
     });
     const text = await response.text();
+    if (Buffer.byteLength(text) > 2_000_000) throw Object.assign(new Error("NOWPayments response is too large"), { code: "NOWPAYMENTS_RESPONSE_TOO_LARGE", status: 502 });
     let payload = null;
     try { payload = text ? JSON.parse(text) : {}; } catch (_) { payload = { raw: text.slice(0, 1000) }; }
     if (!response.ok) {
@@ -828,6 +831,7 @@ function paymentAttemptData(payload) {
     payinExtraId: clean(payload.payin_extra_id, 500) || null,
     purchaseId: clean(payload.purchase_id, 180) || null,
     actuallyPaid: decimalString(payload.actually_paid),
+    actuallyPaidAtFiat: decimalString(payload.actually_paid_at_fiat),
     outcomeAmount: decimalString(payload.outcome_amount ?? payload.outcome_price),
     outcomeCurrency: clean(payload.outcome_currency, 80) || null,
   };
@@ -851,14 +855,6 @@ function permanentBindingError(message, code) {
   return err;
 }
 
-async function activatePaidOrder(orderId, db = null) {
-  return activatePaidOrderEntitlements({
-    orderId,
-    sandboxActivationEnabled: providerConfig().sandboxActivationEnabled,
-    db: db || prisma,
-  });
-}
-
 async function handleRefundedOrder(order, db = null) {
   return refundOrderEntitlements({ order, db: db || prisma });
 }
@@ -870,18 +866,16 @@ async function applyProviderPayment(payload, { signature = null, signatureVerifi
   const providerOrderId = clean(payload.order_id, 180);
   const config = providerConfig();
   const eventKey = sha256(`${PROVIDER}\n${config.environment}\n${clean(signature, 256).toLowerCase()}\n${stableJson(payload)}`);
-  return runBillingProviderEvent({
-    db: client, provider: PROVIDER, eventKey, paymentId: providerPaymentId,
-    data: { providerStatus: providerStatus || null, signature: clean(signature, 256) || null, signatureVerified, payload },
-    replay: async (tx, event) => ({ duplicate: true, order: publicOrder(event.orderId
-      ? await tx.billingOrder.findUnique({ where: { id: event.orderId } }) : null) }),
-    project: async (tx, event) => {
+  const projectPayment = async (tx, event) => {
       let order = providerOrderId ? await tx.billingOrder.findUnique({ where: { id: providerOrderId } }) : null;
       const testMode = order ? order.testMode === true : config.sandbox;
-      const existingAttempt = providerPaymentId ? await tx.billingPaymentAttempt.findUnique({
+      let existingAttempt = providerPaymentId ? await tx.billingPaymentAttempt.findUnique({
         where: paymentAttemptUniqueWhere(providerPaymentId, testMode), include: { order: true },
       }) : null;
       if (!providerOrderId) order = existingAttempt?.order || null;
+      if (!order && !providerOrderId && clean(payload.invoice_id, 180)) order = await tx.billingOrder.findUnique({
+        where: { provider_testMode_providerInvoiceId: { provider: PROVIDER, testMode: config.sandbox, providerInvoiceId: clean(payload.invoice_id, 180) } },
+      });
       if (order && (config.sandbox || config.live) && (order.testMode === true) !== config.sandbox) {
         throw permanentBindingError("NOWPayments event environment does not match the billing order", "BILLING_PROVIDER_ENVIRONMENT_MISMATCH");
       }
@@ -896,12 +890,22 @@ async function applyProviderPayment(payload, { signature = null, signatureVerifi
       await lockAgencyBillingMutation(tx, order.agencyId);
       order = await tx.billingOrder.findUnique({ where: { id: order.id } });
       if (!order) return { duplicate: false, order: null, code: "ORDER_NOT_FOUND" };
-      const candidate = monotonicOrderStatus(order.status, providerStatus);
-      validateProviderPaymentForOrder(order, payload, { requirePrice: candidate === "PAID" });
-      let attempt = null;
       if (providerPaymentId) {
-        const attemptData = paymentAttemptData(payload);
-        attemptData.providerStatus = monotonicProviderStatus(existingAttempt?.providerStatus, providerStatus);
+        existingAttempt = await tx.billingPaymentAttempt.findUnique({ where: paymentAttemptUniqueWhere(providerPaymentId, order.testMode) });
+        if (existingAttempt && existingAttempt.orderId !== order.id) throw permanentBindingError("Payment belongs to another order", "BILLING_PROVIDER_PAYMENT_ORDER_MISMATCH");
+      }
+      const purpose = String(order.purpose || "SUBSCRIPTION");
+      const candidate = monotonicOrderStatus(order.status, providerStatus);
+      validateProviderPaymentForOrder(order, payload, { requirePrice: purpose === "WALLET_TOP_UP" ? ["finished", "partially_paid"].includes(providerStatus) : candidate === "PAID" });
+      let attempt = null, acceptedObservation = true;
+      if (providerPaymentId) {
+        const nextStatus = monotonicProviderStatus(existingAttempt?.providerStatus, providerStatus);
+        const incomingTime = payload.updated_at ? new Date(payload.updated_at) : null;
+        const observedAt = incomingTime && Number.isFinite(incomingTime.getTime()) ? incomingTime : null;
+        acceptedObservation = nextStatus === providerStatus && !(observedAt && existingAttempt?.providerUpdatedAt && observedAt < existingAttempt.providerUpdatedAt);
+        const attemptData = acceptedObservation ? Object.fromEntries(Object.entries(paymentAttemptData(payload)).filter(([, value]) => value !== null)) : {};
+        attemptData.providerStatus = nextStatus;
+        if (acceptedObservation && observedAt) attemptData.providerUpdatedAt = observedAt;
         attempt = await tx.billingPaymentAttempt.upsert({
           where: paymentAttemptUniqueWhere(providerPaymentId, order.testMode),
           create: { orderId: order.id, provider: PROVIDER, testMode: order.testMode === true, providerPaymentId, ...attemptData },
@@ -914,32 +918,74 @@ async function applyProviderPayment(payload, { signature = null, signatureVerifi
         }
       }
       await tx.billingProviderEvent.update({ where: { id: event.id }, data: { orderId: order.id, paymentAttemptId: attempt?.id || null } });
-      const advanced = await updateOrderStatusMonotonically(tx, order, providerStatus, payload);
-      order = advanced.order;
-      const candidateStatus = advanced.candidateStatus;
-      const purpose = String(order.purpose || "SUBSCRIPTION");
-      let activation = null;
-      if (candidateStatus === "PAID") {
-        activation = purpose === "WALLET_TOP_UP"
-          ? await creditPaidTopUp({ orderId: order.id, sandboxActivationEnabled: config.sandboxActivationEnabled, db: tx })
-          : await activatePaidOrderEntitlements({ orderId: order.id, sandboxActivationEnabled: config.sandboxActivationEnabled, db: tx });
-      }
-      if (candidateStatus === "REFUNDED") {
-        if (purpose === "WALLET_TOP_UP") await refundTopUp({ order, db: tx });
-        else await handleRefundedOrder(order, tx);
+      let activation = null, candidateStatus;
+      if (purpose === "WALLET_TOP_UP") {
+        if (attempt && acceptedObservation && ["finished", "partially_paid"].includes(attempt.providerStatus)) activation = await creditPaidTopUp({
+          orderId: order.id, paymentAttemptId: attempt.id, settlement: valuePayment(order, payload),
+          sandboxActivationEnabled: config.sandboxActivationEnabled, db: tx,
+        });
+        if (attempt?.providerStatus === "refunded") activation = await refundTopUp({ order, paymentAttemptId: attempt.id, db: tx });
+        order = await aggregateTopUpOrder(tx, order);
+        candidateStatus = order.status;
+      } else {
+        const advanced = await updateOrderStatusMonotonically(tx, order, providerStatus, payload);
+        order = advanced.order; candidateStatus = advanced.candidateStatus;
+        if (candidateStatus === "PAID") activation = await activatePaidOrderEntitlements({ orderId: order.id, sandboxActivationEnabled: config.sandboxActivationEnabled, db: tx });
+        if (candidateStatus === "REFUNDED") await handleRefundedOrder(order, tx);
       }
       if (candidateStatus === "PAID" || candidateStatus === "REFUNDED") {
         await audit({
           agencyId: order.agencyId, actorUserId: null,
           action: candidateStatus === "PAID" ? "billing.payment_finished" : "billing.payment_refunded",
           targetType: "billing_order", targetId: order.id,
-          metadata: { provider: PROVIDER, providerStatus, source, testMode: order.testMode, activated: activation?.activated === true },
+          metadata: { provider: PROVIDER, providerPaymentId, providerStatus, source, testMode: order.testMode, activated: activation?.activated === true || activation?.credited === true },
           db: tx, required: true,
         });
       }
       return { duplicate: false, order: publicOrder(await tx.billingOrder.findUnique({ where: { id: order.id } })), activation };
+  };
+  return runBillingProviderEvent({
+    db: client, provider: PROVIDER, eventKey, paymentId: providerPaymentId,
+    data: { providerStatus: providerStatus || null, signature: clean(signature, 256) || null, signatureVerified, payload },
+    replay: async (tx, event) => {
+      // A read-back can recover a settlement that was previously recorded with
+      // activation disabled. Keep the same payment/agency lock order and ledger
+      // identity; an ordinary duplicate IPN stays a cheap receipt read.
+      if (source === "RECONCILIATION") {
+        if (providerPaymentId) await require("./db-transaction-service").lockDbAdvisoryXact({ db: tx, key: `${PROVIDER}:billing-payment:${providerPaymentId}` });
+        return { ...await projectPayment(tx, event), duplicate: true };
+      }
+      return { duplicate: true, order: publicOrder(event.orderId ? await tx.billingOrder.findUnique({ where: { id: event.orderId } }) : null) };
     },
+    project: projectPayment,
   });
+}
+
+async function aggregateTopUpOrder(tx, order) {
+  const [counts] = await tx.$queryRawUnsafe(`SELECT
+    coalesce(sum("settledCents") FILTER (WHERE "reversedAt" IS NULL),0)::text AS net,
+    count(*) FILTER (WHERE "reversedAt" IS NOT NULL)::int AS refunded,
+    count(*) FILTER (WHERE "settlementState"='REVIEW_REQUIRED')::int AS review,
+    count(*) FILTER (WHERE "providerStatus" IN ('waiting','confirming','confirmed','sending'))::int AS pending,
+    count(*) FILTER (WHERE "providerStatus"='failed')::int AS failed,
+    count(*) FILTER (WHERE "providerStatus"='expired')::int AS expired,
+    count(*)::int AS total
+    FROM "BillingPaymentAttempt" WHERE "orderId"=$1`, order.id);
+  const net = BigInt(counts.net);
+  let status = order.status;
+  if (net > 0n) status = net >= BigInt(order.amountCents) ? "PAID" : "PARTIALLY_PAID";
+  else if (counts.pending || counts.review) status = "PROCESSING";
+  else if (counts.refunded) status = "REFUNDED";
+  else if (counts.failed) status = "FAILED";
+  else if (counts.expired) status = "EXPIRED";
+  else if (counts.total) status = "PROCESSING";
+  const legacyReview = order.reconciliationState?.reason === "LEGACY_PAYMENT_BINDING_REVIEW_REQUIRED";
+  return tx.billingOrder.update({ where: { id: order.id }, data: {
+    status, providerStatus: counts.review || legacyReview ? "SETTLEMENT_REVIEW_REQUIRED" : status.toLowerCase(),
+    paidAt: net > 0n ? order.paidAt || new Date() : order.paidAt,
+    reconciliationState: { ...(order.reconciliationState || {}), settledAmountCents: String(net),
+      reviewRequired: counts.review > 0 || legacyReview, paymentCount: counts.total },
+  } });
 }
 
 async function handleNowPaymentsIpn({ payload, signature, db = null }) {
@@ -965,7 +1011,7 @@ async function handleNowPaymentsIpn({ payload, signature, db = null }) {
   return applyProviderPayment(payload, { signature, signatureVerified: true, source: "IPN", db });
 }
 
-async function reconcileOrder({ agencyId, orderId, actorUserId = null, authorize = null, db = null }) {
+async function reconcileOrder({ agencyId, orderId, providerPaymentId = null, actorUserId = null, authorize = null, db = null }) {
   const client = db || prisma;
   const read = async (tx) => {
     await authorize?.(tx);
@@ -985,45 +1031,17 @@ async function reconcileOrder({ agencyId, orderId, actorUserId = null, authorize
     err.status = 409;
     throw err;
   }
-  const attempt = await client.billingPaymentAttempt.findFirst({ where: { orderId: order.id }, orderBy: { updatedAt: "desc" } });
-  if (!attempt?.providerPaymentId) {
-    const current = authorize ? await runTransaction(client, read) : order;
-    if (!current) throw Object.assign(new Error("Billing order not found"), { code: "BILLING_ORDER_NOT_FOUND", status: 404 });
-    return { order: publicOrder(current), reconciled: false, reason: "PAYMENT_NOT_DETECTED_YET" };
-  }
-  const payload = await nowPaymentsRequest(`/payment/${encodeURIComponent(attempt.providerPaymentId)}`);
-  const fetchedPaymentId = clean(payload?.payment_id ?? payload?.id, 180);
-  const fetchedOrderId = clean(payload?.order_id, 180);
-  if (fetchedPaymentId && fetchedPaymentId !== String(attempt.providerPaymentId)) {
-    throw permanentBindingError("NOWPayments reconciliation returned a different payment_id", "BILLING_PROVIDER_PAYMENT_ID_MISMATCH");
-  }
-  if (fetchedOrderId && fetchedOrderId !== String(order.id)) {
-    throw permanentBindingError("NOWPayments reconciliation returned a different order_id", "BILLING_PROVIDER_ORDER_MISMATCH");
-  }
-  const result = await applyProviderPayment(payload, { signature: null, signatureVerified: false, source: "RECONCILIATION", db: client });
-  let reconciledOrder = result.order || publicOrder(order);
-  let activation = result.activation || null;
-  if (reconciledOrder?.status === "PAID" && !reconciledOrder.activatedAt) {
-    // Recovery must preserve the order purpose. A wallet top-up is activated
-    // only by crediting its wallet ledger; sending it through the legacy
-    // subscription activator could claim activatedAt without crediting funds.
-    activation = String(reconciledOrder.purpose || order.purpose || "SUBSCRIPTION") === "WALLET_TOP_UP"
-      ? await creditPaidTopUp({ orderId: order.id, sandboxActivationEnabled: cfg.sandboxActivationEnabled, db: client })
-      : await activatePaidOrder(order.id, client);
-    reconciledOrder = publicOrder(await client.billingOrder.findUnique({ where: { id: order.id } })) || reconciledOrder;
-  }
-  // Provider settlement is an independent financial fact and can converge
-  // after a role change. Disclosure of its result is still current-owner only.
-  const recordReadback = (tx) => audit({ agencyId, actorUserId, action: "billing.payment_reconciled", targetType: "billing_order", targetId: order.id, metadata: { provider: PROVIDER, providerPaymentId: attempt.providerPaymentId, providerStatus: normalizeStatus(payload.payment_status || payload.status), activated: activation?.activated === true }, db: tx });
-  if (authorize) {
-    reconciledOrder = await runTransaction(client, async (tx) => {
-      const fresh = await read(tx);
-      if (!fresh) throw Object.assign(new Error("Billing order not found"), { code: "BILLING_ORDER_NOT_FOUND", status: 404 });
-      await recordReadback(tx);
-      return publicOrder(fresh);
-    });
-  } else await recordReadback(client);
-  return { order: reconciledOrder, reconciled: true, activation };
+  const outcome = await require("./billing-payment-discovery-service").reconcilePayments({
+    db: client, order, cfg, providerPaymentId, request: nowPaymentsRequest, apply: applyProviderPayment,
+  });
+  const readback = async tx => {
+    const fresh = await read(tx);
+    if (!fresh) throw Object.assign(new Error("Billing order not found"), { code: "BILLING_ORDER_NOT_FOUND", status: 404 });
+    await audit({ agencyId, actorUserId, action: "billing.payment_reconciled", targetType: "billing_order", targetId: order.id,
+      metadata: { provider: PROVIDER, checked: outcome.checked, reason: outcome.reason }, db: tx });
+    return publicOrder(fresh);
+  };
+  return { order: authorize ? await runTransaction(client, readback) : await readback(client), ...outcome };
 }
 
 function publicOrder(row) {
@@ -1055,6 +1073,8 @@ function publicOrder(row) {
     providerInvoiceId: row.providerInvoiceId || null,
     providerInvoiceUrl: row.providerInvoiceUrl || null,
     providerStatus: row.providerStatus || null,
+    settledAmountCents: row.reconciliationState?.settledAmountCents ?? null,
+    settlementReviewRequired: row.reconciliationState?.reviewRequired === true,
     testMode: row.testMode === true,
     paidAt: row.paidAt ? new Date(row.paidAt).toISOString() : null,
     activatedAt: row.activatedAt ? new Date(row.activatedAt).toISOString() : null,

@@ -1,5 +1,6 @@
 "use strict";
 const { z } = require("zod");
+const {blockSummary,contentSnapshot}=require("./message-library-read-service");
 const { digest } = require("./team-command-contract");
 const { runRootCommit } = require("./db-commit-kernel");
 const {
@@ -128,7 +129,10 @@ async function executeMessageLibraryCommand({
                   orderBy: [{ order: "asc" }, { id: "asc" }],
                   take: 501,
                 });
-                if (blocks.length <= 500) value = projectScript({ ...row, blocks });
+                if (blocks.length <= 500) {
+                  const summary=(await blockSummary(tx,[row.id])).get(row.id);
+                  value=projectScript({...row,blocks,...summary,contentState:'complete',contentSnapshot:contentSnapshot(row,summary)});
+                }
               } else value = projectScript(row);
             }
           }

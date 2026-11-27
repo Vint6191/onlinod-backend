@@ -11,7 +11,6 @@ const { authRequired } = require("../middleware/auth");
 const { sha256 } = require("../utils/crypto");
 const {
   publicUser,
-  getPrimaryMembership,
   issueEmailVerification,
   enqueueInitialEmailVerification,
   issuePasswordReset,
@@ -31,6 +30,7 @@ const { acquireAuthorizationUserLock } = require("../services/authorization-sess
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { newPasswordSchema } = require("../services/account-password-policy");
 const { principalDeviceContext } = require("../services/principal-device-context-service");
+const { acceptInvitationForUser, invitationAgencyForAccount } = require("../services/invitation-acceptance-service");
 
 const webTransport = require("../services/website-session-transport");
 const { requireAuthMail } = require("../services/website-config-service");
@@ -48,6 +48,8 @@ const registerSchema = z.object({
 
 const loginSchema = z.object({
   expectedUserId: z.string().min(1).max(180).optional(),
+  agencyId: z.string().min(1).max(180).optional(),
+  inviteToken: z.string().min(10).max(512).optional(),
   email: z.string().email(),
   password: z.string().min(1),
   rememberDevice: z.boolean().optional(),
@@ -453,27 +455,48 @@ router.post("/resend-verification", async (req, res) => {
   }
 });
 
-async function authenticateLogin(input) {
+async function authenticateAccount(input) {
   const fail = (status, code, message) => { throw Object.assign(new Error(message), { status, code }); };
   const user = await prisma.user.findUnique({ where: { email: input.email.toLowerCase().trim() } });
   if (!user) fail(401, "INVALID_CREDENTIALS", "Invalid email or password");
   if (user.disabledAt) fail(403, "USER_DISABLED", "User is disabled");
   if (!await bcrypt.compare(input.password, user.passwordHash)) fail(401, "INVALID_CREDENTIALS", "Invalid email or password");
   if (!user.emailVerifiedAt) fail(403, "EMAIL_NOT_VERIFIED", "Email is not verified");
-  const membership = await getPrimaryMembership(user.id);
-  if (!membership) fail(401, "NO_AGENCY", "User has no agency");
-  return { user, membership };
+  if (input.expectedUserId && input.expectedUserId !== user.id) fail(409, "LOGIN_PRINCIPAL_CHANGED", "The account changed during sign-in");
+  return user;
+}
+async function accountWorkspaceSelection(user, input, { acceptInvite = false } = {}) {
+  let selectedAgencyId = input.agencyId || null;
+  if (input.inviteToken) {
+    const invitedAgency = await invitationAgencyForAccount({ token: input.inviteToken, user });
+    if (selectedAgencyId && selectedAgencyId !== invitedAgency.id) throw Object.assign(new Error("The invitation belongs to another agency"), { status: 409, code: "INVITE_AGENCY_MISMATCH" });
+    const agency = acceptInvite
+      ? (await acceptInvitationForUser({ token: input.inviteToken, userId: user.id, verifiedUser: user, expectedAgencyId: invitedAgency.id, allowClaimedReplay: true })).agency
+      : invitedAgency;
+    selectedAgencyId = agency.id;
+  }
+  const memberships = await prisma.agencyMember.findMany({
+    where: { userId: user.id, deletedAt: null, deactivatedAt: null, agency: { deletedAt: null } },
+    include: { agency: true }, orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+  });
+  const workspaces = memberships.map(member => ({ agencyId: member.agencyId, memberId: member.id, name: member.agency.name, role: member.role }));
+  const membership = selectedAgencyId ? memberships.find(member => member.agencyId === selectedAgencyId) : memberships.length === 1 ? memberships[0] : null;
+  if (selectedAgencyId && !membership && !(input.inviteToken && !acceptInvite)) throw Object.assign(new Error("This agency is not available to your account"), { status: 403, code: "AGENCY_MEMBERSHIP_UNAVAILABLE" });
+  return { membership, workspaces, selectedAgencyId: selectedAgencyId || membership?.agencyId || null };
 }
 
 // Resolve immutable identity before the client chooses its logical device and
 // before a device-bound JWT exists. Credentials are verified again at login;
 // expectedUserId prevents an intervening email reassignment from changing it.
-if (!web) router.post("/resolve-principal", require("../middleware/login-admission").loginAdmission({ db: prisma, surface: "member" }), async (req, res) => {
+router.post("/resolve-principal", require("../middleware/login-admission").loginAdmission({ db: prisma, surface: "member" }), async (req, res) => {
   try {
-    const input = loginSchema.pick({ email: true, password: true, deviceId: true }).parse(req.body);
-    const { user, membership } = await authenticateLogin(input);
-    const legacyDevice = await principalDeviceContext({ db: prisma, userId: user.id, agencyId: membership.agencyId, deviceId: input.deviceId });
-    return res.json({ ok: true, userId: user.id, legacyDevice });
+    const input = loginSchema.pick({ email: true, password: true, deviceId: true, agencyId: true, inviteToken: true }).parse(req.body);
+    const user = await authenticateAccount(input);
+    const selection = await accountWorkspaceSelection(user, input);
+    const legacyDevice = selection.selectedAgencyId
+      ? await principalDeviceContext({ db: prisma, userId: user.id, agencyId: selection.selectedAgencyId, deviceId: input.deviceId }) : null;
+    return res.json({ ok: true, userId: user.id, legacyDevice, workspaces: selection.workspaces,
+      selectedAgencyId: selection.selectedAgencyId, selectionRequired: !selection.selectedAgencyId && selection.workspaces.length > 1 });
   } catch (error) {
     if (error?.issues) return validationError(res, error);
     const status = Number(error?.status) || 500;
@@ -485,7 +508,10 @@ if (!web) router.post("/resolve-principal", require("../middleware/login-admissi
 router.post("/login", require("../middleware/login-admission").loginAdmission({ db: prisma, surface: "member" }), async (req, res) => {
   try {
     const input = loginSchema.parse(req.body);
-    const { user, membership } = await authenticateLogin(input);
+    const user = await authenticateAccount(input);
+    const { membership, workspaces } = await accountWorkspaceSelection(user, input, { acceptInvite: true });
+    if (!membership) return res.status(409).json({ ok: false, code: workspaces.length ? "AGENCY_SELECTION_REQUIRED" : "NO_AGENCY",
+      error: workspaces.length ? "Choose an agency to sign in" : "Accept an agency invitation to continue", workspaces });
     if (input.expectedUserId && input.expectedUserId !== user.id) {
       return res.status(409).json({ ok: false, code: "LOGIN_PRINCIPAL_CHANGED", error: "The account changed during sign-in. Try signing in again." });
     }

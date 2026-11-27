@@ -702,11 +702,11 @@ class CrmAnalysisService {
   async beginReplies(ctx, scope, token) {
     const fanId = this.scope(ctx, scope);
     c.commandId(token);
-    const identityRevision = await this.crm.identityRevision(ctx);
+    const identityRevision = await this.crm.identityToken(ctx, fanId);
     const history = await this.history.beginInput(ctx, scope),
       profile = await this.crm.getProfile(ctx, fanId),
       persona = await this.crm.scope(ctx);
-    const messages = replyMessages((await this.history.getMessages(ctx, { dialogId: fanId, limit: 40, order: "desc" }))
+    const messages = replyMessages((await this.history.getReplyMessages(ctx, { dialogId: fanId, upper: history.upper }))
       .filter(
         (m) =>
           history.upper &&
@@ -723,6 +723,7 @@ class CrmAnalysisService {
         mediaIds: m.mediaIds,
         price: m.price,
         opened: m.opened === 1,
+        ...(m.textView ? { textView: m.textView } : {}),
       })));
     c.check(messages.length, "CRM_NO_MESSAGES");
     const promptProfile = boundedProjection({ boundaries: profile.boundaries, negations: profile.negations,
@@ -739,7 +740,7 @@ class CrmAnalysisService {
     const descriptor = { ...history, replyContext: { policy: REPLY_PROJECTION,
       messagesHash: c.hash(messages), fanProfileHash: c.hash(promptProfile), creatorPersonaHash: c.hash(creatorPersona),
       profileRevision: profile.revision, personaRevision: Number(persona.persona_revision), identityRevision: String(identityRevision) } };
-    c.check(await this.crm.identityRevision(ctx) === identityRevision, "CRM_REPLY_PROFILE_CHANGED");
+    c.check(await this.crm.identityToken(ctx, fanId) === identityRevision, "CRM_REPLY_PROFILE_CHANGED");
     const currentRevision = await this.history.validateInput(ctx, history);
     c.check(currentRevision === history.revision, "CRM_REPLY_HISTORY_CHANGED");
     await c.transaction(this.db, async (tx) => {
@@ -839,7 +840,7 @@ class CrmAnalysisService {
     }
     const revision = await this.history.validateInput(ctx, saved.input);
     c.check(revision === saved.input.revision, "CRM_REPLY_HISTORY_CHANGED");
-    c.check(String(await this.crm.identityRevision(ctx)) === saved.input?.replyContext?.identityRevision, "CRM_REPLY_PROFILE_CHANGED");
+    c.check(await this.crm.identityToken(ctx, fanId) === saved.input?.replyContext?.identityRevision, "CRM_REPLY_PROFILE_CHANGED");
     await c.transaction(this.db, async (tx) => {
       await c.one(tx, "SELECT scope_id FROM crm_scope WHERE scope_id=$1 FOR UPDATE", ctx.scopeId);
       const p = await c.one(

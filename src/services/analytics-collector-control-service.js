@@ -223,6 +223,10 @@ async function acceptFinancialGeneration({ db = prisma, job, deviceId = null } =
   const command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL);
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: job.creatorId, work: async (tx) => {
     const existing = await tx.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
+    if(require("./billing-financial-recovery-service").targeted(job)) {
+      require("./billing-financial-recovery-service").assertCommand(job);
+      return {accepted:true,stale:false,targeted:true,command,state:existing};
+    }
     if (require("./money-resolution-authority").targeted(job)) {
       await require("./money-resolution-authority").assertMoneyResolutionAuthority(tx, job);
       return { accepted: true, stale: false, targeted: true, command, state: existing };
@@ -295,6 +299,7 @@ async function completeFinancialCollection({ db = prisma, job, deviceId = null, 
 }
 
 async function recordFinancialCollectionFailure({ db = prisma, job, error, terminal = true, retryAfterAt = null } = {}) {
+  if(require("./billing-financial-recovery-service").targeted(job))return null;
   let command;
   try { command = collectionCommand(job, COLLECTOR_TYPES.FINANCIAL); } catch { return null; }
   return withCollectorStateLock({ db, type: COLLECTOR_TYPES.FINANCIAL, creatorId: job.creatorId, work: async (tx) => {

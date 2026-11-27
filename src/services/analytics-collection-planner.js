@@ -508,6 +508,12 @@ async function ensureAnalyticsWindowFreshness({
   const to = utcDay(endDay);
   const today = utcDay(currentNow);
   if (!currentNow || !from || !to || from > to || to > today) throw new Error("ANALYTICS_PLANNER_WINDOW_INVALID");
+  if(String(reason).toUpperCase()==="BILLING") {
+    const recovery=await require("./billing-financial-recovery-service").plan({db,agencyId,creatorId,now:currentNow});
+    return {ok:true,displayRangeKey,startDay:new Date(recovery.scanFrom),endDay:new Date(recovery.scanTo),
+      created:Number(recovery.created),reused:Number(!recovery.created),jobs:[recovery.job],windows:1,
+      dueDays:0,deferredDays:0,staleDays:0,fresh:false};
+  }
   const days = eachDay(from, to);
   const rows = Array.isArray(coverageRows)
     ? coverageRows
@@ -524,9 +530,7 @@ async function ensureAnalyticsWindowFreshness({
   // A user refresh requests a new verification of the selected period, even
   // when the historical cache is within its ordinary background freshness TTL.
   const normalizedReason = String(reason).toUpperCase();
-  const billingLedger = normalizedReason === "BILLING" && typeof db.$queryRawUnsafe === "function"
-    ? await require("./earnings-live-read-sql").readLiveEarningsCoverage(db,creatorId,currentNow) : null;
-  if(normalizedReason === "HOME_INTERACTIVE_REFRESH" || billingLedger) {
+  if(normalizedReason === "HOME_INTERACTIVE_REFRESH") {
     // Home and the model's manual financial control share the same planning
     // authority, including paused jobs and commands already being published.
     const scheduled=await require("./financial-transaction-scan-control-service").startManualFinancialTransactionScan({

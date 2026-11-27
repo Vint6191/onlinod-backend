@@ -19,6 +19,20 @@ const key=(...parts)=>JSON.stringify(parts);
 const own=result=>{if(!result||result.lost||result.current===false)throw fail('FAN_LTV_CLAIM_LOST');return result;};
 function sourceKey(proof){return proof.activeGeneration?'generation:'+proof.activeGeneration:'ledger:'+proof.creatorId;}
 
+async function writePublishedBalances(db,creatorId,rows) {
+ const all=rows.filter(row=>row.rangeKey==='all');
+ if(!all.length)return;
+ await db.$executeRawUnsafe(`INSERT INTO "FanLtvPublishedBalance"("creatorId","fanId",revision,"netCents",payments)
+  SELECT $1,r."fanId",s."workingRevision",r."netCents",r.payments FROM "FanLtvState" s
+  CROSS JOIN jsonb_to_recordset($2::jsonb) r("fanId" text,"netCents" bigint,payments bigint) WHERE s."creatorId"=$1
+  ON CONFLICT("creatorId","fanId",revision) DO UPDATE SET "netCents"=EXCLUDED."netCents",payments=EXCLUDED.payments`,creatorId,json(all));
+ // At most one published and one working value are retained per changed fan.
+ // Unchanged fans keep their last committed value across any number of epochs.
+ await db.$executeRawUnsafe(`DELETE FROM "FanLtvPublishedBalance" b WHERE b."creatorId"=$1 AND b."fanId"=ANY($2::text[])
+  AND b.revision<(SELECT max(v.revision) FROM "FanLtvPublishedBalance" v JOIN "FanLtvState" s ON s."creatorId"=v."creatorId"
+    WHERE v."creatorId"=b."creatorId" AND v."fanId"=b."fanId" AND v.revision<=s."publishedRevision")`,creatorId,all.map(row=>row.fanId));
+}
+
 async function sourceRows(db,proof,{ids,after='',upper=''}) {
  const generated=Boolean(proof.activeGeneration),table=generated?'CreatorEarningsGenerationEntry':'CreatorEarningsLedgerEntry';
  const values=[generated?proof.activeGeneration:proof.creatorId,proof.creatorId];
@@ -83,6 +97,7 @@ async function applyRows(db,creatorId,ids,source,now) {
    }
    return {...row,netCents:net,payments};
   });
+  await writePublishedBalances(db,creatorId,writes);
   await db.$executeRawUnsafe(`INSERT INTO "FanLtvBalance"("creatorId","rangeKey","fanId","netCents",payments)
    SELECT $1,r."rangeKey",r."fanId",r."netCents",r.payments FROM jsonb_to_recordset($2::jsonb) r("rangeKey" text,"fanId" text,"netCents" bigint,payments bigint)
    ON CONFLICT("creatorId","rangeKey","fanId") DO UPDATE SET "netCents"=EXCLUDED."netCents",payments=EXCLUDED.payments`,creatorId,json(writes));
@@ -140,11 +155,12 @@ async function publishSnapshot(db,proof,state,now) {
  const ranges=Object.fromEntries(RANGES.map(range=>[range,rangeDto(rows.find(row=>row.rangeKey===range&&row.category==='*')?.values,
   rows.filter(row=>row.rangeKey===range&&row.category!=='*'))]));
  const snapshot={version:1,sourceKey:sourceKey(proof),proofGeneration:proof.generation,fromAt:proof.fromAt.toISOString(),throughAt:proof.throughAt.toISOString(),
-  historyComplete:proof.fullScan===true&&Boolean(proof.publishedAt),windowDay:utcDay(now).toISOString().slice(0,10),
+  historyComplete:proof.proofPolicyVersion===require('./earnings-coverage-service').FINANCIAL_PROOF_POLICY_VERSION
+   && +proof.fromAt<=+require('./financial-receipt-authority').FLOOR&&Boolean(proof.publishedAt),windowDay:utcDay(now).toISOString().slice(0,10),
   medianCents:await median(db,proof.creatorId,ranges.all.payingFans),ranges,asOf:now.toISOString()};
  // Idle daily wakes update period boundaries, but do not manufacture a fresh
  // financial observation: freshness is still read from the money authority.
- await db.$executeRawUnsafe('UPDATE "FanLtvState" SET snapshot=$2::jsonb,"updatedAt"=$3 WHERE "creatorId"=$1',proof.creatorId,json(snapshot),now);
+ await db.$executeRawUnsafe('UPDATE "FanLtvState" SET snapshot=$2::jsonb,"updatedAt"=$3,"publishedRevision"="workingRevision","workingRevision"="workingRevision"+1 WHERE "creatorId"=$1',proof.creatorId,json(snapshot),now);
  const { hashCanonicalJson }=require('./realtime-receipt-hash');
  await require('./creator-entity-change-service').publishEntityChanges({db,agencyId:proof.agencyId,creatorId:proof.creatorId,
   changes:[{entityType:'HOME',entityId:proof.creatorId,sourceIdentity:'FanLtvProjection',sourceVersion:hashCanonicalJson(snapshot),payload:{reason:'FAN_LTV_PUBLISHED'}}]});
@@ -160,7 +176,7 @@ async function processPage({db,item,ownerToken}) {
   // the durable work row in the reverse order.
   if(!await earnings.tryLock(tx,item.creatorId)){own(await work.yieldDomainWorkClaim({db:tx,item,ownerToken,availableAt:new Date(Date.now()+1000)}));return {processed:0,busy:true};}
   own(await work.lockDomainWorkClaimForCommit({db:tx,item,ownerToken}));
-  const [proof]=await tx.$queryRawUnsafe(`SELECT p.*,g."fullScan",g."publishedAt" FROM "CreatorEarningsLedgerProof" p
+  const [proof]=await tx.$queryRawUnsafe(`SELECT p.*,g."fullScan",g."publishedAt",g."baseGeneration",g."ltvDeltaVersion" FROM "CreatorEarningsLedgerProof" p
    JOIN "CreatorAccount" c ON c.id=p."creatorId" AND c."agencyId"=p."agencyId" AND c."deletedAt" IS NULL
    LEFT JOIN "CreatorEarningsGeneration" g ON g.id=p."activeGeneration"
    WHERE p."creatorId"=$1 AND p."agencyId"=$2`,item.creatorId,item.agencyId);
@@ -170,14 +186,46 @@ async function processPage({db,item,ownerToken}) {
   let [state]=await tx.$queryRawUnsafe('SELECT * FROM "FanLtvState" WHERE "creatorId"=$1 FOR UPDATE',item.creatorId);
   if(!state)throw fail('FAN_LTV_STATE_MISSING');
   const current=sourceKey(proof);let processed=0;
-  if(state.sourceKey!==current){
-   state={...state,sourceKey:current,stage:'RESET',resetStage:0,cursor:'',upperId:await sourceUpper(tx,proof)};
-   await tx.$executeRawUnsafe('UPDATE "FanLtvState" SET "sourceKey"=$2,stage=\'RESET\',"resetStage"=0,cursor=\'\',"upperId"=$3 WHERE "creatorId"=$1',item.creatorId,current,state.upperId);
+  if(!state.balanceSeedComplete) {
+   const balances=await tx.$queryRawUnsafe(`SELECT * FROM "FanLtvBalance" WHERE "creatorId"=$1 AND "rangeKey"='all'
+    AND "fanId">$2 ORDER BY "fanId" LIMIT $3`,item.creatorId,state.balanceSeedCursor,PAGE);
+   await writePublishedBalances(tx,item.creatorId,balances);
+   state.balanceSeedComplete=balances.length<PAGE;
+   await tx.$executeRawUnsafe('UPDATE "FanLtvState" SET "balanceSeedCursor"=$2,"balanceSeedComplete"=$3 WHERE "creatorId"=$1',item.creatorId,balances.at(-1)?.fanId||state.balanceSeedCursor,state.balanceSeedComplete);
+   if(!state.balanceSeedComplete) {
+    own(await work.yieldDomainWorkClaim({db:tx,item,ownerToken,availableAt:now}));
+    return {processed:balances.length,completed:false,stage:'BALANCE_SEED'};
+   }
   }
-  if(state.stage==='RESET'){
+  if(state.sourceKey!==current){
+   const delta=state.stage==='LIVE'&&proof.ltvDeltaVersion===1&&state.sourceKey==='generation:'+proof.baseGeneration;
+   const [priorUpper]=await tx.$queryRawUnsafe('SELECT "transactionId" FROM "FanLtvReceipt" WHERE "creatorId"=$1 ORDER BY "transactionId" DESC LIMIT 1',item.creatorId);
+   const upper=delta?'':[await sourceUpper(tx,proof),priorUpper?.transactionId||''].sort().at(-1);
+   state={...state,sourceKey:current,stage:delta?'DELTA':'SYNC',cursor:'',upperId:upper};
+   await tx.$executeRawUnsafe('UPDATE "FanLtvState" SET "sourceKey"=$2,stage=$3,cursor=\'\',"upperId"=$4 WHERE "creatorId"=$1',item.creatorId,current,state.stage,state.upperId);
+  }
+  if(state.stage==='DELTA'){
+   const rows=await tx.$queryRawUnsafe('SELECT "transactionId" FROM "CreatorEarningsGenerationChange" WHERE generation=$1 AND "transactionId">$2 ORDER BY "transactionId" LIMIT $3',proof.activeGeneration,state.cursor,PAGE);
+   const ids=rows.map(row=>row.transactionId);
+   if(ids.length)processed=await applyRows(tx,item.creatorId,ids,await sourceRows(tx,proof,{ids}),now);
+   state.cursor=rows.at(-1)?.transactionId||state.cursor;if(rows.length<PAGE)state.stage='LIVE';
+   await tx.$executeRawUnsafe('UPDATE "FanLtvState" SET stage=$2,cursor=$3 WHERE "creatorId"=$1',item.creatorId,state.stage,state.cursor);
+  }else if(state.stage==='SYNC'){
+   const generated=Boolean(proof.activeGeneration),table=generated?'CreatorEarningsGenerationEntry':'CreatorEarningsLedgerEntry';
+   const rows=await tx.$queryRawUnsafe(`SELECT "transactionId" FROM (
+    (SELECT "transactionId" FROM "FanLtvReceipt" WHERE "creatorId"=$1 AND "transactionId">$2 AND "transactionId"<=$3 ORDER BY "transactionId" LIMIT $5)
+    UNION (SELECT "transactionId" FROM "${table}" WHERE "${generated?'generation':'creatorId'}"=$4 AND "transactionId">$2 AND "transactionId"<=$3 ORDER BY "transactionId" LIMIT $5)
+   ) ids ORDER BY "transactionId" LIMIT $5`,item.creatorId,state.cursor,state.upperId,generated?proof.activeGeneration:item.creatorId,PAGE);
+   const ids=rows.map(row=>row.transactionId);
+   if(ids.length)processed=await applyRows(tx,item.creatorId,ids,await sourceRows(tx,proof,{ids}),now);
+   state.cursor=rows.at(-1)?.transactionId||state.cursor;if(rows.length<PAGE)state.stage='LIVE';
+   await tx.$executeRawUnsafe('UPDATE "FanLtvState" SET stage=$2,cursor=$3 WHERE "creatorId"=$1',item.creatorId,state.stage,state.cursor);
+  }else if(state.stage==='RESET'){
    for(let turn=state.resetStage;turn<RESET_TABLES.length;turn++){
     const table=RESET_TABLES[turn];
-    const deleted=await tx.$executeRawUnsafe(`DELETE FROM "${table}" WHERE ctid IN (SELECT ctid FROM "${table}" WHERE "creatorId"=$1 LIMIT $2)`,item.creatorId,PAGE);
+    const removed=await tx.$queryRawUnsafe(`DELETE FROM "${table}" WHERE ctid IN (SELECT ctid FROM "${table}" WHERE "creatorId"=$1 LIMIT $2) RETURNING *`,item.creatorId,PAGE);
+    if(table==='FanLtvBalance')await writePublishedBalances(tx,item.creatorId,removed.map(row=>({...row,netCents:0,payments:0})));
+    const deleted=removed.length;
     processed+=deleted;if(deleted===PAGE){state.resetStage=turn;break;}state.resetStage=turn+1;
    }
    if(state.resetStage===RESET_TABLES.length)state.stage='SEED';

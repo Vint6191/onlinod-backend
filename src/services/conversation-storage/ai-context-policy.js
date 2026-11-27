@@ -37,7 +37,7 @@ function replyMessages(descending, budget = 5632) {
     if (selected.length) break;
     let low = 0, high = item.text.length;
     const build = start => ({ ...item, text: item.text.slice(start), textView: {
-      policy: REPLY_PROJECTION, omittedPrefixChars: start, originalTextChars: item.text.length } });
+      ...item.textView, policy: REPLY_PROJECTION, omittedPrefixChars: start, originalTextChars: item.text.length } });
     while (low < high) {
       const mid = Math.floor((low + high) / 2);
       const start = unicodeEnd(item.text, mid);

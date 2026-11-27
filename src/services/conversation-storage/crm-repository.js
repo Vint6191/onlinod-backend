@@ -1,6 +1,7 @@
 "use strict";
 const c = require("./common");
 const defaults = require("./crm-profile-default.json");
+const editLimits = require("../../contracts/crm-edit-limits.json");
 const personaLimits = require("../../contracts/creator-ai-profile-limits.json");
 const MANUAL = new Set(defaults.manualFields);
 const FORBIDDEN = new Set([
@@ -41,13 +42,13 @@ function profileValue(row, notes = []) {
   return p;
 }
 function cleanPatch(raw) {
-  c.bounded(raw, 32768);
+  c.bounded(raw, editLimits.patchBytesMax);
   const patch = {};
   for (const [key, value] of Object.entries(raw)) {
     c.check(Object.hasOwn(defaults.profile, key), "CRM_FIELD_UNKNOWN", 400);
     const sample = defaults.profile[key];
     if (typeof sample === "string")
-      c.check(typeof value === "string" && value.length <= 4000, "CRM_FIELD_INVALID", 400);
+      c.check(typeof value === "string" && value.length <= editLimits.fieldTextMax, "CRM_FIELD_INVALID", 400);
     else if (Array.isArray(sample)) c.check(Array.isArray(value) && value.length <= 80, "CRM_FIELD_INVALID", 400);
     else if (sample === null)
       c.check(
@@ -126,6 +127,10 @@ class CrmRepository {
     const rows = await this.canonical.read(ctx, ids);
     return new Map(rows.filter(row => ids.includes(String(row.onlyFansUserId)))
       .map(row => [String(row.onlyFansUserId), row.platformIdentity]));
+  }
+  async identityToken(ctx, fanId) {
+    const identity = (await this.identities(ctx, [fanId])).get(fanId);
+    return c.hash({ username: identity?.username || "", platformDisplayName: identity?.platformDisplayName || "" });
   }
   async identityRevision(ctx) {
     return this.canonical ? BigInt(await this.canonical.revision(ctx)) : 0n;
@@ -302,7 +307,7 @@ class CrmRepository {
         if (!current || Number(current.revision) !== descriptor.replyContext.profileRevision
           || current.reply_token !== row.reply_token || c.hash(current.reply_input) !== c.hash(descriptor)) replyFreshnessReason = "PROFILE_CHANGED";
         else if (Number(current.persona_revision) !== descriptor.replyContext.personaRevision) replyFreshnessReason = "PERSONA_CHANGED";
-        else if (String(await this.identityRevision(ctx)) !== descriptor.replyContext.identityRevision) replyFreshnessReason = "IDENTITY_CHANGED";
+        else if (await this.identityToken(ctx, fanId) !== descriptor.replyContext.identityRevision) replyFreshnessReason = "IDENTITY_CHANGED";
         else replyFreshnessReason = null;
       }
     }
@@ -349,14 +354,20 @@ class CrmRepository {
     const receipt = await this.command(
       ctx,
       id,
-      { kind: "profile.patch", fanId, patch, baseRevision: input.baseRevision, appendNotes: input.appendNotes || [] },
+      { kind: "profile.patch", fanId, patch, baseRevision: input.baseRevision, appendNotes: input.appendNotes || [],
+        ...(input.fieldBaseRevisions === undefined ? {} : { fieldBaseRevisions: input.fieldBaseRevisions }) },
       async (tx) => {
         const before = await this.ensure(ctx, fanId, tx);
         const expected = c.integer(input.baseRevision, 0);
         c.check(input.baseRevision !== undefined, "CRM_EXPECTED_REVISION_REQUIRED", 409);
-        c.check(expected <= Number(before.revision), "CRM_EDIT_CONFLICT", 409);
-        for (const key of Object.keys(patch))
-          c.check(Number(before.field_versions[key] || 0) <= expected, "CRM_EDIT_CONFLICT", 409);
+        if (expected > Number(before.revision)) return { rejected: { code: "CRM_EDIT_CONFLICT" } };
+        if (input.fieldBaseRevisions !== undefined) c.check(input.fieldBaseRevisions && typeof input.fieldBaseRevisions === "object"
+          && !Array.isArray(input.fieldBaseRevisions) && Object.keys(input.fieldBaseRevisions).every(key => Object.hasOwn(patch, key)), "CRM_FIELD_BASE_INVALID", 400);
+        for (const key of Object.keys(patch)) {
+          const fieldExpected = input.fieldBaseRevisions?.[key] ?? expected;
+          c.check(Number.isSafeInteger(fieldExpected) && fieldExpected >= 0 && fieldExpected <= Number(before.revision), "CRM_FIELD_BASE_INVALID", 400);
+          if (Number(before.field_versions[key] || 0) > fieldExpected) return { rejected: { code: "CRM_EDIT_CONFLICT" } };
+        }
         const next = { ...before.profile, ...patch },
           manual = [...new Set([...before.manual_fields, ...Object.keys(patch)])],
           revision = Number(before.revision) + 1;
@@ -365,12 +376,12 @@ class CrmRepository {
         validateMergedProfile(next);
         boundStoredProfile(next);
         c.check(
-          Array.isArray(input.appendNotes || []) && (input.appendNotes || []).length <= 10,
+          Array.isArray(input.appendNotes || []) && (input.appendNotes || []).length <= editLimits.notesPerCommandMax,
           "CRM_NOTES_INVALID",
           400
         );
         for (const [index, note] of (input.appendNotes || []).entries()) {
-          c.text(note, 4000);
+          c.check(typeof note === "string" && note.trim().length > 0 && !note.includes("\0") && note.length <= editLimits.noteTextMax, "CRM_NOTES_INVALID", 400);
           const noteBytes = Number(
             (
               await c.one(
@@ -416,6 +427,9 @@ class CrmRepository {
         return { revision };
       }
     );
+    // A CAS rejection is recorded under the same command/hash before returning.
+    // Receipt lookup can therefore prove non-application after a lost response.
+    if (receipt.rejected?.code === "CRM_EDIT_CONFLICT") throw c.fail("CRM_EDIT_CONFLICT", 409);
     return { ...await this.getPanelSnapshot(ctx, input), mutation: {
       kind: "crm.profile.update", commandId: id, committedRevision: receipt.revision,
     } };

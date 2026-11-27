@@ -32,6 +32,7 @@ const acquireSchema = scopeSchema.extend({
     leaseRevision: z.number().int().positive(),
     scanFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
     scanTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    financialRecovery: z.literal(true).optional(),
   }).strict().optional().nullable(),
   timeoutMs: z.number().int().min(5_000).max(60_000).optional(),
 });

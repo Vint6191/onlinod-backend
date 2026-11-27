@@ -535,6 +535,20 @@ async function bumpStat({ agencyId, creatorId, templateId = "", field, at = new 
   });
 }
 
+function bumpMessageOwnership(delivery, result = delivery?.result) {
+  const receipt = object(result), proof = object(receipt.messageOwnership);
+  const messageId = clean(receipt.messageId || delivery?.messageId, 160);
+  const operationId = delivery?.idempotencyKey || delivery?.id;
+  if (!messageId || !operationId) return null;
+  if (proof.kind === "PROVIDER_SEND_ACK" && proof.messageId === messageId && proof.operationId === operationId) return proof;
+  // Older desktop direct-POST receipts already contain the exact ID, endpoint,
+  // and HTTP acknowledgement. Their text-readback receipts have no such proof.
+  if (receipt.recoveredByPreflight !== true && receipt.endpointKey === "chats.sendMessage"
+    && Number(receipt.status) >= 200 && Number(receipt.status) < 300 && receipt.messageId === messageId)
+    return { kind: "PROVIDER_SEND_ACK", operationId, messageId };
+  return null;
+}
+
 async function validateBumpDelivery({ delivery, control = null, now = new Date(), db = prisma }) {
   if (!delivery || delivery.moduleKey !== BUMPS_MODULE_KEY) return { ok: true };
   const payload = object(delivery.payload);
@@ -607,6 +621,13 @@ async function validateBumpDelivery({ delivery, control = null, now = new Date()
   if (delivery.actionType === DELETE_ACTION) {
     const messageId = clean(payload.messageId || delivery.targetId, 160);
     if (!messageId) return { ok: false, terminal: true, status: "SKIPPED", code: "message_id_missing" };
+    const source = payload.sourceDeliveryId ? await db.automationDelivery.findUnique({ where: { id: payload.sourceDeliveryId } }) : null;
+    const proof = bumpMessageOwnership(source);
+    if (!source || source.agencyId !== delivery.agencyId || source.creatorId !== delivery.creatorId || source.fanId !== delivery.fanId
+      || source.actionType !== SEND_ACTION || source.status !== "COMPLETED" || source.messageId !== messageId
+      || !proof || proof.messageId !== messageId) {
+      return { ok: false, terminal: true, status: "SKIPPED", code: "bump_message_ownership_unproven" };
+    }
     if (!state?.pendingMessageId || state.pendingMessageId !== messageId) return { ok: false, terminal: true, status: "SKIPPED", code: "cancel_not_needed" };
     if (state.lastAnyRepliedAt && state.lastAnyRepliedAt > (delivery.createdAt || new Date(0))) return { ok: false, terminal: true, status: "SKIPPED", code: "replied" };
   }
@@ -620,6 +641,10 @@ async function finalizeBumpSend({ delivery, result, db = prisma }) {
   const timing = object(payload.timing);
   const messageId = clean(result.messageId || delivery.messageId, 160);
   if (!messageId) throw Object.assign(new Error("Bump send result is missing messageId"), { code: "message_id_missing", status: 409 });
+  const ownership = bumpMessageOwnership(delivery, result);
+  if (!ownership || ownership.messageId !== messageId) {
+    throw Object.assign(new Error("Bump message ownership requires an exact provider send acknowledgement"), { code: "bump_message_ownership_unproven", status: 409 });
+  }
   const sentAt = date(result.sentAt || delivery.sentAt) || new Date();
   const deleteAfter = int(timing.deleteAfterNoReplyMs, 60 * 60_000, 60_000, 14 * 24 * 60 * 60_000);
   const cancelAt = new Date(sentAt.getTime() + deleteAfter);
@@ -629,6 +654,7 @@ async function finalizeBumpSend({ delivery, result, db = prisma }) {
   const cancelPayload = {
     schemaVersion: 1,
     sourceDeliveryId: delivery.id,
+    messageOwnership: ownership,
     source: payload.source || delivery.trigger || "manual",
     messageId,
     dialogId: delivery.dialogId,
@@ -690,8 +716,13 @@ async function finalizeBumpDelete({ delivery, result, outcomeCode, db = prisma }
   const messageId = clean(payload.messageId || delivery.targetId || delivery.messageId, 160);
   const state = await db.automationBumpFanState.findUnique({ where: { creatorId_fanId: { creatorId: delivery.creatorId, fanId: delivery.fanId } } });
   const replied = outcomeCode === "replied" || result.replied === true;
-  const canceled = outcomeCode === "message_deleted" || outcomeCode === "message_not_found" || result.deleted === true;
-  const at = date(result.repliedAt || result.deletedAt) || new Date();
+  const exactAbsence = result.messageId === messageId && [404, 410].includes(Number(result.observedStatus));
+  const canceled = exactAbsence && ((outcomeCode === "message_deleted" && result.deletionProof === "DELETE_AND_EXACT_ABSENCE" && result.deleted === true)
+    || (outcomeCode === "message_not_found" && result.absenceProof === "EXACT_MESSAGE_LOOKUP" && result.targetAbsent === true));
+  if (["message_deleted", "message_not_found"].includes(outcomeCode) && !canceled) {
+    throw Object.assign(new Error("Bump deletion outcome lacks exact target proof"), { code: "bump_delete_outcome_unproven", status: 409 });
+  }
+  const at = date(result.repliedAt || result.deletedAt || result.checkedAt) || new Date();
   let changed = 0;
   if (replied) {
     const cooldownMs = int(payload.afterReplyCooldownMs, 24 * 60 * 60_000, 0, 90 * 24 * 60 * 60_000);
@@ -746,7 +777,10 @@ async function markBumpReply({ agencyId, creatorId, fanId, messageId = null, rep
       if (at.getTime() < sentAt.getTime()) return { ok: true, matched: false, code: "reply_predates_bump" };
       const replyMessageId = clean(messageId, 160);
       if (!replyMessageId || replyMessageId === pendingMessageId) return { ok: true, matched: false, code: "reply_message_unproven" };
-      if (/^\d+$/.test(replyMessageId) && /^\d+$/.test(pendingMessageId) && BigInt(replyMessageId) <= BigInt(pendingMessageId)) {
+      if (at.getTime() === sentAt.getTime() && (!/^\d+$/.test(replyMessageId) || !/^\d+$/.test(pendingMessageId))) {
+        return { ok: true, matched: false, code: "reply_episode_order_unproven" };
+      }
+      if (at.getTime() === sentAt.getTime() && BigInt(replyMessageId) <= BigInt(pendingMessageId)) {
         return { ok: true, matched: false, code: "reply_predates_bump" };
       }
       if (send && (send.id !== state.pendingDeliveryId || send.agencyId !== agencyId || send.creatorId !== creatorId || send.fanId !== fanId

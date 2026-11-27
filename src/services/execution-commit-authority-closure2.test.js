@@ -239,7 +239,7 @@ test("Audit17 automation worker lease APIs reject programmatic-origin rows even 
   );
 });
 
-test("Closure2 COMMITTING expiry and reconciliation-worker crash retain creator lane until proven no-effect", async () => {
+test("Closure2 COMMITTING expiry and reconciliation-worker crash retain creator lane despite unproven history absence", async () => {
   const { rows, db } = actionFixture();
   const service = loadActionService(db);
 
@@ -274,12 +274,13 @@ test("Closure2 COMMITTING expiry and reconciliation-worker crash retain creator 
     failureCode: "send_reconcile_no_effect", error: "readback proved no effect",
     result: { outcomeState: "PROVEN_NO_EFFECT", provenNoEffect: true, readbackCovered: true },
   });
-  assert.equal(rows[0].status, "RETRY_SCHEDULED");
-  assert.equal(rows[0].result.outcomeState, "PROVEN_NO_EFFECT");
+  assert.equal(rows[0].status, "RECONCILE_REQUIRED");
+  assert.equal(rows[0].result.outcomeState, "RECONCILE_REQUIRED");
+  assert.equal(rows[0].result.provenNoEffect, false);
 
   const afterProof = await service.claimActionDelivery({ userId: "user-1", deviceId: "device-1", actionTypes: ["LIKE_POST"] });
-  assert.equal(afterProof.reason, "claimed");
-  assert.equal(afterProof.delivery.id, "B");
+  assert.equal(afterProof.reason, "no_work");
+  assert.equal(rows[1].status, "QUEUED");
 });
 
 function loadFollowBackForFence(db) {
@@ -443,7 +444,7 @@ function commitRaceDb({ moduleKey, targetId, actionType }) {
   const db = {
     $executeRawUnsafe: async (sql, generation) => {
       if (sql === "SELECT pg_advisory_xact_lock_shared(hashtext($1))") { assert.equal(generation, "agency-lifecycle:agency-1"); return 1; }
-      if (sql.includes("set_config('lock_timeout'")) return 1;
+      if (sql.includes("set_config('lock_timeout'") || sql === "SET CONSTRAINTS ALL IMMEDIATE") return 1;
       assert.equal(sql, "SELECT set_config('onlinod.phase3_fan_consumer_generation',$1,true)");
       assert.equal(generation, "phase3_fan_consumer_v1_current_bounded");
       currentConsumerPermit = true;

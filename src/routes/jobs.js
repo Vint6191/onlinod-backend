@@ -39,6 +39,7 @@ const JOB_SERVER_CAPABILITIES = Object.freeze({
   financialWindowReceiptsV1: true,
   financialMoneyResolutionV1: true,
   financialTraversalV2: true,
+  billingFinancialRecoveryV1: true,
 });
 
 router.use((req, res, next) => {
@@ -144,6 +145,7 @@ const claimSchema = z.object({
     financialWindowReceiptsV1: z.boolean().optional().default(false),
     financialMoneyResolutionV1: z.boolean().optional().default(false),
     financialTraversalV2: z.boolean().optional().default(false),
+    billingFinancialRecoveryV1: z.boolean().optional().default(false),
   }).passthrough().optional().default({}),
 });
 

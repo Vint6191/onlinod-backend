@@ -372,92 +372,90 @@ async function mutateWallet(tx, { agencyId, testMode, amountCents, type, idempot
   return { transaction, wallet: updated, replayed: false };
 }
 
-async function creditPaidTopUp({ orderId, sandboxActivationEnabled, db = null }) {
+async function creditPaidTopUp({ orderId, paymentAttemptId, settlement, sandboxActivationEnabled, db = null }) {
   const client = db || prisma;
   return runDbTransaction(client, async (tx) => {
     const identity = await tx.billingOrder.findUnique({ where: { id: orderId }, select: { id: true, agencyId: true } });
     if (!identity) return { credited: false, reason: "ORDER_NOT_FOUND" };
     await lockAgencyBillingMutation(tx, identity.agencyId);
     const order = await tx.billingOrder.findUnique({ where: { id: orderId } });
-    if (!order || String(order.purpose || "SUBSCRIPTION") !== "WALLET_TOP_UP" || order.status !== "PAID") return { credited: false, reason: "ORDER_NOT_PAID_TOP_UP" };
+    if (!order || order.purpose !== "WALLET_TOP_UP") return { credited: false, reason: "ORDER_NOT_TOP_UP" };
+    const attempt = paymentAttemptId ? await tx.billingPaymentAttempt.findUnique({ where: { id: paymentAttemptId } }) : null;
+    if (!attempt || attempt.orderId !== order.id || attempt.testMode !== order.testMode) return { credited: false, reason: "PAYMENT_SETTLEMENT_REQUIRED" };
+    if (!["finished", "partially_paid"].includes(attempt.providerStatus) || attempt.reversedAt) return { credited: false, reason: "PAYMENT_NOT_SETTLED" };
     if (order.testMode && sandboxActivationEnabled !== true) return { credited: false, reason: "SANDBOX_ACTIVATION_DISABLED" };
-
-    const idempotencyKey = `topup:${order.id}`;
-    const already = await tx.billingWalletTransaction.findUnique({ where: { idempotencyKey } });
-    if (already) {
-      assertWalletTransactionBinding(already, {
-        agencyId: order.agencyId,
-        testMode: order.testMode === true,
-        amountCents: BigInt(order.amountCents),
-        type: "TOP_UP",
-        orderId: order.id,
-        idempotencyKey,
-      });
-      return { credited: false, reason: "ALREADY_CREDITED", transaction: publicWalletTransaction(already) };
-    }
-
-    const claim = await tx.billingOrder.updateMany({ where: { id: order.id, status: "PAID", activatedAt: null }, data: { activatedAt: new Date(), paidAt: order.paidAt || new Date() } });
-    if (claim.count !== 1) {
-      const replay = await tx.billingWalletTransaction.findUnique({ where: { idempotencyKey } });
-      if (replay) {
-        assertWalletTransactionBinding(replay, {
-          agencyId: order.agencyId,
-          testMode: order.testMode === true,
-          amountCents: BigInt(order.amountCents),
-          type: "TOP_UP",
-          orderId: order.id,
-          idempotencyKey,
-        });
-        return { credited: false, reason: "ALREADY_CREDITED", transaction: publicWalletTransaction(replay) };
+    const review = async reason => {
+      await tx.billingPaymentAttempt.update({ where: { id: attempt.id }, data: { settlementState: "REVIEW_REQUIRED", settlementEvidence: attempt.settledCents > 0n ? { ...(attempt.settlementEvidence || {}), reviewReason: reason, conflictingObservation: settlement?.evidence || null } : { ...(settlement?.evidence || {}), reason } } });
+      return { credited: false, reason, reconciliationRequired: true };
+    };
+    // Old order-level credits are adopted only by a proven unique payment in
+    // the migration. Ambiguous old money is preserved for an explicit review.
+    const legacy = await tx.billingWalletTransaction.findUnique({ where: { idempotencyKey: `topup:${order.id}` } });
+    if (legacy && !await tx.billingPaymentAttempt.findFirst({ where: { orderId: order.id, walletCreditTransactionId: legacy.id } })) return review("LEGACY_PAYMENT_BINDING_REVIEW_REQUIRED");
+    if (!settlement?.ok) return review(settlement?.reason || "SETTLEMENT_VALUE_UNPROVEN");
+    const settled = bigintCents(attempt.settledCents), amount = bigintCents(settlement.amountCents);
+    if (amount < settled) return review("SETTLEMENT_VALUE_DECREASE_REVIEW_REQUIRED");
+    const values = require("./billing-payment-value-service");
+    const accepted = attempt.settlementEvidence || {};
+    const compatible = attempt.settlementBasis === settlement.basis && values.sameQuote(accepted, settlement.evidence);
+    if (amount === settled) {
+      if (attempt.settlementBasis === "LEGACY_ORDER_CREDIT") {
+        // A uniquely adopted old credit may acquire its first verified quote,
+        // without changing one cent or the identity of the credited payment.
+        if (accepted.payCurrency && accepted.payCurrency !== settlement.evidence.payCurrency) return review("LEGACY_PAYMENT_QUOTE_REVIEW_REQUIRED");
+        await tx.billingPaymentAttempt.update({ where: { id: attempt.id }, data: {
+          settlementState: "CREDITED", settlementBasis: settlement.basis, settlementEvidence: settlement.evidence,
+        } });
+      } else {
+        if (!compatible || !(values.equalDecimal(accepted.actuallyPaid, settlement.evidence.actuallyPaid)
+          || values.greaterDecimal(settlement.evidence.actuallyPaid, accepted.actuallyPaid))) return review("SETTLEMENT_CHANGE_REVIEW_REQUIRED");
+        if (attempt.settlementState === "REVIEW_REQUIRED") {
+          const { reviewReason, conflictingObservation, ...originalEvidence } = accepted;
+          await tx.billingPaymentAttempt.update({ where: { id: attempt.id }, data: { settlementState: "CREDITED", settlementEvidence: originalEvidence } });
+        }
       }
-      return { credited: false, reason: "ORDER_ALREADY_ACTIVATED" };
+      return { credited: false, reason: "ALREADY_CREDITED" };
     }
-
+    if (settled > 0n && (!compatible || !values.greaterDecimal(settlement.evidence.actuallyPaid, accepted.actuallyPaid))) return review("SETTLEMENT_CHANGE_REVIEW_REQUIRED");
+    const idempotencyKey = `topup-payment:${attempt.provider}:${attempt.testMode ? "test" : "live"}:${attempt.providerPaymentId}:${amount}`;
     const result = await mutateWallet(tx, {
-      agencyId: order.agencyId,
-      testMode: order.testMode === true,
-      amountCents: BigInt(order.amountCents),
-      type: "TOP_UP",
-      idempotencyKey,
-      orderId: order.id,
-      description: `Balance top-up · $${(Number(order.amountCents) / 100).toFixed(2)}`,
-      metadata: { provider: String(order.provider || "NOWPAYMENTS"), providerInvoiceId: order.providerInvoiceId || null },
+      agencyId: order.agencyId, testMode: order.testMode === true, amountCents: amount - settled,
+      type: "TOP_UP", idempotencyKey, orderId: order.id,
+      description: `Payment balance top-up · $${(Number(amount - settled) / 100).toFixed(2)}`,
+      metadata: { provider: attempt.provider, providerPaymentId: attempt.providerPaymentId, paymentAttemptId: attempt.id,
+        providerInvoiceId: order.providerInvoiceId || null, settlementBasis: settlement.basis, settledTotalCents: String(amount) },
     });
-    return { credited: true, wallet: publicWallet(result.wallet), transaction: publicWalletTransaction(result.transaction) };
+    const now = new Date();
+    await tx.billingPaymentAttempt.update({ where: { id: attempt.id }, data: {
+      settlementState: "CREDITED", settledCents: amount, settlementBasis: settlement.basis,
+      settlementEvidence: settlement.evidence, settledAt: attempt.settledAt || now,
+      walletCreditTransactionId: attempt.walletCreditTransactionId || result.transaction.id,
+    } });
+    await tx.billingOrder.updateMany({ where: { id: order.id, activatedAt: null }, data: { activatedAt: now, paidAt: order.paidAt || now } });
+    return { credited: !result.replayed, wallet: publicWallet(result.wallet), transaction: publicWalletTransaction(result.transaction) };
   });
 }
 
-async function refundTopUp({ order, db = null }) {
-  const orderId = String(order?.id || "").trim();
-  const agencyId = String(order?.agencyId || "").trim();
-  if (!orderId || !agencyId) return { reversed: false, reason: "ORDER_NOT_FOUND" };
+async function refundTopUp({ order, paymentAttemptId, db = null }) {
+  const orderId = String(order?.id || "").trim(), agencyId = String(order?.agencyId || "").trim();
+  if (!orderId || !agencyId || !paymentAttemptId) return { reversed: false, reason: "PAYMENT_SETTLEMENT_REQUIRED" };
   const client = db || prisma;
-  return runDbTransaction(client, async (tx) => {
+  return runDbTransaction(client, async tx => {
     await lockAgencyBillingMutation(tx, agencyId);
     const current = await tx.billingOrder.findUnique({ where: { id: orderId } });
-    if (!current || String(current.purpose || "SUBSCRIPTION") !== "WALLET_TOP_UP" || current.status !== "REFUNDED") return { reversed: false, reason: "ORDER_NOT_REFUNDED_TOP_UP" };
-    const originalIdempotencyKey = `topup:${orderId}`;
-    const original = await tx.billingWalletTransaction.findUnique({ where: { idempotencyKey: originalIdempotencyKey } });
-    if (!original) return { reversed: false, reason: "TOP_UP_WAS_NOT_CREDITED" };
-    assertWalletTransactionBinding(original, {
-      agencyId,
-      testMode: current.testMode === true,
-      amountCents: BigInt(current.amountCents),
-      type: "TOP_UP",
-      orderId,
-      idempotencyKey: originalIdempotencyKey,
+    const attempt = await tx.billingPaymentAttempt.findUnique({ where: { id: paymentAttemptId } });
+    if (!current || current.purpose !== "WALLET_TOP_UP" || !attempt || attempt.orderId !== current.id || attempt.testMode !== current.testMode || attempt.providerStatus !== "refunded") return { reversed: false, reason: "PAYMENT_NOT_REFUNDED" };
+    if (attempt.reversedAt) return { reversed: false, reason: "ALREADY_REVERSED" };
+    const amount = bigintCents(attempt.settledCents);
+    let result = null;
+    if (amount > 0n) result = await mutateWallet(tx, {
+      agencyId, testMode: current.testMode === true, amountCents: -amount, type: "TOP_UP_REFUND", orderId,
+      idempotencyKey: `topup-payment-refund:${attempt.provider}:${attempt.testMode ? "test" : "live"}:${attempt.providerPaymentId}`,
+      description: `Refunded payment top-up · $${(Number(amount) / 100).toFixed(2)}`,
+      metadata: { paymentAttemptId: attempt.id, providerPaymentId: attempt.providerPaymentId, originalTransactionId: attempt.walletCreditTransactionId },
     });
-    const result = await mutateWallet(tx, {
-      agencyId,
-      testMode: current.testMode === true,
-      amountCents: -bigintCents(original.amountCents),
-      type: "TOP_UP_REFUND",
-      idempotencyKey: `topup-refund:${orderId}`,
-      orderId,
-      description: `Refunded balance top-up · $${(Number(bigintCents(original.amountCents)) / 100).toFixed(2)}`,
-      metadata: { originalTransactionId: original.id },
-    });
-    return { reversed: !result.replayed, wallet: publicWallet(result.wallet), transaction: publicWalletTransaction(result.transaction) };
+    await tx.billingPaymentAttempt.update({ where: { id: attempt.id }, data: { settlementState: "REFUNDED", reversedAt: new Date() } });
+    return { reversed: !!result && !result.replayed, ...(result ? { wallet: publicWallet(result.wallet), transaction: publicWalletTransaction(result.transaction) } : { reason: "PAYMENT_WAS_NOT_CREDITED" }) };
   });
 }
 

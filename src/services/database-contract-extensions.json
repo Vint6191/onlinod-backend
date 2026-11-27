@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v34_financial_and_workspace_repairs",
+  "version": "nod_current_v35_payment_and_runtime_repairs",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -144,16 +144,44 @@
     {
       "migration": "20261127050000_principal_device_lookup",
       "checksum": "fbe09b15b48063eebfd04d7b70b1ef56ae01afd2d6bb1a1e0dd1582d60fed751"
+    },
+    {
+      "migration": "20261128010000_finance_identity_and_ltv",
+      "checksum": "f36a1f7b123e49587610bf78e348f7fcc885d9e99d6f2a8e981e9d47ff6edb41"
+    },
+    {
+      "migration": "20261128011000_financial_correlation_provenance",
+      "checksum": "6b8d9f7b33fe36147fe412d6f1cf352cf8b3c058c130a4187bdd4c6f7c8681a9"
+    },
+    {
+      "migration": "20261128020000_runtime_identity_revision",
+      "checksum": "0b3405ea77bc258ba66219eb1d7fe4931fba8760f4c943836af56360acbf3c91"
+    },
+    {
+      "migration": "20261128030000_payment_settlements",
+      "checksum": "a7986e8e411539651bf9ac28e52c5a685f37e9947aafe5b10a494d35c8020d38"
     }
   ],
   "extension": {
     "tables": [
+      {
+        "name": "AutomationTemplateScopeRevision",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorBillingRecoverySnapshot",
+        "persistence": "p"
+      },
       {
         "name": "CreatorDialogRecoveryRequest",
         "persistence": "p"
       },
       {
         "name": "CreatorEarningsGeneration",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorEarningsGenerationChange",
         "persistence": "p"
       },
       {
@@ -194,6 +222,10 @@
       },
       {
         "name": "CreatorEntityCurrent",
+        "persistence": "p"
+      },
+      {
+        "name": "CreatorFanIdentityHead",
         "persistence": "p"
       },
       {
@@ -269,6 +301,10 @@
         "persistence": "p"
       },
       {
+        "name": "FanLtvPublishedBalance",
+        "persistence": "p"
+      },
+      {
         "name": "FanLtvReceipt",
         "persistence": "p"
       },
@@ -291,6 +327,10 @@
       {
         "name": "TeamPpvPurchaseAlias",
         "persistence": "p"
+      },
+      {
+        "name": "TeamTipAlias",
+        "persistence": "p"
       }
     ],
     "columns": [
@@ -311,6 +351,110 @@
         "column_default": null
       },
       {
+        "table": "AutomationTemplateScopeRevision",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "AutomationTemplateScopeRevision",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "AutomationTemplateScopeRevision",
+        "name": "revision",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "BillingOrder",
+        "name": "reconciliationState",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "settlementState",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'PENDING'::text"
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "settledCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "settlementBasis",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "settlementEvidence",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "settledAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "reversedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "actuallyPaidAtFiat",
+        "data_type": "numeric",
+        "udt_name": "numeric",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "walletCreditTransactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "providerUpdatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
         "table": "CampaignReadReceipt",
         "name": "windowDueAt",
         "data_type": "timestamp without time zone",
@@ -325,6 +469,86 @@
         "udt_name": "int4",
         "is_nullable": "NO",
         "column_default": "0"
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "fromDay",
+        "data_type": "date",
+        "udt_name": "date",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "toDay",
+        "data_type": "date",
+        "udt_name": "date",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "transactionsCount",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "publishedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "receiptId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "proof",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": null
       },
       {
         "table": "CreatorDialogRecoveryRequest",
@@ -564,6 +788,30 @@
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "ltvDeltaVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorEarningsGenerationChange",
+        "name": "generation",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationChange",
+        "name": "transactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
@@ -1333,6 +1581,30 @@
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorFanIdentityHead",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorFanIdentityHead",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorFanIdentityHead",
+        "name": "revision",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
       },
       {
         "table": "CreatorFinancialCollectionState",
@@ -2815,10 +3087,26 @@
         "column_default": null
       },
       {
+        "table": "CreatorSale",
+        "name": "financialCorrelation",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
         "table": "CreatorTip",
         "name": "amountCents",
         "data_type": "integer",
         "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorTip",
+        "name": "financialCorrelation",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
         "is_nullable": "YES",
         "column_default": null
       },
@@ -2935,6 +3223,46 @@
         "column_default": "'{}'::jsonb"
       },
       {
+        "table": "FanLtvPublishedBalance",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvPublishedBalance",
+        "name": "fanId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvPublishedBalance",
+        "name": "revision",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvPublishedBalance",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "FanLtvPublishedBalance",
+        "name": "payments",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
         "table": "FanLtvReceipt",
         "name": "creatorId",
         "data_type": "text",
@@ -3037,6 +3365,38 @@
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "publishedRevision",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "workingRevision",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "1"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "balanceSeedCursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "FanLtvState",
+        "name": "balanceSeedComplete",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
       },
       {
         "table": "MaintenanceAdmissionClassState",
@@ -3239,6 +3599,54 @@
         "column_default": "CURRENT_TIMESTAMP"
       },
       {
+        "table": "TeamTipAlias",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "TeamTipAlias",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "TeamTipAlias",
+        "name": "namespace",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "TeamTipAlias",
+        "name": "externalId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "TeamTipAlias",
+        "name": "rootId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "TeamTipAlias",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
         "table": "TelegramDeliveryIntent",
         "name": "instructionManifest",
         "data_type": "jsonb",
@@ -3277,9 +3685,29 @@
         "hash": "254251db29b2df6223b54693bb0d75be563e86d191822e56b0654733f8af4b3e"
       },
       {
+        "name": "nod_billing_payment_identity_immutable",
+        "args": "",
+        "hash": "073836be02b405f8f5972a69ac1f737cc13121c8d03bbb72272ae0af434ed632"
+      },
+      {
+        "name": "nod_bump_automation_template_revision",
+        "args": "",
+        "hash": "b1a711325ec09e0ceefb117d9c7008a90ecca9c5fec60bd0a1dfde93c48c1650"
+      },
+      {
+        "name": "nod_bump_fan_identity_revision",
+        "args": "",
+        "hash": "2a9ec5e22b086f785b66d53ac8400acc906da4e8a88935e8484d19354009b07b"
+      },
+      {
         "name": "nod_member_edit_revision",
         "args": "",
         "hash": "de96fb6375daa1bff3f52a5628fc02d6fee5acffba4190c391bd8f69468b2fb5"
+      },
+      {
+        "name": "onlinod_billing_recovery_writer208",
+        "args": "",
+        "hash": "b7e47c8d902bae0208d850bf27c8caf92841fc45f5d34fe2c2513fb3e9b9c2f5"
       },
       {
         "name": "onlinod_capacity_publication_fence",
@@ -3312,6 +3740,11 @@
         "hash": "672961dd0f1bf92db88837db884821064ba36d32eb54d9e4aa56759f71cf6d70"
       },
       {
+        "name": "onlinod_fan_ltv_generation_delta208",
+        "args": "",
+        "hash": "a83a3a2add2252aa38593cd1b3428ec179bf1dc8a429b1c55902735a4205a54e"
+      },
+      {
         "name": "onlinod_fan_ltv_source178",
         "args": "",
         "hash": "c0902f1107244bd7841bdd011faa8c7a1de9f69c7dfeb834ec2429e407dee2f0"
@@ -3335,6 +3768,11 @@
         "name": "onlinod_guard_team_purchase_identity_v3",
         "args": "",
         "hash": "a52cf235081fab8464c26d0faaa547d405d4326536803259577a20bf784f4cd2"
+      },
+      {
+        "name": "onlinod_guard_team_tip_identity_v4",
+        "args": "",
+        "hash": "2cca3a3e13b44c1c90733f9831b62ad702fd23b44fdd60301543180567ab0a37"
       },
       {
         "name": "onlinod_live_earnings_hour_v1",
@@ -3382,6 +3820,22 @@
         "function": "nod_member_edit_revision"
       },
       {
+        "table": "AutomationTask",
+        "name": "nod_automation_template_revision",
+        "type": 29,
+        "definition": "CREATE TRIGGER nod_automation_template_revision AFTER INSERT OR DELETE OR UPDATE ON public.\"AutomationTask\" FOR EACH ROW EXECUTE FUNCTION nod_bump_automation_template_revision()",
+        "args": "",
+        "function": "nod_bump_automation_template_revision"
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "nod_billing_payment_identity_immutable",
+        "type": 19,
+        "definition": "CREATE TRIGGER nod_billing_payment_identity_immutable BEFORE UPDATE ON public.\"BillingPaymentAttempt\" FOR EACH ROW EXECUTE FUNCTION nod_billing_payment_identity_immutable()",
+        "args": "",
+        "function": "nod_billing_payment_identity_immutable"
+      },
+      {
         "table": "ContentBlock",
         "name": "ContentBlock_message_library_revision",
         "type": 29,
@@ -3398,10 +3852,26 @@
         "function": "message_library_collection_revision"
       },
       {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "CreatorBillingRecoverySnapshot_writer208",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"CreatorBillingRecoverySnapshot_writer208\" BEFORE INSERT OR UPDATE ON public.\"CreatorBillingRecoverySnapshot\" FOR EACH ROW EXECUTE FUNCTION onlinod_billing_recovery_writer208()",
+        "args": "",
+        "function": "onlinod_billing_recovery_writer208"
+      },
+      {
         "table": "CreatorEarningsGeneration",
         "name": "onlinod_earnings_writer_fence_v7",
         "type": 31,
         "definition": "CREATE TRIGGER onlinod_earnings_writer_fence_v7 BEFORE INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsGeneration\" FOR EACH ROW EXECUTE FUNCTION onlinod_earnings_writer_fence_v7()",
+        "args": "",
+        "function": "onlinod_earnings_writer_fence_v7"
+      },
+      {
+        "table": "CreatorEarningsGenerationChange",
+        "name": "CreatorEarningsGenerationChange_writer208",
+        "type": 31,
+        "definition": "CREATE TRIGGER \"CreatorEarningsGenerationChange_writer208\" BEFORE INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsGenerationChange\" FOR EACH ROW EXECUTE FUNCTION onlinod_earnings_writer_fence_v7()",
         "args": "",
         "function": "onlinod_earnings_writer_fence_v7"
       },
@@ -3412,6 +3882,14 @@
         "definition": "CREATE TRIGGER \"FanLtv_generation178\" AFTER INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsGenerationEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_source178()",
         "args": "",
         "function": "onlinod_fan_ltv_source178"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "FanLtv_generation_delta208",
+        "type": 29,
+        "definition": "CREATE TRIGGER \"FanLtv_generation_delta208\" AFTER INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsGenerationEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_generation_delta208()",
+        "args": "",
+        "function": "onlinod_fan_ltv_generation_delta208"
       },
       {
         "table": "CreatorEarningsGenerationEntry",
@@ -3470,6 +3948,14 @@
         "function": "onlinod_earnings_writer_fence_v6"
       },
       {
+        "table": "CreatorFan",
+        "name": "nod_creator_fan_identity_revision",
+        "type": 29,
+        "definition": "CREATE TRIGGER nod_creator_fan_identity_revision AFTER INSERT OR DELETE OR UPDATE OF \"creatorId\", \"agencyId\", \"onlyFansUserId\", username, \"displayName\" ON public.\"CreatorFan\" FOR EACH ROW EXECUTE FUNCTION nod_bump_fan_identity_revision()",
+        "args": "",
+        "function": "nod_bump_fan_identity_revision"
+      },
+      {
         "table": "CreatorFinancialCollectionState",
         "name": "onlinod_resolution_publication_guard_v7",
         "type": 23,
@@ -3518,6 +4004,14 @@
         "function": "onlinod_fan_ltv_writer178"
       },
       {
+        "table": "FanLtvPublishedBalance",
+        "name": "FanLtvPublishedBalance_writer208",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"FanLtvPublishedBalance_writer208\" BEFORE INSERT OR UPDATE ON public.\"FanLtvPublishedBalance\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_writer178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_writer178"
+      },
+      {
         "table": "FanLtvReceipt",
         "name": "FanLtvReceipt_writer178",
         "type": 23,
@@ -3556,6 +4050,22 @@
         "definition": "CREATE TRIGGER \"TeamPpvPurchaseLedger_identity_guard\" BEFORE UPDATE ON public.\"TeamPpvPurchaseLedger\" FOR EACH ROW EXECUTE FUNCTION onlinod_guard_team_purchase_identity_v3()",
         "args": "",
         "function": "onlinod_guard_team_purchase_identity_v3"
+      },
+      {
+        "table": "TeamTipAlias",
+        "name": "TeamTipAlias_identity_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamTipAlias_identity_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamTipAlias\" FOR EACH ROW EXECUTE FUNCTION onlinod_guard_team_tip_identity_v4()",
+        "args": "",
+        "function": "onlinod_guard_team_tip_identity_v4"
+      },
+      {
+        "table": "TeamTipLedger",
+        "name": "TeamTipLedger_00_identity_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamTipLedger_00_identity_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamTipLedger\" FOR EACH ROW EXECUTE FUNCTION onlinod_guard_team_tip_identity_v4()",
+        "args": "",
+        "function": "onlinod_guard_team_tip_identity_v4"
       }
     ],
     "constraints": [
@@ -3574,6 +4084,70 @@
         "deferrable": false,
         "deferred": false,
         "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "AutomationTemplateScopeRevision",
+        "name": "AutomationTemplateScopeRevision_agencyId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\") REFERENCES \"Agency\"(id) ON DELETE CASCADE"
+      },
+      {
+        "table": "AutomationTemplateScopeRevision",
+        "name": "AutomationTemplateScopeRevision_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"agencyId\", \"creatorId\")"
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "BillingPaymentAttempt_settledCents_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"settledCents\" >= 0))"
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "CreatorBillingRecoverySnapshot_netCents_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"netCents\" >= 0) AND (\"netCents\" <= '9007199254740991'::bigint)))"
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "CreatorBillingRecoverySnapshot_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "CreatorBillingRecoverySnapshot_scope_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "CreatorBillingRecoverySnapshot_transactionsCount_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"transactionsCount\" >= 0))"
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "CreatorBillingRecoverySnapshot_window_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"toDay\" - \"fromDay\") = 29))"
       },
       {
         "table": "CreatorDialogRecoveryRequest",
@@ -3646,6 +4220,22 @@
         "deferrable": false,
         "deferred": false,
         "definition": "CHECK ((state = ANY (ARRAY['BUILDING'::text, 'READY'::text, 'REPAIRING'::text, 'ACTIVE'::text, 'RETIRED'::text])))"
+      },
+      {
+        "table": "CreatorEarningsGenerationChange",
+        "name": "CreatorEarningsGenerationChange_generation_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (generation) REFERENCES \"CreatorEarningsGeneration\"(id) ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorEarningsGenerationChange",
+        "name": "CreatorEarningsGenerationChange_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (generation, \"transactionId\")"
       },
       {
         "table": "CreatorEarningsGenerationDay",
@@ -3902,6 +4492,30 @@
         "deferrable": false,
         "deferred": false,
         "definition": "CHECK ((revision > 0))"
+      },
+      {
+        "table": "CreatorFanIdentityHead",
+        "name": "CreatorFanIdentityHead_agencyId_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON DELETE CASCADE"
+      },
+      {
+        "table": "CreatorFanIdentityHead",
+        "name": "CreatorFanIdentityHead_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorFanIdentityHead",
+        "name": "CreatorFanIdentityHead_revision_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((revision >= 0))"
       },
       {
         "table": "CreatorLiveSync",
@@ -4256,6 +4870,22 @@
         "definition": "PRIMARY KEY (\"creatorId\", stream)"
       },
       {
+        "table": "CreatorSale",
+        "name": "CreatorSale_correlation208_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"financialCorrelation\" IS NULL) OR COALESCE(((jsonb_typeof(\"financialCorrelation\") = 'object'::text) AND ((\"financialCorrelation\" ->> 'version'::text) = '1'::text) AND ((\"financialCorrelation\" ->> 'kind'::text) = ANY (ARRAY['EXACT'::text, 'NEIGHBORHOOD'::text, 'LEGACY_NEIGHBORHOOD'::text])) AND ((\"financialCorrelation\" ->> 'state'::text) = ANY (ARRAY['UNIQUE'::text, 'AMBIGUOUS'::text, 'EXACT'::text]))), false)))"
+      },
+      {
+        "table": "CreatorTip",
+        "name": "CreatorTip_correlation208_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"financialCorrelation\" IS NULL) OR COALESCE(((jsonb_typeof(\"financialCorrelation\") = 'object'::text) AND ((\"financialCorrelation\" ->> 'version'::text) = '1'::text) AND ((\"financialCorrelation\" ->> 'kind'::text) = ANY (ARRAY['EXACT'::text, 'NEIGHBORHOOD'::text, 'LEGACY_NEIGHBORHOOD'::text])) AND ((\"financialCorrelation\" ->> 'state'::text) = ANY (ARRAY['UNIQUE'::text, 'AMBIGUOUS'::text, 'EXACT'::text]))), false)))"
+      },
+      {
         "table": "FanLtvBalance",
         "name": "FanLtvBalance_creatorId_fkey",
         "type": "f",
@@ -4350,6 +4980,38 @@
         "deferrable": false,
         "deferred": false,
         "definition": "PRIMARY KEY (\"creatorId\", \"rangeKey\", category)"
+      },
+      {
+        "table": "FanLtvPublishedBalance",
+        "name": "FanLtvPublishedBalance_creatorId_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"creatorId\") REFERENCES \"FanLtvState\"(\"creatorId\") ON DELETE CASCADE"
+      },
+      {
+        "table": "FanLtvPublishedBalance",
+        "name": "FanLtvPublishedBalance_netCents_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"netCents\" >= 0) AND (\"netCents\" <= '9007199254740991'::bigint)))"
+      },
+      {
+        "table": "FanLtvPublishedBalance",
+        "name": "FanLtvPublishedBalance_payments_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((payments >= 0) AND (payments <= '9007199254740991'::bigint)))"
+      },
+      {
+        "table": "FanLtvPublishedBalance",
+        "name": "FanLtvPublishedBalance_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", \"fanId\", revision)"
       },
       {
         "table": "FanLtvReceipt",
@@ -4480,6 +5142,30 @@
         "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
       },
       {
+        "table": "TeamTipAlias",
+        "name": "TeamTipAlias_namespace_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((namespace = ANY (ARRAY['creator_tip'::text, 'notification'::text, 'transaction'::text, 'event'::text])))"
+      },
+      {
+        "table": "TeamTipAlias",
+        "name": "TeamTipAlias_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"agencyId\", \"creatorId\", namespace, \"externalId\")"
+      },
+      {
+        "table": "TeamTipAlias",
+        "name": "TeamTipAlias_scope_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
         "table": "TelegramDeliveryIntent",
         "name": "TelegramDeliveryIntent_continuation_manifest_check",
         "type": "c",
@@ -4527,6 +5213,24 @@
         "name": "AnalyticsPlanningBudget_creator_idx",
         "unique": false,
         "keys": "6",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "AutomationTemplateScopeRevision",
+        "name": "AutomationTemplateScopeRevision_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "BillingPaymentAttempt",
+        "name": "BillingPaymentAttempt_walletCreditTransactionId_key",
+        "unique": true,
+        "keys": "26",
         "options": "0",
         "expressions": null,
         "predicate": null
@@ -4582,6 +5286,15 @@
         "unique": false,
         "keys": "27 23 4",
         "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorBillingRecoverySnapshot",
+        "name": "CreatorBillingRecoverySnapshot_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
         "expressions": null,
         "predicate": null
       },
@@ -4656,6 +5369,15 @@
         "options": "0 0",
         "expressions": null,
         "predicate": "(state = 'RETIRED'::text)"
+      },
+      {
+        "table": "CreatorEarningsGenerationChange",
+        "name": "CreatorEarningsGenerationChange_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
       },
       {
         "table": "CreatorEarningsGenerationDay",
@@ -4861,6 +5583,15 @@
         "unique": true,
         "keys": "1 2 3",
         "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorFanIdentityHead",
+        "name": "CreatorFanIdentityHead_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
         "expressions": null,
         "predicate": null
       },
@@ -5369,6 +6100,15 @@
         "predicate": null
       },
       {
+        "table": "FanLtvPublishedBalance",
+        "name": "FanLtvPublishedBalance_pkey",
+        "unique": true,
+        "keys": "1 2 3",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
         "table": "FanLtvReceipt",
         "name": "FanLtvReceipt_due178_idx",
         "unique": false,
@@ -5590,6 +6330,24 @@
         "unique": false,
         "keys": "2 5",
         "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "TeamTipAlias",
+        "name": "TeamTipAlias_pkey",
+        "unique": true,
+        "keys": "1 2 3 4",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "TeamTipAlias",
+        "name": "TeamTipAlias_rootId_idx",
+        "unique": false,
+        "keys": "5",
+        "options": "0",
         "expressions": null,
         "predicate": null
       },

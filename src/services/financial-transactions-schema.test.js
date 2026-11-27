@@ -49,18 +49,16 @@ test("ingest keeps unavailable-user and unknown-type transactions as durable fac
     factType: "OTHER", projectionStatus: "STORED_ONLY", saleType: null, reasonCode: "unmapped_transaction_type",
   });
   assert.match(service, /nonpositive_transaction_not_projected/);
-  assert.match(service, /creatorFinancialTransaction\.create/);
-  assert.match(service, /creatorFinancialTransaction\.update/);
   assert.match(service, /creatorId_externalTransactionId/);
-  assert.match(service, /uniqueLegacyProjectionCandidate/);
   assert.match(service, /acceptedByTransactionId = new Map/);
-  assert.match(service, /externalTransactionId: null/);
-  assert.match(service, /purchasedAt: \{ gte, lte \}/);
-  assert.match(service, /tippedAt: \{ gte, lte \}/);
-  const saleUpdate = service.slice(service.indexOf('if (row.factType === "SALE")'), service.indexOf('if (row.factType === "TIP")'));
-  assert.doesNotMatch(saleUpdate, /messageId:\s*null.*data:\s*update/s, "payout updates must not erase an existing message target");
-  const sourceWrite = service.indexOf("creatorFinancialTransaction.create");
-  const projection = service.indexOf("projectKnownFact", sourceWrite);
+  const publication = read("src/services/financial-canonical-publication-repository.js");
+  const live = service.slice(service.indexOf("async function ingestExactLiveTransaction"), service.indexOf("async function publishVerifiedFinancialFactsPage"));
+  assert.match(live, /financial-canonical-publication-repository/);
+  assert.match(publication, /legacyCandidates/);
+  assert.match(publication, /financialCorrelation:correlation\.neighborhoodEvidence/);
+  assert.doesNotMatch(publication, /messageId:\s*null/, "payout updates must not erase notification message evidence");
+  const sourceWrite = publication.indexOf('await upsert(db,"CreatorFinancialTransaction"');
+  const projection = publication.indexOf("const prior=", sourceWrite);
   assert.ok(sourceWrite >= 0 && projection > sourceWrite, "source transaction must be durable before business projection");
 });
 

@@ -1472,15 +1472,10 @@ async function failActionDelivery(input) {
   const endpointSemantics = automationActionWriteSemantics(delivery.actionType);
   const idempotent = endpointSemantics === "IDEMPOTENT_WRITE";
   const reachedWire = delivery.status === "COMMITTING" || Boolean(delivery.writeCommitAt);
-  // Strong negative proof is action-specific and server-owned. Generic client
-  // provenNoEffect/idempotent flags never unlock a non-idempotent COMMITTING row.
-  // SEND_MESSAGE has the existing anchored recent-message reconciliation contract.
-  const actionSpecificNoEffectProof = deliveryRequiresReconciliation(delivery)
-    && delivery.actionType === "SEND_MESSAGE"
-    && failureCode === "send_reconcile_no_effect"
-    && inputResult.readbackCovered === true;
-  const provenNoEffect = !reachedWire || actionSpecificNoEffectProof;
-  const failureCategory = reachedWire && !idempotent && !actionSpecificNoEffectProof
+  // History absence is not provider acknowledgement of a failed POST. A
+  // client readback flag must never release the immutable unknown send lane.
+  const provenNoEffect = !reachedWire;
+  const failureCategory = reachedWire && !idempotent
     ? FAILURE_CATEGORIES.OUTCOME_UNKNOWN_RECONCILE
     : classifyAutomationFailure({
       failureCode, deliveryStatus: delivery.status, provenNoEffect, idempotent, endpointSemantics,

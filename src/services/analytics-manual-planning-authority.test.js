@@ -102,7 +102,8 @@ test("manual Financial planning is serialized by the collector advisory transact
   };
   const tx = {
     async $executeRawUnsafe(sql, key) {
-      // Transaction-local budget setup is not a domain mutation/lock.
+      // Transaction-local setup and the commit constraint check are not locks.
+      if (sql === "SET CONSTRAINTS ALL IMMEDIATE") return 1;
       if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)") return 1;
  locks.push([sql, key]); return 1; },
     jobInstance: { async findMany() { return []; } },

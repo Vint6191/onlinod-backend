@@ -158,7 +158,7 @@ router.post("/creators/:creatorId/cancel-renewal", async (req, res) => {
 
 router.post("/orders/:orderId/reconcile", async (req, res) => {
   try {
-    const result = await reconcileOrder({ agencyId: req.auth.agencyId, orderId: req.params.orderId, actorUserId: req.auth.userId, authorize: billingCheckoutAuthority({ agencyId: req.auth.agencyId, userId: req.auth.userId, actorMember: req.auth.membership }) });
+    const result = await reconcileOrder({ agencyId: req.auth.agencyId, orderId: req.params.orderId, providerPaymentId: req.body?.providerPaymentId || null, actorUserId: req.auth.userId, authorize: billingCheckoutAuthority({ agencyId: req.auth.agencyId, userId: req.auth.userId, actorMember: req.auth.membership }) });
     return res.json({ ok: true, ...result });
   } catch (err) {
     return sendError(res, err, "BILLING_RECONCILE_FAILED");

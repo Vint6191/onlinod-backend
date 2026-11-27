@@ -74,6 +74,7 @@ function makeDb({ balanceCents = 0n, revenue30dCents = 0, capturedAt = new Date(
   const entitlements = new Map();
   const profiles = new Map();
   const orders = new Map();
+  const attempts = new Map();
   let snapshot = null;
   let dailyRows = [];
   let coverageRows = [];
@@ -204,6 +205,11 @@ function makeDb({ balanceCents = 0n, revenue30dCents = 0, capturedAt = new Date(
       findUnique: async ({ where }) => orders.has(where.id) ? { ...orders.get(where.id) } : null,
       updateMany: async ({ where, data }) => { const old=orders.get(where.id); if (!old || (where.status && old.status!==where.status) || (where.activatedAt===null && old.activatedAt)) return {count:0}; orders.set(where.id,{...old,...data}); return {count:1}; },
     },
+    billingPaymentAttempt: {
+      findUnique: async ({ where }) => attempts.has(where.id) ? { ...attempts.get(where.id) } : null,
+      findFirst: async ({ where }) => [...attempts.values()].find(row => Object.entries(where).every(([key, value]) => row[key] === value)) || null,
+      update: async ({ where, data }) => { const row = attempts.get(where.id); assert.ok(row, "payment attempt exists"); const next = { ...row, ...data }; attempts.set(row.id, next); return { ...next }; },
+    },
     _setSnapshot: (amount, at) => { setRevenueEvidence(amount, at); },
     _wallet: (mode = testMode) => wallets.get(walletKey("agency-1", mode)),
     _wallets: wallets,
@@ -212,8 +218,19 @@ function makeDb({ balanceCents = 0n, revenue30dCents = 0, capturedAt = new Date(
     _entitlements: entitlements,
     _profiles: profiles,
     _orders: orders,
+    _attempts: attempts,
   };
   return db;
+}
+
+function seedTopUpPayment(db) {
+  const order = { id: "order-top", agencyId: "agency-1", purpose: "WALLET_TOP_UP", status: "PAID", testMode: false, amountCents: 6000, currency: "USD", provider: "NOWPAYMENTS", providerInvoiceId: "inv", activatedAt: null, paidAt: new Date() };
+  const attempt = { id: "attempt-top", orderId: order.id, provider: "NOWPAYMENTS", providerPaymentId: "payment-top", testMode: false, providerStatus: "finished", settledCents: 0n, settlementState: "PENDING", settlementBasis: null, settlementEvidence: null, settledAt: null, reversedAt: null, walletCreditTransactionId: null };
+  const settlement = require("./billing-payment-value-service").valuePayment(order, { price_amount: "60", price_currency: "usd", pay_amount: "0.006", actually_paid: "0.006", pay_currency: "btc" });
+  assert.equal(settlement.ok, true);
+  assert.equal(settlement.amountCents, 6000n);
+  db._orders.set(order.id, order); db._attempts.set(attempt.id, attempt);
+  return { orderId: order.id, paymentAttemptId: attempt.id, settlement, sandboxActivationEnabled: true, db };
 }
 
 test("automatic tier boundaries are server-defined and customer catalog is monthly-only", () => {
@@ -366,50 +383,60 @@ test("stale earnings never debit wallet", async () => {
 
 test("top-up credit and refund are idempotent; spent refunded funds can produce negative balance", async () => {
   const db=makeDb({balanceCents:0n});
-  db._orders.set("order-top",{id:"order-top",agencyId:"agency-1",purpose:"WALLET_TOP_UP",status:"PAID",testMode:false,amountCents:6000,provider:"NOWPAYMENTS",providerInvoiceId:"inv",activatedAt:null,paidAt:new Date()});
+  const payment = seedTopUpPayment(db);
   const svc=loadWalletService(db);
-  const one=await svc.creditPaidTopUp({orderId:"order-top",sandboxActivationEnabled:true,db});
+  const one=await svc.creditPaidTopUp(payment);
   assert.equal(one.credited,true); assert.equal(db._wallet().balanceCents,6000n);
-  const two=await svc.creditPaidTopUp({orderId:"order-top",sandboxActivationEnabled:true,db});
+  const two=await svc.creditPaidTopUp(payment);
   assert.equal(two.credited,false); assert.equal(db._wallet().balanceCents,6000n);
+  assert.equal(db._transactions.size,1);
+  assert.equal(db._attempts.get(payment.paymentAttemptId).settledCents,6000n);
+  assert.equal([...db._transactions.values()][0].idempotencyKey,"topup-payment:NOWPAYMENTS:live:payment-top:6000");
   db._wallet().balanceCents=1000n; // model already consumed $50 of the top-up
   db._orders.set("order-top",{...db._orders.get("order-top"),status:"REFUNDED"});
-  const refunded=await svc.refundTopUp({order:db._orders.get("order-top"),db});
+  db._attempts.set(payment.paymentAttemptId,{...db._attempts.get(payment.paymentAttemptId),providerStatus:"refunded"});
+  const refunded=await svc.refundTopUp({order:db._orders.get("order-top"),paymentAttemptId:payment.paymentAttemptId,db});
   assert.equal(refunded.reversed,true); assert.equal(db._wallet().balanceCents,-5000n);
-  const again=await svc.refundTopUp({order:db._orders.get("order-top"),db});
+  const again=await svc.refundTopUp({order:db._orders.get("order-top"),paymentAttemptId:payment.paymentAttemptId,db});
   assert.equal(again.reversed,false); assert.equal(db._wallet().balanceCents,-5000n);
+  assert.equal(db._transactions.size,2);
+  assert.equal(db._attempts.get(payment.paymentAttemptId).settlementState,"REFUNDED");
 });
 
 test("top-up idempotency key cannot be poisoned by a foreign agency transaction", async () => {
   const db=makeDb({balanceCents:0n});
-  db._orders.set("order-top",{id:"order-top",agencyId:"agency-1",purpose:"WALLET_TOP_UP",status:"PAID",testMode:false,amountCents:6000,provider:"NOWPAYMENTS",providerInvoiceId:"inv",activatedAt:null,paidAt:new Date()});
+  const payment = seedTopUpPayment(db);
   db._transactions.set("foreign-tx",{
     id:"foreign-tx", walletId:"wallet-agency-2", agencyId:"agency-2", creatorId:null, orderId:"order-top", periodId:null,
-    testMode:false, type:"TOP_UP", amountCents:6000n, balanceAfterCents:6000n, currency:"USD", idempotencyKey:"topup:order-top", createdAt:new Date(),
+    testMode:false, type:"TOP_UP", amountCents:6000n, balanceAfterCents:6000n, currency:"USD", idempotencyKey:"topup-payment:NOWPAYMENTS:live:payment-top:6000", createdAt:new Date(),
   });
   const svc=loadWalletService(db);
   await assert.rejects(
-    () => svc.creditPaidTopUp({orderId:"order-top",sandboxActivationEnabled:true,db}),
+    () => svc.creditPaidTopUp(payment),
     (e)=>e.code==="BILLING_WALLET_IDEMPOTENCY_BINDING_MISMATCH",
   );
   assert.equal(db._wallet().balanceCents,0n);
   assert.equal(db._orders.get("order-top").activatedAt,null);
+  assert.equal(db._attempts.get(payment.paymentAttemptId).settledCents,0n);
+  assert.equal(db._transactions.size,1);
 });
 
-test("top-up idempotency replay must match the locked order amount and scope", async () => {
+test("top-up idempotency replay must match the locked payment amount and scope", async () => {
   const db=makeDb({balanceCents:0n});
-  db._orders.set("order-top",{id:"order-top",agencyId:"agency-1",purpose:"WALLET_TOP_UP",status:"PAID",testMode:false,amountCents:6000,provider:"NOWPAYMENTS",providerInvoiceId:"inv",activatedAt:null,paidAt:new Date()});
+  const payment = seedTopUpPayment(db);
   db._transactions.set("wrong-amount-tx",{
     id:"wrong-amount-tx", walletId:"wallet-live", agencyId:"agency-1", creatorId:null, orderId:"order-top", periodId:null,
-    testMode:false, type:"TOP_UP", amountCents:2417400n, balanceAfterCents:2417400n, currency:"USD", idempotencyKey:"topup:order-top", createdAt:new Date(),
+    testMode:false, type:"TOP_UP", amountCents:2417400n, balanceAfterCents:2417400n, currency:"USD", idempotencyKey:"topup-payment:NOWPAYMENTS:live:payment-top:6000", createdAt:new Date(),
   });
   const svc=loadWalletService(db);
   await assert.rejects(
-    () => svc.creditPaidTopUp({orderId:"order-top",sandboxActivationEnabled:true,db}),
+    () => svc.creditPaidTopUp(payment),
     (e)=>e.code==="BILLING_WALLET_IDEMPOTENCY_BINDING_MISMATCH",
   );
   assert.equal(db._wallet().balanceCents,0n);
   assert.equal(db._orders.get("order-top").activatedAt,null);
+  assert.equal(db._attempts.get(payment.paymentAttemptId).settledCents,0n);
+  assert.equal(db._transactions.size,1);
 });
 
 test("sandbox and live balances are isolated", async () => {

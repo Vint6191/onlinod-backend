@@ -103,14 +103,33 @@ async function readPublishedEarningsAggregates({ db, creatorIds, from, to, now, 
           AND v."status"='COMPLETE'
           AND NOT EXISTS(SELECT 1 FROM ledger_daily l WHERE l."creatorId"=d."creatorId" AND l.date=d.date)
       )
-      SELECT "creatorId",COUNT(*)::bigint AS days,SUM("totalCents")::bigint AS cents,
+      , totals AS (SELECT "creatorId",COUNT(*)::bigint AS days,SUM("totalCents")::bigint AS cents,
         MAX("collectedAt") AS captured,COUNT(*) FILTER (WHERE fresh)::bigint AS fresh,
         (SELECT CASE WHEN a."proofPolicyVersion"<>${require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION} THEN 'POLICY_ADOPTION_REQUIRED'
           WHEN a.publishing THEN 'FINANCIAL_PUBLICATION_PENDING'
           WHEN a.recovering THEN 'RECOVERY_PENDING' WHEN a.unresolved THEN 'UNRESOLVED_MONEY'
           WHEN a.undelivered THEN 'DELIVERY_PENDING' WHEN a."shortGapFrom" IS NOT NULL THEN 'DELIVERY_GAP'
           ELSE NULL END FROM ledger_authority a WHERE a.id=usable_days."creatorId") AS "staleReason"
-      FROM usable_days GROUP BY "creatorId"`, ids.slice(offset, offset+CREATOR_BATCH), from, to, freshAfter, freshBefore, now);
+      FROM usable_days GROUP BY "creatorId"), recovery AS (
+        SELECT s.* FROM "CreatorBillingRecoverySnapshot" s JOIN live_scope c ON c.id=s."creatorId" AND c."agencyId"=s."agencyId"
+        WHERE s."fromDay"=($2::timestamptz AT TIME ZONE 'UTC')::date AND s."toDay"=($3::timestamptz AT TIME ZONE 'UTC')::date
+          AND s."observedAt" BETWEEN ($4::timestamptz AT TIME ZONE 'UTC') AND ($5::timestamptz AT TIME ZONE 'UTC')
+          AND s.proof->>'version'='1' AND s.proof->>'semanticsVersion'='3'
+          AND NOT EXISTS(SELECT 1 FROM totals t WHERE t."creatorId"=s."creatorId" AND t.fresh=30 AND t.captured>=s."observedAt")
+          AND NOT EXISTS(SELECT 1 FROM "CreatorFinancialTransaction" f WHERE f."creatorId"=s."creatorId"
+            AND f."occurredAt">=s."fromDay" AND f."occurredAt"<s."toDay"+interval '1 day' AND f."sourceUpdatedAt">s."observedAt")
+          AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" g WHERE g."creatorId"=s."creatorId"
+            AND g."snapshotAt">s."observedAt" AND g.state IN ('BUILDING','READY','REPAIRING'))
+          AND NOT EXISTS(SELECT 1 FROM "CreatorMoneyObservation" m WHERE m."creatorId"=s."creatorId" AND m.status='PENDING'
+            AND m."capturedAt">s."observedAt" AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" g
+              WHERE g.id=m."coveredGeneration" AND g."publishedAt" IS NOT NULL))
+          AND NOT EXISTS(SELECT 1 FROM "CreatorRecoveryIntent" i WHERE i."creatorId"=s."creatorId" AND i.stream='financial'
+            AND i.status<>'COMPLETE' AND i."targetAt">s."observedAt")
+          AND NOT EXISTS(SELECT 1 FROM "CreatorLiveSync" l WHERE l."creatorId"=s."creatorId" AND l."shortGapTo">s."observedAt")
+          AND NOT EXISTS(SELECT 1 FROM "CreatorRealtimeSession" receiver CROSS JOIN LATERAL (SELECT s."observedAt" AS "throughAt") proof
+            WHERE receiver."creatorId"=s."creatorId" AND ${require("./earnings-coverage-service").uncoveredReceiverDebtSql('proof','receiver')})
+      ) SELECT t.* FROM totals t WHERE NOT EXISTS(SELECT 1 FROM recovery r WHERE r."creatorId"=t."creatorId")
+      UNION ALL SELECT r."creatorId",30::bigint,r."netCents",r."observedAt",30::bigint,NULL::text FROM recovery r`, ids.slice(offset, offset+CREATOR_BATCH), from, to, freshAfter, freshBefore, now);
     rows.push(...batch.map(row => ({ ...row, days: integer(row.days), cents: integer(row.cents), fresh: integer(row.fresh) })));
   }
   return new Map(rows.map(row => [row.creatorId, row]));

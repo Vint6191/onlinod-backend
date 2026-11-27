@@ -94,6 +94,7 @@ test("retention commit guard rejects expired, replaced and completed owner",asyn
  for(const change of [{ownerToken:"new"},{leaseUntil:at},{completedAt:at}]){const tx={$queryRawUnsafe:async sql=>sql.includes("clock_timestamp")?[{authorityNow:olderThan}]:[{ownerToken:"owner",leaseUntil:new Date("2027-01-01"),completedAt:null,...change}]};await assert.rejects(lockRetentionCommit({tx,ownerToken:"owner"}),{code:"RETENTION_LEASE_LOST"});}
 });
 test("metrics reads live and archive within one repeatable snapshot",async()=>{
- let options;const db={$transaction:async(fn,opt)=>{options=opt;return fn({automationMonthlyAggregate:{findMany:async()=>[]},automationDelivery:{findMany:async()=>[],groupBy:async()=>[]}});}};
- assert.equal((await getAutomationMetrics({db,agencyId:"agency-a",creatorId:"creator-a"})).summary.total,0);assert.equal(options.isolationLevel,"RepeatableRead");
+ let options,queries=0;const db={$transaction:async(fn,opt)=>{options=opt;return fn({$queryRawUnsafe:async()=>{queries++;return [];},automationMonthlyAggregate:{findMany:async()=>[]},automationDelivery:{findMany:async()=>{throw Error("Delivery history must be aggregated in SQL");},groupBy:async()=>[]}});}};
+ const result=await getAutomationMetrics({db,agencyId:"agency-a",creatorId:"creator-a"});
+ assert.equal(result.summary.total,0);assert.equal(result.coverage.exact,true);assert.equal(queries,1);assert.equal(options.isolationLevel,"RepeatableRead");
 });

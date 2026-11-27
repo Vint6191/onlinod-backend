@@ -213,6 +213,10 @@ function isLegacyMigrationReviewRow(row) {
     || result?.audit15Closure6MigrationAuthority?.requiresManualReview === true;
 }
 
+function isFinancialIdentityReviewRow(row) {
+  return row?.status === "conflict" && row?.attributionBasis === "FINANCIAL_IDENTITY_AMBIGUOUS";
+}
+
 function expiresAtMs(row) {
   const received = new Date(row?.receivedAt || 0).getTime();
   return Number.isFinite(received) && received > 0 ? received + TIP_CLAIM_GRACE_PERIOD_MS : null;
@@ -320,8 +324,8 @@ function tipRowForClaims(row, membersById = new Map()) {
     state: statusToState(row),
     status: row.status,
     locked,
-    requiresManualReview: isLegacyMigrationReviewRow(row),
-    reviewLane: isLegacyMigrationReviewRow(row) ? "migration_ambiguity" : null,
+    requiresManualReview: isLegacyMigrationReviewRow(row) || isFinancialIdentityReviewRow(row),
+    reviewLane: isFinancialIdentityReviewRow(row) ? "financial_identity_ambiguity" : isLegacyMigrationReviewRow(row) ? "migration_ambiguity" : null,
     expiresAt: expiresAtMs(row),
     attributedToMemberId: row.attributedMemberId,
     attributedToUserId: row.attributedUserId,
@@ -366,7 +370,8 @@ async function listTipClaims({ agencyId, limit = 200, actorMemberId = null, seni
     ? await readCanonicalTipClaims("tip_claims_migration_review", () => prisma.teamTipLedger.findMany({
         where: {
           ...baseWhere,
-          AND: [activeFinancialWhere(), { resolvedSource: LEGACY_MIGRATION_REVIEW_SOURCE }],
+          AND: [activeFinancialWhere(), { OR: [{ resolvedSource: LEGACY_MIGRATION_REVIEW_SOURCE },
+            { status: "conflict", attributionBasis: "FINANCIAL_IDENTITY_AMBIGUOUS" }] }],
         },
         orderBy: [{ receivedAt: "asc" }, { id: "asc" }],
         take: safeLimit,
@@ -391,7 +396,7 @@ async function listTipClaims({ agencyId, limit = 200, actorMemberId = null, seni
     visible = filtered;
   }
   visible.sort((a, b) => {
-    const reviewOrder = Number(isLegacyMigrationReviewRow(b)) - Number(isLegacyMigrationReviewRow(a));
+    const reviewOrder = Number(isLegacyMigrationReviewRow(b) || isFinancialIdentityReviewRow(b)) - Number(isLegacyMigrationReviewRow(a) || isFinancialIdentityReviewRow(a));
     if (reviewOrder) return reviewOrder;
     return new Date(b.receivedAt || 0).getTime() - new Date(a.receivedAt || 0).getTime();
   });
@@ -507,7 +512,8 @@ async function applyTipOverride({ agencyId, byUserId, byMemberId, actorMember = 
     if (!financiallyActive(row)) return { code: "TIP_FINANCIAL_REVERSED", error: "This tip was reversed in the financial ledger" };
     const migrationReview = isLegacyMigrationReviewRow(row);
     const historicalManagerReview = cleanAction === "manager_override" && migrationReview;
-    if (isLocked(row) && !historicalManagerReview) return { code: "ATTRIBUTION_LOCKED", error: "48-hour grace period elapsed" };
+    const financialIdentityReview = cleanAction === "manager_override" && isFinancialIdentityReviewRow(row);
+    if (isLocked(row) && !historicalManagerReview && !financialIdentityReview) return { code: "ATTRIBUTION_LOCKED", error: "48-hour grace period elapsed" };
 
     let nextStatus = row.status;
     let nextOwnerMemberId = row.attributedMemberId;

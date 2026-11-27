@@ -223,7 +223,7 @@ async function ensureActiveMember(db, sale, sent) {
   });
 }
 
-async function upsertResolveJob(db, { purchase, sale, proposed, sent }) {
+async function upsertResolveJob(db, { purchase, sale, proposed, sent, previousResult = null }) {
   const messageId = clean(sale.messageId, 160);
   if (!messageId || !db?.teamPpvResolveJob?.upsert) return null;
   const key = {
@@ -269,14 +269,14 @@ async function upsertResolveJob(db, { purchase, sale, proposed, sent }) {
         ...base,
         status: "conflict",
         attempts: 0,
-        result: { conflict: true, claimType: "ppv_attribution_conflict", source: "creator_sale_reconciliation", candidates },
+        result: { ...previousResult, conflict: true, claimType: "ppv_attribution_conflict", source: "creator_sale_reconciliation", reason: proposed.basis, candidates },
       },
       update: {
         amountCents: base.amountCents,
         currency: base.currency,
         purchasedAt: base.purchasedAt,
         status: "conflict",
-        result: { conflict: true, claimType: "ppv_attribution_conflict", source: "creator_sale_reconciliation", candidates },
+        result: { ...previousResult, conflict: true, claimType: "ppv_attribution_conflict", source: "creator_sale_reconciliation", reason: proposed.basis, candidates },
       },
     });
   }
@@ -388,8 +388,10 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
   let existing = await findExistingPurchase(db, {
     sale, purchaseId, fanExternalId, financialTransactionId: financialTransaction?.id || null,
   });
-  await lockPpvResolveJobByIdentity(db, {agencyId:sale.agencyId,purchaseId:existing?.purchaseId||purchaseId,messageId:clean(sale.messageId,160)});
+  const lockedResolveJob = await lockPpvResolveJobByIdentity(db, {agencyId:sale.agencyId,purchaseId:existing?.purchaseId||purchaseId,messageId:clean(sale.messageId,160)});
   if (existing) existing = await lockPpvPurchaseRow(db, existing);
+  const correlationReview = require("./financial-correlation-service").requiresReview(sale, existing);
+  if (correlationReview) proposed = { ...proposed, status: "conflict", basis: "FINANCIAL_IDENTITY_AMBIGUOUS" };
   const ambiguousLegacyClaim=existing && manualResolutionPreserved(existing)
     && await require("./team-purchase-identity-service").legacyAmbiguous(db,sale,existing);
   const accountId = clean(sent?.accountId || sale.creatorId, 160) || sale.creatorId;
@@ -418,11 +420,19 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
       where: { id: existing.id },
       data: {
         ...sourceData,
-        attributionBasis: ambiguousLegacyClaim?"LEGACY_IDENTITY_REVIEW_REQUIRED":existing.attributionBasis || "MANUAL_OVERRIDE_PRESERVED",
-        ...(ambiguousLegacyClaim?{status:"conflict"}:{}),
+        attributionBasis: correlationReview?"FINANCIAL_IDENTITY_AMBIGUOUS":ambiguousLegacyClaim?"LEGACY_IDENTITY_REVIEW_REQUIRED":existing.attributionBasis || "MANUAL_OVERRIDE_PRESERVED",
+        ...(ambiguousLegacyClaim||correlationReview?{status:"conflict"}:{}),
+        ...(!correlationReview&&!ambiguousLegacyClaim?require("./financial-correlation-service").restoredManualDecision(sale,existing):{}),
       },
     });
     await require("./team-purchase-identity-service").bind(db,sale,existing);
+    if (correlationReview && sale.messageId && financiallyActive({financialStatus})) {
+      await upsertResolveJob(db, { purchase: existing, sale, proposed, sent, previousResult: lockedResolveJob?.result });
+    } else if (!correlationReview && lockedResolveJob?.status === "conflict"
+      && lockedResolveJob.result?.reason === "FINANCIAL_IDENTITY_AMBIGUOUS" && existing.status === "attributed") {
+      await db.teamPpvResolveJob.update({where:{id:lockedResolveJob.id},data:{status:"resolved",resolvedAt:new Date(),
+        result:{...lockedResolveJob.result,conflict:false,financialCorrelationResolution:"EXACT_IDENTITY_OR_EXPLICIT_REVIEW"}}});
+    }
     await publishTeamMoneyResult(db, existing, "PPV_RECONCILED");
     return { ok: true, purchase: existing, preservedManualResolution: true, financialRefunded: isRefundStatus(financialStatus) };
   }
@@ -570,11 +580,11 @@ function tipManualResolutionPreserved(row) {
     || String(row?.resolvedSource || "").startsWith("manual_");
 }
 
-async function recoverTipRootFromDurableFact(db, { tip, eventHash }) {
+async function recoverTipRootFromDurableFact(db, { tip, eventHash, aliasRootId = null }) {
   if (!db?.teamMoneyAttributionFact?.findMany || !db?.teamTipLedger?.create) return null;
-  const externalIds = [tip.externalNotificationId, tip.externalTransactionId, tip.eventFingerprint, tip.id].map((v) => clean(v, 220)).filter(Boolean);
   const facts = await db.teamMoneyAttributionFact.findMany({
-    where: { agencyId: tip.agencyId, sourceType: "TIP", OR: [{ creatorTipId: tip.id }, { externalId: { in: externalIds } }] },
+    where: { agencyId: tip.agencyId, creatorId: tip.creatorId, sourceType: "TIP",
+      OR: [{ creatorTipId: tip.id }, ...(aliasRootId ? [{ rootId: aliasRootId }] : [])] },
     orderBy: [{ sourceUpdatedAt: "desc" }, { id: "asc" }], take: 3,
   });
   const roots = [...new Set((facts || []).map((f) => clean(f.rootId || f.sourceRowId, 220)).filter(Boolean))];
@@ -589,7 +599,11 @@ async function recoverTipRootFromDurableFact(db, { tip, eventHash }) {
   const existingById = db.teamTipLedger.findUnique
     ? await db.teamTipLedger.findUnique({ where: { id: rootId } })
     : null;
-  if (existingById) return existingById;
+  if (existingById) {
+    if (!require("./team-tip-identity-service").compatible(existingById, tip)) throw Object.assign(Error("TEAM_TIP_ROOT_SCOPE_MISMATCH"), { code: "TEAM_TIP_ROOT_SCOPE_MISMATCH" });
+    return existingById;
+  }
+  if (fact.creatorTipId && fact.creatorTipId !== tip.id && aliasRootId !== rootId) throw Object.assign(Error("TEAM_TIP_RETAINED_IDENTITY_MISMATCH"), { code: "TEAM_TIP_RETAINED_IDENTITY_MISMATCH" });
   try {
     return await db.teamTipLedger.create({ data: {
       id: rootId, agencyId: tip.agencyId, accountId: clean(fact.creatorId || tip.creatorId, 160) || tip.creatorId,
@@ -612,7 +626,7 @@ async function recoverTipRootFromDurableFact(db, { tip, eventHash }) {
     const recovered = db.teamTipLedger.findUnique
       ? await db.teamTipLedger.findUnique({ where: { id: rootId } })
       : null;
-    if (recovered) return recovered;
+    if (recovered && require("./team-tip-identity-service").compatible(recovered, tip)) return recovered;
     throw error;
   }
 }
@@ -645,11 +659,18 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
   }
 
   const eventHash = clean(tip.eventFingerprint, 120) || clean(tip.id, 120);
+  const identity = require("./team-tip-identity-service");
+  const aliased = await identity.find(db, tip);
   let existing = await db.teamTipLedger.findFirst({
-    where: { agencyId: tip.agencyId, OR: [{ creatorTipId: tip.id }, { eventHash }] },
-  }).catch(() => null);
-  if (!existing) existing = await recoverTipRootFromDurableFact(db, { tip, eventHash });
+    where: { agencyId: tip.agencyId, creatorId: tip.creatorId, creatorTipId: tip.id },
+  });
+  if (existing && aliased && existing.id !== aliased.rootId) throw Object.assign(Error("TEAM_TIP_ALIAS_CONFLICT"), { code: "TEAM_TIP_ALIAS_CONFLICT" });
+  existing ||= aliased?.root;
+  if (!existing) existing = await recoverTipRootFromDurableFact(db, { tip, eventHash, aliasRootId: aliased?.rootId });
+  if (existing && !identity.compatible(existing, tip)) throw Object.assign(Error("TEAM_TIP_ROOT_SCOPE_MISMATCH"), { code: "TEAM_TIP_ROOT_SCOPE_MISMATCH" });
   if (existing) existing = await lockTipLedgerRow(db, existing);
+  const correlationReview = require("./financial-correlation-service").requiresReview(tip, existing);
+  if (correlationReview) proposed = { ...proposed, status: "conflict", basis: "FINANCIAL_IDENTITY_AMBIGUOUS" };
 
   const sourceData = {
     agencyId: tip.agencyId,
@@ -671,10 +692,14 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
   };
 
   if (existing && tipManualResolutionPreserved(existing)) {
+    const ambiguousLegacy=!aliased&&await identity.legacyAmbiguous(db,tip);
     existing = await db.teamTipLedger.update({
       where: { id: existing.id },
-      data: { ...sourceData, attributionBasis: existing.attributionBasis || "MANUAL_OVERRIDE_PRESERVED" },
+      data: { ...sourceData, attributionBasis: correlationReview?"FINANCIAL_IDENTITY_AMBIGUOUS":ambiguousLegacy?"LEGACY_IDENTITY_REVIEW_REQUIRED":existing.attributionBasis || "MANUAL_OVERRIDE_PRESERVED",
+        ...(ambiguousLegacy||correlationReview?{status:"conflict"}:{}),
+        ...(!correlationReview&&!ambiguousLegacy?require("./financial-correlation-service").restoredManualDecision(tip,existing):{}) },
     });
+    await identity.bind(db, tip, existing);
     await publishTeamMoneyResult(db, existing, "TIP_RECONCILED");
     return { ok: true, attribution: existing, preservedManualResolution: true, financialRefunded: isRefundStatus(financialStatus) };
   }
@@ -733,6 +758,7 @@ async function reconcileCreatorTipToTeamInTransaction({ db, tipId }) {
     ? await db.teamTipLedger.update({ where: { id: existing.id }, data })
     : await db.teamTipLedger.create({ data });
 
+  await identity.bind(db, tip, attribution);
   await publishTeamMoneyResult(db, attribution, "TIP_RECONCILED");
   return {
     ok: true, attribution, proposedStatus: proposed.status, attributionBasis: proposed.basis,

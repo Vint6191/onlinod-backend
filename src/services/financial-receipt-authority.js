@@ -14,7 +14,7 @@ function fault(code) { return new FinancialReceiptError(code); }
 const INVALID_CLAIM_CODES = new Set([
   "FINANCIAL_WINDOW_END_INVALID", "FINANCIAL_WINDOWS_REQUIRED", "FINANCIAL_WINDOW_INVALID",
   "FINANCIAL_WINDOW_BINDING_INVALID", "FINANCIAL_RESOLUTION_BINDING_INVALID", "FINANCIAL_FRONTIER_BINDING_INVALID",
-  "FINANCIAL_HEAD_WINDOW_INVALID", "FINANCIAL_HISTORY_WINDOW_INVALID", "FINANCIAL_FULL_WINDOW_INVALID",
+  "FINANCIAL_HEAD_WINDOW_INVALID", "FINANCIAL_HISTORY_WINDOW_INVALID", "FINANCIAL_FULL_WINDOW_INVALID", "BILLING_FINANCIAL_WINDOW_INVALID",
 ]);
 function invalidClaim(error) { return error instanceof FinancialReceiptError && INVALID_CLAIM_CODES.has(error.code); }
 function enabled(job) { return job?.jobKey === "financial_transactions_scan" && job.params?.financialReceiptVersion === 1; }
@@ -66,6 +66,10 @@ function planWindows(params, state) {
   const end = date(params.endDate) || date(params.collectionRequestedAt);
   if (!end) throw fault("FINANCIAL_WINDOW_END_INVALID");
   const mode = params.collectionMode || params.financialMode;
+  if(params.billingRecoveryVersion===1) {
+    if(!require("./billing-financial-recovery-service").windowValid(params,date(params.collectionRequestedAt)))throw fault("BILLING_FINANCIAL_WINDOW_INVALID");
+    return [window("BILLING",date(params.startDate),end)];
+  }
   if (params.moneyResolutionVersion === 1) {
     const from = date(params.startDate);
     if (!from || from > end || +end - from > 3600000 || mode !== "catchup"
@@ -106,11 +110,14 @@ function windowsFor(job) {
   if (!enabled(job) || job.params.financialWindowGeneration !== job.params.collectionGeneration || !Array.isArray(windows) || !windows.length || windows.length > 2) throw fault("FINANCIAL_WINDOWS_REQUIRED");
   for (const w of windows) {
     const unbounded = currentTraversal(job) && ["FULL", "FRONTIER"].includes(w?.kind) && w.from === null;
-    if (!w || !["FULL", "HEAD", "GAP", "AUDIT", "FRONTIER", "RESOLUTION"].includes(w.kind) || (!unbounded && !date(w.from)) || !date(w.to) || (w.from && date(w.from) > date(w.to)) || String(w.initialMarker) !== String(Math.floor(+date(w.to) / 1000))) throw fault("FINANCIAL_WINDOW_INVALID");
+    if (!w || !["FULL", "HEAD", "GAP", "AUDIT", "FRONTIER", "RESOLUTION", "BILLING"].includes(w.kind) || (!unbounded && !date(w.from)) || !date(w.to) || (w.from && date(w.from) > date(w.to)) || String(w.initialMarker) !== String(Math.floor(+date(w.to) / 1000))) throw fault("FINANCIAL_WINDOW_INVALID");
   }
   const head = windows[0], catchup = (job.params.collectionMode || job.params.financialMode) === "catchup";
   if (head.to !== date(job.params.endDate)?.toISOString()) throw fault("FINANCIAL_WINDOW_BINDING_INVALID");
-  if (job.params.moneyResolutionVersion === 1) {
+  if (job.params.billingRecoveryVersion === 1) {
+    if(!require("./billing-financial-recovery-service").windowValid(job.params,date(job.params.collectionRequestedAt))
+      ||windows.length!==1||head.kind!=="BILLING"||head.from!==date(job.params.startDate)?.toISOString())throw fault("BILLING_FINANCIAL_WINDOW_INVALID");
+  } else if (job.params.moneyResolutionVersion === 1) {
     if (!catchup || windows.length!==1 || head.kind!=="RESOLUTION" || +date(head.to)-date(head.from)>3600000
       || !job.params.moneyResolutionObservationId || head.from!==date(job.params.startDate)?.toISOString()) throw fault("FINANCIAL_RESOLUTION_BINDING_INVALID");
   } else if (catchup && job.params.financialFrontierVersion === 2) {
@@ -152,7 +159,7 @@ async function claimParams(db, job) {
   state ??= await db.creatorFinancialCollectionState.findUnique({ where: { creatorId: job.creatorId } });
   const params = { ...job.params, financialReceiptVersion: 1, financialTraversalVersion: 2, collectorVersion: COLLECTOR };
   delete params.knownTransactionIds; delete params.catchupMaxPages;
-  if ((params.collectionMode || params.financialMode) === "catchup" && params.moneyResolutionVersion !== 1) params.financialFrontierVersion = 2;
+  if ((params.collectionMode || params.financialMode) === "catchup" && params.moneyResolutionVersion !== 1 && params.billingRecoveryVersion!==1) params.financialFrontierVersion = 2;
   if (params.financialFrontierVersion===2 && (params.collectionMode||params.financialMode)==="catchup") {
     const generation=state?.lastCatchupGeneration || state?.baselineGeneration;
     if(!generation || !state?.baselineVerifiedAt)throw fault("FINANCIAL_FRONTIER_BASELINE_REQUIRED");

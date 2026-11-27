@@ -321,10 +321,14 @@ function dialogDiscoveryClaimConstraint(enabled, targetedReconciliation = false)
   };
 }
 
-function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly, targetedReconciliation, excludedJobIds = [], fanRefreshBlockedCreatorIds = [], fanRefreshGlobalBlocked = false, billingConstraint = null, moneyResolutionSupported = true }) {
+function claimCandidateWhere({ allowedJobKeys, eligibleCreatorIds, now, dialogDiscoveryOnly, targetedReconciliation, excludedJobIds = [], fanRefreshBlockedCreatorIds = [], fanRefreshGlobalBlocked = false, billingConstraint = null, moneyResolutionSupported = true, billingFinancialRecoverySupported = true }) {
   const constraints = [];
   if (allowedJobKeys.some(key => INITIAL_ORDERED_JOB_KEYS.has(key))) constraints.push(initialCollectionClaimWhere(now));
   if (billingConstraint) constraints.push(billingConstraint);
+  if(!billingFinancialRecoverySupported&&allowedJobKeys.includes("financial_transactions_scan"))constraints.push({OR:[
+    {jobKey:{not:"financial_transactions_scan"}},{params:{path:["billingRecoveryVersion"],not:1}},
+    {params:{path:["billingRecoveryVersion"],equals:Prisma.DbNull}},
+  ]});
   if (!moneyResolutionSupported && allowedJobKeys.includes("financial_transactions_scan")) constraints.push({ OR: [
     { jobKey: { not: "financial_transactions_scan" } },
     { params: { path: ["moneyResolutionVersion"], not: 1 } },
@@ -666,6 +670,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
   const billingConstraint = billingJobClaimWhere({
     access: await readBillingExecutionAccess({ db: prisma, agencyId: device.agencyId, creatorIds: eligibleCreatorIds }),
     recoveryCapable: capabilities?.billingRecoveryLeaseV1 === true,
+    financialRecoveryCapable: capabilities?.billingFinancialRecoveryV1 === true,
   });
   const capacityBlockedIds = [];
   const fanRefreshBlockedCreatorIds = [];
@@ -695,6 +700,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       fanRefreshGlobalBlocked,
       billingConstraint,
       moneyResolutionSupported: capabilities?.financialMoneyResolutionV1 === true,
+      billingFinancialRecoverySupported: capabilities?.billingFinancialRecoveryV1 === true,
     });
     const candidate = await require("./job-claim-fairness-service").selectClaimCandidate({ db: prisma, where: candidateWhere, now });
     if (!candidate) return { job: null, reason: rejectedFinancialClaims ? "invalid-financial-command" : initialStageBlocked ? "initial-stage-wait" : "no-work",
@@ -743,7 +749,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
     const claimWork = async (db) => {
       await assertExecutionAccessFence({ db, userId, agencyId: device.agencyId, memberId: member.id,
         accessEpoch: Number(member.accessEpoch || 1), creatorId: candidate.creatorId, lock: true });
-      await assertJobBillingAccess({ db, job: candidate, recoveryCapable: capabilities?.billingRecoveryLeaseV1 === true });
+      await assertJobBillingAccess({ db, job: candidate, recoveryCapable: capabilities?.billingRecoveryLeaseV1 === true, financialRecoveryCapable: capabilities?.billingFinancialRecoveryV1 === true });
       if (String(candidate.jobKey || "") === "fetch_campaigns") {
         await enterCampaignClaimGeneration({ db });
         if (campaignDirectoryDiscoveryJob(candidate.params) && !(await campaignDirectoryDiscoveryClaimAvailable(db, candidate.params))) {
@@ -764,7 +770,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
       }
       // Capacity/job locks can outlive the time read during request admission.
       // Recheck paid access and telemetry and construct a full lease only now.
-      const billing = await assertJobBillingAccess({ db, job: candidate, recoveryCapable: capabilities?.billingRecoveryLeaseV1 === true });
+      const billing = await assertJobBillingAccess({ db, job: candidate, recoveryCapable: capabilities?.billingRecoveryLeaseV1 === true, financialRecoveryCapable: capabilities?.billingFinancialRecoveryV1 === true });
       const claimNow = billing.now;
       if (INITIAL_ORDERED_JOB_KEYS.has(candidate.jobKey)) {
         const fresh = await loadInitialCollectionAdmission({ db, creatorIds: [candidate.creatorId], now: claimNow });
@@ -836,6 +842,7 @@ async function claimJob({ userId, deviceId, leaseMs, jobKeys, excludedCreatorIds
             fanRefreshGlobalBlocked,
             billingConstraint,
             moneyResolutionSupported: capabilities?.financialMoneyResolutionV1 === true,
+            billingFinancialRecoverySupported: capabilities?.billingFinancialRecoveryV1 === true,
           }),
         },
         data: attemptClaimData,

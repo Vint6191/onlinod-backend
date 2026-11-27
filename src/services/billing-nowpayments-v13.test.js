@@ -134,6 +134,20 @@ function makeProcessingDb({ failOrderUpdateOnce = false } = {}) {
   const db = {
     systemSetting: policyModelFixture(),
     $executeRawUnsafe: async () => 0,
+    $queryRawUnsafe: async (sql, id) => {
+      if (sql.includes("clock_timestamp")) return [{ authorityNow: new Date() }];
+      if (!sql.includes('FROM "BillingPaymentAttempt"')) return [{ id }];
+      const rows = [...attempts.values()].filter(row => row.orderId === id);
+      return [{
+        net: String(rows.filter(row => !row.reversedAt).reduce((sum, row) => sum + BigInt(row.settledCents || 0), 0n)),
+        refunded: rows.filter(row => row.reversedAt).length,
+        review: rows.filter(row => row.settlementState === "REVIEW_REQUIRED").length,
+        pending: rows.filter(row => ["waiting", "confirming", "confirmed", "sending"].includes(row.providerStatus)).length,
+        failed: rows.filter(row => row.providerStatus === "failed").length,
+        expired: rows.filter(row => row.providerStatus === "expired").length,
+        total: rows.length,
+      }];
+    },
     billingOrder: {
       findUnique: async ({ where }) => where.id === order.id ? { ...order } : null,
       update: async ({ where, data }) => {
@@ -194,12 +208,22 @@ function makeProcessingDb({ failOrderUpdateOnce = false } = {}) {
       upsert: async ({ where, create, update }) => { const current = profiles.get(where.creatorId); const next = current ? { ...current, ...update } : { id: `profile-${profiles.size + 1}`, ...create }; profiles.set(where.creatorId, next); return { ...next }; },
     },
     billingPaymentAttempt: {
-      findUnique: async ({ where }) => attempts.get(paymentIdFromWhere(where)) || null,
+      findUnique: async ({ where }) => {
+        const row = where.id ? [...attempts.values()].find(row => row.id === where.id) : attempts.get(paymentIdFromWhere(where));
+        return row ? { ...row } : null;
+      },
       findFirst: async () => { const rows = [...attempts.values()]; return rows.length ? { ...rows[rows.length - 1] } : null; },
+      findMany: async ({ where = {}, take } = {}) => [...attempts.values()]
+        .filter(row => (!where.orderId || row.orderId === where.orderId) && (!where.id?.gt || row.id > where.id.gt))
+        .sort((a, b) => a.id.localeCompare(b.id)).slice(0, take).map(row => ({ ...row })),
+      update: async ({ where, data }) => {
+        const row = [...attempts.values()].find(row => row.id === where.id); assert.ok(row, "payment attempt exists");
+        const next = { ...row, ...data }; attempts.set(next.providerPaymentId, next); return { ...next };
+      },
       upsert: async ({ where, create, update }) => {
         const providerPaymentId = paymentIdFromWhere(where);
         let row = attempts.get(providerPaymentId);
-        if (!row) row = { id: `attempt-${attempts.size + 1}`, ...create, order: { ...order } };
+        if (!row) row = { id: `attempt-${attempts.size + 1}`, settledCents: 0n, reversedAt: null, ...create, order: { ...order } };
         else row = { ...row, ...update, order: { ...order } };
         attempts.set(providerPaymentId, row); return { ...row };
       },
@@ -222,7 +246,7 @@ function makeProcessingDb({ failOrderUpdateOnce = false } = {}) {
     _getOrder: () => ({ ...order }),
     _setOrder: (patch) => { order = { ...order, ...patch }; },
     _setSubscription: (patch) => { subscription = { ...subscription, ...patch }; },
-    _seedAttempt: (row) => { attempts.set(row.providerPaymentId, { id: row.id || `attempt-${attempts.size + 1}`, orderId: order.id, provider: "NOWPAYMENTS", testMode: order.testMode === true, order: { ...order }, ...row }); },
+    _seedAttempt: (row) => { attempts.set(row.providerPaymentId, { id: row.id || `attempt-${attempts.size + 1}`, orderId: order.id, provider: "NOWPAYMENTS", testMode: order.testMode === true, settledCents: 0n, reversedAt: null, order: { ...order }, ...row }); },
     _activationWrites: () => ({ subscriptionWrites, agencyWrites }),
     _lastSubscriptionWrite: () => lastSubscriptionWrite ? { ...lastSubscriptionWrite } : null,
     _entitlements: entitlements,
@@ -569,24 +593,37 @@ test("manual reconciliation can activate an already-paid sandbox order after act
       assert.equal(second.order.status, "PAID");
       assert.ok(second.order.activatedAt);
       assert.equal(db._activationWrites().subscriptionWrites, 1);
+      assert.equal(db._events.size, 1, "same provider observation retains one receipt while activation is recovered");
+      const replay = await service.reconcileOrder({ agencyId: "agency-1", orderId: "order-1", actorUserId: "owner", db });
+      assert.equal(replay.order.activatedAt, second.order.activatedAt);
+      assert.equal(db._activationWrites().subscriptionWrites, 1, "reconciliation never grants the paid period twice");
     });
   } finally { global.fetch = previousFetch; }
 });
 
-test("manual reconciliation of a paid wallet top-up never claims subscription activation and remains recoverable", async () => {
+test("manual reconciliation of a finished wallet payment never claims subscription activation and remains recoverable", async () => {
   const db = makeProcessingDb();
   db._setOrder({ purpose: "WALLET_TOP_UP", status: "PAID", billedCreators: 0, pricingSnapshot: { purpose: "WALLET_TOP_UP" }, activatedAt: null });
   db._seedAttempt({ id: "attempt-topup-recover", providerPaymentId: "payment-topup-recover", providerStatus: "finished" });
-  const payload = { payment_id: "payment-topup-recover", payment_status: "finished", order_id: "order-1", invoice_id: "invoice-1", price_amount: 20, price_currency: "usd" };
+  const payload = { payment_id: "payment-topup-recover", payment_status: "finished", order_id: "order-1", invoice_id: "invoice-1", price_amount: "20", price_currency: "usd", pay_amount: "0.002", actually_paid: "0.002", pay_currency: "btc" };
   const previousFetch = global.fetch;
   global.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(payload) });
   let creditCalls = 0;
+  let credits = 0;
   let subscriptionActivationCalls = 0;
   const dependencyMocks = {
     wallet: {
-      creditPaidTopUp: async ({ sandboxActivationEnabled }) => {
+      creditPaidTopUp: async ({ orderId, paymentAttemptId, settlement, sandboxActivationEnabled }) => {
         creditCalls += 1;
+        assert.equal(orderId, "order-1");
+        assert.equal(paymentAttemptId, "attempt-topup-recover");
+        assert.equal(settlement.ok, true);
+        assert.equal(settlement.amountCents, 2000n);
         if (sandboxActivationEnabled !== true) return { credited: false, reason: "SANDBOX_ACTIVATION_DISABLED" };
+        const previous = await db.billingPaymentAttempt.findUnique({ where: { id: paymentAttemptId } });
+        if (previous.settledCents === settlement.amountCents) return { credited: false, reason: "ALREADY_CREDITED" };
+        await db.billingPaymentAttempt.update({ where: { id: paymentAttemptId }, data: { settledCents: settlement.amountCents, settlementState: "CREDITED", settlementBasis: settlement.basis, settlementEvidence: settlement.evidence } });
+        credits += 1;
         db._setOrder({ activatedAt: new Date("2026-08-14T13:00:00Z") });
         return { credited: true };
       },
@@ -601,17 +638,26 @@ test("manual reconciliation of a paid wallet top-up never claims subscription ac
     await withEnv({ NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NOWPAYMENTS_SANDBOX_ACTIVATE: "0", NODE_ENV: "production" }, async () => {
       const service = loadService(db, async () => null, dependencyMocks);
       const first = await service.reconcileOrder({ agencyId: "agency-1", orderId: "order-1", actorUserId: "owner", db });
-      assert.equal(first.order.status, "PAID");
+      assert.equal(first.order.status, "PROCESSING");
       assert.equal(first.order.activatedAt, null);
+      assert.equal(first.order.settledAmountCents, "0");
       assert.equal(subscriptionActivationCalls, 0);
+      assert.equal(credits, 0);
     });
     await withEnv({ NOWPAYMENTS_MODE: "sandbox", NOWPAYMENTS_API_KEY: "key", NOWPAYMENTS_IPN_SECRET: "secret", PUBLIC_BASE_URL: "https://api.example.com", NOWPAYMENTS_SANDBOX_ACTIVATE: "1", NODE_ENV: "production" }, async () => {
       const service = loadService(db, async () => null, dependencyMocks);
       const second = await service.reconcileOrder({ agencyId: "agency-1", orderId: "order-1", actorUserId: "owner", db });
       assert.equal(second.order.status, "PAID");
       assert.ok(second.order.activatedAt);
+      assert.equal(second.order.settledAmountCents, "2000");
       assert.equal(subscriptionActivationCalls, 0);
-      assert.ok(creditCalls >= 3, "wallet credit path was retried instead of subscription activation");
+      assert.equal(creditCalls, 2, "each reconciliation checks the same payment exactly once");
+      assert.equal(credits, 1);
+      assert.equal(db._events.size, 1, "recovery reuses the original provider receipt");
+      const replay = await service.reconcileOrder({ agencyId: "agency-1", orderId: "order-1", actorUserId: "owner", db });
+      assert.equal(replay.order.settledAmountCents, "2000");
+      assert.equal(replay.order.activatedAt, second.order.activatedAt);
+      assert.equal(creditCalls, 3); assert.equal(credits, 1); assert.equal(subscriptionActivationCalls, 0);
     });
   } finally { global.fetch = previousFetch; }
 });

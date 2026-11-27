@@ -91,7 +91,7 @@ function recoveryWindow(params, now) {
   return from >= bounds.from && to <= bounds.to && from <= to && Date.parse(to) - Date.parse(from) < 30 * DAY_MS;
 }
 
-function billingJobClaimWhere({ access, recoveryCapable }) {
+function billingJobClaimWhere({ access, recoveryCapable, financialRecoveryCapable = false }) {
   const paid = [], recovery = [];
   let now = null;
   for (const [id, state] of access) {
@@ -108,14 +108,21 @@ function billingJobClaimWhere({ access, recoveryCapable }) {
       { params: { path: ["scanFrom"], gte: bounds.from } },
       { params: { path: ["scanTo"], lte: bounds.to } },
     ] });
+    if(financialRecoveryCapable)alternatives.push({creatorId:{in:recovery},jobKey:"financial_transactions_scan",AND:[
+      {params:{path:["billingRecoveryVersion"],equals:1}},
+      {params:{path:["scanFrom"],gte:bounds.from}},{params:{path:["scanTo"],lte:bounds.to}},
+    ]});
   }
   return { OR: alternatives };
 }
 
-async function assertJobBillingAccess({ db, job, recoveryCapable = true }) {
+async function assertJobBillingAccess({ db, job, recoveryCapable = true, financialRecoveryCapable = true }) {
   const state = await creatorBillingAccess({ db, agencyId: job.agencyId, creatorId: job.creatorId });
   if (state.allowed) return state;
   if (state.recoverable && recoveryCapable && job.jobKey === "fetch_earnings" && recoveryWindow(job.params, state.now)) return state;
+  if(state.recoverable&&recoveryCapable&&financialRecoveryCapable
+    &&require("./billing-financial-recovery-service").targeted(job)
+    &&require("./billing-financial-recovery-service").windowValid(job.params,state.now))return state;
   throw denied(state);
 }
 
@@ -136,14 +143,14 @@ async function assertProviderBillingAccess({ db, agencyId, creatorId, userId, de
   }
   const lease = jobLease || billingRecovery;
   if (state.allowed && !lease) return state;
-  if (capability !== "read" || !lease || (!state.allowed && (operation !== RECOVERY_OPERATION || !billingRecovery))) throw denied(state);
+  if (capability !== "read" || !lease || (!state.allowed && (![RECOVERY_OPERATION,"payouts.transactions"].includes(operation) || !billingRecovery))) throw denied(state);
   const { jobId, leaseToken, leaseRevision } = lease;
   if (billingRecovery && (jobId !== billingRecovery.jobId || leaseToken !== billingRecovery.leaseToken || leaseRevision !== billingRecovery.leaseRevision)) {
     throw new BillingExecutionAccessError("BILLING_RECOVERY_LEASE_INVALID", "Conflicting job lease contexts", 403);
   }
   if (typeof jobId !== "string" || typeof leaseToken !== "string" || !Number.isInteger(leaseRevision) || leaseRevision < 1) throw denied(state);
   const tokenHash = crypto.createHash("sha256").update(leaseToken).digest("hex");
-  const rows = await db.$queryRawUnsafe(`SELECT j."jobKey",j."params",j."leaseUntil",clock_timestamp() AT TIME ZONE 'UTC' AS "authorityNow"
+  const rows = await db.$queryRawUnsafe(`SELECT j."jobKey",j."params",j.continuation,j."leaseUntil",clock_timestamp() AT TIME ZONE 'UTC' AS "authorityNow"
     FROM "JobInstance" j JOIN "AgencyMember" m ON m."id"=j."leaseMemberId" AND m."agencyId"=j."agencyId"
     JOIN "User" u ON u."id"=m."userId" AND u."disabledAt" IS NULL
     JOIN "WorkerDevice" d ON d."id"=j."claimedByDeviceId" AND d."userId"=m."userId" AND d."agencyId"=j."agencyId"
@@ -154,12 +161,34 @@ async function assertProviderBillingAccess({ db, agencyId, creatorId, userId, de
       AND m."accessEpoch"=j."leaseAccessEpoch" AND m."accessEpoch"=$9`,
     jobId, agencyId, creatorId, deviceId, tokenHash, leaseRevision, String(member?.id || ""), userId, Number(member?.accessEpoch || 0));
   const job = rows?.[0];
-  if (!job || (!state.allowed && (job.jobKey !== "fetch_earnings" || !recoveryWindow(job.params, job.authorityNow)
+  const financial=job&&require("./billing-financial-recovery-service").targeted(job);
+  if (!job || (!state.allowed && ((!financial&&job.jobKey !== "fetch_earnings")
+    || (financial?!require("./billing-financial-recovery-service").windowValid(job.params,job.authorityNow):!recoveryWindow(job.params, job.authorityNow))
     || job.params.scanFrom !== billingRecovery.scanFrom || job.params.scanTo !== billingRecovery.scanTo))) {
     throw new BillingExecutionAccessError("BILLING_RECOVERY_LEASE_INVALID", "Billing recovery requires a current earnings job for this device and date range", 403);
   }
+  if(!state.allowed)assertRecoveryPhysicalRequest({job,operation,physicalRequest,financial});
   return { ...state, validUntil: state.validUntil ? new Date(Math.min(state.validUntil.getTime(), job.leaseUntil.getTime())) : job.leaseUntil, recovery: !state.allowed };
 }
 
+function assertRecoveryPhysicalRequest({job,operation,physicalRequest,financial}) {
+  const invalid=()=>{throw new BillingExecutionAccessError("BILLING_RECOVERY_ENDPOINT_MISMATCH","Recovery read is outside the server-issued financial window",403);};
+  if(physicalRequest?.method!=="GET"||typeof physicalRequest?.path!=="string")return invalid();
+  const url=new URL(physicalRequest.path,"https://onlyfans.com"),p=url.searchParams;
+  if(url.origin!=="https://onlyfans.com"||!physicalRequest.path.startsWith("/")||physicalRequest.path.startsWith("//"))return invalid();
+  const start=job.params.scanFrom+" 00:00:00",end=job.params.scanTo+" 23:59:59";
+  if([...new Set(p.keys())].some(key=>p.getAll(key).length!==1))return invalid();
+  if(operation==="earnings.chart") {
+    if(url.pathname!=="/api2/v2/earnings/chart"||!((p.get("startDate")===start&&p.get("endDate")===end)
+      ||(!financial&&p.get("startDate")===job.params.scanFrom&&p.get("endDate")===job.params.scanTo)))return invalid();
+    if(financial&&job.continuation?.jobContinuation?.phase!=="charts")return invalid();
+  }else if(operation==="payouts.transactions"&&financial) {
+    const cursor=job.continuation?.jobContinuation;
+    if(url.pathname!=="/api2/v2/payouts/transactions"||p.get("startDate")!==start||!cursor
+      ||cursor.phase!=="transactions"||cursor.windowIndex!==0||p.get("marker")!==String(cursor.marker)
+      ||[...p.keys()].some(key=>!["startDate","marker"].includes(key)))return invalid();
+  }else return invalid();
+}
+
 module.exports = { BillingExecutionAccessError, readBillingExecutionAccess, creatorBillingAccess, billingJobClaimWhere,
-  assertJobBillingAccess, assertProviderBillingAccess, recoveryWindow, recoveryBounds, accessFromRow, ACCESS_SQL };
+  assertJobBillingAccess, assertProviderBillingAccess, assertRecoveryPhysicalRequest, recoveryWindow, recoveryBounds, accessFromRow, ACCESS_SQL };

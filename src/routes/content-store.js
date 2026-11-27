@@ -2,6 +2,7 @@
 const { normalizeUsageInput, recordMessageLibraryUsage } = require("../services/message-library-usage-service");
 
 const express = require("express");
+const {blockSummary,contentSnapshot,readBlockPage,assertCompleteSnapshot}=require("../services/message-library-read-service");
 const { executeMessageLibraryCommand } = require("../services/message-library-command-service");
 const prisma = require("../prisma");
 const { assertMessageLibraryAggregate, aggregateState, activeBlock, MAX_BLOCKS, MAX_BYTES, MAX_MEDIA } = require("../services/message-library-limits-service");
@@ -242,6 +243,11 @@ function scriptFromCollection(collection = {}, { includeTrashedBlocks = false } 
 
   return {
     schemaVersion: 1,
+    contentState: collection.contentState || (Array.isArray(collection.blocks) ? 'complete' : 'summary'),
+    activeMessageCount: activeMessages,
+    trashedMessageCount: collection.trashedMessageCount ?? sourceBlocks.filter(block=>!activeBlock(block)).length,
+    ...(collection.contentSnapshot ? {contentSnapshot:collection.contentSnapshot}:{}),
+    ...(collection.searchMatch !== undefined ? {searchMatch:collection.searchMatch}:{}),
     ...(needsRepair ? {repairRequired:{activeMessages,displayedMessages:visibleBlocks.filter(activeBlock).length,
       truncated:visibleBlocks.filter(activeBlock).length < activeMessages,reason:"MESSAGE_LIBRARY_SCRIPT_LIMIT"}} : {}),
     id: String(collection.clientId || collection.id || ""),
@@ -379,6 +385,7 @@ async function upsertMessageLibraryScript(req, db = prisma) {
     if (existing && !context.expectedUpdatedAt) throw Object.assign(new Error("Reload the server script before saving"), {code:"MESSAGE_LIBRARY_REVISION_REQUIRED",status:428});
     if (req.body?.serverId && req.body.serverId !== existing?.id) throw Object.assign(new Error("Server script identity changed; reload before saving"), {code:"MESSAGE_LIBRARY_REVISION_CONFLICT",status:409});
     if (existing) {
+      await assertCompleteSnapshot(tx,existing,req.body);
       const activeWhere = {collectionId:existing.id,deletedAt:null,status:{notIn:["trash","deleted"]}};
       const activeCount = await tx.contentBlock.count({where:activeWhere});
       let invalid = activeCount > 501;
@@ -434,10 +441,11 @@ async function upsertMessageLibraryScript(req, db = prisma) {
 
     await upsertMessageLibraryBlocks({ tx, collectionId: collection.id, blocks: normalized.blocks, now });
 
-    return tx.contentCollection.findFirst({
-      where: { id: collection.id, agencyId: req.auth.agencyId },
-      include: { blocks: { where: { deletedAt: null, status: { notIn: ["trash","deleted"] } }, orderBy: [{ order: "asc" }, { id: "asc" }], take: 501 } },
-    });
+    const saved=await tx.contentCollection.findFirst({where:{id:collection.id,agencyId:req.auth.agencyId},
+      include:{blocks:{where:{deletedAt:null,status:{notIn:["trash","deleted"]}},orderBy:[{order:"asc"},{id:"asc"}],take:501}}});
+    const summary=(await blockSummary(tx,[collection.id])).get(collection.id);
+    return {...saved,...summary,contentState:'complete',contentSnapshot:contentSnapshot(saved,summary)};
+
   } });
 }
 
@@ -454,7 +462,10 @@ router.get("/message-library/scripts", async (req, res) => {
     if (!includeTrash) { where.deletedAt = null; where.status = { notIn: ["trash","deleted","deleting"] }; }
     if (creatorId) where.creatorId = creatorId;
 
-    const take = parseLimit(req.query.limit, 500, 1000);
+    const search=cleanString(req.query.search,200);
+    if(search) where.OR=[{title:{contains:search,mode:'insensitive'}},{description:{contains:search,mode:'insensitive'}},
+      {blocks:{some:{deletedAt:null,status:{notIn:['trash','deleted']},OR:[{text:{contains:search,mode:'insensitive'}},{title:{contains:search,mode:'insensitive'}},{note:{contains:search,mode:'insensitive'}}]}}}];
+    const take = parseLimit(req.query.limit, 100, 500);
     const skip = parseOffset(req.query.offset);
     const expectedRevision = req.query.snapshotRevision;
     if (expectedRevision !== undefined && (typeof expectedRevision !== "string" || !/^(0|[1-9][0-9]{0,18})$/.test(expectedRevision)))
@@ -468,13 +479,14 @@ router.get("/message-library/scripts", async (req, res) => {
         throw Object.assign(new Error("Message Library changed while reading its pages"), {code:"MESSAGE_LIBRARY_LIST_CHANGED",status:409});
       const items = await tx.contentCollection.findMany({
         where,
-        include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }, { id: "asc" }] } },
+
         orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
         take,
         skip,
       });
       const count = await tx.contentCollection.count({ where });
-      return {items, count, snapshotRevision:revision};
+      const counts=await blockSummary(tx,items.map(item=>item.id));
+      return {items:items.map(item=>({...item,...counts.get(item.id),contentState:'summary',searchMatch:search.toLocaleLowerCase()})),count,snapshotRevision:revision};
     }, {isolationLevel:"RepeatableRead",maxWait:5000,timeout:15000});
 
     return res.json({
@@ -500,20 +512,20 @@ router.get("/message-library/scripts/:id", async (req, res) => {
     if (!scriptId || scriptId.length > 120) {
       return res.status(400).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_ID_INVALID", error: "A valid script identity is required" });
     }
-    const item = await prisma.contentCollection.findFirst({
-      where: {
-        agencyId: req.auth.agencyId, creatorId, kind: MESSAGE_LIBRARY_KIND,
-        deletedAt: null, status: { notIn: ["trash", "deleted", "deleting"] },
-        OR: [{ clientId: scriptId }, { id: scriptId, clientId: null }],
-      },
-      include: { blocks: {
-        where: { deletedAt: null, status: { notIn: ["trash", "deleted"] } },
-        orderBy: [{ order: "asc" }, { id: "asc" }], take: 501,
-      } },
-    });
-    if (!item) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
-    if (item.blocks.length > 500) item.activeMessageCount = await prisma.contentBlock.count({where:{collectionId:item.id,deletedAt:null,status:{notIn:["trash","deleted"]}}});
-    return res.json({ ok: true, source: "server", creatorId, item: scriptFromCollection(item) });
+    const result=await prisma.$transaction(async tx=>{
+      const item=await tx.contentCollection.findFirst({where:{agencyId:req.auth.agencyId,creatorId,kind:MESSAGE_LIBRARY_KIND,status:{not:'deleting'},
+        OR:[{clientId:scriptId},{id:scriptId,clientId:null}]}});
+      if(!item) throw Object.assign(new Error('Script not found'),{status:404,code:'MESSAGE_LIBRARY_SCRIPT_NOT_FOUND'});
+      const state=req.query.blockState==='trash'?'trash':'active';
+      const page=await readBlockPage(tx,item,{state,offset:parseOffset(req.query.offset),limit:parseLimit(req.query.limit,100,100),snapshotRevision:req.query.snapshotRevision});
+      const summary=(await blockSummary(tx,[item.id])).get(item.id);
+      return {ok:true,source:'server',creatorId,
+        item:scriptFromCollection({...item,...summary,blocks:page.rows,contentState:state==='active'&&!page.hasMore&&page.offset===0?'complete':'partial',
+          contentSnapshot:contentSnapshot(item,summary)},{includeTrashedBlocks:state==='trash'}),
+        blockPage:{state,count:page.count,offset:page.offset,nextOffset:page.nextOffset,hasMore:page.hasMore,snapshotRevision:page.snapshotRevision}};
+    },{isolationLevel:'RepeatableRead',maxWait:5000,timeout:15000});
+    return res.json(result);
+
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_SCRIPT_FAILED");
   }

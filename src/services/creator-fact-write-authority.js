@@ -18,6 +18,12 @@ function mergeNotificationMoney(model, existing, incoming) {
     messageId: incoming.messageId || existing.messageId || null,
   };
   if (model === "creatorSale") merged.postId = incoming.postId || existing.postId || null;
+  const correlation = require("./financial-correlation-service").exactEvidence(incoming) || existing.financialCorrelation;
+  if (correlation) merged.financialCorrelation = correlation;
+  // A notification replay supplies no missing payout identity. Keep an
+  // ambiguous correlation out of financial attribution until exact identity
+  // or a newly verified unique source neighborhood resolves it.
+  if(existing.transactionStatus==="unverified"&&!merged.externalTransactionId)merged.transactionStatus="unverified";
   if (existing.source !== "ONLYFANS_API" || !existing.externalTransactionId) return merged;
   // Notification identifies message/post ownership; payout is the money
   // authority. A late or incomplete notification cannot demote the payout row.

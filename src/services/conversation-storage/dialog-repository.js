@@ -644,21 +644,45 @@ class DialogRepository {
     }
   }
   async getMessages(ctx, input) {
+    return (await this.getMessagePage(ctx, input)).items;
+  }
+  async getMessagePage(ctx, input) {
     const order = input.order === "asc" ? "ASC" : "DESC";
     const limit = Math.min(200, c.integer(input.limit, 100, 1000));
-    const offset = c.integer(input.offset, 0, 10000);
-    const result = await c.rows(
-      this.db,
-      `SELECT * FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=$2 ORDER BY created_at ${order},length(message_id) ${order},message_id ${order} LIMIT $3 OFFSET $4`,
-      ctx.scopeId,
-      c.platformId(input.dialogId),
-      limit,
-      offset
-    );
-    const out = result.map((row) => publicRecord(ctx, input.dialogId, row));
+    const offset = c.integer(input.offset, 0, 1000000);
+    // Size the contiguous prefix before transferring bodies. Full message text
+    // is never truncated; callers advance by actual count, not requested count.
+    const result = await c.rows(this.db, `WITH candidates AS MATERIALIZED (
+      SELECT message_id,created_at,octet_length(data::text)+2048 bytes FROM dialog_archive_message
+      WHERE scope_id=$1 AND dialog_id=$2 ORDER BY created_at ${order},length(message_id) ${order},message_id ${order} LIMIT $3 OFFSET $4
+    ), sized AS (SELECT *,sum(bytes) OVER(ORDER BY created_at ${order},length(message_id) ${order},message_id ${order} ROWS UNBOUNDED PRECEDING) used FROM candidates)
+    SELECT m.* FROM sized n JOIN dialog_archive_message m ON m.scope_id=$1 AND m.dialog_id=$2 AND m.message_id=n.message_id
+    WHERE n.used<=983040 ORDER BY m.created_at ${order},length(m.message_id) ${order},m.message_id ${order}`,
+      ctx.scopeId, c.platformId(input.dialogId), limit, offset);
+    const items = result.map(row => publicRecord(ctx, input.dialogId, row));
+    const total = Number((await c.one(this.db, "SELECT count(*) n FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=$2", ctx.scopeId, input.dialogId)).n);
+    c.check(items.length || offset >= total, "DIALOG_MESSAGE_READ_BUDGET_EXCEEDED", 413);
+    const out = { items, count: items.length, total, offset, nextOffset: offset + items.length, hasMore: offset + items.length < total };
     c.bounded(out, 1048576);
     return out;
   }
+  async getReplyMessages(ctx, input) {
+    if (!input.upper) return [];
+    const result = await c.rows(this.db, `WITH candidates AS MATERIALIZED (
+      SELECT message_id,created_at,provider_opened,canonical_opened,first_seen_at,
+        jsonb_build_object('messageId',message_id,'createdAt',data->'createdAt','sender',sender,
+          'text',right(data->>'text',5632),'mediaIds',data->'mediaIds','price',data->'price') ||
+        CASE WHEN char_length(data->>'text')>5632 THEN jsonb_build_object('textView',jsonb_build_object(
+          'policy','crm-replies-context-v1','omittedPrefixCodePoints',char_length(data->>'text')-5632,'originalTextCodePoints',char_length(data->>'text'))) ELSE '{}'::jsonb END AS data
+      FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=$2 AND
+        (created_at,length(message_id),message_id)<=($3::timestamptz,length($4::text),$4)
+      ORDER BY created_at DESC,length(message_id) DESC,message_id DESC LIMIT 40
+    ), sized AS (SELECT *,sum(octet_length(data::text)+512) OVER(ORDER BY created_at DESC,length(message_id) DESC,message_id DESC ROWS UNBOUNDED PRECEDING) used FROM candidates)
+    SELECT * FROM sized WHERE used<=65536 ORDER BY created_at DESC,length(message_id) DESC,message_id DESC`,
+      ctx.scopeId, c.platformId(input.dialogId), input.upper.createdAt, input.upper.messageId);
+    return result.map(row => publicRecord(ctx, input.dialogId, row));
+  }
+
   async findExistingMessageIds(ctx, input) {
     c.check(Array.isArray(input.messageIds) && input.messageIds.length <= 500, "DIALOG_LOOKUP_TOO_LARGE", 400);
     await this.scope(ctx);

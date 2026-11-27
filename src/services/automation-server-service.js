@@ -228,7 +228,9 @@ function mergeBumpStatRows(baseStats = {}, rows = []) {
     totals.canceled += Number(row?.canceled || 0);
     totals.expired += Number(row?.expired || 0);
     totals.failed += Number(row?.failed || 0);
-    if (String(row?.day || "") === today) {
+    if (row.sentToday !== undefined) {
+      totals.sentToday += Number(row.sentToday || 0); totals.repliedToday += Number(row.repliedToday || 0);
+    } else if (String(row?.day || "") === today) {
       totals.sentToday += sent;
       totals.repliedToday += replied;
     }
@@ -259,29 +261,26 @@ function mergeBumpStatRows(baseStats = {}, rows = []) {
 async function loadBumpStatsByTemplate({ agencyId, creatorId, tasks = [] } = {}) {
   const keys = Array.from(new Set((tasks || []).flatMap(statTemplateKeysForTask))).filter(Boolean);
   if (!agencyId || !keys.length) return new Map();
-  const where = { agencyId, templateId: { in: keys } };
-  const cid = clean(creatorId, 100);
-  if (cid) where.creatorId = cid;
+  const cid = clean(creatorId, 100) || null;
   const [rows, liveRows] = await Promise.all([
-    prisma.bumpDeliveryStat.findMany({ where , take: 10000}).catch(() => []),
-    prisma.automationDelivery.findMany({
-      where: {
-        agencyId,
-        originKind: "AUTOMATION",
-        ...(cid ? { creatorId: cid } : {}),
-        contentCollectionId: { in: keys },
-        status: { in: ["sent", "pending_reply", "checking_reply", "cancel_claimed"] },
-        OR: [{ messageId: { not: null } }, { sentAt: { not: null } }],
-      },
-      select: { id: true, contentCollectionId: true, sentAt: true, messageId: true, result: true },
-      take: 50000,
-    }).catch(() => []),
+    prisma.$queryRawUnsafe(`SELECT "templateId",sum(sent)::bigint sent,sum(replied)::bigint replied,
+      sum(canceled)::bigint canceled,sum(expired)::bigint expired,sum(failed)::bigint failed,
+      coalesce(sum(sent) FILTER(WHERE day=$4),0)::bigint "sentToday",coalesce(sum(replied) FILTER(WHERE day=$4),0)::bigint "repliedToday"
+      FROM "BumpDeliveryStat" WHERE "agencyId"=$1 AND ($2::text IS NULL OR "creatorId"=$2) AND "templateId"=ANY($3::text[]) GROUP BY "templateId"`,agencyId,cid,keys,todayKeyUtc()),
+    prisma.$queryRawUnsafe(`SELECT "contentCollectionId" AS "templateId",count(*)::bigint sent,
+      count(*) FILTER(WHERE coalesce(to_char("sentAt" AT TIME ZONE 'UTC','YYYY-MM-DD'),$4)=$4)::bigint "sentToday",
+      0 AS replied,0 AS canceled,0 AS expired,0 AS failed,0 AS "repliedToday"
+      FROM "AutomationDelivery" WHERE "agencyId"=$1 AND ($2::text IS NULL OR "creatorId"=$2)
+        AND "originKind"='AUTOMATION' AND "contentCollectionId"=ANY($3::text[])
+        AND status IN ('sent','pending_reply','checking_reply','cancel_claimed') AND ("messageId" IS NOT NULL OR "sentAt" IS NOT NULL)
+        AND coalesce(result->>'sentStatCounted','false')<>'true' AND coalesce(result->>'serverSentStatCounted','false')<>'true'
+        AND coalesce(result->>'statCounted','false') NOT IN ('true','sent') AND coalesce(result->'statEvents'->>'sent','false')<>'true'
+      GROUP BY "contentCollectionId"`,agencyId,cid,keys,todayKeyUtc()),
   ]);
   const byTemplate = new Map();
-  for (const row of [...(rows || []), ...syntheticStatRowsFromLiveDeliveries(liveRows || [])]) {
-    const key = clean(row.templateId, 120);
-    if (!key) continue;
-    if (!byTemplate.has(key)) byTemplate.set(key, []);
+  for (const row of [...rows,...liveRows]) {
+    const key = clean(row.templateId,120);
+    if (!byTemplate.has(key)) byTemplate.set(key,[]);
     byTemplate.get(key).push(row);
   }
   return byTemplate;
@@ -325,22 +324,39 @@ function taskToBump(task) {
 }
 
 async function listTasks({ agencyId, query = {} }) {
-  const where = { agencyId };
-  const type = clean(query.type, 80);
-  const creatorId = clean(query.creatorId || query.accountId, 100);
-  const status = clean(query.status, 40);
-  const includeDeleted = boolValue(query.includeDeleted || query.includeTrash, false);
-  if (type) where.type = normalizeTaskType(type);
-  if (creatorId) where.creatorId = creatorId;
-  if (status) where.status = status;
-  if (!includeDeleted) where.deletedAt = null;
-  const take = parseLimit(query.limit, 200, 1000);
-  const skip = parseOffset(query.offset);
-  const [items, count] = await Promise.all([
-    prisma.automationTask.findMany({ where, orderBy: [{ updatedAt: "desc" }], take, skip }),
-    prisma.automationTask.count({ where }),
-  ]);
-  return { ok: true, items, count, nextOffset: skip + items.length, hasMore: skip + items.length < count };
+  const type = clean(query.type,80), creatorId = clean(query.creatorId || query.accountId,100);
+  const params=[agencyId], clauses=['"agencyId"=$1'];
+  const add = (sql,value) => { params.push(value); clauses.push(sql.replace('?',`$${params.length}`)); };
+  if (type) add('type=?',normalizeTaskType(type));
+  if (creatorId) add('"creatorId"=?',creatorId);
+  const filter=clean(query.filter,20);
+  if (filter && !["active","enabled","paused","trash"].includes(filter)) throw automationTaskError("AUTOMATION_TEMPLATE_FILTER_INVALID","Invalid template filter",400);
+  if (filter==='trash') clauses.push('"deletedAt" IS NOT NULL');
+  else if (filter || !boolValue(query.includeDeleted || query.includeTrash,false)) clauses.push('"deletedAt" IS NULL');
+  if (filter==='enabled') clauses.push('enabled=true');
+  if (filter==='paused') clauses.push('enabled=false');
+  if (!filter && clean(query.status,40)) add('status=?',clean(query.status,40));
+  const search=clean(query.search,200),trigger=clean(query.trigger,80);
+  if (search) {
+    params.push(search); const n=params.length;
+    clauses.push(`(position(lower($${n}) in lower(title))>0 OR position(lower($${n}) in lower(coalesce(config->>'messageText',config->>'commentText',config->>'text','')))>0)`);
+  }
+  if (trigger) {
+    if (!["fanOnline","fanSubscribed","hiddenOnlineSignal","paidSubscriber","freeSubscriber"].includes(trigger)) throw automationTaskError("AUTOMATION_TEMPLATE_FILTER_INVALID","Invalid trigger",400);
+    add("triggers->>?='true'",trigger);
+  }
+  const take=parseLimit(query.limit,200,1000),skip=parseOffset(query.offset),expected=query.snapshotRevision;
+  if (expected!==undefined && (typeof expected!=="string" || !/^\d{1,19}$/.test(expected))) throw automationTaskError("AUTOMATION_TEMPLATE_SNAPSHOT_INVALID","Invalid template snapshot",400);
+  if (skip && expected===undefined) throw automationTaskError("AUTOMATION_TEMPLATE_SNAPSHOT_REQUIRED","Reload templates from the first page",428);
+  return prisma.$transaction(async tx => {
+    const heads=await tx.$queryRawUnsafe('SELECT coalesce(sum(revision),0)::text revision FROM "AutomationTemplateScopeRevision" WHERE "agencyId"=$1 AND ($2::text IS NULL OR "creatorId"=$2)',agencyId,creatorId || null);
+    const revision=heads[0]?.revision || "0";
+    if (expected!==undefined && expected!==revision) throw automationTaskError("AUTOMATION_TEMPLATE_LIST_CHANGED","Templates changed; reload the first page",409);
+    const sql=clauses.join(' AND ');
+    const items=await tx.$queryRawUnsafe(`SELECT * FROM "AutomationTask" WHERE ${sql} ORDER BY "updatedAt" DESC,id DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`,...params,take,skip);
+    const count=Number((await tx.$queryRawUnsafe(`SELECT count(*) n FROM "AutomationTask" WHERE ${sql}`,...params))[0].n);
+    return {ok:true,items,count,nextOffset:skip+items.length,hasMore:skip+items.length<count,snapshotRevision:revision};
+  },{isolationLevel:"RepeatableRead",maxWait:5000,timeout:15000});
 }
 
 function automationTaskError(code, message, status = 409) {
@@ -532,7 +548,7 @@ async function gcExpiredBumps({ agencyId, creatorId = null } = {}) {
 }
 
 async function listBumps({ agencyId, creatorId, query = {} }) {
-  await gcExpiredBumps({ agencyId, creatorId }).catch(() => null);
+  // Trash maintenance has a scheduler owner; paged reads never mutate their snapshot.
   const result = await listTasks({ agencyId, query: { ...query, type: "bump_online", creatorId, includeDeleted: query.includeTrash ?? query.includeDeleted ?? true } });
   const includeTrash = query.includeTrash !== "false" && query.includeTrash !== false;
   const statRowsByTemplate = await loadBumpStatsByTemplate({ agencyId, creatorId, tasks: result.items || [] });
@@ -541,7 +557,7 @@ async function listBumps({ agencyId, creatorId, query = {} }) {
     const rows = keys.flatMap((key) => statRowsByTemplate.get(key) || []);
     return taskToBumpWithStats(task, rows);
   }).filter((item) => includeTrash || !item.trashedAt);
-  return { ok: true, accountId: String(creatorId || ""), items, count: items.length, source: "server" };
+  return { ok: true, accountId: String(creatorId || ""), items, count: result.count, nextOffset: result.nextOffset, hasMore: result.hasMore, snapshotRevision: result.snapshotRevision, source: "server" };
 }
 
 async function saveBump({ agencyId, userId, accountId, input = {} }) {
@@ -660,7 +676,7 @@ async function listSfsComments({ agencyId, creatorId, query = {} }) {
   const result = await listTasks({ agencyId, query: { ...query, type: "sfs_comment", creatorId, includeDeleted: query.includeTrash ?? query.includeDeleted ?? true } });
   const includeTrash = query.includeTrash !== "false" && query.includeTrash !== false;
   const items = result.items.map(taskToSfsComment).filter((item) => includeTrash || !item.trashedAt);
-  return { ok: true, accountId: String(creatorId || ""), creatorId: String(creatorId || ""), items, count: items.length, source: "server" };
+  return { ok: true, accountId: String(creatorId || ""), creatorId: String(creatorId || ""), items, count: result.count, nextOffset: result.nextOffset, hasMore: result.hasMore, snapshotRevision: result.snapshotRevision, source: "server" };
 }
 
 async function saveSfsComment({ agencyId, userId, accountId, input = {} }) {

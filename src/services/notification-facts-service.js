@@ -238,6 +238,7 @@ function valuesEqual(existing, data, keys) {
   return keys.every((key) => {
     const left = existing?.[key];
     const right = data?.[key];
+    if (key === "financialCorrelation") return require("node:util").isDeepStrictEqual(left ?? null, right ?? null);
     if (left instanceof Date || right instanceof Date) return strictDate(left)?.getTime() === strictDate(right)?.getTime();
     return left === right;
   });
@@ -416,6 +417,10 @@ function buildFactData({ fact, job, deviceId, fanRecordIds, now }) {
     source: "NOTIFICATION",
     sourceUpdatedAt: null,
   };
+  if (["sale", "tip"].includes(fact.kind)) {
+    const correlation = require("./financial-correlation-service").exactEvidence(financial);
+    if (correlation) financial.financialCorrelation = correlation;
+  }
   if (fact.kind === "sale") return { ...financial, saleType: fact.saleType, messageId: fact.messageId, postId: fact.postId, amountCents: fact.amountCents, purchasedAt: fact.occurredAt };
   if (fact.kind === "tip") return { ...financial, messageId: fact.messageId, amountCents: fact.amountCents, tippedAt: fact.occurredAt };
   return { ...financial, eventType: fact.eventType, observedPriceCents: fact.observedPriceCents, occurredAt: fact.occurredAt };
@@ -842,11 +847,11 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       };
       const sale = await persistFactGroup(tx, {
         model: "creatorSale", facts: groups.sale, job, deviceId, fanRecordIds, now,
-        compareKeys: ["fanRecordId", "externalNotificationId", "externalTransactionId", "saleType", "messageId", "postId", "amountCents", "currency", "purchasedAt"],
+        compareKeys: ["fanRecordId", "externalNotificationId", "externalTransactionId", "saleType", "messageId", "postId", "amountCents", "currency", "purchasedAt", "financialCorrelation"],
       });
       const tip = await persistFactGroup(tx, {
         model: "creatorTip", facts: groups.tip, job, deviceId, fanRecordIds, now,
-        compareKeys: ["fanRecordId", "externalNotificationId", "externalTransactionId", "messageId", "amountCents", "currency", "tippedAt"],
+        compareKeys: ["fanRecordId", "externalNotificationId", "externalTransactionId", "messageId", "amountCents", "currency", "tippedAt", "financialCorrelation"],
       });
       // Team Analytics consumes the canonical CreatorSale ledger; it never
       // runs a second OF money scanner. Reconcile inside the same transaction
@@ -854,13 +859,19 @@ async function ingestNotificationFacts({ job, deviceId, result, db = prisma, com
       // effect when Team models are available.
       if (groups.sale.length) {
         const persistedSales = await existingFacts(tx, "creatorSale", job.creatorId, groups.sale);
+        const ambiguous = typeof tx.$queryRawUnsafe === "function"
+          ? await require("./financial-correlation-service").invalidateNeighborhoods({ db: tx, job, rows: persistedSales, kind: "SALE", now }) : [];
+        for (const sourceId of ambiguous) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "PPV", sourceId, now });
         for (const row of persistedSales) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "PPV", sourceId: row.id, now });
-        if (sale.inserted || sale.updated) await require("./creator-entity-change-service").publishCanonicalSales({
-          db:tx,agencyId:job.agencyId,creatorId:job.creatorId,saleIds:persistedSales.map(row=>row.id),
+        if (sale.inserted || sale.updated || ambiguous.length) await require("./creator-entity-change-service").publishCanonicalSales({
+          db:tx,agencyId:job.agencyId,creatorId:job.creatorId,saleIds:[...new Set([...persistedSales.map(row=>row.id),...ambiguous])],
         });
       }
       if (groups.tip.length) {
         const persistedTips = await existingFacts(tx, "creatorTip", job.creatorId, groups.tip);
+        const ambiguous = typeof tx.$queryRawUnsafe === "function"
+          ? await require("./financial-correlation-service").invalidateNeighborhoods({ db: tx, job, rows: persistedTips, kind: "TIP", now }) : [];
+        for (const sourceId of ambiguous) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "TIP", sourceId, now });
         for (const row of persistedTips) await dispatchTeamMoneyReconciliationForCanonicalFact({ db: tx, agencyId: job.agencyId, creatorId: job.creatorId, sourceType: "TIP", sourceId: row.id, now });
       }
       const previousSubscriptions = groups.subscription.length

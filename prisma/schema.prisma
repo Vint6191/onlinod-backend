@@ -1544,6 +1544,7 @@ model BillingOrder {
   pricingSnapshot Json
   requestHash     String?
 
+  reconciliationState Json?
   providerInvoiceId  String?
   providerInvoiceUrl String?
   providerStatus     String?
@@ -1738,6 +1739,15 @@ model CreatorBillingPeriod {
 }
 
 model BillingPaymentAttempt {
+  settlementState String @default("PENDING")
+  settledCents BigInt @default(0)
+  settlementBasis String?
+  settlementEvidence Json?
+  settledAt DateTime?
+  reversedAt DateTime?
+  actuallyPaidAtFiat Decimal? @db.Decimal(30, 12)
+  walletCreditTransactionId String? @unique
+  providerUpdatedAt DateTime?
   id                String          @id @default(cuid())
   orderId           String
   provider          BillingProvider @default(NOWPAYMENTS)
@@ -2898,6 +2908,7 @@ model CreatorEarningsTotal {
 }
 
 model CreatorSale {
+  financialCorrelation Json?
   id                       String            @id @default(cuid())
   agencyId                 String
   creatorId                String
@@ -2951,6 +2962,7 @@ model CreatorSale {
 }
 
 model CreatorTip {
+  financialCorrelation Json?
   id                       String            @id @default(cuid())
   agencyId                 String
   creatorId                String
@@ -6672,6 +6684,7 @@ model CreatorMoneyObservation {
 }
 
 model CreatorEarningsGeneration {
+ ltvDeltaVersion Int @default(0)
  proofPolicyVersion Int @default(1)
  mode String @default("SNAPSHOT")
  id String @id
@@ -6772,6 +6785,10 @@ model MoneyResolutionAdoption {
 }
 
 model FanLtvState {
+ publishedRevision BigInt @default(0)
+ workingRevision BigInt @default(1)
+ balanceSeedCursor String @default("")
+ balanceSeedComplete Boolean @default(false)
  creatorId String @id
  agencyId String
  sourceKey String @default("")
@@ -6845,4 +6862,59 @@ model TeamPpvPurchaseAlias {
 
   @@id([agencyId, creatorId, namespace, externalId])
   @@index([rootId])
+}
+
+model TeamTipAlias {
+  agencyId String
+  creatorId String
+  namespace String
+  externalId String
+  rootId String
+  createdAt DateTime @default(now())
+
+  @@id([agencyId, creatorId, namespace, externalId])
+  @@index([rootId])
+}
+
+model CreatorEarningsGenerationChange {
+  generation String
+  transactionId String
+
+  @@id([generation, transactionId])
+}
+
+model FanLtvPublishedBalance {
+  creatorId String
+  fanId String
+  revision BigInt
+  netCents BigInt
+  payments BigInt
+
+  @@id([creatorId, fanId, revision])
+}
+
+model CreatorFanIdentityHead {
+  creatorId String @id
+  agencyId String
+  revision BigInt @default(0)
+}
+
+model AutomationTemplateScopeRevision {
+  agencyId String
+  creatorId String
+  revision BigInt @default(0)
+  @@id([agencyId, creatorId])
+}
+
+model CreatorBillingRecoverySnapshot {
+  creatorId String @id
+  agencyId String
+  fromDay DateTime @db.Date
+  toDay DateTime @db.Date
+  netCents BigInt
+  transactionsCount BigInt
+  observedAt DateTime
+  publishedAt DateTime
+  receiptId String
+  proof Json
 }

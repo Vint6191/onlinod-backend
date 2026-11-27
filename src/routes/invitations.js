@@ -4,19 +4,10 @@ const express = require("express");
 const crypto = require("node:crypto");
 const { z } = require("zod");
 const prisma = require("../prisma");
-const { runRootCommit, classifyCommitConflict } = require("../services/db-commit-kernel");
-const { dbAuthorityNow } = require("../services/db-time-authority-service");
 const { authRequired } = require("../middleware/auth");
-const { audit } = require("../services/audit-service");
-const {
-  cleanFunctions,
-  ensureRoleExists,
-  lockTeamRoleLifecycle,
-  materializeInvitationMemberWithinTransaction,
-} = require("../services/team-administration-service");
-const { validateAssignedCreators } = require("../services/team-access-control");
+const { cleanFunctions } = require("../services/team-administration-service");
 const { publishDesktopControlEvent } = require("../services/desktop-control-events");
-const { lockTeamControlPlaneTopology, lockLiveTeamControlPlaneCreators } = require("../services/team-control-plane-authority-service");
+const { acceptInvitationForUser, invitationFailure } = require("../services/invitation-acceptance-service");
 
 const router = express.Router();
 
@@ -26,15 +17,6 @@ function sha256(value) {
 
 function actorUserId(req) {
   return req.auth?.userId || req.user?.id || null;
-}
-
-function invitationFailure(inv, now = new Date()) {
-  if (!inv) return { status: 404, code: "INVITE_NOT_FOUND", error: "Invitation not found" };
-  if (inv.revokedAt) return { status: 409, code: "INVITE_REVOKED", error: "Invitation was revoked" };
-  if (inv.claimedAt) return { status: 409, code: "INVITE_CLAIMED", error: "Invitation already claimed" };
-  if (inv.expiresAt < now) return { status: 410, code: "INVITE_EXPIRED", error: "Invitation expired" };
-  if (inv.agency?.deletedAt) return { status: 409, code: "AGENCY_DELETED", error: "Agency was deleted" };
-  return null;
 }
 
 router.get("/preview/:token", async (req, res) => {
@@ -72,126 +54,7 @@ router.post("/claim", authRequired, async (req, res) => {
     if (!userId) return res.status(401).json({ ok: false, code: "AUTH_REQUIRED", error: "Login required to claim invitation" });
 
     const input = claimSchema.parse(req.body || {});
-    const tokenHash = sha256(input.token);
-    const [inv, me] = await Promise.all([
-      prisma.agencyInvitation.findUnique({ where: { tokenHash }, include: { agency: true } }),
-      prisma.user.findUnique({ where: { id: userId }, select: { id: true, email: true, name: true } }),
-    ]);
-    const failure = invitationFailure(inv);
-    if (failure) return res.status(failure.status).json({ ok: false, code: failure.code, error: failure.error });
-    if (!me) return res.status(401).json({ ok: false, code: "AUTH_REQUIRED", error: "User no longer exists" });
-
-    if (inv.email && String(me.email || "").toLowerCase() !== String(inv.email).toLowerCase()) {
-      return res.status(403).json({ ok: false, code: "EMAIL_MISMATCH", error: "This invitation was sent to a different email address" });
-    }
-
-    const result = await runRootCommit(prisma, async ({ tx }) => {
-      const currentInvite = await tx.agencyInvitation.findUnique({ where: { id: inv.id }, include: { agency: true } });
-      const currentFailure = invitationFailure(currentInvite, await dbAuthorityNow({ db: tx }));
-      if (currentFailure) {
-        const error = new Error(currentFailure.error);
-        error.status = currentFailure.status;
-        error.code = currentFailure.code;
-        throw error;
-      }
-
-      let roleKey;
-      try {
-        // Claim is itself a role assignment. Hold the same shared lifecycle
-        // capability used by Team Administration until member + invite claim
-        // commit, so custom-role deletion cannot race an invitation that was
-        // validated just before expiry. Preset roles intentionally no-op here.
-        await lockTeamControlPlaneTopology({ tx, agencyId: currentInvite.agencyId });
-        await lockTeamRoleLifecycle({ tx, agencyId: currentInvite.agencyId, roleKey: currentInvite.roleKey, mode: "share", agencyAlreadyLocked: true });
-        roleKey = await ensureRoleExists({ agencyId: currentInvite.agencyId, roleKey: currentInvite.roleKey, db: tx });
-      } catch (lockError) {
-        if (classifyCommitConflict(lockError)) throw lockError;
-        if (String(lockError?.code || "").startsWith("TEAM_CONTROL_PLANE_")) throw lockError;
-        const error = new Error("Invitation role is no longer available");
-        error.status = 409;
-        error.code = "INVITE_ROLE_STALE";
-        throw error;
-      }
-      if (roleKey === "owner") {
-        const error = new Error("Owner membership cannot be granted by invitation");
-        error.status = 409;
-        error.code = "INVITE_OWNER_FORBIDDEN";
-        throw error;
-      }
-
-      const creatorScope = await validateAssignedCreators({
-        agencyId: currentInvite.agencyId,
-        assignedCreators: currentInvite.assignedCreators ?? [],
-        db: tx,
-      });
-      if (!creatorScope.ok) {
-        const error = new Error("Invitation contains creators that are no longer available");
-        error.status = 409;
-        error.code = "INVITE_CREATOR_SCOPE_STALE";
-        error.details = { unknownCreatorIds: creatorScope.unknownCreatorIds };
-        throw error;
-      }
-      const creatorLocks = await lockLiveTeamControlPlaneCreators({
-        tx,
-        agencyId: currentInvite.agencyId,
-        creatorIds: creatorScope.normalized?.mode === "scoped" ? creatorScope.normalized.creatorIds : [],
-        mode: "share",
-      });
-      if (creatorLocks.missingCreatorIds.length) {
-        const error = new Error("Invitation contains creators that are no longer available");
-        error.status = 409;
-        error.code = "INVITE_CREATOR_SCOPE_STALE";
-        error.details = { unknownCreatorIds: creatorLocks.missingCreatorIds };
-        throw error;
-      }
-      const functions = cleanFunctions(currentInvite.functions);
-
-      const membership = await materializeInvitationMemberWithinTransaction({
-        tx,
-        agencyId: currentInvite.agencyId,
-        userId,
-        roleKey,
-        displayName: currentInvite.displayName || me.name || null,
-        initials: String(currentInvite.displayName || me.name || me.email || "??").trim().slice(0, 2).toUpperCase(),
-        commission: currentInvite.commission ?? { kind: "none" },
-        assignedCreators: creatorScope.value,
-      });
-      const member = membership.member;
-      const restored = membership.restored;
-
-      await tx.teamMemberFunction.deleteMany({ where: { agencyId: currentInvite.agencyId, memberId: member.id } });
-      if (functions.length) {
-        await tx.teamMemberFunction.createMany({
-          data: functions.map((functionKey) => ({ agencyId: currentInvite.agencyId, memberId: member.id, functionKey })),
-          skipDuplicates: true,
-        });
-      }
-
-      const now = await dbAuthorityNow({ db: tx });
-      const claimed = await tx.agencyInvitation.updateMany({
-        where: { id: inv.id, tokenHash, claimedAt: null, revokedAt: null, expiresAt: { gt: now } },
-        data: { claimedAt: now, claimedByUserId: userId, claimedMemberId: member.id },
-      });
-      if (claimed.count !== 1) {
-        const error = new Error("Invitation was claimed, revoked, expired, or reissued while this request was in progress");
-        error.status = 409;
-        error.code = "INVITE_CHANGED";
-        throw error;
-      }
-
-      await audit({
-        agencyId: currentInvite.agencyId,
-        actorUserId: userId,
-        action: restored ? "team.invitation.member_restored" : "team.invitation.claimed",
-        targetType: "agency_member",
-        targetId: member.id,
-        metadata: { invitationId: currentInvite.id, roleKey, functions, restored },
-        db: tx,
-        required: true,
-      });
-
-      return { member, restored, roleKey, functions, agency: currentInvite.agency };
-    }, { profile: "TEAM_MANAGEMENT", authority: { kind: "INVITATION_CLAIM", agencyId: inv.agencyId, userId }, conflictCode: "INVITE_CONCURRENT_CHANGE" });
+    const result = await acceptInvitationForUser({ token: input.token, userId, db: prisma });
 
     try {
       publishDesktopControlEvent({

@@ -20,7 +20,9 @@ async function readFanLtv({db,creatorId,rangeKey='30d',now=new Date()}) {
  const coverage=row?await readLiveEarningsCoverage(db,creatorId,now):null;
  const pending=!snapshot||!sameSource||row.stage!=='LIVE'||row.dirty||row.due||snapshot.windowDay!==today
   ||snapshot.proofGeneration!==row.generation||snapshot.throughAt!==row.throughAt.toISOString()||coverage?.publishing===true;
- const bounds=displayRangeBounds(range,now),periodAvailable=sameSource&&snapshot.windowDay===today;
+ const periodAvailable=Boolean(snapshot?.ranges?.[range]);
+ const periodDay=snapshot?.asOf&&Number.isFinite(Date.parse(snapshot.asOf))?new Date(snapshot.asOf):now;
+ const bounds=displayRangeBounds(range,periodDay);
  const allTime=snapshot?{...snapshot.ranges.all,medianCents:snapshot.medianCents,
   historyComplete:snapshot.historyComplete,complete:snapshot.historyComplete&&snapshot.ranges.all.attributionComplete}:null;
  const period=periodAvailable?{...snapshot.ranges[range],rangeKey:range,startAt:bounds.startAt.toISOString(),endAt:bounds.endAt.toISOString(),

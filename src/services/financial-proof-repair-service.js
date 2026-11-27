@@ -134,6 +134,7 @@ async function runRepairPage({ db = require("../prisma"), runId = "financial-pro
 
 async function runSweep({ db = require("../prisma"), now = new Date(), limit = PAGE } = {}) {
   await require("./team-purchase-identity-service").adoptPage(db);
+  await require("./team-tip-identity-service").adoptPage(db);
   const adoption=await require("./financial-snapshot-adoption-service").runSweep({db,limit});
   if (!adoption.complete) return adoption;
   const result = await runRepairPage({ db, runId:"financial-proof-v3", mode: "apply", targetAt: now, limit });

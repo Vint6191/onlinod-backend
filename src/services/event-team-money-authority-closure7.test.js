@@ -56,6 +56,25 @@ function baseTip(overrides = {}) {
   };
 }
 
+test("financial identity review remains reachable after 48 hours and grants one explicit manager resolution", async () => {
+  const fx = claimsFake(baseTip({ status: "conflict", receivedAt: new Date(Date.now() - 72 * 60 * 60 * 1000),
+    attributionBasis: "FINANCIAL_IDENTITY_AMBIGUOUS", resolvedSource: "manual_manager_resolution" }));
+  const tips = loadWithPrisma(fx.fake);
+  const dto = tips.tipRowForClaims(fx.row);
+  assert.equal(dto.locked, true); assert.equal(dto.requiresManualReview, true);
+  assert.equal(dto.reviewLane, "financial_identity_ambiguity");
+  const input = { agencyId: "agency-1", byMemberId: "manager", byUserId: "user-manager", eventHash: "H",
+    action: "manager_override", targetMemberId: "member-B", reason: "checked both source operations", senior: true,
+    allowedCreatorIds: ["creator-1"] };
+  const chatter = await tips.applyTipOverride({ ...input, action: "claim" });
+  assert.equal(chatter.ok, false); assert.equal(chatter.code, "ATTRIBUTION_LOCKED");
+  const resolved = await tips.applyTipOverride(input);
+  assert.equal(resolved.ok, true); assert.equal(resolved.attribution.requiresManualReview, false);
+  assert.equal(fx.row.attributedMemberId, "member-B"); assert.equal(fx.row.resolvedSource, "manual_manager_resolution");
+  const repeated = await tips.applyTipOverride({ ...input, targetMemberId: "member-C" });
+  assert.equal(repeated.ok, false); assert.equal(repeated.code, "ATTRIBUTION_LOCKED");
+});
+
 test("Closure7 migration review reaches a terminal manual state and cannot reuse the >48h review bypass", async () => {
   const old = new Date(Date.now() - 72 * 60 * 60 * 1000);
   const fx = claimsFake(baseTip({

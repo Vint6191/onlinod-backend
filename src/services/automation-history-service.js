@@ -222,7 +222,7 @@ async function compactAutomationDeliveries({ olderThan, batchSize = 500, db = nu
 function normalizeRange({ from = null, to = null, months = 12 } = {}) {
   const end = to ? new Date(to) : new Date();
   const start = from ? new Date(from) : new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() - Math.max(1, Math.min(60, Number(months) || 12)) + 1, 1));
-  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) {
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || start > end) {
     const error = new Error("Invalid metrics date range");
     error.code = "INVALID_DATE_RANGE";
     error.status = 400;
@@ -239,17 +239,21 @@ async function getAutomationMetrics({ agencyId, creatorId, from = null, to = nul
       where: { agencyId, creatorId, periodStart: { gte: monthStart(start), lte: end } },
       orderBy: [{ periodStart: "asc" }, { moduleKey: "asc" }, { actionType: "asc" }],
     }),
-    tx.automationDelivery.findMany({
-      where: {
-        agencyId,
-        creatorId,
-        originKind: "AUTOMATION",
-        status: { in: TERMINAL_STATUSES },
-        finishedAt: { gte: start, lte: end },
-      },
-      select: { moduleKey: true, actionType: true, status: true, result: true, finishedAt: true, updatedAt: true, createdAt: true, agencyId: true, creatorId: true },
-      take: 100000,
-    }),
+    tx.$queryRawUnsafe(`SELECT "moduleKey",to_char("finishedAt" AT TIME ZONE 'UTC','YYYY-MM') period,
+      count(*)::bigint total,
+      count(*) FILTER(WHERE status='COMPLETED')::bigint completed,
+      count(*) FILTER(WHERE status='FAILED')::bigint failed,
+      count(*) FILTER(WHERE status='SKIPPED')::bigint skipped,
+      count(*) FILTER(WHERE status='CANCELED')::bigint canceled,
+      count(*) FILTER(WHERE status='COMPLETED' AND "actionType"='SEND_MESSAGE')::bigint sent,
+      count(*) FILTER(WHERE result->>'replied'='true' OR result->>'code'='replied')::bigint replied,
+      count(*) FILTER(WHERE status='COMPLETED' AND "actionType" IN ('FOLLOW_BACK','FOLLOW_FAN','SFS_FOLLOW_TARGET'))::bigint followed,
+      count(*) FILTER(WHERE status='COMPLETED' AND "actionType" IN ('UNFOLLOW_FAN','SFS_UNFOLLOW_TARGET'))::bigint unfollowed,
+      count(*) FILTER(WHERE status='COMPLETED' AND "actionType" IN ('LIKE_POST','SFS_LIKE_COMMENT'))::bigint liked,
+      count(*) FILTER(WHERE status='COMPLETED' AND "actionType"='SFS_COMMENT_POST')::bigint commented
+      FROM "AutomationDelivery" WHERE "agencyId"=$1 AND "creatorId"=$2 AND "originKind"='AUTOMATION'
+      AND status IN ('COMPLETED','FAILED','SKIPPED','CANCELED') AND "finishedAt">=$3 AND "finishedAt"<=$4
+      GROUP BY "moduleKey",period`, agencyId,creatorId,start,end),
     tx.automationDelivery.groupBy({
       by: ["moduleKey", "failureCode"],
       where: { agencyId, creatorId, originKind: "AUTOMATION", status: "FAILED", finishedAt: { gte: start, lte: end } },
@@ -266,21 +270,24 @@ async function getAutomationMetrics({ agencyId, creatorId, from = null, to = nul
     byMonth[period] = addCounters(byMonth[period] || counterShape(), counters);
   };
 
+  const coarse = [];
   for (const row of archived) {
-    add(row.moduleKey, row.periodStart.toISOString().slice(0, 7), row);
+    const periodStart = new Date(row.periodStart), periodEnd = new Date(Date.UTC(periodStart.getUTCFullYear(),periodStart.getUTCMonth()+1,1)-1);
+    if (start <= periodStart && end >= periodEnd) add(row.moduleKey, periodStart.toISOString().slice(0,7), row);
+    else coarse.push({ moduleKey: row.moduleKey, actionType: row.actionType, from: periodStart, to: periodEnd });
   }
-
-  for (const row of liveRows) {
-    const period = monthStart(row.finishedAt || row.updatedAt || row.createdAt).toISOString().slice(0, 7);
-    add(row.moduleKey, period, classifyAutomationDelivery(row));
-  }
+  for (const row of liveRows) add(row.moduleKey, row.period, row);
+  const exact = coarse.length === 0;
 
   return {
     ok: true,
     range: { from: start, to: end },
-    summary,
-    byModule,
-    byMonth: Object.entries(byMonth).sort(([a], [b]) => a.localeCompare(b)).map(([period, counters]) => ({ period, ...counters })),
+    coverage: { exact, reason: exact ? null : "ARCHIVED_MONTH_PARTIAL_RANGE", coarsePeriods: coarse },
+    // The exact subtotal remains explicit; it is never labelled as the whole range.
+    knownSubtotal: { summary, byModule },
+    summary: exact ? summary : null,
+    byModule: exact ? byModule : {},
+    byMonth: Object.entries(exact ? byMonth : {}).sort(([a], [b]) => a.localeCompare(b)).map(([period, counters]) => ({ period, ...counters })),
     archivedMonths: archived.length,
     recentFailureCodes: failures
       .map((row) => ({ moduleKey: row.moduleKey, failureCode: row.failureCode || "unknown", count: row._count._all }))
@@ -293,6 +300,16 @@ async function getAutomationMetrics({ agencyId, creatorId, from = null, to = nul
 async function listAutomationAudit({ agencyId, creatorId, moduleKey = null, cursor = null, limit = 100, db = null }) {
   db = db || require("../prisma");
   const take = Math.max(1, Math.min(250, Number(limit) || 100));
+  const scope = createHash("sha256").update(JSON.stringify([agencyId,creatorId,moduleKey || null])).digest("hex").slice(0,24);
+  let after = null;
+  if (cursor) {
+    try {
+      if (typeof cursor !== "string" || !cursor.startsWith("audit.v1.") || cursor.length > 2048) throw new Error();
+      after = JSON.parse(Buffer.from(cursor.slice(9),"base64url").toString("utf8"));
+      if (after.scope !== scope || typeof after.id !== "string" || !after.id || after.id.length > 180
+        || typeof after.at !== "string" || !Number.isFinite(Date.parse(after.at))) throw new Error();
+    } catch { throw Object.assign(new Error("Invalid audit cursor; reload from the first page"), { code:"AUTOMATION_AUDIT_CURSOR_INVALID",status:400 }); }
+  }
   const where = {
     agencyId,
     action: { startsWith: "automation." },
@@ -301,17 +318,20 @@ async function listAutomationAudit({ agencyId, creatorId, moduleKey = null, curs
       { targetId: creatorId },
       { metadata: { path: ["creatorId"], equals: creatorId } },
     ],
-    ...(cursor ? { createdAt: { lt: new Date(cursor) } } : {}),
+    AND: after ? [{ OR: [{ createdAt: { lt: new Date(after.at) } }, { createdAt: new Date(after.at), id: { lt: after.id } }] }] : [],
   };
   if (moduleKey) {
-    where.AND = [{ metadata: { path: ["moduleKey"], equals: moduleKey } }];
+    where.AND.push({ metadata: { path: ["moduleKey"], equals: moduleKey } });
   }
   const rows = await db.auditLog.findMany({
     where,
     include: { actor: { select: { id: true, email: true, name: true } } },
     orderBy: [{ createdAt: "desc" }, { id: "desc" }],
-    take,
+    take: take + 1,
   });
+  const more = rows.length > take;
+  rows.length = Math.min(rows.length,take);
+  const last = rows.at(-1);
   return {
     ok: true,
     items: rows.map((row) => ({
@@ -319,7 +339,7 @@ async function listAutomationAudit({ agencyId, creatorId, moduleKey = null, curs
       metadata: row.metadata || {}, createdAt: row.createdAt,
       actor: row.actor ? { id: row.actor.id, email: row.actor.email, name: row.actor.name } : null,
     })),
-    nextCursor: rows.length === take ? rows[rows.length - 1].createdAt : null,
+    nextCursor: more && last ? "audit.v1." + Buffer.from(JSON.stringify({scope,at:last.createdAt.toISOString(),id:last.id})).toString("base64url") : null,
   };
 }
 module.exports = {

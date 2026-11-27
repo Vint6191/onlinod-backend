@@ -1,9 +1,10 @@
 "use strict";
 const crypto = require("node:crypto");
 const { retainKnownFan } = require("./creator-fact-write-authority");
+const correlation = require("./financial-correlation-service");
 const COMMON = ["agencyId","creatorId","fanId","fanOnlyFansUserIdAtEvent","fanUsernameAtEvent","fanDisplayNameAtEvent","fanAvatarUrlAtEvent",
   "externalTransactionId","amountCents","feeCents","netCents","taxCents","vatCents","mediaTaxCents","transactionStatus","currency",
-  "source","sourceUpdatedAt","collectedAt","sourceDeviceId","sourceJobId","updatedAt"];
+  "source","sourceUpdatedAt","collectedAt","sourceDeviceId","sourceJobId","updatedAt","financialCorrelation"];
 const FINANCIAL = ["agencyId","creatorId","fanId","fanOnlyFansUserId","fanUsernameAtEvent","fanDisplayNameAtEvent","fanAvatarUrlAtEvent",
   "externalTransactionId","transactionType","factType","projectionStatus","amountCents","feeCents","netCents","taxCents","vatCents","mediaTaxCents",
   "currency","occurredAt","transactionStatus","sourceUpdatedAt","collectedAt","sourceDeviceId","reasonCode","updatedAt","sourceJobId","scanRunId","page","ordinal"];
@@ -21,16 +22,37 @@ async function legacyCandidates(db,job,rows,kind) {
   if(!rows.length)return new Map();
   const table=kind==="SALE"?"CreatorSale":"CreatorTip",time=kind==="SALE"?"purchasedAt":"tippedAt";
   const records=rows.filter(row=>row.fanRecordId && row.amountCents!=null && row.amountCents>0).map(row=>({
-    incomingId:row.externalTransactionId,fanId:row.fanRecordId,amountCents:row.amountCents,currency:row.currency,occurredAt:row.occurredAt,saleType:row.saleType||"OTHER"}));
+    incomingId:row.externalTransactionId,fanId:row.fanRecordId,fanExternalId:row.fanOnlyFansUserId,
+    amountCents:row.amountCents,currency:row.currency,occurredAt:row.occurredAt,saleType:row.saleType||"OTHER"}));
   if(!records.length)return new Map();
-  const found=await db.$queryRawUnsafe(`SELECT r."incomingId",f.* FROM jsonb_to_recordset($2::jsonb)
-    r("incomingId" text,"fanId" text,"amountCents" integer,currency text,"occurredAt" timestamp,"saleType" text)
+  // Every publication page consults the entire immutable source run. Counting
+  // only this page makes attribution depend on transaction lexical ordering.
+  const runId=job.financialReceiptRunId || (job.id && job.params?.financialReceiptVersion===1
+    ? require("./financial-receipt-authority").runId(job) : null);
+  const found=await db.$queryRawUnsafe(`SELECT r."incomingId",f.*,(
+    NOT EXISTS(SELECT 1 FROM "CreatorFinancialTransaction" p WHERE p."creatorId"=$1
+      AND p."fanId"=f."fanId" AND p."externalTransactionId"<>r."incomingId"
+      AND p."factType"::text=$4 AND p."amountCents"=f."amountCents" AND p.currency=f.currency
+      AND p."occurredAt" BETWEEN f."${time}"-interval '5 seconds' AND f."${time}"+interval '5 seconds')
+    AND NOT EXISTS(SELECT 1 FROM "FinancialObservedFact" p WHERE p."runId"=$3 AND p."windowIndex"=0
+      AND p."externalId"<>r."incomingId" AND p."occurredAt" BETWEEN f."${time}"-interval '5 seconds' AND f."${time}"+interval '5 seconds'
+      AND p.value->>'factType'=$4 AND p.value->>'fanOnlyFansUserId'=r."fanExternalId"
+      AND p.value->>'amountCents'=f."amountCents"::text AND p.value->>'currency'=f.currency)
+    AND NOT EXISTS(SELECT 1 FROM "${table}" n WHERE n."creatorId"=$1 AND n.id<>f.id
+      AND n."fanId"=r."fanId" AND n."externalNotificationId" IS NOT NULL
+      AND n."amountCents"=r."amountCents" AND n.currency=r.currency
+      AND n."${time}" BETWEEN r."occurredAt"-interval '5 seconds' AND r."occurredAt"+interval '5 seconds'
+      ${kind==="SALE"?'AND n."saleType"::text=r."saleType"':""})) AS "identitySafe"
+    FROM jsonb_to_recordset($2::jsonb)
+    r("incomingId" text,"fanId" text,"fanExternalId" text,"amountCents" integer,currency text,"occurredAt" timestamp,"saleType" text)
     CROSS JOIN LATERAL (SELECT * FROM "${table}" f WHERE f."creatorId"=$1 AND f."fanId"=r."fanId"
       AND f."externalTransactionId" IS NULL AND f."amountCents"=r."amountCents" AND f.currency=r.currency
       AND f."${time}" BETWEEN r."occurredAt"-interval '5 seconds' AND r."occurredAt"+interval '5 seconds'
-      ${kind==="SALE"?'AND f."saleType"::text=r."saleType"':""} ORDER BY f."${time}",f.id LIMIT 2) f`,job.creatorId,JSON.stringify(records));
+      ${kind==="SALE"?'AND f."saleType"::text=r."saleType"':""} ORDER BY f."${time}",f.id LIMIT 2) f`,job.creatorId,JSON.stringify(records),runId,kind);
   const groups=new Map();for(const row of found){const group=groups.get(row.incomingId)||[];group.push({...row,fanRecordId:row.fanId});groups.set(row.incomingId,group);}
-  return new Map([...groups].filter(([,group])=>group.length===1).map(([id,group])=>[id,group[0]]));
+  const result=new Map([...groups].filter(([,group])=>group.length===1&&group[0].identitySafe).map(([id,group])=>[id,group[0]]));
+  result.ambiguousIds=[...new Set([...groups].filter(([id])=>!result.has(id)).flatMap(([,group])=>group.map(row=>row.id)))];
+  return result;
 }
 // A provider transaction has one current classification. An exact correction
 // may move that identity to a different projection (or to a known zero). Keep
@@ -76,16 +98,22 @@ async function publish({db,job,rows,existing,participants,deviceId,observedAt,no
     const model=kind==="SALE"?"creatorSale":"creatorTip",table=kind==="SALE"?"CreatorSale":"CreatorTip",time=kind==="SALE"?"purchasedAt":"tippedAt";
     const candidates=rows.filter(row=>row.factType===kind&&row.projectionStatus==="PROJECTED").map(row=>({...row,fanRecordId:financialById.get(row.externalTransactionId).fanRecordId}));
     if(!candidates.length)continue;
+    ids[kind].push(...await correlation.invalidateNeighborhoods({db,job,rows:candidates,kind,now}));
     const prior=await db[model].findMany({where:{creatorId:job.creatorId,externalTransactionId:{in:candidates.map(row=>row.externalTransactionId)}}});
     const byTransaction=new Map(prior.map(row=>[row.externalTransactionId,row]));
-    const legacy=await legacyCandidates(db,job,candidates.filter(row=>!byTransaction.has(row.externalTransactionId)),kind),used=new Set(),records=[];
+    const legacy=await legacyCandidates(db,job,candidates.filter(row=>!byTransaction.has(row.externalTransactionId)),kind),records=[];
+    if(legacy.ambiguousIds?.length){
+      const held=await db.$queryRawUnsafe(`UPDATE "${table}" SET "transactionStatus"='unverified',"updatedAt"=$3
+        WHERE "creatorId"=$1 AND id=ANY($2::text[]) AND "externalTransactionId" IS NULL
+          AND COALESCE("transactionStatus",'') NOT IN ('unverified','undo','refunded','refund','chargeback','reversed','reversal','superseded') RETURNING id`,job.creatorId,legacy.ambiguousIds,now);
+      ids[kind].push(...held.map(row=>row.id));
+    }
     for(const row of candidates){
       let previous=byTransaction.get(row.externalTransactionId)||legacy.get(row.externalTransactionId);
-      if(previous && used.has(previous.id))previous=null;
       const revision=row.sourceUpdatedAt||observedAt;
       if(!restoringVerifiedLedger && previous?.sourceUpdatedAt && +previous.sourceUpdatedAt>+revision)continue;
-      if(previous)used.add(previous.id);
       records.push(retainKnownFan(restoringVerifiedLedger?null:previous,{...previous,id:previous?.id||crypto.randomUUID(),createdAt:previous?.createdAt||now,
+        financialCorrelation:correlation.neighborhoodEvidence(previous,row,kind,now),
         eventFingerprint:previous?.eventFingerprint||crypto.createHash("sha256").update(`payout-transaction|${job.creatorId}|${row.externalTransactionId}`).digest("hex"),
         agencyId:job.agencyId,creatorId:job.creatorId,fanRecordId:row.fanRecordId,fanOnlyFansUserIdAtEvent:row.fanOnlyFansUserId,
         fanUsernameAtEvent:row.fanUsername,fanDisplayNameAtEvent:row.fanDisplayName,fanAvatarUrlAtEvent:row.fanAvatarUrl,
@@ -100,4 +128,4 @@ async function publish({db,job,rows,existing,participants,deviceId,observedAt,no
   }
   return ids;
 }
-module.exports={publish,supersede};
+module.exports={publish,supersede,legacyCandidates};

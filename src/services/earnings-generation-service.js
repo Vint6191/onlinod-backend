@@ -143,10 +143,10 @@ async function preparePage(db, job, run, { generationId = run.id, repair = false
       }
     }
     [g] = await db.$queryRawUnsafe(`INSERT INTO "CreatorEarningsGeneration"
-      (id,"agencyId","creatorId","runId","baseGeneration","fromAt","throughAt","snapshotAt","fullScan","legacyPending",mode,phase,"proofPolicyVersion")
+      (id,"agencyId","creatorId","runId","baseGeneration","fromAt","throughAt","snapshotAt","fullScan","legacyPending",mode,phase,"proofPolicyVersion","ltvDeltaVersion")
       VALUES($1,$2,$3,$8,(SELECT "activeGeneration" FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3),$4,$5,$6,$7,NOT EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3 AND "activeGeneration" IS NOT NULL),
       CASE WHEN NOT $10 AND EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3 AND "activeGeneration" IS NOT NULL) THEN 'DELTA' ELSE 'SNAPSHOT' END,
-      CASE WHEN NOT $10 AND EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3 AND "activeGeneration" IS NOT NULL) THEN 'APPLY' ELSE 'COPY' END,$9) RETURNING *`,
+      CASE WHEN NOT $10 AND EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3 AND "activeGeneration" IS NOT NULL) THEN 'APPLY' ELSE 'COPY' END,$9,1) RETURNING *`,
       generationId,job.agencyId,job.creatorId,from,through,snapshot,run.windows[0].kind === "FULL",run.id,FINANCIAL_PROOF_POLICY_VERSION,reconcilesMembership);
   }
   if (g.agencyId !== job.agencyId || g.creatorId !== job.creatorId || +g.snapshotAt !== +snapshot) throw fail("EARNINGS_GENERATION_SCOPE_MISMATCH");
@@ -180,6 +180,10 @@ async function preparePage(db, job, run, { generationId = run.id, repair = false
       const present = new Set((await db.$queryRawUnsafe(`SELECT "externalId" FROM "FinancialObservedFact"
         WHERE "runId"=$1 AND "windowIndex"=0 AND "externalId"=ANY($2::text[])`,run.id,rows.map(row=>row.transactionId))).map(row=>row.externalId));
       retained = rows.filter(row=>row.occurredAt<from || row.occurredAt>through || row.observedAt>snapshot || present.has(row.transactionId));
+      const retainedIds=new Set(retained.map(row=>row.transactionId));
+      const removed=rows.filter(row=>!retainedIds.has(row.transactionId)).map(row=>row.transactionId);
+      if(removed.length)await db.$executeRawUnsafe(`INSERT INTO "CreatorEarningsGenerationChange"(generation,"transactionId")
+        SELECT $1,unnest($2::text[]) ON CONFLICT DO NOTHING`,g.id,removed);
     }
     await upsert(db,g.id,retained);
     await advance(db,g,rows,rows.at(-1)?.transactionId,"APPLY");
@@ -198,7 +202,7 @@ async function preparePage(db, job, run, { generationId = run.id, repair = false
     // The complete immutable receipt is checked before preparation. Each delta
     // is already an exact financial fact; only the range proof waits for finalization.
     const accepted = new Set((await upsert(db,g.mode === "DELTA" ? g.baseGeneration : g.id,values)).map(row=>row.transactionId));
-    await require("./financial-transactions-service").publishVerifiedFinancialFactsPage({ db, job, facts: rows.filter(row=>accepted.has(row.externalId)), now: new Date() });
+    await require("./financial-transactions-service").publishVerifiedFinancialFactsPage({ db, job: { ...job, financialReceiptRunId: run.id }, facts: rows.filter(row=>accepted.has(row.externalId)), now: new Date() });
     await require("./financial-revision-repository").capture({db, ...job, transactionIds:[...accepted], observedAt:snapshot,
       generations:[g.mode === "DELTA" ? g.baseGeneration : g.id]});
     await db.$executeRawUnsafe(`UPDATE "CreatorEarningsGeneration" SET "observedCount"="observedCount"+$2,

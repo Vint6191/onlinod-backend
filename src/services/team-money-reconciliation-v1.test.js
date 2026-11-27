@@ -448,10 +448,12 @@ test("automatic Tip reconciliation re-reads a manual resolution at the row lock 
   const manual = { ...stale, attributedMemberId: "manager-selected-member", resolvedSource: "manual_manager_resolution" };
   const fx = tipDbFixture({ exactSent: tipSent({ memberId: "different-member" }), existing: stale });
   fx.db.$queryRawUnsafe = async (sql) => {
+    if(String(sql).includes('"TeamTipAlias"'))return [];
     assert.match(String(sql), /TeamTipLedger[\s\S]*FOR UPDATE/);
     fx.setAttribution(manual);
     return [{ ...manual }];
   };
+  fx.db.$executeRawUnsafe = async () => 1;
   const result = await reconcileCreatorTipToTeam({ db: commitDatabaseFixture(fx.db), tipId: "creator-tip-1" });
   assert.equal(result.preservedManualResolution, true);
   assert.equal(fx.getAttribution().attributedMemberId, "manager-selected-member");
