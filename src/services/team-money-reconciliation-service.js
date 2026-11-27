@@ -33,15 +33,7 @@ function classifySentSource(row) {
   return "UNKNOWN";
 }
 
-function purchaseIdentity(sale) {
-  return clean(
-    sale?.externalNotificationId
-      || sale?.externalTransactionId
-      || sale?.eventFingerprint
-      || (sale?.id ? `creator_sale:${sale.id}` : null),
-    220,
-  );
-}
+function purchaseIdentity(sale) { return require("./team-purchase-identity-service").purchaseId(sale); }
 
 function manualResolutionPreserved(row) {
   return row?.migrationBaselineProtected === true
@@ -119,13 +111,14 @@ async function findExactSentMessage(db, sale) {
   });
 }
 
-async function recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTransactionId = null }) {
+async function recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTransactionId = null, aliasRootId = null }) {
   if (!db?.teamMoneyAttributionFact?.findMany || !db?.teamPpvPurchaseLedger?.create) return null;
   const or = [{ creatorSaleId: sale.id }];
+  if(aliasRootId)or.push({rootId:aliasRootId});
   if (financialTransactionId) or.push({ financialTransactionId });
-  if (purchaseId) or.push({ externalId: purchaseId });
+
   const facts = await db.teamMoneyAttributionFact.findMany({
-    where: { agencyId: sale.agencyId, sourceType: "PPV", OR: or },
+    where: { agencyId: sale.agencyId, creatorId: sale.creatorId, sourceType: "PPV", OR: or },
     orderBy: [{ sourceUpdatedAt: "desc" }, { id: "asc" }], take: 3,
   });
   const roots = [...new Set((facts || []).map((f) => clean(f.rootId || f.sourceRowId, 220)).filter(Boolean))];
@@ -140,14 +133,14 @@ async function recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTr
   const existingById = db.teamPpvPurchaseLedger.findUnique
     ? await db.teamPpvPurchaseLedger.findUnique({ where: { id: rootId } })
     : null;
-  if (existingById) return existingById;
+  if (existingById) return require("./team-purchase-identity-service").compatible(existingById,sale,financialTransactionId)?existingById:null;
   try {
     return await db.teamPpvPurchaseLedger.create({ data: {
       id: rootId,
       agencyId: sale.agencyId,
       accountId: clean(fact.creatorId || sale.creatorId, 160) || sale.creatorId,
       creatorId: clean(fact.creatorId || sale.creatorId, 160) || sale.creatorId,
-      purchaseId: clean(fact.externalId || purchaseId || `recovered:${fact.id}`, 220),
+      purchaseId: purchaseId,
       messageId: clean(sale.messageId, 160), dialogId: clean(fact.dialogId, 160),
       fanId: clean(fact.fanId, 160), buyerFanId: clean(fact.fanId, 160),
       amountCents: Number(fact.amountCents || sale.amountCents || 0),
@@ -169,50 +162,34 @@ async function recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTr
     const recovered = db.teamPpvPurchaseLedger.findUnique
       ? await db.teamPpvPurchaseLedger.findUnique({ where: { id: rootId } })
       : null;
-    if (recovered) return recovered;
+    if (recovered && require("./team-purchase-identity-service").compatible(recovered,sale,financialTransactionId)) return recovered;
     throw error;
   }
 }
 
 async function findExistingPurchase(db, { sale, purchaseId, fanExternalId, financialTransactionId = null }) {
-  if (!db?.teamPpvPurchaseLedger) return null;
-  if (sale.id && db.teamPpvPurchaseLedger.findUnique) {
-    const bySale = await db.teamPpvPurchaseLedger.findUnique({ where: { creatorSaleId: sale.id } }).catch(() => null);
-    if (bySale) return bySale;
+  const identity=require("./team-purchase-identity-service");
+  if(!db?.teamPpvPurchaseLedger)return null;
+  const bySale=await db.teamPpvPurchaseLedger.findUnique({where:{creatorSaleId:sale.id}});
+  if(bySale) {
+    if(!identity.compatible(bySale,sale,financialTransactionId))throw Error("TEAM_PURCHASE_ROOT_IDENTITY_CONFLICT");
+    return bySale;
   }
-  if (purchaseId && db.teamPpvPurchaseLedger.findUnique) {
-    const byId = await db.teamPpvPurchaseLedger.findUnique({
-      where: { agencyId_purchaseId: { agencyId: sale.agencyId, purchaseId } },
-    }).catch(() => null);
-    if (byId) return byId;
+  if(financialTransactionId) {
+    const byFinancial=await db.teamPpvPurchaseLedger.findUnique({where:{financialTransactionId}});
+    if(byFinancial) {
+      if(!identity.compatible(byFinancial,sale,financialTransactionId))throw Error("TEAM_PURCHASE_ROOT_IDENTITY_CONFLICT");
+      return byFinancial;
+    }
   }
-  const messageId = clean(sale.messageId, 160);
-  if (!messageId || !db.teamPpvPurchaseLedger.findMany) {
-    return recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTransactionId });
+  const aliased=await identity.find(db,sale);
+  if(aliased?.root) {
+    if(!identity.compatible(aliased.root,sale,financialTransactionId))throw Error("TEAM_PURCHASE_ALIAS_CONFLICT");
+    return aliased.root;
   }
-  const when = sale.purchasedAt instanceof Date ? sale.purchasedAt : new Date(sale.purchasedAt);
-  if (!Number.isFinite(when.getTime())) return null;
-  const rows = await db.teamPpvPurchaseLedger.findMany({
-    where: {
-      agencyId: sale.agencyId,
-      creatorId: sale.creatorId,
-      messageId,
-      amountCents: Number(sale.amountCents || 0),
-      purchasedAt: {
-        gte: new Date(when.getTime() - 24 * 60 * 60 * 1000),
-        lte: new Date(when.getTime() + 24 * 60 * 60 * 1000),
-      },
-    },
-    orderBy: { createdAt: "asc" },
-    take: 3,
-  });
-  const semanticallySame = (rows || []).filter((row) => {
-    if (!fanExternalId) return true;
-    return !row.fanId || row.fanId === fanExternalId || row.buyerFanId === fanExternalId || row.dialogId === fanExternalId;
-  });
-  if (semanticallySame.length === 1) return semanticallySame[0];
-  if (semanticallySame.length > 1) return null;
-  return recoverPpvRootFromDurableFact(db, { sale, purchaseId, financialTransactionId });
+  // A retained fact proves a canonical operation. A bare provider number or a
+  // similar message/amount/date never proves that two purchases are identical.
+  return recoverPpvRootFromDurableFact(db,{sale,purchaseId,financialTransactionId,aliasRootId:aliased?.rootId});
 }
 
 async function loadSale(db, saleId) {
@@ -408,15 +385,13 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
   // Audit15 Closure3: manual Claims locks ResolveJob -> Purchase. Automatic
   // reconciliation must use the same order whenever the resolve job exists,
   // otherwise a real MANUAL/AUTO overlap can deadlock in PostgreSQL.
-  await lockPpvResolveJobByIdentity(db, {
-    agencyId: sale.agencyId,
-    purchaseId,
-    messageId: clean(sale.messageId, 160),
-  });
   let existing = await findExistingPurchase(db, {
     sale, purchaseId, fanExternalId, financialTransactionId: financialTransaction?.id || null,
   });
+  await lockPpvResolveJobByIdentity(db, {agencyId:sale.agencyId,purchaseId:existing?.purchaseId||purchaseId,messageId:clean(sale.messageId,160)});
   if (existing) existing = await lockPpvPurchaseRow(db, existing);
+  const ambiguousLegacyClaim=existing && manualResolutionPreserved(existing)
+    && await require("./team-purchase-identity-service").legacyAmbiguous(db,sale,existing);
   const accountId = clean(sent?.accountId || sale.creatorId, 160) || sale.creatorId;
   const creatorRef = clean(sale.creator?.username || sale.creator?.displayName, 160);
   const sourceData = {
@@ -435,7 +410,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
     creatorSaleId: sale.id,
     financialTransactionId: financialTransaction?.id || null,
     financialStatus,
-    rootVersion: "team_money_root_v2",
+    rootVersion: "team_money_root_v3",
   };
 
   if (existing && manualResolutionPreserved(existing)) {
@@ -443,9 +418,11 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
       where: { id: existing.id },
       data: {
         ...sourceData,
-        attributionBasis: existing.attributionBasis || "MANUAL_OVERRIDE_PRESERVED",
+        attributionBasis: ambiguousLegacyClaim?"LEGACY_IDENTITY_REVIEW_REQUIRED":existing.attributionBasis || "MANUAL_OVERRIDE_PRESERVED",
+        ...(ambiguousLegacyClaim?{status:"conflict"}:{}),
       },
     });
+    await require("./team-purchase-identity-service").bind(db,sale,existing);
     await publishTeamMoneyResult(db, existing, "PPV_RECONCILED");
     return { ok: true, purchase: existing, preservedManualResolution: true, financialRefunded: isRefundStatus(financialStatus) };
   }
@@ -504,6 +481,7 @@ async function reconcileCreatorSaleToTeamInTransaction({ db, saleId }) {
     purchase = await db.teamPpvPurchaseLedger.create({ data });
   }
 
+  await require("./team-purchase-identity-service").bind(db,sale,purchase);
   if (sale.messageId && financiallyActive({ financialStatus })) {
     await upsertResolveJob(db, { purchase, sale, proposed, sent });
   } else if (sale.messageId && isRefundStatus(financialStatus) && db?.teamPpvResolveJob?.updateMany) {

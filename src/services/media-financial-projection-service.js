@@ -11,9 +11,9 @@ const work = require("./domain-work-authority-service");
 const { lockCreatorFacts } = require("./creator-fact-write-authority");
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { pauseDeletedAgencyProjection } = require("./analytics-projection-lifecycle-service");
-const WORK_CLASS = "MEDIA_FINANCIAL_PROJECTION", ADOPTION_KEY = "media_financial_adoption_v1", PAGE = 500;
+const WORK_CLASS = "MEDIA_FINANCIAL_PROJECTION", ADOPTION_KEY = "media_financial_adoption_v2", PAGE = 500, SEMANTICS_VERSION = 2;
 const COUNTS = ["sentCount", "soldCount", "notOpenedCount", "freeCount", "revenueCents", "revenueUnknownCount"];
-const paid = new Set(["", "done", "completed", "complete", "success", "paid"]);
+const paid = new Set(["", "done", "loading", "completed", "complete", "success", "paid"]);
 const refunded = new Set(["undo", "refunded", "refund", "chargeback", "reversed", "reversal"]);
 const fail = code => Object.assign(new Error(code), { code });
 const own = result => { if (!result || result.lost) throw fail("MEDIA_FINANCIAL_CLAIM_LOST"); return result; };
@@ -217,8 +217,11 @@ async function enumerateAdoption({ db }) {
     const rows = await tx.creatorAccount.findMany({ where: { id: { gt: cursor.afterId || "", lte: cursor.upperId }, deletedAt: null }, select: { id: true, agencyId: true }, orderBy: { id: "asc" }, take: 5 });
     for (const row of rows) {
       await lockAgencyLifecycleBarrier({ db: tx, agencyId: row.agencyId });
-      await tx.$executeRawUnsafe(`INSERT INTO "CreatorMediaFinancialAdoptionState"("creatorId","agencyId","upperSaleId")
-        VALUES($1,$2,COALESCE((SELECT id FROM "CreatorSale" WHERE "creatorId"=$1 ORDER BY id DESC LIMIT 1),'')) ON CONFLICT("creatorId") DO NOTHING`, row.id, row.agencyId);
+      await tx.$executeRawUnsafe(`INSERT INTO "CreatorMediaFinancialAdoptionState"("creatorId","agencyId","upperSaleId","semanticsVersion")
+        VALUES($1,$2,COALESCE((SELECT id FROM "CreatorSale" WHERE "creatorId"=$1 ORDER BY id DESC LIMIT 1),''),2)
+        ON CONFLICT("creatorId") DO UPDATE SET "upperSaleId"=EXCLUDED."upperSaleId","semanticsVersion"=2,
+          phase='SALES',"saleCursor"='',"factSource"='',"factMessage"='',"factMedia"='',"completedAt"=NULL
+        WHERE "CreatorMediaFinancialAdoptionState"."semanticsVersion"<2`, row.id, row.agencyId);
       await requestProjection(tx, { agencyId: row.agencyId, creatorId: row.id });
     }
     const completed = rows.length < 5 || rows.at(-1)?.id === cursor.upperId;
@@ -299,7 +302,7 @@ async function financialProjectionState(db, creatorId) {
   const [row] = await db.$queryRawUnsafe(`SELECT
     (EXISTS(SELECT 1 FROM "CreatorMediaMessageFinancialState" WHERE "creatorId"=$1 AND dirty)
       OR ${require("./earnings-coverage-service").financialPublicationPendingSql('$1')}) AS pending,
-    NOT (EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1 AND "completedAt" IS NULL)
+    NOT (EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1 AND ("completedAt" IS NULL OR "semanticsVersion"<2))
     OR EXISTS(SELECT 1 FROM "CreatorMediaUsageSourceState" WHERE "creatorId"=$1 AND "factProtocol"=0)
     OR EXISTS(SELECT 1 FROM "MaintenanceLaneState" m WHERE m.key=$2 AND m."completedAt" IS NULL
       AND $1<=m.cursor->>'upperId' AND NOT EXISTS(SELECT 1 FROM "CreatorMediaFinancialAdoptionState" WHERE "creatorId"=$1))
@@ -323,5 +326,5 @@ async function runSweep({ db = require("../prisma"), limit = 4, maxRuntimeMs = 4
   return report;
 }
 
-module.exports = { WORK_CLASS, ADOPTION_KEY, PAGE, COUNTS, sourceKey, lock, counts, verifiedLegacyRows, publishCanonicalMediaSales,
+module.exports = { WORK_CLASS, ADOPTION_KEY, SEMANTICS_VERSION, PAGE, COUNTS, sourceKey, lock, counts, verifiedLegacyRows, publishCanonicalMediaSales,
   effectiveFact, statesForFacts, publishMessageStates, financialProjectionState, financialProjectionReady, applyContributionDeltas, projectFactPage, enumerateAdoption, processPage, runSweep };

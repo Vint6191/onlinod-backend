@@ -32,7 +32,7 @@ function resetFixture(change){
  const now=new Date('2026-09-29T00:00:00Z');const f={record:{id:'t',userId:'u',type:'PASSWORD_RESET',usedAt:null,expiresAt:new Date('2099-01-01')},writes:0};
  const tx={$queryRawUnsafe:async()=>[{id:'u'}],authToken:{findUnique:async()=>({...f.record}),update:async()=>{f.writes++;},updateMany:async()=>{f.writes++;return {count:1};}},user:{findUnique:async()=>({id:'u'}),update:async()=>{f.writes++;}},refreshSession:{updateMany:async()=>{f.writes++;}}};
  const db={...tx,authToken:{...tx.authToken,findUnique:async()=>({...f.record})}};
- const stubs={bcryptjs:{hash:async()=>{change(f,now);return 'hash-new';}},'../utils/crypto':{sha256:x=>x},'./db-transaction-service':{runDbTransaction:async(_db,work)=>work(tx)},'./authorization-session-authority-service':{acquireAuthorizationUserLock:async()=>{}},'./db-time-authority-service':{dbAuthorityNow:async()=>now}};
+ const stubs={bcryptjs:{compare:async()=>false,hash:async()=>{change(f,now);return 'hash-new';}},'../utils/crypto':{sha256:x=>x},'./db-transaction-service':{runDbTransaction:async(_db,work)=>work(tx)},'./authorization-session-authority-service':{acquireAuthorizationUserLock:async()=>{}},'./db-time-authority-service':{dbAuthorityNow:async()=>now}};
  const route=fs.readFileSync(path.join(root,'src/routes/auth.js'),'utf8');const snippet=route.slice(route.indexOf('router.post("/reset-password"'),route.indexOf('router.get("/me"'));
  let handler;
  vm.runInNewContext(snippet,{router:{post:(_path,fn)=>{handler=fn;}},resetPasswordSchema:{parse:x=>x},prisma:db,bcrypt:stubs.bcryptjs,sha256:x=>x,

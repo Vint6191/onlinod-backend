@@ -10,6 +10,7 @@ const {
 } = require("./message-library-lifecycle-service");
 const { assertManagementCommitAuthority } = require("./management-commit-authority-service");
 const { withProductBilling } = require("./product-billing-context-service");
+const { assertMessageLibraryAggregate } = require("./message-library-limits-service");
 const ACTIONS = ["save", "duplicate", "trash", "restore", "permanent", "block.trash", "block.restore"];
 const schema = z
   .object({
@@ -169,6 +170,7 @@ async function executeMessageLibraryCommand({
           });
           if (blocks.length > 500)
             throw fail("MESSAGE_LIBRARY_SCRIPT_LIMIT", "Source has more than 500 active messages", 413);
+          assertMessageLibraryAggregate(source,blocks);
           const original = projectScript({ ...source, blocks });
           const clone = {
             ...original,

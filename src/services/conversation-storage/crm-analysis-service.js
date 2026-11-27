@@ -1,16 +1,25 @@
 "use strict";
 const c = require("./common");
 const { validateCrmFinalResult, validateCrmHistoryResult } = require("./contracts/crm-validator.cjs");
+const { REPLY_PROJECTION, replyMessages, boundedProjection } = require("./ai-context-policy");
 function config(value) {
   c.bounded(value, 4096);
   c.check(
-    value &&
+    value && !Array.isArray(value) && Object.keys(value).length === 5 &&
+      value.provider === "ollama" &&
       value.schemaVersion === "crm-final-v1" &&
       ["crm-paged-v1", "crm-paged-v2", "crm-paged-v3"].includes(value.promptVersion),
     "ANALYSIS_CONFIG_NOT_SUPPORTED",
     400
   );
   for (const k of ["provider", "model", "configRevision", "promptVersion", "schemaVersion"]) c.text(value[k], 512);
+  c.check(value.model.trim() === value.model && value.model.length <= 240, "ANALYSIS_CONFIG_NOT_SUPPORTED", 400);
+  const provider = { endpoint: "http://127.0.0.1:11434/api/generate", model: value.model, timeoutMs: 600000,
+    format: "json", promptVersion: value.promptVersion, temperature: 0.1, topP: 0.9, contextSize: 16384,
+    ...(value.promptVersion === "crm-paged-v3" ? { budgetPolicy: "bounded-v1" } : {}) };
+  const revision = require("node:crypto").createHash("sha256")
+    .update(JSON.stringify(["ollama-generate-v1", provider])).digest("hex");
+  c.check(value.configRevision === revision, "ANALYSIS_CONFIG_NOT_SUPPORTED", 400);
   return value;
 }
 class CrmAnalysisService {
@@ -224,7 +233,7 @@ class CrmAnalysisService {
     const fanId = this.scope(ctx, scope);
     const replay = await this.crm.receipt(ctx, id, { kind: "analysis.claim", fanId });
     if (replay) return replay.run;
-    const input = await this.history.beginInput(ctx, scope);
+    const input = { ...await this.history.beginInput(ctx, scope), projectionVersion: "crm-history-fragments-v1" };
     if (!input.upper) return null;
     const priorWork = await c.one(
       this.db,
@@ -236,7 +245,8 @@ class CrmAnalysisService {
       ? await c.one(this.db, "SELECT * FROM crm_analysis_run WHERE run_id=$1", priorWork.active_run_id)
       : null;
     let canResume = false;
-    if (prior && prior.state === "RUNNING" && Number(prior.generation) === Number(priorWork.generation)) {
+    if (prior && prior.state === "RUNNING" && Number(prior.generation) === Number(priorWork.generation)
+      && prior.input?.projectionVersion === input.projectionVersion) {
       try {
         await this.history.validateInput(ctx, prior.input);
         canResume = true;
@@ -280,6 +290,7 @@ class CrmAnalysisService {
           basis &&
           Number(basis.personaRevision) === Number(persona.persona_revision) &&
           basis.input?.epoch === input.epoch &&
+          basis.input?.projectionVersion === input.projectionVersion &&
           basis.input.revision >= input.rewriteRevision &&
           c.hash(basis.config) === c.hash(work.config);
         run = await c.one(
@@ -351,13 +362,16 @@ class CrmAnalysisService {
   }
   async readNextPage(ctx, ref) {
     const r = await this.owned(ctx, ref);
+    // A new lease starts a new input if its projection policy is outdated. Do
+    // not reinterpret an old page/checkpoint under different byte boundaries.
+    c.check(r.input?.projectionVersion === "crm-history-fragments-v1", "ANALYSIS_INPUT_POLICY_OUTDATED");
     c.check(!r.input_done, "ANALYSIS_INPUT_COMPLETE");
     c.check(r.completed_pages === r.reduction_through + 1, "ANALYSIS_REDUCTION_REQUIRED");
-    const page = await this.history.readPage(ctx, r.input, { after: r.cursor, maxItems: 100, maxBytes: 65536 });
+    const page = await this.history.readPage(ctx, r.input, { after: r.cursor, maxItems: 100, maxBytes: 8192 });
     const proof = {
       pageNumber: r.completed_pages,
       hash: c.hash(page.items),
-      count: page.items.length,
+      count: page.items.filter(item => !item.textPart || item.textPart.complete).length,
       next: page.next,
       done: page.done,
     };
@@ -395,6 +409,7 @@ class CrmAnalysisService {
         );
         return;
       }
+      await this.crm.admitGrowth();
       c.check(
         r.pending &&
           r.pending.pageNumber === input.pageNumber &&
@@ -654,16 +669,20 @@ class CrmAnalysisService {
   async recoverProviderFailure(ctx, scope, expected) {
     const fanId = this.scope(ctx, scope);
     config(expected.config);
-    return Boolean(
-      await c.exec(
-        this.db,
-        "UPDATE crm_analysis_work SET state='READY',next_run_at=now(),failures=0,last_error='' WHERE scope_id=$1 AND fan_id=$2 AND generation=$3 AND state='ERROR' AND last_error=$4",
-        ctx.scopeId,
-        fanId,
-        expected.generation,
-        expected.error
-      )
-    );
+    c.check(["AI_PROVIDER_VERSION_UNSUPPORTED", "AI_MODEL_CONTEXT_UNVERIFIED", "ANALYSIS_CONFIG_NOT_SUPPORTED", "HISTORY_ITEM_TOO_LARGE", "AI_CONTEXT_BUDGET_EXCEEDED"].includes(expected.error),
+      "ANALYSIS_RECOVERY_NOT_SUPPORTED", 400);
+    return c.transaction(this.db, async tx => {
+      await c.one(tx, "SELECT scope_id FROM crm_scope WHERE scope_id=$1 FOR UPDATE", ctx.scopeId);
+      const work = await c.one(tx, "SELECT * FROM crm_analysis_work WHERE scope_id=$1 AND fan_id=$2 FOR UPDATE", ctx.scopeId, fanId);
+      if (!work || work.state !== "ERROR" || Number(work.generation) !== expected.generation
+        || work.last_error !== expected.error || c.hash(work.config) !== c.hash(expected.config)) return false;
+      // Only the identical supported configuration can recover; terminal manual
+      // cancellations and truly unsupported persisted options remain untouched.
+      config(work.config);
+      const restart = ["ANALYSIS_CONFIG_NOT_SUPPORTED", "HISTORY_ITEM_TOO_LARGE", "AI_CONTEXT_BUDGET_EXCEEDED"].includes(expected.error);
+      await c.exec(tx, "UPDATE crm_analysis_work SET state='READY',generation=generation+$3,next_run_at=now(),failures=0,last_error='' WHERE scope_id=$1 AND fan_id=$2", ctx.scopeId, fanId, restart ? 1 : 0);
+      return true;
+    });
   }
   async collect(ctx, scope, limit = 32) {
     await this.crm.scope(ctx);
@@ -683,10 +702,11 @@ class CrmAnalysisService {
   async beginReplies(ctx, scope, token) {
     const fanId = this.scope(ctx, scope);
     c.commandId(token);
+    const identityRevision = await this.crm.identityRevision(ctx);
     const history = await this.history.beginInput(ctx, scope),
       profile = await this.crm.getProfile(ctx, fanId),
       persona = await this.crm.scope(ctx);
-    const messages = (await this.history.getMessages(ctx, { dialogId: fanId, limit: 40, order: "desc" }))
+    const messages = replyMessages((await this.history.getMessages(ctx, { dialogId: fanId, limit: 40, order: "desc" }))
       .filter(
         (m) =>
           history.upper &&
@@ -695,7 +715,6 @@ class CrmAnalysisService {
               (m.messageId.length < history.upper.messageId.length ||
                 (m.messageId.length === history.upper.messageId.length && m.messageId <= history.upper.messageId))))
       )
-      .reverse()
       .map((m) => ({
         messageId: m.messageId,
         createdAt: m.createdAt,
@@ -704,10 +723,25 @@ class CrmAnalysisService {
         mediaIds: m.mediaIds,
         price: m.price,
         opened: m.opened === 1,
-      }));
+      })));
     c.check(messages.length, "CRM_NO_MESSAGES");
-    c.bounded(messages, 32768);
-    await this.history.validateInput(ctx, history);
+    const promptProfile = boundedProjection({ boundaries: profile.boundaries, negations: profile.negations,
+      fanName: profile.fanName, preferredAddress: profile.preferredAddress, nativeLanguage: profile.nativeLanguage,
+      chatLanguage: profile.chatLanguage, preferredTone: profile.preferredTone, sexualDynamic: profile.sexualDynamic,
+      summary: profile.summary, notesManual: profile.notesManual, contentPreferences: profile.contentPreferences,
+      fetishes: profile.fetishes, requestedContent: profile.requestedContent, budgetMin: profile.budgetMin, budgetMax: profile.budgetMax }, 2048, ["boundaries","negations"]);
+    const rawPersona = persona.persona;
+    const creatorPersona = rawPersona ? boundedProjection({
+      constraints: { redLines: rawPersona.physicalContent?.redLines, topicsToAvoid: rawPersona.chatting?.topicsToAvoid,
+        phrasesToAvoid: rawPersona.chatting?.phrasesToAvoid },
+      chatting: rawPersona.chatting, personal: rawPersona.personal, physicalContent: rawPersona.physicalContent,
+    }, 4096, ["constraints.redLines","constraints.topicsToAvoid","constraints.phrasesToAvoid"]) : null;
+    const descriptor = { ...history, replyContext: { policy: REPLY_PROJECTION,
+      messagesHash: c.hash(messages), fanProfileHash: c.hash(promptProfile), creatorPersonaHash: c.hash(creatorPersona),
+      profileRevision: profile.revision, personaRevision: Number(persona.persona_revision), identityRevision: String(identityRevision) } };
+    c.check(await this.crm.identityRevision(ctx) === identityRevision, "CRM_REPLY_PROFILE_CHANGED");
+    const currentRevision = await this.history.validateInput(ctx, history);
+    c.check(currentRevision === history.revision, "CRM_REPLY_HISTORY_CHANGED");
     await c.transaction(this.db, async (tx) => {
       await c.one(tx, "SELECT scope_id FROM crm_scope WHERE scope_id=$1 FOR UPDATE", ctx.scopeId);
       const current = await this.crm.ensure(ctx, fanId, tx),
@@ -730,13 +764,14 @@ class CrmAnalysisService {
           "CRM_REPLY_SUPERSEDED"
         );
         c.check(
-          c.hash(saved.input) === c.hash(history) &&
+          c.hash(saved.input) === c.hash(descriptor) &&
             Number(saved.profile_revision) === profile.revision &&
             Number(saved.persona_revision) === Number(persona.persona_revision),
           "CRM_REPLY_INPUT_CHANGED"
         );
         return;
       }
+      await this.crm.admitGrowth();
       await c.exec(
         tx,
         "INSERT INTO crm_reply_run(token,scope_id,fan_id,device_id,actor_id,input,profile_revision,persona_revision) VALUES($1,$2,$3,$4,$5,$6::jsonb,$7,$8)",
@@ -745,7 +780,7 @@ class CrmAnalysisService {
         fanId,
         ctx.deviceId,
         ctx.actorId,
-        JSON.stringify(history),
+        JSON.stringify(descriptor),
         profile.revision,
         persona.persona_revision
       );
@@ -757,7 +792,7 @@ class CrmAnalysisService {
         token
       );
     });
-    return { token, profile, messages };
+    return { token, profile, promptProfile, creatorPersona, messages, contextPolicy: REPLY_PROJECTION };
   }
   async completeReplies(ctx, scope, input) {
     const fanId = this.scope(ctx, scope);
@@ -804,6 +839,7 @@ class CrmAnalysisService {
     }
     const revision = await this.history.validateInput(ctx, saved.input);
     c.check(revision === saved.input.revision, "CRM_REPLY_HISTORY_CHANGED");
+    c.check(String(await this.crm.identityRevision(ctx)) === saved.input?.replyContext?.identityRevision, "CRM_REPLY_PROFILE_CHANGED");
     await c.transaction(this.db, async (tx) => {
       await c.one(tx, "SELECT scope_id FROM crm_scope WHERE scope_id=$1 FOR UPDATE", ctx.scopeId);
       const p = await c.one(
@@ -824,12 +860,18 @@ class CrmAnalysisService {
           Number(persona.persona_revision) === Number(saved.persona_revision),
         "CRM_REPLY_PROFILE_CHANGED"
       );
+      c.check(saved.input?.replyContext?.policy === REPLY_PROJECTION, "CRM_REPLY_INPUT_POLICY_OUTDATED");
+      // The relay catches already observed history changes inside this lock.
+      // A lagging relay cannot fence a different database; panel reads also
+      // compare the immutable descriptor with the authoritative history head.
+      c.check((!p.history_epoch || p.history_epoch === saved.input.epoch)
+        && Number(p.history_revision || 0) <= saved.input.revision, "CRM_REPLY_HISTORY_CHANGED");
       await c.exec(
         tx,
         "UPDATE crm_profile SET profile=profile || $3::jsonb WHERE scope_id=$1 AND fan_id=$2",
         ctx.scopeId,
         fanId,
-        JSON.stringify({ replySuggestions: list })
+        JSON.stringify({ replySuggestions: list, _replyInput: saved.input })
       );
       await c.exec(tx, "UPDATE crm_reply_run SET result_hash=$2 WHERE token=$1", input.token, digest);
     });

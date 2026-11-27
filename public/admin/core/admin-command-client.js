@@ -54,17 +54,17 @@
     const firstValidation = !command.hadPending && current?.attempts === 1 && !data.ok && data.commandId == null && [400, 404, 428].includes(response.status);
     if (data.commandId === command.commandId || firstValidation) forgetIfCurrent(command);
   }
-  async function resolve(path, method, token) {
+  async function resolve(path, method, token, closeMissing = false) {
     const resource = path.replace(/^\/api\/admin\/creators\/([^/]+)\/billing$/, "/api/admin/billing/creator/$1");
     const actor = window.NodAdminState?.admin?.id || token;
     let key = `onlinod_admin_pending_v1:${await digest(`${actor}\n${method}\n${resource}`)}`;
     if (!get(key)) key = `onlinod_admin_pending_v1:${await digest(`${token}\n${method}\n${resource}`)}`;
     const pending = get(key);
     if (!pending) return { ok: true, pending: false };
-    const res = await fetch(`/api/admin/commands/${pending.commandId}`, { headers: { Authorization: `Bearer ${token}` } });
+    const res = await fetch(`/api/admin/commands/${pending.commandId}${closeMissing ? "/abandon" : ""}`, { method: closeMissing ? "POST" : "GET", headers: { Authorization: `Bearer ${token}` } });
     const data = await res.json();
     if (res.ok && data.commandId === pending.commandId && (["SUCCEEDED", "REJECTED"].includes(data.status) || data.result?.accepted === true)) { forgetIfCurrent({ key, commandId: pending.commandId }); return { ...data, pending: Boolean(get(key)) }; }
-    return { ...data, pending: true, commandId: pending.commandId };
+    return { ...data, pending: true, canClose: res.status === 404 && data.code === "ADMIN_COMMAND_NOT_FOUND", commandId: pending.commandId };
   }
   async function pending(token) {
     const owner = await digest(window.NodAdminState?.admin?.id || token);
@@ -80,5 +80,5 @@
     if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, redact(item, name)]));
     return value;
   }
-  window.NodAdminCommands = { prepare, settle, resolve, pending, redact };
+  window.NodAdminCommands = { prepare, settle, resolve, close: (path, method, token) => resolve(path, method, token, true), pending, redact };
 })();

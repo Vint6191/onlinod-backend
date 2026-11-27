@@ -216,7 +216,7 @@ test("missing exact message provenance remains unresolved instead of using last-
   assert.equal(fx.getResolveJob().status, "pending");
 });
 
-test("exact provenance disagreement becomes an explicit conflict instead of silently stealing attribution", async () => {
+test("exact canonical-root provenance disagreement becomes an explicit conflict instead of silently stealing attribution", async () => {
   const existing = {
     id: "old-purchase",
     agencyId: "agency-1",
@@ -230,7 +230,7 @@ test("exact provenance disagreement becomes an explicit conflict instead of sile
     attributedMemberId: "member-old",
     attributedUserId: "user-old",
     resolvedSource: "legacy_auto_resolver",
-    creatorSaleId: null,
+    creatorSaleId: "sale-1",
   };
   const fx = dbFixture({ sent: manualSent("member-new"), existing });
   const result = await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
@@ -244,7 +244,7 @@ test("exact provenance disagreement becomes an explicit conflict instead of sile
   );
 });
 
-test("manual Claims resolution is never overwritten by later automatic reconciliation", async () => {
+test("manual Claims resolution on its canonical root is never overwritten by later automatic reconciliation", async () => {
   const existing = {
     id: "old-purchase",
     agencyId: "agency-1",
@@ -257,7 +257,7 @@ test("manual Claims resolution is never overwritten by later automatic reconcili
     status: "attributed",
     attributedMemberId: "manager-selected-member",
     resolvedSource: "manual_claim_resolution",
-    creatorSaleId: null,
+    creatorSaleId: "sale-1",
   };
   const fx = dbFixture({ sent: manualSent("different-member"), existing });
   const result = await reconcileCreatorSaleToTeam({ db: commitDatabaseFixture(fx.db), saleId: "sale-1" });
@@ -418,7 +418,7 @@ test("automatic PPV reconciliation re-reads a manual resolution at the row lock 
     id: "old-purchase", agencyId: "agency-1", accountId: "creator-1", creatorId: "creator-1",
     purchaseId: "notification-1", messageId: "message-1", amountCents: 2500,
     purchasedAt: new Date("2026-08-12T10:00:00Z"), status: "attributed",
-    attributedMemberId: "member-old", resolvedSource: "legacy_auto_resolver", creatorSaleId: null,
+    attributedMemberId: "member-old", resolvedSource: "legacy_auto_resolver", creatorSaleId: "sale-1",
   };
   const manual = { ...stale, attributedMemberId: "manager-selected-member", resolvedSource: "manual_claim_resolution" };
   const fx = dbFixture({ sent: manualSent("different-member"), existing: stale });

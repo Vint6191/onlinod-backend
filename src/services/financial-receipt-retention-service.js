@@ -26,7 +26,7 @@ async function processPage({ db, item, ownerToken }) {
         AND NOT EXISTS(SELECT 1 FROM "JobInstance" j WHERE j.id=r."jobId" AND j.params->>'collectionGeneration'=r.generation
           AND j.status IN ('SCHEDULED','CLAIMED','PAUSED','PUBLISHING'))
         AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" g JOIN "SystemSetting" s
-          ON s.key='repair:financial-snapshot:v2' AND s.value->'current'->>'generationId'=g.id
+          ON s.key IN ('repair:financial-snapshot:v2','repair:financial-snapshot:v3') AND s.value->'current'->>'generationId'=g.id
           WHERE g."runId"=r.id AND g.state IN ('BUILDING','READY','REPAIRING','RETIRED') AND s."updatedAt">clock_timestamp()-interval '1 day')
       ORDER BY r."createdAt",r.id LIMIT 1 FOR UPDATE OF r SKIP LOCKED`, item.agencyId, item.creatorId, cutoff);
     owned(await work.lockDomainWorkClaimForCommit({ db: tx, item, ownerToken }));
@@ -36,7 +36,7 @@ async function processPage({ db, item, ownerToken }) {
       const [protectedRun]=await tx.$queryRawUnsafe(`SELECT s."updatedAt"+interval '1 day' AS "untilAt"
         FROM "SystemSetting" s JOIN "CreatorEarningsGeneration" g ON g.id=s.value->'current'->>'generationId'
         JOIN "FinancialReceiptRun" r ON r.id=g."runId"
-        WHERE s.key='repair:financial-snapshot:v2' AND r."agencyId"=$1 AND r."creatorId"=$2
+        WHERE s.key IN ('repair:financial-snapshot:v2','repair:financial-snapshot:v3') AND r."agencyId"=$1 AND r."creatorId"=$2
           AND r."createdAt"<$3 AND g.state IN ('BUILDING','READY','REPAIRING','RETIRED')
           AND s."updatedAt">clock_timestamp()-interval '1 day'`,item.agencyId,item.creatorId,cutoff);
       const due=[next&&+next.createdAt+KEEP_MS+1000,protectedRun&&+protectedRun.untilAt+1000].filter(Number.isFinite);

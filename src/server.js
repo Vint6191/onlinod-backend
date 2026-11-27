@@ -5,6 +5,7 @@ const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
 const { createApiTrafficLimiter } = require("./middleware/api-traffic-limiter");
+const { httpBodyError } = require("./middleware/http-body-error");
 const path = require("node:path");
 const { URL } = require("node:url");
 
@@ -305,6 +306,7 @@ app.use((req, res) => {
   });
 });
 
+app.use(httpBodyError);
 app.use((err, _req, res, _next) => {
   console.error("[server] unhandled error:", err);
 

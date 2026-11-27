@@ -1,5 +1,5 @@
 {
-  "version": "nod_current_v33_financial_snapshot_reconciliation",
+  "version": "nod_current_v34_financial_and_workspace_repairs",
   "migrations": [
     {
       "migration": "20261014000000_notification_source_ledger",
@@ -128,6 +128,22 @@
     {
       "migration": "20261127010000_financial_snapshot_reconciliation",
       "checksum": "df47eb8ad8e44066e868d1c02108e551f69f96667622d44b83c6eafe77e7739f"
+    },
+    {
+      "migration": "20261127020000_financial_repair",
+      "checksum": "2d16dbaa0609e757c4e5b130186d2fa281368c5283fa5c5fd1367b22c2af6216"
+    },
+    {
+      "migration": "20261127030000_message_library_revisions",
+      "checksum": "193979e679f3f7e7a7c796474349d730c0c68ad29ea1a39990a83037de5a353e"
+    },
+    {
+      "migration": "20261127040000_team_retained_purchase_identity",
+      "checksum": "3875a0691c3fd14d3c74f7ee6cae4319ecec240ab83ebf3819e2553835d2c816"
+    },
+    {
+      "migration": "20261127050000_principal_device_lookup",
+      "checksum": "fbe09b15b48063eebfd04d7b70b1ef56ae01afd2d6bb1a1e0dd1582d60fed751"
     }
   ],
   "extension": {
@@ -237,14 +253,6 @@
         "persistence": "p"
       },
       {
-        "name": "MoneyResolutionAdoption",
-        "persistence": "p"
-      },
-      {
-        "name": "ProviderCapacityCreatorBucket",
-        "persistence": "p"
-      },
-      {
         "name": "FanLtvBalance",
         "persistence": "p"
       },
@@ -267,9 +275,33 @@
       {
         "name": "FanLtvState",
         "persistence": "p"
+      },
+      {
+        "name": "MessageLibraryScopeRevision",
+        "persistence": "p"
+      },
+      {
+        "name": "MoneyResolutionAdoption",
+        "persistence": "p"
+      },
+      {
+        "name": "ProviderCapacityCreatorBucket",
+        "persistence": "p"
+      },
+      {
+        "name": "TeamPpvPurchaseAlias",
+        "persistence": "p"
       }
     ],
     "columns": [
+      {
+        "table": "AgencyMember",
+        "name": "editRevision",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "1"
+      },
       {
         "table": "AnalyticsPlanningBudget",
         "name": "creatorId",
@@ -296,7 +328,7 @@
       },
       {
         "table": "CreatorDialogRecoveryRequest",
-        "name": "agencyId",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -304,7 +336,7 @@
       },
       {
         "table": "CreatorDialogRecoveryRequest",
-        "name": "creatorId",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -316,6 +348,14 @@
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorDialogRecoveryRequest",
+        "name": "sampleAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
@@ -343,16 +383,32 @@
         "column_default": null
       },
       {
-        "table": "CreatorDialogRecoveryRequest",
-        "name": "sampleAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
+        "table": "CreatorEarningsGeneration",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorEarningsGeneration",
         "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "runId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -368,19 +424,19 @@
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "createdAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "creatorId",
+        "name": "state",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": null
+        "column_default": "'BUILDING'::text"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "phase",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'COPY'::text"
       },
       {
         "table": "CreatorEarningsGeneration",
@@ -400,27 +456,27 @@
       },
       {
         "table": "CreatorEarningsGeneration",
+        "name": "throughAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "snapshotAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGeneration",
         "name": "fullScan",
         "data_type": "boolean",
         "udt_name": "bool",
         "is_nullable": "NO",
         "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "invalidCount",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": "0"
       },
       {
         "table": "CreatorEarningsGeneration",
@@ -432,15 +488,15 @@
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "mode",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "observedCount",
+        "data_type": "bigint",
+        "udt_name": "int8",
         "is_nullable": "NO",
-        "column_default": "'SNAPSHOT'::text"
+        "column_default": "0"
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "observedCount",
+        "name": "invalidCount",
         "data_type": "bigint",
         "udt_name": "int8",
         "is_nullable": "NO",
@@ -456,11 +512,11 @@
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "phase",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
         "is_nullable": "NO",
-        "column_default": "'COPY'::text"
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorEarningsGeneration",
@@ -480,39 +536,39 @@
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "runId",
+        "name": "mode",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": null
+        "column_default": "'SNAPSHOT'::text"
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "snapshotAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
+        "name": "proofPolicyVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
         "is_nullable": "NO",
-        "column_default": null
+        "column_default": "1"
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "state",
+        "name": "canonicalRepairCursor",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "'BUILDING'::text"
+        "column_default": "''::text"
       },
       {
         "table": "CreatorEarningsGeneration",
-        "name": "throughAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
+        "name": "canonicalRepairThroughId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
         "table": "CreatorEarningsGenerationDay",
-        "name": "category",
+        "name": "generation",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -528,38 +584,6 @@
       },
       {
         "table": "CreatorEarningsGenerationDay",
-        "name": "financialMetrics",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
-        "is_nullable": "NO",
-        "column_default": "'{}'::jsonb"
-      },
-      {
-        "table": "CreatorEarningsGenerationDay",
-        "name": "generation",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationDay",
-        "name": "netCents",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationDay",
-        "name": "observedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationEntry",
         "name": "category",
         "data_type": "text",
         "udt_name": "text",
@@ -567,23 +591,7 @@
         "column_default": null
       },
       {
-        "table": "CreatorEarningsGenerationEntry",
-        "name": "generation",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationEntry",
-        "name": "grossCents",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGenerationEntry",
+        "table": "CreatorEarningsGenerationDay",
         "name": "netCents",
         "data_type": "bigint",
         "udt_name": "int8",
@@ -591,7 +599,7 @@
         "column_default": null
       },
       {
-        "table": "CreatorEarningsGenerationEntry",
+        "table": "CreatorEarningsGenerationDay",
         "name": "observedAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
@@ -599,16 +607,16 @@
         "column_default": null
       },
       {
-        "table": "CreatorEarningsGenerationEntry",
-        "name": "occurredAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
+        "table": "CreatorEarningsGenerationDay",
+        "name": "financialMetrics",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
         "is_nullable": "NO",
-        "column_default": null
+        "column_default": "'{}'::jsonb"
       },
       {
         "table": "CreatorEarningsGenerationEntry",
-        "name": "status",
+        "name": "generation",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -623,11 +631,67 @@
         "column_default": null
       },
       {
-        "table": "CreatorEarningsGenerationHour",
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
         "name": "category",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "status",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "grossCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "fanOnlyFansUserId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "financialFact",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -648,6 +712,14 @@
       },
       {
         "table": "CreatorEarningsGenerationHour",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsGenerationHour",
         "name": "netCents",
         "data_type": "bigint",
         "udt_name": "int8",
@@ -672,55 +744,7 @@
       },
       {
         "table": "CreatorEarningsLedgerEntry",
-        "name": "category",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'other'::text"
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
         "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "grossCents",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "netCents",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "observedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "occurredAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "status",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -735,20 +759,76 @@
         "column_default": null
       },
       {
-        "table": "CreatorEarningsLedgerHour",
-        "name": "agencyId",
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'other'::text"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "status",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
       },
       {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "observedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "grossCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "fanOnlyFansUserId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
+        "name": "financialFact",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
         "table": "CreatorEarningsLedgerHour",
-        "name": "category",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "'other'::text"
+        "column_default": null
       },
       {
         "table": "CreatorEarningsLedgerHour",
@@ -760,19 +840,19 @@
       },
       {
         "table": "CreatorEarningsLedgerHour",
-        "name": "financialMetrics",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
-        "is_nullable": "NO",
-        "column_default": "'{}'::jsonb"
-      },
-      {
-        "table": "CreatorEarningsLedgerHour",
         "name": "hour",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerHour",
+        "name": "category",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'other'::text"
       },
       {
         "table": "CreatorEarningsLedgerHour",
@@ -791,16 +871,16 @@
         "column_default": null
       },
       {
-        "table": "CreatorEarningsLedgerProof",
-        "name": "activeGeneration",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
+        "table": "CreatorEarningsLedgerHour",
+        "name": "financialMetrics",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": "'{}'::jsonb"
       },
       {
         "table": "CreatorEarningsLedgerProof",
-        "name": "agencyId",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -808,15 +888,7 @@
       },
       {
         "table": "CreatorEarningsLedgerProof",
-        "name": "confirmedThroughAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerProof",
-        "name": "creatorId",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -832,6 +904,14 @@
       },
       {
         "table": "CreatorEarningsLedgerProof",
+        "name": "throughAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
         "name": "generation",
         "data_type": "text",
         "udt_name": "text",
@@ -840,9 +920,33 @@
       },
       {
         "table": "CreatorEarningsLedgerProof",
-        "name": "throughAt",
+        "name": "activeGeneration",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "confirmedThroughAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "proofPolicyVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -856,30 +960,6 @@
       },
       {
         "table": "CreatorEarningsPublishedDay",
-        "name": "collectedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "coverageStatus",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "createdAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
         "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
@@ -888,90 +968,10 @@
       },
       {
         "table": "CreatorEarningsPublishedDay",
-        "name": "currency",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'USD'::text"
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
         "name": "date",
         "data_type": "date",
         "udt_name": "date",
         "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "hourlyPoints",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "lastVerifiedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "messagesCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "postsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "referralsCents",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "scanProofId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "sourceScanRequestedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "sourceScanRunId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -984,15 +984,7 @@
       },
       {
         "table": "CreatorEarningsPublishedDay",
-        "name": "sourceUpdatedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsPublishedDay",
-        "name": "streamsCents",
+        "name": "subscriptionsCents",
         "data_type": "integer",
         "udt_name": "int4",
         "is_nullable": "YES",
@@ -1000,7 +992,7 @@
       },
       {
         "table": "CreatorEarningsPublishedDay",
-        "name": "subscriptionsCents",
+        "name": "messagesCents",
         "data_type": "integer",
         "udt_name": "int4",
         "is_nullable": "YES",
@@ -1016,11 +1008,91 @@
       },
       {
         "table": "CreatorEarningsPublishedDay",
+        "name": "postsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "streamsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "referralsCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
         "name": "totalCents",
         "data_type": "integer",
         "udt_name": "int4",
         "is_nullable": "NO",
         "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "currency",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'USD'::text"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceUpdatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceScanRunId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "sourceScanRequestedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "scanProofId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "collectedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorEarningsPublishedDay",
@@ -1031,20 +1103,28 @@
         "column_default": null
       },
       {
-        "table": "CreatorEntityChange",
-        "name": "agencyId",
+        "table": "CreatorEarningsPublishedDay",
+        "name": "coverageStatus",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
       },
       {
-        "table": "CreatorEntityChange",
-        "name": "createdAt",
+        "table": "CreatorEarningsPublishedDay",
+        "name": "lastVerifiedAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEarningsPublishedDay",
+        "name": "hourlyPoints",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
+        "column_default": null
       },
       {
         "table": "CreatorEntityChange",
@@ -1056,7 +1136,15 @@
       },
       {
         "table": "CreatorEntityChange",
-        "name": "entityId",
+        "name": "revision",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1072,17 +1160,9 @@
       },
       {
         "table": "CreatorEntityChange",
-        "name": "payload",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEntityChange",
-        "name": "revision",
-        "data_type": "bigint",
-        "udt_name": "int8",
+        "name": "entityId",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -1104,6 +1184,14 @@
       },
       {
         "table": "CreatorEntityChange",
+        "name": "payload",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityChange",
         "name": "tombstone",
         "data_type": "boolean",
         "udt_name": "bool",
@@ -1111,8 +1199,16 @@
         "column_default": "false"
       },
       {
+        "table": "CreatorEntityChange",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
         "table": "CreatorEntityChangeHead",
-        "name": "agencyId",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1120,7 +1216,7 @@
       },
       {
         "table": "CreatorEntityChangeHead",
-        "name": "creatorId",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1136,19 +1232,19 @@
       },
       {
         "table": "CreatorEntityChangeHead",
-        "name": "nextRetentionAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEntityChangeHead",
         "name": "retainedFrom",
         "data_type": "bigint",
         "udt_name": "int8",
         "is_nullable": "NO",
         "column_default": "1"
+      },
+      {
+        "table": "CreatorEntityChangeHead",
+        "name": "nextRetentionAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
       },
       {
         "table": "CreatorEntityChangeHead",
@@ -1160,23 +1256,7 @@
       },
       {
         "table": "CreatorEntityCurrent",
-        "name": "agencyId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEntityCurrent",
         "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEntityCurrent",
-        "name": "entityId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1192,9 +1272,17 @@
       },
       {
         "table": "CreatorEntityCurrent",
-        "name": "payload",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
+        "name": "entityId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -1219,6 +1307,14 @@
         "name": "sourceVersion",
         "data_type": "text",
         "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorEntityCurrent",
+        "name": "payload",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -1256,7 +1352,7 @@
       },
       {
         "table": "CreatorLiveSync",
-        "name": "agencyId",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1264,7 +1360,7 @@
       },
       {
         "table": "CreatorLiveSync",
-        "name": "creatorId",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1320,22 +1416,6 @@
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "agencyId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaFinancialAdoptionState",
-        "name": "completedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaFinancialAdoptionState",
         "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
@@ -1344,7 +1424,23 @@
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "factMedia",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "phase",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'SALES'::text"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "upperSaleId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1352,7 +1448,7 @@
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "factMessage",
+        "name": "saleCursor",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1368,15 +1464,7 @@
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "phase",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'SALES'::text"
-      },
-      {
-        "table": "CreatorMediaFinancialAdoptionState",
-        "name": "saleCursor",
+        "name": "factMessage",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1384,11 +1472,27 @@
       },
       {
         "table": "CreatorMediaFinancialAdoptionState",
-        "name": "upperSaleId",
+        "name": "factMedia",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
         "column_default": "''::text"
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "completedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaFinancialAdoptionState",
+        "name": "semanticsVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "1"
       },
       {
         "table": "CreatorMediaMessageFinancialState",
@@ -1408,27 +1512,11 @@
       },
       {
         "table": "CreatorMediaMessageFinancialState",
-        "name": "cursor",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "''::text"
-      },
-      {
-        "table": "CreatorMediaMessageFinancialState",
-        "name": "dialogId",
+        "name": "sourceKey",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
-      },
-      {
-        "table": "CreatorMediaMessageFinancialState",
-        "name": "dirty",
-        "data_type": "boolean",
-        "udt_name": "bool",
-        "is_nullable": "NO",
-        "column_default": "true"
       },
       {
         "table": "CreatorMediaMessageFinancialState",
@@ -1440,17 +1528,17 @@
       },
       {
         "table": "CreatorMediaMessageFinancialState",
-        "name": "netCents",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "YES",
+        "name": "dialogId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorMediaMessageFinancialState",
-        "name": "operationId",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "netCents",
+        "data_type": "bigint",
+        "udt_name": "int8",
         "is_nullable": "YES",
         "column_default": null
       },
@@ -1472,11 +1560,35 @@
       },
       {
         "table": "CreatorMediaMessageFinancialState",
-        "name": "sourceKey",
+        "name": "operationId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "version",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "dirty",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "true"
+      },
+      {
+        "table": "CreatorMediaMessageFinancialState",
+        "name": "cursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
       },
       {
         "table": "CreatorMediaMessageFinancialState",
@@ -1487,8 +1599,8 @@
         "column_default": "CURRENT_TIMESTAMP"
       },
       {
-        "table": "CreatorMediaMessageFinancialState",
-        "name": "version",
+        "table": "CreatorMediaSaleLink",
+        "name": "saleId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1508,6 +1620,14 @@
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaSaleLink",
+        "name": "sourceKey",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -1536,14 +1656,6 @@
       },
       {
         "table": "CreatorMediaSaleLink",
-        "name": "operationId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaSaleLink",
         "name": "proofActive",
         "data_type": "boolean",
         "udt_name": "bool",
@@ -1560,18 +1672,18 @@
       },
       {
         "table": "CreatorMediaSaleLink",
-        "name": "saleId",
+        "name": "operationId",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "NO",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
         "table": "CreatorMediaSaleLink",
-        "name": "sourceKey",
+        "name": "version",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "YES",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
@@ -1581,14 +1693,6 @@
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorMediaSaleLink",
-        "name": "version",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
       },
       {
         "table": "CreatorMediaUsageContribution",
@@ -1608,7 +1712,7 @@
       },
       {
         "table": "CreatorMediaUsageFact",
-        "name": "agencyId",
+        "name": "id",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1616,11 +1720,11 @@
       },
       {
         "table": "CreatorMediaUsageFact",
-        "name": "createdAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
+        "column_default": null
       },
       {
         "table": "CreatorMediaUsageFact",
@@ -1632,7 +1736,7 @@
       },
       {
         "table": "CreatorMediaUsageFact",
-        "name": "id",
+        "name": "sourceKey",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1640,10 +1744,10 @@
       },
       {
         "table": "CreatorMediaUsageFact",
-        "name": "lastSeenRunId",
+        "name": "sourceMessageId",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "YES",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
@@ -1652,14 +1756,6 @@
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaUsageFact",
-        "name": "observedPayload",
-        "data_type": "jsonb",
-        "udt_name": "jsonb",
-        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -1680,22 +1776,6 @@
       },
       {
         "table": "CreatorMediaUsageFact",
-        "name": "sourceKey",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaUsageFact",
-        "name": "sourceMessageId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMediaUsageFact",
         "name": "sourceRevision",
         "data_type": "text",
         "udt_name": "text",
@@ -1704,10 +1784,34 @@
       },
       {
         "table": "CreatorMediaUsageFact",
+        "name": "lastSeenRunId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorMediaUsageFact",
         "name": "updatedAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMediaUsageFact",
+        "name": "observedPayload",
+        "data_type": "jsonb",
+        "udt_name": "jsonb",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -1728,9 +1832,41 @@
       },
       {
         "table": "CreatorMoneyObservation",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
         "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "transactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -1744,7 +1880,15 @@
       },
       {
         "table": "CreatorMoneyObservation",
-        "name": "coveredGeneration",
+        "name": "status",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyObservation",
+        "name": "reason",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -1752,31 +1896,15 @@
       },
       {
         "table": "CreatorMoneyObservation",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyObservation",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyObservation",
-        "name": "occurredAt",
+        "name": "resolvedAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
-        "is_nullable": "NO",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
         "table": "CreatorMoneyObservation",
-        "name": "reason",
+        "name": "coveredGeneration",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -1799,46 +1927,6 @@
         "column_default": null
       },
       {
-        "table": "CreatorMoneyObservation",
-        "name": "resolvedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyObservation",
-        "name": "status",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyObservation",
-        "name": "transactionId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyResolutionRequest",
-        "name": "agencyId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyResolutionRequest",
-        "name": "attempts",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": "0"
-      },
-      {
         "table": "CreatorMoneyResolutionRequest",
         "name": "creatorId",
         "data_type": "text",
@@ -1848,18 +1936,10 @@
       },
       {
         "table": "CreatorMoneyResolutionRequest",
-        "name": "jobId",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorMoneyResolutionRequest",
-        "name": "lastError",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
@@ -1880,51 +1960,35 @@
       },
       {
         "table": "CreatorMoneyResolutionRequest",
+        "name": "attempts",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "jobId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
+        "name": "lastError",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorMoneyResolutionRequest",
         "name": "updatedAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorNotificationCorrection",
-        "name": "agencyId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationCorrection",
-        "name": "createdAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorNotificationCorrection",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationCorrection",
-        "name": "formerFactId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationCorrection",
-        "name": "formerModel",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
       },
       {
         "table": "CreatorNotificationCorrection",
@@ -1936,15 +2000,15 @@
       },
       {
         "table": "CreatorNotificationCorrection",
-        "name": "newEventType",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "YES",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorNotificationCorrection",
-        "name": "normalizerVersion",
+        "name": "creatorId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1960,6 +2024,38 @@
       },
       {
         "table": "CreatorNotificationCorrection",
+        "name": "formerModel",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationCorrection",
+        "name": "formerFactId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationCorrection",
+        "name": "newEventType",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationCorrection",
+        "name": "reasonCode",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationCorrection",
         "name": "priorEvidence",
         "data_type": "jsonb",
         "udt_name": "jsonb",
@@ -1968,7 +2064,7 @@
       },
       {
         "table": "CreatorNotificationCorrection",
-        "name": "reasonCode",
+        "name": "normalizerVersion",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -1983,6 +2079,22 @@
         "column_default": null
       },
       {
+        "table": "CreatorNotificationCorrection",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
         "table": "CreatorNotificationEvent",
         "name": "agencyId",
         "data_type": "text",
@@ -1992,15 +2104,47 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "amountCents",
-        "data_type": "integer",
-        "udt_name": "int4",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "identityKey",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "notificationId",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "canonicalFactId",
+        "name": "transactionId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "sourceType",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "sourceSubType",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -2016,38 +2160,6 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "commentId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "currency",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "disposition",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
         "name": "eventType",
         "data_type": "text",
         "udt_name": "text",
@@ -2056,17 +2168,9 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "fanAvatarUrlAtEvent",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "fanDisplayNameAtEvent",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "occurredAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
         "is_nullable": "YES",
         "column_default": null
       },
@@ -2088,35 +2192,19 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "firstObservedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "id",
+        "name": "fanDisplayNameAtEvent",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "NO",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "identityKey",
+        "name": "fanAvatarUrlAtEvent",
         "data_type": "text",
         "udt_name": "text",
-        "is_nullable": "NO",
+        "is_nullable": "YES",
         "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "lastObservedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorNotificationEvent",
@@ -2128,15 +2216,7 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "normalizerVersion",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "notificationId",
+        "name": "postId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -2144,9 +2224,49 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "occurredAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
+        "name": "commentId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "targetState",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "amountCents",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "currency",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "disposition",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationEvent",
+        "name": "reasonCode",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
       },
@@ -2160,7 +2280,7 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "postId",
+        "name": "canonicalFactId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -2168,15 +2288,7 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "reasonCode",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "scanRunId",
+        "name": "normalizerVersion",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2208,23 +2320,7 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "sourceSubType",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "sourceType",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationEvent",
-        "name": "targetState",
+        "name": "scanRunId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2232,23 +2328,15 @@
       },
       {
         "table": "CreatorNotificationEvent",
-        "name": "transactionId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationFrontierPage",
-        "name": "agencyId",
-        "data_type": "text",
-        "udt_name": "text",
+        "name": "firstObservedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
         "is_nullable": "NO",
-        "column_default": null
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
-        "table": "CreatorNotificationFrontierPage",
-        "name": "createdAt",
+        "table": "CreatorNotificationEvent",
+        "name": "lastObservedAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "NO",
@@ -2264,23 +2352,7 @@
       },
       {
         "table": "CreatorNotificationFrontierPage",
-        "name": "cursorEnd",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationFrontierPage",
-        "name": "cursorStart",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorNotificationFrontierPage",
-        "name": "digest",
+        "name": "agencyId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2303,12 +2375,36 @@
         "column_default": null
       },
       {
-        "table": "CreatorNotificationScanItem",
-        "name": "canonicalEventId",
+        "table": "CreatorNotificationFrontierPage",
+        "name": "cursorStart",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "cursorEnd",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "digest",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationFrontierPage",
+        "name": "createdAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorNotificationScanItem",
@@ -2320,7 +2416,7 @@
       },
       {
         "table": "CreatorNotificationScanItem",
-        "name": "normalizerVersion",
+        "name": "targetState",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -2336,7 +2432,7 @@
       },
       {
         "table": "CreatorNotificationScanItem",
-        "name": "sourcePhase",
+        "name": "normalizerVersion",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -2344,7 +2440,23 @@
       },
       {
         "table": "CreatorNotificationScanItem",
-        "name": "targetState",
+        "name": "canonicalEventId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationScanItem",
+        "name": "sourcePhase",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorNotificationSyncState",
+        "name": "normalizerVersion",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "YES",
@@ -2359,24 +2471,8 @@
         "column_default": "'{}'::jsonb"
       },
       {
-        "table": "CreatorNotificationSyncState",
-        "name": "normalizerVersion",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
         "table": "CreatorRealtimeReceipt",
-        "name": "capturedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRealtimeReceipt",
-        "name": "digest",
+        "name": "sessionId",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
@@ -2392,27 +2488,27 @@
       },
       {
         "table": "CreatorRealtimeReceipt",
-        "name": "sessionId",
+        "name": "digest",
         "data_type": "text",
         "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
       },
       {
-        "table": "CreatorRealtimeSession",
-        "name": "accessEpoch",
-        "data_type": "integer",
-        "udt_name": "int4",
+        "table": "CreatorRealtimeReceipt",
+        "name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
         "is_nullable": "NO",
         "column_default": null
       },
       {
         "table": "CreatorRealtimeSession",
-        "name": "ackedSeq",
-        "data_type": "bigint",
-        "udt_name": "int8",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
         "is_nullable": "NO",
-        "column_default": "0"
+        "column_default": null
       },
       {
         "table": "CreatorRealtimeSession",
@@ -2421,30 +2517,6 @@
         "udt_name": "text",
         "is_nullable": "NO",
         "column_default": null
-      },
-      {
-        "table": "CreatorRealtimeSession",
-        "name": "captureFromAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRealtimeSession",
-        "name": "capturedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRealtimeSession",
-        "name": "capturedSeq",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": "0"
       },
       {
         "table": "CreatorRealtimeSession",
@@ -2464,9 +2536,17 @@
       },
       {
         "table": "CreatorRealtimeSession",
-        "name": "id",
+        "name": "memberId",
         "data_type": "text",
         "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "accessEpoch",
+        "data_type": "integer",
+        "udt_name": "int4",
         "is_nullable": "NO",
         "column_default": null
       },
@@ -2480,11 +2560,19 @@
       },
       {
         "table": "CreatorRealtimeSession",
-        "name": "loss",
-        "data_type": "boolean",
-        "udt_name": "bool",
+        "name": "capturedSeq",
+        "data_type": "bigint",
+        "udt_name": "int8",
         "is_nullable": "NO",
-        "column_default": "false"
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "ackedSeq",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
       },
       {
         "table": "CreatorRealtimeSession",
@@ -2504,19 +2592,35 @@
       },
       {
         "table": "CreatorRealtimeSession",
-        "name": "memberId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRealtimeSession",
         "name": "resolvedLossRevision",
         "data_type": "integer",
         "udt_name": "int4",
         "is_nullable": "NO",
         "column_default": "0"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "capturedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "loss",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "table": "CreatorRealtimeSession",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorRealtimeSession",
@@ -2528,50 +2632,26 @@
       },
       {
         "table": "CreatorRealtimeSession",
-        "name": "updatedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "agencyId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "completedAt",
+        "name": "captureFromAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
         "is_nullable": "YES",
         "column_default": null
       },
       {
-        "table": "CreatorRecoveryIntent",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
+        "table": "CreatorRealtimeSession",
+        "name": "unackedSinceAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
-        "table": "CreatorRecoveryIntent",
-        "name": "failedAttempts",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": "0"
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "gapFrom",
+        "table": "CreatorRealtimeSession",
+        "name": "unackedThroughAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
-        "is_nullable": "NO",
+        "is_nullable": "YES",
         "column_default": null
       },
       {
@@ -2584,9 +2664,105 @@
       },
       {
         "table": "CreatorRecoveryIntent",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "stream",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "reason",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "gapFrom",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "targetAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "policyVersion",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "status",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "'PENDING'::text"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
         "name": "jobId",
         "data_type": "text",
         "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "completedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "updatedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "failedAttempts",
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "CreatorRecoveryIntent",
+        "name": "stoppedAt",
+        "data_type": "timestamp without time zone",
+        "udt_name": "timestamp",
         "is_nullable": "YES",
         "column_default": null
       },
@@ -2605,62 +2781,6 @@
         "udt_name": "timestamp",
         "is_nullable": "YES",
         "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "policyVersion",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "reason",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "status",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "'PENDING'::text"
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "stoppedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "stream",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "targetAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "CreatorRecoveryIntent",
-        "name": "updatedAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "NO",
-        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "CreatorRecoveryWatermark",
@@ -2699,214 +2819,6 @@
         "name": "amountCents",
         "data_type": "integer",
         "udt_name": "int4",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "MaintenanceAdmissionClassState",
-        "name": "admissionSequence",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": "0"
-      },
-      {
-        "table": "MoneyResolutionAdoption",
-        "name": "complete",
-        "data_type": "boolean",
-        "udt_name": "bool",
-        "is_nullable": "NO",
-        "column_default": "false"
-      },
-      {
-        "table": "MoneyResolutionAdoption",
-        "name": "cursor",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "''::text"
-      },
-      {
-        "table": "MoneyResolutionAdoption",
-        "name": "id",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "OfProviderRequestGateState",
-        "name": "scopeCreatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "ProviderCapacityContribution",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "ProviderCapacityCreatorBucket",
-        "name": "bucket",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "ProviderCapacityCreatorBucket",
-        "name": "creatorId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "ProviderCapacityCreatorBucket",
-        "name": "itemCount",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": "0"
-      },
-      {
-        "table": "ProviderCapacityCreatorBucket",
-        "name": "overdueCount",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": "0"
-      },
-      {
-        "table": "ProviderCapacityCreatorBucket",
-        "name": "requiredCalls",
-        "data_type": "bigint",
-        "udt_name": "int8",
-        "is_nullable": "NO",
-        "column_default": "0"
-      },
-      {
-        "table": "ProviderCapacityDebtState",
-        "name": "topologyId",
-        "data_type": "character varying",
-        "udt_name": "varchar",
-        "is_nullable": "NO",
-        "column_default": "'of-creator'::character varying"
-      },
-      {
-        "table": "ProviderCapacityDebtState",
-        "name": "topologyScope",
-        "data_type": "character varying",
-        "udt_name": "varchar",
-        "is_nullable": "NO",
-        "column_default": "'CREATOR_PARALLEL'::character varying"
-      },
-      {
-        "table": "ProviderCapacityDebtState",
-        "name": "topologyShardCount",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": "0"
-      },
-      {
-        "table": "ProviderCapacityDebtState",
-        "name": "topologyShardingAllowed",
-        "data_type": "boolean",
-        "udt_name": "bool",
-        "is_nullable": "NO",
-        "column_default": "true"
-      },
-      {
-        "table": "ProviderCapacityDebtState",
-        "name": "topologyVersion",
-        "data_type": "character varying",
-        "udt_name": "varchar",
-        "is_nullable": "NO",
-        "column_default": "'creator_provider_capacity_v2'::character varying"
-      },
-      {
-        "table": "_prisma_migrations",
-        "name": "applied_steps_count",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": "0"
-      },
-      {
-        "table": "_prisma_migrations",
-        "name": "checksum",
-        "data_type": "character varying",
-        "udt_name": "varchar",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "_prisma_migrations",
-        "name": "finished_at",
-        "data_type": "timestamp with time zone",
-        "udt_name": "timestamptz",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "_prisma_migrations",
-        "name": "id",
-        "data_type": "character varying",
-        "udt_name": "varchar",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "_prisma_migrations",
-        "name": "logs",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "_prisma_migrations",
-        "name": "migration_name",
-        "data_type": "character varying",
-        "udt_name": "varchar",
-        "is_nullable": "NO",
-        "column_default": null
-      },
-      {
-        "table": "_prisma_migrations",
-        "name": "rolled_back_at",
-        "data_type": "timestamp with time zone",
-        "udt_name": "timestamptz",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "_prisma_migrations",
-        "name": "started_at",
-        "data_type": "timestamp with time zone",
-        "udt_name": "timestamptz",
-        "is_nullable": "NO",
-        "column_default": "now()"
-      },
-      {
-        "table": "CreatorEarningsGenerationEntry",
-        "name": "fanOnlyFansUserId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "fanOnlyFansUserId",
-        "data_type": "text",
-        "udt_name": "text",
         "is_nullable": "YES",
         "column_default": null
       },
@@ -3127,36 +3039,204 @@
         "column_default": "CURRENT_TIMESTAMP"
       },
       {
-        "table": "CreatorEarningsLedgerProof",
-        "name": "proofPolicyVersion",
+        "table": "MaintenanceAdmissionClassState",
+        "name": "admissionSequence",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "MessageLibraryScopeRevision",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "MessageLibraryScopeRevision",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "MessageLibraryScopeRevision",
+        "name": "revision",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "MoneyResolutionAdoption",
+        "name": "id",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "MoneyResolutionAdoption",
+        "name": "cursor",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": "''::text"
+      },
+      {
+        "table": "MoneyResolutionAdoption",
+        "name": "complete",
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": "NO",
+        "column_default": "false"
+      },
+      {
+        "table": "OfProviderRequestGateState",
+        "name": "scopeCreatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "ProviderCapacityContribution",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "YES",
+        "column_default": null
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "bucket",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "itemCount",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "overdueCount",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "requiredCalls",
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": "NO",
+        "column_default": "0"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyVersion",
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": "NO",
+        "column_default": "'creator_provider_capacity_v2'::character varying"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyId",
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": "NO",
+        "column_default": "'of-creator'::character varying"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyScope",
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": "NO",
+        "column_default": "'CREATOR_PARALLEL'::character varying"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyShardCount",
         "data_type": "integer",
         "udt_name": "int4",
         "is_nullable": "NO",
         "column_default": "0"
       },
       {
-        "table": "AgencyMember",
-        "name": "editRevision",
-        "data_type": "integer",
-        "udt_name": "int4",
+        "table": "ProviderCapacityDebtState",
+        "name": "topologyShardingAllowed",
+        "data_type": "boolean",
+        "udt_name": "bool",
         "is_nullable": "NO",
-        "column_default": "1"
+        "column_default": "true"
       },
       {
-        "table": "CreatorRealtimeSession",
-        "name": "unackedSinceAt",
-        "data_type": "timestamp without time zone",
-        "udt_name": "timestamp",
-        "is_nullable": "YES",
+        "table": "TeamPpvPurchaseAlias",
+        "name": "agencyId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
         "column_default": null
       },
       {
-        "table": "CreatorRealtimeSession",
-        "name": "unackedThroughAt",
+        "table": "TeamPpvPurchaseAlias",
+        "name": "creatorId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "TeamPpvPurchaseAlias",
+        "name": "namespace",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "TeamPpvPurchaseAlias",
+        "name": "externalId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "TeamPpvPurchaseAlias",
+        "name": "rootId",
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": "NO",
+        "column_default": null
+      },
+      {
+        "table": "TeamPpvPurchaseAlias",
+        "name": "createdAt",
         "data_type": "timestamp without time zone",
         "udt_name": "timestamp",
-        "is_nullable": "YES",
-        "column_default": null
+        "is_nullable": "NO",
+        "column_default": "CURRENT_TIMESTAMP"
       },
       {
         "table": "TelegramDeliveryIntent",
@@ -3181,35 +3261,26 @@
         "udt_name": "int4",
         "is_nullable": "YES",
         "column_default": null
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "proofPolicyVersion",
-        "data_type": "integer",
-        "udt_name": "int4",
-        "is_nullable": "NO",
-        "column_default": "1"
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "canonicalRepairCursor",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "NO",
-        "column_default": "''::text"
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "canonicalRepairThroughId",
-        "data_type": "text",
-        "udt_name": "text",
-        "is_nullable": "YES",
-        "column_default": null
       }
     ],
     "enums": [],
     "views": [],
     "functions": [
+      {
+        "name": "message_library_block_revision",
+        "args": "",
+        "hash": "17769627da960ab432c9991b0c0954163509bb5ddacdacf74cb2e398847584ad"
+      },
+      {
+        "name": "message_library_collection_revision",
+        "args": "",
+        "hash": "254251db29b2df6223b54693bb0d75be563e86d191822e56b0654733f8af4b3e"
+      },
+      {
+        "name": "nod_member_edit_revision",
+        "args": "",
+        "hash": "de96fb6375daa1bff3f52a5628fc02d6fee5acffba4190c391bd8f69468b2fb5"
+      },
       {
         "name": "onlinod_capacity_publication_fence",
         "args": "",
@@ -3228,12 +3299,12 @@
       {
         "name": "onlinod_earnings_writer_fence_v6",
         "args": "",
-        "hash": "4c011e18f51ef353b55ad50e4b9e9baf3a5d97928dfab61ed5f85b23615c1e1d"
+        "hash": "af33c62ca164b7c6b9a4d31867d4f6d6801427d615de710463f02c02f148c334"
       },
       {
         "name": "onlinod_earnings_writer_fence_v7",
         "args": "",
-        "hash": "7fb2b5ce196ecf0f0ac9217bafbbe7d6daa0c28b5956d2129bf19f1f030e87fc"
+        "hash": "28b80847c9c8ac4296ab3a2dc5e745f42994e32569aebb00eb3abbdda16d3369"
       },
       {
         "name": "onlinod_enforce_provider_gate_waiter_registration",
@@ -3241,9 +3312,29 @@
         "hash": "672961dd0f1bf92db88837db884821064ba36d32eb54d9e4aa56759f71cf6d70"
       },
       {
+        "name": "onlinod_fan_ltv_source178",
+        "args": "",
+        "hash": "c0902f1107244bd7841bdd011faa8c7a1de9f69c7dfeb834ec2429e407dee2f0"
+      },
+      {
+        "name": "onlinod_fan_ltv_wake178",
+        "args": "a text, c text, t text",
+        "hash": "8d8a10cb81994bba701c7f76da6a8ae8d25bf2b203bef2e9206132e803f1d593"
+      },
+      {
+        "name": "onlinod_fan_ltv_writer178",
+        "args": "",
+        "hash": "a8996803881264d23ecb4fd64849209978d79155c21d6fa876351405a4506ac9"
+      },
+      {
         "name": "onlinod_guard_team_financial_authority_v1",
         "args": "",
         "hash": "7b98b12e9a287d9783ffb2d1b763a73e0958ae02955e240ef6d14891655530f4"
+      },
+      {
+        "name": "onlinod_guard_team_purchase_identity_v3",
+        "args": "",
+        "hash": "a52cf235081fab8464c26d0faaa547d405d4326536803259577a20bf784f4cd2"
       },
       {
         "name": "onlinod_live_earnings_hour_v1",
@@ -3279,29 +3370,33 @@
         "name": "onlinod_traffic_member_metrics_v2",
         "args": "member_id text",
         "hash": "85dbdfde605ff69021ba66b982863774b8c72de803df15352c4fbf005b2dbe3b"
-      },
-      {
-        "name": "onlinod_fan_ltv_source178",
-        "args": "",
-        "hash": "c0902f1107244bd7841bdd011faa8c7a1de9f69c7dfeb834ec2429e407dee2f0"
-      },
-      {
-        "name": "onlinod_fan_ltv_wake178",
-        "args": "a text, c text, t text",
-        "hash": "8d8a10cb81994bba701c7f76da6a8ae8d25bf2b203bef2e9206132e803f1d593"
-      },
-      {
-        "name": "onlinod_fan_ltv_writer178",
-        "args": "",
-        "hash": "a8996803881264d23ecb4fd64849209978d79155c21d6fa876351405a4506ac9"
-      },
-      {
-        "name": "nod_member_edit_revision",
-        "args": "",
-        "hash": "de96fb6375daa1bff3f52a5628fc02d6fee5acffba4190c391bd8f69468b2fb5"
       }
     ],
     "triggers": [
+      {
+        "table": "AgencyMember",
+        "name": "AgencyMember_edit_revision",
+        "type": 19,
+        "definition": "CREATE TRIGGER \"AgencyMember_edit_revision\" BEFORE UPDATE ON public.\"AgencyMember\" FOR EACH ROW EXECUTE FUNCTION nod_member_edit_revision()",
+        "args": "",
+        "function": "nod_member_edit_revision"
+      },
+      {
+        "table": "ContentBlock",
+        "name": "ContentBlock_message_library_revision",
+        "type": 29,
+        "definition": "CREATE TRIGGER \"ContentBlock_message_library_revision\" AFTER INSERT OR DELETE OR UPDATE ON public.\"ContentBlock\" FOR EACH ROW EXECUTE FUNCTION message_library_block_revision()",
+        "args": "",
+        "function": "message_library_block_revision"
+      },
+      {
+        "table": "ContentCollection",
+        "name": "ContentCollection_message_library_revision",
+        "type": 29,
+        "definition": "CREATE TRIGGER \"ContentCollection_message_library_revision\" AFTER INSERT OR DELETE OR UPDATE ON public.\"ContentCollection\" FOR EACH ROW EXECUTE FUNCTION message_library_collection_revision()",
+        "args": "",
+        "function": "message_library_collection_revision"
+      },
       {
         "table": "CreatorEarningsGeneration",
         "name": "onlinod_earnings_writer_fence_v7",
@@ -3309,6 +3404,14 @@
         "definition": "CREATE TRIGGER onlinod_earnings_writer_fence_v7 BEFORE INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsGeneration\" FOR EACH ROW EXECUTE FUNCTION onlinod_earnings_writer_fence_v7()",
         "args": "",
         "function": "onlinod_earnings_writer_fence_v7"
+      },
+      {
+        "table": "CreatorEarningsGenerationEntry",
+        "name": "FanLtv_generation178",
+        "type": 29,
+        "definition": "CREATE TRIGGER \"FanLtv_generation178\" AFTER INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsGenerationEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_source178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_source178"
       },
       {
         "table": "CreatorEarningsGenerationEntry",
@@ -3328,6 +3431,14 @@
       },
       {
         "table": "CreatorEarningsLedgerEntry",
+        "name": "FanLtv_ledger178",
+        "type": 29,
+        "definition": "CREATE TRIGGER \"FanLtv_ledger178\" AFTER INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsLedgerEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_source178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_source178"
+      },
+      {
+        "table": "CreatorEarningsLedgerEntry",
         "name": "onlinod_earnings_writer_fence_v6",
         "type": 31,
         "definition": "CREATE TRIGGER onlinod_earnings_writer_fence_v6 BEFORE INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsLedgerEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_earnings_writer_fence_v6()",
@@ -3341,6 +3452,14 @@
         "definition": "CREATE TRIGGER onlinod_live_earnings_hour_v1 AFTER INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsLedgerEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_live_earnings_hour_v1()",
         "args": "",
         "function": "onlinod_live_earnings_hour_v1"
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "FanLtv_publication178",
+        "type": 21,
+        "definition": "CREATE TRIGGER \"FanLtv_publication178\" AFTER INSERT OR UPDATE ON public.\"CreatorEarningsLedgerProof\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_source178()",
+        "args": "",
+        "function": "onlinod_fan_ltv_source178"
       },
       {
         "table": "CreatorEarningsLedgerProof",
@@ -3375,46 +3494,6 @@
         "function": "onlinod_money_coverage_monotonic_v7"
       },
       {
-        "table": "OfProviderRequestGateState",
-        "name": "onlinod_provider_gate_waiter_registration",
-        "type": 23,
-        "definition": "CREATE TRIGGER onlinod_provider_gate_waiter_registration BEFORE INSERT OR UPDATE ON public.\"OfProviderRequestGateState\" FOR EACH ROW EXECUTE FUNCTION onlinod_enforce_provider_gate_waiter_registration()",
-        "args": "",
-        "function": "onlinod_enforce_provider_gate_waiter_registration"
-      },
-      {
-        "table": "TeamMoneyAttributionFact",
-        "name": "TeamMoneyAttributionFact_current_financial_guard",
-        "type": 23,
-        "definition": "CREATE TRIGGER \"TeamMoneyAttributionFact_current_financial_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamMoneyAttributionFact\" FOR EACH ROW EXECUTE FUNCTION onlinod_guard_team_financial_authority_v1()",
-        "args": "",
-        "function": "onlinod_guard_team_financial_authority_v1"
-      },
-      {
-        "table": "CreatorEarningsGenerationEntry",
-        "name": "FanLtv_generation178",
-        "type": 29,
-        "definition": "CREATE TRIGGER \"FanLtv_generation178\" AFTER INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsGenerationEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_source178()",
-        "args": "",
-        "function": "onlinod_fan_ltv_source178"
-      },
-      {
-        "table": "CreatorEarningsLedgerEntry",
-        "name": "FanLtv_ledger178",
-        "type": 29,
-        "definition": "CREATE TRIGGER \"FanLtv_ledger178\" AFTER INSERT OR DELETE OR UPDATE ON public.\"CreatorEarningsLedgerEntry\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_source178()",
-        "args": "",
-        "function": "onlinod_fan_ltv_source178"
-      },
-      {
-        "table": "CreatorEarningsLedgerProof",
-        "name": "FanLtv_publication178",
-        "type": 21,
-        "definition": "CREATE TRIGGER \"FanLtv_publication178\" AFTER INSERT OR UPDATE ON public.\"CreatorEarningsLedgerProof\" FOR EACH ROW EXECUTE FUNCTION onlinod_fan_ltv_source178()",
-        "args": "",
-        "function": "onlinod_fan_ltv_source178"
-      },
-      {
         "table": "FanLtvBalance",
         "name": "FanLtvBalance_writer178",
         "type": 23,
@@ -3447,15 +3526,47 @@
         "function": "onlinod_fan_ltv_writer178"
       },
       {
-        "table": "AgencyMember",
-        "name": "AgencyMember_edit_revision",
-        "type": 19,
-        "definition": "CREATE TRIGGER \"AgencyMember_edit_revision\" BEFORE UPDATE ON public.\"AgencyMember\" FOR EACH ROW EXECUTE FUNCTION nod_member_edit_revision()",
+        "table": "OfProviderRequestGateState",
+        "name": "onlinod_provider_gate_waiter_registration",
+        "type": 23,
+        "definition": "CREATE TRIGGER onlinod_provider_gate_waiter_registration BEFORE INSERT OR UPDATE ON public.\"OfProviderRequestGateState\" FOR EACH ROW EXECUTE FUNCTION onlinod_enforce_provider_gate_waiter_registration()",
         "args": "",
-        "function": "nod_member_edit_revision"
+        "function": "onlinod_enforce_provider_gate_waiter_registration"
+      },
+      {
+        "table": "TeamMoneyAttributionFact",
+        "name": "TeamMoneyAttributionFact_current_financial_guard",
+        "type": 23,
+        "definition": "CREATE TRIGGER \"TeamMoneyAttributionFact_current_financial_guard\" BEFORE INSERT OR UPDATE ON public.\"TeamMoneyAttributionFact\" FOR EACH ROW EXECUTE FUNCTION onlinod_guard_team_financial_authority_v1()",
+        "args": "",
+        "function": "onlinod_guard_team_financial_authority_v1"
+      },
+      {
+        "table": "TeamPpvPurchaseAlias",
+        "name": "TeamPpvPurchaseAlias_identity_guard",
+        "type": 19,
+        "definition": "CREATE TRIGGER \"TeamPpvPurchaseAlias_identity_guard\" BEFORE UPDATE ON public.\"TeamPpvPurchaseAlias\" FOR EACH ROW EXECUTE FUNCTION onlinod_guard_team_purchase_identity_v3()",
+        "args": "",
+        "function": "onlinod_guard_team_purchase_identity_v3"
+      },
+      {
+        "table": "TeamPpvPurchaseLedger",
+        "name": "TeamPpvPurchaseLedger_identity_guard",
+        "type": 19,
+        "definition": "CREATE TRIGGER \"TeamPpvPurchaseLedger_identity_guard\" BEFORE UPDATE ON public.\"TeamPpvPurchaseLedger\" FOR EACH ROW EXECUTE FUNCTION onlinod_guard_team_purchase_identity_v3()",
+        "args": "",
+        "function": "onlinod_guard_team_purchase_identity_v3"
       }
     ],
     "constraints": [
+      {
+        "table": "AgencyMember",
+        "name": "AgencyMember_editRevision_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"editRevision\" >= 1))"
+      },
       {
         "table": "AnalyticsPlanningBudget",
         "name": "AnalyticsPlanningBudget_creator_fkey",
@@ -3490,6 +3601,14 @@
       },
       {
         "table": "CreatorEarningsGeneration",
+        "name": "CreatorEarningsGeneration_canonical_repair_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((state <> 'REPAIRING'::text) OR ((\"publishedAt\" IS NULL) AND (\"canonicalRepairThroughId\" IS NOT NULL))))"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
         "name": "CreatorEarningsGeneration_mode_check",
         "type": "c",
         "deferrable": false,
@@ -3511,6 +3630,14 @@
         "deferrable": false,
         "deferred": false,
         "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "table": "CreatorEarningsGeneration",
+        "name": "CreatorEarningsGeneration_proofPolicyVersion_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"proofPolicyVersion\" >= 1))"
       },
       {
         "table": "CreatorEarningsGeneration",
@@ -3647,6 +3774,14 @@
         "deferrable": false,
         "deferred": false,
         "definition": "PRIMARY KEY (\"creatorId\")"
+      },
+      {
+        "table": "CreatorEarningsLedgerProof",
+        "name": "CreatorEarningsLedgerProof_proofPolicyVersion_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((\"proofPolicyVersion\" >= 0))"
       },
       {
         "table": "CreatorEarningsPublishedDay",
@@ -4121,70 +4256,6 @@
         "definition": "PRIMARY KEY (\"creatorId\", stream)"
       },
       {
-        "table": "MaintenanceAdmissionClassState",
-        "name": "MaintenanceAdmissionClassState_sequence_check",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK ((\"admissionSequence\" >= 0))"
-      },
-      {
-        "table": "MoneyResolutionAdoption",
-        "name": "MoneyResolutionAdoption_pkey",
-        "type": "p",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "PRIMARY KEY (id)"
-      },
-      {
-        "table": "OfProviderRequestGateState",
-        "name": "OfProviderRequestGateState_scope_creator_fkey",
-        "type": "f",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "FOREIGN KEY (\"scopeCreatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
-      },
-      {
-        "table": "ProviderCapacityCreatorBucket",
-        "name": "ProviderCapacityCreatorBucket_nonnegative",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK (((\"itemCount\" >= 0) AND (\"overdueCount\" >= 0) AND (\"requiredCalls\" >= 0)))"
-      },
-      {
-        "table": "ProviderCapacityCreatorBucket",
-        "name": "ProviderCapacityCreatorBucket_pkey",
-        "type": "p",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "PRIMARY KEY (\"creatorId\", bucket)"
-      },
-      {
-        "table": "ProviderCapacityDebtState",
-        "name": "ProviderCapacityDebtState_topology_v1_check",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK ((((\"topologyId\")::text = 'of-creator'::text) AND ((\"topologyScope\")::text = 'CREATOR_PARALLEL'::text) AND (\"topologyShardCount\" >= 0) AND (\"topologyShardingAllowed\" = true) AND ((\"controlMode\")::text = ANY ((ARRAY['NORMAL'::character varying, 'OVERLOAD_PROTECTED'::character varying, 'CONSERVATIVE'::character varying])::text[])) AND (\"campaignDirectoryAdmissionBudgetCalls\" >= 1) AND (\"campaignDirectoryGuaranteedCallsPerSweep\" >= 1)))"
-      },
-      {
-        "table": "SubscriberDirectoryMaintenanceSignal",
-        "name": "SubscriberDirectoryMaintenanceSignal_kind_check",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK (((kind)::text = ANY (ARRAY['RECOVERY'::text, 'RETENTION'::text, 'DERIVED_PLANNING'::text])))"
-      },
-      {
-        "table": "_prisma_migrations",
-        "name": "_prisma_migrations_pkey",
-        "type": "p",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "PRIMARY KEY (id)"
-      },
-      {
         "table": "FanLtvBalance",
         "name": "FanLtvBalance_creatorId_fkey",
         "type": "f",
@@ -4313,20 +4384,116 @@
         "definition": "PRIMARY KEY (\"creatorId\")"
       },
       {
-        "table": "CreatorEarningsLedgerProof",
-        "name": "CreatorEarningsLedgerProof_proofPolicyVersion_check",
+        "table": "MaintenanceAdmissionClassState",
+        "name": "MaintenanceAdmissionClassState_sequence_check",
         "type": "c",
         "deferrable": false,
         "deferred": false,
-        "definition": "CHECK ((\"proofPolicyVersion\" >= 0))"
+        "definition": "CHECK ((\"admissionSequence\" >= 0))"
       },
       {
-        "table": "AgencyMember",
-        "name": "AgencyMember_editRevision_check",
+        "table": "MessageLibraryScopeRevision",
+        "name": "MessageLibraryScopeRevision_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"agencyId\", \"creatorId\")"
+      },
+      {
+        "table": "MessageLibraryScopeRevision",
+        "name": "MessageLibraryScopeRevision_revision_nonnegative",
         "type": "c",
         "deferrable": false,
         "deferred": false,
-        "definition": "CHECK ((\"editRevision\" >= 1))"
+        "definition": "CHECK ((revision >= 0))"
+      },
+      {
+        "table": "MoneyResolutionAdoption",
+        "name": "MoneyResolutionAdoption_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (id)"
+      },
+      {
+        "table": "OfProviderRequestGateState",
+        "name": "OfProviderRequestGateState_scope_creator_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"scopeCreatorId\") REFERENCES \"CreatorAccount\"(id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "ProviderCapacityCreatorBucket_nonnegative",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"itemCount\" >= 0) AND (\"overdueCount\" >= 0) AND (\"requiredCalls\" >= 0)))"
+      },
+      {
+        "table": "ProviderCapacityCreatorBucket",
+        "name": "ProviderCapacityCreatorBucket_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"creatorId\", bucket)"
+      },
+      {
+        "table": "ProviderCapacityDebtState",
+        "name": "ProviderCapacityDebtState_topology_v1_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((((\"topologyId\")::text = 'of-creator'::text) AND ((\"topologyScope\")::text = 'CREATOR_PARALLEL'::text) AND (\"topologyShardCount\" >= 0) AND (\"topologyShardingAllowed\" = true) AND ((\"controlMode\")::text = ANY ((ARRAY['NORMAL'::character varying, 'OVERLOAD_PROTECTED'::character varying, 'CONSERVATIVE'::character varying])::text[])) AND (\"campaignDirectoryAdmissionBudgetCalls\" >= 1) AND (\"campaignDirectoryGuaranteedCallsPerSweep\" >= 1)))"
+      },
+      {
+        "table": "SubscriberDirectoryMaintenanceSignal",
+        "name": "SubscriberDirectoryMaintenanceSignal_kind_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((kind)::text = ANY (ARRAY['RECOVERY'::text, 'RETENTION'::text, 'DERIVED_PLANNING'::text])))"
+      },
+      {
+        "table": "TeamPpvPurchaseAlias",
+        "name": "TeamPpvPurchaseAlias_namespace_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK ((namespace = ANY (ARRAY['creator_sale'::text, 'notification'::text, 'transaction'::text, 'event'::text])))"
+      },
+      {
+        "table": "TeamPpvPurchaseAlias",
+        "name": "TeamPpvPurchaseAlias_pkey",
+        "type": "p",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "PRIMARY KEY (\"agencyId\", \"creatorId\", namespace, \"externalId\")"
+      },
+      {
+        "table": "TeamPpvPurchaseAlias",
+        "name": "TeamPpvPurchaseAlias_scope_fkey",
+        "type": "f",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "FOREIGN KEY (\"agencyId\", \"creatorId\") REFERENCES \"CreatorAccount\"(\"agencyId\", id) ON UPDATE CASCADE ON DELETE CASCADE"
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "TelegramDeliveryIntent_continuation_manifest_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((kind <> 'INSTRUCTION_CONTINUATION'::text) OR (\"instructionManifest\" IS NOT NULL)))"
+      },
+      {
+        "table": "TelegramDeliveryIntent",
+        "name": "TelegramDeliveryIntent_instruction_manifest_check",
+        "type": "c",
+        "deferrable": false,
+        "deferred": false,
+        "definition": "CHECK (((\"instructionManifest\" IS NULL) OR ((kind = ANY (ARRAY['TASK'::text, 'REVISION_REQUEST'::text, 'INSTRUCTION_CONTINUATION'::text])) AND (jsonb_typeof(\"instructionManifest\") = 'object'::text))))"
       },
       {
         "table": "TelegramDeliveryIntent",
@@ -4343,38 +4510,6 @@
         "deferrable": false,
         "deferred": false,
         "definition": "CHECK ((kind = ANY (ARRAY['TASK'::text, 'REFERENCE'::text, 'MANUAL_REMINDER'::text, 'AUTO_REMINDER'::text, 'CANCELLATION'::text, 'REVISION_REQUEST'::text, 'INSTRUCTION_PART'::text, 'INSTRUCTION_CONTINUATION'::text])))"
-      },
-      {
-        "table": "TelegramDeliveryIntent",
-        "name": "TelegramDeliveryIntent_instruction_manifest_check",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK (((\"instructionManifest\" IS NULL) OR ((kind = ANY (ARRAY['TASK'::text, 'REVISION_REQUEST'::text, 'INSTRUCTION_CONTINUATION'::text])) AND (jsonb_typeof(\"instructionManifest\") = 'object'::text))))"
-      },
-      {
-        "table": "TelegramDeliveryIntent",
-        "name": "TelegramDeliveryIntent_continuation_manifest_check",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK (((kind <> 'INSTRUCTION_CONTINUATION'::text) OR (\"instructionManifest\" IS NOT NULL)))"
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "CreatorEarningsGeneration_proofPolicyVersion_check",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK ((\"proofPolicyVersion\" >= 1))"
-      },
-      {
-        "table": "CreatorEarningsGeneration",
-        "name": "CreatorEarningsGeneration_canonical_repair_check",
-        "type": "c",
-        "deferrable": false,
-        "deferred": false,
-        "definition": "CHECK (((state <> 'REPAIRING'::text) OR ((\"publishedAt\" IS NULL) AND (\"canonicalRepairThroughId\" IS NOT NULL))))"
       }
     ],
     "indexes": [
@@ -4440,6 +4575,15 @@
         "options": "0 0 0",
         "expressions": "\"left\"(COALESCE((\"publishedValue\" ->> 'purchasedAt'::text), (\"publishedValue\" ->> 'tippedAt'::text), (\"publishedValue\" ->> 'occurredAt'::text), (\"publishedValue\" ->> 'paidAt'::text), (\"publishedValue\" ->> 'likedAt'::text), (\"publishedValue\" ->> 'commentedAt'::text), (\"publishedValue\" ->> 'date'::text)), 10)",
         "predicate": "dirty"
+      },
+      {
+        "table": "CreatorBillingEntitlement",
+        "name": "CreatorBillingEntitlement_autoRenewEnabled_nextRenewalAt_creato",
+        "unique": false,
+        "keys": "27 23 4",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
       },
       {
         "table": "CreatorDialogRecoveryRequest",
@@ -5109,6 +5253,24 @@
       },
       {
         "table": "CreatorSale",
+        "name": "CreatorSale_agencyId_externalNotificationId_idx",
+        "unique": false,
+        "keys": "2 10",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorSale",
+        "name": "CreatorSale_agencyId_externalTransactionId_idx",
+        "unique": false,
+        "keys": "2 11",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "CreatorSale",
         "name": "CreatorSale_media_adoption_idx",
         "unique": false,
         "keys": "3 1",
@@ -5124,6 +5286,15 @@
         "options": "0 0",
         "expressions": null,
         "predicate": "(status = 'PENDING'::\"CustomOrderStatus\")"
+      },
+      {
+        "table": "DeviceCryptoIdentity",
+        "name": "DeviceCryptoIdentity_deviceId_userId_idx",
+        "unique": false,
+        "keys": "1 3",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
       },
       {
         "table": "DomainWorkItem",
@@ -5145,12 +5316,84 @@
       },
       {
         "table": "DomainWorkItem",
+        "name": "DomainWorkItem_notification_refresh_recovery_idx",
+        "unique": false,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": "((state = 'RECONCILE_REQUIRED'::text) AND (\"terminalCause\" = 'RETRY_EXHAUSTED:NOTIFICATION_BUMP_PROJECTION_FAILED:FAN_DATA_REFRESH_BACKLOG_FULL'::text) AND (\"workClass\" = ANY (ARRAY['NOTIFICATION_CONSEQUENCES'::text, 'NOTIFICATION_CONSEQUENCES_V2'::text, 'NOTIFICATION_FACT_RECEIPTS'::text])) AND ((\"lastRepair\" ->> 'kind'::text) IS DISTINCT FROM 'notification_refresh_capacity_recovery_v1'::text))"
+      },
+      {
+        "table": "DomainWorkItem",
         "name": "DomainWorkItem_reconcile_class_current_idx",
         "unique": false,
         "keys": "3 12 1",
         "options": "0 0 0",
         "expressions": null,
         "predicate": "(\"isOutstanding\" AND (state = 'RECONCILE_REQUIRED'::text))"
+      },
+      {
+        "table": "FanLtvBalance",
+        "name": "FanLtvBalance_pkey",
+        "unique": true,
+        "keys": "1 2 3",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvChange",
+        "name": "FanLtvChange_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvDistribution",
+        "name": "FanLtvDistribution_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvMetric",
+        "name": "FanLtvMetric_pkey",
+        "unique": true,
+        "keys": "1 2 3",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "FanLtvReceipt_due178_idx",
+        "unique": false,
+        "keys": "1 4 2",
+        "options": "0 0 0",
+        "expressions": null,
+        "predicate": "(\"nextDueAt\" IS NOT NULL)"
+      },
+      {
+        "table": "FanLtvReceipt",
+        "name": "FanLtvReceipt_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "FanLtvState",
+        "name": "FanLtvState_pkey",
+        "unique": true,
+        "keys": "1",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
       },
       {
         "table": "JobInstance",
@@ -5176,6 +5419,15 @@
         "unique": false,
         "keys": "1 6 3",
         "options": "0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "MessageLibraryScopeRevision",
+        "name": "MessageLibraryScopeRevision_pkey",
+        "unique": true,
+        "keys": "1 2",
+        "options": "0 0",
         "expressions": null,
         "predicate": null
       },
@@ -5261,6 +5513,24 @@
         "predicate": "(\"financialStatus\" = ANY (ARRAY['unverified'::text, 'gross_unknown'::text]))"
       },
       {
+        "table": "TeamPpvPurchaseAlias",
+        "name": "TeamPpvPurchaseAlias_pkey",
+        "unique": true,
+        "keys": "1 2 3 4",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "TeamPpvPurchaseAlias",
+        "name": "TeamPpvPurchaseAlias_rootId_idx",
+        "unique": false,
+        "keys": "5",
+        "options": "0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
         "table": "TeamPpvPurchaseLedger",
         "name": "TeamPpvPurchaseLedger_retention_compact_v8_idx",
         "unique": false,
@@ -5268,6 +5538,24 @@
         "options": "0 0",
         "expressions": null,
         "predicate": "((\"compactedAt\" IS NULL) AND (\"historicalFactVersion\" = 'team_money_fact_v2'::text) AND (\"historicalFactProjectedAt\" IS NOT NULL) AND (status = ANY (ARRAY['resolved'::text, 'expired'::text, 'attributed'::text, 'unresolved'::text, 'rejected'::text, 'creator_revenue'::text])))"
+      },
+      {
+        "table": "TeamPpvResolveJob",
+        "name": "TeamPpvResolveJob_agency_status_created_id_idx",
+        "unique": false,
+        "keys": "2 11 18 1",
+        "options": "0 0 0 0",
+        "expressions": null,
+        "predicate": null
+      },
+      {
+        "table": "TeamPpvResolveJob",
+        "name": "TeamPpvResolveJob_creator_status_created_id_idx",
+        "unique": false,
+        "keys": "2 4 11 18 1",
+        "options": "0 0 0 0 0",
+        "expressions": null,
+        "predicate": null
       },
       {
         "table": "TeamPpvResolveJob",
@@ -5315,112 +5603,13 @@
         "predicate": "((\"compactedAt\" IS NULL) AND (\"historicalFactVersion\" = 'team_money_fact_v2'::text) AND (\"historicalFactProjectedAt\" IS NOT NULL))"
       },
       {
-        "table": "_prisma_migrations",
-        "name": "_prisma_migrations_pkey",
-        "unique": true,
-        "keys": "1",
-        "options": "0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "FanLtvBalance",
-        "name": "FanLtvBalance_pkey",
-        "unique": true,
-        "keys": "1 2 3",
-        "options": "0 0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "FanLtvChange",
-        "name": "FanLtvChange_pkey",
-        "unique": true,
-        "keys": "1 2",
-        "options": "0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "FanLtvDistribution",
-        "name": "FanLtvDistribution_pkey",
-        "unique": true,
-        "keys": "1 2",
-        "options": "0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "FanLtvMetric",
-        "name": "FanLtvMetric_pkey",
-        "unique": true,
-        "keys": "1 2 3",
-        "options": "0 0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "FanLtvReceipt",
-        "name": "FanLtvReceipt_due178_idx",
-        "unique": false,
-        "keys": "1 4 2",
-        "options": "0 0 0",
-        "expressions": null,
-        "predicate": "(\"nextDueAt\" IS NOT NULL)"
-      },
-      {
-        "table": "FanLtvReceipt",
-        "name": "FanLtvReceipt_pkey",
-        "unique": true,
-        "keys": "1 2",
-        "options": "0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "FanLtvState",
-        "name": "FanLtvState_pkey",
-        "unique": true,
-        "keys": "1",
-        "options": "0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "DomainWorkItem",
-        "name": "DomainWorkItem_notification_refresh_recovery_idx",
-        "unique": false,
-        "keys": "1",
-        "options": "0",
-        "expressions": null,
-        "predicate": "((state = 'RECONCILE_REQUIRED'::text) AND (\"terminalCause\" = 'RETRY_EXHAUSTED:NOTIFICATION_BUMP_PROJECTION_FAILED:FAN_DATA_REFRESH_BACKLOG_FULL'::text) AND (\"workClass\" = ANY (ARRAY['NOTIFICATION_CONSEQUENCES'::text, 'NOTIFICATION_CONSEQUENCES_V2'::text, 'NOTIFICATION_FACT_RECEIPTS'::text])) AND ((\"lastRepair\" ->> 'kind'::text) IS DISTINCT FROM 'notification_refresh_capacity_recovery_v1'::text))"
-      },
-      {
-        "table": "TeamPpvResolveJob",
-        "name": "TeamPpvResolveJob_agency_status_created_id_idx",
-        "unique": false,
-        "keys": "2 11 18 1",
-        "options": "0 0 0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
-        "table": "TeamPpvResolveJob",
-        "name": "TeamPpvResolveJob_creator_status_created_id_idx",
-        "unique": false,
-        "keys": "2 4 11 18 1",
-        "options": "0 0 0 0 0",
-        "expressions": null,
-        "predicate": null
-      },
-      {
         "table": "TelegramDeliveryIntent",
-        "name": "TelegramDeliveryIntent_instruction_part_key",
-        "unique": true,
-        "keys": "37 38",
-        "options": "0 0",
+        "name": "TelegramDeliveryIntent_current_thread_lookup_idx",
+        "unique": false,
+        "keys": "2 4 6 23 7 29 1",
+        "options": "0 0 0 0 0 3 3",
         "expressions": null,
-        "predicate": null
+        "predicate": "((state = 'CONFIRMED'::text) AND (kind = ANY (ARRAY['TASK'::text, 'REVISION_REQUEST'::text, 'INSTRUCTION_CONTINUATION'::text])))"
       },
       {
         "table": "TelegramDeliveryIntent",
@@ -5433,12 +5622,12 @@
       },
       {
         "table": "TelegramDeliveryIntent",
-        "name": "TelegramDeliveryIntent_current_thread_lookup_idx",
-        "unique": false,
-        "keys": "2 4 6 23 7 29 1",
-        "options": "0 0 0 0 0 3 3",
+        "name": "TelegramDeliveryIntent_instruction_part_key",
+        "unique": true,
+        "keys": "37 38",
+        "options": "0 0",
         "expressions": null,
-        "predicate": "((state = 'CONFIRMED'::text) AND (kind = ANY (ARRAY['TASK'::text, 'REVISION_REQUEST'::text, 'INSTRUCTION_CONTINUATION'::text])))"
+        "predicate": null
       }
     ]
   }

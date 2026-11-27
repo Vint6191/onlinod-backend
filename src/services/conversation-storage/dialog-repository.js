@@ -1,6 +1,7 @@
 "use strict";
 const c = require("./common");
 const { pruneDialogHistory } = require("./garbage-collection");
+const { HISTORY_PROJECTION, historyFragment } = require("./ai-context-policy");
 const THREAD_BYTES = 16384,
   MESSAGE_OVERHEAD = 1536,
   RECEIPT_BYTES = 4096,
@@ -119,8 +120,9 @@ function publicRecord(ctx, dialogId, row) {
   };
 }
 class DialogRepository {
-  constructor(db) {
+  constructor(db, admitGrowth = async () => {}) {
     this.db = db;
+    this.admitGrowth = admitGrowth;
   }
   async scope(ctx, db = this.db) {
     let row = await c.one(
@@ -322,6 +324,7 @@ class DialogRepository {
           // after receipt retention or an independent database restore.
           c.commandId(command);
         }
+        await this.admitGrowth();
         let thread = await this.thread(ctx, dialogId, tx);
         const f = input.frontier;
         await pruneDialogHistory(tx, ctx.scopeId, 32);
@@ -776,6 +779,7 @@ class DialogRepository {
     return Number(t?.revision || 0);
   }
   async readPage(ctx, input, options = {}) {
+    if (input.projectionVersion === HISTORY_PROJECTION) return this.readFragmentPage(ctx, input, options);
     return c.transaction(this.db, async (tx) => {
       await this.validateInput(ctx, input, tx);
       if (!input.upper) return { items: [], next: null, done: true, bytes: 2 };
@@ -843,6 +847,54 @@ class DialogRepository {
         done: metadata.length === items.length,
         bytes,
       };
+    });
+  }
+  async readFragmentPage(ctx, input, options = {}) {
+    return c.transaction(this.db, async tx => {
+      await this.validateInput(ctx, input, tx);
+      if (!input.upper) return { items: [], next: null, done: true, bytes: 2 };
+      const maxItems = Math.min(100, c.integer(options.maxItems, 100, 1000));
+      const maxBytes = Math.min(8192, c.integer(options.maxBytes, 8192, 1048576));
+      c.check(maxItems > 0 && maxBytes >= 6144, "HISTORY_PAGE_BUDGET_INVALID", 400);
+      const after = options.after;
+      const continuing = after?.textOffset != null;
+      if (continuing) c.check(after.policy === HISTORY_PROJECTION && Number.isSafeInteger(after.textOffset) && after.textOffset > 0, "HISTORY_CURSOR_INVALID", 400);
+      const metadata = await c.rows(tx, `SELECT message_id,storage_bytes FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=$2
+        AND (created_at,length(message_id),message_id)<=($3::timestamptz,length($4::text),$4)
+        AND ($5::timestamptz IS NULL OR (created_at,length(message_id),message_id)>($5::timestamptz,length($6::text),$6)
+          OR ($7 AND created_at=$5::timestamptz AND message_id=$6))
+        ORDER BY created_at,length(message_id),message_id LIMIT $8`,
+      ctx.scopeId, input.scope.dialogId, input.upper.createdAt, input.upper.messageId, after?.createdAt || null, after?.messageId || "", continuing, maxItems + 1);
+      const keys = [];
+      let estimated = 0;
+      for (const row of metadata.slice(0, maxItems)) {
+        if (keys.length && estimated + Number(row.storage_bytes) > maxBytes + MESSAGE_OVERHEAD) break;
+        keys.push(row.message_id); estimated += Number(row.storage_bytes);
+      }
+      const rows = keys.length ? await c.rows(tx,
+        "SELECT * FROM dialog_archive_message WHERE scope_id=$1 AND dialog_id=$2 AND message_id=ANY($3::text[]) ORDER BY created_at,length(message_id),message_id",
+        ctx.scopeId, input.scope.dialogId, keys) : [];
+      const items = [];
+      let bytes = 2, next = after || null, completed = 0;
+      for (const row of rows) {
+        const m = publicRecord(ctx, input.scope.dialogId, row);
+        let item = { messageId: m.messageId, createdAt: m.createdAt, sender: m.sender, text: m.text, mediaIds: m.mediaIds, price: m.price, opened: m.opened === 1 };
+        const offset = continuing && m.messageId === after.messageId ? after.textOffset : 0;
+        const available = maxBytes - bytes - (items.length ? 1 : 0);
+        if (offset || Buffer.byteLength(JSON.stringify(item)) > available) {
+          if (items.length) break;
+          item = historyFragment(item, offset, available);
+        }
+        items.push(item); bytes += Buffer.byteLength(JSON.stringify(item)) + (items.length > 1 ? 1 : 0);
+        next = { createdAt: item.createdAt, messageId: item.messageId };
+        if (item.textPart && !item.textPart.complete) {
+          next = { ...next, policy: HISTORY_PROJECTION, textOffset: item.textPart.end }; break;
+        }
+        completed++;
+      }
+      c.check(!metadata.length || items.length > 0, "HISTORY_PAGE_NO_PROGRESS", 503);
+      await this.validateInput(ctx, input, tx);
+      return { items, next, done: completed === metadata.length, bytes };
     });
   }
 }

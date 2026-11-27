@@ -6,7 +6,7 @@ const options={maxWait:1500,timeout:5000,deadlineMs:7000,lockTimeoutMs:1000,stat
 // SKIP LOCKED and bounded deletes keep active devices/publications independent.
 async function page(db,kind) {
   return runRootCommit(db,async({tx})=>{
-    await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v8',true)");
+    await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v9',true)");
     let result;
     if(kind==="receipts") result=await tx.$executeRawUnsafe(`WITH old AS (
       SELECT r."sessionId",r.seq FROM "CreatorRealtimeReceipt" r JOIN "CreatorRealtimeSession" s ON s.id=r."sessionId"
@@ -64,7 +64,7 @@ async function page(db,kind) {
       }
     } else if(kind==="legacy") {
       // Legacy tables become unreachable only after the first successful switch.
-      await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v8',true)");
+      await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v9',true)");
       const [p]=await tx.$queryRawUnsafe(`SELECT id,"creatorId" FROM "CreatorEarningsGeneration"
         WHERE "legacyPending" AND "publishedAt" IS NOT NULL ORDER BY "publishedAt",id LIMIT 1 FOR UPDATE SKIP LOCKED`);
       result=0;
@@ -81,7 +81,7 @@ async function page(db,kind) {
       const [g]=await tx.$queryRawUnsafe(`SELECT g.* FROM "CreatorEarningsGeneration" g WHERE g.state='RETIRED'
         AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" p WHERE p."activeGeneration"=g.id)
         AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" b WHERE b."baseGeneration"=g.id AND b.state IN ('BUILDING','READY','REPAIRING'))
-        AND NOT EXISTS(SELECT 1 FROM "SystemSetting" s WHERE s.key='repair:financial-snapshot:v2'
+        AND NOT EXISTS(SELECT 1 FROM "SystemSetting" s WHERE s.key IN ('repair:financial-snapshot:v2','repair:financial-snapshot:v3')
           AND s.value->'current'->>'generationId'=g.id AND s."updatedAt">clock_timestamp()-interval '1 day')
         ORDER BY g."retiredAt",g.id LIMIT 1 FOR UPDATE OF g SKIP LOCKED`);
       result=0;

@@ -28,6 +28,12 @@ async function repairPage({ db, agencyId, creatorId, afterId = "", throughId = n
   const rows = await db.$queryRawUnsafe(`SELECT f.*,
       COALESCE(e."netCents",l."netCents") AS "verifiedNet",COALESCE(e.status,l.status) AS "verifiedStatus",
       COALESCE(e.category,l.category) AS "verifiedCategory",
+      COALESCE(e."financialFact",l."financialFact") AS "verifiedFact",
+      COALESCE(e."fanOnlyFansUserId",l."fanOnlyFansUserId") AS "verifiedFan",
+      CASE WHEN e."observedAt"=active."snapshotAt" THEN (SELECT o.value FROM "FinancialObservedFact" o
+        WHERE o."runId"=active."runId" AND o."windowIndex"=0 AND o."externalId"=e."transactionId") END AS "verifiedReceipt",
+      (SELECT r."jobId" FROM "FinancialReceiptRun" r WHERE r.id=active."runId") AS "verifiedReceiptJobId",
+      (SELECT r.generation FROM "FinancialReceiptRun" r WHERE r.id=active."runId") AS "verifiedReceiptGeneration",
       COALESCE(e."grossCents",l."grossCents") AS "verifiedGross",
       COALESCE(e."occurredAt",l."occurredAt") AS "verifiedOccurredAt",
       COALESCE(e."observedAt",l."observedAt") AS "verifiedObservedAt",
@@ -46,7 +52,7 @@ async function repairPage({ db, agencyId, creatorId, afterId = "", throughId = n
   // Keep its snapshot revision fence; replacing it with an unverified fact at
   // `now` would reject a valid later provider revision between those clocks.
   const values = rows.filter(row=>!(row.verifiedNet==null && row.transactionStatus==="superseded"
-    && row.reasonCode==="VERIFIED_SNAPSHOT_ABSENT" && row.activeFullScan && row.activePublishedAt
+    && row.reasonCode==="VERIFIED_SNAPSHOT_ABSENT" && row.activePublishedAt
     && row.activeProofPolicyVersion===require("./earnings-coverage-service").FINANCIAL_PROOF_POLICY_VERSION
     && row.sourceUpdatedAt && row.sourceUpdatedAt<=row.activeSnapshotAt && row.occurredAt>=row.activeFromAt && row.occurredAt<=row.activeThroughAt))
     .map(row => ({ id: row.id, transactionId: row.externalTransactionId,
@@ -61,12 +67,17 @@ async function repairPage({ db, agencyId, creatorId, afterId = "", throughId = n
   if(unverifiedValues.length){
     await db.$executeRawUnsafe(`UPDATE "CreatorFinancialTransaction" f SET "netCents"=v.net,"amountCents"=v.gross,
       "transactionStatus"=v.status,"occurredAt"=v."occurredAt","sourceUpdatedAt"=v."observedAt","reasonCode"=v.reason,
+      "feeCents"=NULL,"taxCents"=NULL,"vatCents"=NULL,"mediaTaxCents"=NULL,
+      "fanId"=NULL,"fanOnlyFansUserId"=NULL,"fanUsernameAtEvent"=NULL,"fanDisplayNameAtEvent"=NULL,"fanAvatarUrlAtEvent"=NULL,
+      "sourceDeviceId"=NULL,"sourceJobId"=NULL,"scanRunId"=NULL,
       "projectionStatus"=CASE WHEN v.status='unverified' THEN 'STORED_ONLY'::"CreatorFinancialTransactionProjectionStatus" ELSE f."projectionStatus" END,"updatedAt"=$2
     FROM jsonb_to_recordset($1::jsonb) v(${fields}) WHERE f.id=v.id`, input, now);
     sales.push(...await db.$queryRawUnsafe(`UPDATE "CreatorSale" f SET "netCents"=v.net,"amountCents"=v.gross,
+      "feeCents"=NULL,"taxCents"=NULL,"vatCents"=NULL,"mediaTaxCents"=NULL,
       "transactionStatus"=v.status,"purchasedAt"=v."occurredAt","sourceUpdatedAt"=v."observedAt","updatedAt"=$4
     FROM jsonb_to_recordset($1::jsonb) v(${fields}) WHERE f."creatorId"=$2 AND f."agencyId"=$3 AND f."externalTransactionId"=v."transactionId" RETURNING f.id`, input, creatorId, agencyId, now));
     tips.push(...await db.$queryRawUnsafe(`UPDATE "CreatorTip" f SET "netCents"=v.net,"amountCents"=v.gross,
+      "feeCents"=NULL,"taxCents"=NULL,"vatCents"=NULL,"mediaTaxCents"=NULL,
       "transactionStatus"=v.status,"tippedAt"=v."occurredAt","sourceUpdatedAt"=v."observedAt","updatedAt"=$4
     FROM jsonb_to_recordset($1::jsonb) v(${fields}) WHERE f."creatorId"=$2 AND f."agencyId"=$3 AND f."externalTransactionId"=v."transactionId" RETURNING f.id`, input, creatorId, agencyId, now));
   }
@@ -77,20 +88,45 @@ async function repairPage({ db, agencyId, creatorId, afterId = "", throughId = n
   const category=require("./financial-transaction-category");
   const categoryTypes={messages:"message",posts:"post",streams:"stream",tips:"tip",subscriptions:"subscription",other:"other"};
   const existing=new Map(rows.map(row=>[row.externalTransactionId,{...row,fanRecordId:row.fanId}]));
+  let revisionUnavailable=false;
   const verified=rows.filter(row=>row.verifiedNet!=null).map((row,index)=>{
-    const transactionType=category.categoryForTransactionType(row.transactionType)===row.verifiedCategory
-      ?row.transactionType:categoryTypes[row.verifiedCategory];
+    let source=row.verifiedFact?.version===1?row.verifiedFact.value:null;
+    const receipt=row.verifiedReceipt;
+    if (!source && receipt && Number(receipt.netCents)===Number(row.verifiedNet)
+      && receipt.transactionStatus===row.verifiedStatus && +new Date(receipt.occurredAt)===+row.verifiedOccurredAt
+      && category.earningsCategory(receipt)===row.verifiedCategory
+      && (receipt.amountCents==null?null:Number(receipt.amountCents))===(row.verifiedGross==null?null:Number(row.verifiedGross))) source={...receipt,
+        sourceJobId:row.verifiedReceiptJobId,scanRunId:row.verifiedReceiptGeneration,collectedAt:row.verifiedObservedAt};
+    if(!source) revisionUnavailable=true;
+    const transactionType=source?.transactionType||categoryTypes[row.verifiedCategory];
     if(!transactionType)throw new Error("LEGACY_FINANCIAL_CATEGORY_INVALID");
-    const normalized=require("./financial-transactions-service").normalizeTransaction({...row,transactionType,
+    const normalized=require("./financial-transactions-service").normalizeTransaction({...(source||{}),
+      externalTransactionId:row.externalTransactionId,transactionType,
       amountCents:row.verifiedGross==null?null:Number(row.verifiedGross),netCents:Number(row.verifiedNet),
       transactionStatus:row.verifiedStatus,occurredAt:row.verifiedOccurredAt,currency:"USD",
-      fanUsername:row.fanUsernameAtEvent,fanDisplayName:row.fanDisplayNameAtEvent,fanAvatarUrl:row.fanAvatarUrlAtEvent},index,row.page||1);
+      fanOnlyFansUserId:source?.fanOnlyFansUserId??row.verifiedFan,
+      fanUsername:source?.fanUsername??source?.fanUsernameAtEvent??null,
+      fanDisplayName:source?.fanDisplayName??source?.fanDisplayNameAtEvent??null,
+      fanAvatarUrl:source?.fanAvatarUrl??source?.fanAvatarUrlAtEvent??null},index,source?.page||1);
     if(normalized.rejected)throw new Error("LEGACY_FINANCIAL_VERIFIED_FACT_INVALID");
-    return {...normalized,sourceUpdatedAt:row.verifiedObservedAt};
+    return {...normalized,sourceUpdatedAt:row.verifiedObservedAt,
+      sourceDeviceId:source?.sourceDeviceId||null,sourceJobId:source?.sourceJobId||null,scanRunId:source?.scanRunId||null,
+      collectedAt:source?.collectedAt?new Date(source.collectedAt):row.verifiedObservedAt,
+      ...(!source?{reasonCode:"FINANCIAL_REVISION_REVERIFY_REQUIRED"}:{})};
   });
+  if(revisionUnavailable) await require("./financial-recovery-intent-service").requestFull({db,agencyId,creatorId,now,
+    reason:"FINANCIAL_REVISION_REVERIFY_REQUIRED",identity:repairingGenerationId||"legacy-financial-revision-v3"});
   if(verified.length){
+    // Retention may have removed a source job/device. Its original identity
+    // remains in financialFact; nullable relational links must reference a
+    // still-retained row, never an unrelated newer publication.
+    const jobIds=[...new Set(verified.map(row=>row.sourceJobId).filter(Boolean))];
+    const deviceIds=[...new Set(verified.map(row=>row.sourceDeviceId).filter(Boolean))];
+    const keptJobs=new Set((jobIds.length?await db.jobInstance.findMany({where:{id:{in:jobIds}},select:{id:true}}):[]).map(row=>row.id));
+    const keptDevices=new Set((deviceIds.length?await db.workerDevice.findMany({where:{id:{in:deviceIds}},select:{id:true}}):[]).map(row=>row.id));
+    for(const row of verified){if(!keptJobs.has(row.sourceJobId))row.sourceJobId=null;if(!keptDevices.has(row.sourceDeviceId))row.sourceDeviceId=null;}
     const restored=await require("./financial-canonical-publication-repository").publish({db,job:{agencyId,creatorId},rows:verified,
-      existing,participants:{fans:new Map()},deviceId:null,observedAt:now,now,catchup:true,restoringVerifiedLedger:true});
+      existing,participants:await require("./financial-transactions-service").resolveFans(db,{agencyId,creatorId},verified,now),deviceId:null,observedAt:now,now,catchup:true,restoringVerifiedLedger:true});
     sales.push(...restored.SALE.map(id=>({id})));tips.push(...restored.TIP.map(id=>({id})));
   }
   const unverified = unverifiedValues.map(row => ({

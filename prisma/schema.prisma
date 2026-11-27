@@ -1173,6 +1173,7 @@ model DeviceCryptoIdentity {
   @@unique([agencyId, fingerprint])
   @@index([agencyId, userId])
   @@index([agencyId, status])
+  @@index([deviceId, userId])
 }
 
 model AgencyCryptoRoot {
@@ -1655,6 +1656,7 @@ model CreatorBillingEntitlement {
   agency  Agency         @relation(fields: [agencyId], references: [id], onDelete: Cascade)
   creator CreatorAccount @relation(fields: [creatorId], references: [id], onDelete: Cascade)
 
+  @@index([autoRenewEnabled, nextRenewalAt, creatorId], map: "CreatorBillingEntitlement_autoRenewEnabled_nextRenewalAt_creato")
   @@index([agencyId, coreValidUntil])
   @@index([coreValidUntil])
   @@index([aiChatterValidUntil])
@@ -2934,6 +2936,8 @@ model CreatorSale {
   teamPpvPurchase TeamPpvPurchaseLedger?
 
   @@unique([creatorId, eventFingerprint])
+  @@index([agencyId, externalNotificationId])
+  @@index([agencyId, externalTransactionId])
   @@unique([creatorId, externalNotificationId])
   @@unique([creatorId, externalTransactionId])
   @@index([agencyId, creatorId, purchasedAt])
@@ -4243,6 +4247,7 @@ model CreatorMediaMessageFinancialState {
 }
 
 model CreatorMediaFinancialAdoptionState {
+  semanticsVersion Int @default(1)
   creatorId String @id
   agencyId String
   phase String @default("SALES")
@@ -6622,6 +6627,7 @@ model CreatorEarningsLedgerProof {
  creator CreatorAccount @relation(fields:[agencyId,creatorId],references:[agencyId,id],onDelete:Cascade)
 }
 model CreatorEarningsLedgerEntry {
+  financialFact Json?
  fanOnlyFansUserId String?
 
  agencyId String
@@ -6696,6 +6702,7 @@ model CreatorEarningsGeneration {
  @@index([creatorId,state],map:"EarningsGeneration_creator")
 }
 model CreatorEarningsGenerationEntry {
+  financialFact Json?
  fanOnlyFansUserId String?
 
  generation String
@@ -6818,4 +6825,24 @@ model FanLtvDistribution {
  count BigInt
  owner FanLtvState @relation(fields:[creatorId],references:[creatorId],onDelete:Cascade)
  @@id([creatorId,prefix])
+}
+
+model MessageLibraryScopeRevision {
+  agencyId  String
+  creatorId String
+  revision  BigInt @default(0)
+
+  @@id([agencyId, creatorId])
+}
+
+model TeamPpvPurchaseAlias {
+  agencyId String
+  creatorId String
+  namespace String
+  externalId String
+  rootId String
+  createdAt DateTime @default(now())
+
+  @@id([agencyId, creatorId, namespace, externalId])
+  @@index([rootId])
 }

@@ -60,14 +60,15 @@ async function publish({db,job,rows,existing,participants,deviceId,observedAt,no
   if(rows.length>500)throw Error("FINANCIAL_PUBLICATION_PAGE_TOO_LARGE");
   const financial=rows.map(row=>{
     const previous=existing.get(row.externalTransactionId),fan=participants.fans.get(`${job.creatorId}\u0000${row.fanOnlyFansUserId}`);
-    return retainKnownFan(previous,{...previous,id:previous?.id||crypto.randomUUID(),createdAt:previous?.createdAt||now,
+    return retainKnownFan(restoringVerifiedLedger?null:previous,{...previous,id:previous?.id||crypto.randomUUID(),createdAt:previous?.createdAt||now,
       agencyId:job.agencyId,creatorId:job.creatorId,fanRecordId:fan?.id||null,fanOnlyFansUserId:row.fanOnlyFansUserId,
       fanUsernameAtEvent:row.fanUsername,fanDisplayNameAtEvent:row.fanDisplayName,fanAvatarUrlAtEvent:row.fanAvatarUrl,
       externalTransactionId:row.externalTransactionId,transactionType:row.transactionType,factType:row.factType,projectionStatus:row.projectionStatus,
       amountCents:row.amountCents,feeCents:row.feeCents,netCents:row.netCents,taxCents:row.taxCents,vatCents:row.vatCents,mediaTaxCents:row.mediaTaxCents,
       currency:row.currency,occurredAt:row.occurredAt,transactionStatus:row.transactionStatus,sourceUpdatedAt:row.sourceUpdatedAt||observedAt,collectedAt:now,
-      sourceDeviceId:deviceId,reasonCode:row.reasonCode,updatedAt:now,
-      ...(!previous||!catchup?{sourceJobId:job.id,scanRunId,page:row.page,ordinal:row.ordinal}:{})});
+      sourceDeviceId:restoringVerifiedLedger?row.sourceDeviceId:deviceId,reasonCode:row.reasonCode,updatedAt:now,
+      ...(!previous||!catchup?{sourceJobId:job.id,scanRunId,page:row.page,ordinal:row.ordinal}:{}),
+      ...(restoringVerifiedLedger?{sourceJobId:row.sourceJobId,scanRunId:row.scanRunId,page:row.page,ordinal:row.ordinal,collectedAt:row.collectedAt}:{})});
   });
   await upsert(db,"CreatorFinancialTransaction",financial,FINANCIAL);
   const ids=await supersede({db,job,rows,observedAt,now,restoringVerifiedLedger}), financialById=new Map(financial.map(row=>[row.externalTransactionId,row]));
@@ -84,14 +85,14 @@ async function publish({db,job,rows,existing,participants,deviceId,observedAt,no
       const revision=row.sourceUpdatedAt||observedAt;
       if(!restoringVerifiedLedger && previous?.sourceUpdatedAt && +previous.sourceUpdatedAt>+revision)continue;
       if(previous)used.add(previous.id);
-      records.push(retainKnownFan(previous,{...previous,id:previous?.id||crypto.randomUUID(),createdAt:previous?.createdAt||now,
+      records.push(retainKnownFan(restoringVerifiedLedger?null:previous,{...previous,id:previous?.id||crypto.randomUUID(),createdAt:previous?.createdAt||now,
         eventFingerprint:previous?.eventFingerprint||crypto.createHash("sha256").update(`payout-transaction|${job.creatorId}|${row.externalTransactionId}`).digest("hex"),
         agencyId:job.agencyId,creatorId:job.creatorId,fanRecordId:row.fanRecordId,fanOnlyFansUserIdAtEvent:row.fanOnlyFansUserId,
         fanUsernameAtEvent:row.fanUsername,fanDisplayNameAtEvent:row.fanDisplayName,fanAvatarUrlAtEvent:row.fanAvatarUrl,
         externalTransactionId:row.externalTransactionId,amountCents:row.amountCents,feeCents:row.feeCents,netCents:row.netCents,taxCents:row.taxCents,
         vatCents:row.vatCents,mediaTaxCents:row.mediaTaxCents,transactionStatus:row.transactionStatus,currency:row.currency,
-        source:"ONLYFANS_API",sourceUpdatedAt:revision,collectedAt:now,sourceDeviceId:deviceId,
-        sourceJobId:job.id??financialById.get(row.externalTransactionId)?.sourceJobId??previous?.sourceJobId??null,updatedAt:now,
+        source:"ONLYFANS_API",sourceUpdatedAt:revision,collectedAt:restoringVerifiedLedger?row.collectedAt:now,sourceDeviceId:restoringVerifiedLedger?row.sourceDeviceId:deviceId,
+        sourceJobId:restoringVerifiedLedger?row.sourceJobId:job.id??financialById.get(row.externalTransactionId)?.sourceJobId??previous?.sourceJobId??null,updatedAt:now,
         [time]:row.occurredAt,...(kind==="SALE"?{saleType:row.saleType||"OTHER"}:{})}));
     }
     await upsert(db,table,records,[...COMMON,time,...(kind==="SALE"?["saleType"]:[])],["eventFingerprint"]);

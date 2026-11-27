@@ -9,6 +9,7 @@ const { assertManagementCommitAuthority, lockAgencyLifecycle } = require("./mana
 const { dbAuthorityNow } = require("./db-time-authority-service");
 const { audit } = require("./audit-service");
 const { fail, sessionRevision, selectSessions, readActiveSessions } = require("./account-security-state");
+const { assertNewPassword } = require("./account-password-policy");
 const ACTIONS = ["account.password", "account.logoutDevice", "account.logoutOthers", "account.revokeSession", "account.revokeOthers"];
 const identity = z.string().min(1).max(220);
 const origin = { originAuthorizationSessionId: identity, deviceId: z.string().min(1).max(160) };
@@ -32,9 +33,14 @@ async function preparePassword(db, userId, c, receiptId) {
   // again under locks before any preparation error is surfaced.
   const prior = await db.$queryRawUnsafe('SELECT "id" FROM "ManagementCommandReceipt" WHERE "id"=$1', receiptId);
   if (prior.length) return null;
+  // Old receipts remain replayable with their original envelope. Apply the new
+  // credential policy only when preparing a previously uncommitted intent.
+  try { assertNewPassword(c.payload.newPassword); } catch (error) { return { error }; }
   const user = await db.user.findUnique({ where: { id: userId } });
   if (!user || user.disabledAt || !(await bcrypt.compare(c.payload.currentPassword, user.passwordHash)))
     return { error: fail("SETTINGS_CURRENT_PASSWORD_INVALID", "Current password is incorrect", 400) };
+  if (await bcrypt.compare(c.payload.newPassword, user.passwordHash))
+    return { error: fail("PASSWORD_UNCHANGED", "Choose a password different from your current password", 400) };
   return { before: user.passwordHash, next: await bcrypt.hash(c.payload.newPassword, 12) };
 }
 async function executeAccountSecurityCommand({ db, agencyId, userId, actorMember, deviceId, authorizationSessionId, input, cancel = false }) {

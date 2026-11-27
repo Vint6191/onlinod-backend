@@ -4,6 +4,7 @@ const { normalizeUsageInput, recordMessageLibraryUsage } = require("../services/
 const express = require("express");
 const { executeMessageLibraryCommand } = require("../services/message-library-command-service");
 const prisma = require("../prisma");
+const { assertMessageLibraryAggregate, aggregateState, activeBlock, MAX_BLOCKS, MAX_BYTES, MAX_MEDIA } = require("../services/message-library-limits-service");
 const { canUsePermission } = require("../services/team-access-control");
 const { requireProductCreator } = require("../middleware/product-access");
 const { preflightProgrammaticCustomMedia } = require("../services/custom-content-delivery-service");
@@ -218,7 +219,22 @@ function messageFromBlock(block = {}, index = 0) {
 function scriptFromCollection(collection = {}, { includeTrashedBlocks = false } = {}) {
   const metadata = jsonObject(collection.metadata);
   const collectionInTrash = !!collection.deletedAt || collection.status === "trash" || collection.status === "deleted";
-  const messages = (Array.isArray(collection.blocks) ? collection.blocks : [])
+  const sourceBlocks = Array.isArray(collection.blocks) ? collection.blocks : [];
+  const aggregate = aggregateState(collection, sourceBlocks.filter(activeBlock));
+  const activeMessages = collection.activeMessageCount ?? aggregate.activeMessages;
+  const needsRepair = activeMessages > MAX_BLOCKS || aggregate.bytes > MAX_BYTES || aggregate.distinctMedia > MAX_MEDIA;
+  let visibleBlocks = sourceBlocks;
+  if (needsRepair) {
+    // Old bad aggregates remain readable and reducible using block.trash.
+    // A bounded partial view can never be mistaken for a complete save payload.
+    visibleBlocks = []; let bytes = 0;
+    for (const block of [...sourceBlocks.filter(activeBlock),...sourceBlocks.filter(block => !activeBlock(block))]) {
+      const size = Buffer.byteLength(JSON.stringify(block));
+      if (visibleBlocks.length >= 501 || bytes + size > 4 * 1024 * 1024) break;
+      visibleBlocks.push(block); bytes += size;
+    }
+  }
+  const messages = visibleBlocks
     .filter((block) => includeTrashedBlocks || collectionInTrash || !(block.deletedAt || block.status === "trash" || block.status === "deleted"))
     .map(messageFromBlock)
     .sort((a, b) => Number(a.order || 0) - Number(b.order || 0))
@@ -226,6 +242,8 @@ function scriptFromCollection(collection = {}, { includeTrashedBlocks = false } 
 
   return {
     schemaVersion: 1,
+    ...(needsRepair ? {repairRequired:{activeMessages,displayedMessages:visibleBlocks.filter(activeBlock).length,
+      truncated:visibleBlocks.filter(activeBlock).length < activeMessages,reason:"MESSAGE_LIBRARY_SCRIPT_LIMIT"}} : {}),
     id: String(collection.clientId || collection.id || ""),
     serverId: collection.id || null,
     accountId: collection.creatorId || metadata.accountId || "",
@@ -313,9 +331,8 @@ async function normalizeMlScriptPayload(req, { patch = false, db = prisma } = {}
   }
 
   const blocks = Array.isArray(body.messages) ? body.messages : Array.isArray(body.blocks) ? body.blocks : [];
-  if (blocks.length > 500) throw Object.assign(new Error("One script supports at most 500 messages"), {code:"MESSAGE_LIBRARY_SCRIPT_LIMIT",status:413});
   const normalizedBlocks = blocks.map(normalizeMlMessage);
-  if (Buffer.byteLength(JSON.stringify({data,blocks:normalizedBlocks})) > 2 * 1024 * 1024) throw Object.assign(new Error("One script supports at most 2 MiB of normalized content"), {code:"MESSAGE_LIBRARY_SCRIPT_LIMIT",status:413});
+  assertMessageLibraryAggregate(data,normalizedBlocks);
   assertUniqueMlBlockClientIds(normalizedBlocks);
   return { scriptId, data, blocks: normalizedBlocks };
 }
@@ -361,6 +378,21 @@ async function upsertMessageLibraryScript(req, db = prisma) {
     if (normalized.data.deletedAt) throw Object.assign(new Error("Use the trash action"), { code: "MESSAGE_LIBRARY_TYPED_TRASH_REQUIRED", status: 409 });
     if (existing && !context.expectedUpdatedAt) throw Object.assign(new Error("Reload the server script before saving"), {code:"MESSAGE_LIBRARY_REVISION_REQUIRED",status:428});
     if (req.body?.serverId && req.body.serverId !== existing?.id) throw Object.assign(new Error("Server script identity changed; reload before saving"), {code:"MESSAGE_LIBRARY_REVISION_CONFLICT",status:409});
+    if (existing) {
+      const activeWhere = {collectionId:existing.id,deletedAt:null,status:{notIn:["trash","deleted"]}};
+      const activeCount = await tx.contentBlock.count({where:activeWhere});
+      let invalid = activeCount > 501;
+      if (!invalid) {
+        const beforeBlocks = await tx.contentBlock.findMany({where:activeWhere,orderBy:[{order:"asc"},{id:"asc"}],take:501});
+        try { assertMessageLibraryAggregate(existing,beforeBlocks); }
+        catch (error) { if (error.code !== "MESSAGE_LIBRARY_SCRIPT_LIMIT") throw error; invalid = true; }
+      }
+      const repair = req.body?.repairRequired;
+      if (invalid && (activeCount > 501 || !repair || repair.truncated !== false
+        || repair.activeMessages !== activeCount || repair.displayedMessages !== activeCount))
+        throw Object.assign(new Error("Reload the complete repair view or delete individual messages before saving this over-limit script"),
+          {code:"MESSAGE_LIBRARY_REPAIR_REQUIRED",status:409});
+    }
     for(let offset=0;offset<mediaIds.length;offset+=200){
       const proof=await preflightProgrammaticCustomMedia({agencyId:req.auth.agencyId,member:req.auth.membership||req.member,creatorId:normalized.data.creatorId,mediaIds:mediaIds.slice(offset,offset+200),db:tx});
       if(!proof?.ok || !Array.isArray(proof.customMediaIds) || proof.customMediaIds.length) throw Object.assign(new Error("Reusable media provenance changed; reload"), {code:"MESSAGE_LIBRARY_MEDIA_PROVENANCE_CHANGED",status:409});
@@ -424,16 +456,26 @@ router.get("/message-library/scripts", async (req, res) => {
 
     const take = parseLimit(req.query.limit, 500, 1000);
     const skip = parseOffset(req.query.offset);
-    const [items, count] = await Promise.all([
-      prisma.contentCollection.findMany({
+    const expectedRevision = req.query.snapshotRevision;
+    if (expectedRevision !== undefined && (typeof expectedRevision !== "string" || !/^(0|[1-9][0-9]{0,18})$/.test(expectedRevision)))
+      throw Object.assign(new Error("Invalid Message Library snapshot revision"), {code:"MESSAGE_LIBRARY_SNAPSHOT_INVALID",status:400});
+    if (skip > 0 && expectedRevision === undefined)
+      throw Object.assign(new Error("Reload the library from its first page"), {code:"MESSAGE_LIBRARY_SNAPSHOT_REQUIRED",status:428});
+    const { items, count, snapshotRevision } = await prisma.$transaction(async tx => {
+      const heads = await tx.$queryRawUnsafe('SELECT "revision"::text AS revision FROM "MessageLibraryScopeRevision" WHERE "agencyId"=$1 AND "creatorId"=$2', req.auth.agencyId, creatorId);
+      const revision = heads[0]?.revision || "0";
+      if (expectedRevision !== undefined && expectedRevision !== revision)
+        throw Object.assign(new Error("Message Library changed while reading its pages"), {code:"MESSAGE_LIBRARY_LIST_CHANGED",status:409});
+      const items = await tx.contentCollection.findMany({
         where,
         include: { blocks: { orderBy: [{ order: "asc" }, { createdAt: "asc" }, { id: "asc" }] } },
         orderBy: [{ updatedAt: "desc" }, { id: "desc" }],
         take,
         skip,
-      }),
-      prisma.contentCollection.count({ where }),
-    ]);
+      });
+      const count = await tx.contentCollection.count({ where });
+      return {items, count, snapshotRevision:revision};
+    }, {isolationLevel:"RepeatableRead",maxWait:5000,timeout:15000});
 
     return res.json({
       ok: true,
@@ -442,6 +484,7 @@ router.get("/message-library/scripts", async (req, res) => {
       accountId: creatorId || null,
       items: items.map(item => scriptFromCollection(item, { includeTrashedBlocks: includeTrash })),
       count,
+      snapshotRevision,
       nextOffset: skip + items.length,
       hasMore: skip + items.length < count,
     });
@@ -469,7 +512,7 @@ router.get("/message-library/scripts/:id", async (req, res) => {
       } },
     });
     if (!item) return res.status(404).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_NOT_FOUND", error: "Script not found" });
-    if (item.blocks.length > 500) return res.status(413).json({ ok: false, code: "MESSAGE_LIBRARY_SCRIPT_LIMIT", error: "Script has more than 500 active messages" });
+    if (item.blocks.length > 500) item.activeMessageCount = await prisma.contentBlock.count({where:{collectionId:item.id,deletedAt:null,status:{notIn:["trash","deleted"]}}});
     return res.json({ ok: true, source: "server", creatorId, item: scriptFromCollection(item) });
   } catch (err) {
     return sendError(res, err, "MESSAGE_LIBRARY_SCRIPT_FAILED");

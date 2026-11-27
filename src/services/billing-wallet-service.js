@@ -735,8 +735,8 @@ async function renewCreatorSubscription({ entitlement, db = null, now = new Date
     if (err?.code === "BILLING_WALLET_INSUFFICIENT_BALANCE" || err?.code === "BILLING_EARNINGS_30D_UNAVAILABLE") {
       await client.creatorBillingEntitlement.updateMany({
         where: { creatorId, agencyId, autoRenewEnabled: true, coreValidUntil: { lte: now } },
-        data: { lastRenewalAttemptAt: now, lastRenewalErrorCode: err.code, nextRenewalAt: now },
-      }).catch(() => undefined);
+        data: { lastRenewalAttemptAt: now, lastRenewalErrorCode: err.code, nextRenewalAt: new Date(now.getTime() + 5 * 60 * 1000) },
+      });
       return { renewed: false, reason: err.code, balanceCents: err.balanceCents ?? null, requiredCents: err.requiredCents ?? null };
     }
     if (err?.code === "BILLING_FREE_INTERNAL_LIVE_DEBIT_DISABLED" || err?.code === "BILLING_LIVE_AUTO_PRICING_DISABLED") {
@@ -765,22 +765,44 @@ async function renewDueCreatorSubscriptions({ now = new Date(), db = null, limit
       autoRenewEnabled: true,
       coreValidUntil: { lte: now },
       creator: { deletedAt: null },
+      AND: [
+        { OR: [{ nextRenewalAt: null }, { nextRenewalAt: { lte: now } }] },
+        { OR: [{ walletTestMode: null }, { walletTestMode: String(process.env.NOWPAYMENTS_MODE || "").toLowerCase() === "sandbox" }] },
+      ],
     },
-    orderBy: [{ coreValidUntil: "asc" }, { creatorId: "asc" }],
+    // Eligibility is an attempt clock, independent of the paid-through date.
+    // Every failed prefix moves behind untouched due work on its next sweep.
+    orderBy: [{ nextRenewalAt: { sort: "asc", nulls: "first" } }, { coreValidUntil: "asc" }, { creatorId: "asc" }],
     take: Math.max(1, Math.min(10_000, Number(limit || 1000))),
   });
   let renewed = 0;
   let insufficientBalance = 0;
   let earningsUnavailable = 0;
   let skipped = 0;
+  let failed = 0;
   for (const entitlement of due) {
-    const result = await renewCreatorSubscription({ entitlement, db: client, now });
+    let result;
+    try {
+      result = await renewCreatorSubscription({ entitlement, db: client, now });
+    } catch (error) {
+      // A per-creator failure cannot monopolize the bounded sweep. The due
+      // predicate also protects a renewal whose commit succeeded but whose
+      // acknowledgement was lost: its new paid-through date wins.
+      await client.creatorBillingEntitlement.updateMany({
+        where: { creatorId: entitlement.creatorId, agencyId: entitlement.agencyId,
+          autoRenewEnabled: true, coreValidUntil: { lte: now } },
+        data: { lastRenewalAttemptAt: now, nextRenewalAt: new Date(now.getTime() + 5 * 60 * 1000),
+          lastRenewalErrorCode: String(error?.code || "BILLING_RENEWAL_RETRY_REQUIRED").slice(0, 100) },
+      });
+      failed += 1;
+      continue;
+    }
     if (result.renewed) renewed += 1;
     else if (result.reason === "BILLING_WALLET_INSUFFICIENT_BALANCE") insufficientBalance += 1;
     else if (result.reason === "BILLING_EARNINGS_30D_UNAVAILABLE") earningsUnavailable += 1;
     else skipped += 1;
   }
-  return { scanned: due.length, renewed, insufficientBalance, earningsUnavailable, skipped };
+  return { scanned: due.length, renewed, insufficientBalance, earningsUnavailable, skipped, failed };
 }
 
 async function getWalletState({ agencyId, testMode = false, db = null, limit = 30 }) {

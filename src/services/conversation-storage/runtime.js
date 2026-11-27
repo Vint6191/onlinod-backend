@@ -54,14 +54,14 @@ class ConversationRuntime {
   constructor(db, core) {
     this.db = db;
     this.core = core;
-    this.dialogs = new DialogRepository(db.dialogs);
+    this.dialogs = new DialogRepository(db.dialogs, () => this.capacity("dialogs"));
     this.models = new DialogReadModels(this.dialogs);
     this.crm = new CrmRepository(db.crm, this.dialogs, {
       read: (ctx, onlyFansUserIds) => readFanCurrent(core, { agencyId: ctx.agencyId, creatorId: ctx.creatorId, onlyFansUserIds }),
       revision: async ctx => (await c.one(core,
         'SELECT "lastRevision" FROM "CreatorEntityChangeHead" WHERE "agencyId"=$1 AND "creatorId"=$2',
         ctx.agencyId, ctx.creatorId))?.lastRevision || 0n,
-    });
+    }, () => this.capacity("crm"));
     this.crm.models = this.models;
     this.relay = new HistoryRelay(this.dialogs, this.crm);
     this.analysis = new CrmAnalysisService(this.crm, this.dialogs, this.relay);
@@ -205,16 +205,7 @@ class ConversationRuntime {
     await this.check(domain);
     if (
       [
-        "commitScanPage",
-        "upsertMessages",
-        "apply",
-        "updateProfile",
-        "save",
-        "request",
-        "claim",
-        "beginReplies",
         "ensureAutomatic",
-        "checkpoint",
       ].includes(method)
     )
       await this.capacity(domain);

@@ -189,9 +189,9 @@ async function restoreContinuation(db, job) {
   const row = await db.financialReceiptRun.findUnique({ where: { id: runId(job) } });
   return envelope(job, row?.cursor || initialCursor(job));
 }
-function emptyTotals() { return { count: 0, storedOnly: 0, grossKnown: 0, grossCents: 0, netCents: 0, feeCents: 0, statusGroups: {}, typeGroups: {} }; }
+function emptyTotals() { return { count: 0, storedOnly: 0, grossKnown: 0, grossCents: 0, netCents: 0, feeCents: 0, statusGroups: {}, typeGroups: {}, categoryTotals: {} }; }
 function sum(a, b) { const n = (a || 0) + (b || 0); if (!Number.isSafeInteger(n)) throw fault("FINANCIAL_RECEIPT_AMOUNT_OVERFLOW"); return n; }
-function addFact(totals, value, sign) {
+function addFact(totals, value, sign, partition = true) {
   totals.grossKnown ??= totals.count;
   totals.count += sign;
   if (value.amountCents !== null && value.amountCents !== undefined) totals.grossKnown += sign;
@@ -215,6 +215,23 @@ function addFact(totals, value, sign) {
   if (value.amountCents != null) typed.grossKnown += sign;
   typed.count += sign; typed.grossCents = sum(typed.grossCents, sign * (value.amountCents || 0)); typed.netCents = sum(typed.netCents, sign * (value.netCents || 0));
   if (typed.count) totals.typeGroups[identity] = typed; else delete totals.typeGroups[identity];
+  if (partition) {
+    const category = require("./financial-transaction-category").earningsCategory(value);
+    totals.categoryTotals ||= {};
+    totals.categoryTotals[category] ||= emptyTotals();
+    addFact(totals.categoryTotals[category], value, sign, false);
+  }
+}
+const CHART_CATEGORY = { subscribes: "subscriptions", tips: "tips", messages: "messages", post: "posts", stream: "streams" };
+function chartsMatch(totals, categories) {
+  const observed = comparableTotals(totals);
+  if (categories.some(category=>category!=="total") && !observed.categoryTotals) return false;
+  return categories.every(category => {
+    const actual = earningsTotals(category === "total" ? observed : observed.categoryTotals[CHART_CATEGORY[category]] || emptyTotals());
+    const chart = totals.charts?.[category];
+    return chart && actual.transactionsCount === chart.transactionsCount && actual.netCents === chart.netCents
+      && (actual.grossCents === null || chart.grossCents === null || actual.grossCents === chart.grossCents);
+  });
 }
 async function lockedRun(db, job) {
   await enter(db);
@@ -370,8 +387,9 @@ async function commitChart(db, job, chunk) {
   const proof = row.proof, totals = proof.windows[index]; totals.charts[chunk.category] = summary;
   const cursor = { ...state, chartIndex: state.chartIndex + 1 };
   if (cursor.chartIndex === categories.length) {
-    const chart = totals.charts.total, observed = earningsTotals(comparableTotals(totals));
-    totals.matched = observed.transactionsCount === chart.transactionsCount && (observed.grossCents === null || chart.grossCents === null || observed.grossCents === chart.grossCents) && observed.netCents === chart.netCents;
+    totals.matched = chartsMatch(totals, categories);
+    totals.categoryMismatches = categories.filter(category=>category!=="total" && !chartsMatch(totals,[category]));
+    proof.semanticsVersion = 3;
     cursor.windowIndex++;
     if (cursor.windowIndex < row.windows.length) Object.assign(cursor, { phase: "transactions", marker: row.windows[cursor.windowIndex].initialMarker, page: 0, chartIndex: 0 });
     else {
@@ -438,5 +456,5 @@ function evaluateCollection(state, now, freshnessMs) {
   return Object.freeze({ ...base, fresh: false, stale: base.proven, deferred, due: !deferred && !base.failed });
 }
 module.exports = { FinancialReceiptError, invalidClaim, COLLECTOR, FULL_CHARTS, RECENT_DAYS, AUDIT_DAYS, HISTORY_FRESH_MS, FLOOR, enabled, enter, date, hash, runId,
-  planWindows, windowsFor, claimParams, initialCursor, envelope, resultFor, expectedMatches, restoreContinuation, currentTraversal, historyRead, comparisonRange, comparableTotals, earningsTotals,
+  planWindows, windowsFor, claimParams, initialCursor, envelope, resultFor, expectedMatches, restoreContinuation, currentTraversal, historyRead, comparisonRange, comparableTotals, earningsTotals, chartsMatch,
   beforePage, withinWindow, commitPage, commitChart, completionProof, coverageUpdate, coverageView, evaluateCollection };

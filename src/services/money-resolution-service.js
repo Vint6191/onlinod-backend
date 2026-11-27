@@ -22,14 +22,24 @@ async function enqueue({ db, agencyId, creatorId, now }) {
 
 async function adoptPage(db) {
   return runRootCommit(db,async({tx})=>{
-    const [state]=await tx.$queryRawUnsafe(`SELECT * FROM "MoneyResolutionAdoption" WHERE id='v7' AND NOT complete FOR UPDATE SKIP LOCKED`);
+    const [state]=await tx.$queryRawUnsafe(`SELECT * FROM "MoneyResolutionAdoption" WHERE id='v8' AND NOT complete FOR UPDATE SKIP LOCKED`);
     if(!state)return 0;
-    const rows=await tx.$queryRawUnsafe(`SELECT m.id,m."agencyId",m."creatorId",EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" g WHERE g.id=m."coveredGeneration" AND g."publishedAt" IS NOT NULL) AS covered FROM "CreatorMoneyObservation" m
-      WHERE m.id>$1 AND m.status='PENDING' AND m."resolutionBlockedAt" IS NULL ORDER BY m.id LIMIT 100`,state.cursor);
+    const rows=await tx.$queryRawUnsafe(`SELECT m.id,m."agencyId",m."creatorId",m."transactionId",m."capturedAt",m.reason,m."resolutionError",EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" g WHERE g.id=m."coveredGeneration" AND g."publishedAt" IS NOT NULL) AS covered FROM "CreatorMoneyObservation" m
+      WHERE m.id>$1 AND m.status='PENDING' AND (m."resolutionBlockedAt" IS NULL OR m.reason='SOURCE_TIME_INVALID'
+        OR m."resolutionError" LIKE '%MONEY_RESOLUTION_LEDGER_DIVERGED%') ORDER BY m.id LIMIT 100`,state.cursor);
     const now=await dbAuthorityNow({db:tx});
+    for(const row of rows.filter(x=>!x.covered)) {
+      const life=await lockAgencyLifecycleBarrier({db:tx,agencyId:row.agencyId});
+      if(!life.row || life.row.deletedAt)continue;
+      await require("./earnings-generation-service").lock(tx,row.creatorId);
+      if(row.reason==="SOURCE_TIME_INVALID" && row.transactionId)
+        await require("./financial-revision-repository").resolveInvalidTime({db:tx,...row,transactionId:row.transactionId,capturedAt:now,now});
+      if(String(row.resolutionError||"").includes("MONEY_RESOLUTION_LEDGER_DIVERGED"))
+        await require("./financial-recovery-intent-service").requestFull({db:tx,...row,now,reason:"MONEY_RESOLUTION_LEDGER_DIVERGED",identity:row.id});
+    }
     const creators=[...new Map(rows.filter(x=>!x.covered).map(x=>[x.creatorId,x])).values()].sort((a,b)=>a.creatorId.localeCompare(b.creatorId));
     for(const row of creators) { const life=await lockAgencyLifecycleBarrier({db:tx,agencyId:row.agencyId}); if(life.row && !life.row.deletedAt) await enqueue({db:tx,...row,now}); }
-    await tx.$executeRawUnsafe(`UPDATE "MoneyResolutionAdoption" SET cursor=$1,complete=$2 WHERE id='v7'`,rows.at(-1)?.id||state.cursor,rows.length<100);
+    await tx.$executeRawUnsafe(`UPDATE "MoneyResolutionAdoption" SET cursor=$1,complete=$2 WHERE id='v8'`,rows.at(-1)?.id||state.cursor,rows.length<100);
     return rows.length;
   },{profile:"JOB_CHUNK",authority:{kind:"MONEY_RESOLUTION_ADOPTION"}});
 }
@@ -79,8 +89,14 @@ async function processRequest({db,item,ownerToken}) {
     if(!proof?.activeGeneration)return wait("BASELINE_REQUIRED",300000);
     const prior=request.jobId?await tx.jobInstance.findUnique({where:{id:request.jobId},select:{status:true,lastError:true,params:true}}):null;
     const attempts=request.targetId===target.id?request.attempts:0;
+    if(request.targetId===target.id && prior?.status!=="CANCELLED" && String(prior?.lastError||"").includes("MONEY_RESOLUTION_LEDGER_DIVERGED")) {
+      await require("./financial-recovery-intent-service").requestFull({db:tx,agencyId:item.agencyId,creatorId:item.creatorId,now,
+        reason:"MONEY_RESOLUTION_LEDGER_DIVERGED",identity:target.id});
+      await tx.$executeRawUnsafe(`UPDATE "CreatorMoneyObservation" SET "resolutionBlockedAt"=$2,"resolutionError"='FULL_REPAIR_REQUIRED:MONEY_RESOLUTION_LEDGER_DIVERGED' WHERE id=$1`,target.id,now);
+      return wait("FULL_REPAIR_REQUIRED",1000);
+    }
     if(attempts>=MAX_ATTEMPTS || (request.targetId===target.id && prior?.status==="CANCELLED")) {
-      await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v8',true)");
+      await tx.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v9',true)");
       await tx.$executeRawUnsafe(`UPDATE "CreatorMoneyObservation" SET "resolutionBlockedAt"=$2,"resolutionError"=$3 WHERE id=$1`,target.id,now,prior?.status==="CANCELLED"?"RESOLUTION_CANCELLED":prior?.lastError||"RESOLUTION_ATTEMPTS_EXHAUSTED");
       return wait("RESOLUTION_REVIEW_REQUIRED",1000);
     }

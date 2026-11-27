@@ -59,13 +59,15 @@ function financialVerificationDiagnostics(value) {
     reject(chartRequired && row.exhausted === false && row.traversalComplete !== true, "FINANCIAL_SOURCE_BOUNDARY_NOT_REACHED");
     reject(row.comparable === false, "FINANCIAL_COMPARISON_SCOPE_UNAVAILABLE");
     reject(chartRequired && !chartPresent, "FINANCIAL_CHART_RECEIPT_MISSING");
+    const categoryMismatches=(row.categoryMismatches||[]).filter(value=>["subscribes","tips","messages","post","stream"].includes(value)).slice(0,5);
+    reject(categoryMismatches.length>0,"FINANCIAL_CATEGORY_TOTAL_MISMATCH");
     for (const [key, reason] of [["count", "FINANCIAL_CHART_COUNT_MISMATCH"], ["grossCents", "FINANCIAL_CHART_GROSS_MISMATCH"], ["netCents", "FINANCIAL_CHART_NET_MISMATCH"]])
       reject(chartRequired && chartPresent && observed[key] !== null && expected[key] !== null && observed[key] !== expected[key], reason);
     return { index, kind: KINDS.has(row.kind) ? row.kind : null, fromAt: iso(row.from), toAt: iso(row.to),
       pages: number(row.pages), received: number(row.received), rejected: number(row.rejected), exhausted: bool(row.exhausted),
       rejectionReasons: Object.fromEntries(REJECTION_REASONS.filter(key => number(object(row.rejectionReasons)[key]) > 0)
         .map(key => [key, number(row.rejectionReasons[key])])),
-      matched: bool(row.matched), chartPresent, comparable: bool(row.comparable),
+      matched: bool(row.matched), chartPresent, comparable: bool(row.comparable), categoryMismatches,
       comparisonFromAt: iso(row.comparisonFrom || row.from), comparisonToAt: iso(row.comparisonTo || row.to), observed, expected,
       timeAuthority: "UTC", oldestObservedAt: iso(row.oldestAt), newestObservedAt: iso(row.newestAt),
       allObserved, comparedIncludingRefunds: comparedObserved, excludedBeforeComparison: subtract(allObserved, comparedObserved),

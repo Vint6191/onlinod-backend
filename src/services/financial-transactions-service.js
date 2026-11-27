@@ -482,7 +482,7 @@ async function ingestExactLiveTransaction({db,agencyId,creatorId,deviceId,money,
     amountCents:row.amountCents,netCents:row.netCents,feeCents:row.feeCents,taxCents:row.taxCents,
     vatCents:row.vatCents,mediaTaxCents:row.mediaTaxCents,currency:row.currency,
     occurredAt:row.occurredAt,transactionStatus:row.transactionStatus,sourceUpdatedAt:observedAt,
-    collectedAt:now,sourceDeviceId:deviceId,reasonCode:row.reasonCode,
+    collectedAt:now,sourceDeviceId:deviceId,sourceJobId:null,scanRunId:null,page:row.page,ordinal:row.ordinal,reasonCode:row.reasonCode,
     fanRecordId:fan?.id || null,fanOnlyFansUserId:row.fanOnlyFansUserId || null,
     fanUsernameAtEvent:row.fanUsername,fanDisplayNameAtEvent:row.fanDisplayName,fanAvatarUrlAtEvent:row.fanAvatarUrl});
   if(previous)await db.creatorFinancialTransaction.update({where:{id:previous.id},data});
@@ -542,6 +542,7 @@ module.exports = {
   withdrawVerifiedFinancialFactsPage,
   publishVerifiedFinancialFactsPage,
   ingestExactLiveTransaction,
+  resolveFans,
   normalizeTransaction,
   JOB_KEY,
   COLLECTOR_VERSION,

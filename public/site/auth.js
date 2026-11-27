@@ -152,6 +152,7 @@
       if (input.type === 'email') input.value = input.value.trim();
       let message = !input.value.trim() ? pair(['Fill in this field.', 'Заполни это поле.']) : !input.checkValidity() ? pair(['Check this value.', 'Проверь значение.']) : '';
       if (input.dataset.passwordMode === 'new' && input.value.length < 8) message = pair(['Use at least 8 characters.', 'Нужно не менее 8 символов.']);
+      if (input.dataset.passwordMode === 'new' && new TextEncoder().encode(input.value).length > 72) message = pair(['Use no more than 72 UTF-8 bytes for a new password.', 'Новый пароль должен занимать не более 72 байт UTF-8.']);
       if (input.id === 'reset-confirm' && input.value !== $('#reset-password').value) message = pair(['Passwords do not match.', 'Пароли не совпадают.']);
       const error = $('#' + input.id + '-error'); if (error) { error.textContent = message; error.hidden = !message; }
       input.setAttribute('aria-invalid', String(!!message)); if (message && valid) input.focus(); valid = valid && !message;

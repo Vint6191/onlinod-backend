@@ -25,14 +25,17 @@ function currentIdentity(profile, identity) {
   return p;
 }
 function profileValue(row, notes = []) {
+  const revision = Number(row.revision);
+  c.check(Number.isSafeInteger(revision) && revision >= 0, "CRM_REVISION_OVERFLOW", 503);
   const p = {
     ...globalThis.structuredClone(defaults.profile),
     ...row.profile,
     notesManual: notes.map((n) => n.text),
     manualFields: row.manual_fields,
-    revision: Number(row.revision),
+    revision,
     fieldVersions: row.field_versions,
   };
+  delete p._replyInput;
   p.fanName = p.preferredName || p.inferredPersonalName || p.legacyUnclassifiedName || p.platformDisplayName || "";
   p.fanUsername = p.platformUsername || "";
   return p;
@@ -104,11 +107,17 @@ function validateMergedProfile(profile) {
     c.check(profile.budgetMin <= profile.budgetMax, "CRM_BUDGET_INVALID", 400);
   return profile;
 }
+function boundStoredProfile(profile) {
+  const { _replyInput, ...publicProfile } = profile;
+  c.bounded(publicProfile, 65536);
+  if (_replyInput !== undefined) c.bounded(_replyInput, 4096);
+}
 class CrmRepository {
-  constructor(db, dialogs, canonical = null) {
+  constructor(db, dialogs, canonical = null, admitGrowth = async () => {}) {
     this.db = db;
     this.dialogs = dialogs;
     this.canonical = canonical;
+    this.admitGrowth = admitGrowth;
   }
   async identities(ctx, fanIds) {
     if (!this.canonical || !fanIds.length) return new Map();
@@ -191,6 +200,9 @@ class CrmRepository {
         return existing.result;
       }
       c.commandId(id);
+      // A retained receipt is a read of a committed outcome. Capacity only
+      // admits new growth, after the scope and command fingerprint are checked.
+      await this.admitGrowth();
       const result = await fn(tx);
       c.bounded(result, 16384);
       await c.exec(
@@ -277,6 +289,27 @@ class CrmRepository {
     } catch (error) {
       history.error = error.code || "DIALOG_HISTORY_UNAVAILABLE";
     }
+    const descriptor = row.profile?._replyInput;
+    let replyFreshnessReason = "UNKNOWN_INPUT";
+    if (descriptor?.replyContext?.policy === "crm-replies-context-v1" && typeof descriptor.replyContext.identityRevision === "string") {
+      if (!currentInput) replyFreshnessReason = "HISTORY_UNAVAILABLE";
+      else if (descriptor.epoch !== currentInput.epoch || descriptor.revision !== currentInput.revision) replyFreshnessReason = "HISTORY_CHANGED";
+      else {
+        // Re-read the CRM source after the authoritative history read: a panel
+        // assembled across databases must not mark a changed profile as fresh.
+        const current = await c.one(this.db, `SELECT p.revision,p.reply_token,p.profile->'_replyInput' AS reply_input,s.persona_revision
+          FROM crm_profile p JOIN crm_scope s USING(scope_id) WHERE p.scope_id=$1 AND p.fan_id=$2`, ctx.scopeId, fanId);
+        if (!current || Number(current.revision) !== descriptor.replyContext.profileRevision
+          || current.reply_token !== row.reply_token || c.hash(current.reply_input) !== c.hash(descriptor)) replyFreshnessReason = "PROFILE_CHANGED";
+        else if (Number(current.persona_revision) !== descriptor.replyContext.personaRevision) replyFreshnessReason = "PERSONA_CHANGED";
+        else if (String(await this.identityRevision(ctx)) !== descriptor.replyContext.identityRevision) replyFreshnessReason = "IDENTITY_CHANGED";
+        else replyFreshnessReason = null;
+      }
+    }
+    const staleReplySuggestions = replyFreshnessReason === null ? [] : profile.replySuggestions;
+    // Older desktops do not understand the freshness flag. Keep stale text in
+    // a separate read-only field so their existing actionable list is empty.
+    if (replyFreshnessReason !== null) profile.replySuggestions = [];
     return {
       ok: true,
       creatorId: ctx.creatorId,
@@ -294,6 +327,9 @@ class CrmRepository {
         row.accepted_input.epoch === currentInput.epoch &&
         row.accepted_input.revision === currentInput.revision
       ),
+      repliesFresh: replyFreshnessReason === null,
+      replyFreshnessReason,
+      staleReplySuggestions,
     };
   }
   async updateProfile(ctx, input, id) {
@@ -310,7 +346,7 @@ class CrmRepository {
     delete incoming.notesManual;
     const patch = cleanPatch(incoming);
     for (const key of Object.keys(patch)) c.check(MANUAL.has(key) && !FORBIDDEN.has(key), "CRM_FIELD_READ_ONLY", 403);
-    await this.command(
+    const receipt = await this.command(
       ctx,
       id,
       { kind: "profile.patch", fanId, patch, baseRevision: input.baseRevision, appendNotes: input.appendNotes || [] },
@@ -327,7 +363,7 @@ class CrmRepository {
         const versions = { ...before.field_versions };
         for (const key of Object.keys(patch)) versions[key] = revision;
         validateMergedProfile(next);
-        c.bounded(next, 65536);
+        boundStoredProfile(next);
         c.check(
           Array.isArray(input.appendNotes || []) && (input.appendNotes || []).length <= 10,
           "CRM_NOTES_INVALID",
@@ -380,7 +416,9 @@ class CrmRepository {
         return { revision };
       }
     );
-    return this.getPanelSnapshot(ctx, input);
+    return { ...await this.getPanelSnapshot(ctx, input), mutation: {
+      kind: "crm.profile.update", commandId: id, committedRevision: receipt.revision,
+    } };
   }
   async applyAiPatch(ctx, fanId, patch, tx) {
     const before = await this.ensure(ctx, fanId, tx);
@@ -396,7 +434,7 @@ class CrmRepository {
     delete values.fanUsername;
     const next = { ...before.profile, ...values };
     validateMergedProfile(next);
-    c.bounded(next, 65536);
+    boundStoredProfile(next);
     const revision = Number(before.revision) + 1;
     await c.exec(
       tx,
@@ -518,7 +556,6 @@ class CrmRepository {
       records.length = Math.min(100, records.length);
       for (const row of records) {
         row.profile = Object.fromEntries(Object.entries(row.profile).filter(([, v]) => v !== null));
-        c.bounded(row, 16384);
       }
       const result = {
         rows: records.map((row) => ({
@@ -531,6 +568,7 @@ class CrmRepository {
         revision,
         nextDialogId: more ? records.at(-1).fan_id : null,
       };
+      for (const row of result.rows) c.bounded(row, 16384);
       c.bounded(result, 2097152);
       return result;
     });
@@ -563,6 +601,11 @@ class CrmRepository {
         event.revision,
         event.rewriteRevision
       );
+      // A delayed event may arrive after analysis already accepted this exact
+      // authoritative history. Advance the mirror without requeueing that same
+      // input or changing the generation of a separately requested run.
+      if (p.accepted_input?.epoch === event.epoch && Number(p.accepted_input.revision) >= event.revision)
+        return { duplicate: false };
       await c.exec(
         tx,
         `UPDATE crm_analysis_work w SET generation=generation+CASE WHEN state='RUNNING' AND EXISTS(SELECT 1 FROM crm_analysis_run r WHERE r.run_id=w.active_run_id AND r.input->>'epoch'=$3 AND (r.input->>'revision')::bigint>=$4) THEN 0 ELSE 1 END,

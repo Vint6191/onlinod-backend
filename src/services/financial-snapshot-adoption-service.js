@@ -9,7 +9,7 @@ const { dbAuthorityNow } = require("./db-time-authority-service");
 const generation = require("./earnings-generation-service");
 const { FINANCIAL_PROOF_POLICY_VERSION: VERSION } = require("./earnings-coverage-service");
 const { FLOOR } = require("./financial-receipt-authority");
-const KEY = "repair:financial-snapshot:v2";
+const KEY = "repair:financial-snapshot:v3";
 const digest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 // These are deterministic evidence failures, not database availability,
 // transaction or unknown-commit outcomes. Only this closed set may advance a
@@ -123,7 +123,7 @@ async function page({ db }) {
     }
     const [run]=source?await tx.$queryRawUnsafe('SELECT * FROM "FinancialReceiptRun" WHERE id=$1 FOR UPDATE',source.runId):[];
     const window=run?.windows?.[0], observed=run?.proof?.windows?.[0];
-    const retained=source?.fullScan && run?.agencyId===creator.agencyId && run?.creatorId===creator.id
+    const retained=run?.proof?.semanticsVersion===3 && source?.fullScan && run?.agencyId===creator.agencyId && run?.creatorId===creator.id
       && !run.detailsRetiredAt && !run.compactedAt && run.proof?.complete===true
       && run.windows.length===1 && window.kind==="FULL" && window.from===null
       && observed?.exhausted===true && observed?.matched===true && observed?.rejected===0;

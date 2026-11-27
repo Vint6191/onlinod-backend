@@ -80,7 +80,7 @@ async function inventory({ db, agencyId = null, cursor = "", upperCreatorId = nu
     ORDER BY p."creatorId" LIMIT $5`, agencyId, cursor, upperCreatorId, FINANCIAL_PROOF_POLICY_VERSION, size);
 }
 
-async function runRepairPage({ db = require("../prisma"), runId = "financial-proof-v2", agencyId = null,
+async function runRepairPage({ db = require("../prisma"), runId = "financial-proof-v3", agencyId = null,
   mode = "dry-run", cursor = "", targetAt = new Date(), expectedRevision = null, limit = PAGE } = {}) {
   if (!["dry-run", "apply"].includes(mode) || !/^[a-zA-Z0-9_.:-]{1,100}$/.test(runId)) throw fault("FINANCIAL_REPAIR_INPUT_INVALID");
   const target = asDate(targetAt); if (!target) throw fault("FINANCIAL_REPAIR_TARGET_INVALID");
@@ -133,9 +133,10 @@ async function runRepairPage({ db = require("../prisma"), runId = "financial-pro
 }
 
 async function runSweep({ db = require("../prisma"), now = new Date(), limit = PAGE } = {}) {
+  await require("./team-purchase-identity-service").adoptPage(db);
   const adoption=await require("./financial-snapshot-adoption-service").runSweep({db,limit});
   if (!adoption.complete) return adoption;
-  const result = await runRepairPage({ db, runId:"financial-proof-v2", mode: "apply", targetAt: now, limit });
+  const result = await runRepairPage({ db, runId:"financial-proof-v3", mode: "apply", targetAt: now, limit });
   return { ok: true, processed: result.pageVisited, status: result.status,
     completionMeaning: "ADOPTION_ONLY_PROVIDER_RECOVERY_MUST_COMPLETE", counts: result.counts };
 }

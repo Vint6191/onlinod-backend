@@ -12,30 +12,31 @@ const { earningsCategory } = require("./financial-transaction-category");
 const { FINANCIAL_PROOF_POLICY_VERSION } = require("./earnings-coverage-service");
 const fail = (code) => Object.assign(new Error(code), { code });
 async function lock(db, creatorId) {
-  await db.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v8',true), pg_advisory_xact_lock(hashtextextended($1,0))", `live-earnings:${creatorId}`);
+  await db.$executeRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v9',true), pg_advisory_xact_lock(hashtextextended($1,0))", `live-earnings:${creatorId}`);
 }
 async function tryLock(db, creatorId) {
-  const [row] = await db.$queryRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v8',true), pg_try_advisory_xact_lock(hashtextextended($1,0)) AS owned", `live-earnings:${creatorId}`);
+  const [row] = await db.$queryRawUnsafe("SELECT set_config('onlinod.earnings_writer_generation','v9',true), pg_try_advisory_xact_lock(hashtextextended($1,0)) AS owned", `live-earnings:${creatorId}`);
   return row?.owned === true;
 }
 async function upsert(db, generation, rows) {
   if (!rows.length) return [];
   return db.$queryRawUnsafe(`INSERT INTO "CreatorEarningsGenerationEntry"
-    (generation,"transactionId","occurredAt",category,"netCents","grossCents",status,"observedAt","fanOnlyFansUserId")
-    SELECT $1,x."transactionId",x."occurredAt",x.category,x."netCents",x."grossCents",x.status,x."observedAt",x."fanOnlyFansUserId"
-    FROM jsonb_to_recordset($2::jsonb) x("transactionId" text,"occurredAt" timestamp,category text,"netCents" bigint,"grossCents" bigint,status text,"observedAt" timestamp,"fanOnlyFansUserId" text)
+    (generation,"transactionId","occurredAt",category,"netCents","grossCents",status,"observedAt","fanOnlyFansUserId","financialFact")
+    SELECT $1,x."transactionId",x."occurredAt",x.category,x."netCents",x."grossCents",x.status,x."observedAt",x."fanOnlyFansUserId",x."financialFact"
+    FROM jsonb_to_recordset($2::jsonb) x("transactionId" text,"occurredAt" timestamp,category text,"netCents" bigint,"grossCents" bigint,status text,"observedAt" timestamp,"fanOnlyFansUserId" text,"financialFact" jsonb)
     ORDER BY x."transactionId"
     ON CONFLICT(generation,"transactionId") DO UPDATE SET "occurredAt"=EXCLUDED."occurredAt",category=EXCLUDED.category,
       "netCents"=EXCLUDED."netCents","grossCents"=EXCLUDED."grossCents",status=EXCLUDED.status,"observedAt"=EXCLUDED."observedAt",
-      "fanOnlyFansUserId"=COALESCE(EXCLUDED."fanOnlyFansUserId","CreatorEarningsGenerationEntry"."fanOnlyFansUserId")
+      "fanOnlyFansUserId"=COALESCE(EXCLUDED."fanOnlyFansUserId","CreatorEarningsGenerationEntry"."fanOnlyFansUserId"),
+      "financialFact"=EXCLUDED."financialFact"
     WHERE "CreatorEarningsGenerationEntry"."observedAt"<=EXCLUDED."observedAt" RETURNING "transactionId"`, generation,
     JSON.stringify(rows, (_, v) => typeof v === "bigint" ? v.toString() : v));
 }
 async function activeEntry(db, creatorId, transactionId) {
-  const [row] = await db.$queryRawUnsafe(`SELECT e."transactionId",e."occurredAt",e.category,e."netCents",e."grossCents",e.status,e."observedAt",e."fanOnlyFansUserId",e.generation FROM "CreatorEarningsLedgerProof" p
+  const [row] = await db.$queryRawUnsafe(`SELECT e."transactionId",e."occurredAt",e.category,e."netCents",e."grossCents",e.status,e."observedAt",e."fanOnlyFansUserId",e."financialFact",e.generation FROM "CreatorEarningsLedgerProof" p
     JOIN "CreatorEarningsGenerationEntry" e ON e.generation=p."activeGeneration"
     WHERE p."creatorId"=$1 AND e."transactionId"=$2
-    UNION ALL SELECT e.* FROM (SELECT "transactionId","occurredAt",category,"netCents","grossCents",status,"observedAt","fanOnlyFansUserId",NULL::text AS generation
+    UNION ALL SELECT e.* FROM (SELECT "transactionId","occurredAt",category,"netCents","grossCents",status,"observedAt","fanOnlyFansUserId","financialFact",NULL::text AS generation
       FROM "CreatorEarningsLedgerEntry" WHERE "creatorId"=$1 AND "transactionId"=$2) e
     WHERE NOT EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$1 AND "activeGeneration" IS NOT NULL)`, creatorId, transactionId);
   return row || null;
@@ -46,7 +47,7 @@ async function snapshotAbsence(db, creatorId, transactionId, occurredAt) {
   // the pointer swap. Pending observations covered by a build remain pending
   // unless that exact generation is eventually published.
   const [row]=await db.$queryRawUnsafe(`SELECT g.id,g."snapshotAt",g."publishedAt" FROM "CreatorEarningsGeneration" g
-    WHERE g."creatorId"=$1 AND g."fullScan" AND g.mode='SNAPSHOT' AND g."proofPolicyVersion"=$4
+    WHERE g."creatorId"=$1 AND g.mode='SNAPSHOT' AND g."proofPolicyVersion"=$4
       AND g.state IN ('ACTIVE','BUILDING','READY') AND $3 BETWEEN g."fromAt" AND g."throughAt"
       AND ((g.state='ACTIVE' AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsGenerationEntry" e WHERE e.generation=g.id AND e."transactionId"=$2))
         OR (g.state IN ('BUILDING','READY') AND NOT EXISTS(SELECT 1 FROM "FinancialObservedFact" f
@@ -60,12 +61,12 @@ async function writeLive(db, scope, row) {
     WHERE "creatorId"=$1 AND mode='SNAPSHOT' AND state IN ('ACTIVE','BUILDING','READY') ORDER BY id`, scope.creatorId);
   if (!targets.some(x => x.state === "ACTIVE")) {
     await db.$executeRawUnsafe(`INSERT INTO "CreatorEarningsLedgerEntry"
-      ("agencyId","creatorId","transactionId","occurredAt",category,"netCents",status,"observedAt","grossCents","fanOnlyFansUserId")
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT("creatorId","transactionId") DO UPDATE SET
+      ("agencyId","creatorId","transactionId","occurredAt",category,"netCents",status,"observedAt","grossCents","fanOnlyFansUserId","financialFact")
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb) ON CONFLICT("creatorId","transactionId") DO UPDATE SET
       "occurredAt"=EXCLUDED."occurredAt",category=EXCLUDED.category,"netCents"=EXCLUDED."netCents",
       "grossCents"=EXCLUDED."grossCents",status=EXCLUDED.status,"observedAt"=EXCLUDED."observedAt",
-      "fanOnlyFansUserId"=COALESCE(EXCLUDED."fanOnlyFansUserId","CreatorEarningsLedgerEntry"."fanOnlyFansUserId")`, scope.agencyId,scope.creatorId,row.transactionId,
-      row.occurredAt,row.category,row.netCents,row.status,row.observedAt,row.grossCents ?? null,row.fanOnlyFansUserId ?? null);
+      "fanOnlyFansUserId"=COALESCE(EXCLUDED."fanOnlyFansUserId","CreatorEarningsLedgerEntry"."fanOnlyFansUserId"),"financialFact"=EXCLUDED."financialFact"`, scope.agencyId,scope.creatorId,row.transactionId,
+      row.occurredAt,row.category,row.netCents,row.status,row.observedAt,row.grossCents ?? null,row.fanOnlyFansUserId ?? null,row.financialFact?JSON.stringify(row.financialFact):null);
   }
   for (const target of targets) await upsert(db,target.id,[row]);
 }
@@ -84,7 +85,7 @@ function unpublishedGenerationOwnedSql(g="g") {
   return `(EXISTS(SELECT 1 FROM "FinancialReceiptRun" r JOIN "JobInstance" j ON j.id=r."jobId"
       WHERE r.id=${g}."runId" AND r."creatorId"=${g}."creatorId" AND r."agencyId"=${g}."agencyId"
         AND j.status IN ('SCHEDULED','CLAIMED','PUBLISHING','PAUSED') AND j.params->>'collectionGeneration'=r.generation)
-    OR EXISTS(SELECT 1 FROM "SystemSetting" s WHERE s.key='repair:financial-snapshot:v2'
+    OR EXISTS(SELECT 1 FROM "SystemSetting" s WHERE s.key='repair:financial-snapshot:v3'
       AND s.value->'current'->>'generationId'=${g}.id AND s."updatedAt">clock_timestamp()-interval '1 day'))`;
 }
 // Callers hold the creator earnings lock. Canonical pages are visible to
@@ -122,8 +123,10 @@ async function repairUnpublishedPage(db, generationId) {
 }
 async function preparePage(db, job, run, { generationId = run.id, repair = false } = {}) {
   if (!supported(run)) return { ready: false, unsupported: true };
+  if (run.proof.semanticsVersion !== 3) throw fail("FINANCIAL_PROOF_POLICY_REVERIFY_REQUIRED");
   // Chart comparison proves the requested empty hours too. The oldest payment
   // bounds observed facts; it must not shorten the accepted verification window.
+  const reconcilesMembership = run.windows[0].kind !== "RESOLUTION";
   const from = verifiedWindowFrom(run), through = new Date(run.windows[0].to), snapshot = require("./analytics-observation-time").observationStartForJob(job);
   if (![from,through,snapshot].every(x=>Number.isFinite(+x))) throw fail("EARNINGS_PUBLICATION_TIME_INVALID");
   await lock(db,job.creatorId);
@@ -142,9 +145,9 @@ async function preparePage(db, job, run, { generationId = run.id, repair = false
     [g] = await db.$queryRawUnsafe(`INSERT INTO "CreatorEarningsGeneration"
       (id,"agencyId","creatorId","runId","baseGeneration","fromAt","throughAt","snapshotAt","fullScan","legacyPending",mode,phase,"proofPolicyVersion")
       VALUES($1,$2,$3,$8,(SELECT "activeGeneration" FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3),$4,$5,$6,$7,NOT EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3 AND "activeGeneration" IS NOT NULL),
-      CASE WHEN NOT $7 AND EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3 AND "activeGeneration" IS NOT NULL) THEN 'DELTA' ELSE 'SNAPSHOT' END,
-      CASE WHEN NOT $7 AND EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3 AND "activeGeneration" IS NOT NULL) THEN 'APPLY' ELSE 'COPY' END,$9) RETURNING *`,
-      generationId,job.agencyId,job.creatorId,from,through,snapshot,run.windows[0].kind === "FULL",run.id,FINANCIAL_PROOF_POLICY_VERSION);
+      CASE WHEN NOT $10 AND EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3 AND "activeGeneration" IS NOT NULL) THEN 'DELTA' ELSE 'SNAPSHOT' END,
+      CASE WHEN NOT $10 AND EXISTS(SELECT 1 FROM "CreatorEarningsLedgerProof" WHERE "creatorId"=$3 AND "activeGeneration" IS NOT NULL) THEN 'APPLY' ELSE 'COPY' END,$9) RETURNING *`,
+      generationId,job.agencyId,job.creatorId,from,through,snapshot,run.windows[0].kind === "FULL",run.id,FINANCIAL_PROOF_POLICY_VERSION,reconcilesMembership);
   }
   if (g.agencyId !== job.agencyId || g.creatorId !== job.creatorId || +g.snapshotAt !== +snapshot) throw fail("EARNINGS_GENERATION_SCOPE_MISMATCH");
   if (g.publishedAt) return { ready:true, generation:g.id };
@@ -173,7 +176,7 @@ async function preparePage(db, job, run, { generationId = run.id, repair = false
     // replaced. Later live/catch-up revisions and facts outside the interval
     // remain authoritative and are copied unchanged.
     let retained = rows;
-    if (g.fullScan && rows.length) {
+    if (reconcilesMembership && rows.length) {
       const present = new Set((await db.$queryRawUnsafe(`SELECT "externalId" FROM "FinancialObservedFact"
         WHERE "runId"=$1 AND "windowIndex"=0 AND "externalId"=ANY($2::text[])`,run.id,rows.map(row=>row.transactionId))).map(row=>row.externalId));
       retained = rows.filter(row=>row.occurredAt<from || row.occurredAt>through || row.observedAt>snapshot || present.has(row.transactionId));
@@ -196,11 +199,13 @@ async function preparePage(db, job, run, { generationId = run.id, repair = false
     // is already an exact financial fact; only the range proof waits for finalization.
     const accepted = new Set((await upsert(db,g.mode === "DELTA" ? g.baseGeneration : g.id,values)).map(row=>row.transactionId));
     await require("./financial-transactions-service").publishVerifiedFinancialFactsPage({ db, job, facts: rows.filter(row=>accepted.has(row.externalId)), now: new Date() });
+    await require("./financial-revision-repository").capture({db, ...job, transactionIds:[...accepted], observedAt:snapshot,
+      generations:[g.mode === "DELTA" ? g.baseGeneration : g.id]});
     await db.$executeRawUnsafe(`UPDATE "CreatorEarningsGeneration" SET "observedCount"="observedCount"+$2,
       "invalidCount"="invalidCount"+$3,"oldestAt"=$4 WHERE id=$1`,g.id,rows.length,invalid,oldest);
     if (rows.length<APPLY_PAGE && (Number(g.observedCount)+rows.length !== run.proof.windows[0].count || Number(g.invalidCount)+invalid))
       throw fail("EARNINGS_GENERATION_PROOF_MISMATCH");
-    await advance(db,g,rows,rows.at(-1)?.externalId,g.fullScan?"WITHDRAW":"RESOLVE",APPLY_PAGE);
+    await advance(db,g,rows,rows.at(-1)?.externalId,reconcilesMembership?"WITHDRAW":"RESOLVE",APPLY_PAGE);
   } else if (g.phase === "WITHDRAW") {
     // Page the canonical identities before testing absence. A sparse omitted
     // set must not turn one publication unit into an unbounded history scan.
@@ -228,7 +233,7 @@ async function preparePage(db, job, run, { generationId = run.id, repair = false
     // or superseded build cannot declare ambiguous live money covered.
     rows = await db.$queryRawUnsafe(`SELECT id FROM "CreatorMoneyObservation" WHERE "creatorId"=$1
       AND status='PENDING' AND id>$2
-      AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" old WHERE old.id="CreatorMoneyObservation"."coveredGeneration" AND old."publishedAt" IS NOT NULL) AND ("occurredAt" BETWEEN $3 AND $4 OR ($7 AND EXISTS(SELECT 1 FROM "FinancialObservedFact" f WHERE f."runId"=$8 AND f."windowIndex"=0 AND f."externalId"="CreatorMoneyObservation"."transactionId")))
+      AND NOT EXISTS(SELECT 1 FROM "CreatorEarningsGeneration" old WHERE old.id="CreatorMoneyObservation"."coveredGeneration" AND old."publishedAt" IS NOT NULL) AND ("occurredAt" BETWEEN $3 AND $4 OR (($7 OR "reason"='SOURCE_TIME_INVALID') AND EXISTS(SELECT 1 FROM "FinancialObservedFact" f WHERE f."runId"=$8 AND f."windowIndex"=0 AND f."externalId"="CreatorMoneyObservation"."transactionId")))
       AND (NOT $7 OR "transactionId" IS NULL OR EXISTS(SELECT 1 FROM "FinancialObservedFact" f WHERE f."runId"=$8 AND f."windowIndex"=0 AND f."externalId"="CreatorMoneyObservation"."transactionId"))
       AND "capturedAt"<=$5 ORDER BY id LIMIT $6`,
       job.creatorId,g.cursor,(g.fullScan || run.windows[0].kind === "RESOLUTION")?from:g.oldestAt,through,snapshot,PAGE,run.windows[0].kind === "RESOLUTION",run.id);

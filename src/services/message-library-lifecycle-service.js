@@ -6,6 +6,7 @@ const { assertManagementCommitAuthority } = require("./management-commit-authori
 const { lockAgencyLifecycleBarrier } = require("./agency-lifecycle-barrier-service");
 const { lockLiveTeamControlPlaneCreators } = require("./team-control-plane-authority-service");
 const { dbAuthorityNow } = require("./db-time-authority-service");
+const { assertMessageLibraryRestore } = require("./message-library-limits-service");
 const KIND = "message_library_script";
 const RETENTION_DAYS = 14;
 const fail = (code, message, status=409) => Object.assign(new Error(message), {code,status});
@@ -60,9 +61,11 @@ async function changeMessageLibraryLifecycle({tx,existing,now,action,userId=null
     throw fail("MESSAGE_LIBRARY_DELETE_COMMITTED","Permanent deletion has already been committed");
   }
   if(messageId) {
-    if(isTrash(existing)) throw fail("MESSAGE_LIBRARY_SCRIPT_TRASHED","Restore the script before editing its messages");
+    // Shrinking an old over-limit script remains possible while it is in trash.
+    if(isTrash(existing) && action!=="trash") throw fail("MESSAGE_LIBRARY_SCRIPT_TRASHED","Restore the script before editing its messages");
     const block=await tx.contentBlock.findFirst({where:{collectionId:existing.id,OR:[{clientId:messageId},{id:messageId}]}});
     if(!block) throw fail("MESSAGE_LIBRARY_BLOCK_NOT_FOUND","Message block not found",404);
+    if(action==="restore") await assertMessageLibraryRestore(tx,{...existing,updatedByUserId:userId},block);
     const data=action==="restore"?{status:"active",deletedAt:null,purgeAfter:null,trashedByUserId:null}:{status:"trash",deletedAt:block.deletedAt||now,purgeAfter:block.purgeAfter||trashPurgeAfter(now),trashedByUserId:userId};
     const updated=await tx.contentBlock.update({where:{id:block.id},data});
     await tx.contentCollection.update({where:{id:existing.id},data:{updatedByUserId:userId,updatedAt:now}});
@@ -72,6 +75,7 @@ async function changeMessageLibraryLifecycle({tx,existing,now,action,userId=null
   const data=action==="restore"?{status:"active",deletedAt:null,purgeAfter:null,trashedByUserId:null,updatedByUserId:userId}:
     action==="permanent"?{status:"deleting",deletedAt:existing.deletedAt||now,purgeAfter:now,updatedByUserId:userId}:
     {status:"trash",deletedAt:existing.deletedAt||now,purgeAfter:existing.purgeAfter||trashPurgeAfter(now),trashedByUserId:userId,updatedByUserId:userId};
+  if(action==="restore") await assertMessageLibraryRestore(tx,{...existing,...data});
   const item=await tx.contentCollection.update({where:{id:existing.id},data,...(includeBlocks && action!=="permanent"?{include:{blocks:{orderBy:[{order:"asc"},{createdAt:"asc"}]}}}:{})});
   return {item,...(action==="permanent"?{permanent:true,pendingCleanup:true}:{})};
 }

@@ -13,6 +13,26 @@ function browser(storage = new Map(), fetch = async () => { throw Error("network
   return { window, commands: window.NodAdminCommands, storage };
 }
 const input = { path: "/api/admin/billing/creator/creator-a", method: "PATCH", body: { expectedRevision: 1, corePriceCents: 3200, reason: "Edit" }, token: "bearer-sensitive-value" };
+test("reauthenticated administrator can close only a server-fenced missing attempt", async () => {
+  const calls = [];
+  const b = browser(new Map(), async (url, options) => {
+    calls.push({ url, options });
+    const closing = options.method === "POST";
+    return { ok: closing, status: closing ? 200 : 404, json: async () => closing
+      ? { ok: true, commandId: url.split("/").at(-2), status: "REJECTED", result: { code: "ADMIN_COMMAND_ABANDONED" } }
+      : { ok: false, code: "ADMIN_COMMAND_NOT_FOUND" } };
+  });
+  b.window.NodAdminState = { admin: { id: "admin-one" } };
+  const first = await b.commands.prepare(input);
+  assert.equal((await b.commands.prepare({ ...input, token: "new-token" })).blocked, true);
+  const absent = await b.commands.resolve(input.path, input.method, "new-token");
+  assert.equal(absent.pending, true); assert.equal(absent.canClose, true);
+  const closed = await b.commands.close(input.path, input.method, "new-token");
+  assert.equal(closed.pending, false);
+  assert.equal(calls[1].url, `/api/admin/commands/${first.commandId}/abandon`);
+  assert.equal(calls[1].options.headers.Authorization, "Bearer new-token");
+  assert.notEqual((await b.commands.prepare({ ...input, token: "new-token" })).commandId, first.commandId);
+});
 test("network uncertainty and browser reload retain the exact command identity", async () => {
   const a = browser(); const first = await a.commands.prepare(input);
   const b = browser(a.storage); const retry = await b.commands.prepare(input);

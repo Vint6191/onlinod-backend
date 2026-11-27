@@ -443,7 +443,11 @@ async function runAnalyticsPublicationSweep({ db, limit = 8, maxRuntimeMs = 5000
         // No provider write is performed here: each retry re-reads the durable
         // publication stage under the existing ownership and generation fences.
         // Database availability must not reject already accepted source facts.
-        if (!isTransientDatabaseError(error) && require("./domain-work-failure-policy").domainWorkFailureOutcome({ error, consecutiveFailures: attempt }).state === "RECONCILE_REQUIRED") {
+        const semanticRepair=["MONEY_RESOLUTION_LEDGER_DIVERGED","FINANCIAL_PROOF_POLICY_REVERIFY_REQUIRED"].includes(error?.code||error?.message);
+        if(semanticRepair) await require("./financial-recovery-intent-service").requestFull({db:tx,
+          agencyId:jobs[0].agencyId,creatorId:jobs[0].creatorId,now:at,reason:error.code||error.message,
+          identity:jobs[0].params?.moneyResolutionObservationId||row.id});
+        if (semanticRepair || (!isTransientDatabaseError(error) && require("./domain-work-failure-policy").domainWorkFailureOutcome({ error, consecutiveFailures: attempt }).state === "RECONCILE_REQUIRED")) {
           await settle(tx, jobs[0], row, { ok: false, type: "analytics_publication", error: message }, at, { forceTerminal: true });
         } else await tx.analyticsPublication.update({ where: { id: publicationId }, data: {
           attempts: attempt, lastError: message, availableAt: new Date(at.getTime() + Math.min(300000, 1000 * 2 ** Math.min(10, attempt))),

@@ -100,6 +100,8 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
           observedAt,
           now,
         });
+        await require("./financial-revision-repository").capture({db,agencyId,creatorId,transactionIds:[money.transactionId],observedAt});
+        await require("./financial-revision-repository").resolveInvalidTime({db,agencyId,creatorId,transactionId:money.transactionId,capturedAt:eventCapturedAt,now});
         applied++;
       }
     }
@@ -125,7 +127,7 @@ async function ingestLive({ db, agencyId, creatorId, deviceId, events, capturedA
   await db.$executeRawUnsafe(
     `DELETE FROM "CreatorMoneyObservation" WHERE id IN (
     SELECT id FROM "CreatorMoneyObservation" WHERE "creatorId"=$1 AND status IN ('APPLIED','COVERED')
-      AND "occurredAt"<$2 ORDER BY "occurredAt",id LIMIT 100)`,
+      AND "occurredAt"<$2 AND ("resolvedAt" IS NULL OR "resolvedAt"<$2) ORDER BY "occurredAt",id LIMIT 100)`,
     creatorId,
     new Date(+now - 30 * 86400000)
   );

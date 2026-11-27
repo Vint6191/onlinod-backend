@@ -165,7 +165,7 @@ async function createRefreshSession({
 }
 
 async function issueLoginTokens({
-  user, membership, req, rememberDevice = false, deviceId = null, client = null, authorizationScopeIncarnation = null,
+  user, membership, req, rememberDevice = false, deviceId = null, client = null, authorizationScopeIncarnation = null, verifyDevicePrincipal = false,
 }) {
   // Rolling activation mirrors refresh adoption. A lineage-aware Desktop brings
   // the durable incarnation it already owns; a legacy client that cannot persist
@@ -189,6 +189,13 @@ async function issueLoginTokens({
       expectedAccessEpoch: membership.accessEpoch,
       expectedPasswordHash: user.passwordHash || null,
     });
+
+    if (verifyDevicePrincipal) {
+      const context = await require("./principal-device-context-service").principalDeviceContext({ db: tx, userId: user.id, agencyId: membership.agencyId, deviceId });
+      if (!deviceId || (!context.owned && !context.unclaimed)) throw Object.assign(new Error("The logical device belongs to another account; resolve your account again"), {
+        code: "AUTH_DEVICE_PRINCIPAL_MISMATCH", status: 409,
+      });
+    }
 
     if (authorizationSessionId) {
       // The Desktop incarnation is a global authorization-generation identity,

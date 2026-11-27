@@ -5,6 +5,8 @@ const { ACTIONS, adminError, commandIdSchema, intentHash } = require("./admin-co
 const { lockAdminActor, assertAdminSessionLifetime: assertCommandSessionLifetime } = require("./admin-session-authority-service");
 const { runRootCommit, discardCommitHints, classifyCommitConflict } = require("./db-commit-kernel");
 
+const ABANDONED_ACTION = "admin.command.abandon";
+
 async function lockCommandIdentity(tx, actorId, commandId) {
   await tx.$executeRawUnsafe("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", `admin-command:${actorId}:${commandId}`);
 }
@@ -33,6 +35,12 @@ async function executeAdminCommand({ db, actor, commandId, action, targetId, pay
     const where = { actorId_commandId: { actorId: actor.adminId, commandId } };
     const existing = await tx.adminCommand.findUnique({ where });
     if (existing) {
+      // A recovery tombstone closes this identity before an originally delayed
+      // request can arrive. It deliberately has no knowledge of that payload.
+      if (existing.action === ABANDONED_ACTION) {
+        await assertCommandSessionLifetime(tx, authority);
+        return { commandId, replayed: true, statusCode: existing.httpStatus, body: existing.result };
+      }
       if (existing.payloadHash !== hash) throw adminError("ADMIN_COMMAND_PAYLOAD_CONFLICT", "Command identity was already used for another intent", 409);
       await assertCommandSessionLifetime(tx, authority);
       return { commandId, replayed: true, statusCode: existing.httpStatus, body: existing.result };
@@ -116,4 +124,32 @@ async function readAdminCommand({ db, actor, commandId }) {
   }, { profile: "ADMIN_COMMAND", authority: { kind: "ADMIN_COMMAND_READ", adminId: actor.adminId } });
 }
 
-module.exports = { executeAdminCommand, readAdminCommand, lockCommandIdentity, safeJson };
+async function abandonAdminCommand({ db, actor, commandId }) {
+  commandIdSchema.parse(commandId);
+  if (!actor?.adminId) throw adminError("ADMIN_AUTH_REQUIRED", "Admin context is required", 401);
+  return runRootCommit(db, async ({ tx }) => {
+    // Absence from a status read alone is not proof of noncommit. Serialize
+    // closing and executing the identity on the very same transaction lock.
+    await lockCommandIdentity(tx, actor.adminId, commandId);
+    const authority = await lockAdminActor(tx, actor);
+    let row = await tx.adminCommand.findUnique({ where: { actorId_commandId: { actorId: actor.adminId, commandId } } });
+    if (!row) {
+      const completedAt = await dbAuthorityNow({ db: tx });
+      const result = { ok: false, commandId, code: "ADMIN_COMMAND_ABANDONED", error: "This unsubmitted change was closed. Reload current values before submitting a new change." };
+      row = await tx.adminCommand.create({ data: {
+        commandId, actorId: actor.adminId, sessionId: actor.sessionId, actorAccessEpoch: actor.accessEpoch,
+        action: ABANDONED_ACTION, targetId: commandId, payloadHash: intentHash({ action: ABANDONED_ACTION, targetId: commandId, payload: {} }),
+        reason: "Close an unconfirmed change", status: "REJECTED", httpStatus: 409, result, completedAt,
+      } });
+      await tx.adminCommandAudit.create({ data: { commandId: row.id, sequence: 1, actorId: actor.adminId,
+        action: ABANDONED_ACTION, targetId: commandId, event: "REJECTED", detail: { code: "ADMIN_COMMAND_ABANDONED" }, reason: row.reason } });
+    }
+    // An already accepted command keeps its result and background work. This
+    // operation closes only an identity which has never committed a receipt.
+    await assertCommandSessionLifetime(tx, authority);
+    return { ok: true, commandId, action: row.action, targetId: row.targetId, status: row.status,
+      result: row.result, httpStatus: row.httpStatus, createdAt: row.createdAt, completedAt: row.completedAt };
+  }, { profile: "ADMIN_COMMAND", authority: { kind: "ADMIN_COMMAND_ABANDON", adminId: actor.adminId } });
+}
+
+module.exports = { executeAdminCommand, readAdminCommand, abandonAdminCommand, lockCommandIdentity, safeJson };

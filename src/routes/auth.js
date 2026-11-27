@@ -29,6 +29,8 @@ const { lockTeamControlPlaneTopology, lockLiveTeamControlPlaneCreators } = requi
 const { assertTeamControlPlaneWriteAdmission } = require("../services/database-write-contract-service");
 const { acquireAuthorizationUserLock } = require("../services/authorization-session-authority-service");
 const { dbAuthorityNow } = require("../services/db-time-authority-service");
+const { newPasswordSchema } = require("../services/account-password-policy");
+const { principalDeviceContext } = require("../services/principal-device-context-service");
 
 const webTransport = require("../services/website-session-transport");
 const { requireAuthMail } = require("../services/website-config-service");
@@ -38,13 +40,14 @@ if (web) router.use(webTransport.prepareAuthRequest);
 
 const registerSchema = z.object({
   email: z.string().email(),
-  password: z.string().min(8).max(200),
+  password: newPasswordSchema,
   name: z.string().min(1).max(80).optional(),
   agencyName: z.string().min(1).max(120).optional(),
   inviteToken: z.string().min(10).optional().nullable(),
 });
 
 const loginSchema = z.object({
+  expectedUserId: z.string().min(1).max(180).optional(),
   email: z.string().email(),
   password: z.string().min(1),
   rememberDevice: z.boolean().optional(),
@@ -71,7 +74,7 @@ const refreshSchema = z.object({
 
 const resetPasswordSchema = z.object({
   token: z.string().min(20).max(256),
-  password: z.string().min(8).max(200),
+  password: newPasswordSchema,
 });
 
 
@@ -384,6 +387,7 @@ router.post("/register", async (req, res) => {
       emailVerificationRequired: true,
       emailSent: verification.emailResult?.ok === true && !verification.emailResult?.skipped,
       user: publicUser(result.user),
+      ...(!web && input.deviceId ? { principalDevice: await principalDeviceContext({ db: prisma, userId: result.user.id, agencyId: result.membership.agencyId, deviceId: input.deviceId }) } : {}),
       agency: result.agency,
       role: result.member.role,
       roleKey: result.member.roleKey || result.inviteRoleKey || null,
@@ -449,32 +453,41 @@ router.post("/resend-verification", async (req, res) => {
   }
 });
 
+async function authenticateLogin(input) {
+  const fail = (status, code, message) => { throw Object.assign(new Error(message), { status, code }); };
+  const user = await prisma.user.findUnique({ where: { email: input.email.toLowerCase().trim() } });
+  if (!user) fail(401, "INVALID_CREDENTIALS", "Invalid email or password");
+  if (user.disabledAt) fail(403, "USER_DISABLED", "User is disabled");
+  if (!await bcrypt.compare(input.password, user.passwordHash)) fail(401, "INVALID_CREDENTIALS", "Invalid email or password");
+  if (!user.emailVerifiedAt) fail(403, "EMAIL_NOT_VERIFIED", "Email is not verified");
+  const membership = await getPrimaryMembership(user.id);
+  if (!membership) fail(401, "NO_AGENCY", "User has no agency");
+  return { user, membership };
+}
+
+// Resolve immutable identity before the client chooses its logical device and
+// before a device-bound JWT exists. Credentials are verified again at login;
+// expectedUserId prevents an intervening email reassignment from changing it.
+if (!web) router.post("/resolve-principal", require("../middleware/login-admission").loginAdmission({ db: prisma, surface: "member" }), async (req, res) => {
+  try {
+    const input = loginSchema.pick({ email: true, password: true, deviceId: true }).parse(req.body);
+    const { user, membership } = await authenticateLogin(input);
+    const legacyDevice = await principalDeviceContext({ db: prisma, userId: user.id, agencyId: membership.agencyId, deviceId: input.deviceId });
+    return res.json({ ok: true, userId: user.id, legacyDevice });
+  } catch (error) {
+    if (error?.issues) return validationError(res, error);
+    const status = Number(error?.status) || 500;
+    return res.status(status).json({ ok: false, code: error?.code || "LOGIN_PRINCIPAL_RESOLUTION_FAILED",
+      error: status < 500 ? error.message : "Could not resolve the account for sign-in" });
+  }
+});
+
 router.post("/login", require("../middleware/login-admission").loginAdmission({ db: prisma, surface: "member" }), async (req, res) => {
   try {
     const input = loginSchema.parse(req.body);
-    const email = input.email.toLowerCase().trim();
-
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) {
-      return res.status(401).json({ ok: false, code: "INVALID_CREDENTIALS", error: "Invalid email or password" });
-    }
-
-    if (user.disabledAt) {
-      return res.status(403).json({ ok: false, code: "USER_DISABLED", error: "User is disabled" });
-    }
-
-    const passwordOk = await bcrypt.compare(input.password, user.passwordHash);
-    if (!passwordOk) {
-      return res.status(401).json({ ok: false, code: "INVALID_CREDENTIALS", error: "Invalid email or password" });
-    }
-
-    if (!user.emailVerifiedAt) {
-      return res.status(403).json({ ok: false, code: "EMAIL_NOT_VERIFIED", error: "Email is not verified" });
-    }
-
-    const membership = await getPrimaryMembership(user.id);
-    if (!membership) {
-      return res.status(401).json({ ok: false, code: "NO_AGENCY", error: "User has no agency" });
+    const { user, membership } = await authenticateLogin(input);
+    if (input.expectedUserId && input.expectedUserId !== user.id) {
+      return res.status(409).json({ ok: false, code: "LOGIN_PRINCIPAL_CHANGED", error: "The account changed during sign-in. Try signing in again." });
     }
 
     const tokens = await issueLoginTokens({
@@ -482,6 +495,7 @@ router.post("/login", require("../middleware/login-admission").loginAdmission({ 
       membership,
       req,
       rememberDevice: input.rememberDevice === true,
+      verifyDevicePrincipal: Boolean(input.expectedUserId),
       deviceId: input.deviceId || null,
       client: input.client || null,
       authorizationScopeIncarnation: input.authorizationScopeIncarnation || null,
@@ -536,6 +550,7 @@ router.post("/refresh", async (req, res) => {
       refreshTokenExpiresAt: result.refreshTokenExpiresAt,
       authorizationSessionId: result.authorizationSessionId || null,
       user: publicUser(result.user),
+      ...(!web && input.deviceId ? { principalDevice: await principalDeviceContext({ db: prisma, userId: result.user.id, agencyId: result.membership.agencyId, deviceId: input.deviceId }) } : {}),
       agency: result.membership.agency,
       activeAgency: result.membership.agency,
       activeAgencyId: result.membership.agencyId,
@@ -603,6 +618,7 @@ router.get("/me", authRequired, async (req, res) => {
     return res.json({
       ok: true,
       user: publicUser(req.auth.user),
+      ...(!web && req.auth.deviceId ? { principalDevice: await principalDeviceContext({ db: prisma, userId: req.auth.user.id, agencyId: req.auth.agencyId, deviceId: req.auth.deviceId }) } : {}),
       agency: req.auth.agency,
       activeAgency: req.auth.agency,
       activeAgencyId: req.auth.agencyId,

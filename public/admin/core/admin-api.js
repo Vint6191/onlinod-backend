@@ -129,6 +129,7 @@
     getToken, setToken, request,
     commandStatus: (id) => request(`/api/admin/commands/${encodeURIComponent(id)}`),
     resolveCommand: (path, method) => window.NodAdminCommands.resolve(path, method, getToken()),
+    closeCommand: (path, method) => window.NodAdminCommands.close(path, method, getToken()),
 
     // auth
     login:  (body)   => request("/api/admin-auth/login",  { method: "POST", body, auth: false }),

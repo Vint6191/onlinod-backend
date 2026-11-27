@@ -83,6 +83,7 @@ function createMemoryDb(options = {}) {
         throw new Error(`Unexpected SQL ${sql}`);
       },
       async $executeRawUnsafe(sql) {
+        if (sql === "SET CONSTRAINTS ALL IMMEDIATE") return 1;
         if (sql === "SELECT set_config('lock_timeout', $1, true), set_config('statement_timeout', $2, true), set_config('TimeZone', 'UTC', true), set_config('onlinod.campaign_projection_writer', 'campaign_projection_v2', true)") return 1;
         if (sql.startsWith("SAVEPOINT ")) savepoints.set(sql.slice(10),copy(read()));
         else if (sql.startsWith("ROLLBACK TO SAVEPOINT ")) write(copy(savepoints.get(sql.slice(22))));

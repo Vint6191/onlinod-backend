@@ -23,15 +23,19 @@
       text.textContent = `${item.method} ${item.path.replace(/^\/api\/admin\//, "")} · ${item.commandId}`;
       button.className = "adm-btn";
       button.textContent = "Check result";
+      let closeMissing = false;
       button.addEventListener("click", async () => {
         button.disabled = true;
         const stillHere = W().capture(root);
         try {
-          const result = await window.NodAdminApi.resolveCommand(item.path, item.method);
+          const result = await window.NodAdminApi[closeMissing ? "closeCommand" : "resolveCommand"](item.path, item.method);
           if (!stillHere()) return;
           if (result.pending) {
+            closeMissing = result.canClose === true;
             text.textContent =
-              result.error || `${result.status || "Result unknown"}. Check again or retry the same change.`;
+              closeMissing ? "No saved result yet. Close this attempt to prevent a delayed request from applying; then reload and submit your change again."
+                : result.error || `${result.status || "Result unknown"}. Check again or retry the same change.`;
+            button.textContent = closeMissing ? "Close unconfirmed attempt" : "Check result";
             button.disabled = false;
             return;
           }
